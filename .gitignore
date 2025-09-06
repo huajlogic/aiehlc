@@ -1,0 +1,12 @@
+# build/binary
+aout/
+build/
+.cache/
+
+# bsp
+thirdparty/arch
+
+# llvm-aie
+thirdparty/llvm-aie/
+*.whl
+*.dist-info/

@@ -1,0 +1,39 @@
+# /******************************************************************************
+# * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+# * SPDX-License-Identifier: MIT
+# ******************************************************************************/
+
+# resource/CMakeLists.txt
+cmake_minimum_required(VERSION 3.20)
+# This file is processed from the top-level CMakeLists.txt via
+#     add_subdirectory(resource)
+
+# ------------------------------------------------------------
+# 1.  Production library
+# ------------------------------------------------------------
+set(routing_SRC
+    routingpath.cpp          # add more .cpp files here as needed
+)
+
+project(aie_routing LANGUAGES CXX)
+
+add_library(routing STATIC ${routing_SRC})
+
+target_include_directories(routing
+    PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+target_compile_features(routing PUBLIC cxx_std_17)
+
+# ------------------------------------------------------------
+# 2.  Unit tests (optional)
+# ------------------------------------------------------------
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/unitest/CMakeLists.txt")
+    add_subdirectory(unitest)         # builds tests when present
+endif()
+
+
+

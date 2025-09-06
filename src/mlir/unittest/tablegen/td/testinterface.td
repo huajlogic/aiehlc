@@ -1,0 +1,14 @@
+/******************************************************************************
+* Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
+
+include "mlir/IR/OpBase.td"
+
+def TileInterface: TypeInterface<"TileInterface"> {
+	let cppNamespace = "test";
+	let description = "base addr compute";
+	let methods = [
+		InterfaceMethod<"get base addrss", "int64_t", "getTileBase">
+	];
+}
