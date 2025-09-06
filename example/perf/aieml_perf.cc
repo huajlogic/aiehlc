@@ -13,10 +13,10 @@
 #include <math.h>
 #if AIE_GEN <= 2
 #define HW_GEN XAIE_DEV_GEN_AIEML
-#include "xtime_l.h"
+//#include "xtime_l.h"
 #else
 #define HW_GEN XAIE_DEV_GEN_AIE2PS
-#include "xiltimer.h"
+//#include "xiltimer.h"
 #endif
 // #include "unistd.h"
 #define uint_TYPE uint32_t
