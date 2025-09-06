@@ -52,8 +52,8 @@ USE_LLVMAIE=0
 SKIP_BSP=0
 LOCAL_AIE_RT_REPO=0
 PATH_SET_ONLY=0
-VITIS_SETTINGS_PATH="/proj/xbuilds/2025.2_0414_1/installs/lin64/HEAD/Vitis/settings64.sh"
-#VITIS_SETTINGS_PATH="/proj/xbuilds/HEAD_qualified_latest/installs/lin64/HEAD/Vitis/settings64.sh"
+#VITIS_SETTINGS_PATH="/proj/xbuilds/2025.2_0414_1/installs/lin64/HEAD/Vitis/settings64.sh"
+VITIS_SETTINGS_PATH="/proj/xbuilds/HEAD_qualified_latest/installs/lin64/HEAD/Vitis/settings64.sh"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

@@ -58,29 +58,29 @@ include_directories("./src/mlir/mlirfront/")
 
 
 #fiind antlr include
-find_path(ANTLR4_INCLUDE_DIR antlr4-runtime/antlr4-runtime.h PATH_SUFFIXES include)
-if(ANTLR4_INCLUDE_DIR)
-    message("ANTLR4 Include Directory: ${ANTLR4_INCLUDE_DIR}")
-    include_directories(${ANTLR4_INCLUDE_DIR}/antlr4-runtime/)
-else()
-    message(FATAL_ERROR "ANTLR4 runtime header not found.")
-endif()
+#find_path(ANTLR4_INCLUDE_DIR antlr4-runtime/antlr4-runtime.h PATH_SUFFIXES include)
+#if(ANTLR4_INCLUDE_DIR)
+#    message("ANTLR4 Include Directory: ${ANTLR4_INCLUDE_DIR}")
+#    include_directories(${ANTLR4_INCLUDE_DIR}/antlr4-runtime/)
+#else()
+#    message(FATAL_ERROR "ANTLR4 runtime header not found.")
+#endif()
 #find antlr lib
-execute_process(COMMAND dpkg-query -L libantlr4-runtime-dev
-                OUTPUT_VARIABLE ANTLR4_PACKAGE_FILES
-                RESULT_VARIABLE DPkg_RESULT)
+#execute_process(COMMAND dpkg-query -L libantlr4-runtime-dev
+#                OUTPUT_VARIABLE ANTLR4_PACKAGE_FILES
+#                RESULT_VARIABLE DPkg_RESULT)
 
-string(STRIP ${ANTLR4_PACKAGE_FILES} ANTLR4_PACKAGE_FILES)
+#string(STRIP ${ANTLR4_PACKAGE_FILES} ANTLR4_PACKAGE_FILES)
 
-string(REPLACE "\n" ";" ANTLR4_PACKAGE_FILES_LIST ${ANTLR4_PACKAGE_FILES})
+#string(REPLACE "\n" ";" ANTLR4_PACKAGE_FILES_LIST ${ANTLR4_PACKAGE_FILES})
 
-foreach(FILE_PATH IN LISTS ANTLR4_PACKAGE_FILES_LIST)
-    if(FILE_PATH MATCHES "\\.so$")
-        list(APPEND ANTLR4_LIBRARY_PATHS_LIST ${FILE_PATH})
-    endif()
-endforeach()
+#foreach(FILE_PATH IN LISTS ANTLR4_PACKAGE_FILES_LIST)
+#    if(FILE_PATH MATCHES "\\.so$")
+#        list(APPEND ANTLR4_LIBRARY_PATHS_LIST ${FILE_PATH})
+#    endif()
+#endforeach()
 
-message("ANTLR4 Library Paths: ${ANTLR4_LIBRARY_PATHS_LIST}")
+#message("ANTLR4 Library Paths: ${ANTLR4_LIBRARY_PATHS_LIST}")
 #####
 find_package(Boost REQUIRED COMPONENTS system)
 
