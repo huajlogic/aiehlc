@@ -1,34 +1,39 @@
 # Building aiehlc
 
-## Compile
-
-```bash
-mkdir ./build
-cd ./build
-cmake ../
-make -j32
-cd ..
-```
-
 ## Dependencies
 
 1. Install cmake 20+
 
-2. Install antlr4
+2. Install antlr4(optional)
 
 ```bash
 sudo apt-get install antlr4
 sudo apt-get install libantlr4-runtime-dev
 ```
 
-3. Install curses and ninja
+3. install boost
+
+MacosX
+
+```
+brew upgrade
+brew install boost
+```
+
+ubuntu
+
+```
+sudo apt install boost
+```
+
+4. Install curses and ninja
 
 ```bash
 sudo apt-get install libncurses5-dev
 sudo apt-get install ninja-build
 ```
 
-4. Install LLVM, MLIR, and clang, build from LLVM 19.1.4 source or Install llvm 19.1.4 with RTTI enable. 
+5. Install LLVM, MLIR, and clang, build from LLVM 19.1.4 source or Install llvm 19.1.4 with RTTI enable. 
 
 Build from source and enable RTTI option
 
@@ -52,3 +57,26 @@ This is required to resolve "undefined reference to typeinfo" linker errors and 
 <https://docs.amd.com/r/en-US/ug1400-vitis-embedded/Installing-the-Vitis-Software-Platform>
 
 <p align="center">Copyright&copy; 2025 Advanced Micro Devices, Inc</p>
+
+
+## Compile
+
+### Find the llvm build or install path
+
+for example the llvm build is
+
+```
+/Users/user/src/app/thirdparty/llvm-project/build
+```
+
+### cmake with set llvm path into the said path
+
+default will use /usr/local/, if the LLVM path is different or need to use local llvm do following
+
+```bash
+mkdir ./build
+cd ./build
+cmake ../ -DLLVM_INSTALL_DIR=/Users/user/src/app/thirdparty/llvm-project/build
+make -j32
+ls
+```
