@@ -13,16 +13,31 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 #set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(LLVM_INSTALL_DIR /usr/local/)
-set(CMAKE_PREFIX_PATH "${LLVM_INSTALL_DIR}/lib/cmake/clang" ${CMAKE_PREFIX_PATH})
+#set(LLVM_INSTALL_DIR /usr/local/)
+#set(CMAKE_PREFIX_PATH "${LLVM_INSTALL_DIR}/lib/cmake/clang" ${CMAKE_PREFIX_PATH})
+set(LLVM_ROOT /usr/local/)
+if(DEFINED LLVM_INSTALL_DIR AND NOT "${LLVM_INSTALL_DIR}" STREQUAL "")
+  set(LLVM_ROOT "${LLVM_INSTALL_DIR}" CACHE PATH "Root of LLVM/Clang/MLIR install" FORCE)
+endif()
+#set(LLVM_ROOT "/path/to/thirdparty/llvm-project/build" CACHE PATH "Root of an LLVM/Clang/MLIR install")
+
+if(LLVM_ROOT)
+  list(APPEND CMAKE_PREFIX_PATH
+       "${LLVM_ROOT}"
+       "${LLVM_ROOT}/lib/cmake"
+       "${LLVM_ROOT}/lib/cmake/llvm"
+       "${LLVM_ROOT}/lib/cmake/clang"
+       "${LLVM_ROOT}/lib/cmake/mlir")
+endif()
 find_package(Clang REQUIRED CONFIG)
+find_package(MLIR  REQUIRED CONFIG)
 
 message(STATUS "Found Clang ${Clang_PACKAGE_VERSION}")
 message(STATUS "Using ClangConfig.cmake in: ${Clang_DIR}")
 
-include_directories(${Clang_INCLUDE_DIRS})
+include_directories(${CLANG_INCLUDE_DIRS})
 
-message(STATUS "Using ${Clang_INCLUDE_DIRS}")
+message(STATUS "Using ${CLANG_INCLUDE_DIRS}")
 
 set(CMAKE_BUILD_TYPE Debug)
 
@@ -39,11 +54,15 @@ set(SOURCE_FILES ./test.cpp ../routinghwmanager.cpp)
 
 add_executable(test ${SOURCE_FILES})
 
+set(MLIR_INC_ARGS "")
+foreach(dir IN LISTS MLIR_INCLUDE_DIRS)
+  list(APPEND MLIR_INC_ARGS --mlir-include "${dir}")
+endforeach()
 
 add_custom_target(
 	aiedialectteablegen ALL
   COMMAND ${CMAKE_COMMAND} -E echo "Running custom script..."
-	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../gen.sh
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../gen.sh ${MLIR_INC_ARGS}
   COMMENT "Executing custom script before building AIE Dialect from tablegen"
 )
 

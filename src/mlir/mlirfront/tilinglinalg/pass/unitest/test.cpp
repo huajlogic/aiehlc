@@ -12,16 +12,26 @@
 //#include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IRPrinter/IRPrintingPasses.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/MLIRContext.h"
+
+
 #include "routingdeadargclean.h"
 
 #include "routingconstantfold.h"
 
 int main(int argc, char* argv[]) {
     MLIRContext ctx;
+    
     routingmanager mtest;
     routinghwmanager mtesthw;
     mtesthw.loaddialect(&ctx);
     mtest.loaddialect(&ctx);
+
+    ctx.getOrLoadDialect<arith::ArithDialect>();
     
     //auto module1 = mtest.createroutingfunc(&ctx,1);
     auto module1 = mtest.ops_test(&ctx,1);
