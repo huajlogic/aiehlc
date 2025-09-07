@@ -6,16 +6,20 @@
 cmake_minimum_required(VERSION 3.5)
 project(aiehlc)
 
+
+
 # Set the C++ standard to C++17
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_BUILD_TYPE Debug)
 
 #set the llvm path find path into the path you installed
 set(LLVM_INSTALL_DIR /usr/local/)
+#set(LLVM_INSTALL_DIR "/path/to/thirdparty/llvm-project/build" CACHE PATH "Root of an LLVM/Clang/MLIR install")
 
 set(CMAKE_PREFIX_PATH "${LLVM_INSTALL_DIR}/bin/" ${CMAKE_PREFIX_PATH})
 find_program(LLVM_CONFIG llvm-config REQUIRED)
@@ -82,8 +86,8 @@ include_directories("./src/mlir/mlirfront/")
 
 #message("ANTLR4 Library Paths: ${ANTLR4_LIBRARY_PATHS_LIST}")
 #####
-find_package(Boost REQUIRED COMPONENTS system)
-
+find_package(Boost REQUIRED CONFIG)
+#find_package(Boost 1.89.0 REQUIRED)
 # MLIR
 find_package(MLIR REQUIRED CONFIG PATHS ${MLIR_DIR})
 
