@@ -160,7 +160,7 @@ int main(int argc, char* argv[]) {
     routingmanager mtest;
     mtest.loaddialect(&ctx);
     mtest.type_interface_test(&ctx);
-    mtest.ops_test(&ctx);
+    mtest.ops_testNew(&ctx);
     std::cout << "main" <<std::endl;
     return 0;
 }
