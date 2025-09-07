@@ -14,17 +14,44 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+#cmake_policy(SET CMP0075 NEW)
+
 #set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(LLVM_INSTALL_DIR /usr/local/)
-set(CMAKE_PREFIX_PATH "${LLVM_INSTALL_DIR}/lib/cmake/clang" ${CMAKE_PREFIX_PATH})
+#set(LLVM_INSTALL_DIR /usr/local/)
+set(LLVM_ROOT /usr/local/)
+if(DEFINED LLVM_INSTALL_DIR AND NOT "${LLVM_INSTALL_DIR}" STREQUAL "")
+  set(LLVM_ROOT "${LLVM_INSTALL_DIR}" CACHE PATH "Root of LLVM/Clang/MLIR install" FORCE)
+endif()
+#set(LLVM_ROOT "/path/to/thirdparty/llvm-project/build" CACHE PATH "Root of an LLVM/Clang/MLIR install")
+
+if(LLVM_ROOT)
+  list(APPEND CMAKE_PREFIX_PATH
+       "${LLVM_ROOT}"
+       "${LLVM_ROOT}/lib/cmake"
+       "${LLVM_ROOT}/lib/cmake/llvm"
+       "${LLVM_ROOT}/lib/cmake/clang"
+       "${LLVM_ROOT}/lib/cmake/mlir")
+endif()
+
+# ---- Find packages (auto-resolve via CMAKE_PREFIX_PATH) ----------------------
+find_package(LLVM  REQUIRED CONFIG)
 find_package(Clang REQUIRED CONFIG)
+find_package(MLIR  REQUIRED CONFIG)
+find_package(Boost REQUIRED CONFIG)
 
 message(STATUS "Found Clang ${Clang_PACKAGE_VERSION}")
 message(STATUS "Using ClangConfig.cmake in: ${Clang_DIR}")
 
-include_directories(${Clang_INCLUDE_DIRS})
+include_directories(${CLANG_INCLUDE_DIRS})
 
-message(STATUS "Using ${Clang_INCLUDE_DIRS}")
+include_directories(${Boost_INCLUDE_DIRS})
+
+message(STATUS "Using ${CLANG_INCLUDE_DIRS}")
+
+set(MLIR_INC_ARGS "")
+foreach(dir IN LISTS MLIR_INCLUDE_DIRS)
+  list(APPEND MLIR_INC_ARGS --mlir-include "${dir}")
+endforeach()
 
 set(CMAKE_BUILD_TYPE Debug)
 
@@ -83,21 +110,21 @@ add_library(mlirtestlib ${SOURCE_LIB_FILES} )
 add_custom_target(
 	aiedialectteablegen ALL
   COMMAND ${CMAKE_COMMAND} -E echo "Running custom script for AIE dialect..."
-	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/gen.sh
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/gen.sh ${MLIR_INC_ARGS}
   COMMENT "Executing custom script before building AIE Dialect from tablegen"
 )
 
 add_custom_target(
 	aielinkerdialectgen ALL
   COMMAND ${CMAKE_COMMAND} -E echo "Running custom script for linker dialect..."
-	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/mlirlinkrelocate/gen.sh
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/mlirlinkrelocate/gen.sh ${MLIR_INC_ARGS}
   COMMENT "Executing custom script before building AIE Linker Dialect from tablegen"
 )
 
 add_custom_target(
 	routingtablegen ALL
   COMMAND ${CMAKE_COMMAND} -E echo "Running custom script for routing..."
-	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/routing/gen.sh
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/routing/gen.sh ${MLIR_INC_ARGS}
   COMMENT "Executing custom script before building Routing Dialect from tablegen"
 )
 
@@ -124,16 +151,16 @@ add_dependencies(mlirtestlib routingtablegen)
 
 #message(STATUS "curse include is ${CURSES_INCLUDE_DIR} lib is ${CURSES_LIBRARIES}")
 
-set(LLVM_PATH /scratch/staff/huaj/mlirdocker/)
+#set(LLVM_PATH /scratch/staff/huaj/mlirdocker/)
 #set(LLVM_LIBRARY_DIR ${LLVM_PATH}/acompiler/download/llvm/lib/)
-set(LLVM_LIBRARY_DIR ${LLVM_PATH}/llvm-project/build/lib/)
-if(NOT MLIR_DIR)
-	set(MLIR_DIR ${LLVM_LIBRARY_DIR}/cmake/mlir)
-endif()
-message(STATUS "${LLVM_LIBRARY_DIR}/cmake/mlir")
+#set(LLVM_LIBRARY_DIR ${LLVM_PATH}/llvm-project/build/lib/)
+#if(NOT MLIR_DIR)
+#	set(MLIR_DIR ${LLVM_LIBRARY_DIR}/cmake/mlir)
+#endif()
+#message(STATUS "${LLVM_LIBRARY_DIR}/cmake/mlir")
  
 # MLIR
-find_package(MLIR REQUIRED CONFIG PATHS ${MLIR_DIR})
+#find_package(MLIR REQUIRED CONFIG PATHS ${MLIR_DIR})
 
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${LLVM_INCLUDE_DIRS})
@@ -188,10 +215,10 @@ target_link_libraries(mlirtest PUBLIC
       MLIRTransformDialectTransforms
       #tiling logic end
     LLVMPasses
-    LLVMNVPTXCodeGen
+    #LLVMNVPTXCodeGen
     #LLVMNVPTXAsmPrinter
-    LLVMAMDGPUCodeGen
-    LLVMAMDGPUAsmParser
+    #LLVMAMDGPUCodeGen
+    #LLVMAMDGPUAsmParser
     dl
 )
 target_link_options(mlirtest PRIVATE ${LLVM_LDFLAGS})
