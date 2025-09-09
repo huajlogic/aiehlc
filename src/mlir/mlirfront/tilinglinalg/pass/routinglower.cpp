@@ -20,6 +20,34 @@ private:
     LLVMTypeConverter& typeconverter;
 };
 
+struct createhwmeshconvert : public ConversionPattern {
+    explicit createhwmeshconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::createhwmesh::getOperationName(),1, ctx), typeconverter(converter) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
+
+//createdummytensor
+struct createdummytensorconvert : public ConversionPattern {
+    explicit createdummytensorconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::createdummytensor::getOperationName(),1, ctx), typeconverter(converter) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
+
+
 struct routingcreatedataioconvert : public ConversionPattern {
     explicit routingcreatedataioconvert(MLIRContext * ctx, LLVMTypeConverter &converter, RoutingTopology & router):
         ConversionPattern(routing::createdataio::getOperationName(),1, ctx), typeconverter(converter), router_(router) {
@@ -329,7 +357,10 @@ void RoutingLowerPass::runOnOperation() {
     patterns.add<routingcreatedataioconvert>(&ctx, typeconverter,rtopology_);
     patterns.add<routingcreatetilearrayconvert>(&ctx, typeconverter,rtopology_);
     patterns.add<indexcastconvert>(&ctx, typeconverter);
-
+    patterns.add<createhwmeshconvert>(&ctx, typeconverter);
+    patterns.add<createdummytensorconvert>(&ctx, typeconverter);
+    
+    
     if (failed(applyPartialConversion(module, target, std::move(patterns) ))) {
         llvm::outs() << "routing convert failed \n";
     }

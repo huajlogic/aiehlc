@@ -116,7 +116,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     auto func = createroutingfuncByDim(ctx, true);
-    m.push_back(func);
+    //m.push_back(func);
     auto functype = builder.getFunctionType({},{});
     
     mlir::func::FuncOp main = builder.create<func::FuncOp>(builder.getUnknownLoc(), "main", functype);
@@ -124,6 +124,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     auto block = main.addEntryBlock();
     builder.setInsertionPointToEnd(block);
     auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(),  hwrowused, hwcolused);
+    
     //dummy tensor
     SmallVector<Attribute> shape;
     for (int64_t v : {10, 20})
@@ -150,6 +151,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
    // Value cnum = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 1);
     //Value rnum = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 8);
     //Value total = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(),16);
+    /*
     auto callop = builder.create<mlir::func::CallOp>(builder.getUnknownLoc(), func, ValueRange({mesh, 
                                                                                                 tensor,
                                                                                                 splitnum,
@@ -159,7 +161,9 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
                                                                                                 partensor_replicate_on,
                                                                                                 partensor_singleowner,
                                                                                                 io_direction}));
+    */
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
+    
     m.push_back(main);
     llvm::errs() << m;
     return m;
