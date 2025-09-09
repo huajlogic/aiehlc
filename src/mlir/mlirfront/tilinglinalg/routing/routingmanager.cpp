@@ -141,6 +141,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     mlir::Value partensor_axis_owner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//0 is row
     mlir::Value partensor_replicate_on = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is row 2 is col 0 is Non
     mlir::Value partensor_singleowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is first tile, n is n tile, 0 is none
+    mlir::Value io_direction = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//10 is input, 1 is output
 
     if( auto definingOp = axis.getDefiningOp()) {
         printf("dsafdsafdsafdsa\n");
@@ -156,7 +157,8 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
                                                                                                 partensor_splitdim,
                                                                                                 partensor_axis_owner,
                                                                                                 partensor_replicate_on,
-                                                                                                partensor_singleowner}));
+                                                                                                partensor_singleowner,
+                                                                                                io_direction}));
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(main);
     llvm::errs() << m;
@@ -234,8 +236,9 @@ mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int total
             //extract tile
             */
             //
-            auto io = builder.create<createdataio>(builder.getUnknownLoc(), "mem", "input");
+            
             auto tilearray = builder.create<createtilearrayOp>(builder.getUnknownLoc(), rnum_i32, cnum_i32);
+            auto io = builder.create<createdataio>(builder.getUnknownLoc(), "mem", "input");
             
           
             auto output = builder.getI32Type();
@@ -258,11 +261,11 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
         auto location = builder.getUnknownLoc();
         //ModuleOp module= ModuleOp::create(builder.getUnknownLoc());
         auto itype= builder.getI32Type();
-        mlir::FunctionType ftype = builder.getFunctionType({itype,itype,itype,itype,itype,itype,itype,itype},{});
+        mlir::FunctionType ftype = builder.getFunctionType({itype,itype,itype,itype,itype,itype,itype,itype,itype},{});
         func::FuncOp func = builder.create<func::FuncOp>(builder.getUnknownLoc(), "createroutebydim", ftype);
         //add parameter comments
          llvm::SmallVector<llvm::StringRef, 8> argNamesStorage = {"mesh", "tensor", "splitnum", "axisidx", "partensor_dim", 
-                                                    "axisowner", "partensor_replicateon","partensor_singleowner"};
+                                                    "axisowner", "partensor_replicateon","partensor_singleowner", "iodirection"};
         llvm::ArrayRef<llvm::StringRef> argNames(argNamesStorage);
         llvm::SmallVector<mlir::Attribute> argAttrs;
         for (size_t i = 0; i < argNames.size(); ++i) {
@@ -285,6 +288,7 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
         Value partensor_axisowner= eb->getArgument(5);
         Value partensor_replicateon = eb->getArgument(6);
         Value partensor_singleowner = eb->getArgument(7);
+        Value io_direction = eb->getArgument(8);
         //Value total_col = eb->getArgument(2);
         Value cnum_i32, rnum_i32;
         cnum_i32 = mesh;//builder.create<arith::IndexCastOp>(location,builder.getI32Type(), mesh);
@@ -330,8 +334,10 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
             builder.setInsertionPointToStart(scf.getBody());
             
             Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);  
-            auto edata = builder.create<extract_data>(builder.getUnknownLoc(), tensor, idx);
-            auto emeshtile = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, cnum_i32);
+            auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, idx);
+            auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, cnum_i32);
+            auto hwio = builder.create<createhwiowithtarget>(builder.getUnknownLoc(), tilelist, io_direction, "mem");
+            auto datamov = builder.create<movedatabyio>(builder.getUnknownLoc(), slicetensor, hwio);
             //extract tile
             //*/
        

@@ -34,6 +34,21 @@ def routing_createdataio : routingop<"routingcreatedataio", [DeclareOpInterfaceM
 	let assemblyFormat = " $iotype `,` $direction attr-dict `->` type($output)";
 }
 
+def routing_createhwiowithtarget : routingop<"routingcreatehwiowithtarget"> {
+	let summary = "createhwiowithtarget";
+	let cppNamespace = "routing";
+	let description = "create hw io with target";
+	let arguments = (ins
+		I32:$targettilelist,
+		I32:$direction,
+		StrAttr:$iotype
+	);
+	let results = (outs
+		I32:$output
+	);
+	let assemblyFormat = " `targettilelist` `=` $targettilelist `,` `direction` `=` $direction`:` type($targettilelist) `,`type($direction) attr-dict `->` type($output)";
+}
+
 def routing_creatbroadcast : routingop<"routingcreatebroadcast"> {
 	let summary = "createbroadcast";
 	let cppNamespace = "routing";
@@ -46,6 +61,20 @@ def routing_creatbroadcast : routingop<"routingcreatebroadcast"> {
 	let results = (outs
 		I32:$output);
 	let assemblyFormat = "$io `,` $tilearray `:` type($io) `,` type($tilearray)  attr-dict`->` type($output)";
+}
+
+def routing_movedatabyio : routingop<"routingmovedatabyio "> {
+	let summary = "movedatabyio";
+	let cppNamespace = "routing";
+	let description = "move data through io to aie or from";
+
+	let arguments = (ins
+		I32:$pktmerge_or_slicetestor,
+		I32:$hwiowithtarget);
+
+	let results = (outs
+		I32:$output);
+	let assemblyFormat = " `pktmerge_or_slicetestor` `=` $pktmerge_or_slicetestor `,` `hwiowithtarget` `=` $hwiowithtarget `:` type($pktmerge_or_slicetestor) `,` type($hwiowithtarget)  attr-dict`->` type($output)";
 }
 
 def routing_createhwmesh :routingop<"routingcreatehwmesh"> {
