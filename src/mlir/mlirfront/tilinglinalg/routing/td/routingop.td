@@ -194,6 +194,17 @@ def routing_extract_tiles :routingop<"routingextract_tiles"> {
 
 }
 
+def Routing_YieldOp : routingop<"yield", [Terminator]> {
+  let summary = "Terminator for regions in routing ops";
+  let description = [{
+    The `routing.yield` operation is a terminator that yields a value from
+    a region within a `routing` operation.
+  }];
+
+  let arguments = (ins AnyType:$value);
+  let results = (outs); // No results
+}
+
 def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
   let summary = "A structured operation for routing logic";
   let description = [{

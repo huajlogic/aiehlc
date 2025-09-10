@@ -325,6 +325,36 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
         Value ub = builder.create<arith::ConstantIndexOp>(location, 10);
         //Value ub = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), meshslitnum);   
         Value step = builder.create<arith::ConstantIndexOp>(location,1);
+
+        // create RoutingCreate region op
+        mlir::Value input =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32); 
+        //auto routingcreate = builder.create<RoutingCreate>(location, input, 32);
+        //{
+        //
+        //}
+        auto deviceRowAttr = builder.getI32IntegerAttr(5);
+        // --- 使用我们定义的优雅 Builder 来创建 Op ---
+        auto routingcreateOp = builder.create<routing::RoutingCreate>(
+            builder.getUnknownLoc(),             // Location
+            //input.getType(), // 返回类型
+            input,           // 输入操作数
+            deviceRowAttr,   // 属性
+            // C++ lambda, 这就是我们的 "bodyBuilder"
+            [&](OpBuilder &builder1, Location bodyLoc, Value regionArg) {
+                // 现在我们进入了 Region 的世界
+                // regionArg 就是 dispatchOp 的输入在 Region 内部的映射
+
+                // Region 内部的逻辑...
+                auto cst = builder1.create<arith::ConstantOp>(
+                    bodyLoc, builder1.getI32IntegerAttr(10));
+                auto intermediate = builder1.create<arith::MulIOp>(
+                    bodyLoc, regionArg, cst);
+
+                // 使用 routing.yield 来返回值，结束 Region
+                builder1.create<routing::YieldOp>(bodyLoc, intermediate);
+            }
+        );
+
   // ──────────────────────────────
   // 2. 创建 scf.forall
   //    OpBuilder 会回调一个 lambda，让你往 region 里塞指令
