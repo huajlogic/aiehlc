@@ -193,3 +193,62 @@ def routing_extract_tiles :routingop<"routingextract_tiles"> {
 	let assemblyFormat = "$partitions `,`  $idx `:` type($partitions) `,` type($idx) attr-dict `->` type($output)";	
 
 }
+
+def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
+  let summary = "A structured operation for routing logic";
+  let description = [{
+    Represents a dispatch of a value through a routing pipeline,
+    configured by a static device_row attribute. The operation contains
+    a region that defines the routing logic.
+  }];
+
+  let arguments = (ins I32:$input, I32Attr:$device_row);
+  let results = (outs I32:$output);
+
+  let regions = (region SizedRegion<1>:$body);
+ 
+
+  let builders = [
+    OpBuilder<(ins "Value":$input, "Attribute":$device_row,
+                   "function_ref<void(OpBuilder &, Location, Value)>":$bodyBuilder),
+    [{
+      // no region creatation
+      $_state.addTypes(input.getType());
+      // 2. Add operands to the state object.
+      $_state.addOperands(input);
+      // 3. Add attributes to the state object.
+      // Note that we must provide the attribute's name as a string.
+      $_state.addAttribute("device_row", device_row);
+
+      // 2. 创建 Region 和 Block
+      auto *bodyRegion = $_state.addRegion();
+      Block *bodyBlock = new Block();
+      bodyRegion->push_back(bodyBlock);
+      bodyBlock->addArgument(input.getType(), input.getLoc());
+
+      // 3. 调用用户提供的 lambda 来填充 Block
+      OpBuilder::InsertionGuard guard($_builder);
+      $_builder.setInsertionPointToStart(bodyBlock);
+      bodyBuilder($_builder, input.getLoc(), bodyBlock->getArgument(0));
+    }]>
+  ];
+
+  // --- 添加一个验证器 ---
+  /*
+  let verifier = [{
+    // verify region and argument
+    if (getRegion().front().getArgument(0).getType() != getInput().getType())
+      return emitOpError("region argument type must match input type");
+
+    // verify yeild
+    auto yieldOp = getRegion().front().getTerminator();
+    if (yieldOp->getOperand(0).getType() != getResult().getType())
+      return emitOpError("yield type must match result type");
+  }];
+*/
+  // 
+  let assemblyFormat = [{
+    $device_row attr-dict `(` $input `)` `->` type($output) `region` $body
+  }];
+}
+
