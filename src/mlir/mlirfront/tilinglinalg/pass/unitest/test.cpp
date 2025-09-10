@@ -42,6 +42,7 @@ int main(int argc, char* argv[]) {
     mlir::PassManager pm(&ctx);;
     RoutingTopology rtopology("Gen2");
     
+    pm.addPass(mlir::createPrintIRPass());
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
     pm.addPass(mlir::createPrintIRPass());
     pm.addPass(std::make_unique<RoutingLowerPass>(rtopology));

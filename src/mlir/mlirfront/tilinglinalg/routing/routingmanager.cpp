@@ -116,7 +116,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     auto func = createroutingfuncByDim(ctx, true);
-    //m.push_back(func);
+    m.push_back(func);
     auto functype = builder.getFunctionType({},{});
     
     mlir::func::FuncOp main = builder.create<func::FuncOp>(builder.getUnknownLoc(), "main", functype);
@@ -161,7 +161,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
                                                                                                 partensor_replicate_on,
                                                                                                 partensor_singleowner,
                                                                                                 io_direction}));
-    */
+    //*/
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     
     m.push_back(main);
@@ -319,32 +319,35 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
         auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(),  
                     tensor, tensorsplitnum, partensor_splitdim,partensor_axisowner,partensor_replicateon,partensor_singleowner);
 
+        auto nmeshsplit = getconstant(meshslitnum);
 
         Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
-        //Value ub = builder.create<arith::ConstantIndexOp>(location, 10);
-        Value ub = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), meshslitnum);   
+        Value ub = builder.create<arith::ConstantIndexOp>(location, 10);
+        //Value ub = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), meshslitnum);   
         Value step = builder.create<arith::ConstantIndexOp>(location,1);
   // ──────────────────────────────
   // 2. 创建 scf.forall
   //    OpBuilder 会回调一个 lambda，让你往 region 里塞指令
   // ──────────────────────────────
-
         auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
         {
-            ///*
+            
             mlir::Value scf_idx = scf.getInductionVar();
             //use such format to fix the generic format print issue 
             OpBuilder::InsertionGuard guard(builder);
             builder.setInsertionPointToStart(scf.getBody());
             
-            Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);  
+            Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);
+            //auto tilearray = builder.create<createtilearrayOp>(builder.getUnknownLoc(), rnum_i32, cnum_i32);
+            
             auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, idx);
+            /*
             auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, cnum_i32);
+            
             auto hwio = builder.create<createhwiowithtarget>(builder.getUnknownLoc(), tilelist, io_direction, "mem");
             auto datamov = builder.create<movedatabyio>(builder.getUnknownLoc(), slicetensor, hwio);
             //extract tile
-            //*/
-       
+            */
             /*
             auto io = builder.create<createdataio>(builder.getUnknownLoc(), "mem", "input");
             auto tilearray = builder.create<createtilearrayOp>(builder.getUnknownLoc(), rnum_i32, cnum_i32);

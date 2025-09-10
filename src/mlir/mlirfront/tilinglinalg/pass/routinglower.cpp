@@ -46,11 +46,68 @@ struct createdummytensorconvert : public ConversionPattern {
 private:
     LLVMTypeConverter& typeconverter;
 };
+//partitiontensor
+struct partitiontensorrconvert : public ConversionPattern {
+    explicit partitiontensorrconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::partitiontensor::getOperationName(),1, ctx), typeconverter(converter) {
 
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
+
+//partitionmesh
+struct partitionmeshconvert : public ConversionPattern {
+    explicit partitionmeshconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::partitionmesh::getOperationName(),1, ctx), typeconverter(converter) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
+
+//routingcreatedataioconvert
 
 struct routingcreatedataioconvert : public ConversionPattern {
     explicit routingcreatedataioconvert(MLIRContext * ctx, LLVMTypeConverter &converter, RoutingTopology & router):
         ConversionPattern(routing::createdataio::getOperationName(),1, ctx), typeconverter(converter), router_(router) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+    RoutingTopology & router_;
+};
+
+//extract_data
+struct extract_dataconvert : public ConversionPattern {
+    explicit extract_dataconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::extract_data::getOperationName(),1, ctx), typeconverter(converter) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
+
+//extract_tiles
+struct extract_tilesconvert : public ConversionPattern {
+    explicit extract_tilesconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::extract_tiles::getOperationName(),1, ctx), typeconverter(converter) {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
@@ -85,7 +142,6 @@ struct routingcreatedataioconvert : public ConversionPattern {
     }
 private:
     LLVMTypeConverter& typeconverter;
-    RoutingTopology & router_;
 };
 struct routingcreatetilearrayconvert : public ConversionPattern {
     explicit routingcreatetilearrayconvert(MLIRContext * ctx, LLVMTypeConverter &converter, RoutingTopology & router):
@@ -359,8 +415,12 @@ void RoutingLowerPass::runOnOperation() {
     patterns.add<indexcastconvert>(&ctx, typeconverter);
     patterns.add<createhwmeshconvert>(&ctx, typeconverter);
     patterns.add<createdummytensorconvert>(&ctx, typeconverter);
-    
-    
+    patterns.add<partitiontensorrconvert>(&ctx, typeconverter);
+    patterns.add<partitionmeshconvert>(&ctx, typeconverter);
+
+    patterns.add<extract_dataconvert>(&ctx, typeconverter);
+    patterns.add<extract_tilesconvert>(&ctx, typeconverter);
+        
     if (failed(applyPartialConversion(module, target, std::move(patterns) ))) {
         llvm::outs() << "routing convert failed \n";
     }
