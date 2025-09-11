@@ -459,8 +459,7 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                 mlir::StringAttr replicate_on=builder.getStringAttr("col");
                 mlir::StringAttr single_tile_owner=builder.getStringAttr("");
                 auto outTy = builder.getI32Type();
-                auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(),  
-                            tensor, tensorsplitnum, partensor_splitdim,partensor_axisowner,partensor_replicateon,partensor_singleowner);
+                auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensor, hwsplitnum, 0,"row","col","");
 
                 auto nmeshsplit = getconstant(meshslitnum);
 

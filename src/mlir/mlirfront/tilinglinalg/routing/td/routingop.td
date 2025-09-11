@@ -136,26 +136,18 @@ def routing_partitiontensor :routingop<"routingpartitiontensor"> {
 
 	let arguments = (ins
 		I32:$tensor,
-		I32:$splitnum,
-		I32:$splitdim,
-		I32:$hw_axis_owner,
-		I32:$replicate_on,
-		I32:$single_tile_owner
+		I32Attr:$splitnum,
+		I32Attr:$splitdim,
+		StrAttr:$hw_axis_owner,
+		StrAttr:$replicate_on,
+		StrAttr:$single_tile_owner
 	);
 
 	let results = (outs
 		I32:$output);
 	
 	let assemblyFormat = [{
-		`tensor` `=` $tensor `,`
-		`splitnum` `=` $splitnum `,`
-		`splitdim` `=` $splitdim `,`
-		`hw_axis_owner` `=` $hw_axis_owner `,`
-		`replicate_on` `=` $replicate_on `,`
-		`single_tile_owner` `=` $single_tile_owner
-		`:` type($tensor) `,` type($splitnum) `,` type($splitdim) `,`
-			type($hw_axis_owner) `,` type($replicate_on) `,` type($single_tile_owner)
-		attr-dict `->` type($output)
+		`tensor` `=` $tensor `:` type($tensor) attr-dict `->` type($output)
 	}];	
 
 }
