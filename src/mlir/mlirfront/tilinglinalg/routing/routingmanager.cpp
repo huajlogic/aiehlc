@@ -8,12 +8,17 @@
 #define GET_TYPEDEF_CLASSES
 #define GET_ATTRDEF_CLASSES
 #define GET_OP_CLASSES
+#define GET_OP_DEFS
+//#define GET_OP_LIST
 #include "routinginterface.cc.inc"
 #include "routingdialect.cc.inc"
 #include "routingattr.cc.inc"
 #include "routingtype.cc.inc"
 
 #include "routingop.cc.inc"
+//#undef GET_OP_LIST
+#undef GET_OP_DEFS
+
 #undef GET_OP_CLASSES
 #undef GET_ATTRDEF_CLASSES
 #undef GET_TYPEDEF_CLASSES
@@ -75,6 +80,103 @@ LogicalResult createdataio::inferReturnTypes(mlir::MLIRContext* ctx,
 
     return success();
 
+}
+
+// In RoutingOps.cpp
+
+// This is the C++ implementation for the printer.
+void routing::RoutingCreate::print(OpAsmPrinter &p) {
+  // `p` is the printer object. The `<<` operator prints literal strings.
+  p << " on_row ";
+
+  // Use printAttribute to print attributes. Angle brackets are just literals.
+  p << "<";
+  p << (getDeviceRow());
+  p << ">";
+
+  // Use printOperand for SSA values, and print its type.
+  p << " (";
+  p.printOperand(getInput());
+  p << " : ";
+  p.printType(getInput().getType());
+  p << ")";
+
+  // Use printOptionalAttrDict to print any attributes we haven't
+  // explicitly printed. This is good practice for forward compatibility.
+  // We need to tell it which attributes we already handled.
+  //p.printOptionalAttrDict(this->getAttrs(), /*elidedAttrs=*/{"device_row"});
+
+  // Print the result type.
+  p << " -> ";
+  p.printType(getResult().getType());
+  
+  // Use printRegion to print the region.
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false, 
+                              /*printBlockTerminators=*/false);
+}
+
+// In RoutingOps.cpp
+
+// This is the C++ implementation for the parser.
+ParseResult RoutingCreate::parse(OpAsmParser &parser, OperationState &result) {
+  // --- 1. Parse the components of the op ---
+
+  // `result` is the blueprint we will populate.
+  
+  // Parse the keyword "on_row"
+  if (parser.parseKeyword("on_row"))
+    return failure();
+  
+  // Parse the device_row attribute, which is inside <>
+  IntegerAttr deviceRowAttr;
+  if (parser.parseLess() ||
+      parser.parseAttribute(deviceRowAttr, "device_row", result.attributes) ||
+      parser.parseGreater())
+    return failure();
+
+  // Parse the input operand and its type
+  OpAsmParser::UnresolvedOperand inputOperand;
+  Type inputType;
+  if (parser.parseLParen() || 
+      parser.parseOperand(inputOperand) || 
+      parser.parseColon() ||
+      parser.parseType(inputType) || 
+      parser.parseRParen())
+    return failure();
+
+  // Parse any optional attributes
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // Parse the arrow and result type
+  Type resultType;
+  if (parser.parseArrow() || parser.parseType(resultType))
+    return failure();
+  
+  // Parse the region
+  Region *body = result.addRegion();
+  // 1. Create a list to hold the region's expected arguments.
+  llvm::SmallVector<OpAsmParser::Argument> regionArgs;
+
+    // 2. Create an Argument struct for our input. We can leave the SSA name
+    //    and location fields empty as the parser will fill them.
+  OpAsmParser::Argument arg; 
+  arg.type = inputType;
+  regionArgs.push_back(arg);
+  // 3. Pass the list of arguments to parseRegion.
+  if (parser.parseRegion(*body, regionArgs))
+    return failure();
+
+  // --- 2. Populate the OperationState (the result) ---
+
+  // Add the result type to the blueprint
+  result.addTypes(resultType);
+  
+  // Resolve the parsed operand and add it to the blueprint
+  if (parser.resolveOperand(inputOperand, inputType, result.operands))
+    return failure();
+
+  return success();
 }
 
 //routing class
@@ -327,37 +429,57 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
         Value step = builder.create<arith::ConstantIndexOp>(location,1);
 
         // create RoutingCreate region op
-        mlir::Value input =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32); 
-        //auto routingcreate = builder.create<RoutingCreate>(location, input, 32);
-        //{
-        //
-        //}
         auto deviceRowAttr = builder.getI32IntegerAttr(5);
-        // --- 使用我们定义的优雅 Builder 来创建 Op ---
+        mlir::Value input =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32); 
+        auto routingcreate = builder.create<RoutingCreate>(location, input, 32);
+        {
+            mlir::Region &body = routingcreate.getBody();
+            if (body.empty()) {
+            // Create the entry block and add its argument if required
+            mlir::Block &entry = body.emplaceBlock();
+                entry.addArgument(input.getType(), location); // if your op expects a block arg
+            }
+
+            // Now it's safe to take front()
+            mlir::Block &entry = body.front();
+
+            OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(&entry);
+
+            auto cst = builder.create<arith::ConstantOp>(
+                location, builder.getI32IntegerAttr(10));
+            builder.create<routing::YieldOp>(location, cst);
+        
+        }
+        /*
+        auto deviceRowAttr = builder.getI32IntegerAttr(5);
+        // --- builder create op-
+        //void RoutingCreate::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, Value input, Attribute device_row, function_ref<void(OpBuilder &, Location, Value)> bodyBuilder) {
+        // no region creatation
+        //
         auto routingcreateOp = builder.create<routing::RoutingCreate>(
             builder.getUnknownLoc(),             // Location
-            //input.getType(), // 返回类型
-            input,           // 输入操作数
-            deviceRowAttr,   // 属性
-            // C++ lambda, 这就是我们的 "bodyBuilder"
+            //input.getType(), // 
+            input,           // 
+            deviceRowAttr,   // 
+            // C++ lambda, is "bodyBuilder"
             [&](OpBuilder &builder1, Location bodyLoc, Value regionArg) {
-                // 现在我们进入了 Region 的世界
-                // regionArg 就是 dispatchOp 的输入在 Region 内部的映射
+                // inside region
 
-                // Region 内部的逻辑...
+                // Region 
                 auto cst = builder1.create<arith::ConstantOp>(
                     bodyLoc, builder1.getI32IntegerAttr(10));
-                auto intermediate = builder1.create<arith::MulIOp>(
-                    bodyLoc, regionArg, cst);
+                //auto intermediate = builder1.create<arith::MulIOp>(
+                //   bodyLoc, regionArg, cst);
 
-                // 使用 routing.yield 来返回值，结束 Region
-                builder1.create<routing::YieldOp>(bodyLoc, intermediate);
+                // use routing.yield to return value finish the yield
+                builder1.create<routing::YieldOp>(bodyLoc,cst);
             }
         );
+        //*/
 
   // ──────────────────────────────
-  // 2. 创建 scf.forall
-  //    OpBuilder 会回调一个 lambda，让你往 region 里塞指令
+  // 2. create scf.for
   // ──────────────────────────────
         auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
         {

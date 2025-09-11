@@ -62,7 +62,9 @@ using namespace routing;
 #undef GET_TYPEDEF_CLASSES
 
 #define GET_OP_CLASSES
+#define GET_OP_DECLS
 #include "routingop.h.inc"
+#undef GET_OP_DECLS
 #undef GET_OP_CLASSEST
 
 class routingmanager{

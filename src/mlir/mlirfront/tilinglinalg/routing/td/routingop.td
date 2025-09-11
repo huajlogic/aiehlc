@@ -201,6 +201,7 @@ def Routing_YieldOp : routingop<"yield", [Terminator]> {
     a region within a `routing` operation.
   }];
 
+  //let arguments = (ins AnyType:$value);
   let arguments = (ins AnyType:$value);
   let results = (outs); // No results
 }
@@ -258,8 +259,8 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
   }];
 */
   // 
-  let assemblyFormat = [{
-    $device_row attr-dict `(` $input `)` `->` type($output) `region` $body
-  }];
+  //let assemblyFormat = [{ `(` $input `)` attr-dict `->` type($output) region $body
+  //}];
+  let hasCustomAssemblyFormat = 1;
 }
 
