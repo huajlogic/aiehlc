@@ -217,8 +217,8 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     const int hwrowused= 8, hwcolused=8;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
-    auto func = createroutingfuncByDim(ctx, true);
-    m.push_back(func);
+    //auto func = createroutingfuncByDim(ctx, true);
+    //m.push_back(func);
     auto functype = builder.getFunctionType({},{});
     
     mlir::func::FuncOp main = builder.create<func::FuncOp>(builder.getUnknownLoc(), "main", functype);
@@ -238,17 +238,6 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     //auto mesh_index = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), mesh);
     //auto tensor_index = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), tensor);
     
-    mlir::Value splitnum = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),hwrowused,32);
-    mlir::Value axis = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//0 is row
-    mlir::Value partensor_splitdim =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),hwrowused,32); 
-    mlir::Value partensor_axis_owner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//0 is row
-    mlir::Value partensor_replicate_on = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is row 2 is col 0 is Non
-    mlir::Value partensor_singleowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is first tile, n is n tile, 0 is none
-    mlir::Value io_direction = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//10 is input, 1 is output
-
-    if( auto definingOp = axis.getDefiningOp()) {
-        printf("dsafdsafdsafdsa\n");
-    }
     //Value cnum   = builder.create<arith::ConstantIndexOp>(location, 1);
    // Value cnum = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 1);
     //Value rnum = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 8);
@@ -264,8 +253,8 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
                                                                                                 partensor_singleowner,
                                                                                                 io_direction}));
     //*/
+    createroutingfuncByDim(builder, ctx, mesh, tensor, hwrowused, true);
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
-    
     m.push_back(main);
     llvm::errs() << m;
     return m;
@@ -362,29 +351,29 @@ mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int total
         return func;
 }
 
-mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool braodcastbyrow, bool purefunc) {
-        OpBuilder builder(ctx);
+void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx, Value mesh, Value tensor, uint32_t hwsplitnum, bool braodcastbyrow) {
+        //OpBuilder builder(ctx);
         auto location = builder.getUnknownLoc();
         //ModuleOp module= ModuleOp::create(builder.getUnknownLoc());
-        auto itype= builder.getI32Type();
-        mlir::FunctionType ftype = builder.getFunctionType({itype,itype,itype,itype,itype,itype,itype,itype,itype},{});
-        func::FuncOp func = builder.create<func::FuncOp>(builder.getUnknownLoc(), "createroutebydim", ftype);
+        //auto itype= builder.getI32Type();
+        //mlir::FunctionType ftype = builder.getFunctionType({itype,itype,itype,itype,itype,itype,itype,itype,itype},{});
+        //func::FuncOp func = builder.create<func::FuncOp>(builder.getUnknownLoc(), "createroutebydim", ftype);
         //add parameter comments
-         llvm::SmallVector<llvm::StringRef, 8> argNamesStorage = {"mesh", "tensor", "splitnum", "axisidx", "partensor_dim", 
-                                                    "axisowner", "partensor_replicateon","partensor_singleowner", "iodirection"};
-        llvm::ArrayRef<llvm::StringRef> argNames(argNamesStorage);
-        llvm::SmallVector<mlir::Attribute> argAttrs;
-        for (size_t i = 0; i < argNames.size(); ++i) {
-            std::string argName = "arg" + std::to_string(i) + "_name";
-            llvm::StringRef name = argNames[i];
-            auto nameAttr = builder.getStringAttr(name);
-            argAttrs.push_back(mlir::DictionaryAttr::get(builder.getContext(), {builder.getNamedAttr(argName, nameAttr)}));
-        }
-        func->setAttr("func.arg_attrs",  mlir::ArrayAttr::get(builder.getContext(), argAttrs));
+        // llvm::SmallVector<llvm::StringRef, 8> argNamesStorage = {"mesh", "tensor", "splitnum", "axisidx", "partensor_dim", 
+        //                                            "axisowner", "partensor_replicateon","partensor_singleowner", "iodirection"};
+        //llvm::ArrayRef<llvm::StringRef> argNames(argNamesStorage);
+        //llvm::SmallVector<mlir::Attribute> argAttrs;
+        //for (size_t i = 0; i < argNames.size(); ++i) {
+        //    std::string argName = "arg" + std::to_string(i) + "_name";
+        //    llvm::StringRef name = argNames[i];
+        //    auto nameAttr = builder.getStringAttr(name);
+        //    argAttrs.push_back(mlir::DictionaryAttr::get(builder.getContext(), {builder.getNamedAttr(argName, nameAttr)}));
+        //}
+        //func->setAttr("func.arg_attrs",  mlir::ArrayAttr::get(builder.getContext(), argAttrs));
         //
-        Block* eb = func.addEntryBlock();
-        builder.setInsertionPointToStart(eb);
-
+        //Block* eb = func.addEntryBlock();
+        //builder.setInsertionPointToStart(eb);
+        /*
         Value mesh = eb->getArgument(0);
         Value tensor = eb->getArgument(1);
         Value meshslitnum = eb->getArgument(2);
@@ -396,9 +385,14 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
         Value partensor_singleowner = eb->getArgument(7);
         Value io_direction = eb->getArgument(8);
         //Value total_col = eb->getArgument(2);
+        */
         Value cnum_i32, rnum_i32;
         cnum_i32 = mesh;//builder.create<arith::IndexCastOp>(location,builder.getI32Type(), mesh);
         rnum_i32 = tensor;//builder.create<arith::IndexCastOp>(location, builder.getI32Type(), tensor);
+
+
+
+
 
         auto getconstant = [&](Value value) -> int {
             if (auto definingOp = value.getDefiningOp()) {
@@ -411,26 +405,8 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
             return 0;
         };
         
-        auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, meshslitnum, axis);
-        auto hw_row_number = rnum_i32;
-        IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
-        mlir::StringAttr hw_axis_owner=builder.getStringAttr("row");
-		mlir::StringAttr replicate_on=builder.getStringAttr("col");
-		mlir::StringAttr single_tile_owner=builder.getStringAttr("");
-        auto outTy = builder.getI32Type();
-        auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(),  
-                    tensor, tensorsplitnum, partensor_splitdim,partensor_axisowner,partensor_replicateon,partensor_singleowner);
-
-        auto nmeshsplit = getconstant(meshslitnum);
-
-        Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
-        Value ub = builder.create<arith::ConstantIndexOp>(location, 10);
-        //Value ub = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), meshslitnum);   
-        Value step = builder.create<arith::ConstantIndexOp>(location,1);
-
-        // create RoutingCreate region op
-        auto deviceRowAttr = builder.getI32IntegerAttr(5);
-        mlir::Value input =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32); 
+       
+        /*
         auto routingcreate = builder.create<RoutingCreate>(location, input, 32);
         {
             mlir::Region &body = routingcreate.getBody();
@@ -451,12 +427,14 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
             builder.create<routing::YieldOp>(location, cst);
         
         }
-        /*
-        auto deviceRowAttr = builder.getI32IntegerAttr(5);
+            */
+        ///*
         // --- builder create op-
         //void RoutingCreate::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, Value input, Attribute device_row, function_ref<void(OpBuilder &, Location, Value)> bodyBuilder) {
         // no region creatation
         //
+        auto deviceRowAttr = builder.getI32IntegerAttr(5);
+        mlir::Value input =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32); 
         auto routingcreateOp = builder.create<routing::RoutingCreate>(
             builder.getUnknownLoc(),             // Location
             //input.getType(), // 
@@ -464,16 +442,53 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
             deviceRowAttr,   // 
             // C++ lambda, is "bodyBuilder"
             [&](OpBuilder &builder1, Location bodyLoc, Value regionArg) {
-                // inside region
+                //
+                mlir::Value meshslitnum = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),hwsplitnum,32);
+                Value tensorsplitnum = meshslitnum;
+                mlir::Value axis = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//0 is row
+                mlir::Value partensor_splitdim =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),hwsplitnum,32); 
+                mlir::Value partensor_axisowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//0 is row
+                mlir::Value partensor_replicateon = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is row 2 is col 0 is Non
+                mlir::Value partensor_singleowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is first tile, n is n tile, 0 is none
+                mlir::Value io_direction = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//10 is input, 1 is output
 
-                // Region 
-                auto cst = builder1.create<arith::ConstantOp>(
-                    bodyLoc, builder1.getI32IntegerAttr(10));
-                //auto intermediate = builder1.create<arith::MulIOp>(
-                //   bodyLoc, regionArg, cst);
+                auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, meshslitnum, axis);
+                auto hw_row_number = rnum_i32;
+                IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
+                mlir::StringAttr hw_axis_owner=builder.getStringAttr("row");
+                mlir::StringAttr replicate_on=builder.getStringAttr("col");
+                mlir::StringAttr single_tile_owner=builder.getStringAttr("");
+                auto outTy = builder.getI32Type();
+                auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(),  
+                            tensor, tensorsplitnum, partensor_splitdim,partensor_axisowner,partensor_replicateon,partensor_singleowner);
+
+                auto nmeshsplit = getconstant(meshslitnum);
+
+                Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
+                Value ub = builder.create<arith::ConstantIndexOp>(location, 10);
+                //Value ub = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), meshslitnum);   
+                Value step = builder.create<arith::ConstantIndexOp>(location,1);
+
+                // create RoutingCreate region op
+                // inside region
+                auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
+                { 
+                    mlir::Value scf_idx = scf.getInductionVar();
+                    //use such format to fix the generic format print issue 
+                    OpBuilder::InsertionGuard guard(builder);
+                    builder.setInsertionPointToStart(scf.getBody()); 
+                    Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);
+                    //auto tilearray = builder.create<createtilearrayOp>(builder.getUnknownLoc(), rnum_i32, cnum_i32);
+                    auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, idx);
+                    auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, cnum_i32);
+                    
+                    auto hwio = builder.create<createhwiowithtarget>(builder.getUnknownLoc(), tilelist, io_direction, "mem");
+                    auto datamov = builder.create<movedatabyio>(builder.getUnknownLoc(), slicetensor, hwio);
+                    //extract tile
+                }
 
                 // use routing.yield to return value finish the yield
-                builder1.create<routing::YieldOp>(bodyLoc,cst);
+                builder1.create<routing::YieldOp>(bodyLoc);
             }
         );
         //*/
@@ -481,9 +496,9 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
   // ──────────────────────────────
   // 2. create scf.for
   // ──────────────────────────────
-        auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
-        {
-            
+        //auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
+        //{
+            /*
             mlir::Value scf_idx = scf.getInductionVar();
             //use such format to fix the generic format print issue 
             OpBuilder::InsertionGuard guard(builder);
@@ -493,6 +508,7 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
             //auto tilearray = builder.create<createtilearrayOp>(builder.getUnknownLoc(), rnum_i32, cnum_i32);
             
             auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, idx);
+            */
             /*
             auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, cnum_i32);
             
@@ -511,13 +527,13 @@ mlir::func::FuncOp routingmanager::createroutingfuncByDim(MLIRContext* ctx, bool
 
             llvm::outs() << "result count is "<< result.getItems().size() <<" \n";
            //*/
-        }
+        //}
          
          //without return the print will go into generic as some verify failed.
-         auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
+         //auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
 
        
-        return func;
+        return ;//func;
 }
 /*
 int main() {

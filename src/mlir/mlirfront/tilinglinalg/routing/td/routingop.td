@@ -202,7 +202,7 @@ def Routing_YieldOp : routingop<"yield", [Terminator]> {
   }];
 
   //let arguments = (ins AnyType:$value);
-  let arguments = (ins AnyType:$value);
+  let arguments = (ins);
   let results = (outs); // No results
 }
 
