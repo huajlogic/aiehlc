@@ -494,6 +494,7 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
             // C++ lambda, is "bodyBuilder"
             [&](OpBuilder &builder1, Location bodyLoc, Value lmesh, Value ltensor) {
                 //
+                auto ldatasplitnum = llvm::cast <IntegerAttr> (datasplitnum).getInt();
                 //mlir::Value meshslitnum = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),hwsplitnum,32);
                 //Value tensorsplitnum = meshslitnum;
                 //mlir::Value axis = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//0 is row
@@ -509,7 +510,7 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                 mlir::StringAttr replicate_on=builder.getStringAttr("col");
                 mlir::StringAttr single_tile_owner=builder.getStringAttr("");
                 auto outTy = builder.getI32Type();
-                auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensor, hwsplitnum, 0,"row","col","");
+                auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensor, ldatasplitnum, 0,"row","col","");
 
                 //auto nmeshsplit = getconstant(meshslitnum);
 
