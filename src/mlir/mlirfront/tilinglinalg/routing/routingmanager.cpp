@@ -91,14 +91,38 @@ void routing::RoutingCreate::print(OpAsmPrinter &p) {
 
   // Use printAttribute to print attributes. Angle brackets are just literals.
   p << "<";
-  p << (getDeviceRow());
+  p << "Meshsplitaxis = \"";
+  p << (getMeshsplitaxis());
+  p << "\",Datasplitnum = ";
+  p << (getDatasplitnum());
+  p << ", \n";
+  p.getStream().indent(40);
+  p << "Datasplitdim = ";
+  p << (getDatasplitdim());
+  p << ", Dataslicehwaxisowne = \" ";
+  p << (getDataslicehwaxisowner());
+  p << ", \n";
+  p.getStream().indent(40);
+  p << "Dataslicehwreplicateon = \"";
+  p << (getDataslicehwreplicateon());
+  p << "\", Datasingletileowner = \"";
+  p << (getDatasingletileowner());
+  p << "\", \n";
+  p.getStream().indent(40);
+  p << "Iotargetdirection = \"";
+  p << (getIotargetdirection());
+  p << "\"";
   p << ">";
 
   // Use printOperand for SSA values, and print its type.
   p << " (";
-  p.printOperand(getInput());
+  p.printOperand(getHwmesh());
+  p << " , ";
+  p.printOperand(getDatatensor());
   p << " : ";
-  p.printType(getInput().getType());
+  p.printType(getHwmesh().getType());
+  p << " , ";
+  p.printType(getDatatensor().getType());
   p << ")";
 
   // Use printOptionalAttrDict to print any attributes we haven't
@@ -433,26 +457,52 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
         //void RoutingCreate::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, Value input, Attribute device_row, function_ref<void(OpBuilder &, Location, Value)> bodyBuilder) {
         // no region creatation
         //
-        auto deviceRowAttr = builder.getI32IntegerAttr(5);
+        /*
+         I32Attr:$meshsplitnum,
+				   StrAttr:$meshsplitaxis,
+				   I32Attr:$datasplitnum,
+				   I32Attr:$datasplitdim,
+				   StrAttr:$dataslicehwaxisowner,
+				   StrAttr:$dataslicehwreplicateon,
+				   StrAttr:$datasingletileowner,
+				   StrAttr:iotargetdirection
+        */
+        auto meshsplitnum = builder.getI32IntegerAttr(hwsplitnum);
+        auto meshsplitaxis = builder.getStringAttr("row");
+        auto datasplitnum = meshsplitnum;
+        auto datasplitdim = builder.getI32IntegerAttr(0);
+        auto dataslicehwaxisowner = builder.getStringAttr("row");
+        auto dataslicehwreplicateon = builder.getStringAttr("col");
+        auto datasingletileowner = builder.getStringAttr("");
+        auto iotargetdirection = builder.getStringAttr("input");
+//void RoutingCreate::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, Value Hwmesh, Value Datatensor, Attribute Meshsplitnum, Attribute Meshsplitaxis, Attribute Datasplitnum, Attribute Datasplitdim, Attribute Dataslicehwaxisowner, Attribute Dataslicehwreplicateon, Attribute Datasingletileowner, Attribute Iotargetdirection, function_ref<void(OpBuilder &, Location, Value,Value)> bodyBuilder) {
+
         mlir::Value input =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32); 
         auto routingcreateOp = builder.create<routing::RoutingCreate>(
             builder.getUnknownLoc(),             // Location
             //input.getType(), // 
-            input,           // 
-            deviceRowAttr,   // 
+            mesh,           // 
+            tensor,
+            meshsplitnum,   //
+            meshsplitaxis,
+			datasplitnum,
+			datasplitdim,
+			dataslicehwaxisowner,
+			dataslicehwreplicateon,
+			datasingletileowner,
+			iotargetdirection,
             // C++ lambda, is "bodyBuilder"
-            [&](OpBuilder &builder1, Location bodyLoc, Value regionArg) {
+            [&](OpBuilder &builder1, Location bodyLoc, Value lmesh, Value ltensor) {
                 //
-                mlir::Value meshslitnum = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),hwsplitnum,32);
-                Value tensorsplitnum = meshslitnum;
-                mlir::Value axis = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//0 is row
-                mlir::Value partensor_splitdim =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),hwsplitnum,32); 
-                mlir::Value partensor_axisowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//0 is row
-                mlir::Value partensor_replicateon = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is row 2 is col 0 is Non
-                mlir::Value partensor_singleowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is first tile, n is n tile, 0 is none
-                mlir::Value io_direction = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//10 is input, 1 is output
+                //mlir::Value meshslitnum = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),hwsplitnum,32);
+                //Value tensorsplitnum = meshslitnum;
+                //mlir::Value axis = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//0 is row
+                //mlir::Value partensor_axisowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//0 is row
+                //mlir::Value partensor_replicateon = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is row 2 is col 0 is Non
+                //mlir::Value partensor_singleowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is first tile, n is n tile, 0 is none
+                //mlir::Value io_direction = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//10 is input, 1 is output
 
-                auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, meshslitnum, axis);
+                auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, hwsplitnum, "row");
                 auto hw_row_number = rnum_i32;
                 IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
                 mlir::StringAttr hw_axis_owner=builder.getStringAttr("row");
@@ -461,7 +511,7 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                 auto outTy = builder.getI32Type();
                 auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensor, hwsplitnum, 0,"row","col","");
 
-                auto nmeshsplit = getconstant(meshslitnum);
+                //auto nmeshsplit = getconstant(meshslitnum);
 
                 Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
                 Value ub = builder.create<arith::ConstantIndexOp>(location, 10);
@@ -479,9 +529,9 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                     Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);
                     //auto tilearray = builder.create<createtilearrayOp>(builder.getUnknownLoc(), rnum_i32, cnum_i32);
                     auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, idx);
-                    auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, cnum_i32);
+                    auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, idx);
                     
-                    auto hwio = builder.create<createhwiowithtarget>(builder.getUnknownLoc(), tilelist, io_direction, "mem");
+                    auto hwio = builder.create<createhwiowithtarget>(builder.getUnknownLoc(), tilelist, "input", "mem");
                     auto datamov = builder.create<movedatabyio>(builder.getUnknownLoc(), slicetensor, hwio);
                     //extract tile
                 }

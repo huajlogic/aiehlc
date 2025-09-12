@@ -40,13 +40,13 @@ def routing_createhwiowithtarget : routingop<"routingcreatehwiowithtarget"> {
 	let description = "create hw io with target";
 	let arguments = (ins
 		I32:$targettilelist,
-		I32:$direction,
+		StrAttr:$direction,
 		StrAttr:$iotype
 	);
 	let results = (outs
 		I32:$output
 	);
-	let assemblyFormat = " `targettilelist` `=` $targettilelist `,` `direction` `=` $direction`:` type($targettilelist) `,`type($direction) attr-dict `->` type($output)";
+	let assemblyFormat = " `targettilelist` `=` $targettilelist `:` type($targettilelist) attr-dict `->` type($output)";
 }
 
 def routing_creatbroadcast : routingop<"routingcreatebroadcast"> {
@@ -118,14 +118,14 @@ def routing_partitionmesh :routingop<"routingpartitionmesh"> {
 
 	let arguments = (ins
 		I32:$mesh,
-		I32:$splitnum,
-		I32:$axisidx
+		I32Attr:$splitnum,
+		StrAttr:$splitaxis
 		);
 
 	let results = (outs
 		I32:$output);
 
-	let assemblyFormat = [{`mesh` `=` $mesh`,` `splitnum` `=` $splitnum `,` `axisidx` `=`  $axisidx `:` type($mesh) `,` type($splitnum) `,` type($axisidx) attr-dict `->` type($output)}];	
+	let assemblyFormat = [{`mesh` `=` $mesh `:` type($mesh) attr-dict `->` type($output)}];	
 
 }
 
@@ -206,34 +206,68 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
     a region that defines the routing logic.
   }];
 
-  let arguments = (ins I32:$input, I32Attr:$device_row);
+  let arguments = (ins 
+  				   I32:$Hwmesh,
+				   I32:$Datatensor,
+				   I32Attr:$Meshsplitnum,
+				   StrAttr:$Meshsplitaxis,
+				   I32Attr:$Datasplitnum,
+				   I32Attr:$Datasplitdim,
+				   StrAttr:$Dataslicehwaxisowner,
+				   StrAttr:$Dataslicehwreplicateon,
+				   StrAttr:$Datasingletileowner,
+				   StrAttr:$Iotargetdirection
+				   );
   let results = (outs I32:$output);
 
   let regions = (region SizedRegion<1>:$body);
  
 
   let builders = [
-    OpBuilder<(ins "Value":$input, "Attribute":$device_row,
-                   "function_ref<void(OpBuilder &, Location, Value)>":$bodyBuilder),
+    OpBuilder<(ins "Value":$Hwmesh, 
+				   "Value":$Datatensor, 
+				   "Attribute":$Meshsplitnum,
+				   "Attribute":$Meshsplitaxis,
+				   "Attribute":$Datasplitnum,
+				   "Attribute":$Datasplitdim,
+				   "Attribute":$Dataslicehwaxisowner,
+				   "Attribute":$Dataslicehwreplicateon,
+				   "Attribute":$Datasingletileowner,
+				   "Attribute":$Iotargetdirection,
+                   "function_ref<void(OpBuilder &, Location, Value,Value)>":$bodyBuilder),
     [{
       // no region creatation
-      $_state.addTypes(input.getType());
-      // 2. Add operands to the state object.
-      $_state.addOperands(input);
+	  // 2. Add operands to the state object.
+      $_state.addTypes($_builder.getI32Type());//for output , the result
+      $_state.addOperands(Hwmesh);
+	  $_state.addOperands(Datatensor);
+	  
       // 3. Add attributes to the state object.
       // Note that we must provide the attribute's name as a string.
-      $_state.addAttribute("device_row", device_row);
+      $_state.addAttribute("Meshsplitnum", Meshsplitnum);
+	  $_state.addAttribute("Meshsplitaxis", Meshsplitaxis);
+	  $_state.addAttribute("Datasplitnum", Datasplitnum);
+	  $_state.addAttribute("Datasplitdim", Datasplitdim);
+	  $_state.addAttribute("Dataslicehwaxisowner", Dataslicehwaxisowner);
+	  $_state.addAttribute("Dataslicehwreplicateon", Dataslicehwreplicateon);
+	  $_state.addAttribute("Datasingletileowner", Datasingletileowner);
+	  $_state.addAttribute("Iotargetdirection", Iotargetdirection);
 
       // 2. 创建 Region 和 Block
       auto *bodyRegion = $_state.addRegion();
       Block *bodyBlock = new Block();
       bodyRegion->push_back(bodyBlock);
-      bodyBlock->addArgument(input.getType(), input.getLoc());
+      bodyBlock->addArgument(Hwmesh.getType(), Hwmesh.getLoc());
+	  bodyBlock->addArgument(Datatensor.getType(), Datatensor.getLoc());
 
       // 3. 调用用户提供的 lambda 来填充 Block
       OpBuilder::InsertionGuard guard($_builder);
       $_builder.setInsertionPointToStart(bodyBlock);
-      bodyBuilder($_builder, input.getLoc(), bodyBlock->getArgument(0));
+      bodyBuilder($_builder, 
+	  			  Hwmesh.getLoc(),
+				  bodyBlock->getArgument(0),
+				  bodyBlock->getArgument(1)
+				  );
     }]>
   ];
 
