@@ -25,7 +25,8 @@ struct createhwmeshconvert : public ConversionPattern {
         ConversionPattern(routing::createhwmesh::getOperationName(),1, ctx), typeconverter(converter) {
 
         }
-    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {   
+        
         rewriter.eraseOp(op);
         return success();
     }
@@ -66,7 +67,11 @@ struct partitionmeshconvert : public ConversionPattern {
         ConversionPattern(routing::partitionmesh::getOperationName(),1, ctx), typeconverter(converter) {
 
         }
-    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {  
+        auto parent = op->getParentOfType<routing::RoutingCreate>();
+        if (!parent) {
+            return rewriter.notifyMatchFailure(op, "not inside RoutingCreateOp");  
+        }
         rewriter.eraseOp(op);
         return success();
     }

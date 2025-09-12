@@ -87,37 +87,18 @@ LogicalResult createdataio::inferReturnTypes(mlir::MLIRContext* ctx,
 // This is the C++ implementation for the printer.
 void routing::RoutingCreate::print(OpAsmPrinter &p) {
   // `p` is the printer object. The `<<` operator prints literal strings.
-  p << " on_row ";
+  //p << " on_row ";
 
   // Use printAttribute to print attributes. Angle brackets are just literals.
   p << "<";
-  p << "Meshsplitaxis = \"";
-  p << (getMeshsplitaxis());
-  p << "\",Datasplitnum = ";
-  p << (getDatasplitnum());
-  p << ", \n";
-  p.getStream().indent(40);
-  p << "Datasplitdim = ";
-  p << (getDatasplitdim());
-  p << ", Dataslicehwaxisowne = \" ";
-  p << (getDataslicehwaxisowner());
-  p << ", \n";
-  p.getStream().indent(40);
-  p << "Dataslicehwreplicateon = \"";
-  p << (getDataslicehwreplicateon());
-  p << "\", Datasingletileowner = \"";
-  p << (getDatasingletileowner());
-  p << "\", \n";
-  p.getStream().indent(40);
-  p << "Iotargetdirection = \"";
-  p << (getIotargetdirection());
-  p << "\"";
-  p << ">";
+  p << "Memo = \"";
+  p << (getMemo());
+  p << "\">";
 
   // Use printOperand for SSA values, and print its type.
-  p << " (";
+  p << " ( HWMesh = ";
   p.printOperand(getHwmesh());
-  p << " , ";
+  p << " , Datatensor =";
   p.printOperand(getDatatensor());
   p << " : ";
   p.printType(getHwmesh().getType());
@@ -300,6 +281,17 @@ mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int total
         Block* eb = func.addEntryBlock();
         builder.setInsertionPointToStart(eb);
 
+        auto getconstant = [&](Value value) -> int {
+            if (auto definingOp = value.getDefiningOp()) {
+                if (auto constantOp = dyn_cast<arith::ConstantIntOp>(definingOp)) {
+                    if (auto intAttr = constantOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+                        return intAttr.getInt();
+                    }
+                }
+            }
+            return 0;
+        };
+
         Value row = eb->getArgument(0);
         Value col = eb->getArgument(1);
         //Value total_col = eb->getArgument(2);
@@ -375,150 +367,25 @@ mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int total
         return func;
 }
 
-void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx, Value mesh, Value tensor, uint32_t hwsplitnum, bool braodcastbyrow) {
-        //OpBuilder builder(ctx);
+void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx, Value mesh, Value tensor,
+                                           uint32_t hwsplitnum, bool braodcastbyrow) {
         auto location = builder.getUnknownLoc();
-        //ModuleOp module= ModuleOp::create(builder.getUnknownLoc());
-        //auto itype= builder.getI32Type();
-        //mlir::FunctionType ftype = builder.getFunctionType({itype,itype,itype,itype,itype,itype,itype,itype,itype},{});
-        //func::FuncOp func = builder.create<func::FuncOp>(builder.getUnknownLoc(), "createroutebydim", ftype);
-        //add parameter comments
-        // llvm::SmallVector<llvm::StringRef, 8> argNamesStorage = {"mesh", "tensor", "splitnum", "axisidx", "partensor_dim", 
-        //                                            "axisowner", "partensor_replicateon","partensor_singleowner", "iodirection"};
-        //llvm::ArrayRef<llvm::StringRef> argNames(argNamesStorage);
-        //llvm::SmallVector<mlir::Attribute> argAttrs;
-        //for (size_t i = 0; i < argNames.size(); ++i) {
-        //    std::string argName = "arg" + std::to_string(i) + "_name";
-        //    llvm::StringRef name = argNames[i];
-        //    auto nameAttr = builder.getStringAttr(name);
-        //    argAttrs.push_back(mlir::DictionaryAttr::get(builder.getContext(), {builder.getNamedAttr(argName, nameAttr)}));
-        //}
-        //func->setAttr("func.arg_attrs",  mlir::ArrayAttr::get(builder.getContext(), argAttrs));
-        //
-        //Block* eb = func.addEntryBlock();
-        //builder.setInsertionPointToStart(eb);
-        /*
-        Value mesh = eb->getArgument(0);
-        Value tensor = eb->getArgument(1);
-        Value meshslitnum = eb->getArgument(2);
-        Value tensorsplitnum = meshslitnum;
-        Value axis = eb->getArgument(3);
-        Value partensor_splitdim = eb->getArgument(4);
-        Value partensor_axisowner= eb->getArgument(5);
-        Value partensor_replicateon = eb->getArgument(6);
-        Value partensor_singleowner = eb->getArgument(7);
-        Value io_direction = eb->getArgument(8);
-        //Value total_col = eb->getArgument(2);
-        */
-        Value cnum_i32, rnum_i32;
-        cnum_i32 = mesh;//builder.create<arith::IndexCastOp>(location,builder.getI32Type(), mesh);
-        rnum_i32 = tensor;//builder.create<arith::IndexCastOp>(location, builder.getI32Type(), tensor);
-
-
-
-
-
-        auto getconstant = [&](Value value) -> int {
-            if (auto definingOp = value.getDefiningOp()) {
-                if (auto constantOp = dyn_cast<arith::ConstantIntOp>(definingOp)) {
-                    if (auto intAttr = constantOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
-                        return intAttr.getInt();
-                    }
-                }
-            }
-            return 0;
-        };
-        
-       
-        /*
-        auto routingcreate = builder.create<RoutingCreate>(location, input, 32);
-        {
-            mlir::Region &body = routingcreate.getBody();
-            if (body.empty()) {
-            // Create the entry block and add its argument if required
-            mlir::Block &entry = body.emplaceBlock();
-                entry.addArgument(input.getType(), location); // if your op expects a block arg
-            }
-
-            // Now it's safe to take front()
-            mlir::Block &entry = body.front();
-
-            OpBuilder::InsertionGuard guard(builder);
-            builder.setInsertionPointToStart(&entry);
-
-            auto cst = builder.create<arith::ConstantOp>(
-                location, builder.getI32IntegerAttr(10));
-            builder.create<routing::YieldOp>(location, cst);
-        
-        }
-            */
-        ///*
-        // --- builder create op-
-        //void RoutingCreate::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, Value input, Attribute device_row, function_ref<void(OpBuilder &, Location, Value)> bodyBuilder) {
         // no region creatation
         //
-        /*
-         I32Attr:$meshsplitnum,
-				   StrAttr:$meshsplitaxis,
-				   I32Attr:$datasplitnum,
-				   I32Attr:$datasplitdim,
-				   StrAttr:$dataslicehwaxisowner,
-				   StrAttr:$dataslicehwreplicateon,
-				   StrAttr:$datasingletileowner,
-				   StrAttr:iotargetdirection
-        */
-        auto meshsplitnum = builder.getI32IntegerAttr(hwsplitnum);
-        auto meshsplitaxis = builder.getStringAttr("row");
-        auto datasplitnum = meshsplitnum;
-        auto datasplitdim = builder.getI32IntegerAttr(0);
-        auto dataslicehwaxisowner = builder.getStringAttr("row");
-        auto dataslicehwreplicateon = builder.getStringAttr("col");
-        auto datasingletileowner = builder.getStringAttr("");
-        auto iotargetdirection = builder.getStringAttr("input");
-//void RoutingCreate::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState, Value Hwmesh, Value Datatensor, Attribute Meshsplitnum, Attribute Meshsplitaxis, Attribute Datasplitnum, Attribute Datasplitdim, Attribute Dataslicehwaxisowner, Attribute Dataslicehwreplicateon, Attribute Datasingletileowner, Attribute Iotargetdirection, function_ref<void(OpBuilder &, Location, Value,Value)> bodyBuilder) {
-
-        mlir::Value input =builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32); 
-        auto routingcreateOp = builder.create<routing::RoutingCreate>(
-            builder.getUnknownLoc(),             // Location
-            //input.getType(), // 
-            mesh,           // 
-            tensor,
-            meshsplitnum,   //
-            meshsplitaxis,
-			datasplitnum,
-			datasplitdim,
-			dataslicehwaxisowner,
-			dataslicehwreplicateon,
-			datasingletileowner,
-			iotargetdirection,
-            // C++ lambda, is "bodyBuilder"
-            [&](OpBuilder &builder1, Location bodyLoc, Value lmesh, Value ltensor) {
-                //
-                auto ldatasplitnum = llvm::cast <IntegerAttr> (datasplitnum).getInt();
-                //mlir::Value meshslitnum = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),hwsplitnum,32);
-                //Value tensorsplitnum = meshslitnum;
-                //mlir::Value axis = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//0 is row
-                //mlir::Value partensor_axisowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//0 is row
-                //mlir::Value partensor_replicateon = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is row 2 is col 0 is Non
-                //mlir::Value partensor_singleowner = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),1,32);//1 is first tile, n is n tile, 0 is none
-                //mlir::Value io_direction = builder.create<mlir::arith::ConstantIntOp>(builder.getUnknownLoc(),0,32);//10 is input, 1 is output
-
-                auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, hwsplitnum, "row");
-                auto hw_row_number = rnum_i32;
+        auto memo = builder.getStringAttr("memo");
+        auto routingcreateOp = builder.create<routing::RoutingCreate>(builder.getUnknownLoc(),  mesh,tensor, memo, 
+                                                                      [&](OpBuilder &builder1, Location bodyLoc,Value lmesh, Value ltenso) {
+            
+                auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  lmesh, hwsplitnum, "row");
                 IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
                 mlir::StringAttr hw_axis_owner=builder.getStringAttr("row");
                 mlir::StringAttr replicate_on=builder.getStringAttr("col");
                 mlir::StringAttr single_tile_owner=builder.getStringAttr("");
                 auto outTy = builder.getI32Type();
-                auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensor, ldatasplitnum, 0,"row","col","");
-
-                //auto nmeshsplit = getconstant(meshslitnum);
-
+                auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), ltenso, hwsplitnum, 0,"row","col","");
                 Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
                 Value ub = builder.create<arith::ConstantIndexOp>(location, 10);
-                //Value ub = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), meshslitnum);   
                 Value step = builder.create<arith::ConstantIndexOp>(location,1);
-
                 // create RoutingCreate region op
                 // inside region
                 auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
@@ -528,7 +395,6 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                     OpBuilder::InsertionGuard guard(builder);
                     builder.setInsertionPointToStart(scf.getBody()); 
                     Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);
-                    //auto tilearray = builder.create<createtilearrayOp>(builder.getUnknownLoc(), rnum_i32, cnum_i32);
                     auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, idx);
                     auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, idx);
                     
@@ -541,47 +407,7 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                 builder1.create<routing::YieldOp>(bodyLoc);
             }
         );
-        //*/
-
-  // ──────────────────────────────
-  // 2. create scf.for
-  // ──────────────────────────────
-        //auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
-        //{
-            /*
-            mlir::Value scf_idx = scf.getInductionVar();
-            //use such format to fix the generic format print issue 
-            OpBuilder::InsertionGuard guard(builder);
-            builder.setInsertionPointToStart(scf.getBody());
-            
-            Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);
-            //auto tilearray = builder.create<createtilearrayOp>(builder.getUnknownLoc(), rnum_i32, cnum_i32);
-            
-            auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, idx);
-            */
-            /*
-            auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, cnum_i32);
-            
-            auto hwio = builder.create<createhwiowithtarget>(builder.getUnknownLoc(), tilelist, io_direction, "mem");
-            auto datamov = builder.create<movedatabyio>(builder.getUnknownLoc(), slicetensor, hwio);
-            //extract tile
-            */
-            /*
-            auto io = builder.create<createdataio>(builder.getUnknownLoc(), "mem", "input");
-            auto tilearray = builder.create<createtilearrayOp>(builder.getUnknownLoc(), rnum_i32, cnum_i32);
-            
-          
-            auto output = builder.getI32Type();
-            auto op3 = builder.create<creatbroadcast>(builder.getUnknownLoc(), io.getResult(), tilearray.getResult());
-            auto result = tilearray.getResult().getType().dyn_cast<tilearrayType>();
-
-            llvm::outs() << "result count is "<< result.getItems().size() <<" \n";
-           //*/
-        //}
-         
-         //without return the print will go into generic as some verify failed.
-         //auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
-
+        
        
         return ;//func;
 }

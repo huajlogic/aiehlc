@@ -209,31 +209,16 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
   let arguments = (ins 
   				   I32:$Hwmesh,
 				   I32:$Datatensor,
-				   I32Attr:$Meshsplitnum,
-				   StrAttr:$Meshsplitaxis,
-				   I32Attr:$Datasplitnum,
-				   I32Attr:$Datasplitdim,
-				   StrAttr:$Dataslicehwaxisowner,
-				   StrAttr:$Dataslicehwreplicateon,
-				   StrAttr:$Datasingletileowner,
-				   StrAttr:$Iotargetdirection
+				   StrAttr:$Memo
 				   );
   let results = (outs I32:$output);
 
   let regions = (region SizedRegion<1>:$body);
  
-
   let builders = [
     OpBuilder<(ins "Value":$Hwmesh, 
 				   "Value":$Datatensor, 
-				   "Attribute":$Meshsplitnum,
-				   "Attribute":$Meshsplitaxis,
-				   "Attribute":$Datasplitnum,
-				   "Attribute":$Datasplitdim,
-				   "Attribute":$Dataslicehwaxisowner,
-				   "Attribute":$Dataslicehwreplicateon,
-				   "Attribute":$Datasingletileowner,
-				   "Attribute":$Iotargetdirection,
+				   "Attribute":$Memo,
                    "function_ref<void(OpBuilder &, Location, Value,Value)>":$bodyBuilder),
     [{
       // no region creatation
@@ -244,14 +229,7 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
 	  
       // 3. Add attributes to the state object.
       // Note that we must provide the attribute's name as a string.
-      $_state.addAttribute("Meshsplitnum", Meshsplitnum);
-	  $_state.addAttribute("Meshsplitaxis", Meshsplitaxis);
-	  $_state.addAttribute("Datasplitnum", Datasplitnum);
-	  $_state.addAttribute("Datasplitdim", Datasplitdim);
-	  $_state.addAttribute("Dataslicehwaxisowner", Dataslicehwaxisowner);
-	  $_state.addAttribute("Dataslicehwreplicateon", Dataslicehwreplicateon);
-	  $_state.addAttribute("Datasingletileowner", Datasingletileowner);
-	  $_state.addAttribute("Iotargetdirection", Iotargetdirection);
+      $_state.addAttribute("Memo", Memo);
 
       // 2. 创建 Region 和 Block
       auto *bodyRegion = $_state.addRegion();
