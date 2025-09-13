@@ -111,7 +111,7 @@ def routing_createdummytensor :routingop<"routingcreatedummytensor"> {
 
 }
 
-def routing_partitionmesh :routingop<"routingpartitionmesh"> {
+def routing_partitionmesh :routingop<"partitionmesh"> {
 	let summary = "partitionmesh";
 	let cppNamespace = "routing";
 	let description = "partitionmesh";
@@ -129,10 +129,10 @@ def routing_partitionmesh :routingop<"routingpartitionmesh"> {
 
 }
 
-def routing_partitiontensor :routingop<"routingpartitiontensor"> {
+def routing_partitiontensor :routingop<"partitiontensor"> {
 	let summary = "partitiontensor";
 	let cppNamespace = "routing";
-	let description = "partitionmtensor";
+	let description = "partitiontensor";
 
 	let arguments = (ins
 		I32:$tensor,
@@ -207,8 +207,7 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
   }];
 
   let arguments = (ins 
-  				   I32:$Hwmesh,
-				   I32:$Datatensor,
+  				   I32:$scf_idx,
 				   StrAttr:$Memo
 				   );
   let results = (outs I32:$output);
@@ -216,16 +215,14 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
   let regions = (region SizedRegion<1>:$body);
  
   let builders = [
-    OpBuilder<(ins "Value":$Hwmesh, 
-				   "Value":$Datatensor, 
+    OpBuilder<(ins "Value":$scf_idx, 
 				   "Attribute":$Memo,
-                   "function_ref<void(OpBuilder &, Location, Value,Value)>":$bodyBuilder),
+                   "function_ref<void(OpBuilder &, Location, Value)>":$bodyBuilder),
     [{
       // no region creatation
 	  // 2. Add operands to the state object.
       $_state.addTypes($_builder.getI32Type());//for output , the result
-      $_state.addOperands(Hwmesh);
-	  $_state.addOperands(Datatensor);
+      $_state.addOperands(scf_idx);
 	  
       // 3. Add attributes to the state object.
       // Note that we must provide the attribute's name as a string.
@@ -235,16 +232,14 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
       auto *bodyRegion = $_state.addRegion();
       Block *bodyBlock = new Block();
       bodyRegion->push_back(bodyBlock);
-      bodyBlock->addArgument(Hwmesh.getType(), Hwmesh.getLoc());
-	  bodyBlock->addArgument(Datatensor.getType(), Datatensor.getLoc());
+      bodyBlock->addArgument(scf_idx.getType(), scf_idx.getLoc());
 
       // 3. 调用用户提供的 lambda 来填充 Block
       OpBuilder::InsertionGuard guard($_builder);
       $_builder.setInsertionPointToStart(bodyBlock);
       bodyBuilder($_builder, 
-	  			  Hwmesh.getLoc(),
-				  bodyBlock->getArgument(0),
-				  bodyBlock->getArgument(1)
+	  			  scf_idx.getLoc(),
+				  bodyBlock->getArgument(0)
 				  );
     }]>
   ];

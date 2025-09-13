@@ -68,10 +68,10 @@ struct partitionmeshconvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {  
-        auto parent = op->getParentOfType<routing::RoutingCreate>();
-        if (!parent) {
-            return rewriter.notifyMatchFailure(op, "not inside RoutingCreateOp");  
-        }
+        //auto parent = op->getParentOfType<routing::RoutingCreate>();
+        //if (!parent) {
+        //    return rewriter.notifyMatchFailure(op, "not inside RoutingCreateOp");  
+        //}
         rewriter.eraseOp(op);
         return success();
     }
@@ -401,6 +401,33 @@ private:
     LLVMTypeConverter& typeconverter;
 };
 
+//RoutingCreate
+struct RoutingcreatehwiowithtargetConvert : public ConversionPattern {
+    explicit RoutingcreatehwiowithtargetConvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::createhwiowithtarget::getOperationName(),1, ctx), typeconverter(converter) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
+
+//RoutingCreate
+struct RoutingmovedatabyioConvert : public ConversionPattern {
+    explicit RoutingmovedatabyioConvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::movedatabyio::getOperationName(),1, ctx), typeconverter(converter) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
 
 void RoutingLowerPass::getDependentDialects(DialectRegistry &registry) const {
         registry.insert<LLVM::LLVMDialect>();
@@ -410,10 +437,15 @@ RoutingLowerPass::RoutingLowerPass(RoutingTopology& rtopology):rtopology_(rtopol
 void RoutingLowerPass::runOnOperation() {
     auto& ctx = getContext();
     auto module = getOperation();
-    RewritePatternSet patterns(&ctx);
+    RewritePatternSet patterns(&ctx),patternsGlobal(&ctx);
     ConversionTarget target(ctx);
     target.addIllegalDialect<routing::routingdialect>();
     target.addLegalDialect<routinghw::RoutingHWDialect>();
+    target.addLegalOp<routing::RoutingCreate>();
+    target.addLegalOp<routing::YieldOp>();
+    target.addLegalOp<routing::RoutingCreate>();
+    //target.addLegalOp<routing::createhwmesh>();
+    //target.addLegalOp<routing::createdummytensor>();
     target.addIllegalOp<arith::IndexCastOp>();
     //target.addLegalOp<routinghw::TileArrayHandleCreate>();
     LLVMTypeConverter typeconverter(&ctx);
@@ -430,23 +462,39 @@ void RoutingLowerPass::runOnOperation() {
     RoutingPath router(rmgr, dio, wall);
     */
     //RoutingTopology rtopology("Gen2");
-
-    patterns.add<routingcreatebroadcastconvert>(&ctx, typeconverter,rtopology_);
-    patterns.add<routingcreatedataioconvert>(&ctx, typeconverter,rtopology_);
-    patterns.add<routingcreatetilearrayconvert>(&ctx, typeconverter,rtopology_);
-    patterns.add<indexcastconvert>(&ctx, typeconverter);
-    patterns.add<createhwmeshconvert>(&ctx, typeconverter);
-    patterns.add<createdummytensorconvert>(&ctx, typeconverter);
+    
     patterns.add<partitiontensorrconvert>(&ctx, typeconverter);
     patterns.add<partitionmeshconvert>(&ctx, typeconverter);
 
     patterns.add<extract_dataconvert>(&ctx, typeconverter);
     patterns.add<extract_tilesconvert>(&ctx, typeconverter);
-    
-    getOperation()->walk([&](RoutingCreate rop) {
-        if (failed(applyPartialConversion(rop, target, std::move(patterns) ))) {
+
+    patterns.add<RoutingcreatehwiowithtargetConvert>(&ctx, typeconverter);
+    patterns.add<RoutingmovedatabyioConvert>(&ctx, typeconverter);
+
+    //erase hwmesh and dummytensor
+    patternsGlobal.add<routingcreatebroadcastconvert>(&ctx, typeconverter,rtopology_);
+    patternsGlobal.add<routingcreatedataioconvert>(&ctx, typeconverter,rtopology_);
+    patternsGlobal.add<routingcreatetilearrayconvert>(&ctx, typeconverter,rtopology_);
+    patternsGlobal.add<indexcastconvert>(&ctx, typeconverter);
+
+    patternsGlobal.add<createhwmeshconvert>(&ctx, typeconverter);
+    patternsGlobal.add<createdummytensorconvert>(&ctx, typeconverter);
+    //rewrite the ops inside scf::exe
+    ///*
+    module->walk([&](scf::ExecuteRegionOp exec) {
+        //only deal with the routing_memo executeregionop
+        if (!exec->getAttrOfType<StringAttr>("routing_memo")) {
+            return;
+        }
+
+        if (failed(applyPartialConversion(exec, target, std::move(patterns) ))) {
             llvm::outs() << "routing convert failed \n";
         }
-    });
+    });//*/
+    //rewrite the hwmesh and hwdummy tensor
+    if (failed(applyPartialConversion(module, target, std::move(patternsGlobal) ))) {
+        llvm::outs() << "routing convert failed 2--- \n";
+    }
     return;
 }

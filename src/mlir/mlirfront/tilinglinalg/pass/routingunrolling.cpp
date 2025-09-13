@@ -82,7 +82,7 @@ void RoutingUnrollingLowerPass::runOnOperation() {
             dialect->getCanonicalizationPatterns(patterns);
         }
         for (mlir::RegisteredOperationName op : context->getRegisteredOperations()) {
-            op.getCanonicalizationPatterns(patterns, context);
+           // op.getCanonicalizationPatterns(patterns, context);
         }
 
             // Apply the patterns greedily. This will simplify and clean up the IR.
