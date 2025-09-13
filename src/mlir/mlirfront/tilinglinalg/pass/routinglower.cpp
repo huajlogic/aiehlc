@@ -386,6 +386,22 @@ private:
     LLVMTypeConverter& typeconverter;
     RoutingTopology & router_;
 };
+
+//RoutingCreate
+struct RoutingCreateConvert : public ConversionPattern {
+    explicit RoutingCreateConvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::RoutingCreate::getOperationName(),1, ctx), typeconverter(converter) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
+
+
 void RoutingLowerPass::getDependentDialects(DialectRegistry &registry) const {
         registry.insert<LLVM::LLVMDialect>();
 }
@@ -414,6 +430,7 @@ void RoutingLowerPass::runOnOperation() {
     RoutingPath router(rmgr, dio, wall);
     */
     //RoutingTopology rtopology("Gen2");
+
     patterns.add<routingcreatebroadcastconvert>(&ctx, typeconverter,rtopology_);
     patterns.add<routingcreatedataioconvert>(&ctx, typeconverter,rtopology_);
     patterns.add<routingcreatetilearrayconvert>(&ctx, typeconverter,rtopology_);
@@ -425,9 +442,11 @@ void RoutingLowerPass::runOnOperation() {
 
     patterns.add<extract_dataconvert>(&ctx, typeconverter);
     patterns.add<extract_tilesconvert>(&ctx, typeconverter);
-        
-    if (failed(applyPartialConversion(module, target, std::move(patterns) ))) {
-        llvm::outs() << "routing convert failed \n";
-    }
+    
+    getOperation()->walk([&](RoutingCreate rop) {
+        if (failed(applyPartialConversion(rop, target, std::move(patterns) ))) {
+            llvm::outs() << "routing convert failed \n";
+        }
+    });
     return;
 }

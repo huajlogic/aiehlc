@@ -219,7 +219,7 @@ ModuleOp routingmanager::ops_test(MLIRContext* ctx, int totalN) {
 }
 
 ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
-    const int hwrowused= 8, hwcolused=8;
+    const int hwrowused= 2, hwcolused=8;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     //auto func = createroutingfuncByDim(ctx, true);
@@ -372,42 +372,53 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
         auto location = builder.getUnknownLoc();
         // no region creatation
         //
-        auto memo = builder.getStringAttr("memo");
-        auto routingcreateOp = builder.create<routing::RoutingCreate>(builder.getUnknownLoc(),  mesh,tensor, memo, 
-                                                                      [&](OpBuilder &builder1, Location bodyLoc,Value lmesh, Value ltenso) {
-            
-                auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  lmesh, hwsplitnum, "row");
-                IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
-                mlir::StringAttr hw_axis_owner=builder.getStringAttr("row");
-                mlir::StringAttr replicate_on=builder.getStringAttr("col");
-                mlir::StringAttr single_tile_owner=builder.getStringAttr("");
-                auto outTy = builder.getI32Type();
-                auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), ltenso, hwsplitnum, 0,"row","col","");
-                Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
-                Value ub = builder.create<arith::ConstantIndexOp>(location, 10);
-                Value step = builder.create<arith::ConstantIndexOp>(location,1);
-                // create RoutingCreate region op
-                // inside region
-                auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
-                { 
-                    mlir::Value scf_idx = scf.getInductionVar();
-                    //use such format to fix the generic format print issue 
-                    OpBuilder::InsertionGuard guard(builder);
-                    builder.setInsertionPointToStart(scf.getBody()); 
-                    Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);
-                    auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, idx);
-                    auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, idx);
-                    
-                    auto hwio = builder.create<createhwiowithtarget>(builder.getUnknownLoc(), tilelist, "input", "mem");
-                    auto datamov = builder.create<movedatabyio>(builder.getUnknownLoc(), slicetensor, hwio);
-                    //extract tile
-                }
+        auto exec = builder.create<scf::ExecuteRegionOp>(builder.getUnknownLoc(), /*result types*/TypeRange{});
+        exec->setAttr("memo", builder.getStringAttr("Stage A: preprocessing"));
+        //Block *body = builder.createBlock(&exec.getRegion());
+        {
+                OpBuilder::InsertionGuard guard(builder);
+                //fix the upper scope return go inside this region issue
+                builder.setInsertionPointToStart(&exec.getRegion().emplaceBlock());
+                ///*
+                auto memo = builder.getStringAttr("memo");
+                auto routingcreateOp = builder.create<routing::RoutingCreate>(builder.getUnknownLoc(),  mesh,tensor, memo, 
+                                                                        [&](OpBuilder &builder1, Location bodyLoc,Value lmesh, Value ltensor) {
+                
+                    auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, hwsplitnum, "row");
+                    IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
+                    mlir::StringAttr hw_axis_owner=builder.getStringAttr("row");
+                    mlir::StringAttr replicate_on=builder.getStringAttr("col");
+                    mlir::StringAttr single_tile_owner=builder.getStringAttr("");
+                    auto outTy = builder.getI32Type();
+                    auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensor, hwsplitnum, 0,"row","col","");
+                    Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
+                    Value ub = builder.create<arith::ConstantIndexOp>(location, hwsplitnum);
+                    Value step = builder.create<arith::ConstantIndexOp>(location,1);
+                    // create RoutingCreate region op
+                    // inside region
+                    ///*
+                    auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
+                    { 
+                        mlir::Value scf_idx = scf.getInductionVar();
+                        //use such format to fix the generic format print issue 
+                        OpBuilder::InsertionGuard guard(builder);
+                        builder.setInsertionPointToStart(scf.getBody()); 
+                        Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);
+                        auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, idx);
+                        auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, idx);
+                        
+                        auto hwio = builder.create<createhwiowithtarget>(builder.getUnknownLoc(), tilelist, "input", "mem");
+                        auto datamov = builder.create<movedatabyio>(builder.getUnknownLoc(), slicetensor, hwio);
+                        //extract tile
+                    }
+                    //*/
 
-                // use routing.yield to return value finish the yield
-                builder1.create<routing::YieldOp>(bodyLoc);
-            }
-        );
-        
+                    // use routing.yield to return value finish the yield
+                    builder1.create<routing::YieldOp>(bodyLoc);
+                }
+            );//*/
+            builder.create<scf::YieldOp>(builder.getUnknownLoc());
+        };//
        
         return ;//func;
 }
