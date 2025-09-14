@@ -363,14 +363,72 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
-        rewriter.eraseOp(op);
-        //auto datasource = operands[0].getDefiningOp();
-        //auto targetio = operands[1].getDefiningOp<routing::createhwiowithtarget>();
-        //if (datasource= dyn_cast<extract_data>(*datasource)) {
-        //    llvm::outs() << "" << "\n";
-        //} else {
+        
+        auto getRoutingCreateConsArgu = [&] (Value operand) -> int {
+            if (auto barg = dyn_cast<BlockArgument>(operand)) {
+                Operation *parentOp = barg.getOwner()->getParentOp();
+                if (auto create = dyn_cast<routing::RoutingCreate>(parentOp)) {
+                    unsigned idx = barg.getArgNumber();
+                    Value incoming = create->getOperand(idx);
+                    IntegerAttr intAttr;
+                    if (matchPattern(incoming, m_Constant(&intAttr))) {
+                        auto concrete = intAttr.getInt();        // -> 0
+                        return concrete;
+                    }
+                }
+            };
+            return 0;
+        };
+        int round_idx = 0;
+        // get all the op
+        Operation* createhwmesh;
+        Operation* createdummytensor;
+        Operation* partitionmesh;
+        Operation* partitiontensor;
+        Operation* extract_data;
+        Operation* extract_tiles;
+        Operation* createhwiowithtarget = operands[1].getDefiningOp<routing::createhwiowithtarget>();
+        if (extract_data = operands[0].getDefiningOp<routing::extract_data>()) {
+            auto edata_operands = extract_data->getOperands();
+            round_idx = getRoutingCreateConsArgu(edata_operands[1]);
+            llvm::outs() << "slice data round_idx=" << round_idx << "\n";
+            if (!(partitiontensor = extract_data->getOperands()[0].getDefiningOp<routing::partitiontensor>())) {
+                llvm::outs() << " extract_tiles not found return" << "\n";
+                return failure();
+            }
+        } else {
+            llvm::outs() << "pkt merge" << "\n";
+        }
 
-        //}
+        if (!extract_data) {
+            return failure();
+        }
+
+        if (!(createhwiowithtarget = operands[1].getDefiningOp<routing::createhwiowithtarget>())) {
+            llvm::outs() << " createhwiowithtarget not found return" << "\n";
+            return failure();
+        }
+        if (!(extract_tiles = createhwiowithtarget->getOperands()[0].getDefiningOp<routing::extract_tiles>())) {
+            llvm::outs() << " extract_tiles not found return" << "\n";
+            return failure();
+        }
+
+        if (!(partitionmesh = extract_tiles->getOperands()[0].getDefiningOp<routing::partitionmesh>())) {
+            llvm::outs() << " partitionmesh not found return" << "\n";
+            return failure();
+        }
+
+        if (!(createhwmesh = createhwiowithtarget->getOperands()[0].getDefiningOp<routing::createhwmesh>())) {
+            llvm::outs() << " createhwmesh not found return" << "\n";
+            return failure();
+        }
+
+        if (!(createdummytensor = extract_tiles->getOperands()[0].getDefiningOp<routing::createdummytensor>())) {
+            llvm::outs() << " createdummytensor not found return" << "\n";
+            return failure();
+        }
+
+        rewriter.eraseOp(op);
         return success();
     }
 private:
