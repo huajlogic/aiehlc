@@ -45,9 +45,15 @@ find_package(Boost REQUIRED CONFIG)
 message(STATUS "Found Clang ${Clang_PACKAGE_VERSION}")
 message(STATUS "Using ClangConfig.cmake in: ${Clang_DIR}")
 
+message(STATUS "Clang_INCLUDE_DIRS is: ${Clang_INCLUDE_DIRS}")
+message(STATUS "CLANG_INCLUDE_DIRS is: ${CLANG_INCLUDE_DIRS}")
+
+include_directories(${Clang_INCLUDE_DIRS})
 include_directories(${CLANG_INCLUDE_DIRS})
 
 include_directories(${Boost_INCLUDE_DIRS})
+
+include_directories(${LLVM_INSTALL_DIR}/include/)
 
 message(STATUS "Using ${CLANG_INCLUDE_DIRS}")
 

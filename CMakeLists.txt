@@ -48,6 +48,10 @@ execute_process(
 
 
 include_directories(${LLVM_INCLUDE_DIRS})
+include_directories(${LLVM_INSTALL_DIR}/include/)
+
+message(STATUS "LLVM_INCLUDE_DIRS is: ${LLVM_INCLUDE_DIRS}")
+
 #LLVM_DEFINITIONS will cause a conflict with boost::btree, and complain undefined reference to `boost::throw_exception(
 # the reason why that happen is because in LLVM_DEFINITIONS there is a -fno-exceptions ,that will cause the said issue
 #add_definitions(${LLVM_DEFINITIONS})
@@ -60,7 +64,11 @@ find_package(Clang REQUIRED CONFIG)
 message(STATUS "Found Clang ${Clang_PACKAGE_VERSION}")
 message(STATUS "Using ClangConfig.cmake in: ${Clang_DIR}")
 
+message(STATUS "Clang_INCLUDE_DIRS is: ${Clang_INCLUDE_DIRS}")
+message(STATUS "CLANG_INCLUDE_DIRS is: ${CLANG_INCLUDE_DIRS}")
+
 include_directories(${Clang_INCLUDE_DIRS})
+include_directories(${CLANG_INCLUDE_DIRS})
 include_directories("./src/mlir/mlirfront/")
 
 
@@ -141,10 +149,10 @@ target_link_libraries(aiehlc PRIVATE
 			#MLIRGPUToROCDLTransforms
 			#LLVM
     LLVMPasses
-    LLVMNVPTXCodeGen
+    #LLVMNVPTXCodeGen
     #LLVMNVPTXAsmPrinter
-    LLVMAMDGPUCodeGen
-    LLVMAMDGPUAsmParser
+    #LLVMAMDGPUCodeGen
+    #LLVMAMDGPUAsmParser
     dl
 		#LLVM # use this replace ${llvm_libs} to fix the register more than once issue
 )

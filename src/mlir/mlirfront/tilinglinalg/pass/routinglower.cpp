@@ -116,32 +116,6 @@ struct extract_tilesconvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
-        /*
-        auto createioop = dyn_cast<routing::createdataio>(op);
-        auto attr = createioop.getIotypeAttrName();
-        
-        std::ostringstream ostr;
-        ostr << "dio" << ioIdx++;
-        
-        auto dio = router_.createDataIO(ostr.str());
-        auto ctx = getContext();
-        auto output = rewriter.getI32Type();
-      
-        //int shimcol = dio->colpos();
-        //auto routingshimio = rewriter.create<IOShimTileCreate>(op->getLoc(), output, 0, shimcol, ostr.str());
-        //auto bridge = rewriter.create<UnrealizedConversionCastOp>(op->getLoc(), TypeRange{op->getResultTypes()}, ValueRange{tilecreatehandle->getResults()});
-
-        //llvm::outs() << "op number results is " << op->getNumResults()  << " newop number results is " << routingshimio->getNumResults() << " op empty is " << op->use_empty() <<  "\n";
-
-        //rewriter.replaceOp(op, bridge.getResults());
-    
-        //rewriter.eraseOp(op);
-        rewriter.replaceOp(op, routingshimio.getResult());
-        llvm::errs() << "old results  : " << op->getNumResults() << " | "
-             << op->getResult(0).getType()  << "\n";
-        llvm::errs() << "cast results : " << routingshimio->getNumResults() << " | "
-             << routingshimio.getResult().getType() << "\n";
-             */
         rewriter.eraseOp(op);
         return success();
     }
@@ -154,39 +128,6 @@ struct routingcreatetilearrayconvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {
-        /*
-        auto output = rewriter.getI32Type();
-        int cols = 0, rows=0;
-        if (auto indexOp = operands[0].getDefiningOp<mlir::arith::IndexCastOp>()) {
-            Value input = indexOp.getIn();
-            if (auto constOp = input.getDefiningOp<mlir::arith::ConstantOp>()) {
-                if (auto intAttr = constOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
-                    rows = intAttr.getInt();  // Success!
-                }
-            }
-        }
-
-        if (auto indexOp = operands[1].getDefiningOp<mlir::arith::IndexCastOp>()) {
-            Value input = indexOp.getIn();
-            if (auto constOp = input.getDefiningOp<mlir::arith::ConstantOp>()) {
-                if (auto intAttr = constOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
-                    cols = intAttr.getInt();  // Success!
-                }
-            }
-        }
-  
-        //get the number of tiles
-        std::vector<Point> allocatedTiles = router_.ReserveTiles(cols * rows);
-
-        auto tilecreatehandle = rewriter.create<TileArrayHandleCreate>(op->getLoc(), output, "array handle");
-        rewriter.replaceOp(op, tilecreatehandle.getResult());
-
-        rewriter.setInsertionPointAfter(tilecreatehandle); // now insert after handle
-        
-        for(auto x: allocatedTiles) {
-            auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
-        }
-            */
             rewriter.eraseOp(op);
         return success();
     }
@@ -423,6 +364,13 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
         rewriter.eraseOp(op);
+        //auto datasource = operands[0].getDefiningOp();
+        //auto targetio = operands[1].getDefiningOp<routing::createhwiowithtarget>();
+        //if (datasource= dyn_cast<extract_data>(*datasource)) {
+        //    llvm::outs() << "" << "\n";
+        //} else {
+
+        //}
         return success();
     }
 private:
