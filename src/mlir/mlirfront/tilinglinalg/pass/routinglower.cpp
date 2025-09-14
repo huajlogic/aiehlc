@@ -363,7 +363,7 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
-        
+        //function to get blockarg constant
         auto getRoutingCreateConsArgu = [&] (Value operand) -> int {
             if (auto barg = dyn_cast<BlockArgument>(operand)) {
                 Operation *parentOp = barg.getOwner()->getParentOp();
@@ -381,8 +381,8 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         };
         int round_idx = 0;
         // get all the op
-        Operation* createhwmesh;
-        Operation* createdummytensor;
+        routing::createhwmesh createhwmesh;
+        routing::createdummytensor createdummytensor;
         Operation* partitionmesh;
         Operation* partitiontensor;
         Operation* extract_data;
@@ -399,11 +399,9 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         } else {
             llvm::outs() << "pkt merge" << "\n";
         }
-
         if (!extract_data) {
             return failure();
         }
-
         if (!(createhwiowithtarget = operands[1].getDefiningOp<routing::createhwiowithtarget>())) {
             llvm::outs() << " createhwiowithtarget not found return" << "\n";
             return failure();
@@ -412,21 +410,25 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
             llvm::outs() << " extract_tiles not found return" << "\n";
             return failure();
         }
-
         if (!(partitionmesh = extract_tiles->getOperands()[0].getDefiningOp<routing::partitionmesh>())) {
             llvm::outs() << " partitionmesh not found return" << "\n";
             return failure();
         }
-
-        if (!(createhwmesh = createhwiowithtarget->getOperands()[0].getDefiningOp<routing::createhwmesh>())) {
+        if (!(createhwmesh = partitionmesh->getOperands()[0].getDefiningOp<routing::createhwmesh>())) {
             llvm::outs() << " createhwmesh not found return" << "\n";
             return failure();
         }
-
-        if (!(createdummytensor = extract_tiles->getOperands()[0].getDefiningOp<routing::createdummytensor>())) {
+        if (!(createdummytensor = partitiontensor->getOperands()[0].getDefiningOp<routing::createdummytensor>())) {
             llvm::outs() << " createdummytensor not found return" << "\n";
             return failure();
         }
+
+        int col = createhwmesh.getCol();
+        int row = createhwmesh.getRow();
+        auto shape = createdummytensor.getShape();
+
+        int tensor_x = shape[0].cast<mlir::IntegerAttr>().getInt();
+        int tensor_y = shape[1].cast<mlir::IntegerAttr>().getInt();
 
         rewriter.eraseOp(op);
         return success();
