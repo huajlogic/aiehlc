@@ -24,6 +24,9 @@ if(DEFINED LLVM_INSTALL_DIR AND NOT "${LLVM_INSTALL_DIR}" STREQUAL "")
 endif()
 #set(LLVM_ROOT "/path/to/thirdparty/llvm-project/build" CACHE PATH "Root of an LLVM/Clang/MLIR install")
 
+set(LLVM_ROOT_BIN_ARG "")
+list(APPEND LLVM_ROOT_BIN_ARG --llvm-bin "${LLVM_ROOT}/bin/")
+
 if(LLVM_ROOT)
   list(APPEND CMAKE_PREFIX_PATH
        "${LLVM_ROOT}"
@@ -110,21 +113,21 @@ add_library(mlirtestlib ${SOURCE_LIB_FILES} )
 add_custom_target(
 	aiedialectteablegen ALL
   COMMAND ${CMAKE_COMMAND} -E echo "Running custom script for AIE dialect..."
-	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/gen.sh ${MLIR_INC_ARGS}
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMENT "Executing custom script before building AIE Dialect from tablegen"
 )
 
 add_custom_target(
 	aielinkerdialectgen ALL
   COMMAND ${CMAKE_COMMAND} -E echo "Running custom script for linker dialect..."
-	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/mlirlinkrelocate/gen.sh ${MLIR_INC_ARGS}
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/mlirlinkrelocate/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMENT "Executing custom script before building AIE Linker Dialect from tablegen"
 )
 
 add_custom_target(
 	routingtablegen ALL
   COMMAND ${CMAKE_COMMAND} -E echo "Running custom script for routing..."
-	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/routing/gen.sh ${MLIR_INC_ARGS}
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/routing/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMENT "Executing custom script before building Routing Dialect from tablegen"
 )
 
