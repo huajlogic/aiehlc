@@ -358,7 +358,7 @@ private:
 
 //RoutingCreate
 struct RoutingmovedatabyioConvert : public ConversionPattern {
-    explicit RoutingmovedatabyioConvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+    explicit RoutingmovedatabyioConvert(MLIRContext * ctx, LLVMTypeConverter &converter, RoutingTopology & router):
         ConversionPattern(routing::movedatabyio::getOperationName(),1, ctx), typeconverter(converter) {
 
         }
@@ -487,7 +487,7 @@ void RoutingLowerPass::runOnOperation() {
     patterns.add<extract_tilesconvert>(&ctx, typeconverter);
 
     patterns.add<RoutingcreatehwiowithtargetConvert>(&ctx, typeconverter);
-    patterns.add<RoutingmovedatabyioConvert>(&ctx, typeconverter);
+    patterns.add<RoutingmovedatabyioConvert>(&ctx, typeconverter,rtopology_);
 
     //erase hwmesh and dummytensor
     patternsGlobal.add<routingcreatebroadcastconvert>(&ctx, typeconverter,rtopology_);
