@@ -383,11 +383,11 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         // get all the op
         routing::createhwmesh createhwmesh;
         routing::createdummytensor createdummytensor;
-        Operation* partitionmesh;
-        Operation* partitiontensor;
-        Operation* extract_data;
-        Operation* extract_tiles;
-        Operation* createhwiowithtarget = operands[1].getDefiningOp<routing::createhwiowithtarget>();
+        routing::partitiontensor partitiontensor;
+        routing::partitionmesh partitionmesh;
+        routing::extract_data extract_data;
+        routing::extract_tiles extract_tiles;
+        routing::createhwiowithtarget createhwiowithtarget = operands[1].getDefiningOp<routing::createhwiowithtarget>();
         if (extract_data = operands[0].getDefiningOp<routing::extract_data>()) {
             auto edata_operands = extract_data->getOperands();
             round_idx = getRoutingCreateConsArgu(edata_operands[1]);
@@ -429,6 +429,15 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
 
         int tensor_x = shape[0].cast<mlir::IntegerAttr>().getInt();
         int tensor_y = shape[1].cast<mlir::IntegerAttr>().getInt();
+
+        llvm::StringRef split_axis = partitionmesh.getSplitaxis();
+        llvm::StringRef hw_axis_owner = partitiontensor.getHwAxisOwner();
+        llvm::StringRef replicate_on = partitiontensor.getReplicateOn();
+        llvm::StringRef single_tile_owner = partitiontensor.getSingleTileOwner();
+
+        llvm::outs() << "col =" << col << " row=" << row  << " tensor_x=" << tensor_x << " tensor_y=" << tensor_y << "\n";
+        llvm::outs() << "split_axis =" << split_axis << " hw_axis_owner=" << hw_axis_owner  << "\n";
+        llvm::outs() << "replicate_on=" << replicate_on << " single_tile_owner=" << single_tile_owner << "\n";
 
         rewriter.eraseOp(op);
         return success();
