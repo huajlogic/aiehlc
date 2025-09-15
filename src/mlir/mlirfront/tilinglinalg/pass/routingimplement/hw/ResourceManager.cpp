@@ -171,6 +171,35 @@ std::optional<Point> ResourceMgr::freeShimNoc(std::optional<Point> dst) const {
     return std::nullopt;
 }
 
+std::optional<Point> ResourceMgr::freeShimNoc(std::optional<TypeBasedTileLoc> loc) const {
+    int row_offset = 0;
+    if (!loc) {
+        return std::nullopt;
+    }
+    
+    Point abspos = loc->loc;
+    switch(loc->ttype) {
+        case TileType::Core:
+            abspos.r = resource_->absTileRow(TileType::Core, loc->loc.r);
+            break;
+        case TileType::Mem:
+            abspos.r = resource_->absTileRow(TileType::Mem, loc->loc.r);
+            break;
+        case TileType::Shim:
+        case TileType::NocShim:
+        case TileType::PLShim:
+        case TileType::PLNocShim:
+            abspos.r = resource_->absTileRow(TileType::Shim, loc->loc.r);
+             break;
+        case TileType::Unknown:
+            std::cout << "the tile type is unknow check failed, force return" << std::endl;
+            return std::nullopt;
+    }
+    std::cout << " relative row is " << loc->loc.r << " abs row is " << abspos.r << std::endl;
+    auto absdstpoint = std::make_optional(abspos);
+    return freeShimNoc(absdstpoint);
+}
+
 bool ResourceMgr::init(std::unique_ptr<IHwResource> resource, TileType defType)
 {
   

@@ -124,6 +124,7 @@ public:
     bool occupyLink(Point a, Point b, const int ioId,int& portNum, PortDirection& pda, PortDirection& pdb);
     bool releaseLink(Point a, Point b, int ioId,int portNum);
     std::optional<Point> freeShimNoc(std::optional<Point> dst = std::nullopt )const;
+    std::optional<Point> freeShimNoc(std::optional<TypeBasedTileLoc> loc)const;
     RoutingTile&       tile(int r,int c);
     const RoutingTile& tile(int r,int c) const;
     int rows() const;

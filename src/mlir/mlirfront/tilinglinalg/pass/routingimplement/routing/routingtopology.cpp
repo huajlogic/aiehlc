@@ -12,6 +12,18 @@ RoutingTopology::RoutingTopology(std::string gen, std::string name)
 
 // ── createDataIO ────────────────────────────────────────────────────────
 std::shared_ptr<DataIO>
+RoutingTopology::createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc)
+{
+    auto shim = rm_->freeShimNoc();         // optional<TileCoord>
+    if (!shim)
+        throw std::runtime_error("No free shim tile for `" + std::string(dioName) + "`");
+
+    auto dio      = rm_->createDataIO(IOType::Input,shim->r, shim->c, dioName);
+    dataios_.emplace(dio->id(), dio);
+    return dio;
+}
+
+std::shared_ptr<DataIO>
 RoutingTopology::createDataIO(std::string dioName)
 {
     auto shim = rm_->freeShimNoc();         // optional<TileCoord>
