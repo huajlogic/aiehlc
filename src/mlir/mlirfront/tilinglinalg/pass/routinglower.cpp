@@ -439,6 +439,18 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         llvm::outs() << "split_axis =" << split_axis << " hw_axis_owner=" << hw_axis_owner  << "\n";
         llvm::outs() << "replicate_on=" << replicate_on << " single_tile_owner=" << single_tile_owner << "\n";
 
+        std::vector<std::pair<int, int>> tileList;
+        int round = (split_axis == "row") ? row : col;
+        for(int i = 0; i < round; i++) {
+            if (split_axis == "row") {
+                tileList.push_back({round_idx, i});
+                llvm::outs() << " row = " << row + round_idx << "col = " << i << "\n";
+            } else {
+                 tileList.push_back({i, round_idx});
+                llvm::outs() << " row = " << i << "col = " << row + round_idx << "\n";
+            }
+        }
+
         rewriter.eraseOp(op);
         return success();
     }
@@ -499,13 +511,14 @@ void RoutingLowerPass::runOnOperation() {
     patternsGlobal.add<createdummytensorconvert>(&ctx, typeconverter);
     //rewrite the ops inside scf::exe
     ///*
+    FrozenRewritePatternSet frozenPatterns(std::move(patterns));
     module->walk([&](scf::ExecuteRegionOp exec) {
         //only deal with the routing_memo executeregionop
         if (!exec->getAttrOfType<StringAttr>("routing_memo")) {
             return;
         }
 
-        if (failed(applyPartialConversion(exec, target, std::move(patterns) ))) {
+        if (failed(applyPartialConversion(exec, target, frozenPatterns ))) {
             llvm::outs() << "routing convert failed \n";
         }
     });//*/
