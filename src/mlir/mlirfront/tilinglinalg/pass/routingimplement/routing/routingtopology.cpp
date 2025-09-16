@@ -12,27 +12,29 @@ RoutingTopology::RoutingTopology(std::string gen, std::string name)
 
 // ── createDataIO ────────────────────────────────────────────────────────
 std::shared_ptr<DataIO>
-RoutingTopology::createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc)
+RoutingTopology::_createDataIO(std::string dioName, std::optional<Point> shim)
 {
-    auto shim = rm_->freeShimNoc();         // optional<TileCoord>
-    if (!shim)
+    if (!shim) {
         throw std::runtime_error("No free shim tile for `" + std::string(dioName) + "`");
-
+        return nullptr;
+    }
     auto dio      = rm_->createDataIO(IOType::Input,shim->r, shim->c, dioName);
     dataios_.emplace(dio->id(), dio);
     return dio;
 }
 
 std::shared_ptr<DataIO>
+RoutingTopology::createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc)
+{
+    auto shim = rm_->freeShimNoc(loc);         // optional<TileCoord>
+    return _createDataIO(dioName,shim);;
+}
+
+std::shared_ptr<DataIO>
 RoutingTopology::createDataIO(std::string dioName)
 {
     auto shim = rm_->freeShimNoc();         // optional<TileCoord>
-    if (!shim)
-        throw std::runtime_error("No free shim tile for `" + std::string(dioName) + "`");
-
-    auto dio      = rm_->createDataIO(IOType::Input,shim->r, shim->c, dioName);
-    dataios_.emplace(dio->id(), dio);
-    return dio;
+    return _createDataIO(dioName,shim);
 }
 
 std::vector<Point> RoutingTopology::ReserveTiles(int nums,int dioID) {

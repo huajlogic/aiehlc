@@ -359,7 +359,7 @@ private:
 //RoutingCreate
 struct RoutingmovedatabyioConvert : public ConversionPattern {
     explicit RoutingmovedatabyioConvert(MLIRContext * ctx, LLVMTypeConverter &converter, RoutingTopology & router):
-        ConversionPattern(routing::movedatabyio::getOperationName(),1, ctx), typeconverter(converter) {
+        ConversionPattern(routing::movedatabyio::getOperationName(),1, ctx), typeconverter(converter), router_(router) {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
@@ -439,23 +439,38 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         llvm::outs() << "split_axis =" << split_axis << " hw_axis_owner=" << hw_axis_owner  << "\n";
         llvm::outs() << "replicate_on=" << replicate_on << " single_tile_owner=" << single_tile_owner << "\n";
 
-        std::vector<std::pair<int, int>> tileList;
-        int round = (split_axis == "row") ? row : col;
-        for(int i = 0; i < round; i++) {
+        std::vector<Point> tileList;
+        int tileNum = (split_axis == "row") ? col : row;
+        for(int i = 0; i < tileNum; i++) {
             if (split_axis == "row") {
-                tileList.push_back({round_idx, i});
+                tileList.push_back(Point{round_idx, i});
                 llvm::outs() << " row = " << row + round_idx << "col = " << i << "\n";
             } else {
-                 tileList.push_back({i, round_idx});
+                 tileList.push_back(Point{i, round_idx});
                 llvm::outs() << " row = " << i << "col = " << row + round_idx << "\n";
             }
         }
+        // start to convert
+        Point firtTile = tileList[0];
+        std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firtTile});
+        std::cout << "tile type is  TileType::Core , tile relative row is " << firtTile.r <<std::endl;
+        std::ostringstream ostr;
+        ostr << "dio" << ioIdx++;
+        auto dio = router_.createDataIO(ostr.str(), dstcoreloc);
+        //auto ctx = getContext();
+        //auto output = rewriter.getI32Type();
+        ///*
+        int shimcol = dio->colpos();
+        int dioid = dio->id();
+
+        std::cout << "get the shim tile is " << shimcol << std::endl;
 
         rewriter.eraseOp(op);
         return success();
     }
 private:
     LLVMTypeConverter& typeconverter;
+    RoutingTopology & router_;
 };
 
 void RoutingLowerPass::getDependentDialects(DialectRegistry &registry) const {

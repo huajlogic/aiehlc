@@ -27,5 +27,6 @@ private:
     std::shared_ptr<ResourceMgr> rm_;
     std::unordered_map<int, std::shared_ptr<DataIO>> dataios_;
     std::vector<std::shared_ptr<RoutingPath>> paths_;
+    std::shared_ptr<DataIO> _createDataIO(std::string dioName, std::optional<Point> shim);
 
 };
