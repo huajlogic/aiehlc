@@ -31,14 +31,16 @@ int main()
         std::cout << "no free shim" << std::endl;
     }
     //test with tile loc with the tile type info
-    Point d2 = Point{0, 20};
-    std::optional<TypeBasedTileLoc> loc(TypeBasedTileLoc{TileType::Core, d2});
-    std::cout << "tile type is  TileType::Core , tile relative row is " << d2.r <<std::endl;
-    auto f2 = rmgr->freeShimNoc(loc);
-    if (f2) {
-        std::cout << "From the said TypeBasedTileLoc get free col is " << f2->c <<std::endl;
-    } else {
-        std::cout << "no free shim" << std::endl;
+    for (int i = 0; i < 3; i++) {
+        Point d2 = Point{0 + i, 20};
+        std::optional<TypeBasedTileLoc> loc(TypeBasedTileLoc{TileType::Core, d2});
+        std::cout << "tile type is  TileType::Core , tile relative row is " << d2.r <<std::endl;
+        auto f2 = rmgr->freeShimNoc(loc);
+        if (f2) {
+            std::cout << "From the said TypeBasedTileLoc get free col is " << f2->c <<std::endl;
+        } else {
+            std::cout << "no free shim" << std::endl;
+        }
     }
 
     Point shimPoint = *free_shim, memtile1 = {1, free_shim->c};

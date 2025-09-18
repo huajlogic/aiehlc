@@ -12,22 +12,34 @@ RoutingTopology::RoutingTopology(std::string gen, std::string name)
 
 // ── createDataIO ────────────────────────────────────────────────────────
 std::shared_ptr<DataIO>
-RoutingTopology::_createDataIO(std::string dioName, std::optional<Point> shim)
+RoutingTopology::_createDataIO(std::string dioName, std::optional<Point> shim, DMADIRECTION direction, int channel)
 {
     if (!shim) {
         throw std::runtime_error("No free shim tile for `" + std::string(dioName) + "`");
         return nullptr;
     }
-    auto dio      = rm_->createDataIO(IOType::Input,shim->r, shim->c, dioName);
+    auto dio      = rm_->createDataIO(IOType::Input,shim->r, shim->c, direction, channel, dioName);
     dataios_.emplace(dio->id(), dio);
     return dio;
 }
 
 std::shared_ptr<DataIO>
-RoutingTopology::createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc)
+RoutingTopology::createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc, int dioId, DMADIRECTION direct)
 {
-    auto shim = rm_->freeShimNoc(loc);         // optional<TileCoord>
-    return _createDataIO(dioName,shim);;
+    //std::optional<FoundDmaSlot> ResourceMgr::freeShimNoc(std::optional<TypeBasedTileLoc> ioPaireddstTileloc,
+    //                                                 DMADIRECTION direct,
+    //                                                 int requesterIoId)
+
+    /*
+    struct FoundDmaSlot {
+    DMADIRECTION direct;
+    Point loc;
+    int channel;
+    */
+
+    std::optional<FoundDmaSlot> foundDmaSlot = rm_->freeShimNoc(loc, direct, dioId);// optional<TileCoord>
+    auto shimpoint = std::make_optional<Point>(foundDmaSlot->loc);
+    return _createDataIO(dioName, shimpoint, foundDmaSlot->direct, foundDmaSlot->channel);;
 }
 
 std::shared_ptr<DataIO>

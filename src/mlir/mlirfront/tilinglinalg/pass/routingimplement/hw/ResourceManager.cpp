@@ -12,8 +12,8 @@
 // ── global DataIO id init ──
 std::atomic<int> DataIO::next_{0};
 
-DataIO::DataIO(IOType tp, int r, int c, std::string nm, std::string cmt)
-    : id_(++next_), rowpos_(r), colpos_(c), type_(tp), name_(std::move(nm)), comment_(std::move(cmt)) {}
+DataIO::DataIO(IOType tp, int r, int c, DMADIRECTION dir, int channel, std::string nm, std::string cmt)
+    : id_(++next_), rowpos_(r), colpos_(c), type_(tp), dmaDirection_(dir), channel_(channel), name_(std::move(nm)), comment_(std::move(cmt)) {}
 // ──────────────────────────────────────────────────────────────
 // RoutingTile impl
 // ──────────────────────────────────────────────────────────────
@@ -81,13 +81,26 @@ ResourceMgr::ResourceMgr(std::unique_ptr<IHwResource> resource, TileType defType
         }
     }
     resource_ = std::move(resource);
+    InitSHIMNocList();
+}
+
+void ResourceMgr::InitSHIMNocList() {
+    auto& shimnocs = resource_->getShimNoc();
+    for (auto x:shimnocs) {
+        addShimTile(std::make_shared<ShimTile>(0, x, 2, 2));
+    }
+}
+
+void ResourceMgr::addShimTile(std::shared_ptr<ShimTile> shim) {
+       TileCoord key{shim->row(), shim->col()};
+       shimTiles_[key] = std::move(shim);
 }
 
 RoutingTile& ResourceMgr::tile(int r,int c){ return tiles_[r][c]; }
 const RoutingTile& ResourceMgr::tile(int r,int c) const { return tiles_[r][c]; }
 
-std::shared_ptr<DataIO> ResourceMgr::createDataIO(IOType tp, int r, int c, std::string nm, std::string cmt) {
-    std::shared_ptr<DataIO> dataioptr = std::make_shared<DataIO>(tp, r, c, nm, cmt);
+std::shared_ptr<DataIO> ResourceMgr::createDataIO(IOType tp, int r, int c, DMADIRECTION dir, int channel, std::string nm, std::string cmt) {
+    std::shared_ptr<DataIO> dataioptr = std::make_shared<DataIO>(tp, r, c, dir, channel, nm, cmt);
     DataIOMap[dataioptr->id()] = dataioptr;
     TileType tt =resource_->tileType(r, c);
     if (tt == TileType::Shim) {
@@ -137,6 +150,34 @@ int ResourceMgr::rows() const {
 }
 int ResourceMgr::cols() const {
     return resource_->getColumns();
+}
+//-------------------------
+std::optional<FoundDmaSlot> ResourceMgr::freeShimNoc(std::optional<TypeBasedTileLoc> ioPaireddstTileloc,
+                                                     DMADIRECTION direct,
+                                                     int requesterIoId) const {
+    auto iopaireddst = ioPaireddstTileloc->loc;
+    std::optional<ShimTile> findShimTile;
+    for (const auto& kv : shimTiles_) {
+        ShimTile& t = *(kv.second);
+        if (requesterIoId >= 0 && t.isReserved() && t.getReservedByIoId() != requesterIoId)
+            continue;
+        if ( t.hasAnyFreeChannelForEngine(direct)) {
+            auto c = t.col();
+            uint32_t new_distance = std::abs((int)c - (int)iopaireddst.c);
+            uint32_t old_distance = std::abs((int)findShimTile->col() - (int)iopaireddst.c);
+            if (!findShimTile || (new_distance < old_distance)) {
+                findShimTile = std::make_optional<ShimTile>(t);
+            }
+        }
+    }
+
+    if (findShimTile) {
+        std::optional<int> ch = findShimTile->allocate(direct, -1 , requesterIoId);
+        if (ch) {
+           return std::make_optional <FoundDmaSlot> (FoundDmaSlot{direct, Point{0, findShimTile->col()}, static_cast <int> (*ch)});
+        }
+    }
+    return  std::nullopt;
 }
 // ---------- freeShim 例子 ----------
 std::optional<Point> ResourceMgr::freeShimNoc(std::optional<Point> dst) const {
