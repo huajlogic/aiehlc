@@ -351,6 +351,7 @@ public:
     ResourceMgr(std::unique_ptr<IHwResource> resource, TileType defaultType = TileType::Core);
     static bool     init(std::unique_ptr<IHwResource> resource, TileType defType = TileType::Core);
     static std::shared_ptr<ResourceMgr> instance();
+    uint32_t allocdioid();
 
     std::shared_ptr<DataIO> createDataIO(IOType tp, int r=0, int c=0, DMADIRECTION dir = DMADIRECTION::MM2S, int channel =0,std::string nm="", std::string cmt="");
     bool linkAvailable(Point a, Point b, int& portNum) const;
@@ -392,6 +393,7 @@ private:
 
     void addShimTile(std::shared_ptr<ShimTile> shim);
 
+    uint32_t lastdioid;
     std::vector<std::vector<RoutingTile>> tiles_;
     std::unordered_map<TileCoord, std::shared_ptr<ShimTile>, TileCoordHasher> shimTiles_;
      

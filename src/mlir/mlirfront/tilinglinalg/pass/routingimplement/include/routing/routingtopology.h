@@ -14,7 +14,7 @@ class RoutingTopology {
 public:
     explicit RoutingTopology(std::string gen, std::string name="");
     std::shared_ptr<DataIO> createDataIO(std::string dioName);
-    std::shared_ptr<DataIO> createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc, int dioId = 0, DMADIRECTION direct=DMADIRECTION::MM2S);
+    std::shared_ptr<DataIO> createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc, DMADIRECTION direct=DMADIRECTION::MM2S);
     std::optional<std::shared_ptr<const RoutingPath>> createPath(int dioID, std::vector<Point> dsttiles);
     const std::vector<std::shared_ptr<RoutingPath>>& paths() const { return paths_; }
     std::vector<Point> ReserveTiles(int nums,int dioID=-1);

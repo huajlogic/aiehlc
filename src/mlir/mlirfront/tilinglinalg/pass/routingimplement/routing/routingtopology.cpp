@@ -24,7 +24,7 @@ RoutingTopology::_createDataIO(std::string dioName, std::optional<Point> shim, D
 }
 
 std::shared_ptr<DataIO>
-RoutingTopology::createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc, int dioId, DMADIRECTION direct)
+RoutingTopology::createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc,DMADIRECTION direct)
 {
     //std::optional<FoundDmaSlot> ResourceMgr::freeShimNoc(std::optional<TypeBasedTileLoc> ioPaireddstTileloc,
     //                                                 DMADIRECTION direct,
@@ -36,7 +36,7 @@ RoutingTopology::createDataIO(std::string dioName, std::optional<TypeBasedTileLo
     Point loc;
     int channel;
     */
-
+    auto dioId = rm_->allocdioid();
     std::optional<FoundDmaSlot> foundDmaSlot = rm_->freeShimNoc(loc, direct, dioId);// optional<TileCoord>
     auto shimpoint = std::make_optional<Point>(foundDmaSlot->loc);
     return _createDataIO(dioName, shimpoint, foundDmaSlot->direct, foundDmaSlot->channel);;

@@ -456,14 +456,14 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         std::cout << "tile type is  TileType::Core , tile relative row is " << firtTile.r <<std::endl;
         std::ostringstream ostr;
         ostr << "dio" << ioIdx++;
-        auto dio = router_.createDataIO(ostr.str(), dstcoreloc);
+        auto dio = router_.createDataIO(ostr.str(), dstcoreloc,  DMADIRECTION::MM2S);
         //auto ctx = getContext();
         //auto output = rewriter.getI32Type();
         ///*
         int shimcol = dio->colpos();
         int dioid = dio->id();
 
-        std::cout << "get the shim tile is " << shimcol << std::endl;
+        std::cout << "get the shim tile is " << shimcol << " channel is " << dio->channel()  << " IOID is " << dio->id() << std::endl;
 
         rewriter.eraseOp(op);
         return success();

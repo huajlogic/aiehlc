@@ -81,6 +81,7 @@ ResourceMgr::ResourceMgr(std::unique_ptr<IHwResource> resource, TileType defType
         }
     }
     resource_ = std::move(resource);
+    lastdioid = 0;
     InitSHIMNocList();
 }
 
@@ -94,6 +95,10 @@ void ResourceMgr::InitSHIMNocList() {
 void ResourceMgr::addShimTile(std::shared_ptr<ShimTile> shim) {
        TileCoord key{shim->row(), shim->col()};
        shimTiles_[key] = std::move(shim);
+}
+
+uint32_t ResourceMgr::allocdioid() {
+    return ++lastdioid;
 }
 
 RoutingTile& ResourceMgr::tile(int r,int c){ return tiles_[r][c]; }
@@ -156,18 +161,23 @@ std::optional<FoundDmaSlot> ResourceMgr::freeShimNoc(std::optional<TypeBasedTile
                                                      DMADIRECTION direct,
                                                      int requesterIoId) const {
     auto iopaireddst = ioPaireddstTileloc->loc;
-    std::optional<ShimTile> findShimTile;
+    std::shared_ptr<ShimTile> findShimTile;
     for (const auto& kv : shimTiles_) {
         ShimTile& t = *(kv.second);
         if (requesterIoId >= 0 && t.isReserved() && t.getReservedByIoId() != requesterIoId)
             continue;
         if ( t.hasAnyFreeChannelForEngine(direct)) {
+            if (!findShimTile) {
+                findShimTile = kv.second;
+                continue;
+            }
             auto c = t.col();
             uint32_t new_distance = std::abs((int)c - (int)iopaireddst.c);
             uint32_t old_distance = std::abs((int)findShimTile->col() - (int)iopaireddst.c);
-            if (!findShimTile || (new_distance < old_distance)) {
-                findShimTile = std::make_optional<ShimTile>(t);
-            }
+            if (new_distance < old_distance) {
+                findShimTile = kv.second;
+                continue;
+            } 
         }
     }
 
