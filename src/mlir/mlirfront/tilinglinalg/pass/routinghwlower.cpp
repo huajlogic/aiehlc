@@ -133,6 +133,86 @@ private:
     RoutingTopology & router_;
 };
 
+struct routingRoutingCreatePattern: public ConversionPattern {
+    explicit routingRoutingCreatePattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
+        ConversionPattern(routing::RoutingCreate::getOperationName(), 1, ctx), typeconverter(converter), router_(router) {
+
+    }
+    LogicalResult matchAndRewrite(Operation *op , ArrayRef<Value> operands, ConversionPatternRewriter& rewriter) const override{
+         // Preconditions for the simple lowering.
+        //rewriter.eraseOp(op);
+        //return success();
+        if (op->getNumRegions() != 1)
+        return rewriter.notifyMatchFailure(op, "expected exactly one region");
+        Region &region = op->getRegion(0);
+        if (!llvm::hasSingleElement(region))
+        return rewriter.notifyMatchFailure(op, "expected single-block region");
+        Block &body = region.front();
+
+        // Expect one region argument that mirrors the operand `(scf_idx = %c0_i32 : i32)`.
+        if (body.getNumArguments() != 1 || op->getNumOperands() != 1)
+        return rewriter.notifyMatchFailure(op, "expected 1 operand and 1 region arg");
+
+        // Make sure we have one result.
+        if (op->getNumResults() != 1)
+        return rewriter.notifyMatchFailure(op, "expected single result");
+
+        // Replace all uses of the region argument with the op's operand.
+        Value idx = op->getOperand(0);
+        BlockArgument barg = body.getArgument(0);
+        rewriter.replaceAllUsesWith(barg, idx);
+
+        
+
+        Location loc = op->getLoc();
+        Block *parent = op->getBlock();
+
+        // Insert "{\n" before the op.
+        rewriter.setInsertionPoint(op);
+        auto open = rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr("{\n"));
+
+      
+        // Inline the region body right before the original op.
+        // After this, the ops from the region are moved into `parent` before `op`.
+        Block *after = rewriter.splitBlock(parent, Block::iterator(op));
+        rewriter.inlineRegionBefore(region, *parent->getParent(), Region::iterator(after));
+
+        rewriter.eraseOp(op);
+        return success();
+
+        // The inlined block should end with your region terminator (e.g., routing::YieldOp).
+        // Grab its operand (the region result), erase the terminator.
+        Operation *beforeOp = op->getPrevNode(); // last op of inlined body
+        if (!beforeOp)
+        return rewriter.notifyMatchFailure(op, "empty region body after inlining");
+
+        // Adjust this cast to your actual terminator type.
+        auto yield = dyn_cast<routing::YieldOp>(beforeOp);
+        if (!yield)
+        return rewriter.notifyMatchFailure(op, "expected routing yield terminator");
+
+        // Single result expected; take it.
+        if (yield->getNumOperands() != 1)
+        return rewriter.notifyMatchFailure(op, "yield must return one value");
+
+        Value regionResult = yield->getOperand(0);
+        rewriter.eraseOp(yield);
+
+        // Insert "}\n" at the original op position (now after the inlined body).
+        rewriter.setInsertionPoint(op);
+        rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr("}\n"));
+
+        // Replace the original op's result with the value produced in the region.
+        rewriter.replaceOp(op, regionResult);
+
+        return success();
+    }
+
+private:
+    LLVMTypeConverter& typeconverter;
+    RoutingTopology & router_;
+};
+
 struct IOShimTileCreatepattern: public ConversionPattern {
     explicit IOShimTileCreatepattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
         ConversionPattern(routinghw::IOShimTileCreate::getOperationName(), 1, ctx), typeconverter(converter), router_(router) {
@@ -177,6 +257,20 @@ private:
     LLVMTypeConverter& typeconverter;
     RoutingTopology & router_;
 };
+
+struct arithconstantconvert : public ConversionPattern {
+    explicit arithconstantconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(arith::ConstantOp::getOperationName(),1, ctx), typeconverter(converter) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
+
 void declareAieTileFunction(mlir::ModuleOp module) {
   mlir::MLIRContext *context = module.getContext();
   mlir::OpBuilder builder(context);
@@ -218,7 +312,9 @@ void RoutingHWLowerPass::runOnOperation() {
     RewritePatternSet patterns(&ctx);
     ConversionTarget target(ctx);
     LLVMTypeConverter typeConverter(&ctx);
-    //target.addLegalDialect<mlir::LLVM::LLVMDialect>();
+    target.addLegalDialect<mlir::LLVM::LLVMDialect>();
+    //target.addIllegalOp<arith::ConstantOp>();
+    //target.addIllegalOp<routing::RoutingCreate>();
     target.addIllegalOp<routinghw::EnableExtToAieShimPort>();
     target.addIllegalOp<routinghw::ConnectStreamSingleSwitchPort>();
     target.addIllegalOp<routinghw::TileCreate>();
@@ -240,6 +336,8 @@ void RoutingHWLowerPass::runOnOperation() {
     patterns.add<TileCreatepattern>(&ctx,typeConverter,rtopology_);
     patterns.add<IOShimTileCreatepattern>(&ctx,typeConverter,rtopology_);
     patterns.add<TileArrayHandleCreatepattern>(&ctx,typeConverter,rtopology_);
+    patterns.add<routingRoutingCreatePattern>(&ctx,typeConverter,rtopology_);
+    //patterns.add<arithconstantconvert>(&ctx,typeConverter);
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
         llvm::outs() << "applyPartialConversion failed\n";
     }

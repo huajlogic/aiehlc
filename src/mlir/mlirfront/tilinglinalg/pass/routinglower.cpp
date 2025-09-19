@@ -143,6 +143,19 @@ private:
     LLVMTypeConverter& typeconverter;
 };
 
+struct arithconstantconvert : public ConversionPattern {
+    explicit arithconstantconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(arith::ConstantOp::getOperationName(),1, ctx), typeconverter(converter) {
+
+        }
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
+        rewriter.eraseOp(op);
+        return success();
+    }
+private:
+    LLVMTypeConverter& typeconverter;
+};
+
 struct createhwmeshconvert : public ConversionPattern {
     explicit createhwmeshconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
         ConversionPattern(routing::createhwmesh::getOperationName(),1, ctx), typeconverter(converter) {
@@ -628,7 +641,6 @@ void RoutingLowerPass::runOnOperation() {
     target.addLegalDialect<routinghw::RoutingHWDialect>();
     target.addLegalOp<routing::RoutingCreate>();
     target.addLegalOp<routing::YieldOp>();
-    target.addLegalOp<routing::RoutingCreate>();
     //target.addLegalOp<routing::createhwmesh>();
     //target.addLegalOp<routing::createdummytensor>();
     target.addIllegalOp<arith::IndexCastOp>();
@@ -656,12 +668,15 @@ void RoutingLowerPass::runOnOperation() {
 
     patterns.add<RoutingcreatehwiowithtargetConvert>(&ctx, typeconverter);
     patterns.add<RoutingmovedatabyioConvert>(&ctx, typeconverter,rtopology_);
+    //patterns.add<arithconstantconvert>(&ctx, typeconverter);
 
     //erase hwmesh and dummytensor
     patternsGlobal.add<routingcreatebroadcastconvert>(&ctx, typeconverter,rtopology_);
     patternsGlobal.add<routingcreatedataioconvert>(&ctx, typeconverter,rtopology_);
     patternsGlobal.add<routingcreatetilearrayconvert>(&ctx, typeconverter,rtopology_);
     patternsGlobal.add<indexcastconvert>(&ctx, typeconverter);
+    //patternsGlobal.add<arithconstantconvert>(&ctx, typeconverter);
+    
 
     patternsGlobal.add<createhwmeshconvert>(&ctx, typeconverter);
     patternsGlobal.add<createdummytensorconvert>(&ctx, typeconverter);

@@ -215,7 +215,7 @@ ModuleOp routingmanager::ops_test(MLIRContext* ctx, int totalN) {
 }
 
 ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
-    const int hwrowused= 2, hwcolused=8;
+    const int hwrowused= 1, hwcolused=8;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     //auto func = createroutingfuncByDim(ctx, true);
@@ -400,12 +400,12 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                         auto routingcreateOp = builder.create<routing::RoutingCreate>(builder.getUnknownLoc(), idx, memo, [&](OpBuilder &builder1, Location bodyLoc,Value sidx) { 
                             //use such format to fix the generic format print issue 
                             
-                            auto slicetensor = builder.create<extract_data>(builder.getUnknownLoc(), rowtensor, sidx);
-                            auto tilelist = builder.create<extract_tiles>(builder.getUnknownLoc(), patitionmesh, sidx);
+                            auto slicetensor = builder1.create<extract_data>(builder1.getUnknownLoc(), rowtensor, sidx);
+                            auto tilelist = builder1.create<extract_tiles>(builder1.getUnknownLoc(), patitionmesh, sidx);
                             
-                            auto hwio = builder.create<createhwiowithtarget>(builder.getUnknownLoc(), tilelist, "input", "mem");
-                            auto datamov = builder.create<movedatabyio>(builder.getUnknownLoc(), slicetensor, hwio);
-                            builder1.create<routing::YieldOp>(bodyLoc);
+                            auto hwio = builder1.create<createhwiowithtarget>(builder1.getUnknownLoc(), tilelist, "input", "mem2");
+                            auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), slicetensor, hwio);
+                            builder1.create<routing::YieldOp>(builder1.getUnknownLoc());
                         });
                         //extract tile
                     }
