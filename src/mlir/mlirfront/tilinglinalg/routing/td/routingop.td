@@ -194,8 +194,8 @@ def Routing_YieldOp : routingop<"yield", [Terminator]> {
   }];
 
   //let arguments = (ins AnyType:$value);
-  let arguments = (ins);
-  let results = (outs); // No results
+  //let arguments = (ins);
+  //let results = (outs); // No results
 }
 
 def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
@@ -210,7 +210,7 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
   				   I32:$scf_idx,
 				   StrAttr:$Memo
 				   );
-  let results = (outs I32:$output);
+  //let results = (outs I32:$output);
 
   let regions = (region SizedRegion<1>:$body);
  
@@ -234,7 +234,7 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
       bodyRegion->push_back(bodyBlock);
       bodyBlock->addArgument(scf_idx.getType(), scf_idx.getLoc());
 
-      // 3. 调用用户提供的 lambda 来填充 Block
+      // 3. use the lambda to fill Block
       OpBuilder::InsertionGuard guard($_builder);
       $_builder.setInsertionPointToStart(bodyBlock);
       bodyBuilder($_builder, 
@@ -258,7 +258,7 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
   }];
 */
   // 
-  //let assemblyFormat = [{ `(` $input `)` attr-dict `->` type($output) region $body
+  //let assemblyFormat = [{ `(` $input `)` attr-dict `->` region $body
   //}];
   let hasCustomAssemblyFormat = 1;
 }

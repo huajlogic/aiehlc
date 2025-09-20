@@ -143,19 +143,26 @@ struct routingRoutingCreatePattern: public ConversionPattern {
         //rewriter.eraseOp(op);
         //return success();
         if (op->getNumRegions() != 1)
-        return rewriter.notifyMatchFailure(op, "expected exactly one region");
+            return rewriter.notifyMatchFailure(op, "expected exactly one region");
+
         Region &region = op->getRegion(0);
         if (!llvm::hasSingleElement(region))
-        return rewriter.notifyMatchFailure(op, "expected single-block region");
+            return rewriter.notifyMatchFailure(op, "expected single-block region");
+
         Block &body = region.front();
+
+        auto yieldOp = llvm::dyn_cast<routing::YieldOp>(body.getTerminator());
+        if (!yieldOp) {
+            return rewriter.notifyMatchFailure(op, "region must terminate with a my.yield op");
+        }
 
         // Expect one region argument that mirrors the operand `(scf_idx = %c0_i32 : i32)`.
         if (body.getNumArguments() != 1 || op->getNumOperands() != 1)
-        return rewriter.notifyMatchFailure(op, "expected 1 operand and 1 region arg");
+            return rewriter.notifyMatchFailure(op, "expected 1 operand and 1 region arg");
 
         // Make sure we have one result.
         if (op->getNumResults() != 1)
-        return rewriter.notifyMatchFailure(op, "expected single result");
+            return rewriter.notifyMatchFailure(op, "expected single result");
 
         // Replace all uses of the region argument with the op's operand.
         Value idx = op->getOperand(0);
@@ -178,6 +185,7 @@ struct routingRoutingCreatePattern: public ConversionPattern {
         rewriter.inlineRegionBefore(region, *parent->getParent(), Region::iterator(after));
 
         rewriter.eraseOp(op);
+        rewriter.eraseOp(yieldOp);
         return success();
 
         // The inlined block should end with your region terminator (e.g., routing::YieldOp).

@@ -109,7 +109,7 @@ void routing::RoutingCreate::print(OpAsmPrinter &p) {
 
   // Print the result type.
   p << " -> ";
-  p.printType(getResult().getType());
+  //p.printType(getResult().getType());
   
   // Use printRegion to print the region.
   p.printRegion(getBody(), /*printEntryBlockArgs=*/true, 
