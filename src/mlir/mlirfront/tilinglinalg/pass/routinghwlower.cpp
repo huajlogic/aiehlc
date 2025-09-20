@@ -140,78 +140,51 @@ struct routingRoutingCreatePattern: public ConversionPattern {
     }
     LogicalResult matchAndRewrite(Operation *op , ArrayRef<Value> operands, ConversionPatternRewriter& rewriter) const override{
          // Preconditions for the simple lowering.
-        //rewriter.eraseOp(op);
-        //return success();
-        if (op->getNumRegions() != 1)
-            return rewriter.notifyMatchFailure(op, "expected exactly one region");
+         auto getRoutingCreateOprandConst = [&] (Value operand) -> int {
+            IntegerAttr intAttr;
+            if (matchPattern(operand, m_Constant(&intAttr))) {
+                auto concrete = intAttr.getInt();        // -> 0
+                return concrete;
+            }
+            return 0;
+        };
+        auto loc = op->getLoc();
 
-        Region &region = op->getRegion(0);
-        if (!llvm::hasSingleElement(region))
-            return rewriter.notifyMatchFailure(op, "expected single-block region");
+    // 1. Cast the generic 'Operation*' to your specific op type.
+        auto routingOp = cast<routing::RoutingCreate>(op);
 
-        Block &body = region.front();
-
-        auto yieldOp = llvm::dyn_cast<routing::YieldOp>(body.getTerminator());
-        if (!yieldOp) {
-            return rewriter.notifyMatchFailure(op, "region must terminate with a my.yield op");
+        // 2. Get the single block from the op's region.
+        mlir::Region &region = routingOp.getRegion();
+        if (!llvm::hasSingleElement(region)) {
+            return rewriter.notifyMatchFailure(op, "expected a single block in the region");
         }
+        mlir::Block &bodyBlock = region.front();
 
-        // Expect one region argument that mirrors the operand `(scf_idx = %c0_i32 : i32)`.
-        if (body.getNumArguments() != 1 || op->getNumOperands() != 1)
-            return rewriter.notifyMatchFailure(op, "expected 1 operand and 1 region arg");
+        // 3. Find the terminator (yield) to get the results from the body.
+        auto yieldOp = dyn_cast<routing::YieldOp>(bodyBlock.getTerminator());
+        if (!yieldOp) {
+            return rewriter.notifyMatchFailure(op, "region must end with a routing::YieldOp");
+        }
+        // These are the values that will replace the results of the routingOp.
+        ValueRange yieldedValues = yieldOp.getODSOperands(0);
 
-        // Make sure we have one result.
-        if (op->getNumResults() != 1)
-            return rewriter.notifyMatchFailure(op, "expected single result");
-
-        // Replace all uses of the region argument with the op's operand.
-        Value idx = op->getOperand(0);
-        BlockArgument barg = body.getArgument(0);
-        rewriter.replaceAllUsesWith(barg, idx);
-
+        //rewriter.setInsertionPoint(op);
         
-
-        Location loc = op->getLoc();
-        Block *parent = op->getBlock();
-
-        // Insert "{\n" before the op.
-        rewriter.setInsertionPoint(op);
-        auto open = rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr("{\n"));
-
-      
-        // Inline the region body right before the original op.
-        // After this, the ops from the region are moved into `parent` before `op`.
-        Block *after = rewriter.splitBlock(parent, Block::iterator(op));
-        rewriter.inlineRegionBefore(region, *parent->getParent(), Region::iterator(after));
-
-        rewriter.eraseOp(op);
-        rewriter.eraseOp(yieldOp);
-        return success();
-
-        // The inlined block should end with your region terminator (e.g., routing::YieldOp).
-        // Grab its operand (the region result), erase the terminator.
-        Operation *beforeOp = op->getPrevNode(); // last op of inlined body
-        if (!beforeOp)
-        return rewriter.notifyMatchFailure(op, "empty region body after inlining");
-
-        // Adjust this cast to your actual terminator type.
-        auto yield = dyn_cast<routing::YieldOp>(beforeOp);
-        if (!yield)
-        return rewriter.notifyMatchFailure(op, "expected routing yield terminator");
-
-        // Single result expected; take it.
-        if (yield->getNumOperands() != 1)
-        return rewriter.notifyMatchFailure(op, "yield must return one value");
-
-        Value regionResult = yield->getOperand(0);
-        rewriter.eraseOp(yield);
-
-        // Insert "}\n" at the original op position (now after the inlined body).
-        rewriter.setInsertionPoint(op);
+        auto idx = getRoutingCreateOprandConst(operands[0]);
+        std::ostringstream ostr;
+        ostr << "\n{ round is " << idx << " -----------";
+        auto open = rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr(ostr.str()));
+        // 4. Inline the body, remapping the region arguments to the NEW operands.
+        // This is the key step: we use the 'operands' array passed into this function.
+        rewriter.inlineBlockBefore(&bodyBlock, op, operands);
         rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr("}\n"));
 
-        // Replace the original op's result with the value produced in the region.
-        rewriter.replaceOp(op, regionResult);
+        // 5. Replace the original op with the values from the yield.
+        // The conversion framework requires you to either erase or replace the original op.
+        rewriter.replaceOp(op, yieldedValues);
+
+        // 6. Clean up the now-obsolete yield op.
+        rewriter.eraseOp(yieldOp);
 
         return success();
     }
@@ -345,7 +318,7 @@ void RoutingHWLowerPass::runOnOperation() {
     patterns.add<IOShimTileCreatepattern>(&ctx,typeConverter,rtopology_);
     patterns.add<TileArrayHandleCreatepattern>(&ctx,typeConverter,rtopology_);
     patterns.add<routingRoutingCreatePattern>(&ctx,typeConverter,rtopology_);
-    //patterns.add<arithconstantconvert>(&ctx,typeConverter);
+    patterns.add<arithconstantconvert>(&ctx,typeConverter);
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
         llvm::outs() << "applyPartialConversion failed\n";
     }

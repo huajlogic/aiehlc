@@ -109,7 +109,7 @@ void routing::RoutingCreate::print(OpAsmPrinter &p) {
 
   // Print the result type.
   p << " -> ";
-  //p.printType(getResult().getType());
+  p.printType(getResult().getType());
   
   // Use printRegion to print the region.
   p.printRegion(getBody(), /*printEntryBlockArgs=*/true, 
@@ -215,7 +215,7 @@ ModuleOp routingmanager::ops_test(MLIRContext* ctx, int totalN) {
 }
 
 ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
-    const int hwrowused= 1, hwcolused=8;
+    const int hwrowused= 4, hwcolused=8;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     //auto func = createroutingfuncByDim(ctx, true);
@@ -255,7 +255,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
                                                                                                 io_direction}));
     //*/
     createroutingfuncByDim(builder, ctx, mesh, tensor, hwrowused, "row");
-    //createroutingfuncByDim(builder, ctx, mesh, tensor, hwcolused, "col");
+    createroutingfuncByDim(builder, ctx, mesh, tensor, hwcolused, "col");
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(main);
     llvm::errs() << m;
@@ -396,17 +396,26 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                         builder.setInsertionPointToStart(scf.getBody());
                         auto memo = builder.getStringAttr("memo");
                         mlir::Value scf_idx = scf.getInductionVar();
+                        
                         Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);
+                        
                         auto routingcreateOp = builder.create<routing::RoutingCreate>(builder.getUnknownLoc(), idx, memo, [&](OpBuilder &builder1, Location bodyLoc,Value sidx) { 
                             //use such format to fix the generic format print issue 
-                            
+                            ///*
                             auto slicetensor = builder1.create<extract_data>(builder1.getUnknownLoc(), rowtensor, sidx);
                             auto tilelist = builder1.create<extract_tiles>(builder1.getUnknownLoc(), patitionmesh, sidx);
                             
                             auto hwio = builder1.create<createhwiowithtarget>(builder1.getUnknownLoc(), tilelist, "input", "mem2");
                             auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), slicetensor, hwio);
-                            builder1.create<routing::YieldOp>(builder1.getUnknownLoc());
+                            //*/
+                            mlir::Type i32Type = builder1.getI32Type();
+                            mlir::IntegerAttr intAttr = builder1.getIntegerAttr(i32Type, 42);
+                            auto intConst = builder1.create<mlir::arith::ConstantOp>(builder1.getUnknownLoc(), intAttr);
+                            builder1.create<routing::YieldOp>(builder1.getUnknownLoc(), intConst);
+                            //builder1.create<routing::YieldOp>(builder1.getUnknownLoc(), datamov.getResult());
+                            
                         });
+                        
                         //extract tile
                     }
                     //*/

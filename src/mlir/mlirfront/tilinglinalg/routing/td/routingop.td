@@ -193,7 +193,7 @@ def Routing_YieldOp : routingop<"yield", [Terminator]> {
     a region within a `routing` operation.
   }];
 
-  //let arguments = (ins AnyType:$value);
+  let arguments = (ins I32:$value);
   //let arguments = (ins);
   //let results = (outs); // No results
 }
@@ -210,7 +210,7 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
   				   I32:$scf_idx,
 				   StrAttr:$Memo
 				   );
-  //let results = (outs I32:$output);
+  let results = (outs I32:$output);
 
   let regions = (region SizedRegion<1>:$body);
  
