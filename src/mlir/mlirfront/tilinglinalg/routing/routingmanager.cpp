@@ -215,7 +215,7 @@ ModuleOp routingmanager::ops_test(MLIRContext* ctx, int totalN) {
 }
 
 ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
-    const int hwrowused= 4, hwcolused=8;
+    const int hwrowused= 2, hwcolused=4;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     //auto func = createroutingfuncByDim(ctx, true);

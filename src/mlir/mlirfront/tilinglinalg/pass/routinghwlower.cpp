@@ -172,26 +172,141 @@ struct routingRoutingCreatePattern: public ConversionPattern {
         
         auto idx = getRoutingCreateOprandConst(operands[0]);
         std::ostringstream ostr;
-        ostr << "\n{ round is " << idx << " -----------";
-        auto open = rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr(ostr.str()));
-        // 4. Inline the body, remapping the region arguments to the NEW operands.
-        // This is the key step: we use the 'operands' array passed into this function.
-        rewriter.inlineBlockBefore(&bodyBlock, op, operands);
-        rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr("}\n"));
+        ostr << "\n{ //round is " << idx << " -----------";
+        if (1) {// use if block
+            // First, erase the default terminator in the 'then' block.
+            auto trueAttr = rewriter.getBoolAttr(true);
+            mlir::Value trueVal = rewriter.create<mlir::arith::ConstantOp>(loc, trueAttr);
+            auto ifOp = rewriter.create<mlir::emitc::IfOp>(loc, trueVal, /*withElseRegion=*/false);
+            auto& tblock = ifOp.getThenRegion().front();
 
-        // 5. Replace the original op with the values from the yield.
-        // The conversion framework requires you to either erase or replace the original op.
-        rewriter.replaceOp(op, yieldedValues);
-
-        // 6. Clean up the now-obsolete yield op.
-        rewriter.eraseOp(yieldOp);
-
+            //remove block parameter
+            Value idx = operands[0];
+            ///auto& body = op->getRegion(0).front();
+            //BlockArgument barg = body.getArgument(0);
+            //rewriter.replaceAllUsesWith(barg, idx);
+            llvm::errs() << "--- DEBUG: Contents of the 'then' block: ---\n";
+llvm::errs() << tblock << "\n";
+llvm::errs() << "--- END DEBUG ---\n";
+llvm::errs() << "--- DEBUG: Contents of the 'bodyBlock' block: ---\n";
+llvm::errs() << bodyBlock << "\n";
+llvm::errs() << "--- END DEBUG ---\n";
+            //rewriter.eraseOp(tblock.getTerminator());
+            // Then, merge the scopeOp's block into the now-empty 'then' block.
+            rewriter.mergeBlocks(&bodyBlock, &tblock, operands);
+            llvm::errs() << "--- DEBUG: after merge Contents of the 'then' block: ---\n";
+llvm::errs() << tblock << "\n";
+llvm::errs() << "--- END DEBUG ---\n";
+            //rewriter.setInsertionPoint(yieldOp);
+            //rewriter.create<mlir::emitc::YieldOp>(loc);
+            rewriter.eraseOp(op);
+            
+        } else { // use {} block
+            auto open = rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr(ostr.str()));
+            // 4. Inline the body, remapping the region arguments to the NEW operands.
+            // This is the key step: we use the 'operands' array passed into this function.
+            rewriter.inlineBlockBefore(&bodyBlock, op, operands);
+            rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr("}\n"));
+            // 5. Replace the original op with the values from the yield.
+            // The conversion framework requires you to either erase or replace the original op.
+            rewriter.replaceOp(op, yieldedValues);
+            // 6. Clean up the now-obsolete yield op.
+            rewriter.eraseOp(yieldOp);
+  
+        }
         return success();
     }
 
 private:
     LLVMTypeConverter& typeconverter;
     RoutingTopology & router_;
+};
+
+//scf::ExecuteRegionOp
+struct ScfExecuteRegionOpPattern: public ConversionPattern {
+    explicit ScfExecuteRegionOpPattern(MLIRContext* ctx, LLVMTypeConverter &converter) :
+        ConversionPattern(scf::ExecuteRegionOp::getOperationName(), 1, ctx), typeconverter(converter) {
+
+    }
+    LogicalResult matchAndRewrite(Operation *op , ArrayRef<Value> operands, ConversionPatternRewriter& rewriter) const override{
+         // Preconditions for the simple lowering.
+         auto getRoutingCreateOprandConst = [&] (Value operand) -> int {
+            IntegerAttr intAttr;
+            if (matchPattern(operand, m_Constant(&intAttr))) {
+                auto concrete = intAttr.getInt();        // -> 0
+                return concrete;
+            }
+            return 0;
+        };
+        auto loc = op->getLoc();
+
+    // 1. Cast the generic 'Operation*' to your specific op type.
+        auto seop = cast<scf::ExecuteRegionOp>(op);
+
+        // 2. Get the single block from the op's region.
+        mlir::Region &region = seop.getRegion();
+        if (!llvm::hasSingleElement(region)) {
+            return rewriter.notifyMatchFailure(op, "expected a single block in the region");
+        }
+        mlir::Block &bodyBlock = region.front();
+
+        // 3. Find the terminator (yield) to get the results from the body.
+        auto yieldOp = dyn_cast<scf::YieldOp>(bodyBlock.getTerminator());
+        if (!yieldOp) {
+            return rewriter.notifyMatchFailure(op, "region must end with a routing::YieldOp");
+        }
+        // These are the values that will replace the results of the routingOp.
+        ValueRange yieldedValues = yieldOp.getODSOperands(0);
+
+        //rewriter.setInsertionPoint(op);
+        
+        std::ostringstream ostr;
+        ostr << "\n{ //round is " << 0 << " -----------";
+        if (0) {// use if block
+            // First, erase the default terminator in the 'then' block.
+            auto trueAttr = rewriter.getBoolAttr(true);
+            mlir::Value trueVal = rewriter.create<mlir::arith::ConstantOp>(loc, trueAttr);
+            auto ifOp = rewriter.create<mlir::emitc::IfOp>(loc, trueVal, /*withElseRegion=*/false);
+            auto& tblock = ifOp.getThenRegion().front();
+
+            //remove block parameter
+            Value idx = operands[0];
+            ///auto& body = op->getRegion(0).front();
+            //BlockArgument barg = body.getArgument(0);
+            //rewriter.replaceAllUsesWith(barg, idx);
+            llvm::errs() << "--- DEBUG: Contents of the 'then' block: ---\n";
+llvm::errs() << tblock << "\n";
+llvm::errs() << "--- END DEBUG ---\n";
+llvm::errs() << "--- DEBUG: Contents of the 'bodyBlock' block: ---\n";
+llvm::errs() << bodyBlock << "\n";
+llvm::errs() << "--- END DEBUG ---\n";
+            //rewriter.eraseOp(tblock.getTerminator());
+            // Then, merge the scopeOp's block into the now-empty 'then' block.
+            rewriter.mergeBlocks(&bodyBlock, &tblock, operands);
+            llvm::errs() << "--- DEBUG: after merge Contents of the 'then' block: ---\n";
+llvm::errs() << tblock << "\n";
+llvm::errs() << "--- END DEBUG ---\n";
+
+            rewriter.eraseOp(op);
+            
+        } else { // use {} block
+            auto open = rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr(ostr.str()));
+            // 4. Inline the body, remapping the region arguments to the NEW operands.
+            // This is the key step: we use the 'operands' array passed into this function.
+            rewriter.inlineBlockBefore(&bodyBlock, op, operands);
+            rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr("}\n"));
+            // 5. Replace the original op with the values from the yield.
+            // The conversion framework requires you to either erase or replace the original op.
+            rewriter.replaceOp(op, yieldedValues);
+            // 6. Clean up the now-obsolete yield op.
+            rewriter.eraseOp(yieldOp);
+  
+        }
+        return success();
+    }
+
+private:
+    LLVMTypeConverter& typeconverter;
 };
 
 struct IOShimTileCreatepattern: public ConversionPattern {
@@ -207,6 +322,22 @@ struct IOShimTileCreatepattern: public ConversionPattern {
 private:
     LLVMTypeConverter& typeconverter;
     RoutingTopology & router_;
+};
+
+struct RoutingYieldOp: public ConversionPattern {
+    explicit RoutingYieldOp(MLIRContext* ctx, LLVMTypeConverter &converter) :
+        ConversionPattern(routing::YieldOp::getOperationName(), 1, ctx), typeconverter(converter) {
+
+    }
+    LogicalResult matchAndRewrite(Operation *op , ArrayRef<Value> operands, ConversionPatternRewriter& rewriter) const override{
+        //rewriter.eraseOp(op);
+        auto constantOp = cast<routing::YieldOp>(op);
+        rewriter.replaceOpWithNewOp<mlir::emitc::YieldOp>(op);
+        return success();
+    }
+
+private:
+    LLVMTypeConverter& typeconverter;
 };
 
 struct TileArrayHandleCreatepattern: public ConversionPattern {
@@ -245,7 +376,10 @@ struct arithconstantconvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
-        rewriter.eraseOp(op);
+        //rewriter.eraseOp(op);
+        //return success();
+        auto constantOp = cast<mlir::arith::ConstantOp>(op);
+        rewriter.replaceOpWithNewOp<mlir::emitc::ConstantOp>(op, constantOp.getType(), constantOp.getValue());
         return success();
     }
 private:
@@ -319,6 +453,8 @@ void RoutingHWLowerPass::runOnOperation() {
     patterns.add<TileArrayHandleCreatepattern>(&ctx,typeConverter,rtopology_);
     patterns.add<routingRoutingCreatePattern>(&ctx,typeConverter,rtopology_);
     patterns.add<arithconstantconvert>(&ctx,typeConverter);
+    patterns.add<RoutingYieldOp>(&ctx,typeConverter);
+    patterns.add<ScfExecuteRegionOpPattern>(&ctx,typeConverter);
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
         llvm::outs() << "applyPartialConversion failed\n";
     }
@@ -332,6 +468,7 @@ void RoutingHWLowerPass::runOnOperation() {
     for (auto* dialect : ctx.getLoadedDialects()) {
         dialect->getCanonicalizationPatterns(patternscde);
     }
+    /*
     for (mlir::RegisteredOperationName op : ctx.getRegisteredOperations()) {
         op.getCanonicalizationPatterns(patternscde, &ctx);
     }
@@ -348,6 +485,7 @@ void RoutingHWLowerPass::runOnOperation() {
         llvm::errs() << "Failed to translate MLIR to C++.\n";
         return;
     }
+    //*/
 
 
 
