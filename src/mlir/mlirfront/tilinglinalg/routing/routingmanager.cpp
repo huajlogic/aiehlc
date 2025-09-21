@@ -371,7 +371,7 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
         // no region creatation
         //
         auto exec = builder.create<scf::ExecuteRegionOp>(builder.getUnknownLoc(), /*result types*/TypeRange{});
-        exec->setAttr("routing_memo", builder.getStringAttr("Routing"));
+        exec->setAttr("routing_memo", builder.getStringAttr(splitAxis));
         //Block *body = builder.createBlock(&exec.getRegion());
         {
                 OpBuilder::InsertionGuard guard(builder);
@@ -394,7 +394,7 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                     { 
                         OpBuilder::InsertionGuard guard(builder);
                         builder.setInsertionPointToStart(scf.getBody());
-                        auto memo = builder.getStringAttr("memo");
+                        auto memo = builder.getStringAttr(splitAxis);
                         mlir::Value scf_idx = scf.getInductionVar();
                         
                         Value idx = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getI32Type(), scf_idx);
