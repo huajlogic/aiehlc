@@ -215,7 +215,7 @@ ModuleOp routingmanager::ops_test(MLIRContext* ctx, int totalN) {
 }
 
 ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
-    const int hwrowused= 2, hwcolused=4;
+    const int hwrowused= 4, hwcolused=2;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     //auto func = createroutingfuncByDim(ctx, true);
@@ -254,8 +254,9 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
                                                                                                 partensor_singleowner,
                                                                                                 io_direction}));
     //*/
-    createroutingfuncByDim(builder, ctx, mesh, tensor, hwrowused, "row");
-    createroutingfuncByDim(builder, ctx, mesh, tensor, hwcolused, "col");
+    //createroutingfuncByDim(builder, ctx, false, mesh, tensor, hwrowused, "row");
+    createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwrowused, "row");
+    //createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwcolused, "col");
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(main);
     llvm::errs() << m;
@@ -364,7 +365,7 @@ mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int total
         return func;
 }
 
-void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx, Value mesh, Value tensor,
+void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx, bool binput, Value mesh, Value tensor,
                                            uint32_t hwsplitnum, std::string splitAxis) {
         auto location = builder.getUnknownLoc();
         auto tensorhwaxisowner = splitAxis;
@@ -374,12 +375,10 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
         exec->setAttr("routing_memo", builder.getStringAttr(splitAxis));
         //Block *body = builder.createBlock(&exec.getRegion());
         {
-                OpBuilder::InsertionGuard guard(builder);
-                //fix the upper scope return go inside this region issue
-                builder.setInsertionPointToStart(&exec.getRegion().emplaceBlock());
-                ///*
-                
-                
+                    OpBuilder::InsertionGuard guard(builder);
+                    //fix the upper scope return go inside this region issue
+                    builder.setInsertionPointToStart(&exec.getRegion().emplaceBlock());
+                ///*                
                     auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, hwsplitnum, splitAxis);
                     IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
                     auto outTy = builder.getI32Type();
@@ -405,14 +404,20 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                             auto slicetensor = builder1.create<extract_data>(builder1.getUnknownLoc(), rowtensor, sidx);
                             auto tilelist = builder1.create<extract_tiles>(builder1.getUnknownLoc(), patitionmesh, sidx);
                             
-                            auto hwio = builder1.create<createhwiowithtarget>(builder1.getUnknownLoc(), tilelist, "input", "mem2");
-                            auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), slicetensor, hwio);
+                            if (binput) {
+                                auto hwio = builder1.create<createhwiowithtarget>(builder1.getUnknownLoc(), tilelist, "input", "mem2");
+                                auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), slicetensor, hwio);
+                            } else {
+                                auto gatherdata = builder1.create<routinggatherout>(builder1.getUnknownLoc(), tilelist, slicetensor);
+                                auto hwio = builder1.create<createhwiowithtarget>(builder1.getUnknownLoc(), tilelist, "output", "mem2");
+                                auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), gatherdata, hwio);
+                            }
                             //*/
-                            mlir::Type i32Type = builder1.getI32Type();
-                            mlir::IntegerAttr intAttr = builder1.getIntegerAttr(i32Type, 42);
-                            auto intConst = builder1.create<mlir::arith::ConstantOp>(builder1.getUnknownLoc(), intAttr);
-                            builder1.create<routing::YieldOp>(builder1.getUnknownLoc(), intConst);
-                            //builder1.create<routing::YieldOp>(builder1.getUnknownLoc(), datamov.getResult());
+                            //mlir::Type i32Type = builder1.getI32Type();
+                            //mlir::IntegerAttr intAttr = builder1.getIntegerAttr(i32Type, 42);
+                            //auto intConst = builder1.create<mlir::arith::ConstantOp>(builder1.getUnknownLoc(), intAttr);
+                            //builder1.create<routing::YieldOp>(builder1.getUnknownLoc(), intConst);
+                            builder1.create<routing::YieldOp>(builder1.getUnknownLoc());
                             
                         });
                         
