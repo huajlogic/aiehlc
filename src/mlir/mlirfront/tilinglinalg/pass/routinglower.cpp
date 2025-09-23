@@ -609,38 +609,42 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
                 llvm::outs() << " row = " << i << "col = " << row + round_idx << "\n";
             }
         }
-        // start to convert
-        Point firtTile = tileList[0];
-        std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firtTile});
-        std::cout << "tile type is  TileType::Core , tile relative row is " << firtTile.r <<std::endl;
-        std::ostringstream ostr;
-        ostr << "dio" << ioIdx++;
-        auto dio = router_.createDataIO(ostr.str(), dstcoreloc,  DMADIRECTION::MM2S);
-        //auto ctx = getContext();
-        //auto output = rewriter.getI32Type();
-        ///*
-        int shimcol = dio->colpos();
-        int dioid = dio->id();
-        auto output = rewriter.getI32Type();
+        if (processing_type == 0) {
+            // start to convert
+            Point firtTile = tileList[0];
+            std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firtTile});
+            std::cout << "tile type is  TileType::Core , tile relative row is " << firtTile.r <<std::endl;
+            std::ostringstream ostr;
+            ostr << "dio" << ioIdx++;
+            auto dio = router_.createDataIO(ostr.str(), dstcoreloc,  DMADIRECTION::MM2S);
+            //auto ctx = getContext();
+            //auto output = rewriter.getI32Type();
+            ///*
+            int shimcol = dio->colpos();
+            int dioid = dio->id();
+            auto output = rewriter.getI32Type();
 
-        std::cout << "get the shim tile is " << shimcol << " channel is " << dio->channel()  << " IOID is " << dio->id() << std::endl;
+            std::cout << "get the shim tile is " << shimcol << " channel is " << dio->channel()  << " IOID is " << dio->id() << std::endl;
 
-        auto tilecreatehandle = rewriter.create<TileArrayHandleCreate>(op->getLoc(), output, "array handle");
+            auto tilecreatehandle = rewriter.create<TileArrayHandleCreate>(op->getLoc(), output, "array handle");
 
-        Point shimpoint= {0, shimcol};
+            Point shimpoint= {0, shimcol};
 
-        
-        auto opCreated = rewriter.create <IOShimTileCreate> ( op->getLoc(), output, 0, shimcol, dioid, ostr.str(), static_cast <int> (DMADIRECTION::MM2S), dio->channel());
+            
+            auto opCreated = rewriter.create <IOShimTileCreate> ( op->getLoc(), output, 0, shimcol, dioid, ostr.str(), static_cast <int> (DMADIRECTION::MM2S), dio->channel());
 
-        //----------start create path--------stream switch-----------
-        auto rpath = router_.createPath(dioid, tileList);
-        std::unordered_map<Point, Operation*, Point::Hash> dsttiles;
-        for(auto x: tileList) {
-            auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
-            dsttiles[{x.r , x.c}] = tile1;
+            //----------start create path--------stream switch-----------
+            auto rpath = router_.createPath(dioid, tileList);
+            std::unordered_map<Point, Operation*, Point::Hash> dsttiles;
+            for(auto x: tileList) {
+                auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
+                dsttiles[{x.r , x.c}] = tile1;
+            }
+
+            ParseTheRoutingPath(op, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
+        } else if (processing_type == 2) {
+            //GatherRoutingPathCreate(op, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
         }
-
-        ParseTheRoutingPath(op, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
 
         rewriter.eraseOp(op);
         return success();
