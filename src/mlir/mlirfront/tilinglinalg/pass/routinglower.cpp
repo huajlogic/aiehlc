@@ -540,10 +540,12 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         routing::extract_data extract_data;
         routing::routinggatherout gatherout_pktmerge;
         routing::extract_tiles extract_tiles;
+        int processing_type = 0;// 0 broadcast //1 tbd //2 gather an packet merge
         routing::createhwiowithtarget createhwiowithtarget = operands[1].getDefiningOp<routing::createhwiowithtarget>();
         if (!(extract_data = operands[0].getDefiningOp<routing::extract_data>())) {
             if (gatherout_pktmerge = operands[0].getDefiningOp<routing::routinggatherout>()){
                 extract_data = gatherout_pktmerge->getOperands()[1].getDefiningOp<routing::extract_data>();
+                processing_type = 2;
             }
         }
 
