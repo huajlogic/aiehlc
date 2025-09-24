@@ -227,7 +227,6 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     auto block = main.addEntryBlock();
     builder.setInsertionPointToEnd(block);
     auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(),  hwrowused, hwcolused);
-    
     //dummy tensor
     SmallVector<Attribute> shape;
     for (int64_t v : {10, 20})
@@ -235,26 +234,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     ArrayAttr vals = builder.getArrayAttr(shape);  // satisfies I64ArrayAttr
     IntegerAttr dimnum = builder.getI64IntegerAttr(2);
     auto tensor = builder.create<createdummytensor>(builder.getUnknownLoc(), vals, dimnum);
-    //convert into index typ
-    //auto mesh_index = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), mesh);
-    //auto tensor_index = builder.create<arith::IndexCastOp>(builder.getUnknownLoc(),builder.getIndexType(), tensor);
-    
-    //Value cnum   = builder.create<arith::ConstantIndexOp>(location, 1);
-   // Value cnum = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 1);
-    //Value rnum = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 8);
-    //Value total = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(),16);
-    /*
-    auto callop = builder.create<mlir::func::CallOp>(builder.getUnknownLoc(), func, ValueRange({mesh, 
-                                                                                                tensor,
-                                                                                                splitnum,
-                                                                                                axis,
-                                                                                                partensor_splitdim,
-                                                                                                partensor_axis_owner,
-                                                                                                partensor_replicate_on,
-                                                                                                partensor_singleowner,
-                                                                                                io_direction}));
-    //*/
-    //createroutingfuncByDim(builder, ctx, false, mesh, tensor, hwrowused, "row");
+    createroutingfuncByDim(builder, ctx, false, mesh, tensor, hwrowused, "row");
     createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwrowused, "row");
     //createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwcolused, "col");
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
@@ -413,10 +393,6 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                                 auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), gatherdata, hwio);
                             }
                             //*/
-                            //mlir::Type i32Type = builder1.getI32Type();
-                            //mlir::IntegerAttr intAttr = builder1.getIntegerAttr(i32Type, 42);
-                            //auto intConst = builder1.create<mlir::arith::ConstantOp>(builder1.getUnknownLoc(), intAttr);
-                            //builder1.create<routing::YieldOp>(builder1.getUnknownLoc(), intConst);
                             builder1.create<routing::YieldOp>(builder1.getUnknownLoc());
                             
                         });
