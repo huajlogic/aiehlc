@@ -49,9 +49,29 @@ void GatherRoutingPathCreate(Operation* op,
     auto firstpoint = prevpoint;
     std::unordered_map<Point, std::vector<int>, Point::Hash> tileMasterPortMapping;
     std::unordered_map<Point, Operation*, Point::Hash> pathtiles;
+    /*
+struct StreamPKTConnection {
+    PortDirection SlaveReceiveForwardDirection;
+    int SlaveReceiveForwardDirectionPortIdx;
+    int SlaveReceivePktID;
+    int SlaveReceivePktType;
+    int localDMAForwardPortIdx;
+    int localDMAForwardPktID;
+    int localDMAForwardPktType;
+    PortDirection MasterSendToNextTileDirection;
+    int MasterSendToNextTileDirectionPortIdx;
+}; */
+    std::unordered_map<Point, StreamPKTConnection, Point::Hash> pktswitchmap;
+    //create empty structure for each dstPoint
+    for (const auto& [dstPoint, dstTileOp] : dsttiles) {
+        pktswitchmap[dstPoint] = StreamPKTConnection{};
+    }
+    //fill the switch map
     for (const auto& [dstPoint, dstTileOp] : dsttiles) {
         if (prevpoint == dstPoint) continue;// when process the first point by pass.
         int portNum = 0;
+        int dmaportNum;
+        PortDirection dmadirection = PortDirection::DMA;
         //get the connection port and direction
         PortDirection portdirectionPrevMaster, portdirectionCurSlave;
         if (!router_.occupyLink(prevpoint, dstPoint, dioid, portNum, portdirectionPrevMaster, portdirectionCurSlave)) {
@@ -59,25 +79,25 @@ void GatherRoutingPathCreate(Operation* op,
             assert(0);
             return;
         }
-        tileMasterPortMapping[dstPoint]={(int)portdirectionCurSlave, portNum, 0};
-        //
-        PortDirection rcv_slave_dir = PortDirection::NONE;
-        int receiveportnum = 0;
-        int receivePktId = 0;
-        int receivePktType = 0;
-        //for the first point, assume no receive port config
-        //set master port for prevpoint and set slave port for dstport
-        if (prevpoint != firstpoint) {
-
-        }
-
-        int dmaportNum;
-        PortDirection dmadirection = PortDirection::DMA;
-        if (!router_.occupyPointDirection(prevpoint,dmaportNum, dmadirection)) {
+        //get DMA port index
+        if (!router_.occupyPointDirection(prevpoint,dmaportNum, dmadirection, true)) {
             llvm::outs() << "DMA occupy failed " << "\n";
             assert(0);
             return;
         }
+        struct StreamPKTConnection& prevtileconf = pktswitchmap[prevpoint];
+        struct StreamPKTConnection& curtileconf = pktswitchmap[dstPoint];
+        //set prev tile master port and dma port
+        prevtileconf.localDMAForwardPortIdx = dmaportNum;
+        prevtileconf.localDMAForwardPktID = 0;//fix me
+        prevtileconf.localDMAForwardPktType = 0;
+        prevtileconf.MasterSendToNextTileDirection = portdirectionPrevMaster;
+        prevtileconf.MasterSendToNextTileDirectionPortIdx = portNum;
+        //set currenttile receive/slave port
+        curtileconf.SlaveReceiveForwardDirection = portdirectionCurSlave;
+        curtileconf.SlaveReceiveForwardDirectionPortIdx = portNum;
+        curtileconf.SlaveReceivePktID = 0;//fixme
+        curtileconf.SlaveReceivePktType = 0;
         
         /*
         rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
@@ -96,6 +116,20 @@ void GatherRoutingPathCreate(Operation* op,
             rewriter.getI32IntegerAttr(0)   // No forwarding: packet type 0
         );
         */
+       // 🔹 print directly using your variables
+    std::cout << "PrevTileConf:\n";
+    std::cout << "  localDMAForwardPortIdx = " << prevtileconf.localDMAForwardPortIdx << "\n";
+    std::cout << "  localDMAForwardPktID   = " << prevtileconf.localDMAForwardPktID << "\n";
+    std::cout << "  localDMAForwardPktType = " << prevtileconf.localDMAForwardPktType << "\n";
+    std::cout << "  MasterSendToNextTileDirection        = " << (int)prevtileconf.MasterSendToNextTileDirection << "\n";
+    std::cout << "  MasterSendToNextTileDirectionPortIdx = " << prevtileconf.MasterSendToNextTileDirectionPortIdx << "\n";
+
+    std::cout << "CurTileConf:\n";
+    std::cout << "  SlaveReceiveForwardDirection        = " << (int)curtileconf.SlaveReceiveForwardDirection << "\n";
+    std::cout << "  SlaveReceiveForwardDirectionPortIdx = " << curtileconf.SlaveReceiveForwardDirectionPortIdx << "\n";
+    std::cout << "  SlaveReceivePktID   = " << curtileconf.SlaveReceivePktID << "\n";
+    std::cout << "  SlaveReceivePktType = " << curtileconf.SlaveReceivePktType << "\n";
+       //
         prevpoint = dstPoint;
     }
 }
