@@ -127,6 +127,31 @@ def ConnectStreamSingleSwitchPort:RoutingHWOp<"connectsinglestreamswitchport"> {
     let assemblyFormat = "$curtile `:` type($curtile) attr-dict `->` type($output)";
 }
 
+def ConnectStreamPktSwitchPort:RoutingHWOp<"connectpktstreamswitchport"> {
+     let cppNamespace = "routinghw";
+     let arguments = (
+        ins
+        I32:$curtile,
+        StrAttr:$receiveslavedirection,
+        I32Attr:$receiveslaveportidx,
+        I32Attr:$receiveslavepktid,
+        I32Attr:$receiveslavepkttype,
+        I32Attr:$localdmaportidx,
+        I32Attr:$localdmapktid,
+        I32Attr:$localdmapkttype,
+        StrAttr:$forwardmasterdirection,
+        I32Attr:$forwardmasterportidx,
+        I32Attr:$forwardmasterpktid,
+        I32Attr:$forwardmasterpkttype
+     );
+
+     let results = (outs
+        I32:$output
+    );
+    let assemblyFormat = "$curtile `:` type($curtile) attr-dict `->` type($output)";
+}
+
+
 def EnableExtToAieShimPort:RoutingHWOp<"enableexttoaieshimport"> {
     let cppNamespace = "routinghw";
     let arguments = (

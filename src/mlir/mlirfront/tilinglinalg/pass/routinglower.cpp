@@ -7,6 +7,72 @@
 #include "routing/routingpath.h"
 #include <sstream>
 int ioIdx = 0;
+//connectpktstreamswitchport
+void GatherRoutingPathCreate(Operation* op,
+                             uint32_t dioid,
+                             Point shimpoint,
+                             std::shared_ptr<DataIO>  dio,
+                             TileArrayHandleCreate tilecreatehandle, 
+                             std::optional<std::shared_ptr<const RoutingPath>> rpath, 
+                             std::unordered_map<Point, Operation*, Point::Hash> dsttiles,
+                             RoutingTopology & router_,
+                             ConversionPatternRewriter& rewriter) {
+    auto getrowcol =  [] (routinghw::TileCreate& creatileop) -> std::vector<int> {
+            std::vector<int> ret(2,0);
+            if (auto rowAttr = creatileop.getRowAttr()) {
+                ret[0] = rowAttr.getInt();
+            } 
+            if (auto colAttr = creatileop.getColAttr()) {
+                ret[1] = colAttr.getInt();
+            }
+            return ret;
+    };
+
+    if (!rpath || !*rpath || dsttiles.empty()) {
+        return; // Exit if no valid routing path is provided.
+    }
+
+    std::vector<Point> pktmergetile;
+    for(auto x: dsttiles) {
+        pktmergetile.push_back(x.first);
+    }
+    std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, pktmergetile[0]});
+    std::ostringstream ostr;
+    ostr << "dio" << ioIdx++;
+    auto diogather = router_.createDataIO(ostr.str(), dstcoreloc, DMADIRECTION::MM2S);
+    int diogetherid = diogather->id();
+    auto rpath2 = router_.createPath(diogetherid, pktmergetile);
+    if (!rpath2) {
+        return;
+    }
+    auto prevpoint = dsttiles.begin()->first;
+    for (const auto& [dstPoint, dstTileOp] : dsttiles) {
+        int portNum = 0;
+        if (prevpoint == dstPoint) continue;// bpass the first item;
+        //
+        //
+        
+        /*
+        rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
+            op->getLoc(),                   // Operation location
+            dstTileValue,                   // Tile to be configured
+            rewriter.getStringAttr(receiveSlaveDir), // Direction of the port receiving the stream
+            rewriter.getI32IntegerAttr(portNum),     // Index of the receiving port
+            rewriter.getI32IntegerAttr(receivePktId),// Packet ID to expect
+            rewriter.getI32IntegerAttr(receivePktType),// Packet Type to expect
+            rewriter.getI32IntegerAttr(dmaPortIdx),  // Index of the local DMA port to send to
+            rewriter.getI32IntegerAttr(dmaPktId),    // Packet ID for the DMA transfer
+            rewriter.getI32IntegerAttr(dmaPktType),  // Packet Type for the DMA transfer
+            rewriter.getStringAttr(""),     // No forwarding: empty master direction
+            rewriter.getI32IntegerAttr(0),  // No forwarding: port index 0
+            rewriter.getI32IntegerAttr(0),  // No forwarding: packet ID 0
+            rewriter.getI32IntegerAttr(0)   // No forwarding: packet type 0
+        );
+        */
+        prevpoint = dstPoint;
+    }
+}
+
 void ParseTheRoutingPath(Operation* op,
                              uint32_t dioid,
                              Point shimpoint,
@@ -609,30 +675,25 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
                 llvm::outs() << " row = " << i << "col = " << row + round_idx << "\n";
             }
         }
+        auto output = rewriter.getI32Type();
+        auto tilecreatehandle = rewriter.create<TileArrayHandleCreate>(op->getLoc(), output, "array handle");
+        // if input choose first tile, if output use last tile for row base, and first tile for col base
+        // this tile is used to connect shim
+        Point firtTile = tileList[0];
         if (processing_type == 0) {
+            firtTile = tileList[0];
             // start to convert
-            Point firtTile = tileList[0];
             std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firtTile});
             std::cout << "tile type is  TileType::Core , tile relative row is " << firtTile.r <<std::endl;
             std::ostringstream ostr;
             ostr << "dio" << ioIdx++;
-            auto dio = router_.createDataIO(ostr.str(), dstcoreloc,  DMADIRECTION::MM2S);
-            //auto ctx = getContext();
-            //auto output = rewriter.getI32Type();
+            auto dio = router_.createDataIO(ostr.str(), dstcoreloc, DMADIRECTION::MM2S);
             ///*
             int shimcol = dio->colpos();
             int dioid = dio->id();
-            auto output = rewriter.getI32Type();
-
             std::cout << "get the shim tile is " << shimcol << " channel is " << dio->channel()  << " IOID is " << dio->id() << std::endl;
-
-            auto tilecreatehandle = rewriter.create<TileArrayHandleCreate>(op->getLoc(), output, "array handle");
-
             Point shimpoint= {0, shimcol};
-
-            
             auto opCreated = rewriter.create <IOShimTileCreate> ( op->getLoc(), output, 0, shimcol, dioid, ostr.str(), static_cast <int> (DMADIRECTION::MM2S), dio->channel());
-
             //----------start create path--------stream switch-----------
             auto rpath = router_.createPath(dioid, tileList);
             std::unordered_map<Point, Operation*, Point::Hash> dsttiles;
@@ -640,12 +701,34 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
                 auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
                 dsttiles[{x.r , x.c}] = tile1;
             }
-
             ParseTheRoutingPath(op, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
-        } else if (processing_type == 2) {
-            //GatherRoutingPathCreate(op, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
+        }  else if (processing_type == 2) {
+            if (split_axis == "row") {
+                firtTile = tileList.back();
+            } else if (split_axis == "col") {
+                firtTile = tileList[0];
+            }
+            std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firtTile});
+            std::cout << "tile type is  TileType::Core , tile relative row is " << firtTile.r <<std::endl;
+            std::ostringstream ostr;
+            ostr << "dio" << ioIdx++;
+            auto dio = router_.createDataIO(ostr.str(), dstcoreloc, DMADIRECTION::MM2S);
+            
+            int shimcol = dio->colpos();
+            int dioid = dio->id();
+            std::cout << "get the shim tile is " << shimcol << " channel is " << dio->channel()  << " IOID is " << dio->id() << std::endl;
+            Point shimpoint= {0, shimcol};
+            auto opCreated = rewriter.create <IOShimTileCreate> ( op->getLoc(), output, 0, shimcol, dioid, ostr.str(), static_cast <int> (DMADIRECTION::MM2S), dio->channel());
+            //----------start create path--------stream switch-----------
+            std::vector<Point> pktmergetile = {firtTile};
+            auto rpath = router_.createPath(dioid, pktmergetile);
+            std::unordered_map<Point, Operation*, Point::Hash> dsttiles;
+            for(auto x: tileList) {
+                auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
+                dsttiles[{x.r , x.c}] = tile1;
+            }
+            GatherRoutingPathCreate(op, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
         }
-
         rewriter.eraseOp(op);
         return success();
     }
