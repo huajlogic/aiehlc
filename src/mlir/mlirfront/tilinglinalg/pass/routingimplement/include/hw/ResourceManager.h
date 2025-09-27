@@ -356,6 +356,7 @@ public:
     std::shared_ptr<DataIO> createDataIO(IOType tp, int r=0, int c=0, DMADIRECTION dir = DMADIRECTION::MM2S, int channel =0,std::string nm="", std::string cmt="");
     bool linkAvailable(Point a, Point b, int& portNum) const;
     bool occupyLink(Point a, Point b, const int ioId,int& portNum, PortDirection& pda, PortDirection& pdb);
+    bool occupyPointDirection(Point a,int& portNum, PortDirection& pd);
     bool releaseLink(Point a, Point b, int ioId,int portNum);
     std::optional<Point> freeShimNoc(std::optional<Point> dst = std::nullopt )const;
     std::optional<Point> freeShimNoc(std::optional<TypeBasedTileLoc> loc)const;

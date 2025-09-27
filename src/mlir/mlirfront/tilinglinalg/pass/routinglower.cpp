@@ -46,11 +46,38 @@ void GatherRoutingPathCreate(Operation* op,
         return;
     }
     auto prevpoint = dsttiles.begin()->first;
+    auto firstpoint = prevpoint;
+    std::unordered_map<Point, std::vector<int>, Point::Hash> tileMasterPortMapping;
+    std::unordered_map<Point, Operation*, Point::Hash> pathtiles;
     for (const auto& [dstPoint, dstTileOp] : dsttiles) {
+        if (prevpoint == dstPoint) continue;// when process the first point by pass.
         int portNum = 0;
-        if (prevpoint == dstPoint) continue;// bpass the first item;
+        //get the connection port and direction
+        PortDirection portdirectionPrevMaster, portdirectionCurSlave;
+        if (!router_.occupyLink(prevpoint, dstPoint, dioid, portNum, portdirectionPrevMaster, portdirectionCurSlave)) {
+            llvm::outs() << "link occupy failed " << "\n";
+            assert(0);
+            return;
+        }
+        tileMasterPortMapping[dstPoint]={(int)portdirectionCurSlave, portNum, 0};
         //
-        //
+        PortDirection rcv_slave_dir = PortDirection::NONE;
+        int receiveportnum = 0;
+        int receivePktId = 0;
+        int receivePktType = 0;
+        //for the first point, assume no receive port config
+        //set master port for prevpoint and set slave port for dstport
+        if (prevpoint != firstpoint) {
+
+        }
+
+        int dmaportNum;
+        PortDirection dmadirection = PortDirection::DMA;
+        if (!router_.occupyPointDirection(prevpoint,dmaportNum, dmadirection)) {
+            llvm::outs() << "DMA occupy failed " << "\n";
+            assert(0);
+            return;
+        }
         
         /*
         rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
@@ -138,7 +165,10 @@ void ParseTheRoutingPath(Operation* op,
                     if (prev_optional_point) {
                         // when next == current, the next is dumpy point
                         if (currentpoint != nextpoint) {
-                            router_.occupyLink(currentpoint, nextpoint, dioid, portNum, portdirectionPrevSlave, portdirectionCurMaster);
+                            if (!router_.occupyLink(currentpoint, nextpoint, dioid, portNum, portdirectionPrevSlave, portdirectionCurMaster)) {
+                                llvm::outs() << "link occupy failed " << "\n";
+                                assert(0);
+                            }
                             // check if this currentpoint is the start shim port
                             if (shimpoint == currentpoint) {
                                 

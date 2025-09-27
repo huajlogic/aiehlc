@@ -19,6 +19,7 @@ public:
     const std::vector<std::shared_ptr<RoutingPath>>& paths() const { return paths_; }
     std::vector<Point> ReserveTiles(int nums,int dioID=-1);
     bool occupyLink(Point a, Point b, const int ioId,int& portNum, PortDirection& pda, PortDirection& pdb);
+    bool occupyPointDirection(Point a,int& portNum, PortDirection& pd);
     std::shared_ptr<ResourceMgr> getRM() {return rm_;};
 
 private:

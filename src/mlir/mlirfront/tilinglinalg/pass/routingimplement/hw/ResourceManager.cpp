@@ -142,6 +142,13 @@ bool ResourceMgr::occupyLink(Point a, Point b,const int ioId,int& portNum, PortD
     return false;
 }
 
+bool ResourceMgr::occupyPointDirection(Point a,int& portNum, PortDirection& pd) {
+     if(tile(a.r,a.c).allocate(IOType::Output, portNum, pd , 0)) {
+        return true;
+     }
+     return false;
+}
+
 // ---------- releaseLink (by ioId) ----------
 bool ResourceMgr::releaseLink(Point a, Point b, int ioId,int portNum){
     PortDirection dir=getDir(a,b), odir=opposite(dir);
