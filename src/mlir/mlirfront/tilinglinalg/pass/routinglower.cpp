@@ -46,7 +46,7 @@ void GatherRoutingPathCreate(Operation* op,
     if (!rpath2) {
         return;
     }
-    auto prevpoint = dsttiles.begin()->first;
+    auto prevpoint = tilist[0];
     auto firstpoint = prevpoint;
     std::unordered_map<Point, std::vector<int>, Point::Hash> tileMasterPortMapping;
     std::unordered_map<Point, Operation*, Point::Hash> pathtiles;
@@ -109,21 +109,7 @@ struct StreamPKTConnection {
         curtileconf.MasterSendToNextTileDirection = PortDirection::NONE;
         
         /*
-        rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
-            op->getLoc(),                   // Operation location
-            dstTileValue,                   // Tile to be configured
-            rewriter.getStringAttr(receiveSlaveDir), // Direction of the port receiving the stream
-            rewriter.getI32IntegerAttr(portNum),     // Index of the receiving port
-            rewriter.getI32IntegerAttr(receivePktId),// Packet ID to expect
-            rewriter.getI32IntegerAttr(receivePktType),// Packet Type to expect
-            rewriter.getI32IntegerAttr(dmaPortIdx),  // Index of the local DMA port to send to
-            rewriter.getI32IntegerAttr(dmaPktId),    // Packet ID for the DMA transfer
-            rewriter.getI32IntegerAttr(dmaPktType),  // Packet Type for the DMA transfer
-            rewriter.getStringAttr(""),     // No forwarding: empty master direction
-            rewriter.getI32IntegerAttr(0),  // No forwarding: port index 0
-            rewriter.getI32IntegerAttr(0),  // No forwarding: packet ID 0
-            rewriter.getI32IntegerAttr(0)   // No forwarding: packet type 0
-        );
+        
         */
        // 🔹 print directly using your variables
     /**
@@ -145,6 +131,9 @@ struct StreamPKTConnection {
     }
     for (const auto& dstPoint : tilist) {
         const Point& key = dstPoint;
+
+        auto output = rewriter.getI32Type();
+        auto curTileOp = dyn_cast<routinghw::TileCreate>(dsttiles[key]);
         const StreamPKTConnection& value = pktswitchmap[key];
 
         // Print the key
@@ -160,6 +149,21 @@ struct StreamPKTConnection {
         std::cout << "  - localDMAForwardPktType: " << value.localDMAForwardPktType << std::endl;
         std::cout << "  - MasterSendToNextTileDirection: " << PortDirectiontoString(value.MasterSendToNextTileDirection) << std::endl;
         std::cout << "  - MasterSendToNextTileDirectionPortIdx: " << (int)(value.MasterSendToNextTileDirectionPortIdx) << std::endl;
+
+        rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
+            op->getLoc(),                   // Operation location
+            output,
+            curTileOp.getResult(),                   // Tile to be configured
+            rewriter.getStringAttr(PortDirectiontoString(value.SlaveReceiveForwardDirection)), // Direction of the port receiving the stream
+            rewriter.getI32IntegerAttr((int)value.SlaveReceiveForwardDirectionPortIdx),     // Index of the receiving port
+            rewriter.getI32IntegerAttr(value.SlaveReceivePktID),// Packet ID to expect
+            rewriter.getI32IntegerAttr(value.SlaveReceivePktType),// Packet Type to expect
+            rewriter.getI32IntegerAttr(value.localDMAForwardPortIdx),  // Index of the local DMA port to send to
+            rewriter.getI32IntegerAttr(value.localDMAForwardPktID ),    // Packet ID for the DMA transfer
+            rewriter.getI32IntegerAttr(value.localDMAForwardPktType),  // Packet Type for the DMA transfer
+            rewriter.getStringAttr(PortDirectiontoString(value.MasterSendToNextTileDirection)),     // No forwarding: empty master direction
+            rewriter.getI32IntegerAttr((int)(value.MasterSendToNextTileDirectionPortIdx)) // No forwarding: port index 0
+        );
     }
 }
 
