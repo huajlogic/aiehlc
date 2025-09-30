@@ -59,6 +59,93 @@ private:
     RoutingTopology & router_;
 };
 
+//ConnectStreamPktSwitchPort
+struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
+    explicit ConnectStreamPktSwitchPortpattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
+        ConversionPattern(routinghw::ConnectStreamPktSwitchPort::getOperationName(), 1, ctx), typeconverter(converter), router_(router) {
+
+    }
+    LogicalResult matchAndRewrite(Operation *op , ArrayRef<Value> operands, ConversionPatternRewriter& rewriter) const override{
+        auto tileoprand = operands[0];
+        auto tileop = tileoprand.getDefiningOp();
+        
+        int32_t rowValue=-1, colValue=-1;
+        if (auto colAttr = tileop->getAttrOfType<IntegerAttr>("col")) {
+            colValue = colAttr.getInt();
+        } 
+        if (auto rowAttr = tileop->getAttrOfType<IntegerAttr>("row")) {
+            rowValue = rowAttr.getInt();
+        }
+        /*
+         I32:$curtile,
+        StrAttr:$receiveslavedirection,
+        I32Attr:$receiveslaveportidx,
+        I32Attr:$receiveslavepktid,
+        I32Attr:$receiveslavepkttype,
+        I32Attr:$localdmaportidx,
+        I32Attr:$localdmapktid,
+        I32Attr:$localdmapkttype,
+        StrAttr:$forwardmasterdirection,
+        I32Attr:$forwardmasterportidx
+         */
+
+        int32_t masterportdirection=-1, masterportidx = -1,slaveportdirection=-1, slaveportidx = -1;
+        std::string masterportdirectionstr="fixme",slaveportdirectionstr="fixme";
+        if (auto pd = op->getAttrOfType<StringAttr>("forwardmasterdirection")) {
+            masterportdirectionstr = pd.getValue().str();
+        }
+        if (auto pi = op->getAttrOfType<IntegerAttr>("forwardmasterportidx")) {
+            masterportidx = pi.getInt();
+        }
+
+        if (auto pd = op->getAttrOfType<StringAttr>("receiveslavedirection")) {
+            slaveportdirectionstr = pd.getValue().str();
+        }
+        if (auto pi = op->getAttrOfType<IntegerAttr>("receiveslaveportidx")) {
+            slaveportidx = pi.getInt();
+        }
+
+        //StringRef callee = "XAie_StrmConnCctEnable";
+        //Value arg0 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(42));
+        ///auto callOp = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, callee, ValueRange{arg0});
+
+        auto colConstOp = rewriter.create<emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(colValue));
+        auto rowConstOp = rewriter.create<emitc::ConstantOp>(op->getLoc(),rewriter.getI32Type(), rewriter.getI32IntegerAttr(rowValue));
+
+        auto tileLocType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_LocType");
+
+        auto tileLocOp = rewriter.create<emitc::CallOp>(
+            op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
+            ValueRange{rowConstOp, colConstOp});
+
+        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
+        auto devInstPtrType = emitc::PointerType::get(devInstType);
+        auto deviceInstOp = rewriter.create<emitc::CallOp>(
+                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
+        Value deviceInst = deviceInstOp.getResult(0);
+
+        StringRef callee = "XAie_StrmPktSwSlaveSlotEnable";
+         //string type
+        mlir::Type stringType = mlir::emitc::PointerType::get(rewriter.getI8Type());
+
+        Value masterport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType,
+                                        mlir::emitc::OpaqueAttr::get(rewriter.getContext(), masterportdirectionstr));
+        Value masteridx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(masterportidx));
+        Value slaveport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType,
+                                        mlir::emitc::OpaqueAttr::get(rewriter.getContext(), slaveportdirectionstr));
+        Value slaveidx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(slaveportidx));
+        auto callOp = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, callee, 
+            ValueRange{deviceInst, tileLocOp.getResult(0), masterport,masteridx,slaveport,slaveidx});
+
+        rewriter.eraseOp(op);
+        return success();
+    }
+
+private:
+    LLVMTypeConverter& typeconverter;
+    RoutingTopology & router_;
+};
+
 struct ConnectStreamSingleSwitchPortpattern: public ConversionPattern {
     explicit ConnectStreamSingleSwitchPortpattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
         ConversionPattern(routinghw::ConnectStreamSingleSwitchPort::getOperationName(), 1, ctx), typeconverter(converter), router_(router) {
@@ -378,6 +465,9 @@ void declareAieTileFunction(mlir::ModuleOp module) {
 
   auto decl4 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_StrmConnCctEnable", tileconnectType);
   decl4.setVisibility(SymbolTable::Visibility::Private);
+
+  auto decl5 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_StrmPktSwSlaveSlotEnable", tileconnectType);
+  decl5.setVisibility(SymbolTable::Visibility::Private);
 }
 
 void RoutingHWLowerPass::runOnOperation() {
@@ -407,6 +497,7 @@ void RoutingHWLowerPass::runOnOperation() {
     llvm::outs() << "RoutingHWLowerPass::runOnOperation\n";
     patterns.add<EnableExtToAieShimPortpattern>(&ctx,typeConverter,rtopology_);
     patterns.add<ConnectStreamSingleSwitchPortpattern>(&ctx,typeConverter,rtopology_);
+    patterns.add<ConnectStreamPktSwitchPortpattern>(&ctx,typeConverter,rtopology_);
     patterns.add<TileCreatepattern>(&ctx,typeConverter,rtopology_);
     patterns.add<IOShimTileCreatepattern>(&ctx,typeConverter,rtopology_);
     patterns.add<TileArrayHandleCreatepattern>(&ctx,typeConverter,rtopology_);
@@ -414,6 +505,7 @@ void RoutingHWLowerPass::runOnOperation() {
     patterns.add<arithconstantconvert>(&ctx,typeConverter);
     patterns.add<RoutingYieldOp>(&ctx,typeConverter);
     patterns.add<ScfExecuteRegionOpPattern>(&ctx,typeConverter);
+    
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
         llvm::outs() << "applyPartialConversion failed\n";
     }

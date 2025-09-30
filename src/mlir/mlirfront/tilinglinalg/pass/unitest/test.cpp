@@ -39,29 +39,52 @@ int main(int argc, char* argv[]) {
     //auto module2 = mtesthw.ops_test(&ctx);
     std::cout << "main" <<std::endl;
     
+    mlir::PrintIRPassOptions options;
+
     mlir::PassManager pm(&ctx);;
     RoutingTopology rtopology("Gen2");
     
-    pm.addPass(mlir::createPrintIRPass());
+    options.label = "Before RoutingUnrollingLowerPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
-    pm.addPass(mlir::createPrintIRPass());
+    options.label = "After RoutingUnrollingLowerPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingLowerPass>(rtopology));
-    pm.addPass(mlir::createPrintIRPass());
+    options.label = "After RoutingLowerPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
-    pm.addPass(mlir::createPrintIRPass());
+    options.label = "After RoutingHWLowerPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
     //remove dead arg
     pm.addPass(std::make_unique<RoutingDeadArgPass>());
-    pm.addPass(mlir::createPrintIRPass());
+    options.label = "After RoutingDeadArgPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    //The constanfold change emitc.call into emic.call_opaque to convert 
+    /*
+    XAie_LocType v251 = XAie_TileLoc(v1, v10);
+    XAie_DevInst* v252 = getOrCreateDeviceInstance();
+    int32_t v253 = XAie_StrmConnCctEnable(v252, v251, v6, v13, v5, v12);
+    */
+    //into
+    /*
+    int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0); 
+    */
     pm.addPass(std::make_unique<RoutingConstantFoldPass>());
-    pm.addPass(mlir::createPrintIRPass());
+
+    options.label = "After RoutingConstantFoldPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
     //remove the dead code
     pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createPrintIRPass());
+
+    options.label = "After createCanonicalizerPasse:";
+    pm.addPass(mlir::createPrintIRPass(options));
 
     //remove dead arg
     //pm.addPass(mlir::createConvertSCFToEmitCPass());
     (void)pm.run(module1);
-    //module1.dump();
+
+    llvm::outs() << "----------module1.dump---------\n";
+    module1.dump();
 /*
     mlir::PassManager pm2(&ctx);;
     pm2.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
