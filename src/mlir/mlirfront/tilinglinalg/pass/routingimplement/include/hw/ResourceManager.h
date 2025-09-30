@@ -33,6 +33,27 @@ inline PortDirection getDir(Point a, Point b){
     throw std::runtime_error("Points not neighbours");
 }
 
+struct StreamPKTConnection {
+    PortDirection SlaveReceiveForwardDirection;
+    int SlaveReceiveForwardDirectionPortIdx;
+    int SlaveReceivePktID;
+    int SlaveReceivePktType;
+    int localDMAForwardPortIdx;
+    int localDMAForwardPktID;
+    int localDMAForwardPktType;
+    PortDirection MasterSendToNextTileDirection;
+    int MasterSendToNextTileDirectionPortIdx;
+};
+
+struct StreamCCTConnection {
+    PortDirection SlaveReceiveForwardDirection;
+    int SlaveReceiveForwardDirectionPortIdx;
+    int localDMAForwardPortIdx;
+    PortDirection MasterSendToNextTileDirection;
+    int MasterSendToNextTileDirectionPortIdx;
+};
+
+
 /*
 some port is enabled by hw design, in here it specify to SHIM tile input/output port
 for example only port 3 and port 7 enabled by HW to responsible on data movement from
@@ -355,8 +376,10 @@ public:
 
     std::shared_ptr<DataIO> createDataIO(IOType tp, int r=0, int c=0, DMADIRECTION dir = DMADIRECTION::MM2S, int channel =0,std::string nm="", std::string cmt="");
     bool linkAvailable(Point a, Point b, int& portNum) const;
+    bool portDirAvailable(Point a, int& portNum, PortDirection direction, bool master) const;
+
     bool occupyLink(Point a, Point b, const int ioId,int& portNum, PortDirection& pda, PortDirection& pdb);
-    bool occupyPointDirection(Point a,int& portNum, PortDirection& pd);
+    bool occupyPointDirection(Point a,int& portNum, PortDirection& pd,bool slave);
     bool releaseLink(Point a, Point b, int ioId,int portNum);
     std::optional<Point> freeShimNoc(std::optional<Point> dst = std::nullopt )const;
     std::optional<Point> freeShimNoc(std::optional<TypeBasedTileLoc> loc)const;
