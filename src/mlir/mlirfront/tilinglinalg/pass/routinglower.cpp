@@ -14,6 +14,7 @@ void GatherRoutingPathCreate(Operation* op,
                              std::shared_ptr<DataIO>  dio,
                              TileArrayHandleCreate tilecreatehandle, 
                              std::optional<std::shared_ptr<const RoutingPath>> rpath, 
+                             std::vector<Point>& tilist,
                              std::unordered_map<Point, Operation*, Point::Hash> dsttiles,
                              RoutingTopology & router_,
                              ConversionPatternRewriter& rewriter) {
@@ -63,12 +64,18 @@ struct StreamPKTConnection {
 }; */
     std::unordered_map<Point, StreamPKTConnection, Point::Hash> pktswitchmap;
     //create empty structure for each dstPoint
-    for (const auto& [dstPoint, dstTileOp] : dsttiles) {
+    for (const auto& dstPoint : tilist) {
         pktswitchmap[dstPoint] = StreamPKTConnection{};
     }
     //fill the switch map
-    for (const auto& [dstPoint, dstTileOp] : dsttiles) {
-        if (prevpoint == dstPoint) continue;// when process the first point by pass.
+    int pkt_idx = 0;
+    for (const auto& dstPoint : tilist) {
+        pkt_idx++;
+        if (prevpoint == dstPoint) {
+            struct StreamPKTConnection& curtileconf = pktswitchmap[dstPoint];
+            curtileconf.SlaveReceiveForwardDirection = PortDirection::NONE;
+            continue;// when process the first point by pass.
+        }
         int portNum = 0;
         int dmaportNum;
         PortDirection dmadirection = PortDirection::DMA;
@@ -89,15 +96,17 @@ struct StreamPKTConnection {
         struct StreamPKTConnection& curtileconf = pktswitchmap[dstPoint];
         //set prev tile master port and dma port
         prevtileconf.localDMAForwardPortIdx = dmaportNum;
-        prevtileconf.localDMAForwardPktID = 0;//fix me
+        prevtileconf.localDMAForwardPktID = pkt_idx;//fix me
         prevtileconf.localDMAForwardPktType = 0;
         prevtileconf.MasterSendToNextTileDirection = portdirectionPrevMaster;
         prevtileconf.MasterSendToNextTileDirectionPortIdx = portNum;
         //set currenttile receive/slave port
         curtileconf.SlaveReceiveForwardDirection = portdirectionCurSlave;
         curtileconf.SlaveReceiveForwardDirectionPortIdx = portNum;
-        curtileconf.SlaveReceivePktID = 0;//fixme
+        curtileconf.SlaveReceivePktID = 0;//forward all packet
         curtileconf.SlaveReceivePktType = 0;
+        //set currenttile master port into None and expect next neighbor change it
+        curtileconf.MasterSendToNextTileDirection = PortDirection::NONE;
         
         /*
         rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
@@ -117,6 +126,7 @@ struct StreamPKTConnection {
         );
         */
        // 🔹 print directly using your variables
+    /**
     std::cout << "PrevTileConf:\n";
     std::cout << "  localDMAForwardPortIdx = " << prevtileconf.localDMAForwardPortIdx << "\n";
     std::cout << "  localDMAForwardPktID   = " << prevtileconf.localDMAForwardPktID << "\n";
@@ -129,8 +139,27 @@ struct StreamPKTConnection {
     std::cout << "  SlaveReceiveForwardDirectionPortIdx = " << curtileconf.SlaveReceiveForwardDirectionPortIdx << "\n";
     std::cout << "  SlaveReceivePktID   = " << curtileconf.SlaveReceivePktID << "\n";
     std::cout << "  SlaveReceivePktType = " << curtileconf.SlaveReceivePktType << "\n";
+    */
        //
         prevpoint = dstPoint;
+    }
+    for (const auto& dstPoint : tilist) {
+        const Point& key = dstPoint;
+        const StreamPKTConnection& value = pktswitchmap[key];
+
+        // Print the key
+        std::cout << "\nKey: (row is " << key.r << ", col is " << key.c << ")" << std::endl;
+
+        // Print the members of the value struct
+        std::cout << "  - SlaveReceiveForwardDirection: " << PortDirectiontoString(value.SlaveReceiveForwardDirection) << std::endl;
+        std::cout << "  - SlaveReceiveForwardDirectionPortIdx: " << (int)value.SlaveReceiveForwardDirectionPortIdx << std::endl;
+        std::cout << "  - SlaveReceivePktID: " << value.SlaveReceivePktID << std::endl;
+        std::cout << "  - SlaveReceivePktType: " << value.SlaveReceivePktType << std::endl;
+        std::cout << "  - localDMAForwardPortIdx: " << value.localDMAForwardPortIdx << std::endl;
+        std::cout << "  - localDMAForwardPktID: " << value.localDMAForwardPktID << std::endl;
+        std::cout << "  - localDMAForwardPktType: " << value.localDMAForwardPktType << std::endl;
+        std::cout << "  - MasterSendToNextTileDirection: " << PortDirectiontoString(value.MasterSendToNextTileDirection) << std::endl;
+        std::cout << "  - MasterSendToNextTileDirectionPortIdx: " << (int)(value.MasterSendToNextTileDirectionPortIdx) << std::endl;
     }
 }
 
@@ -732,11 +761,12 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         int tileNum = (split_axis == "row") ? col : row;
         for(int i = 0; i < tileNum; i++) {
             if (split_axis == "row") {
+                //FIXME get the core tile base from resource manager
                 tileList.push_back(Point{round_idx + 3/*core row start */, i});
-                llvm::outs() << " row = " << row + round_idx << "col = " << i << "\n";
+                llvm::outs() << " same row  list row = " << round_idx + 3 << "col = " << i << "\n";
             } else {
-                 tileList.push_back(Point{i, round_idx});
-                llvm::outs() << " row = " << i << "col = " << row + round_idx << "\n";
+                 tileList.push_back(Point{i + 3, round_idx});
+                llvm::outs() << "same col list row = " << i << "col = " << row + round_idx << "\n";
             }
         }
         auto output = rewriter.getI32Type();
@@ -791,7 +821,7 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
                 auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
                 dsttiles[{x.r , x.c}] = tile1;
             }
-            GatherRoutingPathCreate(op, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
+            GatherRoutingPathCreate(op, dioid, shimpoint, dio, tilecreatehandle, rpath, tileList, dsttiles, router_, rewriter);
         }
         rewriter.eraseOp(op);
         return success();
