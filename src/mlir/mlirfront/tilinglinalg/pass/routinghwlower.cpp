@@ -114,6 +114,20 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             slave_pkt_type = pi.getInt();
         }
 
+
+        int32_t dma_pkt_idx = 0, dma_pkt_type = 0, dma_port_num, dma_port_slot_num = 0;
+
+        if (auto pd = op->getAttrOfType<IntegerAttr>("localdmapktid")) {
+            dma_pkt_idx = pd.getInt();
+        }
+        if (auto pi = op->getAttrOfType<IntegerAttr>("localdmapkttype")) {
+            dma_pkt_type = pi.getInt();
+        }
+
+        if (auto pn = op->getAttrOfType<IntegerAttr>("localdmaportidx")) {
+            dma_port_num = pn.getInt();
+        }
+
         auto dropheader = "XAIE_SS_PKT_DROP_HEADER";
         auto nodropheader = "XAIE_SS_PKT_DONOT_DROP_HEADER";
 
@@ -151,6 +165,13 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_Packet", TypeRange{packetType}, 
             ValueRange{spkt_idx, spkt_type});
 
+        auto dpkt_idx = rewriter.create<emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_pkt_idx));
+        auto dpkt_type = rewriter.create<emitc::ConstantOp>(op->getLoc(),rewriter.getI32Type(), rewriter.getI32IntegerAttr(dma_pkt_type));
+ 
+        auto packetLocDMAOp = rewriter.create<emitc::CallOp>(
+            op->getLoc(), "XAie_Packet", TypeRange{packetType}, 
+            ValueRange{dpkt_idx, dpkt_type});
+
         Value slaveport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
                                         mlir::emitc::OpaqueAttr::get(rewriter.getContext(), slaveportdirectionstr));
         Value dmaport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
@@ -168,27 +189,29 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
                 ValueRange{deviceInst, tileLocOp.getResult(0), slaveport,slaveidx, slaveslotnum, packetLocOp.getResult(0), mask, msel, abitr});
         }
 
+        Value dmaportn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_num));
+        Value dmaportslotn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_slot_num));
         auto callOpDMA = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
-                ValueRange{deviceInst, tileLocOp.getResult(0), dmaport,slaveidx, slaveslotnum, packetLocOp.getResult(0), dmamask, msel, abitr});
+                ValueRange{deviceInst, tileLocOp.getResult(0), dmaport,dmaportn, dmaportslotn, packetLocDMAOp.getResult(0), dmamask, msel, abitr});
           
         //*///*
         //master port enable
         StringRef calleeM = "XAie_StrmPktSwMstrPortEnable";
          //string type
         mlir::Type stringType2 = mlir::emitc::PointerType::get(rewriter.getI8Type());
+        if (PortDirectiontoString(PortDirection::NONE) != masterportdirectionstr) {
+            Value masterport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType2,
+                                            mlir::emitc::OpaqueAttr::get(rewriter.getContext(), masterportdirectionstr));
+            Value masteridx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(masterportidx));
 
-        Value masterport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType2,
-                                        mlir::emitc::OpaqueAttr::get(rewriter.getContext(), masterportdirectionstr));
-        Value masteridx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(masterportidx));
+            Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(1));
+            Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
 
-        Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(1));
-        Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
-
-        Value dropheadervalue = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
-                                        mlir::emitc::OpaqueAttr::get(rewriter.getContext(), dropheader));
-        
-        auto callOpMport = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeM, 
-            ValueRange{deviceInst, tileLocOp.getResult(0), masterport, masteridx, dropheadervalue, abitr2, msel2});
+            Value dropheadervalue = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
+                                            mlir::emitc::OpaqueAttr::get(rewriter.getContext(), dropheader));
+            auto callOpMport = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeM, 
+                ValueRange{deviceInst, tileLocOp.getResult(0), masterport, masteridx, dropheadervalue, abitr2, msel2});
+        }
         //*/
         rewriter.eraseOp(op);
         return success();
