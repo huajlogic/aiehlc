@@ -35,7 +35,7 @@ struct Point {
 };
 //#include "routing/routingpath.h"
 enum class TileType : uint8_t { Core, Mem, Shim, NocShim, PLShim, PLNocShim, Unknown };
-enum class PortDirection { North, South, East, West, DMA, Control};
+enum class PortDirection { North, South, East, West, DMA, Control, NONE};
 enum class PortRole      { Master, Slave };
 struct PortTemplate {
     PortDirection dir;   // port direction
@@ -56,7 +56,8 @@ static const std::string& PortDirectiontoString(PortDirection dir) {
         { PortDirection::East,    "EAST"    },
         { PortDirection::West,    "WEST"    },
         { PortDirection::DMA,     "DMA"     },
-        { PortDirection::Control, "CONTROL" }
+        { PortDirection::Control, "CONTROL" },
+        { PortDirection::NONE, "NONE" }
     };
 
     auto it = PortDirectionMap.find(dir);

@@ -8,6 +8,17 @@
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/SymbolTable.h"
 
+//The constanfold change emitc.call into emic.call_opaque to convert 
+/*
+XAie_LocType v251 = XAie_TileLoc(v1, v10);
+XAie_DevInst* v252 = getOrCreateDeviceInstance();
+int32_t v253 = XAie_StrmConnCctEnable(v252, v251, v6, v13, v5, v12);
+*/
+//into
+/*
+int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0); 
+*/
+
 static mlir::Attribute findConstantValue(mlir::MLIRContext *context, mlir::PatternRewriter &rewriter, 
   std::string calleeName,mlir::Value value) 
 {
@@ -179,7 +190,7 @@ struct RemoveDeadCallopOpaqueOp : public mlir::OpRewritePattern<mlir::emitc::Cal
   mlir::LogicalResult matchAndRewrite(mlir::emitc::CallOpaqueOp callOp,
                                       mlir::PatternRewriter &rewriter) const override {
     std::string calleeName = callOp.getCallee().str();
-    if (callOp.use_empty() && calleeName == "XAie_TileLoc") {
+    if (callOp.use_empty() && (calleeName == "XAie_TileLoc" || calleeName == "XAie_Packet")) {
       rewriter.eraseOp(callOp);
     }
     return success();

@@ -130,6 +130,17 @@ bool ResourceMgr::linkAvailable(Point a, Point b, int& portNum) const {
     return false;
 }
 
+bool ResourceMgr::portDirAvailable(Point a, int& portNum, PortDirection direction, bool master) const {
+    const auto& va = tile(a.r,a.c).bank(direction).slave;
+    if (master) {
+        tile(a.r,a.c).bank(direction).master;
+    }
+    int lim = va.size();
+    for(int ch=0; ch<lim; ++ch)
+        if(!va[ch].used ){ portNum=ch; return true; }
+    return false;
+}
+
 // ---------- occupyLink ----------
 bool ResourceMgr::occupyLink(Point a, Point b,const int ioId,int& portNum, PortDirection& directionAtoB, PortDirection& directionBtoA) {
     int chosenPort; if(!linkAvailable(a,b,portNum)) return false;
@@ -138,6 +149,14 @@ bool ResourceMgr::occupyLink(Point a, Point b,const int ioId,int& portNum, PortD
     if (tile(a.r,a.c).allocate(IOType::Output, portNum, directionAtoB , ioId) &&
         tile(b.r,b.c).allocate(IOType::Input, portNum, directionBtoA, ioId) ) {
             return true;
+    }
+    return false;
+}
+
+bool ResourceMgr::occupyPointDirection(Point a,int& portNum, PortDirection& pd, bool slave) {
+    if (!portDirAvailable(a, portNum, pd, slave)) return false;
+    if(tile(a.r,a.c).allocate(IOType::Output, portNum, pd , 0)) {
+        return true;
     }
     return false;
 }
