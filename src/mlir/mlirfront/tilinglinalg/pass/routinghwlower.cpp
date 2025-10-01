@@ -153,14 +153,23 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
 
         Value slaveport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
                                         mlir::emitc::OpaqueAttr::get(rewriter.getContext(), slaveportdirectionstr));
-        Value mask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0x1f));
+        Value dmaport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
+                                        mlir::emitc::OpaqueAttr::get(rewriter.getContext(), "DMA"));
+        Value mask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
         Value msel = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
         Value abitr = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
 
         Value slaveidx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(slaveportidx));
         Value slaveslotnum = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
-        auto callOpSPort = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
-            ValueRange{deviceInst, tileLocOp.getResult(0), slaveport,slaveidx, slaveslotnum, packetLocOp.getResult(0), mask, msel, abitr});
+        Value dmamask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0x1f));
+        //receive pkt from neighbor
+        if (PortDirectiontoString(PortDirection::NONE) != slaveportdirectionstr) {
+            auto callOpSPort = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
+                ValueRange{deviceInst, tileLocOp.getResult(0), slaveport,slaveidx, slaveslotnum, packetLocOp.getResult(0), mask, msel, abitr});
+        }
+
+        auto callOpDMA = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
+                ValueRange{deviceInst, tileLocOp.getResult(0), dmaport,slaveidx, slaveslotnum, packetLocOp.getResult(0), dmamask, msel, abitr});
           
         //*///*
         //master port enable
