@@ -190,7 +190,7 @@ struct RemoveDeadCallopOpaqueOp : public mlir::OpRewritePattern<mlir::emitc::Cal
   mlir::LogicalResult matchAndRewrite(mlir::emitc::CallOpaqueOp callOp,
                                       mlir::PatternRewriter &rewriter) const override {
     std::string calleeName = callOp.getCallee().str();
-    if (callOp.use_empty() && calleeName == "XAie_TileLoc") {
+    if (callOp.use_empty() && (calleeName == "XAie_TileLoc" || calleeName == "XAie_Packet")) {
       rewriter.eraseOp(callOp);
     }
     return success();
