@@ -196,36 +196,34 @@ std::optional<TileListRoutingMap> GetSeqPath(
             const Point& currentPoint = branch[i];
             addPointToOrderedList(currentPoint); // Add point to maintain order
 
-            if ( i > 0  && i < branch.size() - 1) {
+            if ( i < branch.size() - 1) {
                 const Point& nextPoint = branch[i+1];
                 int portNum;
                 PortDirection slaveDirOnNext, masterDirOnCurrent;
-                if (!router_.occupyLink(currentPoint, nextPoint, dioid, portNum, slaveDirOnNext, masterDirOnCurrent)) {
+                if (!router_.occupyLink(currentPoint, nextPoint, dioid, portNum, masterDirOnCurrent, slaveDirOnNext)) {
                     llvm::report_fatal_error("Failed to occupy link in routing topology.");
                 }
-                //connectionData[currentPoint].SlaveReceiveForwardDirection = PortDirection::NONE;
+                if (0 == i) {
+                    connectionData[currentPoint].SlaveReceiveForwardDirection = PortDirection::NONE;
+                }
                 connectionData[currentPoint].MasterSendToNextTileDirection = masterDirOnCurrent;
                 connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx = portNum;
                 connectionData[nextPoint].SlaveReceiveForwardDirection = slaveDirOnNext;
                 connectionData[nextPoint].SlaveReceiveForwardDirectionPortIdx = portNum;
-            } else if (0 == i) {
-                connectionData[currentPoint].SlaveReceiveForwardDirection = PortDirection::NONE;
-            } else if (branch.size() - 1 == i) {
-                connectionData[currentPoint].MasterSendToNextTileDirection = PortDirection::NONE;
-            }
+                //set next master into None
+                connectionData[nextPoint].MasterSendToNextTileDirection = PortDirection::NONE;
+            } 
         }
     }
 
     // 1b. Populate DMA connection information
-    if (1 == dmatype) { //if receive DMA
-        auto rm = router_.getRM();
-        for (const auto& p : orderedPathPoints) {
-            connectionData[p].localDMAForwardDirection = PortDirection::NONE;
-            if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core) {
-                if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::TileDMA, PortDirection::DMA, -1)) {
-                    connectionData[p].localDMAForwardDirection = PortDirection::DMA;
-                    connectionData[p].localDMAForwardPortIdx = *portnumptr;
-                }
+    auto rm = router_.getRM();
+    for (const auto& p : orderedPathPoints) {
+        connectionData[p].localDMAForwardDirection = PortDirection::NONE;
+        if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core && 1 == dmatype) {
+            if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::TileDMA, PortDirection::DMA, -1)) {
+                connectionData[p].localDMAForwardDirection = PortDirection::DMA;
+                connectionData[p].localDMAForwardPortIdx = *portnumptr;
             }
         }
     }
@@ -246,7 +244,7 @@ std::optional<TileListRoutingMap> GetSeqPath(
 }
 
 void ParseTheRoutingPath2(Operation* op,
-                         uint32_t dmapolicy,// 0 no dma 1 dma receive
+                         uint32_t streamtype,// 0 normal, 1 broadcast
                          uint32_t dioid,
                          Point shimpoint,
                          std::shared_ptr<DataIO> dio,
@@ -263,7 +261,7 @@ void ParseTheRoutingPath2(Operation* op,
     auto loc = op->getLoc();
     auto outputType = rewriter.getI32Type();
     // --- Phase 1: Build connection map AND an ordered list of points ---
-    auto troutingmap = GetSeqPath(rpath,dio,0/*0 no dma, 1 dma receive*/,router_,rewriter);
+    auto troutingmap = GetSeqPath(rpath,dio,streamtype/* 0 normal no dma, 1 broadcast dma receive*/,router_,rewriter);
     if (!troutingmap) {
         return;
     }
@@ -314,7 +312,7 @@ void ParseTheRoutingPath2(Operation* op,
         }
 
         // Create connection to the local DMA
-        if (conn.localDMAForwardDirection == PortDirection::NONE) {
+        if (conn.localDMAForwardDirection != PortDirection::NONE) {
             rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
                     inputDirStr, inputPortIdx,
                     "DMA", conn.localDMAForwardPortIdx);
@@ -958,7 +956,8 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
                 auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
                 dsttiles[{x.r , x.c}] = tile1;
             }
-            ParseTheRoutingPath(op, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
+            ParseTheRoutingPath2(op, 1, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
+            //ParseTheRoutingPath(op, dioid, shimpoint, dio, tilecreatehandle, rpath, dsttiles, router_, rewriter);
         }  else if (processing_type == 2) {
             if (split_axis == "row") {
                 firtTile = tileList.back();
