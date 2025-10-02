@@ -48,12 +48,17 @@ struct StreamPKTConnection {
 struct StreamCCTConnection {
     PortDirection SlaveReceiveForwardDirection;
     int SlaveReceiveForwardDirectionPortIdx;
+    PortDirection localDMAForwardDirection;
     int localDMAForwardPortIdx;
     PortDirection MasterSendToNextTileDirection;
     int MasterSendToNextTileDirectionPortIdx;
 };
 
-
+struct TileListRoutingMap{
+    std::vector<Point> tilelist;
+    std::unordered_map<Point, StreamCCTConnection, Point::Hash> tilemap;
+    //TileListRoutingMap(std::vector<int> tlist, std::unordered_map<Point, StreamCCTConnection, Point::Hash> tmap) : tilelist(tlist), tilemap(tmap) {}
+};
 /*
 some port is enabled by hw design, in here it specify to SHIM tile input/output port
 for example only port 3 and port 7 enabled by HW to responsible on data movement from
