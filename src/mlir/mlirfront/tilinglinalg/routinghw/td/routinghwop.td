@@ -136,6 +136,7 @@ def ConnectStreamPktSwitchPort:RoutingHWOp<"connectpktstreamswitchport"> {
         I32Attr:$receiveslaveportidx,
         I32Attr:$receiveslavepktid,
         I32Attr:$receiveslavepkttype,
+        StrAttr:$localdmadirection,
         I32Attr:$localdmaportidx,
         I32Attr:$localdmapktid,
         I32Attr:$localdmapkttype,

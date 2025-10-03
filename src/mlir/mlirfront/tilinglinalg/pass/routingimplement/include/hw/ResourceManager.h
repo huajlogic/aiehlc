@@ -57,8 +57,19 @@ struct StreamCCTConnection {
 struct TileListRoutingMap{
     std::vector<Point> tilelist;
     std::unordered_map<Point, StreamCCTConnection, Point::Hash> tilemap;
-    //TileListRoutingMap(std::vector<int> tlist, std::unordered_map<Point, StreamCCTConnection, Point::Hash> tmap) : tilelist(tlist), tilemap(tmap) {}
 };
+
+struct TileListPktRoutingNode {
+    Point tile;
+    void * tileOp;
+    StreamPKTConnection pktconn;
+};
+
+enum class  PktHeaderProcessType {
+    PKT_NO_DROP,
+    PKT_DROP
+};
+
 /*
 some port is enabled by hw design, in here it specify to SHIM tile input/output port
 for example only port 3 and port 7 enabled by HW to responsible on data movement from
@@ -71,6 +82,11 @@ enum class IOType {Input, Output, TileDMA};
 enum class ReservationStrategy {
     COLUMN_FIRST,
     ROW_FIRST
+};
+// stream type
+enum class StreamType {
+    FORWARDONLY,
+    BROADCAST
 };
 class RoutingTile {
 public:

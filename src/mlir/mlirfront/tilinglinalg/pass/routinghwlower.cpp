@@ -116,6 +116,11 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
 
 
         int32_t dma_pkt_idx = 0, dma_pkt_type = 0, dma_port_num, dma_port_slot_num = 0;
+        std::string dmadirectionstr="fixme";
+
+        if (auto pdma = op->getAttrOfType<StringAttr>("localdmadirection")) {
+            dmadirectionstr = pdma.getValue().str();
+        }
 
         if (auto pd = op->getAttrOfType<IntegerAttr>("localdmapktid")) {
             dma_pkt_idx = pd.getInt();
@@ -189,10 +194,13 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
                 ValueRange{deviceInst, tileLocOp.getResult(0), slaveport,slaveidx, slaveslotnum, packetLocOp.getResult(0), mask, msel, abitr});
         }
 
-        Value dmaportn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_num));
-        Value dmaportslotn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_slot_num));
-        auto callOpDMA = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
-                ValueRange{deviceInst, tileLocOp.getResult(0), dmaport,dmaportn, dmaportslotn, packetLocDMAOp.getResult(0), dmamask, msel, abitr});
+        if ( PortDirectiontoString(PortDirection::NONE) != dmadirectionstr) {
+
+            Value dmaportn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_num));
+            Value dmaportslotn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_slot_num));
+            auto callOpDMA = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
+                    ValueRange{deviceInst, tileLocOp.getResult(0), dmaport,dmaportn, dmaportslotn, packetLocDMAOp.getResult(0), dmamask, msel, abitr});
+        }
           
         //*///*
         //master port enable
