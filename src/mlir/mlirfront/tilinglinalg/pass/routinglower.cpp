@@ -346,7 +346,7 @@ void ParseTheCCTRoutingPath(Operation* op,
             if (dio->type() == IOType::Input) {
                 rewriter.create<EnableExtToAieShimPort>(loc, outputType, currentTileOp.getResult(), inputDirStr, inputPortIdx);
             } else {
-               // rewriter.create<EnableAieToExtShimPort>(loc, outputType, currentTileOp.getResult(), inputDirStr, inputPortIdx);
+                rewriter.create<EnableAieToExtShimPort>(loc, outputType, currentTileOp.getResult(), inputDirStr, inputPortIdx);
             }
         }
        // /*
@@ -367,6 +367,7 @@ void ParseTheCCTRoutingPath(Operation* op,
     }
 }
 
+/*
 void ParseTheRoutingPath(Operation* op,
                              uint32_t dioid,
                              Point shimpoint,
@@ -454,14 +455,14 @@ void ParseTheRoutingPath(Operation* op,
                             auto portprevidx = prevportinfo[1];
                             rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output, curop.getResult(),portprevmaster, portprevidx, portdirectionPrevSlaveStr, portNum);
                             //add to dma logic
-                            ///*
+                            //
                             auto rowcol = getrowcol(curop);
                             if (rm->getrsc()->tileType(rowcol[0], rowcol[1]) == TileType::Core) {
                                if (auto portnumptr = rm->tile(rowcol[0],rowcol[1]).occupyport(IOType::TileDMA, PortDirection::DMA, -1)) {
                                    rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output, curop.getResult(),portprevmaster, portprevidx, "DMA", *portnumptr);                                
                                }
                             }
-                            //*/
+                            //
                         } else {
                             //no master port finding means this is the inital shim port get the master information from io
                             //io.getmasterportinfo
@@ -495,6 +496,7 @@ void ParseTheRoutingPath(Operation* op,
         }
     }
 }
+*/
 
 struct indexcastconvert : public ConversionPattern {
     explicit indexcastconvert(MLIRContext * ctx, LLVMTypeConverter &converter):

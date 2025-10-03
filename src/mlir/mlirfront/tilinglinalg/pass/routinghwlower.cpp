@@ -59,6 +59,63 @@ private:
     RoutingTopology & router_;
 };
 
+struct EnableAieToExtShimPortpattern: public ConversionPattern {
+    explicit EnableAieToExtShimPortpattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
+        ConversionPattern(routinghw::EnableAieToExtShimPort::getOperationName(), 1, ctx), typeconverter(converter), router_(router) {
+
+    }
+    LogicalResult matchAndRewrite(Operation *op , ArrayRef<Value> operands, ConversionPatternRewriter& rewriter) const override{
+        //rewriter.eraseOp(op);
+        //return success();
+        auto shimtileoprand = operands[0];
+        auto shimtileop = shimtileoprand.getDefiningOp();
+        //get the enable ext to aie port attribute
+        int32_t portdirection=-1, portidx = -1;
+        if (auto pd = op->getAttrOfType<IntegerAttr>("portdirection")) {
+            portdirection = pd.getInt();
+        }
+        if (auto pi = op->getAttrOfType<IntegerAttr>("portidx")) {
+            portidx = pi.getInt();
+        }
+        // get the tilecreate parameter
+        // Access attributes by name
+        int32_t rowValue=-1, colValue=-1;
+        if (auto colAttr = shimtileop->getAttrOfType<IntegerAttr>("col")) {
+            colValue = colAttr.getInt();
+        } 
+        if (auto rowAttr = shimtileop->getAttrOfType<IntegerAttr>("row")) {
+            rowValue = rowAttr.getInt();
+        }
+        auto colConstOp = rewriter.create<emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(colValue));
+        auto rowConstOp = rewriter.create<emitc::ConstantOp>(op->getLoc(),rewriter.getI32Type(), rewriter.getI32IntegerAttr(rowValue));
+
+        auto tileLocType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_LocType");
+
+        auto tileLocOp = rewriter.create<emitc::CallOp>(
+            op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
+            ValueRange{rowConstOp, colConstOp});
+
+        //get the device instance
+        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
+        auto devInstPtrType = emitc::PointerType::get(devInstType);
+        auto deviceInstOp = rewriter.create<emitc::CallOp>(
+                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
+        Value deviceInst = deviceInstOp.getResult(0);
+
+        StringRef callee = "XAie_EnableAieToShimDmaStrmPort";
+        Value arg0 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(portidx));
+        auto callOp = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, callee, 
+            ValueRange{deviceInst, tileLocOp.getResult(0), arg0});
+
+        rewriter.eraseOp(op);
+        return success();
+    }
+
+private:
+    LLVMTypeConverter& typeconverter;
+    RoutingTopology & router_;
+};
+
 //ConnectStreamPktSwitchPort
 struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
     explicit ConnectStreamPktSwitchPortpattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
@@ -556,6 +613,9 @@ void declareAieTileFunction(mlir::ModuleOp module) {
   auto decl3 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_EnableShimDmaToAieStrmPort", shimportenableType);
   decl3.setVisibility(SymbolTable::Visibility::Private);
 
+  auto decl31 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_EnableAieToShimDmaStrmPort", shimportenableType);
+  decl31.setVisibility(SymbolTable::Visibility::Private);
+
   auto decl4 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_StrmConnCctEnable", tileconnectType);
   decl4.setVisibility(SymbolTable::Visibility::Private);
 
@@ -576,6 +636,7 @@ void RoutingHWLowerPass::runOnOperation() {
     //target.addIllegalOp<arith::ConstantOp>();
     //target.addIllegalOp<routing::RoutingCreate>();
     target.addIllegalOp<routinghw::EnableExtToAieShimPort>();
+    target.addIllegalOp<routinghw::EnableAieToExtShimPort>();
     target.addIllegalOp<routinghw::ConnectStreamSingleSwitchPort>();
     target.addIllegalOp<routinghw::TileCreate>();
     target.addIllegalOp<routinghw::IOShimTileCreate>();
@@ -592,6 +653,7 @@ void RoutingHWLowerPass::runOnOperation() {
     //target.addIllegalDialect<routinghw::RoutingHWDialect>();
     llvm::outs() << "RoutingHWLowerPass::runOnOperation\n";
     patterns.add<EnableExtToAieShimPortpattern>(&ctx,typeConverter,rtopology_);
+    patterns.add<EnableAieToExtShimPortpattern>(&ctx,typeConverter,rtopology_);
     patterns.add<ConnectStreamSingleSwitchPortpattern>(&ctx,typeConverter,rtopology_);
     patterns.add<ConnectStreamPktSwitchPortpattern>(&ctx,typeConverter,rtopology_);
     patterns.add<TileCreatepattern>(&ctx,typeConverter,rtopology_);
