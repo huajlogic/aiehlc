@@ -219,7 +219,21 @@ std::optional<TileListRoutingMap> GetSeqPath(
                 connectionData[nextPoint].SlaveReceiveForwardDirectionPortIdx = portNum;
                 //set next master into None
                 connectionData[nextPoint].MasterSendToNextTileDirection = PortDirection::NONE;
+                
             } 
+        }
+    }
+
+    //Process output dataio, when the last tile is be the shim tile of dataio
+
+    if (dio->type() == IOType::Output) {
+        auto lastilepoint = orderedPathPoints.back();
+        Point shimpoint = { dio->rowpos(),dio->colpos() };
+        if (lastilepoint == shimpoint) {
+             if (auto shimPortInfo = dio->getshimport()) {
+                connectionData[shimpoint].MasterSendToNextTileDirection = shimPortInfo->dir_;
+                connectionData[shimpoint].MasterSendToNextTileDirectionPortIdx = shimPortInfo->portnum_;
+            }
         }
     }
 
