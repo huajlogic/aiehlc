@@ -20,36 +20,36 @@ template<> struct GenTraits<1>
 {
     static const std::string& defaultVariant()
     {
-        static const std::string def = "XCVE2302";
+        static const std::string def = "XCVC190";
         return def;
     }
 
     static const std::map<TileType, std::vector<PortTemplate>>& defaultPortTemplates() {
         static const std::map<TileType, std::vector<PortTemplate>> templates = {
             { TileType::Core, {
-                 { PortDirection::North, PortRole::Master, 4 },
-                { PortDirection::South, PortRole::Master, 4 },
-                { PortDirection::East, PortRole::Master, 4 },
-                { PortDirection::West, PortRole::Master, 4 },
-                { PortDirection::DMA, PortRole::Master, 4 },
-                { PortDirection::North, PortRole::Slave, 4 },
-                { PortDirection::South, PortRole::Slave, 4 },
-                { PortDirection::East, PortRole::Slave, 4 },
-                { PortDirection::West, PortRole::Slave, 4 },
-                { PortDirection::DMA, PortRole::Slave, 4 }
+                 { PortDirection::North, PortRole::Master, 4, {} },
+                { PortDirection::South, PortRole::Master, 4 , {} },
+                { PortDirection::East, PortRole::Master, 4 , {} },
+                { PortDirection::West, PortRole::Master, 4 , {} },
+                { PortDirection::DMA, PortRole::Master, 4 , {} },
+                { PortDirection::North, PortRole::Slave, 4 , {} },
+                { PortDirection::South, PortRole::Slave, 4 , {} },
+                { PortDirection::East, PortRole::Slave, 4 , {} },
+                { PortDirection::West, PortRole::Slave, 4 , {} },
+                { PortDirection::DMA, PortRole::Slave, 4 , {} }
               }
             },
             { TileType::Shim, {
-                 { PortDirection::North, PortRole::Master, 4 },
-                { PortDirection::South, PortRole::Master, 4 },
-                { PortDirection::East, PortRole::Master, 4 },
-                { PortDirection::West, PortRole::Master, 4 },
-                { PortDirection::DMA, PortRole::Master, 4 },
-                { PortDirection::North, PortRole::Slave, 4 },
-                { PortDirection::South, PortRole::Slave, 4 },
-                { PortDirection::East, PortRole::Slave, 4 },
-                { PortDirection::West, PortRole::Slave, 4 },
-                { PortDirection::DMA, PortRole::Slave, 4 }
+                 { PortDirection::North, PortRole::Master, 4 , {} },
+                { PortDirection::South, PortRole::Master, 2 , {2, 3} },//mux
+                { PortDirection::East, PortRole::Master, 4 , {} },
+                { PortDirection::West, PortRole::Master, 4 , {} },
+                { PortDirection::DMA, PortRole::Master, 4 , {} },
+                { PortDirection::North, PortRole::Slave, 4 , {} },
+                { PortDirection::South, PortRole::Slave, 2 , {3, 7} },//demux
+                { PortDirection::East, PortRole::Slave, 4 , {} },
+                { PortDirection::West, PortRole::Slave, 4 , {} },
+                { PortDirection::DMA, PortRole::Slave, 4 , {} }
               }
             },
             { TileType::Mem, {
@@ -84,19 +84,14 @@ template<> struct GenTraits<1>
     static const std::unordered_map<std::string, AIEDeviceLayout>& table()
     {
         static const std::unordered_map<std::string, AIEDeviceLayout> db = {
-            { "XCVE2302",
+            { "XCVC190",
               { 8, 8, 0x2000'0000'000, 23, 18,
                 { {0,0,TileType::Shim},{1,2,TileType::Mem},{3,7,TileType::Core} },
-                  {},
-                  defaultPortTemplates() } },
-
-            { "XCVE2802",
-              { 12, 8, 0x2000'0000'000, 23, 18,
-                { {0,1,TileType::Shim},
-                  {2,2,TileType::Mem},
-                  {3,7,TileType::Core} } ,
-                  {},
-                  defaultPortTemplates()} }
+                  {2, 3, 6, 7, 10, 11, 18, 19, 26, 27, 34, 35, 42, 43, 46, 47},//enabled noc shim
+                  {3, 7},//mux
+                  {2, 3},//demux
+                  defaultPortTemplates() } 
+            }
         };
         return db;
     }
@@ -107,7 +102,7 @@ template<> struct GenTraits<2>
 {
     static const std::string& defaultVariant()
     {
-        static const std::string def = "XCVEk280";
+        static const std::string def = "XCVE2802";
         return def;
     }
 
@@ -128,12 +123,12 @@ template<> struct GenTraits<2>
             },
             { TileType::Shim, {
                 { PortDirection::North, PortRole::Master, 4 },
-                { PortDirection::South, PortRole::Master, 4 },
+                { PortDirection::South, PortRole::Master, 2 , {2, 3} },//mux
                 { PortDirection::East, PortRole::Master, 4 },
                 { PortDirection::West, PortRole::Master, 4 },
                 { PortDirection::DMA, PortRole::Master, 4 },
                 { PortDirection::North, PortRole::Slave, 4 },
-                { PortDirection::South, PortRole::Slave, 4 },
+                { PortDirection::South, PortRole::Slave, 2 , {3, 7} },//demux
                 { PortDirection::East, PortRole::Slave, 4 },
                 { PortDirection::West, PortRole::Slave, 4 },
                 { PortDirection::DMA, PortRole::Slave, 4 }
@@ -171,14 +166,16 @@ template<> struct GenTraits<2>
     static const std::unordered_map<std::string, AIEDeviceLayout>& table()
     {
         static const std::unordered_map<std::string, AIEDeviceLayout> db = {
-            { "XCVEk280",
+            { "XCVE2802",
               { 11, 38, 0x2000'0000000, 25, 20,
                 { 
                   {0,0,TileType::Shim},
                   {1,2,TileType::Mem},
                   {3,11,TileType::Core},
                 } ,
-                {2, 3, 6, 7, 14, 15, 22, 23, 30, 31, 34, 35},
+                {2, 3, 6, 7, 14, 15, 22, 23, 30, 31, 34, 35},//noc shim support
+                {3, 7},//mux
+                {2, 3},//demux
                 defaultPortTemplates()
               } 
             }
@@ -226,6 +223,13 @@ public:
 
     const std::unordered_set<uint32_t>& getShimNoc() const override{
         return layout_.getShimNoc();
+    }
+
+    const std::unordered_set<uint32_t>& getShimExtToAieMuxList() const override {
+        return layout_.getShimExtToAieMuxList();
+    }
+    const std::unordered_set<uint32_t>& getShimAieToExtDemuxList() const override {
+        return layout_.getShimAieToExtDemuxList();
     }
 
     std::string name() const override

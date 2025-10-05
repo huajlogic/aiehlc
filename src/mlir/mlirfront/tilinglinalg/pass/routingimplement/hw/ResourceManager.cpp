@@ -24,6 +24,10 @@ RoutingTile::RoutingTile(int r,int c, TileType tt,const std::vector<PortTemplate
         auto& vec = (tp.role==PortRole::Master)?
                      banks_[tp.dir].master : banks_[tp.dir].slave;
         vec.resize(tp.ports);
+        // if there is an valid available_ports then update the vc.porNum
+        for (int i = 0; i < std::min(tp.ports, (int)tp.available_ports.size()); i++) {
+            vec[i].portNum = tp.available_ports[i];
+        }
     }
 }
 
@@ -32,30 +36,30 @@ std::optional<int> RoutingTile::occupyport(IOType io, PortDirection dir, int ioI
     // the slave port is used and connect to neighbor tile master, when input the
     //master port is the interface
     auto& vec = (io==IOType::Input)? banks_[dir].master : banks_[dir].slave;
-    for (int portNum = 0; portNum < vec.size(); portNum++) {
-        auto portidx = allocate(io, portNum, dir, ioId);
+    for (int i = 0; i < vec.size(); i++) {
+        auto portidx = allocate(io, i, dir, ioId);
         if (portidx) {
-            return *portidx;
+            return portidx;
         }
     }
     return std::nullopt;
 }
-std::optional<int> RoutingTile::allocate(IOType io, int portNum, PortDirection dir, int ioId){
+std::optional<int> RoutingTile::allocate(IOType io, int portidx, PortDirection dir, int ioId){
     //the steam switch on the tile have master and slave port, when it output data
     // the slave port is used and connect to neighbor tile master, when input the
     //master port is the interface
     auto& vec = (io==IOType::Input)? banks_[dir].master : banks_[dir].slave;
     //for(int ch=0; ch<(int)vec.size(); ++ch){
-    if(!vec[portNum].used){ vec[portNum]={true,false,ioId}; return portNum; }
+    if(!vec[portidx].used){ vec[portidx]={true,false,ioId}; return portidx; }
     //}
     return std::nullopt;
 }
 
-bool RoutingTile::releaseByIo(IOType io, int portNum,  PortDirection dir, int ioId){
+bool RoutingTile::releaseByIo(IOType io, int portidx,  PortDirection dir, int ioId){
     auto& vec = (io==IOType::Input)? banks_[dir].slave : banks_[dir].master;
     //for(auto& slot: vec) 
-    auto& slot = vec[portNum];
-    if(slot.used && slot.ioId==ioId && slot.portNum == portNum) {
+    auto& slot = vec[portidx];
+    if(slot.used && slot.ioId==ioId) {
         slot = {};
         return true;
     }
@@ -120,24 +124,24 @@ std::shared_ptr<DataIO> ResourceMgr::createDataIO(IOType tp, int r, int c, DMADI
 }
 // ---------- linkAvailable ----------
 //link a to link b means same port number of A slave and B master should both exist
-bool ResourceMgr::linkAvailable(Point a, Point b, int& portNum) const {
+bool ResourceMgr::linkAvailable(Point a, Point b, int& portIdx) const {
     PortDirection dir=getDir(a,b), odir=opposite(dir);
     const auto& va = tile(a.r,a.c).bank(dir).slave;
     const auto& vb = tile(b.r,b.c).bank(odir).master;
     int lim = std::min<int>(va.size(), vb.size());
     for(int ch=0; ch<lim; ++ch)
-        if(!va[ch].used && !vb[ch].used){ portNum=ch; return true; }
+        if(!va[ch].used && !vb[ch].used){ portIdx=ch; return true; }
     return false;
 }
 
-bool ResourceMgr::portDirAvailable(Point a, int& portNum, PortDirection direction, bool master) const {
+bool ResourceMgr::portDirAvailable(Point a, int& portIdx, PortDirection direction, bool master) const {
     const auto& va = tile(a.r,a.c).bank(direction).slave;
     if (master) {
         tile(a.r,a.c).bank(direction).master;
     }
     int lim = va.size();
     for(int ch=0; ch<lim; ++ch)
-        if(!va[ch].used ){ portNum=ch; return true; }
+        if(!va[ch].used ){ portIdx=ch; return true; }
     return false;
 }
 

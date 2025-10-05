@@ -41,6 +41,7 @@ struct PortTemplate {
     PortDirection dir;   // port direction
     PortRole      role;  // Master / Slave
     int           ports; // available number of ports
+    std::vector<uint32_t> available_ports; //vaiable ports list, this is optinonal infor can be empty if port is 0-(ports-1)
 };
 
 struct TypeBasedTileLoc {
@@ -97,6 +98,8 @@ struct AIEDeviceLayout
 
     std::vector<TileSegment> segments;
     std::unordered_set<uint32_t> nocShimCols;
+    std::unordered_set<uint32_t> shimexttoaie_mux;
+    std::unordered_set<uint32_t> shimaietoext_demux;
     std::map<TileType, std::vector<PortTemplate>> portTemplates;
     
     // helpers -------------------------------------------------
@@ -129,6 +132,12 @@ struct AIEDeviceLayout
     const std::unordered_set<uint32_t>& getShimNoc() const {
         return nocShimCols;
     }
+    const std::unordered_set<uint32_t>& getShimExtToAieMuxList() const {
+        return shimexttoaie_mux;
+    }
+    const std::unordered_set<uint32_t>& getShimAieToExtDemuxList() const {
+        return shimaietoext_demux;
+    }
 };
 
 /* ---------- abstract interface ---------------------------- */
@@ -148,6 +157,8 @@ public:
     virtual const std::vector<PortTemplate>& getPortsForTileType(TileType type) const = 0;
 
     virtual const std::unordered_set<uint32_t>& getShimNoc() const = 0;
+    virtual const std::unordered_set<uint32_t>& getShimExtToAieMuxList() const = 0;
+    virtual const std::unordered_set<uint32_t>& getShimAieToExtDemuxList() const = 0;
 
     virtual uint32_t absTileRow(TileType type, uint32_t relativeRow) const = 0;
 
