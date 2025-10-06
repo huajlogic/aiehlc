@@ -75,7 +75,17 @@ some port is enabled by hw design, in here it specify to SHIM tile input/output 
 for example only port 3 and port 7 enabled by HW to responsible on data movement from
 DDR
 */
-struct PortSlot { bool used=false; bool invalid=false; int portNum=-1; int ioId=-1; };
+struct PortSlot {
+public:
+void setportNum(int pnum) { portNum = pnum;}
+int getportNum() {return portNum;}
+public: 
+    bool used=false; 
+    bool invalid=false; 
+    int ioId=-1;
+private:
+    int portNum=-1; 
+};
 struct DirBank  { std::vector<PortSlot> master; std::vector<PortSlot> slave; };
 enum class IOType {Input, Output, TileDMA};
 // Added for tile reservation
@@ -91,6 +101,8 @@ enum class StreamType {
 class RoutingTile {
 public:
     RoutingTile(int r,int c, TileType tt,const std::vector<PortTemplate> & Portinfo);
+
+    uint32_t getPortnumFromPortIdx(PortDirection dir, PortRole role, uint32_t portidx);
 
     std::optional<int> allocate(IOType io, int portidx,PortDirection dir, int ioId);
     std::optional<int> occupyport(IOType io, PortDirection dir, int ioId);
@@ -399,9 +411,9 @@ public:
     bool linkAvailable(Point a, Point b, int& portIdx) const;
     bool portDirAvailable(Point a, int& portIdx, PortDirection direction, bool master) const;
 
-    bool occupyLink(Point a, Point b, const int ioId,int& portNum, PortDirection& pda, PortDirection& pdb);
-    bool occupyPointDirection(Point a,int& portNum, PortDirection& pd,bool slave);
-    bool releaseLink(Point a, Point b, int ioId,int portNum);
+    bool occupyLink(Point a, Point b, const int ioId,int& portidx, PortDirection& pda, PortDirection& pdb);
+    bool occupyPointDirection(Point a,int& portidx, PortDirection& pd,bool slave);
+    bool releaseLink(Point a, Point b, int ioId,int portidx);
     std::optional<Point> freeShimNoc(std::optional<Point> dst = std::nullopt )const;
     std::optional<Point> freeShimNoc(std::optional<TypeBasedTileLoc> loc)const;
     std::optional<FoundDmaSlot> freeShimNoc(std::optional<TypeBasedTileLoc> ioPaireddstTileloc, DMADIRECTION direct, int requesterIoId)const;
