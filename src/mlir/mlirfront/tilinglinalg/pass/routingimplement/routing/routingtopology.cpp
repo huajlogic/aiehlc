@@ -18,7 +18,8 @@ RoutingTopology::_createDataIO(std::string dioName, std::optional<Point> shim, D
         throw std::runtime_error("No free shim tile for `" + std::string(dioName) + "`");
         return nullptr;
     }
-    auto dio      = rm_->createDataIO(IOType::Input,shim->r, shim->c, direction, channel, dioName);
+    auto diotype = (direction == DMADIRECTION::MM2S) ? IOType::Input : IOType::Output;
+    auto dio      = rm_->createDataIO(diotype,shim->r, shim->c, direction, channel, dioName);
     dataios_.emplace(dio->id(), dio);
     return dio;
 }
