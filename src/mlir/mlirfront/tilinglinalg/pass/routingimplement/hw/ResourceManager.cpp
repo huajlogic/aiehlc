@@ -24,7 +24,22 @@ RoutingTile::RoutingTile(int r,int c, TileType tt,const std::vector<PortTemplate
         auto& vec = (tp.role==PortRole::Master)?
                      banks_[tp.dir].master : banks_[tp.dir].slave;
         vec.resize(tp.ports);
+        // if there is an valid available_ports then update the vc.porNum
+        for (int i = 0; i < std::min(tp.ports, (int)tp.available_ports.size()); i++) {
+            vec[i].setportNum(tp.available_ports[i]);
+        }
     }
+    std::cout << "routing construct done " << std::endl;
+}
+
+uint32_t RoutingTile::getPortnumFromPortIdx(PortDirection dir, PortRole role, uint32_t portidx)
+{
+     auto& vec = (role==PortRole::Master)? banks_[dir].master : banks_[dir].slave;
+     //if vec is empty or the portNum is default -1, then port idx is the portnum
+     if (vec.empty() || (-1 == vec[portidx].getportNum())) {
+        return portidx;
+     }
+     return vec[portidx].getportNum();
 }
 
 std::optional<int> RoutingTile::occupyport(IOType io, PortDirection dir, int ioId){
@@ -32,30 +47,36 @@ std::optional<int> RoutingTile::occupyport(IOType io, PortDirection dir, int ioI
     // the slave port is used and connect to neighbor tile master, when input the
     //master port is the interface
     auto& vec = (io==IOType::Input)? banks_[dir].master : banks_[dir].slave;
-    for (int portNum = 0; portNum < vec.size(); portNum++) {
-        auto portidx = allocate(io, portNum, dir, ioId);
+    for (int i = 0; i < vec.size(); i++) {
+        auto portidx = allocate(io, i, dir, ioId);
         if (portidx) {
-            return *portidx;
+            return portidx;
         }
     }
     return std::nullopt;
 }
-std::optional<int> RoutingTile::allocate(IOType io, int portNum, PortDirection dir, int ioId){
+std::optional<int> RoutingTile::allocate(IOType io, int portidx, PortDirection dir, int ioId){
     //the steam switch on the tile have master and slave port, when it output data
     // the slave port is used and connect to neighbor tile master, when input the
     //master port is the interface
     auto& vec = (io==IOType::Input)? banks_[dir].master : banks_[dir].slave;
     //for(int ch=0; ch<(int)vec.size(); ++ch){
-    if(!vec[portNum].used){ vec[portNum]={true,false,ioId}; return portNum; }
+    if(!vec[portidx].used){ 
+        vec[portidx].used=true;
+        vec[portidx].invalid=false;
+        vec[portidx].ioId = ioId;
+        //keep portNum no change as the allocate only mark the port as used and should not change portnum
+        return portidx; 
+    }
     //}
     return std::nullopt;
 }
 
-bool RoutingTile::releaseByIo(IOType io, int portNum,  PortDirection dir, int ioId){
+bool RoutingTile::releaseByIo(IOType io, int portidx,  PortDirection dir, int ioId){
     auto& vec = (io==IOType::Input)? banks_[dir].slave : banks_[dir].master;
     //for(auto& slot: vec) 
-    auto& slot = vec[portNum];
-    if(slot.used && slot.ioId==ioId && slot.portNum == portNum) {
+    auto& slot = vec[portidx];
+    if(slot.used && slot.ioId==ioId) {
         slot = {};
         return true;
     }
@@ -110,9 +131,10 @@ std::shared_ptr<DataIO> ResourceMgr::createDataIO(IOType tp, int r, int c, DMADI
     TileType tt =resource_->tileType(r, c);
     if (tt == TileType::Shim) {
         RoutingTile& t = tile(r, c);
-        auto portnum = t.occupyport(tp,PortDirection::South, dataioptr->id());
-        if (portnum) {
-            auto shimport = std::make_optional<ShimIOPort>(tp,PortDirection::South,  *portnum);
+        auto portidx = t.occupyport(tp,PortDirection::South, dataioptr->id());
+        if (portidx) {
+            uint32_t portnum = t.getPortnumFromPortIdx(PortDirection::South, (tp == IOType::Input) ? PortRole::Slave : PortRole::Master, *portidx);
+            auto shimport = std::make_optional<ShimIOPort>(tp,PortDirection::South,  portnum);
             dataioptr->setshimport(shimport);
         }
     }
@@ -120,52 +142,52 @@ std::shared_ptr<DataIO> ResourceMgr::createDataIO(IOType tp, int r, int c, DMADI
 }
 // ---------- linkAvailable ----------
 //link a to link b means same port number of A slave and B master should both exist
-bool ResourceMgr::linkAvailable(Point a, Point b, int& portNum) const {
+bool ResourceMgr::linkAvailable(Point a, Point b, int& portIdx) const {
     PortDirection dir=getDir(a,b), odir=opposite(dir);
     const auto& va = tile(a.r,a.c).bank(dir).slave;
     const auto& vb = tile(b.r,b.c).bank(odir).master;
     int lim = std::min<int>(va.size(), vb.size());
     for(int ch=0; ch<lim; ++ch)
-        if(!va[ch].used && !vb[ch].used){ portNum=ch; return true; }
+        if(!va[ch].used && !vb[ch].used){ portIdx=ch; return true; }
     return false;
 }
 
-bool ResourceMgr::portDirAvailable(Point a, int& portNum, PortDirection direction, bool master) const {
+bool ResourceMgr::portDirAvailable(Point a, int& portIdx, PortDirection direction, bool master) const {
     const auto& va = tile(a.r,a.c).bank(direction).slave;
     if (master) {
         tile(a.r,a.c).bank(direction).master;
     }
     int lim = va.size();
     for(int ch=0; ch<lim; ++ch)
-        if(!va[ch].used ){ portNum=ch; return true; }
+        if(!va[ch].used ){ portIdx=ch; return true; }
     return false;
 }
 
 // ---------- occupyLink ----------
-bool ResourceMgr::occupyLink(Point a, Point b,const int ioId,int& portNum, PortDirection& directionAtoB, PortDirection& directionBtoA) {
-    int chosenPort; if(!linkAvailable(a,b,portNum)) return false;
+bool ResourceMgr::occupyLink(Point a, Point b,const int ioId,int& portidx, PortDirection& directionAtoB, PortDirection& directionBtoA) {
+    int chosenPort; if(!linkAvailable(a,b,portidx)) return false;
     directionAtoB=getDir(a,b);
     directionBtoA=opposite(directionAtoB);
-    if (tile(a.r,a.c).allocate(IOType::Output, portNum, directionAtoB , ioId) &&
-        tile(b.r,b.c).allocate(IOType::Input, portNum, directionBtoA, ioId) ) {
+    if (tile(a.r,a.c).allocate(IOType::Output, portidx, directionAtoB , ioId) &&
+        tile(b.r,b.c).allocate(IOType::Input, portidx, directionBtoA, ioId) ) {
             return true;
     }
     return false;
 }
 
-bool ResourceMgr::occupyPointDirection(Point a,int& portNum, PortDirection& pd, bool slave) {
-    if (!portDirAvailable(a, portNum, pd, slave)) return false;
-    if(tile(a.r,a.c).allocate(IOType::Output, portNum, pd , 0)) {
+bool ResourceMgr::occupyPointDirection(Point a,int& portidx, PortDirection& pd, bool slave) {
+    if (!portDirAvailable(a, portidx, pd, slave)) return false;
+    if(tile(a.r,a.c).allocate(IOType::Output, portidx, pd , 0)) {
         return true;
     }
     return false;
 }
 
 // ---------- releaseLink (by ioId) ----------
-bool ResourceMgr::releaseLink(Point a, Point b, int ioId,int portNum){
+bool ResourceMgr::releaseLink(Point a, Point b, int ioId,int portidx){
     PortDirection dir=getDir(a,b), odir=opposite(dir);
-    bool ret = tile(a.r,a.c).releaseByIo(IOType::Output,portNum, dir , ioId);
-    ret |= tile(b.r,b.c).releaseByIo(IOType::Input ,portNum, odir, ioId);
+    bool ret = tile(a.r,a.c).releaseByIo(IOType::Output,portidx, dir , ioId);
+    ret |= tile(b.r,b.c).releaseByIo(IOType::Input ,portidx, odir, ioId);
     return ret;
 }
 

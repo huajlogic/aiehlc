@@ -123,13 +123,21 @@ bool RoutingPath::addIOTree(const std::vector<Point>& sinksIn) {
 //--------------------------------------------------------------------
 // multi sink incremental tree
 //--------------------------------------------------------------------
-bool RoutingPath::addIOTree(const std::vector<Point>& sinksIn,MultiPath& out){
-
-    if (!dio_) return false;
-    Point src = {dio_->rowpos(), dio_->colpos()};
-    if(sinksIn.empty()) return false;
+bool RoutingPath::addIOTree(const std::vector<Point>& sinksIn,MultiPath& out) {
+    if (!dio_ || sinksIn.empty()) return false;
+    Point src;
+    std::vector<Point> sinks;
+    if(dio_->dmadir() == DMADIRECTION::MM2S) {
+        src = {dio_->rowpos(), dio_->colpos()};
+        sinks=sinksIn;
+    }else if (dio_->dmadir() == DMADIRECTION::S2MM)  {
+        src = {sinksIn.back().r, sinksIn.back().c};
+        sinks= std::vector<Point>{{dio_->rowpos(), dio_->colpos()}};
+    } else {
+        std::cout << " dma dir not found  " << (int)dio_->dmadir() << std::endl;
+        return false;
+    }
     // 1. sort sinks by col then row
-    std::vector<Point> sinks=sinksIn;
     std::sort(sinks.begin(),sinks.end(),[](Point a,Point b){
         if(a.c!=b.c) return a.c<b.c;
         return a.r<b.r;

@@ -59,6 +59,63 @@ private:
     RoutingTopology & router_;
 };
 
+struct EnableAieToExtShimPortpattern: public ConversionPattern {
+    explicit EnableAieToExtShimPortpattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
+        ConversionPattern(routinghw::EnableAieToExtShimPort::getOperationName(), 1, ctx), typeconverter(converter), router_(router) {
+
+    }
+    LogicalResult matchAndRewrite(Operation *op , ArrayRef<Value> operands, ConversionPatternRewriter& rewriter) const override{
+        //rewriter.eraseOp(op);
+        //return success();
+        auto shimtileoprand = operands[0];
+        auto shimtileop = shimtileoprand.getDefiningOp();
+        //get the enable ext to aie port attribute
+        int32_t portdirection=-1, portidx = -1;
+        if (auto pd = op->getAttrOfType<IntegerAttr>("portdirection")) {
+            portdirection = pd.getInt();
+        }
+        if (auto pi = op->getAttrOfType<IntegerAttr>("portidx")) {
+            portidx = pi.getInt();
+        }
+        // get the tilecreate parameter
+        // Access attributes by name
+        int32_t rowValue=-1, colValue=-1;
+        if (auto colAttr = shimtileop->getAttrOfType<IntegerAttr>("col")) {
+            colValue = colAttr.getInt();
+        } 
+        if (auto rowAttr = shimtileop->getAttrOfType<IntegerAttr>("row")) {
+            rowValue = rowAttr.getInt();
+        }
+        auto colConstOp = rewriter.create<emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(colValue));
+        auto rowConstOp = rewriter.create<emitc::ConstantOp>(op->getLoc(),rewriter.getI32Type(), rewriter.getI32IntegerAttr(rowValue));
+
+        auto tileLocType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_LocType");
+
+        auto tileLocOp = rewriter.create<emitc::CallOp>(
+            op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
+            ValueRange{rowConstOp, colConstOp});
+
+        //get the device instance
+        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
+        auto devInstPtrType = emitc::PointerType::get(devInstType);
+        auto deviceInstOp = rewriter.create<emitc::CallOp>(
+                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
+        Value deviceInst = deviceInstOp.getResult(0);
+
+        StringRef callee = "XAie_EnableAieToShimDmaStrmPort";
+        Value arg0 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(portidx));
+        auto callOp = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, callee, 
+            ValueRange{deviceInst, tileLocOp.getResult(0), arg0});
+
+        rewriter.eraseOp(op);
+        return success();
+    }
+
+private:
+    LLVMTypeConverter& typeconverter;
+    RoutingTopology & router_;
+};
+
 //ConnectStreamPktSwitchPort
 struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
     explicit ConnectStreamPktSwitchPortpattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
@@ -114,6 +171,25 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             slave_pkt_type = pi.getInt();
         }
 
+
+        int32_t dma_pkt_idx = 0, dma_pkt_type = 0, dma_port_num, dma_port_slot_num = 0;
+        std::string dmadirectionstr="fixme";
+
+        if (auto pdma = op->getAttrOfType<StringAttr>("localdmadirection")) {
+            dmadirectionstr = pdma.getValue().str();
+        }
+
+        if (auto pd = op->getAttrOfType<IntegerAttr>("localdmapktid")) {
+            dma_pkt_idx = pd.getInt();
+        }
+        if (auto pi = op->getAttrOfType<IntegerAttr>("localdmapkttype")) {
+            dma_pkt_type = pi.getInt();
+        }
+
+        if (auto pn = op->getAttrOfType<IntegerAttr>("localdmaportidx")) {
+            dma_port_num = pn.getInt();
+        }
+
         auto dropheader = "XAIE_SS_PKT_DROP_HEADER";
         auto nodropheader = "XAIE_SS_PKT_DONOT_DROP_HEADER";
 
@@ -151,6 +227,13 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_Packet", TypeRange{packetType}, 
             ValueRange{spkt_idx, spkt_type});
 
+        auto dpkt_idx = rewriter.create<emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_pkt_idx));
+        auto dpkt_type = rewriter.create<emitc::ConstantOp>(op->getLoc(),rewriter.getI32Type(), rewriter.getI32IntegerAttr(dma_pkt_type));
+ 
+        auto packetLocDMAOp = rewriter.create<emitc::CallOp>(
+            op->getLoc(), "XAie_Packet", TypeRange{packetType}, 
+            ValueRange{dpkt_idx, dpkt_type});
+
         Value slaveport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
                                         mlir::emitc::OpaqueAttr::get(rewriter.getContext(), slaveportdirectionstr));
         Value dmaport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
@@ -168,27 +251,32 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
                 ValueRange{deviceInst, tileLocOp.getResult(0), slaveport,slaveidx, slaveslotnum, packetLocOp.getResult(0), mask, msel, abitr});
         }
 
-        auto callOpDMA = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
-                ValueRange{deviceInst, tileLocOp.getResult(0), dmaport,slaveidx, slaveslotnum, packetLocOp.getResult(0), dmamask, msel, abitr});
+        if ( PortDirectiontoString(PortDirection::NONE) != dmadirectionstr) {
+
+            Value dmaportn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_num));
+            Value dmaportslotn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_slot_num));
+            auto callOpDMA = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
+                    ValueRange{deviceInst, tileLocOp.getResult(0), dmaport,dmaportn, dmaportslotn, packetLocDMAOp.getResult(0), dmamask, msel, abitr});
+        }
           
         //*///*
         //master port enable
         StringRef calleeM = "XAie_StrmPktSwMstrPortEnable";
          //string type
         mlir::Type stringType2 = mlir::emitc::PointerType::get(rewriter.getI8Type());
+        if (PortDirectiontoString(PortDirection::NONE) != masterportdirectionstr) {
+            Value masterport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType2,
+                                            mlir::emitc::OpaqueAttr::get(rewriter.getContext(), masterportdirectionstr));
+            Value masteridx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(masterportidx));
 
-        Value masterport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType2,
-                                        mlir::emitc::OpaqueAttr::get(rewriter.getContext(), masterportdirectionstr));
-        Value masteridx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(masterportidx));
+            Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(1));
+            Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
 
-        Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(1));
-        Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
-
-        Value dropheadervalue = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
-                                        mlir::emitc::OpaqueAttr::get(rewriter.getContext(), dropheader));
-        
-        auto callOpMport = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeM, 
-            ValueRange{deviceInst, tileLocOp.getResult(0), masterport, masteridx, dropheadervalue, abitr2, msel2});
+            Value dropheadervalue = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
+                                            mlir::emitc::OpaqueAttr::get(rewriter.getContext(), dropheader));
+            auto callOpMport = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeM, 
+                ValueRange{deviceInst, tileLocOp.getResult(0), masterport, masteridx, dropheadervalue, abitr2, msel2});
+        }
         //*/
         rewriter.eraseOp(op);
         return success();
@@ -525,6 +613,9 @@ void declareAieTileFunction(mlir::ModuleOp module) {
   auto decl3 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_EnableShimDmaToAieStrmPort", shimportenableType);
   decl3.setVisibility(SymbolTable::Visibility::Private);
 
+  auto decl31 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_EnableAieToShimDmaStrmPort", shimportenableType);
+  decl31.setVisibility(SymbolTable::Visibility::Private);
+
   auto decl4 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_StrmConnCctEnable", tileconnectType);
   decl4.setVisibility(SymbolTable::Visibility::Private);
 
@@ -545,6 +636,7 @@ void RoutingHWLowerPass::runOnOperation() {
     //target.addIllegalOp<arith::ConstantOp>();
     //target.addIllegalOp<routing::RoutingCreate>();
     target.addIllegalOp<routinghw::EnableExtToAieShimPort>();
+    target.addIllegalOp<routinghw::EnableAieToExtShimPort>();
     target.addIllegalOp<routinghw::ConnectStreamSingleSwitchPort>();
     target.addIllegalOp<routinghw::TileCreate>();
     target.addIllegalOp<routinghw::IOShimTileCreate>();
@@ -561,6 +653,7 @@ void RoutingHWLowerPass::runOnOperation() {
     //target.addIllegalDialect<routinghw::RoutingHWDialect>();
     llvm::outs() << "RoutingHWLowerPass::runOnOperation\n";
     patterns.add<EnableExtToAieShimPortpattern>(&ctx,typeConverter,rtopology_);
+    patterns.add<EnableAieToExtShimPortpattern>(&ctx,typeConverter,rtopology_);
     patterns.add<ConnectStreamSingleSwitchPortpattern>(&ctx,typeConverter,rtopology_);
     patterns.add<ConnectStreamPktSwitchPortpattern>(&ctx,typeConverter,rtopology_);
     patterns.add<TileCreatepattern>(&ctx,typeConverter,rtopology_);
