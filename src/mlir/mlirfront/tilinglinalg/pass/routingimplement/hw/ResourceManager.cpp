@@ -29,7 +29,7 @@ RoutingTile::RoutingTile(int r,int c, TileType tt,const std::vector<PortTemplate
             vec[i].setportNum(tp.available_ports[i]);
         }
     }
-    std::cout << "routing construct done " << std::endl;
+    //std::cout << "routing construct done " << std::endl;
 }
 
 uint32_t RoutingTile::getPortnumFromPortIdx(PortDirection dir, PortRole role, uint32_t portidx)

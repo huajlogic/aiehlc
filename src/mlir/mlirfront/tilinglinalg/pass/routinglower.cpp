@@ -967,15 +967,16 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         llvm::outs() << "replicate_on=" << replicate_on << " single_tile_owner=" << single_tile_owner << "\n";
 
         std::vector<Point> tileList;
-        int tileNum = (split_axis == "row") ? col : row;
+        int tileNum = (split_axis == "row") ? row : col;
+        int core_start_row = (int) router_.getRM()->getrsc()->absTileRow(TileType::Core, 0);
         for(int i = 0; i < tileNum; i++) {
             if (split_axis == "row") {
                 //FIXME get the core tile base from resource manager
-                tileList.push_back(Point{round_idx + 3/*core row start */, i});
+                tileList.push_back(Point{round_idx + core_start_row/*core row start */, i});
                 llvm::outs() << " same row  list row = " << round_idx + 3 << "col = " << i << "\n";
             } else {
-                 tileList.push_back(Point{i + 3, round_idx});
-                llvm::outs() << "same col list row = " << i << "col = " << row + round_idx << "\n";
+                tileList.push_back(Point{i + core_start_row, round_idx});
+                llvm::outs() << "same col list row = " << i + core_start_row << "col = " << round_idx << "\n";
             }
         }
         auto output = rewriter.getI32Type();
