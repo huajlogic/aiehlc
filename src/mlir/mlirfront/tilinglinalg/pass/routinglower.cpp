@@ -169,6 +169,7 @@ struct StreamPKTConnection {
 std::optional<TileListRoutingMap> GetSeqPath(
                          std::optional<std::shared_ptr<const RoutingPath>> rpath,
                          std::shared_ptr<DataIO> dio,
+                         std::unordered_map<Point, Operation*, Point::Hash> dsttiles,
                          StreamType streamtype,// 0 no dma, 1 dma receive
                          std::optional<TileListPktRoutingNode> lastPkttilemap,
                          RoutingTopology& router_,
@@ -198,11 +199,15 @@ std::optional<TileListRoutingMap> GetSeqPath(
     };
 
     // 1a. Iterate over path links to populate connectionData and the ordered list
+    uint8_t tree_round = 0;
     for (const auto& branch : tree.branches) {
+        
         for (size_t i = 0; i < branch.size(); ++i) {
             const Point& currentPoint = branch[i];
             addPointToOrderedList(currentPoint); // Add point to maintain order
-
+            if (0 == tree_round && 0 == i) {
+                connectionData[currentPoint].SlaveReceiveForwardDirection = PortDirection::NONE;
+            }
             if ( i < branch.size() - 1) {
                 const Point& nextPoint = branch[i+1];
                 int portNum;
@@ -210,9 +215,7 @@ std::optional<TileListRoutingMap> GetSeqPath(
                 if (!router_.occupyLink(currentPoint, nextPoint, dioid, portNum, masterDirOnCurrent, slaveDirOnNext)) {
                     llvm::report_fatal_error("Failed to occupy link in routing topology.");
                 }
-                if (0 == i) {
-                    connectionData[currentPoint].SlaveReceiveForwardDirection = PortDirection::NONE;
-                }
+                
                 connectionData[currentPoint].MasterSendToNextTileDirection = masterDirOnCurrent;
                 connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx = portNum;
                 connectionData[nextPoint].SlaveReceiveForwardDirection = slaveDirOnNext;
@@ -222,6 +225,7 @@ std::optional<TileListRoutingMap> GetSeqPath(
                 
             } 
         }
+        tree_round++;
     }
 
     //Process output dataio, when the last tile is be the shim tile of dataio
@@ -241,7 +245,9 @@ std::optional<TileListRoutingMap> GetSeqPath(
     auto rm = router_.getRM();
     for (const auto& p : orderedPathPoints) {
         connectionData[p].localDMAForwardDirection = PortDirection::NONE;
-        if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core && StreamType::BROADCAST == streamtype) {
+        if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core 
+            && StreamType::BROADCAST == streamtype
+            && dsttiles.find(p) != dsttiles.end()) {
             if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::TileDMA, PortDirection::DMA, -1)) {
                 connectionData[p].localDMAForwardDirection = PortDirection::DMA;
                 connectionData[p].localDMAForwardPortIdx = *portnumptr;
@@ -283,7 +289,7 @@ void ParseTheCCTRoutingPath(Operation* op,
     auto loc = op->getLoc();
     auto outputType = rewriter.getI32Type();
     // --- Phase 1: Build connection map AND an ordered list of points ---
-    auto troutingmap = GetSeqPath(rpath,dio,streamtype/* 0 normal no dma, 1 broadcast dma receive*/,lastPkttilemap,router_,rewriter);
+    auto troutingmap = GetSeqPath(rpath,dio,dsttiles, streamtype/* 0 normal no dma, 1 broadcast dma receive*/,lastPkttilemap,router_,rewriter);
     if (!troutingmap) {
         return;
     }
