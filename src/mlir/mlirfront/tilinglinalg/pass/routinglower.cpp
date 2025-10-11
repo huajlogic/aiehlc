@@ -359,9 +359,15 @@ void ParseTheCCTRoutingPath(Operation* op,
        // /*
         // Create connection to the next tile in the path
         if (conn.MasterSendToNextTileDirection != PortDirection::NONE) {
-            rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
-                inputDirStr, inputPortIdx,
-                PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
+            if (point == shimpoint) {
+                 rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, shimio.getResult(),
+                    inputDirStr, inputPortIdx,
+                    PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
+            } else {
+                rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
+                    inputDirStr, inputPortIdx,
+                    PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
+            }
         }
 
         // Create connection to the local DMA

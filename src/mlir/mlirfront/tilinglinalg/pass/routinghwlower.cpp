@@ -306,12 +306,29 @@ struct ConnectStreamSingleSwitchPortpattern: public ConversionPattern {
         auto tileop = tileoprand.getDefiningOp();
         
         int32_t rowValue=-1, colValue=-1;
-        if (auto colAttr = tileop->getAttrOfType<IntegerAttr>("col")) {
-            colValue = colAttr.getInt();
-        } 
-        if (auto rowAttr = tileop->getAttrOfType<IntegerAttr>("row")) {
-            rowValue = rowAttr.getInt();
+        //if (auto colAttr = tileop->getAttrOfType<IntegerAttr>("col")) {
+        //    colValue = colAttr.getInt();
+        //} 
+        //if (auto rowAttr = tileop->getAttrOfType<IntegerAttr>("row")) {
+        //    rowValue = rowAttr.getInt();
+        //}
+        ///*
+        if (auto shimop = dyn_cast<routinghw::TileCreate>(tileop)) {
+            if (auto colAttr = shimop->getAttrOfType<IntegerAttr>("col")) {
+                colValue = colAttr.getInt();
+            } 
+            if (auto rowAttr = shimop->getAttrOfType<IntegerAttr>("row")) {
+                rowValue = rowAttr.getInt();
+            }
+        } else if (auto shimop = dyn_cast<IOShimTileCreate>(tileop)){
+            if (auto colAttr = shimop->getAttrOfType<IntegerAttr>("col")) {
+                colValue = colAttr.getInt();
+            } 
+            if (auto rowAttr = shimop->getAttrOfType<IntegerAttr>("row")) {
+                rowValue = rowAttr.getInt();
+            }
         }
+        //*/
 
         int32_t masterportdirection=-1, masterportidx = -1,slaveportdirection=-1, slaveportidx = -1;
         std::string masterportdirectionstr="fixme",slaveportdirectionstr="fixme";
