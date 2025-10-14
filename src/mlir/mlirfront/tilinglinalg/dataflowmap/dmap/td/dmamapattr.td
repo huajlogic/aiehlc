@@ -20,4 +20,16 @@ def dmamapdialect : Dialect {
 class dmamapattr<string name> : AttrDef<dmamapdialect, name>{}
 class dmamaptype<string name, list<Trait> traits=[]> : TypeDef<dmamapdialect, name,traits>{} 
 
+def dataaccesspattern : dmamapattr<"dataaccesspattern"> {
+    let mnemonic = "datadirectionattr";
+    let cppNamespace = "dmapdialect";
+    let parameters = ( ins
+        "StringAttr":$direction,
+        "int64_t":$sizepertran,
+        "int64_t":$pingpongbuffer,
+        "int64_t":$slidingaccess
+    );
+    let assemblyFormat = "`{` $direction `,` $sizepertran  `,` $pingpongbuffer `,` $slidingaccess `}`";
+
+}
 #endif//_ATTR_DMAMAP_
