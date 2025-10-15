@@ -11,7 +11,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 
 include "dmapattr.td"
 
-def dmap_ConfigureIOOp : dmapop<"configure_io"> {
+def dmap_ConfigurePortOp : dmapop<"configure_port"> {
   let summary = "Configures a logical data port on a physical hardware entity.";
   let description = [{
     Binds a physical hardware handle (e.g., a tile from the routinghw dialect)
@@ -21,11 +21,11 @@ def dmap_ConfigureIOOp : dmapop<"configure_io"> {
 
   let arguments = (ins
     I32Attr:$channel,
-    ioattr:$io,
+    portattr:$port,
     dataaccesspattern:$accesspattern,
   );
 
-  let results = (outs dmapiotype:$port);
+  let results = (outs dmapporttype:$port);
 
   let assemblyFormat = [{
      attr-dict `->` $port
