@@ -33,6 +33,6 @@ ${LLVM_BIN}/mlir-tblgen --gen-attrdef-decls $TD/dmapattr.td -attrdefs-dialect=dm
 #${LLVM_BIN}/mlir-tblgen --gen-type-interface-defs $TD/dmamapterface.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} -o  $INC/dmamapterface.cc.inc
 #${LLVM_BIN}/mlir-tblgen --gen-type-interface-decls $TD/dmamapterface.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} -o  $INC/dmamapterface.h.inc
 
-#${LLVM_BIN}/mlir-tblgen -gen-op-defs $TD/dmamapop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmamapop.cc.inc
-#${LLVM_BIN}/mlir-tblgen -gen-op-decls $TD/dmamapop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmamapop.h.inc
+${LLVM_BIN}/mlir-tblgen -gen-op-defs $TD/dmapop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmamapop.cc.inc
+${LLVM_BIN}/mlir-tblgen -gen-op-decls $TD/dmapop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmamapop.h.inc
 popd

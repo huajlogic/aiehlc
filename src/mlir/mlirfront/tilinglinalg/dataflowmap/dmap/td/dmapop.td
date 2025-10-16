@@ -4,14 +4,26 @@
 ******************************************************************************/
 #ifndef dmap_OPS
 #define dmap_OPS
-
-include "mlir/IR/OpBase.td"
-include "mlir/IR/Dialect.td"
-include "mlir/Interfaces/SideEffectInterfaces.td"
-
 include "dmapattr.td"
+/*
+      %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
+      %portsend = dataflowmap.configure_port {row = 0, col = 2, dataacces=}  
+      %portreceive1 = dataflowmap.configure_port on %{row = 3, col = 0, dataacces=}  
+      %portreceive2 = dataflowmap.configure_port on %{row = 3, col = 1, dataacces=}   
+      %receive_group = dataflowmap.create_port_group(%portreceive1, %portreceive2)    
+      %broadcast_stream = dataflowmap.create_stream %send_port, %receive_group         
+      dataflowmap.push %data, %broadcast_stream {cache_policy = "force_memtile" }
 
-def dmap_ConfigurePortOp : dmapop<"configure_port"> {
+      def Dataflow_PortType : Type<CPred<"$_self.isa<dflow::PortType>()">, "dataflow port">;
+def Dataflow_PortGroupType : Type<CPred<"$_self.isa<dflow::PortGroupType>()">, "dataflow port group">;
+
+def Dataflow_PortOrGroup : TypeConstraint<
+  CPred<"$_self.isa<dflow::PortType>() || $_self.isa<dflow::PortGroupType>()">,
+  "port or port group">;
+
+*/
+
+def dmap_configure_port : dmapop<"configure_port"> {
   let summary = "Configures a logical data port on a physical hardware entity.";
   let description = [{
     Binds a physical hardware handle (e.g., a tile from the routinghw dialect)
@@ -20,7 +32,8 @@ def dmap_ConfigurePortOp : dmapop<"configure_port"> {
   }];
 
   let arguments = (ins
-    I32Attr:$channel,
+    I32Attr:$row,
+    I32Attr:$col,
     portattr:$port,
     dataaccesspattern:$accesspattern,
   );
