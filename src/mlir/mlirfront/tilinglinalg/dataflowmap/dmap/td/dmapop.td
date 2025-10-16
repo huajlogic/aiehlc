@@ -4,10 +4,12 @@
 ******************************************************************************/
 #ifndef dmap_OPS
 #define dmap_OPS
-include "dmapattr.td"
+include "dmaptype.td"
 /*
       %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
-      %portsend = dataflowmap.configure_port {row = 0, col = 2, dataacces=}  
+      %pegroup = dataflowmap.dmap_create_pe_group {group_idx = 1, pe_count=4, "row"}
+      %pegroup = dataflowmap.dmap_create_pe_group {1, 4, "row"}
+      %portsend = dataflowmap.configure_port %pegroup {row = 0, col = 2, dataacces=}  
       %portreceive1 = dataflowmap.configure_port on %{row = 3, col = 0, dataacces=}  
       %portreceive2 = dataflowmap.configure_port on %{row = 3, col = 1, dataacces=}   
       %receive_group = dataflowmap.create_port_group(%portreceive1, %portreceive2)    
@@ -23,6 +25,41 @@ def Dataflow_PortOrGroup : TypeConstraint<
 
 */
 
+def dmap_create_core_engine_group : dmapop<"create_core_engine_group"> {
+  let summary = "create core engine group";
+  let description = [{
+
+  }];
+
+  let arguments = (ins
+    I32Attr:$group_idx,
+    I32Attr:$core_count,
+    StrAttr:$group_axis // row or col
+  );
+  let results = (outs dmapcoreenginegrouptype:$pegroup );
+
+  let assemblyFormat = [{
+    attr-dict `->` type($pegroup)
+  }];
+}
+
+def dmap_create_io_engine : dmapop<"create_io_group"> {
+  let summary = "create io group";
+  let description = [{
+
+  }];
+
+  let arguments = (ins
+    I32Attr:$io_idx,
+    StrAttr:$comments // row or col
+  );
+  let results = (outs dmapioenginetype:$ioengine );
+
+  let assemblyFormat = [{
+    attr-dict `->` type($ioengine)
+  }];
+}
+
 def dmap_configure_port : dmapop<"configure_port"> {
   let summary = "Configures a logical data port on a physical hardware entity.";
   let description = [{
@@ -32,20 +69,19 @@ def dmap_configure_port : dmapop<"configure_port"> {
   }];
 
   let arguments = (ins
-    I32Attr:$row,
-    I32Attr:$col,
-    portattr:$port,
-    dataaccesspattern:$accesspattern,
+    AnyTypeOf<[dmapioenginetype, dmapcoreenginegrouptype]>:$pegrouporioengine,
+    I32Attr:$peorioidx,
+    dataaccesspattern:$accesspattern
   );
 
   let results = (outs dmapporttype:$port);
 
   let assemblyFormat = [{
-     attr-dict `->` $port
+     $pegrouporioengine `:` type($pegrouporioengine) attr-dict `->` type($port) 
   }];
 }
 
-def dmap_CreatePortGroupOp : dmapop<"create_port_group"> {
+def dmap_createport_group : dmapop<"create_port_group"> {
   let summary = "Groups multiple destination ports into a single multicast group.";
   let description = [{
     Takes a list of destination ports and bundles them into a single, addressable
@@ -54,17 +90,17 @@ def dmap_CreatePortGroupOp : dmapop<"create_port_group"> {
   }];
 
   let arguments = (ins
-    Variadic<dmap_PortType>:$ports
+    Variadic<dmapporttype>:$ports
   );
 
-  let results = (outs dmap_PortGroupType:$group);
+  let results = (outs dmapportgrouptype:$group);
 
   let assemblyFormat = [{
-    `(` $ports `)` attr-dict `:` type($ports) `->` $group
+    `(` $ports `)` attr-dict `:` type($ports) `->` type($group)
   }];
 }
 
-def dmap_CreateStreamOp : dmapop<"create_stream"> {
+def dmap_createSstream : dmapop<"create_stream"> {
   let summary = "Defines a logical data stream from a source to a destination.";
   let description = [{
     Creates an edge in the dataflow graph, explicitly connecting a source port
@@ -73,23 +109,23 @@ def dmap_CreateStreamOp : dmapop<"create_stream"> {
   }];
 
   let arguments = (ins
-    dmap_PortType:$source,
-    AnyTypeOf<[dmap_PortType, dmap_PortGroupType]>:$destination
+    //dmapportorgroup:$source,
+    AnyTypeOf<[dmapporttype, dmapportgrouptype]>:$source,
+    AnyTypeOf<[dmapporttype, dmapportgrouptype]>:$destination
   );
 
-  let results = (outs dmap_StreamType:$stream);
+  let results = (outs dmapportstreamtype:$stream);
 
   let assemblyFormat = [{
-    $source `,` $destination attr-dict `->` $stream
+    $source `,` $destination `:` type($source) type($destination) attr-dict `->` type($stream)
   }];
 }
-
 
 //===----------------------------------------------------------------------===//
 // Execution Operators
 //===----------------------------------------------------------------------===//
 
-def dmap_PushOp : dmapop<"push", [MemoryEffect_Interface]> {
+def dmap_push : dmapop<"push"> {
   let summary = "Pushes a block of data into a pre-defined stream.";
   let description = [{
     The primary execution-phase operation. It takes a memref of data and
@@ -98,17 +134,16 @@ def dmap_PushOp : dmapop<"push", [MemoryEffect_Interface]> {
   }];
 
   let arguments = (ins
-    AnyMemRef:$data,
-    dmap_StreamType:$stream
+    dmapdata:$data,
+    dmapportstreamtype:$stream
   );
 
   let assemblyFormat = [{
     $data `to` $stream attr-dict
   }];
 
-  let effects = [MemoryEffects::Write]; // This op causes writes to device memory.
 }
-
+/*
 def dmap_SyncOp : dmapop<"sync", [MemoryEffect_Interface]> {
   let summary = "Waits for all transfers in a stream to complete.";
   let description = [{
@@ -126,5 +161,5 @@ def dmap_SyncOp : dmapop<"sync", [MemoryEffect_Interface]> {
   // A sync acts as a full memory barrier.
   let effects = [MemoryEffects::Read, MemoryEffects::Write];
 }
-
+*/
 #endif // dmap_OPS
