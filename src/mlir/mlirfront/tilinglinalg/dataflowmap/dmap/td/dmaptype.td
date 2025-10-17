@@ -27,7 +27,7 @@ def dmapportstreamtype : dmaptype<"dmapportstreamtype"> {
     let summary = "this is a dmap stream port";
 }
 
-def dmapdata : dmaptype<"dmapdata"> {
+def dmapdatatype : dmaptype<"dmapdata"> {
     let mnemonic = "dmapdata";
     let summary = "this is a dmap data";
 }

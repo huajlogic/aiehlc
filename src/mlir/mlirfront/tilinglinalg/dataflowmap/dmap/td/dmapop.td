@@ -8,22 +8,31 @@ include "dmaptype.td"
 /*
       %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
       %pegroup = dataflowmap.dmap_create_pe_group {group_idx = 1, pe_count=4, "row"}
-      %pegroup = dataflowmap.dmap_create_pe_group {1, 4, "row"}
-      %portsend = dataflowmap.configure_port %pegroup {row = 0, col = 2, dataacces=}  
-      %portreceive1 = dataflowmap.configure_port on %{row = 3, col = 0, dataacces=}  
-      %portreceive2 = dataflowmap.configure_port on %{row = 3, col = 1, dataacces=}   
+      %coreenginegroup = dataflowmap.dmap_create_core_engine_group {1, 4, "row"}
+      %ioengine = dataflowmap.dmap_create_io_engine {0, "shim"}
+      %portsend = dataflowmap.configure_port %ioengine {peorioidx=0, dataacces=}  
+      %portreceive1 = dataflowmap.configure_port on %{peorioidx = 0, dataacces=}  
+      %portreceive2 = dataflowmap.configure_port on %{peorioidx = 1, dataacces=}   
       %receive_group = dataflowmap.create_port_group(%portreceive1, %portreceive2)    
       %broadcast_stream = dataflowmap.create_stream %send_port, %receive_group         
       dataflowmap.push %data, %broadcast_stream {cache_policy = "force_memtile" }
-
-      def Dataflow_PortType : Type<CPred<"$_self.isa<dflow::PortType>()">, "dataflow port">;
-def Dataflow_PortGroupType : Type<CPred<"$_self.isa<dflow::PortGroupType>()">, "dataflow port group">;
-
-def Dataflow_PortOrGroup : TypeConstraint<
-  CPred<"$_self.isa<dflow::PortType>() || $_self.isa<dflow::PortGroupType>()">,
-  "port or port group">;
-
 */
+def dmap_create_data : dmapop<"create_data"> {
+  let summary = "create data";
+  let description = [{
+
+  }];
+
+  let arguments = (ins
+    ArrayAttr:$shape,
+    TypeAttr:$element_type
+  );
+  let results = (outs dmapdatatype:$data );
+
+  let assemblyFormat = [{
+    attr-dict `->` type($data)
+  }];
+}
 
 def dmap_create_core_engine_group : dmapop<"create_core_engine_group"> {
   let summary = "create core engine group";
@@ -134,7 +143,7 @@ def dmap_push : dmapop<"push"> {
   }];
 
   let arguments = (ins
-    dmapdata:$data,
+    dmapdatatype:$data,
     dmapportstreamtype:$stream
   );
 

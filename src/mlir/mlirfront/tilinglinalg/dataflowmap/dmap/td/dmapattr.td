@@ -29,7 +29,7 @@ def dmapdirection_enum
       DMAP_SEND,
       DMAP_RECEIVE]> {
   let genSpecializedAttr = 0;
-  let cppNamespace = "dmapdialect";
+  let cppNamespace = "dmap";
 }
 
 def DMAP_SHIMIO : I32EnumAttrCase<"DMAP_SHIMIO", 0, "DMAP_SHIMIO">;
@@ -54,7 +54,7 @@ def dmapioAttr : EnumAttr<dmamapdialect, dmapio_enum, "direction"> {
 
 def dataaccesspattern : dmapattr<"dataaccesspattern"> {
     let mnemonic = "datadirectionattr";
-    let cppNamespace = "dmapdialect";
+    let cppNamespace = "dmap";
     let parameters = ( ins
         "dmapdirectionAttr":$direction,
         "int64_t":$sizepertran,
