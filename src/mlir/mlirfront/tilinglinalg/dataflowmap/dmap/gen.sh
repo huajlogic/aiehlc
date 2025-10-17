@@ -23,16 +23,16 @@ done
 
 echo "Script is located in: $GEN_SCRIPT_DIR"
 pushd ${GEN_SCRIPT_DIR}
-#${LLVM_BIN}/mlir-tblgen -gen-dialect-defs $TD/dmamaptype.td -dialect=dmamap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include/ ${MLIR_INCLUDES} > $INC/dmamapdialect.cc.inc
-#${LLVM_BIN}/mlir-tblgen -gen-dialect-decls $TD/dmamaptype.td -dialect=dmamap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmamapdialect.h.inc
-${LLVM_BIN}/mlir-tblgen -gen-typedef-defs $TD/dmaptype.td -typedefs-dialect=dmamap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmamaptype.cc.inc
-${LLVM_BIN}/mlir-tblgen -gen-typedef-decls $TD/dmaptype.td -typedefs-dialect=dmamap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmamaptype.h.inc
-${LLVM_BIN}/mlir-tblgen --gen-attrdef-defs $TD/dmapattr.td -attrdefs-dialect=dmamap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmamapattr.cc.inc
-${LLVM_BIN}/mlir-tblgen --gen-attrdef-decls $TD/dmapattr.td -attrdefs-dialect=dmamap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmamapattr.h.inc
+${LLVM_BIN}/mlir-tblgen -gen-dialect-defs $TD/dmaptype.td -dialect=dmap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include/ ${MLIR_INCLUDES} > $INC/dmapdialect.cc.inc
+${LLVM_BIN}/mlir-tblgen -gen-dialect-decls $TD/dmaptype.td -dialect=dmap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmapdialect.h.inc
+${LLVM_BIN}/mlir-tblgen -gen-typedef-defs $TD/dmaptype.td -typedefs-dialect=dmap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmaptype.cc.inc
+${LLVM_BIN}/mlir-tblgen -gen-typedef-decls $TD/dmaptype.td -typedefs-dialect=dmap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmaptype.h.inc
+${LLVM_BIN}/mlir-tblgen --gen-attrdef-defs $TD/dmapattr.td -attrdefs-dialect=dmap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmapattr.cc.inc
+${LLVM_BIN}/mlir-tblgen --gen-attrdef-decls $TD/dmapattr.td -attrdefs-dialect=dmap -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmapattr.h.inc
 
 #${LLVM_BIN}/mlir-tblgen --gen-type-interface-defs $TD/dmamapterface.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} -o  $INC/dmamapterface.cc.inc
 #${LLVM_BIN}/mlir-tblgen --gen-type-interface-decls $TD/dmamapterface.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} -o  $INC/dmamapterface.h.inc
 
-${LLVM_BIN}/mlir-tblgen -gen-op-defs $TD/dmapop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmamapop.cc.inc
-${LLVM_BIN}/mlir-tblgen -gen-op-decls $TD/dmapop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmamapop.h.inc
+${LLVM_BIN}/mlir-tblgen -gen-op-defs $TD/dmapop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmapop.cc.inc
+${LLVM_BIN}/mlir-tblgen -gen-op-decls $TD/dmapop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmapop.h.inc
 popd

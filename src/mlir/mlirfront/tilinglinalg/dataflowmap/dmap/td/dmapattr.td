@@ -8,9 +8,9 @@ include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/IR/EnumAttr.td"
 
-def dmamapdialect : Dialect {
-    let name = "dmamap";
-    let cppNamespace = "dmamap";
+def dmapdialect : Dialect {
+    let name = "dmap";
+    let cppNamespace = "dmap";
     let useDefaultAttributePrinterParser = 1;
     let hasOperationAttrVerify = 0;
     let useDefaultAttributePrinterParser = 1;
@@ -18,13 +18,14 @@ def dmamapdialect : Dialect {
     dag discardableAttrs = (ins);
 }
 
-class dmapattr<string name> : AttrDef<dmamapdialect, name>{}
-class dmaptype<string name, list<Trait> traits=[]> : TypeDef<dmamapdialect, name,traits>{}
-class dmapop<string name, list<Trait> traits=[]> : Op<dmamapdialect, name, traits>{}
 
+class dmapattr<string name> : AttrDef<dmapdialect, name>{}
+class dmaptype<string name, list<Trait> traits=[]> : TypeDef<dmapdialect, name,traits>{}
+class dmapop<string name, list<Trait> traits=[]> : Op<dmapdialect, name, traits>{}
+/*
 def DMAP_SEND : I32EnumAttrCase<"DMAP_SEND", 0, "DMAP_SEND">;
-def DMAP_RECEIVE : I32EnumAttrCase<"DMAP_RECEIVE", 0, "DMAP_RECEIVE">;
-def dmapdirection_enum
+def DMAP_RECEIVE : I32EnumAttrCase<"DMAP_RECEIVE", 1, "DMAP_RECEIVE">;
+def dmapdirection
     : I32EnumAttr<"dmapdirection", "dmap direction", [
       DMAP_SEND,
       DMAP_RECEIVE]> {
@@ -32,36 +33,38 @@ def dmapdirection_enum
   let cppNamespace = "dmap";
 }
 
+def dmapdirectionAttr : EnumAttr<dmapdialect, dmapdirection, "direction"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
+
 def DMAP_SHIMIO : I32EnumAttrCase<"DMAP_SHIMIO", 0, "DMAP_SHIMIO">;
-def DMAP_MEMTILEIO : I32EnumAttrCase<"DMAP_MEMTILEIO", 0, "DMAP_MEMTILEIO">;
-def DMAP_CORETILEIO : I32EnumAttrCase<"DMAP_CORETILEIO", 0, "DMAP_CORETILEIO">;
+def DMAP_MEMTILEIO : I32EnumAttrCase<"DMAP_MEMTILEIO", 1, "DMAP_MEMTILEIO">;
+def DMAP_CORETILEIO : I32EnumAttrCase<"DMAP_CORETILEIO", 2, "DMAP_CORETILEIO">;
 def dmapio_enum
     : I32EnumAttr<"dmapio", "dmap direction", [
       DMAP_SHIMIO,
       DMAP_MEMTILEIO,
       DMAP_CORETILEIO]> {
   let genSpecializedAttr = 0;
-  let cppNamespace = "dmapio";
+  let cppNamespace = "dmap";
 }
 
-def dmapdirectionAttr : EnumAttr<dmamapdialect, dmapdirection_enum, "direction"> {
+def dmapioAttr : EnumAttr<dmapdialect, dmapio_enum, "io"> {
   let assemblyFormat = "`<` $value `>`";
 }
-
-def dmapioAttr : EnumAttr<dmamapdialect, dmapio_enum, "direction"> {
-  let assemblyFormat = "`<` $value `>`";
-}
+*/
 
 def dataaccesspattern : dmapattr<"dataaccesspattern"> {
     let mnemonic = "datadirectionattr";
     let cppNamespace = "dmap";
     let parameters = ( ins
-        "dmapdirectionAttr":$direction,
+        "StringAttr":$direction,
         "int64_t":$sizepertran,
         "int64_t":$pingpongbuffer,
         "int64_t":$slidingaccess
     );
-    let assemblyFormat = "`{` $direction `,` $sizepertran  `,` $pingpongbuffer `,` $slidingaccess `}`";
+    let assemblyFormat = "`{` $direction  `,` $sizepertran  `,` $pingpongbuffer `,` $slidingaccess `}`";
 
 }
 
