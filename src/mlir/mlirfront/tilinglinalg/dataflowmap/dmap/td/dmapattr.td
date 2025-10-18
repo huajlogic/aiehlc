@@ -11,10 +11,11 @@ include "mlir/IR/EnumAttr.td"
 def dmapdialect : Dialect {
     let name = "dmap";
     let cppNamespace = "dmap";
-    let useDefaultAttributePrinterParser = 1;
+    //let useDefaultAttributePrinterParser = 1;
     let hasOperationAttrVerify = 0;
     let useDefaultAttributePrinterParser = 1;
-	let usePropertiesForAttributes = 0;
+	  let usePropertiesForAttributes = 0;
+    let useDefaultTypePrinterParser = 1;  
     dag discardableAttrs = (ins);
 }
 
