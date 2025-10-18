@@ -77,20 +77,49 @@ void dmapmanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
 }
-
+/*
+      %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
+      %coreenginegroup = dataflowmap.dmap_create_core_engine_group {1, 4, "row"}
+      %ioengine = dataflowmap.dmap_create_io_engine {0, "shim"}
+      %send_port = dataflowmap.configure_port %ioengine {peorioidx=0, dataacces=}  
+      %portreceive1 = dataflowmap.configure_port on %{peorioidx = 0, dataacces=}  
+      %portreceive2 = dataflowmap.configure_port on %{peorioidx = 1, dataacces=}   
+      %receive_group = dataflowmap.create_port_group(%portreceive1, %portreceive2)    
+      %broadcast_stream = dataflowmap.create_stream %send_port, %receive_group         
+      dataflowmap.push %data, %broadcast_stream {cache_policy = "force_memtile" }
+*/
 void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx) {
         auto location = builder.getUnknownLoc();
         // no region creatation
     ///*   
         mlir::SmallVector<mlir::Attribute, 4> shapeElems;
-
         shapeElems.push_back(builder.getI64IntegerAttr(16));
         shapeElems.push_back(builder.getI64IntegerAttr(16));
         mlir::ArrayAttr shapettr = mlir::ArrayAttr::get(ctx, shapeElems);
         mlir::Type elementType = builder.getF32Type();
         mlir::Type myDataHandleType = dmap::dmapdataType::get(ctx);
         auto data = builder.create<create_data>(builder.getUnknownLoc(),  myDataHandleType, shapettr, elementType); 
-        
-       
+        mlir::Type pgeout = dmap::dmacoreenginegroupType::get(ctx);
+        auto peg = builder.create<create_core_engine_group>(builder.getUnknownLoc(),  pgeout, 0, 4,"row"); 
+        mlir::Type ioout = dmap::dmapioenginetypeType::get(ctx);
+        auto io = builder.create<create_io_engine>(builder.getUnknownLoc(),  ioout, 0,"shim"); 
+        //config port
+        auto dataaccesspattern = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("SEND"), 16, 1, 1);
+        auto cport = builder.create<configure_port>(builder.getUnknownLoc(),  ioout, io.getResult(),0, dataaccesspattern);
+        //port
+        auto dataaccesspattern1 = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
+        auto cport0 = builder.create<configure_port>(builder.getUnknownLoc(),  ioout, peg.getResult(),0, dataaccesspattern1);
+        auto cport1 = builder.create<configure_port>(builder.getUnknownLoc(),  ioout, peg.getResult(),1, dataaccesspattern1); 
+        auto cport2 = builder.create<configure_port>(builder.getUnknownLoc(),  ioout, peg.getResult(),2, dataaccesspattern1); 
+        auto cport3 = builder.create<configure_port>(builder.getUnknownLoc(),  ioout, peg.getResult(),3, dataaccesspattern1);  
+        //create port group
+        mlir::SmallVector<mlir::Value, 4> portlist;
+        //portlist.push_back(cport0.getResult());
+        //portlist.push_back(cport1.getResult());
+        //portlist.push_back(cport2.getResult());
+        //portlist.push_back(cport3.getResult());
+
+        auto portg = dmap::dmapportgroupType::get(ctx);
+        auto portgroup = builder.create<createport_group>(builder.getUnknownLoc(),  ioout, portlist);  
         return ;//func;
 }

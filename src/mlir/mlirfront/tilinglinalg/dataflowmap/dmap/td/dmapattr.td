@@ -57,7 +57,7 @@ def dmapioAttr : EnumAttr<dmapdialect, dmapio_enum, "io"> {
 */
 
 def dataaccesspattern : dmapattr<"dataaccesspattern"> {
-    let mnemonic = "datadirectionattr";
+    let mnemonic = "dataaccesspattern";
     let cppNamespace = "dmap";
     let parameters = ( ins
         "StringAttr":$direction,

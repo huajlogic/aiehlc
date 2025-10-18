@@ -52,7 +52,7 @@ def dmap_create_core_engine_group : dmapop<"create_core_engine_group"> {
   }];
 }
 
-def dmap_create_io_engine : dmapop<"create_io_group"> {
+def dmap_create_io_engine : dmapop<"create_io_engine"> {
   let summary = "create io group";
   let description = [{
 

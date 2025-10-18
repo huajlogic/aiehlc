@@ -3,12 +3,12 @@
 include "dmapattr.td"
 
 def dmapcoreenginegrouptype:dmaptype<"dmacoreenginegroup"> {
-    let mnemonic = "core engine group";
+    let mnemonic = "dmacoreenginegroupType";
     let summary = "this is dmap process engine group";
 }
 
 def dmapioenginetype:dmaptype<"dmapioenginetype"> {
-    let mnemonic = " io engine";
+    let mnemonic = "dmapioenginetype";
     let summary = "this is dmap IO engine";
 }
 
