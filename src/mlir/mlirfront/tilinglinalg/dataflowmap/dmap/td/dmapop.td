@@ -69,6 +69,43 @@ def dmap_create_io_engine : dmapop<"create_io_engine"> {
   }];
 }
 
+def dmap_port_configure_create : dmapop<"port_configure_create", [Symbol]> {
+  let summary = "this is port config.";
+  let description = [{
+    Binds a physical hardware handle (e.g., a tile from the routinghw dialect)
+    to a logical data port, specifying its direction and a logical channel ID.
+    This creates a node in the logical dataflow graph.
+  }];
+
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    dataaccesspattern:$accesspattern
+  );
+  let results = (outs dmapportconfigtype:$portconfig);
+  //let assemblyFormat = [{
+  let assemblyFormat =   "$sym_name `:` $accesspattern attr-dict-with-keyword  `->` type($portconfig)";
+  //}];
+}
+def UseSymbolOp : Op<dmapdialect, "use_symbol", []> {
+  let arguments = (ins SymbolRefAttr:$target);
+  let assemblyFormat = "$target attr-dict";
+}
+
+def dmap_port_configure_map : dmapop<"port_configure_map"> {
+  let summary = "this is port config.";
+  let description = [{
+    the map between core index and configure.
+  }];
+
+  let arguments = (ins
+    dataaccesspattern:$accesspattern
+  );
+  let results = (outs dmapportconfigtype:$portconfig);
+  let assemblyFormat = [{
+     attr-dict `->` type($portconfig) 
+  }];
+}
+
 def dmap_configure_port : dmapop<"configure_port"> {
   let summary = "Configures a logical data port on a physical hardware entity.";
   let description = [{

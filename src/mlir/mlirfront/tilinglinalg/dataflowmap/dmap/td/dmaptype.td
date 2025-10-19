@@ -33,6 +33,16 @@ def dmapdatatype : dmaptype<"dmapdata"> {
     
 }
 
+def dmapportconfigtype : dmaptype<"dmapportconfig"> {
+    let mnemonic = "dmapportconfig";
+    let summary = "this is a dmap port config"; 
+}
+
+def dmaportconfigmaptype : dmaptype<"dmaportconfigmap"> {
+    let mnemonic = "dmaportconfigmap";
+    let summary = "this is a dmap port config map";
+}
+
 def dmapportorgroup : TypeConstraint<
   CPred<"$_self.isa<dflow::PortType>() || $_self.isa<dflow::PortGroupType>()">,
   "port or port group">;
