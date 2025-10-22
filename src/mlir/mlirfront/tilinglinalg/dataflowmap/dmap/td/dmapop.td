@@ -91,18 +91,19 @@ def UseSymbolOp : Op<dmapdialect, "use_symbol", []> {
   let assemblyFormat = "$target attr-dict";
 }
 
-def dmap_port_configure_map : dmapop<"port_configure_map"> {
+def dmap_core_group_config : dmapop<"core_group_config"> {
   let summary = "this is port config.";
   let description = [{
     the map between core index and configure.
   }];
 
   let arguments = (ins
-    dataaccesspattern:$accesspattern
+    dmapcoreenginegrouptype:$coregroup,
+    dataconfigmap:$map
   );
-  let results = (outs dmapportconfigtype:$portconfig);
+  let results = (outs dmacoregroupconfigtype:$portconfig);
   let assemblyFormat = [{
-     attr-dict `->` type($portconfig) 
+     `{` $map `}` $coregroup attr-dict `:` type($coregroup) `->` type($portconfig) 
   }];
 }
 

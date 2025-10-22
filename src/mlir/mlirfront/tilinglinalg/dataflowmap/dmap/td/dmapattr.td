@@ -69,4 +69,25 @@ def dataaccesspattern : dmapattr<"dataaccesspattern"> {
 
 }
 
+def dataconfigmapitem :dmapattr<"dataconfmapitem"> {
+    let mnemonic = "dataconfmapitem";
+    let cppNamespace = "dmap";
+    let parameters = ( ins
+        "int64_t":$index,
+        "SymbolRefAttr":$configsymbol
+    );
+    let assemblyFormat = "`{` $index  `,` $configsymbol `}`";
+}
+
+def dataconfigmap : dmapattr<"dataconfigmap"> {
+  let mnemonic = "dataconfigmap";
+  let summary  = "configure map";
+  let parameters = (ins
+    ArrayRefParameter<"dataconfmapitemAttr">:$items
+  );
+  let assemblyFormat = "`[` $items `]`";
+}
+
+
+
 #endif//_ATTR_DMAMAP_

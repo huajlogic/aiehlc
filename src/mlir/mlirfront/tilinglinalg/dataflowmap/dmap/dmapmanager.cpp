@@ -110,12 +110,25 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx) {
         //port_configure_create
         
         mlir::Type portconfig = dmap::dmapportconfigType::get(ctx);
-        std::string symbolName = "forwarding_config";
+        std::string symbolName = "forwarding_config---";
         auto pf = builder.create<dmap::port_configure_create>(builder.getUnknownLoc(), portconfig, symbolName, dataaccesspattern);
-        mlir::SymbolRefAttr symbolRef = mlir::SymbolRefAttr::get(ctx,symbolName);
+        mlir::SymbolRefAttr symbolRef = mlir::SymbolRefAttr::get(ctx,"symbolName");
         auto useOp = builder.create<dmap::UseSymbolOp>(builder.getUnknownLoc(), symbolRef);
-        //config io port
+        //config io port 
         auto cport = builder.create<configure_port>(builder.getUnknownLoc(),  portret, io.getResult(),0, dataaccesspattern);
+        //config port group
+        dmap::dataconfmapitemAttr item1 = dmap::dataconfmapitemAttr::get(ctx,0, mlir::SymbolRefAttr::get(ctx, "cfg1"));
+        dmap::dataconfmapitemAttr item2 = dmap::dataconfmapitemAttr::get(ctx,1, mlir::SymbolRefAttr::get(ctx, "cfg1"));
+        dmap::dataconfmapitemAttr item3 = dmap::dataconfmapitemAttr::get(ctx,2, mlir::SymbolRefAttr::get(ctx, "cfg1"));
+        dmap::dataconfmapitemAttr item4 = dmap::dataconfmapitemAttr::get(ctx,3, mlir::SymbolRefAttr::get(ctx, "cfg1"));
+        llvm::SmallVector<dmap::dataconfmapitemAttr> itemsVector;
+        itemsVector.push_back(item1);
+        itemsVector.push_back(item2);
+        itemsVector.push_back(item3);
+        itemsVector.push_back(item4);
+        dmap::dataconfigmapAttr configMapAttr = dmap::dataconfigmapAttr::get(ctx,itemsVector);
+        auto gcret = dmap::dmacoregroupconfigType::get(ctx);
+        auto gcmap = builder.create<core_group_config>(builder.getUnknownLoc(),  gcret, peg.getResult(), configMapAttr);
         //config core port
         auto dataaccesspattern1 = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
         auto cport0 = builder.create<configure_port>(builder.getUnknownLoc(),  portret, peg.getResult(),0, dataaccesspattern1);
