@@ -22,8 +22,8 @@ def dmapportgrouptype : dmaptype<"dmapportgroup"> {
     let summary = "this is a dmap port";
 }
 
-def dmapportstreamtype : dmaptype<"dmapportstreamtype"> {
-    let mnemonic = "dmapportstreamtype";
+def dmapportstreamtype : dmaptype<"dmapportstream"> {
+    let mnemonic = "dmapportstream";
     let summary = "this is a dmap stream port";
 }
 
@@ -31,6 +31,11 @@ def dmapdatatype : dmaptype<"dmapdata"> {
     let mnemonic = "dmapdata";
     let summary = "this is a dmap data";
     
+}
+
+def dmapioconfigtype : dmaptype<"dmapioconfig"> {
+    let mnemonic = "dmapioconfig";
+    let summary = "this is a dmap port config"; 
 }
 
 def dmapportconfigtype : dmaptype<"dmapportconfig"> {

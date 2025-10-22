@@ -67,6 +67,19 @@ ModuleOp dmapmanager::ops_test(MLIRContext* ctx, int totalN) {
     createdmapfuncByDim(builder, ctx);
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(main);
+
+    SymbolTable symTab(m);
+
+  // ------------------------------------------------------------------
+  // 4. Look up the symbol anywhere inside the module
+  // ------------------------------------------------------------------
+   Operation *def = symTab.lookup("receive1");
+   if (!def) {
+     llvm::errs() << "Symbol @receive1 not found!\n";
+ 
+   } else {
+     llvm::outs() << "receive1 found \n";
+   }
     llvm::errs() << m;
     return m;
 }
@@ -104,23 +117,24 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx) {
         mlir::Type ioout = dmap::dmapioenginetypeType::get(ctx);
         auto io = builder.create<create_io_engine>(builder.getUnknownLoc(),  ioout, 0,"shim"); 
         //config port
-        auto portret = dmap::dmapportType::get(ctx);
+        auto ioconfigret = dmap::dmapioconfigType::get(ctx);
         auto dataaccesspattern = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("SEND"), 16, 1, 1);
+        auto receivepattern = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
         // create a port configuration
         //port_configure_create
         
         mlir::Type portconfig = dmap::dmapportconfigType::get(ctx);
-        std::string symbolName = "forwarding_config---";
-        auto pf = builder.create<dmap::port_configure_create>(builder.getUnknownLoc(), portconfig, symbolName, dataaccesspattern);
-        mlir::SymbolRefAttr symbolRef = mlir::SymbolRefAttr::get(ctx,"symbolName");
+        std::string symbolName = "receive1";
+        auto pf = builder.create<dmap::port_configure_create>(builder.getUnknownLoc(), portconfig, symbolName, receivepattern);
+        mlir::SymbolRefAttr symbolRef = mlir::SymbolRefAttr::get(ctx,"receive1");
         auto useOp = builder.create<dmap::UseSymbolOp>(builder.getUnknownLoc(), symbolRef);
         //config io port 
-        auto cport = builder.create<configure_port>(builder.getUnknownLoc(),  portret, io.getResult(),0, dataaccesspattern);
+        auto ioconfig = builder.create<configure_io>(builder.getUnknownLoc(),  ioconfigret, io.getResult(),dataaccesspattern);
         //config port group
-        dmap::dataconfmapitemAttr item1 = dmap::dataconfmapitemAttr::get(ctx,0, mlir::SymbolRefAttr::get(ctx, "cfg1"));
-        dmap::dataconfmapitemAttr item2 = dmap::dataconfmapitemAttr::get(ctx,1, mlir::SymbolRefAttr::get(ctx, "cfg1"));
-        dmap::dataconfmapitemAttr item3 = dmap::dataconfmapitemAttr::get(ctx,2, mlir::SymbolRefAttr::get(ctx, "cfg1"));
-        dmap::dataconfmapitemAttr item4 = dmap::dataconfmapitemAttr::get(ctx,3, mlir::SymbolRefAttr::get(ctx, "cfg1"));
+        dmap::dataconfmapitemAttr item1 = dmap::dataconfmapitemAttr::get(ctx,0, mlir::SymbolRefAttr::get(ctx, "receive1"));
+        dmap::dataconfmapitemAttr item2 = dmap::dataconfmapitemAttr::get(ctx,1, mlir::SymbolRefAttr::get(ctx, "receive1"));
+        dmap::dataconfmapitemAttr item3 = dmap::dataconfmapitemAttr::get(ctx,2, mlir::SymbolRefAttr::get(ctx, "receive1"));
+        dmap::dataconfmapitemAttr item4 = dmap::dataconfmapitemAttr::get(ctx,3, mlir::SymbolRefAttr::get(ctx, "receive1"));
         llvm::SmallVector<dmap::dataconfmapitemAttr> itemsVector;
         itemsVector.push_back(item1);
         itemsVector.push_back(item2);
@@ -128,21 +142,27 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx) {
         itemsVector.push_back(item4);
         dmap::dataconfigmapAttr configMapAttr = dmap::dataconfigmapAttr::get(ctx,itemsVector);
         auto gcret = dmap::dmacoregroupconfigType::get(ctx);
-        auto gcmap = builder.create<core_group_config>(builder.getUnknownLoc(),  gcret, peg.getResult(), configMapAttr);
-        //config core port
-        auto dataaccesspattern1 = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
-        auto cport0 = builder.create<configure_port>(builder.getUnknownLoc(),  portret, peg.getResult(),0, dataaccesspattern1);
-        auto cport1 = builder.create<configure_port>(builder.getUnknownLoc(),  portret, peg.getResult(),1, dataaccesspattern1); 
-        auto cport2 = builder.create<configure_port>(builder.getUnknownLoc(),  portret, peg.getResult(),2, dataaccesspattern1); 
-        auto cport3 = builder.create<configure_port>(builder.getUnknownLoc(),  portret, peg.getResult(),3, dataaccesspattern1);  
-        //create port group
-        mlir::SmallVector<mlir::Value, 4> portlist;
-        portlist.push_back(cport0.getResult());
-        portlist.push_back(cport1.getResult());
-        portlist.push_back(cport2.getResult());
-        portlist.push_back(cport3.getResult());
+        auto gcmap = builder.create<configure_coregroup>(builder.getUnknownLoc(),  gcret, peg.getResult(), "row", configMapAttr);
+        //create strem
+        auto streamret = dmap::dmapportstreamType::get(ctx);
+        auto streamhandle = builder.create<createstream>(builder.getUnknownLoc(),  streamret, ioconfig.getResult(),gcmap.getResult());
+        //push stream
+        auto pret = builder.create<push>(builder.getUnknownLoc(), data.getResult(),streamhandle.getResult());
 
-        auto portg = dmap::dmapportgroupType::get(ctx);
-        auto portgroup = builder.create<createport_group>(builder.getUnknownLoc(),  ioout, portlist);  
+        //config core port
+        //auto dataaccesspattern1 = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
+        //auto cport0 = builder.create<configure_io>(builder.getUnknownLoc(),  portret, peg.getResult(),0, dataaccesspattern1);
+        //auto cport1 = builder.create<configure_io>(builder.getUnknownLoc(),  portret, peg.getResult(),1, dataaccesspattern1); 
+        //auto cport2 = builder.create<configure_io>(builder.getUnknownLoc(),  portret, peg.getResult(),2, dataaccesspattern1); 
+        //auto cport3 = builder.create<configure_io>(builder.getUnknownLoc(),  portret, peg.getResult(),3, dataaccesspattern1);  
+        //create port group
+        //mlir::SmallVector<mlir::Value, 4> portlist;
+        //portlist.push_back(cport0.getResult());
+        //portlist.push_back(cport1.getResult());
+        //portlist.push_back(cport2.getResult());
+        //portlist.push_back(cport3.getResult());
+
+        //auto portg = dmap::dmapportgroupType::get(ctx);
+        //auto portgroup = builder.create<createport_group>(builder.getUnknownLoc(),  ioout, portlist);  
         return ;//func;
 }
