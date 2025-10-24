@@ -162,8 +162,17 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx,Symbo
             auto streamhandle1 = builder.create<createstream>(builder.getUnknownLoc(),  streamret, shimioconfig.getResult(),memiorecvconfig.getResult(),"SH2ME",0, 1);
             auto streamhandle2 = builder.create<createstream>(builder.getUnknownLoc(),  streamret, memiosendconfig.getResult(),gcmap.getResult(), "ME2CO", 0, 1);
 
-            auto pret1 = builder.create<push>(builder.getUnknownLoc(), data.getResult(),streamhandle1.getResult());
-            auto pret2 = builder.create<push>(builder.getUnknownLoc(), data.getResult(),streamhandle2.getResult());
+            // Create a chained stream from streamhandle1 and streamhandle2, then push once to the chained stream.
+            auto chainType = dmap::dmapportchainstreamType::get(ctx);
+            // The generated op build expects (TypeRange resultTypes, ValueRange operands, ArrayRef<NamedAttribute> attrs).
+            auto chainStreamOp = builder.create<createchainstream>(builder.getUnknownLoc(),
+                                                                   chainType,
+                                                                   mlir::ValueRange{streamhandle1.getResult(),
+                                                                                    streamhandle2.getResult()});
+            auto chainStream = chainStreamOp.getResult();
+
+            // Single push that targets the chained stream (replaces pret1 and pret2)
+            auto pchain = builder.create<push>(builder.getUnknownLoc(), data.getResult(), chainStream);
 
         } else {
             auto streamhandle = builder.create<createstream>(builder.getUnknownLoc(),  streamret, shimioconfig.getResult(),gcmap.getResult(),"SH2CO", 0, 1);
