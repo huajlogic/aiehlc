@@ -29,14 +29,13 @@ def portaccesspattern : dmapattr<"portaccesspattern"> {
     let cppNamespace = "dmap";
     let parameters = ( ins
         "StringAttr":$direction,
-        "int64_t":$sizepertran,
+        "int64_t":$transsize,
+        "int64_t":$totalsize,
         "int64_t":$pingpongbuffer,
         "int64_t":$slidingaccess
     );
     let assemblyFormat = "`{` $direction  `,` $sizepertran  `,` $pingpongbuffer `,` $slidingaccess `}`";
 
 }
-
-
 
 #endif//_ATTR_DMAMAP_
