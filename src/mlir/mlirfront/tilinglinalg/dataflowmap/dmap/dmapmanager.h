@@ -48,6 +48,8 @@
 
 #include "dmapdialect.h.inc"
 
+#include "dmapenums.h.inc"
+
 using namespace mlir;
 using namespace dmap;
 
@@ -63,7 +65,7 @@ using namespace dmap;
 #define GET_OP_DECLS
 #include "dmapop.h.inc"
 #undef GET_OP_DECLS
-#undef GET_OP_CLASSEST
+#undef GET_OP_CLASSES
 
 class dmapmanager{
 public:
