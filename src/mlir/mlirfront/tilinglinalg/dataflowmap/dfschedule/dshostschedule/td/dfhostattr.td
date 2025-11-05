@@ -1,4 +1,4 @@
-//===- DsHostDialect.td ---------------------------------------*- tablegen -*-===//
+//===- DSHostDialect.td ---------------------------------------*- tablegen -*-===//
 include "mlir/IR/OpBase.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/BuiltinTypes.td"
@@ -6,9 +6,10 @@ include "mlir/IR/BuiltinAttributes.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/IR/EnumAttr.td"
 
 // Dialect: amd_host
-def DSHost_Dialect : Dialect {
+def dshosdialect : Dialect {
   let name = "dshost";
   let cppNamespace = "::dshost";
   let summary = "aie data flow Host-side runtime and launch control dialect";
@@ -16,20 +17,13 @@ def DSHost_Dialect : Dialect {
     Host-side ops for device memory, async copies, kernel launch, events and streams.
   }];
 }
-//=== DsHost Types/Attrs ===//
-def DsHost_EventType : TypeDef<DsHost_Dialect, "Event"> {
-  let mnemonic = "event";
-  let summary = "Opaque async event type for host runtime";
-}
 
-def DsHost_StreamType : TypeDef<DsHost_Dialect, "Stream"> {
-  let mnemonic = "stream";
-  let parameters = (ins TypeParameter<"element type">:$elemTy);
-  let summary = "Host-visible stream handle carrying element type";
-  let assemblyFormat = "`<` $elemTy `>`";
-}
+class dshosattr<string name> : AttrDef<dshosdialect, name>{ let mnemonic = name;}
+class dshostype<string name, list<Trait> traits=[]> : TypeDef<dshosdialect, name,traits>{}
+class dshosop<string name, list<Trait> traits=[]> : Op<dshosdialect, name, traits>{}
 
-def AMD_TileAttr : AttrDef<DsHost_Dialect, "Tile"> {
+
+def DSHost_TileAttr : dshosattr<"Tile"> {
   let summary = "Tile location attribute (row, col)";
   let parameters = (ins
     I64Attr:$row,
@@ -38,33 +32,21 @@ def AMD_TileAttr : AttrDef<DsHost_Dialect, "Tile"> {
   let assemblyFormat = "`<` `row` `=` $row `,` `col` `=` $col `>`";
 }
 
-//=== AMDDMA Types/Attrs ===//
-def AMDDMA_LockType : TypeDef<AMDDMA_Dialect, "Lock"> {
-  let mnemonic = "lock";
-  let summary = "Abstract device lock handle";
+
+def DMAP_MM2S : I32EnumAttrCase<"DMAP_MM2S", 0, "DMAP_MM2S">;
+def DMAP_S2MM : I32EnumAttrCase<"DMAP_S2MM", 1, "DMAP_S2MM">;
+def dsdirection_enum : I32EnumAttr<"dsdirection", "dsdirection direction", [
+      DMAP_MM2S,
+      DMAP_S2MM]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "dsdirection";
 }
 
-def AMDDMA_DirectionAttr : EnumAttr<AMDDMA_Dialect, "Direction",
-  "DMA direction", [
-    EnumAttrCase<"MM2S", 0>,
-    EnumAttrCase<"S2MM", 1>
-  ]> {
-  let cppNamespace = "::amd::dma";
+def dsdirectionAttr : EnumAttr<dshosdialect, dsdirection_enum, "io"> {
+  let assemblyFormat = "`<` $value `>`";
 }
 
-def AMDDMA_DirectionAttrParam : AttrDef<AMDDMA_Dialect, "DirectionParam"> {
-  let summary = "Wrapper to use direction in ops";
-}
-
-//=== Flow Types/Attrs ===//
-def Flow_StreamType : TypeDef<Flow_Dialect, "Stream"> {
-  let mnemonic = "stream";
-  let parameters = (ins TypeParameter<"element type">:$elemTy);
-  let summary = "Logical stream type";
-  let assemblyFormat = "`<` $elemTy `>`";
-}
-
-def Flow_ShimEndpointAttr : AttrDef<Flow_Dialect, "ShimEndpoint"> {
+def Flow_ShimEndpointAttr : dshosattr<"ShimEndpoint"> {
   let summary = "Physical SHIM endpoint binding";
   let parameters = (ins
     SymbolRefArrayAttr:$hops, // optional route, keep generic
