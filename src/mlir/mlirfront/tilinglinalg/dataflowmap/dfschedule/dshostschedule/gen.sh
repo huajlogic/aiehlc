@@ -33,19 +33,19 @@ echo $MLIR_INCLUDES
 echo "Script is located in: $GEN_SCRIPT_DIR"
 pushd ${GEN_SCRIPT_DIR}
 echo ${LLVM_BIN}
-#${LLVM_BIN}/mlir-tblgen -gen-dialect-defs $TD/dmaphoptype.td -dialect=dmaphop -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include/ ${MLIR_INCLUDES} > $INC/dmaphopdialect.cc.inc
-#${LLVM_BIN}/mlir-tblgen -gen-dialect-decls $TD/dmaphoptype.td -dialect=dmaphop -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmaphopdialect.h.inc
-#${LLVM_BIN}/mlir-tblgen -gen-typedef-defs $TD/dmaphoptype.td -typedefs-dialect=dmaphop -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmaphoptype.cc.inc
-#${LLVM_BIN}/mlir-tblgen -gen-typedef-decls $TD/dmaphoptype.td -typedefs-dialect=dmaphop -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmaphoptype.h.inc
-${LLVM_BIN}/mlir-tblgen --gen-attrdef-defs $TD/dfhostattr.td -attrdefs-dialect=dmaphop -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmaphopattr.cc.inc
-${LLVM_BIN}/mlir-tblgen --gen-attrdef-decls $TD/dfhostattr.td -attrdefs-dialect=dmaphop -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dmaphopattr.h.inc
+${LLVM_BIN}/mlir-tblgen -gen-dialect-defs $TD/dshosttype.td -dialect=dshost -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include/ ${MLIR_INCLUDES} > $INC/dshostdialect.cc.inc
+${LLVM_BIN}/mlir-tblgen -gen-dialect-decls $TD/dshosttype.td -dialect=dshost -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dshostdialect.h.inc
+${LLVM_BIN}/mlir-tblgen -gen-typedef-defs $TD/dshosttype.td -typedefs-dialect=dshost -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dshosttype.cc.inc
+${LLVM_BIN}/mlir-tblgen -gen-typedef-decls $TD/dshosttype.td -typedefs-dialect=dshost -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dshosttype.h.inc
+${LLVM_BIN}/mlir-tblgen --gen-attrdef-defs $TD/dshostattr.td -attrdefs-dialect=dshost -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dshostattr.cc.inc
+${LLVM_BIN}/mlir-tblgen --gen-attrdef-decls $TD/dshostattr.td -attrdefs-dialect=dshost -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dshostattr.h.inc
 
-${LLVM_BIN}/mlir-tblgen --gen-enum-decls $TD/dfhostattr.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dshostenums.h.inc
-${LLVM_BIN}/mlir-tblgen --gen-enum-defs $TD/dfhostattr.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dshostenums.cc.inc
+${LLVM_BIN}/mlir-tblgen --gen-enum-decls $TD/dshostattr.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dshostenums.h.inc
+${LLVM_BIN}/mlir-tblgen --gen-enum-defs $TD/dshostattr.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} >  $INC/dshostenums.cc.inc
 
 #${LLVM_BIN}/mlir-tblgen --gen-type-interface-defs $TD/dmamapterface.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} -o  $INC/dmamapterface.cc.inc
 #${LLVM_BIN}/mlir-tblgen --gen-type-interface-decls $TD/dmamapterface.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} -o  $INC/dmamapterface.h.inc
 
-#${LLVM_BIN}/mlir-tblgen -gen-op-defs $TD/dmaphopop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmaphopop.cc.inc
-#${LLVM_BIN}/mlir-tblgen -gen-op-decls $TD/dmaphopop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dmaphopop.h.inc
+${LLVM_BIN}/mlir-tblgen -gen-op-defs $TD/dshostop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dshostop.cc.inc
+${LLVM_BIN}/mlir-tblgen -gen-op-decls $TD/dshostop.td -I $TD -I $GEN_SCRIPT_DIR -I /usr/local/include ${MLIR_INCLUDES} > $INC/dshostop.h.inc
 popd

@@ -1,0 +1,65 @@
+//===- DSHostDialect.td ---------------------------------------*- tablegen -*-===//
+include "mlir/IR/OpBase.td"
+include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/BuiltinTypes.td"
+include "mlir/IR/BuiltinAttributes.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/IR/EnumAttr.td"
+
+// Dialect: amd_host
+def dshostdialect : Dialect {
+    let name = "dshost";
+    let cppNamespace = "dshost";
+    //let useDefaultAttributePrinterParser = 1;
+    let hasOperationAttrVerify = 0;
+    let useDefaultAttributePrinterParser = 1;
+	  let usePropertiesForAttributes = 0;
+    let useDefaultTypePrinterParser = 1;  
+    dag discardableAttrs = (ins);
+}
+
+class dshostattr<string name> : AttrDef<dshostdialect, name>{ let mnemonic = name;}
+class dshostype<string name, list<Trait> traits=[]> : TypeDef<dshostdialect, name,traits>{}
+class dshosop<string name, list<Trait> traits=[]> : Op<dshostdialect, name, traits>{}
+
+
+def DSHost_TileAttr : dshostattr<"Tile"> {
+  let summary = "Tile location attribute (row, col)";
+  let cppNamespace = "dshost";
+  let parameters = (ins
+    "int64_t":$row,
+    "int64_t":$col
+  );
+  let assemblyFormat = "`<` `row` `=` $row `,` `col` `=` $col `>`";
+}
+
+
+def DMAP_MM2S : I32EnumAttrCase<"DMAP_MM2S", 0, "DMAP_MM2S">;
+def DMAP_S2MM : I32EnumAttrCase<"DMAP_S2MM", 1, "DMAP_S2MM">;
+def dsdirection_enum : I32EnumAttr<"dsdirection", "dsdirection direction", [
+      DMAP_MM2S,
+      DMAP_S2MM]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "dsdirection";
+}
+
+def dsdirectionAttr : EnumAttr<dshostdialect, dsdirection_enum, "io"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+ 
+def Flow_ShimEndpointAttr : dshostattr<"ShimEndpoint"> {
+  let summary = "Physical SHIM endpoint binding";
+  let parameters = (ins
+    "SymbolRefArrayAttr":$hops, // optional route, keep generic
+    "int64_t":$row,
+    "int64_t":$col,
+    "StrAttr":$port,           // "MM2S0"/"S2MM0"/etc.
+    "int64_t":$channel,
+    "int64_t":$packet_id,
+    "int64_t":$vc
+  );
+  let assemblyFormat =  "`{` $hops  `,` $row  `,` $col `,` $port `,` $channel  `,` $packet_id `,` $vc `}`";
+}
+ 
