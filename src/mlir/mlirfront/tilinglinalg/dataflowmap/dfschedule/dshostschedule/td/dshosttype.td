@@ -19,4 +19,10 @@ def DSHost_LockType : dshostype<"Lock"> {
   let mnemonic = "lock";
   let summary = "Abstract device lock handle";
 }
+
+//=== DSHostDMA Types/Attrs ===//
+def DSHost_TileHandleType : dshostype<"Tile"> {
+  let mnemonic = "Tile";
+  let summary = "Tile ";
+}
 #endif //_TYPE_DSHOST_

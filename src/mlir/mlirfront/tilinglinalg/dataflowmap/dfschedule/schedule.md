@@ -291,3 +291,68 @@ func.func @kernel_tile_B_pingpong(%in_gmem: memref<1024xf32, "GLOBAL">) {
   return
 }
 */
+/*
+// "After" Pass 2 (SchedulePass)
+builtin.module {
+  
+  // (Pass 1 生成的 "契约" 和 "脚本" 仍然存在)
+  routinghw.config @my_routes {
+    routinghw.packet_flow @route_A {
+       dest_tile   = #dma_hop<tile {col=0, row=3}>,
+       packet_id   = 1 : i32
+    }
+    routinghw.packet_flow @route_B {
+       dest_tile   = #dma_hop<tile {col=1, row=3}>,
+       packet_id   = 2 : i32
+    }
+  }
+  func.func @main() { ... } // (Routing 硬件配置脚本)
+
+  // --- **Pass 2 (SchedulePass) 的输出 (Host 端代码)** ---
+  //
+  // 这个 func.func 是 Pass 2 *新生成的*
+  func.func @host_main_schedule() {
+    %gmem = "ds.host.alloc_device_mem"() : ...
+
+    // (Pass 2 从 dmahop 读取物理位置并生成句柄)
+    %shim_handle = "ds.host.get_tile_handle"() { col = 2, row = 0 }
+    %core_A_handle = "ds.host.get_tile_handle"() { col = 0, row = 3 }
+    %core_B_handle = "ds.host.get_tile_handle"() { col = 1, row = 3 }
+
+    // --- **这是 @route_A 被使用的地方** ---
+    // 1. "Schedule" Pass 生成代码, 
+    //    从 "routinghw" (Pass 1) 的契约中 *查找* 路由。
+    //    这个操作将一个 *编译时符号* (@route_A)
+    //    转换为一个 *运行时句柄* (%stream_A)。
+    %stream_A = "ds.host.get_stream_handle"(@my_routes::@route_A)
+      : () -> !ds.stream
+    %stream_B = "ds.host.get_stream_handle"(@my_routes::@route_B)
+      : () -> !ds.stream
+
+    // 2. "Schedule" Pass 生成 *设置 DMA* 的代码
+    //    这个 "launch_dma" 操作 *使用* 了 Pass 1 验证过的
+    //    运行时句柄 (%stream_A 和 %stream_B)。
+    %evt_dma = "ds.host.launch_dma_g2s_async" on %shim_handle (
+        %gmem, %stream_A, %stream_B  // <-- 传递句柄
+      ) : (memref<...>, !ds.stream, !ds.stream) -> !ds.event
+
+    // 3. "Schedule" Pass 生成 *启动内核* 的代码
+    //    (内核也被传递了它需要监听的句柄)
+    %pid_A = "routinghw.get_packet_id"(@my_routes::@route_A) : i32
+    %pid_B = "routinghw.get_packet_id"(@my_routes::@route_B) : i32
+    
+    %evt_A = "ds.host.launch_kernel_async" on %core_A_handle (
+        @dskernel_A, %pid_A // <-- 传递 Packet ID
+      ) : (i32) -> !ds.event
+      
+    %evt_B = "ds.host.launch_kernel_async" on %core_B_handle (
+        @dskernel_B, %pid_B
+      ) : (i32) -> !ds.event
+
+    "ds.host.wait"(%evt_dma, %evt_A, %evt_B)
+    return
+  }
+  
+  // (Pass 2 同时生成了 L1 dskernel ...)
+}
+*/

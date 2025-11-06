@@ -71,32 +71,24 @@ def DSHost_CopyD2HAsyncOp : dshosop< "copy_d2h_async",
   }];
 }
 
-// amd.host.create_stream
-def DSHost_CreateStreamOp : dshosop< "create_stream", []> {
-  let summary = "Create a host-visible stream";
-  let arguments = (ins TypeAttr:$elem_type);
-  let results   = (outs DSHost_StreamType:$stream);
-  let assemblyFormat = [{
-    `(` $elem_type `)` attr-dict `:` type($stream)
-  }];
+def DSHost_GetTileHandleOp : dshosop<"get_tile_handle"> {
+  let summary = "Gets a runtime handle to a physical tile by coordinates.";
+  let arguments = (ins
+    I32Attr:$col,
+    I32Attr:$row
+  );
+  let results = (outs DSHost_TileHandleType:$handle);
+  let assemblyFormat = "attr-dict `->` type($handle)";
 }
 
-// amd.host.stream_push
-def DSHost_StreamPushOp : dshosop< "stream_push",
-  [MemoryEffects<[MemRead]>]> {
-  let summary = "Push host buffer into a stream";
-  let arguments = (ins DSHost_StreamType:$stream, AnyMemRef:$host);
-  let results   = (outs);
-  let assemblyFormat = "$stream `,` $host attr-dict `:` `(` type($stream) `,` type($host) `)`";
-}
-
-// amd.host.stream_pull
-def DSHost_StreamPullOp : dshosop< "stream_pull",
-  [MemoryEffects<[MemWrite]>]> {
-  let summary = "Pull stream data into a host buffer";
-  let arguments = (ins DSHost_StreamType:$stream, AnyMemRef:$host);
-  let results   = (outs);
-  let assemblyFormat = "$stream `,` $host attr-dict `:` `(` type($stream) `,` type($host) `)`";
+// %stream_A = "ds.host.get_stream_handle"(@my_routes::@route_A)
+def DSHost_GetStreamHandleOp : dshosop<"get_stream_handle"> {
+  let summary = "Gets a runtime handle for a statically defined stream route contract.";
+  let arguments = (ins
+    SymbolRefAttr:$route // The contract: @my_routes::@route_A
+  );
+  let results = (outs DSHost_StreamType:$stream);
+  let assemblyFormat = "$route attr-dict `->` type($stream)";
 }
 
 // amd.host.launch_kernel_async
