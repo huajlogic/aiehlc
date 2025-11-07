@@ -20,6 +20,22 @@ include "dshosttype.td"
 // Base traits helpers
 //def HasRecursiveSideEffects : Trait<"HasRecursiveSideEffects">;
 
+def DSHost_FuncOp : dshosop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
+{
+    let summary = "Defines a function in the Starplat Dialect";
+    let description = [{This operation represents a function definiton in the Starplat dialect.
+                        It contains a name, other related arguments and an optional return type.
+                        It has a single region for the function body.
+                        }];
+
+  let arguments = (ins 
+                    SymbolNameAttr:$sym_name,
+                    TypeAttrOf<FunctionType>:$funcType
+                  );
+
+  let regions = (region AnyRegion:$body);
+}
+
 // amd.host.alloc_device_mem
 def DSHost_AllocDeviceMemOp : dshosop< "alloc_device_mem", []> {
   let summary = "Allocate device global memory";
