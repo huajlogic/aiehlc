@@ -14,6 +14,12 @@ def DSHost_StreamType : dshostype<"Stream"> {
   let summary = "Host-visible stream handle carrying element type";
 }
 
+def DSHost_PacketType : dshostype<"Packet"> {
+  let mnemonic = "packet";
+  //let parameters = (ins TypeParameter<"element type">:$elemTy);
+  let summary = "Host-visible patcket handle carrying element type";
+}
+
 //=== DSHostDMA Types/Attrs ===//
 def DSHost_LockType : dshostype<"Lock"> {
   let mnemonic = "lock";

@@ -105,8 +105,17 @@ def DSHost_GetStreamHandleOp : dshosop<"get_stream_handle"> {
   let assemblyFormat = "$route attr-dict `->` type($stream)";
 }
 
+def DSHost_GetPacketIdOp : dshosop<"get_packet_id"> {
+  let summary = "Gets a runtime handle for a statically defined stream route contract.";
+  let arguments = (ins
+    SymbolRefAttr:$route // The contract: @my_routes::@route_A
+  );
+  let results = (outs DSHost_PacketType:$packetid);
+  let assemblyFormat = "$route attr-dict `->` type($packetid)";
+}
+
 // amd.host.launch_kernel_async
-/*
+///*
 def DSHost_LaunchKernelAsyncOp : dshosop< "launch_kernel_async"> {
   let summary = "Launch a device kernel on a tile asynchronously";
   let arguments = (ins Variadic<AnyType>:$operands);
@@ -117,20 +126,18 @@ def DSHost_LaunchKernelAsyncOp : dshosop< "launch_kernel_async"> {
     static StringRef getCalleeAttrName() { return "callee"; }  // SymbolRefAttr
   }];
   let assemblyFormat = [{
-     `(` $operands `)` 
-    ( `wait` `(` $wait^ `:` type($event) `)` )?
-    ( `on_tile` `=` $on_tile^ )?
-    attr-dict `:` `(` type($operands) `)` `->` type($event)
+     `(` $operands `)` attr-dict `:` `(` type($operands) `)` `->` type($event)
   }];
 }
-*/
+//*/
 
 // amd.host.wait
 def DSHost_WaitOp : dshosop< "wait", []> {
-  let summary = "Wait for an event to complete";
-  let arguments = (ins DSHost_EventType:$event);
+  let summary = "Wait for one or more events to complete";
+  // accept a variadic list of event operands so builders accept ValueRange
+  let arguments = (ins Variadic<DSHost_EventType>:$events);
   let results   = (outs);
-  let assemblyFormat = "$event attr-dict `:` type($event)";
+  let assemblyFormat = "$events attr-dict `:` `(` type($events) `)`";
 }
  
 #endif // DSHOST_OPS

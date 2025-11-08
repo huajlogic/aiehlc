@@ -108,104 +108,75 @@ void dshostmanager::loaddialect(MLIRContext* ctx) {
 void dshostmanager::createdshostfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable) {
         auto location = builder.getUnknownLoc();
         // no region creatation
-        mlir::SmallVector<mlir::Attribute, 4> shapeElems;
-        shapeElems.push_back(builder.getI64IntegerAttr(16));
-        shapeElems.push_back(builder.getI64IntegerAttr(16));
-        mlir::ArrayAttr shapettr = mlir::ArrayAttr::get(ctx, shapeElems);
-        mlir::Type elementType = builder.getF32Type();
-        /*
-        mlir::Type myDataHandleType = dshost::dshostdataType::get(ctx);
-        auto data = builder.create<create_data>(builder.getUnknownLoc(),  myDataHandleType, shapettr, elementType); 
-        mlir::Type pgeout = dshost::dmacoreenginegroupType::get(ctx);
-        auto peg = builder.create<create_core_engine_group>(builder.getUnknownLoc(),  pgeout, 0, 4, "row"); 
-        mlir::Type ioout = dshost::dshostioenginetypeType::get(ctx);
-        auto io = builder.create<create_io_engine>(builder.getUnknownLoc(),  ioout, 0, "SHIM"); 
-        auto memio = builder.create<create_io_engine>(builder.getUnknownLoc(),  ioout, 0, "MEM"); 
-        //config port
-        auto ioconfigret = dshost::dshostioconfigType::get(ctx);
-        auto dataaccesspattern = dshost::dataaccesspatternAttr::get(ctx, builder.getStringAttr("SEND"), 16, 1, 1);
-        auto memsndpattern = dshost::dataaccesspatternAttr::get(ctx, builder.getStringAttr("SEND"), 16, 1, 1);
-        auto memreceivepattern = dshost::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
-        auto receivepattern = dshost::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
-        // create a port configuration
-        //port_configure_create
-        
-        mlir::Type portconfig = dshost::dshostportconfigType::get(ctx);
-        std::string symbolName = "receive1";
-        auto pf = builder.create<dshost::port_configure_create>(builder.getUnknownLoc(), portconfig, symbolName, receivepattern);
-        symTable.insert(pf);
-        mlir::SymbolRefAttr symbolRef = mlir::SymbolRefAttr::get(ctx,"receive1");
-        //auto useOp = builder.create<dshost::UseSymbolOp>(builder.getUnknownLoc(), symbolRef);
-        //config io port 
-        auto shimioconfig = builder.create<configure_io_engine>(builder.getUnknownLoc(),  ioconfigret,  io.getResult(),dataaccesspattern);
-        //config port group
-        dshost::dataconfmapitemAttr item1 = dshost::dataconfmapitemAttr::get(ctx,0, mlir::SymbolRefAttr::get(ctx, "receive1"));
-        dshost::dataconfmapitemAttr item2 = dshost::dataconfmapitemAttr::get(ctx,1, mlir::SymbolRefAttr::get(ctx, "receive1"));
-        dshost::dataconfmapitemAttr item3 = dshost::dataconfmapitemAttr::get(ctx,2, mlir::SymbolRefAttr::get(ctx, "receive1"));
-        dshost::dataconfmapitemAttr item4 = dshost::dataconfmapitemAttr::get(ctx,3, mlir::SymbolRefAttr::get(ctx, "receive1"));
-        llvm::SmallVector<dshost::dataconfmapitemAttr> itemsVector;
-        itemsVector.push_back(item1);
-        itemsVector.push_back(item2);
-        itemsVector.push_back(item3);
-        itemsVector.push_back(item4);
-        dshost::dataconfigmapAttr configMapAttr = dshost::dataconfigmapAttr::get(ctx,itemsVector);
-        auto gcret = dshost::dmacoregroupconfigType::get(ctx);
-        auto gcmap = builder.create<configure_coregroup>(builder.getUnknownLoc(),  gcret, peg.getResult(), "row", configMapAttr);
-        //create strem
-        auto streamret = dshost::dshostportstreamType::get(ctx);
-        bool opbymemio = false;
-        if (opbymemio) {
-            auto memiorecvconfig = builder.create<configure_io_engine>(builder.getUnknownLoc(),  ioconfigret,  memio.getResult(),memreceivepattern);
-            auto memiosendconfig = builder.create<configure_io_engine>(builder.getUnknownLoc(),  ioconfigret,  memio.getResult(),memsndpattern);
-            
-            auto shimToMemAttr = dshostioAttr::get(ctx, dshostio::DMAP_SHIMIO);
-            auto memToCoreAttr = dshostioAttr::get(ctx, dshostio::DMAP_MEMTILEIO);
-            
-            auto groupIndexAttr = builder.getI32IntegerAttr(0);
-            auto streamIdAttr1 = builder.getI32IntegerAttr(1);
-            
-            auto streamhandle1 = builder.create<createstream>(builder.getUnknownLoc(),  streamret, shimioconfig.getResult(),memiorecvconfig.getResult(), shimToMemAttr, groupIndexAttr, streamIdAttr1);
-            auto streamhandle2 = builder.create<createstream>(builder.getUnknownLoc(),  streamret, memiosendconfig.getResult(),gcmap.getResult(), memToCoreAttr, groupIndexAttr, streamIdAttr1);
 
-            // Create a chained stream from streamhandle1 and streamhandle2, then push once to the chained stream.
-            auto chainType = dshost::dshostportchainstreamType::get(ctx);
-            // The generated op build expects (TypeRange resultTypes, ValueRange operands, ArrayRef<NamedAttribute> attrs).
-            auto chainStreamOp = builder.create<createchainstream>(builder.getUnknownLoc(),
-                                                                   chainType,
-                                                                   mlir::ValueRange{streamhandle1.getResult(),
-                                                                                    streamhandle2.getResult()});
-            auto chainStream = chainStreamOp.getResult();
+        // memref<1024xf32>
+        auto memrefType = mlir::MemRefType::get({1024}, builder.getF32Type());
 
-            // Single push that targets the chained stream (replaces pret1 and pret2)
-            auto pchain = builder.create<push>(builder.getUnknownLoc(), data.getResult(), chainStream);
+        // 1) allocate device memory on host: %gmem = "ds.host.alloc_device_mem"() : memref<1024xf32, 1>
+        auto gmemOp = builder.create<dshost::AllocDeviceMemOp>(location, memrefType);
+        Value gmem = gmemOp.getResult();
 
-        } else {
-            auto shimToCoreAttr = dshostioAttr::get(ctx, dshostio::DMAP_SHIMIO);
-            
-            auto groupIndexAttr = builder.getI32IntegerAttr(0);
-            auto streamIdAttr = builder.getI32IntegerAttr(1);
-            
-            auto streamhandle = builder.create<createstream>(builder.getUnknownLoc(),  streamret, shimioconfig.getResult(),gcmap.getResult(), shimToCoreAttr, groupIndexAttr, streamIdAttr);
-            auto pret = builder.create<push>(builder.getUnknownLoc(), data.getResult(),streamhandle.getResult());
-        }
-        //push stream
-        
+        // 2) get tile handles
+        auto shim_handle = builder.create<dshost::GetTileHandleOp>(location,
+            /*col=*/builder.getI64IntegerAttr(2),
+            /*row=*/builder.getI64IntegerAttr(0)
+        ).getResult();
 
-        //config core port
-        //auto dataaccesspattern1 = dshost::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
-        //auto cport0 = builder.create<configure_io>(builder.getUnknownLoc(),  portret, peg.getResult(),0, dataaccesspattern1);
-        //auto cport1 = builder.create<configure_io>(builder.getUnknownLoc(),  portret, peg.getResult(),1, dataaccesspattern1); 
-        //auto cport2 = builder.create<configure_io>(builder.getUnknownLoc(),  portret, peg.getResult(),2, dataaccesspattern1); 
-        //auto cport3 = builder.create<configure_io>(builder.getUnknownLoc(),  portret, peg.getResult(),3, dataaccesspattern1);  
-        //create port group
-        //mlir::SmallVector<mlir::Value, 4> portlist;
-        //portlist.push_back(cport0.getResult());
-        //portlist.push_back(cport1.getResult());
-        //portlist.push_back(cport2.getResult());
-        //portlist.push_back(cport3.getResult());
+        auto core_A_handle = builder.create<dshost::GetTileHandleOp>(location,
+            /*col=*/builder.getI64IntegerAttr(0),
+            /*row=*/builder.getI64IntegerAttr(3)
+        ).getResult();
 
-        //auto portg = dshost::dshostportgroupType::get(ctx);
-        //auto portgroup = builder.create<createport_group>(builder.getUnknownLoc(),  ioout, portlist);  
-        */
-        return ;//func;
+        auto core_B_handle = builder.create<dshost::GetTileHandleOp>(location,
+            /*col=*/builder.getI64IntegerAttr(1),
+            /*row=*/builder.getI64IntegerAttr(3)
+        ).getResult();
+
+        // 3) look up stream handles from routing symbols: %stream_A = "ds.host.get_stream_handle"(@my_routes::@route_A)
+        auto routeARef = mlir::SymbolRefAttr::get(ctx, "my_routes::route_A");
+        auto routeBRef = mlir::SymbolRefAttr::get(ctx, "my_routes::route_B");
+
+        auto streamA = builder.create<dshost::GetStreamHandleOp>(location, routeARef).getResult();
+        auto streamB = builder.create<dshost::GetStreamHandleOp>(location, routeBRef).getResult();
+
+        ///*
+        // 4) launch DMA: %evt_dma = "dshost::LaunchKernelAsyncOp" on %shim_handle ( %gmem, %stream_A, %stream_B )
+        // get the event result type produced by the op
+        auto eventType = dshost::EventType::get(ctx);
+        auto evt_dma = builder.create<dshost::LaunchKernelAsyncOp>(location,
+            eventType,
+            ValueRange{shim_handle, gmem, streamA, streamB}
+        ).getResult();
+
+        // 5) get packet ids from routinghw dialect
+        auto pidA = builder.create<dshost::GetPacketIdOp>(location, routeARef).getResult();
+        auto pidB = builder.create<dshost::GetPacketIdOp>(location, routeBRef).getResult();
+
+        // 6) launch kernels asynchronously on core handles
+        //    pass kernel symbol and packet id as operands
+        auto kernelARef = mlir::SymbolRefAttr::get(ctx, "dskernel_A");
+        auto kernelBRef = mlir::SymbolRefAttr::get(ctx, "dskernel_B");
+
+        // callee is an attribute on the op (see extraClassDeclaration)
+        auto calleeAttrA = builder.getNamedAttr(dshost::LaunchKernelAsyncOp::getCalleeAttrName(), kernelARef);
+        auto evt_A = builder.create<dshost::LaunchKernelAsyncOp>(location,
+            eventType,
+            ValueRange{core_A_handle, pidA},
+            llvm::ArrayRef<mlir::NamedAttribute>{calleeAttrA}
+        ).getResult();
+
+        auto calleeAttrB = builder.getNamedAttr(dshost::LaunchKernelAsyncOp::getCalleeAttrName(), kernelBRef);
+        auto evt_B = builder.create<dshost::LaunchKernelAsyncOp>(location,
+            eventType,
+            ValueRange{core_B_handle, pidB},
+            llvm::ArrayRef<mlir::NamedAttribute>{calleeAttrB}
+        ).getResult();
+
+        // 7) wait on events
+        builder.create<dshost::WaitOp>(location, ValueRange{evt_dma, evt_A, evt_B});
+
+        // return from function
+        builder.create<mlir::func::ReturnOp>(location);
+
+        return ;
 }
