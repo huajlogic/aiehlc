@@ -48,7 +48,7 @@ def dsdirection_enum : I32EnumAttr<"dsdirection", "dsdirection direction", [
 def dsdirectionAttr : EnumAttr<dshostdialect, dsdirection_enum, "io"> {
   let assemblyFormat = "`<` $value `>`";
 }
- 
+ /*
 def Flow_ShimEndpointAttr : dshostattr<"ShimEndpoint"> {
   let summary = "Physical SHIM endpoint binding";
   let parameters = (ins
@@ -62,4 +62,4 @@ def Flow_ShimEndpointAttr : dshostattr<"ShimEndpoint"> {
   );
   let assemblyFormat =  "`{` $hops  `,` $row  `,` $col `,` $port `,` $channel  `,` $packet_id `,` $vc `}`";
 }
- 
+ */

@@ -7,7 +7,7 @@
 
 int main(int argc, char* argv[]) {
     MLIRContext ctx;
-    dshosthopmanager hoptest;
+    dshostmanager hoptest;
     
     // Load the dshosthop dialect
     hoptest.loaddialect(&ctx);

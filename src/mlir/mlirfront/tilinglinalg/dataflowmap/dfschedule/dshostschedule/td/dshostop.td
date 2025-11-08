@@ -41,13 +41,11 @@ def DSHost_AllocDeviceMemOp : dshosop< "alloc_device_mem", []> {
   let summary = "Allocate device global memory";
   let arguments = (ins);
   let results   = (outs AnyMemRef:$memref);
-  let assemblyFormat = [{
-    attr-dict `:` type($memref)
-  }];
-  let hasVerifier = 1;
-  let builders = [
-    OpBuilder<(ins "Type":$memrefTy)>
-  ];
+  let assemblyFormat = "attr-dict `:` type($memref)";
+  //let hasVerifier = 1;
+  //let builders = [
+  //  OpBuilder<(ins "Type":$memrefTy)>
+  //];
 }
 
 // amd.host.free_device_mem
@@ -56,7 +54,7 @@ def DSHost_FreeDeviceMemOp : dshosop< "free_device_mem", []> {
   let arguments = (ins AnyMemRef:$memref);
   let results   = (outs);
   let assemblyFormat = "$memref attr-dict `:` type($memref)";
-  let hasVerifier = 1;
+  //let hasVerifier = 1;
 }
 
 // amd.host.copy_h2d_async
