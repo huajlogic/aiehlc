@@ -63,7 +63,7 @@ ModuleOp dshostmanager::ops_test(MLIRContext* ctx, int totalN) {
     
     dshost::FuncOp main = builder.create<dshost::FuncOp>(builder.getUnknownLoc(), "main", functype);
     m.push_back(main);
-    /*
+    ///*
     //auto block = main.addEntryBlock();
     auto &block = main.getBody().emplaceBlock();
     builder.setInsertionPointToEnd(&block);
@@ -84,7 +84,7 @@ ModuleOp dshostmanager::ops_test(MLIRContext* ctx, int totalN) {
         llvm::outs() << "Found: " << found->getName() <<"\n";
    }
     llvm::errs() << m;
-    */
+   // */
     return m;
 }
 
@@ -108,12 +108,12 @@ void dshostmanager::loaddialect(MLIRContext* ctx) {
 void dshostmanager::createdshostfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable) {
         auto location = builder.getUnknownLoc();
         // no region creatation
-    /*   
         mlir::SmallVector<mlir::Attribute, 4> shapeElems;
         shapeElems.push_back(builder.getI64IntegerAttr(16));
         shapeElems.push_back(builder.getI64IntegerAttr(16));
         mlir::ArrayAttr shapettr = mlir::ArrayAttr::get(ctx, shapeElems);
         mlir::Type elementType = builder.getF32Type();
+        /*
         mlir::Type myDataHandleType = dshost::dshostdataType::get(ctx);
         auto data = builder.create<create_data>(builder.getUnknownLoc(),  myDataHandleType, shapettr, elementType); 
         mlir::Type pgeout = dshost::dmacoreenginegroupType::get(ctx);
