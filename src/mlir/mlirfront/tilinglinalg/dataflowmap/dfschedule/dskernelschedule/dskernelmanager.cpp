@@ -130,18 +130,87 @@ mlir::func::FuncOp dskernelmanager::createdskernelfuncByDim(OpBuilder &builder, 
   // 3. Create the function's entry block and set the insertion point inside it.
   //    This is the correct way to create the entry block for a function.
   Block *entryBlock = funcOp.addEntryBlock();
+  
+  // 3.1 Add "packetid" attribute to the first argument
+  //funcOp.setArgAttr(0, "packetid", builder.getUnitAttr());
+  
   builder.setInsertionPointToStart(entryBlock);
 
   // 4. Get the packet id from the function's argument.
   Value my_packet_id = entryBlock->getArgument(0);
 
   // --- Function Body ---
-  // (The rest of your logic is commented out, so I will leave it that way)
-  /*
+  // Create ping-pong buffers for double-buffering pattern
+  // %ping = memref.alloca() : memref<256xf32> {buffer_type = "ping"}
   auto memrefType = mlir::MemRefType::get({256}, builder.getF32Type());
   auto ping = builder.create<mlir::memref::AllocaOp>(location, memrefType);
-  // ... etc ...
-  */
+  ping->setAttr("buffer_type", builder.getStringAttr("ping"));
+  ping->setAttr("comment", builder.getStringAttr("Ping buffer of DMA"));
+  
+  // %pong = memref.alloca() : memref<256xf32> {buffer_type = "pong"}
+  auto pong = builder.create<mlir::memref::AllocaOp>(location, memrefType);
+  pong->setAttr("buffer_type", builder.getStringAttr("pong"));
+  pong->setAttr("comment", builder.getStringAttr("Pong buffer of DMA"));
+
+  // %lock_dma = "dskernel.lock_init"(1)
+  auto lock_dma = builder.create<dskernel::LockInitOp>(location, dskernel::lockType::get(ctx), builder.getI64IntegerAttr(1));
+  // %lock_compute = "dskernel.lock_init"(0)
+  auto lock_compute = builder.create<dskernel::LockInitOp>(location, dskernel::lockType::get(ctx), builder.getI64IntegerAttr(0));
+
+  // "dskernel.launch_dma_s2m_loop"(%ping, %pong) { ... }
+  auto dmaLoop = builder.create<dskernel::LaunchDmaS2MLoopOp>(
+      location, ping.getResult(), pong.getResult(), my_packet_id, lock_dma.getResult(), lock_compute.getResult());
+  
+
+  // scf.for %i = 0 to 4 { ... }
+  auto lowerBound = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
+  auto upperBound = builder.create<mlir::arith::ConstantIndexOp>(location, 4);
+  auto step = builder.create<mlir::arith::ConstantIndexOp>(location, 1);
+
+  auto forLoop = builder.create<mlir::scf::ForOp>(location, lowerBound.getResult(), upperBound.getResult(), step.getResult());
+  builder.setInsertionPointToStart(forLoop.getBody());
+
+  Value iv = forLoop.getInductionVar();
+
+  // "dskernel.acquire_lock"(%lock_compute, %i+1)
+  auto one_i32 = builder.create<mlir::arith::ConstantOp>(location, builder.getI32IntegerAttr(1));
+  // The induction variable is index type, cast to i32 if needed for the lock op.
+  Value iv_i32 = builder.create<mlir::arith::IndexCastOp>(location, builder.getI32Type(), iv).getResult();
+  Value token_compute = builder.create<mlir::arith::AddIOp>(location, iv_i32, one_i32.getResult()).getResult();
+  builder.create<dskernel::AcquireLockOp>(location, lock_compute.getResult(), token_compute);
+
+  // Select ping or pong buffer based on iteration (even/odd)
+  // %is_even = arith.remui %i, 2
+  auto two_idx = builder.create<mlir::arith::ConstantIndexOp>(location, 2);
+  Value is_even = builder.create<mlir::arith::RemUIOp>(location, iv, two_idx.getResult()).getResult();
+  auto zero_idx = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
+  Value use_ping = builder.create<mlir::arith::CmpIOp>(location, mlir::arith::CmpIPredicate::eq, is_even, zero_idx.getResult()).getResult();
+  
+  // %current_buffer = arith.select %use_ping, %ping, %pong : memref<256xf32>
+  Value current_buffer = builder.create<mlir::arith::SelectOp>(location, use_ping, ping.getResult(), pong.getResult()).getResult();
+
+  // scf.for %j = 0 to 10 { ... compute on current_buffer ... }
+  auto innerLowerBound = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
+  auto innerUpperBound = builder.create<mlir::arith::ConstantIndexOp>(location, 10);
+  auto innerStep = builder.create<mlir::arith::ConstantIndexOp>(location, 1);
+
+  auto innerForLoop = builder.create<mlir::scf::ForOp>(location, innerLowerBound.getResult(), innerUpperBound.getResult(), innerStep.getResult());
+  builder.setInsertionPointToStart(innerForLoop.getBody());
+
+  Value jv = innerForLoop.getInductionVar();
+
+  // "core.compute"(...) - Placeholder for compute operation on current_buffer
+  // Example: %val = memref.load %current_buffer[%j]
+  // builder.create<memref::LoadOp>(location, current_buffer, ValueRange{jv});
+
+  // Move back to outer loop body after inner loop
+  builder.setInsertionPointAfter(innerForLoop);
+
+  // "dskernel.release_lock"(%lock_dma, %i+1)
+  builder.create<dskernel::ReleaseLockOp>(location, lock_dma.getResult(), token_compute);
+
+  // Move insertion point back to function level to add return
+  builder.setInsertionPointToEnd(entryBlock);
   // --- End of Function Body ---
   
   // 5. Add a return op at the end of the function.

@@ -71,7 +71,7 @@ class dskernelmanager{
 public:
     dskernelmanager(){};
     ModuleOp ops_test(MLIRContext* ctx,int totalN=2) ;
-    mlir::func::FuncOp createdskernelfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
+    mlir::func::FuncOp createdskernelfuncByDim(OpBuilder& builder, MLIRContext* ctx);
     static void loaddialect(MLIRContext* ctx);
 };
 #endif//DSKERNEL_MANAGER_H
