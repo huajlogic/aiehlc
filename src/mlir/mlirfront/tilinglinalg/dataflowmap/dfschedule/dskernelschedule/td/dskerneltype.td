@@ -7,14 +7,14 @@ include "dskernelattr.td"
 // dskernel types
 //
 def DSKernel_LockType:dskerneltype<"lock"> {
-  let mnemonic = "event";
-  let summary = "Opaque async event type for Kernel runtime";
+  let mnemonic = "lock";
+  let summary = "Opaque   lock type for Kernel runtime";
 }
 
 def DSKernel_EventType : dskerneltype<"event"> {
-  let mnemonic = "stream";
+  let mnemonic = "event";
   //let parameters = (ins TypeParameter<"element type">:$elemTy);
-  let summary = "Kernel-visible stream handle carrying element type";
+  let summary = "Kernel-visible event handle carrying element type";
 }
 
 def DSKernel_PacketType : dskerneltype<"Ppacketcket"> {
@@ -25,8 +25,8 @@ def DSKernel_PacketType : dskerneltype<"Ppacketcket"> {
 
 //=== dskernelDMA Types/Attrs ===//
 def DSKernel_StreamType : dskerneltype<"stream"> {
-  let mnemonic = "lock";
-  let summary = "Abstract device lock handle";
+  let mnemonic = "stream";
+  let summary = "Abstract device stream handle";
 }
 
 

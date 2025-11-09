@@ -7,10 +7,37 @@ include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ShapedOpInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
 
 include "dskerneltype.td"
 // NOTE: replace `dskernelop` below with the op-wrapper macro your dialect defines
 // (e.g. dskernelop or similar). If you haven't defined one, add it in your dialect .td.
+
+def DSKernel_FuncOp : dskernelop<"func",[IsolatedFromAbove, Symbol, SymbolTable,FunctionOpInterface]>
+{
+    let summary = "Defines a function in the dskernel Dialect";
+    let description = [{This operation represents a function definiton in the dskernel dialect.
+                        It contains a name, other related arguments and an optional return type.
+                        It has a single region for the function body.
+                        }];
+
+  let arguments = (ins 
+                    SymbolNameAttr:$sym_name,
+                    TypeAttrOf<FunctionType>:$function_type
+                  );
+
+  let regions = (region AnyRegion:$body);
+  
+  // Use custom parser/printer for proper function syntax
+  let hasCustomAssemblyFormat = 1;
+  
+   let extraClassDeclaration = [{
+    // FunctionOpInterface methods
+    mlir::Region *getCallableRegion() { return &getBody(); }
+    llvm::ArrayRef<mlir::Type> getArgumentTypes() { return getFunctionType().getInputs(); }
+    llvm::ArrayRef<mlir::Type> getResultTypes() { return getFunctionType().getResults(); }
+  }];
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // dskernel.lock_init
@@ -21,9 +48,6 @@ def DSKernel_LockInitOp : dskernelop<"lock_init"> {
   let arguments = (ins I64Attr:$count);
   let results   = (outs DSKernel_LockType:$lock);
   let assemblyFormat = "attr-dict `(` $count `)` `->` type($lock)";
-  let extraClassDeclaration = [{
-    static StringRef getCountAttrName() { return "count"; }
-  }];
 }
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -2,8 +2,8 @@
 * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
-#ifndef __DMAP_MANAGER__
-#define __DMAP_MANAGER__
+#ifndef DSKERNEL_MANAGER_H
+#define DSKERNEL_MANAGER_H
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/SymbolTable.h"
@@ -21,6 +21,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
@@ -46,32 +47,31 @@
 //fieldparser
 #include "mlir/IR/DialectImplementation.h"
 
-#include "dshostdialect.h.inc"
+#include "dskerneldialect.h.inc"
 
-#include "dshostenums.h.inc"
 
 using namespace mlir;
-using namespace dshost;
+using namespace dskernel;
 
 #define GET_ATTRDEF_CLASSES
-#include "dshostattr.h.inc"
+#include "dskernelattr.h.inc"
 #undef GET_ATTRDEF_CLASSES
 
 #define GET_TYPEDEF_CLASSES
-#include "dshosttype.h.inc"
+#include "dskerneltype.h.inc"
 #undef GET_TYPEDEF_CLASSES
 
 #define GET_OP_CLASSES
 #define GET_OP_DECLS
-#include "dshostop.h.inc"
+#include "dskernelop.h.inc"
 #undef GET_OP_DECLS
 #undef GET_OP_CLASSES
 
-class dshostmanager{
+class dskernelmanager{
 public:
-    dshostmanager(){};
+    dskernelmanager(){};
     ModuleOp ops_test(MLIRContext* ctx,int totalN=2) ;
-    void createdshostfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
+    void createdskernelfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
     static void loaddialect(MLIRContext* ctx);
 };
-#endif//__DMAP_MANAGER__
+#endif//DSKERNEL_MANAGER_H
