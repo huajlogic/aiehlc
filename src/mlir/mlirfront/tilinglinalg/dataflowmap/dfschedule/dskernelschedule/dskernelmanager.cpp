@@ -89,9 +89,12 @@ ModuleOp dskernelmanager::ops_test(MLIRContext* ctx, int totalN) {
     // Set the insertion point at the top level of the module.
     builder.setInsertionPointToStart(m.getBody());
 
-    // Call the helper function to create the FuncOp.
+    //L2 high level kernel
+    mlir::func::FuncOp kernelFunc1 = createdskernelfuncByDimL2(builder, ctx);
+
+    // Call the helper function to create the FuncOp.            
     // The builder will automatically insert it into the module.
-    mlir::func::FuncOp kernelFunc = createdskernelfuncByDim(builder, ctx);
+    //mlir::func::FuncOp kernelFunc = createdskernelfuncByDim(builder, ctx);
     
     // Print the generated module
     llvm::errs() << m;
@@ -237,34 +240,124 @@ mlir::func::FuncOp dskernelmanager::createdskernelfuncByDim(OpBuilder &builder, 
   return funcOp;
 }
 
+mlir::func::FuncOp dskernelmanager::createdskernelfuncByDimL2(OpBuilder &builder, MLIRContext *ctx) {
+  auto location = builder.getUnknownLoc();
+  // Define memory spaces. Let's assume GLOBAL=0, SHARED=1.
+  auto global_mem_space = builder.getIntegerAttr(builder.getI64Type(), 0);
+  auto shared_mem_space = builder.getIntegerAttr(builder.getI64Type(), 1);
+
+  // 1. Define the function type: func.func @kernel_flow_level(%gmem_in: memref<1024xf32, "GLOBAL">)
+  auto gmemType = mlir::MemRefType::get({1024}, builder.getF32Type(), nullptr, global_mem_space);
+  auto funcType = builder.getFunctionType({gmemType}, {});
+
+  // 2. Create the func.func operation.
+  auto funcOp = builder.create<mlir::func::FuncOp>(location, "kernel_flow_level", funcType);
+
+  // 3. Create the function's entry block and set the insertion point.
+  Block *entryBlock = funcOp.addEntryBlock();
+  builder.setInsertionPointToStart(entryBlock);
+  Value gmem_in = entryBlock->getArgument(0);
+
+  // 4. Allocate ping/pong buffers in shared memory.
+  auto smemType = mlir::MemRefType::get({256}, builder.getF32Type(), nullptr, shared_mem_space);
+  auto ping = builder.create<mlir::memref::AllocaOp>(location, smemType);
+  auto pong = builder.create<mlir::memref::AllocaOp>(location, smemType);
+
+  // 5. Create the high-level pipeline operation.
+  // The custom builder we defined in the .td file handles region and block argument creation.
+  auto pipelineOp = builder.create<dskernel::L2PipelineG2sOp>(location, gmem_in, ping, pong);
+  {
+  // 6. Populate the body of the pipeline operation.
+  Block *pipelineBody = &bodyRegion.front();
+  if (pipelineBody->empty() || !isa<dskernel::L2YieldOp>(pipelineBody->back())) {
+      // If the block is empty or doesn't have a yield, something is wrong.
+      // Set insertion point to the end of the block and add a terminator.
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToEnd(pipelineBody);
+      builder.create<dskernel::L2YieldOp>(loc);
+  }
+  builder.setInsertionPoint(pipelineBody->getTerminator());
+
+  // 5. Create the compute op inside the pipeline
+  builder.create<dskernel::ComputeOp>(location, smem_block);
+
+  // 9. Set insertion point after the pipeline op.
+  builder.setInsertionPointAfter(pipelineOp);
+  }
+  // 10. Add a return op at the end of the function.
+  builder.create<mlir::func::ReturnOp>(location);
+
+  return funcOp;
+}
+
 // Add these includes at the top if not already present
 #include "mlir/Interfaces/FunctionImplementation.h"
 
 // Add after the initialize() function:
 
-::mlir::ParseResult dskernel::FuncOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
-  auto buildFuncType = [](Builder &builder, ArrayRef<Type> argTypes, ArrayRef<Type> results,
-                          function_interface_impl::VariadicFlag,
-                          std::string &) {
-    return builder.getFunctionType(argTypes, results);
-  };
+ 
 
-  StringAttr functionTypeAttr = parser.getBuilder().getStringAttr("function_type");
-  StringAttr argAttrsAttr = parser.getBuilder().getStringAttr("arg_attrs");
-  StringAttr resAttrsAttr = parser.getBuilder().getStringAttr("res_attrs");
+// =============================================================================
+// C++ Implementations for L2PipelineG2sOp Builder and Verifier
+// =============================================================================
+/*
+void dskernel::L2PipelineG2sOp::build(
+    mlir::OpBuilder &builder, mlir::OperationState &state,
+    mlir::Value gmem_buffer, mlir::Value ping_buffer, mlir::Value pong_buffer) {
 
-  return function_interface_impl::parseFunctionOp(
-      parser, result, /*allowVariadic=*/false,
-      functionTypeAttr, buildFuncType,
-      argAttrsAttr, resAttrsAttr);
+  state.addOperands({gmem_buffer, ping_buffer, pong_buffer});
+
+  // Create the region and its entry block
+  mlir::Region *bodyRegion = state.addRegion();
+  mlir::Block *bodyBlock = new mlir::Block();
+  bodyRegion->push_back(bodyBlock);
+
+  // Add the two block arguments (%i and %smem_block)
+  mlir::Type indexType = builder.getIndexType();
+  mlir::Type smemType = ping_buffer.getType();
+  bodyBlock->addArgument(indexType, state.location);
+  bodyBlock->addArgument(smemType, state.location);
+
+  // Automatically insert the terminator at the end of the block
+  mlir::OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(bodyBlock);
+  builder.create<dskernel::DSKernel_L2YieldOp>(state.location);
 }
 
-void dskernel::FuncOp::print(::mlir::OpAsmPrinter &p) {
-  StringAttr functionTypeAttr = StringAttr::get(getContext(), "function_type");
-  StringAttr argAttrsAttr = StringAttr::get(getContext(), "arg_attrs");
-  StringAttr resAttrsAttr = StringAttr::get(getContext(), "res_attrs");
-  printf("--- dskernel::FuncOp::print----\n");
-  function_interface_impl::printFunctionOp(
-      p, *this, /*isVariadic=*/false,
-      functionTypeAttr, argAttrsAttr, resAttrsAttr);
+mlir::LogicalResult dskernel::L2PipelineG2sOp::verify(L2PipelineG2sOp op) {
+  // 1. Get operand types
+  auto gmemType = ::mlir::dyn_cast<mlir::MemRefType>(op.getGmemBuffer().getType());
+  auto pingType = ::mlir::dyn_cast<mlir::MemRefType>(op.getPingBuffer().getType());
+  auto pongType = ::mlir::dyn_cast<mlir::MemRefType>(op.getPongBuffer().getType());
+
+  if (!gmemType || !pingType || !pongType)
+    return op.emitOpError("all operands must be memref types");
+
+  // 2. Check memory spaces (assuming GLOBAL=0, SHARED=1, adjust if needed)
+  if (gmemType.getMemorySpaceAsInt() != 0)
+    return op.emitOpError("gmem_buffer must be in global memory (space 0)");
+  if (pingType.getMemorySpaceAsInt() != 1)
+    return op.emitOpError("ping_buffer must be in shared memory (space 1)");
+  if (pongType.getMemorySpaceAsInt() != 1)
+    return op.emitOpError("pong_buffer must be in shared memory (space 1)");
+
+  // 3. Check if ping and pong types are identical
+  if (pingType != pongType)
+    return op.emitOpError("ping and pong buffers must have identical types");
+
+  // 4. Check region and block arguments
+  auto *block = op.getBodyRegion().empty() ? nullptr : &op.getBodyRegion().front();
+  if (!block || block->getNumArguments() != 2)
+    return op.emitOpError("region must have exactly two block arguments");
+
+  // 5. Check %i: index
+  if (!::mlir::isa<mlir::IndexType>(block->getArgument(0).getType()))
+    return op.emitOpError("first block argument must be 'index' type");
+
+  // 6. Check %smem_block (must match ping/pong type)
+  if (block->getArgument(1).getType() != pingType)
+    return op.emitOpError("second block argument must match ping/pong buffer type");
+
+  return mlir::success();
 }
+*/
