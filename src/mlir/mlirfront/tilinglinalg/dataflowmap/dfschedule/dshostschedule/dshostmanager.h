@@ -21,6 +21,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
@@ -72,6 +73,7 @@ public:
     dshostmanager(){};
     ModuleOp ops_test(MLIRContext* ctx,int totalN=2) ;
     void createdshostfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
+    mlir::func::FuncOp createDSKernelFunc(OpBuilder &builder, MLIRContext *ctx);
     static void loaddialect(MLIRContext* ctx);
 };
 #endif//__DMAP_MANAGER__

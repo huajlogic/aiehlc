@@ -265,26 +265,17 @@ mlir::func::FuncOp dskernelmanager::createdskernelfuncByDimL2(OpBuilder &builder
 
   // 5. Create the high-level pipeline operation.
   // The custom builder we defined in the .td file handles region and block argument creation.
-  auto pipelineOp = builder.create<dskernel::L2PipelineG2sOp>(location, gmem_in, ping, pong);
+  auto pipelineOp = builder.create<dskernel::L2PipelineG2sOp>(location, gmem_in, ping, pong,
+    [&](OpBuilder &builder, Location location, ValueRange args)
   {
-  // 6. Populate the body of the pipeline operation.
-  Block *pipelineBody = &bodyRegion.front();
-  if (pipelineBody->empty() || !isa<dskernel::L2YieldOp>(pipelineBody->back())) {
-      // If the block is empty or doesn't have a yield, something is wrong.
-      // Set insertion point to the end of the block and add a terminator.
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToEnd(pipelineBody);
-      builder.create<dskernel::L2YieldOp>(loc);
-  }
-  builder.setInsertionPoint(pipelineBody->getTerminator());
+    
+    // 7. Create the compute op inside the pipeline, using the block argument
+   // builder.create<dskernel::ComputeOp>(location, smem_block);
+    builder.create<dskernel::ComputeOp>(location, args[1]);
+  
+  });
 
-  // 5. Create the compute op inside the pipeline
-  builder.create<dskernel::ComputeOp>(location, smem_block);
-
-  // 9. Set insertion point after the pipeline op.
-  builder.setInsertionPointAfter(pipelineOp);
-  }
-  // 10. Add a return op at the end of the function.
+  // 9. Add a return op at the end of the function.
   builder.create<mlir::func::ReturnOp>(location);
 
   return funcOp;

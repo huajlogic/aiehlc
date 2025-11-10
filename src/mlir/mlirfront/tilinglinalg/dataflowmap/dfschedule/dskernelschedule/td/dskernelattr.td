@@ -15,7 +15,7 @@ def dskerneldialect : Dialect {
     //let useDefaultAttributePrinterParser = 1;
     let hasOperationAttrVerify = 0;
     let useDefaultAttributePrinterParser = 1;
-	  let usePropertiesForAttributes = 0;
+	let usePropertiesForAttributes = 0;
     let useDefaultTypePrinterParser = 1;  
     dag discardableAttrs = (ins);
 }

@@ -115,13 +115,41 @@ def DSKernel_L2PipelineG2sOp : dskernelop<"pipeline_g2s", []> {
 
   // --- C++ Declarations for Builder and Verifier ---
 
+ 
   // --- Assembly Format ---
   let assemblyFormat = [{
     $gmem_buffer `,` $ping_buffer `,` $pong_buffer
-    `yields` `(` $bodyRegion `)`
-    attr-dict
+    `yields` `(`   `)`
+    $bodyRegion attr-dict
     `:` functional-type(operands, results)
   }];
+ 
+  
+ 
+  let builders = [
+    OpBuilder<(ins "Value":$gmem_buffer, "Value":$ping_buffer, "Value":$pong_buffer,"function_ref<void(OpBuilder &, Location, ValueRange)>":$bodyBuilderCallback),
+    [{
+      // 1. Get types for the block arguments
+      Type indexType = odsBuilder.getIndexType();
+      Type smemType = ping_buffer.getType(); // %smem_block matches %ping
+      Location loc = $_state.location;
+      
+      // 2. Create the region and its entry block
+      Region *body = $_state.addRegion();
+      Block *block = new Block();
+      body->push_back(block);
+      
+      // 3. Add the two block arguments (%i and %smem_block)
+      block->addArgument(indexType, loc); // %i: index
+      block->addArgument(smemType, loc);  // %smem_block: memref<...>
+      
+      // 4. Add the 'dskernel.yield' terminator
+      OpBuilder::InsertionGuard guard(odsBuilder);
+      odsBuilder.setInsertionPointToEnd(block);
+      odsBuilder.create<dskernel::L2YieldOp>(loc); // Assumes 'dskernel.yield'
+    }]>
+  ];
+ 
 }
 
 def DSKernel_L2YieldOp : dskernelop<"yield", [

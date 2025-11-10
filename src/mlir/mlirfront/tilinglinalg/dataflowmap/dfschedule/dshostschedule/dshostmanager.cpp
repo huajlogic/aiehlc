@@ -53,38 +53,40 @@ void dshostdialect::printType(Type type, DialectAsmPrinter &printer) const {
 //*/
 
 
+// Forward declaration for the new helper function
+
 ModuleOp dshostmanager::ops_test(MLIRContext* ctx, int totalN) {
     const int hwrowused= 4, hwcolused=4;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
-    //auto func = createdshostfuncByDim(ctx, true);
-    //m.push_back(func);
-    auto functype = builder.getFunctionType({},{});
     
-    dshost::FuncOp main = builder.create<dshost::FuncOp>(builder.getUnknownLoc(), "main", functype);
+    // --- 1. 创建主机端函数 @main ---
+    auto mainFuncType = builder.getFunctionType({}, {});
+    //auto main = builder.create<dshost::FuncOp>(builder.getUnknownLoc(), "main", mainFuncType);
+    auto main = builder.create<mlir::func::FuncOp>(builder.getUnknownLoc(), "main", mainFuncType);
     m.push_back(main);
-    ///*
-    //auto block = main.addEntryBlock();
-    auto &block = main.getBody().emplaceBlock();
-    builder.setInsertionPointToEnd(&block);
-
-    SymbolTable symTable(main);
-
-    createdshostfuncByDim(builder, ctx, symTable);
-    auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     
-  // ------------------------------------------------------------------
-  // 4. Look up the symbol anywhere inside the module
-  // ------------------------------------------------------------------
-    Operation *found = symTable.lookup("receive1");
-    if (!found) {
-        llvm::errs() << "Symbol @receive1 not found!\n";
-   } else {
-        llvm::outs() << "receive1 found \n";
-        llvm::outs() << "Found: " << found->getName() <<"\n";
-   }
+    // 正确的创建方式：使用 addEntryBlock()
+    Block *mainBlock = main.addEntryBlock();
+    builder.setInsertionPointToStart(mainBlock);
+    //auto &block = main.getBody().emplaceBlock();
+    //builder.setInsertionPointToEnd(&block);
+
+    SymbolTable symTable(m);
+    createdshostfuncByDim(builder, ctx, symTable);
+    //builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
+    // createdshostfuncByDim 内部已经添加了 return
+
+    // --- 2. 创建设备端内核函数 @dskernel_coretile_compute ---
+    
+    // 将 OpBuilder 的插入点移回到模块的末尾
+    builder.setInsertionPointToEnd(m.getBody());
+    
+    // 在模块的顶层创建第二个函数
+    mlir::func::FuncOp kernelFunc = createDSKernelFunc(builder, ctx);
+    
+    // --- 3. 打印最终的模块 ---
     llvm::errs() << m;
-   // */
     return m;
 }
 
@@ -93,6 +95,7 @@ void dshostmanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<dshost::dshostdialect>();
     ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx->getOrLoadDialect<mlir::memref::MemRefDialect>(); // Add MemRef dialect
 }
 /*
       %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
@@ -108,7 +111,7 @@ void dshostmanager::loaddialect(MLIRContext* ctx) {
 void dshostmanager::createdshostfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable) {
         auto location = builder.getUnknownLoc();
         // no region creatation
-
+        
         // memref<1024xf32>
         auto memrefType = mlir::MemRefType::get({1024}, builder.getF32Type());
 
@@ -118,18 +121,18 @@ void dshostmanager::createdshostfuncByDim(OpBuilder& builder, MLIRContext* ctx,S
 
         // 2) get tile handles
         auto shim_handle = builder.create<dshost::GetTileHandleOp>(location,
-            /*col=*/builder.getI64IntegerAttr(2),
-            /*row=*/builder.getI64IntegerAttr(0)
+            builder.getI32IntegerAttr(2),
+            builder.getI32IntegerAttr(0)
         ).getResult();
 
         auto core_A_handle = builder.create<dshost::GetTileHandleOp>(location,
-            /*col=*/builder.getI64IntegerAttr(0),
-            /*row=*/builder.getI64IntegerAttr(3)
+            builder.getI32IntegerAttr(0),
+            builder.getI32IntegerAttr(3)
         ).getResult();
 
         auto core_B_handle = builder.create<dshost::GetTileHandleOp>(location,
-            /*col=*/builder.getI64IntegerAttr(1),
-            /*row=*/builder.getI64IntegerAttr(3)
+            builder.getI32IntegerAttr(1),
+            builder.getI32IntegerAttr(3)
         ).getResult();
 
         // 3) look up stream handles from routing symbols: %stream_A = "ds.host.get_stream_handle"(@my_routes::@route_A)
@@ -174,9 +177,125 @@ void dshostmanager::createdshostfuncByDim(OpBuilder& builder, MLIRContext* ctx,S
 
         // 7) wait on events
         builder.create<dshost::WaitOp>(location, ValueRange{evt_dma, evt_A, evt_B});
-
+        //*/
         // return from function
         builder.create<mlir::func::ReturnOp>(location);
 
         return ;
+}
+
+// --- New function with the COMPLETE logic from dskernelmanager ---
+mlir::func::FuncOp dshostmanager::createDSKernelFunc(OpBuilder &builder, MLIRContext *ctx) {
+  auto location = builder.getUnknownLoc();
+ 
+  // 1. Define the function type: (i32) -> ()
+  auto funcType = builder.getFunctionType({builder.getI32Type()}, {});
+
+  // 2. Create the func.func operation.
+  auto funcOp = builder.create<mlir::func::FuncOp>(location, "dskernel_coretile_compute", funcType);
+
+  // 3. Create the function's entry block and set the insertion point inside it.
+  Block *entryBlock = funcOp.addEntryBlock();
+  builder.setInsertionPointToStart(entryBlock);
+
+  // 4. Get the packet id from the function's argument.
+  Value my_packet_id = entryBlock->getArgument(0);
+
+  // --- Function Body ---
+  // Create ping-pong buffers for double-buffering pattern
+  auto memrefType = mlir::MemRefType::get({256}, builder.getF32Type());
+  auto ping = builder.create<mlir::memref::AllocaOp>(location, memrefType);
+  ping->setAttr("buffer_type", builder.getStringAttr("ping"));
+  
+  auto pong = builder.create<mlir::memref::AllocaOp>(location, memrefType);
+  pong->setAttr("buffer_type", builder.getStringAttr("pong"));
+
+  // Lock Definitions:
+  auto ping_acquire = builder.create<dshost::LockInitOp>(location, dshost::LockType::get(ctx), 0);
+  auto pong_acquire = builder.create<dshost::LockInitOp>(location, dshost::LockType::get(ctx), 0);
+  auto ping_release = builder.create<dshost::LockInitOp>(location, dshost::LockType::get(ctx), 1);
+  auto pong_release = builder.create<dshost::LockInitOp>(location, dshost::LockType::get(ctx), 0);
+
+  // Thread A (DMA): Launch DMA s2m loop - runs in parallel
+  // NOTE: Ensure DSHost_LaunchDmaS2MLoopOp is defined correctly in dshostop.td
+  auto dmaLoop = builder.create<dshost::LaunchDmaS2MLoopOp>(
+      location, ping.getResult(), pong.getResult(), my_packet_id, 
+      ping_acquire.getResult(), pong_acquire.getResult(), 
+      ping_release.getResult(), pong_release.getResult());
+
+  // Thread B (Compute): Main processing loop - runs in parallel
+  auto c0 = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
+  auto c4 = builder.create<mlir::arith::ConstantIndexOp>(location, 4);
+  auto c1 = builder.create<mlir::arith::ConstantIndexOp>(location, 1);
+  auto c2 = builder.create<mlir::arith::ConstantIndexOp>(location, 2); // For modulo
+
+  auto forLoop = builder.create<mlir::scf::ForOp>(location, c0.getResult(), c4.getResult(), c1.getResult());
+  builder.setInsertionPointToStart(forLoop.getBody());
+  Value iv = forLoop.getInductionVar();
+
+  // Ping-Pong Switch Logic: Determine if iteration is even or odd
+  Value rem = builder.create<mlir::arith::RemUIOp>(location, iv, c2.getResult()).getResult();
+  Value is_even = builder.create<mlir::arith::CmpIOp>(location, mlir::arith::CmpIPredicate::eq, rem, c0.getResult()).getResult();
+
+  // Select buffer based on iteration (even=ping, odd=pong)
+  auto ifBuffer = builder.create<mlir::scf::IfOp>(location, memrefType, is_even, true);
+  builder.setInsertionPointToStart(&ifBuffer.getThenRegion().front());
+  builder.create<mlir::scf::YieldOp>(location, ValueRange{ping.getResult()});
+  builder.setInsertionPointToStart(&ifBuffer.getElseRegion().front());
+  builder.create<mlir::scf::YieldOp>(location, ValueRange{pong.getResult()});
+  builder.setInsertionPointAfter(ifBuffer);
+  Value current_buffer = ifBuffer.getResult(0);
+
+  // Select acquire lock (the one DMA releases)
+  auto ifAcquire = builder.create<mlir::scf::IfOp>(location, dshost::LockType::get(ctx), is_even, true);
+  builder.setInsertionPointToStart(&ifAcquire.getThenRegion().front());
+  builder.create<mlir::scf::YieldOp>(location, ValueRange{ping_acquire.getResult()});
+  builder.setInsertionPointToStart(&ifAcquire.getElseRegion().front());
+  builder.create<mlir::scf::YieldOp>(location, ValueRange{pong_acquire.getResult()});
+  builder.setInsertionPointAfter(ifAcquire);
+  Value acquire_lock = ifAcquire.getResult(0);
+
+  // Select release lock (the one DMA waits for)
+  auto ifRelease = builder.create<mlir::scf::IfOp>(location, dshost::LockType::get(ctx), is_even, true);
+  builder.setInsertionPointToStart(&ifRelease.getThenRegion().front());
+  builder.create<mlir::scf::YieldOp>(location, ValueRange{ping_release.getResult()});
+  builder.setInsertionPointToStart(&ifRelease.getElseRegion().front());
+  builder.create<mlir::scf::YieldOp>(location, ValueRange{pong_release.getResult()});
+  builder.setInsertionPointAfter(ifRelease);
+  Value release_lock = ifRelease.getResult(0);
+
+  // Calculate lock value (1, 2, 3, 4 for iterations 0, 1, 2, 3)
+  auto one_i32 = builder.create<mlir::arith::ConstantOp>(location, builder.getI32IntegerAttr(1));
+  Value iv_i32 = builder.create<mlir::arith::IndexCastOp>(location, builder.getI32Type(), iv).getResult();
+  Value lock_val = builder.create<mlir::arith::AddIOp>(location, iv_i32, one_i32.getResult()).getResult();
+
+  // Wait for the selected buffer to be full
+  builder.create<dshost::AcquireLockOp>(location, acquire_lock, lock_val);
+
+  // Compute using the selected buffer
+  auto c0_inner = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
+  auto c10 = builder.create<mlir::arith::ConstantIndexOp>(location, 10);
+  auto c1_inner = builder.create<mlir::arith::ConstantIndexOp>(location, 1);
+  
+  auto innerForLoop = builder.create<mlir::scf::ForOp>(location, c0_inner.getResult(), c10.getResult(), c1_inner.getResult());
+  builder.setInsertionPointToStart(innerForLoop.getBody());
+  Value jv = innerForLoop.getInductionVar();
+
+  // Perform compute operation on current_buffer
+  builder.create<dshost::ComputeOp>(location, current_buffer);
+
+  // Move back to outer loop body after inner loop
+  builder.setInsertionPointAfter(innerForLoop);
+
+  // Release the selected buffer (for DMA to refill)
+  builder.create<dshost::ReleaseLockOp>(location, release_lock, lock_val);
+
+  // Move insertion point back to function level to add return
+  builder.setInsertionPointToEnd(entryBlock);
+  //*/
+  // 5. Add a return op at the end of the function.
+  builder.create<mlir::func::ReturnOp>(location);
+  
+  // 6. Return the created function.
+  return funcOp;
 }
