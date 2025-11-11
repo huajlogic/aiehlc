@@ -22,9 +22,8 @@
 #include "routingdeadargclean.h"
 
 #include "routingconstantfold.h"
-
-int main(int argc, char* argv[]) {
-    MLIRContext ctx;
+void routingtoroutinghw() {
+     MLIRContext ctx;
     
     routingmanager mtest;
     routinghwmanager mtesthw;
@@ -93,5 +92,68 @@ int main(int argc, char* argv[]) {
   */
 //conver emitc into c code  
     mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    return;
+}
+void routingtodmap() {
+     MLIRContext ctx;
+    
+    routingmanager mtest;
+    routinghwmanager mtesthw;
+    mtesthw.loaddialect(&ctx);
+    mtest.loaddialect(&ctx);
+
+    ctx.getOrLoadDialect<arith::ArithDialect>();
+    
+    //auto module1 = mtest.createroutingfunc(&ctx,1);
+    auto module1 = mtest.ops_testNew(&ctx,1);
+    module1.dump();
+    //auto module2 = mtesthw.ops_test(&ctx);
+    std::cout << "main" <<std::endl;
+    
+    mlir::PrintIRPassOptions options;
+
+    mlir::PassManager pm(&ctx);;
+    RoutingTopology rtopology("Gen2");
+    
+    options.label = "Before RoutingUnrollingLowerPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
+    options.label = "After RoutingUnrollingLowerPass:";
+    //pm.addPass(mlir::createPrintIRPass(options));
+    //pm.addPass(std::make_unique<RoutingLowerPass>(rtopology));
+    
+    //into
+    /*
+    int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0); 
+    */
+    pm.addPass(std::make_unique<RoutingConstantFoldPass>());
+
+    options.label = "After RoutingConstantFoldPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    //remove the dead code
+    pm.addPass(mlir::createCanonicalizerPass());
+
+    options.label = "After createCanonicalizerPasse:";
+    pm.addPass(mlir::createPrintIRPass(options));
+
+    //remove dead arg
+    //pm.addPass(mlir::createConvertSCFToEmitCPass());
+    (void)pm.run(module1);
+
+    llvm::outs() << "----------module1.dump---------\n";
+    module1.dump();
+/*
+    mlir::PassManager pm2(&ctx);;
+    pm2.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
+    (void)pm2.run(module1);
+    module1.dump();
+  */
+//conver emitc into c code  
+    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    return;
+}
+int main(int argc, char* argv[]) {
+    //routingtoroutinghw();
+    routingtodmap();
     return 0;
 }

@@ -69,8 +69,91 @@ module {
     "func.return"() : () -> ()
     "func.return"() : () -> ()
   }) {funcType = () -> (), sym_name = "main"} : () -> ()
-  
-// layer 4.a ROUTING CONFI
+
+//LAYER 4.a DMA config and Runtime schedule
+module {
+  func.func @dskernel_coretile_compute(%arg0: i32) {
+    %alloca = memref.alloca() {buffer_type = "ping"} : memref<256xf32>
+    %alloca_0 = memref.alloca() {buffer_type = "pong"} : memref<256xf32>
+    
+    // --- Lock Definitions (from your code) ---
+    // %0 = ping_aquire (DMA releases this)
+    // %1 = pong_aquire (DMA releases this)
+    // %2 = ping_release (DMA waits for this)
+    // %3 = pong_release (DMA waits for this)
+    %0 = dskernel.lock_init(0, "ping_aquire_lock") -> !dskernel.lock
+    %1 = dskernel.lock_init(0, "pong_aquire_lock") -> !dskernel.lock
+    %2 = dskernel.lock_init(1, "ping_release_lock") -> !dskernel.lock
+    %3 = dskernel.lock_init(0, "pong_release_lock") -> !dskernel.lock
+    
+    // --- Thread A (DMA): Runs in Parallel ---
+    // (Your code was correct, but the initial lock values must 
+    //  match the parallel compute loop's needs. 
+    //  DMA waits for Ping-Release(1) and releases Ping-Acquire(0))
+    dskernel.launch_dma_s2m_loop %alloca, %alloca_0, %arg0, %0, %1, %2, %3 : !{
+    }
+    
+    // --- Thread B (Compute): Runs in Parallel ---
+    %c0 = arith.constant 0 : index
+    %c4 = arith.constant 4 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index // <-- **NEW: Need '2' for modulo**
+
+    scf.for %arg1 = %c0 to %c4 step %c1 {
+      // --- **START: Ping-Pong Switch Logic** ---
+      
+      // 1. Is the iteration %arg1 even or odd?
+      %is_even = arith.cmpi "eq", arith.remui(%arg1, %c2), %c0
+
+      // 2. Select the *correct buffer* based on iteration
+      %buffer = scf.if %is_even -> (memref<256xf32>) {
+        scf.yield %alloca // Even: Use Ping
+      } else {
+        scf.yield %alloca_0 // Odd: Use Pong
+      }
+
+      // 3. Select the *correct acquire lock* (the one DMA releases)
+      %acquire_lock = scf.if %is_even -> (!dskernel.lock) {
+        scf.yield %0 // Even: Wait for Ping-Acquire
+      } else {
+        scf.yield %1 // Odd: Wait for Pong-Acquire
+      }
+
+      // 4. Select the *correct release lock* (the one DMA waits for)
+      %release_lock = scf.if %is_even -> (!dskernel.lock) {
+        scf.yield %2 // Even: Release Ping-Release
+      } else {
+        scf.yield %3 // Odd: Release Pong-Release
+      }
+      
+      // --- **END: Ping-Pong Switch Logic** ---
+
+      // 5. Get the value to acquire/release (e.g., 1, 2, 3, 4)
+      //    (Your logic was correct)
+      %c1_i32 = arith.constant 1 : i32
+      %idx_i32 = arith.index_cast %arg1 : index to i32
+      %lock_val = arith.addi %idx_i32, %c1_i32 : i32
+
+      // 6. Wait for the *selected* buffer to be full
+      dskernel.acquire_lock %acquire_lock, %lock_val
+
+      // 7. Compute using the *selected* buffer (Smem reuse)
+      %c0_inner = arith.constant 0 : index
+      %c10 = arith.constant 10 : index
+      %c1_inner = arith.constant 1 : index
+      scf.for %arg2 = %c0_inner to %c10 step %c1_inner {
+         // --- This is where your computation goes ---
+         "core.compute"(%buffer) : (memref<256xf32>) -> ()
+      }
+
+      // 8. Release the *selected* buffer (for DMA to refill)
+      dskernel.release_lock %release_lock, %lock_val
+    }
+    return
+  }
+}
+
+// layer 4.b ROUTING CONFI
 // -----// IR Dump After RoutingLowerPass: //----- //
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
   func.func @main() {
@@ -513,87 +596,5 @@ void main() {
   return;
 }
 
-//LAYER 4.b DMA config and Runtime schedule
-module {
-  func.func @dskernel_coretile_compute(%arg0: i32) {
-    %alloca = memref.alloca() {buffer_type = "ping"} : memref<256xf32>
-    %alloca_0 = memref.alloca() {buffer_type = "pong"} : memref<256xf32>
-    
-    // --- Lock Definitions (from your code) ---
-    // %0 = ping_aquire (DMA releases this)
-    // %1 = pong_aquire (DMA releases this)
-    // %2 = ping_release (DMA waits for this)
-    // %3 = pong_release (DMA waits for this)
-    %0 = dskernel.lock_init(0, "ping_aquire_lock") -> !dskernel.lock
-    %1 = dskernel.lock_init(0, "pong_aquire_lock") -> !dskernel.lock
-    %2 = dskernel.lock_init(1, "ping_release_lock") -> !dskernel.lock
-    %3 = dskernel.lock_init(0, "pong_release_lock") -> !dskernel.lock
-    
-    // --- Thread A (DMA): Runs in Parallel ---
-    // (Your code was correct, but the initial lock values must 
-    //  match the parallel compute loop's needs. 
-    //  DMA waits for Ping-Release(1) and releases Ping-Acquire(0))
-    dskernel.launch_dma_s2m_loop %alloca, %alloca_0, %arg0, %0, %1, %2, %3 : !{
-    }
-    
-    // --- Thread B (Compute): Runs in Parallel ---
-    %c0 = arith.constant 0 : index
-    %c4 = arith.constant 4 : index
-    %c1 = arith.constant 1 : index
-    %c2 = arith.constant 2 : index // <-- **NEW: Need '2' for modulo**
-
-    scf.for %arg1 = %c0 to %c4 step %c1 {
-      // --- **START: Ping-Pong Switch Logic** ---
-      
-      // 1. Is the iteration %arg1 even or odd?
-      %is_even = arith.cmpi "eq", arith.remui(%arg1, %c2), %c0
-
-      // 2. Select the *correct buffer* based on iteration
-      %buffer = scf.if %is_even -> (memref<256xf32>) {
-        scf.yield %alloca // Even: Use Ping
-      } else {
-        scf.yield %alloca_0 // Odd: Use Pong
-      }
-
-      // 3. Select the *correct acquire lock* (the one DMA releases)
-      %acquire_lock = scf.if %is_even -> (!dskernel.lock) {
-        scf.yield %0 // Even: Wait for Ping-Acquire
-      } else {
-        scf.yield %1 // Odd: Wait for Pong-Acquire
-      }
-
-      // 4. Select the *correct release lock* (the one DMA waits for)
-      %release_lock = scf.if %is_even -> (!dskernel.lock) {
-        scf.yield %2 // Even: Release Ping-Release
-      } else {
-        scf.yield %3 // Odd: Release Pong-Release
-      }
-      
-      // --- **END: Ping-Pong Switch Logic** ---
-
-      // 5. Get the value to acquire/release (e.g., 1, 2, 3, 4)
-      //    (Your logic was correct)
-      %c1_i32 = arith.constant 1 : i32
-      %idx_i32 = arith.index_cast %arg1 : index to i32
-      %lock_val = arith.addi %idx_i32, %c1_i32 : i32
-
-      // 6. Wait for the *selected* buffer to be full
-      dskernel.acquire_lock %acquire_lock, %lock_val
-
-      // 7. Compute using the *selected* buffer (Smem reuse)
-      %c0_inner = arith.constant 0 : index
-      %c10 = arith.constant 10 : index
-      %c1_inner = arith.constant 1 : index
-      scf.for %arg2 = %c0_inner to %c10 step %c1_inner {
-         // --- This is where your computation goes ---
-         "core.compute"(%buffer) : (memref<256xf32>) -> ()
-      }
-
-      // 8. Release the *selected* buffer (for DMA to refill)
-      dskernel.release_lock %release_lock, %lock_val
-    }
-    return
-  }
-}
 
 
