@@ -1,5 +1,5 @@
-#ifndef DSHOST_OPS
-#define DSHOST_OPS
+#ifndef dfschedule_OPS
+#define dfschedule_OPS
 
 include "mlir/Dialect/Arith/IR/ArithBase.td"
 include "mlir/Dialect/MemRef/IR/MemRefBase.td"
@@ -16,14 +16,14 @@ include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td" // Added from dskernelop.td
 
 include "mlir/IR/BuiltinTypes.td"
-include "dshosttype.td"
-// You may need to merge dskerneltype.td into dshosttype.td
-// and ensure types like DSHost_LockType are defined.
+include "dfscheduletype.td"
+// You may need to merge dskerneltype.td into dfscheduletype.td
+// and ensure types like dfschedule_LockType are defined.
 
 // Base traits helpers
 //def HasRecursiveSideEffects : Trait<"HasRecursiveSideEffects">;
 
-def DSHost_FuncOp : dshosop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
+def dfschedule_FuncOp : dfscheduleop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
 {
     let summary = "Defines a function in the Starplat Dialect";
     let description = [{This operation represents a function definiton in the Starplat dialect.
@@ -40,7 +40,7 @@ def DSHost_FuncOp : dshosop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
 }
 
 // amd.host.alloc_device_mem
-def DSHost_AllocDeviceMemOp : dshosop< "alloc_device_mem", []> {
+def dfschedule_AllocDeviceMemOp : dfscheduleop< "alloc_device_mem", []> {
   let summary = "Allocate device global memory";
   let arguments = (ins);
   let results   = (outs AnyMemRef:$memref);
@@ -48,7 +48,7 @@ def DSHost_AllocDeviceMemOp : dshosop< "alloc_device_mem", []> {
 }
 
 // amd.host.free_device_mem
-def DSHost_FreeDeviceMemOp : dshosop< "free_device_mem", []> {
+def dfschedule_FreeDeviceMemOp : dfscheduleop< "free_device_mem", []> {
   let summary = "Free device global memory";
   let arguments = (ins AnyMemRef:$memref);
   let results   = (outs);
@@ -56,11 +56,11 @@ def DSHost_FreeDeviceMemOp : dshosop< "free_device_mem", []> {
 }
 
 // amd.host.copy_h2d_async
-def DSHost_CopyH2DAsyncOp : dshosop< "copy_h2d_async",
+def dfschedule_CopyH2DAsyncOp : dfscheduleop< "copy_h2d_async",
   [MemoryEffects<[MemWrite]>]> {
   let summary = "Async copy Host->Device";
   let arguments = (ins AnyMemRef:$host, AnyMemRef:$device);
-  let results   = (outs DSHost_EventType:$event);
+  let results   = (outs dfschedule_EventType:$event);
   let extraClassDeclaration = [{
     static StringRef getViaAttrName() { return "via"; }  // Flow_ShimEndpointAttr
   }];
@@ -70,11 +70,11 @@ def DSHost_CopyH2DAsyncOp : dshosop< "copy_h2d_async",
 }
 
 // amd.host.copy_d2h_async
-def DSHost_CopyD2HAsyncOp : dshosop< "copy_d2h_async",
+def dfschedule_CopyD2HAsyncOp : dfscheduleop< "copy_d2h_async",
   [MemoryEffects<[MemRead]>]> {
   let summary = "Async copy Device->Host";
   let arguments = (ins AnyMemRef:$device, AnyMemRef:$host);
-  let results   = (outs DSHost_EventType:$event);
+  let results   = (outs dfschedule_EventType:$event);
   let extraClassDeclaration = [{
     static StringRef getViaAttrName() { return "via"; }
   }];
@@ -83,41 +83,41 @@ def DSHost_CopyD2HAsyncOp : dshosop< "copy_d2h_async",
   }];
 }
 
-def DSHost_GetTileHandleOp : dshosop<"get_tile_handle"> {
+def dfschedule_GetTileHandleOp : dfscheduleop<"get_tile_handle"> {
   let summary = "Gets a runtime handle to a physical tile by coordinates.";
   let arguments = (ins
     I32Attr:$col,
     I32Attr:$row
   );
-  let results = (outs DSHost_TileHandleType:$handle);
+  let results = (outs dfschedule_TileHandleType:$handle);
   let assemblyFormat = "attr-dict `->` type($handle)";
 }
 
-def DSHost_GetStreamHandleOp : dshosop<"get_stream_handle"> {
+def dfschedule_GetStreamHandleOp : dfscheduleop<"get_stream_handle"> {
   let summary = "Gets a runtime handle for a statically defined stream route contract.";
   let arguments = (ins
     SymbolRefAttr:$route // The contract: @my_routes::@route_A
   );
-  let results = (outs DSHost_StreamType:$stream);
+  let results = (outs dfschedule_StreamType:$stream);
   let assemblyFormat = "$route attr-dict `->` type($stream)";
 }
 
-def DSHost_GetPacketIdOp : dshosop<"get_packet_id"> {
+def dfschedule_GetPacketIdOp : dfscheduleop<"get_packet_id"> {
   let summary = "Gets a runtime handle for a statically defined stream route contract.";
   let arguments = (ins
     SymbolRefAttr:$route // The contract: @my_routes::@route_A
   );
-  let results = (outs DSHost_PacketType:$packetid);
+  let results = (outs dfschedule_PacketType:$packetid);
   let assemblyFormat = "$route attr-dict `->` type($packetid)";
 }
 
-def DSHost_LaunchKernelAsyncOp : dshosop< "launch_kernel_async"> {
+def dfschedule_LaunchKernelAsyncOp : dfscheduleop< "launch_kernel_async"> {
   let summary = "Launch a device kernel on a tile asynchronously";
   let arguments = (ins Variadic<AnyType>:$operands);
-  let results   = (outs DSHost_EventType:$event);
+  let results   = (outs dfschedule_EventType:$event);
   let extraClassDeclaration = [{
     static StringRef getOnTileAttrName() { return "on_tile"; } // AMD_TileAttr
-    static StringRef getWaitDepsAttrName() { return "wait"; }  // Array of DSHost_EventType
+    static StringRef getWaitDepsAttrName() { return "wait"; }  // Array of dfschedule_EventType
     static StringRef getCalleeAttrName() { return "callee"; }  // SymbolRefAttr
   }];
   let assemblyFormat = [{
@@ -125,33 +125,33 @@ def DSHost_LaunchKernelAsyncOp : dshosop< "launch_kernel_async"> {
   }];
 }
 
-def DSHost_WaitOp : dshosop< "wait", []> {
+def dfschedule_WaitOp : dfscheduleop< "wait", []> {
   let summary = "Wait for one or more events to complete";
   // accept a variadic list of event operands so builders accept ValueRange
-  let arguments = (ins Variadic<DSHost_EventType>:$events);
+  let arguments = (ins Variadic<dfschedule_EventType>:$events);
   let results   = (outs);
   let assemblyFormat = "$events attr-dict `:` `(` type($events) `)`";
 }
 
 // ---- Ops from dskernelop.td ----
 
-def DSHost_LockInitOp : dshosop<"lock_init"> {
+def dfschedule_LockInitOp : dfscheduleop<"lock_init"> {
   let summary = "Create/init a kernel-local lock (initial count)";
   let arguments = (ins I64Attr:$count);
-  let results   = (outs DSHost_LockType:$lock);
+  let results   = (outs dfschedule_LockType:$lock);
   let assemblyFormat = "attr-dict `(` $count `)` `->` type($lock)";
 }
 
-def DSHost_LaunchDmaS2MLoopOp : dshosop<"launch_dma_s2m_loop"> {
+def dfschedule_LaunchDmaS2MLoopOp : dfscheduleop<"launch_dma_s2m_loop"> {
   let summary = "Launch a local DMA s2m ping-pong loop that listens on a packet id";
   let arguments = (ins 
     AnyMemRef:$ping, 
     AnyMemRef:$pong, 
     I32:$listen_on_packet_id, 
-    DSHost_LockType:$ping_acquire_lock, 
-    DSHost_LockType:$pong_acquire_lock,
-    DSHost_LockType:$ping_release_lock,
-    DSHost_LockType:$pong_release_lock
+    dfschedule_LockType:$ping_acquire_lock, 
+    dfschedule_LockType:$pong_acquire_lock,
+    dfschedule_LockType:$ping_release_lock,
+    dfschedule_LockType:$pong_release_lock
   );
   let regions = (region AnyRegion:$body);
   let assemblyFormat = "$ping `:` type($ping) `,` $pong `:` type($pong) `,` $listen_on_packet_id `,` $ping_acquire_lock `,` $pong_acquire_lock `,` $ping_release_lock `,` $pong_release_lock attr-dict-with-keyword $body";
@@ -164,21 +164,21 @@ def DSHost_LaunchDmaS2MLoopOp : dshosop<"launch_dma_s2m_loop"> {
   }];
 }
 
-def DSHost_AcquireLockOp : dshosop<"acquire_lock"> {
+def dfschedule_AcquireLockOp : dfscheduleop<"acquire_lock"> {
   let summary = "Acquire a kernel lock for a token";
-  let arguments = (ins DSHost_LockType:$lock, I32:$token);
+  let arguments = (ins dfschedule_LockType:$lock, I32:$token);
   let results   = (outs);
   let assemblyFormat = "$lock `,` $token attr-dict";
 }
 
-def DSHost_ReleaseLockOp : dshosop<"release_lock"> {
+def dfschedule_ReleaseLockOp : dfscheduleop<"release_lock"> {
   let summary = "Release a kernel lock for a token";
-  let arguments = (ins DSHost_LockType:$lock, I32:$token);
+  let arguments = (ins dfschedule_LockType:$lock, I32:$token);
   let results   = (outs);
   let assemblyFormat = "$lock `,` $token attr-dict";
 }
 
-def DSHost_ComputeOp : dshosop<"compute"> {
+def dfschedule_ComputeOp : dfscheduleop<"compute"> {
   let summary = "Perform computation on a buffer";
   let description = [{
     This operation represents a compute kernel that processes data from a memory buffer.
@@ -188,7 +188,7 @@ def DSHost_ComputeOp : dshosop<"compute"> {
   let assemblyFormat = "$buffer `:` type($buffer) attr-dict";
 }
 
-def DSHost_L2PipelineG2sOp : dshosop<"pipeline_g2s", []> {
+def dfschedule_L2PipelineG2sOp : dfscheduleop<"pipeline_g2s", []> {
   let summary = "Abstracts a Gmem->Smem ping-pong buffer dataflow pipeline.";
   let arguments = (ins
     AnyMemRef:$gmem_buffer,
@@ -224,13 +224,13 @@ def DSHost_L2PipelineG2sOp : dshosop<"pipeline_g2s", []> {
   ];
 }
 
-def DSHost_L2YieldOp : dshosop<"yield", [
+def dfschedule_L2YieldOp : dfscheduleop<"yield", [
     Terminator,
     HasParent<"L2PipelineG2sOp">
   ]> {
-  let summary = "Terminator for dshost.pipeline_g2s regions.";
+  let summary = "Terminator for dfschedule.pipeline_g2s regions.";
   let arguments = (ins);
   let assemblyFormat = "attr-dict";
 }
  
-#endif // DSHOST_OPS
+#endif // dfschedule_OPS

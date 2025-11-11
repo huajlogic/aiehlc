@@ -1,34 +1,34 @@
-#ifndef _TYPE_DSHOST_
-#define _TYPE_DSHOST_
-include "dshostattr.td"
+#ifndef _TYPE_dfschedule_
+#define _TYPE_dfschedule_
+include "dfscheduleattr.td"
 
-//=== DSHost Types ===//
-def DSHost_EventType:dshostype<"Event"> {
+//=== dfschedule Types ===//
+def dfschedule_EventType:dfscheduleype<"Event"> {
   let mnemonic = "event";
   let summary = "Opaque async event type for host runtime";
 }
 
-def DSHost_StreamType : dshostype<"Stream"> {
+def dfschedule_StreamType : dfscheduleype<"Stream"> {
   let mnemonic = "stream";
   //let parameters = (ins TypeParameter<"element type">:$elemTy);
   let summary = "Host-visible stream handle carrying element type";
 }
 
-def DSHost_PacketType : dshostype<"Packet"> {
+def dfschedule_PacketType : dfscheduleype<"Packet"> {
   let mnemonic = "packet";
   //let parameters = (ins TypeParameter<"element type">:$elemTy);
   let summary = "Host-visible patcket handle carrying element type";
 }
 
-//=== DSHostDMA Types/Attrs ===//
-def DSHost_LockType : dshostype<"Lock"> {
+//=== dfscheduleDMA Types/Attrs ===//
+def dfschedule_LockType : dfscheduleype<"Lock"> {
   let mnemonic = "lock";
   let summary = "Abstract device lock handle";
 }
 
-//=== DSHostDMA Types/Attrs ===//
-def DSHost_TileHandleType : dshostype<"Tile"> {
+//=== dfscheduleDMA Types/Attrs ===//
+def dfschedule_TileHandleType : dfscheduleype<"Tile"> {
   let mnemonic = "Tile";
   let summary = "Tile ";
 }
-#endif //_TYPE_DSHOST_
+#endif //_TYPE_dfschedule_

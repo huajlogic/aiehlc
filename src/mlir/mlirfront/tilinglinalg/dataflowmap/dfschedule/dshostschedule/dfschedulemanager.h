@@ -47,32 +47,32 @@
 //fieldparser
 #include "mlir/IR/DialectImplementation.h"
 
-#include "dshostdialect.h.inc"
+#include "dfscheduledialect.h.inc"
 
-#include "dshostenums.h.inc"
+#include "dfscheduleenums.h.inc"
 
 using namespace mlir;
-using namespace dshost;
+using namespace dfschedule;
 
 #define GET_ATTRDEF_CLASSES
-#include "dshostattr.h.inc"
+#include "dfscheduleattr.h.inc"
 #undef GET_ATTRDEF_CLASSES
 
 #define GET_TYPEDEF_CLASSES
-#include "dshosttype.h.inc"
+#include "dfscheduletype.h.inc"
 #undef GET_TYPEDEF_CLASSES
 
 #define GET_OP_CLASSES
 #define GET_OP_DECLS
-#include "dshostop.h.inc"
+#include "dfscheduleop.h.inc"
 #undef GET_OP_DECLS
 #undef GET_OP_CLASSES
 
-class dshostmanager{
+class dfschedulemanager{
 public:
-    dshostmanager(){};
+    dfschedulemanager(){};
     ModuleOp ops_test(MLIRContext* ctx,int totalN=2) ;
-    void createdshostfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
+    void createdfschedulefuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
     mlir::func::FuncOp createDSKernelFunc(OpBuilder &builder, MLIRContext *ctx);
     static void loaddialect(MLIRContext* ctx);
 };
