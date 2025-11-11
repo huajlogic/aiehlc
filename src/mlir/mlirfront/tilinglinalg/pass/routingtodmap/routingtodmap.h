@@ -1,0 +1,19 @@
+/******************************************************************************
+* Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
+
+#ifndef __ROUTING_LOWER__
+#define __ROUTING_LOWER__
+#include "common.h"
+#include "routingmanager.h"
+using namespace mlir;
+class RoutingLowerPass : public PassWrapper<RoutingLowerPass, OperationPass<>> {
+public:
+    RoutingLowerPass(RoutingTopology& rtopology);
+private:
+    void runOnOperation() override;
+    void getDependentDialects(DialectRegistry &registry) const;
+    RoutingTopology& rtopology_;
+};
+#endif //
