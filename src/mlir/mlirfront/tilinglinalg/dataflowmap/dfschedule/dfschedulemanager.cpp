@@ -28,7 +28,7 @@ void dfscheduledialect::initialize()  {
     #define GET_OP_LIST
     #include "dfscheduleop.cc.inc"
         >();
-    // 如果有 Attr / Type：addAttributes<...>(); addTypes<...>();
+    // If there are Attrs / Types: addAttributes<...>(); addTypes<...>();
      addAttributes<
     #define GET_ATTRDEF_LIST
     #include "dfscheduleattr.cc.inc"
@@ -60,13 +60,13 @@ ModuleOp dfschedulemanager::ops_test(MLIRContext* ctx, int totalN) {
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     
-    // --- 1. 创建主机端函数 @main ---
+    // --- 1. Create host function @main ---
     auto mainFuncType = builder.getFunctionType({}, {});
     //auto main = builder.create<dfschedule::FuncOp>(builder.getUnknownLoc(), "main", mainFuncType);
     auto main = builder.create<mlir::func::FuncOp>(builder.getUnknownLoc(), "main", mainFuncType);
     m.push_back(main);
     
-    // 正确的创建方式：使用 addEntryBlock()
+    // Correct way to create: use addEntryBlock()
     Block *mainBlock = main.addEntryBlock();
     builder.setInsertionPointToStart(mainBlock);
     //auto &block = main.getBody().emplaceBlock();
@@ -75,17 +75,17 @@ ModuleOp dfschedulemanager::ops_test(MLIRContext* ctx, int totalN) {
     SymbolTable symTable(m);
     createdfschedulefuncByDim(builder, ctx, symTable);
     //builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
-    // createdfschedulefuncByDim 内部已经添加了 return
+    // return is already added inside createdfschedulefuncByDim
 
-    // --- 2. 创建设备端内核函数 @dskernel_coretile_compute ---
+    // --- 2. Create device kernel function @dskernel_coretile_compute ---
     
-    // 将 OpBuilder 的插入点移回到模块的末尾
+    // Move OpBuilder's insertion point back to the end of the module
     builder.setInsertionPointToEnd(m.getBody());
     
-    // 在模块的顶层创建第二个函数
+    // Create the second function at the top level of the module
     mlir::func::FuncOp kernelFunc = createDSKernelFunc(builder, ctx);
     
-    // --- 3. 打印最终的模块 ---
+    // --- 3. Print the final module ---
     llvm::errs() << m;
     return m;
 }
