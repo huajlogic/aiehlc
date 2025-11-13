@@ -3,18 +3,18 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 #include <iostream>
-#include "dshostmanager.h"
+#include "dfschedulemanager.h"
 
 int main(int argc, char* argv[]) {
     MLIRContext ctx;
-    dshostmanager hoptest;
+    dfschedulemanager hoptest;
     
-    // Load the dshosthop dialect
+    // Load the dfschedulehop dialect
     hoptest.loaddialect(&ctx);
     
     // Run the cache-and-forward broadcast test
     hoptest.ops_test(&ctx);
     
-    std::cout << "Completed dshosthop dialect test" << std::endl;
+    std::cout << "Completed dfschedulehop dialect test" << std::endl;
     return 0;
 }

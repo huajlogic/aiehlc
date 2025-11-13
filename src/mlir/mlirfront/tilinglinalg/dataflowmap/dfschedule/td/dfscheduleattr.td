@@ -1,4 +1,4 @@
-//===- DSHostDialect.td ---------------------------------------*- tablegen -*-===//
+//===- dfscheduleDialect.td ---------------------------------------*- tablegen -*-===//
 include "mlir/IR/OpBase.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/BuiltinTypes.td"
@@ -9,9 +9,9 @@ include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/IR/EnumAttr.td"
 
 // Dialect: amd_host
-def dshostdialect : Dialect {
-    let name = "dshost";
-    let cppNamespace = "dshost";
+def dfscheduledialect : Dialect {
+    let name = "dfschedule";
+    let cppNamespace = "dfschedule";
     //let useDefaultAttributePrinterParser = 1;
     let hasOperationAttrVerify = 0;
     let useDefaultAttributePrinterParser = 1;
@@ -20,14 +20,14 @@ def dshostdialect : Dialect {
     dag discardableAttrs = (ins);
 }
 
-class dshostattr<string name> : AttrDef<dshostdialect, name>{ let mnemonic = name;}
-class dshostype<string name, list<Trait> traits=[]> : TypeDef<dshostdialect, name,traits>{}
-class dshosop<string name, list<Trait> traits=[]> : Op<dshostdialect, name, traits>{}
+class dfscheduleattr<string name> : AttrDef<dfscheduledialect, name>{ let mnemonic = name;}
+class dfscheduleype<string name, list<Trait> traits=[]> : TypeDef<dfscheduledialect, name,traits>{}
+class dfscheduleop<string name, list<Trait> traits=[]> : Op<dfscheduledialect, name, traits>{}
 
 
-def DSHost_TileAttr : dshostattr<"Tile"> {
+def dfschedule_TileAttr : dfscheduleattr<"Tile"> {
   let summary = "Tile location attribute (row, col)";
-  let cppNamespace = "dshost";
+  let cppNamespace = "dfschedule";
   let parameters = (ins
     "int64_t":$row,
     "int64_t":$col
@@ -45,11 +45,11 @@ def dsdirection_enum : I32EnumAttr<"dsdirection", "dsdirection direction", [
   let cppNamespace = "dsdirection";
 }
 
-def dsdirectionAttr : EnumAttr<dshostdialect, dsdirection_enum, "io"> {
+def dsdirectionAttr : EnumAttr<dfscheduledialect, dsdirection_enum, "io"> {
   let assemblyFormat = "`<` $value `>`";
 }
  /*
-def Flow_ShimEndpointAttr : dshostattr<"ShimEndpoint"> {
+def Flow_ShimEndpointAttr : dfscheduleattr<"ShimEndpoint"> {
   let summary = "Physical SHIM endpoint binding";
   let parameters = (ins
     "SymbolRefArrayAttr":$hops, // optional route, keep generic

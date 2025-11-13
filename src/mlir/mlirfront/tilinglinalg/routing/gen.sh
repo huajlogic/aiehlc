@@ -22,12 +22,13 @@ done
 
 if [ ${#MLIR_INCLUDES[@]} -eq 0 ]; then
   echo "No --mlir-include provided, using default."
-  MLIR_INCLUDES=("-I/usr/local/include/mlir/")
-
+  #MLIR_INCLUDES=("-I/usr/local/include/mlir/")
+  MLIR_INCLUDES=("-I/Users/llvm/llvm-project/mlir/include/")
 fi
 if [ ${#LLVM_BIN[@]} -eq 0 ]; then
   echo "No LLVM_BIN provided, using default."
-  LLVM_BIN=("/usr/local/bin/")
+  #LLVM_BIN=("/usr/local/bin/")
+  LLVM_BIN=("/Users/llvm/llvm-project/build/bin/")
 fi
 
 echo "Script is located in: $GEN_SCRIPT_DIR"

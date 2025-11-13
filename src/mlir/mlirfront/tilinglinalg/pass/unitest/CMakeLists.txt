@@ -61,6 +61,7 @@ include_directories(../../routing/)
 include_directories(../../routinghw/)
 include_directories(../)
 include_directories(../routingimplement/include/)
+include_directories(../passroutingtodmap/)
 
 
 #file(GLOB PARSER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../Parser/*.cpp)
@@ -74,10 +75,12 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingunrolling.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingdeadargclean.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingconstantfold.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passroutingtodmap/routingtodmap.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingpath.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/hwresource.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/ResourceManager.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingtopology.cpp)
+                ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingtopology.cpp
+                )
 
 add_executable(test ${SOURCE_FILES})
 

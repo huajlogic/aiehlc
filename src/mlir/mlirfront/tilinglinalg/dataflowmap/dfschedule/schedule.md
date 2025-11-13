@@ -317,32 +317,33 @@ builtin.module {
   //
   // 这个 func.func 是 Pass 2 *新生成的*
   func.func @host_main_schedule() {
-    %gmem = "ds.host.alloc_device_mem"() : ...
+    %gmem = "ds.host.alloc_device_mem"() : memref<1024xf32, 1>
 
-    // (Pass 2 从 dmahop 读取物理位置并生成句柄)
+    // (Pass 2 get the handle from dmaphop)
     %shim_handle = "ds.host.get_tile_handle"() { col = 2, row = 0 }
     %core_A_handle = "ds.host.get_tile_handle"() { col = 0, row = 3 }
     %core_B_handle = "ds.host.get_tile_handle"() { col = 1, row = 3 }
 
-    // --- **这是 @route_A 被使用的地方** ---
-    // 1. "Schedule" Pass 生成代码, 
-    //    从 "routinghw" (Pass 1) 的契约中 *查找* 路由。
-    //    这个操作将一个 *编译时符号* (@route_A)
-    //    转换为一个 *运行时句柄* (%stream_A)。
+    // --- This is where @route_A is used ---
+    // 1. "Schedule" Pass generates code, 
+    //    which *looks up* the route from the "routinghw" (Pass 1) contract.
+    //    This operation converts a *compile-time symbol* (@route_A)
+    //    into a *runtime handle* (%stream_A).
     %stream_A = "ds.host.get_stream_handle"(@my_routes::@route_A)
       : () -> !ds.stream
     %stream_B = "ds.host.get_stream_handle"(@my_routes::@route_B)
       : () -> !ds.stream
 
-    // 2. "Schedule" Pass 生成 *设置 DMA* 的代码
-    //    这个 "launch_dma" 操作 *使用* 了 Pass 1 验证过的
-    //    运行时句柄 (%stream_A 和 %stream_B)。
+    // 2. "Schedule" Pass generates code to *set up DMA*.
+    //    This "launch_dma" operation *uses* the runtime handles
+    //    (%stream_A and %stream_B) verified by Pass 1.
     %evt_dma = "ds.host.launch_dma_g2s_async" on %shim_handle (
         %gmem, %stream_A, %stream_B  // <-- 传递句柄
       ) : (memref<...>, !ds.stream, !ds.stream) -> !ds.event
 
-    // 3. "Schedule" Pass 生成 *启动内核* 的代码
-    //    (内核也被传递了它需要监听的句柄)
+    // 3. "Schedule" Pass generates code to *launch the kernel*.
+    //    (The kernel is also passed the handle it needs to listen on)
+
     %pid_A = "routinghw.get_packet_id"(@my_routes::@route_A) : i32
     %pid_B = "routinghw.get_packet_id"(@my_routes::@route_B) : i32
     
