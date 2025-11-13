@@ -533,7 +533,7 @@ struct createhwmeshconvert : public ConversionPattern {
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {   
         // Replace all uses of this op's result with its operand.
         // This allows the user of this op to be processed correctly.
-        rewriter.replaceOp(op, operands);
+        rewriter.eraseOp(op);
         return success();
     }
 private:
@@ -547,7 +547,7 @@ struct createdummytensorconvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
-        rewriter.replaceOp(op, operands);
+        rewriter.eraseOp(op);
         return success();
     }
 private:
@@ -560,7 +560,7 @@ struct partitiontensorrconvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
-        rewriter.replaceOp(op, operands);
+        rewriter.eraseOp(op);
         return success();
     }
 private:
@@ -574,7 +574,7 @@ struct partitionmeshconvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {  
-        rewriter.replaceOp(op, operands);
+        rewriter.eraseOp(op);
         return success();
     }
 private:
@@ -598,13 +598,13 @@ private:
 };
 
 //extract_data
-struct extract_dataconvert : public ConversionPattern {
-    explicit extract_dataconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+struct extract_dataconvertdmap : public ConversionPattern {
+    explicit extract_dataconvertdmap(MLIRContext * ctx, LLVMTypeConverter &converter):
         ConversionPattern(routing::extract_data::getOperationName(),1, ctx), typeconverter(converter) {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
-        rewriter.replaceOp(op, operands);
+        rewriter.eraseOp(op);
         return success();
     }
 private:
@@ -619,7 +619,7 @@ struct routinggatheroutconvert : public ConversionPattern {
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
         //TODO create gather/pktmerge logic
-        rewriter.replaceOp(op, operands);
+        rewriter.eraseOp(op);
         return success();
     }
 private:
@@ -634,7 +634,7 @@ struct extract_tilesconvert : public ConversionPattern {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
-        rewriter.replaceOp(op, operands);
+        rewriter.eraseOp(op);
         return success();
     }
 private:
@@ -868,7 +868,7 @@ struct RoutingcreatehwiowithtargetConvert : public ConversionPattern {
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
         //rewriter.eraseOp(op);
-        rewriter.replaceOp(op, operands);
+        rewriter.eraseOp(op);
         return success();
     }
 private:
@@ -1047,7 +1047,7 @@ void RoutingToDmapPass::runOnOperation() {
     patterns.add<partitiontensorrconvert>(&ctx, typeconverter);
     patterns.add<partitionmeshconvert>(&ctx, typeconverter);
 
-    patterns.add<extract_dataconvert>(&ctx, typeconverter);
+    patterns.add<extract_dataconvertdmap>(&ctx, typeconverter);
     patterns.add<extract_tilesconvert>(&ctx, typeconverter);
     patterns.add<routinggatheroutconvert>(&ctx, typeconverter,rtopology_);
 
