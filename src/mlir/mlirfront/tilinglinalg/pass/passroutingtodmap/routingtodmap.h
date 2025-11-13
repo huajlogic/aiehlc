@@ -3,14 +3,16 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 
-#ifndef __ROUTING_LOWER__
-#define __ROUTING_LOWER__
+#ifndef __ROUTING_TODMAP__
+#define __ROUTING_TODMAP__
 #include "common.h"
 #include "routingmanager.h"
+#include "routing/routingpath.h"
+#include "routing/routingtopology.h"
 using namespace mlir;
-class RoutingLowerPass : public PassWrapper<RoutingLowerPass, OperationPass<>> {
+class RoutingToDmapPass : public PassWrapper<RoutingToDmapPass, OperationPass<>> {
 public:
-    RoutingLowerPass(RoutingTopology& rtopology);
+    RoutingToDmapPass(RoutingTopology& rtopology);
 private:
     void runOnOperation() override;
     void getDependentDialects(DialectRegistry &registry) const;

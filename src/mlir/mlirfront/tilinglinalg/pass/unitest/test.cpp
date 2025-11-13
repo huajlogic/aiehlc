@@ -7,6 +7,7 @@
 #include "routinghwlower.h"
 #include "routingmanager.h"
 #include "routinglower.h"
+#include "../passroutingtodmap/routingtodmap.h"
 #include "routingunrolling.h"
 #include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 //#include "llvm/IR/IRPrintingPasses.h"
@@ -105,7 +106,7 @@ void routingtodmap() {
     ctx.getOrLoadDialect<arith::ArithDialect>();
     
     //auto module1 = mtest.createroutingfunc(&ctx,1);
-    auto module1 = mtest.ops_testNew(&ctx,1);
+    auto module1 = mtest.ops_testNew_dmap(&ctx,1);
     module1.dump();
     //auto module2 = mtesthw.ops_test(&ctx);
     std::cout << "main" <<std::endl;
@@ -119,8 +120,8 @@ void routingtodmap() {
     pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
     options.label = "After RoutingUnrollingLowerPass:";
-    //pm.addPass(mlir::createPrintIRPass(options));
-    //pm.addPass(std::make_unique<RoutingLowerPass>(rtopology));
+    pm.addPass(mlir::createPrintIRPass(options));
+    pm.addPass(std::make_unique<RoutingToDmapPass>(rtopology));
     
     //into
     /*
@@ -149,7 +150,7 @@ void routingtodmap() {
     module1.dump();
   */
 //conver emitc into c code  
-    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    //mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
     return;
 }
 int main(int argc, char* argv[]) {
