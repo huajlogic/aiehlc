@@ -156,7 +156,7 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx,Symbo
         auto gcmap = builder.create<configure_coregroup>(builder.getUnknownLoc(),  gcret, peg.getResult(), "row", configMapAttr);
         //create strem
         auto streamret = dmap::dmapportstreamType::get(ctx);
-        bool opbymemio = false;
+        bool opbymemio = true;
         if (opbymemio) {
             auto memiorecvconfig = builder.create<configure_io_engine>(builder.getUnknownLoc(),  ioconfigret,  memio.getResult(),memreceivepattern);
             auto memiosendconfig = builder.create<configure_io_engine>(builder.getUnknownLoc(),  ioconfigret,  memio.getResult(),memsndpattern);

@@ -2,8 +2,8 @@
 * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
-#ifndef __ROUTING_MANAGER__
-#define __ROUTING_MANAGER__
+#ifndef __DMAP_MANAGER__
+#define __DMAP_MANAGER__
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/SymbolTable.h"
@@ -21,6 +21,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
@@ -46,37 +47,33 @@
 //fieldparser
 #include "mlir/IR/DialectImplementation.h"
 
-#include "routinginterface.h.inc"
+#include "dfscheduledialect.h.inc"
 
-#include "routingdialect.h.inc"
+#include "dfscheduleenums.h.inc"
 
 using namespace mlir;
-using namespace routing;
+using namespace dfschedule;
 
 #define GET_ATTRDEF_CLASSES
-#include "routingattr.h.inc"
+#include "dfscheduleattr.h.inc"
 #undef GET_ATTRDEF_CLASSES
 
 #define GET_TYPEDEF_CLASSES
-#include "routingtype.h.inc"
+#include "dfscheduletype.h.inc"
 #undef GET_TYPEDEF_CLASSES
 
 #define GET_OP_CLASSES
 #define GET_OP_DECLS
-#include "routingop.h.inc"
+#include "dfscheduleop.h.inc"
 #undef GET_OP_DECLS
-#undef GET_OP_CLASSEST
+#undef GET_OP_CLASSES
 
-class routingmanager{
+class dfschedulemanager{
 public:
-    routingmanager(){};
-    void type_interface_test(MLIRContext* ctx) ;
+    dfschedulemanager(){};
     ModuleOp ops_test(MLIRContext* ctx,int totalN=2) ;
-    ModuleOp ops_testNew(MLIRContext* ctx,int totalN=2) ;
-    ModuleOp ops_testNew_dmap(MLIRContext* ctx, int totalN = 2);
-    mlir::func::FuncOp createroutingfunc(MLIRContext* ctx, int totalN = 16,bool purefunc=false) ;
-    void createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx,  bool binput,Value mesh, Value tensor, uint32_t hwsplitnum, std::string splitAxis);
-    void createroutingfuncByDimDmap(OpBuilder& builder, MLIRContext* ctx,  bool binput,Value mesh, Value tensor, uint32_t hwsplitnum, std::string splitAxis);
+    void createdfschedulefuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
+    mlir::func::FuncOp createDSKernelFunc(OpBuilder &builder, MLIRContext *ctx);
     static void loaddialect(MLIRContext* ctx);
 };
-#endif//__ROUTING_MANAGER__
+#endif//__DMAP_MANAGER__

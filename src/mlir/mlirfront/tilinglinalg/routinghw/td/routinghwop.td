@@ -4,6 +4,39 @@
 ******************************************************************************/
 
 include "routinghwtype.td"
+/*// the omponent 1 not implemented and it should be add then it can cooperate with data packet_flow
+schedule dialect
+builtin.module {
+
+  // --- Component 1: Declarative "Contract" (L3R Database) ---
+  // This is global and readable by Pass 2
+  routinghw.config @my_routes {
+    
+    // Pass 1 *declares* its decisions here
+    routinghw.packet_flow @route_A {
+       dest_tile   = #dma_hop<tile {col=0, row=3}>,
+       packet_id   = 1 : i32
+    }
+    routinghw.packet_flow @route_B {
+       dest_tile   = #dma_hop<tile {col=1, row=3}>,
+       packet_id   = 2 : i32
+    }
+  }
+
+  // --- Component 2: Imperative "Script" (L3R Instructions) ---
+  // (This is your existing @main, it *implements* the contract above)
+  // Its i32 return value (%0) is only used internally or is discarded
+  func.func @main() {
+    ...
+    // %0 = routing.RoutingCreate ... { ... }
+    // ...
+    // %10 = routinghw.connectpktstreamswitchport ... { localdmapktid = 1 ... }
+    // %11 = routinghw.connectpktstreamswitchport ... { localdmapktid = 2 ... }
+    ...
+    return
+  }
+}
+*/
 
 def TileArrayHandleCreate:RoutingHWOp<"tilearrayhandlecreate"> {
     let cppNamespace = "routinghw";
