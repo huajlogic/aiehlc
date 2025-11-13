@@ -1,3 +1,7 @@
+/******************************************************************************
+* Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
 //Layer 1
 module {
   func.func @main() {
