@@ -66,6 +66,8 @@ include_directories(../../routinghw/)
 include_directories(../)
 include_directories(../routingimplement/include/)
 include_directories(../passroutingtodmap/)
+include_directories(../../dataflowmap/dmap/inc/)
+include_directories(../../dataflowmap/dmap/)
 
 
 #file(GLOB PARSER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../Parser/*.cpp)
@@ -73,7 +75,8 @@ message("Parser src Directory: ${PARSER_FILES}")
 
 set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp 
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../routinghw/routinghwmanager.cpp 
-                ${CMAKE_CURRENT_SOURCE_DIR}/../../routing/routingmanager.cpp 
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../routing/routingmanager.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmap/dmapmanager.cpp  
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinghwlower.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinglower.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingunrolling.cpp

@@ -6,7 +6,7 @@
 #include "routingtodmap.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include <sstream>
-//int ioIdx = 0;
+int dmapioIdx = 0;
 //connectpktstreamswitchport
 /*
 std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
@@ -899,11 +899,12 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
     explicit RoutingmovedatabyioConvertdmap(MLIRContext * ctx, LLVMTypeConverter &converter, RoutingTopology & router):
         ConversionPattern(routing::movedatabyio::getOperationName(),1, ctx), typeconverter(converter), router_(router) {
             //setHasBoundedRewriteRecursion(true);
+            //MLIRContext * context = ctx;
         }
 
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
         //function to get blockarg constant
-        /*
+        ///*
         auto getRoutingCreateConsArgu = [&] (Value operand) -> int {
             if (auto barg = dyn_cast<BlockArgument>(operand)) {
                 Operation *parentOp = barg.getOwner()->getParentOp();
@@ -1000,8 +1001,14 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
             }
         }
         auto output = rewriter.getI32Type();
-        */
-
+       // */
+        auto ctx = getContext();
+        auto ioout = dmap::dmapioenginetypeType::get(ctx); 
+        printf("before xxxx---0----\n");
+        auto io = rewriter.create<dmap::create_io_engine>(rewriter.getUnknownLoc(),  ioout, 0, "SHIM"); 
+        auto ioconfigret = dmap::dmapioconfigType::get(ctx);
+        auto dataaccesspattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("SEND"), 16, 1, 1);
+        auto shimioconfig = rewriter.create<configure_io_engine>(rewriter.getUnknownLoc(),  ioconfigret,  io.getResult(),dataaccesspattern);
         rewriter.eraseOp(op);
 
         return success();
@@ -1009,6 +1016,7 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
 private:
     LLVMTypeConverter& typeconverter;
     RoutingTopology & router_;
+    //MLIRContext * context;
 };
 
 void RoutingToDmapPass::getDependentDialects(DialectRegistry &registry) const {
@@ -1022,7 +1030,7 @@ void RoutingToDmapPass::runOnOperation() {
     RewritePatternSet patterns(&ctx),patternsGlobal(&ctx);
     ConversionTarget target(ctx);
     //target.addIllegalDialect<routing::routingdialect>();
-    //target.addLegalDialect<routinghw::RoutingHWDialect>();
+    target.addLegalDialect<dmap::dmapdialect>();
     target.addLegalOp<routing::RoutingCreate>();
     target.addLegalOp<routing::YieldOp>();
     //target.addLegalOp<routing::createhwmesh>();

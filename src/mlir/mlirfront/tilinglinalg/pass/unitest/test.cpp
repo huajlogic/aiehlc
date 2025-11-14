@@ -99,9 +99,11 @@ void routingtodmap() {
      MLIRContext ctx;
     
     routingmanager mtest;
-    routinghwmanager mtesthw;
-    mtesthw.loaddialect(&ctx);
+    //routinghwmanager mtesthw;
+    dmapmanager mdmaptest;
+    //mtesthw.loaddialect(&ctx);
     mtest.loaddialect(&ctx);
+    mdmaptest.loaddialect(&ctx);
 
     ctx.getOrLoadDialect<arith::ArithDialect>();
     
