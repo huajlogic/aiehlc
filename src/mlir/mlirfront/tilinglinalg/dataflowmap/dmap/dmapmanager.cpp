@@ -126,7 +126,9 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx) {
         shapeElems.push_back(builder.getI64IntegerAttr(16));
         mlir::ArrayAttr shapettr = mlir::ArrayAttr::get(ctx, shapeElems);
         mlir::Type elementType = builder.getF32Type();
-        mlir::Type myDataHandleType = dmap::dmapdataType::get(ctx);
+        //mlir::Type myDataHandleType = dmap::dmapdataType::get(ctx);
+        //auto data = builder.create<create_data>(builder.getUnknownLoc(),  myDataHandleType, shapettr, elementType);
+        mlir::Type myDataHandleType = builder.getI32Type();
         auto data = builder.create<create_data>(builder.getUnknownLoc(),  myDataHandleType, shapettr, elementType); 
         mlir::Type pgeout = dmap::dmacoreenginegroupType::get(ctx);
         auto peg = builder.create<define_core_group>(builder.getUnknownLoc(),  pgeout, 0, 4, "row"); 

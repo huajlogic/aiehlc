@@ -1069,7 +1069,7 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
             auto chainStream = chainStreamOp.getResult();
 
             // Single push that targets the chained stream (replaces pret1 and pret2)
-            auto pchain = rewriter.create<push>(rewriter.getUnknownLoc(), data.getResult(), chainStream);
+            auto pchain = rewriter.create<push>(rewriter.getUnknownLoc(), extract_data.getResult(), chainStream);
             //*/
         } else {
             auto shimToCoreAttr = dmapioAttr::get(ctx, dmapio::DMAP_SHIMIO);
@@ -1078,7 +1078,7 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
             auto streamIdAttr = rewriter.getI32IntegerAttr(1);
             
             auto streamhandle = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, shimioconfig.getResult(),gcmap.getResult(), shimToCoreAttr, groupIndexAttr, streamIdAttr);
-            auto pret = rewriter.create<push>(rewriter.getUnknownLoc(), data.getResult(),streamhandle.getResult());
+            auto pret = rewriter.create<push>(rewriter.getUnknownLoc(), extract_data.getResult(),streamhandle.getResult());
         }
         //
         rewriter.eraseOp(op);
@@ -1125,10 +1125,10 @@ void RoutingToDmapPass::runOnOperation() {
     */
     //RoutingTopology rtopology("Gen2");
     
-    patterns.add<partitiontensorrconvert>(&ctx, typeconverter);
+    //patterns.add<partitiontensorrconvert>(&ctx, typeconverter);
     patterns.add<partitionmeshconvert>(&ctx, typeconverter);
 
-    patterns.add<extract_dataconvertdmap>(&ctx, typeconverter);
+    //patterns.add<extract_dataconvertdmap>(&ctx, typeconverter);
     patterns.add<extract_tilesconvert>(&ctx, typeconverter);
     patterns.add<routinggatheroutconvert>(&ctx, typeconverter,rtopology_);
 
@@ -1147,7 +1147,7 @@ void RoutingToDmapPass::runOnOperation() {
     
 
     patternsGlobal.add<createhwmeshconvert>(&ctx, typeconverter);
-    patternsGlobal.add<createdummytensorconvert>(&ctx, typeconverter);
+    //patternsGlobal.add<createdummytensorconvert>(&ctx, typeconverter);
     //rewrite the ops inside scf::exe
     ///*
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));
