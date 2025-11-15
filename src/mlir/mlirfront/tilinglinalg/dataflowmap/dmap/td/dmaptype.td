@@ -40,17 +40,17 @@ def dmapdatatype : dmaptype<"dmapdata"> {
 
 def dmapioconfigtype : dmaptype<"dmapioconfig"> {
     let mnemonic = "dmapioconfig";
-    let summary = "this is a dmap port config"; 
+    let summary = "this is a dmap dmapioconfig config"; 
 }
 
 def dmapportconfigtype : dmaptype<"dmapportconfig"> {
     let mnemonic = "dmapportconfig";
-    let summary = "this is a dmap port config"; 
+    let summary = "this is a dmapportconfig config"; 
 }
 
 def dmacoregroupconfigtype : dmaptype<"dmacoregroupconfig"> {
     let mnemonic = "dmacoregroupconfig";
-    let summary = "this is a dmap port config map";
+    let summary = "this is a dmacoregroupconfig map";
 }
 
 //def dmapportorgroup : TypeConstraint<

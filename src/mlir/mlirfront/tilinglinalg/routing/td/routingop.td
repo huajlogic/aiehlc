@@ -212,7 +212,7 @@ def Routing_YieldOp : routingop<"yield", [Terminator]> {
   //let results = (outs); // No results
 }
 
-def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
+def Routing_RoutingCreate : routingop<"RoutingCreate", [SymbolTable]> {
   let summary = "A structured operation for routing logic";
   let description = [{
     Represents a dispatch of a value through a routing pipeline,
@@ -242,7 +242,7 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
       // Note that we must provide the attribute's name as a string.
       $_state.addAttribute("Memo", Memo);
 
-      // 2. 创建 Region 和 Block
+      // 2. Region 和 Block
       auto *bodyRegion = $_state.addRegion();
       Block *bodyBlock = new Block();
       bodyRegion->push_back(bodyBlock);
@@ -258,7 +258,6 @@ def Routing_RoutingCreate : routingop<"RoutingCreate", []> {
     }]>
   ];
 
-  // --- 添加一个验证器 ---
   /*
   let verifier = [{
     // verify region and argument

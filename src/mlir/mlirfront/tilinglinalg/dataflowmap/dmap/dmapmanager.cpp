@@ -61,15 +61,20 @@ ModuleOp dmapmanager::ops_test(MLIRContext* ctx, int totalN) {
     //m.push_back(func);
     auto functype = builder.getFunctionType({},{});
     
-    dmap::FuncOp main = builder.create<dmap::FuncOp>(builder.getUnknownLoc(), "main", functype);
-    m.push_back(main);
+    //dmap::FuncOp main = builder.create<dmap::FuncOp>(builder.getUnknownLoc(), "main", functype);
+    //m.push_back(main);
     //auto block = main.addEntryBlock();
-    auto &block = main.getBody().emplaceBlock();
-    builder.setInsertionPointToEnd(&block);
+    //auto &block = main.getBody().emplaceBlock();
+    //builder.setInsertionPointToEnd(&block);
+    mlir::func::FuncOp main = builder.create<func::FuncOp>(builder.getUnknownLoc(), "main", functype);
+    auto block = main.addEntryBlock();
+    builder.setInsertionPointToEnd(block);
+    m.push_back(main);
 
-    SymbolTable symTable(main);
+    //SymbolTable symTable(main);
 
-    createdmapfuncByDim(builder, ctx, symTable);
+    //createdmapfuncByDim(builder, ctx, symTable);
+    createdmapfuncByDim(builder, ctx);
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     
 
@@ -78,15 +83,15 @@ ModuleOp dmapmanager::ops_test(MLIRContext* ctx, int totalN) {
   // ------------------------------------------------------------------
   // 4. Look up the symbol anywhere inside the module
   // ------------------------------------------------------------------
-   Operation *found = symTable.lookup("receive1");
-   if (!found) {
-     llvm::errs() << "Symbol @receive1 not found!\n";
+   //Operation *found = symTable.lookup("receive1");
+   //if (!found) {
+    // llvm::errs() << "Symbol @receive1 not found!\n";
      
  
-   } else {
-     llvm::outs() << "receive1 found \n";
-     llvm::outs() << "Found: " << found->getName() <<"\n";
-   }
+   //} else {
+    // llvm::outs() << "receive1 found \n";
+    // llvm::outs() << "Found: " << found->getName() <<"\n";
+   //}
     llvm::errs() << m;
     return m;
 }
@@ -99,8 +104,8 @@ void dmapmanager::loaddialect(MLIRContext* ctx) {
 }
 /*
       %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
-      %coreenginegroup = dataflowmap.dmap_create_core_engine_group {1, 4, "row"}
-      %ioengine = dataflowmap.dmap_create_io_engine {0, "shim"}
+      %coreenginegroup = dataflowmap.dmap_define_core_group {1, 4, "row"}
+      %ioengine = dataflowmap.dmap_define_io_engine {0, "shim"}
       %send_port = dataflowmap.configure_port %ioengine {peorioidx=0, dataacces=}  
       %portreceive1 = dataflowmap.configure_port on %{peorioidx = 0, dataacces=}  
       %portreceive2 = dataflowmap.configure_port on %{peorioidx = 1, dataacces=}   
@@ -108,10 +113,14 @@ void dmapmanager::loaddialect(MLIRContext* ctx) {
       %broadcast_stream = dataflowmap.create_stream %send_port, %receive_group         
       dataflowmap.push %data, %broadcast_stream {cache_policy = "force_memtile" }
 */
-void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable) {
-        auto location = builder.getUnknownLoc();
+//void dmapmanager::createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx,SymbolTable& symTable) {
+void dmapmanager::createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx) {
+        auto location = builder1.getUnknownLoc();
         // no region creatation
-    ///*   
+        auto functype = builder1.getFunctionType({},{});
+        mlir::Attribute mm=builder1.getStringAttr("main");
+        dmap::FuncOp main = builder1.create<dmap::FuncOp>(builder1.getUnknownLoc(), mm, [&](OpBuilder &builder, Location bodyLoc) { 
+       ///*   
         mlir::SmallVector<mlir::Attribute, 4> shapeElems;
         shapeElems.push_back(builder.getI64IntegerAttr(16));
         shapeElems.push_back(builder.getI64IntegerAttr(16));
@@ -120,10 +129,10 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx,Symbo
         mlir::Type myDataHandleType = dmap::dmapdataType::get(ctx);
         auto data = builder.create<create_data>(builder.getUnknownLoc(),  myDataHandleType, shapettr, elementType); 
         mlir::Type pgeout = dmap::dmacoreenginegroupType::get(ctx);
-        auto peg = builder.create<create_core_engine_group>(builder.getUnknownLoc(),  pgeout, 0, 4, "row"); 
+        auto peg = builder.create<define_core_group>(builder.getUnknownLoc(),  pgeout, 0, 4, "row"); 
         mlir::Type ioout = dmap::dmapioenginetypeType::get(ctx);
-        auto io = builder.create<create_io_engine>(builder.getUnknownLoc(),  ioout, 0, "SHIM"); 
-        auto memio = builder.create<create_io_engine>(builder.getUnknownLoc(),  ioout, 0, "MEM"); 
+        auto io = builder.create<define_io_engine>(builder.getUnknownLoc(),  ioout, 0, "SHIM"); 
+        auto memio = builder.create<define_io_engine>(builder.getUnknownLoc(),  ioout, 0, "MEM"); 
         //config port
         auto ioconfigret = dmap::dmapioconfigType::get(ctx);
         auto dataaccesspattern = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("SEND"), 16, 1, 1);
@@ -131,16 +140,16 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx,Symbo
         auto memreceivepattern = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
         auto receivepattern = dmap::dataaccesspatternAttr::get(ctx, builder.getStringAttr("RECEIVE"), 16, 1, 1);
         // create a port configuration
-        //port_configure_create
+        //define_port_configure
         
         mlir::Type portconfig = dmap::dmapportconfigType::get(ctx);
         std::string symbolName = "receive1";
-        auto pf = builder.create<dmap::port_configure_create>(builder.getUnknownLoc(), portconfig, symbolName, receivepattern);
-        symTable.insert(pf);
+        auto pf = builder.create<dmap::define_port_configure>(builder.getUnknownLoc(), portconfig, symbolName, receivepattern);
+        //symTable.insert(pf);
         mlir::SymbolRefAttr symbolRef = mlir::SymbolRefAttr::get(ctx,"receive1");
         //auto useOp = builder.create<dmap::UseSymbolOp>(builder.getUnknownLoc(), symbolRef);
         //config io port 
-        auto shimioconfig = builder.create<configure_io_engine>(builder.getUnknownLoc(),  ioconfigret,  io.getResult(),dataaccesspattern);
+        auto shimioconfig = builder.create<create_io_engin_with_config>(builder.getUnknownLoc(),  ioconfigret,  io.getResult(),dataaccesspattern);
         //config port group
         dmap::dataconfmapitemAttr item1 = dmap::dataconfmapitemAttr::get(ctx,0, mlir::SymbolRefAttr::get(ctx, "receive1"));
         dmap::dataconfmapitemAttr item2 = dmap::dataconfmapitemAttr::get(ctx,1, mlir::SymbolRefAttr::get(ctx, "receive1"));
@@ -153,13 +162,13 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx,Symbo
         itemsVector.push_back(item4);
         dmap::dataconfigmapAttr configMapAttr = dmap::dataconfigmapAttr::get(ctx,itemsVector);
         auto gcret = dmap::dmacoregroupconfigType::get(ctx);
-        auto gcmap = builder.create<configure_coregroup>(builder.getUnknownLoc(),  gcret, peg.getResult(), "row", configMapAttr);
+        auto gcmap = builder.create<create_core_group_with_config>(builder.getUnknownLoc(),  gcret, peg.getResult(), "row", configMapAttr);
         //create strem
         auto streamret = dmap::dmapportstreamType::get(ctx);
         bool opbymemio = true;
         if (opbymemio) {
-            auto memiorecvconfig = builder.create<configure_io_engine>(builder.getUnknownLoc(),  ioconfigret,  memio.getResult(),memreceivepattern);
-            auto memiosendconfig = builder.create<configure_io_engine>(builder.getUnknownLoc(),  ioconfigret,  memio.getResult(),memsndpattern);
+            auto memiorecvconfig = builder.create<create_io_engin_with_config>(builder.getUnknownLoc(),  ioconfigret,  memio.getResult(),memreceivepattern);
+            auto memiosendconfig = builder.create<create_io_engin_with_config>(builder.getUnknownLoc(),  ioconfigret,  memio.getResult(),memsndpattern);
             
             auto shimToMemAttr = dmapioAttr::get(ctx, dmapio::DMAP_SHIMIO);
             auto memToCoreAttr = dmapioAttr::get(ctx, dmapio::DMAP_MEMTILEIO);
@@ -209,5 +218,59 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx,Symbo
 
         //auto portg = dmap::dmapportgroupType::get(ctx);
         //auto portgroup = builder.create<createport_group>(builder.getUnknownLoc(),  ioout, portlist);  
-        return ;//func;
+        //*/
+        builder.create<dmap::YieldOp>(builder.getUnknownLoc());
+     });
+    SymbolTable symTable(main);
+    Operation *found = symTable.lookup("receive1");
+    if (!found) {
+        llvm::errs() << "Symbol @receive1 not found!\n";
+        
+    
+    } else {
+        //llvm::outs() << "receive1 found \n";
+        llvm::outs() << "Found: " << found->getName() <<"\n";
+    }
+    return ;//func;
 }
+/*
+void dmap::FuncOp::print(OpAsmPrinter &p) {
+  // `p` is the printer object. The `<<` operator prints literal strings.
+  //p << " on_row ";
+
+  // Use printAttribute to print attributes. Angle brackets are just literals.
+  p << "<";
+  p << "Memo = \"";
+  p << (getSymName());
+  p << "\">";
+
+  // Use printOperand for SSA values, and print its type.
+ 
+  // Use printOptionalAttrDict to print any attributes we haven't
+  // explicitly printed. This is good practice for forward compatibility.
+  // We need to tell it which attributes we already handled.
+  //p.printOptionalAttrDict(this->getAttrs(),  {"device_row"});
+
+  // Print the result type.
+  p << " -> ";
+  p.printType(getResult().getType());
+  
+  // Use printRegion to print the region.
+  p.printRegion(getBody(),  true,  false);
+}
+   
+
+// In RoutingOps.cpp
+
+// This is the C++ implementation for the parser.
+ParseResult dmap::FuncOp::parse(OpAsmParser &parser, OperationState &result) {
+  // --- 1. Parse the components of the op ---
+
+  // `result` is the blueprint we will populate.
+  
+  // Parse the keyword "on_row"
+ // if (parser.parseKeyword("on_row"))
+  //  return failure();
+  return success();
+}
+  //*/

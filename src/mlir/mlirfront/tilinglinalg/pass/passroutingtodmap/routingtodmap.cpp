@@ -1005,10 +1005,28 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
         auto ctx = getContext();
         auto ioout = dmap::dmapioenginetypeType::get(ctx); 
         printf("before xxxx---0----\n");
-        auto io = rewriter.create<dmap::create_io_engine>(rewriter.getUnknownLoc(),  ioout, 0, "SHIM"); 
+        auto io = rewriter.create<dmap::define_io_engine>(rewriter.getUnknownLoc(),  ioout, dmapioIdx++, "SHIM"); 
         auto ioconfigret = dmap::dmapioconfigType::get(ctx);
         auto dataaccesspattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("SEND"), 16, 1, 1);
-        auto shimioconfig = rewriter.create<configure_io_engine>(rewriter.getUnknownLoc(),  ioconfigret,  io.getResult(),dataaccesspattern);
+        auto receivepattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("RECEIVE"), 16, 1, 1);
+        mlir::Type pgeout = dmap::dmacoreenginegroupType::get(ctx);
+        auto peg = rewriter.create<define_core_group>(rewriter.getUnknownLoc(),  pgeout, round_idx, tileNum, split_axis);
+        //config
+        mlir::Type portconfig = dmap::dmapportconfigType::get(ctx);
+        std::string symbolName = "receive1";
+        auto pf = rewriter.create<dmap::define_port_configure>(rewriter.getUnknownLoc(), portconfig, symbolName, receivepattern);
+      
+        //
+        //Data
+        mlir::SmallVector<mlir::Attribute, 4> shapeElems;
+        shapeElems.push_back(rewriter.getI64IntegerAttr(16));
+        shapeElems.push_back(rewriter.getI64IntegerAttr(16));
+        mlir::ArrayAttr shapettr = mlir::ArrayAttr::get(ctx, shapeElems);
+        mlir::Type elementType = rewriter.getF32Type();
+        mlir::Type myDataHandleType = dmap::dmapdataType::get(ctx);
+        auto data = rewriter.create<create_data>(rewriter.getUnknownLoc(),  myDataHandleType, shapettr, elementType);
+        //------
+        auto shimioconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  io.getResult(),dataaccesspattern);
         rewriter.eraseOp(op);
 
         return success();
