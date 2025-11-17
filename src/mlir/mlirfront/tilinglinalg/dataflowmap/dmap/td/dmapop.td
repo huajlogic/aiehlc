@@ -81,7 +81,8 @@ def dmap_create_data : dmapop<"create_data"> {
     ArrayAttr:$shape,
     TypeAttr:$element_type
   );
-  let results = (outs dmapdatatype:$data );
+  //let results = (outs dmapdatatype:$data );
+  let results = (outs I32:$data );
 
   let assemblyFormat = [{
     attr-dict `->` type($data)
@@ -256,7 +257,7 @@ def dmap_push : dmapop<"push"> {
   }];
 
   let arguments = (ins
-    dmapdatatype:$data,
+    I32:$data,
     AnyTypeOf<[dmapportstreamtype, dmapportchainstreamtype]>:$stream
   );
 
