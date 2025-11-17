@@ -3,11 +3,11 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 
-#ifndef __ROUTING_TODMAP__
-#define __ROUTING_TODMAP__
+#ifndef __DMAP__TODMAPHOP__
+#define __DMAP__TODMAPHOP__
 #include "common.h"
 #include "dmapmanager.h"
-#include "routingmanager.h"
+#include "dmaphopmanager.h"
 #include "routing/routingpath.h"
 #include "routing/routingtopology.h"
 using namespace mlir;

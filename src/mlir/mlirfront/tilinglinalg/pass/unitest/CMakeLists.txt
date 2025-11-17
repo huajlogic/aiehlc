@@ -69,7 +69,7 @@ include_directories(../passroutingtodmap/)
 include_directories(../../dataflowmap/dmap/inc/)
 include_directories(../../dataflowmap/dmap/)
 include_directories(../../dataflowmap/dmaphop/inc/)
-include_directories(../../dataflowmap/dmap/)
+include_directories(../../dataflowmap/dmaphop/)
 
 #file(GLOB PARSER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../Parser/*.cpp)
 message("Parser src Directory: ${PARSER_FILES}")

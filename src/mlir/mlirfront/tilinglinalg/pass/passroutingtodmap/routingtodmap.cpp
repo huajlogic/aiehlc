@@ -1027,7 +1027,8 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
         shapeElems.push_back(rewriter.getI64IntegerAttr(16));
         mlir::ArrayAttr shapettr = mlir::ArrayAttr::get(ctx, shapeElems);
         mlir::Type elementType = rewriter.getF32Type();
-        mlir::Type myDataHandleType = dmap::dmapdataType::get(ctx);
+        //mlir::Type myDataHandleType = dmap::dmapdataType::get(ctx);
+        mlir::Type myDataHandleType = rewriter.getI32Type();
         auto data = rewriter.create<create_data>(rewriter.getUnknownLoc(),  myDataHandleType, shapettr, elementType);
         //------
         auto shimioconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  io.getResult(),dataaccesspattern);
