@@ -157,26 +157,50 @@ DmapToDmaphopPass::DmapToDmaphopPass(RoutingTopology& rtopology):rtopology_(rtop
 void DmapToDmaphopPass::runOnOperation() {
     auto& ctx = getContext();
     auto module = getOperation();
-    RewritePatternSet patternsGlobal(&ctx);
+    RewritePatternSet patterns(&ctx),patternsGlobal(&ctx);
     ConversionTarget target(ctx);
-    target.addLegalDialect<dmap::dmapdialect>();
+    target.addIllegalDialect<dmap::dmapdialect>();
+    target.addLegalOp<routing::RoutingCreate>();
+    target.addLegalOp<routing::YieldOp>();
     target.addLegalDialect<dmaphop::dmaphopdialect>();
+
     target.addLegalOp<dmap::YieldOp>();
     LLVMTypeConverter typeconverter(&ctx);
     patternsGlobal.add<indexcastconvert>(&ctx, typeconverter);
-    patternsGlobal.add<define_io_engineconvert>(&ctx, typeconverter);
-    patternsGlobal.add<define_core_groupconvert>(&ctx, typeconverter);
-    patternsGlobal.add<define_port_configureconvert>(&ctx, typeconverter);
-    //
-    patternsGlobal.add<create_io_engin_with_configconvert>(&ctx, typeconverter);
-    patternsGlobal.add<create_core_group_with_configconvert>(&ctx, typeconverter);
-    patternsGlobal.add<create_streamconvert>(&ctx, typeconverter);
-    patternsGlobal.add<createchainstreamconvert>(&ctx, typeconverter);
 
-    patternsGlobal.add<PushConvert>(&ctx, typeconverter,rtopology_, 0/*op through memtile or not*/);
+    patterns.add<define_io_engineconvert>(&ctx, typeconverter);
+    patterns.add<define_core_groupconvert>(&ctx, typeconverter);
+    patterns.add<define_port_configureconvert>(&ctx, typeconverter);
+    //
+    patterns.add<create_io_engin_with_configconvert>(&ctx, typeconverter);
+    patterns.add<create_core_group_with_configconvert>(&ctx, typeconverter);
+    patterns.add<create_streamconvert>(&ctx, typeconverter);
+    patterns.add<createchainstreamconvert>(&ctx, typeconverter);
+
+    patterns.add<PushConvert>(&ctx, typeconverter,rtopology_, 0/*op through memtile or not*/);
+    llvm::outs() << "dmaphop--pass--\n";
+    /*
+      There are two patterns are used for different purpose
+      first, the ops what we plan to convert is inside the executeregionop, hence we should use walk to
+      go inside this op for the parttern convert, the patterns variable is used for such purpose.
+      patternsglobal is the second pattern used to convert the ops outside of the executeregionop
+      for example arith.constant routingrectedummytensor etc if need.
+    */
+    FrozenRewritePatternSet frozenPatterns(std::move(patterns));
+    module->walk([&](scf::ExecuteRegionOp exec) {
+        //only deal with the routing_memo executeregionop
+        if (!exec->getAttrOfType<StringAttr>("routing_memo")) {
+            llvm::outs() << "dmaphop convert failed--not routing memo \n";
+            return;
+        }
+        llvm::errs() << exec;
+        if (failed(applyPartialConversion(exec, target, frozenPatterns ))) {
+            llvm::outs() << "dmaphop convert failed \n";
+        }
+    });//*/
 
     if (failed(applyPartialConversion(module, target, std::move(patternsGlobal) ))) {
-        llvm::outs() << "routing convert failed 2--- \n";
+        llvm::outs() << "dmaphop convert failed in global--- \n";
     }
     return;
 }

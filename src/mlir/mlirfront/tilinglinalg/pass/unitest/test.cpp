@@ -127,7 +127,7 @@ void routingtodmap() {
     options.label = "After RoutingToDmapPass:";
     pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingToDmapPass>(rtopology));
-    options.label = "After DmapToDmaphopPass:";
+    options.label = "After DmapToDmaphopPass 2:";
     pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<DmapToDmaphopPass>(rtopology));
     

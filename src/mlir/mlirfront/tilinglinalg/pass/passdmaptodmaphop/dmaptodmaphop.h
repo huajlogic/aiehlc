@@ -8,6 +8,7 @@
 #include "common.h"
 #include "dmapmanager.h"
 #include "dmaphopmanager.h"
+#include "routingmanager.h"
 #include "routing/routingpath.h"
 #include "routing/routingtopology.h"
 using namespace mlir;
