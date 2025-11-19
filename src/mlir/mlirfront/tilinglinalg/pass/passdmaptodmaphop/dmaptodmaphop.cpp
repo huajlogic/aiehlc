@@ -50,6 +50,10 @@ enum class DataflowDirection { Push, Pull };
 static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewriter &rewriter,
                                          RoutingTopology &router, DataflowDirection direction) {
     auto loc = op->getLoc();
+    
+    // Get topology info - core tile start row
+    int core_start_row = (int) router.getRM()->getrsc()->absTileRow(TileType::Core, 0);
+    
     // dmap.push %data, %stream -> stream is operand 1
     // dmap.pull %data from %stream -> stream is operand 1
     Value streamValue = op->getOperand(1);
@@ -107,7 +111,8 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     SmallVector<dmaphop::port, 4> corePortsOutOps;
     SmallVector<Attribute, 4> consumerPortSymbols;
     for (int i = 0; i < coreGroup.getCoreCount(); ++i) {
-        int row = (coreGroup.getGroupAxis() == "col") ? i + 1 : coreGroup.getGroupIdx() + 1;
+        // Use core_start_row as the base for core tile row calculation
+        int row = (coreGroup.getGroupAxis() == "col") ? (i + core_start_row) : (coreGroup.getGroupIdx() + core_start_row);
         int col = (coreGroup.getGroupAxis() == "row") ? i : coreGroup.getGroupIdx();
         auto coreTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("core"), rewriter.getI64IntegerAttr(col), rewriter.getI64IntegerAttr(row));
         coreTiles.push_back(coreTile);
