@@ -45,10 +45,14 @@ struct DmapFuncOpLowering : public OpConversionPattern<dmap::FuncOp> {
 
 // Lowering for dmap::push. This is the main conversion driver.
 struct PushOpLowering : public OpConversionPattern<dmap::push> {
-    using OpConversionPattern<dmap::push>::OpConversionPattern;
+    explicit PushOpLowering(MLIRContext *context, RoutingTopology &router)
+        : OpConversionPattern<dmap::push>(context), router_(router) {}
 
     LogicalResult matchAndRewrite(dmap::push op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
+        //toplogy info
+        int core_start_row = (int) router_.getRM()->getrsc()->absTileRow(TileType::Core, 0);
+        //lowing dmap::push to dmaphop::create_hop chain
         auto loc = op.getLoc();
         auto streamValue = op.getStream();
         Operation *streamOp = streamValue.getDefiningOp();
@@ -224,6 +228,8 @@ struct PushOpLowering : public OpConversionPattern<dmap::push> {
         rewriter.eraseOp(op);
         return success();
     }
+private:
+    RoutingTopology &router_;
 };
 
 // Generic lowering pattern to erase an op that is no longer needed.
@@ -251,7 +257,7 @@ void DmapToDmaphopPass::runOnOperation() {
 
     // Add the primary lowering patterns.
     //patterns.add<DmapFuncOpLowering, PushOpLowering>(&ctx);
-    patterns.add<PushOpLowering>(&ctx);
+    patterns.add<PushOpLowering>(&ctx, rtopology_);
     
     // Add patterns to erase the old dmap ops that are now handled by the main patterns.
     patterns.add<
