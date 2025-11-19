@@ -266,6 +266,25 @@ def dmap_push : dmapop<"push"> {
   }];
 
 }
+
+def dmap_pull : dmapop<"pull"> {
+  let summary = "Pushes a block of data into a pre-defined stream.";
+  let description = [{
+    The primary pull execution-phase operation. It takes a data handle and
+    a stream handle (either a single port stream or a chained stream),
+    initiating the data transfer along the path defined by the stream.
+  }];
+
+  let arguments = (ins
+    I32:$data,
+    AnyTypeOf<[dmapportstreamtype, dmapportchainstreamtype]>:$stream
+  );
+
+  let assemblyFormat = [{
+    $data `from` $stream `:` type($stream) attr-dict
+  }];
+
+}
 /*
 def dmap_SyncOp : dmapop<"sync", [MemoryEffect_Interface]> {
   let summary = "Waits for all transfers in a stream to complete.";
