@@ -1008,17 +1008,31 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
         printf("before xxxx---0----\n");
         auto io = rewriter.create<dmap::define_io_engine>(rewriter.getUnknownLoc(),  ioout, dmapioIdx++, "SHIM"); 
         auto ioconfigret = dmap::dmapioconfigType::get(ctx);
-        auto dataaccesspattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("SEND"), 16, 1, 1);
+
+        // Define patterns for SEND and RECEIVE
+        auto sendpattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("SEND"), 16, 1, 1);
         auto receivepattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("RECEIVE"), 16, 1, 1);
-        auto memsndpattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("SEND"), 16, 1, 1);
-        auto memreceivepattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("RECEIVE"), 16, 1, 1);
+        
+        // Determine patterns based on processing_type
+        dmap::dataaccesspatternAttr io_pattern;
+        dmap::dataaccesspatternAttr core_group_pattern;
+        std::string port_symbol_name;
+
+        if (processing_type == 0) { // Broadcast
+            io_pattern = sendpattern;
+            core_group_pattern = receivepattern;
+            port_symbol_name = "receive_port";
+        } else { // Gather (processing_type == 2)
+            io_pattern = receivepattern;
+            core_group_pattern = sendpattern;
+            port_symbol_name = "send_port";
+        }
        
         mlir::Type pgeout = dmap::dmacoreenginegroupType::get(ctx);
         auto peg = rewriter.create<define_core_group>(rewriter.getUnknownLoc(),  pgeout, round_idx, tileNum, split_axis);
         //config
         mlir::Type portconfig = dmap::dmapportconfigType::get(ctx);
-        std::string symbolName = "receive1";
-        auto pf = rewriter.create<dmap::define_port_configure>(rewriter.getUnknownLoc(), portconfig, symbolName, receivepattern);
+        auto pf = rewriter.create<dmap::define_port_configure>(rewriter.getUnknownLoc(), portconfig, port_symbol_name, core_group_pattern);
       
         //
         //Data
@@ -1031,12 +1045,12 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
         mlir::Type myDataHandleType = rewriter.getI32Type();
         //auto data = rewriter.create<create_data>(rewriter.getUnknownLoc(),  myDataHandleType, shapettr, elementType);
         //------
-        auto shimioconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  io.getResult(),dataaccesspattern);
+        auto shimioconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  io.getResult(), io_pattern);
         //
         //config port group
         llvm::SmallVector<dmap::dataconfmapitemAttr> itemsVector;
         for (int i = 0; i < tileNum; i++) {
-            dmap::dataconfmapitemAttr item = dmap::dataconfmapitemAttr::get(ctx,i, mlir::SymbolRefAttr::get(ctx, "receive1"));
+            dmap::dataconfmapitemAttr item = dmap::dataconfmapitemAttr::get(ctx,i, mlir::SymbolRefAttr::get(ctx, port_symbol_name));
             itemsVector.push_back(item);
         }
         
@@ -1048,8 +1062,8 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
         if (moplevel == 1) {
             auto memio = rewriter.create<define_io_engine>(rewriter.getUnknownLoc(),  ioout, 0, "MEM"); 
             ///*
-            auto memiorecvconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  memio.getResult(),memreceivepattern);
-            auto memiosendconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  memio.getResult(),memsndpattern);
+            auto memiorecvconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  memio.getResult(),receivepattern);
+            auto memiosendconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  memio.getResult(),sendpattern);
             
             auto shimToMemAttr = dmapioAttr::get(ctx, dmapio::DMAP_SHIMIO);
             auto memToCoreAttr = dmapioAttr::get(ctx, dmapio::DMAP_MEMTILEIO);
@@ -1057,8 +1071,24 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
             auto groupIndexAttr = rewriter.getI32IntegerAttr(0);
             auto streamIdAttr1 = rewriter.getI32IntegerAttr(1);
             
-            auto streamhandle1 = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, shimioconfig.getResult(),memiorecvconfig.getResult(), shimToMemAttr, groupIndexAttr, streamIdAttr1);
-            auto streamhandle2 = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, memiosendconfig.getResult(),gcmap.getResult(), memToCoreAttr, groupIndexAttr, streamIdAttr1);
+            Value stream_src, stream_dst;
+            if (processing_type == 0) { // Broadcast: SHIM -> MEM -> CORE
+                stream_src = shimioconfig.getResult();
+                stream_dst = memiorecvconfig.getResult();
+            } else { // Gather: CORE -> MEM -> SHIM
+                stream_src = gcmap.getResult();
+                stream_dst = memiorecvconfig.getResult();
+            }
+            auto streamhandle1 = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, stream_src, stream_dst, shimToMemAttr, groupIndexAttr, streamIdAttr1);
+
+            if (processing_type == 0) { // Broadcast: SHIM -> MEM -> CORE
+                stream_src = memiosendconfig.getResult();
+                stream_dst = gcmap.getResult();
+            } else { // Gather: CORE -> MEM -> SHIM
+                stream_src = memiosendconfig.getResult();
+                stream_dst = shimioconfig.getResult();
+            }
+            auto streamhandle2 = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, stream_src, stream_dst, memToCoreAttr, groupIndexAttr, streamIdAttr1);
 
             // Create a chained stream from streamhandle1 and streamhandle2, then push once to the chained stream.
             auto chainType = dmap::dmapportchainstreamType::get(ctx);
@@ -1069,8 +1099,12 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
                                                                                     streamhandle2.getResult()});
             auto chainStream = chainStreamOp.getResult();
 
-            // Single push that targets the chained stream (replaces pret1 and pret2)
-            auto pchain = rewriter.create<push>(rewriter.getUnknownLoc(), extract_data.getResult(), chainStream);
+            // Single push/pull that targets the chained stream
+            if (processing_type == 0) {
+                rewriter.create<push>(rewriter.getUnknownLoc(), extract_data.getResult(), chainStream);
+            } else {
+                rewriter.create<pull>(rewriter.getUnknownLoc(), extract_data.getResult(), chainStream);
+            }
             //*/
         } else {
             auto shimToCoreAttr = dmapioAttr::get(ctx, dmapio::DMAP_SHIMIO);
@@ -1078,8 +1112,21 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
             auto groupIndexAttr = rewriter.getI32IntegerAttr(0);
             auto streamIdAttr = rewriter.getI32IntegerAttr(1);
             
-            auto streamhandle = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, shimioconfig.getResult(),gcmap.getResult(), shimToCoreAttr, groupIndexAttr, streamIdAttr);
-            auto pret = rewriter.create<push>(rewriter.getUnknownLoc(), extract_data.getResult(),streamhandle.getResult());
+            Value stream_src, stream_dst;
+            if (processing_type == 0) { // Broadcast: SHIM -> CORE
+                stream_src = shimioconfig.getResult();
+                stream_dst = gcmap.getResult();
+            } else { // Gather: CORE -> SHIM
+                stream_src = gcmap.getResult();
+                stream_dst = shimioconfig.getResult();
+            }
+            auto streamhandle = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, stream_src, stream_dst, shimToCoreAttr, groupIndexAttr, streamIdAttr);
+            
+            if (processing_type == 0) {
+                rewriter.create<push>(rewriter.getUnknownLoc(), extract_data.getResult(),streamhandle.getResult());
+            } else {
+                rewriter.create<pull>(rewriter.getUnknownLoc(), extract_data.getResult(),streamhandle.getResult());
+            }
         }
         //
         rewriter.eraseOp(op);
