@@ -172,14 +172,14 @@ def dmap_create_io_engin_with_config : dmapop<"create_io_engin_with_config"> {
   }];
 
   let arguments = (ins
-    dmapioenginetype :$peioengine,
+    dmapioenginetype :$ioengine,
     dataaccesspattern:$accesspattern
   );
 
   let results = (outs dmapioconfigtype:$ioconfig);
 
   let assemblyFormat = [{
-     $peioengine `:` type($peioengine) attr-dict `->` type($ioconfig) 
+     $ioengine `:` type($ioengine) attr-dict `->` type($ioconfig) 
   }];
 }
 
