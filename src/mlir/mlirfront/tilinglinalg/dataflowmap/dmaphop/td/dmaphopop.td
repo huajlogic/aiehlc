@@ -303,6 +303,18 @@ def dmaphop_push : dmaphopop<"push"> {
   let assemblyFormat = "$data `onto` $path `outputs` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
 }
  
+ def dmaphop_pull : dmaphopop<"pull"> {
+  let summary = "pull data through a path to multiple destinations";
+  let arguments = (ins
+    AnyMemRef:$data,
+    dmaphoppathtype:$path,
+    Variadic<AnyMemRef>:$output_buffers,
+    Variadic<dmaphopporttype>:$output_ports
+  );
+  let traits = [SameVariadicOperandSize];
+  let assemblyFormat = "$data `from` $path `outputs` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
+}
+
 // --- 7. Sync Operation ---
 def dmaphop_sync : dmaphopop<"sync"> {
   let summary = "Synchronizes completion of transfers on a path";
