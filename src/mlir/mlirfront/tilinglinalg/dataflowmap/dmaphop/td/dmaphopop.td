@@ -312,7 +312,7 @@ def dmaphop_push : dmaphopop<"push"> {
     Variadic<dmaphopporttype>:$output_ports
   );
   let traits = [SameVariadicOperandSize];
-  let assemblyFormat = "$data `from` $path `outputs` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
+  let assemblyFormat = "$data `from` $path `input` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
 }
 
 // --- 7. Sync Operation ---

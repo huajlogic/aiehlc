@@ -43,279 +43,164 @@ struct DmapFuncOpLowering : public OpConversionPattern<dmap::FuncOp> {
 };
 
 
-// Lowering for dmap::push. This is the main conversion driver.
+// Enum to distinguish between push and pull dataflow directions.
+enum class DataflowDirection { Push, Pull };
+
+// Generic function to lower a data movement operation (push or pull).
+static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewriter &rewriter,
+                                         RoutingTopology &router, DataflowDirection direction) {
+    auto loc = op->getLoc();
+    // dmap.push %data, %stream -> stream is operand 1
+    // dmap.pull %data from %stream -> stream is operand 1
+    Value streamValue = op->getOperand(1);
+    Operation *streamOp = streamValue.getDefiningOp();
+
+    dmap::define_io_engine shimEngine, memEngine;
+    dmap::define_core_group coreGroup;
+
+    // --- 1. Extract tile/engine definitions from the stream ---
+    if (auto chainStreamOp = dyn_cast<dmap::createchainstream>(streamOp)) {
+        if (chainStreamOp.getStreams().size() != 2) return op->emitError("only supports 2-hop chained streams");
+        auto stream1 = chainStreamOp.getStreams()[0].getDefiningOp<dmap::createstream>();
+        auto stream2 = chainStreamOp.getStreams()[1].getDefiningOp<dmap::createstream>();
+
+        auto config1_src = stream1.getSource().getDefiningOp<dmap::create_io_engin_with_config>();
+        auto config1_dst = stream1.getDestination().getDefiningOp<dmap::create_io_engin_with_config>();
+        auto config2_src = stream2.getSource().getDefiningOp<dmap::create_io_engin_with_config>();
+        auto config2_dst = stream2.getDestination().getDefiningOp<dmap::create_core_group_with_config>();
+        
+        shimEngine = config1_src.getIoengine().getDefiningOp<dmap::define_io_engine>();
+        memEngine = config1_dst.getIoengine().getDefiningOp<dmap::define_io_engine>();
+        coreGroup = config2_dst.getCoregroup().getDefiningOp<dmap::define_core_group>();
+
+    } else if (auto createStreamOp = dyn_cast<dmap::createstream>(streamOp)) {
+        dmap::create_io_engin_with_config shimConfig;
+        dmap::create_core_group_with_config coreGroupConfig;
+        if (direction == DataflowDirection::Push) { // SHIM -> CORES
+            shimConfig = createStreamOp.getSource().getDefiningOp<dmap::create_io_engin_with_config>();
+            coreGroupConfig = createStreamOp.getDestination().getDefiningOp<dmap::create_core_group_with_config>();
+        } else { // CORES -> SHIM
+            coreGroupConfig = createStreamOp.getSource().getDefiningOp<dmap::create_core_group_with_config>();
+            shimConfig = createStreamOp.getDestination().getDefiningOp<dmap::create_io_engin_with_config>();
+        }
+        shimEngine = shimConfig.getIoengine().getDefiningOp<dmap::define_io_engine>();
+        coreGroup = coreGroupConfig.getCoregroup().getDefiningOp<dmap::define_core_group>();
+    } else {
+        return op->emitError("unsupported stream type for lowering");
+    }
+
+    // --- 2. Create dmaphop::tile and dmaphop::port Ops ---
+    auto shimTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("shim"), rewriter.getI64IntegerAttr(shimEngine.getIoId()), rewriter.getI64IntegerAttr(0));
+    auto shimPortOut = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr("shimPortOut"), rewriter.getI64IntegerAttr(0));
+    auto shimPortIn = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("In"), rewriter.getStringAttr("shimPortIn"), rewriter.getI64IntegerAttr(0));
+    
+    dmaphop::tile memTile;
+    dmaphop::port memPortIn, memPortOut;
+    if (memEngine) {
+        memTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("mem"), rewriter.getI64IntegerAttr(memEngine.getIoId()), rewriter.getI64IntegerAttr(0));
+        memPortIn = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("In"), rewriter.getStringAttr("memPortIn"), rewriter.getI64IntegerAttr(0));
+        memPortOut = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr("memPortOut"), rewriter.getI64IntegerAttr(0));
+    }
+
+    SmallVector<dmaphop::tile, 4> coreTiles;
+    SmallVector<Value, 4> corePortsInValues;
+    SmallVector<dmaphop::port, 4> corePortsOutOps;
+    SmallVector<Attribute, 4> consumerPortSymbols;
+    for (int i = 0; i < coreGroup.getCoreCount(); ++i) {
+        int row = (coreGroup.getGroupAxis() == "col") ? i + 1 : coreGroup.getGroupIdx() + 1;
+        int col = (coreGroup.getGroupAxis() == "row") ? i : coreGroup.getGroupIdx();
+        auto coreTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("core"), rewriter.getI64IntegerAttr(col), rewriter.getI64IntegerAttr(row));
+        coreTiles.push_back(coreTile);
+
+        std::string inPortName = "corePortIn" + std::to_string(i);
+        auto portInOp = rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("In"), rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0));
+        corePortsInValues.push_back(portInOp.getResult());
+        consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), inPortName));
+
+        std::string outPortName = "corePortOut" + std::to_string(i);
+        corePortsOutOps.push_back(rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr(outPortName), rewriter.getI64IntegerAttr(0)));
+    }
+
+    // --- 3. Create dmaphop::create_hop Ops based on direction ---
+    SmallVector<Value, 4> hops;
+    SmallVector<Attribute, 4> producerPortSymbols;
+    if (direction == DataflowDirection::Push) {
+        if (memTile) { // SHIM -> MEM -> CORES
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, memPortIn).getResult());
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, corePortsInValues[0]).getResult());
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "memPortIn"));
+        } else { // SHIM -> CORES
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, corePortsInValues[0]).getResult());
+        }
+        for (size_t i = 0; i < corePortsOutOps.size() - 1; ++i) {
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i+1]).getResult());
+        }
+    } else { // Pull
+        if (memTile) { // CORES -> MEM -> SHIM
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, shimPortIn).getResult());
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps.back(), memPortIn).getResult());
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortIn"));
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "memPortIn"));
+        } else { // CORES -> SHIM
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps.back(), shimPortIn).getResult());
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortIn"));
+        }
+        for (int i = corePortsOutOps.size() - 2; i >= 0; --i) {
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i]).getResult());
+        }
+    }
+
+    // --- 4. Create path, buffers, and final data movement op ---
+    auto path = (direction == DataflowDirection::Push)
+        ? rewriter.create<dmaphop::create_path>(loc, hops, rewriter.getArrayAttr(consumerPortSymbols), rewriter.getArrayAttr(producerPortSymbols))
+        : rewriter.create<dmaphop::create_path>(loc, hops, rewriter.getArrayAttr(producerPortSymbols), rewriter.getArrayAttr({}));
+
+    auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
+    Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
+    Value coreBufferTemplate = rewriter.create<memref::AllocOp>(loc, memrefType);
+    SmallVector<Value, 4> coreBuffers;
+    for (auto coreTile : coreTiles) {
+        coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, memrefType, coreTile.getResult(), coreBufferTemplate).getResult());
+    }
+
+    if (direction == DataflowDirection::Push) {
+        rewriter.create<dmaphop::push>(loc, ddrBuffer, path, coreBuffers, corePortsInValues);
+    } else {
+        rewriter.create<dmaphop::pull>(loc, ddrBuffer, path, coreBuffers, corePortsInValues);
+    }
+    rewriter.create<dmaphop::sync>(loc, path);
+
+    // --- 5. Deallocate buffers and erase original op ---
+    for (auto buffer : coreBuffers) {
+        rewriter.create<dmaphop::dealloc_buffer>(loc, buffer);
+    }
+    rewriter.create<memref::DeallocOp>(loc, ddrBuffer);
+    rewriter.create<memref::DeallocOp>(loc, coreBufferTemplate);
+    rewriter.eraseOp(op);
+    return success();
+}
+
+// Lowering for dmap::push. This is now a thin wrapper.
 struct PushOpLowering : public OpConversionPattern<dmap::push> {
     explicit PushOpLowering(MLIRContext *context, RoutingTopology &router)
         : OpConversionPattern<dmap::push>(context), router_(router) {}
 
     LogicalResult matchAndRewrite(dmap::push op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        //toplogy info
-        int core_start_row = (int) router_.getRM()->getrsc()->absTileRow(TileType::Core, 0);
-        //lowing dmap::push to dmaphop::create_hop chain
-        auto loc = op.getLoc();
-        auto streamValue = op.getStream();
-        Operation *streamOp = streamValue.getDefiningOp();
-
-        if (auto chainStreamOp = dyn_cast<dmap::createchainstream>(streamOp)) {
-            // Handle a chained stream (e.g., SHIM -> MEM -> CORES)
-            if (chainStreamOp.getStreams().size() != 2) {
-                return op.emitError("lowering only supports a 2-hop chained stream (SHIM->MEM->CORES)");
-            }
-
-            auto stream1 = chainStreamOp.getStreams()[0].getDefiningOp<dmap::createstream>();
-            auto stream2 = chainStreamOp.getStreams()[1].getDefiningOp<dmap::createstream>();
-            if (!stream1 || !stream2) return failure();
-
-            // Extract Ops from the first stream (SHIM -> MEM)
-            auto shimConfig = stream1.getSource().getDefiningOp<dmap::create_io_engin_with_config>();
-            auto memInConfig = stream1.getDestination().getDefiningOp<dmap::create_io_engin_with_config>();
-            auto shimEngine = shimConfig.getIoengine().getDefiningOp<dmap::define_io_engine>();
-            auto memEngine = memInConfig.getIoengine().getDefiningOp<dmap::define_io_engine>();
-
-            // Extract Ops from the second stream (MEM -> CORES)
-            auto memOutConfig = stream2.getSource().getDefiningOp<dmap::create_io_engin_with_config>();
-            auto coreGroupConfig = stream2.getDestination().getDefiningOp<dmap::create_core_group_with_config>();
-            auto coreGroup = coreGroupConfig.getCoregroup().getDefiningOp<dmap::define_core_group>();
-
-            // 1. Create dmaphop::tile Ops
-            auto shimTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("shim"), rewriter.getI64IntegerAttr(shimEngine.getIoId()), rewriter.getI64IntegerAttr(0));
-            auto memTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("mem"), rewriter.getI64IntegerAttr(memEngine.getIoId()), rewriter.getI64IntegerAttr(0));
-            
-            auto groupIdx = coreGroup.getGroupIdx();
-            SmallVector<dmaphop::tile, 4> coreTiles;
-            for (int i = 0; i < coreGroup.getCoreCount(); ++i) {
-                int row = (coreGroup.getGroupAxis() == "col") ? i + 1 : coreGroup.getGroupIdx() + 1; // Assuming core tiles start at row 1
-                int col = (coreGroup.getGroupAxis() == "row") ? i : coreGroup.getGroupIdx();
-                coreTiles.push_back(rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("core"), rewriter.getI64IntegerAttr(col), rewriter.getI64IntegerAttr(row)));
-            }
-
-            // 2. Create dmaphop::port Ops for the daisy chain
-            auto shimPortOut = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr("shimPortOut"), rewriter.getI64IntegerAttr(0));
-            auto memPortIn = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("In"), rewriter.getStringAttr("memPortIn"), rewriter.getI64IntegerAttr(0));
-            auto memPortOut = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr("memPortOut"), rewriter.getI64IntegerAttr(0));
-
-            SmallVector<Value, 4> corePortsInValues;
-            SmallVector<Attribute, 4> consumerPortSymbols;
-            SmallVector<dmaphop::port, 4> corePortsOutOps;
-
-            for (const auto &it : llvm::enumerate(coreTiles)) {
-                std::string inPortName = "corePortIn" + std::to_string(it.index());
-                auto portInOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("In"), rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0));
-                corePortsInValues.push_back(portInOp.getResult());
-                consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), inPortName));
-
-                // Each core except the last one also needs an Out port
-                if (it.index() < coreTiles.size() - 1) {
-                    std::string outPortName = "corePortOut" + std::to_string(it.index());
-                    auto portOutOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("Out"), rewriter.getStringAttr(outPortName), rewriter.getI64IntegerAttr(0));
-                    corePortsOutOps.push_back(portOutOp);
-                }
-            }
-
-            // 3. Create dmaphop::create_hop Ops for the sequential chain
-            SmallVector<Value, 4> hops;
-            // First hop: SHIM -> MEM
-            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, memPortIn).getResult());
-            // Second hop: MEM -> Core 0
-            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, corePortsInValues[0]).getResult());
-
-            // Subsequent hops: Core i -> Core i+1
-            for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
-                hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i+1]).getResult());
-            }
-
-            // 4. Create dmaphop::create_path Op
-            auto path = rewriter.create<dmaphop::create_path>(loc, hops, rewriter.getArrayAttr(consumerPortSymbols), rewriter.getArrayAttr({SymbolRefAttr::get(rewriter.getContext(), "memPortIn")}));
-
-            // 5. Allocate buffers
-            auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
-            Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
-            Value coreBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
-
-            SmallVector<Value, 4> coreBuffers;
-            for (auto coreTile : coreTiles) {
-                coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, memrefType, coreTile.getResult(), coreBuffer).getResult());
-            }
-
-            // 6. Create dmaphop::push and sync
-            rewriter.create<dmaphop::push>(loc, ddrBuffer, path, coreBuffers, corePortsInValues);
-            rewriter.create<dmaphop::sync>(loc, path);
-
-            // 7. Deallocate
-            for (auto buffer : coreBuffers) {
-                rewriter.create<dmaphop::dealloc_buffer>(loc, buffer);
-            }
-            rewriter.create<memref::DeallocOp>(loc, ddrBuffer);
-
-        } else if (auto createStreamOp = dyn_cast<dmap::createstream>(streamOp)) {
-            // Handle a single stream (e.g., SHIM -> CORES)
-            auto shimConfig = createStreamOp.getSource().getDefiningOp<dmap::create_io_engin_with_config>();
-            auto coreGroupConfig = createStreamOp.getDestination().getDefiningOp<dmap::create_core_group_with_config>();
-            if (!shimConfig || !coreGroupConfig) return failure();
-
-            auto shimEngine = shimConfig.getIoengine().getDefiningOp<dmap::define_io_engine>();
-            auto coreGroup = coreGroupConfig.getCoregroup().getDefiningOp<dmap::define_core_group>();
-
-            // 1. Create dmaphop::tile Ops
-            auto shimTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("shim"), rewriter.getI64IntegerAttr(shimEngine.getIoId()), rewriter.getI64IntegerAttr(0));
-            
-            SmallVector<dmaphop::tile, 4> coreTiles;
-            for (int i = 0; i < coreGroup.getCoreCount(); ++i) {
-                int row = (coreGroup.getGroupAxis() == "col") ? i + 1 : coreGroup.getGroupIdx() + 1;
-                int col = (coreGroup.getGroupAxis() == "row") ? i : coreGroup.getGroupIdx();
-                coreTiles.push_back(rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("core"), rewriter.getI64IntegerAttr(col), rewriter.getI64IntegerAttr(row)));
-            }
-
-            // 2. Create dmaphop::port Ops for the daisy chain
-            auto shimPortOut = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr("shimPortOut"), rewriter.getI64IntegerAttr(0));
-
-            SmallVector<Value, 4> corePortsInValues;
-            SmallVector<Attribute, 4> consumerPortSymbols;
-            SmallVector<dmaphop::port, 4> corePortsOutOps;
-
-            for (const auto &it : llvm::enumerate(coreTiles)) {
-                std::string inPortName = "corePortIn" + std::to_string(it.index());
-                auto portInOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("In"), rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0));
-                corePortsInValues.push_back(portInOp.getResult());
-                consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), inPortName));
-
-                // Each core except the last one also needs an Out port
-                if (it.index() < coreTiles.size() - 1) {
-                    std::string outPortName = "corePortOut" + std::to_string(it.index());
-                    auto portOutOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("Out"), rewriter.getStringAttr(outPortName), rewriter.getI64IntegerAttr(0));
-                    corePortsOutOps.push_back(portOutOp);
-                }
-            }
-
-            // 3. Create dmaphop::create_hop Ops for the sequential chain
-            SmallVector<Value, 4> hops;
-            // First hop: SHIM -> Core 0
-            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, corePortsInValues[0]).getResult());
-
-            // Subsequent hops: Core i -> Core i+1
-            for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
-                hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i+1]).getResult());
-            }
-
-            // 4. Create dmaphop::create_path Op
-            auto path = rewriter.create<dmaphop::create_path>(loc, hops, rewriter.getArrayAttr(consumerPortSymbols), rewriter.getArrayAttr({}));
-
-            // 5. Allocate buffers
-            auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
-            Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
-            mlir::Value inputMemRef = rewriter.create<mlir::memref::AllocOp>(loc, memrefType);
-
-            SmallVector<Value, 4> coreBuffers;
-            for (auto coreTile : coreTiles) {
-                coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, memrefType, coreTile.getResult(),inputMemRef).getResult());
-            }
-
-            // 6. Create dmaphop::push and sync
-            rewriter.create<dmaphop::push>(loc, ddrBuffer, path, coreBuffers, corePortsInValues);
-            rewriter.create<dmaphop::sync>(loc, path);
-
-            // 7. Deallocate
-            for (auto buffer : coreBuffers) {
-                rewriter.create<dmaphop::dealloc_buffer>(loc, buffer);
-            }
-            rewriter.create<memref::DeallocOp>(loc, ddrBuffer);
-
-        } else {
-            return op.emitError("unsupported stream type for lowering. Expected dmap.createstream or dmap.createchainstream");
-        }
-
-        rewriter.eraseOp(op);
-        return success();
+        return lowerDataMovementOp(op, rewriter, router_, DataflowDirection::Push);
     }
 private:
     RoutingTopology &router_;
 };
 
-// Lowering for dmap::pull.
+// Lowering for dmap::pull. This is now a thin wrapper.
 struct PullOpLowering : public OpConversionPattern<dmap::pull> {
     explicit PullOpLowering(MLIRContext *context, RoutingTopology &router)
         : OpConversionPattern<dmap::pull>(context), router_(router) {}
 
     LogicalResult matchAndRewrite(dmap::pull op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        auto loc = op.getLoc();
-        auto streamValue = op.getStream();
-        Operation *streamOp = streamValue.getDefiningOp();
-
-        if (auto createStreamOp = dyn_cast<dmap::createstream>(streamOp)) {
-            // Handle a single stream (e.g., CORES -> SHIM)
-            auto coreGroupConfig = createStreamOp.getSource().getDefiningOp<dmap::create_core_group_with_config>();
-            auto shimConfig = createStreamOp.getDestination().getDefiningOp<dmap::create_io_engin_with_config>();
-            if (!shimConfig || !coreGroupConfig) return failure();
-
-            auto coreGroup = coreGroupConfig.getCoregroup().getDefiningOp<dmap::define_core_group>();
-            auto shimEngine = shimConfig.getIoengine().getDefiningOp<dmap::define_io_engine>();
-
-            // 1. Create dmaphop::tile Ops
-            SmallVector<dmaphop::tile, 4> coreTiles;
-            for (int i = 0; i < coreGroup.getCoreCount(); ++i) {
-                int row = (coreGroup.getGroupAxis() == "col") ? i + 1 : coreGroup.getGroupIdx() + 1;
-                int col = (coreGroup.getGroupAxis() == "row") ? i : coreGroup.getGroupIdx();
-                coreTiles.push_back(rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("core"), rewriter.getI64IntegerAttr(col), rewriter.getI64IntegerAttr(row)));
-            }
-            auto shimTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("shim"), rewriter.getI64IntegerAttr(shimEngine.getIoId()), rewriter.getI64IntegerAttr(0));
-
-            // 2. Create dmaphop::port Ops for the daisy chain
-            SmallVector<Value, 4> corePortsInValues;
-            SmallVector<dmaphop::port, 4> corePortsOutOps;
-            for (const auto &it : llvm::enumerate(coreTiles)) {
-                // Each core except the first one needs an In port to receive from the previous core
-                if (it.index() > 0) {
-                    std::string inPortName = "corePortIn" + std::to_string(it.index());
-                    auto portInOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("In"), rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0));
-                    corePortsInValues.push_back(portInOp.getResult());
-                }
-                // Each core needs an Out port
-                std::string outPortName = "corePortOut" + std::to_string(it.index());
-                auto portOutOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("Out"), rewriter.getStringAttr(outPortName), rewriter.getI64IntegerAttr(0));
-                corePortsOutOps.push_back(portOutOp);
-            }
-            auto shimPortIn = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("In"), rewriter.getStringAttr("shimPortIn"), rewriter.getI64IntegerAttr(0));
-
-            // 3. Create dmaphop::create_hop Ops for the sequential chain (in reverse)
-            SmallVector<Value, 4> hops;
-            // First hop: Last core -> SHIM
-            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps.back(), shimPortIn).getResult());
-            // Subsequent hops: Core i -> Core i+1
-            for (int i = corePortsOutOps.size() - 2; i >= 0; --i) {
-                hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i]).getResult());
-            }
-
-            // 4. Create dmaphop::create_path Op
-            auto path = rewriter.create<dmaphop::create_path>(loc, hops, rewriter.getArrayAttr({}), rewriter.getArrayAttr({SymbolRefAttr::get(rewriter.getContext(), "shimPortIn")}));
-
-            // 5. Allocate buffers
-            auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
-            Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
-            mlir::Value inputMemRef = rewriter.create<mlir::memref::AllocOp>(loc, memrefType);
-
-            SmallVector<Value, 4> coreBuffers;
-            for (auto coreTile : coreTiles) {
-                coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, memrefType, coreTile.getResult(), inputMemRef).getResult());
-            }
-
-            // 6. Create dmaphop::pull and sync
-            rewriter.create<dmaphop::pull>(loc, ddrBuffer, path, coreBuffers, corePortsInValues);
-            rewriter.create<dmaphop::sync>(loc, path);
-
-            // 7. Deallocate
-            for (auto buffer : coreBuffers) {
-                rewriter.create<dmaphop::dealloc_buffer>(loc, buffer);
-            }
-            rewriter.create<memref::DeallocOp>(loc, ddrBuffer);
-
-        } else {
-            return op.emitError("unsupported stream type for pull lowering. Expected dmap.createstream");
-        }
-
-        rewriter.eraseOp(op);
-        return success();
+        return lowerDataMovementOp(op, rewriter, router_, DataflowDirection::Pull);
     }
 private:
     RoutingTopology &router_;
