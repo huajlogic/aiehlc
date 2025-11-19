@@ -86,29 +86,39 @@ struct PushOpLowering : public OpConversionPattern<dmap::push> {
                 coreTiles.push_back(rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("core"), rewriter.getI64IntegerAttr(col), rewriter.getI64IntegerAttr(row)));
             }
 
-            // 2. Create dmaphop::port Ops
+            // 2. Create dmaphop::port Ops for the daisy chain
             auto shimPortOut = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr("shimPortOut"), rewriter.getI64IntegerAttr(0));
             auto memPortIn = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("In"), rewriter.getStringAttr("memPortIn"), rewriter.getI64IntegerAttr(0));
             auto memPortOut = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr("memPortOut"), rewriter.getI64IntegerAttr(0));
 
-            SmallVector<dmaphop::port, 4> corePortsInOps;
             SmallVector<Value, 4> corePortsInValues;
             SmallVector<Attribute, 4> consumerPortSymbols;
+            SmallVector<dmaphop::port, 4> corePortsOutOps;
+
             for (const auto &it : llvm::enumerate(coreTiles)) {
-                std::string portName = "corePortIn" + std::to_string(it.index());
-                auto portOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("In"), rewriter.getStringAttr(portName), rewriter.getI64IntegerAttr(0));
-                corePortsInOps.push_back(portOp);
-                corePortsInValues.push_back(portOp.getResult());
-                consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), portName));
+                std::string inPortName = "corePortIn" + std::to_string(it.index());
+                auto portInOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("In"), rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0));
+                corePortsInValues.push_back(portInOp.getResult());
+                consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), inPortName));
+
+                // Each core except the last one also needs an Out port
+                if (it.index() < coreTiles.size() - 1) {
+                    std::string outPortName = "corePortOut" + std::to_string(it.index());
+                    auto portOutOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("Out"), rewriter.getStringAttr(outPortName), rewriter.getI64IntegerAttr(0));
+                    corePortsOutOps.push_back(portOutOp);
+                }
             }
 
-            // 3. Create dmaphop::create_hop Ops
-            auto hop1 = rewriter.create<dmaphop::create_hop>(loc, shimPortOut, memPortIn);
-            
+            // 3. Create dmaphop::create_hop Ops for the sequential chain
             SmallVector<Value, 4> hops;
-            hops.push_back(hop1.getResult());
-            for(auto corePort : corePortsInOps) {
-                hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, corePort).getResult());
+            // First hop: SHIM -> MEM
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, memPortIn).getResult());
+            // Second hop: MEM -> Core 0
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, corePortsInValues[0]).getResult());
+
+            // Subsequent hops: Core i -> Core i+1
+            for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
+                hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i+1]).getResult());
             }
 
             // 4. Create dmaphop::create_path Op
@@ -117,11 +127,11 @@ struct PushOpLowering : public OpConversionPattern<dmap::push> {
             // 5. Allocate buffers
             auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
             Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
+            Value coreBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
 
             SmallVector<Value, 4> coreBuffers;
             for (auto coreTile : coreTiles) {
-                // The result type (memrefType) must be the first argument, followed by operands.
-                coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, memrefType, coreTile.getResult()).getResult());
+                coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, memrefType, coreTile.getResult(), coreBuffer).getResult());
             }
 
             // 6. Create dmaphop::push and sync
@@ -153,24 +163,35 @@ struct PushOpLowering : public OpConversionPattern<dmap::push> {
                 coreTiles.push_back(rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("core"), rewriter.getI64IntegerAttr(col), rewriter.getI64IntegerAttr(row)));
             }
 
-            // 2. Create dmaphop::port Ops
+            // 2. Create dmaphop::port Ops for the daisy chain
             auto shimPortOut = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr("shimPortOut"), rewriter.getI64IntegerAttr(0));
 
-            SmallVector<dmaphop::port, 4> corePortsInOps;
             SmallVector<Value, 4> corePortsInValues;
             SmallVector<Attribute, 4> consumerPortSymbols;
+            SmallVector<dmaphop::port, 4> corePortsOutOps;
+
             for (const auto &it : llvm::enumerate(coreTiles)) {
-                std::string portName = "corePortIn" + std::to_string(it.index());
-                auto portOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("In"), rewriter.getStringAttr(portName), rewriter.getI64IntegerAttr(0));
-                corePortsInOps.push_back(portOp);
-                corePortsInValues.push_back(portOp.getResult());
-                consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), portName));
+                std::string inPortName = "corePortIn" + std::to_string(it.index());
+                auto portInOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("In"), rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0));
+                corePortsInValues.push_back(portInOp.getResult());
+                consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), inPortName));
+
+                // Each core except the last one also needs an Out port
+                if (it.index() < coreTiles.size() - 1) {
+                    std::string outPortName = "corePortOut" + std::to_string(it.index());
+                    auto portOutOp = rewriter.create<dmaphop::port>(loc, it.value(), rewriter.getStringAttr("Out"), rewriter.getStringAttr(outPortName), rewriter.getI64IntegerAttr(0));
+                    corePortsOutOps.push_back(portOutOp);
+                }
             }
 
-            // 3. Create dmaphop::create_hop Ops
+            // 3. Create dmaphop::create_hop Ops for the sequential chain
             SmallVector<Value, 4> hops;
-            for(auto corePort : corePortsInOps) {
-                hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, corePort).getResult());
+            // First hop: SHIM -> Core 0
+            hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, corePortsInValues[0]).getResult());
+
+            // Subsequent hops: Core i -> Core i+1
+            for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
+                hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i+1]).getResult());
             }
 
             // 4. Create dmaphop::create_path Op
@@ -178,12 +199,11 @@ struct PushOpLowering : public OpConversionPattern<dmap::push> {
 
             // 5. Allocate buffers
             auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
-            mlir::Value inputMemRef = rewriter.create<mlir::memref::AllocOp>(loc, memrefType);
             Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
+            mlir::Value inputMemRef = rewriter.create<mlir::memref::AllocOp>(loc, memrefType);
 
             SmallVector<Value, 4> coreBuffers;
             for (auto coreTile : coreTiles) {
-                // The result type (memrefType) must be the first argument, followed by operands.
                 coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, memrefType, coreTile.getResult(),inputMemRef).getResult());
             }
 
