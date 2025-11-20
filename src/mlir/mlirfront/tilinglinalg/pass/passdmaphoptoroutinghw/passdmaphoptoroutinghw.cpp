@@ -141,9 +141,33 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         auto loc = op.getLoc();
         auto output = rewriter.getI32Type();
         
-        // Extract tiles from the hops in this specific path
+        // Get consumers attribute to determine which tiles should output to DMA
+        llvm::DenseSet<Value> consumerPorts;
+        if (auto consumersAttr = op->getAttrOfType<ArrayAttr>("consumers")) {
+            for (auto consumerGroup : consumersAttr) {
+                if (auto groupArray = dyn_cast<ArrayAttr>(consumerGroup)) {
+                    for (auto symRef : groupArray) {
+                        if (auto symRefAttr = dyn_cast<FlatSymbolRefAttr>(symRef)) {
+                            // Find the port with this symbol name in the parent function
+                            auto parentFunc = op->getParentOfType<func::FuncOp>();
+                            if (parentFunc) {
+                                parentFunc.walk([&](dmaphop::port portOp) {
+                                    auto symName = portOp.getSymName();
+                                    if (!symName.empty() && symName == symRefAttr.getValue()) {
+                                        consumerPorts.insert(portOp.getResult());
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Extract tiles and track which tiles have consumer ports
         std::vector<Value> tilesInPath;
         llvm::DenseSet<Value> seenTiles;
+        llvm::DenseMap<Value, bool> tileHasConsumer;  // Map tile -> has consumer port
         
         for (auto hopValue : adaptor.getHops()) {
             if (auto hopOp = hopValue.getDefiningOp<dmaphop::create_hop>()) {
@@ -168,6 +192,10 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                     if (!seenTiles.contains(dstTile)) {
                         tilesInPath.push_back(dstTile);
                         seenTiles.insert(dstTile);
+                    }
+                    // Mark this tile as having a consumer if destination port is a consumer
+                    if (consumerPorts.contains(dstPort)) {
+                        tileHasConsumer[dstTile] = true;
                     }
                 }
             }
@@ -202,32 +230,58 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             // Skip shim tiles for stream switch connections
             if (tileInfoIt->second.tileType != "core") continue;
             
-            // Determine port directions based on position in chain
+            // Determine if this tile is a consumer
+            bool isConsumer = tileHasConsumer.count(tileValue) && tileHasConsumer[tileValue];
+            
+            // Determine port directions for routing (always create routing connection)
             std::string slaveDirection;
             std::string masterDirection;
             
             if (i == 0) {
                 // First tile: no slave input, forward to next tile
                 slaveDirection = "NONE";
-                masterDirection = (hwTileOps.size() > 1) ? "EAST" : "NONE";
+                masterDirection = (i < hwTileOps.size() - 1) ? "EAST" : "NONE";
             } else if (i == hwTileOps.size() - 1) {
-                // Last tile (consumer): receive from previous, output to DMA
+                // Last tile: receive from previous, no forward
                 slaveDirection = "WEST";
-                masterDirection = "DMA";
+                masterDirection = "NONE";
             } else {
                 // Middle tiles: receive from WEST, forward to EAST
                 slaveDirection = "WEST";
                 masterDirection = "EAST";
             }
             
-            rewriter.create<routinghw::ConnectStreamSingleSwitchPort>(
-                loc, output,
-                tileOp->getResult(0),
-                rewriter.getStringAttr(slaveDirection),
-                rewriter.getI32IntegerAttr(0),  // slaveportidx
-                rewriter.getStringAttr(masterDirection),
-                rewriter.getI32IntegerAttr(0)   // masterportidx
-            );
+            // Create routing stream switch connection
+            if (masterDirection != "NONE" || slaveDirection != "NONE") {
+                rewriter.create<routinghw::ConnectStreamSingleSwitchPort>(
+                    loc, output,
+                    tileOp->getResult(0),
+                    rewriter.getStringAttr(slaveDirection),
+                    rewriter.getI32IntegerAttr(0),  // slaveportidx
+                    rewriter.getStringAttr(masterDirection),
+                    rewriter.getI32IntegerAttr(0)   // masterportidx
+                );
+            }
+            
+            // If this tile is a consumer, create ADDITIONAL DMA connection
+            if (isConsumer) {
+                // Determine the slave direction for DMA connection (where data comes from)
+                std::string dmaSlaveDirection;
+                if (i == 0) {
+                    dmaSlaveDirection = "SOUTH";  // First tile gets from shim
+                } else {
+                    dmaSlaveDirection = "WEST";  // Others get from previous tile
+                }
+                
+                rewriter.create<routinghw::ConnectStreamSingleSwitchPort>(
+                    loc, output,
+                    tileOp->getResult(0),
+                    rewriter.getStringAttr(dmaSlaveDirection),
+                    rewriter.getI32IntegerAttr(0),  // slaveportidx
+                    rewriter.getStringAttr("DMA"),
+                    rewriter.getI32IntegerAttr(2)   // masterportidx (DMA channel 2)
+                );
+            }
         }
         
         // Erase the path operation
