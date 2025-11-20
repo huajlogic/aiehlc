@@ -178,11 +178,6 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             return success();
         }
         
-        // Create tile array handle for this specific path
-        //auto tileArrayHandle = rewriter.create<routinghw::TileArrayHandleCreate>(
-        //    loc, output, rewriter.getStringAttr("array handle")
-        //);
-        
         // Create routinghw tile operations for tiles in this path
         std::vector<Operation*> hwTileOps;
         
@@ -191,29 +186,8 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             if (tileInfoIt == routingCtx.tileMap.end()) continue;
             
             const TileInfo& info = tileInfoIt->second;
-            Operation* hwTileOp = nullptr;
-            
-            if (info.tileType == "shim") {
-                hwTileOp = rewriter.create<routinghw::IOShimTileCreate>(
-                    loc, output,
-                    rewriter.getI32IntegerAttr(info.row),
-                    rewriter.getI32IntegerAttr(info.col),
-                    rewriter.getI32IntegerAttr(info.col),
-                    rewriter.getStringAttr("shim_dma"),
-                    rewriter.getI32IntegerAttr(0),
-                    rewriter.getI32IntegerAttr(0)
-                );
-            } else if (info.tileType == "core") {
-                hwTileOp = rewriter.create<routinghw::TileCreate>(
-                    loc, output,
-                    rewriter.getI32IntegerAttr(info.row),
-                    rewriter.getI32IntegerAttr(info.col),
-                    rewriter.getStringAttr("core_tile")
-                );
-            }
-            
-            if (hwTileOp) {
-                hwTileOps.push_back(hwTileOp);
+            if (info.tileOp) {
+                hwTileOps.push_back(info.tileOp);
             }
         }
         
