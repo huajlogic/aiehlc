@@ -144,21 +144,17 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         // Get consumers attribute to determine which tiles should output to DMA
         llvm::DenseSet<Value> consumerPorts;
         if (auto consumersAttr = op->getAttrOfType<ArrayAttr>("consumers")) {
-            for (auto consumerGroup : consumersAttr) {
-                if (auto groupArray = dyn_cast<ArrayAttr>(consumerGroup)) {
-                    for (auto symRef : groupArray) {
-                        if (auto symRefAttr = dyn_cast<FlatSymbolRefAttr>(symRef)) {
-                            // Find the port with this symbol name in the parent function
-                            auto parentFunc = op->getParentOfType<func::FuncOp>();
-                            if (parentFunc) {
-                                parentFunc.walk([&](dmaphop::port portOp) {
-                                    auto symName = portOp.getSymName();
-                                    if (!symName.empty() && symName == symRefAttr.getValue()) {
-                                        consumerPorts.insert(portOp.getResult());
-                                    }
-                                });
+            for (auto symRef : consumersAttr) {
+                if (auto symRefAttr = dyn_cast<FlatSymbolRefAttr>(symRef)) {
+                    // Find the port with this symbol name in the parent function
+                    auto parentFunc = op->getParentOfType<func::FuncOp>();
+                    if (parentFunc) {
+                        parentFunc.walk([&](dmaphop::port portOp) {
+                            auto symName = portOp.getSymName();
+                            if (!symName.empty() && symName == symRefAttr.getValue()) {
+                                consumerPorts.insert(portOp.getResult());
                             }
-                        }
+                        });
                     }
                 }
             }

@@ -156,9 +156,13 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     }
 
     // --- 4. Create path, buffers, and final data movement op ---
+    //ArrayAttr consumeArray = rewriter.getArrayAttr(consumerPortSymbols);
+    mlir::MLIRContext *ctx = rewriter.getContext();
+    ArrayAttr produceArray = rewriter.getArrayAttr(producerPortSymbols);
+    mlir::ArrayAttr consumeArray = mlir::ArrayAttr::get(ctx, consumerPortSymbols);
     auto path = (direction == DataflowDirection::Push)
-        ? rewriter.create<dmaphop::create_path>(loc, hops, rewriter.getArrayAttr(consumerPortSymbols), rewriter.getArrayAttr(producerPortSymbols))
-        : rewriter.create<dmaphop::create_path>(loc, hops, rewriter.getArrayAttr(producerPortSymbols), rewriter.getArrayAttr({}));
+        ? rewriter.create<dmaphop::create_path>(loc, hops, consumeArray, rewriter.getArrayAttr({}))/*produceArray)*/
+        : rewriter.create<dmaphop::create_path>(loc, hops, produceArray, rewriter.getArrayAttr({}));
 
     auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
     Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
