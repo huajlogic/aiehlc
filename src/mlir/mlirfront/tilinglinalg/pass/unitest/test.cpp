@@ -9,6 +9,7 @@
 #include "routinglower.h"
 #include "../passroutingtodmap/routingtodmap.h"
 #include "../passdmaptodmaphop/dmaptodmaphop.h"
+#include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
 #include "routingunrolling.h"
 #include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 //#include "llvm/IR/IRPrintingPasses.h"
@@ -100,10 +101,10 @@ void routingtodmap() {
      MLIRContext ctx;
     
     routingmanager mtest;
-    //routinghwmanager mtesthw;
+    routinghwmanager mtesthw;
     dmapmanager mdmaptest;
     dmaphopmanager dmaphoptest;
-    //mtesthw.loaddialect(&ctx);
+    mtesthw.loaddialect(&ctx);
     mtest.loaddialect(&ctx);
     mdmaptest.loaddialect(&ctx);
     dmaphoptest.loaddialect(&ctx);
@@ -127,9 +128,12 @@ void routingtodmap() {
     options.label = "After RoutingToDmapPass:";
     pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingToDmapPass>(rtopology));
-    options.label = "After DmapToDmaphopPass 2:";
+    options.label = "After DmapToDmaphopPass:";
     pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<DmapToDmaphopPass>(rtopology));
+    options.label = "After DmaphopToRoutinghwPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    pm.addPass(std::make_unique<DmaphopToRoutinghwPass>(rtopology));
     
     //into
     /*
