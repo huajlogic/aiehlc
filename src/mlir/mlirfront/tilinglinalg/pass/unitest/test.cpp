@@ -166,7 +166,7 @@ void routingtodmap() {
     return;
 }
 int main(int argc, char* argv[]) {
-    //routingtoroutinghw();
-    routingtodmap();
+    routingtoroutinghw();
+    //routingtodmap();
     return 0;
 }

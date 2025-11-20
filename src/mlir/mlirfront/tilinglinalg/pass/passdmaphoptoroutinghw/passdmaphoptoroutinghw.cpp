@@ -10,6 +10,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "routinghwmanager.h"
 #include "routingmanager.h"
 #include "routing/routingpath.h"
@@ -55,7 +56,7 @@ struct DmaphopTileConversionPattern : public OpConversionPattern<dmaphop::tile> 
             routingCtx.tileArrayHandle = rewriter.create<routinghw::TileArrayHandleCreate>(
                 loc, output, rewriter.getStringAttr("array handle")
             );
-        }
+        };
 
         // Extract tile attributes
         std::string tileType = op.getTiletype().str();
@@ -141,45 +142,114 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         auto loc = op.getLoc();
         auto output = rewriter.getI32Type();
         
-        // Analyze the path and create appropriate stream switch connections
-        auto hops = adaptor.getHops();
+        // Extract tiles from the hops in this specific path
+        std::vector<Value> tilesInPath;
+        llvm::DenseSet<Value> seenTiles;
         
-        // For each core tile in the path, create packet stream switch port connections
-        for (size_t i = 0; i < routingCtx.orderedTileOps.size(); ++i) {
-            auto tileOp = routingCtx.orderedTileOps[i];
-            
-            // Determine port directions based on position in chain
-            std::string slaveDirection = (i == 0) ? "NONE" : "WEST";
-            std::string masterDirection = (i == routingCtx.orderedTileOps.size() - 1) ? "NONE" : "EAST";
-            
-            // Skip shim tiles for packet routing
-            bool isCoreTile = false;
-            for (const auto& entry : routingCtx.tileMap) {
-                if (entry.second.tileOp == tileOp && entry.second.tileType == "core") {
-                    isCoreTile = true;
-                    break;
+        for (auto hopValue : adaptor.getHops()) {
+            if (auto hopOp = hopValue.getDefiningOp<dmaphop::create_hop>()) {
+                // Get source and destination ports
+                Value srcPort = hopOp.getSource();
+                Value dstPort = hopOp.getDestination();
+                
+                // Get the tiles for these ports
+                auto srcPortOp = srcPort.getDefiningOp<dmaphop::port>();
+                auto dstPortOp = dstPort.getDefiningOp<dmaphop::port>();
+                
+                if (srcPortOp) {
+                    Value srcTile = srcPortOp.getTile();
+                    if (!seenTiles.contains(srcTile)) {
+                        tilesInPath.push_back(srcTile);
+                        seenTiles.insert(srcTile);
+                    }
                 }
-            }
-            
-            if (isCoreTile) {
-                rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
-                    loc,
-                    output,
-                    tileOp->getResult(0),
-                    rewriter.getStringAttr(slaveDirection),
-                    rewriter.getI32IntegerAttr(0),  // receiveslaveportidx
-                    rewriter.getI32IntegerAttr(0),  // receiveslavepktid (0 = forward all)
-                    rewriter.getI32IntegerAttr(0),  // receiveslavepkttype
-                    rewriter.getStringAttr("DMA"),  // localdmadirection
-                    rewriter.getI32IntegerAttr(0),  // localdmaportidx
-                    rewriter.getI32IntegerAttr(routingCtx.pktId++),  // localdmapktid
-                    rewriter.getI32IntegerAttr(0),  // localdmapkttype
-                    rewriter.getStringAttr(masterDirection),  // forwardmasterdirection
-                    rewriter.getI32IntegerAttr(0)   // forwardmasterportidx
-                );
+                
+                if (dstPortOp) {
+                    Value dstTile = dstPortOp.getTile();
+                    if (!seenTiles.contains(dstTile)) {
+                        tilesInPath.push_back(dstTile);
+                        seenTiles.insert(dstTile);
+                    }
+                }
             }
         }
         
+        if (tilesInPath.empty()) {
+            rewriter.eraseOp(op);
+            return success();
+        }
+        
+        // Create tile array handle for this specific path
+        auto tileArrayHandle = rewriter.create<routinghw::TileArrayHandleCreate>(
+            loc, output, rewriter.getStringAttr("array handle")
+        );
+        
+        // Create routinghw tile operations for tiles in this path
+        std::vector<Operation*> hwTileOps;
+        
+        for (auto tileValue : tilesInPath) {
+            auto tileInfoIt = routingCtx.tileMap.find(tileValue);
+            if (tileInfoIt == routingCtx.tileMap.end()) continue;
+            
+            const TileInfo& info = tileInfoIt->second;
+            Operation* hwTileOp = nullptr;
+            
+            if (info.tileType == "shim") {
+                hwTileOp = rewriter.create<routinghw::IOShimTileCreate>(
+                    loc, output,
+                    rewriter.getI32IntegerAttr(info.row),
+                    rewriter.getI32IntegerAttr(info.col),
+                    rewriter.getI32IntegerAttr(info.col),
+                    rewriter.getStringAttr("shim_dma"),
+                    rewriter.getI32IntegerAttr(0),
+                    rewriter.getI32IntegerAttr(0)
+                );
+            } else if (info.tileType == "core") {
+                hwTileOp = rewriter.create<routinghw::TileCreate>(
+                    loc, output,
+                    tileArrayHandle.getResult(),
+                    rewriter.getI32IntegerAttr(info.row),
+                    rewriter.getI32IntegerAttr(info.col),
+                    rewriter.getStringAttr("core_tile")
+                );
+            }
+            
+            if (hwTileOp) {
+                hwTileOps.push_back(hwTileOp);
+            }
+        }
+        
+        // Create packet stream switch connections for core tiles in this path
+        for (size_t i = 0; i < hwTileOps.size(); ++i) {
+            auto tileOp = hwTileOps[i];
+            Value tileValue = tilesInPath[i];
+            
+            auto tileInfoIt = routingCtx.tileMap.find(tileValue);
+            if (tileInfoIt == routingCtx.tileMap.end()) continue;
+            
+            // Skip shim tiles for packet routing
+            if (tileInfoIt->second.tileType != "core") continue;
+            
+            // Determine port directions based on position in chain
+            std::string slaveDirection = (i == 0) ? "NONE" : "WEST";
+            std::string masterDirection = (i == hwTileOps.size() - 1) ? "NONE" : "EAST";
+            
+            rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
+                loc, output,
+                tileOp->getResult(0),
+                rewriter.getStringAttr(slaveDirection),
+                rewriter.getI32IntegerAttr(0),  // receiveslaveportidx
+                rewriter.getI32IntegerAttr(0),  // receiveslavepktid (0 = forward all)
+                rewriter.getI32IntegerAttr(0),  // receiveslavepkttype
+                rewriter.getStringAttr("DMA"),  // localdmadirection
+                rewriter.getI32IntegerAttr(0),  // localdmaportidx
+                rewriter.getI32IntegerAttr(routingCtx.pktId++),  // localdmapktid
+                rewriter.getI32IntegerAttr(0),  // localdmapkttype
+                rewriter.getStringAttr(masterDirection),  // forwardmasterdirection
+                rewriter.getI32IntegerAttr(0)   // forwardmasterportidx
+            );
+        }
+        routingCtx.tileArrayHandle = nullptr;
         // Erase the path operation
         rewriter.eraseOp(op);
         return success();
