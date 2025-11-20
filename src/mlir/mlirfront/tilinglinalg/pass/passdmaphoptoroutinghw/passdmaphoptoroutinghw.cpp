@@ -191,7 +191,7 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             }
         }
         
-        // Create packet stream switch connections for core tiles in this path
+        // Create stream switch connections for tiles in this path
         for (size_t i = 0; i < hwTileOps.size(); ++i) {
             auto tileOp = hwTileOps[i];
             Value tileValue = tilesInPath[i];
@@ -199,29 +199,37 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             auto tileInfoIt = routingCtx.tileMap.find(tileValue);
             if (tileInfoIt == routingCtx.tileMap.end()) continue;
             
-            // Skip shim tiles for packet routing
+            // Skip shim tiles for stream switch connections
             if (tileInfoIt->second.tileType != "core") continue;
             
             // Determine port directions based on position in chain
-            std::string slaveDirection = (i == 0) ? "NONE" : "WEST";
-            std::string masterDirection = (i == hwTileOps.size() - 1) ? "NONE" : "EAST";
+            std::string slaveDirection;
+            std::string masterDirection;
             
-            rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
+            if (i == 0) {
+                // First tile: no slave input, forward to next tile
+                slaveDirection = "NONE";
+                masterDirection = (hwTileOps.size() > 1) ? "EAST" : "NONE";
+            } else if (i == hwTileOps.size() - 1) {
+                // Last tile (consumer): receive from previous, output to DMA
+                slaveDirection = "WEST";
+                masterDirection = "DMA";
+            } else {
+                // Middle tiles: receive from WEST, forward to EAST
+                slaveDirection = "WEST";
+                masterDirection = "EAST";
+            }
+            
+            rewriter.create<routinghw::ConnectStreamSingleSwitchPort>(
                 loc, output,
                 tileOp->getResult(0),
                 rewriter.getStringAttr(slaveDirection),
-                rewriter.getI32IntegerAttr(0),  // receiveslaveportidx
-                rewriter.getI32IntegerAttr(0),  // receiveslavepktid (0 = forward all)
-                rewriter.getI32IntegerAttr(0),  // receiveslavepkttype
-                rewriter.getStringAttr("DMA"),  // localdmadirection
-                rewriter.getI32IntegerAttr(0),  // localdmaportidx
-                rewriter.getI32IntegerAttr(routingCtx.pktId++),  // localdmapktid
-                rewriter.getI32IntegerAttr(0),  // localdmapkttype
-                rewriter.getStringAttr(masterDirection),  // forwardmasterdirection
-                rewriter.getI32IntegerAttr(0)   // forwardmasterportidx
+                rewriter.getI32IntegerAttr(0),  // slaveportidx
+                rewriter.getStringAttr(masterDirection),
+                rewriter.getI32IntegerAttr(0)   // masterportidx
             );
         }
-        //routingCtx.tileArrayHandle = nullptr;
+        
         // Erase the path operation
         rewriter.eraseOp(op);
         return success();
