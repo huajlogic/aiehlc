@@ -33,7 +33,7 @@ struct TileInfo {
 
 // Helper structure to store the routing context
 struct RoutingContext {
-    Operation* tileArrayHandle = nullptr;
+    //Operation* tileArrayHandle = nullptr;
     DenseMap<Value, TileInfo> tileMap;
     DenseMap<Value, Operation*> portToTileOpMap;
     std::vector<Operation*> orderedTileOps;
@@ -52,11 +52,11 @@ struct DmaphopTileConversionPattern : public OpConversionPattern<dmaphop::tile> 
         auto output = rewriter.getI32Type();
         
         // Create tile array handle once
-        if (!routingCtx.tileArrayHandle) {
-            routingCtx.tileArrayHandle = rewriter.create<routinghw::TileArrayHandleCreate>(
-                loc, output, rewriter.getStringAttr("array handle")
-            );
-        };
+        //if (!routingCtx.tileArrayHandle) {
+        //    routingCtx.tileArrayHandle = rewriter.create<routinghw::TileArrayHandleCreate>(
+        //        loc, output, rewriter.getStringAttr("array handle")
+        //    );
+        //};
 
         // Extract tile attributes
         std::string tileType = op.getTiletype().str();
@@ -82,7 +82,6 @@ struct DmaphopTileConversionPattern : public OpConversionPattern<dmaphop::tile> 
             hwTileOp = rewriter.create<routinghw::TileCreate>(
                 loc,
                 output,
-                routingCtx.tileArrayHandle->getResult(0),
                 rewriter.getI32IntegerAttr(row),
                 rewriter.getI32IntegerAttr(col),
                 rewriter.getStringAttr("core_tile")
@@ -180,9 +179,9 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         }
         
         // Create tile array handle for this specific path
-        auto tileArrayHandle = rewriter.create<routinghw::TileArrayHandleCreate>(
-            loc, output, rewriter.getStringAttr("array handle")
-        );
+        //auto tileArrayHandle = rewriter.create<routinghw::TileArrayHandleCreate>(
+        //    loc, output, rewriter.getStringAttr("array handle")
+        //);
         
         // Create routinghw tile operations for tiles in this path
         std::vector<Operation*> hwTileOps;
@@ -207,7 +206,6 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             } else if (info.tileType == "core") {
                 hwTileOp = rewriter.create<routinghw::TileCreate>(
                     loc, output,
-                    tileArrayHandle.getResult(),
                     rewriter.getI32IntegerAttr(info.row),
                     rewriter.getI32IntegerAttr(info.col),
                     rewriter.getStringAttr("core_tile")
@@ -249,7 +247,7 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                 rewriter.getI32IntegerAttr(0)   // forwardmasterportidx
             );
         }
-        routingCtx.tileArrayHandle = nullptr;
+        //routingCtx.tileArrayHandle = nullptr;
         // Erase the path operation
         rewriter.eraseOp(op);
         return success();
