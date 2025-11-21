@@ -123,7 +123,7 @@ void routingtodmap() {
     RoutingTopology rtopology("Gen2");
     
     options.label = "Before RoutingUnrollingLowerPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
+    //pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
     options.label = "After RoutingToDmapPass:";
     pm.addPass(mlir::createPrintIRPass(options));
@@ -142,12 +142,12 @@ void routingtodmap() {
     pm.addPass(std::make_unique<RoutingConstantFoldPass>());
 
     options.label = "After RoutingConstantFoldPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
+    //pm.addPass(mlir::createPrintIRPass(options));
     //remove the dead code
     pm.addPass(mlir::createCanonicalizerPass());
 
     options.label = "After createCanonicalizerPasse:";
-    pm.addPass(mlir::createPrintIRPass(options));
+    //pm.addPass(mlir::createPrintIRPass(options));
 
     //remove dead arg
     //pm.addPass(mlir::createConvertSCFToEmitCPass());

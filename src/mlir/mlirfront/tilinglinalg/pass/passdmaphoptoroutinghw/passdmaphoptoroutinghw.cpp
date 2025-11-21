@@ -28,6 +28,7 @@ struct TileInfo {
     Operation* tileOp;
     int col;
     int row;
+    int channel;
     std::string tileType; // "shim" or "core"
 };
 
@@ -93,6 +94,7 @@ struct DmaphopTileConversionPattern : public OpConversionPattern<dmaphop::tile> 
         info.tileOp = hwTileOp;
         info.col = col;
         info.row = row;
+        info.channel = 0;
         info.tileType = tileType;
         routingCtx.tileMap[op.getResult()] = info;
         routingCtx.orderedTileOps.push_back(hwTileOp);

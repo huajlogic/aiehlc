@@ -90,51 +90,6 @@ module {
   }
 }
 main
-// -----// IR Dump Before RoutingUnrollingLowerPass: //----- //
-module {
-  func.func @main() {
-    %0 = routing.routingcreatehwmesh {col = 4 : i64, row = 4 : i64} -> i32
-    %1 = routing.routingcreatedummytensor {dim = 2 : i64, shape = [10, 20]} -> i32
-    scf.execute_region {
-      %2 = routing.partitionmesh mesh = %0 : i32 {splitaxis = "row", splitnum = 4 : i32} -> i32
-      %3 = routing.partitiontensor tensor = %1 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
-      %c0 = arith.constant 0 : index
-      %c4 = arith.constant 4 : index
-      %c1 = arith.constant 1 : index
-      scf.for %arg0 = %c0 to %c4 step %c1 {
-        %4 = arith.index_cast %arg0 : index to i32
-        %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %4 : i32) -> i32{
-        ^bb0(%arg1: i32):
-          %6 = routing.routingextract_data %3, %arg1 : i32, i32 -> i32
-          %7 = routing.routingextract_tiles %2, %arg1 : i32, i32 -> i32
-          %8 = routing.routingroutinggatherout tilelist = %7, tensordata = %6 : i32, i32 -> i32
-          %9 = routing.routingcreatehwiowithtarget targettilelist = %7 : i32 {direction = "output", iotype = "mem2"} -> i32
-          %10 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %9 : i32, i32 -> i32
-        }
-      }
-      scf.yield
-    } {routing_memo = "row"}
-    scf.execute_region {
-      %2 = routing.partitionmesh mesh = %0 : i32 {splitaxis = "row", splitnum = 4 : i32} -> i32
-      %3 = routing.partitiontensor tensor = %1 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
-      %c0 = arith.constant 0 : index
-      %c4 = arith.constant 4 : index
-      %c1 = arith.constant 1 : index
-      scf.for %arg0 = %c0 to %c4 step %c1 {
-        %4 = arith.index_cast %arg0 : index to i32
-        %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %4 : i32) -> i32{
-        ^bb0(%arg1: i32):
-          %6 = routing.routingextract_data %3, %arg1 : i32, i32 -> i32
-          %7 = routing.routingextract_tiles %2, %arg1 : i32, i32 -> i32
-          %8 = routing.routingcreatehwiowithtarget targettilelist = %7 : i32 {direction = "input", iotype = "mem2"} -> i32
-          %9 = routing.routingmovedatabyio gatherout_tensorin = %6, hwiowithtarget = %8 : i32, i32 -> i32
-        }
-      }
-      scf.yield
-    } {routing_memo = "row"}
-    return
-  }
-}
 // -----// IR Dump After RoutingToDmapPass: //----- //
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
   func.func @main() {
@@ -217,7 +172,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
     return
   }
 }
-// -----// IR Dump After DmapToDmaphopPass 2: //----- //
+// -----// IR Dump After DmapToDmaphopPass: //----- //
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
   func.func @main() {
     %c3_i32 = arith.constant 3 : i32
@@ -324,7 +279,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
     return
   }
 }
-// -----// IR Dump After RoutingConstantFoldPass: //----- //
+// -----// IR Dump After DmaphopToRoutinghwPass: //----- //
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
   func.func @main() {
     %c3_i32 = arith.constant 3 : i32
@@ -332,629 +287,318 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
     %0 = routing.routingcreatedummytensor {dim = 2 : i64, shape = [10, 20]} -> i32
-    %1 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
-    %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 0, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 1} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 1} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 1} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 1} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 1, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 2} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 2} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 2} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 2} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %6 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
-    %7 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 4, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 1} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 1} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 1} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 1} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %8 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 5, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 2} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 2} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 2} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 2} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %9 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 6, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %10 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 7, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    return
-  }
-}
-// -----// IR Dump After createCanonicalizerPasse: //----- //
-module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
-  func.func @main() {
-    %c3_i32 = arith.constant 3 : i32
-    %c2_i32 = arith.constant 2 : i32
-    %c1_i32 = arith.constant 1 : i32
-    %c0_i32 = arith.constant 0 : i32
-    %0 = routing.routingcreatedummytensor {dim = 2 : i64, shape = [10, 20]} -> i32
-    %1 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
-    %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 0, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 1} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 1} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 1} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 1} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 1, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 2} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 2} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 2} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 2} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %6 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
-    %7 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 4, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 1} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 1} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 1} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 1} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %8 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 5, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 2} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 2} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 2} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 2} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %9 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 6, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
-    %10 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 7, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
-    }
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
+        %7 = dmaphop.tile{TILETYPE = "shim", col = 0, row = 0} -> !dmaphop.tile
+        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
+        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
+        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
+        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
+        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
+        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
+        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
+        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
+        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
+        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
+        %22 = dmaphop.create_hop %21 -> %9 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %18 -> %17 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %15 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %12 -> %11 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
+        %alloc = memref.alloc() : memref<1024xf32>
+        %alloc_0 = memref.alloc() : memref<1024xf32>
+        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        dmaphop.pull %alloc from %26 input(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+        dmaphop.dealloc_buffer %27 : memref<1024xf32>
+        dmaphop.dealloc_buffer %28 : memref<1024xf32>
+        dmaphop.dealloc_buffer %29 : memref<1024xf32>
+        dmaphop.dealloc_buffer %30 : memref<1024xf32>
+        memref.dealloc %alloc : memref<1024xf32>
+        memref.dealloc %alloc_0 : memref<1024xf32>
+      }
+      %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
+        %7 = dmaphop.tile{TILETYPE = "shim", col = 1, row = 0} -> !dmaphop.tile
+        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
+        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
+        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
+        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
+        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
+        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
+        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
+        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
+        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
+        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
+        %22 = dmaphop.create_hop %21 -> %9 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %18 -> %17 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %15 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %12 -> %11 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
+        %alloc = memref.alloc() : memref<1024xf32>
+        %alloc_0 = memref.alloc() : memref<1024xf32>
+        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        dmaphop.pull %alloc from %26 input(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+        dmaphop.dealloc_buffer %27 : memref<1024xf32>
+        dmaphop.dealloc_buffer %28 : memref<1024xf32>
+        dmaphop.dealloc_buffer %29 : memref<1024xf32>
+        dmaphop.dealloc_buffer %30 : memref<1024xf32>
+        memref.dealloc %alloc : memref<1024xf32>
+        memref.dealloc %alloc_0 : memref<1024xf32>
+      }
+      %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
+        %7 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
+        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
+        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 5} -> !dmaphop.tile
+        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
+        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 5} -> !dmaphop.tile
+        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
+        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 5} -> !dmaphop.tile
+        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
+        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 5} -> !dmaphop.tile
+        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
+        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
+        %22 = dmaphop.create_hop %21 -> %9 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %18 -> %17 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %15 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %12 -> %11 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
+        %alloc = memref.alloc() : memref<1024xf32>
+        %alloc_0 = memref.alloc() : memref<1024xf32>
+        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        dmaphop.pull %alloc from %26 input(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+        dmaphop.dealloc_buffer %27 : memref<1024xf32>
+        dmaphop.dealloc_buffer %28 : memref<1024xf32>
+        dmaphop.dealloc_buffer %29 : memref<1024xf32>
+        dmaphop.dealloc_buffer %30 : memref<1024xf32>
+        memref.dealloc %alloc : memref<1024xf32>
+        memref.dealloc %alloc_0 : memref<1024xf32>
+      }
+      %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
+        %7 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
+        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
+        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 6} -> !dmaphop.tile
+        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
+        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 6} -> !dmaphop.tile
+        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
+        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 6} -> !dmaphop.tile
+        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
+        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
+        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
+        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
+        %22 = dmaphop.create_hop %21 -> %9 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %18 -> %17 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %15 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %12 -> %11 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
+        %alloc = memref.alloc() : memref<1024xf32>
+        %alloc_0 = memref.alloc() : memref<1024xf32>
+        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        dmaphop.pull %alloc from %26 input(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+        dmaphop.dealloc_buffer %27 : memref<1024xf32>
+        dmaphop.dealloc_buffer %28 : memref<1024xf32>
+        dmaphop.dealloc_buffer %29 : memref<1024xf32>
+        dmaphop.dealloc_buffer %30 : memref<1024xf32>
+        memref.dealloc %alloc : memref<1024xf32>
+        memref.dealloc %alloc_0 : memref<1024xf32>
+      }
+      scf.yield
+    } {routing_memo = "row"}
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
+        %7 = dmaphop.tile{TILETYPE = "shim", col = 4, row = 0} -> !dmaphop.tile
+        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
+        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
+        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
+        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
+        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
+        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
+        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
+        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
+        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
+        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
+        %22 = dmaphop.create_hop %8 -> %11 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %18 -> %20 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        %alloc = memref.alloc() : memref<1024xf32>
+        %alloc_0 = memref.alloc() : memref<1024xf32>
+        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        dmaphop.push %alloc onto %26 outputs(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+        dmaphop.dealloc_buffer %27 : memref<1024xf32>
+        dmaphop.dealloc_buffer %28 : memref<1024xf32>
+        dmaphop.dealloc_buffer %29 : memref<1024xf32>
+        dmaphop.dealloc_buffer %30 : memref<1024xf32>
+        memref.dealloc %alloc : memref<1024xf32>
+        memref.dealloc %alloc_0 : memref<1024xf32>
+      }
+      %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
+        %7 = dmaphop.tile{TILETYPE = "shim", col = 5, row = 0} -> !dmaphop.tile
+        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
+        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
+        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
+        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
+        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
+        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
+        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
+        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
+        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
+        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
+        %22 = dmaphop.create_hop %8 -> %11 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %18 -> %20 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        %alloc = memref.alloc() : memref<1024xf32>
+        %alloc_0 = memref.alloc() : memref<1024xf32>
+        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        dmaphop.push %alloc onto %26 outputs(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+        dmaphop.dealloc_buffer %27 : memref<1024xf32>
+        dmaphop.dealloc_buffer %28 : memref<1024xf32>
+        dmaphop.dealloc_buffer %29 : memref<1024xf32>
+        dmaphop.dealloc_buffer %30 : memref<1024xf32>
+        memref.dealloc %alloc : memref<1024xf32>
+        memref.dealloc %alloc_0 : memref<1024xf32>
+      }
+      %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
+        %7 = dmaphop.tile{TILETYPE = "shim", col = 6, row = 0} -> !dmaphop.tile
+        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
+        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 5} -> !dmaphop.tile
+        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
+        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 5} -> !dmaphop.tile
+        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
+        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 5} -> !dmaphop.tile
+        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
+        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 5} -> !dmaphop.tile
+        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
+        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
+        %22 = dmaphop.create_hop %8 -> %11 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %18 -> %20 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        %alloc = memref.alloc() : memref<1024xf32>
+        %alloc_0 = memref.alloc() : memref<1024xf32>
+        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        dmaphop.push %alloc onto %26 outputs(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+        dmaphop.dealloc_buffer %27 : memref<1024xf32>
+        dmaphop.dealloc_buffer %28 : memref<1024xf32>
+        dmaphop.dealloc_buffer %29 : memref<1024xf32>
+        dmaphop.dealloc_buffer %30 : memref<1024xf32>
+        memref.dealloc %alloc : memref<1024xf32>
+        memref.dealloc %alloc_0 : memref<1024xf32>
+      }
+      %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
+        %7 = dmaphop.tile{TILETYPE = "shim", col = 7, row = 0} -> !dmaphop.tile
+        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
+        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 6} -> !dmaphop.tile
+        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
+        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 6} -> !dmaphop.tile
+        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
+        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 6} -> !dmaphop.tile
+        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
+        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
+        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
+        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
+        %22 = dmaphop.create_hop %8 -> %11 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %18 -> %20 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        %alloc = memref.alloc() : memref<1024xf32>
+        %alloc_0 = memref.alloc() : memref<1024xf32>
+        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
+        dmaphop.push %alloc onto %26 outputs(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+        dmaphop.dealloc_buffer %27 : memref<1024xf32>
+        dmaphop.dealloc_buffer %28 : memref<1024xf32>
+        dmaphop.dealloc_buffer %29 : memref<1024xf32>
+        dmaphop.dealloc_buffer %30 : memref<1024xf32>
+        memref.dealloc %alloc : memref<1024xf32>
+        memref.dealloc %alloc_0 : memref<1024xf32>
+      }
+      scf.yield
+    } {routing_memo = "row"}
     return
   }
 }
@@ -969,307 +613,123 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
     %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
     ^bb0(%arg0: i32):
       %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 0, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 1} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 1} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 1} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 1} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
+      %12 = routinghw.ioshimtilecreate {IOID = 0 : i32, channelused = 0 : i32, col = 0 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
+      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 3 : i32} -> i32
+      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 3 : i32} -> i32
+      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 3 : i32} -> i32
+      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 3 : i32} -> i32
+      %17 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "NONE", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %18 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %20 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
     }
     %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
     ^bb0(%arg0: i32):
       %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 1, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 2} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 2} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 2} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 2} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
+      %12 = routinghw.ioshimtilecreate {IOID = 1 : i32, channelused = 0 : i32, col = 1 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
+      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 4 : i32} -> i32
+      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 4 : i32} -> i32
+      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 4 : i32} -> i32
+      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 4 : i32} -> i32
+      %17 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "NONE", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %18 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %20 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
     }
     %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
     ^bb0(%arg0: i32):
       %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
+      %12 = routinghw.ioshimtilecreate {IOID = 2 : i32, channelused = 0 : i32, col = 2 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
+      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 5 : i32} -> i32
+      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 5 : i32} -> i32
+      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 5 : i32} -> i32
+      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 5 : i32} -> i32
+      %17 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "NONE", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %18 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %20 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
     }
     %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
     ^bb0(%arg0: i32):
       %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %26 -> %14 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %23 -> %22 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %19 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %17 -> %16 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.pull %alloc from %31 input(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
+      %12 = routinghw.ioshimtilecreate {IOID = 3 : i32, channelused = 0 : i32, col = 3 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
+      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 6 : i32} -> i32
+      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 6 : i32} -> i32
+      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 6 : i32} -> i32
+      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 6 : i32} -> i32
+      %17 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "NONE", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %18 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %20 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
     }
     %6 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
     %7 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
     ^bb0(%arg0: i32):
       %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 4, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 1} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 1} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 1} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 1} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
+      %12 = routinghw.ioshimtilecreate {IOID = 4 : i32, channelused = 0 : i32, col = 4 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
+      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 3 : i32} -> i32
+      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 3 : i32} -> i32
+      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 3 : i32} -> i32
+      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 3 : i32} -> i32
+      %17 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %18 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %20 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %22 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
+      %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
     }
     %8 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
     ^bb0(%arg0: i32):
       %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 5, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 2} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 2} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 2} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 2} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
+      %12 = routinghw.ioshimtilecreate {IOID = 5 : i32, channelused = 0 : i32, col = 5 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
+      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 4 : i32} -> i32
+      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 4 : i32} -> i32
+      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 4 : i32} -> i32
+      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 4 : i32} -> i32
+      %17 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %18 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %20 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %22 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
+      %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
     }
     %9 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
     ^bb0(%arg0: i32):
       %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 6, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
+      %12 = routinghw.ioshimtilecreate {IOID = 6 : i32, channelused = 0 : i32, col = 6 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
+      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 5 : i32} -> i32
+      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 5 : i32} -> i32
+      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 5 : i32} -> i32
+      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 5 : i32} -> i32
+      %17 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %18 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %20 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %22 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
+      %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
     }
     %10 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
     ^bb0(%arg0: i32):
       %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = dmaphop.tile{TILETYPE = "shim", col = 7, row = 0} -> !dmaphop.tile
-      %13 = dmaphop.port on %12{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-      %14 = dmaphop.port on %12{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-      %15 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
-      %16 = dmaphop.port on %15{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-      %17 = dmaphop.port on %15{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-      %18 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
-      %19 = dmaphop.port on %18{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-      %20 = dmaphop.port on %18{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-      %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
-      %22 = dmaphop.port on %21{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-      %23 = dmaphop.port on %21{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-      %24 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
-      %25 = dmaphop.port on %24{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-      %26 = dmaphop.port on %24{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-      %27 = dmaphop.create_hop %13 -> %16 -> !dmaphop.hop
-      %28 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
-      %29 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
-      %30 = dmaphop.create_hop %23 -> %25 -> !dmaphop.hop
-      %31 = dmaphop.create_path[%27, %28, %29, %30] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-      %alloc = memref.alloc() : memref<1024xf32>
-      %alloc_0 = memref.alloc() : memref<1024xf32>
-      %32 = dmaphop.alloc_buffer on %15 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %33 = dmaphop.alloc_buffer on %18 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %34 = dmaphop.alloc_buffer on %21 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      %35 = dmaphop.alloc_buffer on %24 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-      dmaphop.push %alloc onto %31 outputs(%32, %33, %34, %35 at %16, %19, %22, %25) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-      dmaphop.sync %31
-      dmaphop.dealloc_buffer %32 : memref<1024xf32>
-      dmaphop.dealloc_buffer %33 : memref<1024xf32>
-      dmaphop.dealloc_buffer %34 : memref<1024xf32>
-      dmaphop.dealloc_buffer %35 : memref<1024xf32>
-      memref.dealloc %alloc : memref<1024xf32>
-      memref.dealloc %alloc_0 : memref<1024xf32>
+      %12 = routinghw.ioshimtilecreate {IOID = 7 : i32, channelused = 0 : i32, col = 7 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
+      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 6 : i32} -> i32
+      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 6 : i32} -> i32
+      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 6 : i32} -> i32
+      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 6 : i32} -> i32
+      %17 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %18 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %20 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
+      %22 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
+      %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
+      %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
     }
     return
   }
