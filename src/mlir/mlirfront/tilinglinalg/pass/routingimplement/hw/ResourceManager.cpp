@@ -137,6 +137,9 @@ std::shared_ptr<DataIO> ResourceMgr::createDataIO(IOType tp, int r, int c, DMADI
             auto shimport = std::make_optional<ShimIOPort>(tp,PortDirection::South,  portnum);
             dataioptr->setshimport(shimport);
         }
+        
+        // Register the shim column and channel to ioId mapping
+        registerShimChannelMapping(c, channel, dataioptr->id());
     }
     return dataioptr;
 }
@@ -538,4 +541,17 @@ bool ResourceMgr::reserveTiles(int ioId, int numTiles, ReservationStrategy strat
     return false;
 }
 
+// Register shim column and channel to ioId mapping
+void ResourceMgr::registerShimChannelMapping(int shimCol, int channel, int ioId) {
+    shimChannelToIoIdMap_[std::make_pair(shimCol, channel)] = ioId;
+}
 
+// Find ioId based on shim column and channel number
+std::optional<int> ResourceMgr::findIoIdByShimChannel(int shimCol, int channel) const {
+    auto key = std::make_pair(shimCol, channel);
+    auto it = shimChannelToIoIdMap_.find(key);
+    if (it != shimChannelToIoIdMap_.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}

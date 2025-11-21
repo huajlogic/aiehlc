@@ -18,12 +18,420 @@
 #include "routing/routingpath.h"
 #include <sstream>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <iostream>
 
 using namespace mlir;
 using namespace dmaphop;
 using namespace routinghw;
 
 namespace {
+
+int ioIdx = 0;
+/*
+// Helper structures from routinglower.cpp - needed for GetSeqPath and ParseTheCCTRoutingPath
+struct StreamCCTConnection {
+    PortDirection SlaveReceiveForwardDirection;
+    int SlaveReceiveForwardDirectionPortIdx;
+    PortDirection localDMAForwardDirection;
+    int localDMAForwardPortIdx;
+    PortDirection MasterSendToNextTileDirection;
+    int MasterSendToNextTileDirectionPortIdx;
+};
+
+struct TileListRoutingMap {
+    std::unordered_map<Point, StreamCCTConnection, Point::Hash> tilemap;
+    std::vector<Point> tilelist;
+};
+
+struct StreamPKTConnection {
+    PortDirection SlaveReceiveForwardDirection;
+    int SlaveReceiveForwardDirectionPortIdx;
+    int SlaveReceivePktID;
+    int SlaveReceivePktType;
+    int localDMAForwardPortIdx;
+    int localDMAForwardPktID;
+    int localDMAForwardPktType;
+    PortDirection MasterSendToNextTileDirection;
+    int MasterSendToNextTileDirectionPortIdx;
+};
+
+struct TileListPktRoutingNode {
+    Point tile;
+    StreamPKTConnection pktconn;
+    Operation* tileOp;
+};
+*/
+// Functions from routinglower.cpp (lines 12-381)
+std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
+                             uint32_t dioid,
+                             Point shimpoint,
+                             std::shared_ptr<DataIO>  dio,
+                             std::optional<std::shared_ptr<const RoutingPath>> rpath, 
+                             std::vector<Point>& tilist,
+                             std::unordered_map<Point, Operation*, Point::Hash> dsttiles,
+                             RoutingTopology & router_,
+                             ConversionPatternRewriter& rewriter) {
+    auto getrowcol =  [] (routinghw::TileCreate& creatileop) -> std::vector<int> {
+            std::vector<int> ret(2,0);
+            if (auto rowAttr = creatileop.getRowAttr()) {
+                ret[0] = rowAttr.getInt();
+            } 
+            if (auto colAttr = creatileop.getColAttr()) {
+                ret[1] = colAttr.getInt();
+            }
+            return ret;
+    };
+
+    if (!rpath || !*rpath || dsttiles.empty()) {
+        return std::nullopt; // Exit if no valid routing path is provided.
+    }
+    TileListPktRoutingNode ret;
+
+    std::vector<Point> pktmergetile;
+    for(auto x: dsttiles) {
+        pktmergetile.push_back(x.first);
+    }
+    std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, pktmergetile[0]});
+    std::ostringstream ostr;
+    ostr << "dio" << ioIdx++;
+    auto diogather = router_.createDataIO(ostr.str(), dstcoreloc, DMADIRECTION::MM2S);
+    int diogetherid = diogather->id();
+    auto rpath2 = router_.createPath(diogetherid, pktmergetile);
+    if (!rpath2) {
+        return std::nullopt;
+    }
+    
+    std::unordered_map<Point, std::vector<int>, Point::Hash> tileMasterPortMapping;
+    std::unordered_map<Point, Operation*, Point::Hash> pathtiles;
+    std::unordered_map<Point, StreamPKTConnection, Point::Hash> pktswitchmap;
+    
+    //parse and set dma and slave master
+    //create empty structure for each dstPoint
+    int pkt_idx = 0;
+    for (const auto& dstPoint : tilist) {
+        pktswitchmap[dstPoint] = StreamPKTConnection{};
+    }
+    //set the local DMA pkt connection
+    for (const auto& dstPoint : tilist) {
+        pkt_idx++;
+        int dmaportNum;
+        PortDirection dmadirection = PortDirection::DMA;
+        //get DMA port index
+        if (!router_.occupyPointDirection(dstPoint,dmaportNum, dmadirection, true)) {
+            llvm::outs() << "DMA occupy failed " << "\n";
+            assert(0);
+            return std::nullopt;
+        }
+        //set prev tile master port and dma port
+        struct StreamPKTConnection& curtileconf = pktswitchmap[dstPoint];
+        curtileconf.localDMAForwardPortIdx = dmaportNum;
+        curtileconf.localDMAForwardPktID = pkt_idx;//fix me
+        curtileconf.localDMAForwardPktType = 0;
+    }
+    //set the slave master direction
+    auto prevpoint = tilist[0];
+    for (const auto& dstPoint : tilist) {
+        struct StreamPKTConnection& prevtileconf = pktswitchmap[prevpoint];
+        struct StreamPKTConnection& curtileconf = pktswitchmap[dstPoint];
+        //set the in out as default None, as the first tile slave should be None
+        //and the last tile master should be None
+        curtileconf.SlaveReceiveForwardDirection = PortDirection::NONE;
+        curtileconf.MasterSendToNextTileDirection = PortDirection::NONE;
+        if (prevpoint == dstPoint) {
+            continue;// when process the first point by pass. as the occupy logic need two point
+        }
+        
+        //get the connection port and direction
+        int portNum = 0;
+        PortDirection portdirectionPrevMaster, portdirectionCurSlave;
+        if (!router_.occupyLink(prevpoint, dstPoint, dioid, portNum, portdirectionPrevMaster, portdirectionCurSlave)) {
+            llvm::outs() << "link occupy failed " << "\n";
+            assert(0);
+            return std::nullopt;
+        }
+        
+        //set prev tile master port and dma port
+        prevtileconf.MasterSendToNextTileDirection = portdirectionPrevMaster;
+        prevtileconf.MasterSendToNextTileDirectionPortIdx = portNum;
+        //set currenttile receive/slave port
+        curtileconf.SlaveReceiveForwardDirection = portdirectionCurSlave;
+        curtileconf.SlaveReceiveForwardDirectionPortIdx = portNum;
+        curtileconf.SlaveReceivePktID = 0;//forward all packet
+        curtileconf.SlaveReceivePktType = 0;
+        //
+        prevpoint = dstPoint;
+    }
+    //create the op call
+    for (const auto& dstPoint : tilist) {
+        const Point& key = dstPoint;
+
+        auto output = rewriter.getI32Type();
+        auto curTileOp = dyn_cast<routinghw::TileCreate>(dsttiles[key]);
+        const StreamPKTConnection& value = pktswitchmap[key];
+
+        // Print the key
+        std::cout << "\nKey: (row is " << key.r << ", col is " << key.c << ")" << std::endl;
+
+        // Print the members of the value struct
+        std::cout << "  - SlaveReceiveForwardDirection: " << PortDirectiontoString(value.SlaveReceiveForwardDirection) << std::endl;
+        std::cout << "  - SlaveReceiveForwardDirectionPortIdx: " << (int)value.SlaveReceiveForwardDirectionPortIdx << std::endl;
+        std::cout << "  - SlaveReceivePktID: " << value.SlaveReceivePktID << std::endl;
+        std::cout << "  - SlaveReceivePktType: " << value.SlaveReceivePktType << std::endl;
+        std::cout << "  - localDMAForwardPortIdx: " << value.localDMAForwardPortIdx << std::endl;
+        std::cout << "  - localDMAForwardPktID: " << value.localDMAForwardPktID << std::endl;
+        std::cout << "  - localDMAForwardPktType: " << value.localDMAForwardPktType << std::endl;
+        std::cout << "  - MasterSendToNextTileDirection: " << PortDirectiontoString(value.MasterSendToNextTileDirection) << std::endl;
+        std::cout << "  - MasterSendToNextTileDirectionPortIdx: " << (int)(value.MasterSendToNextTileDirectionPortIdx) << std::endl;
+
+        rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
+            op->getLoc(),                   // Operation location
+            output,
+            curTileOp.getResult(),                   // Tile to be configured
+            rewriter.getStringAttr(PortDirectiontoString(value.SlaveReceiveForwardDirection)), // Direction of the port receiving the stream
+            rewriter.getI32IntegerAttr((int)value.SlaveReceiveForwardDirectionPortIdx),     // Index of the receiving port
+            rewriter.getI32IntegerAttr(value.SlaveReceivePktID),// Packet ID to expect
+            rewriter.getI32IntegerAttr(value.SlaveReceivePktType),// Packet Type to expect
+            rewriter.getStringAttr(PortDirectiontoString(PortDirection::DMA)),  // local DMA direction NONE means no DMA
+            rewriter.getI32IntegerAttr(value.localDMAForwardPortIdx),  // Index of the local DMA port to send to
+            rewriter.getI32IntegerAttr(value.localDMAForwardPktID ),    // Packet ID for the DMA transfer
+            rewriter.getI32IntegerAttr(value.localDMAForwardPktType),  // Packet Type for the DMA transfer
+            rewriter.getStringAttr(PortDirectiontoString(value.MasterSendToNextTileDirection)),     // No forwarding: empty master direction
+            rewriter.getI32IntegerAttr((int)(value.MasterSendToNextTileDirectionPortIdx)) // No forwarding: port index 0
+        );
+    }
+    ret.tile = tilist.back();
+    ret.pktconn = pktswitchmap[ret.tile];
+    ret.tileOp = dsttiles[ret.tile];
+    // connect pkt merge/data gather into shim tile
+    return std::make_optional<TileListPktRoutingNode>(ret);
+}
+
+std::optional<TileListRoutingMap> GetSeqPath(
+                         std::optional<std::shared_ptr<const RoutingPath>> rpath,
+                         std::shared_ptr<DataIO> dio,
+                         std::unordered_map<Point, Operation*, Point::Hash> dsttiles,
+                         StreamType streamtype,// 0 no dma, 1 dma receive
+                         std::optional<TileListPktRoutingNode> lastPkttilemap,
+                         RoutingTopology& router_,
+                         ConversionPatternRewriter& rewriter) {
+    TileListRoutingMap troutingmap;
+    std::unordered_map<Point, StreamCCTConnection, Point::Hash> & connectionData = troutingmap.tilemap;
+    std::vector<Point> & orderedPathPoints = troutingmap.tilelist;
+    uint32_t dioid = dio->id();
+    if (!rpath || !(*rpath)) {
+        return std::nullopt; // No path to process
+    }
+
+    auto outputType = rewriter.getI32Type();
+    auto tree = (*rpath)->multipaths();
+
+    // --- Phase 1: Build connection map AND an ordered list of points ---
+    
+    
+    std::unordered_set<Point, Point::Hash> pointsInOrderedList; // Helper to avoid duplicates
+
+    // Helper lambda to add a point to our ordered list, ensuring uniqueness
+    auto addPointToOrderedList = [&](const Point& p) {
+        if (pointsInOrderedList.find(p) == pointsInOrderedList.end()) {
+            pointsInOrderedList.insert(p);
+            orderedPathPoints.push_back(p);
+        }
+    };
+
+    // 1a. Iterate over path links to populate connectionData and the ordered list
+    uint8_t tree_round = 0;
+    for (const auto& branch : tree.branches) {
+        
+        for (size_t i = 0; i < branch.size(); ++i) {
+            const Point& currentPoint = branch[i];
+            addPointToOrderedList(currentPoint); // Add point to maintain order
+            if (0 == tree_round && 0 == i) {
+                connectionData[currentPoint].SlaveReceiveForwardDirection = PortDirection::NONE;
+            }
+            if ( i < branch.size() - 1) {
+                const Point& nextPoint = branch[i+1];
+                int portNum;
+                PortDirection slaveDirOnNext, masterDirOnCurrent;
+                if (!router_.occupyLink(currentPoint, nextPoint, dioid, portNum, masterDirOnCurrent, slaveDirOnNext)) {
+                    llvm::report_fatal_error("Failed to occupy link in routing topology.");
+                }
+                
+                connectionData[currentPoint].MasterSendToNextTileDirection = masterDirOnCurrent;
+                connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx = portNum;
+                connectionData[nextPoint].SlaveReceiveForwardDirection = slaveDirOnNext;
+                connectionData[nextPoint].SlaveReceiveForwardDirectionPortIdx = portNum;
+                //set next master into None
+                connectionData[nextPoint].MasterSendToNextTileDirection = PortDirection::NONE;
+                
+            } 
+        }
+        tree_round++;
+    }
+
+    //Process output dataio, when the last tile is be the shim tile of dataio
+
+    if (dio->type() == IOType::Output) {
+        auto lastilepoint = orderedPathPoints.back();
+        Point shimpoint = { dio->rowpos(),dio->colpos() };
+        if (lastilepoint == shimpoint) {
+             if (auto shimPortInfo = dio->getshimport()) {
+                connectionData[shimpoint].MasterSendToNextTileDirection = shimPortInfo->dir_;
+                connectionData[shimpoint].MasterSendToNextTileDirectionPortIdx = shimPortInfo->portnum_;
+            }
+        }
+    }
+
+    // 1b. Populate DMA connection information
+    auto rm = router_.getRM();
+    for (const auto& p : orderedPathPoints) {
+        connectionData[p].localDMAForwardDirection = PortDirection::NONE;
+        if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core 
+            && StreamType::BROADCAST == streamtype
+            && dsttiles.find(p) != dsttiles.end()) {
+            if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::TileDMA, PortDirection::DMA, -1)) {
+                connectionData[p].localDMAForwardDirection = PortDirection::DMA;
+                connectionData[p].localDMAForwardPortIdx = *portnumptr;
+            }
+        }
+    }
+
+    // 1c. Handle the special case for the starting SHIM tile's input
+    
+    PortDirection shimDir = PortDirection::South;
+    int shimPortNum = 3; // A reasonable default
+    if (auto shimPortInfo = dio->getshimport()) {
+        shimDir = shimPortInfo->dir_;
+        shimPortNum = shimPortInfo->portnum_;
+    }
+    Point dioshimpoint = Point{dio->rowpos(), dio->colpos()};
+    connectionData[dioshimpoint].SlaveReceiveForwardDirection = shimDir;
+    connectionData[dioshimpoint].SlaveReceiveForwardDirectionPortIdx = shimPortNum;
+
+    return std::make_optional<TileListRoutingMap>(troutingmap);
+}
+
+void ParseTheCCTRoutingPath(Operation* op,
+                         std::optional<TileListPktRoutingNode> lastPkttilemap,
+                         StreamType streamtype,// 0 normal, 1 broadcast
+                         uint32_t dioid,
+                         Point shimpoint,
+                         std::shared_ptr<DataIO> dio,
+                         IOShimTileCreate shimio,
+                         std::optional<std::shared_ptr<const RoutingPath>> rpath,
+                         std::unordered_map<Point, Operation*, Point::Hash> dsttiles,
+                         RoutingTopology& router_,
+                         ConversionPatternRewriter& rewriter) {
+
+    if (!rpath || !(*rpath)) {
+        return; // No path to process
+    }
+
+    auto loc = op->getLoc();
+    auto outputType = rewriter.getI32Type();
+    // --- Phase 1: Build connection map AND an ordered list of points ---
+    auto troutingmap = GetSeqPath(rpath,dio,dsttiles, streamtype/* 0 normal no dma, 1 broadcast dma receive*/,lastPkttilemap,router_,rewriter);
+    if (!troutingmap) {
+        return;
+    }
+
+    std::unordered_map<Point, StreamCCTConnection, Point::Hash> & connectionData = troutingmap->tilemap;
+    std::vector<Point> & orderedPathPoints = troutingmap->tilelist;
+    // --- Phase 2: Generate MLIR ops using the ordered list ---
+    
+    // 2a. Use existing tile operations from dsttiles (already created by DmaphopTileConversionPattern)
+    // No need to create new tiles - reuse the ones already created
+    std::unordered_map<Point, Operation*, Point::Hash> allTileOps = dsttiles;
+    
+    // Note: We don't create new tiles here anymore - they were already created in DmaphopTileConversionPattern
+    // If there are intermediate routing tiles not in dsttiles, they would need to be created,
+    // but for dmaphop->routinghw conversion, all tiles should already be defined
+
+    // 2b. Create connections IN ORDER by iterating through the ordered vector
+    for (const Point& point : orderedPathPoints) {
+        // Look up the connection info from our map
+        auto it = connectionData.find(point);
+        if (it == connectionData.end()) continue; // This point might not have connections (e.g., an un-routed destination)
+        
+        const StreamCCTConnection& conn = it->second;
+        
+        // Get the tile operation - it should already exist in allTileOps
+        auto tileOpIt = allTileOps.find(point);
+        if (tileOpIt == allTileOps.end()) {
+            // Tile not found - this shouldn't happen in dmaphop->routinghw conversion
+            // but we need to handle routing tiles that might be created by the router
+            continue;
+        }
+        
+        auto currentTileOp = dyn_cast<routinghw::TileCreate>(tileOpIt->second);
+        if (!currentTileOp) {
+            // Might be a shim tile, skip
+            continue;
+        }
+        
+        // Ensure the tile has an input port to connect from
+        if (conn.SlaveReceiveForwardDirection == PortDirection::NONE) {
+            if (lastPkttilemap && lastPkttilemap->tile == point) {
+                auto output = rewriter.getI32Type();
+                auto tileOp = dyn_cast<routinghw::TileCreate>((Operation* )lastPkttilemap->tileOp);
+                ///*
+                rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
+                        loc,                   // Operation location
+                        output,
+                        tileOp.getResult(),                   // Tile to be configured
+                        rewriter.getStringAttr(PortDirectiontoString(PortDirection::NONE)), // Direction of the port receiving the stream
+                        rewriter.getI32IntegerAttr(0),     // Index of the receiving port
+                        rewriter.getI32IntegerAttr(0),// Packet ID to expect
+                        rewriter.getI32IntegerAttr(0),// Packet Type to expect
+                        rewriter.getStringAttr(PortDirectiontoString(PortDirection::NONE)),
+                        rewriter.getI32IntegerAttr(0),  // Index of the local DMA port to send to
+                        rewriter.getI32IntegerAttr(0),    // Packet ID for the DMA transfer
+                        rewriter.getI32IntegerAttr(0),  // Packet Type for the DMA transfer
+                        rewriter.getStringAttr(PortDirectiontoString(conn.MasterSendToNextTileDirection)),     // No forwarding: empty master direction
+                        rewriter.getI32IntegerAttr((int)(conn.MasterSendToNextTileDirectionPortIdx)) // No forwarding: port index 0
+                );//*/
+            }
+            
+            continue;
+
+        }
+        
+        StringRef inputDirStr = PortDirectiontoString(conn.SlaveReceiveForwardDirection);
+        int inputPortIdx = conn.SlaveReceiveForwardDirectionPortIdx;
+
+        
+        // Special handling for the SHIM tile to enable its external port
+        if (point == shimpoint) {
+            if (dio->type() == IOType::Input) {
+                rewriter.create<EnableExtToAieShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
+            } else {
+                rewriter.create<EnableAieToExtShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
+            }
+        }
+       // /*
+        // Create connection to the next tile in the path
+        if (conn.MasterSendToNextTileDirection != PortDirection::NONE) {
+            if (point == shimpoint) {
+                 rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, shimio.getResult(),
+                    inputDirStr, inputPortIdx,
+                    PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
+            } else {
+                rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
+                    inputDirStr, inputPortIdx,
+                    PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
+            }
+        }
+
+        // Create connection to the local DMA
+        if (conn.localDMAForwardDirection != PortDirection::NONE) {
+            rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
+                    inputDirStr, inputPortIdx,
+                    "DMA", conn.localDMAForwardPortIdx);
+        }
+           // */
+    }
+}
 
 // Helper structure to store tile information
 struct TileInfo {
@@ -186,7 +594,18 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         }
         
         // Extract tiles and track which tiles have producer/consumer ports
-        std::vector<Value> tilesInPath;
+        // Separate shim tiles from core tiles
+        std::vector<Value> allTilesInPath;
+        std::vector<Point> coreTileList;  // Core tiles for routing
+        std::unordered_map<Point, Operation*, Point::Hash> dsttiles;  // Core tiles map
+        std::vector<Point> consumerCoreTiles;  // Core tiles that consume (need DMA receive)
+        std::vector<Point> producerCoreTiles;  // Core tiles that produce (need DMA send)
+        
+        Value shimTileValue;
+        Point shimPoint{-1, -1};
+        bool hasShim = false;
+        bool isShimToCore = false;  // true: shim->core (MM2S), false: core->shim (S2MM)
+        
         llvm::DenseSet<Value> seenTiles;
         llvm::DenseMap<Value, bool> tileHasProducer;  // Map tile -> has producer port (sends to DMA)
         llvm::DenseMap<Value, bool> tileHasConsumer;  // Map tile -> has consumer port (receives from DMA)
@@ -204,8 +623,22 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                 if (srcPortOp) {
                     Value srcTile = srcPortOp.getTile();
                     if (!seenTiles.contains(srcTile)) {
-                        tilesInPath.push_back(srcTile);
+                        allTilesInPath.push_back(srcTile);
                         seenTiles.insert(srcTile);
+                        
+                        // Categorize tile
+                        auto tileInfoIt = routingCtx.tileMap.find(srcTile);
+                        if (tileInfoIt != routingCtx.tileMap.end()) {
+                            if (tileInfoIt->second.tileType == "shim") {
+                                shimTileValue = srcTile;
+                                shimPoint = Point{tileInfoIt->second.row, tileInfoIt->second.col};
+                                hasShim = true;
+                            } else if (tileInfoIt->second.tileType == "core") {
+                                Point pt{tileInfoIt->second.row, tileInfoIt->second.col};
+                                coreTileList.push_back(pt);
+                                dsttiles[pt] = tileInfoIt->second.tileOp;
+                            }
+                        }
                     }
                     // Mark this tile as having a producer if source port is a producer
                     if (producerPorts.contains(srcPort)) {
@@ -216,8 +649,22 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                 if (dstPortOp) {
                     Value dstTile = dstPortOp.getTile();
                     if (!seenTiles.contains(dstTile)) {
-                        tilesInPath.push_back(dstTile);
+                        allTilesInPath.push_back(dstTile);
                         seenTiles.insert(dstTile);
+                        
+                        // Categorize tile
+                        auto tileInfoIt = routingCtx.tileMap.find(dstTile);
+                        if (tileInfoIt != routingCtx.tileMap.end()) {
+                            if (tileInfoIt->second.tileType == "shim") {
+                                shimTileValue = dstTile;
+                                shimPoint = Point{tileInfoIt->second.row, tileInfoIt->second.col};
+                                hasShim = true;
+                            } else if (tileInfoIt->second.tileType == "core") {
+                                Point pt{tileInfoIt->second.row, tileInfoIt->second.col};
+                                coreTileList.push_back(pt);
+                                dsttiles[pt] = tileInfoIt->second.tileOp;
+                            }
+                        }
                     }
                     // Mark this tile as having a consumer if destination port is a consumer
                     if (consumerPorts.contains(dstPort)) {
@@ -227,109 +674,110 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             }
         }
         
-        if (tilesInPath.empty()) {
+        if (allTilesInPath.empty()) {
             rewriter.eraseOp(op);
             return success();
         }
         
-        // Create routinghw tile operations for tiles in this path
-        std::vector<Operation*> hwTileOps;
-        
-        for (auto tileValue : tilesInPath) {
-            auto tileInfoIt = routingCtx.tileMap.find(tileValue);
-            if (tileInfoIt == routingCtx.tileMap.end()) continue;
+        // Determine data flow direction based on shim position and producers/consumers
+        if (hasShim) {
+            // If shim is at the beginning and we have consumers, it's shim->core (MM2S, processing_type=0)
+            // If shim is at the end and we have producers, it's core->shim (S2MM, processing_type=2)
+            Value firstTile = allTilesInPath.front();
+            Value lastTile = allTilesInPath.back();
             
-            const TileInfo& info = tileInfoIt->second;
-            if (info.tileOp) {
-                hwTileOps.push_back(info.tileOp);
-            }
-        }
-        
-        // Create stream switch connections for tiles in this path
-        for (size_t i = 0; i < hwTileOps.size(); ++i) {
-            auto tileOp = hwTileOps[i];
-            Value tileValue = tilesInPath[i];
-            
-            auto tileInfoIt = routingCtx.tileMap.find(tileValue);
-            if (tileInfoIt == routingCtx.tileMap.end()) continue;
-            
-            // Skip shim tiles for stream switch connections
-            if (tileInfoIt->second.tileType != "core") continue;
-            
-            // Determine if this tile is a producer (sends to DMA) or consumer (receives from DMA)
-            bool isProducer = tileHasProducer.count(tileValue) && tileHasProducer[tileValue];
-            bool isConsumer = tileHasConsumer.count(tileValue) && tileHasConsumer[tileValue];
-            
-            // Determine port directions for routing (always create routing connection)
-            std::string slaveDirection;
-            std::string masterDirection;
-            
-            if (i == 0) {
-                // First tile: no slave input, forward to next tile
-                slaveDirection = "NONE";
-                masterDirection = (i < hwTileOps.size() - 1) ? "EAST" : "NONE";
-            } else if (i == hwTileOps.size() - 1) {
-                // Last tile: receive from previous, no forward
-                slaveDirection = "WEST";
-                masterDirection = "NONE";
+            if (firstTile == shimTileValue && !consumerPorts.empty()) {
+                isShimToCore = true;  // MM2S: shim sends to cores
+            } else if (lastTile == shimTileValue && !producerPorts.empty()) {
+                isShimToCore = false;  // S2MM: cores send to shim
+            } else if (firstTile == shimTileValue) {
+                isShimToCore = true;  // Default to MM2S if shim is first
             } else {
-                // Middle tiles: receive from WEST, forward to EAST
-                slaveDirection = "WEST";
-                masterDirection = "EAST";
-            }
-            
-            // Create routing stream switch connection
-            if (masterDirection != "NONE" || slaveDirection != "NONE") {
-                rewriter.create<routinghw::ConnectStreamSingleSwitchPort>(
-                    loc, output,
-                    tileOp->getResult(0),
-                    rewriter.getStringAttr(slaveDirection),
-                    rewriter.getI32IntegerAttr(0),  // slaveportidx
-                    rewriter.getStringAttr(masterDirection),
-                    rewriter.getI32IntegerAttr(0)   // masterportidx
-                );
-            }
-            
-            // If this tile is a consumer, create DMA receive connection (MM2S: DMA -> core)
-            if (isConsumer) {
-                // Determine the slave direction for DMA connection (where data comes from)
-                std::string dmaSlaveDirection;
-                if (i == 0) {
-                    dmaSlaveDirection = "SOUTH";  // First tile gets from shim
-                } else {
-                    dmaSlaveDirection = "WEST";  // Others get from previous tile
-                }
-                
-                rewriter.create<routinghw::ConnectStreamSingleSwitchPort>(
-                    loc, output,
-                    tileOp->getResult(0),
-                    rewriter.getStringAttr(dmaSlaveDirection),
-                    rewriter.getI32IntegerAttr(0),  // slaveportidx
-                    rewriter.getStringAttr("DMA"),
-                    rewriter.getI32IntegerAttr(2)   // masterportidx (DMA channel 2)
-                );
-            }
-            
-            // If this tile is a producer, create DMA send connection (S2MM: core -> DMA)
-            if (isProducer) {
-                // Determine the master direction for DMA send (where data goes to)
-                std::string dmaMasterDirection;
-                if (i == hwTileOps.size() - 1) {
-                    dmaMasterDirection = "SOUTH";  // Last tile sends to shim
-                } else {
-                    dmaMasterDirection = "EAST";  // Others send to next tile
-                }
-                
-                rewriter.create<routinghw::ConnectStreamSingleSwitchPort>(
-                    loc, output,
-                    tileOp->getResult(0),
-                    rewriter.getStringAttr("DMA"),
-                    rewriter.getI32IntegerAttr(2),  // slaveportidx (DMA channel 2)
-                    rewriter.getStringAttr(dmaMasterDirection),
-                    rewriter.getI32IntegerAttr(0)   // masterportidx
-                );
+                isShimToCore = false;  // Default to S2MM if shim is last
             }
         }
+        
+        // Build consumer and producer core tile lists
+        for (const auto& pt : coreTileList) {
+            // Find the tile Value for this Point
+            for (const auto& tileKV : routingCtx.tileMap) {
+                if (tileKV.second.row == pt.r && tileKV.second.col == pt.c) {
+                    if (tileHasConsumer.count(tileKV.first) && tileHasConsumer[tileKV.first]) {
+                        consumerCoreTiles.push_back(pt);
+                    }
+                    if (tileHasProducer.count(tileKV.first) && tileHasProducer[tileKV.first]) {
+                        producerCoreTiles.push_back(pt);
+                    }
+                    break;
+                }
+            }
+        }
+        
+        // Now call the routing logic similar to RoutingmovedatabyioConvert
+        if (coreTileList.empty()) {
+            rewriter.eraseOp(op);
+            return success();
+        }
+        
+        // Determine which tile to use for shim allocation
+        Point firstTile = isShimToCore ? coreTileList[0] : coreTileList.back();
+        DMADIRECTION dmadir = isShimToCore ? DMADIRECTION::MM2S : DMADIRECTION::S2MM;
+        StreamType streamtype = isShimToCore ? StreamType::BROADCAST : StreamType::FORWARDONLY;
+        
+        // Create DataIO (like RoutingmovedatabyioConvert lines 1004-1014 or 1045-1055)
+        std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firstTile});
+        std::ostringstream ostr;
+        ostr << "dio" << ioIdx++;
+        auto dio = router_.createDataIO(ostr.str(), dstcoreloc, dmadir);
+        
+        int shimcol = dio->colpos();
+        int dioid = dio->id();
+        int shimchannel = dio->channel();
+        Point allocatedShimPoint = {0, shimcol};
+        
+        // Create IOShimTileCreate (like line 1014 or 1055)
+        auto shimIoOp = rewriter.create<IOShimTileCreate>(
+            loc, output, 
+            0,  // row
+            shimcol,  // col
+            dioid,  // IOID
+            ostr.str(),  // comments
+            static_cast<int>(dmadir),  // dmadirection
+            shimchannel  // channelused
+        );
+        
+        // Create routing path (like line 1030 or 1058)
+        auto rpath = router_.createPath(dioid, coreTileList);
+        
+        if (!rpath || !(*rpath)) {
+            rewriter.eraseOp(op);
+            return success();
+        }
+        
+        // Check if this is core-to-shim (S2MM) with producers
+        // In this case, we need packet routing for gathering data from multiple producers
+        bool isCoreToShim = !isShimToCore;
+        std::optional<TileListPktRoutingNode> lastPkttilemap = std::nullopt;
+        
+        if (isCoreToShim && !producerCoreTiles.empty()) {
+            // Use GatherPktRoutingPathCreate for core-to-shim packet routing (processing_type=2)
+            // This creates packet-based routing for gathering data from producer tiles
+            lastPkttilemap = GatherPktRoutingPathCreate(
+                op,
+                dioid,
+                allocatedShimPoint,
+                dio,
+                rpath,
+                producerCoreTiles,  // Tiles that produce data
+                dsttiles,
+                router_,
+                rewriter
+            );
+        }
+        
+        // Call ParseTheCCTRoutingPath to generate the routing connections
+        ParseTheCCTRoutingPath(op, lastPkttilemap, streamtype, dioid, allocatedShimPoint, 
+                              dio, shimIoOp, rpath, dsttiles, router_, rewriter);
         
         // Erase the path operation
         rewriter.eraseOp(op);
