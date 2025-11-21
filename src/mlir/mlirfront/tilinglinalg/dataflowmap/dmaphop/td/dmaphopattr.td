@@ -1,3 +1,8 @@
+/******************************************************************************
+* Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
+
 #ifndef _ATTR_DMAMAP_
 #define _ATTR_DMAMAP_
 

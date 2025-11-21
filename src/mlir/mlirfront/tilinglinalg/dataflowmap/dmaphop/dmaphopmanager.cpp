@@ -132,7 +132,15 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
     auto directionSend =  "Out";
     auto directionReceive =  "In";
     
-    // SHIM output port
+    // SHIM ports (need both In and Out for proper producer/consumer tracking)
+    auto portShimIn = builder.create<dmaphop::port>(location,
+        shimTile.getResult(),
+        directionReceive,
+        "portShimIn",
+        builder.getI64IntegerAttr(0)  // channel
+    );
+    symTable.insert(portShimIn);
+    
     auto portShimOut = builder.create<dmaphop::port>(location,
         shimTile.getResult(),
         directionSend,
@@ -179,16 +187,28 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
     );
 
      
-    mlir::SymbolRefAttr symbolRefA = mlir::SymbolRefAttr::get(ctx,"portAIn");
-    mlir::SymbolRefAttr symbolRefB = mlir::SymbolRefAttr::get(ctx,"portBIn");
-        //auto useOp = builder.create<dmap::UseSymbolOp>(builder.getUnknownLoc(), symbolRef);
-    // --- 4. Define Path with Consumers and Tee Points ---
-    SmallVector<Attribute> consumers{symbolRefA, symbolRefB};
+    mlir::SymbolRefAttr symbolRefShimIn = mlir::SymbolRefAttr::get(ctx,"portShimIn");
+    mlir::SymbolRefAttr symbolRefAIn = mlir::SymbolRefAttr::get(ctx,"portAIn");
+    mlir::SymbolRefAttr symbolRefBIn = mlir::SymbolRefAttr::get(ctx,"portBIn");
+    mlir::SymbolRefAttr symbolRefAOut = mlir::SymbolRefAttr::get(ctx,"portAOut");
+    
+    // --- 4. Define Path with Producers, Consumers and Tee Points ---
+    // This is a PUSH operation: SHIM (receives from DDR) -> Core A -> Core B
+    // Producers (source ports): 
+    //   - shimPortIn: shim receives from external DDR (source of data into fabric)
+    //   - portAOut: tile A sends to tile B
+    // Consumers (sink ports):
+    //   - portAIn: tile A receives data
+    //   - portBIn: tile B receives data
+    SmallVector<Attribute> producers{symbolRefShimIn, symbolRefAOut};
+    SmallVector<Attribute> consumers{symbolRefAIn, symbolRefBIn};
 
-    SmallVector<Attribute> teePoints{symbolRefA};
+    // Tee points: ports where data is split/broadcasted (tile A splits to B)
+    SmallVector<Attribute> teePoints{symbolRefAOut};
     
     auto serialPath = builder.create<dmaphop::create_path>(location,
         ValueRange{hop1, hop2},
+        builder.getArrayAttr(producers),
         builder.getArrayAttr(consumers),
         builder.getArrayAttr(teePoints)
     );

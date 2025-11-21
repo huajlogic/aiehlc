@@ -7,6 +7,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
@@ -143,7 +145,28 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         auto loc = op.getLoc();
         auto output = rewriter.getI32Type();
         
-        // Get consumers attribute to determine which tiles should output to DMA
+        // Get producers attribute to determine which tiles should send to DMA (S2MM)
+        // Producers are core tiles that send data FROM core TO shim/memory (Pull direction)
+        llvm::DenseSet<Value> producerPorts;
+        if (auto producersAttr = op->getAttrOfType<ArrayAttr>("producers")) {
+            for (auto symRef : producersAttr) {
+                if (auto symRefAttr = dyn_cast<FlatSymbolRefAttr>(symRef)) {
+                    // Find the port with this symbol name in the parent function
+                    auto parentFunc = op->getParentOfType<func::FuncOp>();
+                    if (parentFunc) {
+                        parentFunc.walk([&](dmaphop::port portOp) {
+                            auto symName = portOp.getSymName();
+                            if (!symName.empty() && symName == symRefAttr.getValue()) {
+                                producerPorts.insert(portOp.getResult());
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        
+        // Get consumers attribute to determine which tiles should receive from DMA (MM2S)
+        // Consumers are core tiles that receive data FROM shim/memory TO core (Push direction)
         llvm::DenseSet<Value> consumerPorts;
         if (auto consumersAttr = op->getAttrOfType<ArrayAttr>("consumers")) {
             for (auto symRef : consumersAttr) {
@@ -162,10 +185,11 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             }
         }
         
-        // Extract tiles and track which tiles have consumer ports
+        // Extract tiles and track which tiles have producer/consumer ports
         std::vector<Value> tilesInPath;
         llvm::DenseSet<Value> seenTiles;
-        llvm::DenseMap<Value, bool> tileHasConsumer;  // Map tile -> has consumer port
+        llvm::DenseMap<Value, bool> tileHasProducer;  // Map tile -> has producer port (sends to DMA)
+        llvm::DenseMap<Value, bool> tileHasConsumer;  // Map tile -> has consumer port (receives from DMA)
         
         for (auto hopValue : adaptor.getHops()) {
             if (auto hopOp = hopValue.getDefiningOp<dmaphop::create_hop>()) {
@@ -182,6 +206,10 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                     if (!seenTiles.contains(srcTile)) {
                         tilesInPath.push_back(srcTile);
                         seenTiles.insert(srcTile);
+                    }
+                    // Mark this tile as having a producer if source port is a producer
+                    if (producerPorts.contains(srcPort)) {
+                        tileHasProducer[srcTile] = true;
                     }
                 }
                 
@@ -228,7 +256,8 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             // Skip shim tiles for stream switch connections
             if (tileInfoIt->second.tileType != "core") continue;
             
-            // Determine if this tile is a consumer
+            // Determine if this tile is a producer (sends to DMA) or consumer (receives from DMA)
+            bool isProducer = tileHasProducer.count(tileValue) && tileHasProducer[tileValue];
             bool isConsumer = tileHasConsumer.count(tileValue) && tileHasConsumer[tileValue];
             
             // Determine port directions for routing (always create routing connection)
@@ -261,7 +290,7 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                 );
             }
             
-            // If this tile is a consumer, create ADDITIONAL DMA connection
+            // If this tile is a consumer, create DMA receive connection (MM2S: DMA -> core)
             if (isConsumer) {
                 // Determine the slave direction for DMA connection (where data comes from)
                 std::string dmaSlaveDirection;
@@ -278,6 +307,26 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                     rewriter.getI32IntegerAttr(0),  // slaveportidx
                     rewriter.getStringAttr("DMA"),
                     rewriter.getI32IntegerAttr(2)   // masterportidx (DMA channel 2)
+                );
+            }
+            
+            // If this tile is a producer, create DMA send connection (S2MM: core -> DMA)
+            if (isProducer) {
+                // Determine the master direction for DMA send (where data goes to)
+                std::string dmaMasterDirection;
+                if (i == hwTileOps.size() - 1) {
+                    dmaMasterDirection = "SOUTH";  // Last tile sends to shim
+                } else {
+                    dmaMasterDirection = "EAST";  // Others send to next tile
+                }
+                
+                rewriter.create<routinghw::ConnectStreamSingleSwitchPort>(
+                    loc, output,
+                    tileOp->getResult(0),
+                    rewriter.getStringAttr("DMA"),
+                    rewriter.getI32IntegerAttr(2),  // slaveportidx (DMA channel 2)
+                    rewriter.getStringAttr(dmaMasterDirection),
+                    rewriter.getI32IntegerAttr(0)   // masterportidx
                 );
             }
         }
@@ -316,7 +365,22 @@ void DmaphopToRoutinghwPass::runOnOperation() {
 
     // Define conversion target
     //target.addIllegalDialect<dmaphop::dmaphopdialect>();
-    target.addLegalDialect<routinghw::RoutingHWDialect, func::FuncDialect, memref::MemRefDialect>();
+    target.addLegalDialect<routinghw::RoutingHWDialect, func::FuncDialect, memref::MemRefDialect, 
+                           routing::routingdialect, scf::SCFDialect, arith::ArithDialect>();
+    
+    // Mark routing::extract_data as illegal so it gets erased
+    target.addIllegalOp<routing::extract_data>();
+    target.addIllegalOp<routing::createdummytensor>();
+    target.addIllegalOp<routing::partitiontensor>();
+    
+    // Explicitly mark all other routing and SCF operations as legal to preserve them
+    target.addDynamicallyLegalDialect<routing::routingdialect>(
+        [](Operation *op) { return !isa<routing::extract_data>(op); }
+    );
+    
+    // Explicitly preserve scf.execute_region and other SCF operations
+    target.addLegalOp<scf::ExecuteRegionOp>();
+    target.addLegalOp<scf::YieldOp>();
     
     // Add conversion patterns
     patterns.add<DmaphopTileConversionPattern>(&ctx, rtopology_, routingCtx);
@@ -330,6 +394,9 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     patterns.add<EraseOpPattern<dmaphop::push>>(&ctx);
     patterns.add<EraseOpPattern<dmaphop::pull>>(&ctx);
     patterns.add<EraseOpPattern<dmaphop::sync>>(&ctx);
+    patterns.add<EraseOpPattern<routing::extract_data>>(&ctx);  // Erase routing::extract_data
+    patterns.add<EraseOpPattern<routing::createdummytensor>>(&ctx);
+    patterns.add<EraseOpPattern<routing::partitiontensor>>(&ctx);  // Erase routing::partitiontensor
     
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();

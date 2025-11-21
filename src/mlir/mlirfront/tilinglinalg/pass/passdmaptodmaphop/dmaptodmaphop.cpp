@@ -147,7 +147,6 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     SmallVector<dmaphop::tile, 4> coreTiles;
     SmallVector<Value, 4> corePortsInValues;
     SmallVector<dmaphop::port, 4> corePortsOutOps;
-    SmallVector<Attribute, 4> consumerPortSymbols;
     
     for (int i = 0; i < coreGroup.getCoreCount(); ++i) {
         // Use core_start_row as the base for core tile row calculation
@@ -162,7 +161,6 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         std::string inPortName = "corePortIn" + std::to_string(i);
         auto portInOp = rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("In"), rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0));
         corePortsInValues.push_back(portInOp.getResult());
-        consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), inPortName));
 
         std::string outPortName = "corePortOut" + std::to_string(i);
         corePortsOutOps.push_back(rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr(outPortName), rewriter.getI64IntegerAttr(0)));
@@ -232,42 +230,89 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     
 
     // --- 6. Create dmaphop::create_hop Ops based on direction ---
+    // Producer/Consumer semantics:
+    // - Producers: ports that SOURCE data (send it out)
+    //   * Core/Mem tiles: Out ports
+    //   * Shim tile: In port (receives from external memory to send into fabric)
+    // - Consumers: ports that SINK data (receive it)
+    //   * Core/Mem tiles: In ports
+    //   * Shim tile: Out port (sends to external memory from fabric)
+    
     SmallVector<Value, 4> hops;
     SmallVector<Attribute, 4> producerPortSymbols;
+    SmallVector<Attribute, 4> consumerPortSymbols;
+    
     if (direction == DataflowDirection::Push) {
+        // Push: SHIM (In) -> [MEM (Out)] -> CORES (In)
+        // Producers: shimPortIn (for shim), memPortOut (if mem exists)
+        // Consumers: all corePortIn
+        
         if (memTile) { // SHIM -> MEM -> CORES
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, memPortIn).getResult());
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, corePortsInValues[0]).getResult());
-            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "memPortIn"));
+            // Producers: shimPortIn (shim receives from DDR), memPortOut (mem sends to cores)
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortIn"));
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "memPortOut"));
         } else { // SHIM -> CORES
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, corePortsInValues[0]).getResult());
+            // Producer: shimPortIn (shim receives from DDR to send into fabric)
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortIn"));
         }
+        
+        // All core input ports are consumers
+        for (size_t i = 0; i < corePortsInValues.size(); ++i) {
+            std::string inPortName = "corePortIn" + std::to_string(i);
+            consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), inPortName));
+        }
+        
+        // Create hops between cores (if multiple cores)
         for (size_t i = 0; i < corePortsOutOps.size() - 1; ++i) {
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i+1]).getResult());
         }
+        
     } else { // Pull
+        // Pull: CORES (Out) -> [MEM (In)] -> SHIM (Out)
+        // Producers: all corePortOut, memPortIn (if mem exists)
+        // Consumers: shimPortOut (for shim sends to DDR)
+        
         if (memTile) { // CORES -> MEM -> SHIM
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, shimPortIn).getResult());
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps.back(), memPortIn).getResult());
-            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortIn"));
+            // Producers: all core output ports, memPortIn (mem receives from cores)
+            for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
+                std::string outPortName = "corePortOut" + std::to_string(i);
+                producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), outPortName));
+            }
             producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "memPortIn"));
+            // Consumer: shimPortOut (shim sends to DDR)
+            consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortOut"));
         } else { // CORES -> SHIM
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps.back(), shimPortIn).getResult());
-            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortIn"));
+            // Producers: all core output ports
+            for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
+                std::string outPortName = "corePortOut" + std::to_string(i);
+                producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), outPortName));
+            }
+            // Consumer: shimPortOut (shim sends to DDR)
+            consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortOut"));
         }
+        
+        // Create hops between cores (if multiple cores)
         for (int i = corePortsOutOps.size() - 2; i >= 0; --i) {
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i]).getResult());
         }
     }
 
     // --- 7. Create path, buffers, and final data movement op ---
-    //ArrayAttr consumeArray = rewriter.getArrayAttr(consumerPortSymbols);
     mlir::MLIRContext *ctx = rewriter.getContext();
     ArrayAttr produceArray = rewriter.getArrayAttr(producerPortSymbols);
     mlir::ArrayAttr consumeArray = mlir::ArrayAttr::get(ctx, consumerPortSymbols);
+    
+    // For Push: shim/mem produces, cores consume
+    // For Pull: cores produce, shim/mem consumes
     auto path = (direction == DataflowDirection::Push)
-        ? rewriter.create<dmaphop::create_path>(loc, hops, consumeArray, rewriter.getArrayAttr({}))/*produceArray)*/
-        : rewriter.create<dmaphop::create_path>(loc, hops, produceArray, rewriter.getArrayAttr({}));
+        ? rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}))
+        : rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}));
 
     auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
     Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);

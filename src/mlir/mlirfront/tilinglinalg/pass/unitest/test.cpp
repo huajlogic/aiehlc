@@ -134,6 +134,13 @@ void routingtodmap() {
     options.label = "After DmaphopToRoutinghwPass:";
     pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<DmaphopToRoutinghwPass>(rtopology));
+
+    pm.addPass(mlir::createPrintIRPass(options));
+    pm.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
+    options.label = "After RoutingHWLowerPass:";
+    //pm.addPass(mlir::createPrintIRPass(options));
+    //remove dead arg
+    pm.addPass(std::make_unique<RoutingDeadArgPass>());
     
     //into
     /*
@@ -154,7 +161,7 @@ void routingtodmap() {
     (void)pm.run(module1);
 
     llvm::outs() << "----------module1.dump---------\n";
-    module1.dump();
+    //module1.dump();
 /*
     mlir::PassManager pm2(&ctx);;
     pm2.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
@@ -162,7 +169,11 @@ void routingtodmap() {
     module1.dump();
   */
 //conver emitc into c code  
-    //mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    if (failed(result)) {
+        llvm::errs() << "Failed to translate MLIR to C++.\n";
+        return;
+    }
     return;
 }
 int main(int argc, char* argv[]) {
