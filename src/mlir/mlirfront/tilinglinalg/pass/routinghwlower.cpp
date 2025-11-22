@@ -45,7 +45,7 @@ struct EnableExtToAieShimPortpattern: public ConversionPattern {
 
         auto tileLocOp = rewriter.create<emitc::CallOp>(
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
-            ValueRange{rowConstOp, colConstOp});
+            ValueRange{colConstOp, rowConstOp});
 
         //get the device instance
         auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
@@ -102,7 +102,7 @@ struct EnableAieToExtShimPortpattern: public ConversionPattern {
 
         auto tileLocOp = rewriter.create<emitc::CallOp>(
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
-            ValueRange{rowConstOp, colConstOp});
+            ValueRange{colConstOp, rowConstOp});
 
         //get the device instance
         auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
@@ -213,7 +213,7 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
 
         auto tileLocOp = rewriter.create<emitc::CallOp>(
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
-            ValueRange{rowConstOp, colConstOp});
+            ValueRange{colConstOp, rowConstOp});
 
         
 
@@ -357,7 +357,7 @@ struct ConnectStreamSingleSwitchPortpattern: public ConversionPattern {
 
         auto tileLocOp = rewriter.create<emitc::CallOp>(
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
-            ValueRange{rowConstOp, colConstOp});
+            ValueRange{colConstOp, rowConstOp});
 
         auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
         auto devInstPtrType = emitc::PointerType::get(devInstType);
