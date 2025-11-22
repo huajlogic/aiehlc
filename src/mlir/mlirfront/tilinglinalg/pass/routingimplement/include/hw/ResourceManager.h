@@ -450,6 +450,9 @@ public:
     
     // Find ioId based on shim column and channel number
     std::optional<int> findIoIdByShimChannel(int shimCol, int channel) const;
+    
+    // Find DataIO object by shim column and channel
+    std::shared_ptr<DataIO> findDataIOByShimChannel(int shimCol, int channel) const;
 
 private:
     void InitSHIMNocList();

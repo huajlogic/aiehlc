@@ -93,11 +93,16 @@ std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
     for(auto x: dsttiles) {
         pktmergetile.push_back(x.first);
     }
-    std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, pktmergetile[0]});
-    std::ostringstream ostr;
-    ostr << "dio" << ioIdx++;
-    auto diogather = router_.createDataIO(ostr.str(), dstcoreloc, DMADIRECTION::MM2S);
-    int diogetherid = diogather->id();
+    
+    // For core-to-shim (S2MM) packet gather routing:
+    // We need to reuse the existing shim DataIO based on shimpoint and channel
+    // The passed 'dio' parameter already has the shim column and channel information
+    
+    int shimcol = shimpoint.c;
+    int shimchannel = dio->channel();
+    
+    // Find the existing DataIO using the shim column and channel
+    int diogetherid = dio->id();
     auto rpath2 = router_.createPath(diogetherid, pktmergetile);
     if (!rpath2) {
         return std::nullopt;
@@ -726,24 +731,55 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         DMADIRECTION dmadir = isShimToCore ? DMADIRECTION::MM2S : DMADIRECTION::S2MM;
         StreamType streamtype = isShimToCore ? StreamType::BROADCAST : StreamType::FORWARDONLY;
         
-        // Create DataIO (like RoutingmovedatabyioConvert lines 1004-1014 or 1045-1055)
-        std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firstTile});
-        std::ostringstream ostr;
-        ostr << "dio" << ioIdx++;
-        auto dio = router_.createDataIO(ostr.str(), dstcoreloc, dmadir);
+        // Try to find existing DataIO for the shim location
+        // If shim was specified in dmaphop, we should look it up
+        // Otherwise, create a new DataIO
+        std::shared_ptr<DataIO> dio;
+        int shimcol, dioid, shimchannel;
+        Point allocatedShimPoint;
         
-        int shimcol = dio->colpos();
-        int dioid = dio->id();
-        int shimchannel = dio->channel();
-        Point allocatedShimPoint = {0, shimcol};
+        if (hasShim) {
+            // Shim tile was explicitly defined in dmaphop
+            // Try to find existing DataIO for this shim column
+            // For now, we assume channel 0, but this should be determined from dmaphop if available
+            auto rm = router_.getRM();
+            shimcol = shimPoint.c;
+            
+            // Try channel 0 first
+            dio = rm->findDataIOByShimChannel(shimcol, 0);
+            
+            if (!dio) {
+                // No existing DataIO found, create a new one
+                std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firstTile});
+                std::ostringstream ostr;
+                ostr << "dio" << ioIdx++;
+                dio = router_.createDataIO(ostr.str(), dstcoreloc, dmadir);
+            }
+            
+            shimcol = dio->colpos();
+            allocatedShimPoint = {0, shimcol};
+        } else {
+            // No explicit shim - let router allocate one
+            std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firstTile});
+            std::ostringstream ostr;
+            ostr << "dio" << ioIdx++;
+            dio = router_.createDataIO(ostr.str(), dstcoreloc, dmadir);
+            shimcol = dio->colpos();
+            allocatedShimPoint = {0, shimcol};
+        }
+        
+        dioid = dio->id();
+        shimchannel = dio->channel();
         
         // Create IOShimTileCreate (like line 1014 or 1055)
+        std::ostringstream commentStr;
+        commentStr << "shim_dma_" << dioid;
         auto shimIoOp = rewriter.create<IOShimTileCreate>(
             loc, output, 
             0,  // row
             shimcol,  // col
             dioid,  // IOID
-            ostr.str(),  // comments
+            commentStr.str(),  // comments
             static_cast<int>(dmadir),  // dmadirection
             shimchannel  // channelused
         );

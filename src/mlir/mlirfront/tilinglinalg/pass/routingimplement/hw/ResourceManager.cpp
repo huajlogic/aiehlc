@@ -555,3 +555,16 @@ std::optional<int> ResourceMgr::findIoIdByShimChannel(int shimCol, int channel) 
     }
     return std::nullopt;
 }
+
+// Find DataIO object by shim column and channel
+std::shared_ptr<DataIO> ResourceMgr::findDataIOByShimChannel(int shimCol, int channel) const {
+    auto ioIdOpt = findIoIdByShimChannel(shimCol, channel);
+    if (ioIdOpt) {
+        int ioId = *ioIdOpt;
+        auto dioIt = DataIOMap.find(ioId);
+        if (dioIt != DataIOMap.end()) {
+            return dioIt->second;
+        }
+    }
+    return nullptr;
+}
