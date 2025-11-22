@@ -343,9 +343,8 @@ void ParseTheCCTRoutingPath(Operation* op,
 
     std::unordered_map<Point, StreamCCTConnection, Point::Hash> & connectionData = troutingmap->tilemap;
     std::vector<Point> & orderedPathPoints = troutingmap->tilelist;
-    // --- Phase 2: Generate MLIR ops using the ordered list ---
     
-    // 2a. Create all tile operations first, IN ORDER
+    // --- Phase 2: Create all tile operations first, IN ORDER ---
     // Start with existing tiles from dsttiles (created by DmaphopTileConversionPattern)
     // Then create intermediate routing tiles that router_.createPath() inserted
     std::unordered_map<Point, Operation*, Point::Hash> allTileOps = dsttiles;
@@ -359,7 +358,31 @@ void ParseTheCCTRoutingPath(Operation* op,
         }
     }
 
-    // 2b. Create connections IN ORDER by iterating through the ordered vector
+    // --- Phase 3: Create enable shim port operations ---
+    for (const Point& point : orderedPathPoints) {
+        auto it = connectionData.find(point);
+        if (it == connectionData.end()) continue;
+        
+        const StreamCCTConnection& conn = it->second;
+        
+        if (conn.SlaveReceiveForwardDirection == PortDirection::NONE) {
+            continue;
+        }
+        
+        StringRef inputDirStr = PortDirectiontoString(conn.SlaveReceiveForwardDirection);
+        int inputPortIdx = conn.SlaveReceiveForwardDirectionPortIdx;
+
+        // Special handling for the SHIM tile to enable its external port
+        if (point == shimpoint) {
+            if (dio->type() == IOType::Input) {
+                rewriter.create<EnableExtToAieShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
+            } else {
+                rewriter.create<EnableAieToExtShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
+            }
+        }
+    }
+    
+    // --- Phase 4: Create stream switch connections IN ORDER ---
     for (const Point& point : orderedPathPoints) {
         // Look up the connection info from our map
         auto it = connectionData.find(point);
@@ -401,14 +424,8 @@ void ParseTheCCTRoutingPath(Operation* op,
         StringRef inputDirStr = PortDirectiontoString(conn.SlaveReceiveForwardDirection);
         int inputPortIdx = conn.SlaveReceiveForwardDirectionPortIdx;
 
-        // Special handling for the SHIM tile to enable its external port
+        // Create stream switch connections
         if (point == shimpoint) {
-            if (dio->type() == IOType::Input) {
-                rewriter.create<EnableExtToAieShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
-            } else {
-                rewriter.create<EnableAieToExtShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
-            }
-            
             // Create connection from shim to the next tile in the path
             if (conn.MasterSendToNextTileDirection != PortDirection::NONE) {
                 rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, shimio.getResult(),
