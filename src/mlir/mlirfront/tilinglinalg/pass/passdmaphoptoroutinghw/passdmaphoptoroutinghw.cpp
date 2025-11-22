@@ -340,13 +340,19 @@ void ParseTheCCTRoutingPath(Operation* op,
     std::vector<Point> & orderedPathPoints = troutingmap->tilelist;
     // --- Phase 2: Generate MLIR ops using the ordered list ---
     
-    // 2a. Use existing tile operations from dsttiles (already created by DmaphopTileConversionPattern)
-    // No need to create new tiles - reuse the ones already created
+    // 2a. Create all tile operations first, IN ORDER
+    // Start with existing tiles from dsttiles (created by DmaphopTileConversionPattern)
+    // Then create intermediate routing tiles that router_.createPath() inserted
     std::unordered_map<Point, Operation*, Point::Hash> allTileOps = dsttiles;
     
-    // Note: We don't create new tiles here anymore - they were already created in DmaphopTileConversionPattern
-    // If there are intermediate routing tiles not in dsttiles, they would need to be created,
-    // but for dmaphop->routinghw conversion, all tiles should already be defined
+    for (const Point& p : orderedPathPoints) {
+        if (allTileOps.find(p) == allTileOps.end()) {
+            // This is an intermediate routing tile (e.g., mem tile at row 1)
+            // that router_.createPath() inserted to connect shim to core tiles
+            allTileOps[p] = rewriter.create<routinghw::TileCreate>(
+                loc, outputType, p.r, p.c, "tile in path");
+        }
+    }
 
     // 2b. Create connections IN ORDER by iterating through the ordered vector
     for (const Point& point : orderedPathPoints) {
@@ -356,17 +362,10 @@ void ParseTheCCTRoutingPath(Operation* op,
         
         const StreamCCTConnection& conn = it->second;
         
-        // Get the tile operation - it should already exist in allTileOps
+        // Get the tile operation
         auto tileOpIt = allTileOps.find(point);
         if (tileOpIt == allTileOps.end()) {
-            // Tile not found - this shouldn't happen in dmaphop->routinghw conversion
-            // but we need to handle routing tiles that might be created by the router
-            continue;
-        }
-        
-        auto currentTileOp = dyn_cast<routinghw::TileCreate>(tileOpIt->second);
-        if (!currentTileOp) {
-            // Might be a shim tile, skip
+            // This shouldn't happen since we created all tiles above
             continue;
         }
         
@@ -375,7 +374,6 @@ void ParseTheCCTRoutingPath(Operation* op,
             if (lastPkttilemap && lastPkttilemap->tile == point) {
                 auto output = rewriter.getI32Type();
                 auto tileOp = dyn_cast<routinghw::TileCreate>((Operation* )lastPkttilemap->tileOp);
-                ///*
                 rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
                         loc,                   // Operation location
                         output,
@@ -390,17 +388,14 @@ void ParseTheCCTRoutingPath(Operation* op,
                         rewriter.getI32IntegerAttr(0),  // Packet Type for the DMA transfer
                         rewriter.getStringAttr(PortDirectiontoString(conn.MasterSendToNextTileDirection)),     // No forwarding: empty master direction
                         rewriter.getI32IntegerAttr((int)(conn.MasterSendToNextTileDirectionPortIdx)) // No forwarding: port index 0
-                );//*/
+                );
             }
-            
             continue;
-
         }
         
         StringRef inputDirStr = PortDirectiontoString(conn.SlaveReceiveForwardDirection);
         int inputPortIdx = conn.SlaveReceiveForwardDirectionPortIdx;
 
-        
         // Special handling for the SHIM tile to enable its external port
         if (point == shimpoint) {
             if (dio->type() == IOType::Input) {
@@ -408,28 +403,35 @@ void ParseTheCCTRoutingPath(Operation* op,
             } else {
                 rewriter.create<EnableAieToExtShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
             }
-        }
-       // /*
-        // Create connection to the next tile in the path
-        if (conn.MasterSendToNextTileDirection != PortDirection::NONE) {
-            if (point == shimpoint) {
-                 rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, shimio.getResult(),
+            
+            // Create connection from shim to the next tile in the path
+            if (conn.MasterSendToNextTileDirection != PortDirection::NONE) {
+                rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, shimio.getResult(),
                     inputDirStr, inputPortIdx,
                     PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
-            } else {
+            }
+        } else {
+            // Handle regular tiles (core, mem, or intermediate routing tiles)
+            auto currentTileOp = dyn_cast<routinghw::TileCreate>(tileOpIt->second);
+            if (!currentTileOp) {
+                // Not a regular tile, skip
+                continue;
+            }
+            
+            // Create connection to the next tile in the path
+            if (conn.MasterSendToNextTileDirection != PortDirection::NONE) {
                 rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
                     inputDirStr, inputPortIdx,
                     PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
             }
-        }
 
-        // Create connection to the local DMA
-        if (conn.localDMAForwardDirection != PortDirection::NONE) {
-            rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
+            // Create connection to the local DMA (if this is a destination core tile)
+            if (conn.localDMAForwardDirection != PortDirection::NONE) {
+                rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
                     inputDirStr, inputPortIdx,
                     "DMA", conn.localDMAForwardPortIdx);
+            }
         }
-           // */
     }
 }
 
@@ -462,13 +464,6 @@ struct DmaphopTileConversionPattern : public OpConversionPattern<dmaphop::tile> 
         auto loc = op.getLoc();
         auto output = rewriter.getI32Type();
         
-        // Create tile array handle once
-        //if (!routingCtx.tileArrayHandle) {
-        //    routingCtx.tileArrayHandle = rewriter.create<routinghw::TileArrayHandleCreate>(
-        //        loc, output, rewriter.getStringAttr("array handle")
-        //    );
-        //};
-
         // Extract tile attributes
         std::string tileType = op.getTiletype().str();
         int64_t col = op.getCol();
@@ -477,17 +472,24 @@ struct DmaphopTileConversionPattern : public OpConversionPattern<dmaphop::tile> 
         Operation* hwTileOp = nullptr;
         
         if (tileType == "shim") {
-            // Create IO Shim tile
-            hwTileOp = rewriter.create<routinghw::IOShimTileCreate>(
-                loc,
-                output,
-                rewriter.getI32IntegerAttr(row),
-                rewriter.getI32IntegerAttr(col),
-                rewriter.getI32IntegerAttr(col),  // IOID = col
-                rewriter.getStringAttr("shim_dma"),
-                rewriter.getI32IntegerAttr(0),  // dmadirection MM2S
-                rewriter.getI32IntegerAttr(0)   // channelused
-            );
+            // For shim tiles from dmaphop, we don't create IOShimTileCreate here
+            // The actual shim tile will be created in DmaphopPathConversionPattern
+            // based on the routing allocation (router_.createDataIO())
+            // For now, just store the info and don't create any operation
+            
+            // Store tile info but without creating an operation
+            TileInfo info;
+            info.tileOp = nullptr;  // Will be set later if needed
+            info.col = col;
+            info.row = row;
+            info.channel = 0;
+            info.tileType = tileType;
+            routingCtx.tileMap[op.getResult()] = info;
+            
+            // Erase the dmaphop.tile operation for shim tiles
+            // They will be replaced by dynamically allocated shim tiles in the path conversion
+            rewriter.eraseOp(op);
+            return success();
         } else if (tileType == "core") {
             // Create Core tile
             hwTileOp = rewriter.create<routinghw::TileCreate>(
@@ -497,20 +499,20 @@ struct DmaphopTileConversionPattern : public OpConversionPattern<dmaphop::tile> 
                 rewriter.getI32IntegerAttr(col),
                 rewriter.getStringAttr("core_tile")
             );
+            
+            // Store tile info
+            TileInfo info;
+            info.tileOp = hwTileOp;
+            info.col = col;
+            info.row = row;
+            info.channel = 0;
+            info.tileType = tileType;
+            routingCtx.tileMap[op.getResult()] = info;
+            routingCtx.orderedTileOps.push_back(hwTileOp);
+            
+            // Replace the original tile operation with the hardware tile
+            rewriter.replaceOp(op, hwTileOp->getResult(0));
         }
-
-        // Store tile info
-        TileInfo info;
-        info.tileOp = hwTileOp;
-        info.col = col;
-        info.row = row;
-        info.channel = 0;
-        info.tileType = tileType;
-        routingCtx.tileMap[op.getResult()] = info;
-        routingCtx.orderedTileOps.push_back(hwTileOp);
-        
-        // Replace the original tile operation with the hardware tile
-        rewriter.replaceOp(op, hwTileOp->getResult(0));
         
         return success();
     }
