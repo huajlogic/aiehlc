@@ -379,6 +379,21 @@ void testRoutingLowerPassPathContiguity() {
             }
             std::cout << std::endl;
             
+            // Print detailed path with port information
+            std::cout << "\nDetailed path with port connections:" << std::endl;
+            for (size_t i = 0; i < path.size(); ++i) {
+                const TileLocation& tile = path[i];
+                std::cout << "  [" << i << "] " << tile.toString();
+                
+                // Print connection info if this tile has an outgoing connection
+                if (connectionMap.count(tile)) {
+                    const auto& conn = connectionMap[tile];
+                    std::cout << "\n      Source (Slave): " << conn.slavePortDir << "[" << conn.slavePortIdx << "]"
+                              << " -> Dest (Master): " << conn.masterPortDir << "[" << conn.masterPortIdx << "]";
+                }
+                std::cout << std::endl;
+            }
+            
             // Verify all hops are contiguous
             bool isContiguous = true;
             std::vector<std::string> contiguityErrors;
@@ -398,7 +413,7 @@ void testRoutingLowerPassPathContiguity() {
             
             // Report results
             if (!path.empty()) {
-                std::cout << "Starting location: " << path[0].toString() << std::endl;
+                std::cout << "\nStarting location: " << path[0].toString() << std::endl;
                 std::cout << "Ending location: " << path.back().toString() << std::endl;
             }
             
