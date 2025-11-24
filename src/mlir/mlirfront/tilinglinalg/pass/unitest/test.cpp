@@ -99,6 +99,15 @@ void testRoutingLowerPassPathContiguity() {
     std::map<Operation*, std::vector<TileInfo>> tilesByRoutingCreate;
     std::map<Operation*, std::vector<PortConnection>> connectionsByRoutingCreate;
     
+    // Helper function to get neighbor location based on direction
+    auto getNeighbor = [](const TileLocation& loc, const std::string& dir) -> TileLocation {
+        if (dir == "NORTH") return TileLocation(loc.row + 1, loc.col);
+        if (dir == "SOUTH") return TileLocation(loc.row - 1, loc.col);
+        if (dir == "EAST") return TileLocation(loc.row, loc.col + 1);
+        if (dir == "WEST") return TileLocation(loc.row, loc.col - 1);
+        return TileLocation(-1, -1);
+    };
+    
     // Walk through the module to find routing::RoutingCreate operations
     module1.walk([&](Operation* op) {
         if (auto routingCreateOp = dyn_cast<routing::RoutingCreate>(op)) {
@@ -132,6 +141,14 @@ void testRoutingLowerPassPathContiguity() {
                 }
             });
             
+            // Helper to check if a tile location exists in our tile set
+            auto tileExists = [&opToLocation](const TileLocation& loc) -> bool {
+                for (const auto& [op, tileLoc] : opToLocation) {
+                    if (tileLoc == loc) return true;
+                }
+                return false;
+            };
+            
             // Second pass: collect all port connections
             routingCreateOp->walk([&](Operation* innerOp) {
                 if (auto connectOp = dyn_cast<routinghw::ConnectStreamSingleSwitchPort>(innerOp)) {
@@ -147,9 +164,8 @@ void testRoutingLowerPassPathContiguity() {
                             // Skip connections that involve DMA (source or dest)
                             // DMA connections typically use "DMA" in the port direction
                             if (slaveDir == "DMA" || masterDir == "DMA") {
-                                std::cout << "  Skipping DMA connection at tile (" << opToLocation[tileOp].col 
-                                          << "," << opToLocation[tileOp].row << "): "
-                                          << slaveDir << " -> " << masterDir << std::endl;
+                                std::cout << "  Skipping DMA connection at tile " << opToLocation[tileOp].toString() 
+                                          << ": " << slaveDir << " -> " << masterDir << std::endl;
                                 return;
                             }
                             
@@ -161,6 +177,150 @@ void testRoutingLowerPassPathContiguity() {
                                 masterDir,
                                 masterIdx
                             });
+                        }
+                    }
+                } else if (auto pktConnectOp = dyn_cast<routinghw::ConnectStreamPktSwitchPort>(innerOp)) {
+                    // Handle packet switch port connections
+                    if (pktConnectOp->getNumOperands() > 0) {
+                        Operation* tileOp = pktConnectOp->getOperand(0).getDefiningOp();
+                        if (opToLocation.count(tileOp)) {
+                            auto receiveSlaveDir = pktConnectOp.getReceiveslavedirection().str();
+                            auto localDmaDir = pktConnectOp.getLocaldmadirection().str();
+                            auto forwardMasterDir = pktConnectOp.getForwardmasterdirection().str();
+                            
+                            int receiveSlaveIdx = pktConnectOp.getReceiveslaveportidx();
+                            int localDmaIdx = pktConnectOp.getLocaldmaportidx();
+                            int forwardMasterIdx = pktConnectOp.getForwardmasterportidx();
+                            
+                            // For packet connections with DMA:
+                            // - If localdmadirection == "DMA", the tile has a DMA that sends data
+                            // - The forwardmasterdirection shows where DMA data goes
+                            // - The receiveslavedirection shows if tile receives from neighbor
+                            
+                            bool hasDma = (localDmaDir == "DMA");
+                            bool receivesFromNeighbor = (receiveSlaveDir != "DMA" && receiveSlaveDir != "NONE");
+                            bool forwardsToNeighbor = (forwardMasterDir != "DMA" && forwardMasterDir != "NONE");
+                            
+                            if (hasDma) {
+                                // Case 1: DMA sends to a neighbor (DMA -> stream out)
+                                // This creates an outgoing connection
+                                if (forwardsToNeighbor) {
+                                    connections.push_back({
+                                        tileOp,
+                                        opToLocation[tileOp],
+                                        localDmaDir,  // DMA as source (slave)
+                                        localDmaIdx,
+                                        forwardMasterDir,  // Direction to neighbor (master)
+                                        forwardMasterIdx
+                                    });
+                                    std::cout << "  PKT connection (DMA->stream) at tile " << opToLocation[tileOp].toString() 
+                                              << ": DMA[" << localDmaIdx << "] -> "
+                                              << forwardMasterDir << "[" << forwardMasterIdx << "]" << std::endl;
+                                }
+                                
+                                // Case 2: Tile also receives from neighbor -> DMA
+                                // This creates an incoming connection that feeds the DMA
+                                if (receivesFromNeighbor) {
+                                    connections.push_back({
+                                        tileOp,
+                                        opToLocation[tileOp],
+                                        receiveSlaveDir,  // Receive from neighbor (slave)
+                                        receiveSlaveIdx,
+                                        localDmaDir,  // To DMA (master)
+                                        localDmaIdx
+                                    });
+                                    std::cout << "  PKT connection (stream->DMA) at tile " << opToLocation[tileOp].toString()
+                                              << ": " << receiveSlaveDir << "[" << receiveSlaveIdx << "] -> "
+                                              << "DMA[" << localDmaIdx << "]" << std::endl;
+                                }
+                            } else {
+                                // Case 3: Pure stream-to-stream forwarding (no DMA involved)
+                                if (receivesFromNeighbor && forwardsToNeighbor) {
+                                    connections.push_back({
+                                        tileOp,
+                                        opToLocation[tileOp],
+                                        receiveSlaveDir,
+                                        receiveSlaveIdx,
+                                        forwardMasterDir,
+                                        forwardMasterIdx
+                                    });
+                                    std::cout << "  PKT connection (stream->stream) at tile " << opToLocation[tileOp].toString()
+                                              << ": " << receiveSlaveDir << "[" << receiveSlaveIdx << "] -> "
+                                              << forwardMasterDir << "[" << forwardMasterIdx << "]" << std::endl;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            
+            // **NEW: Third pass - infer DMA output connections for packet switches with NONE forward**
+            // This handles the case where a tile has DMA but forwardmasterdirection = "NONE"
+            // We infer the output direction by finding neighbors that receive from this tile
+            routingCreateOp->walk([&](Operation* innerOp) {
+                if (auto pktConnectOp = dyn_cast<routinghw::ConnectStreamPktSwitchPort>(innerOp)) {
+                    if (pktConnectOp->getNumOperands() > 0) {
+                        Operation* tileOp = pktConnectOp->getOperand(0).getDefiningOp();
+                        if (opToLocation.count(tileOp)) {
+                            auto localDmaDir = pktConnectOp.getLocaldmadirection().str();
+                            auto forwardMasterDir = pktConnectOp.getForwardmasterdirection().str();
+                            int localDmaIdx = pktConnectOp.getLocaldmaportidx();
+                            
+                            // Only process tiles with DMA and no explicit forward direction
+                            if (localDmaDir == "DMA" && forwardMasterDir == "NONE") {
+                                TileLocation dmaLoc = opToLocation[tileOp];
+                                std::cout << "  Checking DMA tile at " << dmaLoc.toString() 
+                                          << " for implicit output connections..." << std::endl;
+                                
+                                // Check all 4 directions for tiles that receive from this DMA tile
+                                std::vector<std::string> directions = {"NORTH", "SOUTH", "EAST", "WEST"};
+                                
+                                for (const auto& dir : directions) {
+                                    TileLocation neighborLoc = getNeighbor(dmaLoc, dir);
+                                    if (!neighborLoc.isValid() || !tileExists(neighborLoc)) continue;
+                                    
+                                    // What direction does neighbor use to receive from us?
+                                    std::string oppositeDir = "";
+                                    if (dir == "NORTH") oppositeDir = "SOUTH";
+                                    else if (dir == "SOUTH") oppositeDir = "NORTH";
+                                    else if (dir == "EAST") oppositeDir = "WEST";
+                                    else if (dir == "WEST") oppositeDir = "EAST";
+                                    
+                                    // Check if neighbor has a connection receiving from oppositeDir
+                                    bool foundReceiver = false;
+                                    routingCreateOp->walk([&](Operation* checkOp) {
+                                        if (auto checkConnect = dyn_cast<routinghw::ConnectStreamSingleSwitchPort>(checkOp)) {
+                                            if (checkConnect->getNumOperands() > 0) {
+                                                Operation* checkTileOp = checkConnect->getOperand(0).getDefiningOp();
+                                                if (opToLocation.count(checkTileOp) && 
+                                                    opToLocation[checkTileOp] == neighborLoc) {
+                                                    auto slaveDir = checkConnect.getSlaveportdirection().str();
+                                                    if (slaveDir == oppositeDir) {
+                                                        foundReceiver = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                    
+                                    if (foundReceiver) {
+                                        // Found a neighbor that receives from this DMA tile
+                                        // Create the inferred DMA output connection
+                                        connections.push_back({
+                                            tileOp,
+                                            dmaLoc,
+                                            localDmaDir,  // DMA as source
+                                            localDmaIdx,
+                                            dir,  // Direction to neighbor
+                                            0  // Use index 0 for inferred connection
+                                        });
+                                        std::cout << "  ✓ Inferred DMA output: " << dmaLoc.toString()
+                                                  << " DMA[" << localDmaIdx << "] -> " << dir 
+                                                  << " to neighbor " << neighborLoc.toString() << std::endl;
+                                        break;  // Found the output, stop checking other directions
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -179,15 +339,6 @@ void testRoutingLowerPassPathContiguity() {
     }
     
     std::cout << "Found " << tilesByRoutingCreate.size() << " routing path(s)" << std::endl;
-    
-    // Helper function to get neighbor location based on direction
-    auto getNeighbor = [](const TileLocation& loc, const std::string& dir) -> TileLocation {
-        if (dir == "NORTH") return TileLocation(loc.row+1, loc.col );
-        if (dir == "SOUTH") return TileLocation(loc.row-1, loc.col );
-        if (dir == "EAST") return TileLocation(loc.row, loc.col + 1);
-        if (dir == "WEST") return TileLocation(loc.row, loc.col - 1);
-        return TileLocation(-1, -1);
-    };
     
     // Helper function to check if two tiles are contiguous (adjacent)
     auto isContiguousTiles = [](const TileLocation& tile1, const TileLocation& tile2) -> bool {
@@ -209,7 +360,8 @@ void testRoutingLowerPassPathContiguity() {
         
         // ========== STEP 1: Build map for all tile locations and operations ==========
         std::map<TileLocation, TileInfo> tileMap;
-        std::map<TileLocation, PortConnection> connectionMap;
+        // Changed from map to multimap to support multiple connections per tile
+        std::multimap<TileLocation, PortConnection> connectionMap;
         
         for (const auto& tile : tiles) {
             tileMap[tile.loc] = tile;
@@ -217,7 +369,7 @@ void testRoutingLowerPassPathContiguity() {
         }
         
         for (const auto& conn : connections) {
-            connectionMap[conn.tileLoc] = conn;
+            connectionMap.insert({conn.tileLoc, conn});
             std::cout << "Connection at " << conn.tileLoc.toString() << ": "
                       << conn.slavePortDir << "[" << conn.slavePortIdx << "] -> "
                       << conn.masterPortDir << "[" << conn.masterPortIdx << "]" << std::endl;
@@ -231,11 +383,15 @@ void testRoutingLowerPassPathContiguity() {
         std::set<TileLocation> tilesWithIncoming;
         for (const auto& conn : connections) {
             // Master port sends data in masterPortDir direction
+            // Skip if master is DMA (not a tile-to-tile connection)
+            if (conn.masterPortDir == "DMA") continue;
+            
             TileLocation targetTile = getNeighbor(conn.tileLoc, conn.masterPortDir);
             if (targetTile.isValid() && tileMap.count(targetTile)) {
                 tilesWithIncoming.insert(targetTile);
                 std::cout << "  Tile " << targetTile.toString() 
-                          << " receives from " << conn.tileLoc.toString() << std::endl;
+                          << " receives from " << conn.tileLoc.toString() 
+                          << " via " << conn.masterPortDir << std::endl;
             }
         }
         
@@ -249,17 +405,25 @@ void testRoutingLowerPassPathContiguity() {
             tilesWithConnections.insert(conn.tileLoc);
         }
         
+        // Find tiles with outgoing connections (excluding DMA-only)
+        std::set<TileLocation> tilesWithOutgoing;
         for (const auto& conn : connections) {
-            if (tilesWithIncoming.find(conn.tileLoc) == tilesWithIncoming.end()) {
-                startTiles.push_back(conn.tileLoc);
-                std::cout << "  Found start tile: " << conn.tileLoc.toString() << std::endl;
+            if (conn.masterPortDir != "DMA") {
+                tilesWithOutgoing.insert(conn.tileLoc);
+                if (tilesWithIncoming.find(conn.tileLoc) == tilesWithIncoming.end()) {
+                    // This tile sends but doesn't receive - it's a start point
+                    if (std::find(startTiles.begin(), startTiles.end(), conn.tileLoc) == startTiles.end()) {
+                        startTiles.push_back(conn.tileLoc);
+                        std::cout << "  Found start tile: " << conn.tileLoc.toString() << std::endl;
+                    }
+                }
             }
         }
         
-        // Find end tiles (tiles that are in tileMap but have no outgoing connections)
+        // Find end tiles (tiles that receive but have no outgoing tile-to-tile connections)
         for (const auto& [loc, tileInfo] : tileMap) {
-            if (tilesWithConnections.find(loc) == tilesWithConnections.end() && 
-                tilesWithIncoming.find(loc) != tilesWithIncoming.end()) {
+            if (tilesWithIncoming.find(loc) != tilesWithIncoming.end() &&
+                tilesWithOutgoing.find(loc) == tilesWithOutgoing.end()) {
                 endTiles.push_back(loc);
                 std::cout << "  Found end tile: " << loc.toString() << std::endl;
             }
@@ -330,39 +494,55 @@ void testRoutingLowerPassPathContiguity() {
             std::cout << "Starting at: " << currentTile.toString() << std::endl;
             
             // Follow the path by looking at master port directions
-            while (connectionMap.count(currentTile)) {
-                const auto& conn = connectionMap[currentTile];
+            while (true) {
+                // Find outgoing connection to next tile (not DMA)
+                auto range = connectionMap.equal_range(currentTile);
+                bool foundNext = false;
                 
-                // Find next tile based on master port direction
-                TileLocation nextTile = getNeighbor(currentTile, conn.masterPortDir);
+                for (auto it = range.first; it != range.second; ++it) {
+                    const auto& conn = it->second;
+                    
+                    // Skip DMA connections - we're looking for tile-to-tile
+                    if (conn.masterPortDir == "DMA") continue;
+                    
+                    // Find next tile based on master port direction
+                    TileLocation nextTile = getNeighbor(currentTile, conn.masterPortDir);
+                    
+                    std::cout << "  Current tile " << currentTile.toString()
+                              << " master port " << conn.masterPortDir 
+                              << " points to " << nextTile.toString() << std::endl;
+                    
+                    // Check if next tile is valid and in our tile map
+                    if (!nextTile.isValid() || !tileMap.count(nextTile)) {
+                        std::cout << "  Next tile not found in tile map." << std::endl;
+                        continue;
+                    }
+                    
+                    // Check for cycles
+                    if (visited.count(nextTile)) {
+                        std::cout << "  Cycle detected at " << nextTile.toString() << ", skipping." << std::endl;
+                        continue;
+                    }
+                    
+                    // ========== STEP 4: Verify contiguity ==========
+                    if (!isContiguousTiles(currentTile, nextTile)) {
+                        std::cout << "  ✗ ERROR: Non-contiguous hop from " << currentTile.toString()
+                                  << " to " << nextTile.toString() << std::endl;
+                    } else {
+                        std::cout << "  ✓ Contiguous hop to " << nextTile.toString() << std::endl;
+                    }
+                    
+                    path.push_back(nextTile);
+                    visited.insert(nextTile);
+                    currentTile = nextTile;
+                    foundNext = true;
+                    break;  // Follow first valid outgoing connection
+                }
                 
-                std::cout << "  Current tile " << currentTile.toString()
-                          << " master port " << conn.masterPortDir 
-                          << " points to " << nextTile.toString() << std::endl;
-                
-                // Check if next tile is valid and in our tile map
-                if (!nextTile.isValid() || !tileMap.count(nextTile)) {
-                    std::cout << "  Next tile not found in tile map, ending path." << std::endl;
+                if (!foundNext) {
+                    std::cout << "  No more outgoing connections, ending path." << std::endl;
                     break;
                 }
-                
-                // Check for cycles
-                if (visited.count(nextTile)) {
-                    std::cout << "  Cycle detected at " << nextTile.toString() << ", ending path." << std::endl;
-                    break;
-                }
-                
-                // ========== STEP 4: Verify contiguity ==========
-                if (!isContiguousTiles(currentTile, nextTile)) {
-                    std::cout << "  ✗ ERROR: Non-contiguous hop from " << currentTile.toString()
-                              << " to " << nextTile.toString() << std::endl;
-                } else {
-                    std::cout << "  ✓ Contiguous hop to " << nextTile.toString() << std::endl;
-                }
-                
-                path.push_back(nextTile);
-                visited.insert(nextTile);
-                currentTile = nextTile;
             }
             
             // ========== Path verification for this start point ==========
@@ -385,11 +565,15 @@ void testRoutingLowerPassPathContiguity() {
                 const TileLocation& tile = path[i];
                 std::cout << "  [" << i << "] " << tile.toString();
                 
-                // Print connection info if this tile has an outgoing connection
-                if (connectionMap.count(tile)) {
-                    const auto& conn = connectionMap[tile];
-                    std::cout << "\n      Source (Slave): " << conn.slavePortDir << "[" << conn.slavePortIdx << "]"
-                              << " -> Dest (Master): " << conn.masterPortDir << "[" << conn.masterPortIdx << "]";
+                // Print all connection info for this tile
+                auto range = connectionMap.equal_range(tile);
+                if (range.first != range.second) {
+                    std::cout << "\n      Connections:";
+                    for (auto it = range.first; it != range.second; ++it) {
+                        const auto& conn = it->second;
+                        std::cout << "\n        " << conn.slavePortDir << "[" << conn.slavePortIdx << "]"
+                                  << " -> " << conn.masterPortDir << "[" << conn.masterPortIdx << "]";
+                    }
                 }
                 std::cout << std::endl;
             }
