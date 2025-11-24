@@ -11,6 +11,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinDialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "routingmanager.h"
@@ -156,8 +157,8 @@ struct RoutingCreateTodfschedulePattern : public OpConversionPattern<routing::Ro
             pingReleaseLock.getResult(), 
             pongReleaseLock.getResult());
         
-        // Create empty region for DMA loop
-        Block *dmaBlock = rewriter.createBlock(&dmaLoop.getBodyRegion());
+        // Create empty region for DMA loop (the region is named 'body')
+        Block *dmaBlock = rewriter.createBlock(&dmaLoop.getBody());
         rewriter.setInsertionPointToEnd(dmaBlock);
         
         // Set insertion point after DMA loop for compute logic
@@ -260,6 +261,10 @@ struct RoutingCreateTodfschedulePattern : public OpConversionPattern<routing::Ro
         return success();
     }
 };
+
+} // namespace
+
+namespace mlir {
 
 void DmaphopTodfschedulePass::runOnOperation() {
     MLIRContext *context = &getContext();
