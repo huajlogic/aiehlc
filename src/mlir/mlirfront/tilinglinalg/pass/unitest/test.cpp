@@ -10,6 +10,10 @@
 #include "../passroutingtodmap/routingtodmap.h"
 #include "../passdmaptodmaphop/dmaptodmaphop.h"
 #include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
+#include "../passdmaphoptodfschedule/passdmaphoptodfschedule.h"
+#include "dmapmanager.h"
+#include "dmaphopmanager.h"
+#include "dfschedulemanager.h"
 #include "routingunrolling.h"
 #include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 //#include "llvm/IR/IRPrintingPasses.h"
@@ -789,6 +793,52 @@ void routingtodmap() {
     }
     return;
 }
+
+void routingtodfschedule() {
+    MLIRContext ctx;
+    
+    routingmanager mtest;
+    dfschedulemanager dfscheduletest;
+    
+    mtest.loaddialect(&ctx);
+    dfscheduletest.loaddialect(&ctx);
+    ctx.getOrLoadDialect<arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::func::FuncDialect>();
+    ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    
+    // Create test routing module
+    auto module1 = mtest.ops_testNew(&ctx, 1);
+    
+    std::cout << "=== Initial Routing Module ===" << std::endl;
+    module1.dump();
+    
+    // Create pass manager
+    mlir::PassManager pm(&ctx);
+    mlir::PrintIRPassOptions options;
+    
+    // Unroll routing operations
+    options.label = "After RoutingUnrollingLowerPass:";
+    pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
+    pm.addPass(mlir::createPrintIRPass(options));
+    
+    // Convert routing to dfschedule
+    options.label = "After DmaphopTodfschedulePass:";
+    pm.addPass(std::make_unique<DmaphopTodfschedulePass>());
+    pm.addPass(mlir::createPrintIRPass(options));
+    
+    // Run the pass pipeline
+    if (failed(pm.run(module1))) {
+        llvm::errs() << "ERROR: Pass pipeline failed!\n";
+        return;
+    }
+    
+    std::cout << "\n=== Final Module with dfschedule ===" << std::endl;
+    module1.dump();
+    
+    return;
+}
+
 int main(int argc, char* argv[]) {
     if (argc > 1) {
         std::string arg = argv[1];
@@ -798,6 +848,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "test") {
             std::cout << "Executing unit test for RoutingLowerPass..." << std::endl;
             testRoutingLowerPassPathContiguity();
+        } else if (arg == "dfschedule") {
+            std::cout << "Executing routingtodfschedule..." << std::endl;
+            routingtodfschedule();
         } else {
             std::cout << "Executing routingtodmap..." << std::endl;
             routingtodmap();
