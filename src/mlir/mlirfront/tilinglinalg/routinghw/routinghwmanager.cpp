@@ -60,7 +60,7 @@ mlir::func::FuncOp routinghwmanager::createroutingfunc(MLIRContext* ctx) {
     for (int i = 0; i < 8 ; i++) {
         std::ostringstream ostr;
         ostr << "tile" << i + 1;
-        auto tile1 = builder.create<TileCreate>(builder.getUnknownLoc(), output, routinghandle.getResult(),3+i, 0, ostr.str());
+        auto tile1 = builder.create<TileCreate>(builder.getUnknownLoc(), output, 3+i, 0, ostr.str());
         tileArray.push_back(tile1);
     }
     for (int i = 0; i < 8; i++) {

@@ -71,7 +71,8 @@ class dmapmanager{
 public:
     dmapmanager(){};
     ModuleOp ops_test(MLIRContext* ctx,int totalN=2) ;
-    void createdmapfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
+    //void createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx,SymbolTable& symTable);
+    void createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx);
     static void loaddialect(MLIRContext* ctx);
 };
 #endif//__DMAP_MANAGER__

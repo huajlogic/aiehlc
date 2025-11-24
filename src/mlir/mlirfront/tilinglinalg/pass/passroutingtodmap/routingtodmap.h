@@ -6,6 +6,7 @@
 #ifndef __ROUTING_TODMAP__
 #define __ROUTING_TODMAP__
 #include "common.h"
+#include "dmapmanager.h"
 #include "routingmanager.h"
 #include "routing/routingpath.h"
 #include "routing/routingtopology.h"

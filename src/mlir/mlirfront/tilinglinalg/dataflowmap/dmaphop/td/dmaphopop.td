@@ -1,3 +1,8 @@
+/******************************************************************************
+* Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
+
 /*
 // --- 1. resource
 %shim_engine = dataflowmap.create_engine <"shim"> {id = 0}
@@ -254,24 +259,34 @@ def dmaphop_create_hop : dmaphopop<"create_hop"> {
 
 // --- 4. Path Creation Operation ---
 def dmaphop_create_path : dmaphopop<"create_path"> {
-  let summary = "Creates a path from a sequence of hops with consumers and tee points";
+  let summary = "Creates a path from a sequence of hops with producers, consumers and tee points";
   let description = [{
     Creates a complete data movement path from a sequence of hops, specifying:
     - List of hops that form the path
-    - Consumer ports that will receive the data
+    - Producer ports that generate/send the data (for DMA S2MM: core -> shim)
+    - Consumer ports that will receive the data (for DMA MM2S: shim -> core)
     - Tee points where data splitting occurs
+    
+    Semantics:
+    - producers: Output ports that initiate data transfer (used for Pull/S2MM operations)
+                 Example: core output ports sending data back to shim/memory
+    - consumers: Input ports that receive data (used for Push/MM2S operations)
+                 Example: core input ports receiving data from shim/memory
+    - tee_points: Ports where data is duplicated/broadcasted to multiple destinations
   }];
 
   let arguments = (ins
     Variadic<dmaphophoptype>:$hops,
-    ArrayAttr:$consumers,    // Array of ports that consume data
-    ArrayAttr:$tee_points    // Array of ports where data splitting occurs
+    ArrayAttr:$producers,    // Array of symbol refs to output ports (DMA send: S2MM)
+    ArrayAttr:$consumers,    // Array of symbol refs to input ports (DMA receive: MM2S)
+    ArrayAttr:$tee_points    // Array of symbol refs to ports where data splitting occurs
   );
   
   let results = (outs dmaphoppathtype:$path);
   
   let assemblyFormat = [{
     `[` $hops `]` `{`
+      `producers` `=` `[` $producers `]` `,`
       `consumers` `=` `[` $consumers `]` `,`
       `tee_points` `=` `[` $tee_points `]`
     `}` attr-dict `->` type($path)
@@ -303,6 +318,18 @@ def dmaphop_push : dmaphopop<"push"> {
   let assemblyFormat = "$data `onto` $path `outputs` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
 }
  
+ def dmaphop_pull : dmaphopop<"pull"> {
+  let summary = "pull data through a path to multiple destinations";
+  let arguments = (ins
+    AnyMemRef:$data,
+    dmaphoppathtype:$path,
+    Variadic<AnyMemRef>:$output_buffers,
+    Variadic<dmaphopporttype>:$output_ports
+  );
+  let traits = [SameVariadicOperandSize];
+  let assemblyFormat = "$data `from` $path `input` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
+}
+
 // --- 7. Sync Operation ---
 def dmaphop_sync : dmaphopop<"sync"> {
   let summary = "Synchronizes completion of transfers on a path";

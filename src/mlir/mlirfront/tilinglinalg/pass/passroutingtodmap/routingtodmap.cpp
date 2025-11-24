@@ -6,7 +6,7 @@
 #include "routingtodmap.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include <sstream>
-//int ioIdx = 0;
+int dmapioIdx = 0;
 //connectpktstreamswitchport
 /*
 std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
@@ -896,14 +896,16 @@ private:
 
 //RoutingCreate
 struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
-    explicit RoutingmovedatabyioConvertdmap(MLIRContext * ctx, LLVMTypeConverter &converter, RoutingTopology & router):
+    explicit RoutingmovedatabyioConvertdmap(MLIRContext * ctx, LLVMTypeConverter &converter, RoutingTopology & router, uint32_t oplevel):
         ConversionPattern(routing::movedatabyio::getOperationName(),1, ctx), typeconverter(converter), router_(router) {
             //setHasBoundedRewriteRecursion(true);
+            //MLIRContext * context = ctx;
+            moplevel = oplevel;
         }
 
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
         //function to get blockarg constant
-        /*
+        ///*
         auto getRoutingCreateConsArgu = [&] (Value operand) -> int {
             if (auto barg = dyn_cast<BlockArgument>(operand)) {
                 Operation *parentOp = barg.getOwner()->getParentOp();
@@ -1000,8 +1002,133 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
             }
         }
         auto output = rewriter.getI32Type();
-        */
+       // */
+        auto ctx = getContext();
+        auto ioout = dmap::dmapioenginetypeType::get(ctx); 
+        printf("before xxxx---0----\n");
+        auto io = rewriter.create<dmap::define_io_engine>(rewriter.getUnknownLoc(),  ioout, dmapioIdx++, "SHIM"); 
+        auto ioconfigret = dmap::dmapioconfigType::get(ctx);
 
+        // Define patterns for SEND and RECEIVE
+        auto sendpattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("SEND"), 16, 1, 1);
+        auto receivepattern = dmap::dataaccesspatternAttr::get(ctx, rewriter.getStringAttr("RECEIVE"), 16, 1, 1);
+        
+        // Determine patterns based on processing_type
+        dmap::dataaccesspatternAttr io_pattern;
+        dmap::dataaccesspatternAttr core_group_pattern;
+        std::string port_symbol_name;
+
+        if (processing_type == 0) { // Broadcast
+            io_pattern = sendpattern;
+            core_group_pattern = receivepattern;
+            port_symbol_name = "receive_port";
+        } else { // Gather (processing_type == 2)
+            io_pattern = receivepattern;
+            core_group_pattern = sendpattern;
+            port_symbol_name = "send_port";
+        }
+       
+        mlir::Type pgeout = dmap::dmacoreenginegroupType::get(ctx);
+        auto peg = rewriter.create<define_core_group>(rewriter.getUnknownLoc(),  pgeout, round_idx, tileNum, split_axis);
+        //config
+        mlir::Type portconfig = dmap::dmapportconfigType::get(ctx);
+        auto pf = rewriter.create<dmap::define_port_configure>(rewriter.getUnknownLoc(), portconfig, port_symbol_name, core_group_pattern);
+      
+        //
+        //Data
+        mlir::SmallVector<mlir::Attribute, 4> shapeElems;
+        shapeElems.push_back(rewriter.getI64IntegerAttr(16));
+        shapeElems.push_back(rewriter.getI64IntegerAttr(16));
+        mlir::ArrayAttr shapettr = mlir::ArrayAttr::get(ctx, shapeElems);
+        mlir::Type elementType = rewriter.getF32Type();
+        //mlir::Type myDataHandleType = dmap::dmapdataType::get(ctx);
+        mlir::Type myDataHandleType = rewriter.getI32Type();
+        //auto data = rewriter.create<create_data>(rewriter.getUnknownLoc(),  myDataHandleType, shapettr, elementType);
+        //------
+        auto shimioconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  io.getResult(), io_pattern);
+        //
+        //config port group
+        llvm::SmallVector<dmap::dataconfmapitemAttr> itemsVector;
+        for (int i = 0; i < tileNum; i++) {
+            dmap::dataconfmapitemAttr item = dmap::dataconfmapitemAttr::get(ctx,i, mlir::SymbolRefAttr::get(ctx, port_symbol_name));
+            itemsVector.push_back(item);
+        }
+        
+        dmap::dataconfigmapAttr configMapAttr = dmap::dataconfigmapAttr::get(ctx,itemsVector);
+        auto gcret = dmap::dmacoregroupconfigType::get(ctx);
+        auto gcmap = rewriter.create<create_core_group_with_config>(rewriter.getUnknownLoc(),  gcret, peg.getResult(), "row", configMapAttr);
+        auto streamret = dmap::dmapportstreamType::get(ctx);
+        //op level is a outside parameter, opby mem tile will pass mem tile
+        if (moplevel == 1) {
+            auto memio = rewriter.create<define_io_engine>(rewriter.getUnknownLoc(),  ioout, 0, "MEM"); 
+            ///*
+            auto memiorecvconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  memio.getResult(),receivepattern);
+            auto memiosendconfig = rewriter.create<create_io_engin_with_config>(rewriter.getUnknownLoc(),  ioconfigret,  memio.getResult(),sendpattern);
+            
+            auto shimToMemAttr = dmapioAttr::get(ctx, dmapio::DMAP_SHIMIO);
+            auto memToCoreAttr = dmapioAttr::get(ctx, dmapio::DMAP_MEMTILEIO);
+            
+            auto groupIndexAttr = rewriter.getI32IntegerAttr(0);
+            auto streamIdAttr1 = rewriter.getI32IntegerAttr(1);
+            
+            Value stream_src, stream_dst;
+            if (processing_type == 0) { // Broadcast: SHIM -> MEM -> CORE
+                stream_src = shimioconfig.getResult();
+                stream_dst = memiorecvconfig.getResult();
+            } else { // Gather: CORE -> MEM -> SHIM
+                stream_src = gcmap.getResult();
+                stream_dst = memiorecvconfig.getResult();
+            }
+            auto streamhandle1 = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, stream_src, stream_dst, shimToMemAttr, groupIndexAttr, streamIdAttr1);
+
+            if (processing_type == 0) { // Broadcast: SHIM -> MEM -> CORE
+                stream_src = memiosendconfig.getResult();
+                stream_dst = gcmap.getResult();
+            } else { // Gather: CORE -> MEM -> SHIM
+                stream_src = memiosendconfig.getResult();
+                stream_dst = shimioconfig.getResult();
+            }
+            auto streamhandle2 = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, stream_src, stream_dst, memToCoreAttr, groupIndexAttr, streamIdAttr1);
+
+            // Create a chained stream from streamhandle1 and streamhandle2, then push once to the chained stream.
+            auto chainType = dmap::dmapportchainstreamType::get(ctx);
+            // The generated op build expects (TypeRange resultTypes, ValueRange operands, ArrayRef<NamedAttribute> attrs).
+            auto chainStreamOp = rewriter.create<createchainstream>(rewriter.getUnknownLoc(),
+                                                                   chainType,
+                                                                   mlir::ValueRange{streamhandle1.getResult(),
+                                                                                    streamhandle2.getResult()});
+            auto chainStream = chainStreamOp.getResult();
+
+            // Single push/pull that targets the chained stream
+            if (processing_type == 0) {
+                rewriter.create<push>(rewriter.getUnknownLoc(), extract_data.getResult(), chainStream);
+            } else {
+                rewriter.create<pull>(rewriter.getUnknownLoc(), extract_data.getResult(), chainStream);
+            }
+            //*/
+        } else {
+            auto shimToCoreAttr = dmapioAttr::get(ctx, dmapio::DMAP_SHIMIO);
+            
+            auto groupIndexAttr = rewriter.getI32IntegerAttr(0);
+            auto streamIdAttr = rewriter.getI32IntegerAttr(1);
+            
+            Value stream_src, stream_dst;
+            if (processing_type == 0) { // Broadcast: SHIM -> CORE
+                stream_src = shimioconfig.getResult();
+                stream_dst = gcmap.getResult();
+            } else { // Gather: CORE -> SHIM
+                stream_src = gcmap.getResult();
+                stream_dst = shimioconfig.getResult();
+            }
+            auto streamhandle = rewriter.create<createstream>(rewriter.getUnknownLoc(),  streamret, stream_src, stream_dst, shimToCoreAttr, groupIndexAttr, streamIdAttr);
+            
+            if (processing_type == 0) {
+                rewriter.create<push>(rewriter.getUnknownLoc(), extract_data.getResult(),streamhandle.getResult());
+            } else {
+                rewriter.create<pull>(rewriter.getUnknownLoc(), extract_data.getResult(),streamhandle.getResult());
+            }
+        }
+        //
         rewriter.eraseOp(op);
 
         return success();
@@ -1009,6 +1136,8 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
 private:
     LLVMTypeConverter& typeconverter;
     RoutingTopology & router_;
+    uint32_t moplevel;
+    //MLIRContext * context;
 };
 
 void RoutingToDmapPass::getDependentDialects(DialectRegistry &registry) const {
@@ -1022,7 +1151,7 @@ void RoutingToDmapPass::runOnOperation() {
     RewritePatternSet patterns(&ctx),patternsGlobal(&ctx);
     ConversionTarget target(ctx);
     //target.addIllegalDialect<routing::routingdialect>();
-    //target.addLegalDialect<routinghw::RoutingHWDialect>();
+    target.addLegalDialect<dmap::dmapdialect>();
     target.addLegalOp<routing::RoutingCreate>();
     target.addLegalOp<routing::YieldOp>();
     //target.addLegalOp<routing::createhwmesh>();
@@ -1044,15 +1173,15 @@ void RoutingToDmapPass::runOnOperation() {
     */
     //RoutingTopology rtopology("Gen2");
     
-    patterns.add<partitiontensorrconvert>(&ctx, typeconverter);
+    //patterns.add<partitiontensorrconvert>(&ctx, typeconverter);
     patterns.add<partitionmeshconvert>(&ctx, typeconverter);
 
-    patterns.add<extract_dataconvertdmap>(&ctx, typeconverter);
+    //patterns.add<extract_dataconvertdmap>(&ctx, typeconverter);
     patterns.add<extract_tilesconvert>(&ctx, typeconverter);
     patterns.add<routinggatheroutconvert>(&ctx, typeconverter,rtopology_);
 
     patterns.add<RoutingcreatehwiowithtargetConvert>(&ctx, typeconverter);
-    patterns.add<RoutingmovedatabyioConvertdmap>(&ctx, typeconverter,rtopology_);
+    patterns.add<RoutingmovedatabyioConvertdmap>(&ctx, typeconverter,rtopology_, 0/*op through memtile or not*/);
     
     
     //patterns.add<arithconstantconvert>(&ctx, typeconverter);
@@ -1066,7 +1195,7 @@ void RoutingToDmapPass::runOnOperation() {
     
 
     patternsGlobal.add<createhwmeshconvert>(&ctx, typeconverter);
-    patternsGlobal.add<createdummytensorconvert>(&ctx, typeconverter);
+    //patternsGlobal.add<createdummytensorconvert>(&ctx, typeconverter);
     //rewrite the ops inside scf::exe
     ///*
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));

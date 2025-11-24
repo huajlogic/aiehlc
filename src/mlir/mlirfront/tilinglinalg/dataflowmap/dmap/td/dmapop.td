@@ -9,8 +9,8 @@ include "dmapattr.td"
 /*
       %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
       %pegroup = dataflowmap.dmap_create_pe_group {group_idx = 1, pe_count=4, "row"}
-      %coreenginegroup = dataflowmap.dmap_create_core_engine_group {1, 4, "row"}
-      %ioengine = dataflowmap.dmap_create_io_engine {0, "shim"}
+      %coreenginegroup = dataflowmap.dmap_define_core_group {1, 4, "row"}
+      %ioengine = dataflowmap.dmap_define_io_engine {0, "shim"}
       %portsend = dataflowmap.configure_io %ioengine {peorioidx=0, dataacces=}  
       %portreceive1 = dataflowmap.configure_io on %{peorioidx = 0, dataacces=}  
       %portreceive2 = dataflowmap.configure_io on %{peorioidx = 1, dataacces=}   
@@ -18,7 +18,7 @@ include "dmapattr.td"
       %broadcast_stream = dataflowmap.create_stream %send_port, %receive_group         
       dataflowmap.push %data, %broadcast_stream {cache_policy = "force_memtile" }
 */
-def dmap_FuncOp : dmapop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
+def dmap_FuncOp : dmapop<"func",[SymbolTable]>
 {
     let summary = "Defines a function in the Starplat Dialect";
     let description = [{This operation represents a function definiton in the Starplat dialect.
@@ -27,11 +27,48 @@ def dmap_FuncOp : dmapop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
                         }];
 
   let arguments = (ins 
-                    SymbolNameAttr:$sym_name,
-                    TypeAttrOf<FunctionType>:$funcType
+                    StrAttr:$sym_name
                   );
 
-  let regions = (region AnyRegion:$body);
+  //let regions = (region AnyRegion:$body);
+  let regions = (region SizedRegion<1>:$body);
+  let results = (outs I32:$output);
+  let builders = [
+    OpBuilder<(ins 
+				   "Attribute":$Memo,
+                   "function_ref<void(OpBuilder &, Location)>":$bodyBuilder),
+    [{
+      // no region creatation
+	  // 2. Add operands to the state object.
+      // 3. Add attributes to the state object.
+      // Note that we must provide the attribute's name as a string.
+      $_state.addAttribute("sym_name", Memo);
+
+      // 2. Region 和 Block
+      auto *bodyRegion = $_state.addRegion();
+      Block *bodyBlock = new Block();
+      bodyRegion->push_back(bodyBlock);
+
+      // 3. use the lambda to fill Block
+      OpBuilder::InsertionGuard guard($_builder);
+      $_builder.setInsertionPointToStart(bodyBlock);
+      auto loc = mlir::UnknownLoc::get($_builder.getContext());
+      bodyBuilder($_builder, loc);
+    }]>
+  ];
+  //let hasCustomAssemblyFormat = 1;
+}
+
+def dmap_YieldOp : dmapop<"yield", [Terminator]> {
+  let summary = "Terminator for regions in routing ops";
+  let description = [{
+    The `routing.yield` operation is a terminator that yields a value from
+    a region within a `routing` operation.
+  }];
+
+  //let arguments = (ins I32:$value);
+  //let arguments = (ins);
+  //let results = (outs); // No results
 }
 
 def dmap_create_data : dmapop<"create_data"> {
@@ -44,15 +81,16 @@ def dmap_create_data : dmapop<"create_data"> {
     ArrayAttr:$shape,
     TypeAttr:$element_type
   );
-  let results = (outs dmapdatatype:$data );
+  //let results = (outs dmapdatatype:$data );
+  let results = (outs I32:$data );
 
   let assemblyFormat = [{
     attr-dict `->` type($data)
   }];
 }
 
-def dmap_create_core_engine_group : dmapop<"create_core_engine_group"> {
-  let summary = "create core engine group";
+def dmap_define_core_group : dmapop<"define_core_group"> {
+  let summary = "define core engine group";
   let description = [{
 
   }];
@@ -69,7 +107,7 @@ def dmap_create_core_engine_group : dmapop<"create_core_engine_group"> {
   }];
 }
 
-def dmap_create_io_engine : dmapop<"create_io_engine"> {
+def dmap_define_io_engine : dmapop<"define_io_engine"> {
   let summary = "create io group";
   let description = [{
 
@@ -86,7 +124,7 @@ def dmap_create_io_engine : dmapop<"create_io_engine"> {
   }];
 }
 
-def dmap_port_configure_create : dmapop<"port_configure_create", [Symbol]> {
+def dmap_define_port_configure : dmapop<"define_port_configure", [Symbol]> {
   let summary = "this is port config.";
   let description = [{
     Binds a physical hardware handle (e.g., a tile from the routinghw dialect)
@@ -98,7 +136,7 @@ def dmap_port_configure_create : dmapop<"port_configure_create", [Symbol]> {
     SymbolNameAttr:$sym_name,
     dataaccesspattern:$accesspattern
   );
-  let results = (outs dmapioconfigtype:$portconfig);
+  let results = (outs dmapportconfigtype:$portconfig);
   //let assemblyFormat = [{
   let assemblyFormat =   "$sym_name `:` $accesspattern attr-dict-with-keyword  `->` type($portconfig)";
   //}];
@@ -108,7 +146,7 @@ def UseSymbolOp : Op<dmapdialect, "use_symbol", []> {
   let assemblyFormat = "$target attr-dict";
 }
 
-def dmap_configure_coregroup : dmapop<"configure_coregroup"> {
+def dmap_create_core_group_with_config : dmapop<"create_core_group_with_config"> {
   let summary = "this is port config.";
   let description = [{
     the map between core index and configure.
@@ -125,7 +163,7 @@ def dmap_configure_coregroup : dmapop<"configure_coregroup"> {
   }];
 }
 
-def dmap_configure_io_engine : dmapop<"configure_io_engine"> {
+def dmap_create_io_engin_with_config : dmapop<"create_io_engin_with_config"> {
   let summary = "Configures a logical data port on a physical hardware entity.";
   let description = [{
     Binds a physical hardware handle (e.g., a tile from the routinghw dialect)
@@ -134,14 +172,14 @@ def dmap_configure_io_engine : dmapop<"configure_io_engine"> {
   }];
 
   let arguments = (ins
-    dmapioenginetype :$peioengine,
+    dmapioenginetype :$ioengine,
     dataaccesspattern:$accesspattern
   );
 
   let results = (outs dmapioconfigtype:$ioconfig);
 
   let assemblyFormat = [{
-     $peioengine `:` type($peioengine) attr-dict `->` type($ioconfig) 
+     $ioengine `:` type($ioengine) attr-dict `->` type($ioconfig) 
   }];
 }
 
@@ -219,12 +257,31 @@ def dmap_push : dmapop<"push"> {
   }];
 
   let arguments = (ins
-    dmapdatatype:$data,
+    I32:$data,
     AnyTypeOf<[dmapportstreamtype, dmapportchainstreamtype]>:$stream
   );
 
   let assemblyFormat = [{
     $data `to` $stream `:` type($stream) attr-dict
+  }];
+
+}
+
+def dmap_pull : dmapop<"pull"> {
+  let summary = "Pushes a block of data into a pre-defined stream.";
+  let description = [{
+    The primary pull execution-phase operation. It takes a data handle and
+    a stream handle (either a single port stream or a chained stream),
+    initiating the data transfer along the path defined by the stream.
+  }];
+
+  let arguments = (ins
+    I32:$data,
+    AnyTypeOf<[dmapportstreamtype, dmapportchainstreamtype]>:$stream
+  );
+
+  let assemblyFormat = [{
+    $data `from` $stream `:` type($stream) attr-dict
   }];
 
 }

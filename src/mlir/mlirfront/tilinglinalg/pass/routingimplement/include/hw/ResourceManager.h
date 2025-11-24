@@ -444,6 +444,15 @@ public:
     // Get all tiles reserved by a specific DataIO
     std::vector<Point> getReservedTilesForDataIo(int ioId) const;
     IHwResource* getrsc() {return resource_.get();};
+    
+    // Register shim column and channel to ioId mapping
+    void registerShimChannelMapping(int shimCol, int channel, int ioId);
+    
+    // Find ioId based on shim column and channel number
+    std::optional<int> findIoIdByShimChannel(int shimCol, int channel) const;
+    
+    // Find DataIO object by shim column and channel
+    std::shared_ptr<DataIO> findDataIOByShimChannel(int shimCol, int channel) const;
 
 private:
     void InitSHIMNocList();
@@ -456,6 +465,16 @@ private:
      
     std::unique_ptr<IHwResource> resource_;
     std::unordered_map<int, std::shared_ptr<DataIO>> DataIOMap;
+    
+    // Hash function for (shimCol, channel) pair
+    struct ShimChannelHash {
+        std::size_t operator()(const std::pair<int, int>& p) const {
+            return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 1);
+        }
+    };
+    
+    // Mapping from (shimCol, channel) to ioId
+    std::unordered_map<std::pair<int, int>, int, ShimChannelHash> shimChannelToIoIdMap_;
 };
 
 #endif // ROUTINGRESOURCE_H

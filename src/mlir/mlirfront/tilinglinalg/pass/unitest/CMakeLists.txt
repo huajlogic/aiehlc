@@ -15,9 +15,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 #set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #set(LLVM_INSTALL_DIR /usr/local/)
 #set(CMAKE_PREFIX_PATH "${LLVM_INSTALL_DIR}/lib/cmake/clang" ${CMAKE_PREFIX_PATH})
-#set(LLVM_ROOT /usr/local/)
-message(STATUS "use set LLVM_ROOT to change LLVM into your local llvm if the compile failed!!!")
-set(LLVM_ROOT "/Users/llvm/llvm-project/build" CACHE PATH "Root of an LLVM/Clang/MLIR install")
+if(DEFINED ENV{AIEHLCLOCALBUILD})
+    set(LLVM_ROOT "/Users/llvm/llvm-project/build")
+    message(STATUS "AIEHLCLOCALBUILD is defined: using local LLVM at ${LLVM_ROOT}")
+else()
+    set(LLVM_ROOT "/usr/local")
+    message(STATUS "AIEHLCLOCALBUILD is NOT defined: using system LLVM at ${LLVM_ROOT}")
+endif()
 
 if(DEFINED LLVM_INSTALL_DIR AND NOT "${LLVM_INSTALL_DIR}" STREQUAL "")
   set(LLVM_ROOT "${LLVM_INSTALL_DIR}" CACHE PATH "Root of LLVM/Clang/MLIR install" FORCE)
@@ -62,20 +66,32 @@ include_directories(../../routinghw/)
 include_directories(../)
 include_directories(../routingimplement/include/)
 include_directories(../passroutingtodmap/)
-
+include_directories(../passdmaphoptodfschedule/)
+include_directories(../../dataflowmap/dmap/inc/)
+include_directories(../../dataflowmap/dmap/)
+include_directories(../../dataflowmap/dmaphop/inc/)
+include_directories(../../dataflowmap/dmaphop/)
+include_directories(../../dataflowmap/dfschedule/inc/)
+include_directories(../../dataflowmap/dfschedule/)
 
 #file(GLOB PARSER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../Parser/*.cpp)
 message("Parser src Directory: ${PARSER_FILES}")
 
 set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp 
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../routinghw/routinghwmanager.cpp 
-                ${CMAKE_CURRENT_SOURCE_DIR}/../../routing/routingmanager.cpp 
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../routing/routingmanager.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmap/dmapmanager.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmaphop/dmaphopmanager.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfschedule/dfschedulemanager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinghwlower.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinglower.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingunrolling.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingdeadargclean.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingconstantfold.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passroutingtodmap/routingtodmap.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaptodmaphop/dmaptodmaphop.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptodfschedule/passdmaphoptodfschedule.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingpath.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/hwresource.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/ResourceManager.cpp

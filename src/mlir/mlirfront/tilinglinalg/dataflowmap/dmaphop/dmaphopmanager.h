@@ -2,8 +2,8 @@
 * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
-#ifndef __DMAP_MANAGER__
-#define __DMAP_MANAGER__
+#ifndef __DMAPHOP_MANAGER__
+#define __DMAPHOP_MANAGER__
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/SymbolTable.h"
@@ -75,4 +75,4 @@ public:
     void createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
     static void loaddialect(MLIRContext* ctx);
 };
-#endif//__DMAP_MANAGER__
+#endif//__DMAPHOP_MANAGER__

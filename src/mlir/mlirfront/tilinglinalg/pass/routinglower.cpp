@@ -239,6 +239,16 @@ std::optional<TileListRoutingMap> GetSeqPath(
                 connectionData[shimpoint].MasterSendToNextTileDirectionPortIdx = shimPortInfo->portnum_;
             }
         }
+    } else if (dio->type() == IOType::Input) {// 1c. Handle the special case for the starting SHIM tile's input
+        PortDirection shimDir = PortDirection::South;
+        int shimPortNum = 3; // A reasonable default
+        if (auto shimPortInfo = dio->getshimport()) {
+            shimDir = shimPortInfo->dir_;
+            shimPortNum = shimPortInfo->portnum_;
+        }
+        Point dioshimpoint = Point{dio->rowpos(), dio->colpos()};
+        connectionData[dioshimpoint].SlaveReceiveForwardDirection = shimDir;
+        connectionData[dioshimpoint].SlaveReceiveForwardDirectionPortIdx = shimPortNum;
     }
 
     // 1b. Populate DMA connection information
@@ -254,18 +264,6 @@ std::optional<TileListRoutingMap> GetSeqPath(
             }
         }
     }
-
-    // 1c. Handle the special case for the starting SHIM tile's input
-    
-    PortDirection shimDir = PortDirection::South;
-    int shimPortNum = 3; // A reasonable default
-    if (auto shimPortInfo = dio->getshimport()) {
-        shimDir = shimPortInfo->dir_;
-        shimPortNum = shimPortInfo->portnum_;
-    }
-    Point dioshimpoint = Point{dio->rowpos(), dio->colpos()};
-    connectionData[dioshimpoint].SlaveReceiveForwardDirection = shimDir;
-    connectionData[dioshimpoint].SlaveReceiveForwardDirectionPortIdx = shimPortNum;
 
     return std::make_optional<TileListRoutingMap>(troutingmap);
 }
@@ -304,7 +302,7 @@ void ParseTheCCTRoutingPath(Operation* op,
     for (const Point& p : orderedPathPoints) {
         if (allTileOps.find(p) == allTileOps.end()) {
             allTileOps[p] = rewriter.create<routinghw::TileCreate>(
-                loc, outputType, tilecreatehandle.getResult(), p.r, p.c, "tile in path");
+                loc, outputType, p.r, p.c, "tile in path");
         }
     }
 
@@ -415,7 +413,7 @@ void ParseTheRoutingPath(Operation* op,
                 for (auto p : tree.branches[i]) {
                     std::cout << "(" << p.r << "," << p.c << ") ";
                     if (dsttiles.count(p) == 0 && pathtiles.count(p) == 0) {
-                        auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),p.r, p.c, "tile reserved in path");
+                        auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, p.r, p.c, "tile reserved in path");
                         pathtiles[p] = tile1;
                     }
                 }
@@ -740,7 +738,7 @@ struct routingcreatebroadcastconvert : public ConversionPattern {
         std::unordered_map<Point, Operation*, Point::Hash> dsttiles, pathtiles;
         auto tilecreatehandle = rewriter.create<TileArrayHandleCreate>(op->getLoc(), output, "array handle");
         for(auto x: allocatedTiles) {
-            auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
+            auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, x.r, x.c, "tile reserved");
             dsttiles[{x.r, x.c}] = tile1;
         }
         std::vector<Point> routerdsttiles;
@@ -759,7 +757,7 @@ struct routingcreatebroadcastconvert : public ConversionPattern {
                 for (auto p : tree.branches[i]) {
                     std::cout << "(" << p.r << "," << p.c << ") ";
                     if (dsttiles.count(p) == 0 && pathtiles.count(p) == 0) {
-                        auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),p.r, p.c, "tile reserved in path");
+                        auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, p.r, p.c, "tile reserved in path");
                         pathtiles[p] = tile1;
                     }
                 }
@@ -1030,7 +1028,7 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
             auto rpath = router_.createPath(dioid, tileList);
             std::unordered_map<Point, Operation*, Point::Hash> dsttiles;
             for(auto x: tileList) {
-                auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
+                auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, x.r, x.c, "tile reserved");
                 dsttiles[{x.r , x.c}] = tile1;
             }
         
@@ -1058,7 +1056,7 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
             auto rpath = router_.createPath(dioid, pktmergetile);
             std::unordered_map<Point, Operation*, Point::Hash> dsttiles;
             for(auto x: tileList) {
-                auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, tilecreatehandle.getResult(),x.r, x.c, "tile reserved");
+                auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, x.r, x.c, "tile reserved");
                 dsttiles[{x.r , x.c}] = tile1;
             }
             auto lastPkttilemap = GatherPktRoutingPathCreate(op, dioid, shimpoint, dio, tilecreatehandle, rpath, tileList, dsttiles, router_, rewriter);

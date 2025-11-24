@@ -53,7 +53,6 @@ def TileCreate:RoutingHWOp<"tilecreate"> {
     let cppNamespace = "routinghw";
     let arguments = (
         ins
-        I32:$handle,
         I32Attr:$row,
         I32Attr:$col,
         StrAttr:$comments
@@ -61,7 +60,7 @@ def TileCreate:RoutingHWOp<"tilecreate"> {
     let results = (outs
         I32:$output
     );
-    let assemblyFormat = "$handle  `:` type($handle) attr-dict `->` type($output) ";
+    let assemblyFormat = "attr-dict `->` type($output) ";
 }
 
 def IOShimTileCreate:RoutingHWOp<"ioshimtilecreate"> {

@@ -1,3 +1,8 @@
+/******************************************************************************
+* Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
+
 #ifndef _TYPE_DMAMAPHOP_
 #define _TYPE_DMAMAPHOP_
 include "dmaphopattr.td"
