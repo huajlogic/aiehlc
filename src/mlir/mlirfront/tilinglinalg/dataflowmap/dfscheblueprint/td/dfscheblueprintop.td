@@ -18,8 +18,9 @@ include "mlir/Interfaces/FunctionInterfaces.td"
 
 include "mlir/IR/BuiltinTypes.td"
 include "dfscheblueprinttype.td"
-// no SymbolTable will cause the generic print when block have Symbol
-// no NoTerminator will cause the generic print when block is empty or there is no terminate op like yeld
+//-- no SymbolTable will cause the generic print when block have Symbol
+//-- no NoTerminator will cause the generic print when block is empty or there is no terminate op like yeld
+//-- let hasCustomAssemblyFormat = 1; will fix the generic print issue after the said fix in
 // schedule.config - Top-level container for schedule blueprint
 def dfscheblueprint_ConfigOp : dfscheblueprintop<"config", [
     IsolatedFromAbove,  

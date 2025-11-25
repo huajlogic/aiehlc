@@ -3,6 +3,7 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 #include "dmaphopmanager.h"
+#include "mlir/IR/OpImplementation.h"
 #include <iostream>
 
 #define GET_TYPEDEF_CLASSES
@@ -22,7 +23,96 @@
 #undef GET_ATTRDEF_CLASSES
 #undef GET_TYPEDEF_CLASSES
 
+//===----------------------------------------------------------------------===//
+// Custom Printers and Parsers
+//===----------------------------------------------------------------------===//
 
+// FuncOp printer
+void dmaphop::FuncOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName();
+    printer << " ";
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+}
+
+// FuncOp parser
+ParseResult dmaphop::FuncOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    Region *body = result.addRegion();
+    if (parser.parseRegion(*body, {}, {}))
+        return failure();
+    
+    // Ensure the region has a block
+    if (body->empty())
+        body->emplaceBlock();
+    
+    // Add default function type () -> ()
+    auto builder = parser.getBuilder();
+    auto funcType = builder.getFunctionType({}, {});
+    result.addAttribute("funcType", TypeAttr::get(funcType));
+    
+    return success();
+}
+
+// PortOp printer
+void dmaphop::port::print(OpAsmPrinter &printer) {
+    printer << " ";
+    printer.printSymbolName(getSymName());
+    printer << " on " << getTile();
+    printer << " { direction = \"" << getDirection() << "\"";
+    if (auto channel = getDirectionChannel()) {
+        printer << ", channel = " << *channel;
+    }
+    printer << " }";
+    printer << " : " << getTile().getType();
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), {"sym_name", "direction", "direction_channel"});
+    printer << " -> " << getType();
+}
+
+// PortOp parser
+ParseResult dmaphop::port::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+
+    if (parser.parseKeyword("on")) return failure();
+
+    OpAsmParser::UnresolvedOperand tileOperand;
+    if (parser.parseOperand(tileOperand)) return failure();
+
+    if (parser.parseLBrace()) return failure();
+    
+    if (parser.parseKeyword("direction") || parser.parseEqual()) return failure();
+    
+    StringAttr directionAttr;
+    if (parser.parseAttribute(directionAttr, "direction", result.attributes)) return failure();
+
+    if (succeeded(parser.parseOptionalComma())) {
+        if (parser.parseKeyword("channel") || parser.parseEqual()) return failure();
+        IntegerAttr channelAttr;
+        if (parser.parseAttribute(channelAttr, "direction_channel", result.attributes)) return failure();
+    }
+
+    if (parser.parseRBrace()) return failure();
+
+    Type tileType;
+    if (parser.parseColonType(tileType)) return failure();
+    
+    if (parser.resolveOperand(tileOperand, tileType, result.operands)) return failure();
+
+    if (parser.parseOptionalAttrDict(result.attributes)) return failure();
+
+    if (parser.parseArrow()) return failure();
+
+    Type resultType;
+    if (parser.parseType(resultType)) return failure();
+    result.addTypes(resultType);
+
+    return success();
+}
+ 
 void dmaphopdialect::initialize()  { 
     addOperations<
     #define GET_OP_LIST
@@ -46,7 +136,7 @@ ModuleOp dmaphopmanager::ops_test(MLIRContext* ctx, int totalN) {
     //m.push_back(func);
     auto functype = builder.getFunctionType({},{});
     
-    auto main = builder.create<dmaphop::FuncOp>(builder.getUnknownLoc(), "main", functype);
+    auto main = builder.create<dmaphop::FuncOp>(builder.getUnknownLoc(), builder.getStringAttr("main"), functype);
     m.push_back(main);
     //auto block = main.addEntryBlock();
     auto &block = main.getBody().emplaceBlock();
@@ -55,21 +145,18 @@ ModuleOp dmaphopmanager::ops_test(MLIRContext* ctx, int totalN) {
     SymbolTable symTable(main);
 
     createdmaphopfuncByDim(builder, ctx, symTable);
-    auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
-    
-
-    
+    //auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
 
   // ------------------------------------------------------------------
   // 4. Look up the symbol anywhere inside the module
   // ------------------------------------------------------------------
-   Operation *found = symTable.lookup("receive1");
+   Operation *found = symTable.lookup("portShimIn");
    if (!found) {
-     llvm::errs() << "Symbol @receive1 not found!\n";
+     llvm::errs() << "Symbol @portShimIn not found!\n";
      
  
    } else {
-     llvm::outs() << "receive1 found \n";
+     llvm::outs() << "portShimIn found \n";
      llvm::outs() << "Found: " << found->getName() <<"\n";
    }
     llvm::errs() << m;
@@ -128,6 +215,7 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
         builder.getI64IntegerAttr(2)   // row
     );
  
+    ///*
     // --- 2. Define Logical Ports ---
     auto directionSend =  "Out";
     auto directionReceive =  "In";
@@ -252,6 +340,6 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
     builder.create<memref::DeallocOp>(location, data);
 
     // Add return
-    builder.create<func::ReturnOp>(location);
+   // builder.create<func::ReturnOp>(location);
    // */
 }

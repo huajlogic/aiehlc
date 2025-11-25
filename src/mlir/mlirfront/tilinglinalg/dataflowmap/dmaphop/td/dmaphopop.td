@@ -202,7 +202,11 @@ include "mlir/IR/BuiltinTypes.td"  // Add this line for MemRefType
 include "dmaphoptype.td"
 include "dmaphopattr.td"
 
-def dmaphop_FuncOp : dmaphopop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
+def dmaphop_FuncOp : dmaphopop<"func",[ IsolatedFromAbove,  
+    SymbolTable,
+    Symbol,
+    SingleBlock,
+    NoTerminator]>
 {
     let summary = "Defines a function in the Starplat Dialect";
     let description = [{This operation represents a function definiton in the Starplat dialect.
@@ -216,6 +220,7 @@ def dmaphop_FuncOp : dmaphopop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
                   );
 
   let regions = (region AnyRegion:$body);
+  let hasCustomAssemblyFormat = 1;
 }
 
 // --- 1. Tile Definition Operation ---
@@ -233,7 +238,7 @@ def dmaphop_tile : dmaphopop<"tile"> {
 
  
 // --- 2. Port Definition Operation ---
-
+// let hasCustomAssemblyFormat = 1; will fix the port itself generic print issue when have symbol
 def dmaphop_port : dmaphopop<"port",[Symbol]> {
   let summary = "Defines a logical port on a tile";
   let arguments = (ins
@@ -243,7 +248,7 @@ def dmaphop_port : dmaphopop<"port",[Symbol]> {
     OptionalAttr<I64Attr>:$direction_channel
   );
   let results = (outs dmaphopporttype:$port);
-  let assemblyFormat = "`on` $tile `{` `direction` `=` $direction (`,` `channel` `=` $direction_channel^)? `}` `:` type($tile) attr-dict `->` type($port)";
+  let hasCustomAssemblyFormat = 1;
 }
  
 // --- 3. Hop Creation Operation ---

@@ -18,7 +18,12 @@ include "dmapattr.td"
       %broadcast_stream = dataflowmap.create_stream %send_port, %receive_group         
       dataflowmap.push %data, %broadcast_stream {cache_policy = "force_memtile" }
 */
-def dmap_FuncOp : dmapop<"func",[SymbolTable]>
+def dmap_FuncOp : dmapop<"func",[
+    SymbolTable,
+    Symbol,
+    SingleBlock,
+    NoTerminator
+  ]>
 {
     let summary = "Defines a function in the Starplat Dialect";
     let description = [{This operation represents a function definiton in the Starplat dialect.
@@ -27,15 +32,17 @@ def dmap_FuncOp : dmapop<"func",[SymbolTable]>
                         }];
 
   let arguments = (ins 
-                    StrAttr:$sym_name
+                    SymbolNameAttr:$sym_name,
+                    TypeAttrOf<FunctionType>:$funcType
                   );
 
   //let regions = (region AnyRegion:$body);
   let regions = (region SizedRegion<1>:$body);
-  let results = (outs I32:$output);
+  //let results = (outs I32:$output);
   let builders = [
     OpBuilder<(ins 
 				   "Attribute":$Memo,
+                   "TypeAttr":$type,
                    "function_ref<void(OpBuilder &, Location)>":$bodyBuilder),
     [{
       // no region creatation
@@ -43,6 +50,7 @@ def dmap_FuncOp : dmapop<"func",[SymbolTable]>
       // 3. Add attributes to the state object.
       // Note that we must provide the attribute's name as a string.
       $_state.addAttribute("sym_name", Memo);
+      $_state.addAttribute("funcType", type);
 
       // 2. Region 和 Block
       auto *bodyRegion = $_state.addRegion();
@@ -56,7 +64,7 @@ def dmap_FuncOp : dmapop<"func",[SymbolTable]>
       bodyBuilder($_builder, loc);
     }]>
   ];
-  //let hasCustomAssemblyFormat = 1;
+  let hasCustomAssemblyFormat = 1;
 }
 
 def dmap_YieldOp : dmapop<"yield", [Terminator]> {
