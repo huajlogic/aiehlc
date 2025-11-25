@@ -110,6 +110,9 @@ add_custom_target(
   COMMAND ${CMAKE_COMMAND} -E echo "Running custom script..."
 	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../routing/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../routinghw/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmap/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmaphop/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfschedule/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMENT "Executing custom script before building AIE Dialect from tablegen"
 )
 
