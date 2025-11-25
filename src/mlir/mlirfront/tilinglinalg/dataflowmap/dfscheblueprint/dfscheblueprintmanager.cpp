@@ -10,9 +10,9 @@
 #define GET_OP_CLASSES
 #define GET_OP_DEFS
 #include "dfscheblueprintdialect.cc.inc"
+#include "dfscheblueprintenums.cc.inc"
 #include "dfscheblueprintattr.cc.inc"
 #include "dfscheblueprinttype.cc.inc"
-#include "dfscheblueprintenums.cc.inc"
 
 #include "dfscheblueprintop.cc.inc"
 #undef GET_OP_DEFS
@@ -186,138 +186,176 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Create the top-level schedule.config operation
     auto configOp = builder.create<dfscheblueprint::ConfigOp>(
         location,
-        builder.getStringAttr("tiling_and_broadcast_blueprint")
+        builder.getStringAttr("broadcast_gather_blueprint")
     );
     
     // Set insertion point inside the config body
     Block *configBody = new Block();
     configOp.getBody().push_back(configBody);
     builder.setInsertionPointToStart(configBody);
-    ///*
-    // --- Transfer Manifest 1: broadcast_upper_half ---
+
+    // ============================================================
+    // 1. Physical Resources
+    // ============================================================
     
-    // Create payload_slice attribute for upper half
-    auto memrefType1024x1024 = mlir::MemRefType::get({1024, 1024}, builder.getF32Type());
-    auto dataTypeAttr = mlir::TypeAttr::get(memrefType1024x1024);
-    
-    auto offsetAttr = builder.getArrayAttr({
-        builder.getI64IntegerAttr(0),
-        builder.getI64IntegerAttr(0)
+    // Shim Gateway: tiles = [(0, 2)]
+    auto shimTiles = builder.getArrayAttr({
+        builder.getArrayAttr({builder.getI64IntegerAttr(0), builder.getI64IntegerAttr(2)})
     });
+    builder.create<dfscheblueprint::ResourceGroupOp>(
+        location,
+        builder.getStringAttr("shim_gateway"),
+        shimTiles
+    );
+
+    // Compute Row: tiles = [(2, 0), (2, 1), (2, 2), (2, 3)]
+    auto computeTiles = builder.getArrayAttr({
+        builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(0)}),
+        builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(1)}),
+        builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(2)}),
+        builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(3)})
+    });
+    builder.create<dfscheblueprint::ResourceGroupOp>(
+        location,
+        builder.getStringAttr("compute_row"),
+        computeTiles
+    );
+
+    // ============================================================
+    // 2. Logical Data View
+    // ============================================================
     
-    auto sizeAttrUpper = builder.getArrayAttr({
-        builder.getI64IntegerAttr(512),
+    // Declare Data: <1024x1024xf32>
+    auto memrefType = mlir::MemRefType::get({1024, 1024}, builder.getF32Type());
+    auto dataOp = builder.create<dfscheblueprint::DeclareDataOp>(
+        location,
+        mlir::TypeAttr::get(memrefType)
+    );
+    auto dataMatrix = dataOp.getResult();
+
+    // Partition: tile_shape = [256, 1024]
+    auto tileShape = builder.getArrayAttr({
+        builder.getI64IntegerAttr(256),
         builder.getI64IntegerAttr(1024)
     });
-    
-    auto strideAttr = builder.getArrayAttr({
-        builder.getI64IntegerAttr(1024),
-        builder.getI64IntegerAttr(1)
-    });
-    
-    auto sliceAttrUpper = dfscheblueprint::SliceAttr::get(
-        ctx,
-        dataTypeAttr,
-        offsetAttr,
-        sizeAttrUpper,
-        strideAttr
-    );
-    
-    // Create source endpoint: tile=(0,2), direction="MM2S", channel=0
-    auto sourceEndpoint = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        0,  // row
-        2,  // col
-        builder.getStringAttr("MM2S"),
-        0  // channel
-    );
-    
-    // Create destination endpoints
-    auto dest1 = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        2,  // row
-        2,  // col
-        builder.getStringAttr("S2MM"),
-        0  // channel
-    );
-    
-    auto dest2 = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        3,  // row
-        2,  // col
-        builder.getStringAttr("S2MM"),
-        0  // channel
-    );
-    
-    auto destinationsAttr = builder.getArrayAttr({dest1, dest2});
-    
-    // Create the transfer manifest operation
-    builder.create<dfscheblueprint::TransferManifestOp>(
+    auto partitionOp = builder.create<dfscheblueprint::PartitionOp>(
         location,
-        builder.getStringAttr("broadcast_upper_half"),
-        sliceAttrUpper,
-        builder.getI32IntegerAttr(10),  // packet_id
-        sourceEndpoint,
-        destinationsAttr
+        dataMatrix,
+        tileShape
     );
-    ///*
-    // --- Transfer Manifest 2: broadcast_lower_half ---
-    
-    auto offsetAttrLower = builder.getArrayAttr({
-        builder.getI64IntegerAttr(512),  // Start from row 512
-        builder.getI64IntegerAttr(0)
-    });
-    
-    auto sizeAttrLower = builder.getArrayAttr({
-        builder.getI64IntegerAttr(512),
-        builder.getI64IntegerAttr(1024)
-    });
-    
-    auto sliceAttrLower = dfscheblueprint::SliceAttr::get(
-        ctx,
-        dataTypeAttr,
-        offsetAttrLower,
-        sizeAttrLower,
-        strideAttr
-    );
-    
-    // Source endpoint (same as before)
-    auto sourceEndpointLower = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        0,  // row
-        2,  // col
-        builder.getStringAttr("MM2S"),
-        0  // channel
-    );
-    
-    // Different destination endpoints for lower half
-    auto dest3 = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        4,  // row
-        2,  // col
-        builder.getStringAttr("S2MM"),
-        0  // channel
-    );
-    
-    auto dest4 = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        5,  // row
-        2,  // col
-        builder.getStringAttr("S2MM"),
-        0  // channel
-    );
-    
-    auto destinationsAttrLower = builder.getArrayAttr({dest3, dest4});
-    
-    // Create the second transfer manifest
-    builder.create<dfscheblueprint::TransferManifestOp>(
+    auto viewSplit = partitionOp.getResult();
+
+    // ============================================================
+    // 3. Binding & Channel Config
+    // ============================================================
+
+    // Extract partition 0
+    auto extractOp = builder.create<dfscheblueprint::ExtractOp>(
         location,
-        builder.getStringAttr("broadcast_lower_half"),
-        sliceAttrLower,
-        builder.getI32IntegerAttr(11),  // Different packet_id
-        sourceEndpointLower,
-        destinationsAttrLower
+        viewSplit,
+        builder.getI32IntegerAttr(0)
     );
-    //*/
+    auto extractedView = extractOp.getResult();
+
+    // Create 4 DataSliceOps for output (4x256 each) using extractedView
+    auto subSliceType = mlir::TypeAttr::get(mlir::MemRefType::get({4, 256}, builder.getF32Type()));
+    auto subSliceSize = builder.getArrayAttr({builder.getI64IntegerAttr(4), builder.getI64IntegerAttr(256)});
+    auto subSliceStride = builder.getArrayAttr({builder.getI64IntegerAttr(256), builder.getI64IntegerAttr(1)});
+    
+    llvm::SmallVector<mlir::Attribute, 4> outSliceSymbols;
+    for (int i = 0; i < 4; ++i) {
+        std::string sliceName = "out_slice_" + std::to_string(i);
+        auto sliceOffset = builder.getArrayAttr({
+            builder.getI64IntegerAttr(i * 4), // Offset row by 4 each time
+            builder.getI64IntegerAttr(0)
+        });
+        auto sliceAttr = dfscheblueprint::SliceAttr::get(ctx, subSliceType, sliceOffset, subSliceSize, subSliceStride);
+        
+        builder.create<dfscheblueprint::DataSliceOp>(
+            location,
+            builder.getStringAttr(sliceName),
+            extractedView,
+            sliceAttr
+        );
+        outSliceSymbols.push_back(mlir::SymbolRefAttr::get(ctx, sliceName));
+    }
+
+    // Bind Shim TX
+    llvm::SmallVector<int64_t, 1> shimTxCh = {0};
+    auto shimTxDMA = dfscheblueprint::DMAAttr::get(ctx, shimTxCh, dfscheblueprint::bp_direction::MM2S);
+    builder.create<dfscheblueprint::BindOp>(
+        location,
+        builder.getStringAttr("bind_shim_tx"),
+        mlir::SymbolRefAttr::get(ctx, "shim_gateway"),
+        viewSplit,
+        builder.getStringAttr("root"),
+        shimTxDMA,
+        nullptr // slice_symbol
+    );
+
+    // Bind Cores Input (S2MM - Receive)
+    llvm::SmallVector<int64_t, 1> coresInCh = {0};
+    auto coresInDMA = dfscheblueprint::DMAAttr::get(ctx, coresInCh, dfscheblueprint::bp_direction::S2MM);
+    builder.create<dfscheblueprint::BindGroupOp>(
+        location,
+        builder.getStringAttr("bind_cores_in"),
+        mlir::SymbolRefAttr::get(ctx, "compute_row"),
+        viewSplit,
+        builder.getStringAttr("linear"),
+        coresInDMA,
+        nullptr // slice_symbols
+    );
+
+    // Bind Cores Output (MM2S - Send)
+    llvm::SmallVector<int64_t, 1> coresOutCh = {1};
+    auto coresOutDMA = dfscheblueprint::DMAAttr::get(ctx, coresOutCh, dfscheblueprint::bp_direction::MM2S);
+    builder.create<dfscheblueprint::BindGroupOp>(
+        location,
+        builder.getStringAttr("bind_cores_out"),
+        mlir::SymbolRefAttr::get(ctx, "compute_row"),
+        viewSplit,
+        builder.getStringAttr("linear"),
+        coresOutDMA,
+        builder.getArrayAttr(outSliceSymbols) // slice_symbols
+    );
+
+    // Bind Shim RX
+    llvm::SmallVector<int64_t, 1> shimRxCh = {0};
+    auto shimRxDMA = dfscheblueprint::DMAAttr::get(ctx, shimRxCh, dfscheblueprint::bp_direction::S2MM);
+    builder.create<dfscheblueprint::BindOp>(
+        location,
+        builder.getStringAttr("bind_shim_rx"),
+        mlir::SymbolRefAttr::get(ctx, "shim_gateway"),
+        viewSplit,
+        builder.getStringAttr("root"),
+        shimRxDMA,
+        nullptr // slice_symbol
+    );
+
+    // ============================================================
+    // 4. Collective Transfers
+    // ============================================================
+
+    // Input Scatter
+    builder.create<dfscheblueprint::CollectiveTransferOp>(
+        location,
+        builder.getStringAttr("input_scatter"),
+        builder.getStringAttr("one_to_many"),
+        mlir::SymbolRefAttr::get(ctx, "bind_shim_tx"),
+        mlir::SymbolRefAttr::get(ctx, "bind_cores_in"),
+        nullptr, // ordering
+        builder.getI32IntegerAttr(10)
+    );
+
+    // Output Gather
+    builder.create<dfscheblueprint::CollectiveTransferOp>(
+        location,
+        builder.getStringAttr("output_gather"),
+        builder.getStringAttr("many_to_one"),
+        mlir::SymbolRefAttr::get(ctx, "bind_cores_out"),
+        mlir::SymbolRefAttr::get(ctx, "bind_shim_rx"),
+        builder.getStringAttr("sequential"),
+        builder.getI32IntegerAttr(20)
+    );
 }
 

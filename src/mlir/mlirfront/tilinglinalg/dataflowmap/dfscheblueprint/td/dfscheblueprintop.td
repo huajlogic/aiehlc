@@ -100,5 +100,150 @@ def dfscheblueprint_TransferManifestOp : dfscheblueprintop<"transfer_manifest", 
   }];
 }
 
+// schedule.resource_group
+def dfscheblueprint_ResourceGroupOp : dfscheblueprintop<"resource_group", [
+    Symbol,
+    HasParent<"ConfigOp">
+  ]> {
+  let summary = "Defines a group of physical tiles";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    ArrayAttr:$tiles // Array of arrays/tuples e.g. [(0,2)]
+  );
+  let assemblyFormat = "$sym_name `{` `tiles` `=` $tiles `}` attr-dict";
+}
+
+// schedule.declare_data
+def dfscheblueprint_DeclareDataOp : dfscheblueprintop<"declare_data", [
+    HasParent<"ConfigOp">
+  ]> {
+  let summary = "Declares a data matrix";
+  let arguments = (ins
+    TypeAttr:$type
+  );
+  let results = (outs dfscheblueprint_DataHandleType:$result);
+  let assemblyFormat = "$type attr-dict";
+}
+
+// schedule.partition
+def dfscheblueprint_PartitionOp : dfscheblueprintop<"partition", [
+    HasParent<"ConfigOp">
+  ]> {
+  let summary = "Partitions data into views";
+  let arguments = (ins
+    dfscheblueprint_DataHandleType:$data,
+    ArrayAttr:$tile_shape
+  );
+  let results = (outs dfscheblueprint_ViewHandleType:$result);
+  let assemblyFormat = "$data `{` `tile_shape` `=` $tile_shape `}` attr-dict";
+}
+
+// schedule.extract
+def dfscheblueprint_ExtractOp : dfscheblueprintop<"extract", [
+    HasParent<"ConfigOp">
+  ]> {
+  let summary = "Extracts a specific partition from a partitioned view";
+  let arguments = (ins
+    dfscheblueprint_ViewHandleType:$view,
+    I32Attr:$index
+  );
+  let results = (outs dfscheblueprint_ViewHandleType:$result);
+  let assemblyFormat = "$view `{` `index` `=` $index `}` attr-dict";
+}
+
+// schedule.data_slice
+def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
+    Symbol,
+    HasParent<"ConfigOp">
+  ]> {
+  let summary = "Defines a named slice of a data view";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    dfscheblueprint_ViewHandleType:$view,
+    dfscheblueprint_SliceAttr:$slice_params
+  );
+  let assemblyFormat = [{
+    $sym_name `{`
+      `view` `=` $view `,`
+      `slice` `=` $slice_params
+    `}` attr-dict
+  }];
+}
+
+// schedule.bind
+def dfscheblueprint_BindOp : dfscheblueprintop<"bind", [
+    Symbol,
+    HasParent<"ConfigOp">
+  ]> {
+  let summary = "Binds a resource to a data view";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    SymbolRefAttr:$target,
+    dfscheblueprint_ViewHandleType:$view,
+    StrAttr:$slice,
+    dfscheblueprint_DMAAttr:$dma,
+    OptionalAttr<SymbolRefAttr>:$slice_symbol
+  );
+  let assemblyFormat = [{
+    $sym_name `{`
+      `target` `=` $target `,`
+      `view` `=` $view `,`
+      `slice` `=` $slice `,`
+      `dma` `=` $dma
+      (`,` `slice_symbol` `=` $slice_symbol^)?
+    `}` attr-dict
+  }];
+}
+
+// schedule.bind_group
+def dfscheblueprint_BindGroupOp : dfscheblueprintop<"bind_group", [
+    Symbol,
+    HasParent<"ConfigOp">
+  ]> {
+  let summary = "Binds a resource group to a data view";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    SymbolRefAttr:$target_group,
+    dfscheblueprint_ViewHandleType:$view,
+    StrAttr:$distribution,
+    dfscheblueprint_DMAAttr:$dma,
+    OptionalAttr<ArrayAttr>:$slice_symbols
+  );
+  let assemblyFormat = [{
+    $sym_name `{`
+      `target_group` `=` $target_group `,`
+      `view` `=` $view `,`
+      `distribution` `=` $distribution `,`
+      `dma` `=` $dma
+      (`,` `slice_symbols` `=` $slice_symbols^)?
+    `}` attr-dict
+  }];
+}
+
+// schedule.collective_transfer
+def dfscheblueprint_CollectiveTransferOp : dfscheblueprintop<"collective_transfer", [
+    Symbol,
+    HasParent<"ConfigOp">
+  ]> {
+  let summary = "Defines a collective transfer between bindings";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    StrAttr:$type,
+    SymbolRefAttr:$from,
+    SymbolRefAttr:$to,
+    OptionalAttr<StrAttr>:$ordering,
+    I32Attr:$base_packet_id
+  );
+  let assemblyFormat = [{
+    $sym_name `{`
+      `type` `=` $type `,`
+      `from` `=` $from `,`
+      `to` `=` $to
+      (`,` `ordering` `=` $ordering^)? `,`
+      `base_packet_id` `=` $base_packet_id
+    `}` attr-dict
+  }];
+}
+
 #endif // dfscheblueprint_OPS
 
