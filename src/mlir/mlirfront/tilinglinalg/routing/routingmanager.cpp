@@ -236,7 +236,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     auto tensor = builder.create<createdummytensor>(builder.getUnknownLoc(), vals, dimnum);
     createroutingfuncByDim(builder, ctx, false, mesh, tensor, hwrowused, "row");
     createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwrowused, "row");
-    //createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwcolused, "col");
+    createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwcolused, "col");
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(main);
     llvm::errs() << m;

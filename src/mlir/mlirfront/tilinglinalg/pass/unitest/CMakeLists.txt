@@ -73,6 +73,8 @@ include_directories(../../dataflowmap/dmaphop/inc/)
 include_directories(../../dataflowmap/dmaphop/)
 include_directories(../../dataflowmap/dfschedule/inc/)
 include_directories(../../dataflowmap/dfschedule/)
+include_directories(../../dataflowmap/dfscheblueprint/inc/)
+include_directories(../../dataflowmap/dfscheblueprint/)
 
 #file(GLOB PARSER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../Parser/*.cpp)
 message("Parser src Directory: ${PARSER_FILES}")
@@ -83,6 +85,7 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmap/dmapmanager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmaphop/dmaphopmanager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfschedule/dfschedulemanager.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfscheblueprint/dfscheblueprintmanager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinghwlower.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinglower.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingunrolling.cpp
@@ -113,6 +116,7 @@ add_custom_target(
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmap/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmaphop/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfschedule/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfscheblueprint/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMENT "Executing custom script before building AIE Dialect from tablegen"
 )
 
