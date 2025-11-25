@@ -62,11 +62,13 @@ set(CMAKE_BUILD_TYPE Debug)
 include_directories(../inc/)
 include_directories(../)
 include_directories(./)
+include_directories(../../../routing/inc/)
+include_directories(../../../routing/)
 
 #file(GLOB PARSER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../Parser/*.cpp)
 message("Parser src Directory: ${PARSER_FILES}")
 
-set(SOURCE_FILES ./test.cpp ../dfscheblueprintmanager.cpp)
+set(SOURCE_FILES ./test.cpp ../dfscheblueprintmanager.cpp ../../../routing/routingmanager.cpp)
 
 add_executable(test ${SOURCE_FILES})
 

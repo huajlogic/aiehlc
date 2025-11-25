@@ -144,11 +144,11 @@ def dfscheblueprint_ExtractOp : dfscheblueprintop<"extract", [
   ]> {
   let summary = "Extracts a specific partition from a partitioned view";
   let arguments = (ins
-    dfscheblueprint_ViewHandleType:$view,
+    AnyType:$view,
     I32Attr:$index
   );
   let results = (outs dfscheblueprint_ViewHandleType:$result);
-  let assemblyFormat = "$view `{` `index` `=` $index `}` attr-dict";
+  let assemblyFormat = "$view `:` type($view) `{` `index` `=` $index `}` attr-dict";
 }
 
 // schedule.data_slice
@@ -159,12 +159,12 @@ def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
   let summary = "Defines a named slice of a data view";
   let arguments = (ins
     SymbolNameAttr:$sym_name,
-    dfscheblueprint_ViewHandleType:$view,
+    AnyType:$view,
     dfscheblueprint_SliceAttr:$slice_params
   );
   let assemblyFormat = [{
     $sym_name `{`
-      `view` `=` $view `,`
+      `view` `=` $view `:` type($view) `,`
       `slice` `=` $slice_params
     `}` attr-dict
   }];
@@ -179,7 +179,7 @@ def dfscheblueprint_BindOp : dfscheblueprintop<"bind", [
   let arguments = (ins
     SymbolNameAttr:$sym_name,
     SymbolRefAttr:$target,
-    dfscheblueprint_ViewHandleType:$view,
+    AnyType:$view,
     StrAttr:$slice,
     dfscheblueprint_DMAAttr:$dma,
     OptionalAttr<SymbolRefAttr>:$slice_symbol
@@ -187,7 +187,7 @@ def dfscheblueprint_BindOp : dfscheblueprintop<"bind", [
   let assemblyFormat = [{
     $sym_name `{`
       `target` `=` $target `,`
-      `view` `=` $view `,`
+      `view` `=` $view `:` type($view) `,`
       `slice` `=` $slice `,`
       `dma` `=` $dma
       (`,` `slice_symbol` `=` $slice_symbol^)?
@@ -204,7 +204,7 @@ def dfscheblueprint_BindGroupOp : dfscheblueprintop<"bind_group", [
   let arguments = (ins
     SymbolNameAttr:$sym_name,
     SymbolRefAttr:$target_group,
-    dfscheblueprint_ViewHandleType:$view,
+    AnyType:$view,
     StrAttr:$distribution,
     dfscheblueprint_DMAAttr:$dma,
     OptionalAttr<ArrayAttr>:$slice_symbols
@@ -212,7 +212,7 @@ def dfscheblueprint_BindGroupOp : dfscheblueprintop<"bind_group", [
   let assemblyFormat = [{
     $sym_name `{`
       `target_group` `=` $target_group `,`
-      `view` `=` $view `,`
+      `view` `=` $view `:` type($view) `,`
       `distribution` `=` $distribution `,`
       `dma` `=` $dma
       (`,` `slice_symbols` `=` $slice_symbols^)?

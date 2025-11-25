@@ -3,6 +3,7 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 #include "dfscheblueprintmanager.h"
+#include "../../routing/routingmanager.h"
 #include <iostream>
 
 #define GET_TYPEDEF_CLASSES
@@ -162,6 +163,7 @@ void dfscheblueprintmanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<dfscheblueprint::dfscheblueprintdialect>();
     ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx->getOrLoadDialect<routing::routingdialect>();
 }
 
 /**
@@ -225,25 +227,42 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // 2. Logical Data View
     // ============================================================
     
-    // Declare Data: <1024x1024xf32>
-    auto memrefType = mlir::MemRefType::get({1024, 1024}, builder.getF32Type());
-    auto dataOp = builder.create<dfscheblueprint::DeclareDataOp>(
+    // Create Dummy Tensor
+    auto shapeAttr = builder.getI64ArrayAttr({1024, 1024});
+    auto dimAttr = builder.getI64IntegerAttr(2);
+    auto dummyTensorOp = builder.create<routing::createdummytensor>(
         location,
-        mlir::TypeAttr::get(memrefType)
+        builder.getI32Type(), // result type
+        shapeAttr,
+        dimAttr
     );
-    auto dataMatrix = dataOp.getResult();
+    auto dataMatrix = dummyTensorOp.getResult();
 
-    // Partition: tile_shape = [256, 1024]
-    auto tileShape = builder.getArrayAttr({
-        builder.getI64IntegerAttr(256),
-        builder.getI64IntegerAttr(1024)
-    });
-    auto partitionOp = builder.create<dfscheblueprint::PartitionOp>(
+    // Partition Tensor
+    auto partitionOp = builder.create<routing::partitiontensor>(
         location,
+        builder.getI32Type(), // result type
         dataMatrix,
-        tileShape
+        builder.getI32IntegerAttr(4), // splitnum
+        builder.getI32IntegerAttr(0), // splitdim
+        builder.getStringAttr(""),    // hw_axis_owner
+        builder.getStringAttr(""),    // replicate_on
+        builder.getStringAttr("")     // single_tile_owner
     );
-    auto viewSplit = partitionOp.getResult();
+    auto partitionResult = partitionOp.getResult();
+
+    // Extract Data (index 0)
+    auto indexOp = builder.create<mlir::arith::ConstantOp>(
+        location,
+        builder.getI32IntegerAttr(0)
+    );
+    auto extractOpdata = builder.create<routing::extract_data>(
+        location,
+        builder.getI32Type(), // result type
+        partitionResult,
+        indexOp.getResult()
+    );
+    auto viewSplit = extractOpdata.getResult();
 
     // ============================================================
     // 3. Binding & Channel Config
