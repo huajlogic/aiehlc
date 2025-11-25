@@ -116,6 +116,259 @@ ParseResult dfscheblueprint::TransferManifestOp::parse(OpAsmParser &parser, Oper
     return success();
 }
 
+// DataSliceOp printer
+void dfscheblueprint::DataSliceOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName() << " {";
+    printer << "\n          view = " << getView() << " : " << getView().getType() << ",";
+    printer << "\n          slice = " << getSliceParams();
+    printer << " \n     }";
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), /*elidedAttrs=*/{"sym_name", "view", "slice_params"});
+}
+
+// DataSliceOp parser
+ParseResult dfscheblueprint::DataSliceOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    if (parser.parseLBrace())
+        return failure();
+    
+    OpAsmParser::UnresolvedOperand viewOperand;
+    Type viewType;
+    dfscheblueprint::SliceAttr sliceParams;
+    
+    while (true) {
+        StringRef attrName;
+        if (parser.parseOptionalKeyword(&attrName)) {
+            break;
+        }
+        
+        if (parser.parseEqual())
+            return failure();
+        
+        if (attrName == "view") {
+            if (parser.parseOperand(viewOperand) || parser.parseColonType(viewType))
+                return failure();
+        } else if (attrName == "slice") {
+            if (parser.parseAttribute(sliceParams))
+                return failure();
+        }
+        
+        parser.parseOptionalComma();
+    }
+    
+    if (parser.parseRBrace())
+        return failure();
+    
+    if (parser.resolveOperand(viewOperand, viewType, result.operands))
+        return failure();
+        
+    result.addAttribute("slice_params", sliceParams);
+    parser.parseOptionalAttrDict(result.attributes);
+    
+    return success();
+}
+
+// BindGroupOp printer
+void dfscheblueprint::BindGroupOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName() << " {";
+    printer << "\n          target_group = " << getTargetGroup() << ",";
+    printer << "\n          view = " << getView() << " : " << getView().getType() << ",";
+    printer << "\n          distribution = \"" << getDistribution() << "\",";
+    printer << "\n          dma = " << getDma();
+    if (getSliceSymbols()) {
+        printer << ",\n          slice_symbols = " << getSliceSymbols();
+    }
+    printer << " \n     }";
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), 
+        /*elidedAttrs=*/{"sym_name", "target_group", "view", "distribution", "dma", "slice_symbols"});
+}
+
+// BindGroupOp parser
+ParseResult dfscheblueprint::BindGroupOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    if (parser.parseLBrace())
+        return failure();
+    
+    SymbolRefAttr targetGroup;
+    OpAsmParser::UnresolvedOperand viewOperand;
+    Type viewType;
+    StringAttr distribution;
+    dfscheblueprint::DMAAttr dma;
+    ArrayAttr sliceSymbols;
+    
+    while (true) {
+        OptionalParseResult res = parser.parseOptionalRBrace();
+        if (res.has_value()) {
+            if (failed(res.value())) return failure();
+            break;
+        }
+
+        StringRef attrName;
+        if (parser.parseKeyword(&attrName) || parser.parseEqual())
+            return failure();
+        
+        if (attrName == "target_group") {
+            if (parser.parseAttribute(targetGroup, "target_group", result.attributes)) return failure();
+        } else if (attrName == "view") {
+            if (parser.parseOperand(viewOperand) || parser.parseColonType(viewType))
+                return failure();
+        } else if (attrName == "distribution") {
+            if (parser.parseAttribute(distribution, "distribution", result.attributes)) return failure();
+        } else if (attrName == "dma") {
+            if (parser.parseAttribute(dma, "dma", result.attributes)) return failure();
+        } else if (attrName == "slice_symbols") {
+            if (parser.parseAttribute(sliceSymbols, "slice_symbols", result.attributes)) return failure();
+        } else {
+             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+        }
+        
+        parser.parseOptionalComma();
+    }
+    
+    if (parser.resolveOperand(viewOperand, viewType, result.operands))
+        return failure();
+        
+    parser.parseOptionalAttrDict(result.attributes);
+    
+    return success();
+}
+
+// BindOp printer
+void dfscheblueprint::BindOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName() << " {";
+    printer << "\n          target = " << getTarget() << ",";
+    printer << "\n          view = " << getView() << " : " << getView().getType() << ",";
+    printer << "\n          slice = \"" << getSlice() << "\",";
+    printer << "\n          dma = " << getDma();
+    if (getSliceSymbol()) {
+        printer << ",\n          slice_symbol = " << getSliceSymbol();
+    }
+    printer << " \n     }";
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), 
+        /*elidedAttrs=*/{"sym_name", "target", "view", "slice", "dma", "slice_symbol"});
+}
+
+// BindOp parser
+ParseResult dfscheblueprint::BindOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    if (parser.parseLBrace())
+        return failure();
+    
+    SymbolRefAttr target;
+    OpAsmParser::UnresolvedOperand viewOperand;
+    Type viewType;
+    StringAttr slice;
+    dfscheblueprint::DMAAttr dma;
+    SymbolRefAttr sliceSymbol;
+    
+    while (true) {
+        OptionalParseResult res = parser.parseOptionalRBrace();
+        if (res.has_value()) {
+            if (failed(res.value())) return failure();
+            break;
+        }
+
+        StringRef attrName;
+        if (parser.parseKeyword(&attrName) || parser.parseEqual())
+            return failure();
+        
+        if (attrName == "target") {
+            if (parser.parseAttribute(target, "target", result.attributes)) return failure();
+        } else if (attrName == "view") {
+            if (parser.parseOperand(viewOperand) || parser.parseColonType(viewType))
+                return failure();
+        } else if (attrName == "slice") {
+            if (parser.parseAttribute(slice, "slice", result.attributes)) return failure();
+        } else if (attrName == "dma") {
+            if (parser.parseAttribute(dma, "dma", result.attributes)) return failure();
+        } else if (attrName == "slice_symbol") {
+            if (parser.parseAttribute(sliceSymbol, "slice_symbol", result.attributes)) return failure();
+        } else {
+             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+        }
+        
+        parser.parseOptionalComma();
+    }
+    
+    if (parser.resolveOperand(viewOperand, viewType, result.operands))
+        return failure();
+        
+    parser.parseOptionalAttrDict(result.attributes);
+    
+    return success();
+}
+
+// CollectiveTransferOp printer
+void dfscheblueprint::CollectiveTransferOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName() << " {";
+    printer << "\n          type = \"" << getType() << "\",";
+    printer << "\n          from = " << getFrom() << ",";
+    printer << "\n          to = " << getTo();
+    if (getOrdering()) {
+        printer << ",\n          ordering = \"" << getOrdering() << "\"";
+    }
+    printer << ",\n          base_packet_id = " << getBasePacketId();
+    printer << " \n     }";
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), 
+        /*elidedAttrs=*/{"sym_name", "type", "from", "to", "ordering", "base_packet_id"});
+}
+
+// CollectiveTransferOp parser
+ParseResult dfscheblueprint::CollectiveTransferOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    if (parser.parseLBrace())
+        return failure();
+    
+    StringAttr type;
+    SymbolRefAttr from;
+    SymbolRefAttr to;
+    StringAttr ordering;
+    IntegerAttr basePacketId;
+    
+    while (true) {
+        OptionalParseResult res = parser.parseOptionalRBrace();
+        if (res.has_value()) {
+            if (failed(res.value())) return failure();
+            break;
+        }
+
+        StringRef attrName;
+        if (parser.parseKeyword(&attrName) || parser.parseEqual())
+            return failure();
+        
+        if (attrName == "type") {
+            if (parser.parseAttribute(type, "type", result.attributes)) return failure();
+        } else if (attrName == "from") {
+            if (parser.parseAttribute(from, "from", result.attributes)) return failure();
+        } else if (attrName == "to") {
+            if (parser.parseAttribute(to, "to", result.attributes)) return failure();
+        } else if (attrName == "ordering") {
+            if (parser.parseAttribute(ordering, "ordering", result.attributes)) return failure();
+        } else if (attrName == "base_packet_id") {
+            if (parser.parseAttribute(basePacketId, "base_packet_id", result.attributes)) return failure();
+        } else {
+             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+        }
+        
+        parser.parseOptionalComma();
+    }
+    
+    parser.parseOptionalAttrDict(result.attributes);
+    
+    return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Dialect Initialization
 //===----------------------------------------------------------------------===//

@@ -162,12 +162,7 @@ def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
     AnyType:$view,
     dfscheblueprint_SliceAttr:$slice_params
   );
-  let assemblyFormat = [{
-    $sym_name `{`
-      `view` `=` $view `:` type($view) `,`
-      `slice` `=` $slice_params
-    `}` attr-dict
-  }];
+  let hasCustomAssemblyFormat = 1;
 }
 
 // schedule.bind
@@ -184,15 +179,7 @@ def dfscheblueprint_BindOp : dfscheblueprintop<"bind", [
     dfscheblueprint_DMAAttr:$dma,
     OptionalAttr<SymbolRefAttr>:$slice_symbol
   );
-  let assemblyFormat = [{
-    $sym_name `{`
-      `target` `=` $target `,`
-      `view` `=` $view `:` type($view) `,`
-      `slice` `=` $slice `,`
-      `dma` `=` $dma
-      (`,` `slice_symbol` `=` $slice_symbol^)?
-    `}` attr-dict
-  }];
+  let hasCustomAssemblyFormat = 1;
 }
 
 // schedule.bind_group
@@ -209,15 +196,7 @@ def dfscheblueprint_BindGroupOp : dfscheblueprintop<"bind_group", [
     dfscheblueprint_DMAAttr:$dma,
     OptionalAttr<ArrayAttr>:$slice_symbols
   );
-  let assemblyFormat = [{
-    $sym_name `{`
-      `target_group` `=` $target_group `,`
-      `view` `=` $view `:` type($view) `,`
-      `distribution` `=` $distribution `,`
-      `dma` `=` $dma
-      (`,` `slice_symbols` `=` $slice_symbols^)?
-    `}` attr-dict
-  }];
+  let hasCustomAssemblyFormat = 1;
 }
 
 // schedule.collective_transfer
@@ -234,15 +213,7 @@ def dfscheblueprint_CollectiveTransferOp : dfscheblueprintop<"collective_transfe
     OptionalAttr<StrAttr>:$ordering,
     I32Attr:$base_packet_id
   );
-  let assemblyFormat = [{
-    $sym_name `{`
-      `type` `=` $type `,`
-      `from` `=` $from `,`
-      `to` `=` $to
-      (`,` `ordering` `=` $ordering^)? `,`
-      `base_packet_id` `=` $base_packet_id
-    `}` attr-dict
-  }];
+  let hasCustomAssemblyFormat = 1;
 }
 
 #endif // dfscheblueprint_OPS

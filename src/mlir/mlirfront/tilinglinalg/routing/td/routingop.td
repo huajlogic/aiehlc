@@ -160,9 +160,7 @@ def routing_partitiontensor :routingop<"partitiontensor"> {
 	let results = (outs
 		I32:$output);
 	
-	let assemblyFormat = [{
-		`tensor` `=` $tensor `:` type($tensor) attr-dict `->` type($output)
-	}];	
+	let hasCustomAssemblyFormat = 1;
 
 }
 

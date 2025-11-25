@@ -180,6 +180,83 @@ ParseResult RoutingCreate::parse(OpAsmParser &parser, OperationState &result) {
   return success();
 }
 
+// partitiontensorOp printer
+void routing::partitiontensor::print(OpAsmPrinter &printer) {
+    printer << " tensor = " << getTensor() << " : " << getTensor().getType();
+    printer << " {";
+    printer << "\n          splitnum = " << getSplitnum() << ",";
+    printer << "\n          splitdim = " << getSplitdim() << ",";
+    printer << "\n          hw_axis_owner = " << getHwAxisOwnerAttr() << ",";
+    printer << "\n          replicate_on = " << getReplicateOnAttr() << ",";
+    printer << "\n          single_tile_owner = " << getSingleTileOwnerAttr();
+    printer << "\n     }";
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), 
+        /*elidedAttrs=*/{"splitnum", "splitdim", "hw_axis_owner", "replicate_on", "single_tile_owner"});
+    printer << " -> " << getOutput().getType();
+}
+
+// partitiontensorOp parser
+ParseResult routing::partitiontensor::parse(OpAsmParser &parser, OperationState &result) {
+    OpAsmParser::UnresolvedOperand tensorOperand;
+    Type tensorType;
+    
+    if (parser.parseKeyword("tensor") || parser.parseEqual())
+        return failure();
+        
+    if (parser.parseOperand(tensorOperand) || parser.parseColonType(tensorType))
+        return failure();
+        
+    if (parser.parseLBrace()) return failure();
+    
+    while (true) {
+        OptionalParseResult res = parser.parseOptionalRBrace();
+        if (res.has_value()) {
+            if (failed(res.value())) return failure();
+            break;
+        }
+        
+        StringRef attrName;
+        if (parser.parseKeyword(&attrName) || parser.parseEqual()) return failure();
+        
+        if (attrName == "splitnum") {
+            IntegerAttr attr;
+            if (parser.parseAttribute(attr, "splitnum", result.attributes)) return failure();
+        } else if (attrName == "splitdim") {
+            IntegerAttr attr;
+            if (parser.parseAttribute(attr, "splitdim", result.attributes)) return failure();
+        } else if (attrName == "hw_axis_owner") {
+            StringAttr attr;
+            if (parser.parseAttribute(attr, "hw_axis_owner", result.attributes)) return failure();
+        } else if (attrName == "replicate_on") {
+            StringAttr attr;
+            if (parser.parseAttribute(attr, "replicate_on", result.attributes)) return failure();
+        } else if (attrName == "single_tile_owner") {
+            StringAttr attr;
+            if (parser.parseAttribute(attr, "single_tile_owner", result.attributes)) return failure();
+        } else {
+             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+        }
+        
+        parser.parseOptionalComma();
+    }
+        
+    if (parser.parseOptionalAttrDict(result.attributes))
+        return failure();
+        
+    if (parser.parseArrow())
+        return failure();
+        
+    Type resultType;
+    if (parser.parseType(resultType))
+        return failure();
+        
+    result.addTypes(resultType);
+    if (parser.resolveOperand(tensorOperand, tensorType, result.operands))
+        return failure();
+        
+    return success();
+}
+
 //routing class
 void routingmanager::type_interface_test(MLIRContext* ctx) {
         //ctx->getOrLoadDialect<routing::routingdialect>();
