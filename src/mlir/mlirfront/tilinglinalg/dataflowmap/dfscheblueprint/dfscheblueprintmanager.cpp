@@ -138,6 +138,7 @@ void dfscheblueprintdialect::initialize()  {
 }
 
 ModuleOp dfscheblueprintmanager::ops_test(MLIRContext* ctx) {
+    loaddialect(ctx);
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     
@@ -187,12 +188,12 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         location,
         builder.getStringAttr("tiling_and_broadcast_blueprint")
     );
-    /*
+    
     // Set insertion point inside the config body
     Block *configBody = new Block();
     configOp.getBody().push_back(configBody);
     builder.setInsertionPointToStart(configBody);
-    
+    ///*
     // --- Transfer Manifest 1: broadcast_upper_half ---
     
     // Create payload_slice attribute for upper half
@@ -259,7 +260,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         sourceEndpoint,
         destinationsAttr
     );
-    
+    ///*
     // --- Transfer Manifest 2: broadcast_lower_half ---
     
     auto offsetAttrLower = builder.getArrayAttr({
@@ -317,6 +318,6 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         sourceEndpointLower,
         destinationsAttrLower
     );
-    */
+    //*/
 }
 

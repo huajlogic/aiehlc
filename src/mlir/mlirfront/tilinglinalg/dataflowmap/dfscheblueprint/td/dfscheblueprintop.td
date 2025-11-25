@@ -18,12 +18,15 @@ include "mlir/Interfaces/FunctionInterfaces.td"
 
 include "mlir/IR/BuiltinTypes.td"
 include "dfscheblueprinttype.td"
-
+// no SymbolTable will cause the generic print when block have Symbol
+// no NoTerminator will cause the generic print when block is empty or there is no terminate op like yeld
 // schedule.config - Top-level container for schedule blueprint
 def dfscheblueprint_ConfigOp : dfscheblueprintop<"config", [
     IsolatedFromAbove,  
+    SymbolTable,
     Symbol,
-    SingleBlock
+    SingleBlock,
+    NoTerminator
   ]> {
   let summary = "Schedule configuration blueprint container";
   let description = [{
@@ -47,7 +50,7 @@ def dfscheblueprint_ConfigOp : dfscheblueprintop<"config", [
   
   let hasCustomAssemblyFormat = 1;
 }
-
+// Symbol will cause generic print once the partent have no Symboltalbe
 // schedule.transfer_manifest - Individual data transfer specification
 def dfscheblueprint_TransferManifestOp : dfscheblueprintop<"transfer_manifest", [
     Symbol,
