@@ -21,6 +21,104 @@
 #undef GET_ATTRDEF_CLASSES
 #undef GET_TYPEDEF_CLASSES
 
+//===----------------------------------------------------------------------===//
+// Custom Printers and Parsers
+//===----------------------------------------------------------------------===//
+
+// ConfigOp printer
+void dfscheblueprint::ConfigOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName();
+    printer << " ";
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+}
+
+// ConfigOp parser
+ParseResult dfscheblueprint::ConfigOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    Region *body = result.addRegion();
+    if (parser.parseRegion(*body, {}, {}))
+        return failure();
+    
+    // Ensure the region has a block
+    if (body->empty())
+        body->emplaceBlock();
+    
+    return success();
+}
+
+// TransferManifestOp printer
+void dfscheblueprint::TransferManifestOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName() << " {";
+    printer.printNewline();
+    printer << "    payload_slice = " << getPayloadSlice() << ",";
+    printer.printNewline();
+    printer << "    packet_id = " << getPacketId() << ",";
+    printer.printNewline();
+    printer << "    source = " << getSource() << ",";
+    printer.printNewline();
+    printer << "    destinations = " << getDestinations();
+    printer.printNewline();
+    printer << "  }";
+}
+
+// TransferManifestOp parser
+ParseResult dfscheblueprint::TransferManifestOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    if (parser.parseLBrace())
+        return failure();
+    
+    dfscheblueprint::SliceAttr payloadSlice;
+    IntegerAttr packetId;
+    dfscheblueprint::EndpointAttr source;
+    ArrayAttr destinations;
+    
+    while (true) {
+        StringRef attrName;
+        if (parser.parseOptionalKeyword(&attrName)) {
+            break;
+        }
+        
+        if (parser.parseEqual())
+            return failure();
+        
+        if (attrName == "payload_slice") {
+            if (parser.parseAttribute(payloadSlice))
+                return failure();
+        } else if (attrName == "packet_id") {
+            if (parser.parseAttribute(packetId))
+                return failure();
+        } else if (attrName == "source") {
+            if (parser.parseAttribute(source))
+                return failure();
+        } else if (attrName == "destinations") {
+            if (parser.parseAttribute(destinations))
+                return failure();
+        }
+        
+        parser.parseOptionalComma();
+    }
+    
+    if (parser.parseRBrace())
+        return failure();
+    
+    result.addAttribute("payload_slice", payloadSlice);
+    result.addAttribute("packet_id", packetId);
+    result.addAttribute("source", source);
+    result.addAttribute("destinations", destinations);
+    
+    return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Dialect Initialization
+//===----------------------------------------------------------------------===//
+
 void dfscheblueprintdialect::initialize()  { 
     addOperations<
     #define GET_OP_LIST
@@ -48,7 +146,13 @@ ModuleOp dfscheblueprintmanager::ops_test(MLIRContext* ctx) {
     
     createBlueprintExample(builder, ctx);
     
-    llvm::errs() << m;
+    // Print with custom format (not generic)
+    OpPrintingFlags flags;
+    flags.enableDebugInfo(false);
+    flags.printGenericOpForm(false);  // Disable generic form
+    m.print(llvm::outs(), flags);
+    llvm::outs() << "\n";
+    
     return m;
 }
 
@@ -83,7 +187,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         location,
         builder.getStringAttr("tiling_and_broadcast_blueprint")
     );
-    
+    /*
     // Set insertion point inside the config body
     Block *configBody = new Block();
     configOp.getBody().push_back(configBody);
@@ -118,13 +222,11 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         strideAttr
     );
     
-    // Create source endpoint: tile=(2,0), direction="MM2S", channel=0
+    // Create source endpoint: tile=(0,2), direction="MM2S", channel=0
     auto sourceEndpoint = dfscheblueprint::EndpointAttr::get(
         ctx,
-        builder.getArrayAttr({
-            builder.getI64IntegerAttr(0),  // row
-            builder.getI64IntegerAttr(2)   // col
-        }),
+        0,  // row
+        2,  // col
         builder.getStringAttr("MM2S"),
         0  // channel
     );
@@ -132,20 +234,16 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Create destination endpoints
     auto dest1 = dfscheblueprint::EndpointAttr::get(
         ctx,
-        builder.getArrayAttr({
-            builder.getI64IntegerAttr(2),  // row
-            builder.getI64IntegerAttr(2)   // col
-        }),
+        2,  // row
+        2,  // col
         builder.getStringAttr("S2MM"),
         0  // channel
     );
     
     auto dest2 = dfscheblueprint::EndpointAttr::get(
         ctx,
-        builder.getArrayAttr({
-            builder.getI64IntegerAttr(3),  // row
-            builder.getI64IntegerAttr(2)   // col
-        }),
+        3,  // row
+        2,  // col
         builder.getStringAttr("S2MM"),
         0  // channel
     );
@@ -185,10 +283,8 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Source endpoint (same as before)
     auto sourceEndpointLower = dfscheblueprint::EndpointAttr::get(
         ctx,
-        builder.getArrayAttr({
-            builder.getI64IntegerAttr(0),  // row
-            builder.getI64IntegerAttr(2)   // col
-        }),
+        0,  // row
+        2,  // col
         builder.getStringAttr("MM2S"),
         0  // channel
     );
@@ -196,20 +292,16 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Different destination endpoints for lower half
     auto dest3 = dfscheblueprint::EndpointAttr::get(
         ctx,
-        builder.getArrayAttr({
-            builder.getI64IntegerAttr(4),  // row
-            builder.getI64IntegerAttr(2)   // col
-        }),
+        4,  // row
+        2,  // col
         builder.getStringAttr("S2MM"),
         0  // channel
     );
     
     auto dest4 = dfscheblueprint::EndpointAttr::get(
         ctx,
-        builder.getArrayAttr({
-            builder.getI64IntegerAttr(5),  // row
-            builder.getI64IntegerAttr(2)   // col
-        }),
+        5,  // row
+        2,  // col
         builder.getStringAttr("S2MM"),
         0  // channel
     );
@@ -225,5 +317,6 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         sourceEndpointLower,
         destinationsAttrLower
     );
+    */
 }
 

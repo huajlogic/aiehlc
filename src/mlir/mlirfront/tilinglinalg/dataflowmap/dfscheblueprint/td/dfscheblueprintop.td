@@ -21,8 +21,7 @@ include "dfscheblueprinttype.td"
 
 // schedule.config - Top-level container for schedule blueprint
 def dfscheblueprint_ConfigOp : dfscheblueprintop<"config", [
-    IsolatedFromAbove, 
-    SymbolTable, 
+    IsolatedFromAbove,  
     Symbol,
     SingleBlock
   ]> {
@@ -46,7 +45,7 @@ def dfscheblueprint_ConfigOp : dfscheblueprintop<"config", [
   
   let regions = (region SizedRegion<1>:$body);
   
-  let assemblyFormat = "$sym_name $body attr-dict";
+  let hasCustomAssemblyFormat = 1;
 }
 
 // schedule.transfer_manifest - Individual data transfer specification
@@ -89,14 +88,7 @@ def dfscheblueprint_TransferManifestOp : dfscheblueprintop<"transfer_manifest", 
     ArrayAttr:$destinations  // Array of dfscheblueprint_EndpointAttr
   );
   
-  let assemblyFormat = [{
-    $sym_name `{`
-      `payload_slice` `=` $payload_slice `,`
-      `packet_id` `=` $packet_id `,`
-      `source` `=` $source `,`
-      `destinations` `=` $destinations
-    `}` attr-dict
-  }];
+  let hasCustomAssemblyFormat = 1;
   
   let extraClassDeclaration = [{
     // Helper to access destination endpoints

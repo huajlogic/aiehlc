@@ -18,7 +18,7 @@ include "mlir/IR/EnumAttr.td"
 
 // Dialect: dfscheblueprint
 def dfscheblueprintdialect : Dialect {
-    let name = "dfscheblueprint";
+    let name = "schedule";
     let cppNamespace = "dfscheblueprint";
     let hasOperationAttrVerify = 0;
     let useDefaultAttributePrinterParser = 1;
@@ -61,11 +61,12 @@ def dfscheblueprint_SliceAttr : dfscheblueprintattr<"Slice"> {
 def dfscheblueprint_EndpointAttr : dfscheblueprintattr<"Endpoint"> {
   let summary = "Physical tile endpoint with DMA configuration";
   let parameters = (ins
-    "ArrayAttr":$tile,                // (row, col) as [row, col]
+    "int64_t":$row,                   // tile row
+    "int64_t":$col,                   // tile col  
     "StringAttr":$direction,          // "MM2S" or "S2MM"
     "int64_t":$channel                // DMA channel number
   );
-  let assemblyFormat = "`<` `tile` `=` $tile `,` `direction` `=` $direction `,` `channel` `=` $channel `>`";
+  let assemblyFormat = "`<` `tile` `=` `(` $row `,` $col `)` `,` `direction` `=` $direction `,` `channel` `=` $channel `>`";
 }
 
 #endif //_ATTR_dfscheblueprint_
