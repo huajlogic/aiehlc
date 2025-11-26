@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include <sstream>
 #include <iostream>
@@ -52,6 +53,19 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
                                          RoutingTopology &router, DataflowDirection direction) {
     auto loc = op->getLoc();
     
+    // Get operand 0 and extract the data ID
+    Value dataValue = op->getOperand(0);
+    Value dataId;
+    
+    // Try to dyn_cast to routing::extract_data
+    if (auto extractOp = dataValue.getDefiningOp<routing::extract_data>()) {
+        // If it's already an extract_data operation, use its result directly
+        dataId = extractOp.getResult();
+    } else {
+        // Otherwise, use the value directly (assuming it's already an I32)
+        dataId = dataValue;
+    }
+    
     // Get topology info - core tile start row
     int core_start_row = (int) router.getRM()->getrsc()->absTileRow(TileType::Core, 0);
     
@@ -59,6 +73,7 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     // dmap.pull %data from %stream -> stream is operand 1
     Value streamValue = op->getOperand(1);
     Operation *streamOp = streamValue.getDefiningOp();
+    
 
     dmap::define_io_engine shimEngine, memEngine;
     dmap::define_core_group sourceCoreGroup, destCoreGroup;
@@ -315,7 +330,8 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         : rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}));
 
     auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
-    Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
+    
+    // Create template memref for buffer allocation
     Value coreBufferTemplate = rewriter.create<memref::AllocOp>(loc, memrefType);
     SmallVector<Value, 4> coreBuffers;
     for (auto coreTile : coreTiles) {
@@ -323,9 +339,9 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     }
 
     if (direction == DataflowDirection::Push) {
-        rewriter.create<dmaphop::push>(loc, ddrBuffer, path, coreBuffers, corePortsInValues);
+        rewriter.create<dmaphop::push>(loc, dataId, path, coreBuffers, corePortsInValues);
     } else {
-        rewriter.create<dmaphop::pull>(loc, ddrBuffer, path, coreBuffers, corePortsInValues);
+        rewriter.create<dmaphop::pull>(loc, dataId, path, coreBuffers, corePortsInValues);
     }
     rewriter.create<dmaphop::sync>(loc, path);
 
@@ -333,7 +349,6 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     for (auto buffer : coreBuffers) {
         rewriter.create<dmaphop::dealloc_buffer>(loc, buffer);
     }
-    rewriter.create<memref::DeallocOp>(loc, ddrBuffer);
     rewriter.create<memref::DeallocOp>(loc, coreBufferTemplate);
     rewriter.eraseOp(op);
     return success();

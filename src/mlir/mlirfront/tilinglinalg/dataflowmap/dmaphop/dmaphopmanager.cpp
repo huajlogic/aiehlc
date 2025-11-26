@@ -4,6 +4,7 @@
 ******************************************************************************/
 #include "dmaphopmanager.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include <iostream>
 
 #define GET_TYPEDEF_CLASSES
@@ -166,6 +167,7 @@ ModuleOp dmaphopmanager::ops_test(MLIRContext* ctx, int totalN) {
 void dmaphopmanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<mlir::func::FuncDialect>();
     ctx->getOrLoadDialect<dmaphop::dmaphopdialect>();
+    ctx->getOrLoadDialect<routing::routingdialect>();
     ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
     ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
@@ -307,20 +309,33 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
 
     auto memrefTypeOut = MemRefType::get({1024}, builder.getF32Type());
 
-    // Allocate source data buffer
-    auto data = builder.create<memref::AllocOp>(location, memrefType);
+    // Create data handle using routing.routingextract_data
+    // First create a dummy I32 value as the tensor source
+    auto i32Type = builder.getI32Type();
+    auto tensorId = builder.create<arith::ConstantOp>(location, i32Type, builder.getI32IntegerAttr(0));
+    auto dataIdx = builder.create<arith::ConstantOp>(location, i32Type, builder.getI32IntegerAttr(0));
+    
+    // Extract data using routing.routingextract_data
+    auto data = builder.create<routing::extract_data>(location, 
+        i32Type,
+        tensorId.getResult(), 
+        dataIdx.getResult()
+    );
+    
+    // Allocate a template memref for buffer allocation
+    auto memrefTemplate = builder.create<memref::AllocOp>(location, memrefType);
     
     // Allocate destination buffers on tiles
     auto bufferA = builder.create<dmaphop::alloc_buffer>(location,
         memrefTypeOut,
         tileA.getResult(),
-        data.getResult()
+        memrefTemplate.getResult()
     );
     
     auto bufferB = builder.create<dmaphop::alloc_buffer>(location,
         memrefTypeOut,
         tileB.getResult(),
-        data.getResult()
+        memrefTemplate.getResult()
     );
 
     // --- 6. Execute Transfer ---
@@ -333,11 +348,11 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
 
     // --- 7. Synchronization ---
     builder.create<dmaphop::sync>(location, serialPath.getResult());
-///*
+
     // --- 8. Cleanup ---
     builder.create<dmaphop::dealloc_buffer>(location, bufferA);
     builder.create<dmaphop::dealloc_buffer>(location, bufferB);
-    builder.create<memref::DeallocOp>(location, data);
+    builder.create<memref::DeallocOp>(location, memrefTemplate);
 
     // Add return
    // builder.create<func::ReturnOp>(location);

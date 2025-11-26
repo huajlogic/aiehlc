@@ -314,25 +314,25 @@ def dmaphop_alloc_buffer : dmaphopop<"alloc_buffer"> {
 def dmaphop_push : dmaphopop<"push"> {
   let summary = "Pushes data through a path to multiple destinations";
   let arguments = (ins
-    AnyMemRef:$data,
+    I32:$data,
     dmaphoppathtype:$path,
-    Variadic<AnyMemRef>:$output_buffers,
-    Variadic<dmaphopporttype>:$output_ports
+    Variadic<AnyMemRef>:$consumer_buffers,
+    Variadic<dmaphopporttype>:$consumer_ports
   );
   let traits = [SameVariadicOperandSize];
-  let assemblyFormat = "$data `onto` $path `outputs` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
+  let assemblyFormat = "$data `into` $path `consumer` `(` $consumer_buffers `at` $consumer_ports `)` `:` type($data) type($path) type($consumer_buffers) type($consumer_ports) attr-dict";
 }
  
  def dmaphop_pull : dmaphopop<"pull"> {
   let summary = "pull data through a path to multiple destinations";
   let arguments = (ins
-    AnyMemRef:$data,
+    I32:$data,
     dmaphoppathtype:$path,
-    Variadic<AnyMemRef>:$output_buffers,
-    Variadic<dmaphopporttype>:$output_ports
+    Variadic<AnyMemRef>:$producer_buffers,
+    Variadic<dmaphopporttype>:$producer_ports
   );
   let traits = [SameVariadicOperandSize];
-  let assemblyFormat = "$data `from` $path `input` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
+  let assemblyFormat = "$data `from` $path `producer` `(` $producer_buffers `at` $producer_ports `)` `:` type($data) type($path) type($producer_buffers) type($producer_ports) attr-dict";
 }
 
 // --- 7. Sync Operation ---

@@ -247,24 +247,19 @@ struct EraseOpLowering : public OpConversionPattern<Op_T> {
 };
 
 struct PartitionTensorConversion : public OpConversionPattern<routing::partitiontensor> {
-    dfscheblueprint::ConfigOp configOp;
-    PartitionTensorConversion(MLIRContext *context, dfscheblueprint::ConfigOp config) 
-        : OpConversionPattern<routing::partitiontensor>(context), configOp(config) {}
+    PartitionTensorConversion(MLIRContext *context) 
+        : OpConversionPattern<routing::partitiontensor>(context) {}
 
     LogicalResult matchAndRewrite(routing::partitiontensor op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        dfscheblueprint::ConfigOp cfg = configOp;
         auto tensorDef = op.getTensor().getDefiningOp();
+        /*
         auto dummyOp = dyn_cast_or_null<routing::createdummytensor>(tensorDef);
         if (!dummyOp) return failure();
-
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToStart(&cfg.getRegion().front());
-
         auto newDummy = rewriter.clone(*dummyOp);
         auto newPartition = rewriter.clone(*op);
         newPartition->setOperand(0, newDummy->getResult(0));
-
+      
         // Find usage by extract_data
         routing::extract_data extractOp;
         for (auto user : op.getResult().getUsers()) {
@@ -318,19 +313,19 @@ struct PartitionTensorConversion : public OpConversionPattern<routing::partition
             }
             //rewriter.eraseOp(extractOp);
         }
+            */
         rewriter.eraseOp(op);
         return success();
     }
 };
 
 struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
-    dfscheblueprint::ConfigOp configOp;
-    PushOpConversion(MLIRContext *context, dfscheblueprint::ConfigOp config) 
-        : OpConversionPattern<dmaphop::push>(context), configOp(config) {}
+    PushOpConversion(MLIRContext *context) 
+        : OpConversionPattern<dmaphop::push>(context) {}
 
     LogicalResult matchAndRewrite(dmaphop::push op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        dfscheblueprint::ConfigOp cfg = configOp;
+       // dfscheblueprint::ConfigOp cfg = configOp;
         /*
         Value viewHandle;
         cfg.walk([&](dfscheblueprint::ExtractOp extract) {
@@ -349,13 +344,12 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
 };
 
 struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
-    dfscheblueprint::ConfigOp configOp;
-    PullOpConversion(MLIRContext *context, dfscheblueprint::ConfigOp config) 
-        : OpConversionPattern<dmaphop::pull>(context), configOp(config) {}
+    PullOpConversion(MLIRContext *context) 
+        : OpConversionPattern<dmaphop::pull>(context) {}
 
     LogicalResult matchAndRewrite(dmaphop::pull op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        dfscheblueprint::ConfigOp cfg = configOp;
+       // dfscheblueprint::ConfigOp cfg = configOp;
         /*
         Value viewHandle;
         cfg.walk([&](dfscheblueprint::ExtractOp extract) {
@@ -376,10 +370,40 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
 void DmaphopTodfscheblueprintPass::runOnOperation() {
     auto module = getOperation();
     OpBuilder builder(module->getContext());
-    
-    SmallVector<scf::ExecuteRegionOp> execOps;
-    module->walk([&](scf::ExecuteRegionOp op) { execOps.push_back(op); });
 
+    MLIRContext *context = &getContext();
+    ConversionTarget target(*context);
+    target.addLegalDialect<dfscheblueprint::dfscheblueprintdialect>();
+    target.addLegalDialect<routing::routingdialect>();
+    target.addLegalDialect<arith::ArithDialect>();
+    target.addLegalDialect<memref::MemRefDialect>();
+    target.addLegalOp<scf::ExecuteRegionOp>();
+    
+    //target.addIllegalDialect<dmaphop::dmaphopdialect>();
+    //target.addIllegalOp<dmaphop::push>();
+    //target.addIllegalOp<dmaphop::pull>();
+    //target.addIllegalOp<routing::partitiontensor>();
+    
+    RewritePatternSet patterns(context);
+    patterns.add<EraseOpLowering<dmaphop::tile>,
+                    EraseOpLowering<dmaphop::port>,
+                    EraseOpLowering<dmaphop::create_hop>,
+                    EraseOpLowering<dmaphop::create_path>,
+                    EraseOpLowering<dmaphop::alloc_buffer>,
+                    EraseOpLowering<dmaphop::sync>,
+                    EraseOpLowering<dmaphop::dealloc_buffer>>(context);
+    
+    patterns.add<PartitionTensorConversion>(context);
+    patterns.add<PushOpConversion>(context);
+    patterns.add<PullOpConversion>(context);
+
+    if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
+        signalPassFailure();
+    }
+    
+    //SmallVector<scf::ExecuteRegionOp> execOps;
+    //module->walk([&](scf::ExecuteRegionOp op) { execOps.push_back(op); });
+    /*
     for (auto execOp : execOps) {
         bool hasDmapHop = false;
         execOp.walk([&](Operation *op) {
@@ -433,6 +457,7 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
 
         execOp.erase();
     }
+    */
 }
 
 std::unique_ptr<Pass> createDmaphopTodfscheblueprintPass() {
