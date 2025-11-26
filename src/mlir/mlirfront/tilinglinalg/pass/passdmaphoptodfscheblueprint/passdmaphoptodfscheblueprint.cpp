@@ -235,11 +235,152 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     );
 }
 
+// Generic lowering pattern to erase an op that is no longer needed.
+template <typename Op_T>
+struct EraseOpLowering : public OpConversionPattern<Op_T> {
+    using OpConversionPattern<Op_T>::OpConversionPattern;
+    LogicalResult matchAndRewrite(Op_T op, typename Op_T::Adaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+struct PartitionTensorConversion : public OpConversionPattern<routing::partitiontensor> {
+    dfscheblueprint::ConfigOp configOp;
+    PartitionTensorConversion(MLIRContext *context, dfscheblueprint::ConfigOp config) 
+        : OpConversionPattern<routing::partitiontensor>(context), configOp(config) {}
+
+    LogicalResult matchAndRewrite(routing::partitiontensor op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        dfscheblueprint::ConfigOp cfg = configOp;
+        auto tensorDef = op.getTensor().getDefiningOp();
+        auto dummyOp = dyn_cast_or_null<routing::createdummytensor>(tensorDef);
+        if (!dummyOp) return failure();
+
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(&cfg.getRegion().front());
+
+        auto newDummy = rewriter.clone(*dummyOp);
+        auto newPartition = rewriter.clone(*op);
+        newPartition->setOperand(0, newDummy->getResult(0));
+
+        // Find usage by extract_data
+        routing::extract_data extractOp;
+        for (auto user : op.getResult().getUsers()) {
+            if (auto eOp = dyn_cast<routing::extract_data>(user)) {
+                extractOp = eOp;
+                break; 
+            }
+        }
+
+        if (extractOp) {
+            auto c0 = rewriter.create<arith::ConstantOp>(
+                op.getLoc(), 
+                rewriter.getI32IntegerAttr(0)
+            );
+            auto newExtract = rewriter.create<routing::extract_data>(
+                extractOp.getLoc(),
+                extractOp.getType(),
+                newPartition->getResult(0),
+                c0
+            );
+            auto schedExtract = rewriter.create<dfscheblueprint::ExtractOp>(
+                extractOp.getLoc(),
+                dfscheblueprint::ViewHandleType::get(getContext()),
+                newExtract.getResult()
+            );
+            schedExtract->setAttr("index", rewriter.getI64IntegerAttr(0));
+            
+            int64_t splitNum = op.getSplitnum();
+            int64_t sliceRows = 4;
+            int64_t sliceCols = 256;
+            for (int i = 0; i < splitNum; ++i) {
+                std::string name = "out_slice_" + std::to_string(i);
+                auto nameAttr = rewriter.getStringAttr(name);
+                SmallVector<int64_t> offset = {i * sliceRows, 0};
+                SmallVector<int64_t> size = {sliceRows, sliceCols};
+                SmallVector<int64_t> stride = {sliceCols, 1};
+                auto sliceType = MemRefType::get({sliceRows, sliceCols}, rewriter.getF32Type());
+                auto sliceAttr = dfscheblueprint::SliceAttr::get(
+                    getContext(),
+                    TypeAttr::get(sliceType),
+                    rewriter.getI64ArrayAttr(offset),
+                    rewriter.getI64ArrayAttr(size),
+                    rewriter.getI64ArrayAttr(stride)
+                );
+                rewriter.create<dfscheblueprint::DataSliceOp>(
+                    op.getLoc(),
+                    nameAttr,
+                    schedExtract.getResult(),
+                    sliceAttr
+                );
+            }
+            //rewriter.eraseOp(extractOp);
+        }
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
+    dfscheblueprint::ConfigOp configOp;
+    PushOpConversion(MLIRContext *context, dfscheblueprint::ConfigOp config) 
+        : OpConversionPattern<dmaphop::push>(context), configOp(config) {}
+
+    LogicalResult matchAndRewrite(dmaphop::push op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        dfscheblueprint::ConfigOp cfg = configOp;
+        /*
+        Value viewHandle;
+        cfg.walk([&](dfscheblueprint::ExtractOp extract) {
+            viewHandle = extract.getResult();
+            return WalkResult::interrupt();
+        });
+        if (!viewHandle) return failure();
+
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToEnd(&cfg.getRegion().front());
+        processPush(op, rewriter, cfg, viewHandle);
+        */
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
+    dfscheblueprint::ConfigOp configOp;
+    PullOpConversion(MLIRContext *context, dfscheblueprint::ConfigOp config) 
+        : OpConversionPattern<dmaphop::pull>(context), configOp(config) {}
+
+    LogicalResult matchAndRewrite(dmaphop::pull op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        dfscheblueprint::ConfigOp cfg = configOp;
+        /*
+        Value viewHandle;
+        cfg.walk([&](dfscheblueprint::ExtractOp extract) {
+            viewHandle = extract.getResult();
+            return WalkResult::interrupt();
+        });
+        if (!viewHandle) return failure();
+
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToEnd(&cfg.getRegion().front());
+        processPull(op, rewriter, cfg, viewHandle);
+        */
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
 void DmaphopTodfscheblueprintPass::runOnOperation() {
     auto module = getOperation();
     OpBuilder builder(module->getContext());
     
-    module->walk([&](scf::ExecuteRegionOp execOp) {
+    SmallVector<scf::ExecuteRegionOp> execOps;
+    module->walk([&](scf::ExecuteRegionOp op) { execOps.push_back(op); });
+
+    for (auto execOp : execOps) {
         bool hasDmapHop = false;
         execOp.walk([&](Operation *op) {
             if (op->getDialect()->getNamespace() == "dmaphop") {
@@ -249,7 +390,7 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
             return WalkResult::advance();
         });
         
-        if (!hasDmapHop) return;
+        if (!hasDmapHop) continue;
 
         builder.setInsertionPoint(execOp);
         auto configOp = builder.create<dfscheblueprint::ConfigOp>(
@@ -258,97 +399,40 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
         );
         
         Block *configBody = builder.createBlock(&configOp.getRegion());
-        builder.setInsertionPointToStart(configBody);
+        // No need to set insertion point here as patterns will set it
 
-        // 1. Handle Routing/Tensor setup (to get view handle)
-        Value viewHandle;
-        routing::partitiontensor partitionOp;
-        execOp.walk([&](routing::partitiontensor op) {
-            partitionOp = op;
-        });
+        MLIRContext *context = &getContext();
+        ConversionTarget target(*context);
+        target.addLegalDialect<dfscheblueprint::dfscheblueprintdialect>();
+        target.addLegalDialect<routing::routingdialect>();
+        target.addLegalDialect<arith::ArithDialect>();
+        target.addLegalDialect<memref::MemRefDialect>();
+        target.addLegalOp<scf::ExecuteRegionOp>();
+        
+        target.addIllegalDialect<dmaphop::dmaphopdialect>();
+        target.addIllegalOp<dmaphop::push>();
+        target.addIllegalOp<dmaphop::pull>();
+        //target.addIllegalOp<routing::partitiontensor>();
+        
+        RewritePatternSet patterns(context);
+        patterns.add<EraseOpLowering<dmaphop::tile>,
+                     EraseOpLowering<dmaphop::port>,
+                     EraseOpLowering<dmaphop::create_hop>,
+                     EraseOpLowering<dmaphop::create_path>,
+                     EraseOpLowering<dmaphop::alloc_buffer>,
+                     EraseOpLowering<dmaphop::sync>,
+                     EraseOpLowering<dmaphop::dealloc_buffer>>(context);
+        
+        patterns.add<PartitionTensorConversion>(context, configOp);
+        patterns.add<PushOpConversion>(context, configOp);
+        patterns.add<PullOpConversion>(context, configOp);
 
-        if (partitionOp) {
-            auto tensorDef = partitionOp.getTensor().getDefiningOp();
-            if (auto dummyOp = dyn_cast_or_null<routing::createdummytensor>(tensorDef)) {
-                auto newDummy = builder.clone(*dummyOp);
-                auto newPartition = builder.clone(*partitionOp);
-                newPartition->setOperand(0, newDummy->getResult(0));
-                
-                routing::extract_data extractOp;
-                execOp.walk([&](routing::extract_data op) {
-                    extractOp = op;
-                });
-                
-                if (extractOp) {
-                    auto c0 = builder.create<arith::ConstantOp>(
-                        execOp.getLoc(), 
-                        builder.getI32IntegerAttr(0)
-                    );
-                    auto newExtract = builder.create<routing::extract_data>(
-                        extractOp.getLoc(),
-                        extractOp.getType(),
-                        newPartition->getResult(0),
-                        c0
-                    );
-                    auto schedExtract = builder.create<dfscheblueprint::ExtractOp>(
-                        extractOp.getLoc(),
-                        dfscheblueprint::ViewHandleType::get(builder.getContext()),
-                        newExtract.getResult()
-                    );
-                    schedExtract->setAttr("index", builder.getI64IntegerAttr(0));
-                    viewHandle = schedExtract.getResult();
-                    
-                    // Create Data Slices (simplified)
-                    int64_t splitNum = partitionOp.getSplitnum();
-                    int64_t sliceRows = 4;
-                    int64_t sliceCols = 256;
-                    for (int i = 0; i < splitNum; ++i) {
-                        std::string name = "out_slice_" + std::to_string(i);
-                        auto nameAttr = builder.getStringAttr(name);
-                        SmallVector<int64_t> offset = {i * sliceRows, 0};
-                        SmallVector<int64_t> size = {sliceRows, sliceCols};
-                        SmallVector<int64_t> stride = {sliceCols, 1};
-                        auto sliceType = MemRefType::get({sliceRows, sliceCols}, builder.getF32Type());
-                        auto sliceAttr = dfscheblueprint::SliceAttr::get(
-                            builder.getContext(),
-                            TypeAttr::get(sliceType),
-                            builder.getI64ArrayAttr(offset),
-                            builder.getI64ArrayAttr(size),
-                            builder.getI64ArrayAttr(stride)
-                        );
-                        builder.create<dfscheblueprint::DataSliceOp>(
-                            execOp.getLoc(),
-                            nameAttr,
-                            viewHandle,
-                            sliceAttr
-                        );
-                    }
-                }
-            }
+        if (failed(applyPartialConversion(execOp, target, std::move(patterns)))) {
+            signalPassFailure();
         }
-        
-        // 2. Process Push/Pull
-        execOp.walk([&](Operation *op) {
-            if (auto pull = dyn_cast<dmaphop::pull>(op)) {
-                processPull(pull, builder, configOp, viewHandle);
-            } else if (auto pushOp = dyn_cast<dmaphop::push>(op)) {
-                processPush(pushOp, builder, configOp, viewHandle);
-            }
-        });
-        
-        // 3. Erase dmaphop ops
-        SmallVector<Operation*> toErase;
-        execOp.walk([&](Operation *op) {
-            if (op->getDialect()->getNamespace() == "dmaphop") {
-                toErase.push_back(op);
-            }
-        });
-        for (auto op : llvm::reverse(toErase)) {
-            op->erase();
-        }
-        
+
         execOp.erase();
-    });
+    }
 }
 
 std::unique_ptr<Pass> createDmaphopTodfscheblueprintPass() {
