@@ -115,7 +115,7 @@ def dfscheblueprint_ResourceGroupOp : dfscheblueprintop<"resource_group", [
 
 // schedule.declare_data
 def dfscheblueprint_DeclareDataOp : dfscheblueprintop<"declare_data", [
-    HasParent<"ConfigOp">
+    
   ]> {
   let summary = "Declares a data matrix";
   let arguments = (ins
@@ -127,7 +127,7 @@ def dfscheblueprint_DeclareDataOp : dfscheblueprintop<"declare_data", [
 
 // schedule.partition
 def dfscheblueprint_PartitionOp : dfscheblueprintop<"partition", [
-    HasParent<"ConfigOp">
+    
   ]> {
   let summary = "Partitions data into views";
   let arguments = (ins
@@ -140,7 +140,7 @@ def dfscheblueprint_PartitionOp : dfscheblueprintop<"partition", [
 
 // schedule.extract
 def dfscheblueprint_ExtractOp : dfscheblueprintop<"extract", [
-    HasParent<"ConfigOp">
+    
   ]> {
   let summary = "Extracts a specific partition from a partitioned view";
   let arguments = (ins
@@ -153,13 +153,12 @@ def dfscheblueprint_ExtractOp : dfscheblueprintop<"extract", [
 
 // schedule.data_slice
 def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
-    Symbol,
-    HasParent<"ConfigOp">
+    Symbol
   ]> {
   let summary = "Defines a named slice of a data view";
   let arguments = (ins
     SymbolNameAttr:$sym_name,
-    AnyType:$view,
+    I32:$view,
     dfscheblueprint_SliceAttr:$slice_params
   );
   let hasCustomAssemblyFormat = 1;
@@ -167,8 +166,7 @@ def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
 
 // schedule.bind
 def dfscheblueprint_BindOp : dfscheblueprintop<"bind", [
-    Symbol,
-    HasParent<"ConfigOp">
+    Symbol
   ]> {
   let summary = "Binds a resource to a data view";
   let arguments = (ins
@@ -184,8 +182,7 @@ def dfscheblueprint_BindOp : dfscheblueprintop<"bind", [
 
 // schedule.bind_group
 def dfscheblueprint_BindGroupOp : dfscheblueprintop<"bind_group", [
-    Symbol,
-    HasParent<"ConfigOp">
+    Symbol
   ]> {
   let summary = "Binds a resource group to a data view";
   let arguments = (ins
@@ -201,8 +198,7 @@ def dfscheblueprint_BindGroupOp : dfscheblueprintop<"bind_group", [
 
 // schedule.collective_transfer
 def dfscheblueprint_CollectiveTransferOp : dfscheblueprintop<"collective_transfer", [
-    Symbol,
-    HasParent<"ConfigOp">
+    Symbol
   ]> {
   let summary = "Defines a collective transfer between bindings";
   let arguments = (ins

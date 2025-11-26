@@ -522,12 +522,12 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // ============================================================
 
     // Extract partition 0
-    auto extractOp = builder.create<dfscheblueprint::ExtractOp>(
-        location,
-        viewSplit,
-        builder.getI32IntegerAttr(0)
-    );
-    auto extractedView = extractOp.getResult();
+    //auto extractOp = builder.create<dfscheblueprint::ExtractOp>(
+    //    location,
+    //    viewSplit,
+    //    builder.getI32IntegerAttr(0)
+    //);
+    //auto extractedView = extractOp.getResult();
 
     // Create 4 DataSliceOps for output (4x256 each) using extractedView
     auto subSliceType = mlir::TypeAttr::get(mlir::MemRefType::get({4, 256}, builder.getF32Type()));
@@ -546,7 +546,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         builder.create<dfscheblueprint::DataSliceOp>(
             location,
             builder.getStringAttr(sliceName),
-            extractedView,
+            viewSplit,
             sliceAttr
         );
         outSliceSymbols.push_back(mlir::SymbolRefAttr::get(ctx, sliceName));

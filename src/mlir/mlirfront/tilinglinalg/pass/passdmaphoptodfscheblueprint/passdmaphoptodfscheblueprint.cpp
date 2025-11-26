@@ -26,7 +26,7 @@ namespace mlir {
 // Helper to process pull (Gather)
 void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp configOp, Value viewHandle) {
     // 1. Identify Sources
-    auto inputPorts = op.getOutputPorts();
+    auto inputPorts = op.getProducerPorts();
     SmallVector<Attribute> sourceTiles;
     int64_t sourceChannel = -1;
     
@@ -349,19 +349,71 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
 
     LogicalResult matchAndRewrite(dmaphop::pull op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-       // dfscheblueprint::ConfigOp cfg = configOp;
-        /*
-        Value viewHandle;
-        cfg.walk([&](dfscheblueprint::ExtractOp extract) {
-            viewHandle = extract.getResult();
-            return WalkResult::interrupt();
-        });
-        if (!viewHandle) return failure();
+        // Get producer buffers
+        auto producerBuffers = op.getProducerBuffers();
+        if (producerBuffers.empty()) {
+            return failure();
+        }
 
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToEnd(&cfg.getRegion().front());
-        processPull(op, rewriter, cfg, viewHandle);
-        */
+        // Get the data value (should be I32 from routing::extract_data)
+        auto dataValue = op.getData();
+
+        // Create data slices with sequential offsets
+        int64_t cumulativeOffset = 0;
+        for (size_t i = 0; i < producerBuffers.size(); ++i) {
+            auto buffer = producerBuffers[i];
+            auto memrefType = dyn_cast<MemRefType>(buffer.getType());
+            if (!memrefType) continue;
+
+            // Extract shape information
+            auto shape = memrefType.getShape();
+            int64_t bufferSize = 1;
+            SmallVector<int64_t> sizeVec;
+            SmallVector<int64_t> strideVec;
+            
+            for (int64_t dim : shape) {
+                sizeVec.push_back(dim);
+                bufferSize *= (dim == ShapedType::kDynamic ? 1024 : dim); // Default for dynamic dims
+            }
+
+            // Calculate strides (assuming row-major layout)
+            int64_t currentStride = 1;
+            for (int j = shape.size() - 1; j >= 0; --j) {
+                strideVec.insert(strideVec.begin(), currentStride);
+                int64_t dimSize = (shape[j] == ShapedType::kDynamic ? 1024 : shape[j]);
+                currentStride *= dimSize;
+            }
+
+            // Create offset array (sequential offset in first dimension, 0 for others)
+            SmallVector<int64_t> offsetVec;
+            offsetVec.push_back(cumulativeOffset);
+            for (size_t j = 1; j < shape.size(); ++j) {
+                offsetVec.push_back(0);
+            }
+
+            // Create SliceAttr
+            auto sliceAttr = dfscheblueprint::SliceAttr::get(
+                getContext(),
+                TypeAttr::get(memrefType),
+                rewriter.getI64ArrayAttr(offsetVec),
+                rewriter.getI64ArrayAttr(sizeVec),
+                rewriter.getI64ArrayAttr(strideVec)
+            );
+
+            // Create data_slice operation using extract_data result directly
+            std::string sliceName = "producer_slice_" + std::to_string(i);
+            rewriter.create<dfscheblueprint::DataSliceOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(sliceName),
+                dataValue,  // Use extract_data result directly
+                sliceAttr
+            );
+
+            // Update cumulative offset for next slice
+            cumulativeOffset += bufferSize;
+        }
+
+        // Erase the original pull operation
         rewriter.eraseOp(op);
         return success();
     }
