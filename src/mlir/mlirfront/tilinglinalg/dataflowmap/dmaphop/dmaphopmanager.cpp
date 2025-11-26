@@ -63,7 +63,7 @@ void dmaphop::port::print(OpAsmPrinter &printer) {
     printer << " on " << getTile();
     printer << " { direction = \"" << getDirection() << "\"";
     if (auto channel = getDirectionChannel()) {
-        printer << ", channel = " << *channel;
+        printer << ", direction_channel = " << *channel;
     }
     printer << " }";
     printer << " : " << getTile().getType();
