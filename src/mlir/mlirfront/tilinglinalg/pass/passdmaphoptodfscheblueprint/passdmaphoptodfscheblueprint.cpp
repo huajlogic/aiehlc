@@ -422,13 +422,6 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             }
         }
         
-        std::string srcGroupName = "group_src_" + std::to_string((uintptr_t)op.getOperation());
-        rewriter.create<dfscheblueprint::ResourceGroupOp>(
-            op.getLoc(),
-            rewriter.getStringAttr(srcGroupName),
-            rewriter.getArrayAttr(sourceTiles)
-        );
-        
         // Identify Destination (Consumer) from Path
         auto pathValue = op.getPath();
         int64_t destChannel = -1;
@@ -458,12 +451,40 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             }
         }
         
+        std::string srcGroupName = "group_src_" + std::to_string((uintptr_t)op.getOperation());
         std::string dstGroupName = "group_dst_" + std::to_string((uintptr_t)op.getOperation());
-        rewriter.create<dfscheblueprint::ResourceGroupOp>(
-            op.getLoc(),
-            rewriter.getStringAttr(dstGroupName),
-            rewriter.getArrayAttr(destTiles)
-        );
+        
+        // Find parent RoutingCreate and insert resource_group at the beginning of its block
+        if (auto routingCreateOp = op->getParentOfType<routing::RoutingCreate>()) {
+            Block &routingBlock = routingCreateOp.getRegion().front();
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(&routingBlock);
+            
+            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(srcGroupName),
+                rewriter.getArrayAttr(sourceTiles)
+            );
+            
+            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(dstGroupName),
+                rewriter.getArrayAttr(destTiles)
+            );
+        } else {
+            // Fallback: insert at current position if not inside RoutingCreate
+            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(srcGroupName),
+                rewriter.getArrayAttr(sourceTiles)
+            );
+            
+            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(dstGroupName),
+                rewriter.getArrayAttr(destTiles)
+            );
+        }
         
         // Create Binds
         std::string srcBindName = "bind_src_" + std::to_string((uintptr_t)op.getOperation());
