@@ -423,6 +423,223 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
 
     LogicalResult matchAndRewrite(dmaphop::push op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
+        // For Push (scatter/one-to-many):
+        // - Producer from create_path is the source (one tile)
+        // - Consumers from create_path are the destinations (many tiles)
+        
+        auto consumerBuffers = op.getConsumerBuffers();
+        if (consumerBuffers.empty()) return failure();
+
+        Value viewSplit = adaptor.getData();
+        
+        // 1. Create data slices for consumer buffers and collect slice symbol names
+        SmallVector<Attribute> sliceSymbols;
+        int64_t cumulativeOffset = 0;
+        for (size_t i = 0; i < consumerBuffers.size(); ++i) {
+            auto buffer = consumerBuffers[i];
+            auto memrefType = dyn_cast<MemRefType>(buffer.getType());
+            if (!memrefType) continue;
+
+            auto sliceShape = memrefType.getShape();
+            SmallVector<int64_t> sizeVec;
+            SmallVector<int64_t> strideVec;
+            
+            for (int64_t dim : sliceShape) {
+                sizeVec.push_back(dim);
+            }
+
+            int64_t currentStride = 1;
+            for (int j = sliceShape.size() - 1; j >= 0; --j) {
+                strideVec.insert(strideVec.begin(), currentStride);
+                int64_t dimSize = (sliceShape[j] == ShapedType::kDynamic ? 1024 : sliceShape[j]);
+                currentStride *= dimSize;
+            }
+
+            SmallVector<int64_t> offsetVec;
+            offsetVec.push_back(cumulativeOffset);
+            for (size_t j = 1; j < sliceShape.size(); ++j) {
+                offsetVec.push_back(0);
+            }
+
+            auto sliceAttr = dfscheblueprint::SliceAttr::get(
+                getContext(),
+                TypeAttr::get(memrefType),
+                rewriter.getI64ArrayAttr(offsetVec),
+                rewriter.getI64ArrayAttr(sizeVec),
+                rewriter.getI64ArrayAttr(strideVec)
+            );
+
+            std::string sliceName = "consumer_slice_" + std::to_string(i);
+            rewriter.create<dfscheblueprint::DataSliceOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(sliceName),
+                viewSplit,
+                sliceAttr
+            );
+            
+            // Collect slice symbol reference for bind_group
+            sliceSymbols.push_back(FlatSymbolRefAttr::get(getContext(), sliceName));
+
+            cumulativeOffset += sliceShape[0]; 
+        }
+
+        // 2. Get path and extract source/destination from producers/consumers attributes
+        // For Push: producer is src (one), consumers are dst (many)
+        auto pathValue = op.getPath();
+        auto pathOp = dyn_cast_or_null<dmaphop::create_path>(pathValue.getDefiningOp());
+        if (!pathOp) {
+            llvm::errs() << "ERROR: PushOpConversion - failed to get create_path from push op\n";
+            return failure();
+        }
+        
+        SmallVector<Attribute> sourceTiles;
+        SmallVector<Attribute> destTiles;
+        int64_t sourceChannel = -1;
+        int64_t destChannel = -1;
+        
+        // Get producers (source - one tile for push/scatter) from create_path attribute via symbol table lookup
+        auto producersAttr = pathOp.getProducers();
+        if (auto arrayAttr = dyn_cast<ArrayAttr>(producersAttr)) {
+            for (auto innerAttr : arrayAttr) {
+                auto symbolRef = dyn_cast<FlatSymbolRefAttr>(innerAttr);
+                if (!symbolRef) {
+                    llvm::errs() << "ERROR: PushOpConversion - producer is not a FlatSymbolRefAttr\n";
+                    continue;
+                }
+                auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                if (!port) {
+                    llvm::errs() << "ERROR: PushOpConversion - failed to find producer port symbol '" 
+                                << symbolRef.getValue() << "' in symbol table\n";
+                    continue;
+                }
+                sourceChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                auto tileValue = port.getTile();
+                auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
+                if (!tileOp) {
+                    llvm::errs() << "ERROR: PushOpConversion - failed to get tile from producer port '" 
+                                << symbolRef.getValue() << "'\n";
+                    continue;
+                }
+                sourceTiles.push_back(rewriter.getArrayAttr({
+                    rewriter.getI64IntegerAttr(tileOp.getCol()),
+                    rewriter.getI64IntegerAttr(tileOp.getRow())
+                }));
+            }
+        }
+        
+        if (sourceTiles.empty()) {
+            llvm::errs() << "WARNING: PushOpConversion - no source tiles found from producers attribute\n";
+        }
+        
+        // Get consumers (destinations - many tiles for push/scatter) from create_path attribute via symbol table lookup
+        auto consumersAttr = pathOp.getConsumers();
+        if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
+            for (auto innerAttr : arrayAttr) {
+                auto symbolRef = dyn_cast<FlatSymbolRefAttr>(innerAttr);
+                if (!symbolRef) {
+                    llvm::errs() << "ERROR: PushOpConversion - consumer is not a FlatSymbolRefAttr\n";
+                    continue;
+                }
+                auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                if (!port) {
+                    llvm::errs() << "ERROR: PushOpConversion - failed to find consumer port symbol '" 
+                                << symbolRef.getValue() << "' in symbol table\n";
+                    continue;
+                }
+                destChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                auto tileValue = port.getTile();
+                auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
+                if (!tileOp) {
+                    llvm::errs() << "ERROR: PushOpConversion - failed to get tile from consumer port '" 
+                                << symbolRef.getValue() << "'\n";
+                    continue;
+                }
+                destTiles.push_back(rewriter.getArrayAttr({
+                    rewriter.getI64IntegerAttr(tileOp.getCol()),
+                    rewriter.getI64IntegerAttr(tileOp.getRow())
+                }));
+            }
+        }
+        
+        if (destTiles.empty()) {
+            llvm::errs() << "WARNING: PushOpConversion - no destination tiles found from consumers attribute\n";
+        }
+        
+        // Get unique sequential ID for naming
+        int opId = g_pullPushCounter.fetch_add(1);
+        
+        std::string srcGroupName = "group_src_" + std::to_string(opId);
+        std::string dstGroupName = "group_dst_" + std::to_string(opId);
+        
+        // 3. Create resource_group ops at the beginning of RoutingCreate block
+        if (auto routingCreateOp = op->getParentOfType<routing::RoutingCreate>()) {
+            Block &routingBlock = routingCreateOp.getRegion().front();
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(&routingBlock);
+            
+            // Source resource group (producer - one for push)
+            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(srcGroupName),
+                rewriter.getArrayAttr(sourceTiles)
+            );
+            
+            // Destination resource group (consumers - many for push)
+            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(dstGroupName),
+                rewriter.getArrayAttr(destTiles)
+            );
+        } else {
+            // Fallback: insert at current position if not inside RoutingCreate
+            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(srcGroupName),
+                rewriter.getArrayAttr(sourceTiles)
+            );
+            
+            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+                op.getLoc(),
+                rewriter.getStringAttr(dstGroupName),
+                rewriter.getArrayAttr(destTiles)
+            );
+        }
+        
+        // 4. Create Binds
+        // For Push: src is one tile (BindOp with root), dst is many tiles (BindGroupOp with linear and slice_symbols)
+        std::string srcBindName = "bind_src_" + std::to_string(opId);
+        rewriter.create<dfscheblueprint::BindOp>(
+            op.getLoc(),
+            rewriter.getStringAttr(srcBindName),
+            FlatSymbolRefAttr::get(getContext(), srcGroupName),
+            viewSplit,
+            rewriter.getStringAttr("root"),
+            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({sourceChannel}), dfscheblueprint::bp_direction::MM2S),
+            nullptr // slice_symbol - source is root, no slice
+        );
+        
+        std::string dstBindName = "bind_dst_" + std::to_string(opId);
+        rewriter.create<dfscheblueprint::BindGroupOp>(
+            op.getLoc(),
+            rewriter.getStringAttr(dstBindName),
+            FlatSymbolRefAttr::get(getContext(), dstGroupName),
+            viewSplit,
+            rewriter.getStringAttr("linear"),
+            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({destChannel}), dfscheblueprint::bp_direction::S2MM),
+            rewriter.getArrayAttr(sliceSymbols)  // Associate with @consumer_slice_0 to @consumer_slice_N
+        );
+        
+        // 5. Create Collective Transfer - one_to_many for push/scatter
+        rewriter.create<dfscheblueprint::CollectiveTransferOp>(
+            op.getLoc(),
+            rewriter.getStringAttr("transfer_" + std::to_string(opId)),
+            rewriter.getStringAttr("one_to_many"),
+            FlatSymbolRefAttr::get(getContext(), srcBindName),
+            FlatSymbolRefAttr::get(getContext(), dstBindName),
+            rewriter.getStringAttr("sequential"),
+            0
+        );
+        
         rewriter.eraseOp(op);
         return success();
     }
