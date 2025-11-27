@@ -246,75 +246,91 @@ struct EraseOpLowering : public OpConversionPattern<Op_T> {
     }
 };
 
-struct PartitionTensorConversion : public OpConversionPattern<routing::partitiontensor> {
-    PartitionTensorConversion(MLIRContext *context) 
-        : OpConversionPattern<routing::partitiontensor>(context) {}
+struct CreateDummyTensorConversion : public OpConversionPattern<routing::createdummytensor> {
+    using OpConversionPattern<routing::createdummytensor>::OpConversionPattern;
+    LogicalResult matchAndRewrite(routing::createdummytensor op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto shapeAttr = op.getShape();
+        SmallVector<int64_t> shape;
+        for (auto dim : shapeAttr) {
+            shape.push_back(cast<IntegerAttr>(dim).getInt());
+        }
+        auto memRefType = MemRefType::get(shape, rewriter.getF32Type());
+        auto alloc = rewriter.create<memref::AllocOp>(op.getLoc(), memRefType);
+        rewriter.replaceOp(op, alloc.getResult());
+        return success();
+    }
+};
 
+struct PartitionTensorConversion : public OpConversionPattern<routing::partitiontensor> {
+    using OpConversionPattern<routing::partitiontensor>::OpConversionPattern;
     LogicalResult matchAndRewrite(routing::partitiontensor op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        auto tensorDef = op.getTensor().getDefiningOp();
-        /*
-        auto dummyOp = dyn_cast_or_null<routing::createdummytensor>(tensorDef);
-        if (!dummyOp) return failure();
-        auto newDummy = rewriter.clone(*dummyOp);
-        auto newPartition = rewriter.clone(*op);
-        newPartition->setOperand(0, newDummy->getResult(0));
-      
-        // Find usage by extract_data
-        routing::extract_data extractOp;
-        for (auto user : op.getResult().getUsers()) {
-            if (auto eOp = dyn_cast<routing::extract_data>(user)) {
-                extractOp = eOp;
-                break; 
-            }
+        rewriter.replaceOp(op, adaptor.getTensor());
+        return success();
+    }
+};
+
+struct ExtractDataConversion : public OpConversionPattern<routing::extract_data> {
+    using OpConversionPattern<routing::extract_data>::OpConversionPattern;
+    LogicalResult matchAndRewrite(routing::extract_data op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto partitionOp = dyn_cast_or_null<routing::partitiontensor>(op.getTensor().getDefiningOp());
+        if (!partitionOp) return failure();
+
+        int64_t splitNum = partitionOp.getSplitnum();
+        int64_t splitDim = partitionOp.getSplitdim();
+
+        Value inputMemRef = adaptor.getTensor();
+        auto memRefType = dyn_cast<MemRefType>(inputMemRef.getType());
+        if (!memRefType) return failure();
+        auto shape = memRefType.getShape();
+
+        SmallVector<OpFoldResult> offsets;
+        SmallVector<OpFoldResult> sizes;
+        SmallVector<OpFoldResult> strides;
+
+        Value indexVal = adaptor.getIdx();
+        if (!indexVal.getType().isIndex()) {
+            indexVal = rewriter.create<arith::IndexCastOp>(op.getLoc(), rewriter.getIndexType(), indexVal);
         }
 
-        if (extractOp) {
-            auto c0 = rewriter.create<arith::ConstantOp>(
-                op.getLoc(), 
-                rewriter.getI32IntegerAttr(0)
-            );
-            auto newExtract = rewriter.create<routing::extract_data>(
-                extractOp.getLoc(),
-                extractOp.getType(),
-                newPartition->getResult(0),
-                c0
-            );
-            auto schedExtract = rewriter.create<dfscheblueprint::ExtractOp>(
-                extractOp.getLoc(),
-                dfscheblueprint::ViewHandleType::get(getContext()),
-                newExtract.getResult()
-            );
-            schedExtract->setAttr("index", rewriter.getI64IntegerAttr(0));
-            
-            int64_t splitNum = op.getSplitnum();
-            int64_t sliceRows = 4;
-            int64_t sliceCols = 256;
-            for (int i = 0; i < splitNum; ++i) {
-                std::string name = "out_slice_" + std::to_string(i);
-                auto nameAttr = rewriter.getStringAttr(name);
-                SmallVector<int64_t> offset = {i * sliceRows, 0};
-                SmallVector<int64_t> size = {sliceRows, sliceCols};
-                SmallVector<int64_t> stride = {sliceCols, 1};
-                auto sliceType = MemRefType::get({sliceRows, sliceCols}, rewriter.getF32Type());
-                auto sliceAttr = dfscheblueprint::SliceAttr::get(
-                    getContext(),
-                    TypeAttr::get(sliceType),
-                    rewriter.getI64ArrayAttr(offset),
-                    rewriter.getI64ArrayAttr(size),
-                    rewriter.getI64ArrayAttr(stride)
-                );
-                rewriter.create<dfscheblueprint::DataSliceOp>(
-                    op.getLoc(),
-                    nameAttr,
-                    schedExtract.getResult(),
-                    sliceAttr
-                );
+        for (size_t i = 0; i < shape.size(); ++i) {
+            if (i == (size_t)splitDim) {
+                Value dimSizeVal;
+                if (shape[i] == ShapedType::kDynamic) {
+                    dimSizeVal = rewriter.create<memref::DimOp>(op.getLoc(), inputMemRef, i);
+                } else {
+                    dimSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), shape[i]);
+                }
+                
+                Value splitNumVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), splitNum);
+                Value splitSize = rewriter.create<arith::DivUIOp>(op.getLoc(), dimSizeVal, splitNumVal);
+                Value offset = rewriter.create<arith::MulIOp>(op.getLoc(), indexVal, splitSize);
+                
+                offsets.push_back(offset);
+                sizes.push_back(splitSize);
+            } else {
+                offsets.push_back(rewriter.getIndexAttr(0));
+                if (shape[i] == ShapedType::kDynamic) {
+                     Value dimSizeVal = rewriter.create<memref::DimOp>(op.getLoc(), inputMemRef, i);
+                     sizes.push_back(dimSizeVal);
+                } else {
+                    sizes.push_back(rewriter.getIndexAttr(shape[i]));
+                }
             }
-            //rewriter.eraseOp(extractOp);
+            strides.push_back(rewriter.getIndexAttr(1));
         }
-            */
-        rewriter.eraseOp(op);
+
+        auto subView = rewriter.create<memref::SubViewOp>(
+            op.getLoc(),
+            inputMemRef,
+            offsets,
+            sizes,
+            strides
+        );
+        
+        rewriter.replaceOp(op, subView.getResult());
         return success();
     }
 };
@@ -325,19 +341,6 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
 
     LogicalResult matchAndRewrite(dmaphop::push op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-       // dfscheblueprint::ConfigOp cfg = configOp;
-        /*
-        Value viewHandle;
-        cfg.walk([&](dfscheblueprint::ExtractOp extract) {
-            viewHandle = extract.getResult();
-            return WalkResult::interrupt();
-        });
-        if (!viewHandle) return failure();
-
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToEnd(&cfg.getRegion().front());
-        processPush(op, rewriter, cfg, viewHandle);
-        */
         rewriter.eraseOp(op);
         return success();
     }
@@ -349,95 +352,25 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
 
     LogicalResult matchAndRewrite(dmaphop::pull op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        // Get producer buffers
         auto producerBuffers = op.getProducerBuffers();
-        if (producerBuffers.empty()) {
-            return failure();
-        }
+        if (producerBuffers.empty()) return failure();
 
-        // Get the data value (should be I32 from routing::extract_data)
-        auto dataValue = op.getData();
+        Value viewSplit = adaptor.getData();
         
-        // Find the defining op of dataValue to trace back to partition/dummy tensor
-        auto extractOp = dyn_cast_or_null<routing::extract_data>(dataValue.getDefiningOp());
-        if (!extractOp) return failure();
-        
-        auto partitionOp = dyn_cast_or_null<routing::partitiontensor>(extractOp.getTensor().getDefiningOp());
-        if (!partitionOp) return failure();
-        
-        auto dummyOp = dyn_cast_or_null<routing::createdummytensor>(partitionOp.getTensor().getDefiningOp());
-        if (!dummyOp) return failure();
-
-        // Create Root Buffer (memref<1024x1024xf32>) - assuming F32 for now, should infer from dummyOp
-        // In a real scenario, we should get shape and type from dummyOp
-        auto shapeAttr = dummyOp.getShape();
-        SmallVector<int64_t> shape;
-        for (auto dim : shapeAttr) {
-            shape.push_back(cast<IntegerAttr>(dim).getInt());
-        }
-        
-        auto rootMemRefType = MemRefType::get(shape, rewriter.getF32Type());
-        auto allocOp = rewriter.create<memref::AllocOp>(op.getLoc(), rootMemRefType);
-        auto rootBuffer = allocOp.getResult();
-
-        // Create SubView based on partition info
-        // Assuming splitnum=4, splitdim=0, index=0 (from extractOp)
-        int64_t splitNum = partitionOp.getSplitnum();
-        int64_t splitDim = partitionOp.getSplitdim();
-        
-        // Get index from extractOp's operand
-        int64_t index = 0;
-        if (auto constOp = dyn_cast_or_null<arith::ConstantOp>(extractOp.getIdx().getDefiningOp())) {
-            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
-                index = intAttr.getInt();
-            }
-        }
-
-        SmallVector<OpFoldResult> offsets;
-        SmallVector<OpFoldResult> sizes;
-        SmallVector<OpFoldResult> strides;
-        
-        for (size_t i = 0; i < shape.size(); ++i) {
-            if (i == (size_t)splitDim) {
-                int64_t dimSize = shape[i];
-                int64_t splitSize = dimSize / splitNum;
-                offsets.push_back(rewriter.getIndexAttr(index * splitSize));
-                sizes.push_back(rewriter.getIndexAttr(splitSize));
-            } else {
-                offsets.push_back(rewriter.getIndexAttr(0));
-                sizes.push_back(rewriter.getIndexAttr(shape[i]));
-            }
-            strides.push_back(rewriter.getIndexAttr(1));
-        }
-        
-        auto subViewOp = rewriter.create<memref::SubViewOp>(
-            op.getLoc(),
-            rootBuffer,
-            offsets,
-            sizes,
-            strides
-        );
-        auto viewSplit = subViewOp.getResult();
-
-        // Create data slices with sequential offsets relative to the subview
         int64_t cumulativeOffset = 0;
         for (size_t i = 0; i < producerBuffers.size(); ++i) {
             auto buffer = producerBuffers[i];
             auto memrefType = dyn_cast<MemRefType>(buffer.getType());
             if (!memrefType) continue;
 
-            // Extract shape information
             auto sliceShape = memrefType.getShape();
-            int64_t bufferSize = 1;
             SmallVector<int64_t> sizeVec;
             SmallVector<int64_t> strideVec;
             
             for (int64_t dim : sliceShape) {
                 sizeVec.push_back(dim);
-                bufferSize *= (dim == ShapedType::kDynamic ? 1024 : dim); 
             }
 
-            // Calculate strides (assuming row-major layout)
             int64_t currentStride = 1;
             for (int j = sliceShape.size() - 1; j >= 0; --j) {
                 strideVec.insert(strideVec.begin(), currentStride);
@@ -445,15 +378,12 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 currentStride *= dimSize;
             }
 
-            // Create offset array (sequential offset in first dimension, 0 for others)
-            // Note: This offset is relative to the subview
             SmallVector<int64_t> offsetVec;
             offsetVec.push_back(cumulativeOffset);
             for (size_t j = 1; j < sliceShape.size(); ++j) {
                 offsetVec.push_back(0);
             }
 
-            // Create SliceAttr
             auto sliceAttr = dfscheblueprint::SliceAttr::get(
                 getContext(),
                 TypeAttr::get(memrefType),
@@ -462,26 +392,17 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 rewriter.getI64ArrayAttr(strideVec)
             );
 
-            // Create data_slice operation using the subview result
             std::string sliceName = "producer_slice_" + std::to_string(i);
             rewriter.create<dfscheblueprint::DataSliceOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(sliceName),
-                viewSplit,  // Use subview result
+                viewSplit,
                 sliceAttr
             );
 
-            // Update cumulative offset for next slice
-            // Assuming we are stacking in the first dimension of the subview
-            // This logic might need adjustment based on how data is actually packed
             cumulativeOffset += sliceShape[0]; 
         }
         
-        // Add dealloc for the root buffer at the end of the block or appropriate place
-        // For now, we can insert it right after, but ideally it should be at the end of scope
-        // rewriter.create<memref::DeallocOp>(op.getLoc(), rootBuffer);
-
-        // Erase the original pull operation
         rewriter.eraseOp(op);
         return success();
     }
@@ -506,16 +427,22 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
     
     RewritePatternSet patterns(context);
     patterns.add<EraseOpLowering<dmaphop::tile>,
-                    EraseOpLowering<dmaphop::port>,
-                    EraseOpLowering<dmaphop::create_hop>,
-                    EraseOpLowering<dmaphop::create_path>,
-                    EraseOpLowering<dmaphop::alloc_buffer>,
-                    EraseOpLowering<dmaphop::sync>,
-                    EraseOpLowering<dmaphop::dealloc_buffer>>(context);
+                 EraseOpLowering<dmaphop::port>,
+                 EraseOpLowering<dmaphop::create_hop>,
+                 EraseOpLowering<dmaphop::create_path>,
+                 EraseOpLowering<dmaphop::alloc_buffer>,
+                 EraseOpLowering<dmaphop::sync>,
+                 EraseOpLowering<dmaphop::dealloc_buffer>>(context);
     
+    patterns.add<CreateDummyTensorConversion>(context);
     patterns.add<PartitionTensorConversion>(context);
+    patterns.add<ExtractDataConversion>(context);
     patterns.add<PushOpConversion>(context);
     patterns.add<PullOpConversion>(context);
+
+    target.addIllegalOp<routing::createdummytensor>();
+    target.addIllegalOp<routing::partitiontensor>();
+    target.addIllegalOp<routing::extract_data>();
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();

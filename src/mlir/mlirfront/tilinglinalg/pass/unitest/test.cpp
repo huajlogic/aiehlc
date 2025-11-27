@@ -831,7 +831,8 @@ void routingtodfschedule() {
     options.label = "After RoutingToDmapPass:";
     pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<DmapToDmaphopPass>(rtopology));
-    options.label = "After DmapToDmaphopPass:"; 
+    options.label = "After DmapToDmaphopPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
     // Convert routing to dfschedule
     options.label = "After DmaphopTodfscheblueprintPass:";
     pm.addPass(std::make_unique<DmaphopTodfscheblueprintPass>());
