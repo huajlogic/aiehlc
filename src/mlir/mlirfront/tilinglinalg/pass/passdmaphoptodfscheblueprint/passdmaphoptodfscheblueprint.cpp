@@ -357,8 +357,69 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
 
         // Get the data value (should be I32 from routing::extract_data)
         auto dataValue = op.getData();
+        
+        // Find the defining op of dataValue to trace back to partition/dummy tensor
+        auto extractOp = dyn_cast_or_null<routing::extract_data>(dataValue.getDefiningOp());
+        if (!extractOp) return failure();
+        
+        auto partitionOp = dyn_cast_or_null<routing::partitiontensor>(extractOp.getTensor().getDefiningOp());
+        if (!partitionOp) return failure();
+        
+        auto dummyOp = dyn_cast_or_null<routing::createdummytensor>(partitionOp.getTensor().getDefiningOp());
+        if (!dummyOp) return failure();
 
-        // Create data slices with sequential offsets
+        // Create Root Buffer (memref<1024x1024xf32>) - assuming F32 for now, should infer from dummyOp
+        // In a real scenario, we should get shape and type from dummyOp
+        auto shapeAttr = dummyOp.getShape();
+        SmallVector<int64_t> shape;
+        for (auto dim : shapeAttr) {
+            shape.push_back(cast<IntegerAttr>(dim).getInt());
+        }
+        
+        auto rootMemRefType = MemRefType::get(shape, rewriter.getF32Type());
+        auto allocOp = rewriter.create<memref::AllocOp>(op.getLoc(), rootMemRefType);
+        auto rootBuffer = allocOp.getResult();
+
+        // Create SubView based on partition info
+        // Assuming splitnum=4, splitdim=0, index=0 (from extractOp)
+        int64_t splitNum = partitionOp.getSplitnum();
+        int64_t splitDim = partitionOp.getSplitdim();
+        
+        // Get index from extractOp's operand
+        int64_t index = 0;
+        if (auto constOp = dyn_cast_or_null<arith::ConstantOp>(extractOp.getIdx().getDefiningOp())) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+                index = intAttr.getInt();
+            }
+        }
+
+        SmallVector<OpFoldResult> offsets;
+        SmallVector<OpFoldResult> sizes;
+        SmallVector<OpFoldResult> strides;
+        
+        for (size_t i = 0; i < shape.size(); ++i) {
+            if (i == (size_t)splitDim) {
+                int64_t dimSize = shape[i];
+                int64_t splitSize = dimSize / splitNum;
+                offsets.push_back(rewriter.getIndexAttr(index * splitSize));
+                sizes.push_back(rewriter.getIndexAttr(splitSize));
+            } else {
+                offsets.push_back(rewriter.getIndexAttr(0));
+                sizes.push_back(rewriter.getIndexAttr(shape[i]));
+            }
+            strides.push_back(rewriter.getIndexAttr(1));
+        }
+        
+        auto subViewOp = rewriter.create<memref::SubViewOp>(
+            op.getLoc(),
+            rootBuffer,
+            offsets,
+            sizes,
+            strides
+        );
+        auto viewSplit = subViewOp.getResult();
+
+        // Create data slices with sequential offsets relative to the subview
         int64_t cumulativeOffset = 0;
         for (size_t i = 0; i < producerBuffers.size(); ++i) {
             auto buffer = producerBuffers[i];
@@ -366,28 +427,29 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             if (!memrefType) continue;
 
             // Extract shape information
-            auto shape = memrefType.getShape();
+            auto sliceShape = memrefType.getShape();
             int64_t bufferSize = 1;
             SmallVector<int64_t> sizeVec;
             SmallVector<int64_t> strideVec;
             
-            for (int64_t dim : shape) {
+            for (int64_t dim : sliceShape) {
                 sizeVec.push_back(dim);
-                bufferSize *= (dim == ShapedType::kDynamic ? 1024 : dim); // Default for dynamic dims
+                bufferSize *= (dim == ShapedType::kDynamic ? 1024 : dim); 
             }
 
             // Calculate strides (assuming row-major layout)
             int64_t currentStride = 1;
-            for (int j = shape.size() - 1; j >= 0; --j) {
+            for (int j = sliceShape.size() - 1; j >= 0; --j) {
                 strideVec.insert(strideVec.begin(), currentStride);
-                int64_t dimSize = (shape[j] == ShapedType::kDynamic ? 1024 : shape[j]);
+                int64_t dimSize = (sliceShape[j] == ShapedType::kDynamic ? 1024 : sliceShape[j]);
                 currentStride *= dimSize;
             }
 
             // Create offset array (sequential offset in first dimension, 0 for others)
+            // Note: This offset is relative to the subview
             SmallVector<int64_t> offsetVec;
             offsetVec.push_back(cumulativeOffset);
-            for (size_t j = 1; j < shape.size(); ++j) {
+            for (size_t j = 1; j < sliceShape.size(); ++j) {
                 offsetVec.push_back(0);
             }
 
@@ -400,18 +462,24 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 rewriter.getI64ArrayAttr(strideVec)
             );
 
-            // Create data_slice operation using extract_data result directly
+            // Create data_slice operation using the subview result
             std::string sliceName = "producer_slice_" + std::to_string(i);
             rewriter.create<dfscheblueprint::DataSliceOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(sliceName),
-                dataValue,  // Use extract_data result directly
+                viewSplit,  // Use subview result
                 sliceAttr
             );
 
             // Update cumulative offset for next slice
-            cumulativeOffset += bufferSize;
+            // Assuming we are stacking in the first dimension of the subview
+            // This logic might need adjustment based on how data is actually packed
+            cumulativeOffset += sliceShape[0]; 
         }
+        
+        // Add dealloc for the root buffer at the end of the block or appropriate place
+        // For now, we can insert it right after, but ideally it should be at the end of scope
+        // rewriter.create<memref::DeallocOp>(op.getLoc(), rootBuffer);
 
         // Erase the original pull operation
         rewriter.eraseOp(op);

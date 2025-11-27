@@ -5,6 +5,7 @@
 #include "dfscheblueprintmanager.h"
 #include "../../routing/routingmanager.h"
 #include <iostream>
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #define GET_TYPEDEF_CLASSES
 #define GET_ATTRDEF_CLASSES
@@ -485,42 +486,25 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // 2. Logical Data View
     // ============================================================
     
-    // Create Dummy Tensor
-    auto shapeAttr = builder.getI64ArrayAttr({1024, 1024});
-    auto dimAttr = builder.getI64IntegerAttr(2);
-    auto dummyTensorOp = builder.create<routing::createdummytensor>(
-        location,
-        builder.getI32Type(), // result type
-        shapeAttr,
-        dimAttr
-    );
-    auto dataMatrix = dummyTensorOp.getResult();
+    // Create Root Buffer (memref<1024x1024xf32>)
+    auto rootMemRefType = MemRefType::get({1024, 1024}, builder.getF32Type());
+    auto allocOp = builder.create<memref::AllocOp>(location, rootMemRefType);
+    auto rootBuffer = allocOp.getResult();
 
-    // Partition Tensor
-    auto partitionOp = builder.create<routing::partitiontensor>(
+    // Create SubView (Partition 0: 256x1024)
+    // Offset=[0, 0], Size=[256, 1024], Stride=[1, 1] relative to source
+    SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(0), builder.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes = {builder.getIndexAttr(256), builder.getIndexAttr(1024)};
+    SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1)};
+    
+    auto subViewOp = builder.create<memref::SubViewOp>(
         location,
-        builder.getI32Type(), // result type
-        dataMatrix,
-        builder.getI32IntegerAttr(4), // splitnum
-        builder.getI32IntegerAttr(0), // splitdim
-        builder.getStringAttr(""),    // hw_axis_owner
-        builder.getStringAttr(""),    // replicate_on
-        builder.getStringAttr("")     // single_tile_owner
+        rootBuffer,
+        offsets,
+        sizes,
+        strides
     );
-    auto partitionResult = partitionOp.getResult();
-
-    // Extract Data (index 0)
-    auto indexOp = builder.create<mlir::arith::ConstantOp>(
-        location,
-        builder.getI32IntegerAttr(0)
-    );
-    auto extractOpdata = builder.create<routing::extract_data>(
-        location,
-        builder.getI32Type(), // result type
-        partitionResult,
-        indexOp.getResult()
-    );
-    auto viewSplit = extractOpdata.getResult();
+    auto viewSplit = subViewOp.getResult();
 
     // ============================================================
     // 3. Binding & Channel Config
@@ -634,5 +618,8 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         builder.getStringAttr("sequential"),
         builder.getI32IntegerAttr(20)
     );
+
+    // Deallocate Root Buffer
+    builder.create<memref::DeallocOp>(location, rootBuffer);
 }
 

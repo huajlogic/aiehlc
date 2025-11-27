@@ -158,7 +158,7 @@ def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
   let summary = "Defines a named slice of a data view";
   let arguments = (ins
     SymbolNameAttr:$sym_name,
-    I32:$view,
+    AnyMemRef:$view,
     dfscheblueprint_SliceAttr:$slice_params
   );
   let hasCustomAssemblyFormat = 1;
