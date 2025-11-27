@@ -25,22 +25,55 @@ namespace mlir {
 
 // Helper to process pull (Gather)
 void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp configOp, Value viewHandle) {
-    // 1. Identify Sources
-    auto inputPorts = op.getProducerPorts();
-    SmallVector<Attribute> sourceTiles;
-    int64_t sourceChannel = -1;
+    // 1. Get path and extract source/destination from producers/consumers attributes
+    auto pathValue = op.getPath();
+    auto pathOp = dyn_cast_or_null<dmaphop::create_path>(pathValue.getDefiningOp());
+    if (!pathOp) {
+        llvm::errs() << "ERROR: processPull - failed to get create_path from pull op\n";
+        return;
+    }
     
-    for (auto portValue : inputPorts) {
-        if (auto port = dyn_cast_or_null<dmaphop::port>(portValue.getDefiningOp())) {
-            sourceChannel = static_cast<int64_t>(port.getDirectionChannel().value());
-            auto tileValue = port.getTile();
-            if (auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp())) {
-                sourceTiles.push_back(builder.getArrayAttr({
-                    builder.getI64IntegerAttr(tileOp.getCol()),
-                    builder.getI64IntegerAttr(tileOp.getRow())
-                }));
+    SmallVector<Attribute> sourceTiles;
+    SmallVector<Attribute> destTiles;
+    int64_t sourceChannel = -1;
+    int64_t destChannel = -1;
+    
+    // Get producers (sources) from create_path attribute via symbol table lookup
+    auto producersAttr = pathOp.getProducers();
+    if (auto arrayAttr = dyn_cast<ArrayAttr>(producersAttr)) {
+        for (auto innerAttr : arrayAttr) {
+            if (auto innerArray = dyn_cast<ArrayAttr>(innerAttr)) {
+                for (auto symbolAttr : innerArray) {
+                    auto symbolRef = dyn_cast<FlatSymbolRefAttr>(symbolAttr);
+                    if (!symbolRef) {
+                        llvm::errs() << "ERROR: processPull - producer is not a FlatSymbolRefAttr\n";
+                        continue;
+                    }
+                    auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                    if (!port) {
+                        llvm::errs() << "ERROR: processPull - failed to find producer port symbol '" 
+                                    << symbolRef.getValue() << "' in symbol table\n";
+                        continue;
+                    }
+                    sourceChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                    auto tileValue = port.getTile();
+                    auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
+                    if (!tileOp) {
+                        llvm::errs() << "ERROR: processPull - failed to get tile from producer port '" 
+                                    << symbolRef.getValue() << "'\n";
+                        continue;
+                    }
+                    sourceTiles.push_back(builder.getArrayAttr({
+                        builder.getI64IntegerAttr(tileOp.getCol()),
+                        builder.getI64IntegerAttr(tileOp.getRow())
+                    }));
+                }
             }
         }
+    }
+    
+    if (sourceTiles.empty()) {
+        llvm::errs() << "WARNING: processPull - no source tiles found from producers attribute\n";
     }
     
     std::string srcGroupName = "group_src_" + std::to_string((uintptr_t)op.getOperation());
@@ -50,33 +83,42 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getArrayAttr(sourceTiles)
     );
     
-    // 2. Identify Destination
-    auto pathValue = op.getPath();
-    int64_t destChannel = -1;
-    SmallVector<Attribute> destTiles;
-    
-    if (auto pathOp = dyn_cast_or_null<dmaphop::create_path>(pathValue.getDefiningOp())) {
-        auto consumersAttr = pathOp.getConsumers();
-        if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
-            if (arrayAttr.size() > 0) {
-                if (auto innerArray = dyn_cast<ArrayAttr>(arrayAttr[0])) {
-                    if (innerArray.size() > 0) {
-                        auto symbolRef = dyn_cast<FlatSymbolRefAttr>(innerArray[0]);
-                        if (symbolRef) {
-                            auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
-                            if (port) {
-                                destChannel = static_cast<int64_t>(port.getDirectionChannel().value());
-                                auto tileOp = dyn_cast<dmaphop::tile>(port.getTile().getDefiningOp());
-                                destTiles.push_back(builder.getArrayAttr({
-                                    builder.getI64IntegerAttr(tileOp.getCol()),
-                                    builder.getI64IntegerAttr(tileOp.getRow())
-                                }));
-                            }
-                        }
+    // Get consumers (destinations) from create_path attribute via symbol table lookup
+    auto consumersAttr = pathOp.getConsumers();
+    if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
+        for (auto innerAttr : arrayAttr) {
+            if (auto innerArray = dyn_cast<ArrayAttr>(innerAttr)) {
+                for (auto symbolAttr : innerArray) {
+                    auto symbolRef = dyn_cast<FlatSymbolRefAttr>(symbolAttr);
+                    if (!symbolRef) {
+                        llvm::errs() << "ERROR: processPull - consumer is not a FlatSymbolRefAttr\n";
+                        continue;
                     }
+                    auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                    if (!port) {
+                        llvm::errs() << "ERROR: processPull - failed to find consumer port symbol '" 
+                                    << symbolRef.getValue() << "' in symbol table\n";
+                        continue;
+                    }
+                    destChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                    auto tileValue = port.getTile();
+                    auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
+                    if (!tileOp) {
+                        llvm::errs() << "ERROR: processPull - failed to get tile from consumer port '" 
+                                    << symbolRef.getValue() << "'\n";
+                        continue;
+                    }
+                    destTiles.push_back(builder.getArrayAttr({
+                        builder.getI64IntegerAttr(tileOp.getCol()),
+                        builder.getI64IntegerAttr(tileOp.getRow())
+                    }));
                 }
             }
         }
+    }
+    
+    if (destTiles.empty()) {
+        llvm::errs() << "WARNING: processPull - no destination tiles found from consumers attribute\n";
     }
     
     std::string dstGroupName = "group_dst_" + std::to_string((uintptr_t)op.getOperation());
@@ -135,56 +177,86 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     SmallVector<Attribute> dstTiles;
     int64_t dstChannel = -1;
     
-    if (auto pathOp = dyn_cast_or_null<dmaphop::create_path>(pathValue.getDefiningOp())) {
-        // Producers
-        auto producersAttr = pathOp.getProducers();
-        if (auto arrayAttr = dyn_cast<ArrayAttr>(producersAttr)) {
-             if (arrayAttr.size() > 0) {
-                if (auto innerArray = dyn_cast<ArrayAttr>(arrayAttr[0])) {
-                    if (innerArray.size() > 0) {
-                        auto symbolRef = dyn_cast<FlatSymbolRefAttr>(innerArray[0]);
-                        if (symbolRef) {
-                            auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
-                            if (port) {
-                                srcChannel = static_cast<int64_t>(port.getDirectionChannel().value());
-                                auto tileOp = dyn_cast<dmaphop::tile>(port.getTile().getDefiningOp());
-                                srcTiles.push_back(builder.getArrayAttr({
-                                    builder.getI64IntegerAttr(tileOp.getCol()),
-                                    builder.getI64IntegerAttr(tileOp.getRow())
-                                }));
-                            }
-                        }
+    auto pathOp = dyn_cast_or_null<dmaphop::create_path>(pathValue.getDefiningOp());
+    if (!pathOp) {
+        llvm::errs() << "ERROR: processPush - failed to get create_path from push op\n";
+        return;
+    }
+    
+    // Producers (sources) via symbol table lookup
+    auto producersAttr = pathOp.getProducers();
+    if (auto arrayAttr = dyn_cast<ArrayAttr>(producersAttr)) {
+        for (auto innerAttr : arrayAttr) {
+            if (auto innerArray = dyn_cast<ArrayAttr>(innerAttr)) {
+                for (auto symbolAttr : innerArray) {
+                    auto symbolRef = dyn_cast<FlatSymbolRefAttr>(symbolAttr);
+                    if (!symbolRef) {
+                        llvm::errs() << "ERROR: processPush - producer is not a FlatSymbolRefAttr\n";
+                        continue;
                     }
+                    auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                    if (!port) {
+                        llvm::errs() << "ERROR: processPush - failed to find producer port symbol '" 
+                                    << symbolRef.getValue() << "' in symbol table\n";
+                        continue;
+                    }
+                    srcChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                    auto tileValue = port.getTile();
+                    auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
+                    if (!tileOp) {
+                        llvm::errs() << "ERROR: processPush - failed to get tile from producer port '" 
+                                    << symbolRef.getValue() << "'\n";
+                        continue;
+                    }
+                    srcTiles.push_back(builder.getArrayAttr({
+                        builder.getI64IntegerAttr(tileOp.getCol()),
+                        builder.getI64IntegerAttr(tileOp.getRow())
+                    }));
                 }
             }
         }
-        
-        // Consumers (Many)
-        // For scatter, consumers are many.
-        // But create_path consumers attribute might list them.
-        // Or we can look at the hops.
-        // Let's assume consumers attribute lists all destination ports.
-        auto consumersAttr = pathOp.getConsumers();
-        if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
-             if (arrayAttr.size() > 0) {
-                if (auto innerArray = dyn_cast<ArrayAttr>(arrayAttr[0])) {
-                    for (auto attr : innerArray) {
-                        auto symbolRef = dyn_cast<FlatSymbolRefAttr>(attr);
-                        if (symbolRef) {
-                            auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
-                            if (port) {
-                                dstChannel = static_cast<int64_t>(port.getDirectionChannel().value()); // Assuming same channel
-                                auto tileOp = dyn_cast<dmaphop::tile>(port.getTile().getDefiningOp());
-                                dstTiles.push_back(builder.getArrayAttr({
-                                    builder.getI64IntegerAttr(tileOp.getCol()),
-                                    builder.getI64IntegerAttr(tileOp.getRow())
-                                }));
-                            }
-                        }
+    }
+    
+    if (srcTiles.empty()) {
+        llvm::errs() << "WARNING: processPush - no source tiles found from producers attribute\n";
+    }
+    
+    // Consumers (destinations) via symbol table lookup
+    auto consumersAttr = pathOp.getConsumers();
+    if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
+        for (auto innerAttr : arrayAttr) {
+            if (auto innerArray = dyn_cast<ArrayAttr>(innerAttr)) {
+                for (auto symbolAttr : innerArray) {
+                    auto symbolRef = dyn_cast<FlatSymbolRefAttr>(symbolAttr);
+                    if (!symbolRef) {
+                        llvm::errs() << "ERROR: processPush - consumer is not a FlatSymbolRefAttr\n";
+                        continue;
                     }
+                    auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                    if (!port) {
+                        llvm::errs() << "ERROR: processPush - failed to find consumer port symbol '" 
+                                    << symbolRef.getValue() << "' in symbol table\n";
+                        continue;
+                    }
+                    dstChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                    auto tileValue = port.getTile();
+                    auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
+                    if (!tileOp) {
+                        llvm::errs() << "ERROR: processPush - failed to get tile from consumer port '" 
+                                    << symbolRef.getValue() << "'\n";
+                        continue;
+                    }
+                    dstTiles.push_back(builder.getArrayAttr({
+                        builder.getI64IntegerAttr(tileOp.getCol()),
+                        builder.getI64IntegerAttr(tileOp.getRow())
+                    }));
                 }
             }
         }
+    }
+    
+    if (dstTiles.empty()) {
+        llvm::errs() << "WARNING: processPush - no destination tiles found from consumers attribute\n";
     }
     
     std::string srcGroupName = "group_src_" + std::to_string((uintptr_t)op.getOperation());
@@ -357,6 +429,8 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
 
         Value viewSplit = adaptor.getData();
         
+        // 1. Create data slices for producer buffers and collect slice symbol names
+        SmallVector<Attribute> sliceSymbols;
         int64_t cumulativeOffset = 0;
         for (size_t i = 0; i < producerBuffers.size(); ++i) {
             auto buffer = producerBuffers[i];
@@ -399,73 +473,121 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 viewSplit,
                 sliceAttr
             );
+            
+            // Collect slice symbol reference for bind_group
+            sliceSymbols.push_back(FlatSymbolRefAttr::get(getContext(), sliceName));
 
             cumulativeOffset += sliceShape[0]; 
         }
 
-           // 2. Create Resource Groups and Binds
-        // Identify Sources (Producers)
-        auto producerPorts = op.getProducerPorts();
-        SmallVector<Attribute> sourceTiles;
-        int64_t sourceChannel = -1;
+        // 2. Get path and extract source/destination from producers/consumers attributes
+        // Path structure: create_path[hop1, hop2, ...] with producers/consumers attributes
+        // producers/consumers are symbol references to port ops
+        auto pathValue = op.getPath();
+        auto pathOp = dyn_cast_or_null<dmaphop::create_path>(pathValue.getDefiningOp());
+        if (!pathOp) {
+            llvm::errs() << "ERROR: PullOpConversion - failed to get create_path from pull op\n";
+            return failure();
+        }
         
-        for (auto portValue : producerPorts) {
-            if (auto port = dyn_cast_or_null<dmaphop::port>(portValue.getDefiningOp())) {
-                sourceChannel = static_cast<int64_t>(port.getDirectionChannel().value());
-                auto tileValue = port.getTile();
-                if (auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp())) {
-                    sourceTiles.push_back(rewriter.getArrayAttr({
-                        rewriter.getI64IntegerAttr(tileOp.getCol()),
-                        rewriter.getI64IntegerAttr(tileOp.getRow())
-                    }));
-                }
+        SmallVector<Attribute> sourceTiles;
+        SmallVector<Attribute> destTiles;
+        int64_t sourceChannel = -1;
+        int64_t destChannel = -1;
+        
+        // Get producers (sources) from create_path attribute via symbol table lookup
+        auto producersAttr = pathOp.getProducers();
+        if (auto arrayAttr = dyn_cast<ArrayAttr>(producersAttr)) {
+            for (auto innerAttr : arrayAttr) {
+                //if (auto innerArray = dyn_cast<ArrayAttr>(innerAttr)) {
+                    //for (auto symbolAttr : innerArray) {
+                        auto symbolRef = dyn_cast<FlatSymbolRefAttr>(innerAttr);
+                        if (!symbolRef) {
+                            llvm::errs() << "ERROR: PullOpConversion - producer is not a FlatSymbolRefAttr\n";
+                            continue;
+                        }
+                        auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                        if (!port) {
+                            llvm::errs() << "ERROR: PullOpConversion - failed to find producer port symbol '" 
+                                        << symbolRef.getValue() << "' in symbol table\n";
+                            continue;
+                        }
+                        sourceChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                        auto tileValue = port.getTile();
+                        auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
+                        if (!tileOp) {
+                            llvm::errs() << "ERROR: PullOpConversion - failed to get tile from producer port '" 
+                                        << symbolRef.getValue() << "'\n";
+                            continue;
+                        }
+                        sourceTiles.push_back(rewriter.getArrayAttr({
+                            rewriter.getI64IntegerAttr(tileOp.getCol()),
+                            rewriter.getI64IntegerAttr(tileOp.getRow())
+                        }));
+                    //}
+                //}
             }
         }
         
-        // Identify Destination (Consumer) from Path
-        auto pathValue = op.getPath();
-        int64_t destChannel = -1;
-        SmallVector<Attribute> destTiles;
+        if (sourceTiles.empty()) {
+            llvm::errs() << "WARNING: PullOpConversion - no source tiles found from producers attribute\n";
+        }
         
-        if (auto pathOp = dyn_cast_or_null<dmaphop::create_path>(pathValue.getDefiningOp())) {
-            auto consumersAttr = pathOp.getConsumers();
-            if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
-                if (arrayAttr.size() > 0) {
-                    if (auto innerArray = dyn_cast<ArrayAttr>(arrayAttr[0])) {
-                        if (innerArray.size() > 0) {
-                            auto symbolRef = dyn_cast<FlatSymbolRefAttr>(innerArray[0]);
-                            if (symbolRef) {
-                                auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
-                                if (port) {
-                                    destChannel = static_cast<int64_t>(port.getDirectionChannel().value());
-                                    auto tileOp = dyn_cast<dmaphop::tile>(port.getTile().getDefiningOp());
-                                    destTiles.push_back(rewriter.getArrayAttr({
-                                        rewriter.getI64IntegerAttr(tileOp.getCol()),
-                                        rewriter.getI64IntegerAttr(tileOp.getRow())
-                                    }));
-                                }
-                            }
+        // Get consumers (destinations) from create_path attribute via symbol table lookup
+        auto consumersAttr = pathOp.getConsumers();
+        if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
+            for (auto innerAttr : arrayAttr) {
+                //if (auto innerArray = dyn_cast<ArrayAttr>(innerAttr)) {
+                    //for (auto symbolAttr : innerArray) {
+                        auto symbolRef = dyn_cast<FlatSymbolRefAttr>(innerAttr);
+                        if (!symbolRef) {
+                            llvm::errs() << "ERROR: PullOpConversion - consumer is not a FlatSymbolRefAttr\n";
+                            continue;
                         }
-                    }
-                }
+                        auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                        if (!port) {
+                            llvm::errs() << "ERROR: PullOpConversion - failed to find consumer port symbol '" 
+                                        << symbolRef.getValue() << "' in symbol table\n";
+                            continue;
+                        }
+                        destChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                        auto tileValue = port.getTile();
+                        auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
+                        if (!tileOp) {
+                            llvm::errs() << "ERROR: PullOpConversion - failed to get tile from consumer port '" 
+                                        << symbolRef.getValue() << "'\n";
+                            continue;
+                        }
+                        destTiles.push_back(rewriter.getArrayAttr({
+                            rewriter.getI64IntegerAttr(tileOp.getCol()),
+                            rewriter.getI64IntegerAttr(tileOp.getRow())
+                        }));
+                    //}
+                //}
             }
+        }
+        
+        if (destTiles.empty()) {
+            llvm::errs() << "WARNING: PullOpConversion - no destination tiles found from consumers attribute\n";
         }
         
         std::string srcGroupName = "group_src_" + std::to_string((uintptr_t)op.getOperation());
         std::string dstGroupName = "group_dst_" + std::to_string((uintptr_t)op.getOperation());
         
-        // Find parent RoutingCreate and insert resource_group at the beginning of its block
+        // 3. Create resource_group ops at the beginning of RoutingCreate block
         if (auto routingCreateOp = op->getParentOfType<routing::RoutingCreate>()) {
             Block &routingBlock = routingCreateOp.getRegion().front();
             OpBuilder::InsertionGuard guard(rewriter);
             rewriter.setInsertionPointToStart(&routingBlock);
             
+            // Source resource group (producers)
             rewriter.create<dfscheblueprint::ResourceGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(srcGroupName),
                 rewriter.getArrayAttr(sourceTiles)
             );
             
+            // Destination resource group (consumers)
             rewriter.create<dfscheblueprint::ResourceGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(dstGroupName),
@@ -486,7 +608,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             );
         }
         
-        // Create Binds
+        // 4. Create Binds
         std::string srcBindName = "bind_src_" + std::to_string((uintptr_t)op.getOperation());
         rewriter.create<dfscheblueprint::BindGroupOp>(
             op.getLoc(),
@@ -495,7 +617,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             viewSplit,
             rewriter.getStringAttr("linear"),
             dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({sourceChannel}), dfscheblueprint::bp_direction::MM2S),
-            rewriter.getArrayAttr({}) 
+            rewriter.getArrayAttr(sliceSymbols)  // Associate with @producer_slice_0 to @producer_slice_N
         );
         
         std::string dstBindName = "bind_dst_" + std::to_string((uintptr_t)op.getOperation());
@@ -509,7 +631,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             nullptr // slice_symbol
         );
         
-        // Collective Transfer
+        // 5. Create Collective Transfer
         rewriter.create<dfscheblueprint::CollectiveTransferOp>(
             op.getLoc(),
             rewriter.getStringAttr("transfer_" + std::to_string((uintptr_t)op.getOperation())),
