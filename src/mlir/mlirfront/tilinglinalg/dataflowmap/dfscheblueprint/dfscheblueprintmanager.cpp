@@ -175,18 +175,34 @@ ParseResult dfscheblueprint::DataSliceOp::parse(OpAsmParser &parser, OperationSt
     
     return success();
 }
-
+/*
+   printer.increaseIndent();
+    printer.printNewline();
+    printer << "view = " << getView() << " : " << getView().getType() << ",";
+    printer.printNewline();
+    printer << "slice = " << getSliceParams();
+    printer.decreaseIndent(); // <--- Reduce the indentation level state FIRST
+    printer.printNewline();  
+*/
 // BindGroupOp printer
 void dfscheblueprint::BindGroupOp::print(OpAsmPrinter &printer) {
     printer << " @" << getSymName() << " {";
-    printer << "\n          target_group = " << getTargetGroup() << ",";
-    printer << "\n          view = " << getView() << " : " << getView().getType() << ",";
-    printer << "\n          distribution = \"" << getDistribution() << "\",";
-    printer << "\n          dma = " << getDma();
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "target_group = " << getTargetGroup() << ",";
+    printer.printNewline();
+    printer << "view = " << getView() << " : " << getView().getType() << ",";
+    printer.printNewline();
+    printer << "distribution = \"" << getDistribution() << "\",";
+    printer.printNewline();
+    printer << "dma = " << getDma();
+    printer.printNewline();
     if (getSliceSymbols()) {
-        printer << ",\n          slice_symbols = " << getSliceSymbols();
+        printer << ",slice_symbols = " << getSliceSymbols();
     }
-    printer << " \n     }";
+    printer.decreaseIndent(); // <--- Reduce the indentation level state FIRST
+    printer.printNewline();  
+    printer << "}";
     printer.printOptionalAttrDict(getOperation()->getAttrs(), 
         /*elidedAttrs=*/{"sym_name", "target_group", "view", "distribution", "dma", "slice_symbols"});
 }
@@ -247,14 +263,22 @@ ParseResult dfscheblueprint::BindGroupOp::parse(OpAsmParser &parser, OperationSt
 // BindOp printer
 void dfscheblueprint::BindOp::print(OpAsmPrinter &printer) {
     printer << " @" << getSymName() << " {";
-    printer << "\n          target = " << getTarget() << ",";
-    printer << "\n          view = " << getView() << " : " << getView().getType() << ",";
-    printer << "\n          slice = \"" << getSlice() << "\",";
-    printer << "\n          dma = " << getDma();
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "target = " << getTarget() << ",";
+    printer.printNewline();
+    printer << "view = " << getView() << " : " << getView().getType() << ",";
+    printer.printNewline();
+    printer << "slice = \"" << getSlice() << "\",";
+    printer.printNewline();
+    printer << "dma = " << getDma();
     if (getSliceSymbol()) {
-        printer << ",\n          slice_symbol = " << getSliceSymbol();
+        printer.printNewline();
+        printer << ",slice_symbol = " << getSliceSymbol();
     }
-    printer << " \n     }";
+    printer.decreaseIndent();
+    printer.printNewline();
+    printer << "}";
     printer.printOptionalAttrDict(getOperation()->getAttrs(), 
         /*elidedAttrs=*/{"sym_name", "target", "view", "slice", "dma", "slice_symbol"});
 }
@@ -315,14 +339,22 @@ ParseResult dfscheblueprint::BindOp::parse(OpAsmParser &parser, OperationState &
 // CollectiveTransferOp printer
 void dfscheblueprint::CollectiveTransferOp::print(OpAsmPrinter &printer) {
     printer << " @" << getSymName() << " {";
-    printer << "\n          type = \"" << getType() << "\",";
-    printer << "\n          from = " << getFrom() << ",";
-    printer << "\n          to = " << getTo();
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "type = \"" << getType() << "\",";
+    printer.printNewline();
+    printer << "from = " << getFrom() << ",";
+    printer.printNewline();
+    printer << "to = " << getTo();
     if (getOrdering()) {
-        printer << ",\n          ordering = \"" << getOrdering() << "\"";
+        printer.printNewline();
+        printer << ",ordering = \"" << getOrdering() << "\"";
     }
-    printer << ",\n          base_packet_id = " << getBasePacketId();
-    printer << " \n     }";
+    printer.printNewline();
+    printer << ",base_packet_id = " << getBasePacketId();
+    printer.decreaseIndent();
+    printer.printNewline();
+    printer << "}";
     printer.printOptionalAttrDict(getOperation()->getAttrs(), 
         /*elidedAttrs=*/{"sym_name", "type", "from", "to", "ordering", "base_packet_id"});
 }

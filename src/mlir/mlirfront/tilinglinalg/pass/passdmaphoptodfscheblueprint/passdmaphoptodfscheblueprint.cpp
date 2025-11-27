@@ -432,6 +432,9 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
 
         Value viewSplit = adaptor.getData();
         
+        // Get unique sequential ID for naming (moved up to use in slice names)
+        int opId = g_pullPushCounter.fetch_add(1);
+        
         // 1. Create data slices for consumer buffers and collect slice symbol names
         SmallVector<Attribute> sliceSymbols;
         int64_t cumulativeOffset = 0;
@@ -469,7 +472,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                 rewriter.getI64ArrayAttr(strideVec)
             );
 
-            std::string sliceName = "consumer_slice_" + std::to_string(i);
+            // Include opId in slice name to make it unique
+            std::string sliceName = "consumer_slice_" + std::to_string(opId) + "_" + std::to_string(i);
             rewriter.create<dfscheblueprint::DataSliceOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(sliceName),
@@ -565,9 +569,6 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             llvm::errs() << "WARNING: PushOpConversion - no destination tiles found from consumers attribute\n";
         }
         
-        // Get unique sequential ID for naming
-        int opId = g_pullPushCounter.fetch_add(1);
-        
         std::string srcGroupName = "group_src_" + std::to_string(opId);
         std::string dstGroupName = "group_dst_" + std::to_string(opId);
         
@@ -656,6 +657,9 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
 
         Value viewSplit = adaptor.getData();
         
+        // Get unique sequential ID for naming (moved up to use in slice names)
+        int opId = g_pullPushCounter.fetch_add(1);
+        
         // 1. Create data slices for producer buffers and collect slice symbol names
         SmallVector<Attribute> sliceSymbols;
         int64_t cumulativeOffset = 0;
@@ -693,7 +697,8 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 rewriter.getI64ArrayAttr(strideVec)
             );
 
-            std::string sliceName = "producer_slice_" + std::to_string(i);
+            // Include opId in slice name to make it unique
+            std::string sliceName = "producer_slice_" + std::to_string(opId) + "_" + std::to_string(i);
             rewriter.create<dfscheblueprint::DataSliceOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(sliceName),
@@ -797,9 +802,6 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         if (destTiles.empty()) {
             llvm::errs() << "WARNING: PullOpConversion - no destination tiles found from consumers attribute\n";
         }
-        
-        // Get unique sequential ID for naming
-        int opId = g_pullPushCounter.fetch_add(1);
         
         std::string srcGroupName = "group_src_" + std::to_string(opId);
         std::string dstGroupName = "group_dst_" + std::to_string(opId);
