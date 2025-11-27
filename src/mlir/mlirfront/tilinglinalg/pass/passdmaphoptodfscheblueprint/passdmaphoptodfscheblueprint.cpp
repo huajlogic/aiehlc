@@ -402,6 +402,102 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
 
             cumulativeOffset += sliceShape[0]; 
         }
+
+           // 2. Create Resource Groups and Binds
+        // Identify Sources (Producers)
+        auto producerPorts = op.getProducerPorts();
+        SmallVector<Attribute> sourceTiles;
+        int64_t sourceChannel = -1;
+        
+        for (auto portValue : producerPorts) {
+            if (auto port = dyn_cast_or_null<dmaphop::port>(portValue.getDefiningOp())) {
+                sourceChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                auto tileValue = port.getTile();
+                if (auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp())) {
+                    sourceTiles.push_back(rewriter.getArrayAttr({
+                        rewriter.getI64IntegerAttr(tileOp.getCol()),
+                        rewriter.getI64IntegerAttr(tileOp.getRow())
+                    }));
+                }
+            }
+        }
+        
+        std::string srcGroupName = "group_src_" + std::to_string((uintptr_t)op.getOperation());
+        rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            op.getLoc(),
+            rewriter.getStringAttr(srcGroupName),
+            rewriter.getArrayAttr(sourceTiles)
+        );
+        
+        // Identify Destination (Consumer) from Path
+        auto pathValue = op.getPath();
+        int64_t destChannel = -1;
+        SmallVector<Attribute> destTiles;
+        
+        if (auto pathOp = dyn_cast_or_null<dmaphop::create_path>(pathValue.getDefiningOp())) {
+            auto consumersAttr = pathOp.getConsumers();
+            if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
+                if (arrayAttr.size() > 0) {
+                    if (auto innerArray = dyn_cast<ArrayAttr>(arrayAttr[0])) {
+                        if (innerArray.size() > 0) {
+                            auto symbolRef = dyn_cast<FlatSymbolRefAttr>(innerArray[0]);
+                            if (symbolRef) {
+                                auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                                if (port) {
+                                    destChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                                    auto tileOp = dyn_cast<dmaphop::tile>(port.getTile().getDefiningOp());
+                                    destTiles.push_back(rewriter.getArrayAttr({
+                                        rewriter.getI64IntegerAttr(tileOp.getCol()),
+                                        rewriter.getI64IntegerAttr(tileOp.getRow())
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        std::string dstGroupName = "group_dst_" + std::to_string((uintptr_t)op.getOperation());
+        rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            op.getLoc(),
+            rewriter.getStringAttr(dstGroupName),
+            rewriter.getArrayAttr(destTiles)
+        );
+        
+        // Create Binds
+        std::string srcBindName = "bind_src_" + std::to_string((uintptr_t)op.getOperation());
+        rewriter.create<dfscheblueprint::BindGroupOp>(
+            op.getLoc(),
+            rewriter.getStringAttr(srcBindName),
+            FlatSymbolRefAttr::get(getContext(), srcGroupName),
+            viewSplit,
+            rewriter.getStringAttr("linear"),
+            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({sourceChannel}), dfscheblueprint::bp_direction::MM2S),
+            rewriter.getArrayAttr({}) 
+        );
+        
+        std::string dstBindName = "bind_dst_" + std::to_string((uintptr_t)op.getOperation());
+        rewriter.create<dfscheblueprint::BindOp>(
+            op.getLoc(),
+            rewriter.getStringAttr(dstBindName),
+            FlatSymbolRefAttr::get(getContext(), dstGroupName),
+            viewSplit,
+            rewriter.getStringAttr("root"),
+            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({destChannel}), dfscheblueprint::bp_direction::S2MM),
+            nullptr // slice_symbol
+        );
+        
+        // Collective Transfer
+        rewriter.create<dfscheblueprint::CollectiveTransferOp>(
+            op.getLoc(),
+            rewriter.getStringAttr("transfer_" + std::to_string((uintptr_t)op.getOperation())),
+            rewriter.getStringAttr("many_to_one"),
+            FlatSymbolRefAttr::get(getContext(), srcBindName),
+            FlatSymbolRefAttr::get(getContext(), dstBindName),
+            rewriter.getStringAttr("sequential"),
+            0
+        );
         
         rewriter.eraseOp(op);
         return success();

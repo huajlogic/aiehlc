@@ -102,8 +102,7 @@ def dfscheblueprint_TransferManifestOp : dfscheblueprintop<"transfer_manifest", 
 
 // schedule.resource_group
 def dfscheblueprint_ResourceGroupOp : dfscheblueprintop<"resource_group", [
-    Symbol,
-    HasParent<"ConfigOp">
+    Symbol
   ]> {
   let summary = "Defines a group of physical tiles";
   let arguments = (ins
