@@ -15,6 +15,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include <iostream>
+#include <atomic>
 
 using namespace mlir;
 using namespace dmaphop;
@@ -22,6 +23,9 @@ using namespace dfscheblueprint;
 using namespace routing;
 
 namespace mlir {
+
+// Global counter for unique sequential naming (avoids conflict)
+static std::atomic<int> g_pullPushCounter{0};
 
 // Helper to process pull (Gather)
 void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp configOp, Value viewHandle) {
@@ -76,7 +80,10 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         llvm::errs() << "WARNING: processPull - no source tiles found from producers attribute\n";
     }
     
-    std::string srcGroupName = "group_src_" + std::to_string((uintptr_t)op.getOperation());
+    // Get unique sequential ID for naming
+    int opId = g_pullPushCounter.fetch_add(1);
+    
+    std::string srcGroupName = "group_src_" + std::to_string(opId);
     builder.create<dfscheblueprint::ResourceGroupOp>(
         op.getLoc(),
         srcGroupName,
@@ -121,7 +128,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         llvm::errs() << "WARNING: processPull - no destination tiles found from consumers attribute\n";
     }
     
-    std::string dstGroupName = "group_dst_" + std::to_string((uintptr_t)op.getOperation());
+    std::string dstGroupName = "group_dst_" + std::to_string(opId);
     builder.create<dfscheblueprint::ResourceGroupOp>(
         op.getLoc(),
         dstGroupName,
@@ -129,7 +136,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     );
     
     // 3. Create Binds
-    std::string srcBindName = "bind_src_" + std::to_string((uintptr_t)op.getOperation());
+    std::string srcBindName = "bind_src_" + std::to_string(opId);
     builder.create<dfscheblueprint::BindGroupOp>(
         op.getLoc(),
         srcBindName,
@@ -140,7 +147,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getArrayAttr({}) 
     );
     
-    std::string dstBindName = "bind_dst_" + std::to_string((uintptr_t)op.getOperation());
+    std::string dstBindName = "bind_dst_" + std::to_string(opId);
     builder.create<dfscheblueprint::BindOp>(
         op.getLoc(),
         dstBindName,
@@ -154,7 +161,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     // 4. Collective Transfer
     builder.create<dfscheblueprint::CollectiveTransferOp>(
         op.getLoc(),
-        "transfer_" + std::to_string((uintptr_t)op.getOperation()),
+        "transfer_" + std::to_string(opId),
         "many_to_one",
         FlatSymbolRefAttr::get(builder.getContext(), srcBindName),
         FlatSymbolRefAttr::get(builder.getContext(), dstBindName),
@@ -259,14 +266,17 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
         llvm::errs() << "WARNING: processPush - no destination tiles found from consumers attribute\n";
     }
     
-    std::string srcGroupName = "group_src_" + std::to_string((uintptr_t)op.getOperation());
+    // Get unique sequential ID for naming
+    int opId = g_pullPushCounter.fetch_add(1);
+    
+    std::string srcGroupName = "group_src_" + std::to_string(opId);
     builder.create<dfscheblueprint::ResourceGroupOp>(
         op.getLoc(),
         srcGroupName,
         builder.getArrayAttr(srcTiles)
     );
     
-    std::string dstGroupName = "group_dst_" + std::to_string((uintptr_t)op.getOperation());
+    std::string dstGroupName = "group_dst_" + std::to_string(opId);
     builder.create<dfscheblueprint::ResourceGroupOp>(
         op.getLoc(),
         dstGroupName,
@@ -274,7 +284,7 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     );
     
     // Binds
-    std::string srcBindName = "bind_src_" + std::to_string((uintptr_t)op.getOperation());
+    std::string srcBindName = "bind_src_" + std::to_string(opId);
     builder.create<dfscheblueprint::BindOp>(
         op.getLoc(),
         srcBindName,
@@ -285,7 +295,7 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
         nullptr // slice_symbol
     );
     
-    std::string dstBindName = "bind_dst_" + std::to_string((uintptr_t)op.getOperation());
+    std::string dstBindName = "bind_dst_" + std::to_string(opId);
     builder.create<dfscheblueprint::BindGroupOp>(
         op.getLoc(),
         dstBindName,
@@ -298,7 +308,7 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     
     builder.create<dfscheblueprint::CollectiveTransferOp>(
         op.getLoc(),
-        "transfer_" + std::to_string((uintptr_t)op.getOperation()),
+        "transfer_" + std::to_string(opId),
         "one_to_many",
         FlatSymbolRefAttr::get(builder.getContext(), srcBindName),
         FlatSymbolRefAttr::get(builder.getContext(), dstBindName),
@@ -571,8 +581,11 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             llvm::errs() << "WARNING: PullOpConversion - no destination tiles found from consumers attribute\n";
         }
         
-        std::string srcGroupName = "group_src_" + std::to_string((uintptr_t)op.getOperation());
-        std::string dstGroupName = "group_dst_" + std::to_string((uintptr_t)op.getOperation());
+        // Get unique sequential ID for naming
+        int opId = g_pullPushCounter.fetch_add(1);
+        
+        std::string srcGroupName = "group_src_" + std::to_string(opId);
+        std::string dstGroupName = "group_dst_" + std::to_string(opId);
         
         // 3. Create resource_group ops at the beginning of RoutingCreate block
         if (auto routingCreateOp = op->getParentOfType<routing::RoutingCreate>()) {
@@ -609,7 +622,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         }
         
         // 4. Create Binds
-        std::string srcBindName = "bind_src_" + std::to_string((uintptr_t)op.getOperation());
+        std::string srcBindName = "bind_src_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::BindGroupOp>(
             op.getLoc(),
             rewriter.getStringAttr(srcBindName),
@@ -620,7 +633,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             rewriter.getArrayAttr(sliceSymbols)  // Associate with @producer_slice_0 to @producer_slice_N
         );
         
-        std::string dstBindName = "bind_dst_" + std::to_string((uintptr_t)op.getOperation());
+        std::string dstBindName = "bind_dst_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::BindOp>(
             op.getLoc(),
             rewriter.getStringAttr(dstBindName),
@@ -634,7 +647,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         // 5. Create Collective Transfer
         rewriter.create<dfscheblueprint::CollectiveTransferOp>(
             op.getLoc(),
-            rewriter.getStringAttr("transfer_" + std::to_string((uintptr_t)op.getOperation())),
+            rewriter.getStringAttr("transfer_" + std::to_string(opId)),
             rewriter.getStringAttr("many_to_one"),
             FlatSymbolRefAttr::get(getContext(), srcBindName),
             FlatSymbolRefAttr::get(getContext(), dstBindName),
