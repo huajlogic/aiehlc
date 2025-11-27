@@ -119,9 +119,14 @@ ParseResult dfscheblueprint::TransferManifestOp::parse(OpAsmParser &parser, Oper
 // DataSliceOp printer
 void dfscheblueprint::DataSliceOp::print(OpAsmPrinter &printer) {
     printer << " @" << getSymName() << " {";
-    printer << "\n          view = " << getView() << " : " << getView().getType() << ",";
-    printer << "\n          slice = " << getSliceParams();
-    printer << " \n     }";
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "view = " << getView() << " : " << getView().getType() << ",";
+    printer.printNewline();
+    printer << "slice = " << getSliceParams();
+    printer.decreaseIndent(); // <--- Reduce the indentation level state FIRST
+    printer.printNewline();   //
+    printer << "}";
     printer.printOptionalAttrDict(getOperation()->getAttrs(), /*elidedAttrs=*/{"sym_name", "view", "slice_params"});
 }
 
