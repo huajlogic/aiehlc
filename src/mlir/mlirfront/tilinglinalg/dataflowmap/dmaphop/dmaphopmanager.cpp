@@ -5,6 +5,7 @@
 #include "dmaphopmanager.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include <iostream>
 
 #define GET_TYPEDEF_CLASSES
@@ -171,6 +172,7 @@ void dmaphopmanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
     ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
 }
 /*
       %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
@@ -217,7 +219,7 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
         builder.getI64IntegerAttr(2)   // row
     );
  
-    ///*
+ 
     // --- 2. Define Logical Ports ---
     auto directionSend =  "Out";
     auto directionReceive =  "In";
@@ -264,7 +266,7 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
         builder.getI64IntegerAttr(0)
     );
     symTable.insert(portBIn);
- 
+    
     // --- 3. Define Hops ---
     auto hop1 = builder.create<dmaphop::create_hop>(location,
         portShimOut.getResult(),
@@ -302,57 +304,72 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
         builder.getArrayAttr(consumers),
         builder.getArrayAttr(teePoints)
     );
-
+///*
     // --- 5. Prepare Data and Buffers ---
-    // Create memref type for the buffers
-    auto memrefType = MemRefType::get({1024}, builder.getF32Type());
+    // Create tensor type for the buffers
+    SmallVector<int64_t> shapeVec = {1024};
+    auto tensorType = RankedTensorType::get(shapeVec, builder.getF32Type());
 
-    auto memrefTypeOut = MemRefType::get({1024}, builder.getF32Type());
-
+    //auto memrefTypeOut = RankedTensorType::get(shapeVec, builder.getF32Type());
+///* 
     // Create data handle using routing.routingextract_data
     // First create a dummy I32 value as the tensor source
     auto i32Type = builder.getI32Type();
-    auto tensorId = builder.create<arith::ConstantOp>(location, i32Type, builder.getI32IntegerAttr(0));
+
+    //auto tensorId = builder.create<arith::ConstantOp>(location, memrefType, builder.getI32IntegerAttr(0)); // Placeholder
     auto dataIdx = builder.create<arith::ConstantOp>(location, i32Type, builder.getI32IntegerAttr(0));
-    
+    ///*
     // Extract data using routing.routingextract_data
+    // Note: extract_data now returns Tensor, input tensorId should be Tensor type
+    // Assuming tensorId creation above is placeholder, for now use createscheduletensor to be correct
+    // But since this is a test/manager file, we can just use EmptyOp for tensorId if needed,
+    // or fix extract_data call.
+    
+    // Actually routing::extract_data expects AnyTensor input now.
+    // Let's create a dummy tensor for it.
+    auto dummyTensor = builder.create<mlir::tensor::EmptyOp>(location, shapeVec, builder.getF32Type());
+
     auto data = builder.create<routing::extract_data>(location, 
-        i32Type,
-        tensorId.getResult(), 
+        tensorType,
+        dummyTensor.getResult(), 
         dataIdx.getResult()
     );
+   ///*
+    // Allocate a template tensor (was memref::AllocOp)
+    // For tensors, we use EmptyOp as placeholder for uninitialized tensor
+    auto memrefTemplate = builder.create<mlir::tensor::EmptyOp>(location, shapeVec, builder.getF32Type());
     
-    // Allocate a template memref for buffer allocation
-    auto memrefTemplate = builder.create<memref::AllocOp>(location, memrefType);
+    // Allocate destination buffers on tiles using tensor.extract_slice
+    // This replaces dmaphop::alloc_buffer logic
+    SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes = {builder.getIndexAttr(1024)};
+    SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1)};
     
-    // Allocate destination buffers on tiles
-    auto bufferA = builder.create<dmaphop::alloc_buffer>(location,
-        memrefTypeOut,
-        tileA.getResult(),
-        memrefTemplate.getResult()
+    auto sliceA = builder.create<mlir::tensor::ExtractSliceOp>(location, 
+        memrefTemplate.getResult(), 
+        offsets, sizes, strides
     );
     
-    auto bufferB = builder.create<dmaphop::alloc_buffer>(location,
-        memrefTypeOut,
-        tileB.getResult(),
-        memrefTemplate.getResult()
+    auto sliceB = builder.create<mlir::tensor::ExtractSliceOp>(location, 
+        memrefTemplate.getResult(), 
+        offsets, sizes, strides
     );
 
     // --- 6. Execute Transfer ---
     builder.create<dmaphop::push>(location,
         data.getResult(),
         serialPath.getResult(),
-        ValueRange{bufferA, bufferB},
+        ValueRange{sliceA.getResult(), sliceB.getResult()},
         ValueRange{portAIn, portBIn}
     );
 
     // --- 7. Synchronization ---
     builder.create<dmaphop::sync>(location, serialPath.getResult());
-
+    //*/
     // --- 8. Cleanup ---
-    builder.create<dmaphop::dealloc_buffer>(location, bufferA);
-    builder.create<dmaphop::dealloc_buffer>(location, bufferB);
-    builder.create<memref::DeallocOp>(location, memrefTemplate);
+    // dmaphop::dealloc_buffer is not needed for tensors
+    // memref::DeallocOp is not for tensors.
+    // builder.create<memref::DeallocOp>(location, memrefTemplate);
 
     // Add return
    // builder.create<func::ReturnOp>(location);

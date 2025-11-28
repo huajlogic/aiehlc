@@ -6,6 +6,7 @@
 #include "dmaptodmaphop.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -329,13 +330,15 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         ? rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}))
         : rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}));
 
-    auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
+    // Create tensor type for buffers (was MemRefType)
+    auto tensorType = RankedTensorType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
     
-    // Create template memref for buffer allocation
-    Value coreBufferTemplate = rewriter.create<memref::AllocOp>(loc, memrefType);
+    // Create template tensor (placeholder) for buffer allocation
+    Value coreBufferTemplate = rewriter.create<tensor::EmptyOp>(loc, tensorType.getShape(), tensorType.getElementType());
     SmallVector<Value, 4> coreBuffers;
     for (auto coreTile : coreTiles) {
-        coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, memrefType, coreTile.getResult(), coreBufferTemplate).getResult());
+        // alloc_buffer now returns Tensor
+        coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, tensorType, coreTile.getResult(), coreBufferTemplate).getResult());
     }
 
     if (direction == DataflowDirection::Push) {
@@ -349,7 +352,8 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     for (auto buffer : coreBuffers) {
         rewriter.create<dmaphop::dealloc_buffer>(loc, buffer);
     }
-    rewriter.create<memref::DeallocOp>(loc, coreBufferTemplate);
+    // memref::DeallocOp is not used for tensors
+    // rewriter.create<memref::DeallocOp>(loc, coreBufferTemplate);
     rewriter.eraseOp(op);
     return success();
 }
@@ -401,7 +405,7 @@ void DmapToDmaphopPass::runOnOperation() {
     // The conversion is successful when the dmap dialect is gone.
     target.addIllegalDialect<dmap::dmapdialect>();
     // These dialects are legal to have in the output.
-    target.addLegalDialect<dmaphop::dmaphopdialect, func::FuncDialect, memref::MemRefDialect>();
+    target.addLegalDialect<dmaphop::dmaphopdialect, func::FuncDialect, memref::MemRefDialect, tensor::TensorDialect>();
 
     // Add the primary lowering patterns.
     //patterns.add<DmapFuncOpLowering, PushOpLowering>(&ctx);

@@ -303,9 +303,9 @@ def dmaphop_alloc_buffer : dmaphopop<"alloc_buffer"> {
   let summary = "Allocates a buffer on a specific tile";
   let arguments = (ins
     dmaphoptiletype:$tile,
-    AnyMemRef:$memref_type
+    AnyTensor:$memref_type
   );
-  let results = (outs AnyMemRef:$buffer);
+  let results = (outs AnyTensor:$buffer);
   let assemblyFormat = "`on` $tile $memref_type `:` type($tile) type($memref_type) attr-dict `->` type($buffer)";
 }
 
@@ -316,7 +316,7 @@ def dmaphop_push : dmaphopop<"push"> {
   let arguments = (ins
     AnyTensor:$data,
     dmaphoppathtype:$path,
-    Variadic<AnyMemRef>:$consumer_buffers,
+    Variadic<AnyTensor>:$consumer_buffers,
     Variadic<dmaphopporttype>:$consumer_ports
   );
   let traits = [SameVariadicOperandSize];
@@ -328,7 +328,7 @@ def dmaphop_pull : dmaphopop<"pull"> {
   let arguments = (ins
     AnyTensor:$data,
     dmaphoppathtype:$path,
-    Variadic<AnyMemRef>:$producer_buffers,
+    Variadic<AnyTensor>:$producer_buffers,
     Variadic<dmaphopporttype>:$producer_ports
   );
   let traits = [SameVariadicOperandSize];
@@ -346,7 +346,7 @@ def dmaphop_sync : dmaphopop<"sync"> {
  
 def dmaphop_dealloc_buffer : dmaphopop<"dealloc_buffer"> {
   let summary = "Deallocates a buffer";
-  let arguments = (ins AnyMemRef:$buffer);
+  let arguments = (ins AnyTensor:$buffer);
   let assemblyFormat = "$buffer `:` type($buffer) attr-dict";
 }
  

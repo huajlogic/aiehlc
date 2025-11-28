@@ -442,10 +442,18 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         int64_t cumulativeOffset = 0;
         for (size_t i = 0; i < consumerBuffers.size(); ++i) {
             auto buffer = consumerBuffers[i];
-            auto memrefType = dyn_cast<MemRefType>(buffer.getType());
-            if (!memrefType) continue;
+            auto tensorType = dyn_cast<RankedTensorType>(buffer.getType());
+            if (!tensorType) {
+                 // Try MemRef for backward compatibility or mixed cases
+                 if (auto memrefType = dyn_cast<MemRefType>(buffer.getType())) {
+                      SmallVector<int64_t> shapeVec(memrefType.getShape().begin(), memrefType.getShape().end());
+                      tensorType = RankedTensorType::get(shapeVec, memrefType.getElementType());
+                 }
+            }
 
-            auto sliceShape = memrefType.getShape();
+            if (!tensorType) continue;
+
+            auto sliceShape = tensorType.getShape();
             SmallVector<int64_t> sizeVec;
             SmallVector<int64_t> strideVec;
             
@@ -466,8 +474,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                 offsetVec.push_back(0);
             }
 
-            // Convert memref type to tensor type for the slice attribute
-            auto tensorType = RankedTensorType::get(sliceShape, memrefType.getElementType());
+            // SliceAttr expects TypeAttr. 
+            // If DataSliceOp expects Tensor type now (which it should if we are consistent), pass tensorType.
             auto sliceAttr = dfscheblueprint::SliceAttr::get(
                 getContext(),
                 TypeAttr::get(tensorType),
@@ -669,10 +677,17 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         int64_t cumulativeOffset = 0;
         for (size_t i = 0; i < producerBuffers.size(); ++i) {
             auto buffer = producerBuffers[i];
-            auto memrefType = dyn_cast<MemRefType>(buffer.getType());
-            if (!memrefType) continue;
+            auto tensorType = dyn_cast<RankedTensorType>(buffer.getType());
+            if (!tensorType) {
+                 // Try MemRef for backward compatibility or mixed cases
+                 if (auto memrefType = dyn_cast<MemRefType>(buffer.getType())) {
+                      SmallVector<int64_t> shapeVec(memrefType.getShape().begin(), memrefType.getShape().end());
+                      tensorType = RankedTensorType::get(shapeVec, memrefType.getElementType());
+                 }
+            }
+            if (!tensorType) continue;
 
-            auto sliceShape = memrefType.getShape();
+            auto sliceShape = tensorType.getShape();
             SmallVector<int64_t> sizeVec;
             SmallVector<int64_t> strideVec;
             
@@ -693,8 +708,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 offsetVec.push_back(0);
             }
 
-            // Convert memref type to tensor type for the slice attribute
-            auto tensorType = RankedTensorType::get(sliceShape, memrefType.getElementType());
+            // SliceAttr expects TypeAttr.
             auto sliceAttr = dfscheblueprint::SliceAttr::get(
                 getContext(),
                 TypeAttr::get(tensorType),
