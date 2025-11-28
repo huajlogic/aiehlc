@@ -6,6 +6,7 @@
 #include "../../routing/routingmanager.h"
 #include <iostream>
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 
 #define GET_TYPEDEF_CLASSES
 #define GET_ATTRDEF_CLASSES
@@ -453,6 +454,7 @@ void dfscheblueprintmanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<mlir::func::FuncDialect>();
     ctx->getOrLoadDialect<dfscheblueprint::dfscheblueprintdialect>();
     ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
     ctx->getOrLoadDialect<routing::routingdialect>();
 }
@@ -515,28 +517,27 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     );
 
     // ============================================================
-    // 2. Logical Data View
+    // 2. Logical Data View (using Tensor types)
     // ============================================================
     
-    // Create Root Buffer (memref<1024x1024xf32>)
-    auto rootMemRefType = MemRefType::get({1024, 1024}, builder.getF32Type());
-    auto allocOp = builder.create<memref::AllocOp>(location, rootMemRefType);
-    auto rootBuffer = allocOp.getResult();
+    // Create Root Tensor (tensor<1024x1024xf32>) - logical declaration, no memory allocation
+    auto emptyTensorOp = builder.create<tensor::EmptyOp>(location, ArrayRef<int64_t>{1024, 1024}, builder.getF32Type());
+    auto rootTensor = emptyTensorOp.getResult();
 
-    // Create SubView (Partition 0: 256x1024)
+    // Create tensor.extract_slice (Partition 0: 256x1024)
     // Offset=[0, 0], Size=[256, 1024], Stride=[1, 1] relative to source
     SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(0), builder.getIndexAttr(0)};
     SmallVector<OpFoldResult> sizes = {builder.getIndexAttr(256), builder.getIndexAttr(1024)};
     SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1)};
     
-    auto subViewOp = builder.create<memref::SubViewOp>(
+    auto extractSliceOp = builder.create<tensor::ExtractSliceOp>(
         location,
-        rootBuffer,
+        rootTensor,
         offsets,
         sizes,
         strides
     );
-    auto viewSplit = subViewOp.getResult();
+    auto viewSplit = extractSliceOp.getResult();
 
     // ============================================================
     // 3. Binding & Channel Config
@@ -550,8 +551,8 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     //);
     //auto extractedView = extractOp.getResult();
 
-    // Create 4 DataSliceOps for output (4x256 each) using extractedView
-    auto subSliceType = mlir::TypeAttr::get(mlir::MemRefType::get({4, 256}, builder.getF32Type()));
+    // Create 4 DataSliceOps for output (4x256 each) using tensor types
+    auto subSliceType = mlir::TypeAttr::get(mlir::RankedTensorType::get({4, 256}, builder.getF32Type()));
     auto subSliceSize = builder.getArrayAttr({builder.getI64IntegerAttr(4), builder.getI64IntegerAttr(256)});
     auto subSliceStride = builder.getArrayAttr({builder.getI64IntegerAttr(256), builder.getI64IntegerAttr(1)});
     
@@ -651,7 +652,6 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         builder.getI32IntegerAttr(20)
     );
 
-    // Deallocate Root Buffer
-    builder.create<memref::DeallocOp>(location, rootBuffer);
+    // Note: Tensors are value types, no deallocation needed (removed memref::DeallocOp)
 }
 

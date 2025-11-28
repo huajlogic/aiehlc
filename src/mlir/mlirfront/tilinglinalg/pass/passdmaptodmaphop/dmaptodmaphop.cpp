@@ -53,7 +53,7 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
                                          RoutingTopology &router, DataflowDirection direction) {
     auto loc = op->getLoc();
     
-    // Get operand 0 and extract the data ID
+    // Get operand 0 and extract the data tensor
     Value dataValue = op->getOperand(0);
     Value dataId;
     
@@ -62,7 +62,7 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         // If it's already an extract_data operation, use its result directly
         dataId = extractOp.getResult();
     } else {
-        // Otherwise, use the value directly (assuming it's already an I32)
+        // Otherwise, use the value directly (it should be a tensor)
         dataId = dataValue;
     }
     

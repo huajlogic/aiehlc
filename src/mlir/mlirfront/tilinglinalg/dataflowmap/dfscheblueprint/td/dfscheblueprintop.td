@@ -112,16 +112,25 @@ def dfscheblueprint_ResourceGroupOp : dfscheblueprintop<"resource_group", [
   let assemblyFormat = "$sym_name `{` `tiles` `=` $tiles `}` attr-dict";
 }
 
-// schedule.declare_data
+// schedule.declare_data - Creates a logical tensor without memory allocation
 def dfscheblueprint_DeclareDataOp : dfscheblueprintop<"declare_data", [
     
   ]> {
-  let summary = "Declares a data matrix";
+  let summary = "Declares a logical data tensor";
+  let description = [{
+    Declares a logical tensor for scheduling purposes. This creates an SSA value
+    representing the data shape and type without actual memory allocation.
+    
+    Example:
+    ```mlir
+    %root_data = schedule.declare_data tensor<1024x1024xf32>
+    ```
+  }];
   let arguments = (ins
-    TypeAttr:$type
+    TypeAttr:$data_type
   );
-  let results = (outs dfscheblueprint_DataHandleType:$result);
-  let assemblyFormat = "$type attr-dict";
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$data_type attr-dict `->` type($result)";
 }
 
 // schedule.partition
@@ -155,9 +164,20 @@ def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
     Symbol
   ]> {
   let summary = "Defines a named slice of a data view";
+  let description = [{
+    Defines a named slice of a tensor view for scheduling purposes.
+    
+    Example:
+    ```mlir
+    schedule.data_slice @out_slice_0 {
+      view = %view_strip,
+      slice = #schedule.Slice<data_type = tensor<4x256xf32>, offset = [0, 0], size = [4, 256], stride = [256, 1]>
+    }
+    ```
+  }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
-    AnyMemRef:$view,
+    AnyTensor:$view,
     dfscheblueprint_SliceAttr:$slice_params
   );
   let hasCustomAssemblyFormat = 1;

@@ -314,7 +314,7 @@ def dmaphop_alloc_buffer : dmaphopop<"alloc_buffer"> {
 def dmaphop_push : dmaphopop<"push"> {
   let summary = "Pushes data through a path to multiple destinations";
   let arguments = (ins
-    I32:$data,
+    AnyTensor:$data,
     dmaphoppathtype:$path,
     Variadic<AnyMemRef>:$consumer_buffers,
     Variadic<dmaphopporttype>:$consumer_ports
@@ -323,10 +323,10 @@ def dmaphop_push : dmaphopop<"push"> {
   let assemblyFormat = "$data `into` $path `consumer` `(` $consumer_buffers `at` $consumer_ports `)` `:` type($data) type($path) type($consumer_buffers) type($consumer_ports) attr-dict";
 }
  
- def dmaphop_pull : dmaphopop<"pull"> {
-  let summary = "pull data through a path to multiple destinations";
+def dmaphop_pull : dmaphopop<"pull"> {
+  let summary = "Pulls data through a path from multiple sources";
   let arguments = (ins
-    I32:$data,
+    AnyTensor:$data,
     dmaphoppathtype:$path,
     Variadic<AnyMemRef>:$producer_buffers,
     Variadic<dmaphopporttype>:$producer_ports

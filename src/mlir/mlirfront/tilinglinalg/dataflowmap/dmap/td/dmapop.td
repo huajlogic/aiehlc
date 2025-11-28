@@ -265,18 +265,18 @@ def dmap_push : dmapop<"push"> {
   }];
 
   let arguments = (ins
-    I32:$data,
+    AnyTensor:$data,
     AnyTypeOf<[dmapportstreamtype, dmapportchainstreamtype]>:$stream
   );
 
   let assemblyFormat = [{
-    $data `to` $stream `:` type($stream) attr-dict
+    $data `:` type($data) `to` $stream `:` type($stream) attr-dict
   }];
 
 }
 
 def dmap_pull : dmapop<"pull"> {
-  let summary = "Pushes a block of data into a pre-defined stream.";
+  let summary = "Pulls a block of data from a pre-defined stream.";
   let description = [{
     The primary pull execution-phase operation. It takes a data handle and
     a stream handle (either a single port stream or a chained stream),
@@ -284,12 +284,12 @@ def dmap_pull : dmapop<"pull"> {
   }];
 
   let arguments = (ins
-    I32:$data,
+    AnyTensor:$data,
     AnyTypeOf<[dmapportstreamtype, dmapportchainstreamtype]>:$stream
   );
 
   let assemblyFormat = [{
-    $data `from` $stream `:` type($stream) attr-dict
+    $data `:` type($data) `from` $stream `:` type($stream) attr-dict
   }];
 
 }

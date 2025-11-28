@@ -304,13 +304,15 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     auto block = main.addEntryBlock();
     builder.setInsertionPointToEnd(block);
     auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(),  hwrowused, hwcolused);
-    //dummy tensor
+    //schedule tensor with tensor type
+    SmallVector<int64_t> shapeVec = {10, 20};
     SmallVector<Attribute> shape;
-    for (int64_t v : {10, 20})
-    shape.push_back(builder.getI64IntegerAttr(v));
+    for (int64_t v : shapeVec)
+        shape.push_back(builder.getI64IntegerAttr(v));
     ArrayAttr vals = builder.getArrayAttr(shape);  // satisfies I64ArrayAttr
     IntegerAttr dimnum = builder.getI64IntegerAttr(2);
-    auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), vals, dimnum);
+    auto tensorType = RankedTensorType::get(shapeVec, builder.getF32Type());
+    auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, vals, dimnum);
     createroutingfuncByDim(builder, ctx, false, mesh, tensor, hwrowused, "row");
     createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwrowused, "row");
     createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwcolused, "col");
@@ -438,8 +440,9 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                 ///*                
                     auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, hwsplitnum, splitAxis);
                     IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
-                    auto outTy = builder.getI32Type();
-                    auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensor, hwsplitnum, 0, tensorhwaxisowner,"col","");
+                    // Get tensor type from input tensor for partitiontensor result
+                    auto tensorType = tensor.getType();
+                    auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensorType, tensor, hwsplitnum, 0, tensorhwaxisowner,"col","");
                     Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
                     Value ub = builder.create<arith::ConstantIndexOp>(location, hwsplitnum);
                     Value step = builder.create<arith::ConstantIndexOp>(location,1);
@@ -458,14 +461,16 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                         auto routingcreateOp = builder.create<routing::RoutingCreate>(builder.getUnknownLoc(), idx, memo, [&](OpBuilder &builder1, Location bodyLoc,Value sidx) { 
                             //use such format to fix the generic format print issue 
                             ///*
-                            auto slicetensor = builder1.create<extract_data>(builder1.getUnknownLoc(), rowtensor, sidx);
+                            // extract_data returns the same tensor type as input
+                            auto slicetensor = builder1.create<extract_data>(builder1.getUnknownLoc(), rowtensor.getType(), rowtensor, sidx);
                             auto tilelist = builder1.create<extract_tiles>(builder1.getUnknownLoc(), patitionmesh, sidx);
                             
                             if (binput) {
                                 auto hwio = builder1.create<createhwiowithtarget>(builder1.getUnknownLoc(), tilelist, "input", "mem2");
                                 auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), slicetensor, hwio);
                             } else {
-                                auto gatherdata = builder1.create<routinggatherout>(builder1.getUnknownLoc(), tilelist, slicetensor);
+                                // routinggatherout now takes AnyTensor and returns AnyTensor
+                                auto gatherdata = builder1.create<routinggatherout>(builder1.getUnknownLoc(), slicetensor.getType(), tilelist, slicetensor);
                                 auto hwio = builder1.create<createhwiowithtarget>(builder1.getUnknownLoc(), tilelist, "output", "mem2");
                                 auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), gatherdata, hwio);
                             }

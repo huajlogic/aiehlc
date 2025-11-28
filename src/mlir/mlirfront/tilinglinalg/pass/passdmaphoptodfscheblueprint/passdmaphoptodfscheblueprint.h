@@ -8,6 +8,7 @@
 
 #include "mlir/Pass/Pass.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "dmaphopmanager.h"
 #include "dfscheblueprintmanager.h"
 #include "routingmanager.h"
@@ -30,6 +31,7 @@ public:
         registry.insert<func::FuncDialect>();
         registry.insert<memref::MemRefDialect>();
         registry.insert<arith::ArithDialect>();
+        registry.insert<tensor::TensorDialect>();
     }
 };
 

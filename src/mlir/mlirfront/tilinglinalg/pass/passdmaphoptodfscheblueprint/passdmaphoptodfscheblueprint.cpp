@@ -6,6 +6,7 @@
 #include "passdmaphoptodfscheblueprint.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -337,9 +338,10 @@ struct CreateScheduleTensorConversion : public OpConversionPattern<routing::crea
         for (auto dim : shapeAttr) {
             shape.push_back(cast<IntegerAttr>(dim).getInt());
         }
-        auto memRefType = MemRefType::get(shape, rewriter.getF32Type());
-        auto alloc = rewriter.create<memref::AllocOp>(op.getLoc(), memRefType);
-        rewriter.replaceOp(op, alloc.getResult());
+        auto tensorType = RankedTensorType::get(shape, rewriter.getF32Type());
+        // Create an empty tensor - it will be filled later by actual data operations
+        auto emptyTensor = rewriter.create<tensor::EmptyOp>(op.getLoc(), shape, rewriter.getF32Type());
+        rewriter.replaceOp(op, emptyTensor.getResult());
         return success();
     }
 };
@@ -363,10 +365,10 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
         int64_t splitNum = partitionOp.getSplitnum();
         int64_t splitDim = partitionOp.getSplitdim();
 
-        Value inputMemRef = adaptor.getTensor();
-        auto memRefType = dyn_cast<MemRefType>(inputMemRef.getType());
-        if (!memRefType) return failure();
-        auto shape = memRefType.getShape();
+        Value inputTensor = adaptor.getTensor();
+        auto tensorType = dyn_cast<RankedTensorType>(inputTensor.getType());
+        if (!tensorType) return failure();
+        auto shape = tensorType.getShape();
 
         SmallVector<OpFoldResult> offsets;
         SmallVector<OpFoldResult> sizes;
@@ -381,7 +383,7 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
             if (i == (size_t)splitDim) {
                 Value dimSizeVal;
                 if (shape[i] == ShapedType::kDynamic) {
-                    dimSizeVal = rewriter.create<memref::DimOp>(op.getLoc(), inputMemRef, i);
+                    dimSizeVal = rewriter.create<tensor::DimOp>(op.getLoc(), inputTensor, i);
                 } else {
                     dimSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), shape[i]);
                 }
@@ -395,7 +397,7 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
             } else {
                 offsets.push_back(rewriter.getIndexAttr(0));
                 if (shape[i] == ShapedType::kDynamic) {
-                     Value dimSizeVal = rewriter.create<memref::DimOp>(op.getLoc(), inputMemRef, i);
+                     Value dimSizeVal = rewriter.create<tensor::DimOp>(op.getLoc(), inputTensor, i);
                      sizes.push_back(dimSizeVal);
                 } else {
                     sizes.push_back(rewriter.getIndexAttr(shape[i]));
@@ -404,15 +406,15 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
             strides.push_back(rewriter.getIndexAttr(1));
         }
 
-        auto subView = rewriter.create<memref::SubViewOp>(
+        auto extractSlice = rewriter.create<tensor::ExtractSliceOp>(
             op.getLoc(),
-            inputMemRef,
+            inputTensor,
             offsets,
             sizes,
             strides
         );
         
-        rewriter.replaceOp(op, subView.getResult());
+        rewriter.replaceOp(op, extractSlice.getResult());
         return success();
     }
 };
@@ -464,9 +466,11 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                 offsetVec.push_back(0);
             }
 
+            // Convert memref type to tensor type for the slice attribute
+            auto tensorType = RankedTensorType::get(sliceShape, memrefType.getElementType());
             auto sliceAttr = dfscheblueprint::SliceAttr::get(
                 getContext(),
-                TypeAttr::get(memrefType),
+                TypeAttr::get(tensorType),
                 rewriter.getI64ArrayAttr(offsetVec),
                 rewriter.getI64ArrayAttr(sizeVec),
                 rewriter.getI64ArrayAttr(strideVec)
@@ -689,9 +693,11 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 offsetVec.push_back(0);
             }
 
+            // Convert memref type to tensor type for the slice attribute
+            auto tensorType = RankedTensorType::get(sliceShape, memrefType.getElementType());
             auto sliceAttr = dfscheblueprint::SliceAttr::get(
                 getContext(),
-                TypeAttr::get(memrefType),
+                TypeAttr::get(tensorType),
                 rewriter.getI64ArrayAttr(offsetVec),
                 rewriter.getI64ArrayAttr(sizeVec),
                 rewriter.getI64ArrayAttr(strideVec)
@@ -889,6 +895,7 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
     target.addLegalDialect<routing::routingdialect>();
     target.addLegalDialect<arith::ArithDialect>();
     target.addLegalDialect<memref::MemRefDialect>();
+    target.addLegalDialect<tensor::TensorDialect>();
     target.addLegalOp<scf::ExecuteRegionOp>();
     
     //target.addIllegalDialect<dmaphop::dmaphopdialect>();
