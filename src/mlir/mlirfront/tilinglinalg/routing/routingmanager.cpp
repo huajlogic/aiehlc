@@ -310,7 +310,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     shape.push_back(builder.getI64IntegerAttr(v));
     ArrayAttr vals = builder.getArrayAttr(shape);  // satisfies I64ArrayAttr
     IntegerAttr dimnum = builder.getI64IntegerAttr(2);
-    auto tensor = builder.create<createdummytensor>(builder.getUnknownLoc(), vals, dimnum);
+    auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), vals, dimnum);
     createroutingfuncByDim(builder, ctx, false, mesh, tensor, hwrowused, "row");
     createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwrowused, "row");
     createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwcolused, "col");
@@ -386,7 +386,7 @@ mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int total
             ArrayAttr vals = builder.getArrayAttr(shape);  // satisfies I64ArrayAttr
             // 3) I64Attr ($dim).
             IntegerAttr dimnum = builder.getI64IntegerAttr(2);
-            auto tensor = builder.create<createdummytensor>(builder.getUnknownLoc(),  subview, vals, dimnum);
+            auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(),  subview, vals, dimnum);
             //
             auto hw_row_number = rnum_i32;
             IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 

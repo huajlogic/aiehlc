@@ -108,10 +108,10 @@ def routing_createhwmesh :routingop<"routingcreatehwmesh"> {
 
 }
 
-def routing_createdummytensor :routingop<"routingcreatedummytensor"> {
-	let summary = "createdummytensor";
+def routing_createscheduletensor :routingop<"routingcreatescheduletensor"> {
+	let summary = "createscheduletensor";
 	let cppNamespace = "routing";
-	let description = "create an dummpy tensor";
+	let description = "create a schedule tensor";
 
 	let arguments = (ins
 		I64ArrayAttr:$shape,

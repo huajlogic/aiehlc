@@ -891,7 +891,7 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     
     // Mark routing::extract_data as illegal so it gets erased
     target.addIllegalOp<routing::extract_data>();
-    target.addIllegalOp<routing::createdummytensor>();
+    target.addIllegalOp<routing::createscheduletensor>();
     target.addIllegalOp<routing::partitiontensor>();
     
     // Explicitly mark all other routing and SCF operations as legal to preserve them
@@ -916,7 +916,7 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     patterns.add<EraseOpPattern<dmaphop::pull>>(&ctx);
     patterns.add<EraseOpPattern<dmaphop::sync>>(&ctx);
     patterns.add<EraseOpPattern<routing::extract_data>>(&ctx);  // Erase routing::extract_data
-    patterns.add<EraseOpPattern<routing::createdummytensor>>(&ctx);
+    patterns.add<EraseOpPattern<routing::createscheduletensor>>(&ctx);
     patterns.add<EraseOpPattern<routing::partitiontensor>>(&ctx);  // Erase routing::partitiontensor
 
     /*

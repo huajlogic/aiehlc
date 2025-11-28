@@ -328,9 +328,9 @@ struct EraseOpLowering : public OpConversionPattern<Op_T> {
     }
 };
 
-struct CreateDummyTensorConversion : public OpConversionPattern<routing::createdummytensor> {
-    using OpConversionPattern<routing::createdummytensor>::OpConversionPattern;
-    LogicalResult matchAndRewrite(routing::createdummytensor op, OpAdaptor adaptor,
+struct CreateScheduleTensorConversion : public OpConversionPattern<routing::createscheduletensor> {
+    using OpConversionPattern<routing::createscheduletensor>::OpConversionPattern;
+    LogicalResult matchAndRewrite(routing::createscheduletensor op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
         auto shapeAttr = op.getShape();
         SmallVector<int64_t> shape;
@@ -905,13 +905,13 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
                  EraseOpLowering<dmaphop::sync>,
                  EraseOpLowering<dmaphop::dealloc_buffer>>(context);
     
-    patterns.add<CreateDummyTensorConversion>(context);
+    patterns.add<CreateScheduleTensorConversion>(context);
     patterns.add<PartitionTensorConversion>(context);
     patterns.add<ExtractDataConversion>(context);
     patterns.add<PushOpConversion>(context);
     patterns.add<PullOpConversion>(context);
 
-    target.addIllegalOp<routing::createdummytensor>();
+    target.addIllegalOp<routing::createscheduletensor>();
     target.addIllegalOp<routing::partitiontensor>();
     target.addIllegalOp<routing::extract_data>();
 
