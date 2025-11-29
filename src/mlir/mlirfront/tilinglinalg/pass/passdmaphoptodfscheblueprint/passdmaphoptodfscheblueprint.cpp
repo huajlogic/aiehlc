@@ -359,12 +359,15 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
     using OpConversionPattern<routing::extract_data>::OpConversionPattern;
     LogicalResult matchAndRewrite(routing::extract_data op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
+        int64_t splitNum = 1;
+        int64_t splitDim = 0;
+
         auto partitionOp = dyn_cast_or_null<routing::partitiontensor>(op.getTensor().getDefiningOp());
-        if (!partitionOp) return failure();
-
-        int64_t splitNum = partitionOp.getSplitnum();
-        int64_t splitDim = partitionOp.getSplitdim();
-
+        if (partitionOp) {
+            splitNum = partitionOp.getSplitnum();
+            splitDim = partitionOp.getSplitdim();
+        }
+        
         Value inputTensor = adaptor.getTensor();
         auto tensorType = dyn_cast<RankedTensorType>(inputTensor.getType());
         if (!tensorType) return failure();
@@ -906,7 +909,7 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
     MLIRContext *context = &getContext();
     ConversionTarget target(*context);
     target.addLegalDialect<dfscheblueprint::dfscheblueprintdialect>();
-    target.addLegalDialect<routing::routingdialect>();
+    //target.addLegalDialect<routing::routingdialect>();
     target.addLegalDialect<arith::ArithDialect>();
     target.addLegalDialect<memref::MemRefDialect>();
     target.addLegalDialect<tensor::TensorDialect>();
@@ -926,15 +929,15 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
                  EraseOpLowering<dmaphop::sync>,
                  EraseOpLowering<dmaphop::dealloc_buffer>>(context);
     
-    patterns.add<CreateScheduleTensorConversion>(context);
-    patterns.add<PartitionTensorConversion>(context);
-    patterns.add<ExtractDataConversion>(context);
+    //patterns.add<CreateScheduleTensorConversion>(context);
+    //patterns.add<PartitionTensorConversion>(context);
+    //patterns.add<ExtractDataConversion>(context);
     patterns.add<PushOpConversion>(context);
     patterns.add<PullOpConversion>(context);
 
-    target.addIllegalOp<routing::createscheduletensor>();
-    target.addIllegalOp<routing::partitiontensor>();
-    target.addIllegalOp<routing::extract_data>();
+    //target.addIllegalOp<routing::createscheduletensor>();
+    //target.addIllegalOp<routing::partitiontensor>();
+    //target.addIllegalOp<routing::extract_data>();
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();

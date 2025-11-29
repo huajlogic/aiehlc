@@ -330,15 +330,31 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         ? rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}))
         : rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}));
 
-    // Create tensor type for buffers (was MemRefType)
-    auto tensorType = RankedTensorType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
-    
-    // Create template tensor (placeholder) for buffer allocation
-    Value coreBufferTemplate = rewriter.create<tensor::EmptyOp>(loc, tensorType.getShape(), tensorType.getElementType());
+    // Replaced dmaphop.alloc_buffer with tensor.extract_slice on the data tensor
     SmallVector<Value, 4> coreBuffers;
-    for (auto coreTile : coreTiles) {
-        // alloc_buffer now returns Tensor
-        coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, tensorType, coreTile.getResult(), coreBufferTemplate).getResult());
+    
+    // Get shape info from dataId to create proper slice (identity slice of the whole data)
+    auto rankedType = dyn_cast<RankedTensorType>(dataId.getType());
+    if (!rankedType) {
+        return op->emitError("Data operand must be a ranked tensor");
+    }
+    int64_t rank = rankedType.getRank();
+    
+    SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+    SmallVector<OpFoldResult> sizes;
+    for (int64_t i = 0; i < rank; ++i) {
+         if (rankedType.isDynamicDim(i)) {
+             sizes.push_back(rewriter.create<tensor::DimOp>(loc, dataId, i).getResult());
+         } else {
+             sizes.push_back(rewriter.getIndexAttr(rankedType.getDimSize(i)));
+         }
+    }
+
+    for (size_t i = 0; i < coreTiles.size(); ++i) {
+        // Extract slice from the data source (%6 in user query example)
+        auto slice = rewriter.create<tensor::ExtractSliceOp>(loc, dataId, offsets, sizes, strides);
+        coreBuffers.push_back(slice.getResult());
     }
 
     if (direction == DataflowDirection::Push) {
@@ -349,9 +365,12 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     rewriter.create<dmaphop::sync>(loc, path);
 
     // --- 8. Deallocate buffers and erase original op ---
+    // dmaphop::dealloc_buffer is not needed for tensors
+    /*
     for (auto buffer : coreBuffers) {
         rewriter.create<dmaphop::dealloc_buffer>(loc, buffer);
     }
+    */
     // memref::DeallocOp is not used for tensors
     // rewriter.create<memref::DeallocOp>(loc, coreBufferTemplate);
     rewriter.eraseOp(op);
