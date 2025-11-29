@@ -338,10 +338,18 @@ struct CreateScheduleTensorConversion : public OpConversionPattern<routing::crea
         for (auto dim : shapeAttr) {
             shape.push_back(cast<IntegerAttr>(dim).getInt());
         }
-        auto tensorType = RankedTensorType::get(shape, rewriter.getF32Type());
-        // Create an empty tensor - it will be filled later by actual data operations
-        auto emptyTensor = rewriter.create<tensor::EmptyOp>(op.getLoc(), shape, rewriter.getF32Type());
-        rewriter.replaceOp(op, emptyTensor.getResult());
+        // Get element type from the original op's result type
+        auto origResultType = dyn_cast<RankedTensorType>(op.getOutput().getType());
+        Type elementType = origResultType ? origResultType.getElementType() : rewriter.getF32Type();
+        auto tensorType = RankedTensorType::get(shape, elementType);
+        
+        // Convert to dfscheblueprint::DeclareDataOp
+        auto declareDataOp = rewriter.create<dfscheblueprint::DeclareDataOp>(
+            op.getLoc(),
+            tensorType,                     // result type (AnyTensor)
+            TypeAttr::get(tensorType)       // data_type attribute
+        );
+        rewriter.replaceOp(op, declareDataOp.getResult());
         return success();
     }
 };
@@ -929,13 +937,13 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
                  EraseOpLowering<dmaphop::sync>,
                  EraseOpLowering<dmaphop::dealloc_buffer>>(context);
     
-    //patterns.add<CreateScheduleTensorConversion>(context);
+    patterns.add<CreateScheduleTensorConversion>(context);
     //patterns.add<PartitionTensorConversion>(context);
     //patterns.add<ExtractDataConversion>(context);
     patterns.add<PushOpConversion>(context);
     patterns.add<PullOpConversion>(context);
 
-    //target.addIllegalOp<routing::createscheduletensor>();
+    target.addIllegalOp<routing::createscheduletensor>();
     //target.addIllegalOp<routing::partitiontensor>();
     //target.addIllegalOp<routing::extract_data>();
 
