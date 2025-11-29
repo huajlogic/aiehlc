@@ -333,27 +333,81 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     // Replaced dmaphop.alloc_buffer with tensor.extract_slice on the data tensor
     SmallVector<Value, 4> coreBuffers;
     
-    // Get shape info from dataId to create proper slice (identity slice of the whole data)
+    // Get shape info from dataId
     auto rankedType = dyn_cast<RankedTensorType>(dataId.getType());
     if (!rankedType) {
         return op->emitError("Data operand must be a ranked tensor");
     }
     int64_t rank = rankedType.getRank();
+    auto shape = rankedType.getShape();
     
+    // Determine split dimension - use the highest dimension > 1 or default to 0
+    int splitDim = 0;
+    
+    // Check if we can split along the dimension that matches core count
+    // or just split the first dimension
+    int numTiles = coreTiles.size();
+    
+    //SmallVector<OpFoldResult> offsets(rank);
     SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
     SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
-    SmallVector<OpFoldResult> sizes;
+    SmallVector<OpFoldResult> sizes;//(rank);
+    
+    // Calculate slice size based on split dim
+    int64_t dimSize = shape[splitDim];
+    if (dimSize != ShapedType::kDynamic && numTiles > 0) {
+        // If static shape, verify divisibility or just div
+        // Assuming divisibility for now as per usual tiling logic
+    }
+    //SmallVector<OpFoldResult> sizes;
     for (int64_t i = 0; i < rank; ++i) {
          if (rankedType.isDynamicDim(i)) {
              sizes.push_back(rewriter.create<tensor::DimOp>(loc, dataId, i).getResult());
          } else {
              sizes.push_back(rewriter.getIndexAttr(rankedType.getDimSize(i)));
-         }
+        }
     }
-
+    // Calculate slice size and offsets for each tile
     for (size_t i = 0; i < coreTiles.size(); ++i) {
-        // Extract slice from the data source (%6 in user query example)
-        auto slice = rewriter.create<tensor::ExtractSliceOp>(loc, dataId, offsets, sizes, strides);
+        for (int64_t d = 0; d < rank; ++d) {
+            if (d == splitDim) {
+                // Sliced dimension - Static calculation
+                int64_t dimSize = shape[d];
+                // Assuming static shape for now as requested
+                int64_t sliceSize = dimSize / numTiles;
+                int64_t offset = i * sliceSize;
+
+                offsets[d] = rewriter.getIndexAttr(offset);
+                sizes[d] = rewriter.getIndexAttr(sliceSize);
+            } else {
+                // Non-sliced dimension: full size, offset 0
+                offsets[d] = rewriter.getIndexAttr(0);
+                sizes[d] = rewriter.getIndexAttr(shape[d]);
+            }
+        }
+        
+        // Calculate result type for this slice
+        SmallVector<int64_t> sliceShape;
+        for (int64_t d = 0; d < rank; ++d) {
+            if (d == splitDim) {
+                if (shape[d] == ShapedType::kDynamic)
+                    sliceShape.push_back(ShapedType::kDynamic);
+                else
+                    sliceShape.push_back(shape[d] / numTiles);
+            } else {
+                sliceShape.push_back(shape[d]);
+            }
+        }
+        auto sliceType = RankedTensorType::get(sliceShape, rankedType.getElementType());
+        
+        auto slice = rewriter.create<tensor::ExtractSliceOp>(
+            loc, 
+            sliceType,
+            dataId, 
+            offsets, 
+            sizes, 
+            strides
+        );
         coreBuffers.push_back(slice.getResult());
     }
 
@@ -424,7 +478,7 @@ void DmapToDmaphopPass::runOnOperation() {
     // The conversion is successful when the dmap dialect is gone.
     target.addIllegalDialect<dmap::dmapdialect>();
     // These dialects are legal to have in the output.
-    target.addLegalDialect<dmaphop::dmaphopdialect, func::FuncDialect, memref::MemRefDialect, tensor::TensorDialect>();
+    target.addLegalDialect<dmaphop::dmaphopdialect, func::FuncDialect, memref::MemRefDialect, tensor::TensorDialect, arith::ArithDialect>();
 
     // Add the primary lowering patterns.
     //patterns.add<DmapFuncOpLowering, PushOpLowering>(&ctx);

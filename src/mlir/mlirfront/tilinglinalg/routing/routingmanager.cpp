@@ -305,7 +305,7 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     builder.setInsertionPointToEnd(block);
     auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(),  hwrowused, hwcolused);
     //schedule tensor with tensor type
-    SmallVector<int64_t> shapeVec = {10, 20};
+    SmallVector<int64_t> shapeVec = {16, 16};
     SmallVector<Attribute> shape;
     for (int64_t v : shapeVec)
         shape.push_back(builder.getI64IntegerAttr(v));

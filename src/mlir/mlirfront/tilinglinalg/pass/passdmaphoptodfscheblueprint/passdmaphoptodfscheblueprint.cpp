@@ -367,58 +367,72 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
     using OpConversionPattern<routing::extract_data>::OpConversionPattern;
     LogicalResult matchAndRewrite(routing::extract_data op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        int64_t splitNum = 1;
-        int64_t splitDim = 0;
-
-        auto partitionOp = dyn_cast_or_null<routing::partitiontensor>(op.getTensor().getDefiningOp());
-        if (partitionOp) {
-            splitNum = partitionOp.getSplitnum();
-            splitDim = partitionOp.getSplitdim();
-        }
-        
         Value inputTensor = adaptor.getTensor();
-        auto tensorType = dyn_cast<RankedTensorType>(inputTensor.getType());
-        if (!tensorType) return failure();
-        auto shape = tensorType.getShape();
+        auto inputType = dyn_cast<RankedTensorType>(inputTensor.getType());
+        auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
 
-        SmallVector<OpFoldResult> offsets;
-        SmallVector<OpFoldResult> sizes;
-        SmallVector<OpFoldResult> strides;
+        if (!inputType || !resultType) {
+            return op.emitError("ExtractDataConversion: input and result must be ranked tensors");
+        }
+
+        auto inputShape = inputType.getShape();
+        auto resultShape = resultType.getShape();
+
+        if (inputShape.size() != 2 || resultShape.size() != 2) {
+             return op.emitError("ExtractDataConversion: tensors must be 2D");
+        }
+
+        int64_t dim0 = inputShape[0];
+        int64_t dim1 = inputShape[1];
+        int64_t sliceDim0 = resultShape[0];
+        int64_t sliceDim1 = resultShape[1];
+
+        // Determine split dimension based on shape difference
+        // If result shape is smaller than input shape in one dimension, that's the split dimension.
+        int64_t splitDim = 0;
+        int64_t sliceSize = sliceDim0;
+
+        if (dim0 != sliceDim0) {
+            splitDim = 0;
+            sliceSize = sliceDim0;
+        } else if (dim1 != sliceDim1) {
+            splitDim = 1;
+            sliceSize = sliceDim1;
+        } else {
+            // Both dimensions match. This implies a 1-to-1 extraction (or splitNum=1).
+            // We default to splitDim=0, sliceSize=dim0 (full size).
+            // This results in offset 0 for idx 0.
+            splitDim = 0;
+            sliceSize = dim0;
+        }
 
         Value indexVal = adaptor.getIdx();
         if (!indexVal.getType().isIndex()) {
             indexVal = rewriter.create<arith::IndexCastOp>(op.getLoc(), rewriter.getIndexType(), indexVal);
         }
 
-        for (size_t i = 0; i < shape.size(); ++i) {
-            if (i == (size_t)splitDim) {
-                Value dimSizeVal;
-                if (shape[i] == ShapedType::kDynamic) {
-                    dimSizeVal = rewriter.create<tensor::DimOp>(op.getLoc(), inputTensor, i);
-                } else {
-                    dimSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), shape[i]);
-                }
-                
-                Value splitNumVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), splitNum);
-                Value splitSize = rewriter.create<arith::DivUIOp>(op.getLoc(), dimSizeVal, splitNumVal);
-                Value offset = rewriter.create<arith::MulIOp>(op.getLoc(), indexVal, splitSize);
-                
-                offsets.push_back(offset);
-                sizes.push_back(splitSize);
-            } else {
-                offsets.push_back(rewriter.getIndexAttr(0));
-                if (shape[i] == ShapedType::kDynamic) {
-                     Value dimSizeVal = rewriter.create<tensor::DimOp>(op.getLoc(), inputTensor, i);
-                     sizes.push_back(dimSizeVal);
-                } else {
-                    sizes.push_back(rewriter.getIndexAttr(shape[i]));
-                }
-            }
-            strides.push_back(rewriter.getIndexAttr(1));
+        SmallVector<OpFoldResult> offsets(2);
+        SmallVector<OpFoldResult> sizes(2);
+        SmallVector<OpFoldResult> strides(2, rewriter.getIndexAttr(1));
+
+        Value sliceSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), sliceSize);
+        Value offsetVal = rewriter.create<arith::MulIOp>(op.getLoc(), indexVal, sliceSizeVal);
+
+        if (splitDim == 0) {
+            offsets[0] = offsetVal;
+            offsets[1] = rewriter.getIndexAttr(0);
+            sizes[0] = rewriter.getIndexAttr(sliceDim0);
+            sizes[1] = rewriter.getIndexAttr(sliceDim1);
+        } else {
+            offsets[0] = rewriter.getIndexAttr(0);
+            offsets[1] = offsetVal;
+            sizes[0] = rewriter.getIndexAttr(sliceDim0);
+            sizes[1] = rewriter.getIndexAttr(sliceDim1);
         }
 
         auto extractSlice = rewriter.create<tensor::ExtractSliceOp>(
             op.getLoc(),
+            resultType,
             inputTensor,
             offsets,
             sizes,
