@@ -462,66 +462,30 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         // Get unique sequential ID for naming (moved up to use in slice names)
         int opId = g_pullPushCounter.fetch_add(1);
         
-        // 1. Create data slices for consumer buffers and collect slice symbol names
+        // Create schedule.data_slice ops to wrap the existing consumer buffers (already tensors)
         SmallVector<Attribute> sliceSymbols;
-        int64_t cumulativeOffset = 0;
         for (size_t i = 0; i < consumerBuffers.size(); ++i) {
             auto buffer = consumerBuffers[i];
             auto tensorType = dyn_cast<RankedTensorType>(buffer.getType());
             if (!tensorType) {
-                 // Try MemRef for backward compatibility or mixed cases
-                 if (auto memrefType = dyn_cast<MemRefType>(buffer.getType())) {
-                      SmallVector<int64_t> shapeVec(memrefType.getShape().begin(), memrefType.getShape().end());
-                      tensorType = RankedTensorType::get(shapeVec, memrefType.getElementType());
-                 }
+                // Try MemRef for backward compatibility
+                if (auto memrefType = dyn_cast<MemRefType>(buffer.getType())) {
+                    SmallVector<int64_t> shapeVec(memrefType.getShape().begin(), memrefType.getShape().end());
+                    tensorType = RankedTensorType::get(shapeVec, memrefType.getElementType());
+                }
             }
-
             if (!tensorType) continue;
 
-            auto sliceShape = tensorType.getShape();
-            SmallVector<int64_t> sizeVec;
-            SmallVector<int64_t> strideVec;
-            
-            for (int64_t dim : sliceShape) {
-                sizeVec.push_back(dim);
-            }
-
-            int64_t currentStride = 1;
-            for (int j = sliceShape.size() - 1; j >= 0; --j) {
-                strideVec.insert(strideVec.begin(), currentStride);
-                int64_t dimSize = (sliceShape[j] == ShapedType::kDynamic ? 1024 : sliceShape[j]);
-                currentStride *= dimSize;
-            }
-
-            SmallVector<int64_t> offsetVec;
-            offsetVec.push_back(cumulativeOffset);
-            for (size_t j = 1; j < sliceShape.size(); ++j) {
-                offsetVec.push_back(0);
-            }
-
-            // SliceAttr expects TypeAttr. 
-            // If DataSliceOp expects Tensor type now (which it should if we are consistent), pass tensorType.
-            auto sliceAttr = dfscheblueprint::SliceAttr::get(
-                getContext(),
-                TypeAttr::get(tensorType),
-                rewriter.getI64ArrayAttr(offsetVec),
-                rewriter.getI64ArrayAttr(sizeVec),
-                rewriter.getI64ArrayAttr(strideVec)
-            );
-
-            // Include opId in slice name to make it unique
             std::string sliceName = "consumer_slice_" + std::to_string(opId) + "_" + std::to_string(i);
             rewriter.create<dfscheblueprint::DataSliceOp>(
                 op.getLoc(),
+                tensorType, // Result type
                 rewriter.getStringAttr(sliceName),
-                viewSplit,
-                sliceAttr
+                buffer // Reuse existing consumer buffer tensor
             );
             
             // Collect slice symbol reference for bind_group
             sliceSymbols.push_back(FlatSymbolRefAttr::get(getContext(), sliceName));
-
-            cumulativeOffset += sliceShape[0]; 
         }
 
         // 2. Get path and extract source/destination from producers/consumers attributes
@@ -697,64 +661,30 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         // Get unique sequential ID for naming (moved up to use in slice names)
         int opId = g_pullPushCounter.fetch_add(1);
         
-        // 1. Create data slices for producer buffers and collect slice symbol names
+        // Create schedule.data_slice ops to wrap the existing producer buffers (already tensors)
         SmallVector<Attribute> sliceSymbols;
-        int64_t cumulativeOffset = 0;
         for (size_t i = 0; i < producerBuffers.size(); ++i) {
             auto buffer = producerBuffers[i];
             auto tensorType = dyn_cast<RankedTensorType>(buffer.getType());
             if (!tensorType) {
-                 // Try MemRef for backward compatibility or mixed cases
-                 if (auto memrefType = dyn_cast<MemRefType>(buffer.getType())) {
-                      SmallVector<int64_t> shapeVec(memrefType.getShape().begin(), memrefType.getShape().end());
-                      tensorType = RankedTensorType::get(shapeVec, memrefType.getElementType());
-                 }
+                // Try MemRef for backward compatibility
+                if (auto memrefType = dyn_cast<MemRefType>(buffer.getType())) {
+                    SmallVector<int64_t> shapeVec(memrefType.getShape().begin(), memrefType.getShape().end());
+                    tensorType = RankedTensorType::get(shapeVec, memrefType.getElementType());
+                }
             }
             if (!tensorType) continue;
 
-            auto sliceShape = tensorType.getShape();
-            SmallVector<int64_t> sizeVec;
-            SmallVector<int64_t> strideVec;
-            
-            for (int64_t dim : sliceShape) {
-                sizeVec.push_back(dim);
-            }
-
-            int64_t currentStride = 1;
-            for (int j = sliceShape.size() - 1; j >= 0; --j) {
-                strideVec.insert(strideVec.begin(), currentStride);
-                int64_t dimSize = (sliceShape[j] == ShapedType::kDynamic ? 1024 : sliceShape[j]);
-                currentStride *= dimSize;
-            }
-
-            SmallVector<int64_t> offsetVec;
-            offsetVec.push_back(cumulativeOffset);
-            for (size_t j = 1; j < sliceShape.size(); ++j) {
-                offsetVec.push_back(0);
-            }
-
-            // SliceAttr expects TypeAttr.
-            auto sliceAttr = dfscheblueprint::SliceAttr::get(
-                getContext(),
-                TypeAttr::get(tensorType),
-                rewriter.getI64ArrayAttr(offsetVec),
-                rewriter.getI64ArrayAttr(sizeVec),
-                rewriter.getI64ArrayAttr(strideVec)
-            );
-
-            // Include opId in slice name to make it unique
             std::string sliceName = "producer_slice_" + std::to_string(opId) + "_" + std::to_string(i);
             rewriter.create<dfscheblueprint::DataSliceOp>(
                 op.getLoc(),
+                tensorType, // Result type
                 rewriter.getStringAttr(sliceName),
-                viewSplit,
-                sliceAttr
+                buffer // Reuse existing producer buffer tensor
             );
             
             // Collect slice symbol reference for bind_group
             sliceSymbols.push_back(FlatSymbolRefAttr::get(getContext(), sliceName));
-
-            cumulativeOffset += sliceShape[0]; 
         }
 
         // 2. Get path and extract source/destination from producers/consumers attributes

@@ -159,27 +159,26 @@ def dfscheblueprint_ExtractOp : dfscheblueprintop<"extract", [
   let assemblyFormat = "$view `:` type($view) `{` `index` `=` $index `}` attr-dict";
 }
 
-// schedule.data_slice
+// schedule.data_slice - wraps a tensor slice with a symbol name
 def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
     Symbol
   ]> {
-  let summary = "Defines a named slice of a data view";
+  let summary = "Wraps a tensor slice with a symbol name for scheduling";
   let description = [{
-    Defines a named slice of a tensor view for scheduling purposes.
+    Wraps a tensor (typically from tensor.extract_slice) with a symbol name
+    for scheduling and binding purposes.
     
     Example:
     ```mlir
-    schedule.data_slice @out_slice_0 {
-      view = %view_strip,
-      slice = #schedule.Slice<data_type = tensor<4x256xf32>, offset = [0, 0], size = [4, 256], stride = [256, 1]>
-    }
+    %slice = tensor.extract_slice %tensor[0, 0] [4, 256] [1, 1] : tensor<16x256xf32> to tensor<4x256xf32>
+    %wrapped = schedule.data_slice @out_slice_0 wrap %slice : tensor<4x256xf32>
     ```
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
-    AnyTensor:$view,
-    dfscheblueprint_SliceAttr:$slice_params
+    AnyTensor:$tensor_slice
   );
+  let results = (outs AnyTensor:$result);
   let hasCustomAssemblyFormat = 1;
 }
 

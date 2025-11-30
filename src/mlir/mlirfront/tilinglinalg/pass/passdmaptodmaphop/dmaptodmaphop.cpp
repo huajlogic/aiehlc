@@ -408,6 +408,11 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
             sizes, 
             strides
         );
+        
+        std::string tagName = (direction == DataflowDirection::Push) ? "consumer" : "producer";
+        tagName += std::to_string(i);
+        slice->setAttr("tag", rewriter.getStringAttr(tagName));
+        
         coreBuffers.push_back(slice.getResult());
     }
 

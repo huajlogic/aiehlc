@@ -119,59 +119,34 @@ ParseResult dfscheblueprint::TransferManifestOp::parse(OpAsmParser &parser, Oper
 }
 
 // DataSliceOp printer
+// Format: %result = schedule.data_slice @sym_name wrap %tensor_slice : tensor_type
 void dfscheblueprint::DataSliceOp::print(OpAsmPrinter &printer) {
-    printer << " @" << getSymName() << " {";
-    printer.increaseIndent();
-    printer.printNewline();
-    printer << "view = " << getView() << " : " << getView().getType() << ",";
-    printer.printNewline();
-    printer << "slice = " << getSliceParams();
-    printer.decreaseIndent(); // <--- Reduce the indentation level state FIRST
-    printer.printNewline();   //
-    printer << "}";
-    printer.printOptionalAttrDict(getOperation()->getAttrs(), /*elidedAttrs=*/{"sym_name", "view", "slice_params"});
+    printer << " @" << getSymName() << " wrap ";
+    printer << getTensorSlice() << " : " << getTensorSlice().getType();
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), /*elidedAttrs=*/{"sym_name"});
 }
 
 // DataSliceOp parser
+// Format: %result = schedule.data_slice @sym_name wrap %tensor_slice : tensor_type
 ParseResult dfscheblueprint::DataSliceOp::parse(OpAsmParser &parser, OperationState &result) {
     StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return failure();
     
-    if (parser.parseLBrace())
+    if (parser.parseKeyword("wrap"))
         return failure();
     
-    OpAsmParser::UnresolvedOperand viewOperand;
-    Type viewType;
-    dfscheblueprint::SliceAttr sliceParams;
-    
-    while (true) {
-        StringRef attrName;
-        if (parser.parseOptionalKeyword(&attrName)) {
-            break;
-        }
-        
-        if (parser.parseEqual())
-            return failure();
-        
-        if (attrName == "view") {
-            if (parser.parseOperand(viewOperand) || parser.parseColonType(viewType))
-                return failure();
-        } else if (attrName == "slice") {
-            if (parser.parseAttribute(sliceParams))
-                return failure();
-        }
-        
-        parser.parseOptionalComma();
-    }
-    
-    if (parser.parseRBrace())
+    OpAsmParser::UnresolvedOperand tensorOperand;
+    Type tensorType;
+    if (parser.parseOperand(tensorOperand) || parser.parseColonType(tensorType))
         return failure();
     
-    if (parser.resolveOperand(viewOperand, viewType, result.operands))
+    if (parser.resolveOperand(tensorOperand, tensorType, result.operands))
         return failure();
-        
-    result.addAttribute("slice_params", sliceParams);
+    
+    // Set the result type to match the input tensor type
+    result.addTypes(tensorType);
+    
     parser.parseOptionalAttrDict(result.attributes);
     
     return success();
@@ -551,27 +526,48 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     //);
     //auto extractedView = extractOp.getResult();
 
-    // Create 4 DataSliceOps for output (4x256 each) using tensor types
-    auto subSliceType = mlir::TypeAttr::get(mlir::RankedTensorType::get({4, 256}, builder.getF32Type()));
-    auto subSliceSize = builder.getArrayAttr({builder.getI64IntegerAttr(4), builder.getI64IntegerAttr(256)});
-    auto subSliceStride = builder.getArrayAttr({builder.getI64IntegerAttr(256), builder.getI64IntegerAttr(1)});
+    // First: Create all 4 tensor.extract_slice ops as a group
+    // Each slice is 64x1024 from the 256x1024 view (viewSplit)
+    llvm::SmallVector<mlir::Value, 4> tensorSlices;
+    for (int i = 0; i < 4; ++i) {
+        // Offset: [i * 64, 0], Size: [64, 1024], Stride: [1, 1]
+        SmallVector<OpFoldResult> sliceOffsets = {
+            builder.getIndexAttr(i * 64),
+            builder.getIndexAttr(0)
+        };
+        SmallVector<OpFoldResult> sliceSizes = {
+            builder.getIndexAttr(64),
+            builder.getIndexAttr(1024)
+        };
+        SmallVector<OpFoldResult> sliceStrides = {
+            builder.getIndexAttr(1),
+            builder.getIndexAttr(1)
+        };
+        
+        auto tensorSlice = builder.create<tensor::ExtractSliceOp>(
+            location,
+            viewSplit,
+            sliceOffsets,
+            sliceSizes,
+            sliceStrides
+        );
+        tensorSlices.push_back(tensorSlice.getResult());
+    }
     
+    // Second: Create all 4 schedule.data_slice ops as a group to wrap the tensor slices
     llvm::SmallVector<mlir::Attribute, 4> outSliceSymbols;
+    llvm::SmallVector<mlir::Value, 4> dataSliceResults;
     for (int i = 0; i < 4; ++i) {
         std::string sliceName = "out_slice_" + std::to_string(i);
-        auto sliceOffset = builder.getArrayAttr({
-            builder.getI64IntegerAttr(i * 4), // Offset row by 4 each time
-            builder.getI64IntegerAttr(0)
-        });
-        auto sliceAttr = dfscheblueprint::SliceAttr::get(ctx, subSliceType, sliceOffset, subSliceSize, subSliceStride);
-        
-        builder.create<dfscheblueprint::DataSliceOp>(
+        auto dataSliceOp = builder.create<dfscheblueprint::DataSliceOp>(
             location,
+            tensorSlices[i].getType(), // Result type matches input tensor type
             builder.getStringAttr(sliceName),
-            viewSplit,
-            sliceAttr
+            tensorSlices[i]
         );
+        
         outSliceSymbols.push_back(mlir::SymbolRefAttr::get(ctx, sliceName));
+        dataSliceResults.push_back(dataSliceOp.getResult());
     }
 
     // Bind Shim TX
