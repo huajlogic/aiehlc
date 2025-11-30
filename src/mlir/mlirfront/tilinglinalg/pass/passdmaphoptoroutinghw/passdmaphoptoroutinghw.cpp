@@ -6,6 +6,7 @@
 #include "passdmaphoptoroutinghw.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -873,23 +874,6 @@ struct EraseOpPattern : public OpConversionPattern<OpType> {
     }
 };
 
-// Pattern to erase routing::extract_data and its users
-struct ExtractDataErasePattern : public OpConversionPattern<routing::extract_data> {
-    using OpConversionPattern<routing::extract_data>::OpConversionPattern;
-    
-    LogicalResult matchAndRewrite(routing::extract_data op, OpAdaptor adaptor,
-                                  ConversionPatternRewriter &rewriter) const override {
-        // 1. Erase all reference ops (users)
-        // We use make_early_inc_range to safely iterate while erasing
-        for (auto user : llvm::make_early_inc_range(op.getResult().getUsers())) {
-            rewriter.eraseOp(user);
-        }
-        // 2. Erase itself
-        rewriter.eraseOp(op);
-        return success();
-    }
-};
-
 } // namespace
 
 void DmaphopToRoutinghwPass::runOnOperation() {
@@ -910,6 +894,8 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     target.addIllegalOp<routing::extract_data>();
     target.addIllegalOp<routing::createscheduletensor>();
     target.addIllegalOp<routing::partitiontensor>();
+    // Mark tensor::ExtractSliceOp as illegal so it gets erased
+    target.addIllegalOp<tensor::ExtractSliceOp>();
     
     // Explicitly mark all other routing and SCF operations as legal to preserve them
     target.addDynamicallyLegalDialect<routing::routingdialect>(
@@ -932,9 +918,10 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     patterns.add<EraseOpPattern<dmaphop::push>>(&ctx);
     patterns.add<EraseOpPattern<dmaphop::pull>>(&ctx);
     patterns.add<EraseOpPattern<dmaphop::sync>>(&ctx);
-    patterns.add<ExtractDataErasePattern>(&ctx);  // Erase routing::extract_data and its users
+    patterns.add<EraseOpPattern<routing::extract_data>>(&ctx);
+    patterns.add<EraseOpPattern<tensor::ExtractSliceOp>>(&ctx);
     patterns.add<EraseOpPattern<routing::createscheduletensor>>(&ctx);
-    patterns.add<EraseOpPattern<routing::partitiontensor>>(&ctx);  // Erase routing::partitiontensor
+    patterns.add<EraseOpPattern<routing::partitiontensor>>(&ctx);
 
     /*
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));
