@@ -278,32 +278,20 @@ struct ConfigOpConversion : public OpConversionPattern<dfscheblueprint::ConfigOp
     }
 };
 
-// Pattern to erase dfscheblueprint::ResourceGroupOp (handled by ConfigOp conversion)
-struct ResourceGroupOpConversion : public OpConversionPattern<dfscheblueprint::ResourceGroupOp> {
-    using OpConversionPattern<dfscheblueprint::ResourceGroupOp>::OpConversionPattern;
+// Unified template pattern to erase dfscheblueprint operations
+template <typename OpTy>
+struct EraseOpPattern : public OpConversionPattern<OpTy> {
+    using OpConversionPattern<OpTy>::OpConversionPattern;
 
     LogicalResult
-    matchAndRewrite(dfscheblueprint::ResourceGroupOp op, OpAdaptor adaptor,
-                    ConversionPatternRewriter &rewriter) const override {
-        // ResourceGroupOp is handled as part of ConfigOp conversion
-        rewriter.eraseOp(op);
-        return success();
-    }
-};
-
-// Pattern to erase dfscheblueprint::DeclareDataOp (handled by ConfigOp conversion)
-struct DeclareDataOpConversion : public OpConversionPattern<dfscheblueprint::DeclareDataOp> {
-    using OpConversionPattern<dfscheblueprint::DeclareDataOp>::OpConversionPattern;
-
-    LogicalResult
-    matchAndRewrite(dfscheblueprint::DeclareDataOp op, OpAdaptor adaptor,
+    matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
                     ConversionPatternRewriter &rewriter) const override {
         rewriter.eraseOp(op);
         return success();
     }
 };
 
-// Pattern to erase dfscheblueprint::DataSliceOp
+// Special pattern for DataSliceOp - replaces with input tensor instead of erasing
 struct DataSliceOpConversion : public OpConversionPattern<dfscheblueprint::DataSliceOp> {
     using OpConversionPattern<dfscheblueprint::DataSliceOp>::OpConversionPattern;
 
@@ -312,54 +300,6 @@ struct DataSliceOpConversion : public OpConversionPattern<dfscheblueprint::DataS
                     ConversionPatternRewriter &rewriter) const override {
         // DataSliceOp is used for symbol references, replace with the input tensor
         rewriter.replaceOp(op, adaptor.getTensorSlice());
-        return success();
-    }
-};
-
-// Pattern to erase dfscheblueprint::BindOp
-struct BindOpConversion : public OpConversionPattern<dfscheblueprint::BindOp> {
-    using OpConversionPattern<dfscheblueprint::BindOp>::OpConversionPattern;
-
-    LogicalResult
-    matchAndRewrite(dfscheblueprint::BindOp op, OpAdaptor adaptor,
-                    ConversionPatternRewriter &rewriter) const override {
-        rewriter.eraseOp(op);
-        return success();
-    }
-};
-
-// Pattern to erase dfscheblueprint::BindGroupOp
-struct BindGroupOpConversion : public OpConversionPattern<dfscheblueprint::BindGroupOp> {
-    using OpConversionPattern<dfscheblueprint::BindGroupOp>::OpConversionPattern;
-
-    LogicalResult
-    matchAndRewrite(dfscheblueprint::BindGroupOp op, OpAdaptor adaptor,
-                    ConversionPatternRewriter &rewriter) const override {
-        rewriter.eraseOp(op);
-        return success();
-    }
-};
-
-// Pattern to erase dfscheblueprint::CollectiveTransferOp
-struct CollectiveTransferOpConversion : public OpConversionPattern<dfscheblueprint::CollectiveTransferOp> {
-    using OpConversionPattern<dfscheblueprint::CollectiveTransferOp>::OpConversionPattern;
-
-    LogicalResult
-    matchAndRewrite(dfscheblueprint::CollectiveTransferOp op, OpAdaptor adaptor,
-                    ConversionPatternRewriter &rewriter) const override {
-        rewriter.eraseOp(op);
-        return success();
-    }
-};
-
-// Pattern to erase dfscheblueprint::TransferManifestOp
-struct TransferManifestOpConversion : public OpConversionPattern<dfscheblueprint::TransferManifestOp> {
-    using OpConversionPattern<dfscheblueprint::TransferManifestOp>::OpConversionPattern;
-
-    LogicalResult
-    matchAndRewrite(dfscheblueprint::TransferManifestOp op, OpAdaptor adaptor,
-                    ConversionPatternRewriter &rewriter) const override {
-        rewriter.eraseOp(op);
         return success();
     }
 };
@@ -395,13 +335,14 @@ void BlueprintToSchedulePass::runOnOperation() {
     
     RewritePatternSet patterns(context);
     patterns.add<ConfigOpConversion>(context);
-    patterns.add<ResourceGroupOpConversion>(context);
-    patterns.add<DeclareDataOpConversion>(context);
     patterns.add<DataSliceOpConversion>(context);
-    patterns.add<BindOpConversion>(context);
-    patterns.add<BindGroupOpConversion>(context);
-    patterns.add<CollectiveTransferOpConversion>(context);
-    patterns.add<TransferManifestOpConversion>(context);
+    // Use unified erase pattern for ops that just need to be removed
+    patterns.add<EraseOpPattern<dfscheblueprint::ResourceGroupOp>>(context);
+    patterns.add<EraseOpPattern<dfscheblueprint::DeclareDataOp>>(context);
+    patterns.add<EraseOpPattern<dfscheblueprint::BindOp>>(context);
+    patterns.add<EraseOpPattern<dfscheblueprint::BindGroupOp>>(context);
+    patterns.add<EraseOpPattern<dfscheblueprint::CollectiveTransferOp>>(context);
+    patterns.add<EraseOpPattern<dfscheblueprint::TransferManifestOp>>(context);
     
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();
