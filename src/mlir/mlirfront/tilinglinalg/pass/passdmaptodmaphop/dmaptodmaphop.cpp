@@ -344,7 +344,7 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     // Determine split dimension based on core group axis
     // If axis is "row", tiles are arranged horizontally (varying columns), so we split the column dimension (1)
     // If axis is "col", tiles are arranged vertically (varying rows), so we split the row dimension (0)
-    int splitDim = (coreGroup.getGroupAxis() == "row") ? 0 : 1;
+    int splitDim = (coreGroup.getGroupAxis() == "row") ? 0 : 1;//axis is col 
     
     // Check if we can split along the dimension that matches core count
     // or just split the first dimension
@@ -370,52 +370,60 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         }
     }
     // Calculate slice size and offsets for each tile
-    for (size_t i = 0; i < coreTiles.size(); ++i) {
-        for (int64_t d = 0; d < rank; ++d) {
-            if (d == splitDim) {
-                // Sliced dimension - Static calculation
-                int64_t dimSize = shape[d];
-                // Assuming static shape for now as requested
-                int64_t sliceSize = dimSize / numTiles;
-                int64_t offset = i * sliceSize;
+    if (direction == DataflowDirection::Pull) {
+        for (size_t i = 0; i < coreTiles.size(); ++i) {
+            for (int64_t d = 0; d < rank; ++d) {
+                if (d == splitDim) {
+                    // Sliced dimension - Static calculation
+                    int64_t dimSize = shape[d];
+                    // Assuming static shape for now as requested
+                    int64_t sliceSize = dimSize / numTiles;
+                    int64_t offset = i * sliceSize;
 
-                offsets[d] = rewriter.getIndexAttr(offset);
-                sizes[d] = rewriter.getIndexAttr(sliceSize);
-            } else {
-                // Non-sliced dimension: full size, offset 0
-                offsets[d] = rewriter.getIndexAttr(0);
-                sizes[d] = rewriter.getIndexAttr(shape[d]);
+                    offsets[d] = rewriter.getIndexAttr(offset);
+                    sizes[d] = rewriter.getIndexAttr(sliceSize);
+                } else {
+                    // Non-sliced dimension: full size, offset 0
+                    offsets[d] = rewriter.getIndexAttr(0);
+                    sizes[d] = rewriter.getIndexAttr(shape[d]);
+                }
             }
-        }
-        
-        // Calculate result type for this slice
-        SmallVector<int64_t> sliceShape;
-        for (int64_t d = 0; d < rank; ++d) {
-            if (d == splitDim) {
-                if (shape[d] == ShapedType::kDynamic)
-                    sliceShape.push_back(ShapedType::kDynamic);
-                else
-                    sliceShape.push_back(shape[d] / numTiles);
-            } else {
-                sliceShape.push_back(shape[d]);
+            
+            // Calculate result type for this slice
+            SmallVector<int64_t> sliceShape;
+            for (int64_t d = 0; d < rank; ++d) {
+                if (d == splitDim) {
+                    if (shape[d] == ShapedType::kDynamic)
+                        sliceShape.push_back(ShapedType::kDynamic);
+                    else
+                        sliceShape.push_back(shape[d] / numTiles);
+                } else {
+                    sliceShape.push_back(shape[d]);
+                }
             }
+            auto sliceType = RankedTensorType::get(sliceShape, rankedType.getElementType());
+            
+            auto slice = rewriter.create<tensor::ExtractSliceOp>(
+                loc, 
+                sliceType,
+                dataId, 
+                offsets, 
+                sizes, 
+                strides
+            );
+            
+            std::string tagName = (direction == DataflowDirection::Push) ? "consumer" : "producer";
+            tagName += std::to_string(i);
+            slice->setAttr("tag", rewriter.getStringAttr(tagName));
+            
+            coreBuffers.push_back(slice.getResult());
         }
-        auto sliceType = RankedTensorType::get(sliceShape, rankedType.getElementType());
-        
-        auto slice = rewriter.create<tensor::ExtractSliceOp>(
-            loc, 
-            sliceType,
-            dataId, 
-            offsets, 
-            sizes, 
-            strides
-        );
-        
-        std::string tagName = (direction == DataflowDirection::Push) ? "consumer" : "producer";
-        tagName += std::to_string(i);
-        slice->setAttr("tag", rewriter.getStringAttr(tagName));
-        
-        coreBuffers.push_back(slice.getResult());
+    } else {
+        // Push direction: use routing::extract_data for each tile
+        // This will later be converted to tensor.extract_slice with "partitionslice" tag
+        for (size_t i = 0; i < coreTiles.size(); ++i) {
+            coreBuffers.push_back(dataId);
+        }
     }
 
     if (direction == DataflowDirection::Push) {
