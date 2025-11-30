@@ -13,6 +13,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/Matchers.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include <iostream>
@@ -376,67 +377,108 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
             return op.emitError("ExtractDataConversion: input and result must be ranked tensors");
         }
         
-        // Get partition info from the original tensor's defining op (partitiontensor)
-        int64_t splitDim = 0;  // Default: split along row (dim 0)
-        int64_t splitNum = 1;  // Default: no split
-        
-        // Try to get partition info from the original (unconverted) tensor
-        if (auto partitionOp = dyn_cast_or_null<routing::partitiontensor>(op.getTensor().getDefiningOp())) {
-            splitDim = partitionOp.getSplitdim();
-            splitNum = partitionOp.getSplitnum();
-        }
-        
         auto inputShape = inputType.getShape();
         auto resultShape = resultType.getShape();
         
         if (inputShape.size() != 2 || resultShape.size() != 2) {
             return op.emitError("ExtractDataConversion: tensors must be 2D");
         }
-        
-        // Calculate slice size based on splitDim
-        int64_t sliceSize;
-        if (splitDim == 0) {
-            sliceSize = inputShape[0] / splitNum;  // Row split
-        } else {
-            sliceSize = inputShape[1] / splitNum;  // Col split
+
+        int64_t splitDim = 0;
+        int64_t sliceSize = 0;
+        bool partitionFound = false;
+
+        // 1. Try to get partition info
+        if (auto partitionOp = dyn_cast_or_null<routing::partitiontensor>(op.getTensor().getDefiningOp())) {
+            splitDim = partitionOp.getSplitdim();
+            int64_t splitNum = partitionOp.getSplitnum();
+            if (splitNum > 0) {
+                 if (splitDim == 0) sliceSize = inputShape[0] / splitNum;
+                 else sliceSize = inputShape[1] / splitNum;
+            }
+            partitionFound = true;
         }
-        
-        // Get the index value and try to extract constant for tag naming
-        Value indexVal = adaptor.getIdx();
+
+        // 2. Infer/Override from result shape (Crucial for validity)
+        if (resultShape[0] != inputShape[0]) {
+             splitDim = 0;
+             sliceSize = resultShape[0];
+        } else if (resultShape[1] != inputShape[1]) {
+             splitDim = 1;
+             sliceSize = resultShape[1];
+        } else if (!partitionFound) {
+             // Identity default
+             splitDim = 0;
+             sliceSize = inputShape[0];
+        }
+
+        // 3. Constant Index Analysis
+        Value indexValRaw = op.getIdx();
         int64_t constIndex = -1;  // Default: unknown index
+        bool isConstIndex = false;
         
-        // Try to get constant index from the original op's idx
-        if (auto constOp = dyn_cast_or_null<arith::ConstantOp>(op.getIdx().getDefiningOp())) {
+        // 1. Try to get constant index from the original op's idx (direct constant)
+        if (auto constOp = dyn_cast_or_null<arith::ConstantOp>(indexValRaw.getDefiningOp())) {
             if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
                 constIndex = intAttr.getInt();
+                isConstIndex = true;
             }
         }
         
-        if (!indexVal.getType().isIndex()) {
-            indexVal = rewriter.create<arith::IndexCastOp>(op.getLoc(), rewriter.getIndexType(), indexVal);
+        // 2. Try to trace back to RoutingCreate block argument
+        if (!isConstIndex) {
+             if (auto barg = dyn_cast<BlockArgument>(indexValRaw)) {
+                Operation *parentOp = barg.getOwner()->getParentOp();
+                if (auto create = dyn_cast<routing::RoutingCreate>(parentOp)) {
+                    unsigned idx = barg.getArgNumber();
+                    Value incoming = create->getOperand(idx);
+                    IntegerAttr intAttr;
+                    if (matchPattern(incoming, m_Constant(&intAttr))) {
+                        constIndex = intAttr.getInt();
+                        isConstIndex = true;
+                    }
+                }
+            }
         }
         
-        // Calculate offset: offset = idx * sliceSize
-        Value sliceSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), sliceSize);
-        Value offsetVal = rewriter.create<arith::MulIOp>(op.getLoc(), indexVal, sliceSizeVal);
-        
-        // Build offsets, sizes, strides for tensor.extract_slice
+        // 4. Build ExtractSlice operands
         SmallVector<OpFoldResult> offsets(2);
         SmallVector<OpFoldResult> sizes(2);
         SmallVector<OpFoldResult> strides(2, rewriter.getIndexAttr(1));
         
-        if (splitDim == 0) {
-            // Split along row (dim 0): offset on dim 0, full size on dim 1
-            offsets[0] = offsetVal;
-            offsets[1] = rewriter.getIndexAttr(0);
-            sizes[0] = rewriter.getIndexAttr(resultShape[0]);
-            sizes[1] = rewriter.getIndexAttr(resultShape[1]);
+        // Always use resultShape for sizes to ensure type match
+        sizes[0] = rewriter.getIndexAttr(resultShape[0]);
+        sizes[1] = rewriter.getIndexAttr(resultShape[1]);
+        
+        if (isConstIndex) {
+             // Static offset calculation
+             int64_t offset = constIndex * sliceSize;
+             Attribute offsetAttr = rewriter.getIndexAttr(offset);
+             
+             if (splitDim == 0) {
+                 offsets[0] = offsetAttr;
+                 offsets[1] = rewriter.getIndexAttr(0);
+             } else {
+                 offsets[0] = rewriter.getIndexAttr(0);
+                 offsets[1] = offsetAttr;
+             }
         } else {
-            // Split along col (dim 1): full size on dim 0, offset on dim 1
-            offsets[0] = rewriter.getIndexAttr(0);
-            offsets[1] = offsetVal;
-            sizes[0] = rewriter.getIndexAttr(resultShape[0]);
-            sizes[1] = rewriter.getIndexAttr(resultShape[1]);
+             // Dynamic calculation using arith ops
+             Value indexVal = adaptor.getIdx(); 
+             if (!indexVal.getType().isIndex()) {
+                 indexVal = rewriter.create<arith::IndexCastOp>(op.getLoc(), rewriter.getIndexType(), indexVal);
+             }
+             
+             Value sliceSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), sliceSize);
+             Value offsetVal = rewriter.create<arith::MulIOp>(op.getLoc(), indexVal, sliceSizeVal);
+             
+             if (splitDim == 0) {
+                 offsets[0] = offsetVal;
+                 offsets[1] = rewriter.getIndexAttr(0);
+             } else {
+                 offsets[0] = rewriter.getIndexAttr(0);
+                 offsets[1] = offsetVal;
+             }
         }
         
         // Create tensor.extract_slice with "partitionsliceN" tag
