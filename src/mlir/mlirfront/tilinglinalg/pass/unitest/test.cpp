@@ -10,7 +10,7 @@
 #include "../passroutingtodmap/routingtodmap.h"
 #include "../passdmaptodmaphop/dmaptodmaphop.h"
 #include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
-#include "../passdmaphoptodfschedule/passdmaphoptodfschedule.h"
+#include "../passblueprinttoschedule/passblueprinttoschedule.h"
 #include "../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.h"
 #include "dmapmanager.h"
 #include "dmaphopmanager.h"

@@ -8,9 +8,9 @@
 
 #include "mlir/Pass/Pass.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "dmaphopmanager.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "dfscheblueprintmanager.h"
 #include "dfschedulemanager.h"
-#include "routingmanager.h"
 
 namespace mlir {
 
@@ -20,21 +20,21 @@ public:
     //MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BlueprintToSchedulePass)
 
     StringRef getArgument() const final { return "lower-blueprint-to-schedule"; }
-    StringRef getDescription() const final { return "Lower blueprint dialect to schedule dialect"; }
+    StringRef getDescription() const final { return "Lower dfscheblueprint dialect to dfschedule dialect"; }
 
     void runOnOperation() override;
 
     void getDependentDialects(DialectRegistry &registry) const override {
-        registry.insert<dmaphop::dmaphopdialect, 
+        registry.insert<dfscheblueprint::dfscheblueprintdialect,
                         dfschedule::dfscheduledialect, 
                         func::FuncDialect, 
                         memref::MemRefDialect,
                         arith::ArithDialect,
-                        scf::SCFDialect>();
+                        scf::SCFDialect,
+                        tensor::TensorDialect>();
     }
 };
 
 } // namespace mlir
 
 #endif // __BLUEPRINT_TOSCHEDULE_PASS_H__
-
