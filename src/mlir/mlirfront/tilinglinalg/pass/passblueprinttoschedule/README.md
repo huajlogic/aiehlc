@@ -1,11 +1,11 @@
-# Pass: DmaphopTodfschedulePass
+# Pass: BlueprintToSchedulePass
 
 ## Overview
 This pass converts `routing.RoutingCreate` operations containing `dmaphop` dialect operations into `dfschedule` dialect operations for AIE dataflow scheduling.
 
 ## Location
-- Header: `src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptodfschedule/passdmaphoptodfschedule.h`
-- Implementation: `src/mlir/mlirfront/tilinglinalg/pass/passdmaphoptodfschedule/passdmaphoptodfschedule.cpp`
+- Header: `src/mlir/mlirfront/tilinglinalg/pass/passblueprinttoschedule/passblueprinttoschedule.h`
+- Implementation: `src/mlir/mlirfront/tilinglinalg/pass/passblueprinttoschedule/passblueprinttoschedule.cpp`
 
 ## Purpose
 Transforms physical dataflow operations (dmaphop) into kernel-side scheduling operations (dfschedule) that implement ping-pong buffering for efficient data streaming on AIE tiles.
@@ -69,7 +69,7 @@ module {
 To use this pass in the build system, add to `src/mlir/mlirfront/CMakeLists.txt`:
 
 ```cmake
-list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdmaphoptodfschedule/passdmaphoptodfschedule.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passblueprinttoschedule/passblueprinttoschedule.cpp)
 ```
 
 And include necessary dialect directories:
@@ -80,8 +80,8 @@ include_directories(./tilinglinalg/dataflowmap/dfschedule/)
 
 ## Pass Registration
 ```cpp
-StringRef getArgument() const final { return "lower-dmaphop-to-dfschedule"; }
-StringRef getDescription() const final { return "Lower dmaphop dialect to dfschedule dialect"; }
+StringRef getArgument() const final { return "lower-blueprint-to-schedule"; }
+StringRef getDescription() const final { return "Lower blueprint dialect to schedule dialect"; }
 ```
 
 ## Dependencies
@@ -93,7 +93,7 @@ StringRef getDescription() const final { return "Lower dmaphop dialect to dfsche
 ## Usage Example
 ```bash
 # Apply pass during compilation pipeline
-mlir-opt --lower-dmaphop-to-dfschedule input.mlir -o output.mlir
+mlir-opt --lower-blueprint-to-schedule input.mlir -o output.mlir
 ```
 
 ## Notes
@@ -101,3 +101,4 @@ mlir-opt --lower-dmaphop-to-dfschedule input.mlir -o output.mlir
 - Ping-pong selection based on even/odd iteration parity
 - DMA and compute threads run in parallel using separate lock synchronization
 - Buffer size defaults to 256xf32 (configurable if needed)
+

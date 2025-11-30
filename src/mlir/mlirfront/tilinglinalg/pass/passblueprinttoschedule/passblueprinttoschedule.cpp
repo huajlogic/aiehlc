@@ -3,7 +3,7 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 
-#include "passdmaphoptodfschedule.h"
+#include "passblueprinttoschedule.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -266,7 +266,7 @@ struct RoutingCreateTodfschedulePattern : public OpConversionPattern<routing::Ro
 
 namespace mlir {
 
-void DmaphopTodfschedulePass::runOnOperation() {
+void BlueprintToSchedulePass::runOnOperation() {
     MLIRContext *context = &getContext();
     ConversionTarget target(*context);
     
@@ -290,3 +290,4 @@ void DmaphopTodfschedulePass::runOnOperation() {
 }
 
 } // namespace mlir
+
