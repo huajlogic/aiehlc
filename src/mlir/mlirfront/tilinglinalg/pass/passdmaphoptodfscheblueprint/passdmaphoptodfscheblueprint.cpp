@@ -367,69 +367,79 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
     using OpConversionPattern<routing::extract_data>::OpConversionPattern;
     LogicalResult matchAndRewrite(routing::extract_data op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
+        // Get the input tensor (from adaptor for converted value)
         Value inputTensor = adaptor.getTensor();
         auto inputType = dyn_cast<RankedTensorType>(inputTensor.getType());
         auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
-
+        
         if (!inputType || !resultType) {
             return op.emitError("ExtractDataConversion: input and result must be ranked tensors");
         }
-
+        
+        // Get partition info from the original tensor's defining op (partitiontensor)
+        int64_t splitDim = 0;  // Default: split along row (dim 0)
+        int64_t splitNum = 1;  // Default: no split
+        
+        // Try to get partition info from the original (unconverted) tensor
+        if (auto partitionOp = dyn_cast_or_null<routing::partitiontensor>(op.getTensor().getDefiningOp())) {
+            splitDim = partitionOp.getSplitdim();
+            splitNum = partitionOp.getSplitnum();
+        }
+        
         auto inputShape = inputType.getShape();
         auto resultShape = resultType.getShape();
-
+        
         if (inputShape.size() != 2 || resultShape.size() != 2) {
-             return op.emitError("ExtractDataConversion: tensors must be 2D");
+            return op.emitError("ExtractDataConversion: tensors must be 2D");
         }
-
-        int64_t dim0 = inputShape[0];
-        int64_t dim1 = inputShape[1];
-        int64_t sliceDim0 = resultShape[0];
-        int64_t sliceDim1 = resultShape[1];
-
-        // Determine split dimension based on shape difference
-        // If result shape is smaller than input shape in one dimension, that's the split dimension.
-        int64_t splitDim = 0;
-        int64_t sliceSize = sliceDim0;
-
-        if (dim0 != sliceDim0) {
-            splitDim = 0;
-            sliceSize = sliceDim0;
-        } else if (dim1 != sliceDim1) {
-            splitDim = 1;
-            sliceSize = sliceDim1;
+        
+        // Calculate slice size based on splitDim
+        int64_t sliceSize;
+        if (splitDim == 0) {
+            sliceSize = inputShape[0] / splitNum;  // Row split
         } else {
-            // Both dimensions match. This implies a 1-to-1 extraction (or splitNum=1).
-            // We default to splitDim=0, sliceSize=dim0 (full size).
-            // This results in offset 0 for idx 0.
-            splitDim = 0;
-            sliceSize = dim0;
+            sliceSize = inputShape[1] / splitNum;  // Col split
         }
-
+        
+        // Get the index value and try to extract constant for tag naming
         Value indexVal = adaptor.getIdx();
+        int64_t constIndex = -1;  // Default: unknown index
+        
+        // Try to get constant index from the original op's idx
+        if (auto constOp = dyn_cast_or_null<arith::ConstantOp>(op.getIdx().getDefiningOp())) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+                constIndex = intAttr.getInt();
+            }
+        }
+        
         if (!indexVal.getType().isIndex()) {
             indexVal = rewriter.create<arith::IndexCastOp>(op.getLoc(), rewriter.getIndexType(), indexVal);
         }
-
+        
+        // Calculate offset: offset = idx * sliceSize
+        Value sliceSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), sliceSize);
+        Value offsetVal = rewriter.create<arith::MulIOp>(op.getLoc(), indexVal, sliceSizeVal);
+        
+        // Build offsets, sizes, strides for tensor.extract_slice
         SmallVector<OpFoldResult> offsets(2);
         SmallVector<OpFoldResult> sizes(2);
         SmallVector<OpFoldResult> strides(2, rewriter.getIndexAttr(1));
-
-        Value sliceSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), sliceSize);
-        Value offsetVal = rewriter.create<arith::MulIOp>(op.getLoc(), indexVal, sliceSizeVal);
-
+        
         if (splitDim == 0) {
+            // Split along row (dim 0): offset on dim 0, full size on dim 1
             offsets[0] = offsetVal;
             offsets[1] = rewriter.getIndexAttr(0);
-            sizes[0] = rewriter.getIndexAttr(sliceDim0);
-            sizes[1] = rewriter.getIndexAttr(sliceDim1);
+            sizes[0] = rewriter.getIndexAttr(resultShape[0]);
+            sizes[1] = rewriter.getIndexAttr(resultShape[1]);
         } else {
+            // Split along col (dim 1): full size on dim 0, offset on dim 1
             offsets[0] = rewriter.getIndexAttr(0);
             offsets[1] = offsetVal;
-            sizes[0] = rewriter.getIndexAttr(sliceDim0);
-            sizes[1] = rewriter.getIndexAttr(sliceDim1);
+            sizes[0] = rewriter.getIndexAttr(resultShape[0]);
+            sizes[1] = rewriter.getIndexAttr(resultShape[1]);
         }
-
+        
+        // Create tensor.extract_slice with "partitionsliceN" tag
         auto extractSlice = rewriter.create<tensor::ExtractSliceOp>(
             op.getLoc(),
             resultType,
@@ -438,6 +448,13 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
             sizes,
             strides
         );
+        
+        // Add "partitionsliceN" tag attribute (with index if known)
+        std::string tagName = "partitionslice";
+        if (constIndex >= 0) {
+            tagName += std::to_string(constIndex);
+        }
+        extractSlice->setAttr("tag", rewriter.getStringAttr(tagName));
         
         rewriter.replaceOp(op, extractSlice.getResult());
         return success();
@@ -454,7 +471,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         // - Producer from create_path is the source (one tile)
         // - Consumers from create_path are the destinations (many tiles)
         
-        auto consumerBuffers = op.getConsumerBuffers();
+        // Use adaptor to get converted consumer buffers (now DeclareDataOp results)
+        auto consumerBuffers = adaptor.getConsumerBuffers();
         if (consumerBuffers.empty()) return failure();
 
         Value viewSplit = adaptor.getData();
@@ -462,10 +480,10 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         // Get unique sequential ID for naming (moved up to use in slice names)
         int opId = g_pullPushCounter.fetch_add(1);
         
-        // Create schedule.data_slice ops to wrap the existing consumer buffers (already tensors)
+        // Create schedule.data_slice ops to wrap the converted consumer buffers
         SmallVector<Attribute> sliceSymbols;
         for (size_t i = 0; i < consumerBuffers.size(); ++i) {
-            auto buffer = consumerBuffers[i];
+            Value buffer = consumerBuffers[i];
             auto tensorType = dyn_cast<RankedTensorType>(buffer.getType());
             if (!tensorType) {
                 // Try MemRef for backward compatibility
@@ -481,7 +499,7 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                 op.getLoc(),
                 tensorType, // Result type
                 rewriter.getStringAttr(sliceName),
-                buffer // Reuse existing consumer buffer tensor
+                buffer // Use adapted consumer buffer (DeclareDataOp result)
             );
             
             // Collect slice symbol reference for bind_group
@@ -653,7 +671,8 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
 
     LogicalResult matchAndRewrite(dmaphop::pull op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        auto producerBuffers = op.getProducerBuffers();
+        // Use adaptor to get converted producer buffers (now DeclareDataOp results)
+        auto producerBuffers = adaptor.getProducerBuffers();
         if (producerBuffers.empty()) return failure();
 
         Value viewSplit = adaptor.getData();
@@ -661,10 +680,10 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         // Get unique sequential ID for naming (moved up to use in slice names)
         int opId = g_pullPushCounter.fetch_add(1);
         
-        // Create schedule.data_slice ops to wrap the existing producer buffers (already tensors)
+        // Create schedule.data_slice ops to wrap the converted producer buffers
         SmallVector<Attribute> sliceSymbols;
         for (size_t i = 0; i < producerBuffers.size(); ++i) {
-            auto buffer = producerBuffers[i];
+            Value buffer = producerBuffers[i];
             auto tensorType = dyn_cast<RankedTensorType>(buffer.getType());
             if (!tensorType) {
                 // Try MemRef for backward compatibility
@@ -680,7 +699,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 op.getLoc(),
                 tensorType, // Result type
                 rewriter.getStringAttr(sliceName),
-                buffer // Reuse existing producer buffer tensor
+                buffer // Use adapted producer buffer (DeclareDataOp result)
             );
             
             // Collect slice symbol reference for bind_group
@@ -883,13 +902,15 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
     
     patterns.add<CreateScheduleTensorConversion>(context);
     //patterns.add<PartitionTensorConversion>(context);
-    //patterns.add<ExtractDataConversion>(context);
+    patterns.add<ExtractDataConversion>(context);
     patterns.add<PushOpConversion>(context);
     patterns.add<PullOpConversion>(context);
 
     target.addIllegalOp<routing::createscheduletensor>();
     //target.addIllegalOp<routing::partitiontensor>();
-    //target.addIllegalOp<routing::extract_data>();
+    target.addIllegalOp<routing::extract_data>();
+    target.addIllegalOp<dmaphop::push>();
+    target.addIllegalOp<dmaphop::pull>();
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();

@@ -873,6 +873,23 @@ struct EraseOpPattern : public OpConversionPattern<OpType> {
     }
 };
 
+// Pattern to erase routing::extract_data and its users
+struct ExtractDataErasePattern : public OpConversionPattern<routing::extract_data> {
+    using OpConversionPattern<routing::extract_data>::OpConversionPattern;
+    
+    LogicalResult matchAndRewrite(routing::extract_data op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        // 1. Erase all reference ops (users)
+        // We use make_early_inc_range to safely iterate while erasing
+        for (auto user : llvm::make_early_inc_range(op.getResult().getUsers())) {
+            rewriter.eraseOp(user);
+        }
+        // 2. Erase itself
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
 } // namespace
 
 void DmaphopToRoutinghwPass::runOnOperation() {
@@ -915,7 +932,7 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     patterns.add<EraseOpPattern<dmaphop::push>>(&ctx);
     patterns.add<EraseOpPattern<dmaphop::pull>>(&ctx);
     patterns.add<EraseOpPattern<dmaphop::sync>>(&ctx);
-    patterns.add<EraseOpPattern<routing::extract_data>>(&ctx);  // Erase routing::extract_data
+    patterns.add<ExtractDataErasePattern>(&ctx);  // Erase routing::extract_data and its users
     patterns.add<EraseOpPattern<routing::createscheduletensor>>(&ctx);
     patterns.add<EraseOpPattern<routing::partitiontensor>>(&ctx);  // Erase routing::partitiontensor
 
