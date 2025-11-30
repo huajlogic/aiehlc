@@ -341,8 +341,10 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     int64_t rank = rankedType.getRank();
     auto shape = rankedType.getShape();
     
-    // Determine split dimension - use the highest dimension > 1 or default to 0
-    int splitDim = 0;
+    // Determine split dimension based on core group axis
+    // If axis is "row", tiles are arranged horizontally (varying columns), so we split the column dimension (1)
+    // If axis is "col", tiles are arranged vertically (varying rows), so we split the row dimension (0)
+    int splitDim = (coreGroup.getGroupAxis() == "row") ? 0 : 1;
     
     // Check if we can split along the dimension that matches core count
     // or just split the first dimension
