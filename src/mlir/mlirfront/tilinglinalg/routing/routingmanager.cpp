@@ -437,12 +437,28 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                     OpBuilder::InsertionGuard guard(builder);
                     //fix the upper scope return go inside this region issue
                     builder.setInsertionPointToStart(&exec.getRegion().emplaceBlock());
-                ///*                
+                ///*               
                     auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, hwsplitnum, splitAxis);
-                    IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
+                    int splitdimn= splitAxis == "row" ? 0 : 1;
+                    IntegerAttr splitdim = builder.getI64IntegerAttr(splitdimn);//dim 0 is 
+                    if (splitdimn == 0) {
+                        assert(splitAxis == "row" && "splitdim 0 must be row");
+                    } else {
+                        assert(splitAxis == "col" && "splitdim 1 must be col");
+                    }
                     // Get tensor type from input tensor for partitiontensor result
-                    auto tensorType = tensor.getType();
+                    auto tensorType = tensor.getType().cast<RankedTensorType>();
                     auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensorType, tensor, hwsplitnum, 0, tensorhwaxisowner,"col","");
+                    
+                    // Calculate split tensor type
+                    SmallVector<int64_t> splitShape(tensorType.getShape());
+                    if (splitdimn== 0) {
+                        if (splitShape[0] != ShapedType::kDynamic) splitShape[0] /= hwsplitnum;
+                    } else {
+                        if (splitShape[1] != ShapedType::kDynamic) splitShape[1] /= hwsplitnum;
+                    }
+                    auto splitTensorType = RankedTensorType::get(splitShape, tensorType.getElementType());
+
                     Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
                     Value ub = builder.create<arith::ConstantIndexOp>(location, hwsplitnum);
                     Value step = builder.create<arith::ConstantIndexOp>(location,1);
@@ -461,8 +477,8 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                         auto routingcreateOp = builder.create<routing::RoutingCreate>(builder.getUnknownLoc(), idx, memo, [&](OpBuilder &builder1, Location bodyLoc,Value sidx) { 
                             //use such format to fix the generic format print issue 
                             ///*
-                            // extract_data returns the same tensor type as input
-                            auto slicetensor = builder1.create<extract_data>(builder1.getUnknownLoc(), rowtensor.getType(), rowtensor, sidx);
+                            // extract_data returns the split tensor type
+                            auto slicetensor = builder1.create<extract_data>(builder1.getUnknownLoc(), splitTensorType, rowtensor, sidx);
                             auto tilelist = builder1.create<extract_tiles>(builder1.getUnknownLoc(), patitionmesh, sidx);
                             
                             if (binput) {
