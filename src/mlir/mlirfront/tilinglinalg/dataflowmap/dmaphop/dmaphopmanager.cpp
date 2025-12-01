@@ -3,6 +3,9 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 #include "dmaphopmanager.h"
+#include "mlir/IR/OpImplementation.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include <iostream>
 
 #define GET_TYPEDEF_CLASSES
@@ -22,7 +25,96 @@
 #undef GET_ATTRDEF_CLASSES
 #undef GET_TYPEDEF_CLASSES
 
+//===----------------------------------------------------------------------===//
+// Custom Printers and Parsers
+//===----------------------------------------------------------------------===//
 
+// FuncOp printer
+void dmaphop::FuncOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName();
+    printer << " ";
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+}
+
+// FuncOp parser
+ParseResult dmaphop::FuncOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    Region *body = result.addRegion();
+    if (parser.parseRegion(*body, {}, {}))
+        return failure();
+    
+    // Ensure the region has a block
+    if (body->empty())
+        body->emplaceBlock();
+    
+    // Add default function type () -> ()
+    auto builder = parser.getBuilder();
+    auto funcType = builder.getFunctionType({}, {});
+    result.addAttribute("funcType", TypeAttr::get(funcType));
+    
+    return success();
+}
+
+// PortOp printer
+void dmaphop::port::print(OpAsmPrinter &printer) {
+    printer << " ";
+    printer.printSymbolName(getSymName());
+    printer << " on " << getTile();
+    printer << " { direction = \"" << getDirection() << "\"";
+    if (auto channel = getDirectionChannel()) {
+        printer << ", direction_channel = " << *channel;
+    }
+    printer << " }";
+    printer << " : " << getTile().getType();
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), {"sym_name", "direction", "direction_channel"});
+    printer << " -> " << getType();
+}
+
+// PortOp parser
+ParseResult dmaphop::port::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+
+    if (parser.parseKeyword("on")) return failure();
+
+    OpAsmParser::UnresolvedOperand tileOperand;
+    if (parser.parseOperand(tileOperand)) return failure();
+
+    if (parser.parseLBrace()) return failure();
+    
+    if (parser.parseKeyword("direction") || parser.parseEqual()) return failure();
+    
+    StringAttr directionAttr;
+    if (parser.parseAttribute(directionAttr, "direction", result.attributes)) return failure();
+
+    if (succeeded(parser.parseOptionalComma())) {
+        if (parser.parseKeyword("channel") || parser.parseEqual()) return failure();
+        IntegerAttr channelAttr;
+        if (parser.parseAttribute(channelAttr, "direction_channel", result.attributes)) return failure();
+    }
+
+    if (parser.parseRBrace()) return failure();
+
+    Type tileType;
+    if (parser.parseColonType(tileType)) return failure();
+    
+    if (parser.resolveOperand(tileOperand, tileType, result.operands)) return failure();
+
+    if (parser.parseOptionalAttrDict(result.attributes)) return failure();
+
+    if (parser.parseArrow()) return failure();
+
+    Type resultType;
+    if (parser.parseType(resultType)) return failure();
+    result.addTypes(resultType);
+
+    return success();
+}
+ 
 void dmaphopdialect::initialize()  { 
     addOperations<
     #define GET_OP_LIST
@@ -46,7 +138,7 @@ ModuleOp dmaphopmanager::ops_test(MLIRContext* ctx, int totalN) {
     //m.push_back(func);
     auto functype = builder.getFunctionType({},{});
     
-    auto main = builder.create<dmaphop::FuncOp>(builder.getUnknownLoc(), "main", functype);
+    auto main = builder.create<dmaphop::FuncOp>(builder.getUnknownLoc(), builder.getStringAttr("main"), functype);
     m.push_back(main);
     //auto block = main.addEntryBlock();
     auto &block = main.getBody().emplaceBlock();
@@ -55,21 +147,18 @@ ModuleOp dmaphopmanager::ops_test(MLIRContext* ctx, int totalN) {
     SymbolTable symTable(main);
 
     createdmaphopfuncByDim(builder, ctx, symTable);
-    auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
-    
-
-    
+    //auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
 
   // ------------------------------------------------------------------
   // 4. Look up the symbol anywhere inside the module
   // ------------------------------------------------------------------
-   Operation *found = symTable.lookup("receive1");
+   Operation *found = symTable.lookup("portShimIn");
    if (!found) {
-     llvm::errs() << "Symbol @receive1 not found!\n";
+     llvm::errs() << "Symbol @portShimIn not found!\n";
      
  
    } else {
-     llvm::outs() << "receive1 found \n";
+     llvm::outs() << "portShimIn found \n";
      llvm::outs() << "Found: " << found->getName() <<"\n";
    }
     llvm::errs() << m;
@@ -79,9 +168,11 @@ ModuleOp dmaphopmanager::ops_test(MLIRContext* ctx, int totalN) {
 void dmaphopmanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<mlir::func::FuncDialect>();
     ctx->getOrLoadDialect<dmaphop::dmaphopdialect>();
+    ctx->getOrLoadDialect<routing::routingdialect>();
     ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
     ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
 }
 /*
       %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
@@ -127,6 +218,7 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
         builder.getI64IntegerAttr(2),  // col
         builder.getI64IntegerAttr(2)   // row
     );
+ 
  
     // --- 2. Define Logical Ports ---
     auto directionSend =  "Out";
@@ -174,7 +266,7 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
         builder.getI64IntegerAttr(0)
     );
     symTable.insert(portBIn);
- 
+    
     // --- 3. Define Hops ---
     auto hop1 = builder.create<dmaphop::create_hop>(location,
         portShimOut.getResult(),
@@ -212,46 +304,74 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
         builder.getArrayAttr(consumers),
         builder.getArrayAttr(teePoints)
     );
-
+///*
     // --- 5. Prepare Data and Buffers ---
-    // Create memref type for the buffers
-    auto memrefType = MemRefType::get({1024}, builder.getF32Type());
+    // Create tensor type for the buffers
+    SmallVector<int64_t> shapeVec = {1024};
+    auto tensorType = RankedTensorType::get(shapeVec, builder.getF32Type());
 
-    auto memrefTypeOut = MemRefType::get({1024}, builder.getF32Type());
+    //auto memrefTypeOut = RankedTensorType::get(shapeVec, builder.getF32Type());
+///* 
+    // Create data handle using routing.routingextract_data
+    // First create a dummy I32 value as the tensor source
+    auto i32Type = builder.getI32Type();
 
-    // Allocate source data buffer
-    auto data = builder.create<memref::AllocOp>(location, memrefType);
+    //auto tensorId = builder.create<arith::ConstantOp>(location, memrefType, builder.getI32IntegerAttr(0)); // Placeholder
+    auto dataIdx = builder.create<arith::ConstantOp>(location, i32Type, builder.getI32IntegerAttr(0));
+    ///*
+    // Extract data using routing.routingextract_data
+    // Note: extract_data now returns Tensor, input tensorId should be Tensor type
+    // Assuming tensorId creation above is placeholder, for now use createscheduletensor to be correct
+    // But since this is a test/manager file, we can just use EmptyOp for tensorId if needed,
+    // or fix extract_data call.
     
-    // Allocate destination buffers on tiles
-    auto bufferA = builder.create<dmaphop::alloc_buffer>(location,
-        memrefTypeOut,
-        tileA.getResult(),
-        data.getResult()
+    // Actually routing::extract_data expects AnyTensor input now.
+    // Let's create a dummy tensor for it.
+    auto dummyTensor = builder.create<mlir::tensor::EmptyOp>(location, shapeVec, builder.getF32Type());
+
+    auto data = builder.create<routing::extract_data>(location, 
+        tensorType,
+        dummyTensor.getResult(), 
+        dataIdx.getResult()
+    );
+   ///*
+    // Allocate a template tensor (was memref::AllocOp)
+    // For tensors, we use EmptyOp as placeholder for uninitialized tensor
+    auto memrefTemplate = builder.create<mlir::tensor::EmptyOp>(location, shapeVec, builder.getF32Type());
+    
+    // Allocate destination buffers on tiles using tensor.extract_slice
+    // This replaces dmaphop::alloc_buffer logic
+    SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes = {builder.getIndexAttr(1024)};
+    SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1)};
+    
+    auto sliceA = builder.create<mlir::tensor::ExtractSliceOp>(location, 
+        memrefTemplate.getResult(), 
+        offsets, sizes, strides
     );
     
-    auto bufferB = builder.create<dmaphop::alloc_buffer>(location,
-        memrefTypeOut,
-        tileB.getResult(),
-        data.getResult()
+    auto sliceB = builder.create<mlir::tensor::ExtractSliceOp>(location, 
+        memrefTemplate.getResult(), 
+        offsets, sizes, strides
     );
 
     // --- 6. Execute Transfer ---
     builder.create<dmaphop::push>(location,
         data.getResult(),
         serialPath.getResult(),
-        ValueRange{bufferA, bufferB},
+        ValueRange{sliceA.getResult(), sliceB.getResult()},
         ValueRange{portAIn, portBIn}
     );
 
     // --- 7. Synchronization ---
     builder.create<dmaphop::sync>(location, serialPath.getResult());
-///*
+    //*/
     // --- 8. Cleanup ---
-    builder.create<dmaphop::dealloc_buffer>(location, bufferA);
-    builder.create<dmaphop::dealloc_buffer>(location, bufferB);
-    builder.create<memref::DeallocOp>(location, data);
+    // dmaphop::dealloc_buffer is not needed for tensors
+    // memref::DeallocOp is not for tensors.
+    // builder.create<memref::DeallocOp>(location, memrefTemplate);
 
     // Add return
-    builder.create<func::ReturnOp>(location);
+   // builder.create<func::ReturnOp>(location);
    // */
 }

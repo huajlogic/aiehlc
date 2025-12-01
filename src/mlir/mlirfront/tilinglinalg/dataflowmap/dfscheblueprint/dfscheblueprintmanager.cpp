@@ -3,16 +3,19 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 #include "dfscheblueprintmanager.h"
+#include "../../routing/routingmanager.h"
 #include <iostream>
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 
 #define GET_TYPEDEF_CLASSES
 #define GET_ATTRDEF_CLASSES
 #define GET_OP_CLASSES
 #define GET_OP_DEFS
 #include "dfscheblueprintdialect.cc.inc"
+#include "dfscheblueprintenums.cc.inc"
 #include "dfscheblueprintattr.cc.inc"
 #include "dfscheblueprinttype.cc.inc"
-#include "dfscheblueprintenums.cc.inc"
 
 #include "dfscheblueprintop.cc.inc"
 #undef GET_OP_DEFS
@@ -115,6 +118,271 @@ ParseResult dfscheblueprint::TransferManifestOp::parse(OpAsmParser &parser, Oper
     return success();
 }
 
+// DataSliceOp printer
+// Format: %result = schedule.data_slice @sym_name wrap %tensor_slice : tensor_type
+void dfscheblueprint::DataSliceOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName() << " wrap ";
+    printer << getTensorSlice() << " : " << getTensorSlice().getType();
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), /*elidedAttrs=*/{"sym_name"});
+}
+
+// DataSliceOp parser
+// Format: %result = schedule.data_slice @sym_name wrap %tensor_slice : tensor_type
+ParseResult dfscheblueprint::DataSliceOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    if (parser.parseKeyword("wrap"))
+        return failure();
+    
+    OpAsmParser::UnresolvedOperand tensorOperand;
+    Type tensorType;
+    if (parser.parseOperand(tensorOperand) || parser.parseColonType(tensorType))
+        return failure();
+    
+    if (parser.resolveOperand(tensorOperand, tensorType, result.operands))
+        return failure();
+    
+    // Set the result type to match the input tensor type
+    result.addTypes(tensorType);
+    
+    parser.parseOptionalAttrDict(result.attributes);
+    
+    return success();
+}
+/*
+   printer.increaseIndent();
+    printer.printNewline();
+    printer << "view = " << getView() << " : " << getView().getType() << ",";
+    printer.printNewline();
+    printer << "slice = " << getSliceParams();
+    printer.decreaseIndent(); // <--- Reduce the indentation level state FIRST
+    printer.printNewline();  
+*/
+// BindGroupOp printer
+void dfscheblueprint::BindGroupOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName() << " {";
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "target_group = " << getTargetGroup() << ",";
+    printer.printNewline();
+    printer << "view = " << getView() << " : " << getView().getType() << ",";
+    printer.printNewline();
+    printer << "distribution = \"" << getDistribution() << "\",";
+    printer.printNewline();
+    printer << "dma = " << getDma();
+    printer.printNewline();
+    if (getSliceSymbols()) {
+        printer << ",slice_symbols = " << getSliceSymbols();
+    }
+    printer.decreaseIndent(); // <--- Reduce the indentation level state FIRST
+    printer.printNewline();  
+    printer << "}";
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), 
+        /*elidedAttrs=*/{"sym_name", "target_group", "view", "distribution", "dma", "slice_symbols"});
+}
+
+// BindGroupOp parser
+ParseResult dfscheblueprint::BindGroupOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    if (parser.parseLBrace())
+        return failure();
+    
+    SymbolRefAttr targetGroup;
+    OpAsmParser::UnresolvedOperand viewOperand;
+    Type viewType;
+    StringAttr distribution;
+    dfscheblueprint::DMAAttr dma;
+    ArrayAttr sliceSymbols;
+    
+    while (true) {
+        OptionalParseResult res = parser.parseOptionalRBrace();
+        if (res.has_value()) {
+            if (failed(res.value())) return failure();
+            break;
+        }
+
+        StringRef attrName;
+        if (parser.parseKeyword(&attrName) || parser.parseEqual())
+            return failure();
+        
+        if (attrName == "target_group") {
+            if (parser.parseAttribute(targetGroup, "target_group", result.attributes)) return failure();
+        } else if (attrName == "view") {
+            if (parser.parseOperand(viewOperand) || parser.parseColonType(viewType))
+                return failure();
+        } else if (attrName == "distribution") {
+            if (parser.parseAttribute(distribution, "distribution", result.attributes)) return failure();
+        } else if (attrName == "dma") {
+            if (parser.parseAttribute(dma, "dma", result.attributes)) return failure();
+        } else if (attrName == "slice_symbols") {
+            if (parser.parseAttribute(sliceSymbols, "slice_symbols", result.attributes)) return failure();
+        } else {
+             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+        }
+        
+        parser.parseOptionalComma();
+    }
+    
+    if (parser.resolveOperand(viewOperand, viewType, result.operands))
+        return failure();
+        
+    parser.parseOptionalAttrDict(result.attributes);
+    
+    return success();
+}
+
+// BindOp printer
+void dfscheblueprint::BindOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName() << " {";
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "target = " << getTarget() << ",";
+    printer.printNewline();
+    printer << "view = " << getView() << " : " << getView().getType() << ",";
+    printer.printNewline();
+    printer << "slice = \"" << getSlice() << "\",";
+    printer.printNewline();
+    printer << "dma = " << getDma();
+    if (getSliceSymbol()) {
+        printer.printNewline();
+        printer << ",slice_symbol = " << getSliceSymbol();
+    }
+    printer.decreaseIndent();
+    printer.printNewline();
+    printer << "}";
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), 
+        /*elidedAttrs=*/{"sym_name", "target", "view", "slice", "dma", "slice_symbol"});
+}
+
+// BindOp parser
+ParseResult dfscheblueprint::BindOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    if (parser.parseLBrace())
+        return failure();
+    
+    SymbolRefAttr target;
+    OpAsmParser::UnresolvedOperand viewOperand;
+    Type viewType;
+    StringAttr slice;
+    dfscheblueprint::DMAAttr dma;
+    SymbolRefAttr sliceSymbol;
+    
+    while (true) {
+        OptionalParseResult res = parser.parseOptionalRBrace();
+        if (res.has_value()) {
+            if (failed(res.value())) return failure();
+            break;
+        }
+
+        StringRef attrName;
+        if (parser.parseKeyword(&attrName) || parser.parseEqual())
+            return failure();
+        
+        if (attrName == "target") {
+            if (parser.parseAttribute(target, "target", result.attributes)) return failure();
+        } else if (attrName == "view") {
+            if (parser.parseOperand(viewOperand) || parser.parseColonType(viewType))
+                return failure();
+        } else if (attrName == "slice") {
+            if (parser.parseAttribute(slice, "slice", result.attributes)) return failure();
+        } else if (attrName == "dma") {
+            if (parser.parseAttribute(dma, "dma", result.attributes)) return failure();
+        } else if (attrName == "slice_symbol") {
+            if (parser.parseAttribute(sliceSymbol, "slice_symbol", result.attributes)) return failure();
+        } else {
+             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+        }
+        
+        parser.parseOptionalComma();
+    }
+    
+    if (parser.resolveOperand(viewOperand, viewType, result.operands))
+        return failure();
+        
+    parser.parseOptionalAttrDict(result.attributes);
+    
+    return success();
+}
+
+// CollectiveTransferOp printer
+void dfscheblueprint::CollectiveTransferOp::print(OpAsmPrinter &printer) {
+    printer << " @" << getSymName() << " {";
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "type = \"" << getType() << "\",";
+    printer.printNewline();
+    printer << "from = " << getFrom() << ",";
+    printer.printNewline();
+    printer << "to = " << getTo();
+    if (getOrdering()) {
+        printer.printNewline();
+        printer << ",ordering = \"" << getOrdering() << "\"";
+    }
+    printer.printNewline();
+    printer << ",base_packet_id = " << getBasePacketId();
+    printer.decreaseIndent();
+    printer.printNewline();
+    printer << "}";
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), 
+        /*elidedAttrs=*/{"sym_name", "type", "from", "to", "ordering", "base_packet_id"});
+}
+
+// CollectiveTransferOp parser
+ParseResult dfscheblueprint::CollectiveTransferOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    if (parser.parseLBrace())
+        return failure();
+    
+    StringAttr type;
+    SymbolRefAttr from;
+    SymbolRefAttr to;
+    StringAttr ordering;
+    IntegerAttr basePacketId;
+    
+    while (true) {
+        OptionalParseResult res = parser.parseOptionalRBrace();
+        if (res.has_value()) {
+            if (failed(res.value())) return failure();
+            break;
+        }
+
+        StringRef attrName;
+        if (parser.parseKeyword(&attrName) || parser.parseEqual())
+            return failure();
+        
+        if (attrName == "type") {
+            if (parser.parseAttribute(type, "type", result.attributes)) return failure();
+        } else if (attrName == "from") {
+            if (parser.parseAttribute(from, "from", result.attributes)) return failure();
+        } else if (attrName == "to") {
+            if (parser.parseAttribute(to, "to", result.attributes)) return failure();
+        } else if (attrName == "ordering") {
+            if (parser.parseAttribute(ordering, "ordering", result.attributes)) return failure();
+        } else if (attrName == "base_packet_id") {
+            if (parser.parseAttribute(basePacketId, "base_packet_id", result.attributes)) return failure();
+        } else {
+             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+        }
+        
+        parser.parseOptionalComma();
+    }
+    
+    parser.parseOptionalAttrDict(result.attributes);
+    
+    return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Dialect Initialization
 //===----------------------------------------------------------------------===//
@@ -138,6 +406,7 @@ void dfscheblueprintdialect::initialize()  {
 }
 
 ModuleOp dfscheblueprintmanager::ops_test(MLIRContext* ctx) {
+    loaddialect(ctx);
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     
@@ -160,7 +429,9 @@ void dfscheblueprintmanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<mlir::func::FuncDialect>();
     ctx->getOrLoadDialect<dfscheblueprint::dfscheblueprintdialect>();
     ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
+    ctx->getOrLoadDialect<routing::routingdialect>();
 }
 
 /**
@@ -185,138 +456,198 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Create the top-level schedule.config operation
     auto configOp = builder.create<dfscheblueprint::ConfigOp>(
         location,
-        builder.getStringAttr("tiling_and_broadcast_blueprint")
+        builder.getStringAttr("broadcast_gather_blueprint")
     );
-    /*
+    
     // Set insertion point inside the config body
     Block *configBody = new Block();
     configOp.getBody().push_back(configBody);
     builder.setInsertionPointToStart(configBody);
+
+    // ============================================================
+    // 1. Physical Resources
+    // ============================================================
     
-    // --- Transfer Manifest 1: broadcast_upper_half ---
-    
-    // Create payload_slice attribute for upper half
-    auto memrefType1024x1024 = mlir::MemRefType::get({1024, 1024}, builder.getF32Type());
-    auto dataTypeAttr = mlir::TypeAttr::get(memrefType1024x1024);
-    
-    auto offsetAttr = builder.getArrayAttr({
-        builder.getI64IntegerAttr(0),
-        builder.getI64IntegerAttr(0)
+    // Shim Gateway: tiles = [(0, 2)]
+    auto shimTiles = builder.getArrayAttr({
+        builder.getArrayAttr({builder.getI64IntegerAttr(0), builder.getI64IntegerAttr(2)})
     });
-    
-    auto sizeAttrUpper = builder.getArrayAttr({
-        builder.getI64IntegerAttr(512),
-        builder.getI64IntegerAttr(1024)
-    });
-    
-    auto strideAttr = builder.getArrayAttr({
-        builder.getI64IntegerAttr(1024),
-        builder.getI64IntegerAttr(1)
-    });
-    
-    auto sliceAttrUpper = dfscheblueprint::SliceAttr::get(
-        ctx,
-        dataTypeAttr,
-        offsetAttr,
-        sizeAttrUpper,
-        strideAttr
-    );
-    
-    // Create source endpoint: tile=(0,2), direction="MM2S", channel=0
-    auto sourceEndpoint = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        0,  // row
-        2,  // col
-        builder.getStringAttr("MM2S"),
-        0  // channel
-    );
-    
-    // Create destination endpoints
-    auto dest1 = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        2,  // row
-        2,  // col
-        builder.getStringAttr("S2MM"),
-        0  // channel
-    );
-    
-    auto dest2 = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        3,  // row
-        2,  // col
-        builder.getStringAttr("S2MM"),
-        0  // channel
-    );
-    
-    auto destinationsAttr = builder.getArrayAttr({dest1, dest2});
-    
-    // Create the transfer manifest operation
-    builder.create<dfscheblueprint::TransferManifestOp>(
+    builder.create<dfscheblueprint::ResourceGroupOp>(
         location,
-        builder.getStringAttr("broadcast_upper_half"),
-        sliceAttrUpper,
-        builder.getI32IntegerAttr(10),  // packet_id
-        sourceEndpoint,
-        destinationsAttr
+        builder.getStringAttr("shim_gateway"),
+        shimTiles
     );
-    
-    // --- Transfer Manifest 2: broadcast_lower_half ---
-    
-    auto offsetAttrLower = builder.getArrayAttr({
-        builder.getI64IntegerAttr(512),  // Start from row 512
-        builder.getI64IntegerAttr(0)
+
+    // Compute Row: tiles = [(2, 0), (2, 1), (2, 2), (2, 3)]
+    auto computeTiles = builder.getArrayAttr({
+        builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(0)}),
+        builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(1)}),
+        builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(2)}),
+        builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(3)})
     });
-    
-    auto sizeAttrLower = builder.getArrayAttr({
-        builder.getI64IntegerAttr(512),
-        builder.getI64IntegerAttr(1024)
-    });
-    
-    auto sliceAttrLower = dfscheblueprint::SliceAttr::get(
-        ctx,
-        dataTypeAttr,
-        offsetAttrLower,
-        sizeAttrLower,
-        strideAttr
-    );
-    
-    // Source endpoint (same as before)
-    auto sourceEndpointLower = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        0,  // row
-        2,  // col
-        builder.getStringAttr("MM2S"),
-        0  // channel
-    );
-    
-    // Different destination endpoints for lower half
-    auto dest3 = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        4,  // row
-        2,  // col
-        builder.getStringAttr("S2MM"),
-        0  // channel
-    );
-    
-    auto dest4 = dfscheblueprint::EndpointAttr::get(
-        ctx,
-        5,  // row
-        2,  // col
-        builder.getStringAttr("S2MM"),
-        0  // channel
-    );
-    
-    auto destinationsAttrLower = builder.getArrayAttr({dest3, dest4});
-    
-    // Create the second transfer manifest
-    builder.create<dfscheblueprint::TransferManifestOp>(
+    builder.create<dfscheblueprint::ResourceGroupOp>(
         location,
-        builder.getStringAttr("broadcast_lower_half"),
-        sliceAttrLower,
-        builder.getI32IntegerAttr(11),  // Different packet_id
-        sourceEndpointLower,
-        destinationsAttrLower
+        builder.getStringAttr("compute_row"),
+        computeTiles
     );
-    */
+
+    // ============================================================
+    // 2. Logical Data View (using Tensor types)
+    // ============================================================
+    
+    // Create Root Tensor (tensor<1024x1024xf32>) - logical declaration, no memory allocation
+    auto emptyTensorOp = builder.create<tensor::EmptyOp>(location, ArrayRef<int64_t>{1024, 1024}, builder.getF32Type());
+    auto rootTensor = emptyTensorOp.getResult();
+
+    // Create tensor.extract_slice (Partition 0: 256x1024)
+    // Offset=[0, 0], Size=[256, 1024], Stride=[1, 1] relative to source
+    SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(0), builder.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes = {builder.getIndexAttr(256), builder.getIndexAttr(1024)};
+    SmallVector<OpFoldResult> strides = {builder.getIndexAttr(1), builder.getIndexAttr(1)};
+    
+    auto extractSliceOp = builder.create<tensor::ExtractSliceOp>(
+        location,
+        rootTensor,
+        offsets,
+        sizes,
+        strides
+    );
+    auto viewSplit = extractSliceOp.getResult();
+
+    // ============================================================
+    // 3. Binding & Channel Config
+    // ============================================================
+
+    // Extract partition 0
+    //auto extractOp = builder.create<dfscheblueprint::ExtractOp>(
+    //    location,
+    //    viewSplit,
+    //    builder.getI32IntegerAttr(0)
+    //);
+    //auto extractedView = extractOp.getResult();
+
+    // First: Create all 4 tensor.extract_slice ops as a group
+    // Each slice is 64x1024 from the 256x1024 view (viewSplit)
+    llvm::SmallVector<mlir::Value, 4> tensorSlices;
+    for (int i = 0; i < 4; ++i) {
+        // Offset: [i * 64, 0], Size: [64, 1024], Stride: [1, 1]
+        SmallVector<OpFoldResult> sliceOffsets = {
+            builder.getIndexAttr(i * 64),
+            builder.getIndexAttr(0)
+        };
+        SmallVector<OpFoldResult> sliceSizes = {
+            builder.getIndexAttr(64),
+            builder.getIndexAttr(1024)
+        };
+        SmallVector<OpFoldResult> sliceStrides = {
+            builder.getIndexAttr(1),
+            builder.getIndexAttr(1)
+        };
+        
+        auto tensorSlice = builder.create<tensor::ExtractSliceOp>(
+            location,
+            viewSplit,
+            sliceOffsets,
+            sliceSizes,
+            sliceStrides
+        );
+        tensorSlices.push_back(tensorSlice.getResult());
+    }
+    
+    // Second: Create all 4 schedule.data_slice ops as a group to wrap the tensor slices
+    llvm::SmallVector<mlir::Attribute, 4> outSliceSymbols;
+    llvm::SmallVector<mlir::Value, 4> dataSliceResults;
+    for (int i = 0; i < 4; ++i) {
+        std::string sliceName = "out_slice_" + std::to_string(i);
+        auto dataSliceOp = builder.create<dfscheblueprint::DataSliceOp>(
+            location,
+            tensorSlices[i].getType(), // Result type matches input tensor type
+            builder.getStringAttr(sliceName),
+            tensorSlices[i]
+        );
+        
+        outSliceSymbols.push_back(mlir::SymbolRefAttr::get(ctx, sliceName));
+        dataSliceResults.push_back(dataSliceOp.getResult());
+    }
+
+    // Bind Shim TX
+    llvm::SmallVector<int64_t, 1> shimTxCh = {0};
+    auto shimTxDMA = dfscheblueprint::DMAAttr::get(ctx, shimTxCh, dfscheblueprint::bp_direction::MM2S);
+    builder.create<dfscheblueprint::BindOp>(
+        location,
+        builder.getStringAttr("bind_shim_tx"),
+        mlir::SymbolRefAttr::get(ctx, "shim_gateway"),
+        viewSplit,
+        builder.getStringAttr("root"),
+        shimTxDMA,
+        nullptr // slice_symbol
+    );
+
+    // Bind Cores Input (S2MM - Receive)
+    llvm::SmallVector<int64_t, 1> coresInCh = {0};
+    auto coresInDMA = dfscheblueprint::DMAAttr::get(ctx, coresInCh, dfscheblueprint::bp_direction::S2MM);
+    builder.create<dfscheblueprint::BindGroupOp>(
+        location,
+        builder.getStringAttr("bind_cores_in"),
+        mlir::SymbolRefAttr::get(ctx, "compute_row"),
+        viewSplit,
+        builder.getStringAttr("linear"),
+        coresInDMA,
+        nullptr // slice_symbols
+    );
+
+    // Bind Cores Output (MM2S - Send)
+    llvm::SmallVector<int64_t, 1> coresOutCh = {1};
+    auto coresOutDMA = dfscheblueprint::DMAAttr::get(ctx, coresOutCh, dfscheblueprint::bp_direction::MM2S);
+    builder.create<dfscheblueprint::BindGroupOp>(
+        location,
+        builder.getStringAttr("bind_cores_out"),
+        mlir::SymbolRefAttr::get(ctx, "compute_row"),
+        viewSplit,
+        builder.getStringAttr("linear"),
+        coresOutDMA,
+        builder.getArrayAttr(outSliceSymbols) // slice_symbols
+    );
+
+    // Bind Shim RX
+    llvm::SmallVector<int64_t, 1> shimRxCh = {0};
+    auto shimRxDMA = dfscheblueprint::DMAAttr::get(ctx, shimRxCh, dfscheblueprint::bp_direction::S2MM);
+    builder.create<dfscheblueprint::BindOp>(
+        location,
+        builder.getStringAttr("bind_shim_rx"),
+        mlir::SymbolRefAttr::get(ctx, "shim_gateway"),
+        viewSplit,
+        builder.getStringAttr("root"),
+        shimRxDMA,
+        nullptr // slice_symbol
+    );
+
+    // ============================================================
+    // 4. Collective Transfers
+    // ============================================================
+
+    // Input Scatter
+    builder.create<dfscheblueprint::CollectiveTransferOp>(
+        location,
+        builder.getStringAttr("input_scatter"),
+        builder.getStringAttr("one_to_many"),
+        mlir::SymbolRefAttr::get(ctx, "bind_shim_tx"),
+        mlir::SymbolRefAttr::get(ctx, "bind_cores_in"),
+        nullptr, // ordering
+        builder.getI32IntegerAttr(10)
+    );
+
+    // Output Gather
+    builder.create<dfscheblueprint::CollectiveTransferOp>(
+        location,
+        builder.getStringAttr("output_gather"),
+        builder.getStringAttr("many_to_one"),
+        mlir::SymbolRefAttr::get(ctx, "bind_cores_out"),
+        mlir::SymbolRefAttr::get(ctx, "bind_shim_rx"),
+        builder.getStringAttr("sequential"),
+        builder.getI32IntegerAttr(20)
+    );
+
+    // Note: Tensors are value types, no deallocation needed (removed memref::DeallocOp)
 }
 

@@ -10,7 +10,8 @@
 #include "../passroutingtodmap/routingtodmap.h"
 #include "../passdmaptodmaphop/dmaptodmaphop.h"
 #include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
-#include "../passdmaphoptodfschedule/passdmaphoptodfschedule.h"
+#include "../passblueprinttoschedule/passblueprinttoschedule.h"
+#include "../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.h"
 #include "dmapmanager.h"
 #include "dmaphopmanager.h"
 #include "dfschedulemanager.h"
@@ -797,6 +798,8 @@ void routingtodmap() {
 void routingtodfschedule() {
     MLIRContext ctx;
     
+    RoutingTopology rtopology("Gen2");
+    
     routingmanager mtest;
     dfschedulemanager dfscheduletest;
     
@@ -821,10 +824,18 @@ void routingtodfschedule() {
     options.label = "After RoutingUnrollingLowerPass:";
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
     pm.addPass(mlir::createPrintIRPass(options));
-    
+
+    options.label = "After RoutingToDmapPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    pm.addPass(std::make_unique<RoutingToDmapPass>(rtopology));
+    options.label = "After RoutingToDmapPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    pm.addPass(std::make_unique<DmapToDmaphopPass>(rtopology));
+    options.label = "After DmapToDmaphopPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
     // Convert routing to dfschedule
-    options.label = "After DmaphopTodfschedulePass:";
-    pm.addPass(std::make_unique<DmaphopTodfschedulePass>());
+    options.label = "After DmaphopTodfscheblueprintPass:";
+    pm.addPass(std::make_unique<DmaphopTodfscheblueprintPass>());
     pm.addPass(mlir::createPrintIRPass(options));
     
     // Run the pass pipeline

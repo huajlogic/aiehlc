@@ -66,7 +66,8 @@ include_directories(../../routinghw/)
 include_directories(../)
 include_directories(../routingimplement/include/)
 include_directories(../passroutingtodmap/)
-include_directories(../passdmaphoptodfschedule/)
+include_directories(../passblueprinttoschedule/)
+include_directories(../passdmaphoptodfscheblueprint/)
 include_directories(../../dataflowmap/dmap/inc/)
 include_directories(../../dataflowmap/dmap/)
 include_directories(../../dataflowmap/dmaphop/inc/)
@@ -94,7 +95,8 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passroutingtodmap/routingtodmap.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaptodmaphop/dmaptodmaphop.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptodfschedule/passdmaphoptodfschedule.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/passblueprinttoschedule.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingpath.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/hwresource.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/ResourceManager.cpp

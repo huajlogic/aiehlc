@@ -67,6 +67,7 @@ using namespace dmaphop;
 
 //#include "../dmap/dmapmanager.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "routingmanager.h"
 
 class dmaphopmanager{
 public:

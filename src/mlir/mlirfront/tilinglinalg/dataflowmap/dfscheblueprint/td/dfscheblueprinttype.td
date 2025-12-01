@@ -27,5 +27,17 @@ def dfscheblueprint_ManifestType : dfscheblueprinttype<"Manifest"> {
   let summary = "Transfer manifest handle";
 }
 
+// Data handle type
+def dfscheblueprint_DataHandleType : dfscheblueprinttype<"DataHandle"> {
+  let mnemonic = "data_handle";
+  let summary = "Handle to declared data";
+}
+
+// View handle type
+def dfscheblueprint_ViewHandleType : dfscheblueprinttype<"ViewHandle"> {
+  let mnemonic = "view_handle";
+  let summary = "Handle to a data view/partition";
+}
+
 #endif //_TYPE_dfscheblueprint_
 

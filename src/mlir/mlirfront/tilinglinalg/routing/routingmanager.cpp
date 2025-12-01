@@ -180,6 +180,83 @@ ParseResult RoutingCreate::parse(OpAsmParser &parser, OperationState &result) {
   return success();
 }
 
+// partitiontensorOp printer
+void routing::partitiontensor::print(OpAsmPrinter &printer) {
+    printer << " tensor = " << getTensor() << " : " << getTensor().getType();
+    printer << " {";
+    printer << "\n          splitnum = " << getSplitnum() << ",";
+    printer << "\n          splitdim = " << getSplitdim() << ",";
+    printer << "\n          hw_axis_owner = " << getHwAxisOwnerAttr() << ",";
+    printer << "\n          replicate_on = " << getReplicateOnAttr() << ",";
+    printer << "\n          single_tile_owner = " << getSingleTileOwnerAttr();
+    printer << "\n     }";
+    printer.printOptionalAttrDict(getOperation()->getAttrs(), 
+        /*elidedAttrs=*/{"splitnum", "splitdim", "hw_axis_owner", "replicate_on", "single_tile_owner"});
+    printer << " -> " << getOutput().getType();
+}
+
+// partitiontensorOp parser
+ParseResult routing::partitiontensor::parse(OpAsmParser &parser, OperationState &result) {
+    OpAsmParser::UnresolvedOperand tensorOperand;
+    Type tensorType;
+    
+    if (parser.parseKeyword("tensor") || parser.parseEqual())
+        return failure();
+        
+    if (parser.parseOperand(tensorOperand) || parser.parseColonType(tensorType))
+        return failure();
+        
+    if (parser.parseLBrace()) return failure();
+    
+    while (true) {
+        OptionalParseResult res = parser.parseOptionalRBrace();
+        if (res.has_value()) {
+            if (failed(res.value())) return failure();
+            break;
+        }
+        
+        StringRef attrName;
+        if (parser.parseKeyword(&attrName) || parser.parseEqual()) return failure();
+        
+        if (attrName == "splitnum") {
+            IntegerAttr attr;
+            if (parser.parseAttribute(attr, "splitnum", result.attributes)) return failure();
+        } else if (attrName == "splitdim") {
+            IntegerAttr attr;
+            if (parser.parseAttribute(attr, "splitdim", result.attributes)) return failure();
+        } else if (attrName == "hw_axis_owner") {
+            StringAttr attr;
+            if (parser.parseAttribute(attr, "hw_axis_owner", result.attributes)) return failure();
+        } else if (attrName == "replicate_on") {
+            StringAttr attr;
+            if (parser.parseAttribute(attr, "replicate_on", result.attributes)) return failure();
+        } else if (attrName == "single_tile_owner") {
+            StringAttr attr;
+            if (parser.parseAttribute(attr, "single_tile_owner", result.attributes)) return failure();
+        } else {
+             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+        }
+        
+        parser.parseOptionalComma();
+    }
+        
+    if (parser.parseOptionalAttrDict(result.attributes))
+        return failure();
+        
+    if (parser.parseArrow())
+        return failure();
+        
+    Type resultType;
+    if (parser.parseType(resultType))
+        return failure();
+        
+    result.addTypes(resultType);
+    if (parser.resolveOperand(tensorOperand, tensorType, result.operands))
+        return failure();
+        
+    return success();
+}
+
 //routing class
 void routingmanager::type_interface_test(MLIRContext* ctx) {
         //ctx->getOrLoadDialect<routing::routingdialect>();
@@ -227,13 +304,15 @@ ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
     auto block = main.addEntryBlock();
     builder.setInsertionPointToEnd(block);
     auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(),  hwrowused, hwcolused);
-    //dummy tensor
+    //schedule tensor with tensor type
+    SmallVector<int64_t> shapeVec = {16, 16};
     SmallVector<Attribute> shape;
-    for (int64_t v : {10, 20})
-    shape.push_back(builder.getI64IntegerAttr(v));
+    for (int64_t v : shapeVec)
+        shape.push_back(builder.getI64IntegerAttr(v));
     ArrayAttr vals = builder.getArrayAttr(shape);  // satisfies I64ArrayAttr
     IntegerAttr dimnum = builder.getI64IntegerAttr(2);
-    auto tensor = builder.create<createdummytensor>(builder.getUnknownLoc(), vals, dimnum);
+    auto tensorType = RankedTensorType::get(shapeVec, builder.getF32Type());
+    auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, vals, dimnum);
     createroutingfuncByDim(builder, ctx, false, mesh, tensor, hwrowused, "row");
     createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwrowused, "row");
     createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwcolused, "col");
@@ -309,7 +388,7 @@ mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int total
             ArrayAttr vals = builder.getArrayAttr(shape);  // satisfies I64ArrayAttr
             // 3) I64Attr ($dim).
             IntegerAttr dimnum = builder.getI64IntegerAttr(2);
-            auto tensor = builder.create<createdummytensor>(builder.getUnknownLoc(),  subview, vals, dimnum);
+            auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(),  subview, vals, dimnum);
             //
             auto hw_row_number = rnum_i32;
             IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
@@ -358,11 +437,28 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                     OpBuilder::InsertionGuard guard(builder);
                     //fix the upper scope return go inside this region issue
                     builder.setInsertionPointToStart(&exec.getRegion().emplaceBlock());
-                ///*                
+                ///*               
                     auto patitionmesh = builder.create<partitionmesh>(builder.getUnknownLoc(),  mesh, hwsplitnum, splitAxis);
-                    IntegerAttr splitdim = builder.getI64IntegerAttr(0);//dim 0 is 
-                    auto outTy = builder.getI32Type();
-                    auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensor, hwsplitnum, 0, tensorhwaxisowner,"col","");
+                    int splitdimn= splitAxis == "row" ? 0 : 1;
+                    IntegerAttr splitdim = builder.getI64IntegerAttr(splitdimn);//dim 0 is 
+                    if (splitdimn == 0) {
+                        assert(splitAxis == "row" && "splitdim 0 must be row");
+                    } else {
+                        assert(splitAxis == "col" && "splitdim 1 must be col");
+                    }
+                    // Get tensor type from input tensor for partitiontensor result
+                    auto tensorType = tensor.getType().cast<RankedTensorType>();
+                    auto rowtensor = builder.create<partitiontensor>(builder.getUnknownLoc(), tensorType, tensor, hwsplitnum, 0, tensorhwaxisowner,"col","");
+                    
+                    // Calculate split tensor type
+                    SmallVector<int64_t> splitShape(tensorType.getShape());
+                    if (splitdimn== 0) {
+                        if (splitShape[0] != ShapedType::kDynamic) splitShape[0] /= hwsplitnum;
+                    } else {
+                        if (splitShape[1] != ShapedType::kDynamic) splitShape[1] /= hwsplitnum;
+                    }
+                    auto splitTensorType = RankedTensorType::get(splitShape, tensorType.getElementType());
+
                     Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
                     Value ub = builder.create<arith::ConstantIndexOp>(location, hwsplitnum);
                     Value step = builder.create<arith::ConstantIndexOp>(location,1);
@@ -381,14 +477,16 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
                         auto routingcreateOp = builder.create<routing::RoutingCreate>(builder.getUnknownLoc(), idx, memo, [&](OpBuilder &builder1, Location bodyLoc,Value sidx) { 
                             //use such format to fix the generic format print issue 
                             ///*
-                            auto slicetensor = builder1.create<extract_data>(builder1.getUnknownLoc(), rowtensor, sidx);
+                            // extract_data returns the split tensor type
+                            auto slicetensor = builder1.create<extract_data>(builder1.getUnknownLoc(), splitTensorType, rowtensor, sidx);
                             auto tilelist = builder1.create<extract_tiles>(builder1.getUnknownLoc(), patitionmesh, sidx);
                             
                             if (binput) {
                                 auto hwio = builder1.create<createhwiowithtarget>(builder1.getUnknownLoc(), tilelist, "input", "mem2");
                                 auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), slicetensor, hwio);
                             } else {
-                                auto gatherdata = builder1.create<routinggatherout>(builder1.getUnknownLoc(), tilelist, slicetensor);
+                                // routinggatherout now takes AnyTensor and returns AnyTensor
+                                auto gatherdata = builder1.create<routinggatherout>(builder1.getUnknownLoc(), slicetensor.getType(), tilelist, slicetensor);
                                 auto hwio = builder1.create<createhwiowithtarget>(builder1.getUnknownLoc(), tilelist, "output", "mem2");
                                 auto datamov = builder1.create<movedatabyio>(builder1.getUnknownLoc(), gatherdata, hwio);
                             }

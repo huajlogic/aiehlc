@@ -34,15 +34,27 @@ class dfscheblueprintop<string name, list<Trait> traits=[]> : Op<dfscheblueprint
 // DMA Direction Enum
 def BP_MM2S : I32EnumAttrCase<"MM2S", 0, "MM2S">;
 def BP_S2MM : I32EnumAttrCase<"S2MM", 1, "S2MM">;
+def BP_BOTH : I32EnumAttrCase<"BOTH", 2, "BOTH">;
 def bp_direction_enum : I32EnumAttr<"bp_direction", "DMA direction", [
       BP_MM2S,
-      BP_S2MM]> {
+      BP_S2MM,
+      BP_BOTH]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "dfscheblueprint";
 }
 
 def bp_directionAttr : EnumAttr<dfscheblueprintdialect, bp_direction_enum, "direction"> {
   let assemblyFormat = "`<` $value `>`";
+}
+
+// DMA Attribute
+def dfscheblueprint_DMAAttr : dfscheblueprintattr<"DMA"> {
+  let summary = "DMA configuration attribute";
+  let parameters = (ins
+    ArrayRefParameter<"int64_t">:$channels,
+    "bp_direction":$direction
+  );
+  let assemblyFormat = "`<` `channels` `=` `[` $channels `]` `,` `direction` `=` $direction `>`";
 }
 
 // Slice attribute - defines data tiling/slicing

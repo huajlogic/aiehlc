@@ -3,6 +3,7 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 #include "dmapmanager.h"
+#include "mlir/IR/OpImplementation.h"
 #include <iostream>
 
 #define GET_TYPEDEF_CLASSES
@@ -22,6 +23,40 @@
 #undef GET_OP_CLASSES
 #undef GET_ATTRDEF_CLASSES
 #undef GET_TYPEDEF_CLASSES
+
+//===----------------------------------------------------------------------===//
+// Custom Printers and Parsers
+//===----------------------------------------------------------------------===//
+
+// FuncOp printer
+void dmap::FuncOp::print(OpAsmPrinter &printer) {
+    printer << " ";
+    printer.printSymbolName(getSymName());
+    printer << " ";
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+    printer.printOptionalAttrDictWithKeyword(getOperation()->getAttrs(), /*elidedAttrs=*/{"sym_name"});
+}
+
+// FuncOp parser
+ParseResult dmap::FuncOp::parse(OpAsmParser &parser, OperationState &result) {
+    StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return failure();
+    
+    Region *body = result.addRegion();
+    if (parser.parseRegion(*body, {}, {}))
+        return failure();
+    
+    if (body->empty())
+        body->emplaceBlock();
+    
+    // Add default function type () -> ()
+    auto builder = parser.getBuilder();
+    auto funcType = builder.getFunctionType({}, {});
+    result.addAttribute("funcType", TypeAttr::get(funcType));
+    
+    return success();
+}
 
 void dmapdialect::initialize()  { 
     addOperations<
@@ -61,21 +96,19 @@ ModuleOp dmapmanager::ops_test(MLIRContext* ctx, int totalN) {
     //m.push_back(func);
     auto functype = builder.getFunctionType({},{});
     
-    //dmap::FuncOp main = builder.create<dmap::FuncOp>(builder.getUnknownLoc(), "main", functype);
-    //m.push_back(main);
-    //auto block = main.addEntryBlock();
-    //auto &block = main.getBody().emplaceBlock();
-    //builder.setInsertionPointToEnd(&block);
-    mlir::func::FuncOp main = builder.create<func::FuncOp>(builder.getUnknownLoc(), "main", functype);
-    auto block = main.addEntryBlock();
-    builder.setInsertionPointToEnd(block);
+    dmap::FuncOp main = builder.create<dmap::FuncOp>(builder.getUnknownLoc(), builder.getStringAttr("main"), TypeAttr::get(functype));
     m.push_back(main);
+    auto &block = main.getBody().emplaceBlock();
+    builder.setInsertionPointToEnd(&block);
+    //mlir::func::FuncOp main = builder.create<func::FuncOp>(builder.getUnknownLoc(), "main", functype);
+    //auto block = main.addEntryBlock();
+    //builder.setInsertionPointToEnd(block);
+    //
+    SymbolTable symTable(main);
 
-    //SymbolTable symTable(main);
-
-    //createdmapfuncByDim(builder, ctx, symTable);
-    createdmapfuncByDim(builder, ctx);
-    auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
+    createdmapfuncByDim(builder, ctx, symTable);
+    //createdmapfuncByDim(builder, ctx);
+    //auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     
 
     
@@ -83,15 +116,15 @@ ModuleOp dmapmanager::ops_test(MLIRContext* ctx, int totalN) {
   // ------------------------------------------------------------------
   // 4. Look up the symbol anywhere inside the module
   // ------------------------------------------------------------------
-   //Operation *found = symTable.lookup("receive1");
-   //if (!found) {
-    // llvm::errs() << "Symbol @receive1 not found!\n";
+   Operation *found = symTable.lookup("receive1");
+   if (!found) {
+     llvm::errs() << "Symbol @receive1 not found!\n";
      
  
-   //} else {
-    // llvm::outs() << "receive1 found \n";
-    // llvm::outs() << "Found: " << found->getName() <<"\n";
-   //}
+   } else {
+     llvm::outs() << "receive1 found \n";
+     llvm::outs() << "Found: " << found->getName() <<"\n";
+   }
     llvm::errs() << m;
     return m;
 }
@@ -113,13 +146,14 @@ void dmapmanager::loaddialect(MLIRContext* ctx) {
       %broadcast_stream = dataflowmap.create_stream %send_port, %receive_group         
       dataflowmap.push %data, %broadcast_stream {cache_policy = "force_memtile" }
 */
-//void dmapmanager::createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx,SymbolTable& symTable) {
-void dmapmanager::createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx) {
+void dmapmanager::createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx,SymbolTable& symTable) {
+//void dmapmanager::createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx) {
         auto location = builder1.getUnknownLoc();
         // no region creatation
         auto functype = builder1.getFunctionType({},{});
         mlir::Attribute mm=builder1.getStringAttr("main");
-        dmap::FuncOp main = builder1.create<dmap::FuncOp>(builder1.getUnknownLoc(), mm, [&](OpBuilder &builder, Location bodyLoc) { 
+        auto & builder = builder1;
+        //dmap::FuncOp main = builder1.create<dmap::FuncOp>(builder1.getUnknownLoc(), mm, [&](OpBuilder &builder, Location bodyLoc) { 
        ///*   
         mlir::SmallVector<mlir::Attribute, 4> shapeElems;
         shapeElems.push_back(builder.getI64IntegerAttr(16));
@@ -147,7 +181,7 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx) {
         mlir::Type portconfig = dmap::dmapportconfigType::get(ctx);
         std::string symbolName = "receive1";
         auto pf = builder.create<dmap::define_port_configure>(builder.getUnknownLoc(), portconfig, symbolName, receivepattern);
-        //symTable.insert(pf);
+        symTable.insert(pf);
         mlir::SymbolRefAttr symbolRef = mlir::SymbolRefAttr::get(ctx,"receive1");
         //auto useOp = builder.create<dmap::UseSymbolOp>(builder.getUnknownLoc(), symbolRef);
         //config io port 
@@ -222,17 +256,17 @@ void dmapmanager::createdmapfuncByDim(OpBuilder& builder1, MLIRContext* ctx) {
         //auto portgroup = builder.create<createport_group>(builder.getUnknownLoc(),  ioout, portlist);  
         //*/
         builder.create<dmap::YieldOp>(builder.getUnknownLoc());
-     });
-    SymbolTable symTable(main);
-    Operation *found = symTable.lookup("receive1");
-    if (!found) {
-        llvm::errs() << "Symbol @receive1 not found!\n";
+     //});
+    //SymbolTable symTable(main);
+    //Operation *found = symTable.lookup("receive1");
+    //if (!found) {
+    //    llvm::errs() << "Symbol @receive1 not found!\n";
         
     
-    } else {
-        //llvm::outs() << "receive1 found \n";
-        llvm::outs() << "Found: " << found->getName() <<"\n";
-    }
+    //} else {
+    //    //llvm::outs() << "receive1 found \n";
+    //    llvm::outs() << "Found: " << found->getName() <<"\n";
+    //}
     return ;//func;
 }
 /*

@@ -18,12 +18,16 @@ include "mlir/Interfaces/FunctionInterfaces.td"
 
 include "mlir/IR/BuiltinTypes.td"
 include "dfscheblueprinttype.td"
-
+//-- no SymbolTable will cause the generic print when block have Symbol
+//-- no NoTerminator will cause the generic print when block is empty or there is no terminate op like yeld
+//-- let hasCustomAssemblyFormat = 1; will fix the generic print issue after the said fix in
 // schedule.config - Top-level container for schedule blueprint
 def dfscheblueprint_ConfigOp : dfscheblueprintop<"config", [
     IsolatedFromAbove,  
+    SymbolTable,
     Symbol,
-    SingleBlock
+    SingleBlock,
+    NoTerminator
   ]> {
   let summary = "Schedule configuration blueprint container";
   let description = [{
@@ -47,7 +51,7 @@ def dfscheblueprint_ConfigOp : dfscheblueprintop<"config", [
   
   let hasCustomAssemblyFormat = 1;
 }
-
+// Symbol will cause generic print once the partent have no Symboltalbe
 // schedule.transfer_manifest - Individual data transfer specification
 def dfscheblueprint_TransferManifestOp : dfscheblueprintop<"transfer_manifest", [
     Symbol,
@@ -94,6 +98,136 @@ def dfscheblueprint_TransferManifestOp : dfscheblueprintop<"transfer_manifest", 
     // Helper to access destination endpoints
     ArrayAttr getDestinationEndpoints() { return getDestinations(); }
   }];
+}
+
+// schedule.resource_group
+def dfscheblueprint_ResourceGroupOp : dfscheblueprintop<"resource_group", [
+    Symbol
+  ]> {
+  let summary = "Defines a group of physical tiles";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    ArrayAttr:$tiles // Array of arrays/tuples e.g. [(0,2)]
+  );
+  let assemblyFormat = "$sym_name `{` `tiles` `=` $tiles `}` attr-dict";
+}
+
+// schedule.declare_data - Creates a logical tensor without memory allocation
+def dfscheblueprint_DeclareDataOp : dfscheblueprintop<"declare_data", [
+    
+  ]> {
+  let summary = "Declares a logical data tensor";
+  let description = [{
+    Declares a logical tensor for scheduling purposes. This creates an SSA value
+    representing the data shape and type without actual memory allocation.
+    
+    Example:
+    ```mlir
+    %root_data = schedule.declare_data tensor<1024x1024xf32>
+    ```
+  }];
+  let arguments = (ins
+    TypeAttr:$data_type
+  );
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$data_type attr-dict `->` type($result)";
+}
+
+// schedule.partition
+def dfscheblueprint_PartitionOp : dfscheblueprintop<"partition", [
+    
+  ]> {
+  let summary = "Partitions data into views";
+  let arguments = (ins
+    dfscheblueprint_DataHandleType:$data,
+    ArrayAttr:$tile_shape
+  );
+  let results = (outs dfscheblueprint_ViewHandleType:$result);
+  let assemblyFormat = "$data `{` `tile_shape` `=` $tile_shape `}` attr-dict";
+}
+
+// schedule.extract
+def dfscheblueprint_ExtractOp : dfscheblueprintop<"extract", [
+    
+  ]> {
+  let summary = "Extracts a specific partition from a partitioned view";
+  let arguments = (ins
+    AnyType:$view,
+    I32Attr:$index
+  );
+  let results = (outs dfscheblueprint_ViewHandleType:$result);
+  let assemblyFormat = "$view `:` type($view) `{` `index` `=` $index `}` attr-dict";
+}
+
+// schedule.data_slice - wraps a tensor slice with a symbol name
+def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
+    Symbol
+  ]> {
+  let summary = "Wraps a tensor slice with a symbol name for scheduling";
+  let description = [{
+    Wraps a tensor (typically from tensor.extract_slice) with a symbol name
+    for scheduling and binding purposes.
+    
+    Example:
+    ```mlir
+    %slice = tensor.extract_slice %tensor[0, 0] [4, 256] [1, 1] : tensor<16x256xf32> to tensor<4x256xf32>
+    %wrapped = schedule.data_slice @out_slice_0 wrap %slice : tensor<4x256xf32>
+    ```
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    AnyTensor:$tensor_slice
+  );
+  let results = (outs AnyTensor:$result);
+  let hasCustomAssemblyFormat = 1;
+}
+
+// schedule.bind
+def dfscheblueprint_BindOp : dfscheblueprintop<"bind", [
+    Symbol
+  ]> {
+  let summary = "Binds a resource to a data view";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    SymbolRefAttr:$target,
+    AnyType:$view,
+    StrAttr:$slice,
+    dfscheblueprint_DMAAttr:$dma,
+    OptionalAttr<SymbolRefAttr>:$slice_symbol
+  );
+  let hasCustomAssemblyFormat = 1;
+}
+
+// schedule.bind_group
+def dfscheblueprint_BindGroupOp : dfscheblueprintop<"bind_group", [
+    Symbol
+  ]> {
+  let summary = "Binds a resource group to a data view";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    SymbolRefAttr:$target_group,
+    AnyType:$view,
+    StrAttr:$distribution,
+    dfscheblueprint_DMAAttr:$dma,
+    OptionalAttr<ArrayAttr>:$slice_symbols
+  );
+  let hasCustomAssemblyFormat = 1;
+}
+
+// schedule.collective_transfer
+def dfscheblueprint_CollectiveTransferOp : dfscheblueprintop<"collective_transfer", [
+    Symbol
+  ]> {
+  let summary = "Defines a collective transfer between bindings";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    StrAttr:$type,
+    SymbolRefAttr:$from,
+    SymbolRefAttr:$to,
+    OptionalAttr<StrAttr>:$ordering,
+    I32Attr:$base_packet_id
+  );
+  let hasCustomAssemblyFormat = 1;
 }
 
 #endif // dfscheblueprint_OPS
