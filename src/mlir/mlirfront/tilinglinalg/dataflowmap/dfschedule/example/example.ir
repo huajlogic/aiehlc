@@ -1,11 +1,25 @@
+//===----------------------------------------------------------------------===//
+//
+// Copyright (C) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: MIT
+//
+//===----------------------------------------------------------------------===//
+//
+// Example IR demonstrating the dfschedule dialect usage pattern.
+// This file shows the host-side configuration and kernel-side scheduling
+// for a typical AIE dataflow application with ping-pong buffering.
+//
+//===----------------------------------------------------------------------===//
+
 module {
    dfschedule.host_0 {
-      %gmem = "dfschedule.dfhost.config.alloc"() : () -> memref<1024xf32>
+      %tensor = tensor.empty() : tensor<1024x1024xf32>
+      %gmem = "dfschedule.dfhost.config.alloc"(%tensor) : () -> memref<1024xf32>
       %shim0 = dfschedule.dfhost.config.declaretile {col = 3, row = 0} : dfhost.config.tile
       %core0 = dfschedule.dfhost.config.declaretile {col = 0, row = 3} : dfhost.config.tile
       %core1 = dfschedule.dfhost.config.declaretile {col = 1, row = 3} : dfhost.config.tile
-      %slice_0 = tensor.extract_slice  %data[...]
-      %slice_1 = tensor.extract_slice  %data[...]
+      %slice_0 = tensor.extract_slice  %tensor[...]
+      %slice_1 = tensor.extract_slice  %tensor[...]
       %kernel_packet_0 = dfschedule.dfhost.packet @packet0 (%slice_0) {dma_channel=0}
       %kernel_packet_1 = dfschedule.dfhost.packet @packet1 (%slice_1) {dma_channel=0}
       %bd_config = "dfhost.config.dma_bd"(%gmem) {
@@ -23,61 +37,71 @@ module {
         operation = "SEND"
       } : ( !dfhost.bdconfig_handle) -> !dfhost.io_handle
 
-      //launch kernel
+      // Launch kernel
       %evt_group = "ds.host.launch_kernel_group"(%core_0, %core_1) {
         callee = [@dskernel_receiver],
         distributed_args = [@packet0, @packet1],   
       } : (!ds.tile, !ds.tile, tensor<4xi32>, i32) -> !ds.event
+      
       // ============================================================
-      // Step 3: schedule
+      // Step 3: Schedule - Runtime execution phase
       // ============================================================
       %bd_id = dfhost.schedule.getbdid(): arith.constant(i32)
       %evnt_io = "dfhost.schedule.start_io"(%io_0, %bd_id) : (!dfhost.io_handle) -> ()
       dfhost.schedule.wait(%evt_io, %evt_kern)
     
   }
+  
+  // ============================================================
+  // Kernel Function: Receiver with Ping-Pong Buffering
+  // ============================================================
   dfschedule.dskernel_receiver(%arg0: packet,%loop_count:arith:constant) {
     %input_tensor = dfschedule.gettensor(%arg0)
     %channel = dfschedule.getdmachannel(%arg0)
+    
+    // Allocate ping-pong buffers in shared local memory
     %ping = dfschedule.kernel.memalloc(%input_tensor) 
         : (tensor<16x256xf32>) -> memref<16x256xf32, "SHARED">
   
     %pong = dfschedule.kernel.memalloc(%input_tensor) 
         : (tensor<16x256xf32>) -> memref<16x256xf32, "SHARED">
 
+    // Initialize locks for ping-pong synchronization
+    // Acquire locks: signal when buffer is filled by DMA (0 = empty)
+    // Release locks: signal when buffer is processed by compute (1 = ready for DMA)
     %0 = dskernel.lock_init(0, "ping_aquire_lock") -> !dskernel.lock
     %1 = dskernel.lock_init(0, "pong_aquire_lock") -> !dskernel.lock
     %2 = dskernel.lock_init(1, "ping_release_lock") -> !dskernel.lock
     %3 = dskernel.lock_init(0, "pong_release_lock") -> !dskernel.lock
     
-    // --- Thread A (DMA): Runs in Parallel ---
-    // (Your code was correct, but the initial lock values must 
-    //  match the parallel compute loop's needs. 
-    //  DMA waits for Ping-Release(1) and releases Ping-Acquire(0))
+    // ============================================================
+    // DMA Thread: Runs in parallel with compute
+    // ============================================================
+    // The DMA waits for Release locks (buffer is free) and sets Acquire locks (buffer is full)
     "dskernel.launch_dma_s2m_loop"(%ping, %pong) {
-      listen_on_packet_id = %pkt_id, // <--- 使用提取出的 ID
+      listen_on_packet_id = %pkt_id,  // Use the extracted packet ID
       
-      // 告诉 DMA: 
-      // 1. 获取 Write 锁 (确保 buffer 空闲)
-      // 2. 搬运数据
-      // 3. 释放 Read 锁 (告诉 Core 数据好了)
+      // DMA behavior:
+      // 1. Acquire Write lock (ensure buffer is empty/available)
+      // 2. Transfer data into buffer
+      // 3. Release Read lock (signal to compute core that data is ready)
       locks_ping = { acq=%l_ping_write, rel=%l_ping_read },
       locks_pong = { acq=%l_pong_write, rel=%l_pong_read }
     } : (memref<16x256xf32, "SHARED">, memref<16x256xf32, "SHARED">) -> ()
 
     // ============================================================
-    // 5. [Compute Loop] 执行 Ping-Pong 计算
+    // Compute Loop: Ping-Pong computation pattern
     // ============================================================
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
     
     scf.for %i = %c0 to %loop_count step %c1 {
       
-      // --- A. Ping/Pong 选择逻辑 ---
-      // 偶数轮用 Ping，奇数轮用 Pong
+      // --- A. Ping/Pong selection logic ---
+      // Even iterations use Ping, odd iterations use Pong
       %is_ping = arith.cmpi "eq", arith.remui(%i, %c2), %c0 : index
       
-      // 使用 scf.if 选择当前的 Buffer 和 Lock
+      // Use scf.if to select the current buffer and locks
       %curr_buf, %curr_read_lock, %curr_write_lock = scf.if %is_ping 
         -> (memref<16x256xf32, "SHARED">, !dskernel.lock, !dskernel.lock) {
         scf.yield %ping, %l_ping_read, %l_ping_write
@@ -85,16 +109,16 @@ module {
         scf.yield %pong, %l_pong_read, %l_pong_write
       }
 
-      // --- B. Acquire (等待数据) ---
-      // 等待 DMA 填满数据 (Read Lock -> 1)
+      // --- B. Acquire (wait for data) ---
+      // Wait for DMA to fill the buffer (Read Lock -> 1)
       "dskernel.acquire_lock"(%curr_read_lock, 1)
 
-      // --- C. Compute (核心计算) ---
-      // 在这里，tensor 的概念已经消失了，我们直接操作物理 memref
+      // --- C. Compute (core computation) ---
+      // At this point, the tensor abstraction is gone; we operate on physical memref
       "core.compute"(%curr_buf) : (memref<16x256xf32, "SHARED">) -> ()
 
-      // --- D. Release (释放缓冲) ---
-      // 归还 Buffer 给 DMA (Write Lock -> 1)
+      // --- D. Release (free buffer) ---
+      // Return buffer to DMA (Write Lock -> 1)
       "dskernel.release_lock"(%curr_write_lock, 1)
     }
   
