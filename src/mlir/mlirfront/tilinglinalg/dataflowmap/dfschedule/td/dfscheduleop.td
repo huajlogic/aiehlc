@@ -237,5 +237,147 @@ def dfschedule_L2YieldOp : dfscheduleop<"yield", [
   let arguments = (ins);
   let assemblyFormat = "attr-dict";
 }
+
+// ---- Block Ops for Host/Kernel Config and Schedule ----
+// These operations organize the schedule into logical sections:
+// - Config blocks: Setup and resource allocation (host or kernel side)
+// - Schedule blocks: Execution and synchronization logic (host or kernel side)
+// All four blocks use SingleBlock + NoTerminator traits, meaning:
+// 1. They contain exactly one region with one block
+// 2. No explicit terminator is required (operations flow through implicitly)
+
+///*
+def dfschedule_HostConfigOp : dfscheduleop<"host_config", [
+//
+    SymbolTable,
+    Symbol,
+    SingleBlock,
+    NoTerminator
+  ]> {
+  let summary = "Host-side DMA configuration block (no terminator required)";
+  let description = [{
+    Logical grouping for host-side resource allocation and configuration.
+    Contains operations for:
+    - Device memory allocation (alloc_device_mem)
+    - Tile handle acquisition (get_tile_handle)
+    - Stream handle lookup (get_stream_handle)
+    - Packet ID retrieval (get_packet_id)
+    
+    This block has no explicit terminator - execution flows implicitly to the next operation.
+    
+    Example:
+    ```mlir
+    dfschedule.host_config @config_name {
+      %gmem = dfschedule.alloc_device_mem : memref<1024xf32>
+      %shim_handle = dfschedule.get_tile_handle {col = 2 : i32, row = 0 : i32} -> !dfschedule.tile_handle
+      %streamA = dfschedule.get_stream_handle @my_routes::@route_A -> !dfschedule.stream
+      %pidA = dfschedule.get_packet_id @my_routes::@route_A -> !dfschedule.packet
+    }
+    ```
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+}
+
+def dfschedule_KernelConfigOp : dfscheduleop<"kernel_config", [
+    SingleBlock,
+    NoTerminator//,
+    //SymbolTable,
+    //Symbol
+  ]> {
+  let summary = "Kernel-side buffer and lock configuration block (no terminator required)";
+  let description = [{
+    Logical grouping for kernel-side resource setup.
+    Contains operations for:
+    - Ping-pong buffer allocation (memref.alloca)
+    - Lock initialization for synchronization (lock_init)
+    - DMA configuration resources
+    
+    This block has no explicit terminator - execution flows implicitly to the next operation.
+    
+    Example:
+    ```mlir
+    dfschedule.kernel_config @config_name {
+      %ping = memref.alloca() {buffer_type = "ping"} : memref<256xf32>
+      %pong = memref.alloca() {buffer_type = "pong"} : memref<256xf32>
+      %ping_acquire = dfschedule.lock_init(0) -> !dfschedule.lock
+      %pong_acquire = dfschedule.lock_init(0) -> !dfschedule.lock
+      %ping_release = dfschedule.lock_init(1) -> !dfschedule.lock
+      %pong_release = dfschedule.lock_init(0) -> !dfschedule.lock
+    }
+    ```
+  }];
+  //let arguments = (ins SymbolNameAttr:$sym_name);
+  let arguments = (ins StrAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+}
+
+def dfschedule_HostScheduleOp : dfscheduleop<"host_schedule", [
+    SingleBlock,
+    NoTerminator,
+    SymbolTable,
+    Symbol
+  ]> {
+  let summary = "Host-side execution schedule block (no terminator required)";
+  let description = [{
+    Logical grouping for host-side execution orchestration.
+    Contains operations for:
+    - Asynchronous kernel launches (launch_kernel_async)
+    - DMA initiation
+    - Event synchronization (wait)
+    
+    This block has no explicit terminator - execution flows implicitly to the next operation.
+    
+    Example:
+    ```mlir
+    dfschedule.host_schedule @schedule_name {
+      %evt_dma = dfschedule.launch_kernel_async(%shim_handle, %gmem, %streamA, %streamB) -> !dfschedule.event
+      %evt_A = dfschedule.launch_kernel_async(%core_A_handle, %pidA) {callee = @kernel_func} -> !dfschedule.event
+      %evt_B = dfschedule.launch_kernel_async(%core_B_handle, %pidB) {callee = @kernel_func} -> !dfschedule.event
+      dfschedule.wait(%evt_dma, %evt_A, %evt_B) : (!dfschedule.event, !dfschedule.event, !dfschedule.event)
+    }
+    ```
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+}
+
+def dfschedule_KernelScheduleOp : dfscheduleop<"kernel_schedule", [
+    SingleBlock,
+    NoTerminator,
+    SymbolTable,
+    Symbol
+  ]> {
+  let summary = "Kernel-side execution schedule block (no terminator required)";
+  let description = [{
+    Logical grouping for kernel-side execution logic.
+    Contains operations for:
+    - DMA loops (launch_dma_s2m_loop)
+    - Compute loops with ping-pong synchronization
+    - Lock acquire/release operations
+    
+    This block has no explicit terminator - execution flows implicitly to the next operation.
+    
+    Example:
+    ```mlir
+    dfschedule.kernel_schedule @schedule_name {
+      dfschedule.launch_dma_s2m_loop %ping : memref<256xf32>, %pong : memref<256xf32>, %packet_id, 
+                                     %ping_acq, %pong_acq, %ping_rel, %pong_rel { ... }
+      scf.for %i = %c0 to %c4 step %c1 {
+        // Ping-pong buffer selection and compute logic
+        dfschedule.acquire_lock %selected_lock, %lock_val
+        dfschedule.compute %selected_buffer : memref<256xf32>
+        dfschedule.release_lock %selected_lock, %lock_val
+      }
+    }
+    ```
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+}
  
 #endif // dfschedule_OPS

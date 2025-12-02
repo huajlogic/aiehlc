@@ -84,7 +84,14 @@ add_custom_target(
   COMMENT "Executing custom script before building dfscheblueprint Dialect from tablegen MLIR_INC_ARGS is  ${MLIR_INC_ARGS}  LLVM_ROOT_BIN_ARG is ${LLVM_ROOT_BIN_ARG}"
 )
 
-add_dependencies(test dfscheblueprintdialectteablegen)
+add_custom_target(
+	routingdialectteablegen ALL
+  COMMAND ${CMAKE_COMMAND} -E echo "Running custom script to generate routing dialect..."
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../../routing/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMENT "Executing custom script before building routing Dialect from tablegen MLIR_INC_ARGS is  ${MLIR_INC_ARGS}  LLVM_ROOT_BIN_ARG is ${LLVM_ROOT_BIN_ARG}"
+)
+
+add_dependencies(test dfscheblueprintdialectteablegen routingdialectteablegen)
 
 set(LLVM_PATH /scratch/staff/huaj/mlirdocker/)
 set(LLVM_LIBRARY_DIR ${LLVM_PATH}/llvm-project/build/lib/)

@@ -32,7 +32,7 @@
 void dfscheblueprint::ConfigOp::print(OpAsmPrinter &printer) {
     printer << " @" << getSymName();
     printer << " ";
-    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/true, /*printBlockTerminators=*/false);
 }
 
 // ConfigOp parser

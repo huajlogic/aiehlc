@@ -21,6 +21,8 @@ include "dfscheblueprinttype.td"
 //-- no SymbolTable will cause the generic print when block have Symbol
 //-- no NoTerminator will cause the generic print when block is empty or there is no terminate op like yeld
 //-- let hasCustomAssemblyFormat = 1; will fix the generic print issue after the said fix in
+//-- the synbol op can not be put inside a func.func, if we do that the symbol func will cause generic print
+//--- the reason is the func.func do isolatedfrom above but @symbol will be module visible that will cause confuse
 // schedule.config - Top-level container for schedule blueprint
 def dfscheblueprint_ConfigOp : dfscheblueprintop<"config", [
     IsolatedFromAbove,  
