@@ -14,14 +14,8 @@
 module {
    dfschedule.host_0 {
       %tensor = tensor.empty() : tensor<1024x1024xf32>
-      %gmem = "dfschedule.dfhost.config.alloc"(%tensor) : () -> memref<1024xf32>
-      %shim0 = dfschedule.dfhost.config.declaretile {col = 3, row = 0} : dfhost.config.tile
-      %core0 = dfschedule.dfhost.config.declaretile {col = 0, row = 3} : dfhost.config.tile
-      %core1 = dfschedule.dfhost.config.declaretile {col = 1, row = 3} : dfhost.config.tile
-      %slice_0 = tensor.extract_slice  %tensor[...]
-      %slice_1 = tensor.extract_slice  %tensor[...]
-      %kernel_packet_0 = dfschedule.dfhost.packet @packet0 (%slice_0) {dma_channel=0}
-      %kernel_packet_1 = dfschedule.dfhost.packet @packet1 (%slice_1) {dma_channel=0}
+      %gmem = "dfschedule.declaretensor"(%tensor) : () -> memref<1024xf32>
+      %shim0 = dfschedule.declaretile {col = 3, row = 0} : dfschedule.tile
       %bd_config = "dfhost.config.dma_bd"(%gmem) {
         bd_id = 0 : i32,
         offset = 0 : i32,
@@ -38,33 +32,59 @@ module {
       } : ( !dfhost.bdconfig_handle) -> !dfhost.io_handle
 
       // Launch kernel
-      %evt_group = "ds.host.launch_kernel_group"(%core_0, %core_1) {
+      %core0 = dfschedule.declaretile {col = 0, row = 3} : dfschedule.tile
+      %core1 = dfschedule.declaretile {col = 1, row = 3} : dfschedule.tile
+      //%slice_0 = tensor.extract_slice %gmem[0, 4] [256, 1024] [1, 1] {tag = "partitionslice1"} : tensor<16x16xf32> to tensor<16x4xf32>
+      %kernel_packet_0 = dfschedule.packet @packet0 (%gmem) {dma_channel=0}
+      %kernel_packet_1 = dfschedule.packet @packet1 (%gmem) {dma_channel=0}
+      %kernel_group = "dfschedule.config.load_kernel_group"(%core_0, %core_1) {
         callee = [@dskernel_receiver],
+        distributed_compute_kernel_args = [@comput0, @compute0],
         distributed_args = [@packet0, @packet1],   
-      } : (!ds.tile, !ds.tile, tensor<4xi32>, i32) -> !ds.event
+      } : (!ds.tile, !ds.tile, tensor<4xi32>, i32) -> !dfschedule.kernelgroup
+      %evt_kernel_group = "dfschedule.schedule.launch_kernel_group"(%kernel_group) {
+      } : (dfschedule.kernelgroup) -> !ds.event
       
       // ============================================================
       // Step 3: Schedule - Runtime execution phase
       // ============================================================
       %bd_id = dfhost.schedule.getbdid(): arith.constant(i32)
       %evnt_io = "dfhost.schedule.start_io"(%io_0, %bd_id) : (!dfhost.io_handle) -> ()
-      dfhost.schedule.wait(%evt_io, %evt_kern)
+      dfhost.schedule.wait(%evt_io, %evt_kernel_group)
     
   }
   
+  dfschedule.dskernel.compute @compute0 ( %buf:memref<16x256xf32, "LOCAL">,%loop_count:arith.constant) -> compute {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %rows = arith.constant 16 : index
+      %cols = arith.constant 256 : index
+
+      scf.for %r = %c0 to %rows step %c1 {
+        scf.for %c = %c0 to %cols step %c1 {
+          %v = memref.load %buf[%r, %c] : memref<16x256xf32, "LOCAL">
+          %sq = arith.mulf %v, %v : f32
+          memref.store %sq, %buf[%r, %c] : memref<16x256xf32, "LOCAL">
+          scf.yield
+        }
+        scf.yield
+      }
+      return
+  }
+
   // ============================================================
   // Kernel Function: Receiver with Ping-Pong Buffering
   // ============================================================
-  dfschedule.dskernel_receiver(%arg0: packet,%loop_count:arith:constant) {
+  dfschedule.dskernel_receiver(%arg0: packet, %computelogic:compute , %loop_count:arith:constant) {
     %input_tensor = dfschedule.gettensor(%arg0)
     %channel = dfschedule.getdmachannel(%arg0)
     
     // Allocate ping-pong buffers in shared local memory
     %ping = dfschedule.kernel.memalloc(%input_tensor) 
-        : (tensor<16x256xf32>) -> memref<16x256xf32, "SHARED">
+        : (tensor<16x256xf32>) -> memref<16x256xf32, "LOCAL">
   
     %pong = dfschedule.kernel.memalloc(%input_tensor) 
-        : (tensor<16x256xf32>) -> memref<16x256xf32, "SHARED">
+        : (tensor<16x256xf32>) -> memref<16x256xf32, "LOCAL">
 
     // Initialize locks for ping-pong synchronization
     // Acquire locks: signal when buffer is filled by DMA (0 = empty)
@@ -79,14 +99,9 @@ module {
     // ============================================================
     // The DMA waits for Release locks (buffer is free) and sets Acquire locks (buffer is full)
     "dskernel.launch_dma_s2m_loop"(%ping, %pong) {
-      listen_on_packet_id = %pkt_id,  // Use the extracted packet ID
-      
-      // DMA behavior:
-      // 1. Acquire Write lock (ensure buffer is empty/available)
-      // 2. Transfer data into buffer
-      // 3. Release Read lock (signal to compute core that data is ready)
       locks_ping = { acq=%l_ping_write, rel=%l_ping_read },
-      locks_pong = { acq=%l_pong_write, rel=%l_pong_read }
+      locks_pong = { acq=%l_pong_write, rel=%l_pong_read },
+      channelid = %channel
     } : (memref<16x256xf32, "SHARED">, memref<16x256xf32, "SHARED">) -> ()
 
     // ============================================================
@@ -115,7 +130,7 @@ module {
 
       // --- C. Compute (core computation) ---
       // At this point, the tensor abstraction is gone; we operate on physical memref
-      "core.compute"(%curr_buf) : (memref<16x256xf32, "SHARED">) -> ()
+      "core.compute"(%curr_buf,computelogic = %computelogic) : (memref<16x256xf32, "SHARED">) -> ()
 
       // --- D. Release (free buffer) ---
       // Return buffer to DMA (Write Lock -> 1)
