@@ -10,14 +10,12 @@ def dfschedule_EventType:dfscheduleype<"Event"> {
 
 def dfschedule_StreamType : dfscheduleype<"Stream"> {
   let mnemonic = "stream";
-  //let parameters = (ins TypeParameter<"element type">:$elemTy);
   let summary = "Host-visible stream handle carrying element type";
 }
 
 def dfschedule_PacketType : dfscheduleype<"Packet"> {
   let mnemonic = "packet";
-  //let parameters = (ins TypeParameter<"element type">:$elemTy);
-  let summary = "Host-visible patcket handle carrying element type";
+  let summary = "Host-visible packet handle carrying element type";
 }
 
 //=== dfscheduleDMA Types/Attrs ===//
@@ -26,9 +24,39 @@ def dfschedule_LockType : dfscheduleype<"Lock"> {
   let summary = "Abstract device lock handle";
 }
 
-//=== dfscheduleDMA Types/Attrs ===//
+//=== Tile Types ===//
 def dfschedule_TileHandleType : dfscheduleype<"Tile"> {
-  let mnemonic = "Tile";
-  let summary = "Tile ";
+  let mnemonic = "tile";
+  let summary = "Tile handle for physical tile location";
 }
+
+//=== Kernel Group Types ===//
+def dfschedule_KernelGroupType : dfscheduleype<"KernelGroup"> {
+  let mnemonic = "kernelgroup";
+  let summary = "Handle to a group of kernel instances to be launched together";
+}
+
+//=== Compute Type (for kernel compute logic reference) ===//
+def dfschedule_ComputeType : dfscheduleype<"Compute"> {
+  let mnemonic = "compute";
+  let summary = "Reference to a compute kernel logic block";
+}
+
+//=== DMA Configuration Types ===//
+def dfschedule_BdHandleType : dfscheduleype<"BdHandle"> {
+  let mnemonic = "bd_handle";
+  let summary = "Buffer descriptor handle for DMA configuration";
+}
+
+def dfschedule_IoHandleType : dfscheduleype<"IoHandle"> {
+  let mnemonic = "io_handle";
+  let summary = "IO handle for DMA channel operations";
+}
+
+//=== DMA Channel Type ===//
+def dfschedule_DmaChannelType : dfscheduleype<"DmaChannel"> {
+  let mnemonic = "dma_channel";
+  let summary = "DMA channel identifier";
+}
+
 #endif //_TYPE_dfschedule_

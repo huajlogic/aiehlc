@@ -9,7 +9,6 @@
 #define GET_ATTRDEF_CLASSES
 #define GET_OP_CLASSES
 #define GET_OP_DEFS
-//#define GET_OP_LIST
 #include "dfscheduledialect.cc.inc"
 #include "dfscheduleattr.cc.inc"
 #include "dfscheduletype.cc.inc"
@@ -17,8 +16,6 @@
 
 #include "dfscheduleop.cc.inc"
 
-//#include "../../routing/routingmanager.h"
-//#undef GET_OP_LIST
 #undef GET_OP_DEFS
 
 #undef GET_OP_CLASSES
@@ -30,13 +27,11 @@ void dfscheduledialect::initialize()  {
     #define GET_OP_LIST
     #include "dfscheduleop.cc.inc"
         >();
-    // If there are Attrs / Types: addAttributes<...>(); addTypes<...>();
-     addAttributes<
+    addAttributes<
     #define GET_ATTRDEF_LIST
     #include "dfscheduleattr.cc.inc"
     >();
 
-        // 3. Types
     addTypes<
     #define GET_TYPEDEF_LIST
     #include "dfscheduletype.cc.inc"
@@ -44,47 +39,149 @@ void dfscheduledialect::initialize()  {
 }
 
 // ===== Custom Print/Parse for Block Operations =====
-///*
-// HostConfigOp
-::mlir::ParseResult dfschedule::HostConfigOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
-    // Parse: @symbol_name { body }
+
+// HostBlockOp - Top-level host block
+::mlir::ParseResult dfschedule::HostBlockOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
     mlir::StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return mlir::failure();
     
-    // Parse the region
     auto *body = result.addRegion();
-    if (parser.parseRegion(*body,  {},  {}))
+    if (parser.parseRegion(*body, {}, {}))
         return mlir::failure();
     
-    // Ensure the region has a block
     if (body->empty())
         body->emplaceBlock();
     
     return mlir::success();
 }
 
-
-void dfschedule::HostConfigOp::print(::mlir::OpAsmPrinter &printer) {
-    // Print: @symbol_name { body }
-    printer << "------------- @" << getSymName();
+void dfschedule::HostBlockOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << " @" << getSymName();
     printer << " ";
     printer.printRegion(getBody(), false, false);
 }
-//*/
-// KernelConfigOp
-::mlir::ParseResult dfschedule::KernelConfigOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
-    // Parse: @symbol_name { body }
+
+// DSKernelComputeOp - Compute kernel logic block
+::mlir::ParseResult dfschedule::DSKernelComputeOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
     mlir::StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return mlir::failure();
     
-    // Parse the region
+    // Parse arguments like (%buf: memref<...>, %loop_count: index)
+    llvm::SmallVector<mlir::OpAsmParser::Argument, 4> args;
+    if (parser.parseArgumentList(args, mlir::OpAsmParser::Delimiter::Paren, true))
+        return mlir::failure();
+    
+    // Parse optional -> compute return
+    if (succeeded(parser.parseOptionalArrow())) {
+        // Parse the return type
+        mlir::Type returnType;
+        if (parser.parseType(returnType))
+            return mlir::failure();
+    }
+    
+    auto *body = result.addRegion();
+    if (parser.parseRegion(*body, args))
+        return mlir::failure();
+    
+    if (body->empty())
+        body->emplaceBlock();
+    
+    // Add result type
+    result.addTypes(dfschedule::ComputeType::get(parser.getContext()));
+    
+    return mlir::success();
+}
+
+void dfschedule::DSKernelComputeOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << " @" << getSymName();
+    
+    // Print block arguments
+    auto &block = getBody().front();
+    if (!block.getArguments().empty()) {
+        printer << "(";
+        llvm::interleaveComma(block.getArguments(), printer, [&](mlir::BlockArgument arg) {
+            printer << arg << ": " << arg.getType();
+        });
+        printer << ")";
+    }
+    
+    printer << " -> " << getCompute().getType();
+    printer << " ";
+    printer.printRegion(getBody(), false, false);
+}
+
+// DSKernelReceiverOp - Receiver kernel with ping-pong buffering
+::mlir::ParseResult dfschedule::DSKernelReceiverOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
+    mlir::StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return mlir::failure();
+    
+    // Parse arguments like (%arg0: packet, %computelogic: compute, %loop_count: index)
+    llvm::SmallVector<mlir::OpAsmParser::Argument, 4> args;
+    if (parser.parseArgumentList(args, mlir::OpAsmParser::Delimiter::Paren, true))
+        return mlir::failure();
+    
+    auto *body = result.addRegion();
+    if (parser.parseRegion(*body, args))
+        return mlir::failure();
+    
+    if (body->empty())
+        body->emplaceBlock();
+    
+    return mlir::success();
+}
+
+void dfschedule::DSKernelReceiverOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << " @" << getSymName();
+    
+    // Print block arguments
+    auto &block = getBody().front();
+    if (!block.getArguments().empty()) {
+        printer << "(";
+        llvm::interleaveComma(block.getArguments(), printer, [&](mlir::BlockArgument arg) {
+            printer << arg << ": " << arg.getType();
+        });
+        printer << ")";
+    }
+    
+    printer << " ";
+    printer.printRegion(getBody(), false, false);
+}
+
+// HostConfigOp (legacy)
+::mlir::ParseResult dfschedule::HostConfigOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
+    mlir::StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return mlir::failure();
+    
     auto *body = result.addRegion();
     if (parser.parseRegion(*body, {}, {}))
         return mlir::failure();
     
-    // Ensure the region has a block
+    if (body->empty())
+        body->emplaceBlock();
+    
+    return mlir::success();
+}
+
+void dfschedule::HostConfigOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << " @" << getSymName();
+    printer << " ";
+    printer.printRegion(getBody(), false, false);
+}
+
+// KernelConfigOp
+::mlir::ParseResult dfschedule::KernelConfigOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
+    mlir::StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return mlir::failure();
+    
+    auto *body = result.addRegion();
+    if (parser.parseRegion(*body, {}, {}))
+        return mlir::failure();
+    
     if (body->empty())
         body->emplaceBlock();
     
@@ -92,25 +189,21 @@ void dfschedule::HostConfigOp::print(::mlir::OpAsmPrinter &printer) {
 }
  
 void dfschedule::KernelConfigOp::print(::mlir::OpAsmPrinter &printer) {
-    // Print: @symbol_name { body }
     printer << " @" << getSymName();
     printer << " ";
-    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+    printer.printRegion(getBody(), false, false);
 }
 
 // HostScheduleOp
 ::mlir::ParseResult dfschedule::HostScheduleOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
-    // Parse: @symbol_name { body }
     mlir::StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return mlir::failure();
     
-    // Parse the region
     auto *body = result.addRegion();
-    if (parser.parseRegion(*body, /*arguments=*/{}, /*argTypes=*/{}))
+    if (parser.parseRegion(*body, {}, {}))
         return mlir::failure();
     
-    // Ensure the region has a block
     if (body->empty())
         body->emplaceBlock();
     
@@ -118,25 +211,21 @@ void dfschedule::KernelConfigOp::print(::mlir::OpAsmPrinter &printer) {
 }
 
 void dfschedule::HostScheduleOp::print(::mlir::OpAsmPrinter &printer) {
-    // Print: @symbol_name { body }
     printer << " @" << getSymName();
     printer << " ";
-    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+    printer.printRegion(getBody(), false, false);
 }
 
 // KernelScheduleOp
 ::mlir::ParseResult dfschedule::KernelScheduleOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
-    // Parse: @symbol_name { body }
     mlir::StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return mlir::failure();
     
-    // Parse the region
     auto *body = result.addRegion();
-    if (parser.parseRegion(*body, /*arguments=*/{}, /*argTypes=*/{}))
+    if (parser.parseRegion(*body, {}, {}))
         return mlir::failure();
     
-    // Ensure the region has a block
     if (body->empty())
         body->emplaceBlock();
     
@@ -144,49 +233,31 @@ void dfschedule::HostScheduleOp::print(::mlir::OpAsmPrinter &printer) {
 }
 
 void dfschedule::KernelScheduleOp::print(::mlir::OpAsmPrinter &printer) {
-    // Print: @symbol_name { body }
     printer << " @" << getSymName();
     printer << " ";
-    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+    printer.printRegion(getBody(), false, false);
 }
 
-/*
-void dfscheduledialect::printType(Type type, DialectAsmPrinter &printer) const {
-    // This is the C++ type generated by TableGen from your TypeDef.
-    // Ensure you use the correct name (e.g., DMAPDataType).
-    if (isa<dfscheduledataType>(type)) {
-        // All you need to do is print the mnemonic you defined in TableGen.
-        printer << "dfscheduledata";
-    }
-}
-//*/
-
-
-// Forward declaration for the new helper function
+// ===== Manager Implementation =====
 
 ModuleOp dfschedulemanager::ops_test(MLIRContext* ctx, int totalN) {
-    const int hwrowused= 4, hwcolused=4;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     
     builder.setInsertionPointToStart(m.getBody());
-    //auto &block = main.getBody().emplaceBlock();
-    //builder.setInsertionPointToEnd(&block);
 
     SymbolTable symTable(m);
-    createdfschedulefuncByDim(builder, ctx, symTable);
-    //builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
-    // return is already added inside createdfschedulefuncByDim
+    
+    // Create the host block with full example
+    createHostBlock(builder, ctx, symTable);
+    
+    // Create the compute kernel
+    createDSKernelCompute(builder, ctx);
+    
+    // Create the receiver kernel
+    createDSKernelReceiver(builder, ctx);
 
-    // --- 2. Create device kernel function @dskernel_coretile_compute ---
-    
-    // Move OpBuilder's insertion point back to the end of the module
-    //builder.setInsertionPointToEnd(m.getBody());
-    
-    // Create the second function at the top level of the module
-    //mlir::func::FuncOp kernelFunc = createDSKernelFunc(builder, ctx);
-    
-    // --- 3. Print the final module ---
+    // Print the final module
     mlir::OpPrintingFlags flags;
     flags.printGenericOpForm(false);
     flags.enableDebugInfo(false);
@@ -200,393 +271,370 @@ void dfschedulemanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<dfschedule::dfscheduledialect>();
     ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
-    ctx->getOrLoadDialect<mlir::memref::MemRefDialect>(); // Add MemRef dialect
-
-    //ctx->getOrLoadDialect<mlir::func::FuncDialect>();
-    //ctx->getOrLoadDialect<dfscheblueprint::dfscheblueprintdialect>();
-    //ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx->getOrLoadDialect<mlir::memref::MemRefDialect>();
     ctx->getOrLoadDialect<mlir::tensor::TensorDialect>();
-    //ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
-    //ctx->getOrLoadDialect<routing::routingdialect>();
-}
-/*
-      %data = dataflowmap.create_data {type="i32", dim1=10, dim2 20}
-      %coreenginegroup = dataflowmap.dfschedule_create_core_engine_group {1, 4, "row"}
-      %ioengine = dataflowmap.dfschedule_create_io_engine {0, "shim"}
-      %send_port = dataflowmap.configure_port %ioengine {peorioidx=0, dataacces=}  
-      %portreceive1 = dataflowmap.configure_port on %{peorioidx = 0, dataacces=}  
-      %portreceive2 = dataflowmap.configure_port on %{peorioidx = 1, dataacces=}   
-      %receive_group = dataflowmap.create_port_group(%portreceive1, %portreceive2)    
-      %broadcast_stream = dataflowmap.create_stream %send_port, %receive_group         
-      dataflowmap.push %data, %broadcast_stream {cache_policy = "force_memtile" }
-*/
-void dfschedulemanager::createdfschedulefuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable) {
-        auto location = builder.getUnknownLoc();
-        
-        // =============================================================================
-        // HOST CONFIG BLOCK: Resource allocation and handle acquisition
-        // =============================================================================
-        // This block groups all host-side configuration operations that must complete
-        // before launching any asynchronous execution. It establishes:
-        // - Device memory buffers
-        // - Tile handles (shim and core tiles)
-        // - Stream routing handles
-        // - Packet ID handles for routing
-        
-        // Declare variables outside the block so they remain in scope
-        Value gmem, shim_handle, core_A_handle, core_B_handle, streamA, streamB, pidA, pidB;
-        
-        auto hostConfigOp = builder.create<dfschedule::HostConfigOp>(
-            location,
-            builder.getStringAttr("host_config_main")
-        );
-       
-        
-        {
-            OpBuilder::InsertionGuard guard(builder);
-            Block *hostConfigBlock = new Block();
-            hostConfigOp.getBody().push_back(hostConfigBlock);
-            builder.setInsertionPointToStart(hostConfigBlock);
-            // --- Device Memory Allocation ---
-            // Allocate a 1024-element f32 buffer in device global memory.
-            // This memory is accessible from both host and device (shim DMA).
-            auto memrefType = mlir::MemRefType::get({1024}, builder.getF32Type());
-            auto gmemOp = builder.create<dfschedule::AllocDeviceMemOp>(location, memrefType);
-            gmem = gmemOp.getResult();
-        
-   
-        
-        // --- Tile Handle Acquisition ---
-        // Get runtime handles for physical tiles that will execute kernels or DMAs.
-        // Shim tile (col=2, row=0): Interface between host memory and AI Engine array
-            shim_handle = builder.create<dfschedule::GetTileHandleOp>(location,
-                builder.getI32IntegerAttr(2),
-                builder.getI32IntegerAttr(0)
-            ).getResult();
-   
- 
-            // Core tile A (col=0, row=3): First compute tile that will process data
-            core_A_handle = builder.create<dfschedule::GetTileHandleOp>(location,
-                builder.getI32IntegerAttr(0),
-                builder.getI32IntegerAttr(3)
-            ).getResult();
-
-            // Core tile B (col=1, row=3): Second compute tile for parallel processing
-            core_B_handle = builder.create<dfschedule::GetTileHandleOp>(location,
-                builder.getI32IntegerAttr(1),
-                builder.getI32IntegerAttr(3)
-            ).getResult();
-
-            // --- Stream Handle Lookup ---
-            // Look up stream routing configuration from the routing blueprint.
-            // These symbol references point to pre-configured routes in the routing dialect.
-            // Format: @routing_table::@route_name
-            auto routeARef = mlir::SymbolRefAttr::get(ctx, "my_routes::route_A");
-            auto routeBRef = mlir::SymbolRefAttr::get(ctx, "my_routes::route_B");
-
-            // Stream handles encapsulate the routing path configuration for data movement
-            streamA = builder.create<dfschedule::GetStreamHandleOp>(location, routeARef).getResult();
-            streamB = builder.create<dfschedule::GetStreamHandleOp>(location, routeBRef).getResult();
-
-            // --- Packet ID Retrieval ---
-            // Get packet IDs for packet-switched routing to core tiles.
-            // Each route has a unique packet ID that determines its destination.
-            pidA = builder.create<dfschedule::GetPacketIdOp>(location, routeARef).getResult();
-            pidB = builder.create<dfschedule::GetPacketIdOp>(location, routeBRef).getResult();
-            
-            // Move back to the parent function level after HostConfigOp
-            //builder.setInsertionPointAfter(hostConfigOp);
-        }
-        // =============================================================================
-        // HOST SCHEDULE BLOCK: Asynchronous execution and synchronization
-        // =============================================================================
-        // This block contains the actual execution schedule for the host side:
-        // - Launch DMA operations (shim DMA transfers)
-        // - Launch kernel executions on core tiles
-        // - Synchronize on completion events
-        ///*
-        auto hostScheduleOp = builder.create<dfschedule::HostScheduleOp>(
-            location,
-            builder.getStringAttr("host_schedule_main")
-        );
-        {
-            OpBuilder::InsertionGuard guard(builder);
-            Block *hostScheduleBlock = new Block();
-            hostScheduleOp.getBody().push_back(hostScheduleBlock);
-            builder.setInsertionPointToStart(hostScheduleBlock);
-            
-            // --- Launch Shim DMA ---
-            // Launch an asynchronous DMA operation on the shim tile.
-            // This DMA reads from host memory (%gmem) and sends data through
-            // the stream switches (%streamA, %streamB) to core tiles.
-            // Returns an event handle for later synchronization.
-            /*
-            auto eventType = dfschedule::EventType::get(ctx);
-            llvm::SmallVector<Value, 4> dmaOperands = {shim_handle, gmem, streamA, streamB};
-            auto evt_dma = builder.create<dfschedule::LaunchKernelAsyncOp>(location,
-                eventType,
-                dmaOperands
-            ).getResult();
-
-            // --- Launch Core Kernels ---
-            // Launch compute kernels asynchronously on both core tiles.
-            // Each kernel is identified by a symbol reference (@dskernel_coretile_compute).
-            // The packet ID determines which data packets the kernel receives.
-            
-            // Kernel A: Processes data arriving on route_A (packet ID pidA)
-            
-            auto kernelARef = mlir::SymbolRefAttr::get(ctx, "dskernel_coretile_compute");
-            auto calleeAttrA = builder.getNamedAttr(
-                dfschedule::LaunchKernelAsyncOp::getCalleeAttrName(), 
-                kernelARef
-            );
-            llvm::SmallVector<Value, 2> kernelAOperands = {core_A_handle, pidA};
-            auto evt_A = builder.create<dfschedule::LaunchKernelAsyncOp>(location,
-                eventType,
-                kernelAOperands,
-                llvm::ArrayRef<mlir::NamedAttribute>{calleeAttrA}
-            ).getResult();
-            
-            // Kernel B: Processes data arriving on route_B (packet ID pidB)
-            auto kernelBRef = mlir::SymbolRefAttr::get(ctx, "dskernel_coretile_compute");
-            auto calleeAttrB = builder.getNamedAttr(
-                dfschedule::LaunchKernelAsyncOp::getCalleeAttrName(), 
-                kernelBRef
-            );
-            llvm::SmallVector<Value, 2> kernelBOperands = {core_B_handle, pidB};
-            auto evt_B = builder.create<dfschedule::LaunchKernelAsyncOp>(location,
-                eventType,
-                kernelBOperands,
-                llvm::ArrayRef<mlir::NamedAttribute>{calleeAttrB}
-            ).getResult();
-
-            // --- Synchronization Point ---
-            // Wait for all asynchronous operations to complete.
-            // This ensures DMA and both kernels finish before function returns.
-            llvm::SmallVector<Value, 3> waitEvents = {evt_dma, evt_A, evt_B};
-            builder.create<dfschedule::WaitOp>(location, waitEvents);
-            
-            // Move back to the parent function level after HostSchedule
-            */
-            // Return from host function
-        } 
-        return ;
 }
 
-// --- New function with the COMPLETE logic from dskernelmanager ---
+// Create the host block matching example.ir
+void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, SymbolTable& symTable) {
+    auto location = builder.getUnknownLoc();
+    
+    // Create host block: dfschedule.host @host_0 { ... }
+    auto hostBlockOp = builder.create<dfschedule::HostBlockOp>(
+        location,
+        builder.getStringAttr("host_0")
+    );
+    
+    Block *hostBody = new Block();
+    hostBlockOp.getBody().push_back(hostBody);
+    builder.setInsertionPointToStart(hostBody);
+    
+    // %tensor = tensor.empty() : tensor<1024x1024xf32>
+    auto tensorType = mlir::RankedTensorType::get({1024, 1024}, builder.getF32Type());
+    auto tensor = builder.create<mlir::tensor::EmptyOp>(location, tensorType.getShape(), builder.getF32Type());
+    
+    // %gmem = dfschedule.declaretensor(%tensor) : (tensor<1024x1024xf32>) -> memref<1024xf32>
+    auto memrefType = mlir::MemRefType::get({1024}, builder.getF32Type());
+    auto gmem = builder.create<dfschedule::DeclareTensorOp>(location, memrefType, tensor.getResult());
+    
+    // %shim0 = dfschedule.declaretile {col = 3, row = 0} : !dfschedule.tile
+    auto tileType = dfschedule::TileType::get(ctx);
+    auto shim0 = builder.create<dfschedule::DeclareTileOp>(
+        location, tileType,
+        builder.getI32IntegerAttr(3),  // col
+        builder.getI32IntegerAttr(0)   // row
+    );
+    
+    // %bd_config = dfschedule.config.dma_bd(%gmem, %shim0) {...}
+    auto bdHandleType = dfschedule::BdHandleType::get(ctx);
+    auto bdConfig = builder.create<dfschedule::ConfigDmaBdOp>(
+        location, bdHandleType,
+        gmem.getResult(),
+        shim0.getResult(),
+        builder.getI32IntegerAttr(0),     // bd_id
+        builder.getI32IntegerAttr(0),     // offset
+        builder.getI32IntegerAttr(1024),  // len
+        builder.getBoolAttr(true),        // enable_packet
+        builder.getI32IntegerAttr(10),    // packet_id
+        builder.getI32IntegerAttr(-1)     // next_bd
+    );
+    
+    // %io_0 = dfschedule.config.create_io(%bd_config, %shim0) {...}
+    auto ioHandleType = dfschedule::IoHandleType::get(ctx);
+    auto io0 = builder.create<dfschedule::ConfigCreateIoOp>(
+        location, ioHandleType,
+        bdConfig.getResult(),
+        shim0.getResult(),
+        builder.getI32IntegerAttr(0),       // channel
+        builder.getStringAttr("MM2S"),      // direction
+        builder.getStringAttr("SEND")       // io_operation
+    );
+    
+    // Launch kernel section
+    // %core0 = dfschedule.declaretile {col = 0, row = 3} : !dfschedule.tile
+    auto core0 = builder.create<dfschedule::DeclareTileOp>(
+        location, tileType,
+        builder.getI32IntegerAttr(0),  // col
+        builder.getI32IntegerAttr(3)   // row
+    );
+    
+    // %core1 = dfschedule.declaretile {col = 1, row = 3} : !dfschedule.tile
+    auto core1 = builder.create<dfschedule::DeclareTileOp>(
+        location, tileType,
+        builder.getI32IntegerAttr(1),  // col
+        builder.getI32IntegerAttr(3)   // row
+    );
+    
+    // %kernel_packet_0 = dfschedule.packet @packet0 (%gmem) {dma_channel=0}
+    auto packetType = dfschedule::PacketType::get(ctx);
+    auto kernelPacket0 = builder.create<dfschedule::PacketOp>(
+        location, packetType,
+        builder.getStringAttr("packet0"),
+        gmem.getResult(),
+        builder.getI32IntegerAttr(0)  // dma_channel
+    );
+    
+    // %kernel_packet_1 = dfschedule.packet @packet1 (%gmem) {dma_channel=0}
+    auto kernelPacket1 = builder.create<dfschedule::PacketOp>(
+        location, packetType,
+        builder.getStringAttr("packet1"),
+        gmem.getResult(),
+        builder.getI32IntegerAttr(0)  // dma_channel
+    );
+    
+    // %kernel_group = dfschedule.config.load_kernel_group(%core0, %core1) {...}
+    auto kernelGroupType = dfschedule::KernelGroupType::get(ctx);
+    llvm::SmallVector<Value, 2> tiles = {core0.getResult(), core1.getResult()};
+    
+    // Create symbol ref arrays
+    llvm::SmallVector<mlir::Attribute, 1> calleeRefs = {
+        mlir::FlatSymbolRefAttr::get(ctx, "dskernel_receiver")
+    };
+    llvm::SmallVector<mlir::Attribute, 2> computeKernelRefs = {
+        mlir::FlatSymbolRefAttr::get(ctx, "compute0"),
+        mlir::FlatSymbolRefAttr::get(ctx, "compute0")
+    };
+    llvm::SmallVector<mlir::Attribute, 2> packetRefs = {
+        mlir::FlatSymbolRefAttr::get(ctx, "packet0"),
+        mlir::FlatSymbolRefAttr::get(ctx, "packet1")
+    };
+    
+    auto kernelGroup = builder.create<dfschedule::LoadKernelGroupOp>(
+        location, kernelGroupType,
+        tiles,
+        builder.getArrayAttr(calleeRefs),
+        builder.getArrayAttr(computeKernelRefs),
+        builder.getArrayAttr(packetRefs)
+    );
+    
+    // %evt_kernel_group = dfschedule.schedule.launch_kernel_group(%kernel_group) {...}
+    auto eventType = dfschedule::EventType::get(ctx);
+    auto evtKernelGroup = builder.create<dfschedule::LaunchKernelGroupOp>(
+        location, eventType,
+        kernelGroup.getResult()
+    );
+    
+    // Schedule section
+    // %bd_id = dfschedule.schedule.getbdid() : i32
+    auto bdId = builder.create<dfschedule::GetBdIdOp>(location, builder.getI32Type());
+    
+    // %evnt_io = dfschedule.schedule.start_io(%io_0, %bd_id) {...}
+    auto evntIo = builder.create<dfschedule::StartIoOp>(
+        location, eventType,
+        io0.getResult(),
+        bdId.getResult()
+    );
+    
+    // dfschedule.schedule.wait(%evt_io, %evt_kernel_group) : (...)
+    llvm::SmallVector<Value, 2> waitEvents = {evntIo.getResult(), evtKernelGroup.getResult()};
+    builder.create<dfschedule::ScheduleWaitOp>(location, waitEvents);
+    
+    // Move insertion point back to module level
+    builder.setInsertionPointAfter(hostBlockOp);
+}
+
+// Create the compute kernel: dfschedule.dskernel.compute @compute0 {...}
+void dfschedulemanager::createDSKernelCompute(OpBuilder& builder, MLIRContext* ctx) {
+    auto location = builder.getUnknownLoc();
+    
+    auto computeOp = builder.create<dfschedule::DSKernelComputeOp>(
+        location,
+        dfschedule::ComputeType::get(ctx),
+        builder.getStringAttr("compute0")
+    );
+    
+    // Create body block with arguments
+    Block *body = new Block();
+    computeOp.getBody().push_back(body);
+    
+    // Add arguments: %buf: memref<16x256xf32, "LOCAL">, %loop_count: index
+    auto memrefType = mlir::MemRefType::get(
+        {16, 256}, builder.getF32Type(),
+        mlir::AffineMap(), 
+        builder.getStringAttr("LOCAL")
+    );
+    auto bufArg = body->addArgument(memrefType, location);
+    auto loopCountArg = body->addArgument(builder.getIndexType(), location);
+    
+    builder.setInsertionPointToStart(body);
+    
+    // %c0 = arith.constant 0 : index
+    auto c0 = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
+    // %c1 = arith.constant 1 : index
+    auto c1 = builder.create<mlir::arith::ConstantIndexOp>(location, 1);
+    // %rows = arith.constant 16 : index
+    auto rows = builder.create<mlir::arith::ConstantIndexOp>(location, 16);
+    // %cols = arith.constant 256 : index
+    auto cols = builder.create<mlir::arith::ConstantIndexOp>(location, 256);
+    
+    // Outer loop: scf.for %r = %c0 to %rows step %c1
+    auto outerLoop = builder.create<mlir::scf::ForOp>(
+        location, c0.getResult(), rows.getResult(), c1.getResult()
+    );
+    builder.setInsertionPointToStart(outerLoop.getBody());
+    Value r = outerLoop.getInductionVar();
+    
+    // Inner loop: scf.for %c = %c0 to %cols step %c1
+    auto innerLoop = builder.create<mlir::scf::ForOp>(
+        location, c0.getResult(), cols.getResult(), c1.getResult()
+    );
+    builder.setInsertionPointToStart(innerLoop.getBody());
+    Value c = innerLoop.getInductionVar();
+    
+    // %v = memref.load %buf[%r, %c] : memref<16x256xf32, "LOCAL">
+    auto v = builder.create<mlir::memref::LoadOp>(location, bufArg, ValueRange{r, c});
+    
+    // %sq = arith.mulf %v, %v : f32
+    auto sq = builder.create<mlir::arith::MulFOp>(location, v.getResult(), v.getResult());
+    
+    // memref.store %sq, %buf[%r, %c] : memref<16x256xf32, "LOCAL">
+    builder.create<mlir::memref::StoreOp>(location, sq.getResult(), bufArg, ValueRange{r, c});
+    
+    // Move insertion point back to module level
+    builder.setInsertionPointAfter(computeOp);
+}
+
+// Create the receiver kernel: dfschedule.dskernel_receiver @... {...}
+void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* ctx) {
+    auto location = builder.getUnknownLoc();
+    
+    auto receiverOp = builder.create<dfschedule::DSKernelReceiverOp>(
+        location,
+        builder.getStringAttr("dskernel_receiver")
+    );
+    
+    // Create body block with arguments
+    Block *body = new Block();
+    receiverOp.getBody().push_back(body);
+    
+    // Add arguments: %arg0: !dfschedule.packet, %computelogic: !dfschedule.compute, %loop_count: index
+    auto packetType = dfschedule::PacketType::get(ctx);
+    auto computeType = dfschedule::ComputeType::get(ctx);
+    auto arg0 = body->addArgument(packetType, location);
+    auto computelogic = body->addArgument(computeType, location);
+    auto loop_count = body->addArgument(builder.getIndexType(), location);
+    
+    builder.setInsertionPointToStart(body);
+    
+    // %input_tensor = dfschedule.gettensor(%arg0) : (!dfschedule.packet) -> tensor<16x256xf32>
+    auto tensorType = mlir::RankedTensorType::get({16, 256}, builder.getF32Type());
+    auto inputTensor = builder.create<dfschedule::GetTensorOp>(location, tensorType, arg0);
+    
+    // %channel = dfschedule.getdmachannel(%arg0) : (!dfschedule.packet) -> !dfschedule.dma_channel
+    auto dmaChannelType = dfschedule::DmaChannelType::get(ctx);
+    auto channel = builder.create<dfschedule::GetDmaChannelOp>(location, dmaChannelType, arg0);
+    
+    // Allocate ping-pong buffers in local memory
+    auto localMemrefType = mlir::MemRefType::get(
+        {16, 256}, builder.getF32Type(),
+        mlir::AffineMap(),
+        builder.getStringAttr("LOCAL")
+    );
+    
+    // %ping = dfschedule.kernel.memalloc(%input_tensor) : (tensor<16x256xf32>) -> memref<16x256xf32, "LOCAL">
+    auto ping = builder.create<dfschedule::KernelMemAllocOp>(location, localMemrefType, inputTensor.getResult());
+    
+    // %pong = dfschedule.kernel.memalloc(%input_tensor) : (tensor<16x256xf32>) -> memref<16x256xf32, "LOCAL">
+    auto pong = builder.create<dfschedule::KernelMemAllocOp>(location, localMemrefType, inputTensor.getResult());
+    
+    // Initialize locks
+    auto lockType = dfschedule::LockType::get(ctx);
+    
+    // %l_ping_acq = dfschedule.dskernel.lock_init(0, "ping_acquire_lock") -> !dfschedule.lock
+    auto l_ping_acq = builder.create<dfschedule::DSKernelLockInitOp>(
+        location, lockType, 0, builder.getStringAttr("ping_acquire_lock")
+    );
+    
+    // %l_pong_acq = dfschedule.dskernel.lock_init(0, "pong_acquire_lock") -> !dfschedule.lock
+    auto l_pong_acq = builder.create<dfschedule::DSKernelLockInitOp>(
+        location, lockType, 0, builder.getStringAttr("pong_acquire_lock")
+    );
+    
+    // %l_ping_rel = dfschedule.dskernel.lock_init(1, "ping_release_lock") -> !dfschedule.lock
+    auto l_ping_rel = builder.create<dfschedule::DSKernelLockInitOp>(
+        location, lockType, 1, builder.getStringAttr("ping_release_lock")
+    );
+    
+    // %l_pong_rel = dfschedule.dskernel.lock_init(0, "pong_release_lock") -> !dfschedule.lock
+    auto l_pong_rel = builder.create<dfschedule::DSKernelLockInitOp>(
+        location, lockType, 0, builder.getStringAttr("pong_release_lock")
+    );
+    
+    // Launch DMA loop
+    auto sharedMemrefType = mlir::MemRefType::get(
+        {16, 256}, builder.getF32Type(),
+        mlir::AffineMap(),
+        builder.getStringAttr("SHARED")
+    );
+    
+    builder.create<dfschedule::DSKernelLaunchDmaLoopOp>(
+        location,
+        ping.getResult(),
+        pong.getResult(),
+        l_ping_acq.getResult(),
+        l_ping_rel.getResult(),
+        l_pong_acq.getResult(),
+        l_pong_rel.getResult(),
+        channel.getResult()
+    );
+    
+    // Compute loop with ping-pong pattern
+    auto c0 = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
+    auto c1 = builder.create<mlir::arith::ConstantIndexOp>(location, 1);
+    auto c2 = builder.create<mlir::arith::ConstantIndexOp>(location, 2);
+    
+    // scf.for %i = %c0 to %loop_count step %c1
+    auto forLoop = builder.create<mlir::scf::ForOp>(
+        location, c0.getResult(), loop_count, c1.getResult()
+    );
+    builder.setInsertionPointToStart(forLoop.getBody());
+    Value iv = forLoop.getInductionVar();
+    
+    // Ping/Pong selection logic
+    // %is_ping = arith.cmpi "eq", arith.remui(%i, %c2), %c0 : index
+    auto rem = builder.create<mlir::arith::RemUIOp>(location, iv, c2.getResult());
+    auto isPing = builder.create<mlir::arith::CmpIOp>(
+        location, mlir::arith::CmpIPredicate::eq, rem.getResult(), c0.getResult()
+    );
+    
+    // Select buffer
+    auto ifBuffer = builder.create<mlir::scf::IfOp>(
+        location, sharedMemrefType, isPing.getResult(), true
+    );
+    builder.setInsertionPointToStart(&ifBuffer.getThenRegion().front());
+    builder.create<mlir::scf::YieldOp>(location, ping.getResult());
+    builder.setInsertionPointToStart(&ifBuffer.getElseRegion().front());
+    builder.create<mlir::scf::YieldOp>(location, pong.getResult());
+    builder.setInsertionPointAfter(ifBuffer);
+    Value currBuf = ifBuffer.getResult(0);
+    
+    // Select read lock
+    auto ifReadLock = builder.create<mlir::scf::IfOp>(
+        location, lockType, isPing.getResult(), true
+    );
+    builder.setInsertionPointToStart(&ifReadLock.getThenRegion().front());
+    builder.create<mlir::scf::YieldOp>(location, l_ping_acq.getResult());
+    builder.setInsertionPointToStart(&ifReadLock.getElseRegion().front());
+    builder.create<mlir::scf::YieldOp>(location, l_pong_acq.getResult());
+    builder.setInsertionPointAfter(ifReadLock);
+    Value currReadLock = ifReadLock.getResult(0);
+    
+    // Select write lock
+    auto ifWriteLock = builder.create<mlir::scf::IfOp>(
+        location, lockType, isPing.getResult(), true
+    );
+    builder.setInsertionPointToStart(&ifWriteLock.getThenRegion().front());
+    builder.create<mlir::scf::YieldOp>(location, l_ping_rel.getResult());
+    builder.setInsertionPointToStart(&ifWriteLock.getElseRegion().front());
+    builder.create<mlir::scf::YieldOp>(location, l_pong_rel.getResult());
+    builder.setInsertionPointAfter(ifWriteLock);
+    Value currWriteLock = ifWriteLock.getResult(0);
+    
+    // Acquire lock (wait for data)
+    builder.create<dfschedule::DSKernelAcquireLockOp>(location, currReadLock, builder.getI32IntegerAttr(1));
+    
+    // Compute
+    builder.create<dfschedule::CoreComputeOp>(location, currBuf, computelogic);
+    
+    // Release lock
+    builder.create<dfschedule::DSKernelReleaseLockOp>(location, currWriteLock, builder.getI32IntegerAttr(1));
+    
+    // Move insertion point back to module level
+    builder.setInsertionPointAfter(receiverOp);
+}
+
+// Legacy functions (kept for backward compatibility)
+void dfschedulemanager::createdfschedulefuncByDim(OpBuilder& builder, MLIRContext* ctx, SymbolTable& symTable) {
+    createHostBlock(builder, ctx, symTable);
+}
+
 mlir::func::FuncOp dfschedulemanager::createDSKernelFunc(OpBuilder &builder, MLIRContext *ctx) {
-  auto location = builder.getUnknownLoc();
- 
-  // 1. Define the function type: (i32) -> ()
-  // Function signature: takes packet_id as input, returns nothing
-  auto funcType = builder.getFunctionType({builder.getI32Type()}, {});
-
-  // 2. Create the func.func operation.
-  auto funcOp = builder.create<mlir::func::FuncOp>(location, "dskernel_coretile_compute", funcType);
-
-  // 3. Create the function's entry block and set the insertion point inside it.
-  Block *entryBlock = funcOp.addEntryBlock();
-  builder.setInsertionPointToStart(entryBlock);
-
-  // 4. Get the packet id from the function's argument.
-  // This packet ID is used to filter incoming data packets from the stream network.
-  Value my_packet_id = entryBlock->getArgument(0);
-
-  // =============================================================================
-  // KERNEL CONFIG BLOCK: Buffer and lock setup for ping-pong pattern
-  // =============================================================================
-  // This block configures all resources needed for double-buffered DMA:
-  // - Ping/pong buffers: Alternate between reading and computing
-  // - Acquire locks: Signal when buffer is full (DMA -> Compute handshake)
-  // - Release locks: Signal when buffer is empty (Compute -> DMA handshake)
-  //
-  // Double-buffering pattern:
-  //   While DMA fills ping buffer, compute processes pong buffer (and vice versa)
-  //   This overlaps data transfer and computation for better performance.
-  auto kernelConfigOp = builder.create<dfschedule::KernelConfigOp>(
-      location,
-      builder.getStringAttr("kernel_config_compute")
-  );
-  Block *kernelConfigBlock = new Block();
-  kernelConfigOp.getBody().push_back(kernelConfigBlock);
-  builder.setInsertionPointToStart(kernelConfigBlock);
-  
-  // --- Ping-Pong Buffer Allocation ---
-  // Allocate two 256-element f32 buffers in local memory (L1).
-  // These buffers are used alternately: while one is being filled by DMA,
-  // the other is being processed by compute.
-  auto memrefType = mlir::MemRefType::get({256}, builder.getF32Type());
-  
-  // Ping buffer: Used in even iterations (0, 2, 4, ...)
-  auto ping = builder.create<mlir::memref::AllocaOp>(location, memrefType);
-  ping->setAttr("buffer_type", builder.getStringAttr("ping"));
-  
-  // Pong buffer: Used in odd iterations (1, 3, 5, ...)
-  auto pong = builder.create<mlir::memref::AllocaOp>(location, memrefType);
-  pong->setAttr("buffer_type", builder.getStringAttr("pong"));
-
-  // --- Lock Initialization ---
-  // Locks implement the producer-consumer synchronization between DMA and compute.
-  // Lock semantics:
-  //   - acquire_lock(N): Wait until lock value == N, then decrement
-  //   - release_lock(N): Increment lock value to N
-  //
-  // Ping acquire lock: Compute waits on this (DMA releases after filling ping)
-  auto ping_acquire = builder.create<dfschedule::LockInitOp>(
-      location, dfschedule::LockType::get(ctx), 0);  // Initial value: 0 (empty)
-  
-  // Pong acquire lock: Compute waits on this (DMA releases after filling pong)
-  auto pong_acquire = builder.create<dfschedule::LockInitOp>(
-      location, dfschedule::LockType::get(ctx), 0);  // Initial value: 0 (empty)
-  
-  // Ping release lock: DMA waits on this (Compute releases after processing ping)
-  auto ping_release = builder.create<dfschedule::LockInitOp>(
-      location, dfschedule::LockType::get(ctx), 1);  // Initial value: 1 (ready for DMA)
-  
-  // Pong release lock: DMA waits on this (Compute releases after processing pong)
-  auto pong_release = builder.create<dfschedule::LockInitOp>(
-      location, dfschedule::LockType::get(ctx), 0);  // Initial value: 0 (not ready yet)
-  
-  // Move back to the parent function level after KernelConfigOp
-  builder.setInsertionPointAfter(kernelConfigOp);
-  
-  // =============================================================================
-  // KERNEL SCHEDULE BLOCK: DMA and compute execution with synchronization
-  // =============================================================================
-  // This block contains the actual execution logic:
-  // - Thread A (DMA): Continuously listens for packets and fills ping/pong buffers
-  // - Thread B (Compute): Processes buffers in a loop with lock synchronization
-  //
-  // Execution flow (per iteration):
-  //   1. Compute: Acquire lock -> wait for DMA to fill buffer
-  //   2. Compute: Process buffer data
-  //   3. Compute: Release lock -> signal DMA that buffer is empty
-  //   4. DMA: (in parallel) Wait for release lock, fill buffer, set acquire lock
-  auto kernelScheduleOp = builder.create<dfschedule::KernelScheduleOp>(
-      location,
-      builder.getStringAttr("kernel_schedule_compute")
-  );
-  Block *kernelScheduleBlock = new Block();
-  kernelScheduleOp.getBody().push_back(kernelScheduleBlock);
-  builder.setInsertionPointToStart(kernelScheduleBlock);
-
-  // --- Thread A: DMA S2M (Stream-to-Memory) Loop ---
-  // Launches an asynchronous DMA operation that:
-  // - Listens on the stream network for packets matching %my_packet_id
-  // - Alternates between filling ping and pong buffers
-  // - Uses acquire/release locks to synchronize with compute thread
-  // This runs in parallel with the compute loop below.
-  auto dmaLoop = builder.create<dfschedule::LaunchDmaS2MLoopOp>(
-      location, 
-      ping.getResult(),           // Ping buffer destination
-      pong.getResult(),           // Pong buffer destination
-      my_packet_id,               // Filter packets by this ID
-      ping_acquire.getResult(),   // Signal when ping is full
-      pong_acquire.getResult(),   // Signal when pong is full
-      ping_release.getResult(),   // Wait for ping to be empty
-      pong_release.getResult()    // Wait for pong to be empty
-  );
-
-  // --- Thread B: Compute Loop with Ping-Pong Synchronization ---
-  // Main processing loop: iterates 4 times (0, 1, 2, 3)
-  // Each iteration processes one buffer (alternating ping/pong)
-  auto c0 = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
-  auto c4 = builder.create<mlir::arith::ConstantIndexOp>(location, 4);  // 4 iterations
-  auto c1 = builder.create<mlir::arith::ConstantIndexOp>(location, 1);
-  auto c2 = builder.create<mlir::arith::ConstantIndexOp>(location, 2);  // For modulo
-
-  auto forLoop = builder.create<mlir::scf::ForOp>(
-      location, c0.getResult(), c4.getResult(), c1.getResult());
-  builder.setInsertionPointToStart(forLoop.getBody());
-  Value iv = forLoop.getInductionVar();  // Induction variable: 0, 1, 2, 3
-
-  // --- Ping-Pong Selection Logic ---
-  // Determine which buffer and locks to use based on iteration parity.
-  // Even iterations (0, 2): Use ping buffer and ping locks
-  // Odd iterations (1, 3): Use pong buffer and pong locks
-  
-  // Calculate: is_even = (iv % 2 == 0)
-  Value rem = builder.create<mlir::arith::RemUIOp>(
-      location, iv, c2.getResult()).getResult();
-  Value is_even = builder.create<mlir::arith::CmpIOp>(
-      location, mlir::arith::CmpIPredicate::eq, rem, c0.getResult()).getResult();
-
-  // Select buffer: even ? ping : pong
-  auto ifBuffer = builder.create<mlir::scf::IfOp>(location, memrefType, is_even, true);
-  builder.setInsertionPointToStart(&ifBuffer.getThenRegion().front());
-  builder.create<mlir::scf::YieldOp>(location, ping.getResult());
-  builder.setInsertionPointToStart(&ifBuffer.getElseRegion().front());
-  builder.create<mlir::scf::YieldOp>(location, pong.getResult());
-  builder.setInsertionPointAfter(ifBuffer);
-  Value current_buffer = ifBuffer.getResult(0);
-
-  // Select acquire lock: even ? ping_acquire : pong_acquire
-  // (Compute waits on this lock for DMA to fill the buffer)
-  auto ifAcquire = builder.create<mlir::scf::IfOp>(
-      location, dfschedule::LockType::get(ctx), is_even, true);
-  builder.setInsertionPointToStart(&ifAcquire.getThenRegion().front());
-  builder.create<mlir::scf::YieldOp>(location, ping_acquire.getResult());
-  builder.setInsertionPointToStart(&ifAcquire.getElseRegion().front());
-  builder.create<mlir::scf::YieldOp>(location, pong_acquire.getResult());
-  builder.setInsertionPointAfter(ifAcquire);
-  Value acquire_lock = ifAcquire.getResult(0);
-
-  // Select release lock: even ? ping_release : pong_release
-  // (Compute sets this lock after processing to signal DMA that buffer is empty)
-  auto ifRelease = builder.create<mlir::scf::IfOp>(
-      location, dfschedule::LockType::get(ctx), is_even, true);
-  builder.setInsertionPointToStart(&ifRelease.getThenRegion().front());
-  builder.create<mlir::scf::YieldOp>(location, ping_release.getResult());
-  builder.setInsertionPointToStart(&ifRelease.getElseRegion().front());
-  builder.create<mlir::scf::YieldOp>(location, pong_release.getResult());
-  builder.setInsertionPointAfter(ifRelease);
-  Value release_lock = ifRelease.getResult(0);
-
-  // --- Calculate Lock Value ---
-  // Lock values increment with each iteration: 1, 2, 3, 4
-  // This allows the DMA to track how many buffers have been processed.
-  auto one_i32 = builder.create<mlir::arith::ConstantOp>(
-      location, builder.getI32IntegerAttr(1));
-  Value iv_i32 = builder.create<mlir::arith::IndexCastOp>(
-      location, builder.getI32Type(), iv).getResult();
-  Value lock_val = builder.create<mlir::arith::AddIOp>(
-      location, iv_i32, one_i32.getResult()).getResult();
-
-  // --- Synchronization Point: Wait for Buffer to be Full ---
-  // Block until DMA has filled the selected buffer.
-  // This acquire operation waits for acquire_lock to reach lock_val.
-  builder.create<dfschedule::AcquireLockOp>(location, acquire_lock, lock_val);
-
-  // --- Compute Inner Loop ---
-  // Process the selected buffer 10 times.
-  // This represents the actual computation work on the data.
-  auto c0_inner = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
-  auto c10 = builder.create<mlir::arith::ConstantIndexOp>(location, 10);
-  auto c1_inner = builder.create<mlir::arith::ConstantIndexOp>(location, 1);
-  
-  auto innerForLoop = builder.create<mlir::scf::ForOp>(
-      location, c0_inner.getResult(), c10.getResult(), c1_inner.getResult());
-  builder.setInsertionPointToStart(innerForLoop.getBody());
-  Value jv = innerForLoop.getInductionVar();
-
-  // Perform computation on the current buffer
-  // This is a placeholder for actual compute operations (e.g., vector ops, math, etc.)
-  builder.create<dfschedule::ComputeOp>(location, current_buffer);
-
-  // --- Return to Outer Loop ---
-  builder.setInsertionPointAfter(innerForLoop);
-
-  // --- Synchronization Point: Signal Buffer is Empty ---
-  // Release the lock to signal DMA that the buffer has been processed
-  // and is ready to be refilled.
-  builder.create<dfschedule::ReleaseLockOp>(location, release_lock, lock_val);
-
-  // Move back to the parent function level after KernelScheduleOp
-  builder.setInsertionPointAfter(kernelScheduleOp);
-  
-  // 5. Add a return op at the end of the function.
-  builder.create<mlir::func::ReturnOp>(location);
-  
-  // 6. Return the created function.
-  return funcOp;
+    // This legacy function is no longer needed but kept for API compatibility
+    auto location = builder.getUnknownLoc();
+    auto funcType = builder.getFunctionType({builder.getI32Type()}, {});
+    auto funcOp = builder.create<mlir::func::FuncOp>(location, "dskernel_legacy", funcType);
+    Block *entryBlock = funcOp.addEntryBlock();
+    builder.setInsertionPointToStart(entryBlock);
+    builder.create<mlir::func::ReturnOp>(location);
+    return funcOp;
 }

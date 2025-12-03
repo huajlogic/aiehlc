@@ -73,8 +73,20 @@ class dfschedulemanager{
 public:
     dfschedulemanager(){};
     ModuleOp ops_test(MLIRContext* ctx,int totalN=2) ;
-    void createdfschedulefuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
+    
+    // New design: Host block with config and schedule
+    void createHostBlock(OpBuilder& builder, MLIRContext* ctx, SymbolTable& symTable);
+    
+    // New design: DSKernel compute function
+    void createDSKernelCompute(OpBuilder& builder, MLIRContext* ctx);
+    
+    // New design: DSKernel receiver function
+    void createDSKernelReceiver(OpBuilder& builder, MLIRContext* ctx);
+    
+    // Legacy functions (kept for backward compatibility)
+    void createdfschedulefuncByDim(OpBuilder& builder, MLIRContext* ctx, SymbolTable& symTable);
     mlir::func::FuncOp createDSKernelFunc(OpBuilder &builder, MLIRContext *ctx);
+    
     static void loaddialect(MLIRContext* ctx);
 };
 #endif//__DFSCHEDULE_MANAGER__

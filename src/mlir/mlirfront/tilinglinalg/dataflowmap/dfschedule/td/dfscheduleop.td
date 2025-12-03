@@ -18,20 +18,329 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ViewLikeInterface.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
-include "mlir/Interfaces/FunctionInterfaces.td" // Added from dskernelop.td
+include "mlir/Interfaces/FunctionInterfaces.td"
 
 include "mlir/IR/BuiltinTypes.td"
 include "dfscheduletype.td"
-// You may need to merge dskerneltype.td into dfscheduletype.td
-// and ensure types like dfschedule_LockType are defined.
 
-// Base traits helpers
-//def HasRecursiveSideEffects : Trait<"HasRecursiveSideEffects">;
+// ============================================================================
+// TOP-LEVEL HOST BLOCK OPERATION
+// ============================================================================
+
+def dfschedule_HostBlockOp : dfscheduleop<"host", [
+    IsolatedFromAbove,
+    SymbolTable,
+    Symbol,
+    SingleBlock,
+    NoTerminator
+  ]> {
+  let summary = "Top-level host block containing config, kernel launch, and schedule";
+  let description = [{
+    This operation represents a complete host-side program block that contains:
+    - Tensor/memory declarations
+    - Tile declarations  
+    - DMA configuration
+    - Kernel group loading and launching
+    - Schedule execution
+    
+    Example:
+    ```mlir
+    dfschedule.host @host_0 {
+      %tensor = tensor.empty() : tensor<1024x1024xf32>
+      %gmem = dfschedule.declaretensor(%tensor) : (tensor<1024x1024xf32>) -> memref<1024xf32>
+      %shim0 = dfschedule.declaretile {col = 3, row = 0} : !dfschedule.tile
+      // ... more ops ...
+    }
+    ```
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+}
+
+// ============================================================================
+// CONFIG PHASE OPERATIONS
+// ============================================================================
+
+// Declare a tensor and convert to memref
+def dfschedule_DeclareTensorOp : dfscheduleop<"declaretensor"> {
+  let summary = "Declare a tensor and allocate corresponding device memory";
+  let arguments = (ins AnyTensor:$tensor);
+  let results = (outs AnyMemRef:$memref);
+  let assemblyFormat = "`(` $tensor `)` attr-dict `:` `(` type($tensor) `)` `->` type($memref)";
+}
+
+// Declare a tile location
+def dfschedule_DeclareTileOp : dfscheduleop<"declaretile"> {
+  let summary = "Declare a physical tile by coordinates";
+  let arguments = (ins
+    I32Attr:$col,
+    I32Attr:$row
+  );
+  let results = (outs dfschedule_TileHandleType:$tile);
+  let assemblyFormat = "attr-dict `:` type($tile)";
+}
+
+// Create a packet handle
+def dfschedule_PacketOp : dfscheduleop<"packet", [Symbol]> {
+  let summary = "Create a named packet associated with data and DMA channel";
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    AnyMemRef:$data,
+    I32Attr:$dma_channel
+  );
+  let results = (outs dfschedule_PacketType:$packet);
+  let assemblyFormat = "$sym_name `(` $data `)` attr-dict `:` `(` type($data) `)` `->` type($packet)";
+}
+
+// DMA Buffer Descriptor Configuration
+def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
+  let summary = "Configure a DMA buffer descriptor";
+  let arguments = (ins
+    AnyMemRef:$buffer,
+    dfschedule_TileHandleType:$tile,
+    I32Attr:$bd_id,
+    I32Attr:$offset,
+    I32Attr:$len,
+    BoolAttr:$enable_packet,
+    I32Attr:$packet_id,
+    I32Attr:$next_bd
+  );
+  let results = (outs dfschedule_BdHandleType:$bd_handle);
+  let assemblyFormat = [{
+    `(` $buffer `,` $tile `)` attr-dict `:` `(` type($buffer) `,` type($tile) `)` `->` type($bd_handle)
+  }];
+}
+
+// Create IO handle
+def dfschedule_ConfigCreateIoOp : dfscheduleop<"config.create_io"> {
+  let summary = "Create an IO handle for DMA operations";
+  let arguments = (ins
+    dfschedule_BdHandleType:$bd_config,
+    dfschedule_TileHandleType:$tile,
+    I32Attr:$channel,
+    StrAttr:$direction,
+    StrAttr:$io_operation  // Renamed from 'operation' to avoid conflict with getOperation()
+  );
+  let results = (outs dfschedule_IoHandleType:$io_handle);
+  let assemblyFormat = [{
+    `(` $bd_config `,` $tile `)` attr-dict `:` `(` type($bd_config) `,` type($tile) `)` `->` type($io_handle)
+  }];
+}
+
+// Load kernel group configuration
+def dfschedule_LoadKernelGroupOp : dfscheduleop<"config.load_kernel_group"> {
+  let summary = "Configure and load a group of kernels to be launched on tiles";
+  let arguments = (ins
+    Variadic<dfschedule_TileHandleType>:$tiles,
+    SymbolRefArrayAttr:$callee,
+    SymbolRefArrayAttr:$distributed_compute_kernel_args,
+    SymbolRefArrayAttr:$distributed_args
+  );
+  let results = (outs dfschedule_KernelGroupType:$kernel_group);
+  let assemblyFormat = [{
+    `(` $tiles `)` attr-dict `:` `(` type($tiles) `)` `->` type($kernel_group)
+  }];
+}
+
+// ============================================================================
+// SCHEDULE PHASE OPERATIONS
+// ============================================================================
+
+// Launch kernel group
+def dfschedule_LaunchKernelGroupOp : dfscheduleop<"schedule.launch_kernel_group"> {
+  let summary = "Launch a pre-configured kernel group";
+  let arguments = (ins dfschedule_KernelGroupType:$kernel_group);
+  let results = (outs dfschedule_EventType:$event);
+  let assemblyFormat = "`(` $kernel_group `)` attr-dict `:` `(` type($kernel_group) `)` `->` type($event)";
+}
+
+// Get BD ID for scheduling
+def dfschedule_GetBdIdOp : dfscheduleop<"schedule.getbdid"> {
+  let summary = "Get a buffer descriptor ID for runtime scheduling";
+  let arguments = (ins);
+  let results = (outs I32:$bd_id);
+  let assemblyFormat = "attr-dict `:` type($bd_id)";
+}
+
+// Start IO operation
+def dfschedule_StartIoOp : dfscheduleop<"schedule.start_io"> {
+  let summary = "Start an IO operation with a given BD ID";
+  let arguments = (ins
+    dfschedule_IoHandleType:$io_handle,
+    I32:$bd_id
+  );
+  let results = (outs dfschedule_EventType:$event);
+  let assemblyFormat = "`(` $io_handle `,` $bd_id `)` attr-dict `:` `(` type($io_handle) `,` type($bd_id) `)` `->` type($event)";
+}
+
+// Schedule wait for multiple events
+def dfschedule_ScheduleWaitOp : dfscheduleop<"schedule.wait"> {
+  let summary = "Wait for multiple events to complete";
+  let arguments = (ins Variadic<dfschedule_EventType>:$events);
+  let results = (outs);
+  let assemblyFormat = "`(` $events `)` attr-dict `:` `(` type($events) `)`";
+}
+
+// ============================================================================
+// KERNEL FUNCTION OPERATIONS
+// ============================================================================
+
+// DSKernel Compute - defines a compute logic block
+def dfschedule_DSKernelComputeOp : dfscheduleop<"dskernel.compute", [
+    IsolatedFromAbove,
+    Symbol,
+    SingleBlock,
+    NoTerminator
+  ]> {
+  let summary = "Define a compute kernel logic that can be invoked from a receiver";
+  let description = [{
+    Defines reusable compute logic that operates on a buffer.
+    The compute logic is referenced by symbol and invoked from dskernel_receiver.
+    
+    Example:
+    ```mlir
+    dfschedule.dskernel.compute @compute0 (%buf: memref<16x256xf32, "LOCAL">, %loop_count: index) -> !dfschedule.compute {
+      // compute logic here
+    }
+    ```
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+  let results = (outs dfschedule_ComputeType:$compute);
+  let hasCustomAssemblyFormat = 1;
+}
+
+// DSKernel Receiver - kernel function with ping-pong buffering
+def dfschedule_DSKernelReceiverOp : dfscheduleop<"dskernel_receiver", [
+    IsolatedFromAbove,
+    Symbol,
+    SingleBlock,
+    NoTerminator
+  ]> {
+  let summary = "Define a kernel receiver with ping-pong buffering pattern";
+  let description = [{
+    Defines a receiver kernel that:
+    - Receives packets from DMA
+    - Allocates ping-pong buffers
+    - Initializes locks for synchronization
+    - Launches DMA loop
+    - Executes compute loop with ping-pong pattern
+    
+    Example:
+    ```mlir
+    dfschedule.dskernel_receiver @receiver(%arg0: !dfschedule.packet, %compute: !dfschedule.compute, %loop_count: index) {
+      // receiver logic
+    }
+    ```
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+}
+
+// ============================================================================
+// KERNEL HELPER OPERATIONS
+// ============================================================================
+
+// Get tensor from packet
+def dfschedule_GetTensorOp : dfscheduleop<"gettensor"> {
+  let summary = "Extract tensor reference from a packet";
+  let arguments = (ins dfschedule_PacketType:$packet);
+  let results = (outs AnyTensor:$tensor);
+  let assemblyFormat = "`(` $packet `)` attr-dict `:` `(` type($packet) `)` `->` type($tensor)";
+}
+
+// Get DMA channel from packet
+def dfschedule_GetDmaChannelOp : dfscheduleop<"getdmachannel"> {
+  let summary = "Extract DMA channel from a packet";
+  let arguments = (ins dfschedule_PacketType:$packet);
+  let results = (outs dfschedule_DmaChannelType:$channel);
+  let assemblyFormat = "`(` $packet `)` attr-dict `:` `(` type($packet) `)` `->` type($channel)";
+}
+
+// Kernel memory allocation
+def dfschedule_KernelMemAllocOp : dfscheduleop<"kernel.memalloc"> {
+  let summary = "Allocate local memory in kernel based on tensor shape";
+  let arguments = (ins AnyTensor:$tensor);
+  let results = (outs AnyMemRef:$buffer);
+  let assemblyFormat = "`(` $tensor `)` attr-dict `:` `(` type($tensor) `)` `->` type($buffer)";
+}
+
+// Core compute invocation
+def dfschedule_CoreComputeOp : dfscheduleop<"core.compute"> {
+  let summary = "Invoke compute logic on a buffer";
+  let arguments = (ins
+    AnyMemRef:$buffer,
+    dfschedule_ComputeType:$compute_logic
+  );
+  let results = (outs);
+  let assemblyFormat = "`(` $buffer `,` $compute_logic `)` attr-dict `:` `(` type($buffer) `,` type($compute_logic) `)`";
+}
+
+// DSKernel Lock Init
+def dfschedule_DSKernelLockInitOp : dfscheduleop<"dskernel.lock_init"> {
+  let summary = "Initialize a lock with initial value and name";
+  let arguments = (ins
+    I64Attr:$initial_value,
+    StrAttr:$name
+  );
+  let results = (outs dfschedule_LockType:$lock);
+  let assemblyFormat = "`(` $initial_value `,` $name `)` attr-dict `->` type($lock)";
+}
+
+// DSKernel Launch DMA S2M Loop
+def dfschedule_DSKernelLaunchDmaLoopOp : dfscheduleop<"dskernel.launch_dma_s2m_loop"> {
+  let summary = "Launch a DMA stream-to-memory loop with ping-pong buffers";
+  let arguments = (ins
+    AnyMemRef:$ping,
+    AnyMemRef:$pong,
+    dfschedule_LockType:$ping_acq_lock,
+    dfschedule_LockType:$ping_rel_lock,
+    dfschedule_LockType:$pong_acq_lock,
+    dfschedule_LockType:$pong_rel_lock,
+    dfschedule_DmaChannelType:$channel
+  );
+  let results = (outs);
+  let assemblyFormat = [{
+    `(` $ping `,` $pong `)` `{`
+      `locks_ping` `=` `{` `acq` `=` $ping_acq_lock `,` `rel` `=` $ping_rel_lock `}` `,`
+      `locks_pong` `=` `{` `acq` `=` $pong_acq_lock `,` `rel` `=` $pong_rel_lock `}` `,`
+      `channelid` `=` $channel
+    `}` attr-dict `:` `(` type($ping) `,` type($pong) `)`
+  }];
+}
+
+// DSKernel Acquire Lock
+def dfschedule_DSKernelAcquireLockOp : dfscheduleop<"dskernel.acquire_lock"> {
+  let summary = "Acquire a lock with specified value";
+  let arguments = (ins
+    dfschedule_LockType:$lock,
+    I32Attr:$value
+  );
+  let results = (outs);
+  let assemblyFormat = "`(` $lock `,` $value `)` attr-dict";
+}
+
+// DSKernel Release Lock
+def dfschedule_DSKernelReleaseLockOp : dfscheduleop<"dskernel.release_lock"> {
+  let summary = "Release a lock with specified value";
+  let arguments = (ins
+    dfschedule_LockType:$lock,
+    I32Attr:$value
+  );
+  let results = (outs);
+  let assemblyFormat = "`(` $lock `,` $value `)` attr-dict";
+}
+
+// ============================================================================
+// LEGACY OPERATIONS (kept for backward compatibility)
+// ============================================================================
 
 def dfschedule_FuncOp : dfscheduleop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
 {
-    let summary = "Defines a function in the Starplat Dialect";
-    let description = [{This operation represents a function definiton in the Starplat dialect.
+    let summary = "Defines a function in the dfschedule Dialect";
+    let description = [{This operation represents a function definition in the dfschedule dialect.
                         It contains a name, other related arguments and an optional return type.
                         It has a single region for the function body.
                         }];
