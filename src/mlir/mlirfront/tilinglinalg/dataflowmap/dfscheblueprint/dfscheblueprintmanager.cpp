@@ -160,8 +160,8 @@ ParseResult dfscheblueprint::DataSliceOp::parse(OpAsmParser &parser, OperationSt
     printer.decreaseIndent(); // <--- Reduce the indentation level state FIRST
     printer.printNewline();  
 */
-// BindGroupOp printer
-void dfscheblueprint::BindGroupOp::print(OpAsmPrinter &printer) {
+// FlowConfigGroupOp printer
+void dfscheblueprint::FlowConfigGroupOp::print(OpAsmPrinter &printer) {
     printer << " @" << getSymName() << " {";
     printer.increaseIndent();
     printer.printNewline();
@@ -187,8 +187,8 @@ void dfscheblueprint::BindGroupOp::print(OpAsmPrinter &printer) {
         /*elidedAttrs=*/{"sym_name", "target_group", "view", "distribution", "dma", "slice_symbols", "type"});
 }
 
-// BindGroupOp parser
-ParseResult dfscheblueprint::BindGroupOp::parse(OpAsmParser &parser, OperationState &result) {
+// FlowConfigGroupOp parser
+ParseResult dfscheblueprint::FlowConfigGroupOp::parse(OpAsmParser &parser, OperationState &result) {
     StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return failure();
@@ -243,8 +243,8 @@ ParseResult dfscheblueprint::BindGroupOp::parse(OpAsmParser &parser, OperationSt
     return success();
 }
 
-// BindOp printer
-void dfscheblueprint::BindOp::print(OpAsmPrinter &printer) {
+// FlowConfigOp printer
+void dfscheblueprint::FlowConfigOp::print(OpAsmPrinter &printer) {
     printer << " @" << getSymName() << " {";
     printer.increaseIndent();
     printer.printNewline();
@@ -270,8 +270,8 @@ void dfscheblueprint::BindOp::print(OpAsmPrinter &printer) {
         /*elidedAttrs=*/{"sym_name", "target", "view", "slice", "dma", "slice_symbol", "type"});
 }
 
-// BindOp parser
-ParseResult dfscheblueprint::BindOp::parse(OpAsmParser &parser, OperationState &result) {
+// FlowConfigOp parser
+ParseResult dfscheblueprint::FlowConfigOp::parse(OpAsmParser &parser, OperationState &result) {
     StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return failure();
@@ -326,8 +326,8 @@ ParseResult dfscheblueprint::BindOp::parse(OpAsmParser &parser, OperationState &
     return success();
 }
 
-// CollectiveTransferOp printer
-void dfscheblueprint::CollectiveTransferOp::print(OpAsmPrinter &printer) {
+// FlowTransferOp printer
+void dfscheblueprint::FlowTransferOp::print(OpAsmPrinter &printer) {
     printer << " @" << getSymName() << " {";
     printer.increaseIndent();
     printer.printNewline();
@@ -349,8 +349,8 @@ void dfscheblueprint::CollectiveTransferOp::print(OpAsmPrinter &printer) {
         /*elidedAttrs=*/{"sym_name", "type", "from", "to", "ordering", "base_packet_id"});
 }
 
-// CollectiveTransferOp parser
-ParseResult dfscheblueprint::CollectiveTransferOp::parse(OpAsmParser &parser, OperationState &result) {
+// FlowTransferOp parser
+ParseResult dfscheblueprint::FlowTransferOp::parse(OpAsmParser &parser, OperationState &result) {
     StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return failure();
@@ -486,7 +486,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     auto shimTiles = builder.getArrayAttr({
         builder.getArrayAttr({builder.getI64IntegerAttr(0), builder.getI64IntegerAttr(2)})
     });
-    builder.create<dfscheblueprint::ResourceGroupOp>(
+    builder.create<dfscheblueprint::TileGroupOp>(
         location,
         builder.getStringAttr("shim_gateway"),
         shimTiles
@@ -499,7 +499,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(2)}),
         builder.getArrayAttr({builder.getI64IntegerAttr(2), builder.getI64IntegerAttr(3)})
     });
-    builder.create<dfscheblueprint::ResourceGroupOp>(
+    builder.create<dfscheblueprint::TileGroupOp>(
         location,
         builder.getStringAttr("compute_row"),
         computeTiles
@@ -587,7 +587,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Bind Shim TX
     llvm::SmallVector<int64_t, 1> shimTxCh = {0};
     auto shimTxDMA = dfscheblueprint::DMAAttr::get(ctx, shimTxCh, dfscheblueprint::bp_direction::MM2S);
-    builder.create<dfscheblueprint::BindOp>(
+    builder.create<dfscheblueprint::FlowConfigOp>(
         location,
         builder.getStringAttr("bind_shim_tx"),
         mlir::SymbolRefAttr::get(ctx, "shim_gateway"),
@@ -601,7 +601,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Bind Cores Input (S2MM - Receive)
     llvm::SmallVector<int64_t, 1> coresInCh = {0};
     auto coresInDMA = dfscheblueprint::DMAAttr::get(ctx, coresInCh, dfscheblueprint::bp_direction::S2MM);
-    builder.create<dfscheblueprint::BindGroupOp>(
+    builder.create<dfscheblueprint::FlowConfigGroupOp>(
         location,
         builder.getStringAttr("bind_cores_in"),
         mlir::SymbolRefAttr::get(ctx, "compute_row"),
@@ -615,7 +615,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Bind Cores Output (MM2S - Send)
     llvm::SmallVector<int64_t, 1> coresOutCh = {1};
     auto coresOutDMA = dfscheblueprint::DMAAttr::get(ctx, coresOutCh, dfscheblueprint::bp_direction::MM2S);
-    builder.create<dfscheblueprint::BindGroupOp>(
+    builder.create<dfscheblueprint::FlowConfigGroupOp>(
         location,
         builder.getStringAttr("bind_cores_out"),
         mlir::SymbolRefAttr::get(ctx, "compute_row"),
@@ -629,7 +629,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Bind Shim RX
     llvm::SmallVector<int64_t, 1> shimRxCh = {0};
     auto shimRxDMA = dfscheblueprint::DMAAttr::get(ctx, shimRxCh, dfscheblueprint::bp_direction::S2MM);
-    builder.create<dfscheblueprint::BindOp>(
+    builder.create<dfscheblueprint::FlowConfigOp>(
         location,
         builder.getStringAttr("bind_shim_rx"),
         mlir::SymbolRefAttr::get(ctx, "shim_gateway"),
@@ -645,7 +645,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // ============================================================
 
     // Input Scatter
-    builder.create<dfscheblueprint::CollectiveTransferOp>(
+    builder.create<dfscheblueprint::FlowTransferOp>(
         location,
         builder.getStringAttr("input_scatter"),
         builder.getStringAttr("one_to_many"),
@@ -656,7 +656,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     );
 
     // Output Gather
-    builder.create<dfscheblueprint::CollectiveTransferOp>(
+    builder.create<dfscheblueprint::FlowTransferOp>(
         location,
         builder.getStringAttr("output_gather"),
         builder.getStringAttr("many_to_one"),

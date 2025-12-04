@@ -89,7 +89,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     int opId = g_pullPushCounter.fetch_add(1);
     
     std::string srcGroupName = "group_src_" + std::to_string(opId);
-    builder.create<dfscheblueprint::ResourceGroupOp>(
+    builder.create<dfscheblueprint::TileGroupOp>(
         op.getLoc(),
         srcGroupName,
         builder.getArrayAttr(sourceTiles)
@@ -135,7 +135,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     }
     
     std::string dstGroupName = "group_dst_" + std::to_string(opId);
-    builder.create<dfscheblueprint::ResourceGroupOp>(
+    builder.create<dfscheblueprint::TileGroupOp>(
         op.getLoc(),
         dstGroupName,
         builder.getArrayAttr(destTiles)
@@ -143,7 +143,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     
     // 3. Create Binds
     std::string srcBindName = "bind_src_" + std::to_string(opId);
-    builder.create<dfscheblueprint::BindGroupOp>(
+    builder.create<dfscheblueprint::FlowConfigGroupOp>(
         op.getLoc(),
         srcBindName,
         FlatSymbolRefAttr::get(builder.getContext(), srcGroupName),
@@ -155,7 +155,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     );
     
     std::string dstBindName = "bind_dst_" + std::to_string(opId);
-    builder.create<dfscheblueprint::BindOp>(
+    builder.create<dfscheblueprint::FlowConfigOp>(
         op.getLoc(),
         dstBindName,
         FlatSymbolRefAttr::get(builder.getContext(), dstGroupName),
@@ -167,7 +167,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     );
     
     // 4. Collective Transfer
-    builder.create<dfscheblueprint::CollectiveTransferOp>(
+    builder.create<dfscheblueprint::FlowTransferOp>(
         op.getLoc(),
         "transfer_" + std::to_string(opId),
         "many_to_one",
@@ -282,14 +282,14 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     int opId = g_pullPushCounter.fetch_add(1);
     
     std::string srcGroupName = "group_src_" + std::to_string(opId);
-    builder.create<dfscheblueprint::ResourceGroupOp>(
+    builder.create<dfscheblueprint::TileGroupOp>(
         op.getLoc(),
         srcGroupName,
         builder.getArrayAttr(srcTiles)
     );
     
     std::string dstGroupName = "group_dst_" + std::to_string(opId);
-    builder.create<dfscheblueprint::ResourceGroupOp>(
+    builder.create<dfscheblueprint::TileGroupOp>(
         op.getLoc(),
         dstGroupName,
         builder.getArrayAttr(dstTiles)
@@ -297,7 +297,7 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     
     // Binds
     std::string srcBindName = "bind_src_" + std::to_string(opId);
-    builder.create<dfscheblueprint::BindOp>(
+    builder.create<dfscheblueprint::FlowConfigOp>(
         op.getLoc(),
         srcBindName,
         FlatSymbolRefAttr::get(builder.getContext(), srcGroupName),
@@ -309,7 +309,7 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     );
     
     std::string dstBindName = "bind_dst_" + std::to_string(opId);
-    builder.create<dfscheblueprint::BindGroupOp>(
+    builder.create<dfscheblueprint::FlowConfigGroupOp>(
         op.getLoc(),
         dstBindName,
         FlatSymbolRefAttr::get(builder.getContext(), dstGroupName),
@@ -320,7 +320,7 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getStringAttr(dstTileType)
     );
     
-    builder.create<dfscheblueprint::CollectiveTransferOp>(
+    builder.create<dfscheblueprint::FlowTransferOp>(
         op.getLoc(),
         "transfer_" + std::to_string(opId),
         "one_to_many",
@@ -656,27 +656,27 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             rewriter.setInsertionPointToStart(&routingBlock);
             
             // Source resource group (producer - one for push)
-            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            rewriter.create<dfscheblueprint::TileGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(srcGroupName),
                 rewriter.getArrayAttr(sourceTiles)
             );
             
             // Destination resource group (consumers - many for push)
-            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            rewriter.create<dfscheblueprint::TileGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(dstGroupName),
                 rewriter.getArrayAttr(destTiles)
             );
         } else {
             // Fallback: insert at current position if not inside RoutingCreate
-            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            rewriter.create<dfscheblueprint::TileGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(srcGroupName),
                 rewriter.getArrayAttr(sourceTiles)
             );
             
-            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            rewriter.create<dfscheblueprint::TileGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(dstGroupName),
                 rewriter.getArrayAttr(destTiles)
@@ -684,9 +684,9 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         }
         
         // 4. Create Binds
-        // For Push: src is one tile (BindOp with root), dst is many tiles (BindGroupOp with linear and slice_symbols)
+        // For Push: src is one tile (FlowConfigOp with root), dst is many tiles (FlowConfigGroupOp with linear and slice_symbols)
         std::string srcBindName = "bind_src_" + std::to_string(opId);
-        rewriter.create<dfscheblueprint::BindOp>(
+        rewriter.create<dfscheblueprint::FlowConfigOp>(
             op.getLoc(),
             rewriter.getStringAttr(srcBindName),
             FlatSymbolRefAttr::get(getContext(), srcGroupName),
@@ -698,7 +698,7 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         );
         
         std::string dstBindName = "bind_dst_" + std::to_string(opId);
-        rewriter.create<dfscheblueprint::BindGroupOp>(
+        rewriter.create<dfscheblueprint::FlowConfigGroupOp>(
             op.getLoc(),
             rewriter.getStringAttr(dstBindName),
             FlatSymbolRefAttr::get(getContext(), dstGroupName),
@@ -710,7 +710,7 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         );
         
         // 5. Create Collective Transfer - one_to_many for push/scatter
-        rewriter.create<dfscheblueprint::CollectiveTransferOp>(
+        rewriter.create<dfscheblueprint::FlowTransferOp>(
             op.getLoc(),
             rewriter.getStringAttr("transfer_" + std::to_string(opId)),
             rewriter.getStringAttr("one_to_many"),
@@ -871,27 +871,27 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             rewriter.setInsertionPointToStart(&routingBlock);
             
             // Source resource group (producers)
-            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            rewriter.create<dfscheblueprint::TileGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(srcGroupName),
                 rewriter.getArrayAttr(sourceTiles)
             );
             
             // Destination resource group (consumers)
-            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            rewriter.create<dfscheblueprint::TileGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(dstGroupName),
                 rewriter.getArrayAttr(destTiles)
             );
         } else {
             // Fallback: insert at current position if not inside RoutingCreate
-            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            rewriter.create<dfscheblueprint::TileGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(srcGroupName),
                 rewriter.getArrayAttr(sourceTiles)
             );
             
-            rewriter.create<dfscheblueprint::ResourceGroupOp>(
+            rewriter.create<dfscheblueprint::TileGroupOp>(
                 op.getLoc(),
                 rewriter.getStringAttr(dstGroupName),
                 rewriter.getArrayAttr(destTiles)
@@ -900,7 +900,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         
         // 4. Create Binds
         std::string srcBindName = "bind_src_" + std::to_string(opId);
-        rewriter.create<dfscheblueprint::BindGroupOp>(
+        rewriter.create<dfscheblueprint::FlowConfigGroupOp>(
             op.getLoc(),
             rewriter.getStringAttr(srcBindName),
             FlatSymbolRefAttr::get(getContext(), srcGroupName),
@@ -912,7 +912,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         );
         
         std::string dstBindName = "bind_dst_" + std::to_string(opId);
-        rewriter.create<dfscheblueprint::BindOp>(
+        rewriter.create<dfscheblueprint::FlowConfigOp>(
             op.getLoc(),
             rewriter.getStringAttr(dstBindName),
             FlatSymbolRefAttr::get(getContext(), dstGroupName),
@@ -924,7 +924,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         );
         
         // 5. Create Collective Transfer
-        rewriter.create<dfscheblueprint::CollectiveTransferOp>(
+        rewriter.create<dfscheblueprint::FlowTransferOp>(
             op.getLoc(),
             rewriter.getStringAttr("transfer_" + std::to_string(opId)),
             rewriter.getStringAttr("many_to_one"),

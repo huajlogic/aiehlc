@@ -9,8 +9,8 @@ module {
     // ==========================================
     // 1. Physical Resource Definition
     // ==========================================
-    schedule.resource_group @shim_tx { tiles = [(0, 2)] }
-    schedule.resource_group @core_rx { tiles = [(2, 0), (2, 1)] }
+    schedule.tile_group @shim_tx { tiles = [(0, 2)] }
+    schedule.tile_group @core_rx { tiles = [(2, 0), (2, 1)] }
 
     // ==========================================
     // 2. Logical Data Definition (Using Tensor)
@@ -27,7 +27,7 @@ module {
     // ==========================================
     
     // [Bind A]: Shim Sender (Holds Root Data)
-    schedule.bind @bind_shim {
+    schedule.flowconfig @bind_shim {
       target = @shim_tx,
       view   = %view,
       slice  = "root",
@@ -37,7 +37,7 @@ module {
     // [Bind B]: Core Receiver (Holds Sliced Data)
     // Semantics: Core 0 and Core 1 both receive *complete* Root Data (Broadcast)
     //      (If Scatter, distribution="linear" would be used here)
-    schedule.bind_group @bind_cores {
+    schedule.flowconfig_group @bind_cores {
       target_group = @core_rx,
       view         = %view,
       distribution = "replicate", // Broadcast mode
@@ -48,7 +48,7 @@ module {
     // 4. Transfer
     // ==========================================
     // Circuit-switched broadcast (No Packet ID)
-    schedule.collective_transfer @op_broadcast {
+    schedule.flow_transfer @op_broadcast {
       type = "one_to_many",
       from = @bind_shim,
       to   = @bind_cores,

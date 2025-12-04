@@ -102,8 +102,8 @@ def dfscheblueprint_TransferManifestOp : dfscheblueprintop<"transfer_manifest", 
   }];
 }
 
-// schedule.resource_group
-def dfscheblueprint_ResourceGroupOp : dfscheblueprintop<"resource_group", [
+// schedule.tile_group
+def dfscheblueprint_TileGroupOp : dfscheblueprintop<"tile_group", [
     Symbol
   ]> {
   let summary = "Defines a group of physical tiles";
@@ -184,8 +184,8 @@ def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
   let hasCustomAssemblyFormat = 1;
 }
 
-// schedule.bind
-def dfscheblueprint_BindOp : dfscheblueprintop<"bind", [
+// schedule.flowconfig
+def dfscheblueprint_FlowConfigOp : dfscheblueprintop<"flowconfig", [
     Symbol
   ]> {
   let summary = "Binds a resource to a data view";
@@ -201,8 +201,8 @@ def dfscheblueprint_BindOp : dfscheblueprintop<"bind", [
   let hasCustomAssemblyFormat = 1;
 }
 
-// schedule.bind_group
-def dfscheblueprint_BindGroupOp : dfscheblueprintop<"bind_group", [
+// schedule.flowconfig_group
+def dfscheblueprint_FlowConfigGroupOp : dfscheblueprintop<"flowconfig_group", [
     Symbol
   ]> {
   let summary = "Binds a resource group to a data view";
@@ -218,8 +218,8 @@ def dfscheblueprint_BindGroupOp : dfscheblueprintop<"bind_group", [
   let hasCustomAssemblyFormat = 1;
 }
 
-// schedule.collective_transfer
-def dfscheblueprint_CollectiveTransferOp : dfscheblueprintop<"collective_transfer", [
+// schedule.flow_transfer
+def dfscheblueprint_FlowTransferOp : dfscheblueprintop<"flow_transfer", [
     Symbol
   ]> {
   let summary = "Defines a collective transfer between bindings";
