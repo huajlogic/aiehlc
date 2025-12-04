@@ -534,7 +534,7 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         // Get unique sequential ID for naming (moved up to use in slice names)
         int opId = g_pullPushCounter.fetch_add(1);
         
-        // Create schedule.data_slice ops to wrap the converted consumer buffers
+        // Create dfscheblueprint.data_slice ops to wrap the converted consumer buffers
         SmallVector<Attribute> sliceSymbols;
         for (size_t i = 0; i < consumerBuffers.size(); ++i) {
             Value buffer = consumerBuffers[i];
@@ -740,7 +740,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         // Get unique sequential ID for naming (moved up to use in slice names)
         int opId = g_pullPushCounter.fetch_add(1);
         
-        // Create schedule.data_slice ops to wrap the converted producer buffers
+        // Create dfscheblueprint.data_slice ops to wrap the converted producer buffers
         SmallVector<Attribute> sliceSymbols;
         for (size_t i = 0; i < producerBuffers.size(); ++i) {
             Value buffer = producerBuffers[i];

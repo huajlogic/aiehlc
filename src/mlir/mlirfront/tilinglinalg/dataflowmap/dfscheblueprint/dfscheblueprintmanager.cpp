@@ -119,7 +119,7 @@ ParseResult dfscheblueprint::TransferManifestOp::parse(OpAsmParser &parser, Oper
 }
 
 // DataSliceOp printer
-// Format: %result = schedule.data_slice @sym_name wrap %tensor_slice : tensor_type
+// Format: %result = dfscheblueprint.data_slice @sym_name wrap %tensor_slice : tensor_type
 void dfscheblueprint::DataSliceOp::print(OpAsmPrinter &printer) {
     printer << " @" << getSymName() << " wrap ";
     printer << getTensorSlice() << " : " << getTensorSlice().getType();
@@ -127,7 +127,7 @@ void dfscheblueprint::DataSliceOp::print(OpAsmPrinter &printer) {
 }
 
 // DataSliceOp parser
-// Format: %result = schedule.data_slice @sym_name wrap %tensor_slice : tensor_type
+// Format: %result = dfscheblueprint.data_slice @sym_name wrap %tensor_slice : tensor_type
 ParseResult dfscheblueprint::DataSliceOp::parse(OpAsmParser &parser, OperationState &result) {
     StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
@@ -360,23 +360,23 @@ void dfscheblueprintmanager::loaddialect(MLIRContext* ctx) {
 /**
  * Creates an example schedule blueprint as shown in the user's specification:
  * 
- * schedule.config @tiling_and_broadcast_blueprint {
- *   schedule.transfer_manifest @broadcast_upper_half {
- *     payload_slice = #schedule.slice<...>,
+ * dfscheblueprint.config @tiling_and_broadcast_blueprint {
+ *   dfscheblueprint.transfer_manifest @broadcast_upper_half {
+ *     payload_slice = #dfscheblueprint.slice<...>,
  *     packet_id = 10 : i32,
- *     source = #schedule.endpoint<tile=(2,0), direction="MM2S", channel=0>,
+ *     source = #dfscheblueprint.endpoint<tile=(2,0), direction="MM2S", channel=0>,
  *     destinations = [
- *       #schedule.endpoint<tile=(2,2), direction="S2MM", channel=0>,
- *       #schedule.endpoint<tile=(2,3), direction="S2MM", channel=0>
+ *       #dfscheblueprint.endpoint<tile=(2,2), direction="S2MM", channel=0>,
+ *       #dfscheblueprint.endpoint<tile=(2,3), direction="S2MM", channel=0>
  *     ]
  *   }
- *   schedule.transfer_manifest @broadcast_lower_half { ... }
+ *   dfscheblueprint.transfer_manifest @broadcast_lower_half { ... }
  * }
  */
 void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRContext* ctx) {
     auto location = builder.getUnknownLoc();
     
-    // Create the top-level schedule.config operation
+    // Create the top-level dfscheblueprint.config operation
     auto configOp = builder.create<dfscheblueprint::ConfigOp>(
         location,
         builder.getStringAttr("broadcast_gather_blueprint")
@@ -469,7 +469,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         tensorSlices.push_back(tensorSlice.getResult());
     }
     
-    // Second: Create all 4 schedule.data_slice ops as a group to wrap the tensor slices
+    // Second: Create all 4 dfscheblueprint.data_slice ops as a group to wrap the tensor slices
     llvm::SmallVector<mlir::Attribute, 4> outSliceSymbols;
     llvm::SmallVector<mlir::Value, 4> dataSliceResults;
     for (int i = 0; i < 4; ++i) {
