@@ -825,10 +825,16 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     Block *body = new Block();
     receiverOp.getBody().push_back(body);
     
-    // Add arguments: %arg0: !dfschedule.packet, %computelogic: !dfschedule.compute, %loop_count: index
+    // Add arguments: 
+    //   %arg0: !dfschedule.packet - packet containing tensor and DMA info
+    //   %tile: !dfschedule.tile - tile handle for DMA configuration
+    //   %computelogic: !dfschedule.compute - compute kernel to invoke
+    //   %loop_count: index - number of iterations
     auto packetType = dfschedule::PacketType::get(ctx);
+    auto tileType = dfschedule::TileType::get(ctx);
     auto computeType = dfschedule::ComputeType::get(ctx);
     auto arg0 = body->addArgument(packetType, location);
+    auto tileArg = body->addArgument(tileType, location);
     auto computelogic = body->addArgument(computeType, location);
     auto loop_count = body->addArgument(builder.getIndexType(), location);
     
@@ -855,7 +861,45 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     // %pong = dfschedule.kernel.memalloc(%input_tensor) : (tensor<16x256xf32>) -> memref<16x256xf32, "LOCAL">
     auto pong = builder.create<dfschedule::KernelMemAllocOp>(location, localMemrefType, inputTensor.getResult());
     
+    // ===== DMA Buffer Descriptor Configuration =====
+    ///*
+    // Configure DMA BD for ping buffer
+    auto bdHandleType = dfschedule::BdHandleType::get(ctx);
+    
+    // DMA configuration parameters (derived from buffer shape and local constants)
+    int64_t bufferLen = 16 * 256;  // Total elements in buffer
+    int64_t pingBdId = 0;          // BD ID for ping buffer
+    int64_t pongBdId = 1;          // BD ID for pong buffer
+    int64_t packetIdBase = 10;     // Base packet ID
+    
+    // %bd_ping = dfschedule.config.dma_bd(%ping, %tile) { ... }
+    auto bdPing = builder.create<dfschedule::ConfigDmaBdOp>(
+        location, bdHandleType,
+        ping.getResult(),
+        tileArg,
+        builder.getI32IntegerAttr(pingBdId),      // bd_id
+        builder.getI32IntegerAttr(0),              // offset
+        builder.getI32IntegerAttr(bufferLen),      // len
+        builder.getBoolAttr(true),                 // enable_packet
+        builder.getI32IntegerAttr(packetIdBase),   // packet_id
+        builder.getI32IntegerAttr(pongBdId)        // next_bd (chain to pong)
+    );
+    
+    // %bd_pong = dfschedule.config.dma_bd(%pong, %tile) { ... }
+    auto bdPong = builder.create<dfschedule::ConfigDmaBdOp>(
+        location, bdHandleType,
+        pong.getResult(),
+        tileArg,
+        builder.getI32IntegerAttr(pongBdId),       // bd_id
+        builder.getI32IntegerAttr(0),              // offset
+        builder.getI32IntegerAttr(bufferLen),      // len
+        builder.getBoolAttr(true),                 // enable_packet
+        builder.getI32IntegerAttr(packetIdBase + 1), // packet_id
+        builder.getI32IntegerAttr(pingBdId)        // next_bd (chain back to ping)
+    );
+    //*/
     // Initialize locks
+    ///*
     auto lockType = dfschedule::LockType::get(ctx);
     
     // %l_ping_acq = dfschedule.dskernel.lock_init(0, "ping_acquire_lock") -> !dfschedule.lock
@@ -914,10 +958,10 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     auto isPing = builder.create<mlir::arith::CmpIOp>(
         location, mlir::arith::CmpIPredicate::eq, rem.getResult(), c0.getResult()
     );
-    
-    // Select buffer
+    ///*
+    // Select buffer (must use localMemrefType to match ping/pong types)
     auto ifBuffer = builder.create<mlir::scf::IfOp>(
-        location, sharedMemrefType, isPing.getResult(), true
+        location, localMemrefType, isPing.getResult(), true
     );
     builder.setInsertionPointToStart(&ifBuffer.getThenRegion().front());
     builder.create<mlir::scf::YieldOp>(location, ping.getResult());
@@ -930,13 +974,14 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     auto ifReadLock = builder.create<mlir::scf::IfOp>(
         location, lockType, isPing.getResult(), true
     );
+    
     builder.setInsertionPointToStart(&ifReadLock.getThenRegion().front());
     builder.create<mlir::scf::YieldOp>(location, l_ping_acq.getResult());
     builder.setInsertionPointToStart(&ifReadLock.getElseRegion().front());
     builder.create<mlir::scf::YieldOp>(location, l_pong_acq.getResult());
     builder.setInsertionPointAfter(ifReadLock);
     Value currReadLock = ifReadLock.getResult(0);
-    
+    ///*
     // Select write lock
     auto ifWriteLock = builder.create<mlir::scf::IfOp>(
         location, lockType, isPing.getResult(), true
@@ -947,6 +992,7 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     builder.create<mlir::scf::YieldOp>(location, l_pong_rel.getResult());
     builder.setInsertionPointAfter(ifWriteLock);
     Value currWriteLock = ifWriteLock.getResult(0);
+   
     
     // Acquire lock (wait for data)
     builder.create<dfschedule::DSKernelAcquireLockOp>(location, currReadLock, builder.getI32IntegerAttr(1));
@@ -958,6 +1004,7 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     builder.create<dfschedule::DSKernelReleaseLockOp>(location, currWriteLock, builder.getI32IntegerAttr(1));
     
     // Move insertion point back to module level
+    //*/
     builder.setInsertionPointAfter(receiverOp);
 }
 
