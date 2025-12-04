@@ -48,7 +48,6 @@ struct ConfigOpConversion : public OpConversionPattern<dfscheblueprint::ConfigOp
         SmallVector<dfscheblueprint::DeclareDataOp> declareDataOps;
         SmallVector<dfscheblueprint::DataSliceOp> dataSliceOps;
         SmallVector<dfscheblueprint::FlowConfigOp> bindOps;
-        SmallVector<dfscheblueprint::FlowConfigGroupOp> bindGroupOps;
         SmallVector<dfscheblueprint::FlowTransferOp> transferOps;
         SmallVector<dfscheblueprint::TransferManifestOp> manifestOps;
         
@@ -62,8 +61,6 @@ struct ConfigOpConversion : public OpConversionPattern<dfscheblueprint::ConfigOp
                 dataSliceOps.push_back(dataSlice);
             } else if (auto bind = dyn_cast<dfscheblueprint::FlowConfigOp>(&innerOp)) {
                 bindOps.push_back(bind);
-            } else if (auto bindGroup = dyn_cast<dfscheblueprint::FlowConfigGroupOp>(&innerOp)) {
-                bindGroupOps.push_back(bindGroup);
             } else if (auto transfer = dyn_cast<dfscheblueprint::FlowTransferOp>(&innerOp)) {
                 transferOps.push_back(transfer);
             } else if (auto manifest = dyn_cast<dfscheblueprint::TransferManifestOp>(&innerOp)) {
@@ -341,7 +338,6 @@ void BlueprintToSchedulePass::runOnOperation() {
     patterns.add<EraseOpPattern<dfscheblueprint::TileGroupOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::DeclareDataOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::FlowConfigOp>>(context);
-    patterns.add<EraseOpPattern<dfscheblueprint::FlowConfigGroupOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::FlowTransferOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::TransferManifestOp>>(context);
     */

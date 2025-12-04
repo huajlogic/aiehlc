@@ -30,14 +30,14 @@ module {
     schedule.flowconfig @bind_shim {
       target = @shim_tx,
       view   = %view,
-      slice  = "root",
+      distribution = "root",
       dma    = #schedule.DMA<channel=0, direction=MM2S>
     }
 
     // [Bind B]: Core Receiver (Holds Sliced Data)
     // Semantics: Core 0 and Core 1 both receive *complete* Root Data (Broadcast)
     //      (If Scatter, distribution="linear" would be used here)
-    schedule.flowconfig_group @bind_cores {
+    schedule.flowconfig @bind_cores {
       target_group = @core_rx,
       view         = %view,
       distribution = "replicate", // Broadcast mode

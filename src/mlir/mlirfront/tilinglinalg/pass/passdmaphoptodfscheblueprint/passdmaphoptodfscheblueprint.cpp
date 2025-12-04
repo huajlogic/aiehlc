@@ -142,8 +142,8 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     );
     
     // 3. Create Binds
-    std::string srcBindName = "bind_src_" + std::to_string(opId);
-    builder.create<dfscheblueprint::FlowConfigGroupOp>(
+    std::string srcBindName = "flow_src_" + std::to_string(opId);
+    builder.create<dfscheblueprint::FlowConfigOp>(
         op.getLoc(),
         srcBindName,
         FlatSymbolRefAttr::get(builder.getContext(), srcGroupName),
@@ -154,7 +154,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getStringAttr(srcTileType) 
     );
     
-    std::string dstBindName = "bind_dst_" + std::to_string(opId);
+    std::string dstBindName = "flow_dst_" + std::to_string(opId);
     builder.create<dfscheblueprint::FlowConfigOp>(
         op.getLoc(),
         dstBindName,
@@ -162,7 +162,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         viewHandle,
         builder.getStringAttr("root"),
         dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({destChannel}), dfscheblueprint::bp_direction::S2MM),
-        nullptr, // slice_symbol
+        nullptr, // slice_symbols
         builder.getStringAttr(dstTileType)
     );
     
@@ -296,7 +296,7 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     );
     
     // Binds
-    std::string srcBindName = "bind_src_" + std::to_string(opId);
+    std::string srcBindName = "flow_src_" + std::to_string(opId);
     builder.create<dfscheblueprint::FlowConfigOp>(
         op.getLoc(),
         srcBindName,
@@ -304,12 +304,12 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
         viewHandle,
         builder.getStringAttr("root"),
         dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({srcChannel}), dfscheblueprint::bp_direction::MM2S),
-        nullptr, // slice_symbol
+        nullptr, // slice_symbols
         builder.getStringAttr(srcTileType)
     );
     
-    std::string dstBindName = "bind_dst_" + std::to_string(opId);
-    builder.create<dfscheblueprint::FlowConfigGroupOp>(
+    std::string dstBindName = "flow_dst_" + std::to_string(opId);
+    builder.create<dfscheblueprint::FlowConfigOp>(
         op.getLoc(),
         dstBindName,
         FlatSymbolRefAttr::get(builder.getContext(), dstGroupName),
@@ -556,7 +556,7 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                 buffer // Use adapted consumer buffer (DeclareDataOp result)
             );
             
-            // Collect slice symbol reference for bind_group
+            // Collect slice symbol reference for flow_group
             sliceSymbols.push_back(FlatSymbolRefAttr::get(getContext(), sliceName));
         }
 
@@ -685,7 +685,7 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         
         // 4. Create Binds
         // For Push: src is one tile (FlowConfigOp with root), dst is many tiles (FlowConfigGroupOp with linear and slice_symbols)
-        std::string srcBindName = "bind_src_" + std::to_string(opId);
+        std::string srcBindName = "flow_src_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::FlowConfigOp>(
             op.getLoc(),
             rewriter.getStringAttr(srcBindName),
@@ -693,12 +693,12 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             viewSplit,
             rewriter.getStringAttr("root"),
             dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({sourceChannel}), dfscheblueprint::bp_direction::MM2S),
-            nullptr, // slice_symbol - source is root, no slice
+            nullptr, // slice_symbols - source is root, no slice
             rewriter.getStringAttr(srcTileType)
         );
         
-        std::string dstBindName = "bind_dst_" + std::to_string(opId);
-        rewriter.create<dfscheblueprint::FlowConfigGroupOp>(
+        std::string dstBindName = "flow_dst_" + std::to_string(opId);
+        rewriter.create<dfscheblueprint::FlowConfigOp>(
             op.getLoc(),
             rewriter.getStringAttr(dstBindName),
             FlatSymbolRefAttr::get(getContext(), dstGroupName),
@@ -762,7 +762,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 buffer // Use adapted producer buffer (DeclareDataOp result)
             );
 
-            // Collect slice symbol reference for bind_group
+            // Collect slice symbol reference for flow_group
             sliceSymbols.push_back(FlatSymbolRefAttr::get(getContext(), sliceName));
         }
 
@@ -899,19 +899,19 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         }
         
         // 4. Create Binds
-        std::string srcBindName = "bind_src_" + std::to_string(opId);
-        rewriter.create<dfscheblueprint::FlowConfigGroupOp>(
+        std::string srcBindName = "flow_src_" + std::to_string(opId);
+        rewriter.create<dfscheblueprint::FlowConfigOp>(
             op.getLoc(),
             rewriter.getStringAttr(srcBindName),
             FlatSymbolRefAttr::get(getContext(), srcGroupName),
             viewSplit,
             rewriter.getStringAttr("linear"),
             dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({sourceChannel}), dfscheblueprint::bp_direction::MM2S),
-            rewriter.getArrayAttr(sliceSymbols),  // Associate with @producer_slice_0 to @producer_slice_N
+            rewriter.getArrayAttr(sliceSymbols),  // slice_symbols
             rewriter.getStringAttr(srcTileType)
         );
         
-        std::string dstBindName = "bind_dst_" + std::to_string(opId);
+        std::string dstBindName = "flow_dst_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::FlowConfigOp>(
             op.getLoc(),
             rewriter.getStringAttr(dstBindName),
@@ -919,7 +919,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             viewSplit,
             rewriter.getStringAttr("root"),
             dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({destChannel}), dfscheblueprint::bp_direction::S2MM),
-            nullptr, // slice_symbol
+            nullptr, // slice_symbols
             rewriter.getStringAttr(dstTileType)
         );
         

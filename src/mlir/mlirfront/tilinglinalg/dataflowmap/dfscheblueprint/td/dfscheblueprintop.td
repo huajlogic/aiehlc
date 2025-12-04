@@ -188,27 +188,10 @@ def dfscheblueprint_DataSliceOp : dfscheblueprintop<"data_slice", [
 def dfscheblueprint_FlowConfigOp : dfscheblueprintop<"flowconfig", [
     Symbol
   ]> {
-  let summary = "Binds a resource to a data view";
+  let summary = "Binds a resource or resource group to a data view";
   let arguments = (ins
     SymbolNameAttr:$sym_name,
     SymbolRefAttr:$target,
-    AnyType:$view,
-    StrAttr:$slice,
-    dfscheblueprint_DMAAttr:$dma,
-    OptionalAttr<SymbolRefAttr>:$slice_symbol,
-    OptionalAttr<StrAttr>:$type
-  );
-  let hasCustomAssemblyFormat = 1;
-}
-
-// schedule.flowconfig_group
-def dfscheblueprint_FlowConfigGroupOp : dfscheblueprintop<"flowconfig_group", [
-    Symbol
-  ]> {
-  let summary = "Binds a resource group to a data view";
-  let arguments = (ins
-    SymbolNameAttr:$sym_name,
-    SymbolRefAttr:$target_group,
     AnyType:$view,
     StrAttr:$distribution,
     dfscheblueprint_DMAAttr:$dma,
@@ -235,4 +218,3 @@ def dfscheblueprint_FlowTransferOp : dfscheblueprintop<"flow_transfer", [
 }
 
 #endif // dfscheblueprint_OPS
-
