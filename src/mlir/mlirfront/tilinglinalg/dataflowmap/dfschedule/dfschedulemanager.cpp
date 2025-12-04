@@ -240,6 +240,342 @@ void dfschedule::KernelScheduleOp::print(::mlir::OpAsmPrinter &printer) {
     printer.printRegion(getBody(), false, false);
 }
 
+// ConfigDmaBdOp - DMA Buffer Descriptor Configuration
+::mlir::ParseResult dfschedule::ConfigDmaBdOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
+    mlir::OpAsmParser::UnresolvedOperand bufferOperand, tileOperand;
+    mlir::Type bufferType, tileType;
+    
+    // Parse: (%buffer, %tile)
+    if (parser.parseLParen() ||
+        parser.parseOperand(bufferOperand) ||
+        parser.parseComma() ||
+        parser.parseOperand(tileOperand) ||
+        parser.parseRParen())
+        return mlir::failure();
+    
+    // Parse attributes: { bd_id = ..., offset = ..., len = ..., enable_packet = ..., packet_id = ..., next_bd = ... }
+    if (parser.parseOptionalAttrDict(result.attributes))
+        return mlir::failure();
+    
+    // Parse: : (type($buffer), type($tile)) -> type($bd_handle)
+    if (parser.parseColon() ||
+        parser.parseLParen() ||
+        parser.parseType(bufferType) ||
+        parser.parseComma() ||
+        parser.parseType(tileType) ||
+        parser.parseRParen() ||
+        parser.parseArrow())
+        return mlir::failure();
+    
+    mlir::Type bdHandleType;
+    if (parser.parseType(bdHandleType))
+        return mlir::failure();
+    
+    // Resolve operands
+    if (parser.resolveOperand(bufferOperand, bufferType, result.operands) ||
+        parser.resolveOperand(tileOperand, tileType, result.operands))
+        return mlir::failure();
+    
+    // Add result type
+    result.addTypes(bdHandleType);
+    
+    return mlir::success();
+}
+
+void dfschedule::ConfigDmaBdOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << "(";
+    printer << getBuffer() << ", " << getTile();
+    printer << ") {";
+    
+    // Print attributes with proper indentation
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "bd_id = " << getBdId() << ",";
+    printer.printNewline();
+    printer << "offset = " << getOffset() << ",";
+    printer.printNewline();
+    printer << "len = " << getLen() << ",";
+    printer.printNewline();
+    printer << "enable_packet = " << (getEnablePacket() ? "true" : "false") << ",";
+    printer.printNewline();
+    printer << "packet_id = " << getPacketId() << ",";
+    printer.printNewline();
+    printer << "next_bd = " << getNextBd();
+    printer.decreaseIndent();
+    printer.printNewline();
+    printer << "} ";
+    
+    // Print types
+    printer << ": (";
+    printer << getBuffer().getType() << ", " << getTile().getType();
+    printer << ") -> ";
+    printer << getBdHandle().getType();
+}
+
+// ConfigCreateIoOp - Create IO handle for DMA operations
+::mlir::ParseResult dfschedule::ConfigCreateIoOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
+    mlir::OpAsmParser::UnresolvedOperand bdConfigOperand, tileOperand;
+    mlir::Type bdConfigType, tileType;
+    
+    // Parse: (%bd_config, %tile)
+    if (parser.parseLParen() ||
+        parser.parseOperand(bdConfigOperand) ||
+        parser.parseComma() ||
+        parser.parseOperand(tileOperand) ||
+        parser.parseRParen())
+        return mlir::failure();
+    
+    // Parse attributes: { channel = ..., direction = ..., io_operation = ... }
+    if (parser.parseOptionalAttrDict(result.attributes))
+        return mlir::failure();
+    
+    // Parse: : (type($bd_config), type($tile)) -> type($io_handle)
+    if (parser.parseColon() ||
+        parser.parseLParen() ||
+        parser.parseType(bdConfigType) ||
+        parser.parseComma() ||
+        parser.parseType(tileType) ||
+        parser.parseRParen() ||
+        parser.parseArrow())
+        return mlir::failure();
+    
+    mlir::Type ioHandleType;
+    if (parser.parseType(ioHandleType))
+        return mlir::failure();
+    
+    // Resolve operands
+    if (parser.resolveOperand(bdConfigOperand, bdConfigType, result.operands) ||
+        parser.resolveOperand(tileOperand, tileType, result.operands))
+        return mlir::failure();
+    
+    // Add result type
+    result.addTypes(ioHandleType);
+    
+    return mlir::success();
+}
+
+void dfschedule::ConfigCreateIoOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << "(";
+    printer << getBdConfig() << ", " << getTile();
+    printer << ") {";
+    
+    // Print attributes with proper indentation
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "channel = " << getChannel() << ",";
+    printer.printNewline();
+    printer << "direction = \"" << getDirection() << "\",";
+    printer.printNewline();
+    printer << "io_operation = \"" << getIoOperation() << "\"";
+    printer.decreaseIndent();
+    printer.printNewline();
+    printer << "} ";
+    
+    // Print types
+    printer << ": (";
+    printer << getBdConfig().getType() << ", " << getTile().getType();
+    printer << ") -> ";
+    printer << getIoHandle().getType();
+}
+
+// LoadKernelGroupOp - Load kernel group configuration
+::mlir::ParseResult dfschedule::LoadKernelGroupOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
+    llvm::SmallVector<mlir::OpAsmParser::UnresolvedOperand, 4> tileOperands;
+    llvm::SmallVector<mlir::Type, 4> tileTypes;
+    
+    // Parse: (%tile0, %tile1, ...)
+    if (parser.parseLParen())
+        return mlir::failure();
+    
+    if (parser.parseOptionalRParen()) {
+        // Parse operand list
+        do {
+            mlir::OpAsmParser::UnresolvedOperand operand;
+            if (parser.parseOperand(operand))
+                return mlir::failure();
+            tileOperands.push_back(operand);
+        } while (succeeded(parser.parseOptionalComma()));
+        
+        if (parser.parseRParen())
+            return mlir::failure();
+    }
+    
+    // Parse attributes: { callee = [...], ... }
+    if (parser.parseOptionalAttrDict(result.attributes))
+        return mlir::failure();
+    
+    // Parse: : (type($tiles)) -> type($kernel_group)
+    if (parser.parseColon() ||
+        parser.parseLParen())
+        return mlir::failure();
+    
+    if (parser.parseOptionalRParen()) {
+        // Parse type list
+        do {
+            mlir::Type type;
+            if (parser.parseType(type))
+                return mlir::failure();
+            tileTypes.push_back(type);
+        } while (succeeded(parser.parseOptionalComma()));
+        
+        if (parser.parseRParen())
+            return mlir::failure();
+    }
+    
+    if (parser.parseArrow())
+        return mlir::failure();
+    
+    mlir::Type kernelGroupType;
+    if (parser.parseType(kernelGroupType))
+        return mlir::failure();
+    
+    // Resolve operands
+    for (size_t i = 0; i < tileOperands.size(); ++i) {
+        mlir::Type type = (i < tileTypes.size()) ? tileTypes[i] : tileTypes.back();
+        if (parser.resolveOperand(tileOperands[i], type, result.operands))
+            return mlir::failure();
+    }
+    
+    // Add result type
+    result.addTypes(kernelGroupType);
+    
+    return mlir::success();
+}
+
+void dfschedule::LoadKernelGroupOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << "(";
+    llvm::interleaveComma(getTiles(), printer, [&](mlir::Value tile) {
+        printer << tile;
+    });
+    printer << ") {";
+    
+    // Print attributes with proper indentation
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "callee = ";
+    printer.printAttribute(getCalleeAttr());
+    printer << ",";
+    printer.printNewline();
+    printer << "distributed_compute_kernel_args = ";
+    printer.printAttribute(getDistributedComputeKernelArgsAttr());
+    printer << ",";
+    printer.printNewline();
+    printer << "distributed_args = ";
+    printer.printAttribute(getDistributedArgsAttr());
+    printer.decreaseIndent();
+    printer.printNewline();
+    printer << "} ";
+    
+    // Print types
+    printer << ": (";
+    llvm::interleaveComma(getTiles().getTypes(), printer, [&](mlir::Type type) {
+        printer << type;
+    });
+    printer << ") -> ";
+    printer << getKernelGroup().getType();
+}
+
+// DSKernelLaunchDmaLoopOp - Launch DMA S2M loop with ping-pong buffers
+::mlir::ParseResult dfschedule::DSKernelLaunchDmaLoopOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
+    mlir::OpAsmParser::UnresolvedOperand pingOperand, pongOperand;
+    mlir::OpAsmParser::UnresolvedOperand pingAcqLockOperand, pingRelLockOperand;
+    mlir::OpAsmParser::UnresolvedOperand pongAcqLockOperand, pongRelLockOperand;
+    mlir::OpAsmParser::UnresolvedOperand channelOperand;
+    mlir::Type pingType, pongType;
+    
+    // Parse: (%ping, %pong)
+    if (parser.parseLParen() ||
+        parser.parseOperand(pingOperand) ||
+        parser.parseComma() ||
+        parser.parseOperand(pongOperand) ||
+        parser.parseRParen())
+        return mlir::failure();
+    
+    // Parse: { locks_ping = {acq = %lock, rel = %lock}, locks_pong = {acq = %lock, rel = %lock}, channelid = %channel }
+    if (parser.parseLBrace() ||
+        parser.parseKeyword("locks_ping") ||
+        parser.parseEqual() ||
+        parser.parseLBrace() ||
+        parser.parseKeyword("acq") ||
+        parser.parseEqual() ||
+        parser.parseOperand(pingAcqLockOperand) ||
+        parser.parseComma() ||
+        parser.parseKeyword("rel") ||
+        parser.parseEqual() ||
+        parser.parseOperand(pingRelLockOperand) ||
+        parser.parseRBrace() ||
+        parser.parseComma() ||
+        parser.parseKeyword("locks_pong") ||
+        parser.parseEqual() ||
+        parser.parseLBrace() ||
+        parser.parseKeyword("acq") ||
+        parser.parseEqual() ||
+        parser.parseOperand(pongAcqLockOperand) ||
+        parser.parseComma() ||
+        parser.parseKeyword("rel") ||
+        parser.parseEqual() ||
+        parser.parseOperand(pongRelLockOperand) ||
+        parser.parseRBrace() ||
+        parser.parseComma() ||
+        parser.parseKeyword("channelid") ||
+        parser.parseEqual() ||
+        parser.parseOperand(channelOperand) ||
+        parser.parseRBrace())
+        return mlir::failure();
+    
+    // Parse optional attr-dict
+    if (parser.parseOptionalAttrDict(result.attributes))
+        return mlir::failure();
+    
+    // Parse: : (type($ping), type($pong))
+    if (parser.parseColon() ||
+        parser.parseLParen() ||
+        parser.parseType(pingType) ||
+        parser.parseComma() ||
+        parser.parseType(pongType) ||
+        parser.parseRParen())
+        return mlir::failure();
+    
+    // Get lock and channel types
+    auto lockType = dfschedule::LockType::get(parser.getContext());
+    auto channelType = dfschedule::DmaChannelType::get(parser.getContext());
+    
+    // Resolve operands in the correct order
+    if (parser.resolveOperand(pingOperand, pingType, result.operands) ||
+        parser.resolveOperand(pongOperand, pongType, result.operands) ||
+        parser.resolveOperand(pingAcqLockOperand, lockType, result.operands) ||
+        parser.resolveOperand(pingRelLockOperand, lockType, result.operands) ||
+        parser.resolveOperand(pongAcqLockOperand, lockType, result.operands) ||
+        parser.resolveOperand(pongRelLockOperand, lockType, result.operands) ||
+        parser.resolveOperand(channelOperand, channelType, result.operands))
+        return mlir::failure();
+    
+    return mlir::success();
+}
+
+void dfschedule::DSKernelLaunchDmaLoopOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << "(";
+    printer << getPing() << ", " << getPong();
+    printer << ") {";
+    
+    // Print with proper indentation
+    printer.increaseIndent();
+    printer.printNewline();
+    printer << "locks_ping = {acq = " << getPingAcqLock() << ", rel = " << getPingRelLock() << "},";
+    printer.printNewline();
+    printer << "locks_pong = {acq = " << getPongAcqLock() << ", rel = " << getPongRelLock() << "},";
+    printer.printNewline();
+    printer << "channelid = " << getChannel();
+    printer.decreaseIndent();
+    printer.printNewline();
+    printer << "} ";
+    
+    // Print types
+    printer << ": (";
+    printer << getPing().getType() << ", " << getPong().getType();
+    printer << ")";
+}
+
 // ===== Manager Implementation =====
 
 ModuleOp dfschedulemanager::ops_test(MLIRContext* ctx, int totalN) {
