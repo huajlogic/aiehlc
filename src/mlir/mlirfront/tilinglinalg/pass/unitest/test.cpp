@@ -15,6 +15,8 @@
 #include "dmapmanager.h"
 #include "dmaphopmanager.h"
 #include "dfschedulemanager.h"
+#include "dfscheblueprintmanager.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "routingunrolling.h"
 #include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 //#include "llvm/IR/IRPrintingPasses.h"
@@ -802,13 +804,16 @@ void routingtodfschedule() {
     
     routingmanager mtest;
     dfschedulemanager dfscheduletest;
+    dfscheblueprintmanager dfscheblueprinttest;
     
     mtest.loaddialect(&ctx);
     dfscheduletest.loaddialect(&ctx);
+    dfscheblueprinttest.loaddialect(&ctx);
     ctx.getOrLoadDialect<arith::ArithDialect>();
     ctx.getOrLoadDialect<mlir::func::FuncDialect>();
     ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
     ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    ctx.getOrLoadDialect<mlir::tensor::TensorDialect>();
     
     // Create test routing module
     auto module1 = mtest.ops_testNew(&ctx, 1);
@@ -820,22 +825,29 @@ void routingtodfschedule() {
     mlir::PassManager pm(&ctx);
     mlir::PrintIRPassOptions options;
     
-    // Unroll routing operations
+    // Stage 1: Unroll routing operations
     options.label = "After RoutingUnrollingLowerPass:";
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
     pm.addPass(mlir::createPrintIRPass(options));
 
-    options.label = "After RoutingToDmapPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
+    // Stage 2: Convert routing to dmap
     pm.addPass(std::make_unique<RoutingToDmapPass>(rtopology));
     options.label = "After RoutingToDmapPass:";
     pm.addPass(mlir::createPrintIRPass(options));
+    
+    // Stage 3: Convert dmap to dmaphop
     pm.addPass(std::make_unique<DmapToDmaphopPass>(rtopology));
     options.label = "After DmapToDmaphopPass:";
     pm.addPass(mlir::createPrintIRPass(options));
-    // Convert routing to dfschedule
-    options.label = "After DmaphopTodfscheblueprintPass:";
+    
+    // Stage 4: Convert dmaphop to dfscheblueprint
     pm.addPass(std::make_unique<DmaphopTodfscheblueprintPass>());
+    options.label = "After DmaphopTodfscheblueprintPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    
+    // Stage 5: Convert dfscheblueprint to dfschedule (final schedule IR)
+    pm.addPass(std::make_unique<mlir::BlueprintToSchedulePass>());
+    options.label = "After BlueprintToSchedulePass:";
     pm.addPass(mlir::createPrintIRPass(options));
     
     // Run the pass pipeline

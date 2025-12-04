@@ -322,7 +322,7 @@ void BlueprintToSchedulePass::runOnOperation() {
                           BuiltinDialect>();
     
     // Mark dfscheblueprint operations as illegal to trigger conversion
-    target.addIllegalDialect<dfscheblueprint::dfscheblueprintdialect>();
+    //target.addIllegalDialect<dfscheblueprint::dfscheblueprintdialect>();
     
     // Type converter
     TypeConverter typeConverter;
@@ -337,12 +337,14 @@ void BlueprintToSchedulePass::runOnOperation() {
     patterns.add<ConfigOpConversion>(context);
     patterns.add<DataSliceOpConversion>(context);
     // Use unified erase pattern for ops that just need to be removed
+    /*
     patterns.add<EraseOpPattern<dfscheblueprint::ResourceGroupOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::DeclareDataOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::BindOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::BindGroupOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::CollectiveTransferOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::TransferManifestOp>>(context);
+    */
     
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();

@@ -59,7 +59,7 @@ void dfscheduledialect::initialize()  {
 void dfschedule::HostBlockOp::print(::mlir::OpAsmPrinter &printer) {
     printer << " @" << getSymName();
     printer << " ";
-    printer.printRegion(getBody(), false, false);
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
 }
 
 // DSKernelComputeOp - Compute kernel logic block
@@ -97,19 +97,20 @@ void dfschedule::HostBlockOp::print(::mlir::OpAsmPrinter &printer) {
 void dfschedule::DSKernelComputeOp::print(::mlir::OpAsmPrinter &printer) {
     printer << " @" << getSymName();
     
-    // Print block arguments
+    // Print block arguments inline (not as entry block args)
     auto &block = getBody().front();
     if (!block.getArguments().empty()) {
         printer << "(";
         llvm::interleaveComma(block.getArguments(), printer, [&](mlir::BlockArgument arg) {
-            printer << arg << ": " << arg.getType();
+            printer.printRegionArgument(arg, {}, /*omitType=*/false);
         });
         printer << ")";
     }
     
     printer << " -> " << getCompute().getType();
     printer << " ";
-    printer.printRegion(getBody(), false, false);
+    // Print region without entry block args since we printed them inline
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
 }
 
 // DSKernelReceiverOp - Receiver kernel with ping-pong buffering
@@ -136,18 +137,19 @@ void dfschedule::DSKernelComputeOp::print(::mlir::OpAsmPrinter &printer) {
 void dfschedule::DSKernelReceiverOp::print(::mlir::OpAsmPrinter &printer) {
     printer << " @" << getSymName();
     
-    // Print block arguments
+    // Print block arguments inline
     auto &block = getBody().front();
     if (!block.getArguments().empty()) {
         printer << "(";
         llvm::interleaveComma(block.getArguments(), printer, [&](mlir::BlockArgument arg) {
-            printer << arg << ": " << arg.getType();
+            printer.printRegionArgument(arg, {}, /*omitType=*/false);
         });
         printer << ")";
     }
     
     printer << " ";
-    printer.printRegion(getBody(), false, false);
+    // Print region without entry block args since we printed them inline
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
 }
 
 // HostConfigOp (legacy)
