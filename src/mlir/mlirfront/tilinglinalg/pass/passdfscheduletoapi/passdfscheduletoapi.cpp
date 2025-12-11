@@ -139,7 +139,7 @@ void DfscheduleToApiPass::runOnOperation() {
     // 1a. Generate struct definition and extern declarations at module scope
     builder.setInsertionPointToStart(moduleOp.getBody());
     
-    // PartitionTensor struct definition
+    // PartitionTensor struct definition and helper functions
     builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), builder.getStringAttr(
         "/* PartitionTensor structure for memory management */\n"
         "typedef struct {\n"
@@ -154,6 +154,15 @@ void DfscheduleToApiPass::runOnOperation() {
         "    void* data, size_t size, size_t num_elements, int splitnum, int splitdim) {\n"
         "    PartitionTensor pt = {data, size, num_elements, splitnum, splitdim};\n"
         "    return pt;\n"
+        "}\n\n"
+        "/* Helper function for pointer arithmetic */\n"
+        "static inline void* __emitc_ptr_add(void* ptr, int offset) {\n"
+        "    return (void*)((char*)ptr + offset);\n"
+        "}\n\n"
+        "/* Helper function for 2D strided copy (non-contiguous slices) */\n"
+        "static inline void __emitc_strided_copy_2d(void* dst, void* src) {\n"
+        "    /* TODO: Implement strided copy based on actual dimensions */\n"
+        "    /* For now, this is a placeholder that should be specialized */\n"
         "}"
     ));
     
@@ -211,6 +220,9 @@ void DfscheduleToApiPass::runOnOperation() {
         auto i32Type = builder.getI32Type();
         auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
         auto memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
+        
+        // Track allocated memory for later release
+        SmallVector<Value> allocatedMemList;
         
         // Get DevInst global reference
         auto devInstRef = builder.create<emitc::GetGlobalOp>(loc, devInstType, "DevInst");
@@ -382,6 +394,188 @@ void DfscheduleToApiPass::runOnOperation() {
                     
                     llvm::errs() << "[Pass] Created PartitionTensor via SSA: partition_" << partitionIndex++ << "\n";
                 }
+                
+                // Handle tensor.extract_slice
+                if (nestedOpName == "tensor.extract_slice") {
+                    if (nestedOp.getNumResults() == 0 || nestedOp.getNumOperands() == 0) continue;
+                    
+                    auto resultType = dyn_cast<RankedTensorType>(nestedOp.getResult(0).getType());
+                    auto srcType = dyn_cast<RankedTensorType>(nestedOp.getOperand(0).getType());
+                    if (!resultType || !srcType) continue;
+                    
+                    Value srcTensor = nestedOp.getOperand(0);
+                    
+                    // Get offsets, sizes, strides from static attributes
+                    auto staticOffsetsAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_offsets");
+                    auto staticSizesAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_sizes");
+                    auto staticStridesAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_strides");
+                    
+                    if (!staticOffsetsAttr || !staticSizesAttr || !staticStridesAttr) continue;
+                    
+                    auto offsets = staticOffsetsAttr.asArrayRef();
+                    auto sizes = staticSizesAttr.asArrayRef();
+                    auto strides = staticStridesAttr.asArrayRef();
+                    auto srcShape = srcType.getShape();
+                    
+                    Type elemType = resultType.getElementType();
+                    int64_t elemSize = 1;
+                    if (elemType.isInteger(8)) elemSize = 1;
+                    else if (elemType.isInteger(16)) elemSize = 2;
+                    else if (elemType.isInteger(32) || elemType.isF32()) elemSize = 4;
+                    else if (elemType.isInteger(64) || elemType.isF64()) elemSize = 8;
+                    
+                    // Check if slice is contiguous (row-major layout)
+                    // Contiguous if: all trailing dimensions are fully extracted
+                    // i.e., for dims from innermost, offset=0 and size=srcDim until we hit a partial dim
+                    bool isContiguous = true;
+                    int64_t srcRank = srcShape.size();
+                    for (int64_t i = srcRank - 1; i >= 0; --i) {
+                        if (strides[i] != 1) {
+                            isContiguous = false;
+                            break;
+                        }
+                        // If this dimension is not fully extracted, check if it's the outermost partial
+                        if (offsets[i] != 0 || sizes[i] != srcShape[i]) {
+                            // For inner dimensions, must be fully extracted for contiguity
+                            if (i < srcRank - 1) {
+                                // Check all dimensions after this are fully extracted
+                                for (int64_t j = i + 1; j < srcRank; ++j) {
+                                    if (offsets[j] != 0 || sizes[j] != srcShape[j]) {
+                                        isContiguous = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    
+                    // Calculate total elements in slice
+                    int64_t sliceElements = 1;
+                    for (auto s : sizes) {
+                        sliceElements *= s;
+                    }
+                    int64_t sliceByteSize = sliceElements * elemSize;
+                    
+                    // Get source pointer from memAllocMap
+                    Value srcDataPtr;
+                    int64_t srcByteSize = 0;
+                    if (memAllocMap.count(srcTensor)) {
+                        srcDataPtr = std::get<0>(memAllocMap[srcTensor]);
+                        srcByteSize = std::get<1>(memAllocMap[srcTensor]);
+                    }
+                    
+                    if (!srcDataPtr) {
+                        llvm::errs() << "[Pass] Warning: No source pointer for extract_slice\n";
+                        continue;
+                    }
+                    
+                    if (isContiguous) {
+                        // Calculate byte offset: offset[0] * stride_0_in_bytes + ...
+                        // For row-major: offset = sum(offset[i] * product(srcShape[i+1:])) * elemSize
+                        int64_t byteOffset = 0;
+                        int64_t stride = elemSize;
+                        for (int64_t i = srcRank - 1; i >= 0; --i) {
+                            byteOffset += offsets[i] * stride;
+                            stride *= srcShape[i];
+                        }
+                        
+                        // Create pointer arithmetic: (char*)srcPtr + byteOffset
+                        std::string offsetExpr = "((char*)" + std::to_string(byteOffset) + ")";
+                        
+                        // If offset is 0, just use source pointer directly
+                        Value slicePtr;
+                        if (byteOffset == 0) {
+                            slicePtr = srcDataPtr;
+                        } else {
+                            // Create pointer addition via verbatim or opaque call
+                            auto charPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "char"));
+                            auto offsetConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                                builder.getI32IntegerAttr(byteOffset));
+                            
+                            // __emitc_ptr_add(ptr, offset) helper
+                            slicePtr = builder.create<emitc::CallOpaqueOp>(nestedLoc,
+                                voidPtrType,
+                                "__emitc_ptr_add",
+                                /*args=*/nullptr,
+                                /*templateArgs=*/nullptr,
+                                ValueRange{srcDataPtr, offsetConst.getResult()}).getResult(0);
+                        }
+                        
+                        // Store in memAllocMap (no new allocation needed)
+                        memAllocMap[nestedOp.getResult(0)] = std::make_tuple(slicePtr, sliceByteSize, sliceElements);
+                        
+                        llvm::errs() << "[Pass] Created contiguous slice (offset=" << byteOffset << " bytes)\n";
+                    } else {
+                        // Non-contiguous: need to allocate new memory and copy
+                        // Create size constant
+                        auto sliceSizeConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                            builder.getI32IntegerAttr(sliceByteSize));
+                        
+                        // XAie_MemAllocate for new contiguous buffer
+                        auto newMemInst = builder.create<emitc::CallOpaqueOp>(nestedLoc,
+                            memInstPtrType,
+                            "XAie_MemAllocate",
+                            /*args=*/nullptr,
+                            /*templateArgs=*/nullptr,
+                            ValueRange{devInstRef.getResult(), sliceSizeConst.getResult(), cacheableConst.getResult()});
+                        
+                        // Track allocation for later release
+                        allocatedMemList.push_back(newMemInst.getResult(0));
+                        
+                        // XAie_MemGetVAddr
+                        auto newVaddr = builder.create<emitc::CallOpaqueOp>(nestedLoc,
+                            voidPtrType,
+                            "XAie_MemGetVAddr",
+                            /*args=*/nullptr,
+                            /*templateArgs=*/nullptr,
+                            ValueRange{newMemInst.getResult(0)});
+                        
+                        // Build strided copy parameters as string for verbatim
+                        std::stringstream copyParams;
+                        copyParams << "/* Non-contiguous copy: offsets=[";
+                        for (size_t i = 0; i < offsets.size(); ++i) {
+                            if (i > 0) copyParams << ",";
+                            copyParams << offsets[i];
+                        }
+                        copyParams << "], sizes=[";
+                        for (size_t i = 0; i < sizes.size(); ++i) {
+                            if (i > 0) copyParams << ",";
+                            copyParams << sizes[i];
+                        }
+                        copyParams << "] */";
+                        
+                        builder.create<emitc::VerbatimOp>(nestedLoc, builder.getStringAttr(copyParams.str()));
+                        
+                        // Call helper function for strided copy
+                        // __emitc_strided_copy(dst, src, src_shape, offsets, sizes, elem_size, rank)
+                        builder.create<emitc::CallOpaqueOp>(nestedLoc,
+                            TypeRange{},
+                            "__emitc_strided_copy_2d",
+                            /*args=*/nullptr,
+                            /*templateArgs=*/nullptr,
+                            ValueRange{newVaddr.getResult(0), srcDataPtr});
+                        
+                        // Store in memAllocMap
+                        memAllocMap[nestedOp.getResult(0)] = std::make_tuple(newVaddr.getResult(0), sliceByteSize, sliceElements);
+                        
+                        llvm::errs() << "[Pass] Created non-contiguous slice (allocated " << sliceByteSize << " bytes)\n";
+                    }
+                }
+            }
+        }
+        
+        // Generate memory release calls for all tracked allocations
+        if (!allocatedMemList.empty()) {
+            builder.create<emitc::VerbatimOp>(op->getLoc(), 
+                builder.getStringAttr("/* Release allocated memory */"));
+            for (Value memInst : allocatedMemList) {
+                builder.create<emitc::CallOpaqueOp>(op->getLoc(),
+                    TypeRange{},
+                    "XAie_MemFree",
+                    /*args=*/nullptr,
+                    /*templateArgs=*/nullptr,
+                    ValueRange{memInst});
             }
         }
         
