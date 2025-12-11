@@ -281,24 +281,20 @@ void DfscheduleToApiPass::runOnOperation() {
                         /*templateArgs=*/nullptr,
                         ValueRange{memInst.getResult(0)});
                     
-                    // Cast void* to element type pointer
-                    auto elemPtrType = getEmitCPtrType(ctx, elemType);
-                    auto dstPtr = builder.create<emitc::CastOp>(nestedLoc, elemPtrType, vaddr.getResult(0));
+                    // Get source array pointer as void* via emitc.constant with opaque reference
+                    auto srcPtr = builder.create<emitc::ConstantOp>(nestedLoc, voidPtrType,
+                        emitc::OpaqueAttr::get(ctx, "(void*)" + arrayName));
                     
-                    // Get source array pointer via emitc.constant with opaque reference
-                    auto srcPtr = builder.create<emitc::ConstantOp>(nestedLoc, elemPtrType,
-                        emitc::OpaqueAttr::get(ctx, "(" + cTypeStr + "*)" + arrayName));
-                    
-                    // memcpy(dst, src, size)
+                    // memcpy(dst, src, size) - both are void*, no cast needed
                     builder.create<emitc::CallOpaqueOp>(nestedLoc,
                         voidPtrType,
                         "memcpy",
                         /*args=*/nullptr,
                         /*templateArgs=*/nullptr,
-                        ValueRange{dstPtr.getResult(), srcPtr.getResult(), sizeConst.getResult()});
+                        ValueRange{vaddr.getResult(0), srcPtr.getResult(), sizeConst.getResult()});
                     
-                    // Store SSA value for use by partitiontensor
-                    memAllocMap[nestedOp.getResult(0)] = std::make_tuple(dstPtr.getResult(), byteSize, totalElements);
+                    // Store void* SSA value for use by partitiontensor (no cast needed)
+                    memAllocMap[nestedOp.getResult(0)] = std::make_tuple(vaddr.getResult(0), byteSize, totalElements);
                     
                     llvm::errs() << "[Pass] Generated XAie_MemAllocate with SSA for " << arrayName << "\n";
                 }
@@ -349,10 +345,10 @@ void DfscheduleToApiPass::runOnOperation() {
                         }
                     }
                     
-                    // Cast data pointer to void*
+                    // Data pointer is already void*, no cast needed
                     Value dataVoidPtr;
                     if (srcDataPtr) {
-                        dataVoidPtr = builder.create<emitc::CastOp>(nestedLoc, voidPtrType, srcDataPtr).getResult();
+                        dataVoidPtr = srcDataPtr;  // Already void*
                     } else {
                         // Create NULL pointer if no source found
                         dataVoidPtr = builder.create<emitc::ConstantOp>(nestedLoc, voidPtrType,

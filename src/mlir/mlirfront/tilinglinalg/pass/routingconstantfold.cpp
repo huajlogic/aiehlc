@@ -211,6 +211,49 @@ struct RemoveConstantOp : public mlir::OpRewritePattern<mlir::emitc::ConstantOp>
   }
 };
 
+// Fold redundant cast chains: if we cast A->B->A, just use original A
+// Also fold cast chains where only the final result is used
+struct FoldRedundantCastChain : public mlir::OpRewritePattern<mlir::emitc::CastOp> {
+  using OpRewritePattern<mlir::emitc::CastOp>::OpRewritePattern;
+  FoldRedundantCastChain(MLIRContext* ctx):OpRewritePattern(ctx) {}
+  mlir::LogicalResult matchAndRewrite(mlir::emitc::CastOp castOp,
+                                      mlir::PatternRewriter &rewriter) const override {
+    // Check if input is also a cast
+    auto inputCast = castOp.getSource().getDefiningOp<mlir::emitc::CastOp>();
+    if (!inputCast)
+      return failure();
+    
+    // If output type equals original input type, replace with original
+    if (castOp.getType() == inputCast.getSource().getType()) {
+      rewriter.replaceOp(castOp, inputCast.getSource());
+      return success();
+    }
+    
+    // If intermediate cast has only one use (this cast), fold to single cast
+    if (inputCast->hasOneUse()) {
+      rewriter.replaceOpWithNewOp<mlir::emitc::CastOp>(
+          castOp, castOp.getType(), inputCast.getSource());
+      return success();
+    }
+    
+    return failure();
+  }
+};
+
+// Remove dead (unused) cast operations
+struct RemoveDeadCastOp : public mlir::OpRewritePattern<mlir::emitc::CastOp> {
+  using OpRewritePattern<mlir::emitc::CastOp>::OpRewritePattern;
+  RemoveDeadCastOp(MLIRContext* ctx):OpRewritePattern(ctx) {}
+  mlir::LogicalResult matchAndRewrite(mlir::emitc::CastOp castOp,
+                                      mlir::PatternRewriter &rewriter) const override {
+    if (castOp.use_empty()) {
+      rewriter.eraseOp(castOp);
+      return success();
+    }
+    return failure();
+  }
+};
+
 void RoutingConstantFoldPass::runOnOperation() {
     auto& ctx = getContext();
     mlir::RewritePatternSet patterns(&ctx);
@@ -221,6 +264,8 @@ void RoutingConstantFoldPass::runOnOperation() {
     patterns.add<RemoveDeadCallOp>(&ctx);
     patterns.add<RemoveDeadCallopOpaqueOp>(&ctx);
     patterns.add<RemoveConstantOp>(&ctx);
+    patterns.add<FoldRedundantCastChain>(&ctx);
+    patterns.add<RemoveDeadCastOp>(&ctx);
     
     for (auto* dialect : ctx.getLoadedDialects()) {
         dialect->getCanonicalizationPatterns(patterns);
