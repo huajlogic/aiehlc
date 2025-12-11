@@ -11,6 +11,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include <iostream>
@@ -214,7 +215,7 @@ void DfscheduleToApiPass::runOnOperation() {
         // Get DevInst global reference
         auto devInstRef = builder.create<emitc::GetGlobalOp>(loc, devInstType, "DevInst");
         
-        // Create XAIE_MEM_CACHEABLE constant (typically 0 or a specific value)
+        // Create XAIE_MEM_CACHEABLE constant
         auto cacheableConst = builder.create<emitc::ConstantOp>(loc, i32Type,
             emitc::OpaqueAttr::get(ctx, "XAIE_MEM_CACHEABLE"));
         
@@ -288,17 +289,13 @@ void DfscheduleToApiPass::runOnOperation() {
                     auto srcPtr = builder.create<emitc::ConstantOp>(nestedLoc, elemPtrType,
                         emitc::OpaqueAttr::get(ctx, "(" + cTypeStr + "*)" + arrayName));
                     
-                    // Create num elements constant for memcpy
-                    auto numElemsConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        builder.getI32IntegerAttr(byteSize));
-                    
                     // memcpy(dst, src, size)
                     builder.create<emitc::CallOpaqueOp>(nestedLoc,
                         voidPtrType,
                         "memcpy",
                         /*args=*/nullptr,
                         /*templateArgs=*/nullptr,
-                        ValueRange{dstPtr.getResult(), srcPtr.getResult(), numElemsConst.getResult()});
+                        ValueRange{dstPtr.getResult(), srcPtr.getResult(), sizeConst.getResult()});
                     
                     // Store SSA value for use by partitiontensor
                     memAllocMap[nestedOp.getResult(0)] = std::make_tuple(dstPtr.getResult(), byteSize, totalElements);
@@ -497,6 +494,30 @@ void DfscheduleToApiPass::runOnOperation() {
     for (Operation *op : topLevelOpsToErase) {
         llvm::errs() << "[Pass] Erasing: " << op->getName() << "\n";
         op->erase();
+    }
+    
+    //==========================================================================
+    // Phase 3: Apply canonicalization to optimize EmitC (CSE, dead code, etc.)
+    //==========================================================================
+    
+    llvm::errs() << "[Pass] Phase 3: Applying canonicalization patterns\n";
+    
+    // Collect canonicalization patterns from all loaded dialects
+    mlir::RewritePatternSet patterns(ctx);
+    for (auto *dialect : ctx->getLoadedDialects()) {
+        dialect->getCanonicalizationPatterns(patterns);
+    }
+    
+    // Collect canonicalization patterns from all registered operations
+    for (mlir::RegisteredOperationName op : ctx->getRegisteredOperations()) {
+        op.getCanonicalizationPatterns(patterns, ctx);
+    }
+    
+    // Apply the patterns greedily - this will simplify and clean up the IR
+    // including CSE for duplicate constants
+    if (mlir::failed(mlir::applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)))) {
+        llvm::errs() << "[Pass] Warning: Canonicalization failed\n";
+        // Don't signal failure - canonicalization is optional optimization
     }
     
     llvm::errs() << "=== DfscheduleToApiPass SUCCESS ===\n";
