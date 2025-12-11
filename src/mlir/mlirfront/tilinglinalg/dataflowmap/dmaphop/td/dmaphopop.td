@@ -202,7 +202,11 @@ include "mlir/IR/BuiltinTypes.td"  // Add this line for MemRefType
 include "dmaphoptype.td"
 include "dmaphopattr.td"
 
-def dmaphop_FuncOp : dmaphopop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
+def dmaphop_FuncOp : dmaphopop<"func",[ IsolatedFromAbove,  
+    SymbolTable,
+    Symbol,
+    SingleBlock,
+    NoTerminator]>
 {
     let summary = "Defines a function in the Starplat Dialect";
     let description = [{This operation represents a function definiton in the Starplat dialect.
@@ -216,6 +220,7 @@ def dmaphop_FuncOp : dmaphopop<"func",[IsolatedFromAbove, SymbolTable, Symbol]>
                   );
 
   let regions = (region AnyRegion:$body);
+  let hasCustomAssemblyFormat = 1;
 }
 
 // --- 1. Tile Definition Operation ---
@@ -233,7 +238,7 @@ def dmaphop_tile : dmaphopop<"tile"> {
 
  
 // --- 2. Port Definition Operation ---
-
+// let hasCustomAssemblyFormat = 1; will fix the port itself generic print issue when have symbol
 def dmaphop_port : dmaphopop<"port",[Symbol]> {
   let summary = "Defines a logical port on a tile";
   let arguments = (ins
@@ -243,7 +248,7 @@ def dmaphop_port : dmaphopop<"port",[Symbol]> {
     OptionalAttr<I64Attr>:$direction_channel
   );
   let results = (outs dmaphopporttype:$port);
-  let assemblyFormat = "`on` $tile `{` `direction` `=` $direction (`,` `channel` `=` $direction_channel^)? `}` `:` type($tile) attr-dict `->` type($port)";
+  let hasCustomAssemblyFormat = 1;
 }
  
 // --- 3. Hop Creation Operation ---
@@ -298,9 +303,9 @@ def dmaphop_alloc_buffer : dmaphopop<"alloc_buffer"> {
   let summary = "Allocates a buffer on a specific tile";
   let arguments = (ins
     dmaphoptiletype:$tile,
-    AnyMemRef:$memref_type
+    AnyTensor:$memref_type
   );
-  let results = (outs AnyMemRef:$buffer);
+  let results = (outs AnyTensor:$buffer);
   let assemblyFormat = "`on` $tile $memref_type `:` type($tile) type($memref_type) attr-dict `->` type($buffer)";
 }
 
@@ -309,25 +314,25 @@ def dmaphop_alloc_buffer : dmaphopop<"alloc_buffer"> {
 def dmaphop_push : dmaphopop<"push"> {
   let summary = "Pushes data through a path to multiple destinations";
   let arguments = (ins
-    AnyMemRef:$data,
+    AnyTensor:$data,
     dmaphoppathtype:$path,
-    Variadic<AnyMemRef>:$output_buffers,
-    Variadic<dmaphopporttype>:$output_ports
+    Variadic<AnyTensor>:$consumer_buffers,
+    Variadic<dmaphopporttype>:$consumer_ports
   );
   let traits = [SameVariadicOperandSize];
-  let assemblyFormat = "$data `onto` $path `outputs` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
+  let assemblyFormat = "$data `into` $path `consumer` `(` $consumer_buffers `at` $consumer_ports `)` `:` type($data) type($path) type($consumer_buffers) type($consumer_ports) attr-dict";
 }
  
- def dmaphop_pull : dmaphopop<"pull"> {
-  let summary = "pull data through a path to multiple destinations";
+def dmaphop_pull : dmaphopop<"pull"> {
+  let summary = "Pulls data through a path from multiple sources";
   let arguments = (ins
-    AnyMemRef:$data,
+    AnyTensor:$data,
     dmaphoppathtype:$path,
-    Variadic<AnyMemRef>:$output_buffers,
-    Variadic<dmaphopporttype>:$output_ports
+    Variadic<AnyTensor>:$producer_buffers,
+    Variadic<dmaphopporttype>:$producer_ports
   );
   let traits = [SameVariadicOperandSize];
-  let assemblyFormat = "$data `from` $path `input` `(` $output_buffers `at` $output_ports `)` `:` type($data) type($path) type($output_buffers) type($output_ports) attr-dict";
+  let assemblyFormat = "$data `from` $path `producer` `(` $producer_buffers `at` $producer_ports `)` `:` type($data) type($path) type($producer_buffers) type($producer_ports) attr-dict";
 }
 
 // --- 7. Sync Operation ---
@@ -341,7 +346,7 @@ def dmaphop_sync : dmaphopop<"sync"> {
  
 def dmaphop_dealloc_buffer : dmaphopop<"dealloc_buffer"> {
   let summary = "Deallocates a buffer";
-  let arguments = (ins AnyMemRef:$buffer);
+  let arguments = (ins AnyTensor:$buffer);
   let assemblyFormat = "$buffer `:` type($buffer) attr-dict";
 }
  

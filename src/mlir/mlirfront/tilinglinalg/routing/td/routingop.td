@@ -69,12 +69,12 @@ def routing_movedatabyio : routingop<"routingmovedatabyio"> {
 	let description = "move data through io to aie or from";
 
 	let arguments = (ins
-		I32:$gatherout_tensorin,
+		AnyType:$gatherout_tensorin,
 		I32:$hwiowithtarget);
 
 	let results = (outs
 		I32:$output);
-	let assemblyFormat = " `gatherout_tensorin` `=` $gatherout_tensorin `,` `hwiowithtarget` `=` $hwiowithtarget `:` type($gatherout_tensorin) `,` type($hwiowithtarget)  attr-dict`->` type($output)";
+	let assemblyFormat = " `tensordata` `=` $gatherout_tensorin `,` `hwiowithtarget` `=` $hwiowithtarget `:` type($gatherout_tensorin) `,` type($hwiowithtarget)  attr-dict`->` type($output)";
 }
 
 def routing_routinggatherout : routingop<"routingroutinggatherout"> {
@@ -84,10 +84,10 @@ def routing_routinggatherout : routingop<"routingroutinggatherout"> {
 
 	let arguments = (ins
 		I32:$tilelist,
-		I32:$tensordata);
+		AnyTensor:$tensordata);
 
 	let results = (outs
-		I32:$output);
+		AnyTensor:$output);
 	let assemblyFormat = " `tilelist` `=` $tilelist `,` `tensordata` `=` $tensordata `:` type($tilelist) `,` type($tensordata)  attr-dict`->` type($output)";
 }
 
@@ -104,24 +104,25 @@ def routing_createhwmesh :routingop<"routingcreatehwmesh"> {
 	let results = (outs
 		I32:$output);
 
-	let assemblyFormat = " attr-dict `->` type($output)";	
+	let assemblyFormat = " `row` `=` $row `,` `col` `=` $col attr-dict `->` type($output)";	
 
 }
 
-def routing_createdummytensor :routingop<"routingcreatedummytensor"> {
-	let summary = "createdummytensor";
+def routing_createscheduletensor :routingop<"routingcreatescheduletensor"> {
+	let summary = "createscheduletensor";
 	let cppNamespace = "routing";
-	let description = "create an dummpy tensor";
+	let description = "create a schedule tensor with initial data";
 
 	let arguments = (ins
+		AnyTensor:$init_tensor,
 		I64ArrayAttr:$shape,
 		I64Attr:$dim
 		);
 
 	let results = (outs
-		I32:$output);
+		AnyTensor:$output);
 
-	let assemblyFormat = "attr-dict `->` type($output)";	
+	let assemblyFormat = " $init_tensor `:` type($init_tensor) `shape` `=` $shape `,` `dim` `=` $dim attr-dict `->` type($output)";	
 
 }
 
@@ -139,7 +140,7 @@ def routing_partitionmesh :routingop<"partitionmesh"> {
 	let results = (outs
 		I32:$output);
 
-	let assemblyFormat = [{`mesh` `=` $mesh `:` type($mesh) attr-dict `->` type($output)}];	
+	let assemblyFormat = " `mesh` `=` $mesh `,` `splitnum` `=` $splitnum `,` `splitaxis` `=` $splitaxis `:` type($mesh) attr-dict `->` type($output)";	
 
 }
 
@@ -149,7 +150,7 @@ def routing_partitiontensor :routingop<"partitiontensor"> {
 	let description = "partitiontensor";
 
 	let arguments = (ins
-		I32:$tensor,
+		AnyTensor:$tensor,
 		I32Attr:$splitnum,
 		I32Attr:$splitdim,
 		StrAttr:$hw_axis_owner,
@@ -158,11 +159,9 @@ def routing_partitiontensor :routingop<"partitiontensor"> {
 	);
 
 	let results = (outs
-		I32:$output);
+		AnyTensor:$output);
 	
-	let assemblyFormat = [{
-		`tensor` `=` $tensor `:` type($tensor) attr-dict `->` type($output)
-	}];	
+	let hasCustomAssemblyFormat = 1;
 
 }
 
@@ -172,12 +171,12 @@ def routing_extract_data :routingop<"routingextract_data"> {
 	let description = "extract_data";
 
 	let arguments = (ins
-		I32:$tensor,
+		AnyTensor:$tensor,
 		I32:$idx
 	);
 
 	let results = (outs
-		I32:$output);
+		AnyTensor:$output);
 
 	let assemblyFormat = "$tensor `,`  $idx `:` type($tensor) `,` type($idx) attr-dict `->` type($output)";	
 

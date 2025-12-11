@@ -6,7 +6,9 @@
 #include "dmaptodmaphop.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include <sstream>
 #include <iostream>
@@ -52,6 +54,19 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
                                          RoutingTopology &router, DataflowDirection direction) {
     auto loc = op->getLoc();
     
+    // Get operand 0 and extract the data tensor
+    Value dataValue = op->getOperand(0);
+    Value dataId;
+    
+    // Try to dyn_cast to routing::extract_data
+    if (auto extractOp = dataValue.getDefiningOp<routing::extract_data>()) {
+        // If it's already an extract_data operation, use its result directly
+        dataId = extractOp.getResult();
+    } else {
+        // Otherwise, use the value directly (it should be a tensor)
+        dataId = dataValue;
+    }
+    
     // Get topology info - core tile start row
     int core_start_row = (int) router.getRM()->getrsc()->absTileRow(TileType::Core, 0);
     
@@ -59,6 +74,7 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     // dmap.pull %data from %stream -> stream is operand 1
     Value streamValue = op->getOperand(1);
     Operation *streamOp = streamValue.getDefiningOp();
+    
 
     dmap::define_io_engine shimEngine, memEngine;
     dmap::define_core_group sourceCoreGroup, destCoreGroup;
@@ -314,27 +330,118 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         ? rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}))
         : rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}));
 
-    auto memrefType = MemRefType::get(ArrayRef<int64_t>{1024}, rewriter.getF32Type());
-    Value ddrBuffer = rewriter.create<memref::AllocOp>(loc, memrefType);
-    Value coreBufferTemplate = rewriter.create<memref::AllocOp>(loc, memrefType);
+    // Replaced dmaphop.alloc_buffer with tensor.extract_slice on the data tensor
     SmallVector<Value, 4> coreBuffers;
-    for (auto coreTile : coreTiles) {
-        coreBuffers.push_back(rewriter.create<dmaphop::alloc_buffer>(loc, memrefType, coreTile.getResult(), coreBufferTemplate).getResult());
+    
+    // Get shape info from dataId
+    auto rankedType = dyn_cast<RankedTensorType>(dataId.getType());
+    if (!rankedType) {
+        return op->emitError("Data operand must be a ranked tensor");
+    }
+    int64_t rank = rankedType.getRank();
+    auto shape = rankedType.getShape();
+    
+    // Determine split dimension based on core group axis
+    // If axis is "row", tiles are arranged horizontally (varying columns), so we split the column dimension (1)
+    // If axis is "col", tiles are arranged vertically (varying rows), so we split the row dimension (0)
+    int splitDim = (coreGroup.getGroupAxis() == "row") ? 0 : 1;//axis is col 
+    
+    // Check if we can split along the dimension that matches core count
+    // or just split the first dimension
+    int numTiles = coreTiles.size();
+    
+    //SmallVector<OpFoldResult> offsets(rank);
+    SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+    SmallVector<OpFoldResult> sizes;//(rank);
+    
+    // Calculate slice size based on split dim
+    int64_t dimSize = shape[splitDim];
+    if (dimSize != ShapedType::kDynamic && numTiles > 0) {
+        // If static shape, verify divisibility or just div
+        // Assuming divisibility for now as per usual tiling logic
+    }
+    //SmallVector<OpFoldResult> sizes;
+    for (int64_t i = 0; i < rank; ++i) {
+         if (rankedType.isDynamicDim(i)) {
+             sizes.push_back(rewriter.create<tensor::DimOp>(loc, dataId, i).getResult());
+         } else {
+             sizes.push_back(rewriter.getIndexAttr(rankedType.getDimSize(i)));
+        }
+    }
+    // Calculate slice size and offsets for each tile
+    if (direction == DataflowDirection::Pull) {
+        for (size_t i = 0; i < coreTiles.size(); ++i) {
+            for (int64_t d = 0; d < rank; ++d) {
+                if (d == splitDim) {
+                    // Sliced dimension - Static calculation
+                    int64_t dimSize = shape[d];
+                    // Assuming static shape for now as requested
+                    int64_t sliceSize = dimSize / numTiles;
+                    int64_t offset = i * sliceSize;
+
+                    offsets[d] = rewriter.getIndexAttr(offset);
+                    sizes[d] = rewriter.getIndexAttr(sliceSize);
+                } else {
+                    // Non-sliced dimension: full size, offset 0
+                    offsets[d] = rewriter.getIndexAttr(0);
+                    sizes[d] = rewriter.getIndexAttr(shape[d]);
+                }
+            }
+            
+            // Calculate result type for this slice
+            SmallVector<int64_t> sliceShape;
+            for (int64_t d = 0; d < rank; ++d) {
+                if (d == splitDim) {
+                    if (shape[d] == ShapedType::kDynamic)
+                        sliceShape.push_back(ShapedType::kDynamic);
+                    else
+                        sliceShape.push_back(shape[d] / numTiles);
+                } else {
+                    sliceShape.push_back(shape[d]);
+                }
+            }
+            auto sliceType = RankedTensorType::get(sliceShape, rankedType.getElementType());
+            
+            auto slice = rewriter.create<tensor::ExtractSliceOp>(
+                loc, 
+                sliceType,
+                dataId, 
+                offsets, 
+                sizes, 
+                strides
+            );
+            
+            std::string tagName = (direction == DataflowDirection::Push) ? "consumer" : "producer";
+            tagName += std::to_string(i);
+            slice->setAttr("tag", rewriter.getStringAttr(tagName));
+            
+            coreBuffers.push_back(slice.getResult());
+        }
+    } else {
+        // Push direction: use routing::extract_data for each tile
+        // This will later be converted to tensor.extract_slice with "partitionslice" tag
+        for (size_t i = 0; i < coreTiles.size(); ++i) {
+            coreBuffers.push_back(dataId);
+        }
     }
 
     if (direction == DataflowDirection::Push) {
-        rewriter.create<dmaphop::push>(loc, ddrBuffer, path, coreBuffers, corePortsInValues);
+        rewriter.create<dmaphop::push>(loc, dataId, path, coreBuffers, corePortsInValues);
     } else {
-        rewriter.create<dmaphop::pull>(loc, ddrBuffer, path, coreBuffers, corePortsInValues);
+        rewriter.create<dmaphop::pull>(loc, dataId, path, coreBuffers, corePortsInValues);
     }
     rewriter.create<dmaphop::sync>(loc, path);
 
     // --- 8. Deallocate buffers and erase original op ---
+    // dmaphop::dealloc_buffer is not needed for tensors
+    /*
     for (auto buffer : coreBuffers) {
         rewriter.create<dmaphop::dealloc_buffer>(loc, buffer);
     }
-    rewriter.create<memref::DeallocOp>(loc, ddrBuffer);
-    rewriter.create<memref::DeallocOp>(loc, coreBufferTemplate);
+    */
+    // memref::DeallocOp is not used for tensors
+    // rewriter.create<memref::DeallocOp>(loc, coreBufferTemplate);
     rewriter.eraseOp(op);
     return success();
 }
@@ -386,7 +493,7 @@ void DmapToDmaphopPass::runOnOperation() {
     // The conversion is successful when the dmap dialect is gone.
     target.addIllegalDialect<dmap::dmapdialect>();
     // These dialects are legal to have in the output.
-    target.addLegalDialect<dmaphop::dmaphopdialect, func::FuncDialect, memref::MemRefDialect>();
+    target.addLegalDialect<dmaphop::dmaphopdialect, func::FuncDialect, memref::MemRefDialect, tensor::TensorDialect, arith::ArithDialect>();
 
     // Add the primary lowering patterns.
     //patterns.add<DmapFuncOpLowering, PushOpLowering>(&ctx);

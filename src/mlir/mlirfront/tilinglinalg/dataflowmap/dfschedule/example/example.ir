@@ -1,81 +1,142 @@
+//===----------------------------------------------------------------------===//
+//
+// Copyright (C) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: MIT
+//
+//===----------------------------------------------------------------------===//
+//
+// Example IR demonstrating the dfschedule dialect usage pattern.
+// This file shows the host-side configuration and kernel-side scheduling
+// for a typical AIE dataflow application with ping-pong buffering.
+//
+//===----------------------------------------------------------------------===//
+
 module {
-  func.func @dskernel_coretile_compute(%arg0: i32) {
-    %alloca = memref.alloca() {buffer_type = "ping"} : memref<256xf32>
-    %alloca_0 = memref.alloca() {buffer_type = "pong"} : memref<256xf32>
+   dfschedule.host_0 {
+      %tensor = tensor.empty() : tensor<1024x1024xf32>
+      %gmem = "dfschedule.declaretensor"(%tensor) : () -> memref<1024xf32>
+      %shim0 = dfschedule.declaretile {col = 3, row = 0} : dfschedule.tile
+      %bd_config = "dfhost.config.dma_bd"(%gmem) {
+        bd_id = 0 : i32,
+        offset = 0 : i32,
+        len = 1024 : i32,
+        enable_packet = true,
+        packet_id = 10 : i32,
+        next_bd = -1 : i32
+      } : (!dfhost.tile, memref<1024xf32>) -> !dfhost.bd_handle
+
+      %io_0 = "dfhost.config.create_io"(%bd_config0, %shim0) {
+        channel = 0 : i32,
+        direction = "MM2S",
+        operation = "SEND"
+      } : ( !dfhost.bdconfig_handle) -> !dfhost.io_handle
+
+      // Launch kernel
+      %core0 = dfschedule.declaretile {col = 0, row = 3} : dfschedule.tile
+      %core1 = dfschedule.declaretile {col = 1, row = 3} : dfschedule.tile
+      //%slice_0 = tensor.extract_slice %gmem[0, 4] [256, 1024] [1, 1] {tag = "partitionslice1"} : tensor<16x16xf32> to tensor<16x4xf32>
+      %kernel_packet_0 = dfschedule.packet @packet0 (%gmem) {dma_channel=0}
+      %kernel_packet_1 = dfschedule.packet @packet1 (%gmem) {dma_channel=0}
+      %kernel_group = "dfschedule.config.load_kernel_group"(%core_0, %core_1) {
+        callee = [@dskernel_receiver],
+        distributed_compute_kernel_args = [@comput0, @compute0],
+        distributed_args = [@packet0, @packet1],   
+      } : (!ds.tile, !ds.tile, tensor<4xi32>, i32) -> !dfschedule.kernelgroup
+      %evt_kernel_group = "dfschedule.schedule.launch_kernel_group"(%kernel_group) {
+      } : (dfschedule.kernelgroup) -> !ds.event
+      
+      // ============================================================
+      // Step 3: Schedule - Runtime execution phase
+      // ============================================================
+      %bd_id = dfhost.schedule.getbdid(): arith.constant(i32)
+      %evnt_io = "dfhost.schedule.start_io"(%io_0, %bd_id) : (!dfhost.io_handle) -> ()
+      dfhost.schedule.wait(%evt_io, %evt_kernel_group)
     
-    // --- Lock Definitions (from your code) ---
-    // %0 = ping_aquire (DMA releases this)
-    // %1 = pong_aquire (DMA releases this)
-    // %2 = ping_release (DMA waits for this)
-    // %3 = pong_release (DMA waits for this)
+  }
+  
+  dfschedule.dskernel.compute @compute0 ( %buf:memref<16x256xf32, "LOCAL">,%loop_count:arith.constant) -> compute {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %rows = arith.constant 16 : index
+      %cols = arith.constant 256 : index
+
+      scf.for %r = %c0 to %rows step %c1 {
+        scf.for %c = %c0 to %cols step %c1 {
+          %v = memref.load %buf[%r, %c] : memref<16x256xf32, "LOCAL">
+          %sq = arith.mulf %v, %v : f32
+          memref.store %sq, %buf[%r, %c] : memref<16x256xf32, "LOCAL">
+          scf.yield
+        }
+        scf.yield
+      }
+      return
+  }
+
+  // ============================================================
+  // Kernel Function: Receiver with Ping-Pong Buffering
+  // ============================================================
+  dfschedule.dskernel_receiver(%arg0: packet, %computelogic:compute , %loop_count:arith:constant) {
+    %input_tensor = dfschedule.gettensor(%arg0)
+    %channel = dfschedule.getdmachannel(%arg0)
+    
+    // Allocate ping-pong buffers in shared local memory
+    %ping = dfschedule.kernel.memalloc(%input_tensor) 
+        : (tensor<16x256xf32>) -> memref<16x256xf32, "LOCAL">
+  
+    %pong = dfschedule.kernel.memalloc(%input_tensor) 
+        : (tensor<16x256xf32>) -> memref<16x256xf32, "LOCAL">
+
+    // Initialize locks for ping-pong synchronization
+    // Acquire locks: signal when buffer is filled by DMA (0 = empty)
+    // Release locks: signal when buffer is processed by compute (1 = ready for DMA)
     %0 = dskernel.lock_init(0, "ping_aquire_lock") -> !dskernel.lock
     %1 = dskernel.lock_init(0, "pong_aquire_lock") -> !dskernel.lock
     %2 = dskernel.lock_init(1, "ping_release_lock") -> !dskernel.lock
     %3 = dskernel.lock_init(0, "pong_release_lock") -> !dskernel.lock
     
-    // --- Thread A (DMA): Runs in Parallel ---
-    // (Your code was correct, but the initial lock values must 
-    //  match the parallel compute loop's needs. 
-    //  DMA waits for Ping-Release(1) and releases Ping-Acquire(0))
-    dskernel.launch_dma_s2m_loop %alloca, %alloca_0, %arg0, %0, %1, %2, %3 : !{
-    }
-    
-    // --- Thread B (Compute): Runs in Parallel ---
-    %c0 = arith.constant 0 : index
-    %c4 = arith.constant 4 : index
+    // ============================================================
+    // DMA Thread: Runs in parallel with compute
+    // ============================================================
+    // The DMA waits for Release locks (buffer is free) and sets Acquire locks (buffer is full)
+    "dskernel.launch_dma_s2m_loop"(%ping, %pong) {
+      locks_ping = { acq=%l_ping_write, rel=%l_ping_read },
+      locks_pong = { acq=%l_pong_write, rel=%l_pong_read },
+      channelid = %channel
+    } : (memref<16x256xf32, "SHARED">, memref<16x256xf32, "SHARED">) -> ()
+
+    // ============================================================
+    // Compute Loop: Ping-Pong computation pattern
+    // ============================================================
     %c1 = arith.constant 1 : index
-    %c2 = arith.constant 2 : index // <-- **NEW: Need '2' for modulo**
-
-    scf.for %arg1 = %c0 to %c4 step %c1 {
-      // --- **START: Ping-Pong Switch Logic** ---
+    %c2 = arith.constant 2 : index
+    
+    scf.for %i = %c0 to %loop_count step %c1 {
       
-      // 1. Is the iteration %arg1 even or odd?
-      %is_even = arith.cmpi "eq", arith.remui(%arg1, %c2), %c0
-
-      // 2. Select the *correct buffer* based on iteration
-      %buffer = scf.if %is_even -> (memref<256xf32>) {
-        scf.yield %alloca // Even: Use Ping
-      } else {
-        scf.yield %alloca_0 // Odd: Use Pong
-      }
-
-      // 3. Select the *correct acquire lock* (the one DMA releases)
-      %acquire_lock = scf.if %is_even -> (!dskernel.lock) {
-        scf.yield %0 // Even: Wait for Ping-Acquire
-      } else {
-        scf.yield %1 // Odd: Wait for Pong-Acquire
-      }
-
-      // 4. Select the *correct release lock* (the one DMA waits for)
-      %release_lock = scf.if %is_even -> (!dskernel.lock) {
-        scf.yield %2 // Even: Release Ping-Release
-      } else {
-        scf.yield %3 // Odd: Release Pong-Release
-      }
+      // --- A. Ping/Pong selection logic ---
+      // Even iterations use Ping, odd iterations use Pong
+      %is_ping = arith.cmpi "eq", arith.remui(%i, %c2), %c0 : index
       
-      // --- **END: Ping-Pong Switch Logic** ---
-
-      // 5. Get the value to acquire/release (e.g., 1, 2, 3, 4)
-      //    (Your logic was correct)
-      %c1_i32 = arith.constant 1 : i32
-      %idx_i32 = arith.index_cast %arg1 : index to i32
-      %lock_val = arith.addi %idx_i32, %c1_i32 : i32
-
-      // 6. Wait for the *selected* buffer to be full
-      dskernel.acquire_lock %acquire_lock, %lock_val
-
-      // 7. Compute using the *selected* buffer (Smem reuse)
-      %c0_inner = arith.constant 0 : index
-      %c10 = arith.constant 10 : index
-      %c1_inner = arith.constant 1 : index
-      scf.for %arg2 = %c0_inner to %c10 step %c1_inner {
-         // --- This is where your computation goes ---
-         "core.compute"(%buffer) : (memref<256xf32>) -> ()
+      // Use scf.if to select the current buffer and locks
+      %curr_buf, %curr_read_lock, %curr_write_lock = scf.if %is_ping 
+        -> (memref<16x256xf32, "SHARED">, !dskernel.lock, !dskernel.lock) {
+        scf.yield %ping, %l_ping_read, %l_ping_write
+      } else {
+        scf.yield %pong, %l_pong_read, %l_pong_write
       }
 
-      // 8. Release the *selected* buffer (for DMA to refill)
-      dskernel.release_lock %release_lock, %lock_val
+      // --- B. Acquire (wait for data) ---
+      // Wait for DMA to fill the buffer (Read Lock -> 1)
+      "dskernel.acquire_lock"(%curr_read_lock, 1)
+
+      // --- C. Compute (core computation) ---
+      // At this point, the tensor abstraction is gone; we operate on physical memref
+      "core.compute"(%curr_buf,computelogic = %computelogic) : (memref<16x256xf32, "SHARED">) -> ()
+
+      // --- D. Release (free buffer) ---
+      // Return buffer to DMA (Write Lock -> 1)
+      "dskernel.release_lock"(%curr_write_lock, 1)
     }
+  
     return
   }
 }

@@ -1,14 +1,17 @@
-/******************************************************************************
-* Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
-* SPDX-License-Identifier: MIT
-******************************************************************************/
+Executing routingtodfschedule...
 module {
   func.func @main() {
-    %0 = routing.routingcreatehwmesh {col = 4 : i64, row = 4 : i64} -> i32
-    %1 = routing.routingcreatedummytensor {dim = 2 : i64, shape = [10, 20]} -> i32
+    %0 = routing.routingcreatehwmesh row = 4, col = 4 -> i32
+    %1 = routing.routingcreatescheduletensor shape = [16, 16], dim = 2 -> tensor<16x16xf32>
     scf.execute_region {
-      %2 = routing.partitionmesh mesh = %0 : i32 {splitaxis = "row", splitnum = 4 : i32} -> i32
-      %3 = routing.partitiontensor tensor = %1 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %c0 = arith.constant 0 : index
       %c4 = arith.constant 4 : index
       %c1 = arith.constant 1 : index
@@ -16,18 +19,24 @@ module {
         %4 = arith.index_cast %arg0 : index to i32
         %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %4 : i32) -> i32{
         ^bb0(%arg1: i32):
-          %6 = routing.routingextract_data %3, %arg1 : i32, i32 -> i32
+          %6 = routing.routingextract_data %3, %arg1 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
           %7 = routing.routingextract_tiles %2, %arg1 : i32, i32 -> i32
-          %8 = routing.routingroutinggatherout tilelist = %7, tensordata = %6 : i32, i32 -> i32
+          %8 = routing.routingroutinggatherout tilelist = %7, tensordata = %6 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
           %9 = routing.routingcreatehwiowithtarget targettilelist = %7 : i32 {direction = "output", iotype = "mem2"} -> i32
-          %10 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %9 : i32, i32 -> i32
+          %10 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %9 : tensor<4x16xf32>, i32 -> i32
         }
       }
       scf.yield
     } {routing_memo = "row"}
     scf.execute_region {
-      %2 = routing.partitionmesh mesh = %0 : i32 {splitaxis = "row", splitnum = 4 : i32} -> i32
-      %3 = routing.partitiontensor tensor = %1 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %c0 = arith.constant 0 : index
       %c4 = arith.constant 4 : index
       %c1 = arith.constant 1 : index
@@ -35,23 +44,54 @@ module {
         %4 = arith.index_cast %arg0 : index to i32
         %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %4 : i32) -> i32{
         ^bb0(%arg1: i32):
-          %6 = routing.routingextract_data %3, %arg1 : i32, i32 -> i32
+          %6 = routing.routingextract_data %3, %arg1 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
           %7 = routing.routingextract_tiles %2, %arg1 : i32, i32 -> i32
           %8 = routing.routingcreatehwiowithtarget targettilelist = %7 : i32 {direction = "input", iotype = "mem2"} -> i32
-          %9 = routing.routingmovedatabyio gatherout_tensorin = %6, hwiowithtarget = %8 : i32, i32 -> i32
+          %9 = routing.routingmovedatabyio gatherout_tensorin = %6, hwiowithtarget = %8 : tensor<4x16xf32>, i32 -> i32
         }
       }
       scf.yield
     } {routing_memo = "row"}
+    scf.execute_region {
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "col" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "col",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %c0 = arith.constant 0 : index
+      %c4 = arith.constant 4 : index
+      %c1 = arith.constant 1 : index
+      scf.for %arg0 = %c0 to %c4 step %c1 {
+        %4 = arith.index_cast %arg0 : index to i32
+        %5 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %4 : i32) -> i32{
+        ^bb0(%arg1: i32):
+          %6 = routing.routingextract_data %3, %arg1 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+          %7 = routing.routingextract_tiles %2, %arg1 : i32, i32 -> i32
+          %8 = routing.routingcreatehwiowithtarget targettilelist = %7 : i32 {direction = "input", iotype = "mem2"} -> i32
+          %9 = routing.routingmovedatabyio gatherout_tensorin = %6, hwiowithtarget = %8 : tensor<16x4xf32>, i32 -> i32
+        }
+      }
+      scf.yield
+    } {routing_memo = "col"}
     return
   }
-}module {
+}=== Initial Routing Module ===
+module {
   func.func @main() {
-    %0 = routing.routingcreatehwmesh {col = 4 : i64, row = 4 : i64} -> i32
-    %1 = routing.routingcreatedummytensor {dim = 2 : i64, shape = [10, 20]} -> i32
+    %0 = routing.routingcreatehwmesh row = 4, col = 4 -> i32
+    %1 = routing.routingcreatescheduletensor shape = [16, 16], dim = 2 -> tensor<16x16xf32>
     scf.execute_region {
-      %2 = routing.partitionmesh mesh = %0 : i32 {splitaxis = "row", splitnum = 4 : i32} -> i32
-      %3 = routing.partitiontensor tensor = %1 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %c0 = arith.constant 0 : index
       %c4 = arith.constant 4 : index
       %c1 = arith.constant 1 : index
@@ -59,18 +99,24 @@ module {
         %4 = arith.index_cast %arg0 : index to i32
         %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %4 : i32) -> i32{
         ^bb0(%arg1: i32):
-          %6 = routing.routingextract_data %3, %arg1 : i32, i32 -> i32
+          %6 = routing.routingextract_data %3, %arg1 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
           %7 = routing.routingextract_tiles %2, %arg1 : i32, i32 -> i32
-          %8 = routing.routingroutinggatherout tilelist = %7, tensordata = %6 : i32, i32 -> i32
+          %8 = routing.routingroutinggatherout tilelist = %7, tensordata = %6 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
           %9 = routing.routingcreatehwiowithtarget targettilelist = %7 : i32 {direction = "output", iotype = "mem2"} -> i32
-          %10 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %9 : i32, i32 -> i32
+          %10 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %9 : tensor<4x16xf32>, i32 -> i32
         }
       }
       scf.yield
     } {routing_memo = "row"}
     scf.execute_region {
-      %2 = routing.partitionmesh mesh = %0 : i32 {splitaxis = "row", splitnum = 4 : i32} -> i32
-      %3 = routing.partitiontensor tensor = %1 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %c0 = arith.constant 0 : index
       %c4 = arith.constant 4 : index
       %c1 = arith.constant 1 : index
@@ -78,18 +124,174 @@ module {
         %4 = arith.index_cast %arg0 : index to i32
         %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %4 : i32) -> i32{
         ^bb0(%arg1: i32):
-          %6 = routing.routingextract_data %3, %arg1 : i32, i32 -> i32
+          %6 = routing.routingextract_data %3, %arg1 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
           %7 = routing.routingextract_tiles %2, %arg1 : i32, i32 -> i32
           %8 = routing.routingcreatehwiowithtarget targettilelist = %7 : i32 {direction = "input", iotype = "mem2"} -> i32
-          %9 = routing.routingmovedatabyio gatherout_tensorin = %6, hwiowithtarget = %8 : i32, i32 -> i32
+          %9 = routing.routingmovedatabyio gatherout_tensorin = %6, hwiowithtarget = %8 : tensor<4x16xf32>, i32 -> i32
         }
       }
       scf.yield
     } {routing_memo = "row"}
+    scf.execute_region {
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "col" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "col",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %c0 = arith.constant 0 : index
+      %c4 = arith.constant 4 : index
+      %c1 = arith.constant 1 : index
+      scf.for %arg0 = %c0 to %c4 step %c1 {
+        %4 = arith.index_cast %arg0 : index to i32
+        %5 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %4 : i32) -> i32{
+        ^bb0(%arg1: i32):
+          %6 = routing.routingextract_data %3, %arg1 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+          %7 = routing.routingextract_tiles %2, %arg1 : i32, i32 -> i32
+          %8 = routing.routingcreatehwiowithtarget targettilelist = %7 : i32 {direction = "input", iotype = "mem2"} -> i32
+          %9 = routing.routingmovedatabyio gatherout_tensorin = %6, hwiowithtarget = %8 : tensor<16x4xf32>, i32 -> i32
+        }
+      }
+      scf.yield
+    } {routing_memo = "col"}
     return
   }
 }
-main
+// -----// IR Dump After RoutingUnrollingLowerPass: //----- //
+module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
+  func.func @main() {
+    %c3_i32 = arith.constant 3 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %0 = routing.routingcreatehwmesh row = 4, col = 4 -> i32
+    %1 = routing.routingcreatescheduletensor shape = [16, 16], dim = 2 -> tensor<16x16xf32>
+    scf.execute_region {
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
+        %11 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "output", iotype = "mem2"} -> i32
+        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : tensor<4x16xf32>, i32 -> i32
+      }
+      %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
+        %11 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "output", iotype = "mem2"} -> i32
+        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : tensor<4x16xf32>, i32 -> i32
+      }
+      %6 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
+        %11 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "output", iotype = "mem2"} -> i32
+        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : tensor<4x16xf32>, i32 -> i32
+      }
+      %7 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
+        %11 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "output", iotype = "mem2"} -> i32
+        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : tensor<4x16xf32>, i32 -> i32
+      }
+      scf.yield
+    } {routing_memo = "row"}
+    scf.execute_region {
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<4x16xf32>, i32 -> i32
+      }
+      %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<4x16xf32>, i32 -> i32
+      }
+      %6 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<4x16xf32>, i32 -> i32
+      }
+      %7 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<4x16xf32>, i32 -> i32
+      }
+      scf.yield
+    } {routing_memo = "row"}
+    scf.execute_region {
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "col" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "col",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %4 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<16x4xf32>, i32 -> i32
+      }
+      %5 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<16x4xf32>, i32 -> i32
+      }
+      %6 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<16x4xf32>, i32 -> i32
+      }
+      %7 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<16x4xf32>, i32 -> i32
+      }
+      scf.yield
+    } {routing_memo = "col"}
+    return
+  }
+}
 // -----// IR Dump After RoutingToDmapPass: //----- //
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
   func.func @main() {
@@ -97,81 +299,329 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
     %c2_i32 = arith.constant 2 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    %0 = routing.routingcreatehwmesh {col = 4 : i64, row = 4 : i64} -> i32
-    %1 = routing.routingcreatedummytensor {dim = 2 : i64, shape = [10, 20]} -> i32
+    %0 = routing.routingcreatehwmesh row = 4, col = 4 -> i32
+    %1 = routing.routingcreatescheduletensor shape = [16, 16], dim = 2 -> tensor<16x16xf32>
     scf.execute_region {
-      %2 = routing.partitionmesh mesh = %0 : i32 {splitaxis = "row", splitnum = 4 : i32} -> i32
-      %3 = routing.partitiontensor tensor = %1 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %8 = routing.routingextract_data %3, %arg0 : i32, i32 -> i32
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
         %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
-        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, i32 -> i32
+        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
         %11 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "output", iotype = "mem2"} -> i32
-        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : i32, i32 -> i32
+        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : tensor<4x16xf32>, i32 -> i32
       }
       %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %8 = routing.routingextract_data %3, %arg0 : i32, i32 -> i32
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
         %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
-        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, i32 -> i32
+        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
         %11 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "output", iotype = "mem2"} -> i32
-        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : i32, i32 -> i32
+        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : tensor<4x16xf32>, i32 -> i32
       }
       %6 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %8 = routing.routingextract_data %3, %arg0 : i32, i32 -> i32
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
         %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
-        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, i32 -> i32
+        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
         %11 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "output", iotype = "mem2"} -> i32
-        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : i32, i32 -> i32
+        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : tensor<4x16xf32>, i32 -> i32
       }
       %7 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %8 = routing.routingextract_data %3, %arg0 : i32, i32 -> i32
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
         %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
-        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, i32 -> i32
+        %10 = routing.routingroutinggatherout tilelist = %9, tensordata = %8 : i32, tensor<4x16xf32> -> tensor<4x16xf32>
         %11 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "output", iotype = "mem2"} -> i32
-        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : i32, i32 -> i32
+        %12 = routing.routingmovedatabyio gatherout_tensorin = %10, hwiowithtarget = %11 : tensor<4x16xf32>, i32 -> i32
       }
       scf.yield
     } {routing_memo = "row"}
     scf.execute_region {
-      %2 = routing.partitionmesh mesh = %0 : i32 {splitaxis = "row", splitnum = 4 : i32} -> i32
-      %3 = routing.partitiontensor tensor = %1 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %8 = routing.routingextract_data %3, %arg0 : i32, i32 -> i32
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
         %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
         %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : i32, i32 -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<4x16xf32>, i32 -> i32
       }
       %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %8 = routing.routingextract_data %3, %arg0 : i32, i32 -> i32
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
         %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
         %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : i32, i32 -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<4x16xf32>, i32 -> i32
       }
       %6 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %8 = routing.routingextract_data %3, %arg0 : i32, i32 -> i32
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
         %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
         %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : i32, i32 -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<4x16xf32>, i32 -> i32
       }
       %7 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %8 = routing.routingextract_data %3, %arg0 : i32, i32 -> i32
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
         %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
         %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : i32, i32 -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<4x16xf32>, i32 -> i32
       }
       scf.yield
     } {routing_memo = "row"}
+    scf.execute_region {
+      %2 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "col" : i32 -> i32
+      %3 = routing.partitiontensor tensor = %1 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "col",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %4 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<16x4xf32>, i32 -> i32
+      }
+      %5 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<16x4xf32>, i32 -> i32
+      }
+      %6 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<16x4xf32>, i32 -> i32
+      }
+      %7 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %8 = routing.routingextract_data %3, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %9 = routing.routingextract_tiles %2, %arg0 : i32, i32 -> i32
+        %10 = routing.routingcreatehwiowithtarget targettilelist = %9 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %11 = routing.routingmovedatabyio gatherout_tensorin = %8, hwiowithtarget = %10 : tensor<16x4xf32>, i32 -> i32
+      }
+      scf.yield
+    } {routing_memo = "col"}
     return
   }
 }
+// -----// IR Dump After RoutingToDmapPass: //----- //
+module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
+  func.func @main() {
+    %c3_i32 = arith.constant 3 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %0 = routing.routingcreatescheduletensor shape = [16, 16], dim = 2 -> tensor<16x16xf32>
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmap.define_io_engine {io_id = 0 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 0 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @send_port : {"SEND", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"RECEIVE", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @send_port}, {1, @send_port}, {2, @send_port}, {3, @send_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %11, dst = %10, !dmap.dmacoregroupconfig !dmap.dmapioconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.pull %6 : tensor<4x16xf32> from %12 : !dmap.dmapportstream
+      }
+      %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmap.define_io_engine {io_id = 1 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 1 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @send_port : {"SEND", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"RECEIVE", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @send_port}, {1, @send_port}, {2, @send_port}, {3, @send_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %11, dst = %10, !dmap.dmacoregroupconfig !dmap.dmapioconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.pull %6 : tensor<4x16xf32> from %12 : !dmap.dmapportstream
+      }
+      %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmap.define_io_engine {io_id = 2 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 2 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @send_port : {"SEND", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"RECEIVE", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @send_port}, {1, @send_port}, {2, @send_port}, {3, @send_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %11, dst = %10, !dmap.dmacoregroupconfig !dmap.dmapioconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.pull %6 : tensor<4x16xf32> from %12 : !dmap.dmapportstream
+      }
+      %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmap.define_io_engine {io_id = 3 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 3 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @send_port : {"SEND", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"RECEIVE", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @send_port}, {1, @send_port}, {2, @send_port}, {3, @send_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %11, dst = %10, !dmap.dmacoregroupconfig !dmap.dmapioconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.pull %6 : tensor<4x16xf32> from %12 : !dmap.dmapportstream
+      }
+      scf.yield
+    } {routing_memo = "row"}
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmap.define_io_engine {io_id = 4 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 0 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.push %6 : tensor<4x16xf32> to %12 : !dmap.dmapportstream
+      }
+      %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmap.define_io_engine {io_id = 5 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 1 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.push %6 : tensor<4x16xf32> to %12 : !dmap.dmapportstream
+      }
+      %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmap.define_io_engine {io_id = 6 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 2 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.push %6 : tensor<4x16xf32> to %12 : !dmap.dmapportstream
+      }
+      %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmap.define_io_engine {io_id = 7 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 3 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.push %6 : tensor<4x16xf32> to %12 : !dmap.dmapportstream
+      }
+      scf.yield
+    } {routing_memo = "row"}
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "col",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %2 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %7 = dmap.define_io_engine {io_id = 8 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "col", group_idx = 0 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.push %6 : tensor<16x4xf32> to %12 : !dmap.dmapportstream
+      }
+      %3 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %7 = dmap.define_io_engine {io_id = 9 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "col", group_idx = 1 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.push %6 : tensor<16x4xf32> to %12 : !dmap.dmapportstream
+      }
+      %4 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %7 = dmap.define_io_engine {io_id = 10 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "col", group_idx = 2 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.push %6 : tensor<16x4xf32> to %12 : !dmap.dmapportstream
+      }
+      %5 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %7 = dmap.define_io_engine {io_id = 11 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
+        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "col", group_idx = 3 : i32} -> !dmap.dmacoreenginegroupType
+        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
+        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
+        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
+        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
+        dmap.push %6 : tensor<16x4xf32> to %12 : !dmap.dmapportstream
+      }
+      scf.yield
+    } {routing_memo = "col"}
+    return
+  }
+}
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+before xxxx---0----
+Allocated DataIO: shim col=3 channel=0 IOID=1
+Allocated DataIO: shim col=3 channel=1 IOID=2
+Allocated DataIO: shim col=2 channel=0 IOID=3
+Allocated DataIO: shim col=2 channel=1 IOID=4
+Allocated DataIO: shim col=2 channel=0 IOID=5
+Allocated DataIO: shim col=2 channel=1 IOID=6
+Allocated DataIO: shim col=3 channel=0 IOID=7
+Allocated DataIO: shim col=3 channel=1 IOID=8
+Allocated DataIO: shim col=6 channel=0 IOID=9
+Allocated DataIO: shim col=6 channel=1 IOID=10
+Allocated DataIO: shim col=7 channel=0 IOID=11
+Allocated DataIO: shim col=7 channel=1 IOID=12
 // -----// IR Dump After DmapToDmaphopPass: //----- //
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
   func.func @main() {
@@ -179,558 +629,1200 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
     %c2_i32 = arith.constant 2 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    %0 = routing.routingcreatedummytensor {dim = 2 : i64, shape = [10, 20]} -> i32
+    %0 = routing.routingcreatescheduletensor shape = [16, 16], dim = 2 -> tensor<16x16xf32>
     scf.execute_region {
-      %1 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmap.define_io_engine {io_id = 0 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
-        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 0 : i32} -> !dmap.dmacoreenginegroupType
-        %9 = dmap.define_port_configure @send_port : {"SEND", 16, 1, 1} -> !dmap.dmapportconfig
-        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"RECEIVE", 16, 1, 1}>} -> !dmap.dmapioconfig
-        %11 = dmap.create_core_group_with_config %8{[{0, @send_port}, {1, @send_port}, {2, @send_port}, {3, @send_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
-        %12 = dmap.create_stream src = %11, dst = %10, !dmap.dmacoregroupconfig !dmap.dmapioconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.pull %6 from %12 : !dmap.dmapportstream
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %18 -> %21 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@corePortOut0, @corePortOut1, @corePortOut2, @corePortOut3]], consumers = [[@shimPortOut]], tee_points = [[]]} -> !dmaphop.path
+        %extracted_slice = tensor.extract_slice %6[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %6[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %6[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %6[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        dmaphop.pull %6 from %26 producer(%extracted_slice, %extracted_slice_0, %extracted_slice_1, %extracted_slice_2 at %8, %11, %14, %17) : tensor<4x16xf32> !dmaphop.path tensor<1x16xf32>, tensor<1x16xf32>, tensor<1x16xf32>, tensor<1x16xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
       }
       %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmap.define_io_engine {io_id = 1 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
-        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 1 : i32} -> !dmap.dmacoreenginegroupType
-        %9 = dmap.define_port_configure @send_port : {"SEND", 16, 1, 1} -> !dmap.dmapportconfig
-        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"RECEIVE", 16, 1, 1}>} -> !dmap.dmapioconfig
-        %11 = dmap.create_core_group_with_config %8{[{0, @send_port}, {1, @send_port}, {2, @send_port}, {3, @send_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
-        %12 = dmap.create_stream src = %11, dst = %10, !dmap.dmacoregroupconfig !dmap.dmapioconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.pull %6 from %12 : !dmap.dmapportstream
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %18 -> %21 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@corePortOut0, @corePortOut1, @corePortOut2, @corePortOut3]], consumers = [[@shimPortOut]], tee_points = [[]]} -> !dmaphop.path
+        %extracted_slice = tensor.extract_slice %6[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %6[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %6[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %6[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        dmaphop.pull %6 from %26 producer(%extracted_slice, %extracted_slice_0, %extracted_slice_1, %extracted_slice_2 at %8, %11, %14, %17) : tensor<4x16xf32> !dmaphop.path tensor<1x16xf32>, tensor<1x16xf32>, tensor<1x16xf32>, tensor<1x16xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
       }
       %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmap.define_io_engine {io_id = 2 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
-        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 2 : i32} -> !dmap.dmacoreenginegroupType
-        %9 = dmap.define_port_configure @send_port : {"SEND", 16, 1, 1} -> !dmap.dmapportconfig
-        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"RECEIVE", 16, 1, 1}>} -> !dmap.dmapioconfig
-        %11 = dmap.create_core_group_with_config %8{[{0, @send_port}, {1, @send_port}, {2, @send_port}, {3, @send_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
-        %12 = dmap.create_stream src = %11, dst = %10, !dmap.dmacoregroupconfig !dmap.dmapioconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.pull %6 from %12 : !dmap.dmapportstream
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 0, row = 5} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 1, row = 5} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 2, row = 5} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 3, row = 5} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %18 -> %21 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@corePortOut0, @corePortOut1, @corePortOut2, @corePortOut3]], consumers = [[@shimPortOut]], tee_points = [[]]} -> !dmaphop.path
+        %extracted_slice = tensor.extract_slice %6[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %6[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %6[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %6[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        dmaphop.pull %6 from %26 producer(%extracted_slice, %extracted_slice_0, %extracted_slice_1, %extracted_slice_2 at %8, %11, %14, %17) : tensor<4x16xf32> !dmaphop.path tensor<1x16xf32>, tensor<1x16xf32>, tensor<1x16xf32>, tensor<1x16xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
       }
       %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmap.define_io_engine {io_id = 3 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
-        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 3 : i32} -> !dmap.dmacoreenginegroupType
-        %9 = dmap.define_port_configure @send_port : {"SEND", 16, 1, 1} -> !dmap.dmapportconfig
-        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"RECEIVE", 16, 1, 1}>} -> !dmap.dmapioconfig
-        %11 = dmap.create_core_group_with_config %8{[{0, @send_port}, {1, @send_port}, {2, @send_port}, {3, @send_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
-        %12 = dmap.create_stream src = %11, dst = %10, !dmap.dmacoregroupconfig !dmap.dmapioconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.pull %6 from %12 : !dmap.dmapportstream
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 0, row = 6} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 1, row = 6} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 2, row = 6} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %18 -> %21 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@corePortOut0, @corePortOut1, @corePortOut2, @corePortOut3]], consumers = [[@shimPortOut]], tee_points = [[]]} -> !dmaphop.path
+        %extracted_slice = tensor.extract_slice %6[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %6[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %6[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %6[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        dmaphop.pull %6 from %26 producer(%extracted_slice, %extracted_slice_0, %extracted_slice_1, %extracted_slice_2 at %8, %11, %14, %17) : tensor<4x16xf32> !dmaphop.path tensor<1x16xf32>, tensor<1x16xf32>, tensor<1x16xf32>, tensor<1x16xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
       }
       scf.yield
     } {routing_memo = "row"}
     scf.execute_region {
-      %1 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmap.define_io_engine {io_id = 4 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
-        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 0 : i32} -> !dmap.dmacoreenginegroupType
-        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
-        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
-        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
-        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.push %6 to %12 : !dmap.dmapportstream
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %20 -> %8 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@shimPortIn]], consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        dmaphop.push %6 into %26 consumer(%6, %6, %6, %6 at %8, %11, %14, %17) : tensor<4x16xf32> !dmaphop.path tensor<4x16xf32>, tensor<4x16xf32>, tensor<4x16xf32>, tensor<4x16xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
       }
       %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmap.define_io_engine {io_id = 5 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
-        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 1 : i32} -> !dmap.dmacoreenginegroupType
-        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
-        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
-        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
-        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.push %6 to %12 : !dmap.dmapportstream
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %20 -> %8 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@shimPortIn]], consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        dmaphop.push %6 into %26 consumer(%6, %6, %6, %6 at %8, %11, %14, %17) : tensor<4x16xf32> !dmaphop.path tensor<4x16xf32>, tensor<4x16xf32>, tensor<4x16xf32>, tensor<4x16xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
       }
       %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmap.define_io_engine {io_id = 6 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
-        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 2 : i32} -> !dmap.dmacoreenginegroupType
-        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
-        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
-        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
-        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.push %6 to %12 : !dmap.dmapportstream
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 0, row = 5} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 1, row = 5} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 2, row = 5} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 3, row = 5} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %20 -> %8 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@shimPortIn]], consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        dmaphop.push %6 into %26 consumer(%6, %6, %6, %6 at %8, %11, %14, %17) : tensor<4x16xf32> !dmaphop.path tensor<4x16xf32>, tensor<4x16xf32>, tensor<4x16xf32>, tensor<4x16xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
       }
       %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmap.define_io_engine {io_id = 7 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
-        %8 = dmap.define_core_group {core_count = 4 : i32, group_axis = "row", group_idx = 3 : i32} -> !dmap.dmacoreenginegroupType
-        %9 = dmap.define_port_configure @receive_port : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
-        %10 = dmap.create_io_engin_with_config %7 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
-        %11 = dmap.create_core_group_with_config %8{[{0, @receive_port}, {1, @receive_port}, {2, @receive_port}, {3, @receive_port}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
-        %12 = dmap.create_stream src = %10, dst = %11, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.push %6 to %12 : !dmap.dmapportstream
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<4x16xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 0, row = 6} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 1, row = 6} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 2, row = 6} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %20 -> %8 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@shimPortIn]], consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        dmaphop.push %6 into %26 consumer(%6, %6, %6, %6 at %8, %11, %14, %17) : tensor<4x16xf32> !dmaphop.path tensor<4x16xf32>, tensor<4x16xf32>, tensor<4x16xf32>, tensor<4x16xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
       }
       scf.yield
     } {routing_memo = "row"}
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "col",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %2 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 0, row = 5} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 0, row = 6} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 6, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %20 -> %8 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@shimPortIn]], consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        dmaphop.push %6 into %26 consumer(%6, %6, %6, %6 at %8, %11, %14, %17) : tensor<16x4xf32> !dmaphop.path tensor<16x4xf32>, tensor<16x4xf32>, tensor<16x4xf32>, tensor<16x4xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+      }
+      %3 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 5} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 1, row = 6} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 6, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %20 -> %8 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@shimPortIn]], consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        dmaphop.push %6 into %26 consumer(%6, %6, %6, %6 at %8, %11, %14, %17) : tensor<16x4xf32> !dmaphop.path tensor<16x4xf32>, tensor<16x4xf32>, tensor<16x4xf32>, tensor<16x4xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+      }
+      %4 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 2, row = 5} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 6} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 7, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %20 -> %8 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@shimPortIn]], consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        dmaphop.push %6 into %26 consumer(%6, %6, %6, %6 at %8, %11, %14, %17) : tensor<16x4xf32> !dmaphop.path tensor<16x4xf32>, tensor<16x4xf32>, tensor<16x4xf32>, tensor<16x4xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+      }
+      %5 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        %6 = routing.routingextract_data %1, %arg0 : tensor<16x16xf32>, i32 -> tensor<16x4xf32>
+        %7 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
+        %8 = dmaphop.port @corePortIn0 on %7 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %9 = dmaphop.port @corePortOut0 on %7 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %10 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
+        %11 = dmaphop.port @corePortIn1 on %10 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %12 = dmaphop.port @corePortOut1 on %10 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %13 = dmaphop.tile{TILETYPE = "core", col = 3, row = 5} -> !dmaphop.tile
+        %14 = dmaphop.port @corePortIn2 on %13 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %15 = dmaphop.port @corePortOut2 on %13 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %16 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
+        %17 = dmaphop.port @corePortIn3 on %16 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %18 = dmaphop.port @corePortOut3 on %16 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
+        %19 = dmaphop.tile{TILETYPE = "shim", col = 7, row = 0} -> !dmaphop.tile
+        %20 = dmaphop.port @shimPortOut on %19 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %21 = dmaphop.port @shimPortIn on %19 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
+        %22 = dmaphop.create_hop %20 -> %8 -> !dmaphop.hop
+        %23 = dmaphop.create_hop %9 -> %11 -> !dmaphop.hop
+        %24 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
+        %25 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
+        %26 = dmaphop.create_path[%22, %23, %24, %25] {producers = [[@shimPortIn]], consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
+        dmaphop.push %6 into %26 consumer(%6, %6, %6, %6 at %8, %11, %14, %17) : tensor<16x4xf32> !dmaphop.path tensor<16x4xf32>, tensor<16x4xf32>, tensor<16x4xf32>, tensor<16x4xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.sync %26
+      }
+      scf.yield
+    } {routing_memo = "col"}
     return
   }
 }
-// -----// IR Dump After DmaphopToRoutinghwPass: //----- //
+// -----// IR Dump After DmaphopTodfscheblueprintPass: //----- //
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
   func.func @main() {
     %c3_i32 = arith.constant 3 : i32
     %c2_i32 = arith.constant 2 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    %0 = routing.routingcreatedummytensor {dim = 2 : i64, shape = [10, 20]} -> i32
+    %0 = schedule.declare_data tensor<16x16xf32> -> tensor<16x16xf32>
     scf.execute_region {
-      %1 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmaphop.tile{TILETYPE = "shim", col = 0, row = 0} -> !dmaphop.tile
-        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
-        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
-        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
-        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
-        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-        %22 = dmaphop.create_hop %21 -> %9 -> !dmaphop.hop
-        %23 = dmaphop.create_hop %18 -> %17 -> !dmaphop.hop
-        %24 = dmaphop.create_hop %15 -> %14 -> !dmaphop.hop
-        %25 = dmaphop.create_hop %12 -> %11 -> !dmaphop.hop
-        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-        %alloc = memref.alloc() : memref<1024xf32>
-        %alloc_0 = memref.alloc() : memref<1024xf32>
-        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        dmaphop.pull %alloc from %26 input(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-        dmaphop.sync %26
-        dmaphop.dealloc_buffer %27 : memref<1024xf32>
-        dmaphop.dealloc_buffer %28 : memref<1024xf32>
-        dmaphop.dealloc_buffer %29 : memref<1024xf32>
-        dmaphop.dealloc_buffer %30 : memref<1024xf32>
-        memref.dealloc %alloc : memref<1024xf32>
-        memref.dealloc %alloc_0 : memref<1024xf32>
+        schedule.resource_group @group_src_0{tiles = [[0, 3], [1, 3], [2, 3], [3, 3]]}
+        schedule.resource_group @group_dst_0{tiles = [[3, 0]]}
+        %extracted_slice = tensor.extract_slice %1[0, 0] [4, 16] [1, 1] {tag = "partitionslice0"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %extracted_slice[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %extracted_slice[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %extracted_slice[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_3 = tensor.extract_slice %extracted_slice[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %6 = schedule.data_slice @producer_slice_0_0 wrap %extracted_slice_0 : tensor<1x16xf32>
+        %7 = schedule.data_slice @producer_slice_0_1 wrap %extracted_slice_1 : tensor<1x16xf32>
+        %8 = schedule.data_slice @producer_slice_0_2 wrap %extracted_slice_2 : tensor<1x16xf32>
+        %9 = schedule.data_slice @producer_slice_0_3 wrap %extracted_slice_3 : tensor<1x16xf32>
+        schedule.bind_group @bind_src_0 {
+          target_group = @group_src_0,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+          ,slice_symbols = [@producer_slice_0_0, @producer_slice_0_1, @producer_slice_0_2, @producer_slice_0_3]
+        }
+        schedule.bind @bind_dst_0 {
+          target = @group_dst_0,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+        }
+        schedule.collective_transfer @transfer_0 {
+          type = "many_to_one",
+          from = @bind_src_0,
+          to = @bind_dst_0
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
       }
       %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmaphop.tile{TILETYPE = "shim", col = 1, row = 0} -> !dmaphop.tile
-        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
-        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
-        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
-        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
-        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-        %22 = dmaphop.create_hop %21 -> %9 -> !dmaphop.hop
-        %23 = dmaphop.create_hop %18 -> %17 -> !dmaphop.hop
-        %24 = dmaphop.create_hop %15 -> %14 -> !dmaphop.hop
-        %25 = dmaphop.create_hop %12 -> %11 -> !dmaphop.hop
-        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-        %alloc = memref.alloc() : memref<1024xf32>
-        %alloc_0 = memref.alloc() : memref<1024xf32>
-        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        dmaphop.pull %alloc from %26 input(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-        dmaphop.sync %26
-        dmaphop.dealloc_buffer %27 : memref<1024xf32>
-        dmaphop.dealloc_buffer %28 : memref<1024xf32>
-        dmaphop.dealloc_buffer %29 : memref<1024xf32>
-        dmaphop.dealloc_buffer %30 : memref<1024xf32>
-        memref.dealloc %alloc : memref<1024xf32>
-        memref.dealloc %alloc_0 : memref<1024xf32>
+        schedule.resource_group @group_src_1{tiles = [[0, 4], [1, 4], [2, 4], [3, 4]]}
+        schedule.resource_group @group_dst_1{tiles = [[3, 0]]}
+        %extracted_slice = tensor.extract_slice %1[4, 0] [4, 16] [1, 1] {tag = "partitionslice1"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %extracted_slice[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %extracted_slice[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %extracted_slice[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_3 = tensor.extract_slice %extracted_slice[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %6 = schedule.data_slice @producer_slice_1_0 wrap %extracted_slice_0 : tensor<1x16xf32>
+        %7 = schedule.data_slice @producer_slice_1_1 wrap %extracted_slice_1 : tensor<1x16xf32>
+        %8 = schedule.data_slice @producer_slice_1_2 wrap %extracted_slice_2 : tensor<1x16xf32>
+        %9 = schedule.data_slice @producer_slice_1_3 wrap %extracted_slice_3 : tensor<1x16xf32>
+        schedule.bind_group @bind_src_1 {
+          target_group = @group_src_1,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+          ,slice_symbols = [@producer_slice_1_0, @producer_slice_1_1, @producer_slice_1_2, @producer_slice_1_3]
+        }
+        schedule.bind @bind_dst_1 {
+          target = @group_dst_1,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = S2MM>
+        }
+        schedule.collective_transfer @transfer_1 {
+          type = "many_to_one",
+          from = @bind_src_1,
+          to = @bind_dst_1
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
       }
       %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
-        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 5} -> !dmaphop.tile
-        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 5} -> !dmaphop.tile
-        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 5} -> !dmaphop.tile
-        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 5} -> !dmaphop.tile
-        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-        %22 = dmaphop.create_hop %21 -> %9 -> !dmaphop.hop
-        %23 = dmaphop.create_hop %18 -> %17 -> !dmaphop.hop
-        %24 = dmaphop.create_hop %15 -> %14 -> !dmaphop.hop
-        %25 = dmaphop.create_hop %12 -> %11 -> !dmaphop.hop
-        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-        %alloc = memref.alloc() : memref<1024xf32>
-        %alloc_0 = memref.alloc() : memref<1024xf32>
-        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        dmaphop.pull %alloc from %26 input(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-        dmaphop.sync %26
-        dmaphop.dealloc_buffer %27 : memref<1024xf32>
-        dmaphop.dealloc_buffer %28 : memref<1024xf32>
-        dmaphop.dealloc_buffer %29 : memref<1024xf32>
-        dmaphop.dealloc_buffer %30 : memref<1024xf32>
-        memref.dealloc %alloc : memref<1024xf32>
-        memref.dealloc %alloc_0 : memref<1024xf32>
+        schedule.resource_group @group_src_2{tiles = [[0, 5], [1, 5], [2, 5], [3, 5]]}
+        schedule.resource_group @group_dst_2{tiles = [[2, 0]]}
+        %extracted_slice = tensor.extract_slice %1[8, 0] [4, 16] [1, 1] {tag = "partitionslice2"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %extracted_slice[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %extracted_slice[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %extracted_slice[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_3 = tensor.extract_slice %extracted_slice[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %6 = schedule.data_slice @producer_slice_2_0 wrap %extracted_slice_0 : tensor<1x16xf32>
+        %7 = schedule.data_slice @producer_slice_2_1 wrap %extracted_slice_1 : tensor<1x16xf32>
+        %8 = schedule.data_slice @producer_slice_2_2 wrap %extracted_slice_2 : tensor<1x16xf32>
+        %9 = schedule.data_slice @producer_slice_2_3 wrap %extracted_slice_3 : tensor<1x16xf32>
+        schedule.bind_group @bind_src_2 {
+          target_group = @group_src_2,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+          ,slice_symbols = [@producer_slice_2_0, @producer_slice_2_1, @producer_slice_2_2, @producer_slice_2_3]
+        }
+        schedule.bind @bind_dst_2 {
+          target = @group_dst_2,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+        }
+        schedule.collective_transfer @transfer_2 {
+          type = "many_to_one",
+          from = @bind_src_2,
+          to = @bind_dst_2
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
       }
       %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
-        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 6} -> !dmaphop.tile
-        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 6} -> !dmaphop.tile
-        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 6} -> !dmaphop.tile
-        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
-        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-        %22 = dmaphop.create_hop %21 -> %9 -> !dmaphop.hop
-        %23 = dmaphop.create_hop %18 -> %17 -> !dmaphop.hop
-        %24 = dmaphop.create_hop %15 -> %14 -> !dmaphop.hop
-        %25 = dmaphop.create_hop %12 -> %11 -> !dmaphop.hop
-        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@shimPortIn]], tee_points = [[]]} -> !dmaphop.path
-        %alloc = memref.alloc() : memref<1024xf32>
-        %alloc_0 = memref.alloc() : memref<1024xf32>
-        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        dmaphop.pull %alloc from %26 input(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-        dmaphop.sync %26
-        dmaphop.dealloc_buffer %27 : memref<1024xf32>
-        dmaphop.dealloc_buffer %28 : memref<1024xf32>
-        dmaphop.dealloc_buffer %29 : memref<1024xf32>
-        dmaphop.dealloc_buffer %30 : memref<1024xf32>
-        memref.dealloc %alloc : memref<1024xf32>
-        memref.dealloc %alloc_0 : memref<1024xf32>
+        schedule.resource_group @group_src_3{tiles = [[0, 6], [1, 6], [2, 6], [3, 6]]}
+        schedule.resource_group @group_dst_3{tiles = [[2, 0]]}
+        %extracted_slice = tensor.extract_slice %1[12, 0] [4, 16] [1, 1] {tag = "partitionslice3"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %extracted_slice[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %extracted_slice[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %extracted_slice[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_3 = tensor.extract_slice %extracted_slice[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %6 = schedule.data_slice @producer_slice_3_0 wrap %extracted_slice_0 : tensor<1x16xf32>
+        %7 = schedule.data_slice @producer_slice_3_1 wrap %extracted_slice_1 : tensor<1x16xf32>
+        %8 = schedule.data_slice @producer_slice_3_2 wrap %extracted_slice_2 : tensor<1x16xf32>
+        %9 = schedule.data_slice @producer_slice_3_3 wrap %extracted_slice_3 : tensor<1x16xf32>
+        schedule.bind_group @bind_src_3 {
+          target_group = @group_src_3,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+          ,slice_symbols = [@producer_slice_3_0, @producer_slice_3_1, @producer_slice_3_2, @producer_slice_3_3]
+        }
+        schedule.bind @bind_dst_3 {
+          target = @group_dst_3,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = S2MM>
+        }
+        schedule.collective_transfer @transfer_3 {
+          type = "many_to_one",
+          from = @bind_src_3,
+          to = @bind_dst_3
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
       }
       scf.yield
     } {routing_memo = "row"}
     scf.execute_region {
-      %1 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
       %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmaphop.tile{TILETYPE = "shim", col = 4, row = 0} -> !dmaphop.tile
-        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
-        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
-        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
-        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
-        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-        %22 = dmaphop.create_hop %8 -> %11 -> !dmaphop.hop
-        %23 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
-        %24 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
-        %25 = dmaphop.create_hop %18 -> %20 -> !dmaphop.hop
-        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-        %alloc = memref.alloc() : memref<1024xf32>
-        %alloc_0 = memref.alloc() : memref<1024xf32>
-        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        dmaphop.push %alloc onto %26 outputs(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-        dmaphop.sync %26
-        dmaphop.dealloc_buffer %27 : memref<1024xf32>
-        dmaphop.dealloc_buffer %28 : memref<1024xf32>
-        dmaphop.dealloc_buffer %29 : memref<1024xf32>
-        dmaphop.dealloc_buffer %30 : memref<1024xf32>
-        memref.dealloc %alloc : memref<1024xf32>
-        memref.dealloc %alloc_0 : memref<1024xf32>
+        schedule.resource_group @group_src_4{tiles = [[2, 0]]}
+        schedule.resource_group @group_dst_4{tiles = [[0, 3], [1, 3], [2, 3], [3, 3]]}
+        %extracted_slice = tensor.extract_slice %1[0, 0] [4, 16] [1, 1] {tag = "partitionslice0"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %6 = schedule.data_slice @consumer_slice_4_0 wrap %extracted_slice : tensor<4x16xf32>
+        %7 = schedule.data_slice @consumer_slice_4_1 wrap %extracted_slice : tensor<4x16xf32>
+        %8 = schedule.data_slice @consumer_slice_4_2 wrap %extracted_slice : tensor<4x16xf32>
+        %9 = schedule.data_slice @consumer_slice_4_3 wrap %extracted_slice : tensor<4x16xf32>
+        schedule.bind @bind_src_4 {
+          target = @group_src_4,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_4 {
+          target_group = @group_dst_4,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_4_0, @consumer_slice_4_1, @consumer_slice_4_2, @consumer_slice_4_3]
+        }
+        schedule.collective_transfer @transfer_4 {
+          type = "one_to_many",
+          from = @bind_src_4,
+          to = @bind_dst_4
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
       }
       %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmaphop.tile{TILETYPE = "shim", col = 5, row = 0} -> !dmaphop.tile
-        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 4} -> !dmaphop.tile
-        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 4} -> !dmaphop.tile
-        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 4} -> !dmaphop.tile
-        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
-        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-        %22 = dmaphop.create_hop %8 -> %11 -> !dmaphop.hop
-        %23 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
-        %24 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
-        %25 = dmaphop.create_hop %18 -> %20 -> !dmaphop.hop
-        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-        %alloc = memref.alloc() : memref<1024xf32>
-        %alloc_0 = memref.alloc() : memref<1024xf32>
-        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        dmaphop.push %alloc onto %26 outputs(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-        dmaphop.sync %26
-        dmaphop.dealloc_buffer %27 : memref<1024xf32>
-        dmaphop.dealloc_buffer %28 : memref<1024xf32>
-        dmaphop.dealloc_buffer %29 : memref<1024xf32>
-        dmaphop.dealloc_buffer %30 : memref<1024xf32>
-        memref.dealloc %alloc : memref<1024xf32>
-        memref.dealloc %alloc_0 : memref<1024xf32>
+        schedule.resource_group @group_src_5{tiles = [[2, 0]]}
+        schedule.resource_group @group_dst_5{tiles = [[0, 4], [1, 4], [2, 4], [3, 4]]}
+        %extracted_slice = tensor.extract_slice %1[4, 0] [4, 16] [1, 1] {tag = "partitionslice1"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %6 = schedule.data_slice @consumer_slice_5_0 wrap %extracted_slice : tensor<4x16xf32>
+        %7 = schedule.data_slice @consumer_slice_5_1 wrap %extracted_slice : tensor<4x16xf32>
+        %8 = schedule.data_slice @consumer_slice_5_2 wrap %extracted_slice : tensor<4x16xf32>
+        %9 = schedule.data_slice @consumer_slice_5_3 wrap %extracted_slice : tensor<4x16xf32>
+        schedule.bind @bind_src_5 {
+          target = @group_src_5,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_5 {
+          target_group = @group_dst_5,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_5_0, @consumer_slice_5_1, @consumer_slice_5_2, @consumer_slice_5_3]
+        }
+        schedule.collective_transfer @transfer_5 {
+          type = "one_to_many",
+          from = @bind_src_5,
+          to = @bind_dst_5
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
       }
       %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmaphop.tile{TILETYPE = "shim", col = 6, row = 0} -> !dmaphop.tile
-        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 5} -> !dmaphop.tile
-        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 5} -> !dmaphop.tile
-        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 5} -> !dmaphop.tile
-        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 5} -> !dmaphop.tile
-        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-        %22 = dmaphop.create_hop %8 -> %11 -> !dmaphop.hop
-        %23 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
-        %24 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
-        %25 = dmaphop.create_hop %18 -> %20 -> !dmaphop.hop
-        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-        %alloc = memref.alloc() : memref<1024xf32>
-        %alloc_0 = memref.alloc() : memref<1024xf32>
-        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        dmaphop.push %alloc onto %26 outputs(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-        dmaphop.sync %26
-        dmaphop.dealloc_buffer %27 : memref<1024xf32>
-        dmaphop.dealloc_buffer %28 : memref<1024xf32>
-        dmaphop.dealloc_buffer %29 : memref<1024xf32>
-        dmaphop.dealloc_buffer %30 : memref<1024xf32>
-        memref.dealloc %alloc : memref<1024xf32>
-        memref.dealloc %alloc_0 : memref<1024xf32>
+        schedule.resource_group @group_src_6{tiles = [[3, 0]]}
+        schedule.resource_group @group_dst_6{tiles = [[0, 5], [1, 5], [2, 5], [3, 5]]}
+        %extracted_slice = tensor.extract_slice %1[8, 0] [4, 16] [1, 1] {tag = "partitionslice2"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %6 = schedule.data_slice @consumer_slice_6_0 wrap %extracted_slice : tensor<4x16xf32>
+        %7 = schedule.data_slice @consumer_slice_6_1 wrap %extracted_slice : tensor<4x16xf32>
+        %8 = schedule.data_slice @consumer_slice_6_2 wrap %extracted_slice : tensor<4x16xf32>
+        %9 = schedule.data_slice @consumer_slice_6_3 wrap %extracted_slice : tensor<4x16xf32>
+        schedule.bind @bind_src_6 {
+          target = @group_src_6,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_6 {
+          target_group = @group_dst_6,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_6_0, @consumer_slice_6_1, @consumer_slice_6_2, @consumer_slice_6_3]
+        }
+        schedule.collective_transfer @transfer_6 {
+          type = "one_to_many",
+          from = @bind_src_6,
+          to = @bind_dst_6
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
       }
       %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
       ^bb0(%arg0: i32):
-        %6 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-        %7 = dmaphop.tile{TILETYPE = "shim", col = 7, row = 0} -> !dmaphop.tile
-        %8 = dmaphop.port on %7{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "shimPortOut"} -> !dmaphop.port
-        %9 = dmaphop.port on %7{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "shimPortIn"} -> !dmaphop.port
-        %10 = dmaphop.tile{TILETYPE = "core", col = 0, row = 6} -> !dmaphop.tile
-        %11 = dmaphop.port on %10{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn0"} -> !dmaphop.port
-        %12 = dmaphop.port on %10{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut0"} -> !dmaphop.port
-        %13 = dmaphop.tile{TILETYPE = "core", col = 1, row = 6} -> !dmaphop.tile
-        %14 = dmaphop.port on %13{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn1"} -> !dmaphop.port
-        %15 = dmaphop.port on %13{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut1"} -> !dmaphop.port
-        %16 = dmaphop.tile{TILETYPE = "core", col = 2, row = 6} -> !dmaphop.tile
-        %17 = dmaphop.port on %16{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn2"} -> !dmaphop.port
-        %18 = dmaphop.port on %16{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut2"} -> !dmaphop.port
-        %19 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
-        %20 = dmaphop.port on %19{direction = "In", channel = 0} : !dmaphop.tile {sym_name = "corePortIn3"} -> !dmaphop.port
-        %21 = dmaphop.port on %19{direction = "Out", channel = 0} : !dmaphop.tile {sym_name = "corePortOut3"} -> !dmaphop.port
-        %22 = dmaphop.create_hop %8 -> %11 -> !dmaphop.hop
-        %23 = dmaphop.create_hop %12 -> %14 -> !dmaphop.hop
-        %24 = dmaphop.create_hop %15 -> %17 -> !dmaphop.hop
-        %25 = dmaphop.create_hop %18 -> %20 -> !dmaphop.hop
-        %26 = dmaphop.create_path[%22, %23, %24, %25] {consumers = [[@corePortIn0, @corePortIn1, @corePortIn2, @corePortIn3]], tee_points = [[]]} -> !dmaphop.path
-        %alloc = memref.alloc() : memref<1024xf32>
-        %alloc_0 = memref.alloc() : memref<1024xf32>
-        %27 = dmaphop.alloc_buffer on %10 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %28 = dmaphop.alloc_buffer on %13 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %29 = dmaphop.alloc_buffer on %16 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        %30 = dmaphop.alloc_buffer on %19 %alloc_0 : !dmaphop.tile memref<1024xf32> -> memref<1024xf32>
-        dmaphop.push %alloc onto %26 outputs(%27, %28, %29, %30 at %11, %14, %17, %20) : memref<1024xf32> !dmaphop.path memref<1024xf32>, memref<1024xf32>, memref<1024xf32>, memref<1024xf32> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
-        dmaphop.sync %26
-        dmaphop.dealloc_buffer %27 : memref<1024xf32>
-        dmaphop.dealloc_buffer %28 : memref<1024xf32>
-        dmaphop.dealloc_buffer %29 : memref<1024xf32>
-        dmaphop.dealloc_buffer %30 : memref<1024xf32>
-        memref.dealloc %alloc : memref<1024xf32>
-        memref.dealloc %alloc_0 : memref<1024xf32>
+        schedule.resource_group @group_src_7{tiles = [[3, 0]]}
+        schedule.resource_group @group_dst_7{tiles = [[0, 6], [1, 6], [2, 6], [3, 6]]}
+        %extracted_slice = tensor.extract_slice %1[12, 0] [4, 16] [1, 1] {tag = "partitionslice3"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %6 = schedule.data_slice @consumer_slice_7_0 wrap %extracted_slice : tensor<4x16xf32>
+        %7 = schedule.data_slice @consumer_slice_7_1 wrap %extracted_slice : tensor<4x16xf32>
+        %8 = schedule.data_slice @consumer_slice_7_2 wrap %extracted_slice : tensor<4x16xf32>
+        %9 = schedule.data_slice @consumer_slice_7_3 wrap %extracted_slice : tensor<4x16xf32>
+        schedule.bind @bind_src_7 {
+          target = @group_src_7,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_7 {
+          target_group = @group_dst_7,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_7_0, @consumer_slice_7_1, @consumer_slice_7_2, @consumer_slice_7_3]
+        }
+        schedule.collective_transfer @transfer_7 {
+          type = "one_to_many",
+          from = @bind_src_7,
+          to = @bind_dst_7
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
       }
       scf.yield
     } {routing_memo = "row"}
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "col",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %2 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_8{tiles = [[6, 0]]}
+        schedule.resource_group @group_dst_8{tiles = [[0, 3], [0, 4], [0, 5], [0, 6]]}
+        %extracted_slice = tensor.extract_slice %1[0, 0] [16, 4] [1, 1] {tag = "partitionslice0"} : tensor<16x16xf32> to tensor<16x4xf32>
+        %6 = schedule.data_slice @consumer_slice_8_0 wrap %extracted_slice : tensor<16x4xf32>
+        %7 = schedule.data_slice @consumer_slice_8_1 wrap %extracted_slice : tensor<16x4xf32>
+        %8 = schedule.data_slice @consumer_slice_8_2 wrap %extracted_slice : tensor<16x4xf32>
+        %9 = schedule.data_slice @consumer_slice_8_3 wrap %extracted_slice : tensor<16x4xf32>
+        schedule.bind @bind_src_8 {
+          target = @group_src_8,
+          view = %extracted_slice : tensor<16x4xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_8 {
+          target_group = @group_dst_8,
+          view = %extracted_slice : tensor<16x4xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_8_0, @consumer_slice_8_1, @consumer_slice_8_2, @consumer_slice_8_3]
+        }
+        schedule.collective_transfer @transfer_8 {
+          type = "one_to_many",
+          from = @bind_src_8,
+          to = @bind_dst_8
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %3 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_9{tiles = [[6, 0]]}
+        schedule.resource_group @group_dst_9{tiles = [[1, 3], [1, 4], [1, 5], [1, 6]]}
+        %extracted_slice = tensor.extract_slice %1[0, 4] [16, 4] [1, 1] {tag = "partitionslice1"} : tensor<16x16xf32> to tensor<16x4xf32>
+        %6 = schedule.data_slice @consumer_slice_9_0 wrap %extracted_slice : tensor<16x4xf32>
+        %7 = schedule.data_slice @consumer_slice_9_1 wrap %extracted_slice : tensor<16x4xf32>
+        %8 = schedule.data_slice @consumer_slice_9_2 wrap %extracted_slice : tensor<16x4xf32>
+        %9 = schedule.data_slice @consumer_slice_9_3 wrap %extracted_slice : tensor<16x4xf32>
+        schedule.bind @bind_src_9 {
+          target = @group_src_9,
+          view = %extracted_slice : tensor<16x4xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_9 {
+          target_group = @group_dst_9,
+          view = %extracted_slice : tensor<16x4xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_9_0, @consumer_slice_9_1, @consumer_slice_9_2, @consumer_slice_9_3]
+        }
+        schedule.collective_transfer @transfer_9 {
+          type = "one_to_many",
+          from = @bind_src_9,
+          to = @bind_dst_9
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %4 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_10{tiles = [[7, 0]]}
+        schedule.resource_group @group_dst_10{tiles = [[2, 3], [2, 4], [2, 5], [2, 6]]}
+        %extracted_slice = tensor.extract_slice %1[0, 8] [16, 4] [1, 1] {tag = "partitionslice2"} : tensor<16x16xf32> to tensor<16x4xf32>
+        %6 = schedule.data_slice @consumer_slice_10_0 wrap %extracted_slice : tensor<16x4xf32>
+        %7 = schedule.data_slice @consumer_slice_10_1 wrap %extracted_slice : tensor<16x4xf32>
+        %8 = schedule.data_slice @consumer_slice_10_2 wrap %extracted_slice : tensor<16x4xf32>
+        %9 = schedule.data_slice @consumer_slice_10_3 wrap %extracted_slice : tensor<16x4xf32>
+        schedule.bind @bind_src_10 {
+          target = @group_src_10,
+          view = %extracted_slice : tensor<16x4xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_10 {
+          target_group = @group_dst_10,
+          view = %extracted_slice : tensor<16x4xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_10_0, @consumer_slice_10_1, @consumer_slice_10_2, @consumer_slice_10_3]
+        }
+        schedule.collective_transfer @transfer_10 {
+          type = "one_to_many",
+          from = @bind_src_10,
+          to = @bind_dst_10
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %5 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_11{tiles = [[7, 0]]}
+        schedule.resource_group @group_dst_11{tiles = [[3, 3], [3, 4], [3, 5], [3, 6]]}
+        %extracted_slice = tensor.extract_slice %1[0, 12] [16, 4] [1, 1] {tag = "partitionslice3"} : tensor<16x16xf32> to tensor<16x4xf32>
+        %6 = schedule.data_slice @consumer_slice_11_0 wrap %extracted_slice : tensor<16x4xf32>
+        %7 = schedule.data_slice @consumer_slice_11_1 wrap %extracted_slice : tensor<16x4xf32>
+        %8 = schedule.data_slice @consumer_slice_11_2 wrap %extracted_slice : tensor<16x4xf32>
+        %9 = schedule.data_slice @consumer_slice_11_3 wrap %extracted_slice : tensor<16x4xf32>
+        schedule.bind @bind_src_11 {
+          target = @group_src_11,
+          view = %extracted_slice : tensor<16x4xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_11 {
+          target_group = @group_dst_11,
+          view = %extracted_slice : tensor<16x4xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_11_0, @consumer_slice_11_1, @consumer_slice_11_2, @consumer_slice_11_3]
+        }
+        schedule.collective_transfer @transfer_11 {
+          type = "one_to_many",
+          from = @bind_src_11,
+          to = @bind_dst_11
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      scf.yield
+    } {routing_memo = "col"}
     return
   }
 }
+
+=== Final Module with dfschedule ===
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
   func.func @main() {
     %c3_i32 = arith.constant 3 : i32
     %c2_i32 = arith.constant 2 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    %0 = routing.routingcreatedummytensor {dim = 2 : i64, shape = [10, 20]} -> i32
-    %1 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
-    %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = routinghw.ioshimtilecreate {IOID = 0 : i32, channelused = 0 : i32, col = 0 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
-      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 3 : i32} -> i32
-      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 3 : i32} -> i32
-      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 3 : i32} -> i32
-      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 3 : i32} -> i32
-      %17 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "NONE", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %18 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %20 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
-    }
-    %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = routinghw.ioshimtilecreate {IOID = 1 : i32, channelused = 0 : i32, col = 1 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
-      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 4 : i32} -> i32
-      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 4 : i32} -> i32
-      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 4 : i32} -> i32
-      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 4 : i32} -> i32
-      %17 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "NONE", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %18 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %20 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
-    }
-    %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = routinghw.ioshimtilecreate {IOID = 2 : i32, channelused = 0 : i32, col = 2 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
-      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 5 : i32} -> i32
-      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 5 : i32} -> i32
-      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 5 : i32} -> i32
-      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 5 : i32} -> i32
-      %17 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "NONE", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %18 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %20 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
-    }
-    %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %1, %arg0 : i32, i32 -> i32
-      %12 = routinghw.ioshimtilecreate {IOID = 3 : i32, channelused = 0 : i32, col = 3 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
-      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 6 : i32} -> i32
-      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 6 : i32} -> i32
-      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 6 : i32} -> i32
-      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 6 : i32} -> i32
-      %17 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "NONE", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %18 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %20 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
-    }
-    %6 = routing.partitiontensor tensor = %0 : i32 {hw_axis_owner = "row", replicate_on = "col", single_tile_owner = "", splitdim = 0 : i32, splitnum = 4 : i32} -> i32
-    %7 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = routinghw.ioshimtilecreate {IOID = 4 : i32, channelused = 0 : i32, col = 4 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
-      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 3 : i32} -> i32
-      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 3 : i32} -> i32
-      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 3 : i32} -> i32
-      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 3 : i32} -> i32
-      %17 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %18 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %20 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %22 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
-      %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-    }
-    %8 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = routinghw.ioshimtilecreate {IOID = 5 : i32, channelused = 0 : i32, col = 5 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
-      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 4 : i32} -> i32
-      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 4 : i32} -> i32
-      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 4 : i32} -> i32
-      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 4 : i32} -> i32
-      %17 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %18 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %20 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %22 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
-      %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-    }
-    %9 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = routinghw.ioshimtilecreate {IOID = 6 : i32, channelused = 0 : i32, col = 6 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
-      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 5 : i32} -> i32
-      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 5 : i32} -> i32
-      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 5 : i32} -> i32
-      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 5 : i32} -> i32
-      %17 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %18 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %20 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %22 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
-      %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-    }
-    %10 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
-    ^bb0(%arg0: i32):
-      %11 = routing.routingextract_data %6, %arg0 : i32, i32 -> i32
-      %12 = routinghw.ioshimtilecreate {IOID = 7 : i32, channelused = 0 : i32, col = 7 : i32, comments = "shim_dma", dmadirection = 0 : i32, row = 0 : i32} -> i32
-      %13 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 6 : i32} -> i32
-      %14 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 6 : i32} -> i32
-      %15 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 6 : i32} -> i32
-      %16 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 6 : i32} -> i32
-      %17 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %18 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %19 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %20 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "EAST", masterportidx = 0} : i32
-      %22 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-      %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "NONE", masterportidx = 0} : i32
-      %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "WEST", slaveportidx = 0, masterportdirection = "DMA", masterportidx = 2} : i32
-    }
+    %0 = schedule.declare_data tensor<16x16xf32> -> tensor<16x16xf32>
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_0{tiles = [[0, 3], [1, 3], [2, 3], [3, 3]]}
+        schedule.resource_group @group_dst_0{tiles = [[3, 0]]}
+        %extracted_slice = tensor.extract_slice %1[0, 0] [4, 16] [1, 1] {tag = "partitionslice0"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %extracted_slice[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %extracted_slice[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %extracted_slice[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_3 = tensor.extract_slice %extracted_slice[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %6 = schedule.data_slice @producer_slice_0_0 wrap %extracted_slice_0 : tensor<1x16xf32>
+        %7 = schedule.data_slice @producer_slice_0_1 wrap %extracted_slice_1 : tensor<1x16xf32>
+        %8 = schedule.data_slice @producer_slice_0_2 wrap %extracted_slice_2 : tensor<1x16xf32>
+        %9 = schedule.data_slice @producer_slice_0_3 wrap %extracted_slice_3 : tensor<1x16xf32>
+        schedule.bind_group @bind_src_0 {
+          target_group = @group_src_0,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+          ,slice_symbols = [@producer_slice_0_0, @producer_slice_0_1, @producer_slice_0_2, @producer_slice_0_3]
+        }
+        schedule.bind @bind_dst_0 {
+          target = @group_dst_0,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+        }
+        schedule.collective_transfer @transfer_0 {
+          type = "many_to_one",
+          from = @bind_src_0,
+          to = @bind_dst_0
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_1{tiles = [[0, 4], [1, 4], [2, 4], [3, 4]]}
+        schedule.resource_group @group_dst_1{tiles = [[3, 0]]}
+        %extracted_slice = tensor.extract_slice %1[4, 0] [4, 16] [1, 1] {tag = "partitionslice1"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %extracted_slice[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %extracted_slice[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %extracted_slice[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_3 = tensor.extract_slice %extracted_slice[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %6 = schedule.data_slice @producer_slice_1_0 wrap %extracted_slice_0 : tensor<1x16xf32>
+        %7 = schedule.data_slice @producer_slice_1_1 wrap %extracted_slice_1 : tensor<1x16xf32>
+        %8 = schedule.data_slice @producer_slice_1_2 wrap %extracted_slice_2 : tensor<1x16xf32>
+        %9 = schedule.data_slice @producer_slice_1_3 wrap %extracted_slice_3 : tensor<1x16xf32>
+        schedule.bind_group @bind_src_1 {
+          target_group = @group_src_1,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+          ,slice_symbols = [@producer_slice_1_0, @producer_slice_1_1, @producer_slice_1_2, @producer_slice_1_3]
+        }
+        schedule.bind @bind_dst_1 {
+          target = @group_dst_1,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = S2MM>
+        }
+        schedule.collective_transfer @transfer_1 {
+          type = "many_to_one",
+          from = @bind_src_1,
+          to = @bind_dst_1
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_2{tiles = [[0, 5], [1, 5], [2, 5], [3, 5]]}
+        schedule.resource_group @group_dst_2{tiles = [[2, 0]]}
+        %extracted_slice = tensor.extract_slice %1[8, 0] [4, 16] [1, 1] {tag = "partitionslice2"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %extracted_slice[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %extracted_slice[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %extracted_slice[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_3 = tensor.extract_slice %extracted_slice[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %6 = schedule.data_slice @producer_slice_2_0 wrap %extracted_slice_0 : tensor<1x16xf32>
+        %7 = schedule.data_slice @producer_slice_2_1 wrap %extracted_slice_1 : tensor<1x16xf32>
+        %8 = schedule.data_slice @producer_slice_2_2 wrap %extracted_slice_2 : tensor<1x16xf32>
+        %9 = schedule.data_slice @producer_slice_2_3 wrap %extracted_slice_3 : tensor<1x16xf32>
+        schedule.bind_group @bind_src_2 {
+          target_group = @group_src_2,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+          ,slice_symbols = [@producer_slice_2_0, @producer_slice_2_1, @producer_slice_2_2, @producer_slice_2_3]
+        }
+        schedule.bind @bind_dst_2 {
+          target = @group_dst_2,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+        }
+        schedule.collective_transfer @transfer_2 {
+          type = "many_to_one",
+          from = @bind_src_2,
+          to = @bind_dst_2
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_3{tiles = [[0, 6], [1, 6], [2, 6], [3, 6]]}
+        schedule.resource_group @group_dst_3{tiles = [[2, 0]]}
+        %extracted_slice = tensor.extract_slice %1[12, 0] [4, 16] [1, 1] {tag = "partitionslice3"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %extracted_slice_0 = tensor.extract_slice %extracted_slice[0, 0] [1, 16] [1, 1] {tag = "producer0"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_1 = tensor.extract_slice %extracted_slice[1, 0] [1, 16] [1, 1] {tag = "producer1"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_2 = tensor.extract_slice %extracted_slice[2, 0] [1, 16] [1, 1] {tag = "producer2"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %extracted_slice_3 = tensor.extract_slice %extracted_slice[3, 0] [1, 16] [1, 1] {tag = "producer3"} : tensor<4x16xf32> to tensor<1x16xf32>
+        %6 = schedule.data_slice @producer_slice_3_0 wrap %extracted_slice_0 : tensor<1x16xf32>
+        %7 = schedule.data_slice @producer_slice_3_1 wrap %extracted_slice_1 : tensor<1x16xf32>
+        %8 = schedule.data_slice @producer_slice_3_2 wrap %extracted_slice_2 : tensor<1x16xf32>
+        %9 = schedule.data_slice @producer_slice_3_3 wrap %extracted_slice_3 : tensor<1x16xf32>
+        schedule.bind_group @bind_src_3 {
+          target_group = @group_src_3,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+          ,slice_symbols = [@producer_slice_3_0, @producer_slice_3_1, @producer_slice_3_2, @producer_slice_3_3]
+        }
+        schedule.bind @bind_dst_3 {
+          target = @group_dst_3,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = S2MM>
+        }
+        schedule.collective_transfer @transfer_3 {
+          type = "many_to_one",
+          from = @bind_src_3,
+          to = @bind_dst_3
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      scf.yield
+    } {routing_memo = "row"}
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "row",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %2 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_4{tiles = [[2, 0]]}
+        schedule.resource_group @group_dst_4{tiles = [[0, 3], [1, 3], [2, 3], [3, 3]]}
+        %extracted_slice = tensor.extract_slice %1[0, 0] [4, 16] [1, 1] {tag = "partitionslice0"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %6 = schedule.data_slice @consumer_slice_4_0 wrap %extracted_slice : tensor<4x16xf32>
+        %7 = schedule.data_slice @consumer_slice_4_1 wrap %extracted_slice : tensor<4x16xf32>
+        %8 = schedule.data_slice @consumer_slice_4_2 wrap %extracted_slice : tensor<4x16xf32>
+        %9 = schedule.data_slice @consumer_slice_4_3 wrap %extracted_slice : tensor<4x16xf32>
+        schedule.bind @bind_src_4 {
+          target = @group_src_4,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_4 {
+          target_group = @group_dst_4,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_4_0, @consumer_slice_4_1, @consumer_slice_4_2, @consumer_slice_4_3]
+        }
+        schedule.collective_transfer @transfer_4 {
+          type = "one_to_many",
+          from = @bind_src_4,
+          to = @bind_dst_4
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %3 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_5{tiles = [[2, 0]]}
+        schedule.resource_group @group_dst_5{tiles = [[0, 4], [1, 4], [2, 4], [3, 4]]}
+        %extracted_slice = tensor.extract_slice %1[4, 0] [4, 16] [1, 1] {tag = "partitionslice1"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %6 = schedule.data_slice @consumer_slice_5_0 wrap %extracted_slice : tensor<4x16xf32>
+        %7 = schedule.data_slice @consumer_slice_5_1 wrap %extracted_slice : tensor<4x16xf32>
+        %8 = schedule.data_slice @consumer_slice_5_2 wrap %extracted_slice : tensor<4x16xf32>
+        %9 = schedule.data_slice @consumer_slice_5_3 wrap %extracted_slice : tensor<4x16xf32>
+        schedule.bind @bind_src_5 {
+          target = @group_src_5,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_5 {
+          target_group = @group_dst_5,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_5_0, @consumer_slice_5_1, @consumer_slice_5_2, @consumer_slice_5_3]
+        }
+        schedule.collective_transfer @transfer_5 {
+          type = "one_to_many",
+          from = @bind_src_5,
+          to = @bind_dst_5
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_6{tiles = [[3, 0]]}
+        schedule.resource_group @group_dst_6{tiles = [[0, 5], [1, 5], [2, 5], [3, 5]]}
+        %extracted_slice = tensor.extract_slice %1[8, 0] [4, 16] [1, 1] {tag = "partitionslice2"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %6 = schedule.data_slice @consumer_slice_6_0 wrap %extracted_slice : tensor<4x16xf32>
+        %7 = schedule.data_slice @consumer_slice_6_1 wrap %extracted_slice : tensor<4x16xf32>
+        %8 = schedule.data_slice @consumer_slice_6_2 wrap %extracted_slice : tensor<4x16xf32>
+        %9 = schedule.data_slice @consumer_slice_6_3 wrap %extracted_slice : tensor<4x16xf32>
+        schedule.bind @bind_src_6 {
+          target = @group_src_6,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_6 {
+          target_group = @group_dst_6,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_6_0, @consumer_slice_6_1, @consumer_slice_6_2, @consumer_slice_6_3]
+        }
+        schedule.collective_transfer @transfer_6 {
+          type = "one_to_many",
+          from = @bind_src_6,
+          to = @bind_dst_6
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_7{tiles = [[3, 0]]}
+        schedule.resource_group @group_dst_7{tiles = [[0, 6], [1, 6], [2, 6], [3, 6]]}
+        %extracted_slice = tensor.extract_slice %1[12, 0] [4, 16] [1, 1] {tag = "partitionslice3"} : tensor<16x16xf32> to tensor<4x16xf32>
+        %6 = schedule.data_slice @consumer_slice_7_0 wrap %extracted_slice : tensor<4x16xf32>
+        %7 = schedule.data_slice @consumer_slice_7_1 wrap %extracted_slice : tensor<4x16xf32>
+        %8 = schedule.data_slice @consumer_slice_7_2 wrap %extracted_slice : tensor<4x16xf32>
+        %9 = schedule.data_slice @consumer_slice_7_3 wrap %extracted_slice : tensor<4x16xf32>
+        schedule.bind @bind_src_7 {
+          target = @group_src_7,
+          view = %extracted_slice : tensor<4x16xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_7 {
+          target_group = @group_dst_7,
+          view = %extracted_slice : tensor<4x16xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_7_0, @consumer_slice_7_1, @consumer_slice_7_2, @consumer_slice_7_3]
+        }
+        schedule.collective_transfer @transfer_7 {
+          type = "one_to_many",
+          from = @bind_src_7,
+          to = @bind_dst_7
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      scf.yield
+    } {routing_memo = "row"}
+    scf.execute_region {
+      %1 = routing.partitiontensor tensor = %0 : tensor<16x16xf32> {
+          splitnum = 4,
+          splitdim = 0,
+          hw_axis_owner = "col",
+          replicate_on = "col",
+          single_tile_owner = ""
+     } -> tensor<16x16xf32>
+      %2 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_8{tiles = [[6, 0]]}
+        schedule.resource_group @group_dst_8{tiles = [[0, 3], [0, 4], [0, 5], [0, 6]]}
+        %extracted_slice = tensor.extract_slice %1[0, 0] [16, 4] [1, 1] {tag = "partitionslice0"} : tensor<16x16xf32> to tensor<16x4xf32>
+        %6 = schedule.data_slice @consumer_slice_8_0 wrap %extracted_slice : tensor<16x4xf32>
+        %7 = schedule.data_slice @consumer_slice_8_1 wrap %extracted_slice : tensor<16x4xf32>
+        %8 = schedule.data_slice @consumer_slice_8_2 wrap %extracted_slice : tensor<16x4xf32>
+        %9 = schedule.data_slice @consumer_slice_8_3 wrap %extracted_slice : tensor<16x4xf32>
+        schedule.bind @bind_src_8 {
+          target = @group_src_8,
+          view = %extracted_slice : tensor<16x4xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_8 {
+          target_group = @group_dst_8,
+          view = %extracted_slice : tensor<16x4xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_8_0, @consumer_slice_8_1, @consumer_slice_8_2, @consumer_slice_8_3]
+        }
+        schedule.collective_transfer @transfer_8 {
+          type = "one_to_many",
+          from = @bind_src_8,
+          to = @bind_dst_8
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %3 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c1_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_9{tiles = [[6, 0]]}
+        schedule.resource_group @group_dst_9{tiles = [[1, 3], [1, 4], [1, 5], [1, 6]]}
+        %extracted_slice = tensor.extract_slice %1[0, 4] [16, 4] [1, 1] {tag = "partitionslice1"} : tensor<16x16xf32> to tensor<16x4xf32>
+        %6 = schedule.data_slice @consumer_slice_9_0 wrap %extracted_slice : tensor<16x4xf32>
+        %7 = schedule.data_slice @consumer_slice_9_1 wrap %extracted_slice : tensor<16x4xf32>
+        %8 = schedule.data_slice @consumer_slice_9_2 wrap %extracted_slice : tensor<16x4xf32>
+        %9 = schedule.data_slice @consumer_slice_9_3 wrap %extracted_slice : tensor<16x4xf32>
+        schedule.bind @bind_src_9 {
+          target = @group_src_9,
+          view = %extracted_slice : tensor<16x4xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_9 {
+          target_group = @group_dst_9,
+          view = %extracted_slice : tensor<16x4xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_9_0, @consumer_slice_9_1, @consumer_slice_9_2, @consumer_slice_9_3]
+        }
+        schedule.collective_transfer @transfer_9 {
+          type = "one_to_many",
+          from = @bind_src_9,
+          to = @bind_dst_9
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %4 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c2_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_10{tiles = [[7, 0]]}
+        schedule.resource_group @group_dst_10{tiles = [[2, 3], [2, 4], [2, 5], [2, 6]]}
+        %extracted_slice = tensor.extract_slice %1[0, 8] [16, 4] [1, 1] {tag = "partitionslice2"} : tensor<16x16xf32> to tensor<16x4xf32>
+        %6 = schedule.data_slice @consumer_slice_10_0 wrap %extracted_slice : tensor<16x4xf32>
+        %7 = schedule.data_slice @consumer_slice_10_1 wrap %extracted_slice : tensor<16x4xf32>
+        %8 = schedule.data_slice @consumer_slice_10_2 wrap %extracted_slice : tensor<16x4xf32>
+        %9 = schedule.data_slice @consumer_slice_10_3 wrap %extracted_slice : tensor<16x4xf32>
+        schedule.bind @bind_src_10 {
+          target = @group_src_10,
+          view = %extracted_slice : tensor<16x4xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [0], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_10 {
+          target_group = @group_dst_10,
+          view = %extracted_slice : tensor<16x4xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_10_0, @consumer_slice_10_1, @consumer_slice_10_2, @consumer_slice_10_3]
+        }
+        schedule.collective_transfer @transfer_10 {
+          type = "one_to_many",
+          from = @bind_src_10,
+          to = @bind_dst_10
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      %5 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c3_i32 : i32) -> i32{
+      ^bb0(%arg0: i32):
+        schedule.resource_group @group_src_11{tiles = [[7, 0]]}
+        schedule.resource_group @group_dst_11{tiles = [[3, 3], [3, 4], [3, 5], [3, 6]]}
+        %extracted_slice = tensor.extract_slice %1[0, 12] [16, 4] [1, 1] {tag = "partitionslice3"} : tensor<16x16xf32> to tensor<16x4xf32>
+        %6 = schedule.data_slice @consumer_slice_11_0 wrap %extracted_slice : tensor<16x4xf32>
+        %7 = schedule.data_slice @consumer_slice_11_1 wrap %extracted_slice : tensor<16x4xf32>
+        %8 = schedule.data_slice @consumer_slice_11_2 wrap %extracted_slice : tensor<16x4xf32>
+        %9 = schedule.data_slice @consumer_slice_11_3 wrap %extracted_slice : tensor<16x4xf32>
+        schedule.bind @bind_src_11 {
+          target = @group_src_11,
+          view = %extracted_slice : tensor<16x4xf32>,
+          slice = "root",
+          dma = #schedule.DMA<channels = [1], direction = MM2S>
+        }
+        schedule.bind_group @bind_dst_11 {
+          target_group = @group_dst_11,
+          view = %extracted_slice : tensor<16x4xf32>,
+          distribution = "linear",
+          dma = #schedule.DMA<channels = [0], direction = S2MM>
+          ,slice_symbols = [@consumer_slice_11_0, @consumer_slice_11_1, @consumer_slice_11_2, @consumer_slice_11_3]
+        }
+        schedule.collective_transfer @transfer_11 {
+          type = "one_to_many",
+          from = @bind_src_11,
+          to = @bind_dst_11
+          ,ordering = "sequential"
+          ,base_packet_id = 0
+        }
+      }
+      scf.yield
+    } {routing_memo = "col"}
     return
   }
 }
@@ -738,8 +1830,10 @@ Found an scf.for loop, attempting to unroll by factor 4...
 
 Found an scf.for loop, attempting to unroll by factor 4...
 
+Found an scf.for loop, attempting to unroll by factor 4...
+
 slice data round_idx=0
-col =4 row=4 tensor_x=10 tensor_y=20
+col =4 row=4 tensor_x=16 tensor_y=16
 split_axis =row hw_axis_owner=row
 replicate_on=col single_tile_owner=
  same row  list row = 3col = 0
@@ -747,7 +1841,7 @@ replicate_on=col single_tile_owner=
  same row  list row = 3col = 2
  same row  list row = 3col = 3
 slice data round_idx=1
-col =4 row=4 tensor_x=10 tensor_y=20
+col =4 row=4 tensor_x=16 tensor_y=16
 split_axis =row hw_axis_owner=row
 replicate_on=col single_tile_owner=
  same row  list row = 4col = 0
@@ -755,7 +1849,7 @@ replicate_on=col single_tile_owner=
  same row  list row = 4col = 2
  same row  list row = 4col = 3
 slice data round_idx=2
-col =4 row=4 tensor_x=10 tensor_y=20
+col =4 row=4 tensor_x=16 tensor_y=16
 split_axis =row hw_axis_owner=row
 replicate_on=col single_tile_owner=
  same row  list row = 5col = 0
@@ -763,7 +1857,7 @@ replicate_on=col single_tile_owner=
  same row  list row = 5col = 2
  same row  list row = 5col = 3
 slice data round_idx=3
-col =4 row=4 tensor_x=10 tensor_y=20
+col =4 row=4 tensor_x=16 tensor_y=16
 split_axis =row hw_axis_owner=row
 replicate_on=col single_tile_owner=
  same row  list row = 6col = 0
@@ -771,7 +1865,7 @@ replicate_on=col single_tile_owner=
  same row  list row = 6col = 2
  same row  list row = 6col = 3
 slice data round_idx=0
-col =4 row=4 tensor_x=10 tensor_y=20
+col =4 row=4 tensor_x=16 tensor_y=16
 split_axis =row hw_axis_owner=row
 replicate_on=col single_tile_owner=
  same row  list row = 3col = 0
@@ -779,7 +1873,7 @@ replicate_on=col single_tile_owner=
  same row  list row = 3col = 2
  same row  list row = 3col = 3
 slice data round_idx=1
-col =4 row=4 tensor_x=10 tensor_y=20
+col =4 row=4 tensor_x=16 tensor_y=16
 split_axis =row hw_axis_owner=row
 replicate_on=col single_tile_owner=
  same row  list row = 4col = 0
@@ -787,7 +1881,7 @@ replicate_on=col single_tile_owner=
  same row  list row = 4col = 2
  same row  list row = 4col = 3
 slice data round_idx=2
-col =4 row=4 tensor_x=10 tensor_y=20
+col =4 row=4 tensor_x=16 tensor_y=16
 split_axis =row hw_axis_owner=row
 replicate_on=col single_tile_owner=
  same row  list row = 5col = 0
@@ -795,19 +1889,42 @@ replicate_on=col single_tile_owner=
  same row  list row = 5col = 2
  same row  list row = 5col = 3
 slice data round_idx=3
-col =4 row=4 tensor_x=10 tensor_y=20
+col =4 row=4 tensor_x=16 tensor_y=16
 split_axis =row hw_axis_owner=row
 replicate_on=col single_tile_owner=
  same row  list row = 6col = 0
  same row  list row = 6col = 1
  same row  list row = 6col = 2
  same row  list row = 6col = 3
-----------module1.dump---------
-before xxxx---0----
-before xxxx---0----
-before xxxx---0----
-before xxxx---0----
-before xxxx---0----
-before xxxx---0----
-before xxxx---0----
-before xxxx---0----
+slice data round_idx=0
+col =4 row=4 tensor_x=16 tensor_y=16
+split_axis =col hw_axis_owner=col
+replicate_on=col single_tile_owner=
+same col list row = 3col = 0
+same col list row = 4col = 0
+same col list row = 5col = 0
+same col list row = 6col = 0
+slice data round_idx=1
+col =4 row=4 tensor_x=16 tensor_y=16
+split_axis =col hw_axis_owner=col
+replicate_on=col single_tile_owner=
+same col list row = 3col = 1
+same col list row = 4col = 1
+same col list row = 5col = 1
+same col list row = 6col = 1
+slice data round_idx=2
+col =4 row=4 tensor_x=16 tensor_y=16
+split_axis =col hw_axis_owner=col
+replicate_on=col single_tile_owner=
+same col list row = 3col = 2
+same col list row = 4col = 2
+same col list row = 5col = 2
+same col list row = 6col = 2
+slice data round_idx=3
+col =4 row=4 tensor_x=16 tensor_y=16
+split_axis =col hw_axis_owner=col
+replicate_on=col single_tile_owner=
+same col list row = 3col = 3
+same col list row = 4col = 3
+same col list row = 5col = 3
+same col list row = 6col = 3

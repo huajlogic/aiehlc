@@ -549,10 +549,10 @@ private:
     LLVMTypeConverter& typeconverter;
 };
 
-//createdummytensor
-struct createdummytensorconvert : public ConversionPattern {
-    explicit createdummytensorconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
-        ConversionPattern(routing::createdummytensor::getOperationName(),1, ctx), typeconverter(converter) {
+//createscheduletensor
+struct createscheduletensorconvert : public ConversionPattern {
+    explicit createscheduletensorconvert(MLIRContext * ctx, LLVMTypeConverter &converter):
+        ConversionPattern(routing::createscheduletensor::getOperationName(),1, ctx), typeconverter(converter) {
 
         }
     LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {    
@@ -914,7 +914,7 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
         int round_idx = 0;
         // get all the op
         routing::createhwmesh createhwmesh;
-        routing::createdummytensor createdummytensor;
+        routing::createscheduletensor createscheduletensor;
         routing::partitiontensor partitiontensor;
         routing::partitionmesh partitionmesh;
         routing::extract_data extract_data;
@@ -957,14 +957,14 @@ struct RoutingmovedatabyioConvert : public ConversionPattern {
             llvm::outs() << " createhwmesh not found return" << "\n";
             return failure();
         }
-        if (!(createdummytensor = partitiontensor->getOperands()[0].getDefiningOp<routing::createdummytensor>())) {
-            llvm::outs() << " createdummytensor not found return" << "\n";
+        if (!(createscheduletensor = partitiontensor->getOperands()[0].getDefiningOp<routing::createscheduletensor>())) {
+            llvm::outs() << " createscheduletensor not found return" << "\n";
             return failure();
         }
 
         int col = createhwmesh.getCol();
         int row = createhwmesh.getRow();
-        auto shape = createdummytensor.getShape();
+        auto shape = createscheduletensor.getShape();
 
         int tensor_x = shape[0].cast<mlir::IntegerAttr>().getInt();
         int tensor_y = shape[1].cast<mlir::IntegerAttr>().getInt();
@@ -1086,7 +1086,7 @@ void RoutingLowerPass::runOnOperation() {
     target.addLegalOp<routing::RoutingCreate>();
     target.addLegalOp<routing::YieldOp>();
     //target.addLegalOp<routing::createhwmesh>();
-    //target.addLegalOp<routing::createdummytensor>();
+    //target.addLegalOp<routing::createscheduletensor>();
     target.addIllegalOp<arith::IndexCastOp>();
     //target.addLegalOp<routinghw::TileArrayHandleCreate>();
     LLVMTypeConverter typeconverter(&ctx);
@@ -1126,7 +1126,7 @@ void RoutingLowerPass::runOnOperation() {
     
 
     patternsGlobal.add<createhwmeshconvert>(&ctx, typeconverter);
-    patternsGlobal.add<createdummytensorconvert>(&ctx, typeconverter);
+    patternsGlobal.add<createscheduletensorconvert>(&ctx, typeconverter);
     //rewrite the ops inside scf::exe
     ///*
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));

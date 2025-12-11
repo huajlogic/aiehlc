@@ -2,8 +2,8 @@
 * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
-#ifndef __DMAPHOP_MANAGER__
-#define __DMAPHOP_MANAGER__
+#ifndef __DFSCHEBLUEPRINT_MANAGER__
+#define __DFSCHEBLUEPRINT_MANAGER__
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/SymbolTable.h"
@@ -21,12 +21,14 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/Operation.h"
@@ -46,34 +48,31 @@
 //fieldparser
 #include "mlir/IR/DialectImplementation.h"
 
-#include "dmaphopdialect.h.inc"
+#include "dfscheblueprintdialect.h.inc"
+
+#include "dfscheblueprintenums.h.inc"
 
 using namespace mlir;
-using namespace dmaphop;
-
-#define GET_ATTRDEF_CLASSES
-#include "dmaphopattr.h.inc"
-#undef GET_ATTRDEF_CLASSES
+using namespace dfscheblueprint;
 
 #define GET_TYPEDEF_CLASSES
-#include "dmaphoptype.h.inc"
+#include "dfscheblueprinttype.h.inc"
 #undef GET_TYPEDEF_CLASSES
 
+#define GET_ATTRDEF_CLASSES
+#include "dfscheblueprintattr.h.inc"
+#undef GET_ATTRDEF_CLASSES
+
 #define GET_OP_CLASSES
-#define GET_OP_DECLS
-#include "dmaphopop.h.inc"
-#undef GET_OP_DECLS
-#undef GET_OP_CLASSEST
+#include "dfscheblueprintop.h.inc"
+#undef GET_OP_CLASSES
 
-//#include "../dmap/dmapmanager.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "routingmanager.h"
-
-class dmaphopmanager{
+class dfscheblueprintmanager{
 public:
-    dmaphopmanager(){};
-    ModuleOp ops_test(MLIRContext* ctx,int totalN=2) ;
-    void createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx,SymbolTable& symTable);
+    dfscheblueprintmanager(){};
+    ModuleOp ops_test(MLIRContext* ctx) ;
+    void createBlueprintExample(OpBuilder& builder, MLIRContext* ctx);
     static void loaddialect(MLIRContext* ctx);
 };
-#endif//__DMAPHOP_MANAGER__
+#endif//__DFSCHEBLUEPRINT_MANAGER__
+

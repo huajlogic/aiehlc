@@ -4,7 +4,7 @@
 ###############################################################################
 
 cmake_minimum_required(VERSION 3.5)
-project(tablegen)
+project(dfscheblueprint_unittest)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
 
 # Set the C++ standard to C++17
@@ -68,7 +68,7 @@ include_directories(../../../routing/)
 #file(GLOB PARSER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../Parser/*.cpp)
 message("Parser src Directory: ${PARSER_FILES}")
 
-set(SOURCE_FILES ./test.cpp ../dmaphopmanager.cpp ../../../routing/routingmanager.cpp)
+set(SOURCE_FILES ./test.cpp ../dfscheblueprintmanager.cpp ../../../routing/routingmanager.cpp)
 
 add_executable(test ${SOURCE_FILES})
 
@@ -78,13 +78,20 @@ foreach(dir IN LISTS MLIR_INCLUDE_DIRS)
 endforeach()
 
 add_custom_target(
-	aiedialectteablegen ALL
-  COMMAND ${CMAKE_COMMAND} -E echo "Running custom script..."
+	dfscheblueprintdialectteablegen ALL
+  COMMAND ${CMAKE_COMMAND} -E echo "Running custom script to generate dfscheblueprint dialect..."
 	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
-  COMMENT "Executing custom script before building AIE Dialect from tablegen MLIR_INC_ARGS is  ${MLIR_INC_ARGS}  LLVM_ROOT_BIN_ARG is ${LLVM_ROOT_BIN_ARG}"
+  COMMENT "Executing custom script before building dfscheblueprint Dialect from tablegen MLIR_INC_ARGS is  ${MLIR_INC_ARGS}  LLVM_ROOT_BIN_ARG is ${LLVM_ROOT_BIN_ARG}"
 )
 
-add_dependencies(test aiedialectteablegen)
+add_custom_target(
+	routingdialectteablegen ALL
+  COMMAND ${CMAKE_COMMAND} -E echo "Running custom script to generate routing dialect..."
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../../routing/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMENT "Executing custom script before building routing Dialect from tablegen MLIR_INC_ARGS is  ${MLIR_INC_ARGS}  LLVM_ROOT_BIN_ARG is ${LLVM_ROOT_BIN_ARG}"
+)
+
+add_dependencies(test dfscheblueprintdialectteablegen routingdialectteablegen)
 
 set(LLVM_PATH /scratch/staff/huaj/mlirdocker/)
 set(LLVM_LIBRARY_DIR ${LLVM_PATH}/llvm-project/build/lib/)
@@ -140,6 +147,8 @@ target_link_libraries(test PUBLIC
       MLIRTransformUtils
       MLIRLinalgTransformOps
       MLIRTransformDialectTransforms
+      MLIRSCFDialect
+      MLIRArithDialect
       #tiling logic end
     LLVMPasses
     #LLVMNVPTXCodeGen
@@ -149,3 +158,4 @@ target_link_libraries(test PUBLIC
     dl
 )
 target_link_options(test PRIVATE ${LLVM_LDFLAGS})
+

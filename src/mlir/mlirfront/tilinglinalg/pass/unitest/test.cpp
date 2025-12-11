@@ -10,10 +10,15 @@
 #include "../passroutingtodmap/routingtodmap.h"
 #include "../passdmaptodmaphop/dmaptodmaphop.h"
 #include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
-#include "../passdmaphoptodfschedule/passdmaphoptodfschedule.h"
+#include "../passblueprinttoschedule/passblueprinttoschedule.h"
+#include "../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.h"
+#include "../passschedulecanonicalize/passschedulecanonicalize.h"
+#include "../passdfscheduletoapi/passdfscheduletoapi.h"
 #include "dmapmanager.h"
 #include "dmaphopmanager.h"
 #include "dfschedulemanager.h"
+#include "dfscheblueprintmanager.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "routingunrolling.h"
 #include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 //#include "llvm/IR/IRPrintingPasses.h"
@@ -22,6 +27,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 
@@ -797,15 +804,22 @@ void routingtodmap() {
 void routingtodfschedule() {
     MLIRContext ctx;
     
+    RoutingTopology rtopology("Gen2");
+    
     routingmanager mtest;
     dfschedulemanager dfscheduletest;
+    dfscheblueprintmanager dfscheblueprinttest;
     
     mtest.loaddialect(&ctx);
     dfscheduletest.loaddialect(&ctx);
+    dfscheblueprinttest.loaddialect(&ctx);
     ctx.getOrLoadDialect<arith::ArithDialect>();
     ctx.getOrLoadDialect<mlir::func::FuncDialect>();
     ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
     ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    ctx.getOrLoadDialect<mlir::tensor::TensorDialect>();
+    ctx.getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
+    ctx.getOrLoadDialect<mlir::emitc::EmitCDialect>();
     
     // Create test routing module
     auto module1 = mtest.ops_testNew(&ctx, 1);
@@ -817,14 +831,39 @@ void routingtodfschedule() {
     mlir::PassManager pm(&ctx);
     mlir::PrintIRPassOptions options;
     
-    // Unroll routing operations
+    // Stage 1: Unroll routing operations
     options.label = "After RoutingUnrollingLowerPass:";
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
     pm.addPass(mlir::createPrintIRPass(options));
+
+    // Stage 2: Convert routing to dmap
+    pm.addPass(std::make_unique<RoutingToDmapPass>(rtopology));
+    options.label = "After RoutingToDmapPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
     
-    // Convert routing to dfschedule
-    options.label = "After DmaphopTodfschedulePass:";
-    pm.addPass(std::make_unique<DmaphopTodfschedulePass>());
+    // Stage 3: Convert dmap to dmaphop
+    pm.addPass(std::make_unique<DmapToDmaphopPass>(rtopology));
+    options.label = "After DmapToDmaphopPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    
+    // Stage 4: Convert dmaphop to dfscheblueprint
+    pm.addPass(std::make_unique<DmaphopTodfscheblueprintPass>());
+    options.label = "After DmaphopTodfscheblueprintPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    
+    // Stage 5: Convert dfscheblueprint to dfschedule (final schedule IR)
+    pm.addPass(std::make_unique<mlir::BlueprintToSchedulePass>());
+    options.label = "After BlueprintToSchedulePass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    
+    // Stage 6: Canonicalize schedule - merge kernel loads, deduplicate tiles, consolidate IOs
+    pm.addPass(std::make_unique<mlir::ScheduleCanonicalizePass>());
+    options.label = "After ScheduleCanonicalizePass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    
+    // Stage 7: Convert dfschedule to API calls and EmitC
+    pm.addPass(std::make_unique<mlir::DfscheduleToApiPass>());
+    options.label = "After DfscheduleToApiPass:";
     pm.addPass(mlir::createPrintIRPass(options));
     
     // Run the pass pipeline
@@ -833,8 +872,15 @@ void routingtodfschedule() {
         return;
     }
     
-    std::cout << "\n=== Final Module with dfschedule ===" << std::endl;
+    std::cout << "\n=== Final Module with API calls ===" << std::endl;
     module1.dump();
+    
+    // Convert to C++ code
+    std::cout << "\n=== Generated C++ Code ===" << std::endl;
+    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    if (failed(result)) {
+        llvm::errs() << "Failed to translate MLIR to C++.\n";
+    }
     
     return;
 }

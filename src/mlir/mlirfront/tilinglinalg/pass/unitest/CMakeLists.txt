@@ -66,13 +66,18 @@ include_directories(../../routinghw/)
 include_directories(../)
 include_directories(../routingimplement/include/)
 include_directories(../passroutingtodmap/)
-include_directories(../passdmaphoptodfschedule/)
+include_directories(../passblueprinttoschedule/)
+include_directories(../passdmaphoptodfscheblueprint/)
+include_directories(../passschedulecanonicalize/)
+include_directories(../passdfscheduletoapi/)
 include_directories(../../dataflowmap/dmap/inc/)
 include_directories(../../dataflowmap/dmap/)
 include_directories(../../dataflowmap/dmaphop/inc/)
 include_directories(../../dataflowmap/dmaphop/)
 include_directories(../../dataflowmap/dfschedule/inc/)
 include_directories(../../dataflowmap/dfschedule/)
+include_directories(../../dataflowmap/dfscheblueprint/inc/)
+include_directories(../../dataflowmap/dfscheblueprint/)
 
 #file(GLOB PARSER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../Parser/*.cpp)
 message("Parser src Directory: ${PARSER_FILES}")
@@ -83,6 +88,7 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmap/dmapmanager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmaphop/dmaphopmanager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfschedule/dfschedulemanager.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfscheblueprint/dfscheblueprintmanager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinghwlower.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinglower.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingunrolling.cpp
@@ -91,7 +97,10 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passroutingtodmap/routingtodmap.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaptodmaphop/dmaptodmaphop.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptodfschedule/passdmaphoptodfschedule.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/passblueprinttoschedule.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passschedulecanonicalize/passschedulecanonicalize.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passdfscheduletoapi/passdfscheduletoapi.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingpath.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/hwresource.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/ResourceManager.cpp
@@ -110,6 +119,10 @@ add_custom_target(
   COMMAND ${CMAKE_COMMAND} -E echo "Running custom script..."
 	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../routing/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../routinghw/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmap/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmaphop/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfschedule/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfscheblueprint/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMENT "Executing custom script before building AIE Dialect from tablegen"
 )
 
