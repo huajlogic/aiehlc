@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -48,20 +49,38 @@ static std::string buildInitializerString(DenseElementsAttr denseAttr, Type elem
     initStream << "{";
     bool first = true;
     
-    if (elemType.isIntOrIndex()) {
-        for (auto val : denseAttr.getValues<llvm::APInt>()) {
+    if (elemType.isInteger(8)) {
+        for (auto val : denseAttr.getValues<int8_t>()) {
             if (!first) initStream << ", ";
             first = false;
-            initStream << val.getSExtValue();
+            initStream << static_cast<int>(val);
+        }
+    } else if (elemType.isInteger(16)) {
+        for (auto val : denseAttr.getValues<int16_t>()) {
+            if (!first) initStream << ", ";
+            first = false;
+            initStream << val;
+        }
+    } else if (elemType.isInteger(32)) {
+        for (auto val : denseAttr.getValues<int32_t>()) {
+            if (!first) initStream << ", ";
+            first = false;
+            initStream << val;
+        }
+    } else if (elemType.isInteger(64)) {
+        for (auto val : denseAttr.getValues<int64_t>()) {
+            if (!first) initStream << ", ";
+            first = false;
+            initStream << val;
         }
     } else if (elemType.isF32()) {
-        for (auto val : denseAttr.getValues<llvm::APFloat>()) {
+        for (auto val : denseAttr.getValues<APFloat>()) {
             if (!first) initStream << ", ";
             first = false;
             initStream << val.convertToFloat();
         }
     } else if (elemType.isF64()) {
-        for (auto val : denseAttr.getValues<llvm::APFloat>()) {
+        for (auto val : denseAttr.getValues<APFloat>()) {
             if (!first) initStream << ", ";
             first = false;
             initStream << val.convertToDouble();
@@ -71,167 +90,319 @@ static std::string buildInitializerString(DenseElementsAttr denseAttr, Type elem
     return initStream.str();
 }
 
-// Get EmitC pointer type for element type
-static Type getEmitCPtrType(MLIRContext *ctx, Type elemType) {
-    std::string typeStr = getEmitCTypeString(elemType);
-    return emitc::PointerType::get(emitc::OpaqueType::get(ctx, typeStr));
+static int64_t getElemSize(Type elemType) {
+    if (elemType.isInteger(8)) return 1;
+    if (elemType.isInteger(16)) return 2;
+    if (elemType.isInteger(32) || elemType.isF32()) return 4;
+    if (elemType.isInteger(64) || elemType.isF64()) return 8;
+    return 1;
 }
 
 //===----------------------------------------------------------------------===//
-// Pass Implementation - Using proper EmitC SSA values
+// Shared State for Conversion Patterns
 //===----------------------------------------------------------------------===//
 
-void DfscheduleToApiPass::runOnOperation() {
-    llvm::errs() << "=== DfscheduleToApiPass START ===\n";
-    
-    ModuleOp moduleOp = getOperation();
-    MLIRContext *ctx = moduleOp.getContext();
-    OpBuilder builder(ctx);
-    
+struct ConversionState {
+    DenseMap<Value, std::tuple<Value, int64_t, int64_t>> memAllocMap;
+    SmallVector<Value> allocatedMemList;
+    DenseMap<Operation*, std::string> arrayNameMap;
     int arrayIndex = 0;
     int partitionIndex = 0;
+};
+
+//===----------------------------------------------------------------------===//
+// Conversion Patterns using OpConversionPattern
+//===----------------------------------------------------------------------===//
+
+/// OpConversionPattern for arith.constant with DenseElementsAttr -> emitc.verbatim
+struct DenseConstantToEmitCPattern : public OpConversionPattern<arith::ConstantOp> {
+    ConversionState &state;
     
-    // Map to track memory allocations: source tensor Value -> (dstPtr SSA Value, byteSize, numElements)
-    DenseMap<Value, std::tuple<Value, int64_t, int64_t>> memAllocMap;
+    DenseConstantToEmitCPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : OpConversionPattern<arith::ConstantOp>(typeConverter, ctx, /*benefit=*/10), state(state) {}
     
-    // Map array name to global name for emitc.get_global
-    DenseMap<Operation*, std::string> arrayNameMap;
-    
-    // Collect all operations to process
-    SmallVector<Operation*> hostOps;
-    SmallVector<Operation*> launchHostOps;
-    SmallVector<Operation*> dsKernelReceiverOps;
-    SmallVector<Operation*> allDfscheduleOps;
-    SmallVector<Operation*> arithConstantDenseOps;
-    
-    moduleOp.walk([&](Operation *op) {
-        StringRef opName = op->getName().getStringRef();
+    LogicalResult matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto denseAttr = dyn_cast<DenseElementsAttr>(op.getValue());
+        if (!denseAttr) return failure();
         
-        if (opName == "dfschedule.host") {
-            hostOps.push_back(op);
-        } else if (opName == "dfschedule.launchhost") {
-            launchHostOps.push_back(op);
-        } else if (opName == "dfschedule.dskernel_receiver") {
-            dsKernelReceiverOps.push_back(op);
-        }
-        
-        // Collect all dfschedule and dfscheblueprint ops for later erasure
-        if (opName.starts_with("dfschedule.") || opName.starts_with("dfscheblueprint.") ||
-            opName.starts_with("routing.")) {
-            allDfscheduleOps.push_back(op);
-        }
-        
-        // Also collect arith.constant with dense attributes
-        if (auto constOp = dyn_cast<arith::ConstantOp>(op)) {
-            if (isa<DenseElementsAttr>(constOp.getValue())) {
-                arithConstantDenseOps.push_back(op);
-            }
-        }
-    });
-    
-    llvm::errs() << "[Pass] Found " << hostOps.size() << " host ops\n";
-    llvm::errs() << "[Pass] Found " << allDfscheduleOps.size() << " total dfschedule/dfscheblueprint/routing ops\n";
-    
-    //==========================================================================
-    // Phase 1: Generate EmitC code with proper SSA values
-    //==========================================================================
-    
-    // 1a. Generate struct definition and extern declarations at module scope
-    builder.setInsertionPointToStart(moduleOp.getBody());
-    
-    // PartitionTensor struct definition and helper functions
-    builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), builder.getStringAttr(
-        "/* PartitionTensor structure for memory management */\n"
-        "typedef struct {\n"
-        "    void* data;\n"
-        "    size_t size;\n"
-        "    size_t num_elements;\n"
-        "    int splitnum;\n"
-        "    int splitdim;\n"
-        "} PartitionTensor;\n\n"
-        "/* Helper function for PartitionTensor initialization */\n"
-        "static inline PartitionTensor __emitc_init_PartitionTensor(\n"
-        "    void* data, size_t size, size_t num_elements, int splitnum, int splitdim) {\n"
-        "    PartitionTensor pt = {data, size, num_elements, splitnum, splitdim};\n"
-        "    return pt;\n"
-        "}\n\n"
-        "/* Helper function for pointer arithmetic */\n"
-        "static inline void* __emitc_ptr_add(void* ptr, int offset) {\n"
-        "    return (void*)((char*)ptr + offset);\n"
-        "}\n\n"
-        "/* Helper function for 2D strided copy (non-contiguous slices) */\n"
-        "static inline void __emitc_strided_copy_2d(void* dst, void* src) {\n"
-        "    /* TODO: Implement strided copy based on actual dimensions */\n"
-        "    /* For now, this is a placeholder that should be specialized */\n"
-        "}"
-    ));
-    
-    // Create extern global for DevInst
-    auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
-    builder.create<emitc::GlobalOp>(moduleOp.getLoc(),
-        /*sym_name=*/"DevInst",
-        /*type=*/devInstType,
-        /*initial_value=*/Attribute{},
-        /*extern_specifier=*/true,
-        /*static_specifier=*/false,
-        /*const_specifier=*/false);
-    
-    // 1b. Convert arith.constant dense to emitc.global arrays
-    for (Operation *op : arithConstantDenseOps) {
-        auto constOp = cast<arith::ConstantOp>(op);
-        auto denseAttr = cast<DenseElementsAttr>(constOp.getValue());
         auto tensorType = dyn_cast<RankedTensorType>(denseAttr.getType());
-        if (!tensorType) continue;
+        if (!tensorType) return failure();
         
-        std::string arrayName = "g_data_array_" + std::to_string(arrayIndex++);
+        if (state.arrayNameMap.count(op.getOperation())) return failure();
+        
+        std::string arrayName = "g_data_array_" + std::to_string(state.arrayIndex++);
         Type elemType = tensorType.getElementType();
         std::string cTypeStr = getEmitCTypeString(elemType);
         std::string initStr = buildInitializerString(denseAttr, elemType);
         
-        // Create verbatim for the array with initializer (emitc.global doesn't support array init well)
         std::string verbatimCode = "static const " + cTypeStr + " " + arrayName +
             buildArrayDimString(tensorType.getShape()) + " = " + initStr + ";";
         
-        builder.setInsertionPointToStart(moduleOp.getBody());
-        builder.create<emitc::VerbatimOp>(op->getLoc(), builder.getStringAttr(verbatimCode));
+        auto moduleOp = op->getParentOfType<ModuleOp>();
+        if (!moduleOp) return failure();
         
-        // Store array name for later use
-        arrayNameMap[op] = arrayName;
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(moduleOp.getBody());
+        rewriter.create<emitc::VerbatimOp>(op.getLoc(), rewriter.getStringAttr(verbatimCode));
         
-        llvm::errs() << "[Pass] Created global array: " << arrayName << "\n";
+        state.arrayNameMap[op.getOperation()] = arrayName;
+        llvm::errs() << "[Pattern] Created global array: " << arrayName << "\n";
+        
+        rewriter.eraseOp(op);
+        return success();
     }
+};
+
+/// OpConversionPattern for tensor.extract_slice -> EmitC slice extraction
+struct ExtractSliceToEmitCPattern : public OpConversionPattern<tensor::ExtractSliceOp> {
+    ConversionState &state;
     
-    // 1c. Convert dfschedule.host to emitc.func with proper SSA
-    for (Operation *op : hostOps) {
+    ExtractSliceToEmitCPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : OpConversionPattern<tensor::ExtractSliceOp>(typeConverter, ctx), state(state) {}
+    
+    LogicalResult matchAndRewrite(tensor::ExtractSliceOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        auto ctx = rewriter.getContext();
+        
+        auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
+        auto srcType = dyn_cast<RankedTensorType>(op.getSource().getType());
+        if (!resultType || !srcType) return failure();
+        
+        Value srcTensor = op.getSource();
+        
+        if (!state.memAllocMap.count(srcTensor)) return failure();
+        
+        Value srcDataPtr = std::get<0>(state.memAllocMap[srcTensor]);
+        
+        auto offsets = op.getStaticOffsets();
+        auto sizes = op.getStaticSizes();
+        auto srcShape = srcType.getShape();
+        
+        Type elemType = resultType.getElementType();
+        int64_t elemSize = getElemSize(elemType);
+        
+        int64_t sliceElements = 1;
+        for (auto s : sizes) sliceElements *= s;
+        int64_t sliceByteSize = sliceElements * elemSize;
+        
+        int64_t byteOffset = 0;
+        int64_t stride = elemSize;
+        for (int64_t i = srcShape.size() - 1; i >= 0; --i) {
+            byteOffset += offsets[i] * stride;
+            stride *= srcShape[i];
+        }
+        
+        auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
+        auto i32Type = rewriter.getI32Type();
+        
+        Value slicePtr;
+        if (byteOffset == 0) {
+            slicePtr = srcDataPtr;
+        } else {
+            auto offsetConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
+                rewriter.getI32IntegerAttr(byteOffset));
+            auto sliceSizeConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
+                rewriter.getI32IntegerAttr(sliceByteSize));
+            
+            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc,
+                voidPtrType, "__emitc_extract_slice_contiguous",
+                nullptr, nullptr,
+                ValueRange{srcDataPtr, offsetConst.getResult(), sliceSizeConst.getResult()});
+            slicePtr = sliceOp.getResult(0);
+        }
+        
+        state.memAllocMap[op.getResult()] = std::make_tuple(slicePtr, sliceByteSize, sliceElements);
+        llvm::errs() << "[Pattern] Created slice (offset=" << byteOffset << " bytes)\n";
+        
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// ConversionPattern for dfscheblueprint.declare_data (generic by op name)
+struct DeclareDataPattern : public ConversionPattern {
+    ConversionState &state;
+    
+    DeclareDataPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : ConversionPattern(typeConverter, "dfscheblueprint.declare_data", /*benefit=*/1, ctx), state(state) {}
+    
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (op->getNumResults() == 0) return failure();
+        
+        auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+        if (!resultType) return failure();
+        
+        auto loc = op->getLoc();
+        auto ctx = rewriter.getContext();
+        
+        std::string arrayName = "g_data_array_0";
+        if (op->getNumOperands() > 0) {
+            Value initTensor = op->getOperand(0);
+            if (Operation *initOp = initTensor.getDefiningOp()) {
+                if (state.arrayNameMap.count(initOp)) {
+                    arrayName = state.arrayNameMap[initOp];
+                }
+            }
+        }
+        
+        int64_t totalElements = 1;
+        for (auto dim : resultType.getShape()) {
+            totalElements *= dim;
+        }
+        
+        Type elemType = resultType.getElementType();
+        int64_t elemSize = getElemSize(elemType);
+        int64_t byteSize = totalElements * elemSize;
+        
+        auto i32Type = rewriter.getI32Type();
+        auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
+        auto memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
+        auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
+        
+        auto devInstRef = rewriter.create<emitc::GetGlobalOp>(loc, devInstType, "DevInst");
+        auto sizeConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
+            rewriter.getI32IntegerAttr(byteSize));
+        auto cacheableConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
+            emitc::OpaqueAttr::get(ctx, "XAIE_MEM_CACHEABLE"));
+        
+        auto memInst = rewriter.create<emitc::CallOpaqueOp>(loc,
+            memInstPtrType, "XAie_MemAllocate",
+            nullptr, nullptr,
+            ValueRange{devInstRef.getResult(), sizeConst.getResult(), cacheableConst.getResult()});
+        
+        auto vaddr = rewriter.create<emitc::CallOpaqueOp>(loc,
+            voidPtrType, "XAie_MemGetVAddr",
+            nullptr, nullptr, ValueRange{memInst.getResult(0)});
+        
+        auto srcPtr = rewriter.create<emitc::ConstantOp>(loc, voidPtrType,
+            emitc::OpaqueAttr::get(ctx, "(void*)" + arrayName));
+        
+        rewriter.create<emitc::CallOpaqueOp>(loc,
+            voidPtrType, "memcpy",
+            nullptr, nullptr,
+            ValueRange{vaddr.getResult(0), srcPtr.getResult(), sizeConst.getResult()});
+        
+        state.memAllocMap[op->getResult(0)] = std::make_tuple(vaddr.getResult(0), byteSize, totalElements);
+        llvm::errs() << "[Pattern] Generated XAie_MemAllocate for " << arrayName << "\n";
+        
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// ConversionPattern for routing.partitiontensor
+struct PartitionTensorPattern : public ConversionPattern {
+    ConversionState &state;
+    
+    PartitionTensorPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : ConversionPattern(typeConverter, "routing.partitiontensor", /*benefit=*/1, ctx), state(state) {}
+    
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (op->getNumResults() == 0 || op->getNumOperands() == 0) return failure();
+        
+        auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+        if (!resultType) return failure();
+        
+        auto loc = op->getLoc();
+        auto ctx = rewriter.getContext();
+        
+        Value inputTensor = op->getOperand(0);
+        
+        int splitnum = 1, splitdim = 0;
+        if (auto attr = op->getAttrOfType<IntegerAttr>("splitnum")) {
+            splitnum = attr.getInt();
+        }
+        if (auto attr = op->getAttrOfType<IntegerAttr>("splitdim")) {
+            splitdim = attr.getInt();
+        }
+        
+        int64_t totalElements = 1;
+        for (auto dim : resultType.getShape()) {
+            totalElements *= dim;
+        }
+        
+        Type elemType = resultType.getElementType();
+        int64_t elemSize = getElemSize(elemType);
+        int64_t partitionByteSize = totalElements * elemSize;
+        
+        Value srcDataPtr;
+        if (state.memAllocMap.count(inputTensor)) {
+            srcDataPtr = std::get<0>(state.memAllocMap[inputTensor]);
+        }
+        
+        auto i32Type = rewriter.getI32Type();
+        auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
+        
+        Value dataVoidPtr = srcDataPtr ? srcDataPtr :
+            rewriter.create<emitc::ConstantOp>(loc, voidPtrType,
+                emitc::OpaqueAttr::get(ctx, "NULL")).getResult();
+        
+        auto sizeConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
+            rewriter.getI32IntegerAttr(partitionByteSize));
+        auto numElemsConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
+            rewriter.getI32IntegerAttr(totalElements));
+        auto splitnumConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
+            rewriter.getI32IntegerAttr(splitnum));
+        auto splitdimConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
+            rewriter.getI32IntegerAttr(splitdim));
+        
+        auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
+        rewriter.create<emitc::CallOpaqueOp>(loc,
+            partitionType, "__emitc_init_PartitionTensor",
+            nullptr, nullptr,
+            ValueRange{dataVoidPtr, sizeConst.getResult(), numElemsConst.getResult(),
+                       splitnumConst.getResult(), splitdimConst.getResult()});
+        
+        if (srcDataPtr) {
+            state.memAllocMap[op->getResult(0)] = std::make_tuple(srcDataPtr, partitionByteSize, totalElements);
+        }
+        
+        llvm::errs() << "[Pattern] Created PartitionTensor: partition_" << state.partitionIndex++ << "\n";
+        
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// ConversionPattern for dfschedule.host -> emitc.func
+/// This pattern has low benefit so inner patterns are applied first
+struct HostOpPattern : public ConversionPattern {
+    ConversionState &state;
+    
+    HostOpPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : ConversionPattern(typeConverter, "dfschedule.host", /*benefit=*/0, ctx), state(state) {}
+    
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op->getLoc();
+        auto ctx = rewriter.getContext();
+        
         std::string funcName = "hostruntime";
         if (auto symNameAttr = op->getAttrOfType<StringAttr>("sym_name")) {
             funcName = symNameAttr.getValue().str();
         }
         
-        builder.setInsertionPoint(op);
-        auto funcType = builder.getFunctionType({}, {});
-        auto emitcFunc = builder.create<emitc::FuncOp>(op->getLoc(), funcName, funcType);
+        auto funcType = rewriter.getFunctionType({}, {});
+        auto emitcFunc = rewriter.create<emitc::FuncOp>(loc, funcName, funcType);
         Block *entryBlock = emitcFunc.addEntryBlock();
-        builder.setInsertionPointToStart(entryBlock);
         
-        auto loc = op->getLoc();
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(entryBlock);
         
-        // Create common types
-        auto i32Type = builder.getI32Type();
+        // Process nested operations and convert them inline
+        auto i32Type = rewriter.getI32Type();
         auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
         auto memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
+        auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
         
-        // Track allocated memory for later release
-        SmallVector<Value> allocatedMemList;
-        
-        // Get DevInst global reference
-        auto devInstRef = builder.create<emitc::GetGlobalOp>(loc, devInstType, "DevInst");
-        
-        // Create XAIE_MEM_CACHEABLE constant
-        auto cacheableConst = builder.create<emitc::ConstantOp>(loc, i32Type,
+        auto devInstRef = rewriter.create<emitc::GetGlobalOp>(loc, devInstType, "DevInst");
+        auto cacheableConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
             emitc::OpaqueAttr::get(ctx, "XAIE_MEM_CACHEABLE"));
         
-        // Process nested operations
         if (op->getNumRegions() > 0 && !op->getRegion(0).empty()) {
             Block &srcBlock = op->getRegion(0).front();
             
@@ -239,79 +410,51 @@ void DfscheduleToApiPass::runOnOperation() {
                 StringRef nestedOpName = nestedOp.getName().getStringRef();
                 auto nestedLoc = nestedOp.getLoc();
                 
-                // Handle dfscheblueprint.declare_data
+                // Convert dfscheblueprint.declare_data inline
                 if (nestedOpName == "dfscheblueprint.declare_data") {
                     if (nestedOp.getNumResults() == 0) continue;
                     
                     auto resultType = dyn_cast<RankedTensorType>(nestedOp.getResult(0).getType());
                     if (!resultType) continue;
                     
-                    // Get the array name from the input arith.constant
                     std::string arrayName = "g_data_array_0";
                     if (nestedOp.getNumOperands() > 0) {
-                        Value initTensor = nestedOp.getOperand(0);
-                        if (Operation *initOp = initTensor.getDefiningOp()) {
-                            if (arrayNameMap.count(initOp)) {
-                                arrayName = arrayNameMap[initOp];
+                        if (Operation *initOp = nestedOp.getOperand(0).getDefiningOp()) {
+                            if (state.arrayNameMap.count(initOp)) {
+                                arrayName = state.arrayNameMap[initOp];
                             }
                         }
                     }
                     
-                    // Calculate sizes
                     int64_t totalElements = 1;
-                    for (auto dim : resultType.getShape()) {
-                        totalElements *= dim;
-                    }
+                    for (auto dim : resultType.getShape()) totalElements *= dim;
                     
                     Type elemType = resultType.getElementType();
-                    std::string cTypeStr = getEmitCTypeString(elemType);
-                    int64_t elemSize = 1;
-                    if (elemType.isInteger(8)) elemSize = 1;
-                    else if (elemType.isInteger(16)) elemSize = 2;
-                    else if (elemType.isInteger(32) || elemType.isF32()) elemSize = 4;
-                    else if (elemType.isInteger(64) || elemType.isF64()) elemSize = 8;
+                    int64_t byteSize = totalElements * getElemSize(elemType);
                     
-                    int64_t byteSize = totalElements * elemSize;
+                    auto sizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(byteSize));
                     
-                    // Create size constant
-                    auto sizeConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        builder.getI32IntegerAttr(byteSize));
-                    
-                    // XAie_MemAllocate(&DevInst, size, XAIE_MEM_CACHEABLE)
-                    auto memInst = builder.create<emitc::CallOpaqueOp>(nestedLoc,
-                        memInstPtrType,
-                        "XAie_MemAllocate",
-                        /*args=*/nullptr,
-                        /*templateArgs=*/nullptr,
+                    auto memInst = rewriter.create<emitc::CallOpaqueOp>(nestedLoc,
+                        memInstPtrType, "XAie_MemAllocate", nullptr, nullptr,
                         ValueRange{devInstRef.getResult(), sizeConst.getResult(), cacheableConst.getResult()});
                     
-                    // XAie_MemGetVAddr(memInst)
-                    auto vaddr = builder.create<emitc::CallOpaqueOp>(nestedLoc,
-                        voidPtrType,
-                        "XAie_MemGetVAddr",
-                        /*args=*/nullptr,
-                        /*templateArgs=*/nullptr,
+                    auto vaddr = rewriter.create<emitc::CallOpaqueOp>(nestedLoc,
+                        voidPtrType, "XAie_MemGetVAddr", nullptr, nullptr,
                         ValueRange{memInst.getResult(0)});
                     
-                    // Get source array pointer as void* via emitc.constant with opaque reference
-                    auto srcPtr = builder.create<emitc::ConstantOp>(nestedLoc, voidPtrType,
+                    auto srcPtr = rewriter.create<emitc::ConstantOp>(nestedLoc, voidPtrType,
                         emitc::OpaqueAttr::get(ctx, "(void*)" + arrayName));
                     
-                    // memcpy(dst, src, size) - both are void*, no cast needed
-                    builder.create<emitc::CallOpaqueOp>(nestedLoc,
-                        voidPtrType,
-                        "memcpy",
-                        /*args=*/nullptr,
-                        /*templateArgs=*/nullptr,
+                    rewriter.create<emitc::CallOpaqueOp>(nestedLoc, voidPtrType, "memcpy",
+                        nullptr, nullptr,
                         ValueRange{vaddr.getResult(0), srcPtr.getResult(), sizeConst.getResult()});
                     
-                    // Store void* SSA value for use by partitiontensor (no cast needed)
-                    memAllocMap[nestedOp.getResult(0)] = std::make_tuple(vaddr.getResult(0), byteSize, totalElements);
-                    
-                    llvm::errs() << "[Pass] Generated XAie_MemAllocate with SSA for " << arrayName << "\n";
+                    state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(vaddr.getResult(0), byteSize, totalElements);
+                    llvm::errs() << "[Pattern] Host: XAie_MemAllocate for " << arrayName << "\n";
                 }
                 
-                // Handle routing.partitiontensor
+                // Convert routing.partitiontensor inline
                 if (nestedOpName == "routing.partitiontensor") {
                     if (nestedOp.getNumResults() == 0 || nestedOp.getNumOperands() == 0) continue;
                     
@@ -320,82 +463,46 @@ void DfscheduleToApiPass::runOnOperation() {
                     
                     Value inputTensor = nestedOp.getOperand(0);
                     
-                    // Get splitnum and splitdim attributes
-                    int splitnum = 1;
-                    int splitdim = 0;
-                    if (auto attr = nestedOp.getAttrOfType<IntegerAttr>("splitnum")) {
-                        splitnum = attr.getInt();
-                    }
-                    if (auto attr = nestedOp.getAttrOfType<IntegerAttr>("splitdim")) {
-                        splitdim = attr.getInt();
-                    }
+                    int splitnum = 1, splitdim = 0;
+                    if (auto attr = nestedOp.getAttrOfType<IntegerAttr>("splitnum")) splitnum = attr.getInt();
+                    if (auto attr = nestedOp.getAttrOfType<IntegerAttr>("splitdim")) splitdim = attr.getInt();
                     
-                    // Calculate sizes for this partition
                     int64_t totalElements = 1;
-                    for (auto dim : resultType.getShape()) {
-                        totalElements *= dim;
-                    }
+                    for (auto dim : resultType.getShape()) totalElements *= dim;
                     
-                    Type elemType = resultType.getElementType();
-                    int64_t elemSize = 1;
-                    if (elemType.isInteger(8)) elemSize = 1;
-                    else if (elemType.isInteger(16)) elemSize = 2;
-                    else if (elemType.isInteger(32) || elemType.isF32()) elemSize = 4;
-                    else if (elemType.isInteger(64) || elemType.isF64()) elemSize = 8;
+                    int64_t partitionByteSize = totalElements * getElemSize(resultType.getElementType());
                     
-                    int64_t partitionByteSize = totalElements * elemSize;
-                    
-                    // Get source data pointer from memAllocMap
                     Value srcDataPtr;
-                    if (memAllocMap.count(inputTensor)) {
-                        srcDataPtr = std::get<0>(memAllocMap[inputTensor]);
-                    } else {
-                        // Fallback: try to find any available memory
-                        for (auto &entry : memAllocMap) {
-                            srcDataPtr = std::get<0>(entry.second);
-                            break;
-                        }
+                    if (state.memAllocMap.count(inputTensor)) {
+                        srcDataPtr = std::get<0>(state.memAllocMap[inputTensor]);
                     }
                     
-                    // Data pointer is already void*, no cast needed
-                    Value dataVoidPtr;
-                    if (srcDataPtr) {
-                        dataVoidPtr = srcDataPtr;  // Already void*
-                    } else {
-                        // Create NULL pointer if no source found
-                        dataVoidPtr = builder.create<emitc::ConstantOp>(nestedLoc, voidPtrType,
+                    Value dataVoidPtr = srcDataPtr ? srcDataPtr :
+                        rewriter.create<emitc::ConstantOp>(nestedLoc, voidPtrType,
                             emitc::OpaqueAttr::get(ctx, "NULL")).getResult();
-                    }
                     
-                    // Create constants for struct initialization
-                    auto sizeConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        builder.getI32IntegerAttr(partitionByteSize));
-                    auto numElemsConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        builder.getI32IntegerAttr(totalElements));
-                    auto splitnumConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        builder.getI32IntegerAttr(splitnum));
-                    auto splitdimConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        builder.getI32IntegerAttr(splitdim));
+                    auto sizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(partitionByteSize));
+                    auto numElemsConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(totalElements));
+                    auto splitnumConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(splitnum));
+                    auto splitdimConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(splitdim));
                     
-                    // Create PartitionTensor struct via helper function call
                     auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
-                    auto partition = builder.create<emitc::CallOpaqueOp>(nestedLoc,
-                        partitionType,
-                        "__emitc_init_PartitionTensor",
-                        /*args=*/nullptr,
-                        /*templateArgs=*/nullptr,
+                    rewriter.create<emitc::CallOpaqueOp>(nestedLoc, partitionType,
+                        "__emitc_init_PartitionTensor", nullptr, nullptr,
                         ValueRange{dataVoidPtr, sizeConst.getResult(), numElemsConst.getResult(),
                                    splitnumConst.getResult(), splitdimConst.getResult()});
                     
-                    // Store for potential chained partitions (use the same data pointer)
                     if (srcDataPtr) {
-                        memAllocMap[nestedOp.getResult(0)] = std::make_tuple(srcDataPtr, partitionByteSize, totalElements);
+                        state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(srcDataPtr, partitionByteSize, totalElements);
                     }
-                    
-                    llvm::errs() << "[Pass] Created PartitionTensor via SSA: partition_" << partitionIndex++ << "\n";
+                    llvm::errs() << "[Pattern] Host: PartitionTensor created\n";
                 }
                 
-                // Handle tensor.extract_slice
+                // Convert tensor.extract_slice inline
                 if (nestedOpName == "tensor.extract_slice") {
                     if (nestedOp.getNumResults() == 0 || nestedOp.getNumOperands() == 0) continue;
                     
@@ -404,310 +511,235 @@ void DfscheduleToApiPass::runOnOperation() {
                     if (!resultType || !srcType) continue;
                     
                     Value srcTensor = nestedOp.getOperand(0);
+                    if (!state.memAllocMap.count(srcTensor)) continue;
                     
-                    // Get offsets, sizes, strides from static attributes
+                    Value srcDataPtr = std::get<0>(state.memAllocMap[srcTensor]);
+                    
                     auto staticOffsetsAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_offsets");
                     auto staticSizesAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_sizes");
-                    auto staticStridesAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_strides");
-                    
-                    if (!staticOffsetsAttr || !staticSizesAttr || !staticStridesAttr) continue;
+                    if (!staticOffsetsAttr || !staticSizesAttr) continue;
                     
                     auto offsets = staticOffsetsAttr.asArrayRef();
                     auto sizes = staticSizesAttr.asArrayRef();
-                    auto strides = staticStridesAttr.asArrayRef();
                     auto srcShape = srcType.getShape();
                     
-                    Type elemType = resultType.getElementType();
-                    int64_t elemSize = 1;
-                    if (elemType.isInteger(8)) elemSize = 1;
-                    else if (elemType.isInteger(16)) elemSize = 2;
-                    else if (elemType.isInteger(32) || elemType.isF32()) elemSize = 4;
-                    else if (elemType.isInteger(64) || elemType.isF64()) elemSize = 8;
-                    
-                    // Check if slice is contiguous (row-major layout)
-                    // Contiguous if: all trailing dimensions are fully extracted
-                    // i.e., for dims from innermost, offset=0 and size=srcDim until we hit a partial dim
-                    bool isContiguous = true;
-                    int64_t srcRank = srcShape.size();
-                    for (int64_t i = srcRank - 1; i >= 0; --i) {
-                        if (strides[i] != 1) {
-                            isContiguous = false;
-                            break;
-                        }
-                        // If this dimension is not fully extracted, check if it's the outermost partial
-                        if (offsets[i] != 0 || sizes[i] != srcShape[i]) {
-                            // For inner dimensions, must be fully extracted for contiguity
-                            if (i < srcRank - 1) {
-                                // Check all dimensions after this are fully extracted
-                                for (int64_t j = i + 1; j < srcRank; ++j) {
-                                    if (offsets[j] != 0 || sizes[j] != srcShape[j]) {
-                                        isContiguous = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    
-                    // Calculate total elements in slice
+                    int64_t elemSize = getElemSize(resultType.getElementType());
                     int64_t sliceElements = 1;
-                    for (auto s : sizes) {
-                        sliceElements *= s;
-                    }
+                    for (auto s : sizes) sliceElements *= s;
                     int64_t sliceByteSize = sliceElements * elemSize;
                     
-                    // Get source pointer from memAllocMap
-                    Value srcDataPtr;
-                    int64_t srcByteSize = 0;
-                    if (memAllocMap.count(srcTensor)) {
-                        srcDataPtr = std::get<0>(memAllocMap[srcTensor]);
-                        srcByteSize = std::get<1>(memAllocMap[srcTensor]);
+                    int64_t byteOffset = 0;
+                    int64_t stride = elemSize;
+                    for (int64_t i = srcShape.size() - 1; i >= 0; --i) {
+                        byteOffset += offsets[i] * stride;
+                        stride *= srcShape[i];
                     }
                     
-                    if (!srcDataPtr) {
-                        llvm::errs() << "[Pass] Warning: No source pointer for extract_slice\n";
-                        continue;
-                    }
-                    
-                    if (isContiguous) {
-                        // Calculate byte offset: offset[0] * stride_0_in_bytes + ...
-                        // For row-major: offset = sum(offset[i] * product(srcShape[i+1:])) * elemSize
-                        int64_t byteOffset = 0;
-                        int64_t stride = elemSize;
-                        for (int64_t i = srcRank - 1; i >= 0; --i) {
-                            byteOffset += offsets[i] * stride;
-                            stride *= srcShape[i];
-                        }
-                        
-                        // Create pointer arithmetic: (char*)srcPtr + byteOffset
-                        std::string offsetExpr = "((char*)" + std::to_string(byteOffset) + ")";
-                        
-                        // If offset is 0, just use source pointer directly
-                        Value slicePtr;
-                        if (byteOffset == 0) {
-                            slicePtr = srcDataPtr;
-                        } else {
-                            // Create pointer addition via verbatim or opaque call
-                            auto charPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "char"));
-                            auto offsetConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                                builder.getI32IntegerAttr(byteOffset));
-                            
-                            // __emitc_ptr_add(ptr, offset) helper
-                            slicePtr = builder.create<emitc::CallOpaqueOp>(nestedLoc,
-                                voidPtrType,
-                                "__emitc_ptr_add",
-                                /*args=*/nullptr,
-                                /*templateArgs=*/nullptr,
-                                ValueRange{srcDataPtr, offsetConst.getResult()}).getResult(0);
-                        }
-                        
-                        // Store in memAllocMap (no new allocation needed)
-                        memAllocMap[nestedOp.getResult(0)] = std::make_tuple(slicePtr, sliceByteSize, sliceElements);
-                        
-                        llvm::errs() << "[Pass] Created contiguous slice (offset=" << byteOffset << " bytes)\n";
+                    Value slicePtr;
+                    if (byteOffset == 0) {
+                        slicePtr = srcDataPtr;
                     } else {
-                        // Non-contiguous: need to allocate new memory and copy
-                        // Create size constant
-                        auto sliceSizeConst = builder.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                            builder.getI32IntegerAttr(sliceByteSize));
+                        auto offsetConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                            rewriter.getI32IntegerAttr(byteOffset));
+                        auto sliceSizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                            rewriter.getI32IntegerAttr(sliceByteSize));
                         
-                        // XAie_MemAllocate for new contiguous buffer
-                        auto newMemInst = builder.create<emitc::CallOpaqueOp>(nestedLoc,
-                            memInstPtrType,
-                            "XAie_MemAllocate",
-                            /*args=*/nullptr,
-                            /*templateArgs=*/nullptr,
-                            ValueRange{devInstRef.getResult(), sliceSizeConst.getResult(), cacheableConst.getResult()});
-                        
-                        // Track allocation for later release
-                        allocatedMemList.push_back(newMemInst.getResult(0));
-                        
-                        // XAie_MemGetVAddr
-                        auto newVaddr = builder.create<emitc::CallOpaqueOp>(nestedLoc,
-                            voidPtrType,
-                            "XAie_MemGetVAddr",
-                            /*args=*/nullptr,
-                            /*templateArgs=*/nullptr,
-                            ValueRange{newMemInst.getResult(0)});
-                        
-                        // Build strided copy parameters as string for verbatim
-                        std::stringstream copyParams;
-                        copyParams << "/* Non-contiguous copy: offsets=[";
-                        for (size_t i = 0; i < offsets.size(); ++i) {
-                            if (i > 0) copyParams << ",";
-                            copyParams << offsets[i];
-                        }
-                        copyParams << "], sizes=[";
-                        for (size_t i = 0; i < sizes.size(); ++i) {
-                            if (i > 0) copyParams << ",";
-                            copyParams << sizes[i];
-                        }
-                        copyParams << "] */";
-                        
-                        builder.create<emitc::VerbatimOp>(nestedLoc, builder.getStringAttr(copyParams.str()));
-                        
-                        // Call helper function for strided copy
-                        // __emitc_strided_copy(dst, src, src_shape, offsets, sizes, elem_size, rank)
-                        builder.create<emitc::CallOpaqueOp>(nestedLoc,
-                            TypeRange{},
-                            "__emitc_strided_copy_2d",
-                            /*args=*/nullptr,
-                            /*templateArgs=*/nullptr,
-                            ValueRange{newVaddr.getResult(0), srcDataPtr});
-                        
-                        // Store in memAllocMap
-                        memAllocMap[nestedOp.getResult(0)] = std::make_tuple(newVaddr.getResult(0), sliceByteSize, sliceElements);
-                        
-                        llvm::errs() << "[Pass] Created non-contiguous slice (allocated " << sliceByteSize << " bytes)\n";
+                        auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(nestedLoc, voidPtrType,
+                            "__emitc_extract_slice_contiguous", nullptr, nullptr,
+                            ValueRange{srcDataPtr, offsetConst.getResult(), sliceSizeConst.getResult()});
+                        slicePtr = sliceOp.getResult(0);
                     }
+                    
+                    state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(slicePtr, sliceByteSize, sliceElements);
+                    llvm::errs() << "[Pattern] Host: slice (offset=" << byteOffset << ")\n";
                 }
             }
         }
         
-        // Generate memory release calls for all tracked allocations
-        if (!allocatedMemList.empty()) {
-            builder.create<emitc::VerbatimOp>(op->getLoc(), 
-                builder.getStringAttr("/* Release allocated memory */"));
-            for (Value memInst : allocatedMemList) {
-                builder.create<emitc::CallOpaqueOp>(op->getLoc(),
-                    TypeRange{},
-                    "XAie_MemFree",
-                    /*args=*/nullptr,
-                    /*templateArgs=*/nullptr,
-                    ValueRange{memInst});
-            }
-        }
+        rewriter.setInsertionPointToEnd(entryBlock);
+        rewriter.create<emitc::ReturnOp>(loc, Value{});
         
-        // Add emitc.return at the end
-        builder.setInsertionPointToEnd(entryBlock);
-        builder.create<emitc::ReturnOp>(op->getLoc(), Value{});
+        llvm::errs() << "[Pattern] Created emitc.func: " << funcName << "\n";
         
-        llvm::errs() << "[Pass] Created emitc.func: " << funcName << "\n";
+        rewriter.eraseOp(op);
+        return success();
     }
+};
+
+/// ConversionPattern for dfschedule.launchhost -> emitc.call_opaque
+struct LaunchHostPattern : public ConversionPattern {
+    LaunchHostPattern(TypeConverter &typeConverter, MLIRContext *ctx)
+        : ConversionPattern(typeConverter, "dfschedule.launchhost", /*benefit=*/1, ctx) {}
     
-    // 1d. Convert dfschedule.launchhost to emitc.call_opaque("hostruntime")
-    for (Operation *op : launchHostOps) {
-        builder.setInsertionPoint(op);
-        builder.create<emitc::CallOpaqueOp>(
-            op->getLoc(),
-            TypeRange{},
-            "hostruntime",
-            nullptr, nullptr, ValueRange{}
-        );
-        llvm::errs() << "[Pass] Created hostruntime() call\n";
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.create<emitc::CallOpaqueOp>(op->getLoc(),
+            TypeRange{}, "hostruntime", nullptr, nullptr, ValueRange{});
+        
+        llvm::errs() << "[Pattern] Created hostruntime() call\n";
+        
+        rewriter.eraseOp(op);
+        return success();
     }
+};
+
+/// ConversionPattern for dfschedule.dskernel_receiver -> emitc.func with __global__
+struct DsKernelReceiverPattern : public ConversionPattern {
+    DsKernelReceiverPattern(TypeConverter &typeConverter, MLIRContext *ctx)
+        : ConversionPattern(typeConverter, "dfschedule.dskernel_receiver", /*benefit=*/1, ctx) {}
     
-    // 1e. Convert dfschedule.dskernel_receiver to emitc.func with __global__
-    for (Operation *op : dsKernelReceiverOps) {
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op->getLoc();
+        
         std::string kernelName = "dskernel";
         if (auto symNameAttr = op->getAttrOfType<StringAttr>("sym_name")) {
             kernelName = symNameAttr.getValue().str();
         }
         
-        builder.setInsertionPoint(op);
-        auto funcType = builder.getFunctionType({}, {});
-        auto emitcFunc = builder.create<emitc::FuncOp>(op->getLoc(), kernelName, funcType);
-        emitcFunc->setAttr("specifiers", builder.getStrArrayAttr({"__global__"}));
+        auto funcType = rewriter.getFunctionType({}, {});
+        auto emitcFunc = rewriter.create<emitc::FuncOp>(loc, kernelName, funcType);
+        emitcFunc->setAttr("specifiers", rewriter.getStrArrayAttr({"__global__"}));
         
         Block *entryBlock = emitcFunc.addEntryBlock();
-        builder.setInsertionPointToStart(entryBlock);
-        builder.create<emitc::VerbatimOp>(op->getLoc(), builder.getStringAttr("/* AIE kernel implementation */"));
-        builder.create<emitc::ReturnOp>(op->getLoc(), Value{});
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(entryBlock);
+        rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr("/* AIE kernel implementation */"));
+        rewriter.create<emitc::ReturnOp>(loc, Value{});
         
-        llvm::errs() << "[Pass] Created __global__ func: " << kernelName << "\n";
+        llvm::errs() << "[Pattern] Created __global__ func: " << kernelName << "\n";
+        
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+//===----------------------------------------------------------------------===//
+// Pass Implementation - Using ConversionPattern with applyPartialConversion
+//===----------------------------------------------------------------------===//
+
+void DfscheduleToApiPass::runOnOperation() {
+    llvm::errs() << "=== DfscheduleToApiPass START ===\n";
+    
+    ModuleOp moduleOp = getOperation();
+    MLIRContext *ctx = moduleOp.getContext();
+    
+    // Shared conversion state
+    ConversionState state;
+    
+    // Type converter (identity for now, can be extended)
+    TypeConverter typeConverter;
+    typeConverter.addConversion([](Type type) { return type; });
+    
+    //==========================================================================
+    // Phase 1: Setup - Generate helper definitions at module scope
+    //==========================================================================
+    
+    {
+        OpBuilder builder(ctx);
+        builder.setInsertionPointToStart(moduleOp.getBody());
+        
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), builder.getStringAttr(
+            "/* PartitionTensor structure for memory management */\n"
+            "typedef struct {\n"
+            "    void* data;\n"
+            "    size_t size;\n"
+            "    size_t num_elements;\n"
+            "    int splitnum;\n"
+            "    int splitdim;\n"
+            "} PartitionTensor;\n\n"
+            "/* Helper function for PartitionTensor initialization */\n"
+            "static inline PartitionTensor __emitc_init_PartitionTensor(\n"
+            "    void* data, size_t size, size_t num_elements, int splitnum, int splitdim) {\n"
+            "    PartitionTensor pt = {data, size, num_elements, splitnum, splitdim};\n"
+            "    return pt;\n"
+            "}\n\n"
+            "/* Helper function for contiguous slice extraction */\n"
+            "static inline void* __emitc_extract_slice_contiguous(\n"
+            "    void* src_ptr, int byte_offset, int slice_byte_size) {\n"
+            "    return (void*)((char*)src_ptr + byte_offset);\n"
+            "}\n\n"
+            "/* Helper function for 2D non-contiguous slice extraction */\n"
+            "static inline void __emitc_extract_slice_2d(\n"
+            "    void* dst, void* src, int elem_size,\n"
+            "    int src_dim0, int src_dim1,\n"
+            "    int off0, int off1,\n"
+            "    int size0, int size1) {\n"
+            "    char* d = (char*)dst;\n"
+            "    char* s = (char*)src;\n"
+            "    for (int i = 0; i < size0; i++) {\n"
+            "        int src_idx = ((off0 + i) * src_dim1 + off1) * elem_size;\n"
+            "        int dst_idx = (i * size1) * elem_size;\n"
+            "        memcpy(d + dst_idx, s + src_idx, size1 * elem_size);\n"
+            "    }\n"
+            "}"
+        ));
+        
+        auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
+        builder.create<emitc::GlobalOp>(moduleOp.getLoc(),
+            "DevInst", devInstType, Attribute{}, true, false, false);
     }
     
     //==========================================================================
-    // Phase 2: Drop all uses and erase dfschedule/dfscheblueprint/routing ops
+    // Phase 2: Apply conversion patterns using applyPartialConversion
     //==========================================================================
     
-    llvm::errs() << "[Pass] Phase 2: Erasing operations\n";
+    llvm::errs() << "[Pass] Phase 2: Applying conversion patterns\n";
     
-    // Collect ONLY top-level dfschedule/dfscheblueprint/routing ops
-    SmallVector<Operation*> topLevelOpsToErase;
+    // Setup conversion target
+    ConversionTarget target(*ctx);
+    target.addLegalDialect<emitc::EmitCDialect, func::FuncDialect, scf::SCFDialect>();
+    target.addLegalOp<ModuleOp>();
     
-    for (Operation &op : *moduleOp.getBody()) {
-        StringRef opName = op.getName().getStringRef();
-        if (opName.starts_with("dfschedule.") || 
+    // Mark custom dialect ops as illegal
+    target.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
+        // Illegal if it has DenseElementsAttr (needs conversion)
+        return !isa<DenseElementsAttr>(op.getValue());
+    });
+    target.addIllegalOp<tensor::ExtractSliceOp>();
+    
+    // Mark operations by name as illegal
+    target.markUnknownOpDynamicallyLegal([](Operation *op) {
+        StringRef opName = op->getName().getStringRef();
+        if (opName.starts_with("dfschedule.") ||
             opName.starts_with("dfscheblueprint.") ||
             opName.starts_with("routing.")) {
-            topLevelOpsToErase.push_back(&op);
+            return false; // illegal
         }
-        
-        // Also check for arith.constant with dense attribute at module level
-        if (auto constOp = dyn_cast<arith::ConstantOp>(&op)) {
-            if (isa<DenseElementsAttr>(constOp.getValue())) {
-                topLevelOpsToErase.push_back(&op);
-            }
-        }
-        
-        // Check inside func.func operations
-        if (auto funcOp = dyn_cast<func::FuncOp>(&op)) {
-            funcOp.walk([&](Operation *nestedOp) {
-                if (nestedOp == &op) return;
-                
-                StringRef nestedOpName = nestedOp->getName().getStringRef();
-                
-                if (nestedOp->getParentOp() == funcOp.getOperation()) {
-                    if (nestedOpName.starts_with("dfschedule.") || 
-                        nestedOpName.starts_with("dfscheblueprint.") ||
-                        nestedOpName.starts_with("routing.")) {
-                        topLevelOpsToErase.push_back(nestedOp);
-                    }
-                    
-                    if (auto constOp = dyn_cast<arith::ConstantOp>(nestedOp)) {
-                        if (isa<DenseElementsAttr>(constOp.getValue())) {
-                            topLevelOpsToErase.push_back(nestedOp);
-                        }
-                    }
-                }
-            });
-        }
-    }
+        return true; // legal
+    });
     
-    llvm::errs() << "[Pass] Found " << topLevelOpsToErase.size() << " top-level ops to erase\n";
+    // Create patterns - HostOpPattern handles nested ops inline
+    RewritePatternSet patterns(ctx);
+    patterns.add<DenseConstantToEmitCPattern>(typeConverter, ctx, state);
+    patterns.add<HostOpPattern>(typeConverter, ctx, state);
+    patterns.add<LaunchHostPattern>(typeConverter, ctx);
+    patterns.add<DsKernelReceiverPattern>(typeConverter, ctx);
     
-    // Drop all uses first
-    for (Operation *op : topLevelOpsToErase) {
-        for (Value result : op->getResults()) {
-            result.dropAllUses();
-        }
-        op->walk([](Operation *nestedOp) {
-            for (Value result : nestedOp->getResults()) {
-                result.dropAllUses();
-            }
-        });
-    }
-    
-    // Erase top-level ops
-    for (Operation *op : topLevelOpsToErase) {
-        llvm::errs() << "[Pass] Erasing: " << op->getName() << "\n";
-        op->erase();
+    // Apply partial conversion
+    if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
+        llvm::errs() << "[Pass] Warning: Partial conversion had failures\n";
+        // Don't signal failure - some ops may remain intentionally
     }
     
     //==========================================================================
-    // Phase 3: Apply canonicalization to optimize EmitC (CSE, dead code, etc.)
+    // Phase 3: Apply canonicalization to optimize EmitC
     //==========================================================================
     
     llvm::errs() << "[Pass] Phase 3: Applying canonicalization patterns\n";
     
-    // Collect canonicalization patterns from all loaded dialects
-    mlir::RewritePatternSet patterns(ctx);
-    for (auto *dialect : ctx->getLoadedDialects()) {
-        dialect->getCanonicalizationPatterns(patterns);
-    }
-    
-    // Collect canonicalization patterns from all registered operations
-    for (mlir::RegisteredOperationName op : ctx->getRegisteredOperations()) {
-        op.getCanonicalizationPatterns(patterns, ctx);
-    }
-    
-    // Apply the patterns greedily - this will simplify and clean up the IR
-    // including CSE for duplicate constants
-    if (mlir::failed(mlir::applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)))) {
-        llvm::errs() << "[Pass] Warning: Canonicalization failed\n";
-        // Don't signal failure - canonicalization is optional optimization
+    {
+        RewritePatternSet canonPatterns(ctx);
+        for (auto *dialect : ctx->getLoadedDialects()) {
+            dialect->getCanonicalizationPatterns(canonPatterns);
+        }
+        for (RegisteredOperationName op : ctx->getRegisteredOperations()) {
+            op.getCanonicalizationPatterns(canonPatterns, ctx);
+        }
+        
+        if (failed(applyPatternsAndFoldGreedily(moduleOp, std::move(canonPatterns)))) {
+            llvm::errs() << "[Pass] Warning: Canonicalization had issues\n";
+        }
     }
     
     llvm::errs() << "=== DfscheduleToApiPass SUCCESS ===\n";
