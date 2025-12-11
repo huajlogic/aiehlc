@@ -133,9 +133,9 @@ struct FoldConstantOperandsIntoCall : public mlir::OpRewritePattern<mlir::emitc:
     auto funcDecl = module.lookupSymbol<mlir::emitc::FuncOp>(callOp.getCallee());
     if (!funcDecl) {
       // If the function is not declared, we can't update it.
-      // This might be an error or intentional, depending on the toolchain.
-      // For safety, we fail the pattern.
-      return callOp.emitError("cannot find declaration for callee");
+      // Return failure to skip this pattern - this is common for external C functions
+      // that are called via emitc.call but don't have emitc.func declarations.
+      return mlir::failure();
     }
 
     // Create the new function type based on the remaining operands.
@@ -176,11 +176,11 @@ struct RemoveDeadCallOp : public mlir::OpRewritePattern<mlir::emitc::CallOp> {
   RemoveDeadCallOp(MLIRContext* ctx):OpRewritePattern(ctx) {}
   mlir::LogicalResult matchAndRewrite(mlir::emitc::CallOp callOp,
                                       mlir::PatternRewriter &rewriter) const override {
-    std::string calleeName = callOp.getCallee().str();
     if (callOp.use_empty()) {
       rewriter.eraseOp(callOp);
+      return success();
     }
-    return success();
+    return failure();
   }
 };
 
@@ -192,8 +192,9 @@ struct RemoveDeadCallopOpaqueOp : public mlir::OpRewritePattern<mlir::emitc::Cal
     std::string calleeName = callOp.getCallee().str();
     if (callOp.use_empty() && (calleeName == "XAie_TileLoc" || calleeName == "XAie_Packet")) {
       rewriter.eraseOp(callOp);
+      return success();
     }
-    return success();
+    return failure();
   }
 };
 
@@ -204,8 +205,9 @@ struct RemoveConstantOp : public mlir::OpRewritePattern<mlir::emitc::ConstantOp>
                                       mlir::PatternRewriter &rewriter) const override {
     if (constantop.use_empty()) {
       rewriter.eraseOp(constantop);
+      return success();
     }
-    return success();
+    return failure();
   }
 };
 

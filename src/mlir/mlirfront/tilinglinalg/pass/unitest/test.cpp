@@ -865,6 +865,23 @@ void routingtodfschedule() {
     pm.addPass(std::make_unique<mlir::DfscheduleToApiPass>());
     options.label = "After DfscheduleToApiPass:";
     pm.addPass(mlir::createPrintIRPass(options));
+
+
+    pm.addPass(std::make_unique<RoutingDeadArgPass>());
+    options.label = "After RoutingDeadArgPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    //The constanfold change emitc.call into emic.call_opaque to convert 
+    /*
+    XAie_LocType v251 = XAie_TileLoc(v1, v10);
+    XAie_DevInst* v252 = getOrCreateDeviceInstance();
+    int32_t v253 = XAie_StrmConnCctEnable(v252, v251, v6, v13, v5, v12);
+    */
+    //into
+    /*
+    int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0); 
+    */
+    pm.addPass(std::make_unique<RoutingConstantFoldPass>());
+    
     
     // Run the pass pipeline
     if (failed(pm.run(module1))) {
