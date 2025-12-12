@@ -904,10 +904,10 @@ void routingtodfschedule() {
     
     // Convert to C++ code
     std::cout << "\n=== Generated C++ Code ===" << std::endl;
-    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
-    if (failed(result)) {
-        llvm::errs() << "Failed to translate MLIR to C++.\n";
-    }
+    //mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    //if (failed(result)) {
+    //    llvm::errs() << "Failed to translate MLIR to C++.\n";
+    //}
     
     return;
 }

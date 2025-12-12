@@ -111,10 +111,20 @@ struct ConversionState {
     DenseMap<Operation*, std::string> arrayNameMap;
     int arrayIndex = 0;
     int partitionIndex = 0;
+    
+    // Cached values for inner patterns (set before applying inner patterns)
+    Value devInstRef;
+    Value cacheableConst;
+    Type voidPtrType;
+    Type memInstPtrType;
+    Type i32Type;
+    Type partitionType;
+    Type devInstType;
+    MLIRContext *ctx = nullptr;
 };
 
 //===----------------------------------------------------------------------===//
-// Conversion Patterns using OpConversionPattern
+// Module-Level Patterns (Global conversions)
 //===----------------------------------------------------------------------===//
 
 /// OpConversionPattern for arith.constant with DenseElementsAttr -> emitc.verbatim
@@ -157,26 +167,249 @@ struct DenseConstantToEmitCPattern : public OpConversionPattern<arith::ConstantO
     }
 };
 
-/// OpConversionPattern for tensor.extract_slice -> EmitC PartitionTensor slice extraction
-struct ExtractSliceToEmitCPattern : public OpConversionPattern<tensor::ExtractSliceOp> {
+//===----------------------------------------------------------------------===//
+// Helper: EraseOpLowering - Reusable pattern to erase ops by name
+//===----------------------------------------------------------------------===//
+
+/// EraseOpLowering: A reusable ConversionPattern that erases an op by its string name.
+/// Usage in pattern registration:
+///   patterns.add<EraseOpLowering>(typeConverter, ctx, "dfschedule.schedule.wait");
+///   patterns.add<EraseOpLowering>(typeConverter, ctx, "dfschedule.start_io");
+struct EraseOpLowering : public ConversionPattern {
+    std::string targetOpName;
+    
+    EraseOpLowering(TypeConverter &typeConverter, MLIRContext *ctx, StringRef opName)
+        : ConversionPattern(typeConverter, opName, /*benefit=*/1, ctx), targetOpName(opName.str()) {}
+    
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        llvm::errs() << "[EraseOpLowering] Erasing: " << targetOpName << "\n";
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// Helper function to add multiple EraseOpLowering patterns at once
+inline void addEraseOpPatterns(RewritePatternSet &patterns, TypeConverter &typeConverter, 
+                               MLIRContext *ctx, ArrayRef<StringRef> opNames) {
+    for (StringRef opName : opNames) {
+        patterns.add<EraseOpLowering>(typeConverter, ctx, opName);
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// Inner Patterns (Applied inside host op region via walk)
+//===----------------------------------------------------------------------===//
+
+/// Inner pattern for arith.constant -> erase (already converted to global array)
+struct ArithConstantInnerPattern : public OpConversionPattern<arith::ConstantOp> {
     ConversionState &state;
     
-    ExtractSliceToEmitCPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : OpConversionPattern<tensor::ExtractSliceOp>(typeConverter, ctx), state(state) {}
+    ArithConstantInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : OpConversionPattern<arith::ConstantOp>(typeConverter, ctx, /*benefit=*/1), state(state) {}
+    
+    LogicalResult matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// Inner pattern for dfscheblueprint.declare_data -> XAie_MemAllocate + memcpy
+struct DeclareDataInnerPattern : public ConversionPattern {
+    ConversionState &state;
+    
+    DeclareDataInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : ConversionPattern(typeConverter, "dfscheblueprint.declare_data", /*benefit=*/1, ctx), state(state) {}
+    
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (op->getNumResults() == 0) return failure();
+        
+        auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+        if (!resultType) return failure();
+        
+        auto loc = op->getLoc();
+        
+        std::string arrayName = "g_data_array_0";
+        if (op->getNumOperands() > 0) {
+            if (Operation *initOp = op->getOperand(0).getDefiningOp()) {
+                if (state.arrayNameMap.count(initOp)) {
+                    arrayName = state.arrayNameMap[initOp];
+                }
+            }
+        }
+        
+        auto shape = resultType.getShape();
+        int64_t totalElements = 1;
+        for (auto dim : shape) totalElements *= dim;
+        
+        Type elemType = resultType.getElementType();
+        int64_t elemSize = getElemSize(elemType);
+        int64_t byteSize = totalElements * elemSize;
+        
+        auto sizeConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
+            rewriter.getI32IntegerAttr(byteSize));
+        
+        auto memInst = rewriter.create<emitc::CallOpaqueOp>(loc,
+            state.memInstPtrType, "XAie_MemAllocate", nullptr, nullptr,
+            ValueRange{state.devInstRef, sizeConst.getResult(), state.cacheableConst});
+        
+        auto vaddr = rewriter.create<emitc::CallOpaqueOp>(loc,
+            state.voidPtrType, "XAie_MemGetVAddr", nullptr, nullptr,
+            ValueRange{memInst.getResult(0)});
+        
+        auto srcPtr = rewriter.create<emitc::ConstantOp>(loc, state.voidPtrType,
+            emitc::OpaqueAttr::get(state.ctx, "(void*)" + arrayName));
+        
+        rewriter.create<emitc::CallOpaqueOp>(loc, state.voidPtrType, "memcpy",
+            nullptr, nullptr,
+            ValueRange{vaddr.getResult(0), srcPtr.getResult(), sizeConst.getResult()});
+        
+        // Store the raw data pointer - PartitionTensor will be created by routing.partitiontensor
+        state.dataPtrMap[op->getResult(0)] = vaddr.getResult(0);
+        llvm::errs() << "[Pattern] DeclareData: XAie_MemAllocate for " << arrayName << "\n";
+        
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// Inner pattern for routing.partitiontensor -> __emitc_init_PartitionTensor
+struct PartitionTensorInnerPattern : public ConversionPattern {
+    ConversionState &state;
+    
+    PartitionTensorInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : ConversionPattern(typeConverter, "routing.partitiontensor", /*benefit=*/1, ctx), state(state) {}
+    
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (op->getNumResults() == 0 || op->getNumOperands() == 0) return failure();
+        
+        auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+        auto inputType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+        if (!resultType || !inputType) return failure();
+        
+        auto loc = op->getLoc();
+        Value inputTensor = op->getOperand(0);
+        
+        // Get partition attributes
+        int splitnum = 1, splitdim = 0;
+        if (auto attr = op->getAttrOfType<IntegerAttr>("splitnum")) splitnum = attr.getInt();
+        if (auto attr = op->getAttrOfType<IntegerAttr>("splitdim")) splitdim = attr.getInt();
+        
+        // Get hw_axis_owner and replicate_on (convert string to int)
+        int hwAxisOwner = 0; // 0=row, 1=col
+        int replicateOn = -1; // -1=none, 0=row, 1=col
+        if (auto attr = op->getAttrOfType<StringAttr>("hw_axis_owner")) {
+            hwAxisOwner = (attr.getValue() == "col") ? 1 : 0;
+        }
+        if (auto attr = op->getAttrOfType<StringAttr>("replicate_on")) {
+            if (attr.getValue() == "col") replicateOn = 1;
+            else if (attr.getValue() == "row") replicateOn = 0;
+        }
+        
+        // Get original shape from input type
+        auto originalShape = inputType.getShape();
+        int ndim = originalShape.size();
+        
+        // Compute partition shape: divide by splitnum along splitdim
+        SmallVector<int64_t, 4> partitionShape;
+        for (int i = 0; i < ndim; i++) {
+            if (i == splitdim) {
+                partitionShape.push_back(originalShape[i] / splitnum);
+            } else {
+                partitionShape.push_back(originalShape[i]);
+            }
+        }
+        
+        int64_t totalElements = 1;
+        for (auto dim : partitionShape) totalElements *= dim;
+        
+        int64_t elemSize = getElemSize(resultType.getElementType());
+        int64_t partitionByteSize = totalElements * elemSize;
+        
+        // Get data pointer from source (dataPtrMap stores the raw void*)
+        Value dataVoidPtr;
+        if (state.dataPtrMap.count(inputTensor)) {
+            dataVoidPtr = state.dataPtrMap[inputTensor];
+        } else {
+            dataVoidPtr = rewriter.create<emitc::ConstantOp>(loc, state.voidPtrType,
+                emitc::OpaqueAttr::get(state.ctx, "NULL")).getResult();
+        }
+        
+        // Build original_shape array literal
+        std::string origShapeStr = "(int64_t[]){";
+        for (size_t i = 0; i < originalShape.size(); i++) {
+            if (i > 0) origShapeStr += ", ";
+            origShapeStr += std::to_string(originalShape[i]);
+        }
+        origShapeStr += "}";
+        
+        // Build partition_shape array literal (divided by splitnum along splitdim)
+        std::string partShapeStr = "(int64_t[]){";
+        for (size_t i = 0; i < partitionShape.size(); i++) {
+            if (i > 0) partShapeStr += ", ";
+            partShapeStr += std::to_string(partitionShape[i]);
+        }
+        partShapeStr += "}";
+        
+        auto i64PtrType = emitc::PointerType::get(rewriter.getI64Type());
+        
+        auto elemSizeConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
+            rewriter.getI32IntegerAttr(elemSize));
+        auto ndimConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
+            rewriter.getI32IntegerAttr(ndim));
+        auto origShapeConst = rewriter.create<emitc::ConstantOp>(loc, i64PtrType,
+            emitc::OpaqueAttr::get(state.ctx, origShapeStr));
+        auto partShapeConst = rewriter.create<emitc::ConstantOp>(loc, i64PtrType,
+            emitc::OpaqueAttr::get(state.ctx, partShapeStr));
+        auto splitdimConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
+            rewriter.getI32IntegerAttr(splitdim));
+        auto splitnumConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
+            rewriter.getI32IntegerAttr(splitnum));
+        auto hwAxisConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
+            rewriter.getI32IntegerAttr(hwAxisOwner));
+        auto replicateConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
+            rewriter.getI32IntegerAttr(replicateOn));
+        
+        auto ptOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
+            "__emitc_init_PartitionTensor", nullptr, nullptr,
+            ValueRange{dataVoidPtr, elemSizeConst.getResult(), ndimConst.getResult(),
+                       origShapeConst.getResult(), partShapeConst.getResult(),
+                       splitdimConst.getResult(), splitnumConst.getResult(),
+                       hwAxisConst.getResult(), replicateConst.getResult()});
+        
+        state.memAllocMap[op->getResult(0)] = std::make_tuple(ptOp.getResult(0), partitionByteSize, totalElements);
+        state.dataPtrMap[op->getResult(0)] = dataVoidPtr;
+        llvm::errs() << "[Pattern] PartitionTensor: created (ndim=" << ndim 
+                     << ", splitdim=" << splitdim << ", splitnum=" << splitnum << ")\n";
+        
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// Inner pattern for tensor.extract_slice -> __emitc_extract_slice_*
+struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSliceOp> {
+    ConversionState &state;
+    
+    ExtractSliceInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : OpConversionPattern<tensor::ExtractSliceOp>(typeConverter, ctx, /*benefit=*/1), state(state) {}
     
     LogicalResult matchAndRewrite(tensor::ExtractSliceOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
         auto loc = op.getLoc();
-        auto ctx = rewriter.getContext();
         
         auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
         auto srcType = dyn_cast<RankedTensorType>(op.getSource().getType());
         if (!resultType || !srcType) return failure();
         
         Value srcTensor = op.getSource();
-        
-        // Source must be in memAllocMap (PartitionTensor)
-        if (!state.memAllocMap.count(srcTensor)) return failure();
+        if (!state.memAllocMap.count(srcTensor)) {
+            llvm::errs() << "[Pattern] ExtractSlice: source not in memAllocMap, skipping\n";
+            return failure();
+        }
         
         Value srcPartitionTensor = std::get<0>(state.memAllocMap[srcTensor]);
         
@@ -190,8 +423,7 @@ struct ExtractSliceToEmitCPattern : public OpConversionPattern<tensor::ExtractSl
             return failure();
         }
         
-        Type elemType = resultType.getElementType();
-        int64_t elemSize = getElemSize(elemType);
+        int64_t elemSize = getElemSize(resultType.getElementType());
         int64_t sliceElements = sizes[0] * sizes[1];
         int64_t sliceByteSize = sliceElements * elemSize;
         
@@ -199,14 +431,11 @@ struct ExtractSliceToEmitCPattern : public OpConversionPattern<tensor::ExtractSl
         // For 2D: contiguous if offset[1]==0 && size[1]==srcShape[1], or size[0]==1
         bool isContiguous = (offsets[1] == 0 && sizes[1] == srcShape[1]) || (sizes[0] == 1);
         
-        auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
-        auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
-        
         Value resultPt;
         
         if (isContiguous) {
             // Contiguous slice - pass PartitionTensor by value, use args for inline constants
-            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, partitionType,
+            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
                 "__emitc_extract_slice_contiguous_2d",
                 rewriter.getArrayAttr({
                     rewriter.getIndexAttr(0),
@@ -221,13 +450,11 @@ struct ExtractSliceToEmitCPattern : public OpConversionPattern<tensor::ExtractSl
             llvm::errs() << "[Pattern] ExtractSlice: contiguous 2D slice\n";
         } else {
             // Non-contiguous 2D slice with memory allocation
-            // Need DevInst global reference
-            auto devInstRef = rewriter.create<emitc::GetGlobalOp>(loc, devInstType, "DevInst");
-            auto devInstPtrType = emitc::PointerType::get(devInstType);
+            auto devInstPtrType = emitc::PointerType::get(state.devInstType);
             auto devInstAddr = rewriter.create<emitc::ApplyOp>(loc, devInstPtrType,
-                rewriter.getStringAttr("&"), devInstRef.getResult());
+                rewriter.getStringAttr("&"), state.devInstRef);
             
-            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, partitionType,
+            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
                 "__emitc_extract_slice_strided_2d",
                 rewriter.getArrayAttr({
                     rewriter.getIndexAttr(0),
@@ -252,431 +479,47 @@ struct ExtractSliceToEmitCPattern : public OpConversionPattern<tensor::ExtractSl
     }
 };
 
-/// ConversionPattern for dfscheblueprint.declare_data (generic by op name)
-struct DeclareDataPattern : public ConversionPattern {
-    ConversionState &state;
-    
-    DeclareDataPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : ConversionPattern(typeConverter, "dfscheblueprint.declare_data", /*benefit=*/1, ctx), state(state) {}
-    
-    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
-                                  ConversionPatternRewriter &rewriter) const override {
-        if (op->getNumResults() == 0) return failure();
-        
-        auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-        if (!resultType) return failure();
-        
-        auto loc = op->getLoc();
-        auto ctx = rewriter.getContext();
-        
-        std::string arrayName = "g_data_array_0";
-        if (op->getNumOperands() > 0) {
-            Value initTensor = op->getOperand(0);
-            if (Operation *initOp = initTensor.getDefiningOp()) {
-                if (state.arrayNameMap.count(initOp)) {
-                    arrayName = state.arrayNameMap[initOp];
-                }
-            }
-        }
-        
-        int64_t totalElements = 1;
-        for (auto dim : resultType.getShape()) {
-            totalElements *= dim;
-        }
-        
-        Type elemType = resultType.getElementType();
-        int64_t elemSize = getElemSize(elemType);
-        int64_t byteSize = totalElements * elemSize;
-        
-        auto i32Type = rewriter.getI32Type();
-        auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
-        auto memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
-        auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
-        
-        auto devInstRef = rewriter.create<emitc::GetGlobalOp>(loc, devInstType, "DevInst");
-        auto sizeConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
-            rewriter.getI32IntegerAttr(byteSize));
-        auto cacheableConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
-            emitc::OpaqueAttr::get(ctx, "XAIE_MEM_CACHEABLE"));
-        
-        auto memInst = rewriter.create<emitc::CallOpaqueOp>(loc,
-            memInstPtrType, "XAie_MemAllocate",
-            nullptr, nullptr,
-            ValueRange{devInstRef.getResult(), sizeConst.getResult(), cacheableConst.getResult()});
-        
-        auto vaddr = rewriter.create<emitc::CallOpaqueOp>(loc,
-            voidPtrType, "XAie_MemGetVAddr",
-            nullptr, nullptr, ValueRange{memInst.getResult(0)});
-        
-        auto srcPtr = rewriter.create<emitc::ConstantOp>(loc, voidPtrType,
-            emitc::OpaqueAttr::get(ctx, "(void*)" + arrayName));
-        
-        rewriter.create<emitc::CallOpaqueOp>(loc,
-            voidPtrType, "memcpy",
-            nullptr, nullptr,
-            ValueRange{vaddr.getResult(0), srcPtr.getResult(), sizeConst.getResult()});
-        
-        state.memAllocMap[op->getResult(0)] = std::make_tuple(vaddr.getResult(0), byteSize, totalElements);
-        llvm::errs() << "[Pattern] Generated XAie_MemAllocate for " << arrayName << "\n";
-        
-        rewriter.eraseOp(op);
-        return success();
-    }
-};
+//===----------------------------------------------------------------------===//
+// Outer Patterns (Convert host op structure)
+//===----------------------------------------------------------------------===//
 
-/// ConversionPattern for routing.partitiontensor
-struct PartitionTensorPattern : public ConversionPattern {
-    ConversionState &state;
-    
-    PartitionTensorPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : ConversionPattern(typeConverter, "routing.partitiontensor", /*benefit=*/1, ctx), state(state) {}
-    
-    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
-                                  ConversionPatternRewriter &rewriter) const override {
-        if (op->getNumResults() == 0 || op->getNumOperands() == 0) return failure();
-        
-        auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-        if (!resultType) return failure();
-        
-        auto loc = op->getLoc();
-        auto ctx = rewriter.getContext();
-        
-        Value inputTensor = op->getOperand(0);
-        
-        int splitnum = 1, splitdim = 0;
-        if (auto attr = op->getAttrOfType<IntegerAttr>("splitnum")) {
-            splitnum = attr.getInt();
-        }
-        if (auto attr = op->getAttrOfType<IntegerAttr>("splitdim")) {
-            splitdim = attr.getInt();
-        }
-        
-        int64_t totalElements = 1;
-        for (auto dim : resultType.getShape()) {
-            totalElements *= dim;
-        }
-        
-        Type elemType = resultType.getElementType();
-        int64_t elemSize = getElemSize(elemType);
-        int64_t partitionByteSize = totalElements * elemSize;
-        
-        Value srcDataPtr;
-        if (state.memAllocMap.count(inputTensor)) {
-            srcDataPtr = std::get<0>(state.memAllocMap[inputTensor]);
-        }
-        
-        auto i32Type = rewriter.getI32Type();
-        auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
-        
-        Value dataVoidPtr = srcDataPtr ? srcDataPtr :
-            rewriter.create<emitc::ConstantOp>(loc, voidPtrType,
-                emitc::OpaqueAttr::get(ctx, "NULL")).getResult();
-        
-        auto sizeConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
-            rewriter.getI32IntegerAttr(partitionByteSize));
-        auto numElemsConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
-            rewriter.getI32IntegerAttr(totalElements));
-        auto splitnumConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
-            rewriter.getI32IntegerAttr(splitnum));
-        auto splitdimConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
-            rewriter.getI32IntegerAttr(splitdim));
-        
-        auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
-        rewriter.create<emitc::CallOpaqueOp>(loc,
-            partitionType, "__emitc_init_PartitionTensor",
-            nullptr, nullptr,
-            ValueRange{dataVoidPtr, sizeConst.getResult(), numElemsConst.getResult(),
-                       splitnumConst.getResult(), splitdimConst.getResult()});
-        
-        if (srcDataPtr) {
-            state.memAllocMap[op->getResult(0)] = std::make_tuple(srcDataPtr, partitionByteSize, totalElements);
-        }
-        
-        llvm::errs() << "[Pattern] Created PartitionTensor: partition_" << state.partitionIndex++ << "\n";
-        
-        rewriter.eraseOp(op);
-        return success();
-    }
-};
-
-/// ConversionPattern for dfschedule.host -> emitc.func
-/// This pattern has low benefit so inner patterns are applied first
-struct HostOpPattern : public ConversionPattern {
-    ConversionState &state;
-    
-    HostOpPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : ConversionPattern(typeConverter, "dfschedule.host", /*benefit=*/0, ctx), state(state) {}
+/// Outer pattern for dfschedule.host -> emitc.func (simple shell only)
+/// The inner ops are already converted by the host inner pattern phase
+struct HostOpOuterPattern : public ConversionPattern {
+    HostOpOuterPattern(TypeConverter &typeConverter, MLIRContext *ctx)
+        : ConversionPattern(typeConverter, "dfschedule.host", /*benefit=*/1, ctx) {}
     
     LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                                   ConversionPatternRewriter &rewriter) const override {
         auto loc = op->getLoc();
-        auto ctx = rewriter.getContext();
         
         std::string funcName = "hostruntime";
         if (auto symNameAttr = op->getAttrOfType<StringAttr>("sym_name")) {
             funcName = symNameAttr.getValue().str();
         }
         
+        // Create emitc.func
         auto funcType = rewriter.getFunctionType({}, {});
         auto emitcFunc = rewriter.create<emitc::FuncOp>(loc, funcName, funcType);
         Block *entryBlock = emitcFunc.addEntryBlock();
-        
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToStart(entryBlock);
-        
-        // Process nested operations and convert them inline
-        auto i32Type = rewriter.getI32Type();
-        auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
-        auto memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
-        auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
-        
-        auto devInstRef = rewriter.create<emitc::GetGlobalOp>(loc, devInstType, "DevInst");
-        auto cacheableConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
-            emitc::OpaqueAttr::get(ctx, "XAIE_MEM_CACHEABLE"));
-        
+        ///*
+        // Move converted operations from host region to new func
         if (op->getNumRegions() > 0 && !op->getRegion(0).empty()) {
             Block &srcBlock = op->getRegion(0).front();
             
-            for (Operation &nestedOp : srcBlock.getOperations()) {
-                StringRef nestedOpName = nestedOp.getName().getStringRef();
-                auto nestedLoc = nestedOp.getLoc();
-                
-                // Convert dfscheblueprint.declare_data inline
-                if (nestedOpName == "dfscheblueprint.declare_data") {
-                    if (nestedOp.getNumResults() == 0) continue;
-                    
-                    auto resultType = dyn_cast<RankedTensorType>(nestedOp.getResult(0).getType());
-                    if (!resultType) continue;
-                    
-                    std::string arrayName = "g_data_array_0";
-                    if (nestedOp.getNumOperands() > 0) {
-                        if (Operation *initOp = nestedOp.getOperand(0).getDefiningOp()) {
-                            if (state.arrayNameMap.count(initOp)) {
-                                arrayName = state.arrayNameMap[initOp];
-                            }
-                        }
-                    }
-                    
-                    auto shape = resultType.getShape();
-                    int64_t totalElements = 1;
-                    for (auto dim : shape) totalElements *= dim;
-                    
-                    Type elemType = resultType.getElementType();
-                    int64_t elemSize = getElemSize(elemType);
-                    int64_t byteSize = totalElements * elemSize;
-                    int ndim = shape.size();
-                    
-                    auto sizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(byteSize));
-                    
-                    auto memInst = rewriter.create<emitc::CallOpaqueOp>(nestedLoc,
-                        memInstPtrType, "XAie_MemAllocate", nullptr, nullptr,
-                        ValueRange{devInstRef.getResult(), sizeConst.getResult(), cacheableConst.getResult()});
-                    
-                    auto vaddr = rewriter.create<emitc::CallOpaqueOp>(nestedLoc,
-                        voidPtrType, "XAie_MemGetVAddr", nullptr, nullptr,
-                        ValueRange{memInst.getResult(0)});
-                    
-                    auto srcPtr = rewriter.create<emitc::ConstantOp>(nestedLoc, voidPtrType,
-                        emitc::OpaqueAttr::get(ctx, "(void*)" + arrayName));
-                    
-                    rewriter.create<emitc::CallOpaqueOp>(nestedLoc, voidPtrType, "memcpy",
-                        nullptr, nullptr,
-                        ValueRange{vaddr.getResult(0), srcPtr.getResult(), sizeConst.getResult()});
-                    
-                    // Store the raw data pointer - PartitionTensor will be created by routing.partitiontensor
-                    state.dataPtrMap[nestedOp.getResult(0)] = vaddr.getResult(0);
-                    llvm::errs() << "[Pattern] Host: XAie_MemAllocate for " << arrayName << "\n";
+            // Clone all operations except terminator to the new func
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(entryBlock);
+            
+            for (Operation &nestedOp : llvm::make_early_inc_range(srcBlock.getOperations())) {
+                if (!nestedOp.hasTrait<OpTrait::IsTerminator>()) {
+                    rewriter.clone(nestedOp);
                 }
-                
-                // Convert routing.partitiontensor inline
-                if (nestedOpName == "routing.partitiontensor") {
-                    if (nestedOp.getNumResults() == 0 || nestedOp.getNumOperands() == 0) continue;
-                    
-                    auto resultType = dyn_cast<RankedTensorType>(nestedOp.getResult(0).getType());
-                    auto inputType = dyn_cast<RankedTensorType>(nestedOp.getOperand(0).getType());
-                    if (!resultType || !inputType) continue;
-                    
-                    Value inputTensor = nestedOp.getOperand(0);
-                    
-                    // Get partition attributes
-                    int splitnum = 1, splitdim = 0;
-                    if (auto attr = nestedOp.getAttrOfType<IntegerAttr>("splitnum")) splitnum = attr.getInt();
-                    if (auto attr = nestedOp.getAttrOfType<IntegerAttr>("splitdim")) splitdim = attr.getInt();
-                    
-                    // Get hw_axis_owner and replicate_on (convert string to int)
-                    int hwAxisOwner = 0; // 0=row, 1=col
-                    int replicateOn = -1; // -1=none, 0=row, 1=col
-                    if (auto attr = nestedOp.getAttrOfType<StringAttr>("hw_axis_owner")) {
-                        hwAxisOwner = (attr.getValue() == "col") ? 1 : 0;
-                    }
-                    if (auto attr = nestedOp.getAttrOfType<StringAttr>("replicate_on")) {
-                        if (attr.getValue() == "col") replicateOn = 1;
-                        else if (attr.getValue() == "row") replicateOn = 0;
-                    }
-                    
-                    // Get original shape from input type
-                    auto originalShape = inputType.getShape();
-                    int ndim = originalShape.size();
-                    
-                    // Compute partition shape: divide by splitnum along splitdim
-                    SmallVector<int64_t, 4> partitionShape;
-                    for (int i = 0; i < ndim; i++) {
-                        if (i == splitdim) {
-                            partitionShape.push_back(originalShape[i] / splitnum);
-                        } else {
-                            partitionShape.push_back(originalShape[i]);
-                        }
-                    }
-                    
-                    int64_t totalElements = 1;
-                    for (auto dim : partitionShape) totalElements *= dim;
-                    
-                    int64_t elemSize = getElemSize(resultType.getElementType());
-                    int64_t partitionByteSize = totalElements * elemSize;
-                    
-                    // Get data pointer from source (dataPtrMap stores the raw void*)
-                    Value dataVoidPtr;
-                    if (state.dataPtrMap.count(inputTensor)) {
-                        dataVoidPtr = state.dataPtrMap[inputTensor];
-                    } else {
-                        dataVoidPtr = rewriter.create<emitc::ConstantOp>(nestedLoc, voidPtrType,
-                            emitc::OpaqueAttr::get(ctx, "NULL")).getResult();
-                    }
-                    
-                    // Build original_shape array literal
-                    std::string origShapeStr = "(int64_t[]){";
-                    for (size_t i = 0; i < originalShape.size(); i++) {
-                        if (i > 0) origShapeStr += ", ";
-                        origShapeStr += std::to_string(originalShape[i]);
-                    }
-                    origShapeStr += "}";
-                    
-                    // Build partition_shape array literal (divided by splitnum along splitdim)
-                    std::string partShapeStr = "(int64_t[]){";
-                    for (size_t i = 0; i < partitionShape.size(); i++) {
-                        if (i > 0) partShapeStr += ", ";
-                        partShapeStr += std::to_string(partitionShape[i]);
-                    }
-                    partShapeStr += "}";
-                    
-                    auto i64PtrType = emitc::PointerType::get(rewriter.getI64Type());
-                    
-                    auto elemSizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(elemSize));
-                    auto ndimConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(ndim));
-                    auto origShapeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i64PtrType,
-                        emitc::OpaqueAttr::get(ctx, origShapeStr));
-                    auto partShapeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i64PtrType,
-                        emitc::OpaqueAttr::get(ctx, partShapeStr));
-                    auto splitdimConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(splitdim));
-                    auto splitnumConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(splitnum));
-                    auto hwAxisConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(hwAxisOwner));
-                    auto replicateConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(replicateOn));
-                    
-                    auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
-                    auto ptOp = rewriter.create<emitc::CallOpaqueOp>(nestedLoc, partitionType,
-                        "__emitc_init_PartitionTensor", nullptr, nullptr,
-                        ValueRange{dataVoidPtr, elemSizeConst.getResult(), ndimConst.getResult(),
-                                   origShapeConst.getResult(), partShapeConst.getResult(),
-                                   splitdimConst.getResult(), splitnumConst.getResult(),
-                                   hwAxisConst.getResult(), replicateConst.getResult()});
-                    
-                    state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(ptOp.getResult(0), partitionByteSize, totalElements);
-                    state.dataPtrMap[nestedOp.getResult(0)] = dataVoidPtr;
-                    llvm::errs() << "[Pattern] Host: PartitionTensor created (ndim=" << ndim 
-                                 << ", splitdim=" << splitdim << ", splitnum=" << splitnum << ")\n";
-                }
-                /*
-                // Convert tensor.extract_slice inline (nested ops can't use separate patterns)
-                if (nestedOpName == "tensor.extract_slice") {
-                    if (nestedOp.getNumResults() == 0 || nestedOp.getNumOperands() == 0) continue;
-                    
-                    auto resultType = dyn_cast<RankedTensorType>(nestedOp.getResult(0).getType());
-                    auto srcType = dyn_cast<RankedTensorType>(nestedOp.getOperand(0).getType());
-                    if (!resultType || !srcType) continue;
-                    
-                    Value srcTensor = nestedOp.getOperand(0);
-                    if (!state.memAllocMap.count(srcTensor)) continue;
-                    
-                    Value srcPartitionTensor = std::get<0>(state.memAllocMap[srcTensor]);
-                    
-                    auto staticOffsetsAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_offsets");
-                    auto staticSizesAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_sizes");
-                    if (!staticOffsetsAttr || !staticSizesAttr) continue;
-                    
-                    auto offsets = staticOffsetsAttr.asArrayRef();
-                    auto sizes = staticSizesAttr.asArrayRef();
-                    auto srcShape = srcType.getShape();
-                    
-                    int64_t ndim = srcShape.size();
-                    if (ndim != 2) {
-                        llvm::errs() << "[Pattern] Warning: extract_slice only supported for 2D\n";
-                        continue;
-                    }
-                    
-                    int64_t elemSize = getElemSize(resultType.getElementType());
-                    int64_t sliceElements = sizes[0] * sizes[1];
-                    int64_t sliceByteSize = sliceElements * elemSize;
-                    
-                    // Check if slice is contiguous:
-                    // For 2D: contiguous if offset[1]==0 && size[1]==srcShape[1], or size[0]==1
-                    bool isContiguous = (offsets[1] == 0 && sizes[1] == srcShape[1]) || (sizes[0] == 1);
-                    
-                    auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
-                    
-                    Value resultPt;
-                    
-                    if (isContiguous) {
-                        // Contiguous slice - pass PartitionTensor by value, use args for inline constants
-                        auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(nestedLoc, partitionType,
-                            "__emitc_extract_slice_contiguous_2d",
-                            rewriter.getArrayAttr({
-                                rewriter.getIndexAttr(0),
-                                rewriter.getI32IntegerAttr(offsets[0]),
-                                rewriter.getI32IntegerAttr(offsets[1]),
-                                rewriter.getI32IntegerAttr(sizes[0]),
-                                rewriter.getI32IntegerAttr(sizes[1])
-                            }),
-                            nullptr,
-                            ValueRange{srcPartitionTensor});
-                        resultPt = sliceOp.getResult(0);
-                        llvm::errs() << "[Pattern] Host: contiguous 2D slice\n";
-                    } else {
-                        // Non-contiguous 2D slice with memory allocation
-                        auto devInstPtrType = emitc::PointerType::get(devInstType);
-                        auto devInstAddr = rewriter.create<emitc::ApplyOp>(nestedLoc, devInstPtrType,
-                            rewriter.getStringAttr("&"), devInstRef.getResult());
-                        
-                        auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(nestedLoc, partitionType,
-                            "__emitc_extract_slice_strided_2d",
-                            rewriter.getArrayAttr({
-                                rewriter.getIndexAttr(0),
-                                rewriter.getIndexAttr(1),
-                                rewriter.getI32IntegerAttr(offsets[0]),
-                                rewriter.getI32IntegerAttr(offsets[1]),
-                                rewriter.getI32IntegerAttr(sizes[0]),
-                                rewriter.getI32IntegerAttr(sizes[1])
-                            }),
-                            nullptr,
-                            ValueRange{devInstAddr.getResult(), srcPartitionTensor});
-                        resultPt = sliceOp.getResult(0);
-                        
-                        state.allocatedMemList.push_back(resultPt);
-                        llvm::errs() << "[Pattern] Host: strided 2D slice (allocated)\n";
-                    }
-                    
-                    state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(resultPt, sliceByteSize, sliceElements);
-                }
-                */
             }
         }
+        ///*/
         
+        // Add return at the end
         rewriter.setInsertionPointToEnd(entryBlock);
         rewriter.create<emitc::ReturnOp>(loc, Value{});
         
@@ -736,7 +579,7 @@ struct DsKernelReceiverPattern : public ConversionPattern {
 };
 
 //===----------------------------------------------------------------------===//
-// Pass Implementation - Using ConversionPattern with applyPartialConversion
+// Pass Implementation - Two-Phase Conversion with Walk + Patterns
 //===----------------------------------------------------------------------===//
 
 void DfscheduleToApiPass::runOnOperation() {
@@ -898,54 +741,169 @@ void DfscheduleToApiPass::runOnOperation() {
             "DevInst", devInstType, Attribute{}, true, false, false);
     }
     
+    llvm::errs() << "[Pass] Phase 1: Helper definitions generated\n";
+    
     //==========================================================================
-    // Phase 2: Apply conversion patterns using applyPartialConversion
+    // Phase 2: Convert dense constants at module level
     //==========================================================================
     
-    llvm::errs() << "[Pass] Phase 2: Applying conversion patterns\n";
+    llvm::errs() << "[Pass] Phase 2: Converting dense constants\n";
     
-    // Setup conversion target
-    ConversionTarget target(*ctx);
-    target.addLegalDialect<emitc::EmitCDialect, func::FuncDialect, scf::SCFDialect>();
-    target.addLegalOp<ModuleOp>();
-    
-    // Mark custom dialect ops as illegal
-    target.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
-        // Illegal if it has DenseElementsAttr (needs conversion)
-        return !isa<DenseElementsAttr>(op.getValue());
-    });
-    target.addIllegalOp<tensor::ExtractSliceOp>();
-    
-    // Mark operations by name as illegal
-    target.markUnknownOpDynamicallyLegal([](Operation *op) {
-        StringRef opName = op->getName().getStringRef();
-        if (opName.starts_with("dfschedule.") ||
-            opName.starts_with("dfscheblueprint.") ||
-            opName.starts_with("routing.")) {
-            return false; // illegal
+    {
+        ConversionTarget constTarget(*ctx);
+        constTarget.addLegalDialect<emitc::EmitCDialect>();
+        constTarget.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
+            // Only convert constants with DenseElementsAttr
+            return !dyn_cast<DenseElementsAttr>(op.getValue());
+        });
+        
+        RewritePatternSet constPatterns(ctx);
+        constPatterns.add<DenseConstantToEmitCPattern>(typeConverter, ctx, state);
+        
+        if (failed(applyPartialConversion(moduleOp, constTarget, std::move(constPatterns)))) {
+            llvm::errs() << "[Pass] Warning: Some constants not converted\n";
         }
-        return true; // legal
-    });
-    
-    // Create patterns - HostOpPattern handles nested ops inline
-    RewritePatternSet patterns(ctx);
-    patterns.add<DenseConstantToEmitCPattern>(typeConverter, ctx, state);
-    patterns.add<HostOpPattern>(typeConverter, ctx, state);
-    patterns.add<LaunchHostPattern>(typeConverter, ctx);
-    patterns.add<DsKernelReceiverPattern>(typeConverter, ctx);
-    patterns.add<ExtractSliceToEmitCPattern>(typeConverter, ctx, state);
-    
-    // Apply partial conversion
-    if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
-        llvm::errs() << "[Pass] Warning: Partial conversion had failures\n";
-        // Don't signal failure - some ops may remain intentionally
     }
     
     //==========================================================================
-    // Phase 3: Apply canonicalization to optimize EmitC
+    // Phase 3: Walk dfschedule.host ops and apply inner patterns
     //==========================================================================
     
-    llvm::errs() << "[Pass] Phase 3: Applying canonicalization patterns\n";
+    llvm::errs() << "[Pass] Phase 3: Converting inner ops in dfschedule.host regions\n";
+    
+    // Setup common types for inner patterns
+    state.ctx = ctx;
+    state.i32Type = IntegerType::get(ctx, 32);
+    state.voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
+    state.memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
+    state.devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
+    state.partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
+    
+    // Create inner patterns (arith.constant, declare_data, partitiontensor, extract_slice, erase ops)
+    RewritePatternSet innerPatterns(ctx);
+    innerPatterns.add<ArithConstantInnerPattern>(typeConverter, ctx, state);
+    innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx, state);
+    innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
+    innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
+    
+    // Add EraseOpLowering patterns for ops that should simply be erased
+    addEraseOpPatterns(innerPatterns, typeConverter, ctx, {
+        "dfschedule.schedule.wait",
+        "dfschedule.start_io",
+        "dfschedule.launch_kernel_group",
+        "dfschedule.load_kernel_group",
+        "dfschedule.create_io",
+        "dfschedule.config.dma_bd",
+        "dfschedule.declaretile"
+    });
+    
+    FrozenRewritePatternSet frozenInnerPatterns(std::move(innerPatterns));
+    ///*
+    // Walk each dfschedule.host op and apply inner patterns to its region
+    moduleOp.walk([&](Operation *hostOp) {
+        if (hostOp->getName().getStringRef() != "dfschedule.host")
+            return;
+        
+        if (hostOp->getNumRegions() == 0 || hostOp->getRegion(0).empty())
+            return;
+
+        ConversionTarget innerTarget(*ctx);
+        innerTarget.addLegalDialect<emitc::EmitCDialect>();
+        innerTarget.addLegalDialect<scf::SCFDialect>();
+        innerTarget.addIllegalOp<tensor::ExtractSliceOp>();
+        
+        // arith.constant with DenseElementsAttr is illegal (needs to be erased after global array created)
+        innerTarget.addDynamicallyLegalOp<arith::ConstantOp>([&state](arith::ConstantOp op) {
+            auto denseAttr = dyn_cast<DenseElementsAttr>(op.getValue());
+            if (!denseAttr) return true; // non-tensor constants are legal
+            return !state.arrayNameMap.count(op.getOperation()); // illegal if already in arrayNameMap
+        });
+        
+        innerTarget.markUnknownOpDynamicallyLegal([](Operation *op) {
+            StringRef opName = op->getName().getStringRef();
+            // Ops that need conversion
+            if (opName == "dfscheblueprint.declare_data" ||
+                opName == "routing.partitiontensor") {
+                return false; // illegal - needs conversion
+            }
+            // Ops that need to be erased
+            if (opName == "dfschedule.schedule.wait" ||
+                opName == "dfschedule.start_io" ||
+                opName == "dfschedule.launch_kernel_group" ||
+                opName == "dfschedule.load_kernel_group" ||
+                opName == "dfschedule.create_io" ||
+                opName == "dfschedule.config.dma_bd" ||
+                opName == "dfschedule.declaretile") {
+                return false; // illegal - needs to be erased
+            }
+            return true;
+        });
+        
+        if (failed(applyPartialConversion(hostOp, innerTarget, std::move(frozenInnerPatterns)))) {
+            llvm::errs() << "[Pass] Warning: Some inner ops not converted in host region\n";
+        }
+    });
+    //*/
+    //==========================================================================
+    // Phase 4: Convert dfschedule ops (host -> emitc.func, launchhost, dskernel_receiver)
+    //==========================================================================
+    
+    llvm::errs() << "[Pass] Phase 4: Converting dfschedule operations\n";
+    
+    {
+        ConversionTarget target(*ctx);
+        target.addLegalDialect<emitc::EmitCDialect>();
+        target.addLegalDialect<arith::ArithDialect>();
+        target.addLegalDialect<scf::SCFDialect>();
+        
+        target.markUnknownOpDynamicallyLegal([](Operation *op) {
+            StringRef opName = op->getName().getStringRef();
+            if (opName.starts_with("dfschedule.") ||
+                opName.starts_with("dfscheblueprint.") ||
+                opName.starts_with("routing.")) {
+                return false; // illegal
+            }
+            return true;
+        });
+        
+        RewritePatternSet patterns(ctx);
+        patterns.add<HostOpOuterPattern>(typeConverter, ctx);
+        patterns.add<LaunchHostPattern>(typeConverter, ctx);
+        patterns.add<DsKernelReceiverPattern>(typeConverter, ctx);
+        
+        if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
+            llvm::errs() << "[Pass] Warning: Partial conversion had failures\n";
+        }
+    }
+    
+    //==========================================================================
+    // Phase 4.5: Walk and convert any remaining dfschedule.launchhost inside execute_regions
+    //==========================================================================
+    
+    llvm::errs() << "[Pass] Phase 4.5: Converting nested launchhost ops\n";
+    
+    {
+        SmallVector<Operation*> launchhostOps;
+        moduleOp.walk([&](Operation *op) {
+            if (op->getName().getStringRef() == "dfschedule.launchhost") {
+                launchhostOps.push_back(op);
+            }
+        });
+        
+        for (Operation *op : launchhostOps) {
+            OpBuilder builder(op);
+            builder.create<emitc::CallOpaqueOp>(op->getLoc(),
+                TypeRange{}, "hostruntime", nullptr, nullptr, ValueRange{});
+            llvm::errs() << "[Pass] Converted nested launchhost\n";
+            op->erase();
+        }
+    }
+    
+    //==========================================================================
+    // Phase 5: Apply canonicalization to optimize EmitC
+    //==========================================================================
+    
+    llvm::errs() << "[Pass] Phase 5: Applying canonicalization patterns\n";
     
     {
         RewritePatternSet canonPatterns(ctx);
@@ -961,7 +919,7 @@ void DfscheduleToApiPass::runOnOperation() {
         }
     }
     
-    llvm::errs() << "=== DfscheduleToApiPass SUCCESS ===\n";
+    llvm::errs() << "=== DfscheduleToApiPass COMPLETE ===\n";
 }
 
 } // namespace mlir
