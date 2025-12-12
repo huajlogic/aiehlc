@@ -157,7 +157,7 @@ struct DenseConstantToEmitCPattern : public OpConversionPattern<arith::ConstantO
     }
 };
 
-/// OpConversionPattern for tensor.extract_slice -> EmitC slice extraction
+/// OpConversionPattern for tensor.extract_slice -> EmitC PartitionTensor slice extraction
 struct ExtractSliceToEmitCPattern : public OpConversionPattern<tensor::ExtractSliceOp> {
     ConversionState &state;
     
@@ -175,49 +175,77 @@ struct ExtractSliceToEmitCPattern : public OpConversionPattern<tensor::ExtractSl
         
         Value srcTensor = op.getSource();
         
+        // Source must be in memAllocMap (PartitionTensor)
         if (!state.memAllocMap.count(srcTensor)) return failure();
         
-        Value srcDataPtr = std::get<0>(state.memAllocMap[srcTensor]);
+        Value srcPartitionTensor = std::get<0>(state.memAllocMap[srcTensor]);
         
         auto offsets = op.getStaticOffsets();
         auto sizes = op.getStaticSizes();
         auto srcShape = srcType.getShape();
         
+        int64_t ndim = srcShape.size();
+        if (ndim != 2) {
+            llvm::errs() << "[Pattern] Warning: extract_slice only supported for 2D\n";
+            return failure();
+        }
+        
         Type elemType = resultType.getElementType();
         int64_t elemSize = getElemSize(elemType);
-        
-        int64_t sliceElements = 1;
-        for (auto s : sizes) sliceElements *= s;
+        int64_t sliceElements = sizes[0] * sizes[1];
         int64_t sliceByteSize = sliceElements * elemSize;
         
-        int64_t byteOffset = 0;
-        int64_t stride = elemSize;
-        for (int64_t i = srcShape.size() - 1; i >= 0; --i) {
-            byteOffset += offsets[i] * stride;
-            stride *= srcShape[i];
-        }
+        // Check if slice is contiguous:
+        // For 2D: contiguous if offset[1]==0 && size[1]==srcShape[1], or size[0]==1
+        bool isContiguous = (offsets[1] == 0 && sizes[1] == srcShape[1]) || (sizes[0] == 1);
         
-        auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
-        auto i32Type = rewriter.getI32Type();
+        auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
+        auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
         
-        Value slicePtr;
-        if (byteOffset == 0) {
-            slicePtr = srcDataPtr;
+        Value resultPt;
+        
+        if (isContiguous) {
+            // Contiguous slice - pass PartitionTensor by value, use args for inline constants
+            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, partitionType,
+                "__emitc_extract_slice_contiguous_2d",
+                rewriter.getArrayAttr({
+                    rewriter.getIndexAttr(0),
+                    rewriter.getI32IntegerAttr(offsets[0]),
+                    rewriter.getI32IntegerAttr(offsets[1]),
+                    rewriter.getI32IntegerAttr(sizes[0]),
+                    rewriter.getI32IntegerAttr(sizes[1])
+                }),
+                nullptr,
+                ValueRange{srcPartitionTensor});
+            resultPt = sliceOp.getResult(0);
+            llvm::errs() << "[Pattern] ExtractSlice: contiguous 2D slice\n";
         } else {
-            auto offsetConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
-                rewriter.getI32IntegerAttr(byteOffset));
-            auto sliceSizeConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
-                rewriter.getI32IntegerAttr(sliceByteSize));
+            // Non-contiguous 2D slice with memory allocation
+            // Need DevInst global reference
+            auto devInstRef = rewriter.create<emitc::GetGlobalOp>(loc, devInstType, "DevInst");
+            auto devInstPtrType = emitc::PointerType::get(devInstType);
+            auto devInstAddr = rewriter.create<emitc::ApplyOp>(loc, devInstPtrType,
+                rewriter.getStringAttr("&"), devInstRef.getResult());
             
-            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc,
-                voidPtrType, "__emitc_extract_slice_contiguous",
-                nullptr, nullptr,
-                ValueRange{srcDataPtr, offsetConst.getResult(), sliceSizeConst.getResult()});
-            slicePtr = sliceOp.getResult(0);
+            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, partitionType,
+                "__emitc_extract_slice_strided_2d",
+                rewriter.getArrayAttr({
+                    rewriter.getIndexAttr(0),
+                    rewriter.getIndexAttr(1),
+                    rewriter.getI32IntegerAttr(offsets[0]),
+                    rewriter.getI32IntegerAttr(offsets[1]),
+                    rewriter.getI32IntegerAttr(sizes[0]),
+                    rewriter.getI32IntegerAttr(sizes[1])
+                }),
+                nullptr,
+                ValueRange{devInstAddr.getResult(), srcPartitionTensor});
+            resultPt = sliceOp.getResult(0);
+            
+            state.allocatedMemList.push_back(resultPt);
+            llvm::errs() << "[Pattern] ExtractSlice: strided 2D slice (allocated)\n";
         }
         
-        state.memAllocMap[op.getResult()] = std::make_tuple(slicePtr, sliceByteSize, sliceElements);
-        llvm::errs() << "[Pattern] Created slice (offset=" << byteOffset << " bytes)\n";
+        state.memAllocMap[op.getResult()] = std::make_tuple(resultPt, sliceByteSize, sliceElements);
         
         rewriter.eraseOp(op);
         return success();
@@ -564,8 +592,8 @@ struct HostOpPattern : public ConversionPattern {
                     llvm::errs() << "[Pattern] Host: PartitionTensor created (ndim=" << ndim 
                                  << ", splitdim=" << splitdim << ", splitnum=" << splitnum << ")\n";
                 }
-                
-                // Convert tensor.extract_slice inline
+                /*
+                // Convert tensor.extract_slice inline (nested ops can't use separate patterns)
                 if (nestedOpName == "tensor.extract_slice") {
                     if (nestedOp.getNumResults() == 0 || nestedOp.getNumOperands() == 0) continue;
                     
@@ -621,7 +649,6 @@ struct HostOpPattern : public ConversionPattern {
                         llvm::errs() << "[Pattern] Host: contiguous 2D slice\n";
                     } else {
                         // Non-contiguous 2D slice with memory allocation
-                        // DevInst still needs & since it's XAie_DevInst* parameter
                         auto devInstPtrType = emitc::PointerType::get(devInstType);
                         auto devInstAddr = rewriter.create<emitc::ApplyOp>(nestedLoc, devInstPtrType,
                             rewriter.getStringAttr("&"), devInstRef.getResult());
@@ -646,6 +673,7 @@ struct HostOpPattern : public ConversionPattern {
                     
                     state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(resultPt, sliceByteSize, sliceElements);
                 }
+                */
             }
         }
         
@@ -905,6 +933,7 @@ void DfscheduleToApiPass::runOnOperation() {
     patterns.add<HostOpPattern>(typeConverter, ctx, state);
     patterns.add<LaunchHostPattern>(typeConverter, ctx);
     patterns.add<DsKernelReceiverPattern>(typeConverter, ctx);
+    patterns.add<ExtractSliceToEmitCPattern>(typeConverter, ctx, state);
     
     // Apply partial conversion
     if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
