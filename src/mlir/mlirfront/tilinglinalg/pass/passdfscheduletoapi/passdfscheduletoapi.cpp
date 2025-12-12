@@ -103,7 +103,10 @@ static int64_t getElemSize(Type elemType) {
 //===----------------------------------------------------------------------===//
 
 struct ConversionState {
+    // Maps MLIR Value to (PartitionTensor SSA Value, byte size, num elements)
     DenseMap<Value, std::tuple<Value, int64_t, int64_t>> memAllocMap;
+    // Also track the raw data pointer for cases where we need it
+    DenseMap<Value, Value> dataPtrMap;
     SmallVector<Value> allocatedMemList;
     DenseMap<Operation*, std::string> arrayNameMap;
     int arrayIndex = 0;
@@ -426,11 +429,14 @@ struct HostOpPattern : public ConversionPattern {
                         }
                     }
                     
+                    auto shape = resultType.getShape();
                     int64_t totalElements = 1;
-                    for (auto dim : resultType.getShape()) totalElements *= dim;
+                    for (auto dim : shape) totalElements *= dim;
                     
                     Type elemType = resultType.getElementType();
-                    int64_t byteSize = totalElements * getElemSize(elemType);
+                    int64_t elemSize = getElemSize(elemType);
+                    int64_t byteSize = totalElements * elemSize;
+                    int ndim = shape.size();
                     
                     auto sizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
                         rewriter.getI32IntegerAttr(byteSize));
@@ -450,8 +456,41 @@ struct HostOpPattern : public ConversionPattern {
                         nullptr, nullptr,
                         ValueRange{vaddr.getResult(0), srcPtr.getResult(), sizeConst.getResult()});
                     
-                    state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(vaddr.getResult(0), byteSize, totalElements);
-                    llvm::errs() << "[Pattern] Host: XAie_MemAllocate for " << arrayName << "\n";
+                    // Build shape array literal
+                    std::string shapeStr = "(int64_t[]){";
+                    for (size_t i = 0; i < shape.size(); i++) {
+                        if (i > 0) shapeStr += ", ";
+                        shapeStr += std::to_string(shape[i]);
+                    }
+                    shapeStr += "}";
+                    
+                    auto i64PtrType = emitc::PointerType::get(rewriter.getI64Type());
+                    auto elemSizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(elemSize));
+                    auto ndimConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(ndim));
+                    auto shapeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i64PtrType,
+                        emitc::OpaqueAttr::get(ctx, shapeStr));
+                    auto partDimConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(-1)); // not partitioned
+                    auto numPartConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(1));
+                    auto hwAxisConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(0));
+                    auto replicateConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(-1));
+                    
+                    auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
+                    auto initPtOp = rewriter.create<emitc::CallOpaqueOp>(nestedLoc, partitionType,
+                        "__emitc_init_PartitionTensor", nullptr, nullptr,
+                        ValueRange{vaddr.getResult(0), elemSizeConst.getResult(), ndimConst.getResult(),
+                                   shapeConst.getResult(), shapeConst.getResult(),
+                                   partDimConst.getResult(), numPartConst.getResult(),
+                                   hwAxisConst.getResult(), replicateConst.getResult()});
+                    
+                    state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(initPtOp.getResult(0), byteSize, totalElements);
+                    state.dataPtrMap[nestedOp.getResult(0)] = vaddr.getResult(0);
+                    llvm::errs() << "[Pattern] Host: XAie_MemAllocate for " << arrayName << " -> PartitionTensor\n";
                 }
                 
                 // Convert routing.partitiontensor inline
@@ -459,47 +498,94 @@ struct HostOpPattern : public ConversionPattern {
                     if (nestedOp.getNumResults() == 0 || nestedOp.getNumOperands() == 0) continue;
                     
                     auto resultType = dyn_cast<RankedTensorType>(nestedOp.getResult(0).getType());
-                    if (!resultType) continue;
+                    auto inputType = dyn_cast<RankedTensorType>(nestedOp.getOperand(0).getType());
+                    if (!resultType || !inputType) continue;
                     
                     Value inputTensor = nestedOp.getOperand(0);
                     
+                    // Get partition attributes
                     int splitnum = 1, splitdim = 0;
                     if (auto attr = nestedOp.getAttrOfType<IntegerAttr>("splitnum")) splitnum = attr.getInt();
                     if (auto attr = nestedOp.getAttrOfType<IntegerAttr>("splitdim")) splitdim = attr.getInt();
                     
-                    int64_t totalElements = 1;
-                    for (auto dim : resultType.getShape()) totalElements *= dim;
-                    
-                    int64_t partitionByteSize = totalElements * getElemSize(resultType.getElementType());
-                    
-                    Value srcDataPtr;
-                    if (state.memAllocMap.count(inputTensor)) {
-                        srcDataPtr = std::get<0>(state.memAllocMap[inputTensor]);
+                    // Get hw_axis_owner and replicate_on (convert string to int)
+                    int hwAxisOwner = 0; // 0=row, 1=col
+                    int replicateOn = -1; // -1=none, 0=row, 1=col
+                    if (auto attr = nestedOp.getAttrOfType<StringAttr>("hw_axis_owner")) {
+                        hwAxisOwner = (attr.getValue() == "col") ? 1 : 0;
+                    }
+                    if (auto attr = nestedOp.getAttrOfType<StringAttr>("replicate_on")) {
+                        if (attr.getValue() == "col") replicateOn = 1;
+                        else if (attr.getValue() == "row") replicateOn = 0;
                     }
                     
-                    Value dataVoidPtr = srcDataPtr ? srcDataPtr :
-                        rewriter.create<emitc::ConstantOp>(nestedLoc, voidPtrType,
-                            emitc::OpaqueAttr::get(ctx, "NULL")).getResult();
+                    // Get original and partition shapes
+                    auto originalShape = inputType.getShape();
+                    auto partitionShape = resultType.getShape();
+                    int ndim = originalShape.size();
                     
-                    auto sizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(partitionByteSize));
-                    auto numElemsConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(totalElements));
-                    auto splitnumConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                        rewriter.getI32IntegerAttr(splitnum));
+                    int64_t totalElements = 1;
+                    for (auto dim : partitionShape) totalElements *= dim;
+                    
+                    int64_t elemSize = getElemSize(resultType.getElementType());
+                    int64_t partitionByteSize = totalElements * elemSize;
+                    
+                    // Get data pointer from source (dataPtrMap stores the raw void*)
+                    Value dataVoidPtr;
+                    if (state.dataPtrMap.count(inputTensor)) {
+                        dataVoidPtr = state.dataPtrMap[inputTensor];
+                    } else {
+                        dataVoidPtr = rewriter.create<emitc::ConstantOp>(nestedLoc, voidPtrType,
+                            emitc::OpaqueAttr::get(ctx, "NULL")).getResult();
+                    }
+                    
+                    // Build original_shape array literal
+                    std::string origShapeStr = "(int64_t[]){";
+                    for (size_t i = 0; i < originalShape.size(); i++) {
+                        if (i > 0) origShapeStr += ", ";
+                        origShapeStr += std::to_string(originalShape[i]);
+                    }
+                    origShapeStr += "}";
+                    
+                    // Build partition_shape array literal
+                    std::string partShapeStr = "(int64_t[]){";
+                    for (size_t i = 0; i < partitionShape.size(); i++) {
+                        if (i > 0) partShapeStr += ", ";
+                        partShapeStr += std::to_string(partitionShape[i]);
+                    }
+                    partShapeStr += "}";
+                    
+                    auto i64PtrType = emitc::PointerType::get(rewriter.getI64Type());
+                    
+                    auto elemSizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(elemSize));
+                    auto ndimConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(ndim));
+                    auto origShapeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i64PtrType,
+                        emitc::OpaqueAttr::get(ctx, origShapeStr));
+                    auto partShapeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i64PtrType,
+                        emitc::OpaqueAttr::get(ctx, partShapeStr));
                     auto splitdimConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
                         rewriter.getI32IntegerAttr(splitdim));
+                    auto splitnumConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(splitnum));
+                    auto hwAxisConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(hwAxisOwner));
+                    auto replicateConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
+                        rewriter.getI32IntegerAttr(replicateOn));
                     
                     auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
-                    rewriter.create<emitc::CallOpaqueOp>(nestedLoc, partitionType,
+                    auto ptOp = rewriter.create<emitc::CallOpaqueOp>(nestedLoc, partitionType,
                         "__emitc_init_PartitionTensor", nullptr, nullptr,
-                        ValueRange{dataVoidPtr, sizeConst.getResult(), numElemsConst.getResult(),
-                                   splitnumConst.getResult(), splitdimConst.getResult()});
+                        ValueRange{dataVoidPtr, elemSizeConst.getResult(), ndimConst.getResult(),
+                                   origShapeConst.getResult(), partShapeConst.getResult(),
+                                   splitdimConst.getResult(), splitnumConst.getResult(),
+                                   hwAxisConst.getResult(), replicateConst.getResult()});
                     
-                    if (srcDataPtr) {
-                        state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(srcDataPtr, partitionByteSize, totalElements);
-                    }
-                    llvm::errs() << "[Pattern] Host: PartitionTensor created\n";
+                    state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(ptOp.getResult(0), partitionByteSize, totalElements);
+                    state.dataPtrMap[nestedOp.getResult(0)] = dataVoidPtr;
+                    llvm::errs() << "[Pattern] Host: PartitionTensor created (ndim=" << ndim 
+                                 << ", splitdim=" << splitdim << ", splitnum=" << splitnum << ")\n";
                 }
                 
                 // Convert tensor.extract_slice inline
@@ -513,7 +599,7 @@ struct HostOpPattern : public ConversionPattern {
                     Value srcTensor = nestedOp.getOperand(0);
                     if (!state.memAllocMap.count(srcTensor)) continue;
                     
-                    Value srcDataPtr = std::get<0>(state.memAllocMap[srcTensor]);
+                    Value srcPartitionTensor = std::get<0>(state.memAllocMap[srcTensor]);
                     
                     auto staticOffsetsAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_offsets");
                     auto staticSizesAttr = nestedOp.getAttrOfType<DenseI64ArrayAttr>("static_sizes");
@@ -528,30 +614,87 @@ struct HostOpPattern : public ConversionPattern {
                     for (auto s : sizes) sliceElements *= s;
                     int64_t sliceByteSize = sliceElements * elemSize;
                     
-                    int64_t byteOffset = 0;
-                    int64_t stride = elemSize;
-                    for (int64_t i = srcShape.size() - 1; i >= 0; --i) {
-                        byteOffset += offsets[i] * stride;
-                        stride *= srcShape[i];
+                    // Check if slice is contiguous:
+                    // A slice is contiguous if inner dimensions are fully covered
+                    // (i.e., for 2D: if offset[1]==0 && size[1]==srcShape[1], or size[0]==1)
+                    bool isContiguous = true;
+                    int64_t ndim = srcShape.size();
+                    for (int64_t i = ndim - 1; i > 0; --i) {
+                        if (offsets[i] != 0 || sizes[i] != srcShape[i]) {
+                            bool outerSizeOne = true;
+                            for (int64_t j = 0; j < i; ++j) {
+                                if (sizes[j] != 1) {
+                                    outerSizeOne = false;
+                                    break;
+                                }
+                            }
+                            if (!outerSizeOne) {
+                                isContiguous = false;
+                                break;
+                            }
+                        }
                     }
                     
-                    Value slicePtr;
-                    if (byteOffset == 0) {
-                        slicePtr = srcDataPtr;
-                    } else {
-                        auto offsetConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                            rewriter.getI32IntegerAttr(byteOffset));
-                        auto sliceSizeConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i32Type,
-                            rewriter.getI32IntegerAttr(sliceByteSize));
-                        
-                        auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(nestedLoc, voidPtrType,
+                    auto i64PtrType = emitc::PointerType::get(rewriter.getI64Type());
+                    auto partitionType = emitc::OpaqueType::get(ctx, "PartitionTensor");
+                    auto partitionPtrType = emitc::PointerType::get(partitionType);
+                    
+                    // Build offsets array literal
+                    std::string offsetsStr = "(int64_t[]){";
+                    for (size_t i = 0; i < offsets.size(); i++) {
+                        if (i > 0) offsetsStr += ", ";
+                        offsetsStr += std::to_string(offsets[i]);
+                    }
+                    offsetsStr += "}";
+                    
+                    // Build sizes array literal
+                    std::string sizesStr = "(int64_t[]){";
+                    for (size_t i = 0; i < sizes.size(); i++) {
+                        if (i > 0) sizesStr += ", ";
+                        sizesStr += std::to_string(sizes[i]);
+                    }
+                    sizesStr += "}";
+                    
+                    auto offsetsConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i64PtrType,
+                        emitc::OpaqueAttr::get(ctx, offsetsStr));
+                    auto sizesConst = rewriter.create<emitc::ConstantOp>(nestedLoc, i64PtrType,
+                        emitc::OpaqueAttr::get(ctx, sizesStr));
+                    
+                    // Get pointer to source PartitionTensor
+                    auto srcPtAddr = rewriter.create<emitc::ApplyOp>(nestedLoc, partitionPtrType,
+                        rewriter.getStringAttr("&"), srcPartitionTensor);
+                    
+                    Value resultPt;
+                    
+                    if (isContiguous) {
+                        // Contiguous slice: call __emitc_extract_slice_contiguous
+                        auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(nestedLoc, partitionType,
                             "__emitc_extract_slice_contiguous", nullptr, nullptr,
-                            ValueRange{srcDataPtr, offsetConst.getResult(), sliceSizeConst.getResult()});
-                        slicePtr = sliceOp.getResult(0);
+                            ValueRange{srcPtAddr.getResult(), offsetsConst.getResult(), sizesConst.getResult()});
+                        resultPt = sliceOp.getResult(0);
+                        llvm::errs() << "[Pattern] Host: contiguous slice (PartitionTensor)\n";
+                    } else {
+                        // Non-contiguous 2D slice: call __emitc_extract_slice_2d
+                        if (ndim != 2) {
+                            llvm::errs() << "[Pattern] Warning: non-contiguous slice only supported for 2D\n";
+                            continue;
+                        }
+                        
+                        auto devInstPtrType = emitc::PointerType::get(devInstType);
+                        auto devInstAddr = rewriter.create<emitc::ApplyOp>(nestedLoc, devInstPtrType,
+                            rewriter.getStringAttr("&"), devInstRef.getResult());
+                        
+                        auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(nestedLoc, partitionType,
+                            "__emitc_extract_slice_2d", nullptr, nullptr,
+                            ValueRange{devInstAddr.getResult(), srcPtAddr.getResult(),
+                                       offsetsConst.getResult(), sizesConst.getResult()});
+                        resultPt = sliceOp.getResult(0);
+                        
+                        state.allocatedMemList.push_back(resultPt);
+                        llvm::errs() << "[Pattern] Host: non-contiguous 2D slice (PartitionTensor, allocated)\n";
                     }
                     
-                    state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(slicePtr, sliceByteSize, sliceElements);
-                    llvm::errs() << "[Pattern] Host: slice (offset=" << byteOffset << ")\n";
+                    state.memAllocMap[nestedOp.getResult(0)] = std::make_tuple(resultPt, sliceByteSize, sliceElements);
                 }
             }
         }
@@ -640,38 +783,154 @@ void DfscheduleToApiPass::runOnOperation() {
         builder.setInsertionPointToStart(moduleOp.getBody());
         
         builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), builder.getStringAttr(
-            "/* PartitionTensor structure for memory management */\n"
+            "#define PARTITION_MAX_DIMS 8\n"
+            "#define ALLOC_LIST_MAX_SIZE 256\n\n"
+            "/* Global list to track allocated memory for cleanup */\n"
+            "static XAie_MemInst* g_alloc_mem_list[ALLOC_LIST_MAX_SIZE];\n"
+            "static int g_alloc_mem_count = 0;\n\n"
+            "/* Add memory instance to tracking list */\n"
+            "static inline void __emitc_track_alloc(XAie_MemInst* mem) {\n"
+            "    if (g_alloc_mem_count < ALLOC_LIST_MAX_SIZE) {\n"
+            "        g_alloc_mem_list[g_alloc_mem_count++] = mem;\n"
+            "    }\n"
+            "}\n\n"
+            "/* Free all tracked memory allocations */\n"
+            "static inline void __emitc_free_all_allocs() {\n"
+            "    for (int i = 0; i < g_alloc_mem_count; i++) {\n"
+            "        if (g_alloc_mem_list[i]) {\n"
+            "            XAie_MemFree(g_alloc_mem_list[i]);\n"
+            "            g_alloc_mem_list[i] = NULL;\n"
+            "        }\n"
+            "    }\n"
+            "    g_alloc_mem_count = 0;\n"
+            "}\n\n"
+            "/* PartitionTensor structure for memory management and partitioning info */\n"
             "typedef struct {\n"
-            "    void* data;\n"
-            "    size_t size;\n"
-            "    size_t num_elements;\n"
-            "    int splitnum;\n"
-            "    int splitdim;\n"
+            "    void* data;                              /* Pointer to data */\n"
+            "    size_t elem_size;                        /* Size of each element in bytes */\n"
+            "    int ndim;                                /* Number of dimensions */\n"
+            "    int64_t original_shape[PARTITION_MAX_DIMS];  /* Original tensor shape */\n"
+            "    int64_t partition_shape[PARTITION_MAX_DIMS]; /* Shape of each partition slice */\n"
+            "    int partition_dim;                       /* Dimension being partitioned */\n"
+            "    int num_partitions;                      /* Number of partitions */\n"
+            "    /* Routing metadata */\n"
+            "    int hw_axis_owner;                       /* 0=row, 1=col */\n"
+            "    int replicate_on;                        /* 0=row, 1=col, -1=none */\n"
             "} PartitionTensor;\n\n"
             "/* Helper function for PartitionTensor initialization */\n"
             "static inline PartitionTensor __emitc_init_PartitionTensor(\n"
-            "    void* data, size_t size, size_t num_elements, int splitnum, int splitdim) {\n"
-            "    PartitionTensor pt = {data, size, num_elements, splitnum, splitdim};\n"
+            "    void* data, size_t elem_size, int ndim,\n"
+            "    const int64_t* original_shape, const int64_t* partition_shape,\n"
+            "    int partition_dim, int num_partitions,\n"
+            "    int hw_axis_owner, int replicate_on) {\n"
+            "    PartitionTensor pt;\n"
+            "    pt.data = data;\n"
+            "    pt.elem_size = elem_size;\n"
+            "    pt.ndim = ndim;\n"
+            "    for (int i = 0; i < ndim && i < PARTITION_MAX_DIMS; i++) {\n"
+            "        pt.original_shape[i] = original_shape[i];\n"
+            "        pt.partition_shape[i] = partition_shape[i];\n"
+            "    }\n"
+            "    pt.partition_dim = partition_dim;\n"
+            "    pt.num_partitions = num_partitions;\n"
+            "    pt.hw_axis_owner = hw_axis_owner;\n"
+            "    pt.replicate_on = replicate_on;\n"
             "    return pt;\n"
             "}\n\n"
-            "/* Helper function for contiguous slice extraction */\n"
-            "static inline void* __emitc_extract_slice_contiguous(\n"
-            "    void* src_ptr, int byte_offset, int slice_byte_size) {\n"
-            "    return (void*)((char*)src_ptr + byte_offset);\n"
+            "/* Get pointer to a specific partition slice */\n"
+            "static inline void* __emitc_get_partition_slice(\n"
+            "    PartitionTensor* pt, int partition_idx) {\n"
+            "    if (partition_idx < 0 || partition_idx >= pt->num_partitions) return NULL;\n"
+            "    /* Calculate slice offset based on partition dimension */\n"
+            "    size_t slice_size = pt->elem_size;\n"
+            "    for (int i = 0; i < pt->ndim; i++) {\n"
+            "        slice_size *= pt->partition_shape[i];\n"
+            "    }\n"
+            "    return (void*)((char*)pt->data + partition_idx * slice_size);\n"
             "}\n\n"
-            "/* Helper function for 2D non-contiguous slice extraction */\n"
-            "static inline void __emitc_extract_slice_2d(\n"
-            "    void* dst, void* src, int elem_size,\n"
-            "    int src_dim0, int src_dim1,\n"
-            "    int off0, int off1,\n"
-            "    int size0, int size1) {\n"
+            "/* Extract contiguous slice from PartitionTensor (returns new PartitionTensor with offset pointer) */\n"
+            "/* offsets and sizes are arrays of length ndim */\n"
+            "static inline PartitionTensor __emitc_extract_slice_contiguous(\n"
+            "    PartitionTensor* src, const int64_t* offsets, const int64_t* sizes) {\n"
+            "    PartitionTensor result;\n"
+            "    result.elem_size = src->elem_size;\n"
+            "    result.ndim = src->ndim;\n"
+            "    result.partition_dim = -1;  /* Not partitioned */\n"
+            "    result.num_partitions = 1;\n"
+            "    result.hw_axis_owner = src->hw_axis_owner;\n"
+            "    result.replicate_on = src->replicate_on;\n"
+            "    \n"
+            "    /* Copy shapes */\n"
+            "    for (int i = 0; i < src->ndim && i < PARTITION_MAX_DIMS; i++) {\n"
+            "        result.original_shape[i] = sizes[i];\n"
+            "        result.partition_shape[i] = sizes[i];\n"
+            "    }\n"
+            "    \n"
+            "    /* Calculate byte offset using row-major layout */\n"
+            "    size_t byte_offset = 0;\n"
+            "    size_t stride = src->elem_size;\n"
+            "    for (int i = src->ndim - 1; i >= 0; i--) {\n"
+            "        byte_offset += offsets[i] * stride;\n"
+            "        stride *= src->original_shape[i];\n"
+            "    }\n"
+            "    \n"
+            "    result.data = (void*)((char*)src->data + byte_offset);\n"
+            "    return result;\n"
+            "}\n\n"
+            "/* Extract 2D non-contiguous slice from PartitionTensor */\n"
+            "/* Allocates new memory via XAie_MemAllocate, copies strided data, tracks allocation */\n"
+            "static inline PartitionTensor __emitc_extract_slice_2d(\n"
+            "    XAie_DevInst* dev_inst, PartitionTensor* src,\n"
+            "    const int64_t* offsets, const int64_t* sizes) {\n"
+            "    PartitionTensor result;\n"
+            "    result.elem_size = src->elem_size;\n"
+            "    result.ndim = src->ndim;\n"
+            "    result.partition_dim = -1;  /* Not partitioned */\n"
+            "    result.num_partitions = 1;\n"
+            "    result.hw_axis_owner = src->hw_axis_owner;\n"
+            "    result.replicate_on = src->replicate_on;\n"
+            "    \n"
+            "    /* Copy new shape (slice sizes become the shape) */\n"
+            "    for (int i = 0; i < src->ndim && i < PARTITION_MAX_DIMS; i++) {\n"
+            "        result.original_shape[i] = sizes[i];\n"
+            "        result.partition_shape[i] = sizes[i];\n"
+            "    }\n"
+            "    \n"
+            "    /* Calculate destination size for 2D slice */\n"
+            "    size_t dst_size = (size_t)sizes[0] * sizes[1] * src->elem_size;\n"
+            "    \n"
+            "    /* Allocate memory for the slice */\n"
+            "    XAie_MemInst* mem_inst = XAie_MemAllocate(*dev_inst, dst_size, XAIE_MEM_CACHEABLE);\n"
+            "    if (!mem_inst) {\n"
+            "        result.data = NULL;\n"
+            "        return result;\n"
+            "    }\n"
+            "    \n"
+            "    /* Track the allocation for cleanup */\n"
+            "    __emitc_track_alloc(mem_inst);\n"
+            "    \n"
+            "    /* Get virtual address */\n"
+            "    void* dst = XAie_MemGetVAddr(mem_inst);\n"
+            "    result.data = dst;\n"
+            "    if (!dst) return result;\n"
+            "    \n"
+            "    /* Copy strided data from source to contiguous destination */\n"
             "    char* d = (char*)dst;\n"
-            "    char* s = (char*)src;\n"
+            "    char* s = (char*)src->data;\n"
+            "    int elem_size = src->elem_size;\n"
+            "    int src_dim1 = src->original_shape[1];\n"
+            "    int off0 = offsets[0];\n"
+            "    int off1 = offsets[1];\n"
+            "    int size0 = sizes[0];\n"
+            "    int size1 = sizes[1];\n"
+            "    \n"
             "    for (int i = 0; i < size0; i++) {\n"
             "        int src_idx = ((off0 + i) * src_dim1 + off1) * elem_size;\n"
             "        int dst_idx = (i * size1) * elem_size;\n"
             "        memcpy(d + dst_idx, s + src_idx, size1 * elem_size);\n"
             "    }\n"
+            "    \n"
+            "    return result;\n"
             "}"
         ));
         
