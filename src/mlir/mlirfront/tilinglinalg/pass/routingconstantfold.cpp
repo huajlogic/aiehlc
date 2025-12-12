@@ -200,7 +200,8 @@ struct FoldConstantOperandsIntoCallOpaqueOp : public mlir::OpRewritePattern<mlir
       if (auto intAttr = newArgs[i].dyn_cast<mlir::IntegerAttr>()) {
           if (intAttr.getType().isa<mlir::IndexType>()) {
             if (operandIndex >= callOp.getNumOperands()) return mlir::failure();
-            mlir::Value currentOperand = callOp.getOperands()[operandIndex];
+            mlir::Value currentOperand = callOp.getOperands()[operandIndex];     
+            // Check if this is a PartitionTensor* from emitc.expression containing emitc.apply "&"
             if (mlir::Attribute constValue = findConstantValue(getContext(), rewriter,calleeName,currentOperand)) {
               newArgs[i] = constValue;
               changed = true;
