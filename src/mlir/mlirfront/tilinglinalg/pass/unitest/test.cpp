@@ -36,6 +36,7 @@
 #include "routingdeadargclean.h"
 
 #include "routingconstantfold.h"
+#include "mlir/Transforms/Passes.h"
 
 // Unit test function to verify path contiguity for RoutingLowerPass
 void testRoutingLowerPassPathContiguity() {
@@ -866,6 +867,15 @@ void routingtodfschedule() {
     options.label = "After DfscheduleToApiPass:";
     pm.addPass(mlir::createPrintIRPass(options));
 
+    // Stage 8: CSE - Common Subexpression Elimination to deduplicate constants
+    pm.addPass(mlir::createCSEPass());
+    options.label = "After CSE:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    
+    // Stage 9: Canonicalization to optimize EmitC operations
+    pm.addPass(mlir::createCanonicalizerPass());
+    options.label = "After Canonicalization:";
+    pm.addPass(mlir::createPrintIRPass(options));
 
     pm.addPass(std::make_unique<RoutingDeadArgPass>());
     options.label = "After RoutingDeadArgPass:";
