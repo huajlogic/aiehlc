@@ -14,6 +14,9 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "dfscheblueprintmanager.h"
+#include "dfschedulemanager.h"
+#include "routingmanager.h"
 
 namespace mlir {
 

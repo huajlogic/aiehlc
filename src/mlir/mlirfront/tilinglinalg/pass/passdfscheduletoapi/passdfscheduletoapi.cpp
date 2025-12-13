@@ -162,8 +162,9 @@ struct DenseConstantToEmitCPattern : public OpConversionPattern<arith::ConstantO
         state.arrayNameMap[op.getOperation()] = arrayName;
         llvm::errs() << "[Pattern] Created global array: " << arrayName << "\n";
         
-        rewriter.eraseOp(op);
-        return success();
+        // DO NOT erase - the constant is still used by declare_data ops
+        // It will be erased in Phase 3.5 after all conversions are done
+        return failure(); // Return failure so the op isn't marked as "converted"
     }
 };
 
@@ -171,31 +172,15 @@ struct DenseConstantToEmitCPattern : public OpConversionPattern<arith::ConstantO
 // Helper: EraseOpLowering - Reusable pattern to erase ops by name
 //===----------------------------------------------------------------------===//
 
-/// EraseOpLowering: A reusable ConversionPattern that erases an op by its string name.
-/// Usage in pattern registration:
-///   patterns.add<EraseOpLowering>(typeConverter, ctx, "dfschedule.schedule.wait");
-///   patterns.add<EraseOpLowering>(typeConverter, ctx, "dfschedule.start_io");
-struct EraseOpLowering : public ConversionPattern {
-    std::string targetOpName;
-    
-    EraseOpLowering(TypeConverter &typeConverter, MLIRContext *ctx, StringRef opName)
-        : ConversionPattern(typeConverter, opName, /*benefit=*/1, ctx), targetOpName(opName.str()) {}
-    
-    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+template <typename Op_T>
+struct EraseOpLowering : public OpConversionPattern<Op_T> {
+    using OpConversionPattern<Op_T>::OpConversionPattern;
+    LogicalResult matchAndRewrite(Op_T op, typename Op_T::Adaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        llvm::errs() << "[EraseOpLowering] Erasing: " << targetOpName << "\n";
         rewriter.eraseOp(op);
         return success();
     }
 };
-
-/// Helper function to add multiple EraseOpLowering patterns at once
-inline void addEraseOpPatterns(RewritePatternSet &patterns, TypeConverter &typeConverter, 
-                               MLIRContext *ctx, ArrayRef<StringRef> opNames) {
-    for (StringRef opName : opNames) {
-        patterns.add<EraseOpLowering>(typeConverter, ctx, opName);
-    }
-}
 
 //===----------------------------------------------------------------------===//
 // Inner Patterns (Applied inside host op region via walk)
@@ -228,7 +213,7 @@ struct DeclareDataInnerPattern : public ConversionPattern {
         
         auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
         if (!resultType) return failure();
-        
+        ///*
         auto loc = op->getLoc();
         
         std::string arrayName = "g_data_array_0";
@@ -269,7 +254,7 @@ struct DeclareDataInnerPattern : public ConversionPattern {
         // Store the raw data pointer - PartitionTensor will be created by routing.partitiontensor
         state.dataPtrMap[op->getResult(0)] = vaddr.getResult(0);
         llvm::errs() << "[Pattern] DeclareData: XAie_MemAllocate for " << arrayName << "\n";
-        
+        //*/
         rewriter.eraseOp(op);
         return success();
     }
@@ -289,7 +274,7 @@ struct PartitionTensorInnerPattern : public ConversionPattern {
         auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
         auto inputType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
         if (!resultType || !inputType) return failure();
-        
+        /*
         auto loc = op->getLoc();
         Value inputTensor = op->getOperand(0);
         
@@ -384,7 +369,7 @@ struct PartitionTensorInnerPattern : public ConversionPattern {
         state.dataPtrMap[op->getResult(0)] = dataVoidPtr;
         llvm::errs() << "[Pattern] PartitionTensor: created (ndim=" << ndim 
                      << ", splitdim=" << splitdim << ", splitnum=" << splitnum << ")\n";
-        
+        */
         rewriter.eraseOp(op);
         return success();
     }
@@ -410,7 +395,7 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
             llvm::errs() << "[Pattern] ExtractSlice: source not in memAllocMap, skipping\n";
             return failure();
         }
-        
+        /*
         Value srcPartitionTensor = std::get<0>(state.memAllocMap[srcTensor]);
         
         auto offsets = op.getStaticOffsets();
@@ -473,7 +458,7 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
         }
         
         state.memAllocMap[op.getResult()] = std::make_tuple(resultPt, sliceByteSize, sliceElements);
-        
+        */
         rewriter.eraseOp(op);
         return success();
     }
@@ -750,19 +735,19 @@ void DfscheduleToApiPass::runOnOperation() {
     llvm::errs() << "[Pass] Phase 2: Converting dense constants\n";
     
     {
-        ConversionTarget constTarget(*ctx);
-        constTarget.addLegalDialect<emitc::EmitCDialect>();
-        constTarget.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
+        //ConversionTarget constTarget(*ctx);
+        //constTarget.addLegalDialect<emitc::EmitCDialect>();
+        //constTarget.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
             // Only convert constants with DenseElementsAttr
-            return !dyn_cast<DenseElementsAttr>(op.getValue());
-        });
+        //    return !dyn_cast<DenseElementsAttr>(op.getValue());
+        //});
         
-        RewritePatternSet constPatterns(ctx);
-        constPatterns.add<DenseConstantToEmitCPattern>(typeConverter, ctx, state);
+       /// RewritePatternSet constPatterns(ctx);
+        //constPatterns.add<DenseConstantToEmitCPattern>(typeConverter, ctx, state);
         
-        if (failed(applyPartialConversion(moduleOp, constTarget, std::move(constPatterns)))) {
-            llvm::errs() << "[Pass] Warning: Some constants not converted\n";
-        }
+        //if (failed(applyPartialConversion(moduleOp, constTarget, std::move(constPatterns)))) {
+        //    llvm::errs() << "[Pass] Warning: Some constants not converted\n";
+        //}
     }
     
     //==========================================================================
@@ -781,73 +766,106 @@ void DfscheduleToApiPass::runOnOperation() {
     
     // Create inner patterns (arith.constant, declare_data, partitiontensor, extract_slice, erase ops)
     RewritePatternSet innerPatterns(ctx);
-    innerPatterns.add<ArithConstantInnerPattern>(typeConverter, ctx, state);
+    //innerPatterns.add<ArithConstantInnerPattern>(typeConverter, ctx, state);
+    // Add actual conversion patterns for inner ops
     innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx, state);
-    innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
-    innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
+    //innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
+    //innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
-    addEraseOpPatterns(innerPatterns, typeConverter, ctx, {
-        "dfschedule.schedule.wait",
-        "dfschedule.start_io",
-        "dfschedule.launch_kernel_group",
-        "dfschedule.load_kernel_group",
-        "dfschedule.create_io",
-        "dfschedule.config.dma_bd",
-        "dfschedule.declaretile"
-    });
+    // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
+    innerPatterns.add<EraseOpLowering<dfschedule::ScheduleWaitOp>,
+        EraseOpLowering<dfschedule::StartIoOp>,
+        EraseOpLowering<routing::partitiontensor>,
+        EraseOpLowering<tensor::ExtractSliceOp>,
+        EraseOpLowering<dfschedule::LaunchKernelGroupOp>,
+        EraseOpLowering<dfschedule::GetBdIdOp>,
+        EraseOpLowering<dfschedule::LoadKernelGroupOp>,
+        EraseOpLowering<dfschedule::ConfigCreateIoOp>,
+        EraseOpLowering<dfschedule::ConfigDmaBdOp>,
+        EraseOpLowering<dfschedule::DeclareTileOp>,
+        EraseOpLowering<dfschedule::LaunchHostOp>,
+        EraseOpLowering<dfschedule::DeclareTensorOp>,
+        EraseOpLowering<dfschedule::ScheduleWaitOp>
+       // EraseOpLowering<dfscheblueprint::DeclareDataOp>
+    >(typeConverter, ctx);
     
     FrozenRewritePatternSet frozenInnerPatterns(std::move(innerPatterns));
-    ///*
-    // Walk each dfschedule.host op and apply inner patterns to its region
-    moduleOp.walk([&](Operation *hostOp) {
-        if (hostOp->getName().getStringRef() != "dfschedule.host")
-            return;
+    ConversionTarget innerTarget(*ctx);
+    innerTarget.addLegalDialect<emitc::EmitCDialect>();
+    innerTarget.addLegalDialect<scf::SCFDialect>();
+    innerTarget.addLegalDialect<arith::ArithDialect>(); // Keep arith legal - constants erased later
+    
+    // Mark typed ops as illegal (need conversion)
+    innerTarget.addIllegalOp<tensor::ExtractSliceOp>();
+    innerTarget.addIllegalOp<routing::partitiontensor>();
+    innerTarget.addIllegalOp<dfschedule::ScheduleWaitOp>();
+    innerTarget.addIllegalOp<dfschedule::StartIoOp>();
+    innerTarget.addIllegalOp<dfschedule::LaunchKernelGroupOp>();
+    innerTarget.addIllegalOp<dfschedule::GetBdIdOp>();
+    innerTarget.addIllegalOp<dfschedule::LoadKernelGroupOp>();
+    innerTarget.addIllegalOp<dfschedule::ConfigCreateIoOp>();
+    innerTarget.addIllegalOp<dfschedule::ConfigDmaBdOp>();
+    innerTarget.addIllegalOp<dfschedule::DeclareTileOp>();
+    innerTarget.addIllegalOp<dfschedule::LaunchHostOp>();
+    innerTarget.addIllegalOp<dfschedule::DeclareTensorOp>();
+    innerTarget.addIllegalOp<dfscheblueprint::DeclareDataOp>();
+    
+    // Use dynamic legality for string-named ops without C++ types
+      
+    moduleOp->walk([&](dfschedule::HostBlockOp hostOp) {
+        llvm::errs() << "Converting host block op\n";
         
-        if (hostOp->getNumRegions() == 0 || hostOp->getRegion(0).empty())
-            return;
-
-        ConversionTarget innerTarget(*ctx);
-        innerTarget.addLegalDialect<emitc::EmitCDialect>();
-        innerTarget.addLegalDialect<scf::SCFDialect>();
-        innerTarget.addIllegalOp<tensor::ExtractSliceOp>();
+        // Create devInstRef and cacheableConst for this host block
+        OpBuilder builder(ctx);
+        builder.setInsertionPointToStart(&hostOp.getRegion().front());
         
-        // arith.constant with DenseElementsAttr is illegal (needs to be erased after global array created)
-        innerTarget.addDynamicallyLegalOp<arith::ConstantOp>([&state](arith::ConstantOp op) {
-            auto denseAttr = dyn_cast<DenseElementsAttr>(op.getValue());
-            if (!denseAttr) return true; // non-tensor constants are legal
-            return !state.arrayNameMap.count(op.getOperation()); // illegal if already in arrayNameMap
-        });
+        // Create devInst variable
+        auto devInstVar = builder.create<emitc::VariableOp>(
+            hostOp.getLoc(), state.devInstType, emitc::OpaqueAttr::get(ctx, ""));
         
-        innerTarget.markUnknownOpDynamicallyLegal([](Operation *op) {
-            StringRef opName = op->getName().getStringRef();
-            // Ops that need conversion
-            if (opName == "dfscheblueprint.declare_data" ||
-                opName == "routing.partitiontensor") {
-                return false; // illegal - needs conversion
-            }
-            // Ops that need to be erased
-            if (opName == "dfschedule.schedule.wait" ||
-                opName == "dfschedule.start_io" ||
-                opName == "dfschedule.launch_kernel_group" ||
-                opName == "dfschedule.load_kernel_group" ||
-                opName == "dfschedule.create_io" ||
-                opName == "dfschedule.config.dma_bd" ||
-                opName == "dfschedule.declaretile") {
-                return false; // illegal - needs to be erased
-            }
-            return true;
-        });
+        // Create &devInst reference
+        state.devInstRef = builder.create<emitc::ApplyOp>(
+            hostOp.getLoc(),
+            emitc::PointerType::get(state.devInstType),
+            builder.getStringAttr("&"),
+            devInstVar.getResult()).getResult();
         
-        if (failed(applyPartialConversion(hostOp, innerTarget, std::move(frozenInnerPatterns)))) {
+        // Create XAIE_MEM_CACHEABLE constant
+        state.cacheableConst = builder.create<emitc::ConstantOp>(
+            hostOp.getLoc(), state.i32Type,
+            emitc::OpaqueAttr::get(ctx, "XAIE_MEM_CACHEABLE")).getResult();
+        
+        // Now apply conversion patterns to this host block's region
+        if (failed(applyPartialConversion(hostOp, innerTarget, frozenInnerPatterns))) {
             llvm::errs() << "[Pass] Warning: Some inner ops not converted in host region\n";
         }
+    });//*/
+    /*
+    //==========================================================================
+    // Phase 3.5: Cleanup - erase tensor constants that are now dead
+    //==========================================================================
+    llvm::errs() << "[Pass] Phase 3.5: Cleaning up dead tensor constants\n";
+    SmallVector<Operation*, 8> deadConstants;
+    moduleOp.walk([&](arith::ConstantOp op) {
+        // Check if this constant was converted to a global array
+        if (state.arrayNameMap.count(op.getOperation())) {
+            // Check if it has no uses left
+            if (op.getResult().use_empty()) {
+                deadConstants.push_back(op);
+            }
+        }
     });
-    //*/
+    for (Operation *op : deadConstants) {
+        llvm::errs() << "[Phase3.5] Erasing dead constant\n";
+        op->erase();
+    }
+    */
+    
     //==========================================================================
     // Phase 4: Convert dfschedule ops (host -> emitc.func, launchhost, dskernel_receiver)
     //==========================================================================
-    
+    /*
     llvm::errs() << "[Pass] Phase 4: Converting dfschedule operations\n";
     
     {
@@ -875,11 +893,11 @@ void DfscheduleToApiPass::runOnOperation() {
             llvm::errs() << "[Pass] Warning: Partial conversion had failures\n";
         }
     }
-    
+    */
     //==========================================================================
     // Phase 4.5: Walk and convert any remaining dfschedule.launchhost inside execute_regions
     //==========================================================================
-    
+    /*
     llvm::errs() << "[Pass] Phase 4.5: Converting nested launchhost ops\n";
     
     {
@@ -898,13 +916,13 @@ void DfscheduleToApiPass::runOnOperation() {
             op->erase();
         }
     }
-    
+    */
     //==========================================================================
     // Phase 5: Apply canonicalization to optimize EmitC
     //==========================================================================
     
     llvm::errs() << "[Pass] Phase 5: Applying canonicalization patterns\n";
-    
+    /*
     {
         RewritePatternSet canonPatterns(ctx);
         for (auto *dialect : ctx->getLoadedDialects()) {
@@ -918,7 +936,7 @@ void DfscheduleToApiPass::runOnOperation() {
             llvm::errs() << "[Pass] Warning: Canonicalization had issues\n";
         }
     }
-    
+    */
     llvm::errs() << "=== DfscheduleToApiPass COMPLETE ===\n";
 }
 
