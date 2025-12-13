@@ -274,7 +274,7 @@ struct PartitionTensorInnerPattern : public ConversionPattern {
         auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
         auto inputType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
         if (!resultType || !inputType) return failure();
-        /*
+       // /*
         auto loc = op->getLoc();
         Value inputTensor = op->getOperand(0);
         
@@ -369,7 +369,7 @@ struct PartitionTensorInnerPattern : public ConversionPattern {
         state.dataPtrMap[op->getResult(0)] = dataVoidPtr;
         llvm::errs() << "[Pattern] PartitionTensor: created (ndim=" << ndim 
                      << ", splitdim=" << splitdim << ", splitnum=" << splitnum << ")\n";
-        */
+        //*/
         rewriter.eraseOp(op);
         return success();
     }
@@ -487,22 +487,21 @@ struct HostOpOuterPattern : public ConversionPattern {
         auto funcType = rewriter.getFunctionType({}, {});
         auto emitcFunc = rewriter.create<emitc::FuncOp>(loc, funcName, funcType);
         Block *entryBlock = emitcFunc.addEntryBlock();
-        ///*
+        
         // Move converted operations from host region to new func
         if (op->getNumRegions() > 0 && !op->getRegion(0).empty()) {
             Block &srcBlock = op->getRegion(0).front();
             
-            // Clone all operations except terminator to the new func
+            // Move all operations except terminator to the new func
             OpBuilder::InsertionGuard guard(rewriter);
             rewriter.setInsertionPointToStart(entryBlock);
             
             for (Operation &nestedOp : llvm::make_early_inc_range(srcBlock.getOperations())) {
                 if (!nestedOp.hasTrait<OpTrait::IsTerminator>()) {
-                    rewriter.clone(nestedOp);
+                    nestedOp.moveBefore(entryBlock, entryBlock->end());
                 }
             }
         }
-        ///*/
         
         // Add return at the end
         rewriter.setInsertionPointToEnd(entryBlock);
@@ -769,14 +768,14 @@ void DfscheduleToApiPass::runOnOperation() {
     //innerPatterns.add<ArithConstantInnerPattern>(typeConverter, ctx, state);
     // Add actual conversion patterns for inner ops
     innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx, state);
-    //innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
+    innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
     //innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
     innerPatterns.add<EraseOpLowering<dfschedule::ScheduleWaitOp>,
         EraseOpLowering<dfschedule::StartIoOp>,
-        EraseOpLowering<routing::partitiontensor>,
+        //EraseOpLowering<routing::partitiontensor>,
         EraseOpLowering<tensor::ExtractSliceOp>,
         EraseOpLowering<dfschedule::LaunchKernelGroupOp>,
         EraseOpLowering<dfschedule::GetBdIdOp>,
@@ -816,20 +815,16 @@ void DfscheduleToApiPass::runOnOperation() {
     moduleOp->walk([&](dfschedule::HostBlockOp hostOp) {
         llvm::errs() << "Converting host block op\n";
         
-        // Create devInstRef and cacheableConst for this host block
+        // Create references to global DevInst for this host block
         OpBuilder builder(ctx);
         builder.setInsertionPointToStart(&hostOp.getRegion().front());
         
-        // Create devInst variable
-        auto devInstVar = builder.create<emitc::VariableOp>(
-            hostOp.getLoc(), state.devInstType, emitc::OpaqueAttr::get(ctx, ""));
-        
-        // Create &devInst reference
-        state.devInstRef = builder.create<emitc::ApplyOp>(
-            hostOp.getLoc(),
+        // Create &DevInst reference directly as a constant
+        // The global DevInst is declared as: extern XAie_DevInst DevInst;
+        state.devInstRef = builder.create<emitc::ConstantOp>(
+            hostOp.getLoc(), 
             emitc::PointerType::get(state.devInstType),
-            builder.getStringAttr("&"),
-            devInstVar.getResult()).getResult();
+            emitc::OpaqueAttr::get(ctx, "&DevInst")).getResult();
         
         // Create XAIE_MEM_CACHEABLE constant
         state.cacheableConst = builder.create<emitc::ConstantOp>(
@@ -865,7 +860,6 @@ void DfscheduleToApiPass::runOnOperation() {
     //==========================================================================
     // Phase 4: Convert dfschedule ops (host -> emitc.func, launchhost, dskernel_receiver)
     //==========================================================================
-    /*
     llvm::errs() << "[Pass] Phase 4: Converting dfschedule operations\n";
     
     {
@@ -874,11 +868,12 @@ void DfscheduleToApiPass::runOnOperation() {
         target.addLegalDialect<arith::ArithDialect>();
         target.addLegalDialect<scf::SCFDialect>();
         
+        target.addIllegalOp<dfschedule::HostBlockOp>();
+        target.addIllegalOp<dfschedule::LaunchHostOp>();
+        
         target.markUnknownOpDynamicallyLegal([](Operation *op) {
             StringRef opName = op->getName().getStringRef();
-            if (opName.starts_with("dfschedule.") ||
-                opName.starts_with("dfscheblueprint.") ||
-                opName.starts_with("routing.")) {
+            if (opName == "dfschedule.dskernel_receiver") {
                 return false; // illegal
             }
             return true;
@@ -893,7 +888,6 @@ void DfscheduleToApiPass::runOnOperation() {
             llvm::errs() << "[Pass] Warning: Partial conversion had failures\n";
         }
     }
-    */
     //==========================================================================
     // Phase 4.5: Walk and convert any remaining dfschedule.launchhost inside execute_regions
     //==========================================================================

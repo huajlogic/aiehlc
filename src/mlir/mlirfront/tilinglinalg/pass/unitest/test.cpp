@@ -868,13 +868,13 @@ void routingtodfschedule() {
     pm.addPass(mlir::createPrintIRPass(options));
     
     // Stage 9: Canonicalization to optimize EmitC operations
-    //pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCanonicalizerPass());
     //options.label = "After Canonicalization:";
     //pm.addPass(mlir::createPrintIRPass(options));
 
     //pm.addPass(std::make_unique<RoutingDeadArgPass>());
     //options.label = "After RoutingDeadArgPass:";
-    //pm.addPass(mlir::createPrintIRPass(options));
+    pm.addPass(mlir::createPrintIRPass(options));
     //The constanfold change emitc.call into emic.call_opaque to convert 
     /*
     XAie_LocType v251 = XAie_TileLoc(v1, v10);
@@ -885,7 +885,7 @@ void routingtodfschedule() {
     /*
     int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0); 
     */
-    //pm.addPass(std::make_unique<RoutingConstantFoldPass>());
+    pm.addPass(std::make_unique<RoutingConstantFoldPass>());
     
     
     // Run the pass pipeline
@@ -894,15 +894,15 @@ void routingtodfschedule() {
         return;
     }
     
-    //std::cout << "\n=== Final Module with API calls ===" << std::endl;
-    //module1.dump();
+    std::cout << "\n=== Final Module with API calls ===" << std::endl;
+    module1.dump();
     
     // Convert to C++ code
     std::cout << "\n=== Generated C++ Code ===" << std::endl;
-    //mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
-    //if (failed(result)) {
-    //    llvm::errs() << "Failed to translate MLIR to C++.\n";
-    //}
+    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    if (failed(result)) {
+        llvm::errs() << "Failed to translate MLIR to C++.\n";
+    }
     
     return;
 }
