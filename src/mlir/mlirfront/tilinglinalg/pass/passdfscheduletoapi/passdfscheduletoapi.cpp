@@ -108,7 +108,8 @@ struct ConversionState {
     // Also track the raw data pointer for cases where we need it
     DenseMap<Value, Value> dataPtrMap;
     SmallVector<Value> allocatedMemList;
-    DenseMap<Operation*, std::string> arrayNameMap;
+    
+    // Counter for generating unique array names
     int arrayIndex = 0;
     int partitionIndex = 0;
     
@@ -123,50 +124,10 @@ struct ConversionState {
     MLIRContext *ctx = nullptr;
 };
 
+
 //===----------------------------------------------------------------------===//
 // Module-Level Patterns (Global conversions)
 //===----------------------------------------------------------------------===//
-
-/// OpConversionPattern for arith.constant with DenseElementsAttr -> emitc.verbatim
-struct DenseConstantToEmitCPattern : public OpConversionPattern<arith::ConstantOp> {
-    ConversionState &state;
-    
-    DenseConstantToEmitCPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : OpConversionPattern<arith::ConstantOp>(typeConverter, ctx, /*benefit=*/10), state(state) {}
-    
-    LogicalResult matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
-                                  ConversionPatternRewriter &rewriter) const override {
-        auto denseAttr = dyn_cast<DenseElementsAttr>(op.getValue());
-        if (!denseAttr) return failure();
-        
-        auto tensorType = dyn_cast<RankedTensorType>(denseAttr.getType());
-        if (!tensorType) return failure();
-        
-        if (state.arrayNameMap.count(op.getOperation())) return failure();
-        
-        std::string arrayName = "g_data_array_" + std::to_string(state.arrayIndex++);
-        Type elemType = tensorType.getElementType();
-        std::string cTypeStr = getEmitCTypeString(elemType);
-        std::string initStr = buildInitializerString(denseAttr, elemType);
-        
-        std::string verbatimCode = "static const " + cTypeStr + " " + arrayName +
-            buildArrayDimString(tensorType.getShape()) + " = " + initStr + ";";
-        
-        auto moduleOp = op->getParentOfType<ModuleOp>();
-        if (!moduleOp) return failure();
-        
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToStart(moduleOp.getBody());
-        rewriter.create<emitc::VerbatimOp>(op.getLoc(), rewriter.getStringAttr(verbatimCode));
-        
-        state.arrayNameMap[op.getOperation()] = arrayName;
-        llvm::errs() << "[Pattern] Created global array: " << arrayName << "\n";
-        
-        // DO NOT erase - the constant is still used by declare_data ops
-        // It will be erased in Phase 3.5 after all conversions are done
-        return failure(); // Return failure so the op isn't marked as "converted"
-    }
-};
 
 //===----------------------------------------------------------------------===//
 // Helper: EraseOpLowering - Reusable pattern to erase ops by name
@@ -186,7 +147,7 @@ struct EraseOpLowering : public OpConversionPattern<Op_T> {
 // Inner Patterns (Applied inside host op region via walk)
 //===----------------------------------------------------------------------===//
 
-/// Inner pattern for arith.constant -> erase (already converted to global array)
+/// Inner pattern for arith.constant -> emitc.constant (handles ALL constant types)
 struct ArithConstantInnerPattern : public OpConversionPattern<arith::ConstantOp> {
     ConversionState &state;
     
@@ -195,7 +156,65 @@ struct ArithConstantInnerPattern : public OpConversionPattern<arith::ConstantOp>
     
     LogicalResult matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        rewriter.eraseOp(op);
+        auto loc = op.getLoc();
+        auto resultType = op.getType();
+        auto value = op.getValue();
+        
+        // Handle dense constants (tensors) - these were converted to global arrays in Phase 2
+        if (auto denseAttr = dyn_cast<DenseElementsAttr>(value)) {
+            // Check if this op has the "emitc.global_array_name" attribute (set in Phase 2)
+            if (auto arrayNameAttr = op->getAttrOfType<StringAttr>("emitc.global_array_name")) {
+                std::string arrayName = arrayNameAttr.getValue().str();
+                
+                // Create emitc.constant that references the global array
+                // The type should be a pointer to the array's element type
+                auto emitcConst = rewriter.create<emitc::ConstantOp>(
+                    loc, state.voidPtrType,
+                    emitc::OpaqueAttr::get(state.ctx, "(void*)" + arrayName));
+                
+                rewriter.replaceOp(op, emitcConst.getResult());
+                llvm::errs() << "[Pattern] Converted arith.constant dense -> emitc.constant reference to " 
+                             << arrayName << "\n";
+                return success();
+            }
+            // If not marked with global array name, this shouldn't happen
+            llvm::errs() << "[Pattern] Dense constant without global array name attribute, erasing\n";
+            rewriter.eraseOp(op);
+            return success();
+        }
+        
+        // Handle integer constants (including index type)
+        if (auto intAttr = dyn_cast<IntegerAttr>(value)) {
+            auto emitcConst = rewriter.create<emitc::ConstantOp>(
+                loc, resultType, intAttr);
+            rewriter.replaceOp(op, emitcConst.getResult());
+            llvm::errs() << "[Pattern] Converted arith.constant (int) to emitc.constant\n";
+            return success();
+        }
+        
+        // Handle float constants
+        if (auto floatAttr = dyn_cast<FloatAttr>(value)) {
+            auto emitcConst = rewriter.create<emitc::ConstantOp>(
+                loc, resultType, floatAttr);
+            rewriter.replaceOp(op, emitcConst.getResult());
+            llvm::errs() << "[Pattern] Converted arith.constant (float) to emitc.constant\n";
+            return success();
+        }
+        
+        // Handle bool constants
+        if (auto boolAttr = dyn_cast<BoolAttr>(value)) {
+            auto emitcConst = rewriter.create<emitc::ConstantOp>(
+                loc, resultType, boolAttr);
+            rewriter.replaceOp(op, emitcConst.getResult());
+            llvm::errs() << "[Pattern] Converted arith.constant (bool) to emitc.constant\n";
+            return success();
+        }
+        
+        // For any other constant types, try to convert to emitc.constant
+        auto emitcConst = rewriter.create<emitc::ConstantOp>(
+            loc, resultType, value);
+        rewriter.replaceOp(op, emitcConst.getResult());
+        llvm::errs() << "[Pattern] Converted arith.constant (other) to emitc.constant\n";
         return success();
     }
 };
@@ -205,10 +224,11 @@ struct DeclareDataInnerPattern : public ConversionPattern {
     ConversionState &state;
     
     DeclareDataInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : ConversionPattern(typeConverter, "dfscheblueprint.declare_data", /*benefit=*/1, ctx), state(state) {}
+        : ConversionPattern(typeConverter, "dfscheblueprint.declare_data", /*benefit=*/100, ctx), state(state) {}
     
     LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                                   ConversionPatternRewriter &rewriter) const override {
+        llvm::errs() << "[Pattern] DeclareDataInnerPattern::matchAndRewrite called\n";
         if (op->getNumResults() == 0) return failure();
         
         auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
@@ -216,13 +236,21 @@ struct DeclareDataInnerPattern : public ConversionPattern {
         ///*
         auto loc = op->getLoc();
         
-        std::string arrayName = "g_data_array_0";
+        // Get the global array name from the operand's attribute
+        std::string arrayName;
         if (op->getNumOperands() > 0) {
             if (Operation *initOp = op->getOperand(0).getDefiningOp()) {
-                if (state.arrayNameMap.count(initOp)) {
-                    arrayName = state.arrayNameMap[initOp];
+                // Check if the init op has the global array name attribute
+                if (auto nameAttr = initOp->getAttrOfType<StringAttr>("emitc.global_array_name")) {
+                    arrayName = nameAttr.getValue().str();
                 }
             }
+        }
+        
+        // If we couldn't find the array name, fail conversion
+        if (arrayName.empty()) {
+            llvm::errs() << "[Pattern] DeclareData: No global array name found for operand\n";
+            return failure();
         }
         
         auto shape = resultType.getShape();
@@ -255,28 +283,58 @@ struct DeclareDataInnerPattern : public ConversionPattern {
         state.dataPtrMap[op->getResult(0)] = vaddr.getResult(0);
         llvm::errs() << "[Pattern] DeclareData: XAie_MemAllocate for " << arrayName << "\n";
         //*/
-        rewriter.eraseOp(op);
+        
+        // Replace the op with the vaddr result to maintain SSA chain
+        rewriter.replaceOp(op, vaddr.getResult(0));
         return success();
     }
 };
 
 /// Inner pattern for routing.partitiontensor -> __emitc_init_PartitionTensor
-struct PartitionTensorInnerPattern : public ConversionPattern {
+struct PartitionTensorInnerPattern : public OpConversionPattern<routing::partitiontensor> {
     ConversionState &state;
     
     PartitionTensorInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : ConversionPattern(typeConverter, "routing.partitiontensor", /*benefit=*/1, ctx), state(state) {}
+        : OpConversionPattern<routing::partitiontensor>(typeConverter, ctx, /*benefit=*/50), state(state) {}
     
-    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+    LogicalResult matchAndRewrite(routing::partitiontensor op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        if (op->getNumResults() == 0 || op->getNumOperands() == 0) return failure();
-        
-        auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-        auto inputType = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+        llvm::errs() << "[Pattern] PartitionTensorInnerPattern::matchAndRewrite called\n";
+        // routing::partitiontensor has OneOperand and OneResult traits
+        auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
+        auto inputType = dyn_cast<RankedTensorType>(op.getOperand().getType());
         if (!resultType || !inputType) return failure();
-       // /*
-        auto loc = op->getLoc();
-        Value inputTensor = op->getOperand(0);
+       
+        auto loc = op.getLoc();
+        
+        // Use adaptor to get converted operand (this is the void* from DeclareData)
+        // OpAdaptor for OneOperand ops exposes getOperands() which returns ValueRange
+        Value dataVoidPtr = adaptor.getOperands()[0];
+        Type want = getTypeConverter()->convertType(op.getOperand().getType());
+
+        if (0) {//!dataVoidPtr || dataVoidPtr.getType() != want) {
+            // Debug: Print what we got from adaptor
+            llvm::errs() << "[PartitionTensor] adaptor.getOperands()[0] = ";
+            if (dataVoidPtr) {
+                dataVoidPtr.print(llvm::errs());
+                llvm::errs() << "\n[PartitionTensor] Type: ";
+                dataVoidPtr.getType().print(llvm::errs());
+                llvm::errs() << "\nwant: ";
+                want.print(llvm::errs());
+                llvm::errs() << "\n";
+                if (auto defOp = dataVoidPtr.getDefiningOp()) {
+                    llvm::errs() << "[PartitionTensor] Defining op: " << defOp->getName() << "\n";
+                }
+            } else {
+                llvm::errs() << "NULL!\n";
+            }
+           return failure();
+        }   
+        
+        if (!dataVoidPtr) {
+            dataVoidPtr = rewriter.create<emitc::ConstantOp>(loc, state.voidPtrType,
+                emitc::OpaqueAttr::get(state.ctx, "NULL")).getResult();
+        }
         
         // Get partition attributes
         int splitnum = 1, splitdim = 0;
@@ -313,16 +371,7 @@ struct PartitionTensorInnerPattern : public ConversionPattern {
         
         int64_t elemSize = getElemSize(resultType.getElementType());
         int64_t partitionByteSize = totalElements * elemSize;
-        
-        // Get data pointer from source (dataPtrMap stores the raw void*)
-        Value dataVoidPtr;
-        if (state.dataPtrMap.count(inputTensor)) {
-            dataVoidPtr = state.dataPtrMap[inputTensor];
-        } else {
-            dataVoidPtr = rewriter.create<emitc::ConstantOp>(loc, state.voidPtrType,
-                emitc::OpaqueAttr::get(state.ctx, "NULL")).getResult();
-        }
-        
+        ///*
         // Build original_shape array literal
         std::string origShapeStr = "(int64_t[]){";
         for (size_t i = 0; i < originalShape.size(); i++) {
@@ -338,7 +387,7 @@ struct PartitionTensorInnerPattern : public ConversionPattern {
             partShapeStr += std::to_string(partitionShape[i]);
         }
         partShapeStr += "}";
-        
+        ///*
         auto i64PtrType = emitc::PointerType::get(rewriter.getI64Type());
         
         auto elemSizeConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
@@ -357,20 +406,21 @@ struct PartitionTensorInnerPattern : public ConversionPattern {
             rewriter.getI32IntegerAttr(hwAxisOwner));
         auto replicateConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
             rewriter.getI32IntegerAttr(replicateOn));
-        
+        ///*
         auto ptOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
             "__emitc_init_PartitionTensor", nullptr, nullptr,
             ValueRange{dataVoidPtr, elemSizeConst.getResult(), ndimConst.getResult(),
                        origShapeConst.getResult(), partShapeConst.getResult(),
                        splitdimConst.getResult(), splitnumConst.getResult(),
                        hwAxisConst.getResult(), replicateConst.getResult()});
-        
-        state.memAllocMap[op->getResult(0)] = std::make_tuple(ptOp.getResult(0), partitionByteSize, totalElements);
-        state.dataPtrMap[op->getResult(0)] = dataVoidPtr;
+        ///*
+        state.memAllocMap[op.getResult()] = std::make_tuple(ptOp.getResult(0), partitionByteSize, totalElements);
+        state.dataPtrMap[op.getResult()] = dataVoidPtr;
         llvm::errs() << "[Pattern] PartitionTensor: created (ndim=" << ndim 
                      << ", splitdim=" << splitdim << ", splitnum=" << splitnum << ")\n";
         //*/
-        rewriter.eraseOp(op);
+        rewriter.replaceOp(op, ptOp.getResult(0));
+        //rewriter.eraseOp(op);
         return success();
     }
 };
@@ -563,6 +613,72 @@ struct DsKernelReceiverPattern : public ConversionPattern {
 };
 
 //===----------------------------------------------------------------------===//
+// Helper Functions
+//===----------------------------------------------------------------------===//
+
+/// Generate C array literal from DenseElementsAttr
+static std::string generateCArrayLiteral(DenseElementsAttr denseAttr) {
+    std::string result = "{";
+    bool first = true;
+    
+    if (auto floatAttr = dyn_cast<DenseFPElementsAttr>(denseAttr)) {
+        for (auto val : floatAttr.getValues<APFloat>()) {
+            if (!first) result += ", ";
+            first = false;
+            SmallString<16> strVal;
+            val.toString(strVal);
+            result += strVal.str().str();
+        }
+    } else if (auto intAttr = dyn_cast<DenseIntElementsAttr>(denseAttr)) {
+        for (auto val : intAttr.getValues<APInt>()) {
+            if (!first) result += ", ";
+            first = false;
+            result += std::to_string(val.getSExtValue());
+        }
+    } else {
+        // Fallback for other types
+        result += "0";
+    }
+    
+    result += "}";
+    return result;
+}
+
+static Type buildVoidPtrType(MLIRContext *ctx) {
+    // void*  (emitc.ptr<emitc.opaque<"void">>)
+    return emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
+}
+  
+static void setupTypeConverter(TypeConverter &typeConverter, MLIRContext *ctx) {
+    Type voidPtrTy = buildVoidPtrType(ctx);
+    
+    // 2) 
+    typeConverter.addConversion([voidPtrTy](Type t) -> Type { 
+        llvm::errs() << "is RankedTensorType? " << isa<RankedTensorType>(t) << "\n";
+        if (0) {//isa<RankedTensorType>(t) || isa<TensorType>(t)) {
+            //llvm::errs() << "convert RankedTensorType type is -----: " << t << "\n";
+            return voidPtrTy;
+        }
+        //llvm::errs() << "convert type-----: " << t << "\n";
+        return t; 
+    });
+    return;
+  
+    // 3) 
+    auto castIfNeeded =
+        [&](OpBuilder &builder, Type resultType, ValueRange inputs, Location loc)
+        -> std::optional<Value> {
+          if (inputs.size() != 1) return std::nullopt;
+          if (inputs[0].getType() == resultType) return inputs[0];
+          return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs[0])
+              .getResult(0);
+        };
+  
+    typeConverter.addSourceMaterialization(castIfNeeded);
+    typeConverter.addTargetMaterialization(castIfNeeded);
+    typeConverter.addArgumentMaterialization(castIfNeeded);
+}
+//===----------------------------------------------------------------------===//
 // Pass Implementation - Two-Phase Conversion with Walk + Patterns
 //===----------------------------------------------------------------------===//
 
@@ -575,10 +691,15 @@ void DfscheduleToApiPass::runOnOperation() {
     // Shared conversion state
     ConversionState state;
     
-    // Type converter (identity for now, can be extended)
+    // Type converter
     TypeConverter typeConverter;
-    typeConverter.addConversion([](Type type) { return type; });
+    setupTypeConverter(typeConverter, ctx);  
     
+    llvm::errs() << "convert tensor -> "
+             << typeConverter.convertType(
+                    RankedTensorType::get({16,16},
+                      IntegerType::get(ctx, 8)))
+             << "\n";
     //==========================================================================
     // Phase 1: Setup - Generate helper definitions at module scope
     //==========================================================================
@@ -733,21 +854,53 @@ void DfscheduleToApiPass::runOnOperation() {
     
     llvm::errs() << "[Pass] Phase 2: Converting dense constants\n";
     
-    {
-        //ConversionTarget constTarget(*ctx);
-        //constTarget.addLegalDialect<emitc::EmitCDialect>();
-        //constTarget.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
-            // Only convert constants with DenseElementsAttr
-        //    return !dyn_cast<DenseElementsAttr>(op.getValue());
-        //});
+    // Walk and manually convert dense constants to global arrays
+    moduleOp.walk([&](arith::ConstantOp constOp) {
+        auto denseAttr = dyn_cast<DenseElementsAttr>(constOp.getValue());
+        if (!denseAttr) return;
         
-       /// RewritePatternSet constPatterns(ctx);
-        //constPatterns.add<DenseConstantToEmitCPattern>(typeConverter, ctx, state);
+        // Create global array name
+        std::string arrayName = "g_data_array_" + std::to_string(state.arrayIndex++);
         
-        //if (failed(applyPartialConversion(moduleOp, constTarget, std::move(constPatterns)))) {
-        //    llvm::errs() << "[Pass] Warning: Some constants not converted\n";
-        //}
-    }
+        // Store the array name as an attribute on the operation for later retrieval
+        constOp->setAttr("emitc.global_array_name", 
+                         StringAttr::get(moduleOp.getContext(), arrayName));
+        
+        // Generate C array literal
+        std::string cArrayInit = generateCArrayLiteral(denseAttr);
+        
+        // Get element type
+        Type elemType = denseAttr.getElementType();
+        std::string cType;
+        if (elemType.isF32()) {
+            cType = "float";
+        } else if (elemType.isInteger(32)) {
+            cType = "int32_t";
+        } else if (elemType.isInteger(64)) {
+            cType = "int64_t";
+        } else {
+            cType = "int";
+        }
+        
+        // Get shape
+        auto tensorType = dyn_cast<RankedTensorType>(constOp.getType());
+        if (!tensorType) return;
+        
+        auto shape = tensorType.getShape();
+        std::string shapeStr;
+        for (auto dim : shape) {
+            shapeStr += "[" + std::to_string(dim) + "]";
+        }
+        
+        // Create verbatim array declaration at the same location as the original constant
+        OpBuilder builder(moduleOp.getContext());
+        builder.setInsertionPoint(constOp);
+        
+        std::string arrayDecl = "static " + cType + " " + arrayName + shapeStr + " = " + cArrayInit + ";";
+        builder.create<emitc::VerbatimOp>(constOp.getLoc(), arrayDecl);
+        
+        llvm::errs() << "[Pattern] Created array: " << arrayName << " at original location\n";
+    });
     
     //==========================================================================
     // Phase 3: Walk dfschedule.host ops and apply inner patterns
@@ -765,17 +918,20 @@ void DfscheduleToApiPass::runOnOperation() {
     
     // Create inner patterns (arith.constant, declare_data, partitiontensor, extract_slice, erase ops)
     RewritePatternSet innerPatterns(ctx);
-    //innerPatterns.add<ArithConstantInnerPattern>(typeConverter, ctx, state);
+    
+    // Add arith.constant -> emitc.constant conversion (for scalar constants)
+    innerPatterns.add<ArithConstantInnerPattern>(typeConverter, ctx, state);
+    
     // Add actual conversion patterns for inner ops
-    innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx, state);
-    innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
+    //innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx, state);
+    //innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
     //innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
     innerPatterns.add<EraseOpLowering<dfschedule::ScheduleWaitOp>,
         EraseOpLowering<dfschedule::StartIoOp>,
-        //EraseOpLowering<routing::partitiontensor>,
+        EraseOpLowering<routing::partitiontensor>,
         EraseOpLowering<tensor::ExtractSliceOp>,
         EraseOpLowering<dfschedule::LaunchKernelGroupOp>,
         EraseOpLowering<dfschedule::GetBdIdOp>,
@@ -785,15 +941,24 @@ void DfscheduleToApiPass::runOnOperation() {
         EraseOpLowering<dfschedule::DeclareTileOp>,
         EraseOpLowering<dfschedule::LaunchHostOp>,
         EraseOpLowering<dfschedule::DeclareTensorOp>,
-        EraseOpLowering<dfschedule::ScheduleWaitOp>
-       // EraseOpLowering<dfscheblueprint::DeclareDataOp>
+        EraseOpLowering<dfschedule::ScheduleWaitOp>,
+        EraseOpLowering<dfscheblueprint::DeclareDataOp>
     >(typeConverter, ctx);
     
     FrozenRewritePatternSet frozenInnerPatterns(std::move(innerPatterns));
     ConversionTarget innerTarget(*ctx);
     innerTarget.addLegalDialect<emitc::EmitCDialect>();
     innerTarget.addLegalDialect<scf::SCFDialect>();
-    innerTarget.addLegalDialect<arith::ArithDialect>(); // Keep arith legal - constants erased later
+    
+    // Mark arith dialect as legal, but with exceptions for arith.constant
+    innerTarget.addLegalDialect<arith::ArithDialect>();
+    
+    // Use dynamic legality for arith.constant:
+    // ALL arith.constant ops should be converted to emitc.constant
+    innerTarget.addDynamicallyLegalOp<arith::ConstantOp>([&](arith::ConstantOp op) {
+        // All constants are illegal - need conversion to emitc.constant
+        return false;
+    });
     
     // Mark typed ops as illegal (need conversion)
     innerTarget.addIllegalOp<tensor::ExtractSliceOp>();
@@ -811,16 +976,15 @@ void DfscheduleToApiPass::runOnOperation() {
     innerTarget.addIllegalOp<dfscheblueprint::DeclareDataOp>();
     
     // Use dynamic legality for string-named ops without C++ types
-      
+    
+    // Create &DevInst and XAIE_MEM_CACHEABLE constants in each host block BEFORE conversion
     moduleOp->walk([&](dfschedule::HostBlockOp hostOp) {
-        llvm::errs() << "Converting host block op\n";
+        llvm::errs() << "[Pass] Pre-creating constants in host block\n";
         
-        // Create references to global DevInst for this host block
         OpBuilder builder(ctx);
         builder.setInsertionPointToStart(&hostOp.getRegion().front());
         
         // Create &DevInst reference directly as a constant
-        // The global DevInst is declared as: extern XAie_DevInst DevInst;
         state.devInstRef = builder.create<emitc::ConstantOp>(
             hostOp.getLoc(), 
             emitc::PointerType::get(state.devInstType),
@@ -830,32 +994,15 @@ void DfscheduleToApiPass::runOnOperation() {
         state.cacheableConst = builder.create<emitc::ConstantOp>(
             hostOp.getLoc(), state.i32Type,
             emitc::OpaqueAttr::get(ctx, "XAIE_MEM_CACHEABLE")).getResult();
-        
-        // Now apply conversion patterns to this host block's region
-        if (failed(applyPartialConversion(hostOp, innerTarget, frozenInnerPatterns))) {
-            llvm::errs() << "[Pass] Warning: Some inner ops not converted in host region\n";
-        }
-    });//*/
-    /*
-    //==========================================================================
-    // Phase 3.5: Cleanup - erase tensor constants that are now dead
-    //==========================================================================
-    llvm::errs() << "[Pass] Phase 3.5: Cleaning up dead tensor constants\n";
-    SmallVector<Operation*, 8> deadConstants;
-    moduleOp.walk([&](arith::ConstantOp op) {
-        // Check if this constant was converted to a global array
-        if (state.arrayNameMap.count(op.getOperation())) {
-            // Check if it has no uses left
-            if (op.getResult().use_empty()) {
-                deadConstants.push_back(op);
-            }
-        }
     });
-    for (Operation *op : deadConstants) {
-        llvm::errs() << "[Phase3.5] Erasing dead constant\n";
-        op->erase();
+    
+    // Now apply conversion patterns to the ENTIRE MODULE (not per hostOp)
+    llvm::errs() << "[Pass] Applying inner conversion patterns to entire module\n";
+    if (failed(applyPartialConversion(moduleOp, innerTarget, frozenInnerPatterns))) {
+        llvm::errs() << "[Pass] Warning: Some inner ops not converted\n";
     }
-    */
+    
+    // Phase 3.5 is no longer needed - arith.constant dense ops are replaced directly in ArithConstantInnerPattern
     
     //==========================================================================
     // Phase 4: Convert dfschedule ops (host -> emitc.func, launchhost, dskernel_receiver)
@@ -932,6 +1079,35 @@ void DfscheduleToApiPass::runOnOperation() {
     }
     */
     llvm::errs() << "=== DfscheduleToApiPass COMPLETE ===\n";
+    bool foundNullOperand = false;
+    moduleOp.walk([&](Operation *op) {
+        for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+            if (!op->getOperand(i)) {
+                llvm::errs() << "[Pass] ERROR: Found null operand at index " << i 
+                             << " in operation: " << op->getName() << "\n";
+                
+                // If it's a CallOpaqueOp, print the callee name
+                if (auto callOp = dyn_cast<emitc::CallOpaqueOp>(op)) {
+                    llvm::errs() << "  -> CallOpaqueOp callee: " << callOp.getCallee() << "\n";
+                    llvm::errs() << "  -> Location: ";
+                    op->getLoc().print(llvm::errs());
+                    llvm::errs() << "\n";
+                    llvm::errs() << "  -> Total operands: " << op->getNumOperands() << "\n";
+                    for (unsigned j = 0; j < op->getNumOperands(); ++j) {
+                        llvm::errs() << "     Operand[" << j << "]: " 
+                                     << (op->getOperand(j) ? "valid" : "NULL") << "\n";
+                    }
+                }
+                
+                foundNullOperand = true;
+            }
+        }
+    });
+    
+    if (foundNullOperand) {
+        llvm::errs() << "[Pass] ERROR: Null operands detected, failing pass\n";
+        //signalPassFailure();
+    }
 }
 
 } // namespace mlir
