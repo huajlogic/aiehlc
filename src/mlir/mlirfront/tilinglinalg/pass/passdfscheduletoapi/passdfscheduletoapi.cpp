@@ -15,6 +15,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Format.h"
 #include <iostream>
 #include <sstream>
 
@@ -112,6 +113,11 @@ struct ConversionState {
     // Counter for generating unique array names
     int arrayIndex = 0;
     int partitionIndex = 0;
+    
+    // Statistics for ExtractSliceInnerPattern
+    int extractSliceCallCount = 0;
+    int extractSliceFailCount = 0;
+    int extractSliceSuccessCount = 0;
     
     // Cached values for inner patterns (set before applying inner patterns)
     Value devInstRef;
@@ -450,13 +456,18 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
     
     LogicalResult matchAndRewrite(tensor::ExtractSliceOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        llvm::errs() << "[Pattern] ExtractSliceInnerPattern::matchAndRewrite called\n";
+        state.extractSliceCallCount++;
+        llvm::errs() << "[Pattern] ExtractSliceInnerPattern::matchAndRewrite called (#" 
+                     << state.extractSliceCallCount << ")\n";
         auto loc = op.getLoc();
         
         auto resultType = dyn_cast<RankedTensorType>(op.getResult().getType());
         auto srcType = dyn_cast<RankedTensorType>(op.getSource().getType());
         if (!resultType || !srcType) {
-            llvm::errs() << "[Pattern] ExtractSlice: Not a ranked tensor type\n";
+            state.extractSliceFailCount++;
+            llvm::errs() << "[Pattern] ExtractSlice: CONVERT FAIL - Not a ranked tensor type\n";
+            llvm::errs() << "[Pattern] ExtractSlice: FAILURE #" << state.extractSliceFailCount 
+                         << " (total calls: " << state.extractSliceCallCount << ")\n";
             return failure();
         }
         
@@ -471,7 +482,10 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
         bool isFromExtractSlice = false;
         
         if (!srcOp) {
-            llvm::errs() << "[Pattern] ExtractSlice: Source is BlockArgument\n";
+            state.extractSliceFailCount++;
+            llvm::errs() << "[Pattern] ExtractSlice: CONVERT FAIL - Source is BlockArgument\n";
+            llvm::errs() << "[Pattern] ExtractSlice: FAILURE #" << state.extractSliceFailCount 
+                         << " (total calls: " << state.extractSliceCallCount << ")\n";
             return failure();
         }
         
@@ -505,7 +519,11 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
         
         int64_t ndim = srcShape.size();
         if (ndim != 2) {
-            llvm::errs() << "[Pattern] Warning: extract_slice only supported for 2D\n";
+            state.extractSliceFailCount++;
+            llvm::errs() << "[Pattern] ExtractSlice: CONVERT FAIL - Only 2D slices supported, got " 
+                         << ndim << "D\n";
+            llvm::errs() << "[Pattern] ExtractSlice: FAILURE #" << state.extractSliceFailCount 
+                         << " (total calls: " << state.extractSliceCallCount << ")\n";
             return failure();
         }
         
@@ -598,8 +616,11 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
             }
         } else {
             // Unknown source - this shouldn't happen
-            llvm::errs() << "[Pattern] ExtractSlice: *** ERROR - UNKNOWN SOURCE ***\n";
+            state.extractSliceFailCount++;
+            llvm::errs() << "[Pattern] ExtractSlice: *** CONVERT FAIL - UNKNOWN SOURCE ***\n";
             llvm::errs() << "[Pattern]   Source operation is not routing.partitiontensor or tensor.extract_slice\n";
+            llvm::errs() << "[Pattern] ExtractSlice: FAILURE #" << state.extractSliceFailCount 
+                         << " (total calls: " << state.extractSliceCallCount << ")\n";
             return failure();
         }
         
@@ -607,6 +628,12 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
         //*/
         //rewriter.eraseOp(op);
         rewriter.replaceOp(op, resultPt);
+        
+        // Success!
+        state.extractSliceSuccessCount++;
+        llvm::errs() << "[Pattern] ExtractSlice: ✓ CONVERT SUCCESS #" << state.extractSliceSuccessCount 
+                     << " (total: " << state.extractSliceCallCount 
+                     << ", failures: " << state.extractSliceFailCount << ")\n";
         return success();
     }
 };
@@ -1247,6 +1274,18 @@ void DfscheduleToApiPass::runOnOperation() {
     }
     */
     llvm::errs() << "=== DfscheduleToApiPass COMPLETE ===\n";
+    
+    // Print ExtractSlice conversion statistics
+    llvm::errs() << "\n=== ExtractSlice Conversion Statistics ===\n";
+    llvm::errs() << "  Total calls:    " << state.extractSliceCallCount << "\n";
+    llvm::errs() << "  Successes:      " << state.extractSliceSuccessCount << "\n";
+    llvm::errs() << "  Failures:       " << state.extractSliceFailCount << "\n";
+    if (state.extractSliceCallCount > 0) {
+        double successRate = (100.0 * state.extractSliceSuccessCount) / state.extractSliceCallCount;
+        llvm::errs() << "  Success rate:   " << llvm::format("%.1f", successRate) << "%\n";
+    }
+    llvm::errs() << "==========================================\n\n";
+    
     bool foundNullOperand = false;
     moduleOp.walk([&](Operation *op) {
         for (unsigned i = 0; i < op->getNumOperands(); ++i) {
