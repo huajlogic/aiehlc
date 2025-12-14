@@ -461,21 +461,43 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
         }
         
         Value srcTensor = op.getSource();
-        llvm::errs() << "[Pattern] ExtractSlice: memAllocMap has " << state.memAllocMap.size() << " entries\n";
         
-        // Use adaptor to get the converted source (should be PartitionTensor from routing.partitiontensor)
+        // Use adaptor to get the converted source
         Value srcPartitionTensor = adaptor.getSource();
-        llvm::errs() << "[Pattern] ExtractSlice: adaptor.getSource() = ";
-        srcPartitionTensor.print(llvm::errs());
-        llvm::errs() << "\n[Pattern] ExtractSlice: type = " << srcPartitionTensor.getType() << "\n";
         
-        //if (!state.memAllocMap.count(srcTensor)) {
-        ////    llvm::errs() << "[Pattern] ExtractSlice: source not in memAllocMap, will try to use adaptor source directly\n";
-            // Don't fail - try to use the converted source from adaptor
-        //    // return failure();
-        //}
-        ///*
-       // Value srcPartitionTensor = std::get<0>(state.memAllocMap[srcTensor]);
+        // Check if the input source is already a PartitionTensor or needs conversion
+        Operation* srcOp = srcTensor.getDefiningOp();
+        bool isFromPartitionTensor = false;
+        bool isFromExtractSlice = false;
+        
+        if (!srcOp) {
+            llvm::errs() << "[Pattern] ExtractSlice: Source is BlockArgument\n";
+            return failure();
+        }
+        
+        // Check the defining operation type
+        if (isa<routing::partitiontensor>(srcOp)) {
+            isFromPartitionTensor = true;
+            llvm::errs() << "[Pattern] ExtractSlice: Input from routing.partitiontensor\n";
+        } else if (isa<tensor::ExtractSliceOp>(srcOp)) {
+            isFromPartitionTensor = true;
+            isFromExtractSlice = true;
+            llvm::errs() << "[Pattern] ExtractSlice: Input from tensor.extract_slice (NESTED SLICE)\n";
+        } else {
+            llvm::errs() << "[Pattern] ExtractSlice: Input from other op: " << srcOp->getName() << "\n";
+        }
+        
+        // Verify the converted source type
+        if (auto opaqueType = dyn_cast<emitc::OpaqueType>(srcPartitionTensor.getType())) {
+            if (opaqueType.getValue() == "PartitionTensor") {
+                llvm::errs() << "[Pattern] ExtractSlice: Converted source is PartitionTensor ✓\n";
+            } else {
+                llvm::errs() << "[Pattern] ExtractSlice: Converted source type = " << opaqueType.getValue() << "\n";
+            }
+        } else {
+            llvm::errs() << "[Pattern] ExtractSlice: Converted source NOT yet PartitionTensor, type = " 
+                         << srcPartitionTensor.getType() << " (conversion in progress)\n";
+        }
         
         auto offsets = op.getStaticOffsets();
         auto sizes = op.getStaticSizes();
@@ -497,40 +519,88 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
         
         Value resultPt;
         
-        if (isContiguous) {
-            // Contiguous slice - pass PartitionTensor by value, use args for inline constants
-            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
-                "__emitc_extract_slice_contiguous_2d",
-                rewriter.getArrayAttr({
-                    rewriter.getIndexAttr(0),
-                    rewriter.getI32IntegerAttr(offsets[0]),
-                    rewriter.getI32IntegerAttr(offsets[1]),
-                    rewriter.getI32IntegerAttr(sizes[0]),
-                    rewriter.getI32IntegerAttr(sizes[1])
-                }),
-                nullptr,
-                ValueRange{srcPartitionTensor});
-            resultPt = sliceOp.getResult(0);
-            llvm::errs() << "[Pattern] ExtractSlice: contiguous 2D slice\n";
-        } else {
-            // Non-contiguous 2D slice with memory allocation
-            // state.devInstRef is already &DevInst, no need to apply & again
-            auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
-                "__emitc_extract_slice_strided_2d",
-                rewriter.getArrayAttr({
-                    rewriter.getIndexAttr(0),
-                    rewriter.getIndexAttr(1),
-                    rewriter.getI32IntegerAttr(offsets[0]),
-                    rewriter.getI32IntegerAttr(offsets[1]),
-                    rewriter.getI32IntegerAttr(sizes[0]),
-                    rewriter.getI32IntegerAttr(sizes[1])
-                }),
-                nullptr,
-                ValueRange{state.devInstRef, srcPartitionTensor});
-            resultPt = sliceOp.getResult(0);
+        // Branch based on source operation type
+        if (isFromExtractSlice) {
+            // NESTED SLICE: slicing a previous slice result
+            llvm::errs() << "[Pattern] ExtractSlice: *** NESTED SLICE MODE ***\n";
+            llvm::errs() << "[Pattern]   Parent slice shape: " << srcShape[0] << "x" << srcShape[1] << "\n";
+            llvm::errs() << "[Pattern]   This slice: offset=[" << offsets[0] << ", " << offsets[1] 
+                         << "] size=[" << sizes[0] << ", " << sizes[1] << "]\n";
             
-            state.allocatedMemList.push_back(resultPt);
-            llvm::errs() << "[Pattern] ExtractSlice: strided 2D slice (allocated)\n";
+            if (isContiguous) {
+                auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
+                    "__emitc_extract_slice_contiguous_2d",
+                    rewriter.getArrayAttr({
+                        rewriter.getIndexAttr(0),
+                        rewriter.getI32IntegerAttr(offsets[0]),
+                        rewriter.getI32IntegerAttr(offsets[1]),
+                        rewriter.getI32IntegerAttr(sizes[0]),
+                        rewriter.getI32IntegerAttr(sizes[1])
+                    }),
+                    nullptr,
+                    ValueRange{srcPartitionTensor});
+                resultPt = sliceOp.getResult(0);
+                llvm::errs() << "[Pattern]   => Contiguous nested slice (no allocation)\n";
+            } else {
+                auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
+                    "__emitc_extract_slice_strided_2d",
+                    rewriter.getArrayAttr({
+                        rewriter.getIndexAttr(0),
+                        rewriter.getIndexAttr(1),
+                        rewriter.getI32IntegerAttr(offsets[0]),
+                        rewriter.getI32IntegerAttr(offsets[1]),
+                        rewriter.getI32IntegerAttr(sizes[0]),
+                        rewriter.getI32IntegerAttr(sizes[1])
+                    }),
+                    nullptr,
+                    ValueRange{state.devInstRef, srcPartitionTensor});
+                resultPt = sliceOp.getResult(0);
+                state.allocatedMemList.push_back(resultPt);
+                llvm::errs() << "[Pattern]   => Strided nested slice (allocated " << sliceByteSize << " bytes)\n";
+            }
+        } else if (isFromPartitionTensor) {
+            // PARTITION SLICE: slicing a partitioned tensor
+            llvm::errs() << "[Pattern] ExtractSlice: *** PARTITION SLICE MODE ***\n";
+            llvm::errs() << "[Pattern]   Partition shape: " << srcShape[0] << "x" << srcShape[1] << "\n";
+            llvm::errs() << "[Pattern]   Slice: offset=[" << offsets[0] << ", " << offsets[1] 
+                         << "] size=[" << sizes[0] << ", " << sizes[1] << "]\n";
+            
+            if (isContiguous) {
+                auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
+                    "__emitc_extract_slice_contiguous_2d",
+                    rewriter.getArrayAttr({
+                        rewriter.getIndexAttr(0),
+                        rewriter.getI32IntegerAttr(offsets[0]),
+                        rewriter.getI32IntegerAttr(offsets[1]),
+                        rewriter.getI32IntegerAttr(sizes[0]),
+                        rewriter.getI32IntegerAttr(sizes[1])
+                    }),
+                    nullptr,
+                    ValueRange{srcPartitionTensor});
+                resultPt = sliceOp.getResult(0);
+                llvm::errs() << "[Pattern]   => Contiguous partition slice (no allocation)\n";
+            } else {
+                auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
+                    "__emitc_extract_slice_strided_2d",
+                    rewriter.getArrayAttr({
+                        rewriter.getIndexAttr(0),
+                        rewriter.getIndexAttr(1),
+                        rewriter.getI32IntegerAttr(offsets[0]),
+                        rewriter.getI32IntegerAttr(offsets[1]),
+                        rewriter.getI32IntegerAttr(sizes[0]),
+                        rewriter.getI32IntegerAttr(sizes[1])
+                    }),
+                    nullptr,
+                    ValueRange{state.devInstRef, srcPartitionTensor});
+                resultPt = sliceOp.getResult(0);
+                state.allocatedMemList.push_back(resultPt);
+                llvm::errs() << "[Pattern]   => Strided partition slice (allocated " << sliceByteSize << " bytes)\n";
+            }
+        } else {
+            // Unknown source - this shouldn't happen
+            llvm::errs() << "[Pattern] ExtractSlice: *** ERROR - UNKNOWN SOURCE ***\n";
+            llvm::errs() << "[Pattern]   Source operation is not routing.partitiontensor or tensor.extract_slice\n";
+            return failure();
         }
         
         //state.memAllocMap[op.getResult()] = std::make_tuple(resultPt, sliceByteSize, sliceElements);
