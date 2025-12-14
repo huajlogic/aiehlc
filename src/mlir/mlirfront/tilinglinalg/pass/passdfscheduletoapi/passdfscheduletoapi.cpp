@@ -469,13 +469,13 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
         srcPartitionTensor.print(llvm::errs());
         llvm::errs() << "\n[Pattern] ExtractSlice: type = " << srcPartitionTensor.getType() << "\n";
         
-        if (!state.memAllocMap.count(srcTensor)) {
-            llvm::errs() << "[Pattern] ExtractSlice: source not in memAllocMap, will try to use adaptor source directly\n";
+        //if (!state.memAllocMap.count(srcTensor)) {
+        ////    llvm::errs() << "[Pattern] ExtractSlice: source not in memAllocMap, will try to use adaptor source directly\n";
             // Don't fail - try to use the converted source from adaptor
-            // return failure();
-        }
-        /*
-        Value srcPartitionTensor = std::get<0>(state.memAllocMap[srcTensor]);
+        //    // return failure();
+        //}
+        ///*
+       // Value srcPartitionTensor = std::get<0>(state.memAllocMap[srcTensor]);
         
         auto offsets = op.getStaticOffsets();
         auto sizes = op.getStaticSizes();
@@ -514,10 +514,7 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
             llvm::errs() << "[Pattern] ExtractSlice: contiguous 2D slice\n";
         } else {
             // Non-contiguous 2D slice with memory allocation
-            auto devInstPtrType = emitc::PointerType::get(state.devInstType);
-            auto devInstAddr = rewriter.create<emitc::ApplyOp>(loc, devInstPtrType,
-                rewriter.getStringAttr("&"), state.devInstRef);
-            
+            // state.devInstRef is already &DevInst, no need to apply & again
             auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
                 "__emitc_extract_slice_strided_2d",
                 rewriter.getArrayAttr({
@@ -529,16 +526,17 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
                     rewriter.getI32IntegerAttr(sizes[1])
                 }),
                 nullptr,
-                ValueRange{devInstAddr.getResult(), srcPartitionTensor});
+                ValueRange{state.devInstRef, srcPartitionTensor});
             resultPt = sliceOp.getResult(0);
             
             state.allocatedMemList.push_back(resultPt);
             llvm::errs() << "[Pattern] ExtractSlice: strided 2D slice (allocated)\n";
         }
         
-        state.memAllocMap[op.getResult()] = std::make_tuple(resultPt, sliceByteSize, sliceElements);
-        */
-        rewriter.eraseOp(op);
+        //state.memAllocMap[op.getResult()] = std::make_tuple(resultPt, sliceByteSize, sliceElements);
+        //*/
+        //rewriter.eraseOp(op);
+        rewriter.replaceOp(op, resultPt);
         return success();
     }
 };
@@ -970,14 +968,14 @@ void DfscheduleToApiPass::runOnOperation() {
     innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx);
     innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
     // ExtractSliceInnerPattern not added - will be handled in a separate phase
-    //innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
+    innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
     innerPatterns.add<EraseOpLowering<dfschedule::ScheduleWaitOp>,
         EraseOpLowering<dfschedule::StartIoOp>,
         EraseOpLowering<routing::partitiontensor>,
-        EraseOpLowering<tensor::ExtractSliceOp>,
+        //EraseOpLowering<tensor::ExtractSliceOp>,
         EraseOpLowering<dfschedule::LaunchKernelGroupOp>,
         EraseOpLowering<dfschedule::GetBdIdOp>,
         EraseOpLowering<dfschedule::LoadKernelGroupOp>,
@@ -1006,8 +1004,7 @@ void DfscheduleToApiPass::runOnOperation() {
     });
     
     // Mark typed ops as illegal (need conversion)
-    // tensor.extract_slice is NOT converted in this phase - kept as legal
-    // innerTarget.addIllegalOp<tensor::ExtractSliceOp>();
+    innerTarget.addIllegalOp<tensor::ExtractSliceOp>();
     innerTarget.addIllegalOp<routing::partitiontensor>();
     innerTarget.addIllegalOp<dfschedule::ScheduleWaitOp>();
     innerTarget.addIllegalOp<dfschedule::StartIoOp>();
