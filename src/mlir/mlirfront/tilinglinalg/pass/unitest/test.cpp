@@ -862,7 +862,7 @@ void routingtodfschedule() {
     options.label = "After ScheduleCanonicalizePass:";
     pm.addPass(mlir::createPrintIRPass(options));
     
-    /*
+   // /*
     // Stage 7: Convert dfschedule to API calls and EmitC
     pm.addPass(std::make_unique<mlir::DfscheduleToApiPass>());
     options.label = "After DfscheduleToApiPass:";
@@ -888,13 +888,13 @@ void routingtodfschedule() {
  
     pm.addPass(std::make_unique<RoutingConstantFoldPass>());
     
-    */
+    //*/
     // Run the pass pipeline
     if (failed(pm.run(module1))) {
         llvm::errs() << "ERROR: Pass pipeline failed!\n";
         return;
     }
-    return;
+    //return;
     std::cout << "\n=== Final Module with API calls ===" << std::endl;
     module1.dump();
     

@@ -1134,14 +1134,18 @@ static void removeOldScheduleOps(ModuleScheduleInfo &info) {
         opsToRemove.push_back(opWithParent.op);
     }
     
-    // Remove createIo ops
+    // Remove createIo ops (but NOT those inside dskernel_receiver)
     for (auto &opWithParent : info.configCreateIoOps) {
-        opsToRemove.push_back(opWithParent.op);
+        if (!opWithParent.isInDSKernelReceiver) {
+            opsToRemove.push_back(opWithParent.op);
+        }
     }
     
-    // Remove dmaBd ops
+    // Remove dmaBd ops (but NOT those inside dskernel_receiver)
     for (auto &opWithParent : info.configDmaBdOps) {
-        opsToRemove.push_back(opWithParent.op);
+        if (!opWithParent.isInDSKernelReceiver) {
+            opsToRemove.push_back(opWithParent.op);
+        }
     }
     
     // Remove declareTile ops
@@ -1169,7 +1173,9 @@ static void removeExecuteRegionsFromMain(func::FuncOp mainFunc) {
     
     // Collect ops to erase (fresh collection, not using old pointers)
     SmallVector<Operation*> regionsToErase;
-    SmallVector<Operation*> otherOpsToErase;
+    SmallVector<Operation*> declareDataOps;
+    SmallVector<Operation*> constantOps;
+    SmallVector<Operation*> emptyOps;
     
     mainFunc.walk([&](Operation *op) {
         if (isa<scf::ExecuteRegionOp>(op)) {
@@ -1177,11 +1183,11 @@ static void removeExecuteRegionsFromMain(func::FuncOp mainFunc) {
         } else if (op->getParentOp() == mainFunc.getOperation()) {
             // Only collect ops that are direct children of main's block
             if (isa<tensor::EmptyOp>(op)) {
-                otherOpsToErase.push_back(op);
+                emptyOps.push_back(op);
             } else if (isa<arith::ConstantOp>(op)) {
-                otherOpsToErase.push_back(op);
+                constantOps.push_back(op);
             } else if (op->getName().getStringRef() == "dfscheblueprint.declare_data") {
-                otherOpsToErase.push_back(op);
+                declareDataOps.push_back(op);
             }
         }
     });
@@ -1193,8 +1199,23 @@ static void removeExecuteRegionsFromMain(func::FuncOp mainFunc) {
         }
     }
     
-    // Erase other top-level ops (tensor.empty, arith.constant, declare_data)
-    for (auto *op : otherOpsToErase) {
+    // Erase in dependency order:
+    // 1. tensor.empty (no dependencies)
+    for (auto *op : emptyOps) {
+        if (op->use_empty()) {
+            op->erase();
+        }
+    }
+    
+    // 2. declare_data (uses constants)
+    for (auto *op : declareDataOps) {
+        if (op->use_empty()) {
+            op->erase();
+        }
+    }
+    
+    // 3. constants (used by declare_data, so remove after declare_data)
+    for (auto *op : constantOps) {
         if (op->use_empty()) {
             op->erase();
         }
