@@ -638,6 +638,70 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
     }
 };
 
+/// OpConversionPattern for dfschedule.declaretensor -> pass through partition pointer
+/// This takes a tensor (from extract_slice or partition) and just returns the partition structure pointer
+/// NOTE: Lower benefit than ExtractSliceInnerPattern to ensure extract_slice is converted first
+struct DeclareTensorInnerPattern : public OpConversionPattern<dfschedule::DeclareTensorOp> {
+    ConversionState &state;
+    
+    DeclareTensorInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : OpConversionPattern<dfschedule::DeclareTensorOp>(typeConverter, ctx, /*benefit=*/1), state(state) {}
+    
+    LogicalResult matchAndRewrite(dfschedule::DeclareTensorOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        
+        llvm::errs() << "[Pattern] DeclareTensor called\n";
+        llvm::errs() << "  Input tensor: " << op.getTensor() << "\n";
+        llvm::errs() << "  Result type: " << op.getType() << "\n";
+        
+        // Get the input tensor value
+        Value inputTensor = op.getTensor();
+        
+        // Try to get the converted value through the adaptor
+        Value convertedInput = adaptor.getOperands()[0];
+        llvm::errs() << "  Converted input type: " << convertedInput.getType() << "\n";
+        
+        // The input should already be a PartitionTensor from ExtractSliceInnerPattern or PartitionTensorInnerPattern
+        // We just pass it through - the PartitionTensor struct contains the data pointer
+        
+        // Check if input is PartitionTensor type
+        if (auto opaqueType = convertedInput.getType().dyn_cast<emitc::OpaqueType>()) {
+            if (opaqueType.getValue() == "PartitionTensor") {
+                llvm::errs() << "  ✓ Input is PartitionTensor, passing through\n";
+                
+                // Just replace with the input - the PartitionTensor contains the data pointer
+                rewriter.replaceOp(op, convertedInput);
+                return success();
+            }
+        }
+        
+        // If input is a pointer type (void*), also pass through
+        if (convertedInput.getType().isa<emitc::PointerType>()) {
+            llvm::errs() << "  ✓ Input is pointer type, passing through\n";
+            rewriter.replaceOp(op, convertedInput);
+            return success();
+        }
+        
+        // If the input is still a tensor type, it means the extract_slice hasn't been converted yet
+        // In this case, we need to defer conversion or handle it specially
+        if (convertedInput.getType().isa<RankedTensorType>()) {
+            llvm::errs() << "  ⚠ Input is still tensor type (conversion in progress)\n";
+            llvm::errs() << "  → Passing through tensor value (will be resolved in later pass)\n";
+            
+            // Just pass through - the value will be updated when extract_slice is converted
+            rewriter.replaceOp(op, convertedInput);
+            return success();
+        }
+        
+        llvm::errs() << "  ✗ WARNING: Unexpected input type for DeclareTensor\n";
+        
+        // Fallback: just pass through the converted input
+        rewriter.replaceOp(op, convertedInput);
+        return success();
+    }
+};
+
 //===----------------------------------------------------------------------===//
 // Outer Patterns (Convert host op structure)
 //===----------------------------------------------------------------------===//
@@ -1075,8 +1139,8 @@ void DfscheduleToApiPass::runOnOperation() {
     // Add actual conversion patterns for inner ops
     innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx);
     innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
-    // ExtractSliceInnerPattern not added - will be handled in a separate phase
     innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
+    innerPatterns.add<DeclareTensorInnerPattern>(typeConverter, ctx, state);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
@@ -1092,7 +1156,8 @@ void DfscheduleToApiPass::runOnOperation() {
         EraseOpLowering<dfschedule::DeclareTileOp>,
         // NOTE: LaunchHostOp is handled in Phase 4, not here
         // EraseOpLowering<dfschedule::LaunchHostOp>,
-        EraseOpLowering<dfschedule::DeclareTensorOp>,
+        // NOTE: DeclareTensorOp is now converted by DeclareTensorInnerPattern
+        // EraseOpLowering<dfschedule::DeclareTensorOp>,
         EraseOpLowering<dfschedule::ScheduleWaitOp>
         // EraseOpLowering<dfscheblueprint::DeclareDataOp>
     >(typeConverter, ctx);
