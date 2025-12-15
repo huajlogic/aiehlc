@@ -695,10 +695,21 @@ struct LaunchHostPattern : public ConversionPattern {
     
     LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                                   ConversionPatternRewriter &rewriter) const override {
-        rewriter.create<emitc::CallOpaqueOp>(op->getLoc(),
-            TypeRange{}, "hostruntime", nullptr, nullptr, ValueRange{});
+        llvm::errs() << "[Pattern] LaunchHostPattern::matchAndRewrite called for: " << *op << "\n";
         
-        llvm::errs() << "[Pattern] Created hostruntime() call\n";
+        // Get the host function name from the attribute
+        StringRef hostFuncName = "host_canonicalized";
+        if (auto symAttr = op->getAttrOfType<FlatSymbolRefAttr>("callee")) {
+            hostFuncName = symAttr.getValue();
+        }
+        
+        llvm::errs() << "[Pattern] Calling host function: " << hostFuncName << "\n";
+        
+        // Create emitc.call_opaque to call the host function
+        rewriter.create<emitc::CallOpaqueOp>(op->getLoc(),
+            TypeRange{}, hostFuncName.str(), nullptr, nullptr, ValueRange{});
+        
+        llvm::errs() << "[Pattern] Created call to " << hostFuncName << "()\n";
         
         rewriter.eraseOp(op);
         return success();
@@ -1079,7 +1090,8 @@ void DfscheduleToApiPass::runOnOperation() {
         EraseOpLowering<dfschedule::ConfigCreateIoOp>,
         EraseOpLowering<dfschedule::ConfigDmaBdOp>,
         EraseOpLowering<dfschedule::DeclareTileOp>,
-        EraseOpLowering<dfschedule::LaunchHostOp>,
+        // NOTE: LaunchHostOp is handled in Phase 4, not here
+        // EraseOpLowering<dfschedule::LaunchHostOp>,
         EraseOpLowering<dfschedule::DeclareTensorOp>,
         EraseOpLowering<dfschedule::ScheduleWaitOp>
         // EraseOpLowering<dfscheblueprint::DeclareDataOp>
@@ -1111,7 +1123,8 @@ void DfscheduleToApiPass::runOnOperation() {
     innerTarget.addIllegalOp<dfschedule::ConfigCreateIoOp>();
     innerTarget.addIllegalOp<dfschedule::ConfigDmaBdOp>();
     innerTarget.addIllegalOp<dfschedule::DeclareTileOp>();
-    innerTarget.addIllegalOp<dfschedule::LaunchHostOp>();
+    // NOTE: LaunchHostOp is handled in Phase 4, not here
+    // innerTarget.addIllegalOp<dfschedule::LaunchHostOp>();
     innerTarget.addIllegalOp<dfschedule::DeclareTensorOp>();
     innerTarget.addIllegalOp<dfscheblueprint::DeclareDataOp>();
     
@@ -1209,6 +1222,7 @@ void DfscheduleToApiPass::runOnOperation() {
         target.addLegalDialect<emitc::EmitCDialect>();
         target.addLegalDialect<arith::ArithDialect>();
         target.addLegalDialect<scf::SCFDialect>();
+        target.addLegalDialect<func::FuncDialect>();  // func.func, func.return are legal
         
         target.addIllegalOp<dfschedule::HostBlockOp>();
         target.addIllegalOp<dfschedule::LaunchHostOp>();
@@ -1221,6 +1235,13 @@ void DfscheduleToApiPass::runOnOperation() {
             return true;
         });
         
+        llvm::errs() << "[Pass] Phase 4: Checking for launchhost ops before conversion\n";
+        moduleOp.walk([&](Operation *op) {
+            if (op->getName().getStringRef() == "dfschedule.launchhost") {
+                llvm::errs() << "  Found launchhost op: " << *op << "\n";
+            }
+        });
+        
         RewritePatternSet patterns(ctx);
         patterns.add<HostOpOuterPattern>(typeConverter, ctx);
         patterns.add<LaunchHostPattern>(typeConverter, ctx);
@@ -1229,6 +1250,13 @@ void DfscheduleToApiPass::runOnOperation() {
         if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
             llvm::errs() << "[Pass] Warning: Partial conversion had failures\n";
         }
+        
+        llvm::errs() << "[Pass] Phase 4: Checking for launchhost ops after conversion\n";
+        moduleOp.walk([&](Operation *op) {
+            if (op->getName().getStringRef() == "dfschedule.launchhost") {
+                llvm::errs() << "  Still found launchhost op: " << *op << "\n";
+            }
+        });
     }
     //==========================================================================
     // Phase 4.5: Walk and convert any remaining dfschedule.launchhost inside execute_regions
