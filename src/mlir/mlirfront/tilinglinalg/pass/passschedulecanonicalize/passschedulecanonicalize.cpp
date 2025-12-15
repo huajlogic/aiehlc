@@ -75,33 +75,49 @@ struct PartitionParams {
     std::string single_tile_owner;
 };
 
+// Structure to hold operation with parent information
+struct OpWithParent {
+    Operation* op;
+    Operation* parent;  // Parent operation (can be nullptr if top-level)
+    bool isInDSKernelReceiver;  // true if parent is dfschedule.dskernel_receiver
+    
+    OpWithParent(Operation* operation, Operation* parentOp = nullptr)
+        : op(operation), parent(parentOp) {
+        // Check if parent is dskernel_receiver
+        isInDSKernelReceiver = false;
+        if (parentOp && parentOp->getName().getStringRef() == "dfschedule.dskernel_receiver") {
+            isInDSKernelReceiver = true;
+        }
+    }
+};
+
 // Collected module-level schedule info
 struct ModuleScheduleInfo {
     // Map from (col, row) to tile info
     std::map<TileKey, TileScheduleInfo> coreTiles;
     std::map<TileKey, ShimDmaInfo> shimTiles;
     
-    // All collected operations
-    SmallVector<Operation*> declareTensorOps;
-    SmallVector<Operation*> declareTileOps;
-    SmallVector<Operation*> configDmaBdOps;
-    SmallVector<Operation*> configCreateIoOps;
-    SmallVector<Operation*> packetOps;
-    SmallVector<Operation*> loadKernelGroupOps;
-    SmallVector<Operation*> launchKernelGroupOps;
-    SmallVector<Operation*> getBdIdOps;
-    SmallVector<Operation*> startIoOps;
-    SmallVector<Operation*> scheduleWaitOps;
-    SmallVector<Operation*> dskernelReceiverOps;
+    // All collected operations with parent information
+    SmallVector<OpWithParent> declareTensorOps;
+    SmallVector<OpWithParent> declareTileOps;
+    SmallVector<OpWithParent> configDmaBdOps;
+    SmallVector<OpWithParent> configCreateIoOps;
+    SmallVector<OpWithParent> packetOps;
+    SmallVector<OpWithParent> loadKernelGroupOps;
+    SmallVector<OpWithParent> launchKernelGroupOps;
+    SmallVector<OpWithParent> getBdIdOps;
+    SmallVector<OpWithParent> startIoOps;
+    SmallVector<OpWithParent> scheduleWaitOps;
+    SmallVector<OpWithParent> dskernelReceiverOps;
     
-    // Operations to move from func.func main
-    SmallVector<Operation*> tensorEmptyOps;
-    SmallVector<Operation*> extractSliceOps;
-    SmallVector<Operation*> partitionTensorOps;
-    SmallVector<Operation*> executeRegionOps;
-    SmallVector<Operation*> routingCreateOps;
-    SmallVector<Operation*> declareDataOps;        // dfscheblueprint.declare_data
-    SmallVector<Operation*> topLevelConstantOps;   // arith.constant at top level of main
+    // Operations to move from func.func main (with parent information)
+    SmallVector<OpWithParent> tensorEmptyOps;
+    SmallVector<OpWithParent> extractSliceOps;
+    SmallVector<OpWithParent> partitionTensorOps;
+    SmallVector<OpWithParent> executeRegionOps;
+    SmallVector<OpWithParent> routingCreateOps;
+    SmallVector<OpWithParent> declareDataOps;        // dfscheblueprint.declare_data
+    SmallVector<OpWithParent> topLevelConstantOps;   // arith.constant at top level of main
     
     // Unique source tensor types (deduplicated)
     SmallVector<RankedTensorType> sourceTensorTypes;
@@ -138,13 +154,24 @@ static bool isShimTile(TileKey key) {
     return key.second == 0;
 }
 
+// Helper: Get the parent operation (walks up the region hierarchy)
+static Operation* getParentOp(Operation *op) {
+    if (!op) return nullptr;
+    Region *region = op->getParentRegion();
+    if (!region) return nullptr;
+    return region->getParentOp();
+}
+
 // Collect all dfschedule operations from the module
 static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
     moduleOp.walk([&](Operation *op) {
+        // Get parent operation
+        Operation *parentOp = getParentOp(op);
+        
         if (auto declareTensor = dyn_cast<dfschedule::DeclareTensorOp>(op)) {
-            info.declareTensorOps.push_back(op);
+            info.declareTensorOps.push_back(OpWithParent(op, parentOp));
         } else if (auto declareTile = dyn_cast<dfschedule::DeclareTileOp>(op)) {
-            info.declareTileOps.push_back(op);
+            info.declareTileOps.push_back(OpWithParent(op, parentOp));
             TileKey key = getTileKey(declareTile);
             
             if (isShimTile(key)) {
@@ -158,28 +185,28 @@ static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
                 info.coreTiles[key].tileValues.push_back(declareTile.getTile());
             }
         } else if (auto configDmaBd = dyn_cast<dfschedule::ConfigDmaBdOp>(op)) {
-            info.configDmaBdOps.push_back(op);
+            info.configDmaBdOps.push_back(OpWithParent(op, parentOp));
         } else if (auto createIo = dyn_cast<dfschedule::ConfigCreateIoOp>(op)) {
-            info.configCreateIoOps.push_back(op);
+            info.configCreateIoOps.push_back(OpWithParent(op, parentOp));
         } else if (auto packet = dyn_cast<dfschedule::PacketOp>(op)) {
-            info.packetOps.push_back(op);
+            info.packetOps.push_back(OpWithParent(op, parentOp));
         } else if (auto loadKernel = dyn_cast<dfschedule::LoadKernelGroupOp>(op)) {
-            info.loadKernelGroupOps.push_back(op);
+            info.loadKernelGroupOps.push_back(OpWithParent(op, parentOp));
         } else if (auto launchKernel = dyn_cast<dfschedule::LaunchKernelGroupOp>(op)) {
-            info.launchKernelGroupOps.push_back(op);
+            info.launchKernelGroupOps.push_back(OpWithParent(op, parentOp));
             info.allEvents.push_back(launchKernel.getEvent());
         } else if (auto getBdId = dyn_cast<dfschedule::GetBdIdOp>(op)) {
-            info.getBdIdOps.push_back(op);
+            info.getBdIdOps.push_back(OpWithParent(op, parentOp));
         } else if (auto startIo = dyn_cast<dfschedule::StartIoOp>(op)) {
-            info.startIoOps.push_back(op);
+            info.startIoOps.push_back(OpWithParent(op, parentOp));
             info.allEvents.push_back(startIo.getEvent());
         } else if (auto wait = dyn_cast<dfschedule::ScheduleWaitOp>(op)) {
-            info.scheduleWaitOps.push_back(op);
+            info.scheduleWaitOps.push_back(OpWithParent(op, parentOp));
         } else if (auto receiver = dyn_cast<dfschedule::DSKernelReceiverOp>(op)) {
-            info.dskernelReceiverOps.push_back(op);
+            info.dskernelReceiverOps.push_back(OpWithParent(op, parentOp));
         } else if (auto emptyOp = dyn_cast<tensor::EmptyOp>(op)) {
             // Collect tensor.empty ops
-            info.tensorEmptyOps.push_back(op);
+            info.tensorEmptyOps.push_back(OpWithParent(op, parentOp));
             auto tensorType = cast<RankedTensorType>(emptyOp.getType());
             // Track unique tensor types
             bool found = false;
@@ -195,7 +222,7 @@ static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
         } else if (auto extractSlice = dyn_cast<tensor::ExtractSliceOp>(op)) {
             // Collect tensor.extract_slice ops - NO deduplication!
             // Each slice is unique even if it has same offsets/sizes
-            info.extractSliceOps.push_back(op);
+            info.extractSliceOps.push_back(OpWithParent(op, parentOp));
             
             // Create slice params
             SliceParams params;
@@ -216,7 +243,7 @@ static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
                     // Direct source is partitiontensor
                     params.isFromPartition = true;
                     for (size_t i = 0; i < info.partitionTensorOps.size(); ++i) {
-                        if (info.partitionTensorOps[i] == defOp) {
+                        if (info.partitionTensorOps[i].op == defOp) {
                             params.partitionIndex = i;
                             break;
                         }
@@ -225,7 +252,7 @@ static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
                     // Direct source is another slice - find its index
                     params.isFromPartition = false;
                     for (size_t i = 0; i < info.extractSliceOps.size(); ++i) {
-                        if (info.extractSliceOps[i] == defOp) {
+                        if (info.extractSliceOps[i].op == defOp) {
                             params.parentSliceIndex = static_cast<int64_t>(i);
                             break;
                         }
@@ -236,7 +263,7 @@ static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
                     while (Operation *walkDefOp = walkSource.getDefiningOp()) {
                         if (walkDefOp->getName().getStringRef() == "routing.partitiontensor") {
                             for (size_t i = 0; i < info.partitionTensorOps.size(); ++i) {
-                                if (info.partitionTensorOps[i] == walkDefOp) {
+                                if (info.partitionTensorOps[i].op == walkDefOp) {
                                     params.partitionIndex = i;
                                     break;
                                 }
@@ -255,12 +282,12 @@ static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
             info.uniqueSliceParams.push_back(params);
         } else if (auto execRegion = dyn_cast<scf::ExecuteRegionOp>(op)) {
             // Collect scf.execute_region ops
-            info.executeRegionOps.push_back(op);
+            info.executeRegionOps.push_back(OpWithParent(op, parentOp));
         }
         
         // Check by operation name for routing dialect ops
         if (op->getName().getStringRef() == "routing.partitiontensor") {
-            info.partitionTensorOps.push_back(op);
+            info.partitionTensorOps.push_back(OpWithParent(op, parentOp));
             
             // Extract partition parameters - NO deduplication here!
             // Each execute_region has its own partitiontensor representing different data flows
@@ -289,12 +316,12 @@ static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
             // Always add - each partitiontensor represents a unique data flow
             info.uniquePartitionParams.push_back(params);
         } else if (op->getName().getStringRef().starts_with("routing.RoutingCreate")) {
-            info.routingCreateOps.push_back(op);
+            info.routingCreateOps.push_back(OpWithParent(op, parentOp));
         }
         
         // Collect dfscheblueprint.declare_data
         if (op->getName().getStringRef() == "dfscheblueprint.declare_data") {
-            info.declareDataOps.push_back(op);
+            info.declareDataOps.push_back(OpWithParent(op, parentOp));
             // Extract tensor type and init tensor for source tensor creation
             if (op->getNumResults() > 0) {
                 if (auto tensorType = dyn_cast<RankedTensorType>(op->getResult(0).getType())) {
@@ -327,18 +354,63 @@ static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
             // Only collect if direct child of func.func (not nested in regions)
             if (auto funcOp = dyn_cast<func::FuncOp>(op->getParentOp())) {
                 if (funcOp.getName() == "main") {
-                    info.topLevelConstantOps.push_back(op);
+                    info.topLevelConstantOps.push_back(OpWithParent(op, parentOp));
                 }
             }
         }
     });
 }
 
+// Debug: Print parent information for all collected operations
+static void printParentInfo(const ModuleScheduleInfo &info) {
+    llvm::errs() << "\n=== Operation Parent Information ===\n";
+    
+    auto printOpList = [](const SmallVector<OpWithParent> &ops, StringRef name) {
+        if (ops.empty()) return;
+        llvm::errs() << "\n" << name << " (" << ops.size() << " operations):\n";
+        for (size_t i = 0; i < ops.size(); ++i) {
+            llvm::errs() << "  [" << i << "] " << ops[i].op->getName() << "\n";
+            if (ops[i].parent) {
+                llvm::errs() << "      Parent: " << ops[i].parent->getName();
+                if (ops[i].isInDSKernelReceiver) {
+                    llvm::errs() << " (IS dfschedule.dskernel_receiver)";
+                } else {
+                    llvm::errs() << " (NOT dfschedule.dskernel_receiver)";
+                }
+                llvm::errs() << "\n";
+            } else {
+                llvm::errs() << "      Parent: <none> (top-level)\n";
+            }
+        }
+    };
+    
+    printOpList(info.declareTensorOps, "DeclareTensor");
+    printOpList(info.declareTileOps, "DeclareTile");
+    printOpList(info.configDmaBdOps, "ConfigDmaBd");
+    printOpList(info.configCreateIoOps, "ConfigCreateIo");
+    printOpList(info.packetOps, "Packet");
+    printOpList(info.loadKernelGroupOps, "LoadKernelGroup");
+    printOpList(info.launchKernelGroupOps, "LaunchKernelGroup");
+    printOpList(info.getBdIdOps, "GetBdId");
+    printOpList(info.startIoOps, "StartIo");
+    printOpList(info.scheduleWaitOps, "ScheduleWait");
+    printOpList(info.dskernelReceiverOps, "DSKernelReceiver");
+    printOpList(info.tensorEmptyOps, "TensorEmpty");
+    printOpList(info.extractSliceOps, "ExtractSlice");
+    printOpList(info.partitionTensorOps, "PartitionTensor");
+    printOpList(info.executeRegionOps, "ExecuteRegion");
+    printOpList(info.routingCreateOps, "RoutingCreate");
+    printOpList(info.declareDataOps, "DeclareData");
+    printOpList(info.topLevelConstantOps, "TopLevelConstant");
+    
+    llvm::errs() << "\n====================================\n\n";
+}
+
 // Associate packets with their target tiles
 static void associatePacketsWithTiles(ModuleScheduleInfo &info) {
     // For each LoadKernelGroupOp, extract tile-to-packet mapping
-    for (auto *op : info.loadKernelGroupOps) {
-        auto loadKernel = cast<dfschedule::LoadKernelGroupOp>(op);
+    for (auto &opWithParent : info.loadKernelGroupOps) {
+        auto loadKernel = cast<dfschedule::LoadKernelGroupOp>(opWithParent.op);
         
         auto tiles = loadKernel.getTiles();
         auto distArgs = loadKernel.getDistributedArgs();
@@ -377,31 +449,78 @@ static void associatePacketsWithTiles(ModuleScheduleInfo &info) {
 
 // Associate DMA configs with shim tiles
 static void associateDmaWithShimTiles(ModuleScheduleInfo &info) {
-    for (auto *op : info.configDmaBdOps) {
-        auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(op);
+    for (auto &opWithParent : info.configDmaBdOps) {
+        auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(opWithParent.op);
         Value tileVal = dmaBd.getTile();
+        
+        // Skip DMA BD operations inside dskernel_receiver (these are kernel-side, not host-side shim operations)
+        if (opWithParent.isInDSKernelReceiver) {
+            continue;
+        }
+        
+        // Only include operations that are in dfschedule.host (the canonicalized region)
+        if (!opWithParent.parent || opWithParent.parent->getName().getStringRef() != "dfschedule.host") {
+            continue;
+        }
         
         if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
             TileKey key = getTileKey(declareTile);
+            
             if (isShimTile(key)) {
-                info.shimTiles[key].dmaBdOps.push_back(op);
+                info.shimTiles[key].dmaBdOps.push_back(opWithParent.op);
                 info.shimTiles[key].bdHandles.push_back(dmaBd.getBdHandle());
             }
         }
     }
-    
-    for (auto *op : info.configCreateIoOps) {
-        auto createIo = cast<dfschedule::ConfigCreateIoOp>(op);
+    ///*
+    for (auto &opWithParent : info.configCreateIoOps) {
+        auto createIo = cast<dfschedule::ConfigCreateIoOp>(opWithParent.op);
         Value tileVal = createIo.getTile();
         
         if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
             TileKey key = getTileKey(declareTile);
             if (isShimTile(key)) {
-                info.shimTiles[key].createIoOps.push_back(op);
+                info.shimTiles[key].createIoOps.push_back(opWithParent.op);
                 info.shimTiles[key].ioHandles.push_back(createIo.getIoHandle());
             }
         }
     }
+    //*/
+    // Print all shim tiles and their associated DMA operations
+    llvm::errs() << "\n=== Shim Tiles DMA Association ===\n";
+    if (info.shimTiles.empty()) {
+        llvm::errs() << "  No shim tiles found.\n";
+    } else {
+        for (auto &[key, shimInfo] : info.shimTiles) {
+            llvm::errs() << "\nShim Tile (col=" << key.first << ", row=" << key.second << "):\n";
+            
+            // Print DMA BD operations
+            llvm::errs() << "  DMA BD Operations: " << shimInfo.dmaBdOps.size() << "\n";
+            for (size_t i = 0; i < shimInfo.dmaBdOps.size(); ++i) {
+                auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(shimInfo.dmaBdOps[i]);
+                llvm::errs() << "    [" << i << "] dfschedule.config.dma_bd\n";
+                llvm::errs() << "        Offset: " << dmaBd.getOffset() << "\n";
+                llvm::errs() << "        Length: " << dmaBd.getLen() << "\n";
+                llvm::errs() << "        Enable Packet: " << dmaBd.getEnablePacket() << "\n";
+                if (dmaBd.getEnablePacket()) {
+                    llvm::errs() << "        Packet ID: " << dmaBd.getPacketId() << "\n";
+                }
+                llvm::errs() << "        BD Handle: " << shimInfo.bdHandles[i] << "\n";
+            }
+            
+            // Print IO Config operations
+            llvm::errs() << "  IO Config Operations: " << shimInfo.createIoOps.size() << "\n";
+            for (size_t i = 0; i < shimInfo.createIoOps.size(); ++i) {
+                auto createIo = cast<dfschedule::ConfigCreateIoOp>(shimInfo.createIoOps[i]);
+                llvm::errs() << "    [" << i << "] dfschedule.config.create_io\n";
+                llvm::errs() << "        Channel: " << createIo.getChannel() << "\n";
+                llvm::errs() << "        Direction: " << createIo.getDirection() << "\n";
+                llvm::errs() << "        IO Operation: " << createIo.getIoOperation() << "\n";
+                llvm::errs() << "        IO Handle: " << shimInfo.ioHandles[i] << "\n";
+            }
+        }
+    }
+    llvm::errs() << "\n==================================\n\n";
 }
 
 // Structure to hold DMA BD parameters extracted from original ops
@@ -449,8 +568,8 @@ static void createCanonicalizedSchedule(
     // Map to track BD index per shim tile
     std::map<TileKey, int> shimBdCounter;
     
-    for (auto *op : info.configDmaBdOps) {
-        auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(op);
+    for (auto &opWithParent : info.configDmaBdOps) {
+        auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(opWithParent.op);
         Value tileVal = dmaBd.getTile();
         
         if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
@@ -475,7 +594,7 @@ static void createCanonicalizedSchedule(
                     if (auto extractSlice = tensorVal.getDefiningOp<tensor::ExtractSliceOp>()) {
                         // Find which slice index this corresponds to
                         for (size_t i = 0; i < info.extractSliceOps.size(); ++i) {
-                            if (info.extractSliceOps[i] == extractSlice.getOperation()) {
+                            if (info.extractSliceOps[i].op == extractSlice.getOperation()) {
                                 params.sliceIndex = static_cast<int64_t>(i);
                                 break;
                             }
@@ -491,8 +610,8 @@ static void createCanonicalizedSchedule(
     // Map to track IO index per shim tile
     std::map<TileKey, int> shimIoCounter;
     
-    for (auto *op : info.configCreateIoOps) {
-        auto createIo = cast<dfschedule::ConfigCreateIoOp>(op);
+    for (auto &opWithParent : info.configCreateIoOps) {
+        auto createIo = cast<dfschedule::ConfigCreateIoOp>(opWithParent.op);
         Value tileVal = createIo.getTile();
         
         if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
@@ -986,53 +1105,53 @@ static void removeOldScheduleOps(ModuleScheduleInfo &info) {
     SmallVector<Operation*> opsToRemove;
     
     // Remove wait ops first
-    for (auto *op : info.scheduleWaitOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.scheduleWaitOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Remove start_io ops
-    for (auto *op : info.startIoOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.startIoOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Remove getBdId ops
-    for (auto *op : info.getBdIdOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.getBdIdOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Remove launch ops
-    for (auto *op : info.launchKernelGroupOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.launchKernelGroupOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Remove load_kernel_group ops
-    for (auto *op : info.loadKernelGroupOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.loadKernelGroupOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Remove packet ops
-    for (auto *op : info.packetOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.packetOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Remove createIo ops
-    for (auto *op : info.configCreateIoOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.configCreateIoOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Remove dmaBd ops
-    for (auto *op : info.configDmaBdOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.configDmaBdOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Remove declareTile ops
-    for (auto *op : info.declareTileOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.declareTileOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Remove declareTensor ops
-    for (auto *op : info.declareTensorOps) {
-        opsToRemove.push_back(op);
+    for (auto &opWithParent : info.declareTensorOps) {
+        opsToRemove.push_back(opWithParent.op);
     }
     
     // Erase dfschedule operations (safe, no nested structure issues)
@@ -1094,6 +1213,9 @@ void ScheduleCanonicalizePass::runOnOperation() {
     // Step 1: Collect all dfschedule operations
     collectScheduleOps(moduleOp, info);
     
+    // Debug: Print parent information
+    printParentInfo(info);
+    
     // Early exit if no schedule ops found
     if (info.declareTileOps.empty() && info.loadKernelGroupOps.empty()) {
         return;
@@ -1102,10 +1224,7 @@ void ScheduleCanonicalizePass::runOnOperation() {
     // Step 2: Associate packets with tiles
     associatePacketsWithTiles(info);
     
-    // Step 3: Associate DMA configs with shim tiles
-    associateDmaWithShimTiles(info);
-    
-    // Step 4: Find the main function to insert canonicalized host block
+    // Step 3: Find the main function to insert canonicalized host block
     func::FuncOp mainFunc = nullptr;
     moduleOp.walk([&](func::FuncOp funcOp) {
         if (funcOp.getName() == "main") {
@@ -1124,6 +1243,22 @@ void ScheduleCanonicalizePass::runOnOperation() {
     Location loc = mainFunc.getLoc();
     
     createCanonicalizedSchedule(builder, loc, info, moduleOp, mainFunc);
+    
+    // Step 5.5: Re-collect DMA BD operations after canonicalization to get correct parent info
+    // Clear the old collection and re-collect from the canonicalized IR
+    info.configDmaBdOps.clear();
+    info.configCreateIoOps.clear();
+    moduleOp.walk([&](Operation *op) {
+        Operation *parentOp = getParentOp(op);
+        if (auto configDmaBd = dyn_cast<dfschedule::ConfigDmaBdOp>(op)) {
+            info.configDmaBdOps.push_back(OpWithParent(op, parentOp));
+        } else if (auto createIo = dyn_cast<dfschedule::ConfigCreateIoOp>(op)) {
+            info.configCreateIoOps.push_back(OpWithParent(op, parentOp));
+        }
+    });
+    
+    // Step 5.6: Associate DMA configs with shim tiles (after canonicalization)
+    associateDmaWithShimTiles(info);
     
     // Step 6: Remove old distributed dfschedule operations
     removeOldScheduleOps(info);
