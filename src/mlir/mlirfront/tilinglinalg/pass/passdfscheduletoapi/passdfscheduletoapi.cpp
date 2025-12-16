@@ -702,6 +702,53 @@ struct DeclareTensorInnerPattern : public OpConversionPattern<dfschedule::Declar
     }
 };
 
+/// OpConversionPattern for dfschedule.declaretile -> XAie_TileLoc call
+/// Converts tile declaration to: XAie_LocType tile = XAie_TileLoc(col, row);
+struct DeclareTileInnerPattern : public OpConversionPattern<dfschedule::DeclareTileOp> {
+    ConversionState &state;
+    
+    DeclareTileInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : OpConversionPattern<dfschedule::DeclareTileOp>(typeConverter, ctx, /*benefit=*/1), state(state) {}
+    
+    LogicalResult matchAndRewrite(dfschedule::DeclareTileOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        
+        // Get tile coordinates from attributes
+        int32_t col = op.getCol();
+        int32_t row = op.getRow();
+        
+        llvm::errs() << "[Pattern] DeclareTile called for tile (col=" << col << ", row=" << row << ")\n";
+        
+        // Create XAie_LocType type
+        auto xaieLocType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_LocType");
+        
+        // Create constants for column and row
+        auto i8Type = rewriter.getI8Type();
+        auto colConst = rewriter.create<emitc::ConstantOp>(
+            loc, i8Type, rewriter.getI8IntegerAttr(col));
+        auto rowConst = rewriter.create<emitc::ConstantOp>(
+            loc, i8Type, rewriter.getI8IntegerAttr(row));
+        
+        // Create XAie_TileLoc(col, row) call
+        // This generates: XAie_LocType tile_<col>_<row> = XAie_TileLoc(col, row);
+        auto tileLocOp = rewriter.create<emitc::CallOpaqueOp>(
+            loc,
+            xaieLocType,
+            "XAie_TileLoc",
+            nullptr,
+            nullptr,
+            ValueRange{colConst.getResult(), rowConst.getResult()});
+        
+        llvm::errs() << "  ✓ Created XAie_TileLoc(" << col << ", " << row << ") -> XAie_LocType\n";
+        
+        // Replace the declaretile op with the XAie_TileLoc call result
+        // The result is of type XAie_LocType and can be used by DMA BD operations
+        rewriter.replaceOp(op, tileLocOp.getResult(0));
+        return success();
+    }
+};
+
 //===----------------------------------------------------------------------===//
 // Outer Patterns (Convert host op structure)
 //===----------------------------------------------------------------------===//
@@ -1141,6 +1188,7 @@ void DfscheduleToApiPass::runOnOperation() {
     innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<DeclareTensorInnerPattern>(typeConverter, ctx, state);
+    innerPatterns.add<DeclareTileInnerPattern>(typeConverter, ctx, state);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
@@ -1153,7 +1201,8 @@ void DfscheduleToApiPass::runOnOperation() {
         EraseOpLowering<dfschedule::LoadKernelGroupOp>,
         EraseOpLowering<dfschedule::ConfigCreateIoOp>,
         EraseOpLowering<dfschedule::ConfigDmaBdOp>,
-        EraseOpLowering<dfschedule::DeclareTileOp>,
+        // NOTE: DeclareTileOp is now converted by DeclareTileInnerPattern
+        // EraseOpLowering<dfschedule::DeclareTileOp>,
         // NOTE: LaunchHostOp is handled in Phase 4, not here
         // EraseOpLowering<dfschedule::LaunchHostOp>,
         // NOTE: DeclareTensorOp is now converted by DeclareTensorInnerPattern
