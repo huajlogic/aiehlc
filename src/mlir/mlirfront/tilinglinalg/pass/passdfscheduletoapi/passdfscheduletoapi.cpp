@@ -749,6 +749,72 @@ struct DeclareTileInnerPattern : public OpConversionPattern<dfschedule::DeclareT
     }
 };
 
+/// OpConversionPattern for dfschedule.config.dma_bd
+/// Converts DMA BD configuration to AIE API calls
+/// For now, creates a placeholder that uses the tile to keep it alive
+struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDmaBdOp> {
+    ConversionState &state;
+    
+    ConfigDmaBdInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : OpConversionPattern<dfschedule::ConfigDmaBdOp>(typeConverter, ctx, /*benefit=*/1), state(state) {}
+    
+    LogicalResult matchAndRewrite(dfschedule::ConfigDmaBdOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        
+        // Get attributes
+        int32_t offset = op.getOffset();
+        int32_t len = op.getLen();
+        bool enablePacket = op.getEnablePacket();
+        int32_t packetId = op.getPacketId();
+        uint32_t nextBd = op.getNextBd();
+        
+        llvm::errs() << "[Pattern] ConfigDmaBd called (offset=" << offset 
+                     << ", len=" << len << ", enable_packet=" << enablePacket 
+                     << ", packet_id=" << packetId << ")\n";
+        
+        // Get converted operands
+        Value buffer = adaptor.getOperands()[0];  // PartitionTensor
+        Value tile = adaptor.getOperands()[1];    // XAie_LocType
+        Value bdId = adaptor.getOperands()[2];    // i32
+        
+        llvm::errs() << "  Buffer type: " << buffer.getType() << "\n";
+        llvm::errs() << "  Tile type: " << tile.getType() << "\n";
+        llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";
+        
+        // Create verbatim comment to document the configuration
+        std::string comment = "/* DMA BD Config: offset=" + std::to_string(offset) +
+                            ", len=" + std::to_string(len) +
+                            ", enable_packet=" + (enablePacket ? "true" : "false") +
+                            ", packet_id=" + std::to_string(packetId) +
+                            ", next_bd=" + std::to_string(nextBd) + " */";
+        
+        rewriter.create<emitc::VerbatimOp>(loc, comment);
+        
+        // Create a dummy XAie_DmaDescInit call that uses the tile
+        // This keeps the tile value alive and prevents optimization
+        // Format: XAie_DmaDescInit(&DevInst, &dmaDesc, tile)
+        auto i32Type = rewriter.getI32Type();
+        auto dmaDescType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DmaDesc");
+        
+        // Create a call that uses the tile - this prevents dead code elimination
+        // We'll create a dummy call to document tile usage
+        auto dummyCall = rewriter.create<emitc::CallOpaqueOp>(
+            loc,
+            i32Type,
+            "__emitc_dma_bd_config",
+            nullptr,
+            nullptr,
+            ValueRange{tile, bdId});  // Use the tile here!
+        
+        llvm::errs() << "  ✓ Created DMA BD config with tile usage\n";
+        
+        // Replace the op with the call result
+        rewriter.replaceOp(op, dummyCall.getResult(0));
+        return success();
+    }
+};
+
 //===----------------------------------------------------------------------===//
 // Outer Patterns (Convert host op structure)
 //===----------------------------------------------------------------------===//
@@ -1189,6 +1255,7 @@ void DfscheduleToApiPass::runOnOperation() {
     innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<DeclareTensorInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<DeclareTileInnerPattern>(typeConverter, ctx, state);
+    innerPatterns.add<ConfigDmaBdInnerPattern>(typeConverter, ctx, state);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
@@ -1200,7 +1267,8 @@ void DfscheduleToApiPass::runOnOperation() {
         EraseOpLowering<dfschedule::GetBdIdOp>,
         EraseOpLowering<dfschedule::LoadKernelGroupOp>,
         EraseOpLowering<dfschedule::ConfigCreateIoOp>,
-        EraseOpLowering<dfschedule::ConfigDmaBdOp>,
+        // NOTE: ConfigDmaBdOp is now converted by ConfigDmaBdInnerPattern
+        // EraseOpLowering<dfschedule::ConfigDmaBdOp>,
         // NOTE: DeclareTileOp is now converted by DeclareTileInnerPattern
         // EraseOpLowering<dfschedule::DeclareTileOp>,
         // NOTE: LaunchHostOp is handled in Phase 4, not here
@@ -1235,7 +1303,7 @@ void DfscheduleToApiPass::runOnOperation() {
     innerTarget.addIllegalOp<dfschedule::GetBdIdOp>();
     innerTarget.addIllegalOp<dfschedule::LoadKernelGroupOp>();
     innerTarget.addIllegalOp<dfschedule::ConfigCreateIoOp>();
-    innerTarget.addIllegalOp<dfschedule::ConfigDmaBdOp>();
+    innerTarget.addIllegalOp<dfschedule::ConfigDmaBdOp>();  // Converted by ConfigDmaBdInnerPattern
     innerTarget.addIllegalOp<dfschedule::DeclareTileOp>();
     // NOTE: LaunchHostOp is handled in Phase 4, not here
     // innerTarget.addIllegalOp<dfschedule::LaunchHostOp>();
