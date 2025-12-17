@@ -824,35 +824,78 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         
         llvm::errs() << "  ✓ Tile is XAie_LocType\n";
         
-        // Create verbatim comment to document the configuration
-        std::string comment = "/* DMA BD Config: offset=" + std::to_string(offset) +
+        // Generate AIE DMA BD configuration following the pattern:
+        // XAie_DmaDesc DmaInst;
+        // XAie_DmaDescInit(&DevInst, &DmaInst, tile);
+        // XAie_DmaSetAddrLen(&DmaInst, offset, len);
+        // XAie_DmaSetNextBd(&DmaInst, next_bd, XAIE_ENABLE/XAIE_DISABLE);
+        // XAie_DmaSetPkt(&DmaInst, {.PktId=packet_id, .PktType=0});
+        // XAie_DmaEnableBd(&DmaInst);
+        // XAie_DmaWriteBd(&DevInst, &DmaInst, tile, bd_id);
+        
+        auto i32Type = rewriter.getI32Type();
+        auto dmaDescType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DmaDesc");
+        
+        // Create comment
+        std::string comment = "/* DMA BD Config: bd_id=" + std::to_string(op.getBdId().getDefiningOp<arith::ConstantOp>() ? 
+                              op.getBdId().getDefiningOp<arith::ConstantOp>().getValue().cast<IntegerAttr>().getInt() : -1) +
+                            ", offset=" + std::to_string(offset) +
                             ", len=" + std::to_string(len) +
                             ", enable_packet=" + (enablePacket ? "true" : "false") +
                             ", packet_id=" + std::to_string(packetId) +
                             ", next_bd=" + std::to_string(nextBd) + " */";
-        
         rewriter.create<emitc::VerbatimOp>(loc, comment);
         
-        // Create a dummy XAie_DmaDescInit call that uses the tile
-        // This keeps the tile value alive and prevents optimization
-        // Format: XAie_DmaDescInit(&DevInst, &dmaDesc, tile)
-        auto i32Type = rewriter.getI32Type();
-        auto dmaDescType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DmaDesc");
+        // Create constants for parameters
+        auto offsetConst = rewriter.create<emitc::ConstantOp>(
+            loc, i32Type, rewriter.getI32IntegerAttr(offset));
+        auto lenConst = rewriter.create<emitc::ConstantOp>(
+            loc, i32Type, rewriter.getI32IntegerAttr(len));
+        auto nextBdConst = rewriter.create<emitc::ConstantOp>(
+            loc, i32Type, rewriter.getI32IntegerAttr(nextBd));
+        auto packetIdConst = rewriter.create<emitc::ConstantOp>(
+            loc, i32Type, rewriter.getI32IntegerAttr(packetId));
         
-        // Create a call that uses the tile - this prevents dead code elimination
-        // We'll create a dummy call to document tile usage
-        auto dummyCall = rewriter.create<emitc::CallOpaqueOp>(
+        // Get buffer address - need to convert memref/PartitionTensor to void* address
+        // For now, we'll pass the buffer directly and let the helper function extract the address
+        Value bufferAddr = buffer;
+        
+        // If buffer is a PartitionTensor, we need to extract its data pointer
+        // If it's a memref, we need to get its base address
+        // For simplicity, we'll cast it to void* and let the runtime handle it
+        
+        // Call the helper function that wraps all the AIE API calls
+        // int32_t __emitc_dma_bd_config(XAie_DevInst* dev, XAie_LocType tile, 
+        //                               void* buffer, int32_t bd_id,
+        //                               uint64_t addr, int32_t len, int32_t next_bd,
+        //                               int32_t enable_packet, int32_t packet_id)
+        auto u64Type = rewriter.getIntegerType(64);
+        auto addrConst = rewriter.create<emitc::ConstantOp>(
+            loc, u64Type, rewriter.getIntegerAttr(u64Type, offset));
+        
+        auto configCall = rewriter.create<emitc::CallOpaqueOp>(
             loc,
             i32Type,
             "__emitc_dma_bd_config",
             nullptr,
             nullptr,
-            ValueRange{tile, bdId});  // Use the tile here!
+            ValueRange{
+                state.devInstRef,          // &DevInst
+                tile,                      // XAie_LocType tile
+                bufferAddr,                // void* buffer (for address extraction)
+                bdId,                      // bd_id
+                addrConst.getResult(),     // addr (offset within buffer)
+                lenConst.getResult(),      // len
+                nextBdConst.getResult(),   // next_bd
+                rewriter.create<emitc::ConstantOp>(loc, i32Type, 
+                    rewriter.getI32IntegerAttr(enablePacket ? 1 : 0)).getResult(),  // enable_packet
+                packetIdConst.getResult()  // packet_id
+            });
         
-        llvm::errs() << "  ✓ Created DMA BD config with tile usage\n";
+        llvm::errs() << "  ✓ Created DMA BD config with full AIE API parameters\n";
         
-        // Replace the op with the call result
-        rewriter.replaceOp(op, dummyCall.getResult(0));
+        // Replace the op with the call result (status code)
+        rewriter.replaceOp(op, configCall.getResult(0));
         return success();
     }
 };
