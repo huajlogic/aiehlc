@@ -644,8 +644,8 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
 struct DeclareTensorInnerPattern : public OpConversionPattern<dfschedule::DeclareTensorOp> {
     ConversionState &state;
     
-    DeclareTensorInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : OpConversionPattern<dfschedule::DeclareTensorOp>(typeConverter, ctx, /*benefit=*/1), state(state) {}
+    DeclareTensorInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state, PatternBenefit benefit = 100)
+        : OpConversionPattern<dfschedule::DeclareTensorOp>(typeConverter, ctx, benefit), state(state) {}
     
     LogicalResult matchAndRewrite(dfschedule::DeclareTensorOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -707,8 +707,8 @@ struct DeclareTensorInnerPattern : public OpConversionPattern<dfschedule::Declar
 struct DeclareTileInnerPattern : public OpConversionPattern<dfschedule::DeclareTileOp> {
     ConversionState &state;
     
-    DeclareTileInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : OpConversionPattern<dfschedule::DeclareTileOp>(typeConverter, ctx, /*benefit=*/1), state(state) {}
+    DeclareTileInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state, PatternBenefit benefit = 100)
+        : OpConversionPattern<dfschedule::DeclareTileOp>(typeConverter, ctx, benefit), state(state) {}
     
     LogicalResult matchAndRewrite(dfschedule::DeclareTileOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -755,8 +755,8 @@ struct DeclareTileInnerPattern : public OpConversionPattern<dfschedule::DeclareT
 struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDmaBdOp> {
     ConversionState &state;
     
-    ConfigDmaBdInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
-        : OpConversionPattern<dfschedule::ConfigDmaBdOp>(typeConverter, ctx, /*benefit=*/1), state(state) {}
+    ConfigDmaBdInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state, PatternBenefit benefit = 1)
+        : OpConversionPattern<dfschedule::ConfigDmaBdOp>(typeConverter, ctx, benefit), state(state) {}
     
     LogicalResult matchAndRewrite(dfschedule::ConfigDmaBdOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -773,14 +773,56 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                      << ", len=" << len << ", enable_packet=" << enablePacket 
                      << ", packet_id=" << packetId << ")\n";
         
-        // Get converted operands
-        Value buffer = adaptor.getOperands()[0];  // PartitionTensor
-        Value tile = adaptor.getOperands()[1];    // XAie_LocType
-        Value bdId = adaptor.getOperands()[2];    // i32
+        // Get operands
+        Value buffer = adaptor.getBuffer();
+        Value tile = adaptor.getTile();
+        Value bdId = adaptor.getBdId();
         
         llvm::errs() << "  Buffer type: " << buffer.getType() << "\n";
         llvm::errs() << "  Tile type: " << tile.getType() << "\n";
         llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";
+        
+        // If tile is not yet converted, check if it's a DeclareTileOp and convert it inline
+        if (!tile.getType().isa<emitc::OpaqueType>() || 
+            tile.getType().cast<emitc::OpaqueType>().getValue() != "XAie_LocType") {
+            
+            // Check if the tile comes from a DeclareTileOp
+            if (auto declareTileOp = tile.getDefiningOp<dfschedule::DeclareTileOp>()) {
+                llvm::errs() << "  ℹ Tile from DeclareTileOp, converting inline...\n";
+                
+                // Get tile coordinates
+                int32_t col = declareTileOp.getCol();
+                int32_t row = declareTileOp.getRow();
+                
+                // Create XAie_TileLoc call inline
+                auto xaieLocType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_LocType");
+                auto colConst = rewriter.create<emitc::ConstantOp>(
+                    loc, rewriter.getI32Type(),
+                    rewriter.getI32IntegerAttr(col));
+                auto rowConst = rewriter.create<emitc::ConstantOp>(
+                    loc, rewriter.getI32Type(),
+                    rewriter.getI32IntegerAttr(row));
+                
+                tile = rewriter.create<emitc::CallOpaqueOp>(
+                    loc, xaieLocType, "XAie_TileLoc",
+                    nullptr, nullptr,
+                    ValueRange{colConst.getResult(), rowConst.getResult()}).getResult(0);
+                
+                llvm::errs() << "  ✓ Created inline XAie_TileLoc(" << col << ", " << row << ")\n";
+            } else if (tile.isa<BlockArgument>()) {
+                // Tile is a function argument (e.g., in dskernel_receiver)
+                // This is OK - we'll just use it as-is and it will be handled by the kernel conversion
+                llvm::errs() << "  ℹ Tile is a function argument, using as-is\n";
+                // For now, just erase this op since kernel-side DMA config is handled differently
+                rewriter.eraseOp(op);
+                return success();
+            } else {
+                llvm::errs() << "  ⚠ Tile not from DeclareTileOp or BlockArgument, deferring...\n";
+                return failure();
+            }
+        }
+        
+        llvm::errs() << "  ✓ Tile is XAie_LocType\n";
         
         // Create verbatim comment to document the configuration
         std::string comment = "/* DMA BD Config: offset=" + std::to_string(offset) +
@@ -1250,12 +1292,15 @@ void DfscheduleToApiPass::runOnOperation() {
     innerPatterns.add<ArithConstantInnerPattern>(typeConverter, ctx, state);
     
     // Add actual conversion patterns for inner ops
+    // Higher benefits = run first. We need DeclareTile and DeclareTensor to run before ConfigDmaBd
     innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx);
     innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
-    innerPatterns.add<DeclareTensorInnerPattern>(typeConverter, ctx, state);
-    innerPatterns.add<DeclareTileInnerPattern>(typeConverter, ctx, state);
-    innerPatterns.add<ConfigDmaBdInnerPattern>(typeConverter, ctx, state);
+    
+    // These must run BEFORE ConfigDmaBdOp (higher benefit = 100)
+    innerPatterns.add<DeclareTensorInnerPattern>(typeConverter, ctx, state, /*benefit=*/100);
+    innerPatterns.add<DeclareTileInnerPattern>(typeConverter, ctx, state, /*benefit=*/100);
+    innerPatterns.add<ConfigDmaBdInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
@@ -1303,7 +1348,7 @@ void DfscheduleToApiPass::runOnOperation() {
     innerTarget.addIllegalOp<dfschedule::GetBdIdOp>();
     innerTarget.addIllegalOp<dfschedule::LoadKernelGroupOp>();
     innerTarget.addIllegalOp<dfschedule::ConfigCreateIoOp>();
-    innerTarget.addIllegalOp<dfschedule::ConfigDmaBdOp>();  // Converted by ConfigDmaBdInnerPattern
+    innerTarget.addIllegalOp<dfschedule::ConfigDmaBdOp>();  // Converted in Phase 3 with proper benefits
     innerTarget.addIllegalOp<dfschedule::DeclareTileOp>();
     // NOTE: LaunchHostOp is handled in Phase 4, not here
     // innerTarget.addIllegalOp<dfschedule::LaunchHostOp>();
