@@ -119,6 +119,14 @@ struct ConversionState {
     int extractSliceFailCount = 0;
     int extractSliceSuccessCount = 0;
     
+    // Resource manager for channel and BD IDs
+    // Map from tile (col, row) to next available channel/BD ID
+    DenseMap<std::pair<int32_t, int32_t>, int32_t> nextChannelId;
+    DenseMap<std::pair<int32_t, int32_t>, int32_t> nextBdId;
+    
+    // Map from io_handle Value to (channel_id, bd_id) for __Runtime_dma_createio
+    DenseMap<Value, std::pair<int32_t, int32_t>> ioHandleToResourceMap;
+    
     // Cached values for inner patterns (set before applying inner patterns)
     Value devInstRef;
     Value cacheableConst;
@@ -128,6 +136,20 @@ struct ConversionState {
     Type partitionType;
     Type devInstType;
     MLIRContext *ctx = nullptr;
+    
+    // Helper to allocate a channel ID for a tile
+    int32_t allocateChannelId(int32_t col, int32_t row) {
+        auto key = std::make_pair(col, row);
+        int32_t &nextId = nextChannelId[key];
+        return nextId++;
+    }
+    
+    // Helper to allocate a BD ID for a tile
+    int32_t allocateBdId(int32_t col, int32_t row) {
+        auto key = std::make_pair(col, row);
+        int32_t &nextId = nextBdId[key];
+        return nextId++;
+    }
 };
 
 
@@ -312,7 +334,7 @@ struct DeclareDataInnerPattern : public OpConversionPattern<dfscheblueprint::Dec
     }
 };
 
-/// Inner pattern for routing.partitiontensor -> __emitc_init_PartitionTensor
+/// Inner pattern for routing.partitiontensor -> __Runtime_init_PartitionTensor
 struct PartitionTensorInnerPattern : public OpConversionPattern<routing::partitiontensor> {
     ConversionState &state;
     
@@ -430,7 +452,7 @@ struct PartitionTensorInnerPattern : public OpConversionPattern<routing::partiti
             rewriter.getI32IntegerAttr(replicateOn));
         ///*
         auto ptOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
-            "__emitc_init_PartitionTensor", nullptr, nullptr,
+            "__Runtime_init_PartitionTensor", nullptr, nullptr,
             ValueRange{dataVoidPtr, elemSizeConst.getResult(), ndimConst.getResult(),
                        origShapeConst.getResult(), partShapeConst.getResult(),
                        splitdimConst.getResult(), splitnumConst.getResult(),
@@ -447,7 +469,7 @@ struct PartitionTensorInnerPattern : public OpConversionPattern<routing::partiti
     }
 };
 
-/// Inner pattern for tensor.extract_slice -> __emitc_extract_slice_*
+/// Inner pattern for tensor.extract_slice -> __Runtime_extract_slice_*
 struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSliceOp> {
     ConversionState &state;
     
@@ -547,7 +569,7 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
             
             if (isContiguous) {
                 auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
-                    "__emitc_extract_slice_contiguous_2d",
+                    "__Runtime_extract_slice_contiguous_2d",
                     rewriter.getArrayAttr({
                         rewriter.getIndexAttr(0),
                         rewriter.getI32IntegerAttr(offsets[0]),
@@ -561,7 +583,7 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
                 llvm::errs() << "[Pattern]   => Contiguous nested slice (no allocation)\n";
             } else {
                 auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
-                    "__emitc_extract_slice_strided_2d",
+                    "__Runtime_extract_slice_strided_2d",
                     rewriter.getArrayAttr({
                         rewriter.getIndexAttr(0),
                         rewriter.getIndexAttr(1),
@@ -585,7 +607,7 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
             
             if (isContiguous) {
                 auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
-                    "__emitc_extract_slice_contiguous_2d",
+                    "__Runtime_extract_slice_contiguous_2d",
                     rewriter.getArrayAttr({
                         rewriter.getIndexAttr(0),
                         rewriter.getI32IntegerAttr(offsets[0]),
@@ -599,7 +621,7 @@ struct ExtractSliceInnerPattern : public OpConversionPattern<tensor::ExtractSlic
                 llvm::errs() << "[Pattern]   => Contiguous partition slice (no allocation)\n";
             } else {
                 auto sliceOp = rewriter.create<emitc::CallOpaqueOp>(loc, state.partitionType,
-                    "__emitc_extract_slice_strided_2d",
+                    "__Runtime_extract_slice_strided_2d",
                     rewriter.getArrayAttr({
                         rewriter.getIndexAttr(0),
                         rewriter.getIndexAttr(1),
@@ -783,9 +805,9 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";
         
         // If tile is not yet converted, check if it's a DeclareTileOp and convert it inline
+        /*
         if (!tile.getType().isa<emitc::OpaqueType>() || 
             tile.getType().cast<emitc::OpaqueType>().getValue() != "XAie_LocType") {
-            
             // Check if the tile comes from a DeclareTileOp
             if (auto declareTileOp = tile.getDefiningOp<dfschedule::DeclareTileOp>()) {
                 llvm::errs() << "  ℹ Tile from DeclareTileOp, converting inline...\n";
@@ -823,6 +845,7 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         }
         
         llvm::errs() << "  ✓ Tile is XAie_LocType\n";
+        */
         
         // Generate AIE DMA BD configuration following the pattern:
         // XAie_DmaDesc DmaInst;
@@ -865,18 +888,18 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         // For simplicity, we'll cast it to void* and let the runtime handle it
         
         // Call the helper function that wraps all the AIE API calls
-        // int32_t __emitc_dma_bd_config(XAie_DevInst* dev, XAie_LocType tile, 
-        //                               void* buffer, int32_t bd_id,
-        //                               uint64_t addr, int32_t len, int32_t next_bd,
-        //                               int32_t enable_packet, int32_t packet_id)
+        // XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst* dev, XAie_LocType tile, 
+        //                                      void* buffer, int32_t bd_id,
+        //                                      uint64_t addr, int32_t len, int32_t next_bd,
+        //                                      int32_t enable_packet, int32_t packet_id)
         auto u64Type = rewriter.getIntegerType(64);
         auto addrConst = rewriter.create<emitc::ConstantOp>(
             loc, u64Type, rewriter.getIntegerAttr(u64Type, offset));
         
         auto configCall = rewriter.create<emitc::CallOpaqueOp>(
             loc,
-            i32Type,
-            "__emitc_dma_bd_config",
+            dmaDescType,
+            "__Runtime_dma_bd_config",
             nullptr,
             nullptr,
             ValueRange{
@@ -896,6 +919,171 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         
         // Replace the op with the call result (status code)
         rewriter.replaceOp(op, configCall.getResult(0));
+        return success();
+    }
+};
+
+/// OpConversionPattern for dfschedule.config.create_io
+/// Converts IO creation to __Runtime_dma_createio call that returns an io struct
+/// struct io = __Runtime_dma_createio(dma_desc, channel_id, bd_id);
+/// The channel_id and bd_id are allocated from the resource manager
+struct ConfigCreateIoInnerPattern : public OpConversionPattern<dfschedule::ConfigCreateIoOp> {
+    ConversionState &state;
+    
+    ConfigCreateIoInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state, PatternBenefit benefit = 1)
+        : OpConversionPattern<dfschedule::ConfigCreateIoOp>(typeConverter, ctx, benefit), state(state) {}
+    
+    LogicalResult matchAndRewrite(dfschedule::ConfigCreateIoOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        
+        // Get attributes
+        int32_t channel = op.getChannel();
+        std::string direction = op.getDirection().str();  // "MM2S" or "S2MM"
+        std::string ioOperation = op.getIoOperation().str();
+        
+        llvm::errs() << "[Pattern] ConfigCreateIo called (channel=" << channel 
+                     << ", direction=" << direction << ", io_operation=" << ioOperation << ")\n";
+        
+        // Get operands
+        Value bdConfig = adaptor.getBdConfig();  // This should be the XAie_DmaDesc from config.dma_bd
+        Value tile = adaptor.getTile();
+        
+        // IMPORTANT: In partial conversion, adaptor gives us converted operands if they exist
+        // But we need to explicitly check if they've been remapped
+        llvm::errs() << "  Original BD Config: " << op.getBdConfig() << "\n";
+        llvm::errs() << "  Adapted BD Config: " << bdConfig << "\n";
+        llvm::errs() << "  BD Config type: " << bdConfig.getType() << "\n";
+        llvm::errs() << "  Tile type: " << tile.getType() << "\n";
+        
+     
+        //rewriter.eraseOp(op);
+        //return success();
+        
+        // Extract tile coordinates directly from the original DeclareTileOp
+        int32_t tileCol = -1, tileRow = -1;
+        Value originalTile = op.getTile();  // Get original tile value before conversion
+        
+        if (auto declareTileOp = originalTile.getDefiningOp<dfschedule::DeclareTileOp>()) {
+            tileCol = declareTileOp.getCol();
+            tileRow = declareTileOp.getRow();
+            llvm::errs() << "  ✓ Extracted tile coordinates from DeclareTileOp: (" 
+                         << tileCol << ", " << tileRow << ")\n";
+        } else {
+            llvm::errs() << "  ⚠ Could not find DeclareTileOp for tile\n";
+            return failure();
+        }
+        
+        if (tileCol < 0 || tileRow < 0) {
+            llvm::errs() << "  ⚠ Invalid tile coordinates\n";
+            return failure();
+        }
+        
+        auto i32Type = rewriter.getI32Type();
+        
+        // Allocate channel ID and BD ID from resource manager
+        int32_t allocatedChannelId = state.allocateChannelId(tileCol, tileRow);
+        int32_t allocatedBdId = state.allocateBdId(tileCol, tileRow);
+        
+        llvm::errs() << "  ✓ Allocated resources: channel_id=" << allocatedChannelId 
+                     << ", bd_id=" << allocatedBdId << "\n";
+        
+        // Create constants for channel and BD IDs
+        auto channelIdConst = rewriter.create<emitc::ConstantOp>(
+            loc, i32Type, rewriter.getI32IntegerAttr(allocatedChannelId));
+        
+        auto bdIdConst = rewriter.create<emitc::ConstantOp>(
+            loc, i32Type, rewriter.getI32IntegerAttr(allocatedBdId));
+        // Create comment
+        std::string comment = "/* Create IO: channel_id=" + std::to_string(allocatedChannelId) +
+                            ", bd_id=" + std::to_string(allocatedBdId) +
+                            ", tile=(" + std::to_string(tileCol) + "," + std::to_string(tileRow) + ")" +
+                            ", direction=" + direction + " */";
+        rewriter.create<emitc::VerbatimOp>(loc, comment);
+        
+        // Define the IO struct type
+        auto ioStructType = emitc::OpaqueType::get(rewriter.getContext(), "struct io");
+        
+        // Create __Runtime_dma_createio call:
+        // struct io = __Runtime_dma_createio(tile_loc, dma_desc, channel_id, bd_id);
+        auto createIoCall = rewriter.create<emitc::CallOpaqueOp>(
+            loc,
+            ioStructType,
+            "__Runtime_dma_createio",
+            nullptr,
+            nullptr,
+            ValueRange{
+                tile,                       // XAie_LocType tile_loc
+                bdConfig,                   // XAie_DmaDesc dma_desc
+                channelIdConst.getResult(), // channel_id (from resource manager)
+                bdIdConst.getResult()       // bd_id (from resource manager)
+            });
+        
+        llvm::errs() << "  ✓ Created __Runtime_dma_createio call\n";
+        
+        // Store the resource mapping for use by StartIoOp
+        //state.ioHandleToResourceMap[op.getResult()] = std::make_pair(allocatedChannelId, allocatedBdId);
+        
+        // Replace the op with the IO struct
+        rewriter.replaceOp(op, createIoCall.getResult(0));
+        return success();
+    }
+};
+
+/// OpConversionPattern for dfschedule.schedule.start_io
+/// Converts StartIo to __Runtime_startio call that returns an ioevent
+/// struct ioevent = __Runtime_startio(io, timer_value);
+struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
+    ConversionState &state;
+    
+    StartIoInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state, PatternBenefit benefit = 1)
+        : OpConversionPattern<dfschedule::StartIoOp>(typeConverter, ctx, benefit), state(state) {}
+    
+    LogicalResult matchAndRewrite(dfschedule::StartIoOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        
+        llvm::errs() << "[Pattern] StartIo called\n";
+        
+        // Get operands
+        Value ioHandle = adaptor.getIoHandle();  // This should be the "struct io" from config.create_io
+        Value bdId = adaptor.getBdId();          // BD ID (though not used in __Runtime_startio signature shown)
+        
+        llvm::errs() << "  IO Handle type: " << ioHandle.getType() << "\n";
+        llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";
+        
+        // Verify ioHandle is "struct io"
+        if (!ioHandle.getType().isa<emitc::OpaqueType>() || 
+            ioHandle.getType().cast<emitc::OpaqueType>().getValue() != "struct io") {
+            llvm::errs() << "  ⚠ IO Handle is not 'struct io', deferring...\n";
+            return failure();
+        }
+        
+        // Create comment
+        rewriter.create<emitc::VerbatimOp>(loc, "/* Start IO operation */");
+        
+        // Define the ioevent struct type
+        auto ioEventType = emitc::OpaqueType::get(rewriter.getContext(), "struct ioevent");
+        
+        // Create __Runtime_startio call:
+        // struct ioevent = __Runtime_startio(io, timer_or_data_value);
+        // According to the example: __Runtime_startio(io, v4)
+        // The second parameter seems to be some value (maybe from partition or timer)
+        auto startIoCall = rewriter.create<emitc::CallOpaqueOp>(
+            loc,
+            ioEventType,
+            "__Runtime_startio",
+            nullptr,
+            nullptr,
+            ValueRange{
+                ioHandle,  // struct io
+                bdId       // Using bdId as the second parameter (v4 in example)
+            });
+        
+        llvm::errs() << "  ✓ Created __Runtime_startio call\n";
+        
+        // Replace the op with the ioevent
+        rewriter.replaceOp(op, startIoCall.getResult(0));
         return success();
     }
 };
@@ -1127,13 +1315,13 @@ void DfscheduleToApiPass::runOnOperation() {
             "static XAie_MemInst* g_alloc_mem_list[ALLOC_LIST_MAX_SIZE];\n"
             "static int g_alloc_mem_count = 0;\n\n"
             "/* Add memory instance to tracking list */\n"
-            "static inline void __emitc_track_alloc(XAie_MemInst* mem) {\n"
+            "static inline void __Runtime_track_alloc(XAie_MemInst* mem) {\n"
             "    if (g_alloc_mem_count < ALLOC_LIST_MAX_SIZE) {\n"
             "        g_alloc_mem_list[g_alloc_mem_count++] = mem;\n"
             "    }\n"
             "}\n\n"
             "/* Free all tracked memory allocations */\n"
-            "static inline void __emitc_free_all_allocs() {\n"
+            "static inline void __Runtime_free_all_allocs() {\n"
             "    for (int i = 0; i < g_alloc_mem_count; i++) {\n"
             "        if (g_alloc_mem_list[i]) {\n"
             "            XAie_MemFree(g_alloc_mem_list[i]);\n"
@@ -1156,7 +1344,7 @@ void DfscheduleToApiPass::runOnOperation() {
             "    int replicate_on;                        /* 0=row, 1=col, -1=none */\n"
             "} PartitionTensor;\n\n"
             "/* Helper function for PartitionTensor initialization */\n"
-            "static inline PartitionTensor __emitc_init_PartitionTensor(\n"
+            "static inline PartitionTensor __Runtime_init_PartitionTensor(\n"
             "    void* data, size_t elem_size, int ndim,\n"
             "    const int64_t* original_shape, const int64_t* partition_shape,\n"
             "    int partition_dim, int num_partitions,\n"
@@ -1176,7 +1364,7 @@ void DfscheduleToApiPass::runOnOperation() {
             "    return pt;\n"
             "}\n\n"
             "/* Get pointer to a specific partition slice */\n"
-            "static inline void* __emitc_get_partition_slice(\n"
+            "static inline void* __Runtime_get_partition_slice(\n"
             "    PartitionTensor* pt, int partition_idx) {\n"
             "    if (partition_idx < 0 || partition_idx >= pt->num_partitions) return NULL;\n"
             "    /* Calculate slice offset based on partition dimension */\n"
@@ -1188,7 +1376,7 @@ void DfscheduleToApiPass::runOnOperation() {
             "}\n\n"
             "/* Extract contiguous 2D slice from PartitionTensor */\n"
             "/* Takes PartitionTensor by value for cleaner generated code */\n"
-            "static inline PartitionTensor __emitc_extract_slice_contiguous_2d(\n"
+            "static inline PartitionTensor __Runtime_extract_slice_contiguous_2d(\n"
             "    PartitionTensor src, int off0, int off1, int size0, int size1) {\n"
             "    PartitionTensor result;\n"
             "    result.elem_size = src.elem_size;\n"
@@ -1209,7 +1397,7 @@ void DfscheduleToApiPass::runOnOperation() {
             "}\n\n"
             "/* Extract 2D non-contiguous slice from PartitionTensor */\n"
             "/* Allocates new memory via XAie_MemAllocate, copies strided data */\n"
-            "static inline PartitionTensor __emitc_extract_slice_strided_2d(\n"
+            "static inline PartitionTensor __Runtime_extract_slice_strided_2d(\n"
             "    XAie_DevInst* dev_inst, PartitionTensor src,\n"
             "    int off0, int off1, int size0, int size1) {\n"
             "    PartitionTensor result;\n"
@@ -1233,7 +1421,7 @@ void DfscheduleToApiPass::runOnOperation() {
             "        result.data = NULL;\n"
             "        return result;\n"
             "    }\n"
-            "    __emitc_track_alloc(mem_inst);\n"
+            "    __Runtime_track_alloc(mem_inst);\n"
             "    \n"
             "    void* dst = XAie_MemGetVAddr(mem_inst);\n"
             "    result.data = dst;\n"
@@ -1340,21 +1528,31 @@ void DfscheduleToApiPass::runOnOperation() {
     innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
     
-    // These must run BEFORE ConfigDmaBdOp (higher benefit = 100)
+    // These must run BEFORE ConfigDmaBdOp and ConfigCreateIoOp (higher benefit = 100)
     innerPatterns.add<DeclareTensorInnerPattern>(typeConverter, ctx, state, /*benefit=*/100);
     innerPatterns.add<DeclareTileInnerPattern>(typeConverter, ctx, state, /*benefit=*/100);
-    innerPatterns.add<ConfigDmaBdInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
+    
+    // ConfigDmaBdOp must run before ConfigCreateIoOp (benefit = 50)
+    innerPatterns.add<ConfigDmaBdInnerPattern>(typeConverter, ctx, state, /*benefit=*/50);
+    
+    // ConfigCreateIoOp must run before StartIoOp (benefit = 10)
+    innerPatterns.add<ConfigCreateIoInnerPattern>(typeConverter, ctx, state, /*benefit=*/10);
+    
+    // StartIoOp depends on ConfigCreateIoOp (benefit = 1)
+    //innerPatterns.add<StartIoInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
     innerPatterns.add<EraseOpLowering<dfschedule::ScheduleWaitOp>,
+        // NOTE: StartIoOp is now converted by StartIoInnerPattern
         EraseOpLowering<dfschedule::StartIoOp>,
         EraseOpLowering<routing::partitiontensor>,
         //EraseOpLowering<tensor::ExtractSliceOp>,
         EraseOpLowering<dfschedule::LaunchKernelGroupOp>,
         EraseOpLowering<dfschedule::GetBdIdOp>,
         EraseOpLowering<dfschedule::LoadKernelGroupOp>,
-        EraseOpLowering<dfschedule::ConfigCreateIoOp>,
+        // NOTE: ConfigCreateIoOp is now converted by ConfigCreateIoInnerPattern
+        //EraseOpLowering<dfschedule::ConfigCreateIoOp>,
         // NOTE: ConfigDmaBdOp is now converted by ConfigDmaBdInnerPattern
         // EraseOpLowering<dfschedule::ConfigDmaBdOp>,
         // NOTE: DeclareTileOp is now converted by DeclareTileInnerPattern
@@ -1528,8 +1726,100 @@ void DfscheduleToApiPass::runOnOperation() {
             }
         });
     }
+    
     //==========================================================================
-    // Phase 4.5: Walk and convert any remaining dfschedule.launchhost inside execute_regions
+    // Phase 4.5: Convert remaining arith.constant to emitc.constant
+    //==========================================================================
+    llvm::errs() << "[Pass] Phase 4.5: Converting remaining arith.constant to emitc.constant\n";
+    
+    {
+        RewritePatternSet remainingConstPatterns(ctx);
+        remainingConstPatterns.add<ArithConstantInnerPattern>(typeConverter, ctx, state);
+        
+        ConversionTarget remainingConstTarget(*ctx);
+        remainingConstTarget.addLegalDialect<emitc::EmitCDialect>();
+        remainingConstTarget.addLegalDialect<scf::SCFDialect>();
+        remainingConstTarget.addLegalDialect<func::FuncDialect>();
+        remainingConstTarget.addLegalDialect<arith::ArithDialect>();
+        
+        // Mark all arith.constant as illegal
+        remainingConstTarget.addDynamicallyLegalOp<arith::ConstantOp>([&](arith::ConstantOp op) {
+            return false;  // All constants need conversion
+        });
+        
+        if (failed(applyPartialConversion(moduleOp, remainingConstTarget, std::move(remainingConstPatterns)))) {
+            llvm::errs() << "[Pass] Warning: Some arith.constant ops could not be converted in phase 4.5\n";
+        }
+    }
+    
+    //==========================================================================
+    // Phase 4.6: Remove remaining unconverted ops and orphaned unrealized casts
+    //==========================================================================
+    llvm::errs() << "[Pass] Phase 4.6: Removing remaining unconverted ops\n";
+    
+    // Collect operations that will be removed
+    SmallVector<Operation*> opsToRemove;
+    
+    // Collect declare_data ops that weren't converted
+    moduleOp.walk([&](dfscheblueprint::DeclareDataOp op) {
+        llvm::errs() << "  Will remove unconverted declare_data\n";
+        opsToRemove.push_back(op);
+    });
+    
+    // Collect partitiontensor ops that weren't converted  
+    moduleOp.walk([&](routing::partitiontensor op) {
+        llvm::errs() << "  Will remove unconverted partitiontensor\n";
+        opsToRemove.push_back(op);
+    });
+    
+    // Now collect unrealized casts that only have uses in operations we're removing
+    SmallVector<UnrealizedConversionCastOp> castsToRemove;
+    moduleOp.walk([&](UnrealizedConversionCastOp castOp) {
+        if (castOp.getOutputs().size() == 1) {
+            Value output = castOp.getOutputs()[0];
+            bool allUsersWillBeRemoved = true;
+            
+            for (Operation *user : output.getUsers()) {
+                // Check if this user is in our removal list
+                if (std::find(opsToRemove.begin(), opsToRemove.end(), user) == opsToRemove.end()) {
+                    allUsersWillBeRemoved = false;
+                    break;
+                }
+            }
+            
+            if (output.use_empty() || allUsersWillBeRemoved) {
+                llvm::errs() << "  Will remove orphaned unrealized_conversion_cast\n";
+                castsToRemove.push_back(castOp);
+            }
+        }
+    });
+    
+    // Now actually remove everything
+    for (auto op : opsToRemove) {
+        if (auto declareData = dyn_cast<dfscheblueprint::DeclareDataOp>(op)) {
+            declareData.replaceAllUsesWith(declareData.getInitTensor());
+        } else if (auto partition = dyn_cast<routing::partitiontensor>(op)) {
+            partition.replaceAllUsesWith(partition.getOperand());
+        }
+        op->erase();
+    }
+    
+    for (auto castOp : castsToRemove) {
+        if (castOp.getInputs().size() == 1 && castOp.getOutputs().size() == 1) {
+            Value input = castOp.getInputs()[0];
+            Value output = castOp.getOutputs()[0];
+            
+            llvm::errs() << "    Removing cast from " << input.getType() 
+                         << " to " << output.getType() << "\n";
+            
+            // Replace all uses of the output with the input
+            output.replaceAllUsesWith(input);
+        }
+        castOp.erase();
+    }
+    
+    //==========================================================================
+    // Phase 4.7: Walk and convert any remaining dfschedule.launchhost inside execute_regions
     //==========================================================================
     /*
     llvm::errs() << "[Pass] Phase 4.5: Converting nested launchhost ops\n";
