@@ -923,6 +923,67 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
     }
 };
 
+/// OpConversionPattern for dfschedule.schedule.getbdid
+/// Converts GetBdId to allocate a BD ID from the resource manager
+/// Returns the allocated BD ID as an i32 constant
+struct GetBdIdInnerPattern : public OpConversionPattern<dfschedule::GetBdIdOp> {
+    ConversionState &state;
+    
+    GetBdIdInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state, PatternBenefit benefit = 1)
+        : OpConversionPattern<dfschedule::GetBdIdOp>(typeConverter, ctx, benefit), state(state) {}
+    
+    LogicalResult matchAndRewrite(dfschedule::GetBdIdOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        
+        llvm::errs() << "[Pattern] GetBdId called\n";
+        
+        // Get the tile operand
+        Value tile = adaptor.getTile();
+        
+        llvm::errs() << "  Tile type: " << tile.getType() << "\n";
+        
+        // Extract tile coordinates directly from the original DeclareTileOp
+        int32_t tileCol = -1, tileRow = -1;
+        Value originalTile = op.getTile();  // Get original tile value before conversion
+        
+        if (auto declareTileOp = originalTile.getDefiningOp<dfschedule::DeclareTileOp>()) {
+            tileCol = declareTileOp.getCol();
+            tileRow = declareTileOp.getRow();
+            llvm::errs() << "  ✓ Extracted tile coordinates from DeclareTileOp: (" 
+                         << tileCol << ", " << tileRow << ")\n";
+        } else {
+            llvm::errs() << "  ⚠ Could not find DeclareTileOp for tile\n";
+            return failure();
+        }
+        
+        if (tileCol < 0 || tileRow < 0) {
+            llvm::errs() << "  ⚠ Invalid tile coordinates\n";
+            return failure();
+        }
+        
+        // Allocate BD ID from resource manager
+        int32_t allocatedBdId = state.allocateBdId(tileCol, tileRow);
+        
+        llvm::errs() << "  ✓ Allocated BD ID: " << allocatedBdId 
+                     << " for tile (" << tileCol << ", " << tileRow << ")\n";
+        
+        // Create comment
+        std::string comment = "/* Allocated BD ID " + std::to_string(allocatedBdId) +
+                            " for tile (" + std::to_string(tileCol) + "," + std::to_string(tileRow) + ") */";
+        rewriter.create<emitc::VerbatimOp>(loc, comment);
+        
+        // Create constant for BD ID
+        auto i32Type = rewriter.getI32Type();
+        auto bdIdConst = rewriter.create<emitc::ConstantOp>(
+            loc, i32Type, rewriter.getI32IntegerAttr(allocatedBdId));
+        
+        // Replace the op with the BD ID constant
+        rewriter.replaceOp(op, bdIdConst.getResult());
+        return success();
+    }
+};
+
 /// OpConversionPattern for dfschedule.config.create_io
 /// Converts IO creation to __Runtime_dma_createio call that returns an io struct
 /// struct io = __Runtime_dma_createio(dma_desc, channel_id, bd_id);
@@ -1051,20 +1112,13 @@ struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
         
         llvm::errs() << "  IO Handle type: " << ioHandle.getType() << "\n";
         llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";
-        
-        // Verify ioHandle is "struct io"
-        if (!ioHandle.getType().isa<emitc::OpaqueType>() || 
-            ioHandle.getType().cast<emitc::OpaqueType>().getValue() != "struct io") {
-            llvm::errs() << "  ⚠ IO Handle is not 'struct io', deferring...\n";
-            return failure();
-        }
-        
-        // Create comment
-        rewriter.create<emitc::VerbatimOp>(loc, "/* Start IO operation */");
+      
         
         // Define the ioevent struct type
         auto ioEventType = emitc::OpaqueType::get(rewriter.getContext(), "struct ioevent");
         
+        //rewriter.eraseOp(op);
+        //return success();
         // Create __Runtime_startio call:
         // struct ioevent = __Runtime_startio(io, timer_or_data_value);
         // According to the example: __Runtime_startio(io, v4)
@@ -1535,21 +1589,25 @@ void DfscheduleToApiPass::runOnOperation() {
     // ConfigDmaBdOp must run before ConfigCreateIoOp (benefit = 50)
     innerPatterns.add<ConfigDmaBdInnerPattern>(typeConverter, ctx, state, /*benefit=*/50);
     
+    // GetBdIdOp allocates BD IDs and should run with medium priority (benefit = 30)
+    innerPatterns.add<GetBdIdInnerPattern>(typeConverter, ctx, state, /*benefit=*/30);
+    
     // ConfigCreateIoOp must run before StartIoOp (benefit = 10)
     innerPatterns.add<ConfigCreateIoInnerPattern>(typeConverter, ctx, state, /*benefit=*/10);
     
     // StartIoOp depends on ConfigCreateIoOp (benefit = 1)
-    //innerPatterns.add<StartIoInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
+    innerPatterns.add<StartIoInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
     
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
     innerPatterns.add<EraseOpLowering<dfschedule::ScheduleWaitOp>,
         // NOTE: StartIoOp is now converted by StartIoInnerPattern
-        EraseOpLowering<dfschedule::StartIoOp>,
+        //EraseOpLowering<dfschedule::StartIoOp>,
         EraseOpLowering<routing::partitiontensor>,
         //EraseOpLowering<tensor::ExtractSliceOp>,
         EraseOpLowering<dfschedule::LaunchKernelGroupOp>,
-        EraseOpLowering<dfschedule::GetBdIdOp>,
+        // NOTE: GetBdIdOp is now converted by GetBdIdInnerPattern
+        // EraseOpLowering<dfschedule::GetBdIdOp>,
         EraseOpLowering<dfschedule::LoadKernelGroupOp>,
         // NOTE: ConfigCreateIoOp is now converted by ConfigCreateIoInnerPattern
         //EraseOpLowering<dfschedule::ConfigCreateIoOp>,
