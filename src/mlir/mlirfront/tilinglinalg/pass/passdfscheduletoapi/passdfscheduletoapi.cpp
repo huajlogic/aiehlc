@@ -1142,6 +1142,171 @@ struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
     }
 };
 
+/// OpConversionPattern for dfschedule.schedule.wait
+/// Converts ScheduleWait to __Runtime_wait call that waits for multiple events
+/// __Runtime_wait(event1, event2, ...);
+struct ScheduleWaitInnerPattern : public OpConversionPattern<dfschedule::ScheduleWaitOp> {
+    ConversionState &state;
+    
+    ScheduleWaitInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state, PatternBenefit benefit = 1)
+        : OpConversionPattern<dfschedule::ScheduleWaitOp>(typeConverter, ctx, benefit), state(state) {}
+    
+    LogicalResult matchAndRewrite(dfschedule::ScheduleWaitOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        
+        llvm::errs() << "[Pattern] ScheduleWait called with " << op.getEvents().size() << " events\n";
+        
+        // Get all event operands
+        auto events = adaptor.getEvents();
+        
+        if (events.empty()) {
+            llvm::errs() << "  ⚠ No events to wait for, erasing op\n";
+            rewriter.eraseOp(op);
+            return success();
+        }
+        
+        // Log event types for debugging
+        for (size_t i = 0; i < events.size(); ++i) {
+            llvm::errs() << "  Event[" << i << "] type: " << events[i].getType() << "\n";
+        }
+        
+        // Create comment showing what we're waiting for
+        std::string comment = "/* Wait for " + std::to_string(events.size()) + " event(s) */";
+        rewriter.create<emitc::VerbatimOp>(loc, comment);
+        
+        // Create __Runtime_wait call for each event
+        // (We could also create a single call that takes an array, but for simplicity,
+        //  we'll create individual calls for now)
+        for (auto event : events) {
+            rewriter.create<emitc::CallOpaqueOp>(
+                loc,
+                TypeRange{},  // void return type
+                "__Runtime_wait",
+                nullptr,
+                nullptr,
+                ValueRange{event});
+        }
+        
+        llvm::errs() << "  ✓ Created __Runtime_wait calls for " << events.size() << " event(s)\n";
+        
+        // Erase the original wait op (it has no results)
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// OpConversionPattern for dfschedule.config.load_kernel_group
+/// Converts LoadKernelGroup to __Runtime_load_kernel_group call
+/// struct kernel_group = __Runtime_load_kernel_group(tiles, callee_symbols, compute_args, distributed_args);
+struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::LoadKernelGroupOp> {
+    ConversionState &state;
+    
+    LoadKernelGroupInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state, PatternBenefit benefit = 1)
+        : OpConversionPattern<dfschedule::LoadKernelGroupOp>(typeConverter, ctx, benefit), state(state) {}
+    
+    LogicalResult matchAndRewrite(dfschedule::LoadKernelGroupOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        
+        llvm::errs() << "[Pattern] LoadKernelGroup called\n";
+        
+        // Get tiles operands (variadic)
+        auto tiles = adaptor.getTiles();
+        llvm::errs() << "  Number of tiles: " << tiles.size() << "\n";
+        
+        // Get attributes
+        auto calleeAttr = op.getCalleeAttr();
+        auto computeKernelArgsAttr = op.getDistributedComputeKernelArgsAttr();
+        auto distributedArgsAttr = op.getDistributedArgsAttr();
+        
+        llvm::errs() << "  Callee array: " << calleeAttr << "\n";
+        llvm::errs() << "  Compute kernel args array: " << computeKernelArgsAttr << "\n";
+        llvm::errs() << "  Distributed args array: " << distributedArgsAttr << "\n";
+        
+        // Create comment showing configuration
+        std::string comment = "/* Load Kernel Group: " + std::to_string(tiles.size()) + " tile(s) */";
+        rewriter.create<emitc::VerbatimOp>(loc, comment);
+        
+        // Define the kernel_group struct type
+        auto kernelGroupType = emitc::OpaqueType::get(rewriter.getContext(), "struct kernel_group");
+        
+        // For now, create a simple call that encapsulates the configuration
+        // In a full implementation, this would parse the arrays and pass them appropriately
+        // struct kernel_group = __Runtime_load_kernel_group(...);
+        
+        // We'll pass tiles as an array and the number of tiles
+        auto i32Type = rewriter.getI32Type();
+        auto numTilesConst = rewriter.create<emitc::ConstantOp>(
+            loc, i32Type, rewriter.getI32IntegerAttr(tiles.size()));
+        
+        // Create the call with tiles and count
+        // A full implementation would also pass the symbol references and arguments
+        SmallVector<Value> callOperands;
+        callOperands.append(tiles.begin(), tiles.end());
+        callOperands.push_back(numTilesConst.getResult());
+        
+        auto loadCall = rewriter.create<emitc::CallOpaqueOp>(
+            loc,
+            kernelGroupType,
+            "__Runtime_load_kernel_group",
+            nullptr,
+            nullptr,
+            callOperands);
+        
+        llvm::errs() << "  ✓ Created __Runtime_load_kernel_group call\n";
+        
+        // Replace the op with the kernel_group
+        rewriter.replaceOp(op, loadCall.getResult(0));
+        return success();
+    }
+};
+
+/// OpConversionPattern for dfschedule.schedule.launch_kernel_group
+/// Converts LaunchKernelGroup to __Runtime_launch_kernel_group call
+/// struct event = __Runtime_launch_kernel_group(kernel_group);
+struct LaunchKernelGroupInnerPattern : public OpConversionPattern<dfschedule::LaunchKernelGroupOp> {
+    ConversionState &state;
+    
+    LaunchKernelGroupInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state, PatternBenefit benefit = 1)
+        : OpConversionPattern<dfschedule::LaunchKernelGroupOp>(typeConverter, ctx, benefit), state(state) {}
+    
+    LogicalResult matchAndRewrite(dfschedule::LaunchKernelGroupOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto loc = op.getLoc();
+        
+        llvm::errs() << "[Pattern] LaunchKernelGroup called\n";
+        
+        // Get the kernel group operand
+        Value kernelGroup = adaptor.getKernelGroup();
+        
+        llvm::errs() << "  Kernel Group type: " << kernelGroup.getType() << "\n";
+        //rewriter.eraseOp(op);
+        //return success();
+        // Create comment
+        rewriter.create<emitc::VerbatimOp>(loc, "/* Launch Kernel Group */");
+        
+        // Define the event struct type (same as returned by StartIoOp)
+        auto eventType = emitc::OpaqueType::get(rewriter.getContext(), "struct event");
+        
+        // Create __Runtime_launch_kernel_group call:
+        // struct event = __Runtime_launch_kernel_group(kernel_group);
+        auto launchCall = rewriter.create<emitc::CallOpaqueOp>(
+            loc,
+            eventType,
+            "__Runtime_launch_kernel_group",
+            nullptr,
+            nullptr,
+            ValueRange{kernelGroup});
+        
+        llvm::errs() << "  ✓ Created __Runtime_launch_kernel_group call\n";
+        
+        // Replace the op with the event
+        rewriter.replaceOp(op, launchCall.getResult(0));
+        return success();
+    }
+};
+
 //===----------------------------------------------------------------------===//
 // Outer Patterns (Convert host op structure)
 //===----------------------------------------------------------------------===//
@@ -1598,29 +1763,22 @@ void DfscheduleToApiPass::runOnOperation() {
     // StartIoOp depends on ConfigCreateIoOp (benefit = 1)
     innerPatterns.add<StartIoInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
     
+    // ScheduleWaitOp depends on StartIoOp (benefit = 1)
+    innerPatterns.add<ScheduleWaitInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
+    
+    // LoadKernelGroupOp loads and configures kernel groups (benefit = 2)
+    innerPatterns.add<LoadKernelGroupInnerPattern>(typeConverter, ctx, state, /*benefit=*/2);
+    
+    // LaunchKernelGroupOp depends on LoadKernelGroupOp (benefit = 1)
+    innerPatterns.add<LaunchKernelGroupInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
+    
     // Add EraseOpLowering patterns for ops that should simply be erased
     // NOTE: tensor.extract_slice, routing.partitiontensor, declare_data are NOT here - they are converted above
-    innerPatterns.add<EraseOpLowering<dfschedule::ScheduleWaitOp>,
-        // NOTE: StartIoOp is now converted by StartIoInnerPattern
-        //EraseOpLowering<dfschedule::StartIoOp>,
-        EraseOpLowering<routing::partitiontensor>,
-        //EraseOpLowering<tensor::ExtractSliceOp>,
-        EraseOpLowering<dfschedule::LaunchKernelGroupOp>,
-        // NOTE: GetBdIdOp is now converted by GetBdIdInnerPattern
-        // EraseOpLowering<dfschedule::GetBdIdOp>,
-        EraseOpLowering<dfschedule::LoadKernelGroupOp>,
-        // NOTE: ConfigCreateIoOp is now converted by ConfigCreateIoInnerPattern
-        //EraseOpLowering<dfschedule::ConfigCreateIoOp>,
-        // NOTE: ConfigDmaBdOp is now converted by ConfigDmaBdInnerPattern
-        // EraseOpLowering<dfschedule::ConfigDmaBdOp>,
-        // NOTE: DeclareTileOp is now converted by DeclareTileInnerPattern
-        // EraseOpLowering<dfschedule::DeclareTileOp>,
-        // NOTE: LaunchHostOp is handled in Phase 4, not here
-        // EraseOpLowering<dfschedule::LaunchHostOp>,
-        // NOTE: DeclareTensorOp is now converted by DeclareTensorInnerPattern
-        // EraseOpLowering<dfschedule::DeclareTensorOp>,
-        EraseOpLowering<dfschedule::ScheduleWaitOp>
-        // EraseOpLowering<dfscheblueprint::DeclareDataOp>
+    // NOTE: ScheduleWaitOp, StartIoOp, GetBdIdOp, ConfigCreateIoOp, ConfigDmaBdOp, DeclareTileOp, DeclareTensorOp,
+    //       LoadKernelGroupOp, LaunchKernelGroupOp are now converted by their respective Inner patterns
+    // NOTE: LaunchHostOp is handled in Phase 4, not here
+    innerPatterns.add<
+        EraseOpLowering<routing::partitiontensor>
     >(typeConverter, ctx);
 
     FrozenRewritePatternSet frozenInnerPatterns(std::move(innerPatterns));
