@@ -388,6 +388,38 @@ def dfschedule_ConfigGetNumBuffersOp : dfscheduleop<"config.get_num_buffers"> {
   let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($num)";
 }
 
+// Get ping acquire lock ID from config
+def dfschedule_ConfigGetPingAcquireLockIdOp : dfscheduleop<"config.get_ping_acquire_lock_id"> {
+  let summary = "Get ping acquire lock ID from tile config";
+  let arguments = (ins dfschedule_TileConfigType:$config);
+  let results = (outs I32:$lock_id);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
+}
+
+// Get pong acquire lock ID from config
+def dfschedule_ConfigGetPongAcquireLockIdOp : dfscheduleop<"config.get_pong_acquire_lock_id"> {
+  let summary = "Get pong acquire lock ID from tile config";
+  let arguments = (ins dfschedule_TileConfigType:$config);
+  let results = (outs I32:$lock_id);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
+}
+
+// Get ping release lock ID from config
+def dfschedule_ConfigGetPingReleaseLockIdOp : dfscheduleop<"config.get_ping_release_lock_id"> {
+  let summary = "Get ping release lock ID from tile config";
+  let arguments = (ins dfschedule_TileConfigType:$config);
+  let results = (outs I32:$lock_id);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
+}
+
+// Get pong release lock ID from config
+def dfschedule_ConfigGetPongReleaseLockIdOp : dfscheduleop<"config.get_pong_release_lock_id"> {
+  let summary = "Get pong release lock ID from tile config";
+  let arguments = (ins dfschedule_TileConfigType:$config);
+  let results = (outs I32:$lock_id);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
+}
+
 
 // Kernel memory allocation
 def dfschedule_KernelMemAllocOp : dfscheduleop<"kernel.memalloc"> {
@@ -410,13 +442,14 @@ def dfschedule_CoreComputeOp : dfscheduleop<"core.compute"> {
 
 // DSKernel Lock Init
 def dfschedule_DSKernelLockInitOp : dfscheduleop<"dskernel.lock_init"> {
-  let summary = "Initialize a lock with initial value and name";
+  let summary = "Initialize a lock with lock ID, initial value and name";
   let arguments = (ins
+    I32:$lock_id,
     I64Attr:$initial_value,
     StrAttr:$name
   );
   let results = (outs dfschedule_LockType:$lock);
-  let assemblyFormat = "`(` $initial_value `,` $name `)` attr-dict `->` type($lock)";
+  let assemblyFormat = "`(` $lock_id `,` $initial_value `,` $name `)` attr-dict `:` type($lock_id) `->` type($lock)";
 }
 
 // DSKernel Launch DMA S2M Loop

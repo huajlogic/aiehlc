@@ -911,24 +911,28 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     ///*
     auto lockType = dfschedule::LockType::get(ctx);
     
-    // %l_ping_acq = dfschedule.dskernel.lock_init(0, "ping_acquire_lock") -> !dfschedule.lock
+    // %l_ping_acq = dfschedule.dskernel.lock_init(lock_id=0, init_value=0, "ping_acquire_lock") -> !dfschedule.lock
+    auto lockId0 = builder.create<arith::ConstantOp>(location, builder.getI32Type(), builder.getI32IntegerAttr(0));
     auto l_ping_acq = builder.create<dfschedule::DSKernelLockInitOp>(
-        location, lockType, 0, builder.getStringAttr("ping_acquire_lock")
+        location, lockType, lockId0.getResult(), builder.getI64IntegerAttr(0), builder.getStringAttr("ping_acquire_lock")
     );
     
-    // %l_pong_acq = dfschedule.dskernel.lock_init(0, "pong_acquire_lock") -> !dfschedule.lock
+    // %l_pong_acq = dfschedule.dskernel.lock_init(lock_id=1, init_value=0, "pong_acquire_lock") -> !dfschedule.lock
+    auto lockId1 = builder.create<arith::ConstantOp>(location, builder.getI32Type(), builder.getI32IntegerAttr(1));
     auto l_pong_acq = builder.create<dfschedule::DSKernelLockInitOp>(
-        location, lockType, 0, builder.getStringAttr("pong_acquire_lock")
+        location, lockType, lockId1.getResult(), builder.getI64IntegerAttr(0), builder.getStringAttr("pong_acquire_lock")
     );
     
-    // %l_ping_rel = dfschedule.dskernel.lock_init(1, "ping_release_lock") -> !dfschedule.lock
+    // %l_ping_rel = dfschedule.dskernel.lock_init(lock_id=2, init_value=1, "ping_release_lock") -> !dfschedule.lock
+    auto lockId2 = builder.create<arith::ConstantOp>(location, builder.getI32Type(), builder.getI32IntegerAttr(2));
     auto l_ping_rel = builder.create<dfschedule::DSKernelLockInitOp>(
-        location, lockType, 1, builder.getStringAttr("ping_release_lock")
+        location, lockType, lockId2.getResult(), builder.getI64IntegerAttr(1), builder.getStringAttr("ping_release_lock")
     );
     
-    // %l_pong_rel = dfschedule.dskernel.lock_init(0, "pong_release_lock") -> !dfschedule.lock
+    // %l_pong_rel = dfschedule.dskernel.lock_init(lock_id=3, init_value=0, "pong_release_lock") -> !dfschedule.lock
+    auto lockId3 = builder.create<arith::ConstantOp>(location, builder.getI32Type(), builder.getI32IntegerAttr(3));
     auto l_pong_rel = builder.create<dfschedule::DSKernelLockInitOp>(
-        location, lockType, 0, builder.getStringAttr("pong_release_lock")
+        location, lockType, lockId3.getResult(), builder.getI64IntegerAttr(0), builder.getStringAttr("pong_release_lock")
     );
     
     // Launch DMA loop

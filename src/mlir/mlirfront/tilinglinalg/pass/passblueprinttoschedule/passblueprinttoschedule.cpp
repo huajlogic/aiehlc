@@ -217,6 +217,23 @@ static void generateDSKernelReceiver(
     auto getPongBufferOp = rewriter.create<dfschedule::ConfigGetBufferAddrOp>(
         loc, localMemRefType, readConfigOp.getConfig(), rewriter.getI32IntegerAttr(1));
     
+    // Read lock IDs from config
+    // %ping_acquire_lock_id = dfschedule.config.get_ping_acquire_lock_id(%config) : (!dfschedule.tile_config) -> i32
+    auto getPingAcquireLockIdOp = rewriter.create<dfschedule::ConfigGetPingAcquireLockIdOp>(
+        loc, rewriter.getI32Type(), readConfigOp.getConfig());
+    
+    // %pong_acquire_lock_id = dfschedule.config.get_pong_acquire_lock_id(%config) : (!dfschedule.tile_config) -> i32
+    auto getPongAcquireLockIdOp = rewriter.create<dfschedule::ConfigGetPongAcquireLockIdOp>(
+        loc, rewriter.getI32Type(), readConfigOp.getConfig());
+    
+    // %ping_release_lock_id = dfschedule.config.get_ping_release_lock_id(%config) : (!dfschedule.tile_config) -> i32
+    auto getPingReleaseLockIdOp = rewriter.create<dfschedule::ConfigGetPingReleaseLockIdOp>(
+        loc, rewriter.getI32Type(), readConfigOp.getConfig());
+    
+    // %pong_release_lock_id = dfschedule.config.get_pong_release_lock_id(%config) : (!dfschedule.tile_config) -> i32
+    auto getPongReleaseLockIdOp = rewriter.create<dfschedule::ConfigGetPongReleaseLockIdOp>(
+        loc, rewriter.getI32Type(), readConfigOp.getConfig());
+    
     // Now use these values in the kernel body...
     // Create bd_id constants for ping (0) and pong (1)
     int32_t pingBdId = resourceMgr.allocateBdId();  // 0
@@ -262,34 +279,38 @@ static void generateDSKernelReceiver(
         rewriter.getI32IntegerAttr(basePacketId),     // packet_id (TODO: should be from config at runtime)
         rewriter.getI32IntegerAttr(pingBdId));        // next_bd -> points back to ping
     
-    // Initialize locks for ping-pong synchronization
+    // Initialize locks for ping-pong synchronization using lock IDs from config
     // Lock values: acquire locks start at 0, release locks: ping=1, pong=0
     
-    // %7 = dfschedule.dskernel.lock_init(0, "ping_acquire_lock")
+    // %7 = dfschedule.dskernel.lock_init(%ping_acquire_lock_id, 0, "ping_acquire_lock")
     auto pingAcqLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
         loc,
         dfschedule::LockType::get(rewriter.getContext()),
+        getPingAcquireLockIdOp.getLockId(),
         rewriter.getI64IntegerAttr(0),
         rewriter.getStringAttr("ping_acquire_lock"));
     
-    // %8 = dfschedule.dskernel.lock_init(0, "pong_acquire_lock")
+    // %8 = dfschedule.dskernel.lock_init(%pong_acquire_lock_id, 0, "pong_acquire_lock")
     auto pongAcqLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
         loc,
         dfschedule::LockType::get(rewriter.getContext()),
+        getPongAcquireLockIdOp.getLockId(),
         rewriter.getI64IntegerAttr(0),
         rewriter.getStringAttr("pong_acquire_lock"));
     
-    // %9 = dfschedule.dskernel.lock_init(1, "ping_release_lock")
+    // %9 = dfschedule.dskernel.lock_init(%ping_release_lock_id, 1, "ping_release_lock")
     auto pingRelLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
         loc,
         dfschedule::LockType::get(rewriter.getContext()),
+        getPingReleaseLockIdOp.getLockId(),
         rewriter.getI64IntegerAttr(1),
         rewriter.getStringAttr("ping_release_lock"));
     
-    // %10 = dfschedule.dskernel.lock_init(0, "pong_release_lock")
+    // %10 = dfschedule.dskernel.lock_init(%pong_release_lock_id, 0, "pong_release_lock")
     auto pongRelLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
         loc,
         dfschedule::LockType::get(rewriter.getContext()),
+        getPongReleaseLockIdOp.getLockId(),
         rewriter.getI64IntegerAttr(0),
         rewriter.getStringAttr("pong_release_lock"));
     
