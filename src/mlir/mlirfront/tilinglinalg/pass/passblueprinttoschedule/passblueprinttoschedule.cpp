@@ -634,6 +634,16 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(perTileSize)); // Per-tile buffer size in bytes
             configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(bufferOffset)); // Offset within shared buffer
             configAttrs.append("element_size", rewriter.getI32IntegerAttr(elementSizeBytes)); // Element size in bytes
+            
+            // Lock IDs for ping-pong synchronization
+            // Each tile gets unique lock IDs based on its index
+            // For simplicity: ping_acquire_lock = tileIndex*4, pong_acquire_lock = tileIndex*4+1
+            //                 ping_release_lock = tileIndex*4+2, pong_release_lock = tileIndex*4+3
+            configAttrs.append("ping_acquire_lock_id", rewriter.getI32IntegerAttr(tileIndex * 4 + 0));
+            configAttrs.append("pong_acquire_lock_id", rewriter.getI32IntegerAttr(tileIndex * 4 + 1));
+            configAttrs.append("ping_release_lock_id", rewriter.getI32IntegerAttr(tileIndex * 4 + 2));
+            configAttrs.append("pong_release_lock_id", rewriter.getI32IntegerAttr(tileIndex * 4 + 3));
+            
             // Note: Actual buffer base address will be determined at runtime by __Runtime_load_kernel_group
             // The runtime will use: tile_buffer_addr = base_addr + buffer_offset
             

@@ -1274,6 +1274,10 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
                 uint32_t bufferSize = mlir::cast<IntegerAttr>(configDict.get("buffer_size")).getInt();
                 uint64_t bufferOffset = mlir::cast<IntegerAttr>(configDict.get("buffer_offset")).getInt();
                 uint8_t elementSize = mlir::cast<IntegerAttr>(configDict.get("element_size")).getInt();
+                uint32_t pingAcquireLockId = mlir::cast<IntegerAttr>(configDict.get("ping_acquire_lock_id")).getInt();
+                uint32_t pongAcquireLockId = mlir::cast<IntegerAttr>(configDict.get("pong_acquire_lock_id")).getInt();
+                uint32_t pingReleaseLockId = mlir::cast<IntegerAttr>(configDict.get("ping_release_lock_id")).getInt();
+                uint32_t pongReleaseLockId = mlir::cast<IntegerAttr>(configDict.get("pong_release_lock_id")).getInt();
 
                 llvm::errs() << "    Config: "
                              << "tile_index=" << tileIndex
@@ -1283,7 +1287,11 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
                              << ", num_buffers=" << (int)numBuffers
                              << ", buffer_size=" << bufferSize
                              << ", buffer_offset=" << bufferOffset
-                             << ", element_size=" << (int)elementSize << "\n";
+                             << ", element_size=" << (int)elementSize
+                             << ", ping_acq_lock=" << pingAcquireLockId
+                             << ", pong_acq_lock=" << pongAcquireLockId
+                             << ", ping_rel_lock=" << pingReleaseLockId
+                             << ", pong_rel_lock=" << pongReleaseLockId << "\n";
             }
             
             // NOTE: In the future, this would generate arrays of config values

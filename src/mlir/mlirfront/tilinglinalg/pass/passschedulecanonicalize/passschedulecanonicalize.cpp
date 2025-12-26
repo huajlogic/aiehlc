@@ -1036,7 +1036,7 @@ static void createCanonicalizedSchedule(
         
         // Create config dictionary for this tile
         if (!tileInfo.configDicts.empty()) {
-            // Use existing config
+            // Use existing config (should already have all fields including lock IDs)
             allTileConfigs.push_back(tileInfo.configDicts[0]);
         } else {
             // Create default config (for backward compatibility)
@@ -1047,6 +1047,11 @@ static void createCanonicalizedSchedule(
             configAttrs.append("buffer_mode", builder.getI32IntegerAttr(1)); // 1 = ping-pong
             configAttrs.append("num_buffers", builder.getI32IntegerAttr(2)); // 2 buffers
             configAttrs.append("buffer_size", builder.getI32IntegerAttr(256)); // default 256 bytes
+            // Add default lock IDs
+            configAttrs.append("ping_acquire_lock_id", builder.getI32IntegerAttr(tileIdx * 4 + 0));
+            configAttrs.append("pong_acquire_lock_id", builder.getI32IntegerAttr(tileIdx * 4 + 1));
+            configAttrs.append("ping_release_lock_id", builder.getI32IntegerAttr(tileIdx * 4 + 2));
+            configAttrs.append("pong_release_lock_id", builder.getI32IntegerAttr(tileIdx * 4 + 3));
             allTileConfigs.push_back(builder.getDictionaryAttr(configAttrs));
         }
         
