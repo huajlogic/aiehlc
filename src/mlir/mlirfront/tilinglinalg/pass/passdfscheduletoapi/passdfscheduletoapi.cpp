@@ -1196,9 +1196,23 @@ struct ScheduleWaitInnerPattern : public OpConversionPattern<dfschedule::Schedul
     }
 };
 
+/// OpConversionPattern for dfschedule.declare_kernel_config
+/// This is metadata-only, so just erase it
+struct DeclareKernelConfigInnerPattern : public OpConversionPattern<dfschedule::DeclareKernelConfigOp> {
+    using OpConversionPattern<dfschedule::DeclareKernelConfigOp>::OpConversionPattern;
+    
+    LogicalResult matchAndRewrite(dfschedule::DeclareKernelConfigOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        llvm::errs() << "[Pattern] DeclareKernelConfig - erasing (metadata only)\n";
+        // This operation is pure metadata, it doesn't generate any runtime code
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
 /// OpConversionPattern for dfschedule.config.load_kernel_group
 /// Converts LoadKernelGroup to __Runtime_load_kernel_group call
-/// struct kernel_group = __Runtime_load_kernel_group(tiles, callee_symbols, compute_args, distributed_args);
+/// struct kernel_group = __Runtime_load_kernel_group(tiles, callee_symbols, compute_args, kernel_config);
 struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::LoadKernelGroupOp> {
     ConversionState &state;
     
@@ -1222,7 +1236,64 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         
         llvm::errs() << "  Callee array: " << calleeAttr << "\n";
         llvm::errs() << "  Compute kernel args array: " << computeKernelArgsAttr << "\n";
-        llvm::errs() << "  Distributed args array: " << distributedArgsAttr << "\n";
+        
+        if (distributedArgsAttr) {
+            llvm::errs() << "  Using distributed_args (kernel config symbols): " << distributedArgsAttr << "\n";
+            
+            auto moduleOp = op->getParentOfType<ModuleOp>();
+            
+            // Iterate through distributed_args to extract config for each tile
+            for (size_t i = 0; i < distributedArgsAttr.size(); ++i) {
+                auto symRef = mlir::cast<SymbolRefAttr>(distributedArgsAttr[i]);
+                llvm::errs() << "  Tile[" << i << "] config symbol: " << symRef << "\n";
+                
+                // Look up the kernel_config op
+                auto configOp = moduleOp.lookupSymbol<dfschedule::DeclareKernelConfigOp>(
+                    symRef.getRootReference());
+                
+                if (!configOp) {
+                    llvm::errs() << "    ERROR: Could not find kernel_config symbol\n";
+                    continue;
+                }
+                
+                // Extract tile_configs array (should have exactly one entry per config op)
+                auto tileConfigsAttr = configOp.getTileConfigs();
+                if (tileConfigsAttr.size() == 0) {
+                    llvm::errs() << "    ERROR: Empty tile_configs in kernel_config\n";
+                    continue;
+                }
+                
+                auto configDict = mlir::cast<DictionaryAttr>(tileConfigsAttr[0]);
+                
+                // Extract and log all config fields
+                uint32_t tileIndex = mlir::cast<IntegerAttr>(configDict.get("tile_index")).getInt();
+                uint8_t packetId = mlir::cast<IntegerAttr>(configDict.get("packet_id")).getInt();
+                uint32_t dmaChannel = mlir::cast<IntegerAttr>(configDict.get("dma_channel")).getInt();
+                uint8_t bufferMode = mlir::cast<IntegerAttr>(configDict.get("buffer_mode")).getInt();
+                uint8_t numBuffers = mlir::cast<IntegerAttr>(configDict.get("num_buffers")).getInt();
+                uint32_t bufferSize = mlir::cast<IntegerAttr>(configDict.get("buffer_size")).getInt();
+                uint64_t bufferOffset = mlir::cast<IntegerAttr>(configDict.get("buffer_offset")).getInt();
+                uint8_t elementSize = mlir::cast<IntegerAttr>(configDict.get("element_size")).getInt();
+
+                llvm::errs() << "    Config: "
+                             << "tile_index=" << tileIndex
+                             << ", packet_id=" << (int)packetId
+                             << ", dma_channel=" << dmaChannel
+                             << ", buffer_mode=" << (int)bufferMode
+                             << ", num_buffers=" << (int)numBuffers
+                             << ", buffer_size=" << bufferSize
+                             << ", buffer_offset=" << bufferOffset
+                             << ", element_size=" << (int)elementSize << "\n";
+            }
+            
+            // NOTE: In the future, this would generate arrays of config values
+            // and pass them to __Runtime_load_kernel_group(tiles, num_tiles, configs[])
+            // For now, the simple call below is a placeholder
+            
+        } else {
+            llvm::errs() << "  ERROR: No distributed_args provided\n";
+            return failure();
+        }
         
         // Create comment showing configuration
         std::string comment = "/* Load Kernel Group: " + std::to_string(tiles.size()) + " tile(s) */";
@@ -1399,17 +1470,38 @@ struct DsKernelReceiverPattern : public ConversionPattern {
             kernelName = symNameAttr.getValue().str();
         }
         
-        auto funcType = rewriter.getFunctionType({}, {});
+        // NEW signature: void dskernel(index iterations)
+        auto indexType = rewriter.getIndexType();
+        auto funcType = rewriter.getFunctionType({indexType}, {});
         auto emitcFunc = rewriter.create<emitc::FuncOp>(loc, kernelName, funcType);
         emitcFunc->setAttr("specifiers", rewriter.getStrArrayAttr({"__global__"}));
         
         Block *entryBlock = emitcFunc.addEntryBlock();
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(entryBlock);
-        rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr("/* AIE kernel implementation */"));
+        
+        // Get the iterations parameter
+        Value iterationsParam = entryBlock->getArgument(0);
+        
+        // Generate kernel body that reads config from tile-local memory
+        // The kernel will read from TILE_CONFIG_ADDR at runtime
+        rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr(
+            "// Read tile-specific config from local memory at TILE_CONFIG_ADDR\n"
+            "  TileConfig *config = (TileConfig *)TILE_CONFIG_ADDR;\n"
+            "  uint8_t packet_id = config->packet_id;\n"
+            "  uint32_t dma_channel = config->dma_channel;\n"
+            "  uint8_t buffer_mode = config->buffer_mode;\n"
+            "  uint8_t num_buffers = config->num_buffers;\n"
+            "  uint32_t buffer_size = config->buffer_size;\n"
+            "  void *buffer_addr = (void *)config->buffer_addr;\n"
+            "  uint8_t element_size = config->element_size;\n"
+            "  // TODO: Implement kernel logic using above config"
+        ));
+        
         rewriter.create<emitc::ReturnOp>(loc, Value{});
         
-        llvm::errs() << "[Pattern] Created __global__ func: " << kernelName << "\n";
+        llvm::errs() << "[Pattern] Created __global__ func: " << kernelName 
+                     << " with signature (index iterations)\n";
         
         rewriter.eraseOp(op);
         return success();
@@ -1768,6 +1860,9 @@ void DfscheduleToApiPass::runOnOperation() {
     
     // LoadKernelGroupOp loads and configures kernel groups (benefit = 2)
     innerPatterns.add<LoadKernelGroupInnerPattern>(typeConverter, ctx, state, /*benefit=*/2);
+    
+    // DeclareKernelConfigOp is just metadata (benefit = 5, run early)
+    innerPatterns.add<DeclareKernelConfigInnerPattern>(typeConverter, ctx, /*benefit=*/5);
     
     // LaunchKernelGroupOp depends on LoadKernelGroupOp (benefit = 1)
     innerPatterns.add<LaunchKernelGroupInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);

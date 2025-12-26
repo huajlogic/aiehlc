@@ -35,7 +35,8 @@ struct TileScheduleInfo {
     TileKey key;
     SmallVector<Value> tileValues;           // All tile values for this (col, row)
     SmallVector<Operation*> packetOps;       // Packet ops targeting this tile
-    SmallVector<SymbolRefAttr> packetSymbols; // Packet symbols for this tile
+    SmallVector<SymbolRefAttr> packetSymbols; // Packet symbols for this tile (OLD)
+    SmallVector<DictionaryAttr> configDicts;  // Config dictionaries for this tile (NEW)
     SmallVector<SymbolRefAttr> computeKernelArgs; // Compute args for this tile
     bool isShimTile = false;
     bool isCoreTile = false;
@@ -180,7 +181,7 @@ static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
                 }
             } else {
                 if (info.coreTiles.find(key) == info.coreTiles.end()) {
-                    info.coreTiles[key] = TileScheduleInfo{key, {}, {}, {}, {}, false, true};
+                    info.coreTiles[key] = TileScheduleInfo{key, {}, {}, {}, {}, {}, false, true};
                 }
                 info.coreTiles[key].tileValues.push_back(declareTile.getTile());
             }
@@ -408,39 +409,62 @@ static void printParentInfo(const ModuleScheduleInfo &info) {
 
 // Associate packets with their target tiles
 static void associatePacketsWithTiles(ModuleScheduleInfo &info) {
-    // For each LoadKernelGroupOp, extract tile-to-packet mapping
+    // For each LoadKernelGroupOp, extract tile-to-packet/config mapping
     for (auto &opWithParent : info.loadKernelGroupOps) {
         auto loadKernel = cast<dfschedule::LoadKernelGroupOp>(opWithParent.op);
         
         auto tiles = loadKernel.getTiles();
-        auto distArgs = loadKernel.getDistributedArgs();
         auto computeArgs = loadKernel.getDistributedComputeKernelArgs();
         
-        for (size_t i = 0; i < tiles.size(); ++i) {
-            // Find the DeclareTileOp that produced this tile value
-            Value tileVal = tiles[i];
-            if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
-                TileKey key = getTileKey(declareTile);
-                
-                if (!isShimTile(key)) {
-                    auto &tileInfo = info.coreTiles[key];
+        // Check for distributed_args (which now contains kernel config symbols)
+        auto distArgs = loadKernel.getDistributedArgs();
+        
+        if (distArgs) {
+            // Handle distributed_args pointing to individual kernel config symbols
+            auto distArgsArray = *distArgs;  // Dereference the optional
+            auto moduleOp = opWithParent.parent->getParentOfType<ModuleOp>();
+            
+            for (size_t i = 0; i < tiles.size(); ++i) {
+                Value tileVal = tiles[i];
+                if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
+                    TileKey key = getTileKey(declareTile);
                     
-                    // Add packet symbol
-                    if (i < distArgs.size()) {
-                        if (auto symRef = dyn_cast<SymbolRefAttr>(distArgs[i])) {
-                            tileInfo.packetSymbols.push_back(symRef);
+                    if (!isShimTile(key)) {
+                        auto &tileInfo = info.coreTiles[key];
+                        
+                        // Look up the kernel config symbol for this tile
+                        if (i < distArgsArray.size()) {
+                            if (auto symRef = dyn_cast<SymbolRefAttr>(distArgsArray[i])) {
+                                // Lookup the DeclareKernelConfigOp
+                                auto configOp = moduleOp.lookupSymbol<dfschedule::DeclareKernelConfigOp>(
+                                    symRef.getRootReference());
+                                
+                                if (configOp) {
+                                    auto tileConfigsAttr = configOp.getTileConfigs();
+                                    // Each config op should have exactly one tile config
+                                    if (tileConfigsAttr.size() > 0) {
+                                        auto configDict = dyn_cast<DictionaryAttr>(tileConfigsAttr[0]);
+                                        if (configDict) {
+                                            tileInfo.configDicts.push_back(configDict);
+                                        }
+                                    }
+                                }
+                                
+                                // Also store the symbol reference for backward compatibility
+                                tileInfo.packetSymbols.push_back(symRef);
+                            }
                         }
-                    }
-                    
-                    // Add compute kernel arg
-                    if (i < computeArgs.size()) {
-                        if (auto symRef = dyn_cast<SymbolRefAttr>(computeArgs[i])) {
-                            tileInfo.computeKernelArgs.push_back(symRef);
+                        
+                        // Add compute kernel arg
+                        if (i < computeArgs.size()) {
+                            if (auto symRef = dyn_cast<SymbolRefAttr>(computeArgs[i])) {
+                                tileInfo.computeKernelArgs.push_back(symRef);
+                            }
                         }
+                        
+                        // Track packet count per tile
+                        info.tilePacketCount[key]++;
                     }
-                    
-                    // Track packet count per tile
-                    info.tilePacketCount[key]++;
                 }
             }
         }
@@ -999,23 +1023,31 @@ static void createCanonicalizedSchedule(
         shimIoHandles[params.shimKey].push_back(createIoOp.getIoHandle());
     }
     
-    // 6. Build list of core tiles and their packet symbols for merged kernel group
+    // 6. Build list of core tiles and their configs for merged kernel group
     SmallVector<Value> allCoreTiles;
-    SmallVector<Attribute> allPacketSymbols;
+    SmallVector<Attribute> allTileConfigs;
     SmallVector<Attribute> allComputeKernelArgs;
     
-    int packetIdx = 0;
+    int tileIdx = 0;
     for (auto &[key, tileInfo] : info.coreTiles) {
         if (coreTileMap.find(key) == coreTileMap.end()) continue;
         Value coreTile = coreTileMap[key];
         allCoreTiles.push_back(coreTile);
         
-        // Use the first packet symbol for this tile (or create one)
-        if (!tileInfo.packetSymbols.empty()) {
-            allPacketSymbols.push_back(tileInfo.packetSymbols[0]);
+        // Create config dictionary for this tile
+        if (!tileInfo.configDicts.empty()) {
+            // Use existing config
+            allTileConfigs.push_back(tileInfo.configDicts[0]);
         } else {
-            std::string pktName = "packet" + std::to_string(packetIdx);
-            allPacketSymbols.push_back(SymbolRefAttr::get(builder.getContext(), pktName));
+            // Create default config (for backward compatibility)
+            NamedAttrList configAttrs;
+            configAttrs.append("tile_index", builder.getI32IntegerAttr(tileIdx));
+            configAttrs.append("packet_id", builder.getI32IntegerAttr(tileIdx));
+            configAttrs.append("dma_channel", builder.getI32IntegerAttr(0)); // default channel
+            configAttrs.append("buffer_mode", builder.getI32IntegerAttr(1)); // 1 = ping-pong
+            configAttrs.append("num_buffers", builder.getI32IntegerAttr(2)); // 2 buffers
+            configAttrs.append("buffer_size", builder.getI32IntegerAttr(256)); // default 256 bytes
+            allTileConfigs.push_back(builder.getDictionaryAttr(configAttrs));
         }
         
         // Use the first compute kernel arg for this tile (or default)
@@ -1025,7 +1057,7 @@ static void createCanonicalizedSchedule(
             allComputeKernelArgs.push_back(SymbolRefAttr::get(builder.getContext(), "compute0"));
         }
         
-        packetIdx++;
+        tileIdx++;
     }
     
     // 7. Create SINGLE merged load_kernel_group (if core tiles exist)
@@ -1034,13 +1066,33 @@ static void createCanonicalizedSchedule(
         SmallVector<Attribute> calleeAttrs;
         calleeAttrs.push_back(SymbolRefAttr::get(builder.getContext(), info.kernelName));
         
+        // Create individual kernel_config ops for each tile (e.g., @kernelconfig_merged0, @kernelconfig_merged1)
+        SmallVector<Attribute> kernelConfigSymbols;
+        for (size_t i = 0; i < allTileConfigs.size(); ++i) {
+            std::string configName = "kernelconfig_merged" + std::to_string(i);
+            
+            // Create a kernel_config op with a single tile's config
+            SmallVector<Attribute> singleTileConfig;
+            singleTileConfig.push_back(allTileConfigs[i]);
+            
+            auto kernelConfigOp = builder.create<dfschedule::DeclareKernelConfigOp>(
+                loc,
+                dfschedule::KernelConfigType::get(builder.getContext()),
+                builder.getStringAttr(configName),
+                builder.getArrayAttr(singleTileConfig));
+            
+            // Store symbol reference
+            kernelConfigSymbols.push_back(SymbolRefAttr::get(builder.getContext(), configName));
+        }
+        
         auto loadKernelGroupOp = builder.create<dfschedule::LoadKernelGroupOp>(
             loc,
             dfschedule::KernelGroupType::get(builder.getContext()),
             allCoreTiles,
             builder.getArrayAttr(calleeAttrs),
             builder.getArrayAttr(allComputeKernelArgs),
-            builder.getArrayAttr(allPacketSymbols));
+            nullptr,  // kernel_config = nullptr (not used)
+            builder.getArrayAttr(kernelConfigSymbols));  // distributed_args = [@kernelconfig_merged0, @kernelconfig_merged1, ...]
         
         // 8. Create SINGLE launch_kernel_group
         auto launchKernelGroupOp = builder.create<dfschedule::LaunchKernelGroupOp>(

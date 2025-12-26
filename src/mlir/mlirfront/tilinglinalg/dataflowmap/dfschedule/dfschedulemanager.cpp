@@ -728,7 +728,8 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
         tiles,
         builder.getArrayAttr(calleeRefs),
         builder.getArrayAttr(computeKernelRefs),
-        builder.getArrayAttr(packetRefs)
+        nullptr,  // kernel_config (optional, using old style for now)
+        builder.getArrayAttr(packetRefs)  // distributed_args
     );
     
     // %evt_kernel_group = dfschedule.schedule.launch_kernel_group(%kernel_group) {...}
