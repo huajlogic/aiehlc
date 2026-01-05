@@ -747,7 +747,8 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
     auto evntIo = builder.create<dfschedule::StartIoOp>(
         location, eventType,
         io0.getResult(),
-        bdId.getResult()
+        bdId.getResult(),
+        builder.getI32IntegerAttr(0)
     );
     
     // dfschedule.schedule.wait(%evt_io, %evt_kernel_group) : (...)

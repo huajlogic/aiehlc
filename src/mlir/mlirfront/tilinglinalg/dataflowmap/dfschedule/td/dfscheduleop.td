@@ -233,7 +233,8 @@ def dfschedule_StartIoOp : dfscheduleop<"schedule.start_io"> {
   let summary = "Start an IO operation with a given BD ID";
   let arguments = (ins
     dfschedule_IoHandleType:$io_handle,
-    I32:$bd_id
+    I32:$bd_id,
+    I32Attr:$flow_index
   );
   let results = (outs dfschedule_EventType:$event);
   let assemblyFormat = "`(` $io_handle `,` $bd_id `)` attr-dict `:` `(` type($io_handle) `,` type($bd_id) `)` `->` type($event)";
@@ -347,25 +348,32 @@ def dfschedule_KernelReadConfigOp : dfscheduleop<"kernel.read_tile_config"> {
 
 // Extract packet ID from config
 def dfschedule_ConfigGetPacketIdOp : dfscheduleop<"config.get_packet_id"> {
-  let summary = "Get packet ID from tile config";
-  let arguments = (ins dfschedule_TileConfigType:$config);
+  let summary = "Get packet ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's packet_id to get
+  );
   let results = (outs I32:$packet_id);
   let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($packet_id)";
 }
 
 // Extract DMA channel from config
 def dfschedule_ConfigGetDmaChannelOp : dfscheduleop<"config.get_dma_channel"> {
-  let summary = "Get DMA channel from tile config";
-  let arguments = (ins dfschedule_TileConfigType:$config);
+  let summary = "Get DMA channel from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's DMA channel to get
+  );
   let results = (outs dfschedule_DmaChannelType:$channel);
   let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($channel)";
 }
 
 // Extract buffer address from config
 def dfschedule_ConfigGetBufferAddrOp : dfscheduleop<"config.get_buffer_addr"> {
-  let summary = "Get ping or pong buffer address from config";
+  let summary = "Get ping or pong buffer address from config for a specific flow";
   let arguments = (ins 
     dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index,   // Which flow's buffer to get
     I32Attr:$buffer_index  // 0=first buffer (ping or single), 1=second buffer (pong)
   );
   let results = (outs AnyMemRef:$buffer);
@@ -374,48 +382,66 @@ def dfschedule_ConfigGetBufferAddrOp : dfscheduleop<"config.get_buffer_addr"> {
 
 // Get buffer mode (single vs ping-pong)
 def dfschedule_ConfigGetBufferModeOp : dfscheduleop<"config.get_buffer_mode"> {
-  let summary = "Get buffer mode (0=single, 1=ping-pong)";
-  let arguments = (ins dfschedule_TileConfigType:$config);
+  let summary = "Get buffer mode (0=single, 1=ping-pong) for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's buffer mode to get
+  );
   let results = (outs I32:$mode);
   let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($mode)";
 }
 
 // Get number of buffers
 def dfschedule_ConfigGetNumBuffersOp : dfscheduleop<"config.get_num_buffers"> {
-  let summary = "Get number of buffers (1 or 2)";
-  let arguments = (ins dfschedule_TileConfigType:$config);
+  let summary = "Get number of buffers (1 or 2) for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's num buffers to get
+  );
   let results = (outs I32:$num);
   let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($num)";
 }
 
 // Get ping acquire lock ID from config
 def dfschedule_ConfigGetPingAcquireLockIdOp : dfscheduleop<"config.get_ping_acquire_lock_id"> {
-  let summary = "Get ping acquire lock ID from tile config";
-  let arguments = (ins dfschedule_TileConfigType:$config);
+  let summary = "Get ping acquire lock ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's lock ID to get
+  );
   let results = (outs I32:$lock_id);
   let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
 }
 
 // Get pong acquire lock ID from config
 def dfschedule_ConfigGetPongAcquireLockIdOp : dfscheduleop<"config.get_pong_acquire_lock_id"> {
-  let summary = "Get pong acquire lock ID from tile config";
-  let arguments = (ins dfschedule_TileConfigType:$config);
+  let summary = "Get pong acquire lock ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's lock ID to get
+  );
   let results = (outs I32:$lock_id);
   let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
 }
 
 // Get ping release lock ID from config
 def dfschedule_ConfigGetPingReleaseLockIdOp : dfscheduleop<"config.get_ping_release_lock_id"> {
-  let summary = "Get ping release lock ID from tile config";
-  let arguments = (ins dfschedule_TileConfigType:$config);
+  let summary = "Get ping release lock ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's lock ID to get
+  );
   let results = (outs I32:$lock_id);
   let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
 }
 
 // Get pong release lock ID from config
 def dfschedule_ConfigGetPongReleaseLockIdOp : dfscheduleop<"config.get_pong_release_lock_id"> {
-  let summary = "Get pong release lock ID from tile config";
-  let arguments = (ins dfschedule_TileConfigType:$config);
+  let summary = "Get pong release lock ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's lock ID to get
+  );
   let results = (outs I32:$lock_id);
   let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
 }
