@@ -175,7 +175,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         FlatSymbolRefAttr::get(builder.getContext(), dstBindName),
         builder.getStringAttr("sequential"),
         builder.getI32IntegerAttr(0),
-        builder.getI32IntegerAttr(0) // flow_index
+        builder.getI32IntegerAttr(opId) // flow_index
     );
 }
 
@@ -723,7 +723,7 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             FlatSymbolRefAttr::get(getContext(), dstBindName),
             rewriter.getStringAttr("sequential"),
             rewriter.getI32IntegerAttr(0),
-            rewriter.getI32IntegerAttr(0) // flow_index
+            rewriter.getI32IntegerAttr(opId) // flow_index
         );
         
         rewriter.eraseOp(op);
@@ -938,7 +938,7 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             FlatSymbolRefAttr::get(getContext(), dstBindName),
             rewriter.getStringAttr("sequential"),
             rewriter.getI32IntegerAttr(0),
-            rewriter.getI32IntegerAttr(0) // flow_index
+            rewriter.getI32IntegerAttr(opId) // flow_index
         );
         
         rewriter.eraseOp(op);
