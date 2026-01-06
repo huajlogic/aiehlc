@@ -977,6 +977,7 @@ static void createCanonicalizedSchedule(
                 loc, builder.getI32Type(), builder.getI32IntegerAttr(bdIndexCounter++));
             
             // Create DMA BD config
+            auto minusOne = builder.create<arith::ConstantOp>(loc, builder.getI32Type(), builder.getI32IntegerAttr(-1));
             auto dmaBdOp = builder.create<dfschedule::ConfigDmaBdOp>(
                 loc,
                 dfschedule::BdHandleType::get(builder.getContext()),
@@ -987,7 +988,9 @@ static void createCanonicalizedSchedule(
                 builder.getI32IntegerAttr(params.len),
                 builder.getBoolAttr(params.enablePacket),
                 builder.getI32IntegerAttr(params.packetId),
-                builder.getI32IntegerAttr(params.nextBd));
+                builder.getI32IntegerAttr(params.nextBd),
+                minusOne.getResult(),  // acquire_lock_id = -1 (host-side, no lock)
+                minusOne.getResult()); // release_lock_id = -1 (host-side, no lock)
             
             shimBdHandles[params.shimKey].push_back(dmaBdOp.getBdHandle());
         }

@@ -273,7 +273,9 @@ static void generateDSKernelReceiver(
         rewriter.getI32IntegerAttr(bufferLen),        // len
         rewriter.getBoolAttr(true),                   // enable_packet
         rewriter.getI32IntegerAttr(basePacketId),     // packet_id (TODO: should be from config at runtime)
-        rewriter.getI32IntegerAttr(pongBdId));        // next_bd -> points to pong
+        rewriter.getI32IntegerAttr(pongBdId),         // next_bd -> points to pong
+        getPingAcquireLockIdOp.getLockId(),           // acquire_lock_id from config
+        getPingReleaseLockIdOp.getLockId());          // release_lock_id from config
     
     // %6 = dfschedule.config.dma_bd for pong buffer
     // bd_id=1, next_bd=0, packet_id from config
@@ -287,7 +289,9 @@ static void generateDSKernelReceiver(
         rewriter.getI32IntegerAttr(bufferLen),        // len
         rewriter.getBoolAttr(true),                   // enable_packet
         rewriter.getI32IntegerAttr(basePacketId),     // packet_id (TODO: should be from config at runtime)
-        rewriter.getI32IntegerAttr(pingBdId));        // next_bd -> points back to ping
+        rewriter.getI32IntegerAttr(pingBdId),         // next_bd -> points back to ping
+        getPongAcquireLockIdOp.getLockId(),           // acquire_lock_id from config
+        getPongReleaseLockIdOp.getLockId());          // release_lock_id from config
     
     // Initialize locks for ping-pong synchronization using lock IDs from config
     // Lock values: acquire locks start at 0, release locks: ping=1, pong=0
@@ -587,6 +591,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
         
         // Step 3: Create dfschedule.config.dma_bd for shim tile only
+        auto minusOne = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(-1));
         auto configDmaBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
             loc,
             dfschedule::BdHandleType::get(rewriter.getContext()),
@@ -597,7 +602,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             rewriter.getI32IntegerAttr(bufferLen),            // len
             rewriter.getBoolAttr(true),                       // enable_packet
             rewriter.getI32IntegerAttr(basePacketId),         // packet_id
-            rewriter.getI32IntegerAttr(4294967295));          // next_bd (-1 as unsigned)
+            rewriter.getI32IntegerAttr(4294967295),           // next_bd (-1 as unsigned)
+            minusOne.getResult(),                             // acquire_lock_id = -1 (host-side, no lock)
+            minusOne.getResult());                            // release_lock_id = -1 (host-side, no lock)
         
         // Create dfschedule.config.create_io for shim tile
         auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(

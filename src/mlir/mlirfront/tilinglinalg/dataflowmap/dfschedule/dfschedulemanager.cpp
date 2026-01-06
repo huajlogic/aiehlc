@@ -651,6 +651,7 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
     
     // %bd_config = dfschedule.config.dma_bd(%gmem, %shim0, %bd_id) {...}
     auto bdHandleType = dfschedule::BdHandleType::get(ctx);
+    auto minusOne = builder.create<arith::ConstantOp>(location, builder.getI32Type(), builder.getI32IntegerAttr(-1));
     auto bdConfig = builder.create<dfschedule::ConfigDmaBdOp>(
         location, bdHandleType,
         gmem.getResult(),
@@ -660,7 +661,9 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
         builder.getI32IntegerAttr(1024),  // len
         builder.getBoolAttr(true),        // enable_packet
         builder.getI32IntegerAttr(10),    // packet_id
-        builder.getI32IntegerAttr(-1)     // next_bd
+        builder.getI32IntegerAttr(-1),    // next_bd
+        minusOne.getResult(),             // acquire_lock_id = -1 (host-side, no lock)
+        minusOne.getResult()              // release_lock_id = -1 (host-side, no lock)
     );
     
     // %io_0 = dfschedule.config.create_io(%bd_config, %shim0) {...}
@@ -882,34 +885,7 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     auto pingBdIdOp = builder.create<dfschedule::GetBdIdOp>(location, builder.getI32Type(), tileArg);
     auto pongBdIdOp = builder.create<dfschedule::GetBdIdOp>(location, builder.getI32Type(), tileArg);
     
-    // %bd_ping = dfschedule.config.dma_bd(%ping, %tile, %bd_id_ping) { ... }
-    auto bdPing = builder.create<dfschedule::ConfigDmaBdOp>(
-        location, bdHandleType,
-        ping.getResult(),
-        tileArg,
-        pingBdIdOp.getBdId(),                      // bd_id from GetBdIdOp
-        builder.getI32IntegerAttr(0),              // offset
-        builder.getI32IntegerAttr(bufferLen),      // len
-        builder.getBoolAttr(true),                 // enable_packet
-        builder.getI32IntegerAttr(packetIdBase),   // packet_id
-        builder.getI32IntegerAttr(1)               // next_bd (chain to pong)
-    );
-    
-    // %bd_pong = dfschedule.config.dma_bd(%pong, %tile, %bd_id_pong) { ... }
-    auto bdPong = builder.create<dfschedule::ConfigDmaBdOp>(
-        location, bdHandleType,
-        pong.getResult(),
-        tileArg,
-        pongBdIdOp.getBdId(),                      // bd_id from GetBdIdOp
-        builder.getI32IntegerAttr(0),              // offset
-        builder.getI32IntegerAttr(bufferLen),      // len
-        builder.getBoolAttr(true),                 // enable_packet
-        builder.getI32IntegerAttr(packetIdBase + 1), // packet_id
-        builder.getI32IntegerAttr(0)               // next_bd (chain back to ping)
-    );
-    //*/
-    // Initialize locks
-    ///*
+    // Initialize locks first (moved up to be available for BD config)
     auto lockType = dfschedule::LockType::get(ctx);
     
     // %l_ping_acq = dfschedule.dskernel.lock_init(lock_id=0, init_value=0, "ping_acquire_lock") -> !dfschedule.lock
@@ -935,6 +911,40 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     auto l_pong_rel = builder.create<dfschedule::DSKernelLockInitOp>(
         location, lockType, lockId3.getResult(), builder.getI64IntegerAttr(0), builder.getStringAttr("pong_release_lock")
     );
+    
+    // %bd_ping = dfschedule.config.dma_bd(%ping, %tile, %bd_id_ping) { ... }
+    // DMA acquires ping_acquire_lock (lockId0) and releases ping_release_lock (lockId2)
+    auto bdPing = builder.create<dfschedule::ConfigDmaBdOp>(
+        location, bdHandleType,
+        ping.getResult(),
+        tileArg,
+        pingBdIdOp.getBdId(),                      // bd_id from GetBdIdOp
+        builder.getI32IntegerAttr(0),              // offset
+        builder.getI32IntegerAttr(bufferLen),      // len
+        builder.getBoolAttr(true),                 // enable_packet
+        builder.getI32IntegerAttr(packetIdBase),   // packet_id
+        builder.getI32IntegerAttr(1),              // next_bd (chain to pong)
+        lockId0.getResult(),                       // acquire_lock_id (ping acquire)
+        lockId2.getResult()                        // release_lock_id (ping release)
+    );
+    
+    // %bd_pong = dfschedule.config.dma_bd(%pong, %tile, %bd_id_pong) { ... }
+    // DMA acquires pong_acquire_lock (lockId1) and releases pong_release_lock (lockId3)
+    auto bdPong = builder.create<dfschedule::ConfigDmaBdOp>(
+        location, bdHandleType,
+        pong.getResult(),
+        tileArg,
+        pongBdIdOp.getBdId(),                      // bd_id from GetBdIdOp
+        builder.getI32IntegerAttr(0),              // offset
+        builder.getI32IntegerAttr(bufferLen),      // len
+        builder.getBoolAttr(true),                 // enable_packet
+        builder.getI32IntegerAttr(packetIdBase + 1), // packet_id
+        builder.getI32IntegerAttr(0),              // next_bd (chain back to ping)
+        lockId1.getResult(),                       // acquire_lock_id (pong acquire)
+        lockId3.getResult()                        // release_lock_id (pong release)
+    );
+    //*/
+    // (locks already initialized above)
     
     // Launch DMA loop
     auto sharedMemrefType = mlir::MemRefType::get(
