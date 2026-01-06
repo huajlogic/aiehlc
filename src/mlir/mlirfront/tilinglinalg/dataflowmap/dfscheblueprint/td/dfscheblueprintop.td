@@ -214,7 +214,8 @@ def dfscheblueprint_FlowTransferOp : dfscheblueprintop<"flow_transfer", [
     SymbolRefAttr:$from,
     SymbolRefAttr:$to,
     OptionalAttr<StrAttr>:$ordering,
-    I32Attr:$base_packet_id
+    I32Attr:$base_packet_id,
+    I32Attr:$flow_index  // Unique index for this flow, used to access per-flow DMA configs
   );
   let hasCustomAssemblyFormat = 1;
 }

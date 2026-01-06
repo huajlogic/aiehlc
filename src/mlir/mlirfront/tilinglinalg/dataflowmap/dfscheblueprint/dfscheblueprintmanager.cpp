@@ -251,12 +251,14 @@ void dfscheblueprint::FlowTransferOp::print(OpAsmPrinter &printer) {
         printer << ",ordering = \"" << getOrdering() << "\"";
     }
     printer.printNewline();
-    printer << ",base_packet_id = " << getBasePacketId();
+    printer << ",base_packet_id = " << getBasePacketId() << ",";
+    printer.printNewline();
+    printer << "flow_index = " << getFlowIndex();
     printer.decreaseIndent();
     printer.printNewline();
     printer << "}";
     printer.printOptionalAttrDict(getOperation()->getAttrs(), 
-        /*elidedAttrs=*/{"sym_name", "type", "from", "to", "ordering", "base_packet_id"});
+        /*elidedAttrs=*/{"sym_name", "type", "from", "to", "ordering", "base_packet_id", "flow_index"});
 }
 
 // FlowTransferOp parser
@@ -273,6 +275,7 @@ ParseResult dfscheblueprint::FlowTransferOp::parse(OpAsmParser &parser, Operatio
     SymbolRefAttr to;
     StringAttr ordering;
     IntegerAttr basePacketId;
+    IntegerAttr flowIndex;
     
     while (true) {
         OptionalParseResult res = parser.parseOptionalRBrace();
@@ -295,6 +298,8 @@ ParseResult dfscheblueprint::FlowTransferOp::parse(OpAsmParser &parser, Operatio
             if (parser.parseAttribute(ordering, "ordering", result.attributes)) return failure();
         } else if (attrName == "base_packet_id") {
             if (parser.parseAttribute(basePacketId, "base_packet_id", result.attributes)) return failure();
+        } else if (attrName == "flow_index") {
+            if (parser.parseAttribute(flowIndex, "flow_index", result.attributes)) return failure();
         } else {
              return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
         }
@@ -571,7 +576,8 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         mlir::SymbolRefAttr::get(ctx, "flow_shim_tx"),
         mlir::SymbolRefAttr::get(ctx, "flow_cores_in"),
         nullptr, // ordering
-        builder.getI32IntegerAttr(10)
+        builder.getI32IntegerAttr(10),
+        builder.getI32IntegerAttr(0) // flow_index
     );
 
     // Output Gather
@@ -582,6 +588,7 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
         mlir::SymbolRefAttr::get(ctx, "flow_cores_out"),
         mlir::SymbolRefAttr::get(ctx, "flow_shim_rx"),
         builder.getStringAttr("sequential"),
-        builder.getI32IntegerAttr(20)
+        builder.getI32IntegerAttr(20),
+        builder.getI32IntegerAttr(1) // flow_index
     );
 }

@@ -1109,6 +1109,7 @@ struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
         // Get operands
         Value ioHandle = adaptor.getIoHandle();  // This should be the "struct io" from config.create_io
         Value bdId = adaptor.getBdId();          // BD ID (though not used in __Runtime_startio signature shown)
+        // Note: flow_index is available via op.getFlowIndex() but unused in __Runtime_startio currently
         
         llvm::errs() << "  IO Handle type: " << ioHandle.getType() << "\n";
         llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";

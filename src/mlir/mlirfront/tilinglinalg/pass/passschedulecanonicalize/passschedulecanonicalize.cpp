@@ -1124,13 +1124,15 @@ static void createCanonicalizedSchedule(
             builder.getI32Type(),
             shimTile);
         
-        // Create start_io for each IO handle
+            // Create start_io for each IO handle
         for (Value ioHandle : ioHandles) {
             auto startIoOp = builder.create<dfschedule::StartIoOp>(
                 loc,
                 dfschedule::EventType::get(builder.getContext()),
                 ioHandle,
-                getBdIdOp.getBdId());
+                getBdIdOp.getBdId(),
+                builder.getI32IntegerAttr(0)
+            );
             allEvents.push_back(startIoOp.getEvent());
         }
     }
