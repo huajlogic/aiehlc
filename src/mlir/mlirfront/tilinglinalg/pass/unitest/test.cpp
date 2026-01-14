@@ -36,6 +36,7 @@
 #include "routingdeadargclean.h"
 
 #include "routingconstantfold.h"
+#include "mlir/Transforms/Passes.h"
 
 // Unit test function to verify path contiguity for RoutingLowerPass
 void testRoutingLowerPassPathContiguity() {
@@ -861,17 +862,41 @@ void routingtodfschedule() {
     options.label = "After ScheduleCanonicalizePass:";
     pm.addPass(mlir::createPrintIRPass(options));
     
+   // /*
     // Stage 7: Convert dfschedule to API calls and EmitC
     pm.addPass(std::make_unique<mlir::DfscheduleToApiPass>());
     options.label = "After DfscheduleToApiPass:";
     pm.addPass(mlir::createPrintIRPass(options));
     
+    // Stage 9: Canonicalization to optimize EmitC operations
+    pm.addPass(mlir::createCanonicalizerPass());
+    options.label = "After Canonicalization:";
+    pm.addPass(mlir::createPrintIRPass(options));
+
+    //pm.addPass(std::make_unique<RoutingDeadArgPass>());
+    //options.label = "After RoutingDeadArgPass:";
+   // pm.addPass(mlir::createPrintIRPass(options));
+    //The constanfold change emitc.call into emic.call_opaque to convert 
+
+    //XAie_LocType v251 = XAie_TileLoc(v1, v10);
+    //XAie_DevInst* v252 = getOrCreateDeviceInstance();
+    //int32_t v253 = XAie_StrmConnCctEnable(v252, v251, v6, v13, v5, v12);
+ 
+    //into
+
+    //int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0); 
+ 
+    pm.addPass(std::make_unique<RoutingConstantFoldPass>());
+    options.label = "After RoutingConstantFoldPass:";
+    pm.addPass(mlir::createPrintIRPass(options));
+    
+    //*/
     // Run the pass pipeline
     if (failed(pm.run(module1))) {
         llvm::errs() << "ERROR: Pass pipeline failed!\n";
         return;
     }
-    
+    //return;
     std::cout << "\n=== Final Module with API calls ===" << std::endl;
     module1.dump();
     

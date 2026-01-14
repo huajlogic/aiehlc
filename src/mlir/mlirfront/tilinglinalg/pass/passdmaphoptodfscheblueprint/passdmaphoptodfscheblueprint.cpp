@@ -169,12 +169,13 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     // 4. Collective Transfer
     builder.create<dfscheblueprint::FlowTransferOp>(
         op.getLoc(),
-        "transfer_" + std::to_string(opId),
-        "many_to_one",
+        builder.getStringAttr("transfer_" + std::to_string(opId)),
+        builder.getStringAttr("many_to_one"),
         FlatSymbolRefAttr::get(builder.getContext(), srcBindName),
         FlatSymbolRefAttr::get(builder.getContext(), dstBindName),
         builder.getStringAttr("sequential"),
-        0
+        builder.getI32IntegerAttr(0),
+        builder.getI32IntegerAttr(opId) // flow_index
     );
 }
 
@@ -322,12 +323,13 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     
     builder.create<dfscheblueprint::FlowTransferOp>(
         op.getLoc(),
-        "transfer_" + std::to_string(opId),
-        "one_to_many",
+        builder.getStringAttr("transfer_" + std::to_string(opId)),
+        builder.getStringAttr("one_to_many"),
         FlatSymbolRefAttr::get(builder.getContext(), srcBindName),
         FlatSymbolRefAttr::get(builder.getContext(), dstBindName),
-        builder.getStringAttr(""),
-        0
+        builder.getStringAttr("sequential"),
+        builder.getI32IntegerAttr(0),
+        builder.getI32IntegerAttr(0) // flow_index
     );
 }
 
@@ -720,7 +722,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             FlatSymbolRefAttr::get(getContext(), srcBindName),
             FlatSymbolRefAttr::get(getContext(), dstBindName),
             rewriter.getStringAttr("sequential"),
-            0
+            rewriter.getI32IntegerAttr(0),
+            rewriter.getI32IntegerAttr(opId) // flow_index
         );
         
         rewriter.eraseOp(op);
@@ -934,7 +937,8 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             FlatSymbolRefAttr::get(getContext(), srcBindName),
             FlatSymbolRefAttr::get(getContext(), dstBindName),
             rewriter.getStringAttr("sequential"),
-            0
+            rewriter.getI32IntegerAttr(0),
+            rewriter.getI32IntegerAttr(opId) // flow_index
         );
         
         rewriter.eraseOp(op);

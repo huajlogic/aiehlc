@@ -12,7 +12,11 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "dfscheblueprintmanager.h"
+#include "dfschedulemanager.h"
+#include "routingmanager.h"
 
 namespace mlir {
 
@@ -36,7 +40,8 @@ public:
         registry.insert<func::FuncDialect, 
                         arith::ArithDialect,
                         emitc::EmitCDialect,
-                        scf::SCFDialect>();
+                        scf::SCFDialect,
+                        tensor::TensorDialect>();
     }
 };
 

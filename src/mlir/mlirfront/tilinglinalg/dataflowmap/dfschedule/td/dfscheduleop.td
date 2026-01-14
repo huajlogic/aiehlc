@@ -119,6 +119,33 @@ def dfschedule_PacketOp : dfscheduleop<"packet", [Symbol]> {
   let assemblyFormat = "$sym_name `(` $data `)` attr-dict `:` `(` type($data) `)` `->` type($packet)";
 }
 
+// Declare kernel configuration (replaces multiple packet symbols)
+def dfschedule_DeclareKernelConfigOp : dfscheduleop<"declare_kernel_config", [Symbol]> {
+  let summary = "Declare kernel configuration for multiple tiles";
+  let description = [{
+    This operation declares a unified kernel configuration that contains
+    tile-specific metadata for all tiles that will run the same kernel.
+    Each tile gets its configuration written to its local memory at a fixed address.
+    
+    Example:
+    ```mlir
+    dfschedule.declare_kernel_config @kernelconfig {
+      tile_configs = [
+        {tile_index = 0, packet_id = 0, dma_channel = 0, buffer_mode = 1, num_buffers = 2},
+        {tile_index = 1, packet_id = 1, dma_channel = 0, buffer_mode = 1, num_buffers = 2}
+      ]
+    }
+    ```
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    ArrayAttr:$tile_configs  // Array of DictionaryAttr, one per tile
+  );
+  let results = (outs dfschedule_KernelConfigType:$config);
+  let assemblyFormat = "$sym_name attr-dict";
+}
+
+
 // DMA Buffer Descriptor Configuration
 def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
   let summary = "Configure a DMA buffer descriptor";
@@ -130,7 +157,9 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
     I32Attr:$len,
     BoolAttr:$enable_packet,
     I32Attr:$packet_id,
-    I32Attr:$next_bd
+    I32Attr:$next_bd,
+    I32:$acquire_lock_id,  // Lock ID to acquire before DMA transfer (-1 = no lock)
+    I32:$release_lock_id   // Lock ID to release after DMA transfer (-1 = no lock)
   );
   let results = (outs dfschedule_BdHandleType:$bd_handle);
   let hasCustomAssemblyFormat = 1;
@@ -153,11 +182,27 @@ def dfschedule_ConfigCreateIoOp : dfscheduleop<"config.create_io"> {
 // Load kernel group configuration
 def dfschedule_LoadKernelGroupOp : dfscheduleop<"config.load_kernel_group"> {
   let summary = "Configure and load a group of kernels to be launched on tiles";
+  let description = [{
+    This operation configures a kernel group with tile-specific settings.
+    It can use either:
+    1. NEW: kernel_config - a single unified config symbol (preferred)
+    2. OLD: distributed_args - multiple packet symbols (deprecated)
+    
+    Example (new style):
+    ```mlir
+    %kg = dfschedule.config.load_kernel_group(%tile0, %tile1) {
+      callee = [@dskernel_receiver],
+      kernel_config = @kernelconfig,
+      distributed_compute_kernel_args = [@compute0, @compute0]
+    }
+    ```
+  }];
   let arguments = (ins
     Variadic<dfschedule_TileHandleType>:$tiles,
     SymbolRefArrayAttr:$callee,
     SymbolRefArrayAttr:$distributed_compute_kernel_args,
-    SymbolRefArrayAttr:$distributed_args
+    OptionalAttr<FlatSymbolRefAttr>:$kernel_config,  // NEW: single unified config
+    OptionalAttr<SymbolRefArrayAttr>:$distributed_args  // OLD: for backward compat
   );
   let results = (outs dfschedule_KernelGroupType:$kernel_group);
   let hasCustomAssemblyFormat = 1;
@@ -190,7 +235,8 @@ def dfschedule_StartIoOp : dfscheduleop<"schedule.start_io"> {
   let summary = "Start an IO operation with a given BD ID";
   let arguments = (ins
     dfschedule_IoHandleType:$io_handle,
-    I32:$bd_id
+    I32:$bd_id,
+    I32Attr:$flow_index
   );
   let results = (outs dfschedule_EventType:$event);
   let assemblyFormat = "`(` $io_handle `,` $bd_id `)` attr-dict `:` `(` type($io_handle) `,` type($bd_id) `)` `->` type($event)";
@@ -281,6 +327,128 @@ def dfschedule_GetDmaChannelOp : dfscheduleop<"getdmachannel"> {
   let assemblyFormat = "`(` $packet `)` attr-dict `:` `(` type($packet) `)` `->` type($channel)";
 }
 
+// ============================================================================
+// KERNEL CONFIG READ OPERATIONS (for tile local memory config)
+// ============================================================================
+
+// Read tile config from fixed local memory address
+def dfschedule_KernelReadConfigOp : dfscheduleop<"kernel.read_tile_config"> {
+  let summary = "Read tile configuration from fixed local memory address";
+  let description = [{
+    This operation reads the tile-specific configuration from a fixed address
+    in the tile's local memory. The configuration was pre-written by the host
+    during kernel loading.
+    
+    Example:
+    ```mlir
+    %config = dfschedule.kernel.read_tile_config : !dfschedule.tile_config
+    ```
+  }];
+  let results = (outs dfschedule_TileConfigType:$config);
+  let assemblyFormat = "attr-dict `:` type($config)";
+}
+
+// Extract packet ID from config
+def dfschedule_ConfigGetPacketIdOp : dfscheduleop<"config.get_packet_id"> {
+  let summary = "Get packet ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's packet_id to get
+  );
+  let results = (outs I32:$packet_id);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($packet_id)";
+}
+
+// Extract DMA channel from config
+def dfschedule_ConfigGetDmaChannelOp : dfscheduleop<"config.get_dma_channel"> {
+  let summary = "Get DMA channel from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's DMA channel to get
+  );
+  let results = (outs dfschedule_DmaChannelType:$channel);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($channel)";
+}
+
+// Extract buffer address from config
+def dfschedule_ConfigGetBufferAddrOp : dfscheduleop<"config.get_buffer_addr"> {
+  let summary = "Get ping or pong buffer address from config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index,   // Which flow's buffer to get
+    I32Attr:$buffer_index  // 0=first buffer (ping or single), 1=second buffer (pong)
+  );
+  let results = (outs AnyMemRef:$buffer);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($buffer)";
+}
+
+// Get buffer mode (single vs ping-pong)
+def dfschedule_ConfigGetBufferModeOp : dfscheduleop<"config.get_buffer_mode"> {
+  let summary = "Get buffer mode (0=single, 1=ping-pong) for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's buffer mode to get
+  );
+  let results = (outs I32:$mode);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($mode)";
+}
+
+// Get number of buffers
+def dfschedule_ConfigGetNumBuffersOp : dfscheduleop<"config.get_num_buffers"> {
+  let summary = "Get number of buffers (1 or 2) for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's num buffers to get
+  );
+  let results = (outs I32:$num);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($num)";
+}
+
+// Get ping acquire lock ID from config
+def dfschedule_ConfigGetPingAcquireLockIdOp : dfscheduleop<"config.get_ping_acquire_lock_id"> {
+  let summary = "Get ping acquire lock ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's lock ID to get
+  );
+  let results = (outs I32:$lock_id);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
+}
+
+// Get pong acquire lock ID from config
+def dfschedule_ConfigGetPongAcquireLockIdOp : dfscheduleop<"config.get_pong_acquire_lock_id"> {
+  let summary = "Get pong acquire lock ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's lock ID to get
+  );
+  let results = (outs I32:$lock_id);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
+}
+
+// Get ping release lock ID from config
+def dfschedule_ConfigGetPingReleaseLockIdOp : dfscheduleop<"config.get_ping_release_lock_id"> {
+  let summary = "Get ping release lock ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's lock ID to get
+  );
+  let results = (outs I32:$lock_id);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
+}
+
+// Get pong release lock ID from config
+def dfschedule_ConfigGetPongReleaseLockIdOp : dfscheduleop<"config.get_pong_release_lock_id"> {
+  let summary = "Get pong release lock ID from tile config for a specific flow";
+  let arguments = (ins 
+    dfschedule_TileConfigType:$config,
+    I32Attr:$flow_index  // Which flow's lock ID to get
+  );
+  let results = (outs I32:$lock_id);
+  let assemblyFormat = "`(` $config `)` attr-dict `:` `(` type($config) `)` `->` type($lock_id)";
+}
+
+
 // Kernel memory allocation
 def dfschedule_KernelMemAllocOp : dfscheduleop<"kernel.memalloc"> {
   let summary = "Allocate local memory in kernel based on tensor shape";
@@ -302,13 +470,14 @@ def dfschedule_CoreComputeOp : dfscheduleop<"core.compute"> {
 
 // DSKernel Lock Init
 def dfschedule_DSKernelLockInitOp : dfscheduleop<"dskernel.lock_init"> {
-  let summary = "Initialize a lock with initial value and name";
+  let summary = "Initialize a lock with lock ID, initial value and name";
   let arguments = (ins
+    I32:$lock_id,
     I64Attr:$initial_value,
     StrAttr:$name
   );
   let results = (outs dfschedule_LockType:$lock);
-  let assemblyFormat = "`(` $initial_value `,` $name `)` attr-dict `->` type($lock)";
+  let assemblyFormat = "`(` $lock_id `,` $initial_value `,` $name `)` attr-dict `:` type($lock_id) `->` type($lock)";
 }
 
 // DSKernel Launch DMA S2M Loop

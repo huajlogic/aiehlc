@@ -36,6 +36,17 @@ def dfschedule_KernelGroupType : dfscheduleype<"KernelGroup"> {
   let summary = "Handle to a group of kernel instances to be launched together";
 }
 
+//=== Kernel Configuration Types ===//
+def dfschedule_KernelConfigType : dfscheduleype<"KernelConfig"> {
+  let mnemonic = "kernel_config";
+  let summary = "Handle to kernel configuration for all tiles";
+}
+
+def dfschedule_TileConfigType : dfscheduleype<"TileConfig"> {
+  let mnemonic = "tile_config";
+  let summary = "Handle to tile-specific configuration in local memory";
+}
+
 //=== Compute Type (for kernel compute logic reference) ===//
 def dfschedule_ComputeType : dfscheduleype<"Compute"> {
   let mnemonic = "compute";
