@@ -53,18 +53,20 @@ private:
     int64_t nextLockId;
 };
 
-// Helper function to look up TileGroupOp by symbol reference
-// The TileGroupOp is typically a sibling operation in the same block as the FlowConfigOp
-static dfscheblueprint::TileGroupOp lookupTileGroup(Operation *rootOp, SymbolRefAttr target) {
+// Generic template function to look up any operation by symbol reference
+// This function searches for an operation of type OpTy with a matching symbol name
+// The search starts in the same block as rootOp and then searches parent regions
+template <typename OpTy>
+static OpTy lookupSymbolOp(Operation *rootOp, SymbolRefAttr target) {
     StringRef targetName = target.getRootReference().getValue();
     
-    // First, search in the same block as the FlowConfigOp
+    // First, search in the same block as the rootOp
     Block *parentBlock = rootOp->getBlock();
     if (parentBlock) {
         for (Operation &op : *parentBlock) {
-            if (auto tileGroup = dyn_cast<dfscheblueprint::TileGroupOp>(&op)) {
-                if (tileGroup.getSymName() == targetName) {
-                    return tileGroup;
+            if (auto targetOp = dyn_cast<OpTy>(&op)) {
+                if (targetOp.getSymName() == targetName) {
+                    return targetOp;
                 }
             }
         }
@@ -76,9 +78,9 @@ static dfscheblueprint::TileGroupOp lookupTileGroup(Operation *rootOp, SymbolRef
         for (Region &region : parentOp->getRegions()) {
             for (Block &block : region) {
                 for (Operation &op : block) {
-                    if (auto tileGroup = dyn_cast<dfscheblueprint::TileGroupOp>(&op)) {
-                        if (tileGroup.getSymName() == targetName) {
-                            return tileGroup;
+                    if (auto targetOp = dyn_cast<OpTy>(&op)) {
+                        if (targetOp.getSymName() == targetName) {
+                            return targetOp;
                         }
                     }
                 }
@@ -88,6 +90,11 @@ static dfscheblueprint::TileGroupOp lookupTileGroup(Operation *rootOp, SymbolRef
     }
     
     return nullptr;
+}
+
+// Helper function to look up TileGroupOp by symbol reference (wrapper for backward compatibility)
+static dfscheblueprint::TileGroupOp lookupTileGroup(Operation *rootOp, SymbolRefAttr target) {
+    return lookupSymbolOp<dfscheblueprint::TileGroupOp>(rootOp, target);
 }
 
 // Unified template pattern to erase dfscheblueprint operations
@@ -415,40 +422,41 @@ static void generateDSKernelReceiver(
         loc, selectedRelLock, rewriter.getI32IntegerAttr(1));
 }
 
-// Helper function to look up FlowConfigOp by symbol reference
+static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRefAttr target) {
+    return lookupSymbolOp<dfscheblueprint::DataSliceOp>(rootOp, target);
+}
+
+// Helper function to look up FlowConfigOp by symbol reference (wrapper for backward compatibility)
 static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolRefAttr target) {
-    StringRef targetName = target.getRootReference().getValue();
-    
-    // Search in the same block as the FlowTransferOp
-    Block *parentBlock = rootOp->getBlock();
-    if (parentBlock) {
-        for (Operation &op : *parentBlock) {
-            if (auto flowConfig = dyn_cast<dfscheblueprint::FlowConfigOp>(&op)) {
-                if (flowConfig.getSymName() == targetName) {
-                    return flowConfig;
-                }
-            }
-        }
+    return lookupSymbolOp<dfscheblueprint::FlowConfigOp>(rootOp, target);
+}
+
+bool checktheopusedtensor(Operation *flowtransferOp) {
+    auto op = dyn_cast<dfscheblueprint::FlowTransferOp>(flowtransferOp);
+    if (!op) {
+        return false;
     }
     
-    // Search in parent regions
-    Operation *parentOp = rootOp->getParentOp();
-    while (parentOp) {
-        for (Region &region : parentOp->getRegions()) {
-            for (Block &block : region) {
-                for (Operation &op : block) {
-                    if (auto flowConfig = dyn_cast<dfscheblueprint::FlowConfigOp>(&op)) {
-                        if (flowConfig.getSymName() == targetName) {
-                            return flowConfig;
-                        }
-                    }
-                }
-            }
-        }
-        parentOp = parentOp->getParentOp();
+    SymbolRefAttr fromRef = op.getFrom();
+    auto fromFlowConfig = lookupFlowConfig(op.getOperation(), fromRef);
+    if (!fromFlowConfig) {
+        return false;
     }
-    
-    return nullptr;
+
+    auto toRef = op.getTo();
+    auto toFlowConfig = lookupFlowConfig(op.getOperation(), toRef);
+    if (!toFlowConfig) {
+        return false;
+    }
+    auto sliceSymbolsOpt = fromFlowConfig.getSliceSymbols();
+    if (sliceSymbolsOpt && !sliceSymbolsOpt->empty()) {
+        for (auto sliceSymbol : *sliceSymbolsOpt) {
+            auto sliceOp = lookupDataSlice(op.getOperation(), cast<SymbolRefAttr>(sliceSymbol));
+            // TODO: Add logic to check the slice operation
+        }
+    }
+  
+    return true;
 }
 
 // Pattern to convert dfscheblueprint::FlowTransferOp to dfschedule operations
