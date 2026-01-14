@@ -59,7 +59,8 @@ SKIP_BSP=0
 LOCAL_AIE_RT_REPO=0
 PATH_SET_ONLY=0
 #VITIS_SETTINGS_PATH="/proj/xbuilds/2025.2_0414_1/installs/lin64/HEAD/Vitis/settings64.sh"
-VITIS_SETTINGS_PATH="/proj/xbuilds/HEAD_qualified_latest/installs/lin64/HEAD/Vitis/settings64.sh"
+#VITIS_SETTINGS_PATH="/proj/xbuilds/HEAD_qualified_latest/installs/lin64/HEAD/Vitis/settings64.sh"
+VITIS_SETTINGS_PATH="/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/Vitis/settings64.sh"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -151,7 +152,7 @@ if [ "$SKIP_BSP" -eq 0 ]; then
         pushd "$SCRIPT_DIR"
         
         VEK280_XSA=$XILINX_VITIS/base_platforms/xilinx_vek280_base_202520_1/hw/hw.xsa
-        VEK385_XSA=/proj/xbuilds/2025.2_daily_latest/internal_platforms/vek385_base_202520_1/hw/hw.xsa
+        VEK385_XSA=/proj/xbuilds/2025.2_daily_latest/internal_platforms/vek385_base_reva/hw/hw.xsa
 
         vitis -s gen_bsp.py --xsa $VEK280_XSA --processor psv_cortexr5_0       
         vitis -s gen_bsp.py --xsa $VEK280_XSA --processor psv_cortexa72_0
