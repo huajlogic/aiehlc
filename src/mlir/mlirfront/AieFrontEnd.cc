@@ -294,12 +294,20 @@ void AieFrontEnd::createKernelFunction(std::vector<std::string> params) {
     // std::cout << "--------------AieFrontEnd::createKernelFunction----END-------" << std::endl;
     return;
 }
-void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f,
-                                           clang::Rewriter* Rewriter,
-                                           clang::SourceLocation linestart) {
+void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rewriter, clang::SourceLocation linestart,
+                                           bool isStreaming) {
     llvm::SmallVector<mlir::Value, 4> windowOps;
     llvm::SmallVector<WindowType> windowOpTypes;
     std::string kernelFuncName = f->getNameInfo().getName().getAsString();
+
+    // Store streaming flag for this kernel
+    if (isStreaming) {
+        llvm::outs() << "Enabling streaming mode for kernel: " << kernelFuncName << "\n";
+        // Store this information so we can use it later when generating wrapper
+        // For prototype: hardcode 4 chunks of 4KB (4096 bytes = 1024 int32 elements)
+        kernelStreamingConfig[kernelFuncName] = {true, 1024, 4};
+    }
+
     // std::cout << " kernelFuncNamexx is " << kernelFuncName << std::endl;
     // Assume you have a way to determine the kernel symbol, input args, and output args
     int numInputArgs = 0; // Placeholder: calculate based on function's input
@@ -389,6 +397,14 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f,
     }
     mlir::aie::CreateKernelObjectOp kernelObject = mbuilder.create<mlir::aie::CreateKernelObjectOp>(
             mbuilder.getUnknownLoc(), result_type, numInputArgs, numOutputArgs, kname,fname, window_types[0], window_types[1], windowOps);
+
+    // Add streaming attributes if enabled
+    if (isStreaming) {
+        kernelObject->setAttr("streaming_enabled", mbuilder.getBoolAttr(true));
+        kernelObject->setAttr("streaming_chunk_size", mbuilder.getI32IntegerAttr(1024));
+        kernelObject->setAttr("streaming_num_chunks", mbuilder.getI32IntegerAttr(4));
+    }
+
     kernelfunctionToKernelObjectMap[f->getName().str()] = kernelObject;
     return;
 }

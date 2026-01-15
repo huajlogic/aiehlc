@@ -152,7 +152,19 @@ public:
 		 }
 		 bool VisitFunctionDecl(FunctionDecl *f) {
 			 if (f->hasBody() && f->hasAttr<AnnotateAttr>()) {
-				for (auto attr:f->attrs()) {
+                 // Check for streaming annotation
+                 bool isStreamingKernel = false;
+                 for (auto attr : f->attrs()) {
+                     if (auto anno = clang::dyn_cast<clang::AnnotateAttr>(attr)) {
+                         if (anno->getAnnotation() == "streaming") {
+                             isStreamingKernel = true;
+                             llvm::outs() << "Detected streaming kernel annotation\n";
+                             break;
+                         }
+                     }
+                 }
+
+                for (auto attr:f->attrs()) {
 					if (auto anno = clang::dyn_cast<clang::AnnotateAttr>(attr)){
 						if (anno->getAnnotation() == "__global__" || anno->getAnnotation() == "__kernel__") {
 							std::string kernelName = f->getNameInfo().getName().getAsString();
@@ -169,9 +181,10 @@ public:
 							Rewrite->getSourceMgr().getFileID(startLocation), 
 							Rewrite->getSourceMgr().getSpellingLineNumber(startLocation), 1);
 							Rewrite->RemoveText(f->getSourceRange());
-							// do other rewrite logic only after the RemoveText work done
-							Aiefrontend->createKernelDefinitionOp(f, Rewrite, lineStart);
-							if (anno->getAnnotation() == "__global__") {
+                            // do other rewrite logic only after the RemoveText work done
+                            // Pass streaming flag to frontend
+                            Aiefrontend->createKernelDefinitionOp(f, Rewrite, lineStart, isStreamingKernel);
+                            if (anno->getAnnotation() == "__global__") {
 								std::string globalVars =
 									"\n// Global variables for kernel: " + kernelName + "\n" +
 									"extern unsigned char _binary_kernel_" + kernelName + "_start[];\n" +

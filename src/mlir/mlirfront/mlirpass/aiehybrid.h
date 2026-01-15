@@ -371,7 +371,12 @@ private:
 		uint32_t lbuf_size=128;
 		std::string kernel_in_param_type ="";
 		std::string kernel_out_param_type ="";
-public:
+        // Streaming mode configuration
+        bool streaming_mode = false;
+        uint32_t chunk_size = 4096; // 4KB default chunk size
+        uint32_t num_chunks = 1;
+
+      public:
 		Wrapper(std::string kernelname, std::string filename) {
 			name = "wrapper.cc";
 			kernel_name = kernelname;
@@ -380,8 +385,22 @@ public:
 		std::string getfilename() {
 			return name;
 		}
-		std::string generate() override{
-			std::string code;
+
+        void enableStreaming(uint32_t chunk_sz, uint32_t n_chunks) {
+            streaming_mode = true;
+            chunk_size = chunk_sz;
+            num_chunks = n_chunks;
+        }
+
+        std::string generate() override{
+            if (streaming_mode) {
+                return generateStreamingWrapper();
+            }
+            return generateNormalWrapper();
+        }
+
+        std::string generateNormalWrapper() {
+            std::string code;
 			code += "#include <adf.h>\n";
 			for (auto x:headers) {
 				code += "#include \"" + x + "\"\n";
@@ -430,8 +449,8 @@ public:
 			code += "}";
 
 			return code;
-		}
-		void addkernelfuncparams(std::vector<Buffer>& bufs) {
+        }
+        void addkernelfuncparams(std::vector<Buffer>& bufs) {
 			params = bufs;
 		}
 
@@ -452,6 +471,141 @@ public:
 			kernel_param_type.erase(kernel_param_type.find_last_not_of(" \n\r") + 1);
 			this->kernel_out_param_type = kernel_param_type;
 		}
+
+        std::string generateStreamingWrapper() {
+            std::string code;
+            code += "#include <adf.h>\n";
+            for (auto x : headers) {
+                code += "#include \"" + x + "\"\n";
+            }
+            code += "#define FOR_READ  1\n";
+            code += "#define FOR_WRITE 0\n";
+            code += "#define CHUNK_SIZE " + std::to_string(chunk_size) + "\n";
+            code += "#define NUM_CHUNKS " + std::to_string(num_chunks) + "\n\n";
+
+            // Only generate locks and multiple buffers if NUM_CHUNKS > 1
+            if (num_chunks > 1) {
+                // Generate lock definitions for ping-pong synchronization
+                int lockId = 16; // Start from lock ID 16
+                for (size_t i = 0; i < params.size(); i++) {
+                    auto paramName = params[i].getwinparamname();
+                    code += "#define LOCK_" + paramName + "_0_PRD " + std::to_string(lockId++) + "\n";
+                    code += "#define LOCK_" + paramName + "_0_CNS " + std::to_string(lockId++) + "\n";
+                    code += "#define LOCK_" + paramName + "_1_PRD " + std::to_string(lockId++) + "\n";
+                    code += "#define LOCK_" + paramName + "_1_CNS " + std::to_string(lockId++) + "\n";
+                }
+                code += "\n";
+            }
+
+            code += "volatile static int sync_buffer[8] = {0, -1};\n\n";
+            code += "#include <adf/sync/mesync.h>\n\n";
+
+            // Generate buffer declarations
+            if (num_chunks > 1) {
+                // Ping-pong: 4 buffers per parameter (buf0, buf0d, buf1, buf1d)
+                for (auto x : params) {
+                    auto paramName = x.getwinparamname();
+                    code += "v4int32 " + paramName + "_buf0[CHUNK_SIZE];   // Ping buffer\n";
+                    code += "v4int32 " + paramName + "_buf0d[CHUNK_SIZE];  // Ping double buffer\n";
+                    code += "v4int32 " + paramName + "_buf1[CHUNK_SIZE];   // Pong buffer\n";
+                    code += "v4int32 " + paramName + "_buf1d[CHUNK_SIZE];  // Pong double buffer\n\n";
+                }
+            } else {
+                // Single chunk: Just one buffer per parameter
+                for (auto x : params) {
+                    auto paramName = x.getwinparamname();
+                    code += "v4int32 " + paramName + "_buf[CHUNK_SIZE];\n";
+                }
+                code += "\n";
+            }
+
+            code += "#include \"../../" + kernel_name + ".cc\"\n";
+            code += "\nint main(void) {\n";
+            code += "\tsync_buffer[0] = 0; // reset end signal\n\n";
+
+            // Initialize windows based on NUM_CHUNKS
+            if (num_chunks > 1) {
+                // Use 8-parameter window_init with locks for ping-pong
+                for (size_t i = 0; i < params.size(); i++) {
+                    auto paramName = params[i].getwinparamname();
+                    std::string wfunc = (i == 0) ? "get_input_async_window_int32" : "get_output_async_window_int32";
+                    std::string wtypedef = (i == 0) ? "input_window_int32" : "output_window_int32";
+
+                    code += "\t// Initialize window for " + paramName + " ping-pong with locks (8-parameter version)\n";
+                    code += "\twindow_internal window_" + paramName + "[1];\n";
+                    code += "\twindow_init(window_" + paramName + ", 1, ";
+                    code += paramName + "_buf0, LOCK_" + paramName + "_0_PRD, ";
+                    code += paramName + "_buf1, LOCK_" + paramName + "_1_PRD, ";
+                    code += "CHUNK_SIZE, CHUNK_SIZE);\n";
+                    code += "\t" + wtypedef + "* " + paramName + "_ptr = " + wfunc + "(window_" + paramName + ");\n\n";
+                }
+            } else {
+                // Use 4-parameter window_init for single chunk (no ping-pong)
+                for (size_t i = 0; i < params.size(); i++) {
+                    auto paramName = params[i].getwinparamname();
+                    std::string wfunc = (i == 0) ? "get_input_async_window_int32" : "get_output_async_window_int32";
+                    std::string wtypedef = (i == 0) ? "input_window_int32" : "output_window_int32";
+
+                    code += "\t// Initialize window for " + paramName + " (4-parameter version)\n";
+                    code += "\twindow_internal window_" + paramName + "[1];\n";
+                    code += "\twindow_init(window_" + paramName + ", 1, ";
+                    code += paramName + "_buf, CHUNK_SIZE, CHUNK_SIZE);\n";
+                    code += "\t" + wtypedef + "* " + paramName + "_ptr = " + wfunc + "(window_" + paramName + ");\n\n";
+                }
+            }
+
+            // Index for ping-pong switching (only needed for multi-chunk)
+            if (num_chunks > 1) {
+                code += "\t// Index for ping-pong switching\n";
+                code += "\tint32 index = 1;\n\n";
+            }
+
+            // Generate streaming loop
+            code += "\t// Process data in chunks\n";
+            code += "\tfor (int chunk = 0; chunk < NUM_CHUNKS; chunk++) {\n";
+
+            // Acquire windows before kernel call
+            code += "\t\t// Acquire windows for this iteration\n";
+            for (size_t i = 0; i < params.size(); i++) {
+                auto paramName = params[i].getwinparamname();
+                code += "\t\twindow_acquire(window_" + paramName + ");\n";
+            }
+            code += "\n";
+
+            // Kernel call
+            code += "\t\t// Kernel call\n";
+            code += "\t\t" + kernel_name + "(";
+            for (size_t i = 0; i < params.size(); i++) {
+                code += params[i].getwinparamname() + "_ptr";
+                code += (i < params.size() - 1) ? ", " : "";
+            }
+            code += ");\n\n";
+
+            // Release windows after kernel call
+            code += "\t\t// Release windows after processing\n";
+            for (int i = params.size() - 1; i >= 0; i--) {
+                auto paramName = params[i].getwinparamname();
+                code += "\t\twindow_release(window_" + paramName + ");\n";
+            }
+            code += "\n";
+
+            // Toggle index (only for multi-chunk)
+            if (num_chunks > 1) {
+                code += "\t\t// Toggle index for next iteration\n";
+                code += "\t\tindex = 1 - index;\n\n";
+            }
+
+            // Memory fence
+            code += "\t\t// Memory fence to ensure operations complete\n";
+            code += "\t\tchess_memory_fence();\n";
+            code += "\t}\n\n";
+
+            code += "\tdone();\n";
+            code += "\treturn 0;\n";
+            code += "}";
+
+            return code;
+        }
 };
 
 

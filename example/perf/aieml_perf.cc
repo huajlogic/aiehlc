@@ -56,8 +56,8 @@
 #define MAT_SIZE 256 // Size of each matrix (A and B)
 #define N 16         // Dimension of the square matrices (16x16)
 
-//#define DISABLE_CACHE
-
+// #define DISABLE_CACHE
+//__attribute__((annotate("streaming")))
 __global__ void perf(input_window_int32 * win __attribute__((annotate("mem_address:0x1000"), annotate("size_hint:512"))),
         output_window_int32 *out __attribute__((annotate("mem_address:0x6000"), annotate("size_hint:512")))) {
 #define DATA_SIZE 512 
@@ -107,9 +107,9 @@ int test_routing(XAie_DevInst *DevInst)
 	AieRC RC = XAIE_OK;
 	XAie_RoutingInstance* routingInstance;
   	//XTime tStart, tEnd;
-	breakprint("core reset");
-	int shimcol = 33;
-	XAie_CoreReset(DevInst, XAie_TileLoc(4,4));
+    breakprint("core reset--");
+    int shimcol = 10; // 33;
+    XAie_CoreReset(DevInst, XAie_TileLoc(4,4));
 	XAie_CoreUnreset(DevInst, XAie_TileLoc(4,4));
 	XAie_LoadElfMem(DevInst, XAie_TileLoc(4,4), (unsigned char *)perf);
 
@@ -277,16 +277,16 @@ int main(int argc, char* argv[]) {
 	int colnum = (startcol + partitonnum <= XAIE_NUM_COLS) ? partitonnum : (XAIE_NUM_COLS- startcol);
 
 	AieRC RC;
-	///*
-    RC = XAie_SetupPartitionConfig(&DevInst, XAIE_BASE_ADDR + (startcol<<XAIE_COL_SHIFT), 
+    /*
+    RC = XAie_SetupPartitionConfig(&DevInst, XAIE_BASE_ADDR + (startcol<<XAIE_COL_SHIFT),
                                        startcol, colnum);
-	if(RC != XAIE_OK) {
-		printf("Driver XAie_SetupPartitionConfig failed.\n");
-		return -1;
-	}
-		//*/
+    if(RC != XAIE_OK) {
+        printf("Driver XAie_SetupPartitionConfig failed.\n");
+        return -1;
+    }
+        //*/
 
-	RC = XAie_CfgInitialize(&DevInst, &ConfigPtr);
+    RC = XAie_CfgInitialize(&DevInst, &ConfigPtr);
 	if(RC != XAIE_OK) {
 		printf("Driver initialization failed.\n");
 		return -1;

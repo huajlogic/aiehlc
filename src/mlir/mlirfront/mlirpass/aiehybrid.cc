@@ -129,7 +129,20 @@ void HybridPass::runOnOperation() {
 		wrap.addkernelfuncparams(kfuncparams);
 		wrap.set_kernel_in_param_type(in_param_type);
 		wrap.set_kernel_out_param_type(out_param_type);
-		wrap.exportfile();
+
+        // Check for streaming attributes
+        if (auto streamingEnabled = kop->getAttrOfType<mlir::BoolAttr>("streaming_enabled")) {
+            if (streamingEnabled.getValue()) {
+                llvm::outs() << "Enabling streaming mode for wrapper generation\n";
+                auto chunkSize = kop->getAttrOfType<mlir::IntegerAttr>("streaming_chunk_size");
+                auto numChunks = kop->getAttrOfType<mlir::IntegerAttr>("streaming_num_chunks");
+                if (chunkSize && numChunks) {
+                    wrap.enableStreaming(chunkSize.getInt(), numChunks.getInt());
+                }
+            }
+        }
+
+        wrap.exportfile();
 		llvm::outs() << "Exported files for " << kname << "\n";
 	}
 }
