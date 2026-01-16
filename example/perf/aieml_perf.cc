@@ -108,7 +108,11 @@ int test_routing(XAie_DevInst *DevInst)
 	XAie_RoutingInstance* routingInstance;
   	//XTime tStart, tEnd;
     breakprint("core reset--");
+#if AIE_GEN == XAIE_DEV_GEN_AIE2PS
     int shimcol = 10; // 33;
+#else
+    int shimcol = 33;
+#endif
     XAie_CoreReset(DevInst, XAie_TileLoc(4,4));
 	XAie_CoreUnreset(DevInst, XAie_TileLoc(4,4));
 	XAie_LoadElfMem(DevInst, XAie_TileLoc(4,4), (unsigned char *)perf);
