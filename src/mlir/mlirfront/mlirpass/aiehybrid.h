@@ -330,8 +330,11 @@ public:
 			return code;
 		}
 
+        std::string getPingName() const { return pingName; }
+        std::string getPongName() const { return pongName; }
+        uint32_t getDirection() const { return wtype; }
 
-		std::string getbufdeclare() {
+        std::string getbufdeclare() {
 			std::string code;
 			code = "v4int32 " + pingName +"[BUF_SZ];\n";
 			code += "v4int32 " + pongName +"[BUF_SZ];\n";
@@ -486,17 +489,19 @@ private:
             // Generate lock definitions (2 locks per parameter: PRD and CNS)
             int lockId = 16; // Start from lock ID 16
             for (size_t i = 0; i < params.size(); i++) {
-                auto paramName = params[i].getwinparamname();
-                code += "#define LOCK_" + paramName + "_PRD " + std::to_string(lockId++) + "\n";
-                code += "#define LOCK_" + paramName + "_CNS " + std::to_string(lockId++) + "\n";
+                auto pingName = params[i].getPingName();
+                auto pongName = params[i].getPongName();
+                code += "#define LOCK_" + pingName + "_PRD " + std::to_string(lockId++) + "\n";
+                code += "#define LOCK_" + pongName + "_CNS " + std::to_string(lockId++) + "\n";
             }
             code += "\n";
 
-            // Generate ping-pong buffer declarations (2 buffers per parameter)
-            for (auto x : params) {
-                auto paramName = x.getwinparamname();
-                code += "v4int32 " + paramName + "_ping[BUF_SZ];\n";
-                code += "v4int32 " + paramName + "_pong[BUF_SZ];\n";
+            // Generate ping-pong buffer declarations (use actual ping/pong names from BCF)
+            for (auto &x : params) {
+                auto pingName = x.getPingName();
+                auto pongName = x.getPongName();
+                code += "v4int32 " + pingName + "[BUF_SZ];\n";
+                code += "v4int32 " + pongName + "[BUF_SZ];\n";
             }
             code += "\n";
 
@@ -506,16 +511,19 @@ private:
 
             // Use 8-parameter window_init to associate buffers with locks
             for (size_t i = 0; i < params.size(); i++) {
-                auto paramName = params[i].getwinparamname();
-                std::string wfunc = (i == 0) ? "get_input_async_window_int32" : "get_output_async_window_int32";
-                std::string wtypedef = (i == 0) ? "input_window_int32" : "output_window_int32";
+                auto pingName = params[i].getPingName();
+                auto pongName = params[i].getPongName();
+                auto baseName = params[i].getwinparamname();
+                std::string wfunc =
+                    (params[i].getDirection() == 0) ? "get_input_async_window_int32" : "get_output_async_window_int32";
+                std::string wtypedef = (params[i].getDirection() == 0) ? "input_window_int32" : "output_window_int32";
 
-                code += "\twindow_internal window_" + paramName + "[1];\n";
-                code += "\twindow_init(window_" + paramName + ", 1, ";
-                code += paramName + "_ping, LOCK_" + paramName + "_PRD, ";
-                code += paramName + "_pong, LOCK_" + paramName + "_CNS, ";
+                code += "\twindow_internal window_" + baseName + "[1];\n";
+                code += "\twindow_init(window_" + baseName + ", 1, ";
+                code += pingName + ", LOCK_" + pingName + "_PRD, ";
+                code += pongName + ", LOCK_" + pongName + "_CNS, ";
                 code += "BUF_SZ, BUF_SZ);\n";
-                code += "\t" + wtypedef + "* " + paramName + "_ptr = " + wfunc + "(window_" + paramName + ");\n\n";
+                code += "\t" + wtypedef + "* " + baseName + "_ptr = " + wfunc + "(window_" + baseName + ");\n\n";
             }
 
             // Call kernel (window_acquire/release handled inside kernel)
