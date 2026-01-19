@@ -351,8 +351,9 @@ while IFS= read -r kernel_source_file; do
 
     if [[ "$use_llvm_aie" != "true" ]]; then
         echo "Compiling Kernel (using chess): $kernel_source_file"
-
+        set -x
         xchesscc $compiler_flags_chess -o "${KERNEL_BUILD_DIR}/kernel_orig.ll" "$KERNEL_SRC/wrapper.cc"
+        set +x
         
         run_cmd "$XILINX_VITIS_AIETOOLS/lnx64.o/tools/clang/bin/opt -S -load-pass-plugin="$XILINX_VITIS_AIETOOLS/lib/lnx64.o/libLLVMXLOpt.so" -passes=xlopt "${KERNEL_BUILD_DIR}/kernel_orig.ll" -o "${KERNEL_BUILD_DIR}/kernel.ll""
         run_cmd "$XILINX_VITIS_AIETOOLS/lnx64.o/tools/clang/bin/opt -S -load-pass-plugin="$XILINX_VITIS_AIETOOLS/lib/lnx64.o/libLLVMXLOpt.so" -passes=xlopt "${KERNEL_BUILD_DIR}/kernel.ll" -o "${KERNEL_BUILD_DIR}/kernel.ll""

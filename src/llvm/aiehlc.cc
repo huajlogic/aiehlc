@@ -590,11 +590,17 @@ public:
 				}
 				//ret = "#include <stdio.h>\n";
 				//ret += "#include \"adf.h\"\n";
-				// if(use_llvm_aie) {
-				// 	ret += "typedef int input_window_int32;\n";
-				// 	ret += "typedef int output_window_int32;\n";
-				// }
-				///*
+
+                // Add stub declarations for AIE-specific functions that may be missing
+                // Types are already defined in adf headers, only add function stubs
+                ret += "// Stub declarations for AIE kernel functions (for Clang parsing only)\n";
+                ret += "#ifndef AIEHLC_STUBS_DEFINED\n";
+                ret += "#define AIEHLC_STUBS_DEFINED\n";
+                ret += "template<typename T> inline void window_acquire(T*) {}\n";
+                ret += "template<typename T> inline void window_release(T*) {}\n";
+                ret += "#endif\n\n";
+
+                ///*
 				for (auto x:kernel_name_list) {
 					ret += "template <int Col, int Row, int colstart, int rowstart,int M, int N, int K, typename... Args> \
  									    inline void "+ x +"(Args&&... args) { \

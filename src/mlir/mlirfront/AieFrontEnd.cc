@@ -398,11 +398,9 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rew
     mlir::aie::CreateKernelObjectOp kernelObject = mbuilder.create<mlir::aie::CreateKernelObjectOp>(
             mbuilder.getUnknownLoc(), result_type, numInputArgs, numOutputArgs, kname,fname, window_types[0], window_types[1], windowOps);
 
-    // Add streaming attributes if enabled
+    // Add streaming attributes if enabled (buffer size comes from size_hint annotation)
     if (isStreaming) {
         kernelObject->setAttr("streaming_enabled", mbuilder.getBoolAttr(true));
-        kernelObject->setAttr("streaming_chunk_size", mbuilder.getI32IntegerAttr(1024));
-        kernelObject->setAttr("streaming_num_chunks", mbuilder.getI32IntegerAttr(4));
     }
 
     kernelfunctionToKernelObjectMap[f->getName().str()] = kernelObject;

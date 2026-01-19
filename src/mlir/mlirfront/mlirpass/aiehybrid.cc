@@ -134,11 +134,7 @@ void HybridPass::runOnOperation() {
         if (auto streamingEnabled = kop->getAttrOfType<mlir::BoolAttr>("streaming_enabled")) {
             if (streamingEnabled.getValue()) {
                 llvm::outs() << "Enabling streaming mode for wrapper generation\n";
-                auto chunkSize = kop->getAttrOfType<mlir::IntegerAttr>("streaming_chunk_size");
-                auto numChunks = kop->getAttrOfType<mlir::IntegerAttr>("streaming_num_chunks");
-                if (chunkSize && numChunks) {
-                    wrap.enableStreaming(chunkSize.getInt(), numChunks.getInt());
-                }
+                wrap.enableStreaming();
             }
         }
 
