@@ -76,7 +76,9 @@ void HybridPass::runOnOperation() {
 			auto pongaddr = window.getPongaddr();
 			auto direct = window.getDirection();
 			auto wname = window.getName().str();
-			std::cout << wname << std::endl;
+            auto acquireLockId = window.getPinglockid(); // MLIR uses pinglockid for acquire
+            auto releaseLockId = window.getPonglockid(); // MLIR uses ponglockid for release
+            std::cout << wname << std::endl;
             std::ostringstream ostr;
 
             // Check if this is ping-pong mode (pongaddr != 0) or legacy single buffer mode
@@ -93,13 +95,13 @@ void HybridPass::runOnOperation() {
                 auto wpong = ostr.str();
                 bcf.addsymbols(ostr.str(), 0x70000 + window.getPongaddr());
 
-                kfuncparams.push_back(Buffer(direct, wping, wpong, pingaddr, pongaddr));
+                kfuncparams.push_back(Buffer(direct, wping, wpong, pingaddr, pongaddr, acquireLockId, releaseLockId));
                 max_pingpong_size = std::max(max_pingpong_size, (uint32_t)(pongaddr - pingaddr));
             } else {
                 // Legacy single buffer mode: just use the window name (no suffix)
                 bcf.addsymbols(wname, 0x70000 + window.getPingaddr());
                 // Use pingaddr for both ping and pong names (pong won't be used)
-                kfuncparams.push_back(Buffer(direct, wname, wname, pingaddr, 0));
+                kfuncparams.push_back(Buffer(direct, wname, wname, pingaddr, 0, acquireLockId, releaseLockId));
             }
         }
 

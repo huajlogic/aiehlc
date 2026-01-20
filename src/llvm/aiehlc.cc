@@ -591,8 +591,9 @@ public:
 				//ret = "#include <stdio.h>\n";
 				//ret += "#include \"adf.h\"\n";
 
-                // Add stub declarations for AIE-specific functions that may be missing
-                // Types are already defined in adf headers, only add function stubs
+                // Add stub declarations for AIE-specific functions that clang can't find
+                // (because __AIENGINE__ isn't defined, so adf.h uses different code paths)
+                // These stubs allow parsing to succeed; actual AIE compiler uses real headers
                 ret += "// Stub declarations for AIE kernel functions (for Clang parsing only)\n";
                 ret += "#ifndef AIEHLC_STUBS_DEFINED\n";
                 ret += "#define AIEHLC_STUBS_DEFINED\n";

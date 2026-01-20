@@ -311,8 +311,10 @@ public:
 */
 class Buffer {
 public:
-  Buffer(uint32_t type, std::string piName, std::string poName, uint32_t pingAddr = 0, uint32_t pongAddr = 0)
-      : wtype(type), pingName(piName), pongName(poName), pingAddress(pingAddr), pongAddress(pongAddr) {
+  Buffer(uint32_t type, std::string piName, std::string poName, uint32_t pingAddr = 0, uint32_t pongAddr = 0,
+         int32_t acquireLock = -1, int32_t releaseLock = -1)
+      : wtype(type), pingName(piName), pongName(poName), pingAddress(pingAddr), pongAddress(pongAddr),
+        acquireLockId(acquireLock), releaseLockId(releaseLock) {
       window_type = std::string((wtype == 0 ? "input_window_int32" : "output_window_int32"));
       window_getfunc = std::string((wtype == 0 ? "get_input_async_window_int32" : "get_output_async_window_int32"));
   }
@@ -334,8 +336,12 @@ public:
         uint32_t getDirection() const { return wtype; }
         uint32_t getPingAddress() const { return pingAddress; }
         uint32_t getPongAddress() const { return pongAddress; }
+        int32_t getAcquireLockId() const { return acquireLockId; }
+        int32_t getReleaseLockId() const { return releaseLockId; }
         // Returns true if this is ping-pong mode (pongAddress != 0)
         bool isPingPong() const { return pongAddress != 0; }
+        // Returns true if lock IDs are explicitly set
+        bool hasExplicitLockIds() const { return acquireLockId >= 0 && releaseLockId >= 0; }
 
         std::string getbufdeclare() {
 			std::string code;
@@ -369,6 +375,8 @@ private:
 		std::string pongName;
         uint32_t pingAddress;
         uint32_t pongAddress;
+        int32_t acquireLockId;
+        int32_t releaseLockId;
 
         std::string window_type;
         std::string window_getfunc;
@@ -502,18 +510,22 @@ private:
             code += "#include <adf/sync/mesync.h>\n\n";
 
             // Generate lock definitions
-            // For ping-pong mode: 2 locks per parameter (PRD and CNS)
+            // For ping-pong mode: 2 locks per parameter (ACQ and REL)
             // For single buffer mode: 1 lock per parameter
-            int lockId = 16; // Start from lock ID 16
+            int autoLockId = 16; // Start from lock ID 16 for auto-assignment
             for (size_t i = 0; i < params.size(); i++) {
                 auto pingName = params[i].getPingName();
                 if (params[i].isPingPong()) {
                     auto pongName = params[i].getPongName();
-                    code += "#define LOCK_" + pingName + "_PRD " + std::to_string(lockId++) + "\n";
-                    code += "#define LOCK_" + pongName + "_CNS " + std::to_string(lockId++) + "\n";
+                    // Use explicit lock IDs if set, otherwise auto-increment
+                    int acquireLock = params[i].hasExplicitLockIds() ? params[i].getAcquireLockId() : autoLockId++;
+                    int releaseLock = params[i].hasExplicitLockIds() ? params[i].getReleaseLockId() : autoLockId++;
+                    code += "#define LOCK_" + pingName + "_ACQ " + std::to_string(acquireLock) + "\n";
+                    code += "#define LOCK_" + pongName + "_REL " + std::to_string(releaseLock) + "\n";
                 } else {
                     // Legacy single buffer mode: one lock
-                    code += "#define LOCK_" + pingName + " " + std::to_string(lockId++) + "\n";
+                    int lock = params[i].hasExplicitLockIds() ? params[i].getAcquireLockId() : autoLockId++;
+                    code += "#define LOCK_" + pingName + " " + std::to_string(lock) + "\n";
                 }
             }
             code += "\n";
@@ -544,8 +556,8 @@ private:
                     // Ping-pong mode: 8-parameter window_init
                     auto pongName = params[i].getPongName();
                     code += "\twindow_init(window_" + baseName + ", 1, ";
-                    code += pingName + ", LOCK_" + pingName + "_PRD, ";
-                    code += pongName + ", LOCK_" + pongName + "_CNS, ";
+                    code += pingName + ", LOCK_" + pingName + "_ACQ, ";
+                    code += pongName + ", LOCK_" + pongName + "_REL, ";
                     code += "BUF_SZ, BUF_SZ);\n";
                 } else {
                     // Legacy single buffer mode: 5-parameter window_init

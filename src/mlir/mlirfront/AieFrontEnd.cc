@@ -319,6 +319,8 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rew
     int32_t paramNum = f->getNumParams();
     uint32_t setpingaddress = 0;
     uint32_t setpongaddress = 0;
+    int32_t setpingLockID = -1;  // -1 means not explicitly set
+    int32_t setpongLockID = -1;  // -1 means not explicitly set
     bool isPingPongMode = false; // True if both mem_ping_address and mem_pong_address are explicitly set
 
     auto kname = createKernelFuncName(mbuilder, kernelFuncName);
@@ -333,6 +335,8 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rew
         int defaultSize = 512;
         setpingaddress = 0;
         setpongaddress = 0;
+        setpingLockID = -1;
+        setpongLockID = -1;
         //get the windows size
         auto getvalue = [&](std::string str) {
                     std::istringstream istr(str);
@@ -369,8 +373,23 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rew
                     auto nstr = getvalue(annotation);
                     setpingaddress = stol(nstr, nullptr, 0);
                     pingaddress = setpingaddress ? setpingaddress : pingaddress;
+                } else if (annotation.find("lock_acquire_id") != std::string::npos) {
+                    // Explicit acquire lock ID
+                    auto nstr = getvalue(annotation);
+                    setpingLockID = stol(nstr, nullptr, 0);
+                } else if (annotation.find("lock_release_id") != std::string::npos) {
+                    // Explicit release lock ID
+                    auto nstr = getvalue(annotation);
+                    setpongLockID = stol(nstr, nullptr, 0);
                 }
             }
+        }
+        // Apply explicit lock IDs if set
+        if (setpingLockID >= 0) {
+            pingLockID = setpingLockID;
+        }
+        if (setpongLockID >= 0) {
+            pongLockID = setpongLockID;
         }
         // Set ping-pong mode if both addresses are explicitly provided
         if (hasPingAddress && hasPongAddress) {
