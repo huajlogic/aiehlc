@@ -313,10 +313,13 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rew
     int numInputArgs = 0; // Placeholder: calculate based on function's input
     int numOutputArgs = 0; // Placeholder: calculate based on function's output
     int64_t pingaddress = 0x1000; //start address
+    int64_t pongaddress = 0x1100; // default pong address
     int32_t pingLockID = 0;
     int32_t pongLockID = 1;
     int32_t paramNum = f->getNumParams();
     uint32_t setpingaddress = 0;
+    uint32_t setpongaddress = 0;
+    bool isPingPongMode = false; // True if both mem_ping_address and mem_pong_address are explicitly set
 
     auto kname = createKernelFuncName(mbuilder, kernelFuncName);
     auto fname = createKernelFileName(mbuilder, "./" + kernelFuncName + ".c");
@@ -328,6 +331,8 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rew
         //xchess seems have a logic issue, we need to reserve 4 time large buffer
         //for 512 that means the local buffer is 32 int32 length
         int defaultSize = 512;
+        setpingaddress = 0;
+        setpongaddress = 0;
         //get the windows size
         auto getvalue = [&](std::string str) {
                     std::istringstream istr(str);
@@ -336,6 +341,8 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rew
                     istr >> tmp;
                     return tmp;
         };
+        bool hasPingAddress = false;
+        bool hasPongAddress = false;
         for (auto attr: param->attrs()) {
             if (attr->getKind() == clang::attr::Kind::Annotate) {
                 auto annotateAttr= static_cast<clang::AnnotateAttr*>(attr);
@@ -343,19 +350,45 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rew
                 if (annotation.find("size_hint") != std::string::npos) {
                     int csize = 0;
                     auto nstr = getvalue(annotation);
-                     csize = stol(nstr, nullptr, 0);
+                    csize = stol(nstr, nullptr, 0);
                     defaultSize = csize ? csize : defaultSize;
+                } else if (annotation.find("mem_ping_address") != std::string::npos) {
+                    // New: explicit ping address
+                    auto nstr = getvalue(annotation);
+                    setpingaddress = stol(nstr, nullptr, 0);
+                    pingaddress = setpingaddress ? setpingaddress : pingaddress;
+                    hasPingAddress = true;
+                } else if (annotation.find("mem_pong_address") != std::string::npos) {
+                    // New: explicit pong address
+                    auto nstr = getvalue(annotation);
+                    setpongaddress = stol(nstr, nullptr, 0);
+                    pongaddress = setpongaddress ? setpongaddress : pongaddress;
+                    hasPongAddress = true;
                 } else if (annotation.find("mem_address") != std::string::npos) {
+                    // Legacy: single address, no ping-pong
                     auto nstr = getvalue(annotation);
                     setpingaddress = stol(nstr, nullptr, 0);
                     pingaddress = setpingaddress ? setpingaddress : pingaddress;
                 }
             }
         }
+        // Set ping-pong mode if both addresses are explicitly provided
+        if (hasPingAddress && hasPongAddress) {
+            isPingPongMode = true;
+        }
         //the xchess have a logic to ask 4 time space to storage the data, not sure whether that is bug
         //enclose is a workground to handle compile complain
         defaultSize = defaultSize * 4;
-        int64_t pongaddress = pingaddress  + defaultSize *sizeof(int);
+        // If ping-pong mode, calculate pong address if not explicitly set
+        // In legacy mode (single buffer), set pong address to 0 to indicate no pong buffer
+        if (isPingPongMode) {
+            if (!setpongaddress) {
+                pongaddress = pingaddress + defaultSize * sizeof(int);
+            }
+        } else {
+            // Legacy single buffer mode - no pong buffer
+            pongaddress = 0;
+        }
         auto windowOp = createKernelWindowOp(param,
                                             kernelFuncName,
                                             mbuilder,

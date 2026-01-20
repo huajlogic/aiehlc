@@ -166,13 +166,24 @@ rm -rf $KERNEL_DIR
 XILINX_VITIS_AIETOOLS=$XILINX_VITIS/aietools
 CARDANO_AIE_ARCH_MODEL_DIR="$XILINX_VITIS_AIETOOLS/data/versal_prod/lib"
 
+# Check if local thirdparty/alib/include has xaiengine headers
+LOCAL_ALIB_INCLUDE="${AIEHLC_DIR}/thirdparty/alib/include"
+echo "Local include directory: ${LOCAL_ALIB_INCLUDE}"
+if [ -d "${LOCAL_ALIB_INCLUDE}/xaiengine" ] && [ "$(ls -A ${LOCAL_ALIB_INCLUDE}/xaiengine 2>/dev/null)" ]; then
+    echo "Using local aie-rt headers from ${LOCAL_ALIB_INCLUDE}"
+    AIETOOLS_INCLUDE_BASE="${LOCAL_ALIB_INCLUDE}"
+else
+    echo "Using Vitis aie-rt headers from $XILINX_VITIS_AIETOOLS//include/drivers/aiengine"
+    AIETOOLS_INCLUDE_BASE="$XILINX_VITIS_AIETOOLS//include/drivers/aiengine"
+fi
+
 INCLUDE_PATH="-I$XILINX_VITIS_AIETOOLS/include \
 -I$XILINX_VITIS_AIETOOLS//include/aie_api \
--I$XILINX_VITIS_AIETOOLS//include/drivers/aiengine"
+-I$AIETOOLS_INCLUDE_BASE"
 
 LLVM_AIE_INCLUDE_PATH="-I$XILINX_VITIS_AIETOOLS/include \
 -I$XILINX_VITIS_AIETOOLS//include/aie_api \
--I$XILINX_VITIS_AIETOOLS//include/drivers/aiengine \
+-I$AIETOOLS_INCLUDE_BASE \
 "
 LLVM_AIE_LIB_PATH="-Wl,-L$XILINX_VITIS_AIETOOLS/data/aie_ml/lib/Release"
 
@@ -314,18 +325,21 @@ dbg_echo $BAREMETAL_AIENGINE_INCLUDE
 echo -e "\nStarting Merged File Compilation..."
 echo -e "    ${runtime_source_file}\n"
 #Convert the host&kernel merged source code
+set -x
 if [[ "$use_llvm_aie" == "true" ]]; then
     "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" --use-llvm-aie --extra-arg="-DAIE_GEN=${aie_version}" \
-        --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
+        --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
+        --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
         --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
         --extra-arg="-include"aie_compat.h"" ${runtime_source_file} --
 else
     "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" --extra-arg="-DAIE_GEN=${aie_version}" \
-        --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
+        --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
+        --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
         --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
         --extra-arg="-include"aie_compat.h"" ${runtime_source_file} --
 fi
-
+set +x
 HOST_BUILD_DIR=$(pwd)/aout/
 mkdir -p $HOST_BUILD_DIR
 
@@ -399,16 +413,16 @@ echo "    $host_file"
 echo "Linking kernels..."
 echo "    ${temp_obj_files[@]}"
 if [[ "$platform" == "baremetal" ]]; then
-    dbg_echo ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I$AIE_DRIVER_PARENT_DIR/include/ -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
-    ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I$AIE_DRIVER_PARENT_DIR/include/ -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
+    dbg_echo ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
+    ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
 elif [[ "$platform" == "linux" ]]; then
     dbg_echo ${TOOL_PREFIX}g++ -Os -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
-        -I${AIE_DRIVER_DIR}/include -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I$AIE_DRIVER_PARENT_DIR/include/ \
+        -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I${AIE_DRIVER_DIR}/include -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC \
         -L${AIE_DRIVER_DIR}/src -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -L$AIE_DRIVER_PARENT_DIR/aie-rt/driver/src/ \
         -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} \
         -Wl,--start-group,-lxaiengine,-lxil,--end-group
     ${TOOL_PREFIX}g++ -Os -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
-        -I${AIE_DRIVER_DIR}/include -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I$AIE_DRIVER_PARENT_DIR/include/ \
+        -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I${AIE_DRIVER_DIR}/include -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC \
         -L${AIE_DRIVER_DIR}/src -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -L$AIE_DRIVER_PARENT_DIR/aie-rt/driver/src/  \
         -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} \
         -Wl,--start-group,-lxaiengine,-lxil,--end-group

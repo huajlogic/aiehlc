@@ -311,20 +311,19 @@ public:
 */
 class Buffer {
 public:
-		Buffer(uint32_t type, std::string piName, std::string poName):
-			wtype(type), pingName(piName), pongName(poName) {
-			window_type = std::string((wtype == 0 ? "input_window_int32":"output_window_int32")) ;
-			window_getfunc = std::string((wtype == 0 ? "get_input_async_window_int32":"get_output_async_window_int32"));
+  Buffer(uint32_t type, std::string piName, std::string poName, uint32_t pingAddr = 0, uint32_t pongAddr = 0)
+      : wtype(type), pingName(piName), pongName(poName), pingAddress(pingAddr), pongAddress(pongAddr) {
+      window_type = std::string((wtype == 0 ? "input_window_int32" : "output_window_int32"));
+      window_getfunc = std::string((wtype == 0 ? "get_input_async_window_int32" : "get_output_async_window_int32"));
+  }
 
-		}
+  std::string getwinparamname() {
+      std::string code("");
+      code += pingName;
+      return code;
+  }
 
-		std::string getwinparamname() {
-			std::string code("");
-			code += pingName;
-			return code;
-		}
-
-		std::string getwinpointername() {
+        std::string getwinpointername() {
 			std::string code("");
 			code += pingName+std::string("_win_ptr");
 			return code;
@@ -333,30 +332,46 @@ public:
         std::string getPingName() const { return pingName; }
         std::string getPongName() const { return pongName; }
         uint32_t getDirection() const { return wtype; }
+        uint32_t getPingAddress() const { return pingAddress; }
+        uint32_t getPongAddress() const { return pongAddress; }
+        // Returns true if this is ping-pong mode (pongAddress != 0)
+        bool isPingPong() const { return pongAddress != 0; }
 
         std::string getbufdeclare() {
 			std::string code;
 			code = "v4int32 " + pingName +"[BUF_SZ];\n";
-			code += "v4int32 " + pongName +"[BUF_SZ];\n";
-			return code;
-		}
+            // Only declare pong buffer in ping-pong mode
+            if (isPingPong()) {
+                code += "v4int32 " + pongName + "[BUF_SZ];\n";
+            }
+            return code;
+        }
 
 		std::string getbufdefine() {
 			std::string code;
 			auto internal_win = getwinintername();
 			code = "\twindow_internal " + internal_win + "[1];\n";
-			code += "\twindow_init(" + internal_win + ",1," + pingName + "," + "BUF_SZ, BUF_SZ);\n"; 
-			auto paramname = getwinpointername();
-			code += "\t" + window_type + "*  " + paramname + " = " + window_getfunc + "(" + internal_win + ");\n";
+            if (isPingPong()) {
+                // Ping-pong mode: 8-parameter window_init
+                code += "\twindow_init(" + internal_win + ",1," + pingName + "," + pongName +
+                        ",BUF_SZ,BUF_SZ,BUF_SZ,BUF_SZ);\n";
+            } else {
+                // Legacy single buffer mode: 5-parameter window_init
+                code += "\twindow_init(" + internal_win + ",1," + pingName + "," + "BUF_SZ, BUF_SZ);\n";
+            }
+            auto paramname = getwinpointername();
+            code += "\t" + window_type + "*  " + paramname + " = " + window_getfunc + "(" + internal_win + ");\n";
 			return code;
 		}
 private:
 		uint32_t wtype;
 		std::string pingName;
 		std::string pongName;
+        uint32_t pingAddress;
+        uint32_t pongAddress;
 
-		std::string window_type;
-		std::string window_getfunc;
+        std::string window_type;
+        std::string window_getfunc;
 
 		std::string getwinintername() {
 			std::string code;
@@ -486,22 +501,26 @@ private:
             code += "volatile static int sync_buffer[8] = {0, -1};\n\n";
             code += "#include <adf/sync/mesync.h>\n\n";
 
-            // Generate lock definitions (2 locks per parameter: PRD and CNS)
+            // Generate lock definitions
+            // For ping-pong mode: 2 locks per parameter (PRD and CNS)
+            // For single buffer mode: 1 lock per parameter
             int lockId = 16; // Start from lock ID 16
             for (size_t i = 0; i < params.size(); i++) {
                 auto pingName = params[i].getPingName();
-                auto pongName = params[i].getPongName();
-                code += "#define LOCK_" + pingName + "_PRD " + std::to_string(lockId++) + "\n";
-                code += "#define LOCK_" + pongName + "_CNS " + std::to_string(lockId++) + "\n";
+                if (params[i].isPingPong()) {
+                    auto pongName = params[i].getPongName();
+                    code += "#define LOCK_" + pingName + "_PRD " + std::to_string(lockId++) + "\n";
+                    code += "#define LOCK_" + pongName + "_CNS " + std::to_string(lockId++) + "\n";
+                } else {
+                    // Legacy single buffer mode: one lock
+                    code += "#define LOCK_" + pingName + " " + std::to_string(lockId++) + "\n";
+                }
             }
             code += "\n";
 
-            // Generate ping-pong buffer declarations (use actual ping/pong names from BCF)
+            // Generate buffer declarations (uses getbufdeclare which handles both modes)
             for (auto &x : params) {
-                auto pingName = x.getPingName();
-                auto pongName = x.getPongName();
-                code += "v4int32 " + pingName + "[BUF_SZ];\n";
-                code += "v4int32 " + pongName + "[BUF_SZ];\n";
+                code += x.getbufdeclare();
             }
             code += "\n";
 
@@ -509,20 +528,30 @@ private:
             code += "\nint main(void) {\n";
             code += "\tsync_buffer[0] = 0; // reset end signal\n\n";
 
-            // Use 8-parameter window_init to associate buffers with locks
+            // window_init for each parameter
+            // Ping-pong mode: 8-parameter window_init with locks
+            // Single buffer mode: 5-parameter window_init
             for (size_t i = 0; i < params.size(); i++) {
                 auto pingName = params[i].getPingName();
-                auto pongName = params[i].getPongName();
                 auto baseName = params[i].getwinparamname();
                 std::string wfunc =
                     (params[i].getDirection() == 0) ? "get_input_async_window_int32" : "get_output_async_window_int32";
                 std::string wtypedef = (params[i].getDirection() == 0) ? "input_window_int32" : "output_window_int32";
 
                 code += "\twindow_internal window_" + baseName + "[1];\n";
-                code += "\twindow_init(window_" + baseName + ", 1, ";
-                code += pingName + ", LOCK_" + pingName + "_PRD, ";
-                code += pongName + ", LOCK_" + pongName + "_CNS, ";
-                code += "BUF_SZ, BUF_SZ);\n";
+
+                if (params[i].isPingPong()) {
+                    // Ping-pong mode: 8-parameter window_init
+                    auto pongName = params[i].getPongName();
+                    code += "\twindow_init(window_" + baseName + ", 1, ";
+                    code += pingName + ", LOCK_" + pingName + "_PRD, ";
+                    code += pongName + ", LOCK_" + pongName + "_CNS, ";
+                    code += "BUF_SZ, BUF_SZ);\n";
+                } else {
+                    // Legacy single buffer mode: 5-parameter window_init
+                    code += "\twindow_init(window_" + baseName + ", 1, ";
+                    code += pingName + ", BUF_SZ, BUF_SZ);\n";
+                }
                 code += "\t" + wtypedef + "* " + baseName + "_ptr = " + wfunc + "(window_" + baseName + ");\n\n";
             }
 

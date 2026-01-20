@@ -145,6 +145,21 @@ export CLANG_INCLUDE_PATH="${XILINX_VITIS}/gnu/aarch64/lin/aarch64-none/x86_64-o
 export LLVM_INSTALL_DIR=/Users/hua/src/dsamlir/thirdparty/llvm-project/build/
 
 if [ "$SKIP_BSP" -eq 0 ]; then
+    # Clean thirdparty/alib/ when using default BSP generation (not git repo)
+    # This ensures we use Vitis-provided aie-rt headers, not git-cloned ones
+    if [ -d "${AIE_DRIVER_PARENT_DIR}/aie-rt" ]; then
+        echo "Cleaning thirdparty/alib/aie-rt directory for default BSP setup..."
+        rm -rf "${AIE_DRIVER_PARENT_DIR}/aie-rt"
+    fi
+    if [ -d "${AIE_DRIVER_PARENT_DIR}/include/" ]; then
+        echo "Cleaning thirdparty/alib/include/ directory..."
+        rm -rf "${AIE_DRIVER_PARENT_DIR}/include/"
+    fi
+    if [ -d "${AIE_DRIVER_PARENT_DIR}/lib" ] && [ "$(ls -A ${AIE_DRIVER_PARENT_DIR}/lib 2>/dev/null)" ]; then
+        echo "Cleaning thirdparty/alib/lib directory..."
+        rm -rf "${AIE_DRIVER_PARENT_DIR}/lib"/
+    fi
+
     if [ ! -d "${AIEHLC_DIR}/thirdparty/arch/cortexa78_0/workspace" ] || \
         [ ! -d "${AIEHLC_DIR}/thirdparty/arch/psv_cortexa72_0/workspace" ] || \
         [ ! -d "${AIEHLC_DIR}/thirdparty/arch/psv_cortexr5_0/workspace" ]; then
