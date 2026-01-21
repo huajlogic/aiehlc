@@ -399,6 +399,9 @@ private:
 		std::string kernel_out_param_type ="";
         // Streaming mode configuration
         bool streaming_mode = false;
+        // Debug logging configuration
+        bool enable_logging = true;
+        uint32_t log_base_addr = (0x70000 + 16 * 1024 - 4 * 1024);
 
       public:
 		Wrapper(std::string kernelname, std::string filename) {
@@ -411,6 +414,35 @@ private:
 		}
 
         void enableStreaming() { streaming_mode = true; }
+        void enableLogging(bool enable = true) { enable_logging = enable; }
+        void setLogBaseAddr(uint32_t addr) { log_base_addr = addr; }
+
+        // Generate debug logging code block
+        std::string generateLoggingCode() {
+            std::ostringstream addr_hex;
+            addr_hex << std::hex << log_base_addr;
+
+            std::string code;
+            code += "// =============================================================================\n";
+            code += "// Debug logging at fixed address 0x" + addr_hex.str() + "\n";
+            code += "// =============================================================================\n";
+            code += "#define LOG_BASE_ADDR 0x" + addr_hex.str() + "\n";
+            code += "static volatile int* log_ptr = (volatile int*)LOG_BASE_ADDR;\n";
+            code += "static int log_index = 0;\n\n";
+            code += "// Log a value to the debug buffer (auto-incrementing address)\n";
+            code += "inline void log(int value) {\n";
+            code += "    log_ptr[log_index++] = value;\n";
+            code += "}\n\n";
+            code += "// Log a value at a specific index\n";
+            code += "inline void log_at(int index, int value) {\n";
+            code += "    log_ptr[index] = value;\n";
+            code += "}\n\n";
+            code += "// Reset log index to start\n";
+            code += "inline void log_reset() {\n";
+            code += "    log_index = 0;\n";
+            code += "}\n\n";
+            return code;
+        }
 
         std::string generate() override{
             if (streaming_mode) {
@@ -435,16 +467,31 @@ private:
 			code += "#define BUF_SZ " + std::to_string(lbuf_size) + "\n";
 			code += "\nvolatile static int sync_buffer[8] = {0, -1};\n\n";
 			code += "#include <adf/sync/mesync.h>\n\n";
-			for (auto x:params) {
+
+            // Add debug logging code
+            if (enable_logging) {
+                code += generateLoggingCode();
+            }
+
+            for (auto x:params) {
 				code += x.getbufdeclare();
 			}
 			code += "#include \"../../" + kernel_name +".cc\"";
 			code += "\nint main(void) {\n";
-			for (auto x:params) {
+            if (enable_logging) {
+                code += "\tlog(11);  // Log: entering main\n";
+            }
+            if (enable_logging) {
+                code += "\tlog(22);  // Log: before buffer init\n";
+            }
+            for (auto x:params) {
 				code += x.getbufdefine();
 				code += "\n";
 			}
-			code += "\t";
+            if (enable_logging) {
+                code += "\tlog(33);  // Log: before kernel call\n";
+            }
+            code += "\t";
 			code += kernel_name;
 			code += "(";
 			int len = params.size();
@@ -465,9 +512,18 @@ private:
 				code += (i < len - 1) ? "," : "";
 			}
 			code += ");\n";
-			code += "\tchess_memory_fence();\n";
-			code += "\tdone();\n";
-			code += "\treturn 0;\n";
+            if (enable_logging) {
+                code += "\tlog(44);  // Log: after kernel, before fence\n";
+            }
+            code += "\tchess_memory_fence();\n";
+            if (enable_logging) {
+                code += "\tlog(55);  // Log: before done\n";
+            }
+            code += "\tdone();\n";
+            if (enable_logging) {
+                code += "\tlog(66);  // Log: after done\n";
+            }
+            code += "\treturn 0;\n";
 			code += "}";
 
 			return code;
@@ -509,6 +565,11 @@ private:
             code += "volatile static int sync_buffer[8] = {0, -1};\n\n";
             code += "#include <adf/sync/mesync.h>\n\n";
 
+            // Add debug logging code
+            if (enable_logging) {
+                code += generateLoggingCode();
+            }
+
             // Generate lock definitions
             // For ping-pong mode: 2 locks per parameter (ACQ and REL)
             // For single buffer mode: 1 lock per parameter
@@ -538,11 +599,17 @@ private:
 
             code += "#include \"../../" + kernel_name + ".cc\"\n";
             code += "\nint main(void) {\n";
+            if (enable_logging) {
+                code += "\tlog(1);  // Log: entering main\n";
+            }
             code += "\tsync_buffer[0] = 0; // reset end signal\n\n";
 
             // window_init for each parameter
             // Ping-pong mode: 8-parameter window_init with locks
             // Single buffer mode: 5-parameter window_init
+            if (enable_logging) {
+                code += "\tlog(2);  // Log: before window init\n";
+            }
             for (size_t i = 0; i < params.size(); i++) {
                 auto pingName = params[i].getPingName();
                 auto baseName = params[i].getwinparamname();
@@ -568,6 +635,9 @@ private:
             }
 
             // Call kernel (window_acquire/release handled inside kernel)
+            if (enable_logging) {
+                code += "\tlog(3);  // Log: before kernel call\n";
+            }
             code += "\t// Call kernel\n";
             code += "\t" + kernel_name + "(";
             for (size_t i = 0; i < params.size(); i++) {
@@ -576,7 +646,13 @@ private:
             }
             code += ");\n\n";
 
+            if (enable_logging) {
+                code += "\tlog(4);  // Log: after kernel, before done\n";
+            }
             code += "\tdone();\n";
+            if (enable_logging) {
+                code += "\tlog(5);  // Log: after done\n";
+            }
             code += "\treturn 0;\n";
             code += "}";
 
