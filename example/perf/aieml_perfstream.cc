@@ -81,7 +81,7 @@
 #define MAT_SIZE 128 // Size of each matrix (A and B)
 #define N 16         // Dimension of the square matrices (16x16)
 
-// #define DISABLE_CACHE
+#define DISABLE_CACHE
 __attribute__((annotate("streaming"))) __global__ void perf(
     input_window_int32 *win
     __attribute__((annotate("mem_ping_address:0x1000"), annotate("mem_pong_address:0x1400"), annotate("size_hint:1024"),
@@ -121,8 +121,8 @@ __attribute__((annotate("streaming"))) __global__ void perf(
     }
 
     // Release windows after processing
-    // window_release(out);
-    // window_release(win);
+    window_release(out);
+    window_release(win);
 }
 void blockread(XAie_DevInst *DevInst, uint64_t addr) {
 #define DSIZE 512
@@ -434,7 +434,8 @@ int test_routing(XAie_DevInst *DevInst) {
         printf("There were %d mismatches.\n", mismatches);
     }
 
-    printf("\nDone\n");
+    printf("\nDone---\n");
+    breakprint("press key to clear the partition\n");
     return 0;
 }
 
