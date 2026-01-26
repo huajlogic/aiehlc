@@ -81,7 +81,7 @@
 #define MAT_SIZE 128 // Size of each matrix (A and B)
 #define N 16         // Dimension of the square matrices (16x16)
 
-#define DISABLE_CACHE
+// #define DISABLE_CACHE
 __attribute__((annotate("streaming"))) __global__ void perf(
     input_window_int32 *win
     __attribute__((annotate("mem_ping_address:0x1000"), annotate("mem_pong_address:0x1400"), annotate("size_hint:1024"),
@@ -109,7 +109,7 @@ __attribute__((annotate("streaming"))) __global__ void perf(
     uint32_t *ptr_in = (uint32_t *)(0x70000 + 0x1000);
 
     uint32_t *vec1 = ((uint32_t *)ptr_in), *vec2 = ((uint32_t *)ptr_in + MAT_SIZE);
-
+    /*
     for (int i = 0; i < N; i++) {
         for (uint32_t j = 0; j < N; j++) {
             uint32_t ret = 0;
@@ -119,7 +119,10 @@ __attribute__((annotate("streaming"))) __global__ void perf(
             ptr_out[i * N + j] = ret;
         }
     }
-
+    */
+    for (int i = 0; i < DATA_SIZE; i++) {
+        ptr_out[i] = ptr_in[i] * 2;
+    }
     // Release windows after processing
     window_release(out);
     window_release(win);
