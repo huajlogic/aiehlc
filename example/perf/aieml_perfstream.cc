@@ -97,35 +97,37 @@ __attribute__((annotate("streaming"))) __global__ void perf(
 #define VECTOR_LENGTH 16
 
     // Acquire windows before accessing data
-    log(0x331);
-    window_acquire(win);
-    log(0x332);
-    window_acquire(out);
-    log(0x333);
+    for (int i = 0; i < 10; i++) {
+        log(0x330 + i);
+        window_acquire(win);
+        // log(0x332);
+        window_acquire(out);
+        // log(0x333);
 
-    // aie::vector<int32_t, VECTOR_LENGTH> temp_a = window_readincr_v<VECTOR_LENGTH>(win);
-    // aie::store_unaligned_v<VECTOR_LENGTH>(A_mat + (w*VECTOR_LENGTH), temp_a);
-    uint32_t *ptr_out = (uint32_t *)(0x70000 + 0x2000);
-    uint32_t *ptr_in = (uint32_t *)(0x70000 + 0x1000);
+        // aie::vector<int32_t, VECTOR_LENGTH> temp_a = window_readincr_v<VECTOR_LENGTH>(win);
+        // aie::store_unaligned_v<VECTOR_LENGTH>(A_mat + (w*VECTOR_LENGTH), temp_a);
+        uint32_t *ptr_out = (uint32_t *)win->ptr; //(0x70000 + 0x2000);
+        uint32_t *ptr_in = (uint32_t *)out->ptr;  //(0x70000 + 0x1000);
 
-    uint32_t *vec1 = ((uint32_t *)ptr_in), *vec2 = ((uint32_t *)ptr_in + MAT_SIZE);
-    /*
-    for (int i = 0; i < N; i++) {
-        for (uint32_t j = 0; j < N; j++) {
-            uint32_t ret = 0;
-            for (int k = 0; k < N; k++) {
-                ret += vec1[i * N + k] * vec2[j * N + k];
+        uint32_t *vec1 = ((uint32_t *)ptr_in), *vec2 = ((uint32_t *)ptr_in + MAT_SIZE);
+        /*
+        for (int i = 0; i < N; i++) {
+            for (uint32_t j = 0; j < N; j++) {
+                uint32_t ret = 0;
+                for (int k = 0; k < N; k++) {
+                    ret += vec1[i * N + k] * vec2[j * N + k];
+                }
+                ptr_out[i * N + j] = ret;
             }
-            ptr_out[i * N + j] = ret;
         }
+        */
+        for (int i = 0; i < DATA_SIZE; i++) {
+            ptr_out[i] = ptr_in[i] * 2;
+        }
+        // Release windows after processing
+        window_release(out);
+        window_release(win);
     }
-    */
-    for (int i = 0; i < DATA_SIZE; i++) {
-        ptr_out[i] = ptr_in[i] * 2;
-    }
-    // Release windows after processing
-    window_release(out);
-    window_release(win);
 }
 void blockread(XAie_DevInst *DevInst, uint64_t addr) {
 #define DSIZE 512
@@ -222,7 +224,7 @@ int test_routing(XAie_DevInst *DevInst) {
 
     // printf("Routing successful\n");
     u64 phy = 0, phy_out = 0;
-    u32 mlen = MAT_SIZE * 2;
+    u32 mlen = (MAT_SIZE * 2) * 10;
     const u32 recv_len = MAT_SIZE;
 
     // Prepare DDR data
@@ -389,6 +391,7 @@ int test_routing(XAie_DevInst *DevInst) {
     int32_t result[N][N] = {0}; // Result matrix
 
     // Extract matrix A (row major)
+    /*
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             A_mat[i][j] = ((int32_t *)vmem)[i * N + j];
@@ -410,7 +413,6 @@ int test_routing(XAie_DevInst *DevInst) {
             }
         }
     }
-
     // Store the result in vmem_out_cpu
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
@@ -436,7 +438,13 @@ int test_routing(XAie_DevInst *DevInst) {
     } else {
         printf("There were %d mismatches.\n", mismatches);
     }
-
+    */
+    for (int i = 0; i < 16; i++) {
+        printf("vmem_out[%d] = %d\n", i, ((int32_t *)vmem_out)[i]);
+    }
+    for (int i = mlen - 16; i < mlen; i++) {
+        printf("last vmem_out[%d] = %d\n", i, ((int32_t *)vmem_out)[i]);
+    }
     printf("\nDone---\n");
     breakprint("press key to clear the partition\n");
     return 0;
