@@ -106,8 +106,8 @@ __attribute__((annotate("streaming"))) __global__ void perf(
 
         // aie::vector<int32_t, VECTOR_LENGTH> temp_a = window_readincr_v<VECTOR_LENGTH>(win);
         // aie::store_unaligned_v<VECTOR_LENGTH>(A_mat + (w*VECTOR_LENGTH), temp_a);
-        uint32_t *ptr_out = (uint32_t *)win->ptr; //(0x70000 + 0x2000);
-        uint32_t *ptr_in = (uint32_t *)out->ptr;  //(0x70000 + 0x1000);
+        uint32_t *ptr_out = (uint32_t *)out->ptr; //(0x70000 + 0x2000);
+        uint32_t *ptr_in = (uint32_t *)win->ptr;  //(0x70000 + 0x1000);
 
         uint32_t *vec1 = ((uint32_t *)ptr_in), *vec2 = ((uint32_t *)ptr_in + MAT_SIZE);
         /*
