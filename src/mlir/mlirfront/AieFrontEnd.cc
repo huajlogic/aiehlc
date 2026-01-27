@@ -294,21 +294,34 @@ void AieFrontEnd::createKernelFunction(std::vector<std::string> params) {
     // std::cout << "--------------AieFrontEnd::createKernelFunction----END-------" << std::endl;
     return;
 }
-void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f,
-                                           clang::Rewriter* Rewriter,
-                                           clang::SourceLocation linestart) {
+void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rewriter, clang::SourceLocation linestart,
+                                           bool isStreaming) {
     llvm::SmallVector<mlir::Value, 4> windowOps;
     llvm::SmallVector<WindowType> windowOpTypes;
     std::string kernelFuncName = f->getNameInfo().getName().getAsString();
+
+    // Store streaming flag for this kernel
+    if (isStreaming) {
+        llvm::outs() << "Enabling streaming mode for kernel: " << kernelFuncName << "\n";
+        // Store this information so we can use it later when generating wrapper
+        // For prototype: hardcode 4 chunks of 4KB (4096 bytes = 1024 int32 elements)
+        kernelStreamingConfig[kernelFuncName] = {true, 1024, 4};
+    }
+
     // std::cout << " kernelFuncNamexx is " << kernelFuncName << std::endl;
     // Assume you have a way to determine the kernel symbol, input args, and output args
     int numInputArgs = 0; // Placeholder: calculate based on function's input
     int numOutputArgs = 0; // Placeholder: calculate based on function's output
     int64_t pingaddress = 0x1000; //start address
+    int64_t pongaddress = 0x1100; // default pong address
     int32_t pingLockID = 0;
     int32_t pongLockID = 1;
     int32_t paramNum = f->getNumParams();
     uint32_t setpingaddress = 0;
+    uint32_t setpongaddress = 0;
+    int32_t setpingLockID = -1;  // -1 means not explicitly set
+    int32_t setpongLockID = -1;  // -1 means not explicitly set
+    bool isPingPongMode = false; // True if both mem_ping_address and mem_pong_address are explicitly set
 
     auto kname = createKernelFuncName(mbuilder, kernelFuncName);
     auto fname = createKernelFileName(mbuilder, "./" + kernelFuncName + ".c");
@@ -320,6 +333,10 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f,
         //xchess seems have a logic issue, we need to reserve 4 time large buffer
         //for 512 that means the local buffer is 32 int32 length
         int defaultSize = 512;
+        setpingaddress = 0;
+        setpongaddress = 0;
+        setpingLockID = -1;
+        setpongLockID = -1;
         //get the windows size
         auto getvalue = [&](std::string str) {
                     std::istringstream istr(str);
@@ -328,6 +345,8 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f,
                     istr >> tmp;
                     return tmp;
         };
+        bool hasPingAddress = false;
+        bool hasPongAddress = false;
         for (auto attr: param->attrs()) {
             if (attr->getKind() == clang::attr::Kind::Annotate) {
                 auto annotateAttr= static_cast<clang::AnnotateAttr*>(attr);
@@ -335,19 +354,60 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f,
                 if (annotation.find("size_hint") != std::string::npos) {
                     int csize = 0;
                     auto nstr = getvalue(annotation);
-                     csize = stol(nstr, nullptr, 0);
+                    csize = stol(nstr, nullptr, 0);
                     defaultSize = csize ? csize : defaultSize;
-                } else if (annotation.find("mem_address") != std::string::npos) {
+                } else if (annotation.find("mem_ping_address") != std::string::npos) {
+                    // New: explicit ping address
                     auto nstr = getvalue(annotation);
                     setpingaddress = stol(nstr, nullptr, 0);
                     pingaddress = setpingaddress ? setpingaddress : pingaddress;
+                    hasPingAddress = true;
+                } else if (annotation.find("mem_pong_address") != std::string::npos) {
+                    // New: explicit pong address
+                    auto nstr = getvalue(annotation);
+                    setpongaddress = stol(nstr, nullptr, 0);
+                    pongaddress = setpongaddress ? setpongaddress : pongaddress;
+                    hasPongAddress = true;
+                } else if (annotation.find("mem_address") != std::string::npos) {
+                    // Legacy: single address, no ping-pong
+                    auto nstr = getvalue(annotation);
+                    setpingaddress = stol(nstr, nullptr, 0);
+                    pingaddress = setpingaddress ? setpingaddress : pingaddress;
+                } else if (annotation.find("lock_acquire_id") != std::string::npos) {
+                    // Explicit acquire lock ID
+                    auto nstr = getvalue(annotation);
+                    setpingLockID = stol(nstr, nullptr, 0);
+                } else if (annotation.find("lock_release_id") != std::string::npos) {
+                    // Explicit release lock ID
+                    auto nstr = getvalue(annotation);
+                    setpongLockID = stol(nstr, nullptr, 0);
                 }
             }
+        }
+        // Apply explicit lock IDs if set
+        if (setpingLockID >= 0) {
+            pingLockID = setpingLockID;
+        }
+        if (setpongLockID >= 0) {
+            pongLockID = setpongLockID;
+        }
+        // Set ping-pong mode if both addresses are explicitly provided
+        if (hasPingAddress && hasPongAddress) {
+            isPingPongMode = true;
         }
         //the xchess have a logic to ask 4 time space to storage the data, not sure whether that is bug
         //enclose is a workground to handle compile complain
         defaultSize = defaultSize * 4;
-        int64_t pongaddress = pingaddress  + defaultSize *sizeof(int);
+        // If ping-pong mode, calculate pong address if not explicitly set
+        // In legacy mode (single buffer), set pong address to 0 to indicate no pong buffer
+        if (isPingPongMode) {
+            if (!setpongaddress) {
+                pongaddress = pingaddress + defaultSize * sizeof(int);
+            }
+        } else {
+            // Legacy single buffer mode - no pong buffer
+            pongaddress = 0;
+        }
         auto windowOp = createKernelWindowOp(param,
                                             kernelFuncName,
                                             mbuilder,
@@ -389,6 +449,12 @@ void AieFrontEnd::createKernelDefinitionOp(FunctionDecl *f,
     }
     mlir::aie::CreateKernelObjectOp kernelObject = mbuilder.create<mlir::aie::CreateKernelObjectOp>(
             mbuilder.getUnknownLoc(), result_type, numInputArgs, numOutputArgs, kname,fname, window_types[0], window_types[1], windowOps);
+
+    // Add streaming attributes if enabled (buffer size comes from size_hint annotation)
+    if (isStreaming) {
+        kernelObject->setAttr("streaming_enabled", mbuilder.getBoolAttr(true));
+    }
+
     kernelfunctionToKernelObjectMap[f->getName().str()] = kernelObject;
     return;
 }

@@ -76,25 +76,36 @@ void HybridPass::runOnOperation() {
 			auto pongaddr = window.getPongaddr();
 			auto direct = window.getDirection();
 			auto wname = window.getName().str();
-			std::cout << wname << std::endl;
-			std::ostringstream ostr;
-			ostr << wname << "_ping";
-			auto wping = ostr.str();
-			bcf.addsymbols(ostr.str(), 0x70000 + window.getPingaddr());
-			ostr.str("");
-			ostr.clear();
-			ostr << wname << "_pong";
-			auto wpong = ostr.str();
-			bcf.addsymbols(ostr.str(), 0x70000 + window.getPongaddr());
-			//std::cout << "_symbol " << windowName << " ping addr 0x7" << std::hex << window.getPingaddr() << "\n";
-			//std::cout << "_symbol " << windowName << " pong addr 0x7" << std::hex << window.getPongaddr() << "\n";
-			
-			kfuncparams.push_back(Buffer(direct, wping, wpong));
+            auto acquireLockId = window.getPinglockid(); // MLIR uses pinglockid for acquire
+            auto releaseLockId = window.getPonglockid(); // MLIR uses ponglockid for release
+            std::cout << wname << std::endl;
+            std::ostringstream ostr;
 
-			max_pingpong_size = std::max(max_pingpong_size, (uint32_t)(pongaddr - pingaddr));
-		}
+            // Check if this is ping-pong mode (pongaddr != 0) or legacy single buffer mode
+            bool isPingPongMode = (pongaddr != 0);
 
-		//FIXME count the variable to get the real stack size and give a real stack address
+            if (isPingPongMode) {
+                // Ping-pong mode: use _ping and _pong suffixes
+                ostr << wname << "_ping";
+                auto wping = ostr.str();
+                bcf.addsymbols(ostr.str(), 0x70000 + window.getPingaddr());
+                ostr.str("");
+                ostr.clear();
+                ostr << wname << "_pong";
+                auto wpong = ostr.str();
+                bcf.addsymbols(ostr.str(), 0x70000 + window.getPongaddr());
+
+                kfuncparams.push_back(Buffer(direct, wping, wpong, pingaddr, pongaddr, acquireLockId, releaseLockId));
+                max_pingpong_size = std::max(max_pingpong_size, (uint32_t)(pongaddr - pingaddr));
+            } else {
+                // Legacy single buffer mode: just use the window name (no suffix)
+                bcf.addsymbols(wname, 0x70000 + window.getPingaddr());
+                // Use pingaddr for both ping and pong names (pong won't be used)
+                kfuncparams.push_back(Buffer(direct, wname, wname, pingaddr, 0, acquireLockId, releaseLockId));
+            }
+        }
+
+        //FIXME count the variable to get the real stack size and give a real stack address
 		bcf.setstack(0x7e000, 0x1024);
 		//FIXME add the real reserved address
 		bcf.addreservedDMB(0x40000, 0x10000);
@@ -129,7 +140,16 @@ void HybridPass::runOnOperation() {
 		wrap.addkernelfuncparams(kfuncparams);
 		wrap.set_kernel_in_param_type(in_param_type);
 		wrap.set_kernel_out_param_type(out_param_type);
-		wrap.exportfile();
+
+        // Check for streaming attributes
+        if (auto streamingEnabled = kop->getAttrOfType<mlir::BoolAttr>("streaming_enabled")) {
+            if (streamingEnabled.getValue()) {
+                llvm::outs() << "Enabling streaming mode for wrapper generation\n";
+                wrap.enableStreaming();
+            }
+        }
+
+        wrap.exportfile();
 		llvm::outs() << "Exported files for " << kname << "\n";
 	}
 }

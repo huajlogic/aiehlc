@@ -24,8 +24,8 @@ if(NOT DEFINED LLVM_INSTALL_DIR OR "${LLVM_INSTALL_DIR}" STREQUAL "")
   set(LLVM_INSTALL_DIR "/usr/local/")
 endif()
 message(STATUS "use set LLVM_ROOT to change LLVM into your local llvm if the compile failed!!!")
-set(LLVM_INSTALL_DIR "/Users/username/src/project/thirdparty/llvm-project/build/" CACHE PATH "Root of an LLVM/Clang/MLIR install")
-
+#set(LLVM_INSTALL_DIR "/Users/username/src/project/thirdparty/llvm-project/build/" CACHE PATH "Root of an LLVM/Clang/MLIR install")
+set(LLVM_INSTALL_DIR "/scratch/staff/huaj/llvm-project/build/" CACHE PATH "Root of an LLVM/Clang/MLIR install")
 message(STATUS "Found LLVM ${LLVM_INSTALL_DIR}/bin/")
 
 set(CMAKE_PREFIX_PATH "${LLVM_INSTALL_DIR}/bin/" ${CMAKE_PREFIX_PATH})

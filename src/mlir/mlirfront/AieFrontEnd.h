@@ -76,14 +76,22 @@ void CreateWindowOperation(int arg_dir, int arg_size, long arg_pingaddr, long ar
 void CreateKernelObjectOperation(int NumInputArgs = 1, int NumOutputArgs = 1);
 void CreateTileKernelObjectOperation(int, int, std::string);
 
+// Structure to hold streaming configuration
+struct StreamingConfig {
+    bool enabled;
+    uint32_t chunk_size; // in elements
+    uint32_t num_chunks;
+};
+
 class AieFrontEnd {
 public:
 	AieFrontEnd();
 	void set_llvm_aie(bool);
 	std::string dumpir();
 	void createKernelFunction(std::vector<std::string> params);
-	void createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter* Rewriter, clang::SourceLocation linestart);
-	mlir::Value createKernelWindowOp(ParmVarDecl * param,
+    void createKernelDefinitionOp(FunctionDecl *f, clang::Rewriter *Rewriter, clang::SourceLocation linestart,
+                                  bool isStreaming = false);
+    mlir::Value createKernelWindowOp(ParmVarDecl * param,
                                      std::string kernelFuncName,
                                      OpBuilder &builder,
                                      long unsigned pingaddress,
@@ -109,7 +117,9 @@ public:
 	void Parser(std::string file_path);
   void RunPass(std::string file_path);
 	std::unordered_map<std::string, ::mlir::aie::CreateKernelObjectOp> kernelfunctionToKernelObjectMap;
-private:
+    std::unordered_map<std::string, StreamingConfig> kernelStreamingConfig;
+
+  private:
 	mlir::OpBuilder mbuilder;
 	mlir::MLIRContext mlirContext;
 	mlir::OwningOpRef<mlir::ModuleOp> module;

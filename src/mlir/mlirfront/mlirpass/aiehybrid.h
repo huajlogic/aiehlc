@@ -311,49 +311,75 @@ public:
 */
 class Buffer {
 public:
-		Buffer(uint32_t type, std::string piName, std::string poName):
-			wtype(type), pingName(piName), pongName(poName) {
-			window_type = std::string((wtype == 0 ? "input_window_int32":"output_window_int32")) ;
-			window_getfunc = std::string((wtype == 0 ? "get_input_async_window_int32":"get_output_async_window_int32"));
+  Buffer(uint32_t type, std::string piName, std::string poName, uint32_t pingAddr = 0, uint32_t pongAddr = 0,
+         int32_t acquireLock = -1, int32_t releaseLock = -1)
+      : wtype(type), pingName(piName), pongName(poName), pingAddress(pingAddr), pongAddress(pongAddr),
+        acquireLockId(acquireLock), releaseLockId(releaseLock) {
+      window_type = std::string((wtype == 0 ? "input_window_int32" : "output_window_int32"));
+      window_getfunc = std::string((wtype == 0 ? "get_input_async_window_int32" : "get_output_async_window_int32"));
+  }
 
-		}
+  std::string getwinparamname() {
+      std::string code("");
+      code += pingName;
+      return code;
+  }
 
-		std::string getwinparamname() {
-			std::string code("");
-			code += pingName;
-			return code;
-		}
-
-		std::string getwinpointername() {
+        std::string getwinpointername() {
 			std::string code("");
 			code += pingName+std::string("_win_ptr");
 			return code;
 		}
 
+        std::string getPingName() const { return pingName; }
+        std::string getPongName() const { return pongName; }
+        uint32_t getDirection() const { return wtype; }
+        uint32_t getPingAddress() const { return pingAddress; }
+        uint32_t getPongAddress() const { return pongAddress; }
+        int32_t getAcquireLockId() const { return acquireLockId; }
+        int32_t getReleaseLockId() const { return releaseLockId; }
+        // Returns true if this is ping-pong mode (pongAddress != 0)
+        bool isPingPong() const { return pongAddress != 0; }
+        // Returns true if lock IDs are explicitly set
+        bool hasExplicitLockIds() const { return acquireLockId >= 0 && releaseLockId >= 0; }
 
-		std::string getbufdeclare() {
+        std::string getbufdeclare() {
 			std::string code;
 			code = "v4int32 " + pingName +"[BUF_SZ];\n";
-			code += "v4int32 " + pongName +"[BUF_SZ];\n";
-			return code;
-		}
+            // Only declare pong buffer in ping-pong mode
+            if (isPingPong()) {
+                code += "v4int32 " + pongName + "[BUF_SZ];\n";
+            }
+            return code;
+        }
 
 		std::string getbufdefine() {
 			std::string code;
 			auto internal_win = getwinintername();
 			code = "\twindow_internal " + internal_win + "[1];\n";
-			code += "\twindow_init(" + internal_win + ",1," + pingName + "," + "BUF_SZ, BUF_SZ);\n"; 
-			auto paramname = getwinpointername();
-			code += "\t" + window_type + "*  " + paramname + " = " + window_getfunc + "(" + internal_win + ");\n";
+            if (isPingPong()) {
+                // Ping-pong mode: 8-parameter window_init
+                code += "\twindow_init(" + internal_win + ",1," + pingName + "," + pongName +
+                        ",BUF_SZ,BUF_SZ,BUF_SZ,BUF_SZ);\n";
+            } else {
+                // Legacy single buffer mode: 5-parameter window_init
+                code += "\twindow_init(" + internal_win + ",1," + pingName + "," + "BUF_SZ, BUF_SZ);\n";
+            }
+            auto paramname = getwinpointername();
+            code += "\t" + window_type + "*  " + paramname + " = " + window_getfunc + "(" + internal_win + ");\n";
 			return code;
 		}
 private:
 		uint32_t wtype;
 		std::string pingName;
 		std::string pongName;
+        uint32_t pingAddress;
+        uint32_t pongAddress;
+        int32_t acquireLockId;
+        int32_t releaseLockId;
 
-		std::string window_type;
-		std::string window_getfunc;
+        std::string window_type;
+        std::string window_getfunc;
 
 		std::string getwinintername() {
 			std::string code;
@@ -371,7 +397,13 @@ private:
 		uint32_t lbuf_size=128;
 		std::string kernel_in_param_type ="";
 		std::string kernel_out_param_type ="";
-public:
+        // Streaming mode configuration
+        bool streaming_mode = false;
+        // Debug logging configuration
+        bool enable_logging = true;
+        uint32_t log_base_addr = (0x70000 + 16 * 1024 - 4 * 1024);
+
+      public:
 		Wrapper(std::string kernelname, std::string filename) {
 			name = "wrapper.cc";
 			kernel_name = kernelname;
@@ -380,10 +412,51 @@ public:
 		std::string getfilename() {
 			return name;
 		}
-		std::string generate() override{
-			std::string code;
+
+        void enableStreaming() { streaming_mode = true; }
+        void enableLogging(bool enable = true) { enable_logging = enable; }
+        void setLogBaseAddr(uint32_t addr) { log_base_addr = addr; }
+
+        // Generate debug logging code block
+        std::string generateLoggingCode() {
+            std::ostringstream addr_hex;
+            addr_hex << std::hex << log_base_addr;
+
+            std::string code;
+            code += "// =============================================================================\n";
+            code += "// Debug logging at fixed address 0x" + addr_hex.str() + "\n";
+            code += "// =============================================================================\n";
+            code += "#define LOG_BASE_ADDR 0x" + addr_hex.str() + "\n";
+            code += "static volatile int* log_ptr = (volatile int*)LOG_BASE_ADDR;\n";
+            code += "static int log_index = 0;\n\n";
+            code += "// Log a value to the debug buffer (auto-incrementing address)\n";
+            code += "inline void log(int value) {\n";
+            code += "    log_ptr[log_index++] = value;\n";
+            code += "}\n\n";
+            code += "// Log a value at a specific index\n";
+            code += "inline void log_at(int index, int value) {\n";
+            code += "    log_ptr[index] = value;\n";
+            code += "}\n\n";
+            code += "// Reset log index to start\n";
+            code += "inline void log_reset() {\n";
+            code += "    log_index = 0;\n";
+            code += "}\n\n";
+            return code;
+        }
+
+        std::string generate() override{
+            if (streaming_mode) {
+                return generateStreamingWrapper();
+            }
+            return generateNormalWrapper();
+        }
+
+        std::string generateNormalWrapper() {
+            std::string code;
 			code += "#include <adf.h>\n";
-			for (auto x:headers) {
+            code += "#include <aie_api/aie.hpp>\n";
+            code += "#include <aie_api/aie_adf.hpp>\n";
+            for (auto x:headers) {
 				code += "#include \"" + x + "\"\n";
 			};
 			//code += "#define XSTRINGIFY(s) #s\n";
@@ -394,16 +467,31 @@ public:
 			code += "#define BUF_SZ " + std::to_string(lbuf_size) + "\n";
 			code += "\nvolatile static int sync_buffer[8] = {0, -1};\n\n";
 			code += "#include <adf/sync/mesync.h>\n\n";
-			for (auto x:params) {
+
+            // Add debug logging code
+            if (enable_logging) {
+                code += generateLoggingCode();
+            }
+
+            for (auto x:params) {
 				code += x.getbufdeclare();
 			}
 			code += "#include \"../../" + kernel_name +".cc\"";
 			code += "\nint main(void) {\n";
-			for (auto x:params) {
+            if (enable_logging) {
+                code += "\tlog(11);  // Log: entering main\n";
+            }
+            if (enable_logging) {
+                code += "\tlog(22);  // Log: before buffer init\n";
+            }
+            for (auto x:params) {
 				code += x.getbufdefine();
 				code += "\n";
 			}
-			code += "\t";
+            if (enable_logging) {
+                code += "\tlog(33);  // Log: before kernel call\n";
+            }
+            code += "\t";
 			code += kernel_name;
 			code += "(";
 			int len = params.size();
@@ -424,14 +512,23 @@ public:
 				code += (i < len - 1) ? "," : "";
 			}
 			code += ");\n";
-			code += "\tchess_memory_fence();\n";
-			code += "\tdone();\n";
-			code += "\treturn 0;\n";
+            if (enable_logging) {
+                code += "\tlog(44);  // Log: after kernel, before fence\n";
+            }
+            code += "\tchess_memory_fence();\n";
+            if (enable_logging) {
+                code += "\tlog(55);  // Log: before done\n";
+            }
+            code += "\tdone();\n";
+            if (enable_logging) {
+                code += "\tlog(66);  // Log: after done\n";
+            }
+            code += "\treturn 0;\n";
 			code += "}";
 
 			return code;
-		}
-		void addkernelfuncparams(std::vector<Buffer>& bufs) {
+        }
+        void addkernelfuncparams(std::vector<Buffer>& bufs) {
 			params = bufs;
 		}
 
@@ -452,6 +549,115 @@ public:
 			kernel_param_type.erase(kernel_param_type.find_last_not_of(" \n\r") + 1);
 			this->kernel_out_param_type = kernel_param_type;
 		}
+
+        std::string generateStreamingWrapper() {
+            std::string code;
+            code += "#include <adf.h>\n";
+            code += "#include <aie_api/aie.hpp>\n";
+            code += "#include <aie_api/aie_adf.hpp>\n";
+            for (auto x : headers) {
+                code += "#include \"" + x + "\"\n";
+            }
+            code += "#define FOR_READ  1\n";
+            code += "#define FOR_WRITE 0\n";
+            code += "#define BUF_SZ " + std::to_string(lbuf_size) + "\n\n";
+
+            code += "volatile static int sync_buffer[8] = {0, -1};\n\n";
+            code += "#include <adf/sync/mesync.h>\n\n";
+
+            // Add debug logging code
+            if (enable_logging) {
+                code += generateLoggingCode();
+            }
+
+            // Generate lock definitions
+            // For ping-pong mode: 2 locks per parameter (ACQ and REL)
+            // For single buffer mode: 1 lock per parameter
+            int autoLockId = 16; // Start from lock ID 16 for auto-assignment
+            for (size_t i = 0; i < params.size(); i++) {
+                auto pingName = params[i].getPingName();
+                if (params[i].isPingPong()) {
+                    auto pongName = params[i].getPongName();
+                    // Use explicit lock IDs if set, otherwise auto-increment
+                    int acquireLock = params[i].hasExplicitLockIds() ? params[i].getAcquireLockId() : autoLockId++;
+                    int releaseLock = params[i].hasExplicitLockIds() ? params[i].getReleaseLockId() : autoLockId++;
+                    code += "#define LOCK_" + pingName + "_ACQ " + std::to_string(acquireLock) + "\n";
+                    code += "#define LOCK_" + pongName + "_REL " + std::to_string(releaseLock) + "\n";
+                } else {
+                    // Legacy single buffer mode: one lock
+                    int lock = params[i].hasExplicitLockIds() ? params[i].getAcquireLockId() : autoLockId++;
+                    code += "#define LOCK_" + pingName + " " + std::to_string(lock) + "\n";
+                }
+            }
+            code += "\n";
+
+            // Generate buffer declarations (uses getbufdeclare which handles both modes)
+            for (auto &x : params) {
+                code += x.getbufdeclare();
+            }
+            code += "\n";
+
+            code += "#include \"../../" + kernel_name + ".cc\"\n";
+            code += "\nint main(void) {\n";
+            if (enable_logging) {
+                code += "\tlog(1);  // Log: entering main\n";
+            }
+            code += "\tsync_buffer[0] = 0; // reset end signal\n\n";
+
+            // window_init for each parameter
+            // Ping-pong mode: 8-parameter window_init with locks
+            // Single buffer mode: 5-parameter window_init
+            if (enable_logging) {
+                code += "\tlog(2);  // Log: before window init\n";
+            }
+            for (size_t i = 0; i < params.size(); i++) {
+                auto pingName = params[i].getPingName();
+                auto baseName = params[i].getwinparamname();
+                std::string wfunc =
+                    (params[i].getDirection() == 0) ? "get_input_async_window_int32" : "get_output_async_window_int32";
+                std::string wtypedef = (params[i].getDirection() == 0) ? "input_window_int32" : "output_window_int32";
+
+                code += "\twindow_internal window_" + baseName + "[1];\n";
+
+                if (params[i].isPingPong()) {
+                    // Ping-pong mode: 8-parameter window_init
+                    auto pongName = params[i].getPongName();
+                    code += "\twindow_init(window_" + baseName + ", 1, ";
+                    code += pingName + ", LOCK_" + pingName + "_ACQ, ";
+                    code += pongName + ", LOCK_" + pongName + "_REL, ";
+                    code += "BUF_SZ, BUF_SZ);\n";
+                } else {
+                    // Legacy single buffer mode: 5-parameter window_init
+                    code += "\twindow_init(window_" + baseName + ", 1, ";
+                    code += pingName + ", BUF_SZ, BUF_SZ);\n";
+                }
+                code += "\t" + wtypedef + "* " + baseName + "_ptr = " + wfunc + "(window_" + baseName + ");\n\n";
+            }
+
+            // Call kernel (window_acquire/release handled inside kernel)
+            if (enable_logging) {
+                code += "\tlog(3);  // Log: before kernel call\n";
+            }
+            code += "\t// Call kernel\n";
+            code += "\t" + kernel_name + "(";
+            for (size_t i = 0; i < params.size(); i++) {
+                code += params[i].getwinparamname() + "_ptr";
+                code += (i < params.size() - 1) ? ", " : "";
+            }
+            code += ");\n\n";
+
+            if (enable_logging) {
+                code += "\tlog(4);  // Log: after kernel, before done\n";
+            }
+            code += "\tdone();\n";
+            if (enable_logging) {
+                code += "\tlog(5);  // Log: after done\n";
+            }
+            code += "\treturn 0;\n";
+            code += "}";
+
+            return code;
+        }
 };
 
 
