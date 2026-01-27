@@ -97,7 +97,7 @@ __attribute__((annotate("streaming"))) __global__ void perf(
 #define VECTOR_LENGTH 16
 
     // Acquire windows before accessing data
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 1000; i++) {
         log(0x330 + i);
         window_acquire(win);
         // log(0x332);
@@ -224,7 +224,7 @@ int test_routing(XAie_DevInst *DevInst) {
 
     // printf("Routing successful\n");
     u64 phy = 0, phy_out = 0;
-    u32 mlen = (MAT_SIZE * 2) * 10;
+    u32 mlen = (MAT_SIZE * 2) * 1000;
     const u32 recv_len = MAT_SIZE;
 
     // Prepare DDR data
@@ -371,7 +371,7 @@ int test_routing(XAie_DevInst *DevInst) {
     // Wait for output DMA to complete
 #if AIE_GEN == XAIE_DEV_GEN_AIE2PS
     breakprint("XAie_RouteDmaWait for output\n");
-    XAie_RouteDmaWait(routingInstance, XAie_TileLoc(4, 4), XAie_TileLoc(shimcol, 0), false);
+    XAie_RouteDmaWait(routingInstance, XAie_TileLoc(4, 4), XAie_TileLoc(shimcol, 0), true);
 #endif
 
     // XTime_GetTime(&tEnd);
@@ -386,59 +386,7 @@ int test_routing(XAie_DevInst *DevInst) {
 
     // vmem contains the input (128 samples, 64 of matrix A and 64 of matrix B, in row major and column major forms
     // respectively) and vmem_out contains the output samples (64 of result) compute CPU Result for softmax
-    int32_t A_mat[N][N];        // Matrix A
-    int32_t B_mat[N][N];        // Matrix B
-    int32_t result[N][N] = {0}; // Result matrix
 
-    // Extract matrix A (row major)
-    /*
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            A_mat[i][j] = ((int32_t *)vmem)[i * N + j];
-        }
-    }
-
-    // Extract matrix B (column major)
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            B_mat[i][j] = ((int32_t *)vmem)[MAT_SIZE + i * N + j]; // Adjust index for column major
-        }
-    }
-
-    // Perform matrix multiplication
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            for (int k = 0; k < N; k++) {
-                result[i][j] += A_mat[i][k] * B_mat[j][k];
-            }
-        }
-    }
-    // Store the result in vmem_out_cpu
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            vmem_out_cpu[i * N + j] = result[i][j];
-        }
-    }
-
-    int mismatches = 0;
-    for (int i = 0; i < MAT_SIZE; i++) {
-        if (vmem_out_cpu[i] != ((int32_t *)vmem_out)[i]) {
-
-            printf("Mismatch at index %d: CPU=%d, vmem_out=%d\n", i, vmem_out_cpu[i], ((int32_t *)vmem_out)[i]);
-            mismatches++;
-        }
-    }
-
-    for (int i = 0; i < ((16 > MAT_SIZE) ? MAT_SIZE : 16); i++) {
-        printf("match example at index %d: CPU=%d, vmem_out=%d\n", i, vmem_out_cpu[i], ((int32_t *)vmem_out)[i]);
-    }
-
-    if (mismatches == 0) {
-        printf("CPU result matches vmem_out.\n");
-    } else {
-        printf("There were %d mismatches.\n", mismatches);
-    }
-    */
     for (int i = 0; i < 16; i++) {
         printf("vmem_out[%d] = %d\n", i, ((int32_t *)vmem_out)[i]);
     }
