@@ -13,10 +13,10 @@
 #include <math.h>
 #if AIE_GEN <= 2
 #define HW_GEN XAIE_DEV_GEN_AIEML
-//#include "xtime_l.h"
+#include "xtime_l.h"
 #else
 #define HW_GEN XAIE_DEV_GEN_AIE2PS
-//#include "xiltimer.h"
+#include "xiltimer.h"
 #endif
 // #include "unistd.h"
 #define uint_TYPE uint32_t
@@ -53,33 +53,39 @@
 #define CORE_IP_MEM 0x1000
 #define CORE_OP_MEM 0x6000
 
-#define MAT_SIZE 256 // Size of each matrix (A and B)
+#define MAT_SIZE 2048 // Size of each matrix (A and B)
 #define N 16         // Dimension of the square matrices (16x16)
 
 // #define DISABLE_CACHE
 //__attribute__((annotate("streaming")))
-__global__ void perf(input_window_int32 * win __attribute__((annotate("mem_address:0x1000"), annotate("size_hint:512"))),
-        output_window_int32 *out __attribute__((annotate("mem_address:0x6000"), annotate("size_hint:512")))) {
-#define DATA_SIZE 512 
-#define MAT_SIZE 256
+__global__ void perf(input_window_int32 *win
+                     __attribute__((annotate("mem_address:0x1000"), annotate("size_hint:4096"))),
+                     output_window_int32 *out
+                     __attribute__((annotate("mem_address:0x6000"), annotate("size_hint:4096")))) {
+#define DATA_SIZE 4096
+#define MAT_SIZE 2048
 #define N 16          // Dimension of the square matrices
 #define VECTOR_LENGTH 16
 	//aie::vector<int32_t, VECTOR_LENGTH> temp_a = window_readincr_v<VECTOR_LENGTH>(win);
 	//aie::store_unaligned_v<VECTOR_LENGTH>(A_mat + (w*VECTOR_LENGTH), temp_a);
 	uint32_t * ptr_out = (uint32_t *)(0x70000 + 0x6000);
 	uint32_t * ptr_in = (uint32_t *)(0x70000 + 0x1000);
+    /*
+    uint32_t * vec1 = ((uint32_t*)ptr_in), * vec2 = ((uint32_t*)ptr_in + MAT_SIZE);
 
-	uint32_t * vec1 = ((uint32_t*)ptr_in), * vec2 = ((uint32_t*)ptr_in + MAT_SIZE);
-
-	for (int i = 0; i < N; i++) {
-		for (uint32_t j = 0; j < N; j++) {
-			uint32_t ret = 0;
-			for (int k = 0; k < N; k++) {
-				ret += vec1[i * N + k] * vec2[j * N + k];
-			}
-			ptr_out[i * N + j] = ret;
-		}
-	}
+    for (int i = 0; i < N; i++) {
+        for (uint32_t j = 0; j < N; j++) {
+            uint32_t ret = 0;
+            for (int k = 0; k < N; k++) {
+                ret += vec1[i * N + k] * vec2[j * N + k];
+            }
+            ptr_out[i * N + j] = ret;
+        }
+    }
+    */
+    for (int i = 0; i < DATA_SIZE; i++) {
+        ptr_out[i] = ptr_in[i];
+    }
 }
 void blockread(XAie_DevInst *DevInst, uint64_t addr)
 {
@@ -107,6 +113,7 @@ int test_routing(XAie_DevInst *DevInst)
 	AieRC RC = XAIE_OK;
 	XAie_RoutingInstance* routingInstance;
   	//XTime tStart, tEnd;
+    printf("Starting test_routing 01/27\n");
     breakprint("core reset--");
 #if AIE_GEN == XAIE_DEV_GEN_AIE2PS
     int shimcol = 10; // 33;
@@ -141,120 +148,136 @@ int test_routing(XAie_DevInst *DevInst)
 	breakprint(" XAie_MemSyncForDev---\n");
 
 	u64 vmem =    phy;
-	u64 vmem_out = phy_out;
-	for(int i = 0; i < mlen; i++) {
-		((int32_t*)vmem)[i] = i + 1;
-		((int32_t*)vmem_out)[i] = 0;
-	}
+    u64 vmem_out = phy_out;
 
-	//((u32*)vmem)[0] = 1024*1024;
-
-	XAie_MemSyncForDev(in);
-	XAie_MemSyncForCPU(out);
-
-	breakprint("Starting to Move data\n");
-	// step 3: move data to destination tile
-	//XTime_GetTime(&tStart);
-	printf("vmem = 0x%p\n",vmem);
-
-	XAie_MoveDataExternal2Aie(routingInstance, /*src=*/ XAie_TileLoc(shimcol,0),  in, mlen*sizeof(u32), CORE_IP_MEM, /*dest=*/ XAie_TileLoc(4,4));
-	
-	breakprint("XAie_RouteDmaWait\n");
-		
-#if AIE_GEN == XAIE_DEV_GEN_AIE2PS
-	//Wait until the data transfer completes.
-	breakprint("XAie_RouteDmaWait--bbb--\n");
-	XAie_RouteDmaWait(routingInstance, XAie_TileLoc(shimcol,0), XAie_TileLoc(4,4), true);
-#endif
-	breakprint("blockread\n");
-  	//blockread(DevInst, CORE_IP_MEM);
-	XAie_Run(routingInstance, 1);
-
-	breakprint("XAie_CoreWaitForDone\n");
-	//wait until core done
-	u8 allDone  = 0;
-	uint32_t CoreStatus = 0;
-	//usleep(1000*1000);
-	do {
-		allDone = 1; // Assume all cores are done initially
-		uint32_t coreStatCharWritten = 0;
-		for (int i = 0; i < 1; i++) { // Iterate over the specified tiles
-			RC = XAie_CoreWaitForDone(DevInst, XAie_TileLoc(4,4), 0);
-
-			if (RC != XAIE_OK) {
-				allDone = 0;
-			}
-		}
-	} while (!allDone);
-	breakprint("fflush\n");
-	fflush(stdout);
-
-	XAie_MoveDataAie2External(routingInstance,  XAie_TileLoc(4,4),CORE_OP_MEM, mlen*sizeof(u32),out, XAie_TileLoc(shimcol,0));					
-
-	//XTime_GetTime(&tEnd);
-	//printf("Output took %.2f us.\n", 1.0 * (tEnd - tStart) / (COUNTS_PER_SECOND/1000000));
-
-	//printf("\nFinished moving data back to DDR\n");
-	// step 5 validate data
-  int32_t vmem_out_cpu[recv_len];
-
-	//vmem contains the input (128 samples, 64 of matrix A and 64 of matrix B, in row major and column major forms respectively) and vmem_out contains the output samples (64 of result) 
-	//compute CPU Result for softmax
-    int32_t A_mat[N][N];  // Matrix A
-    int32_t B_mat[N][N];  // Matrix B
-    int32_t result[N][N] = {0};  // Result matrix
-
-    // Extract matrix A (row major)
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            A_mat[i][j] = ((int32_t*)vmem)[i * N + j];
-        }
+    //((u32*)vmem)[0] = 1024*1024;
+    for (int j = 0; j < mlen; j++) {
+        ((int32_t *)vmem)[j] = 1 + j;
+        ((int32_t *)vmem_out)[j] = j;
     }
 
-    // Extract matrix B (column major)
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            B_mat[i][j] = ((int32_t*)vmem)[MAT_SIZE + i * N + j];  // Adjust index for column major
-        }
-    }
+    const int count = 1024 * 6;
 
-    // Perform matrix multiplication
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            for (int k = 0; k < N; k++) {
-                result[i][j] += A_mat[i][k] * B_mat[j][k];
+    XTime tStart, tEnd;
+    XTime_GetTime(&tStart);
+    for (int i = 0; i < count; i++) {
+
+        XAie_MemSyncForDev(in);
+        XAie_MemSyncForCPU(out);
+
+        breakprint("Starting to Move data\n");
+        // step 3: move data to destination tile
+        // XTime_GetTime(&tStart);
+        // printf("vmem = 0x%p\n",vmem);
+
+        XAie_MoveDataExternal2Aie(routingInstance, /*src=*/XAie_TileLoc(shimcol, 0), in, mlen * sizeof(u32),
+                                  CORE_IP_MEM, /*dest=*/XAie_TileLoc(4, 4));
+
+        breakprint("XAie_RouteDmaWait\n");
+
+        // #if AIE_GEN == XAIE_DEV_GEN_AIE2PS
+        // Wait until the data transfer completes.
+        breakprint("XAie_RouteDmaWait--bbb--\n");
+        // XAie_RouteDmaWait(routingInstance, XAie_TileLoc(shimcol,0), XAie_TileLoc(4,4), false);
+        // #endif
+        breakprint("blockread\n");
+        // blockread(DevInst, CORE_IP_MEM);
+        XAie_Run(routingInstance, 1);
+
+        breakprint("XAie_CoreWaitForDone\n");
+        // wait until core done
+        u8 allDone = 0;
+        uint32_t CoreStatus = 0;
+        // usleep(1000*1000);
+        do {
+            allDone = 1; // Assume all cores are done initially
+            uint32_t coreStatCharWritten = 0;
+            for (int i = 0; i < 1; i++) { // Iterate over the specified tiles
+                RC = XAie_CoreWaitForDone(DevInst, XAie_TileLoc(4, 4), 0);
+
+                if (RC != XAIE_OK) {
+                    allDone = 0;
+                }
+            }
+        } while (!allDone);
+        breakprint("fflush\n");
+        // fflush(stdout);
+
+        XAie_MoveDataAie2External(routingInstance, XAie_TileLoc(4, 4), CORE_OP_MEM, mlen * sizeof(u32), out,
+                                  XAie_TileLoc(shimcol, 0));
+        // XAie_RouteDmaWait(routingInstance, XAie_TileLoc(shimcol,0), XAie_TileLoc(4,4), true);
+
+        /*
+        //XTime_GetTime(&tEnd);
+        //printf("Output took %.2f us.\n", 1.0 * (tEnd - tStart) / (COUNTS_PER_SECOND/1000000));
+
+        //printf("\nFinished moving data back to DDR\n");
+        // step 5 validate data
+        int32_t vmem_out_cpu[recv_len];
+
+        //vmem contains the input (128 samples, 64 of matrix A and 64 of matrix B, in row major and column major forms
+        respectively) and vmem_out contains the output samples (64 of result)
+        //compute CPU Result for softmax
+        int32_t A_mat[N][N];  // Matrix A
+        int32_t B_mat[N][N];  // Matrix B
+        int32_t result[N][N] = {0};  // Result matrix
+
+        // Extract matrix A (row major)
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                A_mat[i][j] = ((int32_t*)vmem)[i * N + j];
             }
         }
-    }
 
-    // Store the result in vmem_out_cpu
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            vmem_out_cpu[i * N + j] = result[i][j];
+        // Extract matrix B (column major)
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                B_mat[i][j] = ((int32_t*)vmem)[MAT_SIZE + i * N + j];  // Adjust index for column major
+            }
         }
-    }
 
- 	int mismatches = 0;
-    for (int i = 0; i < MAT_SIZE; i++) {
-        if (vmem_out_cpu[i] != ((int32_t*)vmem_out)[i]) {
-
-            printf("Mismatch at index %d: CPU=%d, vmem_out=%d\n", i, vmem_out_cpu[i], ((int32_t*)vmem_out)[i]);
-            mismatches++;
+        // Perform matrix multiplication
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                for (int k = 0; k < N; k++) {
+                    result[i][j] += A_mat[i][k] * B_mat[j][k];
+                }
+            }
         }
-    }
 
-	for (int i = 0; i < ((16 > MAT_SIZE) ? MAT_SIZE : 16); i++) {
-            printf("match example at index %d: CPU=%d, vmem_out=%d\n", i, vmem_out_cpu[i], ((int32_t*)vmem_out)[i]);
-    }
+        // Store the result in vmem_out_cpu
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                vmem_out_cpu[i * N + j] = result[i][j];
+            }
+        }
 
-    if (mismatches == 0) {
-        printf("CPU result matches vmem_out.\n");
-    } else {
-        printf("There were %d mismatches.\n", mismatches);
-    }
+        int mismatches = 0;
+        for (int i = 0; i < MAT_SIZE; i++) {
+            if (vmem_out_cpu[i] != ((int32_t*)vmem_out)[i]) {
 
-	printf("\nDone\n");
-	return 0;
+                printf("Mismatch at index %d: CPU=%d, vmem_out=%d\n", i, vmem_out_cpu[i], ((int32_t*)vmem_out)[i]);
+                mismatches++;
+            }
+        }
+
+        for (int i = 0; i < ((16 > MAT_SIZE) ? MAT_SIZE : 16); i++) {
+                printf("match example at index %d: CPU=%d, vmem_out=%d\n", i, vmem_out_cpu[i], ((int32_t*)vmem_out)[i]);
+        }
+
+        if (mismatches == 0) {
+            printf("CPU result matches vmem_out.\n");
+        } else {
+            printf("There were %d mismatches.\n", mismatches);
+        }
+
+        printf("\nDone\n");
+        */
+    }
+    XTime_GetTime(&tEnd);
+    printf("%d KB Time taken: %.2f us.\n", (count * mlen * sizeof(u32)) / 1024,
+           1.0 * (tEnd - tStart) / (COUNTS_PER_SECOND / 1000000));
+    return 0;
 }
 
 int main(int argc, char* argv[]) {

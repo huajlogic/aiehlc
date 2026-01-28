@@ -13,10 +13,10 @@
 #include <stdio.h>
 #if AIE_GEN <= 2
 #define HW_GEN XAIE_DEV_GEN_AIEML
-// #include "xtime_l.h"
+#include "xtime_l.h"
 #else
 #define HW_GEN XAIE_DEV_GEN_AIE2PS
-// #include "xiltimer.h"
+#include "xiltimer.h"
 #endif
 // #include "unistd.h"
 #define uint_TYPE uint32_t
@@ -95,9 +95,10 @@ __attribute__((annotate("streaming"))) __global__ void perf(
 #define MAT_SIZE 128
 #define N 16 // Dimension of the square matrices
 #define VECTOR_LENGTH 16
+#define COUNT 25000
 
     // Acquire windows before accessing data
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < COUNT; i++) {
         // log(0x330 + i);
         window_acquire(win);
         // log(0x332);
@@ -141,7 +142,7 @@ void blockread(XAie_DevInst *DevInst, uint64_t addr) {
     }
 }
 void breakprint(char *info) {
-    // return;
+    return;
     char input;
     printf("input key to run %s\n", info);
     scanf("%c", input);
@@ -152,6 +153,7 @@ void breakprint(char *info) {
  * Debug function to print AIE core and DMA status
  */
 void printAieDebugStatus(XAie_DevInst *DevInst, XAie_LocType tile, const char *context) {
+    return;
     u32 coreStatus = 0;
     u32 lockValue = 0;
     u8 dmaS2mmStatus = 0;
@@ -204,7 +206,7 @@ int test_routing(XAie_DevInst *DevInst) {
     XAie_RoutingInstance *routingInstance;
     // XTime tStart, tEnd;
     breakprint("core reset-- 3");
-    printf("core test_routing-- start ---5\n");
+    // printf("core test_routing-- start ---6\n");
 #if AIE_GEN == XAIE_DEV_GEN_AIE2PS
     int shimcol = 10; // 33;
 #else
@@ -224,7 +226,7 @@ int test_routing(XAie_DevInst *DevInst) {
 
     // printf("Routing successful\n");
     u64 phy = 0, phy_out = 0;
-    u32 mlen = (MAT_SIZE * 2) * 1000;
+    u32 mlen = (MAT_SIZE * 2) * 25000;
     const u32 recv_len = MAT_SIZE;
 
     // Prepare DDR data
@@ -242,6 +244,9 @@ int test_routing(XAie_DevInst *DevInst) {
         ((int32_t *)vmem_out)[i] = 0;
     }
 
+    XTime tStart, tEnd;
+    XTime_GetTime(&tStart);
+
     //((u32*)vmem)[0] = 1024*1024;
 
     XAie_MemSyncForDev(in);
@@ -250,7 +255,7 @@ int test_routing(XAie_DevInst *DevInst) {
     breakprint("Starting to Move data using Streaming APIs\n");
     // step 3: Setup streaming DMA with ping-pong buffers
     // XTime_GetTime(&tStart);
-    printf("vmem = 0x%p\n", vmem);
+    // printf("vmem = 0x%p\n", vmem);
 
     // Initialize locks for input streaming (DMA writes to AIE memory)
     // S2MM: DMA acquires with value 0, releases with value 1
@@ -271,7 +276,7 @@ int test_routing(XAie_DevInst *DevInst) {
     breakprint("after output lock set value\n");
 
     // Setup input streaming: External(single) -> AIE(ping-pong)
-    printf("Setting up input streaming: SHIM -> AIE with ping-pong\n");
+    // printf("Setting up input streaming: SHIM -> AIE with ping-pong\n");
     RC = XAie_MoveDataStreamingIn(routingInstance, XAie_TileLoc(shimcol, 0), // shimTile
                                   in,                                        // extBuffer
                                   mlen * sizeof(u32),                        // extBufferSize (total data)
@@ -290,7 +295,7 @@ int test_routing(XAie_DevInst *DevInst) {
     }
 
     // Setup output streaming: AIE(ping-pong) -> External(single)
-    printf("Setting up output streaming: AIE -> SHIM with ping-pong\n");
+    // printf("Setting up output streaming: AIE -> SHIM with ping-pong\n");
     RC = XAie_MoveDataStreamingOut(routingInstance, XAie_TileLoc(4, 4), // aieTile
                                    CORE_OP_PING,                        // aiePingAddr
                                    CORE_OP_PONG,                        // aiePongAddr
@@ -360,7 +365,7 @@ int test_routing(XAie_DevInst *DevInst) {
     } while (!allDone);
 
     if (allDone) {
-        printf("Core completed successfully!\n");
+        // printf("Core completed successfully!\n");
         printAieDebugStatus(DevInst, XAie_TileLoc(4, 4), "After Core Done");
     }
     breakprint("fflush\n");
@@ -379,6 +384,9 @@ int test_routing(XAie_DevInst *DevInst) {
 
     // Sync output memory for CPU access
     XAie_MemSyncForCPU(out);
+
+    XTime_GetTime(&tEnd);
+    printf("Output took %.2f us.\n", 1.0 * (tEnd - tStart) / (COUNTS_PER_SECOND / 1000000));
     printf("\nFinished streaming data back to DDR\n");
 
     // step 5 validate data
