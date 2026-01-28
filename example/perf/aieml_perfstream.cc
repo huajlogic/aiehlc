@@ -56,12 +56,12 @@
 /* Ping-pong buffer addresses for streaming */
 /* With 1024-byte buffers (256 words), pong must be offset by at least 0x400 */
 #define CORE_IP_PING 0x1000
-#define CORE_IP_PONG 0x1400
-#define CORE_OP_PING 0x2000
-#define CORE_OP_PONG 0x2400
+#define CORE_IP_PONG 0x2000
+#define CORE_OP_PING 0x3000
+#define CORE_OP_PONG 0x4000
 
 /* Buffer sizes for streaming */
-#define PING_PONG_SIZE 256 // Size of each ping/pong buffer in WORDS (256 * 4 = 1024 bytes)
+#define PING_PONG_SIZE 1024 // Size of each ping/pong buffer in WORDS (1024 * 4 = 4096 bytes)
 
 /* BD IDs for streaming */
 #define SHIM_IN_BD_ID 0
@@ -78,27 +78,27 @@
 #define OUT_ACQUIRE_LOCK_ID 2 // kernel access lock for local start from 16, so 2 is the third lock
 #define OUT_RELEASE_LOCK_ID 3 // kernel access lock for local start from 16, so 3 is the fourth lock
 
-#define MAT_SIZE 128 // Size of each matrix (A and B)
+#define MAT_SIZE 512 // Size of each matrix (A and B)
 #define N 16         // Dimension of the square matrices (16x16)
 
 // #define DISABLE_CACHE
 __attribute__((annotate("streaming"))) __global__ void perf(
     input_window_int32 *win
-    __attribute__((annotate("mem_ping_address:0x1000"), annotate("mem_pong_address:0x1400"), annotate("size_hint:1024"),
+    __attribute__((annotate("mem_ping_address:0x1000"), annotate("mem_pong_address:0x2000"), annotate("size_hint:4096"),
                    annotate("lock_acquire_id:48"), annotate("lock_release_id:49"))),
     output_window_int32 *out
-    __attribute__((annotate("mem_ping_address:0x2000"), annotate("mem_pong_address:0x2400"), annotate("size_hint:1024"),
+    __attribute__((annotate("mem_ping_address:0x3000"), annotate("mem_pong_address:0x4000"), annotate("size_hint:4096"),
                    annotate("lock_acquire_id:51"), // kernel acquire lock should be dma release lock cooperate with
                                                    // window_acquire(outpointer ) logic
                    annotate("lock_release_id:50")))) {
-#define DATA_SIZE 256
+#define DATA_SIZE 1024
 #define MAT_SIZE 128
 #define N 16 // Dimension of the square matrices
 #define VECTOR_LENGTH 16
 
     // Acquire windows before accessing data
     for (int i = 0; i < 1000; i++) {
-        log(0x330 + i);
+        // log(0x330 + i);
         window_acquire(win);
         // log(0x332);
         window_acquire(out);
@@ -204,7 +204,7 @@ int test_routing(XAie_DevInst *DevInst) {
     XAie_RoutingInstance *routingInstance;
     // XTime tStart, tEnd;
     breakprint("core reset-- 3");
-    printf("core test_routing-- start 3\n");
+    printf("core test_routing-- start ---5\n");
 #if AIE_GEN == XAIE_DEV_GEN_AIE2PS
     int shimcol = 10; // 33;
 #else
