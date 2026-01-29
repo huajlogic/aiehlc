@@ -198,6 +198,41 @@ def download_elf_and_continue(child):
     print("[Connection 1] Execution started!")
 
 
+def copy_elf_to_remote():
+    """Copy main.elf from local ../aout/ to remote /home/{username}/aiehlc/"""
+    import subprocess
+    
+    import shutil
+    
+    # Get the directory where this script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    local_elf = os.path.join(script_dir, "..", "aout", "main.elf")
+    local_elf = os.path.normpath(local_elf)
+    
+    dest_dir = f"/home/{username}/aiehlc/"
+    dest_elf = os.path.join(dest_dir, "main.elf")
+    
+    print(f">>> Copying ELF file...")
+    print(f"    Source: {local_elf}")
+    print(f"    Destination: {dest_elf}")
+    
+    if not os.path.exists(local_elf):
+        print(f"Error: Local ELF file not found: {local_elf}")
+        return False
+    
+    # Create destination directory if it doesn't exist
+    os.makedirs(dest_dir, exist_ok=True)
+    
+    # Copy the file
+    try:
+        shutil.copy2(local_elf, dest_elf)
+        print(">>> ELF file copied successfully")
+        return True
+    except Exception as e:
+        print(f"Error copying ELF file: {e}")
+        return False
+
+
 def main():
     """Main test function."""
     print("=" * 60)
@@ -205,6 +240,13 @@ def main():
     print(f"Host: {host}")
     print(f"ELF Path: {ELF_PATH}")
     print("=" * 60)
+    
+    # Step 0: Copy ELF file to remote server
+    if not copy_elf_to_remote():
+        print("Failed to copy ELF file, exiting...")
+        sys.exit(1)
+
+    #sys.exit(0)
     
     conn1 = None
     conn2 = None
@@ -230,49 +272,30 @@ def main():
         )
         console_thread.start()
         
-        # Wait for console output - check every 1 second
-        print("\n>>> Waiting for console output...")
-        max_wait = 120  # Maximum wait time in seconds
-        wait_count = 0
-        last_queue_size = 0
-        no_change_count = 0
-        output_detected = False
-        
-        print("\n" + "=" * 60)
-        print("CONSOLE OUTPUT FROM COM0 (Connection 2):")
-        print("=" * 60)
-        
-        while wait_count < max_wait:
-            time.sleep(1)
-            wait_count += 1
-            
-            # Check and print any output in the queue
-            has_output = False
-            while not console_output_queue.empty():
-                output = console_output_queue.get()
-                print(output, end='', flush=True)
-                has_output = True
-                output_detected = True
-            
-            if has_output:
-                # Reset no-output counter when we get output
-                no_change_count = 0
-            else:
-                # No output this second
-                no_change_count += 1
-                if no_change_count >= 10:
-                    print(f"\n>>> No output for {no_change_count} seconds, stopping console read")
-                    break
-        
-        print("\n" + "=" * 60)
-        
-        if not output_detected:
-            print("[No output received from com0 serial console]")
+        # Wait 20 seconds for console output
+        print("\n>>> Waiting 10 seconds for console output...")
+        time.sleep(10)
         
         # Stop console reader
         stop_console_thread.set()
         if console_thread:
             console_thread.join(timeout=5)
+        
+        # Print all console output
+        print("\n" + "=" * 60)
+        print("CONSOLE OUTPUT FROM COM0 (Connection 2):")
+        print("=" * 60)
+        
+        output_detected = False
+        while not console_output_queue.empty():
+            output = console_output_queue.get()
+            print(output, end='', flush=True)
+            output_detected = True
+        
+        print("\n" + "=" * 60)
+        
+        if not output_detected:
+            print("[No output received from com0 serial console]")
         
         # Step 6: Go back to conn1, exit xsdb and power off
         print("\n>>> Cleaning up Connection 1...")

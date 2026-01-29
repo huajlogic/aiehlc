@@ -386,7 +386,8 @@ int test_routing(XAie_DevInst *DevInst) {
     XAie_MemSyncForCPU(out);
 
     XTime_GetTime(&tEnd);
-    printf("Output took %.2f us.\n", 1.0 * (tEnd - tStart) / (COUNTS_PER_SECOND / 1000000));
+    printf("-%d KB Output took %.2f us.\n", (mlen * sizeof(u32)) / 1024,
+           1.0 * (tEnd - tStart) / (COUNTS_PER_SECOND / 1000000));
     printf("\nFinished streaming data back to DDR\n");
 
     // step 5 validate data
