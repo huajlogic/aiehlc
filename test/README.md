@@ -167,7 +167,7 @@ If the debug configuration menu still doesn't show "Python File" after installin
 
 ## Part 2: SSH Public Key Authentication Setup
 
-This section explains how to enable passwordless SSH login to remote servers like `<username>@10.23.224.***`.
+This section explains how to enable passwordless SSH login to remote servers like `<username>@10.***.***.***`.
 
 ### Prerequisites
 
@@ -197,7 +197,7 @@ ls -la ~/.ssh/id_ed25519*
 ### Option A: Using ssh-copy-id (Recommended)
 
 ```bash
-ssh-copy-id <username>@10.23.224.***
+ssh-copy-id <username>@10.***.***.***
 ```
 
 Enter your password when prompted. The key will be automatically added.
@@ -211,7 +211,7 @@ Enter your password when prompted. The key will be automatically added.
 
 2. SSH to remote server (with password):
    ```bash
-   ssh <username>@10.23.224.***
+   ssh <username>@10.***.***.***
    ```
 
 3. Add the key to authorized_keys:
@@ -250,7 +250,7 @@ chmod 644 ~/.ssh/id_ed25519.pub
 ### Step 4: Test Connection
 
 ```bash
-ssh <username>@10.23.224.***
+ssh <username>@10.***.***.***
 ```
 
 You should now login without being prompted for a password.
@@ -274,7 +274,7 @@ You should now login without being prompted for a password.
 
 2. **Debug the connection**:
    ```bash
-   ssh -vvv <username>@10.23.224.*** 2>&1 | grep -i "auth\|key\|offer"
+   ssh -vvv <username>@10.***.***.*** 2>&1 | grep -i "auth\|key\|offer"
    ```
 
 3. **Check server auth log** (on remote server):
@@ -312,7 +312,7 @@ Create/edit `~/.ssh/config` on your local machine:
 
 ```
 Host myserver
-    HostName 10.23.224.***
+    HostName 10.***.***.***
     User <username>
     IdentityFile ~/.ssh/id_ed25519
 ```
@@ -330,11 +330,11 @@ ssh myserver
 ssh-keygen -t ed25519 -C "email@example.com"
 
 # Copy key to server
-ssh-copy-id <username>@10.23.224.***
+ssh-copy-id <username>@10.***.***.***
 
 # Fix permissions on remote server
-ssh <username>@10.23.224.*** "chmod 755 ~ && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+ssh <username>@10.***.***.*** "chmod 755 ~ && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
 
 # Test connection
-ssh <username>@10.23.224.***
+ssh <username>@10.***.***.***
 ```
