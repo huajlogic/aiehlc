@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""MIT License
+* Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+"""
 """
 Palboard ELF Test Script
 

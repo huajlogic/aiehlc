@@ -1,4 +1,7 @@
 #!/bin/bash
+#MIT License
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: MIT
 # Environment setup for mainelfpaltest.py
 # Source this file before running the test: source env.sh
 
