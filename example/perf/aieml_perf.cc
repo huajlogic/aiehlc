@@ -113,7 +113,7 @@ int test_routing(XAie_DevInst *DevInst)
 	AieRC RC = XAIE_OK;
 	XAie_RoutingInstance* routingInstance;
   	//XTime tStart, tEnd;
-    printf("Starting test_routing 01/27\n");
+    printf("Starting test_routing 01/28\n");
     breakprint("core reset--");
 #if AIE_GEN == XAIE_DEV_GEN_AIE2PS
     int shimcol = 10; // 33;
@@ -275,7 +275,7 @@ int test_routing(XAie_DevInst *DevInst)
         */
     }
     XTime_GetTime(&tEnd);
-    printf("%d KB Time taken: %.2f us.\n", (count * mlen * sizeof(u32)) / 1024,
+    printf("-%d KB Time taken: %.2f us.\n", (count * mlen * sizeof(u32)) / 1024,
            1.0 * (tEnd - tStart) / (COUNTS_PER_SECOND / 1000000));
     return 0;
 }
