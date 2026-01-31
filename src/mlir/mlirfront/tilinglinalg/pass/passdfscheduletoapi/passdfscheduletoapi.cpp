@@ -1521,6 +1521,14 @@ struct DsKernelReceiverPattern : public ConversionPattern {
 // Kernel Module Conversion Pattern
 //===----------------------------------------------------------------------===//
 
+/// Structure to hold buffer definition info
+struct BufferDefInfo {
+    std::string name;
+    int64_t size = 256;
+    int32_t vectorWidth = 4;
+    std::string elementType = "int32";
+};
+
 /// Structure to hold extracted kernel module information
 struct KernelModuleInfo {
     std::string moduleName;
@@ -1540,6 +1548,9 @@ struct KernelModuleInfo {
     // Window names
     std::string inputWindowName = "win";
     std::string outputWindowName = "out";
+
+    // Buffer definitions extracted from dfschedule.buffer_def ops
+    SmallVector<BufferDefInfo> bufferDefs;
 };
 
 /// Extract kernel module information from dfschedule.module operation
@@ -1614,6 +1625,52 @@ static KernelModuleInfo extractKernelModuleInfo(dfschedule::KernelModuleOp modul
                 }
             }
         }
+
+        // Extract buffer definitions
+        if (auto bufferOp = dyn_cast<dfschedule::BufferDefOp>(op)) {
+            BufferDefInfo bufInfo;
+            bufInfo.name = bufferOp.getSymName().str();
+
+            // Parse buffer type: memref<256xvector<4xi32>, "LOCAL">
+            TypeAttr bufferTypeAttr = bufferOp.getBufferTypeAttr();
+            if (auto memrefType = dyn_cast<MemRefType>(bufferTypeAttr.getValue())) {
+                // Get shape (e.g., 256)
+                if (!memrefType.getShape().empty()) {
+                    bufInfo.size = memrefType.getShape()[0];
+                }
+
+                // Get element type (could be vector<4xi32>)
+                Type elemType = memrefType.getElementType();
+                if (auto vecType = dyn_cast<VectorType>(elemType)) {
+                    // Vector type: extract width and element type
+                    if (!vecType.getShape().empty()) {
+                        bufInfo.vectorWidth = vecType.getShape()[0];
+                    }
+                    Type scalarType = vecType.getElementType();
+                    if (scalarType.isInteger(32))
+                        bufInfo.elementType = "int32";
+                    else if (scalarType.isInteger(16))
+                        bufInfo.elementType = "int16";
+                    else if (scalarType.isInteger(8))
+                        bufInfo.elementType = "int8";
+                    else if (scalarType.isF32())
+                        bufInfo.elementType = "float";
+                } else {
+                    // Scalar type
+                    bufInfo.vectorWidth = 1;
+                    if (elemType.isInteger(32))
+                        bufInfo.elementType = "int32";
+                    else if (elemType.isInteger(16))
+                        bufInfo.elementType = "int16";
+                    else if (elemType.isInteger(8))
+                        bufInfo.elementType = "int8";
+                    else if (elemType.isF32())
+                        bufInfo.elementType = "float";
+                }
+            }
+
+            info.bufferDefs.push_back(bufInfo);
+        }
     });
 
     return info;
@@ -1637,60 +1694,92 @@ static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
 
     // Generate includes and defines
     code << "/* ========== Kernel Driver: " << info.moduleName << " ========== */\n";
+    code << "#include <adf.h>\n";
     code << "#include <aie_api/aie.hpp>\n";
-    code << "#include \"aie2ipu_core.h\"\n\n";
+    code << "#include <aie_api/aie_adf.hpp>\n";
+    code << "#define FOR_READ  1\n";
+    code << "#define FOR_WRITE 0\n";
+    code << "#define BUF_SZ " << info.bufferSize << "\n\n";
 
-    code << "#define BUF_SZ " << info.bufferSize << "\n";
-    code << "using namespace aie::vector;\n\n";
+    code << "volatile static int sync_buffer[8] = {0, -1};\n\n";
+    code << "#include <adf/sync/mesync.h>\n\n";
 
-    // Generate kernel declaration
-    code << "__attribute__((always_inline)) void " << info.kernelName << "(" << vecTypeName << " *restrict win, "
-         << vecTypeName << " *restrict out);\n\n";
+    // Generate debug logging helpers
+    code << "// =============================================================================\n";
+    code << "// Debug logging at fixed address 0x73000\n";
+    code << "// =============================================================================\n";
+    code << "#define LOG_BASE_ADDR 0x73000\n";
+    code << "static volatile int* log_ptr = (volatile int*)LOG_BASE_ADDR;\n";
+    code << "static int log_index = 0;\n\n";
+    code << "inline void log(int value) { log_ptr[log_index++] = value; }\n";
+    code << "inline void log_at(int index, int value) { log_ptr[index] = value; }\n";
+    code << "inline void log_reset() { log_index = 0; }\n\n";
 
     // Generate lock defines
     code << "#define LOCK_win_ping_ACQ " << info.inputAcquireLockId << "\n";
-    code << "#define LOCK_win_pong_ACQ " << info.inputReleaseLockId << "\n";
-    code << "#define LOCK_out_ping_REL " << info.outputReleaseLockId << "\n";
-    code << "#define LOCK_out_pong_REL " << info.outputAcquireLockId << "\n\n";
+    code << "#define LOCK_win_pong_REL " << info.inputReleaseLockId << "\n";
+    code << "#define LOCK_out_ping_ACQ " << info.outputAcquireLockId << "\n";
+    code << "#define LOCK_out_pong_REL " << info.outputReleaseLockId << "\n\n";
 
-    // Generate window declarations
-    code << "input_async_window<" << vecTypeName << ", BUF_SZ, LOCK_win_ping_ACQ, LOCK_win_pong_ACQ>  win;\n";
-    code << "output_async_window<" << vecTypeName << ", BUF_SZ, LOCK_out_ping_REL, LOCK_out_pong_REL> out;\n\n";
-
-    // Generate kernel driver function
-    // Extract function name from module name (remove "kernel_driver_" prefix)
-    std::string funcName = info.moduleName;
-    if (funcName.find("kernel_driver_") == 0) {
-        funcName = funcName.substr(14); // Remove "kernel_driver_" prefix
+    // Generate buffer declarations from extracted buffer definitions
+    if (!info.bufferDefs.empty()) {
+        for (const auto &buf : info.bufferDefs) {
+            std::string bufVecType = "v" + std::to_string(buf.vectorWidth) + buf.elementType;
+            code << bufVecType << " " << buf.name << "[BUF_SZ];\n";
+        }
+        code << "\n";
+    } else {
+        // Fallback to default buffer names if no buffer defs extracted
+        code << vecTypeName << " win_ping[BUF_SZ];\n";
+        code << vecTypeName << " win_pong[BUF_SZ];\n";
+        code << vecTypeName << " out_ping[BUF_SZ];\n";
+        code << vecTypeName << " out_pong[BUF_SZ];\n\n";
     }
 
-    code << "__global__ void " << funcName << "(int iterations)\n";
-    code << "{\n";
-    code << "    uint8_t syncbuf[8];\n";
-    code << "    syncbuf[0] = 0; // reset end signal\n";
-    code << "    aie::tile tile_t = aie::tile::current();\n";
-    code << "    log(1);\n\n";
+    // Include the kernel file
+    if (!info.kernelFile.empty()) {
+        code << "#include \"" << info.kernelFile << "\"\n\n";
+    }
+
+    // Generate main function (kernel driver entry point)
+    code << "int main(void) {\n";
+    code << "    log(1);  // Log: entering main\n";
+    code << "    sync_buffer[0] = 0; // reset end signal\n\n";
 
     // Generate kernel invocation based on iteration style
     if (info.iterationStyle == "internal") {
-        // Legacy style: ptr_init once, call kernel once
+        // Legacy style: window_init once, call kernel once
         code << "    // Legacy style: kernel handles iterations internally\n";
-        code << "    " << vecTypeName << " *win_ptr = (" << vecTypeName << " *)win.ptr_init();\n";
-        code << "    " << vecTypeName << " *out_ptr = (" << vecTypeName << " *)out.ptr_init();\n";
-        code << "    " << info.kernelName << "(win_ptr, out_ptr);\n";
+        code << "    window_internal window_win_ping[1];\n";
+        code << "    window_init(window_win_ping, 1, win_ping, LOCK_win_ping_ACQ, win_pong, LOCK_win_pong_REL, BUF_SZ, "
+                "BUF_SZ);\n";
+        code << "    input_window_int32* win_ping_ptr = get_input_async_window_int32(window_win_ping);\n\n";
+        code << "    window_internal window_out_ping[1];\n";
+        code << "    window_init(window_out_ping, 1, out_ping, LOCK_out_ping_ACQ, out_pong, LOCK_out_pong_REL, BUF_SZ, "
+                "BUF_SZ);\n";
+        code << "    output_window_int32* out_ping_ptr = get_output_async_window_int32(window_out_ping);\n\n";
+        code << "    // Call kernel\n";
+        code << "    " << info.kernelName << "(win_ping_ptr, out_ping_ptr);\n";
     } else {
         // ADF style: loop with acquire/release
         code << "    // ADF style: wrapper handles iterations with acquire/release\n";
+        code << "    window_internal window_win_ping[1];\n";
+        code << "    window_init(window_win_ping, 1, win_ping, LOCK_win_ping_ACQ, win_pong, LOCK_win_pong_REL, BUF_SZ, "
+                "BUF_SZ);\n\n";
+        code << "    window_internal window_out_ping[1];\n";
+        code << "    window_init(window_out_ping, 1, out_ping, LOCK_out_ping_ACQ, out_pong, LOCK_out_pong_REL, BUF_SZ, "
+                "BUF_SZ);\n\n";
         code << "    for(int i = 0; i < iterations; i++) {\n";
-        code << "        " << vecTypeName << " *win_ptr = (" << vecTypeName << " *)win.acquire();\n";
-        code << "        " << vecTypeName << " *out_ptr = (" << vecTypeName << " *)out.acquire();\n";
+        code << "        input_window_int32* win_ptr = window_acquire_in(window_win_ping);\n";
+        code << "        output_window_int32* out_ptr = window_acquire_out(window_out_ping);\n";
         code << "        " << info.kernelName << "(win_ptr, out_ptr);\n";
-        code << "        win.release();\n";
-        code << "        out.release();\n";
+        code << "        window_release(window_win_ping);\n";
+        code << "        window_release(window_out_ping);\n";
         code << "    }\n";
     }
 
     code << "\n    done();\n";
+    code << "    return 0;\n";
     code << "}\n";
     code << "/* ========== End Kernel Driver ========== */\n";
 

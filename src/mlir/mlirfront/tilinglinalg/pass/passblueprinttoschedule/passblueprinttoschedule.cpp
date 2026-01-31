@@ -187,12 +187,13 @@ static Operation* getModuleOp(Operation *rootOp) {
 
 // Structure to hold kernel generation parameters
 struct KernelGenParams {
-    StringRef kernelName;     // e.g., "perf", "passthrough"
-    StringRef kernelFile;     // e.g., "perf.cc"
-    int64_t bufferSize;       // e.g., 256
-    Type elementType;         // e.g., i32
-    int32_t vectorWidth;      // e.g., 4
-    StringRef iterationStyle; // "internal" or "external"
+    StringRef kernelName;        // Wrapper function name, e.g., "dskernel_receiver"
+    StringRef computeKernelName; // Actual compute kernel name, e.g., "perf"
+    StringRef kernelFile;        // e.g., "perf.cc"
+    int64_t bufferSize;          // e.g., 256
+    Type elementType;            // e.g., i32
+    int32_t vectorWidth;         // e.g., 4
+    StringRef iterationStyle;    // "internal" or "external"
 
     // Lock IDs (base values, will be offset for ping/pong)
     int32_t inputAcquireLockId;  // e.g., 48
@@ -239,7 +240,7 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
     // 1. Kernel Config (metadata)
     // =========================================================================
     NamedAttrList configAttrs;
-    configAttrs.append("kernel_name", rewriter.getStringAttr(params.kernelName));
+    configAttrs.append("kernel_name", rewriter.getStringAttr(params.computeKernelName));
     configAttrs.append("kernel_file", rewriter.getStringAttr(params.kernelFile));
     configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(params.bufferSize));
     configAttrs.append("element_type", TypeAttr::get(params.elementType));
@@ -327,7 +328,7 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
     kernelDeclAttrs.append("outputs", rewriter.getArrayAttr(outputWindowRefs));
     kernelDeclAttrs.append("iteration_style", rewriter.getStringAttr(params.iterationStyle));
 
-    rewriter.create<dfschedule::KernelDeclOp>(loc, rewriter.getStringAttr(params.kernelName),
+    rewriter.create<dfschedule::KernelDeclOp>(loc, rewriter.getStringAttr(params.computeKernelName),
                                               rewriter.getDictionaryAttr(kernelDeclAttrs));
 
     // =========================================================================
@@ -370,8 +371,8 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
     kernelArgs.push_back(winPtrOp.getResult());
     kernelArgs.push_back(outPtrOp.getResult());
 
-    rewriter.create<dfschedule::KernelInvokeOp>(loc, SymbolRefAttr::get(rewriter.getContext(), params.kernelName),
-                                                kernelArgs);
+    rewriter.create<dfschedule::KernelInvokeOp>(
+        loc, SymbolRefAttr::get(rewriter.getContext(), params.computeKernelName), kernelArgs);
 
     // --- Signal completion ---
     rewriter.create<dfschedule::DoneOp>(loc);
@@ -396,9 +397,10 @@ static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Locati
 
     // Build kernel generation parameters
     KernelGenParams params;
-    params.kernelName = kernelName;
-    params.kernelFile = "perf.cc"; // Default kernel file
-    params.bufferSize = 256;       // Default buffer size (BUF_SZ)
+    params.kernelName = kernelName;              // Wrapper function name (e.g., "dskernel_receiver")
+    params.computeKernelName = "compute_kernel"; // Actual compute kernel name
+    params.kernelFile = "compute_kernel.cc";     // Kernel source file
+    params.bufferSize = 256;                     // Default buffer size (BUF_SZ)
     params.elementType = rewriter.getI32Type();
     params.vectorWidth = 4;
     params.iterationStyle = "internal"; // Legacy style: loop inside kernel
