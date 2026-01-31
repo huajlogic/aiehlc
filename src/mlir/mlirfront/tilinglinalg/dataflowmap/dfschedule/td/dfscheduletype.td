@@ -70,4 +70,25 @@ def dfschedule_DmaChannelType : dfscheduleype<"DmaChannel"> {
   let summary = "DMA channel identifier";
 }
 
+//=== Sync Buffer Type ===//
+def dfschedule_SyncBufferType : dfscheduleype<"SyncBuffer"> {
+  let mnemonic = "sync_buffer";
+  let summary = "Sync buffer for inter-iteration control signals";
+}
+
+//=== Window Types (for kernel I/O abstraction) ===//
+def dfschedule_InputWindowType : dfscheduleype<"InputWindow"> {
+  let mnemonic = "input_window";
+  let summary = "Abstract input window type with element type parameter";
+  let parameters = (ins "Type":$elementType);
+  let assemblyFormat = "`<` $elementType `>`";
+}
+
+def dfschedule_OutputWindowType : dfscheduleype<"OutputWindow"> {
+  let mnemonic = "output_window";
+  let summary = "Abstract output window type with element type parameter";
+  let parameters = (ins "Type":$elementType);
+  let assemblyFormat = "`<` $elementType `>`";
+}
+
 #endif //_TYPE_dfschedule_

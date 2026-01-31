@@ -94,37 +94,32 @@ __attribute__((annotate("streaming"))) __global__ void perf(
 #define DATA_SIZE 1024
 #define MAT_SIZE 128
 #define N 16 // Dimension of the square matrices
-#define VECTOR_LENGTH 16
+#define VECTOR_LENGTH 32
 #define COUNT 25000
 
     // Acquire windows before accessing data
-    for (int i = 0; i < COUNT; i++) {
-        // log(0x330 + i);
+    for (int iter = 0; iter < COUNT; iter++) {
         window_acquire(win);
-        // log(0x332);
         window_acquire(out);
-        // log(0x333);
 
-        // aie::vector<int32_t, VECTOR_LENGTH> temp_a = window_readincr_v<VECTOR_LENGTH>(win);
-        // aie::store_unaligned_v<VECTOR_LENGTH>(A_mat + (w*VECTOR_LENGTH), temp_a);
-        uint32_t *ptr_out = (uint32_t *)out->ptr; //(0x70000 + 0x2000);
-        uint32_t *ptr_in = (uint32_t *)win->ptr;  //(0x70000 + 0x1000);
+        int32_t *ptr_out = (int32_t *)out->ptr; //(0x70000 + 0x2000);
+        int32_t *ptr_in = (int32_t *)win->ptr;  //(0x70000 + 0x1000);
 
-        uint32_t *vec1 = ((uint32_t *)ptr_in), *vec2 = ((uint32_t *)ptr_in + MAT_SIZE);
-        /*
-        for (int i = 0; i < N; i++) {
-            for (uint32_t j = 0; j < N; j++) {
-                uint32_t ret = 0;
-                for (int k = 0; k < N; k++) {
-                    ret += vec1[i * N + k] * vec2[j * N + k];
-                }
-                ptr_out[i * N + j] = ret;
-            }
+        // Use vector operations for maximum throughput
+        // Process 32 elements at a time using AIE vector intrinsics with loop unrolling
+        for (int j = 0; j < DATA_SIZE; j += VECTOR_LENGTH * 2) {
+            // Process first 32 elements
+            aie::vector<int32_t, VECTOR_LENGTH> v0 = aie::load_v<VECTOR_LENGTH>(ptr_in + j);
+            aie::vector<int32_t, VECTOR_LENGTH> v1 = aie::load_v<VECTOR_LENGTH>(ptr_in + j + VECTOR_LENGTH);
+
+            // Use add instead of multiply (v * 2 = v + v)
+            v0 = aie::add(v0, v0);
+            v1 = aie::add(v1, v1);
+
+            aie::store_v(ptr_out + j, v0);
+            aie::store_v(ptr_out + j + VECTOR_LENGTH, v1);
         }
-        */
-        for (int i = 0; i < DATA_SIZE; i++) {
-            ptr_out[i] = ptr_in[i] * 2;
-        }
+
         // Release windows after processing
         window_release(out);
         window_release(win);

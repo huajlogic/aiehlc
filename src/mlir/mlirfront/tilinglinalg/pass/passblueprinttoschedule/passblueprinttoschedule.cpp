@@ -135,6 +135,29 @@ static bool hasDSKernelReceiver(Operation *rootOp, StringRef kernelName) {
     return false;
 }
 
+// Helper function to check if kernel module already exists in the module
+static bool hasKernelModule(Operation *rootOp, StringRef moduleName) {
+    // Find the module-level operation
+    Operation *moduleOp = rootOp;
+    while (moduleOp->getParentOp()) {
+        moduleOp = moduleOp->getParentOp();
+    }
+
+    // Search for existing kernel module with the given name
+    for (Region &region : moduleOp->getRegions()) {
+        for (Block &block : region) {
+            for (Operation &op : block) {
+                if (auto kernelModule = dyn_cast<dfschedule::KernelModuleOp>(&op)) {
+                    if (kernelModule.getSymName() == moduleName) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // Helper function to get the module-level insertion point
 static Operation* getModuleOp(Operation *rootOp) {
     Operation *moduleOp = rootOp;
@@ -144,7 +167,221 @@ static Operation* getModuleOp(Operation *rootOp) {
     return moduleOp;
 }
 
-// Generate dfschedule.dskernel_receiver function
+// =============================================================================
+// Kernel Module IR Generation
+// =============================================================================
+// Generates a general-purpose kernel module IR that can be lowered by different
+// passes to produce either:
+//   - LegacyKernelPass  -> adfkernellegacy.cc style (loop inside kernel)
+//   - AdfKernelPass     -> adfkernel.cc style (loop in wrapper)
+//
+// The generated IR uses abstract operations:
+//   - dfschedule.module           : top-level kernel module
+//   - dfschedule.kernel_config    : kernel metadata
+//   - dfschedule.lock_def         : named lock definitions
+//   - dfschedule.buffer           : named buffer declarations
+//   - dfschedule.window           : abstract window (ping/pong + locks)
+//   - dfschedule.kernel_decl      : kernel signature with iteration_style
+//   - dfschedule.main             : entry point with kernel_invoke
+// =============================================================================
+
+// Structure to hold kernel generation parameters
+struct KernelGenParams {
+    StringRef kernelName;     // e.g., "perf", "passthrough"
+    StringRef kernelFile;     // e.g., "perf.cc"
+    int64_t bufferSize;       // e.g., 256
+    Type elementType;         // e.g., i32
+    int32_t vectorWidth;      // e.g., 4
+    StringRef iterationStyle; // "internal" or "external"
+
+    // Lock IDs (base values, will be offset for ping/pong)
+    int32_t inputAcquireLockId;  // e.g., 48
+    int32_t inputReleaseLockId;  // e.g., 49
+    int32_t outputAcquireLockId; // e.g., 51
+    int32_t outputReleaseLockId; // e.g., 50
+};
+
+// Generate dfschedule.module with kernel_config, locks, buffers, windows, kernel_decl, and main
+// This is the general-purpose kernel module that can be lowered by different passes
+static void generateKernelModule(ConversionPatternRewriter &rewriter, Location loc, Operation *insertBeforeOp,
+                                 const KernelGenParams &params, RankedTensorType tensorType) {
+
+    // Create module name from kernel name
+    std::string moduleName = "kernel_driver_" + params.kernelName.str();
+
+    // Check if kernel module already exists - skip if duplicate
+    if (hasKernelModule(insertBeforeOp, moduleName)) {
+        return;
+    }
+
+    // Save current insertion point
+    OpBuilder::InsertionGuard guard(rewriter);
+
+    // Find module and insert at module level
+    Operation *rootModuleOp = getModuleOp(insertBeforeOp);
+    Block &moduleBlock = rootModuleOp->getRegions().front().front();
+
+    // Check if block has a terminator, insert before it; otherwise insert at end
+    if (!moduleBlock.empty() && moduleBlock.back().hasTrait<OpTrait::IsTerminator>()) {
+        rewriter.setInsertionPoint(&moduleBlock.back());
+    } else {
+        rewriter.setInsertionPointToEnd(&moduleBlock);
+    }
+
+    // Create the dfschedule.module operation
+    auto kernelModuleOp = rewriter.create<dfschedule::KernelModuleOp>(loc, rewriter.getStringAttr(moduleName));
+
+    // Create the body block for the module
+    Block *body = &kernelModuleOp.getBody().emplaceBlock();
+    rewriter.setInsertionPointToStart(body);
+
+    // =========================================================================
+    // 1. Kernel Config (metadata)
+    // =========================================================================
+    NamedAttrList configAttrs;
+    configAttrs.append("kernel_name", rewriter.getStringAttr(params.kernelName));
+    configAttrs.append("kernel_file", rewriter.getStringAttr(params.kernelFile));
+    configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(params.bufferSize));
+    configAttrs.append("element_type", TypeAttr::get(params.elementType));
+    configAttrs.append("vector_width", rewriter.getI32IntegerAttr(params.vectorWidth));
+
+    rewriter.create<dfschedule::KernelConfigDefOp>(loc, rewriter.getStringAttr("config"),
+                                                   rewriter.getDictionaryAttr(configAttrs));
+
+    // =========================================================================
+    // 2. Lock Definitions
+    // =========================================================================
+    // Input window locks
+    rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_win_ping_ACQ"),
+                                           rewriter.getI32IntegerAttr(params.inputAcquireLockId));
+
+    rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_win_pong_REL"),
+                                           rewriter.getI32IntegerAttr(params.inputReleaseLockId));
+
+    // Output window locks
+    rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_out_ping_ACQ"),
+                                           rewriter.getI32IntegerAttr(params.outputAcquireLockId));
+
+    rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_out_pong_REL"),
+                                           rewriter.getI32IntegerAttr(params.outputReleaseLockId));
+
+    // =========================================================================
+    // 3. Buffer Declarations (ping/pong pairs)
+    // =========================================================================
+    // Create LOCAL memref type: memref<BUF_SZ x vector<4xi32>, "LOCAL">
+    auto vectorType = VectorType::get({params.vectorWidth}, params.elementType);
+    auto localMemRefType =
+        MemRefType::get({params.bufferSize}, vectorType, AffineMap(), rewriter.getStringAttr("LOCAL"));
+
+    // Input window buffers
+    rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("win_ping"), TypeAttr::get(localMemRefType));
+
+    rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("win_pong"), TypeAttr::get(localMemRefType));
+
+    // Output window buffers
+    rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("out_ping"), TypeAttr::get(localMemRefType));
+
+    rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("out_pong"), TypeAttr::get(localMemRefType));
+
+    // =========================================================================
+    // 4. Window Definitions (abstract ping-pong window with locks)
+    // =========================================================================
+    // Input window
+    NamedAttrList winInAttrs;
+    winInAttrs.append("direction", rewriter.getStringAttr("in"));
+    winInAttrs.append("ping_buffer", SymbolRefAttr::get(rewriter.getContext(), "win_ping"));
+    winInAttrs.append("pong_buffer", SymbolRefAttr::get(rewriter.getContext(), "win_pong"));
+    winInAttrs.append("acquire_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_win_ping_ACQ"));
+    winInAttrs.append("release_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_win_pong_REL"));
+    winInAttrs.append("buffer_size", rewriter.getI32IntegerAttr(params.bufferSize));
+    winInAttrs.append("async", rewriter.getBoolAttr(true));
+
+    rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr("window_in"),
+                                             rewriter.getDictionaryAttr(winInAttrs));
+
+    // Output window
+    NamedAttrList winOutAttrs;
+    winOutAttrs.append("direction", rewriter.getStringAttr("out"));
+    winOutAttrs.append("ping_buffer", SymbolRefAttr::get(rewriter.getContext(), "out_ping"));
+    winOutAttrs.append("pong_buffer", SymbolRefAttr::get(rewriter.getContext(), "out_pong"));
+    winOutAttrs.append("acquire_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_out_ping_ACQ"));
+    winOutAttrs.append("release_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_out_pong_REL"));
+    winOutAttrs.append("buffer_size", rewriter.getI32IntegerAttr(params.bufferSize));
+    winOutAttrs.append("async", rewriter.getBoolAttr(true));
+
+    rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr("window_out"),
+                                             rewriter.getDictionaryAttr(winOutAttrs));
+
+    // =========================================================================
+    // 5. Kernel Declaration
+    // =========================================================================
+    // Build inputs/outputs as symbol refs to windows
+    SmallVector<Attribute> inputWindowRefs;
+    inputWindowRefs.push_back(SymbolRefAttr::get(rewriter.getContext(), "window_in"));
+
+    SmallVector<Attribute> outputWindowRefs;
+    outputWindowRefs.push_back(SymbolRefAttr::get(rewriter.getContext(), "window_out"));
+
+    NamedAttrList kernelDeclAttrs;
+    kernelDeclAttrs.append("inputs", rewriter.getArrayAttr(inputWindowRefs));
+    kernelDeclAttrs.append("outputs", rewriter.getArrayAttr(outputWindowRefs));
+    kernelDeclAttrs.append("iteration_style", rewriter.getStringAttr(params.iterationStyle));
+
+    rewriter.create<dfschedule::KernelDeclOp>(loc, rewriter.getStringAttr(params.kernelName),
+                                              rewriter.getDictionaryAttr(kernelDeclAttrs));
+
+    // =========================================================================
+    // 6. Main Entry Point
+    // =========================================================================
+    auto mainOp = rewriter.create<dfschedule::KernelMainOp>(loc, rewriter.getStringAttr("main"));
+
+    // Create the body block for main
+    Block *mainBody = &mainOp.getBody().emplaceBlock();
+    rewriter.setInsertionPointToStart(mainBody);
+
+    // --- Sync buffer ---
+    auto syncBufferType = dfschedule::SyncBufferType::get(rewriter.getContext());
+    auto syncBufferOp =
+        rewriter.create<dfschedule::AllocSyncBufferOp>(loc, syncBufferType, rewriter.getI32IntegerAttr(8));
+
+    // Reset end signal: sync_buffer[0] = 0
+    auto c0_i32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+    rewriter.create<dfschedule::SyncBufferWriteOp>(loc, syncBufferOp.getResult(), c0_i32.getResult(),
+                                                   rewriter.getI32IntegerAttr(0));
+
+    // --- Debug logging ---
+    auto c1_i32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(1));
+    rewriter.create<dfschedule::LogOp>(loc, c1_i32.getResult());
+
+    // --- Window initialization ---
+    // %win_ptr = dfschedule.window_init(@window_in)
+    auto inputWindowType = dfschedule::InputWindowType::get(rewriter.getContext(), params.elementType);
+    auto winPtrOp = rewriter.create<dfschedule::WindowInitOp>(loc, inputWindowType,
+                                                              SymbolRefAttr::get(rewriter.getContext(), "window_in"));
+
+    // %out_ptr = dfschedule.window_init(@window_out)
+    auto outputWindowType = dfschedule::OutputWindowType::get(rewriter.getContext(), params.elementType);
+    auto outPtrOp = rewriter.create<dfschedule::WindowInitOp>(loc, outputWindowType,
+                                                              SymbolRefAttr::get(rewriter.getContext(), "window_out"));
+
+    // --- Kernel invocation ---
+    // dfschedule.kernel_invoke @perf(%win_ptr, %out_ptr)
+    SmallVector<Value> kernelArgs;
+    kernelArgs.push_back(winPtrOp.getResult());
+    kernelArgs.push_back(outPtrOp.getResult());
+
+    rewriter.create<dfschedule::KernelInvokeOp>(loc, SymbolRefAttr::get(rewriter.getContext(), params.kernelName),
+                                                kernelArgs);
+
+    // --- Signal completion ---
+    rewriter.create<dfschedule::DoneOp>(loc);
+
+    // --- Return ---
+    rewriter.create<dfschedule::KernelReturnOp>(loc);
+}
+
+// Generate dfschedule.dskernel_receiver function (legacy style)
+// This is kept for backward compatibility and will call generateKernelModule internally
 // Parameters:
 //   - kernelName: symbol name for the kernel (same as load_kernel_group callee)
 //   - tensorType: the tensor type for data
@@ -152,274 +389,28 @@ static Operation* getModuleOp(Operation *rootOp) {
 //   - basePacketId: base packet ID from FlowTransferOp
 //   - coreChannel: DMA channel from core FlowConfig
 //   - flowIndex: unique index for this flow, used to access per-flow DMA configs
-static void generateDSKernelReceiver(
-    ConversionPatternRewriter &rewriter,
-    Location loc,
-    Operation *insertBeforeOp,
-    StringRef kernelName,
-    RankedTensorType tensorType,
-    int64_t bufferLen,
-    uint32_t basePacketId,
-    int64_t coreChannel,
-    uint32_t flowIndex,
-    KernelResourceManager &resourceMgr) {
-    
-    // Save current insertion point
-    OpBuilder::InsertionGuard guard(rewriter);
-    
-    // Find module and insert at module level (at the end of the first block)
-    Operation *moduleOp = getModuleOp(insertBeforeOp);
-    Block &moduleBlock = moduleOp->getRegions().front().front();
-    
-    // Check if block has a terminator, insert before it; otherwise insert at end
-    if (!moduleBlock.empty() && moduleBlock.back().hasTrait<OpTrait::IsTerminator>()) {
-        rewriter.setInsertionPoint(&moduleBlock.back());
-    } else {
-        rewriter.setInsertionPointToEnd(&moduleBlock);
-    }
-    
-    // Create the dskernel_receiver operation with new signature
-    auto receiverOp = rewriter.create<dfschedule::DSKernelReceiverOp>(
-        loc,
-        rewriter.getStringAttr(kernelName));
-    
-    // Create the body block with only ONE argument:
-    // %arg0: index (iteration count only)
-    Block *body = &receiverOp.getBody().emplaceBlock();
-    
-    auto indexType = rewriter.getIndexType();
-    auto arg0 = body->addArgument(indexType, loc);    // iteration count
-    
-    // Set insertion point to the body
-    rewriter.setInsertionPointToStart(body);
-    
-    // Reset resource manager for this kernel
-    resourceMgr.reset();
-    
-    // First operation: read config from tile local memory
-    // %config = dfschedule.kernel.read_kernelconfig : !dfschedule.tile_config
-    auto tileConfigType = dfschedule::TileConfigType::get(rewriter.getContext());
-    auto readConfigOp = rewriter.create<dfschedule::KernelReadConfigOp>(
-        loc, tileConfigType);
-    
-    // Extract configuration values for this flow (indexed by flow_index)
-    // %packet_id = dfschedule.config.get_packet_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPacketIdOp = rewriter.create<dfschedule::ConfigGetPacketIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // %dma_channel = dfschedule.config.get_dma_channel(%config) {flow_index = N} : (!dfschedule.tile_config) -> !dfschedule.dma_channel
-    auto getDmaChannelOp = rewriter.create<dfschedule::ConfigGetDmaChannelOp>(
-        loc, dfschedule::DmaChannelType::get(rewriter.getContext()), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // Create LOCAL memref type for ping-pong buffers
-    auto localMemRefType = MemRefType::get(
-        tensorType.getShape(),
-        tensorType.getElementType(),
-        AffineMap(),
-        rewriter.getStringAttr("LOCAL"));
-    
-    // %ping_buffer = dfschedule.config.get_buffer_addr(%config) {flow_index = N, buffer_index = 0} : (!dfschedule.tile_config) -> memref<...>
-    auto getPingBufferOp = rewriter.create<dfschedule::ConfigGetBufferAddrOp>(
-        loc, localMemRefType, readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(0));
-    
-    // %pong_buffer = dfschedule.config.get_buffer_addr(%config) {flow_index = N, buffer_index = 1} : (!dfschedule.tile_config) -> memref<...>
-    auto getPongBufferOp = rewriter.create<dfschedule::ConfigGetBufferAddrOp>(
-        loc, localMemRefType, readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(1));
-    
-    // Read lock IDs from config for this flow (indexed by flow_index)
-    // %ping_acquire_lock_id = dfschedule.config.get_ping_acquire_lock_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPingAcquireLockIdOp = rewriter.create<dfschedule::ConfigGetPingAcquireLockIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // %pong_acquire_lock_id = dfschedule.config.get_pong_acquire_lock_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPongAcquireLockIdOp = rewriter.create<dfschedule::ConfigGetPongAcquireLockIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // %ping_release_lock_id = dfschedule.config.get_ping_release_lock_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPingReleaseLockIdOp = rewriter.create<dfschedule::ConfigGetPingReleaseLockIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // %pong_release_lock_id = dfschedule.config.get_pong_release_lock_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPongReleaseLockIdOp = rewriter.create<dfschedule::ConfigGetPongReleaseLockIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // Now use these values in the kernel body...
-    // Create bd_id constants for ping (0) and pong (1)
-    int32_t pingBdId = resourceMgr.allocateBdId();  // 0
-    int32_t pongBdId = resourceMgr.allocateBdId();  // 1
-    
-    auto pingBdIdConst = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pingBdId));
-    auto pongBdIdConst = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pongBdId));
-    
-    // %5 = dfschedule.config.dma_bd for ping buffer
-    // bd_id=0, next_bd=1, packet_id will be read from config at runtime
-    // Note: We'll need to update ConfigDmaBdOp to work with runtime packet_id
-    // For now, we create a placeholder tile value (this needs architectural decision)
-    // TODO: Refactor DMA BD config to work with runtime config
-    auto dummyTile = rewriter.create<dfschedule::DeclareTileOp>(
-        loc, dfschedule::TileType::get(rewriter.getContext()), 
-        rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0));
-    
-    auto pingDmaBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-        loc,
-        dfschedule::BdHandleType::get(rewriter.getContext()),
-        getPingBufferOp.getBuffer(),                  // buffer from config
-        dummyTile.getTile(),                          // tile (placeholder)
-        pingBdIdConst.getResult(),                    // bd_id
-        rewriter.getI32IntegerAttr(0),                // offset
-        rewriter.getI32IntegerAttr(bufferLen),        // len
-        rewriter.getBoolAttr(true),                   // enable_packet
-        rewriter.getI32IntegerAttr(basePacketId),     // packet_id (TODO: should be from config at runtime)
-        rewriter.getI32IntegerAttr(pongBdId),         // next_bd -> points to pong
-        getPingAcquireLockIdOp.getLockId(),           // acquire_lock_id from config
-        getPingReleaseLockIdOp.getLockId());          // release_lock_id from config
-    
-    // %6 = dfschedule.config.dma_bd for pong buffer
-    // bd_id=1, next_bd=0, packet_id from config
-    auto pongDmaBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-        loc,
-        dfschedule::BdHandleType::get(rewriter.getContext()),
-        getPongBufferOp.getBuffer(),                  // buffer from config
-        dummyTile.getTile(),                          // tile (placeholder)
-        pongBdIdConst.getResult(),                    // bd_id
-        rewriter.getI32IntegerAttr(0),                // offset
-        rewriter.getI32IntegerAttr(bufferLen),        // len
-        rewriter.getBoolAttr(true),                   // enable_packet
-        rewriter.getI32IntegerAttr(basePacketId),     // packet_id (TODO: should be from config at runtime)
-        rewriter.getI32IntegerAttr(pingBdId),         // next_bd -> points back to ping
-        getPongAcquireLockIdOp.getLockId(),           // acquire_lock_id from config
-        getPongReleaseLockIdOp.getLockId());          // release_lock_id from config
-    
-    // Initialize locks for ping-pong synchronization using lock IDs from config
-    // Lock values: acquire locks start at 0, release locks: ping=1, pong=0
-    
-    // %7 = dfschedule.dskernel.lock_init(%ping_acquire_lock_id, 0, "ping_acquire_lock")
-    auto pingAcqLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
-        loc,
-        dfschedule::LockType::get(rewriter.getContext()),
-        getPingAcquireLockIdOp.getLockId(),
-        rewriter.getI64IntegerAttr(0),
-        rewriter.getStringAttr("ping_acquire_lock"));
-    
-    // %8 = dfschedule.dskernel.lock_init(%pong_acquire_lock_id, 0, "pong_acquire_lock")
-    auto pongAcqLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
-        loc,
-        dfschedule::LockType::get(rewriter.getContext()),
-        getPongAcquireLockIdOp.getLockId(),
-        rewriter.getI64IntegerAttr(0),
-        rewriter.getStringAttr("pong_acquire_lock"));
-    
-    // %9 = dfschedule.dskernel.lock_init(%ping_release_lock_id, 1, "ping_release_lock")
-    auto pingRelLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
-        loc,
-        dfschedule::LockType::get(rewriter.getContext()),
-        getPingReleaseLockIdOp.getLockId(),
-        rewriter.getI64IntegerAttr(1),
-        rewriter.getStringAttr("ping_release_lock"));
-    
-    // %10 = dfschedule.dskernel.lock_init(%pong_release_lock_id, 0, "pong_release_lock")
-    auto pongRelLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
-        loc,
-        dfschedule::LockType::get(rewriter.getContext()),
-        getPongReleaseLockIdOp.getLockId(),
-        rewriter.getI64IntegerAttr(0),
-        rewriter.getStringAttr("pong_release_lock"));
-    
-    // dfschedule.dskernel.launch_dma_s2m_loop
-    rewriter.create<dfschedule::DSKernelLaunchDmaLoopOp>(
-        loc,
-        getPingBufferOp.getBuffer(),
-        getPongBufferOp.getBuffer(),
-        pingAcqLock.getLock(),
-        pingRelLock.getLock(),
-        pongAcqLock.getLock(),
-        pongRelLock.getLock(),
-        getDmaChannelOp.getChannel());
-    
-    // Create constants for loop
-    auto c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    auto c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    auto c2 = rewriter.create<arith::ConstantIndexOp>(loc, 2);
-    
-    // scf.for %arg1 = %c0 to %arg0 step %c1 (arg0 is the iteration count parameter)
-    auto forOp = rewriter.create<scf::ForOp>(
-        loc, c0.getResult(), arg0, c1.getResult());
-    
-    // Build the loop body
-    rewriter.setInsertionPointToStart(forOp.getBody());
-    Value iv = forOp.getInductionVar();
-    
-    // %11 = arith.remui %arg1, %c2 : index
-    auto remOp = rewriter.create<arith::RemUIOp>(loc, iv, c2.getResult());
-    
-    // %12 = arith.cmpi eq, %11, %c0 : index
-    auto cmpOp = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::eq, remOp.getResult(), c0.getResult());
-    
-    // %13 = scf.if %12 -> (memref<...>) { yield ping } else { yield pong }
-    auto selectBufferOp = rewriter.create<scf::IfOp>(
-        loc, TypeRange{localMemRefType}, cmpOp.getResult(), /*withElseRegion=*/true);
-    
-    // Then block: yield ping
-    rewriter.setInsertionPointToStart(&selectBufferOp.getThenRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{getPingBufferOp.getBuffer()});
-    
-    // Else block: yield pong
-    rewriter.setInsertionPointToStart(&selectBufferOp.getElseRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{getPongBufferOp.getBuffer()});
-    
-    // Continue after if
-    rewriter.setInsertionPointAfter(selectBufferOp);
-    Value selectedBuffer = selectBufferOp.getResult(0);
-    
-    // %14 = scf.if %12 -> (!dfschedule.lock) { yield ping_acq } else { yield pong_acq }
-    auto lockType = dfschedule::LockType::get(rewriter.getContext());
-    auto selectAcqLockOp = rewriter.create<scf::IfOp>(
-        loc, TypeRange{lockType}, cmpOp.getResult(), /*withElseRegion=*/true);
-    
-    rewriter.setInsertionPointToStart(&selectAcqLockOp.getThenRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{pingAcqLock.getLock()});
-    
-    rewriter.setInsertionPointToStart(&selectAcqLockOp.getElseRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{pongAcqLock.getLock()});
-    
-    rewriter.setInsertionPointAfter(selectAcqLockOp);
-    Value selectedAcqLock = selectAcqLockOp.getResult(0);
-    
-    // %15 = scf.if %12 -> (!dfschedule.lock) { yield ping_rel } else { yield pong_rel }
-    auto selectRelLockOp = rewriter.create<scf::IfOp>(
-        loc, TypeRange{lockType}, cmpOp.getResult(), /*withElseRegion=*/true);
-    
-    rewriter.setInsertionPointToStart(&selectRelLockOp.getThenRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{pingRelLock.getLock()});
-    
-    rewriter.setInsertionPointToStart(&selectRelLockOp.getElseRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{pongRelLock.getLock()});
-    
-    rewriter.setInsertionPointAfter(selectRelLockOp);
-    Value selectedRelLock = selectRelLockOp.getResult(0);
-    
-    // dfschedule.dskernel.acquire_lock(%14, 1)
-    rewriter.create<dfschedule::DSKernelAcquireLockOp>(
-        loc, selectedAcqLock, rewriter.getI32IntegerAttr(1));
-    
-    // TODO: Insert actual compute logic here
-    // The compute logic should be provided through the config or as a separate parameter
-    // For now, we just acquire and release locks without actual compute
-    
-    // dfschedule.dskernel.release_lock(%15, 1)
-    rewriter.create<dfschedule::DSKernelReleaseLockOp>(
-        loc, selectedRelLock, rewriter.getI32IntegerAttr(1));
+static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Location loc, Operation *insertBeforeOp,
+                                     StringRef kernelName, RankedTensorType tensorType, int64_t bufferLen,
+                                     uint32_t basePacketId, int64_t coreChannel, uint32_t flowIndex,
+                                     KernelResourceManager &resourceMgr) {
+
+    // Build kernel generation parameters
+    KernelGenParams params;
+    params.kernelName = kernelName;
+    params.kernelFile = "perf.cc"; // Default kernel file
+    params.bufferSize = 256;       // Default buffer size (BUF_SZ)
+    params.elementType = rewriter.getI32Type();
+    params.vectorWidth = 4;
+    params.iterationStyle = "internal"; // Legacy style: loop inside kernel
+
+    // Lock IDs (matching adfkernellegacy.cc)
+    params.inputAcquireLockId = 48;  // LOCK_win_ping_ACQ
+    params.inputReleaseLockId = 49;  // LOCK_win_pong_REL
+    params.outputAcquireLockId = 51; // LOCK_out_ping_ACQ
+    params.outputReleaseLockId = 50; // LOCK_out_pong_REL
+
+    // Generate the kernel module IR
+    generateKernelModule(rewriter, loc, insertBeforeOp, params, tensorType);
 }
 
 static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRefAttr target) {

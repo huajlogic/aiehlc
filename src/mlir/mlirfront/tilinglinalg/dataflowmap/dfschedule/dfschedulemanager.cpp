@@ -240,6 +240,50 @@ void dfschedule::KernelScheduleOp::print(::mlir::OpAsmPrinter &printer) {
     printer.printRegion(getBody(), false, false);
 }
 
+// KernelModuleOp - Top-level kernel module container
+::mlir::ParseResult dfschedule::KernelModuleOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
+    mlir::StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return mlir::failure();
+
+    auto *body = result.addRegion();
+    if (parser.parseRegion(*body, {}, {}))
+        return mlir::failure();
+
+    if (body->empty())
+        body->emplaceBlock();
+
+    return mlir::success();
+}
+
+void dfschedule::KernelModuleOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << " @" << getSymName();
+    printer << " ";
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
+}
+
+// KernelMainOp - Kernel main entry point
+::mlir::ParseResult dfschedule::KernelMainOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
+    mlir::StringAttr nameAttr;
+    if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return mlir::failure();
+
+    auto *body = result.addRegion();
+    if (parser.parseRegion(*body, {}, {}))
+        return mlir::failure();
+
+    if (body->empty())
+        body->emplaceBlock();
+
+    return mlir::success();
+}
+
+void dfschedule::KernelMainOp::print(::mlir::OpAsmPrinter &printer) {
+    printer << " @" << getSymName();
+    printer << " ";
+    printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/true);
+}
+
 // ConfigDmaBdOp - DMA Buffer Descriptor Configuration
 ::mlir::ParseResult dfschedule::ConfigDmaBdOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
     mlir::OpAsmParser::UnresolvedOperand bufferOperand, tileOperand, bdIdOperand;

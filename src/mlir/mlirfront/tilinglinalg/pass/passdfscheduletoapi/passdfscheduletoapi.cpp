@@ -2020,6 +2020,16 @@ void DfscheduleToApiPass::runOnOperation() {
             if (opName == "dfschedule.dskernel_receiver") {
                 return false; // illegal
             }
+            // Skip kernel module operations - they need a separate lowering pass
+            if (opName == "dfschedule.module" || opName == "dfschedule.kernel_config_def" ||
+                opName == "dfschedule.lock_def" || opName == "dfschedule.buffer_def" ||
+                opName == "dfschedule.window_def" || opName == "dfschedule.kernel_decl" ||
+                opName == "dfschedule.main" || opName == "dfschedule.alloc_sync_buffer" ||
+                opName == "dfschedule.sync_buffer_write" || opName == "dfschedule.log" ||
+                opName == "dfschedule.window_init" || opName == "dfschedule.kernel_invoke" ||
+                opName == "dfschedule.done" || opName == "dfschedule.kernel_return") {
+                return true; // legal - skip these
+            }
             return true;
         });
         
