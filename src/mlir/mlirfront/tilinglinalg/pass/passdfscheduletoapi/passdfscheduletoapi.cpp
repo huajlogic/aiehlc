@@ -1518,6 +1518,232 @@ struct DsKernelReceiverPattern : public ConversionPattern {
 };
 
 //===----------------------------------------------------------------------===//
+// Kernel Module Conversion Pattern
+//===----------------------------------------------------------------------===//
+
+/// Structure to hold extracted kernel module information
+struct KernelModuleInfo {
+    std::string moduleName;
+    std::string kernelName;
+    std::string kernelFile;
+    int32_t bufferSize = 256;
+    std::string elementType = "int32_t";
+    int32_t vectorWidth = 4;
+    std::string iterationStyle = "internal"; // "internal" or "external"
+
+    // Lock IDs
+    int32_t inputAcquireLockId = 48;
+    int32_t inputReleaseLockId = 49;
+    int32_t outputAcquireLockId = 51;
+    int32_t outputReleaseLockId = 50;
+
+    // Window names
+    std::string inputWindowName = "win";
+    std::string outputWindowName = "out";
+};
+
+/// Extract kernel module information from dfschedule.module operation
+static KernelModuleInfo extractKernelModuleInfo(dfschedule::KernelModuleOp moduleOp) {
+    KernelModuleInfo info;
+    info.moduleName = moduleOp.getSymName().str();
+
+    // Walk through the module body to extract definitions
+    moduleOp.getBody().walk([&](Operation *op) {
+        // Extract kernel config
+        if (auto configOp = dyn_cast<dfschedule::KernelConfigDefOp>(op)) {
+            DictionaryAttr configDict = configOp.getConfigAttrs();
+            if (auto kernelNameAttr = configDict.getAs<StringAttr>("kernel_name")) {
+                info.kernelName = kernelNameAttr.getValue().str();
+            }
+            if (auto kernelFileAttr = configDict.getAs<StringAttr>("kernel_file")) {
+                info.kernelFile = kernelFileAttr.getValue().str();
+            }
+            if (auto bufSizeAttr = configDict.getAs<IntegerAttr>("buffer_size")) {
+                info.bufferSize = bufSizeAttr.getInt();
+            }
+            if (auto vecWidthAttr = configDict.getAs<IntegerAttr>("vector_width")) {
+                info.vectorWidth = vecWidthAttr.getInt();
+            }
+            if (auto elemTypeAttr = configDict.getAs<TypeAttr>("element_type")) {
+                Type elemType = elemTypeAttr.getValue();
+                if (elemType.isInteger(32))
+                    info.elementType = "int32_t";
+                else if (elemType.isInteger(16))
+                    info.elementType = "int16_t";
+                else if (elemType.isInteger(8))
+                    info.elementType = "int8_t";
+                else if (elemType.isF32())
+                    info.elementType = "float";
+            }
+        }
+
+        // Extract lock definitions
+        if (auto lockOp = dyn_cast<dfschedule::LockDefOp>(op)) {
+            std::string lockName = lockOp.getSymName().str();
+            int32_t lockId = lockOp.getId();
+
+            if (lockName.find("win") != std::string::npos && lockName.find("ACQ") != std::string::npos) {
+                info.inputAcquireLockId = lockId;
+            } else if (lockName.find("win") != std::string::npos && lockName.find("REL") != std::string::npos) {
+                info.inputReleaseLockId = lockId;
+            } else if (lockName.find("out") != std::string::npos && lockName.find("ACQ") != std::string::npos) {
+                info.outputAcquireLockId = lockId;
+            } else if (lockName.find("out") != std::string::npos && lockName.find("REL") != std::string::npos) {
+                info.outputReleaseLockId = lockId;
+            }
+        }
+
+        // Extract kernel declaration to get iteration style
+        if (auto kernelDeclOp = dyn_cast<dfschedule::KernelDeclOp>(op)) {
+            info.kernelName = kernelDeclOp.getSymName().str();
+            DictionaryAttr declAttrs = kernelDeclOp.getDeclAttrs();
+            if (auto iterStyleAttr = declAttrs.getAs<StringAttr>("iteration_style")) {
+                info.iterationStyle = iterStyleAttr.getValue().str();
+            }
+        }
+
+        // Extract window definitions
+        if (auto windowOp = dyn_cast<dfschedule::WindowDefOp>(op)) {
+            std::string windowName = windowOp.getSymName().str();
+            DictionaryAttr windowAttrs = windowOp.getWindowAttrs();
+            if (auto directionAttr = windowAttrs.getAs<StringAttr>("direction")) {
+                if (directionAttr.getValue() == "in") {
+                    info.inputWindowName = windowName;
+                } else if (directionAttr.getValue() == "out") {
+                    info.outputWindowName = windowName;
+                }
+            }
+        }
+    });
+
+    return info;
+}
+
+/// Generate C++ kernel driver code from KernelModuleInfo
+static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
+    std::ostringstream code;
+
+    // Vector type name (e.g., "v4int32")
+    std::string vecTypeName = "v" + std::to_string(info.vectorWidth) + info.elementType;
+    // Simplify type name for vector (int32_t -> int32)
+    std::string vecTypeSimple = info.elementType;
+    if (vecTypeSimple == "int32_t")
+        vecTypeSimple = "int32";
+    else if (vecTypeSimple == "int16_t")
+        vecTypeSimple = "int16";
+    else if (vecTypeSimple == "int8_t")
+        vecTypeSimple = "int8";
+    vecTypeName = "v" + std::to_string(info.vectorWidth) + vecTypeSimple;
+
+    // Generate includes and defines
+    code << "/* ========== Kernel Driver: " << info.moduleName << " ========== */\n";
+    code << "#include <aie_api/aie.hpp>\n";
+    code << "#include \"aie2ipu_core.h\"\n\n";
+
+    code << "#define BUF_SZ " << info.bufferSize << "\n";
+    code << "using namespace aie::vector;\n\n";
+
+    // Generate kernel declaration
+    code << "__attribute__((always_inline)) void " << info.kernelName << "(" << vecTypeName << " *restrict win, "
+         << vecTypeName << " *restrict out);\n\n";
+
+    // Generate lock defines
+    code << "#define LOCK_win_ping_ACQ " << info.inputAcquireLockId << "\n";
+    code << "#define LOCK_win_pong_ACQ " << info.inputReleaseLockId << "\n";
+    code << "#define LOCK_out_ping_REL " << info.outputReleaseLockId << "\n";
+    code << "#define LOCK_out_pong_REL " << info.outputAcquireLockId << "\n\n";
+
+    // Generate window declarations
+    code << "input_async_window<" << vecTypeName << ", BUF_SZ, LOCK_win_ping_ACQ, LOCK_win_pong_ACQ>  win;\n";
+    code << "output_async_window<" << vecTypeName << ", BUF_SZ, LOCK_out_ping_REL, LOCK_out_pong_REL> out;\n\n";
+
+    // Generate kernel driver function
+    // Extract function name from module name (remove "kernel_driver_" prefix)
+    std::string funcName = info.moduleName;
+    if (funcName.find("kernel_driver_") == 0) {
+        funcName = funcName.substr(14); // Remove "kernel_driver_" prefix
+    }
+
+    code << "__global__ void " << funcName << "(int iterations)\n";
+    code << "{\n";
+    code << "    uint8_t syncbuf[8];\n";
+    code << "    syncbuf[0] = 0; // reset end signal\n";
+    code << "    aie::tile tile_t = aie::tile::current();\n";
+    code << "    log(1);\n\n";
+
+    // Generate kernel invocation based on iteration style
+    if (info.iterationStyle == "internal") {
+        // Legacy style: ptr_init once, call kernel once
+        code << "    // Legacy style: kernel handles iterations internally\n";
+        code << "    " << vecTypeName << " *win_ptr = (" << vecTypeName << " *)win.ptr_init();\n";
+        code << "    " << vecTypeName << " *out_ptr = (" << vecTypeName << " *)out.ptr_init();\n";
+        code << "    " << info.kernelName << "(win_ptr, out_ptr);\n";
+    } else {
+        // ADF style: loop with acquire/release
+        code << "    // ADF style: wrapper handles iterations with acquire/release\n";
+        code << "    for(int i = 0; i < iterations; i++) {\n";
+        code << "        " << vecTypeName << " *win_ptr = (" << vecTypeName << " *)win.acquire();\n";
+        code << "        " << vecTypeName << " *out_ptr = (" << vecTypeName << " *)out.acquire();\n";
+        code << "        " << info.kernelName << "(win_ptr, out_ptr);\n";
+        code << "        win.release();\n";
+        code << "        out.release();\n";
+        code << "    }\n";
+    }
+
+    code << "\n    done();\n";
+    code << "}\n";
+    code << "/* ========== End Kernel Driver ========== */\n";
+
+    return code.str();
+}
+
+/// ConversionPattern for dfschedule.module -> EmitC verbatim kernel code
+struct KernelModuleConversionPattern : public ConversionPattern {
+    KernelModuleConversionPattern(TypeConverter &typeConverter, MLIRContext *ctx)
+        : ConversionPattern(typeConverter, "dfschedule.module", /*benefit=*/1, ctx) {}
+
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto moduleOp = cast<dfschedule::KernelModuleOp>(op);
+        auto loc = op->getLoc();
+
+        llvm::errs() << "[Pattern] KernelModuleConversionPattern for: " << moduleOp.getSymName() << "\n";
+
+        // Extract module information
+        KernelModuleInfo info = extractKernelModuleInfo(moduleOp);
+
+        llvm::errs() << "  Kernel name: " << info.kernelName << "\n";
+        llvm::errs() << "  Iteration style: " << info.iterationStyle << "\n";
+        llvm::errs() << "  Buffer size: " << info.bufferSize << "\n";
+        llvm::errs() << "  Vector width: " << info.vectorWidth << "\n";
+
+        // Generate the kernel driver C++ code
+        std::string kernelCode = generateKernelDriverCode(info);
+
+        // Create verbatim op with the generated code
+        rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr(kernelCode));
+
+        llvm::errs() << "  ✓ Generated kernel driver code\n";
+
+        // Erase the original module op
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// Erase pattern for kernel module nested operations
+template <typename OpT> struct EraseKernelModuleNestedOp : public OpConversionPattern<OpT> {
+    using OpConversionPattern<OpT>::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        // These ops are handled as part of the parent KernelModuleOp conversion
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+//===----------------------------------------------------------------------===//
 // Helper Functions
 //===----------------------------------------------------------------------===//
 
@@ -2020,15 +2246,19 @@ void DfscheduleToApiPass::runOnOperation() {
             if (opName == "dfschedule.dskernel_receiver") {
                 return false; // illegal
             }
-            // Skip kernel module operations - they need a separate lowering pass
-            if (opName == "dfschedule.module" || opName == "dfschedule.kernel_config_def" ||
-                opName == "dfschedule.lock_def" || opName == "dfschedule.buffer_def" ||
-                opName == "dfschedule.window_def" || opName == "dfschedule.kernel_decl" ||
-                opName == "dfschedule.main" || opName == "dfschedule.alloc_sync_buffer" ||
-                opName == "dfschedule.sync_buffer_write" || opName == "dfschedule.log" ||
-                opName == "dfschedule.window_init" || opName == "dfschedule.kernel_invoke" ||
-                opName == "dfschedule.done" || opName == "dfschedule.kernel_return") {
-                return true; // legal - skip these
+            // Mark kernel module operations as illegal - they will be converted
+            if (opName == "dfschedule.module") {
+                return false; // illegal - convert to EmitC
+            }
+            // Nested kernel module ops will be erased when parent module is converted
+            if (opName == "dfschedule.kernel_config_def" || opName == "dfschedule.lock_def" ||
+                opName == "dfschedule.buffer_def" || opName == "dfschedule.window_def" ||
+                opName == "dfschedule.kernel_decl" || opName == "dfschedule.main" ||
+                opName == "dfschedule.alloc_sync_buffer" || opName == "dfschedule.sync_buffer_write" ||
+                opName == "dfschedule.log" || opName == "dfschedule.window_init" ||
+                opName == "dfschedule.kernel_invoke" || opName == "dfschedule.done" ||
+                opName == "dfschedule.kernel_return") {
+                return true; // legal - handled by parent module pattern
             }
             return true;
         });
@@ -2044,7 +2274,8 @@ void DfscheduleToApiPass::runOnOperation() {
         patterns.add<HostOpOuterPattern>(typeConverter, ctx);
         patterns.add<LaunchHostPattern>(typeConverter, ctx);
         patterns.add<DsKernelReceiverPattern>(typeConverter, ctx);
-        
+        patterns.add<KernelModuleConversionPattern>(typeConverter, ctx);
+
         if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
             llvm::errs() << "[Pass] Warning: Partial conversion had failures\n";
         }
