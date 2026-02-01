@@ -860,13 +860,15 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         auto dmaDescType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DmaDesc");
         
         // Create comment
-        std::string comment = "/* DMA BD Config: bd_id=" + std::to_string(op.getBdId().getDefiningOp<arith::ConstantOp>() ? 
-                              op.getBdId().getDefiningOp<arith::ConstantOp>().getValue().cast<IntegerAttr>().getInt() : -1) +
-                            ", offset=" + std::to_string(offset) +
-                            ", len=" + std::to_string(len) +
-                            ", enable_packet=" + (enablePacket ? "true" : "false") +
-                            ", packet_id=" + std::to_string(packetId) +
-                            ", next_bd=" + std::to_string(nextBd) + " */";
+        std::string comment =
+            "/* DMA BD Config: bd_id=" +
+            std::to_string(
+                op.getBdId().getDefiningOp<arith::ConstantOp>()
+                    ? mlir::cast<IntegerAttr>(op.getBdId().getDefiningOp<arith::ConstantOp>().getValue()).getInt()
+                    : -1) +
+            ", offset=" + std::to_string(offset) + ", len=" + std::to_string(len) +
+            ", enable_packet=" + (enablePacket ? "true" : "false") + ", packet_id=" + std::to_string(packetId) +
+            ", next_bd=" + std::to_string(nextBd) + " */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
         
         // Create constants for parameters
@@ -1529,6 +1531,17 @@ struct BufferDefInfo {
     std::string elementType = "int32";
 };
 
+/// Structure to hold window parameter information
+struct WindowParamInfo {
+    std::string windowSymbol;    // e.g., "window_out_0"
+    bool isInput;                // true = input, false = output
+    std::string elementTypeName; // e.g., "int32", "int8"
+    std::string bufferPingName;  // e.g., "buf_out_ping_0" or "out_ping"
+    std::string bufferPongName;  // e.g., "buf_out_pong_0" or "out_pong"
+    int32_t acquireLockId;       // Lock ID for acquire
+    int32_t releaseLockId;       // Lock ID for release
+};
+
 /// Structure to hold extracted kernel module information
 struct KernelModuleInfo {
     std::string moduleName;
@@ -1551,6 +1564,9 @@ struct KernelModuleInfo {
 
     // Buffer definitions extracted from dfschedule.buffer_def ops
     SmallVector<BufferDefInfo> bufferDefs;
+
+    // Dynamic window parameters extracted from dfschedule.main
+    SmallVector<WindowParamInfo> windowParams;
 };
 
 /// Extract kernel module information from dfschedule.module operation
@@ -1671,6 +1687,100 @@ static KernelModuleInfo extractKernelModuleInfo(dfschedule::KernelModuleOp modul
 
             info.bufferDefs.push_back(bufInfo);
         }
+
+        // Extract dfschedule.main to get dynamic window parameters
+        if (auto mainOp = dyn_cast<dfschedule::KernelMainOp>(op)) {
+            llvm::errs() << "[extractKernelModuleInfo] Found dfschedule.main\n";
+
+            // Build a map: window symbol -> window definition attributes
+            llvm::StringMap<DictionaryAttr> windowDefMap;
+            moduleOp.getBody().walk([&](dfschedule::WindowDefOp winDefOp) {
+                windowDefMap[winDefOp.getSymName()] = winDefOp.getWindowAttrs();
+                llvm::errs() << "[extractKernelModuleInfo]   Found window def: " << winDefOp.getSymName() << "\n";
+            });
+
+            // Walk the main body to find window_init operations
+            llvm::errs() << "[extractKernelModuleInfo] Walking main body for window_init ops\n";
+            mainOp.getBody().walk([&](dfschedule::WindowInitOp winInitOp) {
+                llvm::errs() << "[extractKernelModuleInfo]   Found window_init op\n";
+                WindowParamInfo paramInfo;
+
+                // Get window symbol reference from the operation's attribute
+                SymbolRefAttr windowRef = winInitOp.getWindowRefAttr();
+                paramInfo.windowSymbol = windowRef.getRootReference().getValue().str();
+
+                // Determine if input or output from result type
+                Type resultType = winInitOp.getResult().getType();
+                if (auto inputWinType = dyn_cast<dfschedule::InputWindowType>(resultType)) {
+                    paramInfo.isInput = true;
+                    Type elemType = inputWinType.getElementType();
+                    if (elemType.isInteger(32))
+                        paramInfo.elementTypeName = "int32";
+                    else if (elemType.isInteger(16))
+                        paramInfo.elementTypeName = "int16";
+                    else if (elemType.isInteger(8))
+                        paramInfo.elementTypeName = "int8";
+                    else if (elemType.isF32())
+                        paramInfo.elementTypeName = "float";
+                } else if (auto outputWinType = dyn_cast<dfschedule::OutputWindowType>(resultType)) {
+                    paramInfo.isInput = false;
+                    Type elemType = outputWinType.getElementType();
+                    if (elemType.isInteger(32))
+                        paramInfo.elementTypeName = "int32";
+                    else if (elemType.isInteger(16))
+                        paramInfo.elementTypeName = "int16";
+                    else if (elemType.isInteger(8))
+                        paramInfo.elementTypeName = "int8";
+                    else if (elemType.isF32())
+                        paramInfo.elementTypeName = "float";
+                }
+
+                // Lookup window definition to get buffer names and lock IDs
+                auto it = windowDefMap.find(paramInfo.windowSymbol);
+                if (it != windowDefMap.end()) {
+                    DictionaryAttr windowAttrs = it->second;
+
+                    // Get ping/pong buffer names
+                    if (auto pingBufAttr = windowAttrs.getAs<SymbolRefAttr>("ping_buffer")) {
+                        paramInfo.bufferPingName = pingBufAttr.getRootReference().getValue().str();
+                    }
+                    if (auto pongBufAttr = windowAttrs.getAs<SymbolRefAttr>("pong_buffer")) {
+                        paramInfo.bufferPongName = pongBufAttr.getRootReference().getValue().str();
+                    }
+
+                    // Get acquire/release lock symbols and lookup their IDs
+                    if (auto acqLockAttr = windowAttrs.getAs<SymbolRefAttr>("acquire_lock")) {
+                        std::string acqLockName = acqLockAttr.getRootReference().getValue().str();
+                        // Find the lock definition to get the actual ID
+                        moduleOp.getBody().walk([&](dfschedule::LockDefOp lockOp) {
+                            if (lockOp.getSymName().str() == acqLockName) {
+                                paramInfo.acquireLockId = lockOp.getId();
+                            }
+                        });
+                    }
+                    if (auto relLockAttr = windowAttrs.getAs<SymbolRefAttr>("release_lock")) {
+                        std::string relLockName = relLockAttr.getRootReference().getValue().str();
+                        // Find the lock definition to get the actual ID
+                        moduleOp.getBody().walk([&](dfschedule::LockDefOp lockOp) {
+                            if (lockOp.getSymName().str() == relLockName) {
+                                paramInfo.releaseLockId = lockOp.getId();
+                            }
+                        });
+                    }
+                }
+
+                llvm::errs() << "[extractKernelModuleInfo]   Window param: " << paramInfo.windowSymbol
+                             << ", isInput=" << paramInfo.isInput << ", elemType=" << paramInfo.elementTypeName
+                             << ", ping=" << paramInfo.bufferPingName << ", pong=" << paramInfo.bufferPongName
+                             << ", acqLock=" << paramInfo.acquireLockId << ", relLock=" << paramInfo.releaseLockId
+                             << "\n";
+
+                info.windowParams.push_back(paramInfo);
+            });
+
+            llvm::errs() << "[extractKernelModuleInfo] Extracted " << info.windowParams.size()
+                         << " window parameters\n";
+        }
     });
 
     return info;
@@ -1679,6 +1789,8 @@ static KernelModuleInfo extractKernelModuleInfo(dfschedule::KernelModuleOp modul
 /// Generate C++ kernel driver code from KernelModuleInfo
 static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
     std::ostringstream code;
+
+    llvm::errs() << "[generateKernelDriverCode] Called with " << info.windowParams.size() << " window parameters\n";
 
     // Vector type name (e.g., "v4int32")
     std::string vecTypeName = "v" + std::to_string(info.vectorWidth) + info.elementType;
@@ -1750,32 +1862,138 @@ static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
     if (info.iterationStyle == "internal") {
         // Legacy style: window_init once, call kernel once
         code << "    // Legacy style: kernel handles iterations internally\n";
-        code << "    window_internal window_win_ping[1];\n";
-        code << "    window_init(window_win_ping, 1, win_ping, LOCK_win_ping_ACQ, win_pong, LOCK_win_pong_REL, BUF_SZ, "
-                "BUF_SZ);\n";
-        code << "    input_window_int32* win_ping_ptr = get_input_async_window_int32(window_win_ping);\n\n";
-        code << "    window_internal window_out_ping[1];\n";
-        code << "    window_init(window_out_ping, 1, out_ping, LOCK_out_ping_ACQ, out_pong, LOCK_out_pong_REL, BUF_SZ, "
-                "BUF_SZ);\n";
-        code << "    output_window_int32* out_ping_ptr = get_output_async_window_int32(window_out_ping);\n\n";
-        code << "    // Call kernel\n";
-        code << "    " << info.kernelName << "(win_ping_ptr, out_ping_ptr);\n";
+
+        // Use dynamic window parameters if available
+        if (!info.windowParams.empty()) {
+            // Dynamic mode: generate window initialization for each parameter
+            SmallVector<std::string> windowPtrVars;
+
+            for (size_t i = 0; i < info.windowParams.size(); ++i) {
+                const auto &param = info.windowParams[i];
+                std::string windowVarName = "window_" + param.windowSymbol;
+                std::string ptrVarName = param.windowSymbol + "_ptr";
+                std::string lockAcqName = "LOCK_" + param.windowSymbol + "_ACQ";
+                std::string lockRelName = "LOCK_" + param.windowSymbol + "_REL";
+
+                // Generate window_internal declaration
+                code << "    window_internal " << windowVarName << "[1];\n";
+
+                // Generate window_init call with actual buffer and lock names
+                code << "    window_init(" << windowVarName << ", 1, " << param.bufferPingName << ", "
+                     << param.acquireLockId << ", " << param.bufferPongName << ", " << param.releaseLockId
+                     << ", BUF_SZ, BUF_SZ);\n";
+
+                // Generate get_input/output_async_window call
+                if (param.isInput) {
+                    code << "    input_window_" << param.elementTypeName << "* " << ptrVarName
+                         << " = get_input_async_window_" << param.elementTypeName << "(" << windowVarName << ");\n\n";
+                } else {
+                    code << "    output_window_" << param.elementTypeName << "* " << ptrVarName
+                         << " = get_output_async_window_" << param.elementTypeName << "(" << windowVarName << ");\n\n";
+                }
+
+                windowPtrVars.push_back(ptrVarName);
+            }
+
+            // Generate kernel call with dynamic arguments
+            code << "    // Call kernel\n";
+            code << "    " << info.kernelName << "(";
+            for (size_t i = 0; i < windowPtrVars.size(); ++i) {
+                if (i > 0)
+                    code << ", ";
+                code << windowPtrVars[i];
+            }
+            code << ");\n";
+        } else {
+            // Fallback: hardcoded mode (backward compatibility)
+            code << "    window_internal window_win_ping[1];\n";
+            code << "    window_init(window_win_ping, 1, win_ping, LOCK_win_ping_ACQ, win_pong, LOCK_win_pong_REL, "
+                    "BUF_SZ, "
+                    "BUF_SZ);\n";
+            code << "    input_window_int32* win_ping_ptr = get_input_async_window_int32(window_win_ping);\n\n";
+            code << "    window_internal window_out_ping[1];\n";
+            code << "    window_init(window_out_ping, 1, out_ping, LOCK_out_ping_ACQ, out_pong, LOCK_out_pong_REL, "
+                    "BUF_SZ, "
+                    "BUF_SZ);\n";
+            code << "    output_window_int32* out_ping_ptr = get_output_async_window_int32(window_out_ping);\n\n";
+            code << "    // Call kernel\n";
+            code << "    " << info.kernelName << "(win_ping_ptr, out_ping_ptr);\n";
+        }
     } else {
         // ADF style: loop with acquire/release
         code << "    // ADF style: wrapper handles iterations with acquire/release\n";
-        code << "    window_internal window_win_ping[1];\n";
-        code << "    window_init(window_win_ping, 1, win_ping, LOCK_win_ping_ACQ, win_pong, LOCK_win_pong_REL, BUF_SZ, "
-                "BUF_SZ);\n\n";
-        code << "    window_internal window_out_ping[1];\n";
-        code << "    window_init(window_out_ping, 1, out_ping, LOCK_out_ping_ACQ, out_pong, LOCK_out_pong_REL, BUF_SZ, "
-                "BUF_SZ);\n\n";
-        code << "    for(int i = 0; i < iterations; i++) {\n";
-        code << "        input_window_int32* win_ptr = window_acquire_in(window_win_ping);\n";
-        code << "        output_window_int32* out_ptr = window_acquire_out(window_out_ping);\n";
-        code << "        " << info.kernelName << "(win_ptr, out_ptr);\n";
-        code << "        window_release(window_win_ping);\n";
-        code << "        window_release(window_out_ping);\n";
-        code << "    }\n";
+
+        // Use dynamic window parameters if available
+        if (!info.windowParams.empty()) {
+            // Dynamic mode: generate window initialization for each parameter
+            SmallVector<std::string> windowVarNames;
+
+            for (size_t i = 0; i < info.windowParams.size(); ++i) {
+                const auto &param = info.windowParams[i];
+                std::string windowVarName = "window_" + param.windowSymbol;
+
+                // Generate window_internal declaration
+                code << "    window_internal " << windowVarName << "[1];\n";
+
+                // Generate window_init call
+                code << "    window_init(" << windowVarName << ", 1, " << param.bufferPingName << ", "
+                     << param.acquireLockId << ", " << param.bufferPongName << ", " << param.releaseLockId
+                     << ", BUF_SZ, BUF_SZ);\n\n";
+
+                windowVarNames.push_back(windowVarName);
+            }
+
+            code << "    for(int i = 0; i < iterations; i++) {\n";
+
+            // Generate window_acquire calls for each parameter
+            SmallVector<std::string> ptrVars;
+            for (size_t i = 0; i < info.windowParams.size(); ++i) {
+                const auto &param = info.windowParams[i];
+                std::string ptrVar = param.windowSymbol + "_ptr";
+
+                if (param.isInput) {
+                    code << "        input_window_" << param.elementTypeName << "* " << ptrVar
+                         << " = window_acquire_in(" << windowVarNames[i] << ");\n";
+                } else {
+                    code << "        output_window_" << param.elementTypeName << "* " << ptrVar
+                         << " = window_acquire_out(" << windowVarNames[i] << ");\n";
+                }
+                ptrVars.push_back(ptrVar);
+            }
+
+            // Generate kernel call with dynamic arguments
+            code << "        " << info.kernelName << "(";
+            for (size_t i = 0; i < ptrVars.size(); ++i) {
+                if (i > 0)
+                    code << ", ";
+                code << ptrVars[i];
+            }
+            code << ");\n";
+
+            // Generate window_release calls for each parameter
+            for (const auto &windowVar : windowVarNames) {
+                code << "        window_release(" << windowVar << ");\n";
+            }
+
+            code << "    }\n";
+        } else {
+            // Fallback: hardcoded mode (backward compatibility)
+            code << "    window_internal window_win_ping[1];\n";
+            code << "    window_init(window_win_ping, 1, win_ping, LOCK_win_ping_ACQ, win_pong, LOCK_win_pong_REL, "
+                    "BUF_SZ, "
+                    "BUF_SZ);\n\n";
+            code << "    window_internal window_out_ping[1];\n";
+            code << "    window_init(window_out_ping, 1, out_ping, LOCK_out_ping_ACQ, out_pong, LOCK_out_pong_REL, "
+                    "BUF_SZ, "
+                    "BUF_SZ);\n\n";
+            code << "    for(int i = 0; i < iterations; i++) {\n";
+            code << "        input_window_int32* win_ptr = window_acquire_in(window_win_ping);\n";
+            code << "        output_window_int32* out_ptr = window_acquire_out(window_out_ping);\n";
+            code << "        " << info.kernelName << "(win_ptr, out_ptr);\n";
+            code << "        window_release(window_win_ping);\n";
+            code << "        window_release(window_out_ping);\n";
+            code << "    }\n";
+        }
     }
 
     code << "\n    done();\n";

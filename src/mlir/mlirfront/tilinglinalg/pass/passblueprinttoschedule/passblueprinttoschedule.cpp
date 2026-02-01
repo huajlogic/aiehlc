@@ -34,23 +34,41 @@ namespace {
 // ============================================================================
 class KernelResourceManager {
 public:
-    KernelResourceManager() : nextBdId(0), nextLockId(0) {}
-    
-    // Allocate next BD ID (0, 1 for ping-pong)
-    int32_t allocateBdId() { return nextBdId++; }
-    
-    // Allocate next Lock ID
-    int64_t allocateLockId() { return nextLockId++; }
-    
-    // Reset for new kernel
-    void reset() {
-        nextBdId = 0;
-        nextLockId = 0;
+  KernelResourceManager()
+      : nextBdId(0), nextLockId(0), nextInputAcqLock(48), nextInputRelLock(49), nextOutputAcqLock(51),
+        nextOutputRelLock(50) {}
+
+  // Allocate next BD ID (0, 1 for ping-pong)
+  int32_t allocateBdId() { return nextBdId++; }
+
+  // Allocate next Lock ID
+  int64_t allocateLockId() { return nextLockId++; }
+
+  // Allocate lock IDs for input windows (acquire for read, release after read)
+  int32_t allocateInputAcquireLock() { return nextInputAcqLock++; }
+  int32_t allocateInputReleaseLock() { return nextInputRelLock++; }
+
+  // Allocate lock IDs for output windows (acquire for write, release after write)
+  int32_t allocateOutputAcquireLock() { return nextOutputAcqLock++; }
+  int32_t allocateOutputReleaseLock() { return nextOutputRelLock++; }
+
+  // Reset for new kernel
+  void reset() {
+      nextBdId = 0;
+      nextLockId = 0;
+      nextInputAcqLock = 48;
+      nextInputRelLock = 49;
+      nextOutputAcqLock = 51;
+      nextOutputRelLock = 50;
     }
     
 private:
     int32_t nextBdId;
     int64_t nextLockId;
+    int32_t nextInputAcqLock;
+    int32_t nextInputRelLock;
+    int32_t nextOutputAcqLock;
+    int32_t nextOutputRelLock;
 };
 
 // Generic template function to look up any operation by symbol reference
@@ -185,6 +203,19 @@ static Operation* getModuleOp(Operation *rootOp) {
 //   - dfschedule.main             : entry point with kernel_invoke
 // =============================================================================
 
+// Structure to hold individual kernel parameter info (input/output window)
+struct KernelParamInfo {
+    std::string windowName;     // e.g., "window_in_0", "window_out_0"
+    std::string bufferPingName; // e.g., "buf_in_ping_0"
+    std::string bufferPongName; // e.g., "buf_in_pong_0"
+    bool isInput;               // true = input parameter, false = output parameter
+    int32_t acquireLockId;      // Lock ID for acquire operation
+    int32_t releaseLockId;      // Lock ID for release operation
+    Type elementType;           // Element type of the buffer
+    int64_t bufferSize;         // Size of the buffer
+    int32_t vectorWidth;        // Vector width (e.g., 4 for v4int32)
+};
+
 // Structure to hold kernel generation parameters
 struct KernelGenParams {
     StringRef kernelName;        // Wrapper function name, e.g., "dskernel_receiver"
@@ -195,11 +226,14 @@ struct KernelGenParams {
     int32_t vectorWidth;         // e.g., 4
     StringRef iterationStyle;    // "internal" or "external"
 
-    // Lock IDs (base values, will be offset for ping/pong)
+    // Lock IDs (base values, will be offset for ping/pong) - used when params is empty
     int32_t inputAcquireLockId;  // e.g., 48
     int32_t inputReleaseLockId;  // e.g., 49
     int32_t outputAcquireLockId; // e.g., 51
     int32_t outputReleaseLockId; // e.g., 50
+
+    // Dynamic parameter list - when non-empty, overrides the hardcoded lock IDs
+    SmallVector<KernelParamInfo> kernelParams;
 };
 
 // Generate dfschedule.module with kernel_config, locks, buffers, windows, kernel_decl, and main
@@ -250,79 +284,120 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
                                                    rewriter.getDictionaryAttr(configAttrs));
 
     // =========================================================================
-    // 2. Lock Definitions
+    // 2-5. Generate Locks, Buffers, Windows, and Kernel Declaration
     // =========================================================================
-    // Input window locks
-    rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_win_ping_ACQ"),
-                                           rewriter.getI32IntegerAttr(params.inputAcquireLockId));
+    // Use dynamic parameters if provided, otherwise fall back to hardcoded values
 
-    rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_win_pong_REL"),
-                                           rewriter.getI32IntegerAttr(params.inputReleaseLockId));
+    SmallVector<Attribute> inputWindowRefs;
+    SmallVector<Attribute> outputWindowRefs;
+    SmallVector<std::string> allWindowNames; // Track window names for main block
 
-    // Output window locks
-    rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_out_ping_ACQ"),
-                                           rewriter.getI32IntegerAttr(params.outputAcquireLockId));
+    if (!params.kernelParams.empty()) {
+        // === DYNAMIC PARAMETER MODE ===
+        // Generate locks, buffers, and windows for each kernel parameter
 
-    rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_out_pong_REL"),
-                                           rewriter.getI32IntegerAttr(params.outputReleaseLockId));
+        for (const auto &paramInfo : params.kernelParams) {
+            // Lock definitions for this parameter
+            std::string acqLockName = "LOCK_" + paramInfo.windowName + "_ACQ";
+            std::string relLockName = "LOCK_" + paramInfo.windowName + "_REL";
 
-    // =========================================================================
-    // 3. Buffer Declarations (ping/pong pairs)
-    // =========================================================================
-    // Create LOCAL memref type: memref<BUF_SZ x vector<4xi32>, "LOCAL">
-    auto vectorType = VectorType::get({params.vectorWidth}, params.elementType);
-    auto localMemRefType =
-        MemRefType::get({params.bufferSize}, vectorType, AffineMap(), rewriter.getStringAttr("LOCAL"));
+            rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr(acqLockName),
+                                                   rewriter.getI32IntegerAttr(paramInfo.acquireLockId));
+            rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr(relLockName),
+                                                   rewriter.getI32IntegerAttr(paramInfo.releaseLockId));
 
-    // Input window buffers
-    rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("win_ping"), TypeAttr::get(localMemRefType));
+            // Buffer definitions (ping/pong pair)
+            Type elemType = paramInfo.elementType ? paramInfo.elementType : params.elementType;
+            auto vectorType = VectorType::get({paramInfo.vectorWidth}, elemType);
+            auto localMemRefType =
+                MemRefType::get({paramInfo.bufferSize}, vectorType, AffineMap(), rewriter.getStringAttr("LOCAL"));
 
-    rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("win_pong"), TypeAttr::get(localMemRefType));
+            rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr(paramInfo.bufferPingName),
+                                                     TypeAttr::get(localMemRefType));
+            rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr(paramInfo.bufferPongName),
+                                                     TypeAttr::get(localMemRefType));
 
-    // Output window buffers
-    rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("out_ping"), TypeAttr::get(localMemRefType));
+            // Window definition
+            NamedAttrList winAttrs;
+            winAttrs.append("direction", rewriter.getStringAttr(paramInfo.isInput ? "in" : "out"));
+            winAttrs.append("ping_buffer", SymbolRefAttr::get(rewriter.getContext(), paramInfo.bufferPingName));
+            winAttrs.append("pong_buffer", SymbolRefAttr::get(rewriter.getContext(), paramInfo.bufferPongName));
+            winAttrs.append("acquire_lock", SymbolRefAttr::get(rewriter.getContext(), acqLockName));
+            winAttrs.append("release_lock", SymbolRefAttr::get(rewriter.getContext(), relLockName));
+            winAttrs.append("buffer_size", rewriter.getI32IntegerAttr(paramInfo.bufferSize));
+            winAttrs.append("async", rewriter.getBoolAttr(true));
 
-    rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("out_pong"), TypeAttr::get(localMemRefType));
+            rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr(paramInfo.windowName),
+                                                     rewriter.getDictionaryAttr(winAttrs));
 
-    // =========================================================================
-    // 4. Window Definitions (abstract ping-pong window with locks)
-    // =========================================================================
-    // Input window
-    NamedAttrList winInAttrs;
-    winInAttrs.append("direction", rewriter.getStringAttr("in"));
-    winInAttrs.append("ping_buffer", SymbolRefAttr::get(rewriter.getContext(), "win_ping"));
-    winInAttrs.append("pong_buffer", SymbolRefAttr::get(rewriter.getContext(), "win_pong"));
-    winInAttrs.append("acquire_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_win_ping_ACQ"));
-    winInAttrs.append("release_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_win_pong_REL"));
-    winInAttrs.append("buffer_size", rewriter.getI32IntegerAttr(params.bufferSize));
-    winInAttrs.append("async", rewriter.getBoolAttr(true));
+            // Track for kernel declaration
+            if (paramInfo.isInput) {
+                inputWindowRefs.push_back(SymbolRefAttr::get(rewriter.getContext(), paramInfo.windowName));
+            } else {
+                outputWindowRefs.push_back(SymbolRefAttr::get(rewriter.getContext(), paramInfo.windowName));
+            }
+            allWindowNames.push_back(paramInfo.windowName);
+        }
+    } else {
+        // === HARDCODED MODE (backward compatibility) ===
+        // Generate fixed input/output locks, buffers, and windows
 
-    rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr("window_in"),
-                                             rewriter.getDictionaryAttr(winInAttrs));
+        // Lock definitions
+        rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_win_ping_ACQ"),
+                                               rewriter.getI32IntegerAttr(params.inputAcquireLockId));
+        rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_win_pong_REL"),
+                                               rewriter.getI32IntegerAttr(params.inputReleaseLockId));
+        rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_out_ping_ACQ"),
+                                               rewriter.getI32IntegerAttr(params.outputAcquireLockId));
+        rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_out_pong_REL"),
+                                               rewriter.getI32IntegerAttr(params.outputReleaseLockId));
 
-    // Output window
-    NamedAttrList winOutAttrs;
-    winOutAttrs.append("direction", rewriter.getStringAttr("out"));
-    winOutAttrs.append("ping_buffer", SymbolRefAttr::get(rewriter.getContext(), "out_ping"));
-    winOutAttrs.append("pong_buffer", SymbolRefAttr::get(rewriter.getContext(), "out_pong"));
-    winOutAttrs.append("acquire_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_out_ping_ACQ"));
-    winOutAttrs.append("release_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_out_pong_REL"));
-    winOutAttrs.append("buffer_size", rewriter.getI32IntegerAttr(params.bufferSize));
-    winOutAttrs.append("async", rewriter.getBoolAttr(true));
+        // Buffer definitions
+        auto vectorType = VectorType::get({params.vectorWidth}, params.elementType);
+        auto localMemRefType =
+            MemRefType::get({params.bufferSize}, vectorType, AffineMap(), rewriter.getStringAttr("LOCAL"));
 
-    rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr("window_out"),
-                                             rewriter.getDictionaryAttr(winOutAttrs));
+        rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("win_ping"),
+                                                 TypeAttr::get(localMemRefType));
+        rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("win_pong"),
+                                                 TypeAttr::get(localMemRefType));
+        rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("out_ping"),
+                                                 TypeAttr::get(localMemRefType));
+        rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr("out_pong"),
+                                                 TypeAttr::get(localMemRefType));
+
+        // Window definitions
+        NamedAttrList winInAttrs;
+        winInAttrs.append("direction", rewriter.getStringAttr("in"));
+        winInAttrs.append("ping_buffer", SymbolRefAttr::get(rewriter.getContext(), "win_ping"));
+        winInAttrs.append("pong_buffer", SymbolRefAttr::get(rewriter.getContext(), "win_pong"));
+        winInAttrs.append("acquire_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_win_ping_ACQ"));
+        winInAttrs.append("release_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_win_pong_REL"));
+        winInAttrs.append("buffer_size", rewriter.getI32IntegerAttr(params.bufferSize));
+        winInAttrs.append("async", rewriter.getBoolAttr(true));
+        rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr("window_in"),
+                                                 rewriter.getDictionaryAttr(winInAttrs));
+
+        NamedAttrList winOutAttrs;
+        winOutAttrs.append("direction", rewriter.getStringAttr("out"));
+        winOutAttrs.append("ping_buffer", SymbolRefAttr::get(rewriter.getContext(), "out_ping"));
+        winOutAttrs.append("pong_buffer", SymbolRefAttr::get(rewriter.getContext(), "out_pong"));
+        winOutAttrs.append("acquire_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_out_ping_ACQ"));
+        winOutAttrs.append("release_lock", SymbolRefAttr::get(rewriter.getContext(), "LOCK_out_pong_REL"));
+        winOutAttrs.append("buffer_size", rewriter.getI32IntegerAttr(params.bufferSize));
+        winOutAttrs.append("async", rewriter.getBoolAttr(true));
+        rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr("window_out"),
+                                                 rewriter.getDictionaryAttr(winOutAttrs));
+
+        inputWindowRefs.push_back(SymbolRefAttr::get(rewriter.getContext(), "window_in"));
+        outputWindowRefs.push_back(SymbolRefAttr::get(rewriter.getContext(), "window_out"));
+        allWindowNames.push_back("window_in");
+        allWindowNames.push_back("window_out");
+    }
 
     // =========================================================================
     // 5. Kernel Declaration
     // =========================================================================
-    // Build inputs/outputs as symbol refs to windows
-    SmallVector<Attribute> inputWindowRefs;
-    inputWindowRefs.push_back(SymbolRefAttr::get(rewriter.getContext(), "window_in"));
-
-    SmallVector<Attribute> outputWindowRefs;
-    outputWindowRefs.push_back(SymbolRefAttr::get(rewriter.getContext(), "window_out"));
-
     NamedAttrList kernelDeclAttrs;
     kernelDeclAttrs.append("inputs", rewriter.getArrayAttr(inputWindowRefs));
     kernelDeclAttrs.append("outputs", rewriter.getArrayAttr(outputWindowRefs));
@@ -354,23 +429,40 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
     auto c1_i32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(1));
     rewriter.create<dfschedule::LogOp>(loc, c1_i32.getResult());
 
-    // --- Window initialization ---
-    // %win_ptr = dfschedule.window_init(@window_in)
-    auto inputWindowType = dfschedule::InputWindowType::get(rewriter.getContext(), params.elementType);
-    auto winPtrOp = rewriter.create<dfschedule::WindowInitOp>(loc, inputWindowType,
-                                                              SymbolRefAttr::get(rewriter.getContext(), "window_in"));
+    // --- Window initialization and kernel args ---
+    SmallVector<Value> kernelArgs;
 
-    // %out_ptr = dfschedule.window_init(@window_out)
-    auto outputWindowType = dfschedule::OutputWindowType::get(rewriter.getContext(), params.elementType);
-    auto outPtrOp = rewriter.create<dfschedule::WindowInitOp>(loc, outputWindowType,
-                                                              SymbolRefAttr::get(rewriter.getContext(), "window_out"));
+    if (!params.kernelParams.empty()) {
+        // Dynamic: Initialize each window based on kernelParams
+        for (const auto &paramInfo : params.kernelParams) {
+            Type elemType = paramInfo.elementType ? paramInfo.elementType : params.elementType;
+            if (paramInfo.isInput) {
+                auto inputWindowType = dfschedule::InputWindowType::get(rewriter.getContext(), elemType);
+                auto winPtrOp = rewriter.create<dfschedule::WindowInitOp>(
+                    loc, inputWindowType, SymbolRefAttr::get(rewriter.getContext(), paramInfo.windowName));
+                kernelArgs.push_back(winPtrOp.getResult());
+            } else {
+                auto outputWindowType = dfschedule::OutputWindowType::get(rewriter.getContext(), elemType);
+                auto outPtrOp = rewriter.create<dfschedule::WindowInitOp>(
+                    loc, outputWindowType, SymbolRefAttr::get(rewriter.getContext(), paramInfo.windowName));
+                kernelArgs.push_back(outPtrOp.getResult());
+            }
+        }
+    } else {
+        // Hardcoded: Initialize fixed input/output windows
+        auto inputWindowType = dfschedule::InputWindowType::get(rewriter.getContext(), params.elementType);
+        auto winPtrOp = rewriter.create<dfschedule::WindowInitOp>(
+            loc, inputWindowType, SymbolRefAttr::get(rewriter.getContext(), "window_in"));
+
+        auto outputWindowType = dfschedule::OutputWindowType::get(rewriter.getContext(), params.elementType);
+        auto outPtrOp = rewriter.create<dfschedule::WindowInitOp>(
+            loc, outputWindowType, SymbolRefAttr::get(rewriter.getContext(), "window_out"));
+
+        kernelArgs.push_back(winPtrOp.getResult());
+        kernelArgs.push_back(outPtrOp.getResult());
+    }
 
     // --- Kernel invocation ---
-    // dfschedule.kernel_invoke @perf(%win_ptr, %out_ptr)
-    SmallVector<Value> kernelArgs;
-    kernelArgs.push_back(winPtrOp.getResult());
-    kernelArgs.push_back(outPtrOp.getResult());
-
     rewriter.create<dfschedule::KernelInvokeOp>(
         loc, SymbolRefAttr::get(rewriter.getContext(), params.computeKernelName), kernelArgs);
 
@@ -380,6 +472,12 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
     // --- Return ---
     rewriter.create<dfschedule::KernelReturnOp>(loc);
 }
+
+// Forward declarations for functions used in generateDSKernelReceiver
+static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolRefAttr target);
+static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
+                                                        Type defaultElementType, int64_t defaultBufferSize,
+                                                        int32_t defaultVectorWidth);
 
 // Generate dfschedule.dskernel_receiver function (legacy style)
 // This is kept for backward compatibility and will call generateKernelModule internally
@@ -405,11 +503,17 @@ static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Locati
     params.vectorWidth = 4;
     params.iterationStyle = "internal"; // Legacy style: loop inside kernel
 
-    // Lock IDs (matching adfkernellegacy.cc)
+    // Lock IDs (fallback - used when kernelParams is empty)
     params.inputAcquireLockId = 48;  // LOCK_win_ping_ACQ
     params.inputReleaseLockId = 49;  // LOCK_win_pong_REL
     params.outputAcquireLockId = 51; // LOCK_out_ping_ACQ
     params.outputReleaseLockId = 50; // LOCK_out_pong_REL
+
+    // Dynamically analyze flow_transfer operations to determine kernel parameters
+    // Walk from the module root to collect all shim<->core data flows
+    Operation *rootOp = getModuleOp(insertBeforeOp);
+    params.kernelParams =
+        analyzeKernelParams(rootOp, resourceMgr, params.elementType, params.bufferSize, params.vectorWidth);
 
     // Generate the kernel module IR
     generateKernelModule(rewriter, loc, insertBeforeOp, params, tensorType);
@@ -422,6 +526,196 @@ static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRef
 // Helper function to look up FlowConfigOp by symbol reference (wrapper for backward compatibility)
 static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolRefAttr target) {
     return lookupSymbolOp<dfscheblueprint::FlowConfigOp>(rootOp, target);
+}
+
+// Helper function to trace a value through the IR to find FlowConfigOp that uses it
+// This follows the value chain from declare_data result to FlowConfig.view
+static dfscheblueprint::FlowConfigOp traceToFlowConfig(Value dataValue, Operation *rootOp) {
+    // Track visited values to avoid infinite loops
+    SmallPtrSet<Value, 16> visited;
+    SmallVector<Value, 16> worklist;
+    worklist.push_back(dataValue);
+
+    while (!worklist.empty()) {
+        Value currentValue = worklist.pop_back_val();
+        if (visited.contains(currentValue))
+            continue;
+        visited.insert(currentValue);
+
+        // Check all users of this value
+        for (Operation *user : currentValue.getUsers()) {
+            // Check if user is a FlowConfigOp and this value is its view operand
+            if (auto flowConfig = dyn_cast<dfscheblueprint::FlowConfigOp>(user)) {
+                if (flowConfig.getView() == currentValue) {
+                    return flowConfig;
+                }
+            }
+
+            // For other ops, add their results to the worklist to continue tracing
+            for (Value result : user->getResults()) {
+                if (!visited.contains(result)) {
+                    worklist.push_back(result);
+                }
+            }
+        }
+    }
+
+    return nullptr; // No FlowConfigOp found using this data
+}
+
+// Helper function to find FlowTransferOp that references a given FlowConfigOp
+// Searches for flow_transfer ops where 'from' or 'to' matches the FlowConfig's symbol
+static dfscheblueprint::FlowTransferOp
+findFlowTransferFor(dfscheblueprint::FlowConfigOp flowConfig, Operation *rootOp,
+                    bool &isFromConfig) { // Output: true if flowConfig is the 'from', false if 'to'
+
+    // Get the symbol name of the FlowConfigOp
+    StringRef configSymbol = flowConfig.getSymName();
+    if (configSymbol.empty())
+        return nullptr;
+
+    dfscheblueprint::FlowTransferOp result = nullptr;
+    isFromConfig = false;
+
+    // Walk all flow_transfer operations to find one that references this FlowConfig
+    rootOp->walk([&](dfscheblueprint::FlowTransferOp transferOp) {
+        if (result)
+            return; // Already found
+
+        // Check if 'from' matches
+        SymbolRefAttr fromRef = transferOp.getFrom();
+        if (fromRef && fromRef.getRootReference().getValue() == configSymbol) {
+            result = transferOp;
+            isFromConfig = true;
+            return;
+        }
+
+        // Check if 'to' matches
+        SymbolRefAttr toRef = transferOp.getTo();
+        if (toRef && toRef.getRootReference().getValue() == configSymbol) {
+            result = transferOp;
+            isFromConfig = false;
+            return;
+        }
+    });
+
+    return result;
+}
+
+// Analyze all declare_data operations to determine kernel parameters dynamically
+// Returns a list of KernelParamInfo based on actual data flows:
+// - For each declare_data, trace value chain to find FlowConfigOp
+// - Find flow_transfer referencing that FlowConfig
+// - shim -> core: Input parameter
+// - core -> shim: Output parameter
+// - No flow_transfer or core -> core: Skip (not a kernel parameter)
+static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
+                                                        Type defaultElementType, int64_t defaultBufferSize,
+                                                        int32_t defaultVectorWidth) {
+
+    SmallVector<KernelParamInfo> params;
+    int inputCount = 0;
+    int outputCount = 0;
+
+    // Walk all declare_data operations in the module
+    rootOp->walk([&](dfscheblueprint::DeclareDataOp declareDataOp) {
+        // Get the result value of declare_data
+        Value dataValue = declareDataOp.getResult();
+
+        // Trace the value chain to find FlowConfigOp that uses this data
+        auto flowConfig = traceToFlowConfig(dataValue, rootOp);
+        if (!flowConfig) {
+            return; // No FlowConfig found - not a kernel parameter
+        }
+
+        // Find flow_transfer that references this FlowConfig
+        bool isFromConfig = false;
+        auto flowTransfer = findFlowTransferFor(flowConfig, rootOp, isFromConfig);
+        if (!flowTransfer) {
+            return; // No flow_transfer found - not a kernel parameter
+        }
+
+        // Get the 'from' and 'to' FlowConfigOps from the flow_transfer
+        SymbolRefAttr fromRef = flowTransfer.getFrom();
+        auto fromFlowConfig = lookupFlowConfig(flowTransfer.getOperation(), fromRef);
+        if (!fromFlowConfig) {
+            return;
+        }
+
+        SymbolRefAttr toRef = flowTransfer.getTo();
+        auto toFlowConfig = lookupFlowConfig(flowTransfer.getOperation(), toRef);
+        if (!toFlowConfig) {
+            return;
+        }
+
+        // Determine direction based on shim/core types
+        auto fromType = fromFlowConfig.getType();
+        auto toType = toFlowConfig.getType();
+
+        bool isInput = false;
+        bool isValidParam = false;
+
+        if (fromType && *fromType == "shim" && toType && *toType == "core") {
+            // shim -> core: Input parameter (MM2S - data flows into kernel)
+            isInput = true;
+            isValidParam = true;
+        } else if (fromType && *fromType == "core" && toType && *toType == "shim") {
+            // core -> shim: Output parameter (S2MM - data flows out of kernel)
+            isInput = false;
+            isValidParam = true;
+        }
+        // Note: core -> core is skipped (inter-tile transfer)
+
+        if (isValidParam) {
+            KernelParamInfo paramInfo;
+
+            if (isInput) {
+                paramInfo.windowName = "window_in_" + std::to_string(inputCount);
+                paramInfo.bufferPingName = "buf_in_ping_" + std::to_string(inputCount);
+                paramInfo.bufferPongName = "buf_in_pong_" + std::to_string(inputCount);
+                paramInfo.isInput = true;
+                // Allocate lock IDs for input (acquire for read, release after read)
+                paramInfo.acquireLockId = resourceMgr.allocateInputAcquireLock();
+                paramInfo.releaseLockId = resourceMgr.allocateInputReleaseLock();
+                inputCount++;
+            } else {
+                paramInfo.windowName = "window_out_" + std::to_string(outputCount);
+                paramInfo.bufferPingName = "buf_out_ping_" + std::to_string(outputCount);
+                paramInfo.bufferPongName = "buf_out_pong_" + std::to_string(outputCount);
+                paramInfo.isInput = false;
+                // Allocate lock IDs for output (acquire for write, release after write)
+                paramInfo.acquireLockId = resourceMgr.allocateOutputAcquireLock();
+                paramInfo.releaseLockId = resourceMgr.allocateOutputReleaseLock();
+                outputCount++;
+            }
+
+            // Get element type from the declare_data operand
+            Value srcValue = declareDataOp.getOperand();
+            if (srcValue) {
+                Type srcType = srcValue.getType();
+                if (auto tensorType = dyn_cast<RankedTensorType>(srcType)) {
+                    paramInfo.elementType = tensorType.getElementType();
+                    // Calculate buffer size from tensor shape
+                    int64_t totalSize = 1;
+                    for (int64_t dim : tensorType.getShape()) {
+                        totalSize *= dim;
+                    }
+                    paramInfo.bufferSize = totalSize;
+                } else {
+                    paramInfo.elementType = defaultElementType;
+                    paramInfo.bufferSize = defaultBufferSize;
+                }
+            } else {
+                paramInfo.elementType = defaultElementType;
+                paramInfo.bufferSize = defaultBufferSize;
+            }
+
+            paramInfo.vectorWidth = defaultVectorWidth;
+            params.push_back(paramInfo);
+        }
+    });
+
+    return params;
 }
 
 bool checktheopusedtensor(Operation *flowtransferOp) {
