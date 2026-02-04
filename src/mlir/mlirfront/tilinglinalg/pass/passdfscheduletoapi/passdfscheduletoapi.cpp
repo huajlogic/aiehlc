@@ -4,20 +4,23 @@
 ******************************************************************************/
 
 #include "passdfscheduletoapi.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Target/Cpp/CppEmitter.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/raw_ostream.h"
+#include <fstream>
 #include <iostream>
 #include <sstream>
+#include <sys/stat.h>
 
 using namespace mlir;
 
@@ -1806,20 +1809,88 @@ static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
 
     // Generate includes and defines
     code << "/* ========== Kernel Driver: " << info.moduleName << " ========== */\n";
-    code << "#include <adf.h>\n";
-    code << "#include <aie_api/aie.hpp>\n";
-    code << "#include <aie_api/aie_adf.hpp>\n";
+    code << "#include <stdint.h>\n";
     code << "#define FOR_READ  1\n";
     code << "#define FOR_WRITE 0\n";
     code << "#define BUF_SZ " << info.bufferSize << "\n\n";
 
     code << "volatile static int sync_buffer[8] = {0, -1};\n\n";
-    code << "#include <adf/sync/mesync.h>\n\n";
+
+    // Generate window management functions
+    code << "// Window management functions for standalone AIE kernels\n";
+    code << "// Note: chess_memory_fence() and done() are already defined by Chess intrinsics\n\n";
+
+    code << "// Window types\n";
+    code << "typedef struct {\n";
+    code << "    void* ptr;\n";
+    code << "    int ping_acq;\n";
+    code << "    int ping_rel;\n";
+    code << "    int pong_acq;\n";
+    code << "    int pong_rel;\n";
+    code << "    int size;\n";
+    code << "} window_internal;\n\n";
+
+    code << "typedef void* output_window_int8;\n";
+    code << "typedef void* input_window_int8;\n";
+    code << "typedef void* output_window_int16;\n";
+    code << "typedef void* input_window_int16;\n";
+    code << "typedef void* output_window_int32;\n";
+    code << "typedef void* input_window_int32;\n";
+    code << "typedef void* output_window_float;\n";
+    code << "typedef void* input_window_float;\n\n";
+
+    code << "// Window initialization\n";
+    code << "inline void window_init(window_internal* win, int count, void* ping, int ping_acq_lock, void* pong, int "
+            "ping_rel_lock, int ping_size, int pong_size) {\n";
+    code << "    win->ptr = ping;\n";
+    code << "    win->ping_acq = ping_acq_lock;\n";
+    code << "    win->ping_rel = ping_rel_lock;\n";
+    code << "    win->size = ping_size;\n";
+    code << "}\n\n";
+
+    code << "// Window access functions\n";
+    code << "inline output_window_int8 get_output_async_window_int8(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline output_window_int16 get_output_async_window_int16(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline output_window_int32 get_output_async_window_int32(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline output_window_float get_output_async_window_float(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline input_window_int8 get_input_async_window_int8(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline input_window_int16 get_input_async_window_int16(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline input_window_int32 get_input_async_window_int32(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline input_window_float get_input_async_window_float(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline int8_t* acquire_output_window(output_window_int8 win) {\n";
+    code << "    return (int8_t*)win;\n";
+    code << "}\n\n";
+
+    code << "inline void release_output_window(output_window_int8 win) {\n";
+    code << "    chess_memory_fence();\n";
+    code << "}\n\n";
 
     // Generate debug logging helpers
-    code << "// =============================================================================\n";
     code << "// Debug logging at fixed address 0x73000\n";
-    code << "// =============================================================================\n";
     code << "#define LOG_BASE_ADDR 0x73000\n";
     code << "static volatile int* log_ptr = (volatile int*)LOG_BASE_ADDR;\n";
     code << "static int log_index = 0;\n\n";
@@ -1883,12 +1954,12 @@ static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
                      << param.acquireLockId << ", " << param.bufferPongName << ", " << param.releaseLockId
                      << ", BUF_SZ, BUF_SZ);\n";
 
-                // Generate get_input/output_async_window call
+                // Generate get_input/output_async_window call (no pointer, return value is already the window type)
                 if (param.isInput) {
-                    code << "    input_window_" << param.elementTypeName << "* " << ptrVarName
+                    code << "    input_window_" << param.elementTypeName << " " << ptrVarName
                          << " = get_input_async_window_" << param.elementTypeName << "(" << windowVarName << ");\n\n";
                 } else {
-                    code << "    output_window_" << param.elementTypeName << "* " << ptrVarName
+                    code << "    output_window_" << param.elementTypeName << " " << ptrVarName
                          << " = get_output_async_window_" << param.elementTypeName << "(" << windowVarName << ");\n\n";
                 }
 
@@ -1910,12 +1981,12 @@ static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
             code << "    window_init(window_win_ping, 1, win_ping, LOCK_win_ping_ACQ, win_pong, LOCK_win_pong_REL, "
                     "BUF_SZ, "
                     "BUF_SZ);\n";
-            code << "    input_window_int32* win_ping_ptr = get_input_async_window_int32(window_win_ping);\n\n";
+            code << "    input_window_int32 win_ping_ptr = get_input_async_window_int32(window_win_ping);\n\n";
             code << "    window_internal window_out_ping[1];\n";
             code << "    window_init(window_out_ping, 1, out_ping, LOCK_out_ping_ACQ, out_pong, LOCK_out_pong_REL, "
                     "BUF_SZ, "
                     "BUF_SZ);\n";
-            code << "    output_window_int32* out_ping_ptr = get_output_async_window_int32(window_out_ping);\n\n";
+            code << "    output_window_int32 out_ping_ptr = get_output_async_window_int32(window_out_ping);\n\n";
             code << "    // Call kernel\n";
             code << "    " << info.kernelName << "(win_ping_ptr, out_ping_ptr);\n";
         }
@@ -1952,10 +2023,10 @@ static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
                 std::string ptrVar = param.windowSymbol + "_ptr";
 
                 if (param.isInput) {
-                    code << "        input_window_" << param.elementTypeName << "* " << ptrVar
-                         << " = window_acquire_in(" << windowVarNames[i] << ");\n";
+                    code << "        input_window_" << param.elementTypeName << " " << ptrVar << " = window_acquire_in("
+                         << windowVarNames[i] << ");\n";
                 } else {
-                    code << "        output_window_" << param.elementTypeName << "* " << ptrVar
+                    code << "        output_window_" << param.elementTypeName << " " << ptrVar
                          << " = window_acquire_out(" << windowVarNames[i] << ");\n";
                 }
                 ptrVars.push_back(ptrVar);
@@ -1987,8 +2058,8 @@ static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
                     "BUF_SZ, "
                     "BUF_SZ);\n\n";
             code << "    for(int i = 0; i < iterations; i++) {\n";
-            code << "        input_window_int32* win_ptr = window_acquire_in(window_win_ping);\n";
-            code << "        output_window_int32* out_ptr = window_acquire_out(window_out_ping);\n";
+            code << "        input_window_int32 win_ptr = window_acquire_in(window_win_ping);\n";
+            code << "        output_window_int32 out_ptr = window_acquire_out(window_out_ping);\n";
             code << "        " << info.kernelName << "(win_ptr, out_ptr);\n";
             code << "        window_release(window_win_ping);\n";
             code << "        window_release(window_out_ping);\n";
@@ -2771,6 +2842,148 @@ void DfscheduleToApiPass::runOnOperation() {
         llvm::errs() << "[Pass] ERROR: Null operands detected, failing pass\n";
         //signalPassFailure();
     }
+
+    //==========================================================================
+    // Phase 6: Write Generated Code to Files
+    //==========================================================================
+    llvm::errs() << "\n=== Phase 6: Writing Generated Code to Files ===\n";
+
+    // Define output directory at unitest level
+    std::string outputDir = "/scratch/staff/huaj/aiehlc/aiehlc/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal/";
+
+    // Create output directory if it doesn't exist
+    mkdir(outputDir.c_str(), 0755);
+
+    // Generate C++ code from the module
+    std::string fullCode;
+    llvm::raw_string_ostream codeStream(fullCode);
+
+    if (failed(mlir::emitc::translateToCpp(moduleOp, codeStream))) {
+        llvm::errs() << "[Pass] ERROR: Failed to translate MLIR to C++\n";
+        signalPassFailure();
+        return;
+    }
+
+    codeStream.flush();
+
+    // Split the generated code into separate files
+    // Strategy: Look for function signatures and __global__ attribute
+
+    std::string kernelCode;
+    std::string hostCode;
+    std::string currentFunction;
+    bool inKernelFunction = false;
+    bool inHostFunction = false;
+
+    std::istringstream codeLines(fullCode);
+    std::string line;
+
+    while (std::getline(codeLines, line)) {
+        // Check for __global__ attribute (kernel function)
+        if (line.find("__global__") != std::string::npos) {
+            inKernelFunction = true;
+            inHostFunction = false;
+        }
+        // Check for regular function starts
+        else if (line.find("void ") == 0 || line.find("int main") != std::string::npos) {
+            // If we see a non-global function, it's host code
+            if (!inKernelFunction) {
+                inHostFunction = true;
+            }
+        }
+
+        // Append to appropriate buffer
+        if (inKernelFunction) {
+            kernelCode += line + "\n";
+            // Check if function ended
+            if (line.find("}") != std::string::npos && line.find("{") == std::string::npos) {
+                inKernelFunction = false;
+            }
+        } else if (inHostFunction) {
+            hostCode += line + "\n";
+            // Check if function ended
+            if (line.find("}") != std::string::npos && line.find("{") == std::string::npos) {
+                inHostFunction = false;
+            }
+        } else {
+            // Global declarations, includes, etc. - add to both
+            if (line.find("#include") != std::string::npos || line.find("typedef") != std::string::npos ||
+                line.find("struct") != std::string::npos || line.find("static") != std::string::npos) {
+                kernelCode += line + "\n";
+                hostCode += line + "\n";
+            }
+        }
+    }
+
+    // Write kernel.cc (this is the kernel driver)
+    // We'll extract the kernel module code that was generated
+    std::string kernelDriverCode;
+    bool foundKernelModule = false;
+
+    moduleOp.walk([&](emitc::VerbatimOp verbatimOp) {
+        std::string verbatimText = verbatimOp.getValue().str();
+        if (verbatimText.find("Kernel Driver:") != std::string::npos) {
+            kernelDriverCode = verbatimText;
+            foundKernelModule = true;
+        }
+    });
+
+    if (foundKernelModule && !kernelDriverCode.empty()) {
+        std::string kernelPath = outputDir + "kernel.cc";
+        std::ofstream kernelFile(kernelPath);
+        if (kernelFile.is_open()) {
+            kernelFile << kernelDriverCode;
+            kernelFile.close();
+            llvm::errs() << "[Pass] ✓ Wrote kernel driver: " << kernelPath << "\n";
+        } else {
+            llvm::errs() << "[Pass] ERROR: Failed to open " << kernelPath << " for writing\n";
+        }
+    }
+
+    // Write compute_kernel.cc (placeholder if not generated)
+    std::string computeKernelPath = outputDir + "compute_kernel.cc";
+    std::ofstream computeKernelFile(computeKernelPath);
+    if (computeKernelFile.is_open()) {
+        // Generate a simple compute kernel template
+        computeKernelFile << "// Compute kernel implementation\n";
+        computeKernelFile << "// This is the actual kernel logic\n\n";
+        computeKernelFile << "void compute_kernel(output_window_int8 window_out) {\n";
+        computeKernelFile << "    int8_t* out = acquire_output_window(window_out);\n";
+        computeKernelFile << "    \n";
+        computeKernelFile << "    // Kernel logic here\n";
+        computeKernelFile << "    for(int i = 0; i < 256; i++) {\n";
+        computeKernelFile << "        v4int8 data;\n";
+        computeKernelFile << "        // Initialize vector using member-wise assignment\n";
+        computeKernelFile << "        ((int8_t*)&data)[0] = i;\n";
+        computeKernelFile << "        ((int8_t*)&data)[1] = i + 1;\n";
+        computeKernelFile << "        ((int8_t*)&data)[2] = i + 2;\n";
+        computeKernelFile << "        ((int8_t*)&data)[3] = i + 3;\n";
+        computeKernelFile << "        *((v4int8*)&out[i * 4]) = data;\n";
+        computeKernelFile << "    }\n";
+        computeKernelFile << "    \n";
+        computeKernelFile << "    release_output_window(window_out);\n";
+        computeKernelFile << "}\n";
+        computeKernelFile.close();
+        llvm::errs() << "[Pass] ✓ Wrote compute kernel: " << computeKernelPath << "\n";
+    }
+
+    // Write host.cc
+    if (!hostCode.empty()) {
+        std::string hostPath = outputDir + "host.cc";
+        std::ofstream hostFile(hostPath);
+        if (hostFile.is_open()) {
+            hostFile << "// Generated host runtime code\n";
+            hostFile << "#include <stdint.h>\n";
+            hostFile << "#include <string.h>\n\n";
+            hostFile << hostCode;
+            hostFile.close();
+            llvm::errs() << "[Pass] ✓ Wrote host code: " << hostPath << "\n";
+        } else {
+            llvm::errs() << "[Pass] ERROR: Failed to open " << hostPath << " for writing\n";
+        }
+    }
+
+    llvm::errs() << "=== File Generation Complete ===\n\n";
 }
 
 } // namespace mlir

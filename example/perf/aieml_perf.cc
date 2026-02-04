@@ -113,7 +113,7 @@ int test_routing(XAie_DevInst *DevInst)
 	AieRC RC = XAIE_OK;
 	XAie_RoutingInstance* routingInstance;
   	//XTime tStart, tEnd;
-    printf("Starting test_routing 01/28\n");
+    printf("Starting test_routing 02/2 -1\n");
     breakprint("core reset--");
 #if AIE_GEN == XAIE_DEV_GEN_AIE2PS
     int shimcol = 10; // 33;
@@ -304,14 +304,14 @@ int main(int argc, char* argv[]) {
 	int colnum = (startcol + partitonnum <= XAIE_NUM_COLS) ? partitonnum : (XAIE_NUM_COLS- startcol);
 
 	AieRC RC;
-    /*
+    ///*
     RC = XAie_SetupPartitionConfig(&DevInst, XAIE_BASE_ADDR + (startcol<<XAIE_COL_SHIFT),
                                        startcol, colnum);
     if(RC != XAIE_OK) {
         printf("Driver XAie_SetupPartitionConfig failed.\n");
         return -1;
     }
-        //*/
+    //*/
 
     RC = XAie_CfgInitialize(&DevInst, &ConfigPtr);
 	if(RC != XAIE_OK) {
