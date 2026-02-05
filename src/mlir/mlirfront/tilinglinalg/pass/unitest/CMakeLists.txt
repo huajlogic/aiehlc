@@ -98,6 +98,7 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaptodmaphop/dmaptodmaphop.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/passblueprinttoschedule.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedulekernel/passblueprinttoschedulekernel.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passschedulecanonicalize/passschedulecanonicalize.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdfscheduletoapi/passdfscheduletoapi.cpp

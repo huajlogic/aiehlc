@@ -851,27 +851,40 @@ void routingtodfschedule() {
     pm.addPass(std::make_unique<DmaphopTodfscheblueprintPass>());
     options.label = "After DmaphopTodfscheblueprintPass:";
     pm.addPass(mlir::createPrintIRPass(options));
-    
+    // generete the blueprint ir
+    if (failed(pm.run(module1))) {
+        llvm::errs() << "ERROR: Pass pipeline failed!\n";
+        return;
+    }
+    // return;
+    std::cout << "\n=== Final Module with API calls ===" << std::endl;
+    module1.dump();
+
+    // clone the module1 which used for generate host ir to kernelModule
+    mlir::ModuleOp kernelModule = cast<ModuleOp>(module1->clone());
+    mlir::ModuleOp hostModule = cast<ModuleOp>(module1->clone());
+
+    mlir::PassManager pmphase2(&ctx);
     // Stage 5: Convert dfscheblueprint to dfschedule (final schedule IR)
-    pm.addPass(std::make_unique<mlir::BlueprintToSchedulePass>());
+    pmphase2.addPass(std::make_unique<mlir::BlueprintToSchedulePass>());
     options.label = "After BlueprintToSchedulePass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    
+    pmphase2.addPass(mlir::createPrintIRPass(options));
+
     // Stage 6: Canonicalize schedule - merge kernel loads, deduplicate tiles, consolidate IOs
-    pm.addPass(std::make_unique<mlir::ScheduleCanonicalizePass>());
+    pmphase2.addPass(std::make_unique<mlir::ScheduleCanonicalizePass>());
     options.label = "After ScheduleCanonicalizePass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    
-   // /*
+    pmphase2.addPass(mlir::createPrintIRPass(options));
+
+    // /*
     // Stage 7: Convert dfschedule to API calls and EmitC
-    pm.addPass(std::make_unique<mlir::DfscheduleToApiPass>());
+    pmphase2.addPass(std::make_unique<mlir::DfscheduleToApiPass>());
     options.label = "After DfscheduleToApiPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    
+    pmphase2.addPass(mlir::createPrintIRPass(options));
+
     // Stage 9: Canonicalization to optimize EmitC operations
-    pm.addPass(mlir::createCanonicalizerPass());
+    pmphase2.addPass(mlir::createCanonicalizerPass());
     options.label = "After Canonicalization:";
-    pm.addPass(mlir::createPrintIRPass(options));
+    pmphase2.addPass(mlir::createPrintIRPass(options));
 
     //pm.addPass(std::make_unique<RoutingDeadArgPass>());
     //options.label = "After RoutingDeadArgPass:";
@@ -884,25 +897,18 @@ void routingtodfschedule() {
  
     //into
 
-    //int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0); 
- 
-    pm.addPass(std::make_unique<RoutingConstantFoldPass>());
+    //int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0);
+
+    pmphase2.addPass(std::make_unique<RoutingConstantFoldPass>());
     options.label = "After RoutingConstantFoldPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    
+    pmphase2.addPass(mlir::createPrintIRPass(options));
+    (void)pmphase2.run(hostModule);
     //*/
     // Run the pass pipeline
-    if (failed(pm.run(module1))) {
-        llvm::errs() << "ERROR: Pass pipeline failed!\n";
-        return;
-    }
-    //return;
-    std::cout << "\n=== Final Module with API calls ===" << std::endl;
-    module1.dump();
-    
+
     // Convert to C++ code
     std::cout << "\n=== Generated C++ Code ===" << std::endl;
-    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    mlir::LogicalResult result = mlir::emitc::translateToCpp(hostModule, llvm::outs());
     if (failed(result)) {
         llvm::errs() << "Failed to translate MLIR to C++.\n";
     }

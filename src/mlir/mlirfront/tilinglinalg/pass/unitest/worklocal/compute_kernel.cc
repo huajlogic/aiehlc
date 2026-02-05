@@ -1,8 +1,3 @@
-/******************************************************************************
- * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
- * SPDX-License-Identifier: MIT
- ******************************************************************************/
-
 // Compute kernel implementation
 // This is the actual kernel logic
 
