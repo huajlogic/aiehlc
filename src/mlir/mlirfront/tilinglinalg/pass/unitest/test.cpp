@@ -5,6 +5,7 @@
 #include "../passblueprinttoschedule/passblueprinttoschedule.h"
 #include "../passblueprinttoschedulekernel/passblueprinttoschedulekernel.h"
 #include "../passdfscheduletoapi/passdfscheduletoapi.h"
+#include "../passdfscheduletokernelapi/passdfscheduletokernelapi.h"
 #include "../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.h"
 #include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
 #include "../passdmaptodmaphop/dmaptodmaphop.h"
@@ -923,12 +924,17 @@ void routingtodfschedule() {
     pmkernel.addPass(std::make_unique<mlir::BlueprintToScheduleKernelPass>());
     options.label = "After BlueprintToScheduleKernelPass:";
     pmkernel.addPass(mlir::createPrintIRPass(options));
+    pmkernel.addPass(std::make_unique<mlir::DfscheduleToKernelApiPass>());
     if (failed(pmkernel.run(kernelModule))) {
         llvm::errs() << "ERROR: Pass pipeline failed!\n";
         return;
     }
+    mlir::LogicalResult result2 = mlir::emitc::translateToCpp(kernelModule, llvm::outs());
+    if (failed(result2)) {
+        llvm::errs() << "Failed to translate MLIR to C++.\n";
+    }
     std::cout << "\n=== Final kernelModule with API calls ===" << std::endl;
-    kernelModule.dump();
+    // kernelModule.dump();
     return;
 }
 
