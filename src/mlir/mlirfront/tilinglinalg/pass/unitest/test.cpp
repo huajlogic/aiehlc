@@ -25,6 +25,8 @@
 #include <iostream>
 //#include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IRPrinter/IRPrintingPasses.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -911,16 +913,33 @@ void routingtodfschedule() {
     //*/
     // Run the pass pipeline
 
-    // Convert to C++ code
-    std::cout << "\n=== Generated C++ Code ===" << std::endl;
-    mlir::LogicalResult result = mlir::emitc::translateToCpp(hostModule, llvm::outs());
-    if (failed(result)) {
-        llvm::errs() << "Failed to translate MLIR to C++.\n";
+    // Output directory for generated host.cc and kernel.cc
+    const std::string worklocalDir =
+        "/scratch/staff/huaj/aiehlc/aiehlc/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal";
+    if (std::error_code EC = llvm::sys::fs::create_directories(worklocalDir)) {
+        llvm::errs() << "Failed to create directory " << worklocalDir << ": " << EC.message() << "\n";
+        return;
     }
 
-    // genereating the kernel module
+    // Convert host module to C++ and write to host.cc
+    std::string hostPath = worklocalDir + "/host.cc";
+    std::error_code hostEC;
+    llvm::raw_fd_ostream hostStream(hostPath, hostEC, llvm::sys::fs::OF_None);
+    if (hostEC) {
+        llvm::errs() << "Failed to open " << hostPath << ": " << hostEC.message() << "\n";
+        return;
+    }
+    std::cout << "\n=== Generated C++ Code (host) ===" << std::endl;
+    mlir::LogicalResult result = mlir::emitc::translateToCpp(hostModule, hostStream);
+    hostStream.close();
+    if (failed(result)) {
+        llvm::errs() << "Failed to translate host MLIR to C++.\n";
+        return;
+    }
+    std::cout << "Host code written to " << hostPath << std::endl;
+
+    // Generate the kernel module
     mlir::PassManager pmkernel(&ctx);
-    // Stage 5: Convert dfscheblueprint to dfschedule (final schedule IR)
     pmkernel.addPass(std::make_unique<mlir::BlueprintToScheduleKernelPass>());
     options.label = "After BlueprintToScheduleKernelPass:";
     pmkernel.addPass(mlir::createPrintIRPass(options));
@@ -929,12 +948,23 @@ void routingtodfschedule() {
         llvm::errs() << "ERROR: Pass pipeline failed!\n";
         return;
     }
-    mlir::LogicalResult result2 = mlir::emitc::translateToCpp(kernelModule, llvm::outs());
-    if (failed(result2)) {
-        llvm::errs() << "Failed to translate MLIR to C++.\n";
+
+    // Convert kernel module to C++ and write to kernel.cc
+    std::string kernelPath = worklocalDir + "/kernel.cc";
+    std::error_code kernelEC;
+    llvm::raw_fd_ostream kernelStream(kernelPath, kernelEC, llvm::sys::fs::OF_None);
+    if (kernelEC) {
+        llvm::errs() << "Failed to open " << kernelPath << ": " << kernelEC.message() << "\n";
+        return;
     }
-    std::cout << "\n=== Final kernelModule with API calls ===" << std::endl;
-    // kernelModule.dump();
+    std::cout << "\n=== Generated C++ Code (kernel) ===" << std::endl;
+    mlir::LogicalResult result2 = mlir::emitc::translateToCpp(kernelModule, kernelStream);
+    kernelStream.close();
+    if (failed(result2)) {
+        llvm::errs() << "Failed to translate kernel MLIR to C++.\n";
+        return;
+    }
+    std::cout << "Kernel code written to " << kernelPath << std::endl;
     return;
 }
 
