@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: MIT
  ******************************************************************************/
 
-#ifndef __BLUEPRINT_TOSCHEDULE_PASS_H__
-#define __BLUEPRINT_TOSCHEDULE_PASS_H__
+#ifndef __BLUEPRINT_TOSCHEDULE_KERNEL_PASS_H__
+#define __BLUEPRINT_TOSCHEDULE_KERNEL_PASS_H__
 
 #include "dfscheblueprintmanager.h"
 #include "dfschedulemanager.h"
@@ -32,4 +32,4 @@ class BlueprintToScheduleKernelPass : public PassWrapper<BlueprintToScheduleKern
 
 } // namespace mlir
 
-#endif // __BLUEPRINT_TOSCHEDULE_PASS_H__
+#endif // __BLUEPRINT_TOSCHEDULE_KERNEL_PASS_H__

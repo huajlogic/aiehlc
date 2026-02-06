@@ -2,25 +2,26 @@
 * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
-#include <iostream>
-#include "routinghwmanager.h"
-#include "routinghwlower.h"
-#include "routingmanager.h"
-#include "routinglower.h"
-#include "../passroutingtodmap/routingtodmap.h"
-#include "../passdmaptodmaphop/dmaptodmaphop.h"
-#include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
 #include "../passblueprinttoschedule/passblueprinttoschedule.h"
-#include "../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.h"
-#include "../passschedulecanonicalize/passschedulecanonicalize.h"
+#include "../passblueprinttoschedulekernel/passblueprinttoschedulekernel.h"
 #include "../passdfscheduletoapi/passdfscheduletoapi.h"
-#include "dmapmanager.h"
-#include "dmaphopmanager.h"
-#include "dfschedulemanager.h"
+#include "../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.h"
+#include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
+#include "../passdmaptodmaphop/dmaptodmaphop.h"
+#include "../passroutingtodmap/routingtodmap.h"
+#include "../passschedulecanonicalize/passschedulecanonicalize.h"
 #include "dfscheblueprintmanager.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "routingunrolling.h"
+#include "dfschedulemanager.h"
+#include "dmaphopmanager.h"
+#include "dmapmanager.h"
 #include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "routinghwlower.h"
+#include "routinghwmanager.h"
+#include "routinglower.h"
+#include "routingmanager.h"
+#include "routingunrolling.h"
+#include <iostream>
 //#include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IRPrinter/IRPrintingPasses.h"
 
@@ -902,7 +903,10 @@ void routingtodfschedule() {
     pmphase2.addPass(std::make_unique<RoutingConstantFoldPass>());
     options.label = "After RoutingConstantFoldPass:";
     pmphase2.addPass(mlir::createPrintIRPass(options));
-    (void)pmphase2.run(hostModule);
+    if (failed(pmphase2.run(hostModule))) {
+        llvm::errs() << "ERROR: Pass pipeline failed!\n";
+        return;
+    }
     //*/
     // Run the pass pipeline
 
@@ -912,7 +916,19 @@ void routingtodfschedule() {
     if (failed(result)) {
         llvm::errs() << "Failed to translate MLIR to C++.\n";
     }
-    
+
+    // genereating the kernel module
+    mlir::PassManager pmkernel(&ctx);
+    // Stage 5: Convert dfscheblueprint to dfschedule (final schedule IR)
+    pmkernel.addPass(std::make_unique<mlir::BlueprintToScheduleKernelPass>());
+    options.label = "After BlueprintToScheduleKernelPass:";
+    pmkernel.addPass(mlir::createPrintIRPass(options));
+    if (failed(pmkernel.run(kernelModule))) {
+        llvm::errs() << "ERROR: Pass pipeline failed!\n";
+        return;
+    }
+    std::cout << "\n=== Final kernelModule with API calls ===" << std::endl;
+    kernelModule.dump();
     return;
 }
 

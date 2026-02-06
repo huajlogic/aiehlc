@@ -861,7 +861,22 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();
+        return;
     }
+
+    // Kernel-only: remove all top-level ops that are not dfschedule kernel logic.
+    // Keep only DSKernelReceiverOp (@kernel_driver_dskernel_receiver) and KernelModuleOp (dfschedule.module).
+    // This removes func @main and any declare_data / partitiontensor / RoutingCreate host IR.
+    Operation *root = getOperation();
+    while (root->getParentOp())
+        root = root->getParentOp();
+    Block &body = root->getRegion(0).front();
+    SmallVector<Operation *> toErase;
+    for (Operation &op : body)
+        if (!isa<dfschedule::DSKernelReceiverOp>(&op) && !isa<dfschedule::KernelModuleOp>(&op))
+            toErase.push_back(&op);
+    for (auto it = toErase.rbegin(); it != toErase.rend(); ++it)
+        (*it)->erase();
 }
 
 } // namespace mlir
