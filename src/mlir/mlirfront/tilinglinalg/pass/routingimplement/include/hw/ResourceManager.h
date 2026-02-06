@@ -100,34 +100,34 @@ enum class StreamType {
 };
 class RoutingTile {
 public:
-    RoutingTile(int r,int c, TileType tt,const std::vector<PortTemplate> & Portinfo);
+  RoutingTile(int r, int c, ::TileType tt, const std::vector<PortTemplate> &Portinfo);
 
-    uint32_t getPortnumFromPortIdx(PortDirection dir, PortRole role, uint32_t portidx);
+  uint32_t getPortnumFromPortIdx(PortDirection dir, PortRole role, uint32_t portidx);
 
-    std::optional<int> allocate(IOType io, int portidx,PortDirection dir, int ioId);
-    std::optional<int> occupyport(IOType io, PortDirection dir, int ioId);
-    bool releaseByIo (IOType io, int portidx,PortDirection dir, int ioId);
+  std::optional<int> allocate(IOType io, int portidx, PortDirection dir, int ioId);
+  std::optional<int> occupyport(IOType io, PortDirection dir, int ioId);
+  bool releaseByIo(IOType io, int portidx, PortDirection dir, int ioId);
 
-    const DirBank& bank(PortDirection d) const { return banks_.at(d); }
-    TileType type() const { return type_; }
-    int row()   const { return row_; }
-    int col()   const { return col_; }
+  const DirBank &bank(PortDirection d) const { return banks_.at(d); }
+  ::TileType type() const { return type_; }
+  int row() const { return row_; }
+  int col() const { return col_; }
 
-    // Added for tile reservation
-    bool isReserved() const { return reserved_; }
-    void setReserved(bool reserved, int ioId) { 
-        reserved_ = reserved; 
-        if (reserved) {
-            reservedByIoId_ = ioId;
-        } else {
-            reservedByIoId_ = -1;
-        }
+  // Added for tile reservation
+  bool isReserved() const { return reserved_; }
+  void setReserved(bool reserved, int ioId) {
+      reserved_ = reserved;
+      if (reserved) {
+          reservedByIoId_ = ioId;
+      } else {
+          reservedByIoId_ = -1;
+      }
     }
     int getReservedByIoId() const { return reservedByIoId_; }
 
 private:
     int row_, col_;
-    TileType type_;
+    ::TileType type_;
     std::unordered_map<PortDirection, DirBank> banks_;
     // Added for tile reservation
     bool reserved_ = false;
@@ -402,57 +402,58 @@ private:
 
 class ResourceMgr {
 public:
-    ResourceMgr(std::unique_ptr<IHwResource> resource, TileType defaultType = TileType::Core);
-    static bool     init(std::unique_ptr<IHwResource> resource, TileType defType = TileType::Core);
-    static std::shared_ptr<ResourceMgr> instance();
-    uint32_t allocdioid();
+  ResourceMgr(std::unique_ptr<IHwResource> resource, ::TileType defaultType = ::TileType::Core);
+  static bool init(std::unique_ptr<IHwResource> resource, ::TileType defType = ::TileType::Core);
+  static std::shared_ptr<ResourceMgr> instance();
+  uint32_t allocdioid();
 
-    std::shared_ptr<DataIO> createDataIO(IOType tp, int r=0, int c=0, DMADIRECTION dir = DMADIRECTION::MM2S, int channel =0,std::string nm="", std::string cmt="");
-    bool linkAvailable(Point a, Point b, int& portIdx) const;
-    bool portDirAvailable(Point a, int& portIdx, PortDirection direction, bool master) const;
+  std::shared_ptr<DataIO> createDataIO(IOType tp, int r = 0, int c = 0, DMADIRECTION dir = DMADIRECTION::MM2S,
+                                       int channel = 0, std::string nm = "", std::string cmt = "");
+  bool linkAvailable(Point a, Point b, int &portIdx) const;
+  bool portDirAvailable(Point a, int &portIdx, PortDirection direction, bool master) const;
 
-    bool occupyLink(Point a, Point b, const int ioId,int& portidx, PortDirection& pda, PortDirection& pdb);
-    bool occupyPointDirection(Point a,int& portidx, PortDirection& pd,bool slave);
-    bool releaseLink(Point a, Point b, int ioId,int portidx);
-    std::optional<Point> freeShimNoc(std::optional<Point> dst = std::nullopt )const;
-    std::optional<Point> freeShimNoc(std::optional<TypeBasedTileLoc> loc)const;
-    std::optional<FoundDmaSlot> freeShimNoc(std::optional<TypeBasedTileLoc> ioPaireddstTileloc, DMADIRECTION direct, int requesterIoId)const;
-    RoutingTile&       tile(int r,int c);
-    const RoutingTile& tile(int r,int c) const;
-    int rows() const;
-    int cols() const;
-    static std::once_flag              flag_;
-    static std::shared_ptr<ResourceMgr> singleton_;
+  bool occupyLink(Point a, Point b, const int ioId, int &portidx, PortDirection &pda, PortDirection &pdb);
+  bool occupyPointDirection(Point a, int &portidx, PortDirection &pd, bool slave);
+  bool releaseLink(Point a, Point b, int ioId, int portidx);
+  std::optional<Point> freeShimNoc(std::optional<Point> dst = std::nullopt) const;
+  std::optional<Point> freeShimNoc(std::optional<TypeBasedTileLoc> loc) const;
+  std::optional<FoundDmaSlot> freeShimNoc(std::optional<TypeBasedTileLoc> ioPaireddstTileloc, DMADIRECTION direct,
+                                          int requesterIoId) const;
+  RoutingTile &tile(int r, int c);
+  const RoutingTile &tile(int r, int c) const;
+  int rows() const;
+  int cols() const;
+  static std::once_flag flag_;
+  static std::shared_ptr<ResourceMgr> singleton_;
 
-    // methods for tile reservation
-    bool isTileReserved(int r, int c) const;
-    bool isTileReserved(const Point& p) const { return isTileReserved(p.r, p.c); }
-    
-    // Reserve a specified tile for a DataIO
-    bool reserveTile(int r, int c, int ioId);
-    bool reserveTile(const Point& p, int ioId) { return reserveTile(p.r, p.c, ioId); }
-    
-    // Reserve multiple tiles for a DataIO using a strategy
-    bool reserveTiles(int ioId, int numTiles, ReservationStrategy strategy, 
-                      std::vector<Point>& allocatedTiles,
-                      std::optional<TileType> requestedType = TileType::Core,
-                      std::optional<Point> startPoint = std::nullopt);
-    
-    // Release all tiles reserved for a specific DataIO
-    void releaseReservedTiles(int ioId);
-    
-    // Get all tiles reserved by a specific DataIO
-    std::vector<Point> getReservedTilesForDataIo(int ioId) const;
-    IHwResource* getrsc() {return resource_.get();};
-    
-    // Register shim column, channel, and direction to ioId mapping
-    void registerShimChannelMapping(int shimCol, int channel, DMADIRECTION direction, int ioId);
-    
-    // Find ioId based on shim column, channel number, and direction
-    std::optional<int> findIoIdByShimChannel(int shimCol, int channel, DMADIRECTION direction) const;
-    
-    // Find DataIO object by shim column, channel, and direction
-    std::shared_ptr<DataIO> findDataIOByShimChannel(int shimCol, int channel, DMADIRECTION direction) const;
+  // methods for tile reservation
+  bool isTileReserved(int r, int c) const;
+  bool isTileReserved(const Point &p) const { return isTileReserved(p.r, p.c); }
+
+  // Reserve a specified tile for a DataIO
+  bool reserveTile(int r, int c, int ioId);
+  bool reserveTile(const Point &p, int ioId) { return reserveTile(p.r, p.c, ioId); }
+
+  // Reserve multiple tiles for a DataIO using a strategy
+  bool reserveTiles(int ioId, int numTiles, ReservationStrategy strategy, std::vector<Point> &allocatedTiles,
+                    std::optional<::TileType> requestedType = ::TileType::Core,
+                    std::optional<Point> startPoint = std::nullopt);
+
+  // Release all tiles reserved for a specific DataIO
+  void releaseReservedTiles(int ioId);
+
+  // Get all tiles reserved by a specific DataIO
+  std::vector<Point> getReservedTilesForDataIo(int ioId) const;
+  IHwResource *getrsc() { return resource_.get(); };
+
+  // Register shim column, channel, and direction to ioId mapping
+  void registerShimChannelMapping(int shimCol, int channel, DMADIRECTION direction, int ioId);
+
+  // Find ioId based on shim column, channel number, and direction
+  std::optional<int> findIoIdByShimChannel(int shimCol, int channel, DMADIRECTION direction) const;
+
+  // Find DataIO object by shim column, channel, and direction
+  std::shared_ptr<DataIO> findDataIOByShimChannel(int shimCol, int channel, DMADIRECTION direction) const;
 
 private:
     void InitSHIMNocList();

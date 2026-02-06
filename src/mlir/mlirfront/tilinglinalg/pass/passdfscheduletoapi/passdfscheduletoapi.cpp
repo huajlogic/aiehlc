@@ -1499,19 +1499,9 @@ struct DsKernelReceiverPattern : public ConversionPattern {
         
         // Generate kernel body that reads config from tile-local memory
         // The kernel will read from TILE_CONFIG_ADDR at runtime
-        rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr(
-            "// Read tile-specific config from local memory at TILE_CONFIG_ADDR\n"
-            "  TileConfig *config = (TileConfig *)TILE_CONFIG_ADDR;\n"
-            "  uint8_t packet_id = config->packet_id;\n"
-            "  uint32_t dma_channel = config->dma_channel;\n"
-            "  uint8_t buffer_mode = config->buffer_mode;\n"
-            "  uint8_t num_buffers = config->num_buffers;\n"
-            "  uint32_t buffer_size = config->buffer_size;\n"
-            "  void *buffer_addr = (void *)config->buffer_addr;\n"
-            "  uint8_t element_size = config->element_size;\n"
-            "  // TODO: Implement kernel logic using above config"
-        ));
-        
+        rewriter.create<emitc::VerbatimOp>(loc,
+                                           rewriter.getStringAttr("// the real kernel will be emitted separately\n"));
+
         rewriter.create<emitc::ReturnOp>(loc, Value{});
         
         llvm::errs() << "[Pattern] Created __global__ func: " << kernelName 
@@ -2841,146 +2831,6 @@ void DfscheduleToApiPass::runOnOperation() {
     if (foundNullOperand) {
         llvm::errs() << "[Pass] ERROR: Null operands detected, failing pass\n";
         //signalPassFailure();
-    }
-
-    //==========================================================================
-    // Phase 6: Write Generated Code to Files
-    //==========================================================================
-    llvm::errs() << "\n=== Phase 6: Writing Generated Code to Files ===\n";
-
-    // Define output directory at unitest level
-    std::string outputDir = "/scratch/staff/huaj/aiehlc/aiehlc/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal/";
-
-    // Create output directory if it doesn't exist
-    mkdir(outputDir.c_str(), 0755);
-
-    // Generate C++ code from the module
-    std::string fullCode;
-    llvm::raw_string_ostream codeStream(fullCode);
-
-    if (failed(mlir::emitc::translateToCpp(moduleOp, codeStream))) {
-        llvm::errs() << "[Pass] ERROR: Failed to translate MLIR to C++\n";
-        signalPassFailure();
-        return;
-    }
-
-    codeStream.flush();
-
-    // Split the generated code into separate files
-    // Strategy: Look for function signatures and __global__ attribute
-
-    std::string kernelCode;
-    std::string hostCode;
-    std::string currentFunction;
-    bool inKernelFunction = false;
-    bool inHostFunction = false;
-
-    std::istringstream codeLines(fullCode);
-    std::string line;
-
-    while (std::getline(codeLines, line)) {
-        // Check for __global__ attribute (kernel function)
-        if (line.find("__global__") != std::string::npos) {
-            inKernelFunction = true;
-            inHostFunction = false;
-        }
-        // Check for regular function starts
-        else if (line.find("void ") == 0 || line.find("int main") != std::string::npos) {
-            // If we see a non-global function, it's host code
-            if (!inKernelFunction) {
-                inHostFunction = true;
-            }
-        }
-
-        // Append to appropriate buffer
-        if (inKernelFunction) {
-            kernelCode += line + "\n";
-            // Check if function ended
-            if (line.find("}") != std::string::npos && line.find("{") == std::string::npos) {
-                inKernelFunction = false;
-            }
-        } else if (inHostFunction) {
-            hostCode += line + "\n";
-            // Check if function ended
-            if (line.find("}") != std::string::npos && line.find("{") == std::string::npos) {
-                inHostFunction = false;
-            }
-        } else {
-            // Global declarations, includes, etc. - add to both
-            if (line.find("#include") != std::string::npos || line.find("typedef") != std::string::npos ||
-                line.find("struct") != std::string::npos || line.find("static") != std::string::npos) {
-                kernelCode += line + "\n";
-                hostCode += line + "\n";
-            }
-        }
-    }
-
-    // Write kernel.cc (this is the kernel driver)
-    // We'll extract the kernel module code that was generated
-    std::string kernelDriverCode;
-    bool foundKernelModule = false;
-
-    moduleOp.walk([&](emitc::VerbatimOp verbatimOp) {
-        std::string verbatimText = verbatimOp.getValue().str();
-        if (verbatimText.find("Kernel Driver:") != std::string::npos) {
-            kernelDriverCode = verbatimText;
-            foundKernelModule = true;
-        }
-    });
-
-    if (foundKernelModule && !kernelDriverCode.empty()) {
-        std::string kernelPath = outputDir + "kernel.cc";
-        std::ofstream kernelFile(kernelPath);
-        if (kernelFile.is_open()) {
-            kernelFile << kernelDriverCode;
-            kernelFile.close();
-            llvm::errs() << "[Pass] ✓ Wrote kernel driver: " << kernelPath << "\n";
-        } else {
-            llvm::errs() << "[Pass] ERROR: Failed to open " << kernelPath << " for writing\n";
-        }
-    }
-
-    // Write compute_kernel.cc (placeholder if not generated)
-    std::string computeKernelPath = outputDir + "compute_kernel.cc";
-    std::ofstream computeKernelFile(computeKernelPath);
-    if (computeKernelFile.is_open()) {
-        // Generate a simple compute kernel template
-        computeKernelFile << "// Compute kernel implementation\n";
-        computeKernelFile << "// This is the actual kernel logic\n\n";
-        computeKernelFile << "void compute_kernel(output_window_int8 window_out) {\n";
-        computeKernelFile << "    int8_t* out = acquire_output_window(window_out);\n";
-        computeKernelFile << "    \n";
-        computeKernelFile << "    // Kernel logic here\n";
-        computeKernelFile << "    for(int i = 0; i < 256; i++) {\n";
-        computeKernelFile << "        v4int8 data;\n";
-        computeKernelFile << "        // Initialize vector using member-wise assignment\n";
-        computeKernelFile << "        ((int8_t*)&data)[0] = i;\n";
-        computeKernelFile << "        ((int8_t*)&data)[1] = i + 1;\n";
-        computeKernelFile << "        ((int8_t*)&data)[2] = i + 2;\n";
-        computeKernelFile << "        ((int8_t*)&data)[3] = i + 3;\n";
-        computeKernelFile << "        *((v4int8*)&out[i * 4]) = data;\n";
-        computeKernelFile << "    }\n";
-        computeKernelFile << "    \n";
-        computeKernelFile << "    release_output_window(window_out);\n";
-        computeKernelFile << "}\n";
-        computeKernelFile.close();
-        llvm::errs() << "[Pass] ✓ Wrote compute kernel: " << computeKernelPath << "\n";
-    }
-
-    // Write host.cc
-    if (!hostCode.empty()) {
-        std::string hostPath = outputDir + "host.cc";
-        std::ofstream hostFile(hostPath);
-        if (hostFile.is_open()) {
-            hostFile << "// Generated host runtime code\n";
-            hostFile << "#include <stdint.h>\n";
-            hostFile << "#include <string.h>\n\n";
-            hostFile << hostCode;
-            hostFile.close();
-            llvm::errs() << "[Pass] ✓ Wrote host code: " << hostPath << "\n";
-        } else {
-            llvm::errs() << "[Pass] ERROR: Failed to open " << hostPath << " for writing\n";
-        }
     }
 
     llvm::errs() << "=== File Generation Complete ===\n\n";

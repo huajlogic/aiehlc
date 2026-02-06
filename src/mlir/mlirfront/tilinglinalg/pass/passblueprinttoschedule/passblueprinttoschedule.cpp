@@ -479,44 +479,31 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                                                         Type defaultElementType, int64_t defaultBufferSize,
                                                         int32_t defaultVectorWidth);
 
-// Generate dfschedule.dskernel_receiver function (legacy style)
-// This is kept for backward compatibility and will call generateKernelModule internally
+// Generate a kernel symbol declaration only (dfschedule.dskernel_receiver with empty body).
+// Details (kernel module, buffers, locks, etc.) are filled in by a separate pass.
 // Parameters:
 //   - kernelName: symbol name for the kernel (same as load_kernel_group callee)
-//   - tensorType: the tensor type for data
-//   - bufferLen: buffer length for DMA BD
-//   - basePacketId: base packet ID from FlowTransferOp
-//   - coreChannel: DMA channel from core FlowConfig
-//   - flowIndex: unique index for this flow, used to access per-flow DMA configs
+//   - insertBeforeOp: used to find module and insertion point
 static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Location loc, Operation *insertBeforeOp,
                                      StringRef kernelName, RankedTensorType tensorType, int64_t bufferLen,
                                      uint32_t basePacketId, int64_t coreChannel, uint32_t flowIndex,
                                      KernelResourceManager &resourceMgr) {
+    (void)tensorType;
+    (void)bufferLen;
+    (void)basePacketId;
+    (void)coreChannel;
+    (void)flowIndex;
+    (void)resourceMgr;
 
-    // Build kernel generation parameters
-    KernelGenParams params;
-    params.kernelName = kernelName;              // Wrapper function name (e.g., "dskernel_receiver")
-    params.computeKernelName = "compute_kernel"; // Actual compute kernel name
-    params.kernelFile = "compute_kernel.cc";     // Kernel source file
-    params.bufferSize = 256;                     // Default buffer size (BUF_SZ)
-    params.elementType = rewriter.getI32Type();
-    params.vectorWidth = 4;
-    params.iterationStyle = "internal"; // Legacy style: loop inside kernel
+    Operation *rootModuleOp = getModuleOp(insertBeforeOp);
+    Block &moduleBlock = rootModuleOp->getRegions().front().front();
+    if (!moduleBlock.empty() && moduleBlock.back().hasTrait<OpTrait::IsTerminator>())
+        rewriter.setInsertionPoint(&moduleBlock.back());
+    else
+        rewriter.setInsertionPointToEnd(&moduleBlock);
 
-    // Lock IDs (fallback - used when kernelParams is empty)
-    params.inputAcquireLockId = 48;  // LOCK_win_ping_ACQ
-    params.inputReleaseLockId = 49;  // LOCK_win_pong_REL
-    params.outputAcquireLockId = 51; // LOCK_out_ping_ACQ
-    params.outputReleaseLockId = 50; // LOCK_out_pong_REL
-
-    // Dynamically analyze flow_transfer operations to determine kernel parameters
-    // Walk from the module root to collect all shim<->core data flows
-    Operation *rootOp = getModuleOp(insertBeforeOp);
-    params.kernelParams =
-        analyzeKernelParams(rootOp, resourceMgr, params.elementType, params.bufferSize, params.vectorWidth);
-
-    // Generate the kernel module IR
-    generateKernelModule(rewriter, loc, insertBeforeOp, params, tensorType);
+    auto receiverOp = rewriter.create<dfschedule::DSKernelReceiverOp>(loc, kernelName);
+    receiverOp.getBody().emplaceBlock();
 }
 
 static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRefAttr target) {
