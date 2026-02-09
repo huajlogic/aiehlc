@@ -59,72 +59,77 @@ stop_console_thread = threading.Event()
 def find_elf_file(filename=None):
     """
     Smart ELF file finder:
-    - No argument: prompt to use default aout/main.elf
-    - With argument: find file, search if not found
+    - Full path given: use it directly
+    - Relative path given: try current directory first
+    - Not found: search for filename in current folder and subfolders, ask which one
+    - No argument: show default aout/main.elf and ask for confirmation
     Returns: full path to ELF file or None to exit
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_elf = os.path.normpath(os.path.join(script_dir, "..", "aout", "main.elf"))
+    current_dir = os.getcwd()
+    
+    def ask_confirm(file_path, prompt_msg):
+        """Helper to ask user confirmation for a file."""
+        print(f"\n{prompt_msg}")
+        print(f"  {file_path}")
+        response = input("\nDo you want to use this file? [y/n]: ").strip().lower()
+        if response in ('y', 'yes'):
+            return file_path
+        else:
+            print("Exiting...")
+            return None
     
     if filename is None:
-        # No argument provided - use default aout/main.elf
+        # No argument provided - show default and ask for confirmation
         if os.path.exists(default_elf):
-            print(f"\nNo ELF file specified. Default ELF file found:")
-            print(f"  {default_elf}")
-            response = input("\nDo you want to use this file? [y/n]: ").strip().lower()
-            if response in ('y', 'yes'):
-                return default_elf
-            else:
-                print("Exiting...")
-                return None
+            return ask_confirm(default_elf, "No ELF file specified. Default ELF file found:")
         else:
             print(f"\nError: Default ELF file not found: {default_elf}")
             print("Please specify an ELF file as argument.")
             return None
     
-    # Filename provided - check if it exists at the given path
+    # Filename provided - check if it's a full path
     if os.path.isabs(filename):
-        # Absolute path provided
+        # Absolute path provided - use it directly
         if os.path.exists(filename):
+            print(f"Using: {filename}")
             return filename
-        search_name = os.path.basename(filename)
-    else:
-        # Relative path provided
-        if os.path.exists(filename):
-            return os.path.abspath(filename)
-        search_name = os.path.basename(filename)
+        else:
+            print(f"\nError: File not found: {filename}")
+            return None
     
-    # File not found at given path - search in current directory and subdirectories
+    # Relative path provided - try current directory first
+    current_path = os.path.join(current_dir, filename)
+    if os.path.exists(current_path):
+        full_path = os.path.abspath(current_path)
+        print(f"Using: {full_path}")
+        return full_path
+    
+    # File not found in current directory - search for the filename
+    search_name = os.path.basename(filename)
     print(f"\nFile not found: {filename}")
     print(f"Searching for '{search_name}' in current directory and subdirectories...")
-    
-    # Search for matching files
-    current_dir = os.getcwd()
-    matches = []
     
     # Use glob to find all matching files recursively
     pattern = os.path.join(current_dir, "**", search_name)
     matches = glob.glob(pattern, recursive=True)
     
     if not matches:
-        print(f"\nError: No files named '{search_name}' found in current directory or subdirectories.")
-        return None
+        print(f"\nNo files named '{search_name}' found.")
+        # Fall back to default main.elf and ask
+        if os.path.exists(default_elf):
+            return ask_confirm(default_elf, "Would you like to use the default ELF file instead?")
+        else:
+            print(f"Error: Default ELF file also not found: {default_elf}")
+            return None
     
     # Normalize all paths
     matches = [os.path.normpath(m) for m in matches]
     
-    # Check if there's exactly one match in the current directory
-    cwd_matches = [m for m in matches if os.path.dirname(m) == current_dir]
-    
-    if len(cwd_matches) == 1:
-        # Single match in current directory - use it directly
-        print(f"Found in current directory: {cwd_matches[0]}")
-        return cwd_matches[0]
-    
+    # Single match - show path and ask for confirmation
     if len(matches) == 1:
-        # Only one match total - use it directly
-        print(f"Found: {matches[0]}")
-        return matches[0]
+        return ask_confirm(matches[0], "Found one matching file:")
     
     # Multiple matches - ask user to choose
     print(f"\nFound {len(matches)} matching files:")
@@ -333,9 +338,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                    # Use default aout/main.elf (will prompt for confirmation)
-  %(prog)s mykernel.elf       # Search for mykernel.elf if not in current path
-  %(prog)s ./build/test.elf   # Use specific file path
+  %(prog)s                      # Ask to use default aout/main.elf
+  %(prog)s /full/path/test.elf  # Use full path directly
+  %(prog)s mykernel.elf         # Try current dir, then search and ask
+  %(prog)s ./build/test.elf     # Use relative path from current directory
         """
     )
     parser.add_argument(
