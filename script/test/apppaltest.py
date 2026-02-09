@@ -40,8 +40,41 @@ palip = os.environ.get("PALIP")
 boardname = os.environ.get("BOARDNAME")
 
 if not username or not palip or not boardname:
+    # Try to find and source envlocal.sh
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    envlocal_path = os.path.join(script_dir, "envlocal.sh")
+    
+    if os.path.exists(envlocal_path):
+        print(f"Environment variables not set. Found envlocal.sh, sourcing it...")
+        try:
+            # Source the shell script and capture environment variables
+            command = f'source "{envlocal_path}" && env'
+            result = subprocess.run(
+                ['bash', '-c', command],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                # Parse environment variables from output
+                for line in result.stdout.splitlines():
+                    if '=' in line:
+                        key, _, value = line.partition('=')
+                        os.environ[key] = value
+                
+                # Recheck the environment variables
+                username = os.environ.get("USERNAME")
+                palip = os.environ.get("PALIP")
+                boardname = os.environ.get("BOARDNAME")
+            else:
+                print(f"Warning: Failed to source envlocal.sh: {result.stderr}")
+        except Exception as e:
+            print(f"Warning: Error sourcing envlocal.sh: {e}")
+
+if not username or not palip or not boardname:
     print("Error: Please set USERNAME, PALIP, and BOARDNAME environment variables")
     print("Example: export USERNAME=aaaaa && export PALIP=10.23.***.*** && export BOARDNAME=pal***")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    print(f"Or create {os.path.join(script_dir, 'envlocal.sh')} with these exports")
     sys.exit(1)
 
 host = f"{username}@{palip}"
