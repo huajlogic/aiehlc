@@ -31,6 +31,8 @@ if [ ! -f "${WORKLOCAL_DIR}/host.cc" ]; then
     exit 1
 fi
 
+# pushd to the script directory
+pushd "${SCRIPT_DIR}"
 # Source env (XILINX_VITIS, etc.) same as aiehlc.sh
 # Export PATH_SET_ONLY so setup.sh's first test does not see unset (avoids "integer expression expected")
 if [ -f "${AIEHLC_ROOT}/script/setup.sh" ]; then
@@ -90,6 +92,9 @@ else
     BAREMETAL_AIENGINE_INCLUDE="${AIE_DRIVER_PARENT_DIR}/include"
 fi
 
+# Fallback xaiengine path when headers live under huaj-aie-rt/driver/include (for XAie_MemInst etc.)
+XAIE_INCLUDE="${AIEHLC_ROOT}/thirdparty/alib/huaj-aie-rt/driver/include"
+
 if [[ "$aie_version" == "1" || "$aie_version" == "2" ]]; then
     ARCH_APU_ALIB="${ARCH_72_DIR}/lib"
     ARCH_APU_AINC="${ARCH_72_DIR}/include"
@@ -97,7 +102,7 @@ if [[ "$aie_version" == "1" || "$aie_version" == "2" ]]; then
     AIELIB_APU_NAME="libxaienginea72.a"
     ARCH_APU_LD="${ARCH_DIR}/psv_cortexa72_0/lscript.ld"
     compiler_cpu_flag="-mcpu=cortex-a72"
-    LINK_EXTRA=""
+    LINK_EXTRA="-lxilstandalone"
 elif [[ "$aie_version" == "5" ]]; then
     ARCH_APU_ALIB="${ARCH_78_DIR}/lib"
     ARCH_APU_AINC="${ARCH_78_DIR}/include"
@@ -105,7 +110,7 @@ elif [[ "$aie_version" == "5" ]]; then
     AIELIB_APU_NAME="libxaienginea78.a"
     ARCH_APU_LD="${ARCH_DIR}/cortexa78_0/lscript.ld"
     compiler_cpu_flag="-mcpu=cortex-a78"
-    LINK_EXTRA="-lxiltimer -lxilstandalone"
+    LINK_EXTRA="-lxiltimer,-lxilstandalone"
 else
     echo "Unsupported AIE version: $aie_version"
     exit 1
@@ -119,8 +124,11 @@ else
     BAREMETAL_AIENGINE_LIB="${AIELIB_APU_NAME:3:-2}"
 fi
 
-# Include options: aiehlc host + aie_runtime.h
+# Include options: aiehlc host + aie_runtime.h; add xaiengine path when present (xaiengine.h, xaiengine/*.h)
 INCLUDE_OPTS="-I${AIEHLC_ROOT}/include -I${AIETOOLS_INCLUDE_BASE} -I${AIE_DRIVER_PARENT_DIR}/include -I${ARCH_APU_AINC} -I${SECONDARY_ARCH_APU_AINC}"
+if [ -d "${XAIE_INCLUDE}" ]; then
+    INCLUDE_OPTS="${INCLUDE_OPTS} -I${XAIE_INCLUDE}"
+fi
 DEFS="-DAIE_GEN=${aie_version}"
 
 mkdir -p "${BUILD_DIR}"
@@ -146,13 +154,14 @@ void host_canonicalized();\
 HOST_SRC="${HOST_FIXED}"
 
 # Compile host
+set -x
 echo "Compiling host..."
 ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${HOST_SRC}" -o host.o
 if [ $? -ne 0 ]; then
     echo "Error: failed to compile host.cc"
     exit 1
 fi
-
+set +x
 # Compile aie_runtime.c
 echo "Compiling aie_runtime.c..."
 ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/aie_runtime.c" -o aie_runtime.o
@@ -160,7 +169,7 @@ if [ $? -ne 0 ]; then
     echo "Error: failed to compile aie_runtime.c"
     exit 1
 fi
-
+set -x
 # Link (same libs as aiehlc.sh baremetal host link: -L and -l for XAie_* and BSP)
 # --specs=nosys.specs provides stubs for _exit, _close, _fstat, etc. (baremetal/newlib)
 # -Wl,--defsym,end=__bss_end__ defines 'end' for newlib _sbrk (lscript.ld defines __bss_end__)
@@ -173,7 +182,7 @@ ${TOOL_PREFIX}g++ -Os -o host host.o aie_runtime.o \
     -L"${AIENGINE_LIB_DIR}" \
     -L"${ARCH_APU_ALIB}" \
     -L"${AIE_DRIVER_PARENT_DIR}/lib" \
-    -Wl,--start-group -lm -l${BAREMETAL_AIENGINE_LIB} -lxil -lgcc -lc -lstdc++ ${LINK_EXTRA} -Wl,--end-group
+    -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${LINK_EXTRA},--end-group
 if [ $? -ne 0 ]; then
     echo "Error: link failed (check XILINX_VITIS and BSP libs)"
     exit 1
@@ -184,3 +193,5 @@ echo "============================================"
 echo "Host built successfully: ${BUILD_DIR}/host"
 echo "============================================"
 ls -l host
+# popd to the original directory
+popd

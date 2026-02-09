@@ -412,6 +412,7 @@ echo "Compiling host..."
 echo "    $host_file"
 echo "Linking kernels..."
 echo "    ${temp_obj_files[@]}"
+set -x
 if [[ "$platform" == "baremetal" ]]; then
     dbg_echo ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
     ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
@@ -427,7 +428,7 @@ elif [[ "$platform" == "linux" ]]; then
         -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} \
         -Wl,--start-group,-lxaiengine,-lxil,--end-group
 fi
-
+set +x
 echo "Stripping extra ELF symbols..."
 ${TOOL_PREFIX}strip $HOST_BUILD_DIR/main.elf
 

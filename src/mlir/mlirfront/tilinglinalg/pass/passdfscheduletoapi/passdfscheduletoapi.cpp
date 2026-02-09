@@ -116,7 +116,8 @@ struct ConversionState {
     // Counter for generating unique array names
     int arrayIndex = 0;
     int partitionIndex = 0;
-    
+    mutable int shapeArrayIndex = 0; // for PartitionTensor static shape arrays (C++ compatible)
+
     // Statistics for ExtractSliceInnerPattern
     int extractSliceCallCount = 0;
     int extractSliceFailCount = 0;
@@ -299,12 +300,11 @@ struct DeclareDataInnerPattern : public OpConversionPattern<dfscheblueprint::Dec
         Type memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
         Type devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
         Type devInstPtrType = emitc::PointerType::get(devInstType);
-        
-        // Create &DevInst reference
-        auto devInstRef = rewriter.create<emitc::ConstantOp>(
-            loc, devInstPtrType,
-            emitc::OpaqueAttr::get(ctx, "&DevInst"));
-        
+
+        // Create g_DevInst reference (from aie_runtime.h)
+        auto devInstRef =
+            rewriter.create<emitc::ConstantOp>(loc, devInstPtrType, emitc::OpaqueAttr::get(ctx, "g_DevInst"));
+
         // Create XAIE_MEM_CACHEABLE constant
         auto cacheableConst = rewriter.create<emitc::ConstantOp>(
             loc, i32Type,
@@ -418,33 +418,34 @@ struct PartitionTensorInnerPattern : public OpConversionPattern<routing::partiti
         
         int64_t elemSize = getElemSize(resultType.getElementType());
         int64_t partitionByteSize = totalElements * elemSize;
-        ///*
-        // Build original_shape array literal
-        std::string origShapeStr = "(int64_t[]){";
+
+        // Emit static arrays for C++ (compound literals (int64_t[]){...} are C-only)
+        int idx = state.shapeArrayIndex++;
+        std::string origName = "_pt_orig_" + std::to_string(idx);
+        std::string partName = "_pt_part_" + std::to_string(idx);
+        std::string origInit, partInit;
         for (size_t i = 0; i < originalShape.size(); i++) {
-            if (i > 0) origShapeStr += ", ";
-            origShapeStr += std::to_string(originalShape[i]);
+            if (i > 0)
+                origInit += ", ";
+            origInit += std::to_string(originalShape[i]);
         }
-        origShapeStr += "}";
-        
-        // Build partition_shape array literal (divided by splitnum along splitdim)
-        std::string partShapeStr = "(int64_t[]){";
         for (size_t i = 0; i < partitionShape.size(); i++) {
-            if (i > 0) partShapeStr += ", ";
-            partShapeStr += std::to_string(partitionShape[i]);
+            if (i > 0)
+                partInit += ", ";
+            partInit += std::to_string(partitionShape[i]);
         }
-        partShapeStr += "}";
-        ///*
+        rewriter.create<emitc::VerbatimOp>(loc, "static const int64_t " + origName + "[] = {" + origInit + "};");
+        rewriter.create<emitc::VerbatimOp>(loc, "static const int64_t " + partName + "[] = {" + partInit + "};");
+
         auto i64PtrType = emitc::PointerType::get(rewriter.getI64Type());
-        
         auto elemSizeConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
             rewriter.getI32IntegerAttr(elemSize));
         auto ndimConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
             rewriter.getI32IntegerAttr(ndim));
-        auto origShapeConst = rewriter.create<emitc::ConstantOp>(loc, i64PtrType,
-            emitc::OpaqueAttr::get(state.ctx, origShapeStr));
-        auto partShapeConst = rewriter.create<emitc::ConstantOp>(loc, i64PtrType,
-            emitc::OpaqueAttr::get(state.ctx, partShapeStr));
+        auto origShapeConst =
+            rewriter.create<emitc::ConstantOp>(loc, i64PtrType, emitc::OpaqueAttr::get(state.ctx, origName));
+        auto partShapeConst =
+            rewriter.create<emitc::ConstantOp>(loc, i64PtrType, emitc::OpaqueAttr::get(state.ctx, partName));
         auto splitdimConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
             rewriter.getI32IntegerAttr(splitdim));
         auto splitnumConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
@@ -883,43 +884,33 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             loc, i32Type, rewriter.getI32IntegerAttr(nextBd));
         auto packetIdConst = rewriter.create<emitc::ConstantOp>(
             loc, i32Type, rewriter.getI32IntegerAttr(packetId));
-        
-        // Get buffer address - need to convert memref/PartitionTensor to void* address
-        // For now, we'll pass the buffer directly and let the helper function extract the address
-        Value bufferAddr = buffer;
-        
-        // If buffer is a PartitionTensor, we need to extract its data pointer
-        // If it's a memref, we need to get its base address
-        // For simplicity, we'll cast it to void* and let the runtime handle it
-        
-        // Call the helper function that wraps all the AIE API calls
-        // XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst* dev, XAie_LocType tile, 
-        //                                      void* buffer, int32_t bd_id,
-        //                                      uint64_t addr, int32_t len, int32_t next_bd,
-        //                                      int32_t enable_packet, int32_t packet_id)
+
+        // PartitionTensor is passed by value; __Runtime_dma_bd_config needs void*.
+        // __runtime_buffer_arg(p) macro emits (void*)&p so runtime gets partition pointer.
+        auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(rewriter.getContext(), "void"));
+        auto bufferPtr = rewriter.create<emitc::CallOpaqueOp>(loc, voidPtrType, "__runtime_buffer_arg", nullptr,
+                                                              nullptr, ValueRange{buffer});
+
         auto u64Type = rewriter.getIntegerType(64);
         auto addrConst = rewriter.create<emitc::ConstantOp>(
             loc, u64Type, rewriter.getIntegerAttr(u64Type, offset));
-        
+
         auto configCall = rewriter.create<emitc::CallOpaqueOp>(
-            loc,
-            dmaDescType,
-            "__Runtime_dma_bd_config",
-            nullptr,
-            nullptr,
+            loc, dmaDescType, "__Runtime_dma_bd_config", nullptr, nullptr,
             ValueRange{
-                state.devInstRef,          // &DevInst
-                tile,                      // XAie_LocType tile
-                bufferAddr,                // void* buffer (for address extraction)
-                bdId,                      // bd_id
-                addrConst.getResult(),     // addr (offset within buffer)
-                lenConst.getResult(),      // len
-                nextBdConst.getResult(),   // next_bd
-                rewriter.create<emitc::ConstantOp>(loc, i32Type, 
-                    rewriter.getI32IntegerAttr(enablePacket ? 1 : 0)).getResult(),  // enable_packet
-                packetIdConst.getResult()  // packet_id
+                state.devInstRef,        // g_DevInst
+                tile,                    // XAie_LocType tile
+                bufferPtr.getResult(0),  // (void*)&buffer via __runtime_buffer_arg
+                bdId,                    // bd_id
+                addrConst.getResult(),   // addr (offset within buffer)
+                lenConst.getResult(),    // len
+                nextBdConst.getResult(), // next_bd
+                rewriter.create<emitc::ConstantOp>(loc, i32Type,
+                                                   rewriter.getI32IntegerAttr(enablePacket ? 1 : 0))
+                    .getResult(),         // enable_packet
+                packetIdConst.getResult() // packet_id
             });
-        
+
         llvm::errs() << "  ✓ Created DMA BD config with full AIE API parameters\n";
         
         // Replace the op with the call result (status code)
@@ -1066,25 +1057,20 @@ struct ConfigCreateIoInnerPattern : public OpConversionPattern<dfschedule::Confi
                             ", tile=(" + std::to_string(tileCol) + "," + std::to_string(tileRow) + ")" +
                             ", direction=" + direction + " */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
-        
-        // Define the IO struct type
-        auto ioStructType = emitc::OpaqueType::get(rewriter.getContext(), "struct io");
-        
-        // Create __Runtime_dma_createio call:
-        // struct io = __Runtime_dma_createio(tile_loc, dma_desc, channel_id, bd_id);
-        auto createIoCall = rewriter.create<emitc::CallOpaqueOp>(
-            loc,
-            ioStructType,
-            "__Runtime_dma_createio",
-            nullptr,
-            nullptr,
-            ValueRange{
-                tile,                       // XAie_LocType tile_loc
-                bdConfig,                   // XAie_DmaDesc dma_desc
-                channelIdConst.getResult(), // channel_id (from resource manager)
-                bdIdConst.getResult()       // bd_id (from resource manager)
-            });
-        
+
+        // Define the IO type (io from aie_runtime.h)
+        auto ioStructType = emitc::OpaqueType::get(rewriter.getContext(), "io");
+
+        // Create __Runtime_dma_createio_4 call (4 args; mem = NULL in runtime)
+        auto createIoCall =
+            rewriter.create<emitc::CallOpaqueOp>(loc, ioStructType, "__Runtime_dma_createio_4", nullptr, nullptr,
+                                                 ValueRange{
+                                                     tile,                       // XAie_LocType tile_loc
+                                                     bdConfig,                   // XAie_DmaDesc dma_desc
+                                                     channelIdConst.getResult(), // channel_id (from resource manager)
+                                                     bdIdConst.getResult()       // bd_id (from resource manager)
+                                                 });
+
         llvm::errs() << "  ✓ Created __Runtime_dma_createio call\n";
         
         // Store the resource mapping for use by StartIoOp
@@ -1118,11 +1104,10 @@ struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
         
         llvm::errs() << "  IO Handle type: " << ioHandle.getType() << "\n";
         llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";
-      
-        
-        // Define the ioevent struct type
-        auto ioEventType = emitc::OpaqueType::get(rewriter.getContext(), "struct ioevent");
-        
+
+        // Define the ioevent type (ioevent from aie_runtime.h)
+        auto ioEventType = emitc::OpaqueType::get(rewriter.getContext(), "ioevent");
+
         //rewriter.eraseOp(op);
         //return success();
         // Create __Runtime_startio call:
@@ -1180,20 +1165,13 @@ struct ScheduleWaitInnerPattern : public OpConversionPattern<dfschedule::Schedul
         // Create comment showing what we're waiting for
         std::string comment = "/* Wait for " + std::to_string(events.size()) + " event(s) */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
-        
-        // Create __Runtime_wait call for each event
-        // (We could also create a single call that takes an array, but for simplicity,
-        //  we'll create individual calls for now)
-        for (auto event : events) {
-            rewriter.create<emitc::CallOpaqueOp>(
-                loc,
-                TypeRange{},  // void return type
-                "__Runtime_wait",
-                nullptr,
-                nullptr,
-                ValueRange{event});
+
+        // Create __Runtime_wait call for each event (macro in aie_runtime.h dispatches event vs ioevent)
+        for (auto eventVal : events) {
+            rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "__Runtime_wait", nullptr, nullptr,
+                                                 ValueRange{eventVal});
         }
-        
+
         llvm::errs() << "  ✓ Created __Runtime_wait calls for " << events.size() << " event(s)\n";
         
         // Erase the original wait op (it has no results)
@@ -1314,8 +1292,8 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         rewriter.create<emitc::VerbatimOp>(loc, comment);
         
         // Define the kernel_group struct type
-        auto kernelGroupType = emitc::OpaqueType::get(rewriter.getContext(), "struct kernel_group");
-        
+        auto kernelGroupType = emitc::OpaqueType::get(rewriter.getContext(), "kernel_group");
+
         // For now, create a simple call that encapsulates the configuration
         // In a full implementation, this would parse the arrays and pass them appropriately
         // struct kernel_group = __Runtime_load_kernel_group(...);
@@ -1330,15 +1308,10 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         SmallVector<Value> callOperands;
         callOperands.append(tiles.begin(), tiles.end());
         callOperands.push_back(numTilesConst.getResult());
-        
-        auto loadCall = rewriter.create<emitc::CallOpaqueOp>(
-            loc,
-            kernelGroupType,
-            "__Runtime_load_kernel_group",
-            nullptr,
-            nullptr,
-            callOperands);
-        
+
+        auto loadCall = rewriter.create<emitc::CallOpaqueOp>(loc, kernelGroupType, "__Runtime_load_kernel_group_4t",
+                                                             nullptr, nullptr, callOperands);
+
         llvm::errs() << "  ✓ Created __Runtime_load_kernel_group call\n";
         
         // Replace the op with the kernel_group
@@ -1370,12 +1343,12 @@ struct LaunchKernelGroupInnerPattern : public OpConversionPattern<dfschedule::La
         //return success();
         // Create comment
         rewriter.create<emitc::VerbatimOp>(loc, "/* Launch Kernel Group */");
-        
-        // Define the event struct type (same as returned by StartIoOp)
-        auto eventType = emitc::OpaqueType::get(rewriter.getContext(), "struct event");
-        
+
+        // Define the event type (event from aie_runtime.h)
+        auto eventType = emitc::OpaqueType::get(rewriter.getContext(), "event");
+
         // Create __Runtime_launch_kernel_group call:
-        // struct event = __Runtime_launch_kernel_group(kernel_group);
+        // event = __Runtime_launch_kernel_group(kernel_group);
         auto launchCall = rewriter.create<emitc::CallOpaqueOp>(
             loc,
             eventType,
@@ -2221,143 +2194,144 @@ void DfscheduleToApiPass::runOnOperation() {
     {
         OpBuilder builder(ctx);
         builder.setInsertionPointToStart(moduleOp.getBody());
-        
-        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), builder.getStringAttr(
-            "#define PARTITION_MAX_DIMS 8\n"
-            "#define ALLOC_LIST_MAX_SIZE 256\n\n"
-            "/* Global list to track allocated memory for cleanup */\n"
-            "static XAie_MemInst* g_alloc_mem_list[ALLOC_LIST_MAX_SIZE];\n"
-            "static int g_alloc_mem_count = 0;\n\n"
-            "/* Add memory instance to tracking list */\n"
-            "static inline void __Runtime_track_alloc(XAie_MemInst* mem) {\n"
-            "    if (g_alloc_mem_count < ALLOC_LIST_MAX_SIZE) {\n"
-            "        g_alloc_mem_list[g_alloc_mem_count++] = mem;\n"
-            "    }\n"
-            "}\n\n"
-            "/* Free all tracked memory allocations */\n"
-            "static inline void __Runtime_free_all_allocs() {\n"
-            "    for (int i = 0; i < g_alloc_mem_count; i++) {\n"
-            "        if (g_alloc_mem_list[i]) {\n"
-            "            XAie_MemFree(g_alloc_mem_list[i]);\n"
-            "            g_alloc_mem_list[i] = NULL;\n"
-            "        }\n"
-            "    }\n"
-            "    g_alloc_mem_count = 0;\n"
-            "}\n\n"
-            "/* PartitionTensor structure for memory management and partitioning info */\n"
-            "typedef struct {\n"
-            "    void* data;                              /* Pointer to data */\n"
-            "    size_t elem_size;                        /* Size of each element in bytes */\n"
-            "    int ndim;                                /* Number of dimensions */\n"
-            "    int64_t original_shape[PARTITION_MAX_DIMS];  /* Original tensor shape */\n"
-            "    int64_t partition_shape[PARTITION_MAX_DIMS]; /* Shape of each partition slice */\n"
-            "    int partition_dim;                       /* Dimension being partitioned */\n"
-            "    int num_partitions;                      /* Number of partitions */\n"
-            "    /* Routing metadata */\n"
-            "    int hw_axis_owner;                       /* 0=row, 1=col */\n"
-            "    int replicate_on;                        /* 0=row, 1=col, -1=none */\n"
-            "} PartitionTensor;\n\n"
-            "/* Helper function for PartitionTensor initialization */\n"
-            "static inline PartitionTensor __Runtime_init_PartitionTensor(\n"
-            "    void* data, size_t elem_size, int ndim,\n"
-            "    const int64_t* original_shape, const int64_t* partition_shape,\n"
-            "    int partition_dim, int num_partitions,\n"
-            "    int hw_axis_owner, int replicate_on) {\n"
-            "    PartitionTensor pt;\n"
-            "    pt.data = data;\n"
-            "    pt.elem_size = elem_size;\n"
-            "    pt.ndim = ndim;\n"
-            "    for (int i = 0; i < ndim && i < PARTITION_MAX_DIMS; i++) {\n"
-            "        pt.original_shape[i] = original_shape[i];\n"
-            "        pt.partition_shape[i] = partition_shape[i];\n"
-            "    }\n"
-            "    pt.partition_dim = partition_dim;\n"
-            "    pt.num_partitions = num_partitions;\n"
-            "    pt.hw_axis_owner = hw_axis_owner;\n"
-            "    pt.replicate_on = replicate_on;\n"
-            "    return pt;\n"
-            "}\n\n"
-            "/* Get pointer to a specific partition slice */\n"
-            "static inline void* __Runtime_get_partition_slice(\n"
-            "    PartitionTensor* pt, int partition_idx) {\n"
-            "    if (partition_idx < 0 || partition_idx >= pt->num_partitions) return NULL;\n"
-            "    /* Calculate slice offset based on partition dimension */\n"
-            "    size_t slice_size = pt->elem_size;\n"
-            "    for (int i = 0; i < pt->ndim; i++) {\n"
-            "        slice_size *= pt->partition_shape[i];\n"
-            "    }\n"
-            "    return (void*)((char*)pt->data + partition_idx * slice_size);\n"
-            "}\n\n"
-            "/* Extract contiguous 2D slice from PartitionTensor */\n"
-            "/* Takes PartitionTensor by value for cleaner generated code */\n"
-            "static inline PartitionTensor __Runtime_extract_slice_contiguous_2d(\n"
-            "    PartitionTensor src, int off0, int off1, int size0, int size1) {\n"
-            "    PartitionTensor result;\n"
-            "    result.elem_size = src.elem_size;\n"
-            "    result.ndim = 2;\n"
-            "    result.partition_dim = -1;\n"
-            "    result.num_partitions = 1;\n"
-            "    result.hw_axis_owner = src.hw_axis_owner;\n"
-            "    result.replicate_on = src.replicate_on;\n"
-            "    result.original_shape[0] = size0;\n"
-            "    result.original_shape[1] = size1;\n"
-            "    result.partition_shape[0] = size0;\n"
-            "    result.partition_shape[1] = size1;\n"
-            "    \n"
-            "    /* Calculate byte offset: off0 * dim1 * elem_size + off1 * elem_size */\n"
-            "    size_t byte_offset = (off0 * src.original_shape[1] + off1) * src.elem_size;\n"
-            "    result.data = (void*)((char*)src.data + byte_offset);\n"
-            "    return result;\n"
-            "}\n\n"
-            "/* Extract 2D non-contiguous slice from PartitionTensor */\n"
-            "/* Allocates new memory via XAie_MemAllocate, copies strided data */\n"
-            "static inline PartitionTensor __Runtime_extract_slice_strided_2d(\n"
-            "    XAie_DevInst* dev_inst, PartitionTensor src,\n"
-            "    int off0, int off1, int size0, int size1) {\n"
-            "    PartitionTensor result;\n"
-            "    result.elem_size = src.elem_size;\n"
-            "    result.ndim = 2;\n"
-            "    result.partition_dim = -1;\n"
-            "    result.num_partitions = 1;\n"
-            "    result.hw_axis_owner = src.hw_axis_owner;\n"
-            "    result.replicate_on = src.replicate_on;\n"
-            "    result.original_shape[0] = size0;\n"
-            "    result.original_shape[1] = size1;\n"
-            "    result.partition_shape[0] = size0;\n"
-            "    result.partition_shape[1] = size1;\n"
-            "    \n"
-            "    /* Calculate destination size */\n"
-            "    size_t dst_size = (size_t)size0 * size1 * src.elem_size;\n"
-            "    \n"
-            "    /* Allocate memory for the slice */\n"
-            "    XAie_MemInst* mem_inst = XAie_MemAllocate(*dev_inst, dst_size, XAIE_MEM_CACHEABLE);\n"
-            "    if (!mem_inst) {\n"
-            "        result.data = NULL;\n"
-            "        return result;\n"
-            "    }\n"
-            "    __Runtime_track_alloc(mem_inst);\n"
-            "    \n"
-            "    void* dst = XAie_MemGetVAddr(mem_inst);\n"
-            "    result.data = dst;\n"
-            "    if (!dst) return result;\n"
-            "    \n"
-            "    /* Copy strided data to contiguous destination */\n"
-            "    char* d = (char*)dst;\n"
-            "    char* s = (char*)src.data;\n"
-            "    int elem_size = src.elem_size;\n"
-            "    int src_dim1 = src.original_shape[1];\n"
-            "    for (int i = 0; i < size0; i++) {\n"
-            "        int src_idx = ((off0 + i) * src_dim1 + off1) * elem_size;\n"
-            "        int dst_idx = (i * size1) * elem_size;\n"
-            "        memcpy(d + dst_idx, s + src_idx, size1 * elem_size);\n"
-            "    }\n"
-            "    return result;\n"
-            "}"
-        ));
-        
-        auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
-        builder.create<emitc::GlobalOp>(moduleOp.getLoc(),
-            "DevInst", devInstType, Attribute{}, true, false, false);
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "#include \"aie_runtime.h\"");
+        /* Extract .data from PartitionTensor for __Runtime_dma_bd_config(void* buffer) */
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "#define __runtime_buffer_arg(p) ((void*)((p).data))");
+        builder.create<emitc::VerbatimOp>(
+            moduleOp.getLoc(),
+            builder.getStringAttr(
+                "#define PARTITION_MAX_DIMS 8\n"
+                "#define ALLOC_LIST_MAX_SIZE 256\n\n"
+                "/* Global list to track allocated memory for cleanup */\n"
+                "static XAie_MemInst* g_alloc_mem_list[ALLOC_LIST_MAX_SIZE];\n"
+                "static int g_alloc_mem_count = 0;\n\n"
+                "/* Add memory instance to tracking list */\n"
+                "static inline void __Runtime_track_alloc(XAie_MemInst* mem) {\n"
+                "    if (g_alloc_mem_count < ALLOC_LIST_MAX_SIZE) {\n"
+                "        g_alloc_mem_list[g_alloc_mem_count++] = mem;\n"
+                "    }\n"
+                "}\n\n"
+                "/* Free all tracked memory allocations */\n"
+                "static inline void __Runtime_free_all_allocs() {\n"
+                "    for (int i = 0; i < g_alloc_mem_count; i++) {\n"
+                "        if (g_alloc_mem_list[i]) {\n"
+                "            XAie_MemFree(g_alloc_mem_list[i]);\n"
+                "            g_alloc_mem_list[i] = NULL;\n"
+                "        }\n"
+                "    }\n"
+                "    g_alloc_mem_count = 0;\n"
+                "}\n\n"
+                "/* PartitionTensor structure for memory management and partitioning info */\n"
+                "typedef struct {\n"
+                "    void* data;                              /* Pointer to data */\n"
+                "    size_t elem_size;                        /* Size of each element in bytes */\n"
+                "    int ndim;                                /* Number of dimensions */\n"
+                "    int64_t original_shape[PARTITION_MAX_DIMS];  /* Original tensor shape */\n"
+                "    int64_t partition_shape[PARTITION_MAX_DIMS]; /* Shape of each partition slice */\n"
+                "    int partition_dim;                       /* Dimension being partitioned */\n"
+                "    int num_partitions;                      /* Number of partitions */\n"
+                "    /* Routing metadata */\n"
+                "    int hw_axis_owner;                       /* 0=row, 1=col */\n"
+                "    int replicate_on;                        /* 0=row, 1=col, -1=none */\n"
+                "} PartitionTensor;\n\n"
+                "/* Helper function for PartitionTensor initialization */\n"
+                "static inline PartitionTensor __Runtime_init_PartitionTensor(\n"
+                "    void* data, size_t elem_size, int ndim,\n"
+                "    const int64_t* original_shape, const int64_t* partition_shape,\n"
+                "    int partition_dim, int num_partitions,\n"
+                "    int hw_axis_owner, int replicate_on) {\n"
+                "    PartitionTensor pt;\n"
+                "    pt.data = data;\n"
+                "    pt.elem_size = elem_size;\n"
+                "    pt.ndim = ndim;\n"
+                "    for (int i = 0; i < ndim && i < PARTITION_MAX_DIMS; i++) {\n"
+                "        pt.original_shape[i] = original_shape[i];\n"
+                "        pt.partition_shape[i] = partition_shape[i];\n"
+                "    }\n"
+                "    pt.partition_dim = partition_dim;\n"
+                "    pt.num_partitions = num_partitions;\n"
+                "    pt.hw_axis_owner = hw_axis_owner;\n"
+                "    pt.replicate_on = replicate_on;\n"
+                "    return pt;\n"
+                "}\n\n"
+                "/* Get pointer to a specific partition slice */\n"
+                "static inline void* __Runtime_get_partition_slice(\n"
+                "    PartitionTensor* pt, int partition_idx) {\n"
+                "    if (partition_idx < 0 || partition_idx >= pt->num_partitions) return NULL;\n"
+                "    /* Calculate slice offset based on partition dimension */\n"
+                "    size_t slice_size = pt->elem_size;\n"
+                "    for (int i = 0; i < pt->ndim; i++) {\n"
+                "        slice_size *= pt->partition_shape[i];\n"
+                "    }\n"
+                "    return (void*)((char*)pt->data + partition_idx * slice_size);\n"
+                "}\n\n"
+                "/* Extract contiguous 2D slice from PartitionTensor */\n"
+                "/* Takes PartitionTensor by value for cleaner generated code */\n"
+                "static inline PartitionTensor __Runtime_extract_slice_contiguous_2d(\n"
+                "    PartitionTensor src, int off0, int off1, int size0, int size1) {\n"
+                "    PartitionTensor result;\n"
+                "    result.elem_size = src.elem_size;\n"
+                "    result.ndim = 2;\n"
+                "    result.partition_dim = -1;\n"
+                "    result.num_partitions = 1;\n"
+                "    result.hw_axis_owner = src.hw_axis_owner;\n"
+                "    result.replicate_on = src.replicate_on;\n"
+                "    result.original_shape[0] = size0;\n"
+                "    result.original_shape[1] = size1;\n"
+                "    result.partition_shape[0] = size0;\n"
+                "    result.partition_shape[1] = size1;\n"
+                "    \n"
+                "    /* Calculate byte offset: off0 * dim1 * elem_size + off1 * elem_size */\n"
+                "    size_t byte_offset = (off0 * src.original_shape[1] + off1) * src.elem_size;\n"
+                "    result.data = (void*)((char*)src.data + byte_offset);\n"
+                "    return result;\n"
+                "}\n\n"
+                "/* Extract 2D non-contiguous slice from PartitionTensor */\n"
+                "/* Allocates new memory via XAie_MemAllocate, copies strided data */\n"
+                "static inline PartitionTensor __Runtime_extract_slice_strided_2d(\n"
+                "    XAie_DevInst* dev_inst, PartitionTensor src,\n"
+                "    int off0, int off1, int size0, int size1) {\n"
+                "    PartitionTensor result;\n"
+                "    result.elem_size = src.elem_size;\n"
+                "    result.ndim = 2;\n"
+                "    result.partition_dim = -1;\n"
+                "    result.num_partitions = 1;\n"
+                "    result.hw_axis_owner = src.hw_axis_owner;\n"
+                "    result.replicate_on = src.replicate_on;\n"
+                "    result.original_shape[0] = size0;\n"
+                "    result.original_shape[1] = size1;\n"
+                "    result.partition_shape[0] = size0;\n"
+                "    result.partition_shape[1] = size1;\n"
+                "    \n"
+                "    /* Calculate destination size */\n"
+                "    size_t dst_size = (size_t)size0 * size1 * src.elem_size;\n"
+                "    \n"
+                "    /* Allocate memory for the slice */\n"
+                "    XAie_MemInst* mem_inst = XAie_MemAllocate(dev_inst, dst_size, XAIE_MEM_CACHEABLE);\n"
+                "    if (!mem_inst) {\n"
+                "        result.data = NULL;\n"
+                "        return result;\n"
+                "    }\n"
+                "    __Runtime_track_alloc(mem_inst);\n"
+                "    \n"
+                "    void* dst = XAie_MemGetVAddr(mem_inst);\n"
+                "    result.data = dst;\n"
+                "    if (!dst) return result;\n"
+                "    \n"
+                "    /* Copy strided data to contiguous destination */\n"
+                "    char* d = (char*)dst;\n"
+                "    char* s = (char*)src.data;\n"
+                "    int elem_size = src.elem_size;\n"
+                "    int src_dim1 = src.original_shape[1];\n"
+                "    for (int i = 0; i < size0; i++) {\n"
+                "        int src_idx = ((off0 + i) * src_dim1 + off1) * elem_size;\n"
+                "        int dst_idx = (i * size1) * elem_size;\n"
+                "        memcpy(d + dst_idx, s + src_idx, size1 * elem_size);\n"
+                "    }\n"
+                "    return result;\n"
+                "}"));
+
+        /* DevInst: use g_DevInst from aie_runtime.h (set in state.devInstRef below) */
     }
     
     llvm::errs() << "[Pass] Phase 1: Helper definitions generated\n";
@@ -2518,13 +2492,13 @@ void DfscheduleToApiPass::runOnOperation() {
         
         OpBuilder builder(ctx);
         builder.setInsertionPointToStart(&hostOp.getRegion().front());
-        
-        // Create &DevInst reference directly as a constant
-        state.devInstRef = builder.create<emitc::ConstantOp>(
-            hostOp.getLoc(), 
-            emitc::PointerType::get(state.devInstType),
-            emitc::OpaqueAttr::get(ctx, "&DevInst")).getResult();
-        
+
+        // Create g_DevInst reference (from aie_runtime.h)
+        state.devInstRef = builder
+                               .create<emitc::ConstantOp>(hostOp.getLoc(), emitc::PointerType::get(state.devInstType),
+                                                          emitc::OpaqueAttr::get(ctx, "g_DevInst"))
+                               .getResult();
+
         // Create XAIE_MEM_CACHEABLE constant
         state.cacheableConst = builder.create<emitc::ConstantOp>(
             hostOp.getLoc(), state.i32Type,

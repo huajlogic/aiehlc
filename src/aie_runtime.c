@@ -39,6 +39,10 @@ struct_io __Runtime_dma_createio(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, i
     return io;
 }
 
+struct_io __Runtime_dma_createio_4(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, int32_t channel_id, int32_t bd_id) {
+    return __Runtime_dma_createio(tile_loc, dma_desc, channel_id, bd_id, NULL);
+}
+
 /**
  * Start I/O operation (triggers DMA)
  * Reference: aieml_perf.cc lines 173-174 (XAie_MoveDataExternal2Aie)
@@ -64,14 +68,21 @@ struct_kernel_group __Runtime_load_kernel_group(XAie_LocType *tiles, int32_t num
     kg.num_tiles = num_tiles;
     kg.elf_buffers = elf_buffers;
 
-    // Load ELF for each tile
-    for (int i = 0; i < num_tiles; i++) {
-        XAie_CoreReset(g_DevInst, tiles[i]);
-        XAie_CoreUnreset(g_DevInst, tiles[i]);
-        XAie_LoadElfMem(g_DevInst, tiles[i], elf_buffers[i]);
+    if (elf_buffers) {
+        for (int i = 0; i < num_tiles; i++) {
+            XAie_CoreReset(g_DevInst, tiles[i]);
+            XAie_CoreUnreset(g_DevInst, tiles[i]);
+            XAie_LoadElfMem(g_DevInst, tiles[i], elf_buffers[i]);
+        }
     }
 
     return kg;
+}
+
+struct_kernel_group __Runtime_load_kernel_group_4t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
+                                                   int n) {
+    XAie_LocType tiles[] = {t0, t1, t2, t3};
+    return __Runtime_load_kernel_group(tiles, n, NULL);
 }
 
 /**

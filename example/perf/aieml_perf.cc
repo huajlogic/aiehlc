@@ -300,11 +300,11 @@ int main(int argc, char* argv[]) {
 	XAie_InstDeclare(DevInst, &ConfigPtr);
 
 	int partitonnum = 34;
-	int startcol = 2;
-	int colnum = (startcol + partitonnum <= XAIE_NUM_COLS) ? partitonnum : (XAIE_NUM_COLS- startcol);
+    int startcol = 1;
+    int colnum = (startcol + partitonnum <= XAIE_NUM_COLS) ? partitonnum : (XAIE_NUM_COLS- startcol);
 
 	AieRC RC;
-    ///*
+    /*
     RC = XAie_SetupPartitionConfig(&DevInst, XAIE_BASE_ADDR + (startcol<<XAIE_COL_SHIFT),
                                        startcol, colnum);
     if(RC != XAIE_OK) {

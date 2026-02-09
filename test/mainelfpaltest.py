@@ -25,6 +25,8 @@ import sys
 import time
 import threading
 import queue
+import argparse
+import glob
 
 try:
     import pexpect
@@ -45,7 +47,6 @@ if not username or not palip or not boardname:
 host = f"{username}@{palip}"
 
 # Configuration
-ELF_PATH = f"/home/{username}/aiehlc/main.elf"
 PALBOARD_SCRIPTS_DIR = "/proj/xsjsswstaff/huaj/palboard_scripts"
 PALBOARD_BIN = f"/home/{username}/palboard/BOOT.BIN"
 XSDB_ALT_PATH = "/everest/set_vnc_bkup/vnc/t50/es1/tools/Labtools/9999.0/bin/xsdb"
@@ -53,6 +54,98 @@ XSDB_ALT_PATH = "/everest/set_vnc_bkup/vnc/t50/es1/tools/Labtools/9999.0/bin/xsd
 # Queue to collect console output from second connection
 console_output_queue = queue.Queue()
 stop_console_thread = threading.Event()
+
+
+def find_elf_file(filename=None):
+    """
+    Smart ELF file finder:
+    - No argument: prompt to use default aout/main.elf
+    - With argument: find file, search if not found
+    Returns: full path to ELF file or None to exit
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_elf = os.path.normpath(os.path.join(script_dir, "..", "aout", "main.elf"))
+    
+    if filename is None:
+        # No argument provided - use default aout/main.elf
+        if os.path.exists(default_elf):
+            print(f"\nNo ELF file specified. Default ELF file found:")
+            print(f"  {default_elf}")
+            response = input("\nDo you want to use this file? [y/n]: ").strip().lower()
+            if response in ('y', 'yes'):
+                return default_elf
+            else:
+                print("Exiting...")
+                return None
+        else:
+            print(f"\nError: Default ELF file not found: {default_elf}")
+            print("Please specify an ELF file as argument.")
+            return None
+    
+    # Filename provided - check if it exists at the given path
+    if os.path.isabs(filename):
+        # Absolute path provided
+        if os.path.exists(filename):
+            return filename
+        search_name = os.path.basename(filename)
+    else:
+        # Relative path provided
+        if os.path.exists(filename):
+            return os.path.abspath(filename)
+        search_name = os.path.basename(filename)
+    
+    # File not found at given path - search in current directory and subdirectories
+    print(f"\nFile not found: {filename}")
+    print(f"Searching for '{search_name}' in current directory and subdirectories...")
+    
+    # Search for matching files
+    current_dir = os.getcwd()
+    matches = []
+    
+    # Use glob to find all matching files recursively
+    pattern = os.path.join(current_dir, "**", search_name)
+    matches = glob.glob(pattern, recursive=True)
+    
+    if not matches:
+        print(f"\nError: No files named '{search_name}' found in current directory or subdirectories.")
+        return None
+    
+    # Normalize all paths
+    matches = [os.path.normpath(m) for m in matches]
+    
+    # Check if there's exactly one match in the current directory
+    cwd_matches = [m for m in matches if os.path.dirname(m) == current_dir]
+    
+    if len(cwd_matches) == 1:
+        # Single match in current directory - use it directly
+        print(f"Found in current directory: {cwd_matches[0]}")
+        return cwd_matches[0]
+    
+    if len(matches) == 1:
+        # Only one match total - use it directly
+        print(f"Found: {matches[0]}")
+        return matches[0]
+    
+    # Multiple matches - ask user to choose
+    print(f"\nFound {len(matches)} matching files:")
+    for i, match in enumerate(matches, 1):
+        print(f"  [{i}] {match}")
+    print(f"  [0] Exit")
+    
+    while True:
+        try:
+            choice = input("\nSelect file number (or 0 to exit): ").strip()
+            choice_num = int(choice)
+            
+            if choice_num == 0:
+                print("Exiting...")
+                return None
+            elif 1 <= choice_num <= len(matches):
+                return matches[choice_num - 1]
+            else:
+                print(f"Invalid choice. Please enter 0-{len(matches)}")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
 
 
 def console_reader(child, output_queue, stop_event):
@@ -184,14 +277,14 @@ def setup_second_connection():
     return child
 
 
-def download_elf_and_continue(child):
+def download_elf_and_continue(child, elf_path):
     """
     Download the ELF file and continue execution on the first connection.
-    Step 12: dow -force /home/<username>/aiehlc/main.elf
+    Step 12: dow -force <elf_path>
     Step 13: con
     """
-    print(f"[Connection 1] Downloading ELF: {ELF_PATH}")
-    child.sendline(f"dow -force {ELF_PATH}")
+    print(f"[Connection 1] Downloading ELF: {elf_path}")
+    child.sendline(f"dow -force {elf_path}")
     child.expect(r'xsdb%', timeout=120)  # Download may take time
     print("[Connection 1] ELF download complete!")
     
@@ -202,19 +295,14 @@ def download_elf_and_continue(child):
     print("[Connection 1] Execution started!")
 
 
-def copy_elf_to_remote():
-    """Copy main.elf from local ../aout/ to remote /home/{username}/aiehlc/"""
-    import subprocess
-    
+def copy_elf_to_remote(local_elf):
+    """Copy ELF file from local path to remote /home/{username}/aiehlc/"""
     import shutil
     
-    # Get the directory where this script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    local_elf = os.path.join(script_dir, "..", "aout", "main.elf")
-    local_elf = os.path.normpath(local_elf)
-    
     dest_dir = f"/home/{username}/aiehlc/"
-    dest_elf = os.path.join(dest_dir, "main.elf")
+    # Use the original filename from the local path
+    elf_filename = os.path.basename(local_elf)
+    dest_elf = os.path.join(dest_dir, elf_filename)
     
     print(f">>> Copying ELF file...")
     print(f"    Source: {local_elf}")
@@ -222,7 +310,7 @@ def copy_elf_to_remote():
     
     if not os.path.exists(local_elf):
         print(f"Error: Local ELF file not found: {local_elf}")
-        return False
+        return False, None
     
     # Create destination directory if it doesn't exist
     os.makedirs(dest_dir, exist_ok=True)
@@ -231,43 +319,66 @@ def copy_elf_to_remote():
     try:
         shutil.copy2(local_elf, dest_elf)
         print(">>> ELF file copied successfully")
-        return True
+        return True, dest_elf
     except Exception as e:
         print(f"Error copying ELF file: {e}")
-        return False
+        return False, None
 
 
 def main():
     """Main test function."""
-    print("=" * 60)
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Palboard ELF Test Script - Run ELF files on palboard",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                    # Use default aout/main.elf (will prompt for confirmation)
+  %(prog)s mykernel.elf       # Search for mykernel.elf if not in current path
+  %(prog)s ./build/test.elf   # Use specific file path
+        """
+    )
+    parser.add_argument(
+        "elf_file",
+        nargs="?",
+        default=None,
+        help="Path to ELF file (optional, will prompt for default if not specified)"
+    )
+    args = parser.parse_args()
+    
+    # Step 0: Find ELF file using smart selection
+    local_elf = find_elf_file(args.elf_file)
+    if local_elf is None:
+        sys.exit(1)
+    
+    print("\n" + "=" * 60)
     print("Palboard ELF Test Script")
     print(f"Host: {host}")
-    print(f"ELF Path: {ELF_PATH}")
+    print(f"ELF File: {local_elf}")
     print("=" * 60)
     
-    # Step 0: Copy ELF file to remote server
-    if not copy_elf_to_remote():
+    # Step 1: Copy ELF file to remote server
+    success, remote_elf_path = copy_elf_to_remote(local_elf)
+    if not success:
         print("Failed to copy ELF file, exiting...")
         sys.exit(1)
-
-    #sys.exit(0)
     
     conn1 = None
     conn2 = None
     console_thread = None
     
     try:
-        # Step 1-2: Setup first connection and program device
+        # Step 2-3: Setup first connection and program device
         print("\n>>> Setting up first connection...")
         conn1 = setup_first_connection()
         
-        # Step 3: Setup second connection for console output
+        # Step 4: Setup second connection for console output
         print("\n>>> Setting up second connection...")
         conn2 = setup_second_connection()
         
-        # Step 4: Download ELF file
+        # Step 5: Download ELF file
         print("\n>>> Downloading ELF file...")
-        download_elf_and_continue(conn1)
+        download_elf_and_continue(conn1, remote_elf_path)
         
         # Start console reader thread after ELF is running
         console_thread = threading.Thread(
