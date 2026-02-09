@@ -7,11 +7,73 @@
 #include "aie_device_map.h"
 #include <stdio.h>
 
-// Global device instances
+// HW generation for device config (reference: aieml_perf.cc lines 14-20)
+#if AIE_GEN <= 2
+#define HW_GEN XAIE_DEV_GEN_AIEML
+#else
+#define HW_GEN XAIE_DEV_GEN_AIE2PS
+#endif
+
+// Device layout declare: config and instance (reference: aieml_perf.cc lines 292-300)
+static XAie_SetupConfig(g_Config, HW_GEN, XAIE_BASE_ADDR, XAIE_COL_SHIFT, XAIE_ROW_SHIFT,
+                        XAIE_NUM_COLS, XAIE_NUM_ROWS, XAIE_SHIM_ROW,
+                        XAIE_RES_TILE_ROW_START, XAIE_RES_TILE_NUM_ROWS,
+                        XAIE_AIE_TILE_ROW_START, XAIE_AIE_TILE_NUM_ROWS);
+static XAie_InstDeclare(g_DevInst_storage, &g_Config);
+
+// Global device instances (set by __Runtime_device_init / __Runtime_routing_init)
 XAie_DevInst *g_DevInst = NULL;
 XAie_RoutingInstance *g_RoutingInst = NULL;
 
 // Reference: aieml_perf.cc lines 111-281 for implementation patterns
+
+/**
+ * Initialize device: config, backend, NPI (if gen>=2), partition (reference: aieml_perf.cc lines 316-344)
+ */
+AieRC __Runtime_device_init(void) {
+    g_DevInst = &g_DevInst_storage;
+
+    AieRC RC = XAie_CfgInitialize(g_DevInst, &g_Config);
+    if (RC != XAIE_OK) {
+        return RC;
+    }
+
+    XAie_SetIOBackend(g_DevInst, XAIE_IO_BACKEND_BAREMETAL);
+
+#if AIE_GEN >= 2
+    if (g_DevInst->Backend->Type == XAIE_IO_BACKEND_BAREMETAL) {
+#if AIE_GEN == 5
+        RC = XAie_UpdateNpiAddr(g_DevInst, 0xf6d50000);
+#else
+        RC = XAie_UpdateNpiAddr(g_DevInst, 0xF6D10000);
+#endif
+        if (RC != XAIE_OK) {
+            return RC;
+        }
+    }
+    RC = XAie_PartitionInitialize(g_DevInst, NULL);
+#else
+    XAie_PmRequestTiles(g_DevInst, NULL, 0);
+    RC = XAIE_OK;
+#endif
+
+    return RC;
+}
+
+/**
+ * Initialize routing handler (reference: aieml_perf.cc line 128)
+ * Must be called after __Runtime_device_init.
+ */
+void __Runtime_routing_init(void) {
+    g_RoutingInst = XAie_InitRoutingHandler(g_DevInst);
+}
+
+/**
+ * Teardown partition (reference: aieml_perf.cc lines 348-352)
+ */
+AieRC __Runtime_device_teardown(void) {
+    return XAie_PartitionTeardown(g_DevInst);
+}
 
 /**
  * Configure DMA buffer descriptor

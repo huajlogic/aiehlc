@@ -48,6 +48,11 @@ typedef struct_event event;
 // Runtime API declarations
 // Reference: aieml_perf.cc for XAie API usage patterns
 
+// Device layout declare and init (reference: aieml_perf.cc main lines 292-344, 348-352)
+AieRC __Runtime_device_init(void);
+void __Runtime_routing_init(void);
+AieRC __Runtime_device_teardown(void);
+
 // DMA and data movement
 XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, uint64_t addr,
                                      int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id);

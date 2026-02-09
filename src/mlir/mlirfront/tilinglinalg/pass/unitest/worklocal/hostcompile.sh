@@ -164,7 +164,7 @@ fi
 set +x
 # Compile aie_runtime.c
 echo "Compiling aie_runtime.c..."
-${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/aie_runtime.c" -o aie_runtime.o
+${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime.c" -o aie_runtime.o
 if [ $? -ne 0 ]; then
     echo "Error: failed to compile aie_runtime.c"
     exit 1

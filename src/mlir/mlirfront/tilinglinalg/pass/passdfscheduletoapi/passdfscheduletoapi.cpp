@@ -1388,7 +1388,17 @@ struct HostOpOuterPattern : public ConversionPattern {
         auto funcType = rewriter.getFunctionType({}, {});
         auto emitcFunc = rewriter.create<emitc::FuncOp>(loc, funcName, funcType);
         Block *entryBlock = emitcFunc.addEntryBlock();
-        
+
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(entryBlock);
+            // Device init and routing init (reference: aie_runtime.c __Runtime_device_init / __Runtime_routing_init)
+            rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "__Runtime_device_init", nullptr, nullptr,
+                                                 ValueRange{});
+            rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "__Runtime_routing_init", nullptr, nullptr,
+                                                 ValueRange{});
+        }
+
         // Move converted operations from host region to new func
         if (op->getNumRegions() > 0 && !op->getRegion(0).empty()) {
             Block &srcBlock = op->getRegion(0).front();
@@ -1403,9 +1413,11 @@ struct HostOpOuterPattern : public ConversionPattern {
                 }
             }
         }
-        
-        // Add return at the end
+
+        // Add device teardown before return (reference: aie_runtime.c __Runtime_device_teardown)
         rewriter.setInsertionPointToEnd(entryBlock);
+        rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "__Runtime_device_teardown", nullptr, nullptr,
+                                             ValueRange{});
         rewriter.create<emitc::ReturnOp>(loc, Value{});
         
         llvm::errs() << "[Pattern] Created emitc.func: " << funcName << "\n";

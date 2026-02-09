@@ -16,6 +16,14 @@
 #define DEFAULT_BUFFER_SIZE 256
 #define ALLOC_LIST_MAX_SIZE 256
 
+// Device layout (reference: aieml_perf.cc lines 26-50)
+#define XAIE_BASE_ADDR 0x20000000000
+#define XAIE_COL_SHIFT 25
+#define XAIE_ROW_SHIFT 20
+#define XAIE_SHIM_ROW 0
+#define XAIE_RES_TILE_ROW_START 1
+#define XAIE_RES_TILE_NUM_ROWS 2
+
 // Architecture-specific defines
 #if AIE_GEN <= 2
 #define XAIE_NUM_ROWS 11
