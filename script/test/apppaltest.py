@@ -66,7 +66,7 @@ def find_elf_file(filename=None):
     Returns: full path to ELF file or None to exit
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_elf = os.path.normpath(os.path.join(script_dir, "..", "aout", "main.elf"))
+    default_elf = os.path.normpath(os.path.join(script_dir, "../../", "aout", "main.elf"))
     current_dir = os.getcwd()
     
     def ask_confirm(file_path, prompt_msg):
