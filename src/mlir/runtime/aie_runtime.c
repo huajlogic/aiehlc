@@ -27,14 +27,22 @@ XAie_RoutingInstance *g_RoutingInst = NULL;
 
 // Reference: aieml_perf.cc lines 111-281 for implementation patterns
 
+/** Return 1 if tile is an AIE core tile (row >= XAIE_AIE_TILE_ROW_START), 0 for shim/res. */
+static inline int __Runtime_is_aie_core_tile(XAie_LocType tile) { return tile.Row >= XAIE_AIE_TILE_ROW_START; }
+
+/** Static buffer for kernel group tiles so kg.tiles/event.tiles outlive __Runtime_load_kernel_group_4t. */
+static XAie_LocType s_kernel_tiles[4];
+
 /**
  * Initialize device: config, backend, NPI (if gen>=2), partition (reference: aieml_perf.cc lines 316-344)
  */
 AieRC __Runtime_device_init(void) {
+    printf("[aie_runtime] device_init start\n");
     g_DevInst = &g_DevInst_storage;
 
     AieRC RC = XAie_CfgInitialize(g_DevInst, &g_Config);
     if (RC != XAIE_OK) {
+        printf("[aie_runtime] device_init CfgInitialize failed: %d\n", (int)RC);
         return RC;
     }
 
@@ -57,6 +65,10 @@ AieRC __Runtime_device_init(void) {
     RC = XAIE_OK;
 #endif
 
+    if (RC == XAIE_OK)
+        printf("[aie_runtime] device_init OK\n");
+    else
+        printf("[aie_runtime] device_init partition/pm failed: %d\n", (int)RC);
     return RC;
 }
 
@@ -65,14 +77,19 @@ AieRC __Runtime_device_init(void) {
  * Must be called after __Runtime_device_init.
  */
 void __Runtime_routing_init(void) {
+    printf("[aie_runtime] routing_init start\n");
     g_RoutingInst = XAie_InitRoutingHandler(g_DevInst);
+    printf("[aie_runtime] routing_init OK\n");
 }
 
 /**
  * Teardown partition (reference: aieml_perf.cc lines 348-352)
  */
 AieRC __Runtime_device_teardown(void) {
-    return XAie_PartitionTeardown(g_DevInst);
+    printf("[aie_runtime] device_teardown\n");
+    AieRC RC = XAie_PartitionTeardown(g_DevInst);
+    printf("[aie_runtime] device_teardown done rc=%d\n", (int)RC);
+    return RC;
 }
 
 /**
@@ -132,6 +149,8 @@ struct_kernel_group __Runtime_load_kernel_group(XAie_LocType *tiles, int32_t num
 
     if (elf_buffers) {
         for (int i = 0; i < num_tiles; i++) {
+            if (!__Runtime_is_aie_core_tile(tiles[i]))
+                continue;
             XAie_CoreReset(g_DevInst, tiles[i]);
             XAie_CoreUnreset(g_DevInst, tiles[i]);
             XAie_LoadElfMem(g_DevInst, tiles[i], elf_buffers[i]);
@@ -143,8 +162,14 @@ struct_kernel_group __Runtime_load_kernel_group(XAie_LocType *tiles, int32_t num
 
 struct_kernel_group __Runtime_load_kernel_group_4t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
                                                    int n) {
-    XAie_LocType tiles[] = {t0, t1, t2, t3};
-    return __Runtime_load_kernel_group(tiles, n, NULL);
+    printf("[aie_runtime] load_kernel_group n=%d tiles=(%u,%u)(%u,%u)(%u,%u)(%u,%u)\n", n, (unsigned)t0.Row,
+           (unsigned)t0.Col, (unsigned)t1.Row, (unsigned)t1.Col, (unsigned)t2.Row, (unsigned)t2.Col, (unsigned)t3.Row,
+           (unsigned)t3.Col);
+    s_kernel_tiles[0] = t0;
+    s_kernel_tiles[1] = t1;
+    s_kernel_tiles[2] = t2;
+    s_kernel_tiles[3] = t3;
+    return __Runtime_load_kernel_group(s_kernel_tiles, n, NULL);
 }
 
 /**
@@ -157,8 +182,16 @@ struct_event __Runtime_launch_kernel_group(struct_kernel_group kg) {
     evt.num_tiles = kg.num_tiles;
     evt.timeout_us = 100000; // 100ms default
 
-    // Start all cores
-    XAie_Run(g_RoutingInst, kg.num_tiles);
+    // Start only AIE core tiles (skip shim/res to avoid invalid tile use)
+    uint32_t core_count = 0;
+    for (uint32_t i = 0; i < kg.num_tiles; i++) {
+        if (__Runtime_is_aie_core_tile(kg.tiles[i]))
+            core_count++;
+    }
+    printf("[aie_runtime] launch_kernel_group num_tiles=%u core_count=%u\n", (unsigned)kg.num_tiles,
+           (unsigned)core_count);
+    if (core_count > 0)
+        XAie_Run(g_RoutingInst, core_count);
 
     return evt;
 }
@@ -170,15 +203,20 @@ struct_event __Runtime_launch_kernel_group(struct_kernel_group kg) {
 void __Runtime_wait_event(struct_event event) {
     uint8_t allDone = 0;
 
+    printf("[aie_runtime] wait_event num_tiles=%u\n", (unsigned)event.num_tiles);
     do {
         allDone = 1;
         for (uint32_t i = 0; i < event.num_tiles; i++) {
+            printf("[aie_runtime] wait_event tile=%u\n", (unsigned)event.tiles[i].Row, (unsigned)event.tiles[i].Col);
+            if (!__Runtime_is_aie_core_tile(event.tiles[i]))
+                continue;
             AieRC RC = XAie_CoreWaitForDone(g_DevInst, event.tiles[i], 0);
             if (RC != XAIE_OK) {
                 allDone = 0;
             }
         }
     } while (!allDone);
+    printf("[aie_runtime] wait_event done\n");
 }
 
 /**
