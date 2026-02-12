@@ -33,6 +33,11 @@ static inline int __Runtime_is_aie_core_tile(XAie_LocType tile) { return tile.Ro
 /** Static buffer for kernel group tiles so kg.tiles/event.tiles outlive __Runtime_load_kernel_group_4t. */
 static XAie_LocType s_kernel_tiles[4];
 
+/* Kernel ELF embedded as binary blob by hostcompile.sh (ld -EL -r -b binary + redefine_symbols) */
+extern unsigned char _binary_kernel_dskernel_receiver_start[];
+extern unsigned char _binary_kernel_dskernel_receiver_end[];
+extern unsigned int _binary_kernel_dskernel_receiver_size;
+
 /**
  * Initialize device: config, backend, NPI (if gen>=2), partition (reference: aieml_perf.cc lines 316-344)
  */
@@ -169,7 +174,24 @@ struct_kernel_group __Runtime_load_kernel_group_4t(XAie_LocType t0, XAie_LocType
     s_kernel_tiles[1] = t1;
     s_kernel_tiles[2] = t2;
     s_kernel_tiles[3] = t3;
-    return __Runtime_load_kernel_group(s_kernel_tiles, n, NULL);
+
+    /* Load the embedded kernel ELF into each core tile
+     * (same pattern as aout/host.cc: CoreReset -> CoreUnreset -> LoadElfMem) */
+    for (int i = 0; i < n; i++) {
+        if (!__Runtime_is_aie_core_tile(s_kernel_tiles[i]))
+            continue;
+        printf("[aie_runtime] loading kernel ELF into tile (%u,%u)\n", (unsigned)s_kernel_tiles[i].Col,
+               (unsigned)s_kernel_tiles[i].Row);
+        XAie_CoreReset(g_DevInst, s_kernel_tiles[i]);
+        XAie_CoreUnreset(g_DevInst, s_kernel_tiles[i]);
+        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_dskernel_receiver_start);
+    }
+
+    struct_kernel_group kg;
+    kg.tiles = s_kernel_tiles;
+    kg.num_tiles = n;
+    kg.elf_buffers = NULL;
+    return kg;
 }
 
 /**

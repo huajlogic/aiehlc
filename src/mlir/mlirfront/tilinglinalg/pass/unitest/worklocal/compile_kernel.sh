@@ -95,9 +95,20 @@ fi
 echo "✓ Optimization pass 2 completed"
 echo ""
 
+# Step 3b: Rename @main -> @_main in LLVM IR (Chess linker expects _main with underscore prefix)
+# The Chess runtime startup (_main_init in libme.a) calls _main, but LLVM emits @main without prefix.
+echo "Step 3b: Renaming @main -> @_main for Chess linker convention..."
+sed -i 's/@main(/@_main(/g' ${BUILD_DIR}/kernel.ll
+echo "✓ Symbol renamed: main -> _main"
+echo ""
+
 # Step 4: Link kernel ELF
 echo "Step 4: Linking kernel ELF..."
-xchessmk -aiearch aie2ps -s -C Release_LLVM +o ${BUILD_DIR} ${KERNEL_SCRIPT_DIR}/aie2ps.prx
+xchessmk -aiearch aie2ps -s -C Release_LLVM \
+    -P ${arch_model_dir_aie2ps} +P 4 \
+    -DDEPLOYMENT_ELF=1 -D__LOCK_FENCE_MODE__=0 \
+    -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST \
+    +o ${BUILD_DIR} ${KERNEL_SCRIPT_DIR}/aie2ps.prx
 if [ $? -eq 0 ]; then
     echo ""
     echo "============================================"
