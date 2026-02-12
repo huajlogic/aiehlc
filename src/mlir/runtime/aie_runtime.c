@@ -203,14 +203,23 @@ struct_event __Runtime_launch_kernel_group(struct_kernel_group kg) {
 void __Runtime_wait_event(struct_event event) {
     uint8_t allDone = 0;
 
-    printf("[aie_runtime] wait_event num_tiles=%u\n", (unsigned)event.num_tiles);
+    printf("[aie_runtime] wait_event num_tiles=%u tiles=(%u,%u)(%u,%u)(%u,%u)(%u,%u)\n", (unsigned)event.num_tiles,
+           (unsigned)event.tiles[0].Row, (unsigned)event.tiles[0].Col, (unsigned)event.tiles[1].Row,
+           (unsigned)event.tiles[1].Col, (unsigned)event.tiles[2].Row, (unsigned)event.tiles[2].Col,
+           (unsigned)event.tiles[3].Row, (unsigned)event.tiles[3].Col);
     do {
         allDone = 1;
         for (uint32_t i = 0; i < event.num_tiles; i++) {
-            printf("[aie_runtime] wait_event tile=%u\n", (unsigned)event.tiles[i].Row, (unsigned)event.tiles[i].Col);
-            if (!__Runtime_is_aie_core_tile(event.tiles[i]))
+            /// printf("[aie_runtime] wait_event tile=%u\n", (unsigned)event.tiles[i].Row,
+            /// (unsigned)event.tiles[i].Col);
+            if (!__Runtime_is_aie_core_tile(event.tiles[i])) {
+                printf("[aie_runtime] wait_event tile=(row %u, col %u) is not a core tile\n",
+                       (unsigned)event.tiles[i].Row, (unsigned)event.tiles[i].Col);
                 continue;
+            }
             AieRC RC = XAie_CoreWaitForDone(g_DevInst, event.tiles[i], 0);
+            printf("[aie_runtime] wait_event tile=%u rc=%d\n", (unsigned)event.tiles[i].Row,
+                   (unsigned)event.tiles[i].Col, (int)RC);
             if (RC != XAIE_OK) {
                 allDone = 0;
             }

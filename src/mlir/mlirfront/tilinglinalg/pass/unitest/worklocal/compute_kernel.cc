@@ -1,7 +1,7 @@
 // Compute kernel implementation
 // This is the actual kernel logic
 
-void compute_kernel(output_window_int8 window_out) {
+void compute_kernel(output_window_int8 *window_out) {
     int8_t *out = acquire_output_window(window_out);
 
     // Kernel logic here

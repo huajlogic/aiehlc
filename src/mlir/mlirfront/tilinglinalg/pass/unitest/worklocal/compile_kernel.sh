@@ -58,7 +58,12 @@ echo ""
 
 # Step 1: Compile kernel.cc to LLVM IR
 echo "Step 1: Compiling kernel.cc to LLVM IR..."
-xchesscc -aiearch aie2ps -s +f -p me ${INCLUDE_PATH} -o ${BUILD_DIR}/kernel_orig.ll ${KERNEL_SCRIPT_DIR}/kernel.cc
+arch_model_dir_aie2ps="${XILINX_VITIS}/aietools/data/aie2ps/lib"
+xchesscc -aiearch aie2ps -s +f -p me -P ${arch_model_dir_aie2ps} +P 4 \
+    +Wllvm,-O2,-fno-jump-tables,-fno-discard-value-names,-mllvm,-chess-collapse-struct-types-during-linking=0,-Xclang,-chess-only-info-critical-passes \
+    -D__AIENGINE__ -D__AIE_ARCH__=22 -D__AIEARCH=22 -D__LOCK_FENCE_MODE__=0 \
+    -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST \
+    ${INCLUDE_PATH} -o ${BUILD_DIR}/kernel_orig.ll ${KERNEL_SCRIPT_DIR}/kernel.cc
 if [ $? -ne 0 ]; then
     echo "✗ Error: xchesscc compilation failed"
     exit 1
