@@ -1889,7 +1889,6 @@ static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
 
     // Generate main function (kernel driver entry point)
     code << "int main(void) {\n";
-    code << "    __Runtime_device_init();//\n\n";
     // code << "    log(1);  // Log: entering main\n";
     code << "    sync_buffer[0] = 0; // reset end signal\n\n";
 
