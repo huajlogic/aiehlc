@@ -1,0 +1,272 @@
+/******************************************************************************
+ * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: MIT
+ ******************************************************************************/
+
+#include "passdfscheduletokernelapi.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+
+using namespace mlir;
+using namespace dfschedule;
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Single pattern for dfschedule.module: convert body line-by-line (one emitc op
+// per dfschedule op) then erase module. Always matches so conversion does not
+// depend on nested ops being converted first (driver may try parent first).
+// ---------------------------------------------------------------------------
+
+/// Window info from WindowDefOp for emitting correct buffer/lock names.
+struct WindowInfo {
+    std::string pingBuffer;
+    std::string pongBuffer;
+    std::string acquireLock;
+    std::string releaseLock;
+};
+
+/// dfschedule.module -> convert entire body line-by-line then erase module.
+/// Always matches and does full conversion so we do not depend on nested patterns
+/// firing first (conversion may try the parent before descending into regions).
+struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(KernelModuleOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        Location loc = op.getLoc();
+        Block &body = op.getBody().front();
+
+        // Build map: window symbol name -> (ping_buffer, pong_buffer, acquire_lock, release_lock)
+        llvm::StringMap<WindowInfo> windowInfoMap;
+        for (Operation &inner : body) {
+            if (auto windowDefOp = dyn_cast<WindowDefOp>(&inner)) {
+                DictionaryAttr winAttrs = windowDefOp.getWindowAttrs();
+                WindowInfo info;
+                if (auto a = winAttrs.getAs<SymbolRefAttr>("ping_buffer"))
+                    info.pingBuffer = a.getRootReference().getValue().str();
+                if (auto a = winAttrs.getAs<SymbolRefAttr>("pong_buffer"))
+                    info.pongBuffer = a.getRootReference().getValue().str();
+                if (auto a = winAttrs.getAs<SymbolRefAttr>("acquire_lock"))
+                    info.acquireLock = a.getRootReference().getValue().str();
+                if (auto a = winAttrs.getAs<SymbolRefAttr>("release_lock"))
+                    info.releaseLock = a.getRootReference().getValue().str();
+                windowInfoMap[windowDefOp.getSymName().str()] = info;
+            }
+        }
+
+        // Config state (from kernel_config_def) for buffer_def emission
+        int32_t bufferSize = 256;
+        int32_t vectorWidth = 4;
+        std::string elementType = "int32";
+        std::string kernelFileName = "compute_kernel.cc";
+
+        rewriter.setInsertionPoint(op);
+
+        for (Operation &inner : body) {
+            if (auto configOp = dyn_cast<KernelConfigDefOp>(&inner)) {
+                DictionaryAttr attrs = configOp.getConfigAttrs();
+                if (auto a = attrs.getAs<IntegerAttr>("buffer_size"))
+                    bufferSize = a.getInt();
+                if (auto a = attrs.getAs<IntegerAttr>("vector_width"))
+                    vectorWidth = a.getInt();
+                if (auto a = attrs.getAs<TypeAttr>("element_type")) {
+                    Type t = a.getValue();
+                    if (t.isInteger(32))
+                        elementType = "int32";
+                    else if (t.isInteger(16))
+                        elementType = "int16";
+                    else if (t.isInteger(8))
+                        elementType = "int8";
+                    else if (t.isF32())
+                        elementType = "float";
+                }
+                if (auto a = attrs.getAs<StringAttr>("kernel_file"))
+                    kernelFileName = a.getValue().str();
+                rewriter.create<emitc::VerbatimOp>(loc, "#include <stdint.h>");
+                rewriter.create<emitc::VerbatimOp>(loc, "#include <adf.h>");
+                rewriter.create<emitc::VerbatimOp>(loc, "#include <aie_api/aie.hpp>");
+                rewriter.create<emitc::VerbatimOp>(loc, "#include <aie_api/aie_adf.hpp>");
+                rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_READ  1");
+                rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_WRITE 0");
+                rewriter.create<emitc::VerbatimOp>(loc, "#define BUF_SZ " + std::to_string(bufferSize));
+                // ADF kernel header: window types and helpers (required for xchesscc)
+                /*
+                rewriter.create<emitc::VerbatimOp>(loc,
+                    "typedef struct { void* ptr; int ping_acq; int ping_rel; int pong_acq; int pong_rel; int size; }
+                window_internal;"); rewriter.create<emitc::VerbatimOp>(loc, "typedef void* output_window_int8;");
+                rewriter.create<emitc::VerbatimOp>(loc,
+                    "inline void window_init(window_internal* win, int count, void* ping, int ping_acq_lock, void* pong,
+                int ping_rel_lock, int ping_size, int pong_size) { win->ptr = ping; win->ping_acq = ping_acq_lock;
+                win->ping_rel = ping_rel_lock; win->size = ping_size; }"); rewriter.create<emitc::VerbatimOp>(loc,
+                    "inline output_window_int8 get_output_async_window_int8(window_internal* win) { return win->ptr;
+                }");
+                */
+                rewriter.create<emitc::VerbatimOp>(
+                    loc, "inline int8_t* acquire_output_window(output_window_int8* win) { return (int8_t*)win; }");
+                rewriter.create<emitc::VerbatimOp>(
+                    loc, "inline void release_output_window(output_window_int8* win) { chess_memory_fence(); }");
+
+                continue;
+            }
+            if (auto lockOp = dyn_cast<LockDefOp>(&inner)) {
+                std::string line = "#define " + lockOp.getSymName().str() + " " + std::to_string(lockOp.getId());
+                rewriter.create<emitc::VerbatimOp>(loc, line);
+                continue;
+            }
+            if (auto bufferOp = dyn_cast<BufferDefOp>(&inner)) {
+                Type t = bufferOp.getBufferTypeAttr().getValue();
+                std::string vecType = "v4int32";
+                if (auto memref = dyn_cast<MemRefType>(t)) {
+                    Type elem = memref.getElementType();
+                    if (auto vec = dyn_cast<VectorType>(elem)) {
+                        int w = vec.getShape().empty() ? 4 : vec.getShape()[0];
+                        if (vec.getElementType().isInteger(32))
+                            vecType = "v" + std::to_string(w) + "int32";
+                        else if (vec.getElementType().isInteger(16))
+                            vecType = "v" + std::to_string(w) + "int16";
+                        else if (vec.getElementType().isInteger(8))
+                            vecType = "v" + std::to_string(w) + "int8";
+                        else if (vec.getElementType().isF32())
+                            vecType = "v" + std::to_string(w) + "float";
+                    }
+                }
+                std::string line = vecType + " " + bufferOp.getSymName().str() + "[BUF_SZ];";
+                rewriter.create<emitc::VerbatimOp>(loc, line);
+                continue;
+            }
+            if (auto windowOp = dyn_cast<WindowDefOp>(&inner)) {
+                rewriter.create<emitc::VerbatimOp>(loc, "// window_def " + windowOp.getSymName().str());
+                continue;
+            }
+            if (auto declOp = dyn_cast<KernelDeclOp>(&inner)) {
+                rewriter.create<emitc::VerbatimOp>(loc, "#include \"" + kernelFileName + "\"");
+                rewriter.create<emitc::VerbatimOp>(loc, "// kernel_decl " + declOp.getSymName().str());
+                continue;
+            }
+            if (auto mainOp = dyn_cast<KernelMainOp>(&inner)) {
+                convertMainToEmitC(rewriter, mainOp, op, windowInfoMap); // insert main func before module op
+                continue;
+            }
+        }
+
+        rewriter.eraseOp(op);
+        return success();
+    }
+
+    void convertMainToEmitC(ConversionPatternRewriter &rewriter, KernelMainOp mainOp, KernelModuleOp kernelModuleOp,
+                            const llvm::StringMap<WindowInfo> &windowInfoMap) const {
+        Location loc = mainOp.getLoc();
+        Block &mainBody = mainOp.getBody().front();
+
+        // Map SSA values to C expression names (e.g. window_init result -> "window_win")
+        llvm::DenseMap<Value, std::string> valueToCName;
+
+        // Insert main func in parent block (before kernelModuleOp), not inside module body
+        rewriter.setInsertionPoint(kernelModuleOp);
+        auto funcType = rewriter.getFunctionType({}, rewriter.getI32Type());
+        auto emitcMain = rewriter.create<emitc::FuncOp>(loc, "main", funcType);
+        Block *entry = emitcMain.addEntryBlock();
+        rewriter.setInsertionPointToStart(entry);
+
+        rewriter.create<emitc::VerbatimOp>(loc, "volatile static int sync_buffer[8] = {0, -1};");
+        // rewriter.create<emitc::VerbatimOp>(loc, "log(1);  // Log: entering main");
+        rewriter.create<emitc::VerbatimOp>(loc, "sync_buffer[0] = 0;");
+
+        for (Operation &inner : mainBody) {
+            if (isa<AllocSyncBufferOp>(&inner)) {
+                rewriter.create<emitc::VerbatimOp>(loc, "// alloc_sync_buffer");
+                continue;
+            }
+            if (isa<SyncBufferWriteOp>(&inner)) {
+                rewriter.create<emitc::VerbatimOp>(loc, "// sync_buffer_write");
+                continue;
+            }
+            if (isa<LogOp>(&inner)) {
+                rewriter.create<emitc::VerbatimOp>(loc, "// log(...)");
+                continue;
+            }
+            if (auto winInit = dyn_cast<WindowInitOp>(&inner)) {
+                std::string winSym = winInit.getWindowRefAttr().getRootReference().getValue().str();
+                valueToCName[winInit.getResult()] = "window_" + winSym;
+                rewriter.create<emitc::VerbatimOp>(loc, "window_internal window_" + winSym + "[1];");
+                std::string pingBuf, pongBuf, acqLock, relLock;
+                auto it = windowInfoMap.find(winSym);
+                if (it != windowInfoMap.end()) {
+                    pingBuf = it->second.pingBuffer;
+                    pongBuf = it->second.pongBuffer;
+                    acqLock = it->second.acquireLock;
+                    relLock = it->second.releaseLock;
+                } else {
+                    pingBuf = winSym + "_ping";
+                    pongBuf = winSym + "_pong";
+                    acqLock = "LOCK_" + winSym + "_ACQ";
+                    relLock = "LOCK_" + winSym + "_REL";
+                }
+                rewriter.create<emitc::VerbatimOp>(loc, "window_init(window_" + winSym + ", 1, " + pingBuf + ", " +
+                                                            acqLock + ", " + pongBuf + ", " + relLock +
+                                                            ", BUF_SZ, BUF_SZ);");
+                continue;
+            }
+            if (auto invokeOp = dyn_cast<KernelInvokeOp>(&inner)) {
+                std::string callee = invokeOp.getKernelRefAttr().getRootReference().getValue().str();
+                std::string argList;
+                for (Value arg : invokeOp.getArgs()) {
+                    auto it = valueToCName.find(arg);
+                    std::string cArg = (it != valueToCName.end()) ? it->second : "/*unknown*/";
+                    if (!argList.empty())
+                        argList += ", ";
+                    // Kernel expects output_window_int8; pass get_output_async_window_int8(window_xxx)
+                    argList += "get_output_async_window_int8(" + cArg + ")";
+                }
+                rewriter.create<emitc::VerbatimOp>(loc, "// kernel_invoke " + callee);
+                rewriter.create<emitc::VerbatimOp>(loc, callee + "(" + argList + ");");
+                continue;
+            }
+            if (isa<DoneOp>(&inner)) {
+                rewriter.create<emitc::VerbatimOp>(loc, "done();");
+                continue;
+            }
+            if (isa<KernelReturnOp>(&inner)) {
+                auto c0 = rewriter.create<emitc::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+                rewriter.create<emitc::ReturnOp>(loc, c0.getResult());
+                break;
+            }
+        }
+
+        if (!entry->back().hasTrait<OpTrait::IsTerminator>()) {
+            auto c0 = rewriter.create<emitc::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+            rewriter.create<emitc::ReturnOp>(loc, c0.getResult());
+        }
+    }
+};
+
+} // namespace
+
+namespace mlir {
+
+void DfscheduleToKernelApiPass::runOnOperation() {
+    ModuleOp moduleOp = getOperation();
+    MLIRContext *ctx = &getContext();
+
+    ConversionTarget target(*ctx);
+    target.addLegalDialect<emitc::EmitCDialect, func::FuncDialect, arith::ArithDialect, memref::MemRefDialect>();
+    target.addIllegalOp<KernelModuleOp>();
+
+    TypeConverter typeConverter;
+    typeConverter.addConversion([](Type type) { return type; });
+
+    RewritePatternSet patterns(ctx);
+    patterns.add<KernelModuleToEmitCPattern>(typeConverter, ctx);
+
+    if (failed(applyPartialConversion(moduleOp, target, std::move(patterns))))
+        signalPassFailure();
+}
+
+} // namespace mlir
