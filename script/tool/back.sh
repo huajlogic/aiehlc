@@ -66,6 +66,7 @@ back() {
             sed -i '$ d' "$stack_file"
             cd "$last" || { echo "back: cd failed: $last"; return 1; }
             echo "  popped -> $last"
+            exec bash
             ;;
 
         # --- rm <n> --------------------------------------------------------
@@ -110,6 +111,7 @@ back() {
             fi
             cd "$target" || { echo "back: cd failed: $target"; return 1; }
             echo "  -> $target"
+            exec bash
             ;;
 
         # --- help / unknown ------------------------------------------------

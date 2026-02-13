@@ -300,7 +300,7 @@ while IFS= read -r kernel_source_file; do
         compile_args+=(--debug-output)
     fi
 
-    "source" "$SCRIPT_DIR/kernelcompile.sh" "${compile_args[@]}"
+    "source" "$SCRIPT_DIR/kc.sh" "${compile_args[@]}"
 done < "$kernel_list_file"
 
 #Compile host
