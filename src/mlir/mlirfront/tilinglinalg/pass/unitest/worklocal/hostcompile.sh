@@ -21,38 +21,15 @@ AIEHLC_DIR="${AIEHLC_ROOT}"
 WORKLOCAL_DIR="${AIEHLC_ROOT}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal"
 BUILD_DIR="${WORKLOCAL_DIR}/build"
 
-# ---------------------------------------------------------------------------
-# redefine_symbols: rename ld-generated _binary_ symbols to a canonical form
-# (same logic as script/aiehlc.sh)
-# ---------------------------------------------------------------------------
-redefine_symbols() {
-    local obj_file="$1"
-    local func_name="$2"
-    local objcopy_tool="$3"
-
-    nm "$obj_file" | while read -r line; do
-        symbol=$(echo "$line" | awk '{print $3}')
-
-        if echo "$symbol" | grep -q "_binary_.*_end$"; then
-            echo "  Renaming symbol: $symbol -> _binary_kernel_${func_name}_end"
-            "$objcopy_tool" --redefine-sym "$symbol"=_binary_kernel_"${func_name}"_end "$obj_file"
-        elif echo "$symbol" | grep -q "_binary_.*_start$"; then
-            echo "  Renaming symbol: $symbol -> _binary_kernel_${func_name}_start"
-            "$objcopy_tool" --redefine-sym "$symbol"=_binary_kernel_"${func_name}"_start "$obj_file"
-        elif echo "$symbol" | grep -q "_binary_.*_size$"; then
-            echo "  Renaming symbol: $symbol -> _binary_kernel_${func_name}_size"
-            "$objcopy_tool" --redefine-sym "$symbol"=_binary_kernel_"${func_name}"_size "$obj_file"
-        fi
-    done
-}
+KERNEL_FUNC_NAME="dskernel_receiver"   # matches the kernel function in host.cc
 
 pushd ${WORKLOCAL_DIR}
-source ./compile_kernel.sh
+source ./compile_kernel.sh "${KERNEL_FUNC_NAME}"
 if [ $? -ne 0 ]; then
     echo "Error: compile_kernel.sh failed"
     exit 1
 fi
-echo "✓ Compiled kernel: ${BUILD_DIR}/kernel"
+echo "✓ Compiled kernel: ${BUILD_DIR}/kernel.o (func: ${KERNEL_FUNC_NAME})"
 popd
 
 # Defaults (match aiehlc.sh)
@@ -168,30 +145,9 @@ DEFS="-DAIE_GEN=${aie_version}"
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# ---------------------------------------------------------------------------
-# Embed kernel ELF as a binary blob (same as aiehlc.sh lines 384-387)
-# Produces kernel.o with _binary_kernel_<name>_{start,end,size} symbols
-# ---------------------------------------------------------------------------
-KERNEL_ELF="${BUILD_DIR}/kernel"
-KERNEL_FUNC_NAME="dskernel_receiver"   # matches the kernel function in host.cc
+# kernel.o is already built by compile_kernel.sh with canonical symbols
+# (_binary_kernel_<func_name>_{start,end,size})
 KERNEL_OBJ="${BUILD_DIR}/kernel.o"
-objcopy_tool="${TOOL_PREFIX}objcopy"
-
-echo "============================================"
-echo "Embedding kernel ELF as binary blob"
-echo "============================================"
-echo "Kernel ELF: ${KERNEL_ELF}"
-
-${TOOL_PREFIX}ld -EL -r -b binary -o "${KERNEL_OBJ}" "${KERNEL_ELF}"
-if [ $? -ne 0 ]; then
-    echo "Error: failed to embed kernel ELF as binary"
-    exit 1
-fi
-echo "✓ Created binary object: ${KERNEL_OBJ}"
-
-echo "Renaming _binary_ symbols to _binary_kernel_${KERNEL_FUNC_NAME}_{start,end,size}..."
-redefine_symbols "${KERNEL_OBJ}" "${KERNEL_FUNC_NAME}" "${objcopy_tool}"
-echo "✓ Symbols renamed"
 
 echo "Symbols in kernel.o:"
 nm "${KERNEL_OBJ}" | grep _binary_

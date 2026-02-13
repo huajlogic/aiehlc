@@ -60,16 +60,21 @@ redefine_symbols() {
     local func_name="$2"
     local objcopy_tool="$3"
 
+    # ld -r -b binary creates symbols like:
+    #   _binary_<path_with_slashes_as_underscores>_{start,end,size}
+    # The path varies depending on where ld is invoked from, so we match
+    # any _binary_..._end / _start / _size and rename to canonical names.
     nm "$obj_file" | while read -r line; do
         symbol=$(echo "$line" | awk '{print $3}')
-        
-        if echo "$symbol" | grep -q "_binary__.*_aout_build_${func_name}_.*_end$"; then
+        [ -z "$symbol" ] && continue
+
+        if echo "$symbol" | grep -q "^_binary_.*_end$"; then
             dbg_echo "Renaming symbol: $symbol to _binary_kernel_${func_name}_end"
             "$objcopy_tool" --redefine-sym "$symbol"=_binary_kernel_"${func_name}"_end "$obj_file"
-        elif echo "$symbol" | grep -q "_binary__.*_aout_build_${func_name}_.*_start$"; then
+        elif echo "$symbol" | grep -q "^_binary_.*_start$"; then
             dbg_echo "Renaming symbol: $symbol to _binary_kernel_${func_name}_start"
             "$objcopy_tool" --redefine-sym "$symbol"=_binary_kernel_"${func_name}"_start "$obj_file"
-        elif echo "$symbol" | grep -q "_binary__.*_aout_build_${func_name}_.*_size$"; then
+        elif echo "$symbol" | grep -q "^_binary_.*_size$"; then
             dbg_echo "Renaming symbol: $symbol to _binary_kernel_${func_name}_size"
             "$objcopy_tool" --redefine-sym "$symbol"=_binary_kernel_"${func_name}"_size "$obj_file"
         fi

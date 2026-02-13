@@ -4,8 +4,15 @@
 # SPDX-License-Identifier: MIT
 ###############################################################################
 # Minimal standalone AIE-2PS kernel compilation script
-# Compiles kernel.cc (which includes compute_kernel.cc) to kernel ELF
+# Compiles kernel.cc (which includes compute_kernel.cc) to kernel ELF + kernel.o
+#
+# Usage: compile_kernel.sh [func_name]
+#   func_name  - kernel function name for binary symbols (default: compute_kernel)
+#                Produces kernel.o with _binary_kernel_<func_name>_{start,end,size}
 ###############################################################################
+
+# Optional first argument: kernel function name (default: compute_kernel)
+KERNEL_FUNC_NAME="${1:-compute_kernel}"
 
 # Save the script directory BEFORE sourcing anything
 # Use a unique name to avoid conflicts with setup.sh
@@ -38,4 +45,5 @@ fi
 # Clean previous kernel build artifacts--to fix the _main missing error
 rm -f "${BUILD_DIR}"/chesswork/kernel* "${BUILD_DIR}"/kernel* 2>/dev/null || true
 
-source ${AIEHLC_DIR}/script/kc.sh --kernel-cc ./kernel.cc --func-name compute_kernel --aie-version 5 --platform baremetal --debug-output --output-dir $BUILD_DIR --prx aie2ps.prx
+echo "Kernel func name: ${KERNEL_FUNC_NAME}"
+source ${AIEHLC_DIR}/script/kc.sh --kernel-cc ./kernel.cc --func-name "${KERNEL_FUNC_NAME}" --aie-version 5 --platform baremetal --debug-output --output-dir $BUILD_DIR --prx aie2ps.prx
