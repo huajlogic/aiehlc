@@ -33,7 +33,7 @@ echo "✓ Compiled kernel: ${BUILD_DIR}/kernel.o (func: ${KERNEL_FUNC_NAME})"
 popd
 
 # Defaults (match aiehlc.sh)
-aie_version="${AIE_VERSION:-2}"
+aie_version="${AIE_VERSION:-5}"
 platform="${PLATFORM:-baremetal}"
 
 if [ ! -f "${WORKLOCAL_DIR}/host.cc" ]; then
@@ -113,7 +113,7 @@ if [[ "$aie_version" == "1" || "$aie_version" == "2" ]]; then
     AIELIB_APU_NAME="libxaienginea72.a"
     ARCH_APU_LD="${ARCH_DIR}/psv_cortexa72_0/lscript.ld"
     compiler_cpu_flag="-mcpu=cortex-a72"
-    LINK_EXTRA="-lxilstandalone"
+    LINK_EXTRA="-lxil"
 elif [[ "$aie_version" == "5" ]]; then
     ARCH_APU_ALIB="${ARCH_78_DIR}/lib"
     ARCH_APU_AINC="${ARCH_78_DIR}/include"

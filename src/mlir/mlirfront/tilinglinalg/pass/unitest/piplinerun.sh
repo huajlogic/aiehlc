@@ -6,9 +6,13 @@
 set -e
 
 echo "=== Step 1: Source environment ==="
+pushd .
 source ../../../../../../script/setup.sh --path-set-only
+popd
 
-source .../../../../../../script/aiehlc.sh --aielib-only
+pushd .
+source ../../../../../../script/aiehlc.sh --aielib-only --aie-version 5
+popd    
 
 echo "=== Step 2: Build unitest ==="
 pushd ./build
@@ -24,7 +28,8 @@ source hostcompile.sh
 popd
 
 echo "=== Step 5: Run on HW (apppaltest) ==="
-source ../../../../../../script/test/envlocal.sh
+source ~/palmtest/envlocal.sh
 apppaltest.py ./worklocal/build/host
 
 echo "=== Pipeline completed successfully ==="
+
