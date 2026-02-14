@@ -20,8 +20,8 @@ run_cmd() {
 }
 
 usage() {
-    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]]"
-    exit 1
+    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only]"
+    return 1
 }
 
 build_hw_lib() {
@@ -87,6 +87,7 @@ build_hw_lib() {
     }
 
 
+main() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AIEHLC_DIR="${SCRIPT_DIR}/../"
 runtime_source_file=""
@@ -94,11 +95,13 @@ aie_version="2"
 use_llvm_aie="false"
 DEBUG_OUTPUT=0
 platform="baremetal"
+COMPILE_AIELIB_ONLY=0
 USE_LOCAL_AIERT_BSP=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -help)
             usage
+            return 0
             ;;
         --runtime-source-file)
             runtime_source_file="$2"
@@ -124,12 +127,24 @@ while [[ $# -gt 0 ]]; do
             DEBUG_OUTPUT=1
             shift
             ;;
+        --aielib-only)
+            COMPILE_AIELIB_ONLY=1
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             usage
+            return 1
             ;;
     esac
 done
+
+# Parameter validation
+if [ "$COMPILE_AIELIB_ONLY" -eq 0 ] && [ -z "$runtime_source_file" ]; then
+    echo "Error: --runtime-source-file is required."
+    usage
+    return 0
+fi
 
 #set up env
 run_cmd "source $SCRIPT_DIR/setup.sh --path-set-only"
@@ -201,7 +216,7 @@ elif [[ $aie_version == "5" ]]; then
     EXTRA_LIBS="-lxiltimer,-lxilstandalone,"
 else
     echo "Unsupported AIE version: $aie_version"
-    exit 1
+    return 1
 fi
 AIENGINE_LIB_DIR=$ARCH_APU_ALIB/../libsrc/build_configs/gen_bsp/libsrc/aienginev2/src
 
@@ -232,6 +247,11 @@ if [ -d "${AIE_DRIVER_PARENT_DIR}/aie-rt/driver/" ] ; then
     else
         echo "aie_version $aie_version is unknown"
     fi
+fi
+
+if [ "$COMPILE_AIELIB_ONLY" -eq 1 ]; then
+    echo "aielib compilation complete (--aielib-only)."
+    return 0
 fi
 
 #Set the aie-rt include path FOR aiehlc 
@@ -350,3 +370,6 @@ ${TOOL_PREFIX}strip $HOST_BUILD_DIR/main.elf
 
 echo "Build complete."
 echo "    $HOST_BUILD_DIR/main.elf"
+}
+
+main "$@"

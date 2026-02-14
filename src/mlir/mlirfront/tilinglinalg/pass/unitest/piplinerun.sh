@@ -8,6 +8,8 @@ set -e
 echo "=== Step 1: Source environment ==="
 source ../../../../../../script/setup.sh --path-set-only
 
+source .../../../../../../script/aiehlc.sh --aielib-only
+
 echo "=== Step 2: Build unitest ==="
 pushd ./build
 make -j4
