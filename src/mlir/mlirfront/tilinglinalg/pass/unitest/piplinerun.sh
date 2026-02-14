@@ -15,12 +15,20 @@ source ../../../../../../script/aiehlc.sh --aielib-only --aie-version 5
 popd    
 
 echo "=== Step 2: Build unitest ==="
-pushd ./build
+if [ ! -d "./build" ]; then
+    mkdir -p ./build
+    pushd ./build
+    cmake ..
+else
+    pushd ./build
+fi
 make -j4
 popd
 
 echo "=== Step 3: Run unitest (generate host.cc + kernel.cc) ==="
-./build/test dfschedule
+pushd ./build/
+./test dfschedule
+popd
 
 echo "=== Step 4: Compile host + kernel (hostcompile.sh) ==="
 pushd ./worklocal/
