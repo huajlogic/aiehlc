@@ -24,6 +24,7 @@
 #include "routingunrolling.h"
 #include <iostream>
 //#include "llvm/IR/IRPrintingPasses.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/IRPrinter/IRPrintingPasses.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
@@ -914,8 +915,13 @@ void routingtodfschedule() {
     // Run the pass pipeline
 
     // Output directory for generated host.cc and kernel.cc
-    const std::string worklocalDir =
-        "/scratch/staff/huaj/aiehlc/aiehlc/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal";
+    // Get the current working directory and build worklocalDir as an absolute path
+    llvm::SmallString<256> cwdPath;
+    if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
+        llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
+        return;
+    }
+    const std::string worklocalDir = (cwdPath + "/../worklocal").str();
     if (std::error_code EC = llvm::sys::fs::create_directories(worklocalDir)) {
         llvm::errs() << "Failed to create directory " << worklocalDir << ": " << EC.message() << "\n";
         return;

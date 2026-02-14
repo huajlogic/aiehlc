@@ -22,6 +22,7 @@ source hostcompile.sh
 popd
 
 echo "=== Step 5: Run on HW (apppaltest) ==="
+source ../../../../../../script/test/envlocal.sh
 apppaltest.py ./worklocal/build/host
 
 echo "=== Pipeline completed successfully ==="

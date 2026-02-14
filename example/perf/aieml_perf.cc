@@ -53,17 +53,16 @@
 #define CORE_IP_MEM 0x1000
 #define CORE_OP_MEM 0x6000
 
-#define MAT_SIZE 2048 // Size of each matrix (A and B)
+#define MAT_SIZE 256 // Size of each matrix (A and B)
 #define N 16         // Dimension of the square matrices (16x16)
 
 // #define DISABLE_CACHE
 //__attribute__((annotate("streaming")))
-__global__ void perf(input_window_int32 *win
-                     __attribute__((annotate("mem_address:0x1000"), annotate("size_hint:4096"))),
+__global__ void perf(input_window_int32 *win __attribute__((annotate("mem_address:0x1000"), annotate("size_hint:512"))),
                      output_window_int32 *out
-                     __attribute__((annotate("mem_address:0x6000"), annotate("size_hint:4096")))) {
-#define DATA_SIZE 4096
-#define MAT_SIZE 2048
+                     __attribute__((annotate("mem_address:0x6000"), annotate("size_hint:512")))) {
+#define DATA_SIZE 512
+#define MAT_SIZE 256
 #define N 16          // Dimension of the square matrices
 #define VECTOR_LENGTH 16
 	//aie::vector<int32_t, VECTOR_LENGTH> temp_a = window_readincr_v<VECTOR_LENGTH>(win);
