@@ -25,6 +25,10 @@ static XAie_InstDeclare(g_DevInst_storage, &g_Config);
 XAie_DevInst *g_DevInst = NULL;
 XAie_RoutingInstance *g_RoutingInst = NULL;
 
+/* Forward declarations for auto-init */
+static void __Runtime_auto_init(void) __attribute__((constructor));
+static void __Runtime_auto_teardown(void) __attribute__((destructor));
+
 // Reference: aieml_perf.cc lines 111-281 for implementation patterns
 
 /** Return 1 if tile is an AIE core tile (row >= XAIE_AIE_TILE_ROW_START), 0 for shim/res. */
@@ -283,4 +287,30 @@ void __Runtime_move_data_from_tile(XAie_RoutingInstance *routing, XAie_LocType s
 
     // Move data using routing API
     XAie_MoveDataAie2External(routing, src_tile, tile_offset, size, mem, shim_tile);
+}
+
+/**
+ * Auto-initialization: runs before main() via __attribute__((constructor)).
+ * Ensures g_DevInst and g_RoutingInst are ready before generated host code
+ * uses them directly (e.g. XAie_MemAllocate(g_DevInst, ...)).
+ */
+static void __Runtime_auto_init(void) {
+    printf("[aie_runtime] auto_init (constructor)\n");
+    AieRC rc = __Runtime_device_init();
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] auto_init: device_init FAILED rc=%d\n", (int)rc);
+        return;
+    }
+    __Runtime_routing_init();
+    printf("[aie_runtime] auto_init OK\n");
+}
+
+/**
+ * Auto-teardown: runs after main() via __attribute__((destructor)).
+ */
+static void __Runtime_auto_teardown(void) {
+    printf("[aie_runtime] auto_teardown (destructor)\n");
+    if (g_DevInst != NULL) {
+        __Runtime_device_teardown();
+    }
 }
