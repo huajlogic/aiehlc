@@ -100,7 +100,8 @@ AieRC __Runtime_device_init(void) {
 void __Runtime_routing_init(void) {
     printf("[aie_runtime] routing_init start\n");
     g_RoutingInst = XAie_InitRoutingHandler(g_DevInst);
-    printf("[aie_runtime] routing_init OK\n");
+    routing();
+    printf("[aie_runtime] 2-routing_init OK----\n");
 }
 
 /**
@@ -314,7 +315,7 @@ static void __Runtime_auto_init(void) {
         return;
     }
     __Runtime_routing_init();
-    routing();
+
     printf("[aie_runtime] auto_init OK\n");
 }
 
