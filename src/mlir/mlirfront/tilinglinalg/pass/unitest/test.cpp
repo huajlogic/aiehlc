@@ -655,8 +655,8 @@ void testRoutingLowerPassPathContiguity() {
     std::cout << "\n=== Test Complete ===" << std::endl;
 }
 
-void routingtoroutinghw() {
-     MLIRContext ctx;
+void routingtoroutinghw(mlir::ModuleOp module1 = nullptr) {
+    MLIRContext ctx;
     
     routingmanager mtest;
     routinghwmanager mtesthw;
@@ -666,7 +666,9 @@ void routingtoroutinghw() {
     ctx.getOrLoadDialect<arith::ArithDialect>();
     
     //auto module1 = mtest.createroutingfunc(&ctx,1);
-    auto module1 = mtest.ops_testNew(&ctx,1);
+    if (!module1) {
+        module1 = mtest.ops_testNew(&ctx, 1, "routing");
+    }
     module1.dump();
     //auto module2 = mtesthw.ops_test(&ctx);
     std::cout << "main" <<std::endl;
@@ -723,8 +725,35 @@ void routingtoroutinghw() {
     (void)pm2.run(module1);
     module1.dump();
   */
-//conver emitc into c code  
-    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
+    // conver emitc into c code
+    //  Get the current working directory and build worklocalDir as an absolute path
+    llvm::SmallString<256> cwdPath;
+    if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
+        llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
+        return;
+    }
+    const std::string worklocalDir = (cwdPath + "/../worklocal").str();
+    if (std::error_code EC = llvm::sys::fs::create_directories(worklocalDir)) {
+        llvm::errs() << "Failed to create directory " << worklocalDir << ": " << EC.message() << "\n";
+        return;
+    }
+
+    // Convert routing module to C++ and write to routing.cc
+    std::string routingPath = worklocalDir + "/routing.cc";
+    std::error_code routingEC;
+    llvm::raw_fd_ostream routingStream(routingPath, routingEC, llvm::sys::fs::OF_None);
+    if (routingEC) {
+        llvm::errs() << "Failed to open " << routingPath << ": " << routingEC.message() << "\n";
+        return;
+    }
+    std::cout << "\n=== Generated C++ Code (routing) ===" << std::endl;
+    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, routingStream);
+    routingStream.close();
+    if (failed(result)) {
+        llvm::errs() << "Failed to translate routing MLIR to C++.\n";
+        return;
+    }
+    std::cout << "Routing code written to " << routingPath << std::endl;
     return;
 }
 void routingtodmap() {
@@ -992,8 +1021,11 @@ int main(int argc, char* argv[]) {
         }
     } else {
         // Default behavior when no argument is provided
-        std::cout << "No argument provided. Executing routingtodmap by default..." << std::endl;
-        routingtodmap();
+        // std::cout << "No argument provided. Executing routingtodmap by default..." << std::endl;
+        // routingtodmap();
+        std::cout << "Executing routingtodfschedule... and hw" << std::endl;
+        routingtodfschedule();
+        routingtoroutinghw();
     }
     return 0;
 

@@ -14,6 +14,7 @@
 #define HW_GEN XAIE_DEV_GEN_AIE2PS
 #endif
 
+extern void routing();
 // Device layout declare: config and instance (reference: aieml_perf.cc lines 292-300)
 static XAie_SetupConfig(g_Config, HW_GEN, XAIE_BASE_ADDR, XAIE_COL_SHIFT, XAIE_ROW_SHIFT,
                         XAIE_NUM_COLS, XAIE_NUM_ROWS, XAIE_SHIM_ROW,
@@ -41,6 +42,17 @@ static XAie_LocType s_kernel_tiles[4];
 extern unsigned char _binary_kernel_dskernel_receiver_start[];
 extern unsigned char _binary_kernel_dskernel_receiver_end[];
 extern unsigned int _binary_kernel_dskernel_receiver_size;
+
+XAie_DevInst *getOrCreateDeviceInstance() {
+    if (g_DevInst == NULL) {
+        AieRC RC = __Runtime_device_init();
+        if (RC != XAIE_OK) {
+            printf("[aie_runtime] getOrCreateDeviceInstance failed: %d\n", (int)RC);
+            return NULL;
+        }
+    }
+    return g_DevInst;
+}
 
 /**
  * Initialize device: config, backend, NPI (if gen>=2), partition (reference: aieml_perf.cc lines 316-344)
@@ -302,6 +314,7 @@ static void __Runtime_auto_init(void) {
         return;
     }
     __Runtime_routing_init();
+    routing();
     printf("[aie_runtime] auto_init OK\n");
 }
 

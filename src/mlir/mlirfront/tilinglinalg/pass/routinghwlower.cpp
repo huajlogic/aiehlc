@@ -229,19 +229,16 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
        // /*
         auto packetType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_Packet");
 
-        auto spkt_idx = rewriter.create<emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(slave_pkt_idx));
-        auto spkt_type = rewriter.create<emitc::ConstantOp>(op->getLoc(),rewriter.getI32Type(), rewriter.getI32IntegerAttr(slave_pkt_type));
+        // Generate designated initializer: {.PktId=<id>, .PktType=<type>}
+        std::string slavePktStr =
+            "{.PktId=" + std::to_string(slave_pkt_idx) + ", .PktType=" + std::to_string(slave_pkt_type) + "}";
+        auto packetLocOp = rewriter.create<emitc::ConstantOp>(
+            op->getLoc(), packetType, emitc::OpaqueAttr::get(rewriter.getContext(), slavePktStr));
 
-        auto packetLocOp = rewriter.create<emitc::CallOp>(
-            op->getLoc(), "XAie_Packet", TypeRange{packetType}, 
-            ValueRange{spkt_idx, spkt_type});
-
-        auto dpkt_idx = rewriter.create<emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_pkt_idx));
-        auto dpkt_type = rewriter.create<emitc::ConstantOp>(op->getLoc(),rewriter.getI32Type(), rewriter.getI32IntegerAttr(dma_pkt_type));
- 
-        auto packetLocDMAOp = rewriter.create<emitc::CallOp>(
-            op->getLoc(), "XAie_Packet", TypeRange{packetType}, 
-            ValueRange{dpkt_idx, dpkt_type});
+        std::string dmaPktStr =
+            "{.PktId=" + std::to_string(dma_pkt_idx) + ", .PktType=" + std::to_string(dma_pkt_type) + "}";
+        auto packetLocDMAOp = rewriter.create<emitc::ConstantOp>(
+            op->getLoc(), packetType, emitc::OpaqueAttr::get(rewriter.getContext(), dmaPktStr));
 
         Value slaveport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
                                         mlir::emitc::OpaqueAttr::get(rewriter.getContext(), slaveportdirectionstr));
@@ -256,16 +253,20 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
         Value dmamask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0x1f));
         //receive pkt from neighbor
         if (PortDirectiontoString(PortDirection::NONE) != slaveportdirectionstr) {
-            auto callOpSPort = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
-                ValueRange{deviceInst, tileLocOp.getResult(0), slaveport,slaveidx, slaveslotnum, packetLocOp.getResult(0), mask, msel, abitr});
+            auto callOpSPort = rewriter.create<mlir::emitc::CallOp>(
+                op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS,
+                ValueRange{deviceInst, tileLocOp.getResult(0), slaveport, slaveidx, slaveslotnum,
+                           packetLocOp.getResult(), mask, msel, abitr});
         }
 
         if ( PortDirectiontoString(PortDirection::NONE) != dmadirectionstr) {
 
             Value dmaportn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_num));
             Value dmaportslotn = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(dma_port_slot_num));
-            auto callOpDMA = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS, 
-                    ValueRange{deviceInst, tileLocOp.getResult(0), dmaport,dmaportn, dmaportslotn, packetLocDMAOp.getResult(0), dmamask, msel, abitr});
+            auto callOpDMA = rewriter.create<mlir::emitc::CallOp>(
+                op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS,
+                ValueRange{deviceInst, tileLocOp.getResult(0), dmaport, dmaportn, dmaportslotn,
+                           packetLocDMAOp.getResult(), dmamask, msel, abitr});
         }
           
         //*///*
@@ -618,7 +619,6 @@ void declareAieTileFunction(mlir::ModuleOp module) {
 
   //auto funcType = mlir::FunctionType::get(context, argTypes, {xaieLocType});
   mlir::FunctionType funcType = builder.getFunctionType({i32Type, i32Type}, {xaieLocType});
-  mlir::FunctionType packetType = builder.getFunctionType({i32Type, i32Type}, {xaiepacket});
   mlir::FunctionType getdevInstType = builder.getFunctionType({}, {devInstPtrType});
   mlir::FunctionType shimportenableType = builder.getFunctionType({devInstPtrType, xaieLocType, i32Type}, {i32Type});
   mlir::FunctionType tileconnectType = builder.getFunctionType({devInstPtrType, xaieLocType, stringType,i32Type,stringType,i32Type}, {i32Type});
@@ -629,9 +629,6 @@ void declareAieTileFunction(mlir::ModuleOp module) {
 
   auto decl1 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_TileLoc", funcType);
   decl1.setVisibility(SymbolTable::Visibility::Private);
-
-  auto decl11 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_Packet", packetType);
-  decl11.setVisibility(SymbolTable::Visibility::Private);
 
   auto decl2 = builder.create<emitc::FuncOp>(module.getLoc(), "getOrCreateDeviceInstance", getdevInstType);
   decl2.setVisibility(SymbolTable::Visibility::Private);
