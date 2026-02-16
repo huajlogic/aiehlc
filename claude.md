@@ -1,0 +1,140 @@
+# AIEHLC Project Architecture
+
+AIEHLC (AIE High-Level Compiler) is a compilation/deployment solution for AMD Versal AI Engine. It has **two parts**:
+
+1. **aiehlc** — Clang-based tool that compiles C++ (AIE driver C API) into host + kernel binaries for single-kernel AIE apps.
+2. **tilinglinalg** — MLIR progressive lowering pipeline that offloads a GEMM operation across multiple AIE tiles, generating host, kernel, and routing C++ code through 6 custom dialects.
+
+Both share the AIE runtime (`include/aie_runtime.h`) and target Versal AI Core Series with pre-built PDI.
+
+## Directory Layout
+
+```
+aiehlc/
+├── include/                   # aie_runtime.h, aie_device_map.h
+├── src/
+│   ├── llvm/aiehlc.cc         # Main aiehlc Clang tool
+│   └── mlir/
+│       ├── runtime/aie_runtime.c  # Runtime wrappers over XAie_* APIs
+│       └── mlirfront/
+│           ├── AieFrontEnd.cc     # Clang AST → MLIR
+│           ├── AieDialect.cc      # AIE dialect (LoadKernel, etc.)
+│           └── tilinglinalg/      # ★ Multi-tile GEMM pipeline
+│               ├── routing/       # Abstract routing dialect
+│               ├── routinghw/     # Physical routing dialect
+│               ├── dataflowmap/   # dmap, dmaphop, dfscheblueprint, dfschedule dialects
+│               └── pass/          # All lowering passes + unitest/
+├── script/                    # setup.sh, aiehlc.sh, kc.sh, test/apppaltest.py
+├── example/                   # AIE examples (perf, matmul, multi-kernel)
+└── thirdparty/alib/           # XAie driver (excluded from this doc)
+```
+
+## Part 1: aiehlc (Single Kernel)
+
+Compiles a user C++ file into a host ELF (ARM) + kernel ELF (AIE core):
+
+```
+User C++ → aiehlc (Clang AST) → AieFrontEnd (MLIR)
+  → Kernel: xchesscc → xchessmk → kernel ELF (embedded in host via ld -r -b binary)
+  → Host: aarch64-g++ (host.cc + aie_runtime.c + routing + kernel.o) → host ELF
+```
+
+Key runtime API: `__Runtime_device_init`, `__Runtime_load_kernel_group`, `__Runtime_launch_kernel_group`, `__Runtime_dma_bd_config`, `__Runtime_wait_event`, `__Runtime_device_teardown`.
+
+Platforms: baremetal (`aarch64-none-elf-g++`) or Linux (`aarch64-linux-gnu-g++`).
+
+## Part 2: tilinglinalg (Multi-Tile GEMM)
+
+### Six Custom MLIR Dialects
+
+| Dialect | Purpose |
+|---------|---------|
+| **routing** | Abstract tile arrays, data IO, broadcast, mesh partitioning |
+| **routinghw** | Physical tiles, stream switch ports, packet flows |
+| **dmap** | Logical dataflow: ports, streams, push/pull |
+| **dmaphop** | Physical hops: tile-to-tile paths, DMA, buffers |
+| **dfscheblueprint** | Schedule blueprint: transfer manifests, flow configs |
+| **dfschedule** | Executable schedule: DMA BD, kernel launch, locks |
+
+### Pass Pipeline
+
+**Shared stages** (produces dfscheblueprint IR, then module is cloned):
+
+1. `RoutingUnrollingLowerPass` — unroll abstract routing into per-tile ops
+2. `RoutingToDmapPass` — routing → logical dataflow
+3. `DmapToDmaphopPass` — logical → physical hops
+4. `DmaphopTodfscheblueprintPass` — hops → schedule blueprints
+
+**Host path** → `host.cc`:
+
+5. `BlueprintToSchedulePass` → `ScheduleCanonicalizePass` → `DfscheduleToApiPass` → `RoutingConstantFoldPass` → `CanonicalizerPass` → EmitC → `host.cc`
+
+**Kernel path** → `kernel.cc`:
+
+5. `BlueprintToScheduleKernelPass` → `DfscheduleToKernelApiPass` → EmitC → `kernel.cc`
+
+**Routing path** (alternative, Path A) → `routing.cc`:
+
+1. `RoutingUnrollingLowerPass` → `RoutingLowerPass` → `RoutingHWLowerPass` → `RoutingDeadArgPass` → `RoutingConstantFoldPass` → `CanonicalizerPass` → EmitC → `routing.cc`
+
+### Routing Implementation (`pass/routingimplement/`)
+
+- **RoutingTopology**: Gen2 AIE tile topology model
+- **RoutingPath**: BFS path finding (priority: Memory > SHIM > Core)
+- **ResourceManager**: Tracks link/port usage to avoid conflicts
+
+## Build
+
+```bash
+# Main aiehlc binary
+mkdir build && cd build && cmake .. -DLLVM_INSTALL_DIR=/path/to/llvm/build && make -j$(nproc)
+
+# TilingLinalg unitest (standalone)
+cd src/mlir/mlirfront/tilinglinalg/pass/unitest && mkdir -p build && cd build && cmake .. && make -j4
+```
+
+Each dialect has `td/` (TableGen), `gen.sh` (runs mlir-tblgen), and `inc/` (generated .inc files).
+
+## Test and Verification
+
+### Unitest CLI (`pass/unitest/test.cpp`)
+
+```bash
+./test dfschedule    # Full pipeline → host.cc + kernel.cc
+./test hw            # Routing path → routing.cc
+./test test          # Path contiguity verification
+./test               # Default: runs both dfschedule and hw
+```
+
+### End-to-End Flow
+
+```
+1. Generate    cd unitest/build && ./test dfschedule     → worklocal/{host,kernel}.cc
+2. Kernel      cd worklocal && source compile_kernel.sh  → build/kernel (ELF)
+3. Host        cd worklocal && source hostcompile.sh     → build/host (ELF)
+4. HW run      python3 script/test/apppaltest.py build/host  → SSH+xsdb+console
+5. Verify      script/test/verify_host.sh → pass: "device_teardown done", fail: "AIE ERROR"
+```
+
+`piplinerun.sh` automates steps 1-4.
+
+### Per-Dialect Unit Tests
+
+Each dialect has its own `unitest/` directory with independent CMake build:
+- `routing/unitest/`, `routinghw/unitest/`
+- `dataflowmap/{dmap,dmaphop,dfschedule,dfscheblueprint}/unitest/`
+- `pass/routingimplement/{routing,hw}/unitest/`
+
+## Key Terms
+
+| Term | Definition |
+|------|------------|
+| **PDI** | Pre-built hardware design; decouples HW/SW development |
+| **GMIO** | Global Memory I/O; DDR ↔ AIE via NoC |
+| **Shim tile** | Row-0 tile bridging NoC/DDR and AIE array |
+| **MemTile** | Large-memory tile for caching between DDR and compute tiles |
+| **BD** | Buffer Descriptor; configures a DMA transfer |
+| **DSKernel** | Data-streaming kernel (receives via DMA, computes, outputs via DMA) |
+| **EmitC** | MLIR dialect for C/C++ emission; final stage before `translateToCpp` |
+| **xchesscc** | Synopsys compiler for AIE cores (from Vitis) |
+| **PAL** | Board environment for running ELFs on real AIE hardware |
