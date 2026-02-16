@@ -27,7 +27,7 @@ popd
 
 echo "=== Step 3: Run unitest (generate host.cc + kernel.cc) ==="
 pushd ./build/
-./test dfschedule
+./test
 popd
 
 echo "=== Step 4: Compile host + kernel (hostcompile.sh) ==="
@@ -40,4 +40,3 @@ source ~/palmtest/envlocal.sh
 apppaltest.py ./worklocal/build/host
 
 echo "=== Pipeline completed successfully ==="
-

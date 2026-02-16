@@ -437,6 +437,7 @@ source piplinerun.sh
 | 1 | `source script/setup.sh --path-set-only` + `source script/aiehlc.sh --aielib-only --aie-version 5` |
 | 2 | `mkdir -p build` → `cmake ..` → `make -j4` |
 | 3 | `./test dfschedule` → `host.cc`, `kernel.cc` |
+| 3b | **Codegen validation**: grep generated files for `XAie_*` / `__Runtime_*` API calls. If none found, clean files, rebuild, and retry (up to 3 attempts). Exits with error if all retries fail. |
 | 4 | `cd worklocal/` → `source hostcompile.sh` → `build/host` |
 | 5 | `source envlocal.sh` → `apppaltest.py ./worklocal/build/host` |
 
