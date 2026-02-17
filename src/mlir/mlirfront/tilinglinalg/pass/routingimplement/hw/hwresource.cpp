@@ -108,78 +108,70 @@ template<> struct GenTraits<2>
 
     static const std::map<TileType, std::vector<PortTemplate>>& defaultPortTemplates() {
         static const std::map<TileType, std::vector<PortTemplate>> templates = {
-            { TileType::Core, {
-                { PortDirection::North, PortRole::Master, 4 },
-                { PortDirection::South, PortRole::Master, 4 },
-                { PortDirection::East, PortRole::Master, 4 },
-                { PortDirection::West, PortRole::Master, 4 },
-                { PortDirection::DMA, PortRole::Master, 4 },
-                { PortDirection::North, PortRole::Slave, 4 },
-                { PortDirection::South, PortRole::Slave, 4 },
-                { PortDirection::East, PortRole::Slave, 4 },
-                { PortDirection::West, PortRole::Slave, 4 },
-                { PortDirection::DMA, PortRole::Slave, 4 }
-              }
-            },
-            { TileType::Shim, {
-                { PortDirection::North, PortRole::Master, 4 },
-                { PortDirection::South, PortRole::Master, 2 , {2, 3} },//mux
-                { PortDirection::East, PortRole::Master, 4 },
-                { PortDirection::West, PortRole::Master, 4 },
-                { PortDirection::DMA, PortRole::Master, 4 },
-                { PortDirection::North, PortRole::Slave, 4 },
-                { PortDirection::South, PortRole::Slave, 2 , {3, 7} },//demux
-                { PortDirection::East, PortRole::Slave, 4 },
-                { PortDirection::West, PortRole::Slave, 4 },
-                { PortDirection::DMA, PortRole::Slave, 4 }
-              }
-            },
-            { TileType::Mem, {
-                { PortDirection::North, PortRole::Master, 4 },
-                { PortDirection::South, PortRole::Master, 4 },
-                { PortDirection::East, PortRole::Master, 4 },
-                { PortDirection::West, PortRole::Master, 4 },
-                { PortDirection::DMA, PortRole::Master, 4 },
-                { PortDirection::North, PortRole::Slave, 4 },
-                { PortDirection::South, PortRole::Slave, 4 },
-                { PortDirection::East, PortRole::Slave, 4 },
-                { PortDirection::West, PortRole::Slave, 4 },
-                { PortDirection::DMA, PortRole::Slave, 4 }
-              }
-            },
-            { TileType::NocShim, {
-                { PortDirection::North, PortRole::Master, 4 },
-                { PortDirection::South, PortRole::Master, 4 },
-                { PortDirection::East, PortRole::Master, 4 },
-                { PortDirection::West, PortRole::Master, 4 },
-                { PortDirection::DMA, PortRole::Master, 4 },
-                { PortDirection::North, PortRole::Slave, 4 },
-                { PortDirection::South, PortRole::Slave, 4 },
-                { PortDirection::East, PortRole::Slave, 4 },
-                { PortDirection::West, PortRole::Slave, 4 },
-                { PortDirection::DMA, PortRole::Slave, 4 }
-              }
-            }
-        };
+            {TileType::Core,
+             {{PortDirection::North, PortRole::Master, 4},
+              {PortDirection::South, PortRole::Master, 4},
+              {PortDirection::East, PortRole::Master, 4},
+              {PortDirection::West, PortRole::Master, 4},
+              {PortDirection::DMA, PortRole::Master, 4},
+              {PortDirection::North, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 4},
+              {PortDirection::East, PortRole::Slave, 4},
+              {PortDirection::West, PortRole::Slave, 4},
+              {PortDirection::DMA, PortRole::Slave, 4}}},
+            {TileType::Shim,
+             {{PortDirection::North, PortRole::Master, 4},
+              {PortDirection::South, PortRole::Master, 2, {1, 3}}, // mux - AIE2PS uses ports 1,3 (not 2,3)
+              {PortDirection::East, PortRole::Master, 4},
+              {PortDirection::West, PortRole::Master, 4},
+              {PortDirection::DMA, PortRole::Master, 4},
+              {PortDirection::North, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 2, {1, 3}}, // demux - AIE2PS uses ports 1,3 (not 3,7)
+              {PortDirection::East, PortRole::Slave, 4},
+              {PortDirection::West, PortRole::Slave, 4},
+              {PortDirection::DMA, PortRole::Slave, 4}}},
+            {TileType::Mem,
+             {{PortDirection::North, PortRole::Master, 4},
+              {PortDirection::South, PortRole::Master, 4},
+              {PortDirection::East, PortRole::Master, 4},
+              {PortDirection::West, PortRole::Master, 4},
+              {PortDirection::DMA, PortRole::Master, 4},
+              {PortDirection::North, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 4},
+              {PortDirection::East, PortRole::Slave, 4},
+              {PortDirection::West, PortRole::Slave, 4},
+              {PortDirection::DMA, PortRole::Slave, 4}}},
+            {TileType::NocShim,
+             {{PortDirection::North, PortRole::Master, 4},
+              {PortDirection::South, PortRole::Master, 4},
+              {PortDirection::East, PortRole::Master, 4},
+              {PortDirection::West, PortRole::Master, 4},
+              {PortDirection::DMA, PortRole::Master, 4},
+              {PortDirection::North, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 4},
+              {PortDirection::East, PortRole::Slave, 4},
+              {PortDirection::West, PortRole::Slave, 4},
+              {PortDirection::DMA, PortRole::Slave, 4}}}};
         return templates;
     }
     static const std::unordered_map<std::string, AIEDeviceLayout>& table()
     {
         static const std::unordered_map<std::string, AIEDeviceLayout> db = {
-            { "XCVE2802",
-              { 11, 38, 0x2000'0000000, 25, 20,
-                { 
-                  {0,0,TileType::Shim},
-                  {1,2,TileType::Mem},
-                  {3,11,TileType::Core},
-                } ,
-                {2, 3, 6, 7, 14, 15, 22, 23, 30, 31, 34, 35},//noc shim support
-                {3, 7},//mux
-                {2, 3},//demux
-                defaultPortTemplates()
-              } 
-            }
-        };
+            {"XCVE2802",
+             {11,
+              38,
+              0x2000'0000000,
+              25,
+              20,
+              {
+                  {0, 0, TileType::Shim},
+                  {1, 2, TileType::Mem},
+                  {3, 11, TileType::Core},
+              },
+              {2, 3, 6, 7, 14, 15, 22, 23, 30, 31, 34, 35}, // noc shim support
+              {1, 3},                                       // mux - AIE2PS
+              {1, 3},                                       // demux - AIE2PS
+              defaultPortTemplates()}}};
         return db;
     }
 };

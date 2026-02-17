@@ -679,39 +679,39 @@ void routingtoroutinghw(mlir::ModuleOp module1 = nullptr) {
     RoutingTopology rtopology("Gen2");
     
     options.label = "Before RoutingUnrollingLowerPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
+    // pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
     options.label = "After RoutingUnrollingLowerPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
+    // pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingLowerPass>(rtopology));
     options.label = "After RoutingLowerPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
+    // pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
     options.label = "After RoutingHWLowerPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    //remove dead arg
+    // pm.addPass(mlir::createPrintIRPass(options));
+    // remove dead arg
     pm.addPass(std::make_unique<RoutingDeadArgPass>());
     options.label = "After RoutingDeadArgPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    //The constanfold change emitc.call into emic.call_opaque to convert 
+    // pm.addPass(mlir::createPrintIRPass(options));
+    // The constanfold change emitc.call into emic.call_opaque to convert
     /*
     XAie_LocType v251 = XAie_TileLoc(v1, v10);
     XAie_DevInst* v252 = getOrCreateDeviceInstance();
     int32_t v253 = XAie_StrmConnCctEnable(v252, v251, v6, v13, v5, v12);
     */
-    //into
+    // into
     /*
-    int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0); 
+    int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0);
     */
     pm.addPass(std::make_unique<RoutingConstantFoldPass>());
 
     options.label = "After RoutingConstantFoldPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    //remove the dead code
+    // pm.addPass(mlir::createPrintIRPass(options));
+    // remove the dead code
     pm.addPass(mlir::createCanonicalizerPass());
 
     options.label = "After createCanonicalizerPasse:";
-    pm.addPass(mlir::createPrintIRPass(options));
+    // pm.addPass(mlir::createPrintIRPass(options));
 
     //remove dead arg
     //pm.addPass(mlir::createConvertSCFToEmitCPass());
@@ -739,7 +739,7 @@ void routingtoroutinghw(mlir::ModuleOp module1 = nullptr) {
     }
 
     // Convert routing module to C++ and write to routing.cc
-    std::string routingPath = worklocalDir + "/routing.cc";
+    std::string routingPath = worklocalDir + "/routing_hw.cc";
     std::error_code routingEC;
     llvm::raw_fd_ostream routingStream(routingPath, routingEC, llvm::sys::fs::OF_None);
     if (routingEC) {
@@ -771,7 +771,7 @@ void routingtodmap() {
     ctx.getOrLoadDialect<arith::ArithDialect>();
     
     //auto module1 = mtest.createroutingfunc(&ctx,1);
-    auto module1 = mtest.ops_testNew(&ctx,1);
+    auto module1 = mtest.ops_testNew(&ctx, 1, "routing");
     module1.dump();
     //auto module2 = mtesthw.ops_test(&ctx);
     std::cout << "main" <<std::endl;
@@ -797,7 +797,7 @@ void routingtodmap() {
     pm.addPass(mlir::createPrintIRPass(options));
     pm.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
     options.label = "After RoutingHWLowerPass:";
-    //pm.addPass(mlir::createPrintIRPass(options));
+    pm.addPass(mlir::createPrintIRPass(options));
     //remove dead arg
     pm.addPass(std::make_unique<RoutingDeadArgPass>());
     
@@ -820,19 +820,35 @@ void routingtodmap() {
     (void)pm.run(module1);
 
     llvm::outs() << "----------module1.dump---------\n";
-    //module1.dump();
-/*
-    mlir::PassManager pm2(&ctx);;
-    pm2.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
-    (void)pm2.run(module1);
-    module1.dump();
-  */
-//conver emitc into c code  
-    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, llvm::outs());
-    if (failed(result)) {
-        llvm::errs() << "Failed to translate MLIR to C++.\n";
+
+    // Resolve worklocal directory relative to the build directory
+    llvm::SmallString<256> cwdPath;
+    if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
+        llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
         return;
     }
+    const std::string worklocalDir = (cwdPath + "/../worklocal").str();
+    if (std::error_code EC = llvm::sys::fs::create_directories(worklocalDir)) {
+        llvm::errs() << "Failed to create directory " << worklocalDir << ": " << EC.message() << "\n";
+        return;
+    }
+
+    // Convert routing module to C++ and write to routing.cc
+    std::string routingPath = worklocalDir + "/routing.cc";
+    std::error_code routingEC;
+    llvm::raw_fd_ostream routingStream(routingPath, routingEC, llvm::sys::fs::OF_None);
+    if (routingEC) {
+        llvm::errs() << "Failed to open " << routingPath << ": " << routingEC.message() << "\n";
+        return;
+    }
+    std::cout << "\n=== Generated C++ Code (routing) ===" << std::endl;
+    mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, routingStream);
+    routingStream.close();
+    if (failed(result)) {
+        llvm::errs() << "Failed to translate routing MLIR to C++.\n";
+        return;
+    }
+    std::cout << "Routing code written to " << routingPath << std::endl;
     return;
 }
 
@@ -869,7 +885,7 @@ void routingtodfschedule() {
     // Stage 1: Unroll routing operations
     options.label = "After RoutingUnrollingLowerPass:";
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
-    pm.addPass(mlir::createPrintIRPass(options));
+    // pm.addPass(mlir::createPrintIRPass(options));
 
     // Stage 2: Convert routing to dmap
     pm.addPass(std::make_unique<RoutingToDmapPass>(rtopology));
@@ -1015,9 +1031,11 @@ int main(int argc, char* argv[]) {
         } else if (arg == "dfschedule") {
             std::cout << "Executing routingtodfschedule..." << std::endl;
             routingtodfschedule();
-        } else {
+        } else if (arg == "dmaphw") {
             std::cout << "Executing routingtodmap..." << std::endl;
             routingtodmap();
+        } else {
+            std::cout << "Invalid argument. Please use hw, test, dfschedule, dmaphw" << std::endl;
         }
     } else {
         // Default behavior when no argument is provided
@@ -1025,7 +1043,7 @@ int main(int argc, char* argv[]) {
         // routingtodmap();
         std::cout << "Executing routingtodfschedule... and hw" << std::endl;
         routingtodfschedule();
-        routingtoroutinghw();
+        routingtodmap();
     }
     return 0;
 

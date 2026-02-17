@@ -129,6 +129,7 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 
 - **[doc/aieapi.md](doc/aieapi.md)** — XAie driver API guide covering: simple single-tile flow (`aieml_perf.cc`), multi-tile manual routing/DMA/locks (`aie_control.cpp`), and production XAie call patterns from `common_layer/aeg_runtime_api.cpp` (transaction batching, broadcast core enable, BD recycling, ping-pong RTP, advanced DMA config)
 - **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: all 6 custom dialects (ops, types, attrs), 15 pass transformations, routing engine internals, and complete test/build/HW-run/verification flow including remote board login
+- **[doc/lowering.md](doc/lowering.md)** — Concrete IR lowering trace: walks a 2x2 mesh / 16x16 tensor through every dialect stage (routing→dmap→dmaphop→blueprint→dfschedule→EmitC and routing→routinghw→EmitC) with actual IR snippets, op-to-API mapping tables, tile/lock/BD allocation, and data partitioning breakdown
 
 ## Key Terms
 

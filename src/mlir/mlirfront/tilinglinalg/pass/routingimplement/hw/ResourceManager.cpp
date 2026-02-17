@@ -133,7 +133,9 @@ std::shared_ptr<DataIO> ResourceMgr::createDataIO(IOType tp, int r, int c, DMADI
         RoutingTile& t = tile(r, c);
         auto portidx = t.occupyport(tp,PortDirection::South, dataioptr->id());
         if (portidx) {
-            uint32_t portnum = t.getPortnumFromPortIdx(PortDirection::South, (tp == IOType::Input) ? PortRole::Slave : PortRole::Master, *portidx);
+            // Must match the bank selection in occupyport: Input uses Master, Output uses Slave
+            uint32_t portnum = t.getPortnumFromPortIdx(
+                PortDirection::South, (tp == IOType::Input) ? PortRole::Master : PortRole::Slave, *portidx);
             auto shimport = std::make_optional<ShimIOPort>(tp,PortDirection::South,  portnum);
             dataioptr->setshimport(shimport);
         }
