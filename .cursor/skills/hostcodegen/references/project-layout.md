@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: MIT -->
+
 # Project layout (paths from repo root)
 
 Use these paths when generating, compiling, or running host code. Resolve from repo root so they work from any cwd.

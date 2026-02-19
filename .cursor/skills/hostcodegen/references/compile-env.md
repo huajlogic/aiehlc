@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: MIT -->
+
 # Compile environment and hostcompile.sh
 
 ## Setup

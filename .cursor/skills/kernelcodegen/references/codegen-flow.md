@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: MIT -->
+
 # Kernel code generation flow
 
 Code flow that produces `worklocal/kernel.cc`. Entry: unitest `./test dfschedule` (function `routingtodfschedule()` in `src/mlir/mlirfront/tilinglinalg/pass/unitest/test.cpp`).

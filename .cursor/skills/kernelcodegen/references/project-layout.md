@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: MIT -->
+
 # Project layout (kernel paths from repo root)
 
 Paths for generating and compiling AIE kernel code. Resolve from repo root.

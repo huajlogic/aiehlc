@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: MIT -->
+
 # XAie API Validation Rules (AIEML)
 
 Pre-extracted constraint tables from the XAie driver source so the agent can verify generated code without re-reading the driver each time. Target device: **AIE-ML** (Versal AI Core series).

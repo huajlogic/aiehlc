@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+     SPDX-License-Identifier: MIT -->
+
 # Kernel testing (bypass for now)
 
 Kernel-on-HW testing is **bypassed** in the current kernelcodegen workflow.
