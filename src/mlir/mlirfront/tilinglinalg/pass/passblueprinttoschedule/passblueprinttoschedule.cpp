@@ -176,6 +176,10 @@ static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolR
     return lookupSymbolOp<dfscheblueprint::FlowConfigOp>(rootOp, target);
 }
 
+static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRefAttr target) {
+    return lookupSymbolOp<dfscheblueprint::DataSliceOp>(rootOp, target);
+}
+
 // Pattern to convert dfscheblueprint::FlowTransferOp to dfschedule operations
 // Logic:
 // 1. Find shim tile from the "from" and "to" FlowConfigOps by checking type="shim"
@@ -337,16 +341,22 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             rewriter.getI32IntegerAttr(shimChannel),          // channel
             rewriter.getStringAttr(dmaDirection),             // direction (MM2S or S2MM)
             rewriter.getStringAttr(ioOperation));             // io_operation (SEND or RECV)
-        
-        // --- CORE TILES (no DMA config, just declaretile and kernel_config) ---
+
+        // --- CORE TILES: declaretile, kernel_config, and ping-pong DMA config ---
         ArrayAttr coreTilesAttr = coreTileGroup.getTiles();
         SmallVector<Value> coreTiles;
-        
-        // Get DMA channel from core FlowConfig for packet ops
+
+        // Get DMA channel and direction from core FlowConfig
         auto coreDmaAttr = coreFlowConfig.getDma();
         auto coreDmaChannels = coreDmaAttr.getChannels();
         int64_t coreChannel = coreDmaChannels.empty() ? 0 : coreDmaChannels[0];
-        
+        auto coreDmaDir = coreDmaAttr.getDirection();
+        StringRef coreDmaDirection = (coreDmaDir == dfscheblueprint::bp_direction::MM2S) ? "MM2S" : "S2MM";
+        StringRef coreIoOperation = (coreDmaDir == dfscheblueprint::bp_direction::MM2S) ? "SEND" : "RECV";
+
+        // Get per-tile data slices from core FlowConfig's slice_symbols
+        auto sliceSymbolsOpt = coreFlowConfig.getSliceSymbols();
+
         // Collect tile config dictionaries for kernel_config
         SmallVector<Attribute> tileConfigDicts;
         int tileIndex = 0;
@@ -373,46 +383,107 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             int64_t elementSizeBytes = 1;
             if (auto memrefType = memrefValue.getType().dyn_cast<MemRefType>()) {
                 for (auto dim : memrefType.getShape()) {
-                    if (dim > 0) {  // Skip dynamic dimensions
+                    if (dim > 0) {
                         bufferSize *= dim;
                     }
                 }
-                // Multiply by element size in bytes
                 elementSizeBytes = memrefType.getElementTypeBitWidth() / 8;
                 bufferSize *= elementSizeBytes;
             }
-            
-            // Calculate buffer offset for this tile (assuming data is partitioned evenly)
-            // For ping-pong mode, we need 2x the per-tile buffer size
+
             int64_t perTileSize = bufferSize / coreTilesAttr.size();
             int64_t bufferOffset = tileIndex * perTileSize;
-            
-            // Build config dictionary for this tile with per-flow configuration
-            // The config is structured to support multiple flows, indexed by flow_index
+
+            // Lock IDs: both ping and pong BDs share the same acquire/release pair
+            int64_t lockBase = flowIndex * 8 + tileIndex * 2;
+            int32_t acquireLockId = lockBase + 0;
+            int32_t releaseLockId = lockBase + 1;
+
+            // Build config dictionary for this tile
             NamedAttrList configAttrs;
             configAttrs.append("tile_index", rewriter.getI32IntegerAttr(tileIndex));
-            configAttrs.append("flow_index", rewriter.getI32IntegerAttr(flowIndex)); // Flow index for this configuration
-            configAttrs.append("packet_id", rewriter.getI32IntegerAttr(basePacketId + tileIndex)); // Packet ID based on base + tile
+            configAttrs.append("flow_index", rewriter.getI32IntegerAttr(flowIndex));
+            configAttrs.append("packet_id", rewriter.getI32IntegerAttr(basePacketId + tileIndex));
             configAttrs.append("dma_channel", rewriter.getI32IntegerAttr(coreChannel));
             configAttrs.append("buffer_mode", rewriter.getI32IntegerAttr(1)); // 1 = ping-pong
-            configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(2)); // 2 buffers
-            configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(perTileSize)); // Per-tile buffer size in bytes
-            configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(bufferOffset)); // Offset within shared buffer
-            configAttrs.append("element_size", rewriter.getI32IntegerAttr(elementSizeBytes)); // Element size in bytes
-            
-            // Lock IDs for ping-pong synchronization
-            // Each flow+tile combination gets unique lock IDs
-            // Lock ID = (flowIndex * maxTilesPerFlow * 4) + (tileIndex * 4) + lockType
-            int64_t lockBase = flowIndex * 16 + tileIndex * 4; // Assuming max 4 tiles per flow
-            configAttrs.append("ping_acquire_lock_id", rewriter.getI32IntegerAttr(lockBase + 0));
-            configAttrs.append("pong_acquire_lock_id", rewriter.getI32IntegerAttr(lockBase + 1));
-            configAttrs.append("ping_release_lock_id", rewriter.getI32IntegerAttr(lockBase + 2));
-            configAttrs.append("pong_release_lock_id", rewriter.getI32IntegerAttr(lockBase + 3));
-            
-            // Note: Actual buffer base address will be determined at runtime by __Runtime_load_kernel_group
-            // The runtime will use: tile_buffer_addr = base_addr + buffer_offset
-            
+            configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(2));
+            configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(perTileSize));
+            configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(bufferOffset));
+            configAttrs.append("element_size", rewriter.getI32IntegerAttr(elementSizeBytes));
+            configAttrs.append("acquire_lock_id", rewriter.getI32IntegerAttr(acquireLockId));
+            configAttrs.append("release_lock_id", rewriter.getI32IntegerAttr(releaseLockId));
+
             tileConfigDicts.push_back(rewriter.getDictionaryAttr(configAttrs));
+
+            // --- Core tile ping-pong DMA BD configuration ---
+            // Look up per-tile data slice from slice_symbols (maps 1:1 to tiles)
+            if (sliceSymbolsOpt && tileIndex < (int)sliceSymbolsOpt->size()) {
+                auto sliceSymRef = cast<SymbolRefAttr>((*sliceSymbolsOpt)[tileIndex]);
+                auto dataSliceOp = lookupDataSlice(op.getOperation(), sliceSymRef);
+                if (dataSliceOp) {
+                    Value perTileTensor = dataSliceOp.getTensorSlice();
+                    Type perTileType = perTileTensor.getType();
+
+                    // Create per-tile declaretensor -> memref
+                    int64_t perTileTotalSize = perTileSize / elementSizeBytes;
+                    MemRefType perTileMemrefType;
+                    if (auto tt = dyn_cast<RankedTensorType>(perTileType)) {
+                        int64_t totalElems = 1;
+                        for (int64_t d : tt.getShape())
+                            totalElems *= d;
+                        perTileMemrefType = MemRefType::get({totalElems}, tt.getElementType());
+                        perTileTotalSize = totalElems;
+                    } else {
+                        perTileMemrefType = MemRefType::get({perTileTotalSize}, memrefType.getElementType());
+                    }
+
+                    Value perTileMemref =
+                        rewriter.create<dfschedule::DeclareTensorOp>(loc, perTileMemrefType, perTileTensor);
+
+                    // Lock ID constants (shared by both ping and pong BDs)
+                    auto acqLockConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                           rewriter.getI32IntegerAttr(acquireLockId));
+                    auto relLockConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                           rewriter.getI32IntegerAttr(releaseLockId));
+
+                    // BD IDs: ping = tileIndex*2, pong = tileIndex*2+1
+                    int32_t pingBdId = tileIndex * 2;
+                    int32_t pongBdId = tileIndex * 2 + 1;
+
+                    // Ping BD: next_bd -> pong
+                    auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                            rewriter.getI32IntegerAttr(pingBdId));
+                    auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                        loc, dfschedule::BdHandleType::get(rewriter.getContext()), perTileMemref, coreTileOp.getTile(),
+                        pingBdIdConst.getResult(),
+                        rewriter.getI32IntegerAttr(0),                // offset
+                        rewriter.getI32IntegerAttr(perTileTotalSize), // len
+                        rewriter.getBoolAttr(true),                   // enable_packet
+                        rewriter.getI32IntegerAttr(basePacketId + tileIndex),
+                        rewriter.getI32IntegerAttr(pongBdId), // next_bd -> pong
+                        acqLockConst.getResult(), relLockConst.getResult());
+
+                    // Pong BD: next_bd -> ping
+                    auto pongBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                            rewriter.getI32IntegerAttr(pongBdId));
+                    rewriter.create<dfschedule::ConfigDmaBdOp>(
+                        loc, dfschedule::BdHandleType::get(rewriter.getContext()), perTileMemref, coreTileOp.getTile(),
+                        pongBdIdConst.getResult(),
+                        rewriter.getI32IntegerAttr(0),                // offset
+                        rewriter.getI32IntegerAttr(perTileTotalSize), // len
+                        rewriter.getBoolAttr(true),                   // enable_packet
+                        rewriter.getI32IntegerAttr(basePacketId + tileIndex),
+                        rewriter.getI32IntegerAttr(pingBdId), // next_bd -> ping
+                        acqLockConst.getResult(), relLockConst.getResult());
+
+                    // Create IO handle for core tile (references ping BD; DMA chains automatically)
+                    rewriter.create<dfschedule::ConfigCreateIoOp>(
+                        loc, dfschedule::IoHandleType::get(rewriter.getContext()), pingBdOp.getBdHandle(),
+                        coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
+                        rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation));
+                }
+            }
+
             tileIndex++;
         }
         
