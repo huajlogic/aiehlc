@@ -5,12 +5,16 @@
 Scan a routing.cc file and draw a per-block connection topology map.
 
 Usage:
-    python routing_topology.py <routing.cc> [-o output.png]
+    python routing_topology.py <routing.cc> [-o output.png] [--host host.cc]
 
 The script parses XAie stream-switch API calls, groups them by code block
 (identified by "round is N" comments or if-block boundaries), traces
 cross-tile connections, and renders an annotated grid diagram with
 color-coded paths per block.
+
+When --host is provided, DMA channel information (BD configs, channel
+assignments, lock/packet metadata) is parsed from the host file and
+annotated inside the tile boxes in the diagram.
 """
 
 import argparse
@@ -84,6 +88,28 @@ class ShimDmaPort:
     tile: tuple
     port_num: int
     direction: str  # "aie_to_shim" or "shim_to_aie"
+    line: int
+
+
+@dataclass
+class DmaBdConfig:
+    tile: tuple
+    bd_id: int
+    addr: int
+    length: int
+    next_bd: int          # -1 = no chaining
+    packet_id: int        # -1 = no packet header
+    acq_lock: tuple       # (lock_id, lock_val) or None
+    rel_lock: tuple       # (lock_id, lock_val) or None
+    line: int
+
+
+@dataclass
+class DmaChannel:
+    tile: tuple
+    channel_id: int
+    direction: str        # "S2MM" or "MM2S"
+    start_bd: int
     line: int
 
 
@@ -208,6 +234,280 @@ def parse_routing_file(filepath: str) -> list[Block]:
     return blocks
 
 
+def parse_host_file(filepath: str) -> tuple[list[DmaBdConfig], list[DmaChannel]]:
+    """Parse a host.cc (or aie_control.cpp) for DMA BD configs and channel assignments.
+
+    Supports two patterns:
+      A) Runtime wrappers: __Runtime_dma_bd_config / __Runtime_dma_createio_4
+         with structured comments (/* DMA BD Config: ... */, /* Create IO: ... */).
+      B) Raw XAie calls: XAie_DmaDescInit, XAie_DmaSetAddrLen, XAie_DmaSetLock,
+         XAie_DmaSetNextBd, XAie_DmaSetPkt, XAie_DmaWriteBd,
+         XAie_DmaChannelSetStartQueue / XAie_DmaChannelSetStartQueueGeneric.
+    """
+    with open(filepath) as f:
+        lines = f.readlines()
+
+    bds: list[DmaBdConfig] = []
+    channels: list[DmaChannel] = []
+
+    # Build a variable → tile lookup for resolving indirect tile references
+    # e.g. "XAie_LocType v11 = XAie_TileLoc(2, 0);"
+    var_tiles: dict[str, tuple] = {}
+
+    # --- State for raw-XAie BD accumulator (Pattern B) ---
+    cur_addr = 0
+    cur_len = 0
+    cur_next_bd = -1
+    cur_pkt_id = -1
+    cur_acq_lock = None
+    cur_rel_lock = None
+    cur_init_tile = None  # tile from XAie_DmaDescInit
+
+    def _reset_bd_accum():
+        nonlocal cur_addr, cur_len, cur_next_bd, cur_pkt_id
+        nonlocal cur_acq_lock, cur_rel_lock, cur_init_tile
+        cur_addr = 0
+        cur_len = 0
+        cur_next_bd = -1
+        cur_pkt_id = -1
+        cur_acq_lock = None
+        cur_rel_lock = None
+        cur_init_tile = None
+
+    def _resolve_tile(token: str) -> Optional[tuple]:
+        """Resolve a token to a (col, row) tuple."""
+        tile = parse_tile_loc(token)
+        if tile:
+            return tile
+        t = token.strip()
+        return var_tiles.get(t)
+
+    # Pending comment data for Pattern A
+    pending_bd_comment: dict = {}
+    pending_io_comment: dict = {}
+
+    for lineno_0, raw in enumerate(lines):
+        lineno = lineno_0 + 1
+        line = raw.strip()
+
+        # --- Variable → TileLoc mapping ---
+        m = re.search(r"(\w+)\s*=\s*(XAie_TileLoc\(\s*\d+\s*,\s*\d+\s*\))", line)
+        if m:
+            var_tiles[m.group(1)] = parse_tile_loc(m.group(2))
+
+        # ==================================================================
+        # Pattern A: Structured comments + runtime wrappers
+        # ==================================================================
+
+        # /* DMA BD Config: bd_id=N, offset=N, len=N, enable_packet=..., packet_id=N, next_bd=N */
+        m = re.search(
+            r"/\*\s*DMA BD Config:\s*bd_id=(\d+),\s*offset=\d+,\s*len=(\d+)"
+            r",\s*enable_packet=\w+,\s*packet_id=(\d+),\s*next_bd=(\d+)", line)
+        if m:
+            pending_bd_comment = {
+                "bd_id": int(m.group(1)),
+                "length": int(m.group(2)),
+                "packet_id": int(m.group(3)),
+                "next_bd": int(m.group(4)),
+                "line": lineno,
+            }
+            nb = pending_bd_comment["next_bd"]
+            if nb == 4294967295 or nb == 0xFFFFFFFF:
+                pending_bd_comment["next_bd"] = -1
+            continue
+
+        # /* Create IO: channel_id=N, bd_id=N, tile=(C,R), direction=S2MM */
+        m = re.search(
+            r"/\*\s*Create IO:\s*channel_id=(\d+),\s*bd_id=(\d+)"
+            r",\s*tile=\((\d+),\s*(\d+)\),\s*direction=(\w+)", line)
+        if m:
+            pending_io_comment = {
+                "channel_id": int(m.group(1)),
+                "bd_id": int(m.group(2)),
+                "tile": (int(m.group(3)), int(m.group(4))),
+                "direction": m.group(5),
+                "line": lineno,
+            }
+            continue
+
+        # __Runtime_dma_bd_config(dev, tile, buf, bd_id, offset, len, next_bd, enable_pkt, pkt_id)
+        m = re.search(
+            r"__Runtime_dma_bd_config\([^,]+,\s*(\w+)\s*,[^,]+,\s*(\d+)\s*,"
+            r"\s*\d+\s*,\s*(\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", line)
+        if m:
+            tile = _resolve_tile(m.group(1))
+            bd_id = int(m.group(2))
+            length = int(m.group(3))
+            next_bd_val = int(m.group(4))
+            pkt_id = int(m.group(6)) if int(m.group(5)) else -1
+            if next_bd_val < 0 or next_bd_val == 4294967295:
+                next_bd_val = -1
+            if pending_bd_comment and pending_bd_comment.get("bd_id") == bd_id:
+                length = pending_bd_comment.get("length", length)
+                pkt_id_c = pending_bd_comment.get("packet_id", -1)
+                if pkt_id == -1 and pkt_id_c >= 0:
+                    pkt_id = pkt_id_c
+                pending_bd_comment = {}
+            if tile:
+                bds.append(DmaBdConfig(
+                    tile=tile, bd_id=bd_id, addr=0, length=length,
+                    next_bd=next_bd_val, packet_id=pkt_id,
+                    acq_lock=None, rel_lock=None, line=lineno))
+            continue
+
+        # __Runtime_dma_createio_4(tile, dma_desc, channel_id, bd_id)
+        m = re.search(
+            r"__Runtime_dma_createio_4\(\s*(\w+)\s*,[^,]+,\s*(\d+)\s*,\s*(\d+)\s*\)", line)
+        if m:
+            tile = _resolve_tile(m.group(1))
+            ch_id = int(m.group(2))
+            bd_id = int(m.group(3))
+            direction = "S2MM"
+            if pending_io_comment and pending_io_comment.get("channel_id") == ch_id:
+                tile = pending_io_comment.get("tile", tile)
+                direction = pending_io_comment.get("direction", "S2MM")
+                pending_io_comment = {}
+            if tile:
+                channels.append(DmaChannel(
+                    tile=tile, channel_id=ch_id, direction=direction,
+                    start_bd=bd_id, line=lineno))
+            continue
+
+        # ==================================================================
+        # Pattern B: Raw XAie DMA calls
+        # ==================================================================
+
+        # XAie_DmaDescInit(&Dev, &Desc, XAie_TileLoc(C,R))
+        m = re.search(
+            r"XAie_DmaDescInit\([^,]+,\s*[^,]+,\s*(XAie_TileLoc\(\s*\d+\s*,\s*\d+\s*\))\s*\)",
+            line)
+        if m:
+            _reset_bd_accum()
+            cur_init_tile = parse_tile_loc(m.group(1))
+            continue
+
+        # XAie_DmaSetAddrLen(&Desc, addr, len)
+        m = re.search(r"XAie_DmaSetAddrLen\([^,]+,\s*(0x[\da-fA-F]+|\d+)\s*,\s*(\d+)\s*\)", line)
+        if m:
+            cur_addr = int(m.group(1), 0)
+            cur_len = int(m.group(2))
+            continue
+
+        # XAie_DmaSetLock(&Desc, XAie_LockInit(id, val), XAie_LockInit(id, val))
+        m = re.search(
+            r"XAie_DmaSetLock\([^,]+,\s*XAie_LockInit\(\s*(\d+)\s*,\s*(-?\d+)\s*\)\s*,"
+            r"\s*XAie_LockInit\(\s*(\d+)\s*,\s*(-?\d+)\s*\)\s*\)", line)
+        if m:
+            cur_acq_lock = (int(m.group(1)), int(m.group(2)))
+            cur_rel_lock = (int(m.group(3)), int(m.group(4)))
+            continue
+
+        # XAie_DmaSetNextBd(&Desc, next_bd, enable)
+        m = re.search(r"XAie_DmaSetNextBd\([^,]+,\s*(\d+)\s*,", line)
+        if m:
+            cur_next_bd = int(m.group(1))
+            continue
+
+        # XAie_DmaSetPkt(&Desc, {.PktId=N, ...})
+        m = re.search(r"XAie_DmaSetPkt\([^,]+,\s*\{[^}]*PktId\s*=\s*(\d+)", line)
+        if m:
+            cur_pkt_id = int(m.group(1))
+            continue
+
+        # XAie_DmaWriteBd(&Dev, &Desc, XAie_TileLoc(C,R), bd_num)
+        m = re.search(
+            r"XAie_DmaWriteBd\([^,]+,\s*[^,]+,\s*(XAie_TileLoc\(\s*\d+\s*,\s*\d+\s*\))\s*,"
+            r"\s*(\d+)\s*\)", line)
+        if m:
+            tile = parse_tile_loc(m.group(1)) or cur_init_tile
+            bd_id = int(m.group(2))
+            if tile:
+                bds.append(DmaBdConfig(
+                    tile=tile, bd_id=bd_id, addr=cur_addr, length=cur_len,
+                    next_bd=cur_next_bd, packet_id=cur_pkt_id,
+                    acq_lock=cur_acq_lock, rel_lock=cur_rel_lock,
+                    line=lineno))
+            _reset_bd_accum()
+            continue
+
+        # XAie_DmaChannelSetStartQueue(&Dev, TileLoc, ch, dir, bd, repeat, ...)
+        m = re.search(
+            r"XAie_DmaChannelSetStartQueue(?:Generic)?\([^,]+,\s*"
+            r"(XAie_TileLoc\(\s*\d+\s*,\s*\d+\s*\))\s*,"
+            r"\s*(\d+)\s*,\s*(DMA_\w+)\s*,\s*(\d+)", line)
+        if m:
+            tile = parse_tile_loc(m.group(1))
+            ch_id = int(m.group(2))
+            direction = "S2MM" if "S2MM" in m.group(3) else "MM2S"
+            start_bd = int(m.group(4))
+            if tile:
+                channels.append(DmaChannel(
+                    tile=tile, channel_id=ch_id, direction=direction,
+                    start_bd=start_bd, line=lineno))
+            continue
+
+    return bds, channels
+
+
+def _build_dma_tile_summary(
+    bds: list[DmaBdConfig], channels: list[DmaChannel]
+) -> dict[tuple, list[str]]:
+    """Group DMA BD/channel info by tile and produce per-tile annotation lines."""
+    bds_by_tile: dict[tuple, list[DmaBdConfig]] = defaultdict(list)
+    for bd in bds:
+        bds_by_tile[bd.tile].append(bd)
+
+    ch_by_tile: dict[tuple, list[DmaChannel]] = defaultdict(list)
+    for ch in channels:
+        ch_by_tile[ch.tile].append(ch)
+
+    all_tiles = set(bds_by_tile) | set(ch_by_tile)
+    result: dict[tuple, list[str]] = {}
+
+    for tile in sorted(all_tiles):
+        lines = []
+        bd_map = {bd.bd_id: bd for bd in bds_by_tile.get(tile, [])}
+        tile_channels = ch_by_tile.get(tile, [])
+
+        seen_bds = set()
+        for ch in sorted(tile_channels, key=lambda c: (c.direction, c.channel_id)):
+            chain = []
+            bd_id = ch.start_bd
+            while bd_id >= 0 and bd_id not in seen_bds:
+                seen_bds.add(bd_id)
+                chain.append(bd_id)
+                bd_cfg = bd_map.get(bd_id)
+                if bd_cfg and bd_cfg.next_bd >= 0:
+                    bd_id = bd_cfg.next_bd
+                else:
+                    break
+
+            bd_str = "->".join(f"BD{b}" for b in chain) if chain else f"BD{ch.start_bd}"
+            first_bd = bd_map.get(ch.start_bd)
+            extras = []
+            if first_bd:
+                extras.append(f"{first_bd.length}B")
+                if first_bd.packet_id >= 0:
+                    extras.append(f"pkt{first_bd.packet_id}")
+                if first_bd.acq_lock:
+                    extras.append(f"L{first_bd.acq_lock[0]}/{first_bd.rel_lock[0]}"
+                                  if first_bd.rel_lock else f"L{first_bd.acq_lock[0]}")
+            suffix = f" ({', '.join(extras)})" if extras else ""
+            lines.append(f"{ch.direction} ch{ch.channel_id}: {bd_str}{suffix}")
+
+        # BDs without a channel assignment
+        for bd in bds_by_tile.get(tile, []):
+            if bd.bd_id not in seen_bds:
+                extras = [f"{bd.length}B"]
+                if bd.packet_id >= 0:
+                    extras.append(f"pkt{bd.packet_id}")
+                lines.append(f"BD{bd.bd_id} ({', '.join(extras)})")
+
+        if lines:
+            result[tile] = lines
+    return result
+
+
 def resolve_pkt_internal_edges(block: Block):
     """Pair packet slave slots with master ports on the same tile via arbiter/msel."""
     edges = []
@@ -300,10 +600,14 @@ def collect_tiles(blocks: list[Block]) -> set:
     return tiles
 
 
-def draw_topology(blocks: list[Block], paths, tiles: set, output: str):
+def draw_topology(blocks: list[Block], paths, tiles: set, output: str,
+                  dma_tile_summary: Optional[dict] = None):
     if not tiles:
         print("No tiles found, nothing to draw.", file=sys.stderr)
         return
+
+    if dma_tile_summary is None:
+        dma_tile_summary = {}
 
     cols = sorted({t[0] for t in tiles})
     rows = sorted({t[1] for t in tiles})
@@ -313,7 +617,8 @@ def draw_topology(blocks: list[Block], paths, tiles: set, output: str):
     all_cols = list(range(min_col, max_col + 1))
     all_rows = list(range(min_row, max_row + 1))
 
-    cell_w, cell_h = 2.0, 1.4
+    cell_w = 2.0
+    cell_h = 1.8 if dma_tile_summary else 1.4
     pad_x, pad_y = 1.5, 1.0
     fig_w = len(all_cols) * cell_w + 2 * pad_x
     fig_h = len(all_rows) * cell_h + 2 * pad_y + 1.5
@@ -494,10 +799,31 @@ def draw_topology(blocks: list[Block], paths, tiles: set, output: str):
                 continue
             cx, cy = tile_centers[sd.tile]
             arrow = "▼" if sd.direction == "aie_to_shim" else "▲"
-            ax.text(cx, cy - cell_h * 0.28,
+            ax.text(cx, cy - cell_h * 0.20,
                     f"{arrow} ShimDMA:{sd.port_num}",
                     ha="center", va="center", fontsize=5.5,
                     color=color, fontweight="bold", zorder=6)
+
+    # --- DMA channel annotations inside tiles ---
+    for tile, dma_lines in dma_tile_summary.items():
+        if tile not in tile_centers:
+            continue
+        cx, cy = tile_centers[tile]
+        y_start = cy - cell_h * 0.15
+        for i, dl in enumerate(dma_lines[:3]):
+            y_pos = y_start - (i + 1) * cell_h * 0.12
+            dma_color = "#1565C0" if "MM2S" in dl else "#C62828"
+            ax.text(cx, y_pos, dl,
+                    ha="center", va="center", fontsize=4.2, color=dma_color,
+                    fontfamily="monospace",
+                    bbox=dict(boxstyle="round,pad=0.08", fc="white",
+                              ec="#BDBDBD", alpha=0.85, lw=0.4),
+                    zorder=7)
+        if len(dma_lines) > 3:
+            y_pos = y_start - 4 * cell_h * 0.12
+            ax.text(cx, y_pos, f"+{len(dma_lines) - 3} more",
+                    ha="center", va="center", fontsize=3.5, color="#888",
+                    zorder=7)
 
     legend_handles = []
     for bi, block in enumerate(blocks):
@@ -521,8 +847,9 @@ def draw_topology(blocks: list[Block], paths, tiles: set, output: str):
     print(f"Topology diagram saved to: {output}")
 
 
-def print_text_summary(blocks: list[Block], paths):
-    """Print a text summary of all blocks and traced paths."""
+def print_text_summary(blocks: list[Block], paths,
+                       dma_tile_summary: Optional[dict] = None):
+    """Print a text summary of all blocks, traced paths, and DMA channels."""
     for block in blocks:
         print(f"\n{'='*60}")
         print(f"  {block.name}")
@@ -564,6 +891,14 @@ def print_text_summary(blocks: list[Block], paths):
             prefix = "    └─► " if j == len(hops) - 1 else "    ├─► "
             print(f"{prefix}{h}")
 
+    if dma_tile_summary:
+        print(f"\n{'='*60}")
+        print(f"  DMA Channels (from host file)")
+        print(f"{'='*60}")
+        for tile in sorted(dma_tile_summary):
+            for dl in dma_tile_summary[tile]:
+                print(f"    tile({tile[0]},{tile[1]}) {dl}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -571,6 +906,8 @@ if __name__ == "__main__":
     parser.add_argument("input", help="Path to routing.cc")
     parser.add_argument("-o", "--output", default=None,
                         help="Output image path (default: <input>_topology.png)")
+    parser.add_argument("--host", default=None,
+                        help="Path to host.cc (or aie_control.cpp) for DMA channel info")
     parser.add_argument("--text-only", action="store_true",
                         help="Print text summary only, no diagram")
     args = parser.parse_args()
@@ -586,7 +923,14 @@ if __name__ == "__main__":
     tiles = collect_tiles(blocks)
     paths = trace_paths(blocks)
 
-    print_text_summary(blocks, paths)
+    dma_tile_summary = {}
+    if args.host:
+        dma_bds, dma_channels = parse_host_file(args.host)
+        dma_tile_summary = _build_dma_tile_summary(dma_bds, dma_channels)
+        for tile in dma_tile_summary:
+            tiles.add(tile)
+
+    print_text_summary(blocks, paths, dma_tile_summary)
 
     if not args.text_only:
-        draw_topology(blocks, paths, tiles, args.output)
+        draw_topology(blocks, paths, tiles, args.output, dma_tile_summary)
