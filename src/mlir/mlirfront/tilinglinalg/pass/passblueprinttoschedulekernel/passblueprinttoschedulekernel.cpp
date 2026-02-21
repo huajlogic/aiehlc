@@ -835,7 +835,7 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
     // target.addIllegalOp<dfscheblueprint::DeclareDataOp>();
     // target.addIllegalOp<dfscheblueprint::DataSliceOp>();
     target.addIllegalOp<dfscheblueprint::FlowTransferOp>();
-    target.addIllegalOp<dfscheblueprint::TransferManifestOp>();
+    // target.addIllegalOp<dfscheblueprint::TransferManifestOp>();
 
     // Type converter
     TypeConverter typeConverter;
@@ -857,7 +857,7 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
     patterns.add<EraseOpPattern<dfscheblueprint::FlowConfigOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::TileGroupOp>>(context);
     // patterns.add<EraseOpPattern<dfscheblueprint::DeclareDataOp>>(context);
-    patterns.add<EraseOpPattern<dfscheblueprint::TransferManifestOp>>(context);
+    // patterns.add<EraseOpPattern<dfscheblueprint::TransferManifestOp>>(context);
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();
