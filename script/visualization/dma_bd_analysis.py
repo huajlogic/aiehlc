@@ -30,6 +30,12 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 @dataclass
+class LockInfo:
+    lock_id: int
+    init_value: Optional[int] = None       # from XAie_LockSetValue
+    operate_value: Optional[int] = None    # from XAie_DmaSetLock acquire/release value
+
+@dataclass
 class BdConfig:
     var: str
     tile_var: str
@@ -42,6 +48,8 @@ class BdConfig:
     next_bd: int               # -1 means no chaining
     enable_packet: bool
     packet_id: int
+    acquire_lock_id: int = -1  # -1 means unset / no lock
+    release_lock_id: int = -1  # -1 means unset / no lock
 
 @dataclass
 class IoConfig:
@@ -67,6 +75,7 @@ class TileDmaInfo:
     tile_type: str  # "Shim", "Mem", "AIE"
     bds: List[BdConfig] = field(default_factory=list)
     ios: List[IoConfig] = field(default_factory=list)
+    locks: Dict[int, LockInfo] = field(default_factory=dict)  # lock_id -> LockInfo
 
 # ---------------------------------------------------------------------------
 # Parser
@@ -118,7 +127,52 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
             return f"{var}[{s.off0}:{s.off0+s.size0}, {s.off1}:{s.off1+s.size1}]"
         return var
 
-    # 4. Parse DMA BD configs
+    # 4. Parse lock IDs from DMA BD Config comments
+    #    Format: /* DMA BD Config: bd_id=X, ..., acquire_lock_id=Y, release_lock_id=Z */
+    bd_comment_locks: Dict[int, Tuple[int, int]] = {}  # positional index -> (acq, rel)
+    bd_comment_pattern = re.compile(
+        r"/\*\s*DMA BD Config:.*?"
+        r"acquire_lock_id=(-?\d+).*?"
+        r"release_lock_id=(-?\d+).*?\*/",
+        re.DOTALL,
+    )
+    bd_call_pattern = re.compile(
+        r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
+    )
+    for cm in bd_comment_pattern.finditer(text):
+        acq = int(cm.group(1))
+        rel = int(cm.group(2))
+        after = text[cm.end():]
+        call_m = bd_call_pattern.search(after)
+        if call_m:
+            bd_comment_locks[call_m.group(1)] = (acq, rel)
+
+    # 5. Parse XAie_LockSetValue calls for lock init values
+    #    XAie_LockSetValue(DevInst, tile, lock_id, value)
+    lock_init_map: Dict[Tuple[int, int], Dict[int, int]] = defaultdict(dict)
+    for m in re.finditer(
+        r"XAie_LockSetValue\(\s*\w+,\s*(\w+),\s*(\d+),\s*(-?\d+)\s*\)", text
+    ):
+        tvar = m.group(1)
+        loc = tile_map.get(tvar, (-1, -1))
+        lock_id = int(m.group(2))
+        init_val = int(m.group(3))
+        lock_init_map[loc][lock_id] = init_val
+
+    # 6. Parse XAie_DmaSetLock calls for lock operate values
+    #    XAie_DmaSetLock(&desc, XAie_LockInit(lock_id, value), XAie_LockInit(lock_id, value))
+    lock_operate_map: Dict[str, Tuple[int, int]] = {}  # bd_var -> (acq_val, rel_val)
+    for m in re.finditer(
+        r"XAie_DmaSetLock\(\s*&(\w+).*?"
+        r"XAie_LockInit\(\s*(-?\d+),\s*(-?\d+)\s*\).*?"
+        r"XAie_LockInit\(\s*(-?\d+),\s*(-?\d+)\s*\)",
+        text,
+        re.DOTALL,
+    ):
+        bd_var = m.group(1)
+        lock_operate_map[bd_var] = (int(m.group(3)), int(m.group(5)))
+
+    # 7. Parse DMA BD configs
     bd_map: Dict[str, BdConfig] = {}
     for m in re.finditer(
         r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
@@ -128,12 +182,19 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
     ):
         tile_var = m.group(3)
         buf_ptr = m.group(4)
+        bd_var = m.group(1)
         loc = tile_map.get(tile_var, (-1, -1))
         next_bd_raw = int(m.group(8))
         if next_bd_raw < 0 or next_bd_raw > 65535:
             next_bd_raw = -1
+
+        acq_lock = -1
+        rel_lock = -1
+        if bd_var in bd_comment_locks:
+            acq_lock, rel_lock = bd_comment_locks[bd_var]
+
         bd = BdConfig(
-            var=m.group(1),
+            var=bd_var,
             tile_var=tile_var,
             tile_loc=loc,
             buf_var=buf_ptr,
@@ -144,10 +205,12 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
             next_bd=next_bd_raw,
             enable_packet=int(m.group(9)) != 0,
             packet_id=int(m.group(10)),
+            acquire_lock_id=acq_lock,
+            release_lock_id=rel_lock,
         )
         bd_map[bd.var] = bd
 
-    # 5. Parse IO configs -- also extract direction from preceding comment
+    # 8. Parse IO configs -- also extract direction from preceding comment
     io_comment = re.compile(
         r"/\*\s*Create IO:.*?direction=(\w+)\s*\*/", re.DOTALL
     )
@@ -172,7 +235,7 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
                 direction=direction,
             ))
 
-    # 6. Assemble per-tile info
+    # 9. Assemble per-tile info
     tiles: Dict[Tuple[int, int], TileDmaInfo] = {}
     for bd in bd_map.values():
         loc = bd.tile_loc
@@ -188,11 +251,47 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
     for info in tiles.values():
         info.bds.sort(key=lambda b: b.bd_id)
 
+    # 10. Populate per-tile lock info from BD lock IDs and init/operate maps
+    for info in tiles.values():
+        loc = info.loc
+        for bd in info.bds:
+            for lid in (bd.acquire_lock_id, bd.release_lock_id):
+                if lid < 0:
+                    continue
+                if lid not in info.locks:
+                    info.locks[lid] = LockInfo(lock_id=lid)
+                lk = info.locks[lid]
+                if loc in lock_init_map and lid in lock_init_map[loc]:
+                    lk.init_value = lock_init_map[loc][lid]
+            if bd.var in lock_operate_map:
+                acq_val, rel_val = lock_operate_map[bd.var]
+                if bd.acquire_lock_id >= 0 and bd.acquire_lock_id in info.locks:
+                    info.locks[bd.acquire_lock_id].operate_value = acq_val
+                if bd.release_lock_id >= 0 and bd.release_lock_id in info.locks:
+                    info.locks[bd.release_lock_id].operate_value = rel_val
+
     return tiles
 
 # ---------------------------------------------------------------------------
 # Text output
 # ---------------------------------------------------------------------------
+
+def _lock_str(lock_id: int, locks: Dict[int, 'LockInfo']) -> str:
+    """Format a lock ID with its init and operate values."""
+    if lock_id < 0:
+        return "unset"
+    lk = locks.get(lock_id)
+    parts = [f"lock={lock_id}"]
+    if lk and lk.operate_value is not None:
+        parts.append(f"val={lk.operate_value}")
+    else:
+        parts.append("val=unset")
+    if lk and lk.init_value is not None:
+        parts.append(f"init={lk.init_value}")
+    else:
+        parts.append("init=unset")
+    return " ".join(parts)
+
 
 def render_text(tiles: Dict[Tuple[int, int], TileDmaInfo], out) -> None:
     out.write("=" * 70 + "\n")
@@ -217,9 +316,14 @@ def render_text(tiles: Dict[Tuple[int, int], TileDmaInfo], out) -> None:
                     f" -> BD{bd.next_bd}" if bd.next_bd >= 0 else " (no chain)"
                 )
                 pkt = f"pkt={bd.packet_id}" if bd.enable_packet else "no-pkt"
+                acq_str = _lock_str(bd.acquire_lock_id, info.locks)
+                rel_str = _lock_str(bd.release_lock_id, info.locks)
                 out.write(
                     f"    [BD{bd.bd_id}] len={bd.length:>4}  {pkt:<8}"
                     f"  next{chain:<12}  buf={bd.buf_source}\n"
+                )
+                out.write(
+                    f"           acquire: {acq_str}  |  release: {rel_str}\n"
                 )
 
             # Detect ping-pong pairs
@@ -236,6 +340,15 @@ def render_text(tiles: Dict[Tuple[int, int], TileDmaInfo], out) -> None:
                             f"  pkt={bd.packet_id}\n"
                         )
                         visited.update([bd.bd_id, other.bd_id])
+
+        # Lock summary for tile
+        if info.locks:
+            out.write("  Lock Summary:\n")
+            for lid in sorted(info.locks):
+                lk = info.locks[lid]
+                init_s = str(lk.init_value) if lk.init_value is not None else "unset"
+                op_s = str(lk.operate_value) if lk.operate_value is not None else "unset"
+                out.write(f"    Lock {lid}: init={init_s}, operate_value={op_s}\n")
         out.write("\n")
 
 # ---------------------------------------------------------------------------
@@ -324,6 +437,10 @@ def render_png(
             pkt = f"pkt{bd.packet_id}" if bd.enable_packet else ""
             chain_str = ""
 
+            acq_s = f"acq={bd.acquire_lock_id}" if bd.acquire_lock_id >= 0 else "acq=unset"
+            rel_s = f"rel={bd.release_lock_id}" if bd.release_lock_id >= 0 else "rel=unset"
+            lock_line = f"{acq_s} {rel_s}"
+
             # Check ping-pong
             pair_key = tuple(sorted([bd.bd_id, bd.next_bd]))
             if (
@@ -340,7 +457,13 @@ def render_png(
                     ha="center", va="top", fontsize=6, color="#1565C0",
                     fontfamily="monospace",
                 )
-                line_y -= 0.28
+                line_y -= 0.22
+                ax.text(
+                    x0 + w / 2, line_y, lock_line,
+                    ha="center", va="top", fontsize=5, color="#7B1FA2",
+                    fontfamily="monospace",
+                )
+                line_y -= 0.22
             elif pair_key not in visited_pairs:
                 ax.text(
                     x0 + w / 2, line_y,
@@ -348,7 +471,13 @@ def render_png(
                     ha="center", va="top", fontsize=6,
                     fontfamily="monospace",
                 )
-                line_y -= 0.28
+                line_y -= 0.22
+                ax.text(
+                    x0 + w / 2, line_y, lock_line,
+                    ha="center", va="top", fontsize=5, color="#7B1FA2",
+                    fontfamily="monospace",
+                )
+                line_y -= 0.22
 
         # Buffer source
         if info.bds:
@@ -392,6 +521,18 @@ def render_html(
 
     def _pkt_color(pid: int) -> str:
         return _PKT_COLORS[pid % len(_PKT_COLORS)]
+
+    def _lock_html(lock_id: int, locks: Dict[int, LockInfo], label: str) -> str:
+        if lock_id < 0:
+            return f'<span class="lock unset">{label}: unset</span>'
+        lk = locks.get(lock_id)
+        init_s = str(lk.init_value) if lk and lk.init_value is not None else "unset"
+        op_s = str(lk.operate_value) if lk and lk.operate_value is not None else "unset"
+        return (
+            f'<span class="lock" title="init={init_s}, operate_val={op_s}">'
+            f'{label}={lock_id}'
+            f'</span>'
+        )
 
     tile_cards = []
     for loc in sorted(tiles, key=lambda k: (-k[1], k[0])):
@@ -437,11 +578,15 @@ def render_html(
                     f"pkt {bd.packet_id}</span>"
                 )
 
+            acq_html = _lock_html(bd.acquire_lock_id, info.locks, "acq")
+            rel_html = _lock_html(bd.release_lock_id, info.locks, "rel")
+
             bd_rows.append(
                 f'<div class="bd-row{pp_class}">'
                 f"  {chain_html} {pkt_html}"
                 f'  <span class="len">len={bd.length}</span>'
                 f'  <span class="buf">buf={bd.buf_source}</span>'
+                f'  <div class="lock-row">{acq_html} {rel_html}</div>'
                 f"</div>"
             )
 
@@ -455,6 +600,21 @@ def render_html(
                 f"</div>"
             )
 
+        # Lock summary rows
+        lock_rows = []
+        for lid in sorted(info.locks):
+            lk = info.locks[lid]
+            init_s = str(lk.init_value) if lk.init_value is not None else "unset"
+            op_s = str(lk.operate_value) if lk.operate_value is not None else "unset"
+            lock_rows.append(
+                f'<div class="lock-summary-row">'
+                f'  Lock {lid}: init={init_s}, val={op_s}'
+                f'</div>'
+            )
+        lock_section = ""
+        if lock_rows:
+            lock_section = f'<div class="lock-section">{"".join(lock_rows)}</div>'
+
         card = (
             f'<div class="tile-card {type_cls}"'
             f' style="grid-column:{loc[0] - all_cols[0] + 1};'
@@ -464,6 +624,7 @@ def render_html(
             f"  </div>"
             f'  <div class="io-section">{"".join(io_rows)}</div>'
             f'  <div class="bd-section">{"".join(bd_rows)}</div>'
+            f"  {lock_section}"
             f"</div>"
         )
         tile_cards.append(card)
@@ -527,6 +688,17 @@ h1 {{ text-align: center; margin-bottom: 18px; font-size: 20px; color: #333; }}
 }}
 .len {{ color: #555; }}
 .buf {{ color: #888; font-style: italic; font-size: 10px; }}
+.lock-row {{ width: 100%; display: flex; gap: 8px; margin-top: 2px; }}
+.lock {{
+    font-size: 10px; font-family: monospace; color: #4A148C;
+    background: #F3E5F5; padding: 1px 5px; border-radius: 3px;
+}}
+.lock.unset {{ color: #999; background: #f0f0f0; }}
+.lock-section {{
+    margin-top: 6px; padding-top: 4px; border-top: 1px dashed #ccc;
+    font-size: 10px; color: #666;
+}}
+.lock-summary-row {{ padding: 1px 0; font-family: monospace; }}
 .legend {{
     display: flex; gap: 16px; justify-content: center;
     margin-bottom: 14px; font-size: 12px;
