@@ -81,18 +81,30 @@ template<> struct GenTraits<1>
         };
         return templates;
     }
+    static const std::map<TileType, TileDmaLimits> &defaultDmaLimits() {
+        static const std::map<TileType, TileDmaLimits> lim = {
+            {TileType::Core, {16, 16}},
+            {TileType::Shim, {16, 16}},
+            {TileType::Mem, {16, 16}},
+        };
+        return lim;
+    }
+
     static const std::unordered_map<std::string, AIEDeviceLayout>& table()
     {
         static const std::unordered_map<std::string, AIEDeviceLayout> db = {
-            { "XCVC190",
-              { 8, 8, 0x2000'0000'000, 23, 18,
-                { {0,0,TileType::Shim},{1,2,TileType::Mem},{3,7,TileType::Core} },
-                  {2, 3, 6, 7, 10, 11, 18, 19, 26, 27, 34, 35, 42, 43, 46, 47},//enabled noc shim
-                  {3, 7},//mux
-                  {2, 3},//demux
-                  defaultPortTemplates() } 
-            }
-        };
+            {"XCVC190",
+             {8,
+              8,
+              0x2000'0000'000,
+              23,
+              18,
+              {{0, 0, TileType::Shim}, {1, 2, TileType::Mem}, {3, 7, TileType::Core}},
+              {2, 3, 6, 7, 10, 11, 18, 19, 26, 27, 34, 35, 42, 43, 46, 47}, // enabled noc shim
+              {3, 7},                                                       // mux
+              {2, 3},                                                       // demux
+              defaultPortTemplates(),
+              defaultDmaLimits()}}};
         return db;
     }
 };
@@ -154,6 +166,16 @@ template<> struct GenTraits<2>
               {PortDirection::DMA, PortRole::Slave, 4}}}};
         return templates;
     }
+
+    static const std::map<TileType, TileDmaLimits> &defaultDmaLimits() {
+        static const std::map<TileType, TileDmaLimits> lim = {
+            {TileType::Core, {16, 16}}, // AIE-ML core: 16 BDs, 16 locks
+            {TileType::Shim, {16, 16}}, // shim: 16 BDs, 16 locks
+            {TileType::Mem, {48, 64}},  // mem tile: 48 BDs, 64 locks
+        };
+        return lim;
+    }
+
     static const std::unordered_map<std::string, AIEDeviceLayout>& table()
     {
         static const std::unordered_map<std::string, AIEDeviceLayout> db = {
@@ -171,7 +193,8 @@ template<> struct GenTraits<2>
               {2, 3, 6, 7, 14, 15, 22, 23, 30, 31, 34, 35}, // noc shim support
               {1, 3},                                       // mux - AIE2PS
               {1, 3},                                       // demux - AIE2PS
-              defaultPortTemplates()}}};
+              defaultPortTemplates(),
+              defaultDmaLimits()}}};
         return db;
     }
 };
@@ -212,6 +235,8 @@ public:
     const std::vector<PortTemplate>& getPortsForTileType(TileType type) const override {
         return layout_.getPortsForTileType(type);
     }
+
+    TileDmaLimits getDmaLimits(TileType type) const override { return layout_.getDmaLimits(type); }
 
     const std::unordered_set<uint32_t>& getShimNoc() const override{
         return layout_.getShimNoc();

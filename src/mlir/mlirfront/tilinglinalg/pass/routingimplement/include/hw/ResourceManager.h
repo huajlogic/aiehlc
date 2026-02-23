@@ -70,6 +70,16 @@ enum class  PktHeaderProcessType {
     PKT_DROP
 };
 
+struct BdSlot {
+    bool used = false;
+    int ownerId = -1;
+};
+
+struct LockSlot {
+    bool used = false;
+    int ownerId = -1;
+};
+
 /*
 some port is enabled by hw design, in here it specify to SHIM tile input/output port
 for example only port 3 and port 7 enabled by HW to responsible on data movement from
@@ -100,7 +110,8 @@ enum class StreamType {
 };
 class RoutingTile {
 public:
-  RoutingTile(int r, int c, ::TileType tt, const std::vector<PortTemplate> &Portinfo);
+  RoutingTile(int r, int c, ::TileType tt, const std::vector<PortTemplate> &Portinfo, int numBds = 16,
+              int numLocks = 16);
 
   uint32_t getPortnumFromPortIdx(PortDirection dir, PortRole role, uint32_t portidx);
 
@@ -112,6 +123,21 @@ public:
   ::TileType type() const { return type_; }
   int row() const { return row_; }
   int col() const { return col_; }
+
+  // BD resource management
+  std::optional<int> allocateBd(int ownerId = -1);
+  bool releaseBd(int bdId, int ownerId = -1);
+  bool isBdFree(int bdId) const;
+  int numBds() const { return static_cast<int>(bdPool_.size()); }
+  int freeBdCount() const;
+
+  // Lock resource management
+  std::optional<int> allocateLock(int ownerId = -1);
+  std::optional<int> allocateLockPair(int ownerId, int &lockA, int &lockB);
+  bool releaseLock(int lockId, int ownerId = -1);
+  bool isLockFree(int lockId) const;
+  int numLocks() const { return static_cast<int>(lockPool_.size()); }
+  int freeLockCount() const;
 
   // Added for tile reservation
   bool isReserved() const { return reserved_; }
@@ -129,6 +155,8 @@ private:
     int row_, col_;
     ::TileType type_;
     std::unordered_map<PortDirection, DirBank> banks_;
+    std::vector<BdSlot> bdPool_;
+    std::vector<LockSlot> lockPool_;
     // Added for tile reservation
     bool reserved_ = false;
     int reservedByIoId_ = -1;
@@ -454,6 +482,17 @@ public:
 
   // Find DataIO object by shim column, channel, and direction
   std::shared_ptr<DataIO> findDataIOByShimChannel(int shimCol, int channel, DMADIRECTION direction) const;
+
+  // Tile-level BD resource management
+  std::optional<int> allocateTileBd(int row, int col, int ownerId = -1);
+  bool releaseTileBd(int row, int col, int bdId, int ownerId = -1);
+  int freeTileBdCount(int row, int col) const;
+
+  // Tile-level Lock resource management
+  std::optional<int> allocateTileLock(int row, int col, int ownerId = -1);
+  std::optional<int> allocateTileLockPair(int row, int col, int ownerId, int &lockA, int &lockB);
+  bool releaseTileLock(int row, int col, int lockId, int ownerId = -1);
+  int freeTileLockCount(int row, int col) const;
 
 private:
     void InitSHIMNocList();

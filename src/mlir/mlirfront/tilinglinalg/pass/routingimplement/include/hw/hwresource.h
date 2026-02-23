@@ -48,6 +48,11 @@ struct PortTemplate {
     std::vector<uint32_t> available_ports; //vaiable ports list, this is optinonal infor can be empty if port is 0-(ports-1)
 };
 
+struct TileDmaLimits {
+    int numBds = 16;   // buffer descriptors per tile
+    int numLocks = 16; // locks per tile
+};
+
 struct TypeBasedTileLoc {
     ::TileType ttype;
     struct Point loc;
@@ -105,6 +110,7 @@ struct AIEDeviceLayout
     std::unordered_set<uint32_t> shimexttoaie_mux;
     std::unordered_set<uint32_t> shimaietoext_demux;
     std::map<::TileType, std::vector<PortTemplate>> portTemplates;
+    std::map<::TileType, TileDmaLimits> dmaLimits;
 
     // helpers -------------------------------------------------
     uint64_t tilePhysAddr(uint32_t r, uint32_t c) const
@@ -140,6 +146,13 @@ struct AIEDeviceLayout
     const std::unordered_set<uint32_t>& getShimAieToExtDemuxList() const {
         return shimaietoext_demux;
     }
+
+    TileDmaLimits getDmaLimits(::TileType type) const {
+        auto it = dmaLimits.find(type);
+        if (it != dmaLimits.end())
+            return it->second;
+        return TileDmaLimits{}; // default: 16 BDs, 16 locks
+    }
 };
 
 /* ---------- abstract interface ---------------------------- */
@@ -163,6 +176,8 @@ public:
     virtual const std::unordered_set<uint32_t>& getShimAieToExtDemuxList() const = 0;
 
     virtual uint32_t absTileRow(::TileType type, uint32_t relativeRow) const = 0;
+
+    virtual TileDmaLimits getDmaLimits(::TileType type) const = 0;
 
     virtual std::string name() const = 0;
 };

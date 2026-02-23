@@ -4,24 +4,26 @@
 ******************************************************************************/
 
 #include "passblueprinttoschedule.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Transforms/DialectConversion.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinDialect.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "dfscheblueprintmanager.h"
 #include "dfschedulemanager.h"
-#include <sstream>
-#include <vector>
-#include <unordered_map>
+#include "hw/ResourceManager.h"
+#include "hw/hwresource.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include <iostream>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
 
 using namespace mlir;
 using namespace dfscheblueprint;
@@ -188,7 +190,10 @@ static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRef
 // 4. Create packet ops for core tiles, load_kernel_group, launch, schedule ops
 // 5. Generate dskernel_receiver function with kernel DMA BD config
 struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::FlowTransferOp> {
-    using OpConversionPattern<dfscheblueprint::FlowTransferOp>::OpConversionPattern;
+    std::shared_ptr<ResourceMgr> resourceMgr;
+
+    FlowTransferConversion(MLIRContext *ctx, std::shared_ptr<ResourceMgr> mgr)
+        : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), resourceMgr(std::move(mgr)) {}
 
     LogicalResult
     matchAndRewrite(dfscheblueprint::FlowTransferOp op, OpAdaptor adaptor,
@@ -394,10 +399,18 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             int64_t perTileSize = bufferSize / coreTilesAttr.size();
             int64_t bufferOffset = tileIndex * perTileSize;
 
-            // Lock IDs: both ping and pong BDs share the same acquire/release pair
-            int64_t lockBase = flowIndex * 8 + tileIndex * 2;
-            int32_t acquireLockId = lockBase + 0;
-            int32_t releaseLockId = lockBase + 1;
+            // Allocate lock pair from ResourceMgr for this core tile
+            int acquireLockId = -1, releaseLockId = -1;
+            if (resourceMgr) {
+                resourceMgr->allocateTileLockPair(row, col, /*ownerId=*/flowIndex, acquireLockId, releaseLockId);
+            }
+            if (acquireLockId < 0 || releaseLockId < 0) {
+                llvm::errs() << "WARNING: lock allocation failed for tile (" << col << "," << row
+                             << "), falling back to formula\n";
+                int64_t lockBase = flowIndex * 8 + tileIndex * 2;
+                acquireLockId = lockBase + 0;
+                releaseLockId = lockBase + 1;
+            }
 
             // Build config dictionary for this tile
             NamedAttrList configAttrs;
@@ -446,9 +459,22 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     auto relLockConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
                                                                            rewriter.getI32IntegerAttr(releaseLockId));
 
-                    // BD IDs are per-tile local (each tile's DMA has its own BD space)
-                    int32_t pingBdId = 0;
-                    int32_t pongBdId = 1;
+                    // Allocate BD IDs from ResourceMgr per-tile pool
+                    int32_t pingBdId = -1, pongBdId = -1;
+                    if (resourceMgr) {
+                        auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                        auto bd1 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                        if (bd0 && bd1) {
+                            pingBdId = *bd0;
+                            pongBdId = *bd1;
+                        }
+                    }
+                    if (pingBdId < 0 || pongBdId < 0) {
+                        llvm::errs() << "WARNING: BD allocation failed for tile (" << col << "," << row
+                                     << "), falling back to 0/1\n";
+                        pingBdId = 0;
+                        pongBdId = 1;
+                    }
 
                     // Ping BD: next_bd -> pong
                     auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
@@ -631,11 +657,15 @@ void BlueprintToSchedulePass::runOnOperation() {
     typeConverter.addConversion([](RankedTensorType tensorType) -> Type {
         return MemRefType::get(tensorType.getShape(), tensorType.getElementType());
     });
-    
+
+    // Create ResourceMgr for BD and lock allocation
+    auto hwRes = makeResource("Gen2");
+    auto resourceMgr = std::make_shared<ResourceMgr>(std::move(hwRes));
+
     RewritePatternSet patterns(context);
     // FlowTransferConversion converts flow_transfer to dfschedule operations
     // It reads from FlowConfigOps to get DMA configuration
-    patterns.add<FlowTransferConversion>(context);
+    patterns.add<FlowTransferConversion>(context, resourceMgr);
     // DataSliceOp replaces with input tensor
     patterns.add<DataSliceOpConversion>(context);
     // Use unified erase pattern for ops that just need to be removed
