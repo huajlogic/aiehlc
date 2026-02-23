@@ -148,12 +148,25 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
             bd_comment_locks[call_m.group(1)] = (acq, rel)
 
     # 5. Parse XAie_LockSetValue calls for lock init values
-    #    XAie_LockSetValue(DevInst, tile, lock_id, value)
+    #    Pattern A: XAie_LockSetValue(dev, XAie_TileLoc(col, row), XAie_LockInit(lock_id, value))
+    #    Pattern B: XAie_LockSetValue(dev, tile_var, XAie_LockInit(lock_id, value))
     lock_init_map: Dict[Tuple[int, int], Dict[int, int]] = defaultdict(dict)
     for m in re.finditer(
-        r"XAie_LockSetValue\(\s*\w+,\s*(\w+),\s*(\d+),\s*(-?\d+)\s*\)", text
+        r"XAie_LockSetValue\(\s*\w+,\s*XAie_TileLoc\(\s*(\d+),\s*(\d+)\s*\),"
+        r"\s*XAie_LockInit\(\s*(\d+),\s*(\d+)\s*\)\)",
+        text,
+    ):
+        loc = (int(m.group(1)), int(m.group(2)))
+        lock_id = int(m.group(3))
+        init_val = int(m.group(4))
+        lock_init_map[loc][lock_id] = init_val
+    for m in re.finditer(
+        r"XAie_LockSetValue\(\s*\w+,\s*(\w+),\s*XAie_LockInit\(\s*(\d+),\s*(\d+)\s*\)\)",
+        text,
     ):
         tvar = m.group(1)
+        if tvar.startswith("XAie_TileLoc"):
+            continue
         loc = tile_map.get(tvar, (-1, -1))
         lock_id = int(m.group(2))
         init_val = int(m.group(3))
@@ -276,21 +289,23 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
 # Text output
 # ---------------------------------------------------------------------------
 
-def _lock_str(lock_id: int, locks: Dict[int, 'LockInfo']) -> str:
-    """Format a lock ID with its init and operate values."""
+def _lock_dma_str(lock_id: int, locks: Dict[int, 'LockInfo']) -> str:
+    """Format lock ID + DMA operate value (from XAie_DmaSetLock)."""
     if lock_id < 0:
-        return "unset"
+        return "none"
     lk = locks.get(lock_id)
-    parts = [f"lock={lock_id}"]
     if lk and lk.operate_value is not None:
-        parts.append(f"val={lk.operate_value}")
-    else:
-        parts.append("val=unset")
+        return f"lock={lock_id} dma_val={lk.operate_value}"
+    return f"lock={lock_id}"
+
+def _lock_init_str(lock_id: int, locks: Dict[int, 'LockInfo']) -> str:
+    """Format lock init value (from XAie_LockSetValue)."""
+    if lock_id < 0:
+        return ""
+    lk = locks.get(lock_id)
     if lk and lk.init_value is not None:
-        parts.append(f"init={lk.init_value}")
-    else:
-        parts.append("init=unset")
-    return " ".join(parts)
+        return f"SetValue={lk.init_value}"
+    return ""
 
 
 def render_text(tiles: Dict[Tuple[int, int], TileDmaInfo], out) -> None:
@@ -316,15 +331,26 @@ def render_text(tiles: Dict[Tuple[int, int], TileDmaInfo], out) -> None:
                     f" -> BD{bd.next_bd}" if bd.next_bd >= 0 else " (no chain)"
                 )
                 pkt = f"pkt={bd.packet_id}" if bd.enable_packet else "no-pkt"
-                acq_str = _lock_str(bd.acquire_lock_id, info.locks)
-                rel_str = _lock_str(bd.release_lock_id, info.locks)
+                acq_dma = _lock_dma_str(bd.acquire_lock_id, info.locks)
+                rel_dma = _lock_dma_str(bd.release_lock_id, info.locks)
                 out.write(
                     f"    [BD{bd.bd_id}] len={bd.length:>4}  {pkt:<8}"
                     f"  next{chain:<12}  buf={bd.buf_source}\n"
                 )
                 out.write(
-                    f"           acquire: {acq_str}  |  release: {rel_str}\n"
+                    f"           DMA lock: acquire={acq_dma}  release={rel_dma}\n"
                 )
+                acq_init = _lock_init_str(bd.acquire_lock_id, info.locks)
+                rel_init = _lock_init_str(bd.release_lock_id, info.locks)
+                init_parts = []
+                if acq_init:
+                    init_parts.append(f"acq lock {bd.acquire_lock_id} {acq_init}")
+                if rel_init:
+                    init_parts.append(f"rel lock {bd.release_lock_id} {rel_init}")
+                if init_parts:
+                    out.write(
+                        f"           XAie_LockSetValue: {', '.join(init_parts)}\n"
+                    )
 
             # Detect ping-pong pairs
             bd_by_id = {bd.bd_id: bd for bd in info.bds}
@@ -346,9 +372,9 @@ def render_text(tiles: Dict[Tuple[int, int], TileDmaInfo], out) -> None:
             out.write("  Lock Summary:\n")
             for lid in sorted(info.locks):
                 lk = info.locks[lid]
-                init_s = str(lk.init_value) if lk.init_value is not None else "unset"
-                op_s = str(lk.operate_value) if lk.operate_value is not None else "unset"
-                out.write(f"    Lock {lid}: init={init_s}, operate_value={op_s}\n")
+                dma_s = f"dma_val={lk.operate_value}" if lk.operate_value is not None else "dma_val=n/a"
+                init_s = f"XAie_LockSetValue(init={lk.init_value})" if lk.init_value is not None else "XAie_LockSetValue: none"
+                out.write(f"    Lock {lid}: {dma_s}  |  {init_s}\n")
         out.write("\n")
 
 # ---------------------------------------------------------------------------
@@ -437,9 +463,20 @@ def render_png(
             pkt = f"pkt{bd.packet_id}" if bd.enable_packet else ""
             chain_str = ""
 
-            acq_s = f"acq={bd.acquire_lock_id}" if bd.acquire_lock_id >= 0 else "acq=unset"
-            rel_s = f"rel={bd.release_lock_id}" if bd.release_lock_id >= 0 else "rel=unset"
-            lock_line = f"{acq_s} {rel_s}"
+            acq_s = f"acq={bd.acquire_lock_id}" if bd.acquire_lock_id >= 0 else "acq=none"
+            rel_s = f"rel={bd.release_lock_id}" if bd.release_lock_id >= 0 else "rel=none"
+            lock_line = f"DMA {acq_s} {rel_s}"
+            init_parts = []
+            if bd.acquire_lock_id >= 0:
+                lk = info.locks.get(bd.acquire_lock_id)
+                if lk and lk.init_value is not None:
+                    init_parts.append(f"acq.init={lk.init_value}")
+            if bd.release_lock_id >= 0:
+                lk = info.locks.get(bd.release_lock_id)
+                if lk and lk.init_value is not None:
+                    init_parts.append(f"rel.init={lk.init_value}")
+            if init_parts:
+                lock_line += f"  SetValue({','.join(init_parts)})"
 
             # Check ping-pong
             pair_key = tuple(sorted([bd.bd_id, bd.next_bd]))
@@ -524,13 +561,18 @@ def render_html(
 
     def _lock_html(lock_id: int, locks: Dict[int, LockInfo], label: str) -> str:
         if lock_id < 0:
-            return f'<span class="lock unset">{label}: unset</span>'
+            return f'<span class="lock unset">{label}: none</span>'
         lk = locks.get(lock_id)
-        init_s = str(lk.init_value) if lk and lk.init_value is not None else "unset"
-        op_s = str(lk.operate_value) if lk and lk.operate_value is not None else "unset"
+        dma_val = str(lk.operate_value) if lk and lk.operate_value is not None else "n/a"
+        init_val = str(lk.init_value) if lk and lk.init_value is not None else "none"
+        tooltip = f"DMA lock: dma_val={dma_val}\nXAie_LockSetValue: init={init_val}"
+        cls = "lock"
+        init_badge = ""
+        if lk and lk.init_value is not None:
+            init_badge = f'<span class="lock-init-badge">init={lk.init_value}</span>'
         return (
-            f'<span class="lock" title="init={init_s}, operate_val={op_s}">'
-            f'{label}={lock_id}'
+            f'<span class="{cls}" title="{tooltip}">'
+            f'{label}={lock_id} {init_badge}'
             f'</span>'
         )
 
@@ -604,11 +646,14 @@ def render_html(
         lock_rows = []
         for lid in sorted(info.locks):
             lk = info.locks[lid]
-            init_s = str(lk.init_value) if lk.init_value is not None else "unset"
-            op_s = str(lk.operate_value) if lk.operate_value is not None else "unset"
+            dma_s = f"dma_val={lk.operate_value}" if lk.operate_value is not None else "dma_val=n/a"
+            if lk.init_value is not None:
+                init_s = f'<span class="lock-init-badge">XAie_LockSetValue(init={lk.init_value})</span>'
+            else:
+                init_s = '<span class="lock-no-init">no XAie_LockSetValue</span>'
             lock_rows.append(
                 f'<div class="lock-summary-row">'
-                f'  Lock {lid}: init={init_s}, val={op_s}'
+                f'  Lock {lid}: {dma_s} &nbsp;|&nbsp; {init_s}'
                 f'</div>'
             )
         lock_section = ""
@@ -694,6 +739,11 @@ h1 {{ text-align: center; margin-bottom: 18px; font-size: 20px; color: #333; }}
     background: #F3E5F5; padding: 1px 5px; border-radius: 3px;
 }}
 .lock.unset {{ color: #999; background: #f0f0f0; }}
+.lock-init-badge {{
+    font-size: 9px; font-weight: 700; color: #fff; background: #7B1FA2;
+    padding: 0 4px; border-radius: 3px; margin-left: 2px;
+}}
+.lock-no-init {{ color: #aaa; font-style: italic; }}
 .lock-section {{
     margin-top: 6px; padding-top: 4px; border-top: 1px dashed #ccc;
     font-size: 10px; color: #666;
