@@ -564,21 +564,35 @@ h1 {{ text-align: center; margin-bottom: 18px; font-size: 20px; color: #333; }}
 # ---------------------------------------------------------------------------
 
 def serve_html(html_path: str, port: int) -> None:
-    directory = str(Path(html_path).parent)
-    filename = Path(html_path).name
+    import socket
+
+    abs_path = Path(html_path).resolve()
+    directory = str(abs_path.parent)
+    filename = abs_path.name
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=directory, **kwargs)
 
         def log_message(self, fmt, *args):
-            pass  # quiet
+            pass
 
-    url = f"http://localhost:{port}/{filename}"
-    print(f"Serving at {url}  (Ctrl+C to stop)")
+    hostname = socket.gethostname()
+    local_url = f"http://localhost:{port}/{filename}"
+    remote_url = f"http://{hostname}:{port}/{filename}"
 
-    server = http.server.HTTPServer(("", port), Handler)
-    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    print(f"Serving DMA BD visualization:")
+    print(f"  Local:  {local_url}")
+    print(f"  Remote: {remote_url}")
+    print(f"  (Ctrl+C to stop)")
+
+    server = http.server.HTTPServer(("0.0.0.0", port), Handler)
+
+    try:
+        webbrowser.open(local_url)
+    except Exception:
+        pass
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -596,19 +610,20 @@ def main():
     parser.add_argument("host_cc", help="Path to generated host.cc")
     parser.add_argument(
         "-m", "--mode", choices=["text", "png", "html"],
-        default="text", help="Output mode (default: text)",
+        default=None,
+        help="Output mode: text, png, or html (default: html + serve)",
     )
     parser.add_argument(
         "-o", "--output", default=None,
         help="Output file (default: auto-named based on mode)",
     )
     parser.add_argument(
-        "--serve", action="store_true",
-        help="(html mode) Start HTTP server and open browser",
+        "--no-serve", action="store_true",
+        help="Generate HTML file only, do not start HTTP server",
     )
     parser.add_argument(
         "--port", type=int, default=8088,
-        help="(html mode) HTTP server port (default: 8088)",
+        help="HTTP server port (default: 8088)",
     )
     args = parser.parse_args()
 
@@ -617,7 +632,13 @@ def main():
         print("No DMA BD configurations found.", file=sys.stderr)
         sys.exit(1)
 
-    if args.mode == "text":
+    mode = args.mode
+
+    # Default: html + serve
+    if mode is None:
+        mode = "html"
+
+    if mode == "text":
         out_path = args.output
         if out_path:
             with open(out_path, "w") as f:
@@ -626,14 +647,14 @@ def main():
         else:
             render_text(tiles, sys.stdout)
 
-    elif args.mode == "png":
+    elif mode == "png":
         out_path = args.output or "dma_bd_config.png"
         render_png(tiles, out_path)
 
-    elif args.mode == "html":
+    elif mode == "html":
         out_path = args.output or "dma_bd_config.html"
         render_html(tiles, out_path)
-        if args.serve:
+        if not args.no_serve:
             serve_html(out_path, args.port)
 
 
