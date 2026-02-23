@@ -446,9 +446,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     auto relLockConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
                                                                            rewriter.getI32IntegerAttr(releaseLockId));
 
-                    // BD IDs: ping = tileIndex*2, pong = tileIndex*2+1
-                    int32_t pingBdId = tileIndex * 2;
-                    int32_t pongBdId = tileIndex * 2 + 1;
+                    // BD IDs are per-tile local (each tile's DMA has its own BD space)
+                    int32_t pingBdId = 0;
+                    int32_t pongBdId = 1;
 
                     // Ping BD: next_bd -> pong
                     auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
