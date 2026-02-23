@@ -298,8 +298,10 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
             std::string acqLockName = "LOCK_" + paramInfo.windowName + "_ACQ";
             std::string relLockName = "LOCK_" + paramInfo.windowName + "_REL";
 
-            rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr(acqLockName),
-                                                   rewriter.getI32IntegerAttr(paramInfo.acquireLockId));
+            auto acqLockOp = rewriter.create<dfschedule::LockDefOp>(
+                loc, rewriter.getStringAttr(acqLockName), rewriter.getI32IntegerAttr(paramInfo.acquireLockId));
+            acqLockOp->setAttr("init_value", rewriter.getI32IntegerAttr(2));
+
             rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr(relLockName),
                                                    rewriter.getI32IntegerAttr(paramInfo.releaseLockId));
 
@@ -339,13 +341,18 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
         // === HARDCODED MODE (backward compatibility) ===
         // Generate fixed input/output locks, buffers, and windows
 
-        // Lock definitions
-        rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_win_ping_ACQ"),
-                                               rewriter.getI32IntegerAttr(params.inputAcquireLockId));
+        // Lock definitions (acquire locks get init_value=2 for ping-pong)
+        auto winPingAcqLock = rewriter.create<dfschedule::LockDefOp>(
+            loc, rewriter.getStringAttr("LOCK_win_ping_ACQ"), rewriter.getI32IntegerAttr(params.inputAcquireLockId));
+        winPingAcqLock->setAttr("init_value", rewriter.getI32IntegerAttr(2));
+
         rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_win_pong_REL"),
                                                rewriter.getI32IntegerAttr(params.inputReleaseLockId));
-        rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_out_ping_ACQ"),
-                                               rewriter.getI32IntegerAttr(params.outputAcquireLockId));
+
+        auto outPingAcqLock = rewriter.create<dfschedule::LockDefOp>(
+            loc, rewriter.getStringAttr("LOCK_out_ping_ACQ"), rewriter.getI32IntegerAttr(params.outputAcquireLockId));
+        outPingAcqLock->setAttr("init_value", rewriter.getI32IntegerAttr(2));
+
         rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_out_pong_REL"),
                                                rewriter.getI32IntegerAttr(params.outputReleaseLockId));
 

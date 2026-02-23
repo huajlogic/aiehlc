@@ -19,8 +19,10 @@
 #include "llvm/Support/raw_ostream.h"
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <sys/stat.h>
+#include <tuple>
 
 using namespace mlir;
 
@@ -130,7 +132,10 @@ struct ConversionState {
     
     // Map from io_handle Value to (channel_id, bd_id) for __Runtime_dma_createio
     DenseMap<Value, std::pair<int32_t, int32_t>> ioHandleToResourceMap;
-    
+
+    // Track (col,row,lock_id) tuples that have already had XAie_LockSetValue emitted
+    std::set<std::tuple<int32_t, int32_t, int32_t>> initializedLocks;
+
     // Cached values for inner patterns (set before applying inner patterns)
     Value devInstRef;
     Value cacheableConst;
@@ -923,7 +928,34 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             });
 
         llvm::errs() << "  ✓ Created DMA BD config with full AIE API parameters\n";
-        
+
+        // For core tiles with ping-pong buffer (acquire_lock_id >= 0, next_bd >= 0),
+        // emit XAie_LockSetValue to initialize the acquire lock to 2.
+        // Only emitted once per (tile, lock_id) to avoid duplicate calls.
+        if (acquireLockId >= 0 && nextBd >= 0) {
+            int32_t tileCol = -1, tileRow = -1;
+            if (auto declareTileOp = op.getTile().getDefiningOp<dfschedule::DeclareTileOp>()) {
+                tileCol = declareTileOp.getCol();
+                tileRow = declareTileOp.getRow();
+            }
+            if (tileCol >= 0 && tileRow >= 0) {
+                auto lockKey = std::make_tuple(tileCol, tileRow, acquireLockId);
+                if (state.initializedLocks.find(lockKey) == state.initializedLocks.end()) {
+                    state.initializedLocks.insert(lockKey);
+                    std::string lockComment = "/* Lock init: tile(" + std::to_string(tileCol) + "," +
+                                              std::to_string(tileRow) + ") lock=" + std::to_string(acquireLockId) +
+                                              " init_value=2 */";
+                    rewriter.create<emitc::VerbatimOp>(loc, lockComment);
+                    std::string lockSetCall = "XAie_LockSetValue(g_DevInst, XAie_TileLoc(" + std::to_string(tileCol) +
+                                              ", " + std::to_string(tileRow) + "), XAie_LockInit(" +
+                                              std::to_string(acquireLockId) + ", 2));";
+                    rewriter.create<emitc::VerbatimOp>(loc, lockSetCall);
+                    llvm::errs() << "  ✓ Emitted XAie_LockSetValue for tile(" << tileCol << "," << tileRow
+                                 << ") lock=" << acquireLockId << " init=2\n";
+                }
+            }
+        }
+
         // Replace the op with the call result (status code)
         rewriter.replaceOp(op, configCall.getResult(0));
         return success();
