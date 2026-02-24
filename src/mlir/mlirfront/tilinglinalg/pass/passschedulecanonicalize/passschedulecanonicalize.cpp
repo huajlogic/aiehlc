@@ -558,6 +558,10 @@ struct DmaBdParams {
     int64_t nextBd;
     int bdIndex;
     int64_t sliceIndex;  // Index into uniqueSliceParams/declaredMemrefs for the buffer
+    int64_t acquireLockId = -1;
+    int64_t acquireLockVal = -1;
+    int64_t releaseLockId = -1;
+    int64_t releaseLockVal = -1;
 };
 
 // Structure to hold IO config parameters
@@ -635,7 +639,11 @@ static void createCanonicalizedSchedule(
                 params.nextBd = dmaBd.getNextBd();
                 params.bdIndex = shimBdCounter[key]++;
                 params.sliceIndex = -1;  // Default: no slice found
-                
+                params.acquireLockId = static_cast<int32_t>(dmaBd.getAcquireLockId());
+                params.acquireLockVal = static_cast<int32_t>(dmaBd.getAcquireLockVal());
+                params.releaseLockId = static_cast<int32_t>(dmaBd.getReleaseLockId());
+                params.releaseLockVal = static_cast<int32_t>(dmaBd.getReleaseLockVal());
+
                 // Trace buffer back to find the slice index
                 // Buffer -> DeclareTensorOp -> ExtractSliceOp
                 Value buffer = dmaBd.getBuffer();
@@ -1078,11 +1086,9 @@ static void createCanonicalizedSchedule(
                 loc, dfschedule::BdHandleType::get(builder.getContext()), buffer, shimTile, bdIdConst.getResult(),
                 builder.getI32IntegerAttr(params.offset), builder.getI32IntegerAttr(params.len),
                 builder.getBoolAttr(params.enablePacket), builder.getI32IntegerAttr(params.packetId),
-                builder.getI32IntegerAttr(params.nextBd),
-                builder.getI32IntegerAttr(-1),  // acquire_lock_id (no lock)
-                builder.getI32IntegerAttr(-1),  // acquire_lock_val
-                builder.getI32IntegerAttr(-1),  // release_lock_id (no lock)
-                builder.getI32IntegerAttr(-1)); // release_lock_val
+                builder.getI32IntegerAttr(params.nextBd), builder.getI32IntegerAttr(params.acquireLockId),
+                builder.getI32IntegerAttr(params.acquireLockVal), builder.getI32IntegerAttr(params.releaseLockId),
+                builder.getI32IntegerAttr(params.releaseLockVal));
 
             shimBdHandles[params.shimKey].push_back(dmaBdOp.getBdHandle());
         }

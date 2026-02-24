@@ -332,10 +332,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             rewriter.getBoolAttr(true),               // enable_packet
             rewriter.getI32IntegerAttr(basePacketId), // packet_id
             rewriter.getI32IntegerAttr(4294967295),   // next_bd (-1 as unsigned)
-            rewriter.getI32IntegerAttr(-1),           // acquire_lock_id (no lock)
-            rewriter.getI32IntegerAttr(-1),           // acquire_lock_val
-            rewriter.getI32IntegerAttr(-1),           // release_lock_id (no lock)
-            rewriter.getI32IntegerAttr(-1));          // release_lock_val
+            rewriter.getI32IntegerAttr(0),            // acquire_lock_id
+            rewriter.getI32IntegerAttr(0),            // acquire_lock_val
+            rewriter.getI32IntegerAttr(0),            // release_lock_id
+            rewriter.getI32IntegerAttr(0));           // release_lock_val
 
         // Create dfschedule.config.create_io for shim tile
         auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
