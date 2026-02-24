@@ -203,13 +203,21 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
         lock_operate_map[bd_var] = (int(m.group(3)), int(m.group(5)))
 
     # 7. Parse DMA BD configs
+    #    New 13-arg format: dev, tile, buf, bd_id, addr, len, next_bd, enable_pkt, pkt_id,
+    #                       acq_lock_id, acq_lock_val, rel_lock_id, rel_lock_val
     bd_map: Dict[str, BdConfig] = {}
-    for m in re.finditer(
+    bd_call_13 = re.compile(
         r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
         r"(\w+),\s*(\w+),\s*(\w+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
-        r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\)",
-        text,
-    ):
+        r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
+        r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\)"
+    )
+    bd_call_10 = re.compile(
+        r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
+        r"(\w+),\s*(\w+),\s*(\w+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
+        r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\)"
+    )
+    for m in bd_call_13.finditer(text):
         tile_var = m.group(3)
         buf_ptr = m.group(4)
         bd_var = m.group(1)
@@ -218,26 +226,41 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
         if next_bd_raw < 0 or next_bd_raw > 65535:
             next_bd_raw = -1
 
+        bd = BdConfig(
+            var=bd_var, tile_var=tile_var, tile_loc=loc,
+            buf_var=buf_ptr,
+            buf_source=_slice_label(buf_source.get(buf_ptr, buf_ptr)),
+            bd_id=int(m.group(5)), offset=int(m.group(6)), length=int(m.group(7)),
+            next_bd=next_bd_raw,
+            enable_packet=int(m.group(9)) != 0, packet_id=int(m.group(10)),
+            acquire_lock_id=int(m.group(11)), acquire_lock_val=int(m.group(12)),
+            release_lock_id=int(m.group(13)), release_lock_val=int(m.group(14)),
+        )
+        bd_map[bd.var] = bd
+
+    # Fallback: old 10-arg format (lock info from comments)
+    for m in bd_call_10.finditer(text):
+        bd_var = m.group(1)
+        if bd_var in bd_map:
+            continue
+        tile_var = m.group(3)
+        buf_ptr = m.group(4)
+        loc = tile_map.get(tile_var, (-1, -1))
+        next_bd_raw = int(m.group(8))
+        if next_bd_raw < 0 or next_bd_raw > 65535:
+            next_bd_raw = -1
         acq_lock, acq_val, rel_lock, rel_val = -1, -1, -1, -1
         if bd_var in bd_comment_locks:
             acq_lock, acq_val, rel_lock, rel_val = bd_comment_locks[bd_var]
-
         bd = BdConfig(
-            var=bd_var,
-            tile_var=tile_var,
-            tile_loc=loc,
+            var=bd_var, tile_var=tile_var, tile_loc=loc,
             buf_var=buf_ptr,
             buf_source=_slice_label(buf_source.get(buf_ptr, buf_ptr)),
-            bd_id=int(m.group(5)),
-            offset=int(m.group(6)),
-            length=int(m.group(7)),
+            bd_id=int(m.group(5)), offset=int(m.group(6)), length=int(m.group(7)),
             next_bd=next_bd_raw,
-            enable_packet=int(m.group(9)) != 0,
-            packet_id=int(m.group(10)),
-            acquire_lock_id=acq_lock,
-            acquire_lock_val=acq_val,
-            release_lock_id=rel_lock,
-            release_lock_val=rel_val,
+            enable_packet=int(m.group(9)) != 0, packet_id=int(m.group(10)),
+            acquire_lock_id=acq_lock, acquire_lock_val=acq_val,
+            release_lock_id=rel_lock, release_lock_val=rel_val,
         )
         bd_map[bd.var] = bd
 
@@ -282,32 +305,31 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
     for info in tiles.values():
         info.bds.sort(key=lambda b: b.bd_id)
 
-    # 10. Populate per-tile lock info from BD lock IDs/values and init/operate maps
+    # 10. Populate per-tile lock info from BD lock IDs/values and init maps
     for info in tiles.values():
         loc = info.loc
         for bd in info.bds:
-            for lid in (bd.acquire_lock_id, bd.release_lock_id):
-                if lid < 0:
-                    continue
-                if lid not in info.locks:
-                    info.locks[lid] = LockInfo(lock_id=lid)
-                lk = info.locks[lid]
-                if loc in lock_init_map and lid in lock_init_map[loc]:
-                    lk.init_value = lock_init_map[loc][lid]
-            # Use lock values from BD config comments (acquire_lock_val, release_lock_val)
-            if bd.acquire_lock_id >= 0 and bd.acquire_lock_val >= 0:
-                if bd.acquire_lock_id in info.locks:
-                    info.locks[bd.acquire_lock_id].operate_value = bd.acquire_lock_val
-            if bd.release_lock_id >= 0 and bd.release_lock_val >= 0:
-                if bd.release_lock_id in info.locks:
-                    info.locks[bd.release_lock_id].operate_value = bd.release_lock_val
-            # Fallback: use XAie_DmaSetLock operate values if available
+            # Register acquire lock
+            if bd.acquire_lock_id >= 0:
+                if bd.acquire_lock_id not in info.locks:
+                    info.locks[bd.acquire_lock_id] = LockInfo(lock_id=bd.acquire_lock_id)
+                info.locks[bd.acquire_lock_id].operate_value = bd.acquire_lock_val
+            # Register release lock
+            if bd.release_lock_id >= 0:
+                if bd.release_lock_id not in info.locks:
+                    info.locks[bd.release_lock_id] = LockInfo(lock_id=bd.release_lock_id)
+                info.locks[bd.release_lock_id].operate_value = bd.release_lock_val
+            # Fallback: XAie_DmaSetLock operate values
             if bd.var in lock_operate_map:
                 acq_val, rel_val = lock_operate_map[bd.var]
-                if bd.acquire_lock_id >= 0 and bd.acquire_lock_id in info.locks:
+                if bd.acquire_lock_id >= 0:
                     info.locks[bd.acquire_lock_id].operate_value = acq_val
-                if bd.release_lock_id >= 0 and bd.release_lock_id in info.locks:
+                if bd.release_lock_id >= 0:
                     info.locks[bd.release_lock_id].operate_value = rel_val
+        # Populate init values from XAie_LockSetValue
+        for lid, lk in info.locks.items():
+            if loc in lock_init_map and lid in lock_init_map[loc]:
+                lk.init_value = lock_init_map[loc][lid]
 
     return tiles
 
@@ -315,14 +337,11 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
 # Text output
 # ---------------------------------------------------------------------------
 
-def _lock_dma_str(lock_id: int, locks: Dict[int, 'LockInfo']) -> str:
-    """Format lock ID + DMA operate value (from XAie_DmaSetLock)."""
+def _lock_dma_str(lock_id: int, lock_val: int) -> str:
+    """Format lock ID + DMA request value from __Runtime_dma_bd_config args."""
     if lock_id < 0:
         return "none"
-    lk = locks.get(lock_id)
-    if lk and lk.operate_value is not None:
-        return f"lock={lock_id} dma_val={lk.operate_value}"
-    return f"lock={lock_id}"
+    return f"lock={lock_id} val={lock_val}"
 
 def _lock_init_str(lock_id: int, locks: Dict[int, 'LockInfo']) -> str:
     """Format lock init value (from XAie_LockSetValue)."""
@@ -330,7 +349,7 @@ def _lock_init_str(lock_id: int, locks: Dict[int, 'LockInfo']) -> str:
         return ""
     lk = locks.get(lock_id)
     if lk and lk.init_value is not None:
-        return f"SetValue={lk.init_value}"
+        return f"XAie_LockSetValue(init={lk.init_value})"
     return ""
 
 
@@ -357,25 +376,25 @@ def render_text(tiles: Dict[Tuple[int, int], TileDmaInfo], out) -> None:
                     f" -> BD{bd.next_bd}" if bd.next_bd >= 0 else " (no chain)"
                 )
                 pkt = f"pkt={bd.packet_id}" if bd.enable_packet else "no-pkt"
-                acq_dma = _lock_dma_str(bd.acquire_lock_id, info.locks)
-                rel_dma = _lock_dma_str(bd.release_lock_id, info.locks)
+                acq_dma = _lock_dma_str(bd.acquire_lock_id, bd.acquire_lock_val)
+                rel_dma = _lock_dma_str(bd.release_lock_id, bd.release_lock_val)
                 out.write(
                     f"    [BD{bd.bd_id}] len={bd.length:>4}  {pkt:<8}"
                     f"  next{chain:<12}  buf={bd.buf_source}\n"
                 )
                 out.write(
-                    f"           DMA lock: acquire={acq_dma}  release={rel_dma}\n"
+                    f"           DMA lock: acquire({acq_dma})  release({rel_dma})\n"
                 )
                 acq_init = _lock_init_str(bd.acquire_lock_id, info.locks)
                 rel_init = _lock_init_str(bd.release_lock_id, info.locks)
                 init_parts = []
                 if acq_init:
-                    init_parts.append(f"acq lock {bd.acquire_lock_id} {acq_init}")
+                    init_parts.append(f"acq lock {bd.acquire_lock_id}: {acq_init}")
                 if rel_init:
-                    init_parts.append(f"rel lock {bd.release_lock_id} {rel_init}")
+                    init_parts.append(f"rel lock {bd.release_lock_id}: {rel_init}")
                 if init_parts:
                     out.write(
-                        f"           XAie_LockSetValue: {', '.join(init_parts)}\n"
+                        f"           Lock init: {', '.join(init_parts)}\n"
                     )
 
             # Detect ping-pong pairs
@@ -398,8 +417,8 @@ def render_text(tiles: Dict[Tuple[int, int], TileDmaInfo], out) -> None:
             out.write("  Lock Summary:\n")
             for lid in sorted(info.locks):
                 lk = info.locks[lid]
-                dma_s = f"dma_val={lk.operate_value}" if lk.operate_value is not None else "dma_val=n/a"
-                init_s = f"XAie_LockSetValue(init={lk.init_value})" if lk.init_value is not None else "XAie_LockSetValue: none"
+                dma_s = f"dma_request_val={lk.operate_value}" if lk.operate_value is not None else "dma_request_val=unset"
+                init_s = f"XAie_LockSetValue(init={lk.init_value})" if lk.init_value is not None else "no XAie_LockSetValue"
                 out.write(f"    Lock {lid}: {dma_s}  |  {init_s}\n")
         out.write("\n")
 
@@ -489,9 +508,9 @@ def render_png(
             pkt = f"pkt{bd.packet_id}" if bd.enable_packet else ""
             chain_str = ""
 
-            acq_s = f"acq={bd.acquire_lock_id}" if bd.acquire_lock_id >= 0 else "acq=none"
-            rel_s = f"rel={bd.release_lock_id}" if bd.release_lock_id >= 0 else "rel=none"
-            lock_line = f"DMA {acq_s} {rel_s}"
+            acq_s = f"acq=lock{bd.acquire_lock_id}(val={bd.acquire_lock_val})" if bd.acquire_lock_id >= 0 else "acq=none"
+            rel_s = f"rel=lock{bd.release_lock_id}(val={bd.release_lock_val})" if bd.release_lock_id >= 0 else "rel=none"
+            lock_line = f"{acq_s} {rel_s}"
             init_parts = []
             if bd.acquire_lock_id >= 0:
                 lk = info.locks.get(bd.acquire_lock_id)
@@ -585,20 +604,18 @@ def render_html(
     def _pkt_color(pid: int) -> str:
         return _PKT_COLORS[pid % len(_PKT_COLORS)]
 
-    def _lock_html(lock_id: int, locks: Dict[int, LockInfo], label: str) -> str:
+    def _lock_html(lock_id: int, lock_val: int, locks: Dict[int, LockInfo], label: str) -> str:
         if lock_id < 0:
             return f'<span class="lock unset">{label}: none</span>'
         lk = locks.get(lock_id)
-        dma_val = str(lk.operate_value) if lk and lk.operate_value is not None else "n/a"
         init_val = str(lk.init_value) if lk and lk.init_value is not None else "none"
-        tooltip = f"DMA lock: dma_val={dma_val}\nXAie_LockSetValue: init={init_val}"
-        cls = "lock"
+        tooltip = f"DMA {label}: lock_id={lock_id}, request_val={lock_val}\nXAie_LockSetValue: init={init_val}"
         init_badge = ""
         if lk and lk.init_value is not None:
             init_badge = f'<span class="lock-init-badge">init={lk.init_value}</span>'
         return (
-            f'<span class="{cls}" title="{tooltip}">'
-            f'{label}={lock_id} {init_badge}'
+            f'<span class="lock" title="{tooltip}">'
+            f'{label}=lock{lock_id}(val={lock_val}) {init_badge}'
             f'</span>'
         )
 
@@ -646,8 +663,8 @@ def render_html(
                     f"pkt {bd.packet_id}</span>"
                 )
 
-            acq_html = _lock_html(bd.acquire_lock_id, info.locks, "acq")
-            rel_html = _lock_html(bd.release_lock_id, info.locks, "rel")
+            acq_html = _lock_html(bd.acquire_lock_id, bd.acquire_lock_val, info.locks, "acq")
+            rel_html = _lock_html(bd.release_lock_id, bd.release_lock_val, info.locks, "rel")
 
             bd_rows.append(
                 f'<div class="bd-row{pp_class}">'
@@ -672,7 +689,7 @@ def render_html(
         lock_rows = []
         for lid in sorted(info.locks):
             lk = info.locks[lid]
-            dma_s = f"dma_val={lk.operate_value}" if lk.operate_value is not None else "dma_val=n/a"
+            dma_s = f"dma_request_val={lk.operate_value}" if lk.operate_value is not None else "dma_request_val=unset"
             if lk.init_value is not None:
                 init_s = f'<span class="lock-init-badge">XAie_LockSetValue(init={lk.init_value})</span>'
             else:
