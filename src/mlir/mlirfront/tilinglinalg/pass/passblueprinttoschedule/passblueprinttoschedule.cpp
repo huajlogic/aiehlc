@@ -482,9 +482,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                         rewriter.getI32IntegerAttr(basePacketId + tileIndex),
                         rewriter.getI32IntegerAttr(pongBdId),      // next_bd -> pong
                         rewriter.getI32IntegerAttr(acquireLockId), // acquire_lock_id
-                        rewriter.getI32IntegerAttr(1),             // acquire_lock_val
+                        rewriter.getI32IntegerAttr(-1),            // acquire_lock_val (wait/decrement)
                         rewriter.getI32IntegerAttr(releaseLockId), // release_lock_id
-                        rewriter.getI32IntegerAttr(1));            // release_lock_val
+                        rewriter.getI32IntegerAttr(1));            // release_lock_val (signal/increment)
 
                     // Pong BD: next_bd -> ping
                     auto pongBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
@@ -498,9 +498,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                         rewriter.getI32IntegerAttr(basePacketId + tileIndex),
                         rewriter.getI32IntegerAttr(pingBdId),      // next_bd -> ping
                         rewriter.getI32IntegerAttr(acquireLockId), // acquire_lock_id
-                        rewriter.getI32IntegerAttr(1),             // acquire_lock_val
+                        rewriter.getI32IntegerAttr(-1),            // acquire_lock_val (wait/decrement)
                         rewriter.getI32IntegerAttr(releaseLockId), // release_lock_id
-                        rewriter.getI32IntegerAttr(1));            // release_lock_val
+                        rewriter.getI32IntegerAttr(1));            // release_lock_val (signal/increment)
 
                     // Create IO handle for core tile (references ping BD; DMA chains automatically)
                     rewriter.create<dfschedule::ConfigCreateIoOp>(
