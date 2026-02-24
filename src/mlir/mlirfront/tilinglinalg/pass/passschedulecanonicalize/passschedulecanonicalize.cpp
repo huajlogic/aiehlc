@@ -581,7 +581,9 @@ struct CoreDmaBdParams {
     int bdIndex;
     int64_t sliceIndex;
     int64_t acquireLockId;
+    int64_t acquireLockVal;
     int64_t releaseLockId;
+    int64_t releaseLockVal;
 };
 
 // Structure to hold core tile IO config parameters
@@ -702,19 +704,11 @@ static void createCanonicalizedSchedule(
                 params.bdIndex = coreBdCounter[key]++;
                 params.sliceIndex = -1;
 
-                // Extract lock IDs from SSA operands (trace to arith.constant)
-                params.acquireLockId = -1;
-                params.releaseLockId = -1;
-                if (auto constOp = dmaBd.getAcquireLockId().getDefiningOp<arith::ConstantOp>()) {
-                    if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
-                        params.acquireLockId = intAttr.getInt();
-                    }
-                }
-                if (auto constOp = dmaBd.getReleaseLockId().getDefiningOp<arith::ConstantOp>()) {
-                    if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
-                        params.releaseLockId = intAttr.getInt();
-                    }
-                }
+                // Read lock IDs and values directly from attributes
+                params.acquireLockId = static_cast<int32_t>(dmaBd.getAcquireLockId());
+                params.acquireLockVal = static_cast<int32_t>(dmaBd.getAcquireLockVal());
+                params.releaseLockId = static_cast<int32_t>(dmaBd.getReleaseLockId());
+                params.releaseLockVal = static_cast<int32_t>(dmaBd.getReleaseLockVal());
 
                 // Trace buffer back to find the slice index
                 Value buffer = dmaBd.getBuffer();
@@ -1078,23 +1072,18 @@ static void createCanonicalizedSchedule(
             // Create BD ID constant
             auto bdIdConst = builder.create<arith::ConstantOp>(
                 loc, builder.getI32Type(), builder.getI32IntegerAttr(bdIndexCounter++));
-            
+
             // Create DMA BD config
-            auto minusOne = builder.create<arith::ConstantOp>(loc, builder.getI32Type(), builder.getI32IntegerAttr(-1));
             auto dmaBdOp = builder.create<dfschedule::ConfigDmaBdOp>(
-                loc,
-                dfschedule::BdHandleType::get(builder.getContext()),
-                buffer,
-                shimTile,
-                bdIdConst.getResult(),
-                builder.getI32IntegerAttr(params.offset),
-                builder.getI32IntegerAttr(params.len),
-                builder.getBoolAttr(params.enablePacket),
-                builder.getI32IntegerAttr(params.packetId),
+                loc, dfschedule::BdHandleType::get(builder.getContext()), buffer, shimTile, bdIdConst.getResult(),
+                builder.getI32IntegerAttr(params.offset), builder.getI32IntegerAttr(params.len),
+                builder.getBoolAttr(params.enablePacket), builder.getI32IntegerAttr(params.packetId),
                 builder.getI32IntegerAttr(params.nextBd),
-                minusOne.getResult(),  // acquire_lock_id = -1 (host-side, no lock)
-                minusOne.getResult()); // release_lock_id = -1 (host-side, no lock)
-            
+                builder.getI32IntegerAttr(-1),  // acquire_lock_id (no lock)
+                builder.getI32IntegerAttr(-1),  // acquire_lock_val
+                builder.getI32IntegerAttr(-1),  // release_lock_id (no lock)
+                builder.getI32IntegerAttr(-1)); // release_lock_val
+
             shimBdHandles[params.shimKey].push_back(dmaBdOp.getBdHandle());
         }
     }
@@ -1159,16 +1148,14 @@ static void createCanonicalizedSchedule(
 
         auto bdIdConst =
             builder.create<arith::ConstantOp>(loc, builder.getI32Type(), builder.getI32IntegerAttr(params.bdIndex));
-        auto acquireLock = builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
-                                                             builder.getI32IntegerAttr(params.acquireLockId));
-        auto releaseLock = builder.create<arith::ConstantOp>(loc, builder.getI32Type(),
-                                                             builder.getI32IntegerAttr(params.releaseLockId));
 
         auto dmaBdOp = builder.create<dfschedule::ConfigDmaBdOp>(
             loc, dfschedule::BdHandleType::get(builder.getContext()), buffer, coreTile, bdIdConst.getResult(),
             builder.getI32IntegerAttr(params.offset), builder.getI32IntegerAttr(params.len),
             builder.getBoolAttr(params.enablePacket), builder.getI32IntegerAttr(params.packetId),
-            builder.getI32IntegerAttr(params.nextBd), acquireLock.getResult(), releaseLock.getResult());
+            builder.getI32IntegerAttr(params.nextBd), builder.getI32IntegerAttr(params.acquireLockId),
+            builder.getI32IntegerAttr(params.acquireLockVal), builder.getI32IntegerAttr(params.releaseLockId),
+            builder.getI32IntegerAttr(params.releaseLockVal));
 
         coreBdHandles[params.coreKey].push_back(dmaBdOp.getBdHandle());
     }

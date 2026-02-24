@@ -158,8 +158,10 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
     BoolAttr:$enable_packet,
     I32Attr:$packet_id,
     I32Attr:$next_bd,
-    I32:$acquire_lock_id,  // Lock ID to acquire before DMA transfer (-1 = no lock)
-    I32:$release_lock_id   // Lock ID to release after DMA transfer (-1 = no lock)
+    DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_id,
+    DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_val,
+    DefaultValuedAttr<I32Attr, "-1">:$release_lock_id,
+    DefaultValuedAttr<I32Attr, "-1">:$release_lock_val
   );
   let results = (outs dfschedule_BdHandleType:$bd_handle);
   let hasCustomAssemblyFormat = 1;

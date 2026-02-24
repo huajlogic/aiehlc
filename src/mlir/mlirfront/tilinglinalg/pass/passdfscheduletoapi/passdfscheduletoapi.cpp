@@ -868,15 +868,11 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         auto i32Type = rewriter.getI32Type();
         auto dmaDescType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DmaDesc");
 
-        // Extract lock IDs from operands (they are I32 SSA values)
-        int32_t acquireLockId = -1;
-        if (auto constOp = op.getAcquireLockId().getDefiningOp<arith::ConstantOp>()) {
-            acquireLockId = mlir::cast<IntegerAttr>(constOp.getValue()).getInt();
-        }
-        int32_t releaseLockId = -1;
-        if (auto constOp = op.getReleaseLockId().getDefiningOp<arith::ConstantOp>()) {
-            releaseLockId = mlir::cast<IntegerAttr>(constOp.getValue()).getInt();
-        }
+        // Read lock IDs and values directly from attributes
+        int32_t acquireLockId = static_cast<int32_t>(op.getAcquireLockId());
+        int32_t acquireLockVal = static_cast<int32_t>(op.getAcquireLockVal());
+        int32_t releaseLockId = static_cast<int32_t>(op.getReleaseLockId());
+        int32_t releaseLockVal = static_cast<int32_t>(op.getReleaseLockVal());
 
         // Create comment
         std::string comment =
@@ -888,7 +884,9 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             ", offset=" + std::to_string(offset) + ", len=" + std::to_string(len) +
             ", enable_packet=" + (enablePacket ? "true" : "false") + ", packet_id=" + std::to_string(packetId) +
             ", next_bd=" + std::to_string(nextBd) + ", acquire_lock_id=" + std::to_string(acquireLockId) +
-            ", release_lock_id=" + std::to_string(releaseLockId) + " */";
+            ", acquire_lock_val=" + std::to_string(acquireLockVal) +
+            ", release_lock_id=" + std::to_string(releaseLockId) +
+            ", release_lock_val=" + std::to_string(releaseLockVal) + " */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
         
         // Create constants for parameters

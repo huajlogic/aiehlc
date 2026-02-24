@@ -298,8 +298,9 @@ void dfschedule::KernelMainOp::print(::mlir::OpAsmPrinter &printer) {
         parser.parseOperand(bdIdOperand) ||
         parser.parseRParen())
         return mlir::failure();
-    
-    // Parse attributes: { offset = ..., len = ..., enable_packet = ..., packet_id = ..., next_bd = ... }
+
+    // Parse attributes (includes offset, len, enable_packet, packet_id, next_bd,
+    // acquire_lock_id, acquire_lock_val, release_lock_id, release_lock_val)
     if (parser.parseOptionalAttrDict(result.attributes))
         return mlir::failure();
     
@@ -318,8 +319,8 @@ void dfschedule::KernelMainOp::print(::mlir::OpAsmPrinter &printer) {
     mlir::Type bdHandleType;
     if (parser.parseType(bdHandleType))
         return mlir::failure();
-    
-    // Resolve operands
+
+    // Resolve operands (3: buffer, tile, bd_id)
     if (parser.resolveOperand(bufferOperand, bufferType, result.operands) ||
         parser.resolveOperand(tileOperand, tileType, result.operands) ||
         parser.resolveOperand(bdIdOperand, bdIdType, result.operands))
@@ -335,8 +336,7 @@ void dfschedule::ConfigDmaBdOp::print(::mlir::OpAsmPrinter &printer) {
     printer << "(";
     printer << getBuffer() << ", " << getTile() << ", " << getBdId();
     printer << ") {";
-    
-    // Print attributes with proper indentation
+
     printer.increaseIndent();
     printer.printNewline();
     printer << "offset = " << getOffset() << ",";
@@ -347,7 +347,15 @@ void dfschedule::ConfigDmaBdOp::print(::mlir::OpAsmPrinter &printer) {
     printer.printNewline();
     printer << "packet_id = " << getPacketId() << ",";
     printer.printNewline();
-    printer << "next_bd = " << getNextBd();
+    printer << "next_bd = " << getNextBd() << ",";
+    printer.printNewline();
+    printer << "acquire_lock_id = " << static_cast<int32_t>(getAcquireLockId()) << ",";
+    printer.printNewline();
+    printer << "acquire_lock_val = " << static_cast<int32_t>(getAcquireLockVal()) << ",";
+    printer.printNewline();
+    printer << "release_lock_id = " << static_cast<int32_t>(getReleaseLockId()) << ",";
+    printer.printNewline();
+    printer << "release_lock_val = " << static_cast<int32_t>(getReleaseLockVal());
     printer.decreaseIndent();
     printer.printNewline();
     printer << "} ";
@@ -695,21 +703,20 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
     
     // %bd_config = dfschedule.config.dma_bd(%gmem, %shim0, %bd_id) {...}
     auto bdHandleType = dfschedule::BdHandleType::get(ctx);
-    auto minusOne = builder.create<arith::ConstantOp>(location, builder.getI32Type(), builder.getI32IntegerAttr(-1));
-    auto bdConfig = builder.create<dfschedule::ConfigDmaBdOp>(
-        location, bdHandleType,
-        gmem.getResult(),
-        shim0.getResult(),
-        bdIdForConfig.getBdId(),          // bd_id from GetBdIdOp
-        builder.getI32IntegerAttr(0),     // offset
-        builder.getI32IntegerAttr(1024),  // len
-        builder.getBoolAttr(true),        // enable_packet
-        builder.getI32IntegerAttr(10),    // packet_id
-        builder.getI32IntegerAttr(-1),    // next_bd
-        minusOne.getResult(),             // acquire_lock_id = -1 (host-side, no lock)
-        minusOne.getResult()              // release_lock_id = -1 (host-side, no lock)
-    );
-    
+    auto bdConfig =
+        builder.create<dfschedule::ConfigDmaBdOp>(location, bdHandleType, gmem.getResult(), shim0.getResult(),
+                                                  bdIdForConfig.getBdId(),         // bd_id from GetBdIdOp
+                                                  builder.getI32IntegerAttr(0),    // offset
+                                                  builder.getI32IntegerAttr(1024), // len
+                                                  builder.getBoolAttr(true),       // enable_packet
+                                                  builder.getI32IntegerAttr(10),   // packet_id
+                                                  builder.getI32IntegerAttr(-1),   // next_bd
+                                                  builder.getI32IntegerAttr(-1),   // acquire_lock_id (no lock)
+                                                  builder.getI32IntegerAttr(-1),   // acquire_lock_val
+                                                  builder.getI32IntegerAttr(-1),   // release_lock_id (no lock)
+                                                  builder.getI32IntegerAttr(-1)    // release_lock_val
+        );
+
     // %io_0 = dfschedule.config.create_io(%bd_config, %shim0) {...}
     auto ioHandleType = dfschedule::IoHandleType::get(ctx);
     auto io0 = builder.create<dfschedule::ConfigCreateIoOp>(
@@ -958,35 +965,35 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     
     // %bd_ping = dfschedule.config.dma_bd(%ping, %tile, %bd_id_ping) { ... }
     // DMA acquires ping_acquire_lock (lockId0) and releases ping_release_lock (lockId2)
-    auto bdPing = builder.create<dfschedule::ConfigDmaBdOp>(
-        location, bdHandleType,
-        ping.getResult(),
-        tileArg,
-        pingBdIdOp.getBdId(),                      // bd_id from GetBdIdOp
-        builder.getI32IntegerAttr(0),              // offset
-        builder.getI32IntegerAttr(bufferLen),      // len
-        builder.getBoolAttr(true),                 // enable_packet
-        builder.getI32IntegerAttr(packetIdBase),   // packet_id
-        builder.getI32IntegerAttr(1),              // next_bd (chain to pong)
-        lockId0.getResult(),                       // acquire_lock_id (ping acquire)
-        lockId2.getResult()                        // release_lock_id (ping release)
-    );
-    
+    auto bdPing =
+        builder.create<dfschedule::ConfigDmaBdOp>(location, bdHandleType, ping.getResult(), tileArg,
+                                                  pingBdIdOp.getBdId(),                    // bd_id from GetBdIdOp
+                                                  builder.getI32IntegerAttr(0),            // offset
+                                                  builder.getI32IntegerAttr(bufferLen),    // len
+                                                  builder.getBoolAttr(true),               // enable_packet
+                                                  builder.getI32IntegerAttr(packetIdBase), // packet_id
+                                                  builder.getI32IntegerAttr(1),            // next_bd (chain to pong)
+                                                  builder.getI32IntegerAttr(0), // acquire_lock_id (ping acquire)
+                                                  builder.getI32IntegerAttr(1), // acquire_lock_val
+                                                  builder.getI32IntegerAttr(2), // release_lock_id (ping release)
+                                                  builder.getI32IntegerAttr(1)  // release_lock_val
+        );
+
     // %bd_pong = dfschedule.config.dma_bd(%pong, %tile, %bd_id_pong) { ... }
     // DMA acquires pong_acquire_lock (lockId1) and releases pong_release_lock (lockId3)
-    auto bdPong = builder.create<dfschedule::ConfigDmaBdOp>(
-        location, bdHandleType,
-        pong.getResult(),
-        tileArg,
-        pongBdIdOp.getBdId(),                      // bd_id from GetBdIdOp
-        builder.getI32IntegerAttr(0),              // offset
-        builder.getI32IntegerAttr(bufferLen),      // len
-        builder.getBoolAttr(true),                 // enable_packet
-        builder.getI32IntegerAttr(packetIdBase + 1), // packet_id
-        builder.getI32IntegerAttr(0),              // next_bd (chain back to ping)
-        lockId1.getResult(),                       // acquire_lock_id (pong acquire)
-        lockId3.getResult()                        // release_lock_id (pong release)
-    );
+    auto bdPong =
+        builder.create<dfschedule::ConfigDmaBdOp>(location, bdHandleType, pong.getResult(), tileArg,
+                                                  pongBdIdOp.getBdId(),                        // bd_id from GetBdIdOp
+                                                  builder.getI32IntegerAttr(0),                // offset
+                                                  builder.getI32IntegerAttr(bufferLen),        // len
+                                                  builder.getBoolAttr(true),                   // enable_packet
+                                                  builder.getI32IntegerAttr(packetIdBase + 1), // packet_id
+                                                  builder.getI32IntegerAttr(0), // next_bd (chain back to ping)
+                                                  builder.getI32IntegerAttr(1), // acquire_lock_id (pong acquire)
+                                                  builder.getI32IntegerAttr(1), // acquire_lock_val
+                                                  builder.getI32IntegerAttr(3), // release_lock_id (pong release)
+                                                  builder.getI32IntegerAttr(1)  // release_lock_val
+        );
     //*/
     // (locks already initialized above)
     

@@ -49,7 +49,9 @@ class BdConfig:
     enable_packet: bool
     packet_id: int
     acquire_lock_id: int = -1  # -1 means unset / no lock
+    acquire_lock_val: int = -1 # DMA lock operate value for acquire
     release_lock_id: int = -1  # -1 means unset / no lock
+    release_lock_val: int = -1 # DMA lock operate value for release
 
 @dataclass
 class IoConfig:
@@ -127,10 +129,18 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
             return f"{var}[{s.off0}:{s.off0+s.size0}, {s.off1}:{s.off1+s.size1}]"
         return var
 
-    # 4. Parse lock IDs from DMA BD Config comments
-    #    Format: /* DMA BD Config: bd_id=X, ..., acquire_lock_id=Y, release_lock_id=Z */
-    bd_comment_locks: Dict[int, Tuple[int, int]] = {}  # positional index -> (acq, rel)
+    # 4. Parse lock IDs and values from DMA BD Config comments
+    #    Format: /* DMA BD Config: ..., acquire_lock_id=Y, acquire_lock_val=V, release_lock_id=Z, release_lock_val=W */
+    bd_comment_locks: Dict[str, Tuple[int, int, int, int]] = {}  # bd_var -> (acq_id, acq_val, rel_id, rel_val)
     bd_comment_pattern = re.compile(
+        r"/\*\s*DMA BD Config:.*?"
+        r"acquire_lock_id=(-?\d+).*?"
+        r"acquire_lock_val=(-?\d+).*?"
+        r"release_lock_id=(-?\d+).*?"
+        r"release_lock_val=(-?\d+).*?\*/",
+        re.DOTALL,
+    )
+    bd_comment_pattern_old = re.compile(
         r"/\*\s*DMA BD Config:.*?"
         r"acquire_lock_id=(-?\d+).*?"
         r"release_lock_id=(-?\d+).*?\*/",
@@ -140,12 +150,19 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
         r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
     )
     for cm in bd_comment_pattern.finditer(text):
-        acq = int(cm.group(1))
-        rel = int(cm.group(2))
+        acq_id, acq_val = int(cm.group(1)), int(cm.group(2))
+        rel_id, rel_val = int(cm.group(3)), int(cm.group(4))
         after = text[cm.end():]
         call_m = bd_call_pattern.search(after)
         if call_m:
-            bd_comment_locks[call_m.group(1)] = (acq, rel)
+            bd_comment_locks[call_m.group(1)] = (acq_id, acq_val, rel_id, rel_val)
+    # Fallback: old comment format without lock_val
+    for cm in bd_comment_pattern_old.finditer(text):
+        acq_id, rel_id = int(cm.group(1)), int(cm.group(2))
+        after = text[cm.end():]
+        call_m = bd_call_pattern.search(after)
+        if call_m and call_m.group(1) not in bd_comment_locks:
+            bd_comment_locks[call_m.group(1)] = (acq_id, -1, rel_id, -1)
 
     # 5. Parse XAie_LockSetValue calls for lock init values
     #    Pattern A: XAie_LockSetValue(dev, XAie_TileLoc(col, row), XAie_LockInit(lock_id, value))
@@ -201,10 +218,9 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
         if next_bd_raw < 0 or next_bd_raw > 65535:
             next_bd_raw = -1
 
-        acq_lock = -1
-        rel_lock = -1
+        acq_lock, acq_val, rel_lock, rel_val = -1, -1, -1, -1
         if bd_var in bd_comment_locks:
-            acq_lock, rel_lock = bd_comment_locks[bd_var]
+            acq_lock, acq_val, rel_lock, rel_val = bd_comment_locks[bd_var]
 
         bd = BdConfig(
             var=bd_var,
@@ -219,7 +235,9 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
             enable_packet=int(m.group(9)) != 0,
             packet_id=int(m.group(10)),
             acquire_lock_id=acq_lock,
+            acquire_lock_val=acq_val,
             release_lock_id=rel_lock,
+            release_lock_val=rel_val,
         )
         bd_map[bd.var] = bd
 
@@ -264,7 +282,7 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
     for info in tiles.values():
         info.bds.sort(key=lambda b: b.bd_id)
 
-    # 10. Populate per-tile lock info from BD lock IDs and init/operate maps
+    # 10. Populate per-tile lock info from BD lock IDs/values and init/operate maps
     for info in tiles.values():
         loc = info.loc
         for bd in info.bds:
@@ -276,6 +294,14 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
                 lk = info.locks[lid]
                 if loc in lock_init_map and lid in lock_init_map[loc]:
                     lk.init_value = lock_init_map[loc][lid]
+            # Use lock values from BD config comments (acquire_lock_val, release_lock_val)
+            if bd.acquire_lock_id >= 0 and bd.acquire_lock_val >= 0:
+                if bd.acquire_lock_id in info.locks:
+                    info.locks[bd.acquire_lock_id].operate_value = bd.acquire_lock_val
+            if bd.release_lock_id >= 0 and bd.release_lock_val >= 0:
+                if bd.release_lock_id in info.locks:
+                    info.locks[bd.release_lock_id].operate_value = bd.release_lock_val
+            # Fallback: use XAie_DmaSetLock operate values if available
             if bd.var in lock_operate_map:
                 acq_val, rel_val = lock_operate_map[bd.var]
                 if bd.acquire_lock_id >= 0 and bd.acquire_lock_id in info.locks:
