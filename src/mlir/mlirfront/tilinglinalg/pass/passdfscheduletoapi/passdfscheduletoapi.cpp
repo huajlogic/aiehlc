@@ -909,6 +909,15 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         auto addrConst = rewriter.create<emitc::ConstantOp>(
             loc, u64Type, rewriter.getIntegerAttr(u64Type, offset));
 
+        auto acquireLockIdConst =
+            rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(acquireLockId));
+        auto acquireLockValConst =
+            rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(acquireLockVal));
+        auto releaseLockIdConst =
+            rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(releaseLockId));
+        auto releaseLockValConst =
+            rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(releaseLockVal));
+
         auto configCall = rewriter.create<emitc::CallOpaqueOp>(
             loc, dmaDescType, "__Runtime_dma_bd_config", nullptr, nullptr,
             ValueRange{
@@ -921,8 +930,12 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                 nextBdConst.getResult(), // next_bd
                 rewriter.create<emitc::ConstantOp>(loc, i32Type,
                                                    rewriter.getI32IntegerAttr(enablePacket ? 1 : 0))
-                    .getResult(),         // enable_packet
-                packetIdConst.getResult() // packet_id
+                    .getResult(),                // enable_packet
+                packetIdConst.getResult(),       // packet_id
+                acquireLockIdConst.getResult(),  // acquire_lock_id
+                acquireLockValConst.getResult(), // acquire_lock_val
+                releaseLockIdConst.getResult(),  // release_lock_id
+                releaseLockValConst.getResult()  // release_lock_val
             });
 
         llvm::errs() << "  ✓ Created DMA BD config with full AIE API parameters\n";

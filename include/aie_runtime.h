@@ -55,7 +55,9 @@ AieRC __Runtime_device_teardown(void);
 
 // DMA and data movement
 XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, uint64_t addr,
-                                     int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id);
+                                     int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
+                                     int32_t acquire_lock_id, int32_t acquire_lock_val, int32_t release_lock_id,
+                                     int32_t release_lock_val);
 
 struct_io __Runtime_dma_createio(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, int32_t channel_id, int32_t bd_id,
                                  XAie_MemInst *mem);

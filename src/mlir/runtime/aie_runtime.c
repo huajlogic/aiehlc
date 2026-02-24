@@ -119,11 +119,30 @@ AieRC __Runtime_device_teardown(void) {
  * Maps to XAie DMA APIs
  */
 XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, uint64_t addr,
-                                     int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id) {
-    XAie_DmaDesc desc;
-    // TODO: Use XAie_DmaDescInit and configure
-    // Reference: XAie routing APIs in aieml_perf.cc
-    return desc;
+                                     int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
+                                     int32_t acquire_lock_id, int32_t acquire_lock_val, int32_t release_lock_id,
+                                     int32_t release_lock_val) {
+    XAie_DmaDesc DmaInst;
+    XAie_DmaDescInit(dev, &DmaInst, tile);
+    XAie_DmaSetAddrLen(&DmaInst, (uint64_t)addr, (uint32_t)(len * sizeof(int32_t)));
+
+    if (acquire_lock_id >= 0 && release_lock_id >= 0) {
+        XAie_DmaSetLock(&DmaInst, XAie_LockInit(acquire_lock_id, acquire_lock_val),
+                        XAie_LockInit(release_lock_id, release_lock_val));
+    }
+
+    if (next_bd >= 0) {
+        XAie_DmaSetNextBd(&DmaInst, (uint8_t)next_bd, XAIE_ENABLE);
+    }
+
+    if (enable_packet) {
+        XAie_DmaSetPkt(&DmaInst, XAie_PacketInit(packet_id, 0));
+    }
+
+    XAie_DmaEnableBd(&DmaInst);
+    XAie_DmaWriteBd(dev, &DmaInst, tile, (uint8_t)bd_id);
+
+    return DmaInst;
 }
 
 /**
