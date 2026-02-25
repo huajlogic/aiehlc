@@ -158,8 +158,10 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
     BoolAttr:$enable_packet,
     I32Attr:$packet_id,
     I32Attr:$next_bd,
-    I32:$acquire_lock_id,  // Lock ID to acquire before DMA transfer (-1 = no lock)
-    I32:$release_lock_id   // Lock ID to release after DMA transfer (-1 = no lock)
+    DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_id,
+    DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_val,
+    DefaultValuedAttr<I32Attr, "-1">:$release_lock_id,
+    DefaultValuedAttr<I32Attr, "-1">:$release_lock_val
   );
   let results = (outs dfschedule_BdHandleType:$bd_handle);
   let hasCustomAssemblyFormat = 1;
@@ -872,6 +874,265 @@ def dfschedule_KernelScheduleOp : dfscheduleop<"kernel_schedule", [
   let arguments = (ins SymbolNameAttr:$sym_name);
   let regions = (region SizedRegion<1>:$body);
   let hasCustomAssemblyFormat = 1;
+}
+
+// ============================================================================
+// GENERAL KERNEL MODULE OPERATIONS
+// ============================================================================
+// These operations form a general-purpose kernel IR that can be lowered by
+// different passes to generate either:
+//   - LegacyKernelPass  -> adfkernellegacy.cc style (loop inside kernel)
+//   - AdfKernelPass     -> adfkernel.cc style (loop in wrapper)
+// ============================================================================
+
+// Top-level kernel module container
+def dfschedule_KernelModuleOp : dfscheduleop<"module", [
+    IsolatedFromAbove,
+    SymbolTable,
+    Symbol,
+    SingleBlock,
+    NoTerminator
+  ]> {
+  let summary = "Top-level kernel module containing config, buffers, windows, and main";
+  let description = [{
+    This operation represents a complete kernel module that can be lowered
+    by different passes to produce either legacy or ADF-style code.
+    
+    Example:
+    ```mlir
+    dfschedule.module @kernel_driver {
+      dfschedule.kernel_config_def @config {...}
+      dfschedule.lock_def @LOCK_win_ping_ACQ {id = 48}
+      dfschedule.buffer_def @win_ping : memref<256xvector<4xi32>, "LOCAL">
+      dfschedule.window_def @window_in {...}
+      dfschedule.kernel_decl @perf {...}
+      dfschedule.main @main {...}
+    }
+    ```
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+}
+
+// Kernel configuration metadata
+def dfschedule_KernelConfigDefOp : dfscheduleop<"kernel_config_def", [Symbol]> {
+  let summary = "Define kernel configuration metadata";
+  let description = [{
+    Defines kernel metadata like name, file, buffer size, element type, etc.
+    This is used by lowering passes to generate appropriate includes and constants.
+    
+    Example:
+    ```mlir
+    dfschedule.kernel_config_def @config {
+      kernel_name = "perf",
+      kernel_file = "perf.cc",
+      buffer_size = 256 : i32,
+      element_type = i32,
+      vector_width = 4 : i32
+    }
+    ```
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    DictionaryAttr:$config_attrs
+  );
+  let assemblyFormat = "$sym_name $config_attrs attr-dict";
+}
+
+// Lock definition
+def dfschedule_LockDefOp : dfscheduleop<"lock_def", [Symbol]> {
+  let summary = "Define a named lock with ID";
+  let description = [{
+    Defines a named lock that can be referenced by windows and kernel operations.
+    The lock ID is used for hardware lock allocation.
+    
+    Example:
+    ```mlir
+    dfschedule.lock_def @LOCK_win_ping_ACQ {id = 48 : i32}
+    ```
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    I32Attr:$id
+  );
+  let assemblyFormat = "$sym_name attr-dict";
+}
+
+// Buffer definition
+def dfschedule_BufferDefOp : dfscheduleop<"buffer_def", [Symbol]> {
+  let summary = "Define a named buffer with type";
+  let description = [{
+    Defines a named buffer (typically in local memory) that can be referenced
+    by windows. Used for ping-pong buffer pairs.
+    
+    Example:
+    ```mlir
+    dfschedule.buffer_def @win_ping : memref<256xvector<4xi32>, "LOCAL">
+    ```
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttr:$buffer_type
+  );
+  let assemblyFormat = "$sym_name `:` $buffer_type attr-dict";
+}
+
+// Window definition (abstract ping-pong window)
+def dfschedule_WindowDefOp : dfscheduleop<"window_def", [Symbol]> {
+  let summary = "Define an abstract window combining ping-pong buffers with locks";
+  let description = [{
+    Defines a window abstraction that combines:
+    - Direction (in/out)
+    - Ping/pong buffer references
+    - Acquire/release lock references
+    - Buffer size and async mode
+    
+    This abstraction allows different lowering strategies based on iteration_style.
+    
+    Example:
+    ```mlir
+    dfschedule.window_def @window_in {
+      direction = "in",
+      ping_buffer = @win_ping,
+      pong_buffer = @win_pong,
+      acquire_lock = @LOCK_win_ping_ACQ,
+      release_lock = @LOCK_win_pong_REL,
+      buffer_size = 256 : i32,
+      async = true
+    }
+    ```
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    DictionaryAttr:$window_attrs
+  );
+  let assemblyFormat = "$sym_name $window_attrs attr-dict";
+}
+
+// Kernel declaration with iteration style
+def dfschedule_KernelDeclOp : dfscheduleop<"kernel_decl", [Symbol]> {
+  let summary = "Declare a kernel with inputs, outputs, and iteration style";
+  let description = [{
+    Declares the kernel interface with:
+    - Input window references
+    - Output window references
+    - iteration_style: "internal" (loop in kernel) or "external" (loop in wrapper)
+    
+    The iteration_style determines how the lowering pass generates code.
+    
+    Example:
+    ```mlir
+    dfschedule.kernel_decl @perf {
+      inputs = [@window_in],
+      outputs = [@window_out],
+      iteration_style = "internal"
+    }
+    ```
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    DictionaryAttr:$decl_attrs
+  );
+  let assemblyFormat = "$sym_name $decl_attrs attr-dict";
+}
+
+// Main entry point
+def dfschedule_KernelMainOp : dfscheduleop<"main", [
+    Symbol,
+    SingleBlock
+  ]> {
+  let summary = "Kernel main entry point";
+  let description = [{
+    The main entry point for the kernel driver. Contains:
+    - Sync buffer allocation
+    - Window initialization
+    - Kernel invocation
+    - Completion signaling
+    - Terminated by dfschedule.kernel_return
+    
+    Example:
+    ```mlir
+    dfschedule.main @main {
+      %sync = dfschedule.alloc_sync_buffer {size = 8}
+      %win = dfschedule.window_init(@window_in)
+      dfschedule.kernel_invoke @perf(%win)
+      dfschedule.done
+      dfschedule.kernel_return
+    }
+    ```
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+}
+
+// Allocate sync buffer
+def dfschedule_AllocSyncBufferOp : dfscheduleop<"alloc_sync_buffer"> {
+  let summary = "Allocate a sync buffer for iteration control";
+  let arguments = (ins I32Attr:$size);
+  let results = (outs dfschedule_SyncBufferType:$buffer);
+  let assemblyFormat = "attr-dict `:` type($buffer)";
+}
+
+// Write to sync buffer
+def dfschedule_SyncBufferWriteOp : dfscheduleop<"sync_buffer_write"> {
+  let summary = "Write a value to sync buffer at specified index";
+  let arguments = (ins
+    dfschedule_SyncBufferType:$buffer,
+    I32:$value,
+    I32Attr:$index
+  );
+  let assemblyFormat = "`(` $buffer `,` $value `)` attr-dict";
+}
+
+// Debug logging
+def dfschedule_LogOp : dfscheduleop<"log"> {
+  let summary = "Log a debug value";
+  let arguments = (ins I32:$value);
+  let assemblyFormat = "`(` $value `)` attr-dict";
+}
+
+// Initialize window
+def dfschedule_WindowInitOp : dfscheduleop<"window_init"> {
+  let summary = "Initialize a window from a window definition";
+  let description = [{
+    Initializes a window and returns a handle for kernel invocation.
+    The lowering depends on iteration_style:
+    - "internal": generates window_init() + get_async_window()
+    - "external": generates _io_buffer<> initialization
+  }];
+  let arguments = (ins SymbolRefAttr:$window_ref);
+  let results = (outs AnyType:$window);
+  let assemblyFormat = "`(` $window_ref `)` attr-dict `:` type($window)";
+}
+
+// Invoke kernel
+def dfschedule_KernelInvokeOp : dfscheduleop<"kernel_invoke"> {
+  let summary = "Invoke a kernel with window arguments";
+  let description = [{
+    Invokes the kernel with the given window arguments.
+    The lowering depends on iteration_style:
+    - "internal": single kernel call (loop is inside kernel)
+    - "external": while loop with setData/acquire/release per iteration
+  }];
+  let arguments = (ins
+    SymbolRefAttr:$kernel_ref,
+    Variadic<AnyType>:$args
+  );
+  let assemblyFormat = "$kernel_ref `(` $args `)` attr-dict `:` `(` type($args) `)`";
+}
+
+// Signal completion
+def dfschedule_DoneOp : dfscheduleop<"done"> {
+  let summary = "Signal kernel completion";
+  let assemblyFormat = "attr-dict";
+}
+
+// Return from kernel main
+def dfschedule_KernelReturnOp : dfscheduleop<"kernel_return", [Terminator]> {
+  let summary = "Return from kernel main";
+  let assemblyFormat = "attr-dict";
 }
  
 #endif // dfschedule_OPS

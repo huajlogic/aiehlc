@@ -20,29 +20,8 @@ run_cmd() {
 }
 
 usage() {
-    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]]"
-    exit 1
-}
-
-redefine_symbols() {
-    local obj_file="$1"
-    local func_name="$2"
-    local objcopy_tool="$3"
-
-    nm "$obj_file" | while read -r line; do
-        symbol=$(echo "$line" | awk '{print $3}')
-        
-        if echo "$symbol" | grep -q "_binary__.*_aout_build_${func_name}_.*_end$"; then
-            dbg_echo "Renaming symbol: $symbol to _binary_kernel_${func_name}_end"
-            "$objcopy_tool" --redefine-sym "$symbol"=_binary_kernel_"${func_name}"_end "$obj_file"
-        elif echo "$symbol" | grep -q "_binary__.*_aout_build_${func_name}_.*_start$"; then
-            dbg_echo "Renaming symbol: $symbol to _binary_kernel_${func_name}_start"
-            "$objcopy_tool" --redefine-sym "$symbol"=_binary_kernel_"${func_name}"_start "$obj_file"
-        elif echo "$symbol" | grep -q "_binary__.*_aout_build_${func_name}_.*_size$"; then
-            dbg_echo "Renaming symbol: $symbol to _binary_kernel_${func_name}_size"
-            "$objcopy_tool" --redefine-sym "$symbol"=_binary_kernel_"${func_name}"_size "$obj_file"
-        fi
-    done
+    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only]"
+    return 1
 }
 
 build_hw_lib() {
@@ -108,6 +87,7 @@ build_hw_lib() {
     }
 
 
+main() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AIEHLC_DIR="${SCRIPT_DIR}/../"
 runtime_source_file=""
@@ -115,11 +95,13 @@ aie_version="2"
 use_llvm_aie="false"
 DEBUG_OUTPUT=0
 platform="baremetal"
+COMPILE_AIELIB_ONLY=0
 USE_LOCAL_AIERT_BSP=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -help)
             usage
+            return 0
             ;;
         --runtime-source-file)
             runtime_source_file="$2"
@@ -145,12 +127,24 @@ while [[ $# -gt 0 ]]; do
             DEBUG_OUTPUT=1
             shift
             ;;
+        --aielib-only)
+            COMPILE_AIELIB_ONLY=1
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             usage
+            return 1
             ;;
     esac
 done
+
+# Parameter validation
+if [ "$COMPILE_AIELIB_ONLY" -eq 0 ] && [ -z "$runtime_source_file" ]; then
+    echo "Error: --runtime-source-file is required."
+    usage
+    return 0
+fi
 
 #set up env
 run_cmd "source $SCRIPT_DIR/setup.sh --path-set-only"
@@ -176,65 +170,6 @@ else
     echo "Using Vitis aie-rt headers from $XILINX_VITIS_AIETOOLS//include/drivers/aiengine"
     AIETOOLS_INCLUDE_BASE="$XILINX_VITIS_AIETOOLS//include/drivers/aiengine"
 fi
-
-INCLUDE_PATH="-I$XILINX_VITIS_AIETOOLS/include \
--I$XILINX_VITIS_AIETOOLS//include/aie_api \
--I$AIETOOLS_INCLUDE_BASE"
-
-LLVM_AIE_INCLUDE_PATH="-I$XILINX_VITIS_AIETOOLS/include \
--I$XILINX_VITIS_AIETOOLS//include/aie_api \
--I$AIETOOLS_INCLUDE_BASE \
-"
-LLVM_AIE_LIB_PATH="-Wl,-L$XILINX_VITIS_AIETOOLS/data/aie_ml/lib/Release"
-
-compiler_flags_llvm_aie_aie="-include ${LLVM_AIE_PATH}/../llvm-aie-extra.h -Wno-unknown-attributes -Wno-macro-redefined -O2 -std=c++20 --target=aie2-none-unknown-elf -D__AIECC__ -D__AIENGINE__ -D__AIE_ARCH__=10 -D__AIEARCH=10 -D_LIBCPP_HAS_NO_THREADS -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR $LLVM_AIE_INCLUDE_PATH $INCLUDE_PATH"
-compiler_flags_llvm_aie_aieml="-include ${LLVM_AIE_PATH}/../llvm-aie-extra.h -Wno-unknown-attributes -Wno-macro-redefined -O2 -std=c++20 --target=aie2-none-unknown-elf -D__AIECC__ -D__AIENGINE__ -D__AIE_ARCH__=20 -D__AIEARCH=20 -D_LIBCPP_HAS_NO_THREADS -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $LLVM_AIE_INCLUDE_PATH $INCLUDE_PATH"
-compiler_flags_llvm_aie_aie2ps="-include ${LLVM_AIE_PATH}/../llvm-aie-extra.h -Wno-unknown-attributes -Wno-macro-redefined -O2 -std=c++20 --target=aie2-none-unknown-elf -D__AIECC__ -D__AIENGINE__ -D__AIE_ARCH__=22 -D__AIEARCH=22 -D_LIBCPP_HAS_NO_THREADS -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $LLVM_AIE_INCLUDE_PATH $INCLUDE_PATH"
-
-if [ $DEBUG_OUTPUT = 1 ]; then
-    compiler_flags_llvm_aie_aie+="-v"
-    compiler_flags_llvm_aie_aieml+="-v"
-    compiler_flags_llvm_aie_aie2ps+="-v"
-fi
-
-arch_model_dir_aie="${XILINX_VITIS}/aietools/data/aie/lib"
-arch_model_dir_aieml="${XILINX_VITIS}/aietools/data/aie_ml/lib"
-arch_model_dir_aie2ps="${XILINX_VITIS}/aietools/data/aie2ps/lib"
-
-
-silent_flag="-s"
-if [ $DEBUG_OUTPUT = 1 ]; then
-    silent_flag="+s"
-fi
-
-compiler_flags_aie="$silent_flag +f -p me -P $arch_model_dir_aie +P 4 +Wllvm,-O2,-fno-jump-tables,-fno-discard-value-names,-mllvm,-chess-collapse-struct-types-during-linking=0,-Xclang,-chess-only-info-critical-passes -D__AIENGINE__ -D__AIE_ARCH__=10 -D__AIEARCH=10 -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR $INCLUDE_PATH -I"$KERNEL_DIR/TheHouseOfCommons/" "
-compiler_flags_aieml="-aiearch aie-ml $silent_flag +f -p me -P $arch_model_dir_aieml +P 4 +Wllvm,-O2,-fno-jump-tables,-fno-discard-value-names,-mllvm,-chess-collapse-struct-types-during-linking=0,-Xclang,-chess-only-info-critical-passes -D__AIENGINE__ -D__AIE_ARCH__=20 -D__AIEARCH=20 -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $INCLUDE_PATH -I"$KERNEL_DIR/TheHouseOfCommons/" "
-compiler_flags_aie2ps="-aiearch aie2ps $silent_flag +f -p me -P $arch_model_dir_aie2ps +P 4 +Wllvm,-O2,-fno-jump-tables,-fno-discard-value-names,-mllvm,-chess-collapse-struct-types-during-linking=0,-Xclang,-chess-only-info-critical-passes -D__AIENGINE__ -D__AIE_ARCH__=22 -D__AIEARCH=22 -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST $INCLUDE_PATH -I"$KERNEL_DIR/TheHouseOfCommons/" "
-
-extra_chess_flag=""
-if [[ "$aie_version" == "1" ]]; then
-    compiler_flags_chess="$compiler_flags_aie"
-    compiler_flags_llvm_aie="$compiler_flags_llvm_aie_aie"
-    arch_model_dir="$arch_model_dir_aie"
-elif [[ "$aie_version" == "2" ]]; then
-    compiler_flags_chess="$compiler_flags_aieml"
-    compiler_flags_llvm_aie="$compiler_flags_llvm_aie_aieml"
-    arch_model_dir="$arch_model_dir_aieml"
-    extra_chess_flag+=" -aiearch aie-ml"
-elif [[ "$aie_version" == "5" ]]; then
-    compiler_flags_chess="$compiler_flags_aie2ps"
-    compiler_flags_llvm_aie="$compiler_flags_llvm_aie_aie2ps"
-    arch_model_dir="$arch_model_dir_aie2ps"
-    extra_chess_flag+=" -aiearch aie2ps"
-else
-    echo "Unsupported AIE version: $aie_version"
-    exit 1
-fi
-
-chess_elf_compiler="xchessmk $extra_chess_flag $silent_flag -s -C Release_LLVM -P $arch_model_dir +P 4 -DDEPLOYMENT_ELF=1 -D__LOCK_FENCE_MODE__=0 -DAIE_OPTION_SCALAR_FLOAT_ON_VECTOR -DAIE2_FP32_EMULATION_ACCURACY_FAST"
-linker="${TOOL_PREFIX}ld -EL -r -b binary"
-
-objcopy_tool="${TOOL_PREFIX}objcopy"
 
 # Arch paths
 ARCH_DIR=$AIEHLC_DIR/thirdparty/arch/
@@ -281,7 +216,7 @@ elif [[ $aie_version == "5" ]]; then
     EXTRA_LIBS="-lxiltimer,-lxilstandalone,"
 else
     echo "Unsupported AIE version: $aie_version"
-    exit 1
+    return 1
 fi
 AIENGINE_LIB_DIR=$ARCH_APU_ALIB/../libsrc/build_configs/gen_bsp/libsrc/aienginev2/src
 
@@ -312,6 +247,11 @@ if [ -d "${AIE_DRIVER_PARENT_DIR}/aie-rt/driver/" ] ; then
     else
         echo "aie_version $aie_version is unknown"
     fi
+fi
+
+if [ "$COMPILE_AIELIB_ONLY" -eq 1 ]; then
+    echo "aielib compilation complete (--aielib-only)."
+    return 0
 fi
 
 #Set the aie-rt include path FOR aiehlc 
@@ -361,30 +301,26 @@ while IFS= read -r kernel_source_file; do
     obj_file="${KERNEL_BUILD_DIR}/kernel.o"
     temp_obj_files+=("$obj_file")
 
-    mkdir -p "$KERNEL_BUILD_DIR"
+    compile_args=(
+        --kernel-cc "$KERNEL_SRC/wrapper.cc"
+        --output-dir "$KERNEL_BUILD_DIR"
+        --func-name "$func_name"
+        --aie-version "$aie_version"
+        --platform "$platform"
+        --include-base "$AIETOOLS_INCLUDE_BASE"
+    )
 
-    if [[ "$use_llvm_aie" != "true" ]]; then
-        echo "Compiling Kernel (using chess): $kernel_source_file"
-        set -x
-        xchesscc $compiler_flags_chess -o "${KERNEL_BUILD_DIR}/kernel_orig.ll" "$KERNEL_SRC/wrapper.cc"
-        set +x
-        
-        run_cmd "$XILINX_VITIS_AIETOOLS/lnx64.o/tools/clang/bin/opt -S -load-pass-plugin="$XILINX_VITIS_AIETOOLS/lib/lnx64.o/libLLVMXLOpt.so" -passes=xlopt "${KERNEL_BUILD_DIR}/kernel_orig.ll" -o "${KERNEL_BUILD_DIR}/kernel.ll""
-        run_cmd "$XILINX_VITIS_AIETOOLS/lnx64.o/tools/clang/bin/opt -S -load-pass-plugin="$XILINX_VITIS_AIETOOLS/lib/lnx64.o/libLLVMXLOpt.so" -passes=xlopt "${KERNEL_BUILD_DIR}/kernel.ll" -o "${KERNEL_BUILD_DIR}/kernel.ll""
-
-        dbg_echo $chess_elf_compiler +o "$KERNEL_BUILD_DIR" "$KERNEL_SRC/aieml.prx"
-        $chess_elf_compiler +o "$KERNEL_BUILD_DIR" "$KERNEL_SRC/aieml.prx"
+    if [[ "$use_llvm_aie" == "true" ]]; then
+        compile_args+=(--use-llvm-aie --ld-script "$KERNEL_SRC/main.ld.script")
     else
-        echo "Compiling Kernel (using llvm-aie): $kernel_source_file"
-
-        dbg_echo ${LLVM_AIE_PATH}/bin/clang++ $compiler_flags_llvm_aie "$KERNEL_SRC/wrapper.cc" -Wl,-T $KERNEL_SRC/main.ld.script -o $KERNEL_BUILD_DIR/kernel
-        ${LLVM_AIE_PATH}/bin/clang++ $compiler_flags_llvm_aie "$KERNEL_SRC/wrapper.cc" -Wl,-T $KERNEL_SRC/main.ld.script -o $KERNEL_BUILD_DIR/kernel
+        compile_args+=(--prx "$KERNEL_SRC/aieml.prx" --commons-dir "$KERNEL_DIR/TheHouseOfCommons/")
     fi
 
-    dbg_echo $linker -o "$obj_file" "$KERNEL_BUILD_DIR/kernel"
-    $linker -o "$obj_file" "$KERNEL_BUILD_DIR/kernel"
-    
-    redefine_symbols "$obj_file" "$func_name" "$objcopy_tool"
+    if [ "$DEBUG_OUTPUT" = 1 ]; then
+        compile_args+=(--debug-output)
+    fi
+
+    "source" "$SCRIPT_DIR/kc.sh" "${compile_args[@]}"
 done < "$kernel_list_file"
 
 #Compile host
@@ -412,6 +348,7 @@ echo "Compiling host..."
 echo "    $host_file"
 echo "Linking kernels..."
 echo "    ${temp_obj_files[@]}"
+set -x
 if [[ "$platform" == "baremetal" ]]; then
     dbg_echo ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
     ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
@@ -427,9 +364,12 @@ elif [[ "$platform" == "linux" ]]; then
         -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} \
         -Wl,--start-group,-lxaiengine,-lxil,--end-group
 fi
-
+set +x
 echo "Stripping extra ELF symbols..."
 ${TOOL_PREFIX}strip $HOST_BUILD_DIR/main.elf
 
 echo "Build complete."
 echo "    $HOST_BUILD_DIR/main.elf"
+}
+
+main "$@"

@@ -4,54 +4,32 @@
 ******************************************************************************/
 
 #include "passblueprinttoschedule.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Transforms/DialectConversion.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinDialect.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "dfscheblueprintmanager.h"
 #include "dfschedulemanager.h"
-#include <sstream>
-#include <vector>
-#include <unordered_map>
+#include "hw/ResourceManager.h"
+#include "hw/hwresource.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include <iostream>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
 
 using namespace mlir;
 using namespace dfscheblueprint;
 using namespace dfschedule;
 
 namespace {
-
-// ============================================================================
-// Fake Resource Manager for Lock and BD ID allocation
-// ============================================================================
-class KernelResourceManager {
-public:
-    KernelResourceManager() : nextBdId(0), nextLockId(0) {}
-    
-    // Allocate next BD ID (0, 1 for ping-pong)
-    int32_t allocateBdId() { return nextBdId++; }
-    
-    // Allocate next Lock ID
-    int64_t allocateLockId() { return nextLockId++; }
-    
-    // Reset for new kernel
-    void reset() {
-        nextBdId = 0;
-        nextLockId = 0;
-    }
-    
-private:
-    int32_t nextBdId;
-    int64_t nextLockId;
-};
 
 // Generic template function to look up any operation by symbol reference
 // This function searches for an operation of type OpTy with a matching symbol name
@@ -135,6 +113,29 @@ static bool hasDSKernelReceiver(Operation *rootOp, StringRef kernelName) {
     return false;
 }
 
+// Helper function to check if kernel module already exists in the module
+static bool hasKernelModule(Operation *rootOp, StringRef moduleName) {
+    // Find the module-level operation
+    Operation *moduleOp = rootOp;
+    while (moduleOp->getParentOp()) {
+        moduleOp = moduleOp->getParentOp();
+    }
+
+    // Search for existing kernel module with the given name
+    for (Region &region : moduleOp->getRegions()) {
+        for (Block &block : region) {
+            for (Operation &op : block) {
+                if (auto kernelModule = dyn_cast<dfschedule::KernelModuleOp>(&op)) {
+                    if (kernelModule.getSymName() == moduleName) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // Helper function to get the module-level insertion point
 static Operation* getModuleOp(Operation *rootOp) {
     Operation *moduleOp = rootOp;
@@ -144,286 +145,32 @@ static Operation* getModuleOp(Operation *rootOp) {
     return moduleOp;
 }
 
-// Generate dfschedule.dskernel_receiver function
+// Forward declarations for functions used in generateDSKernelReceiver
+static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolRefAttr target);
+
+// Generate a kernel symbol declaration only (dfschedule.dskernel_receiver with empty body).
+// Details (kernel module, buffers, locks, etc.) are filled in by a separate pass.
 // Parameters:
 //   - kernelName: symbol name for the kernel (same as load_kernel_group callee)
-//   - tensorType: the tensor type for data
-//   - bufferLen: buffer length for DMA BD
-//   - basePacketId: base packet ID from FlowTransferOp
-//   - coreChannel: DMA channel from core FlowConfig
-//   - flowIndex: unique index for this flow, used to access per-flow DMA configs
-static void generateDSKernelReceiver(
-    ConversionPatternRewriter &rewriter,
-    Location loc,
-    Operation *insertBeforeOp,
-    StringRef kernelName,
-    RankedTensorType tensorType,
-    int64_t bufferLen,
-    uint32_t basePacketId,
-    int64_t coreChannel,
-    uint32_t flowIndex,
-    KernelResourceManager &resourceMgr) {
-    
-    // Save current insertion point
-    OpBuilder::InsertionGuard guard(rewriter);
-    
-    // Find module and insert at module level (at the end of the first block)
-    Operation *moduleOp = getModuleOp(insertBeforeOp);
-    Block &moduleBlock = moduleOp->getRegions().front().front();
-    
-    // Check if block has a terminator, insert before it; otherwise insert at end
-    if (!moduleBlock.empty() && moduleBlock.back().hasTrait<OpTrait::IsTerminator>()) {
-        rewriter.setInsertionPoint(&moduleBlock.back());
-    } else {
-        rewriter.setInsertionPointToEnd(&moduleBlock);
-    }
-    
-    // Create the dskernel_receiver operation with new signature
-    auto receiverOp = rewriter.create<dfschedule::DSKernelReceiverOp>(
-        loc,
-        rewriter.getStringAttr(kernelName));
-    
-    // Create the body block with only ONE argument:
-    // %arg0: index (iteration count only)
-    Block *body = &receiverOp.getBody().emplaceBlock();
-    
-    auto indexType = rewriter.getIndexType();
-    auto arg0 = body->addArgument(indexType, loc);    // iteration count
-    
-    // Set insertion point to the body
-    rewriter.setInsertionPointToStart(body);
-    
-    // Reset resource manager for this kernel
-    resourceMgr.reset();
-    
-    // First operation: read config from tile local memory
-    // %config = dfschedule.kernel.read_kernelconfig : !dfschedule.tile_config
-    auto tileConfigType = dfschedule::TileConfigType::get(rewriter.getContext());
-    auto readConfigOp = rewriter.create<dfschedule::KernelReadConfigOp>(
-        loc, tileConfigType);
-    
-    // Extract configuration values for this flow (indexed by flow_index)
-    // %packet_id = dfschedule.config.get_packet_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPacketIdOp = rewriter.create<dfschedule::ConfigGetPacketIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // %dma_channel = dfschedule.config.get_dma_channel(%config) {flow_index = N} : (!dfschedule.tile_config) -> !dfschedule.dma_channel
-    auto getDmaChannelOp = rewriter.create<dfschedule::ConfigGetDmaChannelOp>(
-        loc, dfschedule::DmaChannelType::get(rewriter.getContext()), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // Create LOCAL memref type for ping-pong buffers
-    auto localMemRefType = MemRefType::get(
-        tensorType.getShape(),
-        tensorType.getElementType(),
-        AffineMap(),
-        rewriter.getStringAttr("LOCAL"));
-    
-    // %ping_buffer = dfschedule.config.get_buffer_addr(%config) {flow_index = N, buffer_index = 0} : (!dfschedule.tile_config) -> memref<...>
-    auto getPingBufferOp = rewriter.create<dfschedule::ConfigGetBufferAddrOp>(
-        loc, localMemRefType, readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(0));
-    
-    // %pong_buffer = dfschedule.config.get_buffer_addr(%config) {flow_index = N, buffer_index = 1} : (!dfschedule.tile_config) -> memref<...>
-    auto getPongBufferOp = rewriter.create<dfschedule::ConfigGetBufferAddrOp>(
-        loc, localMemRefType, readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(1));
-    
-    // Read lock IDs from config for this flow (indexed by flow_index)
-    // %ping_acquire_lock_id = dfschedule.config.get_ping_acquire_lock_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPingAcquireLockIdOp = rewriter.create<dfschedule::ConfigGetPingAcquireLockIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // %pong_acquire_lock_id = dfschedule.config.get_pong_acquire_lock_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPongAcquireLockIdOp = rewriter.create<dfschedule::ConfigGetPongAcquireLockIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // %ping_release_lock_id = dfschedule.config.get_ping_release_lock_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPingReleaseLockIdOp = rewriter.create<dfschedule::ConfigGetPingReleaseLockIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // %pong_release_lock_id = dfschedule.config.get_pong_release_lock_id(%config) {flow_index = N} : (!dfschedule.tile_config) -> i32
-    auto getPongReleaseLockIdOp = rewriter.create<dfschedule::ConfigGetPongReleaseLockIdOp>(
-        loc, rewriter.getI32Type(), readConfigOp.getConfig(),
-        rewriter.getI32IntegerAttr(flowIndex));
-    
-    // Now use these values in the kernel body...
-    // Create bd_id constants for ping (0) and pong (1)
-    int32_t pingBdId = resourceMgr.allocateBdId();  // 0
-    int32_t pongBdId = resourceMgr.allocateBdId();  // 1
-    
-    auto pingBdIdConst = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pingBdId));
-    auto pongBdIdConst = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pongBdId));
-    
-    // %5 = dfschedule.config.dma_bd for ping buffer
-    // bd_id=0, next_bd=1, packet_id will be read from config at runtime
-    // Note: We'll need to update ConfigDmaBdOp to work with runtime packet_id
-    // For now, we create a placeholder tile value (this needs architectural decision)
-    // TODO: Refactor DMA BD config to work with runtime config
-    auto dummyTile = rewriter.create<dfschedule::DeclareTileOp>(
-        loc, dfschedule::TileType::get(rewriter.getContext()), 
-        rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0));
-    
-    auto pingDmaBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-        loc,
-        dfschedule::BdHandleType::get(rewriter.getContext()),
-        getPingBufferOp.getBuffer(),                  // buffer from config
-        dummyTile.getTile(),                          // tile (placeholder)
-        pingBdIdConst.getResult(),                    // bd_id
-        rewriter.getI32IntegerAttr(0),                // offset
-        rewriter.getI32IntegerAttr(bufferLen),        // len
-        rewriter.getBoolAttr(true),                   // enable_packet
-        rewriter.getI32IntegerAttr(basePacketId),     // packet_id (TODO: should be from config at runtime)
-        rewriter.getI32IntegerAttr(pongBdId),         // next_bd -> points to pong
-        getPingAcquireLockIdOp.getLockId(),           // acquire_lock_id from config
-        getPingReleaseLockIdOp.getLockId());          // release_lock_id from config
-    
-    // %6 = dfschedule.config.dma_bd for pong buffer
-    // bd_id=1, next_bd=0, packet_id from config
-    auto pongDmaBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-        loc,
-        dfschedule::BdHandleType::get(rewriter.getContext()),
-        getPongBufferOp.getBuffer(),                  // buffer from config
-        dummyTile.getTile(),                          // tile (placeholder)
-        pongBdIdConst.getResult(),                    // bd_id
-        rewriter.getI32IntegerAttr(0),                // offset
-        rewriter.getI32IntegerAttr(bufferLen),        // len
-        rewriter.getBoolAttr(true),                   // enable_packet
-        rewriter.getI32IntegerAttr(basePacketId),     // packet_id (TODO: should be from config at runtime)
-        rewriter.getI32IntegerAttr(pingBdId),         // next_bd -> points back to ping
-        getPongAcquireLockIdOp.getLockId(),           // acquire_lock_id from config
-        getPongReleaseLockIdOp.getLockId());          // release_lock_id from config
-    
-    // Initialize locks for ping-pong synchronization using lock IDs from config
-    // Lock values: acquire locks start at 0, release locks: ping=1, pong=0
-    
-    // %7 = dfschedule.dskernel.lock_init(%ping_acquire_lock_id, 0, "ping_acquire_lock")
-    auto pingAcqLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
-        loc,
-        dfschedule::LockType::get(rewriter.getContext()),
-        getPingAcquireLockIdOp.getLockId(),
-        rewriter.getI64IntegerAttr(0),
-        rewriter.getStringAttr("ping_acquire_lock"));
-    
-    // %8 = dfschedule.dskernel.lock_init(%pong_acquire_lock_id, 0, "pong_acquire_lock")
-    auto pongAcqLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
-        loc,
-        dfschedule::LockType::get(rewriter.getContext()),
-        getPongAcquireLockIdOp.getLockId(),
-        rewriter.getI64IntegerAttr(0),
-        rewriter.getStringAttr("pong_acquire_lock"));
-    
-    // %9 = dfschedule.dskernel.lock_init(%ping_release_lock_id, 1, "ping_release_lock")
-    auto pingRelLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
-        loc,
-        dfschedule::LockType::get(rewriter.getContext()),
-        getPingReleaseLockIdOp.getLockId(),
-        rewriter.getI64IntegerAttr(1),
-        rewriter.getStringAttr("ping_release_lock"));
-    
-    // %10 = dfschedule.dskernel.lock_init(%pong_release_lock_id, 0, "pong_release_lock")
-    auto pongRelLock = rewriter.create<dfschedule::DSKernelLockInitOp>(
-        loc,
-        dfschedule::LockType::get(rewriter.getContext()),
-        getPongReleaseLockIdOp.getLockId(),
-        rewriter.getI64IntegerAttr(0),
-        rewriter.getStringAttr("pong_release_lock"));
-    
-    // dfschedule.dskernel.launch_dma_s2m_loop
-    rewriter.create<dfschedule::DSKernelLaunchDmaLoopOp>(
-        loc,
-        getPingBufferOp.getBuffer(),
-        getPongBufferOp.getBuffer(),
-        pingAcqLock.getLock(),
-        pingRelLock.getLock(),
-        pongAcqLock.getLock(),
-        pongRelLock.getLock(),
-        getDmaChannelOp.getChannel());
-    
-    // Create constants for loop
-    auto c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    auto c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    auto c2 = rewriter.create<arith::ConstantIndexOp>(loc, 2);
-    
-    // scf.for %arg1 = %c0 to %arg0 step %c1 (arg0 is the iteration count parameter)
-    auto forOp = rewriter.create<scf::ForOp>(
-        loc, c0.getResult(), arg0, c1.getResult());
-    
-    // Build the loop body
-    rewriter.setInsertionPointToStart(forOp.getBody());
-    Value iv = forOp.getInductionVar();
-    
-    // %11 = arith.remui %arg1, %c2 : index
-    auto remOp = rewriter.create<arith::RemUIOp>(loc, iv, c2.getResult());
-    
-    // %12 = arith.cmpi eq, %11, %c0 : index
-    auto cmpOp = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::eq, remOp.getResult(), c0.getResult());
-    
-    // %13 = scf.if %12 -> (memref<...>) { yield ping } else { yield pong }
-    auto selectBufferOp = rewriter.create<scf::IfOp>(
-        loc, TypeRange{localMemRefType}, cmpOp.getResult(), /*withElseRegion=*/true);
-    
-    // Then block: yield ping
-    rewriter.setInsertionPointToStart(&selectBufferOp.getThenRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{getPingBufferOp.getBuffer()});
-    
-    // Else block: yield pong
-    rewriter.setInsertionPointToStart(&selectBufferOp.getElseRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{getPongBufferOp.getBuffer()});
-    
-    // Continue after if
-    rewriter.setInsertionPointAfter(selectBufferOp);
-    Value selectedBuffer = selectBufferOp.getResult(0);
-    
-    // %14 = scf.if %12 -> (!dfschedule.lock) { yield ping_acq } else { yield pong_acq }
-    auto lockType = dfschedule::LockType::get(rewriter.getContext());
-    auto selectAcqLockOp = rewriter.create<scf::IfOp>(
-        loc, TypeRange{lockType}, cmpOp.getResult(), /*withElseRegion=*/true);
-    
-    rewriter.setInsertionPointToStart(&selectAcqLockOp.getThenRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{pingAcqLock.getLock()});
-    
-    rewriter.setInsertionPointToStart(&selectAcqLockOp.getElseRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{pongAcqLock.getLock()});
-    
-    rewriter.setInsertionPointAfter(selectAcqLockOp);
-    Value selectedAcqLock = selectAcqLockOp.getResult(0);
-    
-    // %15 = scf.if %12 -> (!dfschedule.lock) { yield ping_rel } else { yield pong_rel }
-    auto selectRelLockOp = rewriter.create<scf::IfOp>(
-        loc, TypeRange{lockType}, cmpOp.getResult(), /*withElseRegion=*/true);
-    
-    rewriter.setInsertionPointToStart(&selectRelLockOp.getThenRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{pingRelLock.getLock()});
-    
-    rewriter.setInsertionPointToStart(&selectRelLockOp.getElseRegion().front());
-    rewriter.create<scf::YieldOp>(loc, ValueRange{pongRelLock.getLock()});
-    
-    rewriter.setInsertionPointAfter(selectRelLockOp);
-    Value selectedRelLock = selectRelLockOp.getResult(0);
-    
-    // dfschedule.dskernel.acquire_lock(%14, 1)
-    rewriter.create<dfschedule::DSKernelAcquireLockOp>(
-        loc, selectedAcqLock, rewriter.getI32IntegerAttr(1));
-    
-    // TODO: Insert actual compute logic here
-    // The compute logic should be provided through the config or as a separate parameter
-    // For now, we just acquire and release locks without actual compute
-    
-    // dfschedule.dskernel.release_lock(%15, 1)
-    rewriter.create<dfschedule::DSKernelReleaseLockOp>(
-        loc, selectedRelLock, rewriter.getI32IntegerAttr(1));
-}
+//   - insertBeforeOp: used to find module and insertion point
+static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Location loc, Operation *insertBeforeOp,
+                                     StringRef kernelName, RankedTensorType tensorType, int64_t bufferLen,
+                                     uint32_t basePacketId, int64_t coreChannel, uint32_t flowIndex) {
+    (void)tensorType;
+    (void)bufferLen;
+    (void)basePacketId;
+    (void)coreChannel;
+    (void)flowIndex;
 
-static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRefAttr target) {
-    return lookupSymbolOp<dfscheblueprint::DataSliceOp>(rootOp, target);
+    Operation *rootModuleOp = getModuleOp(insertBeforeOp);
+    Block &moduleBlock = rootModuleOp->getRegions().front().front();
+    if (!moduleBlock.empty() && moduleBlock.back().hasTrait<OpTrait::IsTerminator>())
+        rewriter.setInsertionPoint(&moduleBlock.back());
+    else
+        rewriter.setInsertionPointToEnd(&moduleBlock);
+
+    auto receiverOp = rewriter.create<dfschedule::DSKernelReceiverOp>(loc, kernelName);
+    receiverOp.getBody().emplaceBlock();
 }
 
 // Helper function to look up FlowConfigOp by symbol reference (wrapper for backward compatibility)
@@ -431,32 +178,8 @@ static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolR
     return lookupSymbolOp<dfscheblueprint::FlowConfigOp>(rootOp, target);
 }
 
-bool checktheopusedtensor(Operation *flowtransferOp) {
-    auto op = dyn_cast<dfscheblueprint::FlowTransferOp>(flowtransferOp);
-    if (!op) {
-        return false;
-    }
-    
-    SymbolRefAttr fromRef = op.getFrom();
-    auto fromFlowConfig = lookupFlowConfig(op.getOperation(), fromRef);
-    if (!fromFlowConfig) {
-        return false;
-    }
-
-    auto toRef = op.getTo();
-    auto toFlowConfig = lookupFlowConfig(op.getOperation(), toRef);
-    if (!toFlowConfig) {
-        return false;
-    }
-    auto sliceSymbolsOpt = fromFlowConfig.getSliceSymbols();
-    if (sliceSymbolsOpt && !sliceSymbolsOpt->empty()) {
-        for (auto sliceSymbol : *sliceSymbolsOpt) {
-            auto sliceOp = lookupDataSlice(op.getOperation(), cast<SymbolRefAttr>(sliceSymbol));
-            // TODO: Add logic to check the slice operation
-        }
-    }
-  
-    return true;
+static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRefAttr target) {
+    return lookupSymbolOp<dfscheblueprint::DataSliceOp>(rootOp, target);
 }
 
 // Pattern to convert dfscheblueprint::FlowTransferOp to dfschedule operations
@@ -467,10 +190,10 @@ bool checktheopusedtensor(Operation *flowtransferOp) {
 // 4. Create packet ops for core tiles, load_kernel_group, launch, schedule ops
 // 5. Generate dskernel_receiver function with kernel DMA BD config
 struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::FlowTransferOp> {
-    using OpConversionPattern<dfscheblueprint::FlowTransferOp>::OpConversionPattern;
-    
-    // Mutable resource manager for kernel resource allocation
-    mutable KernelResourceManager resourceMgr;
+    std::shared_ptr<ResourceMgr> resourceMgr;
+
+    FlowTransferConversion(MLIRContext *ctx, std::shared_ptr<ResourceMgr> mgr)
+        : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), resourceMgr(std::move(mgr)) {}
 
     LogicalResult
     matchAndRewrite(dfscheblueprint::FlowTransferOp op, OpAdaptor adaptor,
@@ -597,23 +320,23 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         // Create bd_id constant for config
         auto bdIdConst = rewriter.create<arith::ConstantOp>(
             loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
-        
+
         // Step 3: Create dfschedule.config.dma_bd for shim tile only
-        auto minusOne = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(-1));
         auto configDmaBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-            loc,
-            dfschedule::BdHandleType::get(rewriter.getContext()),
-            memrefValue,                                      // buffer
-            shimTileOp.getTile(),                             // tile
-            bdIdConst.getResult(),                            // bd_id
-            rewriter.getI32IntegerAttr(0),                    // offset
-            rewriter.getI32IntegerAttr(bufferLen),            // len
-            rewriter.getBoolAttr(true),                       // enable_packet
-            rewriter.getI32IntegerAttr(basePacketId),         // packet_id
-            rewriter.getI32IntegerAttr(4294967295),           // next_bd (-1 as unsigned)
-            minusOne.getResult(),                             // acquire_lock_id = -1 (host-side, no lock)
-            minusOne.getResult());                            // release_lock_id = -1 (host-side, no lock)
-        
+            loc, dfschedule::BdHandleType::get(rewriter.getContext()),
+            memrefValue,                              // buffer
+            shimTileOp.getTile(),                     // tile
+            bdIdConst.getResult(),                    // bd_id
+            rewriter.getI32IntegerAttr(0),            // offset
+            rewriter.getI32IntegerAttr(bufferLen),    // len
+            rewriter.getBoolAttr(true),               // enable_packet
+            rewriter.getI32IntegerAttr(basePacketId), // packet_id
+            rewriter.getI32IntegerAttr(4294967295),   // next_bd (-1 as unsigned)
+            rewriter.getI32IntegerAttr(0),            // acquire_lock_id
+            rewriter.getI32IntegerAttr(0),            // acquire_lock_val
+            rewriter.getI32IntegerAttr(0),            // release_lock_id
+            rewriter.getI32IntegerAttr(0));           // release_lock_val
+
         // Create dfschedule.config.create_io for shim tile
         auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
             loc,
@@ -623,16 +346,22 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             rewriter.getI32IntegerAttr(shimChannel),          // channel
             rewriter.getStringAttr(dmaDirection),             // direction (MM2S or S2MM)
             rewriter.getStringAttr(ioOperation));             // io_operation (SEND or RECV)
-        
-        // --- CORE TILES (no DMA config, just declaretile and kernel_config) ---
+
+        // --- CORE TILES: declaretile, kernel_config, and ping-pong DMA config ---
         ArrayAttr coreTilesAttr = coreTileGroup.getTiles();
         SmallVector<Value> coreTiles;
-        
-        // Get DMA channel from core FlowConfig for packet ops
+
+        // Get DMA channel and direction from core FlowConfig
         auto coreDmaAttr = coreFlowConfig.getDma();
         auto coreDmaChannels = coreDmaAttr.getChannels();
         int64_t coreChannel = coreDmaChannels.empty() ? 0 : coreDmaChannels[0];
-        
+        auto coreDmaDir = coreDmaAttr.getDirection();
+        StringRef coreDmaDirection = (coreDmaDir == dfscheblueprint::bp_direction::MM2S) ? "MM2S" : "S2MM";
+        StringRef coreIoOperation = (coreDmaDir == dfscheblueprint::bp_direction::MM2S) ? "SEND" : "RECV";
+
+        // Get per-tile data slices from core FlowConfig's slice_symbols
+        auto sliceSymbolsOpt = coreFlowConfig.getSliceSymbols();
+
         // Collect tile config dictionaries for kernel_config
         SmallVector<Attribute> tileConfigDicts;
         int tileIndex = 0;
@@ -659,46 +388,128 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             int64_t elementSizeBytes = 1;
             if (auto memrefType = memrefValue.getType().dyn_cast<MemRefType>()) {
                 for (auto dim : memrefType.getShape()) {
-                    if (dim > 0) {  // Skip dynamic dimensions
+                    if (dim > 0) {
                         bufferSize *= dim;
                     }
                 }
-                // Multiply by element size in bytes
                 elementSizeBytes = memrefType.getElementTypeBitWidth() / 8;
                 bufferSize *= elementSizeBytes;
             }
-            
-            // Calculate buffer offset for this tile (assuming data is partitioned evenly)
-            // For ping-pong mode, we need 2x the per-tile buffer size
+
             int64_t perTileSize = bufferSize / coreTilesAttr.size();
             int64_t bufferOffset = tileIndex * perTileSize;
-            
-            // Build config dictionary for this tile with per-flow configuration
-            // The config is structured to support multiple flows, indexed by flow_index
+
+            // Allocate lock pair from ResourceMgr for this core tile
+            int acquireLockId = -1, releaseLockId = -1;
+            if (resourceMgr) {
+                resourceMgr->allocateTileLockPair(row, col, /*ownerId=*/flowIndex, acquireLockId, releaseLockId);
+            }
+            if (acquireLockId < 0 || releaseLockId < 0) {
+                llvm::errs() << "WARNING: lock allocation failed for tile (" << col << "," << row
+                             << "), falling back to formula\n";
+                int64_t lockBase = flowIndex * 8 + tileIndex * 2;
+                acquireLockId = lockBase + 0;
+                releaseLockId = lockBase + 1;
+            }
+
+            // Build config dictionary for this tile
             NamedAttrList configAttrs;
             configAttrs.append("tile_index", rewriter.getI32IntegerAttr(tileIndex));
-            configAttrs.append("flow_index", rewriter.getI32IntegerAttr(flowIndex)); // Flow index for this configuration
-            configAttrs.append("packet_id", rewriter.getI32IntegerAttr(basePacketId + tileIndex)); // Packet ID based on base + tile
+            configAttrs.append("flow_index", rewriter.getI32IntegerAttr(flowIndex));
+            configAttrs.append("packet_id", rewriter.getI32IntegerAttr(basePacketId + tileIndex));
             configAttrs.append("dma_channel", rewriter.getI32IntegerAttr(coreChannel));
             configAttrs.append("buffer_mode", rewriter.getI32IntegerAttr(1)); // 1 = ping-pong
-            configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(2)); // 2 buffers
-            configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(perTileSize)); // Per-tile buffer size in bytes
-            configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(bufferOffset)); // Offset within shared buffer
-            configAttrs.append("element_size", rewriter.getI32IntegerAttr(elementSizeBytes)); // Element size in bytes
-            
-            // Lock IDs for ping-pong synchronization
-            // Each flow+tile combination gets unique lock IDs
-            // Lock ID = (flowIndex * maxTilesPerFlow * 4) + (tileIndex * 4) + lockType
-            int64_t lockBase = flowIndex * 16 + tileIndex * 4; // Assuming max 4 tiles per flow
-            configAttrs.append("ping_acquire_lock_id", rewriter.getI32IntegerAttr(lockBase + 0));
-            configAttrs.append("pong_acquire_lock_id", rewriter.getI32IntegerAttr(lockBase + 1));
-            configAttrs.append("ping_release_lock_id", rewriter.getI32IntegerAttr(lockBase + 2));
-            configAttrs.append("pong_release_lock_id", rewriter.getI32IntegerAttr(lockBase + 3));
-            
-            // Note: Actual buffer base address will be determined at runtime by __Runtime_load_kernel_group
-            // The runtime will use: tile_buffer_addr = base_addr + buffer_offset
-            
+            configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(2));
+            configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(perTileSize));
+            configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(bufferOffset));
+            configAttrs.append("element_size", rewriter.getI32IntegerAttr(elementSizeBytes));
+            configAttrs.append("acquire_lock_id", rewriter.getI32IntegerAttr(acquireLockId));
+            configAttrs.append("release_lock_id", rewriter.getI32IntegerAttr(releaseLockId));
+
             tileConfigDicts.push_back(rewriter.getDictionaryAttr(configAttrs));
+
+            // --- Core tile ping-pong DMA BD configuration ---
+            // Look up per-tile data slice from slice_symbols (maps 1:1 to tiles)
+            if (sliceSymbolsOpt && tileIndex < (int)sliceSymbolsOpt->size()) {
+                auto sliceSymRef = cast<SymbolRefAttr>((*sliceSymbolsOpt)[tileIndex]);
+                auto dataSliceOp = lookupDataSlice(op.getOperation(), sliceSymRef);
+                if (dataSliceOp) {
+                    Value perTileTensor = dataSliceOp.getTensorSlice();
+                    Type perTileType = perTileTensor.getType();
+
+                    // Create per-tile declaretensor -> memref
+                    int64_t perTileTotalSize = perTileSize / elementSizeBytes;
+                    MemRefType perTileMemrefType;
+                    if (auto tt = dyn_cast<RankedTensorType>(perTileType)) {
+                        int64_t totalElems = 1;
+                        for (int64_t d : tt.getShape())
+                            totalElems *= d;
+                        perTileMemrefType = MemRefType::get({totalElems}, tt.getElementType());
+                        perTileTotalSize = totalElems;
+                    } else {
+                        perTileMemrefType = MemRefType::get({perTileTotalSize}, memrefType.getElementType());
+                    }
+
+                    Value perTileMemref =
+                        rewriter.create<dfschedule::DeclareTensorOp>(loc, perTileMemrefType, perTileTensor);
+
+                    // Allocate BD IDs from ResourceMgr per-tile pool
+                    int32_t pingBdId = -1, pongBdId = -1;
+                    if (resourceMgr) {
+                        auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                        auto bd1 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                        if (bd0 && bd1) {
+                            pingBdId = *bd0;
+                            pongBdId = *bd1;
+                        }
+                    }
+                    if (pingBdId < 0 || pongBdId < 0) {
+                        llvm::errs() << "WARNING: BD allocation failed for tile (" << col << "," << row
+                                     << "), falling back to 0/1\n";
+                        pingBdId = 0;
+                        pongBdId = 1;
+                    }
+
+                    // Ping BD: next_bd -> pong
+                    auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                            rewriter.getI32IntegerAttr(pingBdId));
+                    auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                        loc, dfschedule::BdHandleType::get(rewriter.getContext()), perTileMemref, coreTileOp.getTile(),
+                        pingBdIdConst.getResult(),
+                        rewriter.getI32IntegerAttr(0),                // offset
+                        rewriter.getI32IntegerAttr(perTileTotalSize), // len
+                        rewriter.getBoolAttr(true),                   // enable_packet
+                        rewriter.getI32IntegerAttr(basePacketId + tileIndex),
+                        rewriter.getI32IntegerAttr(pongBdId),      // next_bd -> pong
+                        rewriter.getI32IntegerAttr(acquireLockId), // acquire_lock_id
+                        rewriter.getI32IntegerAttr(-1),            // acquire_lock_val (wait/decrement)
+                        rewriter.getI32IntegerAttr(releaseLockId), // release_lock_id
+                        rewriter.getI32IntegerAttr(1));            // release_lock_val (signal/increment)
+
+                    // Pong BD: next_bd -> ping
+                    auto pongBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                            rewriter.getI32IntegerAttr(pongBdId));
+                    rewriter.create<dfschedule::ConfigDmaBdOp>(
+                        loc, dfschedule::BdHandleType::get(rewriter.getContext()), perTileMemref, coreTileOp.getTile(),
+                        pongBdIdConst.getResult(),
+                        rewriter.getI32IntegerAttr(0),                // offset
+                        rewriter.getI32IntegerAttr(perTileTotalSize), // len
+                        rewriter.getBoolAttr(true),                   // enable_packet
+                        rewriter.getI32IntegerAttr(basePacketId + tileIndex),
+                        rewriter.getI32IntegerAttr(pingBdId),      // next_bd -> ping
+                        rewriter.getI32IntegerAttr(acquireLockId), // acquire_lock_id
+                        rewriter.getI32IntegerAttr(-1),            // acquire_lock_val (wait/decrement)
+                        rewriter.getI32IntegerAttr(releaseLockId), // release_lock_id
+                        rewriter.getI32IntegerAttr(1));            // release_lock_val (signal/increment)
+
+                    // Create IO handle for core tile (references ping BD; DMA chains automatically)
+                    rewriter.create<dfschedule::ConfigCreateIoOp>(
+                        loc, dfschedule::IoHandleType::get(rewriter.getContext()), pingBdOp.getBdHandle(),
+                        coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
+                        rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation));
+                }
+            }
+
             tileIndex++;
         }
         
@@ -787,17 +598,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             }
             
             if (kernelTensorType) {
-                generateDSKernelReceiver(
-                    rewriter,
-                    loc,
-                    op.getOperation(),
-                    kernelName,
-                    kernelTensorType,
-                    bufferLen,
-                    basePacketId,
-                    coreChannel,
-                    flowIndex,
-                    resourceMgr);
+                generateDSKernelReceiver(rewriter, loc, op.getOperation(), kernelName, kernelTensorType, bufferLen,
+                                         basePacketId, coreChannel, flowIndex);
             }
         }
         
@@ -845,8 +647,8 @@ void BlueprintToSchedulePass::runOnOperation() {
     //target.addIllegalOp<dfscheblueprint::DeclareDataOp>();
     //target.addIllegalOp<dfscheblueprint::DataSliceOp>();
     target.addIllegalOp<dfscheblueprint::FlowTransferOp>();
-    target.addIllegalOp<dfscheblueprint::TransferManifestOp>();
-    
+    // target.addIllegalOp<dfscheblueprint::TransferManifestOp>();
+
     // Type converter
     TypeConverter typeConverter;
     typeConverter.addConversion([](Type type) { return type; });
@@ -855,20 +657,24 @@ void BlueprintToSchedulePass::runOnOperation() {
     typeConverter.addConversion([](RankedTensorType tensorType) -> Type {
         return MemRefType::get(tensorType.getShape(), tensorType.getElementType());
     });
-    
+
+    // Create ResourceMgr for BD and lock allocation
+    auto hwRes = makeResource("Gen2");
+    auto resourceMgr = std::make_shared<ResourceMgr>(std::move(hwRes));
+
     RewritePatternSet patterns(context);
     // FlowTransferConversion converts flow_transfer to dfschedule operations
     // It reads from FlowConfigOps to get DMA configuration
-    patterns.add<FlowTransferConversion>(context);
+    patterns.add<FlowTransferConversion>(context, resourceMgr);
     // DataSliceOp replaces with input tensor
     patterns.add<DataSliceOpConversion>(context);
     // Use unified erase pattern for ops that just need to be removed
     // FlowConfigOp is erased since FlowTransferConversion reads its attributes directly
     patterns.add<EraseOpPattern<dfscheblueprint::FlowConfigOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::TileGroupOp>>(context);
-    //patterns.add<EraseOpPattern<dfscheblueprint::DeclareDataOp>>(context);
-    patterns.add<EraseOpPattern<dfscheblueprint::TransferManifestOp>>(context);
-    
+    // patterns.add<EraseOpPattern<dfscheblueprint::DeclareDataOp>>(context);
+    // patterns.add<EraseOpPattern<dfscheblueprint::TransferManifestOp>>(context);
+
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();
     }

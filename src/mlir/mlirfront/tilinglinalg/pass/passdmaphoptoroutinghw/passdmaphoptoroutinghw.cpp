@@ -385,10 +385,18 @@ void ParseTheCCTRoutingPath(Operation* op,
 
         // Special handling for the SHIM tile to enable its external port
         if (point == shimpoint) {
+            // Use the actual hardware port number from shimport, not the stream switch port index
+            int shimHwPortNum = inputPortIdx; // Default fallback
+            if (auto shimPortInfo = dio->getshimport()) {
+                shimHwPortNum = shimPortInfo->portnum_;
+            }
+
             if (dio->type() == IOType::Input) {
-                rewriter.create<EnableExtToAieShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
+                rewriter.create<EnableExtToAieShimPort>(loc, outputType, shimio.getResult(), inputDirStr,
+                                                        shimHwPortNum);
             } else {
-                rewriter.create<EnableAieToExtShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
+                rewriter.create<EnableAieToExtShimPort>(loc, outputType, shimio.getResult(), inputDirStr,
+                                                        shimHwPortNum);
             }
         }
     }

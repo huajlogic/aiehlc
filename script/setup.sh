@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AIEHLC_DIR="${SCRIPT_DIR}/../"
 ARCH_DIR=$AIEHLC_DIR/thirdparty/arch/
 AIE_DRIVER_PARENT_DIR=$AIEHLC_DIR/thirdparty/alib/
-export PATH=$PATH:$AIEHLC_DIR:$SCRIPT_DIR
+export PATH=$PATH:$AIEHLC_DIR:$SCRIPT_DIR:$SCRIPT_DIR/test
 
 usage() {
     echo "Usage: $0 [--help] [--path-set-only] [--enable-llvmaie] [--bsp-use-git-repo=<repo>] [--vitis-settings PATH]"

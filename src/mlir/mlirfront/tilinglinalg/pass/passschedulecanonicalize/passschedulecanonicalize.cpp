@@ -558,6 +558,10 @@ struct DmaBdParams {
     int64_t nextBd;
     int bdIndex;
     int64_t sliceIndex;  // Index into uniqueSliceParams/declaredMemrefs for the buffer
+    int64_t acquireLockId = -1;
+    int64_t acquireLockVal = -1;
+    int64_t releaseLockId = -1;
+    int64_t releaseLockVal = -1;
 };
 
 // Structure to hold IO config parameters
@@ -567,6 +571,32 @@ struct IoConfigParams {
     std::string direction;    // StringAttr
     std::string ioOperation;  // StringAttr
     int bdIndex; // Which BD handle to use
+};
+
+// Structure to hold core tile DMA BD parameters (with lock IDs for ping-pong)
+struct CoreDmaBdParams {
+    TileKey coreKey;
+    Type bufferType;
+    int64_t offset;
+    int64_t len;
+    bool enablePacket;
+    int64_t packetId;
+    int64_t nextBd;
+    int bdIndex;
+    int64_t sliceIndex;
+    int64_t acquireLockId;
+    int64_t acquireLockVal;
+    int64_t releaseLockId;
+    int64_t releaseLockVal;
+};
+
+// Structure to hold core tile IO config parameters
+struct CoreIoConfigParams {
+    TileKey coreKey;
+    int64_t channel;
+    std::string direction;
+    std::string ioOperation;
+    int bdIndex;
 };
 
 // Create canonicalized schedule in dfschedule.host at module level
@@ -609,7 +639,11 @@ static void createCanonicalizedSchedule(
                 params.nextBd = dmaBd.getNextBd();
                 params.bdIndex = shimBdCounter[key]++;
                 params.sliceIndex = -1;  // Default: no slice found
-                
+                params.acquireLockId = static_cast<int32_t>(dmaBd.getAcquireLockId());
+                params.acquireLockVal = static_cast<int32_t>(dmaBd.getAcquireLockVal());
+                params.releaseLockId = static_cast<int32_t>(dmaBd.getReleaseLockId());
+                params.releaseLockVal = static_cast<int32_t>(dmaBd.getReleaseLockVal());
+
                 // Trace buffer back to find the slice index
                 // Buffer -> DeclareTensorOp -> ExtractSliceOp
                 Value buffer = dmaBd.getBuffer();
@@ -651,7 +685,78 @@ static void createCanonicalizedSchedule(
             }
         }
     }
-    
+
+    // ==========================================================
+    // Collect core tile DMA BD and IO parameters
+    // ==========================================================
+    std::vector<CoreDmaBdParams> allCoreDmaBdParams;
+    std::vector<CoreIoConfigParams> allCoreIoConfigParams;
+
+    std::map<TileKey, int> coreBdCounter;
+
+    for (auto &opWithParent : info.configDmaBdOps) {
+        auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(opWithParent.op);
+        Value tileVal = dmaBd.getTile();
+
+        if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
+            TileKey key = getTileKey(declareTile);
+            if (!isShimTile(key)) {
+                CoreDmaBdParams params;
+                params.coreKey = key;
+                params.bufferType = dmaBd.getBuffer().getType();
+                params.offset = dmaBd.getOffset();
+                params.len = dmaBd.getLen();
+                params.enablePacket = dmaBd.getEnablePacket();
+                params.packetId = dmaBd.getPacketId();
+                params.nextBd = dmaBd.getNextBd();
+                params.bdIndex = coreBdCounter[key]++;
+                params.sliceIndex = -1;
+
+                // Read lock IDs and values directly from attributes
+                params.acquireLockId = static_cast<int32_t>(dmaBd.getAcquireLockId());
+                params.acquireLockVal = static_cast<int32_t>(dmaBd.getAcquireLockVal());
+                params.releaseLockId = static_cast<int32_t>(dmaBd.getReleaseLockId());
+                params.releaseLockVal = static_cast<int32_t>(dmaBd.getReleaseLockVal());
+
+                // Trace buffer back to find the slice index
+                Value buffer = dmaBd.getBuffer();
+                if (auto declareTensor = buffer.getDefiningOp<dfschedule::DeclareTensorOp>()) {
+                    Value tensorVal = declareTensor.getTensor();
+                    if (auto extractSlice = tensorVal.getDefiningOp<tensor::ExtractSliceOp>()) {
+                        for (size_t i = 0; i < info.extractSliceOps.size(); ++i) {
+                            if (info.extractSliceOps[i].op == extractSlice.getOperation()) {
+                                params.sliceIndex = static_cast<int64_t>(i);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                allCoreDmaBdParams.push_back(params);
+            }
+        }
+    }
+
+    std::map<TileKey, int> coreIoCounter;
+
+    for (auto &opWithParent : info.configCreateIoOps) {
+        auto createIo = cast<dfschedule::ConfigCreateIoOp>(opWithParent.op);
+        Value tileVal = createIo.getTile();
+
+        if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
+            TileKey key = getTileKey(declareTile);
+            if (!isShimTile(key)) {
+                CoreIoConfigParams params;
+                params.coreKey = key;
+                params.channel = createIo.getChannel();
+                params.direction = createIo.getDirection().str();
+                params.ioOperation = createIo.getIoOperation().str();
+                params.bdIndex = coreIoCounter[key]++;
+                allCoreIoConfigParams.push_back(params);
+            }
+        }
+    }
+
     // ==========================================================
     // PART 1: Create dfschedule.host at MODULE level (after func.func)
     // ==========================================================
@@ -975,23 +1080,16 @@ static void createCanonicalizedSchedule(
             // Create BD ID constant
             auto bdIdConst = builder.create<arith::ConstantOp>(
                 loc, builder.getI32Type(), builder.getI32IntegerAttr(bdIndexCounter++));
-            
+
             // Create DMA BD config
-            auto minusOne = builder.create<arith::ConstantOp>(loc, builder.getI32Type(), builder.getI32IntegerAttr(-1));
             auto dmaBdOp = builder.create<dfschedule::ConfigDmaBdOp>(
-                loc,
-                dfschedule::BdHandleType::get(builder.getContext()),
-                buffer,
-                shimTile,
-                bdIdConst.getResult(),
-                builder.getI32IntegerAttr(params.offset),
-                builder.getI32IntegerAttr(params.len),
-                builder.getBoolAttr(params.enablePacket),
-                builder.getI32IntegerAttr(params.packetId),
-                builder.getI32IntegerAttr(params.nextBd),
-                minusOne.getResult(),  // acquire_lock_id = -1 (host-side, no lock)
-                minusOne.getResult()); // release_lock_id = -1 (host-side, no lock)
-            
+                loc, dfschedule::BdHandleType::get(builder.getContext()), buffer, shimTile, bdIdConst.getResult(),
+                builder.getI32IntegerAttr(params.offset), builder.getI32IntegerAttr(params.len),
+                builder.getBoolAttr(params.enablePacket), builder.getI32IntegerAttr(params.packetId),
+                builder.getI32IntegerAttr(params.nextBd), builder.getI32IntegerAttr(params.acquireLockId),
+                builder.getI32IntegerAttr(params.acquireLockVal), builder.getI32IntegerAttr(params.releaseLockId),
+                builder.getI32IntegerAttr(params.releaseLockVal));
+
             shimBdHandles[params.shimKey].push_back(dmaBdOp.getBdHandle());
         }
     }
@@ -1025,7 +1123,70 @@ static void createCanonicalizedSchedule(
         
         shimIoHandles[params.shimKey].push_back(createIoOp.getIoHandle());
     }
-    
+
+    // 5b. Create DMA BD configurations for core tiles (ping-pong)
+    std::map<TileKey, SmallVector<Value>> coreBdHandles;
+
+    for (const auto &params : allCoreDmaBdParams) {
+        if (coreTileMap.find(params.coreKey) == coreTileMap.end())
+            continue;
+        Value coreTile = coreTileMap[params.coreKey];
+
+        // Look up buffer from declaredMemrefs via sliceIndex
+        Value buffer;
+        if (params.sliceIndex >= 0) {
+            auto memIt = declaredMemrefs.find(static_cast<size_t>(params.sliceIndex));
+            if (memIt != declaredMemrefs.end()) {
+                buffer = memIt->second;
+            }
+        }
+
+        if (!buffer) {
+            std::string bufKey = makeBufferKey(params.bufferType);
+            if (bufferMap.find(bufKey) == bufferMap.end()) {
+                auto memrefType = cast<MemRefType>(params.bufferType);
+                buffer = builder.create<memref::AllocOp>(loc, memrefType);
+                bufferMap[bufKey] = buffer;
+            } else {
+                buffer = bufferMap[bufKey];
+            }
+        }
+
+        auto bdIdConst =
+            builder.create<arith::ConstantOp>(loc, builder.getI32Type(), builder.getI32IntegerAttr(params.bdIndex));
+
+        auto dmaBdOp = builder.create<dfschedule::ConfigDmaBdOp>(
+            loc, dfschedule::BdHandleType::get(builder.getContext()), buffer, coreTile, bdIdConst.getResult(),
+            builder.getI32IntegerAttr(params.offset), builder.getI32IntegerAttr(params.len),
+            builder.getBoolAttr(params.enablePacket), builder.getI32IntegerAttr(params.packetId),
+            builder.getI32IntegerAttr(params.nextBd), builder.getI32IntegerAttr(params.acquireLockId),
+            builder.getI32IntegerAttr(params.acquireLockVal), builder.getI32IntegerAttr(params.releaseLockId),
+            builder.getI32IntegerAttr(params.releaseLockVal));
+
+        coreBdHandles[params.coreKey].push_back(dmaBdOp.getBdHandle());
+    }
+
+    // 5c. Create IO configurations for core tiles
+    for (const auto &params : allCoreIoConfigParams) {
+        if (coreTileMap.find(params.coreKey) == coreTileMap.end())
+            continue;
+        Value coreTile = coreTileMap[params.coreKey];
+
+        Value bdHandle;
+        if (params.bdIndex < (int)coreBdHandles[params.coreKey].size()) {
+            bdHandle = coreBdHandles[params.coreKey][params.bdIndex];
+        } else if (!coreBdHandles[params.coreKey].empty()) {
+            bdHandle = coreBdHandles[params.coreKey][0];
+        } else {
+            continue;
+        }
+
+        builder.create<dfschedule::ConfigCreateIoOp>(loc, dfschedule::IoHandleType::get(builder.getContext()), bdHandle,
+                                                     coreTile, builder.getI32IntegerAttr(params.channel),
+                                                     builder.getStringAttr(params.direction),
+                                                     builder.getStringAttr(params.ioOperation));
+    }
+
     // 6. Build list of core tiles and their configs for merged kernel group
     SmallVector<Value> allCoreTiles;
     SmallVector<Attribute> allTileConfigs;
@@ -1195,17 +1356,23 @@ static void removeOldScheduleOps(ModuleScheduleInfo &info) {
     for (auto &opWithParent : info.packetOps) {
         opsToRemove.push_back(opWithParent.op);
     }
-    
-    // Remove createIo ops (but NOT those inside dskernel_receiver)
+
+    auto isInHostBlock = [](const OpWithParent &owp) -> bool {
+        if (owp.parent && owp.parent->getName().getStringRef() == "dfschedule.host")
+            return true;
+        return false;
+    };
+
+    // Remove createIo ops (but NOT those inside dskernel_receiver or dfschedule.host)
     for (auto &opWithParent : info.configCreateIoOps) {
-        if (!opWithParent.isInDSKernelReceiver) {
+        if (!opWithParent.isInDSKernelReceiver && !isInHostBlock(opWithParent)) {
             opsToRemove.push_back(opWithParent.op);
         }
     }
-    
-    // Remove dmaBd ops (but NOT those inside dskernel_receiver)
+
+    // Remove dmaBd ops (but NOT those inside dskernel_receiver or dfschedule.host)
     for (auto &opWithParent : info.configDmaBdOps) {
-        if (!opWithParent.isInDSKernelReceiver) {
+        if (!opWithParent.isInDSKernelReceiver && !isInHostBlock(opWithParent)) {
             opsToRemove.push_back(opWithParent.op);
         }
     }

@@ -4,20 +4,25 @@
 ******************************************************************************/
 
 #include "passdfscheduletoapi.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Target/Cpp/CppEmitter.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/raw_ostream.h"
+#include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
+#include <sys/stat.h>
+#include <tuple>
 
 using namespace mlir;
 
@@ -113,7 +118,8 @@ struct ConversionState {
     // Counter for generating unique array names
     int arrayIndex = 0;
     int partitionIndex = 0;
-    
+    mutable int shapeArrayIndex = 0; // for PartitionTensor static shape arrays (C++ compatible)
+
     // Statistics for ExtractSliceInnerPattern
     int extractSliceCallCount = 0;
     int extractSliceFailCount = 0;
@@ -126,7 +132,10 @@ struct ConversionState {
     
     // Map from io_handle Value to (channel_id, bd_id) for __Runtime_dma_createio
     DenseMap<Value, std::pair<int32_t, int32_t>> ioHandleToResourceMap;
-    
+
+    // Track (col,row,lock_id) tuples that have already had XAie_LockSetValue emitted
+    std::set<std::tuple<int32_t, int32_t, int32_t>> initializedLocks;
+
     // Cached values for inner patterns (set before applying inner patterns)
     Value devInstRef;
     Value cacheableConst;
@@ -296,12 +305,11 @@ struct DeclareDataInnerPattern : public OpConversionPattern<dfscheblueprint::Dec
         Type memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
         Type devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
         Type devInstPtrType = emitc::PointerType::get(devInstType);
-        
-        // Create &DevInst reference
-        auto devInstRef = rewriter.create<emitc::ConstantOp>(
-            loc, devInstPtrType,
-            emitc::OpaqueAttr::get(ctx, "&DevInst"));
-        
+
+        // Create g_DevInst reference (from aie_runtime.h)
+        auto devInstRef =
+            rewriter.create<emitc::ConstantOp>(loc, devInstPtrType, emitc::OpaqueAttr::get(ctx, "g_DevInst"));
+
         // Create XAIE_MEM_CACHEABLE constant
         auto cacheableConst = rewriter.create<emitc::ConstantOp>(
             loc, i32Type,
@@ -415,33 +423,34 @@ struct PartitionTensorInnerPattern : public OpConversionPattern<routing::partiti
         
         int64_t elemSize = getElemSize(resultType.getElementType());
         int64_t partitionByteSize = totalElements * elemSize;
-        ///*
-        // Build original_shape array literal
-        std::string origShapeStr = "(int64_t[]){";
+
+        // Emit static arrays for C++ (compound literals (int64_t[]){...} are C-only)
+        int idx = state.shapeArrayIndex++;
+        std::string origName = "_pt_orig_" + std::to_string(idx);
+        std::string partName = "_pt_part_" + std::to_string(idx);
+        std::string origInit, partInit;
         for (size_t i = 0; i < originalShape.size(); i++) {
-            if (i > 0) origShapeStr += ", ";
-            origShapeStr += std::to_string(originalShape[i]);
+            if (i > 0)
+                origInit += ", ";
+            origInit += std::to_string(originalShape[i]);
         }
-        origShapeStr += "}";
-        
-        // Build partition_shape array literal (divided by splitnum along splitdim)
-        std::string partShapeStr = "(int64_t[]){";
         for (size_t i = 0; i < partitionShape.size(); i++) {
-            if (i > 0) partShapeStr += ", ";
-            partShapeStr += std::to_string(partitionShape[i]);
+            if (i > 0)
+                partInit += ", ";
+            partInit += std::to_string(partitionShape[i]);
         }
-        partShapeStr += "}";
-        ///*
+        rewriter.create<emitc::VerbatimOp>(loc, "static const int64_t " + origName + "[] = {" + origInit + "};");
+        rewriter.create<emitc::VerbatimOp>(loc, "static const int64_t " + partName + "[] = {" + partInit + "};");
+
         auto i64PtrType = emitc::PointerType::get(rewriter.getI64Type());
-        
         auto elemSizeConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
             rewriter.getI32IntegerAttr(elemSize));
         auto ndimConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
             rewriter.getI32IntegerAttr(ndim));
-        auto origShapeConst = rewriter.create<emitc::ConstantOp>(loc, i64PtrType,
-            emitc::OpaqueAttr::get(state.ctx, origShapeStr));
-        auto partShapeConst = rewriter.create<emitc::ConstantOp>(loc, i64PtrType,
-            emitc::OpaqueAttr::get(state.ctx, partShapeStr));
+        auto origShapeConst =
+            rewriter.create<emitc::ConstantOp>(loc, i64PtrType, emitc::OpaqueAttr::get(state.ctx, origName));
+        auto partShapeConst =
+            rewriter.create<emitc::ConstantOp>(loc, i64PtrType, emitc::OpaqueAttr::get(state.ctx, partName));
         auto splitdimConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
             rewriter.getI32IntegerAttr(splitdim));
         auto splitnumConst = rewriter.create<emitc::ConstantOp>(loc, state.i32Type,
@@ -858,15 +867,26 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         
         auto i32Type = rewriter.getI32Type();
         auto dmaDescType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DmaDesc");
-        
+
+        // Read lock IDs and values directly from attributes
+        int32_t acquireLockId = static_cast<int32_t>(op.getAcquireLockId());
+        int32_t acquireLockVal = static_cast<int32_t>(op.getAcquireLockVal());
+        int32_t releaseLockId = static_cast<int32_t>(op.getReleaseLockId());
+        int32_t releaseLockVal = static_cast<int32_t>(op.getReleaseLockVal());
+
         // Create comment
-        std::string comment = "/* DMA BD Config: bd_id=" + std::to_string(op.getBdId().getDefiningOp<arith::ConstantOp>() ? 
-                              op.getBdId().getDefiningOp<arith::ConstantOp>().getValue().cast<IntegerAttr>().getInt() : -1) +
-                            ", offset=" + std::to_string(offset) +
-                            ", len=" + std::to_string(len) +
-                            ", enable_packet=" + (enablePacket ? "true" : "false") +
-                            ", packet_id=" + std::to_string(packetId) +
-                            ", next_bd=" + std::to_string(nextBd) + " */";
+        std::string comment =
+            "/* DMA BD Config: bd_id=" +
+            std::to_string(
+                op.getBdId().getDefiningOp<arith::ConstantOp>()
+                    ? mlir::cast<IntegerAttr>(op.getBdId().getDefiningOp<arith::ConstantOp>().getValue()).getInt()
+                    : -1) +
+            ", offset=" + std::to_string(offset) + ", len=" + std::to_string(len) +
+            ", enable_packet=" + (enablePacket ? "true" : "false") + ", packet_id=" + std::to_string(packetId) +
+            ", next_bd=" + std::to_string(nextBd) + ", acquire_lock_id=" + std::to_string(acquireLockId) +
+            ", acquire_lock_val=" + std::to_string(acquireLockVal) +
+            ", release_lock_id=" + std::to_string(releaseLockId) +
+            ", release_lock_val=" + std::to_string(releaseLockVal) + " */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
         
         // Create constants for parameters
@@ -878,45 +898,75 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             loc, i32Type, rewriter.getI32IntegerAttr(nextBd));
         auto packetIdConst = rewriter.create<emitc::ConstantOp>(
             loc, i32Type, rewriter.getI32IntegerAttr(packetId));
-        
-        // Get buffer address - need to convert memref/PartitionTensor to void* address
-        // For now, we'll pass the buffer directly and let the helper function extract the address
-        Value bufferAddr = buffer;
-        
-        // If buffer is a PartitionTensor, we need to extract its data pointer
-        // If it's a memref, we need to get its base address
-        // For simplicity, we'll cast it to void* and let the runtime handle it
-        
-        // Call the helper function that wraps all the AIE API calls
-        // XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst* dev, XAie_LocType tile, 
-        //                                      void* buffer, int32_t bd_id,
-        //                                      uint64_t addr, int32_t len, int32_t next_bd,
-        //                                      int32_t enable_packet, int32_t packet_id)
+
+        // PartitionTensor is passed by value; __Runtime_dma_bd_config needs void*.
+        // __runtime_buffer_arg(p) macro emits (void*)&p so runtime gets partition pointer.
+        auto voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(rewriter.getContext(), "void"));
+        auto bufferPtr = rewriter.create<emitc::CallOpaqueOp>(loc, voidPtrType, "__runtime_buffer_arg", nullptr,
+                                                              nullptr, ValueRange{buffer});
+
         auto u64Type = rewriter.getIntegerType(64);
         auto addrConst = rewriter.create<emitc::ConstantOp>(
             loc, u64Type, rewriter.getIntegerAttr(u64Type, offset));
-        
+
+        auto acquireLockIdConst =
+            rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(acquireLockId));
+        auto acquireLockValConst =
+            rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(acquireLockVal));
+        auto releaseLockIdConst =
+            rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(releaseLockId));
+        auto releaseLockValConst =
+            rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(releaseLockVal));
+
         auto configCall = rewriter.create<emitc::CallOpaqueOp>(
-            loc,
-            dmaDescType,
-            "__Runtime_dma_bd_config",
-            nullptr,
-            nullptr,
+            loc, dmaDescType, "__Runtime_dma_bd_config", nullptr, nullptr,
             ValueRange{
-                state.devInstRef,          // &DevInst
-                tile,                      // XAie_LocType tile
-                bufferAddr,                // void* buffer (for address extraction)
-                bdId,                      // bd_id
-                addrConst.getResult(),     // addr (offset within buffer)
-                lenConst.getResult(),      // len
-                nextBdConst.getResult(),   // next_bd
-                rewriter.create<emitc::ConstantOp>(loc, i32Type, 
-                    rewriter.getI32IntegerAttr(enablePacket ? 1 : 0)).getResult(),  // enable_packet
-                packetIdConst.getResult()  // packet_id
+                state.devInstRef,        // g_DevInst
+                tile,                    // XAie_LocType tile
+                bufferPtr.getResult(0),  // (void*)&buffer via __runtime_buffer_arg
+                bdId,                    // bd_id
+                addrConst.getResult(),   // addr (offset within buffer)
+                lenConst.getResult(),    // len
+                nextBdConst.getResult(), // next_bd
+                rewriter.create<emitc::ConstantOp>(loc, i32Type,
+                                                   rewriter.getI32IntegerAttr(enablePacket ? 1 : 0))
+                    .getResult(),                // enable_packet
+                packetIdConst.getResult(),       // packet_id
+                acquireLockIdConst.getResult(),  // acquire_lock_id
+                acquireLockValConst.getResult(), // acquire_lock_val
+                releaseLockIdConst.getResult(),  // release_lock_id
+                releaseLockValConst.getResult()  // release_lock_val
             });
-        
+
         llvm::errs() << "  ✓ Created DMA BD config with full AIE API parameters\n";
-        
+
+        // For core tiles with ping-pong buffer (acquire_lock_id >= 0, next_bd >= 0),
+        // emit XAie_LockSetValue to initialize the acquire lock to 2.
+        // Only emitted once per (tile, lock_id) to avoid duplicate calls.
+        if (acquireLockId >= 0 && nextBd >= 0) {
+            int32_t tileCol = -1, tileRow = -1;
+            if (auto declareTileOp = op.getTile().getDefiningOp<dfschedule::DeclareTileOp>()) {
+                tileCol = declareTileOp.getCol();
+                tileRow = declareTileOp.getRow();
+            }
+            if (tileCol >= 0 && tileRow >= 0) {
+                auto lockKey = std::make_tuple(tileCol, tileRow, acquireLockId);
+                if (state.initializedLocks.find(lockKey) == state.initializedLocks.end()) {
+                    state.initializedLocks.insert(lockKey);
+                    std::string lockComment = "/* Lock init: tile(" + std::to_string(tileCol) + "," +
+                                              std::to_string(tileRow) + ") lock=" + std::to_string(acquireLockId) +
+                                              " init_value=2 */";
+                    rewriter.create<emitc::VerbatimOp>(loc, lockComment);
+                    std::string lockSetCall = "XAie_LockSetValue(g_DevInst, XAie_TileLoc(" + std::to_string(tileCol) +
+                                              ", " + std::to_string(tileRow) + "), XAie_LockInit(" +
+                                              std::to_string(acquireLockId) + ", 2));";
+                    rewriter.create<emitc::VerbatimOp>(loc, lockSetCall);
+                    llvm::errs() << "  ✓ Emitted XAie_LockSetValue for tile(" << tileCol << "," << tileRow
+                                 << ") lock=" << acquireLockId << " init=2\n";
+                }
+            }
+        }
+
         // Replace the op with the call result (status code)
         rewriter.replaceOp(op, configCall.getResult(0));
         return success();
@@ -1061,25 +1111,20 @@ struct ConfigCreateIoInnerPattern : public OpConversionPattern<dfschedule::Confi
                             ", tile=(" + std::to_string(tileCol) + "," + std::to_string(tileRow) + ")" +
                             ", direction=" + direction + " */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
-        
-        // Define the IO struct type
-        auto ioStructType = emitc::OpaqueType::get(rewriter.getContext(), "struct io");
-        
-        // Create __Runtime_dma_createio call:
-        // struct io = __Runtime_dma_createio(tile_loc, dma_desc, channel_id, bd_id);
-        auto createIoCall = rewriter.create<emitc::CallOpaqueOp>(
-            loc,
-            ioStructType,
-            "__Runtime_dma_createio",
-            nullptr,
-            nullptr,
-            ValueRange{
-                tile,                       // XAie_LocType tile_loc
-                bdConfig,                   // XAie_DmaDesc dma_desc
-                channelIdConst.getResult(), // channel_id (from resource manager)
-                bdIdConst.getResult()       // bd_id (from resource manager)
-            });
-        
+
+        // Define the IO type (io from aie_runtime.h)
+        auto ioStructType = emitc::OpaqueType::get(rewriter.getContext(), "io");
+
+        // Create __Runtime_dma_createio_4 call (4 args; mem = NULL in runtime)
+        auto createIoCall =
+            rewriter.create<emitc::CallOpaqueOp>(loc, ioStructType, "__Runtime_dma_createio_4", nullptr, nullptr,
+                                                 ValueRange{
+                                                     tile,                       // XAie_LocType tile_loc
+                                                     bdConfig,                   // XAie_DmaDesc dma_desc
+                                                     channelIdConst.getResult(), // channel_id (from resource manager)
+                                                     bdIdConst.getResult()       // bd_id (from resource manager)
+                                                 });
+
         llvm::errs() << "  ✓ Created __Runtime_dma_createio call\n";
         
         // Store the resource mapping for use by StartIoOp
@@ -1113,11 +1158,10 @@ struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
         
         llvm::errs() << "  IO Handle type: " << ioHandle.getType() << "\n";
         llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";
-      
-        
-        // Define the ioevent struct type
-        auto ioEventType = emitc::OpaqueType::get(rewriter.getContext(), "struct ioevent");
-        
+
+        // Define the ioevent type (ioevent from aie_runtime.h)
+        auto ioEventType = emitc::OpaqueType::get(rewriter.getContext(), "ioevent");
+
         //rewriter.eraseOp(op);
         //return success();
         // Create __Runtime_startio call:
@@ -1175,20 +1219,13 @@ struct ScheduleWaitInnerPattern : public OpConversionPattern<dfschedule::Schedul
         // Create comment showing what we're waiting for
         std::string comment = "/* Wait for " + std::to_string(events.size()) + " event(s) */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
-        
-        // Create __Runtime_wait call for each event
-        // (We could also create a single call that takes an array, but for simplicity,
-        //  we'll create individual calls for now)
-        for (auto event : events) {
-            rewriter.create<emitc::CallOpaqueOp>(
-                loc,
-                TypeRange{},  // void return type
-                "__Runtime_wait",
-                nullptr,
-                nullptr,
-                ValueRange{event});
+
+        // Create __Runtime_wait call for each event (macro in aie_runtime.h dispatches event vs ioevent)
+        for (auto eventVal : events) {
+            rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "__Runtime_wait", nullptr, nullptr,
+                                                 ValueRange{eventVal});
         }
-        
+
         llvm::errs() << "  ✓ Created __Runtime_wait calls for " << events.size() << " event(s)\n";
         
         // Erase the original wait op (it has no results)
@@ -1309,8 +1346,8 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         rewriter.create<emitc::VerbatimOp>(loc, comment);
         
         // Define the kernel_group struct type
-        auto kernelGroupType = emitc::OpaqueType::get(rewriter.getContext(), "struct kernel_group");
-        
+        auto kernelGroupType = emitc::OpaqueType::get(rewriter.getContext(), "kernel_group");
+
         // For now, create a simple call that encapsulates the configuration
         // In a full implementation, this would parse the arrays and pass them appropriately
         // struct kernel_group = __Runtime_load_kernel_group(...);
@@ -1325,15 +1362,10 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         SmallVector<Value> callOperands;
         callOperands.append(tiles.begin(), tiles.end());
         callOperands.push_back(numTilesConst.getResult());
-        
-        auto loadCall = rewriter.create<emitc::CallOpaqueOp>(
-            loc,
-            kernelGroupType,
-            "__Runtime_load_kernel_group",
-            nullptr,
-            nullptr,
-            callOperands);
-        
+
+        auto loadCall = rewriter.create<emitc::CallOpaqueOp>(loc, kernelGroupType, "__Runtime_load_kernel_group_4t",
+                                                             nullptr, nullptr, callOperands);
+
         llvm::errs() << "  ✓ Created __Runtime_load_kernel_group call\n";
         
         // Replace the op with the kernel_group
@@ -1365,12 +1397,12 @@ struct LaunchKernelGroupInnerPattern : public OpConversionPattern<dfschedule::La
         //return success();
         // Create comment
         rewriter.create<emitc::VerbatimOp>(loc, "/* Launch Kernel Group */");
-        
-        // Define the event struct type (same as returned by StartIoOp)
-        auto eventType = emitc::OpaqueType::get(rewriter.getContext(), "struct event");
-        
+
+        // Define the event type (event from aie_runtime.h)
+        auto eventType = emitc::OpaqueType::get(rewriter.getContext(), "event");
+
         // Create __Runtime_launch_kernel_group call:
-        // struct event = __Runtime_launch_kernel_group(kernel_group);
+        // event = __Runtime_launch_kernel_group(kernel_group);
         auto launchCall = rewriter.create<emitc::CallOpaqueOp>(
             loc,
             eventType,
@@ -1410,7 +1442,7 @@ struct HostOpOuterPattern : public ConversionPattern {
         auto funcType = rewriter.getFunctionType({}, {});
         auto emitcFunc = rewriter.create<emitc::FuncOp>(loc, funcName, funcType);
         Block *entryBlock = emitcFunc.addEntryBlock();
-        
+
         // Move converted operations from host region to new func
         if (op->getNumRegions() > 0 && !op->getRegion(0).empty()) {
             Block &srcBlock = op->getRegion(0).front();
@@ -1425,7 +1457,7 @@ struct HostOpOuterPattern : public ConversionPattern {
                 }
             }
         }
-        
+
         // Add return at the end
         rewriter.setInsertionPointToEnd(entryBlock);
         rewriter.create<emitc::ReturnOp>(loc, Value{});
@@ -1494,24 +1526,613 @@ struct DsKernelReceiverPattern : public ConversionPattern {
         
         // Generate kernel body that reads config from tile-local memory
         // The kernel will read from TILE_CONFIG_ADDR at runtime
-        rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr(
-            "// Read tile-specific config from local memory at TILE_CONFIG_ADDR\n"
-            "  TileConfig *config = (TileConfig *)TILE_CONFIG_ADDR;\n"
-            "  uint8_t packet_id = config->packet_id;\n"
-            "  uint32_t dma_channel = config->dma_channel;\n"
-            "  uint8_t buffer_mode = config->buffer_mode;\n"
-            "  uint8_t num_buffers = config->num_buffers;\n"
-            "  uint32_t buffer_size = config->buffer_size;\n"
-            "  void *buffer_addr = (void *)config->buffer_addr;\n"
-            "  uint8_t element_size = config->element_size;\n"
-            "  // TODO: Implement kernel logic using above config"
-        ));
-        
+        rewriter.create<emitc::VerbatimOp>(loc,
+                                           rewriter.getStringAttr("// the real kernel will be emitted separately\n"));
+
         rewriter.create<emitc::ReturnOp>(loc, Value{});
         
         llvm::errs() << "[Pattern] Created __global__ func: " << kernelName 
                      << " with signature (index iterations)\n";
         
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+//===----------------------------------------------------------------------===//
+// Kernel Module Conversion Pattern
+//===----------------------------------------------------------------------===//
+
+/// Structure to hold buffer definition info
+struct BufferDefInfo {
+    std::string name;
+    int64_t size = 256;
+    int32_t vectorWidth = 4;
+    std::string elementType = "int32";
+};
+
+/// Structure to hold window parameter information
+struct WindowParamInfo {
+    std::string windowSymbol;    // e.g., "window_out_0"
+    bool isInput;                // true = input, false = output
+    std::string elementTypeName; // e.g., "int32", "int8"
+    std::string bufferPingName;  // e.g., "buf_out_ping_0" or "out_ping"
+    std::string bufferPongName;  // e.g., "buf_out_pong_0" or "out_pong"
+    int32_t acquireLockId;       // Lock ID for acquire
+    int32_t releaseLockId;       // Lock ID for release
+};
+
+/// Structure to hold extracted kernel module information
+struct KernelModuleInfo {
+    std::string moduleName;
+    std::string kernelName;
+    std::string kernelFile;
+    int32_t bufferSize = 256;
+    std::string elementType = "int32_t";
+    int32_t vectorWidth = 4;
+    std::string iterationStyle = "internal"; // "internal" or "external"
+
+    // Lock IDs
+    int32_t inputAcquireLockId = 48;
+    int32_t inputReleaseLockId = 49;
+    int32_t outputAcquireLockId = 51;
+    int32_t outputReleaseLockId = 50;
+
+    // Window names
+    std::string inputWindowName = "win";
+    std::string outputWindowName = "out";
+
+    // Buffer definitions extracted from dfschedule.buffer_def ops
+    SmallVector<BufferDefInfo> bufferDefs;
+
+    // Dynamic window parameters extracted from dfschedule.main
+    SmallVector<WindowParamInfo> windowParams;
+};
+
+/// Extract kernel module information from dfschedule.module operation
+static KernelModuleInfo extractKernelModuleInfo(dfschedule::KernelModuleOp moduleOp) {
+    KernelModuleInfo info;
+    info.moduleName = moduleOp.getSymName().str();
+
+    // Walk through the module body to extract definitions
+    moduleOp.getBody().walk([&](Operation *op) {
+        // Extract kernel config
+        if (auto configOp = dyn_cast<dfschedule::KernelConfigDefOp>(op)) {
+            DictionaryAttr configDict = configOp.getConfigAttrs();
+            if (auto kernelNameAttr = configDict.getAs<StringAttr>("kernel_name")) {
+                info.kernelName = kernelNameAttr.getValue().str();
+            }
+            if (auto kernelFileAttr = configDict.getAs<StringAttr>("kernel_file")) {
+                info.kernelFile = kernelFileAttr.getValue().str();
+            }
+            if (auto bufSizeAttr = configDict.getAs<IntegerAttr>("buffer_size")) {
+                info.bufferSize = bufSizeAttr.getInt();
+            }
+            if (auto vecWidthAttr = configDict.getAs<IntegerAttr>("vector_width")) {
+                info.vectorWidth = vecWidthAttr.getInt();
+            }
+            if (auto elemTypeAttr = configDict.getAs<TypeAttr>("element_type")) {
+                Type elemType = elemTypeAttr.getValue();
+                if (elemType.isInteger(32))
+                    info.elementType = "int32_t";
+                else if (elemType.isInteger(16))
+                    info.elementType = "int16_t";
+                else if (elemType.isInteger(8))
+                    info.elementType = "int8_t";
+                else if (elemType.isF32())
+                    info.elementType = "float";
+            }
+        }
+
+        // Extract lock definitions
+        if (auto lockOp = dyn_cast<dfschedule::LockDefOp>(op)) {
+            std::string lockName = lockOp.getSymName().str();
+            int32_t lockId = lockOp.getId();
+
+            if (lockName.find("win") != std::string::npos && lockName.find("ACQ") != std::string::npos) {
+                info.inputAcquireLockId = lockId;
+            } else if (lockName.find("win") != std::string::npos && lockName.find("REL") != std::string::npos) {
+                info.inputReleaseLockId = lockId;
+            } else if (lockName.find("out") != std::string::npos && lockName.find("ACQ") != std::string::npos) {
+                info.outputAcquireLockId = lockId;
+            } else if (lockName.find("out") != std::string::npos && lockName.find("REL") != std::string::npos) {
+                info.outputReleaseLockId = lockId;
+            }
+        }
+
+        // Extract kernel declaration to get iteration style
+        if (auto kernelDeclOp = dyn_cast<dfschedule::KernelDeclOp>(op)) {
+            info.kernelName = kernelDeclOp.getSymName().str();
+            DictionaryAttr declAttrs = kernelDeclOp.getDeclAttrs();
+            if (auto iterStyleAttr = declAttrs.getAs<StringAttr>("iteration_style")) {
+                info.iterationStyle = iterStyleAttr.getValue().str();
+            }
+        }
+
+        // Extract window definitions
+        if (auto windowOp = dyn_cast<dfschedule::WindowDefOp>(op)) {
+            std::string windowName = windowOp.getSymName().str();
+            DictionaryAttr windowAttrs = windowOp.getWindowAttrs();
+            if (auto directionAttr = windowAttrs.getAs<StringAttr>("direction")) {
+                if (directionAttr.getValue() == "in") {
+                    info.inputWindowName = windowName;
+                } else if (directionAttr.getValue() == "out") {
+                    info.outputWindowName = windowName;
+                }
+            }
+        }
+
+        // Extract buffer definitions
+        if (auto bufferOp = dyn_cast<dfschedule::BufferDefOp>(op)) {
+            BufferDefInfo bufInfo;
+            bufInfo.name = bufferOp.getSymName().str();
+
+            // Parse buffer type: memref<256xvector<4xi32>, "LOCAL">
+            TypeAttr bufferTypeAttr = bufferOp.getBufferTypeAttr();
+            if (auto memrefType = dyn_cast<MemRefType>(bufferTypeAttr.getValue())) {
+                // Get shape (e.g., 256)
+                if (!memrefType.getShape().empty()) {
+                    bufInfo.size = memrefType.getShape()[0];
+                }
+
+                // Get element type (could be vector<4xi32>)
+                Type elemType = memrefType.getElementType();
+                if (auto vecType = dyn_cast<VectorType>(elemType)) {
+                    // Vector type: extract width and element type
+                    if (!vecType.getShape().empty()) {
+                        bufInfo.vectorWidth = vecType.getShape()[0];
+                    }
+                    Type scalarType = vecType.getElementType();
+                    if (scalarType.isInteger(32))
+                        bufInfo.elementType = "int32";
+                    else if (scalarType.isInteger(16))
+                        bufInfo.elementType = "int16";
+                    else if (scalarType.isInteger(8))
+                        bufInfo.elementType = "int8";
+                    else if (scalarType.isF32())
+                        bufInfo.elementType = "float";
+                } else {
+                    // Scalar type
+                    bufInfo.vectorWidth = 1;
+                    if (elemType.isInteger(32))
+                        bufInfo.elementType = "int32";
+                    else if (elemType.isInteger(16))
+                        bufInfo.elementType = "int16";
+                    else if (elemType.isInteger(8))
+                        bufInfo.elementType = "int8";
+                    else if (elemType.isF32())
+                        bufInfo.elementType = "float";
+                }
+            }
+
+            info.bufferDefs.push_back(bufInfo);
+        }
+
+        // Extract dfschedule.main to get dynamic window parameters
+        if (auto mainOp = dyn_cast<dfschedule::KernelMainOp>(op)) {
+            llvm::errs() << "[extractKernelModuleInfo] Found dfschedule.main\n";
+
+            // Build a map: window symbol -> window definition attributes
+            llvm::StringMap<DictionaryAttr> windowDefMap;
+            moduleOp.getBody().walk([&](dfschedule::WindowDefOp winDefOp) {
+                windowDefMap[winDefOp.getSymName()] = winDefOp.getWindowAttrs();
+                llvm::errs() << "[extractKernelModuleInfo]   Found window def: " << winDefOp.getSymName() << "\n";
+            });
+
+            // Walk the main body to find window_init operations
+            llvm::errs() << "[extractKernelModuleInfo] Walking main body for window_init ops\n";
+            mainOp.getBody().walk([&](dfschedule::WindowInitOp winInitOp) {
+                llvm::errs() << "[extractKernelModuleInfo]   Found window_init op\n";
+                WindowParamInfo paramInfo;
+
+                // Get window symbol reference from the operation's attribute
+                SymbolRefAttr windowRef = winInitOp.getWindowRefAttr();
+                paramInfo.windowSymbol = windowRef.getRootReference().getValue().str();
+
+                // Determine if input or output from result type
+                Type resultType = winInitOp.getResult().getType();
+                if (auto inputWinType = dyn_cast<dfschedule::InputWindowType>(resultType)) {
+                    paramInfo.isInput = true;
+                    Type elemType = inputWinType.getElementType();
+                    if (elemType.isInteger(32))
+                        paramInfo.elementTypeName = "int32";
+                    else if (elemType.isInteger(16))
+                        paramInfo.elementTypeName = "int16";
+                    else if (elemType.isInteger(8))
+                        paramInfo.elementTypeName = "int8";
+                    else if (elemType.isF32())
+                        paramInfo.elementTypeName = "float";
+                } else if (auto outputWinType = dyn_cast<dfschedule::OutputWindowType>(resultType)) {
+                    paramInfo.isInput = false;
+                    Type elemType = outputWinType.getElementType();
+                    if (elemType.isInteger(32))
+                        paramInfo.elementTypeName = "int32";
+                    else if (elemType.isInteger(16))
+                        paramInfo.elementTypeName = "int16";
+                    else if (elemType.isInteger(8))
+                        paramInfo.elementTypeName = "int8";
+                    else if (elemType.isF32())
+                        paramInfo.elementTypeName = "float";
+                }
+
+                // Lookup window definition to get buffer names and lock IDs
+                auto it = windowDefMap.find(paramInfo.windowSymbol);
+                if (it != windowDefMap.end()) {
+                    DictionaryAttr windowAttrs = it->second;
+
+                    // Get ping/pong buffer names
+                    if (auto pingBufAttr = windowAttrs.getAs<SymbolRefAttr>("ping_buffer")) {
+                        paramInfo.bufferPingName = pingBufAttr.getRootReference().getValue().str();
+                    }
+                    if (auto pongBufAttr = windowAttrs.getAs<SymbolRefAttr>("pong_buffer")) {
+                        paramInfo.bufferPongName = pongBufAttr.getRootReference().getValue().str();
+                    }
+
+                    // Get acquire/release lock symbols and lookup their IDs
+                    if (auto acqLockAttr = windowAttrs.getAs<SymbolRefAttr>("acquire_lock")) {
+                        std::string acqLockName = acqLockAttr.getRootReference().getValue().str();
+                        // Find the lock definition to get the actual ID
+                        moduleOp.getBody().walk([&](dfschedule::LockDefOp lockOp) {
+                            if (lockOp.getSymName().str() == acqLockName) {
+                                paramInfo.acquireLockId = lockOp.getId();
+                            }
+                        });
+                    }
+                    if (auto relLockAttr = windowAttrs.getAs<SymbolRefAttr>("release_lock")) {
+                        std::string relLockName = relLockAttr.getRootReference().getValue().str();
+                        // Find the lock definition to get the actual ID
+                        moduleOp.getBody().walk([&](dfschedule::LockDefOp lockOp) {
+                            if (lockOp.getSymName().str() == relLockName) {
+                                paramInfo.releaseLockId = lockOp.getId();
+                            }
+                        });
+                    }
+                }
+
+                llvm::errs() << "[extractKernelModuleInfo]   Window param: " << paramInfo.windowSymbol
+                             << ", isInput=" << paramInfo.isInput << ", elemType=" << paramInfo.elementTypeName
+                             << ", ping=" << paramInfo.bufferPingName << ", pong=" << paramInfo.bufferPongName
+                             << ", acqLock=" << paramInfo.acquireLockId << ", relLock=" << paramInfo.releaseLockId
+                             << "\n";
+
+                info.windowParams.push_back(paramInfo);
+            });
+
+            llvm::errs() << "[extractKernelModuleInfo] Extracted " << info.windowParams.size()
+                         << " window parameters\n";
+        }
+    });
+
+    return info;
+}
+
+/// Generate C++ kernel driver code from KernelModuleInfo
+static std::string generateKernelDriverCode(const KernelModuleInfo &info) {
+    std::ostringstream code;
+
+    llvm::errs() << "[generateKernelDriverCode] Called with " << info.windowParams.size() << " window parameters\n";
+
+    // Vector type name (e.g., "v4int32")
+    std::string vecTypeName = "v" + std::to_string(info.vectorWidth) + info.elementType;
+    // Simplify type name for vector (int32_t -> int32)
+    std::string vecTypeSimple = info.elementType;
+    if (vecTypeSimple == "int32_t")
+        vecTypeSimple = "int32";
+    else if (vecTypeSimple == "int16_t")
+        vecTypeSimple = "int16";
+    else if (vecTypeSimple == "int8_t")
+        vecTypeSimple = "int8";
+    vecTypeName = "v" + std::to_string(info.vectorWidth) + vecTypeSimple;
+
+    // Generate includes and defines
+    code << "/* ========== Kernel Driver: " << info.moduleName << " ========== */\n";
+    code << "#include <stdint.h>\n";
+    code << "#define FOR_READ  1\n";
+    code << "#define FOR_WRITE 0\n";
+    code << "#define BUF_SZ " << info.bufferSize << "\n\n";
+
+    code << "volatile static int sync_buffer[8] = {0, -1};\n\n";
+
+    // Generate window management functions
+    code << "// Window management functions for standalone AIE kernels\n";
+    code << "// Note: chess_memory_fence() and done() are already defined by Chess intrinsics\n\n";
+
+    code << "// Window types\n";
+    code << "typedef struct {\n";
+    code << "    void* ptr;\n";
+    code << "    int ping_acq;\n";
+    code << "    int ping_rel;\n";
+    code << "    int pong_acq;\n";
+    code << "    int pong_rel;\n";
+    code << "    int size;\n";
+    code << "} window_internal;\n\n";
+
+    code << "typedef void* output_window_int8;\n";
+    code << "typedef void* input_window_int8;\n";
+    code << "typedef void* output_window_int16;\n";
+    code << "typedef void* input_window_int16;\n";
+    code << "typedef void* output_window_int32;\n";
+    code << "typedef void* input_window_int32;\n";
+    code << "typedef void* output_window_float;\n";
+    code << "typedef void* input_window_float;\n\n";
+
+    code << "// Window initialization\n";
+    code << "inline void window_init(window_internal* win, int count, void* ping, int ping_acq_lock, void* pong, int "
+            "ping_rel_lock, int ping_size, int pong_size) {\n";
+    code << "    win->ptr = ping;\n";
+    code << "    win->ping_acq = ping_acq_lock;\n";
+    code << "    win->ping_rel = ping_rel_lock;\n";
+    code << "    win->size = ping_size;\n";
+    code << "}\n\n";
+
+    code << "// Window access functions\n";
+    code << "inline output_window_int8 get_output_async_window_int8(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline output_window_int16 get_output_async_window_int16(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline output_window_int32 get_output_async_window_int32(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline output_window_float get_output_async_window_float(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline input_window_int8 get_input_async_window_int8(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline input_window_int16 get_input_async_window_int16(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline input_window_int32 get_input_async_window_int32(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline input_window_float get_input_async_window_float(window_internal* win) {\n";
+    code << "    return win->ptr;\n";
+    code << "}\n\n";
+
+    code << "inline int8_t* acquire_output_window(output_window_int8 win) {\n";
+    code << "    return (int8_t*)win;\n";
+    code << "}\n\n";
+
+    code << "inline void release_output_window(output_window_int8 win) {\n";
+    code << "    chess_memory_fence();\n";
+    code << "}\n\n";
+
+    // Generate debug logging helpers
+    code << "// Debug logging at fixed address 0x73000\n";
+    code << "#define LOG_BASE_ADDR 0x73000\n";
+    code << "static volatile int* log_ptr = (volatile int*)LOG_BASE_ADDR;\n";
+    code << "static int log_index = 0;\n\n";
+    code << "inline void log(int value) { log_ptr[log_index++] = value; }\n";
+    code << "inline void log_at(int index, int value) { log_ptr[index] = value; }\n";
+    code << "inline void log_reset() { log_index = 0; }\n\n";
+
+    // Generate lock defines
+    code << "#define LOCK_win_ping_ACQ " << info.inputAcquireLockId << "\n";
+    code << "#define LOCK_win_pong_REL " << info.inputReleaseLockId << "\n";
+    code << "#define LOCK_out_ping_ACQ " << info.outputAcquireLockId << "\n";
+    code << "#define LOCK_out_pong_REL " << info.outputReleaseLockId << "\n\n";
+
+    // Generate buffer declarations from extracted buffer definitions
+    if (!info.bufferDefs.empty()) {
+        for (const auto &buf : info.bufferDefs) {
+            std::string bufVecType = "v" + std::to_string(buf.vectorWidth) + buf.elementType;
+            code << bufVecType << " " << buf.name << "[BUF_SZ];\n";
+        }
+        code << "\n";
+    } else {
+        // Fallback to default buffer names if no buffer defs extracted
+        code << vecTypeName << " win_ping[BUF_SZ];\n";
+        code << vecTypeName << " win_pong[BUF_SZ];\n";
+        code << vecTypeName << " out_ping[BUF_SZ];\n";
+        code << vecTypeName << " out_pong[BUF_SZ];\n\n";
+    }
+
+    // Include the kernel file
+    if (!info.kernelFile.empty()) {
+        code << "#include \"" << info.kernelFile << "\"\n\n";
+    }
+
+    // Generate main function (kernel driver entry point)
+    code << "int main(void) {\n";
+    // code << "    log(1);  // Log: entering main\n";
+    code << "    sync_buffer[0] = 0; // reset end signal\n\n";
+
+    // Generate kernel invocation based on iteration style
+    if (info.iterationStyle == "internal") {
+        // Legacy style: window_init once, call kernel once
+        code << "    // Legacy style: kernel handles iterations internally\n";
+
+        // Use dynamic window parameters if available
+        if (!info.windowParams.empty()) {
+            // Dynamic mode: generate window initialization for each parameter
+            SmallVector<std::string> windowPtrVars;
+
+            for (size_t i = 0; i < info.windowParams.size(); ++i) {
+                const auto &param = info.windowParams[i];
+                std::string windowVarName = "window_" + param.windowSymbol;
+                std::string ptrVarName = param.windowSymbol + "_ptr";
+                std::string lockAcqName = "LOCK_" + param.windowSymbol + "_ACQ";
+                std::string lockRelName = "LOCK_" + param.windowSymbol + "_REL";
+
+                // Generate window_internal declaration
+                code << "    window_internal " << windowVarName << "[1];\n";
+
+                // Generate window_init call with actual buffer and lock names
+                code << "    window_init(" << windowVarName << ", 1, " << param.bufferPingName << ", "
+                     << param.acquireLockId << ", " << param.bufferPongName << ", " << param.releaseLockId
+                     << ", BUF_SZ, BUF_SZ);\n";
+
+                // Generate get_input/output_async_window call (no pointer, return value is already the window type)
+                if (param.isInput) {
+                    code << "    input_window_" << param.elementTypeName << " " << ptrVarName
+                         << " = get_input_async_window_" << param.elementTypeName << "(" << windowVarName << ");\n\n";
+                } else {
+                    code << "    output_window_" << param.elementTypeName << " " << ptrVarName
+                         << " = get_output_async_window_" << param.elementTypeName << "(" << windowVarName << ");\n\n";
+                }
+
+                windowPtrVars.push_back(ptrVarName);
+            }
+
+            // Generate kernel call with dynamic arguments
+            code << "    // Call kernel\n";
+            code << "    " << info.kernelName << "(";
+            for (size_t i = 0; i < windowPtrVars.size(); ++i) {
+                if (i > 0)
+                    code << ", ";
+                code << windowPtrVars[i];
+            }
+            code << ");\n";
+        } else {
+            // Fallback: hardcoded mode (backward compatibility)
+            code << "    window_internal window_win_ping[1];\n";
+            code << "    window_init(window_win_ping, 1, win_ping, LOCK_win_ping_ACQ, win_pong, LOCK_win_pong_REL, "
+                    "BUF_SZ, "
+                    "BUF_SZ);\n";
+            code << "    input_window_int32 win_ping_ptr = get_input_async_window_int32(window_win_ping);\n\n";
+            code << "    window_internal window_out_ping[1];\n";
+            code << "    window_init(window_out_ping, 1, out_ping, LOCK_out_ping_ACQ, out_pong, LOCK_out_pong_REL, "
+                    "BUF_SZ, "
+                    "BUF_SZ);\n";
+            code << "    output_window_int32 out_ping_ptr = get_output_async_window_int32(window_out_ping);\n\n";
+            code << "    // Call kernel\n";
+            code << "    " << info.kernelName << "(win_ping_ptr, out_ping_ptr);\n";
+        }
+    } else {
+        // ADF style: loop with acquire/release
+        code << "    // ADF style: wrapper handles iterations with acquire/release\n";
+
+        // Use dynamic window parameters if available
+        if (!info.windowParams.empty()) {
+            // Dynamic mode: generate window initialization for each parameter
+            SmallVector<std::string> windowVarNames;
+
+            for (size_t i = 0; i < info.windowParams.size(); ++i) {
+                const auto &param = info.windowParams[i];
+                std::string windowVarName = "window_" + param.windowSymbol;
+
+                // Generate window_internal declaration
+                code << "    window_internal " << windowVarName << "[1];\n";
+
+                // Generate window_init call
+                code << "    window_init(" << windowVarName << ", 1, " << param.bufferPingName << ", "
+                     << param.acquireLockId << ", " << param.bufferPongName << ", " << param.releaseLockId
+                     << ", BUF_SZ, BUF_SZ);\n\n";
+
+                windowVarNames.push_back(windowVarName);
+            }
+
+            code << "    for(int i = 0; i < iterations; i++) {\n";
+
+            // Generate window_acquire calls for each parameter
+            SmallVector<std::string> ptrVars;
+            for (size_t i = 0; i < info.windowParams.size(); ++i) {
+                const auto &param = info.windowParams[i];
+                std::string ptrVar = param.windowSymbol + "_ptr";
+
+                if (param.isInput) {
+                    code << "        input_window_" << param.elementTypeName << " " << ptrVar << " = window_acquire_in("
+                         << windowVarNames[i] << ");\n";
+                } else {
+                    code << "        output_window_" << param.elementTypeName << " " << ptrVar
+                         << " = window_acquire_out(" << windowVarNames[i] << ");\n";
+                }
+                ptrVars.push_back(ptrVar);
+            }
+
+            // Generate kernel call with dynamic arguments
+            code << "        " << info.kernelName << "(";
+            for (size_t i = 0; i < ptrVars.size(); ++i) {
+                if (i > 0)
+                    code << ", ";
+                code << ptrVars[i];
+            }
+            code << ");\n";
+
+            // Generate window_release calls for each parameter
+            for (const auto &windowVar : windowVarNames) {
+                code << "        window_release(" << windowVar << ");\n";
+            }
+
+            code << "    }\n";
+        } else {
+            // Fallback: hardcoded mode (backward compatibility)
+            code << "    window_internal window_win_ping[1];\n";
+            code << "    window_init(window_win_ping, 1, win_ping, LOCK_win_ping_ACQ, win_pong, LOCK_win_pong_REL, "
+                    "BUF_SZ, "
+                    "BUF_SZ);\n\n";
+            code << "    window_internal window_out_ping[1];\n";
+            code << "    window_init(window_out_ping, 1, out_ping, LOCK_out_ping_ACQ, out_pong, LOCK_out_pong_REL, "
+                    "BUF_SZ, "
+                    "BUF_SZ);\n\n";
+            code << "    for(int i = 0; i < iterations; i++) {\n";
+            code << "        input_window_int32 win_ptr = window_acquire_in(window_win_ping);\n";
+            code << "        output_window_int32 out_ptr = window_acquire_out(window_out_ping);\n";
+            code << "        " << info.kernelName << "(win_ptr, out_ptr);\n";
+            code << "        window_release(window_win_ping);\n";
+            code << "        window_release(window_out_ping);\n";
+            code << "    }\n";
+        }
+    }
+
+    code << "\n    done();\n";
+    code << "    return 0;\n";
+    code << "}\n";
+    code << "/* ========== End Kernel Driver ========== */\n";
+
+    return code.str();
+}
+
+/// ConversionPattern for dfschedule.module -> EmitC verbatim kernel code
+struct KernelModuleConversionPattern : public ConversionPattern {
+    KernelModuleConversionPattern(TypeConverter &typeConverter, MLIRContext *ctx)
+        : ConversionPattern(typeConverter, "dfschedule.module", /*benefit=*/1, ctx) {}
+
+    LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto moduleOp = cast<dfschedule::KernelModuleOp>(op);
+        auto loc = op->getLoc();
+
+        llvm::errs() << "[Pattern] KernelModuleConversionPattern for: " << moduleOp.getSymName() << "\n";
+
+        // Extract module information
+        KernelModuleInfo info = extractKernelModuleInfo(moduleOp);
+
+        llvm::errs() << "  Kernel name: " << info.kernelName << "\n";
+        llvm::errs() << "  Iteration style: " << info.iterationStyle << "\n";
+        llvm::errs() << "  Buffer size: " << info.bufferSize << "\n";
+        llvm::errs() << "  Vector width: " << info.vectorWidth << "\n";
+
+        // Generate the kernel driver C++ code
+        std::string kernelCode = generateKernelDriverCode(info);
+
+        // Create verbatim op with the generated code
+        rewriter.create<emitc::VerbatimOp>(loc, rewriter.getStringAttr(kernelCode));
+
+        llvm::errs() << "  ✓ Generated kernel driver code\n";
+
+        // Erase the original module op
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+/// Erase pattern for kernel module nested operations
+template <typename OpT> struct EraseKernelModuleNestedOp : public OpConversionPattern<OpT> {
+    using OpConversionPattern<OpT>::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        // These ops are handled as part of the parent KernelModuleOp conversion
         rewriter.eraseOp(op);
         return success();
     }
@@ -1627,143 +2248,144 @@ void DfscheduleToApiPass::runOnOperation() {
     {
         OpBuilder builder(ctx);
         builder.setInsertionPointToStart(moduleOp.getBody());
-        
-        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), builder.getStringAttr(
-            "#define PARTITION_MAX_DIMS 8\n"
-            "#define ALLOC_LIST_MAX_SIZE 256\n\n"
-            "/* Global list to track allocated memory for cleanup */\n"
-            "static XAie_MemInst* g_alloc_mem_list[ALLOC_LIST_MAX_SIZE];\n"
-            "static int g_alloc_mem_count = 0;\n\n"
-            "/* Add memory instance to tracking list */\n"
-            "static inline void __Runtime_track_alloc(XAie_MemInst* mem) {\n"
-            "    if (g_alloc_mem_count < ALLOC_LIST_MAX_SIZE) {\n"
-            "        g_alloc_mem_list[g_alloc_mem_count++] = mem;\n"
-            "    }\n"
-            "}\n\n"
-            "/* Free all tracked memory allocations */\n"
-            "static inline void __Runtime_free_all_allocs() {\n"
-            "    for (int i = 0; i < g_alloc_mem_count; i++) {\n"
-            "        if (g_alloc_mem_list[i]) {\n"
-            "            XAie_MemFree(g_alloc_mem_list[i]);\n"
-            "            g_alloc_mem_list[i] = NULL;\n"
-            "        }\n"
-            "    }\n"
-            "    g_alloc_mem_count = 0;\n"
-            "}\n\n"
-            "/* PartitionTensor structure for memory management and partitioning info */\n"
-            "typedef struct {\n"
-            "    void* data;                              /* Pointer to data */\n"
-            "    size_t elem_size;                        /* Size of each element in bytes */\n"
-            "    int ndim;                                /* Number of dimensions */\n"
-            "    int64_t original_shape[PARTITION_MAX_DIMS];  /* Original tensor shape */\n"
-            "    int64_t partition_shape[PARTITION_MAX_DIMS]; /* Shape of each partition slice */\n"
-            "    int partition_dim;                       /* Dimension being partitioned */\n"
-            "    int num_partitions;                      /* Number of partitions */\n"
-            "    /* Routing metadata */\n"
-            "    int hw_axis_owner;                       /* 0=row, 1=col */\n"
-            "    int replicate_on;                        /* 0=row, 1=col, -1=none */\n"
-            "} PartitionTensor;\n\n"
-            "/* Helper function for PartitionTensor initialization */\n"
-            "static inline PartitionTensor __Runtime_init_PartitionTensor(\n"
-            "    void* data, size_t elem_size, int ndim,\n"
-            "    const int64_t* original_shape, const int64_t* partition_shape,\n"
-            "    int partition_dim, int num_partitions,\n"
-            "    int hw_axis_owner, int replicate_on) {\n"
-            "    PartitionTensor pt;\n"
-            "    pt.data = data;\n"
-            "    pt.elem_size = elem_size;\n"
-            "    pt.ndim = ndim;\n"
-            "    for (int i = 0; i < ndim && i < PARTITION_MAX_DIMS; i++) {\n"
-            "        pt.original_shape[i] = original_shape[i];\n"
-            "        pt.partition_shape[i] = partition_shape[i];\n"
-            "    }\n"
-            "    pt.partition_dim = partition_dim;\n"
-            "    pt.num_partitions = num_partitions;\n"
-            "    pt.hw_axis_owner = hw_axis_owner;\n"
-            "    pt.replicate_on = replicate_on;\n"
-            "    return pt;\n"
-            "}\n\n"
-            "/* Get pointer to a specific partition slice */\n"
-            "static inline void* __Runtime_get_partition_slice(\n"
-            "    PartitionTensor* pt, int partition_idx) {\n"
-            "    if (partition_idx < 0 || partition_idx >= pt->num_partitions) return NULL;\n"
-            "    /* Calculate slice offset based on partition dimension */\n"
-            "    size_t slice_size = pt->elem_size;\n"
-            "    for (int i = 0; i < pt->ndim; i++) {\n"
-            "        slice_size *= pt->partition_shape[i];\n"
-            "    }\n"
-            "    return (void*)((char*)pt->data + partition_idx * slice_size);\n"
-            "}\n\n"
-            "/* Extract contiguous 2D slice from PartitionTensor */\n"
-            "/* Takes PartitionTensor by value for cleaner generated code */\n"
-            "static inline PartitionTensor __Runtime_extract_slice_contiguous_2d(\n"
-            "    PartitionTensor src, int off0, int off1, int size0, int size1) {\n"
-            "    PartitionTensor result;\n"
-            "    result.elem_size = src.elem_size;\n"
-            "    result.ndim = 2;\n"
-            "    result.partition_dim = -1;\n"
-            "    result.num_partitions = 1;\n"
-            "    result.hw_axis_owner = src.hw_axis_owner;\n"
-            "    result.replicate_on = src.replicate_on;\n"
-            "    result.original_shape[0] = size0;\n"
-            "    result.original_shape[1] = size1;\n"
-            "    result.partition_shape[0] = size0;\n"
-            "    result.partition_shape[1] = size1;\n"
-            "    \n"
-            "    /* Calculate byte offset: off0 * dim1 * elem_size + off1 * elem_size */\n"
-            "    size_t byte_offset = (off0 * src.original_shape[1] + off1) * src.elem_size;\n"
-            "    result.data = (void*)((char*)src.data + byte_offset);\n"
-            "    return result;\n"
-            "}\n\n"
-            "/* Extract 2D non-contiguous slice from PartitionTensor */\n"
-            "/* Allocates new memory via XAie_MemAllocate, copies strided data */\n"
-            "static inline PartitionTensor __Runtime_extract_slice_strided_2d(\n"
-            "    XAie_DevInst* dev_inst, PartitionTensor src,\n"
-            "    int off0, int off1, int size0, int size1) {\n"
-            "    PartitionTensor result;\n"
-            "    result.elem_size = src.elem_size;\n"
-            "    result.ndim = 2;\n"
-            "    result.partition_dim = -1;\n"
-            "    result.num_partitions = 1;\n"
-            "    result.hw_axis_owner = src.hw_axis_owner;\n"
-            "    result.replicate_on = src.replicate_on;\n"
-            "    result.original_shape[0] = size0;\n"
-            "    result.original_shape[1] = size1;\n"
-            "    result.partition_shape[0] = size0;\n"
-            "    result.partition_shape[1] = size1;\n"
-            "    \n"
-            "    /* Calculate destination size */\n"
-            "    size_t dst_size = (size_t)size0 * size1 * src.elem_size;\n"
-            "    \n"
-            "    /* Allocate memory for the slice */\n"
-            "    XAie_MemInst* mem_inst = XAie_MemAllocate(*dev_inst, dst_size, XAIE_MEM_CACHEABLE);\n"
-            "    if (!mem_inst) {\n"
-            "        result.data = NULL;\n"
-            "        return result;\n"
-            "    }\n"
-            "    __Runtime_track_alloc(mem_inst);\n"
-            "    \n"
-            "    void* dst = XAie_MemGetVAddr(mem_inst);\n"
-            "    result.data = dst;\n"
-            "    if (!dst) return result;\n"
-            "    \n"
-            "    /* Copy strided data to contiguous destination */\n"
-            "    char* d = (char*)dst;\n"
-            "    char* s = (char*)src.data;\n"
-            "    int elem_size = src.elem_size;\n"
-            "    int src_dim1 = src.original_shape[1];\n"
-            "    for (int i = 0; i < size0; i++) {\n"
-            "        int src_idx = ((off0 + i) * src_dim1 + off1) * elem_size;\n"
-            "        int dst_idx = (i * size1) * elem_size;\n"
-            "        memcpy(d + dst_idx, s + src_idx, size1 * elem_size);\n"
-            "    }\n"
-            "    return result;\n"
-            "}"
-        ));
-        
-        auto devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
-        builder.create<emitc::GlobalOp>(moduleOp.getLoc(),
-            "DevInst", devInstType, Attribute{}, true, false, false);
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "#include \"aie_runtime.h\"");
+        /* Extract .data from PartitionTensor for __Runtime_dma_bd_config(void* buffer) */
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "#define __runtime_buffer_arg(p) ((void*)((p).data))");
+        builder.create<emitc::VerbatimOp>(
+            moduleOp.getLoc(),
+            builder.getStringAttr(
+                "#define PARTITION_MAX_DIMS 8\n"
+                "#define ALLOC_LIST_MAX_SIZE 256\n\n"
+                "/* Global list to track allocated memory for cleanup */\n"
+                "static XAie_MemInst* g_alloc_mem_list[ALLOC_LIST_MAX_SIZE];\n"
+                "static int g_alloc_mem_count = 0;\n\n"
+                "/* Add memory instance to tracking list */\n"
+                "static inline void __Runtime_track_alloc(XAie_MemInst* mem) {\n"
+                "    if (g_alloc_mem_count < ALLOC_LIST_MAX_SIZE) {\n"
+                "        g_alloc_mem_list[g_alloc_mem_count++] = mem;\n"
+                "    }\n"
+                "}\n\n"
+                "/* Free all tracked memory allocations */\n"
+                "static inline void __Runtime_free_all_allocs() {\n"
+                "    for (int i = 0; i < g_alloc_mem_count; i++) {\n"
+                "        if (g_alloc_mem_list[i]) {\n"
+                "            XAie_MemFree(g_alloc_mem_list[i]);\n"
+                "            g_alloc_mem_list[i] = NULL;\n"
+                "        }\n"
+                "    }\n"
+                "    g_alloc_mem_count = 0;\n"
+                "}\n\n"
+                "/* PartitionTensor structure for memory management and partitioning info */\n"
+                "typedef struct {\n"
+                "    void* data;                              /* Pointer to data */\n"
+                "    size_t elem_size;                        /* Size of each element in bytes */\n"
+                "    int ndim;                                /* Number of dimensions */\n"
+                "    int64_t original_shape[PARTITION_MAX_DIMS];  /* Original tensor shape */\n"
+                "    int64_t partition_shape[PARTITION_MAX_DIMS]; /* Shape of each partition slice */\n"
+                "    int partition_dim;                       /* Dimension being partitioned */\n"
+                "    int num_partitions;                      /* Number of partitions */\n"
+                "    /* Routing metadata */\n"
+                "    int hw_axis_owner;                       /* 0=row, 1=col */\n"
+                "    int replicate_on;                        /* 0=row, 1=col, -1=none */\n"
+                "} PartitionTensor;\n\n"
+                "/* Helper function for PartitionTensor initialization */\n"
+                "static inline PartitionTensor __Runtime_init_PartitionTensor(\n"
+                "    void* data, size_t elem_size, int ndim,\n"
+                "    const int64_t* original_shape, const int64_t* partition_shape,\n"
+                "    int partition_dim, int num_partitions,\n"
+                "    int hw_axis_owner, int replicate_on) {\n"
+                "    PartitionTensor pt;\n"
+                "    pt.data = data;\n"
+                "    pt.elem_size = elem_size;\n"
+                "    pt.ndim = ndim;\n"
+                "    for (int i = 0; i < ndim && i < PARTITION_MAX_DIMS; i++) {\n"
+                "        pt.original_shape[i] = original_shape[i];\n"
+                "        pt.partition_shape[i] = partition_shape[i];\n"
+                "    }\n"
+                "    pt.partition_dim = partition_dim;\n"
+                "    pt.num_partitions = num_partitions;\n"
+                "    pt.hw_axis_owner = hw_axis_owner;\n"
+                "    pt.replicate_on = replicate_on;\n"
+                "    return pt;\n"
+                "}\n\n"
+                "/* Get pointer to a specific partition slice */\n"
+                "static inline void* __Runtime_get_partition_slice(\n"
+                "    PartitionTensor* pt, int partition_idx) {\n"
+                "    if (partition_idx < 0 || partition_idx >= pt->num_partitions) return NULL;\n"
+                "    /* Calculate slice offset based on partition dimension */\n"
+                "    size_t slice_size = pt->elem_size;\n"
+                "    for (int i = 0; i < pt->ndim; i++) {\n"
+                "        slice_size *= pt->partition_shape[i];\n"
+                "    }\n"
+                "    return (void*)((char*)pt->data + partition_idx * slice_size);\n"
+                "}\n\n"
+                "/* Extract contiguous 2D slice from PartitionTensor */\n"
+                "/* Takes PartitionTensor by value for cleaner generated code */\n"
+                "static inline PartitionTensor __Runtime_extract_slice_contiguous_2d(\n"
+                "    PartitionTensor src, int off0, int off1, int size0, int size1) {\n"
+                "    PartitionTensor result;\n"
+                "    result.elem_size = src.elem_size;\n"
+                "    result.ndim = 2;\n"
+                "    result.partition_dim = -1;\n"
+                "    result.num_partitions = 1;\n"
+                "    result.hw_axis_owner = src.hw_axis_owner;\n"
+                "    result.replicate_on = src.replicate_on;\n"
+                "    result.original_shape[0] = size0;\n"
+                "    result.original_shape[1] = size1;\n"
+                "    result.partition_shape[0] = size0;\n"
+                "    result.partition_shape[1] = size1;\n"
+                "    \n"
+                "    /* Calculate byte offset: off0 * dim1 * elem_size + off1 * elem_size */\n"
+                "    size_t byte_offset = (off0 * src.original_shape[1] + off1) * src.elem_size;\n"
+                "    result.data = (void*)((char*)src.data + byte_offset);\n"
+                "    return result;\n"
+                "}\n\n"
+                "/* Extract 2D non-contiguous slice from PartitionTensor */\n"
+                "/* Allocates new memory via XAie_MemAllocate, copies strided data */\n"
+                "static inline PartitionTensor __Runtime_extract_slice_strided_2d(\n"
+                "    XAie_DevInst* dev_inst, PartitionTensor src,\n"
+                "    int off0, int off1, int size0, int size1) {\n"
+                "    PartitionTensor result;\n"
+                "    result.elem_size = src.elem_size;\n"
+                "    result.ndim = 2;\n"
+                "    result.partition_dim = -1;\n"
+                "    result.num_partitions = 1;\n"
+                "    result.hw_axis_owner = src.hw_axis_owner;\n"
+                "    result.replicate_on = src.replicate_on;\n"
+                "    result.original_shape[0] = size0;\n"
+                "    result.original_shape[1] = size1;\n"
+                "    result.partition_shape[0] = size0;\n"
+                "    result.partition_shape[1] = size1;\n"
+                "    \n"
+                "    /* Calculate destination size */\n"
+                "    size_t dst_size = (size_t)size0 * size1 * src.elem_size;\n"
+                "    \n"
+                "    /* Allocate memory for the slice */\n"
+                "    XAie_MemInst* mem_inst = XAie_MemAllocate(dev_inst, dst_size, XAIE_MEM_CACHEABLE);\n"
+                "    if (!mem_inst) {\n"
+                "        result.data = NULL;\n"
+                "        return result;\n"
+                "    }\n"
+                "    __Runtime_track_alloc(mem_inst);\n"
+                "    \n"
+                "    void* dst = XAie_MemGetVAddr(mem_inst);\n"
+                "    result.data = dst;\n"
+                "    if (!dst) return result;\n"
+                "    \n"
+                "    /* Copy strided data to contiguous destination */\n"
+                "    char* d = (char*)dst;\n"
+                "    char* s = (char*)src.data;\n"
+                "    int elem_size = src.elem_size;\n"
+                "    int src_dim1 = src.original_shape[1];\n"
+                "    for (int i = 0; i < size0; i++) {\n"
+                "        int src_idx = ((off0 + i) * src_dim1 + off1) * elem_size;\n"
+                "        int dst_idx = (i * size1) * elem_size;\n"
+                "        memcpy(d + dst_idx, s + src_idx, size1 * elem_size);\n"
+                "    }\n"
+                "    return result;\n"
+                "}"));
+
+        /* DevInst: use g_DevInst from aie_runtime.h (set in state.devInstRef below) */
     }
     
     llvm::errs() << "[Pass] Phase 1: Helper definitions generated\n";
@@ -1924,13 +2546,13 @@ void DfscheduleToApiPass::runOnOperation() {
         
         OpBuilder builder(ctx);
         builder.setInsertionPointToStart(&hostOp.getRegion().front());
-        
-        // Create &DevInst reference directly as a constant
-        state.devInstRef = builder.create<emitc::ConstantOp>(
-            hostOp.getLoc(), 
-            emitc::PointerType::get(state.devInstType),
-            emitc::OpaqueAttr::get(ctx, "&DevInst")).getResult();
-        
+
+        // Create g_DevInst reference (from aie_runtime.h)
+        state.devInstRef = builder
+                               .create<emitc::ConstantOp>(hostOp.getLoc(), emitc::PointerType::get(state.devInstType),
+                                                          emitc::OpaqueAttr::get(ctx, "g_DevInst"))
+                               .getResult();
+
         // Create XAIE_MEM_CACHEABLE constant
         state.cacheableConst = builder.create<emitc::ConstantOp>(
             hostOp.getLoc(), state.i32Type,
@@ -2020,6 +2642,20 @@ void DfscheduleToApiPass::runOnOperation() {
             if (opName == "dfschedule.dskernel_receiver") {
                 return false; // illegal
             }
+            // Mark kernel module operations as illegal - they will be converted
+            if (opName == "dfschedule.module") {
+                return false; // illegal - convert to EmitC
+            }
+            // Nested kernel module ops will be erased when parent module is converted
+            if (opName == "dfschedule.kernel_config_def" || opName == "dfschedule.lock_def" ||
+                opName == "dfschedule.buffer_def" || opName == "dfschedule.window_def" ||
+                opName == "dfschedule.kernel_decl" || opName == "dfschedule.main" ||
+                opName == "dfschedule.alloc_sync_buffer" || opName == "dfschedule.sync_buffer_write" ||
+                opName == "dfschedule.log" || opName == "dfschedule.window_init" ||
+                opName == "dfschedule.kernel_invoke" || opName == "dfschedule.done" ||
+                opName == "dfschedule.kernel_return") {
+                return true; // legal - handled by parent module pattern
+            }
             return true;
         });
         
@@ -2034,7 +2670,8 @@ void DfscheduleToApiPass::runOnOperation() {
         patterns.add<HostOpOuterPattern>(typeConverter, ctx);
         patterns.add<LaunchHostPattern>(typeConverter, ctx);
         patterns.add<DsKernelReceiverPattern>(typeConverter, ctx);
-        
+        patterns.add<KernelModuleConversionPattern>(typeConverter, ctx);
+
         if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
             llvm::errs() << "[Pass] Warning: Partial conversion had failures\n";
         }
@@ -2223,6 +2860,8 @@ void DfscheduleToApiPass::runOnOperation() {
         llvm::errs() << "[Pass] ERROR: Null operands detected, failing pass\n";
         //signalPassFailure();
     }
+
+    llvm::errs() << "=== File Generation Complete ===\n\n";
 }
 
 } // namespace mlir

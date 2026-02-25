@@ -291,16 +291,20 @@ ModuleOp routingmanager::ops_test(MLIRContext* ctx, int totalN) {
     return m;
 }
 
-ModuleOp routingmanager::ops_testNew(MLIRContext* ctx, int totalN) {
+ModuleOp routingmanager::ops_testNew(MLIRContext *ctx, int totalN, std::string routingname) {
     const int hwrowused= 2, hwcolused=2;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
     //auto func = createroutingfuncByDim(ctx, true);
     //m.push_back(func);
     auto functype = builder.getFunctionType({},{});
-    
-    mlir::func::FuncOp main = builder.create<func::FuncOp>(builder.getUnknownLoc(), "main", functype);
-    
+
+    if (routingname.empty()) {
+        routingname = "main";
+    }
+
+    mlir::func::FuncOp main = builder.create<func::FuncOp>(builder.getUnknownLoc(), routingname, functype);
+
     auto block = main.addEntryBlock();
     builder.setInsertionPointToEnd(block);
     auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(),  hwrowused, hwcolused);

@@ -22,15 +22,14 @@ const std::array<Point,4> kDirs{{ {-1,0},{1,0},{0,-1},{0,1} }}; // up,down,left,
 //--------------------------------------------------------------------
 // ctor
 //--------------------------------------------------------------------
-RoutingPath::RoutingPath(std::shared_ptr<ResourceMgr> resmgr,std::shared_ptr<DataIO> dio, const std::vector<Point>& initObs)
-    : R_(resmgr->rows()), C_(resmgr->cols()),
-      wall_(R_,std::vector<bool>(C_,false)),
-      tree_(R_,std::vector<bool>(C_,false)),
-      parent_(R_,std::vector<Point>(C_,{-1,-1})),
-      M_start_(1),       // Memory tiles typically start at row 1
-      M_end_(1),         // Memory tiles typically end at row 1 (single row)
-      SHIM_start_(0),    // SHIM tiles at row 0
-      SHIM_end_(0)       // SHIM tiles at row 0
+RoutingPath::RoutingPath(std::shared_ptr<ResourceMgr> resmgr, std::shared_ptr<DataIO> dio,
+                         const std::vector<Point> &initObs)
+    : R_(resmgr->rows()), C_(resmgr->cols()), wall_(R_, std::vector<bool>(C_, false)),
+      tree_(R_, std::vector<bool>(C_, false)), parent_(R_, std::vector<Point>(C_, {-1, -1})),
+      M_start_(1),    // Memory tiles typically start at row 1
+      M_end_(2),      // Memory tiles end at row 2 (AIEML: rows 1-2)
+      SHIM_start_(0), // SHIM tiles at row 0
+      SHIM_end_(0)    // SHIM tiles at row 0
 {
     addObstacles(initObs);
     resmgr_= resmgr;
@@ -48,7 +47,7 @@ RoutingPath::RoutingPath(std::shared_ptr<ResourceMgr> resmgr,std::shared_ptr<Dat
         SHIM_start_ = 0;
         SHIM_end_ = 0;
         M_start_ = 1;
-        M_end_ = 1;
+        M_end_ = 2;
     }
 }
 
@@ -127,6 +126,8 @@ bool RoutingPath::bfsSingle(const Point& start,const Point& goal,
         
         for(auto d:kDirs){
             if(cur.r==0 && d.c!=0) continue; // row-0 rule: no left/right movement
+            if (cur.r >= M_start_ && cur.r <= M_end_ && d.c != 0)
+                continue; // MemTile: no EAST/WEST ports
             Point nxt{cur.r+d.r,cur.c+d.c};
             
             //check whether the connection has enough resources

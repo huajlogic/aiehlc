@@ -17,19 +17,114 @@ DataIO::DataIO(IOType tp, int r, int c, DMADIRECTION dir, int channel, std::stri
 // ──────────────────────────────────────────────────────────────
 // RoutingTile impl
 // ──────────────────────────────────────────────────────────────
-RoutingTile::RoutingTile(int r,int c, TileType tt,const std::vector<PortTemplate> & Portinfo)
-    : row_(r), col_(c), type_(tt)
-{
+RoutingTile::RoutingTile(int r, int c, TileType tt, const std::vector<PortTemplate> &Portinfo, int numBds, int numLocks)
+    : row_(r), col_(c), type_(tt), bdPool_(numBds), lockPool_(numLocks) {
     for(const auto& tp : Portinfo){
         auto& vec = (tp.role==PortRole::Master)?
                      banks_[tp.dir].master : banks_[tp.dir].slave;
         vec.resize(tp.ports);
-        // if there is an valid available_ports then update the vc.porNum
         for (int i = 0; i < std::min(tp.ports, (int)tp.available_ports.size()); i++) {
             vec[i].setportNum(tp.available_ports[i]);
         }
     }
-    //std::cout << "routing construct done " << std::endl;
+}
+
+// ── BD resource management ──
+std::optional<int> RoutingTile::allocateBd(int ownerId) {
+    for (int i = 0; i < (int)bdPool_.size(); ++i) {
+        if (!bdPool_[i].used) {
+            bdPool_[i].used = true;
+            bdPool_[i].ownerId = ownerId;
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+bool RoutingTile::releaseBd(int bdId, int ownerId) {
+    if (bdId < 0 || bdId >= (int)bdPool_.size())
+        return false;
+    auto &slot = bdPool_[bdId];
+    if (!slot.used)
+        return false;
+    if (ownerId >= 0 && slot.ownerId != ownerId)
+        return false;
+    slot.used = false;
+    slot.ownerId = -1;
+    return true;
+}
+
+bool RoutingTile::isBdFree(int bdId) const {
+    if (bdId < 0 || bdId >= (int)bdPool_.size())
+        return false;
+    return !bdPool_[bdId].used;
+}
+
+int RoutingTile::freeBdCount() const {
+    int n = 0;
+    for (auto &s : bdPool_)
+        if (!s.used)
+            ++n;
+    return n;
+}
+
+// ── Lock resource management ──
+std::optional<int> RoutingTile::allocateLock(int ownerId) {
+    for (int i = 0; i < (int)lockPool_.size(); ++i) {
+        if (!lockPool_[i].used) {
+            lockPool_[i].used = true;
+            lockPool_[i].ownerId = ownerId;
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<int> RoutingTile::allocateLockPair(int ownerId, int &lockA, int &lockB) {
+    int first = -1;
+    for (int i = 0; i < (int)lockPool_.size(); ++i) {
+        if (!lockPool_[i].used) {
+            if (first < 0) {
+                first = i;
+            } else {
+                lockPool_[first].used = true;
+                lockPool_[first].ownerId = ownerId;
+                lockPool_[i].used = true;
+                lockPool_[i].ownerId = ownerId;
+                lockA = first;
+                lockB = i;
+                return first;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool RoutingTile::releaseLock(int lockId, int ownerId) {
+    if (lockId < 0 || lockId >= (int)lockPool_.size())
+        return false;
+    auto &slot = lockPool_[lockId];
+    if (!slot.used)
+        return false;
+    if (ownerId >= 0 && slot.ownerId != ownerId)
+        return false;
+    slot.used = false;
+    slot.ownerId = -1;
+    return true;
+}
+
+bool RoutingTile::isLockFree(int lockId) const {
+    if (lockId < 0 || lockId >= (int)lockPool_.size())
+        return false;
+    return !lockPool_[lockId].used;
+}
+
+int RoutingTile::freeLockCount() const {
+    int n = 0;
+    for (auto &s : lockPool_)
+        if (!s.used)
+            ++n;
+    return n;
 }
 
 uint32_t RoutingTile::getPortnumFromPortIdx(PortDirection dir, PortRole role, uint32_t portidx)
@@ -96,9 +191,10 @@ ResourceMgr::ResourceMgr(std::unique_ptr<IHwResource> resource, TileType defType
     for(int r=0;r<rows;++r){
         tiles_[r].reserve(cols);
         for(int c=0;c<cols;++c){
-            TileType tt =resource->tileType(r, c);
+            TileType tt = resource->tileType(r, c);
             auto& portsinfo = resource->getPortsForTileType(tt);
-            tiles_[r].emplace_back(r,c,tt,portsinfo);
+            auto dmaLim = resource->getDmaLimits(tt);
+            tiles_[r].emplace_back(r, c, tt, portsinfo, dmaLim.numBds, dmaLim.numLocks);
         }
     }
     resource_ = std::move(resource);
@@ -133,7 +229,9 @@ std::shared_ptr<DataIO> ResourceMgr::createDataIO(IOType tp, int r, int c, DMADI
         RoutingTile& t = tile(r, c);
         auto portidx = t.occupyport(tp,PortDirection::South, dataioptr->id());
         if (portidx) {
-            uint32_t portnum = t.getPortnumFromPortIdx(PortDirection::South, (tp == IOType::Input) ? PortRole::Slave : PortRole::Master, *portidx);
+            // Must match the bank selection in occupyport: Input uses Master, Output uses Slave
+            uint32_t portnum = t.getPortnumFromPortIdx(
+                PortDirection::South, (tp == IOType::Input) ? PortRole::Master : PortRole::Slave, *portidx);
             auto shimport = std::make_optional<ShimIOPort>(tp,PortDirection::South,  portnum);
             dataioptr->setshimport(shimport);
         }
@@ -567,4 +665,52 @@ std::shared_ptr<DataIO> ResourceMgr::findDataIOByShimChannel(int shimCol, int ch
         }
     }
     return nullptr;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Tile-level BD resource management
+// ──────────────────────────────────────────────────────────────
+std::optional<int> ResourceMgr::allocateTileBd(int row, int col, int ownerId) {
+    if (row < 0 || row >= rows() || col < 0 || col >= cols())
+        return std::nullopt;
+    return tile(row, col).allocateBd(ownerId);
+}
+
+bool ResourceMgr::releaseTileBd(int row, int col, int bdId, int ownerId) {
+    if (row < 0 || row >= rows() || col < 0 || col >= cols())
+        return false;
+    return tile(row, col).releaseBd(bdId, ownerId);
+}
+
+int ResourceMgr::freeTileBdCount(int row, int col) const {
+    if (row < 0 || row >= rows() || col < 0 || col >= cols())
+        return 0;
+    return tile(row, col).freeBdCount();
+}
+
+// ──────────────────────────────────────────────────────────────
+// Tile-level Lock resource management
+// ──────────────────────────────────────────────────────────────
+std::optional<int> ResourceMgr::allocateTileLock(int row, int col, int ownerId) {
+    if (row < 0 || row >= rows() || col < 0 || col >= cols())
+        return std::nullopt;
+    return tile(row, col).allocateLock(ownerId);
+}
+
+std::optional<int> ResourceMgr::allocateTileLockPair(int row, int col, int ownerId, int &lockA, int &lockB) {
+    if (row < 0 || row >= rows() || col < 0 || col >= cols())
+        return std::nullopt;
+    return tile(row, col).allocateLockPair(ownerId, lockA, lockB);
+}
+
+bool ResourceMgr::releaseTileLock(int row, int col, int lockId, int ownerId) {
+    if (row < 0 || row >= rows() || col < 0 || col >= cols())
+        return false;
+    return tile(row, col).releaseLock(lockId, ownerId);
+}
+
+int ResourceMgr::freeTileLockCount(int row, int col) const {
+    if (row < 0 || row >= rows() || col < 0 || col >= cols())
+        return 0;
+    return tile(row, col).freeLockCount();
 }

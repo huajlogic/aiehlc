@@ -48,8 +48,13 @@ struct PortTemplate {
     std::vector<uint32_t> available_ports; //vaiable ports list, this is optinonal infor can be empty if port is 0-(ports-1)
 };
 
+struct TileDmaLimits {
+    int numBds = 16;   // buffer descriptors per tile
+    int numLocks = 16; // locks per tile
+};
+
 struct TypeBasedTileLoc {
-    TileType ttype;
+    ::TileType ttype;
     struct Point loc;
 };
 
@@ -88,7 +93,7 @@ struct TileSegment          // contiguous column range → TileType
 {
     uint32_t firstRow;      // inclusive
     uint32_t lastRow;       // inclusive
-    TileType type;
+    ::TileType type;
 };
 
 struct AIEDeviceLayout
@@ -104,8 +109,9 @@ struct AIEDeviceLayout
     std::unordered_set<uint32_t> nocShimCols;
     std::unordered_set<uint32_t> shimexttoaie_mux;
     std::unordered_set<uint32_t> shimaietoext_demux;
-    std::map<TileType, std::vector<PortTemplate>> portTemplates;
-    
+    std::map<::TileType, std::vector<PortTemplate>> portTemplates;
+    std::map<::TileType, TileDmaLimits> dmaLimits;
+
     // helpers -------------------------------------------------
     uint64_t tilePhysAddr(uint32_t r, uint32_t c) const
     {
@@ -113,21 +119,19 @@ struct AIEDeviceLayout
              + (static_cast<uint64_t>(c) << colShift)
              + (static_cast<uint64_t>(r) << rowShift);
     }
-    TileType tileType(uint32_t row, uint32_t /*col*/) const
-    {
+    ::TileType tileType(uint32_t row, uint32_t /*col*/) const {
         for (const auto& s : segments)
             if (row >= s.firstRow && row <= s.lastRow) return s.type;
-        return TileType::Unknown;
+        return ::TileType::Unknown;
     }
 
-    uint32_t absTileRow(TileType type, uint32_t relativeRow) const
-    {
+    uint32_t absTileRow(::TileType type, uint32_t relativeRow) const {
         for (const auto& s : segments)
             if (s.type == type) return relativeRow + s.firstRow;
         return relativeRow;
     }
 
-    const std::vector<PortTemplate>& getPortsForTileType(TileType type) const {
+    const std::vector<PortTemplate> &getPortsForTileType(::TileType type) const {
         static const std::vector<PortTemplate> emptyList;
         auto it = portTemplates.find(type);
         return (it != portTemplates.end()) ? it->second : emptyList;
@@ -141,6 +145,13 @@ struct AIEDeviceLayout
     }
     const std::unordered_set<uint32_t>& getShimAieToExtDemuxList() const {
         return shimaietoext_demux;
+    }
+
+    TileDmaLimits getDmaLimits(::TileType type) const {
+        auto it = dmaLimits.find(type);
+        if (it != dmaLimits.end())
+            return it->second;
+        return TileDmaLimits{}; // default: 16 BDs, 16 locks
     }
 };
 
@@ -157,14 +168,16 @@ public:
     virtual void     setBaseAddr(uint64_t addr) = 0;
 
     virtual uint64_t tileAddr (uint32_t r, uint32_t c) const = 0;
-    virtual TileType tileType(uint32_t r, uint32_t c) const = 0;
-    virtual const std::vector<PortTemplate>& getPortsForTileType(TileType type) const = 0;
+    virtual ::TileType tileType(uint32_t r, uint32_t c) const = 0;
+    virtual const std::vector<PortTemplate> &getPortsForTileType(::TileType type) const = 0;
 
     virtual const std::unordered_set<uint32_t>& getShimNoc() const = 0;
     virtual const std::unordered_set<uint32_t>& getShimExtToAieMuxList() const = 0;
     virtual const std::unordered_set<uint32_t>& getShimAieToExtDemuxList() const = 0;
 
-    virtual uint32_t absTileRow(TileType type, uint32_t relativeRow) const = 0;
+    virtual uint32_t absTileRow(::TileType type, uint32_t relativeRow) const = 0;
+
+    virtual TileDmaLimits getDmaLimits(::TileType type) const = 0;
 
     virtual std::string name() const = 0;
 };

@@ -53,17 +53,16 @@
 #define CORE_IP_MEM 0x1000
 #define CORE_OP_MEM 0x6000
 
-#define MAT_SIZE 2048 // Size of each matrix (A and B)
+#define MAT_SIZE 256 // Size of each matrix (A and B)
 #define N 16         // Dimension of the square matrices (16x16)
 
 // #define DISABLE_CACHE
 //__attribute__((annotate("streaming")))
-__global__ void perf(input_window_int32 *win
-                     __attribute__((annotate("mem_address:0x1000"), annotate("size_hint:4096"))),
+__global__ void perf(input_window_int32 *win __attribute__((annotate("mem_address:0x1000"), annotate("size_hint:512"))),
                      output_window_int32 *out
-                     __attribute__((annotate("mem_address:0x6000"), annotate("size_hint:4096")))) {
-#define DATA_SIZE 4096
-#define MAT_SIZE 2048
+                     __attribute__((annotate("mem_address:0x6000"), annotate("size_hint:512")))) {
+#define DATA_SIZE 512
+#define MAT_SIZE 256
 #define N 16          // Dimension of the square matrices
 #define VECTOR_LENGTH 16
 	//aie::vector<int32_t, VECTOR_LENGTH> temp_a = window_readincr_v<VECTOR_LENGTH>(win);
@@ -113,7 +112,7 @@ int test_routing(XAie_DevInst *DevInst)
 	AieRC RC = XAIE_OK;
 	XAie_RoutingInstance* routingInstance;
   	//XTime tStart, tEnd;
-    printf("Starting test_routing 01/28\n");
+    printf("Starting test_routing 02/2 -1\n");
     breakprint("core reset--");
 #if AIE_GEN == XAIE_DEV_GEN_AIE2PS
     int shimcol = 10; // 33;
@@ -300,8 +299,8 @@ int main(int argc, char* argv[]) {
 	XAie_InstDeclare(DevInst, &ConfigPtr);
 
 	int partitonnum = 34;
-	int startcol = 2;
-	int colnum = (startcol + partitonnum <= XAIE_NUM_COLS) ? partitonnum : (XAIE_NUM_COLS- startcol);
+    int startcol = 1;
+    int colnum = (startcol + partitonnum <= XAIE_NUM_COLS) ? partitonnum : (XAIE_NUM_COLS- startcol);
 
 	AieRC RC;
     /*
@@ -311,7 +310,7 @@ int main(int argc, char* argv[]) {
         printf("Driver XAie_SetupPartitionConfig failed.\n");
         return -1;
     }
-        //*/
+    //*/
 
     RC = XAie_CfgInitialize(&DevInst, &ConfigPtr);
 	if(RC != XAIE_OK) {
