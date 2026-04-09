@@ -29,6 +29,27 @@ namespace mlir {
 // Global counter for unique sequential naming (avoids conflict)
 static std::atomic<int> g_pullPushCounter{0};
 
+// Map from root-tensor SSA Value (partitiontensor result) to data_id.
+// All push sub-flows sharing the same root tensor get the same data_id,
+// enabling ScheduleCanonicalizePass to merge their shim BDs into one.
+static llvm::DenseMap<mlir::Value, int32_t> g_rootViewToDataId;
+static int32_t g_dataIdCounter = 0;
+
+// Helper: look up dmapktid from the first producer port of a pull path.
+// Returns 1 as fallback (pkt_id=0 is reserved).
+static int32_t getBasePktIdFromProducers(dmaphop::create_path pathOp, Operation *contextOp) {
+    for (auto attr : pathOp.getProducers()) {
+        if (auto symRef = dyn_cast<FlatSymbolRefAttr>(attr)) {
+            auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, symRef);
+            if (portOp) {
+                if (auto pktIdOpt = portOp.getDmapktid())
+                    return static_cast<int32_t>(*pktIdOpt);
+            }
+        }
+    }
+    return 1; // fallback: 1-based
+}
+
 // Helper to process pull (Gather)
 void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp configOp, Value viewHandle) {
     // 1. Get path and extract source/destination from producers/consumers attributes
@@ -84,10 +105,23 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     if (sourceTiles.empty()) {
         llvm::errs() << "WARNING: processPull - no source tiles found from producers attribute\n";
     }
-    
+
     // Get unique sequential ID for naming
     int opId = g_pullPushCounter.fetch_add(1);
-    
+
+    // Assign data_id: same ID for all pull sub-flows sharing the same root tensor.
+    // viewHandle is the root tensor passed in by the caller.
+    int32_t dataId;
+    {
+        auto it = g_rootViewToDataId.find(viewHandle);
+        if (it != g_rootViewToDataId.end()) {
+            dataId = it->second;
+        } else {
+            dataId = g_dataIdCounter++;
+            g_rootViewToDataId[viewHandle] = dataId;
+        }
+    }
+
     std::string srcGroupName = "group_src_" + std::to_string(opId);
     builder.create<dfscheblueprint::TileGroupOp>(
         op.getLoc(),
@@ -144,37 +178,32 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
     // 3. Create Binds
     std::string srcBindName = "flow_src_" + std::to_string(opId);
     builder.create<dfscheblueprint::FlowConfigOp>(
-        op.getLoc(),
-        srcBindName,
-        FlatSymbolRefAttr::get(builder.getContext(), srcGroupName),
-        viewHandle,
+        op.getLoc(), srcBindName, FlatSymbolRefAttr::get(builder.getContext(), srcGroupName), viewHandle,
         builder.getStringAttr("linear"),
-        dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({sourceChannel}), dfscheblueprint::bp_direction::MM2S),
-        builder.getArrayAttr({}),
-        builder.getStringAttr(srcTileType) 
+        dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({sourceChannel}),
+                                      dfscheblueprint::bp_direction::MM2S),
+        builder.getArrayAttr({}), builder.getStringAttr(srcTileType),
+        nullptr // data_id
     );
-    
+
     std::string dstBindName = "flow_dst_" + std::to_string(opId);
     builder.create<dfscheblueprint::FlowConfigOp>(
-        op.getLoc(),
-        dstBindName,
-        FlatSymbolRefAttr::get(builder.getContext(), dstGroupName),
-        viewHandle,
+        op.getLoc(), dstBindName, FlatSymbolRefAttr::get(builder.getContext(), dstGroupName), viewHandle,
         builder.getStringAttr("root"),
-        dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({destChannel}), dfscheblueprint::bp_direction::S2MM),
+        dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({destChannel}),
+                                      dfscheblueprint::bp_direction::S2MM),
         nullptr, // slice_symbols
-        builder.getStringAttr(dstTileType)
+        builder.getStringAttr(dstTileType),
+        builder.getI32IntegerAttr(dataId) // data_id for shim BD grouping
     );
-    
+
     // 4. Collective Transfer
+    int32_t basePktId = getBasePktIdFromProducers(pathOp, op);
     builder.create<dfscheblueprint::FlowTransferOp>(
-        op.getLoc(),
-        builder.getStringAttr("transfer_" + std::to_string(opId)),
-        builder.getStringAttr("many_to_one"),
+        op.getLoc(), builder.getStringAttr("transfer_" + std::to_string(opId)), builder.getStringAttr("many_to_one"),
         FlatSymbolRefAttr::get(builder.getContext(), srcBindName),
-        FlatSymbolRefAttr::get(builder.getContext(), dstBindName),
-        builder.getStringAttr("sequential"),
-        builder.getI32IntegerAttr(0),
+        FlatSymbolRefAttr::get(builder.getContext(), dstBindName), builder.getStringAttr("sequential"),
+        builder.getI32IntegerAttr(basePktId),
         builder.getI32IntegerAttr(opId) // flow_index
     );
 }
@@ -299,36 +328,31 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
     // Binds
     std::string srcBindName = "flow_src_" + std::to_string(opId);
     builder.create<dfscheblueprint::FlowConfigOp>(
-        op.getLoc(),
-        srcBindName,
-        FlatSymbolRefAttr::get(builder.getContext(), srcGroupName),
-        viewHandle,
+        op.getLoc(), srcBindName, FlatSymbolRefAttr::get(builder.getContext(), srcGroupName), viewHandle,
         builder.getStringAttr("root"),
-        dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({srcChannel}), dfscheblueprint::bp_direction::MM2S),
+        dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({srcChannel}),
+                                      dfscheblueprint::bp_direction::MM2S),
         nullptr, // slice_symbols
-        builder.getStringAttr(srcTileType)
+        builder.getStringAttr(srcTileType),
+        nullptr // data_id
     );
-    
+
     std::string dstBindName = "flow_dst_" + std::to_string(opId);
     builder.create<dfscheblueprint::FlowConfigOp>(
-        op.getLoc(),
-        dstBindName,
-        FlatSymbolRefAttr::get(builder.getContext(), dstGroupName),
-        viewHandle,
+        op.getLoc(), dstBindName, FlatSymbolRefAttr::get(builder.getContext(), dstGroupName), viewHandle,
         builder.getStringAttr("linear"),
-        dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({dstChannel}), dfscheblueprint:: bp_direction::S2MM),
-        builder.getArrayAttr({}),
-        builder.getStringAttr(dstTileType)
+        dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({dstChannel}),
+                                      dfscheblueprint::bp_direction::S2MM),
+        builder.getArrayAttr({}), builder.getStringAttr(dstTileType),
+        nullptr // data_id
     );
-    
+
+    int32_t basePktId = 0; // Push flows are circuit-switched; no pkt_id
     builder.create<dfscheblueprint::FlowTransferOp>(
-        op.getLoc(),
-        builder.getStringAttr("transfer_" + std::to_string(opId)),
-        builder.getStringAttr("one_to_many"),
+        op.getLoc(), builder.getStringAttr("transfer_" + std::to_string(opId)), builder.getStringAttr("one_to_many"),
         FlatSymbolRefAttr::get(builder.getContext(), srcBindName),
-        FlatSymbolRefAttr::get(builder.getContext(), dstBindName),
-        builder.getStringAttr("sequential"),
-        builder.getI32IntegerAttr(0),
+        FlatSymbolRefAttr::get(builder.getContext(), dstBindName), builder.getStringAttr("sequential"),
+        builder.getI32IntegerAttr(basePktId),
         builder.getI32IntegerAttr(0) // flow_index
     );
 }
@@ -535,7 +559,28 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         if (consumerBuffers.empty()) return failure();
 
         Value viewSplit = adaptor.getData();
-        
+
+        // Find the root (pre-split) view: trace extract_slice -> partitiontensor.
+        // The partitiontensor result is shared by all sub-flows for the same tensor,
+        // so it serves as the stable identity key for data_id assignment.
+        Value rootAdaptedView = viewSplit;
+        if (auto extractSlice = viewSplit.getDefiningOp<tensor::ExtractSliceOp>()) {
+            rootAdaptedView = extractSlice.getSource();
+            // rootAdaptedView is now the routing.partitiontensor result (full tensor)
+        }
+
+        // Assign data_id: same ID for all sub-flows sharing the same root tensor
+        int32_t dataId;
+        {
+            auto it = g_rootViewToDataId.find(rootAdaptedView);
+            if (it != g_rootViewToDataId.end()) {
+                dataId = it->second;
+            } else {
+                dataId = g_dataIdCounter++;
+                g_rootViewToDataId[rootAdaptedView] = dataId;
+            }
+        }
+
         // Get unique sequential ID for naming (moved up to use in slice names)
         int opId = g_pullPushCounter.fetch_add(1);
         
@@ -687,45 +732,45 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                 rewriter.getArrayAttr(destTiles)
             );
         }
-        
+
         // 4. Create Binds
-        // For Push: src is one tile (FlowConfigOp with root), dst is many tiles (FlowConfigGroupOp with linear and slice_symbols)
+        // For Push: src is one shim tile (FlowConfigOp with partition slice view),
+        //           dst is many core tiles (FlowConfigOp with linear and slice_symbols)
         std::string srcBindName = "flow_src_" + std::to_string(opId);
+        // Use viewSplit (partition slice) so the shim BD covers only the data
+        // for this round; rootAdaptedView is kept only for data_id assignment.
         rewriter.create<dfscheblueprint::FlowConfigOp>(
-            op.getLoc(),
-            rewriter.getStringAttr(srcBindName),
-            FlatSymbolRefAttr::get(getContext(), srcGroupName),
-            viewSplit,
+            op.getLoc(), rewriter.getStringAttr(srcBindName), FlatSymbolRefAttr::get(getContext(), srcGroupName),
+            viewSplit, // partition slice (tensor<8x16xi8> for each round)
             rewriter.getStringAttr("root"),
-            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({sourceChannel}), dfscheblueprint::bp_direction::MM2S),
+            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({sourceChannel}),
+                                          dfscheblueprint::bp_direction::MM2S),
             nullptr, // slice_symbols - source is root, no slice
-            rewriter.getStringAttr(srcTileType)
+            rewriter.getStringAttr(srcTileType),
+            rewriter.getI32IntegerAttr(dataId) // data_id for shim BD grouping/merging
         );
-        
+
         std::string dstBindName = "flow_dst_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::FlowConfigOp>(
-            op.getLoc(),
-            rewriter.getStringAttr(dstBindName),
-            FlatSymbolRefAttr::get(getContext(), dstGroupName),
-            viewSplit,
-            rewriter.getStringAttr("linear"),
-            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({destChannel}), dfscheblueprint::bp_direction::S2MM),
-            rewriter.getArrayAttr(sliceSymbols),  // Associate with @consumer_slice_0 to @consumer_slice_N
-            rewriter.getStringAttr(dstTileType)
+            op.getLoc(), rewriter.getStringAttr(dstBindName), FlatSymbolRefAttr::get(getContext(), dstGroupName),
+            viewSplit, rewriter.getStringAttr("linear"),
+            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({destChannel}),
+                                          dfscheblueprint::bp_direction::S2MM),
+            rewriter.getArrayAttr(sliceSymbols), // Associate with @consumer_slice_0 to @consumer_slice_N
+            rewriter.getStringAttr(dstTileType),
+            nullptr // data_id
         );
-        
+
         // 5. Create Collective Transfer - one_to_many for push/scatter
+        int32_t basePktId = 0; // Push flows are circuit-switched; no pkt_id
         rewriter.create<dfscheblueprint::FlowTransferOp>(
-            op.getLoc(),
-            rewriter.getStringAttr("transfer_" + std::to_string(opId)),
-            rewriter.getStringAttr("one_to_many"),
-            FlatSymbolRefAttr::get(getContext(), srcBindName),
-            FlatSymbolRefAttr::get(getContext(), dstBindName),
-            rewriter.getStringAttr("sequential"),
-            rewriter.getI32IntegerAttr(0),
+            op.getLoc(), rewriter.getStringAttr("transfer_" + std::to_string(opId)),
+            rewriter.getStringAttr("one_to_many"), FlatSymbolRefAttr::get(getContext(), srcBindName),
+            FlatSymbolRefAttr::get(getContext(), dstBindName), rewriter.getStringAttr("sequential"),
+            rewriter.getI32IntegerAttr(basePktId),
             rewriter.getI32IntegerAttr(opId) // flow_index
         );
-        
+
         rewriter.eraseOp(op);
         return success();
     }
@@ -742,10 +787,28 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         if (producerBuffers.empty()) return failure();
 
         Value viewSplit = adaptor.getData();
-        
+
+        // Find the root (pre-split) view for data_id keying.
+        Value rootAdaptedView = viewSplit;
+        if (auto extractSlice = viewSplit.getDefiningOp<tensor::ExtractSliceOp>()) {
+            rootAdaptedView = extractSlice.getSource();
+        }
+
+        // Assign data_id: same ID for all pull sub-flows sharing the same root tensor.
+        int32_t dataId;
+        {
+            auto it = g_rootViewToDataId.find(rootAdaptedView);
+            if (it != g_rootViewToDataId.end()) {
+                dataId = it->second;
+            } else {
+                dataId = g_dataIdCounter++;
+                g_rootViewToDataId[rootAdaptedView] = dataId;
+            }
+        }
+
         // Get unique sequential ID for naming (moved up to use in slice names)
         int opId = g_pullPushCounter.fetch_add(1);
-        
+
         // Create dfscheblueprint.data_slice ops to wrap the converted producer buffers
         SmallVector<Attribute> sliceSymbols;
         for (size_t i = 0; i < producerBuffers.size(); ++i) {
@@ -907,46 +970,46 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         // 4. Create Binds
         std::string srcBindName = "flow_src_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::FlowConfigOp>(
-            op.getLoc(),
-            rewriter.getStringAttr(srcBindName),
-            FlatSymbolRefAttr::get(getContext(), srcGroupName),
-            viewSplit,
-            rewriter.getStringAttr("linear"),
-            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({sourceChannel}), dfscheblueprint::bp_direction::MM2S),
-            rewriter.getArrayAttr(sliceSymbols),  // slice_symbols
-            rewriter.getStringAttr(srcTileType)
+            op.getLoc(), rewriter.getStringAttr(srcBindName), FlatSymbolRefAttr::get(getContext(), srcGroupName),
+            viewSplit, rewriter.getStringAttr("linear"),
+            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({sourceChannel}),
+                                          dfscheblueprint::bp_direction::MM2S),
+            rewriter.getArrayAttr(sliceSymbols), // slice_symbols
+            rewriter.getStringAttr(srcTileType),
+            nullptr // data_id
         );
-        
+
         std::string dstBindName = "flow_dst_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::FlowConfigOp>(
-            op.getLoc(),
-            rewriter.getStringAttr(dstBindName),
-            FlatSymbolRefAttr::get(getContext(), dstGroupName),
-            viewSplit,
-            rewriter.getStringAttr("root"),
-            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({destChannel}), dfscheblueprint::bp_direction::S2MM),
+            op.getLoc(), rewriter.getStringAttr(dstBindName), FlatSymbolRefAttr::get(getContext(), dstGroupName),
+            viewSplit, rewriter.getStringAttr("root"),
+            dfscheblueprint::DMAAttr::get(getContext(), ArrayRef<int64_t>({destChannel}),
+                                          dfscheblueprint::bp_direction::S2MM),
             nullptr, // slice_symbols
-            rewriter.getStringAttr(dstTileType)
+            rewriter.getStringAttr(dstTileType),
+            rewriter.getI32IntegerAttr(dataId) // data_id for shim BD grouping
         );
-        
+
         // 5. Create Collective Transfer
+        int32_t basePktId = getBasePktIdFromProducers(pathOp, op);
         rewriter.create<dfscheblueprint::FlowTransferOp>(
-            op.getLoc(),
-            rewriter.getStringAttr("transfer_" + std::to_string(opId)),
-            rewriter.getStringAttr("many_to_one"),
-            FlatSymbolRefAttr::get(getContext(), srcBindName),
-            FlatSymbolRefAttr::get(getContext(), dstBindName),
-            rewriter.getStringAttr("sequential"),
-            rewriter.getI32IntegerAttr(0),
+            op.getLoc(), rewriter.getStringAttr("transfer_" + std::to_string(opId)),
+            rewriter.getStringAttr("many_to_one"), FlatSymbolRefAttr::get(getContext(), srcBindName),
+            FlatSymbolRefAttr::get(getContext(), dstBindName), rewriter.getStringAttr("sequential"),
+            rewriter.getI32IntegerAttr(basePktId),
             rewriter.getI32IntegerAttr(opId) // flow_index
         );
-        
+
         rewriter.eraseOp(op);
         return success();
     }
 };
 
 void DmaphopTodfscheblueprintPass::runOnOperation() {
+    // Reset data_id map each pass run so IDs are fresh per compilation unit
+    g_rootViewToDataId.clear();
+    g_dataIdCounter = 0;
+
     auto module = getOperation();
     OpBuilder builder(module->getContext());
 

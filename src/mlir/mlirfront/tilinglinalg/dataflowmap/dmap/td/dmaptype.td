@@ -1,3 +1,7 @@
+/******************************************************************************
+* Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
 #ifndef _TYPE_DMAMAP_
 #define _TYPE_DMAMAP_
 include "dmapattr.td"

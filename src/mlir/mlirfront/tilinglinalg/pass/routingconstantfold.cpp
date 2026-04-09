@@ -1,3 +1,7 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: MIT
+ ******************************************************************************/
 #include "routingconstantfold.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/IR/PatternMatch.h"
@@ -273,8 +277,14 @@ struct RemoveDeadCallOp : public mlir::OpRewritePattern<mlir::emitc::CallOp> {
   mlir::LogicalResult matchAndRewrite(mlir::emitc::CallOp callOp,
                                       mlir::PatternRewriter &rewriter) const override {
     if (callOp.use_empty()) {
-      rewriter.eraseOp(callOp);
-      return success();
+        // Only remove calls that are known to be pure (no side effects).
+        // XAie_* API calls configure hardware registers and must not be
+        // removed even when their return value is unused.
+        auto callee = callOp.getCallee();
+        if (callee == "XAie_TileLoc" || callee == "getOrCreateDeviceInstance") {
+            rewriter.eraseOp(callOp);
+            return success();
+        }
     }
     return failure();
   }

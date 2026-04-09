@@ -12,6 +12,48 @@
 // ── global DataIO id init ──
 std::atomic<int> DataIO::next_{0};
 
+// ──────────────────────────────────────────────────────────────
+// CoreMemAllocator impl
+// ──────────────────────────────────────────────────────────────
+CoreMemAllocator::CoreMemAllocator(uint32_t baseAddr, uint32_t totalSize)
+    : baseAddr_(baseAddr), totalSize_(totalSize), nextFree_(baseAddr) {}
+
+std::optional<uint32_t> CoreMemAllocator::allocate(const std::string &name, uint32_t size, uint32_t alignment,
+                                                   int ownerId) {
+    // If a buffer with the same name was already allocated, return the existing address.
+    // All tiles share the same kernel ELF, so DMA BDs for different flows that reference
+    // the same kernel buffer (e.g., buf_out_ping_0) must use the same address.
+    for (const auto &slot : allocations_) {
+        if (slot.symbolName == name)
+            return slot.address;
+    }
+    // Align nextFree_ up to the requested alignment
+    uint32_t aligned = (nextFree_ + alignment - 1) & ~(alignment - 1);
+    if (aligned + size > baseAddr_ + totalSize_) {
+        std::cerr << "CoreMemAllocator: out of memory for \"" << name << "\" (need " << size << " bytes, "
+                  << (baseAddr_ + totalSize_ - aligned) << " available)" << std::endl;
+        return std::nullopt;
+    }
+    allocations_.push_back({name, aligned, size, ownerId});
+    nextFree_ = aligned + size;
+    return aligned;
+}
+
+const std::vector<CoreMemSlot> &CoreMemAllocator::getAllocations() const { return allocations_; }
+
+uint32_t CoreMemAllocator::getAddress(const std::string &name) const {
+    for (const auto &slot : allocations_) {
+        if (slot.symbolName == name)
+            return slot.address;
+    }
+    return 0;
+}
+
+void CoreMemAllocator::reset() {
+    nextFree_ = baseAddr_;
+    allocations_.clear();
+}
+
 DataIO::DataIO(IOType tp, int r, int c, DMADIRECTION dir, int channel, std::string nm, std::string cmt)
     : id_(++next_), rowpos_(r), colpos_(c), type_(tp), dmaDirection_(dir), channel_(channel), name_(std::move(nm)), comment_(std::move(cmt)) {}
 // ──────────────────────────────────────────────────────────────
@@ -142,7 +184,7 @@ std::optional<int> RoutingTile::occupyport(IOType io, PortDirection dir, int ioI
     // the slave port is used and connect to neighbor tile master, when input the
     //master port is the interface
     auto& vec = (io==IOType::Input)? banks_[dir].master : banks_[dir].slave;
-    for (int i = 0; i < vec.size(); i++) {
+    for (int i = 0; i < (int)vec.size(); i++) {
         auto portidx = allocate(io, i, dir, ioId);
         if (portidx) {
             return portidx;
@@ -248,16 +290,17 @@ bool ResourceMgr::linkAvailable(Point a, Point b, int& portIdx) const {
     const auto& va = tile(a.r,a.c).bank(dir).slave;
     const auto& vb = tile(b.r,b.c).bank(odir).master;
     int lim = std::min<int>(va.size(), vb.size());
-    for(int ch=0; ch<lim; ++ch)
+    std::cout << "[linkAvailable] (" << a.r << "," << a.c << ")->(" << b.r << "," << b.c << ") dir=" << (int)dir
+              << " va.size=" << va.size() << " vb.size=" << vb.size() << " lim=" << lim << std::endl;
+    for (int ch = 0; ch < lim; ++ch) {
+        std::cout << "  ch=" << ch << " va[ch].used=" << va[ch].used << " vb[ch].used=" << vb[ch].used << std::endl;
         if(!va[ch].used && !vb[ch].used){ portIdx=ch; return true; }
+    }
     return false;
 }
 
 bool ResourceMgr::portDirAvailable(Point a, int& portIdx, PortDirection direction, bool master) const {
-    const auto& va = tile(a.r,a.c).bank(direction).slave;
-    if (master) {
-        tile(a.r,a.c).bank(direction).master;
-    }
+    const auto &va = master ? tile(a.r, a.c).bank(direction).master : tile(a.r, a.c).bank(direction).slave;
     int lim = va.size();
     for(int ch=0; ch<lim; ++ch)
         if(!va[ch].used ){ portIdx=ch; return true; }
@@ -277,7 +320,8 @@ bool ResourceMgr::occupyLink(Point a, Point b,const int ioId,int& portidx, PortD
 }
 
 bool ResourceMgr::occupyPointDirection(Point a,int& portidx, PortDirection& pd, bool slave) {
-    if (!portDirAvailable(a, portidx, pd, slave)) return false;
+    if (!portDirAvailable(a, portidx, pd, !slave))
+        return false;
     if(tile(a.r,a.c).allocate(IOType::Output, portidx, pd , 0)) {
         return true;
     }
@@ -713,4 +757,37 @@ int ResourceMgr::freeTileLockCount(int row, int col) const {
     if (row < 0 || row >= rows() || col < 0 || col >= cols())
         return 0;
     return tile(row, col).freeLockCount();
+}
+
+// ──────────────────────────────────────────────────────────────
+// Global pkt_id pool management
+// ──────────────────────────────────────────────────────────────
+std::optional<int> ResourceMgr::allocatePktId(int ownerId) {
+    for (int i = 1; i < kMaxPktId; ++i) { // Start at 1; pkt_id=0 reserved
+        if (!pktIdPool_[i].used) {
+            pktIdPool_[i].used = true;
+            pktIdPool_[i].ownerId = ownerId;
+            return i;
+        }
+    }
+    return std::nullopt; // all 31 slots (1-31) exhausted
+}
+
+bool ResourceMgr::releasePktId(int pktId, int ownerId) {
+    if (pktId < 0 || pktId >= kMaxPktId)
+        return false;
+    auto &slot = pktIdPool_[pktId];
+    if (!slot.used)
+        return false;
+    if (ownerId >= 0 && slot.ownerId != ownerId)
+        return false;
+    slot.used = false;
+    slot.ownerId = -1;
+    return true;
+}
+
+bool ResourceMgr::isPktIdFree(int pktId) const {
+    if (pktId < 0 || pktId >= kMaxPktId)
+        return false;
+    return !pktIdPool_[pktId].used;
 }

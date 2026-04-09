@@ -46,12 +46,17 @@ struct StreamPKTConnection {
 };
 
 struct StreamCCTConnection {
-    PortDirection SlaveReceiveForwardDirection;
-    int SlaveReceiveForwardDirectionPortIdx;
-    PortDirection localDMAForwardDirection;
-    int localDMAForwardPortIdx;
-    PortDirection MasterSendToNextTileDirection;
-    int MasterSendToNextTileDirectionPortIdx;
+    PortDirection SlaveReceiveForwardDirection = PortDirection::NONE;
+    int SlaveReceiveForwardDirectionPortIdx = 0;
+    PortDirection localDMAForwardDirection = PortDirection::NONE;
+    int localDMAForwardPortIdx = 0;
+    PortDirection MasterSendToNextTileDirection = PortDirection::NONE;
+    int MasterSendToNextTileDirectionPortIdx = 0;
+    // Secondary master for fan-out: when a tile forwards to two different
+    // directions (e.g., WEST to continue a chain AND NORTH to reach a tile
+    // above), the second direction is stored here.
+    PortDirection MasterSendToNextTileDirection2 = PortDirection::NONE;
+    int MasterSendToNextTileDirectionPortIdx2 = 0;
 };
 
 struct TileListRoutingMap{
@@ -76,6 +81,11 @@ struct BdSlot {
 };
 
 struct LockSlot {
+    bool used = false;
+    int ownerId = -1;
+};
+
+struct PktIdSlot {
     bool used = false;
     int ownerId = -1;
 };
@@ -428,6 +438,53 @@ private:
     std::optional<ShimIOPort> shimport_;
 };
 
+// ──────────────────────────────────────────────────────────────
+// Core Data Memory Allocator
+// ──────────────────────────────────────────────────────────────
+// AIE-ML/AIE2PS core tile data memory layout:
+//   0x00000 - 0x6FFFF: Reserved (448KB, shared with neighboring tiles)
+//   0x70000 - 0x77FFF: Stack (32KB default)
+//   0x78000 - 0x7FFFF: Data memory (32KB usable for buffers)
+//
+// The allocator manages the 0x78000+ region, allocating buffers with alignment.
+// Shared for all tiles using the same kernel binary (one BCF/PRX for all tiles).
+
+struct CoreMemSlot {
+    std::string symbolName; // e.g., "buf_out_ping_0"
+    uint32_t address;       // absolute DM address, e.g., 0x78000
+    uint32_t size;          // bytes
+    int ownerId;            // DataIO or tile owner
+};
+
+class CoreMemAllocator {
+  public:
+    CoreMemAllocator(uint32_t baseAddr = 0x78000, uint32_t totalSize = 0x8000);
+
+    // Allocate a buffer at next available aligned address
+    std::optional<uint32_t> allocate(const std::string &name, uint32_t size, uint32_t alignment = 32, int ownerId = -1);
+
+    // Get all allocated slots (for BCF generation)
+    const std::vector<CoreMemSlot> &getAllocations() const;
+
+    // Get the address for a symbol name (returns 0 if not found)
+    uint32_t getAddress(const std::string &name) const;
+
+    // Reset allocator
+    void reset();
+
+    // Get base address of the data memory region
+    uint32_t getBaseAddr() const { return baseAddr_; }
+
+    // Get remaining free space
+    uint32_t getFreeSpace() const { return (baseAddr_ + totalSize_) - nextFree_; }
+
+  private:
+    uint32_t baseAddr_;  // 0x78000
+    uint32_t totalSize_; // 0x8000
+    uint32_t nextFree_;  // next available address
+    std::vector<CoreMemSlot> allocations_;
+};
+
 class ResourceMgr {
 public:
   ResourceMgr(std::unique_ptr<IHwResource> resource, ::TileType defaultType = ::TileType::Core);
@@ -474,6 +531,9 @@ public:
   std::vector<Point> getReservedTilesForDataIo(int ioId) const;
   IHwResource *getrsc() { return resource_.get(); };
 
+  // Core memory allocator (shared for all tiles using same kernel binary)
+  CoreMemAllocator &coreMemAllocator() { return coreMemAllocator_; }
+
   // Register shim column, channel, and direction to ioId mapping
   void registerShimChannelMapping(int shimCol, int channel, DMADIRECTION direction, int ioId);
 
@@ -494,26 +554,34 @@ public:
   bool releaseTileLock(int row, int col, int lockId, int ownerId = -1);
   int freeTileLockCount(int row, int col) const;
 
+  // Global pkt_id pool management (5-bit AIE field, valid 0-31)
+  std::optional<int> allocatePktId(int ownerId = -1);
+  bool releasePktId(int pktId, int ownerId = -1);
+  bool isPktIdFree(int pktId) const;
+
 private:
-    void InitSHIMNocList();
+  static constexpr int kMaxPktId = 32; // 5-bit AIE pkt_id field
+  std::array<PktIdSlot, kMaxPktId> pktIdPool_{};
+  void InitSHIMNocList();
 
-    void addShimTile(std::shared_ptr<ShimTile> shim);
+  void addShimTile(std::shared_ptr<ShimTile> shim);
 
-    uint32_t lastdioid;
-    std::vector<std::vector<RoutingTile>> tiles_;
-    std::unordered_map<TileCoord, std::shared_ptr<ShimTile>, TileCoordHasher> shimTiles_;
-     
-    std::unique_ptr<IHwResource> resource_;
-    std::unordered_map<int, std::shared_ptr<DataIO>> DataIOMap;
-    
-    // Hash function for (shimCol, channel, direction) tuple
-    struct ShimChannelDirHash {
-        std::size_t operator()(const std::tuple<int, int, DMADIRECTION>& t) const {
-            auto h1 = std::hash<int>()(std::get<0>(t));
-            auto h2 = std::hash<int>()(std::get<1>(t));
-            auto h3 = std::hash<int>()(static_cast<int>(std::get<2>(t)));
-            return h1 ^ (h2 << 1) ^ (h3 << 2);
-        }
+  uint32_t lastdioid;
+  std::vector<std::vector<RoutingTile>> tiles_;
+  std::unordered_map<TileCoord, std::shared_ptr<ShimTile>, TileCoordHasher> shimTiles_;
+
+  std::unique_ptr<IHwResource> resource_;
+  std::unordered_map<int, std::shared_ptr<DataIO>> DataIOMap;
+  CoreMemAllocator coreMemAllocator_; // Shared core memory allocator for BCF generation
+
+  // Hash function for (shimCol, channel, direction) tuple
+  struct ShimChannelDirHash {
+      std::size_t operator()(const std::tuple<int, int, DMADIRECTION> &t) const {
+          auto h1 = std::hash<int>()(std::get<0>(t));
+          auto h2 = std::hash<int>()(std::get<1>(t));
+          auto h3 = std::hash<int>()(static_cast<int>(std::get<2>(t)));
+          return h1 ^ (h2 << 1) ^ (h3 << 2);
+      }
     };
     
     // Mapping from (shimCol, channel, direction) to ioId

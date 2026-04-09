@@ -6,6 +6,7 @@
 #include "passblueprinttoschedulekernel.h"
 #include "dfscheblueprintmanager.h"
 #include "dfschedulemanager.h"
+#include "hw/ResourceManager.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -34,9 +35,15 @@ namespace {
 // ============================================================================
 class KernelResourceManager {
   public:
-    KernelResourceManager()
-        : nextBdId(0), nextLockId(0), nextInputAcqLock(48), nextInputRelLock(49), nextOutputAcqLock(51),
-          nextOutputRelLock(50) {}
+    // Lock base offset for kernel-side lock intrinsics.
+    // On AIE2/AIE2PS, core tile local locks start at hardware ID 48.
+    // The host side uses XAie_LockSetValue with lock IDs 0,1,2,... which the
+    // driver maps to the tile's memory module locks.  From the kernel's
+    // perspective (acquire_greater_equal / release intrinsics), these same
+    // locks are accessed at ID 48+N where N is the host-side lock ID.
+    static constexpr int32_t LOCK_BASE = 48;
+
+    KernelResourceManager() : nextBdId(0), nextLockId(0), nextLockOffset(0) {}
 
     // Allocate next BD ID (0, 1 for ping-pong)
     int32_t allocateBdId() { return nextBdId++; }
@@ -44,31 +51,31 @@ class KernelResourceManager {
     // Allocate next Lock ID
     int64_t allocateLockId() { return nextLockId++; }
 
-    // Allocate lock IDs for input windows (acquire for read, release after read)
-    int32_t allocateInputAcquireLock() { return nextInputAcqLock++; }
-    int32_t allocateInputReleaseLock() { return nextInputRelLock++; }
+    // Allocate a lock pair for a window (input or output).
+    // Returns sequential lock IDs: lock 0, lock 1, lock 2, ...
+    // acquireLockId gets the first lock, releaseLockId gets the second.
+    void allocateLockPair(int32_t &acquireLockId, int32_t &releaseLockId) {
+        acquireLockId = LOCK_BASE + nextLockOffset++;
+        releaseLockId = LOCK_BASE + nextLockOffset++;
+    }
 
-    // Allocate lock IDs for output windows (acquire for write, release after write)
-    int32_t allocateOutputAcquireLock() { return nextOutputAcqLock++; }
-    int32_t allocateOutputReleaseLock() { return nextOutputRelLock++; }
+    // Convenience wrappers for input/output (both use same sequential allocation)
+    int32_t allocateInputAcquireLock() { return LOCK_BASE + nextLockOffset++; }
+    int32_t allocateInputReleaseLock() { return LOCK_BASE + nextLockOffset++; }
+    int32_t allocateOutputAcquireLock() { return LOCK_BASE + nextLockOffset++; }
+    int32_t allocateOutputReleaseLock() { return LOCK_BASE + nextLockOffset++; }
 
     // Reset for new kernel
     void reset() {
         nextBdId = 0;
         nextLockId = 0;
-        nextInputAcqLock = 48;
-        nextInputRelLock = 49;
-        nextOutputAcqLock = 51;
-        nextOutputRelLock = 50;
+        nextLockOffset = 0;
     }
 
   private:
     int32_t nextBdId;
     int64_t nextLockId;
-    int32_t nextInputAcqLock;
-    int32_t nextInputRelLock;
-    int32_t nextOutputAcqLock;
-    int32_t nextOutputRelLock;
+    int32_t nextLockOffset; // Sequential offset from LOCK_BASE (48)
 };
 
 // Generic template function to look up any operation by symbol reference
@@ -211,6 +218,8 @@ struct KernelParamInfo {
     Type elementType;           // Element type of the buffer
     int64_t bufferSize;         // Size of the buffer
     int32_t vectorWidth;        // Vector width (e.g., 4 for v4int32)
+    uint32_t pingAddress = 0;   // BCF symbol address for ping buffer (from CoreMemAllocator)
+    uint32_t pongAddress = 0;   // BCF symbol address for pong buffer (from CoreMemAllocator)
 };
 
 // Structure to hold kernel generation parameters
@@ -300,7 +309,7 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
 
             auto acqLockOp = rewriter.create<dfschedule::LockDefOp>(
                 loc, rewriter.getStringAttr(acqLockName), rewriter.getI32IntegerAttr(paramInfo.acquireLockId));
-            acqLockOp->setAttr("init_value", rewriter.getI32IntegerAttr(2));
+            acqLockOp->setAttr("init_value", rewriter.getI32IntegerAttr(paramInfo.isInput ? 2 : 0));
 
             rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr(relLockName),
                                                    rewriter.getI32IntegerAttr(paramInfo.releaseLockId));
@@ -311,10 +320,18 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
             auto localMemRefType =
                 MemRefType::get({paramInfo.bufferSize}, vectorType, AffineMap(), rewriter.getStringAttr("LOCAL"));
 
-            rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr(paramInfo.bufferPingName),
-                                                     TypeAttr::get(localMemRefType));
-            rewriter.create<dfschedule::BufferDefOp>(loc, rewriter.getStringAttr(paramInfo.bufferPongName),
-                                                     TypeAttr::get(localMemRefType));
+            auto pingBufDef = rewriter.create<dfschedule::BufferDefOp>(
+                loc, rewriter.getStringAttr(paramInfo.bufferPingName), TypeAttr::get(localMemRefType));
+            auto pongBufDef = rewriter.create<dfschedule::BufferDefOp>(
+                loc, rewriter.getStringAttr(paramInfo.bufferPongName), TypeAttr::get(localMemRefType));
+
+            // Annotate buffer addresses from CoreMemAllocator (for BCF generation)
+            if (paramInfo.pingAddress != 0) {
+                pingBufDef->setAttr("address", rewriter.getI64IntegerAttr(paramInfo.pingAddress));
+            }
+            if (paramInfo.pongAddress != 0) {
+                pongBufDef->setAttr("address", rewriter.getI64IntegerAttr(paramInfo.pongAddress));
+            }
 
             // Window definition
             NamedAttrList winAttrs;
@@ -351,7 +368,7 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
 
         auto outPingAcqLock = rewriter.create<dfschedule::LockDefOp>(
             loc, rewriter.getStringAttr("LOCK_out_ping_ACQ"), rewriter.getI32IntegerAttr(params.outputAcquireLockId));
-        outPingAcqLock->setAttr("init_value", rewriter.getI32IntegerAttr(2));
+        outPingAcqLock->setAttr("init_value", rewriter.getI32IntegerAttr(0));
 
         rewriter.create<dfschedule::LockDefOp>(loc, rewriter.getStringAttr("LOCK_out_pong_REL"),
                                                rewriter.getI32IntegerAttr(params.outputReleaseLockId));
@@ -481,7 +498,7 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
 static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolRefAttr target);
 static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
                                                         Type defaultElementType, int64_t defaultBufferSize,
-                                                        int32_t defaultVectorWidth);
+                                                        int32_t defaultVectorWidth, double bufferRatio);
 
 // Generate dfschedule.dskernel_receiver function (legacy style)
 // This is kept for backward compatibility and will call generateKernelModule internally
@@ -495,29 +512,39 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
 static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Location loc, Operation *insertBeforeOp,
                                      StringRef kernelName, RankedTensorType tensorType, int64_t bufferLen,
                                      uint32_t basePacketId, int64_t coreChannel, uint32_t flowIndex,
-                                     KernelResourceManager &resourceMgr) {
+                                     KernelResourceManager &resourceMgr, double bufferRatio) {
 
     // Build kernel generation parameters
     KernelGenParams params;
     params.kernelName = kernelName;              // Wrapper function name (e.g., "dskernel_receiver")
-    params.computeKernelName = "compute_kernel"; // Actual compute kernel name
-    params.kernelFile = "compute_kernel.cc";     // Kernel source file
-    params.bufferSize = 256;                     // Default buffer size (BUF_SZ)
+    params.computeKernelName = "computekernel";  // Actual compute kernel name
+    params.kernelFile = "computekernel.cc";      // Kernel source file
+    params.bufferSize = 256;                     // Will be overridden by analyzeKernelParams
     params.elementType = rewriter.getI32Type();
     params.vectorWidth = 4;
     params.iterationStyle = "internal"; // Legacy style: loop inside kernel
 
     // Lock IDs (fallback - used when kernelParams is empty)
-    params.inputAcquireLockId = 48;  // LOCK_win_ping_ACQ
-    params.inputReleaseLockId = 49;  // LOCK_win_pong_REL
-    params.outputAcquireLockId = 51; // LOCK_out_ping_ACQ
-    params.outputReleaseLockId = 50; // LOCK_out_pong_REL
+    // Sequential allocation from lock base 48: input pair (48,49), output pair (50,51)
+    params.inputAcquireLockId = 48;  // LOCK_win_ping_ACQ  (lock 0)
+    params.inputReleaseLockId = 49;  // LOCK_win_pong_REL  (lock 1)
+    params.outputAcquireLockId = 50; // LOCK_out_ping_ACQ  (lock 2)
+    params.outputReleaseLockId = 51; // LOCK_out_pong_REL  (lock 3)
 
     // Dynamically analyze flow_transfer operations to determine kernel parameters
     // Walk from the module root to collect all shim<->core data flows
     Operation *rootOp = getModuleOp(insertBeforeOp);
-    params.kernelParams =
-        analyzeKernelParams(rootOp, resourceMgr, params.elementType, params.bufferSize, params.vectorWidth);
+    params.kernelParams = analyzeKernelParams(rootOp, resourceMgr, params.elementType, params.bufferSize,
+                                              params.vectorWidth, bufferRatio);
+
+    // Update params.bufferSize to match the dynamic param buffer size
+    // (used for kernel_config_def's BUF_SZ global define)
+    if (!params.kernelParams.empty()) {
+        params.bufferSize = params.kernelParams[0].bufferSize;
+        // Update element type from the actual tensor (e.g., i8 instead of default i32)
+        if (params.kernelParams[0].elementType)
+            params.elementType = params.kernelParams[0].elementType;
+    }
 
     // Generate the kernel module IR
     generateKernelModule(rewriter, loc, insertBeforeOp, params, tensorType);
@@ -615,11 +642,16 @@ findFlowTransferFor(dfscheblueprint::FlowConfigOp flowConfig, Operation *rootOp,
 // - No flow_transfer or core -> core: Skip (not a kernel parameter)
 static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
                                                         Type defaultElementType, int64_t defaultBufferSize,
-                                                        int32_t defaultVectorWidth) {
+                                                        int32_t defaultVectorWidth, double bufferRatio) {
 
     SmallVector<KernelParamInfo> params;
     int inputCount = 0;
     int outputCount = 0;
+
+    // Track which declare_data results we've already created a window for.
+    // With row partitioning, the same declare_data feeds multiple flow_transfers
+    // (one per row partition) — we keep only the first.
+    llvm::DenseSet<Value> processedDeclareData;
 
     // Walk all declare_data operations in the module
     rootOp->walk([&](dfscheblueprint::DeclareDataOp declareDataOp) {
@@ -671,6 +703,14 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
         // Note: core -> core is skipped (inter-tile transfer)
 
         if (isValidParam) {
+            // Deduplicate row partitions: within one declare_data's routing
+            // region there may be multiple flow_transfers (one per row partition).
+            // We only need one window per declare_data result.
+            if (processedDeclareData.contains(dataValue)) {
+                return; // Already created a window for this declare_data
+            }
+            processedDeclareData.insert(dataValue);
+
             KernelParamInfo paramInfo;
 
             if (isInput) {
@@ -693,28 +733,65 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 outputCount++;
             }
 
-            // Get element type from the declare_data operand
-            Value srcValue = declareDataOp.getOperand();
-            if (srcValue) {
-                Type srcType = srcValue.getType();
-                if (auto tensorType = dyn_cast<RankedTensorType>(srcType)) {
-                    paramInfo.elementType = tensorType.getElementType();
-                    // Calculate buffer size from tensor shape
-                    int64_t totalSize = 1;
-                    for (int64_t dim : tensorType.getShape()) {
-                        totalSize *= dim;
+            // Get element type and partition size from the core FlowConfig's view
+            // (not the full tensor from declare_data, which is the root tensor)
+            auto coreFlowConfig = isInput ? toFlowConfig : fromFlowConfig;
+            Value viewValue = coreFlowConfig.getView();
+            Type viewType = viewValue ? viewValue.getType() : Type();
+            if (auto tensorType = dyn_cast_or_null<RankedTensorType>(viewType)) {
+                paramInfo.elementType = tensorType.getElementType();
+                // Calculate partition size from the flow's view tensor shape
+                int64_t partitionSize = 1;
+                for (int64_t dim : tensorType.getShape()) {
+                    partitionSize *= dim;
+                }
+                // Get number of core tiles from the core TileGroup
+                int64_t numCoreTiles = 1;
+                if (auto coreTG = lookupTileGroup(coreFlowConfig.getOperation(), coreFlowConfig.getTarget())) {
+                    numCoreTiles = coreTG.getTiles().size();
+                    if (numCoreTiles <= 0)
+                        numCoreTiles = 1;
+                }
+                // Per-core data depends on transfer type:
+                // many_to_one (gather/output): each core produces partitionSize / numCoreTiles.
+                // one_to_many (broadcast/input): each core receives the full partition.
+                StringRef transferType = flowTransfer.getType();
+                int64_t perCoreSize = partitionSize;
+                if (transferType == "many_to_one")
+                    perCoreSize = partitionSize / numCoreTiles;
+                int64_t pingPongBufSize = static_cast<int64_t>(perCoreSize * bufferRatio);
+                if (pingPongBufSize <= 0)
+                    pingPongBufSize = 1;
+                // bufferSize is in units of vectors (BUF_SZ = elements / vectorWidth)
+                paramInfo.bufferSize = pingPongBufSize / defaultVectorWidth;
+                if (paramInfo.bufferSize <= 0)
+                    paramInfo.bufferSize = 1;
+            } else {
+                // Fallback: try declare_data operand
+                Value srcValue = declareDataOp.getOperand();
+                if (srcValue) {
+                    if (auto fallbackType = dyn_cast<RankedTensorType>(srcValue.getType())) {
+                        paramInfo.elementType = fallbackType.getElementType();
+                    } else {
+                        paramInfo.elementType = defaultElementType;
                     }
-                    paramInfo.bufferSize = totalSize;
                 } else {
                     paramInfo.elementType = defaultElementType;
-                    paramInfo.bufferSize = defaultBufferSize;
                 }
-            } else {
-                paramInfo.elementType = defaultElementType;
-                paramInfo.bufferSize = defaultBufferSize;
+                paramInfo.bufferSize = static_cast<int64_t>(defaultBufferSize * bufferRatio);
             }
 
             paramInfo.vectorWidth = defaultVectorWidth;
+
+            // Read buffer addresses from CoreMemAllocator (allocated by host pass)
+            try {
+                auto &allocator = ResourceMgr::instance()->coreMemAllocator();
+                paramInfo.pingAddress = allocator.getAddress(paramInfo.bufferPingName);
+                paramInfo.pongAddress = allocator.getAddress(paramInfo.bufferPongName);
+            } catch (...) {
+                // ResourceMgr singleton not initialized; addresses remain 0
+            }
+
             params.push_back(paramInfo);
         }
     });
@@ -723,10 +800,13 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
 }
 
 // Pattern to convert dfscheblueprint::FlowTransferOp to dfschedule operations.
-// Kernel-only: generates only dfschedule.module (kernel driver) via generateDSKernelReceiver.
-// No host IR (DeclareTensor, DeclareTile, ConfigDmaBd, ConfigCreateIo, LoadKernelGroup, etc.).
+// Kernel path: generates dfschedule.module (kernel driver) via generateDSKernelReceiver,
+// plus core tile DMA IO configuration (ConfigDmaBd, ConfigCreateIo, GetBdId, StartIo).
 struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::FlowTransferOp> {
-    using OpConversionPattern<dfscheblueprint::FlowTransferOp>::OpConversionPattern;
+    double bufferRatio;
+
+    FlowTransferConversion(MLIRContext *ctx, double ratio)
+        : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), bufferRatio(ratio) {}
 
     mutable KernelResourceManager resourceMgr;
 
@@ -803,7 +883,61 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         StringRef kernelName = "dskernel_receiver";
         if (!hasDSKernelReceiver(op.getOperation(), kernelName)) {
             generateDSKernelReceiver(rewriter, loc, op.getOperation(), kernelName, kernelTensorType, bufferLen,
-                                     basePacketId, coreChannel, flowIndex, resourceMgr);
+                                     basePacketId, coreChannel, flowIndex, resourceMgr, bufferRatio);
+        }
+
+        // --- Core tile DMA IO configuration (create_io + start_io) ---
+        {
+            ArrayAttr coreTilesAttr = coreTileGroup.getTiles();
+            auto coreDmaDir = coreDmaAttr.getDirection();
+            StringRef coreDmaDirection = (coreDmaDir == dfscheblueprint::bp_direction::MM2S) ? "MM2S" : "S2MM";
+            StringRef coreIoOperation = (coreDmaDir == dfscheblueprint::bp_direction::MM2S) ? "SEND" : "RECV";
+
+            int64_t numCoreTiles = coreTilesAttr.size();
+            int64_t perTileLen = (numCoreTiles > 0) ? bufferLen / numCoreTiles : bufferLen;
+            Type elemType = kernelTensorType.getElementType();
+
+            int tileIdx = 0;
+            for (auto tileAttr : coreTilesAttr) {
+                auto tileArray = dyn_cast<ArrayAttr>(tileAttr);
+                if (!tileArray || tileArray.size() < 2)
+                    continue;
+
+                int64_t col = cast<IntegerAttr>(tileArray[0]).getInt();
+                int64_t row = cast<IntegerAttr>(tileArray[1]).getInt();
+
+                auto coreTileOp = rewriter.create<dfschedule::DeclareTileOp>(
+                    loc, dfschedule::TileType::get(rewriter.getContext()), rewriter.getI32IntegerAttr(col),
+                    rewriter.getI32IntegerAttr(row));
+
+                MemRefType coreBufType = MemRefType::get({perTileLen}, elemType);
+                Value coreBuf = rewriter.create<memref::AllocOp>(loc, coreBufType);
+
+                auto bdIdConst = rewriter.create<arith::ConstantOp>(
+                    loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(resourceMgr.allocateBdId()));
+
+                auto coreBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                    loc, dfschedule::BdHandleType::get(rewriter.getContext()), coreBuf, coreTileOp.getTile(), bdIdConst,
+                    rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(perTileLen), rewriter.getBoolAttr(true),
+                    rewriter.getI32IntegerAttr(basePacketId + tileIdx), rewriter.getI32IntegerAttr(4294967295),
+                    rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0),
+                    rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(-1), Value(),
+                    /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+
+                auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
+                    loc, dfschedule::IoHandleType::get(rewriter.getContext()), coreBdOp.getBdHandle(),
+                    coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
+                    rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation));
+
+                auto getBdIdOp =
+                    rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());
+
+                rewriter.create<dfschedule::StartIoOp>(loc, dfschedule::EventType::get(rewriter.getContext()),
+                                                       createIoOp.getIoHandle(), getBdIdOp.getBdId(),
+                                                       rewriter.getI32IntegerAttr(flowIndex));
+
+                tileIdx++;
+            }
         }
 
         rewriter.eraseOp(op);
@@ -856,7 +990,7 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
     RewritePatternSet patterns(context);
     // FlowTransferConversion converts flow_transfer to dfschedule operations
     // It reads from FlowConfigOps to get DMA configuration
-    patterns.add<FlowTransferConversion>(context);
+    patterns.add<FlowTransferConversion>(context, bufferRatio_);
     // DataSliceOp replaces with input tensor
     patterns.add<DataSliceOpConversion>(context);
     // Use unified erase pattern for ops that just need to be removed
@@ -872,15 +1006,18 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
     }
 
     // Kernel-only: remove all top-level ops that are not dfschedule kernel logic.
-    // Keep only DSKernelReceiverOp (@kernel_driver_dskernel_receiver) and KernelModuleOp (dfschedule.module).
-    // This removes func @main and any declare_data / partitiontensor / RoutingCreate host IR.
+    // Keep DSKernelReceiverOp, KernelModuleOp, and DMA IO config ops
+    // (DeclareTile, ConfigDmaBd, ConfigCreateIo, GetBdId, StartIo + their operand producers).
     Operation *root = getOperation();
     while (root->getParentOp())
         root = root->getParentOp();
     Block &body = root->getRegion(0).front();
     SmallVector<Operation *> toErase;
     for (Operation &op : body)
-        if (!isa<dfschedule::DSKernelReceiverOp>(&op) && !isa<dfschedule::KernelModuleOp>(&op))
+        if (!isa<dfschedule::DSKernelReceiverOp>(&op) && !isa<dfschedule::KernelModuleOp>(&op) &&
+            !isa<dfschedule::DeclareTileOp>(&op) && !isa<dfschedule::ConfigDmaBdOp>(&op) &&
+            !isa<dfschedule::ConfigCreateIoOp>(&op) && !isa<dfschedule::GetBdIdOp>(&op) &&
+            !isa<dfschedule::StartIoOp>(&op) && !isa<arith::ConstantOp>(&op) && !isa<memref::AllocOp>(&op))
             toErase.push_back(&op);
     for (auto it = toErase.rbegin(); it != toErase.rend(); ++it)
         (*it)->erase();

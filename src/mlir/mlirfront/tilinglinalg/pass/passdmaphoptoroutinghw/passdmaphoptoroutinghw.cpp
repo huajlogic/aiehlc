@@ -4,24 +4,25 @@
 ******************************************************************************/
 
 #include "passdmaphoptoroutinghw.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "routing/routingpath.h"
 #include "routinghwmanager.h"
 #include "routingmanager.h"
-#include "routing/routingpath.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include <iostream>
+#include <set>
 #include <sstream>
-#include <vector>
 #include <unordered_map>
 #include <unordered_set>
-#include <iostream>
+#include <vector>
 
 using namespace mlir;
 using namespace dmaphop;
@@ -123,29 +124,52 @@ std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
     std::unordered_map<Point, std::vector<int>, Point::Hash> tileMasterPortMapping;
     std::unordered_map<Point, Operation*, Point::Hash> pathtiles;
     std::unordered_map<Point, StreamPKTConnection, Point::Hash> pktswitchmap;
-    
-    //parse and set dma and slave master
-    //create empty structure for each dstPoint
-    int pkt_idx = 0;
+
+    // parse and set dma and slave master
+    // create empty structure for each dstPoint
     for (const auto& dstPoint : tilist) {
         pktswitchmap[dstPoint] = StreamPKTConnection{};
     }
-    //set the local DMA pkt connection
-    for (const auto& dstPoint : tilist) {
-        pkt_idx++;
-        int dmaportNum;
-        PortDirection dmadirection = PortDirection::DMA;
-        //get DMA port index
-        if (!router_.occupyPointDirection(dstPoint,dmaportNum, dmadirection, true)) {
-            llvm::outs() << "DMA occupy failed " << "\n";
-            assert(0);
-            return std::nullopt;
+
+    // Build indexed list of producer port symbol names from path op.
+    // Each corePortOut{i} carries its own dmapktid (set by DmapToDmaphopPass).
+    SmallVector<StringRef, 4> producerSymNames;
+    if (auto pathOp = dyn_cast<dmaphop::create_path>(op)) {
+        for (auto attr : pathOp.getProducers()) {
+            if (auto symRef = dyn_cast<FlatSymbolRefAttr>(attr)) {
+                producerSymNames.push_back(symRef.getValue());
+            }
         }
-        //set prev tile master port and dma port
-        struct StreamPKTConnection& curtileconf = pktswitchmap[dstPoint];
+    }
+
+    // set the local DMA pkt connection
+    //  Use direction_channel from the dmaphop port op to determine the DMA port.
+    //  This ensures consistency with host.cc which uses the same channel number.
+    int tileIndex = 0;
+    for (const auto &dstPoint : tilist) {
+        int dmaportNum = 0; // default DMA port 0
+
+        // Read dmapktid and direction_channel from the corresponding corePortOut symbol
+        int pktId = 1; // fallback: 1-based
+        if (tileIndex < (int)producerSymNames.size()) {
+            auto symRef = FlatSymbolRefAttr::get(op->getContext(), producerSymNames[tileIndex]);
+            if (auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symRef)) {
+                if (auto pktIdOpt = portOp.getDmapktid()) {
+                    pktId = static_cast<int>(*pktIdOpt);
+                }
+                // Use direction_channel as the DMA slave port number.
+                // This must match the MM2S channel assigned in host.cc.
+                if (auto chOpt = portOp.getDirectionChannel()) {
+                    dmaportNum = static_cast<int>(*chOpt);
+                }
+            }
+        }
+        // set prev tile master port and dma port
+        struct StreamPKTConnection &curtileconf = pktswitchmap[dstPoint];
         curtileconf.localDMAForwardPortIdx = dmaportNum;
-        curtileconf.localDMAForwardPktID = pkt_idx;//fix me
+        curtileconf.localDMAForwardPktID = pktId;
         curtileconf.localDMAForwardPktType = 0;
+        tileIndex++;
     }
     //set the slave master direction
     auto prevpoint = tilist[0];
@@ -274,15 +298,28 @@ std::optional<TileListRoutingMap> GetSeqPath(
                 if (!router_.occupyLink(currentPoint, nextPoint, dioid, portNum, masterDirOnCurrent, slaveDirOnNext)) {
                     llvm::report_fatal_error("Failed to occupy link in routing topology.");
                 }
-                
-                connectionData[currentPoint].MasterSendToNextTileDirection = masterDirOnCurrent;
-                connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx = portNum;
+
+                // If this tile already has a master direction (from a
+                // previous branch), store this one as the secondary
+                // master to support fan-out at intermediate tiles.
+                std::cout << "[GetSeqPath-dmap] point=(" << currentPoint.r << "," << currentPoint.c
+                          << ") occupyLink->portNum=" << portNum << " masterDir=" << (int)masterDirOnCurrent
+                          << " existingMasterDir=" << (int)connectionData[currentPoint].MasterSendToNextTileDirection
+                          << " (NONE=" << (int)PortDirection::NONE << ")" << std::endl;
+                if (connectionData[currentPoint].MasterSendToNextTileDirection != PortDirection::NONE) {
+                    std::cout << "[GetSeqPath-dmap]   -> storing in SECONDARY" << std::endl;
+                    connectionData[currentPoint].MasterSendToNextTileDirection2 = masterDirOnCurrent;
+                    connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx2 = portNum;
+                } else {
+                    std::cout << "[GetSeqPath-dmap]   -> storing in PRIMARY" << std::endl;
+                    connectionData[currentPoint].MasterSendToNextTileDirection = masterDirOnCurrent;
+                    connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx = portNum;
+                }
                 connectionData[nextPoint].SlaveReceiveForwardDirection = slaveDirOnNext;
                 connectionData[nextPoint].SlaveReceiveForwardDirectionPortIdx = portNum;
                 //set next master into None
                 connectionData[nextPoint].MasterSendToNextTileDirection = PortDirection::NONE;
-                
-            } 
+            }
         }
         tree_round++;
     }
@@ -318,7 +355,7 @@ std::optional<TileListRoutingMap> GetSeqPath(
         if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core 
             && StreamType::BROADCAST == streamtype
             && dsttiles.find(p) != dsttiles.end()) {
-            if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::TileDMA, PortDirection::DMA, -1)) {
+            if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::Input, PortDirection::DMA, -1)) {
                 connectionData[p].localDMAForwardDirection = PortDirection::DMA;
                 connectionData[p].localDMAForwardPortIdx = *portnumptr;
             }
@@ -451,6 +488,13 @@ void ParseTheCCTRoutingPath(Operation* op,
                     inputDirStr, inputPortIdx,
                     PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
             }
+            // Secondary master for fan-out at shim
+            if (conn.MasterSendToNextTileDirection2 != PortDirection::NONE) {
+                rewriter.create<ConnectStreamSingleSwitchPort>(
+                    loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx,
+                    PortDirectiontoString(conn.MasterSendToNextTileDirection2),
+                    conn.MasterSendToNextTileDirectionPortIdx2);
+            }
         } else {
             // Handle regular tiles (core, mem, or intermediate routing tiles)
             auto currentTileOp = dyn_cast<routinghw::TileCreate>(tileOpIt->second);
@@ -458,12 +502,20 @@ void ParseTheCCTRoutingPath(Operation* op,
                 // Not a regular tile, skip
                 continue;
             }
-            
+
             // Create connection to the next tile in the path
             if (conn.MasterSendToNextTileDirection != PortDirection::NONE) {
                 rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
                     inputDirStr, inputPortIdx,
                     PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
+            }
+
+            // Secondary master for fan-out at intermediate tiles
+            if (conn.MasterSendToNextTileDirection2 != PortDirection::NONE) {
+                rewriter.create<ConnectStreamSingleSwitchPort>(
+                    loc, outputType, currentTileOp.getResult(), inputDirStr, inputPortIdx,
+                    PortDirectiontoString(conn.MasterSendToNextTileDirection2),
+                    conn.MasterSendToNextTileDirectionPortIdx2);
             }
 
             // Create connection to the local DMA (if this is a destination core tile)
@@ -490,6 +542,8 @@ struct RoutingContext {
     //Operation* tileArrayHandle = nullptr;
     DenseMap<Value, TileInfo> tileMap;
     DenseMap<Value, Operation*> portToTileOpMap;
+    // Map from port symbol name to tile Point — survives port erasure
+    std::unordered_map<std::string, Point> portSymToTilePoint;
     std::vector<Operation*> orderedTileOps;
     bool isFirstTile = true;
     int pktId = 1;
@@ -575,8 +629,12 @@ struct DmaphopPortConversionPattern : public OpConversionPattern<dmaphop::port> 
         auto it = routingCtx.tileMap.find(tileValue);
         if (it != routingCtx.tileMap.end()) {
             routingCtx.portToTileOpMap[op.getResult()] = it->second.tileOp;
+            // Also store the port symbol name → tile Point mapping.
+            // This survives port erasure and is used by DmaphopPathConversionPattern
+            // to find producer/consumer tiles from the create_path attributes.
+            routingCtx.portSymToTilePoint[op.getSymName().str()] = Point{it->second.row, it->second.col};
         }
-        
+
         // Ports are implicit in routinghw, so we just erase them
         rewriter.eraseOp(op);
         return success();
@@ -595,42 +653,33 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                                   ConversionPatternRewriter &rewriter) const override {
         auto loc = op.getLoc();
         auto output = rewriter.getI32Type();
-        
         // Get producers attribute to determine which tiles should send to DMA (S2MM)
         // Producers are core tiles that send data FROM core TO shim/memory (Pull direction)
+        // Use SymbolTable lookup instead of walk to find ports that may have been
+        // scheduled for erasure by DmaphopPortConversionPattern.
         llvm::DenseSet<Value> producerPorts;
+        llvm::DenseSet<StringRef> producerSymNames;
         if (auto producersAttr = op->getAttrOfType<ArrayAttr>("producers")) {
             for (auto symRef : producersAttr) {
                 if (auto symRefAttr = dyn_cast<FlatSymbolRefAttr>(symRef)) {
-                    // Find the port with this symbol name in the parent function
-                    auto parentFunc = op->getParentOfType<func::FuncOp>();
-                    if (parentFunc) {
-                        parentFunc.walk([&](dmaphop::port portOp) {
-                            auto symName = portOp.getSymName();
-                            if (!symName.empty() && symName == symRefAttr.getValue()) {
-                                producerPorts.insert(portOp.getResult());
-                            }
-                        });
+                    producerSymNames.insert(symRefAttr.getValue());
+                    if (auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symRefAttr)) {
+                        producerPorts.insert(portOp.getResult());
                     }
                 }
             }
         }
-        
+
         // Get consumers attribute to determine which tiles should receive from DMA (MM2S)
         // Consumers are core tiles that receive data FROM shim/memory TO core (Push direction)
         llvm::DenseSet<Value> consumerPorts;
+        llvm::DenseSet<StringRef> consumerSymNames;
         if (auto consumersAttr = op->getAttrOfType<ArrayAttr>("consumers")) {
             for (auto symRef : consumersAttr) {
                 if (auto symRefAttr = dyn_cast<FlatSymbolRefAttr>(symRef)) {
-                    // Find the port with this symbol name in the parent function
-                    auto parentFunc = op->getParentOfType<func::FuncOp>();
-                    if (parentFunc) {
-                        parentFunc.walk([&](dmaphop::port portOp) {
-                            auto symName = portOp.getSymName();
-                            if (!symName.empty() && symName == symRefAttr.getValue()) {
-                                consumerPorts.insert(portOp.getResult());
-                            }
-                        });
+                    consumerSymNames.insert(symRefAttr.getValue());
+                    if (auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symRefAttr)) {
+                        consumerPorts.insert(portOp.getResult());
                     }
                 }
             }
@@ -652,7 +701,8 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         llvm::DenseSet<Value> seenTiles;
         llvm::DenseMap<Value, bool> tileHasProducer;  // Map tile -> has producer port (sends to DMA)
         llvm::DenseMap<Value, bool> tileHasConsumer;  // Map tile -> has consumer port (receives from DMA)
-        
+        int shimDmaChannel = 0;                       // direction_channel from the shim port op in dmaphop IR
+
         for (auto hopValue : adaptor.getHops()) {
             if (auto hopOp = hopValue.getDefiningOp<dmaphop::create_hop>()) {
                 // Get source and destination ports
@@ -668,7 +718,7 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                     if (!seenTiles.contains(srcTile)) {
                         allTilesInPath.push_back(srcTile);
                         seenTiles.insert(srcTile);
-                        
+
                         // Categorize tile
                         auto tileInfoIt = routingCtx.tileMap.find(srcTile);
                         if (tileInfoIt != routingCtx.tileMap.end()) {
@@ -676,6 +726,9 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                                 shimTileValue = srcTile;
                                 shimPoint = Point{tileInfoIt->second.row, tileInfoIt->second.col};
                                 hasShim = true;
+                                if (auto ch = srcPortOp.getDirectionChannel()) {
+                                    shimDmaChannel = static_cast<int>(*ch);
+                                }
                             } else if (tileInfoIt->second.tileType == "core") {
                                 Point pt{tileInfoIt->second.row, tileInfoIt->second.col};
                                 coreTileList.push_back(pt);
@@ -684,17 +737,18 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                         }
                     }
                     // Mark this tile as having a producer if source port is a producer
-                    if (producerPorts.contains(srcPort)) {
+                    // Check both the Value set (from SymbolTable lookup) and the symbol name set
+                    if (producerPorts.contains(srcPort) || producerSymNames.contains(srcPortOp.getSymName())) {
                         tileHasProducer[srcTile] = true;
                     }
                 }
-                
+
                 if (dstPortOp) {
                     Value dstTile = dstPortOp.getTile();
                     if (!seenTiles.contains(dstTile)) {
                         allTilesInPath.push_back(dstTile);
                         seenTiles.insert(dstTile);
-                        
+
                         // Categorize tile
                         auto tileInfoIt = routingCtx.tileMap.find(dstTile);
                         if (tileInfoIt != routingCtx.tileMap.end()) {
@@ -702,6 +756,9 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                                 shimTileValue = dstTile;
                                 shimPoint = Point{tileInfoIt->second.row, tileInfoIt->second.col};
                                 hasShim = true;
+                                if (auto ch = dstPortOp.getDirectionChannel()) {
+                                    shimDmaChannel = static_cast<int>(*ch);
+                                }
                             } else if (tileInfoIt->second.tileType == "core") {
                                 Point pt{tileInfoIt->second.row, tileInfoIt->second.col};
                                 coreTileList.push_back(pt);
@@ -710,7 +767,8 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                         }
                     }
                     // Mark this tile as having a consumer if destination port is a consumer
-                    if (consumerPorts.contains(dstPort)) {
+                    // Check both the Value set (from SymbolTable lookup) and the symbol name set
+                    if (consumerPorts.contains(dstPort) || consumerSymNames.contains(dstPortOp.getSymName())) {
                         tileHasConsumer[dstTile] = true;
                     }
                 }
@@ -734,10 +792,12 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             // If shim is at the end and we have producers, it's core->shim (S2MM, processing_type=2)
             Value firstTile = allTilesInPath.front();
             Value lastTile = allTilesInPath.back();
-            
-            if (firstTile == shimTileValue && !consumerPorts.empty()) {
+
+            bool hasConsumers = !consumerPorts.empty() || !consumerSymNames.empty();
+            bool hasProducers = !producerPorts.empty() || !producerSymNames.empty();
+            if (firstTile == shimTileValue && hasConsumers) {
                 isShimToCore = true;  // MM2S: shim sends to cores
-            } else if (lastTile == shimTileValue && !producerPorts.empty()) {
+            } else if (lastTile == shimTileValue && hasProducers) {
                 isShimToCore = false;  // S2MM: cores send to shim
             } else if (firstTile == shimTileValue) {
                 isShimToCore = true;  // Default to MM2S if shim is first
@@ -745,23 +805,43 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
                 isShimToCore = false;  // Default to S2MM if shim is last
             }
         }
-        
-        // Build consumer and producer core tile lists
-        for (const auto& pt : coreTileList) {
-            // Find the tile Value for this Point
-            for (const auto& tileKV : routingCtx.tileMap) {
-                if (tileKV.second.row == pt.r && tileKV.second.col == pt.c) {
-                    if (tileHasConsumer.count(tileKV.first) && tileHasConsumer[tileKV.first]) {
-                        consumerCoreTiles.push_back(pt);
-                    }
-                    if (tileHasProducer.count(tileKV.first) && tileHasProducer[tileKV.first]) {
-                        producerCoreTiles.push_back(pt);
-                    }
-                    break;
+
+        // Build producer and consumer core tile lists directly from the
+        // create_path attributes using portSymToTilePoint.
+        // This is reliable because portSymToTilePoint is populated by
+        // DmaphopPortConversionPattern before ports are erased, and it
+        // maps port symbol names to tile coordinates.
+        // The hop-based tileHasProducer/tileHasConsumer approach is unreliable
+        // because hop ops may be erased before this pattern runs.
+        {
+            std::set<Point> producerPointSet;
+            for (const auto &symName : producerSymNames) {
+                auto it = routingCtx.portSymToTilePoint.find(symName.str());
+                if (it != routingCtx.portSymToTilePoint.end()) {
+                    producerPointSet.insert(it->second);
+                }
+            }
+            for (const auto &pt : coreTileList) {
+                if (producerPointSet.count(pt)) {
+                    producerCoreTiles.push_back(pt);
                 }
             }
         }
-        
+        {
+            std::set<Point> consumerPointSet;
+            for (const auto &symName : consumerSymNames) {
+                auto it = routingCtx.portSymToTilePoint.find(symName.str());
+                if (it != routingCtx.portSymToTilePoint.end()) {
+                    consumerPointSet.insert(it->second);
+                }
+            }
+            for (const auto &pt : coreTileList) {
+                if (consumerPointSet.count(pt)) {
+                    consumerCoreTiles.push_back(pt);
+                }
+            }
+        }
+
         // Now call the routing logic similar to RoutingmovedatabyioConvert
         if (coreTileList.empty()) {
             rewriter.eraseOp(op);
@@ -782,14 +862,15 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         
         if (hasShim) {
             // Shim tile was explicitly defined in dmaphop
-            // Try to find existing DataIO for this shim column
-            // For now, we assume channel 0, but this should be determined from dmaphop if available
+            // Try to find existing DataIO for this shim column+channel
             auto rm = router_.getRM();
             shimcol = shimPoint.c;
-            
-            // Try channel 0 first
-            dio = rm->findDataIOByShimChannel(shimcol, 0, dmadir);
-            
+
+            // Look up by the channel encoded in the dmaphop port op (direction_channel attr).
+            // This allows reusing an already-allocated DataIO for the same shim column+channel,
+            // while correctly assigning distinct ports to different rounds (ch=0, ch=1, ...).
+            dio = rm->findDataIOByShimChannel(shimcol, shimDmaChannel, dmadir);
+
             if (!dio) {
                 // No existing DataIO found, create a new one
                 std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, firstTile});
@@ -892,6 +973,28 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     
     // Create routing context
     RoutingContext routingCtx;
+
+    // Pre-populate routingCtx by walking dmaphop.tile and dmaphop.port ops.
+    // This must happen BEFORE applyPartialConversion because the conversion
+    // framework may process ops in any order — port/tile erasure patterns
+    // can fire before the path conversion pattern needs the mappings.
+    module->walk([&](dmaphop::tile tileOp) {
+        TileInfo info;
+        info.tileOp = nullptr; // Will be replaced by routinghw op during conversion
+        info.col = tileOp.getCol();
+        info.row = tileOp.getRow();
+        info.channel = 0;
+        info.tileType = tileOp.getTiletype().str();
+        routingCtx.tileMap[tileOp.getResult()] = info;
+    });
+    module->walk([&](dmaphop::port portOp) {
+        Value tileValue = portOp.getTile();
+        auto it = routingCtx.tileMap.find(tileValue);
+        if (it != routingCtx.tileMap.end()) {
+            routingCtx.portSymToTilePoint[portOp.getSymName().str()] =
+                Point{static_cast<int>(it->second.row), static_cast<int>(it->second.col)};
+        }
+    });
 
     // Define conversion target
     //target.addIllegalDialect<dmaphop::dmaphopdialect>();

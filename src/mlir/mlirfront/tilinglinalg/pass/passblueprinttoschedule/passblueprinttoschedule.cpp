@@ -17,7 +17,9 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "routingmanager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include <iostream>
@@ -182,6 +184,255 @@ static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRef
     return lookupSymbolOp<dfscheblueprint::DataSliceOp>(rootOp, target);
 }
 
+// Shared state between pre-processing, FlowTransferConversion, and post-processing.
+struct BlueprintPassState {
+    Value rootMemref;
+    MemRefType rootMemrefType;
+    SmallVector<int64_t> rootShape;
+    Type elementType;
+    // Map from each arith.constant result to its allocated memref.
+    // When multiple data tensors exist (e.g. input A, input B, output C),
+    // each has its own backing memref.
+    llvm::DenseMap<Value, Value> constantToMemref;
+};
+
+static SmallVector<OpFoldResult> toOpFoldResult(ArrayRef<int64_t> values, OpBuilder &b) {
+    SmallVector<OpFoldResult> result;
+    for (int64_t v : values)
+        result.push_back(b.getI64IntegerAttr(v));
+    return result;
+}
+
+// Pre-processing: lower arith.constant dense tensors to memrefs via
+// bufferization.to_memref, keeping everything inside @main with no module-level
+// memref.global.  Processes ALL DeclareDataOps so each data tensor (input A,
+// input B, output C, etc.) gets its own backing memref.
+static LogicalResult preprocessConstantToMemref(Operation *topLevel, std::shared_ptr<BlueprintPassState> state) {
+    func::FuncOp mainFunc = nullptr;
+    topLevel->walk([&](func::FuncOp f) {
+        if (f.getName() == "main" || f.getName() == "host_canonicalized")
+            mainFunc = f;
+    });
+    if (!mainFunc)
+        return success();
+
+    // Collect ALL DeclareDataOps
+    SmallVector<dfscheblueprint::DeclareDataOp> declareDataOps;
+    mainFunc.walk([&](dfscheblueprint::DeclareDataOp op) { declareDataOps.push_back(op); });
+    if (declareDataOps.empty())
+        return success();
+
+    // Track which constants have already been lowered to avoid duplicates
+    // (multiple DeclareDataOps may reference the same constant)
+    llvm::DenseSet<Operation *> processedConstants;
+    SmallVector<Value> allocatedMemrefs;
+
+    for (auto declareDataOp : declareDataOps) {
+        Value initTensor = declareDataOp.getInitTensor();
+
+        // Case 1: arith.constant (original path — hardcoded data)
+        if (auto constantOp = initTensor.getDefiningOp<arith::ConstantOp>()) {
+            // Skip if this constant was already lowered
+            if (processedConstants.count(constantOp.getOperation()))
+                continue;
+            processedConstants.insert(constantOp.getOperation());
+
+            auto tensorType = dyn_cast<RankedTensorType>(constantOp.getType());
+            if (!tensorType)
+                continue;
+
+            // Use the first constant's shape/type for the legacy rootShape/elementType fields
+            if (!state->elementType) {
+                state->rootShape.assign(tensorType.getShape().begin(), tensorType.getShape().end());
+                state->elementType = tensorType.getElementType();
+            }
+
+            MemRefType memrefType = MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+
+            // Lower the dense constant: get a read-only memref view via bufferization.to_memref,
+            // then alloc a writable buffer and copy into it.
+            OpBuilder builder(constantOp.getOperation());
+            builder.setInsertionPointAfter(constantOp.getOperation());
+            auto loc = constantOp.getLoc();
+            auto toMemref = builder.create<bufferization::ToMemrefOp>(loc, memrefType, constantOp.getResult());
+            auto allocOp = builder.create<memref::AllocOp>(loc, memrefType);
+            builder.create<memref::CopyOp>(loc, toMemref.getResult(), allocOp.getResult());
+
+            // Register this constant's memref in the map
+            state->constantToMemref[constantOp.getResult()] = allocOp.getResult();
+            allocatedMemrefs.push_back(allocOp.getResult());
+
+            // Keep legacy rootMemref/rootMemrefType pointing to the first allocation
+            if (!state->rootMemref) {
+                state->rootMemref = allocOp.getResult();
+                state->rootMemrefType = memrefType;
+            }
+        }
+        // Case 2: bufferization.to_tensor of func arg (external DDR pointer)
+        // The user's pointer IS the DDR buffer — no alloc, no copy needed.
+        else if (auto toTensorOp = initTensor.getDefiningOp<bufferization::ToTensorOp>()) {
+            Value srcMemref = toTensorOp.getMemref();
+
+            auto tensorType = dyn_cast<RankedTensorType>(toTensorOp.getType());
+            if (!tensorType)
+                continue;
+
+            // Skip if already processed
+            if (processedConstants.count(toTensorOp.getOperation()))
+                continue;
+            processedConstants.insert(toTensorOp.getOperation());
+
+            if (!state->elementType) {
+                state->rootShape.assign(tensorType.getShape().begin(), tensorType.getShape().end());
+                state->elementType = tensorType.getElementType();
+            }
+
+            MemRefType memrefType = cast<MemRefType>(srcMemref.getType());
+
+            // Use the func arg memref DIRECTLY — no alloc, no copy needed.
+            state->constantToMemref[initTensor] = srcMemref;
+
+            if (!state->rootMemref) {
+                state->rootMemref = srcMemref;
+                state->rootMemrefType = memrefType;
+            }
+        }
+    }
+
+    // Insert memref.dealloc for ALL allocated memrefs before the return op.
+    if (!allocatedMemrefs.empty()) {
+        Block &mainBlock = mainFunc.getBody().front();
+        for (auto &op : mainBlock) {
+            if (isa<func::ReturnOp>(op)) {
+                OpBuilder builder(&op);
+                for (auto memref : allocatedMemrefs) {
+                    builder.create<memref::DeallocOp>(op.getLoc(), memref);
+                }
+                break;
+            }
+        }
+    }
+
+    return success();
+}
+
+// Post-processing: restructure scf.execute_region / routing ops into per-partition
+// scf.execute_region blocks, erase old routing/tensor ops, and add memref.dealloc.
+static LogicalResult postprocessRestructure(Operation *topLevel, std::shared_ptr<BlueprintPassState> state) {
+    func::FuncOp mainFunc = nullptr;
+    topLevel->walk([&](func::FuncOp f) {
+        if (f.getName() == "main" || f.getName() == "host_canonicalized")
+            mainFunc = f;
+    });
+    if (!mainFunc || !state->rootMemref)
+        return success();
+
+    // Find the old scf.execute_region with routing_memo attribute
+    scf::ExecuteRegionOp oldExecuteRegion = nullptr;
+    mainFunc.walk([&](scf::ExecuteRegionOp op) {
+        if (op->hasAttr("routing_memo"))
+            oldExecuteRegion = op;
+    });
+    if (!oldExecuteRegion)
+        return success();
+
+    SmallVector<routing::RoutingCreate> routingCreateOps;
+    oldExecuteRegion.walk([&](routing::RoutingCreate op) { routingCreateOps.push_back(op); });
+
+    OpBuilder builder(topLevel->getContext());
+    builder.setInsertionPoint(oldExecuteRegion);
+
+    for (auto routingCreate : routingCreateOps) {
+        auto loc = routingCreate.getLoc();
+        auto newRegionOp = builder.create<scf::ExecuteRegionOp>(loc, TypeRange{});
+        Block *newBlock = new Block();
+        newRegionOp.getRegion().push_back(newBlock);
+
+        // Collect non-tensor, non-routing ops from the RoutingCreate body
+        SmallVector<Operation *> opsToMove;
+        Block &rcBody = routingCreate.getBody().front();
+        for (auto &op : rcBody) {
+            if (isa<tensor::ExtractSliceOp>(op))
+                continue;
+            if (op.hasTrait<OpTrait::IsTerminator>())
+                continue;
+            opsToMove.push_back(&op);
+        }
+
+        // Add yield terminator first, then move ops before it
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToEnd(newBlock);
+        auto yieldOp = builder.create<scf::YieldOp>(loc);
+
+        for (auto *op : opsToMove)
+            op->moveBefore(yieldOp);
+    }
+
+    // Erase tensor.extract_slice ops inside RoutingCreate bodies (now dead)
+    for (auto routingCreate : routingCreateOps) {
+        Block &rcBody = routingCreate.getBody().front();
+        SmallVector<Operation *> toErase;
+        for (auto &op : rcBody) {
+            if (isa<tensor::ExtractSliceOp>(op))
+                toErase.push_back(&op);
+        }
+        for (auto *op : llvm::reverse(toErase)) {
+            if (op->use_empty())
+                op->erase();
+        }
+    }
+
+    // Erase old scf.execute_region (contains partitiontensor, RoutingCreate shells, etc.)
+    oldExecuteRegion->erase();
+
+    // Erase dead arith.constant (tensor type), bufferization.to_tensor, and declare_data
+    Block &mainBlock = mainFunc.getBody().front();
+    SmallVector<Operation *> deadOps;
+    for (auto &op : mainBlock) {
+        if (auto constOp = dyn_cast<arith::ConstantOp>(op)) {
+            if (isa<RankedTensorType>(constOp.getType()) && constOp.use_empty())
+                deadOps.push_back(&op);
+        }
+        if (isa<bufferization::ToTensorOp>(op) && op.use_empty())
+            deadOps.push_back(&op);
+        if (isa<dfscheblueprint::DeclareDataOp>(op) && op.use_empty())
+            deadOps.push_back(&op);
+    }
+    for (auto *op : llvm::reverse(deadOps))
+        op->erase();
+
+    // No dealloc needed: rootMemref comes from bufferization.to_memref which
+    // is a read-only view over a constant — the caller does not own the buffer.
+
+    return success();
+}
+
+// Trace a view value back through tensor.extract_slice → routing.partitiontensor
+// → dfscheblueprint.declare_data → arith.constant to find the originating constant,
+// then look up its memref in the constantToMemref map.
+static Value resolveMemrefForView(Value viewValue, const BlueprintPassState &state) {
+    // Walk backwards through extract_slice chain
+    Value current = viewValue;
+    while (auto extractSlice = current.getDefiningOp<tensor::ExtractSliceOp>()) {
+        current = extractSlice.getSource();
+    }
+    // Now current should be the partition tensor result.
+    // Walk through routing.partitiontensor to find its source tensor.
+    if (auto partitionOp = current.getDefiningOp<routing::partitiontensor>()) {
+        current = partitionOp.getTensor();
+    }
+    // Walk through dfscheblueprint.declare_data to find the init_tensor.
+    if (auto declareOp = current.getDefiningOp<dfscheblueprint::DeclareDataOp>()) {
+        current = declareOp.getInitTensor();
+    }
+    // Now current should be the arith.constant result or bufferization.to_tensor
+    // result — look it up in the map.
+    auto it = state.constantToMemref.find(current);
+    if (it != state.constantToMemref.end())
+        return it->second;
+    return Value();
+}
+
 // Pattern to convert dfscheblueprint::FlowTransferOp to dfschedule operations
 // Logic:
 // 1. Find shim tile from the "from" and "to" FlowConfigOps by checking type="shim"
@@ -191,9 +442,22 @@ static dfscheblueprint::DataSliceOp lookupDataSlice(Operation *rootOp, SymbolRef
 // 5. Generate dskernel_receiver function with kernel DMA BD config
 struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::FlowTransferOp> {
     std::shared_ptr<ResourceMgr> resourceMgr;
+    std::shared_ptr<BlueprintPassState> passState;
+    double bufferRatio;
+    // Buffer index mapping keyed by data_id.
+    // All tiles share the same kernel ELF (one BCF), so all row partitions
+    // of the same input tensor must use the same buffer addresses (e.g.
+    // buf_in_ping_0).  We map each unique data_id to a direction-specific
+    // index so that row partitions reuse the same buffer name/address.
+    mutable std::unordered_map<int32_t, int> dataIdToInputIdx;
+    mutable std::unordered_map<int32_t, int> dataIdToOutputIdx;
+    mutable int nextInputIdx = 0;
+    mutable int nextOutputIdx = 0;
 
-    FlowTransferConversion(MLIRContext *ctx, std::shared_ptr<ResourceMgr> mgr)
-        : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), resourceMgr(std::move(mgr)) {}
+    FlowTransferConversion(MLIRContext *ctx, std::shared_ptr<ResourceMgr> mgr,
+                           std::shared_ptr<BlueprintPassState> state, double ratio)
+        : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), resourceMgr(std::move(mgr)),
+          passState(std::move(state)), bufferRatio(ratio) {}
 
     LogicalResult
     matchAndRewrite(dfscheblueprint::FlowTransferOp op, OpAdaptor adaptor,
@@ -256,29 +520,51 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         // Get the view operand from the shim FlowConfig (shim holds the data buffer)
         Value viewValue = shimFlowConfig.getView();
         Type viewType = viewValue.getType();
-        
-        // Convert tensor type to memref type if needed
+
+        // Trace back to tensor.extract_slice to get partition offsets/sizes
+        auto partExtractSlice = viewValue.getDefiningOp<tensor::ExtractSliceOp>();
+        RankedTensorType shimTensorType = dyn_cast<RankedTensorType>(viewType);
+
+        // Resolve which backing memref this flow's data belongs to.
+        // When multiple data tensors exist (A, B, C), each has its own memref.
+        Value flowRootMemref;
+        if (passState && !passState->constantToMemref.empty()) {
+            flowRootMemref = resolveMemrefForView(viewValue, *passState);
+        }
+        // Fall back to legacy single rootMemref if per-constant lookup didn't find it
+        if (!flowRootMemref && passState)
+            flowRootMemref = passState->rootMemref;
+
+        // Create partition subview from the pre-allocated root memref
+        Value partitionSubview;
         MemRefType memrefType;
-        Value memrefValue;
-        if (auto tensorType = dyn_cast<RankedTensorType>(viewType)) {
-            // Create 1D memref type with total size
-            int64_t totalSize = 1;
-            for (int64_t dim : tensorType.getShape()) {
-                totalSize *= dim;
-            }
-            memrefType = MemRefType::get({totalSize}, tensorType.getElementType());
-            
-            // Create dfschedule.declaretensor
-            memrefValue = rewriter.create<dfschedule::DeclareTensorOp>(
-                loc, memrefType, viewValue);
+        Value ddrBuffer;
+        if (flowRootMemref && partExtractSlice && shimTensorType) {
+            // Path 1: view is a tensor.extract_slice — use partition offsets
+            auto partOffsets = partExtractSlice.getStaticOffsets();
+            auto partSizes = partExtractSlice.getStaticSizes();
+            auto partStrides = partExtractSlice.getStaticStrides();
+
+            auto partSubviewOp = rewriter.create<memref::SubViewOp>(
+                loc, flowRootMemref, toOpFoldResult(partOffsets, rewriter), toOpFoldResult(partSizes, rewriter),
+                toOpFoldResult(partStrides, rewriter));
+            partitionSubview = partSubviewOp.getResult();
+
+            ddrBuffer = partitionSubview;
+            memrefType = cast<MemRefType>(ddrBuffer.getType());
+        } else if (flowRootMemref && shimTensorType) {
+            // Path 2: view is the full partition tensor (e.g. from routing.partitiontensor)
+            // Use the entire root memref as the DDR buffer
+            ddrBuffer = flowRootMemref;
+            memrefType = cast<MemRefType>(flowRootMemref.getType());
+            partitionSubview = flowRootMemref;
         } else if (auto mrType = dyn_cast<MemRefType>(viewType)) {
             memrefType = mrType;
-            memrefValue = viewValue;
         } else {
             rewriter.eraseOp(op);
             return success();
         }
-        
+
         // --- Step 2 & 3: DMA CONFIG FOR SHIM TILE ONLY ---
         ArrayAttr shimTilesAttr = shimTileGroup.getTiles();
         if (shimTilesAttr.empty()) {
@@ -310,42 +596,89 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         // Determine DMA direction based on whether shim is sender or receiver
         StringRef dmaDirection = shimIsSender ? "MM2S" : "S2MM";
         StringRef ioOperation = shimIsSender ? "SEND" : "RECV";
-        
-        // Calculate buffer size
+
+        // Calculate buffer size (logical partition view)
         int64_t bufferLen = 1;
         for (int64_t dim : memrefType.getShape()) {
             bufferLen *= dim;
         }
-        
-        // Create bd_id constant for config
-        auto bdIdConst = rewriter.create<arith::ConstantOp>(
-            loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
 
-        // Step 3: Create dfschedule.config.dma_bd for shim tile only
-        auto configDmaBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+        // Shim BD len in int32-word units: the runtime multiplies len by
+        // sizeof(int32_t).  For sub-int32 element types each logical element
+        // occupies one full int32 in DDR, so convert element count to word count.
+        int64_t elementSizeBytesShim = 1;
+        if (memrefType.getElementType().isIntOrFloat())
+            elementSizeBytesShim = memrefType.getElementTypeBitWidth() / 8;
+        if (elementSizeBytesShim == 0)
+            elementSizeBytesShim = 1;
+        StringRef transferType = op.getType();
+        int64_t shimBdLen = bufferLen * elementSizeBytesShim / sizeof(int32_t);
+        if (shimBdLen <= 0)
+            shimBdLen = bufferLen; // fallback for int32 and larger types
+        // Read data_id from shimFlowConfig (set by DmaphopTodfscheblueprintPass).
+        // Propagate it to the ConfigDmaBdOp so ScheduleCanonicalizePass can group
+        // all shim BDs for the same root tensor and merge them into one.
+        auto dataIdOpt = shimFlowConfig.getDataId();
+        int32_t dataId = dataIdOpt.has_value() ? static_cast<int32_t>(*dataIdOpt) : -1;
+
+        // --- Step 3: Single shim BD with NO packet mode ---
+        // Circuit-switched routing does not support packet-mode filtering at
+        // core S2MM (no TLAST demarcation).  Use a single non-packet shim BD
+        // that sends the per-tile data portion.  With broadcast routing all
+        // core tiles on the same circuit-switched path receive the same data.
+        ArrayAttr coreTilesAttrForShim = coreTileGroup.getTiles();
+        int64_t numCoreTiles = coreTilesAttrForShim.size();
+        if (numCoreTiles <= 0)
+            numCoreTiles = 1;
+
+        // Shim BD len = partition size for BOTH one_to_many and many_to_one.
+        // one_to_many: shim sends full partition, each core receives full copy.
+        // many_to_one: K cores each send N/K bytes, shim receives N bytes total.
+        // No separate alloc needed — partition subview is the correct size.
+        int64_t perTileShimLen = shimBdLen;
+
+        // Single shim BD: sends/receives full data from DDR
+        // Allocate BD ID from ResourceMgr to avoid conflicts when a SHIM tile
+        // is used by both MM2S and S2MM (e.g. input + output on same SHIM).
+        // SHIM tiles share a single BD pool across all channels/directions,
+        // so channel number alone is NOT a valid BD ID.
+        int32_t shimBdIdVal = -1;
+        if (resourceMgr) {
+            auto bdOpt = resourceMgr->allocateTileBd(shimRow, shimCol, /*ownerId=*/flowIndex);
+            if (bdOpt)
+                shimBdIdVal = *bdOpt;
+        }
+        if (shimBdIdVal < 0)
+            shimBdIdVal = static_cast<int32_t>(shimChannel); // fallback
+
+        auto shimBdIdConst =
+            rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(shimBdIdVal));
+
+        auto shimBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
             loc, dfschedule::BdHandleType::get(rewriter.getContext()),
-            memrefValue,                              // buffer
-            shimTileOp.getTile(),                     // tile
-            bdIdConst.getResult(),                    // bd_id
-            rewriter.getI32IntegerAttr(0),            // offset
-            rewriter.getI32IntegerAttr(bufferLen),    // len
-            rewriter.getBoolAttr(true),               // enable_packet
-            rewriter.getI32IntegerAttr(basePacketId), // packet_id
-            rewriter.getI32IntegerAttr(4294967295),   // next_bd (-1 as unsigned)
-            rewriter.getI32IntegerAttr(0),            // acquire_lock_id
-            rewriter.getI32IntegerAttr(0),            // acquire_lock_val
-            rewriter.getI32IntegerAttr(0),            // release_lock_id
-            rewriter.getI32IntegerAttr(0));           // release_lock_val
+            ddrBuffer,                                  // DDR receive buffer
+            shimTileOp.getTile(),                       // tile
+            shimBdIdConst.getResult(),                  // bd_id
+            rewriter.getI32IntegerAttr(0),              // offset
+            rewriter.getI32IntegerAttr(perTileShimLen), // len (per-tile portion)
+            rewriter.getBoolAttr(false),                // enable_packet = false
+            rewriter.getI32IntegerAttr(0),              // packet_id (unused)
+            rewriter.getI32IntegerAttr(4294967295),     // next_bd = none
+            rewriter.getI32IntegerAttr(0),              // acquire_lock_id
+            rewriter.getI32IntegerAttr(0),              // acquire_lock_val
+            rewriter.getI32IntegerAttr(0),              // release_lock_id
+            rewriter.getI32IntegerAttr(0),              // release_lock_val
+            rewriter.getI32IntegerAttr(dataId),         // data_id
+            Value(),                                    // linked_bd = none
+            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
 
-        // Create dfschedule.config.create_io for shim tile
         auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
-            loc,
-            dfschedule::IoHandleType::get(rewriter.getContext()),
-            configDmaBdOp.getBdHandle(),                      // bd_config
-            shimTileOp.getTile(),                             // tile
-            rewriter.getI32IntegerAttr(shimChannel),          // channel
-            rewriter.getStringAttr(dmaDirection),             // direction (MM2S or S2MM)
-            rewriter.getStringAttr(ioOperation));             // io_operation (SEND or RECV)
+            loc, dfschedule::IoHandleType::get(rewriter.getContext()),
+            shimBdOp.getBdHandle(),                  // single BD
+            shimTileOp.getTile(),                    // tile
+            rewriter.getI32IntegerAttr(shimChannel), // channel
+            rewriter.getStringAttr(dmaDirection),    // direction (MM2S or S2MM)
+            rewriter.getStringAttr(ioOperation));    // io_operation (SEND or RECV)
 
         // --- CORE TILES: declaretile, kernel_config, and ping-pong DMA config ---
         ArrayAttr coreTilesAttr = coreTileGroup.getTiles();
@@ -362,8 +695,23 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         // Get per-tile data slices from core FlowConfig's slice_symbols
         auto sliceSymbolsOpt = coreFlowConfig.getSliceSymbols();
 
+        // Pre-allocate buffer addresses once for this flow (shared kernel binary)
+        // All tiles use the same buffer placement.
+        int64_t flowPingL1Offset = 0;
+        int64_t flowPongL1Offset = 0;
+        bool flowAddrsValid = false;
+
         // Collect tile config dictionaries for kernel_config
         SmallVector<Attribute> tileConfigDicts;
+        // Deferred core StartIoOp data: collect IO handles and BD IDs inside the
+        // per-tile loop, then emit StartIoOp AFTER LoadKernelGroup/LaunchKernelGroup
+        // so that ELF BSS initialization does not overwrite DMA data.
+        struct DeferredCoreStartIo {
+            Value ioHandle;
+            Value bdId;
+            uint32_t flowIdx;
+        };
+        SmallVector<DeferredCoreStartIo> deferredCoreStartIos;
         int tileIndex = 0;
         
         for (auto tileAttr : coreTilesAttr) {
@@ -382,24 +730,40 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 rewriter.getI32IntegerAttr(col),
                 rewriter.getI32IntegerAttr(row));
             coreTiles.push_back(coreTileOp.getTile());
-            
-            // Calculate buffer size from memrefType
-            int64_t bufferSize = 1;
-            int64_t elementSizeBytes = 1;
-            if (auto memrefType = memrefValue.getType().dyn_cast<MemRefType>()) {
-                for (auto dim : memrefType.getShape()) {
-                    if (dim > 0) {
-                        bufferSize *= dim;
-                    }
-                }
-                elementSizeBytes = memrefType.getElementTypeBitWidth() / 8;
-                bufferSize *= elementSizeBytes;
-            }
 
+            // Calculate buffer size from the DDR memref type
+            int64_t bufferSize = bufferLen;
+            int64_t elementSizeBytes = 1;
+            if (memrefType.getElementType().isIntOrFloat())
+                elementSizeBytes = memrefType.getElementTypeBitWidth() / 8;
+            if (elementSizeBytes == 0)
+                elementSizeBytes = 1;
+            bufferSize *= elementSizeBytes;
+
+            // With circuit-switched broadcast every core tile receives the FULL
+            // partition data from the shim stream.  The kernel selects its own
+            // portion via buffer_offset.  DMA iterations must cover the full
+            // partition so the stream is fully consumed.
             int64_t perTileSize = bufferSize / coreTilesAttr.size();
             int64_t bufferOffset = tileIndex * perTileSize;
 
-            // Allocate lock pair from ResourceMgr for this core tile
+            // Per-core data depends on transfer type:
+            // many_to_one (gather/output): each core produces partition / numCoreTiles.
+            // one_to_many (broadcast/input): each core receives the full partition.
+            int64_t fullPartitionElements = bufferSize / elementSizeBytes;
+            int64_t perCoreElements = fullPartitionElements;
+            if (transferType == "many_to_one")
+                perCoreElements = fullPartitionElements / numCoreTiles;
+            int64_t pingPongBufferSize = static_cast<int64_t>(perCoreElements * bufferRatio);
+            if (pingPongBufferSize <= 0)
+                pingPongBufferSize = 1;
+            // numIterations uses perCoreElements because each core only
+            // processes its own share of data.
+            int64_t numIterations = (perCoreElements + pingPongBufferSize - 1) / pingPongBufferSize;
+
+            // Allocate lock pair from ResourceMgr for this core tile.
+            // Both XAie API and kernel intrinsics use the same lock ID
+            // namespace (0-15 for AIEML core tiles).
             int acquireLockId = -1, releaseLockId = -1;
             if (resourceMgr) {
                 resourceMgr->allocateTileLockPair(row, col, /*ownerId=*/flowIndex, acquireLockId, releaseLockId);
@@ -420,7 +784,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             configAttrs.append("dma_channel", rewriter.getI32IntegerAttr(coreChannel));
             configAttrs.append("buffer_mode", rewriter.getI32IntegerAttr(1)); // 1 = ping-pong
             configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(2));
-            configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(perTileSize));
+            configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(pingPongBufferSize));
+            configAttrs.append("num_iterations", rewriter.getI32IntegerAttr(numIterations));
             configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(bufferOffset));
             configAttrs.append("element_size", rewriter.getI32IntegerAttr(elementSizeBytes));
             configAttrs.append("acquire_lock_id", rewriter.getI32IntegerAttr(acquireLockId));
@@ -437,76 +802,221 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     Value perTileTensor = dataSliceOp.getTensorSlice();
                     Type perTileType = perTileTensor.getType();
 
-                    // Create per-tile declaretensor -> memref
+                    // Trace back to tensor.extract_slice to get per-tile offsets/sizes
+                    auto tileExtractSlice = perTileTensor.getDefiningOp<tensor::ExtractSliceOp>();
+
                     int64_t perTileTotalSize = perTileSize / elementSizeBytes;
-                    MemRefType perTileMemrefType;
-                    if (auto tt = dyn_cast<RankedTensorType>(perTileType)) {
-                        int64_t totalElems = 1;
-                        for (int64_t d : tt.getShape())
-                            totalElems *= d;
-                        perTileMemrefType = MemRefType::get({totalElems}, tt.getElementType());
-                        perTileTotalSize = totalElems;
-                    } else {
-                        perTileMemrefType = MemRefType::get({perTileTotalSize}, memrefType.getElementType());
-                    }
+                    MemRefType shapedPerTileType;
 
-                    Value perTileMemref =
-                        rewriter.create<dfschedule::DeclareTensorOp>(loc, perTileMemrefType, perTileTensor);
+                    if (flowRootMemref && tileExtractSlice) {
+                        // Get slice info from tileExtractSlice
+                        auto sliceOffsets = tileExtractSlice.getStaticOffsets();
+                        auto sliceSizes = tileExtractSlice.getStaticSizes();
+                        auto sliceStrides = tileExtractSlice.getStaticStrides();
 
-                    // Allocate BD IDs from ResourceMgr per-tile pool
-                    int32_t pingBdId = -1, pongBdId = -1;
-                    if (resourceMgr) {
-                        auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
-                        auto bd1 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
-                        if (bd0 && bd1) {
-                            pingBdId = *bd0;
-                            pongBdId = *bd1;
+                        Value partSubview;
+                        SmallVector<int64_t> perTileSizes;
+                        SmallVector<int64_t> perTileOffsets;
+                        SmallVector<int64_t> perTileStrides(sliceSizes.size(), 1);
+
+                        if (partExtractSlice) {
+                            // Original path: tileExtractSlice gives per-tile offsets relative
+                            // to partition subview (output flow has distinct extract_slices per tile)
+                            perTileSizes.assign(sliceSizes.begin(), sliceSizes.end());
+                            perTileOffsets.assign(sliceOffsets.begin(), sliceOffsets.end());
+                            partSubview = partitionSubview;
+                        } else {
+                            // Path 2: tileExtractSlice gives partition-level offsets from root.
+                            // Create partition subview first, then compute per-tile split.
+                            auto partSubviewOp = rewriter.create<memref::SubViewOp>(
+                                loc, flowRootMemref, toOpFoldResult(sliceOffsets, rewriter),
+                                toOpFoldResult(sliceSizes, rewriter), toOpFoldResult(sliceStrides, rewriter));
+                            partSubview = partSubviewOp.getResult();
+
+                            // Split first dimension evenly among core tiles
+                            int64_t numCoreTiles = coreTilesAttr.size();
+                            perTileSizes.assign(sliceSizes.begin(), sliceSizes.end());
+                            perTileSizes[0] = sliceSizes[0] / numCoreTiles;
+                            perTileOffsets.assign(sliceSizes.size(), 0);
+                            perTileOffsets[0] = tileIndex * perTileSizes[0];
                         }
-                    }
-                    if (pingBdId < 0 || pongBdId < 0) {
-                        llvm::errs() << "WARNING: BD allocation failed for tile (" << col << "," << row
-                                     << "), falling back to 0/1\n";
-                        pingBdId = 0;
-                        pongBdId = 1;
-                    }
 
-                    // Ping BD: next_bd -> pong
-                    auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
-                                                                            rewriter.getI32IntegerAttr(pingBdId));
-                    auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-                        loc, dfschedule::BdHandleType::get(rewriter.getContext()), perTileMemref, coreTileOp.getTile(),
-                        pingBdIdConst.getResult(),
-                        rewriter.getI32IntegerAttr(0),                // offset
-                        rewriter.getI32IntegerAttr(perTileTotalSize), // len
-                        rewriter.getBoolAttr(true),                   // enable_packet
-                        rewriter.getI32IntegerAttr(basePacketId + tileIndex),
-                        rewriter.getI32IntegerAttr(pongBdId),      // next_bd -> pong
-                        rewriter.getI32IntegerAttr(acquireLockId), // acquire_lock_id
-                        rewriter.getI32IntegerAttr(-1),            // acquire_lock_val (wait/decrement)
-                        rewriter.getI32IntegerAttr(releaseLockId), // release_lock_id
-                        rewriter.getI32IntegerAttr(1));            // release_lock_val (signal/increment)
+                        // Create per-tile subview
+                        auto tileSubviewOp = rewriter.create<memref::SubViewOp>(
+                            loc, partSubview, toOpFoldResult(perTileOffsets, rewriter),
+                            toOpFoldResult(perTileSizes, rewriter), toOpFoldResult(perTileStrides, rewriter));
 
-                    // Pong BD: next_bd -> ping
-                    auto pongBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
-                                                                            rewriter.getI32IntegerAttr(pongBdId));
-                    rewriter.create<dfschedule::ConfigDmaBdOp>(
-                        loc, dfschedule::BdHandleType::get(rewriter.getContext()), perTileMemref, coreTileOp.getTile(),
-                        pongBdIdConst.getResult(),
-                        rewriter.getI32IntegerAttr(0),                // offset
-                        rewriter.getI32IntegerAttr(perTileTotalSize), // len
-                        rewriter.getBoolAttr(true),                   // enable_packet
-                        rewriter.getI32IntegerAttr(basePacketId + tileIndex),
-                        rewriter.getI32IntegerAttr(pingBdId),      // next_bd -> ping
-                        rewriter.getI32IntegerAttr(acquireLockId), // acquire_lock_id
-                        rewriter.getI32IntegerAttr(-1),            // acquire_lock_val (wait/decrement)
-                        rewriter.getI32IntegerAttr(releaseLockId), // release_lock_id
-                        rewriter.getI32IntegerAttr(1));            // release_lock_val (signal/increment)
+                        // memref_mapping: strip strides, produce clean shaped type
+                        shapedPerTileType = MemRefType::get(perTileSizes, passState->elementType);
+                        perTileTotalSize = 1;
+                        for (int64_t d : perTileSizes)
+                            perTileTotalSize *= d;
 
-                    // Create IO handle for core tile (references ping BD; DMA chains automatically)
-                    rewriter.create<dfschedule::ConfigCreateIoOp>(
-                        loc, dfschedule::IoHandleType::get(rewriter.getContext()), pingBdOp.getBdHandle(),
-                        coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
-                        rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation));
+                        auto coreMappingOp = rewriter.create<dfschedule::MemRefMappingOp>(loc, shapedPerTileType,
+                                                                                          tileSubviewOp.getResult());
+                        Value perTileToken = coreMappingOp.getMapped();
+
+                        // bind_core_buffer with shaped memref type
+                        // Use pre-allocated buffer addresses from CoreMemAllocator
+                        // (allocated once for first tile, reused for all tiles in this flow)
+                        int64_t pingL1Offset = 0;
+                        // Pong offset must be int32-aligned for DMA transfers
+                        int64_t pingBufBytes = pingPongBufferSize * elementSizeBytes;
+                        int64_t pongL1Offset = (pingBufBytes + 3) & ~3;
+                        if (!flowAddrsValid) {
+                            // First tile: allocate addresses for this flow.
+                            // Use data_id to deduplicate row partitions: all flows
+                            // sharing the same source tensor (same data_id) must map
+                            // to the same kernel buffer so the single shared ELF
+                            // sees data at the expected addresses.
+                            bool isInput = shimIsSender;
+                            int dirIdx;
+                            if (isInput) {
+                                auto it = dataIdToInputIdx.find(dataId);
+                                if (it != dataIdToInputIdx.end()) {
+                                    dirIdx = it->second;
+                                } else {
+                                    dirIdx = nextInputIdx++;
+                                    dataIdToInputIdx[dataId] = dirIdx;
+                                }
+                            } else {
+                                auto it = dataIdToOutputIdx.find(dataId);
+                                if (it != dataIdToOutputIdx.end()) {
+                                    dirIdx = it->second;
+                                } else {
+                                    dirIdx = nextOutputIdx++;
+                                    dataIdToOutputIdx[dataId] = dirIdx;
+                                }
+                            }
+                            std::string pingName, pongName;
+                            if (isInput) {
+                                pingName = "buf_in_ping_" + std::to_string(dirIdx);
+                                pongName = "buf_in_pong_" + std::to_string(dirIdx);
+                            } else {
+                                pingName = "buf_out_ping_" + std::to_string(dirIdx);
+                                pongName = "buf_out_pong_" + std::to_string(dirIdx);
+                            }
+                            // Ensure buffer size is int32-aligned for DMA.
+                            // Use fullPartitionElements * bufferRatio (before numCoreTiles division)
+                            // because the kernel uses a single global BUF_SZ for ALL windows,
+                            // determined by the largest flow (input one_to_many).  Output buffers
+                            // (many_to_one) need the same allocation size even though they transfer
+                            // fewer elements per core.
+                            int64_t kernelBufElements = static_cast<int64_t>(fullPartitionElements * bufferRatio);
+                            if (kernelBufElements < pingPongBufferSize)
+                                kernelBufElements = pingPongBufferSize;
+                            uint32_t bufSizeBytes = ((kernelBufElements * elementSizeBytes) + 3) & ~3;
+                            try {
+                                auto &allocator = ResourceMgr::instance()->coreMemAllocator();
+                                auto pingAddr = allocator.allocate(pingName, bufSizeBytes, /*alignment=*/32);
+                                auto pongAddr = allocator.allocate(pongName, bufSizeBytes, /*alignment=*/32);
+                                if (pingAddr && pongAddr) {
+                                    // Convert core processor view (0x78000+) to DMA view (0x08000+)
+                                    // Core DMA engine sees memory starting at 0x00000, not 0x70000
+                                    flowPingL1Offset = static_cast<int64_t>(*pingAddr) - 0x70000;
+                                    flowPongL1Offset = static_cast<int64_t>(*pongAddr) - 0x70000;
+                                    flowAddrsValid = true;
+                                }
+                            } catch (...) {
+                                // ResourceMgr singleton not initialized; fall back to relative offsets
+                            }
+                        }
+                        if (flowAddrsValid) {
+                            pingL1Offset = flowPingL1Offset;
+                            pongL1Offset = flowPongL1Offset;
+                        }
+                        auto pingL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
+                            loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
+                            rewriter.getI64IntegerAttr(pingL1Offset));
+                        auto pongL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
+                            loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
+                            rewriter.getI64IntegerAttr(pongL1Offset));
+
+                        // Allocate BD IDs from ResourceMgr per-tile pool
+                        int32_t pingBdId = -1, pongBdId = -1;
+                        if (resourceMgr) {
+                            auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                            auto bd1 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                            if (bd0 && bd1) {
+                                pingBdId = *bd0;
+                                pongBdId = *bd1;
+                            }
+                        }
+                        if (pingBdId < 0 || pongBdId < 0) {
+                            llvm::errs() << "WARNING: BD allocation failed for tile (" << col << "," << row
+                                         << "), falling back to 0/1\n";
+                            pingBdId = 0;
+                            pongBdId = 1;
+                        }
+
+                        // Core BD len: runtime multiplies len by sizeof(int32_t), so
+                        // convert from element count to int32-word count.
+                        int64_t coreBdLen = pingPongBufferSize * elementSizeBytes / sizeof(int32_t);
+                        if (coreBdLen <= 0)
+                            coreBdLen = 1;
+
+                        // For output (MM2S on core), swap lock IDs in BD config:
+                        // Input (S2MM):  DMA acquires lock 0 (buffer free), releases lock 1 (data ready)
+                        // Output (MM2S): DMA acquires lock 1 (data produced by kernel), releases lock 0 (buffer free)
+                        bool isOutputFlow = (coreDmaDir == dfscheblueprint::bp_direction::MM2S);
+                        int bdAcquireLockId = isOutputFlow ? releaseLockId : acquireLockId;
+                        int bdReleaseLockId = isOutputFlow ? acquireLockId : releaseLockId;
+
+                        // Output (MM2S) uses packet-switched routing: core DMA must emit
+                        // packet headers so the packet switch can route data to the shim.
+                        // Input (S2MM) uses circuit-switched routing: no packet headers needed.
+                        bool coreBdEnablePacket = isOutputFlow;
+                        int32_t coreBdPacketId = isOutputFlow ? (int32_t)(basePacketId + tileIndex) : 0;
+
+                        // Pong BD first (no linked_bd): next_bd -> ping
+                        auto pongBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                                rewriter.getI32IntegerAttr(pongBdId));
+                        auto pongBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                            loc, dfschedule::BdHandleType::get(rewriter.getContext()), pongL1.getBuffer(),
+                            coreTileOp.getTile(), pongBdIdConst.getResult(),
+                            rewriter.getI32IntegerAttr(0),               // offset
+                            rewriter.getI32IntegerAttr(coreBdLen),       // len (int32-word count)
+                            rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
+                            rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
+                            rewriter.getI32IntegerAttr(pingBdId),        // next_bd -> ping
+                            rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
+                            rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
+                            rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
+                            rewriter.getI32IntegerAttr(1),               // release_lock_val
+                            rewriter.getI32IntegerAttr(-1),              // data_id
+                            Value(),                                     // linked_bd = none
+                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+
+                        // Ping BD second (linked_bd = pong handle): next_bd -> pong
+                        auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                                rewriter.getI32IntegerAttr(pingBdId));
+                        auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                            loc, dfschedule::BdHandleType::get(rewriter.getContext()), pingL1.getBuffer(),
+                            coreTileOp.getTile(), pingBdIdConst.getResult(),
+                            rewriter.getI32IntegerAttr(0),               // offset
+                            rewriter.getI32IntegerAttr(coreBdLen),       // len (int32-word count)
+                            rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
+                            rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
+                            rewriter.getI32IntegerAttr(pongBdId),        // next_bd -> pong
+                            rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
+                            rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
+                            rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
+                            rewriter.getI32IntegerAttr(1),               // release_lock_val
+                            rewriter.getI32IntegerAttr(-1),              // data_id
+                            pongBdOp.getBdHandle(),                      // linked_bd = pong BD
+                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+
+                        // Create IO handle for core tile
+                        auto coreCreateIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
+                            loc, dfschedule::IoHandleType::get(rewriter.getContext()), pingBdOp.getBdHandle(),
+                            coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
+                            rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation));
+                        auto coreBdIdOp =
+                            rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());
+                        // Defer core StartIoOp until after ELF is loaded (LoadKernelGroup)
+                        // to prevent BSS initialization from overwriting DMA data.
+                        deferredCoreStartIos.push_back({coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), flowIndex});
+                    } // end if (passState && ...)
                 }
             }
 
@@ -517,12 +1027,14 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             rewriter.eraseOp(op);
             return success();
         }
-        
+
         // Create individual kernel_config ops for each tile (e.g., @kernelconfig0, @kernelconfig1)
+        // Use static counter to ensure unique names across multiple transfer manifests
+        static int kernelConfigIdx = 0;
         SmallVector<Attribute> kernelConfigSymbols;
         for (size_t i = 0; i < tileConfigDicts.size(); ++i) {
-            std::string configName = "kernelconfig" + std::to_string(i);
-            
+            std::string configName = "kernelconfig" + std::to_string(kernelConfigIdx++);
+
             // Create a kernel_config op with a single tile's config
             SmallVector<Attribute> singleTileConfig;
             singleTileConfig.push_back(tileConfigDicts[i]);
@@ -562,7 +1074,18 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             loc,
             dfschedule::EventType::get(rewriter.getContext()),
             loadKernelGroupOp.getKernelGroup());
-        
+
+        // Emit deferred core StartIoOp calls AFTER kernel load/launch.
+        // This ensures the ELF BSS initialization (which zeroes buf_in_ping/pong)
+        // completes before core S2MM DMAs start writing data into those buffers.
+        SmallVector<Value> coreStartIoEvents;
+        for (auto &deferred : deferredCoreStartIos) {
+            auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
+                loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
+                rewriter.getI32IntegerAttr(deferred.flowIdx));
+            coreStartIoEvents.push_back(coreStartIo.getEvent());
+        }
+
         // Create dfschedule.schedule.getbdid for shim tile
         auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(
             loc,
@@ -576,13 +1099,21 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             createIoOp.getIoHandle(),
             getBdIdOp.getBdId(),
             rewriter.getI32IntegerAttr(flowIndex));
-        
-        // Create dfschedule.schedule.wait with both events
+
+        // Create dfschedule.schedule.wait with kernel launch + shim IO events only.
+        // Core tile IO events are excluded: core DMAs use infinite ping-pong BD
+        // chaining (next_bd cycles BD0→BD1→BD0→...), so wait_io would never
+        // return. The kernel launch event already ensures cores have completed.
         SmallVector<Value> events;
-        events.push_back(startIoOp.getEvent());
         events.push_back(launchKernelGroupOp.getEvent());
+        events.push_back(startIoOp.getEvent());
         rewriter.create<dfschedule::ScheduleWaitOp>(loc, events);
-        
+
+        // Stage 6: free DDR allocation after all transfers complete
+        if (ddrBuffer) {
+            rewriter.create<dfschedule::FreeDeviceMemOp>(loc, ddrBuffer);
+        }
+
         // --- Step 5: Generate dskernel_receiver function ---
         // Use the same symbol name as load_kernel_group callee
         StringRef kernelName = "dskernel_receiver";
@@ -602,10 +1133,14 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                          basePacketId, coreChannel, flowIndex);
             }
         }
-        
+
+        // Buffer naming uses DMA channel index (coreChannel) so that all rounds
+        // sharing the same kernel ELF get the same physical buffer addresses.
+        // Within a single flow, all tiles share the same buffer addresses.
+
         // Erase the original FlowTransferOp
         rewriter.eraseOp(op);
-        
+
         return success();
     }
 };
@@ -623,61 +1158,85 @@ struct DataSliceOpConversion : public OpConversionPattern<dfscheblueprint::DataS
     }
 };
 
+// Pattern for DeclareDataOp - pass through the init_tensor operand to all users
+struct DeclareDataOpConversion : public OpConversionPattern<dfscheblueprint::DeclareDataOp> {
+    using OpConversionPattern<dfscheblueprint::DeclareDataOp>::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(dfscheblueprint::DeclareDataOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        // DeclareDataOp is a logical wrapper around init_tensor; pass through the input
+        rewriter.replaceOp(op, adaptor.getInitTensor());
+        return success();
+    }
+};
+
 } // namespace
 
 namespace mlir {
 
 void BlueprintToSchedulePass::runOnOperation() {
     MLIRContext *context = &getContext();
+
+    // --- Phase 1: Pre-processing ---
+    auto passState = std::make_shared<BlueprintPassState>();
+    if (failed(preprocessConstantToMemref(getOperation(), passState))) {
+        signalPassFailure();
+        return;
+    }
+
+    // --- Phase 2: Dialect conversion ---
     ConversionTarget target(*context);
-    
-    // Mark target dialects as legal
-    target.addLegalDialect<dfschedule::dfscheduledialect, 
-                          func::FuncDialect,
-                          memref::MemRefDialect,
-                          arith::ArithDialect,
-                          scf::SCFDialect,
-                          tensor::TensorDialect,
-                          bufferization::BufferizationDialect,
-                          BuiltinDialect>();
-    
-    // Mark all dfscheblueprint operations as illegal to trigger conversion/erasure
+    target.addLegalDialect<dfschedule::dfscheduledialect, routing::routingdialect, func::FuncDialect,
+                           memref::MemRefDialect, arith::ArithDialect, scf::SCFDialect, tensor::TensorDialect,
+                           bufferization::BufferizationDialect, BuiltinDialect>();
+
     target.addIllegalOp<dfscheblueprint::FlowConfigOp>();
     target.addIllegalOp<dfscheblueprint::TileGroupOp>();
-    //target.addIllegalOp<dfscheblueprint::DeclareDataOp>();
-    //target.addIllegalOp<dfscheblueprint::DataSliceOp>();
+    target.addIllegalOp<dfscheblueprint::DeclareDataOp>();
     target.addIllegalOp<dfscheblueprint::FlowTransferOp>();
-    // target.addIllegalOp<dfscheblueprint::TransferManifestOp>();
 
-    // Type converter
-    TypeConverter typeConverter;
-    typeConverter.addConversion([](Type type) { return type; });
-    
-    // Convert tensor types to memref types where needed
-    typeConverter.addConversion([](RankedTensorType tensorType) -> Type {
-        return MemRefType::get(tensorType.getShape(), tensorType.getElementType());
-    });
-
-    // Create ResourceMgr for BD and lock allocation
     auto hwRes = makeResource("Gen2");
     auto resourceMgr = std::make_shared<ResourceMgr>(std::move(hwRes));
 
     RewritePatternSet patterns(context);
-    // FlowTransferConversion converts flow_transfer to dfschedule operations
-    // It reads from FlowConfigOps to get DMA configuration
-    patterns.add<FlowTransferConversion>(context, resourceMgr);
-    // DataSliceOp replaces with input tensor
+    patterns.add<FlowTransferConversion>(context, resourceMgr, passState, bufferRatio_);
     patterns.add<DataSliceOpConversion>(context);
-    // Use unified erase pattern for ops that just need to be removed
-    // FlowConfigOp is erased since FlowTransferConversion reads its attributes directly
     patterns.add<EraseOpPattern<dfscheblueprint::FlowConfigOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::TileGroupOp>>(context);
-    // patterns.add<EraseOpPattern<dfscheblueprint::DeclareDataOp>>(context);
-    // patterns.add<EraseOpPattern<dfscheblueprint::TransferManifestOp>>(context);
+    patterns.add<DeclareDataOpConversion>(context);
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {
         signalPassFailure();
+        return;
     }
+
+    // --- Phase 3: Erase dead tensor/routing ops ---
+    // tensor.extract_slice chains can be nested (partition → producer), so
+    // iterate until no more dead ops are found.
+    SmallVector<Operation *, 8> deadOps;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        deadOps.clear();
+        getOperation()->walk([&](Operation *op) {
+            if (!op->use_empty())
+                return;
+            if (isa<tensor::ExtractSliceOp>(op) || isa<routing::partitiontensor>(op) ||
+                isa<bufferization::ToTensorOp>(op) ||
+                (isa<arith::ConstantOp>(op) && isa<RankedTensorType>(op->getResult(0).getType())))
+                deadOps.push_back(op);
+        });
+        for (auto *op : deadOps) {
+            op->erase();
+            changed = true;
+        }
+    }
+
+    // Region restructuring is deferred to ScheduleCanonicalizePass.
+    // The dfschedule ops remain inside routing.RoutingCreate bodies, which is
+    // valid because RoutingCreate has the SymbolTable trait needed by
+    // DeclareKernelConfigOp.  ScheduleCanonicalizePass will extract them into
+    // per-partition scf.execute_region blocks and erase the routing ops.
 }
 
 } // namespace mlir

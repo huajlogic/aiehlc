@@ -173,11 +173,16 @@ void dfscheblueprint::FlowConfigOp::print(OpAsmPrinter &printer) {
         printer.printNewline();
         printer << ",type = \"" << getType() << "\"";
     }
+    if (getDataIdAttr()) {
+        printer.printNewline();
+        printer << ",data_id = " << static_cast<int32_t>(*getDataId()) << " : i32";
+    }
     printer.decreaseIndent();
     printer.printNewline();
     printer << "}";
-    printer.printOptionalAttrDict(getOperation()->getAttrs(), 
-        /*elidedAttrs=*/{"sym_name", "target", "view", "distribution", "dma", "slice_symbols", "type"});
+    printer.printOptionalAttrDict(
+        getOperation()->getAttrs(),
+        /*elidedAttrs=*/{"sym_name", "target", "view", "distribution", "dma", "slice_symbols", "type", "data_id"});
 }
 
 // FlowConfigOp parser
@@ -185,10 +190,10 @@ ParseResult dfscheblueprint::FlowConfigOp::parse(OpAsmParser &parser, OperationS
     StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return failure();
-    
+
     if (parser.parseLBrace())
         return failure();
-    
+
     SymbolRefAttr target;
     OpAsmParser::UnresolvedOperand viewOperand;
     Type viewType;
@@ -196,43 +201,54 @@ ParseResult dfscheblueprint::FlowConfigOp::parse(OpAsmParser &parser, OperationS
     dfscheblueprint::DMAAttr dma;
     ArrayAttr sliceSymbols;
     StringAttr type;
-    
+
     while (true) {
-        OptionalParseResult res = parser.parseOptionalRBrace();
-        if (res.has_value()) {
-            if (failed(res.value())) return failure();
-            break;
+        // Try keyword first (avoids parseOptionalRBrace consuming wrong brace)
+        StringRef attrName;
+        if (succeeded(parser.parseOptionalKeyword(&attrName))) {
+            if (parser.parseEqual())
+                return failure();
+
+            if (attrName == "target") {
+                if (parser.parseAttribute(target, "target", result.attributes)) return failure();
+            } else if (attrName == "view") {
+                if (parser.parseOperand(viewOperand) || parser.parseColonType(viewType))
+                    return failure();
+            } else if (attrName == "distribution") {
+                if (parser.parseAttribute(distribution, "distribution", result.attributes)) return failure();
+            } else if (attrName == "dma") {
+                if (parser.parseAttribute(dma, "dma", result.attributes)) return failure();
+            } else if (attrName == "slice_symbols") {
+                if (parser.parseAttribute(sliceSymbols, "slice_symbols", result.attributes)) return failure();
+            } else if (attrName == "type") {
+                if (parser.parseAttribute(type, "type", result.attributes)) return failure();
+            } else if (attrName == "data_id") {
+                IntegerAttr dataIdAttr;
+                if (parser.parseAttribute(dataIdAttr, "data_id", result.attributes)) return failure();
+                if (dataIdAttr.getType().isSignlessInteger(64)) {
+                    auto i32Attr = IntegerAttr::get(
+                        IntegerType::get(parser.getContext(), 32),
+                        dataIdAttr.getInt());
+                    result.attributes.set("data_id", i32Attr);
+                }
+            } else {
+                return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+            }
+            parser.parseOptionalComma();
+            continue;
         }
 
-        StringRef attrName;
-        if (parser.parseKeyword(&attrName) || parser.parseEqual())
+        // No keyword found — must be closing brace
+        if (parser.parseRBrace())
             return failure();
-        
-        if (attrName == "target") {
-            if (parser.parseAttribute(target, "target", result.attributes)) return failure();
-        } else if (attrName == "view") {
-            if (parser.parseOperand(viewOperand) || parser.parseColonType(viewType))
-                return failure();
-        } else if (attrName == "distribution") {
-            if (parser.parseAttribute(distribution, "distribution", result.attributes)) return failure();
-        } else if (attrName == "dma") {
-            if (parser.parseAttribute(dma, "dma", result.attributes)) return failure();
-        } else if (attrName == "slice_symbols") {
-            if (parser.parseAttribute(sliceSymbols, "slice_symbols", result.attributes)) return failure();
-        } else if (attrName == "type") {
-            if (parser.parseAttribute(type, "type", result.attributes)) return failure();
-        } else {
-             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
-        }
-        
-        parser.parseOptionalComma();
+        break;
     }
-    
+
     if (parser.resolveOperand(viewOperand, viewType, result.operands))
         return failure();
-        
+
     parser.parseOptionalAttrDict(result.attributes);
-    
+
     return success();
 }
 
@@ -251,9 +267,9 @@ void dfscheblueprint::FlowTransferOp::print(OpAsmPrinter &printer) {
         printer << ",ordering = \"" << getOrdering() << "\"";
     }
     printer.printNewline();
-    printer << ",base_packet_id = " << getBasePacketId() << ",";
+    printer << ",base_packet_id = " << getBasePacketId() << " : i32,";
     printer.printNewline();
-    printer << "flow_index = " << getFlowIndex();
+    printer << "flow_index = " << getFlowIndex() << " : i32";
     printer.decreaseIndent();
     printer.printNewline();
     printer << "}";
@@ -266,49 +282,63 @@ ParseResult dfscheblueprint::FlowTransferOp::parse(OpAsmParser &parser, Operatio
     StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return failure();
-    
+
     if (parser.parseLBrace())
         return failure();
-    
+
     StringAttr type;
     SymbolRefAttr from;
     SymbolRefAttr to;
     StringAttr ordering;
     IntegerAttr basePacketId;
     IntegerAttr flowIndex;
-    
+
     while (true) {
-        OptionalParseResult res = parser.parseOptionalRBrace();
-        if (res.has_value()) {
-            if (failed(res.value())) return failure();
-            break;
+        // Try keyword first (avoids parseOptionalRBrace consuming wrong brace)
+        StringRef attrName;
+        if (succeeded(parser.parseOptionalKeyword(&attrName))) {
+            if (parser.parseEqual())
+                return failure();
+
+            if (attrName == "type") {
+                if (parser.parseAttribute(type, "type", result.attributes)) return failure();
+            } else if (attrName == "from") {
+                if (parser.parseAttribute(from, "from", result.attributes)) return failure();
+            } else if (attrName == "to") {
+                if (parser.parseAttribute(to, "to", result.attributes)) return failure();
+            } else if (attrName == "ordering") {
+                if (parser.parseAttribute(ordering, "ordering", result.attributes)) return failure();
+            } else if (attrName == "base_packet_id") {
+                if (parser.parseAttribute(basePacketId, "base_packet_id", result.attributes)) return failure();
+                if (basePacketId.getType().isSignlessInteger(64)) {
+                    auto i32Attr = IntegerAttr::get(
+                        IntegerType::get(parser.getContext(), 32),
+                        basePacketId.getInt());
+                    result.attributes.set("base_packet_id", i32Attr);
+                }
+            } else if (attrName == "flow_index") {
+                if (parser.parseAttribute(flowIndex, "flow_index", result.attributes)) return failure();
+                if (flowIndex.getType().isSignlessInteger(64)) {
+                    auto i32Attr = IntegerAttr::get(
+                        IntegerType::get(parser.getContext(), 32),
+                        flowIndex.getInt());
+                    result.attributes.set("flow_index", i32Attr);
+                }
+            } else {
+                return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
+            }
+            parser.parseOptionalComma();
+            continue;
         }
 
-        StringRef attrName;
-        if (parser.parseKeyword(&attrName) || parser.parseEqual())
+        // No keyword found — must be closing brace
+        if (parser.parseRBrace())
             return failure();
-        
-        if (attrName == "type") {
-            if (parser.parseAttribute(type, "type", result.attributes)) return failure();
-        } else if (attrName == "from") {
-            if (parser.parseAttribute(from, "from", result.attributes)) return failure();
-        } else if (attrName == "to") {
-            if (parser.parseAttribute(to, "to", result.attributes)) return failure();
-        } else if (attrName == "ordering") {
-            if (parser.parseAttribute(ordering, "ordering", result.attributes)) return failure();
-        } else if (attrName == "base_packet_id") {
-            if (parser.parseAttribute(basePacketId, "base_packet_id", result.attributes)) return failure();
-        } else if (attrName == "flow_index") {
-            if (parser.parseAttribute(flowIndex, "flow_index", result.attributes)) return failure();
-        } else {
-             return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
-        }
-        
-        parser.parseOptionalComma();
+        break;
     }
-    
+
     parser.parseOptionalAttrDict(result.attributes);
-    
+
     return success();
 }
 
@@ -511,57 +541,45 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
     // Bind Shim TX
     llvm::SmallVector<int64_t, 1> shimTxCh = {0};
     auto shimTxDMA = dfscheblueprint::DMAAttr::get(ctx, shimTxCh, dfscheblueprint::bp_direction::MM2S);
-    builder.create<dfscheblueprint::FlowConfigOp>(
-        location,
-        builder.getStringAttr("flow_shim_tx"),
-        mlir::SymbolRefAttr::get(ctx, "shim_gateway"),
-        viewSplit,
-        builder.getStringAttr("root"),
-        shimTxDMA,
-        nullptr, // slice_symbols
-        builder.getStringAttr("shim") // type
+    builder.create<dfscheblueprint::FlowConfigOp>(location, builder.getStringAttr("flow_shim_tx"),
+                                                  mlir::SymbolRefAttr::get(ctx, "shim_gateway"), viewSplit,
+                                                  builder.getStringAttr("root"), shimTxDMA,
+                                                  nullptr,                       // slice_symbols
+                                                  builder.getStringAttr("shim"), // type
+                                                  nullptr                        // data_id
     );
 
     // Bind Cores Input (S2MM - Receive)
     llvm::SmallVector<int64_t, 1> coresInCh = {0};
     auto coresInDMA = dfscheblueprint::DMAAttr::get(ctx, coresInCh, dfscheblueprint::bp_direction::S2MM);
-    builder.create<dfscheblueprint::FlowConfigOp>(
-        location,
-        builder.getStringAttr("flow_cores_in"),
-        mlir::SymbolRefAttr::get(ctx, "compute_row"),
-        viewSplit,
-        builder.getStringAttr("linear"),
-        coresInDMA,
-        nullptr, // slice_symbols
-        builder.getStringAttr("core") // type
+    builder.create<dfscheblueprint::FlowConfigOp>(location, builder.getStringAttr("flow_cores_in"),
+                                                  mlir::SymbolRefAttr::get(ctx, "compute_row"), viewSplit,
+                                                  builder.getStringAttr("linear"), coresInDMA,
+                                                  nullptr,                       // slice_symbols
+                                                  builder.getStringAttr("core"), // type
+                                                  nullptr                        // data_id
     );
 
     // Bind Cores Output (MM2S - Send)
     llvm::SmallVector<int64_t, 1> coresOutCh = {1};
     auto coresOutDMA = dfscheblueprint::DMAAttr::get(ctx, coresOutCh, dfscheblueprint::bp_direction::MM2S);
-    builder.create<dfscheblueprint::FlowConfigOp>(
-        location,
-        builder.getStringAttr("flow_cores_out"),
-        mlir::SymbolRefAttr::get(ctx, "compute_row"),
-        viewSplit,
-        builder.getStringAttr("linear"),
-        coresOutDMA,
-        builder.getArrayAttr(outSliceSymbols), // slice_symbols
-        builder.getStringAttr("core") // type
+    builder.create<dfscheblueprint::FlowConfigOp>(location, builder.getStringAttr("flow_cores_out"),
+                                                  mlir::SymbolRefAttr::get(ctx, "compute_row"), viewSplit,
+                                                  builder.getStringAttr("linear"), coresOutDMA,
+                                                  builder.getArrayAttr(outSliceSymbols), // slice_symbols
+                                                  builder.getStringAttr("core"),         // type
+                                                  nullptr                                // data_id
     );
 
     // Bind Shim RX
     llvm::SmallVector<int64_t, 1> shimRxCh = {0};
     auto shimRxDMA = dfscheblueprint::DMAAttr::get(ctx, shimRxCh, dfscheblueprint::bp_direction::S2MM);
-    builder.create<dfscheblueprint::FlowConfigOp>(
-        location,
-        builder.getStringAttr("flow_shim_rx"),
-        mlir::SymbolRefAttr::get(ctx, "shim_gateway"),
-        viewSplit,
-        builder.getStringAttr("root"),
-        shimRxDMA,
-        nullptr, // slice_symbols
-        builder.getStringAttr("shim") // type
+    builder.create<dfscheblueprint::FlowConfigOp>(location, builder.getStringAttr("flow_shim_rx"),
+                                                  mlir::SymbolRefAttr::get(ctx, "shim_gateway"), viewSplit,
+                                                  builder.getStringAttr("root"), shimRxDMA,
+                                                  nullptr,                       // slice_symbols
+                                                  builder.getStringAttr("shim"), // type
+                                                  nullptr                        // data_id
     );
 
     // ============================================================

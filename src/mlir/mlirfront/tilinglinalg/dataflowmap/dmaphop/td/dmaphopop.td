@@ -245,7 +245,8 @@ def dmaphop_port : dmaphopop<"port",[Symbol]> {
     dmaphoptiletype:$tile,
     StrAttr:$direction,
     SymbolNameAttr:$sym_name,
-    OptionalAttr<I64Attr>:$direction_channel
+    OptionalAttr<I64Attr>:$direction_channel,
+    OptionalAttr<I32Attr>:$dmapktid
   );
   let results = (outs dmaphopporttype:$port);
   let hasCustomAssemblyFormat = 1;
@@ -282,13 +283,13 @@ def dmaphop_create_path : dmaphopop<"create_path"> {
 
   let arguments = (ins
     Variadic<dmaphophoptype>:$hops,
-    ArrayAttr:$producers,    // Array of symbol refs to output ports (DMA send: S2MM)
-    ArrayAttr:$consumers,    // Array of symbol refs to input ports (DMA receive: MM2S)
-    ArrayAttr:$tee_points    // Array of symbol refs to ports where data splitting occurs
+    ArrayAttr:$producers,              // Array of symbol refs to output ports (DMA send: S2MM)
+    ArrayAttr:$consumers,              // Array of symbol refs to input ports (DMA receive: MM2S)
+    ArrayAttr:$tee_points              // Array of symbol refs to ports where data splitting occurs
   );
-  
+
   let results = (outs dmaphoppathtype:$path);
-  
+
   let assemblyFormat = [{
     `[` $hops `]` `{`
       `producers` `=` `[` $producers `]` `,`

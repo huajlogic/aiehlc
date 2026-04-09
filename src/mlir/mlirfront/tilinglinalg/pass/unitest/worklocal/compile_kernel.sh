@@ -46,4 +46,14 @@ fi
 rm -f "${BUILD_DIR}"/chesswork/kernel* "${BUILD_DIR}"/kernel* 2>/dev/null || true
 
 echo "Kernel func name: ${KERNEL_FUNC_NAME}"
-source ${AIEHLC_DIR}/script/kc.sh --kernel-cc ./kernel.cc --func-name "${KERNEL_FUNC_NAME}" --aie-version 5 --platform baremetal --debug-output --output-dir $BUILD_DIR --prx aie2ps.prx
+
+# Use generated BCF/PRX if available (from tilinglinalg pipeline), fall back to stock
+if [ -f "${KERNEL_SCRIPT_DIR}/aieml.prx" ]; then
+    PRX_FILE="${KERNEL_SCRIPT_DIR}/aieml.prx"
+    echo "Using generated PRX: ${PRX_FILE}"
+else
+    PRX_FILE="aie2ps.prx"
+    echo "Using stock PRX: ${PRX_FILE}"
+fi
+
+source ${AIEHLC_DIR}/script/kc.sh --kernel-cc ./kernel.cc --func-name "${KERNEL_FUNC_NAME}" --aie-version 5 --platform baremetal --debug-output --output-dir $BUILD_DIR --prx "${PRX_FILE}"

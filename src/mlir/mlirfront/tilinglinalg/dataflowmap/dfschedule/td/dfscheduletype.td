@@ -1,3 +1,7 @@
+/******************************************************************************
+* Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
 #ifndef _TYPE_dfschedule_
 #define _TYPE_dfschedule_
 include "dfscheduleattr.td"

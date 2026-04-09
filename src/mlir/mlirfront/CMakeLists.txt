@@ -66,7 +66,8 @@ foreach(dir IN LISTS MLIR_INCLUDE_DIRS)
   list(APPEND MLIR_INC_ARGS --mlir-include "${dir}")
 endforeach()
 
-set(CMAKE_BUILD_TYPE Debug)
+# Use parent CMAKE_BUILD_TYPE (Release) — Debug adds ~35MB to binary
+# set(CMAKE_BUILD_TYPE Debug)
 
 #include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../Parser
 #	                  ./mlirpass/)
@@ -113,6 +114,34 @@ list(APPEND SOURCE_LIB_FILES ./mlirpass/aiehybrid.cc)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/tilinglinalg.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/tilingpass.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/routing/routingmanager.cpp)
+# tilinglinalg pass pipeline sources (dialect managers)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/routinghw/routinghwmanager.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dmap/dmapmanager.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dmaphop/dmaphopmanager.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dfschedule/dfschedulemanager.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dfscheblueprint/dfscheblueprintmanager.cpp)
+# tilinglinalg pass pipeline sources (lowering passes)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routinghwlower.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routinglower.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingunrolling.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingdeadargclean.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingconstantfold.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passroutingtodmap/routingtodmap.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdmaptodmaphop/dmaptodmaphop.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passblueprinttoschedule/passblueprinttoschedule.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passblueprinttoschedulekernel/passblueprinttoschedulekernel.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passschedulecanonicalize/passschedulecanonicalize.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdfscheduletoapi/passdfscheduletoapi.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdfscheduletokernelapi/passdfscheduletokernelapi.cpp)
+# tilinglinalg routing implementation
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingimplement/routing/routingpath.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingimplement/hw/hwresource.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingimplement/hw/ResourceManager.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingimplement/routing/routingtopology.cpp)
+# tilinglinalg pipeline wrapper
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/tilinglinalg_pipeline.cpp)
 
 
 add_executable(mlirtest ${SOURCE_FILES})
@@ -149,12 +178,48 @@ include_directories(./tilinglinalg/routing/)
 include_directories(./tilinglinalg/routinghw/inc)
 #for the routinehw dialect cpp
 include_directories(./tilinglinalg/routinghw/)
+#for common.h used by tilinglinalg pass headers
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../)
 #for the routing lower pass
 include_directories(./tilinglinalg/pass/)
+# tilinglinalg pass include directories
+include_directories(./tilinglinalg/pass/routingimplement/include/)
+include_directories(./tilinglinalg/pass/passroutingtodmap/)
+include_directories(./tilinglinalg/pass/passblueprinttoschedule/)
+include_directories(./tilinglinalg/pass/passblueprinttoschedulekernel/)
+include_directories(./tilinglinalg/pass/passdmaphoptodfscheblueprint/)
+include_directories(./tilinglinalg/pass/passdmaphoptoroutinghw/)
+include_directories(./tilinglinalg/pass/passdmaptodmaphop/)
+include_directories(./tilinglinalg/pass/passschedulecanonicalize/)
+include_directories(./tilinglinalg/pass/passdfscheduletoapi/)
+include_directories(./tilinglinalg/pass/passdfscheduletokernelapi/)
+include_directories(./tilinglinalg/pass/kernelconfig/)
+# tilinglinalg dataflowmap dialect includes
+include_directories(./tilinglinalg/dataflowmap/dmap/inc/)
+include_directories(./tilinglinalg/dataflowmap/dmap/)
+include_directories(./tilinglinalg/dataflowmap/dmaphop/inc/)
+include_directories(./tilinglinalg/dataflowmap/dmaphop/)
+include_directories(./tilinglinalg/dataflowmap/dfschedule/inc/)
+include_directories(./tilinglinalg/dataflowmap/dfschedule/)
+include_directories(./tilinglinalg/dataflowmap/dfscheblueprint/inc/)
+include_directories(./tilinglinalg/dataflowmap/dfscheblueprint/)
 
 add_dependencies(mlirtestlib aiedialectteablegen)
 add_dependencies(mlirtestlib aielinkerdialectgen)
 add_dependencies(mlirtestlib routingtablegen)
+
+# tablegen for additional tilinglinalg dialects
+add_custom_target(
+	tilinglinalgdialecttablegen ALL
+  COMMAND ${CMAKE_COMMAND} -E echo "Running tablegen for tilinglinalg dialects..."
+	COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/routinghw/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/dataflowmap/dmap/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/dataflowmap/dmaphop/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/dataflowmap/dfschedule/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/dataflowmap/dfscheblueprint/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMENT "Executing tablegen for tilinglinalg dialects (routinghw, dmap, dmaphop, dfschedule, dfscheblueprint)"
+)
+add_dependencies(mlirtestlib tilinglinalgdialecttablegen)
 
 #add_library(mlirtestlib ${SOURCE_LIB_FILES} ${PARSER_FILES})
 #add_executable(mlirtest ./AieDialect.cc)

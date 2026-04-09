@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 ###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+###############################################################################
+###############################################################################
 # back.sh - Directory bookmark stack (source this file, do not execute it)
 #
 # Usage:

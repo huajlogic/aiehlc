@@ -5,10 +5,23 @@
 ###############################################################################
 # Compile generated host.cc with aie_runtime and Xilinx AIE libs.
 # Uses the same env and link recipe as script/aiehlc.sh (baremetal).
-# Usage: run from worklocal/ or: ./hostcompile.sh [--aie-version 2] [--platform baremetal]
+# Usage: run from worklocal/ or: ./hostcompile.sh [rebuild|-rebuild] [--aie-version 2] [--platform baremetal]
+#   rebuild/-rebuild  - recompile all *.cc files even if .o files already exist (default: skip if .o exists)
 ###############################################################################
 
 set -e
+
+# Parse arguments: accept 'rebuild' or '-rebuild' anywhere to force recompile of *.cc files
+REBUILD=1
+PASSTHROUGH_ARGS=()
+#for arg in "$@"; do
+#    if [[ "$arg" == "rebuild" || "$arg" == "-rebuild" ]]; then
+#        REBUILD=1
+#    else
+#        PASSTHROUGH_ARGS+=("$arg")
+#    fi
+#done
+#set -- "${PASSTHROUGH_ARGS[@]}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Repo root: script in script/ -> one level up; script in worklocal/ -> 7 levels up
@@ -49,14 +62,14 @@ if [ -f "${WORKLOCAL_DIR}/routing.cc" ]; then
     echo "Found routing.cc – will compile and link into host app."
 fi
 
-# pushd to the script directory
-pushd "${SCRIPT_DIR}"
 # Source env (XILINX_VITIS, etc.) same as aiehlc.sh
 # Export PATH_SET_ONLY so setup.sh's first test does not see unset (avoids "integer expression expected")
 if [ -f "${AIEHLC_ROOT}/script/setup.sh" ]; then
     export PATH_SET_ONLY="${PATH_SET_ONLY:-1}"
     source "${AIEHLC_ROOT}/script/setup.sh" --path-set-only
 fi
+# Restore AIEHLC_DIR after setup.sh (setup.sh overwrites it relative to script/)
+AIEHLC_DIR="${AIEHLC_ROOT}"
 
 if [ -z "${XILINX_VITIS}" ]; then
     echo "Warning: XILINX_VITIS not set. Link may fail (undefined XAie_*)."
@@ -78,17 +91,26 @@ else
 fi
 
 XILINX_VITIS_AIETOOLS="${XILINX_VITIS}/aietools"
-LOCAL_ALIB_INCLUDE="${AIEHLC_DIR}/thirdparty/alib/include"
+LOCAL_ALIB_INCLUDE="${AIEHLC_ROOT}/thirdparty/alib/include"
 if [ -d "${LOCAL_ALIB_INCLUDE}/xaiengine" ] && [ "$(ls -A ${LOCAL_ALIB_INCLUDE}/xaiengine 2>/dev/null)" ]; then
     AIETOOLS_INCLUDE_BASE="${LOCAL_ALIB_INCLUDE}"
 else
     AIETOOLS_INCLUDE_BASE="${XILINX_VITIS_AIETOOLS}/include/drivers/aiengine"
 fi
 
-ARCH_DIR="${AIEHLC_DIR}/thirdparty/arch"
-ARCH_72_DIR="${ARCH_DIR}/psv_cortexa72_0/workspace/platform_baremetal/psv_cortexa72_0/standalone_psv_cortexa72_0/bsp"
-ARCH_78_DIR="${ARCH_DIR}/cortexa78_0/workspace/platform_baremetal/cortexa78_0/standalone_cortexa78_0/bsp"
-AIE_DRIVER_PARENT_DIR="${AIEHLC_DIR}/thirdparty/alib"
+ARCH_DIR="${AIEHLC_ROOT}/thirdparty/arch"
+# Support both nested workspace layout and flat bsp layout
+if [ -d "${ARCH_DIR}/psv_cortexa72_0/workspace/platform_baremetal/psv_cortexa72_0/standalone_psv_cortexa72_0/bsp" ]; then
+    ARCH_72_DIR="${ARCH_DIR}/psv_cortexa72_0/workspace/platform_baremetal/psv_cortexa72_0/standalone_psv_cortexa72_0/bsp"
+else
+    ARCH_72_DIR="${ARCH_DIR}/psv_cortexa72_0/bsp"
+fi
+if [ -d "${ARCH_DIR}/cortexa78_0/workspace/platform_baremetal/cortexa78_0/standalone_cortexa78_0/bsp" ]; then
+    ARCH_78_DIR="${ARCH_DIR}/cortexa78_0/workspace/platform_baremetal/cortexa78_0/standalone_cortexa78_0/bsp"
+else
+    ARCH_78_DIR="${ARCH_DIR}/cortexa78_0/bsp"
+fi
+AIE_DRIVER_PARENT_DIR="${AIEHLC_ROOT}/thirdparty/alib"
 ALIB_LIB_DIR="${AIEHLC_ROOT}/thirdparty/alib/lib"
 USE_LOCAL_AIERT_BSP=0
 if [ -d "${AIE_DRIVER_PARENT_DIR}/aie-rt/driver/" ]; then
@@ -136,14 +158,17 @@ fi
 
 # AIENGINE_LIB_DIR: Vitis BSP build output for aienginev2 (same as aiehlc.sh)
 AIENGINE_LIB_DIR="${ARCH_APU_ALIB}/../libsrc/build_configs/gen_bsp/libsrc/aienginev2/src"
-if [ "$USE_LOCAL_AIERT_BSP" -eq 0 ]; then
-    BAREMETAL_AIENGINE_LIB="aienginev2"
-else
+if [ "$USE_LOCAL_AIERT_BSP" -eq 1 ]; then
     BAREMETAL_AIENGINE_LIB="${AIELIB_APU_NAME:3:-2}"
+elif [ -f "${ALIB_LIB_DIR}/${AIELIB_APU_NAME}" ]; then
+    # aienginev2 not built, but the pre-built AIE engine lib exists in alib/lib
+    BAREMETAL_AIENGINE_LIB="${AIELIB_APU_NAME:3:-2}"
+else
+    BAREMETAL_AIENGINE_LIB="aienginev2"
 fi
 
 # Include options: aiehlc host + aie_runtime.h; add xaiengine path when present (xaiengine.h, xaiengine/*.h)
-INCLUDE_OPTS="-I${AIEHLC_ROOT}/include -I${AIETOOLS_INCLUDE_BASE} -I${AIE_DRIVER_PARENT_DIR}/include -I${ARCH_APU_AINC} -I${SECONDARY_ARCH_APU_AINC}"
+INCLUDE_OPTS="-I${AIEHLC_ROOT}/src/mlir/runtime -I${AIEHLC_ROOT}/include -I${AIETOOLS_INCLUDE_BASE} -I${AIE_DRIVER_PARENT_DIR}/include -I${ARCH_APU_AINC} -I${SECONDARY_ARCH_APU_AINC}"
 if [ -d "${XAIE_INCLUDE}" ]; then
     INCLUDE_OPTS="${INCLUDE_OPTS} -I${XAIE_INCLUDE}"
 fi
@@ -170,40 +195,86 @@ echo ""
 
 # Fix generated host.cc for C++: forward decl, int main(), return 0 in main, __global__
 HOST_FIXED="${BUILD_DIR}/host_fixed.cc"
-sed -e '/#include "aie_runtime.h"/a\
+if grep -q 'int main()' "${WORKLOCAL_DIR}/host.cc"; then
+    # User source already provides int main() — only add __global__ define
+    sed -e '/#include "aie_runtime.h"/a\
+#define __global__
+' \
+        "${WORKLOCAL_DIR}/host.cc" > "${HOST_FIXED}"
+else
+    # MLIR-only output: apply all fixups (void main → int main, return 0, forward decl)
+    sed -e '/#include "aie_runtime.h"/a\
 void host_canonicalized();\
 #define __global__
 ' \
-    -e 's/void main()/int main()/' \
-    -e '0,/^  return;$/s/^  return;$/  return 0;/' \
-    "${WORKLOCAL_DIR}/host.cc" > "${HOST_FIXED}"
+        -e 's/void main()/int main()/' \
+        -e '0,/^  return;$/s/^  return;$/  return 0;/' \
+        "${WORKLOCAL_DIR}/host.cc" > "${HOST_FIXED}"
+fi
 HOST_SRC="${HOST_FIXED}"
 
 # Compile host
-set -x
-echo "Compiling host..."
-${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${HOST_SRC}" -o host.o
-if [ $? -ne 0 ]; then
-    echo "Error: failed to compile host.cc"
-    exit 1
+if [ "${REBUILD}" -eq 1 ] || [ ! -f host.o ]; then
+    set -x
+    echo "Compiling host..."
+    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${HOST_SRC}" -o host.o
+    if [ $? -ne 0 ]; then
+        echo "Error: failed to compile host.cc"
+        exit 1
+    fi
+    set +x
+else
+    echo "Skipping host.cc (host.o exists; pass 'rebuild' or '-rebuild' to force)"
 fi
-set +x
+
 # Compile aie_runtime.c
-echo "Compiling aie_runtime.c..."
-${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime.c" -o aie_runtime.o
-if [ $? -ne 0 ]; then
-    echo "Error: failed to compile aie_runtime.c"
-    exit 1
+if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime.o ]; then
+    echo "Compiling aie_runtime.c..."
+    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime.c" -o aie_runtime.o
+    if [ $? -ne 0 ]; then
+        echo "Error: failed to compile aie_runtime.c"
+        exit 1
+    fi
+else
+    echo "Skipping aie_runtime.c (aie_runtime.o exists; pass 'rebuild' or '-rebuild' to force)"
+fi
+
+# Compile aie_runtime_debug.c
+if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_debug.o ]; then
+    echo "Compiling aie_runtime_debug.c..."
+    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_debug.c" -o aie_runtime_debug.o
+    if [ $? -ne 0 ]; then
+        echo "Error: failed to compile aie_runtime_debug.c"
+        exit 1
+    fi
+else
+    echo "Skipping aie_runtime_debug.c (aie_runtime_debug.o exists; pass 'rebuild' or '-rebuild' to force)"
+fi
+
+# Compile aie_runtime_stream_debug.c
+if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_stream_debug.o ]; then
+    echo "Compiling aie_runtime_stream_debug.c..."
+    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_stream_debug.c" -o aie_runtime_stream_debug.o
+    if [ $? -ne 0 ]; then
+        echo "Error: failed to compile aie_runtime_stream_debug.c"
+        exit 1
+    fi
+else
+    echo "Skipping aie_runtime_stream_debug.c (aie_runtime_stream_debug.o exists; pass 'rebuild' or '-rebuild' to force)"
 fi
 
 # Compile routing.cc (if present)
 ROUTING_OBJ=""
 if [ "${HAS_ROUTING}" -eq 1 ]; then
-    echo "Compiling routing.cc..."
-    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${WORKLOCAL_DIR}/routing.cc" -o routing.o
-    if [ $? -ne 0 ]; then
-        echo "Error: failed to compile routing.cc"
-        exit 1
+    if [ "${REBUILD}" -eq 1 ] || [ ! -f routing.o ]; then
+        echo "Compiling routing.cc..."
+        ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${WORKLOCAL_DIR}/routing.cc" -o routing.o
+        if [ $? -ne 0 ]; then
+            echo "Error: failed to compile routing.cc"
+            exit 1
+        fi
+    else
+        echo "Skipping routing.cc (routing.o exists; pass 'rebuild' or '-rebuild' to force)"
     fi
     ROUTING_OBJ="routing.o"
 fi
@@ -212,7 +283,7 @@ set -x
 # --specs=nosys.specs provides stubs for _exit, _close, _fstat, etc. (baremetal/newlib)
 # -Wl,--defsym,end=__bss_end__ defines 'end' for newlib _sbrk (lscript.ld defines __bss_end__)
 echo "Linking host (with embedded kernel binary)..."
-${TOOL_PREFIX}g++ -Os -o host host.o aie_runtime.o ${ROUTING_OBJ} "${KERNEL_OBJ}" \
+${TOOL_PREFIX}g++ -Os -o host host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o ${ROUTING_OBJ} "${KERNEL_OBJ}" \
     --specs=nosys.specs \
     -Wl,--defsym,end=__bss_end__ \
     -Wl,-T -Wl,${ARCH_APU_LD} \
@@ -231,5 +302,3 @@ echo "============================================"
 echo "Host built successfully: ${BUILD_DIR}/host"
 echo "============================================"
 ls -l host
-# popd to the original directory
-popd

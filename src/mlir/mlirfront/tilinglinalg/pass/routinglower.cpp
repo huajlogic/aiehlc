@@ -39,10 +39,12 @@ std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
     for(auto x: dsttiles) {
         pktmergetile.push_back(x.first);
     }
-    std::optional<TypeBasedTileLoc> dstcoreloc(TypeBasedTileLoc{TileType::Core, pktmergetile[0]});
+    // Reuse the output flow's shim tile for the gather path instead of allocating
+    // a new shim channel. The gather path routes packet-switched data from core
+    // tiles back to the same shim tile used by the output flow.
     std::ostringstream ostr;
     ostr << "dio" << ioIdx++;
-    auto diogather = router_.createDataIO(ostr.str(), dstcoreloc, DMADIRECTION::MM2S);
+    auto diogather = router_.createDataIOAtPoint(ostr.str(), shimpoint, DMADIRECTION::MM2S, dio->channel());
     int diogetherid = diogather->id();
     auto rpath2 = router_.createPath(diogetherid, pktmergetile);
     if (!rpath2) {
@@ -215,15 +217,22 @@ std::optional<TileListRoutingMap> GetSeqPath(
                 if (!router_.occupyLink(currentPoint, nextPoint, dioid, portNum, masterDirOnCurrent, slaveDirOnNext)) {
                     llvm::report_fatal_error("Failed to occupy link in routing topology.");
                 }
-                
-                connectionData[currentPoint].MasterSendToNextTileDirection = masterDirOnCurrent;
-                connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx = portNum;
+
+                // If this tile already has a master direction (from a
+                // previous branch), store this one as the secondary
+                // master to support fan-out at intermediate tiles.
+                if (connectionData[currentPoint].MasterSendToNextTileDirection != PortDirection::NONE) {
+                    connectionData[currentPoint].MasterSendToNextTileDirection2 = masterDirOnCurrent;
+                    connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx2 = portNum;
+                } else {
+                    connectionData[currentPoint].MasterSendToNextTileDirection = masterDirOnCurrent;
+                    connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx = portNum;
+                }
                 connectionData[nextPoint].SlaveReceiveForwardDirection = slaveDirOnNext;
                 connectionData[nextPoint].SlaveReceiveForwardDirectionPortIdx = portNum;
                 //set next master into None
                 connectionData[nextPoint].MasterSendToNextTileDirection = PortDirection::NONE;
-                
-            } 
+            }
         }
         tree_round++;
     }
@@ -258,7 +267,7 @@ std::optional<TileListRoutingMap> GetSeqPath(
         if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core 
             && StreamType::BROADCAST == streamtype
             && dsttiles.find(p) != dsttiles.end()) {
-            if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::TileDMA, PortDirection::DMA, -1)) {
+            if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::Input, PortDirection::DMA, -1)) {
                 connectionData[p].localDMAForwardDirection = PortDirection::DMA;
                 connectionData[p].localDMAForwardPortIdx = *portnumptr;
             }
@@ -351,7 +360,14 @@ void ParseTheCCTRoutingPath(Operation* op,
             if (dio->type() == IOType::Input) {
                 rewriter.create<EnableExtToAieShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
             } else {
-                rewriter.create<EnableAieToExtShimPort>(loc, outputType, shimio.getResult(), inputDirStr, inputPortIdx);
+                // For output (AIE→ext), use the demux port number from the DataIO's
+                // shim port info, not the NORTH slave port index.
+                int demuxPortNum = inputPortIdx; // fallback
+                if (auto shimPortInfo = dio->getshimport()) {
+                    demuxPortNum = shimPortInfo->portnum_;
+                }
+                rewriter.create<EnableAieToExtShimPort>(loc, outputType, shimio.getResult(),
+                                                        PortDirectiontoString(PortDirection::South), demuxPortNum);
             }
         }
        // /*
@@ -366,6 +382,13 @@ void ParseTheCCTRoutingPath(Operation* op,
                     inputDirStr, inputPortIdx,
                     PortDirectiontoString(conn.MasterSendToNextTileDirection), conn.MasterSendToNextTileDirectionPortIdx);
             }
+        }
+
+        // Create connection for secondary master (fan-out)
+        if (conn.MasterSendToNextTileDirection2 != PortDirection::NONE) {
+            rewriter.create<ConnectStreamSingleSwitchPort>(
+                loc, outputType, currentTileOp.getResult(), inputDirStr, inputPortIdx,
+                PortDirectiontoString(conn.MasterSendToNextTileDirection2), conn.MasterSendToNextTileDirectionPortIdx2);
         }
 
         // Create connection to the local DMA
@@ -383,8 +406,8 @@ void ParseTheRoutingPath(Operation* op,
                              uint32_t dioid,
                              Point shimpoint,
                              std::shared_ptr<DataIO>  dio,
-                             TileArrayHandleCreate tilecreatehandle, 
-                             std::optional<std::shared_ptr<const RoutingPath>> rpath, 
+                             TileArrayHandleCreate tilecreatehandle,
+                             std::optional<std::shared_ptr<const RoutingPath>> rpath,
                              std::unordered_map<Point, Operation*, Point::Hash> dsttiles,
                              RoutingTopology & router_,
                              ConversionPatternRewriter& rewriter) {
@@ -393,7 +416,7 @@ void ParseTheRoutingPath(Operation* op,
             std::vector<int> ret(2,0);
             if (auto rowAttr = creatileop.getRowAttr()) {
                 ret[0] = rowAttr.getInt();
-            } 
+            }
             if (auto colAttr = creatileop.getColAttr()) {
                 ret[1] = colAttr.getInt();
             }
@@ -413,21 +436,22 @@ void ParseTheRoutingPath(Operation* op,
                 for (auto p : tree.branches[i]) {
                     std::cout << "(" << p.r << "," << p.c << ") ";
                     if (dsttiles.count(p) == 0 && pathtiles.count(p) == 0) {
-                        auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, p.r, p.c, "tile reserved in path");
-                        pathtiles[p] = tile1;
+                        auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, p.r, p.c, "tile
+reserved in path"); pathtiles[p] = tile1;
                     }
                 }
 
-                //if this branch is the last branch we need to deal with the last item, then add a dump node as we only process the previous on of current
-                if (i == tree.branches.size() - 1) {
+                //if this branch is the last branch we need to deal with the last item, then add a dump node as we only
+process the previous on of current if (i == tree.branches.size() - 1) {
                     tree.branches[i].push_back(tree.branches[i].back());
                 }
                 int len = tree.branches[i].size();
-                //as the stream switch connect need to find the matched master (previous tile) slave (current tile) port, the current process point
+                //as the stream switch connect need to find the matched master (previous tile) slave (current tile)
+port, the current process point
                 //is the previous point which already did tile occupy, then we can have the master port information
                 for (int j = 0; j < len; j ++) {
-                    auto currentpoint = (prev_optional_point == std::nullopt ? tree.branches[i][j] : *prev_optional_point);
-                    auto nextpoint = tree.branches[i][j];
+                    auto currentpoint = (prev_optional_point == std::nullopt ? tree.branches[i][j] :
+*prev_optional_point); auto nextpoint = tree.branches[i][j];
                     //if prev point is same with nextpoint at branch beginning by pass
                     if (j ==0 && prev_optional_point && *prev_optional_point == nextpoint) continue;
                     mlir::Operation* currenttile, *curtile;
@@ -444,13 +468,12 @@ void ParseTheRoutingPath(Operation* op,
                     if (prev_optional_point) {
                         // when next == current, the next is dumpy point
                         if (currentpoint != nextpoint) {
-                            if (!router_.occupyLink(currentpoint, nextpoint, dioid, portNum, portdirectionPrevSlave, portdirectionCurMaster)) {
-                                llvm::outs() << "link occupy failed " << "\n";
-                                assert(0);
+                            if (!router_.occupyLink(currentpoint, nextpoint, dioid, portNum, portdirectionPrevSlave,
+portdirectionCurMaster)) { llvm::outs() << "link occupy failed " << "\n"; assert(0);
                             }
                             // check if this currentpoint is the start shim port
                             if (shimpoint == currentpoint) {
-                                
+
                             }
                             // storage cur tile infor
                             tileMasterPortMapping[nextpoint]={(int)portdirectionCurMaster, portNum, 0};
@@ -464,18 +487,21 @@ void ParseTheRoutingPath(Operation* op,
                             auto portprevmaster = PortDirectiontoString((PortDirection)prevportinfo[0]);
                             auto portdirectionPrevSlaveStr = PortDirectiontoString(portdirectionPrevSlave);
                             auto portprevidx = prevportinfo[1];
-                            rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output, curop.getResult(),portprevmaster, portprevidx, portdirectionPrevSlaveStr, portNum);
+                            rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output,
+curop.getResult(),portprevmaster, portprevidx, portdirectionPrevSlaveStr, portNum);
                             //add to dma logic
                             //
                             auto rowcol = getrowcol(curop);
                             if (rm->getrsc()->tileType(rowcol[0], rowcol[1]) == TileType::Core) {
-                               if (auto portnumptr = rm->tile(rowcol[0],rowcol[1]).occupyport(IOType::TileDMA, PortDirection::DMA, -1)) {
-                                   rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output, curop.getResult(),portprevmaster, portprevidx, "DMA", *portnumptr);                                
+                               if (auto portnumptr = rm->tile(rowcol[0],rowcol[1]).occupyport(IOType::Input,
+PortDirection::DMA, -1)) { rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output,
+curop.getResult(),portprevmaster, portprevidx, "DMA", *portnumptr);
                                }
                             }
                             //
                         } else {
-                            //no master port finding means this is the inital shim port get the master information from io
+                            //no master port finding means this is the inital shim port get the master information from
+io
                             //io.getmasterportinfo
                             //when input shim io
                             if (dio->dmadir() == DMADIRECTION::MM2S) {
@@ -488,12 +514,13 @@ void ParseTheRoutingPath(Operation* op,
                                 auto shimportdirstr = PortDirectiontoString(shimportdir);
                                 auto portdirectionPrevSlaveStr = PortDirectiontoString(portdirectionPrevSlave);
                                 if (dio->type() == IOType::Input) {
-                                    rewriter.create<EnableExtToAieShimPort>(op->getLoc(), output, curop.getResult(),shimportdirstr, shimportnum);
-                                } else {
-                                    rewriter.create<EnableAieToExtShimPort>(op->getLoc(), output, curop.getResult(), shimportdirstr, shimportnum);
+                                    rewriter.create<EnableExtToAieShimPort>(op->getLoc(), output,
+curop.getResult(),shimportdirstr, shimportnum); } else { rewriter.create<EnableAieToExtShimPort>(op->getLoc(), output,
+curop.getResult(), shimportdirstr, shimportnum);
                                 }
-                                rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output, curop.getResult(),shimportdirstr, shimportnum, portdirectionPrevSlaveStr, portNum);
-                                llvm::outs() << "the logic wrong \n";
+                                rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output,
+curop.getResult(),shimportdirstr, shimportnum, portdirectionPrevSlaveStr, portNum); llvm::outs() << "the logic wrong
+\n";
                             }
                         }
                     } else {
@@ -669,43 +696,43 @@ private:
 /*
 struct routingcreatebroadcastconvert : public ConversionPattern {
     explicit routingcreatebroadcastconvert(MLIRContext * ctx, LLVMTypeConverter &converter, RoutingTopology & router):
-        ConversionPattern(routing::creatbroadcast::getOperationName(),1, ctx), typeconverter(converter), router_(router) {
+        ConversionPattern(routing::creatbroadcast::getOperationName(),1, ctx), typeconverter(converter), router_(router)
+{
 
         }
     void createSwitchStream(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) {
 
     }
 
-    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const override {
-        auto getrowcol =  [] (routinghw::TileCreate& creatileop) -> std::vector<int> {
-            std::vector<int> ret(2,0);
-            if (auto rowAttr = creatileop.getRowAttr()) {
-                ret[0] = rowAttr.getInt();
-            } 
+    LogicalResult matchAndRewrite(Operation* op, ArrayRef<Value> operands, ConversionPatternRewriter& rewriter ) const
+override { auto getrowcol =  [] (routinghw::TileCreate& creatileop) -> std::vector<int> { std::vector<int> ret(2,0); if
+(auto rowAttr = creatileop.getRowAttr()) { ret[0] = rowAttr.getInt();
+            }
             if (auto colAttr = creatileop.getColAttr()) {
                 ret[1] = colAttr.getInt();
             }
             return ret;
         };
-       
+
         auto createioop = operands[0].getDefiningOp<routing::createdataio>();
         auto tilearrayOp = operands[1].getDefiningOp<routing::createtilearrayOp>();
         if (!createioop || !tilearrayOp) return success();
         llvm::outs() << operands[0].getDefiningOp()->getName().getDialectNamespace() << "\n";
         // create dataio
         auto attr = createioop.getIotypeAttrName();
-        
+
         std::ostringstream ostr;
         ostr << "dio" << ioIdx++;
-        
+
         auto dio = router_.createDataIO(ostr.str());
         auto ctx = getContext();
         auto output = rewriter.getI32Type();
-  
+
         int shimcol = dio->colpos();
         int dioid = dio->id();
         Point shimpoint= {0, shimcol};
-        auto routingshimio = rewriter.create<IOShimTileCreate>(op->getLoc(), output, 0, shimcol, dioid, ostr.str(), 0, 0);
+        auto routingshimio = rewriter.create<IOShimTileCreate>(op->getLoc(), output, 0, shimcol, dioid, ostr.str(), 0,
+0);
         //create arraytile
         //auto output = rewriter.getI32Type();
         int cols = 0, rows=0;
@@ -727,7 +754,7 @@ struct routingcreatebroadcastconvert : public ConversionPattern {
                 }
             }
         }
-  
+
         //get the number of tiles
         std::vector<Point> allocatedTiles = router_.ReserveTiles(cols * rows,dio->id());
         //the current tile master port is reserved by previous tile connect occupy operation, as only the current tile
@@ -757,21 +784,22 @@ struct routingcreatebroadcastconvert : public ConversionPattern {
                 for (auto p : tree.branches[i]) {
                     std::cout << "(" << p.r << "," << p.c << ") ";
                     if (dsttiles.count(p) == 0 && pathtiles.count(p) == 0) {
-                        auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, p.r, p.c, "tile reserved in path");
-                        pathtiles[p] = tile1;
+                        auto tile1 = rewriter.create<routinghw::TileCreate>(op->getLoc(), output, p.r, p.c, "tile
+reserved in path"); pathtiles[p] = tile1;
                     }
                 }
 
-                //if this branch is the last branch we need to deal with the last item, then add a dump node as we only process the previous on of current
-                if (i == tree.branches.size() - 1) {
+                //if this branch is the last branch we need to deal with the last item, then add a dump node as we only
+process the previous on of current if (i == tree.branches.size() - 1) {
                     tree.branches[i].push_back(tree.branches[i].back());
                 }
                 int len = tree.branches[i].size();
-                //as the stream switch connect need to find the matched master (previous tile) slave (current tile) port, the current process point
+                //as the stream switch connect need to find the matched master (previous tile) slave (current tile)
+port, the current process point
                 //is the previous point which already did tile occupy, then we can have the master port information
                 for (int j = 0; j < len; j ++) {
-                    auto currentpoint = (prev_optional_point == std::nullopt ? tree.branches[i][j] : *prev_optional_point);
-                    auto nextpoint = tree.branches[i][j];
+                    auto currentpoint = (prev_optional_point == std::nullopt ? tree.branches[i][j] :
+*prev_optional_point); auto nextpoint = tree.branches[i][j];
                     //if prev point is same with nextpoint at branch beginning by pass
                     if (j ==0 && prev_optional_point && *prev_optional_point == nextpoint) continue;
                     mlir::Operation* currenttile, *curtile;
@@ -793,10 +821,11 @@ struct routingcreatebroadcastconvert : public ConversionPattern {
                     if (prev_optional_point) {
                         // when next == current, the next is dumpy point
                         if (currentpoint != nextpoint) {
-                            router_.occupyLink(currentpoint, nextpoint, dioid, portNum, portdirectionPrevSlave, portdirectionCurMaster);
+                            router_.occupyLink(currentpoint, nextpoint, dioid, portNum, portdirectionPrevSlave,
+portdirectionCurMaster);
                             // check if this currentpoint is the start shim port
                             if (shimpoint == currentpoint) {
-                                
+
                             }
                             // storage cur tile infor
                             tileMasterPortMapping[nextpoint]={(int)portdirectionCurMaster, portNum, 0};
@@ -810,18 +839,21 @@ struct routingcreatebroadcastconvert : public ConversionPattern {
                             auto CurMasterPortDirection = PortDirectiontoString((PortDirection)CurMasterPortinfo[0]);
                             auto portdirectionPrevSlaveStr = PortDirectiontoString(portdirectionPrevSlave);
                             auto portCurMasteridx = CurMasterPortinfo[1];
-                            rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output, curop.getResult(),CurMasterPortDirection, portCurMasteridx, portdirectionPrevSlaveStr, portNum);
+                            rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output,
+curop.getResult(),CurMasterPortDirection, portCurMasteridx, portdirectionPrevSlaveStr, portNum);
                             //add to dma logic
                             ///*
                             auto rowcol = getrowcol(curop);
                             if (rm->getrsc()->tileType(rowcol[0], rowcol[1]) == TileType::Core) {
-                               if (auto portnumptr = rm->tile(rowcol[0],rowcol[1]).occupyport(IOType::TileDMA, PortDirection::DMA, -1)) {
-                                   rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output, curop.getResult(),CurMasterPortDirection, portCurMasteridx, "DMA", *portnumptr);                                
+                               if (auto portnumptr = rm->tile(rowcol[0],rowcol[1]).occupyport(IOType::Input,
+PortDirection::DMA, -1)) { rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output,
+curop.getResult(),CurMasterPortDirection, portCurMasteridx, "DMA", *portnumptr);
                                }
                             }
-                            // 
+                            //
                         } else {
-                            //no master port finding means this is the inital shim port get the master information from io
+                            //no master port finding means this is the inital shim port get the master information from
+io
                             //io.getmasterportinfo
                             PortDirection shimportdir = PortDirection::South;
                             int shimportnum = 3;
@@ -832,12 +864,13 @@ struct routingcreatebroadcastconvert : public ConversionPattern {
                             auto shimportdirstr = PortDirectiontoString(shimportdir);
                             auto portdirectionPrevSlaveStr = PortDirectiontoString(portdirectionPrevSlave);
                             if (dio->type() == IOType::Input) {
-                                rewriter.create<EnableExtToAieShimPort>(op->getLoc(), output, curop.getResult(),shimportdirstr, shimportnum);
-                            } else {
-                                rewriter.create<EnableAieToExtShimPort>(op->getLoc(), output, curop.getResult(), shimportdirstr, shimportnum);
+                                rewriter.create<EnableExtToAieShimPort>(op->getLoc(), output,
+curop.getResult(),shimportdirstr, shimportnum); } else { rewriter.create<EnableAieToExtShimPort>(op->getLoc(), output,
+curop.getResult(), shimportdirstr, shimportnum);
                             }
-                            rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output, curop.getResult(),shimportdirstr, shimportnum, portdirectionPrevSlaveStr, portNum);
-                            llvm::outs() << "the logic wrong \n";
+                            rewriter.create<ConnectStreamSingleSwitchPort>(op->getLoc(), output,
+curop.getResult(),shimportdirstr, shimportnum, portdirectionPrevSlaveStr, portNum); llvm::outs() << "the logic wrong
+\n";
                         }
                     } else {
 
@@ -850,16 +883,15 @@ struct routingcreatebroadcastconvert : public ConversionPattern {
             }
         }
         //----------------end create stream switch-------------
-        //rewriter.create<routinghw::ConnecIOToTileArray>(op->getLoc(), output, routingshimio.getResult(),tilecreatehandle.getResult());
-        rewriter.eraseOp(op);
-        return success();
+        //rewriter.create<routinghw::ConnecIOToTileArray>(op->getLoc(), output,
+routingshimio.getResult(),tilecreatehandle.getResult()); rewriter.eraseOp(op); return success();
     }
 private:
     LLVMTypeConverter& typeconverter;
     RoutingTopology & router_;
 };
 */
-//RoutingCreate
+// RoutingCreate
 struct RoutingCreateConvert : public ConversionPattern {
     explicit RoutingCreateConvert(MLIRContext * ctx, LLVMTypeConverter &converter):
         ConversionPattern(routing::RoutingCreate::getOperationName(),1, ctx), typeconverter(converter) {

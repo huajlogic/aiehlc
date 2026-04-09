@@ -67,12 +67,19 @@ void dfschedule::HostBlockOp::print(::mlir::OpAsmPrinter &printer) {
     mlir::StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return mlir::failure();
-    
-    // Parse arguments like (%buf: memref<...>, %loop_count: index)
+
+    // Parse optional arguments like (%buf: memref<...>, %loop_count: index)
     llvm::SmallVector<mlir::OpAsmParser::Argument, 4> args;
-    if (parser.parseArgumentList(args, mlir::OpAsmParser::Delimiter::Paren, true))
-        return mlir::failure();
-    
+    if (succeeded(parser.parseOptionalLParen())) {
+        if (failed(parser.parseOptionalRParen())) {
+            // Non-empty argument list
+            if (parser.parseArgumentList(args, mlir::OpAsmParser::Delimiter::None, true))
+                return mlir::failure();
+            if (parser.parseRParen())
+                return mlir::failure();
+        }
+    }
+
     // Parse optional -> compute return
     if (succeeded(parser.parseOptionalArrow())) {
         // Parse the return type
@@ -80,17 +87,17 @@ void dfschedule::HostBlockOp::print(::mlir::OpAsmPrinter &printer) {
         if (parser.parseType(returnType))
             return mlir::failure();
     }
-    
+
     auto *body = result.addRegion();
     if (parser.parseRegion(*body, args))
         return mlir::failure();
-    
+
     if (body->empty())
         body->emplaceBlock();
-    
+
     // Add result type
     result.addTypes(dfschedule::ComputeType::get(parser.getContext()));
-    
+
     return mlir::success();
 }
 
@@ -118,19 +125,26 @@ void dfschedule::DSKernelComputeOp::print(::mlir::OpAsmPrinter &printer) {
     mlir::StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
         return mlir::failure();
-    
-    // Parse arguments like (%arg0: packet, %computelogic: compute, %loop_count: index)
+
+    // Parse optional arguments like (%arg0: packet, %computelogic: compute, %loop_count: index)
     llvm::SmallVector<mlir::OpAsmParser::Argument, 4> args;
-    if (parser.parseArgumentList(args, mlir::OpAsmParser::Delimiter::Paren, true))
-        return mlir::failure();
-    
+    if (succeeded(parser.parseOptionalLParen())) {
+        if (failed(parser.parseOptionalRParen())) {
+            // Non-empty argument list
+            if (parser.parseArgumentList(args, mlir::OpAsmParser::Delimiter::None, true))
+                return mlir::failure();
+            if (parser.parseRParen())
+                return mlir::failure();
+        }
+    }
+
     auto *body = result.addRegion();
     if (parser.parseRegion(*body, args))
         return mlir::failure();
-    
+
     if (body->empty())
         body->emplaceBlock();
-    
+
     return mlir::success();
 }
 
@@ -288,83 +302,206 @@ void dfschedule::KernelMainOp::print(::mlir::OpAsmPrinter &printer) {
 ::mlir::ParseResult dfschedule::ConfigDmaBdOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
     mlir::OpAsmParser::UnresolvedOperand bufferOperand, tileOperand, bdIdOperand;
     mlir::Type bufferType, tileType, bdIdType;
-    
-    // Parse: (%buffer, %tile, %bd_id)
-    if (parser.parseLParen() ||
-        parser.parseOperand(bufferOperand) ||
-        parser.parseComma() ||
-        parser.parseOperand(tileOperand) ||
-        parser.parseComma() ||
-        parser.parseOperand(bdIdOperand) ||
-        parser.parseRParen())
+
+    // Parse: (%buffer, %tile, %bd_id [, %linked_bd])
+    if (parser.parseLParen() || parser.parseOperand(bufferOperand) || parser.parseComma() ||
+        parser.parseOperand(tileOperand) || parser.parseComma() || parser.parseOperand(bdIdOperand))
         return mlir::failure();
 
-    // Parse attributes (includes offset, len, enable_packet, packet_id, next_bd,
-    // acquire_lock_id, acquire_lock_val, release_lock_id, release_lock_val)
+    // Try parsing optional 4th operand: , %linked_bd
+    mlir::OpAsmParser::UnresolvedOperand linkedBdOperand;
+    bool hasLinkedBd = false;
+    if (succeeded(parser.parseOptionalComma())) {
+        if (parser.parseOperand(linkedBdOperand))
+            return mlir::failure();
+        hasLinkedBd = true;
+    }
+
+    if (parser.parseRParen())
+        return mlir::failure();
+
+    // Parse attributes
     if (parser.parseOptionalAttrDict(result.attributes))
         return mlir::failure();
-    
-    // Parse: : (type($buffer), type($tile), type($bd_id)) -> type($bd_handle)
-    if (parser.parseColon() ||
-        parser.parseLParen() ||
-        parser.parseType(bufferType) ||
-        parser.parseComma() ||
-        parser.parseType(tileType) ||
-        parser.parseComma() ||
-        parser.parseType(bdIdType) ||
-        parser.parseRParen() ||
-        parser.parseArrow())
+
+    // Convert i64 attributes to i32 for I32Attr fields (bare integers default to i64)
+    auto convertToI32 = [&](StringRef attrName) {
+        if (auto attr = result.attributes.getNamed(attrName)) {
+            if (auto intAttr = mlir::dyn_cast<IntegerAttr>(attr->getValue())) {
+                if (intAttr.getType().isSignlessInteger(64)) {
+                    result.attributes.set(attrName, IntegerAttr::get(
+                        IntegerType::get(parser.getContext(), 32),
+                        intAttr.getInt()));
+                }
+            }
+        }
+    };
+    convertToI32("offset");
+    convertToI32("len");
+    convertToI32("packet_id");
+    convertToI32("next_bd");
+    convertToI32("acquire_lock_id");
+    convertToI32("acquire_lock_val");
+    convertToI32("release_lock_id");
+    convertToI32("release_lock_val");
+    convertToI32("data_id");
+
+    // Convert dim_strides and dim_wraps array elements from i64 to i32
+    auto convertArrayToI32 = [&](StringRef attrName) {
+        if (auto attr = result.attributes.getNamed(attrName)) {
+            if (auto arrayAttr = mlir::dyn_cast<ArrayAttr>(attr->getValue())) {
+                SmallVector<Attribute> converted;
+                for (auto elem : arrayAttr) {
+                    if (auto intAttr = mlir::dyn_cast<IntegerAttr>(elem)) {
+                        if (intAttr.getType().isSignlessInteger(64)) {
+                            converted.push_back(
+                                IntegerAttr::get(IntegerType::get(parser.getContext(), 32), intAttr.getInt()));
+                        } else {
+                            converted.push_back(elem);
+                        }
+                    } else {
+                        converted.push_back(elem);
+                    }
+                }
+                result.attributes.set(attrName, ArrayAttr::get(parser.getContext(), converted));
+            }
+        }
+    };
+    convertArrayToI32("dim_strides");
+    convertArrayToI32("dim_wraps");
+
+    // Parse: : (type($buffer), type($tile), type($bd_id) [, type($linked_bd)]) -> type($bd_handle)
+    if (parser.parseColon() || parser.parseLParen() || parser.parseType(bufferType) || parser.parseComma() ||
+        parser.parseType(tileType) || parser.parseComma() || parser.parseType(bdIdType))
         return mlir::failure();
-    
+
+    mlir::Type linkedBdType;
+    if (hasLinkedBd) {
+        if (parser.parseComma() || parser.parseType(linkedBdType))
+            return mlir::failure();
+    }
+
+    if (parser.parseRParen() || parser.parseArrow())
+        return mlir::failure();
+
     mlir::Type bdHandleType;
     if (parser.parseType(bdHandleType))
         return mlir::failure();
 
-    // Resolve operands (3: buffer, tile, bd_id)
+    // Resolve operands (3 required + 1 optional)
     if (parser.resolveOperand(bufferOperand, bufferType, result.operands) ||
         parser.resolveOperand(tileOperand, tileType, result.operands) ||
         parser.resolveOperand(bdIdOperand, bdIdType, result.operands))
         return mlir::failure();
-    
-    // Add result type
+
+    if (hasLinkedBd) {
+        if (parser.resolveOperand(linkedBdOperand, linkedBdType, result.operands))
+            return mlir::failure();
+    }
+
     result.addTypes(bdHandleType);
-    
+
     return mlir::success();
 }
 
 void dfschedule::ConfigDmaBdOp::print(::mlir::OpAsmPrinter &printer) {
     printer << "(";
     printer << getBuffer() << ", " << getTile() << ", " << getBdId();
+    if (getLinkedBd())
+        printer << ", " << getLinkedBd();
     printer << ") {";
 
     printer.increaseIndent();
     printer.printNewline();
-    printer << "offset = " << getOffset() << ",";
+    printer << "offset = " << getOffset() << " : i32,";
     printer.printNewline();
-    printer << "len = " << getLen() << ",";
+    printer << "len = " << getLen() << " : i32,";
     printer.printNewline();
     printer << "enable_packet = " << (getEnablePacket() ? "true" : "false") << ",";
     printer.printNewline();
-    printer << "packet_id = " << getPacketId() << ",";
+    printer << "packet_id = " << getPacketId() << " : i32,";
     printer.printNewline();
-    printer << "next_bd = " << getNextBd() << ",";
+    printer << "next_bd = " << getNextBd() << " : i32,";
     printer.printNewline();
-    printer << "acquire_lock_id = " << static_cast<int32_t>(getAcquireLockId()) << ",";
+    printer << "acquire_lock_id = " << static_cast<int32_t>(getAcquireLockId()) << " : i32,";
     printer.printNewline();
-    printer << "acquire_lock_val = " << static_cast<int32_t>(getAcquireLockVal()) << ",";
+    printer << "acquire_lock_val = " << static_cast<int32_t>(getAcquireLockVal()) << " : i32,";
     printer.printNewline();
-    printer << "release_lock_id = " << static_cast<int32_t>(getReleaseLockId()) << ",";
+    printer << "release_lock_id = " << static_cast<int32_t>(getReleaseLockId()) << " : i32,";
     printer.printNewline();
-    printer << "release_lock_val = " << static_cast<int32_t>(getReleaseLockVal());
+    printer << "release_lock_val = " << static_cast<int32_t>(getReleaseLockVal()) << " : i32,";
+    printer.printNewline();
+    printer << "data_id = " << static_cast<int32_t>(getDataId()) << " : i32";
+    // Print optional multi-dimensional addressing attributes
+    if (auto strides = getDimStrides()) {
+        printer << ",";
+        printer.printNewline();
+        printer << "dim_strides = [";
+        for (size_t i = 0; i < strides->size(); ++i) {
+            if (i > 0)
+                printer << ", ";
+            printer << mlir::cast<IntegerAttr>((*strides)[i]).getInt();
+        }
+        printer << "]";
+    }
+    if (auto wraps = getDimWraps()) {
+        printer << ",";
+        printer.printNewline();
+        printer << "dim_wraps = [";
+        for (size_t i = 0; i < wraps->size(); ++i) {
+            if (i > 0)
+                printer << ", ";
+            printer << mlir::cast<IntegerAttr>((*wraps)[i]).getInt();
+        }
+        printer << "]";
+    }
     printer.decreaseIndent();
     printer.printNewline();
     printer << "} ";
-    
+
     // Print types
     printer << ": (";
     printer << getBuffer().getType() << ", " << getTile().getType() << ", " << getBdId().getType();
+    if (getLinkedBd())
+        printer << ", " << getLinkedBd().getType();
     printer << ") -> ";
     printer << getBdHandle().getType();
+}
+
+// ConfigDmaBdOp::verify - ensure the BD handle result has at least one user
+// and validate multi-dim addressing attributes
+::mlir::LogicalResult dfschedule::ConfigDmaBdOp::verify() {
+    if (getBdHandle().use_empty()) {
+        return emitOpError("bd_handle result has no users; every dma_bd must "
+                           "be consumed by a create_io or other operation");
+    }
+    // Validate multi-dimensional addressing attributes
+    auto strides = getDimStrides();
+    auto wraps = getDimWraps();
+    if (strides && !wraps) {
+        return emitOpError("dim_strides provided without dim_wraps");
+    }
+    if (!strides && wraps) {
+        return emitOpError("dim_wraps provided without dim_strides");
+    }
+    if (strides && wraps) {
+        if (strides->size() != wraps->size()) {
+            return emitOpError("dim_strides and dim_wraps must have the same size, got ")
+                   << strides->size() << " vs " << wraps->size();
+        }
+        if (strides->size() > 4) {
+            return emitOpError("dim_strides/dim_wraps size must be <= 4, got ") << strides->size();
+        }
+    }
+    return ::mlir::success();
+}
+
+LogicalResult dfschedule::ConfigCreateIoOp::verify() {
+    if (getResult().use_empty()) {
+        return emitOpError("io_handle result has no users; every create_io must "
+                           "be consumed by a launch_dma_loop or other operation");
+    }
+    return ::mlir::success();
 }
 
 // ConfigCreateIoOp - Create IO handle for DMA operations
@@ -383,7 +520,17 @@ void dfschedule::ConfigDmaBdOp::print(::mlir::OpAsmPrinter &printer) {
     // Parse attributes: { channel = ..., direction = ..., io_operation = ... }
     if (parser.parseOptionalAttrDict(result.attributes))
         return mlir::failure();
-    
+
+    // Convert i64 to i32 for I32Attr fields
+    if (auto attr = result.attributes.getNamed("channel")) {
+        if (auto intAttr = mlir::dyn_cast<IntegerAttr>(attr->getValue())) {
+            if (intAttr.getType().isSignlessInteger(64)) {
+                result.attributes.set("channel", IntegerAttr::get(
+                    IntegerType::get(parser.getContext(), 32), intAttr.getInt()));
+            }
+        }
+    }
+
     // Parse: : (type($bd_config), type($tile)) -> type($io_handle)
     if (parser.parseColon() ||
         parser.parseLParen() ||
@@ -685,11 +832,14 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
     // %tensor = tensor.empty() : tensor<1024x1024xf32>
     auto tensorType = mlir::RankedTensorType::get({1024, 1024}, builder.getF32Type());
     auto tensor = builder.create<mlir::tensor::EmptyOp>(location, tensorType.getShape(), builder.getF32Type());
-    
-    // %gmem = dfschedule.declaretensor(%tensor) : (tensor<1024x1024xf32>) -> memref<1024xf32>
+
+    // %gmem = unrealized_conversion_cast(%tensor) : tensor<1024x1024xf32> -> memref<1024xf32>
+    // (DeclareTensorOp removed: tensor deprecated in dfschedule dialect)
     auto memrefType = mlir::MemRefType::get({1024}, builder.getF32Type());
-    auto gmem = builder.create<dfschedule::DeclareTensorOp>(location, memrefType, tensor.getResult());
-    
+    auto gmemCast = builder.create<mlir::UnrealizedConversionCastOp>(location, mlir::TypeRange{memrefType},
+                                                                     mlir::ValueRange{tensor.getResult()});
+    mlir::Value gmem_val = gmemCast.getOutputs()[0];
+
     // %shim0 = dfschedule.declaretile {col = 3, row = 0} : !dfschedule.tile
     auto tileType = dfschedule::TileType::get(ctx);
     auto shim0 = builder.create<dfschedule::DeclareTileOp>(
@@ -704,7 +854,7 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
     // %bd_config = dfschedule.config.dma_bd(%gmem, %shim0, %bd_id) {...}
     auto bdHandleType = dfschedule::BdHandleType::get(ctx);
     auto bdConfig =
-        builder.create<dfschedule::ConfigDmaBdOp>(location, bdHandleType, gmem.getResult(), shim0.getResult(),
+        builder.create<dfschedule::ConfigDmaBdOp>(location, bdHandleType, gmem_val, shim0.getResult(),
                                                   bdIdForConfig.getBdId(),         // bd_id from GetBdIdOp
                                                   builder.getI32IntegerAttr(0),    // offset
                                                   builder.getI32IntegerAttr(1024), // len
@@ -714,8 +864,10 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
                                                   builder.getI32IntegerAttr(-1),   // acquire_lock_id (no lock)
                                                   builder.getI32IntegerAttr(-1),   // acquire_lock_val
                                                   builder.getI32IntegerAttr(-1),   // release_lock_id (no lock)
-                                                  builder.getI32IntegerAttr(-1)    // release_lock_val
-        );
+                                                  builder.getI32IntegerAttr(-1),   // release_lock_val
+                                                  builder.getI32IntegerAttr(-1),   // data_id
+                                                  Value(),                         // linked_bd
+                                                  /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
 
     // %io_0 = dfschedule.config.create_io(%bd_config, %shim0) {...}
     auto ioHandleType = dfschedule::IoHandleType::get(ctx);
@@ -745,21 +897,17 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
     
     // %kernel_packet_0 = dfschedule.packet @packet0 (%gmem) {dma_channel=0}
     auto packetType = dfschedule::PacketType::get(ctx);
-    auto kernelPacket0 = builder.create<dfschedule::PacketOp>(
-        location, packetType,
-        builder.getStringAttr("packet0"),
-        gmem.getResult(),
-        builder.getI32IntegerAttr(0)  // dma_channel
-    );
-    
+    auto kernelPacket0 =
+        builder.create<dfschedule::PacketOp>(location, packetType, builder.getStringAttr("packet0"), gmem_val,
+                                             builder.getI32IntegerAttr(0) // dma_channel
+        );
+
     // %kernel_packet_1 = dfschedule.packet @packet1 (%gmem) {dma_channel=0}
-    auto kernelPacket1 = builder.create<dfschedule::PacketOp>(
-        location, packetType,
-        builder.getStringAttr("packet1"),
-        gmem.getResult(),
-        builder.getI32IntegerAttr(0)  // dma_channel
-    );
-    
+    auto kernelPacket1 =
+        builder.create<dfschedule::PacketOp>(location, packetType, builder.getStringAttr("packet1"), gmem_val,
+                                             builder.getI32IntegerAttr(0) // dma_channel
+        );
+
     // %kernel_group = dfschedule.config.load_kernel_group(%core0, %core1) {...}
     auto kernelGroupType = dfschedule::KernelGroupType::get(ctx);
     llvm::SmallVector<Value, 2> tiles = {core0.getResult(), core1.getResult()};
@@ -901,11 +1049,14 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     auto loop_count = body->addArgument(builder.getIndexType(), location);
     
     builder.setInsertionPointToStart(body);
-    
-    // %input_tensor = dfschedule.gettensor(%arg0) : (!dfschedule.packet) -> tensor<16x256xf32>
+
+    // %input_tensor = unrealized_conversion_cast(%arg0) : !dfschedule.packet -> tensor<16x256xf32>
+    // (GetTensorOp removed: tensor deprecated in dfschedule dialect)
     auto tensorType = mlir::RankedTensorType::get({16, 256}, builder.getF32Type());
-    auto inputTensor = builder.create<dfschedule::GetTensorOp>(location, tensorType, arg0);
-    
+    auto inputTensorCast =
+        builder.create<mlir::UnrealizedConversionCastOp>(location, mlir::TypeRange{tensorType}, mlir::ValueRange{arg0});
+    mlir::Value inputTensor_val = inputTensorCast.getOutputs()[0];
+
     // %channel = dfschedule.getdmachannel(%arg0) : (!dfschedule.packet) -> !dfschedule.dma_channel
     auto dmaChannelType = dfschedule::DmaChannelType::get(ctx);
     auto channel = builder.create<dfschedule::GetDmaChannelOp>(location, dmaChannelType, arg0);
@@ -916,13 +1067,16 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
         mlir::AffineMap(),
         builder.getStringAttr("LOCAL")
     );
-    
-    // %ping = dfschedule.kernel.memalloc(%input_tensor) : (tensor<16x256xf32>) -> memref<16x256xf32, "LOCAL">
-    auto ping = builder.create<dfschedule::KernelMemAllocOp>(location, localMemrefType, inputTensor.getResult());
-    
-    // %pong = dfschedule.kernel.memalloc(%input_tensor) : (tensor<16x256xf32>) -> memref<16x256xf32, "LOCAL">
-    auto pong = builder.create<dfschedule::KernelMemAllocOp>(location, localMemrefType, inputTensor.getResult());
-    
+
+    // %ping / %pong = unrealized_conversion_cast : tensor -> memref
+    // (KernelMemAllocOp removed: tensor deprecated in dfschedule dialect)
+    auto pingCast = builder.create<mlir::UnrealizedConversionCastOp>(location, mlir::TypeRange{localMemrefType},
+                                                                     mlir::ValueRange{inputTensor_val});
+    mlir::Value ping = pingCast.getOutputs()[0];
+    auto pongCast = builder.create<mlir::UnrealizedConversionCastOp>(location, mlir::TypeRange{localMemrefType},
+                                                                     mlir::ValueRange{inputTensor_val});
+    mlir::Value pong = pongCast.getOutputs()[0];
+
     // ===== DMA Buffer Descriptor Configuration =====
     ///*
     // Configure DMA BD for ping buffer
@@ -962,38 +1116,43 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
     auto l_pong_rel = builder.create<dfschedule::DSKernelLockInitOp>(
         location, lockType, lockId3.getResult(), builder.getI64IntegerAttr(0), builder.getStringAttr("pong_release_lock")
     );
-    
+
+    // %bd_pong = dfschedule.config.dma_bd(%pong, %tile, %bd_id_pong) { ... }
+    // DMA acquires pong_acquire_lock (lockId1) and releases pong_release_lock (lockId3)
+    // Created first so ping BD can reference it via linked_bd
+    auto bdPong =
+        builder.create<dfschedule::ConfigDmaBdOp>(location, bdHandleType, pong, tileArg,
+                                                  pongBdIdOp.getBdId(),                        // bd_id from GetBdIdOp
+                                                  builder.getI32IntegerAttr(0),                // offset
+                                                  builder.getI32IntegerAttr(bufferLen),        // len
+                                                  builder.getBoolAttr(true),                   // enable_packet
+                                                  builder.getI32IntegerAttr(packetIdBase + 1), // packet_id
+                                                  builder.getI32IntegerAttr(0),  // next_bd (chain back to ping)
+                                                  builder.getI32IntegerAttr(1),  // acquire_lock_id (pong acquire)
+                                                  builder.getI32IntegerAttr(1),  // acquire_lock_val
+                                                  builder.getI32IntegerAttr(3),  // release_lock_id (pong release)
+                                                  builder.getI32IntegerAttr(1),  // release_lock_val
+                                                  builder.getI32IntegerAttr(-1), // data_id
+                                                  Value(),                       // linked_bd
+                                                  /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+
     // %bd_ping = dfschedule.config.dma_bd(%ping, %tile, %bd_id_ping) { ... }
     // DMA acquires ping_acquire_lock (lockId0) and releases ping_release_lock (lockId2)
     auto bdPing =
-        builder.create<dfschedule::ConfigDmaBdOp>(location, bdHandleType, ping.getResult(), tileArg,
+        builder.create<dfschedule::ConfigDmaBdOp>(location, bdHandleType, ping, tileArg,
                                                   pingBdIdOp.getBdId(),                    // bd_id from GetBdIdOp
                                                   builder.getI32IntegerAttr(0),            // offset
                                                   builder.getI32IntegerAttr(bufferLen),    // len
                                                   builder.getBoolAttr(true),               // enable_packet
                                                   builder.getI32IntegerAttr(packetIdBase), // packet_id
                                                   builder.getI32IntegerAttr(1),            // next_bd (chain to pong)
-                                                  builder.getI32IntegerAttr(0), // acquire_lock_id (ping acquire)
-                                                  builder.getI32IntegerAttr(1), // acquire_lock_val
-                                                  builder.getI32IntegerAttr(2), // release_lock_id (ping release)
-                                                  builder.getI32IntegerAttr(1)  // release_lock_val
-        );
-
-    // %bd_pong = dfschedule.config.dma_bd(%pong, %tile, %bd_id_pong) { ... }
-    // DMA acquires pong_acquire_lock (lockId1) and releases pong_release_lock (lockId3)
-    auto bdPong =
-        builder.create<dfschedule::ConfigDmaBdOp>(location, bdHandleType, pong.getResult(), tileArg,
-                                                  pongBdIdOp.getBdId(),                        // bd_id from GetBdIdOp
-                                                  builder.getI32IntegerAttr(0),                // offset
-                                                  builder.getI32IntegerAttr(bufferLen),        // len
-                                                  builder.getBoolAttr(true),                   // enable_packet
-                                                  builder.getI32IntegerAttr(packetIdBase + 1), // packet_id
-                                                  builder.getI32IntegerAttr(0), // next_bd (chain back to ping)
-                                                  builder.getI32IntegerAttr(1), // acquire_lock_id (pong acquire)
-                                                  builder.getI32IntegerAttr(1), // acquire_lock_val
-                                                  builder.getI32IntegerAttr(3), // release_lock_id (pong release)
-                                                  builder.getI32IntegerAttr(1)  // release_lock_val
-        );
+                                                  builder.getI32IntegerAttr(0),  // acquire_lock_id (ping acquire)
+                                                  builder.getI32IntegerAttr(1),  // acquire_lock_val
+                                                  builder.getI32IntegerAttr(2),  // release_lock_id (ping release)
+                                                  builder.getI32IntegerAttr(1),  // release_lock_val
+                                                  builder.getI32IntegerAttr(-1), // data_id
+                                                  bdPong.getBdHandle(),          // linked_bd = pong BD
+                                                  /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
     //*/
     // (locks already initialized above)
     
@@ -1003,18 +1162,11 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
         mlir::AffineMap(),
         builder.getStringAttr("SHARED")
     );
-    
-    builder.create<dfschedule::DSKernelLaunchDmaLoopOp>(
-        location,
-        ping.getResult(),
-        pong.getResult(),
-        l_ping_acq.getResult(),
-        l_ping_rel.getResult(),
-        l_pong_acq.getResult(),
-        l_pong_rel.getResult(),
-        channel.getResult()
-    );
-    
+
+    builder.create<dfschedule::DSKernelLaunchDmaLoopOp>(location, ping, pong, l_ping_acq.getResult(),
+                                                        l_ping_rel.getResult(), l_pong_acq.getResult(),
+                                                        l_pong_rel.getResult(), channel.getResult());
+
     // Compute loop with ping-pong pattern
     auto c0 = builder.create<mlir::arith::ConstantIndexOp>(location, 0);
     auto c1 = builder.create<mlir::arith::ConstantIndexOp>(location, 1);
@@ -1039,9 +1191,9 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
         location, localMemrefType, isPing.getResult(), true
     );
     builder.setInsertionPointToStart(&ifBuffer.getThenRegion().front());
-    builder.create<mlir::scf::YieldOp>(location, ping.getResult());
+    builder.create<mlir::scf::YieldOp>(location, ping);
     builder.setInsertionPointToStart(&ifBuffer.getElseRegion().front());
-    builder.create<mlir::scf::YieldOp>(location, pong.getResult());
+    builder.create<mlir::scf::YieldOp>(location, pong);
     builder.setInsertionPointAfter(ifBuffer);
     Value currBuf = ifBuffer.getResult(0);
     

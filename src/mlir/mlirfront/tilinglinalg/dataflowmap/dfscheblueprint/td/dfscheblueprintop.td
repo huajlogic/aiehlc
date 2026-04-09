@@ -198,7 +198,8 @@ def dfscheblueprint_FlowConfigOp : dfscheblueprintop<"flowconfig", [
     StrAttr:$distribution,
     DMAAttr:$dma,
     OptionalAttr<ArrayAttr>:$slice_symbols,
-    OptionalAttr<StrAttr>:$type
+    OptionalAttr<StrAttr>:$type,
+    OptionalAttr<I32Attr>:$data_id
   );
   let hasCustomAssemblyFormat = 1;
 }

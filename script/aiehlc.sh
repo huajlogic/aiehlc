@@ -56,8 +56,8 @@ build_hw_lib() {
                 cp -rf "$header_dir"/*.h "$AIE_DRIVER_PARENT_DIR/include/"
                 cp -rf "$AIE_DRIVER_PARENT_DIR/aie-rt/driver/internal/"* "$AIE_DRIVER_PARENT_DIR/include/"
                 
-            elif [[ "$platform" == "baremetal" ]]; then
-                bash -c "cd $AIE_DRIVER_PARENT_DIR/aie-rt/driver/src; make -f Makefile.Linux"
+            elif [[ "$lplatform" == "baremetal" ]]; then
+                bash -c "cd $AIE_DRIVER_PARENT_DIR/aie-rt/driver/src; CC=\${CC:-gcc} CXX=\${CXX:-g++} make -f Makefile.Linux"
                 ##keep the order, first copy bsp header, then copy the aiert header, then even bsp header have old aiegnine header
                 ##we still get the latest aiert header
                 cp -rf "$header_dir"/*.h "$AIE_DRIVER_PARENT_DIR/include/"
@@ -283,6 +283,53 @@ set +x
 HOST_BUILD_DIR=$(pwd)/aout/
 mkdir -p $HOST_BUILD_DIR
 
+# Check if tiling pipeline generated output in worklocal/
+if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
+    echo -e "\n[TilingLinalg] Detected multi-tile pipeline output in aout/worklocal/"
+    echo "Delegating to hostcompile.sh for tiling mode compilation..."
+
+    # Copy worklocal files to the unitest worklocal dir for hostcompile.sh
+    UNITEST_WORKLOCAL="${AIEHLC_DIR}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal"
+    cp -f "${HOST_BUILD_DIR}/worklocal/host.cc" "${UNITEST_WORKLOCAL}/host.cc"
+    cp -f "${HOST_BUILD_DIR}/worklocal/kernel.cc" "${UNITEST_WORKLOCAL}/kernel.cc"
+    if [ -f "${HOST_BUILD_DIR}/worklocal/routing.cc" ]; then
+        cp -f "${HOST_BUILD_DIR}/worklocal/routing.cc" "${UNITEST_WORKLOCAL}/routing.cc"
+    fi
+    if [ -f "${HOST_BUILD_DIR}/worklocal/aieml.bcf" ]; then
+        cp -f "${HOST_BUILD_DIR}/worklocal/aieml.bcf" "${UNITEST_WORKLOCAL}/aieml.bcf"
+    fi
+    if [ -f "${HOST_BUILD_DIR}/worklocal/aieml.prx" ]; then
+        cp -f "${HOST_BUILD_DIR}/worklocal/aieml.prx" "${UNITEST_WORKLOCAL}/aieml.prx"
+    fi
+    # Copy compute kernel source (any .cc not already copied: host.cc, kernel.cc, routing.cc)
+    for f in "${HOST_BUILD_DIR}"/worklocal/*.cc; do
+        fname="$(basename "$f")"
+        case "$fname" in
+            host.cc|kernel.cc|routing.cc) continue ;;
+        esac
+        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/${fname}"
+    done
+
+    # Run hostcompile.sh
+    export AIE_VERSION="${aie_version}"
+    export PLATFORM="${platform}"
+    bash "${UNITEST_WORKLOCAL}/hostcompile.sh"
+    TILING_RC=$?
+    if [ $TILING_RC -ne 0 ]; then
+        echo "Error: tiling mode compilation failed."
+        return $TILING_RC
+    fi
+
+    # Copy the built ELF to the standard output location
+    TILING_BUILD_DIR="${UNITEST_WORKLOCAL}/build"
+    if [ -f "${TILING_BUILD_DIR}/host" ]; then
+        cp -f "${TILING_BUILD_DIR}/host" "${HOST_BUILD_DIR}/main.elf"
+        echo "Build complete (tiling mode)."
+        echo "    ${HOST_BUILD_DIR}/main.elf"
+    fi
+    return 0
+fi
+
 # compile kernels
 kernel_list_file="$(pwd)/aout/kernel_list"
 final_obj_file="$(pwd)/aout/build/final_kernel.o"
@@ -348,17 +395,19 @@ echo "Compiling host..."
 echo "    $host_file"
 echo "Linking kernels..."
 echo "    ${temp_obj_files[@]}"
+# opt_flags="-O2"
+opt_flags="-Os"
 set -x
 if [[ "$platform" == "baremetal" ]]; then
-    dbg_echo ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
-    ${TOOL_PREFIX}g++ -Os -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
+    dbg_echo ${TOOL_PREFIX}g++ $opt_flags -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
+    ${TOOL_PREFIX}g++ $opt_flags -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
 elif [[ "$platform" == "linux" ]]; then
-    dbg_echo ${TOOL_PREFIX}g++ -Os -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
+    dbg_echo ${TOOL_PREFIX}g++ $opt_flags -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
         -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I${AIE_DRIVER_DIR}/include -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC \
         -L${AIE_DRIVER_DIR}/src -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -L$AIE_DRIVER_PARENT_DIR/aie-rt/driver/src/ \
         -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} \
         -Wl,--start-group,-lxaiengine,-lxil,--end-group
-    ${TOOL_PREFIX}g++ -Os -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
+    ${TOOL_PREFIX}g++ $opt_flags -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
         -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I${AIE_DRIVER_DIR}/include -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC \
         -L${AIE_DRIVER_DIR}/src -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -L$AIE_DRIVER_PARENT_DIR/aie-rt/driver/src/  \
         -o $HOST_BUILD_DIR/main.elf $host_file ${temp_obj_files[@]} \

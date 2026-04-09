@@ -75,6 +75,8 @@ public:
     ModuleOp ops_testNew(MLIRContext *ctx, int totalN = 2, std::string routingname = "");
     mlir::func::FuncOp createroutingfunc(MLIRContext* ctx, int totalN = 16,bool purefunc=false) ;
     void createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx,  bool binput,Value mesh, Value tensor, uint32_t hwsplitnum, std::string splitAxis);
+    void createroutingfuncGEMM(OpBuilder &builder, MLIRContext *ctx, Value mesh, Value tensorA, Value tensorB,
+                               Value tensorC, uint32_t hwsplitnum, std::string splitAxis);
     //void createroutingfuncByDimDmap(OpBuilder& builder, MLIRContext* ctx,  bool binput,Value mesh, Value tensor, uint32_t hwsplitnum, std::string splitAxis);
     static void loaddialect(MLIRContext* ctx);
 };

@@ -1,0 +1,1341 @@
+Using: /scratch/staff/huaj/amdaiehlc/opensource/xilinx/aiehlc/aout/main.elf
+
+============================================================
+Palboard ELF Test Script
+Host: huaj@10.23.224.213
+ELF File: /scratch/staff/huaj/amdaiehlc/opensource/xilinx/aiehlc/aout/main.elf
+============================================================
+>>> Copying ELF file via SCP...
+    Source: /scratch/staff/huaj/amdaiehlc/opensource/xilinx/aiehlc/aout/main.elf
+    Destination: huaj@10.23.224.213:/home/huaj/aiehlc/main.elf
+>>> ELF file copied successfully via SCP
+
+>>> Setting up first connection...
+[Connection 1] Connecting to huaj@10.23.224.213...
+Welcome to Ubuntu 22.04.5 LTS (GNU/Linux 5.15.0-116-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/pro
+
+ System information as of Wed Apr  8 06:43:01 PM PDT 2026
+
+ * Strictly confined Kubernetes makes edge and IoT secure. Learn how MicroK8s
+   just raised the bar for easy, resilient and secure K8s cluster deployment.
+
+   https://ubuntu.com/engage/secure-kubernetes-at-the-edge
+
+Expanded Security Maintenance for Applications is not enabled.
+
+7 updates can be applied immediately.
+To see these additional updates run: apt list --upgradable
+
+7 additional security updates can be applied with ESM Apps.
+Learn more about enabling ESM Apps service at https://ubuntu.com/esm
+
+
+The list of available updates is more than a week old.
+To check for new updates run: sudo apt update
+
+
+The programs included with the Ubuntu system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Ubuntu comes with ABSOLUTELY NO WARRANTY, to the extent permitted by
+applicable law.
+
+
+The programs included with the Ubuntu system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Ubuntu comes with ABSOLUTELY NO WARRANTY, to the extent permitted by
+applicable law.
+
+Last login: Wed Apr  8 17:48:04 2026 from 172.19.2.123
+cat: /etc/sysconfig/Xinventory: No such file or directory
+[4mlocalhost[24m:[1m~[0m> [Connection 1] Connected, starting systest...
+/bin/systest
+------ Systest server v4.5.0 on host localhost started on Apr 8, 2026, 6:43:07 PM ------
+------ Py4J gateway started on port 25333 ------
+Welcome to Systest.
+[cpg-lab-06] Systest# [Connection 1] In systest, becoming palboard...
+become "palmyra"
+fatal: invalid gitfile format: /home/huaj/.git
+fatal: invalid gitfile format: /home/huaj/.git
+ This setup has the following serial port:
+ com0 (PS), com1 (PL), com2 (System Controller) 
+ Board Farm Confluence page: https://amd.atlassian.net/wiki/spaces/XPS/pages/603288465/Boardfarm 
+ You can see the list of commands by typing "help"
+----------------------------------------------------------------------
+Jobs run more than 4 hours can be killed. Limit 1 user per system!
+INFO: boot mode is jtag
+INFO: POR reset asserted
+INFO: POR reset deasserted
+[cpg-lab-06] Systest# [Connection 1] Palboard mode, powering off first...
+power 0
+[cpg-lab-06] Systest# [Connection 1] Power off complete, powering on...
+power 1
+[cpg-lab-06] Systest# [Connection 1] Power on complete, starting xsdb...
+xsdb
+[K
+****** System Debugger (XSDB) v2026.1
+  **** Build date : Mar 17 2026-14:47:05
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2026 Advanced Micro Devices, Inc. All Rights Reserved.
+
+
+[K[Connection 1] xsdb not found, trying alternative path...
+[KI/proj/xbuilds/SWIP/2025.2_1114_2157/installs/lin64/2025.2/Vitis/bin/xsdb[K/proj/xbuilds/SWIP/2025.2_1114_2157/installs/lin64/2025.2/Vitis/bin/xsdb
+[Kxsdb% [Connection 1] In xsdb, connecting...
+[Kxsdb% [Connection 1] Connected, targeting device 1...
+[Kxsdb% conn[Kconn
+[K[Connection 1] Programming Palboard.BIN...
+[Ktar 1[Ktar 1
+[KWARNING: [Common 17-259] Unknown Tcl command '/proj/xbuilds/SWIP/2025.2_1114_2157/installs/lin64/2025.2/Vitis/bin/xsdb' sending command to the OS shell for execution. It is recommended to use 'exec' to send the command to the OS shell.
+[Kdevice program /home/huaj/palboard/BOOT.BIN[Kdevice program /home/huaj/palboard/BOOT.BIN
+[K[Kconn[K[Ktar 1[Kconn
+[Kdevice program /home/huaj/palboard/BOOT.BIN[Ktar 1
+device program /home/huaj/palboard/BOOT.BIN
+[K
+****** System Debugger (XSDB) v2025.2
+  **** Build date : Oct 28 2025-16:09:43
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2025 Advanced Micro Devices, Inc. All Rights Reserved.
+
+
+[Kxsdb% [Connection 1] Device programmed, targeting device 20...
+[Kxsdb% [Kxsdb% attempting to launch hw_server
+[K
+****** Xilinx hw_server v2025.2
+  **** Build date : Oct 28 2025 at 16:07:00
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2025 Advanced Micro Devices, Inc. All Rights Reserved.
+
+INFO: hw_server application started
+INFO: Use Ctrl-C to exit hw_server application
+
+INFO: To connect to this hw_server instance use url: TCP:127.0.0.1:3121
+
+tcfchan#0
+xsdb% [Kxsdb% [Connection 1] Resetting processor...
+[Kxsdb% t
+
+rlwrap: [1;35mwarning: [0mrlwrap appears to do nothing for loader, which asks for
+single keypresses all the time. Don't you need --always-readline
+and possibly --no-children? (cf. the rlwrap manpage)
+
+warnings can be silenced by the --no-warnings (-n) option
+ar 20[Ktar 20
+[K[Krst -proc[Krst -proc
+[K[Connection 1] Setup complete!
+
+>>> Setting up second connection...
+[Connection 2] Connecting to huaj@10.23.224.213...
+[Connection 2] Connected, starting systest...
+[Connection 2] In systest, connecting to com0...
+[Connection 2] Connected to com0, listening for output...
+
+>>> Downloading ELF file...
+[Connection 1] Downloading ELF: /home/huaj/aiehlc/main.elf
+xsdb% initializing  0%    0MB   0.0MB/s  ??:?? ETA[K  0%    0MB   0.0MB/s  ??:?? ETA[Kxsdb% initializing  0%    0MB   0.0MB/s  ??:?? ETA 46%    0MB   1.4MB/s  ??:?? ETA[K 46%    0MB   1.4MB/s  ??:?? ETA[Kxsdb% initializing  0%    0MB   0.0MB/s  ??:?? ETA 46%    0MB   1.4MB/s  ??:?? ETA 71%    1MB   1.1MB/s  ??:?? ETA[K 71%    1MB   1.1MB/s  ??:?? ETA[Kxsdb% initializing  0%    0MB   0.0MB/s  ??:?? ETA 46%    0MB   1.4MB/s  ??:?? ETA 71%    1MB   1.1MB/s  ??:?? ETA100%    1MB   1.1MB/s  00:01    [K100%    1MB   1.1MB/s  00:01    [Kxsdb% initializing  0%    0MB   0.0MB/s  ??:?? ETA 46%    0MB   1.4MB/s  ??:?? ETA 71%    1MB   1.1MB/s  ??:?? ETA100%    1MB   1.1MB/s  00:01    
+xsdb% [Kxsdb% [Kxsdb% dow -force /home/huaj/aiehlc/main.elf[C[C[C[C[C[C[Kdow -force /home/huaj/aiehlc/main.elf
+xsdb% WARNING: If the reset is being triggered after powering on the device,
+          write bootloop at reset vector address (0xffff0000), or use
+          -clear-registers option, to avoid unpredictable behavior.
+          Further warnings will be suppressed
+WARNING: Default system will be activated before triggering reset.
+          Use skip-activate-subsystem to skip this.
+          Further warnings will be suppressed
+[KInfo: Cortex-A78AE #0.0 (target 20) Stopped at 0xffff0000 (Reset Catch)
+xsdb% [Kxsdb% [Kxsdb% Downloading Program -- /home/huaj/aiehlc/main.elf
+	section, .text: 0x00000000 - 0x0004367b
+	section, .init: 0x00043680 - 0x000436b3
+	section, .fini: 0x000436c0 - 0x000436f3
+	section, .rodata: 0x00043700 - 0x0005b73f
+	section, .rodata1: 0x0005b740 - 0x0005b73f
+	section, .sdata2: 0x0005b740 - 0x0005b73f
+	section, .sbss2: 0x0005b740 - 0x0005b73f
+	section, .data: 0x0005b740 - 0x000675c7
+	section, .drvcfg_sec: 0x000675c8 - 0x000675d3
+	section, .data1: 0x000675d4 - 0x000675ff
+	section, .note.gnu.build-id: 0x00067600 - 0x00067623
+	section, .ctors: 0x00067624 - 0x0006763f
+	section, .dtors: 0x00067640 - 0x0006763f
+	section, .eh_frame: 0x00067640 - 0x00068347
+	section, .mmu_tbl0: 0x00069000 - 0x0006903f
+	section, .mmu_tbl1: 0x0006a000 - 0x00071fff
+	section, .mmu_tbl2: 0x00072000 - 0x00075fff
+	section, .preinit_array: 0x00076000 - 0x00075fff
+	section, .init_array: 0x00076000 - 0x0007601f
+	section, .fini_array: 0x00076020 - 0x0007604f
+	section, .sdata: 0x00076050 - 0x0007607f
+	section, .sbss: 0x00076080 - 0x0007607f
+	section, .tdata: 0x00076080 - 0x0007607f
+	section, .tbss: 0x00076080 - 0x0007607f
+	section, .bss: 0x00076080 - 0x00077d7f
+	section, .heap: 0x00077d80 - 0x40077d7f
+	section, .stack: 0x40077d80 - 0x40278d7f
+  0%    0MB   0.0MB/s  ??:?? ETA[K  0%    0MB   0.0MB/s  ??:?? ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA[K 10%    0MB   0.1MB/s  ??:?? ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA[K 16%    0MB   0.1MB/s  ??:?? ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA[K 27%    0MB   0.1MB/s  ??:?? ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA[K 33%    0MB   0.1MB/s  ??:?? ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA[K 40%    0MB   0.1MB/s  00:04 ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA 47%    0MB   0.1MB/s  00:04 ETA[K 47%    0MB   0.1MB/s  00:04 ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA 47%    0MB   0.1MB/s  00:04 ETA 54%    0MB   0.1MB/s  00:03 ETA[K 54%    0MB   0.1MB/s  00:03 ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA 47%    0MB   0.1MB/s  00:04 ETA 54%    0MB   0.1MB/s  00:03 ETA 61%    0MB   0.1MB/s  00:03 ETA[K 61%    0MB   0.1MB/s  00:03 ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA 47%    0MB   0.1MB/s  00:04 ETA 54%    0MB   0.1MB/s  00:03 ETA 61%    0MB   0.1MB/s  00:03 ETA 67%    0MB   0.1MB/s  00:02 ETA[K 67%    0MB   0.1MB/s  00:02 ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA 47%    0MB   0.1MB/s  00:04 ETA 54%    0MB   0.1MB/s  00:03 ETA 61%    0MB   0.1MB/s  00:03 ETA 67%    0MB   0.1MB/s  00:02 ETA 74%    0MB   0.1MB/s  00:02 ETA[K 74%    0MB   0.1MB/s  00:02 ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA 47%    0MB   0.1MB/s  00:04 ETA 54%    0MB   0.1MB/s  00:03 ETA 61%    0MB   0.1MB/s  00:03 ETA 67%    0MB   0.1MB/s  00:02 ETA 74%    0MB   0.1MB/s  00:02 ETA 81%    0MB   0.1MB/s  00:01 ETA[K 81%    0MB   0.1MB/s  00:01 ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA 47%    0MB   0.1MB/s  00:04 ETA 54%    0MB   0.1MB/s  00:03 ETA 61%    0MB   0.1MB/s  00:03 ETA 67%    0MB   0.1MB/s  00:02 ETA 74%    0MB   0.1MB/s  00:02 ETA 81%    0MB   0.1MB/s  00:01 ETA 88%    0MB   0.1MB/s  00:00 ETA[K 88%    0MB   0.1MB/s  00:00 ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA 47%    0MB   0.1MB/s  00:04 ETA 54%    0MB   0.1MB/s  00:03 ETA 61%    0MB   0.1MB/s  00:03 ETA 67%    0MB   0.1MB/s  00:02 ETA 74%    0MB   0.1MB/s  00:02 ETA 81%    0MB   0.1MB/s  00:01 ETA 88%    0MB   0.1MB/s  00:00 ETA 94%    0MB   0.1MB/s  00:00 ETA[K 94%    0MB   0.1MB/s  00:00 ETA[K  0%    0MB   0.0MB/s  ??:?? ETA 10%    0MB   0.1MB/s  ??:?? ETA 16%    0MB   0.1MB/s  ??:?? ETA 27%    0MB   0.1MB/s  ??:?? ETA 33%    0MB   0.1MB/s  ??:?? ETA 40%    0MB   0.1MB/s  00:04 ETA 47%    0MB   0.1MB/s  00:04 ETA 54%    0MB   0.1MB/s  00:03 ETA 61%    0MB   0.1MB/s  00:03 ETA 67%    0MB   0.1MB/s  00:02 ETA 74%    0MB   0.1MB/s  00:02 ETA 81%    0MB   0.1MB/s  00:01 ETA 88%    0MB   0.1MB/s  00:00 ETA 94%    0MB   0.1MB/s  00:00 ETA100%    0MB   0.1MB/s  00:08    
+Setting PC to Program Start Address 0x00000000[KSetting PC to Program Start Address 0x00000000[KSetting PC to Program Start Address 0x00000000
+Successfully downloaded /home/huaj/aiehlc/main.elf
+xsdb% [Connection 1] ELF download complete!
+[Connection 1] Continuing execution...
+[Kxsdb% [Connection 1] Execution started!
+
+>>> Waiting for console output (max 120s, no-output timeout 30s)...
+: Total buffer size = 14336 bytes
+[1720.629]INFO XPm_DumpMemUsage_Pool: Used = 5220 bytes
+[1725.536]INFO XPm_DumpMemUsage_Pool: Free = 9116 bytes
+[1730.442]INFO XPm_DumpMemUsage: DevOps Pool:
+[1734.487]INFO XPm_DumpMemUsage_Pool: Total buffer size = 5120 bytes
+[1740.513]INFO XPm_DumpMemUsage_Pool: Used = 2320 bytes
+[1745.421]INFO XPm_DumpMemUsage_Pool: Free = 2800 bytes
+[1750.328]INFO XPm_DumpMemUsage: Other Pool:
+[1754.287]INFO XPm_DumpMemUsage_Pool: Total buffer size = 8192 bytes
+[1760.313]INFO XPm_DumpMemUsage_Pool: Used = 4144 bytes
+[1765.220]INFO XPm_DumpMemUsage_Pool: Free = 4048 bytes
+[1770.128]XPlmi_VersalAiepG2EAMHandler
+[1862.580]INFO XPmSubsystem_Activate: Subsystem 0x1C000000 is already configured
+[1866.801]INFO XPmSubsystem_Activate: End Subsystem Configure Status: 0x0
+[1873.257]INFO XPm_ActivateSubsystem: Subsys 1C000000 Activation Done with Status = 0x0
+[aie_runtime] platform_init
+[aie_runtime] auto_init (constructor)
+[aie_runtime] device_init start
+[aie_runtime] device_init OK
+[aie_runtime] routing_init start
+[aie_runtime] 2-routing_init OK----
+[aie_runtime] auto_init OK
+------------main--------
+[aie_runtime] bd_config tile(2,0) bd=0 addr=0x80a60 len=32 next=-1 lock_acq=0/0 lock_rel=0/0 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,3) bd=1 addr=0x8040 len=16 next=0 lock_acq=0/-1 lock_rel=1/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,3) bd=0 addr=0x8000 len=16 next=1 lock_acq=0/-1 lock_rel=1/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(1,3) bd=1 addr=0x8040 len=16 next=0 lock_acq=0/-1 lock_rel=1/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(1,3) bd=0 addr=0x8000 len=16 next=1 lock_acq=0/-1 lock_rel=1/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(2,0) bd=1 addr=0x80ae0 len=32 next=-1 lock_acq=0/0 lock_rel=0/0 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,4) bd=1 addr=0x8040 len=16 next=0 lock_acq=0/-1 lock_rel=1/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,4) bd=0 addr=0x8000 len=16 next=1 lock_acq=0/-1 lock_rel=1/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(1,4) bd=1 addr=0x8040 len=16 next=0 lock_acq=0/-1 lock_rel=1/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(1,4) bd=0 addr=0x8000 len=16 next=1 lock_acq=0/-1 lock_rel=1/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(3,0) bd=0 addr=0x80e70 len=32 next=-1 lock_acq=0/0 lock_rel=0/0 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,3) bd=3 addr=0x80c0 len=16 next=2 lock_acq=2/-1 lock_rel=3/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,3) bd=2 addr=0x8080 len=16 next=3 lock_acq=2/-1 lock_rel=3/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(1,3) bd=3 addr=0x80c0 len=16 next=2 lock_acq=2/-1 lock_rel=3/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(1,3) bd=2 addr=0x8080 len=16 next=3 lock_acq=2/-1 lock_rel=3/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(3,0) bd=1 addr=0x80ef0 len=32 next=-1 lock_acq=0/0 lock_rel=0/0 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,4) bd=3 addr=0x80c0 len=16 next=2 lock_acq=2/-1 lock_rel=3/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,4) bd=2 addr=0x8080 len=16 next=3 lock_acq=2/-1 lock_rel=3/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(1,4) bd=3 addr=0x80c0 len=16 next=2 lock_acq=2/-1 lock_rel=3/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(1,4) bd=2 addr=0x8080 len=16 next=3 lock_acq=2/-1 lock_rel=3/1 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(2,0) bd=2 addr=0x81280 len=32 next=-1 lock_acq=0/0 lock_rel=0/0 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,3) bd=5 addr=0x8140 len=8 next=4 lock_acq=5/-1 lock_rel=4/1 pkt=1/9 rc=0
+[aie_runtime] bd_config tile(0,3) bd=4 addr=0x8100 len=8 next=5 lock_acq=5/-1 lock_rel=4/1 pkt=1/9 rc=0
+[aie_runtime] bd_config tile(1,3) bd=5 addr=0x8140 len=8 next=4 lock_acq=5/-1 lock_rel=4/1 pkt=1/10 rc=0
+[aie_runtime] bd_config tile(1,3) bd=4 addr=0x8100 len=8 next=5 lock_acq=5/-1 lock_rel=4/1 pkt=1/10 rc=0
+[aie_runtime] bd_config tile(2,0) bd=3 addr=0x81300 len=32 next=-1 lock_acq=0/0 lock_rel=0/0 pkt=0/0 rc=0
+[aie_runtime] bd_config tile(0,4) bd=5 addr=0x8140 len=8 next=4 lock_acq=5/-1 lock_rel=4/1 pkt=1/11 rc=0
+[aie_runtime] bd_config tile(0,4) bd=4 addr=0x8100 len=8 next=5 lock_acq=5/-1 lock_rel=4/1 pkt=1/11 rc=0
+[aie_runtime] bd_config tile(1,4) bd=5 addr=0x8140 len=8 next=4 lock_acq=5/-1 lock_rel=4/1 pkt=1/12 rc=0
+[aie_runtime] bd_config tile(1,4) bd=4 addr=0x8100 len=8 next=5 lock_acq=5/-1 lock_rel=4/1 pkt=1/12 rc=0
+[aie_runtime] load_kernel_group n=4 tiles=(3,0)(3,1)(4,0)(4,1)
+[aie_runtime] loading kernel ELF into tile (0,3)
+[aie_runtime] loading kernel ELF into tile (1,3)
+[aie_runtime] loading kernel ELF into tile (0,4)
+[aie_runtime] loading kernel ELF into tile (1,4)
+[aie_runtime] launch_kernel_group num_tiles=4
+[aie_runtime] startio tile(0,3) ch=0 dir=S2MM bd=0
+[aie_runtime] startio tile(1,3) ch=0 dir=S2MM bd=0
+[aie_runtime] startio tile(2,0) ch=0 dir=MM2S bd=0
+[aie_runtime] startio tile(0,4) ch=0 dir=S2MM bd=0
+[aie_runtime] startio tile(1,4) ch=0 dir=S2MM bd=0
+[aie_runtime] startio tile(2,0) ch=1 dir=MM2S bd=1
+[aie_runtime] startio tile(0,3) ch=1 dir=S2MM bd=2
+[aie_runtime] startio tile(1,3) ch=1 dir=S2MM bd=2
+[aie_runtime] startio tile(3,0) ch=0 dir=MM2S bd=0
+[aie_runtime] startio tile(0,4) ch=1 dir=S2MM bd=2
+[aie_runtime] startio tile(1,4) ch=1 dir=S2MM bd=2
+[aie_runtime] startio tile(3,0) ch=1 dir=MM2S bd=1
+[aie_runtime] startio tile(0,3) ch=0 dir=MM2S bd=4
+[aie_runtime] startio tile(1,3) ch=0 dir=MM2S bd=4
+[aie_runtime] startio tile(2,0) ch=0 dir=S2MM bd=2
+[aie_runtime] startio tile(0,4) ch=0 dir=MM2S bd=4
+[aie_runtime] startio tile(1,4) ch=0 dir=MM2S bd=4
+[aie_runtime] startio tile(2,0) ch=1 dir=S2MM bd=3
+[aie_runtime] wait_event num_tiles=4 tiles=(3,0)(3,1)(4,0)(4,1)
+[aie_runtime] wait_event done
+[kernel_log] tile(0,3): 13 entries
+  [0] KLOG = 1263292231 (0x4b4c4f47)
+  [1] CENk = 0 (0x00000000)
+  [2] IN0 = 0 (0x00000000)
+  [3] IN1 = -128 (0xffffff80)
+  [4] OUT = 0 (0x00000000)
+  [5] CLOP = 16 (0x00000010)
+  [6] CEXT = 1 (0x00000001)
+  [7] CENk = 1 (0x00000001)
+  [8] IN0 = 64 (0x00000040)
+  [9] IN1 = -64 (0xffffffc0)
+  [10] OUT = 64 (0x00000040)
+  [11] CLOP = 16 (0x00000010)
+  [12] CEXT = 1 (0x00000001)
+[kernel_log] tile(1,3): 13 entries
+  [0] KLOG = 1263292231 (0x4b4c4f47)
+  [1] CENk = 0 (0x00000000)
+  [2] IN0 = 0 (0x00000000)
+  [3] IN1 = -128 (0xffffff80)
+  [4] OUT = 0 (0x00000000)
+  [5] CLOP = 16 (0x00000010)
+  [6] CEXT = 1 (0x00000001)
+  [7] CENk = 1 (0x00000001)
+  [8] IN0 = 64 (0x00000040)
+  [9] IN1 = -64 (0xffffffc0)
+  [10] OUT = 64 (0x00000040)
+  [11] CLOP = 16 (0x00000010)
+  [12] CEXT = 1 (0x00000001)
+[kernel_log] tile(0,4): 13 entries
+  [0] KLOG = 1263292231 (0x4b4c4f47)
+  [1] CENk = 0 (0x00000000)
+  [2] IN0 = 0 (0x00000000)
+  [3] IN1 = -128 (0xffffff80)
+  [4] OUT = 0 (0x00000000)
+  [5] CLOP = 16 (0x00000010)
+  [6] CEXT = 1 (0x00000001)
+  [7] CENk = 1 (0x00000001)
+  [8] IN0 = 64 (0x00000040)
+  [9] IN1 = -64 (0xffffffc0)
+  [10] OUT = 64 (0x00000040)
+  [11] CLOP = 16 (0x00000010)
+  [12] CEXT = 1 (0x00000001)
+[kernel_log] tile(1,4): 13 entries
+  [0] KLOG = 1263292231 (0x4b4c4f47)
+  [1] CENk = 0 (0x00000000)
+  [2] IN0 = 0 (0x00000000)
+  [3] IN1 = -128 (0xffffff80)
+  [4] OUT = 0 (0x00000000)
+  [5] CLOP = 16 (0x00000010)
+  [6] CEXT = 1 (0x00000001)
+  [7] CENk = 1 (0x00000001)
+  [8] IN0 = 64 (0x00000040)
+  [9] IN1 = -64 (0xffffffc0)
+  [10] OUT = 64 (0x00000040)
+  [11] CLOP = 16 (0x00000010)
+  [12] CEXT = 1 (0x00000001)
+aie runtime col = 2, row = 0, channel = 0, dir = 1
+[aie_runtime] ch_status tile(2,0) ch=0 dir=1 raw=0x00000000 rc=0
+aie runtime col = 2, row = 0, channel = 1, dir = 1
+[aie_runtime] ch_status tile(2,0) ch=1 dir=1 raw=0x00000000 rc=0
+aie runtime col = 3, row = 0, channel = 0, dir = 1
+[aie_runtime] ch_status tile(3,0) ch=0 dir=1 raw=0x00000000 rc=0
+aie runtime col = 3, row = 0, channel = 1, dir = 1
+[aie_runtime] ch_status tile(3,0) ch=1 dir=1 raw=0x00000000 rc=0
+aie runtime col = 2, row = 0, channel = 0, dir = 0
+[aie_runtime] ch_status tile(2,0) ch=0 dir=0 raw=0x00000000 rc=0
+aie runtime col = 2, row = 0, channel = 1, dir = 0
+[aie_runtime] ch_status tile(2,0) ch=1 dir=0 raw=0x00000000 rc=0
+
+[AieRt_Debug] ============================================================
+[AieRt_Debug]  DEBUG SNAPSHOT  [gen=AIE2PS]
+[AieRt_Debug] ============================================================
+[AieRt_Debug] ===== Core Status (4 tiles) =====
+[11080.286]XPlmi_VersalAiepG2EAMHandler
+[11083.714]PMC EAM ERR1: 0x22000
+[11086.643]Received EAM error. ErrorNodeId: 0x28100000, Register Mask: 0x20000. The corresponding Error ID: 0x11
+     : 0x00248  (reg 0x32D00, mask 0x000FFFFF)
+  Core_SP      : 0x000700C0  (reg 0x32D20)
+  [21] PROC_BUS_STALL  : no
+  [20] CORE_DONE       : YES
+  [19] ERROR_HALT      : no
+  [18] ECC_SCRUB_STALL : no
+  [17] ECC_ERR_STALL   : no
+  [16] DEBUG_HALT      : no
+  [15] CASCADE_STALL_MCD: no
+  [14] CASCADE_STALL_SCD: no
+  [12] STREAM_STALL_MS0: no
+  [10] STREAM_STALL_SS0: no
+  [ 9] LOCK_STALL_E    : no
+  [ 8] LOCK_STALL_N    : no
+  [ 7] LOCK_STALL_W    : no
+  [ 6] LOCK_STALL_S    : no
+  [ 5] MEMORY_STALL_E  : no
+  [ 4] MEMORY_STALL_N  : no
+  [ 3] MEMORY_STALL_W  : no
+  [ 2] MEMORY_STALL_S  : no
+  [ 1] RESET           : no
+  [ 0] ENABLE          : no
+  LR             : 0x00000000
+  CoreEvtReg0  : 0xB4400026  (event IDs  0-31)
+  CoreEvtReg1  : 0x1400F0D9  (event IDs 32-63)
+  ACTIVE       : YES
+  DISABLED     : no
+  MS_STALL     : no
+  PM_STALL     : no
+  STREAM_STALL : no
+  CASCADE_STALL: *** STALL ***
+  LOCK_STALL   : *** STALL ***
+  ECC_ERR_STALL: no
+  ECC_SCRUB    : no
+  STALL_NOP    : no
+  *** WARN: core has active stall(s)
+[AieRt_Debug] Core tile(1,3) status=0x00100000
+  Core_Status  : 0x00100000  (reg 0x38004, mask 0x003FFFFF)
+  Core_PC      : 0x00248  (reg 0x32D00, mask 0x000FFFFF)
+  Core_SP      : 0x000700C0  (reg 0x32D20)
+  [21] PROC_BUS_STALL  : no
+  [20] CORE_DONE       : YES
+  [19] ERROR_HALT      : no
+  [18] ECC_SCRUB_STALL : no
+  [17] ECC_ERR_STALL   : no
+  [16] DEBUG_HALT      : no
+  [15] CASCADE_STALL_MCD: no
+  [14] CASCADE_STALL_SCD: no
+  [12] STREAM_STALL_MS0: no
+  [10] STREAM_STALL_SS0: no
+  [ 9] LOCK_STALL_E    : no
+  [ 8] LOCK_STALL_N    : no
+  [ 7] LOCK_STALL_W    : no
+  [ 6] LOCK_STALL_S    : no
+  [ 5] MEMORY_STALL_E  : no
+  [ 4] MEMORY_STALL_N  : no
+  [ 3] MEMORY_STALL_W  : no
+  [ 2] MEMORY_STALL_S  : no
+  [ 1] RESET           : no
+  [ 0] ENABLE          : no
+  LR             : 0x00000000
+  CoreEvtReg0  : 0xB4400026  (event IDs  0-31)
+  CoreEvtReg1  : 0x1400F0D9  (event IDs 32-63)
+  ACTIVE       : YES
+  DISABLED     : no
+  MS_STALL     : no
+  PM_STALL     : no
+  STREAM_STALL : no
+  CASCADE_STALL: *** STALL ***
+  LOCK_STALL   : *** STALL ***
+  ECC_ERR_STALL: no
+  ECC_SCRUB    : no
+  STALL_NOP    : no
+  *** WARN: core has active stall(s)
+[AieRt_Debug] Core tile(0,4) status=0x00100000
+  Core_Status  : 0x00100000  (reg 0x38004, mask 0x003FFFFF)
+  Core_PC      : 0x00248  (reg 0x32D00, mask 0x000FFFFF)
+  Core_SP      : 0x000700C0  (reg 0x32D20)
+  [21] PROC_BUS_STALL  : no
+  [20] CORE_DONE       : YES
+  [19] ERROR_HALT      : no
+  [18] ECC_SCRUB_STALL : no
+  [17] ECC_ERR_STALL   : no
+  [16] DEBUG_HALT      : no
+  [15] CASCADE_STALL_MCD: no
+  [14] CASCADE_STALL_SCD: no
+  [12] STREAM_STALL_MS0: no
+  [10] STREAM_STALL_SS0: no
+  [ 9] LOCK_STALL_E    : no
+  [ 8] LOCK_STALL_N    : no
+  [ 7] LOCK_STALL_W    : no
+  [ 6] LOCK_STALL_S    : no
+  [ 5] MEMORY_STALL_E  : no
+  [ 4] MEMORY_STALL_N  : no
+  [ 3] MEMORY_STALL_W  : no
+  [ 2] MEMORY_STALL_S  : no
+  [ 1] RESET           : no
+  [ 0] ENABLE          : no
+  LR             : 0x00000000
+  CoreEvtReg0  : 0xB4400026  (event IDs  0-31)
+  CoreEvtReg1  : 0x1400F0D9  (event IDs 32-63)
+  ACTIVE       : YES
+  DISABLED     : no
+  MS_STALL     : no
+  PM_STALL     : no
+  STREAM_STALL : no
+  CASCADE_STALL: *** STALL ***
+  LOCK_STALL   : *** STALL ***
+  ECC_ERR_STALL: no
+  ECC_SCRUB    : no
+  STALL_NOP    : no
+  *** WARN: core has active stall(s)
+[AieRt_Debug] Core tile(1,4) status=0x00100000
+  Core_Status  : 0x00100000  (reg 0x38004, mask 0x003FFFFF)
+  Core_PC      : 0x00248  (reg 0x32D00, mask 0x000FFFFF)
+  Core_SP      : 0x000700C0  (reg 0x32D20)
+  [21] PROC_BUS_STALL  : no
+  [20] CORE_DONE       : YES
+  [19] ERROR_HALT      : no
+  [18] ECC_SCRUB_STALL : no
+  [17] ECC_ERR_STALL   : no
+  [16] DEBUG_HALT      : no
+  [15] CASCADE_STALL_MCD: no
+  [14] CASCADE_STALL_SCD: no
+  [12] STREAM_STALL_MS0: no
+  [10] STREAM_STALL_SS0: no
+  [ 9] LOCK_STALL_E    : no
+  [ 8] LOCK_STALL_N    : no
+  [ 7] LOCK_STALL_W    : no
+  [ 6] LOCK_STALL_S    : no
+  [ 5] MEMORY_STALL_E  : no
+  [ 4] MEMORY_STALL_N  : no
+  [ 3] MEMORY_STALL_W  : no
+  [ 2] MEMORY_STALL_S  : no
+  [ 1] RESET           : no
+  [ 0] ENABLE          : no
+  LR             : 0x00000000
+  CoreEvtReg0  : 0xB4400026  (event IDs  0-31)
+  CoreEvtReg1  : 0x1400F0D9  (event IDs 32-63)
+  ACTIVE       : YES
+  DISABLED     : no
+  MS_STALL     : no
+  PM_STALL     : no
+  STREAM_STALL : no
+  CASCADE_STALL: *** STALL ***
+  LOCK_STALL   : *** STALL ***
+  ECC_ERR_STALL: no
+  ECC_SCRUB    : no
+  STALL_NOP    : no
+  *** WARN: core has active stall(s)
+[AieRt_Debug] ===== Core Activity Events (4 tiles) =====
+[AieRt_Debug] Core tile(0,3) core_evt_status0(0x334200)=0xB4400026  core_evt_status1(0x334204)=0x1400F0D9
+  ACTIVE          : YES
+  DISABLED        : no
+  MS_STALL        : no
+  PM_STALL(instr) : no
+  STREAM_STALL    : no
+  CASCADE_STALL   : *** STALL ***
+  LOCK_STALL      : *** STALL ***
+  ECC_ERR_STALL   : no
+  ECC_SCRUB_STALL : no
+  STALL_NOP       : no
+  *** WARN: core has active stall(s) - check stall lines above
+[AieRt_Debug] Core tile(1,3) core_evt_status0(0x2334200)=0xB4400026  core_evt_status1(0x2334204)=0x1400F0D9
+  ACTIVE          : YES
+  DISABLED        : no
+  MS_STALL        : no
+  PM_STALL(instr) : no
+  STREAM_STALL    : no
+  CASCADE_STALL   : *** STALL ***
+  LOCK_STALL      : *** STALL ***
+  ECC_ERR_STALL   : no
+  ECC_SCRUB_STALL : no
+  STALL_NOP       : no
+  *** WARN: core has active stall(s) - check stall lines above
+[AieRt_Debug] Core tile(0,4) core_evt_status0(0x434200)=0xB4400026  core_evt_status1(0x434204)=0x1400F0D9
+  ACTIVE          : YES
+  DISABLED        : no
+  MS_STALL        : no
+  PM_STALL(instr) : no
+  STREAM_STALL    : no
+  CASCADE_STALL   : *** STALL ***
+  LOCK_STALL      : *** STALL ***
+  ECC_ERR_STALL   : no
+  ECC_SCRUB_STALL : no
+  STALL_NOP       : no
+  *** WARN: core has active stall(s) - check stall lines above
+[AieRt_Debug] Core tile(1,4) core_evt_status0(0x2434200)=0xB4400026  core_evt_status1(0x2434204)=0x1400F0D9
+  ACTIVE          : YES
+  DISABLED        : no
+  MS_STALL        : no
+  PM_STALL(instr) : no
+  STREAM_STALL    : no
+  CASCADE_STALL   : *** STALL ***
+  LOCK_STALL      : *** STALL ***
+  ECC_ERR_STALL   : no
+  ECC_SCRUB_STALL : no
+  STALL_NOP       : no
+  *** WARN: core has active stall(s) - check stall lines above
+[AieRt_Debug] ===== Core Tile DMA BD Events (4 tiles) =====
+[AieRt_Debug] Core tile(0,3) DMA BD events  mem_evt_status(0x00314200)=0x83BC0002
+  S2MM ch0  START_TASK   : FIRED
+  S2MM ch1  START_TASK   : FIRED
+  MM2S ch0  START_TASK   : FIRED
+  MM2S ch1  START_TASK   : -
+  S2MM ch0  FINISHED_TASK: FIRED
+  S2MM ch1  FINISHED_TASK: FIRED
+  MM2S ch0  FINISHED_TASK: FIRED
+  MM2S ch1  FINISHED_TASK: -
+[AieRt_Debug] Core tile(1,3) DMA BD events  mem_evt_status(0x02314200)=0x83BC0002
+  S2MM ch0  START_TASK   : FIRED
+  S2MM ch1  START_TASK   : FIRED
+  MM2S ch0  START_TASK   : FIRED
+  MM2S ch1  START_TASK   : -
+  S2MM ch0  FINISHED_TASK: FIRED
+  S2MM ch1  FINISHED_TASK: FIRED
+  MM2S ch0  FINISHED_TASK: FIRED
+  MM2S ch1  FINISHED_TASK: -
+[AieRt_Debug] Core tile(0,4) DMA BD events  mem_evt_status(0x00414200)=0x83BC0002
+  S2MM ch0  START_TASK   : FIRED
+  S2MM ch1  START_TASK   : FIRED
+  MM2S ch0  START_TASK   : FIRED
+  MM2S ch1  START_TASK   : -
+  S2MM ch0  FINISHED_TASK: FIRED
+  S2MM ch1  FINISHED_TASK: FIRED
+  MM2S ch0  FINISHED_TASK: FIRED
+  MM2S ch1  FINISHED_TASK: -
+[AieRt_Debug] Core tile(1,4) DMA BD events  mem_evt_status(0x02414200)=0x83BC0002
+  S2MM ch0  START_TASK   : FIRED
+  S2MM ch1  START_TASK   : FIRED
+  MM2S ch0  START_TASK   : FIRED
+  MM2S ch1  START_TASK   : -
+  S2MM ch0  FINISHED_TASK: FIRED
+  S2MM ch1  FINISHED_TASK: FIRED
+  MM2S ch0  FINISHED_TASK: FIRED
+  MM2S ch1  FINISHED_TASK: -
+[AieRt_Debug] ===== MEM Module Events [gen=AIE2PS] (4 tiles) =====
+[AieRt_Debug] tile(0,3) MEM module events [gen=AIE2PS]  reg0(IDs 0-31)=0x83BC0002  reg1(IDs 32-63)=0x6666683B
+  MEM evt   1  TRUE
+  MEM evt  18  GROUP_DMA_ACTIVITY
+  MEM evt  19  DMA_S2MM_0_START_TASK
+  MEM evt  20  DMA_S2MM_1_START_TASK
+  MEM evt  21  DMA_MM2S_0_START_TASK
+  MEM evt  23  DMA_S2MM_0_FINISHED_BD
+  MEM evt  24  DMA_S2MM_1_FINISHED_BD
+  MEM evt  25  DMA_MM2S_0_FINISHED_BD
+  MEM evt  31  DMA_S2MM_0_STALLED_LOCK
+  MEM evt  32  DMA_S2MM_1_STALLED_LOCK
+  MEM evt  33  DMA_MM2S_0_STALLED_LOCK
+  MEM evt  35  DMA_S2MM_0_STREAM_STARVATION
+  MEM evt  36  DMA_S2MM_1_STREAM_STARVATION
+  MEM evt  37  DMA_MM2S_0_STREAM_BACKPRESSURE
+  MEM evt  43  GROUP_LOCK
+  MEM evt  45  LOCK_SEL0_ACQ_GE
+  MEM evt  46  LOCK_0_REL
+  MEM evt  49  LOCK_SEL1_ACQ_GE
+  MEM evt  50  LOCK_1_REL
+  MEM evt  53  LOCK_SEL2_ACQ_GE
+  MEM evt  54  LOCK_2_REL
+  MEM evt  57  LOCK_SEL3_ACQ_GE
+  MEM evt  58  LOCK_3_REL
+  MEM evt  61  LOCK_SEL4_ACQ_GE
+  MEM evt  62  LOCK_4_REL
+[AieRt_Debug] tile(1,3) MEM module events [gen=AIE2PS]  reg0(IDs 0-31)=0x83BC0002  reg1(IDs 32-63)=0x6666683B
+  MEM evt   1  TRUE
+  MEM evt  18  GROUP_DMA_ACTIVITY
+  MEM evt  19  DMA_S2MM_0_START_TASK
+  MEM evt  20  DMA_S2MM_1_START_TASK
+  MEM evt  21  DMA_MM2S_0_START_TASK
+  MEM evt  23  DMA_S2MM_0_FINISHED_BD
+  MEM evt  24  DMA_S2MM_1_FINISHED_BD
+  MEM evt  25  DMA_MM2S_0_FINISHED_BD
+  MEM evt  31  DMA_S2MM_0_STALLED_LOCK
+  MEM evt  32  DMA_S2MM_1_STALLED_LOCK
+  MEM evt  33  DMA_MM2S_0_STALLED_LOCK
+  MEM evt  35  DMA_S2MM_0_STREAM_STARVATION
+  MEM evt  36  DMA_S2MM_1_STREAM_STARVATION
+  MEM evt  37  DMA_MM2S_0_STREAM_BACKPRESSURE
+  MEM evt  43  GROUP_LOCK
+  MEM evt  45  LOCK_SEL0_ACQ_GE
+  MEM evt  46  LOCK_0_REL
+  MEM evt  49  LOCK_SEL1_ACQ_GE
+  MEM evt  50  LOCK_1_REL
+  MEM evt  53  LOCK_SEL2_ACQ_GE
+  MEM evt  54  LOCK_2_REL
+  MEM evt  57  LOCK_SEL3_ACQ_GE
+  MEM evt  58  LOCK_3_REL
+  MEM evt  61  LOCK_SEL4_ACQ_GE
+  MEM evt  62  LOCK_4_REL
+[AieRt_Debug] tile(0,4) MEM module events [gen=AIE2PS]  reg0(IDs 0-31)=0x83BC0002  reg1(IDs 32-63)=0x6666683B
+  MEM evt   1  TRUE
+  MEM evt  18  GROUP_DMA_ACTIVITY
+  MEM evt  19  DMA_S2MM_0_START_TASK
+  MEM evt  20  DMA_S2MM_1_START_TASK
+  MEM evt  21  DMA_MM2S_0_START_TASK
+  MEM evt  23  DMA_S2MM_0_FINISHED_BD
+  MEM evt  24  DMA_S2MM_1_FINISHED_BD
+  MEM evt  25  DMA_MM2S_0_FINISHED_BD
+  MEM evt  31  DMA_S2MM_0_STALLED_LOCK
+  MEM evt  32  DMA_S2MM_1_STALLED_LOCK
+  MEM evt  33  DMA_MM2S_0_STALLED_LOCK
+  MEM evt  35  DMA_S2MM_0_STREAM_STARVATION
+  MEM evt  36  DMA_S2MM_1_STREAM_STARVATION
+  MEM evt  37  DMA_MM2S_0_STREAM_BACKPRESSURE
+  MEM evt  43  GROUP_LOCK
+  MEM evt  45  LOCK_SEL0_ACQ_GE
+  MEM evt  46  LOCK_0_REL
+  MEM evt  49  LOCK_SEL1_ACQ_GE
+  MEM evt  50  LOCK_1_REL
+  MEM evt  53  LOCK_SEL2_ACQ_GE
+  MEM evt  54  LOCK_2_REL
+  MEM evt  57  LOCK_SEL3_ACQ_GE
+  MEM evt  58  LOCK_3_REL
+  MEM evt  61  LOCK_SEL4_ACQ_GE
+  MEM evt  62  LOCK_4_REL
+[AieRt_Debug] tile(1,4) MEM module events [gen=AIE2PS]  reg0(IDs 0-31)=0x83BC0002  reg1(IDs 32-63)=0x6666683B
+  MEM evt   1  TRUE
+  MEM evt  18  GROUP_DMA_ACTIVITY
+  MEM evt  19  DMA_S2MM_0_START_TASK
+  MEM evt  20  DMA_S2MM_1_START_TASK
+  MEM evt  21  DMA_MM2S_0_START_TASK
+  MEM evt  23  DMA_S2MM_0_FINISHED_BD
+  MEM evt  24  DMA_S2MM_1_FINISHED_BD
+  MEM evt  25  DMA_MM2S_0_FINISHED_BD
+  MEM evt  31  DMA_S2MM_0_STALLED_LOCK
+  MEM evt  32  DMA_S2MM_1_STALLED_LOCK
+  MEM evt  33  DMA_MM2S_0_STALLED_LOCK
+  MEM evt  35  DMA_S2MM_0_STREAM_STARVATION
+  MEM evt  36  DMA_S2MM_1_STREAM_STARVATION
+  MEM evt  37  DMA_MM2S_0_STREAM_BACKPRESSURE
+  MEM evt  43  GROUP_LOCK
+  MEM evt  45  LOCK_SEL0_ACQ_GE
+  MEM evt  46  LOCK_0_REL
+  MEM evt  49  LOCK_SEL1_ACQ_GE
+  MEM evt  50  LOCK_1_REL
+  MEM evt  53  LOCK_SEL2_ACQ_GE
+  MEM evt  54  LOCK_2_REL
+  MEM evt  57  LOCK_SEL3_ACQ_GE
+  MEM evt  58  LOCK_3_REL
+  MEM evt  61  LOCK_SEL4_ACQ_GE
+  MEM evt  62  LOCK_4_REL
+[AieRt_Debug] ===== CORE Module Events [gen=AIE2PS] (4 tiles) =====
+[AieRt_Debug] tile(0,3) CORE module events [gen=AIE2PS]  reg0(IDs 0-31)=0xB4400026  reg1(IDs 32-63)=0x1400F0D9
+  CORE evt   1  TRUE
+  CORE evt   2  GROUP_0
+  CORE evt   5  PERF_CNT_0
+  CORE evt  22  GROUP_STALL
+  CORE evt  26  LOCK_STALL
+  CORE evt  28  ACTIVE
+  CORE evt  29  DISABLED
+  CORE evt  31  ECC_SCRUBBING_STALL
+  CORE evt  32  GROUP_CORE_PROGRAM_FLOW
+  CORE evt  35  INSTR_CALL
+  CORE evt  36  INSTR_RETURN
+  CORE evt  38  INSTR_LOAD
+  CORE evt  39  INSTR_STORE
+  CORE evt  44  INSTR_LOCK_ACQUIRE_REQ
+  CORE evt  45  INSTR_LOCK_RELEASE_REQ
+  CORE evt  46  GROUP_ERRORS_0
+  CORE evt  47  GROUP_ERRORS_1
+  CORE evt  58  AXI_MM_SLAVE_ERROR
+  CORE evt  60  DM_ADDRESS_OUT_OF_RANGE
+[AieRt_Debug] tile(1,3) CORE module events [gen=AIE2PS]  reg0(IDs 0-31)=0xB4400026  reg1(IDs 32-63)=0x1400F0D9
+  CORE evt   1  TRUE
+  CORE evt   2  GROUP_0
+  CORE evt   5  PERF_CNT_0
+  CORE evt  22  GROUP_STALL
+  CORE evt  26  LOCK_STALL
+  CORE evt  28  ACTIVE
+  CORE evt  29  DISABLED
+  CORE evt  31  ECC_SCRUBBING_STALL
+  CORE evt  32  GROUP_CORE_PROGRAM_FLOW
+  CORE evt  35  INSTR_CALL
+  CORE evt  36  INSTR_RETURN
+  CORE evt  38  INSTR_LOAD
+  CORE evt  39  INSTR_STORE
+  CORE evt  44  INSTR_LOCK_ACQUIRE_REQ
+  CORE evt  45  INSTR_LOCK_RELEASE_REQ
+  CORE evt  46  GROUP_ERRORS_0
+  CORE evt  47  GROUP_ERRORS_1
+  CORE evt  58  AXI_MM_SLAVE_ERROR
+  CORE evt  60  DM_ADDRESS_OUT_OF_RANGE
+[AieRt_Debug] tile(0,4) CORE module events [gen=AIE2PS]  reg0(IDs 0-31)=0xB4400026  reg1(IDs 32-63)=0x1400F0D9
+  CORE evt   1  TRUE
+  CORE evt   2  GROUP_0
+  CORE evt   5  PERF_CNT_0
+  CORE evt  22  GROUP_STALL
+  CORE evt  26  LOCK_STALL
+  CORE evt  28  ACTIVE
+  CORE evt  29  DISABLED
+  CORE evt  31  ECC_SCRUBBING_STALL
+  CORE evt  32  GROUP_CORE_PROGRAM_FLOW
+  CORE evt  35  INSTR_CALL
+  CORE evt  36  INSTR_RETURN
+  CORE evt  38  INSTR_LOAD
+  CORE evt  39  INSTR_STORE
+  CORE evt  44  INSTR_LOCK_ACQUIRE_REQ
+  CORE evt  45  INSTR_LOCK_RELEASE_REQ
+  CORE evt  46  GROUP_ERRORS_0
+  CORE evt  47  GROUP_ERRORS_1
+  CORE evt  58  AXI_MM_SLAVE_ERROR
+  CORE evt  60  DM_ADDRESS_OUT_OF_RANGE
+[AieRt_Debug] tile(1,4) CORE module events [gen=AIE2PS]  reg0(IDs 0-31)=0xB4400026  reg1(IDs 32-63)=0x1400F0D9
+  CORE evt   1  TRUE
+  CORE evt   2  GROUP_0
+  CORE evt   5  PERF_CNT_0
+  CORE evt  22  GROUP_STALL
+  CORE evt  26  LOCK_STALL
+  CORE evt  28  ACTIVE
+  CORE evt  29  DISABLED
+  CORE evt  31  ECC_SCRUBBING_STALL
+  CORE evt  32  GROUP_CORE_PROGRAM_FLOW
+  CORE evt  35  INSTR_CALL
+  CORE evt  36  INSTR_RETURN
+  CORE evt  38  INSTR_LOAD
+  CORE evt  39  INSTR_STORE
+  CORE evt  44  INSTR_LOCK_ACQUIRE_REQ
+  CORE evt  45  INSTR_LOCK_RELEASE_REQ
+  CORE evt  46  GROUP_ERRORS_0
+  CORE evt  47  GROUP_ERRORS_1
+  CORE evt  58  AXI_MM_SLAVE_ERROR
+  CORE evt  60  DM_ADDRESS_OUT_OF_RANGE
+[AieRt_Debug] ===== Shim DMA Status =====
+[AieRt_Debug] Shim tile(2,0) DMA status:
+[AieRt_Debug]   tile(2,0) ch0 S2MM: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug]   tile(2,0) ch1 S2MM: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug]   tile(2,0) ch0 MM2S: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug]   tile(2,0) ch1 MM2S: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug] Shim(2,0) PL module events [gen=AIE2PS]  reg0=0x03FFE002  reg1=0x80000030  reg2=0x00111111  reg3=0x00000000
+  PL evt   1  TRUE
+  PL evt  13  PL_RISING_EDGE_3
+  PL evt  14  DMA_S2MM_0_START_TASK [DMA]
+  PL evt  15  DMA_S2MM_1_START_TASK [DMA]
+  PL evt  16  DMA_MM2S_0_START_TASK [DMA]
+  PL evt  17  DMA_MM2S_1_START_TASK [DMA]
+  PL evt  18  DMA_S2MM_0_FINISHED_TASK [DMA]
+  PL evt  19  DMA_S2MM_1_FINISHED_TASK [DMA]
+  PL evt  20  DMA_MM2S_0_FINISHED_TASK [DMA]
+  PL evt  21  DMA_MM2S_1_FINISHED_TASK [DMA]
+  PL evt  22  DMA_S2MM_0_STALLED_LOCK *** DMA STALLED_LOCK ***
+  PL evt  23  DMA_S2MM_1_STALLED_LOCK *** DMA STALLED_LOCK ***
+  PL evt  24  DMA_MM2S_0_STALLED_LOCK *** DMA STALLED_LOCK ***
+  PL evt  25  DMA_MM2S_1_STALLED_LOCK *** DMA STALLED_LOCK ***
+  PL evt  36  LOCK_0_EQUAL_TO_VALUE
+  PL evt  37  LOCK_1_ACQ_EQ
+  PL evt  63  PORT_IDLE_2
+  PL evt  64  PORT_IDLE_3
+  PL evt  68  PORT_IDLE_7
+  PL evt  72  PORT_RUNNING_3
+  PL evt  76  PORT_RUNNING_7
+  PL evt  80  PORT_STALL_3
+  PL evt  84  PORT_STALL_7
+[AieRt_Debug] Shim tile(3,0) DMA status:
+[AieRt_Debug]   tile(3,0) ch0 S2MM: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug]   tile(3,0) ch1 S2MM: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug]   tile(3,0) ch0 MM2S: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug]   tile(3,0) ch1 MM2S: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug] Shim(3,0) PL module events [gen=AIE2PS]  reg0=0x03332002  reg1=0x80000030  reg2=0x00111111  reg3=0x00000000
+  PL evt   1  TRUE
+  PL evt  13  PL_RISING_EDGE_3
+  PL evt  16  DMA_MM2S_0_START_TASK [DMA]
+  PL evt  17  DMA_MM2S_1_START_TASK [DMA]
+  PL evt  20  DMA_MM2S_0_FINISHED_TASK [DMA]
+  PL evt  21  DMA_MM2S_1_FINISHED_TASK [DMA]
+  PL evt  24  DMA_MM2S_0_STALLED_LOCK *** DMA STALLED_LOCK ***
+  PL evt  25  DMA_MM2S_1_STALLED_LOCK *** DMA STALLED_LOCK ***
+  PL evt  36  LOCK_0_EQUAL_TO_VALUE
+  PL evt  37  LOCK_1_ACQ_EQ
+  PL evt  63  PORT_IDLE_2
+  PL evt  64  PORT_IDLE_3
+  PL evt  68  PORT_IDLE_7
+  PL evt  72  PORT_RUNNING_3
+  PL evt  76  PORT_RUNNING_7
+  PL evt  80  PORT_STALL_3
+  PL evt  84  PORT_STALL_7
+[AieRt_Debug] ===== Core Tile DMA Status =====
+[AieRt_Debug] Core tile(0,3) DMA status:
+[AieRt_Debug]   tile(0,3) ch0 S2MM: raw=0x00080010  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=0 lock_rel=0 stream=1 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(0,3) ch1 S2MM: raw=0x00080010  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=0 lock_rel=0 stream=1 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(0,3) ch0 MM2S: raw=0x00080004  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=1 lock_rel=0 stream=0 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(0,3) ch1 MM2S: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug] Core tile(1,3) DMA status:
+[AieRt_Debug]   tile(1,3) ch0 S2MM: raw=0x00080010  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=0 lock_rel=0 stream=1 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(1,3) ch1 S2MM: raw=0x00080010  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=0 lock_rel=0 stream=1 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(1,3) ch0 MM2S: raw=0x00080004  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=1 lock_rel=0 stream=0 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(1,3) ch1 MM2S: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug] Core tile(0,4) DMA status:
+[AieRt_Debug]   tile(0,4) ch0 S2MM: raw=0x00080010  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=0 lock_rel=0 stream=1 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(0,4) ch1 S2MM: raw=0x00080010  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=0 lock_rel=0 stream=1 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(0,4) ch0 MM2S: raw=0x00080004  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=1 lock_rel=0 stream=0 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(0,4) ch1 MM2S: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug] Core tile(1,4) DMA status:
+[AieRt_Debug]   tile(1,4) ch0 S2MM: raw=0x00080010  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=0 lock_rel=0 stream=1 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(1,4) ch1 S2MM: raw=0x00080010  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=0 lock_rel=0 stream=1 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(1,4) ch0 MM2S: raw=0x00080004  Idle  running=1  q_size=0  cur_bd=0
+             STALLED: lock_acq=1 lock_rel=0 stream=0 tct=0
+             Current BD contents:
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   tile(1,4) ch1 MM2S: raw=0x00000000  Idle  running=0  q_size=0  cur_bd=0
+[AieRt_Debug] ===== BD Contents (all referenced tiles) =====
+[AieRt_Debug] tile(2,0) BDs (total=16, printing 0-3):
+[AieRt_Debug]   BD0 : addr=0x80a60 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug]   BD1 : addr=0x80ae0 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug]   BD2 : addr=0x81280 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug]   BD3 : addr=0x81300 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug] tile(0,3) BDs (total=16, printing 0-3):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   BD1 : addr=0x2010 len=16 bytes  next->BD0
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   BD2 : addr=0x2020 len=16 bytes  next->BD3
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+[AieRt_Debug]   BD3 : addr=0x2030 len=16 bytes  next->BD2
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+[AieRt_Debug] tile(1,3) BDs (total=16, printing 0-3):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   BD1 : addr=0x2010 len=16 bytes  next->BD0
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   BD2 : addr=0x2020 len=16 bytes  next->BD3
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+[AieRt_Debug]   BD3 : addr=0x2030 len=16 bytes  next->BD2
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+[AieRt_Debug] tile(0,4) BDs (total=16, printing 0-3):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   BD1 : addr=0x2010 len=16 bytes  next->BD0
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   BD2 : addr=0x2020 len=16 bytes  next->BD3
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+[AieRt_Debug]   BD3 : addr=0x2030 len=16 bytes  next->BD2
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+[AieRt_Debug] tile(1,4) BDs (total=16, printing 0-3):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   BD1 : addr=0x2010 len=16 bytes  next->BD0
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug]   BD2 : addr=0x2020 len=16 bytes  next->BD3
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+[AieRt_Debug]   BD3 : addr=0x2030 len=16 bytes  next->BD2
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+[AieRt_Debug] tile(3,0) BDs (total=16, printing 0-3):
+[AieRt_Debug]   BD0 : addr=0x80e70 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug]   BD1 : addr=0x80ef0 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug]   BD2 : addr=0x0 len=0 bytes  next=(none)
+         lock acq: en=0 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug]   BD3 : addr=0x0 len=0 bytes  next=(none)
+         lock acq: en=0 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug] ===== IO Descriptor Verification (18 IOs) =====
+[AieRt_Debug] IO[0] tile(2,0) ch0 MM2S bd_id=0: status=Idle running=0 q=0 cur_bd=0  => OK
+  Registered BD contents (bd_id=0):
+[AieRt_Debug]   BD0 : addr=0x80a60 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug] IO[1] tile(0,3) ch0 S2MM bd_id=0: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=0 lock_rel=0 stream=1 tct=0
+  Registered BD contents (bd_id=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[2] tile(1,3) ch0 S2MM bd_id=0: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=0 lock_rel=0 stream=1 tct=0
+  Registered BD contents (bd_id=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[3] tile(2,0) ch1 MM2S bd_id=1: status=Idle running=0 q=0 cur_bd=0  => OK
+  Registered BD contents (bd_id=1):
+[AieRt_Debug]   BD1 : addr=0x80ae0 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug] IO[4] tile(0,4) ch0 S2MM bd_id=0: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=0 lock_rel=0 stream=1 tct=0
+  Registered BD contents (bd_id=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[5] tile(1,4) ch0 S2MM bd_id=0: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=0 lock_rel=0 stream=1 tct=0
+  Registered BD contents (bd_id=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[6] tile(3,0) ch0 MM2S bd_id=0: status=Idle running=0 q=0 cur_bd=0  => OK
+  Registered BD contents (bd_id=0):
+[AieRt_Debug]   BD0 : addr=0x80e70 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug] IO[7] tile(0,3) ch1 S2MM bd_id=2: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=0 lock_rel=0 stream=1 tct=0
+  Registered BD contents (bd_id=2):
+[AieRt_Debug]   BD2 : addr=0x2020 len=16 bytes  next->BD3
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+  Current BD in flight (cur_bd=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[8] tile(1,3) ch1 S2MM bd_id=2: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=0 lock_rel=0 stream=1 tct=0
+  Registered BD contents (bd_id=2):
+[AieRt_Debug]   BD2 : addr=0x2020 len=16 bytes  next->BD3
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+  Current BD in flight (cur_bd=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[9] tile(3,0) ch1 MM2S bd_id=1: status=Idle running=0 q=0 cur_bd=0  => OK
+  Registered BD contents (bd_id=1):
+[AieRt_Debug]   BD1 : addr=0x80ef0 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug] IO[10] tile(0,4) ch1 S2MM bd_id=2: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=0 lock_rel=0 stream=1 tct=0
+  Registered BD contents (bd_id=2):
+[AieRt_Debug]   BD2 : addr=0x2020 len=16 bytes  next->BD3
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+  Current BD in flight (cur_bd=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[11] tile(1,4) ch1 S2MM bd_id=2: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=0 lock_rel=0 stream=1 tct=0
+  Registered BD contents (bd_id=2):
+[AieRt_Debug]   BD2 : addr=0x2020 len=16 bytes  next->BD3
+         lock acq: en=1 id=2 val=127  rel: en=0 id=3 val=1
+  Current BD in flight (cur_bd=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[12] tile(2,0) ch0 S2MM bd_id=2: status=Idle running=0 q=0 cur_bd=0  => OK
+  Registered BD contents (bd_id=2):
+[AieRt_Debug]   BD2 : addr=0x81280 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug] IO[13] tile(0,3) ch0 MM2S bd_id=4: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=1 lock_rel=0 stream=0 tct=0
+  Registered BD contents (bd_id=4):
+[AieRt_Debug]   BD4 : addr=0x2040 len=8 bytes  next->BD5  pkt_id=9
+         lock acq: en=1 id=5 val=127  rel: en=0 id=4 val=1
+  Current BD in flight (cur_bd=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[14] tile(1,3) ch0 MM2S bd_id=4: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=1 lock_rel=0 stream=0 tct=0
+  Registered BD contents (bd_id=4):
+[AieRt_Debug]   BD4 : addr=0x2040 len=8 bytes  next->BD5  pkt_id=10
+         lock acq: en=1 id=5 val=127  rel: en=0 id=4 val=1
+  Current BD in flight (cur_bd=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[15] tile(2,0) ch1 S2MM bd_id=3: status=Idle running=0 q=0 cur_bd=0  => OK
+  Registered BD contents (bd_id=3):
+[AieRt_Debug]   BD3 : addr=0x81300 len=32 bytes  next=(none)
+         lock acq: en=1 id=0 val=0  rel: en=0 id=0 val=0
+[AieRt_Debug] IO[16] tile(0,4) ch0 MM2S bd_id=4: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=1 lock_rel=0 stream=0 tct=0
+  Registered BD contents (bd_id=4):
+[AieRt_Debug]   BD4 : addr=0x2040 len=8 bytes  next->BD5  pkt_id=11
+         lock acq: en=1 id=5 val=127  rel: en=0 id=4 val=1
+  Current BD in flight (cur_bd=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] IO[17] tile(1,4) ch0 MM2S bd_id=4: status=Idle running=1 q=0 cur_bd=0  => WARN-stall
+  STALLS: lock_acq=1 lock_rel=0 stream=0 tct=0
+  Registered BD contents (bd_id=4):
+[AieRt_Debug]   BD4 : addr=0x2040 len=8 bytes  next->BD5  pkt_id=12
+         lock acq: en=1 id=5 val=127  rel: en=0 id=4 val=1
+  Current BD in flight (cur_bd=0):
+[AieRt_Debug]   BD0 : addr=0x2000 len=16 bytes  next->BD1
+         lock acq: en=1 id=0 val=127  rel: en=0 id=1 val=1
+[AieRt_Debug] ===== Verification result: 0 / 18 FAILED =====
+[AieRt_Debug] ============================================================
+
+------------after matmul--------
+MISMATCH C[0][0]: got 30, expected 21896
+MISMATCH C[0][1]: got 2, expected 22032
+MISMATCH C[0][2]: got 3, expected 22168
+MISMATCH C[0][3]: got 4, expected 22304
+MISMATCH C[0][4]: got 5, expected 22440
+MISMATCH C[0][5]: got 6, expected 22576
+MISMATCH C[0][6]: got 7, expected 22712
+MISMATCH C[0][7]: got 8, expected 22848
+MISMATCH C[0][8]: got 17, expected 22984
+MISMATCH C[0][9]: got 18, expected 23120
+MISMATCH C[0][10]: got 19, expected 23256
+MISMATCH C[0][11]: got 20, expected 23392
+MISMATCH C[0][12]: got 21, expected 23528
+MISMATCH C[0][13]: got 22, expected 23664
+MISMATCH C[0][14]: got 23, expected 23800
+MISMATCH C[0][15]: got 24, expected 23936
+MISMATCH C[1][0]: got 31, expected 52872
+MISMATCH C[1][1]: got 2, expected 53264
+MISMATCH C[1][2]: got 3, expected 53656
+MISMATCH C[1][3]: got 4, expected 54048
+MISMATCH C[1][4]: got 5, expected 54440
+MISMATCH C[1][5]: got 6, expected 54832
+MISMATCH C[1][6]: got 7, expected 55224
+MISMATCH C[1][7]: got 8, expected 55616
+MISMATCH C[1][8]: got 17, expected 56008
+MISMATCH C[1][9]: got 18, expected 56400
+MISMATCH C[1][10]: got 19, expected 56792
+MISMATCH C[1][11]: got 20, expected 57184
+MISMATCH C[1][12]: got 21, expected 57576
+MISMATCH C[1][13]: got 22, expected 57968
+MISMATCH C[1][14]: got 23, expected 58360
+MISMATCH C[1][15]: got 24, expected 58752
+MISMATCH C[2][0]: got 40, expected 83848
+MISMATCH C[2][1]: got 34, expected 84496
+MISMATCH C[2][2]: got 35, expected 85144
+MISMATCH C[2][3]: got 36, expected 85792
+MISMATCH C[2][4]: got 37, expected 86440
+MISMATCH C[2][5]: got 38, expected 87088
+MISMATCH C[2][6]: got 39, expected 87736
+MISMATCH C[2][7]: got 40, expected 88384
+MISMATCH C[2][8]: got 49, expected 89032
+MISMATCH C[2][9]: got 50, expected 89680
+MISMATCH C[2][10]: got 51, expected 90328
+MISMATCH C[2][11]: got 52, expected 90976
+MISMATCH C[2][12]: got 53, expected 91624
+MISMATCH C[2][13]: got 54, expected 92272
+MISMATCH C[2][14]: got 55, expected 92920
+MISMATCH C[2][15]: got 56, expected 93568
+MISMATCH C[3][0]: got 41, expected 114824
+MISMATCH C[3][1]: got 34, expected 115728
+MISMATCH C[3][2]: got 35, expected 116632
+MISMATCH C[3][3]: got 36, expected 117536
+MISMATCH C[3][4]: got 37, expected 118440
+MISMATCH C[3][5]: got 38, expected 119344
+MISMATCH C[3][6]: got 39, expected 120248
+MISMATCH C[3][7]: got 40, expected 121152
+MISMATCH C[3][8]: got 49, expected 122056
+MISMATCH C[3][9]: got 50, expected 122960
+MISMATCH C[3][10]: got 51, expected 123864
+MISMATCH C[3][11]: got 52, expected 124768
+MISMATCH C[3][12]: got 53, expected 125672
+MISMATCH C[3][13]: got 54, expected 126576
+MISMATCH C[3][14]: got 55, expected 127480
+MISMATCH C[3][15]: got 56, expected 128384
+MISMATCH C[4][0]: got 0, expected 145800
+MISMATCH C[4][1]: got 1024, expected 146960
+MISMATCH C[4][2]: got 1073741826, expected 148120
+MISMATCH C[4][3]: got 536870914, expected 149280
+MISMATCH C[4][4]: got 0, expected 150440
+MISMATCH C[4][5]: got 0, expected 151600
+MISMATCH C[4][6]: got 0, expected 152760
+MISMATCH C[4][7]: got 0, expected 153920
+MISMATCH C[4][8]: got 0, expected 155080
+MISMATCH C[4][9]: got 0, expected 156240
+MISMATCH C[4][10]: got 0, expected 157400
+MISMATCH C[4][11]: got 0, expected 158560
+MISMATCH C[4][12]: got 0, expected 159720
+MISMATCH C[4][13]: got 0, expected 160880
+MISMATCH C[4][14]: got 0, expected 162040
+MISMATCH C[4][15]: got 0, expected 163200
+MISMATCH C[5][0]: got 0, expected 176776
+MISMATCH C[5][1]: got 0, expected 178192
+MISMATCH C[5][2]: got 0, expected 179608
+MISMATCH C[5][3]: got 0, expected 181024
+MISMATCH C[5][4]: got 0, expected 182440
+MISMATCH C[5][5]: got 16779264, expected 183856
+MISMATCH C[5][6]: got 0, expected 185272
+MISMATCH C[5][7]: got 0, expected 186688
+MISMATCH C[5][8]: got 0, expected 188104
+MISMATCH C[5][9]: got 1, expected 189520
+MISMATCH C[5][10]: got 1024, expected 190936
+MISMATCH C[5][11]: got 0, expected 192352
+MISMATCH C[5][12]: got 4, expected 193768
+MISMATCH C[5][13]: got 0, expected 195184
+MISMATCH C[5][14]: got 16384, expected 196600
+MISMATCH C[5][15]: got 1028, expected 198016
+MISMATCH C[6][0]: got 0, expected 207752
+MISMATCH C[6][1]: got 0, expected 209424
+MISMATCH C[6][2]: got 0, expected 211096
+MISMATCH C[6][3]: got 0, expected 212768
+MISMATCH C[6][4]: got 0, expected 214440
+MISMATCH C[6][5]: got 0, expected 216112
+MISMATCH C[6][6]: got 0, expected 217784
+MISMATCH C[6][7]: got 0, expected 219456
+MISMATCH C[6][8]: got 0, expected 221128
+MISMATCH C[6][9]: got 0, expected 222800
+MISMATCH C[6][10]: got 2048, expected 224472
+MISMATCH C[6][11]: got 67108864, expected 226144
+MISMATCH C[6][12]: got 0, expected 227816
+MISMATCH C[6][13]: got 0, expected 229488
+MISMATCH C[6][14]: got 0, expected 231160
+MISMATCH C[6][15]: got 0, expected 232832
+MISMATCH C[7][0]: got 0, expected 238728
+MISMATCH C[7][1]: got 0, expected 240656
+MISMATCH C[7][2]: got 0, expected 242584
+MISMATCH C[7][3]: got 0, expected 244512
+MISMATCH C[7][4]: got 0, expected 246440
+MISMATCH C[7][5]: got 0, expected 248368
+MISMATCH C[7][6]: got 0, expected 250296
+MISMATCH C[7][7]: got 0, expected 252224
+MISMATCH C[7][8]: got 16, expected 254152
+MISMATCH C[7][9]: got 65536, expected 256080
+MISMATCH C[7][10]: got 0, expected 258008
+MISMATCH C[7][11]: got 16777216, expected 259936
+MISMATCH C[7][12]: got 1024, expected 261864
+MISMATCH C[7][13]: got 536870912, expected 263792
+MISMATCH C[7][14]: got 8388608, expected 265720
+MISMATCH C[7][15]: got 16777216, expected 267648
+MISMATCH C[8][0]: got 0, expected 269704
+MISMATCH C[8][1]: got 0, expected 271888
+MISMATCH C[8][2]: got 0, expected 274072
+MISMATCH C[8][3]: got 0, expected 276256
+MISMATCH C[8][4]: got 0, expected 278440
+MISMATCH C[8][5]: got 0, expected 280624
+MISMATCH C[8][6]: got 0, expected 282808
+MISMATCH C[8][7]: got 0, expected 284992
+MISMATCH C[8][8]: got 0, expected 287176
+MISMATCH C[8][9]: got 128, expected 289360
+MISMATCH C[8][10]: got 0, expected 291544
+MISMATCH C[8][11]: got 524288, expected 293728
+MISMATCH C[8][12]: got 33587200, expected 295912
+MISMATCH C[8][13]: got 0, expected 298096
+MISMATCH C[8][14]: got -2147483136, expected 300280
+MISMATCH C[8][15]: got 0, expected 302464
+MISMATCH C[9][0]: got 0, expected 300680
+MISMATCH C[9][1]: got 0, expected 303120
+MISMATCH C[9][2]: got 16777216, expected 305560
+MISMATCH C[9][3]: got 0, expected 308000
+MISMATCH C[9][4]: got 0, expected 310440
+MISMATCH C[9][5]: got 268435456, expected 312880
+MISMATCH C[9][6]: got 0, expected 315320
+MISMATCH C[9][7]: got 4096, expected 317760
+MISMATCH C[9][8]: got 0, expected 320200
+MISMATCH C[9][9]: got 0, expected 322640
+MISMATCH C[9][10]: got 0, expected 325080
+MISMATCH C[9][11]: got 0, expected 327520
+MISMATCH C[9][12]: got 0, expected 329960
+MISMATCH C[9][13]: got 0, expected 332400
+MISMATCH C[9][14]: got 0, expected 334840
+MISMATCH C[9][15]: got 0, expected 337280
+MISMATCH C[10][0]: got 0, expected 331656
+MISMATCH C[10][1]: got 0, expected 334352
+MISMATCH C[10][2]: got 0, expected 337048
+MISMATCH C[10][3]: got 0, expected 339744
+MISMATCH C[10][4]: got 32768, expected 342440
+MISMATCH C[10][5]: got 0, expected 345136
+MISMATCH C[10][6]: got 268435456, expected 347832
+MISMATCH C[10][7]: got 512, expected 350528
+MISMATCH C[10][8]: got 0, expected 353224
+MISMATCH C[10][9]: got 32, expected 355920
+MISMATCH C[10][10]: got 1, expected 358616
+MISMATCH C[10][11]: got 0, expected 361312
+MISMATCH C[10][12]: got 0, expected 364008
+MISMATCH C[10][13]: got 0, expected 366704
+MISMATCH C[10][14]: got 0, expected 369400
+MISMATCH C[10][15]: got 131072, expected 372096
+MISMATCH C[11][0]: got 2176, expected 362632
+MISMATCH C[11][1]: got 524288, expected 365584
+MISMATCH C[11][2]: got 1048576, expected 368536
+MISMATCH C[11][3]: got 0, expected 371488
+MISMATCH C[11][4]: got 33554432, expected 374440
+MISMATCH C[11][5]: got 67108864, expected 377392
+MISMATCH C[11][6]: got 0, expected 380344
+MISMATCH C[11][7]: got 0, expected 383296
+MISMATCH C[11][8]: got 0, expected 386248
+MISMATCH C[11][9]: got 2097152, expected 389200
+MISMATCH C[11][10]: got 0, expected 392152
+MISMATCH C[11][11]: got 0, expected 395104
+MISMATCH C[11][12]: got 2097152, expected 398056
+MISMATCH C[11][13]: got 0, expected 401008
+MISMATCH C[11][14]: got 0, expected 403960
+MISMATCH C[11][15]: got 1, expected 406912
+MISMATCH C[12][0]: got 258, expected 393608
+MISMATCH C[12][1]: got 0, expected 396816
+MISMATCH C[12][2]: got 1, expected 400024
+MISMATCH C[12][3]: got 1024, expected 403232
+MISMATCH C[12][4]: got 32, expected 406440
+MISMATCH C[12][5]: got 0, expected 409648
+MISMATCH C[12][6]: got 134217728, expected 412856
+MISMATCH C[12][7]: got 67141648, expected 416064
+MISMATCH C[12][8]: got 278528, expected 419272
+MISMATCH C[12][9]: got 1024, expected 422480
+MISMATCH C[12][10]: got 0, expected 425688
+MISMATCH C[12][11]: got 0, expected 428896
+MISMATCH C[12][12]: got 268435456, expected 432104
+MISMATCH C[12][13]: got 16, expected 435312
+MISMATCH C[12][14]: got 1024, expected 438520
+MISMATCH C[12][15]: got 134217728, expected 441728
+MISMATCH C[13][0]: got 0, expected 424584
+MISMATCH C[13][1]: got 0, expected 428048
+MISMATCH C[13][2]: got 0, expected 431512
+MISMATCH C[13][3]: got 0, expected 434976
+MISMATCH C[13][4]: got 1048576, expected 438440
+MISMATCH C[13][5]: got 67112960, expected 441904
+MISMATCH C[13][6]: got 2, expected 445368
+MISMATCH C[13][7]: got 33587232, expected 448832
+MISMATCH C[13][8]: got 0, expected 452296
+MISMATCH C[13][9]: got 0, expected 455760
+MISMATCH C[13][10]: got 393216, expected 459224
+MISMATCH C[13][11]: got 0, expected 462688
+MISMATCH C[13][12]: got 0, expected 466152
+MISMATCH C[13][13]: got 0, expected 469616
+MISMATCH C[13][14]: got 0, expected 473080
+MISMATCH C[13][15]: got 0, expected 476544
+MISMATCH C[14][0]: got 8388608, expected 455560
+MISMATCH C[14][1]: got 0, expected 459280
+MISMATCH C[14][2]: got 0, expected 463000
+MISMATCH C[14][3]: got 0, expected 466720
+MISMATCH C[14][4]: got 131072, expected 470440
+MISMATCH C[14][5]: got 64, expected 474160
+MISMATCH C[14][6]: got 0, expected 477880
+MISMATCH C[14][7]: got 0, expected 481600
+MISMATCH C[14][8]: got 0, expected 485320
+MISMATCH C[14][9]: got 0, expected 489040
+MISMATCH C[14][10]: got 33562624, expected 492760
+MISMATCH C[14][11]: got 67108864, expected 496480
+MISMATCH C[14][12]: got 134217728, expected 500200
+MISMATCH C[14][13]: got 0, expected 503920
+MISMATCH C[14][14]: got 0, expected 507640
+MISMATCH C[14][15]: got 0, expected 511360
+MISMATCH C[15][0]: got 0, expected 486536
+MISMATCH C[15][1]: got 0, expected 490512
+MISMATCH C[15][2]: got 16777216, expected 494488
+MISMATCH C[15][3]: got 16777216, expected 498464
+MISMATCH C[15][4]: got 100663296, expected 502440
+MISMATCH C[15][5]: got 0, expected 506416
+MISMATCH C[15][6]: got 0, expected 510392
+MISMATCH C[15][7]: got 4096, expected 514368
+MISMATCH C[15][8]: got 0, expected 518344
+MISMATCH C[15][9]: got 32768, expected 522320
+MISMATCH C[15][10]: got 0, expected 526296
+MISMATCH C[15][11]: got 256, expected 530272
+MISMATCH C[15][12]: got 0, expected 534248
+MISMATCH C[15][13]: got 0, expected 538224
+MISMATCH C[15][14]: got 0, expected 542200
+MISMATCH C[15][15]: got 0, expected 546176
+FAIL: 256 mismatches.
+[aie_runtime] auto_teardown (destructor)
+[aie_runtime] device_teardown
+[aie_runtime] device_teardown done rc=0
+
+[Program completed after 5s]
+
+============================================================
+CONSOLE OUTPUT SUMMARY:
+============================================================
+
+>>> Cleaning up Connection 1...
+[Kxsdb% con[Kcon
+[KInfo: Cortex-A78AE #0.0 (target 20) Running
+xsdb% [Kxsdb% [Kxsdb% stop[Kstop
+[KInfo: Cortex-A78AE #0.0 (target 20) Stopped at 0x40950 (External Debug Request)_exit() at _exit.c: 16
+16: couldn't open "/scratch/staff/huaj/amdaiehlc/opensource/xilinx/aiehlc/thirdparty/arch/cortexa78_0/workspace/platform_baremetal/cortexa78_0/standalone_cortexa78_0/bsp/libsrc/standalone/src/arm/common/gcc/_exit.c": no such file or directory
+xsdb% [Kxsdb% [Kxsdb% exit[Kexit
+exit
+[Kxsdb% [Kxsdb% [Connection 1] Warning: exit xsdb timed out, continuing cleanup...
+[Connection 1] Exited xsdb, powering off...
+[Kxsdb% power 0[Kpower 0
+[Kinvalid command name "power"
+xsdb% [Kxsdb% [Connection 1] Warning: power off timed out
+[Connection 1] Power off complete
+
+============================================================
+Test complete!
+============================================================
+
+Connections closed.

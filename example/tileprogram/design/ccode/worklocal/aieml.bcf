@@ -1,0 +1,12 @@
+_entry_point _main_init
+_symbol _main _after  _main_init
+_symbol _main_init 0
+_symbol buf_in_ping_0 0x78000
+_symbol buf_in_pong_0 0x78040
+_symbol buf_in_ping_1 0x78080
+_symbol buf_in_pong_1 0x780c0
+_symbol buf_out_ping_0 0x78100
+_symbol buf_out_pong_0 0x78140
+_stack DM_stack 0x70000 0x1024
+_reserved DMb 0x40000 0x10000
+_reserved DMb 0x7f800 0x800

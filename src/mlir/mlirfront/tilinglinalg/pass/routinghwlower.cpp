@@ -229,14 +229,14 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
        // /*
         auto packetType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_Packet");
 
-        // Generate designated initializer: {.PktId=<id>, .PktType=<type>}
+        // Use XAie_PacketInit(id, type) — C++-compatible function call
         std::string slavePktStr =
-            "{.PktId=" + std::to_string(slave_pkt_idx) + ", .PktType=" + std::to_string(slave_pkt_type) + "}";
+            "XAie_PacketInit(" + std::to_string(slave_pkt_idx) + ", " + std::to_string(slave_pkt_type) + ")";
         auto packetLocOp = rewriter.create<emitc::ConstantOp>(
             op->getLoc(), packetType, emitc::OpaqueAttr::get(rewriter.getContext(), slavePktStr));
 
         std::string dmaPktStr =
-            "{.PktId=" + std::to_string(dma_pkt_idx) + ", .PktType=" + std::to_string(dma_pkt_type) + "}";
+            "XAie_PacketInit(" + std::to_string(dma_pkt_idx) + ", " + std::to_string(dma_pkt_type) + ")";
         auto packetLocDMAOp = rewriter.create<emitc::ConstantOp>(
             op->getLoc(), packetType, emitc::OpaqueAttr::get(rewriter.getContext(), dmaPktStr));
 
@@ -251,12 +251,16 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
         Value slaveidx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(slaveportidx));
         Value slaveslotnum = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
         Value dmamask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0x1f));
+        StringRef calleeSPE = "XAie_StrmPktSwSlavePortEnable";
         //receive pkt from neighbor
         if (PortDirectiontoString(PortDirection::NONE) != slaveportdirectionstr) {
             auto callOpSPort = rewriter.create<mlir::emitc::CallOp>(
                 op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS,
                 ValueRange{deviceInst, tileLocOp.getResult(0), slaveport, slaveidx, slaveslotnum,
                            packetLocOp.getResult(), mask, msel, abitr});
+            // Enable the slave port itself (port-level gate, register 0x3F100+port*4 bit[31])
+            rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeSPE,
+                                                 ValueRange{deviceInst, tileLocOp.getResult(0), slaveport, slaveidx});
         }
 
         if ( PortDirectiontoString(PortDirection::NONE) != dmadirectionstr) {
@@ -267,6 +271,9 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
                 op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeS,
                 ValueRange{deviceInst, tileLocOp.getResult(0), dmaport, dmaportn, dmaportslotn,
                            packetLocDMAOp.getResult(), dmamask, msel, abitr});
+            // Enable the DMA slave port itself (port-level gate, register 0x3F104 bit[31])
+            rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeSPE,
+                                                 ValueRange{deviceInst, tileLocOp.getResult(0), dmaport, dmaportn});
         }
           
         //*///*
@@ -282,9 +289,19 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(1));
             Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
 
-            Value dropheadervalue = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
-                                            mlir::emitc::OpaqueAttr::get(rewriter.getContext(), dropheader));
-            auto callOpMport = rewriter.create<mlir::emitc::CallOp>(op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeM, 
+            // DROP_HEADER only at the PKT→CIRC transition (last PKT hop).
+            // The transition op has both slave=NONE and DMA=NONE (it's the second op
+            // of the last PKT tile, created by ParseTheCCTRoutingPath).
+            // Intermediate PKT hops must preserve the header so the next PKT slave
+            // can read it; dropping early causes the downstream PKT switch to consume
+            // a data word as a fake header, losing one element per BD.
+            bool isLastPktHop = (slaveportdirectionstr == PortDirectiontoString(PortDirection::NONE) &&
+                                 dmadirectionstr == PortDirectiontoString(PortDirection::NONE));
+            auto headerPolicy = isLastPktHop ? dropheader : nodropheader;
+            Value dropheadervalue = rewriter.create<mlir::emitc::ConstantOp>(
+                op->getLoc(), stringType1, mlir::emitc::OpaqueAttr::get(rewriter.getContext(), headerPolicy));
+            auto callOpMport = rewriter.create<mlir::emitc::CallOp>(
+                op->getLoc(), TypeRange{rewriter.getI32Type()}, calleeM,
                 ValueRange{deviceInst, tileLocOp.getResult(0), masterport, masteridx, dropheadervalue, abitr2, msel2});
         }
         //*/
@@ -626,6 +643,9 @@ void declareAieTileFunction(mlir::ModuleOp module) {
   mlir::FunctionType tilepksalveEnableType = builder.getFunctionType({devInstPtrType, xaieLocType, stringType,i32Type,i32Type, xaiepacket,i32Type,i32Type,i32Type}, {i32Type});
   //driverStatus |= XAie_StrmPktSwMstrPortEnable(&DevInst, XAie_TileLoc(0, 4), SOUTH, 3, XAIE_SS_PKT_DROP_HEADER, 0, 0x1);
   mlir::FunctionType tilepkmasterEnableType = builder.getFunctionType({devInstPtrType, xaieLocType, stringType,i32Type,stringType,i32Type,i32Type}, {i32Type});
+  // XAie_StrmPktSwSlavePortEnable(DevInst*, TileLoc, StrmSwPortType, portNum) -> i32
+  mlir::FunctionType tileSlavePortEnableType =
+      builder.getFunctionType({devInstPtrType, xaieLocType, stringType, i32Type}, {i32Type});
 
   auto decl1 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_TileLoc", funcType);
   decl1.setVisibility(SymbolTable::Visibility::Private);
@@ -647,6 +667,9 @@ void declareAieTileFunction(mlir::ModuleOp module) {
 
   auto decl6 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_StrmPktSwMstrPortEnable", tilepkmasterEnableType);
   decl6.setVisibility(SymbolTable::Visibility::Private);
+
+  auto decl7 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_StrmPktSwSlavePortEnable", tileSlavePortEnableType);
+  decl7.setVisibility(SymbolTable::Visibility::Private);
 }
 
 void RoutingHWLowerPass::runOnOperation() {
@@ -661,6 +684,7 @@ void RoutingHWLowerPass::runOnOperation() {
     target.addIllegalOp<routinghw::EnableExtToAieShimPort>();
     target.addIllegalOp<routinghw::EnableAieToExtShimPort>();
     target.addIllegalOp<routinghw::ConnectStreamSingleSwitchPort>();
+    target.addIllegalOp<routinghw::ConnectStreamPktSwitchPort>();
     target.addIllegalOp<routinghw::TileCreate>();
     target.addIllegalOp<routinghw::IOShimTileCreate>();
     target.addIllegalOp<routinghw::TileArrayHandleCreate>();

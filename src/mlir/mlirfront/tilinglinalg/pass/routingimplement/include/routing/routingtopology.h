@@ -15,6 +15,10 @@ public:
     explicit RoutingTopology(std::string gen, std::string name="");
     std::shared_ptr<DataIO> createDataIO(std::string dioName);
     std::shared_ptr<DataIO> createDataIO(std::string dioName, std::optional<TypeBasedTileLoc> loc, DMADIRECTION direct=DMADIRECTION::MM2S);
+    // Create a DataIO at a specific shim point without allocating a new shim channel.
+    // Used for gather paths that share the output flow's shim tile.
+    std::shared_ptr<DataIO> createDataIOAtPoint(std::string dioName, Point shimPoint, DMADIRECTION direction,
+                                                int channel);
     std::optional<std::shared_ptr<const RoutingPath>> createPath(int dioID, std::vector<Point> dsttiles);
     const std::vector<std::shared_ptr<RoutingPath>>& paths() const { return paths_; }
     std::vector<Point> ReserveTiles(int nums,int dioID=-1);

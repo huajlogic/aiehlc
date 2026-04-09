@@ -27,22 +27,20 @@ namespace mlir {
 /// 4. Erase all other dfschedule operations
 class DfscheduleToApiPass : public PassWrapper<DfscheduleToApiPass, OperationPass<ModuleOp>> {
 public:
-    DfscheduleToApiPass() = default;
+  explicit DfscheduleToApiPass(bool enableDebug = false) : enableDebug_(enableDebug) {}
 
-    StringRef getArgument() const final { return "dfschedule-to-api"; }
-    StringRef getDescription() const final { 
-        return "Convert dfschedule operations to API calls and EmitC"; 
+  StringRef getArgument() const final { return "dfschedule-to-api"; }
+  StringRef getDescription() const final { return "Convert dfschedule operations to API calls and EmitC"; }
+
+  void runOnOperation() override;
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+      registry.insert<func::FuncDialect, arith::ArithDialect, emitc::EmitCDialect, scf::SCFDialect,
+                      tensor::TensorDialect>();
     }
-    
-    void runOnOperation() override;
-    
-    void getDependentDialects(DialectRegistry &registry) const override {
-        registry.insert<func::FuncDialect, 
-                        arith::ArithDialect,
-                        emitc::EmitCDialect,
-                        scf::SCFDialect,
-                        tensor::TensorDialect>();
-    }
+
+  private:
+    bool enableDebug_ = false;
 };
 
 } // namespace mlir

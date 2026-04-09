@@ -1,0 +1,768 @@
+/******************************************************************************
+* Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
+#include "tilinglinalg_pipeline.h"
+
+#include "passblueprinttoschedule.h"
+#include "passblueprinttoschedulekernel.h"
+#include "passdfscheduletoapi.h"
+#include "passdfscheduletokernelapi.h"
+#include "passdmaphoptodfscheblueprint.h"
+#include "passdmaphoptoroutinghw.h"
+#include "dmaptodmaphop.h"
+#include "routingtodmap.h"
+#include "passschedulecanonicalize.h"
+#include "routinghwlower.h"
+#include "routinglower.h"
+#include "routingunrolling.h"
+#include "routingdeadargclean.h"
+#include "routingconstantfold.h"
+#include "kernelconfig.h"
+#include "hw/ResourceManager.h"
+
+#include "routingmanager.h"
+#include "routinghwmanager.h"
+#include "dmapmanager.h"
+#include "dmaphopmanager.h"
+#include "dfschedulemanager.h"
+#include "dfscheblueprintmanager.h"
+
+#include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/Transforms/Passes.h"
+#include "mlir/Target/Cpp/CppEmitter.h"
+
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <iostream>
+
+using namespace mlir;
+
+// ---------------------------------------------------------------------------
+// Helpers (same as unitest/test.cpp)
+// ---------------------------------------------------------------------------
+
+static std::string setupPipelineIRDir(const std::string &subdir) {
+    llvm::SmallString<256> cwdPath;
+    if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
+        llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
+        return "";
+    }
+    std::string dir = (cwdPath + "/../ir/" + subdir).str();
+    if (std::error_code EC = llvm::sys::fs::create_directories(dir)) {
+        llvm::errs() << "Failed to create IR directory " << dir << ": " << EC.message() << "\n";
+        return "";
+    }
+    std::cout << "IR output directory: " << dir << std::endl;
+    return dir;
+}
+
+static void dumpPipelineIRToFile(mlir::ModuleOp module, const std::string &dir, int stage, const std::string &passName) {
+    if (dir.empty())
+        return;
+    std::string filename = dir + "/" + std::to_string(stage) + "_" + passName + ".mlir";
+    std::error_code ec;
+    llvm::raw_fd_ostream os(filename, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+        llvm::errs() << "Failed to write IR to " << filename << ": " << ec.message() << "\n";
+        return;
+    }
+    module.print(os);
+    std::cout << "  IR -> " << filename << std::endl;
+}
+
+static bool runPipelineSinglePass(MLIRContext &ctx, mlir::ModuleOp module, std::unique_ptr<mlir::Pass> pass,
+                          const std::string &irDir, int &stage, const std::string &passName) {
+    mlir::PassManager singlePm(&ctx);
+    singlePm.addPass(std::move(pass));
+    if (failed(singlePm.run(module))) {
+        llvm::errs() << "ERROR: " << passName << " failed!\n";
+        return false;
+    }
+    dumpPipelineIRToFile(module, irDir, stage, passName);
+    stage++;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// TilingLinalgPipeline implementation
+// ---------------------------------------------------------------------------
+
+void TilingLinalgPipeline::registerDialects(mlir::MLIRContext &ctx) {
+    // Instantiate dialect managers to trigger registration
+    routingmanager mtest;
+    routinghwmanager mtesthw;
+    dmapmanager mdmaptest;
+    dmaphopmanager dmaphoptest;
+    dfschedulemanager dfscheduletest;
+    dfscheblueprintmanager dfscheblueprinttest;
+
+    mtest.loaddialect(&ctx);
+    mtesthw.loaddialect(&ctx);
+    mdmaptest.loaddialect(&ctx);
+    dmaphoptest.loaddialect(&ctx);
+    dfscheduletest.loaddialect(&ctx);
+    dfscheblueprinttest.loaddialect(&ctx);
+
+    ctx.getOrLoadDialect<arith::ArithDialect>();
+    ctx.getOrLoadDialect<mlir::func::FuncDialect>();
+    ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    ctx.getOrLoadDialect<mlir::tensor::TensorDialect>();
+    ctx.getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
+    ctx.getOrLoadDialect<mlir::emitc::EmitCDialect>();
+}
+
+mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(
+    mlir::MLIRContext &ctx,
+    int meshRows, int meshCols,
+    const std::vector<TensorParam> &tensors) {
+
+    // This is a parameterized version of routingmanager::ops_testNew()
+    using namespace routing;
+
+    OpBuilder builder(&ctx);
+    mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
+
+    // Build function type WITH memref arguments — one per tensor.
+    // Each memref represents an external DDR pointer provided by the caller.
+    SmallVector<Type> argTypes;
+    for (const auto &tp : tensors) {
+        auto elementType = builder.getIntegerType(tp.elementBitWidth);
+        auto memrefType = MemRefType::get(tp.shape, elementType);
+        argTypes.push_back(memrefType);
+    }
+    auto functype = builder.getFunctionType(argTypes, {});
+    mlir::func::FuncOp hostFunc = builder.create<func::FuncOp>(builder.getUnknownLoc(), "main", functype);
+
+    auto block = hostFunc.addEntryBlock();
+    builder.setInsertionPointToEnd(block);
+    auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(), meshRows, meshCols);
+
+    for (unsigned i = 0; i < tensors.size(); ++i) {
+        const auto &tp = tensors[i];
+
+        // Build shape attributes
+        SmallVector<Attribute> shape;
+        for (int64_t v : tp.shape)
+            shape.push_back(builder.getI64IntegerAttr(v));
+        ArrayAttr vals = builder.getArrayAttr(shape);
+        IntegerAttr dimnum = builder.getI64IntegerAttr(tp.shape.size());
+
+        // Build tensor type
+        auto elementType = builder.getIntegerType(tp.elementBitWidth);
+        auto tensorType = RankedTensorType::get(tp.shape, elementType);
+
+        // Get the func argument (memref from user's DDR pointer)
+        Value memrefArg = block->getArgument(i);
+
+        // Convert memref -> tensor (logical view, zero-copy)
+        auto tensorValue = builder.create<bufferization::ToTensorOp>(builder.getUnknownLoc(), tensorType, memrefArg);
+
+        // Feed into createscheduletensor — same as before
+        auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, tensorValue.getResult(),
+                                                           vals, dimnum);
+
+        // Create routing function for this tensor
+        routingmanager rm;
+        rm.createroutingfuncByDim(builder, &ctx, tp.isInput, mesh, tensor, meshRows, "row");
+    }
+
+    builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
+    m.push_back(hostFunc);
+    llvm::errs() << m;
+    return m;
+}
+
+bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
+                                       const std::string &userKernelBody, const std::string &userKernelFuncName,
+                                       int runtimeDebugLevel, const std::string &userRewrittenSource,
+                                       const std::vector<TensorParam> &tensors) {
+
+    RoutingTopology rtopology("Gen2");
+
+    std::string irDir = setupPipelineIRDir("dfschedule");
+    int stage = 0;
+
+    dumpPipelineIRToFile(module, irDir, stage++, "initial");
+
+    // Phase 1: routing -> dmap -> dmaphop -> dfscheblueprint
+    if (!runPipelineSinglePass(ctx, module, std::make_unique<RoutingUnrollingLowerPass>(), irDir, stage,
+                       "RoutingUnrollingLowerPass"))
+        return false;
+    if (!runPipelineSinglePass(ctx, module, std::make_unique<RoutingToDmapPass>(rtopology), irDir, stage, "RoutingToDmapPass"))
+        return false;
+    if (!runPipelineSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage, "DmapToDmaphopPass"))
+        return false;
+
+    // Clone the module at dmaphop stage for the routing path (Phase 5).
+    // This preserves the pkt_ids allocated by DmapToDmaphopPass so that
+    // routing.cc and host.cc use the same packet IDs.
+    mlir::ModuleOp routingDmaphopModule = cast<ModuleOp>(module->clone());
+
+    // Rename @main → @routing in the clone so that routing.cc emits
+    // void routing() instead of void main().
+    // Keep memref func args intact — routing lowering passes need the tensor
+    // operands connected through bufferization.to_tensor. RoutingDeadArgPass
+    // will strip unused args after lowering.
+    for (auto func : routingDmaphopModule.getOps<mlir::func::FuncOp>()) {
+        if (func.getName() == "main")
+            func.setName("routing");
+    }
+
+    if (!runPipelineSinglePass(ctx, module, std::make_unique<DmaphopTodfscheblueprintPass>(), irDir, stage,
+                       "DmaphopTodfscheblueprintPass"))
+        return false;
+
+    // Clone for host and kernel paths
+    mlir::ModuleOp kernelModule = cast<ModuleOp>(module->clone());
+    mlir::ModuleOp hostModule = cast<ModuleOp>(module->clone());
+
+    // Initialize ResourceMgr singleton for CoreMemAllocator (BCF/PRX generation)
+    {
+        auto hwRes = makeResource("Gen2");
+        ResourceMgr::init(std::move(hwRes));
+    }
+
+    // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5), irDir, stage,
+                       "BlueprintToSchedulePass"))
+        return false;
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
+                       "ScheduleCanonicalizePass"))
+        return false;
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true), irDir, stage,
+                       "DfscheduleToApiPass"))
+        return false;
+    if (!runPipelineSinglePass(ctx, hostModule, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
+        return false;
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
+                       "RoutingConstantFoldPass"))
+        return false;
+
+    // Phase 3: kernel path (blueprint -> kernel schedule -> kernel API)
+    if (!runPipelineSinglePass(ctx, kernelModule, std::make_unique<mlir::BlueprintToScheduleKernelPass>(0.5), irDir, stage,
+                       "BlueprintToScheduleKernelPass"))
+        return false;
+
+    // Extract kernel parameter info from KernelModuleOp (before DfscheduleToKernelApiPass lowers it)
+    int numInputWindows = 0;
+    int numOutputWindows = 0;
+    std::string kernelElementType = "int32";
+    std::string computeKernelName = "computekernel";
+    kernelModule->walk([&](dfschedule::KernelDeclOp declOp) {
+        computeKernelName = declOp.getSymName().str();
+        auto declAttrs = declOp.getDeclAttrs();
+        if (auto inputs = declAttrs.getAs<mlir::ArrayAttr>("inputs"))
+            numInputWindows = inputs.size();
+        if (auto outputs = declAttrs.getAs<mlir::ArrayAttr>("outputs"))
+            numOutputWindows = outputs.size();
+    });
+    kernelModule->walk([&](dfschedule::KernelConfigDefOp configOp) {
+        auto attrs = configOp.getConfigAttrs();
+        if (auto typeAttr = attrs.getAs<mlir::TypeAttr>("element_type")) {
+            mlir::Type t = typeAttr.getValue();
+            if (t.isInteger(32)) kernelElementType = "int32";
+            else if (t.isInteger(16)) kernelElementType = "int16";
+            else if (t.isInteger(8)) kernelElementType = "int8";
+            else if (t.isF32()) kernelElementType = "float";
+        }
+    });
+
+    // Override compute kernel name with user's __global__ function name if provided.
+    // This renames KernelDeclOp in the IR so kernel.cc calls the user's function name
+    // and the output file is named accordingly (e.g. matmul.cc instead of computekernel.cc).
+    if (!userKernelFuncName.empty() && userKernelFuncName != computeKernelName) {
+        std::string newKernelFile = userKernelFuncName + ".cc";
+        auto renameKernelInModule = [&](mlir::ModuleOp mod) {
+            mod->walk([&](dfschedule::KernelDeclOp declOp) {
+                declOp.setSymNameAttr(mlir::StringAttr::get(&ctx, userKernelFuncName));
+            });
+            mod->walk([&](dfschedule::KernelInvokeOp invokeOp) {
+                invokeOp.setKernelRefAttr(SymbolRefAttr::get(&ctx, userKernelFuncName));
+            });
+            mod->walk([&](dfschedule::KernelConfigDefOp configOp) {
+                auto oldAttrs = configOp.getConfigAttrs();
+                NamedAttrList newAttrs;
+                for (auto &namedAttr : oldAttrs) {
+                    if (namedAttr.getName() == "kernel_name")
+                        newAttrs.append("kernel_name", StringAttr::get(&ctx, userKernelFuncName));
+                    else if (namedAttr.getName() == "kernel_file")
+                        newAttrs.append("kernel_file", StringAttr::get(&ctx, newKernelFile));
+                    else
+                        newAttrs.append(namedAttr);
+                }
+                configOp.setConfigAttrsAttr(DictionaryAttr::get(&ctx, newAttrs));
+            });
+        };
+        renameKernelInModule(kernelModule);
+        renameKernelInModule(hostModule);
+        std::cout << "Overriding compute kernel name: " << computeKernelName
+                  << " -> " << userKernelFuncName << " (file: " << newKernelFile << ")" << std::endl;
+        computeKernelName = userKernelFuncName;
+    }
+
+    if (!runPipelineSinglePass(ctx, kernelModule, std::make_unique<mlir::DfscheduleToKernelApiPass>(), irDir, stage,
+                       "DfscheduleToKernelApiPass"))
+        return false;
+
+    // Create output directory
+    if (std::error_code EC = llvm::sys::fs::create_directories(outputDir)) {
+        llvm::errs() << "Failed to create directory " << outputDir << ": " << EC.message() << "\n";
+        return false;
+    }
+
+    // Erase func.func @main from hostModule before EmitC emission.
+    // After ScheduleCanonicalizePass, @main only contains dfschedule.launchhost
+    // + return; all real logic lives in dfschedule.host @host_canonicalized
+    // (now emitc.func @host_canonicalized). The user source provides its own
+    // main() via __aie_launch(), so we must not emit a competing main().
+    for (auto func : llvm::make_early_inc_range(hostModule.getOps<mlir::func::FuncOp>())) {
+        if (func.getName() == "main") {
+            func->dropAllUses();
+            func.erase();
+        }
+    }
+
+    // Emit host.cc
+    {
+        std::string hostPath = outputDir + "/host.cc";
+        std::error_code ec;
+        llvm::raw_fd_ostream stream(hostPath, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+            llvm::errs() << "Failed to open " << hostPath << ": " << ec.message() << "\n";
+            return false;
+        }
+        // Emit strong g_runtime_debug_level override if user set #pragma aie_debug_level
+        if (runtimeDebugLevel >= 0) {
+            stream << "// Override runtime debug level (from #pragma aie_debug_level)\n";
+            stream << "int g_runtime_debug_level = " << runtimeDebugLevel << ";\n\n";
+        }
+        if (failed(mlir::emitc::translateToCpp(hostModule, stream))) {
+            llvm::errs() << "Failed to translate host MLIR to C++.\n";
+            return false;
+        }
+
+        // Append user's rewritten source code after MLIR-generated functions.
+        // The user source provides main() and calls host_canonicalized() via __aie_launch().
+        if (!userRewrittenSource.empty()) {
+            stream << "\n// ===== User source (preserved from original file) =====\n";
+
+            // Count the number of void* args on host_canonicalized
+            unsigned numArgs = 0;
+            for (auto func : hostModule.getOps<emitc::FuncOp>()) {
+                if (func.getName() == "host_canonicalized") {
+                    numArgs = func.getNumArguments();
+                    break;
+                }
+            }
+            if (numArgs == 0) {
+                for (auto func : hostModule.getOps<mlir::func::FuncOp>()) {
+                    if (func.getName() == "host_canonicalized") {
+                        numArgs = func.getNumArguments();
+                        break;
+                    }
+                }
+            }
+
+            // Suppress the Clang-phase stubs (which had wrong arity) and emit
+            // correct __aie_launch that forwards DDR pointers.
+            stream << "#define AIEHLC_TILING_STUBS_DEFINED\n";
+            stream << "struct aieDim { int rows, cols; aieDim(int r, int c) : rows(r), cols(c) {} };\n";
+            stream << "inline void aieSetDevice(int) {}\n";
+            stream << "inline void aieDeviceSynchronize() {}\n";
+            if (numArgs > 0) {
+                stream << "inline void __aie_launch(const char* kernel, aieDim mesh";
+                for (unsigned i = 0; i < numArgs; ++i)
+                    stream << ", void* _t" << i;
+                stream << ", ...) {\n";
+                stream << "    (void)kernel; (void)mesh;\n";
+                stream << "    host_canonicalized(";
+                for (unsigned i = 0; i < numArgs; ++i) {
+                    if (i > 0)
+                        stream << ", ";
+                    stream << "_t" << i;
+                }
+                stream << ");\n}\n";
+            } else {
+                stream << "template<typename... Args>\n";
+                stream << "inline void __aie_launch(const char* kernel, aieDim mesh, Args... args) {\n";
+                stream << "    host_canonicalized();\n}\n";
+            }
+
+            stream << userRewrittenSource << "\n";
+        } else if (!tensors.empty()) {
+            // Standalone / unittest mode: generate a default main() that
+            // allocates DDR buffers matching the tensor parameters, fills
+            // inputs with test data, calls host_canonicalized(), and prints
+            // output. device_init/teardown is handled by __Runtime_auto_init/
+            // __Runtime_auto_teardown constructors in aie_runtime.c.
+
+            // Count the number of void* args on host_canonicalized
+            unsigned numArgs = 0;
+            for (auto func : hostModule.getOps<emitc::FuncOp>()) {
+                if (func.getName() == "host_canonicalized") {
+                    numArgs = func.getNumArguments();
+                    break;
+                }
+            }
+            if (numArgs == 0) {
+                for (auto func : hostModule.getOps<mlir::func::FuncOp>()) {
+                    if (func.getName() == "host_canonicalized") {
+                        numArgs = func.getNumArguments();
+                        break;
+                    }
+                }
+            }
+
+            stream << "\n// ===== Auto-generated main() for standalone testing =====\n";
+            stream << "#include <stdio.h>\n";
+            stream << "#include <stdlib.h>\n";
+            stream << "#include <string.h>\n\n";
+            stream << "#define __global__\n\n";
+
+            // Forward-declare host_canonicalized
+            stream << "void host_canonicalized(";
+            for (unsigned i = 0; i < numArgs; ++i) {
+                if (i > 0)
+                    stream << ", ";
+                stream << "void*";
+            }
+            stream << ");\n\n";
+
+            // Extern kernel binary symbols
+            stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_start[];\n";
+            stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_end[];\n";
+            stream << "extern unsigned int _binary_kernel_" << computeKernelName << "_size;\n\n";
+
+            // dskernel_receiver stub for the kernel that gets compiled separately
+            stream << "__global__ void " << computeKernelName << "(size_t v1) {\n";
+            stream << "  return;\n";
+            stream << "}\n\n";
+
+            stream << "int main() {\n";
+            stream << "    printf(\"------------main--------\\n\");\n\n";
+
+            // Allocate DDR buffers for each tensor
+            for (unsigned i = 0; i < tensors.size(); ++i) {
+                int64_t totalElements = 1;
+                for (auto dim : tensors[i].shape)
+                    totalElements *= dim;
+                int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
+                stream << "    // Tensor " << i << ": " << (tensors[i].isInput ? "input" : "output") << ", "
+                       << totalBytes << " bytes\n";
+                stream << "    void* buf_" << i << " = malloc(" << totalBytes << ");\n";
+            }
+            stream << "\n";
+
+            // Initialize inputs with test data, zero outputs
+            for (unsigned i = 0; i < tensors.size(); ++i) {
+                int64_t totalElements = 1;
+                for (auto dim : tensors[i].shape)
+                    totalElements *= dim;
+                int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
+                if (tensors[i].isInput) {
+                    stream << "    for (int j = 0; j < " << totalBytes << "; j++) ((char*)buf_" << i
+                           << ")[j] = (char)(j + " << (i + 1) << ");\n";
+                } else {
+                    stream << "    memset(buf_" << i << ", 0, " << totalBytes << ");\n";
+                }
+            }
+            stream << "\n";
+
+            // Call host_canonicalized
+            stream << "    host_canonicalized(";
+            for (unsigned i = 0; i < tensors.size(); ++i) {
+                if (i > 0)
+                    stream << ", ";
+                stream << "buf_" << i;
+            }
+            stream << ");\n\n";
+
+            stream << "    printf(\"------------after matmul--------\\n\");\n\n";
+
+            // Print output buffers
+            for (unsigned i = 0; i < tensors.size(); ++i) {
+                if (!tensors[i].isInput) {
+                    int64_t totalElements = 1;
+                    for (auto dim : tensors[i].shape)
+                        totalElements *= dim;
+                    int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
+                    stream << "    printf(\"Output buffer " << i << ":\\n\");\n";
+                    stream << "    for (int j = 0; j < " << totalBytes << "; j++) printf(\"  out[%d]=%d\\n\", j, "
+                           << "((unsigned char*)buf_" << i << ")[j]);\n";
+                }
+            }
+            stream << "\n";
+
+            // Free buffers
+            for (unsigned i = 0; i < tensors.size(); ++i) {
+                stream << "    free(buf_" << i << ");\n";
+            }
+            stream << "    return 0;\n";
+            stream << "}\n";
+        }
+
+        stream.close();
+        std::cout << "Host code written to " << hostPath << std::endl;
+    }
+
+    // Emit kernel.cc
+    {
+        std::string kernelPath = outputDir + "/kernel.cc";
+        std::error_code ec;
+        llvm::raw_fd_ostream stream(kernelPath, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+            llvm::errs() << "Failed to open " << kernelPath << ": " << ec.message() << "\n";
+            return false;
+        }
+        if (failed(mlir::emitc::translateToCpp(kernelModule, stream))) {
+            llvm::errs() << "Failed to translate kernel MLIR to C++.\n";
+            return false;
+        }
+        stream.close();
+        std::cout << "Kernel code written to " << kernelPath << std::endl;
+    }
+
+    // Emit computekernel.cc (compute kernel implementation)
+    {
+        std::string computePath = outputDir + "/" + computeKernelName + ".cc";
+        std::error_code ec;
+        llvm::raw_fd_ostream stream(computePath, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+            llvm::errs() << "Failed to open " << computePath << ": " << ec.message() << "\n";
+            return false;
+        }
+
+        if (!userKernelBody.empty()) {
+            // Write the user's __global__ kernel body verbatim
+            stream << "// User-provided compute kernel (extracted from __global__ function)\n";
+            stream << userKernelBody << "\n";
+            std::cout << "Compute kernel (user-provided) written to " << computePath << std::endl;
+        } else {
+            // Auto-generate compute kernel
+            // Determine type strings from element type
+            std::string cType = kernelElementType + "_t"; // e.g. "int32_t"
+            std::string vecType = "v4" + kernelElementType; // e.g. "v4int32"
+            std::string winInputType = "input_window_" + kernelElementType;  // e.g. "input_window_int32"
+            std::string winOutputType = "output_window_" + kernelElementType; // e.g. "output_window_int32"
+
+            stream << "// Auto-generated compute kernel: " << computeKernelName << "\n";
+            stream << "// " << numInputWindows << " input(s) + " << numOutputWindows << " output(s)\n";
+            stream << "void " << computeKernelName << "(";
+
+            // Generate parameter list
+            int paramIdx = 0;
+            for (int i = 0; i < numInputWindows; ++i) {
+                if (paramIdx > 0) stream << ", ";
+                stream << winInputType << " *window_in_" << i;
+                paramIdx++;
+            }
+            for (int i = 0; i < numOutputWindows; ++i) {
+                if (paramIdx > 0) stream << ", ";
+                stream << winOutputType << " *window_out_" << i;
+                paramIdx++;
+            }
+            stream << ") {\n";
+
+            // Function body
+            stream << "    unsigned coreid = get_coreid();\n";
+            stream << "    int col = coreid >> 16;\n";
+            stream << "    int row = coreid & 0x1F;\n";
+            stream << "\n";
+            stream << "    for (int k = 0; k < 2; k++) {\n";
+            stream << "        klog(\"CENk\", k);\n";
+
+            // Acquire all input windows
+            for (int i = 0; i < numInputWindows; ++i) {
+                stream << "        " << cType << " *in" << i
+                       << " = (" << cType << " *)acquire_input_window(window_in_" << i << ");\n";
+            }
+            // Acquire all output windows
+            for (int i = 0; i < numOutputWindows; ++i) {
+                stream << "        " << cType << " *out" << i
+                       << " = (" << cType << " *)acquire_output_window(window_out_" << i << ");\n";
+            }
+
+            stream << "\n";
+            // Debug: print in0 values
+            stream << "        // Debug: dump in0 buffer contents\n";
+            stream << "        klog(\"IN0\", BUF_SZ * 4);\n";
+            stream << "        for (int di = 0; di < BUF_SZ * 4; di++) {\n";
+            stream << "            klog(\"IV\", (int)in0[di]);\n";
+            stream << "        }\n";
+            stream << "\n";
+            stream << "        // GEMM kernel: out0[i] = in0[i] * in1[i]\n";
+            stream << "        for (int i = 0; i < BUF_SZ; i++) {\n";
+            stream << "            " << vecType << " data0 = *((" << vecType << " *)&in0[i * 4]);\n";
+            if (numInputWindows > 1) {
+                stream << "            " << vecType << " data1 = *((" << vecType << " *)&in1[i * 4]);\n";
+            }
+            stream << "            *((" << vecType << " *)&out0[i * 4]) = data0;\n";
+            stream << "        }\n";
+            stream << "        klog(\"CLOP\", BUF_SZ);\n";
+            stream << "\n";
+            // Debug: print out0 values
+            stream << "        // Debug: dump out0 buffer contents\n";
+            stream << "        klog(\"OUT0\", BUF_SZ * 4);\n";
+            stream << "        for (int di = 0; di < BUF_SZ * 4; di++) {\n";
+            stream << "            klog(\"OV\", (int)out0[di]);\n";
+            stream << "        }\n";
+            stream << "\n";
+
+            // Release all windows
+            for (int i = 0; i < numInputWindows; ++i) {
+                stream << "        release_input_window(window_in_" << i << ");\n";
+            }
+            for (int i = 0; i < numOutputWindows; ++i) {
+                stream << "        release_output_window(window_out_" << i << ");\n";
+            }
+            stream << "        klog(\"CEXT\", 1);\n";
+            stream << "    }\n";
+            stream << "}\n";
+
+            std::cout << "Compute kernel (auto-generated) written to " << computePath << std::endl;
+        }
+
+        stream.close();
+    }
+
+    // Phase 4: Generate BCF/PRX for kernel compilation
+    try {
+        auto &allocator = ResourceMgr::instance()->coreMemAllocator();
+        const auto &allocations = allocator.getAllocations();
+
+        if (!allocations.empty()) {
+            TilingBcf bcf;
+            bcf.setStack(0x70000, 0x1024);
+            bcf.addReservedDMB(0x40000, 0x10000);
+            bcf.addReservedDMB(0x7F800, 0x800);
+            for (const auto &slot : allocations) {
+                bcf.addSymbol(slot.symbolName, slot.address);
+            }
+
+            std::string bcfPath = outputDir + "/aieml.bcf";
+            if (bcf.exportToFile(bcfPath)) {
+                std::cout << "BCF written to " << bcfPath << std::endl;
+            } else {
+                llvm::errs() << "Failed to write BCF to " << bcfPath << "\n";
+            }
+
+            TilingPrx prx("kernel", 22);
+            prx.setBcfPath("aieml.bcf");
+            prx.setKernelLLPath("./build/");
+
+            std::string prxPath = outputDir + "/aieml.prx";
+            if (prx.exportToFile(prxPath)) {
+                std::cout << "PRX written to " << prxPath << std::endl;
+            } else {
+                llvm::errs() << "Failed to write PRX to " << prxPath << "\n";
+            }
+
+            std::cout << "\n=== Core Memory Allocation Summary ===" << std::endl;
+            for (const auto &slot : allocations) {
+                std::cout << "  " << slot.symbolName << " @ 0x" << std::hex << slot.address
+                          << " (size=" << std::dec << slot.size << " bytes)" << std::endl;
+            }
+            std::cout << "  Free space: " << allocator.getFreeSpace() << " bytes" << std::endl;
+        } else {
+            std::cout << "No buffer allocations found; skipping BCF/PRX generation." << std::endl;
+        }
+    } catch (...) {
+        std::cout << "ResourceMgr not initialized; skipping BCF/PRX generation." << std::endl;
+    }
+
+    // Phase 5: Routing path (dmaphop -> routinghw -> EmitC) for routing.cc
+    // Uses the dmaphop module cloned after DmapToDmaphopPass so that packet IDs
+    // in routing.cc match those in host.cc (both read from the same dmaphop IR).
+    {
+        int rstage = 0;
+        std::string routingIrDir = setupPipelineIRDir("simplerouting");
+
+        dumpPipelineIRToFile(routingDmaphopModule, routingIrDir, rstage++, "initial");
+
+        // Use the same rtopology that produced the dmaphop IR so that
+        // shim columns and DMA port assignments are consistent.
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<DmaphopToRoutinghwPass>(rtopology),
+                                   routingIrDir, rstage, "DmaphopToRoutinghwPass"))
+            return false;
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(rtopology),
+                                   routingIrDir, rstage, "RoutingHWLowerPass"))
+            return false;
+
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingDeadArgPass>(), routingIrDir,
+                                   rstage, "RoutingDeadArgPass"))
+            return false;
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingConstantFoldPass>(), routingIrDir,
+                                   rstage, "RoutingConstantFoldPass"))
+            return false;
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, mlir::createCanonicalizerPass(), routingIrDir, rstage,
+                                   "CanonicalizerPass"))
+            return false;
+
+        // After all routing lowering passes, clean up residual memref-related
+        // ops (bufferization.to_tensor and routing.routingcreatescheduletensor)
+        // that prevent RoutingDeadArgPass from stripping memref func args.
+        // Only erase specific known-dead op types — never erase scf/emitc ops.
+        for (auto func : routingDmaphopModule.getOps<mlir::func::FuncOp>()) {
+            if (func.getBody().empty())
+                continue;
+            Block &entry = func.getBody().front();
+            // Multi-pass: erasing routing ops may make to_tensor results dead
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (auto &op : llvm::make_early_inc_range(entry.getOperations())) {
+                    // Only erase bufferization.to_tensor or routing dialect ops
+                    bool isTargetOp = isa<bufferization::ToTensorOp>(&op) ||
+                                      (op.getDialect() && op.getDialect()->getNamespace() == "routing");
+                    if (isTargetOp && op.use_empty()) {
+                        op.erase();
+                        changed = true;
+                    }
+                }
+            }
+            // Now strip dead block args (memref params no longer used)
+            for (int i = (int)entry.getNumArguments() - 1; i >= 0; --i) {
+                if (entry.getArgument(i).use_empty())
+                    entry.eraseArgument(i);
+            }
+            // Update function type to match remaining args
+            SmallVector<Type> argTypes;
+            for (auto arg : entry.getArguments())
+                argTypes.push_back(arg.getType());
+            func.setFunctionType(FunctionType::get(func.getContext(), argTypes, func.getFunctionType().getResults()));
+        }
+
+        std::string routingPath = outputDir + "/routing.cc";
+        std::error_code ec;
+        llvm::raw_fd_ostream stream(routingPath, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+            llvm::errs() << "Failed to open " << routingPath << ": " << ec.message() << "\n";
+            return false;
+        }
+        // Emit #include before the translated C++ so int32_t etc. are declared
+        stream << "#include <xaiengine.h>\n";
+        stream << "XAie_DevInst* getOrCreateDeviceInstance();\n\n";
+        if (failed(mlir::emitc::translateToCpp(routingDmaphopModule, stream))) {
+            llvm::errs() << "Failed to translate routing MLIR to C++.\n";
+            return false;
+        }
+        stream.close();
+        std::cout << "Routing code written to " << routingPath << std::endl;
+    }
+
+    return true;
+}

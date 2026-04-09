@@ -53,11 +53,10 @@ void HybridPass::runOnOperation() {
 		std::string kname;
 		std::string fname;
 		std::vector<Buffer> kfuncparams;
-		
-		//the max ping pong buffer size
-		uint32_t max_pingpong_size = 0;
 
-		Bcf bcf;
+        uint32_t max_window_size = 0;
+
+        Bcf bcf;
 		Prx prx("Project", "me");
 
 		mlir::aie::CreateKernelObjectOp kop = llvm::dyn_cast<mlir::aie::CreateKernelObjectOp >(*op);
@@ -96,12 +95,14 @@ void HybridPass::runOnOperation() {
                 bcf.addsymbols(ostr.str(), 0x70000 + window.getPongaddr());
 
                 kfuncparams.push_back(Buffer(direct, wping, wpong, pingaddr, pongaddr, acquireLockId, releaseLockId));
-                max_pingpong_size = std::max(max_pingpong_size, (uint32_t)(pongaddr - pingaddr));
+                max_window_size = std::max(max_window_size, (uint32_t)(pongaddr - pingaddr));
             } else {
                 // Legacy single buffer mode: just use the window name (no suffix)
                 bcf.addsymbols(wname, 0x70000 + window.getPingaddr());
                 // Use pingaddr for both ping and pong names (pong won't be used)
                 kfuncparams.push_back(Buffer(direct, wname, wname, pingaddr, 0, acquireLockId, releaseLockId));
+                if (window.getSize() > 0)
+                    max_window_size = std::max(max_window_size, window.getSize());
             }
         }
 
@@ -135,9 +136,8 @@ void HybridPass::runOnOperation() {
 			prx.exportfile();
 		}
 		Wrapper wrap(kname, fname);
-		std::cout << "std::to_string(max_pingpong_size) is " << std::to_string(max_pingpong_size) << std::endl;
-		wrap.setbufsize(max_pingpong_size);
-		wrap.addkernelfuncparams(kfuncparams);
+        wrap.setbufsize(max_window_size);
+        wrap.addkernelfuncparams(kfuncparams);
 		wrap.set_kernel_in_param_type(in_param_type);
 		wrap.set_kernel_out_param_type(out_param_type);
 

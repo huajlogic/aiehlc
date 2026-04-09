@@ -1,0 +1,1793 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+"""
+Unified AIE visualizer: routing topology + DMA BD configuration.
+
+Parses routing.cc (stream-switch connections) and host.cc (DMA buffer
+descriptors, channels, locks) and produces a single interactive HTML
+visualization showing both routing paths as SVG arrows and DMA details
+inside tile cards.
+
+Usage:
+    python aie_visualizer.py --routing routing.cc --host host.cc
+    python aie_visualizer.py --routing routing.cc --host host.cc -o viz.html
+    python aie_visualizer.py --routing routing.cc                # routing only
+    python aie_visualizer.py --host host.cc                      # DMA only
+    python aie_visualizer.py --routing routing.cc --host host.cc --serve
+    python aie_visualizer.py --routing routing.cc --host host.cc -m text
+    python aie_visualizer.py --routing routing.cc --host host.cc -m png -o out.png
+"""
+
+import argparse
+import http.server
+import json
+import re
+import socket
+import sys
+import webbrowser
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Data structures — Routing
+# ---------------------------------------------------------------------------
+
+DIRECTION_OPPOSITES = {
+    "NORTH": "SOUTH", "SOUTH": "NORTH",
+    "EAST": "WEST", "WEST": "EAST",
+}
+
+DIRECTION_DELTA = {
+    "NORTH": (0, 1), "SOUTH": (0, -1),
+    "EAST": (1, 0), "WEST": (-1, 0),
+}
+
+TILE_TYPE_BY_ROW = lambda row: "Shim" if row == 0 else ("Mem" if row <= 2 else "AIE")
+
+BLOCK_COLORS = [
+    "#2196F3", "#E91E63", "#4CAF50", "#FF9800",
+    "#9C27B0", "#00BCD4", "#795548", "#607D8B",
+    "#F44336", "#3F51B5", "#009688", "#CDDC39",
+]
+
+
+@dataclass
+class PktSlaveSlot:
+    tile: tuple
+    port_type: str
+    port_num: int
+    slot_num: int
+    pkt_id: int
+    mask: int
+    msel: int
+    arbiter: int
+    line: int
+
+
+@dataclass
+class PktMasterPort:
+    tile: tuple
+    port_type: str
+    port_num: int
+    drop_header: bool
+    arbiter: int
+    msel_en: int
+    line: int
+
+
+@dataclass
+class CircuitConn:
+    tile: tuple
+    slave_type: str
+    slave_port: int
+    master_type: str
+    master_port: int
+    line: int
+
+
+@dataclass
+class ShimDmaPort:
+    tile: tuple
+    port_num: int
+    direction: str
+    line: int
+
+
+@dataclass
+class RoutingBlock:
+    name: str
+    circuit_conns: list = field(default_factory=list)
+    pkt_slaves: list = field(default_factory=list)
+    pkt_masters: list = field(default_factory=list)
+    shim_dma: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Data structures — DMA
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LockInfo:
+    lock_id: int
+    init_value: Optional[int] = None
+    operate_value: Optional[int] = None
+
+
+@dataclass
+class BdConfig:
+    var: str
+    tile_var: str
+    tile_loc: Tuple[int, int]
+    buf_var: str
+    buf_source: str
+    bd_id: int
+    offset: int
+    length: int
+    next_bd: int
+    enable_packet: bool
+    packet_id: int
+    acquire_lock_id: int = -1
+    acquire_lock_val: int = -1
+    release_lock_id: int = -1
+    release_lock_val: int = -1
+
+
+@dataclass
+class IoConfig:
+    var: str
+    tile_var: str
+    tile_loc: Tuple[int, int]
+    bd_var: str
+    channel_id: int
+    direction: str
+
+
+@dataclass
+class SliceInfo:
+    var: str
+    source_var: str
+    off0: int
+    off1: int
+    size0: int
+    size1: int
+
+
+@dataclass
+class TileDmaInfo:
+    loc: Tuple[int, int]
+    tile_type: str
+    bds: List[BdConfig] = field(default_factory=list)
+    ios: List[IoConfig] = field(default_factory=list)
+    locks: Dict[int, LockInfo] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Parsing — routing.cc
+# ---------------------------------------------------------------------------
+
+def parse_tile_loc(s: str) -> Optional[tuple]:
+    m = re.search(r"XAie_TileLoc\(\s*(\d+)\s*,\s*(\d+)\s*\)", s)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def parse_routing_file(filepath: str) -> List[RoutingBlock]:
+    with open(filepath) as f:
+        lines = f.readlines()
+
+    blocks: List[RoutingBlock] = []
+    current_block: Optional[RoutingBlock] = None
+    block_idx = 0
+
+    for lineno_0, raw in enumerate(lines):
+        lineno = lineno_0 + 1
+        line = raw.strip()
+
+        round_m = re.search(r"round\s+is\s+(\d+)", line, re.IGNORECASE)
+        if round_m:
+            block_idx = int(round_m.group(1))
+            current_block = RoutingBlock(name=f"Round {block_idx}")
+            blocks.append(current_block)
+            continue
+
+        if current_block is None and re.search(r"XAie_Strm|XAie_Enable", line):
+            if re.match(r"(int32_t|void|AieRC)\s+XAie_\w+\s*\(", line):
+                continue
+            current_block = RoutingBlock(name=f"Block {block_idx}")
+            blocks.append(current_block)
+
+        if current_block is None:
+            continue
+        if re.match(r"(int32_t|void|AieRC)\s+XAie_\w+\s*\(", line):
+            continue
+
+        m = re.search(
+            r"XAie_StrmConnCctEnable\([^,]+,\s*(XAie_TileLoc\(\d+\s*,\s*\d+\))\s*,"
+            r"\s*(\w+)\s*,\s*(\d+)\s*,\s*(\w+)\s*,\s*(\d+)\s*\)", line)
+        if m:
+            tile = parse_tile_loc(m.group(1))
+            current_block.circuit_conns.append(CircuitConn(
+                tile=tile,
+                slave_type=m.group(2), slave_port=int(m.group(3)),
+                master_type=m.group(4), master_port=int(m.group(5)),
+                line=lineno))
+            continue
+
+        m = re.search(
+            r"XAie_StrmPktSwSlaveSlotEnable\([^,]+,\s*(XAie_TileLoc\(\d+\s*,\s*\d+\))\s*,"
+            r"\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*\{[^}]*PktId\s*=\s*(\d+)[^}]*\}\s*,"
+            r"\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", line)
+        if m:
+            tile = parse_tile_loc(m.group(1))
+            current_block.pkt_slaves.append(PktSlaveSlot(
+                tile=tile,
+                port_type=m.group(2), port_num=int(m.group(3)),
+                slot_num=int(m.group(4)),
+                pkt_id=int(m.group(5)),
+                mask=int(m.group(6)), msel=int(m.group(7)),
+                arbiter=int(m.group(8)),
+                line=lineno))
+            continue
+
+        m = re.search(
+            r"XAie_StrmPktSwMstrPortEnable\([^,]+,\s*(XAie_TileLoc\(\d+\s*,\s*\d+\))\s*,"
+            r"\s*(\w+)\s*,\s*(\d+)\s*,\s*\w+\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", line)
+        if m:
+            tile = parse_tile_loc(m.group(1))
+            current_block.pkt_masters.append(PktMasterPort(
+                tile=tile,
+                port_type=m.group(2), port_num=int(m.group(3)),
+                drop_header=True,
+                arbiter=int(m.group(4)), msel_en=int(m.group(5)),
+                line=lineno))
+            continue
+
+        m = re.search(
+            r"XAie_EnableAieToShimDmaStrmPort\([^,]+,\s*(XAie_TileLoc\(\d+\s*,\s*\d+\))\s*,"
+            r"\s*(\d+)\s*\)", line)
+        if m:
+            tile = parse_tile_loc(m.group(1))
+            current_block.shim_dma.append(ShimDmaPort(
+                tile=tile, port_num=int(m.group(2)),
+                direction="aie_to_shim", line=lineno))
+            continue
+
+        m = re.search(
+            r"XAie_EnableShimDmaToAieStrmPort\([^,]+,\s*(XAie_TileLoc\(\d+\s*,\s*\d+\))\s*,"
+            r"\s*(\d+)\s*\)", line)
+        if m:
+            tile = parse_tile_loc(m.group(1))
+            current_block.shim_dma.append(ShimDmaPort(
+                tile=tile, port_num=int(m.group(2)),
+                direction="shim_to_aie", line=lineno))
+            continue
+
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# Parsing — host.cc (DMA BDs)
+# ---------------------------------------------------------------------------
+
+def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
+    text = Path(path).read_text()
+
+    tile_map: Dict[str, Tuple[int, int]] = {}
+    for m in re.finditer(
+        r"XAie_LocType\s+(\w+)\s*=\s*XAie_TileLoc\((\d+),\s*(\d+)\)", text
+    ):
+        tile_map[m.group(1)] = (int(m.group(2)), int(m.group(3)))
+
+    buf_source: Dict[str, str] = {}
+    for m in re.finditer(
+        r"void\*\s+(\w+)\s*=\s*__runtime_buffer_arg\((.+?)\);", text
+    ):
+        buf_source[m.group(1)] = m.group(2).strip()
+
+    slices: Dict[str, SliceInfo] = {}
+    for m in re.finditer(
+        r"PartitionTensor\s+(\w+)\s*=\s*__Runtime_extract_slice_contiguous_2d"
+        r"\((\w+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)", text,
+    ):
+        slices[m.group(1)] = SliceInfo(
+            var=m.group(1), source_var=m.group(2),
+            off0=int(m.group(3)), off1=int(m.group(4)),
+            size0=int(m.group(5)), size1=int(m.group(6)),
+        )
+
+    def _slice_label(var: str) -> str:
+        if var in slices:
+            s = slices[var]
+            return f"{var}[{s.off0}:{s.off0+s.size0}, {s.off1}:{s.off1+s.size1}]"
+        return var
+
+    bd_comment_locks: Dict[str, Tuple[int, int, int, int]] = {}
+    bd_comment_pattern = re.compile(
+        r"/\*\s*DMA BD Config:.*?"
+        r"acquire_lock_id=(-?\d+).*?"
+        r"acquire_lock_val=(-?\d+).*?"
+        r"release_lock_id=(-?\d+).*?"
+        r"release_lock_val=(-?\d+).*?\*/",
+        re.DOTALL,
+    )
+    bd_comment_pattern_old = re.compile(
+        r"/\*\s*DMA BD Config:.*?"
+        r"acquire_lock_id=(-?\d+).*?"
+        r"release_lock_id=(-?\d+).*?\*/",
+        re.DOTALL,
+    )
+    bd_call_pattern = re.compile(
+        r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
+    )
+    for cm in bd_comment_pattern.finditer(text):
+        acq_id, acq_val = int(cm.group(1)), int(cm.group(2))
+        rel_id, rel_val = int(cm.group(3)), int(cm.group(4))
+        after = text[cm.end():]
+        call_m = bd_call_pattern.search(after)
+        if call_m:
+            bd_comment_locks[call_m.group(1)] = (acq_id, acq_val, rel_id, rel_val)
+    for cm in bd_comment_pattern_old.finditer(text):
+        acq_id, rel_id = int(cm.group(1)), int(cm.group(2))
+        after = text[cm.end():]
+        call_m = bd_call_pattern.search(after)
+        if call_m and call_m.group(1) not in bd_comment_locks:
+            bd_comment_locks[call_m.group(1)] = (acq_id, -1, rel_id, -1)
+
+    lock_init_map: Dict[Tuple[int, int], Dict[int, int]] = defaultdict(dict)
+    for m in re.finditer(
+        r"XAie_LockSetValue\(\s*\w+,\s*XAie_TileLoc\(\s*(\d+),\s*(\d+)\s*\),"
+        r"\s*XAie_LockInit\(\s*(\d+),\s*(\d+)\s*\)\)", text,
+    ):
+        loc = (int(m.group(1)), int(m.group(2)))
+        lock_init_map[loc][int(m.group(3))] = int(m.group(4))
+    for m in re.finditer(
+        r"XAie_LockSetValue\(\s*\w+,\s*(\w+),\s*XAie_LockInit\(\s*(\d+),\s*(\d+)\s*\)\)",
+        text,
+    ):
+        tvar = m.group(1)
+        if tvar.startswith("XAie_TileLoc"):
+            continue
+        loc = tile_map.get(tvar, (-1, -1))
+        lock_init_map[loc][int(m.group(2))] = int(m.group(3))
+
+    lock_operate_map: Dict[str, Tuple[int, int]] = {}
+    for m in re.finditer(
+        r"XAie_DmaSetLock\(\s*&(\w+).*?"
+        r"XAie_LockInit\(\s*(-?\d+),\s*(-?\d+)\s*\).*?"
+        r"XAie_LockInit\(\s*(-?\d+),\s*(-?\d+)\s*\)",
+        text, re.DOTALL,
+    ):
+        lock_operate_map[m.group(1)] = (int(m.group(3)), int(m.group(5)))
+
+    bd_map: Dict[str, BdConfig] = {}
+    bd_call_13 = re.compile(
+        r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
+        r"(\w+),\s*(\w+),\s*(\w+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
+        r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
+        r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\)"
+    )
+    bd_call_10 = re.compile(
+        r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
+        r"(\w+),\s*(\w+),\s*(\w+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
+        r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)\)"
+    )
+    for m in bd_call_13.finditer(text):
+        tile_var = m.group(3)
+        buf_ptr = m.group(4)
+        bd_var = m.group(1)
+        loc = tile_map.get(tile_var, (-1, -1))
+        next_bd_raw = int(m.group(8))
+        if next_bd_raw < 0 or next_bd_raw > 65535:
+            next_bd_raw = -1
+        bd = BdConfig(
+            var=bd_var, tile_var=tile_var, tile_loc=loc,
+            buf_var=buf_ptr,
+            buf_source=_slice_label(buf_source.get(buf_ptr, buf_ptr)),
+            bd_id=int(m.group(5)), offset=int(m.group(6)), length=int(m.group(7)),
+            next_bd=next_bd_raw,
+            enable_packet=int(m.group(9)) != 0, packet_id=int(m.group(10)),
+            acquire_lock_id=int(m.group(11)), acquire_lock_val=int(m.group(12)),
+            release_lock_id=int(m.group(13)), release_lock_val=int(m.group(14)),
+        )
+        bd_map[bd.var] = bd
+
+    for m in bd_call_10.finditer(text):
+        bd_var = m.group(1)
+        if bd_var in bd_map:
+            continue
+        tile_var = m.group(3)
+        buf_ptr = m.group(4)
+        loc = tile_map.get(tile_var, (-1, -1))
+        next_bd_raw = int(m.group(8))
+        if next_bd_raw < 0 or next_bd_raw > 65535:
+            next_bd_raw = -1
+        acq_lock, acq_val, rel_lock, rel_val = -1, -1, -1, -1
+        if bd_var in bd_comment_locks:
+            acq_lock, acq_val, rel_lock, rel_val = bd_comment_locks[bd_var]
+        bd = BdConfig(
+            var=bd_var, tile_var=tile_var, tile_loc=loc,
+            buf_var=buf_ptr,
+            buf_source=_slice_label(buf_source.get(buf_ptr, buf_ptr)),
+            bd_id=int(m.group(5)), offset=int(m.group(6)), length=int(m.group(7)),
+            next_bd=next_bd_raw,
+            enable_packet=int(m.group(9)) != 0, packet_id=int(m.group(10)),
+            acquire_lock_id=acq_lock, acquire_lock_val=acq_val,
+            release_lock_id=rel_lock, release_lock_val=rel_val,
+        )
+        bd_map[bd.var] = bd
+
+    io_comment = re.compile(r"/\*\s*Create IO:.*?direction=(\w+)\s*\*/", re.DOTALL)
+    # __Runtime_dma_createio_4(tile, bd_desc, channel_id, hw_bd_id, DMA_DIRECTION)
+    # The 5th arg (DMA_S2MM / DMA_MM2S) is optional for backward compat.
+    io_call = re.compile(
+        r"io\s+(\w+)\s*=\s*__Runtime_dma_createio_4\("
+        r"(\w+),\s*(\w+),\s*(-?\d+),\s*(-?\d+)(?:,\s*\w+)?\)"
+    )
+    io_configs: List[IoConfig] = []
+    for cm in io_comment.finditer(text):
+        direction = cm.group(1)
+        after = text[cm.end():]
+        call_m = io_call.search(after)
+        if call_m:
+            tile_var = call_m.group(2)
+            loc = tile_map.get(tile_var, (-1, -1))
+            io_configs.append(IoConfig(
+                var=call_m.group(1), tile_var=tile_var, tile_loc=loc,
+                bd_var=call_m.group(3), channel_id=int(call_m.group(4)),
+                direction=direction,
+            ))
+
+    tiles: Dict[Tuple[int, int], TileDmaInfo] = {}
+    for bd in bd_map.values():
+        loc = bd.tile_loc
+        if loc not in tiles:
+            tiles[loc] = TileDmaInfo(loc=loc, tile_type=TILE_TYPE_BY_ROW(loc[1]))
+        tiles[loc].bds.append(bd)
+    for io in io_configs:
+        loc = io.tile_loc
+        if loc not in tiles:
+            tiles[loc] = TileDmaInfo(loc=loc, tile_type=TILE_TYPE_BY_ROW(loc[1]))
+        tiles[loc].ios.append(io)
+
+    for info in tiles.values():
+        info.bds.sort(key=lambda b: b.bd_id)
+
+    for info in tiles.values():
+        loc = info.loc
+        for bd in info.bds:
+            if bd.acquire_lock_id >= 0:
+                if bd.acquire_lock_id not in info.locks:
+                    info.locks[bd.acquire_lock_id] = LockInfo(lock_id=bd.acquire_lock_id)
+                info.locks[bd.acquire_lock_id].operate_value = bd.acquire_lock_val
+            if bd.release_lock_id >= 0:
+                if bd.release_lock_id not in info.locks:
+                    info.locks[bd.release_lock_id] = LockInfo(lock_id=bd.release_lock_id)
+                info.locks[bd.release_lock_id].operate_value = bd.release_lock_val
+            if bd.var in lock_operate_map:
+                acq_val, rel_val = lock_operate_map[bd.var]
+                if bd.acquire_lock_id >= 0:
+                    info.locks[bd.acquire_lock_id].operate_value = acq_val
+                if bd.release_lock_id >= 0:
+                    info.locks[bd.release_lock_id].operate_value = rel_val
+        for lid, lk in info.locks.items():
+            if loc in lock_init_map and lid in lock_init_map[loc]:
+                lk.init_value = lock_init_map[loc][lid]
+
+    return tiles
+
+
+# ---------------------------------------------------------------------------
+# Routing analysis
+# ---------------------------------------------------------------------------
+
+def resolve_pkt_internal_edges(block: RoutingBlock):
+    edges = []
+    masters_by_tile = defaultdict(list)
+    for mp in block.pkt_masters:
+        masters_by_tile[mp.tile].append(mp)
+    for ss in block.pkt_slaves:
+        for mp in masters_by_tile.get(ss.tile, []):
+            if mp.arbiter == ss.arbiter and (mp.msel_en >> ss.msel) & 1:
+                edges.append((ss, mp))
+    return edges
+
+
+def trace_paths(blocks: List[RoutingBlock]):
+    all_paths = []
+    for block in blocks:
+        adj = defaultdict(list)
+        for cc in block.circuit_conns:
+            adj[(cc.tile, cc.slave_type, cc.slave_port)].append(
+                (cc.tile, cc.master_type, cc.master_port, "circuit"))
+        for ss, mp in resolve_pkt_internal_edges(block):
+            adj[(ss.tile, ss.port_type, ss.port_num)].append(
+                (mp.tile, mp.port_type, mp.port_num, "packet"))
+
+        sources = set()
+        for ss in block.pkt_slaves:
+            if ss.port_type == "DMA":
+                sources.add((ss.tile, ss.port_type, ss.port_num))
+        for cc in block.circuit_conns:
+            if cc.slave_type not in DIRECTION_OPPOSITES:
+                sources.add((cc.tile, cc.slave_type, cc.slave_port))
+
+        def follow(tile, mstr_type, mstr_port, visited):
+            if mstr_type not in DIRECTION_DELTA:
+                return [[(tile, mstr_type, mstr_port, None, None, "endpoint")]]
+            if mstr_type == "SOUTH" and tile[1] == 0:
+                return [[(tile, "SOUTH", mstr_port, None, None, "shim_exit")]]
+            dc, dr = DIRECTION_DELTA[mstr_type]
+            nb = (tile[0] + dc, tile[1] + dr)
+            opp = DIRECTION_OPPOSITES[mstr_type]
+            nb_key = (nb, opp, mstr_port)
+            if nb_key in visited:
+                return [[(tile, mstr_type, mstr_port, None, None, "loop")]]
+            visited.add(nb_key)
+            nexts = adj.get(nb_key, [])
+            if not nexts:
+                return [[(nb, opp, mstr_port, None, None, "dangling")]]
+            results = []
+            for (nt, mt, mp, mode) in nexts:
+                sub = follow(nt, mt, mp, visited)
+                for s in sub:
+                    results.append([(nb, opp, mstr_port, mt, mp, mode)] + s)
+            return results
+
+        for src_key in sources:
+            visited = {src_key}
+            nexts = adj.get(src_key, [])
+            for (nt, mt, mp, mode) in nexts:
+                sub_paths = follow(nt, mt, mp, visited.copy())
+                for sp in sub_paths:
+                    full = [(src_key[0], src_key[1], src_key[2], mt, mp, mode)] + sp
+                    all_paths.append((block.name, full))
+
+    return all_paths
+
+
+def collect_routing_tiles(blocks: List[RoutingBlock]) -> set:
+    tiles = set()
+    for b in blocks:
+        for cc in b.circuit_conns:
+            tiles.add(cc.tile)
+        for ss in b.pkt_slaves:
+            tiles.add(ss.tile)
+        for mp in b.pkt_masters:
+            tiles.add(mp.tile)
+        for sd in b.shim_dma:
+            tiles.add(sd.tile)
+    return tiles
+
+
+# ---------------------------------------------------------------------------
+# Build routing data for JSON export (used by HTML/JS)
+# ---------------------------------------------------------------------------
+
+def _build_routing_json(blocks: List[RoutingBlock]) -> dict:
+    """Build JSON-serializable routing data for the HTML renderer."""
+    cross_tile_arrows = []
+    internal_conns = []
+
+    for bi, block in enumerate(blocks):
+        color = BLOCK_COLORS[bi % len(BLOCK_COLORS)]
+
+        for cc in block.circuit_conns:
+            internal_conns.append({
+                "tile": list(cc.tile),
+                "slave_type": cc.slave_type,
+                "slave_port": cc.slave_port,
+                "master_type": cc.master_type,
+                "master_port": cc.master_port,
+                "mode": "circuit",
+                "block": block.name,
+                "color": color,
+            })
+
+            mdir = cc.master_type
+            if mdir in DIRECTION_DELTA:
+                dc, dr = DIRECTION_DELTA[mdir]
+                nb = (cc.tile[0] + dc, cc.tile[1] + dr)
+                cross_tile_arrows.append({
+                    "from_tile": list(cc.tile),
+                    "to_tile": list(nb),
+                    "from_dir": mdir,
+                    "to_dir": DIRECTION_OPPOSITES[mdir],
+                    "port": cc.master_port,
+                    "mode": "circuit",
+                    "block": block.name,
+                    "color": color,
+                })
+
+        pkt_edges = resolve_pkt_internal_edges(block)
+        for ss, mp in pkt_edges:
+            internal_conns.append({
+                "tile": list(ss.tile),
+                "slave_type": ss.port_type,
+                "slave_port": ss.port_num,
+                "master_type": mp.port_type,
+                "master_port": mp.port_num,
+                "mode": "packet",
+                "block": block.name,
+                "color": color,
+                "pkt_id": ss.pkt_id,
+            })
+
+            mdir = mp.port_type
+            if mdir in DIRECTION_DELTA:
+                dc, dr = DIRECTION_DELTA[mdir]
+                nb = (mp.tile[0] + dc, mp.tile[1] + dr)
+                cross_tile_arrows.append({
+                    "from_tile": list(mp.tile),
+                    "to_tile": list(nb),
+                    "from_dir": mdir,
+                    "to_dir": DIRECTION_OPPOSITES[mdir],
+                    "port": mp.port_num,
+                    "mode": "packet",
+                    "block": block.name,
+                    "color": color,
+                })
+
+        for sd in block.shim_dma:
+            internal_conns.append({
+                "tile": list(sd.tile),
+                "slave_type": "ShimDMA",
+                "slave_port": sd.port_num,
+                "master_type": "ShimDMA",
+                "master_port": sd.port_num,
+                "mode": "shim_dma",
+                "direction": sd.direction,
+                "block": block.name,
+                "color": color,
+            })
+
+    return {
+        "cross_tile_arrows": cross_tile_arrows,
+        "internal_conns": internal_conns,
+        "blocks": [{"name": b.name, "color": BLOCK_COLORS[i % len(BLOCK_COLORS)]}
+                    for i, b in enumerate(blocks)],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Build per-tile routing summary for tile cards
+# ---------------------------------------------------------------------------
+
+def _build_routing_tile_summary(blocks: List[RoutingBlock]) -> Dict[tuple, List[dict]]:
+    result: Dict[tuple, List[dict]] = defaultdict(list)
+    for bi, block in enumerate(blocks):
+        color = BLOCK_COLORS[bi % len(BLOCK_COLORS)]
+        for cc in block.circuit_conns:
+            result[cc.tile].append({
+                "type": "circuit",
+                "slave": f"{cc.slave_type}:{cc.slave_port}",
+                "master": f"{cc.master_type}:{cc.master_port}",
+                "block": block.name,
+                "color": color,
+            })
+        for ss, mp in resolve_pkt_internal_edges(block):
+            result[ss.tile].append({
+                "type": "packet",
+                "slave": f"{ss.port_type}:{ss.port_num}",
+                "master": f"{mp.port_type}:{mp.port_num}",
+                "block": block.name,
+                "color": color,
+                "pkt_id": ss.pkt_id,
+            })
+        for sd in block.shim_dma:
+            arrow = "AIE->Shim" if sd.direction == "aie_to_shim" else "Shim->AIE"
+            result[sd.tile].append({
+                "type": "shim_dma",
+                "port": sd.port_num,
+                "direction": arrow,
+                "block": block.name,
+                "color": color,
+            })
+    return dict(result)
+
+
+# ---------------------------------------------------------------------------
+# Text output
+# ---------------------------------------------------------------------------
+
+def render_text(blocks: Optional[List[RoutingBlock]],
+                paths: Optional[list],
+                dma_tiles: Optional[Dict[Tuple[int, int], TileDmaInfo]],
+                routing_summary: Optional[Dict[tuple, List[dict]]],
+                out) -> None:
+    if blocks:
+        out.write("=" * 70 + "\n")
+        out.write("  ROUTING TOPOLOGY\n")
+        out.write("=" * 70 + "\n")
+        for block in blocks:
+            out.write(f"\n--- {block.name} ---\n")
+            if block.circuit_conns:
+                out.write("  Circuit-Switch Connections:\n")
+                for cc in block.circuit_conns:
+                    out.write(f"    tile({cc.tile[0]},{cc.tile[1]}) "
+                              f"{cc.slave_type}:{cc.slave_port} -> "
+                              f"{cc.master_type}:{cc.master_port}\n")
+            pkt_edges = resolve_pkt_internal_edges(block)
+            if pkt_edges:
+                out.write("  Packet-Switch Connections:\n")
+                for ss, mp in pkt_edges:
+                    out.write(f"    tile({ss.tile[0]},{ss.tile[1]}) "
+                              f"{ss.port_type}:{ss.port_num} [PktId={ss.pkt_id}] -> "
+                              f"{mp.port_type}:{mp.port_num}  (Arb={ss.arbiter})\n")
+            if block.shim_dma:
+                out.write("  Shim DMA Ports:\n")
+                for sd in block.shim_dma:
+                    d = "AIE->Shim" if sd.direction == "aie_to_shim" else "Shim->AIE"
+                    out.write(f"    tile({sd.tile[0]},{sd.tile[1]}) port {sd.port_num} ({d})\n")
+
+    if paths:
+        out.write(f"\n{'=' * 70}\n")
+        out.write("  TRACED END-TO-END PATHS\n")
+        out.write(f"{'=' * 70}\n")
+        for i, (bname, path) in enumerate(paths):
+            hops = []
+            for (tile, stype, sport, mtype, mport, mode) in path:
+                if mtype:
+                    hops.append(f"({tile[0]},{tile[1]}) {stype}:{sport}->{mtype}:{mport}")
+                elif mode == "shim_exit":
+                    hops.append(f"({tile[0]},{tile[1]}) -> ShimDMA (SOUTH:{sport})")
+                else:
+                    hops.append(f"({tile[0]},{tile[1]}) {stype}:{sport} [{mode}]")
+            out.write(f"\n  [{bname}] Path {i+1}:\n")
+            for j, h in enumerate(hops):
+                prefix = "    +---> " if j == len(hops) - 1 else "    |---> "
+                out.write(f"{prefix}{h}\n")
+
+    if dma_tiles:
+        out.write(f"\n{'=' * 70}\n")
+        out.write("  DMA BUFFER DESCRIPTOR CONFIGURATION\n")
+        out.write(f"{'=' * 70}\n\n")
+        for loc in sorted(dma_tiles, key=lambda k: (k[1], k[0])):
+            info = dma_tiles[loc]
+            header = f"Tile ({loc[0]},{loc[1]}) [{info.tile_type}]"
+            out.write(f"--- {header} ---\n")
+            if info.ios:
+                dirs = ", ".join(f"ch{io.channel_id}:{io.direction}" for io in info.ios)
+                out.write(f"  IO Channels: {dirs}\n")
+            if info.bds:
+                out.write("  BD Configurations:\n")
+                for bd in info.bds:
+                    chain = f" -> BD{bd.next_bd}" if bd.next_bd >= 0 else " (no chain)"
+                    pkt = f"pkt={bd.packet_id}" if bd.enable_packet else "no-pkt"
+                    acq = f"lock={bd.acquire_lock_id} val={bd.acquire_lock_val}" if bd.acquire_lock_id >= 0 else "none"
+                    rel = f"lock={bd.release_lock_id} val={bd.release_lock_val}" if bd.release_lock_id >= 0 else "none"
+                    out.write(f"    [BD{bd.bd_id}] len={bd.length:>4}  {pkt:<8}"
+                              f"  next{chain:<12}  buf={bd.buf_source}\n")
+                    out.write(f"           DMA lock: acquire({acq})  release({rel})\n")
+            if info.locks:
+                out.write("  Lock Summary:\n")
+                for lid in sorted(info.locks):
+                    lk = info.locks[lid]
+                    dma_s = f"dma_request_val={lk.operate_value}" if lk.operate_value is not None else "dma_request_val=unset"
+                    init_s = f"init={lk.init_value}" if lk.init_value is not None else "no init"
+                    out.write(f"    Lock {lid}: {dma_s} | {init_s}\n")
+            out.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# HTML output — combined routing + DMA
+# ---------------------------------------------------------------------------
+
+_PKT_COLORS = [
+    "#4FC3F7", "#81C784", "#FFB74D", "#E57373",
+    "#BA68C8", "#4DB6AC", "#FF8A65", "#A1887F",
+]
+
+
+def render_html(
+    blocks: Optional[List[RoutingBlock]],
+    dma_tiles: Optional[Dict[Tuple[int, int], TileDmaInfo]],
+    routing_tiles: Optional[set],
+    routing_summary: Optional[Dict[tuple, List[dict]]],
+    output_path: str,
+) -> str:
+    all_tile_locs = set()
+    if routing_tiles:
+        all_tile_locs |= routing_tiles
+    if dma_tiles:
+        all_tile_locs |= set(dma_tiles.keys())
+
+    if not all_tile_locs:
+        print("No tiles found.", file=sys.stderr)
+        return output_path
+
+    all_cols = sorted({t[0] for t in all_tile_locs})
+    all_rows = sorted({t[1] for t in all_tile_locs}, reverse=True)
+    min_col = all_cols[0]
+    max_row = all_rows[0]
+
+    if routing_summary is None:
+        routing_summary = {}
+    if dma_tiles is None:
+        dma_tiles = {}
+
+    routing_json_data = {}
+    if blocks:
+        routing_json_data = _build_routing_json(blocks)
+
+    def _pkt_color(pid: int) -> str:
+        return _PKT_COLORS[pid % len(_PKT_COLORS)]
+
+    def _lock_html(lock_id, lock_val, locks, label):
+        if lock_id < 0:
+            return f'<span class="lock unset">{label}: none</span>'
+        lk = locks.get(lock_id)
+        init_val = str(lk.init_value) if lk and lk.init_value is not None else "?"
+        tooltip = f"DMA {label}: lock_id={lock_id}, request_val={lock_val}, init={init_val}"
+        init_badge = ""
+        if lk and lk.init_value is not None:
+            init_badge = f'<span class="lock-init-badge">init={lk.init_value}</span>'
+        return (
+            f'<span class="lock" title="{tooltip}">'
+            f'{label}=L{lock_id}(val={lock_val}) {init_badge}</span>'
+        )
+
+    tile_cards = []
+    for loc in sorted(all_tile_locs, key=lambda k: (-k[1], k[0])):
+        tile_type = TILE_TYPE_BY_ROW(loc[1])
+        type_cls = tile_type.lower()
+        dma_info = dma_tiles.get(loc)
+        rt_info = routing_summary.get(loc, [])
+        is_active = loc in (routing_tiles or set()) or loc in dma_tiles
+
+        # --- Routing section ---
+        routing_rows = []
+        for r in rt_info:
+            if r["type"] == "circuit":
+                routing_rows.append(
+                    f'<div class="route-row circuit" style="border-left:3px solid {r["color"]}">'
+                    f'<span class="route-label">CCT</span> '
+                    f'{r["slave"]} &rarr; {r["master"]}'
+                    f'<span class="route-block">{r["block"]}</span></div>'
+                )
+            elif r["type"] == "packet":
+                routing_rows.append(
+                    f'<div class="route-row packet" style="border-left:3px solid {r["color"]}">'
+                    f'<span class="route-label">PKT</span> '
+                    f'{r["slave"]} &rarr; {r["master"]} '
+                    f'<span class="pkt" style="background:{_pkt_color(r.get("pkt_id", 0))}">'
+                    f'pkt{r.get("pkt_id", "?")}</span>'
+                    f'<span class="route-block">{r["block"]}</span></div>'
+                )
+            elif r["type"] == "shim_dma":
+                arrow = "&#x25BC;" if "AIE" in r["direction"] else "&#x25B2;"
+                routing_rows.append(
+                    f'<div class="route-row shim-dma" style="border-left:3px solid {r["color"]}">'
+                    f'{arrow} ShimDMA:{r["port"]} ({r["direction"]})'
+                    f'<span class="route-block">{r["block"]}</span></div>'
+                )
+
+        routing_section = ""
+        if routing_rows:
+            collapsed = "".join(routing_rows)
+            routing_section = (
+                f'<div class="section-header routing-header" onclick="toggleSection(this)">'
+                f'&#x25BC; Routing ({len(routing_rows)})</div>'
+                f'<div class="routing-section expanded">{collapsed}</div>'
+            )
+
+        # --- DMA section ---
+        dma_section = ""
+        if dma_info:
+            io_rows = []
+            for io in dma_info.ios:
+                dir_cls = "s2mm" if io.direction == "S2MM" else "mm2s"
+                io_rows.append(
+                    f'<div class="io-row {dir_cls}">ch{io.channel_id}: {io.direction}</div>'
+                )
+
+            bd_rows = []
+            bd_by_id = {bd.bd_id: bd for bd in dma_info.bds}
+            for bd in dma_info.bds:
+                is_pp = (bd.next_bd >= 0 and bd.next_bd != bd.bd_id
+                         and bd.next_bd in bd_by_id
+                         and bd_by_id[bd.next_bd].next_bd == bd.bd_id)
+                pp_class = " ping-pong" if is_pp else ""
+                nxt = f"&rarr;BD{bd.next_bd}" if bd.next_bd >= 0 else "none"
+                chain_html = f'<span class="chain">BD{bd.bd_id} next={nxt}</span>'
+
+                pkt_html = ""
+                if bd.enable_packet:
+                    c = _pkt_color(bd.packet_id)
+                    pkt_html = f'<span class="pkt" style="background:{c}">pkt{bd.packet_id}</span>'
+
+                acq_html = _lock_html(bd.acquire_lock_id, bd.acquire_lock_val, dma_info.locks, "acq")
+                rel_html = _lock_html(bd.release_lock_id, bd.release_lock_val, dma_info.locks, "rel")
+
+                bd_rows.append(
+                    f'<div class="bd-row{pp_class}">'
+                    f'{chain_html} {pkt_html} '
+                    f'<span class="len">len={bd.length}</span> '
+                    f'<span class="buf">buf={bd.buf_source}</span>'
+                    f'<div class="lock-row">{acq_html} {rel_html}</div>'
+                    f'</div>'
+                )
+
+            lock_rows = []
+            for lid in sorted(dma_info.locks):
+                lk = dma_info.locks[lid]
+                dma_s = f"req_val={lk.operate_value}" if lk.operate_value is not None else "unset"
+                if lk.init_value is not None:
+                    init_s = f'<span class="lock-init-badge">init={lk.init_value}</span>'
+                else:
+                    init_s = '<span class="lock-no-init">no init</span>'
+                lock_rows.append(
+                    f'<div class="lock-summary-row">L{lid}: {dma_s} {init_s}</div>'
+                )
+            lock_section = ""
+            if lock_rows:
+                lock_section = f'<div class="lock-section">{"".join(lock_rows)}</div>'
+
+            io_html = f'<div class="io-section">{"".join(io_rows)}</div>' if io_rows else ""
+            bd_html = f'<div class="bd-section">{"".join(bd_rows)}</div>' if bd_rows else ""
+            sources = list(dict.fromkeys(bd.buf_source for bd in dma_info.bds))
+            src_text = ", ".join(sources[:2]) + ("..." if len(sources) > 2 else "")
+            buf_html = f'<div class="buf-line">buf: {src_text}</div>' if sources else ""
+
+            dma_section = (
+                f'<div class="section-header dma-header" onclick="toggleSection(this)">'
+                f'&#x25B6; DMA ({len(dma_info.bds)} BDs)</div>'
+                f'<div class="dma-detail-section collapsed">'
+                f'{io_html}{bd_html}{lock_section}{buf_html}</div>'
+            )
+
+        gc = loc[0] - min_col + 1
+        gr = max_row - loc[1] + 1
+
+        card = (
+            f'<div class="tile-card {type_cls}{"" if is_active else " inactive"}" '
+            f'id="tile-{loc[0]}-{loc[1]}" '
+            f'style="grid-column:{gc}; grid-row:{gr}" '
+            f'data-col="{loc[0]}" data-row="{loc[1]}">'
+            f'<div class="tile-header">({loc[0]},{loc[1]}) {tile_type}</div>'
+            f'{routing_section}'
+            f'{dma_section}'
+            f'</div>'
+        )
+        tile_cards.append(card)
+
+    ncols = len(all_cols)
+    nrows = len(all_rows)
+
+    has_routing = bool(blocks)
+    has_dma = bool(dma_tiles)
+    title_parts = []
+    if has_routing:
+        title_parts.append("Routing Topology")
+    if has_dma:
+        title_parts.append("DMA BD Configuration")
+    title = " + ".join(title_parts) or "AIE Visualization"
+
+    block_legend = ""
+    if blocks:
+        items = []
+        for i, b in enumerate(blocks):
+            c = BLOCK_COLORS[i % len(BLOCK_COLORS)]
+            items.append(f'<div class="legend-item">'
+                         f'<div class="legend-swatch" style="background:{c}"></div> {b.name}</div>')
+        block_legend = "".join(items)
+
+    routing_json_str = json.dumps(routing_json_data) if routing_json_data else "{}"
+
+    html = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f0f2f5; padding: 20px;
+    color: #333;
+}}
+h1 {{ text-align: center; margin-bottom: 6px; font-size: 22px; color: #1a1a2e; }}
+.subtitle {{ text-align: center; margin-bottom: 16px; font-size: 12px; color: #888; }}
+.controls {{
+    display: flex; justify-content: center; gap: 12px;
+    margin-bottom: 16px; flex-wrap: wrap;
+}}
+.controls button {{
+    padding: 6px 16px; border: 1px solid #bbb; border-radius: 6px;
+    background: #fff; cursor: pointer; font-size: 12px; font-weight: 600;
+    transition: all .15s;
+}}
+.controls button:hover {{ background: #e3f2fd; border-color: #42a5f5; }}
+.controls button.active {{ background: #1976d2; color: #fff; border-color: #1976d2; }}
+.legend {{
+    display: flex; gap: 14px; justify-content: center;
+    margin-bottom: 14px; font-size: 11px; flex-wrap: wrap;
+}}
+.legend-item {{ display: flex; align-items: center; gap: 4px; }}
+.legend-swatch {{
+    width: 14px; height: 14px; border-radius: 3px; border: 1px solid #aaa;
+}}
+.grid-wrapper {{
+    position: relative; display: inline-block;
+    margin: 0 auto;
+}}
+.grid-container {{
+    display: flex; justify-content: center;
+}}
+.grid {{
+    display: grid;
+    grid-template-columns: repeat({ncols}, 300px);
+    grid-template-rows: repeat({nrows}, auto);
+    gap: 14px;
+    position: relative;
+    z-index: 1;
+}}
+svg.routing-overlay {{
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 10;
+}}
+svg.routing-overlay line, svg.routing-overlay path {{
+    pointer-events: stroke;
+}}
+.tile-card {{
+    border: 2px solid #bbb; border-radius: 10px;
+    padding: 10px; min-height: 80px;
+    background: #fff; position: relative;
+    transition: box-shadow .15s, transform .15s;
+}}
+.tile-card:hover {{ box-shadow: 0 4px 20px rgba(0,0,0,.15); transform: translateY(-1px); }}
+.tile-card.inactive {{ opacity: 0.4; }}
+.tile-card.shim {{ background: #e3f2fd; border-color: #42a5f5; }}
+.tile-card.mem  {{ background: #e8f5e9; border-color: #66bb6a; }}
+.tile-card.aie  {{ background: #fffde7; border-color: #fdd835; }}
+.tile-header {{
+    font-weight: 700; font-size: 13px; margin-bottom: 6px;
+    padding-bottom: 4px; border-bottom: 1px solid #ddd;
+    display: flex; justify-content: space-between; align-items: center;
+}}
+.section-header {{
+    font-size: 11px; font-weight: 700; color: #555;
+    cursor: pointer; padding: 3px 0; user-select: none;
+    transition: color .1s;
+}}
+.section-header:hover {{ color: #1976d2; }}
+.routing-section, .dma-detail-section {{
+    overflow: hidden; transition: max-height .3s ease;
+}}
+.collapsed {{ max-height: 0 !important; }}
+.expanded {{ max-height: 2000px; }}
+.route-row {{
+    font-size: 10px; font-family: monospace;
+    padding: 2px 6px; margin-bottom: 2px; border-radius: 3px;
+    background: rgba(255,255,255,0.7);
+}}
+.route-label {{
+    display: inline-block; width: 28px; font-weight: 700;
+    font-size: 9px; color: #fff; text-align: center;
+    border-radius: 3px; padding: 0 2px; margin-right: 4px;
+}}
+.route-row.circuit .route-label {{ background: #1976d2; }}
+.route-row.packet .route-label {{ background: #7b1fa2; }}
+.route-row.shim-dma .route-label {{ background: #e65100; }}
+.route-block {{
+    float: right; font-size: 9px; color: #999; font-style: italic;
+}}
+.io-section {{ margin-bottom: 4px; }}
+.io-row {{
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 11px; font-weight: 600; margin-right: 4px; margin-bottom: 2px;
+}}
+.io-row.s2mm {{ background: #bbdefb; color: #0d47a1; }}
+.io-row.mm2s {{ background: #ffe0b2; color: #e65100; }}
+.bd-section {{ font-size: 11px; }}
+.bd-row {{
+    padding: 4px 6px; margin-bottom: 3px; border-radius: 4px;
+    background: #fafafa; border: 1px solid #e0e0e0;
+    display: flex; flex-wrap: wrap; gap: 5px; align-items: center;
+}}
+.bd-row.ping-pong {{ background: #e8eaf6; border-color: #7986cb; }}
+.chain {{ font-weight: 700; color: #1565c0; font-family: monospace; }}
+.pkt {{
+    padding: 1px 6px; border-radius: 3px; font-size: 10px;
+    color: #fff; font-weight: 600;
+}}
+.len {{ color: #555; }}
+.buf {{ color: #888; font-style: italic; font-size: 10px; }}
+.lock-row {{ width: 100%; display: flex; gap: 8px; margin-top: 2px; }}
+.lock {{
+    font-size: 10px; font-family: monospace; color: #4a148c;
+    background: #f3e5f5; padding: 1px 5px; border-radius: 3px;
+}}
+.lock.unset {{ color: #999; background: #f0f0f0; }}
+.lock-init-badge {{
+    font-size: 9px; font-weight: 700; color: #fff; background: #7b1fa2;
+    padding: 0 4px; border-radius: 3px; margin-left: 2px;
+}}
+.lock-no-init {{ color: #aaa; font-style: italic; }}
+.lock-section {{
+    margin-top: 4px; padding-top: 3px; border-top: 1px dashed #ccc;
+    font-size: 10px; color: #666;
+}}
+.lock-summary-row {{ padding: 1px 0; font-family: monospace; }}
+.buf-line {{
+    font-size: 10px; color: #777; font-style: italic;
+    margin-top: 3px; padding-top: 3px; border-top: 1px dotted #ddd;
+}}
+.arrow-tooltip {{
+    position: absolute; background: rgba(30,30,30,.92); color: #fff;
+    padding: 4px 10px; border-radius: 5px; font-size: 11px;
+    pointer-events: none; z-index: 100; white-space: nowrap;
+    display: none; font-family: monospace;
+}}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<div class="subtitle">Generated from routing.cc + host.cc</div>
+
+<div class="controls">
+    <button id="btn-expand" onclick="expandAll()">Expand All</button>
+    <button id="btn-collapse" onclick="collapseAll()">Collapse All</button>
+    <button id="btn-arrows" class="active" onclick="toggleArrows(this)">Routing Arrows</button>
+</div>
+
+<div class="legend">
+    <div class="legend-item"><div class="legend-swatch" style="background:#e3f2fd;border-color:#42a5f5"></div> Shim</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#e8f5e9;border-color:#66bb6a"></div> Mem</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#fffde7;border-color:#fdd835"></div> AIE</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#e8eaf6;border-color:#7986cb"></div> Ping-Pong</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#bbdefb"></div> S2MM</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#ffe0b2"></div> MM2S</div>
+    {block_legend}
+    <div class="legend-item"><div class="legend-swatch" style="background:#fff;border:2px solid #1976d2"></div> Circuit (solid)</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#fff;border:2px dashed #7b1fa2"></div> Packet (dashed)</div>
+</div>
+
+<div class="grid-container">
+<div class="grid-wrapper">
+<div class="grid" id="tile-grid">
+{"".join(tile_cards)}
+</div>
+<svg class="routing-overlay" id="routing-svg">
+    <defs>
+        <marker id="arrowhead" markerWidth="8" markerHeight="6"
+                refX="7" refY="3" orient="auto" fill="currentColor">
+            <polygon points="0 0, 8 3, 0 6"/>
+        </marker>
+        <marker id="arrowhead-dashed" markerWidth="8" markerHeight="6"
+                refX="7" refY="3" orient="auto" fill="currentColor">
+            <polygon points="0 0, 8 3, 0 6"/>
+        </marker>
+        <marker id="arrowhead-sm" markerWidth="6" markerHeight="5"
+                refX="5" refY="2.5" orient="auto" fill="currentColor">
+            <polygon points="0 0, 6 2.5, 0 5"/>
+        </marker>
+    </defs>
+</svg>
+<div class="arrow-tooltip" id="arrow-tooltip"></div>
+</div>
+</div>
+
+<script>
+const routingData = {routing_json_str};
+let arrowsVisible = true;
+
+function toggleSection(header) {{
+    const section = header.nextElementSibling;
+    if (section.classList.contains('collapsed')) {{
+        section.classList.remove('collapsed');
+        section.classList.add('expanded');
+        header.innerHTML = header.innerHTML.replace('\\u25B6', '\\u25BC');
+    }} else {{
+        section.classList.remove('expanded');
+        section.classList.add('collapsed');
+        header.innerHTML = header.innerHTML.replace('\\u25BC', '\\u25B6');
+    }}
+    setTimeout(drawArrows, 350);
+}}
+
+function expandAll() {{
+    document.querySelectorAll('.collapsed').forEach(el => {{
+        el.classList.remove('collapsed');
+        el.classList.add('expanded');
+    }});
+    document.querySelectorAll('.section-header').forEach(h => {{
+        h.innerHTML = h.innerHTML.replace('\\u25B6', '\\u25BC');
+    }});
+    setTimeout(drawArrows, 350);
+}}
+
+function collapseAll() {{
+    document.querySelectorAll('.routing-section, .dma-detail-section').forEach(el => {{
+        el.classList.remove('expanded');
+        el.classList.add('collapsed');
+    }});
+    document.querySelectorAll('.section-header').forEach(h => {{
+        h.innerHTML = h.innerHTML.replace('\\u25BC', '\\u25B6');
+    }});
+    setTimeout(drawArrows, 350);
+}}
+
+function toggleArrows(btn) {{
+    arrowsVisible = !arrowsVisible;
+    btn.classList.toggle('active', arrowsVisible);
+    document.getElementById('routing-svg').style.display = arrowsVisible ? '' : 'none';
+}}
+
+function drawArrows() {{
+    const svg = document.getElementById('routing-svg');
+    const wrapper = document.querySelector('.grid-wrapper');
+    const grid = document.getElementById('tile-grid');
+
+    // Clear existing arrows
+    while (svg.lastChild && svg.lastChild.tagName !== 'defs') {{
+        svg.removeChild(svg.lastChild);
+    }}
+
+    const wrapperRect = wrapper.getBoundingClientRect();
+    svg.setAttribute('width', wrapper.offsetWidth);
+    svg.setAttribute('height', wrapper.offsetHeight);
+    svg.setAttribute('viewBox', `0 0 ${{wrapper.offsetWidth}} ${{wrapper.offsetHeight}}`);
+
+    if (!routingData.cross_tile_arrows) return;
+
+    const tileElements = {{}};
+    document.querySelectorAll('.tile-card').forEach(card => {{
+        const col = parseInt(card.dataset.col);
+        const row = parseInt(card.dataset.row);
+        tileElements[col + ',' + row] = card;
+    }});
+
+    const dirOffset = {{
+        'NORTH': {{ dx: 0, dy: -1 }},
+        'SOUTH': {{ dx: 0, dy: 1 }},
+        'EAST':  {{ dx: 1, dy: 0 }},
+        'WEST':  {{ dx: -1, dy: 0 }},
+    }};
+
+    const drawn = new Set();
+
+    routingData.cross_tile_arrows.forEach(arrow => {{
+        const fromKey = arrow.from_tile[0] + ',' + arrow.from_tile[1];
+        const toKey = arrow.to_tile[0] + ',' + arrow.to_tile[1];
+        const fromEl = tileElements[fromKey];
+        const toEl = tileElements[toKey];
+        if (!fromEl || !toEl) return;
+
+        const arrowKey = `${{fromKey}}-${{toKey}}-${{arrow.port}}-${{arrow.mode}}`;
+        if (drawn.has(arrowKey)) return;
+        drawn.add(arrowKey);
+
+        const fromRect = fromEl.getBoundingClientRect();
+        const toRect = toEl.getBoundingClientRect();
+
+        const portSpread = 12;
+        const portOffset = (arrow.port - 0.5) * portSpread;
+
+        let x1, y1, x2, y2;
+        const dir = arrow.from_dir;
+
+        if (dir === 'NORTH') {{
+            x1 = fromRect.left + fromRect.width / 2 + portOffset - wrapperRect.left;
+            y1 = fromRect.top - wrapperRect.top;
+            x2 = toRect.left + toRect.width / 2 + portOffset - wrapperRect.left;
+            y2 = toRect.top + toRect.height - wrapperRect.top;
+        }} else if (dir === 'SOUTH') {{
+            x1 = fromRect.left + fromRect.width / 2 + portOffset - wrapperRect.left;
+            y1 = fromRect.top + fromRect.height - wrapperRect.top;
+            x2 = toRect.left + toRect.width / 2 + portOffset - wrapperRect.left;
+            y2 = toRect.top - wrapperRect.top;
+        }} else if (dir === 'EAST') {{
+            x1 = fromRect.left + fromRect.width - wrapperRect.left;
+            y1 = fromRect.top + fromRect.height / 2 + portOffset - wrapperRect.top;
+            x2 = toRect.left - wrapperRect.left;
+            y2 = toRect.top + toRect.height / 2 + portOffset - wrapperRect.top;
+        }} else if (dir === 'WEST') {{
+            x1 = fromRect.left - wrapperRect.left;
+            y1 = fromRect.top + fromRect.height / 2 + portOffset - wrapperRect.top;
+            x2 = toRect.left + toRect.width - wrapperRect.left;
+            y2 = toRect.top + toRect.height / 2 + portOffset - wrapperRect.top;
+        }}
+
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line.setAttribute('x1', x1);
+        line.setAttribute('y1', y1);
+        line.setAttribute('x2', x2);
+        line.setAttribute('y2', y2);
+        line.setAttribute('stroke', arrow.color);
+        line.setAttribute('stroke-width', arrow.mode === 'circuit' ? '2.5' : '2');
+        line.style.color = arrow.color;
+        if (arrow.mode === 'packet') {{
+            line.setAttribute('stroke-dasharray', '6,3');
+        }}
+        line.setAttribute('marker-end', 'url(#arrowhead)');
+        line.style.pointerEvents = 'stroke';
+        line.style.cursor = 'pointer';
+
+        const tooltip = document.getElementById('arrow-tooltip');
+        line.addEventListener('mouseenter', (e) => {{
+            tooltip.textContent = `${{arrow.block}}: ${{arrow.mode}} port=${{arrow.port}} (${{fromKey}} -> ${{toKey}})`;
+            tooltip.style.display = 'block';
+            tooltip.style.left = (e.clientX - wrapperRect.left + 10) + 'px';
+            tooltip.style.top = (e.clientY - wrapperRect.top - 20) + 'px';
+        }});
+        line.addEventListener('mousemove', (e) => {{
+            tooltip.style.left = (e.clientX - wrapperRect.left + 10) + 'px';
+            tooltip.style.top = (e.clientY - wrapperRect.top - 20) + 'px';
+        }});
+        line.addEventListener('mouseleave', () => {{
+            tooltip.style.display = 'none';
+        }});
+
+        svg.appendChild(line);
+    }});
+
+    // --- Draw internal routing connections within tiles (curved arrows) ---
+    function getPortPos(tileRect, portType, portNum, isMaster) {{
+        const ps = 12;
+        const off = (portNum - 0.5) * ps;
+        const r = tileRect;
+        const inset = 6;
+        if (portType === 'NORTH') return {{x: r.left + r.width/2 + off - wrapperRect.left, y: r.top - wrapperRect.top + inset}};
+        if (portType === 'SOUTH') return {{x: r.left + r.width/2 + off - wrapperRect.left, y: r.top + r.height - wrapperRect.top - inset}};
+        if (portType === 'EAST')  return {{x: r.left + r.width - wrapperRect.left - inset, y: r.top + r.height/2 + off - wrapperRect.top}};
+        if (portType === 'WEST')  return {{x: r.left - wrapperRect.left + inset, y: r.top + r.height/2 + off - wrapperRect.top}};
+        const xp = isMaster ? (r.left + r.width * 0.65 - wrapperRect.left) : (r.left + r.width * 0.35 - wrapperRect.left);
+        return {{x: xp, y: r.top + r.height * 0.4 + portNum * 10 - wrapperRect.top}};
+    }}
+
+    const drawnInternal = new Set();
+    if (routingData.internal_conns) {{
+        routingData.internal_conns.forEach(conn => {{
+            if (conn.mode === 'shim_dma') return;
+
+            const tKey = conn.tile[0] + ',' + conn.tile[1];
+            const tileEl = tileElements[tKey];
+            if (!tileEl) return;
+
+            const connKey = `${{tKey}}-${{conn.slave_type}}-${{conn.slave_port}}-${{conn.master_type}}-${{conn.master_port}}-${{conn.mode}}`;
+            if (drawnInternal.has(connKey)) return;
+            drawnInternal.add(connKey);
+
+            const tr = tileEl.getBoundingClientRect();
+            const s = getPortPos(tr, conn.slave_type, conn.slave_port, false);
+            const m = getPortPos(tr, conn.master_type, conn.master_port, true);
+
+            const tcx = tr.left + tr.width / 2 - wrapperRect.left;
+            const tcy = tr.top + tr.height / 2 - wrapperRect.top;
+
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', `M ${{s.x}} ${{s.y}} Q ${{tcx}} ${{tcy}} ${{m.x}} ${{m.y}}`);
+            path.setAttribute('stroke', conn.color);
+            path.setAttribute('stroke-width', '1.5');
+            path.setAttribute('fill', 'none');
+            path.setAttribute('opacity', '0.55');
+            path.style.color = conn.color;
+            if (conn.mode === 'packet') {{
+                path.setAttribute('stroke-dasharray', '4,2');
+            }}
+            path.setAttribute('marker-end', 'url(#arrowhead-sm)');
+            path.style.pointerEvents = 'stroke';
+            path.style.cursor = 'pointer';
+
+            const tooltip = document.getElementById('arrow-tooltip');
+            const label = `${{conn.block}}: ${{conn.slave_type}}:${{conn.slave_port}} \\u2192 ${{conn.master_type}}:${{conn.master_port}} (${{conn.mode}})`;
+            path.addEventListener('mouseenter', (e) => {{
+                tooltip.textContent = label;
+                tooltip.style.display = 'block';
+                tooltip.style.left = (e.clientX - wrapperRect.left + 10) + 'px';
+                tooltip.style.top = (e.clientY - wrapperRect.top - 20) + 'px';
+            }});
+            path.addEventListener('mousemove', (e) => {{
+                tooltip.style.left = (e.clientX - wrapperRect.left + 10) + 'px';
+                tooltip.style.top = (e.clientY - wrapperRect.top - 20) + 'px';
+            }});
+            path.addEventListener('mouseleave', () => {{
+                tooltip.style.display = 'none';
+            }});
+
+            svg.appendChild(path);
+
+            [s, m].forEach(pos => {{
+                const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                dot.setAttribute('cx', pos.x);
+                dot.setAttribute('cy', pos.y);
+                dot.setAttribute('r', '3');
+                dot.setAttribute('fill', conn.color);
+                dot.setAttribute('opacity', '0.7');
+                svg.appendChild(dot);
+            }});
+        }});
+    }}
+
+}}
+
+window.addEventListener('load', () => {{
+    drawArrows();
+}});
+window.addEventListener('resize', drawArrows);
+</script>
+</body>
+</html>
+"""
+    Path(output_path).write_text(html)
+    print(f"HTML saved to {output_path}")
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# PNG output (matplotlib)
+# ---------------------------------------------------------------------------
+
+def render_png(
+    blocks: Optional[List[RoutingBlock]],
+    dma_tiles: Optional[Dict[Tuple[int, int], TileDmaInfo]],
+    routing_tiles: Optional[set],
+    routing_summary: Optional[Dict[tuple, List[dict]]],
+    output_path: str,
+) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    all_tile_locs = set()
+    if routing_tiles:
+        all_tile_locs |= routing_tiles
+    if dma_tiles:
+        all_tile_locs |= set(dma_tiles.keys())
+
+    if not all_tile_locs:
+        print("No tiles found.", file=sys.stderr)
+        return
+
+    cols = sorted({t[0] for t in all_tile_locs})
+    rows = sorted({t[1] for t in all_tile_locs})
+    min_col, max_col = min(cols), max(cols)
+    min_row, max_row = min(rows), max(rows)
+    all_cols = list(range(min_col, max_col + 1))
+    all_rows = list(range(min_row, max_row + 1))
+
+    has_dma = bool(dma_tiles)
+    cell_w = 3.0
+    cell_h = 2.6 if has_dma else 1.8
+    pad_x, pad_y = 1.5, 1.0
+    fig_w = len(all_cols) * cell_w + 2 * pad_x
+    fig_h = len(all_rows) * cell_h + 2 * pad_y + 1.5
+
+    fig, ax = plt.subplots(figsize=(max(fig_w, 8), max(fig_h, 6)))
+    ax.set_xlim(-pad_x, len(all_cols) * cell_w + pad_x)
+    ax.set_ylim(-pad_y - 1.0, len(all_rows) * cell_h + pad_y)
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    tile_centers = {}
+    type_colors = {"Shim": "#FFECB3", "Mem": "#C8E6C9", "AIE": "#BBDEFB"}
+
+    for ci, c in enumerate(all_cols):
+        for ri, r in enumerate(all_rows):
+            cx = ci * cell_w + cell_w / 2
+            cy = ri * cell_h + cell_h / 2
+            tile_centers[(c, r)] = (cx, cy)
+            ttype = TILE_TYPE_BY_ROW(r)
+            is_active = (c, r) in all_tile_locs
+            fc = type_colors.get(ttype, "#EEE") if is_active else "#F5F5F5"
+            ec = "#333" if is_active else "#CCC"
+            lw = 1.5 if is_active else 0.5
+            rect = mpatches.FancyBboxPatch(
+                (cx - cell_w * 0.42, cy - cell_h * 0.40),
+                cell_w * 0.84, cell_h * 0.80,
+                boxstyle="round,pad=0.05",
+                facecolor=fc, edgecolor=ec, linewidth=lw, zorder=1)
+            ax.add_patch(rect)
+            ax.text(cx, cy + cell_h * 0.25, f"({c},{r})",
+                    ha="center", va="center", fontsize=8, fontweight="bold",
+                    color="#333" if is_active else "#AAA", zorder=5)
+            ax.text(cx, cy + cell_h * 0.12, ttype,
+                    ha="center", va="center", fontsize=6.5,
+                    color="#666" if is_active else "#CCC", zorder=5)
+
+    for ci, c in enumerate(all_cols):
+        cx = ci * cell_w + cell_w / 2
+        ax.text(cx, len(all_rows) * cell_h + pad_y * 0.3,
+                f"Col {c}", ha="center", va="center", fontsize=9, fontweight="bold")
+    for ri, r in enumerate(all_rows):
+        cy = ri * cell_h + cell_h / 2
+        ax.text(-pad_x * 0.55, cy,
+                f"Row {r}", ha="center", va="center", fontsize=9, fontweight="bold")
+
+    port_offsets = {
+        "NORTH": (0, 0.38), "SOUTH": (0, -0.38),
+        "EAST": (0.38, 0), "WEST": (-0.38, 0),
+    }
+
+    def tile_port_pos(tile, direction, port_num, spread=0.2):
+        cx, cy = tile_centers[tile]
+        dx, dy = port_offsets.get(direction, (0, 0))
+        px = cx + dx * cell_w
+        py = cy + dy * cell_h
+        if direction in ("NORTH", "SOUTH"):
+            px += (port_num - 0.5) * spread
+        elif direction in ("EAST", "WEST"):
+            py += (port_num - 0.5) * spread
+        return px, py
+
+    if blocks:
+        drawn_internal = set()
+        drawn_cross = set()
+        for bi, block in enumerate(blocks):
+            color = BLOCK_COLORS[bi % len(BLOCK_COLORS)]
+
+            for cc in block.circuit_conns:
+                if cc.tile not in tile_centers:
+                    continue
+                key = (cc.tile, cc.slave_type, cc.slave_port, cc.master_type, cc.master_port, bi)
+                if key in drawn_internal:
+                    continue
+                drawn_internal.add(key)
+                sx, sy = tile_port_pos(cc.tile, cc.slave_type, cc.slave_port)
+                mx, my = tile_port_pos(cc.tile, cc.master_type, cc.master_port)
+                ax.annotate("", xy=(mx, my), xytext=(sx, sy),
+                            arrowprops=dict(arrowstyle="-|>", color=color,
+                                            lw=1.3, connectionstyle="arc3,rad=0.15"),
+                            zorder=3)
+
+                mdir = cc.master_type
+                if mdir in DIRECTION_DELTA:
+                    dc, dr = DIRECTION_DELTA[mdir]
+                    nb = (cc.tile[0] + dc, cc.tile[1] + dr)
+                    if nb in tile_centers:
+                        ckey = (cc.tile, mdir, cc.master_port, nb, bi)
+                        if ckey not in drawn_cross:
+                            drawn_cross.add(ckey)
+                            esx, esy = tile_port_pos(cc.tile, mdir, cc.master_port)
+                            opp = DIRECTION_OPPOSITES[mdir]
+                            eex, eey = tile_port_pos(nb, opp, cc.master_port)
+                            ax.annotate("", xy=(eex, eey), xytext=(esx, esy),
+                                        arrowprops=dict(arrowstyle="-|>", color=color,
+                                                        lw=1.8),
+                                        zorder=4)
+
+            pkt_edges = resolve_pkt_internal_edges(block)
+            for ss, mp in pkt_edges:
+                if ss.tile not in tile_centers:
+                    continue
+                key = (ss.tile, ss.port_type, ss.port_num, mp.port_type, mp.port_num, bi)
+                if key in drawn_internal:
+                    continue
+                drawn_internal.add(key)
+                sx, sy = tile_port_pos(ss.tile, ss.port_type,
+                                       ss.port_num if ss.port_type in DIRECTION_DELTA else 0)
+                mx, my = tile_port_pos(ss.tile, mp.port_type,
+                                       mp.port_num if mp.port_type in DIRECTION_DELTA else 0)
+                tcx, tcy = tile_centers[ss.tile]
+                if ss.port_type not in DIRECTION_DELTA:
+                    sx = tcx - cell_w * 0.25
+                    sy = tcy
+                if mp.port_type not in DIRECTION_DELTA:
+                    mx = tcx + cell_w * 0.25
+                    my = tcy
+                ax.annotate("", xy=(mx, my), xytext=(sx, sy),
+                            arrowprops=dict(arrowstyle="-|>", color=color,
+                                            lw=1.3, linestyle="dashed",
+                                            connectionstyle="arc3,rad=0.2"),
+                            zorder=3)
+
+                mdir = mp.port_type
+                if mdir in DIRECTION_DELTA:
+                    dc, dr = DIRECTION_DELTA[mdir]
+                    nb = (mp.tile[0] + dc, mp.tile[1] + dr)
+                    if nb in tile_centers:
+                        ckey = (mp.tile, mdir, mp.port_num, nb, bi)
+                        if ckey not in drawn_cross:
+                            drawn_cross.add(ckey)
+                            esx, esy = tile_port_pos(mp.tile, mdir, mp.port_num)
+                            opp = DIRECTION_OPPOSITES[mdir]
+                            eex, eey = tile_port_pos(nb, opp, mp.port_num)
+                            ax.annotate("", xy=(eex, eey), xytext=(esx, esy),
+                                        arrowprops=dict(arrowstyle="-|>", color=color,
+                                                        lw=1.8, linestyle="dashed"),
+                                        zorder=4)
+
+            for sd in block.shim_dma:
+                if sd.tile not in tile_centers:
+                    continue
+                tcx, tcy = tile_centers[sd.tile]
+                arrow = "V" if sd.direction == "aie_to_shim" else "^"
+                ax.text(tcx, tcy - cell_h * 0.0,
+                        f"{arrow} ShimDMA:{sd.port_num}",
+                        ha="center", va="center", fontsize=5.5,
+                        color=color, fontweight="bold", zorder=6)
+
+    if dma_tiles:
+        for tile, info in dma_tiles.items():
+            if tile not in tile_centers:
+                continue
+            tcx, tcy = tile_centers[tile]
+            y_start = tcy - cell_h * 0.05
+            line_i = 0
+            for io in info.ios:
+                y_pos = y_start - line_i * cell_h * 0.10
+                io_color = "#1565C0" if io.direction == "MM2S" else "#C62828"
+                ax.text(tcx, y_pos, f"ch{io.channel_id}:{io.direction}",
+                        ha="center", va="center", fontsize=5, color=io_color,
+                        fontfamily="monospace", zorder=7)
+                line_i += 1
+
+            for bd in info.bds[:3]:
+                y_pos = y_start - line_i * cell_h * 0.10
+                pkt = f"pkt{bd.packet_id}" if bd.enable_packet else ""
+                txt = f"BD{bd.bd_id} {pkt} len={bd.length}"
+                ax.text(tcx, y_pos, txt,
+                        ha="center", va="center", fontsize=4.5,
+                        fontfamily="monospace", color="#333",
+                        bbox=dict(boxstyle="round,pad=0.06", fc="white",
+                                  ec="#BDBDBD", alpha=0.85, lw=0.4),
+                        zorder=7)
+                line_i += 1
+            if len(info.bds) > 3:
+                y_pos = y_start - line_i * cell_h * 0.10
+                ax.text(tcx, y_pos, f"+{len(info.bds)-3} more",
+                        ha="center", va="center", fontsize=3.5, color="#888", zorder=7)
+
+    legend_handles = []
+    if blocks:
+        for bi, block in enumerate(blocks):
+            c = BLOCK_COLORS[bi % len(BLOCK_COLORS)]
+            legend_handles.append(mpatches.Patch(color=c, label=block.name))
+        legend_handles.append(plt.Line2D([0], [0], color="gray", lw=1.5,
+                                         label="Circuit (solid)"))
+        legend_handles.append(plt.Line2D([0], [0], color="gray", lw=1.5,
+                                         linestyle="dashed", label="Packet (dashed)"))
+    if has_dma:
+        legend_handles.append(mpatches.Patch(color="#BBDEFB", label="S2MM (blue)"))
+        legend_handles.append(mpatches.Patch(color="#FFE0B2", label="MM2S (orange)"))
+
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="lower center",
+                  ncol=min(len(legend_handles), 6), fontsize=6.5, frameon=True,
+                  bbox_to_anchor=(0.5, -0.08))
+
+    title_parts = []
+    if blocks:
+        title_parts.append("Routing")
+    if has_dma:
+        title_parts.append("DMA BD")
+    ax.set_title(" + ".join(title_parts) + " — AIE Topology",
+                 fontsize=12, fontweight="bold", pad=15)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180, bbox_inches="tight",
+                facecolor="white", edgecolor="none")
+    plt.close()
+    print(f"PNG saved to {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+
+def serve_html(html_path: str, port: int) -> None:
+    abs_path = Path(html_path).resolve()
+    directory = str(abs_path.parent)
+    filename = abs_path.name
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=directory, **kw)
+        def log_message(self, fmt, *args):
+            pass
+
+    hostname = socket.gethostname()
+    local_url = f"http://localhost:{port}/{filename}"
+    remote_url = f"http://{hostname}:{port}/{filename}"
+    print(f"Serving AIE visualization:")
+    print(f"  Local:  {local_url}")
+    print(f"  Remote: {remote_url}")
+    print(f"  (Ctrl+C to stop)")
+
+    server = http.server.HTTPServer(("0.0.0.0", port), Handler)
+    try:
+        webbrowser.open(local_url)
+    except Exception:
+        pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _find_default_worklocal() -> Path:
+    """Locate the worklocal directory relative to this script or the repo root."""
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parent.parent
+    worklocal = repo_root / "src" / "mlir" / "mlirfront" / "tilinglinalg" / "pass" / "unitest" / "worklocal"
+    return worklocal
+
+
+def main():
+    worklocal = _find_default_worklocal()
+    default_routing = str(worklocal / "routing.cc") if (worklocal / "routing.cc").exists() else None
+    default_host = str(worklocal / "host.cc") if (worklocal / "host.cc").exists() else None
+
+    parser = argparse.ArgumentParser(
+        description="Unified AIE visualizer: routing topology + DMA BD configuration")
+    parser.add_argument("--routing", default=default_routing,
+                        help=f"Path to routing.cc (default: {default_routing})")
+    parser.add_argument("--host", default=default_host,
+                        help=f"Path to host.cc (default: {default_host})")
+    parser.add_argument("-m", "--mode", choices=["text", "png", "html"],
+                        default=None, help="Output mode (default: html)")
+    parser.add_argument("-o", "--output", default=None, help="Output file path")
+    parser.add_argument("--serve", action="store_true", default=True,
+                        help="Start HTTP server after generating HTML (default: enabled)")
+    parser.add_argument("--no-serve", dest="serve", action="store_false",
+                        help="Disable HTTP server")
+    parser.add_argument("--port", type=int, default=8088,
+                        help="HTTP server port (default: 8088)")
+    args = parser.parse_args()
+
+    if not args.routing and not args.host:
+        parser.error("At least one of --routing or --host is required.\n"
+                     f"  Looked for defaults in: {worklocal}")
+
+    blocks = None
+    routing_tiles = None
+    paths = None
+    routing_summary = None
+    dma_tiles = None
+
+    if args.routing:
+        blocks = parse_routing_file(args.routing)
+        if not blocks:
+            print("No routing blocks found.", file=sys.stderr)
+        else:
+            routing_tiles = collect_routing_tiles(blocks)
+            paths = trace_paths(blocks)
+            routing_summary = _build_routing_tile_summary(blocks)
+
+    if args.host:
+        dma_tiles = parse_host_cc(args.host)
+        if not dma_tiles:
+            print("No DMA BD configurations found.", file=sys.stderr)
+
+    if not blocks and not dma_tiles:
+        print("Nothing to visualize.", file=sys.stderr)
+        sys.exit(1)
+
+    mode = args.mode or "html"
+
+    if mode == "text":
+        out = sys.stdout
+        if args.output:
+            out = open(args.output, "w")
+        render_text(blocks, paths, dma_tiles, routing_summary, out)
+        if args.output:
+            out.close()
+            print(f"Text report saved to {args.output}")
+
+    elif mode == "png":
+        out_path = args.output or "aie_topology.png"
+        render_png(blocks, dma_tiles, routing_tiles, routing_summary, out_path)
+
+    elif mode == "html":
+        out_path = args.output or "aie_topology.html"
+        render_html(blocks, dma_tiles, routing_tiles, routing_summary, out_path)
+        if args.serve:
+            serve_html(out_path, args.port)
+
+
+if __name__ == "__main__":
+    main()

@@ -17,6 +17,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # set(CMAKE_BUILD_TYPE Debug)
 set(CMAKE_BUILD_TYPE Release)
+
+# ---- Size reduction flags ----
+# -ffunction-sections/-fdata-sections: put each function/data in its own ELF section
+# -Wl,--gc-sections: linker discards unreferenced sections (removes unused LLVM code)
+# -Wl,--icf=all: Identical Code Folding via gold linker (merges duplicate functions)
+# -fvisibility=hidden/-fvisibility-inlines-hidden: hide symbols to enable more ICF
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections -fdata-sections -fvisibility=hidden -fvisibility-inlines-hidden")
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -ffunction-sections -fdata-sections -fvisibility=hidden")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections -Wl,--icf=all -fuse-ld=gold")
+
 message(STATUS "aFound LLVM ${LLVM_INSTALL_DIR}/bin/")
 #set the llvm path find path into the path you installed
 if(NOT DEFINED LLVM_INSTALL_DIR OR "${LLVM_INSTALL_DIR}" STREQUAL "")
@@ -73,6 +83,7 @@ message(STATUS "CLANG_INCLUDE_DIRS is: ${CLANG_INCLUDE_DIRS}")
 include_directories(${Clang_INCLUDE_DIRS})
 include_directories(${CLANG_INCLUDE_DIRS})
 include_directories("./src/mlir/mlirfront/")
+include_directories("./src/mlir/mlirfront/tilinglinalg/pass/")
 
 
 #fiind antlr include
@@ -156,6 +167,17 @@ target_link_libraries(aiehlc PRIVATE
 			#MLIRIndexToLLVM
 			#MLIRGPUToROCDLTransforms
 			#LLVM
+    #the tiling logic need these
+    MLIRFuncDialect
+    MLIRFuncTransforms
+    MLIRLinalgDialect
+    MLIRLinalgTransforms
+    MLIRMemRefDialect
+    MLIRTransformDialect
+    MLIRTransformUtils
+    MLIRLinalgTransformOps
+    MLIRTransformDialectTransforms
+    #tiling logic end
     LLVMPasses
     #LLVMNVPTXCodeGen
     #LLVMNVPTXAsmPrinter

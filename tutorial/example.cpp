@@ -21,7 +21,7 @@
 #endif
 
 #define CORE_IP_MEM 0x1000
-#define CORE_OP_MEM 0x5000
+#define CORE_OP_MEM 0x2000
 
 __global__
 void loop_kernel(int *in, int *out) {    
@@ -58,7 +58,6 @@ int test_kernel(XAie_DevInst *DevInst) {
     }
 
     XAie_MemSyncForDev(in);
-    XAie_MemSyncForCPU(out);
     printf("Finished. Continuing...\n");
 
     printf("\nMoving input data to AIE...\n");
@@ -79,6 +78,7 @@ int test_kernel(XAie_DevInst *DevInst) {
     XAie_MoveDataAie2External(routingInstance, /*src=*/ XAie_TileLoc(4,4),
                               CORE_OP_MEM, len*sizeof(u32),
                               out, /*dest=*/ XAie_TileLoc(OUT_COL,0));
+    XAie_MemSyncForCPU(out);
     printf("Finished. Continuing...\n");
 
     printf("\nVerifying output data...\n");

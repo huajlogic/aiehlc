@@ -17,10 +17,13 @@ namespace mlir {
 class BlueprintToScheduleKernelPass : public PassWrapper<BlueprintToScheduleKernelPass, OperationPass<>> {
   public:
     BlueprintToScheduleKernelPass() = default;
+    BlueprintToScheduleKernelPass(double ratio) : bufferRatio_(ratio) {}
     // MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BlueprintToScheduleKernelPass)
 
     StringRef getArgument() const final { return "lower-blueprint-to-schedule"; }
     StringRef getDescription() const final { return "Lower dfscheblueprint dialect to dfschedule dialect"; }
+
+    double getBufferRatio() const { return bufferRatio_; }
 
     void runOnOperation() override;
 
@@ -28,6 +31,9 @@ class BlueprintToScheduleKernelPass : public PassWrapper<BlueprintToScheduleKern
         registry.insert<dfscheblueprint::dfscheblueprintdialect, dfschedule::dfscheduledialect, func::FuncDialect,
                         memref::MemRefDialect, arith::ArithDialect, scf::SCFDialect, tensor::TensorDialect>();
     }
+
+  private:
+    double bufferRatio_ = 0.5;
 };
 
 } // namespace mlir

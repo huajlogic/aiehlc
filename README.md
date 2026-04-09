@@ -80,6 +80,32 @@ source ./script/setup.sh --bsp-use-git-repo=https://path/to/aie-rt.git
 source script/aiehlc.sh --platform linux --aie-version 2 --runtime-source-file tutorial/example.cpp
 ```
 
+## Runtime Debug Level
+
+Control runtime diagnostic verbosity from your source file using `#pragma aie_debug_level`:
+
+```cpp
+#pragma aie_debug_level 2
+
+__global__ void mykernel(const int32_t *A, int32_t *B) {
+    // kernel code
+}
+
+int main() {
+    // host code
+}
+```
+
+| Level | Behavior |
+|-------|----------|
+| `0` | Silent (default when pragma is absent) |
+| `1` | BD tracking and IO logs |
+| `2` | Full diagnostics: DMA address log, write pattern, readback |
+
+The pragma is detected during preprocessing and emits a strong symbol override of `g_runtime_debug_level` into the generated `host.cc`. The runtime in `aie_runtime.c` defines this variable as a weak symbol with default `0`, so the linker picks the user-specified value when present.
+
+This works for both single-tile (`aiehlc`) and multi-tile (`tilinglinalg`) compilation paths.
+
 ## Compiling aiehlc (Optional)
 
 Building aiehlc is only necessary if you intend to develop or compile aiehlc itself. If your aim is simply to use aiehlc, this step is not required.

@@ -67,10 +67,14 @@ include_directories(../)
 include_directories(../routingimplement/include/)
 include_directories(../passroutingtodmap/)
 include_directories(../passblueprinttoschedule/)
+include_directories(../passblueprinttoschedulekernel/)
 include_directories(../passdmaphoptodfscheblueprint/)
+include_directories(../passdmaphoptoroutinghw/)
+include_directories(../passdmaptodmaphop/)
 include_directories(../passschedulecanonicalize/)
 include_directories(../passdfscheduletoapi/)
 include_directories(../passdfscheduletokernelapi/)
+include_directories(../kernelconfig/)
 include_directories(../../dataflowmap/dmap/inc/)
 include_directories(../../dataflowmap/dmap/)
 include_directories(../../dataflowmap/dmaphop/inc/)
@@ -108,6 +112,7 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/hwresource.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/ResourceManager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingtopology.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tilinglinalg_pipeline.cpp
                 )
 
 add_executable(test ${SOURCE_FILES})

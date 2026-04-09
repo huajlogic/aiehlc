@@ -1018,14 +1018,16 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
         dmap::dataaccesspatternAttr core_group_pattern;
         std::string port_symbol_name;
 
+        // Use dmapioIdx to make port names unique when multiple movedatabyio ops exist
+        int portIdx = dmapioIdx - 1; // dmapioIdx was already incremented above
         if (processing_type == 0) { // Broadcast
             io_pattern = sendpattern;
             core_group_pattern = receivepattern;
-            port_symbol_name = "receive_port";
+            port_symbol_name = "receive_port_" + std::to_string(portIdx);
         } else { // Gather (processing_type == 2)
             io_pattern = receivepattern;
             core_group_pattern = sendpattern;
-            port_symbol_name = "send_port";
+            port_symbol_name = "send_port_" + std::to_string(portIdx);
         }
        
         mlir::Type pgeout = dmap::dmacoreenginegroupType::get(ctx);

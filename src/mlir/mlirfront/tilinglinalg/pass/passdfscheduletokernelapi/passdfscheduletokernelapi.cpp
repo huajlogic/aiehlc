@@ -108,10 +108,49 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     "inline output_window_int8 get_output_async_window_int8(window_internal* win) { return win->ptr;
                 }");
                 */
+                // AIEML Gen-2 lock protocol (acquire_greater_equal / release with value).
+                // Reference: cardano/src/windowfunctions/window.h lines 1232-1286.
+                // Input window: DMA S2MM writes data then releases lockids[1].
+                //   Kernel acquire: acquire_greater_equal(lockids[1], 1)  -- wait for "data ready"
+                //   Kernel release: release(lockids[0], 1)               -- signal "buffer free"
+                // Output window: Kernel writes data then releases lockids[1].
+                //   Kernel acquire: acquire_greater_equal(lockids[0], 1)  -- wait for "buffer free"
+                //   Kernel release: release(lockids[1], 1)               -- signal "data ready"
+                std::string cType = elementType + "_t"; // e.g. "int32_t", "int8_t"
+                std::string winInType = "input_window_" + elementType;   // e.g. "input_window_int32"
+                std::string winOutType = "output_window_" + elementType; // e.g. "output_window_int32"
                 rewriter.create<emitc::VerbatimOp>(
-                    loc, "inline int8_t* acquire_output_window(output_window_int8* win) { return (int8_t*)win; }");
+                    loc, "inline " + cType + "* acquire_output_window(" + winOutType + "* win) {\n"
+                         "  window_internal* w = (window_internal*)win;\n"
+                         "  w->buffer = (window_datatype*)select(w->current_bufid, w->buffers[1], w->buffers[0]);\n"
+                         "  w->head = w->ptr = (window_datatype*)select(w->current_bufid, w->heads[1], w->heads[0]);\n"
+                         "  acquire_greater_equal(w->lockids[0], 1);\n"
+                         "  return (" + cType + "*)w->ptr;\n"
+                         "}");
                 rewriter.create<emitc::VerbatimOp>(
-                    loc, "inline void release_output_window(output_window_int8* win) { chess_memory_fence(); }");
+                    loc, "inline void release_output_window(" + winOutType + "* win) {\n"
+                         "  chess_memory_fence();\n"
+                         "  window_internal* w = (window_internal*)win;\n"
+                         "  release(w->lockids[1], 1);\n"
+                         "  w->heads[w->current_bufid] = w->head;\n"
+                         "  w->current_bufid = select((w->heads[1] == 0), w->current_bufid, 1 - w->current_bufid);\n"
+                         "}");
+                rewriter.create<emitc::VerbatimOp>(
+                    loc, "inline " + cType + "* acquire_input_window(" + winInType + "* win) {\n"
+                         "  window_internal* w = (window_internal*)win;\n"
+                         "  w->buffer = (window_datatype*)select(w->current_bufid, w->buffers[1], w->buffers[0]);\n"
+                         "  w->head = w->ptr = (window_datatype*)select(w->current_bufid, w->heads[1], w->heads[0]);\n"
+                         "  acquire_greater_equal(w->lockids[1], 1);\n"
+                         "  return (" + cType + "*)w->ptr;\n"
+                         "}");
+                rewriter.create<emitc::VerbatimOp>(
+                    loc, "inline void release_input_window(" + winInType + "* win) {\n"
+                         "  chess_memory_fence();\n"
+                         "  window_internal* w = (window_internal*)win;\n"
+                         "  release(w->lockids[0], 1);\n"
+                         "  w->heads[w->current_bufid] = w->head;\n"
+                         "  w->current_bufid = select((w->heads[1] == 0), w->current_bufid, 1 - w->current_bufid);\n"
+                         "}");
 
                 continue;
             }
@@ -146,12 +185,16 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 continue;
             }
             if (auto declOp = dyn_cast<KernelDeclOp>(&inner)) {
+                // Emit kernel_log.h include for klog() debug logging.
+                // klog writes (tag, value) pairs to fixed DM address 0x7F800.
+                // Host reads via __Runtime_read_kernel_log() at DM offset 0xF800.
+                rewriter.create<emitc::VerbatimOp>(loc, "#include \"kernel_log.h\"");
                 rewriter.create<emitc::VerbatimOp>(loc, "#include \"" + kernelFileName + "\"");
                 rewriter.create<emitc::VerbatimOp>(loc, "// kernel_decl " + declOp.getSymName().str());
                 continue;
             }
             if (auto mainOp = dyn_cast<KernelMainOp>(&inner)) {
-                convertMainToEmitC(rewriter, mainOp, op, windowInfoMap); // insert main func before module op
+                convertMainToEmitC(rewriter, mainOp, op, windowInfoMap, elementType);
                 continue;
             }
         }
@@ -161,7 +204,8 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
     }
 
     void convertMainToEmitC(ConversionPatternRewriter &rewriter, KernelMainOp mainOp, KernelModuleOp kernelModuleOp,
-                            const llvm::StringMap<WindowInfo> &windowInfoMap) const {
+                            const llvm::StringMap<WindowInfo> &windowInfoMap,
+                            const std::string &elementType) const {
         Location loc = mainOp.getLoc();
         Block &mainBody = mainOp.getBody().front();
 
@@ -176,8 +220,8 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         rewriter.setInsertionPointToStart(entry);
 
         rewriter.create<emitc::VerbatimOp>(loc, "volatile static int sync_buffer[8] = {0, -1};");
-        // rewriter.create<emitc::VerbatimOp>(loc, "log(1);  // Log: entering main");
         rewriter.create<emitc::VerbatimOp>(loc, "sync_buffer[0] = 0;");
+        rewriter.create<emitc::VerbatimOp>(loc, "klog_init();");
 
         for (Operation &inner : mainBody) {
             if (isa<AllocSyncBufferOp>(&inner)) {
@@ -222,8 +266,11 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     std::string cArg = (it != valueToCName.end()) ? it->second : "/*unknown*/";
                     if (!argList.empty())
                         argList += ", ";
-                    // Kernel expects output_window_int8; pass get_output_async_window_int8(window_xxx)
-                    argList += "get_output_async_window_int8(" + cArg + ")";
+                    if (isa<InputWindowType>(arg.getType())) {
+                        argList += "get_input_async_window_" + elementType + "(" + cArg + ")";
+                    } else {
+                        argList += "get_output_async_window_" + elementType + "(" + cArg + ")";
+                    }
                 }
                 rewriter.create<emitc::VerbatimOp>(loc, "// kernel_invoke " + callee);
                 rewriter.create<emitc::VerbatimOp>(loc, callee + "(" + argList + ");");

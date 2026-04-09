@@ -67,9 +67,13 @@ void dmaphop::port::print(OpAsmPrinter &printer) {
     if (auto channel = getDirectionChannel()) {
         printer << ", direction_channel = " << *channel;
     }
+    if (auto pktid = getDmapktid()) {
+        printer << ", dmapktid = " << *pktid << " : i32";
+    }
     printer << " }";
     printer << " : " << getTile().getType();
-    printer.printOptionalAttrDict(getOperation()->getAttrs(), {"sym_name", "direction", "direction_channel"});
+    printer.printOptionalAttrDict(getOperation()->getAttrs(),
+                                  {"sym_name", "direction", "direction_channel", "dmapktid"});
     printer << " -> " << getType();
 }
 
@@ -91,10 +95,31 @@ ParseResult dmaphop::port::parse(OpAsmParser &parser, OperationState &result) {
     StringAttr directionAttr;
     if (parser.parseAttribute(directionAttr, "direction", result.attributes)) return failure();
 
-    if (succeeded(parser.parseOptionalComma())) {
-        if (parser.parseKeyword("channel") || parser.parseEqual()) return failure();
-        IntegerAttr channelAttr;
-        if (parser.parseAttribute(channelAttr, "direction_channel", result.attributes)) return failure();
+    // Parse optional direction_channel and/or dmapktid
+    while (succeeded(parser.parseOptionalComma())) {
+        if (succeeded(parser.parseOptionalKeyword("direction_channel"))) {
+            if (parser.parseEqual())
+                return failure();
+            IntegerAttr channelAttr;
+            if (parser.parseAttribute(channelAttr, "direction_channel", result.attributes))
+                return failure();
+        } else if (succeeded(parser.parseOptionalKeyword("dmapktid"))) {
+            if (parser.parseEqual())
+                return failure();
+            IntegerAttr pktidAttr;
+            if (parser.parseAttribute(pktidAttr, "dmapktid", result.attributes))
+                return failure();
+            // Ensure dmapktid is i32 (TableGen constraint: I32Attr).
+            // MLIR defaults bare integers to i64, so convert if needed.
+            if (pktidAttr.getType().isSignlessInteger(64)) {
+                auto i32Attr = IntegerAttr::get(
+                    IntegerType::get(parser.getContext(), 32),
+                    pktidAttr.getInt());
+                result.attributes.set("dmapktid", i32Attr);
+            }
+        } else {
+            break; // unknown keyword, stop
+        }
     }
 
     if (parser.parseRBrace()) return failure();
@@ -225,45 +250,35 @@ void dmaphopmanager::createdmaphopfuncByDim(OpBuilder& builder, MLIRContext* ctx
     auto directionReceive =  "In";
     
     // SHIM ports (need both In and Out for proper producer/consumer tracking)
-    auto portShimIn = builder.create<dmaphop::port>(location,
-        shimTile.getResult(),
-        directionReceive,
-        "portShimIn",
-        builder.getI64IntegerAttr(0)  // channel
+    auto portShimIn = builder.create<dmaphop::port>(location, shimTile.getResult(), directionReceive, "portShimIn",
+                                                    builder.getI64IntegerAttr(0), // channel
+                                                    nullptr                       // dmapktid
     );
     symTable.insert(portShimIn);
-    
-    auto portShimOut = builder.create<dmaphop::port>(location,
-        shimTile.getResult(),
-        directionSend,
-        "portShimOut",
-        builder.getI64IntegerAttr(0)  // channel
+
+    auto portShimOut = builder.create<dmaphop::port>(location, shimTile.getResult(), directionSend, "portShimOut",
+                                                     builder.getI64IntegerAttr(0), // channel
+                                                     nullptr                       // dmapktid
     );
     symTable.insert(portShimOut);
-    
+
     // Tile A ports
-    auto portAIn = builder.create<dmaphop::port>(location,
-        tileA.getResult(),
-        directionReceive,
-        "portAIn",
-        builder.getI64IntegerAttr(0)
+    auto portAIn = builder.create<dmaphop::port>(location, tileA.getResult(), directionReceive, "portAIn",
+                                                 builder.getI64IntegerAttr(0),
+                                                 nullptr // dmapktid
     );
     symTable.insert(portAIn);
-    
-    auto portAOut = builder.create<dmaphop::port>(location,
-        tileA.getResult(),
-        directionSend,
-        "portAOut",
-        builder.getI64IntegerAttr(0)
+
+    auto portAOut = builder.create<dmaphop::port>(location, tileA.getResult(), directionSend, "portAOut",
+                                                  builder.getI64IntegerAttr(0),
+                                                  nullptr // dmapktid
     );
     symTable.insert(portAOut);
-    
+
     // Tile B input port
-    auto portBIn = builder.create<dmaphop::port>(location,
-        tileB.getResult(),
-        directionReceive,
-        "portBIn",
-        builder.getI64IntegerAttr(0)
+    auto portBIn = builder.create<dmaphop::port>(location, tileB.getResult(), directionReceive, "portBIn",
+                                                 builder.getI64IntegerAttr(0),
+                                                 nullptr // dmapktid
     );
     symTable.insert(portBIn);
     

@@ -17,13 +17,19 @@ namespace mlir {
 class BlueprintToSchedulePass : public PassWrapper<BlueprintToSchedulePass, OperationPass<>> {
 public:
     BlueprintToSchedulePass() = default;
+    BlueprintToSchedulePass(double ratio) : bufferRatio_(ratio) {}
     //MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BlueprintToSchedulePass)
 
     StringRef getArgument() const final { return "lower-blueprint-to-schedule"; }
     StringRef getDescription() const final { return "Lower dfscheblueprint dialect to dfschedule dialect"; }
-    
+
+    double getBufferRatio() const { return bufferRatio_; }
+
     void runOnOperation() override;
-    
+
+  private:
+    double bufferRatio_ = 0.5;
+
     void getDependentDialects(DialectRegistry &registry) const override {
         registry.insert<dfscheblueprint::dfscheblueprintdialect,
                         dfschedule::dfscheduledialect, 

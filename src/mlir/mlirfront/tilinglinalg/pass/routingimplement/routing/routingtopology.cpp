@@ -50,6 +50,12 @@ RoutingTopology::createDataIO(std::string dioName)
     return _createDataIO(dioName,shim);
 }
 
+std::shared_ptr<DataIO> RoutingTopology::createDataIOAtPoint(std::string dioName, Point shimPoint,
+                                                             DMADIRECTION direction, int channel) {
+    auto shimOpt = std::make_optional<Point>(shimPoint);
+    return _createDataIO(dioName, shimOpt, direction, channel);
+}
+
 std::vector<Point> RoutingTopology::ReserveTiles(int nums,int dioID) {
     std::vector<Point> allocatedTiles;
     auto result = rm_->reserveTiles(dioID, 8, ReservationStrategy::COLUMN_FIRST, allocatedTiles);

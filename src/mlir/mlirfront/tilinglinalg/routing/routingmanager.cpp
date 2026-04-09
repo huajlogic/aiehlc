@@ -112,36 +112,50 @@ void routing::RoutingCreate::print(OpAsmPrinter &p) {
   p.printType(getResult().getType());
   
   // Use printRegion to print the region.
-  p.printRegion(getBody(), /*printEntryBlockArgs=*/true, 
-                              /*printBlockTerminators=*/false);
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/true,
+                              /*printBlockTerminators=*/true);
 }
 
 // In RoutingOps.cpp
 
 // This is the C++ implementation for the parser.
+// Format (matches printer): <Memo = "str"> ( scf_idx = %val : type) -> type { region }
 ParseResult RoutingCreate::parse(OpAsmParser &parser, OperationState &result) {
-  // --- 1. Parse the components of the op ---
-
-  // `result` is the blueprint we will populate.
-  
-  // Parse the keyword "on_row"
-  if (parser.parseKeyword("on_row"))
-    return failure();
-  
-  // Parse the device_row attribute, which is inside <>
-  IntegerAttr deviceRowAttr;
-  if (parser.parseLess() ||
-      parser.parseAttribute(deviceRowAttr, "device_row", result.attributes) ||
-      parser.parseGreater())
+  // --- 1. Parse <Memo = "string"> ---
+  if (parser.parseLess())
     return failure();
 
-  // Parse the input operand and its type
+  // Parse key-value pairs inside angle brackets
+  while (true) {
+    // Check for closing >
+    if (succeeded(parser.parseOptionalGreater()))
+      break;
+
+    StringRef attrName;
+    if (parser.parseKeyword(&attrName) || parser.parseEqual())
+      return failure();
+
+    if (attrName == "Memo") {
+      StringAttr memoAttr;
+      if (parser.parseAttribute(memoAttr, "Memo", result.attributes))
+        return failure();
+    } else {
+      // Unknown attribute inside <>, try to parse as generic attribute
+      Attribute genericAttr;
+      if (parser.parseAttribute(genericAttr, attrName, result.attributes))
+        return failure();
+    }
+    parser.parseOptionalComma();
+  }
+
+  // --- 2. Parse ( scf_idx = %operand : type ) ---
   OpAsmParser::UnresolvedOperand inputOperand;
   Type inputType;
-  if (parser.parseLParen() || 
-      parser.parseOperand(inputOperand) || 
+  if (parser.parseLParen() ||
+      parser.parseKeyword("scf_idx") || parser.parseEqual() ||
+      parser.parseOperand(inputOperand) ||
       parser.parseColon() ||
-      parser.parseType(inputType) || 
+      parser.parseType(inputType) ||
       parser.parseRParen())
     return failure();
 
@@ -149,31 +163,22 @@ ParseResult RoutingCreate::parse(OpAsmParser &parser, OperationState &result) {
   if (parser.parseOptionalAttrDict(result.attributes))
     return failure();
 
-  // Parse the arrow and result type
+  // --- 3. Parse -> result_type ---
   Type resultType;
   if (parser.parseArrow() || parser.parseType(resultType))
     return failure();
-  
-  // Parse the region
-  Region *body = result.addRegion();
-  // 1. Create a list to hold the region's expected arguments.
-  llvm::SmallVector<OpAsmParser::Argument> regionArgs;
 
-    // 2. Create an Argument struct for our input. We can leave the SSA name
-    //    and location fields empty as the parser will fill them.
-  OpAsmParser::Argument arg; 
+  // --- 4. Parse the region ---
+  Region *body = result.addRegion();
+  llvm::SmallVector<OpAsmParser::Argument> regionArgs;
+  OpAsmParser::Argument arg;
   arg.type = inputType;
   regionArgs.push_back(arg);
-  // 3. Pass the list of arguments to parseRegion.
   if (parser.parseRegion(*body, regionArgs))
     return failure();
 
-  // --- 2. Populate the OperationState (the result) ---
-
-  // Add the result type to the blueprint
+  // --- 5. Populate the OperationState ---
   result.addTypes(resultType);
-  
-  // Resolve the parsed operand and add it to the blueprint
   if (parser.resolveOperand(inputOperand, inputType, result.operands))
     return failure();
 
@@ -199,31 +204,35 @@ void routing::partitiontensor::print(OpAsmPrinter &printer) {
 ParseResult routing::partitiontensor::parse(OpAsmParser &parser, OperationState &result) {
     OpAsmParser::UnresolvedOperand tensorOperand;
     Type tensorType;
-    
+
     if (parser.parseKeyword("tensor") || parser.parseEqual())
         return failure();
-        
+
     if (parser.parseOperand(tensorOperand) || parser.parseColonType(tensorType))
         return failure();
-        
-    if (parser.parseLBrace()) return failure();
-    
+
+    // Parse the attributes as a dictionary-style block: { key = val, ... }
+    if (parser.parseLBrace())
+        return failure();
+
     while (true) {
-        OptionalParseResult res = parser.parseOptionalRBrace();
-        if (res.has_value()) {
-            if (failed(res.value())) return failure();
+        if (succeeded(parser.parseOptionalRBrace()))
             break;
-        }
-        
+
         StringRef attrName;
-        if (parser.parseKeyword(&attrName) || parser.parseEqual()) return failure();
-        
+        if (parser.parseKeyword(&attrName) || parser.parseEqual())
+            return failure();
+
         if (attrName == "splitnum") {
-            IntegerAttr attr;
-            if (parser.parseAttribute(attr, "splitnum", result.attributes)) return failure();
+            int64_t val;
+            if (parser.parseInteger(val)) return failure();
+            result.addAttribute("splitnum",
+                parser.getBuilder().getI32IntegerAttr(val));
         } else if (attrName == "splitdim") {
-            IntegerAttr attr;
-            if (parser.parseAttribute(attr, "splitdim", result.attributes)) return failure();
+            int64_t val;
+            if (parser.parseInteger(val)) return failure();
+            result.addAttribute("splitdim",
+                parser.getBuilder().getI32IntegerAttr(val));
         } else if (attrName == "hw_axis_owner") {
             StringAttr attr;
             if (parser.parseAttribute(attr, "hw_axis_owner", result.attributes)) return failure();
@@ -236,24 +245,24 @@ ParseResult routing::partitiontensor::parse(OpAsmParser &parser, OperationState 
         } else {
              return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
         }
-        
+
         parser.parseOptionalComma();
     }
-        
+
     if (parser.parseOptionalAttrDict(result.attributes))
         return failure();
-        
+
     if (parser.parseArrow())
         return failure();
-        
+
     Type resultType;
     if (parser.parseType(resultType))
         return failure();
-        
+
     result.addTypes(resultType);
     if (parser.resolveOperand(tensorOperand, tensorType, result.operands))
         return failure();
-        
+
     return success();
 }
 
@@ -292,11 +301,9 @@ ModuleOp routingmanager::ops_test(MLIRContext* ctx, int totalN) {
 }
 
 ModuleOp routingmanager::ops_testNew(MLIRContext *ctx, int totalN, std::string routingname) {
-    const int hwrowused= 2, hwcolused=2;
+    const int hwrowused = 2, hwcolused = 2;
     OpBuilder builder(ctx);
     mlir::ModuleOp m = ModuleOp::create(builder.getUnknownLoc());
-    //auto func = createroutingfuncByDim(ctx, true);
-    //m.push_back(func);
     auto functype = builder.getFunctionType({},{});
 
     if (routingname.empty()) {
@@ -308,36 +315,136 @@ ModuleOp routingmanager::ops_testNew(MLIRContext *ctx, int totalN, std::string r
     auto block = main.addEntryBlock();
     builder.setInsertionPointToEnd(block);
     auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(),  hwrowused, hwcolused);
-    //schedule tensor with tensor type
-    SmallVector<int64_t> shapeVec = {16, 16};
-    SmallVector<Attribute> shape;
-    for (int64_t v : shapeVec)
-        shape.push_back(builder.getI64IntegerAttr(v));
-    ArrayAttr vals = builder.getArrayAttr(shape);  // satisfies I64ArrayAttr
-    IntegerAttr dimnum = builder.getI64IntegerAttr(2);
-    auto tensorType = RankedTensorType::get(shapeVec, builder.getI8Type());
-    
-    // Create arith.constant dense with init data starting from 1
-    // For tensor<16x16xi8>, create values [1, 2, 3, ..., 256] (wraps around for i8)
-    SmallVector<llvm::APInt> initValues;
-    int64_t totalElements = 1;
-    for (auto dim : shapeVec) {
-        totalElements *= dim;
-    }
-    for (int64_t i = 1; i <= totalElements; ++i) {
-        initValues.push_back(llvm::APInt(8, i));
-    }
-    auto denseAttr = DenseElementsAttr::get(tensorType, initValues);
-    auto initConstant = builder.create<arith::ConstantOp>(builder.getUnknownLoc(), tensorType, denseAttr);
-    
-    auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, initConstant.getResult(), vals, dimnum);
-    createroutingfuncByDim(builder, ctx, false, mesh, tensor, hwrowused, "row");
-    //createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwrowused, "row");
-    //createroutingfuncByDim(builder, ctx, true, mesh, tensor, hwcolused, "col");
+
+    // Helper to create a schedule tensor with dense init data
+    auto createTensor = [&](SmallVector<int64_t> shapeVec, int64_t startVal) -> Value {
+        SmallVector<Attribute> shape;
+        for (int64_t v : shapeVec)
+            shape.push_back(builder.getI64IntegerAttr(v));
+        ArrayAttr vals = builder.getArrayAttr(shape);
+        IntegerAttr dimnum = builder.getI64IntegerAttr(shapeVec.size());
+        auto tensorType = RankedTensorType::get(shapeVec, builder.getI8Type());
+
+        SmallVector<llvm::APInt> initValues;
+        int64_t totalElements = 1;
+        for (auto dim : shapeVec)
+            totalElements *= dim;
+        for (int64_t i = 0; i < totalElements; ++i)
+            initValues.push_back(llvm::APInt(8, startVal + i));
+
+        auto denseAttr = DenseElementsAttr::get(tensorType, initValues);
+        auto initConstant = builder.create<arith::ConstantOp>(builder.getUnknownLoc(), tensorType, denseAttr);
+        auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType,
+                                                           initConstant.getResult(), vals, dimnum);
+        return tensor;
+    };
+
+    // GEMM: C[16x16] = A[16x16] * B[16x16]
+    // A (input)  — start from 1
+    // B (input)  — start from 2 (must differ from A to prevent constant folding/merge)
+    // C (output) — zeroed out (result buffer)
+    Value tensorA = createTensor({16, 16}, 1);
+    Value tensorB = createTensor({16, 16}, 2);
+    Value tensorC = createTensor({16, 16}, 0);
+
+    createroutingfuncGEMM(builder, ctx, mesh, tensorA, tensorB, tensorC, hwrowused, "row");
+
     auto retop = builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(main);
     llvm::errs() << m;
     return m;
+}
+
+void routingmanager::createroutingfuncGEMM(OpBuilder &builder, MLIRContext *ctx, Value mesh, Value tensorA,
+                                           Value tensorB, Value tensorC, uint32_t hwsplitnum, std::string splitAxis) {
+    auto location = builder.getUnknownLoc();
+    auto exec = builder.create<scf::ExecuteRegionOp>(location, /*result types*/ TypeRange{});
+    exec->setAttr("routing_memo", builder.getStringAttr(splitAxis));
+    {
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(&exec.getRegion().emplaceBlock());
+
+        // One partitionmesh for the entire GEMM
+        auto partmesh = builder.create<partitionmesh>(location, mesh, hwsplitnum, splitAxis);
+
+        int splitdimn = splitAxis == "row" ? 0 : 1;
+
+        // Get tensor types
+        auto tensorTypeA = tensorA.getType().cast<RankedTensorType>();
+        auto tensorTypeB = tensorB.getType().cast<RankedTensorType>();
+        auto tensorTypeC = tensorC.getType().cast<RankedTensorType>();
+
+        // Partition tensor A (input): split by row, each tile group gets its rows
+        auto partTensorA = builder.create<partitiontensor>(location, tensorTypeA, tensorA, hwsplitnum, splitdimn,
+                                                           splitAxis, "col", "");
+
+        // Partition tensor B (input): replicated to all tile groups (broadcast)
+        // splitnum=1 means no split — full tensor goes to each group
+        // hw_axis_owner="" means not owned by any axis, replicate_on=splitAxis means broadcast along split axis
+        auto partTensorB =
+            builder.create<partitiontensor>(location, tensorTypeB, tensorB, 1, splitdimn, "", splitAxis, "");
+
+        // Partition tensor C (output): split by row, each tile group produces its rows
+        auto partTensorC = builder.create<partitiontensor>(location, tensorTypeC, tensorC, hwsplitnum, splitdimn,
+                                                           splitAxis, "col", "");
+
+        // Calculate split tensor shapes
+        SmallVector<int64_t> splitShapeA(tensorTypeA.getShape());
+        SmallVector<int64_t> splitShapeC(tensorTypeC.getShape());
+        if (splitdimn == 0) {
+            if (splitShapeA[0] != ShapedType::kDynamic)
+                splitShapeA[0] /= hwsplitnum;
+            if (splitShapeC[0] != ShapedType::kDynamic)
+                splitShapeC[0] /= hwsplitnum;
+        } else {
+            if (splitShapeA[1] != ShapedType::kDynamic)
+                splitShapeA[1] /= hwsplitnum;
+            if (splitShapeC[1] != ShapedType::kDynamic)
+                splitShapeC[1] /= hwsplitnum;
+        }
+        auto splitTensorTypeA = RankedTensorType::get(splitShapeA, tensorTypeA.getElementType());
+        // B is not split (splitnum=1), extract returns full tensor
+        auto splitTensorTypeB = tensorTypeB;
+        auto splitTensorTypeC = RankedTensorType::get(splitShapeC, tensorTypeC.getElementType());
+
+        Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
+        Value ub = builder.create<arith::ConstantIndexOp>(location, hwsplitnum);
+        Value step = builder.create<arith::ConstantIndexOp>(location, 1);
+
+        auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
+        {
+            OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(scf.getBody());
+            auto memo = builder.getStringAttr(splitAxis);
+            mlir::Value scf_idx = scf.getInductionVar();
+            Value idx = builder.create<arith::IndexCastOp>(location, builder.getI32Type(), scf_idx);
+
+            auto routingcreateOp = builder.create<routing::RoutingCreate>(
+                location, idx, memo, [&](OpBuilder &b, Location bodyLoc, Value sidx) {
+                    auto tilelist = b.create<extract_tiles>(location, partmesh, sidx);
+
+                    // --- Input A: split slice per tile group ---
+                    auto sliceA = b.create<extract_data>(location, splitTensorTypeA, partTensorA, sidx);
+                    auto hwioA = b.create<createhwiowithtarget>(location, tilelist, "input", "mem2");
+                    b.create<movedatabyio>(location, sliceA, hwioA);
+
+                    // --- Input B: broadcast full tensor to each tile group ---
+                    auto sliceB = b.create<extract_data>(location, splitTensorTypeB, partTensorB, sidx);
+                    auto hwioB = b.create<createhwiowithtarget>(location, tilelist, "input", "mem2");
+                    b.create<movedatabyio>(location, sliceB, hwioB);
+
+                    // --- Output C: gather from tile group ---
+                    auto sliceC = b.create<extract_data>(location, splitTensorTypeC, partTensorC, sidx);
+                    auto gatherC = b.create<routinggatherout>(location, sliceC.getType(), tilelist, sliceC);
+                    auto hwioC = b.create<createhwiowithtarget>(location, tilelist, "output", "mem2");
+                    b.create<movedatabyio>(location, gatherC, hwioC);
+
+                    b.create<routing::YieldOp>(location);
+                });
+        }
+
+        builder.create<scf::YieldOp>(location);
+    };
 }
 
 void routingmanager::loaddialect(MLIRContext* ctx) {

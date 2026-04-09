@@ -1,3 +1,7 @@
+/******************************************************************************
+* Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+* SPDX-License-Identifier: MIT
+******************************************************************************/
 //===- dfscheduleDialect.td ---------------------------------------*- tablegen -*-===//
 include "mlir/IR/OpBase.td"
 include "mlir/IR/AttrTypeBase.td"

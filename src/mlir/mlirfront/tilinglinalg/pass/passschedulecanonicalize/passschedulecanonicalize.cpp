@@ -4,1520 +4,545 @@
 ******************************************************************************/
 
 #include "passschedulecanonicalize.h"
+#include "dfschedulemanager.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
-#include "dfschedulemanager.h"
 #include <map>
-#include <set>
-#include <vector>
-#include <iostream>
+#include <string>
 
 using namespace mlir;
 using namespace dfschedule;
 
 namespace {
 
-// Key for tile identification: (col, row)
-using TileKey = std::pair<int64_t, int64_t>;
+//===----------------------------------------------------------------------===//
+// TileKey helpers
+//===----------------------------------------------------------------------===//
 
-// Structure to hold collected schedule information per tile
-struct TileScheduleInfo {
-    TileKey key;
-    SmallVector<Value> tileValues;           // All tile values for this (col, row)
-    SmallVector<Operation*> packetOps;       // Packet ops targeting this tile
-    SmallVector<SymbolRefAttr> packetSymbols; // Packet symbols for this tile (OLD)
-    SmallVector<DictionaryAttr> configDicts;  // Config dictionaries for this tile (NEW)
-    SmallVector<SymbolRefAttr> computeKernelArgs; // Compute args for this tile
-    bool isShimTile = false;
-    bool isCoreTile = false;
-};
+using TileKey = std::pair<int64_t, int64_t>; // (col, row)
 
-// Structure to hold shim tile DMA info
-struct ShimDmaInfo {
-    TileKey key;
-    Value tileValue;
-    SmallVector<Operation*> dmaBdOps;
-    SmallVector<Operation*> createIoOps;
-    SmallVector<Value> bdHandles;
-    SmallVector<Value> ioHandles;
-};
-
-// Structure to hold tensor slice parameters
-struct SliceParams {
-    size_t index;  // Unique index for this slice
-    RankedTensorType sourceType;
-    SmallVector<int64_t, 4> offsets;
-    SmallVector<int64_t, 4> sizes;
-    SmallVector<int64_t, 4> strides;
-    RankedTensorType resultType;
-    size_t partitionIndex;  // Index of the partitiontensor this slice ultimately comes from
-    int64_t parentSliceIndex;  // Index of parent slice if nested, -1 if directly from partition
-    bool isFromPartition;  // true if immediate source is partitiontensor, false if from another slice
-};
-
-// Structure to hold partition tensor parameters
-struct PartitionParams {
-    size_t index;  // Unique index to distinguish partitions with same params but different flows
-    RankedTensorType tensorType;
-    int64_t splitnum;
-    int64_t splitdim;
-    std::string hw_axis_owner;
-    std::string replicate_on;
-    std::string single_tile_owner;
-};
-
-// Structure to hold operation with parent information
-struct OpWithParent {
-    Operation* op;
-    Operation* parent;  // Parent operation (can be nullptr if top-level)
-    bool isInDSKernelReceiver;  // true if parent is dfschedule.dskernel_receiver
-    
-    OpWithParent(Operation* operation, Operation* parentOp = nullptr)
-        : op(operation), parent(parentOp) {
-        // Check if parent is dskernel_receiver
-        isInDSKernelReceiver = false;
-        if (parentOp && parentOp->getName().getStringRef() == "dfschedule.dskernel_receiver") {
-            isInDSKernelReceiver = true;
-        }
-    }
-};
-
-// Collected module-level schedule info
-struct ModuleScheduleInfo {
-    // Map from (col, row) to tile info
-    std::map<TileKey, TileScheduleInfo> coreTiles;
-    std::map<TileKey, ShimDmaInfo> shimTiles;
-    
-    // All collected operations with parent information
-    SmallVector<OpWithParent> declareTensorOps;
-    SmallVector<OpWithParent> declareTileOps;
-    SmallVector<OpWithParent> configDmaBdOps;
-    SmallVector<OpWithParent> configCreateIoOps;
-    SmallVector<OpWithParent> packetOps;
-    SmallVector<OpWithParent> loadKernelGroupOps;
-    SmallVector<OpWithParent> launchKernelGroupOps;
-    SmallVector<OpWithParent> getBdIdOps;
-    SmallVector<OpWithParent> startIoOps;
-    SmallVector<OpWithParent> scheduleWaitOps;
-    SmallVector<OpWithParent> dskernelReceiverOps;
-    
-    // Operations to move from func.func main (with parent information)
-    SmallVector<OpWithParent> tensorEmptyOps;
-    SmallVector<OpWithParent> extractSliceOps;
-    SmallVector<OpWithParent> partitionTensorOps;
-    SmallVector<OpWithParent> executeRegionOps;
-    SmallVector<OpWithParent> routingCreateOps;
-    SmallVector<OpWithParent> declareDataOps;        // dfscheblueprint.declare_data
-    SmallVector<OpWithParent> topLevelConstantOps;   // arith.constant at top level of main
-    
-    // Unique source tensor types (deduplicated)
-    SmallVector<RankedTensorType> sourceTensorTypes;
-    
-    // Map from tensor type string key to its init tensor Value
-    std::map<std::string, Value> initTensorMap;
-    
-    // Unique partition params (deduplicated)
-    SmallVector<PartitionParams> uniquePartitionParams;
-    
-    // Unique extract_slice params (deduplicated)
-    SmallVector<SliceParams> uniqueSliceParams;
-    
-    // Events to wait for
-    SmallVector<Value> allEvents;
-    
-    // Kernel info
-    StringRef kernelName = "dskernel_receiver";
-    RankedTensorType kernelTensorType;
-    int64_t bufferLen = 0;
-    uint32_t basePacketId = 0;
-    
-    // Track how many packet streams each tile needs
-    std::map<TileKey, int> tilePacketCount;
-};
-
-// Helper: Extract (col, row) from DeclareTileOp
 static TileKey getTileKey(dfschedule::DeclareTileOp op) {
     return {op.getCol(), op.getRow()};
 }
 
-// Helper: Check if a tile is a shim tile (row == 0)
-static bool isShimTile(TileKey key) {
-    return key.second == 0;
+//===----------------------------------------------------------------------===//
+// Phase 1 — Greedy rewrite patterns (run inside RoutingCreate blocks)
+//===----------------------------------------------------------------------===//
+
+/// Replace a dfschedule.declaretile with an earlier sibling that declares the
+/// same physical tile (same col + row attributes). Runs both within a single
+/// RoutingCreate block (intra-block dedup) and inside dfschedule.host after
+/// all RoutingCreate blocks are inlined (cross-iteration dedup).
+struct FoldDuplicateDeclareTilePattern : public OpRewritePattern<dfschedule::DeclareTileOp> {
+    using OpRewritePattern::OpRewritePattern;
+
+    LogicalResult matchAndRewrite(dfschedule::DeclareTileOp op, PatternRewriter &rewriter) const override {
+        int64_t col = op.getCol();
+        int64_t row = op.getRow();
+        for (Operation &prior : *op->getBlock()) {
+            if (&prior == op.getOperation())
+                break;
+            if (auto other = dyn_cast<dfschedule::DeclareTileOp>(&prior))
+                if (other.getCol() == col && other.getRow() == row) {
+                    rewriter.replaceOp(op, other.getTile());
+                    return success();
+                }
+        }
+        return failure();
+    }
+};
+
+/// Replace a shim dfschedule.config.dma_bd that is identical (same tile,
+/// data_id, DMA offset, bd_id, and len) to an earlier sibling with that
+/// earlier BD handle.  bd_id must be included in the key because two distinct
+/// DMA channels on the same shim tile configure different hardware BD
+/// registers and must never be merged, even when data_id and offset coincide.
+struct FoldDuplicateShimBdPattern : public OpRewritePattern<dfschedule::ConfigDmaBdOp> {
+    using OpRewritePattern::OpRewritePattern;
+
+    LogicalResult matchAndRewrite(dfschedule::ConfigDmaBdOp op, PatternRewriter &rewriter) const override {
+        auto tileDecl = op.getTile().getDefiningOp<dfschedule::DeclareTileOp>();
+        if (!tileDecl || tileDecl.getRow() != 0)
+            return failure();
+
+        int32_t dataId = static_cast<int32_t>(op.getDataId());
+        int64_t offset = static_cast<int64_t>(op.getOffset());
+        int32_t len = static_cast<int32_t>(op.getLen());
+
+        // bd_id is an SSA i32 value; extract the constant if available.
+        APInt bdIdVal;
+        bool hasBdId = matchPattern(op.getBdId(), m_ConstantInt(&bdIdVal));
+
+        for (Operation &prior : *op->getBlock()) {
+            if (&prior == op.getOperation())
+                break;
+            if (auto other = dyn_cast<dfschedule::ConfigDmaBdOp>(&prior)) {
+                auto otherTile = other.getTile().getDefiningOp<dfschedule::DeclareTileOp>();
+                if (!otherTile)
+                    continue;
+                // Require matching bd_id constants; if either bd_id is non-constant
+                // (dynamic), conservatively skip the fold.
+                APInt otherBdIdVal;
+                bool otherHasBdId = matchPattern(other.getBdId(), m_ConstantInt(&otherBdIdVal));
+                if (!hasBdId || !otherHasBdId || bdIdVal != otherBdIdVal)
+                    continue;
+                if (otherTile.getCol() == tileDecl.getCol() && otherTile.getRow() == tileDecl.getRow() &&
+                    static_cast<int32_t>(other.getDataId()) == dataId &&
+                    static_cast<int64_t>(other.getOffset()) == offset && static_cast<int32_t>(other.getLen()) == len) {
+                    rewriter.replaceOp(op, other.getBdHandle());
+                    return success();
+                }
+            }
+        }
+        return failure();
+    }
+};
+
+//===----------------------------------------------------------------------===//
+// Phase 2 — IRMapping-driven clone + inline into dfschedule.host
+//===----------------------------------------------------------------------===//
+
+/// If `allocVal` is a memref.alloc that is the dest of a memref.copy whose
+/// source traces through bufferization.to_memref → arith.constant, return
+/// that constant op. Returns nullptr if the chain is not found.
+static arith::ConstantOp findInitConstantForAlloc(Value allocVal) {
+    if (!allocVal.getDefiningOp<memref::AllocOp>())
+        return nullptr;
+    Block *parentBlock = allocVal.getDefiningOp()->getBlock();
+    if (!parentBlock)
+        return nullptr;
+    for (Operation &op : *parentBlock) {
+        auto copyOp = dyn_cast<memref::CopyOp>(&op);
+        if (!copyOp || copyOp.getTarget() != allocVal)
+            continue;
+        auto toMr = copyOp.getSource().getDefiningOp<bufferization::ToMemrefOp>();
+        if (!toMr)
+            continue;
+        if (auto constOp = toMr.getOperand().getDefiningOp<arith::ConstantOp>())
+            return constOp;
+    }
+    return nullptr;
 }
 
-// Helper: Get the parent operation (walks up the region hierarchy)
-static Operation* getParentOp(Operation *op) {
-    if (!op) return nullptr;
-    Region *region = op->getParentRegion();
-    if (!region) return nullptr;
-    return region->getParentOp();
-}
-
-// Collect all dfschedule operations from the module
-static void collectScheduleOps(ModuleOp moduleOp, ModuleScheduleInfo &info) {
-    moduleOp.walk([&](Operation *op) {
-        // Get parent operation
-        Operation *parentOp = getParentOp(op);
-        
-        if (auto declareTensor = dyn_cast<dfschedule::DeclareTensorOp>(op)) {
-            info.declareTensorOps.push_back(OpWithParent(op, parentOp));
-        } else if (auto declareTile = dyn_cast<dfschedule::DeclareTileOp>(op)) {
-            info.declareTileOps.push_back(OpWithParent(op, parentOp));
-            TileKey key = getTileKey(declareTile);
-            
-            if (isShimTile(key)) {
-                if (info.shimTiles.find(key) == info.shimTiles.end()) {
-                    info.shimTiles[key] = ShimDmaInfo{key, declareTile.getTile(), {}, {}, {}, {}};
-                }
-            } else {
-                if (info.coreTiles.find(key) == info.coreTiles.end()) {
-                    info.coreTiles[key] = TileScheduleInfo{key, {}, {}, {}, {}, {}, false, true};
-                }
-                info.coreTiles[key].tileValues.push_back(declareTile.getTile());
-            }
-        } else if (auto configDmaBd = dyn_cast<dfschedule::ConfigDmaBdOp>(op)) {
-            info.configDmaBdOps.push_back(OpWithParent(op, parentOp));
-        } else if (auto createIo = dyn_cast<dfschedule::ConfigCreateIoOp>(op)) {
-            info.configCreateIoOps.push_back(OpWithParent(op, parentOp));
-        } else if (auto packet = dyn_cast<dfschedule::PacketOp>(op)) {
-            info.packetOps.push_back(OpWithParent(op, parentOp));
-        } else if (auto loadKernel = dyn_cast<dfschedule::LoadKernelGroupOp>(op)) {
-            info.loadKernelGroupOps.push_back(OpWithParent(op, parentOp));
-        } else if (auto launchKernel = dyn_cast<dfschedule::LaunchKernelGroupOp>(op)) {
-            info.launchKernelGroupOps.push_back(OpWithParent(op, parentOp));
-            info.allEvents.push_back(launchKernel.getEvent());
-        } else if (auto getBdId = dyn_cast<dfschedule::GetBdIdOp>(op)) {
-            info.getBdIdOps.push_back(OpWithParent(op, parentOp));
-        } else if (auto startIo = dyn_cast<dfschedule::StartIoOp>(op)) {
-            info.startIoOps.push_back(OpWithParent(op, parentOp));
-            info.allEvents.push_back(startIo.getEvent());
-        } else if (auto wait = dyn_cast<dfschedule::ScheduleWaitOp>(op)) {
-            info.scheduleWaitOps.push_back(OpWithParent(op, parentOp));
-        } else if (auto receiver = dyn_cast<dfschedule::DSKernelReceiverOp>(op)) {
-            info.dskernelReceiverOps.push_back(OpWithParent(op, parentOp));
-        } else if (auto emptyOp = dyn_cast<tensor::EmptyOp>(op)) {
-            // Collect tensor.empty ops
-            info.tensorEmptyOps.push_back(OpWithParent(op, parentOp));
-            auto tensorType = cast<RankedTensorType>(emptyOp.getType());
-            // Track unique tensor types
-            bool found = false;
-            for (auto &existingType : info.sourceTensorTypes) {
-                if (existingType == tensorType) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                info.sourceTensorTypes.push_back(tensorType);
-            }
-        } else if (auto extractSlice = dyn_cast<tensor::ExtractSliceOp>(op)) {
-            // Collect tensor.extract_slice ops - NO deduplication!
-            // Each slice is unique even if it has same offsets/sizes
-            info.extractSliceOps.push_back(OpWithParent(op, parentOp));
-            
-            // Create slice params
-            SliceParams params;
-            params.index = info.uniqueSliceParams.size();  // Unique index
-            params.sourceType = cast<RankedTensorType>(extractSlice.getSource().getType());
-            for (auto o : extractSlice.getStaticOffsets()) params.offsets.push_back(o);
-            for (auto s : extractSlice.getStaticSizes()) params.sizes.push_back(s);
-            for (auto s : extractSlice.getStaticStrides()) params.strides.push_back(s);
-            params.resultType = cast<RankedTensorType>(extractSlice.getType());
-            params.partitionIndex = 0;
-            params.parentSliceIndex = -1;  // Default: no parent slice
-            params.isFromPartition = false;
-            
-            // Check immediate source
-            Value source = extractSlice.getSource();
-            if (Operation *defOp = source.getDefiningOp()) {
-                if (defOp->getName().getStringRef() == "routing.partitiontensor") {
-                    // Direct source is partitiontensor
-                    params.isFromPartition = true;
-                    for (size_t i = 0; i < info.partitionTensorOps.size(); ++i) {
-                        if (info.partitionTensorOps[i].op == defOp) {
-                            params.partitionIndex = i;
-                            break;
-                        }
-                    }
-                } else if (auto parentSlice = dyn_cast<tensor::ExtractSliceOp>(defOp)) {
-                    // Direct source is another slice - find its index
-                    params.isFromPartition = false;
-                    for (size_t i = 0; i < info.extractSliceOps.size(); ++i) {
-                        if (info.extractSliceOps[i].op == defOp) {
-                            params.parentSliceIndex = static_cast<int64_t>(i);
-                            break;
-                        }
-                    }
-                    
-                    // Walk up to find the ultimate partitiontensor
-                    Value walkSource = parentSlice.getSource();
-                    while (Operation *walkDefOp = walkSource.getDefiningOp()) {
-                        if (walkDefOp->getName().getStringRef() == "routing.partitiontensor") {
-                            for (size_t i = 0; i < info.partitionTensorOps.size(); ++i) {
-                                if (info.partitionTensorOps[i].op == walkDefOp) {
-                                    params.partitionIndex = i;
-                                    break;
-                                }
-                            }
-                            break;
-                        } else if (auto grandParentSlice = dyn_cast<tensor::ExtractSliceOp>(walkDefOp)) {
-                            walkSource = grandParentSlice.getSource();
-                        } else {
-                            break;
-                        }
+/// Deep-walk the entire RoutingCreate subtree and pre-populate `mapper` with
+/// host-local replacements for every value referenced inside `rcOp` but defined
+/// OUTSIDE it.  dfschedule.host has IsolatedFromAbove so external values must
+/// be substituted with host-local equivalents:
+/// - external memref → plain memref.alloc of same shape/element type (with init chain if present)
+/// - external arith.constant → cloned constant inside host
+static void preMapExternalValues(Operation *rcOp, OpBuilder &builder, Location loc, IRMapping &mapper,
+                                 SmallVector<Value> &hostAllocs, Block *hostBody = nullptr) {
+    rcOp->walk([&](Operation *innerOp) {
+        for (Value operand : innerOp->getOperands()) {
+            if (mapper.contains(operand))
+                continue;
+            Operation *defOp = operand.getDefiningOp();
+            // Handle func block arguments (e.g. external DDR pointer memrefs).
+            // These have no defining op. Add them as arguments to the host block
+            // and map them so the cloned ops use the host-local arg.
+            if (!defOp) {
+                if (auto memrefType = dyn_cast<MemRefType>(operand.getType())) {
+                    if (hostBody) {
+                        auto plainType = MemRefType::get(memrefType.getShape(), memrefType.getElementType());
+                        Value hostArg = hostBody->addArgument(plainType, loc);
+                        mapper.map(operand, hostArg);
                     }
                 }
+                continue;
             }
-            
-            // Always add - no deduplication for slices
-            info.uniqueSliceParams.push_back(params);
-        } else if (auto execRegion = dyn_cast<scf::ExecuteRegionOp>(op)) {
-            // Collect scf.execute_region ops
-            info.executeRegionOps.push_back(OpWithParent(op, parentOp));
-        }
-        
-        // Check by operation name for routing dialect ops
-        if (op->getName().getStringRef() == "routing.partitiontensor") {
-            info.partitionTensorOps.push_back(OpWithParent(op, parentOp));
-            
-            // Extract partition parameters - NO deduplication here!
-            // Each execute_region has its own partitiontensor representing different data flows
-            // (e.g., producer flow vs consumer flow may have same partition params but different purposes)
-            PartitionParams params;
-            params.index = info.uniquePartitionParams.size();  // Unique index for each partition
-            if (op->getNumResults() > 0) {
-                params.tensorType = cast<RankedTensorType>(op->getResult(0).getType());
-            }
-            if (auto attr = op->getAttrOfType<IntegerAttr>("splitnum")) {
-                params.splitnum = attr.getInt();
-            }
-            if (auto attr = op->getAttrOfType<IntegerAttr>("splitdim")) {
-                params.splitdim = attr.getInt();
-            }
-            if (auto attr = op->getAttrOfType<StringAttr>("hw_axis_owner")) {
-                params.hw_axis_owner = attr.getValue().str();
-            }
-            if (auto attr = op->getAttrOfType<StringAttr>("replicate_on")) {
-                params.replicate_on = attr.getValue().str();
-            }
-            if (auto attr = op->getAttrOfType<StringAttr>("single_tile_owner")) {
-                params.single_tile_owner = attr.getValue().str();
-            }
-            
-            // Always add - each partitiontensor represents a unique data flow
-            info.uniquePartitionParams.push_back(params);
-        } else if (op->getName().getStringRef().starts_with("routing.RoutingCreate")) {
-            info.routingCreateOps.push_back(OpWithParent(op, parentOp));
-        }
-        
-        // Collect dfscheblueprint.declare_data
-        if (op->getName().getStringRef() == "dfscheblueprint.declare_data") {
-            info.declareDataOps.push_back(OpWithParent(op, parentOp));
-            // Extract tensor type and init tensor for source tensor creation
-            if (op->getNumResults() > 0) {
-                if (auto tensorType = dyn_cast<RankedTensorType>(op->getResult(0).getType())) {
-                    // Create a key for this tensor type
-                    std::string typeKey;
-                    llvm::raw_string_ostream os(typeKey);
-                    os << tensorType;
-                    
-                    bool found = false;
-                    for (auto &existingType : info.sourceTensorTypes) {
-                        if (existingType == tensorType) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        info.sourceTensorTypes.push_back(tensorType);
-                    }
-                    
-                    // Capture the init tensor from the operand (new DeclareDataOp takes init_tensor as input)
-                    if (op->getNumOperands() > 0 && info.initTensorMap.find(typeKey) == info.initTensorMap.end()) {
-                        info.initTensorMap[typeKey] = op->getOperand(0);
-                    }
+            if (rcOp->isAncestor(defOp))
+                continue;
+            if (dyn_cast<MemRefType>(operand.getType())) {
+                auto memrefType = cast<MemRefType>(operand.getType());
+                auto plainType = MemRefType::get(memrefType.getShape(), memrefType.getElementType());
+                Value newAlloc;
+                if (auto constOp = findInitConstantForAlloc(operand)) {
+                    // Reproduce the init chain inside the host body:
+                    //   arith.constant → bufferization.to_memref → memref.alloc → memref.copy
+                    Value clonedConst = builder.clone(*constOp.getOperation())->getResult(0);
+                    auto tensorType = cast<RankedTensorType>(constOp.getType());
+                    auto roType = MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+                    Value roView = builder.create<bufferization::ToMemrefOp>(loc, roType, clonedConst).getResult();
+                    newAlloc = builder.create<memref::AllocOp>(loc, plainType).getResult();
+                    builder.create<memref::CopyOp>(loc, roView, newAlloc);
+                } else {
+                    newAlloc = builder.create<memref::AllocOp>(loc, plainType).getResult();
                 }
-            }
-        }
-        
-        // Collect top-level arith.constant in main function
-        if (auto constOp = dyn_cast<arith::ConstantOp>(op)) {
-            // Only collect if direct child of func.func (not nested in regions)
-            if (auto funcOp = dyn_cast<func::FuncOp>(op->getParentOp())) {
-                if (funcOp.getName() == "main") {
-                    info.topLevelConstantOps.push_back(OpWithParent(op, parentOp));
-                }
+                mapper.map(operand, newAlloc);
+                hostAllocs.push_back(newAlloc);
+            } else if (isa<arith::ConstantOp>(defOp)) {
+                mapper.map(operand, builder.clone(*defOp)->getResult(0));
             }
         }
     });
 }
 
-// Debug: Print parent information for all collected operations
-static void printParentInfo(const ModuleScheduleInfo &info) {
-    llvm::errs() << "\n=== Operation Parent Information ===\n";
-    
-    auto printOpList = [](const SmallVector<OpWithParent> &ops, StringRef name) {
-        if (ops.empty()) return;
-        llvm::errs() << "\n" << name << " (" << ops.size() << " operations):\n";
-        for (size_t i = 0; i < ops.size(); ++i) {
-            llvm::errs() << "  [" << i << "] " << ops[i].op->getName() << "\n";
-            if (ops[i].parent) {
-                llvm::errs() << "      Parent: " << ops[i].parent->getName();
-                if (ops[i].isInDSKernelReceiver) {
-                    llvm::errs() << " (IS dfschedule.dskernel_receiver)";
-                } else {
-                    llvm::errs() << " (NOT dfschedule.dskernel_receiver)";
-                }
-                llvm::errs() << "\n";
-            } else {
-                llvm::errs() << "      Parent: <none> (top-level)\n";
-            }
-        }
-    };
-    
-    printOpList(info.declareTensorOps, "DeclareTensor");
-    printOpList(info.declareTileOps, "DeclareTile");
-    printOpList(info.configDmaBdOps, "ConfigDmaBd");
-    printOpList(info.configCreateIoOps, "ConfigCreateIo");
-    printOpList(info.packetOps, "Packet");
-    printOpList(info.loadKernelGroupOps, "LoadKernelGroup");
-    printOpList(info.launchKernelGroupOps, "LaunchKernelGroup");
-    printOpList(info.getBdIdOps, "GetBdId");
-    printOpList(info.startIoOps, "StartIo");
-    printOpList(info.scheduleWaitOps, "ScheduleWait");
-    printOpList(info.dskernelReceiverOps, "DSKernelReceiver");
-    printOpList(info.tensorEmptyOps, "TensorEmpty");
-    printOpList(info.extractSliceOps, "ExtractSlice");
-    printOpList(info.partitionTensorOps, "PartitionTensor");
-    printOpList(info.executeRegionOps, "ExecuteRegion");
-    printOpList(info.routingCreateOps, "RoutingCreate");
-    printOpList(info.declareDataOps, "DeclareData");
-    printOpList(info.topLevelConstantOps, "TopLevelConstant");
-    
-    llvm::errs() << "\n====================================\n\n";
-}
+struct KernelCfgEntry {
+    TileKey tileKey;
+    ArrayAttr tileConfigs; // from DeclareKernelConfigOp.tile_configs
+    Attribute computeArg;  // from LoadKernelGroupOp.distributed_compute_kernel_args[i]
+};
 
-// Associate packets with their target tiles
-static void associatePacketsWithTiles(ModuleScheduleInfo &info) {
-    // For each LoadKernelGroupOp, extract tile-to-packet/config mapping
-    for (auto &opWithParent : info.loadKernelGroupOps) {
-        auto loadKernel = cast<dfschedule::LoadKernelGroupOp>(opWithParent.op);
-        
-        auto tiles = loadKernel.getTiles();
-        auto computeArgs = loadKernel.getDistributedComputeKernelArgs();
-        
-        // Check for distributed_args (which now contains kernel config symbols)
-        auto distArgs = loadKernel.getDistributedArgs();
-        
-        if (distArgs) {
-            // Handle distributed_args pointing to individual kernel config symbols
-            auto distArgsArray = *distArgs;  // Dereference the optional
-            auto moduleOp = opWithParent.parent->getParentOfType<ModuleOp>();
-            
-            for (size_t i = 0; i < tiles.size(); ++i) {
-                Value tileVal = tiles[i];
-                if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
-                    TileKey key = getTileKey(declareTile);
-                    
-                    if (!isShimTile(key)) {
-                        auto &tileInfo = info.coreTiles[key];
-                        
-                        // Look up the kernel config symbol for this tile
-                        if (i < distArgsArray.size()) {
-                            if (auto symRef = dyn_cast<SymbolRefAttr>(distArgsArray[i])) {
-                                // Lookup the DeclareKernelConfigOp
-                                auto configOp = moduleOp.lookupSymbol<dfschedule::DeclareKernelConfigOp>(
-                                    symRef.getRootReference());
-                                
-                                if (configOp) {
-                                    auto tileConfigsAttr = configOp.getTileConfigs();
-                                    // Each config op should have exactly one tile config
-                                    if (tileConfigsAttr.size() > 0) {
-                                        auto configDict = dyn_cast<DictionaryAttr>(tileConfigsAttr[0]);
-                                        if (configDict) {
-                                            tileInfo.configDicts.push_back(configDict);
-                                        }
-                                    }
-                                }
-                                
-                                // Also store the symbol reference for backward compatibility
-                                tileInfo.packetSymbols.push_back(symRef);
-                            }
-                        }
-                        
-                        // Add compute kernel arg
-                        if (i < computeArgs.size()) {
-                            if (auto symRef = dyn_cast<SymbolRefAttr>(computeArgs[i])) {
-                                tileInfo.computeKernelArgs.push_back(symRef);
-                            }
-                        }
-                        
-                        // Track packet count per tile
-                        info.tilePacketCount[key]++;
-                    }
-                }
-            }
-        }
-    }
-}
-
-// Associate DMA configs with shim tiles
-static void associateDmaWithShimTiles(ModuleScheduleInfo &info) {
-    for (auto &opWithParent : info.configDmaBdOps) {
-        auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(opWithParent.op);
-        Value tileVal = dmaBd.getTile();
-        
-        // Skip DMA BD operations inside dskernel_receiver (these are kernel-side, not host-side shim operations)
-        if (opWithParent.isInDSKernelReceiver) {
+/// Collect kernel config info from the cloned RoutingCreate block, then erase
+/// the ops that must NOT be inlined (ScheduleWait, LaunchKernelGroup,
+/// LoadKernelGroup, DeclareKernelConfig, FreeDeviceMem).
+/// Non-launch events from ScheduleWaitOp are pushed into `allWaitEvents`.
+static void collectAndErasePreInlineOps(Block &clonedBlock, Operation *clonedRc,
+                                        SmallVector<KernelCfgEntry> &kernelCfgEntries, ArrayAttr &calleeAttrs,
+                                        SmallVector<Value> &allWaitEvents) {
+    // First pass: collect from LoadKernelGroupOp (tile→config association).
+    for (Operation &op : clonedBlock) {
+        auto loadOp = dyn_cast<dfschedule::LoadKernelGroupOp>(&op);
+        if (!loadOp)
             continue;
-        }
-        
-        // Only include operations that are in dfschedule.host (the canonicalized region)
-        if (!opWithParent.parent || opWithParent.parent->getName().getStringRef() != "dfschedule.host") {
-            continue;
-        }
-        
-        if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
-            TileKey key = getTileKey(declareTile);
-            
-            if (isShimTile(key)) {
-                info.shimTiles[key].dmaBdOps.push_back(opWithParent.op);
-                info.shimTiles[key].bdHandles.push_back(dmaBd.getBdHandle());
-            }
-        }
-    }
-    ///*
-    for (auto &opWithParent : info.configCreateIoOps) {
-        auto createIo = cast<dfschedule::ConfigCreateIoOp>(opWithParent.op);
-        Value tileVal = createIo.getTile();
-        
-        if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
-            TileKey key = getTileKey(declareTile);
-            if (isShimTile(key)) {
-                info.shimTiles[key].createIoOps.push_back(opWithParent.op);
-                info.shimTiles[key].ioHandles.push_back(createIo.getIoHandle());
-            }
-        }
-    }
-    //*/
-    // Print all shim tiles and their associated DMA operations
-    llvm::errs() << "\n=== Shim Tiles DMA Association ===\n";
-    if (info.shimTiles.empty()) {
-        llvm::errs() << "  No shim tiles found.\n";
-    } else {
-        for (auto &[key, shimInfo] : info.shimTiles) {
-            llvm::errs() << "\nShim Tile (col=" << key.first << ", row=" << key.second << "):\n";
-            
-            // Print DMA BD operations
-            llvm::errs() << "  DMA BD Operations: " << shimInfo.dmaBdOps.size() << "\n";
-            for (size_t i = 0; i < shimInfo.dmaBdOps.size(); ++i) {
-                auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(shimInfo.dmaBdOps[i]);
-                llvm::errs() << "    [" << i << "] dfschedule.config.dma_bd\n";
-                llvm::errs() << "        Offset: " << dmaBd.getOffset() << "\n";
-                llvm::errs() << "        Length: " << dmaBd.getLen() << "\n";
-                llvm::errs() << "        Enable Packet: " << dmaBd.getEnablePacket() << "\n";
-                if (dmaBd.getEnablePacket()) {
-                    llvm::errs() << "        Packet ID: " << dmaBd.getPacketId() << "\n";
+
+        if (!calleeAttrs)
+            calleeAttrs = loadOp.getCalleeAttr();
+
+        auto distArgsOpt = loadOp.getDistributedArgs();
+        auto computeKernelArgs = loadOp.getDistributedComputeKernelArgs();
+        auto tiles = loadOp.getTiles();
+
+        for (size_t i = 0; i < tiles.size(); ++i) {
+            auto tileDecl = tiles[i].getDefiningOp<dfschedule::DeclareTileOp>();
+            if (!tileDecl)
+                continue;
+            TileKey k = getTileKey(tileDecl);
+
+            // Find the corresponding DeclareKernelConfigOp via symbol lookup.
+            ArrayAttr tileConfigs;
+            if (distArgsOpt) {
+                ArrayAttr distArgs = *distArgsOpt;
+                if (i < (size_t)distArgs.size()) {
+                    if (auto symRef = dyn_cast<SymbolRefAttr>(distArgs[i])) {
+                        if (auto cfgOp = SymbolTable::lookupSymbolIn(clonedRc, symRef.getRootReference()))
+                            if (auto kCfg = dyn_cast<dfschedule::DeclareKernelConfigOp>(cfgOp))
+                                tileConfigs = kCfg.getTileConfigs();
+                    }
                 }
-                llvm::errs() << "        BD Handle: " << shimInfo.bdHandles[i] << "\n";
             }
-            
-            // Print IO Config operations
-            llvm::errs() << "  IO Config Operations: " << shimInfo.createIoOps.size() << "\n";
-            for (size_t i = 0; i < shimInfo.createIoOps.size(); ++i) {
-                auto createIo = cast<dfschedule::ConfigCreateIoOp>(shimInfo.createIoOps[i]);
-                llvm::errs() << "    [" << i << "] dfschedule.config.create_io\n";
-                llvm::errs() << "        Channel: " << createIo.getChannel() << "\n";
-                llvm::errs() << "        Direction: " << createIo.getDirection() << "\n";
-                llvm::errs() << "        IO Operation: " << createIo.getIoOperation() << "\n";
-                llvm::errs() << "        IO Handle: " << shimInfo.ioHandles[i] << "\n";
+
+            Attribute computeArg = SymbolRefAttr::get(clonedRc->getContext(), "compute0");
+            if (i < computeKernelArgs.size())
+                computeArg = computeKernelArgs[i];
+
+            kernelCfgEntries.push_back({k, tileConfigs, computeArg});
+        }
+    }
+
+    // Second pass: collect non-launch events from ScheduleWaitOp.
+    for (Operation &op : clonedBlock) {
+        if (auto waitOp = dyn_cast<dfschedule::ScheduleWaitOp>(&op)) {
+            for (Value ev : waitOp.getEvents()) {
+                if (ev.getDefiningOp() && isa<dfschedule::LaunchKernelGroupOp>(ev.getDefiningOp()))
+                    continue;
+                allWaitEvents.push_back(ev);
             }
         }
     }
-    llvm::errs() << "\n==================================\n\n";
+
+    // Third pass: collect ops to erase from cloned block (in program order).
+    // We erase them in REVERSE dependency order so uses are cleared safely.
+    SmallVector<Operation *> eraseList;
+    for (Operation &op : clonedBlock) {
+        if (isa<dfschedule::ScheduleWaitOp, dfschedule::LaunchKernelGroupOp, dfschedule::LoadKernelGroupOp,
+                dfschedule::DeclareKernelConfigOp, dfschedule::FreeDeviceMemOp>(&op))
+            eraseList.push_back(&op);
+    }
+    for (Operation *op : llvm::reverse(eraseList)) {
+        op->dropAllUses();
+        op->erase();
+    }
 }
 
-// Structure to hold DMA BD parameters extracted from original ops
-struct DmaBdParams {
-    TileKey shimKey;
-    Type bufferType;
-    int64_t offset;
-    int64_t len;
-    bool enablePacket;  // Changed to bool for BoolAttr
-    int64_t packetId;
-    int64_t nextBd;
-    int bdIndex;
-    int64_t sliceIndex;  // Index into uniqueSliceParams/declaredMemrefs for the buffer
-    int64_t acquireLockId = -1;
-    int64_t acquireLockVal = -1;
-    int64_t releaseLockId = -1;
-    int64_t releaseLockVal = -1;
-};
+static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
+    MLIRContext *ctx = mainFunc.getContext();
+    OpBuilder builder(ctx);
+    Location loc = mainFunc.getLoc();
 
-// Structure to hold IO config parameters
-struct IoConfigParams {
-    TileKey shimKey;
-    int64_t channel;
-    std::string direction;    // StringAttr
-    std::string ioOperation;  // StringAttr
-    int bdIndex; // Which BD handle to use
-};
-
-// Structure to hold core tile DMA BD parameters (with lock IDs for ping-pong)
-struct CoreDmaBdParams {
-    TileKey coreKey;
-    Type bufferType;
-    int64_t offset;
-    int64_t len;
-    bool enablePacket;
-    int64_t packetId;
-    int64_t nextBd;
-    int bdIndex;
-    int64_t sliceIndex;
-    int64_t acquireLockId;
-    int64_t acquireLockVal;
-    int64_t releaseLockId;
-    int64_t releaseLockVal;
-};
-
-// Structure to hold core tile IO config parameters
-struct CoreIoConfigParams {
-    TileKey coreKey;
-    int64_t channel;
-    std::string direction;
-    std::string ioOperation;
-    int bdIndex;
-};
-
-// Create canonicalized schedule in dfschedule.host at module level
-// All operations use only constants/attributes, so IsolatedFromAbove is OK
-static void createCanonicalizedSchedule(
-    OpBuilder &builder,
-    Location loc,
-    ModuleScheduleInfo &info,
-    ModuleOp moduleOp,
-    func::FuncOp funcOp) {
-    
-    // Early exit if nothing to canonicalize
-    if (info.coreTiles.empty() && info.shimTiles.empty()) {
-        return;
-    }
-    
-    // ==========================================================
-    // Collect DMA BD and IO parameters from original operations
-    // ==========================================================
-    std::vector<DmaBdParams> allDmaBdParams;
-    std::vector<IoConfigParams> allIoConfigParams;
-    
-    // Map to track BD index per shim tile
-    std::map<TileKey, int> shimBdCounter;
-    
-    for (auto &opWithParent : info.configDmaBdOps) {
-        auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(opWithParent.op);
-        Value tileVal = dmaBd.getTile();
-        
-        if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
-            TileKey key = getTileKey(declareTile);
-            if (isShimTile(key)) {
-                DmaBdParams params;
-                params.shimKey = key;
-                params.bufferType = dmaBd.getBuffer().getType();
-                params.offset = dmaBd.getOffset();
-                params.len = dmaBd.getLen();
-                params.enablePacket = dmaBd.getEnablePacket();
-                params.packetId = dmaBd.getPacketId();
-                params.nextBd = dmaBd.getNextBd();
-                params.bdIndex = shimBdCounter[key]++;
-                params.sliceIndex = -1;  // Default: no slice found
-                params.acquireLockId = static_cast<int32_t>(dmaBd.getAcquireLockId());
-                params.acquireLockVal = static_cast<int32_t>(dmaBd.getAcquireLockVal());
-                params.releaseLockId = static_cast<int32_t>(dmaBd.getReleaseLockId());
-                params.releaseLockVal = static_cast<int32_t>(dmaBd.getReleaseLockVal());
-
-                // Trace buffer back to find the slice index
-                // Buffer -> DeclareTensorOp -> ExtractSliceOp
-                Value buffer = dmaBd.getBuffer();
-                if (auto declareTensor = buffer.getDefiningOp<dfschedule::DeclareTensorOp>()) {
-                    Value tensorVal = declareTensor.getTensor();
-                    if (auto extractSlice = tensorVal.getDefiningOp<tensor::ExtractSliceOp>()) {
-                        // Find which slice index this corresponds to
-                        for (size_t i = 0; i < info.extractSliceOps.size(); ++i) {
-                            if (info.extractSliceOps[i].op == extractSlice.getOperation()) {
-                                params.sliceIndex = static_cast<int64_t>(i);
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                allDmaBdParams.push_back(params);
-            }
-        }
-    }
-    
-    // Map to track IO index per shim tile
-    std::map<TileKey, int> shimIoCounter;
-    
-    for (auto &opWithParent : info.configCreateIoOps) {
-        auto createIo = cast<dfschedule::ConfigCreateIoOp>(opWithParent.op);
-        Value tileVal = createIo.getTile();
-        
-        if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
-            TileKey key = getTileKey(declareTile);
-            if (isShimTile(key)) {
-                IoConfigParams params;
-                params.shimKey = key;
-                params.channel = createIo.getChannel();
-                params.direction = createIo.getDirection().str();
-                params.ioOperation = createIo.getIoOperation().str();
-                params.bdIndex = shimIoCounter[key]++;
-                allIoConfigParams.push_back(params);
-            }
-        }
-    }
-
-    // ==========================================================
-    // Collect core tile DMA BD and IO parameters
-    // ==========================================================
-    std::vector<CoreDmaBdParams> allCoreDmaBdParams;
-    std::vector<CoreIoConfigParams> allCoreIoConfigParams;
-
-    std::map<TileKey, int> coreBdCounter;
-
-    for (auto &opWithParent : info.configDmaBdOps) {
-        auto dmaBd = cast<dfschedule::ConfigDmaBdOp>(opWithParent.op);
-        Value tileVal = dmaBd.getTile();
-
-        if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
-            TileKey key = getTileKey(declareTile);
-            if (!isShimTile(key)) {
-                CoreDmaBdParams params;
-                params.coreKey = key;
-                params.bufferType = dmaBd.getBuffer().getType();
-                params.offset = dmaBd.getOffset();
-                params.len = dmaBd.getLen();
-                params.enablePacket = dmaBd.getEnablePacket();
-                params.packetId = dmaBd.getPacketId();
-                params.nextBd = dmaBd.getNextBd();
-                params.bdIndex = coreBdCounter[key]++;
-                params.sliceIndex = -1;
-
-                // Read lock IDs and values directly from attributes
-                params.acquireLockId = static_cast<int32_t>(dmaBd.getAcquireLockId());
-                params.acquireLockVal = static_cast<int32_t>(dmaBd.getAcquireLockVal());
-                params.releaseLockId = static_cast<int32_t>(dmaBd.getReleaseLockId());
-                params.releaseLockVal = static_cast<int32_t>(dmaBd.getReleaseLockVal());
-
-                // Trace buffer back to find the slice index
-                Value buffer = dmaBd.getBuffer();
-                if (auto declareTensor = buffer.getDefiningOp<dfschedule::DeclareTensorOp>()) {
-                    Value tensorVal = declareTensor.getTensor();
-                    if (auto extractSlice = tensorVal.getDefiningOp<tensor::ExtractSliceOp>()) {
-                        for (size_t i = 0; i < info.extractSliceOps.size(); ++i) {
-                            if (info.extractSliceOps[i].op == extractSlice.getOperation()) {
-                                params.sliceIndex = static_cast<int64_t>(i);
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                allCoreDmaBdParams.push_back(params);
-            }
-        }
-    }
-
-    std::map<TileKey, int> coreIoCounter;
-
-    for (auto &opWithParent : info.configCreateIoOps) {
-        auto createIo = cast<dfschedule::ConfigCreateIoOp>(opWithParent.op);
-        Value tileVal = createIo.getTile();
-
-        if (auto declareTile = tileVal.getDefiningOp<dfschedule::DeclareTileOp>()) {
-            TileKey key = getTileKey(declareTile);
-            if (!isShimTile(key)) {
-                CoreIoConfigParams params;
-                params.coreKey = key;
-                params.channel = createIo.getChannel();
-                params.direction = createIo.getDirection().str();
-                params.ioOperation = createIo.getIoOperation().str();
-                params.bdIndex = coreIoCounter[key]++;
-                allCoreIoConfigParams.push_back(params);
-            }
-        }
-    }
-
-    // ==========================================================
-    // PART 1: Create dfschedule.host at MODULE level (after func.func)
-    // ==========================================================
-    builder.setInsertionPointAfter(funcOp);
-    
-    auto hostOp = builder.create<dfschedule::HostBlockOp>(
-        loc,
-        builder.getStringAttr("host_canonicalized"));
-    
+    // Create dfschedule.host at module scope after func.func @main.
+    builder.setInsertionPointAfter(mainFunc);
+    auto hostOp = builder.create<dfschedule::HostBlockOp>(loc, "host_canonicalized");
     Block *hostBody = &hostOp.getBody().emplaceBlock();
     builder.setInsertionPointToStart(hostBody);
-    
-    // All operations below are created INSIDE dfschedule.host
-    // They only use constants and values defined within this block
-    
-    // Helper to create type key strings
-    auto makeTensorTypeKey = [](RankedTensorType t) -> std::string {
-        std::string key;
-        llvm::raw_string_ostream os(key);
-        os << t;
-        return key;
-    };
-    
-    // Helper to create partition key - include index for uniqueness
-    auto makePartitionKey = [&](const PartitionParams &p) -> std::string {
-        std::string key;
-        llvm::raw_string_ostream os(key);
-        os << p.index << "_" << p.tensorType << "_" << p.splitnum << "_" << p.splitdim << "_" << p.hw_axis_owner;
-        return key;
-    };
-    
-    // ==========================================================
-    // DATA FLOW: declare_data -> partitiontensor -> extract_slice
-    // ==========================================================
-    
-    // 0a. Create dfscheblueprint.declare_data for each unique source tensor type
-    // Reuse the init tensor from the original IR instead of creating new ones
-    std::map<std::string, Value> sourceTensorMap;
-    for (auto tensorType : info.sourceTensorTypes) {
-        std::string key = makeTensorTypeKey(tensorType);
-        if (sourceTensorMap.find(key) == sourceTensorMap.end()) {
-            // Look up the captured init tensor from the original IR
-            auto initTensorIt = info.initTensorMap.find(key);
-            if (initTensorIt == info.initTensorMap.end()) {
-                llvm::errs() << "Warning: No init tensor found for type " << key << "\n";
-                continue;
-            }
-            
-            Value originalInitTensor = initTensorIt->second;
-            
-            // Clone the init tensor (arith.constant) into the new block
-            Operation *initDefOp = originalInitTensor.getDefiningOp();
-            Value initTensor;
-            if (initDefOp) {
-                Operation *clonedOp = builder.clone(*initDefOp);
-                initTensor = clonedOp->getResult(0);
-            } else {
-                // If it's a block argument or other, we can't clone - skip
-                llvm::errs() << "Warning: Init tensor is not defined by an operation\n";
-                continue;
-            }
-            
-            // Create declare_data operation using generic op builder with init_tensor
-            OperationState state(loc, "dfscheblueprint.declare_data");
-            state.addOperands({initTensor});
-            state.addTypes({tensorType});
-            Operation *declareDataOp = builder.create(state);
-            sourceTensorMap[key] = declareDataOp->getResult(0);
+
+    // Shared mapper and collection state across all RoutingCreate iterations.
+    IRMapping mapper;
+    SmallVector<KernelCfgEntry> kernelCfgEntries;
+    ArrayAttr calleeAttrs;
+    SmallVector<Value> allWaitEvents;
+    SmallVector<Value> hostAllocs;
+
+    // Walk routing.RoutingCreate ops in mainFunc (in program order).
+    mainFunc.walk([&](Operation *rcOp) {
+        if (rcOp->getName().getStringRef() != "routing.RoutingCreate")
+            return;
+        if (rcOp->getNumRegions() == 0 || rcOp->getRegion(0).empty())
+            return;
+
+        // Always insert new content at the end of host body.
+        builder.setInsertionPointToEnd(hostBody);
+
+        // ── Pre-map external values to host-local ops ──────────────────────
+        preMapExternalValues(rcOp, builder, loc, mapper, hostAllocs, hostBody);
+
+        // ── Clone the entire RoutingCreate (with its body) into host ────────
+        // builder.clone performs a full deep clone, remapping operands via mapper.
+        Operation *clonedRc = builder.clone(*rcOp, mapper);
+
+        // ── Collect kernel info + erase pre-inline-excluded ops ────────────
+        Block &clonedBlock = clonedRc->getRegion(0).front();
+        collectAndErasePreInlineOps(clonedBlock, clonedRc, kernelCfgEntries, calleeAttrs, allWaitEvents);
+
+        // ── Inline cloned body into host block (before the cloned RC op) ───
+        // Remove the block terminator if present (RoutingCreate may have one).
+        if (Operation *term = clonedBlock.getTerminator()) {
+            term->dropAllUses();
+            term->erase();
+        }
+        // Move every remaining op from the cloned block to just before clonedRc.
+        SmallVector<Operation *> opsToMove;
+        for (Operation &op : clonedBlock)
+            opsToMove.push_back(&op);
+        for (Operation *op : opsToMove)
+            op->moveBefore(clonedRc);
+
+        // Erase the now-empty cloned RoutingCreate wrapper.
+        clonedRc->erase();
+    });
+
+    // ── Phase 2b: Deduplicate tiles + shim BDs inside the flat host block ──
+    {
+        RewritePatternSet patterns(ctx);
+        patterns.add<FoldDuplicateDeclareTilePattern>(ctx);
+        patterns.add<FoldDuplicateShimBdPattern>(ctx);
+        FrozenRewritePatternSet frozen(std::move(patterns));
+        GreedyRewriteConfig cfg;
+        cfg.maxIterations = 32;
+        // Ignore failure — dedup is best-effort.
+        (void)applyPatternsAndFoldGreedily(hostOp, frozen, cfg);
+    }
+
+    // ── Build canonicalTileMap from surviving declaretile ops in host ───────
+    DenseMap<TileKey, Value> canonicalTileMap;
+    hostOp.walk([&](dfschedule::DeclareTileOp tileOp) {
+        TileKey k = getTileKey(tileOp);
+        canonicalTileMap.try_emplace(k, tileOp.getTile());
+    });
+
+    // ── Emit merged kernel configs, load, launch at end of host ────────────
+    builder.setInsertionPointToEnd(hostBody);
+
+    // Deduplicate kernelCfgEntries by TileKey (first occurrence wins).
+    SmallVector<KernelCfgEntry> uniqueEntries;
+    DenseSet<TileKey> seenTiles;
+    for (auto &entry : kernelCfgEntries) {
+        if (seenTiles.insert(entry.tileKey).second)
+            uniqueEntries.push_back(entry);
+    }
+
+    SmallVector<Value> allCoreTileVals;
+    SmallVector<Attribute> allComputeArgs;
+    SmallVector<Attribute> kernelConfigSyms;
+
+    for (size_t i = 0; i < uniqueEntries.size(); ++i) {
+        auto &entry = uniqueEntries[i];
+        Value tileVal = canonicalTileMap.lookup(entry.tileKey);
+        if (!tileVal)
+            continue;
+
+        allCoreTileVals.push_back(tileVal);
+        allComputeArgs.push_back(entry.computeArg);
+
+        std::string cfgName = "kernelconfig_merged" + std::to_string(i);
+        ArrayAttr cfgAttr = entry.tileConfigs ? entry.tileConfigs : builder.getArrayAttr({});
+        builder.create<dfschedule::DeclareKernelConfigOp>(loc, dfschedule::KernelConfigType::get(ctx),
+                                                          builder.getStringAttr(cfgName), cfgAttr);
+        kernelConfigSyms.push_back(SymbolRefAttr::get(ctx, cfgName));
+    }
+
+    Value launchEvent;
+    if (!allCoreTileVals.empty() && calleeAttrs) {
+        auto loadOp = builder.create<dfschedule::LoadKernelGroupOp>(
+            loc, dfschedule::KernelGroupType::get(ctx), allCoreTileVals, calleeAttrs,
+            builder.getArrayAttr(allComputeArgs),
+            /*kernel_config=*/nullptr, builder.getArrayAttr(kernelConfigSyms));
+        auto launchOp = builder.create<dfschedule::LaunchKernelGroupOp>(loc, dfschedule::EventType::get(ctx),
+                                                                        loadOp.getKernelGroup());
+        launchEvent = launchOp.getEvent();
+
+        // Move all StartIoOp ops to AFTER the merged LaunchKernelGroupOp.
+        // ELF loading (triggered by LoadKernelGroupOp) zeroes BSS in core
+        // tile memory.  If core S2MM DMA StartIoOps fire before the ELF load,
+        // DMA-written data gets overwritten with zeros.  By placing StartIoOps
+        // after the launch, the ELF is fully loaded before DMAs start writing.
+        SmallVector<Operation *> startIoOps;
+        for (Operation &op : *hostBody) {
+            if (isa<dfschedule::StartIoOp>(&op))
+                startIoOps.push_back(&op);
+        }
+        Operation *insertAfter = launchOp;
+        for (Operation *op : startIoOps) {
+            op->moveAfter(insertAfter);
+            insertAfter = op;
         }
     }
-    
-    // 0b. Create routing.partitiontensor for each unique partition config
-    std::map<std::string, Value> partitionedTensorMap;
-    for (const auto &params : info.uniquePartitionParams) {
-        std::string partKey = makePartitionKey(params);
-        if (partitionedTensorMap.find(partKey) == partitionedTensorMap.end()) {
-            // Find the source tensor
-            std::string srcKey = makeTensorTypeKey(params.tensorType);
-            Value sourceTensor;
-            if (sourceTensorMap.find(srcKey) != sourceTensorMap.end()) {
-                sourceTensor = sourceTensorMap[srcKey];
-            } else {
-                // Create declare_data if not found - reuse init tensor from original IR
-                auto initTensorIt = info.initTensorMap.find(srcKey);
-                if (initTensorIt != info.initTensorMap.end()) {
-                    Value originalInitTensor = initTensorIt->second;
-                    
-                    // Clone the init tensor (arith.constant) into the new block
-                    Operation *initDefOp = originalInitTensor.getDefiningOp();
-                    Value initTensor;
-                    if (initDefOp) {
-                        Operation *clonedOp = builder.clone(*initDefOp);
-                        initTensor = clonedOp->getResult(0);
-                    } else {
-                        continue;
-                    }
-                    
-                    OperationState state(loc, "dfscheblueprint.declare_data");
-                    state.addOperands({initTensor});
-                    state.addTypes({params.tensorType});
-                    Operation *declareDataOp = builder.create(state);
-                    sourceTensorMap[srcKey] = declareDataOp->getResult(0);
-                    sourceTensor = declareDataOp->getResult(0);
-                }
-            }
-            
-            // Create routing.partitiontensor
-            OperationState partState(loc, "routing.partitiontensor");
-            partState.addOperands({sourceTensor});
-            partState.addTypes({params.tensorType});
-            partState.addAttribute("splitnum", builder.getI32IntegerAttr(params.splitnum));
-            partState.addAttribute("splitdim", builder.getI32IntegerAttr(params.splitdim));
-            partState.addAttribute("hw_axis_owner", builder.getStringAttr(params.hw_axis_owner));
-            partState.addAttribute("replicate_on", builder.getStringAttr(params.replicate_on));
-            partState.addAttribute("single_tile_owner", builder.getStringAttr(params.single_tile_owner));
-            Operation *partitionOp = builder.create(partState);
-            partitionedTensorMap[partKey] = partitionOp->getResult(0);
-        }
+
+    // Prepend launch event so wait covers it first.
+    if (launchEvent)
+        allWaitEvents.insert(allWaitEvents.begin(), launchEvent);
+
+    if (!allWaitEvents.empty())
+        builder.create<dfschedule::ScheduleWaitOp>(loc, allWaitEvents);
+
+    // Emit dealloc for each host-local alloc created to substitute external memrefs.
+    for (Value allocVal : hostAllocs)
+        builder.create<memref::DeallocOp>(loc, allocVal);
+
+    // ── Insert dfschedule.launchhost in func.func @main ─────────────────────
+    Block &mainBlock = mainFunc.getBody().front();
+    Operation *terminator = mainBlock.getTerminator();
+    if (terminator)
+        builder.setInsertionPoint(terminator);
+    else
+        builder.setInsertionPointToEnd(&mainBlock);
+    builder.create<dfschedule::LaunchHostOp>(loc, SymbolRefAttr::get(ctx, "host_canonicalized"));
+}
+
+//===----------------------------------------------------------------------===//
+// Phase 3 — Safe cleanup
+//===----------------------------------------------------------------------===//
+
+static void eraseOldOps(func::FuncOp mainFunc) {
+    if (!mainFunc)
+        return;
+
+    // Collect scf.execute_region ops (they contain all the old dfschedule ops
+    // including the original routing.RoutingCreate ops).
+    SmallVector<Operation *> execRegions;
+    mainFunc.walk([&](scf::ExecuteRegionOp op) {
+        if (!op->getParentOfType<dfschedule::HostBlockOp>())
+            execRegions.push_back(op.getOperation());
+    });
+
+    // Erase execute_region ops. Drop all defined-value uses first (the cloned
+    // copies in dfschedule.host have taken over).
+    for (auto *op : llvm::reverse(execRegions)) {
+        op->dropAllDefinedValueUses();
+        op->erase();
     }
-    
-    // 0c. Create extract_slice operations - maintain proper chain
-    // Each slice gets a unique entry, keyed by its index
-    // We process in order: first slices from partitions, then nested slices
-    
-    std::map<size_t, Value> sliceMap;  // Map from slice index to created Value
-    
-    // First pass: create slices that come directly from partitiontensors
-    for (const auto &params : info.uniqueSliceParams) {
-        if (params.isFromPartition) {
-            Value sourceTensor;
-            
-            // Find the partitioned tensor by index
-            for (auto &[partKey, partValue] : partitionedTensorMap) {
-                std::string indexPrefix = std::to_string(params.partitionIndex) + "_";
-                if (partKey.find(indexPrefix) == 0) {
-                    sourceTensor = partValue;
+
+    // Erase dead init-chain allocs in @main (alloc + copy + dealloc) that were
+    // migrated into dfschedule.host by preMapExternalValues.
+    {
+        SmallVector<Operation *> deadAllocs;
+        mainFunc.walk([&](memref::AllocOp allocOp) {
+            if (allocOp->getParentOp() != mainFunc.getOperation())
+                return;
+            bool onlyInitUsers = true;
+            for (Operation *user : allocOp.getResult().getUsers()) {
+                if (!isa<memref::CopyOp>(user) && !isa<memref::DeallocOp>(user)) {
+                    onlyInitUsers = false;
                     break;
                 }
             }
-            
-            if (sourceTensor) {
-                SmallVector<int64_t, 4> defaultStrides(params.offsets.size(), 1);
-                auto newSlice = builder.create<tensor::ExtractSliceOp>(
-                    loc,
-                    params.resultType,
-                    sourceTensor,
-                    ValueRange{}, ValueRange{}, ValueRange{},
-                    params.offsets,
-                    params.sizes,
-                    params.strides.empty() ? defaultStrides : params.strides);
-                sliceMap[params.index] = newSlice.getResult();
-            }
-        }
-    }
-    
-    // Second pass: create nested slices (from other slices)
-    // May need multiple passes if there are deeply nested slices
-    bool progress = true;
-    while (progress) {
-        progress = false;
-        for (const auto &params : info.uniqueSliceParams) {
-            // Skip if already created or if it's directly from partition
-            if (sliceMap.find(params.index) != sliceMap.end() || params.isFromPartition) {
-                continue;
-            }
-            
-            // Check if parent slice is ready
-            if (params.parentSliceIndex >= 0) {
-                auto parentIt = sliceMap.find(static_cast<size_t>(params.parentSliceIndex));
-                if (parentIt != sliceMap.end()) {
-                    // Parent is ready, create this slice
-                    Value sourceTensor = parentIt->second;
-                    SmallVector<int64_t, 4> defaultStrides(params.offsets.size(), 1);
-                    auto newSlice = builder.create<tensor::ExtractSliceOp>(
-                        loc,
-                        params.resultType,
-                        sourceTensor,
-                        ValueRange{}, ValueRange{}, ValueRange{},
-                        params.offsets,
-                        params.sizes,
-                        params.strides.empty() ? defaultStrides : params.strides);
-                    sliceMap[params.index] = newSlice.getResult();
-                    progress = true;
-                }
-            }
-        }
-    }
-    
-    
-    // Identify leaf slices (slices with no children)
-    std::set<size_t> slicesWithChildren;
-    for (const auto &params : info.uniqueSliceParams) {
-        if (params.parentSliceIndex >= 0) {
-            slicesWithChildren.insert(static_cast<size_t>(params.parentSliceIndex));
-        }
-    }
-    
-    // Build mapping from parent slice to its child slices
-    std::map<size_t, SmallVector<size_t>> sliceChildren;
-    for (const auto &params : info.uniqueSliceParams) {
-        if (params.parentSliceIndex >= 0) {
-            sliceChildren[static_cast<size_t>(params.parentSliceIndex)].push_back(params.index);
-        }
-    }
-    
-    // 0d. Create dfschedule.declaretensor ONLY for leaf slices (no children)
-    std::map<size_t, Value> declaredMemrefs;  // Map from slice index to memref
-    for (const auto &params : info.uniqueSliceParams) {
-        // Skip if this slice has children - only create declaretensor for leaf slices
-        if (slicesWithChildren.count(params.index) > 0) {
-            continue;
-        }
-        
-        auto it = sliceMap.find(params.index);
-        if (it != sliceMap.end()) {
-            Value sliceValue = it->second;
-            auto sliceType = cast<RankedTensorType>(sliceValue.getType());
-            auto memrefType = MemRefType::get(sliceType.getShape(), sliceType.getElementType());
-            
-            auto declareTensor = builder.create<dfschedule::DeclareTensorOp>(
-                loc, memrefType, sliceValue);
-            declaredMemrefs[params.index] = declareTensor.getMemref();
-        }
-    }
-    
-    // Build mapping from intermediate slice to its leaf descendants
-    // This is used to map DMA BD (which references intermediate slice) to leaf slices
-    std::map<size_t, SmallVector<size_t>> sliceToLeafDescendants;
-    std::function<SmallVector<size_t>(size_t)> getLeafDescendants = [&](size_t idx) -> SmallVector<size_t> {
-        if (slicesWithChildren.count(idx) == 0) {
-            // This is a leaf slice
-            return {idx};
-        }
-        SmallVector<size_t> leaves;
-        for (size_t childIdx : sliceChildren[idx]) {
-            auto childLeaves = getLeafDescendants(childIdx);
-            leaves.append(childLeaves.begin(), childLeaves.end());
-        }
-        return leaves;
-    };
-    for (const auto &params : info.uniqueSliceParams) {
-        sliceToLeafDescendants[params.index] = getLeafDescendants(params.index);
-    }
-    
-    // 1. Create NEW deduplicated shim tile declarations
-    std::map<TileKey, Value> shimTileMap;
-    for (auto &[key, shimInfo] : info.shimTiles) {
-        auto shimTile = builder.create<dfschedule::DeclareTileOp>(
-            loc,
-            dfschedule::TileType::get(builder.getContext()),
-            builder.getI32IntegerAttr(key.first),
-            builder.getI32IntegerAttr(key.second));
-        shimTileMap[key] = shimTile.getTile();
-    }
-    
-    // 2. Create NEW deduplicated core tile declarations
-    std::map<TileKey, Value> coreTileMap;
-    for (auto &[key, tileInfo] : info.coreTiles) {
-        auto coreTile = builder.create<dfschedule::DeclareTileOp>(
-            loc,
-            dfschedule::TileType::get(builder.getContext()),
-            builder.getI32IntegerAttr(key.first),
-            builder.getI32IntegerAttr(key.second));
-        coreTileMap[key] = coreTile.getTile();
-    }
-    
-    // 3. Create external memory references for DMA buffers (using memref.alloc)
-    // Group buffers by type to deduplicate
-    std::map<std::string, Value> bufferMap;
-    auto makeBufferKey = [](Type t) -> std::string {
-        std::string key;
-        llvm::raw_string_ostream os(key);
-        os << t;
-        return key;
-    };
-    
-    // Map to store BD handles per shim tile
-    std::map<TileKey, SmallVector<Value>> shimBdHandles;
-    
-    // 4. Create DMA BD configurations for shim tiles
-    // If the traced slice is an intermediate slice, create DMA BDs for all its leaf descendants
-    int bdIndexCounter = 0;
-    for (const auto &params : allDmaBdParams) {
-        if (shimTileMap.find(params.shimKey) == shimTileMap.end()) continue;
-        Value shimTile = shimTileMap[params.shimKey];
-        
-        // Get the leaf descendants for this slice
-        SmallVector<size_t> leafIndices;
-        if (params.sliceIndex >= 0) {
-            auto it = sliceToLeafDescendants.find(static_cast<size_t>(params.sliceIndex));
-            if (it != sliceToLeafDescendants.end()) {
-                leafIndices = it->second;
-            }
-        }
-        
-        // If no leaf indices found, try direct lookup
-        if (leafIndices.empty() && params.sliceIndex >= 0) {
-            leafIndices.push_back(static_cast<size_t>(params.sliceIndex));
-        }
-        
-        // Create a DMA BD for each leaf slice
-        for (size_t leafIdx : leafIndices) {
-            Value buffer;
-            auto memIt = declaredMemrefs.find(leafIdx);
-            if (memIt != declaredMemrefs.end()) {
-                buffer = memIt->second;
-            }
-            
-            // Fallback: create or reuse buffer if not found
-            if (!buffer) {
-                std::string bufKey = makeBufferKey(params.bufferType);
-                if (bufferMap.find(bufKey) == bufferMap.end()) {
-                    auto memrefType = cast<MemRefType>(params.bufferType);
-                    buffer = builder.create<memref::AllocOp>(loc, memrefType);
-                    bufferMap[bufKey] = buffer;
-                } else {
-                    buffer = bufferMap[bufKey];
-                }
-            }
-            
-            // Create BD ID constant
-            auto bdIdConst = builder.create<arith::ConstantOp>(
-                loc, builder.getI32Type(), builder.getI32IntegerAttr(bdIndexCounter++));
-
-            // Create DMA BD config
-            auto dmaBdOp = builder.create<dfschedule::ConfigDmaBdOp>(
-                loc, dfschedule::BdHandleType::get(builder.getContext()), buffer, shimTile, bdIdConst.getResult(),
-                builder.getI32IntegerAttr(params.offset), builder.getI32IntegerAttr(params.len),
-                builder.getBoolAttr(params.enablePacket), builder.getI32IntegerAttr(params.packetId),
-                builder.getI32IntegerAttr(params.nextBd), builder.getI32IntegerAttr(params.acquireLockId),
-                builder.getI32IntegerAttr(params.acquireLockVal), builder.getI32IntegerAttr(params.releaseLockId),
-                builder.getI32IntegerAttr(params.releaseLockVal));
-
-            shimBdHandles[params.shimKey].push_back(dmaBdOp.getBdHandle());
-        }
-    }
-    
-    // 5. Create IO configurations for shim tiles
-    std::map<TileKey, SmallVector<Value>> shimIoHandles;
-    
-    for (const auto &params : allIoConfigParams) {
-        if (shimTileMap.find(params.shimKey) == shimTileMap.end()) continue;
-        Value shimTile = shimTileMap[params.shimKey];
-        
-        // Get corresponding BD handle
-        Value bdHandle;
-        if (params.bdIndex < (int)shimBdHandles[params.shimKey].size()) {
-            bdHandle = shimBdHandles[params.shimKey][params.bdIndex];
-        } else if (!shimBdHandles[params.shimKey].empty()) {
-            bdHandle = shimBdHandles[params.shimKey].back();
-        } else {
-            continue; // No BD handle available, skip this IO
-        }
-        
-        // Create IO config
-        auto createIoOp = builder.create<dfschedule::ConfigCreateIoOp>(
-            loc,
-            dfschedule::IoHandleType::get(builder.getContext()),
-            bdHandle,
-            shimTile,
-            builder.getI32IntegerAttr(params.channel),
-            builder.getStringAttr(params.direction),
-            builder.getStringAttr(params.ioOperation));
-        
-        shimIoHandles[params.shimKey].push_back(createIoOp.getIoHandle());
-    }
-
-    // 5b. Create DMA BD configurations for core tiles (ping-pong)
-    std::map<TileKey, SmallVector<Value>> coreBdHandles;
-
-    for (const auto &params : allCoreDmaBdParams) {
-        if (coreTileMap.find(params.coreKey) == coreTileMap.end())
-            continue;
-        Value coreTile = coreTileMap[params.coreKey];
-
-        // Look up buffer from declaredMemrefs via sliceIndex
-        Value buffer;
-        if (params.sliceIndex >= 0) {
-            auto memIt = declaredMemrefs.find(static_cast<size_t>(params.sliceIndex));
-            if (memIt != declaredMemrefs.end()) {
-                buffer = memIt->second;
-            }
-        }
-
-        if (!buffer) {
-            std::string bufKey = makeBufferKey(params.bufferType);
-            if (bufferMap.find(bufKey) == bufferMap.end()) {
-                auto memrefType = cast<MemRefType>(params.bufferType);
-                buffer = builder.create<memref::AllocOp>(loc, memrefType);
-                bufferMap[bufKey] = buffer;
-            } else {
-                buffer = bufferMap[bufKey];
-            }
-        }
-
-        auto bdIdConst =
-            builder.create<arith::ConstantOp>(loc, builder.getI32Type(), builder.getI32IntegerAttr(params.bdIndex));
-
-        auto dmaBdOp = builder.create<dfschedule::ConfigDmaBdOp>(
-            loc, dfschedule::BdHandleType::get(builder.getContext()), buffer, coreTile, bdIdConst.getResult(),
-            builder.getI32IntegerAttr(params.offset), builder.getI32IntegerAttr(params.len),
-            builder.getBoolAttr(params.enablePacket), builder.getI32IntegerAttr(params.packetId),
-            builder.getI32IntegerAttr(params.nextBd), builder.getI32IntegerAttr(params.acquireLockId),
-            builder.getI32IntegerAttr(params.acquireLockVal), builder.getI32IntegerAttr(params.releaseLockId),
-            builder.getI32IntegerAttr(params.releaseLockVal));
-
-        coreBdHandles[params.coreKey].push_back(dmaBdOp.getBdHandle());
-    }
-
-    // 5c. Create IO configurations for core tiles
-    for (const auto &params : allCoreIoConfigParams) {
-        if (coreTileMap.find(params.coreKey) == coreTileMap.end())
-            continue;
-        Value coreTile = coreTileMap[params.coreKey];
-
-        Value bdHandle;
-        if (params.bdIndex < (int)coreBdHandles[params.coreKey].size()) {
-            bdHandle = coreBdHandles[params.coreKey][params.bdIndex];
-        } else if (!coreBdHandles[params.coreKey].empty()) {
-            bdHandle = coreBdHandles[params.coreKey][0];
-        } else {
-            continue;
-        }
-
-        builder.create<dfschedule::ConfigCreateIoOp>(loc, dfschedule::IoHandleType::get(builder.getContext()), bdHandle,
-                                                     coreTile, builder.getI32IntegerAttr(params.channel),
-                                                     builder.getStringAttr(params.direction),
-                                                     builder.getStringAttr(params.ioOperation));
-    }
-
-    // 6. Build list of core tiles and their configs for merged kernel group
-    SmallVector<Value> allCoreTiles;
-    SmallVector<Attribute> allTileConfigs;
-    SmallVector<Attribute> allComputeKernelArgs;
-    
-    int tileIdx = 0;
-    for (auto &[key, tileInfo] : info.coreTiles) {
-        if (coreTileMap.find(key) == coreTileMap.end()) continue;
-        Value coreTile = coreTileMap[key];
-        allCoreTiles.push_back(coreTile);
-        
-        // Create config dictionary for this tile
-        if (!tileInfo.configDicts.empty()) {
-            // Use existing config (should already have all fields including lock IDs)
-            allTileConfigs.push_back(tileInfo.configDicts[0]);
-        } else {
-            // Create default config (for backward compatibility)
-            NamedAttrList configAttrs;
-            configAttrs.append("tile_index", builder.getI32IntegerAttr(tileIdx));
-            configAttrs.append("packet_id", builder.getI32IntegerAttr(tileIdx));
-            configAttrs.append("dma_channel", builder.getI32IntegerAttr(0)); // default channel
-            configAttrs.append("buffer_mode", builder.getI32IntegerAttr(1)); // 1 = ping-pong
-            configAttrs.append("num_buffers", builder.getI32IntegerAttr(2)); // 2 buffers
-            configAttrs.append("buffer_size", builder.getI32IntegerAttr(256)); // default 256 bytes
-            // Add default lock IDs
-            configAttrs.append("ping_acquire_lock_id", builder.getI32IntegerAttr(tileIdx * 4 + 0));
-            configAttrs.append("pong_acquire_lock_id", builder.getI32IntegerAttr(tileIdx * 4 + 1));
-            configAttrs.append("ping_release_lock_id", builder.getI32IntegerAttr(tileIdx * 4 + 2));
-            configAttrs.append("pong_release_lock_id", builder.getI32IntegerAttr(tileIdx * 4 + 3));
-            allTileConfigs.push_back(builder.getDictionaryAttr(configAttrs));
-        }
-        
-        // Use the first compute kernel arg for this tile (or default)
-        if (!tileInfo.computeKernelArgs.empty()) {
-            allComputeKernelArgs.push_back(tileInfo.computeKernelArgs[0]);
-        } else {
-            allComputeKernelArgs.push_back(SymbolRefAttr::get(builder.getContext(), "compute0"));
-        }
-        
-        tileIdx++;
-    }
-    
-    // 7. Create SINGLE merged load_kernel_group (if core tiles exist)
-    Value launchEvent;
-    if (!allCoreTiles.empty()) {
-        SmallVector<Attribute> calleeAttrs;
-        calleeAttrs.push_back(SymbolRefAttr::get(builder.getContext(), info.kernelName));
-        
-        // Create individual kernel_config ops for each tile (e.g., @kernelconfig_merged0, @kernelconfig_merged1)
-        SmallVector<Attribute> kernelConfigSymbols;
-        for (size_t i = 0; i < allTileConfigs.size(); ++i) {
-            std::string configName = "kernelconfig_merged" + std::to_string(i);
-            
-            // Create a kernel_config op with a single tile's config
-            SmallVector<Attribute> singleTileConfig;
-            singleTileConfig.push_back(allTileConfigs[i]);
-            
-            auto kernelConfigOp = builder.create<dfschedule::DeclareKernelConfigOp>(
-                loc,
-                dfschedule::KernelConfigType::get(builder.getContext()),
-                builder.getStringAttr(configName),
-                builder.getArrayAttr(singleTileConfig));
-            
-            // Store symbol reference
-            kernelConfigSymbols.push_back(SymbolRefAttr::get(builder.getContext(), configName));
-        }
-        
-        auto loadKernelGroupOp = builder.create<dfschedule::LoadKernelGroupOp>(
-            loc,
-            dfschedule::KernelGroupType::get(builder.getContext()),
-            allCoreTiles,
-            builder.getArrayAttr(calleeAttrs),
-            builder.getArrayAttr(allComputeKernelArgs),
-            nullptr,  // kernel_config = nullptr (not used)
-            builder.getArrayAttr(kernelConfigSymbols));  // distributed_args = [@kernelconfig_merged0, @kernelconfig_merged1, ...]
-        
-        // 8. Create SINGLE launch_kernel_group
-        auto launchKernelGroupOp = builder.create<dfschedule::LaunchKernelGroupOp>(
-            loc,
-            dfschedule::EventType::get(builder.getContext()),
-            loadKernelGroupOp.getKernelGroup());
-        
-        launchEvent = launchKernelGroupOp.getEvent();
-    }
-    
-    // 9. Create getBdId and start_io for each shim tile
-    SmallVector<Value> allEvents;
-    if (launchEvent) {
-        allEvents.push_back(launchEvent);
-    }
-    
-    for (auto &[key, ioHandles] : shimIoHandles) {
-        if (shimTileMap.find(key) == shimTileMap.end()) continue;
-        Value shimTile = shimTileMap[key];
-        
-        // Create getBdId
-        auto getBdIdOp = builder.create<dfschedule::GetBdIdOp>(
-            loc,
-            builder.getI32Type(),
-            shimTile);
-        
-            // Create start_io for each IO handle
-        for (Value ioHandle : ioHandles) {
-            auto startIoOp = builder.create<dfschedule::StartIoOp>(
-                loc,
-                dfschedule::EventType::get(builder.getContext()),
-                ioHandle,
-                getBdIdOp.getBdId(),
-                builder.getI32IntegerAttr(0)
-            );
-            allEvents.push_back(startIoOp.getEvent());
-        }
-    }
-    
-    // 10. Create SINGLE merged schedule.wait with ALL events
-    if (!allEvents.empty()) {
-        builder.create<dfschedule::ScheduleWaitOp>(loc, allEvents);
-    }
-    
-    // ==========================================================
-    // PART 2: Add a call to host_canonicalized inside func.func @main()
-    // ==========================================================
-    Block &mainBlock = funcOp.getBody().front();
-    Operation *terminator = mainBlock.getTerminator();
-    if (terminator) {
-        builder.setInsertionPoint(terminator);
-    } else {
-        builder.setInsertionPointToEnd(&mainBlock);
-    }
-    
-    // Use dfschedule.launchhost to invoke the host schedule block
-    auto hostSymbol = SymbolRefAttr::get(builder.getContext(), "host_canonicalized");
-    builder.create<dfschedule::LaunchHostOp>(loc, hostSymbol);
-}
-
-// Remove old distributed schedule operations
-static void removeOldScheduleOps(ModuleScheduleInfo &info) {
-    // Mark operations for removal (in reverse order to handle dependencies)
-    SmallVector<Operation*> opsToRemove;
-    
-    // Remove wait ops first
-    for (auto &opWithParent : info.scheduleWaitOps) {
-        opsToRemove.push_back(opWithParent.op);
-    }
-    
-    // Remove start_io ops
-    for (auto &opWithParent : info.startIoOps) {
-        opsToRemove.push_back(opWithParent.op);
-    }
-    
-    // Remove getBdId ops
-    for (auto &opWithParent : info.getBdIdOps) {
-        opsToRemove.push_back(opWithParent.op);
-    }
-    
-    // Remove launch ops
-    for (auto &opWithParent : info.launchKernelGroupOps) {
-        opsToRemove.push_back(opWithParent.op);
-    }
-    
-    // Remove load_kernel_group ops
-    for (auto &opWithParent : info.loadKernelGroupOps) {
-        opsToRemove.push_back(opWithParent.op);
-    }
-    
-    // Remove packet ops
-    for (auto &opWithParent : info.packetOps) {
-        opsToRemove.push_back(opWithParent.op);
-    }
-
-    auto isInHostBlock = [](const OpWithParent &owp) -> bool {
-        if (owp.parent && owp.parent->getName().getStringRef() == "dfschedule.host")
-            return true;
-        return false;
-    };
-
-    // Remove createIo ops (but NOT those inside dskernel_receiver or dfschedule.host)
-    for (auto &opWithParent : info.configCreateIoOps) {
-        if (!opWithParent.isInDSKernelReceiver && !isInHostBlock(opWithParent)) {
-            opsToRemove.push_back(opWithParent.op);
+            if (onlyInitUsers)
+                deadAllocs.push_back(allocOp.getOperation());
+        });
+        for (Operation *allocOp : llvm::reverse(deadAllocs)) {
+            // Erase users (copy + dealloc) first, then the alloc itself.
+            for (Operation *user : llvm::make_early_inc_range(cast<memref::AllocOp>(allocOp).getResult().getUsers()))
+                user->erase();
+            allocOp->erase();
         }
     }
 
-    // Remove dmaBd ops (but NOT those inside dskernel_receiver or dfschedule.host)
-    for (auto &opWithParent : info.configDmaBdOps) {
-        if (!opWithParent.isInDSKernelReceiver && !isInHostBlock(opWithParent)) {
-            opsToRemove.push_back(opWithParent.op);
-        }
-    }
-    
-    // Remove declareTile ops
-    for (auto &opWithParent : info.declareTileOps) {
-        opsToRemove.push_back(opWithParent.op);
-    }
-    
-    // Remove declareTensor ops
-    for (auto &opWithParent : info.declareTensorOps) {
-        opsToRemove.push_back(opWithParent.op);
-    }
-    
-    // Erase dfschedule operations (safe, no nested structure issues)
-    for (auto *op : opsToRemove) {
-        if (op->use_empty()) {
-            op->erase();
-        }
-    }
-}
-
-// Remove scf.execute_region blocks, tensor.empty, declare_data, and constants from func.func main
-// This is done separately to avoid memory corruption from nested op pointer invalidation
-static void removeExecuteRegionsFromMain(func::FuncOp mainFunc) {
-    if (!mainFunc) return;
-    
-    // Collect ops to erase (fresh collection, not using old pointers)
-    SmallVector<Operation*> regionsToErase;
-    SmallVector<Operation*> declareDataOps;
-    SmallVector<Operation*> constantOps;
-    SmallVector<Operation*> emptyOps;
-    
+    // Erase any remaining top-level dead arith.constants in @main.
+    // Also erase dead bufferization.to_memref ops (and their arith.constant sources)
+    // left over after preMapExternalValues substituted them with host-local allocs.
+    SmallVector<Operation *> dead;
     mainFunc.walk([&](Operation *op) {
-        if (isa<scf::ExecuteRegionOp>(op)) {
-            regionsToErase.push_back(op);
-        } else if (op->getParentOp() == mainFunc.getOperation()) {
-            // Only collect ops that are direct children of main's block
-            if (isa<tensor::EmptyOp>(op)) {
-                emptyOps.push_back(op);
-            } else if (isa<arith::ConstantOp>(op)) {
-                constantOps.push_back(op);
-            } else if (op->getName().getStringRef() == "dfscheblueprint.declare_data") {
-                declareDataOps.push_back(op);
-            }
-        }
+        if (op->getParentOp() != mainFunc.getOperation())
+            return;
+        if (!op->use_empty())
+            return;
+        if (isa<arith::ConstantOp>(op) || isa<bufferization::ToMemrefOp>(op))
+            dead.push_back(op);
     });
-    
-    // Erase scf.execute_region ops first (this also erases all nested ops)
-    for (auto *op : regionsToErase) {
-        if (op->use_empty()) {
+    for (auto *op : llvm::reverse(dead))
+        if (op->use_empty())
             op->erase();
-        }
-    }
-    
-    // Erase in dependency order:
-    // 1. tensor.empty (no dependencies)
-    for (auto *op : emptyOps) {
-        if (op->use_empty()) {
+    // Second pass: catch arith.constant whose only user was the now-erased to_memref.
+    dead.clear();
+    mainFunc.walk([&](arith::ConstantOp cOp) {
+        if (cOp->getParentOp() == mainFunc.getOperation() && cOp.use_empty())
+            dead.push_back(cOp.getOperation());
+    });
+    for (auto *op : llvm::reverse(dead))
+        if (op->use_empty())
             op->erase();
-        }
-    }
-    
-    // 2. declare_data (uses constants)
-    for (auto *op : declareDataOps) {
-        if (op->use_empty()) {
-            op->erase();
-        }
-    }
-    
-    // 3. constants (used by declare_data, so remove after declare_data)
-    for (auto *op : constantOps) {
-        if (op->use_empty()) {
-            op->erase();
-        }
-    }
 }
 
 } // namespace
+
+//===----------------------------------------------------------------------===//
+// Pass entry point
+//===----------------------------------------------------------------------===//
 
 namespace mlir {
 
 void ScheduleCanonicalizePass::runOnOperation() {
     ModuleOp moduleOp = getOperation();
-    
-    ModuleScheduleInfo info;
-    
-    // Step 1: Collect all dfschedule operations
-    collectScheduleOps(moduleOp, info);
-    
-    // Debug: Print parent information
-    printParentInfo(info);
-    
-    // Early exit if no schedule ops found
-    if (info.declareTileOps.empty() && info.loadKernelGroupOps.empty()) {
-        return;
-    }
-    
-    // Step 2: Associate packets with tiles
-    associatePacketsWithTiles(info);
-    
-    // Step 3: Find the main function to insert canonicalized host block
-    func::FuncOp mainFunc = nullptr;
-    moduleOp.walk([&](func::FuncOp funcOp) {
-        if (funcOp.getName() == "main") {
-            mainFunc = funcOp;
-        }
+    MLIRContext *ctx = moduleOp.getContext();
+
+    // ── Find func.func @main or @host_canonicalized ────────────────────────
+    func::FuncOp mainFunc;
+    moduleOp.walk([&](func::FuncOp f) {
+        if (f.getName() == "main" || f.getName() == "host_canonicalized")
+            mainFunc = f;
     });
-    
-    if (!mainFunc) {
-        // No main function, skip
+    if (!mainFunc)
         return;
-    }
-    
-    // Step 5: Create canonicalized schedule inside func.func @main()
-    // Operations are placed in an scf.execute_region block to group them
-    OpBuilder builder(moduleOp.getContext());
-    Location loc = mainFunc.getLoc();
-    
-    createCanonicalizedSchedule(builder, loc, info, moduleOp, mainFunc);
-    
-    // Step 5.5: Re-collect DMA BD operations after canonicalization to get correct parent info
-    // Clear the old collection and re-collect from the canonicalized IR
-    info.configDmaBdOps.clear();
-    info.configCreateIoOps.clear();
-    moduleOp.walk([&](Operation *op) {
-        Operation *parentOp = getParentOp(op);
-        if (auto configDmaBd = dyn_cast<dfschedule::ConfigDmaBdOp>(op)) {
-            info.configDmaBdOps.push_back(OpWithParent(op, parentOp));
-        } else if (auto createIo = dyn_cast<dfschedule::ConfigCreateIoOp>(op)) {
-            info.configCreateIoOps.push_back(OpWithParent(op, parentOp));
-        }
+
+    // Early exit: already canonical if no routing.RoutingCreate ops present.
+    bool hasRoutingCreate = false;
+    mainFunc.walk([&](Operation *op) {
+        if (op->getName().getStringRef() == "routing.RoutingCreate")
+            hasRoutingCreate = true;
     });
-    
-    // Step 5.6: Associate DMA configs with shim tiles (after canonicalization)
-    associateDmaWithShimTiles(info);
-    
-    // Step 6: Remove old distributed dfschedule operations
-    removeOldScheduleOps(info);
-    
-    // Step 7: Remove scf.execute_region blocks (contains extract_slice, routing ops)
-    // and tensor.empty from func.func main
-    removeExecuteRegionsFromMain(mainFunc);
+    if (!hasRoutingCreate)
+        return;
+
+    // ── Phase 1: Run dedup patterns inside RoutingCreate blocks ─────────────
+    // These handle intra-block duplicates; cross-iteration dedup happens in
+    // Phase 2b after all RoutingCreate bodies are inlined into dfschedule.host.
+    {
+        RewritePatternSet patterns(ctx);
+        patterns.add<FoldDuplicateDeclareTilePattern>(ctx);
+        patterns.add<FoldDuplicateShimBdPattern>(ctx);
+        GreedyRewriteConfig cfg;
+        cfg.maxIterations = 32;
+        if (failed(applyPatternsAndFoldGreedily(mainFunc, std::move(patterns), cfg)))
+            return signalPassFailure();
+    }
+
+    // ── Phase 2: Clone + inline RoutingCreate blocks, build dfschedule.host ─
+    buildHostBlockByCloning(mainFunc, moduleOp);
+
+    // ── Phase 3: Erase old execute_region ops and dead constants ────────────
+    eraseOldOps(mainFunc);
 }
 
 } // namespace mlir
-
-

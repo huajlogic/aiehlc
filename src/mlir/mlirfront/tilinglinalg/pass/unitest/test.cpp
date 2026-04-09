@@ -27,7 +27,11 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IRPrinter/IRPrintingPasses.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/Parser/Parser.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -40,8 +44,74 @@
 
 #include "routingdeadargclean.h"
 
-#include "routingconstantfold.h"
+#include "../kernelconfig/kernelconfig.h"
+#include "../tilinglinalg_pipeline.h"
+#include "hw/ResourceManager.h"
 #include "mlir/Transforms/Passes.h"
+#include "routingconstantfold.h"
+
+// ---------------------------------------------------------------------------
+// IR dump helpers
+// ---------------------------------------------------------------------------
+
+static std::string setupIRDir(const std::string &subdir,
+                              bool useCurrentDir = false) {
+    llvm::SmallString<256> cwdPath;
+    if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
+        llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
+        return "";
+    }
+    std::string prefix = useCurrentDir ? "/ir/" : "/../ir/";
+    std::string dir = (cwdPath + prefix + subdir).str();
+    if (std::error_code EC = llvm::sys::fs::create_directories(dir)) {
+        llvm::errs() << "Failed to create IR directory " << dir << ": " << EC.message() << "\n";
+        return "";
+    }
+    std::cout << "IR output directory: " << dir << std::endl;
+    return dir;
+}
+
+static std::string setupWorklocalDir(bool useCurrentDir = false) {
+    llvm::SmallString<256> cwdPath;
+    if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
+        llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
+        return "";
+    }
+    std::string suffix = useCurrentDir ? "/worklocal" : "/../worklocal";
+    std::string dir = (cwdPath + suffix).str();
+    if (std::error_code EC = llvm::sys::fs::create_directories(dir)) {
+        llvm::errs() << "Failed to create directory " << dir << ": " << EC.message() << "\n";
+        return "";
+    }
+    return dir;
+}
+
+static void dumpIRToFile(mlir::ModuleOp module, const std::string &dir, int stage, const std::string &passName) {
+    if (dir.empty())
+        return;
+    std::string filename = dir + "/" + std::to_string(stage) + "_" + passName + ".mlir";
+    std::error_code ec;
+    llvm::raw_fd_ostream os(filename, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+        llvm::errs() << "Failed to write IR to " << filename << ": " << ec.message() << "\n";
+        return;
+    }
+    module.print(os);
+    std::cout << "  IR -> " << filename << std::endl;
+}
+
+static bool runSinglePass(MLIRContext &ctx, mlir::ModuleOp module, std::unique_ptr<mlir::Pass> pass,
+                          const std::string &irDir, int &stage, const std::string &passName) {
+    mlir::PassManager singlePm(&ctx);
+    singlePm.addPass(std::move(pass));
+    if (failed(singlePm.run(module))) {
+        llvm::errs() << "ERROR: " << passName << " failed!\n";
+        return false;
+    }
+    dumpIRToFile(module, irDir, stage, passName);
+    stage++;
+    return true;
+}
 
 // Unit test function to verify path contiguity for RoutingLowerPass
 void testRoutingLowerPassPathContiguity() {
@@ -655,90 +725,199 @@ void testRoutingLowerPassPathContiguity() {
     std::cout << "\n=== Test Complete ===" << std::endl;
 }
 
-void routingtoroutinghw(mlir::ModuleOp module1 = nullptr) {
+// ---------------------------------------------------------------------------
+// IR dialect validation
+// ---------------------------------------------------------------------------
+
+// Pipeline stage order (earliest to latest):
+//   routing -> dmap -> dmaphop -> dfscheblueprint -> dfschedule
+//   routing -> routinghw  (alternative path)
+//
+// If the user says "--parse routing <file>", the file must contain routing
+// dialect ops and must NOT contain ops from a later stage.
+
+// Detect whether a post-branch module is host or kernel IR.
+// Returns "host", "kernel", or "unknown".
+static std::string detectHostOrKernel(mlir::ModuleOp module) {
+    bool isHost = false, isKernel = false;
+    module.walk([&](Operation *op) {
+        auto name = op->getName().getStringRef();
+        // dfschedule host-path ops
+        if (name == "dfschedule.declaretile" ||
+            name == "dfschedule.config.dma_bd")
+            isHost = true;
+        // dfschedule kernel-path ops
+        if (name == "dfschedule.kernel_config_def")
+            isKernel = true;
+        // emitc-level detection
+        if (name == "emitc.call_opaque") {
+            if (auto callee = op->getAttrOfType<StringAttr>("callee")) {
+                if (callee.getValue().starts_with("__Runtime_"))
+                    isHost = true;
+            }
+        }
+        if (name == "emitc.verbatim") {
+            if (auto valAttr = op->getAttrOfType<StringAttr>("value")) {
+                auto text = valAttr.getValue();
+                if (text.contains("aie_api/aie.hpp"))
+                    isKernel = true;
+                if (text.contains("__Runtime_"))
+                    isHost = true;
+            }
+        }
+    });
+    if (isHost && !isKernel) return "host";
+    if (isKernel && !isHost) return "kernel";
+    return "unknown";
+}
+
+// Auto-detect the pipeline stage from the dialects present in the module.
+// Returns the stage name (routing, dmap, dmaphop, dfscheblueprint, dfschedule, emitc)
+// or "" if unrecognizable.
+static std::string autoDetectStage(mlir::ModuleOp module) {
+    std::set<std::string> foundDialects;
+    bool hasEmitC = false;
+    module.walk([&](Operation *op) {
+        if (auto *dialect = op->getDialect()) {
+            std::string ns = dialect->getNamespace().str();
+            if (ns == "routing" || ns == "routinghw" || ns == "dmap" ||
+                ns == "dmaphop" || ns == "dfscheblueprint" ||
+                ns == "dfschedule") {
+                foundDialects.insert(ns);
+            }
+            if (ns == "emitc")
+                hasEmitC = true;
+        }
+    });
+
+    // Detect based on the "latest" dialect present (pipeline order)
+    if (foundDialects.count("dfschedule"))     return "dfschedule";
+    if (foundDialects.count("dfscheblueprint")) return "dfscheblueprint";
+    if (foundDialects.count("dmaphop"))         return "dmaphop";
+    if (foundDialects.count("routinghw"))       return "routinghw";
+    if (foundDialects.count("dmap"))            return "dmap";
+    if (foundDialects.count("routing")) {
+        // Check if still stage 0 (has scf.for) or stage 1 (unrolled)
+        bool hasScfFor = false;
+        module.walk([&](Operation *op) {
+            if (op->getName().getStringRef() == "scf.for")
+                hasScfFor = true;
+        });
+        return "routing"; // stage 0 or 1 — both map to "routing" for entry
+    }
+    if (hasEmitC && foundDialects.empty())      return "emitc";
+    return "";
+}
+
+static bool validateIRDialect(mlir::ModuleOp module,
+                              const std::string &expectedMode,
+                              const std::string &filepath,
+                              std::string &detectedMode) {
+    detectedMode = autoDetectStage(module);
+
+    if (detectedMode.empty()) {
+        llvm::errs() << "ERROR: Could not detect any known pipeline dialect in IR.\n"
+                     << "  File: " << filepath << "\n";
+        return false;
+    }
+
+    // If expected mode matches detected mode, we're good
+    if (expectedMode == detectedMode) {
+        // Extra check for routing stage 0: scf.for must still be present
+        if (expectedMode == "routing") {
+            bool hasScfFor = false;
+            module.walk([&](Operation *op) {
+                if (op->getName().getStringRef() == "scf.for")
+                    hasScfFor = true;
+            });
+            if (!hasScfFor) {
+                // Stage 1 (post-unrolling) — still has routing but no scf.for
+                // Treat as "dmap" entry point (startStage=1)
+                std::cout << "Note: IR has routing dialect but scf.for already unrolled (stage 1).\n"
+                          << "  Adjusting to startStage=1." << std::endl;
+                detectedMode = "routing_unrolled";
+            }
+        }
+        std::cout << "IR validation passed: file contains " << detectedMode
+                  << " dialect ops." << std::endl;
+        return true;
+    }
+
+    // Mismatch: auto-correct with a warning
+    std::cout << "WARNING: --parse " << expectedMode
+              << " specified, but IR contains " << detectedMode
+              << " dialect.\n"
+              << "  File: " << filepath << "\n"
+              << "  Auto-correcting to --parse " << detectedMode << ".\n";
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// IR file parser helper
+// ---------------------------------------------------------------------------
+
+static mlir::OwningOpRef<mlir::ModuleOp> loadModuleFromFile(
+    MLIRContext &ctx, const std::string &filepath) {
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileOrErr =
+        llvm::MemoryBuffer::getFileOrSTDIN(filepath);
+    if (std::error_code ec = fileOrErr.getError()) {
+        llvm::errs() << "Could not open file: " << filepath << ": "
+                     << ec.message() << "\n";
+        return nullptr;
+    }
+    llvm::SourceMgr sourceMgr;
+    sourceMgr.AddNewSourceBuffer(std::move(*fileOrErr), llvm::SMLoc());
+
+    // Print diagnostics directly to stderr so they're always visible
+    mlir::SourceMgrDiagnosticHandler diagHandler(sourceMgr, &ctx, llvm::errs());
+
+    auto result = mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, &ctx);
+    if (!result) {
+        llvm::errs() << "Failed to parse: " << filepath << "\n";
+    }
+    return result;
+}
+
+void routingtoroutinghw(mlir::ModuleOp module1 = nullptr,
+                        bool useCurrentDir = false) {
     MLIRContext ctx;
-    
+
     routingmanager mtest;
     routinghwmanager mtesthw;
     mtesthw.loaddialect(&ctx);
     mtest.loaddialect(&ctx);
 
     ctx.getOrLoadDialect<arith::ArithDialect>();
-    
-    //auto module1 = mtest.createroutingfunc(&ctx,1);
+
     if (!module1) {
         module1 = mtest.ops_testNew(&ctx, 1, "routing");
     }
-    module1.dump();
-    //auto module2 = mtesthw.ops_test(&ctx);
-    std::cout << "main" <<std::endl;
-    
-    mlir::PrintIRPassOptions options;
 
-    mlir::PassManager pm(&ctx);;
+    std::string irDir = setupIRDir("simplerouting", useCurrentDir);
     RoutingTopology rtopology("Gen2");
-    
-    options.label = "Before RoutingUnrollingLowerPass:";
-    // pm.addPass(mlir::createPrintIRPass(options));
-    pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
-    options.label = "After RoutingUnrollingLowerPass:";
-    // pm.addPass(mlir::createPrintIRPass(options));
-    pm.addPass(std::make_unique<RoutingLowerPass>(rtopology));
-    options.label = "After RoutingLowerPass:";
-    // pm.addPass(mlir::createPrintIRPass(options));
-    pm.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
-    options.label = "After RoutingHWLowerPass:";
-    // pm.addPass(mlir::createPrintIRPass(options));
-    // remove dead arg
-    pm.addPass(std::make_unique<RoutingDeadArgPass>());
-    options.label = "After RoutingDeadArgPass:";
-    // pm.addPass(mlir::createPrintIRPass(options));
-    // The constanfold change emitc.call into emic.call_opaque to convert
-    /*
-    XAie_LocType v251 = XAie_TileLoc(v1, v10);
-    XAie_DevInst* v252 = getOrCreateDeviceInstance();
-    int32_t v253 = XAie_StrmConnCctEnable(v252, v251, v6, v13, v5, v12);
-    */
-    // into
-    /*
-    int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0);
-    */
-    pm.addPass(std::make_unique<RoutingConstantFoldPass>());
+    int stage = 0;
 
-    options.label = "After RoutingConstantFoldPass:";
-    // pm.addPass(mlir::createPrintIRPass(options));
-    // remove the dead code
-    pm.addPass(mlir::createCanonicalizerPass());
+    dumpIRToFile(module1, irDir, stage++, "initial");
 
-    options.label = "After createCanonicalizerPasse:";
-    // pm.addPass(mlir::createPrintIRPass(options));
-
-    //remove dead arg
-    //pm.addPass(mlir::createConvertSCFToEmitCPass());
-    (void)pm.run(module1);
-
-    llvm::outs() << "----------module1.dump---------\n";
-    module1.dump();
-/*
-    mlir::PassManager pm2(&ctx);;
-    pm2.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
-    (void)pm2.run(module1);
-    module1.dump();
-  */
-    // conver emitc into c code
-    //  Get the current working directory and build worklocalDir as an absolute path
-    llvm::SmallString<256> cwdPath;
-    if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
-        llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingUnrollingLowerPass>(), irDir, stage,
+                       "RoutingUnrollingLowerPass"))
         return;
-    }
-    const std::string worklocalDir = (cwdPath + "/../worklocal").str();
-    if (std::error_code EC = llvm::sys::fs::create_directories(worklocalDir)) {
-        llvm::errs() << "Failed to create directory " << worklocalDir << ": " << EC.message() << "\n";
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingLowerPass>(rtopology), irDir, stage, "RoutingLowerPass"))
         return;
-    }
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingHWLowerPass>(rtopology), irDir, stage,
+                       "RoutingHWLowerPass"))
+        return;
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingDeadArgPass>(), irDir, stage, "RoutingDeadArgPass"))
+        return;
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
+                       "RoutingConstantFoldPass"))
+        return;
+    if (!runSinglePass(ctx, module1, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
+        return;
 
-    // Convert routing module to C++ and write to routing.cc
+    const std::string worklocalDir = setupWorklocalDir(useCurrentDir);
+    if (worklocalDir.empty()) return;
+
     std::string routingPath = worklocalDir + "/routing_hw.cc";
     std::error_code routingEC;
     llvm::raw_fd_ostream routingStream(routingPath, routingEC, llvm::sys::fs::OF_None);
@@ -746,7 +925,6 @@ void routingtoroutinghw(mlir::ModuleOp module1 = nullptr) {
         llvm::errs() << "Failed to open " << routingPath << ": " << routingEC.message() << "\n";
         return;
     }
-    std::cout << "\n=== Generated C++ Code (routing) ===" << std::endl;
     mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, routingStream);
     routingStream.close();
     if (failed(result)) {
@@ -754,11 +932,12 @@ void routingtoroutinghw(mlir::ModuleOp module1 = nullptr) {
         return;
     }
     std::cout << "Routing code written to " << routingPath << std::endl;
-    return;
 }
-void routingtodmap() {
-     MLIRContext ctx;
-    
+void routingtodmap(const std::string &irFilepath = "",
+                   bool useCurrentDir = false,
+                   int startStage = 0) {
+    MLIRContext ctx;
+
     routingmanager mtest;
     routinghwmanager mtesthw;
     dmapmanager mdmaptest;
@@ -769,71 +948,66 @@ void routingtodmap() {
     dmaphoptest.loaddialect(&ctx);
 
     ctx.getOrLoadDialect<arith::ArithDialect>();
-    
-    //auto module1 = mtest.createroutingfunc(&ctx,1);
-    auto module1 = mtest.ops_testNew(&ctx, 1, "routing");
-    module1.dump();
-    //auto module2 = mtesthw.ops_test(&ctx);
-    std::cout << "main" <<std::endl;
-    
-    mlir::PrintIRPassOptions options;
+    ctx.getOrLoadDialect<mlir::func::FuncDialect>();
+    ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
+    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
+    ctx.getOrLoadDialect<mlir::tensor::TensorDialect>();
+    ctx.getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
+    ctx.getOrLoadDialect<mlir::emitc::EmitCDialect>();
+    ctx.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
 
-    mlir::PassManager pm(&ctx);;
+    // Create module: either parse from file or build programmatically
+    mlir::OwningOpRef<mlir::ModuleOp> parsedModule;
+    mlir::ModuleOp module1;
+    if (!irFilepath.empty()) {
+        parsedModule = loadModuleFromFile(ctx, irFilepath);
+        if (!parsedModule) return;
+        module1 = *parsedModule;
+        std::cout << "Parsed module from " << irFilepath << std::endl;
+    } else {
+        module1 = mtest.ops_testNew(&ctx, 1, "routing");
+    }
+
+    std::string irDir = setupIRDir("dmap", useCurrentDir);
     RoutingTopology rtopology("Gen2");
-    
-    options.label = "Before RoutingUnrollingLowerPass:";
-    //pm.addPass(mlir::createPrintIRPass(options));
-    pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
-    options.label = "After RoutingToDmapPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    pm.addPass(std::make_unique<RoutingToDmapPass>(rtopology));
-    options.label = "After DmapToDmaphopPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    pm.addPass(std::make_unique<DmapToDmaphopPass>(rtopology));
-    options.label = "After DmaphopToRoutinghwPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    pm.addPass(std::make_unique<DmaphopToRoutinghwPass>(rtopology));
+    int stage = startStage;
 
-    pm.addPass(mlir::createPrintIRPass(options));
-    pm.addPass(std::make_unique<RoutingHWLowerPass>(rtopology));
-    options.label = "After RoutingHWLowerPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    //remove dead arg
-    pm.addPass(std::make_unique<RoutingDeadArgPass>());
-    
-    //into
-    /*
-    int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0); 
-    */
-    pm.addPass(std::make_unique<RoutingConstantFoldPass>());
+    dumpIRToFile(module1, irDir, stage++, "initial");
 
-    options.label = "After RoutingConstantFoldPass:";
-    //pm.addPass(mlir::createPrintIRPass(options));
-    //remove the dead code
-    pm.addPass(mlir::createCanonicalizerPass());
-
-    options.label = "After createCanonicalizerPasse:";
-    //pm.addPass(mlir::createPrintIRPass(options));
-
-    //remove dead arg
-    //pm.addPass(mlir::createConvertSCFToEmitCPass());
-    (void)pm.run(module1);
-
-    llvm::outs() << "----------module1.dump---------\n";
-
-    // Resolve worklocal directory relative to the build directory
-    llvm::SmallString<256> cwdPath;
-    if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
-        llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
-        return;
+    // Stages 0-2 are shared with dfschedule; stage 3+ diverges
+    if (startStage <= 0) {
+        if (!runSinglePass(ctx, module1, std::make_unique<RoutingUnrollingLowerPass>(), irDir, stage,
+                           "RoutingUnrollingLowerPass"))
+            return;
     }
-    const std::string worklocalDir = (cwdPath + "/../worklocal").str();
-    if (std::error_code EC = llvm::sys::fs::create_directories(worklocalDir)) {
-        llvm::errs() << "Failed to create directory " << worklocalDir << ": " << EC.message() << "\n";
-        return;
+    if (startStage <= 1) {
+        if (!runSinglePass(ctx, module1, std::make_unique<RoutingToDmapPass>(rtopology), irDir, stage,
+                           "RoutingToDmapPass"))
+            return;
     }
+    if (startStage <= 2) {
+        if (!runSinglePass(ctx, module1, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage,
+                           "DmapToDmaphopPass"))
+            return;
+    }
+    // Stage 3+: routing.cc-specific path (diverges from dfschedule here)
+    if (!runSinglePass(ctx, module1, std::make_unique<DmaphopToRoutinghwPass>(rtopology), irDir, stage,
+                       "DmaphopToRoutinghwPass"))
+        return;
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingHWLowerPass>(rtopology), irDir, stage,
+                       "RoutingHWLowerPass"))
+        return;
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingDeadArgPass>(), irDir, stage, "RoutingDeadArgPass"))
+        return;
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
+                       "RoutingConstantFoldPass"))
+        return;
+    if (!runSinglePass(ctx, module1, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
+        return;
 
-    // Convert routing module to C++ and write to routing.cc
+    const std::string worklocalDir = setupWorklocalDir(useCurrentDir);
+    if (worklocalDir.empty()) return;
+
     std::string routingPath = worklocalDir + "/routing.cc";
     std::error_code routingEC;
     llvm::raw_fd_ostream routingStream(routingPath, routingEC, llvm::sys::fs::OF_None);
@@ -841,7 +1015,6 @@ void routingtodmap() {
         llvm::errs() << "Failed to open " << routingPath << ": " << routingEC.message() << "\n";
         return;
     }
-    std::cout << "\n=== Generated C++ Code (routing) ===" << std::endl;
     mlir::LogicalResult result = mlir::emitc::translateToCpp(module1, routingStream);
     routingStream.close();
     if (failed(result)) {
@@ -849,180 +1022,505 @@ void routingtodmap() {
         return;
     }
     std::cout << "Routing code written to " << routingPath << std::endl;
-    return;
 }
 
-void routingtodfschedule() {
+void routingtodfschedule(const std::string &irFilepath = "",
+                         bool useCurrentDir = false,
+                         int startStage = 0) {
     MLIRContext ctx;
-    
+    TilingLinalgPipeline::registerDialects(ctx);
+
+    // Default tensor config for GEMM: 2 inputs + 1 output
+    std::vector<TensorParam> tensors = {
+        {{16, 16}, 8, true},  // input A (window_in_0)
+        {{16, 16}, 8, true},  // input B (window_in_1)
+        {{16, 16}, 8, false}, // output C (window_out_0)
+    };
+
+    // Create module: either parse from file or build programmatically
+    mlir::OwningOpRef<mlir::ModuleOp> parsedModule;
+    mlir::ModuleOp module;
+    if (!irFilepath.empty()) {
+        parsedModule = loadModuleFromFile(ctx, irFilepath);
+        if (!parsedModule) return;
+        module = *parsedModule;
+        std::cout << "Parsed module from " << irFilepath << std::endl;
+    } else {
+        module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors);
+    }
+
+    // When startStage==0 and using the default pipeline, delegate to
+    // TilingLinalgPipeline::runPipeline which handles the full flow.
+    if (startStage == 0) {
+        std::string outputDir = setupWorklocalDir(useCurrentDir);
+        if (outputDir.empty()) return;
+
+        if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir,
+                                               /*userKernelBody=*/"", /*userKernelFuncName=*/"",
+                                               /*runtimeDebugLevel=*/-1, /*userRewrittenSource=*/"", tensors)) {
+            llvm::errs() << "TilingLinalgPipeline::runPipeline failed!\n";
+        }
+        return;
+    }
+
+    // Stage-aware pipeline for --parse mode (startStage > 0)
     RoutingTopology rtopology("Gen2");
-    
-    routingmanager mtest;
-    dfschedulemanager dfscheduletest;
-    dfscheblueprintmanager dfscheblueprinttest;
-    
-    mtest.loaddialect(&ctx);
-    dfscheduletest.loaddialect(&ctx);
-    dfscheblueprinttest.loaddialect(&ctx);
-    ctx.getOrLoadDialect<arith::ArithDialect>();
-    ctx.getOrLoadDialect<mlir::func::FuncDialect>();
-    ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
-    ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
-    ctx.getOrLoadDialect<mlir::tensor::TensorDialect>();
-    ctx.getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
-    ctx.getOrLoadDialect<mlir::emitc::EmitCDialect>();
-    
-    // Create test routing module
-    auto module1 = mtest.ops_testNew(&ctx, 1);
-    
-    std::cout << "=== Initial Routing Module ===" << std::endl;
-    module1.dump();
-    
-    // Create pass manager
-    mlir::PassManager pm(&ctx);
-    mlir::PrintIRPassOptions options;
-    
-    // Stage 1: Unroll routing operations
-    options.label = "After RoutingUnrollingLowerPass:";
-    pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
-    // pm.addPass(mlir::createPrintIRPass(options));
 
-    // Stage 2: Convert routing to dmap
-    pm.addPass(std::make_unique<RoutingToDmapPass>(rtopology));
-    options.label = "After RoutingToDmapPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    
-    // Stage 3: Convert dmap to dmaphop
-    pm.addPass(std::make_unique<DmapToDmaphopPass>(rtopology));
-    options.label = "After DmapToDmaphopPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    
-    // Stage 4: Convert dmaphop to dfscheblueprint
-    pm.addPass(std::make_unique<DmaphopTodfscheblueprintPass>());
-    options.label = "After DmaphopTodfscheblueprintPass:";
-    pm.addPass(mlir::createPrintIRPass(options));
-    // generete the blueprint ir
-    if (failed(pm.run(module1))) {
-        llvm::errs() << "ERROR: Pass pipeline failed!\n";
-        return;
+    // Determine which paths to run based on startStage
+    // Stages 0-4: shared path (can produce host + kernel + bcf/prx)
+    // Stages 5-9: host-only path (host.cc + bcf/prx)
+    // Stages 10-11: kernel-only path (kernel.cc)
+    bool doHostPath = (startStage <= 9);
+    bool doKernelPath = (startStage <= 4 || startStage >= 10);
+
+    // Print output summary
+    std::cout << "Stage: startStage=" << startStage << std::endl;
+    std::cout << "Will produce:";
+    if (doHostPath) std::cout << " host.cc, aieml.bcf, aieml.prx";
+    if (doHostPath && doKernelPath) std::cout << ",";
+    if (doKernelPath) std::cout << " kernel.cc";
+    std::cout << std::endl;
+
+    std::string irDir = setupIRDir("dfschedule", useCurrentDir);
+    int stage = startStage;
+
+    dumpIRToFile(module, irDir, stage++, "initial");
+
+    // Phase 1: shared path (routing -> dmap -> dmaphop -> dfscheblueprint)
+    if (startStage <= 0) {
+        if (!runSinglePass(ctx, module, std::make_unique<RoutingUnrollingLowerPass>(), irDir, stage,
+                           "RoutingUnrollingLowerPass"))
+            return;
     }
-    // return;
-    std::cout << "\n=== Final Module with API calls ===" << std::endl;
-    module1.dump();
-
-    // clone the module1 which used for generate host ir to kernelModule
-    mlir::ModuleOp kernelModule = cast<ModuleOp>(module1->clone());
-    mlir::ModuleOp hostModule = cast<ModuleOp>(module1->clone());
-
-    mlir::PassManager pmphase2(&ctx);
-    // Stage 5: Convert dfscheblueprint to dfschedule (final schedule IR)
-    pmphase2.addPass(std::make_unique<mlir::BlueprintToSchedulePass>());
-    options.label = "After BlueprintToSchedulePass:";
-    pmphase2.addPass(mlir::createPrintIRPass(options));
-
-    // Stage 6: Canonicalize schedule - merge kernel loads, deduplicate tiles, consolidate IOs
-    pmphase2.addPass(std::make_unique<mlir::ScheduleCanonicalizePass>());
-    options.label = "After ScheduleCanonicalizePass:";
-    pmphase2.addPass(mlir::createPrintIRPass(options));
-
-    // /*
-    // Stage 7: Convert dfschedule to API calls and EmitC
-    pmphase2.addPass(std::make_unique<mlir::DfscheduleToApiPass>());
-    options.label = "After DfscheduleToApiPass:";
-    pmphase2.addPass(mlir::createPrintIRPass(options));
-
-    // Stage 9: Canonicalization to optimize EmitC operations
-    pmphase2.addPass(mlir::createCanonicalizerPass());
-    options.label = "After Canonicalization:";
-    pmphase2.addPass(mlir::createPrintIRPass(options));
-
-    //pm.addPass(std::make_unique<RoutingDeadArgPass>());
-    //options.label = "After RoutingDeadArgPass:";
-   // pm.addPass(mlir::createPrintIRPass(options));
-    //The constanfold change emitc.call into emic.call_opaque to convert 
-
-    //XAie_LocType v251 = XAie_TileLoc(v1, v10);
-    //XAie_DevInst* v252 = getOrCreateDeviceInstance();
-    //int32_t v253 = XAie_StrmConnCctEnable(v252, v251, v6, v13, v5, v12);
- 
-    //into
-
-    //int32_t v80 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(6,3), WEST, 0, EAST, 0);
-
-    pmphase2.addPass(std::make_unique<RoutingConstantFoldPass>());
-    options.label = "After RoutingConstantFoldPass:";
-    pmphase2.addPass(mlir::createPrintIRPass(options));
-    if (failed(pmphase2.run(hostModule))) {
-        llvm::errs() << "ERROR: Pass pipeline failed!\n";
-        return;
+    if (startStage <= 1) {
+        if (!runSinglePass(ctx, module, std::make_unique<RoutingToDmapPass>(rtopology), irDir, stage,
+                           "RoutingToDmapPass"))
+            return;
     }
-    //*/
-    // Run the pass pipeline
-
-    // Output directory for generated host.cc and kernel.cc
-    // Get the current working directory and build worklocalDir as an absolute path
-    llvm::SmallString<256> cwdPath;
-    if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
-        llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
-        return;
+    if (startStage <= 2) {
+        if (!runSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage,
+                           "DmapToDmaphopPass"))
+            return;
     }
-    const std::string worklocalDir = (cwdPath + "/../worklocal").str();
-    if (std::error_code EC = llvm::sys::fs::create_directories(worklocalDir)) {
-        llvm::errs() << "Failed to create directory " << worklocalDir << ": " << EC.message() << "\n";
-        return;
+    if (startStage <= 3) {
+        if (!runSinglePass(ctx, module, std::make_unique<DmaphopTodfscheblueprintPass>(), irDir, stage,
+                           "DmaphopTodfscheblueprintPass"))
+            return;
     }
 
-    // Convert host module to C++ and write to host.cc
-    std::string hostPath = worklocalDir + "/host.cc";
+    // Branch point: clone for host and kernel paths (only when entering at shared stages)
+    mlir::ModuleOp hostModule;
+    mlir::ModuleOp kernelModule;
+
+    if (startStage <= 4) {
+        // Pre-branch or at branch point: clone for both paths
+        if (doHostPath)
+            hostModule = cast<ModuleOp>(module->clone());
+        if (doKernelPath)
+            kernelModule = cast<ModuleOp>(module->clone());
+    } else if (startStage <= 9) {
+        // Host-only stages: use module directly
+        hostModule = module;
+    } else {
+        // Kernel-only stages: use module directly
+        kernelModule = module;
+    }
+
+    // Initialize ResourceMgr singleton for CoreMemAllocator (BCF/PRX generation)
+    // The singleton may already exist from a previous pass; init only creates once.
+    if (doHostPath) {
+        auto hwRes = makeResource("Gen2");
+        ResourceMgr::init(std::move(hwRes));
+    }
+
+    // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
+    if (doHostPath) {
+        if (startStage <= 4) {
+            if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5), irDir, stage,
+                               "BlueprintToSchedulePass"))
+                return;
+        }
+        if (startStage <= 5) {
+            if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
+                               "ScheduleCanonicalizePass"))
+                return;
+        }
+        if (startStage <= 6) {
+            if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true),
+                               irDir, stage, "DfscheduleToApiPass"))
+                return;
+        }
+        if (startStage <= 7) {
+            if (!runSinglePass(ctx, hostModule, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
+                return;
+        }
+        if (startStage <= 8) {
+            if (!runSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
+                               "RoutingConstantFoldPass"))
+                return;
+        }
+    }
+
+    // Phase 3: kernel path (blueprint -> kernel schedule -> kernel API)
+    if (doKernelPath) {
+        if (startStage <= 4) {
+            if (!runSinglePass(ctx, kernelModule, std::make_unique<mlir::BlueprintToScheduleKernelPass>(0.5), irDir,
+                               stage, "BlueprintToScheduleKernelPass"))
+                return;
+        }
+        if (startStage <= 10) {
+            if (!runSinglePass(ctx, kernelModule, std::make_unique<mlir::DfscheduleToKernelApiPass>(), irDir, stage,
+                               "DfscheduleToKernelApiPass"))
+                return;
+        }
+    }
+
+    // Output generated C++ code
+    const std::string worklocalDir = setupWorklocalDir(useCurrentDir);
+    if (worklocalDir.empty()) return;
+
+    if (doHostPath) {
+        std::string hostPath = worklocalDir + "/host.cc";
+        std::error_code hostEC;
+        llvm::raw_fd_ostream hostStream(hostPath, hostEC, llvm::sys::fs::OF_None);
+        if (hostEC) {
+            llvm::errs() << "Failed to open " << hostPath << ": " << hostEC.message() << "\n";
+            return;
+        }
+        mlir::LogicalResult result = mlir::emitc::translateToCpp(hostModule, hostStream);
+        hostStream.close();
+        if (failed(result)) {
+            llvm::errs() << "Failed to translate host MLIR to C++.\n";
+            return;
+        }
+        std::cout << "Host code written to " << hostPath << std::endl;
+    }
+
+    if (doKernelPath) {
+        std::string kernelPath = worklocalDir + "/kernel.cc";
+        std::error_code kernelEC;
+        llvm::raw_fd_ostream kernelStream(kernelPath, kernelEC, llvm::sys::fs::OF_None);
+        if (kernelEC) {
+            llvm::errs() << "Failed to open " << kernelPath << ": " << kernelEC.message() << "\n";
+            return;
+        }
+        mlir::LogicalResult result2 = mlir::emitc::translateToCpp(kernelModule, kernelStream);
+        kernelStream.close();
+        if (failed(result2)) {
+            llvm::errs() << "Failed to translate kernel MLIR to C++.\n";
+            return;
+        }
+        std::cout << "Kernel code written to " << kernelPath << std::endl;
+    }
+
+    // Phase 4: Generate BCF/PRX for kernel compilation
+    // The CoreMemAllocator was populated during BlueprintToSchedulePass (host path)
+    // with buffer symbol addresses. Generate BCF/PRX files that pin those symbols
+    // so the kernel linker places buffers where the host DMA BDs expect.
+    if (doHostPath) {
+        try {
+            auto &allocator = ResourceMgr::instance()->coreMemAllocator();
+            const auto &allocations = allocator.getAllocations();
+
+            if (!allocations.empty()) {
+                TilingBcf bcf;
+                bcf.setStack(0x70000, 0x1024);
+                bcf.addReservedDMB(0x40000, 0x10000);
+                // Reserve the last 2KB of DM for kernel_log.h klog() region
+                // (DM absolute 0x7F800-0x7FFFF = DM offset 0xF800, 0x800 bytes)
+                bcf.addReservedDMB(0x7F800, 0x800);
+                for (const auto &slot : allocations) {
+                    bcf.addSymbol(slot.symbolName, slot.address);
+                }
+
+                std::string bcfPath = worklocalDir + "/aieml.bcf";
+                if (bcf.exportToFile(bcfPath)) {
+                    std::cout << "BCF written to " << bcfPath << std::endl;
+                } else {
+                    llvm::errs() << "Failed to write BCF to " << bcfPath << "\n";
+                }
+
+                TilingPrx prx("kernel", 22); // AIE2PS arch=22
+                prx.setBcfPath("aieml.bcf");
+                prx.setKernelLLPath("./build/");
+
+                std::string prxPath = worklocalDir + "/aieml.prx";
+                if (prx.exportToFile(prxPath)) {
+                    std::cout << "PRX written to " << prxPath << std::endl;
+                } else {
+                    llvm::errs() << "Failed to write PRX to " << prxPath << "\n";
+                }
+
+                // Print allocation summary
+                std::cout << "\n=== Core Memory Allocation Summary ===" << std::endl;
+                for (const auto &slot : allocations) {
+                    std::cout << "  " << slot.symbolName << " @ 0x" << std::hex << slot.address << " (size="
+                              << std::dec << slot.size << " bytes)" << std::endl;
+                }
+                std::cout << "  Free space: " << allocator.getFreeSpace() << " bytes" << std::endl;
+            } else {
+                std::cout << "No buffer allocations found; skipping BCF/PRX generation." << std::endl;
+            }
+        } catch (...) {
+            std::cout << "ResourceMgr not initialized; skipping BCF/PRX generation." << std::endl;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-dimensional BD addressing test
+// ---------------------------------------------------------------------------
+// Runs the standard dfschedule pipeline, then creates a standalone dfschedule
+// module with dim_strides/dim_wraps on a config.dma_bd op and runs the
+// DfscheduleToApiPass to verify __Runtime_dma_bd_config_multidim emission.
+
+void testMultidimBd(bool useCurrentDir = false) {
+    std::cout << "\n=== Multi-Dimensional BD Addressing Test ===" << std::endl;
+
+    // First, run the normal pipeline to verify no regression
+    std::cout << "\n--- Phase 1: Regression check (normal pipeline) ---" << std::endl;
+    routingtodfschedule("", useCurrentDir);
+
+    // Phase 2: Build a minimal dfschedule module with dim_strides/dim_wraps
+    // and run DfscheduleToApiPass to check multidim call emission
+    std::cout << "\n--- Phase 2: Multi-dim BD emission test ---" << std::endl;
+
+    MLIRContext ctx;
+    TilingLinalgPipeline::registerDialects(ctx);
+
+    // Build a 2x2 mesh GEMM routing IR and run through shared stages
+    std::vector<TensorParam> tensors = {
+        {{16, 16}, 8, true},  // input A
+        {{16, 16}, 8, true},  // input B
+        {{16, 16}, 8, false}, // output C
+    };
+    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors);
+
+    RoutingTopology rtopology("Gen2");
+    std::string irDir = setupIRDir("multidim", useCurrentDir);
+    int stage = 0;
+
+    dumpIRToFile(module, irDir, stage++, "initial");
+
+    // Run shared stages: routing -> dmap -> dmaphop -> blueprint
+    if (!runSinglePass(ctx, module, std::make_unique<RoutingUnrollingLowerPass>(), irDir, stage,
+                       "RoutingUnrollingLowerPass"))
+        return;
+    if (!runSinglePass(ctx, module, std::make_unique<RoutingToDmapPass>(rtopology), irDir, stage, "RoutingToDmapPass"))
+        return;
+    if (!runSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage, "DmapToDmaphopPass"))
+        return;
+    if (!runSinglePass(ctx, module, std::make_unique<DmaphopTodfscheblueprintPass>(), irDir, stage,
+                       "DmaphopTodfscheblueprintPass"))
+        return;
+
+    // Clone for host path
+    auto hostModule = cast<ModuleOp>(module->clone());
+
+    // Initialize ResourceMgr
+    auto hwRes = makeResource("Gen2");
+    ResourceMgr::init(std::move(hwRes));
+
+    // Run BlueprintToSchedulePass (host path)
+    if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5), irDir, stage,
+                       "BlueprintToSchedulePass"))
+        return;
+    if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
+                       "ScheduleCanonicalizePass"))
+        return;
+
+    // Now inject dim_strides/dim_wraps on the first Shim tile config.dma_bd
+    // that corresponds to B-matrix input (data_id = 1 convention)
+    std::cout << "Injecting dim_strides/dim_wraps on B-matrix BD..." << std::endl;
+    bool injected = false;
+    hostModule.walk([&](dfschedule::ConfigDmaBdOp bdOp) {
+        // Inject on the first BD that doesn't already have multidim attrs
+        // We target a shim-tile BD (data_id >= 0, no locks = shim tile pattern)
+        if (!injected && !bdOp.getDimStrides()) {
+            // B-matrix transpose for 16x16:
+            // dim0: stride=16, wrap=16 (jump across rows for one column)
+            // dim1: stride=1, wrap=8 (next column, 8 columns per tile)
+            SmallVector<Attribute, 2> strides = {
+                IntegerAttr::get(IntegerType::get(&ctx, 32), 16),
+                IntegerAttr::get(IntegerType::get(&ctx, 32), 1),
+            };
+            SmallVector<Attribute, 2> wraps = {
+                IntegerAttr::get(IntegerType::get(&ctx, 32), 16),
+                IntegerAttr::get(IntegerType::get(&ctx, 32), 8),
+            };
+            bdOp.setDimStridesAttr(ArrayAttr::get(&ctx, strides));
+            bdOp.setDimWrapsAttr(ArrayAttr::get(&ctx, wraps));
+            injected = true;
+            std::cout << "  Injected multidim attrs: dim_strides=[16,1], dim_wraps=[16,8]" << std::endl;
+        }
+    });
+
+    if (!injected) {
+        std::cerr << "WARNING: Could not find a BD op to inject multidim attrs" << std::endl;
+    }
+
+    dumpIRToFile(hostModule, irDir, stage++, "MultidimInjected");
+
+    // Run DfscheduleToApiPass
+    if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::DfscheduleToApiPass>(true), irDir, stage,
+                       "DfscheduleToApiPass"))
+        return;
+    if (!runSinglePass(ctx, hostModule, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
+        return;
+    if (!runSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
+                       "RoutingConstantFoldPass"))
+        return;
+
+    // Emit host.cc and check for __Runtime_dma_bd_config_multidim
+    const std::string worklocalDir = setupWorklocalDir(useCurrentDir);
+    if (worklocalDir.empty())
+        return;
+
+    std::string hostPath = worklocalDir + "/host_multidim.cc";
     std::error_code hostEC;
     llvm::raw_fd_ostream hostStream(hostPath, hostEC, llvm::sys::fs::OF_None);
     if (hostEC) {
         llvm::errs() << "Failed to open " << hostPath << ": " << hostEC.message() << "\n";
         return;
     }
-    std::cout << "\n=== Generated C++ Code (host) ===" << std::endl;
     mlir::LogicalResult result = mlir::emitc::translateToCpp(hostModule, hostStream);
     hostStream.close();
     if (failed(result)) {
         llvm::errs() << "Failed to translate host MLIR to C++.\n";
         return;
     }
-    std::cout << "Host code written to " << hostPath << std::endl;
+    std::cout << "Host code (multidim) written to " << hostPath << std::endl;
 
-    // Generate the kernel module
-    mlir::PassManager pmkernel(&ctx);
-    pmkernel.addPass(std::make_unique<mlir::BlueprintToScheduleKernelPass>());
-    options.label = "After BlueprintToScheduleKernelPass:";
-    pmkernel.addPass(mlir::createPrintIRPass(options));
-    pmkernel.addPass(std::make_unique<mlir::DfscheduleToKernelApiPass>());
-    if (failed(pmkernel.run(kernelModule))) {
-        llvm::errs() << "ERROR: Pass pipeline failed!\n";
-        return;
+    // Verify: read host_multidim.cc and check for __Runtime_dma_bd_config_multidim
+    auto bufOrErr = llvm::MemoryBuffer::getFile(hostPath);
+    if (bufOrErr) {
+        auto content = (*bufOrErr)->getBuffer();
+        if (content.contains("__Runtime_dma_bd_config_multidim")) {
+            std::cout << "\n✓ PASS: host_multidim.cc contains __Runtime_dma_bd_config_multidim call" << std::endl;
+        } else {
+            std::cout << "\n✗ FAIL: host_multidim.cc does NOT contain __Runtime_dma_bd_config_multidim call"
+                      << std::endl;
+        }
+        // Also verify regular config still present for non-multidim BDs
+        if (content.contains("__Runtime_dma_bd_config(")) {
+            std::cout << "✓ PASS: host_multidim.cc still contains regular __Runtime_dma_bd_config calls (no regression)"
+                      << std::endl;
+        }
     }
 
-    // Convert kernel module to C++ and write to kernel.cc
-    std::string kernelPath = worklocalDir + "/kernel.cc";
-    std::error_code kernelEC;
-    llvm::raw_fd_ostream kernelStream(kernelPath, kernelEC, llvm::sys::fs::OF_None);
-    if (kernelEC) {
-        llvm::errs() << "Failed to open " << kernelPath << ": " << kernelEC.message() << "\n";
-        return;
-    }
-    std::cout << "\n=== Generated C++ Code (kernel) ===" << std::endl;
-    mlir::LogicalResult result2 = mlir::emitc::translateToCpp(kernelModule, kernelStream);
-    kernelStream.close();
-    if (failed(result2)) {
-        llvm::errs() << "Failed to translate kernel MLIR to C++.\n";
-        return;
-    }
-    std::cout << "Kernel code written to " << kernelPath << std::endl;
-    return;
+    std::cout << "\n=== Multi-Dimensional BD Test Complete ===" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
     if (argc > 1) {
         std::string arg = argv[1];
-        if (arg == "hw") {
+        if (arg == "--parse") {
+            if (argc < 4) {
+                std::cerr << "Usage: ./test --parse <stage> <mlir_file>\n"
+                          << "Supported stages:\n"
+                          << "  routing        - stage 0 (initial routing IR)\n"
+                          << "  dmap           - stage 2 (post-RoutingToDmap)\n"
+                          << "  dmaphop        - stage 3 (post-DmapToDmaphop)\n"
+                          << "  dfscheblueprint - stage 4 (post-DmaphopTodfscheblueprint, branch point)\n"
+                          << "  dfschedule     - stage 5/6/10 (post-branch, auto-detects host/kernel)\n"
+                          << "  emitc          - stage 7/8/9/11 (pure EmitC, auto-detects host/kernel)\n"
+                          << std::endl;
+                return 1;
+            }
+            std::string mode = argv[2];
+            std::string filepath = argv[3];
+
+            std::cout << "Executing --parse " << mode << " with IR from " << filepath << std::endl;
+
+            // Validate IR dialect and auto-detect actual stage
+            std::string detectedMode;
+            {
+                MLIRContext valCtx;
+                valCtx.allowUnregisteredDialects();
+                routingmanager valRouting;
+                routinghwmanager valRoutinghw;
+                dmapmanager valDmap;
+                dmaphopmanager valDmaphop;
+                dfscheblueprintmanager valBlueprint;
+                dfschedulemanager valSchedule;
+                valRouting.loaddialect(&valCtx);
+                valRoutinghw.loaddialect(&valCtx);
+                valDmap.loaddialect(&valCtx);
+                valDmaphop.loaddialect(&valCtx);
+                valBlueprint.loaddialect(&valCtx);
+                valSchedule.loaddialect(&valCtx);
+                valCtx.getOrLoadDialect<arith::ArithDialect>();
+                valCtx.getOrLoadDialect<mlir::func::FuncDialect>();
+                valCtx.getOrLoadDialect<mlir::scf::SCFDialect>();
+                valCtx.getOrLoadDialect<mlir::tensor::TensorDialect>();
+                valCtx.getOrLoadDialect<mlir::emitc::EmitCDialect>();
+                valCtx.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
+                valCtx.getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
+                valCtx.getOrLoadDialect<mlir::memref::MemRefDialect>();
+
+                auto valModule = loadModuleFromFile(valCtx, filepath);
+                if (!valModule) return 1;
+                if (!validateIRDialect(*valModule, mode, filepath, detectedMode))
+                    return 1;
+
+                // Use the detected mode (may differ from user-specified mode)
+                mode = detectedMode;
+
+                // For post-branch stages, auto-detect host vs kernel
+                if (mode == "dfschedule" || mode == "emitc") {
+                    std::string kind = detectHostOrKernel(*valModule);
+                    if (kind == "unknown") {
+                        std::cerr << "ERROR: Could not auto-detect host vs kernel for "
+                                  << mode << " IR.\n"
+                                  << "  File: " << filepath << "\n"
+                                  << "  Hint: ensure the IR contains characteristic ops "
+                                     "(dfschedule.declaretile for host, "
+                                     "dfschedule.kernel_config_def for kernel).\n";
+                        return 1;
+                    }
+                    // Store kind for startStage computation below
+                    if (mode == "dfschedule")
+                        mode = (kind == "host") ? "dfschedule_host" : "dfschedule_kernel";
+                    else
+                        mode = (kind == "host") ? "emitc_host" : "emitc_kernel";
+                    std::cout << "Auto-detected " << kind << " path." << std::endl;
+                }
+            }
+
+            // Map detected mode to startStage
+            int startStage = -1;
+            bool canProduceRouting = false;
+
+            if (mode == "routing")                startStage = 0, canProduceRouting = true;
+            else if (mode == "routing_unrolled")  startStage = 1, canProduceRouting = true;
+            else if (mode == "dmap")              startStage = 2, canProduceRouting = true;
+            else if (mode == "dmaphop")           startStage = 3, canProduceRouting = true;
+            else if (mode == "dfscheblueprint")   startStage = 4;
+            else if (mode == "dfschedule_host")   startStage = 5;
+            else if (mode == "dfschedule_kernel") startStage = 10;
+            else if (mode == "emitc_host")        startStage = 7;
+            else if (mode == "emitc_kernel")      startStage = 11;
+            else {
+                std::cerr << "ERROR: Unrecognized detected mode: " << mode << "\n";
+                return 1;
+            }
+
+            // Run dfschedule pipeline from the detected start stage
+            routingtodfschedule(filepath, /*useCurrentDir=*/true, startStage);
+
+            // Run routing.cc pipeline only if the entry stage is early enough
+            if (canProduceRouting) {
+                routingtodmap(filepath, /*useCurrentDir=*/true, startStage);
+            }
+        } else if (arg == "routing") {
+            if (argc < 3) {
+                std::cerr << "Usage: ./test routing <mlir_file>" << std::endl;
+                return 1;
+            }
+            std::string filepath = argv[2];
+            std::cout << "Executing routingtodfschedule with IR from " << filepath << std::endl;
+            routingtodfschedule(filepath);
+        } else if (arg == "hw") {
             std::cout << "Executing routingtoroutinghw..." << std::endl;
             routingtoroutinghw();
         } else if (arg == "test") {
@@ -1034,16 +1532,21 @@ int main(int argc, char* argv[]) {
         } else if (arg == "dmaphw") {
             std::cout << "Executing routingtodmap..." << std::endl;
             routingtodmap();
+        } else if (arg == "multidim") {
+            std::cout << "Executing multi-dimensional BD addressing test..." << std::endl;
+            testMultidimBd();
         } else {
-            std::cout << "Invalid argument. Please use hw, test, dfschedule, dmaphw" << std::endl;
+            std::cout << "Invalid argument. Please use hw, test, dfschedule, dmaphw, multidim, routing, --parse "
+                         "<stage> <file>\n"
+                      << "Stages: routing, dmap, dmaphop, dfscheblueprint, dfschedule, emitc" << std::endl;
         }
     } else {
-        // Default behavior when no argument is provided
-        // std::cout << "No argument provided. Executing routingtodmap by default..." << std::endl;
-        // routingtodmap();
-        std::cout << "Executing routingtodfschedule... and hw" << std::endl;
+        // Default behavior: routingtodfschedule generates host.cc, kernel.cc,
+        // AND routing.cc (via the dmaphop->routinghw path in TilingLinalgPipeline).
+        // Do NOT run routingtodmap() here — it would overwrite routing.cc with
+        // independently-allocated packet IDs that don't match host.cc.
+        std::cout << "Executing routingtodfschedule..." << std::endl;
         routingtodfschedule();
-        routingtodmap();
     }
     return 0;
 

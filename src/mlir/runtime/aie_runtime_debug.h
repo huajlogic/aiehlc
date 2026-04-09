@@ -1,0 +1,554 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: MIT
+ ******************************************************************************/
+
+/**
+ * @file aie_runtime_debug.h
+ * @brief Runtime debug utilities for AIE tile status inspection.
+ *
+ * Provides functions to:
+ *  - Query and print AIE core status (PC, enabled, stalled, done)
+ *  - Read and print DMA BD descriptors (bd_id, addr, len, lock, next, pkt)
+ *  - Query DMA channel status for core tiles and shim tiles (S2MM/MM2S)
+ *  - Decode current BD from a live channel status register
+ *  - Run a verification pass across a set of tile IOs after startup
+ */
+
+#ifndef AIE_RUNTIME_DEBUG_H
+#define AIE_RUNTIME_DEBUG_H
+
+#include "aie_runtime.h"
+
+/* --------------------------------------------------------------------------
+ * AIE generation selector
+ *
+ * Controls which hardware event name table is used by AieRt_EventName().
+ * CORE and MEM module event IDs are identical between AIEML and AIE2PS.
+ * PL module event IDs differ (AIE2PS extends to ID 183 vs AIEML max 127).
+ *
+ * Set g_aiert_gen (or call AieRt_SetAieGen) before using debug APIs if the
+ * target device is not AIE2PS.
+ * -------------------------------------------------------------------------- */
+
+typedef enum {
+    AIERT_GEN_AIEML = 0,  /* AIE-ML / AIE2 */
+    AIERT_GEN_AIE2PS = 1, /* AIE2PS — default */
+} AieRt_AieGen;
+
+extern AieRt_AieGen g_aiert_gen; /* default: AIERT_GEN_AIE2PS */
+
+/**
+ * Set the AIE generation for event name lookups.
+ * @param gen  AIERT_GEN_AIEML or AIERT_GEN_AIE2PS.
+ */
+void AieRt_SetAieGen(AieRt_AieGen gen);
+
+/* --------------------------------------------------------------------------
+ * Event name lookup
+ *
+ * Returns the human-readable name for a hardware-local event ID.
+ * IDs are module-local (0-based per module), sourced from:
+ *   xaie_events_aieml.h  (XAIEML_EVENTS_{CORE,MEM,PL}_*)
+ *   xaie_events_aie2ps.h (XAIE2PS_EVENTS_{CORE,MEM,PL}_*)
+ *
+ * CORE and MEM tables are identical between AIEML and AIE2PS.
+ * PL table differs: AIEML max=127, AIE2PS max=183.
+ *
+ * @param module  XAIE_CORE_MOD, XAIE_MEM_MOD, or XAIE_PL_MOD.
+ * @param id      Module-local hardware event ID.
+ * @return        Pointer to a static string with the event name.
+ *                Returns "EVT_<id>" for unknown IDs (written to a small
+ *                static buffer — not re-entrant for unknown IDs).
+ * -------------------------------------------------------------------------- */
+const char *AieRt_EventName(XAie_ModuleType module, uint32_t id);
+
+/* --------------------------------------------------------------------------
+ * Print all active events from a module's event status register(s)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Read the Memory Module event status registers of a core tile and print
+ * the name of every set bit using AieRt_EventName(XAIE_MEM_MOD, id).
+ * Covers event IDs 0-31 (register 0x00014200) and 32-63 (0x00014204).
+ * @param dev   Device instance.
+ * @param tile  Core tile location (row >= XAIE_AIE_TILE_ROW_START).
+ */
+void AieRt_PrintMemModuleEvents(XAie_DevInst *dev, XAie_LocType tile);
+
+/**
+ * Call AieRt_PrintMemModuleEvents for every core tile in the list.
+ */
+void AieRt_PrintMemModuleEventsAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles);
+
+/**
+ * Read the Core Module event status registers of a core tile and print
+ * the name of every set bit using AieRt_EventName(XAIE_CORE_MOD, id).
+ * Covers event IDs 0-31 (register 0x00034200) and 32-63 (0x00034204).
+ * @param dev   Device instance.
+ * @param tile  Core tile location (row >= XAIE_AIE_TILE_ROW_START).
+ */
+void AieRt_PrintCoreModuleEvents(XAie_DevInst *dev, XAie_LocType tile);
+
+/**
+ * Call AieRt_PrintCoreModuleEvents for every core tile in the list.
+ */
+void AieRt_PrintCoreModuleEventsAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles);
+
+/* --------------------------------------------------------------------------
+ * Decoded DMA channel status (AIEML / AIE2P register layout)
+ *
+ *  Status raw word bits (shim NOC module, same layout for core/mem tiles):
+ *   [1:0]  STATUS       (0=Idle/Complete, 1=Running, 2=Paused, 3=Paused)
+ *   [2]    STALLED_LOCK_ACQ
+ *   [3]    STALLED_LOCK_REL
+ *   [4]    STALLED_STREAM  (starvation for S2MM, backpressure for MM2S)
+ *   [5]    STALLED_TCT_OR_COUNT_FIFO_FULL
+ *   [10]   ERROR_BD_UNAVAILABLE   (S2MM only)
+ *   [11]   ERROR_BD_INVALID
+ *   [12]   ERROR_FOT_LENGTH_EXCEEDED (S2MM only)
+ *   [13]   ERROR_FOT_BDS_PER_TASK    (S2MM only)
+ *   [16]   AXI_MM_DECODE_ERROR
+ *   [17]   AXI_MM_SLAVE_ERROR
+ *   [18]   TASK_QUEUE_OVERFLOW
+ *   [19]   CHANNEL_RUNNING
+ *   [22:20] TASK_QUEUE_SIZE  (number of BDs in queue)
+ *   [27:24] CUR_BD           (current BD being processed)
+ * -------------------------------------------------------------------------- */
+
+/* Raw bit masks applied to the u32 returned by XAie_DmaGetChannelStatus */
+#define AIERT_DMA_STATUS_MASK 0x00000003u
+#define AIERT_DMA_STALL_LOCK_ACQ_MASK 0x00000004u
+#define AIERT_DMA_STALL_LOCK_REL_MASK 0x00000008u
+#define AIERT_DMA_STALL_STREAM_MASK 0x00000010u
+#define AIERT_DMA_STALL_TCT_MASK 0x00000020u
+#define AIERT_DMA_ERR_BD_UNAVAIL_MASK 0x00000400u
+#define AIERT_DMA_ERR_BD_INVALID_MASK 0x00000800u
+#define AIERT_DMA_ERR_FOT_LEN_MASK 0x00001000u
+#define AIERT_DMA_ERR_FOT_BDS_MASK 0x00002000u
+#define AIERT_DMA_ERR_AXI_DECODE_MASK 0x00010000u
+#define AIERT_DMA_ERR_AXI_SLAVE_MASK 0x00020000u
+#define AIERT_DMA_TASK_Q_OVERFLOW_MASK 0x00040000u
+#define AIERT_DMA_CHANNEL_RUNNING_MASK 0x00080000u
+#define AIERT_DMA_TASK_Q_SIZE_MASK 0x00700000u
+#define AIERT_DMA_TASK_Q_SIZE_LSB 20u
+#define AIERT_DMA_CUR_BD_MASK 0x0F000000u
+#define AIERT_DMA_CUR_BD_LSB 24u
+
+/* STATUS field values */
+#define AIERT_DMA_STATUS_IDLE 0u
+#define AIERT_DMA_STATUS_RUNNING 1u
+#define AIERT_DMA_STATUS_PAUSED 2u
+
+typedef struct {
+    uint8_t status;          /* 0=Idle, 1=Running, 2=Paused */
+    uint8_t channel_running; /* CHANNEL_RUNNING bit */
+    uint8_t task_q_size;     /* pending BDs in queue */
+    uint8_t task_q_overflow;
+    uint8_t cur_bd; /* current BD being processed */
+    uint8_t stall_lock_acq;
+    uint8_t stall_lock_rel;
+    uint8_t stall_stream; /* starvation (S2MM) or backpressure (MM2S) */
+    uint8_t stall_tct;
+    uint8_t err_bd_unavail;
+    uint8_t err_bd_invalid;
+    uint8_t err_fot_len;
+    uint8_t err_fot_bds;
+    uint8_t err_axi_decode;
+    uint8_t err_axi_slave;
+    uint32_t raw; /* raw register value */
+} AieRt_DmaChStatusDecoded;
+
+/* --------------------------------------------------------------------------
+ * Core tile Memory Module event status register constants
+ *
+ * Register: core tile Memory Module event status register 0 covers local
+ * event IDs 0-31.  Address (from debug.md):
+ *   full addr = 0x20000000000 + (col << 25) + (row << 20) + 0x00014200
+ *   XAie_Read32(dev, (col<<25)|(row<<20)|0x00014200, &out)
+ *
+ * Bit positions are the hardware-local event IDs (NOT global aie2psevent.md
+ * IDs).  Confirmed example from debug.md:
+ *   DMA_S2MM_0_START_TASK = local event 19 = bit 19 of event register 0.
+ * Consecutive channel ordering:
+ *   bit 19 : DMA_S2MM_0_START_TASK
+ *   bit 20 : DMA_S2MM_1_START_TASK
+ *   bit 21 : DMA_MM2S_0_START_TASK
+ *   bit 22 : DMA_MM2S_1_START_TASK
+ *   bit 23 : DMA_S2MM_0_FINISHED_TASK
+ *   bit 24 : DMA_S2MM_1_FINISHED_TASK
+ *   bit 25 : DMA_MM2S_0_FINISHED_TASK
+ *   bit 26 : DMA_MM2S_1_FINISHED_TASK
+ * -------------------------------------------------------------------------- */
+
+/* Core module control/status/PC/SP register offsets (tile-relative).
+ * XAIEMLGBL_CORE_MODULE_CORE_STATUS = 0x00032004 (mask 0x003FFFFF)
+ * XAIEMLGBL_CORE_MODULE_CORE_PC     = 0x00031100 (mask 0x000FFFFF, 20-bit)
+ * XAIEMLGBL_CORE_MODULE_CORE_SP     = 0x00031120 */
+#define AIERT_CORE_STATUS_REG 0x00038004u
+#define AIERT_CORE_PC_REG 0x00032D00
+#define AIERT_CORE_SP_REG 0x00032D20
+#define AIERT_CORE_PC_MASK 0x000FFFFFu
+
+#define AIERT_CORE_MEM_EVT_STATUS_REG 0x00014200u
+#define AIERT_CORE_CORE_EVT_STATUS_REG 0x00034200u
+/* Second core-module event status register: covers event IDs 32-63 (bits 32-63
+ * of the core module event space, stored as bits [0:31] of this register). */
+#define AIERT_CORE_CORE_EVT_STATUS_REG1 0x00034204u
+
+/* Shim tile PL module event status register offsets (tile-relative).
+ * Same offsets as CORE module event status registers but accessed on
+ * shim tiles (row=0). Confirmed from XAIE2PSGBL_PL_MODULE_EVENT_STATUS* /
+ * XAIEMLGBL_PL_MODULE_EVENT_STATUS* in xaie2psgbl_params.h / xaiemlgbl_params.h.
+ *   reg0 (0x00034200): PL event IDs   0-31
+ *   reg1 (0x00034204): PL event IDs  32-63
+ *   reg2 (0x00034208): PL event IDs  64-95
+ *   reg3 (0x0003420C): PL event IDs  96-127
+ */
+#define AIERT_SHIM_PL_EVT_STATUS_REG0 0x00034200u
+#define AIERT_SHIM_PL_EVT_STATUS_REG1 0x00034204u
+#define AIERT_SHIM_PL_EVT_STATUS_REG2 0x00034208u
+#define AIERT_SHIM_PL_EVT_STATUS_REG3 0x0003420Cu
+
+/* --------------------------------------------------------------------------
+ * Core module event status register bit positions (aie2psevent.md IDs 0-63)
+ *
+ * Register 0 (AIERT_CORE_CORE_EVT_STATUS_REG,  0x00034200): event IDs  0-31
+ * Register 1 (AIERT_CORE_CORE_EVT_STATUS_REG1, 0x00034204): event IDs 32-63
+ *   bit N of register 1 = event ID (32 + N)
+ *
+ * Stall / activity events (all in register 1):
+ *   ID 41 (bit  9) : MS_STALL
+ *   ID 42 (bit 10) : PM_STALL  (instruction-load / program-memory stall)
+ *   ID 43 (bit 11) : STREAM_STALL
+ *   ID 44 (bit 12) : CASCADE_STALL
+ *   ID 45 (bit 13) : LOCK_STALL
+ *   ID 47 (bit 15) : ACTIVE
+ *   ID 48 (bit 16) : DISABLED
+ *   ID 49 (bit 17) : ECC_ERROR_STALL
+ *   ID 50 (bit 18) : ECC_SCRUBBING_STALL
+ *   ID 55 (bit 23) : STALL_NOP
+ * -------------------------------------------------------------------------- */
+
+/* Bits within register 1 (event ID = 32 + bit_pos) */
+#define AIERT_CORE_EVT1_MS_STALL_BIT 9u         /* ID 41 */
+#define AIERT_CORE_EVT1_PM_STALL_BIT 10u        /* ID 42 - instr load stall */
+#define AIERT_CORE_EVT1_STREAM_STALL_BIT 11u    /* ID 43 */
+#define AIERT_CORE_EVT1_CASCADE_STALL_BIT 12u   /* ID 44 */
+#define AIERT_CORE_EVT1_LOCK_STALL_BIT 13u      /* ID 45 */
+#define AIERT_CORE_EVT1_ACTIVE_BIT 15u          /* ID 47 */
+#define AIERT_CORE_EVT1_DISABLED_BIT 16u        /* ID 48 */
+#define AIERT_CORE_EVT1_ECC_ERR_STALL_BIT 17u   /* ID 49 */
+#define AIERT_CORE_EVT1_ECC_SCRUB_STALL_BIT 18u /* ID 50 */
+#define AIERT_CORE_EVT1_STALL_NOP_BIT 23u       /* ID 55 */
+
+#define AIERT_EVT_DMA_S2MM_0_START_BIT 19u
+#define AIERT_EVT_DMA_S2MM_1_START_BIT 20u
+#define AIERT_EVT_DMA_MM2S_0_START_BIT 21u
+#define AIERT_EVT_DMA_MM2S_1_START_BIT 22u
+#define AIERT_EVT_DMA_S2MM_0_FINISH_BIT 23u
+#define AIERT_EVT_DMA_S2MM_1_FINISH_BIT 24u
+#define AIERT_EVT_DMA_MM2S_0_FINISH_BIT 25u
+#define AIERT_EVT_DMA_MM2S_1_FINISH_BIT 26u
+
+/* --------------------------------------------------------------------------
+ * Core status functions
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Print AIE core status for a single tile.
+ * Reports: enabled, reset, done, error-halt, debug-halt, mem/lock/stream stalls,
+ *          PC value (if core is not in reset).
+ * @param dev   Device instance.
+ * @param tile  Tile location (must be a core tile, row >= XAIE_AIE_TILE_ROW_START).
+ */
+void AieRt_PrintCoreStatus(XAie_DevInst *dev, XAie_LocType tile);
+
+/**
+ * Print core status for every tile in the list that is a core tile.
+ * @param dev        Device instance.
+ * @param tiles      Array of tile locations.
+ * @param num_tiles  Length of the array.
+ */
+void AieRt_PrintCoreStatusAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles);
+
+/* --------------------------------------------------------------------------
+ * Core module activity / stall event analysis (Core Module event status reg)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Read the core tile Core Module event status registers (0x00034200 and
+ * 0x00034204) and print the activity / stall event bits derived from
+ * aie2psevent.md IDs 41-55:
+ *
+ *   ACTIVE, DISABLED, MS_STALL, PM_STALL (instr-load stall),
+ *   STREAM_STALL, CASCADE_STALL, LOCK_STALL, ECC_ERROR_STALL,
+ *   ECC_SCRUBBING_STALL, STALL_NOP.
+ *
+ * Address formula (debug.md):
+ *   full addr = 0x20000000000 + (col<<25) + (row<<20) + reg_offset
+ *   XAie_Read32(dev, (col<<25)|(row<<20)|0x00034200, &out)
+ *
+ * Warns when the core is DISABLED or when any stall bit is set.
+ * @param dev   Device instance.
+ * @param tile  Core tile location (row >= XAIE_AIE_TILE_ROW_START).
+ */
+void AieRt_PrintCoreActivityEvents(XAie_DevInst *dev, XAie_LocType tile);
+
+/**
+ * Call AieRt_PrintCoreActivityEvents for every core tile in the list.
+ * @param dev        Device instance.
+ * @param tiles      Array of tile locations.
+ * @param num_tiles  Length of the array.
+ */
+void AieRt_PrintCoreActivityEventsAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles);
+
+/* --------------------------------------------------------------------------
+ * DMA BD event analysis (Memory Module event status register)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Read the core tile Memory Module event status register (+0x4208) and print
+ * the DMA BD start/finish event bits for all four channels (S2MM ch0/ch1,
+ * MM2S ch0/ch1).  Warns when a channel started a task but never finished
+ * (indicating a stall or incomplete transfer at snapshot time).
+ * @param dev   Device instance.
+ * @param tile  Core tile location (row >= XAIE_AIE_TILE_ROW_START).
+ */
+void AieRt_PrintCoreTileDmaBdEvents(XAie_DevInst *dev, XAie_LocType tile);
+
+/**
+ * Call AieRt_PrintCoreTileDmaBdEvents for every core tile in the list.
+ * @param dev        Device instance.
+ * @param tiles      Array of tile locations.
+ * @param num_tiles  Length of the array.
+ */
+void AieRt_PrintCoreTileDmaBdEventsAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles);
+
+/* --------------------------------------------------------------------------
+ * DMA BD functions
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Read and print a single DMA BD descriptor from hardware.
+ * Prints: addr, len (bytes), lock (acq/rel id and values), next BD, packet.
+ * @param dev     Device instance.
+ * @param tile    Tile location.
+ * @param bd_id   BD index to read.
+ */
+void AieRt_PrintBdInfo(XAie_DevInst *dev, XAie_LocType tile, uint8_t bd_id);
+
+/**
+ * Print all configured BDs for a tile (bd_id 0 .. num_bds-1).
+ * @param dev   Device instance.
+ * @param tile  Tile location.
+ */
+void AieRt_PrintAllBds(XAie_DevInst *dev, XAie_LocType tile);
+
+/* --------------------------------------------------------------------------
+ * DMA channel status functions
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Decode a raw channel status word into AieRt_DmaChStatusDecoded.
+ * @param raw_status  Value returned by XAie_DmaGetChannelStatus.
+ * @return Decoded status struct.
+ */
+AieRt_DmaChStatusDecoded AieRt_DecodeDmaChStatus(uint32_t raw_status);
+
+/**
+ * Print decoded DMA channel status for one channel on a tile.
+ * If the channel is running, also reads and prints the current BD contents.
+ * @param dev     Device instance.
+ * @param tile    Tile location.
+ * @param ch      Channel number.
+ * @param dir     DMA_S2MM or DMA_MM2S.
+ */
+void AieRt_PrintDmaChStatus(XAie_DevInst *dev, XAie_LocType tile, uint8_t ch, XAie_DmaDirection dir);
+
+/**
+ * Print S2MM and MM2S status for channels 0 and 1 of a shim tile (row=0).
+ * @param dev  Device instance.
+ * @param col  Column of the shim tile.
+ */
+void AieRt_PrintShimDmaStatus(XAie_DevInst *dev, uint8_t col);
+
+/**
+ * Read the shim tile PL Module event status registers (0x00034200-0x0003420C)
+ * and print the name of every set bit using AieRt_EventName(XAIE_PL_MOD, id).
+ * Covers event IDs 0-127 (registers 0-3). Flags DMA and error events.
+ * @param dev  Device instance.
+ * @param col  Column of the shim tile (row=0).
+ */
+void AieRt_PrintShimPlModuleEvents(XAie_DevInst *dev, uint8_t col);
+
+/**
+ * Print DMA channel status for all channels of a core tile.
+ * Reports S2MM ch0+ch1 and MM2S ch0+ch1.
+ * @param dev   Device instance.
+ * @param tile  Core tile location.
+ */
+void AieRt_PrintCoreTileDmaStatus(XAie_DevInst *dev, XAie_LocType tile);
+
+/* --------------------------------------------------------------------------
+ * Verification
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Verify a set of struct_io descriptors against live hardware state.
+ *
+ * For each io:
+ *  - Reads the DMA channel status register.
+ *  - Checks that the channel reported as running/done (not stalled, no errors).
+ *  - Reads the BD that was registered for this IO and prints its contents.
+ *
+ * Prints PASS or FAIL for each IO and returns the total fail count.
+ *
+ * @param dev       Device instance.
+ * @param ios       Array of struct_io descriptors (from __Runtime_dma_createio_4).
+ * @param num_ios   Length of the array.
+ * @return          Number of failed checks (0 = all pass).
+ */
+int AieRt_VerifyIoDescriptors(XAie_DevInst *dev, const struct_io *ios, uint32_t num_ios);
+
+/**
+ * Convenience: print full debug snapshot for a GEMM-style run.
+ * Prints core status for all core tiles, shim DMA status for all shim columns
+ * referenced by the ios, and DMA status for all core tiles referenced by ios.
+ * @param dev       Device instance.
+ * @param ios       Array of struct_io descriptors.
+ * @param num_ios   Length of the ios array.
+ * @param tiles     Core tile array (from kernel_group).
+ * @param num_tiles Length of the tiles array.
+ */
+void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_ios, const XAie_LocType *tiles,
+                         uint32_t num_tiles);
+
+/**
+ * Convenience wrapper: build struct_io array from raw coordinate arrays and call AieRt_DebugSnapshot.
+ * @param dev        Device instance.
+ * @param io_cols    Column for each IO (length num_ios).
+ * @param io_rows    Row for each IO.
+ * @param io_chs     Channel ID for each IO.
+ * @param io_bds     BD ID for each IO.
+ * @param io_dirs    DMA direction for each IO (XAie_DmaDirection, cast from int).
+ * @param num_ios    Number of IOs.
+ * @param tile_cols  Column for each core tile (length num_tiles); may be NULL if num_tiles==0.
+ * @param tile_rows  Row for each core tile; may be NULL if num_tiles==0.
+ * @param num_tiles  Number of core tiles.
+ */
+void AieRt_DebugSnapshotFromCoords(XAie_DevInst *dev, const uint8_t *io_cols, const uint8_t *io_rows,
+                                   const uint8_t *io_chs, const uint8_t *io_bds, const int *io_dirs, uint32_t num_ios,
+                                   const uint8_t *tile_cols, const uint8_t *tile_rows, uint32_t num_tiles);
+
+/* --------------------------------------------------------------------------
+ * Stream switch register debug
+ *
+ * Register layout (tile-relative offsets, AIEML, xaiemlgbl_params.h):
+ *
+ * Core tile (row >= XAIE_AIE_TILE_ROW_START) — CORE_MODULE:
+ *   Master config base  : 0x0003F000  (+4 per port, 23 ports)
+ *   Slave config base   : 0x0003F100  (+4 per port, 25 slave ports)
+ *   Slave slot base     : 0x0003F200  (+16 per slave-port, 4 slots each at +0/+4/+8/+C)
+ *   Source: XAIE2PSGBL_CORE_MODULE_STREAM_SWITCH_MASTER_CONFIG_AIE_CORE0
+ *
+ * MemTile (row 1-2, XAIE_RES_TILE_ROW_START .. +XAIE_RES_TILE_NUM_ROWS-1) — MEM_TILE_MODULE:
+ *   Master config base  : 0x000B0000  (+4 per port, 19 ports: DMA0-5, CTRL, NORTH0-5, SOUTH0-5)
+ *   Slave config base   : 0x000B0100  (+4 per port, 20 ports: DMA0-5, CTRL, NORTH0-5, SOUTH0-5, TRACE)
+ *   Slave slot base     : 0x000B0200  (+16 per slave-port, 4 slots each)
+ *   Source: XAIE2PSGBL_MEM_TILE_MODULE_STREAM_SWITCH_MASTER_CONFIG_DMA0
+ *
+ * Shim tile (row == 0) — PL_MODULE:
+ *   Master config base  : 0x0003F000  (same region as core tile)
+ *   Slave config base   : 0x0003F100
+ *   Slave slot base     : 0x0003F200
+ *   Source: XAIE2PSGBL_PL_MODULE_STREAM_SWITCH_MASTER_CONFIG_TILE_CTRL
+ *
+ * Master config register (32-bit):
+ *   [31] MASTER_ENABLE   [30] PACKET_ENABLE   [7] DROP_HEADER   [6:0] CONFIG/ARBITOR
+ *
+ * Slave config register (32-bit):
+ *   [31] SLAVE_ENABLE
+ *
+ * Slave slot register (32-bit, from xaiemlgbl_params.h SLAVE_AIE_CORE0_SLOT0_*):
+ *   [28:24] ID/PktId   [20:16] MASK   [8] ENABLE   [5:4] MSEL   [2:0] ARBIT
+ * -------------------------------------------------------------------------- */
+
+/* Tile-relative stream switch register base offsets.
+ *
+ * Core tile (CORE_MODULE) and Shim tile (PL_MODULE) share the same offsets:
+ *   Source: XAIE2PSGBL_CORE_MODULE_STREAM_SWITCH_MASTER_CONFIG_AIE_CORE0 = 0x0003F000
+ *           XAIE2PSGBL_PL_MODULE_STREAM_SWITCH_MASTER_CONFIG_TILE_CTRL   = 0x0003F000
+ *
+ * MemTile (MEM_TILE_MODULE) uses a completely different register region:
+ *   Source: XAIE2PSGBL_MEM_TILE_MODULE_STREAM_SWITCH_MASTER_CONFIG_DMA0  = 0x000B0000
+ *
+ * All confirmed from xaie2psgbl_params.h / xaie2psgbl_reginit.c.
+ */
+#define AIERT_SS_MASTER_BASE 0x0003F000u /* core and shim */
+#define AIERT_SS_SLAVE_BASE 0x0003F100u  /* core and shim */
+#define AIERT_SS_SLOT_BASE 0x0003F200u   /* core and shim */
+
+#define AIERT_SS_MEM_MASTER_BASE 0x000B0000u /* mem tile only */
+#define AIERT_SS_MEM_SLAVE_BASE 0x000B0100u  /* mem tile only */
+#define AIERT_SS_MEM_SLOT_BASE 0x000B0200u   /* mem tile only */
+
+/* Master config bit masks */
+#define AIERT_SS_MSTR_ENABLE_MASK 0x80000000u
+#define AIERT_SS_MSTR_PKT_EN_MASK 0x40000000u
+#define AIERT_SS_MSTR_DROP_MASK 0x00000080u
+#define AIERT_SS_MSTR_CONFIG_MASK 0x0000007Fu
+
+/* Slave config bit masks */
+#define AIERT_SS_SLV_ENABLE_MASK 0x80000000u
+
+/* Slave slot bit masks (from xaiemlgbl_params.h SLAVE_AIE_CORE0_SLOT0_* fields):
+ *   [28:24] ID    (PktId)  mask 0x1F000000
+ *   [20:16] MASK  (PktMask) mask 0x001F0000
+ *   [8]     ENABLE (slot valid) mask 0x00000100
+ *   [5:4]   MSEL   mask 0x00000030
+ *   [2:0]   ARBIT  mask 0x00000007
+ */
+#define AIERT_SS_SLOT_ENABLE_MASK 0x00000100u /* slot valid / enabled */
+#define AIERT_SS_SLOT_PKTID_MASK 0x1F000000u
+#define AIERT_SS_SLOT_PKTID_LSB 24u
+#define AIERT_SS_SLOT_MASK_MASK 0x001F0000u
+#define AIERT_SS_SLOT_MASK_LSB 16u
+#define AIERT_SS_SLOT_MSEL_MASK 0x00000030u
+#define AIERT_SS_SLOT_MSEL_LSB 4u
+#define AIERT_SS_SLOT_ARB_MASK 0x00000007u
+#define AIERT_SS_SLOT_ARB_LSB 0u
+
+/**
+ * Print all stream switch master config, slave config, and slave slot registers
+ * for a single tile by directly reading hardware via XAie_Read32.
+ *
+ * For each master port: prints enable, packet-switch mode, drop-header, and
+ * the arbitor/configuration field.
+ * For each slave port: prints enable, and for each slot prints PktId, Mask,
+ * MSel, Arbitor.
+ *
+ * Only non-zero / enabled registers are printed to keep output concise.
+ * Set print_all=1 to print every register regardless of value.
+ *
+ * Tile type is detected automatically:
+ *   row == 0                              → SHIM  (22 master, 23 slave)
+ *   row in [XAIE_RES_TILE_ROW_START, +2) → MEMTILE (19 master, 20 slave)
+ *   row >= XAIE_AIE_TILE_ROW_START       → CORE  (23 master, 25 slave)
+ *
+ * @param dev        Device instance.
+ * @param tile       Tile location (shim, memtile, or core).
+ * @param print_all  0 = print only enabled/non-zero; 1 = print all registers.
+ */
+void AieRt_PrintStreamSwitchConfig(XAie_DevInst *dev, XAie_LocType tile, int print_all);
+
+/**
+ * Call AieRt_PrintStreamSwitchConfig for every tile in the list.
+ * @param dev        Device instance.
+ * @param tiles      Array of tile locations.
+ * @param num_tiles  Length of the array.
+ * @param print_all  Passed through to AieRt_PrintStreamSwitchConfig.
+ */
+void AieRt_PrintStreamSwitchConfigAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles, int print_all);
+
+#endif /* AIE_RUNTIME_DEBUG_H */

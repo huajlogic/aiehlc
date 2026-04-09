@@ -43,12 +43,12 @@ aierepo_download_check() {
     fi
 
     bash -c "pushd  $AIE_DRIVER_PARENT_DIR;git clone $AIE_REPO; popd"
-    bash -c "cd $AIE_DRIVER_PARENT_DIR/aie-rt/driver/src; make -f Makefile.Linux; make clean"
+    bash -c "cd $AIE_DRIVER_PARENT_DIR/aie-rt/driver/src; CC=\${CC:-gcc} CXX=\${CXX:-g++} make -f Makefile.Linux; make clean"
     ##temporary disable PLM support privledge register, as compile have issue
     find $AIE_DRIVER_PARENT_DIR/aie-rt/driver/src -name "Makefile" -exec sed -i 's/-DXAIE_PROD//g' {} \;
 }
 
-if [ "$PATH_SET_ONLY" -eq 0 ]; then
+if [ "${PATH_SET_ONLY:-0}" -eq 0 ]; then
     if [ -f "$SCRIPT_DIR/precommitsetup.sh" ]; then
         bash "$SCRIPT_DIR/precommitsetup.sh"
     fi
@@ -178,7 +178,7 @@ if [ "$SKIP_BSP" -eq 0 ]; then
         echo "BSPs already exist. Skipping generation."
     fi
 else
-    if [ "$PATH_SET_ONLY" -eq 0 ]; then
+    if [ "${PATH_SET_ONLY:-0}" -eq 0 ]; then
         echo "Skipping BSP generation due to --skip-bsp option."
         ARCH_72_DIR=$ARCH_DIR/psv_cortexa72_0/workspace/platform_baremetal/psv_cortexa72_0/standalone_psv_cortexa72_0/
         ARCH_53_DIR=$ARCH_DIR/psv_cortexr5_0/workspace/platform_baremetal/psv_cortexr5_0/standalone_psv_cortexr5_0/

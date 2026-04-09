@@ -88,14 +88,6 @@ def dfschedule_LaunchHostOp : dfscheduleop<"launchhost", [
 // CONFIG PHASE OPERATIONS
 // ============================================================================
 
-// Declare a tensor and convert to memref
-def dfschedule_DeclareTensorOp : dfscheduleop<"declaretensor"> {
-  let summary = "Declare a tensor and allocate corresponding device memory";
-  let arguments = (ins AnyTensor:$tensor);
-  let results = (outs AnyMemRef:$memref);
-  let assemblyFormat = "`(` $tensor `)` attr-dict `:` `(` type($tensor) `)` `->` type($memref)";
-}
-
 // Declare a tile location
 def dfschedule_DeclareTileOp : dfscheduleop<"declaretile"> {
   let summary = "Declare a physical tile by coordinates";
@@ -161,10 +153,18 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
     DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_id,
     DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_val,
     DefaultValuedAttr<I32Attr, "-1">:$release_lock_id,
-    DefaultValuedAttr<I32Attr, "-1">:$release_lock_val
+    DefaultValuedAttr<I32Attr, "-1">:$release_lock_val,
+    DefaultValuedAttr<I32Attr, "-1">:$data_id,
+    Optional<dfschedule_BdHandleType>:$linked_bd,
+    // Multi-dimensional addressing (optional, up to 4 dims)
+    // When both present and non-empty, generates XAie_DmaSetMultiDimAddr
+    // When absent, generates existing XAie_DmaSetAddrLen (no behavior change)
+    OptionalAttr<I32ArrayAttr>:$dim_strides,
+    OptionalAttr<I32ArrayAttr>:$dim_wraps
   );
   let results = (outs dfschedule_BdHandleType:$bd_handle);
   let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 // Create IO handle
@@ -179,6 +179,7 @@ def dfschedule_ConfigCreateIoOp : dfscheduleop<"config.create_io"> {
   );
   let results = (outs dfschedule_IoHandleType:$io_handle);
   let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 // Load kernel group configuration
@@ -313,14 +314,6 @@ def dfschedule_DSKernelReceiverOp : dfscheduleop<"dskernel_receiver", [
 // KERNEL HELPER OPERATIONS
 // ============================================================================
 
-// Get tensor from packet
-def dfschedule_GetTensorOp : dfscheduleop<"gettensor"> {
-  let summary = "Extract tensor reference from a packet";
-  let arguments = (ins dfschedule_PacketType:$packet);
-  let results = (outs AnyTensor:$tensor);
-  let assemblyFormat = "`(` $packet `)` attr-dict `:` `(` type($packet) `)` `->` type($tensor)";
-}
-
 // Get DMA channel from packet
 def dfschedule_GetDmaChannelOp : dfscheduleop<"getdmachannel"> {
   let summary = "Extract DMA channel from a packet";
@@ -451,14 +444,6 @@ def dfschedule_ConfigGetPongReleaseLockIdOp : dfscheduleop<"config.get_pong_rele
 }
 
 
-// Kernel memory allocation
-def dfschedule_KernelMemAllocOp : dfscheduleop<"kernel.memalloc"> {
-  let summary = "Allocate local memory in kernel based on tensor shape";
-  let arguments = (ins AnyTensor:$tensor);
-  let results = (outs AnyMemRef:$buffer);
-  let assemblyFormat = "`(` $tensor `)` attr-dict `:` `(` type($tensor) `)` `->` type($buffer)";
-}
-
 // Core compute invocation
 def dfschedule_CoreComputeOp : dfscheduleop<"core.compute"> {
   let summary = "Invoke compute logic on a buffer";
@@ -542,10 +527,39 @@ def dfschedule_FuncOp : dfscheduleop<"func",[IsolatedFromAbove, SymbolTable, Sym
 
 // amd.host.alloc_device_mem
 def dfschedule_AllocDeviceMemOp : dfscheduleop< "alloc_device_mem", []> {
-  let summary = "Allocate device global memory";
-  let arguments = (ins);
+  let summary = "Allocate device DDR memory and copy from source memref";
+  let arguments = (ins AnyMemRef:$source);
   let results   = (outs AnyMemRef:$memref);
-  let assemblyFormat = "attr-dict `:` type($memref)";
+  let assemblyFormat = "`(` $source `)` attr-dict `:` `(` type($source) `)` `->` type($memref)";
+}
+
+// amd.host.buffer_view: byte-offset view into a DDR allocation
+def dfschedule_BufferViewOp : dfscheduleop< "buffer_view", []> {
+  let summary = "Create a byte-offset view into a DDR buffer";
+  let arguments = (ins AnyMemRef:$base, I64Attr:$offset, I64Attr:$len);
+  let results   = (outs AnyMemRef:$view);
+  let assemblyFormat = "$base attr-dict `:` type($base) `->` type($view)";
+}
+
+// amd.host.memref_mapping: strip storage scope from a memref to create a logical channel token
+// This op is Pure (no memory effects). It serves as a zero-cost alias-cast bridge between
+// a physically-scoped memref (e.g., DDR) and an unscoped logical memref token that can then
+// be bound to L1 via bind_core_buffer. The SSA chain:
+//   ddr_view -> memref_mapping -> bind_core_buffer -> L1 buf
+// replaces the opaque unrealized_conversion_cast(tensor -> memref) bridge.
+def dfschedule_MemRefMappingOp : dfscheduleop< "memref_mapping", [Pure]> {
+  let summary = "Strip storage scope from memref to create a logical channel token (Pure, no-copy)";
+  let arguments = (ins AnyMemRef:$source);
+  let results   = (outs AnyMemRef:$mapped);
+  let assemblyFormat = "$source attr-dict `:` `(` type($source) `)` `->` type($mapped)";
+}
+
+// amd.host.bind_core_buffer: bind a logical memref to pre-reserved L1 on a core tile
+def dfschedule_BindCoreBufferOp : dfscheduleop< "bind_core_buffer", []> {
+  let summary = "Bind a logical memref to pre-reserved L1 memory on a core tile";
+  let arguments = (ins AnyMemRef:$source, dfschedule_TileHandleType:$tile, I64Attr:$offset);
+  let results   = (outs AnyMemRef:$buffer);
+  let assemblyFormat = "`(` $source `,` $tile `)` attr-dict `:` `(` type($source) `,` type($tile) `)` `->` type($buffer)";
 }
 
 // amd.host.free_device_mem

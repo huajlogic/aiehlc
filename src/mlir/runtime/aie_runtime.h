@@ -1,0 +1,291 @@
+/******************************************************************************
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+ * SPDX-License-Identifier: MIT
+ ******************************************************************************/
+
+#ifndef AIE_RUNTIME_H
+#define AIE_RUNTIME_H
+
+#include "xaiengine.h"
+#include <stdio.h>
+#include <string.h>
+// #include <stdint.h>
+
+// Runtime structures wrapping XAie types
+typedef struct {
+    XAie_DmaDesc desc;
+    XAie_LocType tile_loc;
+    uint8_t channel_id;
+    uint8_t bd_id;
+    XAie_DmaDirection direction;
+    XAie_MemInst *mem;
+} struct_io;
+
+typedef struct {
+    struct_io io;
+    uint32_t timeout_us;
+} struct_ioevent;
+
+typedef struct {
+    XAie_LocType *tiles;
+    uint32_t num_tiles;
+    unsigned char **elf_buffers;
+} struct_kernel_group;
+
+typedef struct {
+    XAie_LocType *tiles;
+    uint32_t num_tiles;
+    uint32_t timeout_us;
+} struct_event;
+
+// Global device instance (to be initialized by host)
+extern XAie_DevInst *g_DevInst;
+extern XAie_RoutingInstance *g_RoutingInst;
+
+// Debug verbosity: 0=silent (default), 1+=print runtime diagnostics
+extern int g_runtime_debug_level;
+
+// Type aliases for emitted host code (uses "io", "event", etc. without "struct" prefix)
+typedef struct_io io;
+typedef struct_ioevent ioevent;
+typedef struct_kernel_group kernel_group;
+typedef struct_event event;
+
+// ---------------------------------------------------------------------------
+// PartitionTensor: data partitioning for multi-tile tensor distribution
+// ---------------------------------------------------------------------------
+
+#define PARTITION_MAX_DIMS 8
+
+typedef struct {
+    void *data;
+    size_t elem_size;
+    int ndim;
+    int64_t original_shape[PARTITION_MAX_DIMS];
+    int64_t partition_shape[PARTITION_MAX_DIMS];
+    int partition_dim;
+    int num_partitions;
+    int hw_axis_owner; /* 0=row, 1=col */
+    int replicate_on;  /* 0=row, 1=col, -1=none */
+} PartitionTensor;
+
+/* Pass a raw void* buffer through as a void* argument (used by ScheduleCanonicalize
+ * DDR init chain lowering: bind_core_buffer emits L1 offsets as raw void* values). */
+#define __runtime_buffer_arg(p) ((void *)(p))
+
+/* Compute a byte offset into a DDR buffer (used by dfschedule.buffer_view lowering) */
+static inline void *__runtime_buffer_offset(void *base, int64_t offset) { return (void *)((char *)base + offset); }
+
+/* Plain malloc/free/memcpy for DDR buffers allocated by the host init chain.
+ * These wrap the standard C library so host.cc does not need to include <stdlib.h>. */
+void *__Runtime_malloc(size_t bytes);
+void __Runtime_free(void *ptr);
+void __Runtime_memcpy(void *dst, const void *src, size_t bytes);
+
+/* Allocation tracking (implemented in aie_runtime.c) */
+void __Runtime_track_alloc(XAie_MemInst *mem);
+void __Runtime_free_all_allocs(void);
+
+static inline void __Runtime_Partition_Print(void *data, size_t elem_size, int ndim,
+        const int64_t *original_shape,
+        const int64_t *partition_shape, int partition_dim,
+        int num_partitions, int hw_axis_owner, int replicate_on) {
+    if (g_runtime_debug_level > 0) {
+        size_t total_elems = 1;
+        printf("[__Runtime_init_PartitionTensor] data=%p elem_size=%zu ndim=%d "
+               "partition_dim=%d num_partitions=%d hw_axis_owner=%d replicate_on=%d\n",
+               data, elem_size, ndim, partition_dim, num_partitions, hw_axis_owner, replicate_on);
+        printf("  original_shape=[");
+        for (int i = 0; i < ndim; i++) {
+            printf("%s%lld", i ? "," : "", (long long)original_shape[i]);
+            total_elems *= (size_t)original_shape[i];
+        }
+        printf("] partition_shape=[");
+        for (int i = 0; i < ndim; i++)
+            printf("%s%lld", i ? "," : "", (long long)partition_shape[i]);
+        printf("]\n");
+        if (data) {
+            elem_size = 4;
+            printf("  data[%zu elems, %zu bytes each]:", total_elems, elem_size);
+            for (size_t i = 0; i < total_elems; i++) {
+                if (i % 16 == 0)
+                    printf("\n    [%4zu]", i);
+                if (elem_size == 1)
+                    printf(" %4d", (int)((int8_t *)data)[i]);
+                else if (elem_size == 2)
+                    printf(" %6d", (int)((int16_t *)data)[i]);
+                else if (elem_size == 4)
+                    printf(" %11d", ((int32_t *)data)[i]);
+                else
+                    printf(" 0x%llx", (unsigned long long)((uint64_t *)data)[i]);
+            }
+            printf("\n");
+        }
+    }
+}
+
+static inline PartitionTensor __Runtime_init_PartitionTensor(void *data, size_t elem_size, int ndim,
+                                                             const int64_t *original_shape,
+                                                             const int64_t *partition_shape, int partition_dim,
+                                                             int num_partitions, int hw_axis_owner, int replicate_on) {
+    PartitionTensor pt;
+    pt.data = data;
+    pt.elem_size = elem_size;
+    pt.ndim = ndim;
+    for (int i = 0; i < ndim && i < PARTITION_MAX_DIMS; i++) {
+        pt.original_shape[i] = original_shape[i];
+        pt.partition_shape[i] = partition_shape[i];
+    }
+    pt.partition_dim = partition_dim;
+    pt.num_partitions = num_partitions;
+    pt.hw_axis_owner = hw_axis_owner;
+    pt.replicate_on = replicate_on;
+    __Runtime_Partition_Print(data, elem_size, ndim, original_shape, partition_shape, partition_dim, num_partitions, hw_axis_owner, replicate_on);
+    return pt;
+}
+
+static inline void *__Runtime_get_partition_slice(PartitionTensor *pt, int partition_idx) {
+    if (partition_idx < 0 || partition_idx >= pt->num_partitions)
+        return NULL;
+    size_t slice_size = pt->elem_size;
+    for (int i = 0; i < pt->ndim; i++) {
+        slice_size *= pt->partition_shape[i];
+    }
+    return (void *)((char *)pt->data + partition_idx * slice_size);
+}
+
+static inline PartitionTensor __Runtime_extract_slice_contiguous_2d(PartitionTensor src, int off0, int off1, int size0,
+                                                                    int size1) {
+    PartitionTensor result;
+    result.elem_size = src.elem_size;
+    result.ndim = 2;
+    result.partition_dim = -1;
+    result.num_partitions = 1;
+    result.hw_axis_owner = src.hw_axis_owner;
+    result.replicate_on = src.replicate_on;
+    result.original_shape[0] = size0;
+    result.original_shape[1] = size1;
+    result.partition_shape[0] = size0;
+    result.partition_shape[1] = size1;
+    size_t byte_offset = (off0 * src.original_shape[1] + off1) * src.elem_size;
+    result.data = (void *)((char *)src.data + byte_offset);
+    return result;
+}
+
+static inline PartitionTensor __Runtime_extract_slice_strided_2d(XAie_DevInst *dev_inst, PartitionTensor src, int off0,
+                                                                 int off1, int size0, int size1) {
+    PartitionTensor result;
+    result.elem_size = src.elem_size;
+    result.ndim = 2;
+    result.partition_dim = -1;
+    result.num_partitions = 1;
+    result.hw_axis_owner = src.hw_axis_owner;
+    result.replicate_on = src.replicate_on;
+    result.original_shape[0] = size0;
+    result.original_shape[1] = size1;
+    result.partition_shape[0] = size0;
+    result.partition_shape[1] = size1;
+    size_t dst_size = (size_t)size0 * size1 * src.elem_size;
+    XAie_MemInst *mem_inst = XAie_MemAllocate(dev_inst, dst_size, XAIE_MEM_CACHEABLE);
+    if (!mem_inst) {
+        result.data = NULL;
+        return result;
+    }
+    __Runtime_track_alloc(mem_inst);
+    void *dst = XAie_MemGetVAddr(mem_inst);
+    result.data = dst;
+    if (!dst)
+        return result;
+    char *d = (char *)dst;
+    char *s = (char *)src.data;
+    int elem_size = src.elem_size;
+    int src_dim1 = src.original_shape[1];
+    for (int i = 0; i < size0; i++) {
+        int src_idx = ((off0 + i) * src_dim1 + off1) * elem_size;
+        int dst_idx = (i * size1) * elem_size;
+        memcpy(d + dst_idx, s + src_idx, size1 * elem_size);
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime API declarations
+// Reference: aieml_perf.cc for XAie API usage patterns
+// ---------------------------------------------------------------------------
+
+// Device layout declare and init (reference: aieml_perf.cc main lines 292-344, 348-352)
+AieRC __Runtime_device_init(void);
+void __Runtime_routing_init(void);
+AieRC __Runtime_device_teardown(void);
+
+// DMA and data movement
+XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, uint64_t addr,
+                                     int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
+                                     int32_t acquire_lock_id, int32_t acquire_lock_val, int32_t release_lock_id,
+                                     int32_t release_lock_val);
+
+// Multi-dimensional BD addressing for DMA-driven transpose/reshape.
+// Uses XAie_DmaSetMultiDimAddr with stride/wrap descriptors instead of
+// simple XAie_DmaSetAddrLen. num_dims controls how many dim pairs are active
+// (max 4). Unused dims should have stride=0, wrap=0.
+XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
+                                              uint64_t addr, int32_t len, int32_t next_bd, int32_t enable_packet,
+                                              int32_t packet_id, int32_t acquire_lock_id, int32_t acquire_lock_val,
+                                              int32_t release_lock_id, int32_t release_lock_val, int32_t num_dims,
+                                              int32_t dim_stride0, int32_t dim_wrap0, int32_t dim_stride1,
+                                              int32_t dim_wrap1, int32_t dim_stride2, int32_t dim_wrap2,
+                                              int32_t dim_stride3, int32_t dim_wrap3);
+
+struct_io __Runtime_dma_createio(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, int32_t channel_id, int32_t bd_id,
+                                 XAie_DmaDirection direction, XAie_MemInst *mem);
+/* 4-arg version for emitted host code (mem = NULL) */
+struct_io __Runtime_dma_createio_4(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, int32_t channel_id, int32_t bd_id,
+                                   XAie_DmaDirection direction);
+
+struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id);
+
+// Kernel management
+struct_kernel_group __Runtime_load_kernel_group(XAie_LocType *tiles, int32_t num_tiles, unsigned char **elf_buffers);
+/* 4-tile + count version for emitted host code */
+struct_kernel_group __Runtime_load_kernel_group_4t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
+                                                   int n);
+/* N-tile array version for emitted host code (supports any tile count) */
+struct_kernel_group __Runtime_load_kernel_group_nt(XAie_LocType *tiles, int n);
+/* 8-tile and 16-tile positional variants for EmitC-generated host code */
+struct_kernel_group __Runtime_load_kernel_group_8t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
+                                                   XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7,
+                                                   int n);
+struct_kernel_group __Runtime_load_kernel_group_16t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
+                                                    XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7,
+                                                    XAie_LocType t8, XAie_LocType t9, XAie_LocType t10,
+                                                    XAie_LocType t11, XAie_LocType t12, XAie_LocType t13,
+                                                    XAie_LocType t14, XAie_LocType t15, int n);
+
+struct_event __Runtime_launch_kernel_group(struct_kernel_group kg);
+
+// Core enable (reference: aeg_runtime_api.cpp graph_api::run)
+void __Runtime_core_run(XAie_LocType *tiles, uint32_t num_tiles);
+
+// Synchronization
+void __Runtime_wait_event(struct_event ev);
+void __Runtime_wait_io(struct_ioevent io_ev);
+/* C only: single name for emitted host. */
+#ifndef __cplusplus
+#define __Runtime_wait(x) _Generic((x), struct_event: __Runtime_wait_event, struct_ioevent: __Runtime_wait_io)(x)
+#else
+/* C++ overloads so emitted host can call __Runtime_wait(event_or_ioevent) */
+inline void __Runtime_wait(struct_event ev) { __Runtime_wait_event(ev); }
+inline void __Runtime_wait(struct_ioevent ev) { __Runtime_wait_io(ev); }
+#endif
+
+// Kernel log reader (reads log entries from core tile data memory)
+void __Runtime_read_kernel_log(XAie_DevInst *dev, XAie_LocType tile);
+
+// Data movement wrappers (wraps XAie routing APIs)
+void __Runtime_move_data_to_tile(XAie_RoutingInstance *routing, XAie_LocType shim_tile, XAie_LocType dest_tile,
+                                 XAie_MemInst *mem, uint32_t size, uint32_t tile_offset);
+
+void __Runtime_move_data_from_tile(XAie_RoutingInstance *routing, XAie_LocType src_tile, XAie_LocType shim_tile,
+                                   XAie_MemInst *mem, uint32_t tile_offset, uint32_t size);
+
+#endif // AIE_RUNTIME_H

@@ -157,6 +157,13 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         return op->emitError("no core group found in stream configuration");
     }
 
+    // --- Allocate unique flow index for port naming ---
+    static int ioIdx = 0;
+    int curIoIdx = ioIdx++;
+    std::ostringstream dioNameStream;
+    dioNameStream << "dio" << curIoIdx;
+    // Prefix for making port symbol names unique across multiple data flows
+    std::string flowPrefix = "f" + std::to_string(curIoIdx) + "_";
 
     // --- 2. Build core tile list for createDataIO ---
     SmallVector<Point, 4> coreTilePoints;
@@ -174,12 +181,19 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         auto coreTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("core"), rewriter.getI64IntegerAttr(col), rewriter.getI64IntegerAttr(row));
         coreTiles.push_back(coreTile);
 
-        std::string inPortName = "corePortIn" + std::to_string(i);
-        auto portInOp = rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("In"), rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0));
+        std::string inPortName = flowPrefix + "corePortIn" + std::to_string(i);
+        auto portInOp =
+            rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("In"),
+                                           rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0), nullptr);
         corePortsInValues.push_back(portInOp.getResult());
 
-        std::string outPortName = "corePortOut" + std::to_string(i);
-        corePortsOutOps.push_back(rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("Out"), rewriter.getStringAttr(outPortName), rewriter.getI64IntegerAttr(0)));
+        std::string outPortName = flowPrefix + "corePortOut" + std::to_string(i);
+        auto pktId = router.getRM()->allocatePktId(-1);
+        assert(pktId.has_value() && "pkt_id pool exhausted (max 31)");
+        auto pktIdAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(pktId.value()));
+        corePortsOutOps.push_back(rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("Out"),
+                                                                 rewriter.getStringAttr(outPortName),
+                                                                 rewriter.getI64IntegerAttr(0), pktIdAttr));
     }
     
     // --- 3. Use router to allocate shim column and channel ---
@@ -189,11 +203,7 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     //          - For Push (MM2S): shim -> cores, so destination is the FIRST core tile
     //          - For Pull (S2MM): cores -> shim, so shim destination relies on LAST core tile
     // Rule #3: Mem tile (if exists) is located in the SAME column as the shim tile
-    
-    static int ioIdx = 0;
-    std::ostringstream dioNameStream;
-    dioNameStream << "dio" << ioIdx++;
-    
+
     // Get the target core tile for shim allocation
     // - For Push: shim is source, so use first core tile (destination)
     // - For Pull: shim is destination, so use last core tile (source)
@@ -220,13 +230,15 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     auto shimTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("shim"), 
                                                     rewriter.getI64IntegerAttr(shimcol), 
                                                     rewriter.getI64IntegerAttr(0));
-    auto shimPortOut = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("Out"), 
-                                                       rewriter.getStringAttr("shimPortOut"), 
-                                                       rewriter.getI64IntegerAttr(channel));  // Same channel
-    auto shimPortIn = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("In"), 
-                                                      rewriter.getStringAttr("shimPortIn"), 
-                                                      rewriter.getI64IntegerAttr(channel));   // Same channel
-    
+    auto shimPortOut = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("Out"),
+                                                      rewriter.getStringAttr(flowPrefix + "shimPortOut"),
+                                                      rewriter.getI64IntegerAttr(channel), // Same channel
+                                                      nullptr);                            // dmapktid
+    auto shimPortIn = rewriter.create<dmaphop::port>(loc, shimTile, rewriter.getStringAttr("In"),
+                                                     rewriter.getStringAttr(flowPrefix + "shimPortIn"),
+                                                     rewriter.getI64IntegerAttr(channel), // Same channel
+                                                     nullptr);                            // dmapktid
+
     // --- 5. Create mem tile if needed ---
     // Note: Mem tile is in the SAME column as shim tile (Rule #3)
     dmaphop::tile memTile;
@@ -236,12 +248,14 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         memTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("mem"), 
                                                   rewriter.getI64IntegerAttr(shimcol),  // Same col as shim (Rule #3)
                                                   rewriter.getI64IntegerAttr(0));
-        memPortIn = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("In"), 
-                                                    rewriter.getStringAttr("memPortIn"), 
-                                                    rewriter.getI64IntegerAttr(0));
-        memPortOut = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("Out"), 
-                                                     rewriter.getStringAttr("memPortOut"), 
-                                                     rewriter.getI64IntegerAttr(0));
+        memPortIn = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("In"),
+                                                   rewriter.getStringAttr(flowPrefix + "memPortIn"),
+                                                   rewriter.getI64IntegerAttr(0),
+                                                   nullptr); // dmapktid
+        memPortOut = rewriter.create<dmaphop::port>(loc, memTile, rewriter.getStringAttr("Out"),
+                                                    rewriter.getStringAttr(flowPrefix + "memPortOut"),
+                                                    rewriter.getI64IntegerAttr(0),
+                                                    nullptr); // dmapktid
     }
     
 
@@ -262,55 +276,55 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         // Push: SHIM (In) -> [MEM (Out)] -> CORES (In)
         // Producers: shimPortIn (for shim), memPortOut (if mem exists)
         // Consumers: all corePortIn
-        
+
         if (memTile) { // SHIM -> MEM -> CORES
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, memPortIn).getResult());
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, corePortsInValues[0]).getResult());
             // Producers: shimPortIn (shim receives from DDR), memPortOut (mem sends to cores)
-            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortIn"));
-            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "memPortOut"));
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "shimPortIn"));
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "memPortOut"));
         } else { // SHIM -> CORES
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, shimPortOut, corePortsInValues[0]).getResult());
             // Producer: shimPortIn (shim receives from DDR to send into fabric)
-            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortIn"));
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "shimPortIn"));
         }
-        
+
         // All core input ports are consumers
         for (size_t i = 0; i < corePortsInValues.size(); ++i) {
-            std::string inPortName = "corePortIn" + std::to_string(i);
+            std::string inPortName = flowPrefix + "corePortIn" + std::to_string(i);
             consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), inPortName));
         }
-        
+
         // Create hops between cores (if multiple cores)
         for (size_t i = 0; i < corePortsOutOps.size() - 1; ++i) {
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps[i], corePortsInValues[i+1]).getResult());
         }
-        
+
     } else { // Pull
         // Pull: CORES (Out) -> [MEM (In)] -> SHIM (Out)
         // Producers: all corePortOut, memPortIn (if mem exists)
         // Consumers: shimPortOut (for shim sends to DDR)
-        
+
         if (memTile) { // CORES -> MEM -> SHIM
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, shimPortIn).getResult());
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps.back(), memPortIn).getResult());
             // Producers: all core output ports, memPortIn (mem receives from cores)
             for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
-                std::string outPortName = "corePortOut" + std::to_string(i);
+                std::string outPortName = flowPrefix + "corePortOut" + std::to_string(i);
                 producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), outPortName));
             }
-            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "memPortIn"));
+            producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "memPortIn"));
             // Consumer: shimPortOut (shim sends to DDR)
-            consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortOut"));
+            consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "shimPortOut"));
         } else { // CORES -> SHIM
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps.back(), shimPortIn).getResult());
             // Producers: all core output ports
             for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
-                std::string outPortName = "corePortOut" + std::to_string(i);
+                std::string outPortName = flowPrefix + "corePortOut" + std::to_string(i);
                 producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), outPortName));
             }
             // Consumer: shimPortOut (shim sends to DDR)
-            consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), "shimPortOut"));
+            consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "shimPortOut"));
         }
         
         // Create hops between cores (if multiple cores)
@@ -323,12 +337,11 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     mlir::MLIRContext *ctx = rewriter.getContext();
     ArrayAttr produceArray = rewriter.getArrayAttr(producerPortSymbols);
     mlir::ArrayAttr consumeArray = mlir::ArrayAttr::get(ctx, consumerPortSymbols);
-    
+
     // For Push: shim/mem produces, cores consume
     // For Pull: cores produce, shim/mem consumes
-    auto path = (direction == DataflowDirection::Push)
-        ? rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}))
-        : rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}));
+    // pkt_id is now stored per-port on each corePortOut{i} (dmapktid attribute)
+    auto path = rewriter.create<dmaphop::create_path>(loc, hops, produceArray, consumeArray, rewriter.getArrayAttr({}));
 
     // Replaced dmaphop.alloc_buffer with tensor.extract_slice on the data tensor
     SmallVector<Value, 4> coreBuffers;
