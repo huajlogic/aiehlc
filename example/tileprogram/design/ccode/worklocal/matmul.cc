@@ -2,34 +2,33 @@
 // C_tile[8x8] = A_tile[8x16] * B_tile^T[8x16], int8
 // B transposed: C[i][j] = dot(A_row[i,:], B_row[j,:])
 //
-// 2 input rounds (4x16 per acquire), 4 output rounds (4x4 per acquire)
-// Round 1: cache A0,B0 + compute 1 sub-block
-// Round 2: use cached + new data, compute 3 sub-blocks
-#define CHUNK_M 4
-#define CHUNK_N 4
+// Matches pipeline: BUF_SZ=16 (64 bytes), 2 symmetric iterations
+// Output DMA BD len=8 (32 bytes per cycle), ping-pong = 64 bytes total
+// Iter 0: cache A0,B0, write C[0:3,0:3] + zeros → 32 bytes
+// Iter 1: compute C[4:7,0:3] and C[4:7,4:7] → 32 bytes
 #define K_DIM 16
 
 void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, output_window_int8 *window_out_0) {
 
-    // Local cache for round-1 data reuse in round-2
-    int8_t cache_A[CHUNK_M * K_DIM]; // 4 x 16 = 64 bytes
-    int8_t cache_B[CHUNK_M * K_DIM]; // 4 x 16 = 64 bytes
+    // Local cache for round-0 data
+    int8_t cache_A[4 * K_DIM]; // 4 x 16 = 64 bytes
+    int8_t cache_B[4 * K_DIM]; // 4 x 16 = 64 bytes
 
-    // ===== Round 1: acquire + cache + compute 1 sub-block =====
-    int8_t *A0 = (int8_t *)acquire_input_window(window_in_0); // A[0:3, 0:15]
-    int8_t *B0 = (int8_t *)acquire_input_window(window_in_1); // B[0:3, 0:15]
+    // ===== Iter 0: read A[0:3,:], B[0:3,:], cache, write partial output =====
+    int8_t *A0 = (int8_t *)acquire_input_window(window_in_0);
+    int8_t *B0 = (int8_t *)acquire_input_window(window_in_1);
 
-    // Cache for reuse in round 2
-    for (int i = 0; i < CHUNK_M * K_DIM; i++) {
+    // Cache for use in iter 1
+    for (int i = 0; i < 4 * K_DIM; i++) {
         cache_A[i] = A0[i];
         cache_B[i] = B0[i];
     }
 
-    // Compute C[0:3, 0:3] = dot(A0, B0^T)
+    // Write 32 bytes: C[0:3, 0:3] = A0 * B0^T, columns 4-7 = 0
     {
         int8_t *out = acquire_output_window(window_out_0);
-        for (int i = 0; i < CHUNK_M; i++) {
-            for (int j = 0; j < CHUNK_N; j++) {
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
                 int16_t sum = 0;
                 for (int k = 0; k < K_DIM; k++) {
                     sum += (int16_t)A0[i * K_DIM + k] * (int16_t)B0[j * K_DIM + k];
@@ -38,7 +37,10 @@ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, outp
                     sum = 127;
                 else if (sum < -128)
                     sum = -128;
-                out[i * CHUNK_N + j] = (int8_t)sum;
+                out[i * 8 + j] = (int8_t)sum;
+            }
+            for (int j = 4; j < 8; j++) {
+                out[i * 8 + j] = 0;
             }
         }
         release_output_window(window_out_0);
@@ -47,34 +49,16 @@ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, outp
     release_input_window(window_in_0);
     release_input_window(window_in_1);
 
-    // ===== Round 2: acquire + compute 3 sub-blocks =====
-    int8_t *A1 = (int8_t *)acquire_input_window(window_in_0); // A[4:7, 0:15]
-    int8_t *B1 = (int8_t *)acquire_input_window(window_in_1); // B[4:7, 0:15]
+    // ===== Iter 1: read A[4:7,:], B[4:7,:], compute remaining output =====
+    int8_t *A1 = (int8_t *)acquire_input_window(window_in_0);
+    int8_t *B1 = (int8_t *)acquire_input_window(window_in_1);
 
-    // Sub-block 2: C[0:3, 4:7] = dot(cached_A0, B1^T)
+    // Write 32 bytes: C[4:7, 0:3] + C[4:7, 4:7]
     {
         int8_t *out = acquire_output_window(window_out_0);
-        for (int i = 0; i < CHUNK_M; i++) {
-            for (int j = 0; j < CHUNK_N; j++) {
-                int16_t sum = 0;
-                for (int k = 0; k < K_DIM; k++) {
-                    sum += (int16_t)cache_A[i * K_DIM + k] * (int16_t)B1[j * K_DIM + k];
-                }
-                if (sum > 127)
-                    sum = 127;
-                else if (sum < -128)
-                    sum = -128;
-                out[i * CHUNK_N + j] = (int8_t)sum;
-            }
-        }
-        release_output_window(window_out_0);
-    }
-
-    // Sub-block 3: C[4:7, 0:3] = dot(A1, cached_B0^T)
-    {
-        int8_t *out = acquire_output_window(window_out_0);
-        for (int i = 0; i < CHUNK_M; i++) {
-            for (int j = 0; j < CHUNK_N; j++) {
+        // C[4:7, 0:3] = A1 * cached_B0^T
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
                 int16_t sum = 0;
                 for (int k = 0; k < K_DIM; k++) {
                     sum += (int16_t)A1[i * K_DIM + k] * (int16_t)cache_B[j * K_DIM + k];
@@ -83,17 +67,12 @@ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, outp
                     sum = 127;
                 else if (sum < -128)
                     sum = -128;
-                out[i * CHUNK_N + j] = (int8_t)sum;
+                out[i * 8 + j] = (int8_t)sum;
             }
         }
-        release_output_window(window_out_0);
-    }
-
-    // Sub-block 4: C[4:7, 4:7] = dot(A1, B1^T)
-    {
-        int8_t *out = acquire_output_window(window_out_0);
-        for (int i = 0; i < CHUNK_M; i++) {
-            for (int j = 0; j < CHUNK_N; j++) {
+        // C[4:7, 4:7] = A1 * B1^T
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
                 int16_t sum = 0;
                 for (int k = 0; k < K_DIM; k++) {
                     sum += (int16_t)A1[i * K_DIM + k] * (int16_t)B1[j * K_DIM + k];
@@ -102,7 +81,7 @@ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, outp
                     sum = 127;
                 else if (sum < -128)
                     sum = -128;
-                out[i * CHUNK_N + j] = (int8_t)sum;
+                out[i * 8 + j + 4] = (int8_t)sum;
             }
         }
         release_output_window(window_out_0);
