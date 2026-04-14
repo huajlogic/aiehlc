@@ -34,7 +34,7 @@ AIEHLC_DIR="${AIEHLC_ROOT}"
 WORKLOCAL_DIR="${AIEHLC_ROOT}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal"
 BUILD_DIR="${WORKLOCAL_DIR}/build"
 
-KERNEL_FUNC_NAME="dskernel_receiver"   # matches the kernel function in host.cc
+KERNEL_FUNC_NAME="computekernel"   # matches the kernel function in host.cc
 
 pushd ${WORKLOCAL_DIR}
 source ./compile_kernel.sh "${KERNEL_FUNC_NAME}"

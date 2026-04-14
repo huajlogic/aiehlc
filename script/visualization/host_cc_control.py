@@ -230,7 +230,7 @@ def parse_host_cc(text: str) -> List[SSAOp]:
     func_end = len(all_lines)
     depth = 0
     for i, line in enumerate(all_lines):
-        if re.search(r"\bhost_canonicalized\s*\(\s*\)\s*\{", line):
+        if re.search(r"\bhost_canonicalized\s*\([^)]*\)\s*\{", line):
             func_start = i + 1
             depth = 1
             continue
@@ -1115,6 +1115,17 @@ def build_trees(
         if op.op_type == "declaretensor":
             parent_var = op.operands[0] if op.operands else ""
             if parent_var not in def_map:  # literal, not an SSA result
+                t = _build_subtree(op, def_map, use_map, visited, view_mode)
+                if t:
+                    trees.append(t)
+
+    # Root buffer_offset ops whose base operand is a function argument (not in def_map).
+    # This captures shim tile DMA chains that start from function args (e.g. v1, v2, v3)
+    # rather than from mem_allocate or literal declaretensor ops.
+    for op in ops:
+        if op.op_type == "buffer_offset":
+            base_var = op.operands[0] if op.operands else ""
+            if base_var and base_var not in def_map:
                 t = _build_subtree(op, def_map, use_map, visited, view_mode)
                 if t:
                     trees.append(t)

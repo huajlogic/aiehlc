@@ -252,9 +252,9 @@ void __Runtime_memcpy(void *dst, const void *src, size_t bytes) {
 }
 
 /* Kernel ELF embedded as binary blob by hostcompile.sh (ld -EL -r -b binary + redefine_symbols) */
-extern unsigned char _binary_kernel_dskernel_receiver_start[];
-extern unsigned char _binary_kernel_dskernel_receiver_end[];
-extern unsigned int _binary_kernel_dskernel_receiver_size;
+extern unsigned char _binary_kernel_computekernel_start[];
+extern unsigned char _binary_kernel_computekernel_end[];
+extern unsigned int _binary_kernel_computekernel_size;
 
 XAie_DevInst *getOrCreateDeviceInstance() {
     if (g_DevInst == NULL) {
@@ -605,7 +605,7 @@ struct_kernel_group __Runtime_load_kernel_group_4t(XAie_LocType t0, XAie_LocType
                (unsigned)s_kernel_tiles[i].Row);
         XAie_CoreReset(g_DevInst, s_kernel_tiles[i]);
         XAie_CoreUnreset(g_DevInst, s_kernel_tiles[i]);
-        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_dskernel_receiver_start);
+        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_computekernel_start);
     }
 
     struct_kernel_group kg;
@@ -634,7 +634,7 @@ struct_kernel_group __Runtime_load_kernel_group_nt(XAie_LocType *tiles, int n) {
                (unsigned)s_kernel_tiles[i].Row);
         XAie_CoreReset(g_DevInst, s_kernel_tiles[i]);
         XAie_CoreUnreset(g_DevInst, s_kernel_tiles[i]);
-        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_dskernel_receiver_start);
+        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_computekernel_start);
     }
     struct_kernel_group kg;
     kg.tiles = s_kernel_tiles;

@@ -5,28 +5,32 @@
  * AIE Programming Model — Matrix Multiplication with Data Caching
  *
  * GEMM: C[16x16] = A[16x16] * B^T[16x16], int8
- * Deployed on a 2x2 AIE tile mesh.
+ * Deployed on a 4x4 AIE tile mesh.
  *
- * Current pipeline data distribution (actual routing):
- *   A[16x16]: split into A_top[8x16] and A_bot[8x16]
- *     SHIM(2,0) ch0 → A_top → tiles (0,3) and (1,3)
- *     SHIM(2,0) ch1 → A_bot → tiles (0,4) and (1,4)
- *   B[16x16]: split into B_top[8x16] and B_bot[8x16]
- *     SHIM(3,0) ch0 → B_top → tiles (0,3) and (1,3)
- *     SHIM(3,0) ch1 → B_bot → tiles (0,4) and (1,4)
+ * Current pipeline data distribution (row-based split, 4 groups):
+ *   A[16x16]: split into 4 partitions of A[4x16]
+ *     Group 0: A[0:3, :]   → broadcast to 4 tiles in row
+ *     Group 1: A[4:7, :]   → broadcast to 4 tiles in row
+ *     Group 2: A[8:11, :]  → broadcast to 4 tiles in row
+ *     Group 3: A[12:15, :] → broadcast to 4 tiles in row
+ *   B[16x16]: split into 4 partitions of B[4x16]
+ *     Group 0: B[0:3, :]   → broadcast to 4 tiles in row
+ *     Group 1: B[4:7, :]   → broadcast to 4 tiles in row
+ *     Group 2: B[8:11, :]  → broadcast to 4 tiles in row
+ *     Group 3: B[12:15, :] → broadcast to 4 tiles in row
  *
- * Each tile receives 8x16 A-partition + 8x16 B-partition via 2 DMA rounds:
- *   Round 0: A[0:3, 0:15] (64 bytes) + B[0:3, 0:15] (64 bytes)
- *   Round 1: A[4:7, 0:15] (64 bytes) + B[4:7, 0:15] (64 bytes)
+ * Each tile receives 4x16 A-partition + 4x16 B-partition via 2 DMA rounds:
+ *   Round 0: A[0:1, 0:15] (32 bytes) + B[0:1, 0:15] (32 bytes)
+ *   Round 1: A[2:3, 0:15] (32 bytes) + B[2:3, 0:15] (32 bytes)
  *
- * Kernel computes C_tile[8x8] = A_tile[8x16] * B_tile^T[8x16]
+ * Kernel computes C_tile[4x4] = A_tile[4x16] * B_tile^T[4x16]
  *   C_tile[i][j] = sum_{k=0}^{15} A_tile[i][k] * B_tile[j][k]
  *
  * Data caching strategy (matches DMA ping-pong):
- *   Round 0: cache A0[4x16], B0[4x16], write C[0:3, 0:3] to output (32 bytes)
- *   Round 1: use cached + new data, write C[4:7, 0:3]... to output (32 bytes)
+ *   Round 0: cache A0[2x16], B0[2x16], write partial C[0:1, 0:1] (8 bytes)
+ *   Round 1: use cached + new data, compute full C[4x4], write C[2:3, :] (8 bytes)
  *
- * NOTE: With current pipeline, tiles (0,3)/(1,3) produce redundant output
+ * NOTE: With row-based split, tiles in same column produce redundant output
  * (same inputs). Host assembles them at different C offsets.
  *
  ******************************************************************************/
@@ -41,68 +45,70 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // KERNEL: matmul
 //
-// Matches current MLIR pipeline infrastructure:
-//   - BUF_SZ = 16 (v4int8 units = 64 bytes) for all windows
+// Matches current MLIR pipeline infrastructure for 4x4 mesh:
+//   - BUF_SZ = 8 (v4int8 units = 32 bytes) for ping-pong buffers
 //   - 2 symmetric iterations: each iter does 1 input acquire + 1 output acquire
-//   - Input: 64 bytes per acquire (4 rows x 16 cols int8)
-//   - Output DMA BD len=8 (32 bytes transferred per cycle)
+//   - Input: 32 bytes per acquire (2 rows x 16 cols int8)
+//   - Output DMA BD len=2 (8 bytes transferred per cycle)
 //
-// Per-tile computation: C_tile[8x8] = A_tile[8x16] * B_tile^T[8x16]
+// Per-tile computation: C_tile[4x4] = A_tile[4x16] * B_tile^T[4x16]
 //   C_tile[i][j] = sum_k A_tile[i][k] * B_tile[j][k]
 //
-// Iter 0: read A[0:3,:], B[0:3,:], cache both
-//         write first 32 bytes of output (garbage/placeholder - overwritten)
-// Iter 1: read A[4:7,:], B[4:7,:], now have all 8 rows of A and B
-//         compute full 8x8 result using cached + new data
-//         write last 32 bytes of output
-//
-// The output DMA only transfers 32 bytes from each 64-byte buffer.
-// So we write the 8x8 result as two 32-byte chunks:
-//   Chunk 0: C[0:3, 0:7] = 4 rows x 8 cols = 32 bytes
-//   Chunk 1: C[4:7, 0:7] = 4 rows x 8 cols = 32 bytes
-//
-// PROBLEM: In iter 0, we only have B[0:3,:], not the full B[0:7,:].
-// We can compute C[i][j] for j in [0:3] but not j in [4:7].
-//
-// SOLUTION: Write the full 8x8 output in iter 1 only, using both cached
-// and new data. In iter 0, write a dummy/partial output that will be
-// overwritten or that the DMA picks up as the first 32 bytes.
-//
-// Actually, the cleanest approach for the 2-iter symmetric loop:
-// Each iter reads A_chunk[4x16] + B_chunk[4x16], computes partial 4x8
-// C rows using ONLY that iteration's B_chunk as the j-index:
-//   Iter 0: compute C[0:3, 0:3] = A0 * B0^T  → but this is 4x4 = 16 bytes
-//           pad to 32 bytes (rest unused) → DMA picks up 32 bytes
-//   Iter 1: compute C[4:7, 0:3] = A1 * B0_cached^T  → but also 4x4
-//
-// None of these work cleanly. The simplest correct approach:
-// Use iter 0 to cache, iter 1 to compute everything. Fill output in both
-// iters but only iter 1 output matters (both go to host via different
-// ping/pong buffers).
+// Iter 0: read A[0:1,:], B[0:1,:], cache both
+//         write 8 bytes of output: C[0:1, 0:1] = A0 * B0^T (partial)
+// Iter 1: read A[2:3,:], B[2:3,:], now have all 4 rows of A and B
+//         compute C[2:3, 0:1] and C[2:3, 2:3] using cached + new data
+//         write 8 bytes of output
 // ═══════════════════════════════════════════════════════════════════════════
+// Debug flag: when enabled, skip matmul and fill output with encoded tile ID.
+// Each output byte = row[0:2] | col[3:5] | round[6:7]
+// This lets you identify which tile and round produced each output byte.
+
 __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
                        output_window_int8 *window_out_0) {
+#define BUF_SZ_OUT 8
 #define K_DIM 16
+#define DEBUG_OUTPUT_ORDER 1
+#if DEBUG_OUTPUT_ORDER
+    unsigned coreid = get_coreid();
+    int col = coreid >> 16;
+    int row = coreid & 0x1F;
+    klog("DEBUG", 1);
+    for (int round = 0; round < 2; round++) {
+        int8_t *in0 = (int8_t *)acquire_input_window(window_in_0);
+        int8_t *in1 = (int8_t *)acquire_input_window(window_in_1);
+        int8_t *out = (int8_t *)acquire_output_window(window_out_0);
 
+        // Encode: bits[0:2]=row, bits[3:5]=col, bits[6:7]=round
+        int8_t tag = (int8_t)((row & 0x7) | ((col & 0x7) << 3) | ((round & 0x3) << 6));
+        for (int i = 0; i < BUF_SZ_OUT; i++) {
+            out[i] = tag;
+        }
+
+        release_output_window(window_out_0);
+        release_input_window(window_in_0);
+        release_input_window(window_in_1);
+    }
+#else
     // Local cache for round-0 data
-    int8_t cache_A[4 * K_DIM]; // 4 x 16 = 64 bytes
-    int8_t cache_B[4 * K_DIM]; // 4 x 16 = 64 bytes
+    int8_t cache_A[2 * K_DIM]; // 2 x 16 = 32 bytes
+    int8_t cache_B[2 * K_DIM]; // 2 x 16 = 32 bytes
 
-    // ===== Iter 0: read A[0:3,:], B[0:3,:], cache, write partial output =====
+    // ===== Iter 0: read A[0:1,:], B[0:1,:], cache, write partial output =====
     int8_t *A0 = (int8_t *)acquire_input_window(window_in_0);
     int8_t *B0 = (int8_t *)acquire_input_window(window_in_1);
 
     // Cache for use in iter 1
-    for (int i = 0; i < 4 * K_DIM; i++) {
+    for (int i = 0; i < 2 * K_DIM; i++) {
         cache_A[i] = A0[i];
         cache_B[i] = B0[i];
     }
 
-    // Write 32 bytes: C[0:3, 0:3] = A0 * B0^T, columns 4-7 = 0
+    // Write 8 bytes: C[0:1, 0:1] = A0 * B0^T, columns 2-3 = 0
     {
         int8_t *out = acquire_output_window(window_out_0);
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 2; i++) {
+            for (int j = 0; j < 2; j++) {
                 int16_t sum = 0;
                 for (int k = 0; k < K_DIM; k++) {
                     sum += (int16_t)A0[i * K_DIM + k] * (int16_t)B0[j * K_DIM + k];
@@ -111,10 +117,10 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
                     sum = 127;
                 else if (sum < -128)
                     sum = -128;
-                out[i * 8 + j] = (int8_t)sum;
+                out[i * 4 + j] = (int8_t)sum;
             }
-            for (int j = 4; j < 8; j++) {
-                out[i * 8 + j] = 0;
+            for (int j = 2; j < 4; j++) {
+                out[i * 4 + j] = 0;
             }
         }
         release_output_window(window_out_0);
@@ -123,16 +129,16 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
     release_input_window(window_in_0);
     release_input_window(window_in_1);
 
-    // ===== Iter 1: read A[4:7,:], B[4:7,:], compute remaining output =====
+    // ===== Iter 1: read A[2:3,:], B[2:3,:], compute remaining output =====
     int8_t *A1 = (int8_t *)acquire_input_window(window_in_0);
     int8_t *B1 = (int8_t *)acquire_input_window(window_in_1);
 
-    // Write 32 bytes: C[4:7, 0:3] + C[4:7, 4:7]
+    // Write 8 bytes: C[2:3, 0:1] + C[2:3, 2:3]
     {
         int8_t *out = acquire_output_window(window_out_0);
-        // C[4:7, 0:3] = A1 * cached_B0^T
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
+        // C[2:3, 0:1] = A1 * cached_B0^T
+        for (int i = 0; i < 2; i++) {
+            for (int j = 0; j < 2; j++) {
                 int16_t sum = 0;
                 for (int k = 0; k < K_DIM; k++) {
                     sum += (int16_t)A1[i * K_DIM + k] * (int16_t)cache_B[j * K_DIM + k];
@@ -141,12 +147,12 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
                     sum = 127;
                 else if (sum < -128)
                     sum = -128;
-                out[i * 8 + j] = (int8_t)sum;
+                out[i * 4 + j] = (int8_t)sum;
             }
         }
-        // C[4:7, 4:7] = A1 * B1^T
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
+        // C[2:3, 2:3] = A1 * B1^T
+        for (int i = 0; i < 2; i++) {
+            for (int j = 0; j < 2; j++) {
                 int16_t sum = 0;
                 for (int k = 0; k < K_DIM; k++) {
                     sum += (int16_t)A1[i * K_DIM + k] * (int16_t)B1[j * K_DIM + k];
@@ -155,7 +161,7 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
                     sum = 127;
                 else if (sum < -128)
                     sum = -128;
-                out[i * 8 + j + 4] = (int8_t)sum;
+                out[i * 4 + j + 2] = (int8_t)sum;
             }
         }
         release_output_window(window_out_0);
@@ -163,6 +169,7 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
 
     release_input_window(window_in_0);
     release_input_window(window_in_1);
+#endif
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -174,15 +181,15 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
 // verify_matmul: computes full matmul, then maps tile outputs back to the
 //   full result matrix for comparison, accounting for DMA layout.
 //
-// Pipeline data distribution (actual routing):
-//   tile(0,3): A[0:7,:] + B[0:7,:]  → output at C[0:63]
-//   tile(1,3): A[0:7,:] + B[0:7,:]  → output at C[64:127]  (REDUNDANT)
-//   tile(0,4): A[8:15,:] + B[8:15,:] → output at C[128:191]
-//   tile(1,4): A[8:15,:] + B[8:15,:] → output at C[192:255] (REDUNDANT)
+// Pipeline data distribution (4x4 mesh, row-based split, 4 groups):
+//   Group 0 (4 tiles): A[0:3,:] + B[0:3,:]   → 4 tiles produce redundant 4x4
+//   Group 1 (4 tiles): A[4:7,:] + B[4:7,:]   → 4 tiles produce redundant 4x4
+//   Group 2 (4 tiles): A[8:11,:] + B[8:11,:] → 4 tiles produce redundant 4x4
+//   Group 3 (4 tiles): A[12:15,:] + B[12:15,:] → 4 tiles produce redundant 4x4
 //
-// Per-tile DMA output (64 bytes = 2 cycles of 32 bytes):
-//   Cycle 0 (bytes 0-31): rows 0-3, cols 0-3 valid, cols 4-7 = 0
-//   Cycle 1 (bytes 32-63): rows 4-7, cols 0-7 all valid
+// Per-tile DMA output (16 bytes = 2 cycles of 8 bytes):
+//   Cycle 0 (bytes 0-7): rows 0-1, cols 0-1 valid, cols 2-3 = 0
+//   Cycle 1 (bytes 8-15): rows 2-3, cols 0-3 all valid
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Pure scalar matmul: C_ref[M][N] = A[M][K] * B^T[N][K]
@@ -207,51 +214,55 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     int8_t C_ref[M * N];
     scalar_matmul(C_ref, A, B);
 
-    // Each tile outputs an 8x8 sub-block of C_ref
-    // tile row_start col_start  (in the full 16x16 matrix)
-    //  0     0         0
-    //  1     0         0    (redundant)
-    //  2     8         8
-    //  3     8         8    (redundant)
-    const struct {
-        int offset;
-        int row_start;
-        int col_start;
-    } tiles[4] = {{0, 0, 0}, {64, 0, 0}, {128, 8, 8}, {192, 8, 8}};
+    // 4x4 mesh = 16 tiles, 4 groups of 4 tiles each
+    // Each group: 4 tiles produce redundant 4x4 sub-blocks
+    // Group g: row_start = g*4, col_start = g*4 in the full 16x16 matrix
+    // Each tile outputs 16 bytes (4x4 sub-block)
+    // Tiles within a group are at consecutive offsets (16 bytes apart)
+    const int TILES_PER_GROUP = 4;
+    const int NUM_GROUPS = 4;
+    const int TILE_OUT_SIZE = 16; // 4x4 = 16 bytes per tile
+    const int TILE_ROWS = 4;
+    const int TILE_COLS = 4;
 
     int mismatches = 0;
-    for (int t = 0; t < 4; t++) {
-        int base = tiles[t].offset;
-        int rs = tiles[t].row_start;
-        int cs = tiles[t].col_start;
+    for (int g = 0; g < NUM_GROUPS; g++) {
+        int rs = g * 4; // row start in full matrix
+        int cs = g * 4; // col start in full matrix
 
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < 8; j++) {
-                // DMA layout: cycle 0 rows 0-3 cols 4-7 are zero-filled
-                int8_t expected = (i < 4 && j >= 4) ? 0 : C_ref[(rs + i) * N + (cs + j)];
-                int flat = base + i * 8 + j;
-                if (C[flat] != expected) {
-                    printf("MISMATCH C[%d] (tile %d, row %d, col %d): "
-                           "got %d, expected %d\n",
-                           flat, t, i, j, C[flat], expected);
-                    mismatches++;
+        for (int t = 0; t < TILES_PER_GROUP; t++) {
+            int tile_idx = g * TILES_PER_GROUP + t;
+            int base = tile_idx * TILE_OUT_SIZE;
+
+            for (int i = 0; i < TILE_ROWS; i++) {
+                for (int j = 0; j < TILE_COLS; j++) {
+                    // DMA layout: cycle 0 rows 0-1 cols 2-3 are zero-filled
+                    int8_t expected = (i < 2 && j >= 2) ? 0 : C_ref[(rs + i) * N + (cs + j)];
+                    int flat = base + i * TILE_COLS + j;
+                    if (C[flat] != expected) {
+                        printf("MISMATCH C[%d] (group %d, tile %d, row %d, col %d): "
+                               "got %d, expected %d\n",
+                               flat, g, t, i, j, C[flat], expected);
+                        mismatches++;
+                    }
                 }
             }
         }
     }
 
+    int total_elements = NUM_GROUPS * TILES_PER_GROUP * TILE_OUT_SIZE;
     if (mismatches == 0)
-        printf("PASS: all %d elements match.\n", M * N);
+        printf("PASS: all %d elements match.\n", total_elements);
     else
-        printf("FAIL: %d mismatches out of %d.\n", mismatches, M * N);
+        printf("FAIL: %d mismatches out of %d.\n", mismatches, total_elements);
 
-    // Print sample: tile 0, cycle 0 (rows 0-3)
-    printf("\nSample output C[0:3][0:7] (tile 0,3 cycle 0):\n");
+    // Print sample: group 0, tile 0 (rows 0-3)
+    printf("\nSample output C[0:3][0:3] (group 0, tile 0):\n");
     for (int i = 0; i < 4; i++) {
         printf("  [");
-        for (int j = 0; j < 8; j++) {
-            printf("%4d", C[i * 8 + j]);
-            if (j < 7)
+        for (int j = 0; j < 4; j++) {
+            printf("%4d", C[i * 4 + j]);
+            if (j < 3)
                 printf(",");
         }
         printf("]\n");
@@ -288,12 +299,12 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
 // HOST
 // ═══════════════════════════════════════════════════════════════════════════
 int main() {
-    printf("=== Matrix Multiply with Data Caching on AIE 2x2 Mesh ===\n");
+    printf("=== Matrix Multiply with Data Caching on AIE 4x4 Mesh ===\n");
     printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);
 
     // --- Device + mesh ---
     aieSetDevice(0);
-    aieDim mesh(2, 2);
+    aieDim mesh(4, 4);
 
     // --- Allocate host memory ---
     int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t));

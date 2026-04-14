@@ -127,25 +127,30 @@ public:
 				 prepos = std::string::npos;
 			 }
 
-             // Remove #ifdef KERNEL_COMPILE and #endif guards added during preprocessing
+             // Remove #ifdef KERNEL_COMPILE / #endif guard pairs added during
+             // preprocessing.  Only remove #endif lines that were inserted to
+             // close the KERNEL_COMPILE guard — leave user #endif directives
+             // (e.g. #ifdef DEBUG_OUTPUT_ORDER) intact.
              std::string ifdefToRemove = "#ifdef KERNEL_COMPILE";
              while ((pos = str.find(ifdefToRemove)) != std::string::npos) {
-                 // Find the end of line after #ifdef KERNEL_COMPILE
+                 // Erase the #ifdef KERNEL_COMPILE line
                  auto endOfLine = str.find("\n", pos);
                  if (endOfLine != std::string::npos) {
                      str.erase(pos, endOfLine - pos + 1);
                  } else {
                      str.erase(pos, ifdefToRemove.size());
                  }
-             }
-             std::string endifToRemove = "#endif";
-             while ((pos = str.find(endifToRemove)) != std::string::npos) {
-                 // Find the end of line after #endif
-                 auto endOfLine = str.find("\n", pos);
-                 if (endOfLine != std::string::npos) {
-                     str.erase(pos, endOfLine - pos + 1);
-                 } else {
-                     str.erase(pos, endifToRemove.size());
+                 // Find and erase the matching #endif (last one in the string,
+                 // since the KERNEL_COMPILE guard wraps the entire body).
+                 std::string endifToRemove = "#endif";
+                 auto lastEndif = str.rfind(endifToRemove);
+                 if (lastEndif != std::string::npos) {
+                     auto endOfEndifLine = str.find("\n", lastEndif);
+                     if (endOfEndifLine != std::string::npos) {
+                         str.erase(lastEndif, endOfEndifLine - lastEndif + 1);
+                     } else {
+                         str.erase(lastEndif, endifToRemove.size());
+                     }
                  }
              }
 
@@ -375,15 +380,39 @@ public:
 					const Expr *meshArg = CE->getArg(1)->IgnoreParenImpCasts();
 					if (const auto *Construct = dyn_cast<CXXConstructExpr>(meshArg)) {
 						if (Construct->getNumArgs() >= 2) {
-							clang::Expr::EvalResult r0, r1;
+                            // Direct construction: __aie_launch("k", aieDim(4,4), ...)
+                            clang::Expr::EvalResult r0, r1;
 							if (Construct->getArg(0)->EvaluateAsInt(r0, *Context) &&
 								Construct->getArg(1)->EvaluateAsInt(r1, *Context)) {
 								tilingMeshRows = r0.Val.getInt().getExtValue();
 								tilingMeshCols = r1.Val.getInt().getExtValue();
 								llvm::outs() << "[TilingLinalg] Mesh: " << tilingMeshRows << " x " << tilingMeshCols << "\n";
 							}
-						}
-					} else if (const auto *DR = dyn_cast<DeclRefExpr>(meshArg)) {
+                        } else if (Construct->getNumArgs() == 1) {
+                            // Copy/move constructor: __aie_launch("k", mesh, ...) where mesh is by-value
+                            // Look through the copy to find the original DeclRefExpr
+                            const Expr *inner = Construct->getArg(0)->IgnoreParenImpCasts();
+                            if (const auto *DR = dyn_cast<DeclRefExpr>(inner)) {
+                                if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
+                                    if (VD->hasInit()) {
+                                        if (const auto *InitConstruct =
+                                                dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
+                                            if (InitConstruct->getNumArgs() >= 2) {
+                                                clang::Expr::EvalResult r0, r1;
+                                                if (InitConstruct->getArg(0)->EvaluateAsInt(r0, *Context) &&
+                                                    InitConstruct->getArg(1)->EvaluateAsInt(r1, *Context)) {
+                                                    tilingMeshRows = r0.Val.getInt().getExtValue();
+                                                    tilingMeshCols = r1.Val.getInt().getExtValue();
+                                                    llvm::outs() << "[TilingLinalg] Mesh (from copy-ctor var): "
+                                                                 << tilingMeshRows << " x " << tilingMeshCols << "\n";
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if (const auto *DR = dyn_cast<DeclRefExpr>(meshArg)) {
 						// mesh variable already declared — get rows/cols from its initializer
 						if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
 							if (VD->hasInit()) {

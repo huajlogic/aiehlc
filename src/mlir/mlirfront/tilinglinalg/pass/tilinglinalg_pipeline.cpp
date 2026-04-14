@@ -599,25 +599,25 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "\n";
             // Debug: print in0 values
             stream << "        // Debug: dump in0 buffer contents\n";
-            stream << "        klog(\"IN0\", BUF_SZ * 4);\n";
-            stream << "        for (int di = 0; di < BUF_SZ * 4; di++) {\n";
+            stream << "        klog(\"IN0\", BUF_SZ_IN_0 * 4);\n";
+            stream << "        for (int di = 0; di < BUF_SZ_IN_0 * 4; di++) {\n";
             stream << "            klog(\"IV\", (int)in0[di]);\n";
             stream << "        }\n";
             stream << "\n";
             stream << "        // GEMM kernel: out0[i] = in0[i] * in1[i]\n";
-            stream << "        for (int i = 0; i < BUF_SZ; i++) {\n";
+            stream << "        for (int i = 0; i < BUF_SZ_OUT_0; i++) {\n";
             stream << "            " << vecType << " data0 = *((" << vecType << " *)&in0[i * 4]);\n";
             if (numInputWindows > 1) {
                 stream << "            " << vecType << " data1 = *((" << vecType << " *)&in1[i * 4]);\n";
             }
             stream << "            *((" << vecType << " *)&out0[i * 4]) = data0;\n";
             stream << "        }\n";
-            stream << "        klog(\"CLOP\", BUF_SZ);\n";
+            stream << "        klog(\"CLOP\", BUF_SZ_OUT_0);\n";
             stream << "\n";
             // Debug: print out0 values
             stream << "        // Debug: dump out0 buffer contents\n";
-            stream << "        klog(\"OUT0\", BUF_SZ * 4);\n";
-            stream << "        for (int di = 0; di < BUF_SZ * 4; di++) {\n";
+            stream << "        klog(\"OUT0\", BUF_SZ_OUT_0 * 4);\n";
+            stream << "        for (int di = 0; di < BUF_SZ_OUT_0 * 4; di++) {\n";
             stream << "            klog(\"OV\", (int)out0[di]);\n";
             stream << "        }\n";
             stream << "\n";

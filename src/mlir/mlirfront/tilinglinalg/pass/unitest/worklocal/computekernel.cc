@@ -12,22 +12,22 @@ void computekernel(input_window_int8 *window_in_0, input_window_int8 *window_in_
         int8_t *out0 = (int8_t *)acquire_output_window(window_out_0);
 
         // Debug: dump in0 buffer contents
-        klog("IN0", BUF_SZ * 4);
-        for (int di = 0; di < BUF_SZ * 4; di++) {
+        klog("IN0", BUF_SZ_IN_0 * 4);
+        for (int di = 0; di < BUF_SZ_IN_0 * 4; di++) {
             klog("IV", (int)in0[di]);
         }
 
         // GEMM kernel: out0[i] = in0[i] * in1[i]
-        for (int i = 0; i < BUF_SZ; i++) {
+        for (int i = 0; i < BUF_SZ_OUT_0; i++) {
             v4int8 data0 = *((v4int8 *)&in0[i * 4]);
             v4int8 data1 = *((v4int8 *)&in1[i * 4]);
             *((v4int8 *)&out0[i * 4]) = data0;
         }
-        klog("CLOP", BUF_SZ);
+        klog("CLOP", BUF_SZ_OUT_0);
 
         // Debug: dump out0 buffer contents
-        klog("OUT0", BUF_SZ * 4);
-        for (int di = 0; di < BUF_SZ * 4; di++) {
+        klog("OUT0", BUF_SZ_OUT_0 * 4);
+        for (int di = 0; di < BUF_SZ_OUT_0 * 4; di++) {
             klog("OV", (int)out0[di]);
         }
 

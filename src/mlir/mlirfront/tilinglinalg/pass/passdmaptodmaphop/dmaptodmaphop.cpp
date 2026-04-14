@@ -188,9 +188,16 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         corePortsInValues.push_back(portInOp.getResult());
 
         std::string outPortName = flowPrefix + "corePortOut" + std::to_string(i);
-        auto pktId = router.getRM()->allocatePktId(-1);
-        assert(pktId.has_value() && "pkt_id pool exhausted (max 31)");
-        auto pktIdAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(pktId.value()));
+        // Only allocate pkt_id for Pull (output) flows where core OUT ports
+        // are producers that need packet-switched routing to shim.
+        // For Push (input) flows, core OUT ports are only used for inter-core
+        // hop chaining and don't need pkt_ids (saves scarce 5-bit pkt_id pool).
+        mlir::IntegerAttr pktIdAttr = nullptr;
+        if (direction == DataflowDirection::Pull) {
+            auto pktId = router.getRM()->allocatePktId(-1);
+            assert(pktId.has_value() && "pkt_id pool exhausted (max 31)");
+            pktIdAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(pktId.value()));
+        }
         corePortsOutOps.push_back(rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("Out"),
                                                                  rewriter.getStringAttr(outPortName),
                                                                  rewriter.getI64IntegerAttr(0), pktIdAttr));

@@ -1046,7 +1046,7 @@ void routingtodfschedule(const std::string &irFilepath = "",
         module = *parsedModule;
         std::cout << "Parsed module from " << irFilepath << std::endl;
     } else {
-        module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors);
+        module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors);
     }
 
     // When startStage==0 and using the default pipeline, delegate to
@@ -1294,7 +1294,7 @@ void testMultidimBd(bool useCurrentDir = false) {
         {{16, 16}, 8, true},  // input B
         {{16, 16}, 8, false}, // output C
     };
-    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors);
+    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors);
 
     RoutingTopology rtopology("Gen2");
     std::string irDir = setupIRDir("multidim", useCurrentDir);

@@ -537,10 +537,13 @@ static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Locati
     params.kernelParams = analyzeKernelParams(rootOp, resourceMgr, params.elementType, params.bufferSize,
                                               params.vectorWidth, bufferRatio);
 
-    // Update params.bufferSize to match the dynamic param buffer size
-    // (used for kernel_config_def's BUF_SZ global define)
+    // Update params.bufferSize to the max of all per-window sizes
+    // (used for kernel_config_def's backward-compat BUF_SZ global define)
     if (!params.kernelParams.empty()) {
-        params.bufferSize = params.kernelParams[0].bufferSize;
+        int64_t maxBufSize = 0;
+        for (auto &kp : params.kernelParams)
+            maxBufSize = std::max(maxBufSize, kp.bufferSize);
+        params.bufferSize = maxBufSize;
         // Update element type from the actual tensor (e.g., i8 instead of default i32)
         if (params.kernelParams[0].elementType)
             params.elementType = params.kernelParams[0].elementType;
