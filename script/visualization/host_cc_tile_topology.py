@@ -775,13 +775,12 @@ def _map_blocks_to_flows(
 
         # Match against flows: find the flow with best overlap
         # Also consider direction: shim_to_aie -> MM2S flows, aie_to_shim -> S2MM flows
-        already_assigned = set(block_to_flow.values())
+        # NOTE: Multiple blocks can map to the same flow (e.g. intermediate routing
+        # blocks that are part of the same end-to-end data path).
         best_flow_id = -1
         best_score = 0
         candidates = []
         for f in flows:
-            if f.flow_id in already_assigned:
-                continue
             if shim_tiles and f.shim_tile not in shim_tiles:
                 continue
             # Direction matching: shim_to_aie = shim sends data = shim MM2S
@@ -798,7 +797,7 @@ def _map_blocks_to_flows(
         # If no overlap match found but we have exactly one candidate, use it
         if best_flow_id < 0 and len(candidates) == 1:
             best_flow_id = candidates[0].flow_id
-        # If still no match but we have candidates, pick first unassigned
+        # If still no match but we have candidates, pick first one
         if best_flow_id < 0 and candidates:
             best_flow_id = candidates[0].flow_id
         if best_flow_id >= 0:
@@ -978,6 +977,27 @@ def render_html(
                 arrow["flow_id"] = block_to_flow.get(arrow.get("block_key", arrow["block"]), -1)
             for conn in routing_json_data.get("internal_conns", []):
                 conn["flow_id"] = block_to_flow.get(conn.get("block_key", conn["block"]), -1)
+
+            # Fallback: infer flow_id for unmatched entries from neighboring arrows
+            # sharing the same block_key that already have a valid flow_id.
+            block_key_to_flow: Dict[str, int] = {}
+            for arrow in routing_json_data.get("cross_tile_arrows", []):
+                bk = arrow.get("block_key", arrow["block"])
+                if arrow.get("flow_id", -1) >= 0:
+                    block_key_to_flow[bk] = arrow["flow_id"]
+            for conn in routing_json_data.get("internal_conns", []):
+                bk = conn.get("block_key", conn["block"])
+                if conn.get("flow_id", -1) >= 0:
+                    block_key_to_flow[bk] = conn["flow_id"]
+            # Apply inferred flow_ids to unmatched entries
+            for arrow in routing_json_data.get("cross_tile_arrows", []):
+                if arrow.get("flow_id", -1) < 0:
+                    bk = arrow.get("block_key", arrow["block"])
+                    arrow["flow_id"] = block_key_to_flow.get(bk, -1)
+            for conn in routing_json_data.get("internal_conns", []):
+                if conn.get("flow_id", -1) < 0:
+                    bk = conn.get("block_key", conn["block"])
+                    conn["flow_id"] = block_key_to_flow.get(bk, -1)
 
     def _pkt_color(pid: int) -> str:
         return _PKT_COLORS[pid % len(_PKT_COLORS)]
@@ -1185,6 +1205,8 @@ def render_html(
                     f'onchange="toggleFlow({f.flow_id}, this.checked)">'
                     f'{arrow} ch{f.channel_id} {f.direction} ({n_tiles} tiles)'
                     f'</label>'
+                    f'<button class="flow-solo-btn" onclick="soloOneFlow({f.flow_id})" '
+                    f'title="Show only this flow">Solo</button>'
                 )
             panel_items.append('</div>')
 
@@ -1397,6 +1419,13 @@ svg.routing-overlay line, svg.routing-overlay path {{
     display: none !important;
 }}
 .solo-active {{ outline: 2px solid #f44336; outline-offset: -2px; }}
+.tile-card.flow-dimmed {{ opacity: 0.15; pointer-events: none; transition: opacity .2s; }}
+.flow-solo-btn {{
+    padding: 1px 7px; border: 1px solid #bbb; border-radius: 3px;
+    background: #fff; cursor: pointer; font-size: 10px; font-weight: 600;
+    margin-left: 2px; vertical-align: middle; transition: all .15s;
+}}
+.flow-solo-btn:hover {{ background: #ffecb3; border-color: #ffa000; }}
 </style>
 </head>
 <body>
@@ -1455,14 +1484,20 @@ let arrowsVisible = true;
 let soloMode = false;
 let soloFlowId = -1;
 
+function updateTileCardDimming() {{
+    document.querySelectorAll('.tile-card').forEach(card => {{
+        const flowEls = card.querySelectorAll('[data-flow]');
+        if (flowEls.length === 0) return;
+        const anyVisible = [...flowEls].some(el => !el.classList.contains('flow-hidden'));
+        card.classList.toggle('flow-dimmed', !anyVisible);
+    }});
+}}
+
 function toggleFlow(flowId, visible) {{
     document.querySelectorAll('[data-flow="' + flowId + '"]').forEach(el => {{
-        if (visible) {{
-            el.classList.remove('flow-hidden');
-        }} else {{
-            el.classList.add('flow-hidden');
-        }}
+        el.classList.toggle('flow-hidden', !visible);
     }});
+    updateTileCardDimming();
     setTimeout(drawArrows, 100);
 }}
 
@@ -1476,6 +1511,7 @@ function showAllFlows() {{
         el.classList.remove('flow-hidden');
     }});
     document.querySelectorAll('.flow-toggle').forEach(el => el.classList.remove('solo-active'));
+    document.querySelectorAll('.tile-card').forEach(c => c.classList.remove('flow-dimmed'));
     setTimeout(drawArrows, 100);
 }}
 
@@ -1489,6 +1525,7 @@ function hideAllFlows() {{
         el.classList.add('flow-hidden');
     }});
     document.querySelectorAll('.flow-toggle').forEach(el => el.classList.remove('solo-active'));
+    updateTileCardDimming();
     setTimeout(drawArrows, 100);
 }}
 
@@ -1502,6 +1539,30 @@ function soloFlowMode() {{
     // Start by showing none; user clicks to solo one
     hideAllFlows();
     soloMode = true;  // re-set since hideAllFlows resets it
+}}
+
+function soloOneFlow(flowId) {{
+    // Hide all flows first
+    document.querySelectorAll('.flow-toggle input[type="checkbox"]').forEach(cb => {{
+        cb.checked = false;
+    }});
+    document.querySelectorAll('[data-flow]').forEach(el => {{
+        el.classList.add('flow-hidden');
+    }});
+    document.querySelectorAll('.flow-toggle').forEach(el => el.classList.remove('solo-active'));
+    // Show only the selected flow
+    document.querySelectorAll('[data-flow="' + flowId + '"]').forEach(el => {{
+        el.classList.remove('flow-hidden');
+    }});
+    // Check the matching checkbox
+    document.querySelectorAll('.flow-toggle input[data-flow-id="' + flowId + '"]').forEach(cb => {{
+        cb.checked = true;
+        cb.closest('.flow-toggle').classList.add('solo-active');
+    }});
+    soloMode = true;
+    soloFlowId = flowId;
+    updateTileCardDimming();
+    setTimeout(drawArrows, 100);
 }}
 
 function toggleFlowPanel(header) {{

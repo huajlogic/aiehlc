@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_DEFAULT_LOG = _SCRIPT_DIR / "../../src/mlir/mlirfront/tilinglinalg/pass/data/streamswitch.log"
+_DEFAULT_LOG = _SCRIPT_DIR / "../../src/mlir/mlirfront/tilinglinalg/pass/data/streamswitch.json"
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -77,7 +77,8 @@ def parse_log(text: str) -> List[dict]:
     # Try direct array parse first
     if text.startswith("["):
         try:
-            return json.loads(text)
+            items = json.loads(text)
+            return [t for t in items if "tile" in t]
         except json.JSONDecodeError:
             pass
 
