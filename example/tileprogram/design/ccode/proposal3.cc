@@ -63,7 +63,7 @@
 // Debug flag: when enabled, skip matmul and fill output with encoded tile ID.
 // Each output byte = row[0:2] | col[3:5] | round[6:7]
 // This lets you identify which tile and round produced each output byte.
-
+#pragma aie_debug_level 2
 __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
                        output_window_int8 *window_out_0) {
 #define BUF_SZ_OUT 8

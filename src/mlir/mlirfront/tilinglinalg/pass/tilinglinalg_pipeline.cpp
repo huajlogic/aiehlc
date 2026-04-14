@@ -60,7 +60,7 @@ static std::string setupPipelineIRDir(const std::string &subdir) {
         llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
         return "";
     }
-    std::string dir = (cwdPath + "/../ir/" + subdir).str();
+    std::string dir = (cwdPath + "/ir/" + subdir).str();
     if (std::error_code EC = llvm::sys::fs::create_directories(dir)) {
         llvm::errs() << "Failed to create IR directory " << dir << ": " << EC.message() << "\n";
         return "";

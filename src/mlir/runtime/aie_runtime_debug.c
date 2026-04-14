@@ -1194,26 +1194,42 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
 
     /* 2. Stream switch configuration (JSON) — most useful for routing debug */
     {
-        XAie_LocType ss_tiles[128];
+        XAie_LocType ss_tiles[512];
         uint32_t ss_count = 0;
 
-        /* Core tiles */
-        for (uint32_t i = 0; i < num_tiles && ss_count < 128; i++)
-            ss_tiles[ss_count++] = tiles[i];
+        /* Collect all known tiles (core + shim) to determine column/row span */
+        uint8_t min_col = 0xFF, max_col = 0;
+        uint8_t max_row = 0;
 
-        /* Shim tiles from ios (deduplicated) */
-        for (uint32_t i = 0; i < num_ios && ss_count < 128; i++) {
-            if (!s_is_shim(ios[i].tile_loc))
-                continue;
-            int found = 0;
-            for (uint32_t j = 0; j < ss_count; j++) {
-                if (ss_tiles[j].Col == ios[i].tile_loc.Col && ss_tiles[j].Row == ios[i].tile_loc.Row) {
-                    found = 1;
-                    break;
-                }
+        for (uint32_t i = 0; i < num_tiles; i++) {
+            if (tiles[i].Col < min_col)
+                min_col = tiles[i].Col;
+            if (tiles[i].Col > max_col)
+                max_col = tiles[i].Col;
+            if (tiles[i].Row > max_row)
+                max_row = tiles[i].Row;
+        }
+        for (uint32_t i = 0; i < num_ios; i++) {
+            if (ios[i].tile_loc.Col < min_col)
+                min_col = ios[i].tile_loc.Col;
+            if (ios[i].tile_loc.Col > max_col)
+                max_col = ios[i].tile_loc.Col;
+            if (ios[i].tile_loc.Row > max_row)
+                max_row = ios[i].tile_loc.Row;
+        }
+        if (min_col > max_col) {
+            min_col = 0;
+            max_col = 0;
+        }
+
+        /* Scan the full column×row rectangle so that pass-through routing
+         * tiles (e.g. shim col 6 → mem-tile rows 1-2 → core row 3) are
+         * included.  print_all=0 means tiles with no active ports produce
+         * empty JSON and are harmlessly skipped by the visualiser.           */
+        for (uint8_t col = min_col; col <= max_col && ss_count < 512; col++) {
+            for (uint8_t row = 0; row <= max_row && ss_count < 512; row++) {
+                ss_tiles[ss_count++] = XAie_TileLoc(col, row);
             }
-            if (!found)
-                ss_tiles[ss_count++] = ios[i].tile_loc;
         }
 
         if (g_runtime_debug_level >= 1)
@@ -1676,12 +1692,11 @@ void AieRt_PrintStreamSwitchConfigAll(XAie_DevInst *dev, const XAie_LocType *til
 void AieRt_DebugSnapshotFromCoords(XAie_DevInst *dev, const uint8_t *io_cols, const uint8_t *io_rows,
                                    const uint8_t *io_chs, const uint8_t *io_bds, const int *io_dirs, uint32_t num_ios,
                                    const uint8_t *tile_cols, const uint8_t *tile_rows, uint32_t num_tiles) {
-    /* Build struct_io array on the stack (num_ios typically small: <16) */
-    struct_io ios[64];
-    if (num_ios > 64)
-        num_ios = 64;
+    /* Build struct_io array (heap-allocated; debug path, not perf-critical) */
+    struct_io *ios = (struct_io *)calloc(num_ios, sizeof(struct_io));
+    if (!ios)
+        return;
     for (uint32_t i = 0; i < num_ios; i++) {
-        memset(&ios[i], 0, sizeof(struct_io));
         ios[i].tile_loc = XAie_TileLoc(io_cols[i], io_rows[i]);
         ios[i].channel_id = io_chs[i];
         ios[i].bd_id = io_bds[i];
@@ -1689,12 +1704,16 @@ void AieRt_DebugSnapshotFromCoords(XAie_DevInst *dev, const uint8_t *io_cols, co
     }
 
     /* Build tile location array */
-    XAie_LocType tiles[64];
-    if (num_tiles > 64)
-        num_tiles = 64;
+    XAie_LocType *tiles = (XAie_LocType *)calloc(num_tiles, sizeof(XAie_LocType));
+    if (!tiles) {
+        free(ios);
+        return;
+    }
     for (uint32_t i = 0; i < num_tiles; i++) {
         tiles[i] = XAie_TileLoc(tile_cols[i], tile_rows[i]);
     }
 
     AieRt_DebugSnapshot(dev, ios, num_ios, tiles, num_tiles);
+    free(ios);
+    free(tiles);
 }

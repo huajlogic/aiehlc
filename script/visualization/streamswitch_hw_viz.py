@@ -36,12 +36,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# Default log path (absolute)
+# Default log path (relative to this script's directory)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_LOG = Path(
-    "/scratch/staff/huaj/amdaiehlc/aiehlc/src/mlir/mlirfront/tilinglinalg/pass/data/streamswitch.log"
-)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_DEFAULT_LOG = _SCRIPT_DIR / "../../src/mlir/mlirfront/tilinglinalg/pass/data/streamswitch.log"
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -116,13 +115,19 @@ def _port_num(port_name: str) -> int:
 
 def build_cross_tile_arrows(tiles: List[dict]) -> List[dict]:
     """For each enabled master port pointing in a cardinal direction, emit an arrow
-    to the neighbouring tile.  The arrow carries switch_type, pkt_id (if PKT),
-    and drop_header metadata for rendering."""
+    to the nearest tile in that direction present in the log.  Scans past gaps
+    (e.g. shim row 0 → core row 2 when no mem-tile at row 1 is logged)."""
     arrows = []
     tile_set = {
         (t["tile"]["col"], t["tile"]["row"])
         for t in tiles
     }
+    if not tiles:
+        return arrows
+    all_cols = [t["tile"]["col"] for t in tiles]
+    all_rows = [t["tile"]["row"] for t in tiles]
+    max_span = max(max(all_cols) - min(all_cols),
+                   max(all_rows) - min(all_rows), 1)
     for tile in tiles:
         col = tile["tile"]["col"]
         row = tile["tile"]["row"]
@@ -134,12 +139,33 @@ def build_cross_tile_arrows(tiles: List[dict]) -> List[dict]:
             if d is None:
                 continue
             dc, dr = DIRECTION_DELTA[d]
-            nb = (col + dc, row + dr)
-            # Only draw if neighbour tile is in the log
-            if nb not in tile_set:
-                continue
+            # Scan in the direction to find the nearest tile in the log
+            nb = None
+            for step in range(1, max_span + 1):
+                candidate = (col + dc * step, row + dr * step)
+                if candidate in tile_set:
+                    nb = candidate
+                    break
             opp_dir = DIRECTION_OPPOSITE[d]
             port_num = _port_num(port)
+            if nb is None:
+                # Dangling: destination tile not in log — emit a stub arrow
+                arrow = {
+                    "from_tile": [col, row],
+                    "to_tile": [col + dc, row + dr],  # virtual 1-step neighbor
+                    "from_dir": d,
+                    "to_dir": opp_dir,
+                    "port": port_num,
+                    "port_name": port,
+                    "slave_port_name": f"{opp_dir}{port_num}",
+                    "switch_type": master.get("switch_type", "CIRC"),
+                    "drop_header": master.get("drop_header", False),
+                    "drop_header_note": master.get("drop_header_note", ""),
+                    "pkt_id": None,
+                    "dangling": True,
+                }
+                arrows.append(arrow)
+                continue
             arrow = {
                 "from_tile": [col, row],
                 "to_tile": list(nb),
@@ -151,7 +177,8 @@ def build_cross_tile_arrows(tiles: List[dict]) -> List[dict]:
                 "switch_type": master.get("switch_type", "CIRC"),
                 "drop_header": master.get("drop_header", False),
                 "drop_header_note": master.get("drop_header_note", ""),
-                "pkt_id": None,  # will be resolved below if PKT
+                "pkt_id": None,
+                "dangling": False,
             }
             arrows.append(arrow)
     return arrows
@@ -490,6 +517,9 @@ svg.overlay {{
     <div class="legend-item">
         <div class="legend-swatch" style="background:#c8e6c9;border-color:#2e7d32"></div> SHIM tile
     </div>
+    <div class="legend-item">
+        <div class="legend-swatch" style="background:#FFF3E0;border-color:#E65100"></div> dangling (target not in log)
+    </div>
 </div>
 
 <div class="grid-outer">
@@ -554,7 +584,7 @@ function toggleArrows(btn) {{
     document.getElementById('routing-svg').style.display = arrowsVisible ? '' : 'none';
 }}
 
-/* ---- arrow drawing ---- */
+/* ---- arrow drawing (curved paths to avoid overlap) ---- */
 function drawArrows() {{
     const svg     = document.getElementById('routing-svg');
     const wrapper = document.querySelector('.grid-wrapper');
@@ -566,7 +596,6 @@ function drawArrows() {{
 
     [...svg.querySelectorAll('.data-arrow')].forEach(el => el.remove());
 
-    // Build tile-card element map for fallback positioning
     const tileEls = {{}};
     document.querySelectorAll('.tile-card').forEach(card => {{
         tileEls[card.dataset.col + ',' + card.dataset.row] = card;
@@ -575,26 +604,64 @@ function drawArrows() {{
     const tip   = document.getElementById('arrow-tip');
     const dedup = new Set();
 
+    /* --- first pass: collect unique arrows, group by tile pair --- */
+    const items      = [];
+    const pairGroups = {{}};
+
     ARROWS.forEach(arrow => {{
         const fromKey = arrow.from_tile[0] + ',' + arrow.from_tile[1];
         const toKey   = arrow.to_tile[0]   + ',' + arrow.to_tile[1];
-
-        const deKey = `${{fromKey}}-${{toKey}}-${{arrow.port_name}}-${{arrow.switch_type}}`;
+        const deKey   = `${{fromKey}}-${{toKey}}-${{arrow.port_name}}-${{arrow.switch_type}}`;
         if (dedup.has(deKey)) return;
         dedup.add(deKey);
 
-        // Try exact port-element lookup first
+        const pairKey = fromKey < toKey ? `${{fromKey}}|${{toKey}}` : `${{toKey}}|${{fromKey}}`;
+        if (!pairGroups[pairKey]) pairGroups[pairKey] = [];
+        const idx = pairGroups[pairKey].length;
+        pairGroups[pairKey].push(arrow);
+        items.push({{ arrow, pairKey, idx }});
+    }});
+
+    /* --- second pass: draw curved paths --- */
+    const STUB_LEN = 40;   /* px length of dangling stub arrows */
+
+    items.forEach(({{ arrow, pairKey, idx }}) => {{
+        const fromKey = arrow.from_tile[0] + ',' + arrow.from_tile[1];
+        const toKey   = arrow.to_tile[0]   + ',' + arrow.to_tile[1];
+        const isDangling = !!arrow.dangling;
+
         const fromPortId = `mport-${{arrow.from_tile[0]}}-${{arrow.from_tile[1]}}-${{arrow.port_name}}`;
         const toPortId   = `sport-${{arrow.to_tile[0]}}-${{arrow.to_tile[1]}}-${{arrow.slave_port_name}}`;
         const fromPortEl = document.getElementById(fromPortId);
         const toPortEl   = document.getElementById(toPortId);
 
         let x1, y1, x2, y2;
-        const portLevelConnect = fromPortEl && toPortEl;
+        const portLevelConnect = !isDangling && fromPortEl && toPortEl;
 
-        if (portLevelConnect) {{
-            // Port-to-port: connect right edge midpoint of master row
-            // to left edge midpoint of slave row (or top/bottom for N/S)
+        if (isDangling) {{
+            /* Dangling: destination tile not in log — draw a short stub from tile edge */
+            const fromEl = tileEls[fromKey];
+            if (!fromEl) return;
+            const fR = fromEl.getBoundingClientRect();
+            switch (arrow.from_dir) {{
+                case 'NORTH':
+                    x1 = fR.left + fR.width/2 - wRect.left; y1 = fR.top    - wRect.top;
+                    x2 = x1;                                  y2 = y1 - STUB_LEN;
+                    break;
+                case 'SOUTH':
+                    x1 = fR.left + fR.width/2 - wRect.left; y1 = fR.bottom - wRect.top;
+                    x2 = x1;                                  y2 = y1 + STUB_LEN;
+                    break;
+                case 'EAST':
+                    x1 = fR.right - wRect.left; y1 = fR.top + fR.height/2 - wRect.top;
+                    x2 = x1 + STUB_LEN;         y2 = y1;
+                    break;
+                case 'WEST':
+                    x1 = fR.left - wRect.left;  y1 = fR.top + fR.height/2 - wRect.top;
+                    x2 = x1 - STUB_LEN;          y2 = y1;
+                    break;
+            }}
+        }} else if (portLevelConnect) {{
             const fPR = fromPortEl.getBoundingClientRect();
             const tPR = toPortEl.getBoundingClientRect();
             const d   = arrow.from_dir;
@@ -614,75 +681,95 @@ function drawArrows() {{
                 y1 = fPR.top    - wRect.top;
                 x2 = tPR.left + tPR.width / 2 - wRect.left;
                 y2 = tPR.bottom - wRect.top;
-            }} else {{ // SOUTH
+            }} else {{
                 x1 = fPR.left + fPR.width / 2 - wRect.left;
                 y1 = fPR.bottom - wRect.top;
                 x2 = tPR.left + tPR.width / 2 - wRect.left;
                 y2 = tPR.top    - wRect.top;
             }}
         }} else {{
-            // Fallback: tile-edge midpoint (slave port not rendered / not active)
             const fromEl = tileEls[fromKey];
             const toEl   = tileEls[toKey];
             if (!fromEl || !toEl) return;
 
-            const fR  = fromEl.getBoundingClientRect();
-            const tR  = toEl.getBoundingClientRect();
-            const off = (arrow.port - 0.5) * 14;
+            const fR = fromEl.getBoundingClientRect();
+            const tR = toEl.getBoundingClientRect();
 
             switch (arrow.from_dir) {{
                 case 'NORTH':
-                    x1 = fR.left + fR.width/2 + off - wRect.left; y1 = fR.top    - wRect.top;
-                    x2 = tR.left + tR.width/2 + off - wRect.left; y2 = tR.bottom - wRect.top;
+                    x1 = fR.left + fR.width/2 - wRect.left; y1 = fR.top    - wRect.top;
+                    x2 = tR.left + tR.width/2 - wRect.left; y2 = tR.bottom - wRect.top;
                     break;
                 case 'SOUTH':
-                    x1 = fR.left + fR.width/2 + off - wRect.left; y1 = fR.bottom - wRect.top;
-                    x2 = tR.left + tR.width/2 + off - wRect.left; y2 = tR.top    - wRect.top;
+                    x1 = fR.left + fR.width/2 - wRect.left; y1 = fR.bottom - wRect.top;
+                    x2 = tR.left + tR.width/2 - wRect.left; y2 = tR.top    - wRect.top;
                     break;
                 case 'EAST':
-                    x1 = fR.right - wRect.left; y1 = fR.top + fR.height/2 + off - wRect.top;
-                    x2 = tR.left  - wRect.left; y2 = tR.top + tR.height/2 + off - wRect.top;
+                    x1 = fR.right - wRect.left; y1 = fR.top + fR.height/2 - wRect.top;
+                    x2 = tR.left  - wRect.left; y2 = tR.top + tR.height/2 - wRect.top;
                     break;
                 case 'WEST':
-                    x1 = fR.left  - wRect.left; y1 = fR.top + fR.height/2 + off - wRect.top;
-                    x2 = tR.right - wRect.left; y2 = tR.top + tR.height/2 + off - wRect.top;
+                    x1 = fR.left  - wRect.left; y1 = fR.top + fR.height/2 - wRect.top;
+                    x2 = tR.right - wRect.left; y2 = tR.top + tR.height/2 - wRect.top;
                     break;
             }}
         }}
 
-        const sw       = arrow.switch_type;
-        const color    = sw === 'PKT' ? '#7B1FA2' : sw === 'CIRC' ? '#1565C0' : '#9E9E9E';
-        const markerId = sw === 'PKT' ? 'arr-pkt'  : sw === 'CIRC' ? 'arr-circ' : 'arr-ctrl';
-        const dashArr  = sw === 'PKT' ? '6,3' : 'none';
+        /* --- curve offset: perpendicular displacement to separate overlapping arrows --- */
+        const total  = pairGroups[pairKey].length;
+        const spread = (idx - (total - 1) / 2) * 30;
+        const dx  = x2 - x1;
+        const dy  = y2 - y1;
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
+        const px  = -dy / len;   /* perpendicular unit vector */
+        const py  =  dx / len;
 
-        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-        line.classList.add('data-arrow');
-        line.setAttribute('x1', x1); line.setAttribute('y1', y1);
-        line.setAttribute('x2', x2); line.setAttribute('y2', y2);
-        line.setAttribute('stroke', color);
-        line.setAttribute('stroke-width', sw === 'CIRC' ? '2.5' : '2');
-        if (dashArr !== 'none') line.setAttribute('stroke-dasharray', dashArr);
-        line.setAttribute('marker-end', `url(#${{markerId}})`);
-        line.style.pointerEvents = 'stroke';
-        line.style.cursor = 'pointer';
+        const mx = (x1 + x2) / 2 + px * spread;
+        const my = (y1 + y2) / 2 + py * spread;
+
+        const pathD = (total === 1 && spread === 0)
+            ? `M ${{x1}} ${{y1}} L ${{x2}} ${{y2}}`
+            : `M ${{x1}} ${{y1}} Q ${{mx}} ${{my}} ${{x2}} ${{y2}}`;
+
+        const sw       = arrow.switch_type;
+        const color    = isDangling ? '#E65100'
+                       : sw === 'PKT' ? '#7B1FA2' : sw === 'CIRC' ? '#1565C0' : '#9E9E9E';
+        const markerId = sw === 'PKT' ? 'arr-pkt'  : sw === 'CIRC' ? 'arr-circ' : 'arr-ctrl';
+        const dashArr  = isDangling ? '4,4' : (sw === 'PKT' ? '6,3' : 'none');
+
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.classList.add('data-arrow');
+        path.setAttribute('d', pathD);
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke', color);
+        path.setAttribute('stroke-width', isDangling ? '2' : (sw === 'CIRC' ? '2.5' : '2'));
+        if (dashArr !== 'none') path.setAttribute('stroke-dasharray', dashArr);
+        path.setAttribute('marker-end', `url(#${{markerId}})`);
+        path.style.pointerEvents = 'stroke';
+        path.style.cursor = 'pointer';
 
         const drop    = arrow.drop_header ? 'DROP_HEADER' : (sw === 'PKT' ? 'KEEP_HEADER' : '');
-        const portTgt = portLevelConnect
-            ? `${{arrow.port_name}} → ${{arrow.slave_port_name}}`
-            : `${{arrow.port_name}} → (tile edge fallback)`;
-        const tipText = `(${{fromKey}}) ${{portTgt}} (${{toKey}}) [${{sw}}${{drop ? ' ' + drop : ''}}]${{arrow.drop_header_note ? ': ' + arrow.drop_header_note : ''}}`;
+        let tipText;
+        if (isDangling) {{
+            tipText = `(${{fromKey}}) ${{arrow.port_name}} \u2192 ${{arrow.from_dir}} [DANGLING: target tile not in log] [${{sw}}]`;
+        }} else {{
+            const portTgt = portLevelConnect
+                ? `${{arrow.port_name}} \u2192 ${{arrow.slave_port_name}}`
+                : `${{arrow.port_name}} \u2192 (tile edge fallback)`;
+            tipText = `(${{fromKey}}) ${{portTgt}} (${{toKey}}) [${{sw}}${{drop ? ' ' + drop : ''}}]${{arrow.drop_header_note ? ': ' + arrow.drop_header_note : ''}}`;
+        }}
 
-        line.addEventListener('mouseenter', () => {{
+        path.addEventListener('mouseenter', () => {{
             tip.textContent = tipText;
             tip.style.display = 'block';
         }});
-        line.addEventListener('mousemove', e => {{
+        path.addEventListener('mousemove', e => {{
             tip.style.left = (e.clientX - wRect.left + 10) + 'px';
             tip.style.top  = (e.clientY - wRect.top  - 24) + 'px';
         }});
-        line.addEventListener('mouseleave', () => {{ tip.style.display = 'none'; }});
+        path.addEventListener('mouseleave', () => {{ tip.style.display = 'none'; }});
 
-        svg.appendChild(line);
+        svg.appendChild(path);
     }});
 }}
 
