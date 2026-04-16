@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "routinghwlower.h"
 #include "routinghwmanager.h"
+#include "routinghwverify.h"
 #include "routinglower.h"
 #include "routingmanager.h"
 #include "routingunrolling.h"
@@ -987,6 +988,8 @@ void routingtodmap(const std::string &irFilepath = "", int startStage = 0) {
     // Stage 3+: routing.cc-specific path (diverges from dfschedule here)
     if (!runSinglePass(ctx, module1, std::make_unique<DmaphopToRoutinghwPass>(rtopology), irDir, stage,
                        "DmaphopToRoutinghwPass"))
+        return;
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingHWVerifyPass>(), irDir, stage, "RoutingHWVerifyPass"))
         return;
     if (!runSinglePass(ctx, module1, std::make_unique<RoutingHWLowerPass>(rtopology), irDir, stage,
                        "RoutingHWLowerPass"))

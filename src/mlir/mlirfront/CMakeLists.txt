@@ -122,6 +122,7 @@ list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dfschedule/dfscheduleman
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dfscheblueprint/dfscheblueprintmanager.cpp)
 # tilinglinalg pass pipeline sources (lowering passes)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routinghwlower.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routinghwverify.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routinglower.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingunrolling.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingdeadargclean.cpp)
