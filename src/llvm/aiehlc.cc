@@ -1143,6 +1143,7 @@ public:
                     llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
                 } else {
                     llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
+                    std::exit(1);
                 }
             } else {
 				// ---- EXISTING PATH: single-tile ----

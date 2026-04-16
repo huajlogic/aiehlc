@@ -4,22 +4,23 @@
 ******************************************************************************/
 #include "tilinglinalg_pipeline.h"
 
+#include "dmaptodmaphop.h"
+#include "hw/ResourceManager.h"
+#include "kernelconfig.h"
 #include "passblueprinttoschedule.h"
 #include "passblueprinttoschedulekernel.h"
 #include "passdfscheduletoapi.h"
 #include "passdfscheduletokernelapi.h"
 #include "passdmaphoptodfscheblueprint.h"
 #include "passdmaphoptoroutinghw.h"
-#include "dmaptodmaphop.h"
-#include "routingtodmap.h"
 #include "passschedulecanonicalize.h"
-#include "routinghwlower.h"
-#include "routinglower.h"
-#include "routingunrolling.h"
-#include "routingdeadargclean.h"
 #include "routingconstantfold.h"
-#include "kernelconfig.h"
-#include "hw/ResourceManager.h"
+#include "routingdeadargclean.h"
+#include "routinghwlower.h"
+#include "routinghwverify.h"
+#include "routinglower.h"
+#include "routingtodmap.h"
+#include "routingunrolling.h"
 
 #include "routingmanager.h"
 #include "routinghwmanager.h"
@@ -697,6 +698,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         // shim columns and DMA port assignments are consistent.
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<DmaphopToRoutinghwPass>(rtopology),
                                    routingIrDir, rstage, "DmaphopToRoutinghwPass"))
+            return false;
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWVerifyPass>(), routingIrDir,
+                                   rstage, "RoutingHWVerifyPass"))
             return false;
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(rtopology),
                                    routingIrDir, rstage, "RoutingHWLowerPass"))
