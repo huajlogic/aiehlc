@@ -61,7 +61,7 @@ typedef struct {
     uint8_t tile_type; /* XAIEGBL_TILE_TYPE_* value from XAie_GetTileTypefromLoc */
     void *buffer;      /* DDR pointer for shim tiles, NULL for core tiles */
     uint64_t dma_addr; /* physical addr programmed into the BD */
-    int32_t len;       /* length in int32_t elements */
+    int32_t len;       /* length in bytes */
     int32_t packet_id;
     int8_t direction;  /* -1=unknown, 0=DMA_S2MM, 1=DMA_MM2S (set by startio) */
     int8_t channel_id; /* -1=unknown (set by startio) */
@@ -225,7 +225,7 @@ void __Runtime_free(void *ptr) {
                    e->packet_id, (unsigned long)e->dma_addr, e->len);
             if (is_shim && e->buffer != NULL) {
                 int8_t *data = (int8_t *)e->buffer;
-                int byte_len = e->len * (int)sizeof(int32_t);
+                int byte_len = e->len;
                 printf("[aie_runtime]     shim_buf tile(%u,%u) [%s] dir=%s ch=%d @%p [0..%d] (int8):", (unsigned)e->col,
                        (unsigned)e->row, type_str, dir_label, (int)e->channel_id, e->buffer, byte_len - 1);
                 for (int j = 0; j < byte_len; j++)
@@ -335,8 +335,8 @@ AieRC __Runtime_device_teardown(void) {
 }
 
 /**
- * Configure DMA buffer descriptor
- * Maps to XAie DMA APIs
+ * Configure DMA buffer descriptor.
+ * @param len  Transfer length in bytes.
  */
 XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, uint64_t addr,
                                      int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
@@ -350,7 +350,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
      * Core tiles: buffer is a DMA-view byte address (core_proc_addr - 0x70000),
      *   produced by passblueprinttoschedule after CoreMemAllocator conversion. */
     uint64_t dma_addr = (uint64_t)(uintptr_t)buffer;
-    XAie_DmaSetAddrLen(&DmaInst, dma_addr, (uint32_t)(len * sizeof(int32_t)));
+    XAie_DmaSetAddrLen(&DmaInst, dma_addr, (uint32_t)len);
 
     if (acquire_lock_id >= 0 && release_lock_id >= 0) {
         XAie_DmaSetLock(&DmaInst, XAie_LockInit(acquire_lock_id, acquire_lock_val),
@@ -392,21 +392,26 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
         if (tile_type == XAIEGBL_TILE_TYPE_AIETILE) {
             printf("[aie_runtime] bd_config core(%u,%u) bd=%d dma_addr=0x%lx len=%d pkt_id=%d\n", (unsigned)tile.Col,
                    (unsigned)tile.Row, bd_id, (unsigned long)dma_addr, len, packet_id);
-            /* Write pattern col*100+row*10+bd_id to all len int32s at dma_addr.
+            /* Write pattern col*100+row*10+bd_id into the BD region at dma_addr.
+             * len is in bytes; convert to int32 count for the pattern array.
              * ping BD (buffer=0) writes at byte 0; pong BD (buffer=64) writes at byte 256.
-             * Covers the full BD transfer so shim sees 64 consistent values (RC-1 fix). */
+             * Covers the full BD transfer so shim sees consistent values (RC-1 fix). */
             int32_t dbg_pat[64];
             int32_t pat_val = (int32_t)(tile.Col * 100 + tile.Row * 10 + bd_id);
-            int32_t write_len = (len <= 64) ? len : 64;
-            for (int _i = 0; _i < write_len; _i++)
+            int32_t write_words = len / (int32_t)sizeof(int32_t);
+            if (write_words <= 0)
+                write_words = 1;
+            if (write_words > 64)
+                write_words = 64;
+            for (int _i = 0; _i < write_words; _i++)
                 dbg_pat[_i] = pat_val;
-            XAie_DataMemBlockWrite(dev, tile, (u32)dma_addr, dbg_pat, (u32)(write_len * sizeof(int32_t)));
+            XAie_DataMemBlockWrite(dev, tile, (u32)dma_addr, dbg_pat, (u32)(write_words * sizeof(int32_t)));
             /* Read back and print to verify */
             int32_t dbg_read[64];
-            XAie_DataMemBlockRead(dev, tile, (u32)dma_addr, dbg_read, (u32)(write_len * sizeof(int32_t)));
+            XAie_DataMemBlockRead(dev, tile, (u32)dma_addr, dbg_read, (u32)(write_words * sizeof(int32_t)));
             printf("[aie_runtime] core(%u,%u) bd=%d dma_addr=0x%lx pat=%d read:", (unsigned)tile.Col,
                    (unsigned)tile.Row, bd_id, (unsigned long)dma_addr, pat_val);
-            for (int _i = 0; _i < write_len; _i++)
+            for (int _i = 0; _i < write_words; _i++)
                 printf(" %d", dbg_read[_i]);
             printf("\n");
         } else {
@@ -422,6 +427,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
  * Configure DMA buffer descriptor with multi-dimensional addressing.
  * Uses XAie_DmaSetMultiDimAddr with stride/wrap descriptors to enable
  * DMA hardware transpose/reshape during data transfer.
+ * @param len  Transfer length in bytes.
  */
 XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
                                               uint64_t addr, int32_t len, int32_t next_bd, int32_t enable_packet,
@@ -449,7 +455,7 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
     XAie_DmaTensor tensor;
     tensor.NumDim = (uint8_t)num_dims;
     tensor.Dim = dimDescs;
-    XAie_DmaSetMultiDimAddr(&DmaInst, &tensor, dma_addr, (uint32_t)(len * sizeof(int32_t)));
+    XAie_DmaSetMultiDimAddr(&DmaInst, &tensor, dma_addr, (uint32_t)len);
 
     if (acquire_lock_id >= 0 && release_lock_id >= 0) {
         XAie_DmaSetLock(&DmaInst, XAie_LockInit(acquire_lock_id, acquire_lock_val),

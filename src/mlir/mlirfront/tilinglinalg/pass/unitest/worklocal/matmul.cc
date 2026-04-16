@@ -3,7 +3,7 @@ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, outp
 
 #define BUF_SZ_OUT 8
 #define K_DIM 16
-#define DEBUG_OUTPUT_ORDER 1
+// #define DEBUG_OUTPUT_ORDER 1
 #if DEBUG_OUTPUT_ORDER
     unsigned coreid = get_coreid();
     int col = coreid >> 16;

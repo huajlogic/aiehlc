@@ -603,18 +603,15 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             bufferLen *= dim;
         }
 
-        // Shim BD len in int32-word units: the runtime multiplies len by
-        // sizeof(int32_t).  For sub-int32 element types each logical element
-        // occupies one full int32 in DDR, so convert element count to word count.
+        // Shim BD len in bytes: runtime passes len directly to
+        // XAie_DmaSetAddrLen, so compute the total byte count here.
         int64_t elementSizeBytesShim = 1;
         if (memrefType.getElementType().isIntOrFloat())
             elementSizeBytesShim = memrefType.getElementTypeBitWidth() / 8;
         if (elementSizeBytesShim == 0)
             elementSizeBytesShim = 1;
         StringRef transferType = op.getType();
-        int64_t shimBdLen = bufferLen * elementSizeBytesShim / sizeof(int32_t);
-        if (shimBdLen <= 0)
-            shimBdLen = bufferLen; // fallback for int32 and larger types
+        int64_t shimBdLen = bufferLen * elementSizeBytesShim;
         // Read data_id from shimFlowConfig (set by DmaphopTodfscheblueprintPass).
         // Propagate it to the ConfigDmaBdOp so ScheduleCanonicalizePass can group
         // all shim BDs for the same root tensor and merge them into one.
@@ -949,9 +946,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             pongBdId = 1;
                         }
 
-                        // Core BD len: runtime multiplies len by sizeof(int32_t), so
-                        // convert from element count to int32-word count.
-                        int64_t coreBdLen = pingPongBufferSize * elementSizeBytes / sizeof(int32_t);
+                        // Core BD len in bytes: runtime passes len directly to
+                        // XAie_DmaSetAddrLen, so compute the total byte count here.
+                        int64_t coreBdLen = pingPongBufferSize * elementSizeBytes;
                         if (coreBdLen <= 0)
                             coreBdLen = 1;
 
@@ -975,7 +972,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             loc, dfschedule::BdHandleType::get(rewriter.getContext()), pongL1.getBuffer(),
                             coreTileOp.getTile(), pongBdIdConst.getResult(),
                             rewriter.getI32IntegerAttr(0),               // offset
-                            rewriter.getI32IntegerAttr(coreBdLen),       // len (int32-word count)
+                            rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
                             rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
                             rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
                             rewriter.getI32IntegerAttr(pingBdId),        // next_bd -> ping
@@ -994,7 +991,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             loc, dfschedule::BdHandleType::get(rewriter.getContext()), pingL1.getBuffer(),
                             coreTileOp.getTile(), pingBdIdConst.getResult(),
                             rewriter.getI32IntegerAttr(0),               // offset
-                            rewriter.getI32IntegerAttr(coreBdLen),       // len (int32-word count)
+                            rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
                             rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
                             rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
                             rewriter.getI32IntegerAttr(pongBdId),        // next_bd -> pong
