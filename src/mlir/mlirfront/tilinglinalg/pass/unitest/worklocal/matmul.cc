@@ -1,7 +1,7 @@
 // User-provided compute kernel (extracted from __global__ function)
 void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, output_window_int8 *window_out_0) {
 
-#define BUF_SZ_OUT 8
+#define BUF_SZ_OUT (((M * K) / (HW_ROWS * HW_COLS)) / 2)
 #define K_DIM 16
 // #define DEBUG_OUTPUT_ORDER 1
 #if DEBUG_OUTPUT_ORDER

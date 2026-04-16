@@ -5,7 +5,7 @@
  * AIE Programming Model — Matrix Multiplication with Data Caching
  *
  * GEMM: C[16x16] = A[16x16] * B^T[16x16], int8
- * Deployed on a 4x4 AIE tile mesh.
+ * Deployed on a HW_ROWS x HW_COLS AIE tile mesh.
  *
  * Current pipeline data distribution (row-based split, 4 groups):
  *   A[16x16]: split into 4 partitions of A[4x16]
@@ -42,6 +42,10 @@
 #define K 16
 #define N 16
 
+// HW mesh dimensions (number of AIE tile rows and columns)
+#define HW_ROWS 4
+#define HW_COLS 4
+
 // ═══════════════════════════════════════════════════════════════════════════
 // KERNEL: matmul
 //
@@ -66,7 +70,7 @@
 #pragma aie_debug_level 2
 __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
                        output_window_int8 *window_out_0) {
-#define BUF_SZ_OUT 8
+#define BUF_SZ_OUT (((M * K) / (HW_ROWS * HW_COLS)) / 2)
 #define K_DIM 16
 // #define DEBUG_OUTPUT_ORDER 1
 #if DEBUG_OUTPUT_ORDER
@@ -214,21 +218,20 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     int8_t C_ref[M * N];
     scalar_matmul(C_ref, A, B);
 
-    // 4x4 mesh = 16 tiles, 4 groups of 4 tiles each
-    // Each group: 4 tiles produce redundant 4x4 sub-blocks
-    // Group g: row_start = g*4, col_start = g*4 in the full 16x16 matrix
-    // Each tile outputs 16 bytes (4x4 sub-block)
-    // Tiles within a group are at consecutive offsets (16 bytes apart)
-    const int TILES_PER_GROUP = 4;
-    const int NUM_GROUPS = 4;
-    const int TILE_OUT_SIZE = 16; // 4x4 = 16 bytes per tile
-    const int TILE_ROWS = 4;
-    const int TILE_COLS = 4;
+    // HW_ROWS x HW_COLS mesh, NUM_GROUPS row-groups of TILES_PER_GROUP tiles
+    // Each group: tiles produce redundant sub-blocks
+    // Group g: row_start = g*(M/HW_ROWS), col_start = g*(N/HW_COLS)
+    // Tiles within a group are at consecutive offsets
+    const int TILES_PER_GROUP = HW_COLS;
+    const int NUM_GROUPS = HW_ROWS;
+    const int TILE_ROWS = M / HW_ROWS;
+    const int TILE_COLS = N / HW_COLS;
+    const int TILE_OUT_SIZE = TILE_ROWS * TILE_COLS;
 
     int mismatches = 0;
     for (int g = 0; g < NUM_GROUPS; g++) {
-        int rs = g * 4; // row start in full matrix
-        int cs = g * 4; // col start in full matrix
+        int rs = g * TILE_ROWS; // row start in full matrix
+        int cs = g * TILE_COLS; // col start in full matrix
 
         for (int t = 0; t < TILES_PER_GROUP; t++) {
             int tile_idx = g * TILES_PER_GROUP + t;
@@ -256,21 +259,21 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     else
         printf("FAIL: %d mismatches out of %d.\n", mismatches, total_elements);
 
-    // Print sample: group 0, tile 0 (rows 0-3)
-    printf("\nSample output C[0:3][0:3] (group 0, tile 0):\n");
-    for (int i = 0; i < 4; i++) {
+    // Print sample: group 0, tile 0
+    printf("\nSample output C[0:%d][0:%d] (group 0, tile 0):\n", TILE_ROWS - 1, TILE_COLS - 1);
+    for (int i = 0; i < TILE_ROWS; i++) {
         printf("  [");
-        for (int j = 0; j < 4; j++) {
-            printf("%4d", C[i * 4 + j]);
-            if (j < 3)
+        for (int j = 0; j < TILE_COLS; j++) {
+            printf("%4d", C[i * TILE_COLS + j]);
+            if (j < TILE_COLS - 1)
                 printf(",");
         }
         printf("]\n");
     }
 
-    // Print input A first 4 rows
-    printf("\nInput A[0:3][0:15]:\n");
-    for (int i = 0; i < 4; i++) {
+    // Print input A first TILE_ROWS rows
+    printf("\nInput A[0:%d][0:%d]:\n", TILE_ROWS - 1, K - 1);
+    for (int i = 0; i < TILE_ROWS; i++) {
         printf("  [");
         for (int j = 0; j < K; j++) {
             printf("%4d", A[i * K + j]);
@@ -280,9 +283,9 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
         printf("]\n");
     }
 
-    // Print input B first 4 rows
-    printf("\nInput B[0:3][0:15]:\n");
-    for (int i = 0; i < 4; i++) {
+    // Print input B first TILE_ROWS rows
+    printf("\nInput B[0:%d][0:%d]:\n", TILE_ROWS - 1, K - 1);
+    for (int i = 0; i < TILE_ROWS; i++) {
         printf("  [");
         for (int j = 0; j < K; j++) {
             printf("%4d", B[i * K + j]);
@@ -299,12 +302,12 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
 // HOST
 // ═══════════════════════════════════════════════════════════════════════════
 int main() {
-    printf("=== Matrix Multiply with Data Caching on AIE 4x4 Mesh ===\n");
+    printf("=== Matrix Multiply with Data Caching on AIE %dx%d Mesh ===\n", HW_ROWS, HW_COLS);
     printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);
 
     // --- Device + mesh ---
     aieSetDevice(0);
-    aieDim mesh(4, 4);
+    aieDim mesh(HW_ROWS, HW_COLS);
 
     // --- Allocate host memory ---
     int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t));
