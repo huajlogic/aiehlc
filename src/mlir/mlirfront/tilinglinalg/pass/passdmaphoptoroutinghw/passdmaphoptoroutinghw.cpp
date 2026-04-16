@@ -293,6 +293,15 @@ std::optional<TileListRoutingMap> GetSeqPath(
             }
             if ( i < branch.size() - 1) {
                 const Point& nextPoint = branch[i+1];
+
+                // Skip links between tiles that are both already in the tree —
+                // these were already configured by a previous branch.
+                bool currentAlreadyProcessed = (pointsInOrderedList.find(currentPoint) != pointsInOrderedList.end());
+                bool nextAlreadyProcessed = (pointsInOrderedList.find(nextPoint) != pointsInOrderedList.end());
+                if (currentAlreadyProcessed && nextAlreadyProcessed) {
+                    continue; // Both tiles already routed, skip
+                }
+
                 int portNum;
                 PortDirection slaveDirOnNext, masterDirOnCurrent;
                 if (!router_.occupyLink(currentPoint, nextPoint, dioid, portNum, masterDirOnCurrent, slaveDirOnNext)) {
@@ -315,10 +324,17 @@ std::optional<TileListRoutingMap> GetSeqPath(
                     connectionData[currentPoint].MasterSendToNextTileDirection = masterDirOnCurrent;
                     connectionData[currentPoint].MasterSendToNextTileDirectionPortIdx = portNum;
                 }
-                connectionData[nextPoint].SlaveReceiveForwardDirection = slaveDirOnNext;
-                connectionData[nextPoint].SlaveReceiveForwardDirectionPortIdx = portNum;
-                //set next master into None
-                connectionData[nextPoint].MasterSendToNextTileDirection = PortDirection::NONE;
+
+                // Only set slave/reset master on nextPoint if it's new.
+                // Tiles already configured by a prior branch must keep their
+                // existing master direction — resetting it destroys the prior
+                // branch's routing.
+                if (!nextAlreadyProcessed) {
+                    connectionData[nextPoint].SlaveReceiveForwardDirection = slaveDirOnNext;
+                    connectionData[nextPoint].SlaveReceiveForwardDirectionPortIdx = portNum;
+                    // set next master into None
+                    connectionData[nextPoint].MasterSendToNextTileDirection = PortDirection::NONE;
+                }
             }
         }
         tree_round++;
