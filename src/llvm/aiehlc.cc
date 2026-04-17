@@ -51,6 +51,7 @@ static std::vector<std::string> kernel_name_list;
 static std::unordered_map<std::string, const clang::FunctionDecl*> globalKernelFuncs;
 static std::string userKernelBody;      // raw source text of __global__ function body
 static std::string userKernelFuncName;  // kernel function name from __global__
+static std::vector<std::string> userMacroDefines; // #define lines from user source
 
 using namespace clang;
 using namespace clang::tooling;
@@ -178,8 +179,17 @@ public:
 				 "\n#include <aie_api/aie_adf.hpp>"
 				 "\n#include <aie_api/utils.hpp>\n\n";
 			 }
-             str = header + str;
-			 fd << str << std::endl;
+             // Add user macro definitions before kernel body
+             std::string macroBlock;
+             if (!userMacroDefines.empty()) {
+                 macroBlock = "\n// User macro definitions from source file\n";
+                 for (const auto &macro : userMacroDefines) {
+                     macroBlock += macro + "\n";
+                 }
+                 macroBlock += "\n";
+             }
+             str = header + macroBlock + str;
+             fd << str << std::endl;
     }
 
 		 void printSourceRange(const clang::SourceRange &range, const clang::SourceManager &sourceManager) {
@@ -847,7 +857,41 @@ public:
 
 				//llvm::StringRef UpdatedSource;
 				std::string SourceCodeString = SourceCode.str();
-				size_t KeywordPos = 0;
+
+                // Collect user #define macros before any rewriting
+                {
+                    userMacroDefines.clear();
+                    std::istringstream iss(SourceCodeString);
+                    std::string line;
+                    std::string currentDefine;
+                    bool inMultiLine = false;
+                    while (std::getline(iss, line)) {
+                        if (inMultiLine) {
+                            currentDefine += "\n" + line;
+                            if (line.empty() || line.back() != '\\') {
+                                userMacroDefines.push_back(currentDefine);
+                                inMultiLine = false;
+                            }
+                            continue;
+                        }
+                        size_t firstNonSpace = line.find_first_not_of(" \t");
+                        if (firstNonSpace != std::string::npos && line.substr(firstNonSpace, 7) == "#define") {
+                            // Skip aiehlc-internal stub macros
+                            if (line.find("AIEHLC_STUBS_DEFINED") != std::string::npos ||
+                                line.find("AIEHLC_TILING_STUBS_DEFINED") != std::string::npos) {
+                                continue;
+                            }
+                            currentDefine = line;
+                            if (!line.empty() && line.back() == '\\') {
+                                inMultiLine = true;
+                            } else {
+                                userMacroDefines.push_back(currentDefine);
+                            }
+                        }
+                    }
+                }
+
+                size_t KeywordPos = 0;
 				for (auto x:funcMap ) {
 					std::string KeywordToReplace = x.first;//"__global__";
 					std::string Replacement = x.second;//"__attribute__((annotate(\"__global__\")))";
@@ -1136,9 +1180,20 @@ public:
 				// Build routing IR
 				auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors);
 
-				// Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
+                // Prepend user macros to kernel body for multi-tile path
+                std::string kernelBodyWithMacros = userKernelBody;
+                if (!userMacroDefines.empty() && !userKernelBody.empty()) {
+                    std::string macroBlock = "// User macro definitions from source file\n";
+                    for (const auto &macro : userMacroDefines) {
+                        macroBlock += macro + "\n";
+                    }
+                    macroBlock += "\n";
+                    kernelBodyWithMacros = macroBlock + userKernelBody;
+                }
+
+                // Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
 				std::string outputDir = std::string(AOUT) + "worklocal/";
-                if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, userKernelBody, userKernelFuncName,
+                if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros, userKernelFuncName,
                                                       parsedDebugLevel, userRewrittenSource)) {
                     llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
                 } else {

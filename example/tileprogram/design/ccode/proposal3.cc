@@ -46,6 +46,14 @@
 #define HW_ROWS 4
 #define HW_COLS 4
 
+// --- Tile dimensions derived from M, K, N, HW_ROWS, HW_COLS ---
+#define ROWS_PER_ROUND ((M / HW_ROWS) / 2)       // 4: A/B rows per DMA round
+#define COLS_PER_ROUND ((N / HW_COLS) / 2)       // 4: B rows per DMA round (= output cols of partial block)
+#define OUT_STRIDE (N / HW_COLS)                 // 8: output row width (full tile cols)
+#define K_DIM K                                  // 16: inner product dimension
+#define BUF_SZ_OUT (ROWS_PER_ROUND * OUT_STRIDE) // 32: output bytes per round
+// #define DEBUG_OUTPUT_ORDER 1
+
 // ═══════════════════════════════════════════════════════════════════════════
 // KERNEL: matmul
 //
@@ -70,9 +78,6 @@
 #pragma aie_debug_level 2
 __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
                        output_window_int8 *window_out_0) {
-#define BUF_SZ_OUT (((M * K) / (HW_ROWS * HW_COLS)) / 2)
-#define K_DIM 16
-// #define DEBUG_OUTPUT_ORDER 1
 #if DEBUG_OUTPUT_ORDER
     unsigned coreid = get_coreid();
     int col = coreid >> 16;
@@ -95,24 +100,24 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
     }
 #else
     // Local cache for round-0 data
-    int8_t cache_A[2 * K_DIM]; // 2 x 16 = 32 bytes
-    int8_t cache_B[2 * K_DIM]; // 2 x 16 = 32 bytes
+    int8_t cache_A[ROWS_PER_ROUND * K_DIM];
+    int8_t cache_B[ROWS_PER_ROUND * K_DIM];
 
     // ===== Iter 0: read A[0:1,:], B[0:1,:], cache, write partial output =====
     int8_t *A0 = (int8_t *)acquire_input_window(window_in_0);
     int8_t *B0 = (int8_t *)acquire_input_window(window_in_1);
 
     // Cache for use in iter 1
-    for (int i = 0; i < 2 * K_DIM; i++) {
+    for (int i = 0; i < ROWS_PER_ROUND * K_DIM; i++) {
         cache_A[i] = A0[i];
         cache_B[i] = B0[i];
     }
 
-    // Write 8 bytes: C[0:1, 0:1] = A0 * B0^T, columns 2-3 = 0
+    // Write partial output: C[0:RPR-1, 0:CPR-1] = A0 * B0^T, cols CPR..OUT_STRIDE-1 = 0
     {
         int8_t *out = acquire_output_window(window_out_0);
-        for (int i = 0; i < 2; i++) {
-            for (int j = 0; j < 2; j++) {
+        for (int i = 0; i < ROWS_PER_ROUND; i++) {
+            for (int j = 0; j < COLS_PER_ROUND; j++) {
                 int16_t sum = 0;
                 for (int k = 0; k < K_DIM; k++) {
                     sum += (int16_t)A0[i * K_DIM + k] * (int16_t)B0[j * K_DIM + k];
@@ -121,10 +126,10 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
                     sum = 127;
                 else if (sum < -128)
                     sum = -128;
-                out[i * 4 + j] = (int8_t)sum;
+                out[i * OUT_STRIDE + j] = (int8_t)sum;
             }
-            for (int j = 2; j < 4; j++) {
-                out[i * 4 + j] = 0;
+            for (int j = COLS_PER_ROUND; j < OUT_STRIDE; j++) {
+                out[i * OUT_STRIDE + j] = 0;
             }
         }
         release_output_window(window_out_0);
@@ -137,12 +142,11 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
     int8_t *A1 = (int8_t *)acquire_input_window(window_in_0);
     int8_t *B1 = (int8_t *)acquire_input_window(window_in_1);
 
-    // Write 8 bytes: C[2:3, 0:1] + C[2:3, 2:3]
     {
         int8_t *out = acquire_output_window(window_out_0);
-        // C[2:3, 0:1] = A1 * cached_B0^T
-        for (int i = 0; i < 2; i++) {
-            for (int j = 0; j < 2; j++) {
+        // C[RPR:2*RPR-1, 0:CPR-1] = A1 * cached_B0^T
+        for (int i = 0; i < ROWS_PER_ROUND; i++) {
+            for (int j = 0; j < COLS_PER_ROUND; j++) {
                 int16_t sum = 0;
                 for (int k = 0; k < K_DIM; k++) {
                     sum += (int16_t)A1[i * K_DIM + k] * (int16_t)cache_B[j * K_DIM + k];
@@ -151,12 +155,12 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
                     sum = 127;
                 else if (sum < -128)
                     sum = -128;
-                out[i * 4 + j] = (int8_t)sum;
+                out[i * OUT_STRIDE + j] = (int8_t)sum;
             }
         }
-        // C[2:3, 2:3] = A1 * B1^T
-        for (int i = 0; i < 2; i++) {
-            for (int j = 0; j < 2; j++) {
+        // C[RPR:2*RPR-1, CPR:2*CPR-1] = A1 * B1^T
+        for (int i = 0; i < ROWS_PER_ROUND; i++) {
+            for (int j = 0; j < COLS_PER_ROUND; j++) {
                 int16_t sum = 0;
                 for (int k = 0; k < K_DIM; k++) {
                     sum += (int16_t)A1[i * K_DIM + k] * (int16_t)B1[j * K_DIM + k];
@@ -165,7 +169,7 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
                     sum = 127;
                 else if (sum < -128)
                     sum = -128;
-                out[i * 4 + j + 2] = (int8_t)sum;
+                out[i * OUT_STRIDE + j + COLS_PER_ROUND] = (int8_t)sum;
             }
         }
         release_output_window(window_out_0);
@@ -240,7 +244,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
             for (int i = 0; i < TILE_ROWS; i++) {
                 for (int j = 0; j < TILE_COLS; j++) {
                     // DMA layout: cycle 0 rows 0-1 cols 2-3 are zero-filled
-                    int8_t expected = (i < 2 && j >= 2) ? 0 : C_ref[(rs + i) * N + (cs + j)];
+                    int8_t expected = (i < ROWS_PER_ROUND && j >= COLS_PER_ROUND) ? 0 : C_ref[(rs + i) * N + (cs + j)];
                     int flat = base + i * TILE_COLS + j;
                     if (C[flat] != expected) {
                         printf("MISMATCH C[%d] (group %d, tile %d, row %d, col %d): "
