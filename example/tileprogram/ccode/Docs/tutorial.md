@@ -8,6 +8,14 @@ The compiler handles everything in between: DMA transfers, routing, buffer descr
 
 ---
 
+## Design Philosophy
+
+- **High abstraction on data movement** -- DMA, routing, locks, and ping-pong buffering are fully compiler-generated. You just pass pointers.
+- **Low abstraction on computation** -- Inside `__global__`, you write plain C. You control every loop, every multiply, every optimization.
+- **Progressive lowering** -- 6 MLIR dialects (routing &rarr; dmap &rarr; dmaphop &rarr; blueprint &rarr; dfschedule &rarr; EmitC) give you quick defaults and the flexibility to tune at any layer.
+
+---
+
 ## The Programming Model in 30 Seconds
 
 ```
@@ -369,16 +377,67 @@ klog("CEXT", 1);                            // kernel exiting
 
 ## Build and Run
 
+### Step 1: Clone the repository
+
 ```bash
-# 1. Build the compiler
-cd aiehlc/build && cmake .. -DLLVM_INSTALL_DIR=/path/to/llvm/build && make -j$(nproc)
+git clone <repo-url> aiehlc
+cd aiehlc
+```
 
-# 2. Compile your program
-./aiehlc your_program.cc
+### Step 2: Set up the environment
 
-# 3. Run on hardware
+`setup.sh` detects and configures Vitis, cross-compiler toolchains, the aie-rt driver, and build directories.
+
+```bash
+source script/setup.sh
+```
+
+If your aie-rt BSP is in a git repository rather than the default location:
+
+```bash
+source script/setup.sh --bsp-use-git-repo=https://path/to/aie-rt.git
+```
+
+### Step 3: Compile your program
+
+`aiehlc.sh` takes a single `.cc` source file and produces a host ELF (ARM) and kernel ELF (AIE core). It handles Clang AST parsing, MLIR lowering, kernel compilation (via xchesscc), and host cross-compilation in one command.
+
+```bash
+source script/aiehlc.sh --runtime-source-file your_program.cc
+```
+
+Alternative compiler backends:
+
+```bash
+# Using LLVM-AIE (experimental, open-source kernel compiler)
+source script/aiehlc.sh --use-llvm-aie --runtime-source-file your_program.cc
+
+# Targeting AIE2PS devices
+source script/aiehlc.sh --aie-version 5 --runtime-source-file your_program.cc
+
+# PetaLinux (Linux on ARM instead of baremetal)
+source script/aiehlc.sh --platform linux --aie-version 2 --runtime-source-file your_program.cc
+```
+
+### Step 4: Run on hardware
+
+```bash
 python3 script/test/apppaltest.py build/host
 ```
+
+This script handles SSH + xsdb board connection, ELF loading, console capture, and result verification.
+
+### Optional: Build aiehlc itself
+
+Only needed if you are developing the compiler. See [doc/build.md](../../../../doc/build.md) for details.
+
+```bash
+mkdir build && cd build
+cmake .. -DLLVM_INSTALL_DIR=/path/to/llvm/build
+make -j$(nproc)
+```
+
+> For full details on setup options, debug levels, llvm-aie support, and PetaLinux compilation, see the root [README.md](../../../../README.md).
 
 ---
 
