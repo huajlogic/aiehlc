@@ -10,8 +10,8 @@ The compiler handles everything in between: DMA transfers, routing, buffer descr
 
 ## Design Philosophy
 
-- **High abstraction on data movement** -- DMA, routing, locks, and ping-pong buffering are fully compiler-generated. You just pass pointers.
-- **Low abstraction on computation** -- Inside `__global__`, you write plain C. You control every loop, every multiply, every optimization.
+- **High Level abstraction on data movement** -- DMA, routing, locks, and ping-pong buffering are fully compiler-generated. You just pass pointers.
+- **Low Level abstraction on computation** -- Inside `__global__`, you write plain C. You control every loop, every multiply, every optimization.
 - **Progressive lowering** -- 6 MLIR dialects (routing &rarr; dmap &rarr; dmaphop &rarr; blueprint &rarr; dfschedule &rarr; EmitC) give you quick defaults and the flexibility to tune at any layer.
 
 ---
@@ -44,16 +44,16 @@ The smallest possible AIEHLC program:
 #define N 64
 
 // ── Kernel: runs on every AIE tile ──
-__global__ void vecadd(input_window_int8 *win_a,
-                       input_window_int8 *win_b,
-                       output_window_int8 *win_c) {
+__global__ void matmul(aie::row_broadcast_in<input_window_int8 *> win_a,
+                       aie::col_broadcast_in<input_window_int8 *> win_b,
+                       aie::row_major_out<output_window_int8 *> win_c) {
     for (int iter = 0; iter < 2; iter++) {      // ping-pong: 2 iterations
         int8_t *a   = (int8_t *)acquire_input_window(win_a);
         int8_t *b   = (int8_t *)acquire_input_window(win_b);
         int8_t *out = acquire_output_window(win_c);
 
         for (int i = 0; i < N; i++)
-            out[i] = a[i] + b[i];
+            out[i] = a[i] * b[i];
 
         release_input_window(win_a);
         release_input_window(win_b);
@@ -70,7 +70,7 @@ int main() {
     // Initialize A and B ...
 
     aieDim mesh(2, 2);             // 2x2 tile mesh
-    vecadd<<<mesh>>>(A, B, C);     // launch kernel
+    matmul<<<mesh>>>(A, B, C);     // launch kernel
     aieDeviceSynchronize();        // wait for tiles to finish
 
     // Verify C ...

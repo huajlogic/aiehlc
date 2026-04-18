@@ -53,7 +53,7 @@
 #define K_DIM K                                  // 16: inner product dimension
 #define BUF_SZ_OUT (ROWS_PER_ROUND * OUT_STRIDE) // 32: output bytes per round
 // #define DEBUG_OUTPUT_ORDER 1
-
+static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C);
 // ═══════════════════════════════════════════════════════════════════════════
 // KERNEL: matmul
 //
@@ -76,11 +76,12 @@
 // Each output byte = row[0:2] | col[3:5] | round[6:7]
 // This lets you identify which tile and round produced each output byte.
 #pragma aie_debug_level 2
-//__global__ void matmul(aie::row_broadcast_in<input_window_int8 *>window_in_0,
-//                       aie::col_broadcast_in<input_window_int8 *>window_in_1,
-//                       aie::row_major_out<output_window_int8 *>window_out_0) {
-__global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
-                       output_window_int8 *window_out_0) {
+//__global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
+//                       output_window_int8 *window_out_0) {
+__global__ void matmul(aie::row_broadcast_in<input_window_int8 *> window_in_0,
+                       aie::col_broadcast_in<input_window_int8 *> window_in_1,
+                       aie::row_major_out<output_window_int8 *> window_out_0) {
+
 #if DEBUG_OUTPUT_ORDER
     unsigned coreid = get_coreid();
     int col = coreid >> 16;
@@ -184,6 +185,48 @@ __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// HOST
+// ═══════════════════════════════════════════════════════════════════════════
+int main() {
+    printf("=== Matrix Multiply with Data Caching on AIE %dx%d Mesh ===\n", HW_ROWS, HW_COLS);
+    printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);
+
+    // --- Device + mesh ---
+    aieSetDevice(0);
+    aieDim mesh(HW_ROWS, HW_COLS);
+
+    // --- Allocate host memory ---
+    int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t));
+    int8_t *B = (int8_t *)malloc(K * N * sizeof(int8_t));
+    int8_t *C = (int8_t *)malloc(M * N * sizeof(int8_t));
+
+    // --- Initialize input matrices ---
+    for (int i = 0; i < M * K; i++)
+        A[i] = (int8_t)((i % 7) - 3);
+
+    for (int i = 0; i < K * N; i++)
+        B[i] = (int8_t)((i % 5) - 2);
+
+    for (int i = 0; i < M * N; i++)
+        C[i] = 0;
+
+    // --- Launch kernel on tile mesh ---
+    matmul<<<mesh>>>(A, B, C);
+
+    // --- Wait for completion ---
+    aieDeviceSynchronize();
+
+    // --- Verify output ---
+    int result = verify_matmul(A, B, C);
+
+    // --- Cleanup ---
+    free(A);
+    free(B);
+    free(C);
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Verification
 //
 // scalar_matmul: pure C[M][N] = A[M][K] * B^T[N][K], completely independent
@@ -222,9 +265,53 @@ static void scalar_matmul(int8_t *C_ref, const int8_t *A, const int8_t *B) {
 // Verify AIE output C against CPU reference
 static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     // Compute full C_ref[16][16] = A * B^T — no pipeline knowledge
+    int mismatches = 0;
     int8_t C_ref[M * N];
     scalar_matmul(C_ref, A, B);
+    for (int i = 0; i < M * N; i++) {
+        if (C[i] != C_ref[i]) {
+            printf("MISMATCH C[%d]: got %d, expected %d\n", i, C[i], C_ref[i]);
+            mismatches++;
+            // return 1;
+        }
+    }
+    // Print A [16x16]
+    printf("\nA [%dx%d]:\n", M, K);
+    for (int i = 0; i < M; i++) {
+        printf("  [");
+        for (int j = 0; j < K; j++) {
+            printf("%4d", A[i * K + j]);
+            if (j < K - 1)
+                printf(",");
+        }
+        printf("]\n");
+    }
 
+    // Print B [16x16]
+    printf("\nB [%dx%d]:\n", K, N);
+    for (int i = 0; i < K; i++) {
+        printf("  [");
+        for (int j = 0; j < N; j++) {
+            printf("%4d", B[i * N + j]);
+            if (j < N - 1)
+                printf(",");
+        }
+        printf("]\n");
+    }
+
+    // Print C [16x16]
+    printf("\nC [%dx%d]:\n", M, N);
+    for (int i = 0; i < M; i++) {
+        printf("  [");
+        for (int j = 0; j < N; j++) {
+            printf("%4d", C[i * N + j]);
+            if (j < N - 1)
+                printf(",");
+        }
+        printf("]\n");
+    }
+
+    /*
     // HW_ROWS x HW_COLS mesh, NUM_GROUPS row-groups of TILES_PER_GROUP tiles
     // Each group: tiles produce redundant sub-blocks
     // Group g: row_start = g*(M/HW_ROWS), col_start = g*(N/HW_COLS)
@@ -301,48 +388,6 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
         }
         printf("]\n");
     }
-
+    */
     return mismatches;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// HOST
-// ═══════════════════════════════════════════════════════════════════════════
-int main() {
-    printf("=== Matrix Multiply with Data Caching on AIE %dx%d Mesh ===\n", HW_ROWS, HW_COLS);
-    printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);
-
-    // --- Device + mesh ---
-    aieSetDevice(0);
-    aieDim mesh(HW_ROWS, HW_COLS);
-
-    // --- Allocate host memory ---
-    int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t));
-    int8_t *B = (int8_t *)malloc(K * N * sizeof(int8_t));
-    int8_t *C = (int8_t *)malloc(M * N * sizeof(int8_t));
-
-    // --- Initialize input matrices ---
-    for (int i = 0; i < M * K; i++)
-        A[i] = (int8_t)((i % 7) - 3);
-
-    for (int i = 0; i < K * N; i++)
-        B[i] = (int8_t)((i % 5) - 2);
-
-    for (int i = 0; i < M * N; i++)
-        C[i] = 0;
-
-    // --- Launch kernel on tile mesh ---
-    matmul<<<mesh>>>(A, B, C);
-
-    // --- Wait for completion ---
-    aieDeviceSynchronize();
-
-    // --- Verify output ---
-    int result = verify_matmul(A, B, C);
-
-    // --- Cleanup ---
-    free(A);
-    free(B);
-    free(C);
-    return result;
 }
