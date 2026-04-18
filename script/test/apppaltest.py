@@ -80,7 +80,7 @@ if not username or not palip or not boardname:
 host = f"{username}@{palip}"
 
 # Configuration
-PALBOARD_SCRIPTS_DIR = "/proj/xsjsswstaff/huaj/palboard_scripts"
+PALBOARD_SCRIPTS_DIR = f"/proj/xsjsswstaff/{username}/palboard_scripts"
 PALBOARD_BIN = f"/home/{username}/palboard/BOOT.BIN"
 #XSDB_ALT_PATH = "/everest/set_vnc_bkup/vnc/t50/es1/tools/Labtools/9999.0/bin/xsdb"
 XSDB_ALT_PATH = "/proj/xbuilds/SWIP/2025.2_1114_2157/installs/lin64/2025.2/Vitis/bin/xsdb"

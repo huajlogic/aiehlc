@@ -43,6 +43,9 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
+struct TensorSplitDesc;
+struct SplitModel;
+
 //fieldparser
 #include "mlir/IR/DialectImplementation.h"
 
@@ -77,6 +80,12 @@ public:
     void createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx,  bool binput,Value mesh, Value tensor, uint32_t hwsplitnum, std::string splitAxis);
     void createroutingfuncGEMM(OpBuilder &builder, MLIRContext *ctx, Value mesh, Value tensorA, Value tensorB,
                                Value tensorC, uint32_t hwsplitnum, std::string splitAxis);
+    /// Generalized routing function driven by SplitModel instead of hardcoded logic.
+    /// Creates partitiontensor, extract_data, IO, and movedata ops for each tensor
+    /// according to its TensorSplitDesc.
+    void createroutingfuncBySplitModel(OpBuilder &builder, MLIRContext *ctx, Value mesh,
+                                       const std::vector<Value> &tensors, const std::vector<bool> &isInputFlags,
+                                       int meshRows, int meshCols, const struct SplitModel &splitModel);
     //void createroutingfuncByDimDmap(OpBuilder& builder, MLIRContext* ctx,  bool binput,Value mesh, Value tensor, uint32_t hwsplitnum, std::string splitAxis);
     static void loaddialect(MLIRContext* ctx);
 };

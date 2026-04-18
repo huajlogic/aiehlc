@@ -126,10 +126,9 @@ void TilingLinalgPipeline::registerDialects(mlir::MLIRContext &ctx) {
     ctx.getOrLoadDialect<mlir::emitc::EmitCDialect>();
 }
 
-mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(
-    mlir::MLIRContext &ctx,
-    int meshRows, int meshCols,
-    const std::vector<TensorParam> &tensors) {
+mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols,
+                                                    const std::vector<TensorParam> &tensors,
+                                                    const SplitModel &splitModel) {
 
     // This is a parameterized version of routingmanager::ops_testNew()
     using namespace routing;
@@ -152,6 +151,9 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(
     builder.setInsertionPointToEnd(block);
     auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(), meshRows, meshCols);
 
+    // Build all tensor values first
+    std::vector<Value> tensorValues;
+    std::vector<bool> isInputFlags;
     for (unsigned i = 0; i < tensors.size(); ++i) {
         const auto &tp = tensors[i];
 
@@ -175,11 +177,13 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(
         // Feed into createscheduletensor — same as before
         auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, tensorValue.getResult(),
                                                            vals, dimnum);
-
-        // Create routing function for this tensor
-        routingmanager rm;
-        rm.createroutingfuncByDim(builder, &ctx, tp.isInput, mesh, tensor, meshRows, "row");
+        tensorValues.push_back(tensor);
+        isInputFlags.push_back(tp.isInput);
     }
+
+    // Use SplitModel-driven routing generation
+    routingmanager rm;
+    rm.createroutingfuncBySplitModel(builder, &ctx, mesh, tensorValues, isInputFlags, meshRows, meshCols, splitModel);
 
     builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(hostFunc);

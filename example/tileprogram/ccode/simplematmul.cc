@@ -76,6 +76,9 @@
 // Each output byte = row[0:2] | col[3:5] | round[6:7]
 // This lets you identify which tile and round produced each output byte.
 #pragma aie_debug_level 2
+//__global__ void matmul(aie::row_broadcast_in<input_window_int8 *>window_in_0,
+//                       aie::col_broadcast_in<input_window_int8 *>window_in_1,
+//                       aie::row_major_out<output_window_int8 *>window_out_0) {
 __global__ void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
                        output_window_int8 *window_out_0) {
 #if DEBUG_OUTPUT_ORDER
