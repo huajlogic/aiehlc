@@ -237,7 +237,9 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({sourceChannel}),
                                       dfscheblueprint::bp_direction::MM2S),
         builder.getArrayAttr({}), builder.getStringAttr(srcTileType),
-        nullptr // data_id
+        nullptr, // data_id
+        nullptr, // shim_dim_strides
+        nullptr  // shim_dim_wraps
     );
 
     std::string dstBindName = "flow_dst_" + std::to_string(opId);
@@ -248,7 +250,9 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
                                       dfscheblueprint::bp_direction::S2MM),
         nullptr, // slice_symbols
         builder.getStringAttr(dstTileType),
-        builder.getI32IntegerAttr(dataId) // data_id for shim BD grouping
+        builder.getI32IntegerAttr(dataId), // data_id for shim BD grouping
+        nullptr,                           // shim_dim_strides
+        nullptr                            // shim_dim_wraps
     );
 
     // 4. Collective Transfer
@@ -390,7 +394,9 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
                                       dfscheblueprint::bp_direction::MM2S),
         nullptr, // slice_symbols
         builder.getStringAttr(srcTileType),
-        nullptr // data_id
+        nullptr, // data_id
+        nullptr, // shim_dim_strides
+        nullptr  // shim_dim_wraps
     );
 
     std::string dstBindName = "flow_dst_" + std::to_string(opId);
@@ -400,7 +406,9 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
         dfscheblueprint::DMAAttr::get(builder.getContext(), ArrayRef<int64_t>({dstChannel}),
                                       dfscheblueprint::bp_direction::S2MM),
         builder.getArrayAttr({}), builder.getStringAttr(dstTileType),
-        nullptr // data_id
+        nullptr, // data_id
+        nullptr, // shim_dim_strides
+        nullptr  // shim_dim_wraps
     );
 
     int32_t basePktId = 0; // Push flows are circuit-switched; no pkt_id
@@ -805,7 +813,9 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                                           dfscheblueprint::bp_direction::MM2S),
             nullptr, // slice_symbols - source is root, no slice
             rewriter.getStringAttr(srcTileType),
-            rewriter.getI32IntegerAttr(dataId) // data_id for shim BD grouping/merging
+            rewriter.getI32IntegerAttr(dataId), // data_id for shim BD grouping/merging
+            nullptr,                            // shim_dim_strides (input scatter: contiguous DDR, no multi-dim needed)
+            nullptr                             // shim_dim_wraps
         );
 
         std::string dstBindName = "flow_dst_" + std::to_string(opId);
@@ -816,7 +826,9 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                                           dfscheblueprint::bp_direction::S2MM),
             rewriter.getArrayAttr(sliceSymbols), // Associate with @consumer_slice_0 to @consumer_slice_N
             rewriter.getStringAttr(dstTileType),
-            nullptr // data_id
+            nullptr, // data_id
+            nullptr, // shim_dim_strides
+            nullptr  // shim_dim_wraps
         );
 
         // 5. Create Collective Transfer - one_to_many for push/scatter
@@ -1036,8 +1048,64 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                                           dfscheblueprint::bp_direction::MM2S),
             rewriter.getArrayAttr(sliceSymbols), // slice_symbols
             rewriter.getStringAttr(srcTileType),
-            nullptr // data_id
+            nullptr, // data_id
+            nullptr, // shim_dim_strides
+            nullptr  // shim_dim_wraps
         );
+
+        // Compute multi-dimensional DMA addressing for shim S2MM (output assembly).
+        // When the shim receives tiled output from multiple cores, the data arrives
+        // tile-by-tile but must be written into a 2D contiguous DDR buffer.
+        // The 4D addressing pattern reassembles tiles into the correct 2D layout:
+        //   D0: contiguous elements within a tile row (wrap=tileW, stride=1)
+        //   D1: next row within same tile        (wrap=tileH, stride=outW)
+        //   D2: next tile column                  (wrap=numTileCols, stride=tileW)
+        //   D3/Iter: next tile row                (wrap=numTileRows, stride=tileH*outW)
+        ArrayAttr shimDimStrides = nullptr;
+        ArrayAttr shimDimWraps = nullptr;
+
+        if (dstTileType == "shim") {
+            // viewSplit is the per-partition slice (e.g. tensor<8x16xi8>)
+            auto viewType = dyn_cast<RankedTensorType>(viewSplit.getType());
+            // rootAdaptedView is the full output tensor (e.g. tensor<16x16xi8>)
+            auto rootType = dyn_cast<RankedTensorType>(rootAdaptedView.getType());
+
+            if (viewType && rootType && viewType.getRank() == 2 && rootType.getRank() == 2) {
+                int64_t outH = rootType.getDimSize(0);  // full output height
+                int64_t outW = rootType.getDimSize(1);  // full output width
+                int64_t tileH = viewType.getDimSize(0); // per-partition height
+                int64_t tileW = viewType.getDimSize(1); // per-partition width
+
+                // Number of tile columns and rows in the full output
+                int64_t numTileCols = outW / tileW;
+                int64_t numTileRows = outH / tileH;
+
+                // Only apply multi-dim if there's actual tiling (more than 1 tile)
+                if (numTileCols > 1 || numTileRows > 1) {
+                    SmallVector<int32_t> strides = {
+                        1,                                 // D0: contiguous
+                        static_cast<int32_t>(outW),        // D1: next row in output
+                        static_cast<int32_t>(tileW),       // D2: next tile column
+                        static_cast<int32_t>(tileH * outW) // D3/Iter: next tile row
+                    };
+                    SmallVector<int32_t> wraps = {
+                        static_cast<int32_t>(tileW),       // D0: tile width
+                        static_cast<int32_t>(tileH),       // D1: tile height
+                        static_cast<int32_t>(numTileCols), // D2: number of tile columns
+                        static_cast<int32_t>(numTileRows)  // D3/Iter: number of tile rows
+                    };
+                    shimDimStrides = rewriter.getI32ArrayAttr(strides);
+                    shimDimWraps = rewriter.getI32ArrayAttr(wraps);
+
+                    llvm::errs() << "[ShimMultiDim] Pull output assembly: "
+                                 << "outH=" << outH << " outW=" << outW << " tileH=" << tileH << " tileW=" << tileW
+                                 << " numTileCols=" << numTileCols << " numTileRows=" << numTileRows << " strides=["
+                                 << strides[0] << "," << strides[1] << "," << strides[2] << "," << strides[3] << "]"
+                                 << " wraps=[" << wraps[0] << "," << wraps[1] << "," << wraps[2] << "," << wraps[3]
+                                 << "]\n";
+                }
+            }
+        }
 
         std::string dstBindName = "flow_dst_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::FlowConfigOp>(
@@ -1047,7 +1115,9 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                                           dfscheblueprint::bp_direction::S2MM),
             nullptr, // slice_symbols
             rewriter.getStringAttr(dstTileType),
-            rewriter.getI32IntegerAttr(dataId) // data_id for shim BD grouping
+            rewriter.getI32IntegerAttr(dataId), // data_id for shim BD grouping
+            shimDimStrides,                     // multi-dim strides for output assembly
+            shimDimWraps                        // multi-dim wraps for output assembly
         );
 
         // 5. Create Collective Transfer

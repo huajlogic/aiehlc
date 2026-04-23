@@ -105,7 +105,7 @@ __global__ void matmul(aie::row_broadcast_in<input_window_int8 *> window_in_0,
     }
     release_input_window(window_in_0);
     release_input_window(window_in_1);
-
+#if DEBUG_OUTPUT_ORDER
     // Log first COLS_PER_ROUND elements of A and B
     for (int i = 0; i < K_DIM; i++) {
         klog("A0  ", (int32_t)cache_A[i]);
@@ -113,6 +113,7 @@ __global__ void matmul(aie::row_broadcast_in<input_window_int8 *> window_in_0,
     for (int i = 0; i < K_DIM; i++) {
         klog("B0  ", (int32_t)cache_B[i]);
     }
+#endif
 
     // ===== Step 2: Compute top-left quadrant from cached data =====
     // C[0:RPR-1, 0:CPR-1] = A0 * B0^T (top-left)

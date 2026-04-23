@@ -199,7 +199,9 @@ def dfscheblueprint_FlowConfigOp : dfscheblueprintop<"flowconfig", [
     DMAAttr:$dma,
     OptionalAttr<ArrayAttr>:$slice_symbols,
     OptionalAttr<StrAttr>:$type,
-    OptionalAttr<I32Attr>:$data_id
+    OptionalAttr<I32Attr>:$data_id,
+    OptionalAttr<I32ArrayAttr>:$shim_dim_strides,
+    OptionalAttr<I32ArrayAttr>:$shim_dim_wraps
   );
   let hasCustomAssemblyFormat = 1;
 }

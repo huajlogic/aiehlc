@@ -712,6 +712,11 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         auto shimBdIdConst =
             rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(shimBdIdVal));
 
+        // Read multi-dim addressing from FlowConfigOp (computed during
+        // dmaphop→dfscheblueprint lowering for shim output assembly).
+        auto shimDimStrides = shimFlowConfig.getShimDimStridesAttr();
+        auto shimDimWraps = shimFlowConfig.getShimDimWrapsAttr();
+
         auto shimBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
             loc, dfschedule::BdHandleType::get(rewriter.getContext()),
             ddrBuffer,                                  // DDR receive buffer
@@ -728,7 +733,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             rewriter.getI32IntegerAttr(0),              // release_lock_val
             rewriter.getI32IntegerAttr(dataId),         // data_id
             Value(),                                    // linked_bd = none
-            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+            /*dim_strides=*/shimDimStrides, /*dim_wraps=*/shimDimWraps);
 
         auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
             loc, dfschedule::IoHandleType::get(rewriter.getContext()),
