@@ -342,11 +342,11 @@ def dmaphop_consumer : dmaphopop<"consumer", [Symbol]> {
   let description = [{
     Maps a stream port (In direction) to a specific DMA S2MM channel.
     DMA direction is inferred: In port = S2MM (receive from stream to local memory).
-    Has its own symbol name (e.g. @consumer0) and references the port via 'send' attr.
+    Has its own symbol name (e.g. @consumer0) and references the port via 'from' attr.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
-    FlatSymbolRefAttr:$send,
+    FlatSymbolRefAttr:$from,
     I64Attr:$dma_port
   );
   let results = (outs dmaphopporttype:$result);
@@ -359,11 +359,11 @@ def dmaphop_producer : dmaphopop<"producer", [Symbol]> {
   let description = [{
     Maps a stream port (Out direction) to a specific DMA MM2S channel.
     DMA direction is inferred: Out port = MM2S (send from local memory to stream).
-    Has its own symbol name (e.g. @producer0) and references the port via 'recv' attr.
+    Has its own symbol name (e.g. @producer0) and references the port via 'tp' attr.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
-    FlatSymbolRefAttr:$recv,
+    FlatSymbolRefAttr:$tp,
     I64Attr:$dma_port
   );
   let results = (outs dmaphopporttype:$result);

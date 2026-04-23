@@ -36,8 +36,8 @@ static llvm::DenseMap<mlir::Value, int32_t> g_rootViewToDataId;
 static int32_t g_dataIdCounter = 0;
 
 // Helper: resolve a symbol from create_path's producers/consumers array.
-// If the symbol refers to a dmaphop.consumer, follows send -> port.
-// If the symbol refers to a dmaphop.producer, follows recv -> port.
+// If the symbol refers to a dmaphop.consumer, follows from -> port.
+// If the symbol refers to a dmaphop.producer, follows tp -> port.
 // Otherwise assumes it's a direct port symbol.
 static dmaphop::port resolvePortFromPathSymbol(Operation *contextOp, FlatSymbolRefAttr symRef) {
     // Try direct port lookup first (shim/mem ports)
@@ -45,19 +45,19 @@ static dmaphop::port resolvePortFromPathSymbol(Operation *contextOp, FlatSymbolR
         return portOp;
     // Try consumer indirection
     if (auto consumerOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::consumer>(contextOp, symRef)) {
-        auto sendRef = consumerOp.getSendAttr();
-        return SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, sendRef);
+        auto fromRef = consumerOp.getFromAttr();
+        return SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, fromRef);
     }
     // Try producer indirection
     if (auto producerOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::producer>(contextOp, symRef)) {
-        auto recvRef = producerOp.getRecvAttr();
-        return SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, recvRef);
+        auto tpRef = producerOp.getTpAttr();
+        return SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, tpRef);
     }
     return nullptr;
 }
 
 // Helper: look up dma_port from a dmaphop.consumer or dmaphop.producer op
-// matching the given symbol name (own sym_name or send/recv port ref).
+// matching the given symbol name (own sym_name or from/tp port ref).
 // Returns the dma_port, or fallback if not found.
 static int64_t getDmaPortForSym(Operation *contextOp, StringRef portSymName, int64_t fallback) {
     Operation *searchRoot = contextOp->getParentOfType<ModuleOp>();
@@ -69,14 +69,14 @@ static int64_t getDmaPortForSym(Operation *contextOp, StringRef portSymName, int
     int64_t result = fallback;
     searchRoot->walk([&](Operation *op) {
         if (auto consumerOp = dyn_cast<dmaphop::consumer>(op)) {
-            // Match by own symbol name (from create_path) or by send port ref
-            if (consumerOp.getSymName() == portSymName || consumerOp.getSend() == portSymName) {
+            // Match by own symbol name (from create_path) or by from port ref
+            if (consumerOp.getSymName() == portSymName || consumerOp.getFrom() == portSymName) {
                 result = consumerOp.getDmaPort();
                 return WalkResult::interrupt();
             }
         } else if (auto producerOp = dyn_cast<dmaphop::producer>(op)) {
-            // Match by own symbol name (from create_path) or by recv port ref
-            if (producerOp.getSymName() == portSymName || producerOp.getRecv() == portSymName) {
+            // Match by own symbol name (from create_path) or by tp port ref
+            if (producerOp.getSymName() == portSymName || producerOp.getTp() == portSymName) {
                 result = producerOp.getDmaPort();
                 return WalkResult::interrupt();
             }

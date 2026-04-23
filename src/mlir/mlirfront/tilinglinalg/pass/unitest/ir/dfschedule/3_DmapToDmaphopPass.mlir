@@ -33,10 +33,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %21 = dmaphop.tile{TILETYPE = "core", col = 0, row = 6} -> !dmaphop.tile
         %22 = dmaphop.port @f0_corePortIn3 on %21 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %23 = dmaphop.port @f0_corePortOut3 on %21 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
-        %24 = dmaphop.consumer @f0_consumer0 {dma_port = 0 : i64, send = @f0_corePortIn0}
-        %25 = dmaphop.consumer @f0_consumer1 {dma_port = 0 : i64, send = @f0_corePortIn1}
-        %26 = dmaphop.consumer @f0_consumer2 {dma_port = 0 : i64, send = @f0_corePortIn2}
-        %27 = dmaphop.consumer @f0_consumer3 {dma_port = 0 : i64, send = @f0_corePortIn3}
+        %24 = dmaphop.consumer @f0_consumer0 {dma_port = 0 : i64, from = @f0_corePortIn0}
+        %25 = dmaphop.consumer @f0_consumer1 {dma_port = 0 : i64, from = @f0_corePortIn1}
+        %26 = dmaphop.consumer @f0_consumer2 {dma_port = 0 : i64, from = @f0_corePortIn2}
+        %27 = dmaphop.consumer @f0_consumer3 {dma_port = 0 : i64, from = @f0_corePortIn3}
         %28 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
         %29 = dmaphop.port @f0_shimPortOut on %28 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %30 = dmaphop.port @f0_shimPortIn on %28 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -64,10 +64,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %21 = dmaphop.tile{TILETYPE = "core", col = 1, row = 6} -> !dmaphop.tile
         %22 = dmaphop.port @f1_corePortIn3 on %21 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %23 = dmaphop.port @f1_corePortOut3 on %21 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
-        %24 = dmaphop.consumer @f1_consumer0 {dma_port = 0 : i64, send = @f1_corePortIn0}
-        %25 = dmaphop.consumer @f1_consumer1 {dma_port = 0 : i64, send = @f1_corePortIn1}
-        %26 = dmaphop.consumer @f1_consumer2 {dma_port = 0 : i64, send = @f1_corePortIn2}
-        %27 = dmaphop.consumer @f1_consumer3 {dma_port = 0 : i64, send = @f1_corePortIn3}
+        %24 = dmaphop.consumer @f1_consumer0 {dma_port = 0 : i64, from = @f1_corePortIn0}
+        %25 = dmaphop.consumer @f1_consumer1 {dma_port = 0 : i64, from = @f1_corePortIn1}
+        %26 = dmaphop.consumer @f1_consumer2 {dma_port = 0 : i64, from = @f1_corePortIn2}
+        %27 = dmaphop.consumer @f1_consumer3 {dma_port = 0 : i64, from = @f1_corePortIn3}
         %28 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
         %29 = dmaphop.port @f1_shimPortOut on %28 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %30 = dmaphop.port @f1_shimPortIn on %28 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
@@ -95,10 +95,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %21 = dmaphop.tile{TILETYPE = "core", col = 2, row = 6} -> !dmaphop.tile
         %22 = dmaphop.port @f2_corePortIn3 on %21 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %23 = dmaphop.port @f2_corePortOut3 on %21 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
-        %24 = dmaphop.consumer @f2_consumer0 {dma_port = 0 : i64, send = @f2_corePortIn0}
-        %25 = dmaphop.consumer @f2_consumer1 {dma_port = 0 : i64, send = @f2_corePortIn1}
-        %26 = dmaphop.consumer @f2_consumer2 {dma_port = 0 : i64, send = @f2_corePortIn2}
-        %27 = dmaphop.consumer @f2_consumer3 {dma_port = 0 : i64, send = @f2_corePortIn3}
+        %24 = dmaphop.consumer @f2_consumer0 {dma_port = 0 : i64, from = @f2_corePortIn0}
+        %25 = dmaphop.consumer @f2_consumer1 {dma_port = 0 : i64, from = @f2_corePortIn1}
+        %26 = dmaphop.consumer @f2_consumer2 {dma_port = 0 : i64, from = @f2_corePortIn2}
+        %27 = dmaphop.consumer @f2_consumer3 {dma_port = 0 : i64, from = @f2_corePortIn3}
         %28 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
         %29 = dmaphop.port @f2_shimPortOut on %28 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %30 = dmaphop.port @f2_shimPortIn on %28 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -126,10 +126,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %21 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
         %22 = dmaphop.port @f3_corePortIn3 on %21 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %23 = dmaphop.port @f3_corePortOut3 on %21 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
-        %24 = dmaphop.consumer @f3_consumer0 {dma_port = 0 : i64, send = @f3_corePortIn0}
-        %25 = dmaphop.consumer @f3_consumer1 {dma_port = 0 : i64, send = @f3_corePortIn1}
-        %26 = dmaphop.consumer @f3_consumer2 {dma_port = 0 : i64, send = @f3_corePortIn2}
-        %27 = dmaphop.consumer @f3_consumer3 {dma_port = 0 : i64, send = @f3_corePortIn3}
+        %24 = dmaphop.consumer @f3_consumer0 {dma_port = 0 : i64, from = @f3_corePortIn0}
+        %25 = dmaphop.consumer @f3_consumer1 {dma_port = 0 : i64, from = @f3_corePortIn1}
+        %26 = dmaphop.consumer @f3_consumer2 {dma_port = 0 : i64, from = @f3_corePortIn2}
+        %27 = dmaphop.consumer @f3_consumer3 {dma_port = 0 : i64, from = @f3_corePortIn3}
         %28 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
         %29 = dmaphop.port @f3_shimPortOut on %28 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %30 = dmaphop.port @f3_shimPortIn on %28 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
@@ -174,10 +174,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %22 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
         %23 = dmaphop.port @f4_corePortIn3 on %22 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %24 = dmaphop.port @f4_corePortOut3 on %22 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
-        %25 = dmaphop.consumer @f4_consumer0 {dma_port = 1 : i64, send = @f4_corePortIn0}
-        %26 = dmaphop.consumer @f4_consumer1 {dma_port = 1 : i64, send = @f4_corePortIn1}
-        %27 = dmaphop.consumer @f4_consumer2 {dma_port = 1 : i64, send = @f4_corePortIn2}
-        %28 = dmaphop.consumer @f4_consumer3 {dma_port = 1 : i64, send = @f4_corePortIn3}
+        %25 = dmaphop.consumer @f4_consumer0 {dma_port = 1 : i64, from = @f4_corePortIn0}
+        %26 = dmaphop.consumer @f4_consumer1 {dma_port = 1 : i64, from = @f4_corePortIn1}
+        %27 = dmaphop.consumer @f4_consumer2 {dma_port = 1 : i64, from = @f4_corePortIn2}
+        %28 = dmaphop.consumer @f4_consumer3 {dma_port = 1 : i64, from = @f4_corePortIn3}
         %29 = dmaphop.tile{TILETYPE = "shim", col = 6, row = 0} -> !dmaphop.tile
         %30 = dmaphop.port @f4_shimPortOut on %29 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %31 = dmaphop.port @f4_shimPortIn on %29 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -201,10 +201,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %47 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
         %48 = dmaphop.port @f5_corePortIn3 on %47 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %49 = dmaphop.port @f5_corePortOut3 on %47 { direction = "Out", direction_channel = 0, dmapktid = 4 : i32 } : !dmaphop.tile -> !dmaphop.port
-        %50 = dmaphop.producer @f5_producer0 {dma_port = 0 : i64, recv = @f5_corePortOut0}
-        %51 = dmaphop.producer @f5_producer1 {dma_port = 0 : i64, recv = @f5_corePortOut1}
-        %52 = dmaphop.producer @f5_producer2 {dma_port = 0 : i64, recv = @f5_corePortOut2}
-        %53 = dmaphop.producer @f5_producer3 {dma_port = 0 : i64, recv = @f5_corePortOut3}
+        %50 = dmaphop.producer @f5_producer0 {dma_port = 0 : i64, tp = @f5_corePortOut0}
+        %51 = dmaphop.producer @f5_producer1 {dma_port = 0 : i64, tp = @f5_corePortOut1}
+        %52 = dmaphop.producer @f5_producer2 {dma_port = 0 : i64, tp = @f5_corePortOut2}
+        %53 = dmaphop.producer @f5_producer3 {dma_port = 0 : i64, tp = @f5_corePortOut3}
         %54 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
         %55 = dmaphop.port @f5_shimPortOut on %54 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %56 = dmaphop.port @f5_shimPortIn on %54 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -236,10 +236,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %22 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
         %23 = dmaphop.port @f6_corePortIn3 on %22 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %24 = dmaphop.port @f6_corePortOut3 on %22 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
-        %25 = dmaphop.consumer @f6_consumer0 {dma_port = 1 : i64, send = @f6_corePortIn0}
-        %26 = dmaphop.consumer @f6_consumer1 {dma_port = 1 : i64, send = @f6_corePortIn1}
-        %27 = dmaphop.consumer @f6_consumer2 {dma_port = 1 : i64, send = @f6_corePortIn2}
-        %28 = dmaphop.consumer @f6_consumer3 {dma_port = 1 : i64, send = @f6_corePortIn3}
+        %25 = dmaphop.consumer @f6_consumer0 {dma_port = 1 : i64, from = @f6_corePortIn0}
+        %26 = dmaphop.consumer @f6_consumer1 {dma_port = 1 : i64, from = @f6_corePortIn1}
+        %27 = dmaphop.consumer @f6_consumer2 {dma_port = 1 : i64, from = @f6_corePortIn2}
+        %28 = dmaphop.consumer @f6_consumer3 {dma_port = 1 : i64, from = @f6_corePortIn3}
         %29 = dmaphop.tile{TILETYPE = "shim", col = 6, row = 0} -> !dmaphop.tile
         %30 = dmaphop.port @f6_shimPortOut on %29 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %31 = dmaphop.port @f6_shimPortIn on %29 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
@@ -263,10 +263,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %47 = dmaphop.tile{TILETYPE = "core", col = 3, row = 4} -> !dmaphop.tile
         %48 = dmaphop.port @f7_corePortIn3 on %47 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %49 = dmaphop.port @f7_corePortOut3 on %47 { direction = "Out", direction_channel = 0, dmapktid = 8 : i32 } : !dmaphop.tile -> !dmaphop.port
-        %50 = dmaphop.producer @f7_producer0 {dma_port = 0 : i64, recv = @f7_corePortOut0}
-        %51 = dmaphop.producer @f7_producer1 {dma_port = 0 : i64, recv = @f7_corePortOut1}
-        %52 = dmaphop.producer @f7_producer2 {dma_port = 0 : i64, recv = @f7_corePortOut2}
-        %53 = dmaphop.producer @f7_producer3 {dma_port = 0 : i64, recv = @f7_corePortOut3}
+        %50 = dmaphop.producer @f7_producer0 {dma_port = 0 : i64, tp = @f7_corePortOut0}
+        %51 = dmaphop.producer @f7_producer1 {dma_port = 0 : i64, tp = @f7_corePortOut1}
+        %52 = dmaphop.producer @f7_producer2 {dma_port = 0 : i64, tp = @f7_corePortOut2}
+        %53 = dmaphop.producer @f7_producer3 {dma_port = 0 : i64, tp = @f7_corePortOut3}
         %54 = dmaphop.tile{TILETYPE = "shim", col = 3, row = 0} -> !dmaphop.tile
         %55 = dmaphop.port @f7_shimPortOut on %54 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %56 = dmaphop.port @f7_shimPortIn on %54 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
@@ -298,10 +298,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %22 = dmaphop.tile{TILETYPE = "core", col = 3, row = 5} -> !dmaphop.tile
         %23 = dmaphop.port @f8_corePortIn3 on %22 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %24 = dmaphop.port @f8_corePortOut3 on %22 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
-        %25 = dmaphop.consumer @f8_consumer0 {dma_port = 1 : i64, send = @f8_corePortIn0}
-        %26 = dmaphop.consumer @f8_consumer1 {dma_port = 1 : i64, send = @f8_corePortIn1}
-        %27 = dmaphop.consumer @f8_consumer2 {dma_port = 1 : i64, send = @f8_corePortIn2}
-        %28 = dmaphop.consumer @f8_consumer3 {dma_port = 1 : i64, send = @f8_corePortIn3}
+        %25 = dmaphop.consumer @f8_consumer0 {dma_port = 1 : i64, from = @f8_corePortIn0}
+        %26 = dmaphop.consumer @f8_consumer1 {dma_port = 1 : i64, from = @f8_corePortIn1}
+        %27 = dmaphop.consumer @f8_consumer2 {dma_port = 1 : i64, from = @f8_corePortIn2}
+        %28 = dmaphop.consumer @f8_consumer3 {dma_port = 1 : i64, from = @f8_corePortIn3}
         %29 = dmaphop.tile{TILETYPE = "shim", col = 7, row = 0} -> !dmaphop.tile
         %30 = dmaphop.port @f8_shimPortOut on %29 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %31 = dmaphop.port @f8_shimPortIn on %29 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -325,10 +325,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %47 = dmaphop.tile{TILETYPE = "core", col = 3, row = 5} -> !dmaphop.tile
         %48 = dmaphop.port @f9_corePortIn3 on %47 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %49 = dmaphop.port @f9_corePortOut3 on %47 { direction = "Out", direction_channel = 0, dmapktid = 12 : i32 } : !dmaphop.tile -> !dmaphop.port
-        %50 = dmaphop.producer @f9_producer0 {dma_port = 0 : i64, recv = @f9_corePortOut0}
-        %51 = dmaphop.producer @f9_producer1 {dma_port = 0 : i64, recv = @f9_corePortOut1}
-        %52 = dmaphop.producer @f9_producer2 {dma_port = 0 : i64, recv = @f9_corePortOut2}
-        %53 = dmaphop.producer @f9_producer3 {dma_port = 0 : i64, recv = @f9_corePortOut3}
+        %50 = dmaphop.producer @f9_producer0 {dma_port = 0 : i64, tp = @f9_corePortOut0}
+        %51 = dmaphop.producer @f9_producer1 {dma_port = 0 : i64, tp = @f9_corePortOut1}
+        %52 = dmaphop.producer @f9_producer2 {dma_port = 0 : i64, tp = @f9_corePortOut2}
+        %53 = dmaphop.producer @f9_producer3 {dma_port = 0 : i64, tp = @f9_corePortOut3}
         %54 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
         %55 = dmaphop.port @f9_shimPortOut on %54 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %56 = dmaphop.port @f9_shimPortIn on %54 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -360,10 +360,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %22 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
         %23 = dmaphop.port @f10_corePortIn3 on %22 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %24 = dmaphop.port @f10_corePortOut3 on %22 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
-        %25 = dmaphop.consumer @f10_consumer0 {dma_port = 1 : i64, send = @f10_corePortIn0}
-        %26 = dmaphop.consumer @f10_consumer1 {dma_port = 1 : i64, send = @f10_corePortIn1}
-        %27 = dmaphop.consumer @f10_consumer2 {dma_port = 1 : i64, send = @f10_corePortIn2}
-        %28 = dmaphop.consumer @f10_consumer3 {dma_port = 1 : i64, send = @f10_corePortIn3}
+        %25 = dmaphop.consumer @f10_consumer0 {dma_port = 1 : i64, from = @f10_corePortIn0}
+        %26 = dmaphop.consumer @f10_consumer1 {dma_port = 1 : i64, from = @f10_corePortIn1}
+        %27 = dmaphop.consumer @f10_consumer2 {dma_port = 1 : i64, from = @f10_corePortIn2}
+        %28 = dmaphop.consumer @f10_consumer3 {dma_port = 1 : i64, from = @f10_corePortIn3}
         %29 = dmaphop.tile{TILETYPE = "shim", col = 7, row = 0} -> !dmaphop.tile
         %30 = dmaphop.port @f10_shimPortOut on %29 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %31 = dmaphop.port @f10_shimPortIn on %29 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
@@ -387,10 +387,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         %47 = dmaphop.tile{TILETYPE = "core", col = 3, row = 6} -> !dmaphop.tile
         %48 = dmaphop.port @f11_corePortIn3 on %47 { direction = "In", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
         %49 = dmaphop.port @f11_corePortOut3 on %47 { direction = "Out", direction_channel = 0, dmapktid = 16 : i32 } : !dmaphop.tile -> !dmaphop.port
-        %50 = dmaphop.producer @f11_producer0 {dma_port = 0 : i64, recv = @f11_corePortOut0}
-        %51 = dmaphop.producer @f11_producer1 {dma_port = 0 : i64, recv = @f11_corePortOut1}
-        %52 = dmaphop.producer @f11_producer2 {dma_port = 0 : i64, recv = @f11_corePortOut2}
-        %53 = dmaphop.producer @f11_producer3 {dma_port = 0 : i64, recv = @f11_corePortOut3}
+        %50 = dmaphop.producer @f11_producer0 {dma_port = 0 : i64, tp = @f11_corePortOut0}
+        %51 = dmaphop.producer @f11_producer1 {dma_port = 0 : i64, tp = @f11_corePortOut1}
+        %52 = dmaphop.producer @f11_producer2 {dma_port = 0 : i64, tp = @f11_corePortOut2}
+        %53 = dmaphop.producer @f11_producer3 {dma_port = 0 : i64, tp = @f11_corePortOut3}
         %54 = dmaphop.tile{TILETYPE = "shim", col = 2, row = 0} -> !dmaphop.tile
         %55 = dmaphop.port @f11_shimPortOut on %54 { direction = "Out", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %56 = dmaphop.port @f11_shimPortIn on %54 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
