@@ -30,6 +30,57 @@ using namespace dfschedule;
 
 namespace {
 
+// Trace a Value back through the SSA chain to find the originating function
+// argument index.  This walks through bufferization.to_tensor,
+// routing.routingcreatescheduletensor, routing.partitiontensor,
+// routing.routingextract_data, dfscheblueprint.declare_data, and
+// scf.execute_region captures until it reaches a BlockArgument of a func::FuncOp.
+// Returns the argument index (0-based), or -1 if the chain cannot be resolved.
+static int traceToFuncArgIndex(Value v) {
+    // Walk up the def chain, max 20 hops to avoid infinite loops
+    for (int depth = 0; depth < 20; ++depth) {
+        // If v is a block argument of a func op, we found it
+        if (auto blockArg = dyn_cast<BlockArgument>(v)) {
+            if (auto funcOp = dyn_cast<func::FuncOp>(blockArg.getOwner()->getParentOp()))
+                return static_cast<int>(blockArg.getArgNumber());
+            break; // can't follow further through a block argument
+        }
+        Operation *defOp = v.getDefiningOp();
+        if (!defOp)
+            break;
+
+        // routing ops that forward data through operand 0
+        if (defOp->getName().getStringRef() == "routing.routingextract_data" ||
+            defOp->getName().getStringRef() == "routing.routingcreatescheduletensor" ||
+            defOp->getName().getStringRef() == "routing.partitiontensor") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // bufferization.to_tensor %memref -> follow %memref (operand 0)
+        if (defOp->getName().getStringRef() == "bufferization.to_tensor") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // dfscheblueprint.declare_data -> follow init_tensor (operand 0)
+        if (defOp->getName().getStringRef() == "dfscheblueprint.declare_data") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // tensor.extract_slice -> follow source tensor (operand 0)
+        if (defOp->getName().getStringRef() == "tensor.extract_slice") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // Generic single-result ops that just forward operand 0
+        if (defOp->getNumOperands() > 0) {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        break;
+    }
+    return -1; // unable to resolve
+}
+
 // ============================================================================
 // Fake Resource Manager for Lock and BD ID allocation
 // ============================================================================
@@ -220,6 +271,7 @@ struct KernelParamInfo {
     int32_t vectorWidth;        // Vector width (e.g., 4 for v4int32)
     uint32_t pingAddress = 0;   // BCF symbol address for ping buffer (from CoreMemAllocator)
     uint32_t pongAddress = 0;   // BCF symbol address for pong buffer (from CoreMemAllocator)
+    int funcArgIndex = -1;      // Function argument index (0=A, 1=B, 2=C)
 };
 
 // Structure to hold kernel generation parameters
@@ -648,8 +700,6 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                                                         int32_t defaultVectorWidth, double bufferRatio) {
 
     SmallVector<KernelParamInfo> params;
-    int inputCount = 0;
-    int outputCount = 0;
 
     // Track which declare_data results we've already created a window for.
     // With row partitioning, the same declare_data feeds multiple flow_transfers
@@ -715,26 +765,18 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
             processedDeclareData.insert(dataValue);
 
             KernelParamInfo paramInfo;
+            paramInfo.isInput = isInput;
 
-            if (isInput) {
-                paramInfo.windowName = "window_in_" + std::to_string(inputCount);
-                paramInfo.bufferPingName = "buf_in_ping_" + std::to_string(inputCount);
-                paramInfo.bufferPongName = "buf_in_pong_" + std::to_string(inputCount);
-                paramInfo.isInput = true;
-                // Allocate lock IDs for input (acquire for read, release after read)
-                paramInfo.acquireLockId = resourceMgr.allocateInputAcquireLock();
-                paramInfo.releaseLockId = resourceMgr.allocateInputReleaseLock();
-                inputCount++;
-            } else {
-                paramInfo.windowName = "window_out_" + std::to_string(outputCount);
-                paramInfo.bufferPingName = "buf_out_ping_" + std::to_string(outputCount);
-                paramInfo.bufferPongName = "buf_out_pong_" + std::to_string(outputCount);
-                paramInfo.isInput = false;
-                // Allocate lock IDs for output (acquire for write, release after write)
-                paramInfo.acquireLockId = resourceMgr.allocateOutputAcquireLock();
-                paramInfo.releaseLockId = resourceMgr.allocateOutputReleaseLock();
-                outputCount++;
-            }
+            // Trace from declare_data's init_tensor operand back to the
+            // function argument to determine canonical ordering.
+            paramInfo.funcArgIndex = traceToFuncArgIndex(declareDataOp.getOperand());
+
+            // Temporary placeholders - will be reassigned after sorting
+            paramInfo.windowName = "";
+            paramInfo.bufferPingName = "";
+            paramInfo.bufferPongName = "";
+            paramInfo.acquireLockId = 0;
+            paramInfo.releaseLockId = 0;
 
             // Get element type and partition size from the core FlowConfig's view
             // (not the full tensor from declare_data, which is the root tensor)
@@ -786,18 +828,70 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
 
             paramInfo.vectorWidth = defaultVectorWidth;
 
-            // Read buffer addresses from CoreMemAllocator (allocated by host pass)
-            try {
-                auto &allocator = ResourceMgr::instance()->coreMemAllocator();
-                paramInfo.pingAddress = allocator.getAddress(paramInfo.bufferPingName);
-                paramInfo.pongAddress = allocator.getAddress(paramInfo.bufferPongName);
-            } catch (...) {
-                // ResourceMgr singleton not initialized; addresses remain 0
-            }
-
             params.push_back(paramInfo);
         }
     });
+
+    // =========================================================================
+    // Phase 2: Sort by funcArgIndex and assign names, locks, and addresses
+    // =========================================================================
+    // Separate inputs and outputs, sort each by funcArgIndex, then assign
+    // sequential names (window_in_0, window_in_1, ...) and lock IDs.
+    SmallVector<KernelParamInfo *> inputParams, outputParams;
+    for (auto &p : params) {
+        if (p.isInput)
+            inputParams.push_back(&p);
+        else
+            outputParams.push_back(&p);
+    }
+
+    // Sort by funcArgIndex (stable sort preserves encounter order for ties)
+    llvm::sort(inputParams,
+               [](const KernelParamInfo *a, const KernelParamInfo *b) { return a->funcArgIndex < b->funcArgIndex; });
+    llvm::sort(outputParams,
+               [](const KernelParamInfo *a, const KernelParamInfo *b) { return a->funcArgIndex < b->funcArgIndex; });
+
+    // Reset resource manager to allocate locks in sorted order
+    resourceMgr.reset();
+
+    int sortedInputCount = 0;
+    for (auto *p : inputParams) {
+        p->windowName = "window_in_" + std::to_string(sortedInputCount);
+        p->bufferPingName = "buf_in_ping_" + std::to_string(sortedInputCount);
+        p->bufferPongName = "buf_in_pong_" + std::to_string(sortedInputCount);
+        p->acquireLockId = resourceMgr.allocateInputAcquireLock();
+        p->releaseLockId = resourceMgr.allocateInputReleaseLock();
+        sortedInputCount++;
+    }
+    int sortedOutputCount = 0;
+    for (auto *p : outputParams) {
+        p->windowName = "window_out_" + std::to_string(sortedOutputCount);
+        p->bufferPingName = "buf_out_ping_" + std::to_string(sortedOutputCount);
+        p->bufferPongName = "buf_out_pong_" + std::to_string(sortedOutputCount);
+        p->acquireLockId = resourceMgr.allocateOutputAcquireLock();
+        p->releaseLockId = resourceMgr.allocateOutputReleaseLock();
+        sortedOutputCount++;
+    }
+
+    // Read buffer addresses from CoreMemAllocator (allocated by host pass)
+    for (auto &p : params) {
+        try {
+            auto &allocator = ResourceMgr::instance()->coreMemAllocator();
+            p.pingAddress = allocator.getAddress(p.bufferPingName);
+            p.pongAddress = allocator.getAddress(p.bufferPongName);
+        } catch (...) {
+            // ResourceMgr singleton not initialized; addresses remain 0
+        }
+    }
+
+    // Debug: print parameter mapping chain
+    llvm::errs() << "[KernelParamMapping] Parameter order mapping:\n";
+    for (const auto &p : params) {
+        llvm::errs() << "  funcArg=" << p.funcArgIndex << " -> " << p.windowName << " -> " << p.bufferPingName << "/"
+                     << p.bufferPongName << " -> addr=0x" << llvm::utohexstr(p.pingAddress) << "/0x"
+                     << llvm::utohexstr(p.pongAddress) << " -> lock=" << p.acquireLockId << "/" << p.releaseLockId
+                     << "\n";
+    }
 
     return params;
 }

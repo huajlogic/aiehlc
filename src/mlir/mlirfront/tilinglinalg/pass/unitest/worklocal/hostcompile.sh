@@ -142,7 +142,7 @@ if [[ "$aie_version" == "1" || "$aie_version" == "2" ]]; then
     AIELIB_APU_NAME="libxaienginea72.a"
     ARCH_APU_LD="${ARCH_DIR}/psv_cortexa72_0/lscript.ld"
     compiler_cpu_flag="-mcpu=cortex-a72"
-    LINK_EXTRA="-lxil"
+    LINK_EXTRA="-lxil,-lxilstandalone,-lxiltimer"
 elif [[ "$aie_version" == "5" ]]; then
     ARCH_APU_ALIB="${ARCH_78_DIR}/lib"
     ARCH_APU_AINC="${ARCH_78_DIR}/include"

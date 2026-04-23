@@ -12,7 +12,8 @@
       "mcp__*",
       "Skill(superpowers:brainstorming)",
       "Skill(superpowers:systematic-debugging)",
-      "Skill(superpowers:executing-plans)"
+      "Skill(superpowers:executing-plans)",
+      "Skill(session-memory)"
     ],
     "deny": []
   },
