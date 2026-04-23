@@ -31,6 +31,59 @@ using namespace routinghw;
 namespace {
 
 int ioIdx = 0;
+
+// Helper: resolve a symbol from create_path's producers/consumers array.
+// If the symbol refers to a dmaphop.consumer, follows send -> port.
+// If the symbol refers to a dmaphop.producer, follows recv -> port.
+// Otherwise assumes it's a direct port symbol.
+static dmaphop::port resolvePortFromPathSymbol(Operation *contextOp, FlatSymbolRefAttr symRef) {
+    // Try direct port lookup first (shim/mem ports)
+    if (auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, symRef))
+        return portOp;
+    // Try consumer indirection
+    if (auto consumerOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::consumer>(contextOp, symRef)) {
+        auto sendRef = consumerOp.getSendAttr();
+        return SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, sendRef);
+    }
+    // Try producer indirection
+    if (auto producerOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::producer>(contextOp, symRef)) {
+        auto recvRef = producerOp.getRecvAttr();
+        return SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, recvRef);
+    }
+    return nullptr;
+}
+
+// Helper: look up dma_port from a dmaphop.consumer or dmaphop.producer op
+// by matching its sym_name (or send/recv port ref) to the given symbol name.
+// Returns the dma_port value, or std::nullopt if not found.
+static std::optional<int64_t> lookupDmaPort(Operation *contextOp, StringRef portSymName) {
+    auto parentOp = contextOp->getParentOfType<ModuleOp>();
+    if (!parentOp)
+        parentOp = contextOp->getParentOfType<ModuleOp>();
+    Operation *searchRoot = parentOp ? parentOp.getOperation() : contextOp->getParentOp();
+
+    std::optional<int64_t> result;
+    searchRoot->walk([&](Operation *op) {
+        if (result.has_value())
+            return WalkResult::interrupt();
+        if (auto consumerOp = dyn_cast<dmaphop::consumer>(op)) {
+            // Match by own symbol name (from create_path) or by send port ref
+            if (consumerOp.getSymName() == portSymName || consumerOp.getSend() == portSymName) {
+                result = consumerOp.getDmaPort();
+                return WalkResult::interrupt();
+            }
+        } else if (auto producerOp = dyn_cast<dmaphop::producer>(op)) {
+            // Match by own symbol name (from create_path) or by recv port ref
+            if (producerOp.getSymName() == portSymName || producerOp.getRecv() == portSymName) {
+                result = producerOp.getDmaPort();
+                return WalkResult::interrupt();
+            }
+        }
+        return WalkResult::advance();
+    });
+    return result;
+}
+
 /*
 // Helper structures from routinglower.cpp - needed for GetSeqPath and ParseTheCCTRoutingPath
 struct StreamCCTConnection {
@@ -143,25 +196,26 @@ std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
     }
 
     // set the local DMA pkt connection
-    //  Use direction_channel from the dmaphop port op to determine the DMA port.
+    //  Use dma_port from dmaphop.producer ops to determine the DMA port.
     //  This ensures consistency with host.cc which uses the same channel number.
     int tileIndex = 0;
     for (const auto &dstPoint : tilist) {
         int dmaportNum = 0; // default DMA port 0
 
-        // Read dmapktid and direction_channel from the corresponding corePortOut symbol
+        // Read dmapktid from the corresponding corePortOut symbol,
+        // and dma_port from the dmaphop.producer op.
         int pktId = 1; // fallback: 1-based
         if (tileIndex < (int)producerSymNames.size()) {
             auto symRef = FlatSymbolRefAttr::get(op->getContext(), producerSymNames[tileIndex]);
-            if (auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symRef)) {
+            // Use resolvePortFromPathSymbol to handle producer symbol indirection
+            if (auto portOp = resolvePortFromPathSymbol(op, symRef)) {
                 if (auto pktIdOpt = portOp.getDmapktid()) {
                     pktId = static_cast<int>(*pktIdOpt);
                 }
-                // Use direction_channel as the DMA slave port number.
-                // This must match the MM2S channel assigned in host.cc.
-                if (auto chOpt = portOp.getDirectionChannel()) {
-                    dmaportNum = static_cast<int>(*chOpt);
-                }
+            }
+            // Look up the pre-allocated DMA port from the dmaphop.producer op
+            if (auto dmaPortOpt = lookupDmaPort(op, producerSymNames[tileIndex])) {
+                dmaportNum = static_cast<int>(*dmaPortOpt);
             }
         }
         // set prev tile master port and dma port
@@ -364,16 +418,58 @@ std::optional<TileListRoutingMap> GetSeqPath(
         connectionData[dioshimpoint].SlaveReceiveForwardDirectionPortIdx = shimPortNum;
     }
 
-    // 1b. Populate DMA connection information
+    // 1b. Populate DMA connection information from dmaphop.consumer ops
+    // DMA port numbers are pre-allocated in DmapToDmaphopPass and stored as
+    // dmaphop.consumer ops. Walk for consumer ops whose port_sym points to a
+    // core tile in dsttiles.
     auto rm = router_.getRM();
+
+    // Build a reverse map: core tile Point -> consumer dma_port
+    std::unordered_map<Point, int, Point::Hash> consumerDmaPortMap;
+    {
+        // Use the first dsttile's parent to find consumer ops
+        if (!dsttiles.empty()) {
+            auto firstTileOp = dsttiles.begin()->second;
+            if (firstTileOp) {
+                auto moduleOp = firstTileOp->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    moduleOp->walk([&](dmaphop::consumer consumerOp) {
+                        // Consumer now has its own sym_name and references port via 'send' attr
+                        auto sendRef = consumerOp.getSendAttr();
+                        // Find the tile point this consumer belongs to by looking up
+                        // the port referenced by the 'send' attribute
+                        for (const auto &[pt, tileOp] : dsttiles) {
+                            if (auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(moduleOp, sendRef)) {
+                                auto tileVal = portOp.getTile();
+                                if (auto tileDefOp = tileVal.getDefiningOp<dmaphop::tile>()) {
+                                    Point tilePt{static_cast<int>(tileDefOp.getRow()),
+                                                 static_cast<int>(tileDefOp.getCol())};
+                                    if (tilePt == pt) {
+                                        consumerDmaPortMap[pt] = static_cast<int>(consumerOp.getDmaPort());
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     for (const auto& p : orderedPathPoints) {
         connectionData[p].localDMAForwardDirection = PortDirection::NONE;
-        if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core 
-            && StreamType::BROADCAST == streamtype
-            && dsttiles.find(p) != dsttiles.end()) {
-            if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::Input, PortDirection::DMA, -1)) {
+        if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core && StreamType::BROADCAST == streamtype &&
+            dsttiles.find(p) != dsttiles.end()) {
+            auto it = consumerDmaPortMap.find(p);
+            if (it != consumerDmaPortMap.end()) {
                 connectionData[p].localDMAForwardDirection = PortDirection::DMA;
-                connectionData[p].localDMAForwardPortIdx = *portnumptr;
+                connectionData[p].localDMAForwardPortIdx = it->second;
+            } else {
+                // Fallback to dynamic allocation if no consumer op found
+                if (auto portnumptr = rm->tile(p.r, p.c).occupyport(IOType::Input, PortDirection::DMA, -1)) {
+                    connectionData[p].localDMAForwardDirection = PortDirection::DMA;
+                    connectionData[p].localDMAForwardPortIdx = *portnumptr;
+                }
             }
         }
     }
@@ -679,7 +775,8 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             for (auto symRef : producersAttr) {
                 if (auto symRefAttr = dyn_cast<FlatSymbolRefAttr>(symRef)) {
                     producerSymNames.insert(symRefAttr.getValue());
-                    if (auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symRefAttr)) {
+                    // Use resolvePortFromPathSymbol to handle producer symbol indirection
+                    if (auto portOp = resolvePortFromPathSymbol(op, symRefAttr)) {
                         producerPorts.insert(portOp.getResult());
                     }
                 }
@@ -694,7 +791,8 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
             for (auto symRef : consumersAttr) {
                 if (auto symRefAttr = dyn_cast<FlatSymbolRefAttr>(symRef)) {
                     consumerSymNames.insert(symRefAttr.getValue());
-                    if (auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symRefAttr)) {
+                    // Use resolvePortFromPathSymbol to handle consumer symbol indirection
+                    if (auto portOp = resolvePortFromPathSymbol(op, symRefAttr)) {
                         consumerPorts.insert(portOp.getResult());
                     }
                 }
@@ -832,9 +930,20 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         {
             std::set<Point> producerPointSet;
             for (const auto &symName : producerSymNames) {
+                // First try direct port symbol lookup
                 auto it = routingCtx.portSymToTilePoint.find(symName.str());
                 if (it != routingCtx.portSymToTilePoint.end()) {
                     producerPointSet.insert(it->second);
+                } else {
+                    // Try resolving through producer indirection (sym_name -> recv -> port)
+                    auto symRef = FlatSymbolRefAttr::get(op->getContext(), symName);
+                    if (auto producerOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::producer>(op, symRef)) {
+                        auto recvPortName = producerOp.getRecv();
+                        auto it2 = routingCtx.portSymToTilePoint.find(recvPortName.str());
+                        if (it2 != routingCtx.portSymToTilePoint.end()) {
+                            producerPointSet.insert(it2->second);
+                        }
+                    }
                 }
             }
             for (const auto &pt : coreTileList) {
@@ -846,9 +955,20 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         {
             std::set<Point> consumerPointSet;
             for (const auto &symName : consumerSymNames) {
+                // First try direct port symbol lookup
                 auto it = routingCtx.portSymToTilePoint.find(symName.str());
                 if (it != routingCtx.portSymToTilePoint.end()) {
                     consumerPointSet.insert(it->second);
+                } else {
+                    // Try resolving through consumer indirection (sym_name -> send -> port)
+                    auto symRef = FlatSymbolRefAttr::get(op->getContext(), symName);
+                    if (auto consumerOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::consumer>(op, symRef)) {
+                        auto sendPortName = consumerOp.getSend();
+                        auto it2 = routingCtx.portSymToTilePoint.find(sendPortName.str());
+                        if (it2 != routingCtx.portSymToTilePoint.end()) {
+                            consumerPointSet.insert(it2->second);
+                        }
+                    }
                 }
             }
             for (const auto &pt : coreTileList) {
@@ -1045,6 +1165,8 @@ void DmaphopToRoutinghwPass::runOnOperation() {
     patterns.add<EraseOpPattern<dmaphop::push>>(&ctx);
     patterns.add<EraseOpPattern<dmaphop::pull>>(&ctx);
     patterns.add<EraseOpPattern<dmaphop::sync>>(&ctx);
+    patterns.add<EraseOpPattern<dmaphop::consumer>>(&ctx);
+    patterns.add<EraseOpPattern<dmaphop::producer>>(&ctx);
     patterns.add<EraseOpPattern<routing::extract_data>>(&ctx);
     patterns.add<EraseOpPattern<tensor::ExtractSliceOp>>(&ctx);
     patterns.add<EraseOpPattern<routing::createscheduletensor>>(&ctx);

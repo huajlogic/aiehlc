@@ -35,12 +35,64 @@ static std::atomic<int> g_pullPushCounter{0};
 static llvm::DenseMap<mlir::Value, int32_t> g_rootViewToDataId;
 static int32_t g_dataIdCounter = 0;
 
+// Helper: resolve a symbol from create_path's producers/consumers array.
+// If the symbol refers to a dmaphop.consumer, follows send -> port.
+// If the symbol refers to a dmaphop.producer, follows recv -> port.
+// Otherwise assumes it's a direct port symbol.
+static dmaphop::port resolvePortFromPathSymbol(Operation *contextOp, FlatSymbolRefAttr symRef) {
+    // Try direct port lookup first (shim/mem ports)
+    if (auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, symRef))
+        return portOp;
+    // Try consumer indirection
+    if (auto consumerOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::consumer>(contextOp, symRef)) {
+        auto sendRef = consumerOp.getSendAttr();
+        return SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, sendRef);
+    }
+    // Try producer indirection
+    if (auto producerOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::producer>(contextOp, symRef)) {
+        auto recvRef = producerOp.getRecvAttr();
+        return SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, recvRef);
+    }
+    return nullptr;
+}
+
+// Helper: look up dma_port from a dmaphop.consumer or dmaphop.producer op
+// matching the given symbol name (own sym_name or send/recv port ref).
+// Returns the dma_port, or fallback if not found.
+static int64_t getDmaPortForSym(Operation *contextOp, StringRef portSymName, int64_t fallback) {
+    Operation *searchRoot = contextOp->getParentOfType<ModuleOp>();
+    if (!searchRoot)
+        searchRoot = contextOp->getParentOp();
+    if (!searchRoot)
+        return fallback;
+
+    int64_t result = fallback;
+    searchRoot->walk([&](Operation *op) {
+        if (auto consumerOp = dyn_cast<dmaphop::consumer>(op)) {
+            // Match by own symbol name (from create_path) or by send port ref
+            if (consumerOp.getSymName() == portSymName || consumerOp.getSend() == portSymName) {
+                result = consumerOp.getDmaPort();
+                return WalkResult::interrupt();
+            }
+        } else if (auto producerOp = dyn_cast<dmaphop::producer>(op)) {
+            // Match by own symbol name (from create_path) or by recv port ref
+            if (producerOp.getSymName() == portSymName || producerOp.getRecv() == portSymName) {
+                result = producerOp.getDmaPort();
+                return WalkResult::interrupt();
+            }
+        }
+        return WalkResult::advance();
+    });
+    return result;
+}
+
 // Helper: look up dmapktid from the first producer port of a pull path.
 // Returns 1 as fallback (pkt_id=0 is reserved).
 static int32_t getBasePktIdFromProducers(dmaphop::create_path pathOp, Operation *contextOp) {
     for (auto attr : pathOp.getProducers()) {
         if (auto symRef = dyn_cast<FlatSymbolRefAttr>(attr)) {
-            auto portOp = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(contextOp, symRef);
+            // Use resolvePortFromPathSymbol to handle producer symbol indirection
+            auto portOp = resolvePortFromPathSymbol(contextOp, symRef);
             if (portOp) {
                 if (auto pktIdOpt = portOp.getDmapktid())
                     return static_cast<int32_t>(*pktIdOpt);
@@ -78,18 +130,19 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
                         llvm::errs() << "ERROR: processPull - producer is not a FlatSymbolRefAttr\n";
                         continue;
                     }
-                    auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                    auto port = resolvePortFromPathSymbol(op, symbolRef);
                     if (!port) {
-                        llvm::errs() << "ERROR: processPull - failed to find producer port symbol '" 
-                                    << symbolRef.getValue() << "' in symbol table\n";
+                        llvm::errs() << "ERROR: processPull - failed to find producer port symbol '"
+                                     << symbolRef.getValue() << "' in symbol table\n";
                         continue;
                     }
-            sourceChannel = static_cast<int64_t>(port.getDirectionChannel().value());
-            auto tileValue = port.getTile();
+                    sourceChannel = getDmaPortForSym(op, symbolRef.getValue(),
+                                                     static_cast<int64_t>(port.getDirectionChannel().value()));
+                    auto tileValue = port.getTile();
                     auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
                     if (!tileOp) {
-                        llvm::errs() << "ERROR: processPull - failed to get tile from producer port '" 
-                                    << symbolRef.getValue() << "'\n";
+                        llvm::errs() << "ERROR: processPull - failed to get tile from producer port '"
+                                     << symbolRef.getValue() << "'\n";
                         continue;
                     }
                     srcTileType = tileOp.getTiletype().str();
@@ -101,7 +154,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         }
     }
     }
-    
+
     if (sourceTiles.empty()) {
         llvm::errs() << "WARNING: processPull - no source tiles found from producers attribute\n";
     }
@@ -128,7 +181,7 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         srcGroupName,
         builder.getArrayAttr(sourceTiles)
     );
-    
+
     // Get consumers (destinations) from create_path attribute via symbol table lookup
         auto consumersAttr = pathOp.getConsumers();
         if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
@@ -140,13 +193,14 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
                         llvm::errs() << "ERROR: processPull - consumer is not a FlatSymbolRefAttr\n";
                         continue;
                     }
-                            auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                    auto port = resolvePortFromPathSymbol(op, symbolRef);
                     if (!port) {
-                        llvm::errs() << "ERROR: processPull - failed to find consumer port symbol '" 
-                                    << symbolRef.getValue() << "' in symbol table\n";
+                        llvm::errs() << "ERROR: processPull - failed to find consumer port symbol '"
+                                     << symbolRef.getValue() << "' in symbol table\n";
                         continue;
                     }
-                                destChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                    destChannel = getDmaPortForSym(op, symbolRef.getValue(),
+                                                   static_cast<int64_t>(port.getDirectionChannel().value()));
                     auto tileValue = port.getTile();
                     auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
                     if (!tileOp) {
@@ -241,13 +295,14 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
                         llvm::errs() << "ERROR: processPush - producer is not a FlatSymbolRefAttr\n";
                         continue;
                     }
-                            auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                    auto port = resolvePortFromPathSymbol(op, symbolRef);
                     if (!port) {
-                        llvm::errs() << "ERROR: processPush - failed to find producer port symbol '" 
-                                    << symbolRef.getValue() << "' in symbol table\n";
+                        llvm::errs() << "ERROR: processPush - failed to find producer port symbol '"
+                                     << symbolRef.getValue() << "' in symbol table\n";
                         continue;
                     }
-                                srcChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                    srcChannel = getDmaPortForSym(op, symbolRef.getValue(),
+                                                  static_cast<int64_t>(port.getDirectionChannel().value()));
                     auto tileValue = port.getTile();
                     auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
                     if (!tileOp) {
@@ -280,13 +335,14 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
                         llvm::errs() << "ERROR: processPush - consumer is not a FlatSymbolRefAttr\n";
                         continue;
                     }
-                            auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                    auto port = resolvePortFromPathSymbol(op, symbolRef);
                     if (!port) {
-                        llvm::errs() << "ERROR: processPush - failed to find consumer port symbol '" 
-                                    << symbolRef.getValue() << "' in symbol table\n";
+                        llvm::errs() << "ERROR: processPush - failed to find consumer port symbol '"
+                                     << symbolRef.getValue() << "' in symbol table\n";
                         continue;
                     }
-                    dstChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                    dstChannel = getDmaPortForSym(op, symbolRef.getValue(),
+                                                  static_cast<int64_t>(port.getDirectionChannel().value()));
                     auto tileValue = port.getTile();
                     auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
                     if (!tileOp) {
@@ -635,18 +691,19 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                     llvm::errs() << "ERROR: PushOpConversion - producer is not a FlatSymbolRefAttr\n";
                     continue;
                 }
-                auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                auto port = resolvePortFromPathSymbol(op, symbolRef);
                 if (!port) {
-                    llvm::errs() << "ERROR: PushOpConversion - failed to find producer port symbol '" 
-                                << symbolRef.getValue() << "' in symbol table\n";
+                    llvm::errs() << "ERROR: PushOpConversion - failed to find producer port symbol '"
+                                 << symbolRef.getValue() << "' in symbol table\n";
                     continue;
                 }
-                sourceChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                sourceChannel = getDmaPortForSym(op, symbolRef.getValue(),
+                                                 static_cast<int64_t>(port.getDirectionChannel().value()));
                 auto tileValue = port.getTile();
                 auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
                 if (!tileOp) {
-                    llvm::errs() << "ERROR: PushOpConversion - failed to get tile from producer port '" 
-                                << symbolRef.getValue() << "'\n";
+                    llvm::errs() << "ERROR: PushOpConversion - failed to get tile from producer port '"
+                                 << symbolRef.getValue() << "'\n";
                     continue;
                 }
                 srcTileType = tileOp.getTiletype().str();
@@ -656,11 +713,11 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                 }));
             }
         }
-        
+
         if (sourceTiles.empty()) {
             llvm::errs() << "WARNING: PushOpConversion - no source tiles found from producers attribute\n";
         }
-        
+
         // Get consumers (destinations - many tiles for push/scatter) from create_path attribute via symbol table lookup
         auto consumersAttr = pathOp.getConsumers();
         if (auto arrayAttr = dyn_cast<ArrayAttr>(consumersAttr)) {
@@ -670,18 +727,19 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                     llvm::errs() << "ERROR: PushOpConversion - consumer is not a FlatSymbolRefAttr\n";
                     continue;
                 }
-                auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                auto port = resolvePortFromPathSymbol(op, symbolRef);
                 if (!port) {
-                    llvm::errs() << "ERROR: PushOpConversion - failed to find consumer port symbol '" 
-                                << symbolRef.getValue() << "' in symbol table\n";
+                    llvm::errs() << "ERROR: PushOpConversion - failed to find consumer port symbol '"
+                                 << symbolRef.getValue() << "' in symbol table\n";
                     continue;
                 }
-                destChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                destChannel = getDmaPortForSym(op, symbolRef.getValue(),
+                                               static_cast<int64_t>(port.getDirectionChannel().value()));
                 auto tileValue = port.getTile();
                 auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
                 if (!tileOp) {
-                    llvm::errs() << "ERROR: PushOpConversion - failed to get tile from consumer port '" 
-                                << symbolRef.getValue() << "'\n";
+                    llvm::errs() << "ERROR: PushOpConversion - failed to get tile from consumer port '"
+                                 << symbolRef.getValue() << "'\n";
                     continue;
                 }
                 dstTileType = tileOp.getTiletype().str();
@@ -863,13 +921,14 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                             llvm::errs() << "ERROR: PullOpConversion - producer is not a FlatSymbolRefAttr\n";
                             continue;
                         }
-                        auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                        auto port = resolvePortFromPathSymbol(op, symbolRef);
                         if (!port) {
-                            llvm::errs() << "ERROR: PullOpConversion - failed to find producer port symbol '" 
-                                        << symbolRef.getValue() << "' in symbol table\n";
+                            llvm::errs() << "ERROR: PullOpConversion - failed to find producer port symbol '"
+                                         << symbolRef.getValue() << "' in symbol table\n";
                             continue;
                         }
-                        sourceChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                        sourceChannel = getDmaPortForSym(op, symbolRef.getValue(),
+                                                         static_cast<int64_t>(port.getDirectionChannel().value()));
                         auto tileValue = port.getTile();
                         auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
                         if (!tileOp) {
@@ -902,13 +961,14 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                             llvm::errs() << "ERROR: PullOpConversion - consumer is not a FlatSymbolRefAttr\n";
                             continue;
                         }
-                        auto port = SymbolTable::lookupNearestSymbolFrom<dmaphop::port>(op, symbolRef);
+                        auto port = resolvePortFromPathSymbol(op, symbolRef);
                         if (!port) {
-                            llvm::errs() << "ERROR: PullOpConversion - failed to find consumer port symbol '" 
-                                        << symbolRef.getValue() << "' in symbol table\n";
+                            llvm::errs() << "ERROR: PullOpConversion - failed to find consumer port symbol '"
+                                         << symbolRef.getValue() << "' in symbol table\n";
                             continue;
                         }
-                        destChannel = static_cast<int64_t>(port.getDirectionChannel().value());
+                        destChannel = getDmaPortForSym(op, symbolRef.getValue(),
+                                                       static_cast<int64_t>(port.getDirectionChannel().value()));
                         auto tileValue = port.getTile();
                         auto tileOp = dyn_cast_or_null<dmaphop::tile>(tileValue.getDefiningOp());
                         if (!tileOp) {
@@ -1028,14 +1088,11 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
     //target.addIllegalOp<routing::partitiontensor>();
     
     RewritePatternSet patterns(context);
-    patterns.add<EraseOpLowering<dmaphop::tile>,
-                 EraseOpLowering<dmaphop::port>,
-                 EraseOpLowering<dmaphop::create_hop>,
-                 EraseOpLowering<dmaphop::create_path>,
-                 EraseOpLowering<dmaphop::alloc_buffer>,
-                 EraseOpLowering<dmaphop::sync>,
-                 EraseOpLowering<dmaphop::dealloc_buffer>>(context);
-    
+    patterns.add<EraseOpLowering<dmaphop::tile>, EraseOpLowering<dmaphop::port>, EraseOpLowering<dmaphop::create_hop>,
+                 EraseOpLowering<dmaphop::create_path>, EraseOpLowering<dmaphop::alloc_buffer>,
+                 EraseOpLowering<dmaphop::sync>, EraseOpLowering<dmaphop::dealloc_buffer>,
+                 EraseOpLowering<dmaphop::consumer>, EraseOpLowering<dmaphop::producer>>(context);
+
     patterns.add<CreateScheduleTensorConversion>(context);
     //patterns.add<PartitionTensorConversion>(context);
     patterns.add<ExtractDataConversion>(context);
