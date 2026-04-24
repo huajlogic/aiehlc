@@ -552,8 +552,8 @@ Examples:
         #   - Finish early when "device_teardown done" is seen (program completed)
         #   - Abort early if no output arrives within NO_OUTPUT_TIMEOUT seconds
         #   - Hard cap at MAX_WAIT seconds as safety bound
-        MAX_WAIT = 120        # absolute maximum wait (seconds)
-        NO_OUTPUT_TIMEOUT = 30  # abort if no output for this long
+        MAX_WAIT = 600        # absolute maximum wait (seconds)
+        NO_OUTPUT_TIMEOUT = 300  # abort if no output for this long (debug snapshot reads many regs)
         POLL_INTERVAL = 1     # check queue every N seconds
 
         print(f"\n>>> Waiting for console output (max {MAX_WAIT}s, no-output timeout {NO_OUTPUT_TIMEOUT}s)...")

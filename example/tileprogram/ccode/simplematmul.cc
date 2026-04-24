@@ -53,7 +53,7 @@
 #define COLS_PER_ROUND (TILE_COLS / 2)          // 2: B cols per DMA input round
 #define K_DIM K                                 // 16: inner product dimension
 #define BUF_SZ_OUT (ROWS_PER_ROUND * TILE_COLS) // 8: output bytes per DMA round (2 rows * 4 cols)
-#define DEBUG_OUTPUT_ORDER 1
+#define DEBUG_OUTPUT_ORDER 0
 static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C);
 static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *C);
 // ═══════════════════════════════════════════════════════════════════════════
@@ -240,8 +240,7 @@ int main() {
     aieDeviceSynchronize();
 
     // --- Verify output ---
-    // int result = verify_matmul(A, B, C);
-    int result = verify_mat_transpose(A, B, C);
+    int result = verify_matmul(A, B, C);
 
     // --- Cleanup ---
     free(A);
@@ -328,6 +327,24 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
         }
         printf("]\n");
     }
+
+    // Print C_ref [16x16]
+    printf("\nC_ref [%dx%d]:\n", M, N);
+    for (int i = 0; i < M; i++) {
+        printf("  [");
+        for (int j = 0; j < N; j++) {
+            printf("%4d", C_ref[i * N + j]);
+            if (j < N - 1)
+                printf(",");
+        }
+        printf("]\n");
+    }
+
+    int total_elements = M * N;
+    if (mismatches == 0)
+        printf("PASS: all %d elements match.\n", total_elements);
+    else
+        printf("FAIL: %d mismatches out of %d.\n", mismatches, total_elements);
 
     /*
     // HW_ROWS x HW_COLS mesh, NUM_GROUPS row-groups of TILES_PER_GROUP tiles

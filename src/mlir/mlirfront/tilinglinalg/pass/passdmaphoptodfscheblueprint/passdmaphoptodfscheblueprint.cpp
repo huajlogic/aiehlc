@@ -1054,55 +1054,57 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         );
 
         // Compute multi-dimensional DMA addressing for shim S2MM (output assembly).
-        // When the shim receives tiled output from multiple cores, the data arrives
-        // tile-by-tile but must be written into a 2D contiguous DDR buffer.
-        // The 4D addressing pattern reassembles tiles into the correct 2D layout:
+        // Each shim S2MM channel receives a row-strip from multiple cores.
+        // The data arrives tile-by-tile but must be written into the correct 2D DDR layout.
+        // The 3D addressing pattern reassembles tiles within one row-strip:
         //   D0: contiguous elements within a tile row (wrap=tileW, stride=1)
-        //   D1: next row within same tile        (wrap=tileH, stride=outW)
-        //   D2: next tile column                  (wrap=numTileCols, stride=tileW)
-        //   D3/Iter: next tile row                (wrap=numTileRows, stride=tileH*outW)
+        //   D1: next row within same tile             (wrap=stripH, stride=outW)
+        //   D2: next tile column                      (wrap=numTileCols, stride=tileW)
         ArrayAttr shimDimStrides = nullptr;
         ArrayAttr shimDimWraps = nullptr;
 
         if (dstTileType == "shim") {
-            // viewSplit is the per-partition slice (e.g. tensor<8x16xi8>)
+            // viewSplit is the per-channel aggregate (e.g. tensor<4x16xi8> for one row-strip)
             auto viewType = dyn_cast<RankedTensorType>(viewSplit.getType());
             // rootAdaptedView is the full output tensor (e.g. tensor<16x16xi8>)
             auto rootType = dyn_cast<RankedTensorType>(rootAdaptedView.getType());
 
             if (viewType && rootType && viewType.getRank() == 2 && rootType.getRank() == 2) {
-                int64_t outH = rootType.getDimSize(0);  // full output height
-                int64_t outW = rootType.getDimSize(1);  // full output width
-                int64_t tileH = viewType.getDimSize(0); // per-partition height
-                int64_t tileW = viewType.getDimSize(1); // per-partition width
+                int64_t outW = rootType.getDimSize(1);   // full output width
+                int64_t stripH = viewType.getDimSize(0); // strip height = tile height
 
-                // Number of tile columns and rows in the full output
-                int64_t numTileCols = outW / tileW;
-                int64_t numTileRows = outH / tileH;
+                // Number of source tiles = number of cores sending to this channel
+                int64_t numTileCols = static_cast<int64_t>(sourceTiles.size());
 
-                // Only apply multi-dim if there's actual tiling (more than 1 tile)
-                if (numTileCols > 1 || numTileRows > 1) {
-                    SmallVector<int32_t> strides = {
-                        1,                                 // D0: contiguous
-                        static_cast<int32_t>(outW),        // D1: next row in output
-                        static_cast<int32_t>(tileW),       // D2: next tile column
-                        static_cast<int32_t>(tileH * outW) // D3/Iter: next tile row
-                    };
-                    SmallVector<int32_t> wraps = {
-                        static_cast<int32_t>(tileW),       // D0: tile width
-                        static_cast<int32_t>(tileH),       // D1: tile height
-                        static_cast<int32_t>(numTileCols), // D2: number of tile columns
-                        static_cast<int32_t>(numTileRows)  // D3/Iter: number of tile rows
-                    };
+                // Per-core tile width = strip width / number of source tiles
+                int64_t tileW = outW / numTileCols; // e.g. 16/4 = 4
+
+                if (numTileCols > 1) {
+                    // Shim DMA StepSize operates at 32-bit word granularity
+                    // (see XAie_DmaSetMultiDimAddr doc: "stepsize and wrap
+                    //  parameters operate at 32 bit granularity").
+                    // Convert element-based dimensions to 32-bit word units.
+                    unsigned bitWidth = rootType.getElementTypeBitWidth();
+                    int64_t elemsPerWord = 32 / bitWidth; // e.g. 4 for i8, 2 for i16, 1 for i32
+
+                    int64_t tileW_w = tileW / elemsPerWord; // tile width in words
+                    int64_t outW_w = outW / elemsPerWord;   // full output width in words
+
+                    // Per-channel row-strip in 32-bit word units:
+                    // D0: tileW_w contiguous words (stride=1 word)
+                    // D1: stripH rows, stride = outW_w words (jump to next row in DDR)
+                    // D2: numTileCols tiles horizontally, stride = tileW_w words
+                    SmallVector<int32_t> strides = {1, static_cast<int32_t>(outW_w), static_cast<int32_t>(tileW_w)};
+                    SmallVector<int32_t> wraps = {static_cast<int32_t>(tileW_w), static_cast<int32_t>(stripH),
+                                                  static_cast<int32_t>(numTileCols)};
                     shimDimStrides = rewriter.getI32ArrayAttr(strides);
                     shimDimWraps = rewriter.getI32ArrayAttr(wraps);
 
-                    llvm::errs() << "[ShimMultiDim] Pull output assembly: "
-                                 << "outH=" << outH << " outW=" << outW << " tileH=" << tileH << " tileW=" << tileW
-                                 << " numTileCols=" << numTileCols << " numTileRows=" << numTileRows << " strides=["
-                                 << strides[0] << "," << strides[1] << "," << strides[2] << "," << strides[3] << "]"
-                                 << " wraps=[" << wraps[0] << "," << wraps[1] << "," << wraps[2] << "," << wraps[3]
-                                 << "]\n";
+                    llvm::errs() << "[ShimMultiDim] Pull per-channel row-strip: "
+                                 << "outW=" << outW << " stripH=" << stripH << " tileW=" << tileW
+                                 << " numTileCols=" << numTileCols << " elemsPerWord=" << elemsPerWord << " strides=["
+                                 << strides[0] << "," << strides[1] << "," << strides[2] << "]"
+                                 << " wraps=[" << wraps[0] << "," << wraps[1] << "," << wraps[2] << "]\n";
                 }
             }
         }

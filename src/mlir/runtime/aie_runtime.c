@@ -5,6 +5,7 @@
 
 #include "aie_runtime.h"
 #include "aie_device_map.h"
+#include "aie_runtime_debug.h"
 #include "aie_runtime_stream_debug.h"
 #include "sleep.h"
 #include "xaiengine/xaie_helper.h"
@@ -442,20 +443,29 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
     uint8_t tile_type = XAie_GetTileTypefromLoc(dev, tile);
     uint64_t dma_addr = (uint64_t)(uintptr_t)buffer;
 
-    /* Build dimension descriptors from stride/wrap pairs */
-    XAie_DmaDimDesc dimDescs[4];
+    /* Build dimension descriptors — split address dims vs iteration */
     int32_t strides[4] = {dim_stride0, dim_stride1, dim_stride2, dim_stride3};
     int32_t wraps[4] = {dim_wrap0, dim_wrap1, dim_wrap2, dim_wrap3};
     if (num_dims > 4)
         num_dims = 4;
-    for (int i = 0; i < num_dims; i++) {
+
+    /* Address dimensions: first min(num_dims, 3) */
+    int addrDims = (num_dims <= 3) ? num_dims : 3;
+    XAie_DmaDimDesc dimDescs[3];
+    for (int i = 0; i < addrDims; i++) {
         dimDescs[i].AieMlDimDesc.StepSize = (uint32_t)strides[i];
         dimDescs[i].AieMlDimDesc.Wrap = (uint16_t)wraps[i];
     }
     XAie_DmaTensor tensor;
-    tensor.NumDim = (uint8_t)num_dims;
+    tensor.NumDim = (uint8_t)addrDims;
     tensor.Dim = dimDescs;
     XAie_DmaSetMultiDimAddr(&DmaInst, &tensor, dma_addr, (uint32_t)len);
+
+    /* Iteration dimension: 4th dim if present */
+    if (num_dims == 4) {
+        XAie_DmaSetBdIteration(&DmaInst, strides[3], wraps[3], 0);
+        printf("[aie_runtime] bd_config_multidim: iteration stride=%d wrap=%d\n", strides[3], wraps[3]);
+    }
 
     if (acquire_lock_id >= 0 && release_lock_id >= 0) {
         XAie_DmaSetLock(&DmaInst, XAie_LockInit(acquire_lock_id, acquire_lock_val),
@@ -846,8 +856,31 @@ static void __Runtime_auto_teardown(void) {
     if (g_DevInst != NULL) {
         /* Kernel logs are already read in __Runtime_wait_event() right after
          * cores finish, so we don't duplicate the read here. */
-        if (g_runtime_debug_level >= 1)
+        if (g_runtime_debug_level >= 1) {
             AieRtSS_PrintRange(g_DevInst, 0, 3, 0, 5, /*print_all=*/0);
+            /* Dump raw BD registers for shim tiles used by BD tracking.
+             * Scans all 16 BDs with stride/wrap/iteration fields. */
+            {
+                uint8_t shim_cols[BD_TRACK_MAX];
+                int shim_col_count = 0;
+                for (int i = 0; i < g_bd_track_count; i++) {
+                    if (!__bd_is_shim(g_bd_track[i].tile_type))
+                        continue;
+                    /* Deduplicate: check if col already in list */
+                    int dup = 0;
+                    for (int j = 0; j < shim_col_count; j++) {
+                        if (shim_cols[j] == g_bd_track[i].col) {
+                            dup = 1;
+                            break;
+                        }
+                    }
+                    if (!dup)
+                        shim_cols[shim_col_count++] = g_bd_track[i].col;
+                }
+                for (int i = 0; i < shim_col_count; i++)
+                    AieRt_PrintShimBdRawAll(g_DevInst, shim_cols[i]);
+            }
+        }
     }
     __Runtime_free_all_allocs();
     if (g_DevInst != NULL) {
