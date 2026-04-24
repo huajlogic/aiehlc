@@ -336,6 +336,40 @@ def dmaphop_pull : dmaphopop<"pull"> {
   let assemblyFormat = "$data `from` $path `producer` `(` $producer_buffers `at` $producer_ports `)` `:` type($data) type($path) type($producer_buffers) type($producer_ports) attr-dict";
 }
 
+// --- 6b. Consumer Operation (DMA S2MM port mapping for receive) ---
+def dmaphop_consumer : dmaphopop<"consumer", [Symbol]> {
+  let summary = "Declares DMA port mapping for a consumer (receive) port";
+  let description = [{
+    Maps a stream port (In direction) to a specific DMA S2MM channel.
+    DMA direction is inferred: In port = S2MM (receive from stream to local memory).
+    Has its own symbol name (e.g. @consumer0) and references the port via 'from' attr.
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    FlatSymbolRefAttr:$from,
+    I64Attr:$dma_port
+  );
+  let results = (outs dmaphopporttype:$result);
+  let assemblyFormat = "$sym_name attr-dict";
+}
+
+// --- 6c. Producer Operation (DMA MM2S port mapping for send) ---
+def dmaphop_producer : dmaphopop<"producer", [Symbol]> {
+  let summary = "Declares DMA port mapping for a producer (send) port";
+  let description = [{
+    Maps a stream port (Out direction) to a specific DMA MM2S channel.
+    DMA direction is inferred: Out port = MM2S (send from local memory to stream).
+    Has its own symbol name (e.g. @producer0) and references the port via 'tp' attr.
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    FlatSymbolRefAttr:$tp,
+    I64Attr:$dma_port
+  );
+  let results = (outs dmaphopporttype:$result);
+  let assemblyFormat = "$sym_name attr-dict";
+}
+
 // --- 7. Sync Operation ---
 def dmaphop_sync : dmaphopop<"sync"> {
   let summary = "Synchronizes completion of transfers on a path";

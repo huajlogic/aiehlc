@@ -144,24 +144,54 @@ static arith::ConstantOp findInitConstantForAlloc(Value allocVal) {
 /// - external arith.constant → cloned constant inside host
 static void preMapExternalValues(Operation *rcOp, OpBuilder &builder, Location loc, IRMapping &mapper,
                                  SmallVector<Value> &hostAllocs, Block *hostBody = nullptr) {
+    // Phase 1: Collect all unique external block arguments and add them to the
+    // host block sorted by their original argument number. This prevents the
+    // walk-encounter order (which depends on IR layout, e.g. std::map key
+    // ordering of "col" vs "row") from scrambling A/B/C argument positions.
+    if (hostBody) {
+        SmallVector<std::pair<unsigned, Value>> blockArgs; // (argNumber, value)
+        rcOp->walk([&](Operation *innerOp) {
+            for (Value operand : innerOp->getOperands()) {
+                if (mapper.contains(operand))
+                    continue;
+                Operation *defOp = operand.getDefiningOp();
+                if (!defOp) {
+                    if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
+                        if (isa<MemRefType>(operand.getType())) {
+                            bool found = false;
+                            for (auto &pair : blockArgs) {
+                                if (pair.second == operand) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found)
+                                blockArgs.push_back({blockArg.getArgNumber(), operand});
+                        }
+                    }
+                }
+            }
+        });
+        // Sort by original argument number to preserve declaration order.
+        llvm::sort(blockArgs, [](auto &a, auto &b) { return a.first < b.first; });
+        // Add to host block in correct order.
+        for (auto &[argNum, operand] : blockArgs) {
+            auto memrefType = cast<MemRefType>(operand.getType());
+            auto plainType = MemRefType::get(memrefType.getShape(), memrefType.getElementType());
+            Value hostArg = hostBody->addArgument(plainType, loc);
+            mapper.map(operand, hostArg);
+        }
+    }
+
+    // Phase 2: Handle non-block-arg external values (memref allocs, constants).
+    // Block arguments are already mapped above, so they are skipped here.
     rcOp->walk([&](Operation *innerOp) {
         for (Value operand : innerOp->getOperands()) {
             if (mapper.contains(operand))
                 continue;
             Operation *defOp = operand.getDefiningOp();
-            // Handle func block arguments (e.g. external DDR pointer memrefs).
-            // These have no defining op. Add them as arguments to the host block
-            // and map them so the cloned ops use the host-local arg.
-            if (!defOp) {
-                if (auto memrefType = dyn_cast<MemRefType>(operand.getType())) {
-                    if (hostBody) {
-                        auto plainType = MemRefType::get(memrefType.getShape(), memrefType.getElementType());
-                        Value hostArg = hostBody->addArgument(plainType, loc);
-                        mapper.map(operand, hostArg);
-                    }
-                }
-                continue;
-            }
+            if (!defOp)
+                continue; // block args already handled in Phase 1
             if (rcOp->isAncestor(defOp))
                 continue;
             if (dyn_cast<MemRefType>(operand.getType())) {
@@ -285,6 +315,48 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
     SmallVector<Value> allWaitEvents;
     SmallVector<Value> hostAllocs;
 
+    // ── Pre-map ALL external block arguments BEFORE processing any
+    //    RoutingCreate.  Collecting across ALL RoutingCreate ops and sorting
+    //    globally by argNumber ensures host block arguments match the original
+    //    @main signature order (arg0=A, arg1=B, arg2=C) regardless of which
+    //    RoutingCreate happens to reference which argument first.
+    {
+        SmallVector<std::pair<unsigned, Value>> blockArgs;
+        mainFunc.walk([&](Operation *rcOp) {
+            if (rcOp->getName().getStringRef() != "routing.RoutingCreate")
+                return;
+            if (rcOp->getNumRegions() == 0 || rcOp->getRegion(0).empty())
+                return;
+            rcOp->walk([&](Operation *innerOp) {
+                for (Value operand : innerOp->getOperands()) {
+                    Operation *defOp = operand.getDefiningOp();
+                    if (!defOp) {
+                        if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
+                            if (isa<MemRefType>(operand.getType())) {
+                                bool found = false;
+                                for (auto &pair : blockArgs) {
+                                    if (pair.second == operand) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found)
+                                    blockArgs.push_back({blockArg.getArgNumber(), operand});
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        llvm::sort(blockArgs, [](auto &a, auto &b) { return a.first < b.first; });
+        for (auto &[argNum, operand] : blockArgs) {
+            auto memrefType = cast<MemRefType>(operand.getType());
+            auto plainType = MemRefType::get(memrefType.getShape(), memrefType.getElementType());
+            Value hostArg = hostBody->addArgument(plainType, loc);
+            mapper.map(operand, hostArg);
+        }
+    }
+
     // Walk routing.RoutingCreate ops in mainFunc (in program order).
     mainFunc.walk([&](Operation *rcOp) {
         if (rcOp->getName().getStringRef() != "routing.RoutingCreate")
@@ -296,7 +368,9 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
         builder.setInsertionPointToEnd(hostBody);
 
         // ── Pre-map external values to host-local ops ──────────────────────
-        preMapExternalValues(rcOp, builder, loc, mapper, hostAllocs, hostBody);
+        // Block arguments are already mapped globally above; this only handles
+        // non-block-arg external values (memref allocs, constants).
+        preMapExternalValues(rcOp, builder, loc, mapper, hostAllocs, nullptr);
 
         // ── Clone the entire RoutingCreate (with its body) into host ────────
         // builder.clone performs a full deep clone, remapping operands via mapper.

@@ -3,7 +3,9 @@
 * SPDX-License-Identifier: MIT
 ******************************************************************************/
 #include "routingmanager.h"
+#include "tilinglinalg_pipeline.h"
 #include <iostream>
+#include <map>
 
 #define GET_TYPEDEF_CLASSES
 #define GET_ATTRDEF_CLASSES
@@ -630,13 +632,164 @@ void routingmanager::createroutingfuncByDim(OpBuilder& builder, MLIRContext* ctx
        
         return ;//func;
 }
-/*
-int main() {
-    MLIRContext ctx;
-    mlirtest mtest;
-    mtest.type_interface_test(&ctx);
-    mtest.ops_test(&ctx);
-    std::cout << "main" <<std::endl;
-    return 0;
+// ---------------------------------------------------------------------------
+// SplitModel::fromSpatialTag
+// ---------------------------------------------------------------------------
+
+TensorSplitDesc SplitModel::fromSpatialTag(const std::string &tag, bool isInput) {
+    // splitDim always defaults to 0 (row-based tensor split).
+    // The spatial tag controls hwAxisOwner and replicateOn (mesh partitioning),
+    // NOT which tensor dimension to split.
+    if (tag == "row_broadcast_in")
+        return {0, "row", "col"};
+    if (tag == "col_broadcast_in")
+        return {0, "col", "row"};
+    if (tag == "tiled_in")
+        return {0, "row", ""};
+    if (tag == "row_major_out")
+        return {0, "row", "col"};
+    if (tag == "col_major_out")
+        return {0, "col", "row"};
+    if (tag == "row_reduce_out")
+        return {0, "row", ""};
+    // default: backward compat
+    return isInput ? TensorSplitDesc{0, "row", "col"} : TensorSplitDesc{0, "row", "col"};
 }
-    */
+
+// ---------------------------------------------------------------------------
+// createroutingfuncBySplitModel — generalized routing driven by SplitModel
+// Creates separate scf.execute_region per mesh axis. Tensors sharing
+// the same hwAxisOwner (or assigned to an axis via replicateOn when
+// hwAxisOwner is empty) are grouped into one execute_region.
+// ---------------------------------------------------------------------------
+
+void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRContext *ctx, Value mesh,
+                                                   const std::vector<Value> &tensors,
+                                                   const std::vector<bool> &isInputFlags, int meshRows, int meshCols,
+                                                   const SplitModel &splitModel) {
+
+    auto location = builder.getUnknownLoc();
+
+    // ── Step 1: Group tensors by effective axis ──
+    // axis -> [(tensorIndex, isInput)]
+    // Tensors with empty hwAxisOwner but non-empty replicateOn are
+    // broadcast-only; assign them to the replicateOn axis group.
+    struct TensorEntry {
+        unsigned index;
+        bool isInput;
+    };
+    std::map<std::string, std::vector<TensorEntry>> axisGroups;
+
+    for (unsigned i = 0; i < tensors.size(); ++i) {
+        const auto &split = splitModel.tensorSplits[i];
+        std::string effectiveAxis;
+        if (!split.hwAxisOwner.empty()) {
+            effectiveAxis = split.hwAxisOwner;
+        } else if (!split.replicateOn.empty()) {
+            // Broadcast-only tensor: assign to the replicateOn axis group
+            effectiveAxis = split.replicateOn;
+        } else {
+            // Fallback: default to "row"
+            effectiveAxis = "row";
+        }
+        axisGroups[effectiveAxis].push_back({i, isInputFlags[i]});
+    }
+
+    // ── Step 2: For each axis group, create a separate execute_region ──
+    for (auto &[axis, entries] : axisGroups) {
+        uint32_t axisSplitNum = (axis == "row") ? meshRows : meshCols;
+
+        auto exec = builder.create<scf::ExecuteRegionOp>(location, TypeRange{});
+        exec->setAttr("routing_memo", builder.getStringAttr(axis));
+        {
+            OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPointToStart(&exec.getRegion().emplaceBlock());
+
+            // partitionmesh for this axis
+            auto partmesh = builder.create<partitionmesh>(location, mesh, axisSplitNum, axis);
+
+            // Pre-compute partitiontensor and split types for tensors in this group
+            struct TensorInfo {
+                Value partTensor;
+                RankedTensorType splitTensorType;
+                uint32_t splitnum;
+                bool isInput;
+            };
+            std::vector<TensorInfo> tensorInfos;
+
+            for (auto &entry : entries) {
+                const auto &split = splitModel.tensorSplits[entry.index];
+                auto tensorType = tensors[entry.index].getType().cast<RankedTensorType>();
+
+                // Determine splitnum within this axis group
+                uint32_t splitnum;
+                if (!split.hwAxisOwner.empty()) {
+                    // This tensor is owned by this axis — split by axisSplitNum
+                    splitnum = axisSplitNum;
+                } else {
+                    // Broadcast-only tensor (empty hwAxisOwner): splitnum=1
+                    // Full tensor is replicated to each group
+                    splitnum = 1;
+                }
+
+                auto partTensor =
+                    builder.create<partitiontensor>(location, tensorType, tensors[entry.index], splitnum,
+                                                    split.splitDim, split.hwAxisOwner, split.replicateOn, "");
+
+                // Calculate split tensor shape
+                SmallVector<int64_t> splitShape(tensorType.getShape());
+                if (splitnum > 1) {
+                    if (split.splitDim == 0) {
+                        if (splitShape[0] != ShapedType::kDynamic)
+                            splitShape[0] /= splitnum;
+                    } else {
+                        if (splitShape[1] != ShapedType::kDynamic)
+                            splitShape[1] /= splitnum;
+                    }
+                }
+                auto splitTensorType =
+                    (splitnum > 1) ? RankedTensorType::get(splitShape, tensorType.getElementType()) : tensorType;
+
+                tensorInfos.push_back({partTensor, splitTensorType, splitnum, entry.isInput});
+            }
+
+            // scf.for loop over axisSplitNum
+            Value lb = builder.create<arith::ConstantIndexOp>(location, 0);
+            Value ub = builder.create<arith::ConstantIndexOp>(location, axisSplitNum);
+            Value step = builder.create<arith::ConstantIndexOp>(location, 1);
+
+            auto scf = builder.create<mlir::scf::ForOp>(location, lb, ub, step);
+            {
+                OpBuilder::InsertionGuard guard(builder);
+                builder.setInsertionPointToStart(scf.getBody());
+                auto memo = builder.getStringAttr(axis);
+                mlir::Value scf_idx = scf.getInductionVar();
+                Value idx = builder.create<arith::IndexCastOp>(location, builder.getI32Type(), scf_idx);
+
+                auto routingcreateOp = builder.create<routing::RoutingCreate>(
+                    location, idx, memo, [&](OpBuilder &b, Location bodyLoc, Value sidx) {
+                        auto tilelist = b.create<extract_tiles>(location, partmesh, sidx);
+
+                        for (auto &info : tensorInfos) {
+                            auto sliceTensor =
+                                b.create<extract_data>(location, info.splitTensorType, info.partTensor, sidx);
+
+                            if (info.isInput) {
+                                auto hwio = b.create<createhwiowithtarget>(location, tilelist, "input", "mem2");
+                                b.create<movedatabyio>(location, sliceTensor, hwio);
+                            } else {
+                                auto gatherData =
+                                    b.create<routinggatherout>(location, sliceTensor.getType(), tilelist, sliceTensor);
+                                auto hwio = b.create<createhwiowithtarget>(location, tilelist, "output", "mem2");
+                                b.create<movedatabyio>(location, gatherData, hwio);
+                            }
+                        }
+
+                        b.create<routing::YieldOp>(location);
+                    });
+            }
+
+            builder.create<scf::YieldOp>(location);
+        }
+    }
+}

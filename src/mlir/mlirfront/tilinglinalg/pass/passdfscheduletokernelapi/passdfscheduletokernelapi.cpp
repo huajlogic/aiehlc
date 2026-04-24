@@ -30,6 +30,8 @@ struct WindowInfo {
     std::string pongBuffer;
     std::string acquireLock;
     std::string releaseLock;
+    int32_t bufferSize = 0; // Per-window buffer size from window_def attribute
+    std::string direction;  // "in" or "out"
 };
 
 /// dfschedule.module -> convert entire body line-by-line then erase module.
@@ -57,6 +59,10 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     info.acquireLock = a.getRootReference().getValue().str();
                 if (auto a = winAttrs.getAs<SymbolRefAttr>("release_lock"))
                     info.releaseLock = a.getRootReference().getValue().str();
+                if (auto a = winAttrs.getAs<IntegerAttr>("buffer_size"))
+                    info.bufferSize = a.getInt();
+                if (auto a = winAttrs.getAs<StringAttr>("direction"))
+                    info.direction = a.getValue().str();
                 windowInfoMap[windowDefOp.getSymName().str()] = info;
             }
         }
@@ -95,7 +101,35 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 rewriter.create<emitc::VerbatimOp>(loc, "#include <aie_api/aie_adf.hpp>");
                 rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_READ  1");
                 rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_WRITE 0");
-                rewriter.create<emitc::VerbatimOp>(loc, "#define BUF_SZ " + std::to_string(bufferSize));
+                // Emit per-window BUF_SZ defines (e.g. BUF_SZ_IN_0, BUF_SZ_OUT_0)
+                // Collect window_def buffer_size attributes first
+                {
+                    int inIdx = 0, outIdx = 0;
+                    int32_t maxBufSz = bufferSize;
+                    for (Operation &winInner : body) {
+                        if (auto wOp = dyn_cast<WindowDefOp>(&winInner)) {
+                            DictionaryAttr wAttrs = wOp.getWindowAttrs();
+                            int32_t wBufSz = bufferSize;
+                            std::string wDir = "in";
+                            if (auto a = wAttrs.getAs<IntegerAttr>("buffer_size"))
+                                wBufSz = a.getInt();
+                            if (auto a = wAttrs.getAs<StringAttr>("direction"))
+                                wDir = a.getValue().str();
+                            std::string macroName;
+                            if (wDir == "out") {
+                                macroName = "BUF_SZ_OUT_" + std::to_string(outIdx++);
+                            } else {
+                                macroName = "BUF_SZ_IN_" + std::to_string(inIdx++);
+                            }
+                            rewriter.create<emitc::VerbatimOp>(loc,
+                                                               "#define " + macroName + " " + std::to_string(wBufSz));
+                            if (wBufSz > maxBufSz)
+                                maxBufSz = wBufSz;
+                        }
+                    }
+                    // Backward-compat: BUF_SZ = max of all per-window sizes
+                    rewriter.create<emitc::VerbatimOp>(loc, "#define BUF_SZ " + std::to_string(maxBufSz));
+                }
                 // ADF kernel header: window types and helpers (required for xchesscc)
                 /*
                 rewriter.create<emitc::VerbatimOp>(loc,
@@ -162,7 +196,11 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
             if (auto bufferOp = dyn_cast<BufferDefOp>(&inner)) {
                 Type t = bufferOp.getBufferTypeAttr().getValue();
                 std::string vecType = "v4int32";
+                int64_t bufSize = bufferSize; // fallback to global
                 if (auto memref = dyn_cast<MemRefType>(t)) {
+                    // Use the memref dimension as the per-buffer size
+                    if (!memref.getShape().empty())
+                        bufSize = memref.getShape()[0];
                     Type elem = memref.getElementType();
                     if (auto vec = dyn_cast<VectorType>(elem)) {
                         int w = vec.getShape().empty() ? 4 : vec.getShape()[0];
@@ -176,7 +214,7 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                             vecType = "v" + std::to_string(w) + "float";
                     }
                 }
-                std::string line = vecType + " " + bufferOp.getSymName().str() + "[BUF_SZ];";
+                std::string line = vecType + " " + bufferOp.getSymName().str() + "[" + std::to_string(bufSize) + "];";
                 rewriter.create<emitc::VerbatimOp>(loc, line);
                 continue;
             }
@@ -253,9 +291,13 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     acqLock = "LOCK_" + winSym + "_ACQ";
                     relLock = "LOCK_" + winSym + "_REL";
                 }
+                // Use per-window buffer size from window_def attribute
+                std::string winBufSzStr = "BUF_SZ"; // fallback
+                if (it != windowInfoMap.end() && it->second.bufferSize > 0)
+                    winBufSzStr = std::to_string(it->second.bufferSize);
                 rewriter.create<emitc::VerbatimOp>(loc, "window_init(window_" + winSym + ", 1, " + pingBuf + ", " +
-                                                            acqLock + ", " + pongBuf + ", " + relLock +
-                                                            ", BUF_SZ, BUF_SZ);");
+                                                            acqLock + ", " + pongBuf + ", " + relLock + ", " +
+                                                            winBufSzStr + ", " + winBufSzStr + ");");
                 continue;
             }
             if (auto invokeOp = dyn_cast<KernelInvokeOp>(&inner)) {

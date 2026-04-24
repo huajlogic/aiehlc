@@ -177,12 +177,20 @@ void dfscheblueprint::FlowConfigOp::print(OpAsmPrinter &printer) {
         printer.printNewline();
         printer << ",data_id = " << static_cast<int32_t>(*getDataId()) << " : i32";
     }
+    if (getShimDimStrides()) {
+        printer.printNewline();
+        printer << ",shim_dim_strides = " << getShimDimStrides();
+    }
+    if (getShimDimWraps()) {
+        printer.printNewline();
+        printer << ",shim_dim_wraps = " << getShimDimWraps();
+    }
     printer.decreaseIndent();
     printer.printNewline();
     printer << "}";
-    printer.printOptionalAttrDict(
-        getOperation()->getAttrs(),
-        /*elidedAttrs=*/{"sym_name", "target", "view", "distribution", "dma", "slice_symbols", "type", "data_id"});
+    printer.printOptionalAttrDict(getOperation()->getAttrs(),
+                                  /*elidedAttrs=*/{"sym_name", "target", "view", "distribution", "dma", "slice_symbols",
+                                                   "type", "data_id", "shim_dim_strides", "shim_dim_wraps"});
 }
 
 // FlowConfigOp parser
@@ -231,6 +239,14 @@ ParseResult dfscheblueprint::FlowConfigOp::parse(OpAsmParser &parser, OperationS
                         dataIdAttr.getInt());
                     result.attributes.set("data_id", i32Attr);
                 }
+            } else if (attrName == "shim_dim_strides") {
+                ArrayAttr shimDimStrides;
+                if (parser.parseAttribute(shimDimStrides, "shim_dim_strides", result.attributes))
+                    return failure();
+            } else if (attrName == "shim_dim_wraps") {
+                ArrayAttr shimDimWraps;
+                if (parser.parseAttribute(shimDimWraps, "shim_dim_wraps", result.attributes))
+                    return failure();
             } else {
                 return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
             }
@@ -340,6 +356,24 @@ ParseResult dfscheblueprint::FlowTransferOp::parse(OpAsmParser &parser, Operatio
     parser.parseOptionalAttrDict(result.attributes);
 
     return success();
+}
+
+//===----------------------------------------------------------------------===//
+// FlowConfigOp Verifier
+//===----------------------------------------------------------------------===//
+
+::mlir::LogicalResult dfscheblueprint::FlowConfigOp::verify() {
+    auto strides = getShimDimStrides();
+    if (strides) {
+        for (auto [i, attr] : llvm::enumerate(*strides)) {
+            int32_t val = mlir::cast<IntegerAttr>(attr).getInt();
+            if (val % 4 != 0)
+                return emitOpError("shim_dim_strides[") << i << "] = " << val
+                                                        << " is not divisible by 4 "
+                                                           "(strides must be 32-bit word aligned in bytes)";
+        }
+    }
+    return ::mlir::success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -546,7 +580,9 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
                                                   builder.getStringAttr("root"), shimTxDMA,
                                                   nullptr,                       // slice_symbols
                                                   builder.getStringAttr("shim"), // type
-                                                  nullptr                        // data_id
+                                                  nullptr,                       // data_id
+                                                  nullptr,                       // shim_dim_strides
+                                                  nullptr                        // shim_dim_wraps
     );
 
     // Bind Cores Input (S2MM - Receive)
@@ -557,7 +593,9 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
                                                   builder.getStringAttr("linear"), coresInDMA,
                                                   nullptr,                       // slice_symbols
                                                   builder.getStringAttr("core"), // type
-                                                  nullptr                        // data_id
+                                                  nullptr,                       // data_id
+                                                  nullptr,                       // shim_dim_strides
+                                                  nullptr                        // shim_dim_wraps
     );
 
     // Bind Cores Output (MM2S - Send)
@@ -568,7 +606,9 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
                                                   builder.getStringAttr("linear"), coresOutDMA,
                                                   builder.getArrayAttr(outSliceSymbols), // slice_symbols
                                                   builder.getStringAttr("core"),         // type
-                                                  nullptr                                // data_id
+                                                  nullptr,                               // data_id
+                                                  nullptr,                               // shim_dim_strides
+                                                  nullptr                                // shim_dim_wraps
     );
 
     // Bind Shim RX
@@ -579,7 +619,9 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
                                                   builder.getStringAttr("root"), shimRxDMA,
                                                   nullptr,                       // slice_symbols
                                                   builder.getStringAttr("shim"), // type
-                                                  nullptr                        // data_id
+                                                  nullptr,                       // data_id
+                                                  nullptr,                       // shim_dim_strides
+                                                  nullptr                        // shim_dim_wraps
     );
 
     // ============================================================

@@ -1557,9 +1557,12 @@ struct ConfigCreateIoInnerPattern : public OpConversionPattern<dfschedule::Confi
         
         auto i32Type = rewriter.getI32Type();
 
-        // Allocate channel ID from resource manager, per direction.
-        // AIEML has separate channel spaces for MM2S and S2MM.
-        int32_t allocatedChannelId = state.allocateChannelId(tileCol, tileRow, direction);
+        // Use the channel from the schedule IR directly. The BlueprintToSchedulePass
+        // has already assigned correct channels based on dma_port from DmapToDmaphop,
+        // which encodes the kernel's window ordering (arg0 → ch0, arg1 → ch1).
+        // Do NOT use allocateChannelId() here — that auto-increments based on
+        // processing order, which may not match the kernel's window ordering.
+        int32_t allocatedChannelId = channel;
 
         // Look up the bd_id from the bd_handle operand (recorded by ConfigDmaBdInnerPattern).
         // This ensures create_io, bd_config, and startio all use the same bd_id.

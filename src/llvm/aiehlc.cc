@@ -43,6 +43,7 @@ struct ParsedTensorInfo {
     std::vector<int64_t> shape;
     int elementBitWidth;
     bool isInput;
+    std::string spatialTag; // "row_broadcast_in", "col_broadcast_in", etc. or "" for default
 };
 static std::vector<ParsedTensorInfo> parsedTensors;
 
@@ -51,6 +52,7 @@ static std::vector<std::string> kernel_name_list;
 static std::unordered_map<std::string, const clang::FunctionDecl*> globalKernelFuncs;
 static std::string userKernelBody;      // raw source text of __global__ function body
 static std::string userKernelFuncName;  // kernel function name from __global__
+static std::vector<std::string> userMacroDefines; // #define lines from user source
 
 using namespace clang;
 using namespace clang::tooling;
@@ -127,25 +129,54 @@ public:
 				 prepos = std::string::npos;
 			 }
 
-             // Remove #ifdef KERNEL_COMPILE and #endif guards added during preprocessing
+             // Remove #ifdef KERNEL_COMPILE / #endif guard pairs added during
+             // preprocessing.  Only remove #endif lines that were inserted to
+             // close the KERNEL_COMPILE guard — leave user #endif directives
+             // (e.g. #ifdef DEBUG_OUTPUT_ORDER) intact.
              std::string ifdefToRemove = "#ifdef KERNEL_COMPILE";
              while ((pos = str.find(ifdefToRemove)) != std::string::npos) {
-                 // Find the end of line after #ifdef KERNEL_COMPILE
+                 // Erase the #ifdef KERNEL_COMPILE line
                  auto endOfLine = str.find("\n", pos);
                  if (endOfLine != std::string::npos) {
                      str.erase(pos, endOfLine - pos + 1);
                  } else {
                      str.erase(pos, ifdefToRemove.size());
                  }
+                 // Find and erase the matching #endif (last one in the string,
+                 // since the KERNEL_COMPILE guard wraps the entire body).
+                 std::string endifToRemove = "#endif";
+                 auto lastEndif = str.rfind(endifToRemove);
+                 if (lastEndif != std::string::npos) {
+                     auto endOfEndifLine = str.find("\n", lastEndif);
+                     if (endOfEndifLine != std::string::npos) {
+                         str.erase(lastEndif, endOfEndifLine - lastEndif + 1);
+                     } else {
+                         str.erase(lastEndif, endifToRemove.size());
+                     }
+                 }
              }
-             std::string endifToRemove = "#endif";
-             while ((pos = str.find(endifToRemove)) != std::string::npos) {
-                 // Find the end of line after #endif
-                 auto endOfLine = str.find("\n", pos);
-                 if (endOfLine != std::string::npos) {
-                     str.erase(pos, endOfLine - pos + 1);
-                 } else {
-                     str.erase(pos, endifToRemove.size());
+
+             // Strip spatial type wrappers from kernel source text
+             // "aie::row_broadcast_in<input_window_int8 *>" → "input_window_int8 *"
+             for (const auto &wrapper : {"row_broadcast_in", "col_broadcast_in", "tiled_in", "row_major_out",
+                                         "col_major_out", "row_reduce_out"}) {
+                 std::string prefix = "aie::" + std::string(wrapper) + "<";
+                 size_t spos;
+                 while ((spos = str.find(prefix)) != std::string::npos) {
+                     size_t start = spos;
+                     size_t angleStart = spos + prefix.size();
+                     int depth = 1;
+                     size_t end = angleStart;
+                     while (end < str.size() && depth > 0) {
+                         if (str[end] == '<')
+                             depth++;
+                         else if (str[end] == '>')
+                             depth--;
+                         end++;
+                     }
+                     // Replace "aie::wrapper<INNER>" with "INNER"
+                     std::string inner = str.substr(angleStart, end - angleStart - 1);
+                     str.replace(start, end - start, inner);
                  }
              }
 
@@ -173,8 +204,17 @@ public:
 				 "\n#include <aie_api/aie_adf.hpp>"
 				 "\n#include <aie_api/utils.hpp>\n\n";
 			 }
-             str = header + str;
-			 fd << str << std::endl;
+             // Add user macro definitions before kernel body
+             std::string macroBlock;
+             if (!userMacroDefines.empty()) {
+                 macroBlock = "\n// User macro definitions from source file\n";
+                 for (const auto &macro : userMacroDefines) {
+                     macroBlock += macro + "\n";
+                 }
+                 macroBlock += "\n";
+             }
+             str = header + macroBlock + str;
+             fd << str << std::endl;
     }
 
 		 void printSourceRange(const clang::SourceRange &range, const clang::SourceManager &sourceManager) {
@@ -375,15 +415,39 @@ public:
 					const Expr *meshArg = CE->getArg(1)->IgnoreParenImpCasts();
 					if (const auto *Construct = dyn_cast<CXXConstructExpr>(meshArg)) {
 						if (Construct->getNumArgs() >= 2) {
-							clang::Expr::EvalResult r0, r1;
+                            // Direct construction: __aie_launch("k", aieDim(4,4), ...)
+                            clang::Expr::EvalResult r0, r1;
 							if (Construct->getArg(0)->EvaluateAsInt(r0, *Context) &&
 								Construct->getArg(1)->EvaluateAsInt(r1, *Context)) {
 								tilingMeshRows = r0.Val.getInt().getExtValue();
 								tilingMeshCols = r1.Val.getInt().getExtValue();
 								llvm::outs() << "[TilingLinalg] Mesh: " << tilingMeshRows << " x " << tilingMeshCols << "\n";
 							}
-						}
-					} else if (const auto *DR = dyn_cast<DeclRefExpr>(meshArg)) {
+                        } else if (Construct->getNumArgs() == 1) {
+                            // Copy/move constructor: __aie_launch("k", mesh, ...) where mesh is by-value
+                            // Look through the copy to find the original DeclRefExpr
+                            const Expr *inner = Construct->getArg(0)->IgnoreParenImpCasts();
+                            if (const auto *DR = dyn_cast<DeclRefExpr>(inner)) {
+                                if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
+                                    if (VD->hasInit()) {
+                                        if (const auto *InitConstruct =
+                                                dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
+                                            if (InitConstruct->getNumArgs() >= 2) {
+                                                clang::Expr::EvalResult r0, r1;
+                                                if (InitConstruct->getArg(0)->EvaluateAsInt(r0, *Context) &&
+                                                    InitConstruct->getArg(1)->EvaluateAsInt(r1, *Context)) {
+                                                    tilingMeshRows = r0.Val.getInt().getExtValue();
+                                                    tilingMeshCols = r1.Val.getInt().getExtValue();
+                                                    llvm::outs() << "[TilingLinalg] Mesh (from copy-ctor var): "
+                                                                 << tilingMeshRows << " x " << tilingMeshCols << "\n";
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if (const auto *DR = dyn_cast<DeclRefExpr>(meshArg)) {
 						// mesh variable already declared — get rows/cols from its initializer
 						if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
 							if (VD->hasInit()) {
@@ -427,14 +491,32 @@ public:
 								// Don't abort — continue with available info
 							}
 
-							// First pass: collect scalar dimension values from launch args
+                            // Helper lambda: check if a QualType is a spatial wrapper or pointer type
+                            // (i.e. a tensor parameter, not a scalar dimension).
+                            // Spatial wrappers like aie::row_broadcast_in<T*> are struct types
+                            // (not pointer types), but they wrap a pointer inside.
+                            auto isTensorParam = [](clang::QualType qt) -> bool {
+                                if (qt->isPointerType())
+                                    return true;
+                                // Check for aie:: spatial wrapper struct
+                                std::string typeStr = qt.getUnqualifiedType().getAsString();
+                                for (const char *tag :
+                                     {"aie::row_broadcast_in", "aie::col_broadcast_in", "aie::tiled_in",
+                                      "aie::row_major_out", "aie::col_major_out", "aie::row_reduce_out"}) {
+                                    if (typeStr.find(tag) != std::string::npos)
+                                        return true;
+                                }
+                                return false;
+                            };
+
+                            // First pass: collect scalar dimension values from launch args
 							// Launch args start at index 2 (0=name, 1=mesh, 2..=kernel params)
 							std::vector<int64_t> scalarDimValues;
 							for (unsigned i = 0; i < numKernelParams; ++i) {
 								const ParmVarDecl *kp = kernelFD->getParamDecl(i);
 								clang::QualType ptype = kp->getType();
-								if (!ptype->isPointerType()) {
-									// Scalar param — try to evaluate from launch arg
+                                if (!isTensorParam(ptype)) {
+                                    // Scalar param — try to evaluate from launch arg
 									unsigned launchArgIdx = i + 2;
 									if (launchArgIdx < CE->getNumArgs()) {
 										clang::Expr::EvalResult evalRes;
@@ -442,8 +524,8 @@ public:
 											scalarDimValues.push_back(evalRes.Val.getInt().getExtValue());
 										}
 									}
-								}
-							}
+                                }
+                            }
 
 							// Determine default shape from scalar dims (e.g. M, N, K -> MxN for each tensor)
 							// For GEMM: A[M*K], B[K*N], C[M*N] with scalars [M, N, K]
@@ -456,67 +538,125 @@ public:
 								defaultDim0 = defaultDim1 = scalarDimValues[0];
 							}
 
-							// Second pass: build ParsedTensorInfo for each pointer parameter
-							for (unsigned i = 0; i < numKernelParams; ++i) {
+                            // Second pass: build ParsedTensorInfo for each tensor parameter
+                            // Handles both bare pointer types (input_window_int8*) and
+                            // spatial wrapper types (aie::row_broadcast_in<input_window_int8 *>)
+                            for (unsigned i = 0; i < numKernelParams; ++i) {
 								const ParmVarDecl *kp = kernelFD->getParamDecl(i);
 								clang::QualType ptype = kp->getType();
-								if (ptype->isPointerType()) {
-									clang::QualType pointee = ptype->getPointeeType();
-									bool isConst = pointee.isConstQualified();
+                                if (!isTensorParam(ptype))
+                                    continue;
 
-									// Check for window-type parameters: input_window<T>* or output_window<T>*
-									std::string pointeeStr = pointee.getUnqualifiedType().getAsString();
-									bool isWindowParam = false;
-									bool isInputWindow = false;
-									int bitWidth = 32; // default
+                                // Get the full type string for spatial tag extraction
+                                std::string fullTypeStr = ptype.getUnqualifiedType().getAsString();
 
-									if (pointeeStr.find("input_window") != std::string::npos) {
-										isWindowParam = true;
-										isInputWindow = true;
-									} else if (pointeeStr.find("output_window") != std::string::npos) {
-										isWindowParam = true;
-										isInputWindow = false;
-									}
+                                // Check for spatial type wrapper: aie::tag_name<inner_type>
+                                std::string spatialTag;
+                                std::string innerTypeStr;
+                                static const char *spatialTags[] = {"row_broadcast_in", "col_broadcast_in",
+                                                                    "tiled_in",         "row_major_out",
+                                                                    "col_major_out",    "row_reduce_out"};
+                                for (const char *tag : spatialTags) {
+                                    std::string prefix = std::string("aie::") + tag + "<";
+                                    size_t pos = fullTypeStr.find(prefix);
+                                    if (pos != std::string::npos) {
+                                        spatialTag = tag;
+                                        // Extract inner type: everything between < and matching >
+                                        size_t innerStart = pos + prefix.size();
+                                        int depth = 1;
+                                        size_t innerEnd = innerStart;
+                                        while (innerEnd < fullTypeStr.size() && depth > 0) {
+                                            if (fullTypeStr[innerEnd] == '<')
+                                                depth++;
+                                            else if (fullTypeStr[innerEnd] == '>')
+                                                depth--;
+                                            if (depth > 0)
+                                                innerEnd++;
+                                        }
+                                        innerTypeStr = fullTypeStr.substr(innerStart, innerEnd - innerStart);
+                                        // Trim whitespace
+                                        while (!innerTypeStr.empty() && innerTypeStr.front() == ' ')
+                                            innerTypeStr.erase(0, 1);
+                                        while (!innerTypeStr.empty() && innerTypeStr.back() == ' ')
+                                            innerTypeStr.pop_back();
+                                        // Remove trailing * if present (the pointer is inside the wrapper)
+                                        while (!innerTypeStr.empty() && innerTypeStr.back() == '*') {
+                                            innerTypeStr.pop_back();
+                                            while (!innerTypeStr.empty() && innerTypeStr.back() == ' ')
+                                                innerTypeStr.pop_back();
+                                        }
+                                        llvm::outs() << "[TilingLinalg] Spatial tag: " << spatialTag
+                                                     << " -> inner type: " << innerTypeStr << "\n";
+                                        break;
+                                    }
+                                }
 
-									if (isWindowParam) {
-										// Extract element bit width from window type name
-										// e.g. "input_window_int8" or "input_window<signed char>"
-										if (pointeeStr.find("int8") != std::string::npos ||
-											pointeeStr.find("signed char") != std::string::npos ||
-											pointeeStr.find("char") != std::string::npos)
-											bitWidth = 8;
-										else if (pointeeStr.find("int16") != std::string::npos ||
-												 pointeeStr.find("short") != std::string::npos)
-											bitWidth = 16;
-										// else default int32
-									} else {
-										// Plain pointer type (e.g. const int32_t*)
-										if (pointee->isSpecificBuiltinType(clang::BuiltinType::Int))
-											bitWidth = 32;
-										else if (pointee->isSpecificBuiltinType(clang::BuiltinType::Short))
-											bitWidth = 16;
-										else if (pointee->isSpecificBuiltinType(clang::BuiltinType::SChar) ||
-												 pointee->isSpecificBuiltinType(clang::BuiltinType::Char_S) ||
-												 pointee->isSpecificBuiltinType(clang::BuiltinType::UChar))
-											bitWidth = 8;
-										else if (const auto *BT = pointee->getAs<clang::BuiltinType>()) {
-											bitWidth = Context->getTypeSize(BT);
-										}
-									}
+                                // For bare pointer types, use the pointee type string
+                                if (spatialTag.empty() && ptype->isPointerType()) {
+                                    clang::QualType pointee = ptype->getPointeeType();
+                                    innerTypeStr = pointee.getUnqualifiedType().getAsString();
+                                }
 
-									ParsedTensorInfo pti;
-									pti.varName = kp->getNameAsString();
-									pti.shape = {defaultDim0, defaultDim1};
-									pti.elementBitWidth = bitWidth;
-									pti.isInput = isWindowParam ? isInputWindow : isConst;
+                                // Determine input/output and bit width from inner type string
+                                bool isWindowParam = false;
+                                bool isInputWindow = false;
+                                int bitWidth = 32; // default
 
-									parsedTensors.push_back(pti);
-									llvm::outs() << "[TilingLinalg] Tensor param: " << pti.varName
-												 << " [" << pti.shape[0] << "x" << pti.shape[1] << "] i"
-												 << pti.elementBitWidth
-												 << (pti.isInput ? " (input)" : " (output)") << "\n";
-								}
-							}
+                                if (innerTypeStr.find("input_window") != std::string::npos) {
+                                    isWindowParam = true;
+                                    isInputWindow = true;
+                                } else if (innerTypeStr.find("output_window") != std::string::npos) {
+                                    isWindowParam = true;
+                                    isInputWindow = false;
+                                }
+
+                                if (isWindowParam) {
+                                    if (innerTypeStr.find("int8") != std::string::npos ||
+                                        innerTypeStr.find("signed char") != std::string::npos ||
+                                        innerTypeStr.find("char") != std::string::npos)
+                                        bitWidth = 8;
+                                    else if (innerTypeStr.find("int16") != std::string::npos ||
+                                             innerTypeStr.find("short") != std::string::npos)
+                                        bitWidth = 16;
+                                } else if (ptype->isPointerType()) {
+                                    // Plain pointer type (e.g. const int32_t*)
+                                    clang::QualType pointee = ptype->getPointeeType();
+                                    if (pointee->isSpecificBuiltinType(clang::BuiltinType::Int))
+                                        bitWidth = 32;
+                                    else if (pointee->isSpecificBuiltinType(clang::BuiltinType::Short))
+                                        bitWidth = 16;
+                                    else if (pointee->isSpecificBuiltinType(clang::BuiltinType::SChar) ||
+                                             pointee->isSpecificBuiltinType(clang::BuiltinType::Char_S) ||
+                                             pointee->isSpecificBuiltinType(clang::BuiltinType::UChar))
+                                        bitWidth = 8;
+                                    else if (const auto *BT = pointee->getAs<clang::BuiltinType>()) {
+                                        bitWidth = Context->getTypeSize(BT);
+                                    }
+                                }
+
+                                // For spatial tags, determine input/output from the tag name
+                                bool isInput;
+                                if (!spatialTag.empty()) {
+                                    isInput = (spatialTag.find("_in") != std::string::npos);
+                                } else {
+                                    bool isConst =
+                                        ptype->isPointerType() ? ptype->getPointeeType().isConstQualified() : false;
+                                    isInput = isWindowParam ? isInputWindow : isConst;
+                                }
+
+                                ParsedTensorInfo pti;
+                                pti.varName = kp->getNameAsString();
+                                pti.shape = {defaultDim0, defaultDim1};
+                                pti.elementBitWidth = bitWidth;
+                                pti.isInput = isInput;
+                                pti.spatialTag = spatialTag;
+
+                                parsedTensors.push_back(pti);
+                                llvm::outs() << "[TilingLinalg] Tensor param: " << pti.varName << " [" << pti.shape[0]
+                                             << "x" << pti.shape[1] << "] i" << pti.elementBitWidth
+                                             << (pti.isInput ? " (input)" : " (output)")
+                                             << (spatialTag.empty() ? "" : " spatial=" + spatialTag) << "\n";
+                            }
 						}
 					}
 				}
@@ -818,7 +958,41 @@ public:
 
 				//llvm::StringRef UpdatedSource;
 				std::string SourceCodeString = SourceCode.str();
-				size_t KeywordPos = 0;
+
+                // Collect user #define macros before any rewriting
+                {
+                    userMacroDefines.clear();
+                    std::istringstream iss(SourceCodeString);
+                    std::string line;
+                    std::string currentDefine;
+                    bool inMultiLine = false;
+                    while (std::getline(iss, line)) {
+                        if (inMultiLine) {
+                            currentDefine += "\n" + line;
+                            if (line.empty() || line.back() != '\\') {
+                                userMacroDefines.push_back(currentDefine);
+                                inMultiLine = false;
+                            }
+                            continue;
+                        }
+                        size_t firstNonSpace = line.find_first_not_of(" \t");
+                        if (firstNonSpace != std::string::npos && line.substr(firstNonSpace, 7) == "#define") {
+                            // Skip aiehlc-internal stub macros
+                            if (line.find("AIEHLC_STUBS_DEFINED") != std::string::npos ||
+                                line.find("AIEHLC_TILING_STUBS_DEFINED") != std::string::npos) {
+                                continue;
+                            }
+                            currentDefine = line;
+                            if (!line.empty() && line.back() == '\\') {
+                                inMultiLine = true;
+                            } else {
+                                userMacroDefines.push_back(currentDefine);
+                            }
+                        }
+                    }
+                }
+
+                size_t KeywordPos = 0;
 				for (auto x:funcMap ) {
 					std::string KeywordToReplace = x.first;//"__global__";
 					std::string Replacement = x.second;//"__attribute__((annotate(\"__global__\")))";
@@ -974,6 +1148,15 @@ public:
                     ret += "// CUDA-style AIE API stubs for Clang parsing\n";
                     ret += "#ifndef AIEHLC_TILING_STUBS_DEFINED\n";
                     ret += "#define AIEHLC_TILING_STUBS_DEFINED\n";
+                    // Spatial type wrapper stubs for aie:: namespace
+                    ret += "namespace aie {\n";
+                    ret += "template<typename T> struct row_broadcast_in { using type = T; };\n";
+                    ret += "template<typename T> struct col_broadcast_in { using type = T; };\n";
+                    ret += "template<typename T> struct tiled_in         { using type = T; };\n";
+                    ret += "template<typename T> struct row_major_out    { using type = T; };\n";
+                    ret += "template<typename T> struct col_major_out    { using type = T; };\n";
+                    ret += "template<typename T> struct row_reduce_out   { using type = T; };\n";
+                    ret += "}\n";
                     ret += "struct aieDim {\n";
                     ret += "    int rows, cols;\n";
                     ret += "    aieDim(int r, int c) : rows(r), cols(c) {}\n";
@@ -1104,16 +1287,44 @@ public:
 				int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
 				int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
 
-				// Build routing IR
-				auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors);
+                // Build SplitModel from parsed spatial tags
+                SplitModel splitModel;
+                if (!parsedTensors.empty()) {
+                    for (auto &pt : parsedTensors) {
+                        if (pt.spatialTag.empty()) {
+                            // default: row_broadcast_in / row_major_out
+                            splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(
+                                pt.isInput ? "row_broadcast_in" : "row_major_out", pt.isInput));
+                        } else {
+                            splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
+                        }
+                    }
+                } else {
+                    splitModel = SplitModel::gemm();
+                }
 
-				// Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
+                // Build routing IR
+                auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel);
+
+                // Prepend user macros to kernel body for multi-tile path
+                std::string kernelBodyWithMacros = userKernelBody;
+                if (!userMacroDefines.empty() && !userKernelBody.empty()) {
+                    std::string macroBlock = "// User macro definitions from source file\n";
+                    for (const auto &macro : userMacroDefines) {
+                        macroBlock += macro + "\n";
+                    }
+                    macroBlock += "\n";
+                    kernelBodyWithMacros = macroBlock + userKernelBody;
+                }
+
+                // Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
 				std::string outputDir = std::string(AOUT) + "worklocal/";
-                if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, userKernelBody, userKernelFuncName,
+                if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros, userKernelFuncName,
                                                       parsedDebugLevel, userRewrittenSource)) {
                     llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
                 } else {
                     llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
+                    std::exit(1);
                 }
             } else {
 				// ---- EXISTING PATH: single-tile ----

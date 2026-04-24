@@ -272,14 +272,24 @@ if [[ "$use_llvm_aie" == "true" ]]; then
         --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
         --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
         --extra-arg="-include"aie_compat.h"" ${runtime_source_file} --
+    AIEHLC_RC=$?
 else
     "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" --extra-arg="-DAIE_GEN=${aie_version}" \
         --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
         --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
         --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
         --extra-arg="-include"aie_compat.h"" ${runtime_source_file} --
+    AIEHLC_RC=$?
 fi
 set +x
+if [ $AIEHLC_RC -ne 0 ]; then
+    echo ""
+    echo "==========================================================="
+    echo "Error: aiehlc code generation failed (exit code $AIEHLC_RC)."
+    echo "Check the output above for details (e.g. RoutingHWVerifyPass errors)."
+    echo "==========================================================="
+    return $AIEHLC_RC
+fi
 HOST_BUILD_DIR=$(pwd)/aout/
 mkdir -p $HOST_BUILD_DIR
 

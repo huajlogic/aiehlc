@@ -4,22 +4,23 @@
 ******************************************************************************/
 #include "tilinglinalg_pipeline.h"
 
+#include "dmaptodmaphop.h"
+#include "hw/ResourceManager.h"
+#include "kernelconfig.h"
 #include "passblueprinttoschedule.h"
 #include "passblueprinttoschedulekernel.h"
 #include "passdfscheduletoapi.h"
 #include "passdfscheduletokernelapi.h"
 #include "passdmaphoptodfscheblueprint.h"
 #include "passdmaphoptoroutinghw.h"
-#include "dmaptodmaphop.h"
-#include "routingtodmap.h"
 #include "passschedulecanonicalize.h"
-#include "routinghwlower.h"
-#include "routinglower.h"
-#include "routingunrolling.h"
-#include "routingdeadargclean.h"
 #include "routingconstantfold.h"
-#include "kernelconfig.h"
-#include "hw/ResourceManager.h"
+#include "routingdeadargclean.h"
+#include "routinghwlower.h"
+#include "routinghwverify.h"
+#include "routinglower.h"
+#include "routingtodmap.h"
+#include "routingunrolling.h"
 
 #include "routingmanager.h"
 #include "routinghwmanager.h"
@@ -60,7 +61,7 @@ static std::string setupPipelineIRDir(const std::string &subdir) {
         llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
         return "";
     }
-    std::string dir = (cwdPath + "/../ir/" + subdir).str();
+    std::string dir = (cwdPath + "/ir/" + subdir).str();
     if (std::error_code EC = llvm::sys::fs::create_directories(dir)) {
         llvm::errs() << "Failed to create IR directory " << dir << ": " << EC.message() << "\n";
         return "";
@@ -125,10 +126,9 @@ void TilingLinalgPipeline::registerDialects(mlir::MLIRContext &ctx) {
     ctx.getOrLoadDialect<mlir::emitc::EmitCDialect>();
 }
 
-mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(
-    mlir::MLIRContext &ctx,
-    int meshRows, int meshCols,
-    const std::vector<TensorParam> &tensors) {
+mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols,
+                                                    const std::vector<TensorParam> &tensors,
+                                                    const SplitModel &splitModel) {
 
     // This is a parameterized version of routingmanager::ops_testNew()
     using namespace routing;
@@ -151,6 +151,9 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(
     builder.setInsertionPointToEnd(block);
     auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(), meshRows, meshCols);
 
+    // Build all tensor values first
+    std::vector<Value> tensorValues;
+    std::vector<bool> isInputFlags;
     for (unsigned i = 0; i < tensors.size(); ++i) {
         const auto &tp = tensors[i];
 
@@ -174,11 +177,13 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(
         // Feed into createscheduletensor — same as before
         auto tensor = builder.create<createscheduletensor>(builder.getUnknownLoc(), tensorType, tensorValue.getResult(),
                                                            vals, dimnum);
-
-        // Create routing function for this tensor
-        routingmanager rm;
-        rm.createroutingfuncByDim(builder, &ctx, tp.isInput, mesh, tensor, meshRows, "row");
+        tensorValues.push_back(tensor);
+        isInputFlags.push_back(tp.isInput);
     }
+
+    // Use SplitModel-driven routing generation
+    routingmanager rm;
+    rm.createroutingfuncBySplitModel(builder, &ctx, mesh, tensorValues, isInputFlags, meshRows, meshCols, splitModel);
 
     builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(hostFunc);
@@ -599,25 +604,25 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "\n";
             // Debug: print in0 values
             stream << "        // Debug: dump in0 buffer contents\n";
-            stream << "        klog(\"IN0\", BUF_SZ * 4);\n";
-            stream << "        for (int di = 0; di < BUF_SZ * 4; di++) {\n";
+            stream << "        klog(\"IN0\", BUF_SZ_IN_0 * 4);\n";
+            stream << "        for (int di = 0; di < BUF_SZ_IN_0 * 4; di++) {\n";
             stream << "            klog(\"IV\", (int)in0[di]);\n";
             stream << "        }\n";
             stream << "\n";
             stream << "        // GEMM kernel: out0[i] = in0[i] * in1[i]\n";
-            stream << "        for (int i = 0; i < BUF_SZ; i++) {\n";
+            stream << "        for (int i = 0; i < BUF_SZ_OUT_0; i++) {\n";
             stream << "            " << vecType << " data0 = *((" << vecType << " *)&in0[i * 4]);\n";
             if (numInputWindows > 1) {
                 stream << "            " << vecType << " data1 = *((" << vecType << " *)&in1[i * 4]);\n";
             }
             stream << "            *((" << vecType << " *)&out0[i * 4]) = data0;\n";
             stream << "        }\n";
-            stream << "        klog(\"CLOP\", BUF_SZ);\n";
+            stream << "        klog(\"CLOP\", BUF_SZ_OUT_0);\n";
             stream << "\n";
             // Debug: print out0 values
             stream << "        // Debug: dump out0 buffer contents\n";
-            stream << "        klog(\"OUT0\", BUF_SZ * 4);\n";
-            stream << "        for (int di = 0; di < BUF_SZ * 4; di++) {\n";
+            stream << "        klog(\"OUT0\", BUF_SZ_OUT_0 * 4);\n";
+            stream << "        for (int di = 0; di < BUF_SZ_OUT_0 * 4; di++) {\n";
             stream << "            klog(\"OV\", (int)out0[di]);\n";
             stream << "        }\n";
             stream << "\n";
@@ -697,6 +702,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         // shim columns and DMA port assignments are consistent.
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<DmaphopToRoutinghwPass>(rtopology),
                                    routingIrDir, rstage, "DmaphopToRoutinghwPass"))
+            return false;
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWVerifyPass>(), routingIrDir,
+                                   rstage, "RoutingHWVerifyPass"))
             return false;
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(rtopology),
                                    routingIrDir, rstage, "RoutingHWLowerPass"))

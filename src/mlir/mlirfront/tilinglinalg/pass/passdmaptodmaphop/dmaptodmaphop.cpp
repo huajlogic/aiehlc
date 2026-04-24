@@ -49,6 +49,60 @@ struct DmapFuncOpLowering : public OpConversionPattern<dmap::FuncOp> {
 // Enum to distinguish between push and pull dataflow directions.
 enum class DataflowDirection { Push, Pull };
 
+// Trace a Value back through the SSA chain to find the originating function
+// argument index.  This walks through bufferization.to_tensor,
+// routing.routingcreatescheduletensor, routing.partitiontensor,
+// routing.routingextract_data, and scf.execute_region captures until it
+// reaches a BlockArgument of a func::FuncOp.
+// Returns the argument index (0-based), or -1 if the chain cannot be resolved.
+static int traceToFuncArgIndex(Value v) {
+    // Walk up the def chain, max 20 hops to avoid infinite loops
+    for (int depth = 0; depth < 20; ++depth) {
+        // If v is a block argument of a func op, we found it
+        if (auto blockArg = dyn_cast<BlockArgument>(v)) {
+            if (auto funcOp = dyn_cast<func::FuncOp>(blockArg.getOwner()->getParentOp()))
+                return static_cast<int>(blockArg.getArgNumber());
+            // It's a block argument of some other region (e.g., scf.for,
+            // scf.execute_region, routing.RoutingCreate).  These inner
+            // regions capture values from their parent; try to find the
+            // corresponding operand.
+            // scf.execute_region has no operands – values from outside are
+            // simply visible inside.  Walk the uses of `v` inside the region
+            // to find a defining op to continue chasing.
+            break; // can't follow further through a block argument
+        }
+        Operation *defOp = v.getDefiningOp();
+        if (!defOp)
+            break;
+
+        // routing.routingextract_data %tensor, %idx -> follow %tensor (operand 0)
+        if (defOp->getName().getStringRef() == "routing.routingextract_data" ||
+            defOp->getName().getStringRef() == "routing.routingcreatescheduletensor" ||
+            defOp->getName().getStringRef() == "routing.partitiontensor") {
+            // operand 0 is the tensor/data input
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // bufferization.to_tensor %memref -> follow %memref (operand 0)
+        if (defOp->getName().getStringRef() == "bufferization.to_tensor") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // dmap ops that forward data
+        if (defOp->getName().getStringRef() == "dmap.push" || defOp->getName().getStringRef() == "dmap.pull") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // Generic single-result ops that just forward operand 0
+        if (defOp->getNumOperands() > 0) {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        break;
+    }
+    return -1; // unable to resolve
+}
+
 // Generic function to lower a data movement operation (push or pull).
 static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewriter &rewriter,
                                          RoutingTopology &router, DataflowDirection direction) {
@@ -66,7 +120,11 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         // Otherwise, use the value directly (it should be a tensor)
         dataId = dataValue;
     }
-    
+
+    // Determine the originating function argument index for deterministic DMA
+    // port assignment (see section 2b below for the full rationale).
+    int funcArgIdx = traceToFuncArgIndex(dataValue);
+
     // Get topology info - core tile start row
     int core_start_row = (int) router.getRM()->getrsc()->absTileRow(TileType::Core, 0);
     
@@ -182,20 +240,79 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         coreTiles.push_back(coreTile);
 
         std::string inPortName = flowPrefix + "corePortIn" + std::to_string(i);
-        auto portInOp =
-            rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("In"),
-                                           rewriter.getStringAttr(inPortName), rewriter.getI64IntegerAttr(0), nullptr);
+        // direction_channel must match the DMA port number so downstream passes
+        // (DmaphopTodfscheblueprint) assign the correct S2MM channel.
+        // Use funcArgIdx when available; fall back to 0 for unresolvable cases.
+        int64_t inDirChannel = (funcArgIdx >= 0) ? funcArgIdx : 0;
+        auto portInOp = rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("In"),
+                                                       rewriter.getStringAttr(inPortName),
+                                                       rewriter.getI64IntegerAttr(inDirChannel), nullptr);
         corePortsInValues.push_back(portInOp.getResult());
 
         std::string outPortName = flowPrefix + "corePortOut" + std::to_string(i);
-        auto pktId = router.getRM()->allocatePktId(-1);
-        assert(pktId.has_value() && "pkt_id pool exhausted (max 31)");
-        auto pktIdAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(pktId.value()));
+        // Only allocate pkt_id for Pull (output) flows where core OUT ports
+        // are producers that need packet-switched routing to shim.
+        // For Push (input) flows, core OUT ports are only used for inter-core
+        // hop chaining and don't need pkt_ids (saves scarce 5-bit pkt_id pool).
+        mlir::IntegerAttr pktIdAttr = nullptr;
+        if (direction == DataflowDirection::Pull) {
+            auto pktId = router.getRM()->allocatePktId(-1);
+            assert(pktId.has_value() && "pkt_id pool exhausted (max 31)");
+            pktIdAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(pktId.value()));
+        }
         corePortsOutOps.push_back(rewriter.create<dmaphop::port>(loc, coreTile, rewriter.getStringAttr("Out"),
                                                                  rewriter.getStringAttr(outPortName),
                                                                  rewriter.getI64IntegerAttr(0), pktIdAttr));
     }
-    
+
+    // --- 2b. Create explicit DMA port mapping (consumer/producer ops) ---
+    // This makes DMA port allocation visible at the dmaphop IR level.
+    //
+    // The DMA port number must match the kernel's window ordering: the kernel
+    // acquires inputs via acquire_input_window(window_in_0), ...(window_in_1),
+    // which map to DMA S2MM channel 0, 1, ... respectively.  The kernel
+    // signature order mirrors the function argument order (%arg0, %arg1, ...),
+    // so we use the originating function argument index as the DMA port number.
+    //
+    // Without this, the conversion-framework processing order (which may differ
+    // from the argument order) would determine the port allocation, causing A/B
+    // data swaps when the execute_regions are reordered.
+    auto rm = router.getRM();
+    if (direction == DataflowDirection::Push) {
+        // Push: core tiles receive data -> create consumer ops for each core input port
+        for (int i = 0; i < coreGroup.getCoreCount(); ++i) {
+            Point corePt = coreTilePoints[i];
+            int64_t dmaPortNum;
+            if (funcArgIdx >= 0) {
+                // Use the function argument index as the specific DMA port.
+                // allocate(io, portidx, dir, ioId) reserves the exact port index.
+                auto dmaPort = rm->tile(corePt.r, corePt.c).allocate(IOType::Input, funcArgIdx, PortDirection::DMA, -1);
+                dmaPortNum = dmaPort.has_value() ? static_cast<int64_t>(*dmaPort) : funcArgIdx;
+            } else {
+                // Fallback to auto-allocation when arg index cannot be resolved
+                auto dmaPort = rm->tile(corePt.r, corePt.c).occupyport(IOType::Input, PortDirection::DMA, -1);
+                dmaPortNum = dmaPort.has_value() ? static_cast<int64_t>(*dmaPort) : 0;
+            }
+            std::string portName = flowPrefix + "corePortIn" + std::to_string(i);
+            std::string consumerSymName = flowPrefix + "consumer" + std::to_string(i);
+            rewriter.create<dmaphop::consumer>(loc, rewriter.getStringAttr(consumerSymName),
+                                               FlatSymbolRefAttr::get(rewriter.getContext(), portName),
+                                               rewriter.getI64IntegerAttr(dmaPortNum));
+        }
+    } else {
+        // Pull: core tiles send data -> create producer ops for each core output port
+        for (int i = 0; i < coreGroup.getCoreCount(); ++i) {
+            Point corePt = coreTilePoints[i];
+            auto dmaPort = rm->tile(corePt.r, corePt.c).occupyport(IOType::Output, PortDirection::DMA, -1);
+            int64_t dmaPortNum = dmaPort.has_value() ? static_cast<int64_t>(*dmaPort) : 0;
+            std::string portName = flowPrefix + "corePortOut" + std::to_string(i);
+            std::string producerSymName = flowPrefix + "producer" + std::to_string(i);
+            rewriter.create<dmaphop::producer>(loc, rewriter.getStringAttr(producerSymName),
+                                               FlatSymbolRefAttr::get(rewriter.getContext(), portName),
+                                               rewriter.getI64IntegerAttr(dmaPortNum));
+        }
+    }
+
     // --- 3. Use router to allocate shim column and channel ---
     // FIXED RULES:
     // Rule #1: Shim tile In and Out ports use the SAME channel number
@@ -289,10 +406,10 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
             producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "shimPortIn"));
         }
 
-        // All core input ports are consumers
+        // All core input ports are consumers - use consumer symbol names
         for (size_t i = 0; i < corePortsInValues.size(); ++i) {
-            std::string inPortName = flowPrefix + "corePortIn" + std::to_string(i);
-            consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), inPortName));
+            std::string consumerSymName = flowPrefix + "consumer" + std::to_string(i);
+            consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), consumerSymName));
         }
 
         // Create hops between cores (if multiple cores)
@@ -308,20 +425,20 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
         if (memTile) { // CORES -> MEM -> SHIM
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, memPortOut, shimPortIn).getResult());
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps.back(), memPortIn).getResult());
-            // Producers: all core output ports, memPortIn (mem receives from cores)
+            // Producers: all core output ports (use producer symbols), memPortIn (mem stays as port symbol)
             for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
-                std::string outPortName = flowPrefix + "corePortOut" + std::to_string(i);
-                producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), outPortName));
+                std::string producerSymName = flowPrefix + "producer" + std::to_string(i);
+                producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), producerSymName));
             }
             producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "memPortIn"));
             // Consumer: shimPortOut (shim sends to DDR)
             consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "shimPortOut"));
         } else { // CORES -> SHIM
             hops.push_back(rewriter.create<dmaphop::create_hop>(loc, corePortsOutOps.back(), shimPortIn).getResult());
-            // Producers: all core output ports
+            // Producers: all core output ports (use producer symbols)
             for (size_t i = 0; i < corePortsOutOps.size(); ++i) {
-                std::string outPortName = flowPrefix + "corePortOut" + std::to_string(i);
-                producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), outPortName));
+                std::string producerSymName = flowPrefix + "producer" + std::to_string(i);
+                producerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), producerSymName));
             }
             // Consumer: shimPortOut (shim sends to DDR)
             consumerPortSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), flowPrefix + "shimPortOut"));

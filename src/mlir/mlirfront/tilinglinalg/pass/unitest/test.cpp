@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "routinghwlower.h"
 #include "routinghwmanager.h"
+#include "routinghwverify.h"
 #include "routinglower.h"
 #include "routingmanager.h"
 #include "routingunrolling.h"
@@ -54,15 +55,13 @@
 // IR dump helpers
 // ---------------------------------------------------------------------------
 
-static std::string setupIRDir(const std::string &subdir,
-                              bool useCurrentDir = false) {
+static std::string setupIRDir(const std::string &subdir) {
     llvm::SmallString<256> cwdPath;
     if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
         llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
         return "";
     }
-    std::string prefix = useCurrentDir ? "/ir/" : "/../ir/";
-    std::string dir = (cwdPath + prefix + subdir).str();
+    std::string dir = (cwdPath + "/ir/" + subdir).str();
     if (std::error_code EC = llvm::sys::fs::create_directories(dir)) {
         llvm::errs() << "Failed to create IR directory " << dir << ": " << EC.message() << "\n";
         return "";
@@ -71,14 +70,13 @@ static std::string setupIRDir(const std::string &subdir,
     return dir;
 }
 
-static std::string setupWorklocalDir(bool useCurrentDir = false) {
+static std::string setupWorklocalDir() {
     llvm::SmallString<256> cwdPath;
     if (std::error_code EC = llvm::sys::fs::current_path(cwdPath)) {
         llvm::errs() << "Failed to get current directory: " << EC.message() << "\n";
         return "";
     }
-    std::string suffix = useCurrentDir ? "/worklocal" : "/../worklocal";
-    std::string dir = (cwdPath + suffix).str();
+    std::string dir = (cwdPath + "/worklocal").str();
     if (std::error_code EC = llvm::sys::fs::create_directories(dir)) {
         llvm::errs() << "Failed to create directory " << dir << ": " << EC.message() << "\n";
         return "";
@@ -878,8 +876,7 @@ static mlir::OwningOpRef<mlir::ModuleOp> loadModuleFromFile(
     return result;
 }
 
-void routingtoroutinghw(mlir::ModuleOp module1 = nullptr,
-                        bool useCurrentDir = false) {
+void routingtoroutinghw(mlir::ModuleOp module1 = nullptr) {
     MLIRContext ctx;
 
     routingmanager mtest;
@@ -893,7 +890,7 @@ void routingtoroutinghw(mlir::ModuleOp module1 = nullptr,
         module1 = mtest.ops_testNew(&ctx, 1, "routing");
     }
 
-    std::string irDir = setupIRDir("simplerouting", useCurrentDir);
+    std::string irDir = setupIRDir("simplerouting");
     RoutingTopology rtopology("Gen2");
     int stage = 0;
 
@@ -915,7 +912,7 @@ void routingtoroutinghw(mlir::ModuleOp module1 = nullptr,
     if (!runSinglePass(ctx, module1, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
         return;
 
-    const std::string worklocalDir = setupWorklocalDir(useCurrentDir);
+    const std::string worklocalDir = setupWorklocalDir();
     if (worklocalDir.empty()) return;
 
     std::string routingPath = worklocalDir + "/routing_hw.cc";
@@ -933,9 +930,7 @@ void routingtoroutinghw(mlir::ModuleOp module1 = nullptr,
     }
     std::cout << "Routing code written to " << routingPath << std::endl;
 }
-void routingtodmap(const std::string &irFilepath = "",
-                   bool useCurrentDir = false,
-                   int startStage = 0) {
+void routingtodmap(const std::string &irFilepath = "", int startStage = 0) {
     MLIRContext ctx;
 
     routingmanager mtest;
@@ -968,7 +963,7 @@ void routingtodmap(const std::string &irFilepath = "",
         module1 = mtest.ops_testNew(&ctx, 1, "routing");
     }
 
-    std::string irDir = setupIRDir("dmap", useCurrentDir);
+    std::string irDir = setupIRDir("dmap");
     RoutingTopology rtopology("Gen2");
     int stage = startStage;
 
@@ -994,6 +989,8 @@ void routingtodmap(const std::string &irFilepath = "",
     if (!runSinglePass(ctx, module1, std::make_unique<DmaphopToRoutinghwPass>(rtopology), irDir, stage,
                        "DmaphopToRoutinghwPass"))
         return;
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingHWVerifyPass>(), irDir, stage, "RoutingHWVerifyPass"))
+        return;
     if (!runSinglePass(ctx, module1, std::make_unique<RoutingHWLowerPass>(rtopology), irDir, stage,
                        "RoutingHWLowerPass"))
         return;
@@ -1005,7 +1002,7 @@ void routingtodmap(const std::string &irFilepath = "",
     if (!runSinglePass(ctx, module1, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
         return;
 
-    const std::string worklocalDir = setupWorklocalDir(useCurrentDir);
+    const std::string worklocalDir = setupWorklocalDir();
     if (worklocalDir.empty()) return;
 
     std::string routingPath = worklocalDir + "/routing.cc";
@@ -1024,9 +1021,7 @@ void routingtodmap(const std::string &irFilepath = "",
     std::cout << "Routing code written to " << routingPath << std::endl;
 }
 
-void routingtodfschedule(const std::string &irFilepath = "",
-                         bool useCurrentDir = false,
-                         int startStage = 0) {
+void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0) {
     MLIRContext ctx;
     TilingLinalgPipeline::registerDialects(ctx);
 
@@ -1046,13 +1041,13 @@ void routingtodfschedule(const std::string &irFilepath = "",
         module = *parsedModule;
         std::cout << "Parsed module from " << irFilepath << std::endl;
     } else {
-        module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors);
+        module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors);
     }
 
     // When startStage==0 and using the default pipeline, delegate to
     // TilingLinalgPipeline::runPipeline which handles the full flow.
     if (startStage == 0) {
-        std::string outputDir = setupWorklocalDir(useCurrentDir);
+        std::string outputDir = setupWorklocalDir();
         if (outputDir.empty()) return;
 
         if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir,
@@ -1081,7 +1076,7 @@ void routingtodfschedule(const std::string &irFilepath = "",
     if (doKernelPath) std::cout << " kernel.cc";
     std::cout << std::endl;
 
-    std::string irDir = setupIRDir("dfschedule", useCurrentDir);
+    std::string irDir = setupIRDir("dfschedule");
     int stage = startStage;
 
     dumpIRToFile(module, irDir, stage++, "initial");
@@ -1176,7 +1171,7 @@ void routingtodfschedule(const std::string &irFilepath = "",
     }
 
     // Output generated C++ code
-    const std::string worklocalDir = setupWorklocalDir(useCurrentDir);
+    const std::string worklocalDir = setupWorklocalDir();
     if (worklocalDir.empty()) return;
 
     if (doHostPath) {
@@ -1274,12 +1269,12 @@ void routingtodfschedule(const std::string &irFilepath = "",
 // module with dim_strides/dim_wraps on a config.dma_bd op and runs the
 // DfscheduleToApiPass to verify __Runtime_dma_bd_config_multidim emission.
 
-void testMultidimBd(bool useCurrentDir = false) {
+void testMultidimBd() {
     std::cout << "\n=== Multi-Dimensional BD Addressing Test ===" << std::endl;
 
     // First, run the normal pipeline to verify no regression
     std::cout << "\n--- Phase 1: Regression check (normal pipeline) ---" << std::endl;
-    routingtodfschedule("", useCurrentDir);
+    routingtodfschedule("");
 
     // Phase 2: Build a minimal dfschedule module with dim_strides/dim_wraps
     // and run DfscheduleToApiPass to check multidim call emission
@@ -1294,10 +1289,10 @@ void testMultidimBd(bool useCurrentDir = false) {
         {{16, 16}, 8, true},  // input B
         {{16, 16}, 8, false}, // output C
     };
-    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 2, 2, tensors);
+    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors);
 
     RoutingTopology rtopology("Gen2");
-    std::string irDir = setupIRDir("multidim", useCurrentDir);
+    std::string irDir = setupIRDir("multidim");
     int stage = 0;
 
     dumpIRToFile(module, irDir, stage++, "initial");
@@ -1372,7 +1367,7 @@ void testMultidimBd(bool useCurrentDir = false) {
         return;
 
     // Emit host.cc and check for __Runtime_dma_bd_config_multidim
-    const std::string worklocalDir = setupWorklocalDir(useCurrentDir);
+    const std::string worklocalDir = setupWorklocalDir();
     if (worklocalDir.empty())
         return;
 
@@ -1506,11 +1501,11 @@ int main(int argc, char* argv[]) {
             }
 
             // Run dfschedule pipeline from the detected start stage
-            routingtodfschedule(filepath, /*useCurrentDir=*/true, startStage);
+            routingtodfschedule(filepath, startStage);
 
             // Run routing.cc pipeline only if the entry stage is early enough
             if (canProduceRouting) {
-                routingtodmap(filepath, /*useCurrentDir=*/true, startStage);
+                routingtodmap(filepath, startStage);
             }
         } else if (arg == "routing") {
             if (argc < 3) {

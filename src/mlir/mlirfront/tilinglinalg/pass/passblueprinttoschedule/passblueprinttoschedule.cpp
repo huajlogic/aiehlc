@@ -22,6 +22,7 @@
 #include "routingmanager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include <iostream>
 #include <sstream>
 #include <unordered_map>
@@ -32,6 +33,66 @@ using namespace dfscheblueprint;
 using namespace dfschedule;
 
 namespace {
+
+// Trace a Value back through the SSA chain to find the originating function
+// argument index.  This walks through bufferization.to_tensor,
+// routing.routingcreatescheduletensor, routing.partitiontensor,
+// routing.routingextract_data, dfscheblueprint.declare_data, and
+// scf.execute_region captures until it reaches a BlockArgument of a func::FuncOp.
+// Returns the argument index (0-based), or -1 if the chain cannot be resolved.
+static int traceToFuncArgIndex(Value v) {
+    // Walk up the def chain, max 20 hops to avoid infinite loops
+    for (int depth = 0; depth < 20; ++depth) {
+        // If v is a block argument of a func op, we found it
+        if (auto blockArg = dyn_cast<BlockArgument>(v)) {
+            if (auto funcOp = dyn_cast<func::FuncOp>(blockArg.getOwner()->getParentOp()))
+                return static_cast<int>(blockArg.getArgNumber());
+            break; // can't follow further through a block argument
+        }
+        Operation *defOp = v.getDefiningOp();
+        if (!defOp)
+            break;
+
+        // routing ops that forward data through operand 0
+        if (defOp->getName().getStringRef() == "routing.routingextract_data" ||
+            defOp->getName().getStringRef() == "routing.routingcreatescheduletensor" ||
+            defOp->getName().getStringRef() == "routing.partitiontensor") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // bufferization.to_tensor %memref -> follow %memref (operand 0)
+        if (defOp->getName().getStringRef() == "bufferization.to_tensor") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // dfscheblueprint.declare_data -> follow init_tensor (operand 0)
+        if (defOp->getName().getStringRef() == "dfscheblueprint.declare_data") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // tensor.extract_slice -> follow source tensor (operand 0)
+        if (defOp->getName().getStringRef() == "tensor.extract_slice") {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        // Generic single-result ops that just forward operand 0
+        if (defOp->getNumOperands() > 0) {
+            v = defOp->getOperand(0);
+            continue;
+        }
+        break;
+    }
+    return -1; // unable to resolve
+}
+
+// Trace from a FlowConfigOp's view value back through the SSA chain to find
+// the originating function argument index.
+static int traceFlowConfigToFuncArgIndex(dfscheblueprint::FlowConfigOp flowConfig) {
+    Value viewValue = flowConfig.getView();
+    if (!viewValue)
+        return -1;
+    return traceToFuncArgIndex(viewValue);
+}
 
 // Generic template function to look up any operation by symbol reference
 // This function searches for an operation of type OpTy with a matching symbol name
@@ -603,18 +664,15 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             bufferLen *= dim;
         }
 
-        // Shim BD len in int32-word units: the runtime multiplies len by
-        // sizeof(int32_t).  For sub-int32 element types each logical element
-        // occupies one full int32 in DDR, so convert element count to word count.
+        // Shim BD len in bytes: runtime passes len directly to
+        // XAie_DmaSetAddrLen, so compute the total byte count here.
         int64_t elementSizeBytesShim = 1;
         if (memrefType.getElementType().isIntOrFloat())
             elementSizeBytesShim = memrefType.getElementTypeBitWidth() / 8;
         if (elementSizeBytesShim == 0)
             elementSizeBytesShim = 1;
         StringRef transferType = op.getType();
-        int64_t shimBdLen = bufferLen * elementSizeBytesShim / sizeof(int32_t);
-        if (shimBdLen <= 0)
-            shimBdLen = bufferLen; // fallback for int32 and larger types
+        int64_t shimBdLen = bufferLen * elementSizeBytesShim;
         // Read data_id from shimFlowConfig (set by DmaphopTodfscheblueprintPass).
         // Propagate it to the ConfigDmaBdOp so ScheduleCanonicalizePass can group
         // all shim BDs for the same root tensor and merge them into one.
@@ -654,6 +712,11 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         auto shimBdIdConst =
             rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(shimBdIdVal));
 
+        // Read multi-dim addressing from FlowConfigOp (computed during
+        // dmaphop→dfscheblueprint lowering for shim output assembly).
+        auto shimDimStrides = shimFlowConfig.getShimDimStridesAttr();
+        auto shimDimWraps = shimFlowConfig.getShimDimWrapsAttr();
+
         auto shimBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
             loc, dfschedule::BdHandleType::get(rewriter.getContext()),
             ddrBuffer,                                  // DDR receive buffer
@@ -670,7 +733,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             rewriter.getI32IntegerAttr(0),              // release_lock_val
             rewriter.getI32IntegerAttr(dataId),         // data_id
             Value(),                                    // linked_bd = none
-            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+            /*dim_strides=*/shimDimStrides, /*dim_wraps=*/shimDimWraps);
 
         auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
             loc, dfschedule::IoHandleType::get(rewriter.getContext()),
@@ -700,6 +763,31 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         int64_t flowPingL1Offset = 0;
         int64_t flowPongL1Offset = 0;
         bool flowAddrsValid = false;
+
+        // Compute dirIdx (funcArgIndex-based) before the tile loop so it's
+        // available for both lock allocation and buffer naming.
+        // This ensures the host lock IDs match the kernel's window ordering.
+        bool isInput = shimIsSender;
+        int funcArgIdx = traceFlowConfigToFuncArgIndex(shimFlowConfig);
+        int dirIdx;
+        if (isInput) {
+            auto it = dataIdToInputIdx.find(dataId);
+            if (it != dataIdToInputIdx.end()) {
+                dirIdx = it->second;
+            } else {
+                dirIdx = (funcArgIdx >= 0) ? funcArgIdx : nextInputIdx;
+                dataIdToInputIdx[dataId] = dirIdx;
+                nextInputIdx = std::max(nextInputIdx, dirIdx + 1);
+            }
+        } else {
+            auto it = dataIdToOutputIdx.find(dataId);
+            if (it != dataIdToOutputIdx.end()) {
+                dirIdx = it->second;
+            } else {
+                dirIdx = nextOutputIdx++;
+                dataIdToOutputIdx[dataId] = dirIdx;
+            }
+        }
 
         // Collect tile config dictionaries for kernel_config
         SmallVector<Attribute> tileConfigDicts;
@@ -761,19 +849,22 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             // processes its own share of data.
             int64_t numIterations = (perCoreElements + pingPongBufferSize - 1) / pingPongBufferSize;
 
-            // Allocate lock pair from ResourceMgr for this core tile.
-            // Both XAie API and kernel intrinsics use the same lock ID
-            // namespace (0-15 for AIEML core tiles).
-            int acquireLockId = -1, releaseLockId = -1;
-            if (resourceMgr) {
-                resourceMgr->allocateTileLockPair(row, col, /*ownerId=*/flowIndex, acquireLockId, releaseLockId);
-            }
-            if (acquireLockId < 0 || releaseLockId < 0) {
-                llvm::errs() << "WARNING: lock allocation failed for tile (" << col << "," << row
-                             << "), falling back to formula\n";
-                int64_t lockBase = flowIndex * 8 + tileIndex * 2;
-                acquireLockId = lockBase + 0;
-                releaseLockId = lockBase + 1;
+            // Compute lock IDs from dirIdx to match the kernel's window ordering.
+            // The kernel allocates locks sequentially per sorted window:
+            //   input0 → lock 0/1, input1 → lock 2/3, output0 → lock 4/5, ...
+            // (kernel adds LOCK_BASE=48 offset internally).
+            // For outputs, offset by numInputs * 2 (we use nextInputIdx as
+            // an estimate of numInputs since inputs are processed first).
+            int acquireLockId, releaseLockId;
+            if (isInput) {
+                acquireLockId = dirIdx * 2;
+                releaseLockId = dirIdx * 2 + 1;
+            } else {
+                // Output locks start after all input locks.
+                // nextInputIdx tracks the highest input dirIdx+1 seen so far.
+                int outputLockBase = nextInputIdx * 2;
+                acquireLockId = outputLockBase + dirIdx * 2;
+                releaseLockId = outputLockBase + dirIdx * 2 + 1;
             }
 
             // Build config dictionary for this tile
@@ -865,29 +956,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                         int64_t pongL1Offset = (pingBufBytes + 3) & ~3;
                         if (!flowAddrsValid) {
                             // First tile: allocate addresses for this flow.
-                            // Use data_id to deduplicate row partitions: all flows
-                            // sharing the same source tensor (same data_id) must map
-                            // to the same kernel buffer so the single shared ELF
-                            // sees data at the expected addresses.
-                            bool isInput = shimIsSender;
-                            int dirIdx;
-                            if (isInput) {
-                                auto it = dataIdToInputIdx.find(dataId);
-                                if (it != dataIdToInputIdx.end()) {
-                                    dirIdx = it->second;
-                                } else {
-                                    dirIdx = nextInputIdx++;
-                                    dataIdToInputIdx[dataId] = dirIdx;
-                                }
-                            } else {
-                                auto it = dataIdToOutputIdx.find(dataId);
-                                if (it != dataIdToOutputIdx.end()) {
-                                    dirIdx = it->second;
-                                } else {
-                                    dirIdx = nextOutputIdx++;
-                                    dataIdToOutputIdx[dataId] = dirIdx;
-                                }
-                            }
+                            // dirIdx, isInput, and funcArgIdx are computed before
+                            // the tile loop to ensure consistent ordering.
+                            llvm::errs() << "[HostParamMapping] data_id=" << dataId << " funcArgIdx=" << funcArgIdx
+                                         << " isInput=" << isInput << " dirIdx=" << dirIdx << "\n";
                             std::string pingName, pongName;
                             if (isInput) {
                                 pingName = "buf_in_ping_" + std::to_string(dirIdx);
@@ -949,9 +1021,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             pongBdId = 1;
                         }
 
-                        // Core BD len: runtime multiplies len by sizeof(int32_t), so
-                        // convert from element count to int32-word count.
-                        int64_t coreBdLen = pingPongBufferSize * elementSizeBytes / sizeof(int32_t);
+                        // Core BD len in bytes: runtime passes len directly to
+                        // XAie_DmaSetAddrLen, so compute the total byte count here.
+                        int64_t coreBdLen = pingPongBufferSize * elementSizeBytes;
                         if (coreBdLen <= 0)
                             coreBdLen = 1;
 
@@ -975,7 +1047,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             loc, dfschedule::BdHandleType::get(rewriter.getContext()), pongL1.getBuffer(),
                             coreTileOp.getTile(), pongBdIdConst.getResult(),
                             rewriter.getI32IntegerAttr(0),               // offset
-                            rewriter.getI32IntegerAttr(coreBdLen),       // len (int32-word count)
+                            rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
                             rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
                             rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
                             rewriter.getI32IntegerAttr(pingBdId),        // next_bd -> ping
@@ -994,7 +1066,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             loc, dfschedule::BdHandleType::get(rewriter.getContext()), pingL1.getBuffer(),
                             coreTileOp.getTile(), pingBdIdConst.getResult(),
                             rewriter.getI32IntegerAttr(0),               // offset
-                            rewriter.getI32IntegerAttr(coreBdLen),       // len (int32-word count)
+                            rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
                             rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
                             rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
                             rewriter.getI32IntegerAttr(pongBdId),        // next_bd -> pong

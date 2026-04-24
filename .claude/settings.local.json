@@ -9,7 +9,11 @@
       "Grep",
       "WebSearch",
       "WebFetch",
-      "mcp__*"
+      "mcp__*",
+      "Skill(superpowers:brainstorming)",
+      "Skill(superpowers:systematic-debugging)",
+      "Skill(superpowers:executing-plans)",
+      "Skill(session-memory)"
     ],
     "deny": []
   },

@@ -179,6 +179,11 @@ public:
 
     virtual TileDmaLimits getDmaLimits(::TileType type) const = 0;
 
+    /// DMA word size in bytes (32-bit word = 4 bytes).
+    /// Single source of truth for the byte-to-word conversion factor
+    /// used when IR byte-unit strides are converted to HW word-unit strides.
+    virtual uint32_t getDmaWordBytes() const { return 4; }
+
     virtual std::string name() const = 0;
 };
 

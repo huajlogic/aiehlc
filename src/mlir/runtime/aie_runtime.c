@@ -5,6 +5,7 @@
 
 #include "aie_runtime.h"
 #include "aie_device_map.h"
+#include "aie_runtime_debug.h"
 #include "aie_runtime_stream_debug.h"
 #include "sleep.h"
 #include "xaiengine/xaie_helper.h"
@@ -61,7 +62,7 @@ typedef struct {
     uint8_t tile_type; /* XAIEGBL_TILE_TYPE_* value from XAie_GetTileTypefromLoc */
     void *buffer;      /* DDR pointer for shim tiles, NULL for core tiles */
     uint64_t dma_addr; /* physical addr programmed into the BD */
-    int32_t len;       /* length in int32_t elements */
+    int32_t len;       /* length in bytes */
     int32_t packet_id;
     int8_t direction;  /* -1=unknown, 0=DMA_S2MM, 1=DMA_MM2S (set by startio) */
     int8_t channel_id; /* -1=unknown (set by startio) */
@@ -225,7 +226,7 @@ void __Runtime_free(void *ptr) {
                    e->packet_id, (unsigned long)e->dma_addr, e->len);
             if (is_shim && e->buffer != NULL) {
                 int8_t *data = (int8_t *)e->buffer;
-                int byte_len = e->len * (int)sizeof(int32_t);
+                int byte_len = e->len;
                 printf("[aie_runtime]     shim_buf tile(%u,%u) [%s] dir=%s ch=%d @%p [0..%d] (int8):", (unsigned)e->col,
                        (unsigned)e->row, type_str, dir_label, (int)e->channel_id, e->buffer, byte_len - 1);
                 for (int j = 0; j < byte_len; j++)
@@ -252,9 +253,9 @@ void __Runtime_memcpy(void *dst, const void *src, size_t bytes) {
 }
 
 /* Kernel ELF embedded as binary blob by hostcompile.sh (ld -EL -r -b binary + redefine_symbols) */
-extern unsigned char _binary_kernel_dskernel_receiver_start[];
-extern unsigned char _binary_kernel_dskernel_receiver_end[];
-extern unsigned int _binary_kernel_dskernel_receiver_size;
+extern unsigned char _binary_kernel_computekernel_start[];
+extern unsigned char _binary_kernel_computekernel_end[];
+extern unsigned int _binary_kernel_computekernel_size;
 
 XAie_DevInst *getOrCreateDeviceInstance() {
     if (g_DevInst == NULL) {
@@ -335,8 +336,8 @@ AieRC __Runtime_device_teardown(void) {
 }
 
 /**
- * Configure DMA buffer descriptor
- * Maps to XAie DMA APIs
+ * Configure DMA buffer descriptor.
+ * @param len  Transfer length in bytes.
  */
 XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, uint64_t addr,
                                      int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
@@ -350,7 +351,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
      * Core tiles: buffer is a DMA-view byte address (core_proc_addr - 0x70000),
      *   produced by passblueprinttoschedule after CoreMemAllocator conversion. */
     uint64_t dma_addr = (uint64_t)(uintptr_t)buffer;
-    XAie_DmaSetAddrLen(&DmaInst, dma_addr, (uint32_t)(len * sizeof(int32_t)));
+    XAie_DmaSetAddrLen(&DmaInst, dma_addr, (uint32_t)len);
 
     if (acquire_lock_id >= 0 && release_lock_id >= 0) {
         XAie_DmaSetLock(&DmaInst, XAie_LockInit(acquire_lock_id, acquire_lock_val),
@@ -392,21 +393,26 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
         if (tile_type == XAIEGBL_TILE_TYPE_AIETILE) {
             printf("[aie_runtime] bd_config core(%u,%u) bd=%d dma_addr=0x%lx len=%d pkt_id=%d\n", (unsigned)tile.Col,
                    (unsigned)tile.Row, bd_id, (unsigned long)dma_addr, len, packet_id);
-            /* Write pattern col*100+row*10+bd_id to all len int32s at dma_addr.
+            /* Write pattern col*100+row*10+bd_id into the BD region at dma_addr.
+             * len is in bytes; convert to int32 count for the pattern array.
              * ping BD (buffer=0) writes at byte 0; pong BD (buffer=64) writes at byte 256.
-             * Covers the full BD transfer so shim sees 64 consistent values (RC-1 fix). */
+             * Covers the full BD transfer so shim sees consistent values (RC-1 fix). */
             int32_t dbg_pat[64];
             int32_t pat_val = (int32_t)(tile.Col * 100 + tile.Row * 10 + bd_id);
-            int32_t write_len = (len <= 64) ? len : 64;
-            for (int _i = 0; _i < write_len; _i++)
+            int32_t write_words = len / (int32_t)sizeof(int32_t);
+            if (write_words <= 0)
+                write_words = 1;
+            if (write_words > 64)
+                write_words = 64;
+            for (int _i = 0; _i < write_words; _i++)
                 dbg_pat[_i] = pat_val;
-            XAie_DataMemBlockWrite(dev, tile, (u32)dma_addr, dbg_pat, (u32)(write_len * sizeof(int32_t)));
+            XAie_DataMemBlockWrite(dev, tile, (u32)dma_addr, dbg_pat, (u32)(write_words * sizeof(int32_t)));
             /* Read back and print to verify */
             int32_t dbg_read[64];
-            XAie_DataMemBlockRead(dev, tile, (u32)dma_addr, dbg_read, (u32)(write_len * sizeof(int32_t)));
+            XAie_DataMemBlockRead(dev, tile, (u32)dma_addr, dbg_read, (u32)(write_words * sizeof(int32_t)));
             printf("[aie_runtime] core(%u,%u) bd=%d dma_addr=0x%lx pat=%d read:", (unsigned)tile.Col,
                    (unsigned)tile.Row, bd_id, (unsigned long)dma_addr, pat_val);
-            for (int _i = 0; _i < write_len; _i++)
+            for (int _i = 0; _i < write_words; _i++)
                 printf(" %d", dbg_read[_i]);
             printf("\n");
         } else {
@@ -422,6 +428,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
  * Configure DMA buffer descriptor with multi-dimensional addressing.
  * Uses XAie_DmaSetMultiDimAddr with stride/wrap descriptors to enable
  * DMA hardware transpose/reshape during data transfer.
+ * @param len  Transfer length in bytes.
  */
 XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
                                               uint64_t addr, int32_t len, int32_t next_bd, int32_t enable_packet,
@@ -436,20 +443,35 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
     uint8_t tile_type = XAie_GetTileTypefromLoc(dev, tile);
     uint64_t dma_addr = (uint64_t)(uintptr_t)buffer;
 
-    /* Build dimension descriptors from stride/wrap pairs */
-    XAie_DmaDimDesc dimDescs[4];
+    /* Build dimension descriptors — split address dims vs iteration */
     int32_t strides[4] = {dim_stride0, dim_stride1, dim_stride2, dim_stride3};
     int32_t wraps[4] = {dim_wrap0, dim_wrap1, dim_wrap2, dim_wrap3};
     if (num_dims > 4)
         num_dims = 4;
-    for (int i = 0; i < num_dims; i++) {
-        dimDescs[i].AieMlDimDesc.StepSize = (uint32_t)strides[i];
+
+    /* Address dimensions: first min(num_dims, 3) */
+    int addrDims = (num_dims <= 3) ? num_dims : 3;
+    XAie_DmaDimDesc dimDescs[3];
+    for (int i = 0; i < addrDims; i++) {
+        /* IR strides are in byte units; XAie expects 32-bit word units (÷4) */
+        if (strides[i] % 4 != 0) {
+            printf("[aie_runtime] ERROR: dim_stride[%d]=%d not divisible by 4 "
+                   "(must be 32-bit aligned)\n",
+                   i, strides[i]);
+        }
+        dimDescs[i].AieMlDimDesc.StepSize = (uint32_t)(strides[i] / 4);
         dimDescs[i].AieMlDimDesc.Wrap = (uint16_t)wraps[i];
     }
     XAie_DmaTensor tensor;
-    tensor.NumDim = (uint8_t)num_dims;
+    tensor.NumDim = (uint8_t)addrDims;
     tensor.Dim = dimDescs;
-    XAie_DmaSetMultiDimAddr(&DmaInst, &tensor, dma_addr, (uint32_t)(len * sizeof(int32_t)));
+    XAie_DmaSetMultiDimAddr(&DmaInst, &tensor, dma_addr, (uint32_t)len);
+
+    /* Iteration dimension: 4th dim if present */
+    if (num_dims == 4) {
+        XAie_DmaSetBdIteration(&DmaInst, strides[3], wraps[3], 0);
+        printf("[aie_runtime] bd_config_multidim: iteration stride=%d wrap=%d\n", strides[3], wraps[3]);
+    }
 
     if (acquire_lock_id >= 0 && release_lock_id >= 0) {
         XAie_DmaSetLock(&DmaInst, XAie_LockInit(acquire_lock_id, acquire_lock_val),
@@ -605,7 +627,7 @@ struct_kernel_group __Runtime_load_kernel_group_4t(XAie_LocType t0, XAie_LocType
                (unsigned)s_kernel_tiles[i].Row);
         XAie_CoreReset(g_DevInst, s_kernel_tiles[i]);
         XAie_CoreUnreset(g_DevInst, s_kernel_tiles[i]);
-        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_dskernel_receiver_start);
+        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_computekernel_start);
     }
 
     struct_kernel_group kg;
@@ -634,7 +656,7 @@ struct_kernel_group __Runtime_load_kernel_group_nt(XAie_LocType *tiles, int n) {
                (unsigned)s_kernel_tiles[i].Row);
         XAie_CoreReset(g_DevInst, s_kernel_tiles[i]);
         XAie_CoreUnreset(g_DevInst, s_kernel_tiles[i]);
-        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_dskernel_receiver_start);
+        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_computekernel_start);
     }
     struct_kernel_group kg;
     kg.tiles = s_kernel_tiles;
@@ -840,8 +862,31 @@ static void __Runtime_auto_teardown(void) {
     if (g_DevInst != NULL) {
         /* Kernel logs are already read in __Runtime_wait_event() right after
          * cores finish, so we don't duplicate the read here. */
-        if (g_runtime_debug_level >= 1)
+        if (g_runtime_debug_level >= 1) {
             AieRtSS_PrintRange(g_DevInst, 0, 3, 0, 5, /*print_all=*/0);
+            /* Dump raw BD registers for shim tiles used by BD tracking.
+             * Scans all 16 BDs with stride/wrap/iteration fields. */
+            {
+                uint8_t shim_cols[BD_TRACK_MAX];
+                int shim_col_count = 0;
+                for (int i = 0; i < g_bd_track_count; i++) {
+                    if (!__bd_is_shim(g_bd_track[i].tile_type))
+                        continue;
+                    /* Deduplicate: check if col already in list */
+                    int dup = 0;
+                    for (int j = 0; j < shim_col_count; j++) {
+                        if (shim_cols[j] == g_bd_track[i].col) {
+                            dup = 1;
+                            break;
+                        }
+                    }
+                    if (!dup)
+                        shim_cols[shim_col_count++] = g_bd_track[i].col;
+                }
+                for (int i = 0; i < shim_col_count; i++)
+                    AieRt_PrintShimBdRawAll(g_DevInst, shim_cols[i]);
+            }
+        }
     }
     __Runtime_free_all_allocs();
     if (g_DevInst != NULL) {

@@ -340,10 +340,51 @@ void AieRt_PrintBdInfo(XAie_DevInst *dev, XAie_LocType tile, uint8_t bd_id);
 
 /**
  * Print all configured BDs for a tile (bd_id 0 .. num_bds-1).
+ * Scans all BDs and only prints those with non-zero address or length.
  * @param dev   Device instance.
  * @param tile  Tile location.
  */
 void AieRt_PrintAllBds(XAie_DevInst *dev, XAie_LocType tile);
+
+/* --------------------------------------------------------------------------
+ * Raw BD register dump (shim tile)
+ *
+ * Reads all 16 BD slots by directly accessing DMA BD registers via
+ * XAie_Read32.  For each BD where word0 (Buffer_Length) is non-zero,
+ * prints all 8 words decoded:
+ *
+ * AIE2PS/AIEML Shim NOC tile BD register layout (xregdb):
+ *   Base offset: 0x1D000  (BD0), each BD is 8 words = 0x20 bytes apart
+ *   16 BDs total: BD0 @ 0x1D000 .. BD15 @ 0x1D1E0
+ *
+ *   Word 0 (BD_0): Buffer_Length [31:0]
+ *   Word 1 (BD_1): Base_Address_Low [31:0]
+ *   Word 2 (BD_2): Base_Address_High [15:0], Packet_ID [28:24],
+ *                   Packet_Type [22:20], Out_of_Order_BD_ID [5:0]
+ *   Word 3 (BD_3): D0_Stepsize [19:0], D0_Wrap [29:20]
+ *   Word 4 (BD_4): D1_Stepsize [19:0], D1_Wrap [29:20]
+ *   Word 5 (BD_5): D2_Stepsize [19:0], D2_Wrap [29:20]
+ *   Word 6 (BD_6): Iteration_Stepsize [19:0], Iteration_Wrap [25:20],
+ *                   Iteration_Current [31:26]
+ *   Word 7 (BD_7): Valid_BD [0], Next_BD [4:1], Use_Next_BD [5],
+ *                   Lock_Acq_Value [13:6], Lock_Acq_ID [17:14],
+ *                   Lock_Rel_Value [25:18], Lock_Rel_ID [29:26],
+ *                   Lock_Acq_Enable [30], Lock_Rel_Enable [31]
+ * -------------------------------------------------------------------------- */
+
+#define AIERT_SHIM_BD_BASE 0x0001D000u /* BD0 word0 offset in shim tile */
+#define AIERT_SHIM_BD_STRIDE 0x20u     /* 8 words * 4 bytes per BD */
+#define AIERT_SHIM_BD_COUNT 16u        /* 16 BDs per shim tile */
+#define AIERT_SHIM_BD_WORDS 8u         /* 8 x 32-bit words per BD */
+
+/**
+ * Dump all 16 raw BD registers for a shim tile.
+ * Only prints BDs where word0 (Buffer_Length) is non-zero.
+ * Decodes stride/wrap for D0-D2, iteration, lock, next BD, packet fields.
+ * @param dev  Device instance.
+ * @param col  Column of the shim tile (row=0).
+ */
+void AieRt_PrintShimBdRawAll(XAie_DevInst *dev, uint8_t col);
 
 /* --------------------------------------------------------------------------
  * DMA channel status functions

@@ -33,15 +33,16 @@ import socket
 import sys
 import webbrowser
 from pathlib import Path
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# Default log path (absolute)
+# Default log path (relative to this script's directory)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_LOG = Path(
-    "/scratch/staff/huaj/amdaiehlc/aiehlc/src/mlir/mlirfront/tilinglinalg/pass/data/streamswitch.log"
-)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_DEFAULT_LOG = _SCRIPT_DIR / "../../src/mlir/mlirfront/tilinglinalg/pass/data/streamswitch.json"
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -50,6 +51,22 @@ _DEFAULT_LOG = Path(
 DIRECTIONS = {"NORTH", "SOUTH", "EAST", "WEST"}
 DIRECTION_DELTA = {"NORTH": (0, 1), "SOUTH": (0, -1), "EAST": (1, 0), "WEST": (-1, 0)}
 DIRECTION_OPPOSITE = {"NORTH": "SOUTH", "SOUTH": "NORTH", "EAST": "WEST", "WEST": "EAST"}
+
+
+@dataclass
+class StreamFlow:
+    """One logical stream originating from a shim tile SOUTH slave port."""
+    flow_id: int
+    shim_col: int
+    shim_row: int
+    shim_slave_port: str          # e.g. "SOUTH3"
+    arrow_indices: List[int] = field(default_factory=list)
+    port_keys: List[Tuple[int, int, str]] = field(default_factory=list)  # (col, row, port_name)
+    tile_locs: List[Tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return f"({self.shim_col},{self.shim_row}) {self.shim_slave_port}"
 
 
 def _dir_of(port_name: str) -> Optional[str]:
@@ -78,7 +95,8 @@ def parse_log(text: str) -> List[dict]:
     # Try direct array parse first
     if text.startswith("["):
         try:
-            return json.loads(text)
+            items = json.loads(text)
+            return [t for t in items if "tile" in t]
         except json.JSONDecodeError:
             pass
 
@@ -116,13 +134,19 @@ def _port_num(port_name: str) -> int:
 
 def build_cross_tile_arrows(tiles: List[dict]) -> List[dict]:
     """For each enabled master port pointing in a cardinal direction, emit an arrow
-    to the neighbouring tile.  The arrow carries switch_type, pkt_id (if PKT),
-    and drop_header metadata for rendering."""
+    to the nearest tile in that direction present in the log.  Scans past gaps
+    (e.g. shim row 0 → core row 2 when no mem-tile at row 1 is logged)."""
     arrows = []
     tile_set = {
         (t["tile"]["col"], t["tile"]["row"])
         for t in tiles
     }
+    if not tiles:
+        return arrows
+    all_cols = [t["tile"]["col"] for t in tiles]
+    all_rows = [t["tile"]["row"] for t in tiles]
+    max_span = max(max(all_cols) - min(all_cols),
+                   max(all_rows) - min(all_rows), 1)
     for tile in tiles:
         col = tile["tile"]["col"]
         row = tile["tile"]["row"]
@@ -134,12 +158,33 @@ def build_cross_tile_arrows(tiles: List[dict]) -> List[dict]:
             if d is None:
                 continue
             dc, dr = DIRECTION_DELTA[d]
-            nb = (col + dc, row + dr)
-            # Only draw if neighbour tile is in the log
-            if nb not in tile_set:
-                continue
+            # Scan in the direction to find the nearest tile in the log
+            nb = None
+            for step in range(1, max_span + 1):
+                candidate = (col + dc * step, row + dr * step)
+                if candidate in tile_set:
+                    nb = candidate
+                    break
             opp_dir = DIRECTION_OPPOSITE[d]
             port_num = _port_num(port)
+            if nb is None:
+                # Dangling: destination tile not in log — emit a stub arrow
+                arrow = {
+                    "from_tile": [col, row],
+                    "to_tile": [col + dc, row + dr],  # virtual 1-step neighbor
+                    "from_dir": d,
+                    "to_dir": opp_dir,
+                    "port": port_num,
+                    "port_name": port,
+                    "slave_port_name": f"{opp_dir}{port_num}",
+                    "switch_type": master.get("switch_type", "CIRC"),
+                    "drop_header": master.get("drop_header", False),
+                    "drop_header_note": master.get("drop_header_note", ""),
+                    "pkt_id": None,
+                    "dangling": True,
+                }
+                arrows.append(arrow)
+                continue
             arrow = {
                 "from_tile": [col, row],
                 "to_tile": list(nb),
@@ -151,10 +196,128 @@ def build_cross_tile_arrows(tiles: List[dict]) -> List[dict]:
                 "switch_type": master.get("switch_type", "CIRC"),
                 "drop_header": master.get("drop_header", False),
                 "drop_header_note": master.get("drop_header_note", ""),
-                "pkt_id": None,  # will be resolved below if PKT
+                "pkt_id": None,
+                "dangling": False,
             }
             arrows.append(arrow)
     return arrows
+
+
+# ---------------------------------------------------------------------------
+# BFS flow tracing from shim SOUTH slave ports
+# ---------------------------------------------------------------------------
+
+def trace_shim_flows(tiles: List[dict], arrows: List[dict]) -> List[StreamFlow]:
+    """Trace stream flows from each shim tile's SOUTH slave port through the array.
+
+    Uses the master port `config` hex field to determine which slave index feeds
+    each master.  BFS follows: slave → masters reading that slave → cross-tile
+    arrow → next tile's slave → repeat.
+    """
+    if not tiles or not arrows:
+        return []
+
+    # ---- lookup tables ----
+    tile_by_loc: Dict[Tuple[int, int], dict] = {}
+    for t in tiles:
+        tile_by_loc[(t["tile"]["col"], t["tile"]["row"])] = t
+
+    # Per-tile: slave index → slave port dict
+    slave_by_idx: Dict[Tuple[int, int], Dict[int, dict]] = defaultdict(dict)
+    # Per-tile: slave index → port name
+    slave_idx_to_port: Dict[Tuple[int, int], Dict[int, str]] = defaultdict(dict)
+    # Per-tile: slave index → list of master port dicts that read from it
+    master_by_slave_idx: Dict[Tuple[int, int], Dict[int, list]] = defaultdict(lambda: defaultdict(list))
+
+    for t in tiles:
+        loc = (t["tile"]["col"], t["tile"]["row"])
+        for s in t.get("slaves", []):
+            idx = s.get("index")
+            if idx is not None:
+                slave_by_idx[loc][idx] = s
+                slave_idx_to_port[loc][idx] = s.get("port", f"slave{idx}")
+        for m in t.get("masters", []):
+            if not m.get("enabled"):
+                continue
+            cfg = m.get("config")
+            if cfg is None:
+                continue
+            try:
+                src_slave_idx = int(cfg, 16)
+            except (ValueError, TypeError):
+                continue
+            master_by_slave_idx[loc][src_slave_idx].append(m)
+
+    # ---- arrow lookup: (from_col, from_row, master_port_name) → arrow index ----
+    arrow_idx_by_from: Dict[Tuple[int, int, str], int] = {}
+    for i, ar in enumerate(arrows):
+        key = (ar["from_tile"][0], ar["from_tile"][1], ar["port_name"])
+        arrow_idx_by_from[key] = i
+
+    # ---- BFS from each shim SOUTH slave ----
+    flows: List[StreamFlow] = []
+    flow_id = 0
+
+    for t in tiles:
+        col, row = t["tile"]["col"], t["tile"]["row"]
+        if row != 0:
+            continue
+        for s in t.get("slaves", []):
+            if not s.get("enabled"):
+                continue
+            port = s.get("port", "")
+            if not port.startswith("SOUTH"):
+                continue
+            slave_idx = s.get("index")
+            if slave_idx is None:
+                continue
+
+            sf = StreamFlow(
+                flow_id=flow_id,
+                shim_col=col, shim_row=row,
+                shim_slave_port=port,
+            )
+            sf.port_keys.append((col, row, port))
+            sf.tile_locs.append((col, row))
+
+            # BFS queue: (tile_col, tile_row, slave_index)
+            queue = [(col, row, slave_idx)]
+            visited = set()
+
+            while queue:
+                tc, tr, si = queue.pop(0)
+                if (tc, tr, si) in visited:
+                    continue
+                visited.add((tc, tr, si))
+
+                # Find all masters in this tile that read from slave index si
+                for mast in master_by_slave_idx[(tc, tr)].get(si, []):
+                    mport = mast.get("port", "")
+                    sf.port_keys.append((tc, tr, mport))
+
+                    # Find cross-tile arrow for this master
+                    ai = arrow_idx_by_from.get((tc, tr, mport))
+                    if ai is not None:
+                        sf.arrow_indices.append(ai)
+                        ar = arrows[ai]
+                        if not ar.get("dangling"):
+                            nb = (ar["to_tile"][0], ar["to_tile"][1])
+                            if nb not in [l for l in sf.tile_locs]:
+                                sf.tile_locs.append(nb)
+                            # Find the slave port in the destination tile
+                            slave_port_name = ar["slave_port_name"]
+                            sf.port_keys.append((nb[0], nb[1], slave_port_name))
+                            # Look up slave index in destination tile
+                            dest_slaves = slave_by_idx.get(nb, {})
+                            for ds_idx, ds in dest_slaves.items():
+                                if ds.get("port") == slave_port_name:
+                                    queue.append((nb[0], nb[1], ds_idx))
+                                    break
+
+            flows.append(sf)
+            flow_id += 1
+
+    return flows
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +361,7 @@ def _esc(s: str) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
-def _render_master(m: dict, col: int, row: int) -> str:
+def _render_master(m: dict, col: int, row: int, flow_ids: Optional[List[int]] = None) -> str:
     sw = m.get("switch_type", "CIRC")
     enabled = m.get("enabled", False)
     pkt = m.get("packet_switch", False)
@@ -216,9 +379,13 @@ def _render_master(m: dict, col: int, row: int) -> str:
         else:
             drop_badge = '<span class="badge badge-keep" title="Preserves header for downstream slave">KEEP_HDR</span>'
 
+    flow_attr = ""
+    if flow_ids:
+        flow_attr = f' data-flows="{",".join(str(f) for f in flow_ids)}"'
+
     tooltip = _esc(note) if note else _esc(f"port={port} type={sw}")
     return (
-        f'<div id="{elem_id}" class="port-row" style="{style};opacity:{opacity}" title="{tooltip}">'
+        f'<div id="{elem_id}" class="port-row" style="{style};opacity:{opacity}" title="{tooltip}"{flow_attr}>'
         f'<span class="port-name">{_esc(port)}</span>'
         f'<span class="type-badge">{_esc(sw)}</span>'
         f'{drop_badge}'
@@ -241,7 +408,7 @@ def _render_slot(slot: dict) -> str:
     )
 
 
-def _render_slave(s: dict, col: int, row: int) -> str:
+def _render_slave(s: dict, col: int, row: int, flow_ids: Optional[List[int]] = None) -> str:
     sw = s.get("switch_type", "CIRC")
     enabled = s.get("enabled", False)
     port = s.get("port", "?")
@@ -253,8 +420,12 @@ def _render_slave(s: dict, col: int, row: int) -> str:
     if active_slots:
         slots_html = "".join(_render_slot(sl) for sl in active_slots)
 
+    flow_attr = ""
+    if flow_ids:
+        flow_attr = f' data-flows="{",".join(str(f) for f in flow_ids)}"'
+
     return (
-        f'<div id="{elem_id}" class="port-row slave-row" style="{style};opacity:{opacity}">'
+        f'<div id="{elem_id}" class="port-row slave-row" style="{style};opacity:{opacity}"{flow_attr}>'
         f'<span class="port-name">{_esc(port)}</span>'
         f'<span class="type-badge">{_esc(sw)}</span>'
         f'{slots_html}'
@@ -262,7 +433,8 @@ def _render_slave(s: dict, col: int, row: int) -> str:
     )
 
 
-def _render_tile_card(tile: dict, min_col: int, max_row: int) -> str:
+def _render_tile_card(tile: dict, min_col: int, max_row: int,
+                      port_flow_map: Optional[Dict] = None) -> str:
     col = tile["tile"]["col"]
     row = tile["tile"]["row"]
     tile_type = tile["tile"]["type"]
@@ -271,6 +443,7 @@ def _render_tile_card(tile: dict, min_col: int, max_row: int) -> str:
     gr = max_row - row + 1
 
     type_cls = tile_type.lower()
+    pfm = port_flow_map or {}
 
     masters = tile.get("masters", [])
     slaves  = tile.get("slaves", [])
@@ -281,7 +454,10 @@ def _render_tile_card(tile: dict, min_col: int, max_row: int) -> str:
 
     masters_html = ""
     if active_masters:
-        rows = "".join(_render_master(m, col, row) for m in active_masters)
+        rows = "".join(
+            _render_master(m, col, row, pfm.get((col, row, m.get("port", "?"))))
+            for m in active_masters
+        )
         masters_html = (
             f'<div class="section-hdr" onclick="toggleSection(this)">&#x25BC; Masters ({len(active_masters)})</div>'
             f'<div class="section-body expanded">{rows}</div>'
@@ -289,7 +465,10 @@ def _render_tile_card(tile: dict, min_col: int, max_row: int) -> str:
 
     slaves_html = ""
     if active_slaves:
-        rows = "".join(_render_slave(s, col, row) for s in active_slaves)
+        rows = "".join(
+            _render_slave(s, col, row, pfm.get((col, row, s.get("port", "?"))))
+            for s in active_slaves
+        )
         slaves_html = (
             f'<div class="section-hdr slave-hdr" onclick="toggleSection(this)">&#x25BC; Slaves ({len(active_slaves)})</div>'
             f'<div class="section-body expanded">{rows}</div>'
@@ -310,10 +489,13 @@ def _render_tile_card(tile: dict, min_col: int, max_row: int) -> str:
 # Full HTML page
 # ---------------------------------------------------------------------------
 
-def render_html(tiles: List[dict], arrows: List[dict], output_path: str) -> str:
+def render_html(tiles: List[dict], arrows: List[dict], output_path: str,
+                flows: Optional[List[StreamFlow]] = None) -> str:
     if not tiles:
         print("No tiles to render.", file=sys.stderr)
         return output_path
+
+    flows = flows or []
 
     all_cols = sorted({t["tile"]["col"] for t in tiles})
     all_rows = sorted({t["tile"]["row"] for t in tiles}, reverse=True)
@@ -322,13 +504,67 @@ def render_html(tiles: List[dict], arrows: List[dict], output_path: str) -> str:
     ncols = len(all_cols)
     nrows = len(all_rows)
 
+    # Build port → flow_ids map for HTML data attributes
+    port_flow_map: Dict[Tuple[int, int, str], List[int]] = defaultdict(list)
+    for sf in flows:
+        for pk in sf.port_keys:
+            if sf.flow_id not in port_flow_map[pk]:
+                port_flow_map[pk].append(sf.flow_id)
+
     tile_cards = "".join(
-        _render_tile_card(t, min_col, max_row) for t in sorted(
+        _render_tile_card(t, min_col, max_row, port_flow_map) for t in sorted(
             tiles, key=lambda t: (-t["tile"]["row"], t["tile"]["col"])
         )
     )
 
+    # Build flow filter panel HTML
+    flow_panel_html = ""
+    if flows:
+        # Group flows by shim column
+        shim_groups: Dict[int, List[StreamFlow]] = defaultdict(list)
+        for sf in flows:
+            shim_groups[sf.shim_col].append(sf)
+
+        panel_rows = ""
+        for col in sorted(shim_groups.keys()):
+            grp = shim_groups[col]
+            checkboxes = ""
+            for sf in grp:
+                n_arrows = len(sf.arrow_indices)
+                n_tiles = len(sf.tile_locs)
+                checkboxes += (
+                    f'<label class="flow-toggle">'
+                    f'<input type="checkbox" checked data-flow-id="{sf.flow_id}" onchange="toggleFlow({sf.flow_id}, this.checked)">'
+                    f' {_esc(sf.shim_slave_port)}'
+                    f'<span class="flow-stat">{n_arrows} arrows, {n_tiles} tiles</span>'
+                    f'</label>'
+                )
+            panel_rows += (
+                f'<div class="flow-group">'
+                f'<div class="flow-group-hdr">Shim Col {col}</div>'
+                f'{checkboxes}'
+                f'</div>'
+            )
+
+        flow_panel_html = (
+            f'<div class="flow-filter-panel" id="flow-panel">'
+            f'<div class="flow-panel-hdr" onclick="toggleFlowPanel()">'
+            f'&#x25BC; Stream Flow Filter ({len(flows)} flows)</div>'
+            f'<div class="flow-panel-body" id="flow-panel-body">'
+            f'<div class="flow-panel-controls">'
+            f'<button onclick="showAllFlows()">Show All</button>'
+            f'<button onclick="hideAllFlows()">Hide All</button>'
+            f'</div>'
+            f'{panel_rows}'
+            f'</div></div>'
+        )
+
     arrows_json = json.dumps(arrows)
+    flows_json = json.dumps([
+        {"flow_id": sf.flow_id, "arrow_indices": sf.arrow_indices,
+         "label": sf.label}
+        for sf in flows
+    ])
 
     html = f"""\
 <!DOCTYPE html>
@@ -450,6 +686,40 @@ svg.overlay {{
     pointer-events:none; z-index:100; white-space:nowrap;
     display:none; font-family:monospace;
 }}
+
+/* ---- flow filter panel ---- */
+.flow-filter-panel {{
+    max-width:600px; margin:0 auto 14px; border:1px solid #bbb;
+    border-radius:8px; background:#fff; font-size:12px;
+}}
+.flow-panel-hdr {{
+    font-weight:700; padding:6px 12px; cursor:pointer;
+    user-select:none; border-bottom:1px solid #eee;
+}}
+.flow-panel-hdr:hover {{ color:#1976d2; }}
+.flow-panel-body {{ padding:6px 12px; }}
+.flow-panel-body.collapsed {{ display:none; }}
+.flow-panel-controls {{
+    display:flex; gap:6px; margin-bottom:6px;
+}}
+.flow-panel-controls button {{
+    padding:3px 10px; border:1px solid #bbb; border-radius:4px;
+    background:#fff; cursor:pointer; font-size:11px; font-weight:600;
+}}
+.flow-panel-controls button:hover {{ background:#e3f2fd; }}
+.flow-group {{ margin-bottom:6px; }}
+.flow-group-hdr {{
+    font-weight:700; font-size:11px; color:#555; margin-bottom:2px;
+}}
+.flow-toggle {{
+    display:flex; align-items:center; gap:4px; padding:1px 0;
+    cursor:pointer; font-family:monospace; font-size:11px;
+}}
+.flow-toggle input {{ cursor:pointer; }}
+.flow-stat {{
+    font-size:9px; color:#888; margin-left:4px;
+}}
+.port-row.flow-dimmed {{ opacity:0.15 !important; }}
 </style>
 </head>
 <body>
@@ -461,6 +731,8 @@ svg.overlay {{
     <button onclick="collapseAll()">Collapse All</button>
     <button id="btn-arrows" class="active" onclick="toggleArrows(this)">Stream Arrows</button>
 </div>
+
+{flow_panel_html}
 
 <div class="legend">
     <div class="legend-item">
@@ -490,6 +762,9 @@ svg.overlay {{
     <div class="legend-item">
         <div class="legend-swatch" style="background:#c8e6c9;border-color:#2e7d32"></div> SHIM tile
     </div>
+    <div class="legend-item">
+        <div class="legend-swatch" style="background:#FFF3E0;border-color:#E65100"></div> dangling (target not in log)
+    </div>
 </div>
 
 <div class="grid-outer">
@@ -516,7 +791,65 @@ svg.overlay {{
 
 <script>
 const ARROWS = {arrows_json};
+const FLOWS = {flows_json};
 let arrowsVisible = true;
+
+/* ---- build arrow→flow_ids lookup ---- */
+const arrowFlowIds = {{}};
+FLOWS.forEach(f => {{
+    f.arrow_indices.forEach(ai => {{
+        if (!arrowFlowIds[ai]) arrowFlowIds[ai] = [];
+        if (!arrowFlowIds[ai].includes(f.flow_id)) arrowFlowIds[ai].push(f.flow_id);
+    }});
+}});
+
+/* ---- flow filter state ---- */
+const hiddenFlows = new Set();
+
+function toggleFlow(flowId, checked) {{
+    if (checked) {{
+        hiddenFlows.delete(flowId);
+    }} else {{
+        hiddenFlows.add(flowId);
+    }}
+    applyFlowVisibility();
+    drawArrows();
+}}
+
+function showAllFlows() {{
+    hiddenFlows.clear();
+    document.querySelectorAll('#flow-panel input[data-flow-id]').forEach(cb => {{ cb.checked = true; }});
+    applyFlowVisibility();
+    drawArrows();
+}}
+
+function hideAllFlows() {{
+    FLOWS.forEach(f => hiddenFlows.add(f.flow_id));
+    document.querySelectorAll('#flow-panel input[data-flow-id]').forEach(cb => {{ cb.checked = false; }});
+    applyFlowVisibility();
+    drawArrows();
+}}
+
+function toggleFlowPanel() {{
+    const body = document.getElementById('flow-panel-body');
+    const hdr = body.previousElementSibling;
+    if (body.classList.contains('collapsed')) {{
+        body.classList.remove('collapsed');
+        hdr.innerHTML = hdr.innerHTML.replace('\\u25B6','\\u25BC');
+    }} else {{
+        body.classList.add('collapsed');
+        hdr.innerHTML = hdr.innerHTML.replace('\\u25BC','\\u25B6');
+    }}
+}}
+
+function applyFlowVisibility() {{
+    /* dim/undim port rows based on hidden flows */
+    document.querySelectorAll('.port-row[data-flows]').forEach(el => {{
+        const ids = el.dataset.flows.split(',').map(Number);
+        const allHidden = ids.length > 0 && ids.every(id => hiddenFlows.has(id));
+        el.classList.toggle('flow-dimmed', allHidden);
+    }});
+}}
 
 /* ---- section toggle ---- */
 function toggleSection(hdr) {{
@@ -554,7 +887,7 @@ function toggleArrows(btn) {{
     document.getElementById('routing-svg').style.display = arrowsVisible ? '' : 'none';
 }}
 
-/* ---- arrow drawing ---- */
+/* ---- arrow drawing (curved paths to avoid overlap) ---- */
 function drawArrows() {{
     const svg     = document.getElementById('routing-svg');
     const wrapper = document.querySelector('.grid-wrapper');
@@ -566,7 +899,6 @@ function drawArrows() {{
 
     [...svg.querySelectorAll('.data-arrow')].forEach(el => el.remove());
 
-    // Build tile-card element map for fallback positioning
     const tileEls = {{}};
     document.querySelectorAll('.tile-card').forEach(card => {{
         tileEls[card.dataset.col + ',' + card.dataset.row] = card;
@@ -575,26 +907,68 @@ function drawArrows() {{
     const tip   = document.getElementById('arrow-tip');
     const dedup = new Set();
 
-    ARROWS.forEach(arrow => {{
+    /* --- first pass: collect unique arrows, group by tile pair --- */
+    const items      = [];
+    const pairGroups = {{}};
+
+    ARROWS.forEach((arrow, origIdx) => {{
         const fromKey = arrow.from_tile[0] + ',' + arrow.from_tile[1];
         const toKey   = arrow.to_tile[0]   + ',' + arrow.to_tile[1];
-
-        const deKey = `${{fromKey}}-${{toKey}}-${{arrow.port_name}}-${{arrow.switch_type}}`;
+        const deKey   = `${{fromKey}}-${{toKey}}-${{arrow.port_name}}-${{arrow.switch_type}}`;
         if (dedup.has(deKey)) return;
         dedup.add(deKey);
 
-        // Try exact port-element lookup first
+        /* skip arrows whose every flow is hidden */
+        const fids = arrowFlowIds[origIdx] || [];
+        if (fids.length > 0 && fids.every(id => hiddenFlows.has(id))) return;
+
+        const pairKey = fromKey < toKey ? `${{fromKey}}|${{toKey}}` : `${{toKey}}|${{fromKey}}`;
+        if (!pairGroups[pairKey]) pairGroups[pairKey] = [];
+        const idx = pairGroups[pairKey].length;
+        pairGroups[pairKey].push(arrow);
+        items.push({{ arrow, pairKey, idx, origIdx }});
+    }});
+
+    /* --- second pass: draw curved paths --- */
+    const STUB_LEN = 40;   /* px length of dangling stub arrows */
+
+    items.forEach(({{ arrow, pairKey, idx, origIdx }}) => {{
+        const fromKey = arrow.from_tile[0] + ',' + arrow.from_tile[1];
+        const toKey   = arrow.to_tile[0]   + ',' + arrow.to_tile[1];
+        const isDangling = !!arrow.dangling;
+
         const fromPortId = `mport-${{arrow.from_tile[0]}}-${{arrow.from_tile[1]}}-${{arrow.port_name}}`;
         const toPortId   = `sport-${{arrow.to_tile[0]}}-${{arrow.to_tile[1]}}-${{arrow.slave_port_name}}`;
         const fromPortEl = document.getElementById(fromPortId);
         const toPortEl   = document.getElementById(toPortId);
 
         let x1, y1, x2, y2;
-        const portLevelConnect = fromPortEl && toPortEl;
+        const portLevelConnect = !isDangling && fromPortEl && toPortEl;
 
-        if (portLevelConnect) {{
-            // Port-to-port: connect right edge midpoint of master row
-            // to left edge midpoint of slave row (or top/bottom for N/S)
+        if (isDangling) {{
+            /* Dangling: destination tile not in log — draw a short stub from tile edge */
+            const fromEl = tileEls[fromKey];
+            if (!fromEl) return;
+            const fR = fromEl.getBoundingClientRect();
+            switch (arrow.from_dir) {{
+                case 'NORTH':
+                    x1 = fR.left + fR.width/2 - wRect.left; y1 = fR.top    - wRect.top;
+                    x2 = x1;                                  y2 = y1 - STUB_LEN;
+                    break;
+                case 'SOUTH':
+                    x1 = fR.left + fR.width/2 - wRect.left; y1 = fR.bottom - wRect.top;
+                    x2 = x1;                                  y2 = y1 + STUB_LEN;
+                    break;
+                case 'EAST':
+                    x1 = fR.right - wRect.left; y1 = fR.top + fR.height/2 - wRect.top;
+                    x2 = x1 + STUB_LEN;         y2 = y1;
+                    break;
+                case 'WEST':
+                    x1 = fR.left - wRect.left;  y1 = fR.top + fR.height/2 - wRect.top;
+                    x2 = x1 - STUB_LEN;          y2 = y1;
+                    break;
+            }}
+        }} else if (portLevelConnect) {{
             const fPR = fromPortEl.getBoundingClientRect();
             const tPR = toPortEl.getBoundingClientRect();
             const d   = arrow.from_dir;
@@ -614,75 +988,97 @@ function drawArrows() {{
                 y1 = fPR.top    - wRect.top;
                 x2 = tPR.left + tPR.width / 2 - wRect.left;
                 y2 = tPR.bottom - wRect.top;
-            }} else {{ // SOUTH
+            }} else {{
                 x1 = fPR.left + fPR.width / 2 - wRect.left;
                 y1 = fPR.bottom - wRect.top;
                 x2 = tPR.left + tPR.width / 2 - wRect.left;
                 y2 = tPR.top    - wRect.top;
             }}
         }} else {{
-            // Fallback: tile-edge midpoint (slave port not rendered / not active)
             const fromEl = tileEls[fromKey];
             const toEl   = tileEls[toKey];
             if (!fromEl || !toEl) return;
 
-            const fR  = fromEl.getBoundingClientRect();
-            const tR  = toEl.getBoundingClientRect();
-            const off = (arrow.port - 0.5) * 14;
+            const fR = fromEl.getBoundingClientRect();
+            const tR = toEl.getBoundingClientRect();
 
             switch (arrow.from_dir) {{
                 case 'NORTH':
-                    x1 = fR.left + fR.width/2 + off - wRect.left; y1 = fR.top    - wRect.top;
-                    x2 = tR.left + tR.width/2 + off - wRect.left; y2 = tR.bottom - wRect.top;
+                    x1 = fR.left + fR.width/2 - wRect.left; y1 = fR.top    - wRect.top;
+                    x2 = tR.left + tR.width/2 - wRect.left; y2 = tR.bottom - wRect.top;
                     break;
                 case 'SOUTH':
-                    x1 = fR.left + fR.width/2 + off - wRect.left; y1 = fR.bottom - wRect.top;
-                    x2 = tR.left + tR.width/2 + off - wRect.left; y2 = tR.top    - wRect.top;
+                    x1 = fR.left + fR.width/2 - wRect.left; y1 = fR.bottom - wRect.top;
+                    x2 = tR.left + tR.width/2 - wRect.left; y2 = tR.top    - wRect.top;
                     break;
                 case 'EAST':
-                    x1 = fR.right - wRect.left; y1 = fR.top + fR.height/2 + off - wRect.top;
-                    x2 = tR.left  - wRect.left; y2 = tR.top + tR.height/2 + off - wRect.top;
+                    x1 = fR.right - wRect.left; y1 = fR.top + fR.height/2 - wRect.top;
+                    x2 = tR.left  - wRect.left; y2 = tR.top + tR.height/2 - wRect.top;
                     break;
                 case 'WEST':
-                    x1 = fR.left  - wRect.left; y1 = fR.top + fR.height/2 + off - wRect.top;
-                    x2 = tR.right - wRect.left; y2 = tR.top + tR.height/2 + off - wRect.top;
+                    x1 = fR.left  - wRect.left; y1 = fR.top + fR.height/2 - wRect.top;
+                    x2 = tR.right - wRect.left; y2 = tR.top + tR.height/2 - wRect.top;
                     break;
             }}
         }}
 
-        const sw       = arrow.switch_type;
-        const color    = sw === 'PKT' ? '#7B1FA2' : sw === 'CIRC' ? '#1565C0' : '#9E9E9E';
-        const markerId = sw === 'PKT' ? 'arr-pkt'  : sw === 'CIRC' ? 'arr-circ' : 'arr-ctrl';
-        const dashArr  = sw === 'PKT' ? '6,3' : 'none';
+        /* --- curve offset: perpendicular displacement to separate overlapping arrows --- */
+        const total  = pairGroups[pairKey].length;
+        const spread = (idx - (total - 1) / 2) * 30;
+        const dx  = x2 - x1;
+        const dy  = y2 - y1;
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
+        const px  = -dy / len;   /* perpendicular unit vector */
+        const py  =  dx / len;
 
-        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-        line.classList.add('data-arrow');
-        line.setAttribute('x1', x1); line.setAttribute('y1', y1);
-        line.setAttribute('x2', x2); line.setAttribute('y2', y2);
-        line.setAttribute('stroke', color);
-        line.setAttribute('stroke-width', sw === 'CIRC' ? '2.5' : '2');
-        if (dashArr !== 'none') line.setAttribute('stroke-dasharray', dashArr);
-        line.setAttribute('marker-end', `url(#${{markerId}})`);
-        line.style.pointerEvents = 'stroke';
-        line.style.cursor = 'pointer';
+        const mx = (x1 + x2) / 2 + px * spread;
+        const my = (y1 + y2) / 2 + py * spread;
+
+        const pathD = (total === 1 && spread === 0)
+            ? `M ${{x1}} ${{y1}} L ${{x2}} ${{y2}}`
+            : `M ${{x1}} ${{y1}} Q ${{mx}} ${{my}} ${{x2}} ${{y2}}`;
+
+        const sw       = arrow.switch_type;
+        const color    = isDangling ? '#E65100'
+                       : sw === 'PKT' ? '#7B1FA2' : sw === 'CIRC' ? '#1565C0' : '#9E9E9E';
+        const markerId = sw === 'PKT' ? 'arr-pkt'  : sw === 'CIRC' ? 'arr-circ' : 'arr-ctrl';
+        const dashArr  = isDangling ? '4,4' : (sw === 'PKT' ? '6,3' : 'none');
+
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.classList.add('data-arrow');
+        path.setAttribute('d', pathD);
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke', color);
+        path.setAttribute('stroke-width', isDangling ? '2' : (sw === 'CIRC' ? '2.5' : '2'));
+        if (dashArr !== 'none') path.setAttribute('stroke-dasharray', dashArr);
+        path.setAttribute('marker-end', `url(#${{markerId}})`);
+        const pathFlowIds = arrowFlowIds[origIdx] || [];
+        if (pathFlowIds.length) path.setAttribute('data-flows', pathFlowIds.join(','));
+        path.style.pointerEvents = 'stroke';
+        path.style.cursor = 'pointer';
 
         const drop    = arrow.drop_header ? 'DROP_HEADER' : (sw === 'PKT' ? 'KEEP_HEADER' : '');
-        const portTgt = portLevelConnect
-            ? `${{arrow.port_name}} → ${{arrow.slave_port_name}}`
-            : `${{arrow.port_name}} → (tile edge fallback)`;
-        const tipText = `(${{fromKey}}) ${{portTgt}} (${{toKey}}) [${{sw}}${{drop ? ' ' + drop : ''}}]${{arrow.drop_header_note ? ': ' + arrow.drop_header_note : ''}}`;
+        let tipText;
+        if (isDangling) {{
+            tipText = `(${{fromKey}}) ${{arrow.port_name}} \u2192 ${{arrow.from_dir}} [DANGLING: target tile not in log] [${{sw}}]`;
+        }} else {{
+            const portTgt = portLevelConnect
+                ? `${{arrow.port_name}} \u2192 ${{arrow.slave_port_name}}`
+                : `${{arrow.port_name}} \u2192 (tile edge fallback)`;
+            tipText = `(${{fromKey}}) ${{portTgt}} (${{toKey}}) [${{sw}}${{drop ? ' ' + drop : ''}}]${{arrow.drop_header_note ? ': ' + arrow.drop_header_note : ''}}`;
+        }}
 
-        line.addEventListener('mouseenter', () => {{
+        path.addEventListener('mouseenter', () => {{
             tip.textContent = tipText;
             tip.style.display = 'block';
         }});
-        line.addEventListener('mousemove', e => {{
+        path.addEventListener('mousemove', e => {{
             tip.style.left = (e.clientX - wRect.left + 10) + 'px';
             tip.style.top  = (e.clientY - wRect.top  - 24) + 'px';
         }});
-        line.addEventListener('mouseleave', () => {{ tip.style.display = 'none'; }});
+        path.addEventListener('mouseleave', () => {{ tip.style.display = 'none'; }});
 
-        svg.appendChild(line);
+        svg.appendChild(path);
     }});
 }}
 
@@ -787,7 +1183,19 @@ def main() -> None:
     arrows = build_cross_tile_arrows(tiles)
     print(f"Derived {len(arrows)} cross-tile stream arrows")
 
-    render_html(tiles, arrows, args.output)
+    flows = trace_shim_flows(tiles, arrows)
+    print(f"Traced {len(flows)} stream flows from shim SOUTH slave ports")
+
+    # Annotate each arrow with its flow_ids for the JSON payload
+    arrow_flow_map: Dict[int, List[int]] = defaultdict(list)
+    for sf in flows:
+        for ai in sf.arrow_indices:
+            if sf.flow_id not in arrow_flow_map[ai]:
+                arrow_flow_map[ai].append(sf.flow_id)
+    for ai, fids in arrow_flow_map.items():
+        arrows[ai]["flow_ids"] = fids
+
+    render_html(tiles, arrows, args.output, flows=flows)
 
     if not args.no_serve:
         serve_html(args.output, args.port)

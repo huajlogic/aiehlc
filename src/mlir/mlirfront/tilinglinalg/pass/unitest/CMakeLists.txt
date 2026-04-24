@@ -95,6 +95,7 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfschedule/dfschedulemanager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfscheblueprint/dfscheblueprintmanager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinghwlower.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../routinghwverify.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routinglower.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingunrolling.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingdeadargclean.cpp

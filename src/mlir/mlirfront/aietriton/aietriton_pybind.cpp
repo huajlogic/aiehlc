@@ -12,13 +12,11 @@
 
 namespace py = pybind11;
 
-static bool run_aie_pipeline(
-    int meshRows, int meshCols,
-    const std::vector<std::tuple<std::vector<int64_t>, int, bool>> &tensorSpecs,
-    const std::string &outputDir,
-    const std::string &userKernelBody,
-    const std::string &userKernelFuncName)
-{
+static bool run_aie_pipeline(int meshRows, int meshCols,
+                             const std::vector<std::tuple<std::vector<int64_t>, int, bool>> &tensorSpecs,
+                             const std::string &outputDir, const std::string &userKernelBody,
+                             const std::string &userKernelFuncName,
+                             const std::vector<std::tuple<int, std::string, std::string>> &splitSpecs = {}) {
     mlir::MLIRContext ctx;
     TilingLinalgPipeline::registerDialects(ctx);
 
@@ -26,7 +24,16 @@ static bool run_aie_pipeline(
     for (auto &[shape, bw, isIn] : tensorSpecs)
         tensors.push_back({shape, bw, isIn});
 
-    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, meshRows, meshCols, tensors);
+    // Build SplitModel from optional split specs
+    SplitModel splitModel;
+    if (!splitSpecs.empty()) {
+        for (auto &[dim, axis, replicate] : splitSpecs)
+            splitModel.tensorSplits.push_back({dim, axis, replicate});
+    } else {
+        splitModel = SplitModel::gemm();
+    }
+
+    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, meshRows, meshCols, tensors, splitModel);
     return TilingLinalgPipeline::runPipeline(ctx, module, outputDir, userKernelBody, userKernelFuncName);
 }
 
@@ -71,13 +78,11 @@ static std::string build_kernel_body(
 
 PYBIND11_MODULE(_aietriton_core, m) {
     m.doc() = "AIE Triton pybind11 bindings to TilingLinalgPipeline";
-    m.def("run_aie_pipeline", &run_aie_pipeline,
-          py::arg("mesh_rows"), py::arg("mesh_cols"),
-          py::arg("tensor_specs"),
-          py::arg("output_dir"),
-          py::arg("user_kernel_body") = "",
-          py::arg("user_kernel_func_name") = "",
-          "Run TilingLinalgPipeline: buildRoutingIR + runPipeline");
+    m.def("run_aie_pipeline", &run_aie_pipeline, py::arg("mesh_rows"), py::arg("mesh_cols"), py::arg("tensor_specs"),
+          py::arg("output_dir"), py::arg("user_kernel_body") = "", py::arg("user_kernel_func_name") = "",
+          py::arg("split_specs") = std::vector<std::tuple<int, std::string, std::string>>{},
+          "Run TilingLinalgPipeline: buildRoutingIR + runPipeline.\n"
+          "split_specs: optional list of (splitDim, hwAxisOwner, replicateOn) tuples, one per tensor.");
     m.def("build_kernel_body", &build_kernel_body,
           py::arg("kernel_name"),
           py::arg("element_type"),

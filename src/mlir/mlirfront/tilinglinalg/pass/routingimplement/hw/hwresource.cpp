@@ -201,6 +201,119 @@ template<> struct GenTraits<2>
     }
 };
 
+/*  Gen-5  (AIE2PS): default colShift 25, rowShift 20  --------
+ *  All shim tiles (row 0) are ShimNOC — every column has
+ *  DMA engines and NOC connectivity to DDR.                    */
+template <> struct GenTraits<5> {
+    static const std::string &defaultVariant() {
+        static const std::string def = "PALMYRA";
+        return def;
+    }
+
+    static const std::map<TileType, std::vector<PortTemplate>> &defaultPortTemplates() {
+        static const std::map<TileType, std::vector<PortTemplate>> templates = {
+            {TileType::Core,
+             {{PortDirection::North, PortRole::Master, 4},
+              {PortDirection::South, PortRole::Master, 4},
+              {PortDirection::East, PortRole::Master, 4},
+              {PortDirection::West, PortRole::Master, 4},
+              {PortDirection::DMA, PortRole::Master, 4},
+              {PortDirection::North, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 4},
+              {PortDirection::East, PortRole::Slave, 4},
+              {PortDirection::West, PortRole::Slave, 4},
+              {PortDirection::DMA, PortRole::Slave, 4}}},
+            {TileType::Shim,
+             {{PortDirection::North, PortRole::Master, 4},
+              {PortDirection::South, PortRole::Master, 2, {3, 7}}, // mux - XAie_EnableShimDmaToAieStrmPort
+              {PortDirection::East, PortRole::Master, 4},
+              {PortDirection::West, PortRole::Master, 4},
+              {PortDirection::DMA, PortRole::Master, 4},
+              {PortDirection::North, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 2, {1, 3}}, // demux - XAie_EnableAieToShimDmaStrmPort
+              {PortDirection::East, PortRole::Slave, 4},
+              {PortDirection::West, PortRole::Slave, 4},
+              {PortDirection::DMA, PortRole::Slave, 4}}},
+            {TileType::Mem,
+             {{PortDirection::North, PortRole::Master, 6},
+              {PortDirection::South, PortRole::Master, 4},
+              {PortDirection::East, PortRole::Master, 0},
+              {PortDirection::West, PortRole::Master, 0},
+              {PortDirection::DMA, PortRole::Master, 6},
+              {PortDirection::North, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 6},
+              {PortDirection::East, PortRole::Slave, 0},
+              {PortDirection::West, PortRole::Slave, 0},
+              {PortDirection::DMA, PortRole::Slave, 6}}},
+            {TileType::NocShim,
+             {{PortDirection::North, PortRole::Master, 4},
+              {PortDirection::South, PortRole::Master, 2, {3, 7}}, // mux
+              {PortDirection::East, PortRole::Master, 4},
+              {PortDirection::West, PortRole::Master, 4},
+              {PortDirection::DMA, PortRole::Master, 4},
+              {PortDirection::North, PortRole::Slave, 4},
+              {PortDirection::South, PortRole::Slave, 2, {1, 3}}, // demux
+              {PortDirection::East, PortRole::Slave, 4},
+              {PortDirection::West, PortRole::Slave, 4},
+              {PortDirection::DMA, PortRole::Slave, 4}}}};
+        return templates;
+    }
+
+    static const std::map<TileType, TileDmaLimits> &defaultDmaLimits() {
+        static const std::map<TileType, TileDmaLimits> lim = {
+            {TileType::Core, {16, 16}}, // AIE2PS core: 16 BDs, 16 locks
+            {TileType::Shim, {16, 16}}, // shim: 16 BDs, 16 locks
+            {TileType::Mem, {48, 64}},  // mem tile: 48 BDs, 64 locks
+        };
+        return lim;
+    }
+
+    // Helper: generate NOC shim set with all columns (AIE2PS: every shim is ShimNOC)
+    static std::unordered_set<uint32_t> allColumnsNoc(uint32_t numCols) {
+        std::unordered_set<uint32_t> cols;
+        for (uint32_t c = 0; c < numCols; ++c)
+            cols.insert(c);
+        return cols;
+    }
+
+    static const std::unordered_map<std::string, AIEDeviceLayout> &table() {
+        static const std::unordered_map<std::string, AIEDeviceLayout> db = {
+            {"PALMYRA",
+             {7,  // rows: shim(0) + mem(1-2) + core(3-6)
+              12, // columns
+              0x2000'0000'000,
+              25,
+              20,
+              {
+                  {0, 0, TileType::Shim},
+                  {1, 2, TileType::Mem},
+                  {3, 6, TileType::Core},
+              },
+              allColumnsNoc(12), // all 12 shim tiles are ShimNOC
+              {3, 7},            // mux (ext→AIE)
+              {1, 3},            // demux (AIE→ext)
+              defaultPortTemplates(),
+              defaultDmaLimits()}},
+            {"VEK385",
+             {7,  // rows: shim(0) + mem(1-2) + core(3-6)
+              38, // columns
+              0x2000'0000'000,
+              25,
+              20,
+              {
+                  {0, 0, TileType::Shim},
+                  {1, 2, TileType::Mem},
+                  {3, 6, TileType::Core},
+              },
+              allColumnsNoc(38), // all 38 shim tiles are ShimNOC
+              {3, 7},            // mux (ext→AIE)
+              {1, 3},            // demux (AIE→ext)
+              defaultPortTemplates(),
+              defaultDmaLimits()}}};
+        return db;
+    }
+};
+
 /*-------------------- concrete hidden resource --------------*/
 template<int GEN>
 class GenResource final : public IHwResource
@@ -240,6 +353,8 @@ public:
 
     TileDmaLimits getDmaLimits(TileType type) const override { return layout_.getDmaLimits(type); }
 
+    uint32_t getDmaWordBytes() const override { return 4; } // 32-bit DMA word = 4 bytes
+
     const std::unordered_set<uint32_t>& getShimNoc() const override{
         return layout_.getShimNoc();
     }
@@ -275,6 +390,9 @@ makeResource(const std::string& gen, const std::string& var)
         return var.empty()
                ? std::make_unique<GenResource<2>>()
                : std::make_unique<GenResource<2>>(var);
+
+    if (gen == "Gen5")
+        return var.empty() ? std::make_unique<GenResource<5>>() : std::make_unique<GenResource<5>>(var);
 
     throw std::runtime_error("Unsupported generation: " + gen);
 }

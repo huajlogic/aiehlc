@@ -133,6 +133,7 @@ class BdConfig:
     acquire_lock_val: int = -1
     release_lock_id: int = -1
     release_lock_val: int = -1
+    flow_id: int = -1  # assigned during flow grouping
 
 
 @dataclass
@@ -143,6 +144,7 @@ class IoConfig:
     bd_var: str
     channel_id: int
     direction: str
+    flow_id: int = -1  # assigned during flow grouping
 
 
 @dataclass
@@ -162,6 +164,20 @@ class TileDmaInfo:
     bds: List[BdConfig] = field(default_factory=list)
     ios: List[IoConfig] = field(default_factory=list)
     locks: Dict[int, LockInfo] = field(default_factory=dict)
+
+
+@dataclass
+class FlowInfo:
+    """Represents a shim DMA flow: one shim tile channel+direction and its connected tiles."""
+    flow_id: int
+    shim_tile: Tuple[int, int]
+    channel_id: int
+    direction: str  # "S2MM" or "MM2S"
+    connected_tiles: List[Tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return f"Tile({self.shim_tile[0]},{self.shim_tile[1]}) ch{self.channel_id} {self.direction}"
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +289,7 @@ def parse_routing_file(filepath: str) -> List[RoutingBlock]:
 # Parsing — host.cc (DMA BDs)
 # ---------------------------------------------------------------------------
 
-def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
+def parse_host_cc(path: str) -> Tuple[Dict[Tuple[int, int], TileDmaInfo], List[FlowInfo]]:
     text = Path(path).read_text()
 
     tile_map: Dict[str, Tuple[int, int]] = {}
@@ -441,6 +457,53 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
                 direction=direction,
             ))
 
+    # --- Build flow groups ---
+    # A "flow" starts at each shim tile IO (row==0) and includes all subsequent
+    # non-shim IOs until the next shim IO. This captures the fan-out pattern:
+    # shim MM2S -> [compute S2MM tiles], shim S2MM <- [compute MM2S tiles].
+    flows: List[FlowInfo] = []
+    flow_id = 0
+    current_flow: Optional[FlowInfo] = None
+    io_to_flow: Dict[str, int] = {}  # io var -> flow_id
+
+    for io in io_configs:
+        is_shim = (io.tile_loc[1] == 0)
+        if is_shim:
+            current_flow = FlowInfo(
+                flow_id=flow_id,
+                shim_tile=io.tile_loc,
+                channel_id=io.channel_id,
+                direction=io.direction,
+            )
+            flows.append(current_flow)
+            io.flow_id = flow_id
+            io_to_flow[io.var] = flow_id
+            flow_id += 1
+        elif current_flow is not None:
+            current_flow.connected_tiles.append(io.tile_loc)
+            io.flow_id = current_flow.flow_id
+            io_to_flow[io.var] = current_flow.flow_id
+
+    # Map BD vars to flow_id via their IO associations
+    bd_var_to_flow: Dict[str, int] = {}
+    for io in io_configs:
+        if io.flow_id >= 0 and io.bd_var in bd_map:
+            bd_map[io.bd_var].flow_id = io.flow_id
+            bd_var_to_flow[io.bd_var] = io.flow_id
+            # Also tag chained BDs (next_bd chains)
+            bd = bd_map[io.bd_var]
+            visited_bds = {bd.bd_id}
+            while bd.next_bd >= 0 and bd.next_bd not in visited_bds:
+                visited_bds.add(bd.next_bd)
+                # Find the chained BD on the same tile
+                for other_bd in bd_map.values():
+                    if other_bd.tile_loc == bd.tile_loc and other_bd.bd_id == bd.next_bd:
+                        other_bd.flow_id = io.flow_id
+                        break
+                else:
+                    break
+                bd = other_bd
+
     tiles: Dict[Tuple[int, int], TileDmaInfo] = {}
     for bd in bd_map.values():
         loc = bd.tile_loc
@@ -477,7 +540,7 @@ def parse_host_cc(path: str) -> Dict[Tuple[int, int], TileDmaInfo]:
             if loc in lock_init_map and lid in lock_init_map[loc]:
                 lk.init_value = lock_init_map[loc][lid]
 
-    return tiles
+    return tiles, flows
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +637,7 @@ def _build_routing_json(blocks: List[RoutingBlock]) -> dict:
 
     for bi, block in enumerate(blocks):
         color = BLOCK_COLORS[bi % len(BLOCK_COLORS)]
+        block_key = f"{block.name}__{bi}"
 
         for cc in block.circuit_conns:
             internal_conns.append({
@@ -584,6 +648,7 @@ def _build_routing_json(blocks: List[RoutingBlock]) -> dict:
                 "master_port": cc.master_port,
                 "mode": "circuit",
                 "block": block.name,
+                "block_key": block_key,
                 "color": color,
             })
 
@@ -599,6 +664,7 @@ def _build_routing_json(blocks: List[RoutingBlock]) -> dict:
                     "port": cc.master_port,
                     "mode": "circuit",
                     "block": block.name,
+                    "block_key": block_key,
                     "color": color,
                 })
 
@@ -612,6 +678,7 @@ def _build_routing_json(blocks: List[RoutingBlock]) -> dict:
                 "master_port": mp.port_num,
                 "mode": "packet",
                 "block": block.name,
+                "block_key": block_key,
                 "color": color,
                 "pkt_id": ss.pkt_id,
             })
@@ -628,6 +695,7 @@ def _build_routing_json(blocks: List[RoutingBlock]) -> dict:
                     "port": mp.port_num,
                     "mode": "packet",
                     "block": block.name,
+                    "block_key": block_key,
                     "color": color,
                 })
 
@@ -641,6 +709,7 @@ def _build_routing_json(blocks: List[RoutingBlock]) -> dict:
                 "mode": "shim_dma",
                 "direction": sd.direction,
                 "block": block.name,
+                "block_key": block_key,
                 "color": color,
             })
 
@@ -656,16 +725,131 @@ def _build_routing_json(blocks: List[RoutingBlock]) -> dict:
 # Build per-tile routing summary for tile cards
 # ---------------------------------------------------------------------------
 
+def _map_blocks_to_flows(
+    blocks: List[RoutingBlock], flows: List[FlowInfo],
+) -> Dict[str, List[int]]:
+    """Map routing block keys to flow IDs by matching shim tiles and DMA endpoints.
+
+    Block keys use the format "blockname__idx" to handle duplicate block names.
+    The same key format is used in _build_routing_json and _build_routing_tile_summary.
+
+    Returns a dict mapping block_key -> list of flow_ids.  A routing block that
+    carries data for both an input flow (shim_to_aie) and an output flow
+    (aie_to_shim) will map to multiple flow_ids so that checking either
+    flow's checkbox makes the block's arrows visible.
+    """
+    block_to_flow: Dict[str, List[int]] = {}
+    for bi, block in enumerate(blocks):
+        block_key = f"{block.name}__{bi}"
+        # Determine routing directions from shim_dma entries
+        shim_tiles_by_dir: Dict[str, set] = defaultdict(set)
+        shim_tiles = set()
+        for sd in block.shim_dma:
+            shim_tiles.add(sd.tile)
+            shim_tiles_by_dir[sd.direction].add(sd.tile)
+        has_mixed_dirs = len(shim_tiles_by_dir) > 1
+        shim_direction = None
+        if not has_mixed_dirs and shim_tiles_by_dir:
+            shim_direction = next(iter(shim_tiles_by_dir))
+        # Collect compute tiles that have DMA endpoints in circuit connections
+        dma_compute_tiles = set()
+        for cc in block.circuit_conns:
+            if cc.master_type == "DMA" and cc.tile[1] > 0:
+                dma_compute_tiles.add(cc.tile)
+            if cc.slave_type == "DMA" and cc.tile[1] > 0:
+                dma_compute_tiles.add(cc.tile)
+        # Also check packet connections
+        for ss in block.pkt_slaves:
+            if ss.port_type == "DMA" and ss.tile[1] > 0:
+                dma_compute_tiles.add(ss.tile)
+        for mp in block.pkt_masters:
+            if mp.port_type == "DMA" and mp.tile[1] > 0:
+                dma_compute_tiles.add(mp.tile)
+        # If no shim tile found, try inferring from circuit connections at row 0
+        if not shim_tiles:
+            for cc in block.circuit_conns:
+                if cc.tile[1] == 0:
+                    shim_tiles.add(cc.tile)
+        # For output paths (aie_to_shim), compute tiles are not explicit DMA endpoints
+        # in the routing block. Try to find the topmost tile in the routing chain.
+        if not dma_compute_tiles and shim_direction == "aie_to_shim":
+            all_block_tiles = set()
+            for cc in block.circuit_conns:
+                all_block_tiles.add(cc.tile)
+            # The topmost tiles (highest row) are likely the source compute tiles
+            if all_block_tiles:
+                max_r = max(t[1] for t in all_block_tiles)
+                top_tiles = {t for t in all_block_tiles if t[1] == max_r and t[1] > 0}
+                dma_compute_tiles = top_tiles
+
+        # Match against flows: find overlapping flows.
+        # For mixed-direction blocks, match each direction independently so the
+        # block maps to both the input and output flow.
+        matched_flow_ids: List[int] = []
+        if has_mixed_dirs:
+            # Match each direction separately against its corresponding shim tiles
+            for direction, dir_shim_tiles in shim_tiles_by_dir.items():
+                expected_flow_dir = "MM2S" if direction == "shim_to_aie" else "S2MM"
+                best_fid = -1
+                best_score = 0
+                candidates = []
+                for f in flows:
+                    if f.shim_tile not in dir_shim_tiles:
+                        continue
+                    if f.direction != expected_flow_dir:
+                        continue
+                    overlap = len(dma_compute_tiles & set(f.connected_tiles))
+                    if overlap > best_score:
+                        best_score = overlap
+                        best_fid = f.flow_id
+                    candidates.append(f)
+                if best_fid < 0 and len(candidates) == 1:
+                    best_fid = candidates[0].flow_id
+                if best_fid < 0 and candidates:
+                    best_fid = candidates[0].flow_id
+                if best_fid >= 0:
+                    matched_flow_ids.append(best_fid)
+        else:
+            # Single-direction block: find best matching flow
+            best_flow_id = -1
+            best_score = 0
+            candidates = []
+            for f in flows:
+                if shim_tiles and f.shim_tile not in shim_tiles:
+                    continue
+                if shim_direction == "shim_to_aie" and f.direction != "MM2S":
+                    continue
+                if shim_direction == "aie_to_shim" and f.direction != "S2MM":
+                    continue
+                overlap = len(dma_compute_tiles & set(f.connected_tiles))
+                if overlap > best_score:
+                    best_score = overlap
+                    best_flow_id = f.flow_id
+                candidates.append(f)
+            if best_flow_id < 0 and len(candidates) == 1:
+                best_flow_id = candidates[0].flow_id
+            if best_flow_id < 0 and candidates:
+                best_flow_id = candidates[0].flow_id
+            if best_flow_id >= 0:
+                matched_flow_ids.append(best_flow_id)
+
+        if matched_flow_ids:
+            block_to_flow[block_key] = matched_flow_ids
+    return block_to_flow
+
+
 def _build_routing_tile_summary(blocks: List[RoutingBlock]) -> Dict[tuple, List[dict]]:
     result: Dict[tuple, List[dict]] = defaultdict(list)
     for bi, block in enumerate(blocks):
         color = BLOCK_COLORS[bi % len(BLOCK_COLORS)]
+        block_key = f"{block.name}__{bi}"
         for cc in block.circuit_conns:
             result[cc.tile].append({
                 "type": "circuit",
                 "slave": f"{cc.slave_type}:{cc.slave_port}",
                 "master": f"{cc.master_type}:{cc.master_port}",
                 "block": block.name,
+                "block_key": block_key,
                 "color": color,
             })
         for ss, mp in resolve_pkt_internal_edges(block):
@@ -674,6 +858,7 @@ def _build_routing_tile_summary(blocks: List[RoutingBlock]) -> Dict[tuple, List[
                 "slave": f"{ss.port_type}:{ss.port_num}",
                 "master": f"{mp.port_type}:{mp.port_num}",
                 "block": block.name,
+                "block_key": block_key,
                 "color": color,
                 "pkt_id": ss.pkt_id,
             })
@@ -684,6 +869,7 @@ def _build_routing_tile_summary(blocks: List[RoutingBlock]) -> Dict[tuple, List[
                 "port": sd.port_num,
                 "direction": arrow,
                 "block": block.name,
+                "block_key": block_key,
                 "color": color,
             })
     return dict(result)
@@ -788,6 +974,7 @@ def render_html(
     routing_tiles: Optional[set],
     routing_summary: Optional[Dict[tuple, List[dict]]],
     output_path: str,
+    flows: Optional[List[FlowInfo]] = None,
 ) -> str:
     all_tile_locs = set()
     if routing_tiles:
@@ -812,6 +999,38 @@ def render_html(
     routing_json_data = {}
     if blocks:
         routing_json_data = _build_routing_json(blocks)
+
+    # Build block-name -> flow_ids mapping for routing elements
+    block_to_flow: Dict[str, List[int]] = {}
+    if blocks and flows:
+        block_to_flow = _map_blocks_to_flows(blocks, flows)
+        # Inject flow_ids into routing JSON entries using block_key
+        if routing_json_data:
+            for arrow in routing_json_data.get("cross_tile_arrows", []):
+                arrow["flow_ids"] = block_to_flow.get(arrow.get("block_key", arrow["block"]), [])
+            for conn in routing_json_data.get("internal_conns", []):
+                conn["flow_ids"] = block_to_flow.get(conn.get("block_key", conn["block"]), [])
+
+            # Fallback: infer flow_ids for unmatched entries from neighboring arrows
+            # sharing the same block_key that already have valid flow_ids.
+            block_key_to_flows: Dict[str, List[int]] = {}
+            for arrow in routing_json_data.get("cross_tile_arrows", []):
+                bk = arrow.get("block_key", arrow["block"])
+                if arrow.get("flow_ids"):
+                    block_key_to_flows[bk] = arrow["flow_ids"]
+            for conn in routing_json_data.get("internal_conns", []):
+                bk = conn.get("block_key", conn["block"])
+                if conn.get("flow_ids"):
+                    block_key_to_flows[bk] = conn["flow_ids"]
+            # Apply inferred flow_ids to unmatched entries
+            for arrow in routing_json_data.get("cross_tile_arrows", []):
+                if not arrow.get("flow_ids"):
+                    bk = arrow.get("block_key", arrow["block"])
+                    arrow["flow_ids"] = block_key_to_flows.get(bk, [])
+            for conn in routing_json_data.get("internal_conns", []):
+                if not conn.get("flow_ids"):
+                    bk = conn.get("block_key", conn["block"])
+                    conn["flow_ids"] = block_key_to_flows.get(bk, [])
 
     def _pkt_color(pid: int) -> str:
         return _PKT_COLORS[pid % len(_PKT_COLORS)]
@@ -841,16 +1060,18 @@ def render_html(
         # --- Routing section ---
         routing_rows = []
         for r in rt_info:
+            r_flow_ids = block_to_flow.get(r.get("block_key", r["block"]), [])
+            r_flow_attr = f' data-flow-ids="{",".join(str(fid) for fid in r_flow_ids)}"' if r_flow_ids else ''
             if r["type"] == "circuit":
                 routing_rows.append(
-                    f'<div class="route-row circuit" style="border-left:3px solid {r["color"]}">'
+                    f'<div class="route-row circuit"{r_flow_attr} style="border-left:3px solid {r["color"]}">'
                     f'<span class="route-label">CCT</span> '
                     f'{r["slave"]} &rarr; {r["master"]}'
                     f'<span class="route-block">{r["block"]}</span></div>'
                 )
             elif r["type"] == "packet":
                 routing_rows.append(
-                    f'<div class="route-row packet" style="border-left:3px solid {r["color"]}">'
+                    f'<div class="route-row packet"{r_flow_attr} style="border-left:3px solid {r["color"]}">'
                     f'<span class="route-label">PKT</span> '
                     f'{r["slave"]} &rarr; {r["master"]} '
                     f'<span class="pkt" style="background:{_pkt_color(r.get("pkt_id", 0))}">'
@@ -860,7 +1081,7 @@ def render_html(
             elif r["type"] == "shim_dma":
                 arrow = "&#x25BC;" if "AIE" in r["direction"] else "&#x25B2;"
                 routing_rows.append(
-                    f'<div class="route-row shim-dma" style="border-left:3px solid {r["color"]}">'
+                    f'<div class="route-row shim-dma"{r_flow_attr} style="border-left:3px solid {r["color"]}">'
                     f'{arrow} ShimDMA:{r["port"]} ({r["direction"]})'
                     f'<span class="route-block">{r["block"]}</span></div>'
                 )
@@ -880,8 +1101,9 @@ def render_html(
             io_rows = []
             for io in dma_info.ios:
                 dir_cls = "s2mm" if io.direction == "S2MM" else "mm2s"
+                flow_attr = f' data-flow="{io.flow_id}"' if io.flow_id >= 0 else ''
                 io_rows.append(
-                    f'<div class="io-row {dir_cls}">ch{io.channel_id}: {io.direction}</div>'
+                    f'<div class="io-row {dir_cls}"{flow_attr}>ch{io.channel_id}: {io.direction}</div>'
                 )
 
             bd_rows = []
@@ -891,6 +1113,7 @@ def render_html(
                          and bd.next_bd in bd_by_id
                          and bd_by_id[bd.next_bd].next_bd == bd.bd_id)
                 pp_class = " ping-pong" if is_pp else ""
+                flow_attr = f' data-flow="{bd.flow_id}"' if bd.flow_id >= 0 else ''
                 nxt = f"&rarr;BD{bd.next_bd}" if bd.next_bd >= 0 else "none"
                 chain_html = f'<span class="chain">BD{bd.bd_id} next={nxt}</span>'
 
@@ -903,7 +1126,7 @@ def render_html(
                 rel_html = _lock_html(bd.release_lock_id, bd.release_lock_val, dma_info.locks, "rel")
 
                 bd_rows.append(
-                    f'<div class="bd-row{pp_class}">'
+                    f'<div class="bd-row{pp_class}"{flow_attr}>'
                     f'{chain_html} {pkt_html} '
                     f'<span class="len">len={bd.length}</span> '
                     f'<span class="buf">buf={bd.buf_source}</span>'
@@ -976,6 +1199,63 @@ def render_html(
         block_legend = "".join(items)
 
     routing_json_str = json.dumps(routing_json_data) if routing_json_data else "{}"
+
+    # --- Build flow filter panel ---
+    flow_panel_html = ""
+    flow_json_str = "[]"
+    if flows:
+        flow_json_data = []
+        for f in flows:
+            flow_json_data.append({
+                "flow_id": f.flow_id,
+                "shim_tile": list(f.shim_tile),
+                "channel_id": f.channel_id,
+                "direction": f.direction,
+                "connected_tiles": [list(t) for t in f.connected_tiles],
+                "label": f.label,
+            })
+        flow_json_str = json.dumps(flow_json_data)
+
+        # Group flows by shim tile
+        shim_groups: Dict[Tuple[int, int], List[FlowInfo]] = defaultdict(list)
+        for f in flows:
+            shim_groups[f.shim_tile].append(f)
+
+        panel_items = []
+        for stile in sorted(shim_groups.keys()):
+            tile_flows = shim_groups[stile]
+            panel_items.append(
+                f'<div class="flow-group">'
+                f'<div class="flow-group-header">Shim ({stile[0]},{stile[1]})</div>'
+            )
+            for f in tile_flows:
+                dir_cls = "s2mm" if f.direction == "S2MM" else "mm2s"
+                arrow = "&#x25BC;" if f.direction == "S2MM" else "&#x25B2;"
+                n_tiles = len(f.connected_tiles)
+                panel_items.append(
+                    f'<label class="flow-toggle {dir_cls}">'
+                    f'<input type="checkbox" checked data-flow-id="{f.flow_id}" '
+                    f'onchange="toggleFlow({f.flow_id}, this.checked)">'
+                    f'{arrow} ch{f.channel_id} {f.direction} ({n_tiles} tiles)'
+                    f'</label>'
+                    f'<button class="flow-solo-btn" onclick="soloOneFlow({f.flow_id})" '
+                    f'title="Show only this flow">Solo</button>'
+                )
+            panel_items.append('</div>')
+
+        flow_panel_html = (
+            '<div class="flow-filter-panel">'
+            '<div class="flow-panel-header" onclick="toggleFlowPanel(this)">'
+            '&#x25BC; DMA Flow Filter</div>'
+            '<div class="flow-panel-body expanded">'
+            '<div class="flow-panel-controls">'
+            '<button onclick="showAllFlows()">Show All</button>'
+            '<button onclick="hideAllFlows()">Hide All</button>'
+            '<button onclick="soloFlowMode()">Solo Mode</button>'
+            '</div>'
+            + "".join(panel_items) +
+            '</div></div>'
+        )
 
     html = f"""\
 <!DOCTYPE html>
@@ -1126,6 +1406,59 @@ svg.routing-overlay line, svg.routing-overlay path {{
     pointer-events: none; z-index: 100; white-space: nowrap;
     display: none; font-family: monospace;
 }}
+/* Flow filter panel */
+.flow-filter-panel {{
+    max-width: 900px; margin: 0 auto 16px auto;
+    background: #fff; border: 1px solid #ccc; border-radius: 8px;
+    padding: 10px 14px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
+}}
+.flow-panel-header {{
+    font-size: 13px; font-weight: 700; color: #333;
+    cursor: pointer; user-select: none; padding: 2px 0;
+}}
+.flow-panel-header:hover {{ color: #1976d2; }}
+.flow-panel-body {{
+    overflow: hidden; transition: max-height .3s ease;
+}}
+.flow-panel-body.collapsed {{ max-height: 0 !important; padding: 0; }}
+.flow-panel-body.expanded {{ max-height: 2000px; }}
+.flow-panel-controls {{
+    display: flex; gap: 8px; margin: 8px 0;
+}}
+.flow-panel-controls button {{
+    padding: 4px 12px; border: 1px solid #bbb; border-radius: 5px;
+    background: #fff; cursor: pointer; font-size: 11px; font-weight: 600;
+    transition: all .15s;
+}}
+.flow-panel-controls button:hover {{ background: #e3f2fd; border-color: #42a5f5; }}
+.flow-group {{
+    margin-bottom: 6px; padding: 4px 0;
+    border-bottom: 1px solid #eee;
+}}
+.flow-group:last-child {{ border-bottom: none; }}
+.flow-group-header {{
+    font-size: 11px; font-weight: 700; color: #555; margin-bottom: 4px;
+}}
+.flow-toggle {{
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 11px; font-family: monospace;
+    padding: 2px 8px; margin: 2px 4px; border-radius: 4px;
+    cursor: pointer; user-select: none; transition: opacity .15s;
+}}
+.flow-toggle.s2mm {{ background: #bbdefb; color: #0d47a1; }}
+.flow-toggle.mm2s {{ background: #ffe0b2; color: #e65100; }}
+.flow-toggle input[type="checkbox"] {{ margin: 0; cursor: pointer; }}
+[data-flow].flow-hidden, [data-flow-ids].flow-hidden {{
+    display: none !important;
+}}
+.solo-active {{ outline: 2px solid #f44336; outline-offset: -2px; }}
+.tile-card.flow-dimmed {{ opacity: 0.15; pointer-events: none; transition: opacity .2s; }}
+.flow-solo-btn {{
+    padding: 1px 7px; border: 1px solid #bbb; border-radius: 3px;
+    background: #fff; cursor: pointer; font-size: 10px; font-weight: 600;
+    margin-left: 2px; vertical-align: middle; transition: all .15s;
+}}
+.flow-solo-btn:hover {{ background: #ffecb3; border-color: #ffa000; }}
 </style>
 </head>
 <body>
@@ -1137,6 +1470,8 @@ svg.routing-overlay line, svg.routing-overlay path {{
     <button id="btn-collapse" onclick="collapseAll()">Collapse All</button>
     <button id="btn-arrows" class="active" onclick="toggleArrows(this)">Routing Arrows</button>
 </div>
+
+{flow_panel_html}
 
 <div class="legend">
     <div class="legend-item"><div class="legend-swatch" style="background:#e3f2fd;border-color:#42a5f5"></div> Shim</div>
@@ -1177,7 +1512,130 @@ svg.routing-overlay line, svg.routing-overlay path {{
 
 <script>
 const routingData = {routing_json_str};
+const flowData = {flow_json_str};
 let arrowsVisible = true;
+let soloMode = false;
+let soloFlowId = -1;
+
+// Collect the set of currently-visible flow IDs from checkboxes
+function getVisibleFlowIds() {{
+    const visible = new Set();
+    document.querySelectorAll('.flow-toggle input[type="checkbox"]').forEach(cb => {{
+        if (cb.checked) visible.add(parseInt(cb.dataset.flowId));
+    }});
+    return visible;
+}}
+
+// Check if an element matches any visible flow.
+// Handles both data-flow (single, DMA) and data-flow-ids (multi, routing).
+function elMatchesAnyFlow(el, visibleSet) {{
+    const singleFlow = el.getAttribute('data-flow');
+    if (singleFlow !== null) {{
+        return visibleSet.has(parseInt(singleFlow));
+    }}
+    const multiFlow = el.getAttribute('data-flow-ids');
+    if (multiFlow !== null && multiFlow !== '') {{
+        return multiFlow.split(',').some(id => visibleSet.has(parseInt(id)));
+    }}
+    return false;
+}}
+
+// Apply flow visibility to all flow-tagged DOM elements
+function applyFlowVisibility() {{
+    const visible = getVisibleFlowIds();
+    // data-flow elements (DMA items)
+    document.querySelectorAll('[data-flow]').forEach(el => {{
+        el.classList.toggle('flow-hidden', !visible.has(parseInt(el.getAttribute('data-flow'))));
+    }});
+    // data-flow-ids elements (routing items)
+    document.querySelectorAll('[data-flow-ids]').forEach(el => {{
+        const ids = el.getAttribute('data-flow-ids').split(',');
+        const anyMatch = ids.some(id => visible.has(parseInt(id)));
+        el.classList.toggle('flow-hidden', !anyMatch);
+    }});
+}}
+
+function updateTileCardDimming() {{
+    document.querySelectorAll('.tile-card').forEach(card => {{
+        const flowEls = card.querySelectorAll('[data-flow], [data-flow-ids]');
+        if (flowEls.length === 0) return;
+        const anyVisible = [...flowEls].some(el => !el.classList.contains('flow-hidden'));
+        card.classList.toggle('flow-dimmed', !anyVisible);
+    }});
+}}
+
+function toggleFlow(flowId, visible) {{
+    applyFlowVisibility();
+    updateTileCardDimming();
+    setTimeout(drawArrows, 100);
+}}
+
+function showAllFlows() {{
+    soloMode = false;
+    soloFlowId = -1;
+    document.querySelectorAll('.flow-toggle input[type="checkbox"]').forEach(cb => {{
+        cb.checked = true;
+    }});
+    applyFlowVisibility();
+    document.querySelectorAll('.flow-toggle').forEach(el => el.classList.remove('solo-active'));
+    document.querySelectorAll('.tile-card').forEach(c => c.classList.remove('flow-dimmed'));
+    setTimeout(drawArrows, 100);
+}}
+
+function hideAllFlows() {{
+    soloMode = false;
+    soloFlowId = -1;
+    document.querySelectorAll('.flow-toggle input[type="checkbox"]').forEach(cb => {{
+        cb.checked = false;
+    }});
+    applyFlowVisibility();
+    document.querySelectorAll('.flow-toggle').forEach(el => el.classList.remove('solo-active'));
+    updateTileCardDimming();
+    setTimeout(drawArrows, 100);
+}}
+
+function soloFlowMode() {{
+    soloMode = !soloMode;
+    if (!soloMode) {{
+        showAllFlows();
+        return;
+    }}
+    // In solo mode, clicking a flow toggle shows only that flow
+    // Start by showing none; user clicks to solo one
+    hideAllFlows();
+    soloMode = true;  // re-set since hideAllFlows resets it
+}}
+
+function soloOneFlow(flowId) {{
+    // Hide all flows first
+    document.querySelectorAll('.flow-toggle input[type="checkbox"]').forEach(cb => {{
+        cb.checked = false;
+    }});
+    document.querySelectorAll('.flow-toggle').forEach(el => el.classList.remove('solo-active'));
+    // Show only the selected flow
+    document.querySelectorAll('.flow-toggle input[data-flow-id="' + flowId + '"]').forEach(cb => {{
+        cb.checked = true;
+        cb.closest('.flow-toggle').classList.add('solo-active');
+    }});
+    applyFlowVisibility();
+    soloMode = true;
+    soloFlowId = flowId;
+    updateTileCardDimming();
+    setTimeout(drawArrows, 100);
+}}
+
+function toggleFlowPanel(header) {{
+    const body = header.nextElementSibling;
+    if (body.classList.contains('collapsed')) {{
+        body.classList.remove('collapsed');
+        body.classList.add('expanded');
+        header.innerHTML = header.innerHTML.replace('\\u25B6', '\\u25BC');
+    }} else {{
+        body.classList.remove('expanded');
+        body.classList.add('collapsed');
+        header.innerHTML = header.innerHTML.replace('\\u25BC', '\\u25B6');
+    }}
+}}
 
 function toggleSection(header) {{
     const section = header.nextElementSibling;
@@ -1254,7 +1712,19 @@ function drawArrows() {{
 
     const drawn = new Set();
 
+    // Collect visible flow IDs for filtering SVG arrows
+    const visibleFlows = getVisibleFlowIds();
+
+    // Helper: check if an arrow/conn should be shown based on its flow_ids
+    function shouldShowElement(flowIds) {{
+        if (!flowIds || flowIds.length === 0) return true;  // no flow info = always show
+        return flowIds.some(fid => visibleFlows.has(fid));
+    }}
+
     routingData.cross_tile_arrows.forEach(arrow => {{
+        // Skip arrows where all associated flows are hidden
+        if (!shouldShowElement(arrow.flow_ids)) return;
+
         const fromKey = arrow.from_tile[0] + ',' + arrow.from_tile[1];
         const toKey = arrow.to_tile[0] + ',' + arrow.to_tile[1];
         const fromEl = tileElements[fromKey];
@@ -1347,6 +1817,8 @@ function drawArrows() {{
     if (routingData.internal_conns) {{
         routingData.internal_conns.forEach(conn => {{
             if (conn.mode === 'shim_dma') return;
+            // Skip connections where all associated flows are hidden
+            if (!shouldShowElement(conn.flow_ids)) return;
 
             const tKey = conn.tile[0] + ',' + conn.tile[1];
             const tileEl = tileElements[tKey];
@@ -1748,6 +2220,7 @@ def main():
     paths = None
     routing_summary = None
     dma_tiles = None
+    flows = None
 
     if args.routing:
         blocks = parse_routing_file(args.routing)
@@ -1759,7 +2232,7 @@ def main():
             routing_summary = _build_routing_tile_summary(blocks)
 
     if args.host:
-        dma_tiles = parse_host_cc(args.host)
+        dma_tiles, flows = parse_host_cc(args.host)
         if not dma_tiles:
             print("No DMA BD configurations found.", file=sys.stderr)
 
@@ -1784,7 +2257,8 @@ def main():
 
     elif mode == "html":
         out_path = args.output or "aie_topology.html"
-        render_html(blocks, dma_tiles, routing_tiles, routing_summary, out_path)
+        render_html(blocks, dma_tiles, routing_tiles, routing_summary, out_path,
+                    flows=flows)
         if args.serve:
             serve_html(out_path, args.port)
 

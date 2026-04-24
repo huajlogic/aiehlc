@@ -966,6 +966,33 @@ void AieRt_PrintBdInfo(XAie_DevInst *dev, XAie_LocType tile, uint8_t bd_id) {
     printf("\n");
     printf("         lock acq: en=%d id=%d val=%d  rel: en=%d id=%d val=%d\n", acq_en, acq_lock_id, acq_lock_val,
            rel_en, rel_lock_id, rel_lock_val);
+
+    /* Multi-dimensional addressing: stride/wrap for D0-D3 and iteration
+     * XAie_DmaReadBd populates desc.MultiDimDesc from hardware registers.
+     * Access via AieMlMultiDimDesc for AIEML/AIE2 devices. */
+    {
+        XAie_AieMlMultiDimDesc *md = &desc.MultiDimDesc.AieMlMultiDimDesc;
+        int has_dim = 0;
+        for (int d = 0; d < 4; d++) {
+            if (md->DimDesc[d].StepSize != 0 || md->DimDesc[d].Wrap != 0)
+                has_dim = 1;
+        }
+        if (md->IterDesc.StepSize != 0 || md->IterDesc.Wrap != 0)
+            has_dim = 1;
+
+        if (has_dim) {
+            printf("         dims:");
+            for (int d = 0; d < 4; d++) {
+                if (md->DimDesc[d].StepSize != 0 || md->DimDesc[d].Wrap != 0)
+                    printf("  D%d(step=%u,wrap=%u)", d, (unsigned)md->DimDesc[d].StepSize,
+                           (unsigned)md->DimDesc[d].Wrap);
+            }
+            if (md->IterDesc.StepSize != 0 || md->IterDesc.Wrap != 0)
+                printf("  Iter(step=%u,wrap=%u,curr=%u)", (unsigned)md->IterDesc.StepSize, (unsigned)md->IterDesc.Wrap,
+                       (unsigned)md->IterCurr);
+            printf("\n");
+        }
+    }
 }
 
 void AieRt_PrintAllBds(XAie_DevInst *dev, XAie_LocType tile) {
@@ -976,11 +1003,130 @@ void AieRt_PrintAllBds(XAie_DevInst *dev, XAie_LocType tile) {
                (int)rc);
         return;
     }
-    printf("[AieRt_Debug] tile(%u,%u) BDs (total=%u, printing 0-3):\n", (unsigned)tile.Col, (unsigned)tile.Row,
-           (unsigned)num_bds);
-    u8 print_count = (num_bds < 4) ? num_bds : 4;
-    for (u8 i = 0; i < print_count; i++)
+    printf("[AieRt_Debug] tile(%u,%u) BDs (total=%u, printing configured only):\n", (unsigned)tile.Col,
+           (unsigned)tile.Row, (unsigned)num_bds);
+    int printed = 0;
+    for (u8 i = 0; i < num_bds; i++) {
+        /* Quick check: read the BD via API; skip if addr and len are both zero */
+        XAie_DmaDesc desc;
+        memset(&desc, 0, sizeof(desc));
+        AieRC rbd = XAie_DmaReadBd(dev, &desc, tile, (u16)i);
+        if (rbd != XAIE_OK)
+            continue;
+        if (desc.AddrDesc.Address == 0 && desc.AddrDesc.Length == 0)
+            continue;
         AieRt_PrintBdInfo(dev, tile, i);
+        printed++;
+    }
+    if (printed == 0)
+        printf("[AieRt_Debug]   (no configured BDs)\n");
+}
+
+/* --------------------------------------------------------------------------
+ * Raw BD register dump for shim tiles
+ *
+ * Reads all 16 BD slots via XAie_Read32 at tile-relative offsets.
+ * Decodes stride/wrap/iteration/lock/packet fields from raw register words.
+ * -------------------------------------------------------------------------- */
+
+void AieRt_PrintShimBdRawAll(XAie_DevInst *dev, uint8_t col) {
+    printf("[AieRt_Debug] ===== Shim tile(%u,0) Raw BD Dump (16 BDs) =====\n", (unsigned)col);
+
+    int printed = 0;
+    for (uint32_t bd = 0; bd < AIERT_SHIM_BD_COUNT; bd++) {
+        uint32_t base = AIERT_SHIM_BD_BASE + bd * AIERT_SHIM_BD_STRIDE;
+        u32 w[AIERT_SHIM_BD_WORDS];
+
+        /* Read all 8 words of this BD.
+         * Shim tile address: (col << 25) | (row << 20) | reg_offset, row=0. */
+        u64 tile_base = (u64)col << 25; /* shim row=0 */
+        for (uint32_t wi = 0; wi < AIERT_SHIM_BD_WORDS; wi++) {
+            AieRC rc = XAie_Read32(dev, tile_base | (u64)(base + wi * 4), &w[wi]);
+            if (rc != XAIE_OK)
+                w[wi] = 0;
+        }
+
+        /* Skip if Buffer_Length (word0) is zero — BD not configured */
+        if (w[0] == 0)
+            continue;
+
+        /* Decode word 0: Buffer_Length */
+        uint32_t buf_len = w[0];
+
+        /* Decode word 1: Base_Address_Low */
+        uint32_t addr_lo = w[1];
+
+        /* Decode word 2: Base_Address_High[15:0], Packet_ID[28:24], Packet_Type[22:20] */
+        uint32_t addr_hi = w[2] & 0xFFFFu;
+        uint32_t pkt_id = (w[2] >> 24) & 0x1Fu;
+        uint32_t pkt_type = (w[2] >> 20) & 0x7u;
+
+        /* Decode word 3: D0_Stepsize[19:0], D0_Wrap[29:20] */
+        uint32_t d0_step = w[3] & 0xFFFFFu;
+        uint32_t d0_wrap = (w[3] >> 20) & 0x3FFu;
+
+        /* Decode word 4: D1_Stepsize[19:0], D1_Wrap[29:20] */
+        uint32_t d1_step = w[4] & 0xFFFFFu;
+        uint32_t d1_wrap = (w[4] >> 20) & 0x3FFu;
+
+        /* Decode word 5: D2_Stepsize[19:0], D2_Wrap[29:20] */
+        uint32_t d2_step = w[5] & 0xFFFFFu;
+        uint32_t d2_wrap = (w[5] >> 20) & 0x3FFu;
+
+        /* Decode word 6: Iter_Stepsize[19:0], Iter_Wrap[25:20], Iter_Current[31:26] */
+        uint32_t iter_step = w[6] & 0xFFFFFu;
+        uint32_t iter_wrap = (w[6] >> 20) & 0x3Fu;
+        uint32_t iter_curr = (w[6] >> 26) & 0x3Fu;
+
+        /* Decode word 7: Valid[0], Next_BD[4:1], Use_Next[5],
+         * Lock_Acq_Val[13:6], Lock_Acq_ID[17:14],
+         * Lock_Rel_Val[25:18], Lock_Rel_ID[29:26],
+         * Lock_Acq_En[30], Lock_Rel_En[31] */
+        uint32_t valid = w[7] & 0x1u;
+        uint32_t next_bd = (w[7] >> 1) & 0xFu;
+        uint32_t use_next = (w[7] >> 5) & 0x1u;
+        int32_t acq_val = (int32_t)((int8_t)((w[7] >> 6) & 0xFFu));
+        uint32_t acq_id = (w[7] >> 14) & 0xFu;
+        int32_t rel_val = (int32_t)((int8_t)((w[7] >> 18) & 0xFFu));
+        uint32_t rel_id = (w[7] >> 26) & 0xFu;
+        uint32_t acq_en = (w[7] >> 30) & 0x1u;
+        uint32_t rel_en = (w[7] >> 31) & 0x1u;
+
+        /* Print header with raw words */
+        printf("[AieRt_Debug]   BD%-2u raw: [%08x %08x %08x %08x %08x %08x %08x %08x]\n", (unsigned)bd, w[0], w[1],
+               w[2], w[3], w[4], w[5], w[6], w[7]);
+
+        /* Print decoded fields */
+        uint64_t full_addr = ((uint64_t)addr_hi << 32) | (uint64_t)addr_lo;
+        printf("[AieRt_Debug]     addr=0x%llx len=%u valid=%u", (unsigned long long)full_addr, buf_len, valid);
+        if (use_next)
+            printf("  next->BD%u", next_bd);
+        else
+            printf("  next=(none)");
+        if (pkt_id || pkt_type)
+            printf("  pkt_id=%u pkt_type=%u", pkt_id, pkt_type);
+        printf("\n");
+
+        /* Print dimension strides/wraps */
+        printf("[AieRt_Debug]     D0: step=%u wrap=%u  D1: step=%u wrap=%u  D2: step=%u wrap=%u\n", d0_step, d0_wrap,
+               d1_step, d1_wrap, d2_step, d2_wrap);
+
+        /* Print iteration */
+        if (iter_step || iter_wrap || iter_curr)
+            printf("[AieRt_Debug]     Iter: step=%u wrap=%u current=%u\n", iter_step, iter_wrap, iter_curr);
+
+        /* Print lock */
+        if (acq_en || rel_en)
+            printf("[AieRt_Debug]     Lock: acq_en=%u id=%u val=%d  rel_en=%u id=%u val=%d\n", acq_en, acq_id, acq_val,
+                   rel_en, rel_id, rel_val);
+
+        printed++;
+    }
+
+    if (printed == 0)
+        printf("[AieRt_Debug]   (no configured BDs — all Buffer_Length == 0)\n");
+
+    printf("[AieRt_Debug] ===== End Shim tile(%u,0) Raw BD Dump =====\n", (unsigned)col);
 }
 
 /* --------------------------------------------------------------------------
@@ -1194,26 +1340,42 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
 
     /* 2. Stream switch configuration (JSON) — most useful for routing debug */
     {
-        XAie_LocType ss_tiles[128];
+        XAie_LocType ss_tiles[512];
         uint32_t ss_count = 0;
 
-        /* Core tiles */
-        for (uint32_t i = 0; i < num_tiles && ss_count < 128; i++)
-            ss_tiles[ss_count++] = tiles[i];
+        /* Collect all known tiles (core + shim) to determine column/row span */
+        uint8_t min_col = 0xFF, max_col = 0;
+        uint8_t max_row = 0;
 
-        /* Shim tiles from ios (deduplicated) */
-        for (uint32_t i = 0; i < num_ios && ss_count < 128; i++) {
-            if (!s_is_shim(ios[i].tile_loc))
-                continue;
-            int found = 0;
-            for (uint32_t j = 0; j < ss_count; j++) {
-                if (ss_tiles[j].Col == ios[i].tile_loc.Col && ss_tiles[j].Row == ios[i].tile_loc.Row) {
-                    found = 1;
-                    break;
-                }
+        for (uint32_t i = 0; i < num_tiles; i++) {
+            if (tiles[i].Col < min_col)
+                min_col = tiles[i].Col;
+            if (tiles[i].Col > max_col)
+                max_col = tiles[i].Col;
+            if (tiles[i].Row > max_row)
+                max_row = tiles[i].Row;
+        }
+        for (uint32_t i = 0; i < num_ios; i++) {
+            if (ios[i].tile_loc.Col < min_col)
+                min_col = ios[i].tile_loc.Col;
+            if (ios[i].tile_loc.Col > max_col)
+                max_col = ios[i].tile_loc.Col;
+            if (ios[i].tile_loc.Row > max_row)
+                max_row = ios[i].tile_loc.Row;
+        }
+        if (min_col > max_col) {
+            min_col = 0;
+            max_col = 0;
+        }
+
+        /* Scan the full column×row rectangle so that pass-through routing
+         * tiles (e.g. shim col 6 → mem-tile rows 1-2 → core row 3) are
+         * included.  print_all=0 means tiles with no active ports produce
+         * empty JSON and are harmlessly skipped by the visualiser.           */
+        for (uint8_t col = min_col; col <= max_col && ss_count < 512; col++) {
+            for (uint8_t row = 0; row <= max_row && ss_count < 512; row++) {
+                ss_tiles[ss_count++] = XAie_TileLoc(col, row);
             }
-            if (!found)
-                ss_tiles[ss_count++] = ios[i].tile_loc;
         }
 
         if (g_runtime_debug_level >= 1)
@@ -1302,7 +1464,32 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
             AieRt_PrintAllBds(dev, seen[i]);
     }
 
-    /* 10. IO verification */
+    /* 10. Raw BD register dump for shim tiles (shows stride/wrap/iteration) */
+    printf("[AieRt_Debug] ===== Shim Raw BD Registers (stride/wrap) =====\n");
+    {
+        uint8_t shim_seen[64];
+        uint32_t shim_seen_count = 0;
+        for (uint32_t i = 0; i < num_ios; i++) {
+            if (!s_is_shim(ios[i].tile_loc))
+                continue;
+            uint8_t col = ios[i].tile_loc.Col;
+            int already = 0;
+            for (uint32_t j = 0; j < shim_seen_count; j++) {
+                if (shim_seen[j] == col) {
+                    already = 1;
+                    break;
+                }
+            }
+            if (!already && shim_seen_count < 64) {
+                shim_seen[shim_seen_count++] = col;
+                AieRt_PrintShimBdRawAll(dev, col);
+            }
+        }
+        if (shim_seen_count == 0)
+            printf("[AieRt_Debug]  (no shim tiles in ios list)\n");
+    }
+
+    /* 11. IO verification */
     AieRt_VerifyIoDescriptors(dev, ios, num_ios);
 
     printf("[AieRt_Debug] ============================================================\n\n");
@@ -1673,25 +1860,38 @@ void AieRt_PrintStreamSwitchConfigAll(XAie_DevInst *dev, const XAie_LocType *til
  * Coordinate-based debug snapshot helper
  * -------------------------------------------------------------------------- */
 
+/* Max IOs and tiles supported by the stack-allocated snapshot helper.
+ * Baremetal environments often have broken/limited calloc (nosys.specs),
+ * so we avoid heap allocation entirely. */
+#define AIERT_SNAPSHOT_MAX_IOS 128
+#define AIERT_SNAPSHOT_MAX_TILES 64
+
 void AieRt_DebugSnapshotFromCoords(XAie_DevInst *dev, const uint8_t *io_cols, const uint8_t *io_rows,
                                    const uint8_t *io_chs, const uint8_t *io_bds, const int *io_dirs, uint32_t num_ios,
                                    const uint8_t *tile_cols, const uint8_t *tile_rows, uint32_t num_tiles) {
-    /* Build struct_io array on the stack (num_ios typically small: <16) */
-    struct_io ios[64];
-    if (num_ios > 64)
-        num_ios = 64;
+    /* Stack-allocated arrays — avoids calloc which fails on baremetal */
+    struct_io ios[AIERT_SNAPSHOT_MAX_IOS];
+    XAie_LocType tiles[AIERT_SNAPSHOT_MAX_TILES];
+
+    if (num_ios > AIERT_SNAPSHOT_MAX_IOS) {
+        printf("[AieRt_Debug] WARNING: num_ios=%u exceeds max %d, clamping\n", (unsigned)num_ios,
+               AIERT_SNAPSHOT_MAX_IOS);
+        num_ios = AIERT_SNAPSHOT_MAX_IOS;
+    }
+    if (num_tiles > AIERT_SNAPSHOT_MAX_TILES) {
+        printf("[AieRt_Debug] WARNING: num_tiles=%u exceeds max %d, clamping\n", (unsigned)num_tiles,
+               AIERT_SNAPSHOT_MAX_TILES);
+        num_tiles = AIERT_SNAPSHOT_MAX_TILES;
+    }
+
+    memset(ios, 0, num_ios * sizeof(struct_io));
     for (uint32_t i = 0; i < num_ios; i++) {
-        memset(&ios[i], 0, sizeof(struct_io));
         ios[i].tile_loc = XAie_TileLoc(io_cols[i], io_rows[i]);
         ios[i].channel_id = io_chs[i];
         ios[i].bd_id = io_bds[i];
         ios[i].direction = (XAie_DmaDirection)io_dirs[i];
     }
 
-    /* Build tile location array */
-    XAie_LocType tiles[64];
-    if (num_tiles > 64)
-        num_tiles = 64;
     for (uint32_t i = 0; i < num_tiles; i++) {
         tiles[i] = XAie_TileLoc(tile_cols[i], tile_rows[i]);
     }
