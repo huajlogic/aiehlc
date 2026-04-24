@@ -453,7 +453,13 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
     int addrDims = (num_dims <= 3) ? num_dims : 3;
     XAie_DmaDimDesc dimDescs[3];
     for (int i = 0; i < addrDims; i++) {
-        dimDescs[i].AieMlDimDesc.StepSize = (uint32_t)strides[i];
+        /* IR strides are in byte units; XAie expects 32-bit word units (÷4) */
+        if (strides[i] % 4 != 0) {
+            printf("[aie_runtime] ERROR: dim_stride[%d]=%d not divisible by 4 "
+                   "(must be 32-bit aligned)\n",
+                   i, strides[i]);
+        }
+        dimDescs[i].AieMlDimDesc.StepSize = (uint32_t)(strides[i] / 4);
         dimDescs[i].AieMlDimDesc.Wrap = (uint16_t)wraps[i];
     }
     XAie_DmaTensor tensor;

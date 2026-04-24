@@ -492,6 +492,15 @@ void dfschedule::ConfigDmaBdOp::print(::mlir::OpAsmPrinter &printer) {
         if (strides->size() > 4) {
             return emitOpError("dim_strides/dim_wraps size must be <= 4, got ") << strides->size();
         }
+        // Stride alignment check: IR strides are in bytes and must be
+        // 32-bit word aligned (divisible by 4) for the runtime ÷4 conversion.
+        for (auto [i, attr] : llvm::enumerate(*strides)) {
+            int32_t val = mlir::cast<IntegerAttr>(attr).getInt();
+            if (val % 4 != 0)
+                return emitOpError("dim_strides[") << i << "] = " << val
+                                                   << " is not divisible by 4 "
+                                                      "(strides must be 32-bit word aligned in bytes)";
+        }
     }
     return ::mlir::success();
 }

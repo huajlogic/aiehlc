@@ -1080,21 +1080,28 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 int64_t tileW = outW / numTileCols; // e.g. 16/4 = 4
 
                 if (numTileCols > 1) {
-                    // Shim DMA StepSize operates at 32-bit word granularity
-                    // (see XAie_DmaSetMultiDimAddr doc: "stepsize and wrap
-                    //  parameters operate at 32 bit granularity").
-                    // Convert element-based dimensions to 32-bit word units.
+                    // Strides are in BYTE units in the IR.
+                    // The runtime (__Runtime_dma_bd_config_multidim) converts
+                    // to 32-bit word units (÷4) before the XAie driver call.
+                    //
+                    // The DMA operates at 32-bit (4-byte) word granularity,
+                    // so strides are first computed in word units and then
+                    // multiplied by 4 to express them in bytes.
                     unsigned bitWidth = rootType.getElementTypeBitWidth();
-                    int64_t elemsPerWord = 32 / bitWidth; // e.g. 4 for i8, 2 for i16, 1 for i32
+                    int64_t elemsPerWord = 32 / bitWidth; // e.g. 4 for i8, 2 for i16
+                    constexpr int64_t wordBytes = 4;      // 32-bit DMA word = 4 bytes
 
-                    int64_t tileW_w = tileW / elemsPerWord; // tile width in words
+                    int64_t tileW_w = tileW / elemsPerWord; // tile width in words (for D0 wrap)
                     int64_t outW_w = outW / elemsPerWord;   // full output width in words
 
-                    // Per-channel row-strip in 32-bit word units:
-                    // D0: tileW_w contiguous words (stride=1 word)
-                    // D1: stripH rows, stride = outW_w words (jump to next row in DDR)
-                    // D2: numTileCols tiles horizontally, stride = tileW_w words
-                    SmallVector<int32_t> strides = {1, static_cast<int32_t>(outW_w), static_cast<int32_t>(tileW_w)};
+                    // Per-channel row-strip strides in BYTES (word-stride × 4):
+                    // D0: 1 word stride in bytes
+                    // D1: full output row width in bytes (jump to next row in DDR)
+                    // D2: tile width in bytes (jump to next tile column)
+                    SmallVector<int32_t> strides = {static_cast<int32_t>(1 * wordBytes),
+                                                    static_cast<int32_t>(outW_w * wordBytes),
+                                                    static_cast<int32_t>(tileW_w * wordBytes)};
+                    // Wraps are iteration counts — unchanged
                     SmallVector<int32_t> wraps = {static_cast<int32_t>(tileW_w), static_cast<int32_t>(stripH),
                                                   static_cast<int32_t>(numTileCols)};
                     shimDimStrides = rewriter.getI32ArrayAttr(strides);

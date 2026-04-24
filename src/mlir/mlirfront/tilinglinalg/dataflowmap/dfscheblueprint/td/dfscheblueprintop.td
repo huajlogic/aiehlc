@@ -204,6 +204,7 @@ def dfscheblueprint_FlowConfigOp : dfscheblueprintop<"flowconfig", [
     OptionalAttr<I32ArrayAttr>:$shim_dim_wraps
   );
   let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 // dfscheblueprint.flow_transfer

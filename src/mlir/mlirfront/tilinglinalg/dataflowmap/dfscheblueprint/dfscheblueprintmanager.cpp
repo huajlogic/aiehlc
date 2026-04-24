@@ -359,6 +359,24 @@ ParseResult dfscheblueprint::FlowTransferOp::parse(OpAsmParser &parser, Operatio
 }
 
 //===----------------------------------------------------------------------===//
+// FlowConfigOp Verifier
+//===----------------------------------------------------------------------===//
+
+::mlir::LogicalResult dfscheblueprint::FlowConfigOp::verify() {
+    auto strides = getShimDimStrides();
+    if (strides) {
+        for (auto [i, attr] : llvm::enumerate(*strides)) {
+            int32_t val = mlir::cast<IntegerAttr>(attr).getInt();
+            if (val % 4 != 0)
+                return emitOpError("shim_dim_strides[") << i << "] = " << val
+                                                        << " is not divisible by 4 "
+                                                           "(strides must be 32-bit word aligned in bytes)";
+        }
+    }
+    return ::mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
 // Dialect Initialization
 //===----------------------------------------------------------------------===//
 

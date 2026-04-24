@@ -353,6 +353,8 @@ public:
 
     TileDmaLimits getDmaLimits(TileType type) const override { return layout_.getDmaLimits(type); }
 
+    uint32_t getDmaWordBytes() const override { return 4; } // 32-bit DMA word = 4 bytes
+
     const std::unordered_set<uint32_t>& getShimNoc() const override{
         return layout_.getShimNoc();
     }
