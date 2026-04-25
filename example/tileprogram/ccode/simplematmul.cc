@@ -38,9 +38,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-#define M 16
-#define K 16
-#define N 16
+#define M 32
+#define K 32
+#define N 32
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4
@@ -234,7 +234,7 @@ int main() {
         C[i] = 0;
 
     // --- Launch kernel on tile mesh ---
-    matmul<<<mesh>>>(A, B, C);
+    matmul<<<mesh>>>(A, B, C, M, N, K);
 
     // --- Wait for completion ---
     aieDeviceSynchronize();

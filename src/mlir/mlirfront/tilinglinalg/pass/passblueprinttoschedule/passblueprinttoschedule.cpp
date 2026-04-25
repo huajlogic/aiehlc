@@ -505,6 +505,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
     std::shared_ptr<ResourceMgr> resourceMgr;
     std::shared_ptr<BlueprintPassState> passState;
     double bufferRatio;
+    int64_t maxPingPongBytes;
     // Buffer index mapping keyed by data_id.
     // All tiles share the same kernel ELF (one BCF), so all row partitions
     // of the same input tensor must use the same buffer addresses (e.g.
@@ -516,9 +517,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
     mutable int nextOutputIdx = 0;
 
     FlowTransferConversion(MLIRContext *ctx, std::shared_ptr<ResourceMgr> mgr,
-                           std::shared_ptr<BlueprintPassState> state, double ratio)
+                           std::shared_ptr<BlueprintPassState> state, double ratio, int64_t maxPPBytes)
         : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), resourceMgr(std::move(mgr)),
-          passState(std::move(state)), bufferRatio(ratio) {}
+          passState(std::move(state)), bufferRatio(ratio), maxPingPongBytes(maxPPBytes) {}
 
     LogicalResult
     matchAndRewrite(dfscheblueprint::FlowTransferOp op, OpAdaptor adaptor,
@@ -845,6 +846,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             int64_t pingPongBufferSize = static_cast<int64_t>(perCoreElements * bufferRatio);
             if (pingPongBufferSize <= 0)
                 pingPongBufferSize = 1;
+            // Clamp to maxPingPongBytes to prevent exceeding core tile memory
+            if (maxPingPongBytes > 0 && elementSizeBytes > 0) {
+                int64_t maxElements = maxPingPongBytes / elementSizeBytes;
+                if (maxElements > 0 && pingPongBufferSize > maxElements)
+                    pingPongBufferSize = maxElements;
+            }
             // numIterations uses perCoreElements because each core only
             // processes its own share of data.
             int64_t numIterations = (perCoreElements + pingPongBufferSize - 1) / pingPongBufferSize;
@@ -975,6 +982,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             // (many_to_one) need the same allocation size even though they transfer
                             // fewer elements per core.
                             int64_t kernelBufElements = static_cast<int64_t>(fullPartitionElements * bufferRatio);
+                            // Clamp kernelBufElements to maxPingPongBytes (same as pingPongBufferSize clamping)
+                            if (maxPingPongBytes > 0 && elementSizeBytes > 0) {
+                                int64_t maxElements = maxPingPongBytes / elementSizeBytes;
+                                if (maxElements > 0 && kernelBufElements > maxElements)
+                                    kernelBufElements = maxElements;
+                            }
                             if (kernelBufElements < pingPongBufferSize)
                                 kernelBufElements = pingPongBufferSize;
                             uint32_t bufSizeBytes = ((kernelBufElements * elementSizeBytes) + 3) & ~3;
@@ -1271,7 +1284,7 @@ void BlueprintToSchedulePass::runOnOperation() {
     auto resourceMgr = std::make_shared<ResourceMgr>(std::move(hwRes));
 
     RewritePatternSet patterns(context);
-    patterns.add<FlowTransferConversion>(context, resourceMgr, passState, bufferRatio_);
+    patterns.add<FlowTransferConversion>(context, resourceMgr, passState, bufferRatio_, maxPingPongBytes_);
     patterns.add<DataSliceOpConversion>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::FlowConfigOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::TileGroupOp>>(context);

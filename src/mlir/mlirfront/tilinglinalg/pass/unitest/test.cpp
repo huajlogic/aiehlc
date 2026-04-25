@@ -1131,8 +1131,8 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
     // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
     if (doHostPath) {
         if (startStage <= 4) {
-            if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5), irDir, stage,
-                               "BlueprintToSchedulePass"))
+            if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5, 4096), irDir,
+                               stage, "BlueprintToSchedulePass"))
                 return;
         }
         if (startStage <= 5) {
@@ -1159,8 +1159,8 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
     // Phase 3: kernel path (blueprint -> kernel schedule -> kernel API)
     if (doKernelPath) {
         if (startStage <= 4) {
-            if (!runSinglePass(ctx, kernelModule, std::make_unique<mlir::BlueprintToScheduleKernelPass>(0.5), irDir,
-                               stage, "BlueprintToScheduleKernelPass"))
+            if (!runSinglePass(ctx, kernelModule, std::make_unique<mlir::BlueprintToScheduleKernelPass>(0.5, 4096),
+                               irDir, stage, "BlueprintToScheduleKernelPass"))
                 return;
         }
         if (startStage <= 10) {
@@ -1317,7 +1317,7 @@ void testMultidimBd() {
     ResourceMgr::init(std::move(hwRes));
 
     // Run BlueprintToSchedulePass (host path)
-    if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5), irDir, stage,
+    if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5, 4096), irDir, stage,
                        "BlueprintToSchedulePass"))
         return;
     if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,

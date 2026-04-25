@@ -61,5 +61,5 @@ public:
     static bool runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                             const std::string &userKernelBody = "", const std::string &userKernelFuncName = "",
                             int runtimeDebugLevel = -1, const std::string &userRewrittenSource = "",
-                            const std::vector<TensorParam> &tensors = {});
+                            const std::vector<TensorParam> &tensors = {}, int64_t maxPingPongBytes = 4096);
 };

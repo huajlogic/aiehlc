@@ -478,10 +478,11 @@ public:
 							const FunctionDecl *kernelFD = it->second;
 							unsigned numKernelParams = kernelFD->getNumParams();
 
-							// Semantic validation: check launch arg count vs kernel param count
-							unsigned numLaunchArgs = CE->getNumArgs() - 2; // exclude name and mesh
-							if (numLaunchArgs != numKernelParams) {
-								llvm::errs() << "Error: kernel '" << launchKernelName
+                            // Semantic validation: check launch arg count vs kernel param count
+                            // Extra launch args beyond kernel params are dimension scalars (M, N, K)
+                            unsigned numLaunchArgs = CE->getNumArgs() - 2; // exclude name and mesh
+                            if (numLaunchArgs < numKernelParams) {
+                                llvm::errs() << "Error: kernel '" << launchKernelName
 											 << "' declares " << numKernelParams << " parameters but launch provides "
 											 << numLaunchArgs << " arguments.\n";
 								llvm::errs() << "  __global__ void " << launchKernelName << "(...) has "
@@ -489,7 +490,10 @@ public:
 								llvm::errs() << "  " << launchKernelName << "<<<mesh>>>(...) provides "
 											 << numLaunchArgs << " args\n";
 								// Don't abort — continue with available info
-							}
+                            } else if (numLaunchArgs > numKernelParams) {
+                                llvm::outs() << "[TilingLinalg] " << (numLaunchArgs - numKernelParams)
+                                             << " extra launch args detected (dimension scalars)\n";
+                            }
 
                             // Helper lambda: check if a QualType is a spatial wrapper or pointer type
                             // (i.e. a tensor parameter, not a scalar dimension).
@@ -509,9 +513,9 @@ public:
                                 return false;
                             };
 
-                            // First pass: collect scalar dimension values from launch args
-							// Launch args start at index 2 (0=name, 1=mesh, 2..=kernel params)
-							std::vector<int64_t> scalarDimValues;
+                            // First pass: collect scalar dimension values from kernel params
+                            // Launch args start at index 2 (0=name, 1=mesh, 2..=kernel params)
+                            std::vector<int64_t> scalarDimValues;
 							for (unsigned i = 0; i < numKernelParams; ++i) {
 								const ParmVarDecl *kp = kernelFD->getParamDecl(i);
 								clang::QualType ptype = kp->getType();
@@ -527,7 +531,22 @@ public:
                                 }
                             }
 
-							// Determine default shape from scalar dims (e.g. M, N, K -> MxN for each tensor)
+                            // Second: collect extra launch args beyond kernel params as dimension scalars
+                            // e.g. matmul<<<mesh>>>(A, B, C, M, N, K) — M,N,K are at indices numKernelParams+2..
+                            for (unsigned i = numKernelParams; i < numLaunchArgs; ++i) {
+                                unsigned launchArgIdx = i + 2;
+                                if (launchArgIdx < CE->getNumArgs()) {
+                                    clang::Expr::EvalResult evalRes;
+                                    if (CE->getArg(launchArgIdx)->EvaluateAsInt(evalRes, *Context)) {
+                                        int64_t val = evalRes.Val.getInt().getExtValue();
+                                        scalarDimValues.push_back(val);
+                                        llvm::outs() << "[TilingLinalg] Extra launch arg[" << (i - numKernelParams)
+                                                     << "] = " << val << "\n";
+                                    }
+                                }
+                            }
+
+                            // Determine default shape from scalar dims (e.g. M, N, K -> MxN for each tensor)
 							// For GEMM: A[M*K], B[K*N], C[M*N] with scalars [M, N, K]
 							// General case: use first two scalars as shape for all tensors
 							int64_t defaultDim0 = 16, defaultDim1 = 16;
@@ -537,6 +556,60 @@ public:
 							} else if (scalarDimValues.size() == 1) {
 								defaultDim0 = defaultDim1 = scalarDimValues[0];
 							}
+
+                            // Map scalar dims to GEMM M, N, K when 3 values available
+                            // (from either kernel params or extra launch args)
+                            int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0;
+                            if (scalarDimValues.size() >= 3) {
+                                macroDimM = scalarDimValues[0];
+                                macroDimN = scalarDimValues[1];
+                                macroDimK = scalarDimValues[2];
+                                llvm::outs() << "[TilingLinalg] GEMM dims from launch args: M=" << macroDimM
+                                             << " N=" << macroDimN << " K=" << macroDimK << "\n";
+                                defaultDim0 = macroDimM;
+                                defaultDim1 = macroDimK;
+                            }
+                            // Fallback: when no scalar dims found, try to extract M, N, K from
+                            // user #define macros (e.g. #define M 32, #define K 32, #define N 32).
+                            // These are the standard GEMM dimension macros used in the kernel source.
+                            if (macroDimM == 0 && scalarDimValues.empty()) {
+                                for (const auto &macroLine : userMacroDefines) {
+                                    // Parse "#define <NAME> <integer>"
+                                    std::istringstream mss(macroLine);
+                                    std::string tok_define, tok_name, tok_value;
+                                    mss >> tok_define >> tok_name >> tok_value;
+                                    if (tok_define != "#define" || tok_name.empty() || tok_value.empty())
+                                        continue;
+                                    // Only accept pure integer values (no expressions)
+                                    bool allDigits = true;
+                                    for (char c : tok_value) {
+                                        if (!std::isdigit(c)) {
+                                            allDigits = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!allDigits)
+                                        continue;
+                                    int64_t val = std::stoll(tok_value);
+                                    if (tok_name == "M")
+                                        macroDimM = val;
+                                    else if (tok_name == "N")
+                                        macroDimN = val;
+                                    else if (tok_name == "K")
+                                        macroDimK = val;
+                                }
+                                if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0) {
+                                    llvm::outs() << "[TilingLinalg] GEMM dims from macros: M=" << macroDimM
+                                                 << " N=" << macroDimN << " K=" << macroDimK << "\n";
+                                    // Update defaults (used when no per-tensor shape can be determined)
+                                    defaultDim0 = macroDimM;
+                                    defaultDim1 = macroDimK;
+                                } else if (macroDimM > 0) {
+                                    // Partial: at least M is defined
+                                    defaultDim0 = macroDimM;
+                                    defaultDim1 = macroDimN > 0 ? macroDimN : macroDimM;
+                                }
+                            }
 
                             // Second pass: build ParsedTensorInfo for each tensor parameter
                             // Handles both bare pointer types (input_window_int8*) and
@@ -646,7 +719,22 @@ public:
 
                                 ParsedTensorInfo pti;
                                 pti.varName = kp->getNameAsString();
-                                pti.shape = {defaultDim0, defaultDim1};
+                                // Assign per-tensor GEMM shapes from M/N/K macros when available:
+                                //   row_broadcast_in (A) → [M, K]
+                                //   col_broadcast_in (B) → [K, N]
+                                //   row_major_out    (C) → [M, N]
+                                if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0) {
+                                    if (spatialTag == "row_broadcast_in")
+                                        pti.shape = {macroDimM, macroDimK};
+                                    else if (spatialTag == "col_broadcast_in")
+                                        pti.shape = {macroDimK, macroDimN};
+                                    else if (spatialTag == "row_major_out" || spatialTag == "col_major_out")
+                                        pti.shape = {macroDimM, macroDimN};
+                                    else
+                                        pti.shape = {defaultDim0, defaultDim1};
+                                } else {
+                                    pti.shape = {defaultDim0, defaultDim1};
+                                }
                                 pti.elementBitWidth = bitWidth;
                                 pti.isInput = isInput;
                                 pti.spatialTag = spatialTag;

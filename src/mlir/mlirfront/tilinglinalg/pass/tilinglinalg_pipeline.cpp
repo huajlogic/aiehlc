@@ -194,7 +194,7 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
 bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                                        const std::string &userKernelBody, const std::string &userKernelFuncName,
                                        int runtimeDebugLevel, const std::string &userRewrittenSource,
-                                       const std::vector<TensorParam> &tensors) {
+                                       const std::vector<TensorParam> &tensors, int64_t maxPingPongBytes) {
 
     RoutingTopology rtopology("Gen2");
 
@@ -242,8 +242,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     }
 
     // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
-    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5), irDir, stage,
-                       "BlueprintToSchedulePass"))
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5, maxPingPongBytes),
+                               irDir, stage, "BlueprintToSchedulePass"))
         return false;
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
                        "ScheduleCanonicalizePass"))
@@ -258,8 +258,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
 
     // Phase 3: kernel path (blueprint -> kernel schedule -> kernel API)
-    if (!runPipelineSinglePass(ctx, kernelModule, std::make_unique<mlir::BlueprintToScheduleKernelPass>(0.5), irDir, stage,
-                       "BlueprintToScheduleKernelPass"))
+    if (!runPipelineSinglePass(ctx, kernelModule,
+                               std::make_unique<mlir::BlueprintToScheduleKernelPass>(0.5, maxPingPongBytes), irDir,
+                               stage, "BlueprintToScheduleKernelPass"))
         return false;
 
     // Extract kernel parameter info from KernelModuleOp (before DfscheduleToKernelApiPass lowers it)
