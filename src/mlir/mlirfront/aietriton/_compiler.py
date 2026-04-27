@@ -136,7 +136,11 @@ def _bits_to_element_type(bits):
 def _extract_kernel_body(func_def, param_names, tensor_params, constexpr_params,
                          kwargs, element_type, num_input_windows,
                          num_output_windows, kernel_name):
-    """Translate Python kernel AST -> C via KernelOps -> pybind11 -> MLIR EmitC."""
+    """Translate Python kernel AST -> C via KernelOps -> C string.
+
+    Tries the pure Python emitter first (no C++ .so required), then falls
+    back to the pybind11/MLIR EmitC path.
+    """
     from .aie_pass.ast_to_kernelops import ast_to_kernel_ops
 
     # Phase 1: Python AST -> KernelOp list
@@ -147,7 +151,24 @@ def _extract_kernel_body(func_def, param_names, tensor_params, constexpr_params,
     if not kernel_ops:
         return ""  # fallback to auto-gen if AST produced no ops
 
-    # Phase 2: KernelOps -> pybind11 -> MLIR EmitC -> C string
+    # Phase 2: KernelOps -> C string
+    # Try pure Python emitter first (no C++ .so required)
+    try:
+        import sys
+        import os
+        _python_dir = os.path.normpath(os.path.join(
+            os.path.dirname(__file__), '..', '..', '..', 'python'))
+        if _python_dir not in sys.path:
+            sys.path.insert(0, _python_dir)
+        from kernel_emitter import build_kernel_body
+        return build_kernel_body(
+            kernel_name, element_type,
+            num_input_windows, num_output_windows, kernel_ops
+        )
+    except ImportError:
+        pass
+
+    # Fallback: C++ pybind11 path
     from . import _aietriton_core
 
     c_code = _aietriton_core.build_kernel_body(
