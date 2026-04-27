@@ -46,8 +46,10 @@
 #include "routingdeadargclean.h"
 
 #include "../kernelconfig/kernelconfig.h"
+#include "../passkernelgraphtorouting/passkernelgraphtorouting.h"
 #include "../tilinglinalg_pipeline.h"
 #include "hw/ResourceManager.h"
+#include "kernelgraphmanager.h"
 #include "mlir/Transforms/Passes.h"
 #include "routingconstantfold.h"
 
@@ -1406,6 +1408,356 @@ void testMultidimBd() {
     std::cout << "\n=== Multi-Dimensional BD Test Complete ===" << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-kernel test
+// ---------------------------------------------------------------------------
+// Tests the multi-kernel pipeline: builds a 2-kernel graph (gemm + relu),
+// runs KernelGraphToRoutingPass, then runs the full pipeline per-kernel.
+
+void testMultiKernel() {
+    std::cout << "\n=== Multi-Kernel Pipeline Test ===" << std::endl;
+
+    MLIRContext ctx;
+    TilingLinalgPipeline::registerDialects(ctx);
+
+    // Build a 2-kernel graph:
+    //   kernel "gemm" on 2x2 mesh at (row=3, col=2)
+    //   kernel "relu" on 2x2 mesh at (row=3, col=4)
+    //   data_edge: gemm output[0] -> relu input[0] via DDR bounce
+    std::vector<KernelInfo> kernels = {
+        {/*kernelName=*/"gemm",
+         /*kernelFuncName=*/"gemm_i8_i8",
+         /*kernelBody=*/"",
+         /*meshRows=*/2, /*meshCols=*/2,
+         /*originRow=*/3, /*originCol=*/2,
+         /*kernelId=*/0},
+        {/*kernelName=*/"relu",
+         /*kernelFuncName=*/"relu_i8",
+         /*kernelBody=*/"",
+         /*meshRows=*/2, /*meshCols=*/2,
+         /*originRow=*/3, /*originCol=*/4,
+         /*kernelId=*/1},
+    };
+
+    // Step 1: Build the kernelgraph IR
+    std::cout << "\n--- Step 1: Building kernelgraph IR ---" << std::endl;
+    kernelgraphmanager kgm;
+    auto module = kgm.buildMultiKernelGraph(&ctx, kernels);
+    std::cout << "Kernelgraph IR:" << std::endl;
+    module.dump();
+
+    // Step 2: Run KernelGraphToRoutingPass
+    std::cout << "\n--- Step 2: Running KernelGraphToRoutingPass ---" << std::endl;
+    {
+        mlir::PassManager pm(&ctx);
+        pm.addPass(std::make_unique<KernelGraphToRoutingPass>());
+        if (failed(pm.run(module))) {
+            llvm::errs() << "ERROR: KernelGraphToRoutingPass failed!\n";
+            return;
+        }
+    }
+
+    std::cout << "\nPost-KernelGraphToRoutingPass module:" << std::endl;
+    module.dump();
+
+    // Step 3: Run the multi-kernel pipeline
+    std::cout << "\n--- Step 3: Running multi-kernel pipeline ---" << std::endl;
+
+    const std::string worklocalDir = setupWorklocalDir();
+    if (worklocalDir.empty())
+        return;
+
+    std::string mkDir = worklocalDir + "/multikernel";
+    if (std::error_code EC = llvm::sys::fs::create_directories(mkDir)) {
+        llvm::errs() << "Failed to create " << mkDir << ": " << EC.message() << "\n";
+        return;
+    }
+
+    if (!TilingLinalgPipeline::runMultiKernelPipeline(ctx, module, mkDir, kernels)) {
+        llvm::errs() << "ERROR: runMultiKernelPipeline failed!\n";
+        return;
+    }
+
+    std::cout << "\n--- Step 4: Verification ---" << std::endl;
+
+    // Check that output files exist
+    std::vector<std::string> expectedFiles = {
+        mkDir + "/host_main.cc",
+        mkDir + "/compile_all_kernels.sh",
+    };
+    for (const auto &ki : kernels) {
+        expectedFiles.push_back(mkDir + "/" + ki.kernelName + "/host.cc");
+        expectedFiles.push_back(mkDir + "/" + ki.kernelName + "/kernel.cc");
+    }
+
+    bool allExist = true;
+    for (const auto &f : expectedFiles) {
+        bool exists = llvm::sys::fs::exists(f);
+        std::cout << "  " << (exists ? "OK" : "MISSING") << ": " << f << std::endl;
+        if (!exists)
+            allExist = false;
+    }
+
+    if (allExist) {
+        std::cout << "\nPASS: All expected multi-kernel output files generated." << std::endl;
+    } else {
+        std::cout << "\nFAIL: Some output files are missing." << std::endl;
+    }
+
+    std::cout << "\n=== Multi-Kernel Pipeline Test Complete ===" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-kernel sequential test
+// ---------------------------------------------------------------------------
+// Tests sequential execution: 2 kernels on the SAME tile region,
+// where the second kernel reloads ELF after the first completes.
+
+void testMultiKernelSequential() {
+    std::cout << "\n=== Multi-Kernel Sequential Test ===" << std::endl;
+
+    MLIRContext ctx;
+    TilingLinalgPipeline::registerDialects(ctx);
+
+    // Build a 2-kernel graph:
+    //   kernel "conv2d" on 2x2 mesh at (row=3, col=2) — spatial_parallel (runs first)
+    //   kernel "relu"  on 2x2 mesh at (row=3, col=2) — sequential_reuse (same region)
+    //   data_edge: conv2d output[0] -> relu input[0] via DDR bounce
+    std::vector<KernelInfo> kernels = {
+        {/*kernelName=*/"conv2d",
+         /*kernelFuncName=*/"conv2d_i8",
+         /*kernelBody=*/"",
+         /*meshRows=*/2, /*meshCols=*/2,
+         /*originRow=*/3, /*originCol=*/2,
+         /*kernelId=*/0,
+         /*executionMode=*/"spatial_parallel",
+         /*placementStrategy=*/"manual"},
+        {/*kernelName=*/"relu",
+         /*kernelFuncName=*/"relu_i8",
+         /*kernelBody=*/"",
+         /*meshRows=*/2, /*meshCols=*/2,
+         /*originRow=*/3, /*originCol=*/2,
+         /*kernelId=*/1,
+         /*executionMode=*/"sequential_reuse",
+         /*placementStrategy=*/"manual"},
+    };
+
+    // Data edge: conv2d output -> relu input
+    std::vector<DataEdgeInfo> dataEdges = {
+        {/*producerKernelId=*/0, /*consumerKernelId=*/1,
+         /*producerOutputIdx=*/0, /*consumerInputIdx=*/0,
+         /*transferMode=*/"ddr_bounce", /*priority=*/0},
+    };
+
+    // Step 1: Build the kernelgraph IR
+    std::cout << "\n--- Step 1: Building kernelgraph IR ---" << std::endl;
+    kernelgraphmanager kgm;
+    auto module = kgm.buildMultiKernelGraph(&ctx, kernels);
+    std::cout << "Kernelgraph IR:" << std::endl;
+    module.dump();
+
+    // Step 2: Run KernelGraphToRoutingPass
+    std::cout << "\n--- Step 2: Running KernelGraphToRoutingPass ---" << std::endl;
+    {
+        mlir::PassManager pm(&ctx);
+        pm.addPass(std::make_unique<KernelGraphToRoutingPass>());
+        if (failed(pm.run(module))) {
+            llvm::errs() << "ERROR: KernelGraphToRoutingPass failed!\n";
+            return;
+        }
+    }
+
+    // Step 3: Run the multi-kernel pipeline
+    std::cout << "\n--- Step 3: Running multi-kernel pipeline ---" << std::endl;
+
+    llvm::SmallString<256> cwdPath;
+    llvm::sys::fs::current_path(cwdPath);
+    std::string worklocalDir = (cwdPath + "/worklocal").str();
+    llvm::sys::fs::create_directories(worklocalDir);
+
+    std::string mkDir = worklocalDir + "/multikernel_seq";
+    llvm::sys::fs::create_directories(mkDir);
+
+    if (!TilingLinalgPipeline::runMultiKernelPipeline(ctx, module, mkDir, kernels, dataEdges)) {
+        llvm::errs() << "ERROR: runMultiKernelPipeline failed!\n";
+        return;
+    }
+
+    // Step 4: Verification
+    std::cout << "\n--- Step 4: Verification ---" << std::endl;
+
+    std::vector<std::string> expectedFiles = {
+        mkDir + "/host_main.cc",
+        mkDir + "/compile_all_kernels.sh",
+    };
+    for (const auto &ki : kernels) {
+        expectedFiles.push_back(mkDir + "/" + ki.kernelName + "/host.cc");
+        expectedFiles.push_back(mkDir + "/" + ki.kernelName + "/kernel.cc");
+    }
+
+    bool allExist = true;
+    for (const auto &f : expectedFiles) {
+        bool exists = llvm::sys::fs::exists(f);
+        std::cout << "  " << (exists ? "OK" : "MISSING") << ": " << f << std::endl;
+        if (!exists)
+            allExist = false;
+    }
+
+    // Verify host_main.cc has 2 stages (conv2d in stage 0, relu in stage 1)
+    auto bufOrErr = llvm::MemoryBuffer::getFile(mkDir + "/host_main.cc");
+    if (bufOrErr) {
+        auto content = (*bufOrErr)->getBuffer();
+        bool hasStage0 = content.contains("Stage 0");
+        bool hasStage1 = content.contains("Stage 1");
+        bool hasDataTransfer = content.contains("Transferring data");
+        std::cout << "  " << (hasStage0 ? "OK" : "FAIL") << ": host_main.cc has Stage 0" << std::endl;
+        std::cout << "  " << (hasStage1 ? "OK" : "FAIL") << ": host_main.cc has Stage 1" << std::endl;
+        std::cout << "  " << (hasDataTransfer ? "OK" : "FAIL") << ": host_main.cc has data transfer" << std::endl;
+        if (!hasStage0 || !hasStage1 || !hasDataTransfer)
+            allExist = false;
+    }
+
+    if (allExist) {
+        std::cout << "\nPASS: Sequential multi-kernel test passed." << std::endl;
+    } else {
+        std::cout << "\nFAIL: Some checks failed." << std::endl;
+    }
+
+    std::cout << "\n=== Multi-Kernel Sequential Test Complete ===" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-kernel mixed test
+// ---------------------------------------------------------------------------
+// Tests mixed parallel+sequential execution:
+//   Stage 0: gemm (2x2 at col 2) and conv (2x2 at col 4) run in parallel
+//   Stage 1: relu (2x2 at col 2, sequential_reuse after gemm) consumes gemm output
+
+void testMultiKernelMixed() {
+    std::cout << "\n=== Multi-Kernel Mixed Test ===" << std::endl;
+
+    MLIRContext ctx;
+    TilingLinalgPipeline::registerDialects(ctx);
+
+    // 3 kernels:
+    //   gemm: spatial_parallel at (3,2) — stage 0
+    //   conv: spatial_parallel at (3,4) — stage 0 (parallel with gemm, no dependency)
+    //   relu: sequential_reuse at (3,2) — stage 1 (depends on gemm output)
+    std::vector<KernelInfo> kernels = {
+        {/*kernelName=*/"gemm",
+         /*kernelFuncName=*/"gemm_i8_i8",
+         /*kernelBody=*/"",
+         /*meshRows=*/2, /*meshCols=*/2,
+         /*originRow=*/3, /*originCol=*/2,
+         /*kernelId=*/0,
+         /*executionMode=*/"spatial_parallel",
+         /*placementStrategy=*/"manual"},
+        {/*kernelName=*/"conv",
+         /*kernelFuncName=*/"conv_i8",
+         /*kernelBody=*/"",
+         /*meshRows=*/2, /*meshCols=*/2,
+         /*originRow=*/3, /*originCol=*/4,
+         /*kernelId=*/1,
+         /*executionMode=*/"spatial_parallel",
+         /*placementStrategy=*/"manual"},
+        {/*kernelName=*/"relu",
+         /*kernelFuncName=*/"relu_i8",
+         /*kernelBody=*/"",
+         /*meshRows=*/2, /*meshCols=*/2,
+         /*originRow=*/3, /*originCol=*/2,
+         /*kernelId=*/2,
+         /*executionMode=*/"sequential_reuse",
+         /*placementStrategy=*/"manual"},
+    };
+
+    // Data edge: gemm output -> relu input
+    std::vector<DataEdgeInfo> dataEdges = {
+        {/*producerKernelId=*/0, /*consumerKernelId=*/2,
+         /*producerOutputIdx=*/0, /*consumerInputIdx=*/0,
+         /*transferMode=*/"ddr_bounce", /*priority=*/0},
+    };
+
+    // Step 1: Build the kernelgraph IR
+    std::cout << "\n--- Step 1: Building kernelgraph IR ---" << std::endl;
+    kernelgraphmanager kgm;
+    auto module = kgm.buildMultiKernelGraph(&ctx, kernels);
+    std::cout << "Kernelgraph IR:" << std::endl;
+    module.dump();
+
+    // Step 2: Run KernelGraphToRoutingPass
+    std::cout << "\n--- Step 2: Running KernelGraphToRoutingPass ---" << std::endl;
+    {
+        mlir::PassManager pm(&ctx);
+        pm.addPass(std::make_unique<KernelGraphToRoutingPass>());
+        if (failed(pm.run(module))) {
+            llvm::errs() << "ERROR: KernelGraphToRoutingPass failed!\n";
+            return;
+        }
+    }
+
+    // Step 3: Run the multi-kernel pipeline
+    std::cout << "\n--- Step 3: Running multi-kernel pipeline ---" << std::endl;
+
+    llvm::SmallString<256> cwdPath;
+    llvm::sys::fs::current_path(cwdPath);
+    std::string worklocalDir = (cwdPath + "/worklocal").str();
+    llvm::sys::fs::create_directories(worklocalDir);
+
+    std::string mkDir = worklocalDir + "/multikernel_mixed";
+    llvm::sys::fs::create_directories(mkDir);
+
+    if (!TilingLinalgPipeline::runMultiKernelPipeline(ctx, module, mkDir, kernels, dataEdges)) {
+        llvm::errs() << "ERROR: runMultiKernelPipeline failed!\n";
+        return;
+    }
+
+    // Step 4: Verification
+    std::cout << "\n--- Step 4: Verification ---" << std::endl;
+
+    std::vector<std::string> expectedFiles = {
+        mkDir + "/host_main.cc",
+        mkDir + "/compile_all_kernels.sh",
+    };
+    for (const auto &ki : kernels) {
+        expectedFiles.push_back(mkDir + "/" + ki.kernelName + "/host.cc");
+        expectedFiles.push_back(mkDir + "/" + ki.kernelName + "/kernel.cc");
+    }
+
+    bool allExist = true;
+    for (const auto &f : expectedFiles) {
+        bool exists = llvm::sys::fs::exists(f);
+        std::cout << "  " << (exists ? "OK" : "MISSING") << ": " << f << std::endl;
+        if (!exists)
+            allExist = false;
+    }
+
+    // Verify host_main.cc has 2 stages
+    // Stage 0: gemm + conv (parallel)
+    // Stage 1: relu (depends on gemm)
+    auto bufOrErr = llvm::MemoryBuffer::getFile(mkDir + "/host_main.cc");
+    if (bufOrErr) {
+        auto content = (*bufOrErr)->getBuffer();
+        bool hasStage0 = content.contains("Stage 0");
+        bool hasStage1 = content.contains("Stage 1");
+        bool hasDataTransfer = content.contains("Transferring data");
+        bool has2Stages = content.contains("2 stage(s)");
+        std::cout << "  " << (hasStage0 ? "OK" : "FAIL") << ": host_main.cc has Stage 0" << std::endl;
+        std::cout << "  " << (hasStage1 ? "OK" : "FAIL") << ": host_main.cc has Stage 1" << std::endl;
+        std::cout << "  " << (hasDataTransfer ? "OK" : "FAIL") << ": host_main.cc has data transfer" << std::endl;
+        std::cout << "  " << (has2Stages ? "OK" : "FAIL") << ": host_main.cc reports 2 stages" << std::endl;
+        if (!hasStage0 || !hasStage1 || !hasDataTransfer || !has2Stages)
+            allExist = false;
+    }
+
+    if (allExist) {
+        std::cout << "\nPASS: Mixed multi-kernel test passed." << std::endl;
+    } else {
+        std::cout << "\nFAIL: Some checks failed." << std::endl;
+    }
+
+    std::cout << "\n=== Multi-Kernel Mixed Test Complete ===" << std::endl;
+}
+
 int main(int argc, char* argv[]) {
     if (argc > 1) {
         std::string arg = argv[1];
@@ -1530,8 +1882,18 @@ int main(int argc, char* argv[]) {
         } else if (arg == "multidim") {
             std::cout << "Executing multi-dimensional BD addressing test..." << std::endl;
             testMultidimBd();
+        } else if (arg == "multikernel") {
+            std::cout << "Executing multi-kernel pipeline test..." << std::endl;
+            testMultiKernel();
+        } else if (arg == "multikernel_seq") {
+            std::cout << "Executing multi-kernel sequential test..." << std::endl;
+            testMultiKernelSequential();
+        } else if (arg == "multikernel_mixed") {
+            std::cout << "Executing multi-kernel mixed test..." << std::endl;
+            testMultiKernelMixed();
         } else {
-            std::cout << "Invalid argument. Please use hw, test, dfschedule, dmaphw, multidim, routing, --parse "
+            std::cout << "Invalid argument. Please use hw, test, dfschedule, dmaphw, multidim, "
+                         "multikernel, multikernel_seq, multikernel_mixed, routing, --parse "
                          "<stage> <file>\n"
                       << "Stages: routing, dmap, dmaphop, dfscheblueprint, dfschedule, emitc" << std::endl;
         }

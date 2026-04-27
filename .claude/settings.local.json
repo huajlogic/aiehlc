@@ -13,7 +13,8 @@
       "Skill(superpowers:brainstorming)",
       "Skill(superpowers:systematic-debugging)",
       "Skill(superpowers:executing-plans)",
-      "Skill(session-memory)"
+      "Skill(session-memory)",
+      "Skill(brainstorming)"
     ],
     "deny": []
   },

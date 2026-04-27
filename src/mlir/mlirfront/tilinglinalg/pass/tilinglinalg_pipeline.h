@@ -38,6 +38,10 @@ struct SplitModel {
     static TensorSplitDesc fromSpatialTag(const std::string &tag, bool isInput);
 };
 
+// Forward declarations for multi-kernel support
+struct KernelInfo;
+struct DataEdgeInfo;
+
 class TilingLinalgPipeline {
 public:
     /// Register all 6 dialect managers + standard dialects on ctx
@@ -51,6 +55,13 @@ public:
                                          const std::vector<TensorParam> &tensors,
                                          const SplitModel &splitModel = SplitModel::gemm());
 
+    /// Build routing IR for a specific region (multi-kernel support)
+    /// originRow/originCol -> physical offset for tile coordinates
+    /// kernelId -> used for resource isolation
+    static mlir::ModuleOp buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols, int originRow,
+                                         int originCol, const std::vector<TensorParam> &tensors,
+                                         const SplitModel &splitModel = SplitModel::gemm(), int kernelId = 0);
+
     /// Run the full pipeline and emit files to outputDir:
     ///   host.cc, kernel.cc, routing.cc, aieml.bcf, aieml.prx
     /// If userKernelBody is non-empty, it is written as computekernel.cc
@@ -62,4 +73,10 @@ public:
                             const std::string &userKernelBody = "", const std::string &userKernelFuncName = "",
                             int runtimeDebugLevel = -1, const std::string &userRewrittenSource = "",
                             const std::vector<TensorParam> &tensors = {});
+
+    /// Run the multi-kernel pipeline: produces per-kernel host/kernel/routing files.
+    /// dataEdges describes data dependencies between kernels for topological scheduling.
+    static bool runMultiKernelPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
+                                       const std::vector<KernelInfo> &kernels,
+                                       const std::vector<DataEdgeInfo> &dataEdges = {});
 };

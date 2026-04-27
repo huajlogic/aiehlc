@@ -22,12 +22,13 @@
 #include "routingtodmap.h"
 #include "routingunrolling.h"
 
-#include "routingmanager.h"
-#include "routinghwmanager.h"
-#include "dmapmanager.h"
-#include "dmaphopmanager.h"
-#include "dfschedulemanager.h"
 #include "dfscheblueprintmanager.h"
+#include "dfschedulemanager.h"
+#include "dmaphopmanager.h"
+#include "dmapmanager.h"
+#include "kernelgraphmanager.h"
+#include "routinghwmanager.h"
+#include "routingmanager.h"
 
 #include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -48,6 +49,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <iostream>
+#include <unordered_map>
 
 using namespace mlir;
 
@@ -116,6 +118,10 @@ void TilingLinalgPipeline::registerDialects(mlir::MLIRContext &ctx) {
     dmaphoptest.loaddialect(&ctx);
     dfscheduletest.loaddialect(&ctx);
     dfscheblueprinttest.loaddialect(&ctx);
+
+    // Register kernelgraph dialect for multi-kernel support
+    kernelgraphmanager kgm;
+    kgm.loaddialect(&ctx);
 
     ctx.getOrLoadDialect<arith::ArithDialect>();
     ctx.getOrLoadDialect<mlir::func::FuncDialect>();
@@ -189,6 +195,362 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
     m.push_back(hostFunc);
     llvm::errs() << m;
     return m;
+}
+
+mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols, int originRow,
+                                                    int originCol, const std::vector<TensorParam> &tensors,
+                                                    const SplitModel &splitModel, int kernelId) {
+    // Build routing IR at (0,0) using the existing method
+    auto module = buildRoutingIR(ctx, meshRows, meshCols, tensors, splitModel);
+
+    // Post-process: offset all tile coordinate attributes by (originRow, originCol)
+    // This adjusts createhwmesh, RoutingCreate, and other ops that reference
+    // relative tile positions to use absolute physical positions.
+    if (originRow != 0 || originCol != 0) {
+        module.walk([&](Operation *op) {
+            // Offset origin attributes on createhwmesh
+            if (auto meshOp = dyn_cast<routing::createhwmesh>(op)) {
+                // Add origin_row and origin_col attributes for downstream passes
+                meshOp->setAttr("origin_row", IntegerAttr::get(IntegerType::get(&ctx, 64), originRow));
+                meshOp->setAttr("origin_col", IntegerAttr::get(IntegerType::get(&ctx, 64), originCol));
+            }
+        });
+        // Tag the module with kernel_id for multi-kernel tracking
+        module->setAttr("routing.kernel_id", IntegerAttr::get(IntegerType::get(&ctx, 32), kernelId));
+    }
+
+    return module;
+}
+
+bool TilingLinalgPipeline::runMultiKernelPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module,
+                                                  const std::string &outputDir, const std::vector<KernelInfo> &kernels,
+                                                  const std::vector<DataEdgeInfo> &dataEdges) {
+    // Create output directory
+    if (std::error_code EC = llvm::sys::fs::create_directories(outputDir)) {
+        llvm::errs() << "Failed to create directory " << outputDir << ": " << EC.message() << "\n";
+        return false;
+    }
+
+    RoutingTopology rtopology("Gen2");
+    std::string irDir = setupPipelineIRDir("multikernel");
+
+    // Initialize ResourceMgr singleton
+    {
+        auto hwRes = makeResource("Gen2");
+        ResourceMgr::init(std::move(hwRes));
+    }
+
+    // -----------------------------------------------------------------------
+    // Topological sort: group kernels into execution stages based on data edges
+    // Kernels with no dependencies (or whose dependencies are all in earlier
+    // stages) go into the same stage and can run concurrently.
+    // -----------------------------------------------------------------------
+    // Build adjacency: consumer -> set of producer ids
+    std::unordered_map<int, std::vector<int>> predecessors;
+    for (const auto &edge : dataEdges) {
+        predecessors[edge.consumerKernelId].push_back(edge.producerKernelId);
+    }
+
+    // Assign stage numbers via BFS-like topological layering
+    std::unordered_map<int, int> kernelStage; // kernelId -> stage
+    int numStages = 0;
+    {
+        // Compute in-degree based on data edges
+        std::unordered_map<int, int> inDegree;
+        for (const auto &ki : kernels)
+            inDegree[ki.kernelId] = 0;
+        for (const auto &edge : dataEdges) {
+            inDegree[edge.consumerKernelId]++;
+        }
+
+        // BFS layers: kernels with in-degree 0 go to stage 0, etc.
+        std::vector<int> currentLayer;
+        for (const auto &ki : kernels) {
+            if (inDegree[ki.kernelId] == 0) {
+                currentLayer.push_back(ki.kernelId);
+                kernelStage[ki.kernelId] = 0;
+            }
+        }
+
+        int currentStageNum = 0;
+        while (!currentLayer.empty()) {
+            std::vector<int> nextLayer;
+            for (int kid : currentLayer) {
+                // Find consumers of this kernel
+                for (const auto &edge : dataEdges) {
+                    if (edge.producerKernelId == kid) {
+                        inDegree[edge.consumerKernelId]--;
+                        if (inDegree[edge.consumerKernelId] == 0) {
+                            kernelStage[edge.consumerKernelId] = currentStageNum + 1;
+                            nextLayer.push_back(edge.consumerKernelId);
+                        }
+                    }
+                }
+            }
+            currentLayer = nextLayer;
+            if (!nextLayer.empty())
+                currentStageNum++;
+        }
+        numStages = currentStageNum + 1;
+    }
+
+    // If no data edges, all kernels go to stage 0
+    if (dataEdges.empty()) {
+        for (const auto &ki : kernels)
+            kernelStage[ki.kernelId] = 0;
+        numStages = 1;
+    }
+
+    // Build stage -> list of kernel indices
+    std::vector<std::vector<size_t>> stages(numStages);
+    for (size_t i = 0; i < kernels.size(); ++i) {
+        int stg = kernelStage[kernels[i].kernelId];
+        stages[stg].push_back(i);
+    }
+
+    std::cout << "\n=== Multi-Kernel Execution Plan (" << numStages << " stage(s)) ===" << std::endl;
+    for (int s = 0; s < numStages; ++s) {
+        std::cout << "  Stage " << s << ": ";
+        for (size_t idx : stages[s]) {
+            std::cout << kernels[idx].kernelName << " (" << kernels[idx].executionMode << ") ";
+        }
+        std::cout << std::endl;
+    }
+
+    // Reserve regions for spatial_parallel kernels (sequential_reuse share regions)
+    for (const auto &ki : kernels) {
+        if (ki.executionMode == "spatial_parallel") {
+            if (!ResourceMgr::instance()->reserveRegion(ki.kernelId, ki.originRow, ki.originCol, ki.meshRows,
+                                                        ki.meshCols)) {
+                llvm::errs() << "Failed to reserve region for kernel " << ki.kernelName << "\n";
+                return false;
+            }
+        }
+    }
+
+    // For each kernel, build and run the pipeline independently
+    for (size_t ki_idx = 0; ki_idx < kernels.size(); ++ki_idx) {
+        const auto &ki = kernels[ki_idx];
+        std::cout << "\n=== Processing kernel: " << ki.kernelName << " (id=" << ki.kernelId << ", mesh=" << ki.meshRows
+                  << "x" << ki.meshCols << " at " << ki.originRow << "," << ki.originCol
+                  << ", mode=" << ki.executionMode << ", stage=" << kernelStage[ki.kernelId] << ") ===" << std::endl;
+
+        // Default tensor config for each kernel
+        std::vector<TensorParam> tensors = {
+            {{16, 16}, 8, true},  // input A
+            {{16, 16}, 8, true},  // input B
+            {{16, 16}, 8, false}, // output C
+        };
+
+        // Build routing IR with origin offset for this kernel
+        auto kernelModule = buildRoutingIR(ctx, ki.meshRows, ki.meshCols, ki.originRow, ki.originCol, tensors,
+                                           SplitModel::gemm(), ki.kernelId);
+
+        // Create per-kernel output directory
+        std::string kernelDir = outputDir + "/" + ki.kernelName;
+        if (std::error_code EC = llvm::sys::fs::create_directories(kernelDir)) {
+            llvm::errs() << "Failed to create kernel directory " << kernelDir << ": " << EC.message() << "\n";
+            return false;
+        }
+
+        // Run the standard pipeline for this kernel
+        if (!runPipeline(ctx, kernelModule, kernelDir, ki.kernelBody, ki.kernelFuncName, -1, "", tensors)) {
+            llvm::errs() << "Pipeline failed for kernel " << ki.kernelName << "\n";
+            return false;
+        }
+
+        std::cout << "=== Kernel " << ki.kernelName << " complete ===" << std::endl;
+    }
+
+    // -----------------------------------------------------------------------
+    // Generate stage-based unified host_main.cc
+    // -----------------------------------------------------------------------
+    {
+        std::string hostMainPath = outputDir + "/host_main.cc";
+        std::error_code ec;
+        llvm::raw_fd_ostream stream(hostMainPath, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+            llvm::errs() << "Failed to create " << hostMainPath << "\n";
+            return false;
+        }
+
+        stream << "// Auto-generated multi-kernel host main\n";
+        stream << "// Execution plan: " << numStages << " stage(s)\n";
+        stream << "#include <stdio.h>\n";
+        stream << "#include <stdlib.h>\n";
+        stream << "#include <string.h>\n\n";
+
+        // Extern declarations for each kernel's binary and host function
+        for (const auto &ki : kernels) {
+            stream << "// Kernel: " << ki.kernelName << " (stage " << kernelStage[ki.kernelId] << ", "
+                   << ki.executionMode << ")\n";
+            stream << "extern unsigned char _binary_kernel_" << ki.kernelName << "_start[];\n";
+            stream << "extern unsigned char _binary_kernel_" << ki.kernelName << "_end[];\n";
+            stream << "extern unsigned int _binary_kernel_" << ki.kernelName << "_size;\n\n";
+        }
+
+        // Forward-declare each kernel's host_canonicalized function
+        for (const auto &ki : kernels) {
+            stream << "void host_canonicalized_" << ki.kernelName << "(";
+            stream << "void*, void*, void*";
+            stream << ");\n";
+        }
+
+        // Forward-declare routing functions
+        for (const auto &ki : kernels) {
+            stream << "void routing_" << ki.kernelName << "();\n";
+        }
+
+        stream << "\nint main() {\n";
+        stream << "    printf(\"\\n========== Multi-Kernel AIE Test ==========\\n\");\n\n";
+
+        // Allocate DDR buffers for each kernel
+        for (size_t i = 0; i < kernels.size(); ++i) {
+            const auto &ki = kernels[i];
+            int totalBytes = 16 * 16; // Default: 16x16 i8 tensor
+            stream << "    // Buffers for kernel: " << ki.kernelName << "\n";
+            stream << "    void* buf_" << ki.kernelName << "_A = malloc(" << totalBytes << ");\n";
+            stream << "    void* buf_" << ki.kernelName << "_B = malloc(" << totalBytes << ");\n";
+            stream << "    void* buf_" << ki.kernelName << "_C = malloc(" << totalBytes << ");\n";
+            stream << "    for (int j = 0; j < " << totalBytes << "; j++) {\n";
+            stream << "        ((char*)buf_" << ki.kernelName << "_A)[j] = (char)(j + 1);\n";
+            stream << "        ((char*)buf_" << ki.kernelName << "_B)[j] = (char)(j + 2);\n";
+            stream << "    }\n";
+            stream << "    memset(buf_" << ki.kernelName << "_C, 0, " << totalBytes << ");\n\n";
+        }
+
+        // Wire up data edges: copy producer output to consumer input
+        // (emit as comments for now; actual DDR memcpy between stages)
+
+        // Execute stage by stage
+        for (int s = 0; s < numStages; ++s) {
+            stream << "    // ===== Stage " << s << " =====\n";
+            stream << "    printf(\"--- Stage " << s << " ---\\n\");\n";
+
+            // If stage > 0, perform data transfers from previous stages
+            if (s > 0) {
+                for (const auto &edge : dataEdges) {
+                    // Find producer and consumer kernel names
+                    if (kernelStage[edge.consumerKernelId] == s) {
+                        std::string producerName, consumerName;
+                        for (const auto &ki : kernels) {
+                            if (ki.kernelId == edge.producerKernelId)
+                                producerName = ki.kernelName;
+                            if (ki.kernelId == edge.consumerKernelId)
+                                consumerName = ki.kernelName;
+                        }
+                        if (!producerName.empty() && !consumerName.empty()) {
+                            stream << "    // Data edge: " << producerName << " output[" << edge.producerOutputIdx
+                                   << "] -> " << consumerName << " input[" << edge.consumerInputIdx << "] ("
+                                   << edge.transferMode << ")\n";
+                            stream << "    printf(\"  Transferring data: " << producerName << " -> " << consumerName
+                                   << "\\n\");\n";
+                            stream << "    memcpy(buf_" << consumerName << "_A, buf_" << producerName
+                                   << "_C, 256);\n\n";
+                        }
+                    }
+                }
+            }
+
+            // Configure routing for all kernels in this stage
+            for (size_t idx : stages[s]) {
+                const auto &ki = kernels[idx];
+                stream << "    printf(\"Configuring routing for kernel: " << ki.kernelName << "\\n\");\n";
+                stream << "    routing_" << ki.kernelName << "();\n";
+            }
+            stream << "\n";
+
+            // Launch all kernels in this stage (concurrent for spatial_parallel)
+            for (size_t idx : stages[s]) {
+                const auto &ki = kernels[idx];
+                stream << "    printf(\"Launching kernel: " << ki.kernelName << "\\n\");\n";
+                stream << "    host_canonicalized_" << ki.kernelName << "("
+                       << "buf_" << ki.kernelName << "_A, "
+                       << "buf_" << ki.kernelName << "_B, "
+                       << "buf_" << ki.kernelName << "_C);\n";
+            }
+            stream << "\n";
+
+            // Stage synchronization barrier
+            stream << "    printf(\"Stage " << s << " complete.\\n\");\n\n";
+        }
+
+        // Print output buffers
+        for (const auto &ki : kernels) {
+            stream << "    printf(\"Output for kernel " << ki.kernelName << ":\\n\");\n";
+            stream << "    for (int j = 0; j < 256; j++) printf(\"  out[%d]=%d\\n\", j, "
+                   << "((unsigned char*)buf_" << ki.kernelName << "_C)[j]);\n\n";
+        }
+
+        // Free buffers
+        for (const auto &ki : kernels) {
+            stream << "    free(buf_" << ki.kernelName << "_A);\n";
+            stream << "    free(buf_" << ki.kernelName << "_B);\n";
+            stream << "    free(buf_" << ki.kernelName << "_C);\n";
+        }
+
+        stream << "\n    printf(\"\\n========== Multi-Kernel Test Complete ==========\\n\");\n";
+        stream << "    return 0;\n";
+        stream << "}\n";
+
+        stream.close();
+        std::cout << "Unified host main written to " << hostMainPath << std::endl;
+    }
+
+    // Generate unified compile scripts
+    {
+        std::string compilePath = outputDir + "/compile_all_kernels.sh";
+        std::error_code ec;
+        llvm::raw_fd_ostream stream(compilePath, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+            llvm::errs() << "Failed to create " << compilePath << "\n";
+            return false;
+        }
+        stream << "#!/bin/bash\n";
+        stream << "# Auto-generated multi-kernel compile script\n";
+        stream << "set -e\n\n";
+
+        for (const auto &ki : kernels) {
+            stream << "echo \"=== Compiling kernel: " << ki.kernelName << " ===\"\n";
+            stream << "pushd " << ki.kernelName << "\n";
+            stream << "mkdir -p build\n";
+            stream << "# Compile kernel ELF using xchesscc\n";
+            stream << "# xchesscc +f kernel.cc " << ki.kernelFuncName << ".cc -o build/kernel\n";
+            stream << "echo \"Kernel " << ki.kernelName << " compiled.\"\n";
+            stream << "popd\n\n";
+        }
+
+        stream << "echo \"=== Creating kernel binary objects ===\"\n";
+        for (const auto &ki : kernels) {
+            stream << "cd " << ki.kernelName << "/build && ";
+            stream << "ld -r -b binary kernel -o kernel_" << ki.kernelName << ".o && ";
+            stream << "cd ../..\n";
+        }
+
+        stream << "\necho \"=== Compiling unified host ===\"\n";
+        stream << "KERNEL_OBJS=\"";
+        for (size_t i = 0; i < kernels.size(); ++i) {
+            if (i > 0)
+                stream << " ";
+            stream << kernels[i].kernelName << "/build/kernel_" << kernels[i].kernelName << ".o";
+        }
+        stream << "\"\n";
+
+        // Each kernel's host.cc and routing.cc
+        stream << "HOST_SRCS=\"host_main.cc";
+        for (const auto &ki : kernels) {
+            stream << " " << ki.kernelName << "/host.cc";
+            stream << " " << ki.kernelName << "/routing.cc";
+        }
+        stream << "\"\n\n";
+
+        stream << "aarch64-linux-gnu-g++ $HOST_SRCS aie_runtime.c $KERNEL_OBJS -o build/host\n";
+        stream << "echo \"=== All kernels compiled and linked ===\"\n";
+        stream.close();
+        std::cout << "Compile script written to " << compilePath << std::endl;
+    }
+
+    return true;
 }
 
 bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,

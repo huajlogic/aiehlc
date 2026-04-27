@@ -534,6 +534,25 @@ public:
   // Core memory allocator (shared for all tiles using same kernel binary)
   CoreMemAllocator &coreMemAllocator() { return coreMemAllocator_; }
 
+  // Per-kernel core memory allocator for multi-kernel support
+  // Each kernel gets its own allocator since different kernels have different buffer layouts
+  CoreMemAllocator &coreMemAllocator(int kernelId) {
+      if (kernelMemAllocators_.find(kernelId) == kernelMemAllocators_.end()) {
+          kernelMemAllocators_.emplace(kernelId, CoreMemAllocator());
+      }
+      return kernelMemAllocators_.at(kernelId);
+  }
+
+  // Multi-kernel region ownership
+  // Reserve a rectangular tile region for a kernel
+  bool reserveRegion(int kernelId, int originRow, int originCol, int rows, int cols);
+
+  // Check if a tile belongs to a specific kernel. Returns -1 if unowned.
+  int getRegionOwner(int row, int col) const;
+
+  // Allocate shim tiles only within a kernel's column range
+  std::optional<Point> freeShimNocForKernel(int kernelId) const;
+
   // Register shim column, channel, and direction to ioId mapping
   void registerShimChannelMapping(int shimCol, int channel, DMADIRECTION direction, int ioId);
 
@@ -573,6 +592,15 @@ private:
   std::unique_ptr<IHwResource> resource_;
   std::unordered_map<int, std::shared_ptr<DataIO>> DataIOMap;
   CoreMemAllocator coreMemAllocator_; // Shared core memory allocator for BCF generation
+  std::unordered_map<int, CoreMemAllocator> kernelMemAllocators_; // Per-kernel allocators
+
+  // Region ownership: tile (row,col) -> kernelId (-1 = unowned)
+  struct RegionInfo {
+      int kernelId;
+      int originRow, originCol, rows, cols;
+  };
+  std::vector<RegionInfo> regions_;
+  std::unordered_map<int, int> tileOwnership_; // (row * 1000 + col) -> kernelId
 
   // Hash function for (shimCol, channel, direction) tuple
   struct ShimChannelDirHash {

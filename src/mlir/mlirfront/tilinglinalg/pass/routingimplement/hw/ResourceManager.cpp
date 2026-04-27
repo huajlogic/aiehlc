@@ -7,8 +7,9 @@
 // routingresource.cpp  —  ResourceMgr & RoutingTile implementation
 //====================================================================
 #include "hw/ResourceManager.h"
+#include <algorithm>
+#include <climits>
 #include <iostream>
-#include <algorithm> 
 // ── global DataIO id init ──
 std::atomic<int> DataIO::next_{0};
 
@@ -790,4 +791,80 @@ bool ResourceMgr::isPktIdFree(int pktId) const {
     if (pktId < 0 || pktId >= kMaxPktId)
         return false;
     return !pktIdPool_[pktId].used;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Multi-kernel region ownership
+// ──────────────────────────────────────────────────────────────
+bool ResourceMgr::reserveRegion(int kernelId, int originRow, int originCol, int regionRows, int regionCols) {
+    // Check for overlap with existing regions
+    for (int r = originRow; r < originRow + regionRows; ++r) {
+        for (int c = originCol; c < originCol + regionCols; ++c) {
+            int key = r * 1000 + c;
+            auto it = tileOwnership_.find(key);
+            if (it != tileOwnership_.end()) {
+                std::cerr << "ResourceMgr::reserveRegion: tile (" << r << "," << c << ") already owned by kernel "
+                          << it->second << ", cannot assign to kernel " << kernelId << std::endl;
+                return false;
+            }
+            if (r < 0 || r >= rows() || c < 0 || c >= cols()) {
+                std::cerr << "ResourceMgr::reserveRegion: tile (" << r << "," << c
+                          << ") out of bounds (array: " << rows() << "x" << cols() << ")" << std::endl;
+                return false;
+            }
+        }
+    }
+
+    // Mark ownership
+    for (int r = originRow; r < originRow + regionRows; ++r) {
+        for (int c = originCol; c < originCol + regionCols; ++c) {
+            tileOwnership_[r * 1000 + c] = kernelId;
+        }
+    }
+
+    regions_.push_back({kernelId, originRow, originCol, regionRows, regionCols});
+    std::cout << "ResourceMgr: reserved region for kernel " << kernelId << " at (" << originRow << "," << originCol
+              << ") size " << regionRows << "x" << regionCols << std::endl;
+    return true;
+}
+
+int ResourceMgr::getRegionOwner(int row, int col) const {
+    int key = row * 1000 + col;
+    auto it = tileOwnership_.find(key);
+    if (it != tileOwnership_.end()) {
+        return it->second;
+    }
+    return -1;
+}
+
+std::optional<Point> ResourceMgr::freeShimNocForKernel(int kernelId) const {
+    // Find the column range for this kernel
+    int minCol = INT_MAX, maxCol = INT_MIN;
+    for (const auto &ri : regions_) {
+        if (ri.kernelId == kernelId) {
+            minCol = std::min(minCol, ri.originCol);
+            maxCol = std::max(maxCol, ri.originCol + ri.cols - 1);
+        }
+    }
+
+    if (minCol == INT_MAX) {
+        std::cerr << "ResourceMgr::freeShimNocForKernel: no region found for kernel " << kernelId << std::endl;
+        return std::nullopt;
+    }
+
+    // Look for a free shim tile within the kernel's column range
+    for (int c = minCol; c <= maxCol; ++c) {
+        TileCoord tc{0, c};
+        auto shimIt = shimTiles_.find(tc);
+        if (shimIt != shimTiles_.end()) {
+            auto &shim = shimIt->second;
+            if (!shim->isReserved() && (shim->hasAnyFreeChannelForEngine(DMADIRECTION::MM2S) ||
+                                        shim->hasAnyFreeChannelForEngine(DMADIRECTION::S2MM))) {
+                return Point{0, c};
+            }
+        }
+    }
+
+    // Fallback: try any free shim
+    return freeShimNoc(std::optional<Point>(std::nullopt));
 }

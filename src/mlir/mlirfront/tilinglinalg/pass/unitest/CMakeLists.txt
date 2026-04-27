@@ -83,6 +83,9 @@ include_directories(../../dataflowmap/dfschedule/inc/)
 include_directories(../../dataflowmap/dfschedule/)
 include_directories(../../dataflowmap/dfscheblueprint/inc/)
 include_directories(../../dataflowmap/dfscheblueprint/)
+include_directories(../../kernelgraph/inc/)
+include_directories(../../kernelgraph/)
+include_directories(../passkernelgraphtorouting/)
 
 #file(GLOB PARSER_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../Parser/*.cpp)
 message("Parser src Directory: ${PARSER_FILES}")
@@ -114,6 +117,8 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/ResourceManager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingtopology.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../tilinglinalg_pipeline.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../kernelgraph/kernelgraphmanager.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passkernelgraphtorouting/passkernelgraphtorouting.cpp
                 )
 
 add_executable(test ${SOURCE_FILES})
@@ -132,6 +137,7 @@ add_custom_target(
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dmaphop/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfschedule/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../dataflowmap/dfscheblueprint/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../../kernelgraph/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMENT "Executing custom script before building AIE Dialect from tablegen"
 )
 
