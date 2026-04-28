@@ -23,6 +23,7 @@
 #     from aietriton import jit, mesh
 #     from aie_triton_conv import convert_triton_to_c
 #
+# aie-triton-conv example/tileprogram/design/triton/triton_matmul.py -o ./output
 ###############################################################################
 
 _aiehlcpy_setup() {
