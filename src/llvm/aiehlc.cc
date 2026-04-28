@@ -4,6 +4,7 @@
 ******************************************************************************/
 
 #include "../../include/gcommon.h"
+#include "clang/AST/APValue.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -846,6 +847,41 @@ public:
                                 pti.isInput = isInput;
                                 pti.spatialTag = spatialTag;
                                 pti.policyName = policyName;
+
+                                // --- AST-based SpatialPolicy struct extraction ---
+                                if (!policyName.empty()) {
+                                    // Get the template specialization type for port<T, P>
+                                    const clang::Type *rawType = ptype.getTypePtr();
+                                    // Unwrap elaborated types
+                                    if (const auto *elab = dyn_cast<clang::ElaboratedType>(rawType))
+                                        rawType = elab->getNamedType().getTypePtr();
+                                    if (const auto *tst = dyn_cast<clang::TemplateSpecializationType>(rawType)) {
+                                        if (tst->template_arguments().size() >= 2) {
+                                            const auto &policyArg = tst->template_arguments()[1];
+                                            if (policyArg.getKind() == clang::TemplateArgument::StructuralValue) {
+                                                const APValue &val = policyArg.getAsStructuralValue();
+                                                if (val.isStruct() && val.getStructNumFields() >= 4) {
+                                                    pti.pattern = (int)val.getStructField(0).getInt().getExtValue();
+                                                    pti.distribution =
+                                                        (int)val.getStructField(1).getInt().getExtValue();
+                                                    pti.mergeOrder = (int)val.getStructField(2).getInt().getExtValue();
+                                                    pti.pingPong = (int)val.getStructField(3).getInt().getExtValue();
+                                                    pti.policyResolved = true;
+                                                    llvm::outs()
+                                                        << "[TilingLinalg] Policy resolved: pattern=" << pti.pattern
+                                                        << " distribution=" << pti.distribution
+                                                        << " mergeOrder=" << pti.mergeOrder
+                                                        << " pingPong=" << pti.pingPong << "\n";
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (!pti.policyResolved) {
+                                        llvm::errs()
+                                            << "[TilingLinalg] ERROR: Failed to resolve constexpr SpatialPolicy '"
+                                            << policyName << "' from AST\n";
+                                    }
+                                }
 
                                 parsedTensors.push_back(pti);
                                 std::string tagInfo;
