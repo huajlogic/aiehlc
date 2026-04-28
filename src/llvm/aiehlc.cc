@@ -44,6 +44,7 @@ struct ParsedTensorInfo {
     int elementBitWidth;
     bool isInput;
     std::string spatialTag; // "row_broadcast_in", "col_broadcast_in", etc. or "" for default
+    std::string policyName; // "RowBC", "ColBC", "LtoR_Merge", etc. (from aie::port<T, Policy>)
 };
 static std::vector<ParsedTensorInfo> parsedTensors;
 
@@ -176,6 +177,40 @@ public:
                      }
                      // Replace "aie::wrapper<INNER>" with "INNER"
                      std::string inner = str.substr(angleStart, end - angleStart - 1);
+                     str.replace(start, end - start, inner);
+                 }
+             }
+
+             // Strip aie::port<T, Policy> → T (extract first template arg only)
+             {
+                 std::string portPrefix = "aie::port<";
+                 size_t spos;
+                 while ((spos = str.find(portPrefix)) != std::string::npos) {
+                     size_t start = spos;
+                     size_t angleStart = spos + portPrefix.size();
+                     // Find the top-level comma (separating T from Policy) or closing >
+                     int depth = 1;
+                     size_t commaPos = std::string::npos;
+                     size_t end = angleStart;
+                     while (end < str.size() && depth > 0) {
+                         if (str[end] == '<')
+                             depth++;
+                         else if (str[end] == '>')
+                             depth--;
+                         else if (str[end] == ',' && depth == 1 && commaPos == std::string::npos)
+                             commaPos = end;
+                         if (depth > 0)
+                             end++;
+                     }
+                     end++; // skip closing >
+                     // Extract first template arg (the inner type T)
+                     size_t innerEnd = (commaPos != std::string::npos) ? commaPos : (end - 1);
+                     std::string inner = str.substr(angleStart, innerEnd - angleStart);
+                     // Trim whitespace
+                     while (!inner.empty() && inner.front() == ' ')
+                         inner.erase(0, 1);
+                     while (!inner.empty() && inner.back() == ' ')
+                         inner.pop_back();
                      str.replace(start, end - start, inner);
                  }
              }
@@ -502,11 +537,11 @@ public:
                             auto isTensorParam = [](clang::QualType qt) -> bool {
                                 if (qt->isPointerType())
                                     return true;
-                                // Check for aie:: spatial wrapper struct
+                                // Check for aie:: spatial wrapper struct (legacy aliases + new port<>)
                                 std::string typeStr = qt.getUnqualifiedType().getAsString();
                                 for (const char *tag :
                                      {"aie::row_broadcast_in", "aie::col_broadcast_in", "aie::tiled_in",
-                                      "aie::row_major_out", "aie::col_major_out", "aie::row_reduce_out"}) {
+                                      "aie::row_major_out", "aie::col_major_out", "aie::row_reduce_out", "aie::port"}) {
                                     if (typeStr.find(tag) != std::string::npos)
                                         return true;
                                 }
@@ -624,17 +659,18 @@ public:
                                 std::string fullTypeStr = ptype.getUnqualifiedType().getAsString();
 
                                 // Check for spatial type wrapper: aie::tag_name<inner_type>
+                                // Also handles aie::port<inner_type, PolicyName>
                                 std::string spatialTag;
                                 std::string innerTypeStr;
-                                static const char *spatialTags[] = {"row_broadcast_in", "col_broadcast_in",
-                                                                    "tiled_in",         "row_major_out",
-                                                                    "col_major_out",    "row_reduce_out"};
+                                std::string policyName;
+                                static const char *spatialTags[] = {
+                                    "row_broadcast_in", "col_broadcast_in", "tiled_in", "row_major_out",
+                                    "col_major_out",    "row_reduce_out",   "port"};
                                 for (const char *tag : spatialTags) {
                                     std::string prefix = std::string("aie::") + tag + "<";
                                     size_t pos = fullTypeStr.find(prefix);
                                     if (pos != std::string::npos) {
-                                        spatialTag = tag;
-                                        // Extract inner type: everything between < and matching >
+                                        // Extract everything between < and matching >
                                         size_t innerStart = pos + prefix.size();
                                         int depth = 1;
                                         size_t innerEnd = innerStart;
@@ -646,8 +682,51 @@ public:
                                             if (depth > 0)
                                                 innerEnd++;
                                         }
-                                        innerTypeStr = fullTypeStr.substr(innerStart, innerEnd - innerStart);
-                                        // Trim whitespace
+                                        std::string templateArgs =
+                                            fullTypeStr.substr(innerStart, innerEnd - innerStart);
+
+                                        if (std::string(tag) == "port") {
+                                            // aie::port<InnerType, PolicyName>
+                                            // Split on top-level comma to get inner type and policy name
+                                            int commaDepth = 0;
+                                            size_t commaPos = std::string::npos;
+                                            for (size_t ci = 0; ci < templateArgs.size(); ++ci) {
+                                                if (templateArgs[ci] == '<')
+                                                    commaDepth++;
+                                                else if (templateArgs[ci] == '>')
+                                                    commaDepth--;
+                                                else if (templateArgs[ci] == ',' && commaDepth == 0) {
+                                                    commaPos = ci;
+                                                    break;
+                                                }
+                                            }
+                                            if (commaPos != std::string::npos) {
+                                                innerTypeStr = templateArgs.substr(0, commaPos);
+                                                policyName = templateArgs.substr(commaPos + 1);
+                                                // Trim whitespace
+                                                while (!policyName.empty() && policyName.front() == ' ')
+                                                    policyName.erase(0, 1);
+                                                while (!policyName.empty() && policyName.back() == ' ')
+                                                    policyName.pop_back();
+                                                // Strip "aie::" namespace prefix if present
+                                                if (policyName.substr(0, 5) == "aie::")
+                                                    policyName = policyName.substr(5);
+                                            } else {
+                                                // aie::port<InnerType> with default policy
+                                                innerTypeStr = templateArgs;
+                                                policyName = "RowBC"; // default policy
+                                            }
+                                            // Don't set spatialTag for port — policyName is used instead
+                                            llvm::outs() << "[TilingLinalg] Policy port: " << policyName
+                                                         << " -> inner type: " << innerTypeStr << "\n";
+                                        } else {
+                                            spatialTag = tag;
+                                            innerTypeStr = templateArgs;
+                                            llvm::outs() << "[TilingLinalg] Spatial tag: " << spatialTag
+                                                         << " -> inner type: " << innerTypeStr << "\n";
+                                        }
+
+                                        // Trim whitespace from innerTypeStr
                                         while (!innerTypeStr.empty() && innerTypeStr.front() == ' ')
                                             innerTypeStr.erase(0, 1);
                                         while (!innerTypeStr.empty() && innerTypeStr.back() == ' ')
@@ -658,14 +737,12 @@ public:
                                             while (!innerTypeStr.empty() && innerTypeStr.back() == ' ')
                                                 innerTypeStr.pop_back();
                                         }
-                                        llvm::outs() << "[TilingLinalg] Spatial tag: " << spatialTag
-                                                     << " -> inner type: " << innerTypeStr << "\n";
                                         break;
                                     }
                                 }
 
-                                // For bare pointer types, use the pointee type string
-                                if (spatialTag.empty() && ptype->isPointerType()) {
+                                // For bare pointer types (no spatial tag or policy), use the pointee type string
+                                if (spatialTag.empty() && policyName.empty() && ptype->isPointerType()) {
                                     clang::QualType pointee = ptype->getPointeeType();
                                     innerTypeStr = pointee.getUnqualifiedType().getAsString();
                                 }
@@ -707,10 +784,16 @@ public:
                                     }
                                 }
 
-                                // For spatial tags, determine input/output from the tag name
+                                // Determine input/output from spatial tag, policy name, or type info
                                 bool isInput;
                                 if (!spatialTag.empty()) {
                                     isInput = (spatialTag.find("_in") != std::string::npos);
+                                } else if (!policyName.empty()) {
+                                    // Policy-based: RowBC/ColBC are inputs, Merge/Scatter are outputs
+                                    isInput = (policyName == "RowBC" || policyName == "ColBC");
+                                    // Also check inner type for explicit input/output window
+                                    if (isWindowParam)
+                                        isInput = isInputWindow;
                                 } else {
                                     bool isConst =
                                         ptype->isPointerType() ? ptype->getPointeeType().isConstQualified() : false;
@@ -720,15 +803,33 @@ public:
                                 ParsedTensorInfo pti;
                                 pti.varName = kp->getNameAsString();
                                 // Assign per-tensor GEMM shapes from M/N/K macros when available:
-                                //   row_broadcast_in (A) → [M, K]
-                                //   col_broadcast_in (B) → [K, N]
-                                //   row_major_out    (C) → [M, N]
+                                //   row_broadcast_in / RowBC (A) → [M, K]
+                                //   col_broadcast_in / ColBC (B) → [K, N]
+                                //   row_major_out / LtoR_Merge (C) → [M, N]
+                                //   col_major_out / RtoL_Merge (C) → [M, N]
+                                // Determine effective tag for shape assignment (spatial tag or policy)
+                                std::string effectiveTag = spatialTag;
+                                if (effectiveTag.empty() && !policyName.empty()) {
+                                    // Map policy names to equivalent spatial tags for shape lookup
+                                    if (policyName == "RowBC")
+                                        effectiveTag = "row_broadcast_in";
+                                    else if (policyName == "ColBC")
+                                        effectiveTag = "col_broadcast_in";
+                                    else if (policyName == "LtoR_Merge")
+                                        effectiveTag = "row_major_out";
+                                    else if (policyName == "RtoL_Merge")
+                                        effectiveTag = "col_major_out";
+                                    else if (policyName == "RowScatter")
+                                        effectiveTag = "row_reduce_out";
+                                    else if (policyName == "ColScatter")
+                                        effectiveTag = "row_reduce_out";
+                                }
                                 if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0) {
-                                    if (spatialTag == "row_broadcast_in")
+                                    if (effectiveTag == "row_broadcast_in")
                                         pti.shape = {macroDimM, macroDimK};
-                                    else if (spatialTag == "col_broadcast_in")
+                                    else if (effectiveTag == "col_broadcast_in")
                                         pti.shape = {macroDimK, macroDimN};
-                                    else if (spatialTag == "row_major_out" || spatialTag == "col_major_out")
+                                    else if (effectiveTag == "row_major_out" || effectiveTag == "col_major_out")
                                         pti.shape = {macroDimM, macroDimN};
                                     else
                                         pti.shape = {defaultDim0, defaultDim1};
@@ -738,12 +839,17 @@ public:
                                 pti.elementBitWidth = bitWidth;
                                 pti.isInput = isInput;
                                 pti.spatialTag = spatialTag;
+                                pti.policyName = policyName;
 
                                 parsedTensors.push_back(pti);
+                                std::string tagInfo;
+                                if (!policyName.empty())
+                                    tagInfo = " policy=" + policyName;
+                                else if (!spatialTag.empty())
+                                    tagInfo = " spatial=" + spatialTag;
                                 llvm::outs() << "[TilingLinalg] Tensor param: " << pti.varName << " [" << pti.shape[0]
                                              << "x" << pti.shape[1] << "] i" << pti.elementBitWidth
-                                             << (pti.isInput ? " (input)" : " (output)")
-                                             << (spatialTag.empty() ? "" : " spatial=" + spatialTag) << "\n";
+                                             << (pti.isInput ? " (input)" : " (output)") << tagInfo << "\n";
                             }
 						}
 					}
@@ -1236,14 +1342,25 @@ public:
                     ret += "// CUDA-style AIE API stubs for Clang parsing\n";
                     ret += "#ifndef AIEHLC_TILING_STUBS_DEFINED\n";
                     ret += "#define AIEHLC_TILING_STUBS_DEFINED\n";
-                    // Spatial type wrapper stubs for aie:: namespace
+                    // SpatialPolicy enum + port<T, Policy> system with backward-compatible aliases
+                    // Uses int enum for C++11 compatibility (struct NTTP requires C++20)
                     ret += "namespace aie {\n";
-                    ret += "template<typename T> struct row_broadcast_in { using type = T; };\n";
-                    ret += "template<typename T> struct col_broadcast_in { using type = T; };\n";
-                    ret += "template<typename T> struct tiled_in         { using type = T; };\n";
-                    ret += "template<typename T> struct row_major_out    { using type = T; };\n";
-                    ret += "template<typename T> struct col_major_out    { using type = T; };\n";
-                    ret += "template<typename T> struct row_reduce_out   { using type = T; };\n";
+                    ret += "enum SpatialPolicy {\n";
+                    ret += "  RowBC = 0,\n";
+                    ret += "  ColBC = 1,\n";
+                    ret += "  LtoR_Merge = 2,\n";
+                    ret += "  RtoL_Merge = 3,\n";
+                    ret += "  RowScatter = 4,\n";
+                    ret += "  ColScatter = 5\n";
+                    ret += "};\n";
+                    ret += "template<typename T, SpatialPolicy P = RowBC> struct port { using type = T; };\n";
+                    // Backward-compatible aliases
+                    ret += "template<typename T> using row_broadcast_in = port<T, RowBC>;\n";
+                    ret += "template<typename T> using col_broadcast_in = port<T, ColBC>;\n";
+                    ret += "template<typename T> using tiled_in         = port<T, RowBC>;\n";
+                    ret += "template<typename T> using row_major_out    = port<T, LtoR_Merge>;\n";
+                    ret += "template<typename T> using col_major_out    = port<T, RtoL_Merge>;\n";
+                    ret += "template<typename T> using row_reduce_out   = port<T, RowScatter>;\n";
                     ret += "}\n";
                     ret += "struct aieDim {\n";
                     ret += "    int rows, cols;\n";
@@ -1375,16 +1492,20 @@ public:
 				int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
 				int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
 
-                // Build SplitModel from parsed spatial tags
+                // Build SplitModel from parsed spatial tags or policy names
                 SplitModel splitModel;
                 if (!parsedTensors.empty()) {
                     for (auto &pt : parsedTensors) {
-                        if (pt.spatialTag.empty()) {
-                            // default: row_broadcast_in / row_major_out
-                            splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(
-                                pt.isInput ? "row_broadcast_in" : "row_major_out", pt.isInput));
-                        } else {
+                        if (!pt.policyName.empty()) {
+                            // New port<T, Policy> syntax — use policy-based lookup
+                            splitModel.tensorSplits.push_back(SplitModel::fromPolicy(pt.policyName, pt.isInput));
+                        } else if (!pt.spatialTag.empty()) {
+                            // Legacy spatial tag syntax
                             splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
+                        } else {
+                            // default: use policy-based defaults
+                            splitModel.tensorSplits.push_back(
+                                SplitModel::fromPolicy(pt.isInput ? "RowBC" : "LtoR_Merge", pt.isInput));
                         }
                     }
                 } else {
@@ -1547,5 +1668,8 @@ int main(int argc, const char **argv) {
 		Tool.appendArgumentsAdjuster(
 				getInsertArgumentAdjuster(("-I" + IncludePath).c_str(), ArgumentInsertPosition::BEGIN));
 	}
+
+    // Force C++20 for struct NTTP support in aie::port<T, SpatialPolicy>
+    Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster("-std=c++20", ArgumentInsertPosition::BEGIN));
     return Tool.run(newFrontendActionFactory<MyFrontendAction>().get());
 }
