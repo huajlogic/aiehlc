@@ -18,9 +18,11 @@ enabling users to define custom spatial policies for kernel parameter transfer l
 
 ## Design
 
-### 1. Synthetic Header (aiehlc.cc)
+### 1. Synthetic Header (aiehlc.cc) — Types Only
 
-Replace the enum with C++20 struct NTTP:
+The synthetic header defines only the type system (enums, struct, port template).
+Pre-defined policy constants are NOT in the synthetic header — they belong in the
+user's source file, giving users full control over policy definitions.
 
 ```cpp
 namespace aie {
@@ -36,22 +38,32 @@ namespace aie {
   };
 
   template<typename T, SpatialPolicy P> struct port { using type = T; };
-
-  // Pre-defined policies
-  inline constexpr SpatialPolicy RowBC      = {Pattern::Broadcast, Layout::Row,  Flow::Default,     2};
-  inline constexpr SpatialPolicy ColBC      = {Pattern::Broadcast, Layout::Col,  Flow::Default,     2};
-  inline constexpr SpatialPolicy LtoR_Merge = {Pattern::Gather,    Layout::Row,  Flow::LeftToRight, 2};
-  inline constexpr SpatialPolicy RtoL_Merge = {Pattern::Gather,    Layout::Col,  Flow::RightToLeft, 2};
-  inline constexpr SpatialPolicy RowScatter = {Pattern::Scatter,   Layout::Row,  Flow::Default,     2};
-  inline constexpr SpatialPolicy ColScatter = {Pattern::Scatter,   Layout::Col,  Flow::Default,     2};
 }
 ```
 
-Backward-compatible aliases remain:
+### 1b. User Source File (e.g. simplematmul.cc) — Policy Constants
+
+Users define their own policy constants at file scope:
+
 ```cpp
-template<typename T> using row_broadcast_in = port<T, RowBC>;
-// etc.
+constexpr aie::SpatialPolicy RowBC = {
+    .pattern = aie::Pattern::Broadcast,
+    .distribution = aie::Layout::Row
+};
+
+constexpr aie::SpatialPolicy ColBC = {
+    .pattern = aie::Pattern::Broadcast,
+    .distribution = aie::Layout::Col
+};
+
+constexpr aie::SpatialPolicy LtoR_Merge = {
+    .pattern = aie::Pattern::Gather,
+    .distribution = aie::Layout::Row,
+    .merge_order = aie::Flow::LeftToRight
+};
 ```
+
+Backward-compatible aliases (`row_broadcast_in`, etc.) are removed.
 
 ### 2. C++20 Requirement
 
@@ -136,20 +148,34 @@ Derive GEMM shape from `pattern + distribution` fields:
 
 | File | Change |
 |------|--------|
-| `src/llvm/aiehlc.cc` | Synthetic header (struct), AST extraction, `-std=c++20`, remove enum/name paths |
+| `src/llvm/aiehlc.cc` | Synthetic header (types only), AST extraction, `-std=c++20`, remove enum/name paths |
 | `src/mlir/mlirfront/tilinglinalg/pass/tilinglinalg_pipeline.h` | Add `fromPolicyFields()`, remove `fromPolicy()` |
 | `src/mlir/mlirfront/tilinglinalg/routing/routingmanager.cpp` | Implement `fromPolicyFields()`, remove `fromPolicy()` |
-| `example/tileprogram/ccode/simplematmul.cc` | No change (syntax unchanged) |
+| `example/tileprogram/ccode/simplematmul.cc` | Add `constexpr SpatialPolicy` definitions for RowBC, ColBC, LtoR_Merge |
 
 ## User-Facing Example
 
 ```cpp
-// Built-in policy
-__global__ void matmul(aie::port<input_window_int8*, aie::RowBC>      a,
-                       aie::port<input_window_int8*, aie::ColBC>      b,
-                       aie::port<output_window_int8*, aie::LtoR_Merge> c) { ... }
+// Policy constants defined at file scope (user source)
+constexpr aie::SpatialPolicy RowBC = {
+    .pattern = aie::Pattern::Broadcast,
+    .distribution = aie::Layout::Row
+};
+constexpr aie::SpatialPolicy ColBC = {
+    .pattern = aie::Pattern::Broadcast,
+    .distribution = aie::Layout::Col
+};
+constexpr aie::SpatialPolicy LtoR_Merge = {
+    .pattern = aie::Pattern::Gather,
+    .distribution = aie::Layout::Row,
+    .merge_order = aie::Flow::LeftToRight
+};
 
-// Custom policy
+__global__ void matmul(aie::port<input_window_int8*, RowBC>      a,
+                       aie::port<input_window_int8*, ColBC>      b,
+                       aie::port<output_window_int8*, LtoR_Merge> c) { ... }
+
+// Custom policy — user-defined
 constexpr aie::SpatialPolicy MyGather = {
     .pattern = aie::Pattern::Gather,
     .distribution = aie::Layout::Col,

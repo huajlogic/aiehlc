@@ -39,17 +39,23 @@ git commit -m "feat: add -std=c++20 adjuster for struct NTTP support"
 
 ---
 
-### Task 2: Replace enum-based synthetic header with struct-based
+### Task 2: Replace enum-based synthetic header with struct-based (types only)
+
+The synthetic header defines types and the `port` template. Pre-defined policy constants
+(`RowBC`, `ColBC`, `LtoR_Merge`, etc.) move to the user's source file so users control
+their own policy definitions.
 
 **Files:**
 - Modify: `src/llvm/aiehlc.cc:1334-1353`
+- Modify: `example/tileprogram/ccode/simplematmul.cc` (add policy constants)
 
-**Step 1: Replace the enum + template block**
+**Step 1: Replace the enum + template block in synthetic header (types only, no policy constants)**
 
 Replace lines 1334-1353 (from `// SpatialPolicy enum` through the closing `"}\n"` of the namespace) with:
 
 ```cpp
                     // SpatialPolicy struct + port<T, Policy> system (C++20 struct NTTP)
+                    // Types and port template only — policy constants are user-defined
                     ret += "namespace aie {\n";
                     ret += "enum class Pattern  { Broadcast = 0, Scatter = 1, Multicast = 2, Gather = 3 };\n";
                     ret += "enum class Layout   { Row = 0, Col = 1, Grid = 2 };\n";
@@ -61,33 +67,54 @@ Replace lines 1334-1353 (from `// SpatialPolicy enum` through the closing `"}\n"
                     ret += "  int     ping_pong    = 2;\n";
                     ret += "};\n";
                     ret += "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
-                    // Pre-defined policies
-                    ret += "inline constexpr SpatialPolicy RowBC      = {Pattern::Broadcast, Layout::Row,  Flow::Default,     2};\n";
-                    ret += "inline constexpr SpatialPolicy ColBC      = {Pattern::Broadcast, Layout::Col,  Flow::Default,     2};\n";
-                    ret += "inline constexpr SpatialPolicy LtoR_Merge = {Pattern::Gather,    Layout::Row,  Flow::LeftToRight, 2};\n";
-                    ret += "inline constexpr SpatialPolicy RtoL_Merge = {Pattern::Gather,    Layout::Col,  Flow::RightToLeft, 2};\n";
-                    ret += "inline constexpr SpatialPolicy RowScatter = {Pattern::Scatter,   Layout::Row,  Flow::Default,     2};\n";
-                    ret += "inline constexpr SpatialPolicy ColScatter = {Pattern::Scatter,   Layout::Col,  Flow::Default,     2};\n";
-                    // Backward-compatible aliases
-                    ret += "template<typename T> using row_broadcast_in = port<T, RowBC>;\n";
-                    ret += "template<typename T> using col_broadcast_in = port<T, ColBC>;\n";
-                    ret += "template<typename T> using tiled_in         = port<T, RowBC>;\n";
-                    ret += "template<typename T> using row_major_out    = port<T, LtoR_Merge>;\n";
-                    ret += "template<typename T> using col_major_out    = port<T, RtoL_Merge>;\n";
-                    ret += "template<typename T> using row_reduce_out   = port<T, RowScatter>;\n";
                     ret += "}\n";
 ```
 
-**Step 2: Build and verify**
+Note: The backward-compatible aliases (`row_broadcast_in`, `col_broadcast_in`, etc.) are removed.
+Users who need them can define their own in their source files.
+
+**Step 2: Add policy constants to simplematmul.cc**
+
+After the `#include` lines and before the `#define` macros (between lines 39 and 41), add:
+
+```cpp
+// Spatial policy definitions for kernel parameter transfer
+constexpr aie::SpatialPolicy RowBC = {
+    .pattern = aie::Pattern::Broadcast,
+    .distribution = aie::Layout::Row
+};
+
+constexpr aie::SpatialPolicy ColBC = {
+    .pattern = aie::Pattern::Broadcast,
+    .distribution = aie::Layout::Col
+};
+
+constexpr aie::SpatialPolicy LtoR_Merge = {
+    .pattern = aie::Pattern::Gather,
+    .distribution = aie::Layout::Row,
+    .merge_order = aie::Flow::LeftToRight
+};
+```
+
+The kernel signature at line 82-84 changes from `aie::RowBC` to just `RowBC` (since the
+constants are now at file scope, not inside `namespace aie`):
+
+```cpp
+__global__ void matmul(aie::port<input_window_int8 *, RowBC>      window_in_0,
+                       aie::port<input_window_int8 *, ColBC>      window_in_1,
+                       aie::port<output_window_int8 *, LtoR_Merge> window_out_0) {
+```
+
+**Step 3: Build and verify**
 
 Run: `cd build && make -j$(nproc) 2>&1 | tail -20`
 Expected: Compiles without errors.
 
-**Step 3: Commit**
+**Step 4: Commit**
 
 ```bash
-git add src/llvm/aiehlc.cc
-git commit -m "feat: replace enum SpatialPolicy with constexpr struct in synthetic header"
+git add src/llvm/aiehlc.cc example/tileprogram/ccode/simplematmul.cc
+git commit -m "feat: move SpatialPolicy types to synthetic header, policy constants to user source"
 ```
 
 ---
