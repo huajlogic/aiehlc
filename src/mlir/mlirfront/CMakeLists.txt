@@ -120,6 +120,7 @@ list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dmap/dmapmanager.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dmaphop/dmaphopmanager.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dfschedule/dfschedulemanager.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/dataflowmap/dfscheblueprint/dfscheblueprintmanager.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/kernelgraph/kernelgraphmanager.cpp)
 # tilinglinalg pass pipeline sources (lowering passes)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routinghwlower.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routinghwverify.cpp)
@@ -136,6 +137,7 @@ list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdmaphoptodfscheblueprint/pa
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passschedulecanonicalize/passschedulecanonicalize.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdfscheduletoapi/passdfscheduletoapi.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdfscheduletokernelapi/passdfscheduletokernelapi.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passkernelgraphtorouting/passkernelgraphtorouting.cpp)
 # tilinglinalg routing implementation
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingimplement/routing/routingpath.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/routingimplement/hw/hwresource.cpp)
@@ -204,6 +206,10 @@ include_directories(./tilinglinalg/dataflowmap/dfschedule/inc/)
 include_directories(./tilinglinalg/dataflowmap/dfschedule/)
 include_directories(./tilinglinalg/dataflowmap/dfscheblueprint/inc/)
 include_directories(./tilinglinalg/dataflowmap/dfscheblueprint/)
+#for the kernelgraph dialect
+include_directories(./tilinglinalg/kernelgraph/inc/)
+include_directories(./tilinglinalg/kernelgraph/)
+include_directories(./tilinglinalg/pass/passkernelgraphtorouting/)
 
 add_dependencies(mlirtestlib aiedialectteablegen)
 add_dependencies(mlirtestlib aielinkerdialectgen)
@@ -218,7 +224,8 @@ add_custom_target(
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/dataflowmap/dmaphop/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/dataflowmap/dfschedule/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/dataflowmap/dfscheblueprint/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
-  COMMENT "Executing tablegen for tilinglinalg dialects (routinghw, dmap, dmaphop, dfschedule, dfscheblueprint)"
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tilinglinalg/kernelgraph/gen.sh ${MLIR_INC_ARGS} ${LLVM_ROOT_BIN_ARG}
+  COMMENT "Executing tablegen for tilinglinalg dialects (routinghw, dmap, dmaphop, dfschedule, dfscheblueprint, kernelgraph)"
 )
 add_dependencies(mlirtestlib tilinglinalgdialecttablegen)
 
