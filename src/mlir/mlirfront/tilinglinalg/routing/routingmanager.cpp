@@ -641,19 +641,49 @@ TensorSplitDesc SplitModel::fromSpatialTag(const std::string &tag, bool isInput)
     // The spatial tag controls hwAxisOwner and replicateOn (mesh partitioning),
     // NOT which tensor dimension to split.
     if (tag == "row_broadcast_in")
-        return {0, "row", "col"};
+        return {0, "row", "col", "broadcast", "default", 2};
     if (tag == "col_broadcast_in")
-        return {0, "col", "row"};
+        return {0, "col", "row", "broadcast", "default", 2};
     if (tag == "tiled_in")
-        return {0, "row", ""};
+        return {0, "row", "", "scatter", "default", 2};
     if (tag == "row_major_out")
-        return {0, "row", "col"};
+        return {0, "row", "col", "gather", "ltor", 2};
     if (tag == "col_major_out")
-        return {0, "col", "row"};
+        return {0, "col", "row", "gather", "rtol", 2};
     if (tag == "row_reduce_out")
-        return {0, "row", ""};
+        return {0, "row", "", "scatter", "default", 2};
     // default: backward compat
-    return isInput ? TensorSplitDesc{0, "row", "col"} : TensorSplitDesc{0, "row", "col"};
+    return isInput ? TensorSplitDesc{0, "row", "col", "broadcast", "default", 2}
+                   : TensorSplitDesc{0, "row", "col", "gather", "ltor", 2};
+}
+
+// ---------------------------------------------------------------------------
+// SplitModel::fromPolicyFields — struct field-based lookup
+// ---------------------------------------------------------------------------
+
+TensorSplitDesc SplitModel::fromPolicyFields(int pattern, int distribution, int mergeOrder, int pingPong,
+                                             bool isInput) {
+    // Map enum values to strings
+    static const char *patternStr[] = {"broadcast", "scatter", "multicast", "gather"};
+    static const char *flowStr[] = {"default", "ltor", "rtol"};
+
+    std::string pat = (pattern >= 0 && pattern <= 3) ? patternStr[pattern] : "broadcast";
+    std::string flw = (mergeOrder >= 0 && mergeOrder <= 2) ? flowStr[mergeOrder] : "default";
+
+    // Determine hwAxisOwner and replicateOn from distribution + pattern
+    std::string hwAxis, replOn;
+    if (distribution == 0) { // Row
+        hwAxis = "row";
+        replOn = (pattern == 1) ? "" : "col"; // Scatter has no replicateOn
+    } else if (distribution == 1) {           // Col
+        hwAxis = "col";
+        replOn = (pattern == 1) ? "" : "row";
+    } else { // Grid
+        hwAxis = "row";
+        replOn = "";
+    }
+
+    return {0, hwAxis, replOn, pat, flw, pingPong};
 }
 
 // ---------------------------------------------------------------------------

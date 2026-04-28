@@ -793,52 +793,37 @@ public:
 
                                 // Determine input/output from spatial tag, policy name, or type info
                                 bool isInput;
-                                if (!spatialTag.empty()) {
+                                // Determine input/output: always prefer inner type info
+                                if (isWindowParam) {
+                                    isInput = isInputWindow;
+                                } else if (!spatialTag.empty()) {
                                     isInput = (spatialTag.find("_in") != std::string::npos);
-                                } else if (!policyName.empty()) {
-                                    // Policy-based: RowBC/ColBC are inputs, Merge/Scatter are outputs
-                                    isInput = (policyName == "RowBC" || policyName == "ColBC");
-                                    // Also check inner type for explicit input/output window
-                                    if (isWindowParam)
-                                        isInput = isInputWindow;
+                                } else if (ptype->isPointerType()) {
+                                    isInput = ptype->getPointeeType().isConstQualified();
                                 } else {
-                                    bool isConst =
-                                        ptype->isPointerType() ? ptype->getPointeeType().isConstQualified() : false;
-                                    isInput = isWindowParam ? isInputWindow : isConst;
+                                    isInput = true; // conservative default
                                 }
 
                                 ParsedTensorInfo pti;
                                 pti.varName = kp->getNameAsString();
-                                // Assign per-tensor GEMM shapes from M/N/K macros when available:
-                                //   row_broadcast_in / RowBC (A) → [M, K]
-                                //   col_broadcast_in / ColBC (B) → [K, N]
-                                //   row_major_out / LtoR_Merge (C) → [M, N]
-                                //   col_major_out / RtoL_Merge (C) → [M, N]
-                                // Determine effective tag for shape assignment (spatial tag or policy)
-                                std::string effectiveTag = spatialTag;
-                                if (effectiveTag.empty() && !policyName.empty()) {
-                                    // Map policy names to equivalent spatial tags for shape lookup
-                                    if (policyName == "RowBC")
-                                        effectiveTag = "row_broadcast_in";
-                                    else if (policyName == "ColBC")
-                                        effectiveTag = "col_broadcast_in";
-                                    else if (policyName == "LtoR_Merge")
-                                        effectiveTag = "row_major_out";
-                                    else if (policyName == "RtoL_Merge")
-                                        effectiveTag = "col_major_out";
-                                    else if (policyName == "RowScatter")
-                                        effectiveTag = "row_reduce_out";
-                                    else if (policyName == "ColScatter")
-                                        effectiveTag = "row_reduce_out";
-                                }
+                                // Assign per-tensor GEMM shapes from M/N/K macros.
+                                // Shape is initially set to defaults; re-assigned after AST
+                                // resolution using resolved policy fields (pattern+distribution).
                                 if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0) {
-                                    if (effectiveTag == "row_broadcast_in")
-                                        pti.shape = {macroDimM, macroDimK};
-                                    else if (effectiveTag == "col_broadcast_in")
-                                        pti.shape = {macroDimK, macroDimN};
-                                    else if (effectiveTag == "row_major_out" || effectiveTag == "col_major_out")
-                                        pti.shape = {macroDimM, macroDimN};
-                                    else
+                                    bool shapeAssigned = false;
+                                    if (!spatialTag.empty()) {
+                                        if (spatialTag == "row_broadcast_in") {
+                                            pti.shape = {macroDimM, macroDimK};
+                                            shapeAssigned = true;
+                                        } else if (spatialTag == "col_broadcast_in") {
+                                            pti.shape = {macroDimK, macroDimN};
+                                            shapeAssigned = true;
+                                        } else if (spatialTag == "row_major_out" || spatialTag == "col_major_out") {
+                                            pti.shape = {macroDimM, macroDimN};
+                                            shapeAssigned = true;
+                                        }
+                                    }
+                                    if (!shapeAssigned)
                                         pti.shape = {defaultDim0, defaultDim1};
                                 } else {
                                     pti.shape = {defaultDim0, defaultDim1};
@@ -881,6 +866,16 @@ public:
                                             << "[TilingLinalg] ERROR: Failed to resolve constexpr SpatialPolicy '"
                                             << policyName << "' from AST\n";
                                     }
+                                }
+
+                                // Re-assign shape from resolved policy fields
+                                if (pti.policyResolved && macroDimM > 0 && macroDimN > 0 && macroDimK > 0) {
+                                    if (pti.pattern == 0 && pti.distribution == 0) // Broadcast+Row -> A
+                                        pti.shape = {macroDimM, macroDimK};
+                                    else if (pti.pattern == 0 && pti.distribution == 1) // Broadcast+Col -> B
+                                        pti.shape = {macroDimK, macroDimN};
+                                    else // Gather/Scatter -> C
+                                        pti.shape = {macroDimM, macroDimN};
                                 }
 
                                 parsedTensors.push_back(pti);
@@ -1528,20 +1523,24 @@ public:
 				int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
 				int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
 
-                // Build SplitModel from parsed spatial tags or policy names
+                // Build SplitModel from resolved policy fields
                 SplitModel splitModel;
                 if (!parsedTensors.empty()) {
                     for (auto &pt : parsedTensors) {
-                        if (!pt.policyName.empty()) {
-                            // New port<T, Policy> syntax — use policy-based lookup
-                            splitModel.tensorSplits.push_back(SplitModel::fromPolicy(pt.policyName, pt.isInput));
+                        if (pt.policyResolved) {
+                            // Use resolved struct fields from AST
+                            splitModel.tensorSplits.push_back(SplitModel::fromPolicyFields(
+                                pt.pattern, pt.distribution, pt.mergeOrder, pt.pingPong, pt.isInput));
                         } else if (!pt.spatialTag.empty()) {
-                            // Legacy spatial tag syntax
+                            // Legacy spatial tag syntax (e.g. row_broadcast_in<T>)
                             splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
                         } else {
-                            // default: use policy-based defaults
-                            splitModel.tensorSplits.push_back(
-                                SplitModel::fromPolicy(pt.isInput ? "RowBC" : "LtoR_Merge", pt.isInput));
+                            llvm::errs() << "[TilingLinalg] ERROR: tensor '" << pt.varName
+                                         << "' has no resolved policy and no spatial tag\n";
+                            // Default fallback
+                            splitModel.tensorSplits.push_back(SplitModel::fromPolicyFields(
+                                pt.isInput ? 0 : 3, // Broadcast for input, Gather for output
+                                0, pt.isInput ? 0 : 1, 2, pt.isInput));
                         }
                     }
                 } else {

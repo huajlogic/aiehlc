@@ -20,6 +20,10 @@ struct TensorSplitDesc {
     int splitDim;            // tensor dimension to split (default: 0). Irrelevant when splitnum=1.
     std::string hwAxisOwner; // "row" | "col" | "" — which mesh axis owns this tensor's partition
     std::string replicateOn; // "row" | "col" | "" — which mesh axis to replicate/broadcast on
+    // Spatial policy fields (not consumed by passes yet — reserved for future use)
+    std::string pattern; // "broadcast" | "scatter" | "multicast" | "gather"
+    std::string flow;    // "ltor" | "rtol" | "default"
+    int pingPong = 2;    // ping-pong buffer depth
 };
 
 /// Operation-level split model: one TensorSplitDesc per tensor.
@@ -30,12 +34,22 @@ struct SplitModel {
     /// A: tensor split dim=0, mesh partition by row, broadcast along cols
     /// B: tensor split dim=0, mesh partition by col, broadcast along rows
     /// C: tensor split dim=0, mesh partition by row, gather along cols
-    static SplitModel gemm() { return {{{0, "row", "col"}, {0, "col", "row"}, {0, "row", "col"}}}; }
+    static SplitModel gemm() {
+        return {{{0, "row", "col", "broadcast", "default", 2},
+                 {0, "col", "row", "broadcast", "default", 2},
+                 {0, "row", "col", "gather", "ltor", 2}}};
+    }
 
     /// Construct a TensorSplitDesc from a spatial type tag string.
     /// tag: "row_broadcast_in", "col_broadcast_in", etc.
     /// isInput: used for default when tag is empty.
     static TensorSplitDesc fromSpatialTag(const std::string &tag, bool isInput);
+
+    /// Construct a TensorSplitDesc from resolved SpatialPolicy struct fields.
+    /// pattern: 0=Broadcast, 1=Scatter, 2=Multicast, 3=Gather
+    /// distribution: 0=Row, 1=Col, 2=Grid
+    /// mergeOrder: 0=Default, 1=LeftToRight, 2=RightToLeft
+    static TensorSplitDesc fromPolicyFields(int pattern, int distribution, int mergeOrder, int pingPong, bool isInput);
 };
 
 class TilingLinalgPipeline {
