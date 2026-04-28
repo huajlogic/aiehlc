@@ -38,9 +38,17 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-#define M 32
-#define K 32
-#define N 32
+// Spatial policy definitions for kernel parameter transfer
+constexpr aie::SpatialPolicy RowBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Row};
+
+constexpr aie::SpatialPolicy ColBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Col};
+
+constexpr aie::SpatialPolicy LtoR_Merge = {
+    .pattern = aie::Pattern::Gather, .distribution = aie::Layout::Row, .merge_order = aie::Flow::LeftToRight};
+
+#define M 64
+#define K 64
+#define N 64
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4
@@ -53,7 +61,7 @@
 #define COLS_PER_ROUND (TILE_COLS / 2)          // 2: B cols per DMA input round
 #define K_DIM K                                 // 16: inner product dimension
 #define BUF_SZ_OUT (ROWS_PER_ROUND * TILE_COLS) // 8: output bytes per DMA round (2 rows * 4 cols)
-#define DEBUG_OUTPUT_ORDER 0
+#define DEBUG_OUTPUT_ORDER 1
 static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C);
 static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *C);
 // ═══════════════════════════════════════════════════════════════════════════
@@ -78,10 +86,10 @@ static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *
 // Debug flag: when enabled, skip matmul and fill output with encoded tile ID.
 // Each output byte = row[0:2] | col[3:5] | round[6:7]
 // This lets you identify which tile and round produced each output byte.
-// #pragma aie_debug_level 2
-__global__ void matmul(aie::row_broadcast_in<input_window_int8 *> window_in_0,
-                       aie::col_broadcast_in<input_window_int8 *> window_in_1,
-                       aie::row_major_out<output_window_int8 *> window_out_0) {
+#pragma aie_debug_level 4
+__global__ void matmul(aie::port<input_window_int8 *, RowBC> window_in_0,
+                       aie::port<input_window_int8 *, ColBC> window_in_1,
+                       aie::port<output_window_int8 *, LtoR_Merge> window_out_0) {
 
 #if DEBUG_OUTPUT_ORDER
     unsigned coreid = get_coreid();
@@ -289,6 +297,8 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
         if (C[i] != C_ref[i]) {
             printf("MISMATCH C[%d]: got %d, expected %d\n", i, C[i], C_ref[i]);
             mismatches++;
+            if (mismatches > 128)
+                break;
             // return 1;
         }
     }

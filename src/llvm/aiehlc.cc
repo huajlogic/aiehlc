@@ -1342,25 +1342,19 @@ public:
                     ret += "// CUDA-style AIE API stubs for Clang parsing\n";
                     ret += "#ifndef AIEHLC_TILING_STUBS_DEFINED\n";
                     ret += "#define AIEHLC_TILING_STUBS_DEFINED\n";
-                    // SpatialPolicy enum + port<T, Policy> system with backward-compatible aliases
-                    // Uses int enum for C++11 compatibility (struct NTTP requires C++20)
+                    // SpatialPolicy struct + port<T, Policy> system (C++20 struct NTTP)
+                    // Types and port template only — policy constants are user-defined
                     ret += "namespace aie {\n";
-                    ret += "enum SpatialPolicy {\n";
-                    ret += "  RowBC = 0,\n";
-                    ret += "  ColBC = 1,\n";
-                    ret += "  LtoR_Merge = 2,\n";
-                    ret += "  RtoL_Merge = 3,\n";
-                    ret += "  RowScatter = 4,\n";
-                    ret += "  ColScatter = 5\n";
+                    ret += "enum class Pattern  { Broadcast = 0, Scatter = 1, Multicast = 2, Gather = 3 };\n";
+                    ret += "enum class Layout   { Row = 0, Col = 1, Grid = 2 };\n";
+                    ret += "enum class Flow     { Default = 0, LeftToRight = 1, RightToLeft = 2 };\n";
+                    ret += "struct SpatialPolicy {\n";
+                    ret += "  Pattern pattern      = Pattern::Broadcast;\n";
+                    ret += "  Layout  distribution = Layout::Row;\n";
+                    ret += "  Flow    merge_order  = Flow::Default;\n";
+                    ret += "  int     ping_pong    = 2;\n";
                     ret += "};\n";
-                    ret += "template<typename T, SpatialPolicy P = RowBC> struct port { using type = T; };\n";
-                    // Backward-compatible aliases
-                    ret += "template<typename T> using row_broadcast_in = port<T, RowBC>;\n";
-                    ret += "template<typename T> using col_broadcast_in = port<T, ColBC>;\n";
-                    ret += "template<typename T> using tiled_in         = port<T, RowBC>;\n";
-                    ret += "template<typename T> using row_major_out    = port<T, LtoR_Merge>;\n";
-                    ret += "template<typename T> using col_major_out    = port<T, RtoL_Merge>;\n";
-                    ret += "template<typename T> using row_reduce_out   = port<T, RowScatter>;\n";
+                    ret += "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
                     ret += "}\n";
                     ret += "struct aieDim {\n";
                     ret += "    int rows, cols;\n";
