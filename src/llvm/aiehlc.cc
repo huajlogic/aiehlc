@@ -45,6 +45,12 @@ struct ParsedTensorInfo {
     bool isInput;
     std::string spatialTag; // "row_broadcast_in", "col_broadcast_in", etc. or "" for default
     std::string policyName; // "RowBC", "ColBC", "LtoR_Merge", etc. (from aie::port<T, Policy>)
+    // Resolved SpatialPolicy struct fields (from Clang AST constexpr evaluation)
+    int pattern = 0;      // 0=Broadcast, 1=Scatter, 2=Multicast, 3=Gather
+    int distribution = 0; // 0=Row, 1=Col, 2=Grid
+    int mergeOrder = 0;   // 0=Default, 1=LeftToRight, 2=RightToLeft
+    int pingPong = 2;
+    bool policyResolved = false; // true once AST extraction succeeds
 };
 static std::vector<ParsedTensorInfo> parsedTensors;
 
