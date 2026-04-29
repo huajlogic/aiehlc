@@ -31,9 +31,11 @@ static XAie_InstDeclare(g_DevInst_storage, &g_Config);
 XAie_DevInst *g_DevInst = NULL;
 XAie_RoutingInstance *g_RoutingInst = NULL;
 
-// Debug verbosity: 0=silent (default), set >0 to enable runtime diagnostics
-// 1 NO core DMA address log value write logic
-// 2 core DMA address log + write pattern + readback logic
+// Debug level: bits 0-3 = verbosity (0-15), bits 4-31 = feature flags
+//   Verbosity 0: silent (default)
+//   Verbosity 1: BD tracking and IO logs (no core DMA address log)
+//   Verbosity 2: core DMA address log + write pattern + readback logic
+//   Flag bit 4 (value 16): AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA
 // Weak symbol: user source can override via #pragma aie_debug_level N
 __attribute__((weak)) int g_runtime_debug_level = 0;
 
@@ -213,7 +215,7 @@ void __Runtime_free(void *ptr) {
             printf("%d ", (int)p8[j]);
         printf("\n");
     }
-    if (g_runtime_debug_level >= 1 && !g_dumped_done) {
+    if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1 && !g_dumped_done) {
         g_dumped_done = true;
         printf("[aie_runtime] BD tracking dump (%d entries):\n", g_bd_track_count);
         for (int i = 0; i < g_bd_track_count; i++) {
@@ -374,7 +376,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
            acquire_lock_val, release_lock_id, release_lock_val, enable_packet, packet_id, (int)bd_rc);
 
     /* Track this BD for debug dump in __Runtime_free */
-    if (g_runtime_debug_level >= 1 && g_bd_track_count < BD_TRACK_MAX) {
+    if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1 && g_bd_track_count < BD_TRACK_MAX) {
         BdTrackEntry *e = &g_bd_track[g_bd_track_count++];
         e->col = tile.Col;
         e->row = tile.Row;
@@ -389,7 +391,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
         e->next_bd = (int8_t)next_bd;
     }
 
-    if (g_runtime_debug_level >= 2) {
+    if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 2) {
         if (tile_type == XAIEGBL_TILE_TYPE_AIETILE) {
             printf("[aie_runtime] bd_config core(%u,%u) bd=%d dma_addr=0x%lx len=%d pkt_id=%d\n", (unsigned)tile.Col,
                    (unsigned)tile.Row, bd_id, (unsigned long)dma_addr, len, packet_id);
@@ -497,7 +499,7 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
     }
 
     /* Track this BD for debug dump */
-    if (g_runtime_debug_level >= 1 && g_bd_track_count < BD_TRACK_MAX) {
+    if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1 && g_bd_track_count < BD_TRACK_MAX) {
         BdTrackEntry *e = &g_bd_track[g_bd_track_count++];
         e->col = tile.Col;
         e->row = tile.Row;
@@ -762,7 +764,7 @@ void __Runtime_wait_io(struct_ioevent io_event) {
     uint8_t channel = io_event.io.channel_id;
     XAie_DmaDirection dir = io_event.io.direction;
 
-    if (g_runtime_debug_level >= 1)
+    if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1)
         printf("[aie_runtime] wait_io tile(%u,%u) ch=%u dir=%d\n", (unsigned)tile.Col, (unsigned)tile.Row,
                (unsigned)channel, (int)dir);
 
@@ -795,7 +797,7 @@ void __Runtime_wait_io(struct_ioevent io_event) {
                        (unsigned)(max_iters * poll_interval_us / 1000), (unsigned)tile.Col, (unsigned)tile.Row,
                        (unsigned)channel, (int)dir, (unsigned)numPendingBDs);
                 return;
-            } else if (g_runtime_debug_level >= 1) {
+            } else if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1) {
                 printf("[aie_runtime] wait_io pending tile(%u,%u) ch=%u dir=%d pending=%u iter=%u\n",
                        (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)channel, (int)dir, (unsigned)numPendingBDs,
                        (unsigned)iter);
@@ -804,7 +806,7 @@ void __Runtime_wait_io(struct_ioevent io_event) {
         }
     }
 
-    if (g_runtime_debug_level >= 1)
+    if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1)
         printf("[aie_runtime] wait_io done tile(%u,%u) ch=%u dir=%d\n", (unsigned)tile.Col, (unsigned)tile.Row,
                (unsigned)channel, (int)dir);
 }
@@ -862,7 +864,7 @@ static void __Runtime_auto_teardown(void) {
     if (g_DevInst != NULL) {
         /* Kernel logs are already read in __Runtime_wait_event() right after
          * cores finish, so we don't duplicate the read here. */
-        if (g_runtime_debug_level >= 1) {
+        if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1) {
             AieRtSS_PrintRange(g_DevInst, 0, 3, 0, 5, /*print_all=*/0);
             /* Dump raw BD registers for shim tiles used by BD tracking.
              * Scans all 16 BDs with stride/wrap/iteration fields. */

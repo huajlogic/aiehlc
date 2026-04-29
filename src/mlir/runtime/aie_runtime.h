@@ -42,7 +42,11 @@ typedef struct {
 extern XAie_DevInst *g_DevInst;
 extern XAie_RoutingInstance *g_RoutingInst;
 
-// Debug verbosity: 0=silent (default), 1+=print runtime diagnostics
+// Debug level: bits 0-3 = verbosity (0-15), bits 4-31 = feature flags
+// Use AIE_DEBUG_LEVEL(v) to extract verbosity, AIE_DEBUG_HAS_FLAG(v, flag) to test flags
+#define AIE_DEBUG_LEVEL(v) ((v) & 0xF)
+#define AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA (1 << 4)
+#define AIE_DEBUG_HAS_FLAG(v, flag) (((v) & (flag)) != 0)
 extern int g_runtime_debug_level;
 
 // Type aliases for emitted host code (uses "io", "event", etc. without "struct" prefix)
@@ -90,7 +94,7 @@ static inline void __Runtime_Partition_Print(void *data, size_t elem_size, int n
         const int64_t *original_shape,
         const int64_t *partition_shape, int partition_dim,
         int num_partitions, int hw_axis_owner, int replicate_on) {
-    if (g_runtime_debug_level > 0) {
+    if (AIE_DEBUG_LEVEL(g_runtime_debug_level) > 0) {
         size_t total_elems = 1;
         printf("[__Runtime_init_PartitionTensor] data=%p elem_size=%zu ndim=%d "
                "partition_dim=%d num_partitions=%d hw_axis_owner=%d replicate_on=%d\n",

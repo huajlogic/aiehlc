@@ -1,0 +1,120 @@
+#!/bin/bash
+###############################################################################
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+###############################################################################
+# aiehlcrebuild.sh — Rebuild host+kernel ELFs from aout/ without re-running
+# the MLIR pipeline. Copies generated .cc files from aout/worklocal/ into
+# the unitest worklocal/ directory, then compiles kernel and host.
+#
+# Usage: script/aiehlcrebuild.sh [--aout-dir <path>] [--aie-version 5] [--platform baremetal]
+#
+# Default aout dir: <repo>/aout
+###############################################################################
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AIEHLC_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+UNITEST_DIR="${AIEHLC_ROOT}/src/mlir/mlirfront/tilinglinalg/pass/unitest"
+WORKLOCAL_DIR="${UNITEST_DIR}/worklocal"
+AOUT_DIR="${AIEHLC_ROOT}/aout"
+
+# Defaults
+aie_version="5"
+platform="baremetal"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --aout-dir)
+            AOUT_DIR="$2"
+            shift 2
+            ;;
+        --aie-version)
+            aie_version="$2"
+            shift 2
+            ;;
+        --platform)
+            platform="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--aout-dir <path>] [--aie-version 5] [--platform baremetal]"
+            echo ""
+            echo "Rebuild host+kernel ELFs from generated .cc files in aout/worklocal/."
+            echo ""
+            echo "Options:"
+            echo "  --aout-dir <path>      Path to aout directory (default: <repo>/aout)"
+            echo "  --aie-version <ver>    AIE version: 2 or 5 (default: 5)"
+            echo "  --platform <plat>      baremetal or linux (default: baremetal)"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Validate aout directory
+AOUT_WORKLOCAL="${AOUT_DIR}/worklocal"
+if [ ! -d "${AOUT_WORKLOCAL}" ]; then
+    echo "Error: aout/worklocal/ not found at ${AOUT_WORKLOCAL}"
+    echo "Run the pipeline first (e.g. ./test dfschedule or aiehlc.sh) to generate code."
+    exit 1
+fi
+
+if [ ! -f "${AOUT_WORKLOCAL}/host.cc" ]; then
+    echo "Error: host.cc not found in ${AOUT_WORKLOCAL}"
+    exit 1
+fi
+
+if [ ! -f "${AOUT_WORKLOCAL}/kernel.cc" ]; then
+    echo "Error: kernel.cc not found in ${AOUT_WORKLOCAL}"
+    exit 1
+fi
+
+echo "============================================"
+echo "aiehlcrebuild: Rebuild from aout"
+echo "============================================"
+echo "  aout dir:     ${AOUT_DIR}"
+echo "  worklocal:    ${WORKLOCAL_DIR}"
+echo "  AIE version:  ${aie_version}"
+echo "  platform:     ${platform}"
+echo ""
+
+# Step 1: Copy all generated files from aout/worklocal/ to unitest/worklocal/
+echo "=== Step 1: Copy generated files from aout/worklocal/ ==="
+mkdir -p "${WORKLOCAL_DIR}"
+
+for f in "${AOUT_WORKLOCAL}"/*; do
+    [ -f "$f" ] || continue
+    fname="$(basename "$f")"
+    cp -f "$f" "${WORKLOCAL_DIR}/${fname}"
+    echo "  copied: ${fname}"
+done
+echo ""
+
+# Step 2: Compile kernel + host via hostcompile.sh
+echo "=== Step 2: Compile kernel + host ==="
+export AIE_VERSION="${aie_version}"
+export PLATFORM="${platform}"
+
+pushd "${WORKLOCAL_DIR}" > /dev/null
+source ./hostcompile.sh
+popd > /dev/null
+
+# Step 3: Copy the built ELF to aout/main.elf
+BUILD_ELF="${WORKLOCAL_DIR}/build/host"
+if [ -f "${BUILD_ELF}" ]; then
+    cp -f "${BUILD_ELF}" "${AOUT_DIR}/main.elf"
+    echo ""
+    echo "============================================"
+    echo "Rebuild complete."
+    echo "  ${AOUT_DIR}/main.elf"
+    echo "============================================"
+    ls -lh "${AOUT_DIR}/main.elf"
+else
+    echo "Error: build/host not found after compilation"
+    exit 1
+fi

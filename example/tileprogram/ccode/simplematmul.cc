@@ -79,7 +79,8 @@ static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *
 // Debug flag: when enabled, skip matmul and fill output with encoded tile ID.
 // Each output byte = row[0:2] | col[3:5] | round[6:7]
 // This lets you identify which tile and round produced each output byte.
-#pragma aie_debug_level 4
+#define DISABLE_MATMUL (1 << 4)
+#pragma aie_debug_level(2 | DISABLE_MATMUL)
 constexpr aie::SpatialPolicy RowBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Row};
 constexpr aie::SpatialPolicy ColBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Col};
 constexpr aie::SpatialPolicy LtoR_Merge = {

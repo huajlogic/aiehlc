@@ -1278,10 +1278,10 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         auto dimWraps = op.getDimWraps();
         bool useMultiDim = dimStrides && dimWraps && !dimStrides->empty();
 
-        // When debug level >= 4, force linear DMA for easier debugging
-        if (useMultiDim && state.runtimeDebugLevel >= 4) {
-            llvm::errs() << "  [debug_level=" << state.runtimeDebugLevel
-                         << "] Suppressing multi-dim DMA, using linear __Runtime_dma_bd_config\n";
+        // When DISABLE_MULTID_DIM_DMA flag is set (bit 4), force linear DMA
+        if (useMultiDim && (state.runtimeDebugLevel & (1 << 4))) {
+            llvm::errs() << "  [DISABLE_MULTID_DIM_DMA flag set] Suppressing multi-dim DMA, using linear "
+                            "__Runtime_dma_bd_config\n";
             useMultiDim = false;
         }
 

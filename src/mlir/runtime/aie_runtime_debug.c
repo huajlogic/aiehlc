@@ -1378,7 +1378,7 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
             }
         }
 
-        if (g_runtime_debug_level >= 1)
+        if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1)
             AieRt_PrintStreamSwitchConfigAll(dev, ss_tiles, ss_count, /*print_all=*/0);
     }
 
