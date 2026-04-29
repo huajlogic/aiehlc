@@ -457,18 +457,29 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
                                                                         loadOp.getKernelGroup());
         launchEvent = launchOp.getEvent();
 
-        // Move all StartIoOp ops to AFTER the merged LaunchKernelGroupOp.
+        // Move only CORE-tile StartIoOp ops to AFTER the merged LaunchKernelGroupOp.
         // ELF loading (triggered by LoadKernelGroupOp) zeroes BSS in core
         // tile memory.  If core S2MM DMA StartIoOps fire before the ELF load,
-        // DMA-written data gets overwritten with zeros.  By placing StartIoOps
+        // DMA-written data gets overwritten with zeros.  By placing core StartIoOps
         // after the launch, the ELF is fully loaded before DMAs start writing.
-        SmallVector<Operation *> startIoOps;
+        // Shim StartIoOps remain in their original position (before load_kernel_group)
+        // so that shim DMA channels are armed first.
+        SmallVector<Operation *> coreStartIoOps;
         for (Operation &op : *hostBody) {
-            if (isa<dfschedule::StartIoOp>(&op))
-                startIoOps.push_back(&op);
+            if (auto startIo = dyn_cast<dfschedule::StartIoOp>(&op)) {
+                // Trace: StartIoOp → io_handle (ConfigCreateIoOp) → tile (DeclareTileOp)
+                bool isShim = false;
+                if (auto createIo = startIo.getIoHandle().getDefiningOp<dfschedule::ConfigCreateIoOp>()) {
+                    if (auto declareTile = createIo.getTile().getDefiningOp<dfschedule::DeclareTileOp>()) {
+                        isShim = (declareTile.getRow() == 0);
+                    }
+                }
+                if (!isShim)
+                    coreStartIoOps.push_back(&op);
+            }
         }
         Operation *insertAfter = launchOp;
-        for (Operation *op : startIoOps) {
+        for (Operation *op : coreStartIoOps) {
             op->moveAfter(insertAfter);
             insertAfter = op;
         }

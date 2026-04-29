@@ -1143,47 +1143,39 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         for (size_t i = 0; i < coreTiles.size(); ++i) {
             computeKernelAttrs.push_back(SymbolRefAttr::get(rewriter.getContext(), "compute0"));
             }
-            
-        // Create dfschedule.config.load_kernel_group with distributed_args pointing to kernel configs
-        auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
-                loc,
-            dfschedule::KernelGroupType::get(rewriter.getContext()),
-            coreTiles,
-            rewriter.getArrayAttr(calleeAttrs),
-            rewriter.getArrayAttr(computeKernelAttrs),
-            nullptr,  // kernel_config = nullptr (not used)
-            rewriter.getArrayAttr(kernelConfigSymbols));  // distributed_args = [@kernelconfig0, @kernelconfig1, ...]
-            
-        // Create dfschedule.schedule.launch_kernel_group
-        auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
-            loc,
-            dfschedule::EventType::get(rewriter.getContext()),
-            loadKernelGroupOp.getKernelGroup());
 
-        // Emit deferred core StartIoOp calls AFTER kernel load/launch.
-        // This ensures the ELF BSS initialization (which zeroes buf_in_ping/pong)
-        // completes before core S2MM DMAs start writing data into those buffers.
-        SmallVector<Value> coreStartIoEvents;
-        for (auto &deferred : deferredCoreStartIos) {
-            auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
-                loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
-                rewriter.getI32IntegerAttr(deferred.flowIdx));
-            coreStartIoEvents.push_back(coreStartIo.getEvent());
+            // Create dfschedule.schedule.getbdid for shim tile
+            // Shim start_io is emitted BEFORE load_kernel_group so that shim DMA
+            // channels are armed first.  Core start_io remains after kernel launch
+            // to avoid BSS-zeroing races.
+            auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
+
+            // Create dfschedule.schedule.start_io for shim
+            auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
+                loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(), getBdIdOp.getBdId(),
+                rewriter.getI32IntegerAttr(flowIndex));
+
+            // Create dfschedule.config.load_kernel_group with distributed_args pointing to kernel configs
+            auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
+                loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
+                rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs),
+                nullptr,                                     // kernel_config = nullptr (not used)
+                rewriter.getArrayAttr(kernelConfigSymbols)); // distributed_args = [@kernelconfig0, @kernelconfig1, ...]
+
+            // Create dfschedule.schedule.launch_kernel_group
+            auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
+                loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
+
+            // Emit deferred core StartIoOp calls AFTER kernel load/launch.
+            // This ensures the ELF BSS initialization (which zeroes buf_in_ping/pong)
+            // completes before core S2MM DMAs start writing data into those buffers.
+            SmallVector<Value> coreStartIoEvents;
+            for (auto &deferred : deferredCoreStartIos) {
+                auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
+                    rewriter.getI32IntegerAttr(deferred.flowIdx));
+                coreStartIoEvents.push_back(coreStartIo.getEvent());
         }
-
-        // Create dfschedule.schedule.getbdid for shim tile
-        auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(
-            loc,
-            rewriter.getI32Type(),
-            shimTileOp.getTile());
-        
-        // Create dfschedule.schedule.start_io for shim
-        auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
-            loc,
-            dfschedule::EventType::get(rewriter.getContext()),
-            createIoOp.getIoHandle(),
-            getBdIdOp.getBdId(),
-            rewriter.getI32IntegerAttr(flowIndex));
 
         // Create dfschedule.schedule.wait with kernel launch + shim IO events only.
         // Core tile IO events are excluded: core DMAs use infinite ping-pong BD
