@@ -160,6 +160,7 @@ struct ConversionState {
     SmallVector<IoDebugInfo> debugIos;
     SmallVector<TileDebugInfo> debugTiles;
     bool enableDebug = false;
+    int runtimeDebugLevel = -1;
 
     // Cached values for inner patterns (set before applying inner patterns)
     Value devInstRef;
@@ -1276,6 +1277,13 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         auto dimStrides = op.getDimStrides();
         auto dimWraps = op.getDimWraps();
         bool useMultiDim = dimStrides && dimWraps && !dimStrides->empty();
+
+        // When debug level >= 4, force linear DMA for easier debugging
+        if (useMultiDim && state.runtimeDebugLevel >= 4) {
+            llvm::errs() << "  [debug_level=" << state.runtimeDebugLevel
+                         << "] Suppressing multi-dim DMA, using linear __Runtime_dma_bd_config\n";
+            useMultiDim = false;
+        }
 
         emitc::CallOpaqueOp configCall;
         if (useMultiDim) {
@@ -2846,6 +2854,7 @@ void DfscheduleToApiPass::runOnOperation() {
     // Shared conversion state
     ConversionState state;
     state.enableDebug = enableDebug_;
+    state.runtimeDebugLevel = runtimeDebugLevel_;
 
     // Type converter
     TypeConverter typeConverter;

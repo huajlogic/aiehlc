@@ -13,7 +13,9 @@
       "Skill(superpowers:brainstorming)",
       "Skill(superpowers:systematic-debugging)",
       "Skill(superpowers:executing-plans)",
-      "Skill(session-memory)"
+      "Skill(session-memory)",
+      "Skill(superpowers:writing-plans)",
+      "Skill(superpowers:subagent-driven-development)"
     ],
     "deny": []
   },

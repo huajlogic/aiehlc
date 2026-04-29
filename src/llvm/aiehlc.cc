@@ -7,6 +7,7 @@
 #include "clang/AST/APValue.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
@@ -834,30 +835,65 @@ public:
                                 pti.policyName = policyName;
 
                                 // --- AST-based SpatialPolicy struct extraction ---
+                                // Extract the constexpr SpatialPolicy struct fields from the
+                                // template argument of aie::port<T, Policy>.
+                                //
+                                // After template instantiation, ptype is a RecordType (the
+                                // instantiated aie::port<T,P> struct). We reach the template
+                                // args via ClassTemplateSpecializationDecl.
+                                //
+                                // The policy argument kind depends on the LLVM version:
+                                //   - StructuralValue: the APValue is stored directly
+                                //   - Declaration: a reference to the constexpr VarDecl;
+                                //     we evaluate it to get the APValue
                                 if (!policyName.empty()) {
-                                    // Get the template specialization type for port<T, P>
                                     const clang::Type *rawType = ptype.getTypePtr();
-                                    // Unwrap elaborated types
-                                    if (const auto *elab = dyn_cast<clang::ElaboratedType>(rawType))
-                                        rawType = elab->getNamedType().getTypePtr();
-                                    if (const auto *tst = dyn_cast<clang::TemplateSpecializationType>(rawType)) {
-                                        if (tst->template_arguments().size() >= 2) {
-                                            const auto &policyArg = tst->template_arguments()[1];
+                                    rawType = rawType->getUnqualifiedDesugaredType();
+
+                                    const clang::CXXRecordDecl *recDecl = rawType->getAsCXXRecordDecl();
+                                    if (auto *ctsd =
+                                            dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(recDecl)) {
+                                        const auto &targs = ctsd->getTemplateArgs();
+                                        if (targs.size() >= 2) {
+                                            const auto &policyArg = targs[1];
+                                            const APValue *apval = nullptr;
+
                                             if (policyArg.getKind() == clang::TemplateArgument::StructuralValue) {
-                                                const APValue &val = policyArg.getAsStructuralValue();
-                                                if (val.isStruct() && val.getStructNumFields() >= 4) {
-                                                    pti.pattern = (int)val.getStructField(0).getInt().getExtValue();
-                                                    pti.distribution =
-                                                        (int)val.getStructField(1).getInt().getExtValue();
-                                                    pti.mergeOrder = (int)val.getStructField(2).getInt().getExtValue();
-                                                    pti.pingPong = (int)val.getStructField(3).getInt().getExtValue();
-                                                    pti.policyResolved = true;
-                                                    llvm::outs()
-                                                        << "[TilingLinalg] Policy resolved: pattern=" << pti.pattern
-                                                        << " distribution=" << pti.distribution
-                                                        << " mergeOrder=" << pti.mergeOrder
-                                                        << " pingPong=" << pti.pingPong << "\n";
+                                                apval = &policyArg.getAsStructuralValue();
+                                            } else if (policyArg.getKind() == clang::TemplateArgument::Declaration) {
+                                                // C++20 struct NTTP: Clang stores the evaluated value as a
+                                                // TemplateParamObjectDecl (a unique'd APValue holder).
+                                                ValueDecl *decl = policyArg.getAsDecl();
+                                                if (auto *tpo = dyn_cast<clang::TemplateParamObjectDecl>(decl)) {
+                                                    apval = &tpo->getValue();
+                                                } else if (auto *vd = dyn_cast<clang::VarDecl>(decl)) {
+                                                    apval = vd->getEvaluatedValue();
+                                                    if (!apval)
+                                                        vd->evaluateValue(), apval = vd->getEvaluatedValue();
                                                 }
+                                            } else if (policyArg.getKind() == clang::TemplateArgument::Expression) {
+                                                // Fallback: evaluate the expression directly
+                                                clang::Expr::EvalResult evalRes;
+                                                if (policyArg.getAsExpr()->EvaluateAsConstantExpr(evalRes, *Context)) {
+                                                    apval = &evalRes.Val;
+                                                }
+                                            }
+
+                                            if (apval && apval->isStruct() && apval->getStructNumFields() >= 4) {
+                                                pti.pattern = (int)apval->getStructField(0).getInt().getExtValue();
+                                                pti.distribution = (int)apval->getStructField(1).getInt().getExtValue();
+                                                pti.mergeOrder = (int)apval->getStructField(2).getInt().getExtValue();
+                                                pti.pingPong = (int)apval->getStructField(3).getInt().getExtValue();
+                                                pti.policyResolved = true;
+                                                llvm::outs()
+                                                    << "[TilingLinalg] Policy resolved: pattern=" << pti.pattern
+                                                    << " distribution=" << pti.distribution
+                                                    << " mergeOrder=" << pti.mergeOrder << " pingPong=" << pti.pingPong
+                                                    << "\n";
+                                            } else if (!apval) {
+                                                llvm::errs()
+                                                    << "[TilingLinalg] DEBUG: policy arg kind="
+                                                    << (int)policyArg.getKind() << " — could not obtain APValue\n";
                                             }
                                         }
                                     }

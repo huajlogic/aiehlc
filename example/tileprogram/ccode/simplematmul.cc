@@ -39,13 +39,6 @@
 #include <stdint.h>
 
 // Spatial policy definitions for kernel parameter transfer
-constexpr aie::SpatialPolicy RowBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Row};
-
-constexpr aie::SpatialPolicy ColBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Col};
-
-constexpr aie::SpatialPolicy LtoR_Merge = {
-    .pattern = aie::Pattern::Gather, .distribution = aie::Layout::Row, .merge_order = aie::Flow::LeftToRight};
-
 #define M 64
 #define K 64
 #define N 64
@@ -87,6 +80,10 @@ static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *
 // Each output byte = row[0:2] | col[3:5] | round[6:7]
 // This lets you identify which tile and round produced each output byte.
 #pragma aie_debug_level 4
+constexpr aie::SpatialPolicy RowBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Row};
+constexpr aie::SpatialPolicy ColBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Col};
+constexpr aie::SpatialPolicy LtoR_Merge = {
+    .pattern = aie::Pattern::Gather, .distribution = aie::Layout::Row, .merge_order = aie::Flow::LeftToRight};
 __global__ void matmul(aie::port<input_window_int8 *, RowBC> window_in_0,
                        aie::port<input_window_int8 *, ColBC> window_in_1,
                        aie::port<output_window_int8 *, LtoR_Merge> window_out_0) {

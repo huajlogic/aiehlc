@@ -205,6 +205,7 @@ if [[ $aie_version == "1" || $aie_version == "2" ]]; then
     hw_lib_flag="-DARMA72_EL3"
     compiler_cpu_flag="-mcpu=cortex-a72"
     EXTRA_LIBS="-lxiltimer,-lxilstandalone,"
+    AIE_ARCH_MACRO=10
 elif [[ $aie_version == "5" ]]; then
     ARCH_APU_ALIB=$ARCH_APU_A78_LIB
     ARCH_APU_AINC=$ARCH_APU_A78_INC
@@ -214,6 +215,7 @@ elif [[ $aie_version == "5" ]]; then
     hw_lib_flag="-DARMA78_EL3"
     compiler_cpu_flag="-mcpu=cortex-a78"
     EXTRA_LIBS="-lxiltimer,-lxilstandalone,"
+    AIE_ARCH_MACRO=20
 else
     echo "Unsupported AIE version: $aie_version"
     return 1
@@ -268,17 +270,19 @@ echo -e "    ${runtime_source_file}\n"
 set -x
 if [[ "$use_llvm_aie" == "true" ]]; then
     "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" --use-llvm-aie --extra-arg="-DAIE_GEN=${aie_version}" \
+        --extra-arg="-D__AIE_ARCH__=${AIE_ARCH_MACRO}" \
         --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
         --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
         --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
-        --extra-arg="-include"aie_compat.h"" ${runtime_source_file} --
+        ${runtime_source_file} --
     AIEHLC_RC=$?
 else
     "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" --extra-arg="-DAIE_GEN=${aie_version}" \
+        --extra-arg="-D__AIE_ARCH__=${AIE_ARCH_MACRO}" \
         --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
         --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
         --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
-        --extra-arg="-include"aie_compat.h"" ${runtime_source_file} --
+        ${runtime_source_file} --
     AIEHLC_RC=$?
 fi
 set +x

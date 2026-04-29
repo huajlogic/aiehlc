@@ -248,8 +248,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
                        "ScheduleCanonicalizePass"))
         return false;
-    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true), irDir, stage,
-                       "DfscheduleToApiPass"))
+    if (!runPipelineSinglePass(ctx, hostModule,
+                               std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true, runtimeDebugLevel),
+                               irDir, stage, "DfscheduleToApiPass"))
         return false;
     if (!runPipelineSinglePass(ctx, hostModule, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
         return false;
@@ -386,6 +387,18 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             // Suppress the Clang-phase stubs (which had wrong arity) and emit
             // correct __aie_launch that forwards DDR pointers.
             stream << "#define AIEHLC_TILING_STUBS_DEFINED\n";
+            // Re-emit SpatialPolicy types so user source constexpr definitions compile
+            stream << "namespace aie {\n";
+            stream << "enum class Pattern  { Broadcast = 0, Scatter = 1, Multicast = 2, Gather = 3 };\n";
+            stream << "enum class Layout   { Row = 0, Col = 1, Grid = 2 };\n";
+            stream << "enum class Flow     { Default = 0, LeftToRight = 1, RightToLeft = 2 };\n";
+            stream << "struct SpatialPolicy {\n";
+            stream << "  Pattern pattern      = Pattern::Broadcast;\n";
+            stream << "  Layout  distribution = Layout::Row;\n";
+            stream << "  Flow    merge_order  = Flow::Default;\n";
+            stream << "  int     ping_pong    = 2;\n";
+            stream << "};\n";
+            stream << "}\n";
             stream << "struct aieDim { int rows, cols; aieDim(int r, int c) : rows(r), cols(c) {} };\n";
             stream << "inline void aieSetDevice(int) {}\n";
             stream << "inline void aieDeviceSynchronize() {}\n";

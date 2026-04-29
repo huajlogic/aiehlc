@@ -715,16 +715,12 @@ void RoutingHWLowerPass::runOnOperation() {
         llvm::outs() << "applyPartialConversion failed\n";
     }
 
-    std::string cppOutput;
-    llvm::raw_string_ostream os(cppOutput);
-
     //remove the dead code
-    
+
     mlir::RewritePatternSet patternscde(&ctx);
     for (auto* dialect : ctx.getLoadedDialects()) {
         dialect->getCanonicalizationPatterns(patternscde);
     }
-   // /*
     for (mlir::RegisteredOperationName op : ctx.getRegisteredOperations()) {
         op.getCanonicalizationPatterns(patternscde, &ctx);
     }
@@ -733,19 +729,4 @@ void RoutingHWLowerPass::runOnOperation() {
                 // Handle error
         signalPassFailure();
     }
-    
-
-  // This is the core translation call.
-  // It takes the module and an output stream.
-    if (mlir::failed(mlir::emitc::translateToCpp(module, os))) {
-        llvm::errs() << "Failed to translate MLIR to C++.\n";
-        return;
-    }
-    //*/
-
-
-
-  // 4. Print the resulting C++ code.
-    std::cout << "--- Generated C++ Code ---\n" << os.str() << std::endl;
-       // */
 };
