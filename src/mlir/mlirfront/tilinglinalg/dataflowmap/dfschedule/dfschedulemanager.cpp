@@ -345,6 +345,7 @@ void dfschedule::KernelMainOp::print(::mlir::OpAsmPrinter &printer) {
     convertToI32("release_lock_id");
     convertToI32("release_lock_val");
     convertToI32("data_id");
+    convertToI32("out_of_order_bd_id");
 
     // Convert dim_strides and dim_wraps array elements from i64 to i32
     auto convertArrayToI32 = [&](StringRef attrName) {
@@ -431,7 +432,9 @@ void dfschedule::ConfigDmaBdOp::print(::mlir::OpAsmPrinter &printer) {
     printer.printNewline();
     printer << "release_lock_val = " << static_cast<int32_t>(getReleaseLockVal()) << " : i32,";
     printer.printNewline();
-    printer << "data_id = " << static_cast<int32_t>(getDataId()) << " : i32";
+    printer << "data_id = " << static_cast<int32_t>(getDataId()) << " : i32,";
+    printer.printNewline();
+    printer << "out_of_order_bd_id = " << static_cast<int32_t>(getOutOfOrderBdId()) << " : i32";
     // Print optional multi-dimensional addressing attributes
     if (auto strides = getDimStrides()) {
         printer << ",";
@@ -577,11 +580,13 @@ void dfschedule::ConfigCreateIoOp::print(::mlir::OpAsmPrinter &printer) {
     printer.printNewline();
     printer << "direction = \"" << getDirection() << "\",";
     printer.printNewline();
-    printer << "io_operation = \"" << getIoOperation() << "\"";
+    printer << "io_operation = \"" << getIoOperation() << "\",";
+    printer.printNewline();
+    printer << "enable_out_of_order = " << (getEnableOutOfOrder() ? "true" : "false");
     printer.decreaseIndent();
     printer.printNewline();
     printer << "} ";
-    
+
     // Print types
     printer << ": (";
     printer << getBdConfig().getType() << ", " << getTile().getType();
@@ -876,19 +881,19 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
                                                   builder.getI32IntegerAttr(-1),   // release_lock_val
                                                   builder.getI32IntegerAttr(-1),   // data_id
                                                   Value(),                         // linked_bd
+                                                  builder.getI32IntegerAttr(-1),   // out_of_order_bd_id
                                                   /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
 
     // %io_0 = dfschedule.config.create_io(%bd_config, %shim0) {...}
     auto ioHandleType = dfschedule::IoHandleType::get(ctx);
-    auto io0 = builder.create<dfschedule::ConfigCreateIoOp>(
-        location, ioHandleType,
-        bdConfig.getResult(),
-        shim0.getResult(),
-        builder.getI32IntegerAttr(0),       // channel
-        builder.getStringAttr("MM2S"),      // direction
-        builder.getStringAttr("SEND")       // io_operation
-    );
-    
+    auto io0 =
+        builder.create<dfschedule::ConfigCreateIoOp>(location, ioHandleType, bdConfig.getResult(), shim0.getResult(),
+                                                     builder.getI32IntegerAttr(0),  // channel
+                                                     builder.getStringAttr("MM2S"), // direction
+                                                     builder.getStringAttr("SEND"), // io_operation
+                                                     builder.getBoolAttr(false)     // enable_out_of_order
+        );
+
     // Launch kernel section
     // %core0 = dfschedule.declaretile {col = 0, row = 3} : !dfschedule.tile
     auto core0 = builder.create<dfschedule::DeclareTileOp>(
@@ -1143,6 +1148,7 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
                                                   builder.getI32IntegerAttr(1),  // release_lock_val
                                                   builder.getI32IntegerAttr(-1), // data_id
                                                   Value(),                       // linked_bd
+                                                  builder.getI32IntegerAttr(-1), // out_of_order_bd_id
                                                   /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
 
     // %bd_ping = dfschedule.config.dma_bd(%ping, %tile, %bd_id_ping) { ... }
@@ -1161,6 +1167,7 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
                                                   builder.getI32IntegerAttr(1),  // release_lock_val
                                                   builder.getI32IntegerAttr(-1), // data_id
                                                   bdPong.getBdHandle(),          // linked_bd = pong BD
+                                                  builder.getI32IntegerAttr(-1), // out_of_order_bd_id
                                                   /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
     //*/
     // (locks already initialized above)

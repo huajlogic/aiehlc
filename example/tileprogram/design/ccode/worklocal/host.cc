@@ -6,20 +6,20 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=0, offset=0, len=32, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0,
      * acquire_lock_val=0, release_lock_id=0, release_lock_val=0 */
     void *v6 = __runtime_buffer_arg(v4);
-    XAie_DmaDesc v7 = __Runtime_dma_bd_config(g_DevInst, v5, v6, 0, 0, 32, -1, 0, 0, 0, 0, 0, 0);
+    XAie_DmaDesc v7 = __Runtime_dma_bd_config(g_DevInst, v5, v6, 0, 32, -1, 0, 0, 0, 0, 0, 0);
     /* Create IO: channel_id=0, bd_id=0, tile=(2,0), direction=MM2S */
     io v8 = __Runtime_dma_createio_4(v5, v7, 0, 0, DMA_MM2S);
     XAie_LocType v9 = XAie_TileLoc(0, 3);
     /* DMA BD Config: bd_id=1, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=0,
      * acquire_lock_val=-1, release_lock_id=1, release_lock_val=1 */
     void *v10 = __runtime_buffer_arg((void *)32832);
-    XAie_DmaDesc v11 = __Runtime_dma_bd_config(g_DevInst, v9, v10, 1, 0, 16, 0, 0, 0, 0, -1, 1, 1);
+    XAie_DmaDesc v11 = __Runtime_dma_bd_config(g_DevInst, v9, v10, 1, 16, 0, 0, 0, 0, -1, 1, 1);
     /* Lock init: tile(0,3) lock=0 init_value=2 */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(0, 3), XAie_LockInit(0, 2));
     /* DMA BD Config: bd_id=0, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=0,
      * acquire_lock_val=-1, release_lock_id=1, release_lock_val=1 */
     void *v12 = __runtime_buffer_arg((void *)32768);
-    XAie_DmaDesc v13 = __Runtime_dma_bd_config(g_DevInst, v9, v12, 0, 0, 16, 1, 0, 0, 0, -1, 1, 1);
+    XAie_DmaDesc v13 = __Runtime_dma_bd_config(g_DevInst, v9, v12, 0, 16, 1, 0, 0, 0, -1, 1, 1);
     /* Create IO: channel_id=0, bd_id=0, tile=(0,3), direction=S2MM */
     io v14 = __Runtime_dma_createio_4(v9, v13, 0, 0, DMA_S2MM);
     /* Allocated BD ID 0 for tile (0,3) */
@@ -27,13 +27,13 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=1, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=0,
      * acquire_lock_val=-1, release_lock_id=1, release_lock_val=1 */
     void *v16 = __runtime_buffer_arg((void *)32832);
-    XAie_DmaDesc v17 = __Runtime_dma_bd_config(g_DevInst, v15, v16, 1, 0, 16, 0, 0, 0, 0, -1, 1, 1);
+    XAie_DmaDesc v17 = __Runtime_dma_bd_config(g_DevInst, v15, v16, 1, 16, 0, 0, 0, 0, -1, 1, 1);
     /* Lock init: tile(1,3) lock=0 init_value=2 */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(1, 3), XAie_LockInit(0, 2));
     /* DMA BD Config: bd_id=0, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=0,
      * acquire_lock_val=-1, release_lock_id=1, release_lock_val=1 */
     void *v18 = __runtime_buffer_arg((void *)32768);
-    XAie_DmaDesc v19 = __Runtime_dma_bd_config(g_DevInst, v15, v18, 0, 0, 16, 1, 0, 0, 0, -1, 1, 1);
+    XAie_DmaDesc v19 = __Runtime_dma_bd_config(g_DevInst, v15, v18, 0, 16, 1, 0, 0, 0, -1, 1, 1);
     /* Create IO: channel_id=0, bd_id=0, tile=(1,3), direction=S2MM */
     io v20 = __Runtime_dma_createio_4(v15, v19, 0, 0, DMA_S2MM);
     /* Allocated BD ID 0 for tile (1,3) */
@@ -42,7 +42,7 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=1, offset=0, len=32, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0,
      * acquire_lock_val=0, release_lock_id=0, release_lock_val=0 */
     void *v22 = __runtime_buffer_arg(v21);
-    XAie_DmaDesc v23 = __Runtime_dma_bd_config(g_DevInst, v5, v22, 1, 0, 32, -1, 0, 0, 0, 0, 0, 0);
+    XAie_DmaDesc v23 = __Runtime_dma_bd_config(g_DevInst, v5, v22, 1, 32, -1, 0, 0, 0, 0, 0, 0);
     /* Create IO: channel_id=1, bd_id=1, tile=(2,0), direction=MM2S */
     io v24 = __Runtime_dma_createio_4(v5, v23, 1, 1, DMA_MM2S);
     XAie_LocType v25 = XAie_TileLoc(0, 4);
@@ -50,13 +50,13 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=1, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=0,
      * acquire_lock_val=-1, release_lock_id=1, release_lock_val=1 */
     void *v27 = __runtime_buffer_arg((void *)32832);
-    XAie_DmaDesc v28 = __Runtime_dma_bd_config(g_DevInst, v25, v27, 1, 0, 16, 0, 0, 0, 0, -1, 1, 1);
+    XAie_DmaDesc v28 = __Runtime_dma_bd_config(g_DevInst, v25, v27, 1, 16, 0, 0, 0, 0, -1, 1, 1);
     /* Lock init: tile(0,4) lock=0 init_value=2 */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(0, 4), XAie_LockInit(0, 2));
     /* DMA BD Config: bd_id=0, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=0,
      * acquire_lock_val=-1, release_lock_id=1, release_lock_val=1 */
     void *v29 = __runtime_buffer_arg((void *)32768);
-    XAie_DmaDesc v30 = __Runtime_dma_bd_config(g_DevInst, v25, v29, 0, 0, 16, 1, 0, 0, 0, -1, 1, 1);
+    XAie_DmaDesc v30 = __Runtime_dma_bd_config(g_DevInst, v25, v29, 0, 16, 1, 0, 0, 0, -1, 1, 1);
     /* Create IO: channel_id=0, bd_id=0, tile=(0,4), direction=S2MM */
     io v31 = __Runtime_dma_createio_4(v25, v30, 0, 0, DMA_S2MM);
     /* Allocated BD ID 0 for tile (0,4) */
@@ -65,13 +65,13 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=1, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=0,
      * acquire_lock_val=-1, release_lock_id=1, release_lock_val=1 */
     void *v34 = __runtime_buffer_arg((void *)32832);
-    XAie_DmaDesc v35 = __Runtime_dma_bd_config(g_DevInst, v32, v34, 1, 0, 16, 0, 0, 0, 0, -1, 1, 1);
+    XAie_DmaDesc v35 = __Runtime_dma_bd_config(g_DevInst, v32, v34, 1, 16, 0, 0, 0, 0, -1, 1, 1);
     /* Lock init: tile(1,4) lock=0 init_value=2 */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(1, 4), XAie_LockInit(0, 2));
     /* DMA BD Config: bd_id=0, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=0,
      * acquire_lock_val=-1, release_lock_id=1, release_lock_val=1 */
     void *v36 = __runtime_buffer_arg((void *)32768);
-    XAie_DmaDesc v37 = __Runtime_dma_bd_config(g_DevInst, v32, v36, 0, 0, 16, 1, 0, 0, 0, -1, 1, 1);
+    XAie_DmaDesc v37 = __Runtime_dma_bd_config(g_DevInst, v32, v36, 0, 16, 1, 0, 0, 0, -1, 1, 1);
     /* Create IO: channel_id=0, bd_id=0, tile=(1,4), direction=S2MM */
     io v38 = __Runtime_dma_createio_4(v32, v37, 0, 0, DMA_S2MM);
     /* Allocated BD ID 0 for tile (1,4) */
@@ -81,32 +81,32 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=0, offset=0, len=32, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0,
      * acquire_lock_val=0, release_lock_id=0, release_lock_val=0 */
     void *v41 = __runtime_buffer_arg(v39);
-    XAie_DmaDesc v42 = __Runtime_dma_bd_config(g_DevInst, v40, v41, 0, 0, 32, -1, 0, 0, 0, 0, 0, 0);
+    XAie_DmaDesc v42 = __Runtime_dma_bd_config(g_DevInst, v40, v41, 0, 32, -1, 0, 0, 0, 0, 0, 0);
     /* Create IO: channel_id=0, bd_id=0, tile=(3,0), direction=MM2S */
     io v43 = __Runtime_dma_createio_4(v40, v42, 0, 0, DMA_MM2S);
     /* DMA BD Config: bd_id=3, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=2,
      * acquire_lock_val=-1, release_lock_id=3, release_lock_val=1 */
     void *v44 = __runtime_buffer_arg((void *)32960);
-    XAie_DmaDesc v45 = __Runtime_dma_bd_config(g_DevInst, v9, v44, 3, 0, 16, 2, 0, 0, 2, -1, 3, 1);
+    XAie_DmaDesc v45 = __Runtime_dma_bd_config(g_DevInst, v9, v44, 3, 16, 2, 0, 0, 2, -1, 3, 1);
     /* Lock init: tile(0,3) lock=2 init_value=2 */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(0, 3), XAie_LockInit(2, 2));
     /* DMA BD Config: bd_id=2, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=2,
      * acquire_lock_val=-1, release_lock_id=3, release_lock_val=1 */
     void *v46 = __runtime_buffer_arg((void *)32896);
-    XAie_DmaDesc v47 = __Runtime_dma_bd_config(g_DevInst, v9, v46, 2, 0, 16, 3, 0, 0, 2, -1, 3, 1);
+    XAie_DmaDesc v47 = __Runtime_dma_bd_config(g_DevInst, v9, v46, 2, 16, 3, 0, 0, 2, -1, 3, 1);
     /* Create IO: channel_id=1, bd_id=2, tile=(0,3), direction=S2MM */
     io v48 = __Runtime_dma_createio_4(v9, v47, 1, 2, DMA_S2MM);
     /* Allocated BD ID 1 for tile (0,3) */
     /* DMA BD Config: bd_id=3, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=2,
      * acquire_lock_val=-1, release_lock_id=3, release_lock_val=1 */
     void *v49 = __runtime_buffer_arg((void *)32960);
-    XAie_DmaDesc v50 = __Runtime_dma_bd_config(g_DevInst, v15, v49, 3, 0, 16, 2, 0, 0, 2, -1, 3, 1);
+    XAie_DmaDesc v50 = __Runtime_dma_bd_config(g_DevInst, v15, v49, 3, 16, 2, 0, 0, 2, -1, 3, 1);
     /* Lock init: tile(1,3) lock=2 init_value=2 */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(1, 3), XAie_LockInit(2, 2));
     /* DMA BD Config: bd_id=2, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=2,
      * acquire_lock_val=-1, release_lock_id=3, release_lock_val=1 */
     void *v51 = __runtime_buffer_arg((void *)32896);
-    XAie_DmaDesc v52 = __Runtime_dma_bd_config(g_DevInst, v15, v51, 2, 0, 16, 3, 0, 0, 2, -1, 3, 1);
+    XAie_DmaDesc v52 = __Runtime_dma_bd_config(g_DevInst, v15, v51, 2, 16, 3, 0, 0, 2, -1, 3, 1);
     /* Create IO: channel_id=1, bd_id=2, tile=(1,3), direction=S2MM */
     io v53 = __Runtime_dma_createio_4(v15, v52, 1, 2, DMA_S2MM);
     /* Allocated BD ID 1 for tile (1,3) */
@@ -115,20 +115,20 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=1, offset=0, len=32, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0,
      * acquire_lock_val=0, release_lock_id=0, release_lock_val=0 */
     void *v55 = __runtime_buffer_arg(v54);
-    XAie_DmaDesc v56 = __Runtime_dma_bd_config(g_DevInst, v40, v55, 1, 0, 32, -1, 0, 0, 0, 0, 0, 0);
+    XAie_DmaDesc v56 = __Runtime_dma_bd_config(g_DevInst, v40, v55, 1, 32, -1, 0, 0, 0, 0, 0, 0);
     /* Create IO: channel_id=1, bd_id=1, tile=(3,0), direction=MM2S */
     io v57 = __Runtime_dma_createio_4(v40, v56, 1, 1, DMA_MM2S);
     void *v58 = __runtime_buffer_offset(v54, 128);
     /* DMA BD Config: bd_id=3, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=2,
      * acquire_lock_val=-1, release_lock_id=3, release_lock_val=1 */
     void *v59 = __runtime_buffer_arg((void *)32960);
-    XAie_DmaDesc v60 = __Runtime_dma_bd_config(g_DevInst, v25, v59, 3, 0, 16, 2, 0, 0, 2, -1, 3, 1);
+    XAie_DmaDesc v60 = __Runtime_dma_bd_config(g_DevInst, v25, v59, 3, 16, 2, 0, 0, 2, -1, 3, 1);
     /* Lock init: tile(0,4) lock=2 init_value=2 */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(0, 4), XAie_LockInit(2, 2));
     /* DMA BD Config: bd_id=2, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=2,
      * acquire_lock_val=-1, release_lock_id=3, release_lock_val=1 */
     void *v61 = __runtime_buffer_arg((void *)32896);
-    XAie_DmaDesc v62 = __Runtime_dma_bd_config(g_DevInst, v25, v61, 2, 0, 16, 3, 0, 0, 2, -1, 3, 1);
+    XAie_DmaDesc v62 = __Runtime_dma_bd_config(g_DevInst, v25, v61, 2, 16, 3, 0, 0, 2, -1, 3, 1);
     /* Create IO: channel_id=1, bd_id=2, tile=(0,4), direction=S2MM */
     io v63 = __Runtime_dma_createio_4(v25, v62, 1, 2, DMA_S2MM);
     /* Allocated BD ID 1 for tile (0,4) */
@@ -136,13 +136,13 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=3, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=2,
      * acquire_lock_val=-1, release_lock_id=3, release_lock_val=1 */
     void *v65 = __runtime_buffer_arg((void *)32960);
-    XAie_DmaDesc v66 = __Runtime_dma_bd_config(g_DevInst, v32, v65, 3, 0, 16, 2, 0, 0, 2, -1, 3, 1);
+    XAie_DmaDesc v66 = __Runtime_dma_bd_config(g_DevInst, v32, v65, 3, 16, 2, 0, 0, 2, -1, 3, 1);
     /* Lock init: tile(1,4) lock=2 init_value=2 */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(1, 4), XAie_LockInit(2, 2));
     /* DMA BD Config: bd_id=2, offset=0, len=16, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=2,
      * acquire_lock_val=-1, release_lock_id=3, release_lock_val=1 */
     void *v67 = __runtime_buffer_arg((void *)32896);
-    XAie_DmaDesc v68 = __Runtime_dma_bd_config(g_DevInst, v32, v67, 2, 0, 16, 3, 0, 0, 2, -1, 3, 1);
+    XAie_DmaDesc v68 = __Runtime_dma_bd_config(g_DevInst, v32, v67, 2, 16, 3, 0, 0, 2, -1, 3, 1);
     /* Create IO: channel_id=1, bd_id=2, tile=(1,4), direction=S2MM */
     io v69 = __Runtime_dma_createio_4(v32, v68, 1, 2, DMA_S2MM);
     /* Allocated BD ID 1 for tile (1,4) */
@@ -151,20 +151,20 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=2, offset=0, len=32, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0,
      * acquire_lock_val=0, release_lock_id=0, release_lock_val=0 */
     void *v71 = __runtime_buffer_arg(v70);
-    XAie_DmaDesc v72 = __Runtime_dma_bd_config(g_DevInst, v5, v71, 2, 0, 32, -1, 0, 0, 0, 0, 0, 0);
+    XAie_DmaDesc v72 = __Runtime_dma_bd_config(g_DevInst, v5, v71, 2, 32, -1, 0, 0, 0, 0, 0, 0);
     /* Create IO: channel_id=0, bd_id=2, tile=(2,0), direction=S2MM */
     io v73 = __Runtime_dma_createio_4(v5, v72, 0, 2, DMA_S2MM);
     void *v74 = __runtime_buffer_offset(v70, 0);
     /* DMA BD Config: bd_id=5, offset=0, len=8, enable_packet=true, packet_id=9, next_bd=4, acquire_lock_id=5,
      * acquire_lock_val=-1, release_lock_id=4, release_lock_val=1 */
     void *v75 = __runtime_buffer_arg((void *)33088);
-    XAie_DmaDesc v76 = __Runtime_dma_bd_config(g_DevInst, v9, v75, 5, 0, 8, 4, 1, 9, 5, -1, 4, 1);
+    XAie_DmaDesc v76 = __Runtime_dma_bd_config(g_DevInst, v9, v75, 5, 8, 4, 1, 9, 5, -1, 4, 1);
     /* Lock init: tile(0,3) lock=4 init_value=2 (kernel output acquire) */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(0, 3), XAie_LockInit(4, 2));
     /* DMA BD Config: bd_id=4, offset=0, len=8, enable_packet=true, packet_id=9, next_bd=5, acquire_lock_id=5,
      * acquire_lock_val=-1, release_lock_id=4, release_lock_val=1 */
     void *v77 = __runtime_buffer_arg((void *)33024);
-    XAie_DmaDesc v78 = __Runtime_dma_bd_config(g_DevInst, v9, v77, 4, 0, 8, 5, 1, 9, 5, -1, 4, 1);
+    XAie_DmaDesc v78 = __Runtime_dma_bd_config(g_DevInst, v9, v77, 4, 8, 5, 1, 9, 5, -1, 4, 1);
     /* Create IO: channel_id=0, bd_id=4, tile=(0,3), direction=MM2S */
     io v79 = __Runtime_dma_createio_4(v9, v78, 0, 4, DMA_MM2S);
     /* Allocated BD ID 2 for tile (0,3) */
@@ -172,13 +172,13 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=5, offset=0, len=8, enable_packet=true, packet_id=10, next_bd=4, acquire_lock_id=5,
      * acquire_lock_val=-1, release_lock_id=4, release_lock_val=1 */
     void *v81 = __runtime_buffer_arg((void *)33088);
-    XAie_DmaDesc v82 = __Runtime_dma_bd_config(g_DevInst, v15, v81, 5, 0, 8, 4, 1, 10, 5, -1, 4, 1);
+    XAie_DmaDesc v82 = __Runtime_dma_bd_config(g_DevInst, v15, v81, 5, 8, 4, 1, 10, 5, -1, 4, 1);
     /* Lock init: tile(1,3) lock=4 init_value=2 (kernel output acquire) */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(1, 3), XAie_LockInit(4, 2));
     /* DMA BD Config: bd_id=4, offset=0, len=8, enable_packet=true, packet_id=10, next_bd=5, acquire_lock_id=5,
      * acquire_lock_val=-1, release_lock_id=4, release_lock_val=1 */
     void *v83 = __runtime_buffer_arg((void *)33024);
-    XAie_DmaDesc v84 = __Runtime_dma_bd_config(g_DevInst, v15, v83, 4, 0, 8, 5, 1, 10, 5, -1, 4, 1);
+    XAie_DmaDesc v84 = __Runtime_dma_bd_config(g_DevInst, v15, v83, 4, 8, 5, 1, 10, 5, -1, 4, 1);
     /* Create IO: channel_id=0, bd_id=4, tile=(1,3), direction=MM2S */
     io v85 = __Runtime_dma_createio_4(v15, v84, 0, 4, DMA_MM2S);
     /* Allocated BD ID 2 for tile (1,3) */
@@ -187,20 +187,20 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=3, offset=0, len=32, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0,
      * acquire_lock_val=0, release_lock_id=0, release_lock_val=0 */
     void *v87 = __runtime_buffer_arg(v86);
-    XAie_DmaDesc v88 = __Runtime_dma_bd_config(g_DevInst, v5, v87, 3, 0, 32, -1, 0, 0, 0, 0, 0, 0);
+    XAie_DmaDesc v88 = __Runtime_dma_bd_config(g_DevInst, v5, v87, 3, 32, -1, 0, 0, 0, 0, 0, 0);
     /* Create IO: channel_id=1, bd_id=3, tile=(2,0), direction=S2MM */
     io v89 = __Runtime_dma_createio_4(v5, v88, 1, 3, DMA_S2MM);
     void *v90 = __runtime_buffer_offset(v86, 0);
     /* DMA BD Config: bd_id=5, offset=0, len=8, enable_packet=true, packet_id=11, next_bd=4, acquire_lock_id=5,
      * acquire_lock_val=-1, release_lock_id=4, release_lock_val=1 */
     void *v91 = __runtime_buffer_arg((void *)33088);
-    XAie_DmaDesc v92 = __Runtime_dma_bd_config(g_DevInst, v25, v91, 5, 0, 8, 4, 1, 11, 5, -1, 4, 1);
+    XAie_DmaDesc v92 = __Runtime_dma_bd_config(g_DevInst, v25, v91, 5, 8, 4, 1, 11, 5, -1, 4, 1);
     /* Lock init: tile(0,4) lock=4 init_value=2 (kernel output acquire) */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(0, 4), XAie_LockInit(4, 2));
     /* DMA BD Config: bd_id=4, offset=0, len=8, enable_packet=true, packet_id=11, next_bd=5, acquire_lock_id=5,
      * acquire_lock_val=-1, release_lock_id=4, release_lock_val=1 */
     void *v93 = __runtime_buffer_arg((void *)33024);
-    XAie_DmaDesc v94 = __Runtime_dma_bd_config(g_DevInst, v25, v93, 4, 0, 8, 5, 1, 11, 5, -1, 4, 1);
+    XAie_DmaDesc v94 = __Runtime_dma_bd_config(g_DevInst, v25, v93, 4, 8, 5, 1, 11, 5, -1, 4, 1);
     /* Create IO: channel_id=0, bd_id=4, tile=(0,4), direction=MM2S */
     io v95 = __Runtime_dma_createio_4(v25, v94, 0, 4, DMA_MM2S);
     /* Allocated BD ID 2 for tile (0,4) */
@@ -208,13 +208,13 @@ void host_canonicalized(void *v1, void *v2, void *v3) {
     /* DMA BD Config: bd_id=5, offset=0, len=8, enable_packet=true, packet_id=12, next_bd=4, acquire_lock_id=5,
      * acquire_lock_val=-1, release_lock_id=4, release_lock_val=1 */
     void *v97 = __runtime_buffer_arg((void *)33088);
-    XAie_DmaDesc v98 = __Runtime_dma_bd_config(g_DevInst, v32, v97, 5, 0, 8, 4, 1, 12, 5, -1, 4, 1);
+    XAie_DmaDesc v98 = __Runtime_dma_bd_config(g_DevInst, v32, v97, 5, 8, 4, 1, 12, 5, -1, 4, 1);
     /* Lock init: tile(1,4) lock=4 init_value=2 (kernel output acquire) */
     XAie_LockSetValue(g_DevInst, XAie_TileLoc(1, 4), XAie_LockInit(4, 2));
     /* DMA BD Config: bd_id=4, offset=0, len=8, enable_packet=true, packet_id=12, next_bd=5, acquire_lock_id=5,
      * acquire_lock_val=-1, release_lock_id=4, release_lock_val=1 */
     void *v99 = __runtime_buffer_arg((void *)33024);
-    XAie_DmaDesc v100 = __Runtime_dma_bd_config(g_DevInst, v32, v99, 4, 0, 8, 5, 1, 12, 5, -1, 4, 1);
+    XAie_DmaDesc v100 = __Runtime_dma_bd_config(g_DevInst, v32, v99, 4, 8, 5, 1, 12, 5, -1, 4, 1);
     /* Create IO: channel_id=0, bd_id=4, tile=(1,4), direction=MM2S */
     io v101 = __Runtime_dma_createio_4(v32, v100, 0, 4, DMA_MM2S);
     /* Allocated BD ID 2 for tile (1,4) */

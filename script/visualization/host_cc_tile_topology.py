@@ -838,6 +838,97 @@ def _map_blocks_to_flows(
     return block_to_flow
 
 
+def _classify_mixed_block_connections(
+    block: RoutingBlock,
+) -> Dict[str, set]:
+    """For a mixed-direction block, classify each circuit connection as belonging
+    to the 'input' path (shim_to_aie) or the 'output' path (aie_to_shim).
+
+    Returns a dict with keys 'shim_to_aie' and 'aie_to_shim', each mapping to a
+    set of connection indices (into block.circuit_conns).
+
+    Strategy: Build a directed graph of connections within the block. Then BFS
+    forward from each shim DMA source to tag reachable connections.
+    - For shim_to_aie: the shim tile's SOUTH port is the source, data flows
+      northward/outward to compute tiles.
+    - For aie_to_shim: the compute tiles' DMA/SOUTH are sources, data flows
+      southward to the output shim tile.
+
+    We trace forward through the connection graph: a connection's master port
+    becomes the next connection's slave port (via cross-tile neighbor lookup
+    for directional ports like NORTH/SOUTH/EAST/WEST).
+    """
+    # Build adjacency: (tile, port_type, port_num) -> list of connection indices
+    # Each connection has a slave input and master output.
+    # The master output of one connection feeds the slave input of the next.
+    slave_to_conn: Dict[tuple, List[int]] = defaultdict(list)
+    for ci, cc in enumerate(block.circuit_conns):
+        slave_to_conn[(cc.tile, cc.slave_type, cc.slave_port)].append(ci)
+
+    def _next_slave_key(cc: CircuitConn) -> Optional[tuple]:
+        """Given a connection's master port, compute the slave key of the next tile."""
+        mdir = cc.master_type
+        if mdir in DIRECTION_DELTA:
+            dc, dr = DIRECTION_DELTA[mdir]
+            nb = (cc.tile[0] + dc, cc.tile[1] + dr)
+            opp = DIRECTION_OPPOSITES[mdir]
+            return (nb, opp, cc.master_port)
+        return None  # DMA or other non-directional endpoint
+
+    # Identify shim DMA tiles and their directions
+    shim_dma_by_dir: Dict[str, List[ShimDmaPort]] = defaultdict(list)
+    for sd in block.shim_dma:
+        shim_dma_by_dir[sd.direction].append(sd)
+
+    result: Dict[str, set] = {"shim_to_aie": set(), "aie_to_shim": set()}
+
+    # For shim_to_aie: start from the SOUTH port of the input shim tile
+    # The shim DMA enables a SOUTH port on the shim tile, and the first
+    # circuit connection takes SOUTH:N as slave input.
+    for sd in shim_dma_by_dir.get("shim_to_aie", []):
+        # Find connections on the shim tile that have SOUTH as slave
+        start_key = (sd.tile, "SOUTH", sd.port_num)
+        # BFS forward
+        queue = list(slave_to_conn.get(start_key, []))
+        visited = set(queue)
+        while queue:
+            ci = queue.pop(0)
+            result["shim_to_aie"].add(ci)
+            cc = block.circuit_conns[ci]
+            # Follow master port to next tile's slave
+            nk = _next_slave_key(cc)
+            if nk:
+                for nci in slave_to_conn.get(nk, []):
+                    if nci not in visited:
+                        visited.add(nci)
+                        queue.append(nci)
+
+    # For aie_to_shim: start from connections whose slave is DMA or NORTH
+    # on compute tiles, flowing southward to the output shim tile.
+    # We find the output shim tile and trace backward... actually, let's trace
+    # forward from compute DMA outputs.
+    # The output path: compute tile DMA -> SOUTH -> ... -> shim tile SOUTH exit
+    # Find connections with DMA or NORTH slave on non-shim tiles that are NOT
+    # already tagged as input path
+    for sd in shim_dma_by_dir.get("aie_to_shim", []):
+        # The output path ends at the shim tile. Find the connection on the shim
+        # tile whose master is SOUTH (exiting to shim DMA).
+        # Actually for aie_to_shim, the connection chain goes:
+        # compute tile: NORTH:N (slave from above) -> SOUTH:M (master going down)
+        # repeated until reaching shim tile row 0.
+        # We need to find the top of this chain.
+        # Strategy: find all connections NOT in input set, BFS from any that
+        # have DMA or NORTH slave type on compute tiles.
+        pass
+
+    # Simpler approach for aie_to_shim: any connection NOT reached by shim_to_aie
+    # BFS belongs to the output path.
+    all_indices = set(range(len(block.circuit_conns)))
+    result["aie_to_shim"] = all_indices - result["shim_to_aie"]
+
+    return result
+
+
 def _build_routing_tile_summary(blocks: List[RoutingBlock]) -> Dict[tuple, List[dict]]:
     result: Dict[tuple, List[dict]] = defaultdict(list)
     for bi, block in enumerate(blocks):
@@ -1002,14 +1093,84 @@ def render_html(
 
     # Build block-name -> flow_ids mapping for routing elements
     block_to_flow: Dict[str, List[int]] = {}
+    per_conn_flow: Dict[tuple, List[int]] = {}
     if blocks and flows:
         block_to_flow = _map_blocks_to_flows(blocks, flows)
-        # Inject flow_ids into routing JSON entries using block_key
+
+        # For mixed-direction blocks, build per-connection flow_id mappings.
+        # Key: (block_key, tuple(tile), slave_type, slave_port, master_type, master_port)
+        # Value: list of flow_ids for that specific connection.
+        per_conn_flow: Dict[tuple, List[int]] = {}
+        for bi, block in enumerate(blocks):
+            block_key = f"{block.name}__{bi}"
+            all_flow_ids = block_to_flow.get(block_key, [])
+            if len(all_flow_ids) <= 1:
+                continue  # Single-direction block, no splitting needed
+
+            # Classify connections as input vs output
+            classification = _classify_mixed_block_connections(block)
+
+            # Map directions to flow_ids
+            dir_to_fid: Dict[str, List[int]] = {}
+            for sd in block.shim_dma:
+                direction = sd.direction
+                # Find matching flow_id for this direction+shim tile
+                expected_flow_dir = "MM2S" if direction == "shim_to_aie" else "S2MM"
+                for f in flows:
+                    if f.flow_id in all_flow_ids and f.direction == expected_flow_dir:
+                        dir_to_fid.setdefault(direction, []).append(f.flow_id)
+                        break
+
+            # Tag each circuit connection with its direction's flow_ids
+            for ci, cc in enumerate(block.circuit_conns):
+                conn_key = (block_key, tuple(cc.tile), cc.slave_type,
+                            cc.slave_port, cc.master_type, cc.master_port)
+                if ci in classification.get("shim_to_aie", set()):
+                    per_conn_flow[conn_key] = dir_to_fid.get("shim_to_aie", all_flow_ids)
+                elif ci in classification.get("aie_to_shim", set()):
+                    per_conn_flow[conn_key] = dir_to_fid.get("aie_to_shim", all_flow_ids)
+
+            # Tag shim_dma entries per direction
+            for sd in block.shim_dma:
+                conn_key = (block_key, tuple(sd.tile), "ShimDMA",
+                            sd.port_num, "ShimDMA", sd.port_num)
+                per_conn_flow[conn_key] = dir_to_fid.get(sd.direction, all_flow_ids)
+
+        # Inject flow_ids into routing JSON entries, using per-connection
+        # granularity for mixed blocks and block-level for single-direction blocks.
         if routing_json_data:
             for arrow in routing_json_data.get("cross_tile_arrows", []):
-                arrow["flow_ids"] = block_to_flow.get(arrow.get("block_key", arrow["block"]), [])
+                bk = arrow.get("block_key", arrow["block"])
+                # Try per-connection lookup first: the cross_tile_arrow is derived
+                # from a circuit connection at from_tile with the master direction.
+                # We need to find the originating connection's classification.
+                # The arrow's from_tile + from_dir + port corresponds to a connection
+                # with master_type=from_dir, master_port=port at from_tile.
+                # Look up all internal_conns that match this.
+                found = False
+                if bk in block_to_flow and len(block_to_flow[bk]) > 1:
+                    # Mixed block: find which connections at from_tile have this master port
+                    from_t = tuple(arrow["from_tile"])
+                    from_dir = arrow["from_dir"]
+                    port = arrow["port"]
+                    # Search for matching circuit connection entry in per_conn_flow
+                    for conn_key, fids in per_conn_flow.items():
+                        if (conn_key[0] == bk and conn_key[1] == from_t
+                                and conn_key[4] == from_dir and conn_key[5] == port):
+                            arrow["flow_ids"] = fids
+                            found = True
+                            break
+                if not found:
+                    arrow["flow_ids"] = block_to_flow.get(bk, [])
+
             for conn in routing_json_data.get("internal_conns", []):
-                conn["flow_ids"] = block_to_flow.get(conn.get("block_key", conn["block"]), [])
+                bk = conn.get("block_key", conn["block"])
+                conn_key = (bk, tuple(conn["tile"]), conn["slave_type"],
+                            conn["slave_port"], conn["master_type"], conn["master_port"])
+                if conn_key in per_conn_flow:
+                    conn["flow_ids"] = per_conn_flow[conn_key]
+                else:
+                    conn["flow_ids"] = block_to_flow.get(bk, [])
 
             # Fallback: infer flow_ids for unmatched entries from neighboring arrows
             # sharing the same block_key that already have valid flow_ids.
@@ -1060,7 +1221,18 @@ def render_html(
         # --- Routing section ---
         routing_rows = []
         for r in rt_info:
-            r_flow_ids = block_to_flow.get(r.get("block_key", r["block"]), [])
+            # Use per-connection flow_ids for mixed blocks when available
+            _r_bk = r.get("block_key", r["block"])
+            if r["type"] == "circuit":
+                _s_type, _s_port = r["slave"].split(":")
+                _m_type, _m_port = r["master"].split(":")
+                _r_conn_key = (_r_bk, loc, _s_type, int(_s_port), _m_type, int(_m_port))
+                r_flow_ids = per_conn_flow.get(_r_conn_key, block_to_flow.get(_r_bk, []))
+            elif r["type"] == "shim_dma":
+                _r_conn_key = (_r_bk, loc, "ShimDMA", r["port"], "ShimDMA", r["port"])
+                r_flow_ids = per_conn_flow.get(_r_conn_key, block_to_flow.get(_r_bk, []))
+            else:
+                r_flow_ids = block_to_flow.get(_r_bk, [])
             r_flow_attr = f' data-flow-ids="{",".join(str(fid) for fid in r_flow_ids)}"' if r_flow_ids else ''
             if r["type"] == "circuit":
                 routing_rows.append(

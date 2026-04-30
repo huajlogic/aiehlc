@@ -156,6 +156,11 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
     DefaultValuedAttr<I32Attr, "-1">:$release_lock_val,
     DefaultValuedAttr<I32Attr, "-1">:$data_id,
     Optional<dfschedule_BdHandleType>:$linked_bd,
+    // Out-of-order BD target: when >= 0, this core MM2S BD tells the shim S2MM
+    // DMA engine to use this specific BD ID for the transfer (via
+    // XAie_DmaSetOutofOrderBdId). Value of -1 means "not used" (backward
+    // compatible).
+    DefaultValuedAttr<I32Attr, "-1">:$out_of_order_bd_id,
     // Multi-dimensional addressing (optional, up to 4 dims)
     // When both present and non-empty, generates XAie_DmaSetMultiDimAddr
     // When absent, generates existing XAie_DmaSetAddrLen (no behavior change)
@@ -175,7 +180,12 @@ def dfschedule_ConfigCreateIoOp : dfscheduleop<"config.create_io"> {
     dfschedule_TileHandleType:$tile,
     I32Attr:$channel,
     StrAttr:$direction,
-    StrAttr:$io_operation  // Renamed from 'operation' to avoid conflict with getOperation()
+    StrAttr:$io_operation,  // Renamed from 'operation' to avoid conflict with getOperation()
+    // When true, enables out-of-order BD execution on this DMA channel.
+    // The shim S2MM channel will use the out_of_order_bd_id from incoming
+    // packet headers to select which BD processes each transfer, bypassing
+    // sequential BD chain order.
+    DefaultValuedAttr<BoolAttr, "false">:$enable_out_of_order
   );
   let results = (outs dfschedule_IoHandleType:$io_handle);
   let hasCustomAssemblyFormat = 1;

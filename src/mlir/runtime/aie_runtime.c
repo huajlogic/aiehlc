@@ -341,10 +341,10 @@ AieRC __Runtime_device_teardown(void) {
  * Configure DMA buffer descriptor.
  * @param len  Transfer length in bytes.
  */
-XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, uint64_t addr,
-                                     int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
-                                     int32_t acquire_lock_id, int32_t acquire_lock_val, int32_t release_lock_id,
-                                     int32_t release_lock_val) {
+XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, int32_t len,
+                                     int32_t next_bd, int32_t enable_packet, int32_t packet_id, int32_t acquire_lock_id,
+                                     int32_t acquire_lock_val, int32_t release_lock_id, int32_t release_lock_val,
+                                     int32_t out_of_order_bd_id) {
     XAie_DmaDesc DmaInst;
     XAie_DmaDescInit(dev, &DmaInst, tile);
     uint8_t tile_type = XAie_GetTileTypefromLoc(dev, tile);
@@ -368,12 +368,18 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
         XAie_DmaSetPkt(&DmaInst, XAie_PacketInit(packet_id, 0));
     }
 
+    if (out_of_order_bd_id >= 0) {
+        XAie_DmaSetOutofOrderBdId(&DmaInst, (uint8_t)out_of_order_bd_id);
+        printf("[aie_runtime] bd_config: set out_of_order_bd_id=%d\n", out_of_order_bd_id);
+    }
+
     XAie_DmaEnableBd(&DmaInst);
     AieRC bd_rc = XAie_DmaWriteBd(dev, &DmaInst, tile, (uint8_t)bd_id);
     printf("[aie_runtime] bd_config tile(%u,%u) bd=%d addr=0x%lx len=%d next=%d lock_acq=%d/%d lock_rel=%d/%d "
-           "pkt=%d/%d rc=%d\n",
+           "pkt=%d/%d ooo_bd=%d rc=%d\n",
            (unsigned)tile.Col, (unsigned)tile.Row, bd_id, (unsigned long)dma_addr, len, next_bd, acquire_lock_id,
-           acquire_lock_val, release_lock_id, release_lock_val, enable_packet, packet_id, (int)bd_rc);
+           acquire_lock_val, release_lock_id, release_lock_val, enable_packet, packet_id, out_of_order_bd_id,
+           (int)bd_rc);
 
     /* Track this BD for debug dump in __Runtime_free */
     if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1 && g_bd_track_count < BD_TRACK_MAX) {
@@ -433,12 +439,13 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
  * @param len  Transfer length in bytes.
  */
 XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
-                                              uint64_t addr, int32_t len, int32_t next_bd, int32_t enable_packet,
-                                              int32_t packet_id, int32_t acquire_lock_id, int32_t acquire_lock_val,
-                                              int32_t release_lock_id, int32_t release_lock_val, int32_t num_dims,
-                                              int32_t dim_stride0, int32_t dim_wrap0, int32_t dim_stride1,
-                                              int32_t dim_wrap1, int32_t dim_stride2, int32_t dim_wrap2,
-                                              int32_t dim_stride3, int32_t dim_wrap3) {
+                                              int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
+                                              int32_t acquire_lock_id, int32_t acquire_lock_val,
+                                              int32_t release_lock_id, int32_t release_lock_val,
+                                              int32_t out_of_order_bd_id, int32_t num_dims, int32_t dim_stride0,
+                                              int32_t dim_wrap0, int32_t dim_stride1, int32_t dim_wrap1,
+                                              int32_t dim_stride2, int32_t dim_wrap2, int32_t dim_stride3,
+                                              int32_t dim_wrap3) {
 
     XAie_DmaDesc DmaInst;
     XAie_DmaDescInit(dev, &DmaInst, tile);
@@ -488,12 +495,18 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
         XAie_DmaSetPkt(&DmaInst, XAie_PacketInit(packet_id, 0));
     }
 
+    if (out_of_order_bd_id >= 0) {
+        XAie_DmaSetOutofOrderBdId(&DmaInst, (uint8_t)out_of_order_bd_id);
+        printf("[aie_runtime] bd_config_multidim: set out_of_order_bd_id=%d\n", out_of_order_bd_id);
+    }
+
     XAie_DmaEnableBd(&DmaInst);
     AieRC bd_rc = XAie_DmaWriteBd(dev, &DmaInst, tile, (uint8_t)bd_id);
     printf("[aie_runtime] bd_config_multidim tile(%u,%u) bd=%d addr=0x%lx len=%d next=%d "
-           "lock_acq=%d/%d lock_rel=%d/%d pkt=%d/%d num_dims=%d rc=%d\n",
+           "lock_acq=%d/%d lock_rel=%d/%d pkt=%d/%d ooo_bd=%d num_dims=%d rc=%d\n",
            (unsigned)tile.Col, (unsigned)tile.Row, bd_id, (unsigned long)dma_addr, len, next_bd, acquire_lock_id,
-           acquire_lock_val, release_lock_id, release_lock_val, enable_packet, packet_id, num_dims, (int)bd_rc);
+           acquire_lock_val, release_lock_id, release_lock_val, enable_packet, packet_id, out_of_order_bd_id, num_dims,
+           (int)bd_rc);
     for (int i = 0; i < num_dims; i++) {
         printf("[aie_runtime]   dim[%d] stride=%d wrap=%d\n", i, strides[i], wraps[i]);
     }
@@ -535,6 +548,22 @@ struct_io __Runtime_dma_createio(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, i
 struct_io __Runtime_dma_createio_4(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, int32_t channel_id, int32_t bd_id,
                                    XAie_DmaDirection direction) {
     return __Runtime_dma_createio(tile_loc, dma_desc, channel_id, bd_id, direction, NULL);
+}
+
+/**
+ * Enable out-of-order BD execution on a DMA channel.
+ * When enabled, the DMA engine selects BDs based on the out_of_order_bd_id
+ * field in incoming packet headers, bypassing normal sequential BD chaining.
+ * Used on shim S2MM channels for gathering output from multiple core tiles.
+ */
+void __Runtime_dma_channel_enable_ooo(XAie_DevInst *dev, XAie_LocType tile, int32_t channel, XAie_DmaDirection dir) {
+    XAie_DmaChannelDesc DmaChannelDescInst;
+    XAie_DmaChannelDescInit(dev, &DmaChannelDescInst, tile);
+    XAie_DmaChannelEnOutofOrder(&DmaChannelDescInst, XAIE_ENABLE);
+    AieRC rc = XAie_DmaWriteChannel(dev, &DmaChannelDescInst, tile, (uint8_t)channel, dir);
+    const char *dir_str = (dir == DMA_MM2S) ? "MM2S" : "S2MM";
+    printf("[aie_runtime] channel_enable_ooo tile(%u,%u) ch=%d dir=%s rc=%d\n", (unsigned)tile.Col, (unsigned)tile.Row,
+           channel, dir_str, (int)rc);
 }
 
 /**

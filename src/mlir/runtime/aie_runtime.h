@@ -223,22 +223,29 @@ void __Runtime_routing_init(void);
 AieRC __Runtime_device_teardown(void);
 
 // DMA and data movement
-XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, uint64_t addr,
-                                     int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
-                                     int32_t acquire_lock_id, int32_t acquire_lock_val, int32_t release_lock_id,
-                                     int32_t release_lock_val);
+XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, int32_t len,
+                                     int32_t next_bd, int32_t enable_packet, int32_t packet_id, int32_t acquire_lock_id,
+                                     int32_t acquire_lock_val, int32_t release_lock_id, int32_t release_lock_val,
+                                     int32_t out_of_order_bd_id);
 
 // Multi-dimensional BD addressing for DMA-driven transpose/reshape.
 // Uses XAie_DmaSetMultiDimAddr with stride/wrap descriptors instead of
 // simple XAie_DmaSetAddrLen. num_dims controls how many dim pairs are active
 // (max 4). Unused dims should have stride=0, wrap=0.
 XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
-                                              uint64_t addr, int32_t len, int32_t next_bd, int32_t enable_packet,
-                                              int32_t packet_id, int32_t acquire_lock_id, int32_t acquire_lock_val,
-                                              int32_t release_lock_id, int32_t release_lock_val, int32_t num_dims,
-                                              int32_t dim_stride0, int32_t dim_wrap0, int32_t dim_stride1,
-                                              int32_t dim_wrap1, int32_t dim_stride2, int32_t dim_wrap2,
-                                              int32_t dim_stride3, int32_t dim_wrap3);
+                                              int32_t len, int32_t next_bd, int32_t enable_packet, int32_t packet_id,
+                                              int32_t acquire_lock_id, int32_t acquire_lock_val,
+                                              int32_t release_lock_id, int32_t release_lock_val,
+                                              int32_t out_of_order_bd_id, int32_t num_dims, int32_t dim_stride0,
+                                              int32_t dim_wrap0, int32_t dim_stride1, int32_t dim_wrap1,
+                                              int32_t dim_stride2, int32_t dim_wrap2, int32_t dim_stride3,
+                                              int32_t dim_wrap3);
+
+// Enable out-of-order BD execution on a DMA channel.
+// When enabled, the DMA engine selects BDs based on the out_of_order_bd_id
+// field in incoming packet headers, bypassing normal sequential BD chaining.
+// Used on shim S2MM channels for gathering output data from multiple core tiles.
+void __Runtime_dma_channel_enable_ooo(XAie_DevInst *dev, XAie_LocType tile, int32_t channel, XAie_DmaDirection dir);
 
 struct_io __Runtime_dma_createio(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, int32_t channel_id, int32_t bd_id,
                                  XAie_DmaDirection direction, XAie_MemInst *mem);

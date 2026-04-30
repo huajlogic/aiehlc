@@ -1032,12 +1032,14 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     rewriter.getI32IntegerAttr(basePacketId + tileIdx), rewriter.getI32IntegerAttr(4294967295),
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0),
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(-1), Value(),
+                    rewriter.getI32IntegerAttr(-1), // out_of_order_bd_id
                     /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
 
                 auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
                     loc, dfschedule::IoHandleType::get(rewriter.getContext()), coreBdOp.getBdHandle(),
                     coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
-                    rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation));
+                    rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation),
+                    rewriter.getBoolAttr(false)); // enable_out_of_order
 
                 auto getBdIdOp =
                     rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());

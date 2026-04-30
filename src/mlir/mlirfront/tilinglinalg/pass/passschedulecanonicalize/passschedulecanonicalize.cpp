@@ -77,6 +77,14 @@ struct FoldDuplicateShimBdPattern : public OpRewritePattern<dfschedule::ConfigDm
         if (!tileDecl || tileDecl.getRow() != 0)
             return failure();
 
+        // Never merge packet-enabled shim BDs — OOO per-tile shim BDs have
+        // distinct packet IDs and DDR offsets for out-of-order execution.
+        // Also skip BDs with out_of_order_bd_id set (core MM2S OOO BDs).
+        if (op.getEnablePacket())
+            return failure();
+        if (static_cast<int32_t>(op.getOutOfOrderBdId()) >= 0)
+            return failure();
+
         int32_t dataId = static_cast<int32_t>(op.getDataId());
         int64_t offset = static_cast<int64_t>(op.getOffset());
         int32_t len = static_cast<int32_t>(op.getLen());
