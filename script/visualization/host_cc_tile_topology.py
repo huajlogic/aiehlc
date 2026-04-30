@@ -235,17 +235,19 @@ def parse_routing_file(filepath: str) -> List[RoutingBlock]:
 
         m = re.search(
             r"XAie_StrmPktSwSlaveSlotEnable\([^,]+,\s*(XAie_TileLoc\(\d+\s*,\s*\d+\))\s*,"
-            r"\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*\{[^}]*PktId\s*=\s*(\d+)[^}]*\}\s*,"
-            r"\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", line)
+            r"\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"
+            r"(?:\{[^}]*PktId\s*=\s*(\d+)[^}]*\}|XAie_PacketInit\(\s*(\d+)\s*,\s*\d+\s*\))"
+            r"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", line)
         if m:
             tile = parse_tile_loc(m.group(1))
+            pkt_id = int(m.group(5) or m.group(6))
             current_block.pkt_slaves.append(PktSlaveSlot(
                 tile=tile,
                 port_type=m.group(2), port_num=int(m.group(3)),
                 slot_num=int(m.group(4)),
-                pkt_id=int(m.group(5)),
-                mask=int(m.group(6)), msel=int(m.group(7)),
-                arbiter=int(m.group(8)),
+                pkt_id=pkt_id,
+                mask=int(m.group(7)), msel=int(m.group(8)),
+                arbiter=int(m.group(9)),
                 line=lineno))
             continue
 
