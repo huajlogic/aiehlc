@@ -106,7 +106,7 @@ int test_routing_packet(XAie_DevInst *DevInst) {
     u64 recv_phy = 0;
     RC = Runtime_Movedata(DevInst, XAie_TileLoc(0, 3), 0x0,                    // src: tile(0,3), addr=0x0
                           0 /*src_ch*/, 0 /*src_bd*/, XAie_TileLoc(3, 0), 0x0, // dst: Shim(3,0)
-                          0 /*dst_ch*/, 0 /*dst_bd*/, TEST_DATA_BYTES, 0 /*pkt_id*/, &recv_buf, &recv_phy,
+                          0 /*dst_ch*/, 0 /*dst_bd*/, TEST_DATA_BYTES, 1 /*pkt_id*/, &recv_buf, &recv_phy,
                           NULL /*opt: blocking*/);
     if (RC != XAIE_OK) {
         printf("ERROR: Runtime_Movedata failed: %d\n", RC);

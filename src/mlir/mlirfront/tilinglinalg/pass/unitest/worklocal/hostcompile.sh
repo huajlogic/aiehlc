@@ -263,6 +263,18 @@ else
     echo "Skipping aie_runtime_stream_debug.c (aie_runtime_stream_debug.o exists; pass 'rebuild' or '-rebuild' to force)"
 fi
 
+# Compile aie_runtime_common.c
+if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_common.o ]; then
+    echo "Compiling aie_runtime_common.c..."
+    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_common.c" -o aie_runtime_common.o
+    if [ $? -ne 0 ]; then
+        echo "Error: failed to compile aie_runtime_common.c"
+        exit 1
+    fi
+else
+    echo "Skipping aie_runtime_common.c (aie_runtime_common.o exists; pass 'rebuild' or '-rebuild' to force)"
+fi
+
 # Compile routing.cc (if present)
 ROUTING_OBJ=""
 if [ "${HAS_ROUTING}" -eq 1 ]; then
@@ -283,7 +295,7 @@ set -x
 # --specs=nosys.specs provides stubs for _exit, _close, _fstat, etc. (baremetal/newlib)
 # -Wl,--defsym,end=__bss_end__ defines 'end' for newlib _sbrk (lscript.ld defines __bss_end__)
 echo "Linking host (with embedded kernel binary)..."
-${TOOL_PREFIX}g++ -Os -o host host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o ${ROUTING_OBJ} "${KERNEL_OBJ}" \
+${TOOL_PREFIX}g++ -Os -o host host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o ${ROUTING_OBJ} "${KERNEL_OBJ}" \
     --specs=nosys.specs \
     -Wl,--defsym,end=__bss_end__ \
     -Wl,-T -Wl,${ARCH_APU_LD} \
