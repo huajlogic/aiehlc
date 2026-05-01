@@ -110,11 +110,8 @@ int test_routing_packet(XAie_DevInst *DevInst) {
         srcs[i].data_bytes = TEST_DATA_BYTES;
         srcs[i].dst_len = 0;        // 0 = use data_bytes
         srcs[i].src_pkt_id = 1 + i; // pkt_id 1,2,3
-        srcs[i].dst_num_dims = 3;
-        srcs[i].dst_dims[0] = {.AieMlDimDesc = {.StepSize = 1, .Wrap = 4}};
-        srcs[i].dst_dims[1] = {.AieMlDimDesc = {.StepSize = 8, .Wrap = 8}};
-        srcs[i].dst_dims[2] = {.AieMlDimDesc = {.StepSize = 4, .Wrap = 2}};
-        srcs[i].recv_buf = ddr_buf + i * TEST_DATA_BYTES; // point to the i-th chunk of the DDR buffer
+        srcs[i].dst_num_dims = 0;   // linear receive - each source gets its own contiguous chunk
+        srcs[i].recv_buf = ddr_buf; // all share the same MemInst for sync
         srcs[i].recv_phy = ddr_phy + i * TEST_DATA_BYTES;
         printf("[2] Writing test data to tile(%d,3) data memory at 0x0...\n", i);
         {
@@ -130,9 +127,9 @@ int test_routing_packet(XAie_DevInst *DevInst) {
         }
         printf("---[2] Test data written.\n");
     }
-    RC = Runtime_Movedata_ManyToOne(DevInst, srcs, 1,   // 1 source
-                                    XAie_TileLoc(3, 0), // dst: Shim(3,0)
-                                    0);                 // dst_ch
+    RC = Runtime_Movedata_ManyToOne(DevInst, srcs, SRCNUM, // all sources
+                                    XAie_TileLoc(3, 0),    // dst: Shim(3,0)
+                                    0);                    // dst_ch
     if (RC != XAIE_OK) {
         printf("ERROR: Runtime_Movedata_ManyToOne failed: %d\n", RC);
         return -1;
@@ -147,30 +144,37 @@ int test_routing_packet(XAie_DevInst *DevInst) {
 
     // --- Step 4: Verify received data ---
     printf("[4] Verifying received data...\n");
-    XAie_MemSyncForCPU(srcs[0].recv_buf);
+    XAie_MemSyncForCPU(ddr_buf);
 
     int mismatches = 0;
-    for (uint32_t i = 0; i < TEST_DATA_SIZE * SRCNUM; i++) {
-        uint32_t expected = 0xA0000000 | i;
-        uint32_t actual = ((uint32_t *)srcs[0].recv_phy)[i];
-        if (actual != expected) {
-            if (mismatches < 256) {
-                printf("  MISMATCH [%2d]: expected=0x%08x, got=0x%08x\n", i, expected, actual);
+    for (int src = 0; src < SRCNUM; src++) {
+        uint32_t *recv = (uint32_t *)srcs[src].recv_phy;
+        for (uint32_t j = 0; j < TEST_DATA_SIZE; j++) {
+            uint32_t expected = ((src * 0x10000000) | j);
+            uint32_t actual = recv[j];
+            if (actual != expected) {
+                if (mismatches < 256) {
+                    printf("  MISMATCH src%d [%2d]: expected=0x%08x, got=0x%08x\n", src, j, expected, actual);
+                }
+                mismatches++;
             }
-            mismatches++;
         }
     }
 
     if (mismatches == 0) {
-        printf("[4] SUCCESS: All %d words match. Routing tile(0,3)→Shim(3,0) verified.\n", TEST_DATA_SIZE);
+        printf("[4] SUCCESS: All %d words (%d sources x %d each) match.\n", TEST_DATA_SIZE * SRCNUM, SRCNUM,
+               TEST_DATA_SIZE);
     } else {
-        printf("[4] FAIL: %d / %d mismatches.\n", mismatches, TEST_DATA_SIZE);
+        printf("[4] FAIL: %d / %d mismatches.\n", mismatches, TEST_DATA_SIZE * SRCNUM);
     }
 
-    // Print first 8 words for visual inspection
-    printf("  First 8 received words:\n");
-    for (uint32_t i = 0; i < 8 && i < TEST_DATA_SIZE; i++) {
-        printf("    [%d] = 0x%08x\n", i, ((uint32_t *)srcs[0].recv_phy)[i]);
+    // Print first 8 words of each source for visual inspection
+    for (int src = 0; src < SRCNUM; src++) {
+        uint32_t *recv = (uint32_t *)srcs[src].recv_phy;
+        printf("  Source %d first 8 received words:\n", src);
+        for (uint32_t j = 0; j < 8 && j < TEST_DATA_SIZE; j++) {
+            printf("    [%d] = 0x%08x\n", j, recv[j]);
+        }
     }
 
     return (mismatches == 0) ? 0 : -1;
