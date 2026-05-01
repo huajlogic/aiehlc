@@ -101,15 +101,27 @@ int test_routing_packet(XAie_DevInst *DevInst) {
     printf("[2] Test data written.\n");
 
     // --- Step 3: Move data from tile(0,3) → Shim(3,0) via Runtime_Movedata ---
-    printf("[3] Moving data: tile(0,3) → Shim(3,0)...\n");
+    // OOO mode: send packet out-of-order, dst BD=2, stride/wrap receive [[2,2],[2,2]]
+    printf("[3] Moving data (OOO): tile(0,3) → Shim(3,0), dst_bd=2...\n");
     XAie_MemInst *recv_buf = nullptr;
     u64 recv_phy = 0;
+    MovedataOpt ooo_opt;
+    ooo_opt.mode = MOVEDATA_MODE_OOO_STRIDE;
+    ooo_opt.num_dims = 3;
+    ooo_opt.dims[0] = {.AieMlDimDesc = {.StepSize = 4, .Wrap = 1}};
+    ooo_opt.dims[1] = {.AieMlDimDesc = {.StepSize = 8, .Wrap = 8}};
+    ooo_opt.dims[2] = {.AieMlDimDesc = {.StepSize = 4, .Wrap = 2}};
     RC = Runtime_Movedata(DevInst, XAie_TileLoc(0, 3), 0x0,                    // src: tile(0,3), addr=0x0
                           0 /*src_ch*/, 0 /*src_bd*/, XAie_TileLoc(3, 0), 0x0, // dst: Shim(3,0)
-                          0 /*dst_ch*/, 0 /*dst_bd*/, TEST_DATA_BYTES, 1 /*pkt_id*/, &recv_buf, &recv_phy,
-                          NULL /*opt: blocking*/);
+                          0 /*dst_ch*/, 2 /*dst_bd*/, TEST_DATA_BYTES, 1 /*pkt_id*/, &recv_buf, &recv_phy, &ooo_opt);
     if (RC != XAIE_OK) {
         printf("ERROR: Runtime_Movedata failed: %d\n", RC);
+        return -1;
+    }
+    printf("[3] OOO data move enqueued, waiting for completion...\n");
+    RC = Runtime_Movedata_WaitAll(DevInst);
+    if (RC != XAIE_OK) {
+        printf("ERROR: Runtime_Movedata_WaitAll failed: %d\n", RC);
         return -1;
     }
     printf("[3] Data move completed.\n");
@@ -123,7 +135,7 @@ int test_routing_packet(XAie_DevInst *DevInst) {
         uint32_t expected = 0xA0000000 | i;
         uint32_t actual = ((uint32_t *)recv_phy)[i];
         if (actual != expected) {
-            if (mismatches < 16) {
+            if (mismatches < 64) {
                 printf("  MISMATCH [%2d]: expected=0x%08x, got=0x%08x\n", i, expected, actual);
             }
             mismatches++;
