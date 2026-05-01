@@ -110,7 +110,10 @@ int test_routing_packet(XAie_DevInst *DevInst) {
         srcs[i].data_bytes = TEST_DATA_BYTES;
         srcs[i].dst_len = 0;        // 0 = use data_bytes
         srcs[i].src_pkt_id = 1 + i; // pkt_id 1,2,3
-        srcs[i].dst_num_dims = 0;   // linear receive - each source gets its own contiguous chunk
+        srcs[i].dst_num_dims = 3;   // stride/wrap receive dims: [[4,1],[8,8],[4,2]]
+        srcs[i].dst_dims[0] = {.AieMlDimDesc = {.StepSize = 1, .Wrap = 4}};
+        srcs[i].dst_dims[1] = {.AieMlDimDesc = {.StepSize = 8, .Wrap = 8}};
+        srcs[i].dst_dims[2] = {.AieMlDimDesc = {.StepSize = 4, .Wrap = 2}};
         srcs[i].recv_buf = ddr_buf; // all share the same MemInst for sync
         srcs[i].recv_phy = ddr_phy + i * TEST_DATA_BYTES;
         printf("[2] Writing test data to tile(%d,3) data memory at 0x0...\n", i);
@@ -171,7 +174,7 @@ int test_routing_packet(XAie_DevInst *DevInst) {
     // Print first 8 words of each source for visual inspection
     for (int src = 0; src < SRCNUM; src++) {
         uint32_t *recv = (uint32_t *)srcs[src].recv_phy;
-        printf("  Source %d first 8 received words:\n", src);
+        printf("  Source %d %p first 8 received words:\n", src, recv);
         for (uint32_t j = 0; j < 8 && j < TEST_DATA_SIZE; j++) {
             printf("    [%d] = 0x%08x\n", j, recv[j]);
         }
