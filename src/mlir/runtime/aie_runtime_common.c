@@ -195,3 +195,138 @@ AieRC Runtime_Movedata_WaitAll(XAie_DevInst *DevInst) {
     printf("  Runtime_Movedata_WaitAll: done.\n");
     return RC;
 }
+
+AieRC Runtime_Movedata_ManyToOne(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, int num_srcs, XAie_LocType dst_tile,
+                                 uint8_t dst_ch) {
+    AieRC RC = XAIE_OK;
+    int i;
+
+    if (num_srcs <= 0 || num_srcs > MOVEDATA_MAX_SOURCES) {
+        printf("ERROR: ManyToOne: invalid num_srcs=%d (max %d)\n", num_srcs, MOVEDATA_MAX_SOURCES);
+        return XAIE_ERR;
+    }
+
+    if (dst_tile.Row != 0) {
+        printf("ERROR: ManyToOne: dst_tile (%d,%d) is not a shim tile\n", dst_tile.Col, dst_tile.Row);
+        return XAIE_ERR;
+    }
+
+    if (g_pending_count + num_srcs > MOVEDATA_MAX_PENDING) {
+        printf("ERROR: ManyToOne: would exceed max pending (%d + %d > %d)\n", g_pending_count, num_srcs,
+               MOVEDATA_MAX_PENDING);
+        return XAIE_ERR;
+    }
+
+    printf("  Runtime_Movedata_ManyToOne: %d sources → Shim(%d,%d) S2MM ch%d\n", num_srcs, dst_tile.Col, dst_tile.Row,
+           dst_ch);
+
+    /* ---- Configure each source ---- */
+    for (i = 0; i < num_srcs; i++) {
+        MovedataSrcDesc *s = &srcs[i];
+
+        u64 dst_addr = s->recv_phy;
+        uint32_t dst_len = (s->dst_len > 0) ? s->dst_len : s->data_bytes;
+
+        printf("    [src %d] tile(%d,%d) MM2S ch%d bd%d → dst bd%d, src %u bytes, dst addr=0x%llx len=%u", i,
+               s->src_tile.Col, s->src_tile.Row, s->src_ch, s->src_bd, s->dst_bd, s->data_bytes,
+               (unsigned long long)dst_addr, dst_len);
+        if (s->src_pkt_id >= 0)
+            printf(", pkt_id=%d", s->src_pkt_id);
+        if (s->dst_num_dims > 0)
+            printf(", dims=%d", s->dst_num_dims);
+        printf("\n");
+
+        /* ---- 2a: Configure destination BD (S2MM on dst_tile) ---- */
+        {
+            XAie_DmaDesc DmaInst;
+            RC = XAie_DmaDescInit(DevInst, &DmaInst, dst_tile);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: dst DmaDescInit: %d\n", i, RC);
+                return RC;
+            }
+
+            if (s->dst_num_dims > 0) {
+                XAie_DmaTensor tensor;
+                tensor.NumDim = s->dst_num_dims;
+                tensor.Dim = s->dst_dims;
+                RC = XAie_DmaSetMultiDimAddr(&DmaInst, &tensor, dst_addr, dst_len);
+            } else {
+                RC = XAie_DmaSetAddrLen(&DmaInst, dst_addr, dst_len);
+            }
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: dst DmaSetAddr: %d\n", i, RC);
+                return RC;
+            }
+
+            RC = XAie_DmaEnableBd(&DmaInst);
+            RC = XAie_DmaWriteBd(DevInst, &DmaInst, dst_tile, s->dst_bd);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: dst DmaWriteBd: %d\n", i, RC);
+                return RC;
+            }
+
+            RC = XAie_DmaChannelPushBdToQueue(DevInst, dst_tile, dst_ch, DMA_S2MM, s->dst_bd);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: dst PushBdToQueue: %d\n", i, RC);
+                return RC;
+            }
+
+            RC = XAie_DmaChannelEnable(DevInst, dst_tile, dst_ch, DMA_S2MM);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: dst DmaChannelEnable: %d\n", i, RC);
+                return RC;
+            }
+        }
+
+        /* ---- 2b: Configure source BD (MM2S on src_tile) ---- */
+        {
+            XAie_DmaDesc DmaInst;
+            RC = XAie_DmaDescInit(DevInst, &DmaInst, s->src_tile);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: src DmaDescInit: %d\n", i, RC);
+                return RC;
+            }
+
+            RC = XAie_DmaSetAddrLen(&DmaInst, s->src_addr, s->data_bytes);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: src DmaSetAddrLen: %d\n", i, RC);
+                return RC;
+            }
+
+            if (s->src_pkt_id >= 0) {
+                XAie_Packet pkt = XAie_PacketInit(s->src_pkt_id, 0);
+                RC = XAie_DmaSetPkt(&DmaInst, pkt);
+                if (RC != XAIE_OK) {
+                    printf("ERROR: ManyToOne[%d]: src DmaSetPkt: %d\n", i, RC);
+                    return RC;
+                }
+            }
+
+            RC = XAie_DmaEnableBd(&DmaInst);
+            RC = XAie_DmaWriteBd(DevInst, &DmaInst, s->src_tile, s->src_bd);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: src DmaWriteBd: %d\n", i, RC);
+                return RC;
+            }
+
+            RC = XAie_DmaChannelPushBdToQueue(DevInst, s->src_tile, s->src_ch, DMA_MM2S, s->src_bd);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: src PushBdToQueue: %d\n", i, RC);
+                return RC;
+            }
+
+            RC = XAie_DmaChannelEnable(DevInst, s->src_tile, s->src_ch, DMA_MM2S);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne[%d]: src DmaChannelEnable: %d\n", i, RC);
+                return RC;
+            }
+        }
+
+        /* ---- 2c: Record pending for WaitAll ---- */
+        g_pending[g_pending_count].dst_tile = dst_tile;
+        g_pending[g_pending_count].dst_ch = dst_ch;
+        g_pending_count++;
+    }
+
+    return XAIE_OK;
+}

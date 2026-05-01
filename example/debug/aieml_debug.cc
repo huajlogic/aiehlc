@@ -86,39 +86,58 @@ int test_routing_packet(XAie_DevInst *DevInst) {
     printf("[1] Routing configured.\n");
 
     // --- Step 2: Write test data into tile(0,3) data memory at 0x0 ---
-    printf("[2] Writing test data to tile(0,3) data memory at 0x0...\n");
-    {
-        uint32_t test_data[TEST_DATA_SIZE];
-        for (uint32_t i = 0; i < TEST_DATA_SIZE; i++) {
-            test_data[i] = 0xA0000000 | i;
-        }
-        RC = XAie_DataMemBlockWrite(DevInst, XAie_TileLoc(0, 3), 0x0, (void *)test_data, TEST_DATA_BYTES);
-        if (RC != XAIE_OK) {
-            printf("ERROR: DataMemBlockWrite to tile(0,3) failed: %d\n", RC);
-            return -1;
-        }
-    }
-    printf("[2] Test data written.\n");
 
-    // --- Step 3: Move data from tile(0,3) → Shim(3,0) via Runtime_Movedata ---
-    // OOO mode: send packet out-of-order, dst BD=2, stride/wrap receive [[2,2],[2,2]]
-    printf("[3] Moving data (OOO): tile(0,3) → Shim(3,0), dst_bd=2...\n");
-    XAie_MemInst *recv_buf = nullptr;
-    u64 recv_phy = 0;
-    MovedataOpt ooo_opt;
-    ooo_opt.mode = MOVEDATA_MODE_OOO_STRIDE;
-    ooo_opt.num_dims = 3;
-    ooo_opt.dims[0] = {.AieMlDimDesc = {.StepSize = 4, .Wrap = 1}};
-    ooo_opt.dims[1] = {.AieMlDimDesc = {.StepSize = 8, .Wrap = 8}};
-    ooo_opt.dims[2] = {.AieMlDimDesc = {.StepSize = 4, .Wrap = 2}};
-    RC = Runtime_Movedata(DevInst, XAie_TileLoc(0, 3), 0x0,                    // src: tile(0,3), addr=0x0
-                          0 /*src_ch*/, 0 /*src_bd*/, XAie_TileLoc(3, 0), 0x0, // dst: Shim(3,0)
-                          0 /*dst_ch*/, 2 /*dst_bd*/, TEST_DATA_BYTES, 1 /*pkt_id*/, &recv_buf, &recv_phy, &ooo_opt);
+    // --- Step 3: Move data from tile(0,3) → Shim(3,0) via Runtime_Movedata_ManyToOne ---
+    // Many-to-one with a single source (same test, new API).
+    // stride/wrap receive dims: [[4,1],[8,8],[4,2]]
+    printf("abc[3] Moving data (ManyToOne): tile(0,3) → Shim(3,0)...\n");
+#define SRCNUM 3
+    // Allocate one DDR buffer for all sources
+    uint32_t total_bytes = TEST_DATA_BYTES * SRCNUM;
+    XAie_MemInst *ddr_buf = XAie_MemAllocate(DevInst, total_bytes, XAIE_MEM_CACHEABLE);
+    u64 ddr_phy = (u64)XAie_MemGetDevAddr(ddr_buf);
+    for (uint32_t w = 0; w < total_bytes / sizeof(uint32_t); w++)
+        ((uint32_t *)ddr_phy)[w] = 0xDEADBEEF;
+    XAie_MemSyncForDev(ddr_buf);
+
+    MovedataSrcDesc srcs[SRCNUM];
+    for (int i = 0; i < SRCNUM; i++) {
+        srcs[i].src_tile = XAie_TileLoc(i, 3);
+        srcs[i].src_addr = 0x0;
+        srcs[i].src_ch = 0;
+        srcs[i].src_bd = 0;
+        srcs[i].dst_bd = 2 + i; // dst BDs 2,3,4 on shim
+        srcs[i].data_bytes = TEST_DATA_BYTES;
+        srcs[i].dst_len = 0;        // 0 = use data_bytes
+        srcs[i].src_pkt_id = 1 + i; // pkt_id 1,2,3
+        srcs[i].dst_num_dims = 3;
+        srcs[i].dst_dims[0] = {.AieMlDimDesc = {.StepSize = 1, .Wrap = 4}};
+        srcs[i].dst_dims[1] = {.AieMlDimDesc = {.StepSize = 8, .Wrap = 8}};
+        srcs[i].dst_dims[2] = {.AieMlDimDesc = {.StepSize = 4, .Wrap = 2}};
+        srcs[i].recv_buf = ddr_buf + i * TEST_DATA_BYTES; // point to the i-th chunk of the DDR buffer
+        srcs[i].recv_phy = ddr_phy + i * TEST_DATA_BYTES;
+        printf("[2] Writing test data to tile(%d,3) data memory at 0x0...\n", i);
+        {
+            uint32_t test_data[TEST_DATA_SIZE];
+            for (uint32_t j = 0; j < TEST_DATA_SIZE; j++) {
+                test_data[j] = ((i * 0x10000000) | j);
+            }
+            RC = XAie_DataMemBlockWrite(DevInst, XAie_TileLoc(i, 3), 0x0, (void *)test_data, TEST_DATA_BYTES);
+            if (RC != XAIE_OK) {
+                printf("ERROR: DataMemBlockWrite to tile(%d,3) failed: %d\n", i, RC);
+                return -1;
+            }
+        }
+        printf("---[2] Test data written.\n");
+    }
+    RC = Runtime_Movedata_ManyToOne(DevInst, srcs, 1,   // 1 source
+                                    XAie_TileLoc(3, 0), // dst: Shim(3,0)
+                                    0);                 // dst_ch
     if (RC != XAIE_OK) {
-        printf("ERROR: Runtime_Movedata failed: %d\n", RC);
+        printf("ERROR: Runtime_Movedata_ManyToOne failed: %d\n", RC);
         return -1;
     }
-    printf("[3] OOO data move enqueued, waiting for completion...\n");
+    printf("[3] ManyToOne data move enqueued, waiting for completion...\n");
     RC = Runtime_Movedata_WaitAll(DevInst);
     if (RC != XAIE_OK) {
         printf("ERROR: Runtime_Movedata_WaitAll failed: %d\n", RC);
@@ -128,14 +147,14 @@ int test_routing_packet(XAie_DevInst *DevInst) {
 
     // --- Step 4: Verify received data ---
     printf("[4] Verifying received data...\n");
-    XAie_MemSyncForCPU(recv_buf);
+    XAie_MemSyncForCPU(srcs[0].recv_buf);
 
     int mismatches = 0;
-    for (uint32_t i = 0; i < TEST_DATA_SIZE; i++) {
+    for (uint32_t i = 0; i < TEST_DATA_SIZE * SRCNUM; i++) {
         uint32_t expected = 0xA0000000 | i;
-        uint32_t actual = ((uint32_t *)recv_phy)[i];
+        uint32_t actual = ((uint32_t *)srcs[0].recv_phy)[i];
         if (actual != expected) {
-            if (mismatches < 64) {
+            if (mismatches < 256) {
                 printf("  MISMATCH [%2d]: expected=0x%08x, got=0x%08x\n", i, expected, actual);
             }
             mismatches++;
@@ -151,7 +170,7 @@ int test_routing_packet(XAie_DevInst *DevInst) {
     // Print first 8 words for visual inspection
     printf("  First 8 received words:\n");
     for (uint32_t i = 0; i < 8 && i < TEST_DATA_SIZE; i++) {
-        printf("    [%d] = 0x%08x\n", i, ((uint32_t *)recv_phy)[i]);
+        printf("    [%d] = 0x%08x\n", i, ((uint32_t *)srcs[0].recv_phy)[i]);
     }
 
     return (mismatches == 0) ? 0 : -1;
