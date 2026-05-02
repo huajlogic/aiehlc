@@ -758,6 +758,31 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 perTileDimWraps = rewriter.getArrayAttr(wraps2d);
             }
 
+            // Add iteration dimension (dim[3]) for OOO BD reuse.
+            // The runtime treats dims [0..2] as address dimensions and dim[3] as iteration.
+            // Pad address dims to exactly 3, then append iteration as dim[3].
+            // stride = perTileDdrBytes (auto-advance address by one transfer size per packet)
+            // wrap = 2 (handle ping + pong, then BD is done)
+            {
+                SmallVector<Attribute> strides4d, wraps4d;
+                if (perTileDimStrides) {
+                    for (auto a : perTileDimStrides)
+                        strides4d.push_back(a);
+                    for (auto a : perTileDimWraps)
+                        wraps4d.push_back(a);
+                }
+                // Pad address dims to 3 with identity (stride=0, wrap=0)
+                while (strides4d.size() < 3) {
+                    strides4d.push_back(rewriter.getI32IntegerAttr(0));
+                    wraps4d.push_back(rewriter.getI32IntegerAttr(0));
+                }
+                // dim[3] = iteration: stride=perTileDdrBytes, wrap=2
+                strides4d.push_back(rewriter.getI32IntegerAttr(perTileDdrBytes));
+                wraps4d.push_back(rewriter.getI32IntegerAttr(2));
+                perTileDimStrides = rewriter.getArrayAttr(strides4d);
+                perTileDimWraps = rewriter.getArrayAttr(wraps4d);
+            }
+
             // Allocate N shim BD IDs
             SmallVector<int32_t> shimBdIds;
             for (int64_t t = 0; t < numCoreTiles; t++) {
@@ -775,11 +800,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
 
             // Create N shim BDs in reverse order (last first, so each can reference previous via SSA).
             // In OOO mode each BD is independently dispatched by the packet switch based on
-            // packet_id matching, so next_bd = -1 for all BDs (no sequential chaining).
-            // The linkedBd SSA operand is kept for MLIR ordering but does not affect hardware.
+            // packet_id matching. Each BD self-chains (next_bd = self) so it re-enters the
+            // pool after handling a packet. The iteration dim (wrap=2) limits reuse to 2
+            // packets (ping + pong), after which the BD is consumed.
             SmallVector<Value> shimBdHandles(numCoreTiles);
             for (int64_t t = numCoreTiles - 1; t >= 0; t--) {
-                int32_t nextBdId = -1; // OOO: each BD independently dispatched, no chaining
+                int32_t nextBdId = shimBdIds[t]; // self-chain: BD reuses itself after each packet
                 int32_t thisBdId = shimBdIds[t];
                 int64_t ddrOffset = t * perTileDdrBytes;
 
@@ -801,7 +827,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     rewriter.getBoolAttr(false),                 // enable_packet = false (shim S2MM)
                     rewriter.getI32IntegerAttr(basePacketId +
                                                (int32_t)t), // packet_id (unused when enable_packet=false)
-                    rewriter.getI32IntegerAttr(nextBdId),   // next_bd = -1 (OOO: no chaining)
+                    rewriter.getI32IntegerAttr(nextBdId),   // next_bd = self (OOO: self-chain for reuse)
                     rewriter.getI32IntegerAttr(-1), // acquire_lock_id = -1 → no lock (OOO flow control via packets)
                     rewriter.getI32IntegerAttr(0),  // acquire_lock_val (ignored)
                     rewriter.getI32IntegerAttr(-1), // release_lock_id = -1 → no lock

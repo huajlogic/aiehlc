@@ -47,6 +47,7 @@ extern XAie_RoutingInstance *g_RoutingInst;
 #define AIE_DEBUG_LEVEL(v) ((v) & 0xF)
 #define AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA (1 << 4)
 #define AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN (1 << 5)
+#define AIE_DEBUG_FLAG_MM2SBDFINISH (1 << 6)
 #define AIE_DEBUG_HAS_FLAG(v, flag) (((v) & (flag)) != 0)
 extern int g_runtime_debug_level;
 
@@ -292,6 +293,31 @@ inline void __Runtime_wait(struct_ioevent ev) { __Runtime_wait_io(ev); }
 
 // Kernel log reader (reads log entries from core tile data memory)
 void __Runtime_read_kernel_log(XAie_DevInst *dev, XAie_LocType tile);
+
+// ---------------------------------------------------------------------------
+// Performance counter APIs for core tile memory module
+// ---------------------------------------------------------------------------
+
+// Generic: configure perf counter on a core tile.
+// Sets start_event = stop_event so the counter counts occurrences of that event.
+// Uses memory module (XAIE_MEM_MOD) perf counter 0 by default.
+AieRC __Runtime_perfcnt_setup(XAie_DevInst *dev, XAie_LocType tile, uint8_t counter_id, XAie_Events event);
+
+// Read a perf counter value from a core tile memory module.
+AieRC __Runtime_perfcnt_read(XAie_DevInst *dev, XAie_LocType tile, uint8_t counter_id, uint32_t *value);
+
+// Set perf counters for MM2S channel 0 BD finished (counter 0) and
+// MM2S channel 1 BD finished (counter 1) on a single core tile.
+AieRC __Runtime_perfcnt_setup_mm2s_bd_finished(XAie_DevInst *dev, XAie_LocType tile);
+
+// Set MM2S BD finished perf counters on all core tiles in a rectangular
+// partition [start_col..end_col] x [start_row..end_row] (inclusive).
+AieRC __Runtime_perfcnt_setup_mm2s_bd_finished_partition(XAie_DevInst *dev, uint8_t start_col, uint8_t end_col,
+                                                         uint8_t start_row, uint8_t end_row);
+
+// Read and print all MM2S BD finished perf counters across a partition.
+void __Runtime_perfcnt_read_mm2s_bd_finished_partition(XAie_DevInst *dev, uint8_t start_col, uint8_t end_col,
+                                                       uint8_t start_row, uint8_t end_row);
 
 // Data movement wrappers (wraps XAie routing APIs)
 void __Runtime_move_data_to_tile(XAie_RoutingInstance *routing, XAie_LocType shim_tile, XAie_LocType dest_tile,

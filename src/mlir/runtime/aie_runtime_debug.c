@@ -1491,7 +1491,10 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
             AieRt_PrintCoreTileDmaStatus(dev, tiles[i]);
     }
 
-    /* 9. BD contents for all referenced tiles */
+    /* 9. Performance counters (MM2S BD finished counts) */
+    AieRt_PrintCoreTilePerfCountersAll(dev, tiles, num_tiles);
+
+    /* 10. BD contents for all referenced tiles */
     printf("[AieRt_Debug] ===== BD Contents (all referenced tiles) =====\n");
     {
         /* Unique tile list derived from ios + tiles */
@@ -1528,7 +1531,7 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
             AieRt_PrintAllBds(dev, seen[i]);
     }
 
-    /* 10. Raw BD register dump for shim tiles (shows stride/wrap/iteration) */
+    /* 11. Raw BD register dump for shim tiles (shows stride/wrap/iteration) */
     printf("[AieRt_Debug] ===== Shim Raw BD Registers (stride/wrap) =====\n");
     {
         uint8_t shim_seen[64];
@@ -1553,7 +1556,7 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
             printf("[AieRt_Debug]  (no shim tiles in ios list)\n");
     }
 
-    /* 11. IO verification */
+    /* 12. IO verification */
     AieRt_VerifyIoDescriptors(dev, ios, num_ios);
 
     printf("[AieRt_Debug] ============================================================\n\n");
@@ -1961,4 +1964,29 @@ void AieRt_DebugSnapshotFromCoords(XAie_DevInst *dev, const uint8_t *io_cols, co
     }
 
     AieRt_DebugSnapshot(dev, ios, num_ios, tiles, num_tiles);
+}
+
+/* --------------------------------------------------------------------------
+ * Performance counter debug
+ * -------------------------------------------------------------------------- */
+
+void AieRt_PrintCoreTilePerfCounters(XAie_DevInst *dev, XAie_LocType tile) {
+    if (!s_is_core(tile))
+        return;
+
+    uint32_t val0 = 0, val1 = 0;
+    AieRC rc0 = XAie_PerfCounterGet(dev, tile, XAIE_MEM_MOD, 0, &val0);
+    AieRC rc1 = XAie_PerfCounterGet(dev, tile, XAIE_MEM_MOD, 1, &val1);
+
+    printf("[AieRt_Debug] PerfCnt tile(%u,%u) MEM_MOD: "
+           "cnt0=%u (rc=%d) cnt1=%u (rc=%d)\n",
+           (unsigned)tile.Col, (unsigned)tile.Row, val0, (int)rc0, val1, (int)rc1);
+}
+
+void AieRt_PrintCoreTilePerfCountersAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles) {
+    printf("[AieRt_Debug] ===== Core Tile Perf Counters (MEM_MOD cnt0/cnt1) =====\n");
+    for (uint32_t i = 0; i < num_tiles; i++) {
+        if (s_is_core(tiles[i]))
+            AieRt_PrintCoreTilePerfCounters(dev, tiles[i]);
+    }
 }

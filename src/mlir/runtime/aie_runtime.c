@@ -37,6 +37,7 @@ XAie_RoutingInstance *g_RoutingInst = NULL;
 //   Verbosity 2: core DMA address log + write pattern + readback logic
 //   Flag bit 4 (value 16): AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA
 //   Flag bit 5 (value 32): AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN
+//   Flag bit 6 (value 64): AIE_DEBUG_FLAG_MM2SBDFINISH
 // Weak symbol: user source can override via #pragma aie_debug_level N
 __attribute__((weak)) int g_runtime_debug_level = 0;
 
@@ -307,6 +308,12 @@ AieRC __Runtime_device_init(void) {
         printf("[aie_runtime] device_init OK\n");
     else
         printf("[aie_runtime] device_init partition/pm failed: %d\n", (int)RC);
+
+    if (RC == XAIE_OK && AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_MM2SBDFINISH)) {
+        __Runtime_perfcnt_setup_mm2s_bd_finished_partition(g_DevInst, 0, XAIE_NUM_COLS - 1, XAIE_AIE_TILE_ROW_START,
+                                                           XAIE_AIE_TILE_ROW_START + XAIE_AIE_TILE_NUM_ROWS - 1);
+    }
+
     return RC;
 }
 /**
@@ -871,6 +878,140 @@ void __Runtime_move_data_from_tile(XAie_RoutingInstance *routing, XAie_LocType s
     XAie_MoveDataAie2External(routing, src_tile, tile_offset, size, mem, shim_tile);
 }
 
+/* ===========================================================================
+ * Performance Counter APIs
+ * =========================================================================== */
+
+/**
+ * Generic perf counter setup on a core tile memory module.
+ * Sets Cnt<counter_id>_Start_Event = Cnt<counter_id>_Stop_Event = event,
+ * so the counter increments each time the event fires.
+ * Resets the counter to 0 before arming.
+ */
+AieRC __Runtime_perfcnt_setup(XAie_DevInst *dev, XAie_LocType tile, uint8_t counter_id, XAie_Events event) {
+    AieRC rc;
+
+    /* Reset counter value to 0 */
+    rc = XAie_PerfCounterSet(dev, tile, XAIE_MEM_MOD, counter_id, 0);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] perfcnt_setup: PerfCounterSet failed tile(%u,%u) "
+               "counter=%u rc=%d\n",
+               (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)counter_id, (int)rc);
+        return rc;
+    }
+
+    /* Set start and stop events to the same event.
+     * This means: counter starts counting on the event, and the same event
+     * acts as the stop trigger. Each occurrence increments the counter. */
+    rc = XAie_PerfCounterControlSet(dev, tile, XAIE_MEM_MOD, counter_id, event, event);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] perfcnt_setup: PerfCounterControlSet failed "
+               "tile(%u,%u) counter=%u event=%u rc=%d\n",
+               (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)counter_id, (unsigned)event, (int)rc);
+        return rc;
+    }
+
+    printf("[aie_runtime] perfcnt_setup OK tile(%u,%u) counter=%u event=%u\n", (unsigned)tile.Col, (unsigned)tile.Row,
+           (unsigned)counter_id, (unsigned)event);
+    return XAIE_OK;
+}
+
+/**
+ * Read a perf counter value from a core tile memory module.
+ */
+AieRC __Runtime_perfcnt_read(XAie_DevInst *dev, XAie_LocType tile, uint8_t counter_id, uint32_t *value) {
+    AieRC rc = XAie_PerfCounterGet(dev, tile, XAIE_MEM_MOD, counter_id, value);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] perfcnt_read: PerfCounterGet failed tile(%u,%u) "
+               "counter=%u rc=%d\n",
+               (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)counter_id, (int)rc);
+    } else {
+        printf("[aie_runtime] perfcnt_read tile(%u,%u) counter=%u value=%u\n", (unsigned)tile.Col, (unsigned)tile.Row,
+               (unsigned)counter_id, (unsigned)*value);
+    }
+    return rc;
+}
+
+/**
+ * Set perf counters for core tile MM2S BD finished events:
+ *   counter 0 → MM2S channel 0 BD finished
+ *   counter 1 → MM2S channel 1 BD finished
+ */
+AieRC __Runtime_perfcnt_setup_mm2s_bd_finished(XAie_DevInst *dev, XAie_LocType tile) {
+    AieRC rc;
+
+    /* Counter 0: MM2S channel 0 BD finished */
+    rc = __Runtime_perfcnt_setup(dev, tile, 0, XAIE_EVENT_DMA_MM2S_0_FINISHED_BD_MEM);
+    if (rc != XAIE_OK)
+        return rc;
+
+    /* Counter 1: MM2S channel 1 BD finished */
+    rc = __Runtime_perfcnt_setup(dev, tile, 1, XAIE_EVENT_DMA_MM2S_1_FINISHED_BD_MEM);
+    if (rc != XAIE_OK)
+        return rc;
+
+    printf("[aie_runtime] perfcnt_setup_mm2s_bd_finished OK tile(%u,%u)\n", (unsigned)tile.Col, (unsigned)tile.Row);
+    return XAIE_OK;
+}
+
+/**
+ * Set MM2S BD finished perf counters on all core tiles in a rectangular
+ * partition [start_col..end_col] x [start_row..end_row] (inclusive).
+ * Skips non-core tiles (rows below XAIE_AIE_TILE_ROW_START).
+ */
+AieRC __Runtime_perfcnt_setup_mm2s_bd_finished_partition(XAie_DevInst *dev, uint8_t start_col, uint8_t end_col,
+                                                         uint8_t start_row, uint8_t end_row) {
+    printf("[aie_runtime] perfcnt_setup_mm2s_bd_finished_partition "
+           "col[%u..%u] row[%u..%u]\n",
+           (unsigned)start_col, (unsigned)end_col, (unsigned)start_row, (unsigned)end_row);
+
+    for (uint8_t col = start_col; col <= end_col; col++) {
+        for (uint8_t row = start_row; row <= end_row; row++) {
+            XAie_LocType tile = XAie_TileLoc(col, row);
+            if (!__Runtime_is_aie_core_tile(tile)) {
+                printf("[aie_runtime] perfcnt_partition: skipping non-core "
+                       "tile(%u,%u)\n",
+                       (unsigned)col, (unsigned)row);
+                continue;
+            }
+            AieRC rc = __Runtime_perfcnt_setup_mm2s_bd_finished(dev, tile);
+            if (rc != XAIE_OK) {
+                printf("[aie_runtime] perfcnt_partition: FAILED at tile(%u,%u) "
+                       "rc=%d\n",
+                       (unsigned)col, (unsigned)row, (int)rc);
+                return rc;
+            }
+        }
+    }
+
+    printf("[aie_runtime] perfcnt_setup_mm2s_bd_finished_partition OK\n");
+    return XAIE_OK;
+}
+
+/**
+ * Read and print MM2S BD finished perf counters across a partition.
+ */
+void __Runtime_perfcnt_read_mm2s_bd_finished_partition(XAie_DevInst *dev, uint8_t start_col, uint8_t end_col,
+                                                       uint8_t start_row, uint8_t end_row) {
+    printf("[aie_runtime] perfcnt_read_mm2s_bd_finished_partition "
+           "col[%u..%u] row[%u..%u]\n",
+           (unsigned)start_col, (unsigned)end_col, (unsigned)start_row, (unsigned)end_row);
+
+    for (uint8_t col = start_col; col <= end_col; col++) {
+        for (uint8_t row = start_row; row <= end_row; row++) {
+            XAie_LocType tile = XAie_TileLoc(col, row);
+            if (!__Runtime_is_aie_core_tile(tile))
+                continue;
+            uint32_t val0 = 0, val1 = 0;
+            __Runtime_perfcnt_read(dev, tile, 0, &val0);
+            __Runtime_perfcnt_read(dev, tile, 1, &val1);
+            printf("[aie_runtime] perfcnt tile(%u,%u) MM2S_ch0_bd_done=%u "
+                   "MM2S_ch1_bd_done=%u\n",
+                   (unsigned)col, (unsigned)row, val0, val1);
+        }
+    }
+}
+
 /**
  * Auto-initialization: runs before main() via __attribute__((constructor)).
  * Ensures g_DevInst and g_RoutingInst are ready before generated host code
@@ -921,6 +1062,26 @@ static void __Runtime_auto_teardown(void) {
                 }
                 for (int i = 0; i < shim_col_count; i++)
                     AieRt_PrintShimBdRawAll(g_DevInst, shim_cols[i]);
+            }
+            /* Dump perf counters for all core tiles seen in BD tracking */
+            {
+                XAie_LocType core_tiles[BD_TRACK_MAX];
+                int core_tile_count = 0;
+                for (int i = 0; i < g_bd_track_count; i++) {
+                    if (g_bd_track[i].tile_type != XAIEGBL_TILE_TYPE_AIETILE)
+                        continue;
+                    int dup = 0;
+                    for (int j = 0; j < core_tile_count; j++) {
+                        if (core_tiles[j].Col == g_bd_track[i].col && core_tiles[j].Row == g_bd_track[i].row) {
+                            dup = 1;
+                            break;
+                        }
+                    }
+                    if (!dup && core_tile_count < BD_TRACK_MAX)
+                        core_tiles[core_tile_count++] = XAie_TileLoc(g_bd_track[i].col, g_bd_track[i].row);
+                }
+                if (core_tile_count > 0)
+                    AieRt_PrintCoreTilePerfCountersAll(g_DevInst, core_tiles, core_tile_count);
             }
         }
     }

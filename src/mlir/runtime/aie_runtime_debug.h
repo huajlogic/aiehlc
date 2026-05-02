@@ -659,4 +659,24 @@ void AieRt_PrintStreamSwitchConfig(XAie_DevInst *dev, XAie_LocType tile, int pri
  */
 void AieRt_PrintStreamSwitchConfigAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles, int print_all);
 
+/* --------------------------------------------------------------------------
+ * Performance counter debug
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Read and print memory module perf counter 0 and 1 values for a single
+ * core tile.  These are typically configured (via __Runtime_perfcnt_setup
+ * or __Runtime_perfcnt_setup_mm2s_bd_finished) to count MM2S channel 0
+ * and channel 1 BD finished events respectively.
+ *
+ * @param dev   Device instance.
+ * @param tile  Core tile location (row >= XAIE_AIE_TILE_ROW_START).
+ */
+void AieRt_PrintCoreTilePerfCounters(XAie_DevInst *dev, XAie_LocType tile);
+
+/**
+ * Call AieRt_PrintCoreTilePerfCounters for every core tile in the list.
+ */
+void AieRt_PrintCoreTilePerfCountersAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles);
+
 #endif /* AIE_RUNTIME_DEBUG_H */
