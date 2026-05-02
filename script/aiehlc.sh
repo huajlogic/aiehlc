@@ -146,6 +146,11 @@ if [ "$COMPILE_AIELIB_ONLY" -eq 0 ] && [ -z "$runtime_source_file" ]; then
     return 0
 fi
 
+# Convert runtime_source_file to absolute path (resolve relative to AIEHLC_DIR)
+if [ -n "$runtime_source_file" ] && [[ "$runtime_source_file" != /* ]]; then
+    runtime_source_file="$(cd "${AIEHLC_DIR}" && cd "$(dirname "$runtime_source_file")" && pwd)/$(basename "$runtime_source_file")"
+fi
+
 #set up env
 run_cmd "source $SCRIPT_DIR/setup.sh --path-set-only"
 

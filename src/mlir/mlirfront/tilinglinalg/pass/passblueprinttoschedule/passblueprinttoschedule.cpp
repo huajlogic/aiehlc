@@ -1396,7 +1396,7 @@ void BlueprintToSchedulePass::runOnOperation() {
     target.addIllegalOp<dfscheblueprint::DeclareDataOp>();
     target.addIllegalOp<dfscheblueprint::FlowTransferOp>();
 
-    auto hwRes = makeResource("Gen2");
+    auto hwRes = makeResource(aieGen_);
     auto resourceMgr = std::make_shared<ResourceMgr>(std::move(hwRes));
 
     RewritePatternSet patterns(context);

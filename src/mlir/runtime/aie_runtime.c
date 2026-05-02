@@ -36,6 +36,7 @@ XAie_RoutingInstance *g_RoutingInst = NULL;
 //   Verbosity 1: BD tracking and IO logs (no core DMA address log)
 //   Verbosity 2: core DMA address log + write pattern + readback logic
 //   Flag bit 4 (value 16): AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA
+//   Flag bit 5 (value 32): AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN
 // Weak symbol: user source can override via #pragma aie_debug_level N
 __attribute__((weak)) int g_runtime_debug_level = 0;
 
@@ -332,6 +333,10 @@ void __Runtime_routing_init(void) {
  */
 AieRC __Runtime_device_teardown(void) {
     printf("[aie_runtime] device_teardown\n");
+    if (AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)) {
+        printf("[aie_runtime] device_teardown SKIPPED (DISABLE_PARTITIONTEARDOWN flag set)\n");
+        return XAIE_OK;
+    }
     AieRC RC = XAie_PartitionTeardown(g_DevInst);
     printf("[aie_runtime] device_teardown done rc=%d\n", (int)RC);
     return RC;

@@ -128,7 +128,7 @@ void TilingLinalgPipeline::registerDialects(mlir::MLIRContext &ctx) {
 
 mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols,
                                                     const std::vector<TensorParam> &tensors,
-                                                    const SplitModel &splitModel) {
+                                                    const SplitModel &splitModel, const std::string &aieGen) {
 
     // This is a parameterized version of routingmanager::ops_testNew()
     using namespace routing;
@@ -194,9 +194,10 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
 bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                                        const std::string &userKernelBody, const std::string &userKernelFuncName,
                                        int runtimeDebugLevel, const std::string &userRewrittenSource,
-                                       const std::vector<TensorParam> &tensors, int64_t maxPingPongBytes) {
+                                       const std::vector<TensorParam> &tensors, int64_t maxPingPongBytes,
+                                       const std::string &aieGen) {
 
-    RoutingTopology rtopology("Gen2");
+    RoutingTopology rtopology(aieGen);
 
     std::string irDir = setupPipelineIRDir("dfschedule");
     int stage = 0;
@@ -237,13 +238,14 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
     // Initialize ResourceMgr singleton for CoreMemAllocator (BCF/PRX generation)
     {
-        auto hwRes = makeResource("Gen2");
+        auto hwRes = makeResource(aieGen);
         ResourceMgr::init(std::move(hwRes));
     }
 
     // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
-    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5, maxPingPongBytes),
-                               irDir, stage, "BlueprintToSchedulePass"))
+    if (!runPipelineSinglePass(ctx, hostModule,
+                               std::make_unique<mlir::BlueprintToSchedulePass>(0.5, maxPingPongBytes, aieGen), irDir,
+                               stage, "BlueprintToSchedulePass"))
         return false;
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
                        "ScheduleCanonicalizePass"))
@@ -254,8 +256,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     if (!runPipelineSinglePass(ctx, hostModule, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
         return false;
-    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
-                       "RoutingConstantFoldPass"))
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(aieGen), irDir, stage,
+                               "RoutingConstantFoldPass"))
         return false;
 
     // Phase 3: kernel path (blueprint -> kernel schedule -> kernel API)
@@ -727,8 +729,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingDeadArgPass>(), routingIrDir,
                                    rstage, "RoutingDeadArgPass"))
             return false;
-        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingConstantFoldPass>(), routingIrDir,
-                                   rstage, "RoutingConstantFoldPass"))
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingConstantFoldPass>(aieGen),
+                                   routingIrDir, rstage, "RoutingConstantFoldPass"))
             return false;
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, mlir::createCanonicalizerPass(), routingIrDir, rstage,
                                    "CanonicalizerPass"))

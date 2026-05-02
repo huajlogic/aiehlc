@@ -1148,6 +1148,42 @@ void AieRt_PrintShimBdRawAll(XAie_DevInst *dev, uint8_t col) {
  * DMA channel status
  * -------------------------------------------------------------------------- */
 
+AieRC AieRt_DmaGetChannelStatusFull(XAie_DevInst *dev, XAie_LocType tile, uint8_t ch, XAie_DmaDirection dir,
+                                    uint32_t *status) {
+    if (dev == NULL || status == NULL)
+        return XAIE_INVALID_ARGS;
+    if (ch > 1u)
+        return XAIE_INVALID_ARGS;
+
+    /* Select S2MM / MM2S base offset depending on tile type.
+     * Core and MemTile offsets are identical across AIEML and AIE2PS.
+     * Shim NOC tile offsets differ: AIEML vs AIE2PS. */
+    u32 s2mm_base, mm2s_base;
+    if (s_is_shim(tile)) {
+        if (g_aiert_gen == AIERT_GEN_AIE2PS) {
+            s2mm_base = AIERT_DMA_SHIM_S2MM_STATUS_BASE_2PS;
+            mm2s_base = AIERT_DMA_SHIM_MM2S_STATUS_BASE_2PS;
+        } else {
+            s2mm_base = AIERT_DMA_SHIM_S2MM_STATUS_BASE_ML;
+            mm2s_base = AIERT_DMA_SHIM_MM2S_STATUS_BASE_ML;
+        }
+    } else if (s_is_memtile(tile)) {
+        s2mm_base = AIERT_DMA_MEM_S2MM_STATUS_BASE;
+        mm2s_base = AIERT_DMA_MEM_MM2S_STATUS_BASE;
+    } else if (s_is_core(tile)) {
+        s2mm_base = AIERT_DMA_CORE_S2MM_STATUS_BASE;
+        mm2s_base = AIERT_DMA_CORE_MM2S_STATUS_BASE;
+    } else {
+        return XAIE_INVALID_TILE;
+    }
+
+    u32 reg_offset = (dir == DMA_S2MM) ? s2mm_base : mm2s_base;
+    reg_offset += ch * AIERT_DMA_CHNUM_OFFSET;
+
+    u64 addr = ((u64)tile.Col << 25) | ((u64)tile.Row << 20) | (u64)reg_offset;
+    return XAie_Read32(dev, addr, status);
+}
+
 AieRt_DmaChStatusDecoded AieRt_DecodeDmaChStatus(uint32_t raw) {
     AieRt_DmaChStatusDecoded d;
     memset(&d, 0, sizeof(d));
@@ -1172,7 +1208,7 @@ AieRt_DmaChStatusDecoded AieRt_DecodeDmaChStatus(uint32_t raw) {
 
 void AieRt_PrintDmaChStatus(XAie_DevInst *dev, XAie_LocType tile, uint8_t ch, XAie_DmaDirection dir) {
     u32 raw = 0;
-    AieRC rc = XAie_DmaGetChannelStatus(dev, tile, ch, dir, &raw);
+    AieRC rc = AieRt_DmaGetChannelStatusFull(dev, tile, ch, dir, &raw);
     if (rc != XAIE_OK) {
         printf("[AieRt_Debug]   tile(%u,%u) ch%u %s: GetChannelStatus failed rc=%d\n", (unsigned)tile.Col,
                (unsigned)tile.Row, (unsigned)ch, s_dir_str(dir), (int)rc);
@@ -1300,7 +1336,7 @@ int AieRt_VerifyIoDescriptors(XAie_DevInst *dev, const struct_io *ios, uint32_t 
     for (uint32_t i = 0; i < num_ios; i++) {
         const struct_io *io = &ios[i];
         u32 raw = 0;
-        AieRC rc = XAie_DmaGetChannelStatus(dev, io->tile_loc, io->channel_id, io->direction, &raw);
+        AieRC rc = AieRt_DmaGetChannelStatusFull(dev, io->tile_loc, io->channel_id, io->direction, &raw);
         if (rc != XAIE_OK) {
             printf("[AieRt_Debug] IO[%u] tile(%u,%u) ch%u %s: GetChannelStatus FAILED rc=%d\n", (unsigned)i,
                    (unsigned)io->tile_loc.Col, (unsigned)io->tile_loc.Row, (unsigned)io->channel_id,

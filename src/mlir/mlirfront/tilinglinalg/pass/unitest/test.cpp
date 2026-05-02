@@ -112,6 +112,9 @@ static bool runSinglePass(MLIRContext &ctx, mlir::ModuleOp module, std::unique_p
 }
 
 // Unit test function to verify path contiguity for RoutingLowerPass
+// Global AIE generation string, set from --gen CLI argument
+static std::string g_aieGen = "Gen2";
+
 void testRoutingLowerPassPathContiguity() {
     std::cout << "\n=== Testing RoutingLowerPass Path Contiguity ===" << std::endl;
     
@@ -128,8 +131,8 @@ void testRoutingLowerPassPathContiguity() {
     
     // Apply passes up to RoutingLowerPass
     mlir::PassManager pm(&ctx);
-    RoutingTopology rtopology("Gen2");
-    
+    RoutingTopology rtopology(g_aieGen);
+
     pm.addPass(std::make_unique<RoutingUnrollingLowerPass>());
     pm.addPass(std::make_unique<RoutingLowerPass>(rtopology));
     
@@ -891,7 +894,7 @@ void routingtoroutinghw(mlir::ModuleOp module1 = nullptr) {
     }
 
     std::string irDir = setupIRDir("simplerouting");
-    RoutingTopology rtopology("Gen2");
+    RoutingTopology rtopology(g_aieGen);
     int stage = 0;
 
     dumpIRToFile(module1, irDir, stage++, "initial");
@@ -906,7 +909,7 @@ void routingtoroutinghw(mlir::ModuleOp module1 = nullptr) {
         return;
     if (!runSinglePass(ctx, module1, std::make_unique<RoutingDeadArgPass>(), irDir, stage, "RoutingDeadArgPass"))
         return;
-    if (!runSinglePass(ctx, module1, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingConstantFoldPass>(g_aieGen), irDir, stage,
                        "RoutingConstantFoldPass"))
         return;
     if (!runSinglePass(ctx, module1, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
@@ -964,7 +967,7 @@ void routingtodmap(const std::string &irFilepath = "", int startStage = 0) {
     }
 
     std::string irDir = setupIRDir("dmap");
-    RoutingTopology rtopology("Gen2");
+    RoutingTopology rtopology(g_aieGen);
     int stage = startStage;
 
     dumpIRToFile(module1, irDir, stage++, "initial");
@@ -996,7 +999,7 @@ void routingtodmap(const std::string &irFilepath = "", int startStage = 0) {
         return;
     if (!runSinglePass(ctx, module1, std::make_unique<RoutingDeadArgPass>(), irDir, stage, "RoutingDeadArgPass"))
         return;
-    if (!runSinglePass(ctx, module1, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
+    if (!runSinglePass(ctx, module1, std::make_unique<RoutingConstantFoldPass>(g_aieGen), irDir, stage,
                        "RoutingConstantFoldPass"))
         return;
     if (!runSinglePass(ctx, module1, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
@@ -1052,14 +1055,15 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
 
         if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir,
                                                /*userKernelBody=*/"", /*userKernelFuncName=*/"",
-                                               /*runtimeDebugLevel=*/-1, /*userRewrittenSource=*/"", tensors)) {
+                                               /*runtimeDebugLevel=*/-1, /*userRewrittenSource=*/"", tensors,
+                                               /*maxPingPongBytes=*/4096, g_aieGen)) {
             llvm::errs() << "TilingLinalgPipeline::runPipeline failed!\n";
         }
         return;
     }
 
     // Stage-aware pipeline for --parse mode (startStage > 0)
-    RoutingTopology rtopology("Gen2");
+    RoutingTopology rtopology(g_aieGen);
 
     // Determine which paths to run based on startStage
     // Stages 0-4: shared path (can produce host + kernel + bcf/prx)
@@ -1124,15 +1128,15 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
     // Initialize ResourceMgr singleton for CoreMemAllocator (BCF/PRX generation)
     // The singleton may already exist from a previous pass; init only creates once.
     if (doHostPath) {
-        auto hwRes = makeResource("Gen2");
+        auto hwRes = makeResource(g_aieGen);
         ResourceMgr::init(std::move(hwRes));
     }
 
     // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
     if (doHostPath) {
         if (startStage <= 4) {
-            if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5, 4096), irDir,
-                               stage, "BlueprintToSchedulePass"))
+            if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5, 4096, g_aieGen),
+                               irDir, stage, "BlueprintToSchedulePass"))
                 return;
         }
         if (startStage <= 5) {
@@ -1150,7 +1154,7 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
                 return;
         }
         if (startStage <= 8) {
-            if (!runSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
+            if (!runSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(g_aieGen), irDir, stage,
                                "RoutingConstantFoldPass"))
                 return;
         }
@@ -1291,7 +1295,7 @@ void testMultidimBd() {
     };
     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors);
 
-    RoutingTopology rtopology("Gen2");
+    RoutingTopology rtopology(g_aieGen);
     std::string irDir = setupIRDir("multidim");
     int stage = 0;
 
@@ -1313,12 +1317,12 @@ void testMultidimBd() {
     auto hostModule = cast<ModuleOp>(module->clone());
 
     // Initialize ResourceMgr
-    auto hwRes = makeResource("Gen2");
+    auto hwRes = makeResource(g_aieGen);
     ResourceMgr::init(std::move(hwRes));
 
     // Run BlueprintToSchedulePass (host path)
-    if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5, 4096), irDir, stage,
-                       "BlueprintToSchedulePass"))
+    if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5, 4096, g_aieGen), irDir,
+                       stage, "BlueprintToSchedulePass"))
         return;
     if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
                        "ScheduleCanonicalizePass"))
@@ -1362,7 +1366,7 @@ void testMultidimBd() {
         return;
     if (!runSinglePass(ctx, hostModule, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
         return;
-    if (!runSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
+    if (!runSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(g_aieGen), irDir, stage,
                        "RoutingConstantFoldPass"))
         return;
 
@@ -1407,6 +1411,20 @@ void testMultidimBd() {
 }
 
 int main(int argc, char* argv[]) {
+    // Parse --gen argument from anywhere in argv
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--gen" && i + 1 < argc) {
+            g_aieGen = argv[i + 1];
+            // Shift remaining args to remove --gen <value>
+            for (int j = i; j + 2 < argc; ++j)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            --i; // re-check this index
+        }
+    }
+    std::cout << "AIE generation: " << g_aieGen << std::endl;
+
     if (argc > 1) {
         std::string arg = argv[1];
         if (arg == "--parse") {
@@ -1533,7 +1551,8 @@ int main(int argc, char* argv[]) {
         } else {
             std::cout << "Invalid argument. Please use hw, test, dfschedule, dmaphw, multidim, routing, --parse "
                          "<stage> <file>\n"
-                      << "Stages: routing, dmap, dmaphop, dfscheblueprint, dfschedule, emitc" << std::endl;
+                      << "Stages: routing, dmap, dmaphop, dfscheblueprint, dfschedule, emitc\n"
+                      << "Options: --gen <Gen1|Gen2|Gen5> (default: Gen2)" << std::endl;
         }
     } else {
         // Default behavior: routingtodfschedule generates host.cc, kernel.cc,

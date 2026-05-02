@@ -46,6 +46,7 @@ extern XAie_RoutingInstance *g_RoutingInst;
 // Use AIE_DEBUG_LEVEL(v) to extract verbosity, AIE_DEBUG_HAS_FLAG(v, flag) to test flags
 #define AIE_DEBUG_LEVEL(v) ((v) & 0xF)
 #define AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA (1 << 4)
+#define AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN (1 << 5)
 #define AIE_DEBUG_HAS_FLAG(v, flag) (((v) & (flag)) != 0)
 extern int g_runtime_debug_level;
 

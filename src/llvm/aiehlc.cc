@@ -1123,22 +1123,72 @@ class AieDebugLevelPragmaHandler : public clang::PragmaHandler {
     AieDebugLevelPragmaHandler() : PragmaHandler("aie_debug_level") {}
 
     void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer Introducer, clang::Token &FirstToken) override {
+        // Known flag macros (must match aie_runtime.h definitions)
+        static const std::unordered_map<std::string, int> knownFlags = {
+            {"AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA", 1 << 4},
+            {"AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN", 1 << 5},
+        };
+
         clang::Token Tok;
         PP.Lex(Tok);
-        if (Tok.is(clang::tok::numeric_constant)) {
-            llvm::SmallString<8> IntegerBuffer;
-            bool Invalid = false;
-            llvm::StringRef Spelling = PP.getSpelling(Tok, IntegerBuffer, &Invalid);
-            if (!Invalid) {
-                int level = 0;
-                if (!Spelling.getAsInteger(10, level)) {
-                    parsedDebugLevel = level;
-                    llvm::outs() << "[aiehlc] Detected #pragma aie_debug_level " << parsedDebugLevel << "\n";
+
+        // Skip optional opening paren: #pragma aie_debug_level(...)
+        bool hasParen = Tok.is(clang::tok::l_paren);
+        if (hasParen)
+            PP.Lex(Tok);
+
+        int result = 0;
+        bool valid = false;
+
+        // Parse: term ( '|' term )*
+        // Each term is a numeric_constant or a known identifier flag
+        while (true) {
+            if (Tok.is(clang::tok::numeric_constant)) {
+                llvm::SmallString<16> IntegerBuffer;
+                bool Invalid = false;
+                llvm::StringRef Spelling = PP.getSpelling(Tok, IntegerBuffer, &Invalid);
+                if (Invalid)
+                    break;
+                int val = 0;
+                // Support decimal, hex (0x...), octal (0...) via base 0
+                if (Spelling.getAsInteger(0, val))
+                    break;
+                result |= val;
+                valid = true;
+            } else if (Tok.is(clang::tok::identifier)) {
+                std::string name = PP.getSpelling(Tok);
+                auto it = knownFlags.find(name);
+                if (it == knownFlags.end()) {
+                    llvm::errs() << "[aiehlc] Warning: unknown flag '" << name
+                                 << "' in #pragma aie_debug_level, ignored\n";
+                } else {
+                    result |= it->second;
+                    valid = true;
                 }
+            } else {
+                break;
+            }
+
+            PP.Lex(Tok);
+            if (Tok.is(clang::tok::pipe)) {
+                PP.Lex(Tok); // consume '|', continue to next term
+            } else {
+                break;
             }
         }
-        // Consume remaining tokens on the pragma line
-        PP.DiscardUntilEndOfDirective();
+
+        // Consume optional closing paren
+        if (hasParen && Tok.is(clang::tok::r_paren))
+            PP.Lex(Tok);
+
+        if (valid) {
+            parsedDebugLevel = result;
+            llvm::outs() << "[aiehlc] Detected #pragma aie_debug_level " << parsedDebugLevel << "\n";
+        }
+
+        // Consume remaining tokens on the pragma line (if any)
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
     }
 };
 
@@ -1541,103 +1591,114 @@ public:
                     rso.flush();
                 }
 
-                mlir::MLIRContext ctx;
-				TilingLinalgPipeline::registerDialects(ctx);
+// Derive AIE generation string from AIE_GEN preprocessor macro
+#if defined(AIE_GEN) && AIE_GEN == 1
+            std::string aieGenStr = "Gen1";
+#elif defined(AIE_GEN) && AIE_GEN >= 5
+            std::string aieGenStr = "Gen5";
+#else
+            std::string aieGenStr = "Gen2";
+#endif
+            llvm::outs() << "[TilingLinalg] AIE generation: " << aieGenStr << "\n";
 
-				// Build tensor params — use defaults matching unitest if not parsed
-				std::vector<TensorParam> tensors;
-				if (parsedTensors.empty()) {
-					// Default: single input tensor 16x16 i8 (same as unitest)
-					tensors.push_back({{16, 16}, 8, true});
-				} else {
-					for (auto &pt : parsedTensors) {
-						tensors.push_back({pt.shape, pt.elementBitWidth, pt.isInput});
-					}
-				}
+            mlir::MLIRContext ctx;
+            TilingLinalgPipeline::registerDialects(ctx);
 
-				// Use default mesh if not parsed
-				int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
-				int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
-
-                // Build SplitModel from resolved policy fields
-                SplitModel splitModel;
-                if (!parsedTensors.empty()) {
-                    for (auto &pt : parsedTensors) {
-                        if (pt.policyResolved) {
-                            // Use resolved struct fields from AST
-                            splitModel.tensorSplits.push_back(SplitModel::fromPolicyFields(
-                                pt.pattern, pt.distribution, pt.mergeOrder, pt.pingPong, pt.isInput));
-                        } else if (!pt.spatialTag.empty()) {
-                            // Legacy spatial tag syntax (e.g. row_broadcast_in<T>)
-                            splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
-                        } else {
-                            llvm::errs() << "[TilingLinalg] ERROR: tensor '" << pt.varName
-                                         << "' has no resolved policy and no spatial tag\n";
-                            // Default fallback
-                            splitModel.tensorSplits.push_back(SplitModel::fromPolicyFields(
-                                pt.isInput ? 0 : 3, // Broadcast for input, Gather for output
-                                0, pt.isInput ? 0 : 1, 2, pt.isInput));
-                        }
-                    }
-                } else {
-                    splitModel = SplitModel::gemm();
+            // Build tensor params — use defaults matching unitest if not parsed
+            std::vector<TensorParam> tensors;
+            if (parsedTensors.empty()) {
+                // Default: single input tensor 16x16 i8 (same as unitest)
+                tensors.push_back({{16, 16}, 8, true});
+            } else {
+                for (auto &pt : parsedTensors) {
+                    tensors.push_back({pt.shape, pt.elementBitWidth, pt.isInput});
                 }
+            }
 
-                // Build routing IR
-                auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel);
+            // Use default mesh if not parsed
+            int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
+            int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
 
-                // Prepend user macros to kernel body for multi-tile path
-                std::string kernelBodyWithMacros = userKernelBody;
-                if (!userMacroDefines.empty() && !userKernelBody.empty()) {
-                    std::string macroBlock = "// User macro definitions from source file\n";
-                    for (const auto &macro : userMacroDefines) {
-                        macroBlock += macro + "\n";
+            // Build SplitModel from resolved policy fields
+            SplitModel splitModel;
+            if (!parsedTensors.empty()) {
+                for (auto &pt : parsedTensors) {
+                    if (pt.policyResolved) {
+                        // Use resolved struct fields from AST
+                        splitModel.tensorSplits.push_back(SplitModel::fromPolicyFields(
+                            pt.pattern, pt.distribution, pt.mergeOrder, pt.pingPong, pt.isInput));
+                    } else if (!pt.spatialTag.empty()) {
+                        // Legacy spatial tag syntax (e.g. row_broadcast_in<T>)
+                        splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
+                    } else {
+                        llvm::errs() << "[TilingLinalg] ERROR: tensor '" << pt.varName
+                                     << "' has no resolved policy and no spatial tag\n";
+                        // Default fallback
+                        splitModel.tensorSplits.push_back(
+                            SplitModel::fromPolicyFields(pt.isInput ? 0 : 3, // Broadcast for input, Gather for output
+                                                         0, pt.isInput ? 0 : 1, 2, pt.isInput));
                     }
-                    macroBlock += "\n";
-                    kernelBodyWithMacros = macroBlock + userKernelBody;
-                }
-
-                // Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
-				std::string outputDir = std::string(AOUT) + "worklocal/";
-                if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros, userKernelFuncName,
-                                                      parsedDebugLevel, userRewrittenSource)) {
-                    llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
-                } else {
-                    llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
-                    std::exit(1);
                 }
             } else {
-				// ---- EXISTING PATH: single-tile ----
-				std::error_code error_code;
-				llvm::outs() << "Exporting File: " << std::string(AOUT)+"./host.cc" << "\n";
-				llvm::raw_fd_ostream outFile(std::string(AOUT)+"./host.cc", error_code, llvm::sys::fs::OF_None);
-				if (error_code) {
-					llvm::errs() << "Error opening file: " << error_code.message() << "\n";
-					return ;  // Exit early if there's an error
-				}
-                // Emit strong g_runtime_debug_level override if user set #pragma aie_debug_level
-                if (parsedDebugLevel >= 0) {
-                    outFile << "// Override runtime debug level (from #pragma aie_debug_level)\n";
-                    outFile << "int g_runtime_debug_level = " << parsedDebugLevel << ";\n\n";
+                splitModel = SplitModel::gemm();
+            }
+
+            // Build routing IR
+            auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel, aieGenStr);
+
+            // Prepend user macros to kernel body for multi-tile path
+            std::string kernelBodyWithMacros = userKernelBody;
+            if (!userMacroDefines.empty() && !userKernelBody.empty()) {
+                std::string macroBlock = "// User macro definitions from source file\n";
+                for (const auto &macro : userMacroDefines) {
+                    macroBlock += macro + "\n";
                 }
-                //fd.write(RewriteBuf->data(), RewriteBuf->size());
-				RewriteBuf->write(outFile);
-				/*
-				auto& sc = Rewrite.getSourceMgr();
-				auto mid = sc.getMainFileID();
-				llvm::StringRef sourceCode = sc.getBufferData(mid);
-				llvm::outs() << "Original Source Code:\n" << sourceCode << "\n";
-				*/
-				const std::string fname = "aie.mlir";
-				auto mlirstr = aiefrontend.dumpir();
-				std::ofstream ofs(fname);
-				if (ofs.is_open()) {
-						ofs << mlirstr;
-						ofs.close();
-				}
-				aiefrontend.RunPass(fname);
-			}
-			//  std::cout << "----------------end-----------------" << std::endl;
+                macroBlock += "\n";
+                kernelBodyWithMacros = macroBlock + userKernelBody;
+            }
+
+            // Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
+            std::string outputDir = std::string(AOUT) + "worklocal/";
+            if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros, userKernelFuncName,
+                                                  parsedDebugLevel, userRewrittenSource, {},
+                                                  /*maxPingPongBytes=*/4096, aieGenStr)) {
+                llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
+            } else {
+                llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
+                std::exit(1);
+            }
+        } else {
+            // ---- EXISTING PATH: single-tile ----
+            std::error_code error_code;
+            llvm::outs() << "Exporting File: " << std::string(AOUT) + "./host.cc" << "\n";
+            llvm::raw_fd_ostream outFile(std::string(AOUT) + "./host.cc", error_code, llvm::sys::fs::OF_None);
+            if (error_code) {
+                llvm::errs() << "Error opening file: " << error_code.message() << "\n";
+                return; // Exit early if there's an error
+            }
+            // Emit strong g_runtime_debug_level override if user set #pragma aie_debug_level
+            if (parsedDebugLevel >= 0) {
+                outFile << "// Override runtime debug level (from #pragma aie_debug_level)\n";
+                outFile << "int g_runtime_debug_level = " << parsedDebugLevel << ";\n\n";
+            }
+            // fd.write(RewriteBuf->data(), RewriteBuf->size());
+            RewriteBuf->write(outFile);
+            /*
+            auto& sc = Rewrite.getSourceMgr();
+            auto mid = sc.getMainFileID();
+            llvm::StringRef sourceCode = sc.getBufferData(mid);
+            llvm::outs() << "Original Source Code:\n" << sourceCode << "\n";
+            */
+            const std::string fname = "aie.mlir";
+            auto mlirstr = aiefrontend.dumpir();
+            std::ofstream ofs(fname);
+            if (ofs.is_open()) {
+                ofs << mlirstr;
+                ofs.close();
+            }
+            aiefrontend.RunPass(fname);
+        }
+        //  std::cout << "----------------end-----------------" << std::endl;
   	}
     std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                    StringRef file) override {

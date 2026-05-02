@@ -364,8 +364,7 @@ void RoutingConstantFoldPass::runOnOperation() {
     auto& ctx = getContext();
     mlir::RewritePatternSet patterns(&ctx);
     // Add our pattern to the set of patterns to be applied.
-    //FIXE ME
-    RoutingTopology RR("Gen2");
+    RoutingTopology RR(aieGen_);
     patterns.add<FoldConstantOperandsIntoCall>(&ctx, RR);
     patterns.add<FoldConstantOperandsIntoCallOpaqueOp>(&ctx, RR);
     patterns.add<RemoveDeadCallOp>(&ctx);

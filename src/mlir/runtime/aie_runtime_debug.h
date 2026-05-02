@@ -135,6 +135,33 @@ void AieRt_PrintCoreModuleEventsAll(XAie_DevInst *dev, const XAie_LocType *tiles
 #define AIERT_DMA_CUR_BD_MASK 0x0F000000u
 #define AIERT_DMA_CUR_BD_LSB 24u
 
+/* Per-channel register stride (AIEML / AIE2PS: each channel has its own
+ * status register at +0x4 from the previous one) */
+#define AIERT_DMA_CHNUM_OFFSET 0x4u
+
+/* DMA channel status register base offsets (tile-relative).
+ * S2MM_STATUS_0 is the base; ch1 is at base + AIERT_DMA_CHNUM_OFFSET.
+ * MM2S_STATUS_0 is offset from S2MM_STATUS_0 by the direction offset.
+ *
+ * Core tile (MEMORY_MODULE) — same for AIEML and AIE2PS:
+ *   S2MM_STATUS_0 = 0x0001DF00   S2MM_STATUS_1 = 0x0001DF04
+ *   MM2S_STATUS_0 = 0x0001DF10   MM2S_STATUS_1 = 0x0001DF14
+ * Shim NOC tile (NOC_MODULE) — AIEML:
+ *   S2MM_STATUS_0 = 0x0001D220   MM2S_STATUS_0 = 0x0001D228
+ * Shim NOC tile (NOC_MODULE) — AIE2PS:
+ *   S2MM_STATUS_0 = 0x00009320   MM2S_STATUS_0 = 0x00009328
+ * Mem tile (MEM_TILE_MODULE) — same for AIEML and AIE2PS:
+ *   S2MM_STATUS_0 = 0x000A0660   MM2S_STATUS_0 = 0x000A0680
+ */
+#define AIERT_DMA_CORE_S2MM_STATUS_BASE 0x0001DF00u
+#define AIERT_DMA_CORE_MM2S_STATUS_BASE 0x0001DF10u
+#define AIERT_DMA_SHIM_S2MM_STATUS_BASE_ML 0x0001D220u  /* AIEML */
+#define AIERT_DMA_SHIM_MM2S_STATUS_BASE_ML 0x0001D228u  /* AIEML */
+#define AIERT_DMA_SHIM_S2MM_STATUS_BASE_2PS 0x00009320u /* AIE2PS */
+#define AIERT_DMA_SHIM_MM2S_STATUS_BASE_2PS 0x00009328u /* AIE2PS */
+#define AIERT_DMA_MEM_S2MM_STATUS_BASE 0x000A0660u
+#define AIERT_DMA_MEM_MM2S_STATUS_BASE 0x000A0680u
+
 /* STATUS field values */
 #define AIERT_DMA_STATUS_IDLE 0u
 #define AIERT_DMA_STATUS_RUNNING 1u
@@ -410,8 +437,29 @@ void AieRt_PrintShimBdRawAll(XAie_DevInst *dev, uint8_t col);
  * -------------------------------------------------------------------------- */
 
 /**
+ * Read the raw DMA channel status register via XAie_Read32 without masking.
+ *
+ * Unlike XAie_DmaGetChannelStatus (which masks the raw value, stripping
+ * STATUS[1:0], CUR_BD[27:24], and error bits), this function returns the
+ * full unmasked register content so AieRt_DecodeDmaChStatus can decode
+ * all fields correctly.
+ *
+ * Targets AIEML (aie version 5) and AIE2PS only.  Register addresses are
+ * selected based on tile type (core, shim, memtile).
+ *
+ * @param dev     Device instance.
+ * @param tile    Tile location.
+ * @param ch      Channel number (0 or 1).
+ * @param dir     DMA_S2MM or DMA_MM2S.
+ * @param status  [out] Raw unmasked 32-bit status register value.
+ * @return        XAIE_OK on success, or an error code.
+ */
+AieRC AieRt_DmaGetChannelStatusFull(XAie_DevInst *dev, XAie_LocType tile, uint8_t ch, XAie_DmaDirection dir,
+                                    uint32_t *status);
+
+/**
  * Decode a raw channel status word into AieRt_DmaChStatusDecoded.
- * @param raw_status  Value returned by XAie_DmaGetChannelStatus.
+ * @param raw_status  Value returned by AieRt_DmaGetChannelStatusFull.
  * @return Decoded status struct.
  */
 AieRt_DmaChStatusDecoded AieRt_DecodeDmaChStatus(uint32_t raw_status);

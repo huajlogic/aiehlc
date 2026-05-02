@@ -12,7 +12,6 @@
 #define K_DIM K                                 // 16: inner product dimension
 #define BUF_SZ_OUT (ROWS_PER_ROUND * TILE_COLS) // 8: output bytes per DMA round (2 rows * 4 cols)
 #define DEBUG_OUTPUT_ORDER 1
-#define DISABLE_MATMUL (1 << 4)
 
 void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, output_window_int8 *window_out_0) {
 

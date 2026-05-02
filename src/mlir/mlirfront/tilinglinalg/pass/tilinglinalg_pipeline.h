@@ -63,7 +63,8 @@ public:
     /// splitModel -> per-tensor data distribution strategy
     static mlir::ModuleOp buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols,
                                          const std::vector<TensorParam> &tensors,
-                                         const SplitModel &splitModel = SplitModel::gemm());
+                                         const SplitModel &splitModel = SplitModel::gemm(),
+                                         const std::string &aieGen = "Gen2");
 
     /// Run the full pipeline and emit files to outputDir:
     ///   host.cc, kernel.cc, routing.cc, aieml.bcf, aieml.prx
@@ -75,5 +76,6 @@ public:
     static bool runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                             const std::string &userKernelBody = "", const std::string &userKernelFuncName = "",
                             int runtimeDebugLevel = -1, const std::string &userRewrittenSource = "",
-                            const std::vector<TensorParam> &tensors = {}, int64_t maxPingPongBytes = 4096);
+                            const std::vector<TensorParam> &tensors = {}, int64_t maxPingPongBytes = 4096,
+                            const std::string &aieGen = "Gen2");
 };

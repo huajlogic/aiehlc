@@ -480,6 +480,7 @@ Examples:
   %(prog)s ./build/test.elf     # Use relative path from current directory
   %(prog)s -y                   # Use default aout/main.elf without prompting
   %(prog)s -y /path/to/main.elf # Use custom ELF without prompting
+  %(prog)s -nonreboot test.elf  # Run ELF but keep board on for manual debug
         """
     )
     parser.add_argument(
@@ -493,6 +494,12 @@ Examples:
         action="store_true",
         default=False,
         help="Non-interactive mode: auto-confirm all prompts"
+    )
+    parser.add_argument(
+        "-nonreboot", "--nonreboot",
+        action="store_true",
+        default=False,
+        help="Keep board powered on after test (no xsdb exit, no power off) for manual debug"
     )
     args = parser.parse_args()
 
@@ -533,9 +540,17 @@ Examples:
         if not elf_ok:
             # PLM stalled — skip console wait, go straight to cleanup
             print("\n[Skipping console wait due to PLM failure]")
-            # Jump to cleanup (exit xsdb, power off)
-            print("\n>>> Cleaning up Connection 1...")
-            exit_xsdb_and_poweroff(conn1)
+            if not args.nonreboot:
+                print("\n>>> Cleaning up Connection 1...")
+                exit_xsdb_and_poweroff(conn1)
+            else:
+                print("\n>>> --nonreboot: board stays powered on for debug.")
+                print(f"    Kill this process when done: Ctrl+C or 'kill {os.getpid()}'")
+                try:
+                    while True:
+                        time.sleep(60)
+                except KeyboardInterrupt:
+                    print("\nReleasing board...")
             print("\n" + "=" * 60)
             print("Test FAILED (PLM stall)")
             print("=" * 60)
@@ -623,31 +638,57 @@ Examples:
             print("[No output received from com0 serial console]")
         
         # Step 6: Go back to conn1, exit xsdb and power off
-        print("\n>>> Cleaning up Connection 1...")
-        exit_xsdb_and_poweroff(conn1)
-        
+        if not args.nonreboot:
+            print("\n>>> Cleaning up Connection 1...")
+            exit_xsdb_and_poweroff(conn1)
+        else:
+            print("\n>>> --nonreboot: board stays powered on for debug.")
+            print("    xsdb and console connections remain active.")
+            print(f"    Kill this process when done: Ctrl+C or 'kill {os.getpid()}'")
+            try:
+                while True:
+                    time.sleep(60)
+            except KeyboardInterrupt:
+                print("\nReleasing board...")
+
         print("\n" + "=" * 60)
         print("Test complete!")
         print("=" * 60)
         
     except pexpect.TIMEOUT as e:
         print(f"\nError: Command timed out - {e}")
-        if conn1:
+        if conn1 and not args.nonreboot:
             try:
                 exit_xsdb_and_poweroff(conn1)
             except Exception:
                 pass
+        elif conn1 and args.nonreboot:
+            print(">>> --nonreboot: board stays powered on for debug.")
+            print(f"    Kill this process when done: Ctrl+C or 'kill {os.getpid()}'")
+            try:
+                while True:
+                    time.sleep(60)
+            except KeyboardInterrupt:
+                print("\nReleasing board...")
         sys.exit(1)
     except pexpect.EOF as e:
         print(f"\nError: Connection closed unexpectedly - {e}")
         sys.exit(1)
     except Exception as e:
         print(f"\nError: {e}")
-        if conn1:
+        if conn1 and not args.nonreboot:
             try:
                 exit_xsdb_and_poweroff(conn1)
             except Exception:
                 pass
+        elif conn1 and args.nonreboot:
+            print(">>> --nonreboot: board stays powered on for debug.")
+            print(f"    Kill this process when done: Ctrl+C or 'kill {os.getpid()}'")
+            try:
+                while True:
+                    time.sleep(60)
+            except KeyboardInterrupt:
+                print("\nReleasing board...")
         sys.exit(1)
     finally:
         # Cleanup - ensure thread is stopped and connections closed
