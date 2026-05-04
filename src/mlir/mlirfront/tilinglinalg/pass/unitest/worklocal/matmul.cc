@@ -1,8 +1,8 @@
 // User-provided compute kernel (extracted from __global__ function)
 // User macro definitions from source file
-#define M 64
-#define K 64
-#define N 64
+#define M 256
+#define K 256
+#define N 256
 #define HW_ROWS 4
 #define HW_COLS 4
 #define TILE_ROWS (M / HW_ROWS)                 // 4: total output rows per tile
@@ -11,7 +11,7 @@
 #define COLS_PER_ROUND (TILE_COLS / 2)          // 2: B cols per DMA input round
 #define K_DIM K                                 // 16: inner product dimension
 #define BUF_SZ_OUT (ROWS_PER_ROUND * TILE_COLS) // 8: output bytes per DMA round (2 rows * 4 cols)
-#define DEBUG_OUTPUT_ORDER 1
+#define DEBUG_OUTPUT_ORDER 0
 
 void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, output_window_int8 *window_out_0) {
 

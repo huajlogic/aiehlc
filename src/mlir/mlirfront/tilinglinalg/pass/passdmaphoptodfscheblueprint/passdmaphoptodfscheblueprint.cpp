@@ -1096,36 +1096,28 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                     int64_t tileW_w = tileW / elemsPerWord; // tile width in words (for D0 wrap)
                     int64_t outW_w = outW / elemsPerWord;   // full output width in words
 
-                    // Ping-pong factor: each core sends stripH rows across
-                    // pingPongFactor rounds, so coreRowsPerRound = stripH / pingPongFactor.
-                    int64_t pingPongFactor = 2;
-                    int64_t coreRowsPerRound = stripH / pingPongFactor; // e.g. 16/2 = 8
-
-                    // D3 stride: jump from round 0 to round 1 in DDR.
-                    // = coreRowsPerRound * outW_w * wordBytes (in bytes)
-                    int64_t d3Stride = coreRowsPerRound * outW_w * wordBytes; // e.g. 8*16*4 = 512
-
-                    // 4D addressing for shim S2MM output assembly:
+                    // 3D addressing for shim S2MM output assembly:
+                    //
+                    // Data arrival order: each tile sends all its rows (all
+                    // ping-pong rounds) contiguously before the next tile.
+                    // So: tile0_allrows, tile1_allrows, tile2_allrows, ...
+                    //
                     // D0: 1 word stride (contiguous within tile row)
                     // D1: full output row width (jump to next row in DDR)
                     // D2: tile width (jump to next tile column)
-                    // D3: coreRowsPerRound * outW (jump to next ping-pong round)
-                    SmallVector<int32_t> strides = {
-                        static_cast<int32_t>(1 * wordBytes), static_cast<int32_t>(outW_w * wordBytes),
-                        static_cast<int32_t>(tileW_w * wordBytes), static_cast<int32_t>(d3Stride)};
-                    SmallVector<int32_t> wraps = {static_cast<int32_t>(tileW_w), static_cast<int32_t>(coreRowsPerRound),
-                                                  static_cast<int32_t>(numTileCols),
-                                                  static_cast<int32_t>(pingPongFactor)};
+                    SmallVector<int32_t> strides = {static_cast<int32_t>(1 * wordBytes),
+                                                    static_cast<int32_t>(outW_w * wordBytes),
+                                                    static_cast<int32_t>(tileW_w * wordBytes)};
+                    SmallVector<int32_t> wraps = {static_cast<int32_t>(tileW_w), static_cast<int32_t>(stripH),
+                                                  static_cast<int32_t>(numTileCols)};
                     shimDimStrides = rewriter.getI32ArrayAttr(strides);
                     shimDimWraps = rewriter.getI32ArrayAttr(wraps);
 
-                    llvm::errs() << "[ShimMultiDim] Pull per-channel row-strip (4D): "
+                    llvm::errs() << "[ShimMultiDim] Pull per-channel row-strip (3D): "
                                  << "outW=" << outW << " stripH=" << stripH << " tileW=" << tileW
-                                 << " numTileCols=" << numTileCols << " elemsPerWord=" << elemsPerWord
-                                 << " coreRowsPerRound=" << coreRowsPerRound << " strides=[" << strides[0] << ","
-                                 << strides[1] << "," << strides[2] << "," << strides[3] << "]"
-                                 << " wraps=[" << wraps[0] << "," << wraps[1] << "," << wraps[2] << "," << wraps[3]
-                                 << "]\n";
+                                 << " numTileCols=" << numTileCols << " elemsPerWord=" << elemsPerWord << " strides=["
+                                 << strides[0] << "," << strides[1] << "," << strides[2] << "]"
+                                 << " wraps=[" << wraps[0] << "," << wraps[1] << "," << wraps[2] << "]\n";
                 }
             }
         }

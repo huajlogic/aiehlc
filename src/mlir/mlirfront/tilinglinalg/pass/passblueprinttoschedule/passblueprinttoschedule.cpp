@@ -718,11 +718,15 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         auto shimDimStrides = shimFlowConfig.getShimDimStridesAttr();
         auto shimDimWraps = shimFlowConfig.getShimDimWrapsAttr();
 
-        // === Out-of-Order BD support for many_to_one (output/gather) ===
-        // For many_to_one transfers, create N per-tile shim BDs with OOO mode.
-        // For one_to_many (input/broadcast), use a single shim BD as before.
+        // === Output gather (many_to_one) handling ===
+        // OOO BD dispatch on shim S2MM requires the packet header to be preserved
+        // all the way from core MM2S to shim S2MM DMA port. However, the routing
+        // path drops the packet header at the last PKT→CCT transition (DROP_HEADER).
+        // Without the header, the shim DMA cannot do OOO packet matching.
+        // Until the routing is changed to preserve headers for output flows,
+        // use a single sequential shim BD that accumulates data from all cores.
         bool isManyToOne = (transferType == "many_to_one");
-        bool useOOO = isManyToOne;
+        bool useOOO = false;
 
         // Collect shim BD IDs allocated for each tile (used by core MM2S BDs
         // to set out_of_order_bd_id pointing to the correct shim BD).
@@ -815,19 +819,19 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 auto shimBdIdC = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
                                                                     rewriter.getI32IntegerAttr(thisBdId));
 
-                // Per-tile shim BD: enable_packet=false for shim S2MM receiving
-                // (shim receiving side does not use packet headers)
+                // Per-tile shim BD: enable_packet=true for OOO S2MM receiving.
+                // The shim S2MM DMA engine uses packet_id from incoming packets
+                // to match each packet to the correct BD via OOO dispatch.
                 auto shimBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
                     loc, dfschedule::BdHandleType::get(rewriter.getContext()),
-                    ddrBuffer,                                   // DDR buffer
-                    shimTileOp.getTile(),                        // tile
-                    shimBdIdC.getResult(),                       // bd_id
-                    rewriter.getI32IntegerAttr(ddrOffset),       // offset (per-tile DDR position)
-                    rewriter.getI32IntegerAttr(perTileDdrBytes), // len (per-tile)
-                    rewriter.getBoolAttr(false),                 // enable_packet = false (shim S2MM)
-                    rewriter.getI32IntegerAttr(basePacketId +
-                                               (int32_t)t), // packet_id (unused when enable_packet=false)
-                    rewriter.getI32IntegerAttr(nextBdId),   // next_bd = self (OOO: self-chain for reuse)
+                    ddrBuffer,                                             // DDR buffer
+                    shimTileOp.getTile(),                                  // tile
+                    shimBdIdC.getResult(),                                 // bd_id
+                    rewriter.getI32IntegerAttr(ddrOffset),                 // offset (per-tile DDR position)
+                    rewriter.getI32IntegerAttr(perTileDdrBytes),           // len (per-tile)
+                    rewriter.getBoolAttr(true),                            // enable_packet = true (OOO packet matching)
+                    rewriter.getI32IntegerAttr(basePacketId + (int32_t)t), // packet_id for OOO BD dispatch
+                    rewriter.getI32IntegerAttr(nextBdId),                  // next_bd = self (OOO: self-chain for reuse)
                     rewriter.getI32IntegerAttr(-1), // acquire_lock_id = -1 → no lock (OOO flow control via packets)
                     rewriter.getI32IntegerAttr(0),  // acquire_lock_val (ignored)
                     rewriter.getI32IntegerAttr(-1), // release_lock_id = -1 → no lock

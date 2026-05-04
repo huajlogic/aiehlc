@@ -39,9 +39,9 @@
 #include <stdint.h>
 
 // Spatial policy definitions for kernel parameter transfer
-#define M 64
-#define K 64
-#define N 64
+#define M 256
+#define K 256
+#define N 256
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4
@@ -54,7 +54,7 @@
 #define COLS_PER_ROUND (TILE_COLS / 2)          // 2: B cols per DMA input round
 #define K_DIM K                                 // 16: inner product dimension
 #define BUF_SZ_OUT (ROWS_PER_ROUND * TILE_COLS) // 8: output bytes per DMA round (2 rows * 4 cols)
-#define DEBUG_OUTPUT_ORDER 1
+#define DEBUG_OUTPUT_ORDER 0
 static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C);
 static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *C);
 // ═══════════════════════════════════════════════════════════════════════════
@@ -79,8 +79,7 @@ static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *
 // Debug flag: when enabled, skip matmul and fill output with encoded tile ID.
 // Each output byte = row[0:2] | col[3:5] | round[6:7]
 // This lets you identify which tile and round produced each output byte.
-#pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN |         \
-                        AIE_DEBUG_FLAG_MM2SBDFINISH)
+#pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN | AIE_DEBUG_FLAG_MM2SBDFINISH)
 constexpr aie::SpatialPolicy RowBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Row};
 constexpr aie::SpatialPolicy ColBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Col};
 constexpr aie::SpatialPolicy LtoR_Merge = {

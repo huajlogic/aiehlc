@@ -490,8 +490,11 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
 
     /* Iteration dimension: 4th dim if present */
     if (num_dims == 4) {
-        XAie_DmaSetBdIteration(&DmaInst, strides[3], wraps[3], 0);
-        printf("[aie_runtime] bd_config_multidim: iteration stride=%d wrap=%d\n", strides[3], wraps[3]);
+        /* IR strides are in byte units; XAie expects 32-bit word units (÷4) */
+        int32_t iterStepSize = strides[3] / 4;
+        XAie_DmaSetBdIteration(&DmaInst, iterStepSize, wraps[3], 0);
+        printf("[aie_runtime] bd_config_multidim: iteration stride=%d (words, %d bytes) wrap=%d\n", iterStepSize,
+               strides[3], wraps[3]);
     }
 
     if (acquire_lock_id >= 0 && release_lock_id >= 0) {
