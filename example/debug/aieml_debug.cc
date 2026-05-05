@@ -183,6 +183,133 @@ int test_routing_packet(XAie_DevInst *DevInst) {
     return (mismatches == 0) ? 0 : -1;
 }
 
+// ---------------------------------------------------------------------------
+// test_routing_packet2:
+//   Same as test_routing_packet but uses Runtime_Movedata_ManyToOne_SingleDstBd
+//   so that only ONE destination BD is consumed on the shim tile.
+//   The single BD self-loops (NextBd → self) with iteration wrap = SRCNUM
+//   so it replays exactly SRCNUM times and then stops.
+// ---------------------------------------------------------------------------
+int test_routing_packet2(XAie_DevInst *DevInst) {
+    AieRC RC = XAIE_OK;
+    printf("=== test_routing_packet2: tile(0..2,3) → Shim(3,0) single-dst-BD ===\n");
+
+    // --- Step 1: Apply the full routing configuration ---
+    g_DevInst = DevInst;
+    printf("[1] Configuring stream switch routing...\n");
+    routing();
+    printf("[1] Routing configured.\n");
+
+    // --- Step 2: Allocate one DDR buffer for all sources ---
+#define SRCNUM2 3
+    uint32_t total_bytes2 = TEST_DATA_BYTES * SRCNUM2;
+    XAie_MemInst *ddr_buf2 = XAie_MemAllocate(DevInst, total_bytes2, XAIE_MEM_CACHEABLE);
+    u64 ddr_phy2 = (u64)XAie_MemGetDevAddr(ddr_buf2);
+    for (uint32_t w = 0; w < total_bytes2 / sizeof(uint32_t); w++)
+        ((uint32_t *)ddr_phy2)[w] = 0xDEADBEEF;
+    XAie_MemSyncForDev(ddr_buf2);
+
+    // --- Step 3: Write test data into each source tile and fill descriptors ---
+    MovedataSrcDesc srcs2[SRCNUM2];
+    for (int i = 0; i < SRCNUM2; i++) {
+        srcs2[i].src_tile = XAie_TileLoc(i, 3);
+        srcs2[i].src_addr = 0x0;
+        srcs2[i].src_ch = 0;
+        srcs2[i].src_bd = 0;
+        srcs2[i].dst_bd = 0; // unused by SingleDstBd API
+        srcs2[i].data_bytes = TEST_DATA_BYTES;
+        srcs2[i].dst_len = 0;
+        srcs2[i].src_pkt_id = 1 + i; // pkt_id 1,2,3
+        srcs2[i].dst_num_dims = 0;   // unused by SingleDstBd API
+        srcs2[i].recv_buf = ddr_buf2;
+        srcs2[i].recv_phy = ddr_phy2 + i * TEST_DATA_BYTES;
+
+        printf("[2] Writing test data to tile(%d,3) data memory at 0x0...\n", i);
+        {
+            uint32_t test_data[TEST_DATA_SIZE];
+            for (uint32_t j = 0; j < TEST_DATA_SIZE; j++) {
+                test_data[j] = ((i * 0x10000000) | j);
+            }
+            RC = XAie_DataMemBlockWrite(DevInst, XAie_TileLoc(i, 3), 0x0, (void *)test_data, TEST_DATA_BYTES);
+            if (RC != XAIE_OK) {
+                printf("ERROR: DataMemBlockWrite to tile(%d,3) failed: %d\n", i, RC);
+                return -1;
+            }
+        }
+        printf("---[2] Test data written.\n");
+    }
+
+    // --- Step 4: Move data using SingleDstBd (one BD, self-loop + iteration) ---
+    // Same multi-dim dims as test_routing_packet: [[1,4],[8,8],[4,2]]
+    XAie_DmaDimDesc dst_dims2[3] = {
+        {.AieMlDimDesc = {.StepSize = 1, .Wrap = 4}},
+        {.AieMlDimDesc = {.StepSize = 8, .Wrap = 8}},
+        {.AieMlDimDesc = {.StepSize = 4, .Wrap = 2}},
+    };
+
+    // iter_step_size: advance by TEST_DATA_SIZE words between replays
+    // so source 0 → ddr_phy2, source 1 → ddr_phy2 + TEST_DATA_BYTES, etc.
+    int iter_step = TEST_DATA_SIZE; // in 32-bit word units
+
+    printf("[3] Moving data (ManyToOne_SingleDstBd): tile(0..2,3) → Shim(3,0) bd2...\n");
+    RC = Runtime_Movedata_ManyToOne_SingleDstBd(DevInst, srcs2, SRCNUM2, XAie_TileLoc(3, 0), // dst: Shim(3,0)
+                                                0,                                           // dst_ch
+                                                2,                                           // single dst BD id
+                                                ddr_phy2,                                    // DDR base address
+                                                TEST_DATA_BYTES,                             // per_src_bytes
+                                                3,                                           // dst_num_dims
+                                                dst_dims2,                                   // multi-dim descriptors
+                                                iter_step);                                  // iteration step (words)
+    if (RC != XAIE_OK) {
+        printf("ERROR: Runtime_Movedata_ManyToOne_SingleDstBd failed: %d\n", RC);
+        return -1;
+    }
+    printf("[3] SingleDstBd data move enqueued, waiting for completion...\n");
+    RC = Runtime_Movedata_WaitAll(DevInst);
+    if (RC != XAIE_OK) {
+        printf("ERROR: Runtime_Movedata_WaitAll failed: %d\n", RC);
+        return -1;
+    }
+    printf("[3] Data move completed.\n");
+
+    // --- Step 5: Verify received data ---
+    printf("[4] Verifying received data...\n");
+    XAie_MemSyncForCPU(ddr_buf2);
+
+    int mismatches2 = 0;
+    for (int src = 0; src < SRCNUM2; src++) {
+        uint32_t *recv = (uint32_t *)(ddr_phy2 + src * TEST_DATA_BYTES);
+        for (uint32_t j = 0; j < TEST_DATA_SIZE; j++) {
+            uint32_t expected = ((src * 0x10000000) | j);
+            uint32_t actual = recv[j];
+            if (actual != expected) {
+                if (mismatches2 < 256) {
+                    printf("  MISMATCH src%d [%2d]: expected=0x%08x, got=0x%08x\n", src, j, expected, actual);
+                }
+                mismatches2++;
+            }
+        }
+    }
+
+    if (mismatches2 == 0) {
+        printf("[4] SUCCESS: All %d words (%d sources x %d each) match.\n", TEST_DATA_SIZE * SRCNUM2, SRCNUM2,
+               TEST_DATA_SIZE);
+    } else {
+        printf("[4] FAIL: %d / %d mismatches.\n", mismatches2, TEST_DATA_SIZE * SRCNUM2);
+    }
+
+    // Print first 8 words of each source for visual inspection
+    for (int src = 0; src < SRCNUM2; src++) {
+        uint32_t *recv = (uint32_t *)(ddr_phy2 + src * TEST_DATA_BYTES);
+        printf("  Source %d %p first 8 received words:\n", src, recv);
+        for (uint32_t j = 0; j < 8 && j < TEST_DATA_SIZE; j++) {
+            printf("    [%d] = 0x%08x\n", j, recv[j]);
+        }
+    }
+
+    return (mismatches2 == 0) ? 0 : -1;
+}
+
 int main(int argc, char *argv[]) {
 #ifdef DISABLE_CACHE
     Xil_DCacheDisable();
@@ -245,11 +372,16 @@ int main(int argc, char *argv[]) {
 #endif
 
     test_routing_packet(&DevInst);
+    // test_routing_packet2(&DevInst);
 
-    RC = XAie_PartitionTeardown(&DevInst);
-    if (RC != XAIE_OK) {
-        printf("Failed to Teardown partition\n");
-        return -1;
+    if (0) {
+        RC = XAie_PartitionTeardown(&DevInst);
+        if (RC != XAIE_OK) {
+            printf("Failed to Teardown partition\n");
+            return -1;
+        }
+    } else {
+        printf("Not tearing down partition to allow re-running test without reloading\n");
     }
 
     return 1;

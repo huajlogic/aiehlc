@@ -289,15 +289,20 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(1));
             Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
 
-            // DROP_HEADER only at the PKT→CIRC transition (last PKT hop).
+            // DROP_HEADER only at the PKT→CIRC transition (last PKT hop),
+            // UNLESS preserveheader=true (OOO mode needs headers at shim S2MM).
             // The transition op has both slave=NONE and DMA=NONE (it's the second op
             // of the last PKT tile, created by ParseTheCCTRoutingPath).
             // Intermediate PKT hops must preserve the header so the next PKT slave
             // can read it; dropping early causes the downstream PKT switch to consume
             // a data word as a fake header, losing one element per BD.
+            bool preserveHeader = false;
+            if (auto phAttr = op->getAttrOfType<BoolAttr>("preserveheader"))
+                preserveHeader = phAttr.getValue();
             bool isLastPktHop = (slaveportdirectionstr == PortDirectiontoString(PortDirection::NONE) &&
                                  dmadirectionstr == PortDirectiontoString(PortDirection::NONE));
-            auto headerPolicy = isLastPktHop ? dropheader : nodropheader;
+            // When preserveheader=true, always keep headers (OOO BD dispatch needs them)
+            auto headerPolicy = (isLastPktHop && !preserveHeader) ? dropheader : nodropheader;
             Value dropheadervalue = rewriter.create<mlir::emitc::ConstantOp>(
                 op->getLoc(), stringType1, mlir::emitc::OpaqueAttr::get(rewriter.getContext(), headerPolicy));
             auto callOpMport = rewriter.create<mlir::emitc::CallOp>(

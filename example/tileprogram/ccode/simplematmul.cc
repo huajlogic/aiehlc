@@ -39,9 +39,9 @@
 #include <stdint.h>
 
 // Spatial policy definitions for kernel parameter transfer
-#define M 256
-#define K 256
-#define N 256
+#define M 32
+#define K 32
+#define N 32
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4

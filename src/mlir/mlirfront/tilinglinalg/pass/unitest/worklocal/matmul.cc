@@ -1,8 +1,8 @@
 // User-provided compute kernel (extracted from __global__ function)
 // User macro definitions from source file
-#define M 256
-#define K 256
-#define N 256
+#define M 32
+#define K 32
+#define N 32
 #define HW_ROWS 4
 #define HW_COLS 4
 #define TILE_ROWS (M / HW_ROWS)                 // 4: total output rows per tile

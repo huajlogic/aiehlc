@@ -76,8 +76,9 @@ AieRC Runtime_Movedata(XAie_DevInst *DevInst, XAie_LocType src_tile, uint32_t sr
 /**
  * Runtime_Movedata_WaitAll - Wait for all pending OOO transfers to complete.
  *
- * Iterates through all transfers launched with MOVEDATA_MODE_OOO or
- * MOVEDATA_MODE_OOO_STRIDE and waits for their S2MM channels to finish.
+ * Iterates through all pending entries and waits for each DMA channel to
+ * finish. Entries may be S2MM (normal transfers) or MM2S (SingleDstBd
+ * where the self-looping S2MM never idles — we wait on sources instead).
  * Resets the pending count to 0 after all waits succeed.
  *
  * @return XAIE_OK if all transfers completed, first error code otherwise.
@@ -86,7 +87,15 @@ AieRC Runtime_Movedata_WaitAll(XAie_DevInst *DevInst);
 
 /**
  * Runtime_Movedata_ManyToOne - Move data from multiple source tiles to a
- * single destination shim tile.
+ * single destination shim tile using out-of-order (OOO) BD selection.
+ *
+ * Uses hardware OOO DMA:
+ *   - Only source MM2S BDs get XAie_DmaSetOutofOrderBdId (srcs[i].dst_bd
+ *     as the OOO BD ID). Destination S2MM BDs do NOT need it.
+ *   - The S2MM channel is configured with XAie_DmaChannelEnOutofOrder so
+ *     it selects the correct receive BD based on the OOO BD ID embedded
+ *     in incoming packets, rather than processing BDs from the queue.
+ *   - The S2MM channel is started once with BD 0 pushed to the queue.
  *
  * The caller provides the destination DDR address per source via
  * srcs[i].recv_phy and srcs[i].recv_buf. Each destination BD is configured
@@ -96,6 +105,8 @@ AieRC Runtime_Movedata_WaitAll(XAie_DevInst *DevInst);
  *
  * @param srcs          Array of source descriptors. Each srcs[i].recv_phy
  *                      and srcs[i].recv_buf must be set by the caller.
+ *                      srcs[i].dst_bd is used as the OOO BD ID on the
+ *                      source side.
  * @param num_srcs      Number of sources (1..MOVEDATA_MAX_SOURCES).
  * @param dst_tile      Single destination shim tile (row==0).
  * @param dst_ch        Destination DMA channel (S2MM).
@@ -104,6 +115,47 @@ AieRC Runtime_Movedata_WaitAll(XAie_DevInst *DevInst);
  */
 AieRC Runtime_Movedata_ManyToOne(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, int num_srcs, XAie_LocType dst_tile,
                                  uint8_t dst_ch);
+
+/**
+ * Runtime_Movedata_ManyToOne_SingleDstBd - Move data from multiple source
+ * tiles to a single destination shim tile using ONE destination BD.
+ *
+ * Unlike ManyToOne (which allocates one dst BD per source), this variant
+ * configures a single S2MM BD with NextBd→self to handle multiple DMA
+ * transactions:
+ *   - NextBd → self: the BD re-triggers itself for each source's data
+ *   - Iteration wrap = num_srcs with iter_step_size: the write address
+ *     advances by iter_step_size words after each transaction
+ *   - Buffer length = per_src_bytes (per transaction, not total)
+ *   - Optionally uses multi-dim addressing (dst_dims/dst_num_dims) for
+ *     scatter-write patterns within each transaction
+ *
+ * OOO support: since the self-looping S2MM BD never reports channel idle,
+ * WaitAll tracks the source MM2S channels instead. When every source
+ * finishes sending, all data has been received by the destination.
+ *
+ * After this call, use Runtime_Movedata_WaitAll() to wait for completion.
+ *
+ * @param srcs           Array of source descriptors (src_tile, src_addr,
+ *                       src_ch, src_bd, data_bytes, src_pkt_id used).
+ * @param num_srcs       Number of sources (1..MOVEDATA_MAX_SOURCES).
+ * @param dst_tile       Destination shim tile (row==0).
+ * @param dst_ch         Destination DMA channel (S2MM).
+ * @param dst_bd         Single destination BD ID (NextBd→self).
+ * @param dst_addr       DDR physical base address for the destination BD.
+ * @param per_src_bytes  Bytes per transaction (one source's data).
+ * @param dst_num_dims   Number of multi-dim dimensions (0 = linear).
+ * @param dst_dims       Multi-dim descriptors (may be NULL if dst_num_dims==0).
+ * @param iter_step_size Iteration step size in 32-bit words for address
+ *                       advancement between transactions. 0 (default) =
+ *                       auto-compute as per_src_bytes/4 (contiguous).
+ *
+ * @return XAIE_OK on success, error code otherwise.
+ */
+AieRC Runtime_Movedata_ManyToOne_SingleDstBd(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, int num_srcs,
+                                             XAie_LocType dst_tile, uint8_t dst_ch, uint8_t dst_bd, u64 dst_addr,
+                                             uint32_t per_src_bytes, int dst_num_dims = 0,
+                                             XAie_DmaDimDesc *dst_dims = nullptr, int iter_step_size = 0);
 
 #ifdef __cplusplus
 }
