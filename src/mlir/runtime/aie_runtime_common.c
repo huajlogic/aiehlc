@@ -252,9 +252,11 @@ AieRC Runtime_Movedata_ManyToOne(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, i
             RC = XAie_DmaSetAddrLen(&DmaInst, dst_addr, dst_len);
         }
         if (RC != XAIE_OK) {
-            printf("ERROR: ManyToOne[%d]: dst DmaSetAddr: %d\n", i, RC);
+            printf("ERROR: ManyToOne[%d]: dst DmaSetAddr: %d (addr=0x%llx, len=%u, num_dims=%d)\n", i, RC,
+                   (unsigned long long)dst_addr, dst_len, s->dst_num_dims);
             return RC;
         }
+        RC = XAie_DmaSetBdIteration(&DmaInst, 1, 1, 0);
 
         RC = XAie_DmaEnableBd(&DmaInst);
         RC = XAie_DmaWriteBd(DevInst, &DmaInst, dst_tile, s->dst_bd);
@@ -279,18 +281,19 @@ AieRC Runtime_Movedata_ManyToOne(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, i
         }
         printf("    S2MM ch%d OOO enabled on Shim(%d,%d)\n", dst_ch, dst_tile.Col, dst_tile.Row);
     }
-
-    RC = XAie_DmaChannelPushBdToQueue(DevInst, dst_tile, dst_ch, DMA_S2MM, 0 /*bd 0*/);
+    RC = XAie_DmaChannelSetStartQueue(DevInst, dst_tile, dst_ch /*channel*/, DMA_S2MM, 0 /*bdid*/, num_srcs,
+                                      XAIE_DISABLE);
+    // RC = XAie_DmaChannelPushBdToQueue(DevInst, dst_tile, dst_ch, DMA_S2MM, 0 /*bd 0*/);
     if (RC != XAIE_OK) {
-        printf("ERROR: ManyToOne: dst PushBdToQueue: %d\n", RC);
+        printf("ERROR: ManyToOne: dst XAie_DmaChannelSetStartQueue: %d\n", RC);
         return RC;
     }
 
-    RC = XAie_DmaChannelEnable(DevInst, dst_tile, dst_ch, DMA_S2MM);
-    if (RC != XAIE_OK) {
-        printf("ERROR: ManyToOne: dst DmaChannelEnable: %d\n", RC);
-        return RC;
-    }
+    // RC = XAie_DmaChannelEnable(DevInst, dst_tile, dst_ch, DMA_S2MM);
+    // if (RC != XAIE_OK) {
+    //     printf("ERROR: ManyToOne: dst DmaChannelEnable: %d\n", RC);
+    //     return RC;
+    /// }
 
     /* ---- 3: Configure each source BD (MM2S) with OOO BD ID ---- */
     /* Only source BDs need XAie_DmaSetOutofOrderBdId. The OOO BD ID       */

@@ -113,7 +113,7 @@ void routing() {
         int32_t v80 = XAie_StrmPktSwSlavePortEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 3), DMA, 0);
         int32_t v81 = XAie_EnableAieToShimDmaStrmPort(getOrCreateDeviceInstance(), XAie_TileLoc(3, 0), 1);
         int32_t v82 = XAie_StrmPktSwMstrPortEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 3), SOUTH, 0,
-                                                   XAIE_SS_PKT_DROP_HEADER, 0, 1);
+                                                   XAIE_SS_PKT_DONOT_DROP_HEADER, 0, 1);
         int32_t v83 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 2), NORTH, 0, SOUTH, 0);
         int32_t v84 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 1), NORTH, 0, SOUTH, 0);
         int32_t v85 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 0), NORTH, 0, SOUTH, 1);
@@ -168,7 +168,7 @@ void routing() {
         int32_t v120 = XAie_StrmPktSwSlavePortEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 4), DMA, 0);
         int32_t v121 = XAie_EnableAieToShimDmaStrmPort(getOrCreateDeviceInstance(), XAie_TileLoc(3, 0), 3);
         int32_t v122 = XAie_StrmPktSwMstrPortEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 4), SOUTH, 0,
-                                                    XAIE_SS_PKT_DROP_HEADER, 0, 1);
+                                                    XAIE_SS_PKT_DONOT_DROP_HEADER, 0, 1);
         int32_t v123 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 3), NORTH, 0, SOUTH, 1);
         int32_t v124 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 2), NORTH, 1, SOUTH, 1);
         int32_t v125 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 1), NORTH, 1, SOUTH, 1);
@@ -226,7 +226,7 @@ void routing() {
         int32_t v163 = XAie_StrmPktSwSlavePortEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 5), DMA, 0);
         int32_t v164 = XAie_EnableAieToShimDmaStrmPort(getOrCreateDeviceInstance(), XAie_TileLoc(2, 0), 1);
         int32_t v165 = XAie_StrmPktSwMstrPortEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 5), SOUTH, 0,
-                                                    XAIE_SS_PKT_DROP_HEADER, 0, 1);
+                                                    XAIE_SS_PKT_DONOT_DROP_HEADER, 0, 1);
         int32_t v166 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 4), NORTH, 0, WEST, 0);
         int32_t v167 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(2, 4), EAST, 0, SOUTH, 0);
         int32_t v168 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(2, 3), NORTH, 0, SOUTH, 0);
@@ -287,7 +287,7 @@ void routing() {
         int32_t v209 = XAie_StrmPktSwSlavePortEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 6), DMA, 0);
         int32_t v210 = XAie_EnableAieToShimDmaStrmPort(getOrCreateDeviceInstance(), XAie_TileLoc(2, 0), 3);
         int32_t v211 = XAie_StrmPktSwMstrPortEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 6), SOUTH, 0,
-                                                    XAIE_SS_PKT_DROP_HEADER, 0, 1);
+                                                    XAIE_SS_PKT_DONOT_DROP_HEADER, 0, 1);
         int32_t v212 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 5), NORTH, 0, SOUTH, 1);
         int32_t v213 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(3, 4), NORTH, 1, WEST, 2);
         int32_t v214 = XAie_StrmConnCctEnable(getOrCreateDeviceInstance(), XAie_TileLoc(2, 4), EAST, 2, SOUTH, 1);
