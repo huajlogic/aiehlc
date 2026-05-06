@@ -118,21 +118,19 @@ AieRC Runtime_Movedata_ManyToOne(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, i
 
 /**
  * Runtime_Movedata_ManyToOne_SingleDstBd - Move data from multiple source
- * tiles to a single destination shim tile using ONE destination BD.
+ * tiles to a single destination shim tile using ONE destination BD with
+ * out-of-order (OOO) BD selection.
  *
- * Unlike ManyToOne (which allocates one dst BD per source), this variant
- * configures a single S2MM BD with NextBd→self to handle multiple DMA
- * transactions:
- *   - NextBd → self: the BD re-triggers itself for each source's data
+ * Uses hardware OOO DMA (same pattern as Runtime_Movedata_ManyToOne):
+ *   - Source MM2S BDs get XAie_DmaSetOutofOrderBdId(dst_bd) so the
+ *     destination S2MM channel knows which BD to write into.
+ *   - The S2MM channel is configured with XAie_DmaChannelEnOutofOrder
+ *     and started via XAie_DmaChannelSetStartQueue with repeat=num_srcs.
  *   - Iteration wrap = num_srcs with iter_step_size: the write address
- *     advances by iter_step_size words after each transaction
- *   - Buffer length = per_src_bytes (per transaction, not total)
+ *     advances by iter_step_size words after each transaction.
+ *   - Buffer length = per_src_bytes (per transaction, not total).
  *   - Optionally uses multi-dim addressing (dst_dims/dst_num_dims) for
- *     scatter-write patterns within each transaction
- *
- * OOO support: since the self-looping S2MM BD never reports channel idle,
- * WaitAll tracks the source MM2S channels instead. When every source
- * finishes sending, all data has been received by the destination.
+ *     scatter-write patterns within each transaction.
  *
  * After this call, use Runtime_Movedata_WaitAll() to wait for completion.
  *

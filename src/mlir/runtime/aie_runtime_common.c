@@ -385,8 +385,8 @@ AieRC Runtime_Movedata_ManyToOne_SingleDstBd(XAie_DevInst *DevInst, MovedataSrcD
         return XAIE_ERR;
     }
 
-    if (g_pending_count + num_srcs > MOVEDATA_MAX_PENDING) {
-        printf("ERROR: ManyToOne_SingleDstBd: would exceed max pending (%d + %d > %d)\n", g_pending_count, num_srcs,
+    if (g_pending_count + 1 > MOVEDATA_MAX_PENDING) {
+        printf("ERROR: ManyToOne_SingleDstBd: would exceed max pending (%d + 1 > %d)\n", g_pending_count,
                MOVEDATA_MAX_PENDING);
         return XAIE_ERR;
     }
@@ -401,11 +401,9 @@ AieRC Runtime_Movedata_ManyToOne_SingleDstBd(XAie_DevInst *DevInst, MovedataSrcD
            per_src_bytes, iter_step_size, num_srcs);
 
     /* ---- 1: Configure the single destination BD (S2MM on dst_tile) ---- */
-    /*    NextBd → self: BD re-triggers for each DMA transaction.          */
-    /*    Iteration wrap = num_srcs: address advances by iter_step_size     */
-    /*    words each transaction. Buffer length = per_src_bytes (per txn).  */
-    /*    OOO wait: tracks source MM2S channels since the self-looping     */
-    /*    S2MM channel never reports idle.                                   */
+    /*    Uses OOO logic: the S2MM channel selects this BD based on OOO    */
+    /*    BD ID from incoming packets. Iteration wrap = num_srcs with      */
+    /*    iter_step_size for address advancement between transactions.     */
     {
         XAie_DmaDesc DmaInst;
         RC = XAie_DmaDescInit(DevInst, &DmaInst, dst_tile);
@@ -427,13 +425,6 @@ AieRC Runtime_Movedata_ManyToOne_SingleDstBd(XAie_DevInst *DevInst, MovedataSrcD
             return RC;
         }
 
-        /* NextBd → self: same BD handles the next DMA transaction */
-        RC = XAie_DmaSetNextBd(&DmaInst, dst_bd, XAIE_ENABLE);
-        if (RC != XAIE_OK) {
-            printf("ERROR: ManyToOne_SingleDstBd: dst DmaSetNextBd: %d\n", RC);
-            return RC;
-        }
-
         /* Iteration: address advances iter_step_size words per transaction */
         RC = XAie_DmaSetBdIteration(&DmaInst, iter_step_size, num_srcs, 0);
         if (RC != XAIE_OK) {
@@ -447,21 +438,33 @@ AieRC Runtime_Movedata_ManyToOne_SingleDstBd(XAie_DevInst *DevInst, MovedataSrcD
             printf("ERROR: ManyToOne_SingleDstBd: dst DmaWriteBd: %d\n", RC);
             return RC;
         }
-
-        RC = XAie_DmaChannelPushBdToQueue(DevInst, dst_tile, dst_ch, DMA_S2MM, dst_bd);
-        if (RC != XAIE_OK) {
-            printf("ERROR: ManyToOne_SingleDstBd: dst PushBdToQueue: %d\n", RC);
-            return RC;
-        }
-
-        RC = XAie_DmaChannelEnable(DevInst, dst_tile, dst_ch, DMA_S2MM);
-        if (RC != XAIE_OK) {
-            printf("ERROR: ManyToOne_SingleDstBd: dst DmaChannelEnable: %d\n", RC);
-            return RC;
-        }
     }
 
-    /* ---- 2: Configure each source BD (MM2S on src_tile) ---- */
+    /* ---- 2: Enable OOO on S2MM channel, use SetStartQueue ---- */
+    /* With OOO enabled the channel selects BDs based on the OOO BD ID     */
+    /* in incoming packets. We use SetStartQueue with repeat=num_srcs      */
+    /* so the single BD is re-used for each source transaction.            */
+    {
+        XAie_DmaChannelDesc DmaChannelDescInst;
+        XAie_DmaChannelDescInit(DevInst, &DmaChannelDescInst, dst_tile);
+        XAie_DmaChannelEnOutofOrder(&DmaChannelDescInst, XAIE_ENABLE);
+        RC = XAie_DmaWriteChannel(DevInst, &DmaChannelDescInst, dst_tile, dst_ch, DMA_S2MM);
+        if (RC != XAIE_OK) {
+            printf("ERROR: ManyToOne_SingleDstBd: S2MM OOO channel enable: %d\n", RC);
+            return RC;
+        }
+        printf("    S2MM ch%d OOO enabled on Shim(%d,%d)\n", dst_ch, dst_tile.Col, dst_tile.Row);
+    }
+    RC = XAie_DmaChannelSetStartQueue(DevInst, dst_tile, dst_ch, DMA_S2MM, dst_bd, num_srcs /*1*/, XAIE_DISABLE);
+    if (RC != XAIE_OK) {
+        printf("ERROR: ManyToOne_SingleDstBd: dst XAie_DmaChannelSetStartQueue: %d\n", RC);
+        return RC;
+    }
+
+    /* ---- 3: Configure each source BD (MM2S) with OOO BD ID ---- */
+    /* Only source BDs need XAie_DmaSetOutofOrderBdId. The OOO BD ID       */
+    /* tells the destination S2MM channel which BD to write into.           */
+    /* Since SingleDstBd uses a single dst BD, all sources use dst_bd.      */
     for (i = 0; i < num_srcs; i++) {
         MovedataSrcDesc *s = &srcs[i];
 
@@ -469,7 +472,7 @@ AieRC Runtime_Movedata_ManyToOne_SingleDstBd(XAie_DevInst *DevInst, MovedataSrcD
                s->src_bd, s->data_bytes);
         if (s->src_pkt_id >= 0)
             printf(", pkt_id=%d", s->src_pkt_id);
-        printf("\n");
+        printf(", ooo_bd_id=%d\n", dst_bd);
 
         XAie_DmaDesc DmaInst;
         RC = XAie_DmaDescInit(DevInst, &DmaInst, s->src_tile);
@@ -493,6 +496,13 @@ AieRC Runtime_Movedata_ManyToOne_SingleDstBd(XAie_DevInst *DevInst, MovedataSrcD
             }
         }
 
+        /* OOO BD ID on source — tells the destination S2MM which BD to use */
+        RC = XAie_DmaSetOutofOrderBdId(&DmaInst, dst_bd);
+        if (RC != XAIE_OK) {
+            printf("ERROR: ManyToOne_SingleDstBd[%d]: src DmaSetOutofOrderBdId: %d\n", i, RC);
+            return RC;
+        }
+
         RC = XAie_DmaEnableBd(&DmaInst);
         RC = XAie_DmaWriteBd(DevInst, &DmaInst, s->src_tile, s->src_bd);
         if (RC != XAIE_OK) {
@@ -511,14 +521,13 @@ AieRC Runtime_Movedata_ManyToOne_SingleDstBd(XAie_DevInst *DevInst, MovedataSrcD
             printf("ERROR: ManyToOne_SingleDstBd[%d]: src DmaChannelEnable: %d\n", i, RC);
             return RC;
         }
-
-        /* Record source MM2S as pending — self-looping S2MM never idles,
-         * so WaitAll waits on each source MM2S to confirm all data was sent */
-        g_pending[g_pending_count].tile = s->src_tile;
-        g_pending[g_pending_count].ch = s->src_ch;
-        g_pending[g_pending_count].dir = DMA_MM2S;
-        g_pending_count++;
     }
+
+    /* ---- 4: Record single S2MM pending entry for WaitAll ---- */
+    g_pending[g_pending_count].tile = dst_tile;
+    g_pending[g_pending_count].ch = dst_ch;
+    g_pending[g_pending_count].dir = DMA_S2MM;
+    g_pending_count++;
 
     return XAIE_OK;
 }

@@ -257,7 +257,7 @@ int test_routing_packet2(XAie_DevInst *DevInst) {
                                                 2,                                           // single dst BD id
                                                 ddr_phy2,                                    // DDR base address
                                                 TEST_DATA_BYTES,                             // per_src_bytes
-                                                3,                                           // dst_num_dims
+                                                0,                                           // dst_num_dims
                                                 dst_dims2,                                   // multi-dim descriptors
                                                 iter_step);                                  // iteration step (words)
     if (RC != XAIE_OK) {
@@ -371,8 +371,8 @@ int main(int argc, char *argv[]) {
     XAie_PmRequestTiles(&DevInst, NULL, 0);
 #endif
 
-    test_routing_packet(&DevInst);
-    // test_routing_packet2(&DevInst);
+    // test_routing_packet(&DevInst);
+    test_routing_packet2(&DevInst);
 
     if (0) {
         RC = XAie_PartitionTeardown(&DevInst);
