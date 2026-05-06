@@ -281,6 +281,9 @@ AieRC Runtime_Movedata_ManyToOne(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, i
         }
         printf("    S2MM ch%d OOO enabled on Shim(%d,%d)\n", dst_ch, dst_tile.Col, dst_tile.Row);
     }
+    // as OOO drived by src bd list, the detination need repeat N time the n is the source bd transcatin number
+    //  by using this way each first arrive BD can be processed, and each process will remove the packet header
+    //  and process per packet length
     RC = XAie_DmaChannelSetStartQueue(DevInst, dst_tile, dst_ch /*channel*/, DMA_S2MM, 0 /*bdid*/, num_srcs,
                                       XAIE_DISABLE);
     // RC = XAie_DmaChannelPushBdToQueue(DevInst, dst_tile, dst_ch, DMA_S2MM, 0 /*bd 0*/);
