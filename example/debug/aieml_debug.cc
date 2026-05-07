@@ -93,47 +93,53 @@ int test_routing_packet(XAie_DevInst *DevInst) {
     // stride/wrap receive dims: [[4,1],[8,8],[4,2]]
     printf("abc[3] Moving data (ManyToOne): tile(0,3) → Shim(3,0)...\n");
 #define SRCNUM 3
+#define SRCNUM_DUP_ROUND 2
+#define SRCNUM_DUP (SRCNUM * SRCNUM_DUP_ROUND)
     // Allocate one DDR buffer for all sources
-    uint32_t total_bytes = TEST_DATA_BYTES * SRCNUM;
+    uint32_t total_bytes = TEST_DATA_BYTES * SRCNUM_DUP;
     XAie_MemInst *ddr_buf = XAie_MemAllocate(DevInst, total_bytes, XAIE_MEM_CACHEABLE);
     u64 ddr_phy = (u64)XAie_MemGetDevAddr(ddr_buf);
     for (uint32_t w = 0; w < total_bytes / sizeof(uint32_t); w++)
         ((uint32_t *)ddr_phy)[w] = 0xDEADBEEF;
     XAie_MemSyncForDev(ddr_buf);
 
-    MovedataSrcDesc srcs[SRCNUM];
-    for (int i = 0; i < SRCNUM; i++) {
-        srcs[i].src_tile = XAie_TileLoc(i, 3);
-        srcs[i].src_addr = 0x0;
-        srcs[i].src_ch = 0;
-        srcs[i].src_bd = 0;
-        srcs[i].dst_bd = 2 + i; // dst BDs 2,3,4 on shim
-        srcs[i].data_bytes = TEST_DATA_BYTES;
-        srcs[i].dst_len = 0;        // 0 = use data_bytes
-        srcs[i].src_pkt_id = 1 + i; // pkt_id 1,2,3
-        srcs[i].dst_num_dims = 0;   // stride/wrap receive dims: [[4,1],[8,8],[4,2]]
-        // srcs[i].dst_dims[0] = {.AieMlDimDesc = {.StepSize = 1, .Wrap = 4}};
-        // srcs[i].dst_dims[1] = {.AieMlDimDesc = {.StepSize = 8, .Wrap = 8}};
-        // srcs[i].dst_dims[2] = {.AieMlDimDesc = {.StepSize = 4, .Wrap = 2}};
-        srcs[i].recv_buf = ddr_buf; // all share the same MemInst for sync
-        srcs[i].recv_phy = ddr_phy + i * TEST_DATA_BYTES;
-        printf("[2] Writing test data to tile(%d,3) data memory at 0x0...\n", i);
-        {
-            uint32_t test_data[TEST_DATA_SIZE];
-            for (uint32_t j = 0; j < TEST_DATA_SIZE; j++) {
-                test_data[j] = ((i * 0x10000000) | j);
+    MovedataSrcDesc srcs[SRCNUM * SRCNUM_DUP_ROUND];
+    for (int k = 0; k < SRCNUM_DUP_ROUND; k++) {
+        for (int i = 0; i < SRCNUM; i++) {
+            auto idx = k * SRCNUM + i;
+            srcs[idx].src_tile = XAie_TileLoc(i, 3);
+            srcs[idx].src_addr = 0x0 + (k * TEST_DATA_BYTES); // offset for each duplicate round
+            srcs[idx].src_ch = 0;
+            srcs[idx].src_bd = k;
+            srcs[idx].dst_bd = 2 + i; // dst BDs 2,3,4 on shim
+            srcs[idx].data_bytes = TEST_DATA_BYTES;
+            srcs[idx].dst_len = 0;        // 0 = use data_bytes
+            srcs[idx].src_pkt_id = 1 + i; // pkt_id 1,2,3
+            srcs[idx].dst_num_dims = 0;   // stride/wrap receive dims: [[4,1],[8,8],[4,2]]
+            // srcs[idx].dst_dims[0] = {.AieMlDimDesc = {.StepSize = 1, .Wrap = 4}};
+            // srcs[idx].dst_dims[1] = {.AieMlDimDesc = {.StepSize = 8, .Wrap = 8}};
+            // srcs[idx].dst_dims[2] = {.AieMlDimDesc = {.StepSize = 4, .Wrap = 2}};
+            srcs[idx].recv_buf = ddr_buf; // all share the same MemInst for sync
+            srcs[idx].recv_phy = ddr_phy + i * TEST_DATA_BYTES * SRCNUM_DUP_ROUND;
+            printf("[2] Writing test data to tile(%d,3) data memory at 0x0...\n", i);
+            {
+                uint32_t test_data[TEST_DATA_SIZE];
+                for (uint32_t j = 0; j < TEST_DATA_SIZE; j++) {
+                    test_data[j] = ((k * 0x10000000) | (i * 0x1000000) | j);
+                }
+                RC = XAie_DataMemBlockWrite(DevInst, XAie_TileLoc(i, 3), srcs[idx].src_addr, (void *)test_data,
+                                            TEST_DATA_BYTES);
+                if (RC != XAIE_OK) {
+                    printf("ERROR: DataMemBlockWrite to tile(%d,3) failed: %d\n", i, RC);
+                    return -1;
+                }
             }
-            RC = XAie_DataMemBlockWrite(DevInst, XAie_TileLoc(i, 3), 0x0, (void *)test_data, TEST_DATA_BYTES);
-            if (RC != XAIE_OK) {
-                printf("ERROR: DataMemBlockWrite to tile(%d,3) failed: %d\n", i, RC);
-                return -1;
-            }
+            printf("---[2] Test data written.\n");
         }
-        printf("---[2] Test data written.\n");
     }
-    RC = Runtime_Movedata_ManyToOne(DevInst, srcs, SRCNUM, // all sources
-                                    XAie_TileLoc(3, 0),    // dst: Shim(3,0)
-                                    0);                    // dst_ch
+    RC = Runtime_Movedata_ManyToOne(DevInst, srcs, SRCNUM_DUP, // all sources
+                                    XAie_TileLoc(3, 0),        // dst: Shim(3,0)
+                                    0);                        // dst_ch
     if (RC != XAIE_OK) {
         printf("ERROR: Runtime_Movedata_ManyToOne failed: %d\n", RC);
         return -1;
@@ -151,25 +157,31 @@ int test_routing_packet(XAie_DevInst *DevInst) {
     XAie_MemSyncForCPU(ddr_buf);
 
     int mismatches = 0;
-    for (int src = 0; src < SRCNUM; src++) {
-        uint32_t *recv = (uint32_t *)srcs[src].recv_phy;
-        for (uint32_t j = 0; j < TEST_DATA_SIZE; j++) {
-            uint32_t expected = ((src * 0x10000000) | j);
-            uint32_t actual = recv[j];
-            if (actual != expected) {
-                if (mismatches < 256) {
-                    printf("  MISMATCH src%d [%2d]: expected=0x%08x, got=0x%08x\n", src, j, expected, actual);
+    for (int i = 0; i < SRCNUM_DUP_ROUND; i++) {
+
+        for (int src = 0; src < SRCNUM; src++) {
+            auto idx = (i * SRCNUM) + src;
+            uint32_t *recv = (uint32_t *)(srcs[idx].recv_phy + i * TEST_DATA_BYTES); // offset for each duplicate round
+            for (uint32_t j = 0; j < TEST_DATA_SIZE; j++) {
+                uint32_t expected = ((i * 0x10000000) | (src * 0x1000000) | j);
+                uint32_t actual = recv[j];
+                if (actual != expected) {
+                    // if (mismatches < 256) {
+                    printf("  MISMATCH src%d [%2d]: expected=0x%08x, got=0x%08x\n", idx, j, expected, actual);
+                    //}
+                    mismatches++;
+                } else {
+                    printf("  match src%d [%2d]: expected=0x%08x, got=0x%08x\n", idx, j, expected, actual);
                 }
-                mismatches++;
             }
         }
     }
 
     if (mismatches == 0) {
-        printf("[4] SUCCESS: All %d words (%d sources x %d each) match.\n", TEST_DATA_SIZE * SRCNUM, SRCNUM,
+        printf("[4] SUCCESS: All %d words (%d sources x %d each) match.\n", TEST_DATA_SIZE * SRCNUM_DUP, SRCNUM_DUP,
                TEST_DATA_SIZE);
     } else {
-        printf("[4] FAIL: %d / %d mismatches.\n", mismatches, TEST_DATA_SIZE * SRCNUM);
+        printf("[4] FAIL: %d / %d mismatches.\n", mismatches, TEST_DATA_SIZE * SRCNUM_DUP);
     }
 
     // Print first 8 words of each source for visual inspection

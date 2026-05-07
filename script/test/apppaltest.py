@@ -27,6 +27,15 @@ import threading
 import queue
 import argparse
 import glob
+import logging
+
+# Configure logging with timestamps so we can see where things get stuck
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(asctime)s %(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger("apppaltest")
 
 try:
     import pexpect
@@ -198,6 +207,7 @@ def find_elf_file(filename=None, auto_yes=False):
 
 def console_reader(child, output_queue, stop_event):
     """Thread function to continuously read console output from Connection 2."""
+    log.debug("console_reader thread started")
     buffer = ""
     while not stop_event.is_set():
         try:
@@ -210,19 +220,81 @@ def console_reader(child, output_queue, stop_event):
             # No data available, continue polling
             continue
         except pexpect.EOF:
+            log.debug("console_reader: got EOF")
             output_queue.put("[Connection 2 EOF]")
             break
         except Exception as e:
+            log.debug("console_reader: exception: %s", e)
             output_queue.put(f"[Console reader error: {e}]")
             break
-    
+
     # Put any remaining buffer content
     if buffer:
         output_queue.put(f"[Total bytes read: {len(buffer)}]")
+    log.debug("console_reader thread exiting")
+
+
+def exit_xsdb_and_power_cycle(child):
+    """Exit xsdb cleanly (stop target first) and power cycle the board (power 0 then power 1).
+
+    Used in nonreboot mode to reset the board without tearing down the systest session.
+    """
+    log.debug("exit_xsdb_and_power_cycle: draining stale output...")
+    try:
+        child.read_nonblocking(size=65536, timeout=2)
+    except pexpect.TIMEOUT:
+        pass
+
+    log.debug("exit_xsdb_and_power_cycle: sending 'stop'...")
+    child.sendline("stop")
+    try:
+        child.expect(r'xsdb%', timeout=60)
+        log.debug("exit_xsdb_and_power_cycle: 'stop' completed")
+    except pexpect.TIMEOUT:
+        log.warning("exit_xsdb_and_power_cycle: 'stop' timed out")
+        print("[Connection 1] Warning: stop command timed out, continuing cleanup...")
+
+    time.sleep(1)
+    try:
+        child.read_nonblocking(size=65536, timeout=2)
+    except pexpect.TIMEOUT:
+        pass
+
+    log.debug("exit_xsdb_and_power_cycle: sending 'exit'...")
+    child.sendline("exit")
+    time.sleep(2)
+    try:
+        child.expect([r'Systest[#>]', r'\$\s*$', r'>\s*$'], timeout=60)
+        log.debug("exit_xsdb_and_power_cycle: 'exit' completed")
+    except pexpect.TIMEOUT:
+        log.warning("exit_xsdb_and_power_cycle: 'exit' timed out")
+        print("[Connection 1] Warning: exit xsdb timed out, continuing cleanup...")
+    print("[Connection 1] Exited xsdb, power cycling board...")
+
+    log.debug("exit_xsdb_and_power_cycle: sending 'power 0'...")
+    child.sendline("power 0")
+    try:
+        child.expect(r'Systest[#>]', timeout=60)
+        log.debug("exit_xsdb_and_power_cycle: 'power 0' completed")
+    except pexpect.TIMEOUT:
+        log.warning("exit_xsdb_and_power_cycle: 'power 0' timed out")
+        print("[Connection 1] Warning: power 0 timed out")
+    print("[Connection 1] Power off complete, powering back on...")
+
+    log.debug("exit_xsdb_and_power_cycle: sending 'power 1'...")
+    child.sendline("power 1")
+    try:
+        child.expect(r'Systest[#>]', timeout=60)
+        log.debug("exit_xsdb_and_power_cycle: 'power 1' completed")
+    except pexpect.TIMEOUT:
+        log.warning("exit_xsdb_and_power_cycle: 'power 1' timed out")
+        print("[Connection 1] Warning: power 1 timed out")
+    print("[Connection 1] Power cycle complete (board cleaned up)")
 
 
 def exit_xsdb_and_poweroff(child):
     """Exit xsdb cleanly (stop target first) and power off the board."""
+    log.debug("exit_xsdb_and_poweroff: draining stale output...")
     # Drain stale output
     try:
         child.read_nonblocking(size=65536, timeout=2)
@@ -231,10 +303,13 @@ def exit_xsdb_and_poweroff(child):
 
     # Stop the running target before exiting — xsdb may refuse to exit
     # while a target is in Running state.
+    log.debug("exit_xsdb_and_poweroff: sending 'stop'...")
     child.sendline("stop")
     try:
         child.expect(r'xsdb%', timeout=60)
+        log.debug("exit_xsdb_and_poweroff: 'stop' completed")
     except pexpect.TIMEOUT:
+        log.warning("exit_xsdb_and_poweroff: 'stop' timed out")
         print("[Connection 1] Warning: stop command timed out, continuing cleanup...")
 
     # Drain any extra output (e.g. _exit.c source-not-found messages)
@@ -244,18 +319,24 @@ def exit_xsdb_and_poweroff(child):
     except pexpect.TIMEOUT:
         pass
 
+    log.debug("exit_xsdb_and_poweroff: sending 'exit'...")
     child.sendline("exit")
     time.sleep(2)
     try:
         child.expect([r'Systest[#>]', r'\$\s*$', r'>\s*$'], timeout=60)
+        log.debug("exit_xsdb_and_poweroff: 'exit' completed")
     except pexpect.TIMEOUT:
+        log.warning("exit_xsdb_and_poweroff: 'exit' timed out")
         print("[Connection 1] Warning: exit xsdb timed out, continuing cleanup...")
     print("[Connection 1] Exited xsdb, powering off...")
 
+    log.debug("exit_xsdb_and_poweroff: sending 'power 0'...")
     child.sendline("power 0")
     try:
         child.expect(r'Systest[#>]', timeout=60)
+        log.debug("exit_xsdb_and_poweroff: 'power 0' completed")
     except pexpect.TIMEOUT:
+        log.warning("exit_xsdb_and_poweroff: 'power 0' timed out")
         print("[Connection 1] Warning: power off timed out")
     print("[Connection 1] Power off complete")
 
@@ -266,6 +347,7 @@ def setup_first_connection(nonreboot=False):
     Returns the pexpect child process for further commands.
     If nonreboot is True, uses systest-client instead of systest.
     """
+    log.debug("setup_first_connection: starting (nonreboot=%s)", nonreboot)
     print(f"[Connection 1] Connecting to {host}...")
 
     # Start SSH with X forwarding
@@ -273,17 +355,22 @@ def setup_first_connection(nonreboot=False):
     child.logfile_read = sys.stdout
 
     # Wait for shell prompt
+    log.debug("setup_first_connection: waiting for shell prompt...")
     child.expect([r'\$\s*$', r'#\s*$', r'>\s*$'], timeout=60)
+    log.debug("setup_first_connection: shell prompt received")
 
     # Use systest-client in nonreboot mode so the session doesn't hold the
     # systest server lock, allowing other users/tools to connect.
     if nonreboot:
         print("[Connection 1] Connected, starting systest-client (nonreboot mode)...")
+        log.debug("setup_first_connection: sending systest-client")
         child.sendline("/opt/systest/common/bin/systest-client")
     else:
         print("[Connection 1] Connected, starting systest...")
+        log.debug("setup_first_connection: sending systest")
         child.sendline("/bin/systest")
     child.expect(r'Systest[#>]', timeout=60)
+    log.debug("setup_first_connection: systest prompt received")
     print("[Connection 1] In systest, becoming palboard...")
     
     # Step 3: Become palboard - wait for Systest# prompt after board info
@@ -366,25 +453,32 @@ def setup_second_connection():
     Second SSH connection: Connect to com0 for console output.
     Returns the pexpect child process.
     """
+    log.debug("setup_second_connection: starting")
     print(f"[Connection 2] Connecting to {host}...")
-    
+
     # Start SSH with X forwarding
     child = pexpect.spawn(f"ssh -X {host}", encoding='utf-8', timeout=60)
-    
+
     # Wait for shell prompt
+    log.debug("setup_second_connection: waiting for shell prompt...")
     child.expect([r'\$\s*$', r'#\s*$', r'>\s*$'], timeout=60)
+    log.debug("setup_second_connection: shell prompt received")
     print("[Connection 2] Connected, starting systest...")
-    
+
     # Step 2: Run systest
+    log.debug("setup_second_connection: sending systest-client")
     child.sendline("/opt/systest/common/bin/systest-client")
     child.expect(r'Systest[#>]', timeout=60)
+    log.debug("setup_second_connection: systest prompt received")
     print("[Connection 2] In systest, connecting to com0...")
-    
+
     # Step 3: Connect to com0 (no output until ELF runs on first connection)
+    log.debug("setup_second_connection: sending 'connect com0'")
     child.sendline("connect com0")
     child.expect(r'Connecting to device com0.*escape', timeout=60)
+    log.debug("setup_second_connection: com0 connected")
     print("[Connection 2] Connected to com0, listening for output...")
-    
+
     return child
 
 
@@ -394,6 +488,7 @@ def download_elf_and_continue(child, elf_path):
     Step 12: dow -force <elf_path>
     Step 13: con
     """
+    log.debug("download_elf_and_continue: starting with %s", elf_path)
     print(f"[Connection 1] Downloading ELF: {elf_path}")
 
     # Drain stale output from prior commands (e.g. "100%" left over from
@@ -403,6 +498,7 @@ def download_elf_and_continue(child, elf_path):
     except pexpect.TIMEOUT:
         pass
 
+    log.debug("download_elf_and_continue: sending 'dow -force'...")
     child.sendline(f"dow -force {elf_path}")
 
     # Wait for "Successfully downloaded" – this string is emitted only by
@@ -415,6 +511,7 @@ def download_elf_and_continue(child, elf_path):
     # check the script would retry after rst -proc, the download succeeds but
     # UART/PS peripherals are never initialized so we get zero console output
     # and waste 120 seconds waiting.
+    log.debug("download_elf_and_continue: waiting for download result...")
     index = child.expect([r'Successfully downloaded', r'PLM stalled'], timeout=120)
     if index == 1:
         # Consume remaining output up to the prompt
@@ -425,12 +522,15 @@ def download_elf_and_continue(child, elf_path):
         print("Run 'plm log' in xsdb for details.")
         return False
     child.expect(r'xsdb%', timeout=60)
+    log.debug("download_elf_and_continue: download complete")
     print("[Connection 1] ELF download complete!")
 
     # Step 13: Continue execution
     print("[Connection 1] Continuing execution...")
+    log.debug("download_elf_and_continue: sending 'con'...")
     child.sendline("con")
     child.expect(r'xsdb%', timeout=60)
+    log.debug("download_elf_and_continue: 'con' completed, execution started")
     print("[Connection 1] Execution started!")
     return True
 
@@ -529,19 +629,25 @@ Examples:
     conn1 = None
     conn2 = None
     console_thread = None
-    
+
     try:
         # Step 2-3: Setup first connection and program device
+        log.debug("main: setting up first connection...")
         print("\n>>> Setting up first connection...")
         conn1 = setup_first_connection(nonreboot=args.nonreboot)
-        
+        log.debug("main: first connection ready")
+
         # Step 4: Setup second connection for console output
+        log.debug("main: setting up second connection...")
         print("\n>>> Setting up second connection...")
         conn2 = setup_second_connection()
-        
+        log.debug("main: second connection ready")
+
         # Step 5: Download ELF file
+        log.debug("main: downloading ELF file...")
         print("\n>>> Downloading ELF file...")
         elf_ok = download_elf_and_continue(conn1, remote_elf_path)
+        log.debug("main: download_elf_and_continue returned %s", elf_ok)
 
         if not elf_ok:
             # PLM stalled — skip console wait, go straight to cleanup
@@ -550,24 +656,21 @@ Examples:
                 print("\n>>> Cleaning up Connection 1...")
                 exit_xsdb_and_poweroff(conn1)
             else:
-                print("\n>>> --nonreboot: board stays powered on for debug.")
-                print(f"    Kill this process when done: Ctrl+C or 'kill {os.getpid()}'")
-                try:
-                    while True:
-                        time.sleep(60)
-                except KeyboardInterrupt:
-                    print("\nReleasing board...")
+                print("\n>>> --nonreboot: cleaning up board (power cycle)...")
+                exit_xsdb_and_power_cycle(conn1)
             print("\n" + "=" * 60)
             print("Test FAILED (PLM stall)")
             print("=" * 60)
             sys.exit(1)
 
         # Start console reader thread after ELF is running
+        log.debug("main: starting console_reader thread...")
         console_thread = threading.Thread(
             target=console_reader,
             args=(conn2, console_output_queue, stop_console_thread)
         )
         console_thread.start()
+        log.debug("main: console_reader thread started")
 
         # Poll console output instead of fixed sleep:
         #   - Finish early when "device_teardown done" is seen (program completed)
@@ -586,12 +689,14 @@ Examples:
         last_output_time = start_time
 
         while True:
+            #print("\ndebug: polling console output queue...\n")
             elapsed = time.time() - start_time
             since_last_output = time.time() - last_output_time
 
             # Check for new output in the queue
             got_new = False
             while not console_output_queue.empty():
+                #print("\ndebug: new console output detected\n")
                 chunk = console_output_queue.get()
                 collected_output.append(chunk)
                 print(chunk, end='', flush=True)
@@ -601,29 +706,36 @@ Examples:
                 if "device_teardown done" in chunk or "Not tearing down partition" in chunk:
                     program_done = True
 
+            #print(f"\ndebug: elapsed={elapsed:.1f}s, since_last_output={since_last_output:.1f}s, "
+            #      f"output_detected={output_detected}, program_done={program_done}\n")
             if got_new:
                 last_output_time = time.time()
 
             # Exit conditions (in priority order)
             if program_done:
                 # Give a short grace period for any trailing output
+                log.debug("main: program_done detected, draining trailing output...")
                 time.sleep(2)
                 while not console_output_queue.empty():
                     chunk = console_output_queue.get()
                     collected_output.append(chunk)
                     print(chunk, end='', flush=True)
                 print(f"\n[Program completed after {elapsed:.0f}s]")
+                log.debug("main: exiting poll loop (program_done)")
                 break
 
             if elapsed >= MAX_WAIT:
+                log.debug("main: exiting poll loop (MAX_WAIT reached)")
                 print(f"\n[Max wait {MAX_WAIT}s reached]")
                 break
 
             if output_detected and since_last_output >= NO_OUTPUT_TIMEOUT:
+                log.debug("main: exiting poll loop (no new output for %ds)", NO_OUTPUT_TIMEOUT)
                 print(f"\n[No new output for {NO_OUTPUT_TIMEOUT}s — program may be hung]")
                 break
 
             if not output_detected and since_last_output >= NO_OUTPUT_TIMEOUT:
+                log.debug("main: exiting poll loop (no output ever received, %ds)", NO_OUTPUT_TIMEOUT)
                 print(f"\n[ERROR: No output received for {NO_OUTPUT_TIMEOUT}s — "
                       "UART/PS may not be initialized (PLM issue or board problem)]")
                 break
@@ -631,9 +743,15 @@ Examples:
             time.sleep(POLL_INTERVAL)
 
         # Stop console reader
+        log.debug("\nmain: signaling console_reader thread to stop...")
         stop_console_thread.set()
         if console_thread:
+            log.debug("main: joining console_reader thread (timeout=5)...")
             console_thread.join(timeout=5)
+            if console_thread.is_alive():
+                log.warning("main: console_reader thread did not stop within 5s")
+            else:
+                log.debug("main: console_reader thread joined")
 
         # Print summary
         print("\n" + "=" * 60)
@@ -645,23 +763,21 @@ Examples:
         
         # Step 6: Go back to conn1, exit xsdb and power off
         if not args.nonreboot:
+            log.debug("main: cleaning up Connection 1 (exit_xsdb_and_poweroff)...")
             print("\n>>> Cleaning up Connection 1...")
             exit_xsdb_and_poweroff(conn1)
+            log.debug("main: exit_xsdb_and_poweroff done")
         else:
-            print("\n>>> --nonreboot: board stays powered on for debug.")
-            print("    xsdb and console connections remain active.")
-            print(f"    Kill this process when done: Ctrl+C or 'kill {os.getpid()}'")
-            try:
-                while True:
-                    time.sleep(60)
-            except KeyboardInterrupt:
-                print("\nReleasing board...")
+            log.debug("main: nonreboot mode, cleaning up board (power cycle)...")
+            print("\n>>> --nonreboot: cleaning up board (power cycle)...")
+            exit_xsdb_and_power_cycle(conn1)
 
         print("\n" + "=" * 60)
         print("Test complete!")
         print("=" * 60)
-        
+
     except pexpect.TIMEOUT as e:
+        log.error("main: pexpect.TIMEOUT: %s", e)
         print(f"\nError: Command timed out - {e}")
         if conn1 and not args.nonreboot:
             try:
@@ -669,18 +785,17 @@ Examples:
             except Exception:
                 pass
         elif conn1 and args.nonreboot:
-            print(">>> --nonreboot: board stays powered on for debug.")
-            print(f"    Kill this process when done: Ctrl+C or 'kill {os.getpid()}'")
             try:
-                while True:
-                    time.sleep(60)
-            except KeyboardInterrupt:
-                print("\nReleasing board...")
+                exit_xsdb_and_power_cycle(conn1)
+            except Exception:
+                pass
         sys.exit(1)
     except pexpect.EOF as e:
+        log.error("main: pexpect.EOF: %s", e)
         print(f"\nError: Connection closed unexpectedly - {e}")
         sys.exit(1)
     except Exception as e:
+        log.error("main: exception: %s", e, exc_info=True)
         print(f"\nError: {e}")
         if conn1 and not args.nonreboot:
             try:
@@ -688,33 +803,41 @@ Examples:
             except Exception:
                 pass
         elif conn1 and args.nonreboot:
-            print(">>> --nonreboot: board stays powered on for debug.")
-            print(f"    Kill this process when done: Ctrl+C or 'kill {os.getpid()}'")
             try:
-                while True:
-                    time.sleep(60)
-            except KeyboardInterrupt:
-                print("\nReleasing board...")
+                exit_xsdb_and_power_cycle(conn1)
+            except Exception:
+                pass
         sys.exit(1)
     finally:
         # Cleanup - ensure thread is stopped and connections closed
+        log.debug("main finally: stopping console thread...")
         stop_console_thread.set()
-        
+
         if console_thread and console_thread.is_alive():
+            log.debug("main finally: joining console_reader thread (timeout=5)...")
             console_thread.join(timeout=5)
-        
+            if console_thread.is_alive():
+                log.warning("main finally: console_reader thread still alive after join!")
+            else:
+                log.debug("main finally: console_reader thread joined")
+
         if conn1:
+            log.debug("main finally: closing conn1...")
             try:
                 conn1.close()
-            except:
-                pass
-        
+                log.debug("main finally: conn1 closed")
+            except Exception as e:
+                log.debug("main finally: conn1.close() error: %s", e)
+
         if conn2:
+            log.debug("main finally: closing conn2...")
             try:
                 conn2.close()
-            except:
-                pass
-        
+                log.debug("main finally: conn2 closed")
+            except Exception as e:
+                log.debug("main finally: conn2.close() error: %s", e)
+
+        log.debug("main finally: all cleanup done")
         print("\nConnections closed.")
 
 

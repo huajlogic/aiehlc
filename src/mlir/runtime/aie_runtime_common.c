@@ -218,67 +218,102 @@ AieRC Runtime_Movedata_ManyToOne(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, i
         return XAIE_ERR;
     }
 
-    printf("  0504 Runtime_Movedata_ManyToOne: %d sources → Shim(%d,%d) S2MM ch%d\n", num_srcs, dst_tile.Col,
+    printf("  0506 Runtime_Movedata_ManyToOne: %d sources → Shim(%d,%d) S2MM ch%d\n", num_srcs, dst_tile.Col,
            dst_tile.Row, dst_ch);
 
     /* ---- 1: Configure all destination BDs (S2MM on dst_tile) ---- */
     /* Destination BDs do NOT need XAie_DmaSetOutofOrderBdId.               */
     /* The OOO BD ID is only set on the source MM2S BDs; the S2MM channel   */
     /* uses the OOO BD ID from incoming packets to select which BD to use.  */
-    std::unordered_map<int, std::vector<int>> ooo_bd_map;
+
+    /* -- Pass 1: Group sources by dst_bd, count per group, validate --     */
+    /* bd_group[bd_id] = {count, dst_len, recv_phy, dst_num_dims,           */
+    /*                    first_src_index}                                   */
+    typedef struct {
+        int count;
+        uint32_t dst_len;
+        u64 recv_phy;
+        int dst_num_dims;
+        int first_src_idx;
+    } BdGroupInfo;
+    std::unordered_map<int, BdGroupInfo> bd_groups;
+
     for (i = 0; i < num_srcs; i++) {
         MovedataSrcDesc *s = &srcs[i];
-
-        u64 dst_addr = s->recv_phy;
         uint32_t dst_len = (s->dst_len > 0) ? s->dst_len : s->data_bytes;
 
-        printf("    [dst bd%d] addr=0x%llx len=%u", s->dst_bd, (unsigned long long)dst_addr, dst_len);
-        if (s->dst_num_dims > 0)
-            printf(", dims=%d", s->dst_num_dims);
+        auto it = bd_groups.find(s->dst_bd);
+        if (it != bd_groups.end()) {
+            BdGroupInfo &g = it->second;
+            if (g.dst_len != dst_len) {
+                printf("ERROR: ManyToOne[%d]: dst_len mismatch for bd%d: existing=%u new=%u\n", i, s->dst_bd, g.dst_len,
+                       dst_len);
+                return XAIE_ERR;
+            }
+            if (g.recv_phy != s->recv_phy) {
+                printf("ERROR: ManyToOne[%d]: recv_phy mismatch for bd%d: existing=0x%llx new=0x%llx\n", i, s->dst_bd,
+                       (unsigned long long)g.recv_phy, (unsigned long long)s->recv_phy);
+                return XAIE_ERR;
+            }
+            g.count++;
+        } else {
+            BdGroupInfo g;
+            g.count = 1;
+            g.dst_len = dst_len;
+            g.recv_phy = s->recv_phy;
+            g.dst_num_dims = s->dst_num_dims;
+            g.first_src_idx = i;
+            bd_groups[s->dst_bd] = g;
+        }
+    }
+
+    /* -- Pass 2: Write each unique dst_bd exactly once --                  */
+    for (auto &kv : bd_groups) {
+        int bd_id = kv.first;
+        BdGroupInfo &g = kv.second;
+        MovedataSrcDesc *repr = &srcs[g.first_src_idx];
+
+        printf("    [dst bd%d] addr=0x%llx len=%u, srcs_sharing=%d", bd_id, (unsigned long long)g.recv_phy, g.dst_len,
+               g.count);
+        if (g.dst_num_dims > 0)
+            printf(", dims=%d", g.dst_num_dims);
         printf("\n");
 
         XAie_DmaDesc DmaInst;
         RC = XAie_DmaDescInit(DevInst, &DmaInst, dst_tile);
         if (RC != XAIE_OK) {
-            printf("ERROR: ManyToOne[%d]: dst DmaDescInit: %d\n", i, RC);
+            printf("ERROR: ManyToOne: dst DmaDescInit for bd%d: %d\n", bd_id, RC);
             return RC;
         }
 
-        if (s->dst_num_dims > 0) {
+        if (g.dst_num_dims > 0) {
             XAie_DmaTensor tensor;
-            tensor.NumDim = s->dst_num_dims;
-            tensor.Dim = s->dst_dims;
-            RC = XAie_DmaSetMultiDimAddr(&DmaInst, &tensor, dst_addr, dst_len);
+            tensor.NumDim = g.dst_num_dims;
+            tensor.Dim = repr->dst_dims;
+            RC = XAie_DmaSetMultiDimAddr(&DmaInst, &tensor, g.recv_phy, g.dst_len);
         } else {
-            RC = XAie_DmaSetAddrLen(&DmaInst, dst_addr, dst_len);
+            RC = XAie_DmaSetAddrLen(&DmaInst, g.recv_phy, g.dst_len);
         }
         if (RC != XAIE_OK) {
-            printf("ERROR: ManyToOne[%d]: dst DmaSetAddr: %d (addr=0x%llx, len=%u, num_dims=%d)\n", i, RC,
-                   (unsigned long long)dst_addr, dst_len, s->dst_num_dims);
+            printf("ERROR: ManyToOne: dst DmaSetAddr for bd%d: %d (addr=0x%llx, len=%u, num_dims=%d)\n", bd_id, RC,
+                   (unsigned long long)g.recv_phy, g.dst_len, g.dst_num_dims);
             return RC;
         }
-        auto it = ooo_bd_map.find(srcs[i].dst_bd);
-        if (it != ooo_bd_map.end()) {
-            auto vec = it->second;
-            int count = vec[0];
-            int size = vec[1];
-            if (size != dst_len) {
-                printf("ERROR: ManyToOne[%d]: dst_len mismatch for bd%d: existing=%u new=%u\n", i, s->dst_bd, size,
-                       dst_len);
-                return XAIE_ERR;
+
+        /* Iteration: StepSize in 32-bit words (byte→word: /4), Wrap = group count */
+        if (g.count > 1) {
+            RC = XAie_DmaSetBdIteration(&DmaInst, g.dst_len / 4, g.count, 0);
+            if (RC != XAIE_OK) {
+                printf("ERROR: ManyToOne: dst DmaSetBdIteration for bd%d: %d\n", bd_id, RC);
+                return RC;
             }
-            RC = XAie_DmaSetBdIteration(&DmaInst, dst_len, count + 1, 0);
-            vec[0] = count + 1;
-            ooo_bd_map[s->dst_bd] = vec;
-        } else {
-            RC = XAie_DmaSetBdIteration(&DmaInst, 1, 1, 0);
-            ooo_bd_map[s->dst_bd] = {1, dst_len};
         }
+        /* Single-source groups don't need iteration (default: no D3 wrap) */
 
         RC = XAie_DmaEnableBd(&DmaInst);
-        RC = XAie_DmaWriteBd(DevInst, &DmaInst, dst_tile, s->dst_bd);
+        RC = XAie_DmaWriteBd(DevInst, &DmaInst, dst_tile, bd_id);
         if (RC != XAIE_OK) {
-            printf("ERROR: ManyToOne[%d]: dst DmaWriteBd: %d\n", i, RC);
+            printf("ERROR: ManyToOne: dst DmaWriteBd for bd%d: %d\n", bd_id, RC);
             return RC;
         }
     }
