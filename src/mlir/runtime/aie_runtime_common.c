@@ -225,6 +225,7 @@ AieRC Runtime_Movedata_ManyToOne(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, i
     /* Destination BDs do NOT need XAie_DmaSetOutofOrderBdId.               */
     /* The OOO BD ID is only set on the source MM2S BDs; the S2MM channel   */
     /* uses the OOO BD ID from incoming packets to select which BD to use.  */
+    std::unordered_map<int, std::vector<int>> ooo_bd_map;
     for (i = 0; i < num_srcs; i++) {
         MovedataSrcDesc *s = &srcs[i];
 
@@ -256,7 +257,23 @@ AieRC Runtime_Movedata_ManyToOne(XAie_DevInst *DevInst, MovedataSrcDesc *srcs, i
                    (unsigned long long)dst_addr, dst_len, s->dst_num_dims);
             return RC;
         }
-        RC = XAie_DmaSetBdIteration(&DmaInst, 1, 1, 0);
+        auto it = ooo_bd_map.find(srcs[i].dst_bd);
+        if (it != ooo_bd_map.end()) {
+            auto vec = it->second;
+            int count = vec[0];
+            int size = vec[1];
+            if (size != dst_len) {
+                printf("ERROR: ManyToOne[%d]: dst_len mismatch for bd%d: existing=%u new=%u\n", i, s->dst_bd, size,
+                       dst_len);
+                return XAIE_ERR;
+            }
+            RC = XAie_DmaSetBdIteration(&DmaInst, dst_len, count + 1, 0);
+            vec[0] = count + 1;
+            ooo_bd_map[s->dst_bd] = vec;
+        } else {
+            RC = XAie_DmaSetBdIteration(&DmaInst, 1, 1, 0);
+            ooo_bd_map[s->dst_bd] = {1, dst_len};
+        }
 
         RC = XAie_DmaEnableBd(&DmaInst);
         RC = XAie_DmaWriteBd(DevInst, &DmaInst, dst_tile, s->dst_bd);

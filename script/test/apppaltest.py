@@ -260,23 +260,29 @@ def exit_xsdb_and_poweroff(child):
     print("[Connection 1] Power off complete")
 
 
-def setup_first_connection():
+def setup_first_connection(nonreboot=False):
     """
     First SSH connection: Setup xsdb and program device.
     Returns the pexpect child process for further commands.
+    If nonreboot is True, uses systest-client instead of systest.
     """
     print(f"[Connection 1] Connecting to {host}...")
-    
+
     # Start SSH with X forwarding
     child = pexpect.spawn(f"ssh -X {host}", encoding='utf-8', timeout=60)
     child.logfile_read = sys.stdout
-    
+
     # Wait for shell prompt
     child.expect([r'\$\s*$', r'#\s*$', r'>\s*$'], timeout=60)
-    print("[Connection 1] Connected, starting systest...")
-    
-    # Step 2: Run systest
-    child.sendline("/bin/systest")
+
+    # Use systest-client in nonreboot mode so the session doesn't hold the
+    # systest server lock, allowing other users/tools to connect.
+    if nonreboot:
+        print("[Connection 1] Connected, starting systest-client (nonreboot mode)...")
+        child.sendline("/opt/systest/common/bin/systest-client")
+    else:
+        print("[Connection 1] Connected, starting systest...")
+        child.sendline("/bin/systest")
     child.expect(r'Systest[#>]', timeout=60)
     print("[Connection 1] In systest, becoming palboard...")
     
@@ -527,7 +533,7 @@ Examples:
     try:
         # Step 2-3: Setup first connection and program device
         print("\n>>> Setting up first connection...")
-        conn1 = setup_first_connection()
+        conn1 = setup_first_connection(nonreboot=args.nonreboot)
         
         # Step 4: Setup second connection for console output
         print("\n>>> Setting up second connection...")
@@ -592,7 +598,7 @@ Examples:
                 output_detected = True
                 got_new = True
                 # Check for completion marker
-                if "device_teardown done" in chunk:
+                if "device_teardown done" in chunk or "Not tearing down partition" in chunk:
                     program_done = True
 
             if got_new:

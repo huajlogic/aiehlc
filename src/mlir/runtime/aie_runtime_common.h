@@ -7,8 +7,10 @@
 #define AIE_RUNTIME_COMMON_H
 
 #include "xaiengine.h"
+#include <iostream>
 #include <stdio.h>
-
+#include <unordered_map>
+#include <vector>
 #ifdef __cplusplus
 extern "C" {
 #endif

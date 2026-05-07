@@ -12,6 +12,7 @@
 #include "xil_cache.h"
 #include <math.h>
 #include <stdio.h>
+
 #if AIE_GEN <= 2
 #define HW_GEN XAIE_DEV_GEN_AIEML
 #include "xtime_l.h"
@@ -77,7 +78,7 @@ XAie_DevInst *getOrCreateDeviceInstance() { return g_DevInst; }
 // ---------------------------------------------------------------------------
 int test_routing_packet(XAie_DevInst *DevInst) {
     AieRC RC = XAIE_OK;
-    printf("=== test_routing_packet: tile(0,3) → Shim(3,0) ===\n");
+    printf("05/06=== test_routing_packet: tile(0,3) → Shim(3,0) ===\n");
 
     // --- Step 1: Apply the full routing configuration ---
     g_DevInst = DevInst;
@@ -371,8 +372,8 @@ int main(int argc, char *argv[]) {
     XAie_PmRequestTiles(&DevInst, NULL, 0);
 #endif
 
-    // test_routing_packet(&DevInst);
-    test_routing_packet2(&DevInst);
+    test_routing_packet(&DevInst);
+    // test_routing_packet2(&DevInst);
 
     if (0) {
         RC = XAie_PartitionTeardown(&DevInst);
