@@ -39,9 +39,9 @@
 #include <stdint.h>
 
 // Spatial policy definitions for kernel parameter transfer
-#define M 16
-#define K 16
-#define N 16
+#define M 128
+#define K 128
+#define N 128
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4
@@ -54,7 +54,7 @@
 #define COLS_PER_ROUND (TILE_COLS / 2)          // 2: B cols per DMA input round
 #define K_DIM K                                 // 16: inner product dimension
 #define BUF_SZ_OUT (ROWS_PER_ROUND * TILE_COLS) // 8: output bytes per DMA round (2 rows * 4 cols)
-#define DEBUG_OUTPUT_ORDER 1
+#define DEBUG_OUTPUT_ORDER 0
 static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C);
 static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *C);
 // ═══════════════════════════════════════════════════════════════════════════
