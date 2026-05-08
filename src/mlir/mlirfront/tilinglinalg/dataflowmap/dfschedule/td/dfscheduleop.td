@@ -165,7 +165,14 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
     // When both present and non-empty, generates XAie_DmaSetMultiDimAddr
     // When absent, generates existing XAie_DmaSetAddrLen (no behavior change)
     OptionalAttr<I32ArrayAttr>:$dim_strides,
-    OptionalAttr<I32ArrayAttr>:$dim_wraps
+    OptionalAttr<I32ArrayAttr>:$dim_wraps,
+    // OOO iteration parameters (optional).
+    // When iter_wrap > 1, the BD re-executes iter_wrap times with address
+    // advancing by iter_step_size bytes between each OOO packet arrival.
+    // Uses XAie_DmaSetBdIteration(stepSize/4, iter_wrap, 0).
+    // Emits __Runtime_dma_bd_config_multidim_ooo instead of _multidim.
+    DefaultValuedAttr<I32Attr, "0">:$iter_step_size,
+    DefaultValuedAttr<I32Attr, "0">:$iter_wrap
   );
   let results = (outs dfschedule_BdHandleType:$bd_handle);
   let hasCustomAssemblyFormat = 1;
@@ -249,7 +256,8 @@ def dfschedule_StartIoOp : dfscheduleop<"schedule.start_io"> {
   let arguments = (ins
     dfschedule_IoHandleType:$io_handle,
     I32:$bd_id,
-    I32Attr:$flow_index
+    I32Attr:$flow_index,
+    DefaultValuedAttr<I32Attr, "1">:$repeat_count
   );
   let results = (outs dfschedule_EventType:$event);
   let assemblyFormat = "`(` $io_handle `,` $bd_id `)` attr-dict `:` `(` type($io_handle) `,` type($bd_id) `)` `->` type($event)";

@@ -1033,7 +1033,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0),
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(-1), Value(),
                     rewriter.getI32IntegerAttr(-1), // out_of_order_bd_id
-                    /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+                    /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                    rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
 
                 auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
                     loc, dfschedule::IoHandleType::get(rewriter.getContext()), coreBdOp.getBdHandle(),
@@ -1044,9 +1045,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 auto getBdIdOp =
                     rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());
 
-                rewriter.create<dfschedule::StartIoOp>(loc, dfschedule::EventType::get(rewriter.getContext()),
-                                                       createIoOp.getIoHandle(), getBdIdOp.getBdId(),
-                                                       rewriter.getI32IntegerAttr(flowIndex));
+                rewriter.create<dfschedule::StartIoOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(),
+                    getBdIdOp.getBdId(), rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(1));
 
                 tileIdx++;
             }

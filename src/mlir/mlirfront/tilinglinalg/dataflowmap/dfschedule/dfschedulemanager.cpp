@@ -346,6 +346,8 @@ void dfschedule::KernelMainOp::print(::mlir::OpAsmPrinter &printer) {
     convertToI32("release_lock_val");
     convertToI32("data_id");
     convertToI32("out_of_order_bd_id");
+    convertToI32("iter_step_size");
+    convertToI32("iter_wrap");
 
     // Convert dim_strides and dim_wraps array elements from i64 to i32
     auto convertArrayToI32 = [&](StringRef attrName) {
@@ -457,6 +459,14 @@ void dfschedule::ConfigDmaBdOp::print(::mlir::OpAsmPrinter &printer) {
             printer << mlir::cast<IntegerAttr>((*wraps)[i]).getInt();
         }
         printer << "]";
+    }
+    // Print OOO iteration attributes when non-zero
+    if (getIterStepSize() != 0 || getIterWrap() != 0) {
+        printer << ",";
+        printer.printNewline();
+        printer << "iter_step_size = " << getIterStepSize() << " : i32,";
+        printer.printNewline();
+        printer << "iter_wrap = " << getIterWrap() << " : i32";
     }
     printer.decreaseIndent();
     printer.printNewline();
@@ -882,7 +892,8 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
                                                   builder.getI32IntegerAttr(-1),   // data_id
                                                   Value(),                         // linked_bd
                                                   builder.getI32IntegerAttr(-1),   // out_of_order_bd_id
-                                                  /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+                                                  /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                                                  builder.getI32IntegerAttr(0)); // iter_step_size
 
     // %io_0 = dfschedule.config.create_io(%bd_config, %shim0) {...}
     auto ioHandleType = dfschedule::IoHandleType::get(ctx);
@@ -960,13 +971,9 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
     auto bdId = builder.create<dfschedule::GetBdIdOp>(location, builder.getI32Type(), shim0.getResult());
     
     // %evnt_io = dfschedule.schedule.start_io(%io_0, %bd_id) {...}
-    auto evntIo = builder.create<dfschedule::StartIoOp>(
-        location, eventType,
-        io0.getResult(),
-        bdId.getResult(),
-        builder.getI32IntegerAttr(0)
-    );
-    
+    auto evntIo = builder.create<dfschedule::StartIoOp>(location, eventType, io0.getResult(), bdId.getResult(),
+                                                        builder.getI32IntegerAttr(0), builder.getI32IntegerAttr(1));
+
     // dfschedule.schedule.wait(%evt_io, %evt_kernel_group) : (...)
     llvm::SmallVector<Value, 2> waitEvents = {evntIo.getResult(), evtKernelGroup.getResult()};
     builder.create<dfschedule::ScheduleWaitOp>(location, waitEvents);
@@ -1149,7 +1156,8 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
                                                   builder.getI32IntegerAttr(-1), // data_id
                                                   Value(),                       // linked_bd
                                                   builder.getI32IntegerAttr(-1), // out_of_order_bd_id
-                                                  /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+                                                  /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                                                  builder.getI32IntegerAttr(0)); // iter_step_size
 
     // %bd_ping = dfschedule.config.dma_bd(%ping, %tile, %bd_id_ping) { ... }
     // DMA acquires ping_acquire_lock (lockId0) and releases ping_release_lock (lockId2)
@@ -1168,7 +1176,8 @@ void dfschedulemanager::createDSKernelReceiver(OpBuilder& builder, MLIRContext* 
                                                   builder.getI32IntegerAttr(-1), // data_id
                                                   bdPong.getBdHandle(),          // linked_bd = pong BD
                                                   builder.getI32IntegerAttr(-1), // out_of_order_bd_id
-                                                  /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+                                                  /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                                                  builder.getI32IntegerAttr(0)); // iter_step_size
     //*/
     // (locks already initialized above)
     

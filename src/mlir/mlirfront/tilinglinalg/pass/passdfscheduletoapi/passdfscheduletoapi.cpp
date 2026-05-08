@@ -1299,7 +1299,65 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         }
 
         emitc::CallOpaqueOp configCall;
-        if (useMultiDim) {
+        // Check for OOO iteration attributes
+        int32_t iterStepSize = op.getIterStepSize();
+        int32_t iterWrap = op.getIterWrap();
+        bool useOooIter = useMultiDim && iterWrap > 1;
+
+        if (useOooIter) {
+            // OOO iteration path: __Runtime_dma_bd_config_multidim_ooo
+            // Uses only D0-D2 address dims + separate iter_step_size/iter_wrap
+            int32_t strides[3] = {0, 0, 0};
+            int32_t wraps_arr[3] = {0, 0, 0};
+            int32_t numDims = (int32_t)dimStrides->size();
+            if (numDims > 3)
+                numDims = 3;
+            for (int32_t i = 0; i < numDims; i++) {
+                strides[i] = mlir::cast<IntegerAttr>((*dimStrides)[i]).getInt();
+                wraps_arr[i] = mlir::cast<IntegerAttr>((*dimWraps)[i]).getInt();
+            }
+            auto numDimsConst = rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(numDims));
+            // Create stride/wrap constants for 3 address dims
+            SmallVector<Value, 6> dimArgs;
+            for (int d = 0; d < 3; d++) {
+                dimArgs.push_back(
+                    rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(strides[d]))
+                        .getResult());
+                dimArgs.push_back(
+                    rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(wraps_arr[d]))
+                        .getResult());
+            }
+            // Iteration args
+            auto iterStepConst =
+                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(iterStepSize));
+            auto iterWrapConst = rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(iterWrap));
+
+            SmallVector<Value> allArgs = {
+                state.devInstRef,        // g_DevInst
+                tile,                    // XAie_LocType tile
+                bufferVoidPtr,           // void* buffer
+                bdId,                    // bd_id
+                lenConst.getResult(),    // len
+                nextBdConst.getResult(), // next_bd
+                rewriter.create<emitc::ConstantOp>(loc, i32Type,
+                                                   rewriter.getI32IntegerAttr(enablePacket ? 1 : 0))
+                    .getResult(),                // enable_packet
+                packetIdConst.getResult(),       // packet_id
+                acquireLockIdConst.getResult(),  // acquire_lock_id
+                acquireLockValConst.getResult(), // acquire_lock_val
+                releaseLockIdConst.getResult(),  // release_lock_id
+                releaseLockValConst.getResult(), // release_lock_val
+                oooIdConst.getResult(),          // out_of_order_bd_id
+                numDimsConst.getResult(),        // num_dims
+            };
+            allArgs.append(dimArgs.begin(), dimArgs.end()); // stride0,wrap0,...,stride2,wrap2
+            allArgs.push_back(iterStepConst.getResult());   // iter_step_size
+            allArgs.push_back(iterWrapConst.getResult());   // iter_wrap
+            configCall = rewriter.create<emitc::CallOpaqueOp>(loc, dmaDescType, "__Runtime_dma_bd_config_multidim_ooo",
+                                                              nullptr, nullptr, allArgs);
+            llvm::errs() << "  ✓ Created DMA BD config with multi-dim OOO iteration (num_dims=" << numDims
+                         << " iter_step=" << iterStepSize << " iter_wrap=" << iterWrap << ")\n";
+        } else if (useMultiDim) {
             // Extract stride/wrap values (up to 4 dims, pad with 0)
             int32_t strides[4] = {0, 0, 0, 0};
             int32_t wraps[4] = {0, 0, 0, 0};
@@ -1682,7 +1740,7 @@ struct ConfigCreateIoInnerPattern : public OpConversionPattern<dfschedule::Confi
 
 /// OpConversionPattern for dfschedule.schedule.start_io
 /// Converts StartIo to __Runtime_startio call that returns an ioevent
-/// struct ioevent = __Runtime_startio(io, timer_value);
+/// struct ioevent = __Runtime_startio(io, bd_id, repeat);
 struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
     ConversionState &state;
     
@@ -1697,32 +1755,28 @@ struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
         
         // Get operands
         Value ioHandle = adaptor.getIoHandle();  // This should be the "struct io" from config.create_io
-        Value bdId = adaptor.getBdId();          // BD ID (though not used in __Runtime_startio signature shown)
-        // Note: flow_index is available via op.getFlowIndex() but unused in __Runtime_startio currently
-        
+        Value bdId = adaptor.getBdId();          // BD ID
+
         llvm::errs() << "  IO Handle type: " << ioHandle.getType() << "\n";
         llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";
 
         // Define the ioevent type (ioevent from aie_runtime.h)
         auto ioEventType = emitc::OpaqueType::get(rewriter.getContext(), "ioevent");
 
-        //rewriter.eraseOp(op);
-        //return success();
+        // Get repeat count from the op attribute (default 1)
+        uint32_t repeatCount = op.getRepeatCount();
+        auto repeatConst =
+            rewriter.create<emitc::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(repeatCount));
+
         // Create __Runtime_startio call:
-        // struct ioevent = __Runtime_startio(io, timer_or_data_value);
-        // According to the example: __Runtime_startio(io, v4)
-        // The second parameter seems to be some value (maybe from partition or timer)
-        auto startIoCall = rewriter.create<emitc::CallOpaqueOp>(
-            loc,
-            ioEventType,
-            "__Runtime_startio",
-            nullptr,
-            nullptr,
-            ValueRange{
-                ioHandle,  // struct io
-                bdId       // Using bdId as the second parameter (v4 in example)
-            });
-        
+        // struct ioevent = __Runtime_startio(io, bd_id, repeat);
+        auto startIoCall = rewriter.create<emitc::CallOpaqueOp>(loc, ioEventType, "__Runtime_startio", nullptr, nullptr,
+                                                                ValueRange{
+                                                                    ioHandle,               // struct io
+                                                                    bdId,                   // bd_id
+                                                                    repeatConst.getResult() // repeat count
+                                                                });
+
         llvm::errs() << "  ✓ Created __Runtime_startio call\n";
         
         // Replace the op with the ioevent

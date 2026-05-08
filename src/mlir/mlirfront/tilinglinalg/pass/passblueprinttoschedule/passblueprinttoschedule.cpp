@@ -23,7 +23,6 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <unordered_map>
@@ -34,17 +33,6 @@ using namespace dfscheblueprint;
 using namespace dfschedule;
 
 namespace {
-
-// Check DISABLEOOO environment variable. When true, disables OOO BD dispatch
-// and falls back to single sequential 3D BD with DROP_HEADER routing.
-static bool isOOODisabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = std::getenv("DISABLEOOO");
-        cached = (env && (std::string(env) == "true" || std::string(env) == "1")) ? 1 : 0;
-    }
-    return cached == 1;
-}
 
 // Trace a Value back through the SSA chain to find the originating function
 // argument index.  This walks through bufferization.to_tensor,
@@ -731,20 +719,47 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         auto shimDimWraps = shimFlowConfig.getShimDimWrapsAttr();
 
         // === Output gather (many_to_one) handling ===
-        // Controlled by DISABLEOOO env var:
-        //   DISABLEOOO=false (default): OOO path — per-tile shim BDs with packet
-        //     headers preserved (routing uses DONOT_DROP_HEADER), shim S2MM channel
-        //     enables OOO mode for non-deterministic tile arrival order.
-        //   DISABLEOOO=true: Non-OOO path — single sequential 3D BD with
-        //     DROP_HEADER at PKT→CCT transition (original behavior).
+        // OOO path — per-tile shim BDs with packet headers preserved
+        // (routing uses DONOT_DROP_HEADER), shim S2MM channel enables OOO
+        // mode for non-deterministic tile arrival order.
         bool isManyToOne = (transferType == "many_to_one");
-        bool useOOO = isManyToOne && !isOOODisabled();
+        bool useOOO = isManyToOne;
 
         // Collect shim BD IDs allocated for each tile (used by core MM2S BDs
         // to set out_of_order_bd_id pointing to the correct shim BD).
         SmallVector<int32_t> shimPerTileBdIds;
 
         Value lastShimBdHandle; // The BD handle consumed by ConfigCreateIoOp
+
+        // --- Compute per-round parameters for OOO iteration ---
+        // These values are identical for all tiles in this flow.
+        int64_t ooElementSizeBytes = 1;
+        if (memrefType.getElementType().isIntOrFloat())
+            ooElementSizeBytes = memrefType.getElementTypeBitWidth() / 8;
+        if (ooElementSizeBytes == 0)
+            ooElementSizeBytes = 1;
+
+        int64_t ooFullPartitionElements = shimBdLen / ooElementSizeBytes;
+        int64_t ooPerCoreElements = ooFullPartitionElements;
+        if (isManyToOne)
+            ooPerCoreElements = ooFullPartitionElements / numCoreTiles;
+
+        int64_t ooPingPongSize = static_cast<int64_t>(ooPerCoreElements * bufferRatio);
+        if (ooPingPongSize <= 0)
+            ooPingPongSize = 1;
+        if (maxPingPongBytes > 0 && ooElementSizeBytes > 0) {
+            int64_t maxElements = maxPingPongBytes / ooElementSizeBytes;
+            if (maxElements > 0 && ooPingPongSize > maxElements)
+                ooPingPongSize = maxElements;
+        }
+        // perCoreElements must be evenly divisible by ooPingPongSize
+        if (ooPerCoreElements % ooPingPongSize != 0) {
+            op.emitError("OOO iteration: perCoreElements (")
+                << ooPerCoreElements << ") not divisible by pingPongSize (" << ooPingPongSize << ")";
+            return failure();
+        }
+        int64_t ooNumIterations = ooPerCoreElements / ooPingPongSize;
+        int64_t perRoundBytes = ooPingPongSize * ooElementSizeBytes;
 
         if (useOOO && numCoreTiles > 1) {
             // --- OOO path: N per-tile shim BDs ---
@@ -767,36 +782,40 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 perTileStrideFromDims = cast<IntegerAttr>(shimDimStrides[2]).getInt();
             }
 
-            // In OOO packet mode, each shim BD receives the TOTAL per-tile
-            // data (perTileDdrBytes) across multiple packets (ping + pong).
-            // The BD len = perTileDdrBytes. The OOO dispatch ensures each
-            // BD is only triggered by packets with the matching ooo_bd_id.
-            // TLAST between packets does NOT truncate the BD in OOO mode;
-            // the BD continues accumulating data until len is fully consumed.
-            //
-            // No iteration dimension is needed — the BD handles all data
-            // in one shot using D0+D1 multidim addressing.
-            int64_t shimNumIterations = 1;
+            // OOO iteration parameters:
+            // iter_step_size = rows_per_round * DDR_row_stride — the DDR byte
+            //   distance from the start of round N to round N+1 for the same tile.
+            // iter_wrap = ooNumIterations (number of ping/pong rounds per tile).
+            int64_t ddrRowStride = 0;
+            int64_t perTileD1Rows = 0;
+            if (shimDimStrides && shimDimStrides.size() >= 2) {
+                ddrRowStride = cast<IntegerAttr>(shimDimStrides[1]).getInt();
+            }
+            if (shimDimWraps && shimDimWraps.size() >= 2) {
+                // D1 wrap = full partition rows. Tiles split along D2 (columns),
+                // NOT D1 (rows) — each tile writes the same number of rows as
+                // the full partition.
+                perTileD1Rows = cast<IntegerAttr>(shimDimWraps[1]).getInt();
+            }
+            int64_t rowsPerRound = (ooNumIterations > 1) ? perTileD1Rows / ooNumIterations : perTileD1Rows;
 
-            // Build per-tile addressing from shimDimStrides D0 and D1.
-            // Use original D1 wrap (total rows per tile, not halved).
+            int32_t oooIterStepSize = (int32_t)(rowsPerRound * ddrRowStride);
+            int32_t oooIterWrap = (int32_t)ooNumIterations;
+
+            // Build per-tile addressing from shimDimStrides D0 and D1 only.
+            // D1 wrap is adjusted to rows_per_round (per-round scope, not full partition).
             ArrayAttr perTileDimStrides = nullptr;
             ArrayAttr perTileDimWraps = nullptr;
             if (shimDimStrides && shimDimWraps && shimDimStrides.size() >= 2) {
-                SmallVector<Attribute> strides4d, wraps4d;
-                // D0 and D1: intra-tile-row and DDR-row addressing (unchanged)
-                strides4d.push_back(shimDimStrides[0]); // D0 stride
-                wraps4d.push_back(shimDimWraps[0]);     // D0 wrap
-                strides4d.push_back(shimDimStrides[1]); // D1 stride
-                wraps4d.push_back(shimDimWraps[1]);     // D1 wrap (full, not halved)
-                // D2: unused address dimension (stride=4 bytes = 1 word, wrap=0 = no-op)
-                strides4d.push_back(rewriter.getI32IntegerAttr(4));
-                wraps4d.push_back(rewriter.getI32IntegerAttr(0));
-                // D3 (iteration): wrap=1 (single iteration, no repeat)
-                strides4d.push_back(rewriter.getI32IntegerAttr(4));
-                wraps4d.push_back(rewriter.getI32IntegerAttr(shimNumIterations));
-                perTileDimStrides = rewriter.getArrayAttr(strides4d);
-                perTileDimWraps = rewriter.getArrayAttr(wraps4d);
+                SmallVector<Attribute> strides2d, wraps2d;
+                // D0: intra-tile-row addressing (unchanged)
+                strides2d.push_back(shimDimStrides[0]);
+                wraps2d.push_back(shimDimWraps[0]);
+                // D1: DDR-row addressing — use rows_per_round, NOT full partition rows
+                strides2d.push_back(shimDimStrides[1]);
+                wraps2d.push_back(rewriter.getI32IntegerAttr(rowsPerRound));
+                perTileDimStrides = rewriter.getArrayAttr(strides2d);
+                perTileDimWraps = rewriter.getArrayAttr(wraps2d);
             }
 
             // Allocate N shim BD IDs
@@ -816,11 +835,11 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
 
             // Create N shim BDs in reverse order (last first, so each can reference previous via SSA).
             // In OOO mode each BD is independently dispatched by the packet switch based on
-            // packet_id matching. Each BD self-chains (next_bd = self) so it re-enters the
-            // pool after handling a packet.
+            // packet_id matching. next_bd = -1 (disabled) — iteration handles re-execution
+            // across ping-pong rounds; self-chaining would restart from the beginning.
             SmallVector<Value> shimBdHandles(numCoreTiles);
             for (int64_t t = numCoreTiles - 1; t >= 0; t--) {
-                int32_t nextBdId = shimBdIds[t]; // self-chain: BD reuses itself after each packet
+                int32_t nextBdId = -1; // no chaining — iteration handles re-execution
                 int32_t thisBdId = shimBdIds[t];
                 // Per-tile DDR offset: use D2 stride from shimDimStrides for correct
                 // GEMM output tile column placement in DDR.
@@ -840,15 +859,15 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 // xaie_conv2d_2core_dataflow_test.c — shim S2MM BD has no XAie_DmaSetPkt.)
                 auto shimBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
                     loc, dfschedule::BdHandleType::get(rewriter.getContext()),
-                    ddrBuffer,                                   // DDR buffer
-                    shimTileOp.getTile(),                        // tile
-                    shimBdIdC.getResult(),                       // bd_id
-                    rewriter.getI32IntegerAttr(ddrOffset),       // offset (per-tile DDR position using D2 stride)
-                    rewriter.getI32IntegerAttr(perTileDdrBytes), // len (per-tile)
-                    rewriter.getBoolAttr(false),                 // enable_packet = false (OOO dispatch handles packets)
+                    ddrBuffer,                                 // DDR buffer
+                    shimTileOp.getTile(),                      // tile
+                    shimBdIdC.getResult(),                     // bd_id
+                    rewriter.getI32IntegerAttr(ddrOffset),     // offset (per-tile DDR position using D2 stride)
+                    rewriter.getI32IntegerAttr(perRoundBytes), // len (per-round, matches src BD)
+                    rewriter.getBoolAttr(false),               // enable_packet = false (OOO dispatch handles packets)
                     rewriter.getI32IntegerAttr(
                         basePacketId + (int32_t)t), // packet_id (kept for debug/comments, ignored when PktEn=false)
-                    rewriter.getI32IntegerAttr(nextBdId), // next_bd = self (OOO: self-chain for reuse)
+                    rewriter.getI32IntegerAttr(nextBdId), // next_bd = -1 (disabled — iteration handles rounds)
                     rewriter.getI32IntegerAttr(-1), // acquire_lock_id = -1 → no lock (OOO flow control via packets)
                     rewriter.getI32IntegerAttr(0),  // acquire_lock_val (ignored)
                     rewriter.getI32IntegerAttr(-1), // release_lock_id = -1 → no lock
@@ -856,13 +875,16 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     rewriter.getI32IntegerAttr(dataId), // data_id
                     linkedBd,                           // linked_bd
                     rewriter.getI32IntegerAttr(-1),     // out_of_order_bd_id (N/A for shim)
-                    /*dim_strides=*/perTileDimStrides, /*dim_wraps=*/perTileDimWraps);
+                    /*dim_strides=*/perTileDimStrides, /*dim_wraps=*/perTileDimWraps,
+                    rewriter.getI32IntegerAttr(oooIterStepSize), // iter_step_size
+                    rewriter.getI32IntegerAttr(oooIterWrap));    // iter_wrap
 
                 shimBdHandles[t] = shimBd.getBdHandle();
 
                 llvm::errs() << "[OOO ShimBD] tile " << t << " bd_id=" << thisBdId << " pkt_id=" << (basePacketId + t)
-                             << " ddr_offset=" << ddrOffset << " len=" << perTileDdrBytes << " next_bd=" << nextBdId
-                             << " iter_wrap=" << shimNumIterations << "\n";
+                             << " ddr_offset=" << ddrOffset << " len=" << perRoundBytes << " next_bd=" << nextBdId
+                             << " iter_step=" << oooIterStepSize << " iter_wrap=" << oooIterWrap
+                             << " d1_wrap=" << rowsPerRound << "\n";
             }
             // Last BD in SSA chain (BD[0]) is consumed by create_io
             lastShimBdHandle = shimBdHandles[0];
@@ -885,7 +907,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 rewriter.getI32IntegerAttr(dataId),         // data_id
                 Value(),                                    // linked_bd = none
                 rewriter.getI32IntegerAttr(-1),             // out_of_order_bd_id
-                /*dim_strides=*/shimDimStrides, /*dim_wraps=*/shimDimWraps);
+                /*dim_strides=*/shimDimStrides, /*dim_wraps=*/shimDimWraps,
+                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
 
             lastShimBdHandle = shimBdOp.getBdHandle();
             // For single-BD path with OOO (single tile many_to_one), still record
@@ -1239,7 +1262,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             rewriter.getI32IntegerAttr(-1),              // data_id
                             Value(),                                     // linked_bd = none
                             rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
-                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                            rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
 
                         // Ping BD second (linked_bd = pong handle): next_bd -> pong
                         auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
@@ -1259,7 +1283,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             rewriter.getI32IntegerAttr(-1),              // data_id
                             pongBdOp.getBdHandle(),                      // linked_bd = pong BD
                             rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
-                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                            rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
 
                         // Create IO handle for core tile
                         auto coreCreateIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
@@ -1322,9 +1347,11 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
 
             // Create dfschedule.schedule.start_io for shim
+            // For OOO, repeat = numCoreTiles * numPingPong (total source transactions)
+            int32_t repeatCount = useOOO ? (int32_t)(numCoreTiles * 2) : 1;
             auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
                 loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(), getBdIdOp.getBdId(),
-                rewriter.getI32IntegerAttr(flowIndex));
+                rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(repeatCount));
 
             // Create dfschedule.config.load_kernel_group with distributed_args pointing to kernel configs
             auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
@@ -1344,7 +1371,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             for (auto &deferred : deferredCoreStartIos) {
                 auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
                     loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
-                    rewriter.getI32IntegerAttr(deferred.flowIdx));
+                    rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(1));
                 coreStartIoEvents.push_back(coreStartIo.getEvent());
         }
 

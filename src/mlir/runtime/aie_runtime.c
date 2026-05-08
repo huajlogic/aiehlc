@@ -37,7 +37,7 @@ XAie_RoutingInstance *g_RoutingInst = NULL;
 //   Verbosity 2: core DMA address log + write pattern + readback logic
 //   Flag bit 4 (value 16): AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA
 //   Flag bit 5 (value 32): AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN
-//   Flag bit 6 (value 64): AIE_DEBUG_FLAG_MM2SBDFINISH
+//   Flag bit 6 (value 64): AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER
 // Weak symbol: user source can override via #pragma aie_debug_level N
 __attribute__((weak)) int g_runtime_debug_level = 0;
 
@@ -309,7 +309,7 @@ AieRC __Runtime_device_init(void) {
     else
         printf("[aie_runtime] device_init partition/pm failed: %d\n", (int)RC);
 
-    if (RC == XAIE_OK && AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_MM2SBDFINISH)) {
+    if (RC == XAIE_OK && AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER)) {
         __Runtime_perfcnt_setup_mm2s_bd_finished_partition(g_DevInst, 0, XAIE_NUM_COLS - 1, XAIE_AIE_TILE_ROW_START,
                                                            XAIE_AIE_TILE_ROW_START + XAIE_AIE_TILE_NUM_ROWS - 1);
     }
@@ -546,6 +546,111 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
 }
 
 /**
+ * Configure DMA buffer descriptor with multi-dimensional addressing (D0-D2)
+ * plus a separate iteration dimension for out-of-order packet reception.
+ * The iteration dimension (via XAie_DmaSetBdIteration) causes the BD to
+ * re-execute iter_wrap times with the base address advancing by
+ * iter_step_size bytes between each OOO packet arrival.
+ * @param len            Transfer length in bytes per iteration.
+ * @param num_dims       Number of address dimensions (max 3, D0-D2).
+ * @param iter_step_size Iteration step size in bytes (÷4 for 32-bit words).
+ * @param iter_wrap      Number of times the BD re-executes (OOO packets).
+ */
+XAie_DmaDesc __Runtime_dma_bd_config_multidim_ooo(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
+                                                  int32_t len, int32_t next_bd, int32_t enable_packet,
+                                                  int32_t packet_id, int32_t acquire_lock_id, int32_t acquire_lock_val,
+                                                  int32_t release_lock_id, int32_t release_lock_val,
+                                                  int32_t out_of_order_bd_id, int32_t num_dims, int32_t dim_stride0,
+                                                  int32_t dim_wrap0, int32_t dim_stride1, int32_t dim_wrap1,
+                                                  int32_t dim_stride2, int32_t dim_wrap2, int32_t iter_step_size,
+                                                  int32_t iter_wrap) {
+
+    XAie_DmaDesc DmaInst;
+    XAie_DmaDescInit(dev, &DmaInst, tile);
+    uint8_t tile_type = XAie_GetTileTypefromLoc(dev, tile);
+    uint64_t dma_addr = (uint64_t)(uintptr_t)buffer;
+
+    /* Build address dimension descriptors (D0-D2 only, max 3) */
+    int32_t strides[3] = {dim_stride0, dim_stride1, dim_stride2};
+    int32_t wraps[3] = {dim_wrap0, dim_wrap1, dim_wrap2};
+    if (num_dims > 3)
+        num_dims = 3;
+
+    XAie_DmaDimDesc dimDescs[3];
+    for (int i = 0; i < num_dims; i++) {
+        /* IR strides are in byte units; XAie expects 32-bit word units (÷4) */
+        if (strides[i] % 4 != 0) {
+            printf("[aie_runtime] ERROR: dim_stride[%d]=%d not divisible by 4 "
+                   "(must be 32-bit aligned)\n",
+                   i, strides[i]);
+        }
+        dimDescs[i].AieMlDimDesc.StepSize = (uint32_t)(strides[i] / 4);
+        dimDescs[i].AieMlDimDesc.Wrap = (uint16_t)wraps[i];
+    }
+    XAie_DmaTensor tensor;
+    tensor.NumDim = (uint8_t)num_dims;
+    tensor.Dim = dimDescs;
+    XAie_DmaSetMultiDimAddr(&DmaInst, &tensor, dma_addr, (uint32_t)len);
+
+    /* Iteration dimension: BD re-executes iter_wrap times with address
+     * advancing by iter_step_size bytes between each OOO packet trigger. */
+    if (iter_wrap > 1) {
+        int32_t iterStepWords = iter_step_size / 4;
+        XAie_DmaSetBdIteration(&DmaInst, iterStepWords, iter_wrap, 0);
+        printf("[aie_runtime] bd_config_multidim_ooo: iteration step=%d words (%d bytes) wrap=%d\n", iterStepWords,
+               iter_step_size, iter_wrap);
+    }
+
+    if (acquire_lock_id >= 0 && release_lock_id >= 0) {
+        XAie_DmaSetLock(&DmaInst, XAie_LockInit(acquire_lock_id, acquire_lock_val),
+                        XAie_LockInit(release_lock_id, release_lock_val));
+    }
+
+    if (next_bd >= 0) {
+        XAie_DmaSetNextBd(&DmaInst, (uint8_t)next_bd, XAIE_ENABLE);
+    }
+
+    if (enable_packet) {
+        XAie_DmaSetPkt(&DmaInst, XAie_PacketInit(packet_id, 0));
+    }
+
+    if (out_of_order_bd_id >= 0) {
+        XAie_DmaSetOutofOrderBdId(&DmaInst, (uint8_t)out_of_order_bd_id);
+        printf("[aie_runtime] bd_config_multidim_ooo: set out_of_order_bd_id=%d\n", out_of_order_bd_id);
+    }
+
+    XAie_DmaEnableBd(&DmaInst);
+    AieRC bd_rc = XAie_DmaWriteBd(dev, &DmaInst, tile, (uint8_t)bd_id);
+    printf("[aie_runtime] bd_config_multidim_ooo tile(%u,%u) bd=%d addr=0x%lx len=%d next=%d "
+           "lock_acq=%d/%d lock_rel=%d/%d pkt=%d/%d ooo_bd=%d num_dims=%d "
+           "iter_step=%d iter_wrap=%d rc=%d\n",
+           (unsigned)tile.Col, (unsigned)tile.Row, bd_id, (unsigned long)dma_addr, len, next_bd, acquire_lock_id,
+           acquire_lock_val, release_lock_id, release_lock_val, enable_packet, packet_id, out_of_order_bd_id, num_dims,
+           iter_step_size, iter_wrap, (int)bd_rc);
+    for (int i = 0; i < num_dims; i++) {
+        printf("[aie_runtime]   dim[%d] stride=%d wrap=%d\n", i, strides[i], wraps[i]);
+    }
+
+    /* Track this BD for debug dump */
+    if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1 && g_bd_track_count < BD_TRACK_MAX) {
+        BdTrackEntry *e = &g_bd_track[g_bd_track_count++];
+        e->col = tile.Col;
+        e->row = tile.Row;
+        e->bd_id = (uint8_t)bd_id;
+        e->tile_type = tile_type;
+        e->buffer = __bd_is_shim(tile_type) ? buffer : NULL;
+        e->dma_addr = dma_addr;
+        e->len = len;
+        e->packet_id = packet_id;
+        e->direction = -1;
+        e->channel_id = -1;
+        e->next_bd = (int8_t)next_bd;
+    }
+
+    return DmaInst;
+}
+
+/**
  * Create I/O channel for DMA
  */
 struct_io __Runtime_dma_createio(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, int32_t channel_id, int32_t bd_id,
@@ -585,14 +690,14 @@ void __Runtime_dma_channel_enable_ooo(XAie_DevInst *dev, XAie_LocType tile, int3
  * Start I/O operation (triggers DMA)
  * Reference: aieml_perf.cc lines 173-174 (XAie_MoveDataExternal2Aie)
  */
-struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id) {
+struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id, int32_t repeat) {
     struct_ioevent evt;
     evt.io = io;
     evt.timeout_us = 10000;
 
     const char *dir_str = (io.direction == DMA_MM2S) ? "MM2S" : "S2MM";
-    printf("[aie_runtime] startio tile(%u,%u) ch=%u dir=%s bd=%u\n", (unsigned)io.tile_loc.Col,
-           (unsigned)io.tile_loc.Row, (unsigned)io.channel_id, dir_str, (unsigned)io.bd_id);
+    printf("[aie_runtime] startio tile(%u,%u) ch=%u dir=%s bd=%u repeat=%d\n", (unsigned)io.tile_loc.Col,
+           (unsigned)io.tile_loc.Row, (unsigned)io.channel_id, dir_str, (unsigned)io.bd_id, (int)repeat);
 
     /* Update BD tracking entries with direction/channel from this startio.
      * Match by tile (col,row) and bd_id, then follow next_bd chains. */
@@ -620,8 +725,8 @@ struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id) {
         }
     }
 
-    AieRC rc =
-        XAie_DmaChannelSetStartQueue(g_DevInst, io.tile_loc, io.channel_id, io.direction, io.bd_id, 1, XAIE_DISABLE);
+    AieRC rc = XAie_DmaChannelSetStartQueue(g_DevInst, io.tile_loc, io.channel_id, io.direction, io.bd_id, repeat,
+                                            XAIE_DISABLE);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] startio FAILED rc=%d tile(%u,%u) ch=%u dir=%s bd=%u\n", (int)rc,
                (unsigned)io.tile_loc.Col, (unsigned)io.tile_loc.Row, (unsigned)io.channel_id, dir_str,
@@ -629,6 +734,15 @@ struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id) {
     }
 
     return evt;
+}
+
+/**
+ * Syntax sugar for OOO startio — wraps __Runtime_startio with all OOO params.
+ * Enables OOO on the channel, then starts with given repeat count.
+ */
+struct_ioevent _Runtime_startio_ooo(struct_io io, int32_t bd_id, int32_t repeat) {
+    __Runtime_dma_channel_enable_ooo(g_DevInst, io.tile_loc, io.channel_id, io.direction);
+    return __Runtime_startio(io, bd_id, repeat);
 }
 
 /**

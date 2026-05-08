@@ -5,21 +5,7 @@
 
 #include "routinglower.h"
 #include "routing/routingpath.h"
-#include <cstdlib>
 #include <sstream>
-
-namespace {
-// Check DISABLEOOO environment variable. When false (default), output flows
-// preserve packet headers so shim S2MM can do OOO BD dispatch.
-static bool isOOODisabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = std::getenv("DISABLEOOO");
-        cached = (env && (std::string(env) == "true" || std::string(env) == "1")) ? 1 : 0;
-    }
-    return cached == 1;
-}
-} // namespace
 
 int ioIdx = 0;
 //connectpktstreamswitchport
@@ -161,7 +147,7 @@ struct StreamPKTConnection {
         std::cout << "  - MasterSendToNextTileDirectionPortIdx: " << (int)(value.MasterSendToNextTileDirectionPortIdx) << std::endl;
 
         // For output gather flows, preserve headers when OOO is enabled
-        bool preserveHdr = !isOOODisabled();
+        bool preserveHdr = true;
         rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
             op->getLoc(), // Operation location
             output,
@@ -351,7 +337,7 @@ void ParseTheCCTRoutingPath(Operation* op,
                 auto output = rewriter.getI32Type();
                 auto tileOp = dyn_cast<routinghw::TileCreate>((Operation* )lastPkttilemap->tileOp);
                 // Transition op: preserve headers when OOO is enabled
-                bool preserveHdrTransition = !isOOODisabled();
+                bool preserveHdrTransition = true;
                 ///*
                 rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
                     loc, // Operation location

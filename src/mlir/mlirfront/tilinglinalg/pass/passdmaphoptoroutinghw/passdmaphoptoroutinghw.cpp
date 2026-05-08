@@ -17,7 +17,6 @@
 #include "routingmanager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include <cstdlib>
 #include <iostream>
 #include <set>
 #include <sstream>
@@ -30,17 +29,6 @@ using namespace dmaphop;
 using namespace routinghw;
 
 namespace {
-
-// Check DISABLEOOO environment variable. When false (default), output flows
-// preserve packet headers so shim S2MM can do OOO BD dispatch.
-static bool isOOODisabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = std::getenv("DISABLEOOO");
-        cached = (env && (std::string(env) == "true" || std::string(env) == "1")) ? 1 : 0;
-    }
-    return cached == 1;
-}
 
 int ioIdx = 0;
 
@@ -300,7 +288,7 @@ std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
 
         // For output gather flows, preserve packet headers when OOO is enabled
         // so shim S2MM DMA can do OOO BD dispatch based on packet_id.
-        bool preserveHdr = !isOOODisabled();
+        bool preserveHdr = true;
         rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
             op->getLoc(), // Operation location
             output,
@@ -591,7 +579,7 @@ void ParseTheCCTRoutingPath(Operation *op, std::optional<TileListPktRoutingNode>
                 // Transition op at PKT→CCT merge point. When OOO is enabled,
                 // preserve headers so shim S2MM DMA can read packet_id for
                 // OOO BD dispatch.
-                bool preserveHdrTransition = !isOOODisabled();
+                bool preserveHdrTransition = true;
                 rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
                     loc, // Operation location
                     output,

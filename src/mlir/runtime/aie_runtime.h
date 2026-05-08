@@ -47,7 +47,7 @@ extern XAie_RoutingInstance *g_RoutingInst;
 #define AIE_DEBUG_LEVEL(v) ((v) & 0xF)
 #define AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA (1 << 4)
 #define AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN (1 << 5)
-#define AIE_DEBUG_FLAG_MM2SBDFINISH (1 << 6)
+#define AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER (1 << 6)
 #define AIE_DEBUG_HAS_FLAG(v, flag) (((v) & (flag)) != 0)
 extern int g_runtime_debug_level;
 
@@ -243,6 +243,19 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
                                               int32_t dim_stride2, int32_t dim_wrap2, int32_t dim_stride3,
                                               int32_t dim_wrap3);
 
+// Multi-dimensional BD with OOO iteration support.
+// Configures D0-D2 address dimensions plus a separate iteration dimension
+// for out-of-order packet reception where the BD re-executes iter_wrap times
+// with address advancing by iter_step_size bytes between each OOO packet.
+XAie_DmaDesc __Runtime_dma_bd_config_multidim_ooo(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id,
+                                                  int32_t len, int32_t next_bd, int32_t enable_packet,
+                                                  int32_t packet_id, int32_t acquire_lock_id, int32_t acquire_lock_val,
+                                                  int32_t release_lock_id, int32_t release_lock_val,
+                                                  int32_t out_of_order_bd_id, int32_t num_dims, int32_t dim_stride0,
+                                                  int32_t dim_wrap0, int32_t dim_stride1, int32_t dim_wrap1,
+                                                  int32_t dim_stride2, int32_t dim_wrap2, int32_t iter_step_size,
+                                                  int32_t iter_wrap);
+
 // Enable out-of-order BD execution on a DMA channel.
 // When enabled, the DMA engine selects BDs based on the out_of_order_bd_id
 // field in incoming packet headers, bypassing normal sequential BD chaining.
@@ -255,7 +268,8 @@ struct_io __Runtime_dma_createio(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, i
 struct_io __Runtime_dma_createio_4(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, int32_t channel_id, int32_t bd_id,
                                    XAie_DmaDirection direction);
 
-struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id);
+struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id, int32_t repeat);
+struct_ioevent _Runtime_startio_ooo(struct_io io, int32_t bd_id, int32_t repeat);
 
 // Kernel management
 struct_kernel_group __Runtime_load_kernel_group(XAie_LocType *tiles, int32_t num_tiles, unsigned char **elf_buffers);
