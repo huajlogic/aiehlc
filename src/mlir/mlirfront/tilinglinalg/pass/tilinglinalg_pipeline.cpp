@@ -398,8 +398,15 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "  Pattern pattern      = Pattern::Broadcast;\n";
             stream << "  Layout  distribution = Layout::Row;\n";
             stream << "  Flow    merge_order  = Flow::Default;\n";
-            stream << "  int     ping_pong    = 2;\n";
+            stream << "  int     pp_depth     = 2;\n";
+            stream << "  int     max_buffer_bytes = 4096;\n";
             stream << "};\n";
+            stream << "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
+            stream << "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
+            stream << "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
+            stream << "constexpr int get_tile_rows() { return 0; }\n";
+            stream << "constexpr int get_tile_cols() { return 0; }\n";
+            stream << "constexpr int get_k_dim() { return 0; }\n";
             stream << "}\n";
             stream << "struct aieDim { int rows, cols; aieDim(int r, int c) : rows(r), cols(c) {} };\n";
             stream << "inline void aieSetDevice(int) {}\n";

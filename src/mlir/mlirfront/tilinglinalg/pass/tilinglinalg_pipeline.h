@@ -20,10 +20,11 @@ struct TensorSplitDesc {
     int splitDim;            // tensor dimension to split (default: 0). Irrelevant when splitnum=1.
     std::string hwAxisOwner; // "row" | "col" | "" — which mesh axis owns this tensor's partition
     std::string replicateOn; // "row" | "col" | "" — which mesh axis to replicate/broadcast on
-    // Spatial policy fields (not consumed by passes yet — reserved for future use)
+    // Spatial policy fields
     std::string pattern; // "broadcast" | "scatter" | "multicast" | "gather"
     std::string flow;    // "ltor" | "rtol" | "default"
-    int pingPong = 2;    // ping-pong buffer depth
+    int pingPong = 2;    // ping-pong buffer depth (2, 4, 8)
+    int maxBufferBytes = 4096; // max per-buffer size (PP_MAX_BYTES equivalent)
 };
 
 /// Operation-level split model: one TensorSplitDesc per tensor.
@@ -35,9 +36,9 @@ struct SplitModel {
     /// B: tensor split dim=0, mesh partition by col, broadcast along rows
     /// C: tensor split dim=0, mesh partition by row, gather along cols
     static SplitModel gemm() {
-        return {{{0, "row", "col", "broadcast", "default", 2},
-                 {0, "col", "row", "broadcast", "default", 2},
-                 {0, "row", "col", "gather", "ltor", 2}}};
+        return {{{0, "row", "col", "broadcast", "default", 2, 4096},
+                 {0, "col", "row", "broadcast", "default", 2, 4096},
+                 {0, "row", "col", "gather", "ltor", 2, 4096}}};
     }
 
     /// Construct a TensorSplitDesc from a spatial type tag string.
@@ -49,7 +50,8 @@ struct SplitModel {
     /// pattern: 0=Broadcast, 1=Scatter, 2=Multicast, 3=Gather
     /// distribution: 0=Row, 1=Col, 2=Grid
     /// mergeOrder: 0=Default, 1=LeftToRight, 2=RightToLeft
-    static TensorSplitDesc fromPolicyFields(int pattern, int distribution, int mergeOrder, int pingPong, bool isInput);
+    static TensorSplitDesc fromPolicyFields(int pattern, int distribution, int mergeOrder, int pingPong, bool isInput,
+                                            int maxBufferBytes = 4096);
 };
 
 class TilingLinalgPipeline {

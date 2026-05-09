@@ -52,9 +52,30 @@ struct ParsedTensorInfo {
     int distribution = 0; // 0=Row, 1=Col, 2=Grid
     int mergeOrder = 0;   // 0=Default, 1=LeftToRight, 2=RightToLeft
     int pingPong = 2;
+    int maxBufferBytes = 4096;   // max per-buffer size (PP_MAX_BYTES equivalent)
     bool policyResolved = false; // true once AST extraction succeeds
 };
 static std::vector<ParsedTensorInfo> parsedTensors;
+
+/// Derived tiling parameters computed from M/K/N and per-port SpatialPolicy.
+/// These are resolved after AST extraction and used to replace aie::get_*() calls
+/// in the kernel body with integer literals.
+struct DerivedTilingParams {
+    int64_t tileRows = 0; // M / HW_ROWS
+    int64_t tileCols = 0; // N / HW_COLS
+    int64_t kDim = 0;     // K
+
+    // Per-port derived values (indexed by tensor order: 0=A, 1=B, 2=C for GEMM)
+    struct PortParams {
+        int64_t numRounds = 0;
+        int64_t bufferSize = 0; // elements per round
+    };
+    std::vector<PortParams> portParams;
+    bool valid = false;
+};
+static DerivedTilingParams derivedTilingParams;
+
+static int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0; // GEMM dimensions from launch args or macros
 
 static int parsedDebugLevel = -1; // -1 = not set by user, >=0 = #pragma aie_debug_level value
 static std::vector<std::string> kernel_name_list;
@@ -602,7 +623,9 @@ public:
 
                             // Map scalar dims to GEMM M, N, K when 3 values available
                             // (from either kernel params or extra launch args)
-                            int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0;
+                            macroDimM = 0;
+                            macroDimN = 0;
+                            macroDimK = 0;
                             if (scalarDimValues.size() >= 3) {
                                 macroDimM = scalarDimValues[0];
                                 macroDimN = scalarDimValues[1];
@@ -884,12 +907,15 @@ public:
                                                 pti.distribution = (int)apval->getStructField(1).getInt().getExtValue();
                                                 pti.mergeOrder = (int)apval->getStructField(2).getInt().getExtValue();
                                                 pti.pingPong = (int)apval->getStructField(3).getInt().getExtValue();
+                                                if (apval->getStructNumFields() >= 5)
+                                                    pti.maxBufferBytes =
+                                                        (int)apval->getStructField(4).getInt().getExtValue();
                                                 pti.policyResolved = true;
                                                 llvm::outs()
                                                     << "[TilingLinalg] Policy resolved: pattern=" << pti.pattern
                                                     << " distribution=" << pti.distribution
-                                                    << " mergeOrder=" << pti.mergeOrder << " pingPong=" << pti.pingPong
-                                                    << "\n";
+                                                    << " mergeOrder=" << pti.mergeOrder << " ppDepth=" << pti.pingPong
+                                                    << " maxBufferBytes=" << pti.maxBufferBytes << "\n";
                                             } else if (!apval) {
                                                 llvm::errs()
                                                     << "[TilingLinalg] DEBUG: policy arg kind="
@@ -926,7 +952,84 @@ public:
                             }
 						}
 					}
-				}
+
+                    // ---- Compute derived tiling parameters from M/K/N + per-port policy ----
+                    if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0 && tilingMeshRows > 0 && tilingMeshCols > 0 &&
+                        !parsedTensors.empty()) {
+                        derivedTilingParams.tileRows = macroDimM / tilingMeshRows;
+                        derivedTilingParams.tileCols = macroDimN / tilingMeshCols;
+                        derivedTilingParams.kDim = macroDimK;
+
+                        for (auto &pt : parsedTensors) {
+                            DerivedTilingParams::PortParams pp;
+                            int ppDepth = pt.pingPong > 0 ? pt.pingPong : 2;
+                            int maxBuf = pt.maxBufferBytes > 0 ? pt.maxBufferBytes : 4096;
+
+                            if (pt.isInput) {
+                                if (pt.policyResolved) {
+                                    if (pt.pattern == 0 && pt.distribution == 0) {
+                                        // Input A: Broadcast+Row — split along tile rows
+                                        int64_t rowsPerRoundRaw = derivedTilingParams.tileRows / ppDepth;
+                                        int64_t rowsPerRound = rowsPerRoundRaw;
+                                        if (rowsPerRound * macroDimK > maxBuf)
+                                            rowsPerRound = maxBuf / macroDimK;
+                                        if (rowsPerRound <= 0)
+                                            rowsPerRound = 1;
+                                        pp.numRounds = derivedTilingParams.tileRows / rowsPerRound;
+                                        pp.bufferSize = rowsPerRound * macroDimK;
+                                    } else if (pt.pattern == 0 && pt.distribution == 1) {
+                                        // Input B: Broadcast+Col — split along tile cols
+                                        int64_t colsPerRoundRaw = derivedTilingParams.tileCols / ppDepth;
+                                        int64_t colsPerRound = colsPerRoundRaw;
+                                        if (colsPerRound * macroDimK > maxBuf)
+                                            colsPerRound = maxBuf / macroDimK;
+                                        if (colsPerRound <= 0)
+                                            colsPerRound = 1;
+                                        pp.numRounds = derivedTilingParams.tileCols / colsPerRound;
+                                        pp.bufferSize = colsPerRound * macroDimK;
+                                    } else {
+                                        // Other input patterns: default
+                                        int64_t totalElements = 1;
+                                        for (auto d : pt.shape)
+                                            totalElements *= d;
+                                        int64_t perTile = totalElements / (tilingMeshRows * tilingMeshCols);
+                                        pp.bufferSize = std::min(perTile / ppDepth, (int64_t)maxBuf);
+                                        if (pp.bufferSize <= 0)
+                                            pp.bufferSize = perTile;
+                                        pp.numRounds = perTile / pp.bufferSize;
+                                    }
+                                } else {
+                                    // Unresolved policy — use defaults
+                                    int64_t totalElements = pt.shape[0] * pt.shape[1] / tilingMeshRows;
+                                    pp.bufferSize = std::min(totalElements / ppDepth, (int64_t)maxBuf);
+                                    if (pp.bufferSize <= 0)
+                                        pp.bufferSize = totalElements;
+                                    pp.numRounds = totalElements / pp.bufferSize;
+                                }
+                            } else {
+                                // Output: no K dimension involved
+                                int64_t outputPerCore = derivedTilingParams.tileRows * derivedTilingParams.tileCols;
+                                int64_t bufSzOut = outputPerCore / ppDepth;
+                                if (bufSzOut > maxBuf)
+                                    bufSzOut = maxBuf;
+                                if (bufSzOut <= 0)
+                                    bufSzOut = outputPerCore;
+                                pp.numRounds = outputPerCore / bufSzOut;
+                                pp.bufferSize = bufSzOut;
+                            }
+                            derivedTilingParams.portParams.push_back(pp);
+                        }
+                        derivedTilingParams.valid = true;
+                        llvm::outs() << "[TilingLinalg] Derived tiling: tileRows=" << derivedTilingParams.tileRows
+                                     << " tileCols=" << derivedTilingParams.tileCols
+                                     << " kDim=" << derivedTilingParams.kDim << "\n";
+                        for (size_t i = 0; i < derivedTilingParams.portParams.size(); ++i) {
+                            llvm::outs() << "[TilingLinalg]   port[" << i
+                                         << "]: numRounds=" << derivedTilingParams.portParams[i].numRounds
+                                         << " bufferSize=" << derivedTilingParams.portParams[i].bufferSize << "\n";
+                        }
+                    }
+                }
 				return true;
 			}
 
@@ -1476,9 +1579,17 @@ public:
                     ret += "  Pattern pattern      = Pattern::Broadcast;\n";
                     ret += "  Layout  distribution = Layout::Row;\n";
                     ret += "  Flow    merge_order  = Flow::Default;\n";
-                    ret += "  int     ping_pong    = 2;\n";
+                    ret += "  int     pp_depth     = 2;\n";
+                    ret += "  int     max_buffer_bytes = 4096;\n";
                     ret += "};\n";
                     ret += "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
+                    // Built-in query function stubs — Clang parses these but the compiler
+                    // replaces the calls with computed integer literals during kernel body rewriting.
+                    ret += "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
+                    ret += "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
+                    ret += "constexpr int get_tile_rows() { return 0; }\n";
+                    ret += "constexpr int get_tile_cols() { return 0; }\n";
+                    ret += "constexpr int get_k_dim() { return 0; }\n";
                     ret += "}\n";
                     ret += "struct aieDim {\n";
                     ret += "    int rows, cols;\n";
@@ -1627,7 +1738,7 @@ public:
                     if (pt.policyResolved) {
                         // Use resolved struct fields from AST
                         splitModel.tensorSplits.push_back(SplitModel::fromPolicyFields(
-                            pt.pattern, pt.distribution, pt.mergeOrder, pt.pingPong, pt.isInput));
+                            pt.pattern, pt.distribution, pt.mergeOrder, pt.pingPong, pt.isInput, pt.maxBufferBytes));
                     } else if (!pt.spatialTag.empty()) {
                         // Legacy spatial tag syntax (e.g. row_broadcast_in<T>)
                         splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
@@ -1637,7 +1748,7 @@ public:
                         // Default fallback
                         splitModel.tensorSplits.push_back(
                             SplitModel::fromPolicyFields(pt.isInput ? 0 : 3, // Broadcast for input, Gather for output
-                                                         0, pt.isInput ? 0 : 1, 2, pt.isInput));
+                                                         0, pt.isInput ? 0 : 1, 2, pt.isInput, pt.maxBufferBytes));
                     }
                 }
             } else {
@@ -1646,6 +1757,65 @@ public:
 
             // Build routing IR
             auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel, aieGenStr);
+
+            // Replace aie::get_*() calls in kernel body with computed integer literals
+            if (derivedTilingParams.valid && !userKernelBody.empty()) {
+                llvm::outs() << "[TilingLinalg] Replacing aie::get_*() calls in kernel body\n";
+
+                // Build parameter-name-to-port-index map from parsedTensors
+                std::unordered_map<std::string, size_t> paramToPort;
+                for (size_t i = 0; i < parsedTensors.size(); ++i) {
+                    paramToPort[parsedTensors[i].varName] = i;
+                }
+
+                // Replace aie::get_num_rounds(param_name) and aie::get_buffer_size(param_name)
+                for (const auto &funcName : {"aie::get_num_rounds", "aie::get_buffer_size"}) {
+                    std::string prefix = std::string(funcName) + "(";
+                    size_t pos = 0;
+                    while ((pos = userKernelBody.find(prefix, pos)) != std::string::npos) {
+                        size_t argStart = pos + prefix.size();
+                        size_t argEnd = userKernelBody.find(")", argStart);
+                        if (argEnd == std::string::npos)
+                            break;
+                        std::string argName = userKernelBody.substr(argStart, argEnd - argStart);
+                        // Trim whitespace
+                        while (!argName.empty() && argName.front() == ' ')
+                            argName.erase(0, 1);
+                        while (!argName.empty() && argName.back() == ' ')
+                            argName.pop_back();
+
+                        auto it = paramToPort.find(argName);
+                        if (it != paramToPort.end() && it->second < derivedTilingParams.portParams.size()) {
+                            int64_t val;
+                            if (std::string(funcName) == "aie::get_num_rounds")
+                                val = derivedTilingParams.portParams[it->second].numRounds;
+                            else
+                                val = derivedTilingParams.portParams[it->second].bufferSize;
+                            std::string replacement = std::to_string(val);
+                            userKernelBody.replace(pos, argEnd + 1 - pos, replacement);
+                            llvm::outs() << "[TilingLinalg]   " << funcName << "(" << argName << ") -> " << replacement
+                                         << "\n";
+                            pos += replacement.size();
+                        } else {
+                            pos = argEnd + 1;
+                        }
+                    }
+                }
+
+                // Replace aie::get_tile_rows(), aie::get_tile_cols(), aie::get_k_dim()
+                auto replaceSimpleCall = [&](const std::string &call, int64_t val) {
+                    std::string replacement = std::to_string(val);
+                    size_t pos = 0;
+                    while ((pos = userKernelBody.find(call, pos)) != std::string::npos) {
+                        userKernelBody.replace(pos, call.size(), replacement);
+                        llvm::outs() << "[TilingLinalg]   " << call << " -> " << replacement << "\n";
+                        pos += replacement.size();
+                    }
+                };
+                replaceSimpleCall("aie::get_tile_rows()", derivedTilingParams.tileRows);
+                replaceSimpleCall("aie::get_tile_cols()", derivedTilingParams.tileCols);
+                replaceSimpleCall("aie::get_k_dim()", derivedTilingParams.kDim);
+            }
 
             // Prepend user macros to kernel body for multi-tile path
             std::string kernelBodyWithMacros = userKernelBody;
@@ -1658,11 +1828,21 @@ public:
                 kernelBodyWithMacros = macroBlock + userKernelBody;
             }
 
+            // Determine maxPingPongBytes from per-port policy (use minimum across all ports)
+            int64_t effectiveMaxPPBytes = 4096;
+            if (!parsedTensors.empty()) {
+                effectiveMaxPPBytes = parsedTensors[0].maxBufferBytes;
+                for (auto &pt : parsedTensors) {
+                    if (pt.maxBufferBytes > 0 && pt.maxBufferBytes < effectiveMaxPPBytes)
+                        effectiveMaxPPBytes = pt.maxBufferBytes;
+                }
+            }
+
             // Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
             std::string outputDir = std::string(AOUT) + "worklocal/";
             if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros, userKernelFuncName,
-                                                  parsedDebugLevel, userRewrittenSource, {},
-                                                  /*maxPingPongBytes=*/4096, aieGenStr)) {
+                                                  parsedDebugLevel, userRewrittenSource, {}, effectiveMaxPPBytes,
+                                                  aieGenStr)) {
                 llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
             } else {
                 llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";

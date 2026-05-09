@@ -641,28 +641,28 @@ TensorSplitDesc SplitModel::fromSpatialTag(const std::string &tag, bool isInput)
     // The spatial tag controls hwAxisOwner and replicateOn (mesh partitioning),
     // NOT which tensor dimension to split.
     if (tag == "row_broadcast_in")
-        return {0, "row", "col", "broadcast", "default", 2};
+        return {0, "row", "col", "broadcast", "default", 2, 4096};
     if (tag == "col_broadcast_in")
-        return {0, "col", "row", "broadcast", "default", 2};
+        return {0, "col", "row", "broadcast", "default", 2, 4096};
     if (tag == "tiled_in")
-        return {0, "row", "", "scatter", "default", 2};
+        return {0, "row", "", "scatter", "default", 2, 4096};
     if (tag == "row_major_out")
-        return {0, "row", "col", "gather", "ltor", 2};
+        return {0, "row", "col", "gather", "ltor", 2, 4096};
     if (tag == "col_major_out")
-        return {0, "col", "row", "gather", "rtol", 2};
+        return {0, "col", "row", "gather", "rtol", 2, 4096};
     if (tag == "row_reduce_out")
-        return {0, "row", "", "scatter", "default", 2};
+        return {0, "row", "", "scatter", "default", 2, 4096};
     // default: backward compat
-    return isInput ? TensorSplitDesc{0, "row", "col", "broadcast", "default", 2}
-                   : TensorSplitDesc{0, "row", "col", "gather", "ltor", 2};
+    return isInput ? TensorSplitDesc{0, "row", "col", "broadcast", "default", 2, 4096}
+                   : TensorSplitDesc{0, "row", "col", "gather", "ltor", 2, 4096};
 }
 
 // ---------------------------------------------------------------------------
 // SplitModel::fromPolicyFields — struct field-based lookup
 // ---------------------------------------------------------------------------
 
-TensorSplitDesc SplitModel::fromPolicyFields(int pattern, int distribution, int mergeOrder, int pingPong,
-                                             bool isInput) {
+TensorSplitDesc SplitModel::fromPolicyFields(int pattern, int distribution, int mergeOrder, int pingPong, bool isInput,
+                                             int maxBufferBytes) {
     // Map enum values to strings
     static const char *patternStr[] = {"broadcast", "scatter", "multicast", "gather"};
     static const char *flowStr[] = {"default", "ltor", "rtol"};
@@ -683,7 +683,7 @@ TensorSplitDesc SplitModel::fromPolicyFields(int pattern, int distribution, int 
         replOn = "";
     }
 
-    return {0, hwAxis, replOn, pat, flw, pingPong};
+    return {0, hwAxis, replOn, pat, flw, pingPong, maxBufferBytes};
 }
 
 // ---------------------------------------------------------------------------

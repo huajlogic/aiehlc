@@ -217,7 +217,7 @@ HOST_SRC="${HOST_FIXED}"
 if [ "${REBUILD}" -eq 1 ] || [ ! -f host.o ]; then
     set -x
     echo "Compiling host..."
-    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${HOST_SRC}" -o host.o
+    ${TOOL_PREFIX}g++ -Os -std=c++20 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${HOST_SRC}" -o host.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile host.cc"
         exit 1
