@@ -2,36 +2,27 @@
  * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
  * SPDX-License-Identifier: MIT
  *
- * AIE Programming Model — Matrix Multiplication with Receive-First Ping
+ * AIE Programming Model — Matrix Multiplication (Generalized Ping-Pong)
  *
- * GEMM: C[16x16] = A[16x16] * B^T[16x16], int8
+ * GEMM: C[MxN] = A[MxK] * B^T[NxK], int8
  * Deployed on a HW_ROWS x HW_COLS AIE tile mesh.
  *
- * Data distribution (row-based split, 4 groups):
- *   A[16x16]: split into 4 partitions of A[4x16], broadcast per row
- *   B[16x16]: split into 4 partitions of B[4x16], broadcast per col
+ * Data distribution (row-based split):
+ *   A[MxK]: split into HW_ROWS partitions of A[TILE_ROWS x K], broadcast per row
+ *   B[NxK]: split into HW_COLS partitions of B[TILE_COLS x K], broadcast per col
  *
- * Each tile receives 4x16 A + 4x16 B via 2 DMA input rounds (ping-pong):
- *   Ping: A[0:1, 0:15] (32 bytes) + B[0:1, 0:15] (32 bytes)
- *   Pong: A[2:3, 0:15] (32 bytes) + B[2:3, 0:15] (32 bytes)
+ * Each tile receives TILE_ROWS x K (A) + TILE_COLS x K (B) via DMA ping-pong.
+ * The number of input DMA rounds is derived from PP_MAX_BYTES:
+ *   NUM_A_ROUNDS = TILE_ROWS / ROWS_PER_ROUND
+ *   NUM_B_ROUNDS = TILE_COLS / COLS_PER_ROUND
  *
- * Kernel flow (receive-first ping):
- *   Step 1: Receive ping — acquire+cache A0,B0, release inputs (no output)
- *   Step 2: Compute top-left quadrant C[0:1,0:1] from cached data
- *   Step 3: Receive pong — acquire A1,B1
- *   Step 4: Compute remaining 3 quadrants using cached + new data
- *   Step 5: Release pong inputs
- *   Step 6: Output round 0 — rows 0-1 (all 4 cols), 8 bytes sequential
- *   Step 7: Output round 1 — rows 2-3 (all 4 cols), 8 bytes sequential
+ * Kernel strategy: "cache all A, stream B"
+ *   Phase 1: Receive all A chunks into local memory (NUM_A_ROUNDS acquires)
+ *   Phase 2: Stream B chunks one at a time, computing against all cached A
+ *            (NUM_B_ROUNDS acquires, each iterates over all A rows)
+ *   Phase 3: Output results (NUM_OUTPUT_ROUNDS acquires)
  *
- * Output is sequential row-major 4x4 into local_out[16]:
- *   local_out[ 0.. 3] = C[row0, col0..col3]  → DMA round 0 (8 bytes)
- *   local_out[ 4.. 7] = C[row1, col0..col3]  ↗
- *   local_out[ 8..11] = C[row2, col0..col3]  → DMA round 1 (8 bytes)
- *   local_out[12..15] = C[row3, col0..col3]  ↗
- *
- * NOTE: With row-based split, tiles in same column produce redundant output
- * (same inputs). Host assembles them at different C offsets.
+ * This matches the DMA iteration counts from BlueprintToSchedulePass.
  *
  ******************************************************************************/
 #include <stdio.h>
@@ -39,46 +30,58 @@
 #include <stdint.h>
 
 // Spatial policy definitions for kernel parameter transfer
-#define M 128
-#define K 128
-#define N 128
+#define M 256
+#define K 256
+#define N 256
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4
 #define HW_COLS 4
 
 // --- Tile dimensions derived from M, K, N, HW_ROWS, HW_COLS ---
-#define TILE_ROWS (M / HW_ROWS)                 // 4: total output rows per tile
-#define TILE_COLS (N / HW_COLS)                 // 4: total output cols per tile
-#define ROWS_PER_ROUND (TILE_ROWS / 2)          // 2: A/B rows per DMA input round
-#define COLS_PER_ROUND (TILE_COLS / 2)          // 2: B cols per DMA input round
-#define K_DIM K                                 // 16: inner product dimension
-#define BUF_SZ_OUT (ROWS_PER_ROUND * TILE_COLS) // 8: output bytes per DMA round (2 rows * 4 cols)
+#define K_DIM K           // inner product dimension
+#define PP_MAX_BYTES 4096 // max ping-pong buffer size
+
+#define TILE_ROWS (M / HW_ROWS) // output rows per tile
+#define TILE_COLS (N / HW_COLS) // output cols per tile
+
+// Input A: each ping-pong buffer holds ROWS_PER_ROUND rows x K_DIM elements
+#define ROWS_PER_ROUND_RAW (TILE_ROWS / 2)
+#define ROWS_PER_ROUND ((ROWS_PER_ROUND_RAW * K_DIM > PP_MAX_BYTES) ? (PP_MAX_BYTES / K_DIM) : ROWS_PER_ROUND_RAW)
+#define NUM_A_ROUNDS (TILE_ROWS / ROWS_PER_ROUND)
+
+// Input B (transposed): each ping-pong buffer holds COLS_PER_ROUND rows x K_DIM elements
+#define COLS_PER_ROUND_RAW (TILE_COLS / 2)
+#define COLS_PER_ROUND ((COLS_PER_ROUND_RAW * K_DIM > PP_MAX_BYTES) ? (PP_MAX_BYTES / K_DIM) : COLS_PER_ROUND_RAW)
+#define NUM_B_ROUNDS (TILE_COLS / COLS_PER_ROUND)
+
+// Output: no K dimension, just rows x cols elements
+#define OUTPUT_PER_CORE (TILE_ROWS * TILE_COLS)
+#define OUTPUT_PP_RAW (OUTPUT_PER_CORE / 2)
+#define BUF_SZ_OUT ((OUTPUT_PP_RAW > PP_MAX_BYTES) ? PP_MAX_BYTES : OUTPUT_PP_RAW)
+#define NUM_OUTPUT_ROUNDS (OUTPUT_PER_CORE / BUF_SZ_OUT)
+
 #define DEBUG_OUTPUT_ORDER 0
 static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C);
 static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *C);
 // ═══════════════════════════════════════════════════════════════════════════
 // KERNEL: matmul
 //
-// Receive-first ping design for 4x4 mesh:
-//   - 2 DMA input rounds (ping-pong), 2 DMA output rounds
-//   - Input: 32 bytes per acquire (2 rows x 16 cols int8)
-//   - Output: 8 bytes per round (2 rows x 4 cols, sequential row-major)
+// "Cache all A, stream B" design for generalized round counts:
+//   - NUM_A_ROUNDS DMA input rounds for A (ping-pong)
+//   - NUM_B_ROUNDS DMA input rounds for B (ping-pong)
+//   - NUM_OUTPUT_ROUNDS DMA output rounds
 //
-// Per-tile computation: C_tile[4x4] = A_tile[4x16] * B_tile^T[4x16]
-//   C_tile[i][j] = sum_k A_tile[i][k] * B_tile[j][k]
+// Per-tile computation:
+//   C_tile[TILE_ROWS x TILE_COLS] = A_tile[TILE_ROWS x K] * B_tile^T[TILE_COLS x K]
 //
-// Step 1: Receive ping — acquire+cache A0,B0, release (no output)
-// Step 2: Compute top-left quadrant from cached data
-// Step 3: Receive pong — acquire A1,B1
-// Step 4: Compute remaining 3 quadrants (top-right, bottom-left, bottom-right)
-// Step 5: Release pong inputs
-// Step 6: Output round 0 — local_out[0..7] (rows 0-1, all 4 cols)
-// Step 7: Output round 1 — local_out[8..15] (rows 2-3, all 4 cols)
+// Phase 1: Cache all A — acquire NUM_A_ROUNDS chunks, copy to all_A[], release
+// Phase 2: Stream B — for each of NUM_B_ROUNDS B chunks:
+//            compute all A rows against current B chunk
+// Phase 3: Output — write NUM_OUTPUT_ROUNDS chunks of BUF_SZ_OUT bytes
 // ═══════════════════════════════════════════════════════════════════════════
 // Debug flag: when enabled, skip matmul and fill output with encoded tile ID.
-// Each output byte = row[0:2] | col[3:5] | round[6:7]
-// This lets you identify which tile and round produced each output byte.
+// Each output byte = row[0:2] | col[3:5] | round_tag[6:7]
 #pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN | AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER)
 constexpr aie::SpatialPolicy RowBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Row};
 constexpr aie::SpatialPolicy ColBC = {.pattern = aie::Pattern::Broadcast, .distribution = aie::Layout::Col};
@@ -97,117 +100,63 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBC> window_in_0,
 #endif
 
     // Local buffers
-    int8_t cache_A[ROWS_PER_ROUND * K_DIM];
-    int8_t cache_B[ROWS_PER_ROUND * K_DIM];
+    int8_t all_A[TILE_ROWS * K_DIM]; // cache all A data
     int8_t local_out[TILE_ROWS * TILE_COLS];
 
-    // ===== Step 1: Receive-only ping — acquire+cache+release inputs =====
-    int8_t *A0 = (int8_t *)acquire_input_window(window_in_0);
-    int8_t *B0 = (int8_t *)acquire_input_window(window_in_1);
-    for (int i = 0; i < ROWS_PER_ROUND * K_DIM; i++) {
-        cache_A[i] = A0[i];
-        cache_B[i] = B0[i];
+    // ===== Phase 1: Receive and cache all A chunks =====
+    for (int ra = 0; ra < NUM_A_ROUNDS; ra++) {
+        int8_t *A_ptr = (int8_t *)acquire_input_window(window_in_0);
+        for (int i = 0; i < ROWS_PER_ROUND * K_DIM; i++)
+            all_A[ra * ROWS_PER_ROUND * K_DIM + i] = A_ptr[i];
+        release_input_window(window_in_0);
     }
-    release_input_window(window_in_0);
-    release_input_window(window_in_1);
+
 #if DEBUG_OUTPUT_ORDER
-    // Log first COLS_PER_ROUND elements of A and B
+    // Log first K_DIM elements of cached A
     for (int i = 0; i < K_DIM; i++) {
-        klog("A0  ", (int32_t)cache_A[i]);
-    }
-    for (int i = 0; i < K_DIM; i++) {
-        klog("B0  ", (int32_t)cache_B[i]);
+        klog("A0  ", (int32_t)all_A[i]);
     }
 #endif
 
-    // ===== Step 2: Compute top-left quadrant from cached data =====
-    // C[0:RPR-1, 0:CPR-1] = A0 * B0^T (top-left)
-    for (int i = 0; i < ROWS_PER_ROUND; i++) {
-        for (int j = 0; j < COLS_PER_ROUND; j++) {
-            int16_t sum = 0;
-            for (int k = 0; k < K_DIM; k++)
-                sum += (int16_t)cache_A[i * K_DIM + k] * (int16_t)cache_B[j * K_DIM + k];
-            if (sum > 127)
-                sum = 127;
-            else if (sum < -128)
-                sum = -128;
+    // ===== Phase 2: Stream B, compute all sub-blocks =====
+    for (int rb = 0; rb < NUM_B_ROUNDS; rb++) {
+        int8_t *B_ptr = (int8_t *)acquire_input_window(window_in_1);
+
 #if DEBUG_OUTPUT_ORDER
-            if (j == 0)
-                sum = tag | ((0 & 0x3) << 6);
-#endif
-            local_out[i * TILE_COLS + j] = (int8_t)sum;
+        if (rb == 0) {
+            for (int i = 0; i < K_DIM; i++) {
+                klog("B0  ", (int32_t)B_ptr[i]);
+            }
         }
-    }
+#endif
 
-    // ===== Step 3: Receive pong =====
-    int8_t *A1 = (int8_t *)acquire_input_window(window_in_0);
-    int8_t *B1 = (int8_t *)acquire_input_window(window_in_1);
-
-    // ===== Step 4: Compute remaining 3 quadrants =====
-    // C[0:RPR-1, CPR:TILE_COLS-1] = cached_A0 * B1^T (top-right)
-    for (int i = 0; i < ROWS_PER_ROUND; i++) {
-        for (int j = 0; j < COLS_PER_ROUND; j++) {
-            int16_t sum = 0;
-            for (int k = 0; k < K_DIM; k++)
-                sum += (int16_t)cache_A[i * K_DIM + k] * (int16_t)B1[j * K_DIM + k];
-            if (sum > 127)
-                sum = 127;
-            else if (sum < -128)
-                sum = -128;
+        for (int ra = 0; ra < NUM_A_ROUNDS; ra++) {
+            for (int i = 0; i < ROWS_PER_ROUND; i++) {
+                for (int j = 0; j < COLS_PER_ROUND; j++) {
+                    int16_t sum = 0;
+                    for (int k = 0; k < K_DIM; k++)
+                        sum += (int16_t)all_A[(ra * ROWS_PER_ROUND + i) * K_DIM + k] * (int16_t)B_ptr[j * K_DIM + k];
+                    if (sum > 127)
+                        sum = 127;
+                    else if (sum < -128)
+                        sum = -128;
 #if DEBUG_OUTPUT_ORDER
-            if (j == 0)
-                sum = tag | ((1 & 0x3) << 6);
+                    if (j == 0)
+                        sum = tag | (((ra * NUM_B_ROUNDS + rb) & 0x3) << 6);
 #endif
-            local_out[i * TILE_COLS + j + COLS_PER_ROUND] = (int8_t)sum;
+                    local_out[(ra * ROWS_PER_ROUND + i) * TILE_COLS + rb * COLS_PER_ROUND + j] = (int8_t)sum;
+                }
+            }
         }
+
+        release_input_window(window_in_1);
     }
 
-    // C[RPR:TILE_ROWS-1, 0:CPR-1] = A1 * cached_B0^T (bottom-left)
-    for (int i = 0; i < ROWS_PER_ROUND; i++) {
-        for (int j = 0; j < COLS_PER_ROUND; j++) {
-            int16_t sum = 0;
-            for (int k = 0; k < K_DIM; k++)
-                sum += (int16_t)A1[i * K_DIM + k] * (int16_t)cache_B[j * K_DIM + k];
-            if (sum > 127)
-                sum = 127;
-            else if (sum < -128)
-                sum = -128;
-#if DEBUG_OUTPUT_ORDER
-            if (j == 0)
-                sum = tag | ((2 & 0x3) << 6);
-#endif
-            local_out[(i + ROWS_PER_ROUND) * TILE_COLS + j] = (int8_t)sum;
-        }
-    }
-
-    // C[RPR:TILE_ROWS-1, CPR:TILE_COLS-1] = A1 * B1^T (bottom-right)
-    for (int i = 0; i < ROWS_PER_ROUND; i++) {
-        for (int j = 0; j < COLS_PER_ROUND; j++) {
-            int16_t sum = 0;
-            for (int k = 0; k < K_DIM; k++)
-                sum += (int16_t)A1[i * K_DIM + k] * (int16_t)B1[j * K_DIM + k];
-            if (sum > 127)
-                sum = 127;
-            else if (sum < -128)
-                sum = -128;
-#if DEBUG_OUTPUT_ORDER
-            if (j == 0)
-                sum = tag | ((3 & 0x3) << 6);
-#endif
-            local_out[(i + ROWS_PER_ROUND) * TILE_COLS + j + COLS_PER_ROUND] = (int8_t)sum;
-        }
-    }
-
-    // ===== Step 5: Release pong inputs =====
-    release_input_window(window_in_0);
-    release_input_window(window_in_1);
-
-    // ===== Step 6-7: Output 2 rounds (8 bytes each, sequential row-major) =====
-    for (int round = 0; round < 2; round++) {
+    // ===== Phase 3: Output =====
+    for (int round = 0; round < NUM_OUTPUT_ROUNDS; round++) {
         int8_t *out = (int8_t *)acquire_output_window(window_out_0);
-        for (int i = 0; i < BUF_SZ_OUT; i++) {
+        for (int i = 0; i < BUF_SZ_OUT; i++)
             out[i] = local_out[round * BUF_SZ_OUT + i];
-        }
         release_output_window(window_out_0);
     }
 }
@@ -262,10 +211,6 @@ int main() {
 //
 // verify_matmul: computes full matmul, then compares flat C[] against
 //   reference. Host assembles tile outputs into the full C matrix.
-//
-// Per-tile DMA output (16 bytes = 2 rounds of 8 bytes, sequential row-major):
-//   Round 0 (bytes 0-7): rows 0-1, all 4 cols
-//   Round 1 (bytes 8-15): rows 2-3, all 4 cols
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Pure scalar matmul: C_ref[M][N] = A[M][K] * B^T[N][K]
@@ -286,7 +231,6 @@ static void scalar_matmul(int8_t *C_ref, const int8_t *A, const int8_t *B) {
 
 // Verify AIE output C against CPU reference
 static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
-    // Compute full C_ref[16][16] = A * B^T — no pipeline knowledge
     int mismatches = 0;
     int8_t C_ref[M * N];
     scalar_matmul(C_ref, A, B);
@@ -296,10 +240,9 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
             mismatches++;
             if (mismatches > 128)
                 break;
-            // return 1;
         }
     }
-    // Print A [16x16]
+    // Print A
     printf("\nA [%dx%d]:\n", M, K);
     for (int i = 0; i < M; i++) {
         printf("  [");
@@ -311,7 +254,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
         printf("]\n");
     }
 
-    // Print B [16x16]
+    // Print B
     printf("\nB [%dx%d]:\n", K, N);
     for (int i = 0; i < K; i++) {
         printf("  [");
@@ -323,7 +266,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
         printf("]\n");
     }
 
-    // Print C [16x16]
+    // Print C
     printf("\nC [%dx%d]:\n", M, N);
     for (int i = 0; i < M; i++) {
         printf("  [");
@@ -335,7 +278,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
         printf("]\n");
     }
 
-    // Print C_ref [16x16]
+    // Print C_ref
     printf("\nC_ref [%dx%d]:\n", M, N);
     for (int i = 0; i < M; i++) {
         printf("  [");
@@ -360,24 +303,23 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     // Tiles within a group are at consecutive offsets
     const int TILES_PER_GROUP = HW_COLS;
     const int NUM_GROUPS = HW_ROWS;
-    const int TILE_ROWS = M / HW_ROWS;
-    const int TILE_COLS = N / HW_COLS;
-    const int TILE_OUT_SIZE = TILE_ROWS * TILE_COLS;
+    const int TILE_ROWS_L = M / HW_ROWS;
+    const int TILE_COLS_L = N / HW_COLS;
+    const int TILE_OUT_SIZE = TILE_ROWS_L * TILE_COLS_L;
 
     int mismatches = 0;
     for (int g = 0; g < NUM_GROUPS; g++) {
-        int rs = g * TILE_ROWS; // row start in full matrix
-        int cs = g * TILE_COLS; // col start in full matrix
+        int rs = g * TILE_ROWS_L; // row start in full matrix
+        int cs = g * TILE_COLS_L; // col start in full matrix
 
         for (int t = 0; t < TILES_PER_GROUP; t++) {
             int tile_idx = g * TILES_PER_GROUP + t;
             int base = tile_idx * TILE_OUT_SIZE;
 
-            for (int i = 0; i < TILE_ROWS; i++) {
-                for (int j = 0; j < TILE_COLS; j++) {
-                    // DMA layout: cycle 0 rows 0-1 cols 2-3 are zero-filled
-                    int8_t expected = (i < ROWS_PER_ROUND && j >= COLS_PER_ROUND) ? 0 : C_ref[(rs + i) * N + (cs + j)];
-                    int flat = base + i * TILE_COLS + j;
+            for (int i = 0; i < TILE_ROWS_L; i++) {
+                for (int j = 0; j < TILE_COLS_L; j++) {
+                    int8_t expected = C_ref[(rs + i) * N + (cs + j)];
+                    int flat = base + i * TILE_COLS_L + j;
                     if (C[flat] != expected) {
                         printf("MISMATCH C[%d] (group %d, tile %d, row %d, col %d): "
                                "got %d, expected %d\n",
@@ -396,20 +338,20 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
         printf("FAIL: %d mismatches out of %d.\n", mismatches, total_elements);
 
     // Print sample: group 0, tile 0
-    printf("\nSample output C[0:%d][0:%d] (group 0, tile 0):\n", TILE_ROWS - 1, TILE_COLS - 1);
-    for (int i = 0; i < TILE_ROWS; i++) {
+    printf("\nSample output C[0:%d][0:%d] (group 0, tile 0):\n", TILE_ROWS_L - 1, TILE_COLS_L - 1);
+    for (int i = 0; i < TILE_ROWS_L; i++) {
         printf("  [");
-        for (int j = 0; j < TILE_COLS; j++) {
-            printf("%4d", C[i * TILE_COLS + j]);
-            if (j < TILE_COLS - 1)
+        for (int j = 0; j < TILE_COLS_L; j++) {
+            printf("%4d", C[i * TILE_COLS_L + j]);
+            if (j < TILE_COLS_L - 1)
                 printf(",");
         }
         printf("]\n");
     }
 
-    // Print input A first TILE_ROWS rows
-    printf("\nInput A[0:%d][0:%d]:\n", TILE_ROWS - 1, K - 1);
-    for (int i = 0; i < TILE_ROWS; i++) {
+    // Print input A first TILE_ROWS_L rows
+    printf("\nInput A[0:%d][0:%d]:\n", TILE_ROWS_L - 1, K - 1);
+    for (int i = 0; i < TILE_ROWS_L; i++) {
         printf("  [");
         for (int j = 0; j < K; j++) {
             printf("%4d", A[i * K + j]);
@@ -419,9 +361,9 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
         printf("]\n");
     }
 
-    // Print input B first TILE_ROWS rows
-    printf("\nInput B[0:%d][0:%d]:\n", TILE_ROWS - 1, K - 1);
-    for (int i = 0; i < TILE_ROWS; i++) {
+    // Print input B first TILE_ROWS_L rows
+    printf("\nInput B[0:%d][0:%d]:\n", TILE_ROWS_L - 1, K - 1);
+    for (int i = 0; i < TILE_ROWS_L; i++) {
         printf("  [");
         for (int j = 0; j < K; j++) {
             printf("%4d", B[i * K + j]);
@@ -435,14 +377,14 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
 }
 
 // Verify raw tile-order output against CPU reference
-// Assumes tiles output in row-major tile order: (0,0),(0,1),...,(0,3),(1,0),...,(3,3)
-// Within each tile: sequential row-major 4x4
+// Assumes tiles output in row-major tile order: (0,0),(0,1),...
+// Within each tile: sequential row-major TILE_ROWS x TILE_COLS
 static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *C) {
     int8_t C_ref[M * N];
     scalar_matmul(C_ref, A, B);
 
-    const int TILE_OUT_SZ = TILE_ROWS * TILE_COLS; // 16
-    int total = HW_ROWS * HW_COLS * TILE_OUT_SZ;   // 256
+    const int TILE_OUT_SZ = TILE_ROWS * TILE_COLS;
+    int total = HW_ROWS * HW_COLS * TILE_OUT_SZ;
     int mismatches = 0;
 
     for (int flat = 0; flat < total; flat++) {
@@ -469,7 +411,7 @@ static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *
     else
         printf("verify_mat_transpose FAIL: %d mismatches out of %d.\n", mismatches, total);
 
-    // Print A [16x16]
+    // Print A
     printf("\nA [%dx%d]:\n", M, K);
     for (int i = 0; i < M; i++) {
         printf("  [");
@@ -481,7 +423,7 @@ static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *
         printf("]\n");
     }
 
-    // Print B [16x16]
+    // Print B
     printf("\nB [%dx%d]:\n", K, N);
     for (int i = 0; i < K; i++) {
         printf("  [");
@@ -493,7 +435,7 @@ static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *
         printf("]\n");
     }
 
-    // Print C [16x16]
+    // Print C
     printf("\nC [%dx%d]:\n", M, N);
     for (int i = 0; i < M; i++) {
         printf("  [");
@@ -505,7 +447,7 @@ static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *
         printf("]\n");
     }
 
-    // Print C [16x16]
+    // Print C_ref
     printf("\nC_ref [%dx%d]:\n", M, N);
     for (int i = 0; i < M; i++) {
         printf("  [");
