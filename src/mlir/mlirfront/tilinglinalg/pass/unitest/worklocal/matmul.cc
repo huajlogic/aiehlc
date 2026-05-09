@@ -1,10 +1,5 @@
 // User-provided compute kernel (extracted from __global__ function)
 // User macro definitions from source file
-#define M 256
-#define K 256
-#define N 256
-#define HW_ROWS 4
-#define HW_COLS 4
 #define DEBUG_OUTPUT_ORDER 0
 
 void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_int8 *win_c) {

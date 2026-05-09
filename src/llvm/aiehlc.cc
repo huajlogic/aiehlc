@@ -78,6 +78,7 @@ static DerivedTilingParams derivedTilingParams;
 static int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0; // GEMM dimensions from launch args or macros
 
 static int parsedDebugLevel = -1; // -1 = not set by user, >=0 = #pragma aie_debug_level value
+static std::string userSourceDir; // directory containing the original user source file
 static std::vector<std::string> kernel_name_list;
 static std::unordered_map<std::string, const clang::FunctionDecl*> globalKernelFuncs;
 static std::string userKernelBody;      // raw source text of __global__ function body
@@ -1358,7 +1359,17 @@ public:
 				// Get the file name
 				llvm::StringRef FileName = FileEntryRef->getName();
 
-				// Print or use the file name as needed
+                // Capture source directory for include path propagation
+                {
+                    std::string fnStr = FileName.str();
+                    auto lastSlash = fnStr.rfind('/');
+                    if (lastSlash != std::string::npos)
+                        userSourceDir = fnStr.substr(0, lastSlash);
+                    else
+                        userSourceDir = ".";
+                }
+
+                // Print or use the file name as needed
 				// llvm::outs() << "Processing file: " << FileName << "\n";
 				clang::FileID MainFileID = SourceMgr.getMainFileID();
 
@@ -1844,6 +1855,30 @@ public:
                                                   parsedDebugLevel, userRewrittenSource, {}, effectiveMaxPPBytes,
                                                   aieGenStr)) {
                 llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
+                // Copy user #include "..." headers to outputDir so host.cc is self-contained.
+                if (!userSourceDir.empty() && !userRewrittenSource.empty()) {
+                    std::regex includeRegex(R"(#\s*include\s*\"([^\"]+)\")");
+                    auto begin =
+                        std::sregex_iterator(userRewrittenSource.begin(), userRewrittenSource.end(), includeRegex);
+                    auto end = std::sregex_iterator();
+                    for (auto it = begin; it != end; ++it) {
+                        std::string headerName = (*it)[1].str();
+                        // Skip runtime headers already on the compiler include path
+                        if (headerName == "aie_runtime.h" || headerName == "aie_runtime_debug.h" ||
+                            headerName == "xaiengine.h")
+                            continue;
+                        std::string srcPath = userSourceDir + "/" + headerName;
+                        std::string dstPath = outputDir + "/" + headerName;
+                        // Only copy if the file exists in the user source directory
+                        std::ifstream src(srcPath, std::ios::binary);
+                        if (src.good()) {
+                            std::ofstream dst(dstPath, std::ios::binary);
+                            dst << src.rdbuf();
+                            llvm::outs() << "[TilingLinalg] Copied user header: " << headerName << " -> " << dstPath
+                                         << "\n";
+                        }
+                    }
+                }
             } else {
                 llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
                 std::exit(1);

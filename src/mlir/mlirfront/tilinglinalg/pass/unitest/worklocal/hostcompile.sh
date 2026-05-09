@@ -172,6 +172,8 @@ INCLUDE_OPTS="-I${AIEHLC_ROOT}/src/mlir/runtime -I${AIEHLC_ROOT}/include -I${AIE
 if [ -d "${XAIE_INCLUDE}" ]; then
     INCLUDE_OPTS="${INCLUDE_OPTS} -I${XAIE_INCLUDE}"
 fi
+# User headers are copied to worklocal/ by aiehlc alongside host.cc
+INCLUDE_OPTS="${INCLUDE_OPTS} -I${WORKLOCAL_DIR}"
 DEFS="-DAIE_GEN=${aie_version}"
 
 mkdir -p "${BUILD_DIR}"
