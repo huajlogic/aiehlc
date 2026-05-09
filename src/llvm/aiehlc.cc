@@ -48,6 +48,7 @@ struct ParsedTensorInfo {
 static std::vector<ParsedTensorInfo> parsedTensors;
 
 static int parsedDebugLevel = -1; // -1 = not set by user, >=0 = #pragma aie_debug_level value
+static PartitionDesc parsedPartition; // default: invalid (all -1), set by #pragma aie_partition
 static std::vector<std::string> kernel_name_list;
 static std::unordered_map<std::string, const clang::FunctionDecl*> globalKernelFuncs;
 static std::string userKernelBody;      // raw source text of __global__ function body
@@ -56,6 +57,57 @@ static std::vector<std::string> userMacroDefines; // #define lines from user sou
 
 using namespace clang;
 using namespace clang::tooling;
+
+// Extract partition bounds from the 3rd argument of aieDim constructor.
+// Handles InitListExpr {2,7,0,10}, CXXConstructExpr (copy/aggregate), and DeclRefExpr (variable).
+static void extractPartitionFromExpr(const Expr *partExpr, ASTContext *Context) {
+    partExpr = partExpr->IgnoreParenImpCasts();
+    // Try InitListExpr: aiePartition{2,7,0,10} or {2,7,0,10}
+    if (const auto *IL = dyn_cast<InitListExpr>(partExpr)) {
+        if (IL->getNumInits() >= 4) {
+            clang::Expr::EvalResult r0, r1, r2, r3;
+            if (IL->getInit(0)->EvaluateAsInt(r0, *Context) && IL->getInit(1)->EvaluateAsInt(r1, *Context) &&
+                IL->getInit(2)->EvaluateAsInt(r2, *Context) && IL->getInit(3)->EvaluateAsInt(r3, *Context)) {
+                parsedPartition.startCol = r0.Val.getInt().getExtValue();
+                parsedPartition.endCol = r1.Val.getInt().getExtValue();
+                parsedPartition.startRow = r2.Val.getInt().getExtValue();
+                parsedPartition.endRow = r3.Val.getInt().getExtValue();
+                llvm::outs() << "[TilingLinalg] Partition: [" << parsedPartition.startCol << ","
+                             << parsedPartition.endCol << "," << parsedPartition.startRow << ","
+                             << parsedPartition.endRow << "]\n";
+            }
+        }
+        return;
+    }
+    // Try CXXConstructExpr: aggregate or copy constructor
+    if (const auto *CE = dyn_cast<CXXConstructExpr>(partExpr)) {
+        if (CE->getNumArgs() >= 4) {
+            clang::Expr::EvalResult r0, r1, r2, r3;
+            if (CE->getArg(0)->EvaluateAsInt(r0, *Context) && CE->getArg(1)->EvaluateAsInt(r1, *Context) &&
+                CE->getArg(2)->EvaluateAsInt(r2, *Context) && CE->getArg(3)->EvaluateAsInt(r3, *Context)) {
+                parsedPartition.startCol = r0.Val.getInt().getExtValue();
+                parsedPartition.endCol = r1.Val.getInt().getExtValue();
+                parsedPartition.startRow = r2.Val.getInt().getExtValue();
+                parsedPartition.endRow = r3.Val.getInt().getExtValue();
+                llvm::outs() << "[TilingLinalg] Partition: [" << parsedPartition.startCol << ","
+                             << parsedPartition.endCol << "," << parsedPartition.startRow << ","
+                             << parsedPartition.endRow << "]\n";
+            }
+        } else if (CE->getNumArgs() == 1) {
+            // Copy/move ctor — unwrap inner
+            extractPartitionFromExpr(CE->getArg(0), Context);
+        }
+        return;
+    }
+    // Try DeclRefExpr: variable reference like `part`
+    if (const auto *DR = dyn_cast<DeclRefExpr>(partExpr)) {
+        if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
+            if (VD->hasInit())
+                extractPartitionFromExpr(VD->getInit(), Context);
+        }
+    }
+}
+
 class GlobalFunctionVisitor : public RecursiveASTVisitor<GlobalFunctionVisitor> {
 private:
 	std::string GetFuncText(FunctionDecl *f) {
@@ -423,6 +475,10 @@ public:
 								tilingMeshCols = r1.Val.getInt().getExtValue();
 								llvm::outs() << "[TilingLinalg] Mesh: " << tilingMeshRows << " x " << tilingMeshCols << "\n";
 							}
+                            // Check for 3rd arg (aiePartition)
+                            if (Construct->getNumArgs() >= 3) {
+                                extractPartitionFromExpr(Construct->getArg(2), Context);
+                            }
                         } else if (Construct->getNumArgs() == 1) {
                             // Copy/move constructor: __aie_launch("k", mesh, ...) where mesh is by-value
                             // Look through the copy to find the original DeclRefExpr
@@ -440,6 +496,10 @@ public:
                                                     tilingMeshCols = r1.Val.getInt().getExtValue();
                                                     llvm::outs() << "[TilingLinalg] Mesh (from copy-ctor var): "
                                                                  << tilingMeshRows << " x " << tilingMeshCols << "\n";
+                                                }
+                                                // Check for 3rd arg (aiePartition)
+                                                if (InitConstruct->getNumArgs() >= 3) {
+                                                    extractPartitionFromExpr(InitConstruct->getArg(2), Context);
                                                 }
                                             }
                                         }
@@ -460,7 +520,11 @@ public:
 											tilingMeshCols = r1.Val.getInt().getExtValue();
 											llvm::outs() << "[TilingLinalg] Mesh (from var): " << tilingMeshRows << " x " << tilingMeshCols << "\n";
 										}
-									}
+                                        // Check for 3rd arg (aiePartition)
+                                        if (Construct->getNumArgs() >= 3) {
+                                            extractPartitionFromExpr(Construct->getArg(2), Context);
+                                        }
+                                    }
 								}
 							}
 						}
@@ -1157,9 +1221,17 @@ public:
                     ret += "template<typename T> struct col_major_out    { using type = T; };\n";
                     ret += "template<typename T> struct row_reduce_out   { using type = T; };\n";
                     ret += "}\n";
+                    ret += "struct aiePartition {\n";
+                    ret += "    int startCol, endCol, startRow, endRow;\n";
+                    ret += "};\n";
                     ret += "struct aieDim {\n";
                     ret += "    int rows, cols;\n";
-                    ret += "    aieDim(int r, int c) : rows(r), cols(c) {}\n";
+                    ret += "    aiePartition partition;\n";
+                    ret += "    bool hasPartition;\n";
+                    ret +=
+                        "    aieDim(int r, int c) : rows(r), cols(c), partition{-1,-1,-1,-1}, hasPartition(false) {}\n";
+                    ret += "    aieDim(int r, int c, aiePartition p) : rows(r), cols(c), partition(p), "
+                           "hasPartition(true) {}\n";
                     ret += "};\n";
                     ret += "inline void aieSetDevice(int) {}\n";
                     ret += "inline void aieDeviceSynchronize() {}\n";
@@ -1304,7 +1376,8 @@ public:
                 }
 
                 // Build routing IR
-                auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel);
+                auto module =
+                    TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel, parsedPartition);
 
                 // Prepend user macros to kernel body for multi-tile path
                 std::string kernelBodyWithMacros = userKernelBody;

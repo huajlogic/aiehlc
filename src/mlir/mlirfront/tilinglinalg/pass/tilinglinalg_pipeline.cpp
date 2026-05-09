@@ -128,7 +128,7 @@ void TilingLinalgPipeline::registerDialects(mlir::MLIRContext &ctx) {
 
 mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols,
                                                     const std::vector<TensorParam> &tensors,
-                                                    const SplitModel &splitModel) {
+                                                    const SplitModel &splitModel, const PartitionDesc &partition) {
 
     // This is a parameterized version of routingmanager::ops_testNew()
     using namespace routing;
@@ -149,7 +149,15 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
 
     auto block = hostFunc.addEntryBlock();
     builder.setInsertionPointToEnd(block);
-    auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(), meshRows, meshCols);
+    mlir::IntegerAttr startColAttr, endColAttr, startRowAttr, endRowAttr;
+    if (partition.isValid()) {
+        startColAttr = builder.getI64IntegerAttr(partition.startCol);
+        endColAttr = builder.getI64IntegerAttr(partition.endCol);
+        startRowAttr = builder.getI64IntegerAttr(partition.startRow);
+        endRowAttr = builder.getI64IntegerAttr(partition.endRow);
+    }
+    auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(), meshRows, meshCols, startColAttr, endColAttr,
+                                             startRowAttr, endRowAttr);
 
     // Build all tensor values first
     std::vector<Value> tensorValues;
@@ -196,7 +204,20 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                                        int runtimeDebugLevel, const std::string &userRewrittenSource,
                                        const std::vector<TensorParam> &tensors) {
 
-    RoutingTopology rtopology("Gen2");
+    // Extract partition bounds from createhwmesh op in the IR (if present)
+    int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
+    module.walk([&](routing::createhwmesh meshOp) {
+        if (auto sc = meshOp.getStartCol())
+            partStartCol = *sc;
+        if (auto ec = meshOp.getEndCol())
+            partEndCol = *ec;
+        if (auto sr = meshOp.getStartRow())
+            partStartRow = *sr;
+        if (auto er = meshOp.getEndRow())
+            partEndRow = *er;
+    });
+
+    RoutingTopology rtopology("Gen2", "", partStartCol, partEndCol, partStartRow, partEndRow);
 
     std::string irDir = setupPipelineIRDir("dfschedule");
     int stage = 0;
@@ -385,7 +406,17 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             // Suppress the Clang-phase stubs (which had wrong arity) and emit
             // correct __aie_launch that forwards DDR pointers.
             stream << "#define AIEHLC_TILING_STUBS_DEFINED\n";
-            stream << "struct aieDim { int rows, cols; aieDim(int r, int c) : rows(r), cols(c) {} };\n";
+            stream << "struct aiePartition {\n";
+            stream << "    int startCol, endCol, startRow, endRow;\n";
+            stream << "};\n";
+            stream << "struct aieDim {\n";
+            stream << "    int rows, cols;\n";
+            stream << "    aiePartition partition;\n";
+            stream << "    bool hasPartition;\n";
+            stream << "    aieDim(int r, int c) : rows(r), cols(c), partition{-1,-1,-1,-1}, hasPartition(false) {}\n";
+            stream
+                << "    aieDim(int r, int c, aiePartition p) : rows(r), cols(c), partition(p), hasPartition(true) {}\n";
+            stream << "};\n";
             stream << "inline void aieSetDevice(int) {}\n";
             stream << "inline void aieDeviceSynchronize() {}\n";
             if (numArgs > 0) {
@@ -393,7 +424,11 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 for (unsigned i = 0; i < numArgs; ++i)
                     stream << ", void* _t" << i;
                 stream << ", ...) {\n";
-                stream << "    (void)kernel; (void)mesh;\n";
+                stream << "    (void)kernel;\n";
+                stream << "    if (mesh.hasPartition) {\n";
+                stream << "        __Runtime_device_init_partition(mesh.partition.startCol, mesh.partition.endCol - "
+                          "mesh.partition.startCol);\n";
+                stream << "    }\n";
                 stream << "    host_canonicalized(";
                 for (unsigned i = 0; i < numArgs; ++i) {
                     if (i > 0)
@@ -404,6 +439,11 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             } else {
                 stream << "template<typename... Args>\n";
                 stream << "inline void __aie_launch(const char* kernel, aieDim mesh, Args... args) {\n";
+                stream << "    (void)kernel;\n";
+                stream << "    if (mesh.hasPartition) {\n";
+                stream << "        __Runtime_device_init_partition(mesh.partition.startCol, mesh.partition.endCol - "
+                          "mesh.partition.startCol);\n";
+                stream << "    }\n";
                 stream << "    host_canonicalized();\n}\n";
             }
 
@@ -698,15 +738,20 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
         dumpPipelineIRToFile(routingDmaphopModule, routingIrDir, rstage++, "initial");
 
-        // Use the same rtopology that produced the dmaphop IR so that
-        // shim columns and DMA port assignments are consistent.
-        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<DmaphopToRoutinghwPass>(rtopology),
-                                   routingIrDir, rstage, "DmaphopToRoutinghwPass"))
+        // Create a fresh RoutingTopology for Phase 5 so that DmaphopToRoutinghwPass
+        // starts with clean resource state. Phase 1 (RoutingToDmapPass/DmapToDmaphopPass)
+        // consumed shim/port resources from the original rtopology. Phase 5 reads
+        // shim tile info from the dmaphop IR and allocates its own DataIO objects.
+        RoutingTopology routingPathTopology("Gen2", "", partStartCol, partEndCol, partStartRow, partEndRow);
+
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule,
+                                   std::make_unique<DmaphopToRoutinghwPass>(routingPathTopology), routingIrDir, rstage,
+                                   "DmaphopToRoutinghwPass"))
             return false;
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWVerifyPass>(), routingIrDir,
                                    rstage, "RoutingHWVerifyPass"))
             return false;
-        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(rtopology),
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(routingPathTopology),
                                    routingIrDir, rstage, "RoutingHWLowerPass"))
             return false;
 

@@ -215,6 +215,9 @@ static inline PartitionTensor __Runtime_extract_slice_strided_2d(XAie_DevInst *d
 
 // Device layout declare and init (reference: aieml_perf.cc main lines 292-344, 348-352)
 AieRC __Runtime_device_init(void);
+// Partition-aware device init: confines the AIE driver to columns [startCol, startCol+numCols).
+// Row constraints are handled at compile time (generated code only references tiles in-partition).
+AieRC __Runtime_device_init_partition(int startCol, int numCols);
 void __Runtime_routing_init(void);
 AieRC __Runtime_device_teardown(void);
 

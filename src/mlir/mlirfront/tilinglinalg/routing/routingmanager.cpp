@@ -268,6 +268,54 @@ ParseResult routing::partitiontensor::parse(OpAsmParser &parser, OperationState 
     return success();
 }
 
+// createhwmesh printer
+// Format: routing.routingcreatehwmesh row = <row>, col = <col> [partition = <startCol>, <endCol>, <startRow>, <endRow>]
+// -> type
+void routing::createhwmesh::print(OpAsmPrinter &p) {
+    p << " row = " << getRow() << ", col = " << getCol();
+    if (getStartCol()) {
+        p << " partition = " << *getStartCol() << ", " << *getEndCol() << ", " << *getStartRow() << ", "
+          << *getEndRow();
+    }
+    p.printOptionalAttrDict(getOperation()->getAttrs(),
+                            /*elidedAttrs=*/{"row", "col", "startCol", "endCol", "startRow", "endRow"});
+    p << " -> " << getOutput().getType();
+}
+
+// createhwmesh parser
+ParseResult routing::createhwmesh::parse(OpAsmParser &parser, OperationState &result) {
+    int64_t row, col;
+    if (parser.parseKeyword("row") || parser.parseEqual() || parser.parseInteger(row) || parser.parseComma() ||
+        parser.parseKeyword("col") || parser.parseEqual() || parser.parseInteger(col))
+        return failure();
+
+    result.addAttribute("row", parser.getBuilder().getI64IntegerAttr(row));
+    result.addAttribute("col", parser.getBuilder().getI64IntegerAttr(col));
+
+    // Parse optional partition = startCol, endCol, startRow, endRow
+    if (succeeded(parser.parseOptionalKeyword("partition"))) {
+        int64_t startCol, endCol, startRow, endRow;
+        if (parser.parseEqual() || parser.parseInteger(startCol) || parser.parseComma() ||
+            parser.parseInteger(endCol) || parser.parseComma() || parser.parseInteger(startRow) ||
+            parser.parseComma() || parser.parseInteger(endRow))
+            return failure();
+        result.addAttribute("startCol", parser.getBuilder().getI64IntegerAttr(startCol));
+        result.addAttribute("endCol", parser.getBuilder().getI64IntegerAttr(endCol));
+        result.addAttribute("startRow", parser.getBuilder().getI64IntegerAttr(startRow));
+        result.addAttribute("endRow", parser.getBuilder().getI64IntegerAttr(endRow));
+    }
+
+    if (parser.parseOptionalAttrDict(result.attributes))
+        return failure();
+
+    Type resultType;
+    if (parser.parseArrow() || parser.parseType(resultType))
+        return failure();
+
+    result.addTypes(resultType);
+    return success();
+}
+
 //routing class
 void routingmanager::type_interface_test(MLIRContext* ctx) {
         //ctx->getOrLoadDialect<routing::routingdialect>();
@@ -316,7 +364,9 @@ ModuleOp routingmanager::ops_testNew(MLIRContext *ctx, int totalN, std::string r
 
     auto block = main.addEntryBlock();
     builder.setInsertionPointToEnd(block);
-    auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(),  hwrowused, hwcolused);
+    auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(), hwrowused, hwcolused,
+                                             /*startCol=*/mlir::IntegerAttr{}, /*endCol=*/mlir::IntegerAttr{},
+                                             /*startRow=*/mlir::IntegerAttr{}, /*endRow=*/mlir::IntegerAttr{});
 
     // Helper to create a schedule tensor with dense init data
     auto createTensor = [&](SmallVector<int64_t> shapeVec, int64_t startVal) -> Value {

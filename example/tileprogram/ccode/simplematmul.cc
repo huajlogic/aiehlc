@@ -216,7 +216,8 @@ int main() {
 
     // --- Device + mesh ---
     aieSetDevice(0);
-    aieDim mesh(HW_ROWS, HW_COLS);
+    aiePartition part = {2, 7, 0, 10};
+    aieDim mesh(HW_ROWS, HW_COLS, part);
 
     // --- Allocate host memory ---
     int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t));

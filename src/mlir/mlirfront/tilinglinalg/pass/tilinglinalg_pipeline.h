@@ -38,6 +38,14 @@ struct SplitModel {
     static TensorSplitDesc fromSpatialTag(const std::string &tag, bool isInput);
 };
 
+/// Partition descriptor: confines tile allocation to a sub-region of the AIE array.
+/// When invalid (all -1), the full mesh is used.
+struct PartitionDesc {
+    int startCol = -1, endCol = -1; // column range [startCol, endCol]
+    int startRow = -1, endRow = -1; // row range [startRow, endRow]
+    bool isValid() const { return startCol >= 0; }
+};
+
 class TilingLinalgPipeline {
 public:
     /// Register all 6 dialect managers + standard dialects on ctx
@@ -47,9 +55,11 @@ public:
     /// meshRows/meshCols -> createhwmesh dimensions
     /// tensors -> createscheduletensor + createroutingfuncBySplitModel
     /// splitModel -> per-tensor data distribution strategy
+    /// partition -> optional sub-region for tile allocation
     static mlir::ModuleOp buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols,
                                          const std::vector<TensorParam> &tensors,
-                                         const SplitModel &splitModel = SplitModel::gemm());
+                                         const SplitModel &splitModel = SplitModel::gemm(),
+                                         const PartitionDesc &partition = {});
 
     /// Run the full pipeline and emit files to outputDir:
     ///   host.cc, kernel.cc, routing.cc, aieml.bcf, aieml.prx
