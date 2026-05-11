@@ -5,10 +5,12 @@
 
 #include "routing/routingtopology.h"
 
-RoutingTopology::RoutingTopology(std::string gen, std::string name)
-    : gen_(gen), name_(name),
-      rm_(std::make_shared<ResourceMgr>(makeResource(gen, name)))
-{}
+RoutingTopology::RoutingTopology(std::string gen, std::string name, int startCol, int endCol, int startRow, int endRow)
+    : gen_(gen), name_(name), rm_(std::make_shared<ResourceMgr>(makeResource(gen, name))) {
+    if (startCol >= 0) {
+        rm_->setPartitionBounds(startCol, endCol, startRow, endRow);
+    }
+}
 
 // ── createDataIO ────────────────────────────────────────────────────────
 std::shared_ptr<DataIO>
@@ -39,8 +41,12 @@ RoutingTopology::createDataIO(std::string dioName, std::optional<TypeBasedTileLo
     */
     auto dioId = rm_->allocdioid();
     std::optional<FoundDmaSlot> foundDmaSlot = rm_->freeShimNoc(loc, direct, dioId);// optional<TileCoord>
+    if (!foundDmaSlot) {
+        throw std::runtime_error("No free shim DMA slot for `" + std::string(dioName) + "`");
+        return nullptr;
+    }
     auto shimpoint = std::make_optional<Point>(foundDmaSlot->loc);
-    return _createDataIO(dioName, shimpoint, foundDmaSlot->direct, foundDmaSlot->channel);;
+    return _createDataIO(dioName, shimpoint, foundDmaSlot->direct, foundDmaSlot->channel);
 }
 
 std::shared_ptr<DataIO>

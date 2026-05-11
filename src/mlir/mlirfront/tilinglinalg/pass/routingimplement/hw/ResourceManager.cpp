@@ -244,6 +244,15 @@ ResourceMgr::ResourceMgr(std::unique_ptr<IHwResource> resource, TileType defType
     InitSHIMNocList();
 }
 
+void ResourceMgr::setPartitionBounds(int startCol, int endCol, int startRow, int endRow) {
+    partitionStartCol_ = startCol;
+    partitionEndCol_ = endCol;
+    partitionStartRow_ = startRow;
+    partitionEndRow_ = endRow;
+    std::cout << "[ResourceMgr] Partition bounds set: col=[" << startCol << "," << endCol << "] row=[" << startRow
+              << "," << endRow << "]" << std::endl;
+}
+
 void ResourceMgr::InitSHIMNocList() {
     auto& shimnocs = resource_->getShimNoc();
     for (auto x:shimnocs) {
@@ -350,6 +359,9 @@ std::optional<FoundDmaSlot> ResourceMgr::freeShimNoc(std::optional<TypeBasedTile
     std::shared_ptr<ShimTile> findShimTile;
     for (const auto& kv : shimTiles_) {
         ShimTile& t = *(kv.second);
+        // Skip shim tiles outside partition column bounds
+        if (hasPartition() && !isColInPartition(t.col()))
+            continue;
         if (requesterIoId >= 0 && t.isReserved() && t.getReservedByIoId() != requesterIoId)
             continue;
         if ( t.hasAnyFreeChannelForEngine(direct)) {
@@ -363,7 +375,7 @@ std::optional<FoundDmaSlot> ResourceMgr::freeShimNoc(std::optional<TypeBasedTile
             if (new_distance < old_distance) {
                 findShimTile = kv.second;
                 continue;
-            } 
+            }
         }
     }
 
@@ -382,6 +394,9 @@ std::optional<Point> ResourceMgr::freeShimNoc(std::optional<Point> dst) const {
     bool findAvailable = false;
     Point shimNoc = {0,-1};
     for(auto c:shimnocs){
+        // Skip shim tiles outside partition column bounds
+        if (hasPartition() && !isColInPartition(c))
+            continue;
         const RoutingTile& t = tile(0, c);
         if(t.type()!=TileType::Shim) continue;
         const auto& north = t.bank(PortDirection::North).slave;
@@ -543,24 +558,27 @@ bool ResourceMgr::reserveTiles(int ioId, int numTiles, ReservationStrategy strat
     
     if (strategy == ReservationStrategy::COLUMN_FIRST) {
         // Create a vector of columns sorted by proximity to the DataIO column
+        // Only include columns within partition bounds
         std::vector<int> colsByProximity;
         for (int c = 0; c < cols(); c++) {
-            colsByProximity.push_back(c);
+            if (isTileInPartition(0, c))
+                colsByProximity.push_back(c);
         }
-        
+
         // Sort columns by distance to DataIO column
-        std::sort(colsByProximity.begin(), colsByProximity.end(), 
-            [dataIoCol](int a, int b) {
-                return std::abs(a - dataIoCol) < std::abs(b - dataIoCol);
-            });
-        
+        std::sort(colsByProximity.begin(), colsByProximity.end(),
+                  [dataIoCol](int a, int b) { return std::abs(a - dataIoCol) < std::abs(b - dataIoCol); });
+
         // Try each column in order of proximity to DataIO
         for (int c : colsByProximity) {
             int consecutiveAvailable = 0;
             int firstAvailableRow = -1;
-            
-            // Look for consecutive available tiles in this column
+
+            // Look for consecutive available tiles in this column (within partition row bounds)
             for (int r = 0; r < rows(); r++) {
+                // Skip rows outside partition bounds
+                if (!isRowInPartition(r))
+                    continue;
                 // Check if tile is available and matches requested type if specified
                 bool tileAvailable = !isTileReserved(r, c);
                 if (requestedType.has_value()) {
@@ -611,24 +629,27 @@ bool ResourceMgr::reserveTiles(int ioId, int numTiles, ReservationStrategy strat
         }
     } else { // ROW_FIRST strategy
         // Create a vector of rows sorted by proximity to the DataIO row
+        // Only include rows within partition bounds
         std::vector<int> rowsByProximity;
         for (int r = 0; r < rows(); r++) {
-            rowsByProximity.push_back(r);
+            if (isRowInPartition(r))
+                rowsByProximity.push_back(r);
         }
-        
+
         // Sort rows by distance to DataIO row
-        std::sort(rowsByProximity.begin(), rowsByProximity.end(), 
-            [dataIoRow](int a, int b) {
-                return std::abs(a - dataIoRow) < std::abs(b - dataIoRow);
-            });
-        
+        std::sort(rowsByProximity.begin(), rowsByProximity.end(),
+                  [dataIoRow](int a, int b) { return std::abs(a - dataIoRow) < std::abs(b - dataIoRow); });
+
         // Try each row in order of proximity to DataIO
         for (int r : rowsByProximity) {
             int consecutiveAvailable = 0;
             int firstAvailableCol = -1;
-            
-            // Look for consecutive available tiles in this row
+
+            // Look for consecutive available tiles in this row (within partition col bounds)
             for (int c = 0; c < cols(); c++) {
+                // Skip columns outside partition bounds
+                if (!isColInPartition(c))
+                    continue;
                 // Check if tile is available and matches requested type if specified
                 bool tileAvailable = !isTileReserved(r, c);
                 if (requestedType.has_value()) {

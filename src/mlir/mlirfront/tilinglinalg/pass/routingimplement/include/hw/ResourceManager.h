@@ -489,6 +489,12 @@ class ResourceMgr {
 public:
   ResourceMgr(std::unique_ptr<IHwResource> resource, ::TileType defaultType = ::TileType::Core);
   static bool init(std::unique_ptr<IHwResource> resource, ::TileType defType = ::TileType::Core);
+
+  /// Set partition bounds to confine tile/shim allocation to a sub-region.
+  /// col range [startCol, endCol], row range [startRow, endRow] (inclusive).
+  /// Call before any allocation. When not set, full mesh is used.
+  void setPartitionBounds(int startCol, int endCol, int startRow, int endRow);
+  bool hasPartition() const { return partitionStartCol_ >= 0; }
   static std::shared_ptr<ResourceMgr> instance();
   uint32_t allocdioid();
 
@@ -559,7 +565,22 @@ public:
   bool releasePktId(int pktId, int ownerId = -1);
   bool isPktIdFree(int pktId) const;
 
+  // Partition bounds accessors
+  int partitionStartCol() const { return partitionStartCol_; }
+  int partitionEndCol() const { return partitionEndCol_; }
+  int partitionStartRow() const { return partitionStartRow_; }
+  int partitionEndRow() const { return partitionEndRow_; }
+
 private:
+  // Partition bounds (-1 = use full mesh)
+  int partitionStartCol_ = -1, partitionEndCol_ = -1;
+  int partitionStartRow_ = -1, partitionEndRow_ = -1;
+
+  // Check if a column/row is within partition bounds
+  bool isColInPartition(int c) const { return !hasPartition() || (c >= partitionStartCol_ && c <= partitionEndCol_); }
+  bool isRowInPartition(int r) const { return !hasPartition() || (r >= partitionStartRow_ && r <= partitionEndRow_); }
+  bool isTileInPartition(int r, int c) const { return isColInPartition(c) && isRowInPartition(r); }
+
   static constexpr int kMaxPktId = 32; // 5-bit AIE pkt_id field
   std::array<PktIdSlot, kMaxPktId> pktIdPool_{};
   void InitSHIMNocList();

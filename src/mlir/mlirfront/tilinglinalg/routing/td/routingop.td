@@ -94,17 +94,21 @@ def routing_routinggatherout : routingop<"routingroutinggatherout"> {
 def routing_createhwmesh :routingop<"routingcreatehwmesh"> {
 	let summary = "createhwmesh";
 	let cppNamespace = "routing";
-	let description = "create an hw mesh";
+	let description = "create an hw mesh with optional partition bounds";
 
 	let arguments = (ins
 		I64Attr:$row,
-		I64Attr:$col
+		I64Attr:$col,
+		OptionalAttr<I64Attr>:$startCol,
+		OptionalAttr<I64Attr>:$endCol,
+		OptionalAttr<I64Attr>:$startRow,
+		OptionalAttr<I64Attr>:$endRow
 		);
 
 	let results = (outs
 		I32:$output);
 
-	let assemblyFormat = " `row` `=` $row `,` `col` `=` $col attr-dict `->` type($output)";	
+	let hasCustomAssemblyFormat = 1;
 
 }
 

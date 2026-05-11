@@ -109,7 +109,13 @@ int main() {
     printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);
     // --- Device + mesh ---
     aieSetDevice(0);
-    aieDim mesh(HW_ROWS, HW_COLS);
+    // Confine tile allocation to a sub-region of the AIE array.
+    // Fields: {startCol, endCol, startRow, endRow}
+    // This partition uses columns [2,7] and rows [0,10], which covers
+    // Gen2 NoC shim columns {2,3,6,7} — enough for a 4x4 GEMM's ~12 DataIOs.
+    // Without a partition the full AIE array is used.
+    aiePartition part = {2 /*startCol*/, 5 /*endCol*/, 0 /*startRow*/, 6 /*endRow*/};
+    aieDim mesh(HW_ROWS, HW_COLS, part);
     // --- Allocate host memory ---
     int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t));
     int8_t *B = (int8_t *)malloc(K * N * sizeof(int8_t));

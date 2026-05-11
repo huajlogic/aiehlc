@@ -317,6 +317,54 @@ AieRC __Runtime_device_init(void) {
     return RC;
 }
 /**
+ * Partition-aware device init: XAie driver is configured for a column sub-range.
+ * startCol: first column of the partition (0-based)
+ * numCols: number of columns in the partition
+ */
+AieRC __Runtime_device_init_partition(int startCol, int numCols) {
+    printf("[aie_runtime] device_init_partition start: startCol=%d numCols=%d\n", startCol, numCols);
+    g_DevInst = &g_DevInst_storage;
+
+    AieRC RC = XAie_SetupPartitionConfig(g_DevInst, XAIE_BASE_ADDR + ((uint64_t)startCol << XAIE_COL_SHIFT), startCol,
+                                         numCols);
+    if (RC != XAIE_OK) {
+        printf("[aie_runtime] device_init_partition SetupPartitionConfig failed: %d\n", (int)RC);
+        return RC;
+    }
+
+    RC = XAie_CfgInitialize(g_DevInst, &g_Config);
+    if (RC != XAIE_OK) {
+        printf("[aie_runtime] device_init_partition CfgInitialize failed: %d\n", (int)RC);
+        return RC;
+    }
+
+    XAie_SetIOBackend(g_DevInst, XAIE_IO_BACKEND_BAREMETAL);
+
+#if AIE_GEN >= 2
+    if (g_DevInst->Backend->Type == XAIE_IO_BACKEND_BAREMETAL) {
+#if AIE_GEN == 5
+        RC = XAie_UpdateNpiAddr(g_DevInst, 0xf6d50000);
+#else
+        RC = XAie_UpdateNpiAddr(g_DevInst, 0xF6D10000);
+#endif
+        if (RC != XAIE_OK) {
+            return RC;
+        }
+    }
+    RC = XAie_PartitionInitialize(g_DevInst, NULL);
+#else
+    XAie_PmRequestTiles(g_DevInst, NULL, 0);
+    RC = XAIE_OK;
+#endif
+
+    if (RC == XAIE_OK)
+        printf("[aie_runtime] device_init_partition OK (startCol=%d numCols=%d)\n", startCol, numCols);
+    else
+        printf("[aie_runtime] device_init_partition partition/pm failed: %d\n", (int)RC);
+    return RC;
+}
+
+/**
  */
 void __Runtime_platform_init(void) {
     // FIXME: use cache coherency logic and comments this cache disable logic
