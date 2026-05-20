@@ -162,6 +162,8 @@ fi
 
 KERNEL_DIR=$(pwd)/aout/
 rm -rf $KERNEL_DIR
+# Also clean build/aout/ if it exists (stale from previous runs with different CWD)
+[ -d "$(pwd)/build/aout" ] && rm -rf "$(pwd)/build/aout"
 XILINX_VITIS_AIETOOLS=$XILINX_VITIS/aietools
 CARDANO_AIE_ARCH_MODEL_DIR="$XILINX_VITIS_AIETOOLS/data/versal_prod/lib"
 
@@ -331,6 +333,15 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
             host.cc|kernel.cc|routing.cc) continue ;;
         esac
         [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/${fname}"
+    done
+    # Copy user headers (.h) so host.cc picks up the latest definitions (e.g. M/K/N)
+    for f in "${HOST_BUILD_DIR}"/worklocal/*.h; do
+        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
+    done
+    # Also copy headers directly from SOURCE_DIR to ensure freshness
+    # (guards against stale copies from aiehlc output)
+    for f in "${SOURCE_DIR}"/*.h; do
+        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
     done
 
     # Run hostcompile.sh
