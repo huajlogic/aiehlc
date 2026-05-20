@@ -62,6 +62,18 @@ struct PartitionDesc {
     bool isValid() const { return startCol >= 0; }
 };
 
+/// Descriptor for a kernel launch on a specific mesh.
+/// Used by multi-kernel mode to associate each <<<meshVar>>> launch with
+/// its kernel name, mesh dimensions, partition, and tensor parameters.
+struct MeshKernelDesc {
+    std::string kernelName;  // e.g. "matmul", "relu"
+    std::string meshVarName; // e.g. "meshA", "meshB"
+    int meshRows = 0, meshCols = 0;
+    PartitionDesc partition;
+    std::vector<TensorParam> tensors;
+    int meshId = 0; // compiler-assigned ID for partition tracking
+};
+
 class TilingLinalgPipeline {
 public:
     /// Register all 6 dialect managers + standard dialects on ctx
@@ -83,10 +95,13 @@ public:
     /// instead of auto-generating the compute kernel. The function name
     /// in userKernelBody (userKernelFuncName) is renamed to match the
     /// pipeline's expected compute kernel name.
+    /// hostFuncSuffix: when non-empty, the generated host function is named
+    ///   host_canonicalized_<suffix> instead of host_canonicalized.
+    ///   Used by multi-kernel mode to generate per-kernel host functions.
     /// Returns true on success.
     static bool runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                             const std::string &userKernelBody = "", const std::string &userKernelFuncName = "",
                             int runtimeDebugLevel = -1, const std::string &userRewrittenSource = "",
                             const std::vector<TensorParam> &tensors = {}, int64_t maxPingPongBytes = 4096,
-                            const std::string &aieGen = "Gen2");
+                            const std::string &aieGen = "Gen2", const std::string &hostFuncSuffix = "");
 };

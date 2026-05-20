@@ -38,8 +38,7 @@ typedef struct {
     uint32_t timeout_us;
 } struct_event;
 
-// Global device instance (to be initialized by host)
-extern XAie_DevInst *g_DevInst;
+// Global routing instance (kept for legacy path)
 extern XAie_RoutingInstance *g_RoutingInst;
 
 // Debug level: bits 0-3 = verbosity (0-15), bits 4-31 = feature flags
@@ -219,13 +218,30 @@ static inline PartitionTensor __Runtime_extract_slice_strided_2d(XAie_DevInst *d
 // Reference: aieml_perf.cc for XAie API usage patterns
 // ---------------------------------------------------------------------------
 
-// Device layout declare and init (reference: aieml_perf.cc main lines 292-344, 348-352)
-AieRC __Runtime_device_init(void);
-// Partition-aware device init: confines the AIE driver to columns [startCol, startCol+numCols).
-// Row constraints are handled at compile time (generated code only references tiles in-partition).
-AieRC __Runtime_device_init_partition(int startCol, int numCols);
-void __Runtime_routing_init(void);
-AieRC __Runtime_device_teardown(void);
+// Routing init (takes explicit dev pointer)
+void __Runtime_routing_init(XAie_DevInst *dev);
+// Device teardown (takes explicit dev pointer)
+AieRC __Runtime_device_teardown(XAie_DevInst *dev);
+
+// ---------------------------------------------------------------------------
+// Explicit init/teardown: heap-allocates XAie_DevInst, returns pointer.
+// Caller owns the returned pointer and must call __Runtime_explicit_teardown().
+// ---------------------------------------------------------------------------
+XAie_DevInst *__Runtime_explicit_init(void);
+XAie_DevInst *__Runtime_explicit_init_partition(int startCol, int numCols);
+void __Runtime_explicit_teardown(XAie_DevInst *dev);
+
+// ---------------------------------------------------------------------------
+// Partition registry: init-once, get-existing, teardown-all.
+// Used by the multi-kernel/multi-partition programming model.
+// Each aieMesh carries a meshId; the runtime tracks which meshIds have been
+// initialized. If already initialized, skip re-init and return the existing
+// XAie_DevInst*. aieArray::synchronize() calls __Runtime_teardown_all().
+// ---------------------------------------------------------------------------
+int __Runtime_partition_is_initialized(int meshId);
+XAie_DevInst *__Runtime_get_partition_dev(int meshId);
+void __Runtime_register_partition(int meshId, XAie_DevInst *dev);
+void __Runtime_teardown_all(void);
 
 // DMA and data movement
 XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, int32_t len,
@@ -271,41 +287,40 @@ struct_io __Runtime_dma_createio(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, i
 struct_io __Runtime_dma_createio_4(XAie_LocType tile_loc, XAie_DmaDesc dma_desc, int32_t channel_id, int32_t bd_id,
                                    XAie_DmaDirection direction);
 
-struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id, int32_t repeat);
-struct_ioevent _Runtime_startio_ooo(struct_io io, int32_t bd_id, int32_t repeat);
+struct_ioevent __Runtime_startio(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat);
+struct_ioevent _Runtime_startio_ooo(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat);
 
-// Kernel management
-struct_kernel_group __Runtime_load_kernel_group(XAie_LocType *tiles, int32_t num_tiles, unsigned char **elf_buffers);
-/* 4-tile + count version for emitted host code */
-struct_kernel_group __Runtime_load_kernel_group_4t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
-                                                   int n);
-/* N-tile array version for emitted host code (supports any tile count) */
-struct_kernel_group __Runtime_load_kernel_group_nt(XAie_LocType *tiles, int n);
-/* 8-tile and 16-tile positional variants for EmitC-generated host code */
-struct_kernel_group __Runtime_load_kernel_group_8t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
-                                                   XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7,
-                                                   int n);
-struct_kernel_group __Runtime_load_kernel_group_16t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
-                                                    XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7,
-                                                    XAie_LocType t8, XAie_LocType t9, XAie_LocType t10,
-                                                    XAie_LocType t11, XAie_LocType t12, XAie_LocType t13,
-                                                    XAie_LocType t14, XAie_LocType t15, int n);
+// Kernel management (all take explicit XAie_DevInst*)
+struct_kernel_group __Runtime_load_kernel_group(XAie_DevInst *dev, XAie_LocType *tiles, int32_t num_tiles,
+                                                unsigned char **elf_buffers);
+struct_kernel_group __Runtime_load_kernel_group_nt(XAie_DevInst *dev, XAie_LocType *tiles, int n);
+struct_kernel_group __Runtime_load_kernel_group_4t(XAie_DevInst *dev, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+                                                   XAie_LocType t3, int n);
+struct_kernel_group __Runtime_load_kernel_group_8t(XAie_DevInst *dev, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+                                                   XAie_LocType t3, XAie_LocType t4, XAie_LocType t5, XAie_LocType t6,
+                                                   XAie_LocType t7, int n);
+struct_kernel_group __Runtime_load_kernel_group_16t(XAie_DevInst *dev, XAie_LocType t0, XAie_LocType t1,
+                                                    XAie_LocType t2, XAie_LocType t3, XAie_LocType t4, XAie_LocType t5,
+                                                    XAie_LocType t6, XAie_LocType t7, XAie_LocType t8, XAie_LocType t9,
+                                                    XAie_LocType t10, XAie_LocType t11, XAie_LocType t12,
+                                                    XAie_LocType t13, XAie_LocType t14, XAie_LocType t15, int n);
 
-struct_event __Runtime_launch_kernel_group(struct_kernel_group kg);
+struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_group kg);
 
 // Core enable (reference: aeg_runtime_api.cpp graph_api::run)
-void __Runtime_core_run(XAie_LocType *tiles, uint32_t num_tiles);
+void __Runtime_core_run(XAie_DevInst *dev, XAie_LocType *tiles, uint32_t num_tiles);
 
 // Synchronization
-void __Runtime_wait_event(struct_event ev);
-void __Runtime_wait_io(struct_ioevent io_ev);
+void __Runtime_wait_event(XAie_DevInst *dev, struct_event ev);
+void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_ev);
 /* C only: single name for emitted host. */
 #ifndef __cplusplus
-#define __Runtime_wait(x) _Generic((x), struct_event: __Runtime_wait_event, struct_ioevent: __Runtime_wait_io)(x)
+#define __Runtime_wait(dev, x)                                                                                         \
+    _Generic((x), struct_event: __Runtime_wait_event, struct_ioevent: __Runtime_wait_io)(dev, x)
 #else
-/* C++ overloads so emitted host can call __Runtime_wait(event_or_ioevent) */
-inline void __Runtime_wait(struct_event ev) { __Runtime_wait_event(ev); }
-inline void __Runtime_wait(struct_ioevent ev) { __Runtime_wait_io(ev); }
+/* C++ overloads so emitted host can call __Runtime_wait(dev, event_or_ioevent) */
+inline void __Runtime_wait(XAie_DevInst *dev, struct_event ev) { __Runtime_wait_event(dev, ev); }
+inline void __Runtime_wait(XAie_DevInst *dev, struct_ioevent ev) { __Runtime_wait_io(dev, ev); }
 #endif
 
 // Kernel log reader (reads log entries from core tile data memory)

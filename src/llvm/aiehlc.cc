@@ -82,6 +82,7 @@ static int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0; // GEMM dimensions f
 static int parsedDebugLevel = -1; // -1 = not set by user, >=0 = #pragma aie_debug_level value
 static std::string userSourceDir; // directory containing the original user source file
 static PartitionDesc parsedPartition; // default: invalid (all -1), set by #pragma aie_partition
+static std::vector<MeshKernelDesc> parsedMeshKernels; // multi-kernel mode: one per <<<mesh>>> launch
 static std::vector<std::string> kernel_name_list;
 static std::unordered_map<std::string, const clang::FunctionDecl*> globalKernelFuncs;
 static std::string userKernelBody;      // raw source text of __global__ function body
@@ -520,54 +521,104 @@ public:
 			// Detect __aie_launch("kernelName", mesh, A, B, C, M, N, K) for tiling mode
 			if (Callee && Callee->getNameAsString() == "__aie_launch") {
 				isTilingLinalgMode = true;
-				// Guard: only parse tensor params once (AST visitor may visit the call twice)
-				if (!parsedTensors.empty()) {
-					return true;
-				}
-				// Arg 0: kernel name (string literal after preprocessing)
+
+                // Extract kernel name to check for duplicate AST visits
+                std::string currentLaunchKernel;
+                if (CE->getNumArgs() >= 1) {
+                    if (const auto *SL = dyn_cast<clang::StringLiteral>(CE->getArg(0)->IgnoreParenImpCasts()))
+                        currentLaunchKernel = SL->getString().str();
+                }
+
+                // Guard: skip if this exact kernel was already parsed (AST visitor may visit twice)
+                for (const auto &mk : parsedMeshKernels) {
+                    if (mk.kernelName == currentLaunchKernel)
+                        return true;
+                }
+
+                // For multi-kernel: first launch populates parsedTensors/tilingMeshRows/etc.
+                // Subsequent launches add to parsedMeshKernels but don't overwrite the globals
+                // (backward compat: globals reflect the first kernel's values).
+                bool isFirstKernel = parsedMeshKernels.empty();
+
+                // Arg 0: kernel name (string literal after preprocessing)
 				if (CE->getNumArgs() >= 2) {
-					// Try to extract kernel name from first arg (string literal)
-					if (const auto *SL = dyn_cast<clang::StringLiteral>(CE->getArg(0)->IgnoreParenImpCasts())) {
-						llvm::outs() << "[TilingLinalg] Detected kernel launch: " << SL->getString() << "\n";
-					}
-					// Arg 1: aieDim mesh variable — extract rows/cols from CXXConstructExpr
-					const Expr *meshArg = CE->getArg(1)->IgnoreParenImpCasts();
-					if (const auto *Construct = dyn_cast<CXXConstructExpr>(meshArg)) {
-						if (Construct->getNumArgs() >= 2) {
-                            // Direct construction: __aie_launch("k", aieDim(4,4), ...)
+                    if (!currentLaunchKernel.empty()) {
+                        llvm::outs() << "[TilingLinalg] Detected kernel launch: " << currentLaunchKernel << "\n";
+                    }
+                    // Arg 1: aieDim or aieMesh variable — extract rows/cols
+                    const Expr *meshArg = CE->getArg(1)->IgnoreParenImpCasts();
+
+                    // Local vars for this kernel's mesh dims and partition
+                    int localMeshRows = 0, localMeshCols = 0;
+                    PartitionDesc localPartition;
+                    // Helper: extract mesh dims from a CXXConstructExpr (aieDim(rows, cols [, part]))
+                    auto extractDimsFromConstruct = [&](const CXXConstructExpr *Construct) {
+                        if (Construct->getNumArgs() >= 2) {
                             clang::Expr::EvalResult r0, r1;
-							if (Construct->getArg(0)->EvaluateAsInt(r0, *Context) &&
+                            if (Construct->getArg(0)->EvaluateAsInt(r0, *Context) &&
 								Construct->getArg(1)->EvaluateAsInt(r1, *Context)) {
-								tilingMeshRows = r0.Val.getInt().getExtValue();
-								tilingMeshCols = r1.Val.getInt().getExtValue();
-								llvm::outs() << "[TilingLinalg] Mesh: " << tilingMeshRows << " x " << tilingMeshCols << "\n";
-							}
-                            // Check for 3rd arg (aiePartition)
+                                localMeshRows = r0.Val.getInt().getExtValue();
+                                localMeshCols = r1.Val.getInt().getExtValue();
+                            }
                             if (Construct->getNumArgs() >= 3) {
                                 extractPartitionFromExpr(Construct->getArg(2), Context);
+                                localPartition = parsedPartition;
                             }
+                        }
+                    };
+
+                    // Helper: extract mesh dims from an aieMesh VarDecl initialized via device.partition(part, rows,
+                    // cols)
+                    auto extractDimsFromAieMeshVar = [&](const VarDecl *VD) -> bool {
+                        if (!VD->hasInit())
+                            return false;
+                        const Expr *init = VD->getInit()->IgnoreParenImpCasts();
+                        // Handle ExprWithCleanups wrapper
+                        if (const auto *EWC = dyn_cast<ExprWithCleanups>(init))
+                            init = EWC->getSubExpr()->IgnoreParenImpCasts();
+                        // Handle MaterializeTemporaryExpr wrapper
+                        if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(init))
+                            init = MTE->getSubExpr()->IgnoreParenImpCasts();
+                        // device.partition({...}, rows, cols) is a CXXMemberCallExpr
+                        if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(init)) {
+                            if (const auto *MD = MCE->getMethodDecl()) {
+                                if (MD->getNameAsString() == "partition" && MCE->getNumArgs() >= 3) {
+                                    // Arg 0: aiePartition, Arg 1: rows, Arg 2: cols
+                                    extractPartitionFromExpr(MCE->getArg(0), Context);
+                                    localPartition = parsedPartition;
+                                    clang::Expr::EvalResult r0, r1;
+                                    if (MCE->getArg(1)->EvaluateAsInt(r0, *Context) &&
+                                        MCE->getArg(2)->EvaluateAsInt(r1, *Context)) {
+                                        localMeshRows = r0.Val.getInt().getExtValue();
+                                        localMeshCols = r1.Val.getInt().getExtValue();
+                                    }
+                                    return true;
+                                }
+                            }
+                        }
+                        // Fallback: CXXConstructExpr (aieDim or aggregate init)
+                        if (const auto *Construct = dyn_cast<CXXConstructExpr>(init)) {
+                            extractDimsFromConstruct(Construct);
+                            return localMeshRows > 0;
+                        }
+                        return false;
+                    };
+
+                    if (const auto *Construct = dyn_cast<CXXConstructExpr>(meshArg)) {
+                        if (Construct->getNumArgs() >= 2) {
+                            // Direct construction: __aie_launch("k", aieDim(4,4), ...)
+                            extractDimsFromConstruct(Construct);
                         } else if (Construct->getNumArgs() == 1) {
                             // Copy/move constructor: __aie_launch("k", mesh, ...) where mesh is by-value
-                            // Look through the copy to find the original DeclRefExpr
                             const Expr *inner = Construct->getArg(0)->IgnoreParenImpCasts();
                             if (const auto *DR = dyn_cast<DeclRefExpr>(inner)) {
                                 if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
-                                    if (VD->hasInit()) {
-                                        if (const auto *InitConstruct =
-                                                dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
-                                            if (InitConstruct->getNumArgs() >= 2) {
-                                                clang::Expr::EvalResult r0, r1;
-                                                if (InitConstruct->getArg(0)->EvaluateAsInt(r0, *Context) &&
-                                                    InitConstruct->getArg(1)->EvaluateAsInt(r1, *Context)) {
-                                                    tilingMeshRows = r0.Val.getInt().getExtValue();
-                                                    tilingMeshCols = r1.Val.getInt().getExtValue();
-                                                    llvm::outs() << "[TilingLinalg] Mesh (from copy-ctor var): "
-                                                                 << tilingMeshRows << " x " << tilingMeshCols << "\n";
-                                                }
-                                                // Check for 3rd arg (aiePartition)
-                                                if (InitConstruct->getNumArgs() >= 3) {
-                                                    extractPartitionFromExpr(InitConstruct->getArg(2), Context);
-                                                }
+                                    if (!extractDimsFromAieMeshVar(VD)) {
+                                        // Try aieDim ctor inside VarDecl init
+                                        if (VD->hasInit()) {
+                                            if (const auto *IC =
+                                                    dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
+                                                extractDimsFromConstruct(IC);
                                             }
                                         }
                                     }
@@ -575,28 +626,36 @@ public:
                             }
                         }
                     } else if (const auto *DR = dyn_cast<DeclRefExpr>(meshArg)) {
-						// mesh variable already declared — get rows/cols from its initializer
-						if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
-							if (VD->hasInit()) {
-								if (const auto *Construct = dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
-									if (Construct->getNumArgs() >= 2) {
-										clang::Expr::EvalResult r0, r1;
-										if (Construct->getArg(0)->EvaluateAsInt(r0, *Context) &&
-											Construct->getArg(1)->EvaluateAsInt(r1, *Context)) {
-											tilingMeshRows = r0.Val.getInt().getExtValue();
-											tilingMeshCols = r1.Val.getInt().getExtValue();
-											llvm::outs() << "[TilingLinalg] Mesh (from var): " << tilingMeshRows << " x " << tilingMeshCols << "\n";
-										}
-                                        // Check for 3rd arg (aiePartition)
-                                        if (Construct->getNumArgs() >= 3) {
-                                            extractPartitionFromExpr(Construct->getArg(2), Context);
-                                        }
+                        // mesh variable already declared — get rows/cols from initializer
+                        if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
+                            if (!extractDimsFromAieMeshVar(VD)) {
+                                // Fallback: try CXXConstructExpr (aieDim)
+                                if (VD->hasInit()) {
+                                    if (const auto *Construct =
+                                            dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
+                                        extractDimsFromConstruct(Construct);
                                     }
                                 }
-							}
-						}
-					}
-					// Extract tensor params from the __global__ kernel function signature
+                            }
+                        }
+                    }
+
+                    if (localMeshRows > 0 && localMeshCols > 0) {
+                        llvm::outs() << "[TilingLinalg] Mesh: " << localMeshRows << " x " << localMeshCols << "\n";
+                        if (localPartition.isValid()) {
+                            llvm::outs() << "[TilingLinalg] Partition: [" << localPartition.startCol << ","
+                                         << localPartition.endCol << "," << localPartition.startRow << ","
+                                         << localPartition.endRow << "]\n";
+                        }
+                    }
+
+                    // Update globals for backward compat (first kernel only)
+                    if (isFirstKernel) {
+                        tilingMeshRows = localMeshRows;
+                        tilingMeshCols = localMeshCols;
+                        parsedPartition = localPartition;
+                    }
+                    // Extract tensor params from the __global__ kernel function signature
 					// Args 2+ of __aie_launch correspond to the kernel function parameters
 					std::string launchKernelName;
 					if (const auto *SL2 = dyn_cast<clang::StringLiteral>(CE->getArg(0)->IgnoreParenImpCasts())) {
@@ -1021,10 +1080,12 @@ public:
 					}
 
                     // ---- Compute derived tiling parameters from M/K/N + per-port policy ----
-                    if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0 && tilingMeshRows > 0 && tilingMeshCols > 0 &&
-                        !parsedTensors.empty()) {
-                        derivedTilingParams.tileRows = macroDimM / tilingMeshRows;
-                        derivedTilingParams.tileCols = macroDimN / tilingMeshCols;
+                    int effectiveMeshRows = localMeshRows > 0 ? localMeshRows : tilingMeshRows;
+                    int effectiveMeshCols = localMeshCols > 0 ? localMeshCols : tilingMeshCols;
+                    if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0 && effectiveMeshRows > 0 &&
+                        effectiveMeshCols > 0 && !parsedTensors.empty()) {
+                        derivedTilingParams.tileRows = macroDimM / effectiveMeshRows;
+                        derivedTilingParams.tileCols = macroDimN / effectiveMeshCols;
                         derivedTilingParams.kDim = macroDimK;
 
                         for (auto &pt : parsedTensors) {
@@ -1067,7 +1128,7 @@ public:
                                     }
                                 } else {
                                     // Unresolved policy — use defaults
-                                    int64_t totalElements = pt.shape[0] * pt.shape[1] / tilingMeshRows;
+                                    int64_t totalElements = pt.shape[0] * pt.shape[1] / effectiveMeshRows;
                                     pp.bufferSize = std::min(totalElements / ppDepth, (int64_t)maxBuf);
                                     if (pp.bufferSize <= 0)
                                         pp.bufferSize = totalElements;
@@ -1095,6 +1156,23 @@ public:
                                          << "]: numRounds=" << derivedTilingParams.portParams[i].numRounds
                                          << " bufferSize=" << derivedTilingParams.portParams[i].bufferSize << "\n";
                         }
+                    }
+
+                    // ---- Store MeshKernelDesc for multi-kernel support ----
+                    {
+                        MeshKernelDesc mkd;
+                        mkd.kernelName = currentLaunchKernel;
+                        mkd.meshRows = localMeshRows > 0 ? localMeshRows : tilingMeshRows;
+                        mkd.meshCols = localMeshCols > 0 ? localMeshCols : tilingMeshCols;
+                        mkd.partition = localPartition.isValid() ? localPartition : parsedPartition;
+                        mkd.meshId = (int)parsedMeshKernels.size();
+                        for (auto &pt : parsedTensors) {
+                            mkd.tensors.push_back({pt.shape, pt.elementBitWidth, pt.isInput});
+                        }
+                        parsedMeshKernels.push_back(mkd);
+                        llvm::outs() << "[TilingLinalg] Registered MeshKernelDesc: kernel=" << mkd.kernelName
+                                     << " mesh=" << mkd.meshRows << "x" << mkd.meshCols << " meshId=" << mkd.meshId
+                                     << "\n";
                     }
                 }
 				return true;
@@ -1671,6 +1749,20 @@ public:
                     ret += "struct aiePartition {\n";
                     ret += "    int startCol, endCol, startRow, endRow;\n";
                     ret += "};\n";
+                    // New programming model types: aieMesh + aieArray
+                    ret += "struct aieMesh {\n";
+                    ret += "    int rows, cols;\n";
+                    ret += "    aiePartition partition;\n";
+                    ret += "    int meshId;\n";
+                    ret += "};\n";
+                    ret += "struct aieArray {\n";
+                    ret += "    int nextMeshId = 0;\n";
+                    ret += "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
+                    ret += "        return aieMesh{rows, cols, p, nextMeshId++};\n";
+                    ret += "    }\n";
+                    ret += "    void synchronize() {}\n";
+                    ret += "};\n";
+                    // Backward-compatible aieDim
                     ret += "struct aieDim {\n";
                     ret += "    int rows, cols;\n";
                     ret += "    aiePartition partition;\n";
@@ -1688,6 +1780,10 @@ public:
                     // generated later by TilingLinalgPipeline::runPipeline when
                     // appending user source to host.cc.
                     ret += "extern void host_canonicalized(...);\n";
+                    ret += "template<typename... Args>\n";
+                    ret += "inline void __aie_launch(const char* kernel, aieMesh mesh, Args... args) {\n";
+                    ret += "    (void)kernel; (void)mesh; (void)sizeof...(args);\n";
+                    ret += "}\n";
                     ret += "template<typename... Args>\n";
                     ret += "inline void __aie_launch(const char* kernel, aieDim mesh, Args... args) {\n";
                     ret += "    (void)kernel; (void)mesh; (void)sizeof...(args);\n";
@@ -1940,10 +2036,15 @@ public:
             }
 
             // Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
+            // When multiple kernels are detected, suffix host function with kernel name
+            std::string hostFuncSuffix;
+            if (parsedMeshKernels.size() > 1 && !userKernelFuncName.empty()) {
+                hostFuncSuffix = userKernelFuncName;
+            }
             std::string outputDir = std::string(AOUT) + "worklocal/";
             if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros, userKernelFuncName,
                                                   parsedDebugLevel, userRewrittenSource, {}, effectiveMaxPPBytes,
-                                                  aieGenStr)) {
+                                                  aieGenStr, hostFuncSuffix)) {
                 llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
                 // Copy user #include "..." headers to outputDir so host.cc is self-contained.
                 if (!userSourceDir.empty() && !userRewrittenSource.empty()) {

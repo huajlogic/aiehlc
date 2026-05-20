@@ -47,12 +47,9 @@ struct EnableExtToAieShimPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
             ValueRange{colConstOp, rowConstOp});
 
-        //get the device instance
-        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
-        auto devInstPtrType = emitc::PointerType::get(devInstType);
-        auto deviceInstOp = rewriter.create<emitc::CallOp>(
-                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
-        Value deviceInst = deviceInstOp.getResult(0);
+        // get the device instance from parent function's first argument (XAie_DevInst* dev)
+        auto parentFunc = op->getParentOfType<func::FuncOp>();
+        Value deviceInst = parentFunc.getArgument(0);
 
         StringRef callee = "XAie_EnableShimDmaToAieStrmPort";
         Value arg0 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(portidx));
@@ -104,12 +101,9 @@ struct EnableAieToExtShimPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
             ValueRange{colConstOp, rowConstOp});
 
-        //get the device instance
-        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
-        auto devInstPtrType = emitc::PointerType::get(devInstType);
-        auto deviceInstOp = rewriter.create<emitc::CallOp>(
-                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
-        Value deviceInst = deviceInstOp.getResult(0);
+        // get the device instance from parent function's first argument (XAie_DevInst* dev)
+        auto parentFunc = op->getParentOfType<func::FuncOp>();
+        Value deviceInst = parentFunc.getArgument(0);
 
         StringRef callee = "XAie_EnableAieToShimDmaStrmPort";
         Value arg0 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(portidx));
@@ -215,13 +209,9 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
             ValueRange{colConstOp, rowConstOp});
 
-        
-
-        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
-        auto devInstPtrType = emitc::PointerType::get(devInstType);
-        auto deviceInstOp = rewriter.create<emitc::CallOp>(
-                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
-        Value deviceInst = deviceInstOp.getResult(0);
+        // get the device instance from parent function's first argument (XAie_DevInst* dev)
+        auto parentFunc = op->getParentOfType<func::FuncOp>();
+        Value deviceInst = parentFunc.getArgument(0);
         //slave port enable
         StringRef calleeS = "XAie_StrmPktSwSlaveSlotEnable";
          //string type
@@ -382,11 +372,9 @@ struct ConnectStreamSingleSwitchPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
             ValueRange{colConstOp, rowConstOp});
 
-        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
-        auto devInstPtrType = emitc::PointerType::get(devInstType);
-        auto deviceInstOp = rewriter.create<emitc::CallOp>(
-                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
-        Value deviceInst = deviceInstOp.getResult(0);
+        // get the device instance from parent function's first argument (XAie_DevInst* dev)
+        auto parentFunc = op->getParentOfType<func::FuncOp>();
+        Value deviceInst = parentFunc.getArgument(0);
 
         StringRef callee = "XAie_StrmConnCctEnable";
          //string type
@@ -654,9 +642,6 @@ void declareAieTileFunction(mlir::ModuleOp module) {
 
   auto decl1 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_TileLoc", funcType);
   decl1.setVisibility(SymbolTable::Visibility::Private);
-
-  auto decl2 = builder.create<emitc::FuncOp>(module.getLoc(), "getOrCreateDeviceInstance", getdevInstType);
-  decl2.setVisibility(SymbolTable::Visibility::Private);
 
   auto decl3 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_EnableShimDmaToAieStrmPort", shimportenableType);
   decl3.setVisibility(SymbolTable::Visibility::Private);

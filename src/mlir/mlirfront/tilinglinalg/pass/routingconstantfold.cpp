@@ -281,7 +281,7 @@ struct RemoveDeadCallOp : public mlir::OpRewritePattern<mlir::emitc::CallOp> {
         // XAie_* API calls configure hardware registers and must not be
         // removed even when their return value is unused.
         auto callee = callOp.getCallee();
-        if (callee == "XAie_TileLoc" || callee == "getOrCreateDeviceInstance") {
+        if (callee == "XAie_TileLoc") {
             rewriter.eraseOp(callOp);
             return success();
         }

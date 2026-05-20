@@ -403,7 +403,12 @@ def setup_first_connection(nonreboot=False):
     print("[Connection 1] In xsdb, connecting...")
     
     # Step 7: Connect
-    child.sendline("conn")
+    if nonreboot:
+        #child.sendline("hw_server -stcp:0.0.0.0:3121 &")
+        #child.expect(r'xsdb%', timeout=60)
+        child.sendline("connect -url TCP:10.23.224.213:3121")
+    else:
+        child.sendline("conn")
     child.expect(r'xsdb%', timeout=60)
     print("[Connection 1] Connected, targeting device 1...")
     
@@ -656,8 +661,7 @@ Examples:
                 print("\n>>> Cleaning up Connection 1...")
                 exit_xsdb_and_poweroff(conn1)
             else:
-                print("\n>>> --nonreboot: cleaning up board (power cycle)...")
-                exit_xsdb_and_power_cycle(conn1)
+                print("\n>>> --nonreboot: skipping cleanup, board left as-is for manual debug")
             print("\n" + "=" * 60)
             print("Test FAILED (PLM stall)")
             print("=" * 60)
@@ -768,9 +772,8 @@ Examples:
             exit_xsdb_and_poweroff(conn1)
             log.debug("main: exit_xsdb_and_poweroff done")
         else:
-            log.debug("main: nonreboot mode, cleaning up board (power cycle)...")
-            print("\n>>> --nonreboot: cleaning up board (power cycle)...")
-            exit_xsdb_and_power_cycle(conn1)
+            log.debug("main: nonreboot mode, skipping cleanup entirely")
+            print("\n>>> --nonreboot: skipping cleanup, board left powered on for manual debug")
 
         print("\n" + "=" * 60)
         print("Test complete!")
@@ -785,10 +788,7 @@ Examples:
             except Exception:
                 pass
         elif conn1 and args.nonreboot:
-            try:
-                exit_xsdb_and_power_cycle(conn1)
-            except Exception:
-                pass
+            print("[--nonreboot] Skipping cleanup, board left as-is")
         sys.exit(1)
     except pexpect.EOF as e:
         log.error("main: pexpect.EOF: %s", e)
@@ -803,10 +803,7 @@ Examples:
             except Exception:
                 pass
         elif conn1 and args.nonreboot:
-            try:
-                exit_xsdb_and_power_cycle(conn1)
-            except Exception:
-                pass
+            print("[--nonreboot] Skipping cleanup, board left as-is")
         sys.exit(1)
     finally:
         # Cleanup - ensure thread is stopped and connections closed

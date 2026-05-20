@@ -15,7 +15,7 @@ constexpr aie::SpatialPolicy LtoR_Merge = {.pattern = aie::Pattern::Gather,
                                            .merge_order = aie::Flow::LeftToRight,
                                            .pp_depth = 2,
                                            .max_buffer_bytes = 4096};
-#define DEBUG_OUTPUT_ORDER 0
+#define DEBUG_OUTPUT_ORDER 1
 __global__ void matmul(aie::port<input_window_int8 *, RowBC> win_a, aie::port<input_window_int8 *, ColBC> win_b,
                        aie::port<output_window_int8 *, LtoR_Merge> win_c) {
 
@@ -39,7 +39,7 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBC> win_a, aie::port<in
     int col = coreid >> 16;
     int row = coreid & 0x1F;
     int8_t tag = (int8_t)((row & 0x7) | ((col & 0x7) << 3));
-    klog("DEBUG", 2);
+    klog("DEBUG", 3);
 #endif
 
     // Local buffers
@@ -55,7 +55,7 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBC> win_a, aie::port<in
     }
 
 #if DEBUG_OUTPUT_ORDER
-    for (int i = 0; i < k_dim; i++) {
+    for (int i = 0; i < 16; i++) {
         klog("A0  ", (int32_t)all_A[i]);
     }
 #endif
@@ -66,7 +66,7 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBC> win_a, aie::port<in
 
 #if DEBUG_OUTPUT_ORDER
         if (rb == 0) {
-            for (int i = 0; i < k_dim; i++) {
+            for (int i = 0; i < 16; i++) {
                 klog("B0  ", (int32_t)B_ptr[i]);
             }
         }
@@ -99,6 +99,13 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBC> win_a, aie::port<in
         int8_t *out = (int8_t *)acquire_output_window(win_c);
         for (int i = 0; i < buf_sz_c; i++)
             out[i] = local_out[rc * buf_sz_c + i];
+#if DEBUG_OUTPUT_ORDER
+        if (rc == 0) {
+            for (int l = 0; l < 8; l++) {
+                klog("C0 ", (int32_t)out[l]);
+            }
+        }
+#endif
         release_output_window(win_c);
     }
 }
@@ -109,13 +116,12 @@ int main() {
     printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);
     // --- Device + mesh ---
     aieSetDevice(0);
-    // Confine tile allocation to a sub-region of the AIE array.
+    aieArray device;
+    // Carve a partition from the AIE array.
     // Fields: {startCol, endCol, startRow, endRow}
-    // This partition uses columns [2,7] and rows [0,10], which covers
-    // Gen2 NoC shim columns {2,3,6,7} — enough for a 4x4 GEMM's ~12 DataIOs.
-    // Without a partition the full AIE array is used.
-    aiePartition part = {2 /*startCol*/, 5 /*endCol*/, 0 /*startRow*/, 6 /*endRow*/};
-    aieDim mesh(HW_ROWS, HW_COLS, part);
+    // This partition uses columns [2,5] and rows [0,6], which covers
+    // Gen2 NoC shim columns {2,3} — enough for a 4x4 GEMM's ~12 DataIOs.
+    aieMesh mesh = device.partition({1, 4, 0, 6}, HW_ROWS, HW_COLS);
     // --- Allocate host memory ---
     int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t));
     int8_t *B = (int8_t *)malloc(K * N * sizeof(int8_t));
@@ -129,8 +135,8 @@ int main() {
         C[i] = 0;
     // --- Launch kernel on tile mesh ---
     matmul<<<mesh>>>(A, B, C, M, N, K);
-    // --- Wait for completion ---
-    aieDeviceSynchronize();
+    // --- Wait for all partitions and teardown ---
+    device.synchronize();
     // --- Verify output ---
     int result = verify_matmul(A, B, C);
     // --- Cleanup ---

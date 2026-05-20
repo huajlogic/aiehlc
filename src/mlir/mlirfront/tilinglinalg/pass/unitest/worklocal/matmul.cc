@@ -1,6 +1,6 @@
 // User-provided compute kernel (extracted from __global__ function)
 // User macro definitions from source file
-#define DEBUG_OUTPUT_ORDER 0
+#define DEBUG_OUTPUT_ORDER 1
 
 void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_int8 *win_c) {
 
@@ -24,7 +24,7 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
     int col = coreid >> 16;
     int row = coreid & 0x1F;
     int8_t tag = (int8_t)((row & 0x7) | ((col & 0x7) << 3));
-    klog("DEBUG", 2);
+    klog("DEBUG", 3);
 #endif
 
     // Local buffers
@@ -40,7 +40,7 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
     }
 
 #if DEBUG_OUTPUT_ORDER
-    for (int i = 0; i < k_dim; i++) {
+    for (int i = 0; i < 16; i++) {
         klog("A0  ", (int32_t)all_A[i]);
     }
 #endif
@@ -51,7 +51,7 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
 
 #if DEBUG_OUTPUT_ORDER
         if (rb == 0) {
-            for (int i = 0; i < k_dim; i++) {
+            for (int i = 0; i < 16; i++) {
                 klog("B0  ", (int32_t)B_ptr[i]);
             }
         }
@@ -84,6 +84,13 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
         int8_t *out = (int8_t *)acquire_output_window(win_c);
         for (int i = 0; i < buf_sz_c; i++)
             out[i] = local_out[rc * buf_sz_c + i];
+#if DEBUG_OUTPUT_ORDER
+        if (rc == 0) {
+            for (int l = 0; l < 8; l++) {
+                klog("C0 ", (int32_t)out[l]);
+            }
+        }
+#endif
         release_output_window(win_c);
     }
 }

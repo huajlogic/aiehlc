@@ -19,16 +19,13 @@
 #define HW_GEN XAIE_DEV_GEN_AIE2PS
 #endif
 
-extern void routing();
+extern void routing(XAie_DevInst *dev);
 // Device layout declare: config and instance (reference: aieml_perf.cc lines 292-300)
-static XAie_SetupConfig(g_Config, HW_GEN, XAIE_BASE_ADDR, XAIE_COL_SHIFT, XAIE_ROW_SHIFT,
-                        XAIE_NUM_COLS, XAIE_NUM_ROWS, XAIE_SHIM_ROW,
-                        XAIE_RES_TILE_ROW_START, XAIE_RES_TILE_NUM_ROWS,
-                        XAIE_AIE_TILE_ROW_START, XAIE_AIE_TILE_NUM_ROWS);
-static XAie_InstDeclare(g_DevInst_storage, &g_Config);
+static XAie_SetupConfig(g_Config, HW_GEN, XAIE_BASE_ADDR, XAIE_COL_SHIFT, XAIE_ROW_SHIFT, XAIE_NUM_COLS, XAIE_NUM_ROWS,
+                        XAIE_SHIM_ROW, XAIE_RES_TILE_ROW_START, XAIE_RES_TILE_NUM_ROWS, XAIE_AIE_TILE_ROW_START,
+                        XAIE_AIE_TILE_NUM_ROWS);
 
-// Global device instances (set by __Runtime_device_init / __Runtime_routing_init)
-XAie_DevInst *g_DevInst = NULL;
+// Global routing instance (kept for legacy path)
 XAie_RoutingInstance *g_RoutingInst = NULL;
 
 // Debug level: bits 0-3 = verbosity (0-15), bits 4-31 = feature flags
@@ -40,10 +37,6 @@ XAie_RoutingInstance *g_RoutingInst = NULL;
 //   Flag bit 6 (value 64): AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER
 // Weak symbol: user source can override via #pragma aie_debug_level N
 __attribute__((weak)) int g_runtime_debug_level = 0;
-
-/* Forward declarations for auto-init */
-static void __Runtime_auto_init(void) __attribute__((constructor));
-static void __Runtime_auto_teardown(void) __attribute__((destructor));
 
 // Reference: aieml_perf.cc lines 111-281 for implementation patterns
 
@@ -261,140 +254,266 @@ extern unsigned char _binary_kernel_computekernel_start[];
 extern unsigned char _binary_kernel_computekernel_end[];
 extern unsigned int _binary_kernel_computekernel_size;
 
-XAie_DevInst *getOrCreateDeviceInstance() {
-    if (g_DevInst == NULL) {
-        AieRC RC = __Runtime_device_init();
-        if (RC != XAIE_OK) {
-            printf("[aie_runtime] getOrCreateDeviceInstance failed: %d\n", (int)RC);
-            return NULL;
-        }
-    }
-    return g_DevInst;
-}
-
-/**
- * Initialize device: config, backend, NPI (if gen>=2), partition (reference: aieml_perf.cc lines 316-344)
- */
-AieRC __Runtime_device_init(void) {
-    printf("[aie_runtime] device_init start\n");
-    g_DevInst = &g_DevInst_storage;
-
-    AieRC RC = XAie_CfgInitialize(g_DevInst, &g_Config);
-    if (RC != XAIE_OK) {
-        printf("[aie_runtime] device_init CfgInitialize failed: %d\n", (int)RC);
-        return RC;
-    }
-
-    XAie_SetIOBackend(g_DevInst, XAIE_IO_BACKEND_BAREMETAL);
-
-#if AIE_GEN >= 2
-    if (g_DevInst->Backend->Type == XAIE_IO_BACKEND_BAREMETAL) {
-#if AIE_GEN == 5
-        RC = XAie_UpdateNpiAddr(g_DevInst, 0xf6d50000);
-#else
-        RC = XAie_UpdateNpiAddr(g_DevInst, 0xF6D10000);
-#endif
-        if (RC != XAIE_OK) {
-            return RC;
-        }
-    }
-    RC = XAie_PartitionInitialize(g_DevInst, NULL);
-#else
-    XAie_PmRequestTiles(g_DevInst, NULL, 0);
-    RC = XAIE_OK;
-#endif
-
-    if (RC == XAIE_OK)
-        printf("[aie_runtime] device_init OK\n");
-    else
-        printf("[aie_runtime] device_init partition/pm failed: %d\n", (int)RC);
-
-    if (RC == XAIE_OK && AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER)) {
-        __Runtime_perfcnt_setup_mm2s_bd_finished_partition(g_DevInst, 0, XAIE_NUM_COLS - 1, XAIE_AIE_TILE_ROW_START,
-                                                           XAIE_AIE_TILE_ROW_START + XAIE_AIE_TILE_NUM_ROWS - 1);
-    }
-
-    return RC;
-}
-/**
- * Partition-aware device init: XAie driver is configured for a column sub-range.
- * startCol: first column of the partition (0-based)
- * numCols: number of columns in the partition
- */
-AieRC __Runtime_device_init_partition(int startCol, int numCols) {
-    printf("[aie_runtime] device_init_partition start: startCol=%d numCols=%d\n", startCol, numCols);
-    g_DevInst = &g_DevInst_storage;
-
-    AieRC RC = XAie_SetupPartitionConfig(g_DevInst, XAIE_BASE_ADDR + ((uint64_t)startCol << XAIE_COL_SHIFT), startCol,
-                                         numCols);
-    if (RC != XAIE_OK) {
-        printf("[aie_runtime] device_init_partition SetupPartitionConfig failed: %d\n", (int)RC);
-        return RC;
-    }
-
-    RC = XAie_CfgInitialize(g_DevInst, &g_Config);
-    if (RC != XAIE_OK) {
-        printf("[aie_runtime] device_init_partition CfgInitialize failed: %d\n", (int)RC);
-        return RC;
-    }
-
-    XAie_SetIOBackend(g_DevInst, XAIE_IO_BACKEND_BAREMETAL);
-
-#if AIE_GEN >= 2
-    if (g_DevInst->Backend->Type == XAIE_IO_BACKEND_BAREMETAL) {
-#if AIE_GEN == 5
-        RC = XAie_UpdateNpiAddr(g_DevInst, 0xf6d50000);
-#else
-        RC = XAie_UpdateNpiAddr(g_DevInst, 0xF6D10000);
-#endif
-        if (RC != XAIE_OK) {
-            return RC;
-        }
-    }
-    RC = XAie_PartitionInitialize(g_DevInst, NULL);
-#else
-    XAie_PmRequestTiles(g_DevInst, NULL, 0);
-    RC = XAIE_OK;
-#endif
-
-    if (RC == XAIE_OK)
-        printf("[aie_runtime] device_init_partition OK (startCol=%d numCols=%d)\n", startCol, numCols);
-    else
-        printf("[aie_runtime] device_init_partition partition/pm failed: %d\n", (int)RC);
-    return RC;
-}
-
 /**
  */
 void __Runtime_platform_init(void) {
-    // FIXME: use cache coherency logic and comments this cache disable logic
+    // Flush all dirty cache lines to DDR BEFORE disabling cache.
+    // User data (malloc'd A, B, C arrays) may have been written with cache enabled,
+    // so dirty lines must be written back to physical DDR before DMA can read them.
+    Xil_DCacheFlush();
     Xil_DCacheDisable();
     Xil_ICacheDisable();
 }
 
 /**
  * Initialize routing handler (reference: aieml_perf.cc line 128)
- * Must be called after __Runtime_device_init.
+ * Must be called after device init.
  */
-void __Runtime_routing_init(void) {
+void __Runtime_routing_init(XAie_DevInst *dev) {
     printf("[aie_runtime] routing_init start\n");
-    g_RoutingInst = XAie_InitRoutingHandler(g_DevInst);
-    routing();
+    g_RoutingInst = XAie_InitRoutingHandler(dev);
+    routing(dev);
     printf("[aie_runtime] 2-routing_init OK----\n");
 }
 
 /**
  * Teardown partition (reference: aieml_perf.cc lines 348-352)
  */
-AieRC __Runtime_device_teardown(void) {
+AieRC __Runtime_device_teardown(XAie_DevInst *dev) {
     printf("[aie_runtime] device_teardown\n");
     if (AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)) {
         printf("[aie_runtime] device_teardown SKIPPED (DISABLE_PARTITIONTEARDOWN flag set)\n");
         return XAIE_OK;
     }
-    AieRC RC = XAie_PartitionTeardown(g_DevInst);
+    AieRC RC = XAie_PartitionTeardown(dev);
     printf("[aie_runtime] device_teardown done rc=%d\n", (int)RC);
     return RC;
+}
+
+/* ---------------------------------------------------------------------------
+ * Explicit init/teardown: heap-allocate XAie_DevInst, return pointer.
+ * Caller owns the pointer and must call __Runtime_explicit_teardown().
+ * ----------------------------------------------------------------------- */
+
+XAie_DevInst *__Runtime_explicit_init(void) {
+    __Runtime_platform_init();
+    XAie_DevInst *dev = (XAie_DevInst *)malloc(sizeof(XAie_DevInst));
+    if (!dev) {
+        printf("[aie_runtime] explicit_init: malloc failed\n");
+        return NULL;
+    }
+
+    AieRC RC = XAie_CfgInitialize(dev, &g_Config);
+    if (RC != XAIE_OK) {
+        printf("[aie_runtime] explicit_init CfgInitialize failed: %d\n", (int)RC);
+        free(dev);
+        return NULL;
+    }
+
+    XAie_SetIOBackend(dev, XAIE_IO_BACKEND_BAREMETAL);
+
+#if AIE_GEN >= 2
+    if (dev->Backend->Type == XAIE_IO_BACKEND_BAREMETAL) {
+#if AIE_GEN == 5
+        RC = XAie_UpdateNpiAddr(dev, 0xf6d50000);
+#else
+        RC = XAie_UpdateNpiAddr(dev, 0xF6D10000);
+#endif
+        if (RC != XAIE_OK) {
+            free(dev);
+            return NULL;
+        }
+    }
+    RC = XAie_PartitionInitialize(dev, NULL);
+#else
+    XAie_PmRequestTiles(dev, NULL, 0);
+    RC = XAIE_OK;
+#endif
+
+    if (RC != XAIE_OK) {
+        printf("[aie_runtime] explicit_init partition/pm failed: %d\n", (int)RC);
+        free(dev);
+        return NULL;
+    }
+
+    if (AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER)) {
+        __Runtime_perfcnt_setup_mm2s_bd_finished_partition(dev, 0, XAIE_NUM_COLS - 1, XAIE_AIE_TILE_ROW_START,
+                                                           XAIE_AIE_TILE_ROW_START + XAIE_AIE_TILE_NUM_ROWS - 1);
+    }
+
+    __Runtime_routing_init(dev);
+
+    printf("[aie_runtime] explicit_init OK dev=%p\n", (void *)dev);
+    return dev;
+}
+
+XAie_DevInst *__Runtime_explicit_init_partition(int startCol, int numCols) {
+    __Runtime_platform_init();
+    XAie_DevInst *dev = (XAie_DevInst *)malloc(sizeof(XAie_DevInst));
+    if (!dev) {
+        printf("[aie_runtime] explicit_init_partition: malloc failed\n");
+        return NULL;
+    }
+
+    AieRC RC =
+        XAie_SetupPartitionConfig(dev, XAIE_BASE_ADDR + ((uint64_t)startCol << XAIE_COL_SHIFT), startCol, numCols);
+    if (RC != XAIE_OK) {
+        printf("[aie_runtime] explicit_init_partition SetupPartitionConfig failed: %d\n", (int)RC);
+        free(dev);
+        return NULL;
+    }
+
+    RC = XAie_CfgInitialize(dev, &g_Config);
+    if (RC != XAIE_OK) {
+        printf("[aie_runtime] explicit_init_partition CfgInitialize failed: %d\n", (int)RC);
+        free(dev);
+        return NULL;
+    }
+
+    XAie_SetIOBackend(dev, XAIE_IO_BACKEND_BAREMETAL);
+
+#if AIE_GEN >= 2
+    if (dev->Backend->Type == XAIE_IO_BACKEND_BAREMETAL) {
+#if AIE_GEN == 5
+        RC = XAie_UpdateNpiAddr(dev, 0xf6d50000);
+#else
+        RC = XAie_UpdateNpiAddr(dev, 0xF6D10000);
+#endif
+        if (RC != XAIE_OK) {
+            free(dev);
+            return NULL;
+        }
+    }
+    RC = XAie_PartitionInitialize(dev, NULL);
+#else
+    XAie_PmRequestTiles(dev, NULL, 0);
+    RC = XAIE_OK;
+#endif
+
+    if (RC != XAIE_OK) {
+        printf("[aie_runtime] explicit_init_partition partition/pm failed: %d\n", (int)RC);
+        free(dev);
+        return NULL;
+    }
+
+    __Runtime_routing_init(dev);
+
+    printf("[aie_runtime] explicit_init_partition OK startCol=%d numCols=%d dev=%p\n", startCol, numCols, (void *)dev);
+    return dev;
+}
+
+void __Runtime_explicit_teardown(XAie_DevInst *dev) {
+    if (dev == NULL)
+        return;
+    printf("[aie_runtime] explicit_teardown dev=%p\n", (void *)dev);
+
+    if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1) {
+        AieRtSS_PrintRange(dev, 0, 3, 0, 5, /*print_all=*/0);
+        /* Dump raw BD registers for shim tiles used by BD tracking */
+        {
+            uint8_t shim_cols[BD_TRACK_MAX];
+            int shim_col_count = 0;
+            for (int i = 0; i < g_bd_track_count; i++) {
+                if (!__bd_is_shim(g_bd_track[i].tile_type))
+                    continue;
+                int dup = 0;
+                for (int j = 0; j < shim_col_count; j++) {
+                    if (shim_cols[j] == g_bd_track[i].col) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (!dup)
+                    shim_cols[shim_col_count++] = g_bd_track[i].col;
+            }
+            for (int i = 0; i < shim_col_count; i++)
+                AieRt_PrintShimBdRawAll(dev, shim_cols[i]);
+        }
+        /* Dump perf counters for all core tiles seen in BD tracking */
+        {
+            XAie_LocType core_tiles[BD_TRACK_MAX];
+            int core_tile_count = 0;
+            for (int i = 0; i < g_bd_track_count; i++) {
+                if (g_bd_track[i].tile_type != XAIEGBL_TILE_TYPE_AIETILE)
+                    continue;
+                int dup = 0;
+                for (int j = 0; j < core_tile_count; j++) {
+                    if (core_tiles[j].Col == g_bd_track[i].col && core_tiles[j].Row == g_bd_track[i].row) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (!dup && core_tile_count < BD_TRACK_MAX)
+                    core_tiles[core_tile_count++] = XAie_TileLoc(g_bd_track[i].col, g_bd_track[i].row);
+            }
+            if (core_tile_count > 0)
+                AieRt_PrintCoreTilePerfCountersAll(dev, core_tiles, core_tile_count);
+        }
+    }
+
+    __Runtime_free_all_allocs();
+    __Runtime_device_teardown(dev);
+    free(dev);
+    printf("[aie_runtime] explicit_teardown done\n");
+}
+
+/* ---------------------------------------------------------------------------
+ * Partition registry: init-once, get-existing, teardown-all.
+ * Used by the multi-kernel/multi-partition programming model (aieArray + aieMesh).
+ * Each aieMesh carries a meshId. The runtime tracks which meshIds have been
+ * initialized so sequential kernel launches on the same mesh skip re-init.
+ * aieArray::synchronize() calls __Runtime_teardown_all() to clean up.
+ * ----------------------------------------------------------------------- */
+
+#define PARTITION_REGISTRY_MAX 16
+
+typedef struct {
+    int meshId;
+    XAie_DevInst *dev;
+} PartitionRegistryEntry;
+
+static PartitionRegistryEntry g_partition_registry[PARTITION_REGISTRY_MAX];
+static int g_partition_registry_count = 0;
+
+int __Runtime_partition_is_initialized(int meshId) {
+    for (int i = 0; i < g_partition_registry_count; i++) {
+        if (g_partition_registry[i].meshId == meshId)
+            return 1;
+    }
+    return 0;
+}
+
+XAie_DevInst *__Runtime_get_partition_dev(int meshId) {
+    for (int i = 0; i < g_partition_registry_count; i++) {
+        if (g_partition_registry[i].meshId == meshId)
+            return g_partition_registry[i].dev;
+    }
+    printf("[aie_runtime] ERROR: partition meshId=%d not found in registry\n", meshId);
+    return NULL;
+}
+
+void __Runtime_register_partition(int meshId, XAie_DevInst *dev) {
+    if (g_partition_registry_count >= PARTITION_REGISTRY_MAX) {
+        printf("[aie_runtime] ERROR: partition registry full (max=%d)\n", PARTITION_REGISTRY_MAX);
+        return;
+    }
+    g_partition_registry[g_partition_registry_count].meshId = meshId;
+    g_partition_registry[g_partition_registry_count].dev = dev;
+    g_partition_registry_count++;
+    printf("[aie_runtime] register_partition meshId=%d dev=%p (total=%d)\n", meshId, (void *)dev,
+           g_partition_registry_count);
+}
+
+void __Runtime_teardown_all(void) {
+    printf("[aie_runtime] teardown_all: %d partitions registered\n", g_partition_registry_count);
+    for (int i = 0; i < g_partition_registry_count; i++) {
+        printf("[aie_runtime] teardown_all: meshId=%d dev=%p\n", g_partition_registry[i].meshId,
+               (void *)g_partition_registry[i].dev);
+        __Runtime_explicit_teardown(g_partition_registry[i].dev);
+        g_partition_registry[i].dev = NULL;
+    }
+    g_partition_registry_count = 0;
+    printf("[aie_runtime] teardown_all done\n");
 }
 
 /**
@@ -474,7 +593,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
                 write_words = 64;
             for (int _i = 0; _i < write_words; _i++)
                 dbg_pat[_i] = pat_val;
-            XAie_DataMemBlockWrite(dev, tile, (u32)dma_addr, dbg_pat, (u32)(write_words * sizeof(int32_t)));
+            XAie_DataMemBlockWrite(dev, tile, (u32)dma_addr - 16, dbg_pat, (u32)(write_words * sizeof(int32_t)));
             /* Read back and print to verify */
             int32_t dbg_read[64];
             XAie_DataMemBlockRead(dev, tile, (u32)dma_addr, dbg_read, (u32)(write_words * sizeof(int32_t)));
@@ -738,7 +857,7 @@ void __Runtime_dma_channel_enable_ooo(XAie_DevInst *dev, XAie_LocType tile, int3
  * Start I/O operation (triggers DMA)
  * Reference: aieml_perf.cc lines 173-174 (XAie_MoveDataExternal2Aie)
  */
-struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id, int32_t repeat) {
+struct_ioevent __Runtime_startio(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat) {
     struct_ioevent evt;
     evt.io = io;
     evt.timeout_us = 10000;
@@ -773,8 +892,8 @@ struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id, int32_t repeat) {
         }
     }
 
-    AieRC rc = XAie_DmaChannelSetStartQueue(g_DevInst, io.tile_loc, io.channel_id, io.direction, io.bd_id, repeat,
-                                            XAIE_DISABLE);
+    AieRC rc =
+        XAie_DmaChannelSetStartQueue(dev, io.tile_loc, io.channel_id, io.direction, io.bd_id, repeat, XAIE_DISABLE);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] startio FAILED rc=%d tile(%u,%u) ch=%u dir=%s bd=%u\n", (int)rc,
                (unsigned)io.tile_loc.Col, (unsigned)io.tile_loc.Row, (unsigned)io.channel_id, dir_str,
@@ -788,16 +907,17 @@ struct_ioevent __Runtime_startio(struct_io io, int32_t bd_id, int32_t repeat) {
  * Syntax sugar for OOO startio — wraps __Runtime_startio with all OOO params.
  * Enables OOO on the channel, then starts with given repeat count.
  */
-struct_ioevent _Runtime_startio_ooo(struct_io io, int32_t bd_id, int32_t repeat) {
-    __Runtime_dma_channel_enable_ooo(g_DevInst, io.tile_loc, io.channel_id, io.direction);
-    return __Runtime_startio(io, bd_id, repeat);
+struct_ioevent _Runtime_startio_ooo(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat) {
+    __Runtime_dma_channel_enable_ooo(dev, io.tile_loc, io.channel_id, io.direction);
+    return __Runtime_startio(dev, io, bd_id, repeat);
 }
 
 /**
  * Load kernel ELF into tiles
  * Reference: aieml_perf.cc lines 123-125
  */
-struct_kernel_group __Runtime_load_kernel_group(XAie_LocType *tiles, int32_t num_tiles, unsigned char **elf_buffers) {
+struct_kernel_group __Runtime_load_kernel_group(XAie_DevInst *dev, XAie_LocType *tiles, int32_t num_tiles,
+                                                unsigned char **elf_buffers) {
     struct_kernel_group kg;
     kg.tiles = tiles;
     kg.num_tiles = num_tiles;
@@ -807,47 +927,18 @@ struct_kernel_group __Runtime_load_kernel_group(XAie_LocType *tiles, int32_t num
         for (int i = 0; i < num_tiles; i++) {
             if (!__Runtime_is_aie_core_tile(tiles[i]))
                 continue;
-            XAie_CoreReset(g_DevInst, tiles[i]);
-            XAie_CoreUnreset(g_DevInst, tiles[i]);
-            XAie_LoadElfMem(g_DevInst, tiles[i], elf_buffers[i]);
+            XAie_CoreReset(dev, tiles[i]);
+            XAie_CoreUnreset(dev, tiles[i]);
+            XAie_LoadElfMem(dev, tiles[i], elf_buffers[i]);
         }
     }
 
     return kg;
 }
 
-struct_kernel_group __Runtime_load_kernel_group_4t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
-                                                   int n) {
-    printf("[aie_runtime] load_kernel_group n=%d tiles=(%u,%u)(%u,%u)(%u,%u)(%u,%u)\n", n, (unsigned)t0.Row,
-           (unsigned)t0.Col, (unsigned)t1.Row, (unsigned)t1.Col, (unsigned)t2.Row, (unsigned)t2.Col, (unsigned)t3.Row,
-           (unsigned)t3.Col);
-    s_kernel_tiles[0] = t0;
-    s_kernel_tiles[1] = t1;
-    s_kernel_tiles[2] = t2;
-    s_kernel_tiles[3] = t3;
-
-    /* Load the embedded kernel ELF into each core tile
-     * (same pattern as aout/host.cc: CoreReset -> CoreUnreset -> LoadElfMem) */
-    for (int i = 0; i < n; i++) {
-        if (!__Runtime_is_aie_core_tile(s_kernel_tiles[i]))
-            continue;
-        printf("[aie_runtime] loading kernel ELF into tile (%u,%u)\n", (unsigned)s_kernel_tiles[i].Col,
-               (unsigned)s_kernel_tiles[i].Row);
-        XAie_CoreReset(g_DevInst, s_kernel_tiles[i]);
-        XAie_CoreUnreset(g_DevInst, s_kernel_tiles[i]);
-        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_computekernel_start);
-    }
-
-    struct_kernel_group kg;
-    kg.tiles = s_kernel_tiles;
-    kg.num_tiles = n;
-    kg.elf_buffers = NULL;
-    return kg;
-}
-
 /** Array-based variant: copies caller-provided tile array into the static buffer
  *  and loads the kernel ELF into each core tile. Supports up to MAX_KERNEL_TILES. */
-struct_kernel_group __Runtime_load_kernel_group_nt(XAie_LocType *tiles, int n) {
+struct_kernel_group __Runtime_load_kernel_group_nt(XAie_DevInst *dev, XAie_LocType *tiles, int n) {
     printf("[aie_runtime] load_kernel_group_nt n=%d\n", n);
     if (n > MAX_KERNEL_TILES) {
         printf("[aie_runtime] WARNING: tile count %d exceeds MAX_KERNEL_TILES %d, clamping\n", n, MAX_KERNEL_TILES);
@@ -862,9 +953,9 @@ struct_kernel_group __Runtime_load_kernel_group_nt(XAie_LocType *tiles, int n) {
             continue;
         printf("[aie_runtime] loading kernel ELF into tile (%u,%u)\n", (unsigned)s_kernel_tiles[i].Col,
                (unsigned)s_kernel_tiles[i].Row);
-        XAie_CoreReset(g_DevInst, s_kernel_tiles[i]);
-        XAie_CoreUnreset(g_DevInst, s_kernel_tiles[i]);
-        XAie_LoadElfMem(g_DevInst, s_kernel_tiles[i], _binary_kernel_computekernel_start);
+        XAie_CoreReset(dev, s_kernel_tiles[i]);
+        XAie_CoreUnreset(dev, s_kernel_tiles[i]);
+        XAie_LoadElfMem(dev, s_kernel_tiles[i], _binary_kernel_computekernel_start);
     }
     struct_kernel_group kg;
     kg.tiles = s_kernel_tiles;
@@ -873,47 +964,56 @@ struct_kernel_group __Runtime_load_kernel_group_nt(XAie_LocType *tiles, int n) {
     return kg;
 }
 
-struct_kernel_group __Runtime_load_kernel_group_8t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
-                                                   XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7,
-                                                   int n) {
-    XAie_LocType arr[] = {t0, t1, t2, t3, t4, t5, t6, t7};
-    return __Runtime_load_kernel_group_nt(arr, n);
+struct_kernel_group __Runtime_load_kernel_group_4t(XAie_DevInst *dev, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+                                                   XAie_LocType t3, int n) {
+    printf("[aie_runtime] load_kernel_group_4t n=%d tiles=(%u,%u)(%u,%u)(%u,%u)(%u,%u)\n", n, (unsigned)t0.Row,
+           (unsigned)t0.Col, (unsigned)t1.Row, (unsigned)t1.Col, (unsigned)t2.Row, (unsigned)t2.Col, (unsigned)t3.Row,
+           (unsigned)t3.Col);
+    XAie_LocType arr[] = {t0, t1, t2, t3};
+    return __Runtime_load_kernel_group_nt(dev, arr, n);
 }
 
-struct_kernel_group __Runtime_load_kernel_group_16t(XAie_LocType t0, XAie_LocType t1, XAie_LocType t2, XAie_LocType t3,
-                                                    XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7,
-                                                    XAie_LocType t8, XAie_LocType t9, XAie_LocType t10,
-                                                    XAie_LocType t11, XAie_LocType t12, XAie_LocType t13,
-                                                    XAie_LocType t14, XAie_LocType t15, int n) {
+struct_kernel_group __Runtime_load_kernel_group_8t(XAie_DevInst *dev, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+                                                   XAie_LocType t3, XAie_LocType t4, XAie_LocType t5, XAie_LocType t6,
+                                                   XAie_LocType t7, int n) {
+    XAie_LocType arr[] = {t0, t1, t2, t3, t4, t5, t6, t7};
+    return __Runtime_load_kernel_group_nt(dev, arr, n);
+}
+
+struct_kernel_group __Runtime_load_kernel_group_16t(XAie_DevInst *dev, XAie_LocType t0, XAie_LocType t1,
+                                                    XAie_LocType t2, XAie_LocType t3, XAie_LocType t4, XAie_LocType t5,
+                                                    XAie_LocType t6, XAie_LocType t7, XAie_LocType t8, XAie_LocType t9,
+                                                    XAie_LocType t10, XAie_LocType t11, XAie_LocType t12,
+                                                    XAie_LocType t13, XAie_LocType t14, XAie_LocType t15, int n) {
     XAie_LocType arr[] = {t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15};
-    return __Runtime_load_kernel_group_nt(arr, n);
+    return __Runtime_load_kernel_group_nt(dev, arr, n);
 }
 
 /**
  * Enable AIE cores using transaction batching.
  * Reference: aeg_runtime_api.cpp graph_api::run() lines 176-181
  */
-void __Runtime_core_run(XAie_LocType *tiles, uint32_t num_tiles) {
-    XAie_StartTransaction(g_DevInst, XAIE_TRANSACTION_ENABLE_AUTO_FLUSH);
+void __Runtime_core_run(XAie_DevInst *dev, XAie_LocType *tiles, uint32_t num_tiles) {
+    XAie_StartTransaction(dev, XAIE_TRANSACTION_ENABLE_AUTO_FLUSH);
     for (uint32_t i = 0; i < num_tiles; i++) {
         if (__Runtime_is_aie_core_tile(tiles[i]))
-            XAie_CoreEnable(g_DevInst, tiles[i]);
+            XAie_CoreEnable(dev, tiles[i]);
     }
-    XAie_SubmitTransaction(g_DevInst, NULL);
+    XAie_SubmitTransaction(dev, NULL);
 }
 
 /**
  * Launch kernel group (start cores)
  * Reference: aeg_runtime_api.cpp graph_api::run()
  */
-struct_event __Runtime_launch_kernel_group(struct_kernel_group kg) {
+struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_group kg) {
     struct_event evt;
     evt.tiles = kg.tiles;
     evt.num_tiles = kg.num_tiles;
     evt.timeout_us = 100000;
 
     printf("[aie_runtime] launch_kernel_group num_tiles=%u\n", (unsigned)kg.num_tiles);
-    __Runtime_core_run(kg.tiles, kg.num_tiles);
+    __Runtime_core_run(dev, kg.tiles, kg.num_tiles);
 
     return evt;
 }
@@ -922,7 +1022,7 @@ struct_event __Runtime_launch_kernel_group(struct_kernel_group kg) {
  * Wait for kernel completion
  * Reference: aieml_perf.cc lines 189-202 (XAie_CoreWaitForDone loop)
  */
-void __Runtime_wait_event(struct_event event) {
+void __Runtime_wait_event(XAie_DevInst *dev, struct_event event) {
     uint8_t allDone = 0;
 
     printf("[aie_runtime] wait_event num_tiles=%u tiles=(%u,%u)(%u,%u)(%u,%u)(%u,%u)\n", (unsigned)event.num_tiles,
@@ -937,7 +1037,7 @@ void __Runtime_wait_event(struct_event event) {
             if (!__Runtime_is_aie_core_tile(event.tiles[i])) {
                 continue;
             }
-            AieRC RC = XAie_CoreWaitForDone(g_DevInst, event.tiles[i], 0);
+            AieRC RC = XAie_CoreWaitForDone(dev, event.tiles[i], 0);
             if (RC != XAIE_OK) {
                 allDone = 0;
             }
@@ -955,7 +1055,7 @@ void __Runtime_wait_event(struct_event event) {
      * (wait_io timeouts + debug snapshot can exceed the capture budget). */
     for (uint32_t i = 0; i < event.num_tiles; i++) {
         if (__Runtime_is_aie_core_tile(event.tiles[i]))
-            __Runtime_read_kernel_log(g_DevInst, event.tiles[i]);
+            __Runtime_read_kernel_log(dev, event.tiles[i]);
     }
 }
 
@@ -965,7 +1065,7 @@ void __Runtime_wait_event(struct_event event) {
  * meaning both the start queue is empty and no BD is currently executing.
  * Reference: aeg_runtime_api.cpp waitDMAChannelTaskQueue / waitDMAChannelDone
  */
-void __Runtime_wait_io(struct_ioevent io_event) {
+void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
     XAie_LocType tile = io_event.io.tile_loc;
     uint8_t channel = io_event.io.channel_id;
     XAie_DmaDirection dir = io_event.io.direction;
@@ -984,12 +1084,12 @@ void __Runtime_wait_io(struct_ioevent io_event) {
     /* Read raw DMA channel status for diagnostic */
     {
         u32 ch_status = 0;
-        AieRC src = XAie_DmaGetChannelStatus(g_DevInst, tile, channel, dir, &ch_status);
+        AieRC src = XAie_DmaGetChannelStatus(dev, tile, channel, dir, &ch_status);
         printf("[aie_runtime] ch_status tile(%u,%u) ch=%u dir=%d raw=0x%08x rc=%d\n", (unsigned)tile.Col,
                (unsigned)tile.Row, (unsigned)channel, (int)dir, (unsigned)ch_status, (int)src);
     }
     while (numPendingBDs > 0) {
-        AieRC rc = XAie_DmaGetPendingBdCount(g_DevInst, tile, channel, dir, &numPendingBDs);
+        AieRC rc = XAie_DmaGetPendingBdCount(dev, tile, channel, dir, &numPendingBDs);
         if (rc != XAIE_OK) {
             printf("[aie_runtime] wait_io ERROR: XAie_DmaGetPendingBdCount "
                    "failed rc=%d tile(%u,%u) ch=%u dir=%d\n",
@@ -1174,84 +1274,5 @@ void __Runtime_perfcnt_read_mm2s_bd_finished_partition(XAie_DevInst *dev, uint8_
                    "MM2S_ch1_bd_done=%u\n",
                    (unsigned)col, (unsigned)row, val0, val1);
         }
-    }
-}
-
-/**
- * Auto-initialization: runs before main() via __attribute__((constructor)).
- * Ensures g_DevInst and g_RoutingInst are ready before generated host code
- * uses them directly (e.g. XAie_MemAllocate(g_DevInst, ...)).
- */
-static void __Runtime_auto_init(void) {
-    printf("[aie_runtime] platform_init\n");
-    __Runtime_platform_init();
-    printf("[aie_runtime] auto_init (constructor)\n");
-    AieRC rc = __Runtime_device_init();
-    if (rc != XAIE_OK) {
-        printf("[aie_runtime] auto_init: device_init FAILED rc=%d\n", (int)rc);
-        return;
-    }
-    __Runtime_routing_init();
-
-    printf("[aie_runtime] auto_init OK\n");
-}
-
-/**
- * Auto-teardown: runs after main() via __attribute__((destructor)).
- */
-static void __Runtime_auto_teardown(void) {
-    printf("[aie_runtime] auto_teardown (destructor)\n");
-    if (g_DevInst != NULL) {
-        /* Kernel logs are already read in __Runtime_wait_event() right after
-         * cores finish, so we don't duplicate the read here. */
-        if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1) {
-            AieRtSS_PrintRange(g_DevInst, 0, 3, 0, 5, /*print_all=*/0);
-            /* Dump raw BD registers for shim tiles used by BD tracking.
-             * Scans all 16 BDs with stride/wrap/iteration fields. */
-            {
-                uint8_t shim_cols[BD_TRACK_MAX];
-                int shim_col_count = 0;
-                for (int i = 0; i < g_bd_track_count; i++) {
-                    if (!__bd_is_shim(g_bd_track[i].tile_type))
-                        continue;
-                    /* Deduplicate: check if col already in list */
-                    int dup = 0;
-                    for (int j = 0; j < shim_col_count; j++) {
-                        if (shim_cols[j] == g_bd_track[i].col) {
-                            dup = 1;
-                            break;
-                        }
-                    }
-                    if (!dup)
-                        shim_cols[shim_col_count++] = g_bd_track[i].col;
-                }
-                for (int i = 0; i < shim_col_count; i++)
-                    AieRt_PrintShimBdRawAll(g_DevInst, shim_cols[i]);
-            }
-            /* Dump perf counters for all core tiles seen in BD tracking */
-            {
-                XAie_LocType core_tiles[BD_TRACK_MAX];
-                int core_tile_count = 0;
-                for (int i = 0; i < g_bd_track_count; i++) {
-                    if (g_bd_track[i].tile_type != XAIEGBL_TILE_TYPE_AIETILE)
-                        continue;
-                    int dup = 0;
-                    for (int j = 0; j < core_tile_count; j++) {
-                        if (core_tiles[j].Col == g_bd_track[i].col && core_tiles[j].Row == g_bd_track[i].row) {
-                            dup = 1;
-                            break;
-                        }
-                    }
-                    if (!dup && core_tile_count < BD_TRACK_MAX)
-                        core_tiles[core_tile_count++] = XAie_TileLoc(g_bd_track[i].col, g_bd_track[i].row);
-                }
-                if (core_tile_count > 0)
-                    AieRt_PrintCoreTilePerfCountersAll(g_DevInst, core_tiles, core_tile_count);
-            }
-        }
-    }
-    __Runtime_free_all_allocs();
-    if (g_DevInst != NULL) {
-        __Runtime_device_teardown();
     }
 }
