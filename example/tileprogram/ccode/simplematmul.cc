@@ -121,7 +121,7 @@ int main() {
     // Fields: {startCol, endCol, startRow, endRow}
     // This partition uses columns [2,5] and rows [0,6], which covers
     // Gen2 NoC shim columns {2,3} — enough for a 4x4 GEMM's ~12 DataIOs.
-    aieMesh mesh = device.partition({0, 8, 0, 6}, HW_ROWS, HW_COLS);
+    aieMesh mesh = device.partition({3, 6, 0, 6}, HW_ROWS, HW_COLS);
     // aieDim mesh(HW_ROWS, HW_COLS);
     //  --- Allocate host memory ---
     int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t));
