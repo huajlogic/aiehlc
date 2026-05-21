@@ -1990,3 +1990,154 @@ void AieRt_PrintCoreTilePerfCountersAll(XAie_DevInst *dev, const XAie_LocType *t
             AieRt_PrintCoreTilePerfCounters(dev, tiles[i]);
     }
 }
+
+/* ==========================================================================
+ * Shim DMA Loopback Debug API
+ *
+ * Performs a DDR→ShimDMA→DDR loopback test on a single shim tile column.
+ * Flow:
+ *   1. Allocate two DDR buffers (src, dst) via XAie_MemAllocate.
+ *   2. Fill src with a known pattern, clear dst.
+ *   3. Configure shim tile stream switch: circuit-switch SOUTH port 3
+ *      back to itself (MM2S output → S2MM input on same port).
+ *   4. Set up two BDs on the shim tile:
+ *        BD 0 — MM2S: reads src buffer from DDR
+ *        BD 1 — S2MM: writes received data to dst buffer in DDR
+ *   5. Push BDs to channel queues, enable channels, poll for completion.
+ *   6. Compare src vs dst; print PASS/FAIL.
+ *   7. Free DDR buffers.
+ *
+ * Reference: aieml-tests/src/xaie_shimdma_loopback.c
+ * ========================================================================== */
+
+int AieRt_ShimDmaLoopback(XAie_DevInst *dev, uint8_t col, uint32_t *srcaddr, uint32_t *dstaddr, uint32_t len) {
+    AieRC RC;
+    uint64_t src_addr = (uint64_t)(uintptr_t)srcaddr;
+    uint64_t dst_addr = (uint64_t)(uintptr_t)dstaddr;
+    uint32_t num_words = len / sizeof(uint32_t);
+
+    printf("[AieRt_ShimDmaLoopback] col=%u src=0x%lx dst=0x%lx len=%u\n", (unsigned)col, (unsigned long)src_addr,
+           (unsigned long)dst_addr, (unsigned)len);
+
+    /* ---- 1. Configure stream switch: SOUTH3 → SOUTH3 circuit loopback ---- */
+    XAie_LocType shim_tile = XAie_TileLoc(col, 0);
+
+    RC = XAie_StrmConnCctEnable(dev, shim_tile, SOUTH, 3, SOUTH, 3);
+    printf("[AieRt_ShimDmaLoopback] StrmConnCctEnable SOUTH3→SOUTH3 rc=%d\n", (int)RC);
+
+    RC = XAie_EnableShimDmaToAieStrmPort(dev, shim_tile, 3);
+    printf("[AieRt_ShimDmaLoopback] EnableShimDmaToAieStrmPort(3) rc=%d\n", (int)RC);
+
+    RC = XAie_EnableAieToShimDmaStrmPort(dev, shim_tile, 3);
+    printf("[AieRt_ShimDmaLoopback] EnableAieToShimDmaStrmPort(3) rc=%d\n", (int)RC);
+
+    /* ---- 2. Configure BDs ----
+     *   BD 0: MM2S — read from src DDR buffer
+     *   BD 1: S2MM — write to dst DDR buffer
+     */
+    XAie_DmaDesc DmaDescMM2S, DmaDescS2MM;
+
+    /* MM2S BD (BD 0): read src from DDR */
+    RC = XAie_DmaDescInit(dev, &DmaDescMM2S, shim_tile);
+    RC = XAie_DmaSetAddrLen(&DmaDescMM2S, src_addr, len);
+    RC = XAie_DmaEnableBd(&DmaDescMM2S);
+    RC = XAie_DmaSetAxi(&DmaDescMM2S, 0U, 16U, 0U, 0U, 0U);
+    RC = XAie_DmaWriteBd(dev, &DmaDescMM2S, shim_tile, 0);
+    printf("[AieRt_ShimDmaLoopback] MM2S BD0 addr=0x%lx len=%u rc=%d\n", (unsigned long)src_addr, (unsigned)len,
+           (int)RC);
+
+    /* S2MM BD (BD 1): write dst to DDR */
+    RC = XAie_DmaDescInit(dev, &DmaDescS2MM, shim_tile);
+    RC = XAie_DmaSetAddrLen(&DmaDescS2MM, dst_addr, len);
+    RC = XAie_DmaEnableBd(&DmaDescS2MM);
+    RC = XAie_DmaSetAxi(&DmaDescS2MM, 0U, 16U, 0U, 0U, 0U);
+    RC = XAie_DmaWriteBd(dev, &DmaDescS2MM, shim_tile, 1);
+    printf("[AieRt_ShimDmaLoopback] S2MM BD1 addr=0x%lx len=%u rc=%d\n", (unsigned long)dst_addr, (unsigned)len,
+           (int)RC);
+
+    /* ---- 3. Push BDs to queues and enable channels ----
+     *   AIEML shim DMA channel-to-port mapping (fixed in HW):
+     *     MM2S ch0 → SOUTH slave port 3   (3, 7)
+     *     S2MM ch1 → SOUTH master port 3  (1, 3)
+     *   We configured circuit-switch on port 3, so must use these channels.
+     *   S2MM must be armed FIRST (receiver ready before sender starts).
+     */
+    RC = XAie_DmaChannelPushBdToQueue(dev, shim_tile, 1, DMA_S2MM, 1);
+    printf("[AieRt_ShimDmaLoopback] S2MM ch1 push BD1 rc=%d\n", (int)RC);
+
+    RC = XAie_DmaChannelPushBdToQueue(dev, shim_tile, 0, DMA_MM2S, 0);
+    printf("[AieRt_ShimDmaLoopback] MM2S ch0 push BD0 rc=%d\n", (int)RC);
+
+    RC = XAie_DmaChannelEnable(dev, shim_tile, 1, DMA_S2MM);
+    printf("[AieRt_ShimDmaLoopback] S2MM ch1 enable rc=%d\n", (int)RC);
+
+    RC = XAie_DmaChannelEnable(dev, shim_tile, 0, DMA_MM2S);
+    printf("[AieRt_ShimDmaLoopback] MM2S ch0 enable rc=%d\n", (int)RC);
+
+    /* ---- 4. Poll for S2MM ch1 completion ---- */
+    u8 pending = 1;
+    uint32_t poll_count = 0;
+    const uint32_t max_polls = 10000;
+    while (pending != 0 && poll_count < max_polls) {
+        RC = XAie_DmaGetPendingBdCount(dev, shim_tile, 1, DMA_S2MM, &pending);
+        if (RC != XAIE_OK) {
+            printf("[AieRt_ShimDmaLoopback] ERROR: GetPendingBdCount failed rc=%d\n", (int)RC);
+            break;
+        }
+        poll_count++;
+    }
+
+    if (pending != 0) {
+        printf("[AieRt_ShimDmaLoopback] TIMEOUT: S2MM still pending after %u polls\n", (unsigned)poll_count);
+        AieRt_PrintShimDmaStatus(dev, col);
+        return -2;
+    }
+
+    printf("[AieRt_ShimDmaLoopback] DMA transfer complete after %u polls\n", (unsigned)poll_count);
+
+    /* ---- 5. Verify: compare src vs dst ---- */
+    int errors = 0;
+    for (uint32_t i = 0; i < num_words; i++) {
+        if (srcaddr[i] != dstaddr[i]) {
+            if (errors < 16) {
+                printf("[AieRt_ShimDmaLoopback] MISMATCH [%u]: src=0x%08x dst=0x%08x\n", (unsigned)i,
+                       (unsigned)srcaddr[i], (unsigned)dstaddr[i]);
+            }
+            errors++;
+        }
+    }
+
+    if (errors == 0) {
+        printf("[AieRt_ShimDmaLoopback] PASS col=%u (%u words verified)\n", (unsigned)col, (unsigned)num_words);
+    } else {
+        printf("[AieRt_ShimDmaLoopback] FAIL col=%u (%d/%u mismatches)\n", (unsigned)col, errors, (unsigned)num_words);
+    }
+
+    /* Print first 16 words of src and dst for visual inspection */
+    uint32_t print_n = (num_words < 16) ? num_words : 16;
+    printf("[AieRt_ShimDmaLoopback] src[0..%u]:", (unsigned)(print_n - 1));
+    for (uint32_t i = 0; i < print_n; i++)
+        printf(" 0x%08x", (unsigned)srcaddr[i]);
+    printf("\n");
+    printf("[AieRt_ShimDmaLoopback] dst[0..%u]:", (unsigned)(print_n - 1));
+    for (uint32_t i = 0; i < print_n; i++)
+        printf(" 0x%08x", (unsigned)dstaddr[i]);
+    printf("\n");
+
+    return errors == 0 ? 0 : -3;
+}
+
+int AieRt_ShimDmaLoopbackAllCols(XAie_DevInst *dev, const uint8_t *cols, int num_cols, uint32_t *srcaddr,
+                                 uint32_t *dstaddr, uint32_t len) {
+    printf("[AieRt_ShimDmaLoopback] ===== Running loopback on %d columns, len=%u =====\n", num_cols, (unsigned)len);
+    int total_fail = 0;
+    for (int i = 0; i < num_cols; i++) {
+        int rc = AieRt_ShimDmaLoopback(dev, cols[i], srcaddr, dstaddr, len);
+        if (rc != 0) {
+            printf("[AieRt_ShimDmaLoopback] Column %u FAILED (rc=%d)\n", (unsigned)cols[i], rc);
+            total_fail++;
+        }
+    }
+    printf("[AieRt_ShimDmaLoopback] ===== Result: %d/%d columns passed =====\n", num_cols - total_fail, num_cols);
+    return total_fail;
+}

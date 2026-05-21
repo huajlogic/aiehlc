@@ -19,6 +19,8 @@
 #define HW_GEN XAIE_DEV_GEN_AIE2PS
 #endif
 
+// for cache disable case we need to do that at app construction beginning
+static void __Runtime_init(void) __attribute__((constructor));
 extern void routing(XAie_DevInst *dev);
 // Device layout declare: config and instance (reference: aieml_perf.cc lines 292-300)
 static XAie_SetupConfig(g_Config, HW_GEN, XAIE_BASE_ADDR, XAIE_COL_SHIFT, XAIE_ROW_SHIFT, XAIE_NUM_COLS, XAIE_NUM_ROWS,
@@ -265,6 +267,13 @@ void __Runtime_platform_init(void) {
     Xil_ICacheDisable();
 }
 
+void __Runtime_init(void) {
+    printf("[aie_runtime] __Runtime_init--\n");
+    __Runtime_platform_init();
+
+    printf("[aie_runtime] _init OK\n");
+}
+
 /**
  * Initialize routing handler (reference: aieml_perf.cc line 128)
  * Must be called after device init.
@@ -396,6 +405,27 @@ XAie_DevInst *__Runtime_explicit_init_partition(int startCol, int numCols) {
         return NULL;
     }
 
+    /* Shim DMA loopback self-test: write 0xABCD at DDR offset 10MB,
+     * loopback-copy to DDR offset 20MB, verify. Uses col=startCol. */
+    /*
+    {
+        uint32_t *src = (uint32_t *)(uintptr_t)(1024U * 1024U * 10U);
+        uint32_t *dst = (uint32_t *)(uintptr_t)(1024U * 1024U * 20U);
+        uint32_t len = 512 * sizeof(uint32_t);
+        uint32_t num_words = len / sizeof(uint32_t);
+
+        printf("[aie_runtime] shim_dma_loopback_test 3: src=%p dst=%p len=%u\n",
+               (void *)src, (void *)dst, (unsigned)len);
+
+        for (uint32_t i = 0; i < num_words; i++) {
+            src[i] = 0xABCD;
+            dst[i] = 0;
+        }
+
+        int lb_rc = AieRt_ShimDmaLoopback(dev, (uint8_t)0, src, dst, len);
+        printf("[aie_runtime] shim_dma_loopback_test: rc=%d\n", lb_rc);
+    }
+    */
     __Runtime_routing_init(dev);
 
     printf("[aie_runtime] explicit_init_partition OK startCol=%d numCols=%d dev=%p\n", startCol, numCols, (void *)dev);
@@ -593,7 +623,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
                 write_words = 64;
             for (int _i = 0; _i < write_words; _i++)
                 dbg_pat[_i] = pat_val;
-            XAie_DataMemBlockWrite(dev, tile, (u32)dma_addr - 16, dbg_pat, (u32)(write_words * sizeof(int32_t)));
+            XAie_DataMemBlockWrite(dev, tile, (u32)dma_addr, dbg_pat, (u32)(write_words * sizeof(int32_t)));
             /* Read back and print to verify */
             int32_t dbg_read[64];
             XAie_DataMemBlockRead(dev, tile, (u32)dma_addr, dbg_read, (u32)(write_words * sizeof(int32_t)));

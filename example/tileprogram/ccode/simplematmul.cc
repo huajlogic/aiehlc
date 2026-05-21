@@ -15,7 +15,7 @@ constexpr aie::SpatialPolicy LtoR_Merge = {.pattern = aie::Pattern::Gather,
                                            .merge_order = aie::Flow::LeftToRight,
                                            .pp_depth = 2,
                                            .max_buffer_bytes = 4096};
-#define DEBUG_OUTPUT_ORDER 1
+#define DEBUG_OUTPUT_ORDER 0
 __global__ void matmul(aie::port<input_window_int8 *, RowBC> win_a, aie::port<input_window_int8 *, ColBC> win_b,
                        aie::port<output_window_int8 *, LtoR_Merge> win_c) {
 
@@ -121,8 +121,9 @@ int main() {
     // Fields: {startCol, endCol, startRow, endRow}
     // This partition uses columns [2,5] and rows [0,6], which covers
     // Gen2 NoC shim columns {2,3} — enough for a 4x4 GEMM's ~12 DataIOs.
-    aieMesh mesh = device.partition({1, 4, 0, 6}, HW_ROWS, HW_COLS);
-    // --- Allocate host memory ---
+    aieMesh mesh = device.partition({0, 8, 0, 6}, HW_ROWS, HW_COLS);
+    // aieDim mesh(HW_ROWS, HW_COLS);
+    //  --- Allocate host memory ---
     int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t));
     int8_t *B = (int8_t *)malloc(K * N * sizeof(int8_t));
     int8_t *C = (int8_t *)malloc(M * N * sizeof(int8_t));

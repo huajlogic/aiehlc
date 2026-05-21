@@ -679,4 +679,47 @@ void AieRt_PrintCoreTilePerfCounters(XAie_DevInst *dev, XAie_LocType tile);
  */
 void AieRt_PrintCoreTilePerfCountersAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles);
 
+/* --------------------------------------------------------------------------
+ * Shim DMA Loopback
+ *
+ * Self-contained DDR→ShimDMA→DDR loopback test. Allocates src/dst DDR
+ * buffers, configures a circuit-switch loopback on SOUTH port 3 of the
+ * shim tile, runs a DMA transfer through it, and verifies the data.
+ * Useful for validating that the shim DMA + NoC + DDR path is functional
+ * on a given column before running the full GEMM pipeline.
+ *
+ * Reference: aieml-tests/src/xaie_shimdma_loopback.c
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Run a shim DMA loopback test on a single column.
+ *
+ * Caller provides pre-allocated DDR src and dst buffers. The function
+ * configures a circuit-switch loopback on SOUTH port 3, DMA-reads from
+ * srcaddr into the stream, loops it back, and DMA-writes to dstaddr.
+ * After transfer, compares srcaddr[] vs dstaddr[] word-by-word.
+ *
+ * @param dev      Device instance (must be initialized and partitioned).
+ * @param col      Shim tile column (must have NOC-DDR path enabled).
+ * @param srcaddr  Source DDR buffer (filled by caller with test data).
+ * @param dstaddr  Destination DDR buffer (cleared by caller, receives loopback data).
+ * @param len      Transfer size in bytes (must be multiple of 4).
+ * @return         0 on success (PASS), -2 timeout, -3 mismatch.
+ */
+int AieRt_ShimDmaLoopback(XAie_DevInst *dev, uint8_t col, uint32_t *srcaddr, uint32_t *dstaddr, uint32_t len);
+
+/**
+ * Run shim DMA loopback on multiple columns.
+ *
+ * @param dev      Device instance.
+ * @param cols     Array of column indices to test.
+ * @param num_cols Length of the cols array.
+ * @param srcaddr  Source DDR buffer (filled by caller).
+ * @param dstaddr  Destination DDR buffer (cleared by caller).
+ * @param len      Transfer size in bytes (must be multiple of 4).
+ * @return         Number of failed columns (0 = all passed).
+ */
+int AieRt_ShimDmaLoopbackAllCols(XAie_DevInst *dev, const uint8_t *cols, int num_cols, uint32_t *srcaddr,
+                                 uint32_t *dstaddr, uint32_t len);
+
 #endif /* AIE_RUNTIME_DEBUG_H */
