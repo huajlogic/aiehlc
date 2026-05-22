@@ -5,15 +5,15 @@
 void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_int8 *win_c) {
 
     // Compiler-resolved tiling parameters
-    const int tile_rows = 4;
-    const int tile_cols = 4;
-    const int k_dim = 16;
-    const int num_a_rounds = 2;
-    const int num_b_rounds = 2;
+    const int tile_rows = 64;
+    const int tile_cols = 64;
+    const int k_dim = 256;
+    const int num_a_rounds = 4;
+    const int num_b_rounds = 4;
     const int num_c_rounds = 2;
-    const int buf_sz_a = 32;
-    const int buf_sz_b = 32;
-    const int buf_sz_c = 8;
+    const int buf_sz_a = 4096;
+    const int buf_sz_b = 4096;
+    const int buf_sz_c = 2048;
 
     // Derived per-round sizes
     const int rows_per_round = buf_sz_a / k_dim;

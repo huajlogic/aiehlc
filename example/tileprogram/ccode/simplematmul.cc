@@ -171,8 +171,7 @@ __global__ void mul2(aie::port<input_window_int8 *, RowBC> win_a, aie::port<inpu
                 for (int j = 0; j < cols_per_round; j++) {
                     int16_t sum = 0;
                     for (int k = 0; k < k_dim; k++)
-                        sum +=
-                            1 + (int16_t)all_A[(ra * rows_per_round + i) * k_dim + k] * (int16_t)B_ptr[j * k_dim + k];
+                        sum += (int16_t)all_A[(ra * rows_per_round + i) * k_dim + k] * (int16_t)B_ptr[j * k_dim + k];
                     if (sum > 127)
                         sum = 127;
                     else if (sum < -128)
@@ -231,11 +230,12 @@ int main() {
         C[i] = 0;
     // --- Launch kernel on tile mesh ---
     matmul<<<mesh>>>(A, B, C, M, N, K);
-    // mul2<<<mesh>>>(C, B, A, M, N, K);
+    int result = verify_matmul(A, B, C);
+    mul2<<<mesh>>>(C, B, A, M, N, K);
+    int result2 = verify_matmul(C, B, A);
     //  --- Wait for all partitions and teardown ---
     device.synchronize();
     // --- Verify output ---
-    int result = verify_matmul(A, B, C);
     // --- Cleanup ---
     free(A);
     free(B);
