@@ -251,10 +251,13 @@ void __Runtime_memcpy(void *dst, const void *src, size_t bytes) {
     printf("\n");
 }
 
-/* Kernel ELF embedded as binary blob by hostcompile.sh (ld -EL -r -b binary + redefine_symbols) */
-extern unsigned char _binary_kernel_computekernel_start[];
-extern unsigned char _binary_kernel_computekernel_end[];
-extern unsigned int _binary_kernel_computekernel_size;
+/* Active kernel ELF pointer — set by __Runtime_set_kernel_elf() before load_kernel_group.
+ * In single-kernel mode, host.cc declares the extern and calls set_kernel_elf once.
+ * In multi-kernel mode, each __aie_launch dispatch calls set_kernel_elf with the
+ * appropriate _binary_kernel_<name>_start before calling host_canonicalized_<name>. */
+static unsigned char *s_active_kernel_elf = NULL;
+
+void __Runtime_set_kernel_elf(unsigned char *elf_start) { s_active_kernel_elf = elf_start; }
 
 /**
  */
@@ -358,12 +361,18 @@ XAie_DevInst *__Runtime_explicit_init(void) {
 
 XAie_DevInst *__Runtime_explicit_init_partition(int startCol, int numCols) {
     __Runtime_platform_init();
-    XAie_DevInst *dev = (XAie_DevInst *)malloc(sizeof(XAie_DevInst));
+    // calloc zero-initializes the struct so IsReady == 0, which
+    // XAie_SetupPartitionConfig requires (it rejects IsReady != 0).
+    XAie_DevInst *dev = (XAie_DevInst *)calloc(1, sizeof(XAie_DevInst));
     if (!dev) {
-        printf("[aie_runtime] explicit_init_partition: malloc failed\n");
+        printf("[aie_runtime] explicit_init_partition: calloc failed\n");
         return NULL;
     }
 
+    // XAie_SetupPartitionConfig must be called BEFORE XAie_CfgInitialize.
+    // It requires IsReady == 0 (freshly zeroed struct) and sets
+    // BaseAddr/StartCol/NumCols. CfgInitialize then reads those fields
+    // and sets IsReady = XAIE_COMPONENT_IS_READY.
     AieRC RC =
         XAie_SetupPartitionConfig(dev, XAIE_BASE_ADDR + ((uint64_t)startCol << XAIE_COL_SHIFT), startCol, numCols);
     if (RC != XAIE_OK) {
@@ -985,7 +994,7 @@ struct_kernel_group __Runtime_load_kernel_group_nt(XAie_DevInst *dev, XAie_LocTy
                (unsigned)s_kernel_tiles[i].Row);
         XAie_CoreReset(dev, s_kernel_tiles[i]);
         XAie_CoreUnreset(dev, s_kernel_tiles[i]);
-        XAie_LoadElfMem(dev, s_kernel_tiles[i], _binary_kernel_computekernel_start);
+        XAie_LoadElfMem(dev, s_kernel_tiles[i], s_active_kernel_elf);
     }
     struct_kernel_group kg;
     kg.tiles = s_kernel_tiles;

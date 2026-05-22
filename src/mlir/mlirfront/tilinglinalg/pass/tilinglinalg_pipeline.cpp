@@ -204,7 +204,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                                        const std::string &userKernelBody, const std::string &userKernelFuncName,
                                        int runtimeDebugLevel, const std::string &userRewrittenSource,
                                        const std::vector<TensorParam> &tensors, int64_t maxPingPongBytes,
-                                       const std::string &aieGen, const std::string &hostFuncSuffix) {
+                                       const std::string &aieGen, const std::string &hostFuncSuffix, bool appendMode,
+                                       unsigned *numHostDdrArgs) {
 
     // Extract partition bounds from createhwmesh op in the IR (if present)
     int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
@@ -404,23 +405,73 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         }
     }
 
+    // Count DDR args on the host function and report back to caller
+    {
+        unsigned numArgs = 0;
+        for (auto func : hostModule.getOps<emitc::FuncOp>()) {
+            if (func.getName() == hostFuncName) {
+                numArgs = func.getNumArguments();
+                break;
+            }
+        }
+        if (numArgs == 0) {
+            for (auto func : hostModule.getOps<mlir::func::FuncOp>()) {
+                if (func.getName() == hostFuncName) {
+                    numArgs = func.getNumArguments();
+                    break;
+                }
+            }
+        }
+        unsigned ddrArgs = (numArgs > 0) ? numArgs - 1 : 0;
+        if (numHostDdrArgs)
+            *numHostDdrArgs = ddrArgs;
+    }
+
     // Emit host.cc
     {
         std::string hostPath = outputDir + "/host.cc";
         std::error_code ec;
-        llvm::raw_fd_ostream stream(hostPath, ec, llvm::sys::fs::OF_None);
+        auto openFlags = appendMode ? llvm::sys::fs::OF_Append : llvm::sys::fs::OF_None;
+        llvm::raw_fd_ostream stream(hostPath, ec, openFlags);
         if (ec) {
             llvm::errs() << "Failed to open " << hostPath << ": " << ec.message() << "\n";
             return false;
         }
         // Emit strong g_runtime_debug_level override if user set #pragma aie_debug_level
-        if (runtimeDebugLevel >= 0) {
+        // (only on first write, not in append mode)
+        if (!appendMode && runtimeDebugLevel >= 0) {
             stream << "// Override runtime debug level (from #pragma aie_debug_level)\n";
             stream << "int g_runtime_debug_level = " << runtimeDebugLevel << ";\n\n";
+        }
+        if (appendMode) {
+            stream << "\n// ===== Appended host function: " << hostFuncName << " =====\n";
+            // In append mode, erase dskernel_receiver from the module to avoid
+            // redefinition (it was already emitted by the first pipeline run).
+            // Also erase #include "aie_runtime.h" emitc.include ops to avoid duplicate.
+            {
+                llvm::SmallVector<Operation *, 4> toErase;
+                for (auto &op : hostModule.getOps()) {
+                    if (auto func = dyn_cast<emitc::FuncOp>(op)) {
+                        if (func.getName() == "dskernel_receiver")
+                            toErase.push_back(&op);
+                    } else if (auto inc = dyn_cast<emitc::IncludeOp>(op)) {
+                        toErase.push_back(&op);
+                    }
+                }
+                for (auto *op : toErase)
+                    op->erase();
+            }
         }
         if (failed(mlir::emitc::translateToCpp(hostModule, stream))) {
             llvm::errs() << "Failed to translate host MLIR to C++.\n";
             return false;
+        }
+
+        // In append mode, skip user source and __aie_launch emission — caller handles it
+        if (appendMode) {
+            stream.close();
+            std::cout << "Host function appended to " << hostPath << std::endl;
+            goto after_host_emit;
         }
 
         // Append user's rewritten source code after MLIR-generated functions.
@@ -498,6 +549,11 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             // numArgs includes the XAie_DevInst* dev param (arg 0); DDR pointer args are numArgs-1
             unsigned numDdrArgs = (numArgs > 0) ? numArgs - 1 : 0;
 
+            // Forward-declare kernel binary symbols so __aie_launch can reference them
+            stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_start[];\n";
+            stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_end[];\n";
+            stream << "extern unsigned int _binary_kernel_" << computeKernelName << "_size;\n\n";
+
             // --- __aie_launch with partition registry (init-once, dispatch by kernel name) ---
             if (numDdrArgs > 0) {
                 // aieMesh overload (new programming model)
@@ -513,6 +569,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                           "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
                 stream << "        __Runtime_register_partition(mesh.meshId, dev);\n";
                 stream << "    }\n";
+                stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
                 stream << "    " << hostFuncName << "(dev";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
                     stream << ", _t" << i;
@@ -532,6 +589,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << "    } else {\n";
                 stream << "        dev = __Runtime_explicit_init();\n";
                 stream << "    }\n";
+                stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
                 stream << "    " << hostFuncName << "(dev";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
                     stream << ", _t" << i;
@@ -550,6 +608,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                           "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
                 stream << "        __Runtime_register_partition(mesh.meshId, dev);\n";
                 stream << "    }\n";
+                stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
                 stream << "    " << hostFuncName << "(dev);\n";
                 stream << "}\n";
 
@@ -564,6 +623,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << "    } else {\n";
                 stream << "        dev = __Runtime_explicit_init();\n";
                 stream << "    }\n";
+                stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
                 stream << "    " << hostFuncName << "(dev);\n";
                 stream << "    __Runtime_explicit_teardown(dev);\n";
                 stream << "}\n";
@@ -683,10 +743,12 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         stream.close();
         std::cout << "Host code written to " << hostPath << std::endl;
     }
+after_host_emit:
 
-    // Emit kernel.cc
+    // Emit kernel.cc (suffixed per kernel in multi-kernel mode)
     {
-        std::string kernelPath = outputDir + "/kernel.cc";
+        std::string kernelFilename = hostFuncSuffix.empty() ? "kernel.cc" : "kernel_" + hostFuncSuffix + ".cc";
+        std::string kernelPath = outputDir + "/" + kernelFilename;
         std::error_code ec;
         llvm::raw_fd_ostream stream(kernelPath, ec, llvm::sys::fs::OF_None);
         if (ec) {
@@ -818,7 +880,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 bcf.addSymbol(slot.symbolName, slot.address);
             }
 
-            std::string bcfPath = outputDir + "/aieml.bcf";
+            // Suffix BCF/PRX with kernel name in multi-kernel mode
+            std::string bcfBaseName = hostFuncSuffix.empty() ? "aieml" : "aieml_" + hostFuncSuffix;
+            std::string bcfPath = outputDir + "/" + bcfBaseName + ".bcf";
             if (bcf.exportToFile(bcfPath)) {
                 std::cout << "BCF written to " << bcfPath << std::endl;
             } else {
@@ -826,10 +890,10 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             }
 
             TilingPrx prx("kernel", 22);
-            prx.setBcfPath("aieml.bcf");
+            prx.setBcfPath(bcfBaseName + ".bcf");
             prx.setKernelLLPath("./build/");
 
-            std::string prxPath = outputDir + "/aieml.prx";
+            std::string prxPath = outputDir + "/" + bcfBaseName + ".prx";
             if (prx.exportToFile(prxPath)) {
                 std::cout << "PRX written to " << prxPath << std::endl;
             } else {

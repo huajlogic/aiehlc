@@ -290,6 +290,10 @@ struct_io __Runtime_dma_createio_4(XAie_LocType tile_loc, XAie_DmaDesc dma_desc,
 struct_ioevent __Runtime_startio(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat);
 struct_ioevent _Runtime_startio_ooo(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat);
 
+// Set the active kernel ELF binary for the next load_kernel_group call.
+// In multi-kernel mode, host code calls this before each host_canonicalized_<name>().
+void __Runtime_set_kernel_elf(unsigned char *elf_start);
+
 // Kernel management (all take explicit XAie_DevInst*)
 struct_kernel_group __Runtime_load_kernel_group(XAie_DevInst *dev, XAie_LocType *tiles, int32_t num_tiles,
                                                 unsigned char **elf_buffers);

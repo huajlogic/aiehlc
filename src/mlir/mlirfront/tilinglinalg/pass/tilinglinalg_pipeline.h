@@ -62,6 +62,23 @@ struct PartitionDesc {
     bool isValid() const { return startCol >= 0; }
 };
 
+/// Derived tiling parameters computed from M/K/N and per-port SpatialPolicy.
+/// These are resolved after AST extraction and used to replace aie::get_*() calls
+/// in the kernel body with integer literals.
+struct DerivedTilingParams {
+    int64_t tileRows = 0; // M / HW_ROWS
+    int64_t tileCols = 0; // N / HW_COLS
+    int64_t kDim = 0;     // K
+
+    // Per-port derived values (indexed by tensor order: 0=A, 1=B, 2=C for GEMM)
+    struct PortParams {
+        int64_t numRounds = 0;
+        int64_t bufferSize = 0; // elements per round
+    };
+    std::vector<PortParams> portParams;
+    bool valid = false;
+};
+
 /// Descriptor for a kernel launch on a specific mesh.
 /// Used by multi-kernel mode to associate each <<<meshVar>>> launch with
 /// its kernel name, mesh dimensions, partition, and tensor parameters.
@@ -72,6 +89,17 @@ struct MeshKernelDesc {
     PartitionDesc partition;
     std::vector<TensorParam> tensors;
     int meshId = 0; // compiler-assigned ID for partition tracking
+    // Per-kernel fields for multi-kernel pipeline
+    std::string kernelBody;     // raw source text of __global__ function body
+    std::string kernelFuncName; // kernel function name from __global__
+    SplitModel splitModel;      // per-tensor data distribution strategy
+    int64_t maxPPBytes = 4096;  // max ping-pong buffer bytes
+    /// Number of DDR args on the generated host function (set after pipeline run)
+    unsigned numHostDdrArgs = 0;
+    /// Per-port variable names (e.g. "win_a", "win_b", "win_c") for aie::get_*() replacement
+    std::vector<std::string> portVarNames;
+    /// Derived tiling parameters for this kernel (aie::get_*() replacement)
+    DerivedTilingParams derivedParams;
 };
 
 class TilingLinalgPipeline {
@@ -98,10 +126,16 @@ public:
     /// hostFuncSuffix: when non-empty, the generated host function is named
     ///   host_canonicalized_<suffix> instead of host_canonicalized.
     ///   Used by multi-kernel mode to generate per-kernel host functions.
+    /// appendMode: when true, host.cc is opened in append mode (OF_Append) and
+    ///   user source / __aie_launch emission is skipped. Used by multi-kernel mode
+    ///   so that each kernel appends its host_canonicalized_<name> function.
+    /// numHostDdrArgs (out): if non-null, set to the number of DDR pointer args
+    ///   on the generated host function (numArgs - 1, excluding XAie_DevInst* dev).
     /// Returns true on success.
     static bool runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                             const std::string &userKernelBody = "", const std::string &userKernelFuncName = "",
                             int runtimeDebugLevel = -1, const std::string &userRewrittenSource = "",
                             const std::vector<TensorParam> &tensors = {}, int64_t maxPingPongBytes = 4096,
-                            const std::string &aieGen = "Gen2", const std::string &hostFuncSuffix = "");
+                            const std::string &aieGen = "Gen2", const std::string &hostFuncSuffix = "",
+                            bool appendMode = false, unsigned *numHostDdrArgs = nullptr);
 };

@@ -59,22 +59,7 @@ struct ParsedTensorInfo {
 };
 static std::vector<ParsedTensorInfo> parsedTensors;
 
-/// Derived tiling parameters computed from M/K/N and per-port SpatialPolicy.
-/// These are resolved after AST extraction and used to replace aie::get_*() calls
-/// in the kernel body with integer literals.
-struct DerivedTilingParams {
-    int64_t tileRows = 0; // M / HW_ROWS
-    int64_t tileCols = 0; // N / HW_COLS
-    int64_t kDim = 0;     // K
-
-    // Per-port derived values (indexed by tensor order: 0=A, 1=B, 2=C for GEMM)
-    struct PortParams {
-        int64_t numRounds = 0;
-        int64_t bufferSize = 0; // elements per round
-    };
-    std::vector<PortParams> portParams;
-    bool valid = false;
-};
+// DerivedTilingParams is defined in tilinglinalg_pipeline.h
 static DerivedTilingParams derivedTilingParams;
 
 static int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0; // GEMM dimensions from launch args or macros
@@ -85,8 +70,9 @@ static PartitionDesc parsedPartition; // default: invalid (all -1), set by #prag
 static std::vector<MeshKernelDesc> parsedMeshKernels; // multi-kernel mode: one per <<<mesh>>> launch
 static std::vector<std::string> kernel_name_list;
 static std::unordered_map<std::string, const clang::FunctionDecl*> globalKernelFuncs;
-static std::string userKernelBody;      // raw source text of __global__ function body
-static std::string userKernelFuncName;  // kernel function name from __global__
+static std::string userKernelBody;     // raw source text of __global__ function body (last kernel, backward compat)
+static std::string userKernelFuncName; // kernel function name from __global__ (last kernel, backward compat)
+static std::unordered_map<std::string, std::string> globalKernelBodies; // per-kernel: name -> cleaned body text
 static std::vector<std::string> userMacroDefines; // #define lines from user source
 
 using namespace clang;
@@ -303,6 +289,7 @@ public:
              // Capture cleaned kernel body for tiling mode computekernel.cc emission
              userKernelFuncName = kname;
              userKernelBody = str;
+             globalKernelBodies[kname] = str; // per-kernel map for multi-kernel support
              llvm::outs() << "[TilingLinalg] Captured __global__ kernel body for: " << kname << "\n";
 
              std::string header = "/******************************************************************************"
@@ -530,15 +517,20 @@ public:
                 }
 
                 // Guard: skip if this exact kernel was already parsed (AST visitor may visit twice)
+                // Important: do NOT clear globals before this check — a same-name kernel called
+                // twice (e.g. matmul<<<mesh>>>(A,B,C); matmul<<<mesh>>>(C,B,A);) must not
+                // clobber the state captured from the first visit.
                 for (const auto &mk : parsedMeshKernels) {
                     if (mk.kernelName == currentLaunchKernel)
                         return true;
                 }
 
-                // For multi-kernel: first launch populates parsedTensors/tilingMeshRows/etc.
-                // Subsequent launches add to parsedMeshKernels but don't overwrite the globals
-                // (backward compat: globals reflect the first kernel's values).
+                // For multi-kernel: each launch gets its own parsedTensors / derivedTilingParams.
+                // Clear per-kernel state so this kernel starts fresh.
+                // This must happen AFTER the duplicate check above.
                 bool isFirstKernel = parsedMeshKernels.empty();
+                parsedTensors.clear();
+                derivedTilingParams = DerivedTilingParams();
 
                 // Arg 0: kernel name (string literal after preprocessing)
 				if (CE->getNumArgs() >= 2) {
@@ -1162,12 +1154,46 @@ public:
                     {
                         MeshKernelDesc mkd;
                         mkd.kernelName = currentLaunchKernel;
+                        mkd.kernelFuncName = currentLaunchKernel;
                         mkd.meshRows = localMeshRows > 0 ? localMeshRows : tilingMeshRows;
                         mkd.meshCols = localMeshCols > 0 ? localMeshCols : tilingMeshCols;
                         mkd.partition = localPartition.isValid() ? localPartition : parsedPartition;
                         mkd.meshId = (int)parsedMeshKernels.size();
                         for (auto &pt : parsedTensors) {
                             mkd.tensors.push_back({pt.shape, pt.elementBitWidth, pt.isInput});
+                        }
+                        // Store per-kernel body from globalKernelBodies map
+                        auto bodyIt = globalKernelBodies.find(currentLaunchKernel);
+                        if (bodyIt != globalKernelBodies.end()) {
+                            mkd.kernelBody = bodyIt->second;
+                        }
+                        // Build per-kernel SplitModel from parsedTensors
+                        for (auto &pt : parsedTensors) {
+                            if (pt.policyResolved) {
+                                mkd.splitModel.tensorSplits.push_back(
+                                    SplitModel::fromPolicyFields(pt.pattern, pt.distribution, pt.mergeOrder,
+                                                                 pt.pingPong, pt.isInput, pt.maxBufferBytes));
+                            } else if (!pt.spatialTag.empty()) {
+                                mkd.splitModel.tensorSplits.push_back(
+                                    SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
+                            } else {
+                                mkd.splitModel.tensorSplits.push_back(SplitModel::fromPolicyFields(
+                                    pt.isInput ? 0 : 3, 0, pt.isInput ? 0 : 1, 2, pt.isInput, pt.maxBufferBytes));
+                            }
+                        }
+                        // Store per-kernel maxPPBytes (minimum across ports)
+                        if (!parsedTensors.empty()) {
+                            mkd.maxPPBytes = parsedTensors[0].maxBufferBytes;
+                            for (auto &pt : parsedTensors) {
+                                if (pt.maxBufferBytes > 0 && pt.maxBufferBytes < mkd.maxPPBytes)
+                                    mkd.maxPPBytes = pt.maxBufferBytes;
+                            }
+                        }
+                        // Store per-kernel derivedTilingParams and port var names
+                        // for aie::get_*() replacement in multi-kernel mode
+                        mkd.derivedParams = derivedTilingParams;
+                        for (auto &pt : parsedTensors) {
+                            mkd.portVarNames.push_back(pt.varName);
                         }
                         parsedMeshKernels.push_back(mkd);
                         llvm::outs() << "[TilingLinalg] Registered MeshKernelDesc: kernel=" << mkd.kernelName
@@ -1912,167 +1938,399 @@ public:
             mlir::MLIRContext ctx;
             TilingLinalgPipeline::registerDialects(ctx);
 
-            // Build tensor params — use defaults matching unitest if not parsed
-            std::vector<TensorParam> tensors;
-            if (parsedTensors.empty()) {
-                // Default: single input tensor 16x16 i8 (same as unitest)
-                tensors.push_back({{16, 16}, 8, true});
-            } else {
-                for (auto &pt : parsedTensors) {
-                    tensors.push_back({pt.shape, pt.elementBitWidth, pt.isInput});
-                }
-            }
-
-            // Use default mesh if not parsed
-            int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
-            int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
-
-            // Build SplitModel from resolved policy fields
-            SplitModel splitModel;
-            if (!parsedTensors.empty()) {
-                for (auto &pt : parsedTensors) {
-                    if (pt.policyResolved) {
-                        // Use resolved struct fields from AST
-                        splitModel.tensorSplits.push_back(SplitModel::fromPolicyFields(
-                            pt.pattern, pt.distribution, pt.mergeOrder, pt.pingPong, pt.isInput, pt.maxBufferBytes));
-                    } else if (!pt.spatialTag.empty()) {
-                        // Legacy spatial tag syntax (e.g. row_broadcast_in<T>)
-                        splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
-                    } else {
-                        llvm::errs() << "[TilingLinalg] ERROR: tensor '" << pt.varName
-                                     << "' has no resolved policy and no spatial tag\n";
-                        // Default fallback
-                        splitModel.tensorSplits.push_back(
-                            SplitModel::fromPolicyFields(pt.isInput ? 0 : 3, // Broadcast for input, Gather for output
-                                                         0, pt.isInput ? 0 : 1, 2, pt.isInput, pt.maxBufferBytes));
-                    }
-                }
-            } else {
-                splitModel = SplitModel::gemm();
-            }
-
-            // Build routing IR
-            auto module =
-                TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel, parsedPartition, aieGenStr);
-
-            // Replace aie::get_*() calls in kernel body with computed integer literals
-            if (derivedTilingParams.valid && !userKernelBody.empty()) {
-                llvm::outs() << "[TilingLinalg] Replacing aie::get_*() calls in kernel body\n";
-
-                // Build parameter-name-to-port-index map from parsedTensors
-                std::unordered_map<std::string, size_t> paramToPort;
-                for (size_t i = 0; i < parsedTensors.size(); ++i) {
-                    paramToPort[parsedTensors[i].varName] = i;
-                }
-
-                // Replace aie::get_num_rounds(param_name) and aie::get_buffer_size(param_name)
-                for (const auto &funcName : {"aie::get_num_rounds", "aie::get_buffer_size"}) {
-                    std::string prefix = std::string(funcName) + "(";
-                    size_t pos = 0;
-                    while ((pos = userKernelBody.find(prefix, pos)) != std::string::npos) {
-                        size_t argStart = pos + prefix.size();
-                        size_t argEnd = userKernelBody.find(")", argStart);
-                        if (argEnd == std::string::npos)
-                            break;
-                        std::string argName = userKernelBody.substr(argStart, argEnd - argStart);
-                        // Trim whitespace
-                        while (!argName.empty() && argName.front() == ' ')
-                            argName.erase(0, 1);
-                        while (!argName.empty() && argName.back() == ' ')
-                            argName.pop_back();
-
-                        auto it = paramToPort.find(argName);
-                        if (it != paramToPort.end() && it->second < derivedTilingParams.portParams.size()) {
-                            int64_t val;
-                            if (std::string(funcName) == "aie::get_num_rounds")
-                                val = derivedTilingParams.portParams[it->second].numRounds;
-                            else
-                                val = derivedTilingParams.portParams[it->second].bufferSize;
-                            std::string replacement = std::to_string(val);
-                            userKernelBody.replace(pos, argEnd + 1 - pos, replacement);
-                            llvm::outs() << "[TilingLinalg]   " << funcName << "(" << argName << ") -> " << replacement
-                                         << "\n";
-                            pos += replacement.size();
-                        } else {
-                            pos = argEnd + 1;
-                        }
-                    }
-                }
-
-                // Replace aie::get_tile_rows(), aie::get_tile_cols(), aie::get_k_dim()
-                auto replaceSimpleCall = [&](const std::string &call, int64_t val) {
-                    std::string replacement = std::to_string(val);
-                    size_t pos = 0;
-                    while ((pos = userKernelBody.find(call, pos)) != std::string::npos) {
-                        userKernelBody.replace(pos, call.size(), replacement);
-                        llvm::outs() << "[TilingLinalg]   " << call << " -> " << replacement << "\n";
-                        pos += replacement.size();
-                    }
-                };
-                replaceSimpleCall("aie::get_tile_rows()", derivedTilingParams.tileRows);
-                replaceSimpleCall("aie::get_tile_cols()", derivedTilingParams.tileCols);
-                replaceSimpleCall("aie::get_k_dim()", derivedTilingParams.kDim);
-            }
-
-            // Prepend user macros to kernel body for multi-tile path
-            std::string kernelBodyWithMacros = userKernelBody;
-            if (!userMacroDefines.empty() && !userKernelBody.empty()) {
-                std::string macroBlock = "// User macro definitions from source file\n";
-                for (const auto &macro : userMacroDefines) {
-                    macroBlock += macro + "\n";
-                }
-                macroBlock += "\n";
-                kernelBodyWithMacros = macroBlock + userKernelBody;
-            }
-
-            // Determine maxPingPongBytes from per-port policy (use minimum across all ports)
-            int64_t effectiveMaxPPBytes = 4096;
-            if (!parsedTensors.empty()) {
-                effectiveMaxPPBytes = parsedTensors[0].maxBufferBytes;
-                for (auto &pt : parsedTensors) {
-                    if (pt.maxBufferBytes > 0 && pt.maxBufferBytes < effectiveMaxPPBytes)
-                        effectiveMaxPPBytes = pt.maxBufferBytes;
-                }
-            }
-
-            // Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
-            // When multiple kernels are detected, suffix host function with kernel name
-            std::string hostFuncSuffix;
-            if (parsedMeshKernels.size() > 1 && !userKernelFuncName.empty()) {
-                hostFuncSuffix = userKernelFuncName;
-            }
             std::string outputDir = std::string(AOUT) + "worklocal/";
-            if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros, userKernelFuncName,
-                                                  parsedDebugLevel, userRewrittenSource, {}, effectiveMaxPPBytes,
-                                                  aieGenStr, hostFuncSuffix)) {
-                llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
-                // Copy user #include "..." headers to outputDir so host.cc is self-contained.
-                if (!userSourceDir.empty() && !userRewrittenSource.empty()) {
-                    std::regex includeRegex(R"(#\s*include\s*\"([^\"]+)\")");
-                    auto begin =
-                        std::sregex_iterator(userRewrittenSource.begin(), userRewrittenSource.end(), includeRegex);
-                    auto end = std::sregex_iterator();
-                    for (auto it = begin; it != end; ++it) {
-                        std::string headerName = (*it)[1].str();
-                        // Skip runtime headers already on the compiler include path
-                        if (headerName == "aie_runtime.h" || headerName == "aie_runtime_debug.h" ||
-                            headerName == "xaiengine.h")
-                            continue;
-                        std::string srcPath = userSourceDir + "/" + headerName;
-                        std::string dstPath = outputDir + "/" + headerName;
-                        // Only copy if the file exists in the user source directory
-                        std::ifstream src(srcPath, std::ios::binary);
-                        if (src.good()) {
-                            std::ofstream dst(dstPath, std::ios::binary);
-                            dst << src.rdbuf();
-                            llvm::outs() << "[TilingLinalg] Copied user header: " << headerName << " -> " << dstPath
-                                         << "\n";
+            bool isMultiKernel = parsedMeshKernels.size() > 1;
+
+            // ---- Multi-kernel loop: run pipeline per kernel ----
+            if (isMultiKernel) {
+                llvm::outs() << "[TilingLinalg] Multi-kernel mode: " << parsedMeshKernels.size() << " kernels\n";
+
+                for (size_t ki = 0; ki < parsedMeshKernels.size(); ++ki) {
+                    auto &mkd = parsedMeshKernels[ki];
+                    llvm::outs() << "[TilingLinalg] === Pipeline run " << ki << ": kernel=" << mkd.kernelName
+                                 << " mesh=" << mkd.meshRows << "x" << mkd.meshCols << " ===\n";
+
+                    int rows = mkd.meshRows > 0 ? mkd.meshRows : 2;
+                    int cols = mkd.meshCols > 0 ? mkd.meshCols : 2;
+
+                    // Use per-kernel tensors and splitModel
+                    SplitModel &splitModel = mkd.splitModel;
+                    if (splitModel.tensorSplits.empty())
+                        splitModel = SplitModel::gemm();
+
+                    // Build routing IR for this kernel
+                    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, mkd.tensors, splitModel,
+                                                                       mkd.partition, aieGenStr);
+
+                    // Replace aie::get_*() calls in kernel body with computed integer literals
+                    std::string resolvedBody = mkd.kernelBody;
+                    if (mkd.derivedParams.valid && !resolvedBody.empty()) {
+                        llvm::outs() << "[TilingLinalg] Replacing aie::get_*() calls in kernel body for "
+                                     << mkd.kernelName << "\n";
+
+                        // Build port name -> index map from stored varNames
+                        std::unordered_map<std::string, size_t> paramToPort;
+                        for (size_t pi = 0; pi < mkd.portVarNames.size(); ++pi) {
+                            paramToPort[mkd.portVarNames[pi]] = pi;
                         }
+
+                        // Replace aie::get_num_rounds(win_x) and aie::get_buffer_size(win_x)
+                        for (const auto &funcName : {"aie::get_num_rounds", "aie::get_buffer_size"}) {
+                            std::string prefix = std::string(funcName) + "(";
+                            size_t pos = 0;
+                            while ((pos = resolvedBody.find(prefix, pos)) != std::string::npos) {
+                                size_t argStart = pos + prefix.size();
+                                size_t argEnd = resolvedBody.find(")", argStart);
+                                if (argEnd == std::string::npos)
+                                    break;
+                                std::string argName = resolvedBody.substr(argStart, argEnd - argStart);
+                                while (!argName.empty() && argName.front() == ' ')
+                                    argName.erase(0, 1);
+                                while (!argName.empty() && argName.back() == ' ')
+                                    argName.pop_back();
+                                auto it = paramToPort.find(argName);
+                                if (it != paramToPort.end() && it->second < mkd.derivedParams.portParams.size()) {
+                                    int64_t val;
+                                    if (std::string(funcName) == "aie::get_num_rounds")
+                                        val = mkd.derivedParams.portParams[it->second].numRounds;
+                                    else
+                                        val = mkd.derivedParams.portParams[it->second].bufferSize;
+                                    std::string replacement = std::to_string(val);
+                                    resolvedBody.replace(pos, argEnd + 1 - pos, replacement);
+                                    pos += replacement.size();
+                                } else {
+                                    pos = argEnd + 1;
+                                }
+                            }
+                        }
+
+                        // Replace simple calls: get_tile_rows(), get_tile_cols(), get_k_dim()
+                        auto replaceSimpleCall = [&](const std::string &call, int64_t val) {
+                            std::string replacement = std::to_string(val);
+                            size_t pos = 0;
+                            while ((pos = resolvedBody.find(call, pos)) != std::string::npos) {
+                                resolvedBody.replace(pos, call.size(), replacement);
+                                pos += replacement.size();
+                            }
+                        };
+                        replaceSimpleCall("aie::get_tile_rows()", mkd.derivedParams.tileRows);
+                        replaceSimpleCall("aie::get_tile_cols()", mkd.derivedParams.tileCols);
+                        replaceSimpleCall("aie::get_k_dim()", mkd.derivedParams.kDim);
                     }
+
+                    // Prepend user macros to kernel body
+                    std::string kernelBodyWithMacros = resolvedBody;
+                    if (!userMacroDefines.empty() && !resolvedBody.empty()) {
+                        std::string macroBlock = "// User macro definitions from source file\n";
+                        for (const auto &macro : userMacroDefines) {
+                            macroBlock += macro + "\n";
+                        }
+                        macroBlock += "\n";
+                        kernelBodyWithMacros = macroBlock + resolvedBody;
+                    }
+
+                    // First kernel writes host.cc fresh; subsequent kernels append
+                    bool appendMode = (ki > 0);
+                    // In multi-kernel mode, always suffix host function with kernel name
+                    std::string hostFuncSuffix = mkd.kernelName;
+                    // Don't pass userRewrittenSource in multi-kernel mode — we emit it ourselves after all runs
+                    unsigned hostDdrArgs = 0;
+                    if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros,
+                                                           mkd.kernelFuncName, parsedDebugLevel,
+                                                           /*userRewrittenSource=*/"", {}, mkd.maxPPBytes, aieGenStr,
+                                                           hostFuncSuffix, appendMode, &hostDdrArgs)) {
+                        llvm::errs() << "[TilingLinalg] Pipeline FAILED for kernel: " << mkd.kernelName << "\n";
+                        std::exit(1);
+                    }
+                    mkd.numHostDdrArgs = hostDdrArgs;
+                    llvm::outs() << "[TilingLinalg] Pipeline completed for kernel: " << mkd.kernelName
+                                 << " (hostDdrArgs=" << hostDdrArgs << ")\n";
+                }
+
+                // ---- Post-pipeline: append user source + unified __aie_launch to host.cc ----
+                {
+                    std::string hostPath = outputDir + "/host.cc";
+                    std::error_code ec;
+                    llvm::raw_fd_ostream stream(hostPath, ec, llvm::sys::fs::OF_Append);
+                    if (ec) {
+                        llvm::errs() << "Failed to open " << hostPath << " for appending: " << ec.message() << "\n";
+                        std::exit(1);
+                    }
+
+                    stream << "\n// ===== User source + multi-kernel __aie_launch dispatch =====\n";
+                    stream << "#define AIEHLC_TILING_STUBS_DEFINED\n";
+                    stream << "#include <cstring>\n";
+                    // Re-emit SpatialPolicy types so user source constexpr definitions compile
+                    stream << "namespace aie {\n";
+                    stream << "enum class Pattern  { Broadcast = 0, Scatter = 1, Multicast = 2, Gather = 3 };\n";
+                    stream << "enum class Layout   { Row = 0, Col = 1, Grid = 2 };\n";
+                    stream << "enum class Flow     { Default = 0, LeftToRight = 1, RightToLeft = 2 };\n";
+                    stream << "struct SpatialPolicy {\n";
+                    stream << "  Pattern pattern      = Pattern::Broadcast;\n";
+                    stream << "  Layout  distribution = Layout::Row;\n";
+                    stream << "  Flow    merge_order  = Flow::Default;\n";
+                    stream << "  int     pp_depth     = 2;\n";
+                    stream << "  int     max_buffer_bytes = 4096;\n";
+                    stream << "};\n";
+                    stream << "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
+                    stream << "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
+                    stream << "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
+                    stream << "constexpr int get_tile_rows() { return 0; }\n";
+                    stream << "constexpr int get_tile_cols() { return 0; }\n";
+                    stream << "constexpr int get_k_dim() { return 0; }\n";
+                    stream << "}\n";
+                    // aiePartition struct
+                    stream << "struct aiePartition {\n";
+                    stream << "    int startCol, endCol, startRow, endRow;\n";
+                    stream << "};\n";
+                    // aieMesh + aieArray
+                    stream << "struct aieMesh {\n";
+                    stream << "    int rows, cols;\n";
+                    stream << "    aiePartition partition;\n";
+                    stream << "    int meshId;\n";
+                    stream << "};\n";
+                    stream << "struct aieArray {\n";
+                    stream << "    int nextMeshId = 0;\n";
+                    stream << "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
+                    stream << "        return aieMesh{rows, cols, p, nextMeshId++};\n";
+                    stream << "    }\n";
+                    stream << "    void synchronize() { /* no-op: each <<<mesh>>> call does its own teardown */ }\n";
+                    stream << "};\n";
+                    // aieDim (backward compat)
+                    stream << "struct aieDim {\n";
+                    stream << "    int rows, cols;\n";
+                    stream << "    aiePartition partition;\n";
+                    stream << "    bool hasPartition;\n";
+                    stream << "    aieDim(int r, int c) : rows(r), cols(c), partition{-1,-1,-1,-1}, "
+                              "hasPartition(false) {}\n";
+                    stream << "    aieDim(int r, int c, aiePartition p) : rows(r), cols(c), partition(p), "
+                              "hasPartition(true) {}\n";
+                    stream << "};\n";
+                    stream << "inline void aieSetDevice(int) {}\n";
+                    stream << "inline void aieDeviceSynchronize() {}\n";
+
+                    // Emit extern declarations for per-kernel binary symbols
+                    // (must appear before __aie_launch which references them)
+                    for (auto &mkd : parsedMeshKernels) {
+                        stream << "extern unsigned char _binary_kernel_" << mkd.kernelName << "_start[];\n";
+                        stream << "extern unsigned char _binary_kernel_" << mkd.kernelName << "_end[];\n";
+                        stream << "extern unsigned int _binary_kernel_" << mkd.kernelName << "_size;\n";
+                    }
+
+                    // Find max DDR args across all kernels for __aie_launch signature
+                    unsigned maxDdrArgs = 0;
+                    for (auto &mkd : parsedMeshKernels) {
+                        if (mkd.numHostDdrArgs > maxDdrArgs)
+                            maxDdrArgs = mkd.numHostDdrArgs;
+                    }
+
+                    // Emit unified __aie_launch with strcmp dispatch (aieMesh overload)
+                    if (maxDdrArgs > 0) {
+                        stream << "inline void __aie_launch(const char* kernel, aieMesh mesh";
+                        for (unsigned i = 0; i < maxDdrArgs; ++i)
+                            stream << ", void* _t" << i;
+                        stream << ", ...) {\n";
+                        for (size_t ki = 0; ki < parsedMeshKernels.size(); ++ki) {
+                            auto &mkd = parsedMeshKernels[ki];
+                            std::string hostFunc = "host_canonicalized_" + mkd.kernelName;
+                            stream << "    " << (ki == 0 ? "if" : "} else if") << " (strcmp(kernel, \""
+                                   << mkd.kernelName << "\") == 0) {\n";
+                            stream
+                                << "        XAie_DevInst* dev = __Runtime_explicit_init_partition("
+                                << "mesh.partition.startCol, mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                            stream << "        __Runtime_set_kernel_elf(_binary_kernel_" << mkd.kernelName
+                                   << "_start);\n";
+                            stream << "        " << hostFunc << "(dev";
+                            for (unsigned i = 0; i < mkd.numHostDdrArgs; ++i)
+                                stream << ", _t" << i;
+                            stream << ");\n";
+                            stream << "        __Runtime_explicit_teardown(dev);\n";
+                        }
+                        stream << "    }\n";
+                        stream << "}\n";
+
+                        // aieDim overload (backward compat)
+                        stream << "inline void __aie_launch(const char* kernel, aieDim mesh";
+                        for (unsigned i = 0; i < maxDdrArgs; ++i)
+                            stream << ", void* _t" << i;
+                        stream << ", ...) {\n";
+                        stream << "    (void)kernel;\n";
+                        stream << "    XAie_DevInst* dev;\n";
+                        stream << "    if (mesh.hasPartition) {\n";
+                        stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
+                                  "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                        stream << "    } else {\n";
+                        stream << "        dev = __Runtime_explicit_init();\n";
+                        stream << "    }\n";
+                        // aieDim only supports single kernel (backward compat) — dispatch first kernel
+                        if (!parsedMeshKernels.empty()) {
+                            std::string hostFunc = "host_canonicalized_" + parsedMeshKernels[0].kernelName;
+                            stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << parsedMeshKernels[0].kernelName
+                                   << "_start);\n";
+                            stream << "    " << hostFunc << "(dev";
+                            for (unsigned i = 0; i < parsedMeshKernels[0].numHostDdrArgs; ++i)
+                                stream << ", _t" << i;
+                            stream << ");\n";
+                        }
+                        stream << "    __Runtime_explicit_teardown(dev);\n";
+                        stream << "}\n";
+                    } else {
+                        // No DDR args variant (template)
+                        stream << "template<typename... Args>\n";
+                        stream << "inline void __aie_launch(const char* kernel, aieMesh mesh, Args... args) {\n";
+                        for (size_t ki = 0; ki < parsedMeshKernels.size(); ++ki) {
+                            auto &mkd = parsedMeshKernels[ki];
+                            std::string hostFunc = "host_canonicalized_" + mkd.kernelName;
+                            stream << "    " << (ki == 0 ? "if" : "} else if") << " (strcmp(kernel, \""
+                                   << mkd.kernelName << "\") == 0) {\n";
+                            stream
+                                << "        XAie_DevInst* dev = __Runtime_explicit_init_partition("
+                                << "mesh.partition.startCol, mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                            stream << "        __Runtime_set_kernel_elf(_binary_kernel_" << mkd.kernelName
+                                   << "_start);\n";
+                            stream << "        " << hostFunc << "(dev);\n";
+                            stream << "        __Runtime_explicit_teardown(dev);\n";
+                        }
+                        stream << "    }\n";
+                        stream << "}\n";
+                    }
+
+                    // Append user's rewritten source
+                    stream << userRewrittenSource << "\n";
+                    stream.close();
+                    llvm::outs() << "[TilingLinalg] Multi-kernel __aie_launch + user source appended to host.cc\n";
                 }
             } else {
-                llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
-                std::exit(1);
+                // ---- Single-kernel path (backward compatible) ----
+                // Build tensor params — use defaults matching unitest if not parsed
+                std::vector<TensorParam> tensors;
+                SplitModel splitModel;
+                std::string singleKernelBody = userKernelBody;
+                std::string singleKernelFuncName = userKernelFuncName;
+                int64_t effectiveMaxPPBytes = 4096;
+
+                if (!parsedMeshKernels.empty()) {
+                    // Use data from the single MeshKernelDesc
+                    auto &mkd = parsedMeshKernels[0];
+                    tensors = mkd.tensors;
+                    splitModel = mkd.splitModel;
+                    singleKernelBody = mkd.kernelBody;
+                    singleKernelFuncName = mkd.kernelFuncName;
+                    effectiveMaxPPBytes = mkd.maxPPBytes;
+                } else if (parsedTensors.empty()) {
+                    tensors.push_back({{16, 16}, 8, true});
+                    splitModel = SplitModel::gemm();
+                } else {
+                    for (auto &pt : parsedTensors) {
+                        tensors.push_back({pt.shape, pt.elementBitWidth, pt.isInput});
+                    }
+                    splitModel = SplitModel::gemm();
+                }
+                if (splitModel.tensorSplits.empty())
+                    splitModel = SplitModel::gemm();
+
+                // Use default mesh if not parsed
+                int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
+                int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
+
+                // Build routing IR
+                auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel,
+                                                                   parsedPartition, aieGenStr);
+
+                // Replace aie::get_*() calls in kernel body with computed integer literals
+                if (derivedTilingParams.valid && !singleKernelBody.empty()) {
+                    llvm::outs() << "[TilingLinalg] Replacing aie::get_*() calls in kernel body\n";
+
+                    std::unordered_map<std::string, size_t> paramToPort;
+                    for (size_t i = 0; i < parsedTensors.size(); ++i) {
+                        paramToPort[parsedTensors[i].varName] = i;
+                    }
+
+                    for (const auto &funcName : {"aie::get_num_rounds", "aie::get_buffer_size"}) {
+                        std::string prefix = std::string(funcName) + "(";
+                        size_t pos = 0;
+                        while ((pos = singleKernelBody.find(prefix, pos)) != std::string::npos) {
+                            size_t argStart = pos + prefix.size();
+                            size_t argEnd = singleKernelBody.find(")", argStart);
+                            if (argEnd == std::string::npos)
+                                break;
+                            std::string argName = singleKernelBody.substr(argStart, argEnd - argStart);
+                            while (!argName.empty() && argName.front() == ' ')
+                                argName.erase(0, 1);
+                            while (!argName.empty() && argName.back() == ' ')
+                                argName.pop_back();
+                            auto it = paramToPort.find(argName);
+                            if (it != paramToPort.end() && it->second < derivedTilingParams.portParams.size()) {
+                                int64_t val;
+                                if (std::string(funcName) == "aie::get_num_rounds")
+                                    val = derivedTilingParams.portParams[it->second].numRounds;
+                                else
+                                    val = derivedTilingParams.portParams[it->second].bufferSize;
+                                std::string replacement = std::to_string(val);
+                                singleKernelBody.replace(pos, argEnd + 1 - pos, replacement);
+                                pos += replacement.size();
+                            } else {
+                                pos = argEnd + 1;
+                            }
+                        }
+                    }
+
+                    auto replaceSimpleCall = [&](const std::string &call, int64_t val) {
+                        std::string replacement = std::to_string(val);
+                        size_t pos = 0;
+                        while ((pos = singleKernelBody.find(call, pos)) != std::string::npos) {
+                            singleKernelBody.replace(pos, call.size(), replacement);
+                            pos += replacement.size();
+                        }
+                    };
+                    replaceSimpleCall("aie::get_tile_rows()", derivedTilingParams.tileRows);
+                    replaceSimpleCall("aie::get_tile_cols()", derivedTilingParams.tileCols);
+                    replaceSimpleCall("aie::get_k_dim()", derivedTilingParams.kDim);
+                }
+
+                // Prepend user macros to kernel body for multi-tile path
+                std::string kernelBodyWithMacros = singleKernelBody;
+                if (!userMacroDefines.empty() && !singleKernelBody.empty()) {
+                    std::string macroBlock = "// User macro definitions from source file\n";
+                    for (const auto &macro : userMacroDefines) {
+                        macroBlock += macro + "\n";
+                    }
+                    macroBlock += "\n";
+                    kernelBodyWithMacros = macroBlock + singleKernelBody;
+                }
+
+                // Run pipeline (single kernel — no suffix, no append mode)
+                if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros,
+                                                       singleKernelFuncName, parsedDebugLevel, userRewrittenSource, {},
+                                                       effectiveMaxPPBytes, aieGenStr)) {
+                    llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
+                    std::exit(1);
+                }
+            }
+
+            llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
+            // Copy user #include "..." headers to outputDir so host.cc is self-contained.
+            if (!userSourceDir.empty() && !userRewrittenSource.empty()) {
+                std::regex includeRegex(R"(#\s*include\s*\"([^\"]+)\")");
+                auto begin = std::sregex_iterator(userRewrittenSource.begin(), userRewrittenSource.end(), includeRegex);
+                auto end = std::sregex_iterator();
+                for (auto it = begin; it != end; ++it) {
+                    std::string headerName = (*it)[1].str();
+                    // Skip runtime headers already on the compiler include path
+                    if (headerName == "aie_runtime.h" || headerName == "aie_runtime_debug.h" ||
+                        headerName == "xaiengine.h")
+                        continue;
+                    std::string srcPath = userSourceDir + "/" + headerName;
+                    std::string dstPath = outputDir + "/" + headerName;
+                    // Only copy if the file exists in the user source directory
+                    std::ifstream src(srcPath, std::ios::binary);
+                    if (src.good()) {
+                        std::ofstream dst(dstPath, std::ios::binary);
+                        dst << src.rdbuf();
+                        llvm::outs() << "[TilingLinalg] Copied user header: " << headerName << " -> " << dstPath
+                                     << "\n";
+                    }
+                }
             }
         } else {
             // ---- EXISTING PATH: single-tile ----

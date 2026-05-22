@@ -36,14 +36,62 @@ BUILD_DIR="${WORKLOCAL_DIR}/build"
 
 KERNEL_FUNC_NAME="computekernel"   # matches the kernel function in host.cc
 
-pushd ${WORKLOCAL_DIR}
-source ./compile_kernel.sh "${KERNEL_FUNC_NAME}"
-if [ $? -ne 0 ]; then
-    echo "Error: compile_kernel.sh failed"
-    exit 1
+# Detect multi-kernel mode: check for kernel_<name>.cc files
+MULTI_KERNEL_FILES=()
+for f in "${WORKLOCAL_DIR}"/kernel_*.cc; do
+    [ -f "$f" ] && MULTI_KERNEL_FILES+=("$f")
+done
+
+KERNEL_OBJ_LIST=""
+if [ ${#MULTI_KERNEL_FILES[@]} -gt 0 ]; then
+    echo "[Multi-kernel] Detected ${#MULTI_KERNEL_FILES[@]} kernel(s)"
+    pushd ${WORKLOCAL_DIR}
+    for kf in "${MULTI_KERNEL_FILES[@]}"; do
+        kfname="$(basename "$kf")"
+        # Extract kernel name: kernel_<name>.cc -> <name>
+        kname="${kfname#kernel_}"
+        kname="${kname%.cc}"
+        echo "[Multi-kernel] Compiling kernel: ${kname} (${kfname})"
+
+        # Use per-kernel PRX if available, fall back to aieml.prx
+        KPRX=""
+        if [ -f "${WORKLOCAL_DIR}/aieml_${kname}.prx" ]; then
+            KPRX="${WORKLOCAL_DIR}/aieml_${kname}.prx"
+        elif [ -f "${WORKLOCAL_DIR}/aieml.prx" ]; then
+            KPRX="${WORKLOCAL_DIR}/aieml.prx"
+        fi
+
+        # compile_kernel.sh compiles kernel.cc — for multi-kernel, temporarily symlink
+        ln -sf "${kfname}" "${WORKLOCAL_DIR}/kernel.cc"
+        if [ -n "$KPRX" ]; then
+            ln -sf "$(basename "$KPRX")" "${WORKLOCAL_DIR}/aieml.prx"
+        fi
+
+        source ./compile_kernel.sh "${kname}"
+        if [ $? -ne 0 ]; then
+            echo "Error: compile_kernel.sh failed for kernel ${kname}"
+            exit 1
+        fi
+        # Rename kernel.o to kernel_<name>.o to avoid overwriting
+        mv -f "${BUILD_DIR}/kernel.o" "${BUILD_DIR}/kernel_${kname}.o"
+        echo "✓ Compiled kernel: ${BUILD_DIR}/kernel_${kname}.o (func: ${kname})"
+        KERNEL_OBJ_LIST="${KERNEL_OBJ_LIST} ${BUILD_DIR}/kernel_${kname}.o"
+    done
+    # Remove temporary symlink
+    rm -f "${WORKLOCAL_DIR}/kernel.cc"
+    popd
+else
+    # Single-kernel mode (backward compat)
+    pushd ${WORKLOCAL_DIR}
+    source ./compile_kernel.sh "${KERNEL_FUNC_NAME}"
+    if [ $? -ne 0 ]; then
+        echo "Error: compile_kernel.sh failed"
+        exit 1
+    fi
+    echo "✓ Compiled kernel: ${BUILD_DIR}/kernel.o (func: ${KERNEL_FUNC_NAME})"
+    KERNEL_OBJ_LIST="${BUILD_DIR}/kernel.o"
+    popd
 fi
-echo "✓ Compiled kernel: ${BUILD_DIR}/kernel.o (func: ${KERNEL_FUNC_NAME})"
-popd
 
 # Defaults (match aiehlc.sh)
 aie_version="${AIE_VERSION:-5}"
@@ -179,12 +227,15 @@ DEFS="-DAIE_GEN=${aie_version}"
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# kernel.o is already built by compile_kernel.sh with canonical symbols
+# Kernel .o file(s) are already built by compile_kernel.sh with canonical symbols
 # (_binary_kernel_<func_name>_{start,end,size})
-KERNEL_OBJ="${BUILD_DIR}/kernel.o"
+# KERNEL_OBJ_LIST is set above (single file or multiple files for multi-kernel)
 
-echo "Symbols in kernel.o:"
-nm "${KERNEL_OBJ}" | grep _binary_
+echo "Kernel object(s):"
+for kobj in ${KERNEL_OBJ_LIST}; do
+    echo "  $(basename ${kobj}):"
+    nm "${kobj}" | grep _binary_ || true
+done
 echo ""
 
 echo "============================================"
@@ -297,7 +348,7 @@ set -x
 # --specs=nosys.specs provides stubs for _exit, _close, _fstat, etc. (baremetal/newlib)
 # -Wl,--defsym,end=__bss_end__ defines 'end' for newlib _sbrk (lscript.ld defines __bss_end__)
 echo "Linking host (with embedded kernel binary)..."
-${TOOL_PREFIX}g++ -Os -o host host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o ${ROUTING_OBJ} "${KERNEL_OBJ}" \
+${TOOL_PREFIX}g++ -Os -o host host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o ${ROUTING_OBJ} ${KERNEL_OBJ_LIST} \
     --specs=nosys.specs \
     -Wl,--defsym,end=__bss_end__ \
     -Wl,-T -Wl,${ARCH_APU_LD} \

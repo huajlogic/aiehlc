@@ -316,21 +316,29 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     # Copy worklocal files to the unitest worklocal dir for hostcompile.sh
     UNITEST_WORKLOCAL="${AIEHLC_DIR}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal"
     cp -f "${HOST_BUILD_DIR}/worklocal/host.cc" "${UNITEST_WORKLOCAL}/host.cc"
-    cp -f "${HOST_BUILD_DIR}/worklocal/kernel.cc" "${UNITEST_WORKLOCAL}/kernel.cc"
+    # Copy kernel.cc (single-kernel) or kernel_*.cc (multi-kernel)
+    if [ -f "${HOST_BUILD_DIR}/worklocal/kernel.cc" ]; then
+        cp -f "${HOST_BUILD_DIR}/worklocal/kernel.cc" "${UNITEST_WORKLOCAL}/kernel.cc"
+    fi
+    for f in "${HOST_BUILD_DIR}"/worklocal/kernel_*.cc; do
+        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
+    done
     if [ -f "${HOST_BUILD_DIR}/worklocal/routing.cc" ]; then
         cp -f "${HOST_BUILD_DIR}/worklocal/routing.cc" "${UNITEST_WORKLOCAL}/routing.cc"
     fi
-    if [ -f "${HOST_BUILD_DIR}/worklocal/aieml.bcf" ]; then
-        cp -f "${HOST_BUILD_DIR}/worklocal/aieml.bcf" "${UNITEST_WORKLOCAL}/aieml.bcf"
-    fi
-    if [ -f "${HOST_BUILD_DIR}/worklocal/aieml.prx" ]; then
-        cp -f "${HOST_BUILD_DIR}/worklocal/aieml.prx" "${UNITEST_WORKLOCAL}/aieml.prx"
-    fi
-    # Copy compute kernel source (any .cc not already copied: host.cc, kernel.cc, routing.cc)
+    # Copy BCF/PRX files (single-kernel: aieml.bcf, multi-kernel: aieml_*.bcf)
+    for f in "${HOST_BUILD_DIR}"/worklocal/aieml*.bcf; do
+        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
+    done
+    for f in "${HOST_BUILD_DIR}"/worklocal/aieml*.prx; do
+        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
+    done
+    # Copy compute kernel source (any .cc not already copied)
     for f in "${HOST_BUILD_DIR}"/worklocal/*.cc; do
         fname="$(basename "$f")"
         case "$fname" in
-            host.cc|kernel.cc|routing.cc) continue ;;
+            host.cc|routing.cc) continue ;;
+            kernel.cc|kernel_*.cc) continue ;;
         esac
         [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/${fname}"
     done
