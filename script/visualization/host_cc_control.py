@@ -403,7 +403,7 @@ def parse_host_cc(text: str) -> List[SSAOp]:
             ))
             continue
 
-        # --- __Runtime_dma_bd_config (13-arg) ---
+        # --- __Runtime_dma_bd_config (13-arg: DevInst, tile, buf, bd_id, len, next_bd, enable_packet, packet_id, acq_lock_id, acq_lock_val, rel_lock_id, rel_lock_val, ooo_bd_id) ---
         m = re.search(
             r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
             r"(\w+),\s*(\w+),\s*(\w+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
@@ -414,27 +414,31 @@ def parse_host_cc(text: str) -> List[SSAOp]:
         if m:
             buf_var = m.group(4)
             source_pt = buf_arg_map.get(buf_var, buf_var)
-            next_bd = m.group(8)
+            next_bd = m.group(7)
             if int(next_bd) < 0 or int(next_bd) > 65535:
                 next_bd = "none"
+            ooo_bd_id = m.group(14)
+            if int(ooo_bd_id) < 0:
+                ooo_bd_id = "none"
             ops.append(SSAOp(
                 result=m.group(1), op_type="config.dma_bd",
                 operands=[buf_var, m.group(3)],
                 attrs={
-                    "bd_id": m.group(5), "offset": m.group(6),
-                    "len": m.group(7), "next_bd": next_bd,
-                    "enable_packet": "true" if int(m.group(9)) else "false",
-                    "packet_id": m.group(10),
-                    "acquire_lock_id": m.group(11),
-                    "acquire_lock_val": m.group(12),
-                    "release_lock_id": m.group(13),
-                    "release_lock_val": m.group(14),
+                    "bd_id": m.group(5),
+                    "len": m.group(6), "next_bd": next_bd,
+                    "enable_packet": "true" if int(m.group(8)) else "false",
+                    "packet_id": m.group(9),
+                    "acquire_lock_id": m.group(10),
+                    "acquire_lock_val": m.group(11),
+                    "release_lock_id": m.group(12),
+                    "release_lock_val": m.group(13),
+                    "ooo_bd_id": ooo_bd_id,
                 },
                 result_type="XAie_DmaDesc", raw=stripped, line_num=lno,
             ))
             continue
 
-        # --- __Runtime_dma_bd_config (10-arg fallback) ---
+        # --- __Runtime_dma_bd_config (10-arg fallback: DevInst, tile, buf, bd_id, len, next_bd, enable_packet, packet_id, acq_lock_id, acq_lock_val) ---
         m = re.search(
             r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
             r"(\w+),\s*(\w+),\s*(\w+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
@@ -443,17 +447,17 @@ def parse_host_cc(text: str) -> List[SSAOp]:
         )
         if m:
             buf_var = m.group(4)
-            next_bd = m.group(8)
+            next_bd = m.group(7)
             if int(next_bd) < 0 or int(next_bd) > 65535:
                 next_bd = "none"
             ops.append(SSAOp(
                 result=m.group(1), op_type="config.dma_bd",
                 operands=[buf_var, m.group(3)],
                 attrs={
-                    "bd_id": m.group(5), "offset": m.group(6),
-                    "len": m.group(7), "next_bd": next_bd,
-                    "enable_packet": "true" if int(m.group(9)) else "false",
-                    "packet_id": m.group(10),
+                    "bd_id": m.group(5),
+                    "len": m.group(6), "next_bd": next_bd,
+                    "enable_packet": "true" if int(m.group(8)) else "false",
+                    "packet_id": m.group(9),
                 },
                 result_type="XAie_DmaDesc", raw=stripped, line_num=lno,
             ))
@@ -476,6 +480,7 @@ def parse_host_cc(text: str) -> List[SSAOp]:
                 operands=[m.group(3), m.group(2)],
                 attrs={
                     "channel": m.group(4),
+                    "start_bd": m.group(5),
                     "direction": direction,
                     "io_operation": "RECV" if "S2MM" in direction else "SEND",
                 },
@@ -506,9 +511,33 @@ def parse_host_cc(text: str) -> List[SSAOp]:
             ))
             continue
 
+        # --- __Runtime_dma_channel_enable_ooo ---
+        m = re.search(
+            r"__Runtime_dma_channel_enable_ooo\(\s*(\w+),\s*(\w+),\s*(-?\d+),\s*(\w+)\)",
+            stripped,
+        )
+        if m:
+            tile_var = m.group(2)
+            channel = m.group(3)
+            direction = m.group(4)
+            if "S2MM" in direction:
+                direction = "S2MM"
+            elif "MM2S" in direction:
+                direction = "MM2S"
+            ops.append(SSAOp(
+                result="", op_type="ooo_enable",
+                operands=[tile_var],
+                attrs={
+                    "channel": channel,
+                    "direction": direction,
+                },
+                result_type="", raw=stripped, line_num=lno,
+            ))
+            continue
+
         # --- __Runtime_load_kernel_group ---
         m = re.search(
-            r"kernel_group\s+(\w+)\s*=\s*__Runtime_load_kernel_group",
+            r"kernel_group\s+(\w+)\s*=\s*__Runtime_load_kernel_group\w*",
             stripped,
         )
         if m:
@@ -581,6 +610,20 @@ def parse_host_cc(text: str) -> List[SSAOp]:
                 result_type="", raw=stripped, line_num=lno,
             ))
             continue
+
+    # Post-pass: annotate create_io ops with OOO enable info
+    ooo_ops = [op for op in ops if op.op_type == "ooo_enable"]
+    for ooo_op in ooo_ops:
+        ooo_tile_var = ooo_op.operands[0] if ooo_op.operands else ""
+        ooo_ch = ooo_op.attrs.get("channel", "")
+        ooo_dir = ooo_op.attrs.get("direction", "")
+        for op in ops:
+            if op.op_type == "config.create_io":
+                io_tile_var = op.operands[1] if len(op.operands) >= 2 else ""
+                if (io_tile_var == ooo_tile_var
+                        and op.attrs.get("channel", "") == ooo_ch
+                        and op.attrs.get("direction", "") == ooo_dir):
+                    op.attrs["ooo_enabled"] = "true"
 
     return ops
 
@@ -885,6 +928,7 @@ _API_NAME_MAP = {
     "wait": "__Runtime_wait",
     "declaretile": "XAie_TileLoc",
     "lock_init": "XAie_LockSetValue",
+    "ooo_enable": "__Runtime_dma_channel_enable_ooo",
 }
 
 
@@ -986,12 +1030,13 @@ def _build_subtree(
                     cm = re.search(r"constant\s+(\d+)", bd_op.raw)
                     if cm:
                         bd_val = cm.group(1)
-        off = op.attrs.get("offset", "?")
         ln = op.attrs.get("len", "?")
         pkt = op.attrs.get("packet_id", "?")
         nxt = op.attrs.get("next_bd", "?")
         if nxt == "4294967295":
             nxt = "none"
+        ooo = op.attrs.get("ooo_bd_id", "none")
+        en_pkt = op.attrs.get("enable_packet", "false")
         # Detect linked_bd: check if any operand is another dma_bd result
         linked_bd_src = ""
         for opr in op.operands:
@@ -1000,22 +1045,45 @@ def _build_subtree(
                 linked_bd_src = opr
                 break
         label = f"dma_bd {op.result} @ {tile}"
-        detail = f"bd={bd_val} off={off} len={ln} pkt={pkt} next_bd={nxt}"
+        detail = f"bd={bd_val} len={ln} pkt={pkt} next_bd={nxt}"
+        if ooo != "none":
+            detail += f" ooo_target_bd={ooo}"
+        if en_pkt == "true":
+            detail += " [PKT]"
+        acq_lk = op.attrs.get("acquire_lock_id", "")
+        rel_lk = op.attrs.get("release_lock_id", "")
+        if acq_lk and acq_lk not in ("-1", ""):
+            acq_val = op.attrs.get("acquire_lock_val", "?")
+            rel_val = op.attrs.get("release_lock_val", "?")
+            detail += f" acq_lock={acq_lk}({acq_val}) rel_lock={rel_lk}({rel_val})"
         if linked_bd_src:
             detail += f" linked_bd=%{linked_bd_src}"
+    elif "ooo_enable" in op.op_type:
+        node_type = "other"
+        tile = _resolve_tile(op.operands[0], def_map) if op.operands else "?"
+        ch = op.attrs.get("channel", "?")
+        d = op.attrs.get("direction", "?")
+        label = f"OOO enable @ {tile}"
+        detail = f"ch={ch} dir={d}"
     elif "create_io" in op.op_type:
         node_type = "create_io"
         tile = _resolve_tile(op.operands[1], def_map) if len(op.operands) >= 2 else "?"
         d = op.attrs.get("direction", "?")
         ch = op.attrs.get("channel", "?")
         io = op.attrs.get("io_operation", "?")
+        start_bd = op.attrs.get("start_bd", "")
+        ooo_en = op.attrs.get("ooo_enabled", "false")
         label = f"create_io {op.result} @ {tile}"
         detail = f"ch={ch} {d} {io}"
+        if start_bd:
+            detail += f" start_bd={start_bd}"
+        if ooo_en == "true":
+            detail += " [OOO]"
     elif "start_io" in op.op_type:
         node_type = "start_io"
         fi = op.attrs.get("flow_index", op.attrs.get("bd_id", "?"))
         label = f"start_io {op.result}"
-        detail = f"flow_index={fi}"
+        detail = f"target_bd={fi}"
     elif "launch_kernel_group" in op.op_type:
         node_type = "kernel"
         label = f"launch_kernel_group {op.result}"

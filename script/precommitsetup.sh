@@ -9,13 +9,22 @@ AIEHLC_DIR="${SCRIPT_DIR}/../"
 
 setup_git_hooks() {
     echo "Setting up git pre-commit hooks..."
-    local HOOKS_DIR="$AIEHLC_DIR/.git/hooks"
-    local PRE_COMMIT_HOOK="$HOOKS_DIR/pre-commit"
-    
-    if [ ! -d "$HOOKS_DIR" ]; then
-        echo "Warning: Git hooks directory not found. Make sure you're in a git repository."
-        return 1
+    # Use git rev-parse to find hooks dir (works in both normal repos and worktrees)
+    local HOOKS_DIR
+    HOOKS_DIR="$(git -C "$AIEHLC_DIR" rev-parse --git-path hooks 2>/dev/null)" || true
+    if [ -z "$HOOKS_DIR" ] || [ ! -d "$HOOKS_DIR" ]; then
+        # Fallback: try creating hooks dir if we can resolve git dir
+        local GIT_DIR
+        GIT_DIR="$(git -C "$AIEHLC_DIR" rev-parse --git-common-dir 2>/dev/null)" || true
+        if [ -n "$GIT_DIR" ] && [ -d "$GIT_DIR" ]; then
+            HOOKS_DIR="$GIT_DIR/hooks"
+            mkdir -p "$HOOKS_DIR"
+        else
+            echo "Warning: Git hooks directory not found. Make sure you're in a git repository."
+            return 0
+        fi
     fi
+    local PRE_COMMIT_HOOK="$HOOKS_DIR/pre-commit"
     
     if [ -f "$PRE_COMMIT_HOOK" ]; then
         echo "Pre-commit hook already exists at $PRE_COMMIT_HOOK. Skipping installation."

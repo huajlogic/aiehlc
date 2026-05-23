@@ -27,7 +27,8 @@ namespace mlir {
 /// 4. Erase all other dfschedule operations
 class DfscheduleToApiPass : public PassWrapper<DfscheduleToApiPass, OperationPass<ModuleOp>> {
 public:
-  explicit DfscheduleToApiPass(bool enableDebug = false) : enableDebug_(enableDebug) {}
+  explicit DfscheduleToApiPass(bool enableDebug = false, int runtimeDebugLevel = -1)
+      : enableDebug_(enableDebug), runtimeDebugLevel_(runtimeDebugLevel) {}
 
   StringRef getArgument() const final { return "dfschedule-to-api"; }
   StringRef getDescription() const final { return "Convert dfschedule operations to API calls and EmitC"; }
@@ -41,6 +42,7 @@ public:
 
   private:
     bool enableDebug_ = false;
+    int runtimeDebugLevel_ = -1;
 };
 
 } // namespace mlir

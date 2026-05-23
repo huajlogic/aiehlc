@@ -18,12 +18,14 @@ class BlueprintToScheduleKernelPass : public PassWrapper<BlueprintToScheduleKern
   public:
     BlueprintToScheduleKernelPass() = default;
     BlueprintToScheduleKernelPass(double ratio) : bufferRatio_(ratio) {}
+    BlueprintToScheduleKernelPass(double ratio, int64_t maxBytes) : bufferRatio_(ratio), maxPingPongBytes_(maxBytes) {}
     // MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BlueprintToScheduleKernelPass)
 
     StringRef getArgument() const final { return "lower-blueprint-to-schedule"; }
     StringRef getDescription() const final { return "Lower dfscheblueprint dialect to dfschedule dialect"; }
 
     double getBufferRatio() const { return bufferRatio_; }
+    int64_t getMaxPingPongBytes() const { return maxPingPongBytes_; }
 
     void runOnOperation() override;
 
@@ -34,6 +36,7 @@ class BlueprintToScheduleKernelPass : public PassWrapper<BlueprintToScheduleKern
 
   private:
     double bufferRatio_ = 0.5;
+    int64_t maxPingPongBytes_ = 4096;
 };
 
 } // namespace mlir

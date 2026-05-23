@@ -9,14 +9,12 @@
 using namespace mlir;
 class RoutingConstantFoldPass : public PassWrapper<RoutingConstantFoldPass, OperationPass<ModuleOp>> {
 public:
-    RoutingConstantFoldPass(){};
+  RoutingConstantFoldPass(std::string gen = "Gen2") : aieGen_(std::move(gen)) {};
+
 private:
-    void runOnOperation() override;
-    mlir::StringRef getArgument() const final {
-        return "emitc-constant-fold";
-    }
-    mlir::StringRef getDescription() const final {
-        return "Folds emitc.constant operands into emitc.call operations.";
-    }
+  std::string aieGen_;
+  void runOnOperation() override;
+  mlir::StringRef getArgument() const final { return "emitc-constant-fold"; }
+  mlir::StringRef getDescription() const final { return "Folds emitc.constant operands into emitc.call operations."; }
 };
 #endif //

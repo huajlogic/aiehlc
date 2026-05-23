@@ -128,7 +128,8 @@ void TilingLinalgPipeline::registerDialects(mlir::MLIRContext &ctx) {
 
 mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols,
                                                     const std::vector<TensorParam> &tensors,
-                                                    const SplitModel &splitModel) {
+                                                    const SplitModel &splitModel, const PartitionDesc &partition,
+                                                    const std::string &aieGen) {
 
     // This is a parameterized version of routingmanager::ops_testNew()
     using namespace routing;
@@ -149,7 +150,15 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
 
     auto block = hostFunc.addEntryBlock();
     builder.setInsertionPointToEnd(block);
-    auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(), meshRows, meshCols);
+    mlir::IntegerAttr startColAttr, endColAttr, startRowAttr, endRowAttr;
+    if (partition.isValid()) {
+        startColAttr = builder.getI64IntegerAttr(partition.startCol);
+        endColAttr = builder.getI64IntegerAttr(partition.endCol);
+        startRowAttr = builder.getI64IntegerAttr(partition.startRow);
+        endRowAttr = builder.getI64IntegerAttr(partition.endRow);
+    }
+    auto mesh = builder.create<createhwmesh>(builder.getUnknownLoc(), meshRows, meshCols, startColAttr, endColAttr,
+                                             startRowAttr, endRowAttr);
 
     // Build all tensor values first
     std::vector<Value> tensorValues;
@@ -194,9 +203,29 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
 bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                                        const std::string &userKernelBody, const std::string &userKernelFuncName,
                                        int runtimeDebugLevel, const std::string &userRewrittenSource,
-                                       const std::vector<TensorParam> &tensors) {
+                                       const std::vector<TensorParam> &tensors, int64_t maxPingPongBytes,
+                                       const std::string &aieGen, const std::string &hostFuncSuffix, bool appendMode,
+                                       unsigned *numHostDdrArgs) {
 
-    RoutingTopology rtopology("Gen2");
+    // Extract partition bounds from createhwmesh op in the IR (if present)
+    int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
+    module.walk([&](routing::createhwmesh meshOp) {
+        if (auto sc = meshOp.getStartCol())
+            partStartCol = *sc;
+        if (auto ec = meshOp.getEndCol())
+            partEndCol = *ec;
+        if (auto sr = meshOp.getStartRow())
+            partStartRow = *sr;
+        if (auto er = meshOp.getEndRow())
+            partEndRow = *er;
+    });
+
+    // Convert absolute partition columns to 0-based partition-relative columns.
+    // XAie_SetupPartitionConfig handles the physical mapping, so the pipeline
+    // should generate coordinates relative to the partition origin.
+    int relStartCol = 0;
+    int relEndCol = (partStartCol >= 0 && partEndCol >= 0) ? (partEndCol - partStartCol) : -1;
+    RoutingTopology rtopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
 
     std::string irDir = setupPipelineIRDir("dfschedule");
     int stage = 0;
@@ -218,13 +247,27 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     mlir::ModuleOp routingDmaphopModule = cast<ModuleOp>(module->clone());
 
     // Rename @main → @routing in the clone so that routing.cc emits
-    // void routing() instead of void main().
+    // void routing(XAie_DevInst* dev) instead of void main().
+    // Prepend a XAie_DevInst* argument at position 0 so that
+    // RoutingHWLowerPass patterns can use parentFunc.getArgument(0)
+    // instead of calling getOrCreateDeviceInstance().
     // Keep memref func args intact — routing lowering passes need the tensor
     // operands connected through bufferization.to_tensor. RoutingDeadArgPass
     // will strip unused args after lowering.
     for (auto func : routingDmaphopModule.getOps<mlir::func::FuncOp>()) {
-        if (func.getName() == "main")
+        if (func.getName() == "main") {
             func.setName("routing");
+            // Insert XAie_DevInst* as arg 0
+            auto devInstType = emitc::OpaqueType::get(&ctx, "XAie_DevInst");
+            auto devInstPtrType = emitc::PointerType::get(devInstType);
+            func.getBody().front().insertArgument(0u, devInstPtrType, func.getLoc());
+            // Update the function type to include the new arg
+            SmallVector<Type> newArgTypes;
+            newArgTypes.push_back(devInstPtrType);
+            for (auto t : func.getFunctionType().getInputs())
+                newArgTypes.push_back(t);
+            func.setFunctionType(FunctionType::get(&ctx, newArgTypes, func.getFunctionType().getResults()));
+        }
     }
 
     if (!runPipelineSinglePass(ctx, module, std::make_unique<DmaphopTodfscheblueprintPass>(), irDir, stage,
@@ -237,29 +280,32 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
     // Initialize ResourceMgr singleton for CoreMemAllocator (BCF/PRX generation)
     {
-        auto hwRes = makeResource("Gen2");
+        auto hwRes = makeResource(aieGen);
         ResourceMgr::init(std::move(hwRes));
     }
 
     // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
-    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::BlueprintToSchedulePass>(0.5), irDir, stage,
-                       "BlueprintToSchedulePass"))
+    if (!runPipelineSinglePass(ctx, hostModule,
+                               std::make_unique<mlir::BlueprintToSchedulePass>(0.5, maxPingPongBytes, aieGen), irDir,
+                               stage, "BlueprintToSchedulePass"))
         return false;
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
                        "ScheduleCanonicalizePass"))
         return false;
-    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true), irDir, stage,
-                       "DfscheduleToApiPass"))
+    if (!runPipelineSinglePass(ctx, hostModule,
+                               std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true, runtimeDebugLevel),
+                               irDir, stage, "DfscheduleToApiPass"))
         return false;
     if (!runPipelineSinglePass(ctx, hostModule, mlir::createCanonicalizerPass(), irDir, stage, "CanonicalizerPass"))
         return false;
-    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(), irDir, stage,
-                       "RoutingConstantFoldPass"))
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(aieGen), irDir, stage,
+                               "RoutingConstantFoldPass"))
         return false;
 
     // Phase 3: kernel path (blueprint -> kernel schedule -> kernel API)
-    if (!runPipelineSinglePass(ctx, kernelModule, std::make_unique<mlir::BlueprintToScheduleKernelPass>(0.5), irDir, stage,
-                       "BlueprintToScheduleKernelPass"))
+    if (!runPipelineSinglePass(ctx, kernelModule,
+                               std::make_unique<mlir::BlueprintToScheduleKernelPass>(0.5, maxPingPongBytes), irDir,
+                               stage, "BlueprintToScheduleKernelPass"))
         return false;
 
     // Extract kernel parameter info from KernelModuleOp (before DfscheduleToKernelApiPass lowers it)
@@ -341,23 +387,91 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         }
     }
 
+    // Multi-kernel mode: rename host_canonicalized → host_canonicalized_<suffix>
+    // so each kernel gets its own host dispatch function.
+    std::string hostFuncName = "host_canonicalized";
+    if (!hostFuncSuffix.empty()) {
+        hostFuncName = "host_canonicalized_" + hostFuncSuffix;
+        for (auto func : hostModule.getOps<emitc::FuncOp>()) {
+            if (func.getName() == "host_canonicalized") {
+                func.setSymName(hostFuncName);
+                std::cout << "Renamed host function: host_canonicalized -> " << hostFuncName << std::endl;
+            }
+        }
+        for (auto func : hostModule.getOps<mlir::func::FuncOp>()) {
+            if (func.getName() == "host_canonicalized") {
+                func.setName(hostFuncName);
+            }
+        }
+    }
+
+    // Count DDR args on the host function and report back to caller
+    {
+        unsigned numArgs = 0;
+        for (auto func : hostModule.getOps<emitc::FuncOp>()) {
+            if (func.getName() == hostFuncName) {
+                numArgs = func.getNumArguments();
+                break;
+            }
+        }
+        if (numArgs == 0) {
+            for (auto func : hostModule.getOps<mlir::func::FuncOp>()) {
+                if (func.getName() == hostFuncName) {
+                    numArgs = func.getNumArguments();
+                    break;
+                }
+            }
+        }
+        unsigned ddrArgs = (numArgs > 0) ? numArgs - 1 : 0;
+        if (numHostDdrArgs)
+            *numHostDdrArgs = ddrArgs;
+    }
+
     // Emit host.cc
     {
         std::string hostPath = outputDir + "/host.cc";
         std::error_code ec;
-        llvm::raw_fd_ostream stream(hostPath, ec, llvm::sys::fs::OF_None);
+        auto openFlags = appendMode ? llvm::sys::fs::OF_Append : llvm::sys::fs::OF_None;
+        llvm::raw_fd_ostream stream(hostPath, ec, openFlags);
         if (ec) {
             llvm::errs() << "Failed to open " << hostPath << ": " << ec.message() << "\n";
             return false;
         }
         // Emit strong g_runtime_debug_level override if user set #pragma aie_debug_level
-        if (runtimeDebugLevel >= 0) {
+        // (only on first write, not in append mode)
+        if (!appendMode && runtimeDebugLevel >= 0) {
             stream << "// Override runtime debug level (from #pragma aie_debug_level)\n";
             stream << "int g_runtime_debug_level = " << runtimeDebugLevel << ";\n\n";
+        }
+        if (appendMode) {
+            stream << "\n// ===== Appended host function: " << hostFuncName << " =====\n";
+            // In append mode, erase dskernel_receiver from the module to avoid
+            // redefinition (it was already emitted by the first pipeline run).
+            // Also erase #include "aie_runtime.h" emitc.include ops to avoid duplicate.
+            {
+                llvm::SmallVector<Operation *, 4> toErase;
+                for (auto &op : hostModule.getOps()) {
+                    if (auto func = dyn_cast<emitc::FuncOp>(op)) {
+                        if (func.getName() == "dskernel_receiver")
+                            toErase.push_back(&op);
+                    } else if (auto inc = dyn_cast<emitc::IncludeOp>(op)) {
+                        toErase.push_back(&op);
+                    }
+                }
+                for (auto *op : toErase)
+                    op->erase();
+            }
         }
         if (failed(mlir::emitc::translateToCpp(hostModule, stream))) {
             llvm::errs() << "Failed to translate host MLIR to C++.\n";
             return false;
+        }
+
+        // In append mode, skip user source and __aie_launch emission — caller handles it
+        if (appendMode) {
+            stream.close();
+            std::cout << "Host function appended to " << hostPath << std::endl;
+            goto after_host_emit;
         }
 
         // Append user's rewritten source code after MLIR-generated functions.
@@ -365,17 +479,17 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         if (!userRewrittenSource.empty()) {
             stream << "\n// ===== User source (preserved from original file) =====\n";
 
-            // Count the number of void* args on host_canonicalized
+            // Count total args on the host function (includes XAie_DevInst* dev as arg 0)
             unsigned numArgs = 0;
             for (auto func : hostModule.getOps<emitc::FuncOp>()) {
-                if (func.getName() == "host_canonicalized") {
+                if (func.getName() == hostFuncName) {
                     numArgs = func.getNumArguments();
                     break;
                 }
             }
             if (numArgs == 0) {
                 for (auto func : hostModule.getOps<mlir::func::FuncOp>()) {
-                    if (func.getName() == "host_canonicalized") {
+                    if (func.getName() == hostFuncName) {
                         numArgs = func.getNumArguments();
                         break;
                     }
@@ -385,47 +499,154 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             // Suppress the Clang-phase stubs (which had wrong arity) and emit
             // correct __aie_launch that forwards DDR pointers.
             stream << "#define AIEHLC_TILING_STUBS_DEFINED\n";
-            stream << "struct aieDim { int rows, cols; aieDim(int r, int c) : rows(r), cols(c) {} };\n";
+            // Re-emit SpatialPolicy types so user source constexpr definitions compile
+            stream << "namespace aie {\n";
+            stream << "enum class Pattern  { Broadcast = 0, Scatter = 1, Multicast = 2, Gather = 3 };\n";
+            stream << "enum class Layout   { Row = 0, Col = 1, Grid = 2 };\n";
+            stream << "enum class Flow     { Default = 0, LeftToRight = 1, RightToLeft = 2 };\n";
+            stream << "struct SpatialPolicy {\n";
+            stream << "  Pattern pattern      = Pattern::Broadcast;\n";
+            stream << "  Layout  distribution = Layout::Row;\n";
+            stream << "  Flow    merge_order  = Flow::Default;\n";
+            stream << "  int     pp_depth     = 2;\n";
+            stream << "  int     max_buffer_bytes = 4096;\n";
+            stream << "};\n";
+            stream << "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
+            stream << "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
+            stream << "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
+            stream << "constexpr int get_tile_rows() { return 0; }\n";
+            stream << "constexpr int get_tile_cols() { return 0; }\n";
+            stream << "constexpr int get_k_dim() { return 0; }\n";
+            stream << "}\n";
+            // aiePartition struct (shared between aieDim and aieMesh)
+            stream << "struct aiePartition {\n";
+            stream << "    int startCol, endCol, startRow, endRow;\n";
+            stream << "};\n";
+            // New programming model types: aieMesh + aieArray
+            stream << "struct aieMesh {\n";
+            stream << "    int rows, cols;\n";
+            stream << "    aiePartition partition;\n";
+            stream << "    int meshId;\n";
+            stream << "};\n";
+            stream << "struct aieArray {\n";
+            stream << "    int nextMeshId = 0;\n";
+            stream << "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
+            stream << "        return aieMesh{rows, cols, p, nextMeshId++};\n";
+            stream << "    }\n";
+            stream << "    void synchronize() { __Runtime_teardown_all(); }\n";
+            stream << "};\n";
+            // Backward-compatible aieDim (maps to aieMesh internally)
+            stream << "struct aieDim {\n";
+            stream << "    int rows, cols;\n";
+            stream << "    aiePartition partition;\n";
+            stream << "    bool hasPartition;\n";
+            stream << "    aieDim(int r, int c) : rows(r), cols(c), partition{-1,-1,-1,-1}, hasPartition(false) {}\n";
+            stream
+                << "    aieDim(int r, int c, aiePartition p) : rows(r), cols(c), partition(p), hasPartition(true) {}\n";
+            stream << "};\n";
             stream << "inline void aieSetDevice(int) {}\n";
             stream << "inline void aieDeviceSynchronize() {}\n";
-            if (numArgs > 0) {
-                stream << "inline void __aie_launch(const char* kernel, aieDim mesh";
-                for (unsigned i = 0; i < numArgs; ++i)
+            // numArgs includes the XAie_DevInst* dev param (arg 0); DDR pointer args are numArgs-1
+            unsigned numDdrArgs = (numArgs > 0) ? numArgs - 1 : 0;
+
+            // Forward-declare kernel binary symbols so __aie_launch can reference them
+            stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_start[];\n";
+            stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_end[];\n";
+            stream << "extern unsigned int _binary_kernel_" << computeKernelName << "_size;\n\n";
+
+            // --- __aie_launch with partition registry (init-once, dispatch by kernel name) ---
+            if (numDdrArgs > 0) {
+                // aieMesh overload (new programming model)
+                stream << "inline void __aie_launch(const char* kernel, aieMesh mesh";
+                for (unsigned i = 0; i < numDdrArgs; ++i)
                     stream << ", void* _t" << i;
                 stream << ", ...) {\n";
-                stream << "    (void)kernel; (void)mesh;\n";
-                stream << "    host_canonicalized(";
-                for (unsigned i = 0; i < numArgs; ++i) {
-                    if (i > 0)
-                        stream << ", ";
-                    stream << "_t" << i;
-                }
-                stream << ");\n}\n";
+                stream << "    XAie_DevInst* dev;\n";
+                stream << "    if (__Runtime_partition_is_initialized(mesh.meshId)) {\n";
+                stream << "        dev = __Runtime_get_partition_dev(mesh.meshId);\n";
+                stream << "    } else {\n";
+                stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
+                          "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                stream << "        __Runtime_register_partition(mesh.meshId, dev);\n";
+                stream << "    }\n";
+                stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                stream << "    " << hostFuncName << "(dev";
+                for (unsigned i = 0; i < numDdrArgs; ++i)
+                    stream << ", _t" << i;
+                stream << ");\n";
+                stream << "}\n";
+
+                // aieDim overload (backward compatibility)
+                stream << "inline void __aie_launch(const char* kernel, aieDim mesh";
+                for (unsigned i = 0; i < numDdrArgs; ++i)
+                    stream << ", void* _t" << i;
+                stream << ", ...) {\n";
+                stream << "    (void)kernel;\n";
+                stream << "    XAie_DevInst* dev;\n";
+                stream << "    if (mesh.hasPartition) {\n";
+                stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
+                          "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                stream << "    } else {\n";
+                stream << "        dev = __Runtime_explicit_init();\n";
+                stream << "    }\n";
+                stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                stream << "    " << hostFuncName << "(dev";
+                for (unsigned i = 0; i < numDdrArgs; ++i)
+                    stream << ", _t" << i;
+                stream << ");\n";
+                stream << "    __Runtime_explicit_teardown(dev);\n";
+                stream << "}\n";
             } else {
+                // aieMesh overload (new programming model)
+                stream << "template<typename... Args>\n";
+                stream << "inline void __aie_launch(const char* kernel, aieMesh mesh, Args... args) {\n";
+                stream << "    XAie_DevInst* dev;\n";
+                stream << "    if (__Runtime_partition_is_initialized(mesh.meshId)) {\n";
+                stream << "        dev = __Runtime_get_partition_dev(mesh.meshId);\n";
+                stream << "    } else {\n";
+                stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
+                          "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                stream << "        __Runtime_register_partition(mesh.meshId, dev);\n";
+                stream << "    }\n";
+                stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                stream << "    " << hostFuncName << "(dev);\n";
+                stream << "}\n";
+
+                // aieDim overload (backward compatibility)
                 stream << "template<typename... Args>\n";
                 stream << "inline void __aie_launch(const char* kernel, aieDim mesh, Args... args) {\n";
-                stream << "    host_canonicalized();\n}\n";
+                stream << "    (void)kernel;\n";
+                stream << "    XAie_DevInst* dev;\n";
+                stream << "    if (mesh.hasPartition) {\n";
+                stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
+                          "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                stream << "    } else {\n";
+                stream << "        dev = __Runtime_explicit_init();\n";
+                stream << "    }\n";
+                stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                stream << "    " << hostFuncName << "(dev);\n";
+                stream << "    __Runtime_explicit_teardown(dev);\n";
+                stream << "}\n";
             }
 
             stream << userRewrittenSource << "\n";
         } else if (!tensors.empty()) {
             // Standalone / unittest mode: generate a default main() that
             // allocates DDR buffers matching the tensor parameters, fills
-            // inputs with test data, calls host_canonicalized(), and prints
-            // output. device_init/teardown is handled by __Runtime_auto_init/
-            // __Runtime_auto_teardown constructors in aie_runtime.c.
+            // inputs with test data, calls the host function, and prints
+            // output. Uses explicit init/teardown (no global g_DevInst).
 
-            // Count the number of void* args on host_canonicalized
+            // Count total args on the host function (includes XAie_DevInst* dev as arg 0)
             unsigned numArgs = 0;
             for (auto func : hostModule.getOps<emitc::FuncOp>()) {
-                if (func.getName() == "host_canonicalized") {
+                if (func.getName() == hostFuncName) {
                     numArgs = func.getNumArguments();
                     break;
                 }
             }
             if (numArgs == 0) {
                 for (auto func : hostModule.getOps<mlir::func::FuncOp>()) {
-                    if (func.getName() == "host_canonicalized") {
+                    if (func.getName() == hostFuncName) {
                         numArgs = func.getNumArguments();
                         break;
                     }
@@ -438,12 +659,11 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "#include <string.h>\n\n";
             stream << "#define __global__\n\n";
 
-            // Forward-declare host_canonicalized
-            stream << "void host_canonicalized(";
-            for (unsigned i = 0; i < numArgs; ++i) {
-                if (i > 0)
-                    stream << ", ";
-                stream << "void*";
+            // Forward-declare the host function (first arg is XAie_DevInst* dev)
+            stream << "void " << hostFuncName << "(XAie_DevInst* dev";
+            // numArgs includes the dev param; DDR pointer args are numArgs-1
+            for (unsigned i = 1; i < numArgs; ++i) {
+                stream << ", void*";
             }
             stream << ");\n\n";
 
@@ -487,12 +707,11 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             }
             stream << "\n";
 
-            // Call host_canonicalized
-            stream << "    host_canonicalized(";
+            // Explicit init → host function → explicit teardown
+            stream << "    XAie_DevInst* dev = __Runtime_explicit_init();\n";
+            stream << "    " << hostFuncName << "(dev";
             for (unsigned i = 0; i < tensors.size(); ++i) {
-                if (i > 0)
-                    stream << ", ";
-                stream << "buf_" << i;
+                stream << ", buf_" << i;
             }
             stream << ");\n\n";
 
@@ -516,6 +735,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             for (unsigned i = 0; i < tensors.size(); ++i) {
                 stream << "    free(buf_" << i << ");\n";
             }
+            stream << "    __Runtime_explicit_teardown(dev);\n";
             stream << "    return 0;\n";
             stream << "}\n";
         }
@@ -523,10 +743,12 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         stream.close();
         std::cout << "Host code written to " << hostPath << std::endl;
     }
+after_host_emit:
 
-    // Emit kernel.cc
+    // Emit kernel.cc (suffixed per kernel in multi-kernel mode)
     {
-        std::string kernelPath = outputDir + "/kernel.cc";
+        std::string kernelFilename = hostFuncSuffix.empty() ? "kernel.cc" : "kernel_" + hostFuncSuffix + ".cc";
+        std::string kernelPath = outputDir + "/" + kernelFilename;
         std::error_code ec;
         llvm::raw_fd_ostream stream(kernelPath, ec, llvm::sys::fs::OF_None);
         if (ec) {
@@ -658,7 +880,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 bcf.addSymbol(slot.symbolName, slot.address);
             }
 
-            std::string bcfPath = outputDir + "/aieml.bcf";
+            // Suffix BCF/PRX with kernel name in multi-kernel mode
+            std::string bcfBaseName = hostFuncSuffix.empty() ? "aieml" : "aieml_" + hostFuncSuffix;
+            std::string bcfPath = outputDir + "/" + bcfBaseName + ".bcf";
             if (bcf.exportToFile(bcfPath)) {
                 std::cout << "BCF written to " << bcfPath << std::endl;
             } else {
@@ -666,10 +890,10 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             }
 
             TilingPrx prx("kernel", 22);
-            prx.setBcfPath("aieml.bcf");
+            prx.setBcfPath(bcfBaseName + ".bcf");
             prx.setKernelLLPath("./build/");
 
-            std::string prxPath = outputDir + "/aieml.prx";
+            std::string prxPath = outputDir + "/" + bcfBaseName + ".prx";
             if (prx.exportToFile(prxPath)) {
                 std::cout << "PRX written to " << prxPath << std::endl;
             } else {
@@ -698,23 +922,29 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
         dumpPipelineIRToFile(routingDmaphopModule, routingIrDir, rstage++, "initial");
 
-        // Use the same rtopology that produced the dmaphop IR so that
-        // shim columns and DMA port assignments are consistent.
-        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<DmaphopToRoutinghwPass>(rtopology),
-                                   routingIrDir, rstage, "DmaphopToRoutinghwPass"))
+        // Create a fresh RoutingTopology for Phase 5 so that DmaphopToRoutinghwPass
+        // starts with clean resource state. Phase 1 (RoutingToDmapPass/DmapToDmaphopPass)
+        // consumed shim/port resources from the original rtopology. Phase 5 reads
+        // shim tile info from the dmaphop IR and allocates its own DataIO objects.
+        // Use the same 0-based partition-relative columns as the host path.
+        RoutingTopology routingPathTopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
+
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule,
+                                   std::make_unique<DmaphopToRoutinghwPass>(routingPathTopology), routingIrDir, rstage,
+                                   "DmaphopToRoutinghwPass"))
             return false;
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWVerifyPass>(), routingIrDir,
                                    rstage, "RoutingHWVerifyPass"))
             return false;
-        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(rtopology),
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(routingPathTopology),
                                    routingIrDir, rstage, "RoutingHWLowerPass"))
             return false;
 
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingDeadArgPass>(), routingIrDir,
                                    rstage, "RoutingDeadArgPass"))
             return false;
-        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingConstantFoldPass>(), routingIrDir,
-                                   rstage, "RoutingConstantFoldPass"))
+        if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingConstantFoldPass>(aieGen),
+                                   routingIrDir, rstage, "RoutingConstantFoldPass"))
             return false;
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, mlir::createCanonicalizerPass(), routingIrDir, rstage,
                                    "CanonicalizerPass"))
@@ -762,8 +992,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             return false;
         }
         // Emit #include before the translated C++ so int32_t etc. are declared
-        stream << "#include <xaiengine.h>\n";
-        stream << "XAie_DevInst* getOrCreateDeviceInstance();\n\n";
+        stream << "#include <xaiengine.h>\n\n";
         if (failed(mlir::emitc::translateToCpp(routingDmaphopModule, stream))) {
             llvm::errs() << "Failed to translate routing MLIR to C++.\n";
             return false;

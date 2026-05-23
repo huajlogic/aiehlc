@@ -19,152 +19,17 @@ void AieRt_SetAieGen(AieRt_AieGen gen) { g_aiert_gen = gen; }
 /* --------------------------------------------------------------------------
  * Event name lookup tables
  *
- * Sourced directly from:
- *   thirdparty/alib/include/xaiengine/xaie_events_aieml.h  (XAIEML_EVENTS_*)
- *   thirdparty/alib/include/xaiengine/xaie_events_aie2ps.h (XAIE2PS_EVENTS_*)
- *
- * CORE and MEM module IDs are identical between AIEML and AIE2PS.
- * PL module IDs differ: AIEML max=127, AIE2PS max=183 (NOC0/NOC1 extras).
+ * Sourced from AIE2PS architecture specification:
+ *   doc/aie2pscoreevent.md  — Table 4-8 (Core module, IDs 0-127)
+ *   doc/aie2psmemevent.md   — Mem module (IDs 0-127)
+ *   doc/aie2psshimevent.md  — Table 7-12 (Shim/PL module, IDs 0-181)
  *
  * Tables are sparse arrays indexed by local hardware event ID.
  * NULL entries indicate gaps (reserved / not defined for this generation).
  * -------------------------------------------------------------------------- */
 
-/* --- CORE module (identical for AIEML and AIE2PS, max ID=127) --- */
+/* --- CORE module (AIE2PS, Table 4-8, max ID=127) --- */
 static const char *s_core_evt_names[128] = {
-    "NONE",                         /* 0 */
-    "TRUE",                         /* 1 */
-    "GROUP_0",                      /* 2 */
-    "TIMER_SYNC",                   /* 3 */
-    "TIMER_VALUE_REACHED",          /* 4 */
-    "PERF_CNT_0",                   /* 5 */
-    "PERF_CNT_1",                   /* 6 */
-    "PERF_CNT_2",                   /* 7 */
-    "PERF_CNT_3",                   /* 8 */
-    "COMBO_EVENT_0",                /* 9 */
-    "COMBO_EVENT_1",                /* 10 */
-    "COMBO_EVENT_2",                /* 11 */
-    "COMBO_EVENT_3",                /* 12 */
-    "EDGE_DETECTION_EVENT_0",       /* 13 */
-    "EDGE_DETECTION_EVENT_1",       /* 14 */
-    "GROUP_PC_EVENT",               /* 15 */
-    "PC_0",                         /* 16 */
-    "PC_1",                         /* 17 */
-    "PC_2",                         /* 18 */
-    "PC_3",                         /* 19 */
-    "PC_RANGE_0_1",                 /* 20 */
-    "PC_RANGE_2_3",                 /* 21 */
-    "GROUP_STALL",                  /* 22 */
-    "MEMORY_STALL",                 /* 23 */
-    "STREAM_STALL",                 /* 24 */
-    "CASCADE_STALL",                /* 25 */
-    "LOCK_STALL",                   /* 26 */
-    "DEBUG_HALTED",                 /* 27 */
-    "ACTIVE",                       /* 28 */
-    "DISABLED",                     /* 29 */
-    "ECC_ERROR_STALL",              /* 30 */
-    "ECC_SCRUBBING_STALL",          /* 31 */
-    "GROUP_CORE_PROGRAM_FLOW",      /* 32 */
-    "INSTR_EVENT_0",                /* 33 */
-    "INSTR_EVENT_1",                /* 34 */
-    "INSTR_CALL",                   /* 35 */
-    "INSTR_RETURN",                 /* 36 */
-    "INSTR_VECTOR",                 /* 37 */
-    "INSTR_LOAD",                   /* 38 */
-    "INSTR_STORE",                  /* 39 */
-    "INSTR_STREAM_GET",             /* 40 */
-    "INSTR_STREAM_PUT",             /* 41 */
-    "INSTR_CASCADE_GET",            /* 42 */
-    "INSTR_CASCADE_PUT",            /* 43 */
-    "INSTR_LOCK_ACQUIRE_REQ",       /* 44 */
-    "INSTR_LOCK_RELEASE_REQ",       /* 45 */
-    "GROUP_ERRORS_0",               /* 46 */
-    "GROUP_ERRORS_1",               /* 47 */
-    "SRS_SATURATE",                 /* 48 */
-    "UPS_SATURATE",                 /* 49 */
-    "FP_OVERFLOW",                  /* 50 */
-    "FP_UNDERFLOW",                 /* 51 */
-    "FP_INVALID",                   /* 52 */
-    "FP_DIV_BY_ZERO",               /* 53 */
-    "TLAST_IN_WSS_WORDS_0_2",       /* 54 */
-    "PM_REG_ACCESS_FAILURE",        /* 55 */
-    "STREAM_PKT_PARITY_ERROR",      /* 56 */
-    "CONTROL_PKT_ERROR",            /* 57 */
-    "AXI_MM_SLAVE_ERROR",           /* 58 */
-    "INSTR_DECOMPRSN_ERROR",        /* 59 */
-    "DM_ADDRESS_OUT_OF_RANGE",      /* 60 */
-    "PM_ECC_ERROR_SCRUB_CORRECTED", /* 61 */
-    "PM_ECC_ERROR_SCRUB_2BIT",      /* 62 */
-    "PM_ECC_ERROR_1BIT",            /* 63 */
-    "PM_ECC_ERROR_2BIT",            /* 64 */
-    "PM_ADDRESS_OUT_OF_RANGE",      /* 65 */
-    "DM_ACCESS_TO_UNAVAILABLE",     /* 66 */
-    "LOCK_ACCESS_TO_UNAVAILABLE",   /* 67 */
-    NULL,                           /* 68 */
-    NULL,                           /* 69 */
-    "GROUP_STREAM_SWITCH",          /* 70 */
-    "PORT_IDLE_0",                  /* 71 */
-    "PORT_RUNNING_0",               /* 72 */
-    "PORT_STALLED_0",               /* 73 */
-    "PORT_TLAST_0",                 /* 74 */
-    "PORT_IDLE_1",                  /* 75 */
-    "PORT_RUNNING_1",               /* 76 */
-    "PORT_STALLED_1",               /* 77 */
-    "PORT_TLAST_1",                 /* 78 */
-    "PORT_IDLE_2",                  /* 79 */
-    "PORT_RUNNING_2",               /* 80 */
-    "PORT_STALLED_2",               /* 81 */
-    "PORT_TLAST_2",                 /* 82 */
-    "PORT_IDLE_3",                  /* 83 */
-    "PORT_RUNNING_3",               /* 84 */
-    "PORT_STALLED_3",               /* 85 */
-    "PORT_TLAST_3",                 /* 86 */
-    "PORT_IDLE_4",                  /* 87 */
-    "PORT_RUNNING_4",               /* 88 */
-    "PORT_STALLED_4",               /* 89 */
-    "PORT_TLAST_4",                 /* 90 */
-    "PORT_IDLE_5",                  /* 91 */
-    "PORT_RUNNING_5",               /* 92 */
-    "PORT_STALLED_5",               /* 93 */
-    "PORT_TLAST_5",                 /* 94 */
-    "PORT_IDLE_6",                  /* 95 */
-    "PORT_RUNNING_6",               /* 96 */
-    "PORT_STALLED_6",               /* 97 */
-    "PORT_TLAST_6",                 /* 98 */
-    "PORT_IDLE_7",                  /* 99 */
-    "PORT_RUNNING_7",               /* 100 */
-    "PORT_STALLED_7",               /* 101 */
-    "PORT_TLAST_7",                 /* 102 */
-    "GROUP_BROADCAST",              /* 103 */
-    "BROADCAST_0",                  /* 104 */
-    "BROADCAST_1",                  /* 105 */
-    "BROADCAST_2",                  /* 106 */
-    "BROADCAST_3",                  /* 107 */
-    "BROADCAST_4",                  /* 108 */
-    "BROADCAST_5",                  /* 109 */
-    "BROADCAST_6",                  /* 110 */
-    "BROADCAST_7",                  /* 111 */
-    "BROADCAST_8",                  /* 112 */
-    "BROADCAST_9",                  /* 113 */
-    "BROADCAST_10",                 /* 114 */
-    "BROADCAST_11",                 /* 115 */
-    "BROADCAST_12",                 /* 116 */
-    "BROADCAST_13",                 /* 117 */
-    "BROADCAST_14",                 /* 118 */
-    "BROADCAST_15",                 /* 119 */
-    "GROUP_USER_EVENT",             /* 120 */
-    "USER_EVENT_0",                 /* 121 */
-    "USER_EVENT_1",                 /* 122 */
-    "USER_EVENT_2",                 /* 123 */
-    "USER_EVENT_3",                 /* 124 */
-    NULL,                           /* 125 */
-    NULL,                           /* 126 */
-    NULL,                           /* 127 */
-};
-#define AIERT_CORE_EVT_MAX 127u
-
-/* --- MEM module (identical for AIEML and AIE2PS, max ID=160) --- */
-static const char *s_mem_evt_names[161] = {
     "NONE",                            /* 0 */
     "TRUE",                            /* 1 */
     "GROUP_0",                         /* 2 */
@@ -172,296 +37,459 @@ static const char *s_mem_evt_names[161] = {
     "TIMER_VALUE_REACHED",             /* 4 */
     "PERF_CNT_0",                      /* 5 */
     "PERF_CNT_1",                      /* 6 */
-    "COMBO_EVENT_0",                   /* 7 */
-    "COMBO_EVENT_1",                   /* 8 */
-    "COMBO_EVENT_2",                   /* 9 */
-    "COMBO_EVENT_3",                   /* 10 */
-    "EDGE_DETECTION_EVENT_0",          /* 11 */
-    "EDGE_DETECTION_EVENT_1",          /* 12 */
-    NULL,                              /* 13 */
-    NULL,                              /* 14 */
-    "GROUP_WATCHPOINT",                /* 15 */
-    "WATCHPOINT_0",                    /* 16 */
-    "WATCHPOINT_1",                    /* 17 */
-    "GROUP_DMA_ACTIVITY",              /* 18 */
-    "DMA_S2MM_0_START_TASK",           /* 19 */
-    "DMA_S2MM_1_START_TASK",           /* 20 */
-    "DMA_MM2S_0_START_TASK",           /* 21 */
-    "DMA_MM2S_1_START_TASK",           /* 22 */
-    "DMA_S2MM_0_FINISHED_BD",          /* 23 */
-    "DMA_S2MM_1_FINISHED_BD",          /* 24 */
-    "DMA_MM2S_0_FINISHED_BD",          /* 25 */
-    "DMA_MM2S_1_FINISHED_BD",          /* 26 */
-    "DMA_S2MM_0_FINISHED_TASK",        /* 27 */
-    "DMA_S2MM_1_FINISHED_TASK",        /* 28 */
-    "DMA_MM2S_0_FINISHED_TASK",        /* 29 */
-    "DMA_MM2S_1_FINISHED_TASK",        /* 30 */
-    "DMA_S2MM_0_STALLED_LOCK",         /* 31 */
-    "DMA_S2MM_1_STALLED_LOCK",         /* 32 */
-    "DMA_MM2S_0_STALLED_LOCK",         /* 33 */
-    "DMA_MM2S_1_STALLED_LOCK",         /* 34 */
-    "DMA_S2MM_0_STREAM_STARVATION",    /* 35 */
-    "DMA_S2MM_1_STREAM_STARVATION",    /* 36 */
-    "DMA_MM2S_0_STREAM_BACKPRESSURE",  /* 37 — stream switch won't accept packet */
-    "DMA_MM2S_1_STREAM_BACKPRESSURE",  /* 38 */
-    "DMA_S2MM_0_MEMORY_BACKPRESSURE",  /* 39 */
-    "DMA_S2MM_1_MEMORY_BACKPRESSURE",  /* 40 */
-    "DMA_MM2S_0_MEMORY_STARVATION",    /* 41 */
-    "DMA_MM2S_1_MEMORY_STARVATION",    /* 42 */
-    "GROUP_LOCK",                      /* 43 */
-    "LOCK_SEL0_ACQ_EQ",                /* 44 */
-    "LOCK_SEL0_ACQ_GE",                /* 45 */
-    "LOCK_0_REL",                      /* 46 */
-    "LOCK_SEL0_EQUAL_TO_VALUE",        /* 47 */
-    "LOCK_SEL1_ACQ_EQ",                /* 48 */
-    "LOCK_SEL1_ACQ_GE",                /* 49 */
-    "LOCK_1_REL",                      /* 50 */
-    "LOCK_SEL1_EQUAL_TO_VALUE",        /* 51 */
-    "LOCK_SEL2_ACQ_EQ",                /* 52 */
-    "LOCK_SEL2_ACQ_GE",                /* 53 */
-    "LOCK_2_REL",                      /* 54 */
-    "LOCK_SEL2_EQUAL_TO_VALUE",        /* 55 */
-    "LOCK_SEL3_ACQ_EQ",                /* 56 */
-    "LOCK_SEL3_ACQ_GE",                /* 57 */
-    "LOCK_3_REL",                      /* 58 */
-    "LOCK_SEL3_EQUAL_TO_VALUE",        /* 59 */
-    "LOCK_SEL4_ACQ_EQ",                /* 60 */
-    "LOCK_SEL4_ACQ_GE",                /* 61 */
-    "LOCK_4_REL",                      /* 62 */
-    "LOCK_SEL4_EQUAL_TO_VALUE",        /* 63 */
-    "LOCK_SEL5_ACQ_EQ",                /* 64 */
-    "LOCK_SEL5_ACQ_GE",                /* 65 */
-    "LOCK_5_REL",                      /* 66 */
-    "LOCK_SEL5_EQUAL_TO_VALUE",        /* 67 */
-    "LOCK_SEL6_ACQ_EQ",                /* 68 */
-    "LOCK_SEL6_ACQ_GE",                /* 69 */
-    "LOCK_6_REL",                      /* 70 */
-    "LOCK_SEL6_EQUAL_TO_VALUE",        /* 71 */
-    "LOCK_SEL7_ACQ_EQ",                /* 72 */
-    "LOCK_SEL7_ACQ_GE",                /* 73 */
-    "LOCK_7_REL",                      /* 74 */
-    "LOCK_SEL7_EQUAL_TO_VALUE",        /* 75 */
-    NULL,                              /* 76 */
-    NULL,                              /* 77 */
-    NULL,                              /* 78 */
-    NULL,                              /* 79 */
-    NULL,                              /* 80 */
-    NULL,                              /* 81 */
-    NULL,                              /* 82 */
-    NULL,                              /* 83 */
-    NULL,                              /* 84 */
-    NULL,                              /* 85 */
-    NULL,                              /* 86 */
-    NULL,                              /* 87 */
-    NULL,                              /* 88 */
-    NULL,                              /* 89 */
-    NULL,                              /* 90 */
-    NULL,                              /* 91 */
-    NULL,                              /* 92 */
-    NULL,                              /* 93 */
-    NULL,                              /* 94 */
-    NULL,                              /* 95 */
-    "GROUP_ERRORS",                    /* 96 */
-    "DM_ECC_ERROR_SCRUB_CORRECTED",    /* 97 */
-    "DM_ECC_ERROR_SCRUB_2BIT",         /* 98 */
-    "DM_ECC_ERROR_1BIT",               /* 99 */
-    "DM_ECC_ERROR_2BIT",               /* 100 */
-    "DM_PARITY_ERROR_BANK_2",          /* 101 */
-    "DM_PARITY_ERROR_BANK_3",          /* 102 */
-    "DM_PARITY_ERROR_BANK_4",          /* 103 */
-    "DM_PARITY_ERROR_BANK_5",          /* 104 */
-    "DM_PARITY_ERROR_BANK_6",          /* 105 */
-    "DM_PARITY_ERROR_BANK_7",          /* 106 */
-    "DMA_S2MM_0_ERROR",                /* 107 */
-    "DMA_S2MM_1_ERROR",                /* 108 */
-    "DMA_MM2S_0_ERROR",                /* 109 */
-    "DMA_MM2S_1_ERROR",                /* 110 */
-    NULL,                              /* 111 */
-    "GROUP_BROADCAST",                 /* 112 */
-    "BROADCAST_0",                     /* 113 */
-    "BROADCAST_1",                     /* 114 */
-    "BROADCAST_2",                     /* 115 */
-    "BROADCAST_3",                     /* 116 */
-    "BROADCAST_4",                     /* 117 */
-    "BROADCAST_5",                     /* 118 */
-    "BROADCAST_6",                     /* 119 */
-    "BROADCAST_7",                     /* 120 */
-    "BROADCAST_8",                     /* 121 */
-    "BROADCAST_9",                     /* 122 */
-    "BROADCAST_10",                    /* 123 */
-    "BROADCAST_11",                    /* 124 */
-    "BROADCAST_12",                    /* 125 */
-    "BROADCAST_13",                    /* 126 */
-    "BROADCAST_14",                    /* 127 */
-    "BROADCAST_15",                    /* 128 */
-    "GROUP_USER_EVENT",                /* 129 */
-    "USER_EVENT_0",                    /* 130 */
-    "USER_EVENT_1",                    /* 131 */
-    "USER_EVENT_2",                    /* 132 */
-    "USER_EVENT_3",                    /* 133 */
-    NULL,                              /* 134 */
-    NULL,                              /* 135 */
-    "DMA_S2MM_0_START_TASK2",          /* 136 — XAIEML_EVENTS_MEM_DMA_S2MM_0_START_TASK=136 (2nd alias) */
-    "DMA_S2MM_1_START_TASK2",          /* 137 */
-    "DMA_MM2S_0_START_TASK2",          /* 138 */
-    "DMA_MM2S_1_START_TASK2",          /* 139 */
-    "DMA_S2MM_0_FINISHED_TASK2",       /* 140 */
-    "DMA_S2MM_1_FINISHED_TASK2",       /* 141 */
-    "DMA_MM2S_0_FINISHED_TASK2",       /* 142 */
-    "DMA_MM2S_1_FINISHED_TASK2",       /* 143 */
-    "DMA_S2MM_0_STALLED_LOCK2",        /* 144 */
-    "DMA_S2MM_1_STALLED_LOCK2",        /* 145 */
-    "DMA_MM2S_0_STALLED_LOCK2",        /* 146 */
-    "DMA_MM2S_1_STALLED_LOCK2",        /* 147 */
-    "DMA_S2MM_0_STREAM_STARVATION2",   /* 148 */
-    "DMA_S2MM_1_STREAM_STARVATION2",   /* 149 */
-    "DMA_MM2S_0_STREAM_BACKPRESSURE2", /* 150 */
-    "DMA_MM2S_1_STREAM_BACKPRESSURE2", /* 151 */
-    "DMA_S2MM_0_MEMORY_BACKPRESSURE2", /* 152 */
-    "DMA_S2MM_1_MEMORY_BACKPRESSURE2", /* 153 */
-    "DMA_MM2S_0_MEMORY_STARVATION2",   /* 154 */
-    "DMA_MM2S_1_MEMORY_STARVATION2",   /* 155 */
-    "LOCK_SEL0_ACQ_EQ2",               /* 156 */
-    "LOCK_SEL0_ACQ_GE2",               /* 157 */
-    "LOCK_SEL0_EQUAL_TO_VALUE2",       /* 158 */
-    "LOCK_SEL1_ACQ_EQ2",               /* 159 */
-    "LOCK_ERROR",                      /* 160 */
+    "PERF_CNT_2",                      /* 7 */
+    "PERF_CNT_3",                      /* 8 */
+    "COMBO_EVENT_0",                   /* 9 */
+    "COMBO_EVENT_1",                   /* 10 */
+    "COMBO_EVENT_2",                   /* 11 */
+    "COMBO_EVENT_3",                   /* 12 */
+    "EDGE_DETECTION_EVENT_0",          /* 13 */
+    "EDGE_DETECTION_EVENT_1",          /* 14 */
+    "GROUP_PC_EVENT",                  /* 15 */
+    "PC_0",                            /* 16 */
+    "PC_1",                            /* 17 */
+    "PC_2",                            /* 18 */
+    "PC_3",                            /* 19 */
+    "PC_RANGE_0_1",                    /* 20 */
+    "PC_RANGE_2_3",                    /* 21 */
+    "GROUP_CORE_STALL",                /* 22 */
+    "MEMORY_STALL",                    /* 23 */
+    "STREAM_STALL",                    /* 24 */
+    "CASCADE_STALL",                   /* 25 */
+    "LOCK_STALL",                      /* 26 */
+    "DEBUG_HALTED",                    /* 27 */
+    "ACTIVE",                          /* 28 */
+    "DISABLED",                        /* 29 */
+    "ECC_ERROR_STALL",                 /* 30 */
+    "ECC_SCRUBBING_STALL",             /* 31 */
+    "GROUP_CORE_PROGRAM_FLOW",         /* 32 */
+    "INSTR_EVENT_0",                   /* 33 */
+    "INSTR_EVENT_1",                   /* 34 */
+    "INSTR_CALL",                      /* 35 */
+    "INSTR_RETURN",                    /* 36 */
+    "INSTR_VECTOR",                    /* 37 */
+    "INSTR_LOAD",                      /* 38 */
+    "INSTR_STORE",                     /* 39 */
+    "INSTR_STREAM_GET",                /* 40 */
+    "INSTR_STREAM_PUT",                /* 41 */
+    "INSTR_CASCADE_GET",               /* 42 */
+    "INSTR_CASCADE_PUT",               /* 43 */
+    "INSTR_LOCK_ACQUIRE_REQ",          /* 44 */
+    "INSTR_LOCK_RELEASE_REQ",          /* 45 */
+    "GROUP_ERRORS_0",                  /* 46 */
+    "GROUP_ERRORS_1",                  /* 47 */
+    "SRS_OVERFLOW",                    /* 48 */
+    "UPS_OVERFLOW",                    /* 49 */
+    "FP_HUGE",                         /* 50 */
+    "INT_FP_ZERO",                     /* 51 */
+    "FP_INVALID",                      /* 52 */
+    "FP_INF",                          /* 53 */
+    NULL,                              /* 54 — reserved */
+    "PM_REG_ACCESS_FAILURE",           /* 55 */
+    "STREAM_PKT_PARITY_ERROR",         /* 56 */
+    "CONTROL_PKT_ERROR",               /* 57 */
+    "AXI_MM_SLAVE_ERROR",              /* 58 */
+    "INSTR_DECOMPRESSION_ERROR",       /* 59 — deprecated, never fires */
+    "DM_ADDRESS_OUT_OF_RANGE",         /* 60 */
+    "PM_ECC_ERROR_SCRUB_CORRECTED",    /* 61 */
+    "PM_ECC_ERROR_SCRUB_2BIT",         /* 62 */
+    "PM_ECC_ERROR_1BIT",               /* 63 */
+    "PM_ECC_ERROR_2BIT",               /* 64 */
+    "PM_ADDRESS_OUT_OF_RANGE",         /* 65 */
+    "DM_ACCESS_TO_UNAVAILABLE",        /* 66 */
+    "LOCK_ACCESS_TO_UNAVAILABLE",      /* 67 */
+    "INSTR_WARNING",                   /* 68 */
+    "INSTR_ERROR",                     /* 69 */
+    "SPARSITY_OVERFLOW",               /* 70 */
+    "STREAM_SWITCH_PORT_PARITY_ERROR", /* 71 */
+    "PROCESSOR_BUS_ERROR",             /* 72 */
+    "GROUP_STREAM_SWITCH",             /* 73 */
+    "PORT_IDLE_0",                     /* 74 */
+    "PORT_RUNNING_0",                  /* 75 */
+    "PORT_STALLED_0",                  /* 76 */
+    "PORT_TLAST_0",                    /* 77 */
+    "PORT_IDLE_1",                     /* 78 */
+    "PORT_RUNNING_1",                  /* 79 */
+    "PORT_STALLED_1",                  /* 80 */
+    "PORT_TLAST_1",                    /* 81 */
+    "PORT_IDLE_2",                     /* 82 */
+    "PORT_RUNNING_2",                  /* 83 */
+    "PORT_STALLED_2",                  /* 84 */
+    "PORT_TLAST_2",                    /* 85 */
+    "PORT_IDLE_3",                     /* 86 */
+    "PORT_RUNNING_3",                  /* 87 */
+    "PORT_STALLED_3",                  /* 88 */
+    "PORT_TLAST_3",                    /* 89 */
+    "PORT_IDLE_4",                     /* 90 */
+    "PORT_RUNNING_4",                  /* 91 */
+    "PORT_STALLED_4",                  /* 92 */
+    "PORT_TLAST_4",                    /* 93 */
+    "PORT_IDLE_5",                     /* 94 */
+    "PORT_RUNNING_5",                  /* 95 */
+    "PORT_STALLED_5",                  /* 96 */
+    "PORT_TLAST_5",                    /* 97 */
+    "PORT_IDLE_6",                     /* 98 */
+    "PORT_RUNNING_6",                  /* 99 */
+    "PORT_STALLED_6",                  /* 100 */
+    "PORT_TLAST_6",                    /* 101 */
+    "PORT_IDLE_7",                     /* 102 */
+    "PORT_RUNNING_7",                  /* 103 */
+    "PORT_STALLED_7",                  /* 104 */
+    "PORT_TLAST_7",                    /* 105 */
+    "GROUP_BROADCAST",                 /* 106 */
+    "BROADCAST_0",                     /* 107 */
+    "BROADCAST_1",                     /* 108 */
+    "BROADCAST_2",                     /* 109 */
+    "BROADCAST_3",                     /* 110 */
+    "BROADCAST_4",                     /* 111 */
+    "BROADCAST_5",                     /* 112 */
+    "BROADCAST_6",                     /* 113 */
+    "BROADCAST_7",                     /* 114 */
+    "BROADCAST_8",                     /* 115 */
+    "BROADCAST_9",                     /* 116 */
+    "BROADCAST_10",                    /* 117 */
+    "BROADCAST_11",                    /* 118 */
+    "BROADCAST_12",                    /* 119 */
+    "BROADCAST_13",                    /* 120 */
+    "BROADCAST_14",                    /* 121 */
+    "BROADCAST_15",                    /* 122 */
+    "GROUP_USER_EVENT",                /* 123 */
+    "USER_EVENT_0",                    /* 124 */
+    "USER_EVENT_1",                    /* 125 */
+    "USER_EVENT_2",                    /* 126 */
+    "USER_EVENT_3",                    /* 127 */
 };
-#define AIERT_MEM_EVT_MAX 160u
+#define AIERT_CORE_EVT_MAX 127u
+
+/* --- MEM module (AIE2PS, aie2psmemevent.md, max ID=127) --- */
+static const char *s_mem_evt_names[128] = {
+    "NONE",                           /* 0 */
+    "TRUE",                           /* 1 */
+    "GROUP_0",                        /* 2 */
+    "TIMER_SYNC",                     /* 3 */
+    "TIMER_VALUE_REACHED",            /* 4 */
+    "PERF_CNT0_EVENT",                /* 5 */
+    "PERF_CNT1_EVENT",                /* 6 */
+    "COMBO_EVENT_0",                  /* 7 */
+    "COMBO_EVENT_1",                  /* 8 */
+    "COMBO_EVENT_2",                  /* 9 */
+    "COMBO_EVENT_3",                  /* 10 */
+    "EDGE_DETECTION_EVENT_0",         /* 11 */
+    "EDGE_DETECTION_EVENT_1",         /* 12 */
+    NULL,                             /* 13 — reserved */
+    NULL,                             /* 14 — reserved */
+    "GROUP_WATCHPOINT",               /* 15 */
+    "WATCHPOINT_0",                   /* 16 */
+    "WATCHPOINT_1",                   /* 17 */
+    "GROUP_DMA_ACTIVITY",             /* 18 */
+    "DMA_S2MM_0_START_TASK",          /* 19 */
+    "DMA_S2MM_1_START_TASK",          /* 20 */
+    "DMA_MM2S_0_START_TASK",          /* 21 */
+    "DMA_MM2S_1_START_TASK",          /* 22 */
+    "DMA_S2MM_0_FINISHED_BD",         /* 23 */
+    "DMA_S2MM_1_FINISHED_BD",         /* 24 */
+    "DMA_MM2S_0_FINISHED_BD",         /* 25 */
+    "DMA_MM2S_1_FINISHED_BD",         /* 26 */
+    "DMA_S2MM_0_FINISHED_TASK",       /* 27 */
+    "DMA_S2MM_1_FINISHED_TASK",       /* 28 */
+    "DMA_MM2S_0_FINISHED_TASK",       /* 29 */
+    "DMA_MM2S_1_FINISHED_TASK",       /* 30 */
+    "DMA_S2MM_0_STALLED_LOCK",        /* 31 */
+    "DMA_S2MM_1_STALLED_LOCK",        /* 32 */
+    "DMA_MM2S_0_STALLED_LOCK",        /* 33 */
+    "DMA_MM2S_1_STALLED_LOCK",        /* 34 */
+    "DMA_S2MM_0_STREAM_STARVATION",   /* 35 */
+    "DMA_S2MM_1_STREAM_STARVATION",   /* 36 */
+    "DMA_MM2S_0_STREAM_BACKPRESSURE", /* 37 */
+    "DMA_MM2S_1_STREAM_BACKPRESSURE", /* 38 */
+    "DMA_S2MM_0_MEMORY_BACKPRESSURE", /* 39 */
+    "DMA_S2MM_1_MEMORY_BACKPRESSURE", /* 40 */
+    "DMA_MM2S_0_MEMORY_STARVATION",   /* 41 */
+    "DMA_MM2S_1_MEMORY_STARVATION",   /* 42 */
+    "GROUP_LOCK",                     /* 43 */
+    "LOCK_SEL0_ACQ_EQ",               /* 44 */
+    "LOCK_SEL0_ACQ_GE",               /* 45 */
+    "LOCK_SEL0_REL",                  /* 46 */
+    "LOCK_SEL0_EQUAL_TO_VALUE",       /* 47 */
+    "LOCK_SEL1_ACQ_EQ",               /* 48 */
+    "LOCK_SEL1_ACQ_GE",               /* 49 */
+    "LOCK_SEL1_REL",                  /* 50 */
+    "LOCK_SEL1_EQUAL_TO_VALUE",       /* 51 */
+    "LOCK_SEL2_ACQ_EQ",               /* 52 */
+    "LOCK_SEL2_ACQ_GE",               /* 53 */
+    "LOCK_SEL2_REL",                  /* 54 */
+    "LOCK_SEL2_EQUAL_TO_VALUE",       /* 55 */
+    "LOCK_SEL3_ACQ_EQ",               /* 56 */
+    "LOCK_SEL3_ACQ_GE",               /* 57 */
+    "LOCK_SEL3_REL",                  /* 58 */
+    "LOCK_SEL3_EQUAL_TO_VALUE",       /* 59 */
+    "LOCK_SEL4_ACQ_EQ",               /* 60 */
+    "LOCK_SEL4_ACQ_GE",               /* 61 */
+    "LOCK_SEL4_REL",                  /* 62 */
+    "LOCK_SEL4_EQUAL_TO_VALUE",       /* 63 */
+    "LOCK_SEL5_ACQ_EQ",               /* 64 */
+    "LOCK_SEL5_ACQ_GE",               /* 65 */
+    "LOCK_SEL5_REL",                  /* 66 */
+    "LOCK_SEL5_EQUAL_TO_VALUE",       /* 67 */
+    "LOCK_SEL6_ACQ_EQ",               /* 68 */
+    "LOCK_SEL6_ACQ_GE",               /* 69 */
+    "LOCK_SEL6_REL",                  /* 70 */
+    "LOCK_SEL6_EQUAL_TO_VALUE",       /* 71 */
+    "LOCK_SEL7_ACQ_EQ",               /* 72 */
+    "LOCK_SEL7_ACQ_GE",               /* 73 */
+    "LOCK_SEL7_REL",                  /* 74 */
+    "LOCK_SEL7_EQUAL_TO_VALUE",       /* 75 */
+    "GROUP_MEMORY_CONFLICT",          /* 76 */
+    "CONFLICT_DM_BANK_0",             /* 77 */
+    "CONFLICT_DM_BANK_1",             /* 78 */
+    "CONFLICT_DM_BANK_2",             /* 79 */
+    "CONFLICT_DM_BANK_3",             /* 80 */
+    "CONFLICT_DM_BANK_4",             /* 81 */
+    "CONFLICT_DM_BANK_5",             /* 82 */
+    "CONFLICT_DM_BANK_6",             /* 83 */
+    "CONFLICT_DM_BANK_7",             /* 84 */
+    NULL,                             /* 85 — reserved */
+    "GROUP_ERRORS",                   /* 86 */
+    "DM_ECC_ERROR_SCRUB_CORRECTED",   /* 87 */
+    "DM_ECC_ERROR_SCRUB_2BIT",        /* 88 */
+    "DM_ECC_ERROR_1BIT",              /* 89 */
+    "DM_ECC_ERROR_2BIT",              /* 90 */
+    "DM_PARITY_ERROR_BANK_2",         /* 91 */
+    "DM_PARITY_ERROR_BANK_3",         /* 92 */
+    "DM_PARITY_ERROR_BANK_4",         /* 93 */
+    "DM_PARITY_ERROR_BANK_5",         /* 94 */
+    "DM_PARITY_ERROR_BANK_6",         /* 95 */
+    "DM_PARITY_ERROR_BANK_7",         /* 96 */
+    "DMA_S2MM_0_ERROR",               /* 97 */
+    "DMA_S2MM_1_ERROR",               /* 98 */
+    "DMA_MM2S_0_ERROR",               /* 99 */
+    "DMA_MM2S_1_ERROR",               /* 100 */
+    "LOCK_ERROR",                     /* 101 */
+    "DMA_TASK_TOKEN_STALL",           /* 102 */
+    NULL,                             /* 103 — reserved */
+    NULL,                             /* 104 — reserved */
+    NULL,                             /* 105 — reserved */
+    "GROUP_BROADCAST",                /* 106 */
+    "BROADCAST_0",                    /* 107 */
+    "BROADCAST_1",                    /* 108 */
+    "BROADCAST_2",                    /* 109 */
+    "BROADCAST_3",                    /* 110 */
+    "BROADCAST_4",                    /* 111 */
+    "BROADCAST_5",                    /* 112 */
+    "BROADCAST_6",                    /* 113 */
+    "BROADCAST_7",                    /* 114 */
+    "BROADCAST_8",                    /* 115 */
+    "BROADCAST_9",                    /* 116 */
+    "BROADCAST_10",                   /* 117 */
+    "BROADCAST_11",                   /* 118 */
+    "BROADCAST_12",                   /* 119 */
+    "BROADCAST_13",                   /* 120 */
+    "BROADCAST_14",                   /* 121 */
+    "BROADCAST_15",                   /* 122 */
+    "GROUP_USER_EVENT",               /* 123 */
+    "USER_EVENT_0",                   /* 124 */
+    "USER_EVENT_1",                   /* 125 */
+    "USER_EVENT_2",                   /* 126 */
+    "USER_EVENT_3",                   /* 127 */
+};
+#define AIERT_MEM_EVT_MAX 127u
 
 /* --- PL module (Shim tile) event status register bit layout.
  *
- * Source: aie2psevent.md §4 "Shim Tile Events (IDs 0-116)"
+ * Source: aie2psshimevent.md Table 7-12 "Shim Event List" (AIE2PS)
  * This is the HARDWARE event status register bit layout, NOT the XAie
  * driver enum values (xaie_events_aieml.h / xaie_events_aie2ps.h).
  * The XAie enums are software IDs used to program event counters and
  * do NOT match the hardware register bit positions.
  *
- * Both AIEML and AIE2PS use the same shim event status register layout.
- * Max hardware event ID = 116 (COMBO_EVENT_3). One table covers both gens.
+ * Max hardware event ID = 181 (USER_EVENT_1). Events 182-234 are uC
+ * module events (Table 8-7) and not included here.
  */
-static const char *s_pl_evt_names[117] = {
-    "NONE",                           /* 0 */
-    "TRUE",                           /* 1 */
-    "PERF_CNT0",                      /* 2 */
-    "PERF_CNT1",                      /* 3 */
-    "PERF_CNT0_HALF",                 /* 4 */
-    "PERF_CNT1_HALF",                 /* 5 */
-    "PL_FALLING_EDGE_0",              /* 6 */
-    "PL_FALLING_EDGE_1",              /* 7 */
-    "PL_RISING_EDGE_0",               /* 8 */
-    "PL_RISING_EDGE_1",               /* 9 */
-    "PL_FALLING_EDGE_2",              /* 10 */
-    "PL_FALLING_EDGE_3",              /* 11 */
-    "PL_RISING_EDGE_2",               /* 12 */
-    "PL_RISING_EDGE_3",               /* 13 */
-    "DMA_S2MM_0_START_TASK",          /* 14 */
-    "DMA_S2MM_1_START_TASK",          /* 15 */
-    "DMA_MM2S_0_START_TASK",          /* 16 */
-    "DMA_MM2S_1_START_TASK",          /* 17 */
-    "DMA_S2MM_0_FINISHED_TASK",       /* 18 */
-    "DMA_S2MM_1_FINISHED_TASK",       /* 19 */
-    "DMA_MM2S_0_FINISHED_TASK",       /* 20 */
-    "DMA_MM2S_1_FINISHED_TASK",       /* 21 */
-    "DMA_S2MM_0_STALLED_LOCK",        /* 22 */
-    "DMA_S2MM_1_STALLED_LOCK",        /* 23 */
-    "DMA_MM2S_0_STALLED_LOCK",        /* 24 */
-    "DMA_MM2S_1_STALLED_LOCK",        /* 25 */
-    "DMA_S2MM_0_STREAM_STARVATION",   /* 26 */
-    "DMA_S2MM_1_STREAM_STARVATION",   /* 27 */
-    "DMA_MM2S_0_STREAM_BACKPRESSURE", /* 28 */
-    "DMA_MM2S_1_STREAM_BACKPRESSURE", /* 29 */
-    "DMA_S2MM_0_MEMORY_BACKPRESSURE", /* 30 */
-    "DMA_S2MM_1_MEMORY_BACKPRESSURE", /* 31 */
-    "DMA_MM2S_0_MEMORY_STARVATION",   /* 32 */
-    "DMA_MM2S_1_MEMORY_STARVATION",   /* 33 */
-    "LOCK_0_ACQ_EQ",                  /* 34 */
-    "LOCK_0_ACQ_GE",                  /* 35 */
-    "LOCK_0_EQUAL_TO_VALUE",          /* 36 */
-    "LOCK_1_ACQ_EQ",                  /* 37 */
-    "LOCK_1_ACQ_GE",                  /* 38 */
-    "LOCK_1_EQUAL_TO_VALUE",          /* 39 */
-    "LOCK_2_ACQ_EQ",                  /* 40 */
-    "LOCK_2_ACQ_GE",                  /* 41 */
-    "LOCK_2_EQUAL_TO_VALUE",          /* 42 */
-    "LOCK_3_ACQ_EQ",                  /* 43 */
-    "LOCK_3_ACQ_GE",                  /* 44 */
-    "LOCK_3_EQUAL_TO_VALUE",          /* 45 */
-    "LOCK_4_ACQ_EQ",                  /* 46 */
-    "LOCK_4_ACQ_GE",                  /* 47 */
-    "LOCK_4_EQUAL_TO_VALUE",          /* 48 */
-    "LOCK_5_ACQ_EQ",                  /* 49 */
-    "LOCK_5_ACQ_GE",                  /* 50 */
-    "LOCK_5_EQUAL_TO_VALUE",          /* 51 */
-    "SS_STALL_0",                     /* 52 */
-    "SS_STALL_1",                     /* 53 */
-    "SS_STALL_2",                     /* 54 */
-    "SS_STALL_3",                     /* 55 */
-    "SS_STALL_4",                     /* 56 */
-    "SS_STALL_5",                     /* 57 */
-    "SS_STALL_6",                     /* 58 */
-    "SS_STALL_7",                     /* 59 */
-    "SS_OVERFLOW",                    /* 60 */
-    "PORT_IDLE_0",                    /* 61 */
-    "PORT_IDLE_1",                    /* 62 */
-    "PORT_IDLE_2",                    /* 63 */
-    "PORT_IDLE_3",                    /* 64 */
-    "PORT_IDLE_4",                    /* 65 */
-    "PORT_IDLE_5",                    /* 66 */
-    "PORT_IDLE_6",                    /* 67 */
-    "PORT_IDLE_7",                    /* 68 */
-    "PORT_RUNNING_0",                 /* 69 */
-    "PORT_RUNNING_1",                 /* 70 */
-    "PORT_RUNNING_2",                 /* 71 */
-    "PORT_RUNNING_3",                 /* 72 */
-    "PORT_RUNNING_4",                 /* 73 */
-    "PORT_RUNNING_5",                 /* 74 */
-    "PORT_RUNNING_6",                 /* 75 */
-    "PORT_RUNNING_7",                 /* 76 */
-    "PORT_STALL_0",                   /* 77 */
-    "PORT_STALL_1",                   /* 78 */
-    "PORT_STALL_2",                   /* 79 */
-    "PORT_STALL_3",                   /* 80 */
-    "PORT_STALL_4",                   /* 81 */
-    "PORT_STALL_5",                   /* 82 */
-    "PORT_STALL_6",                   /* 83 */
-    "PORT_STALL_7",                   /* 84 */
-    "PORT_TLAST_0",                   /* 85 */
-    "PORT_TLAST_1",                   /* 86 */
-    "PORT_TLAST_2",                   /* 87 */
-    "PORT_TLAST_3",                   /* 88 */
-    "PORT_TLAST_4",                   /* 89 */
-    "PORT_TLAST_5",                   /* 90 */
-    "PORT_TLAST_6",                   /* 91 */
-    "PORT_TLAST_7",                   /* 92 */
-    "BROADCAST_A_0",                  /* 93 */
-    "BROADCAST_A_1",                  /* 94 */
-    "BROADCAST_A_2",                  /* 95 */
-    "BROADCAST_A_3",                  /* 96 */
-    "BROADCAST_A_4",                  /* 97 */
-    "BROADCAST_A_5",                  /* 98 */
-    "BROADCAST_A_6",                  /* 99 */
-    "BROADCAST_A_7",                  /* 100 */
-    "BROADCAST_A_8",                  /* 101 */
-    "BROADCAST_A_9",                  /* 102 */
-    "BROADCAST_A_10",                 /* 103 */
-    "BROADCAST_A_11",                 /* 104 */
-    "BROADCAST_A_12",                 /* 105 */
-    "BROADCAST_A_13",                 /* 106 */
-    "BROADCAST_A_14",                 /* 107 */
-    "BROADCAST_A_15",                 /* 108 */
-    "USER_EVENT_0",                   /* 109 */
-    "USER_EVENT_1",                   /* 110 */
-    "EDGE_DETECTION_EVENT_0",         /* 111 */
-    "EDGE_DETECTION_EVENT_1",         /* 112 */
-    "COMBO_EVENT_0",                  /* 113 */
-    "COMBO_EVENT_1",                  /* 114 */
-    "COMBO_EVENT_2",                  /* 115 */
-    "COMBO_EVENT_3",                  /* 116 */
+static const char *s_pl_evt_names[182] = {
+    "NONE",                                  /* 0 */
+    "TRUE",                                  /* 1 */
+    "GROUP_0",                               /* 2 */
+    "TIMER_SYNC",                            /* 3 */
+    "TIMER_VALUE_REACHED",                   /* 4 */
+    "PERF_CNT0_EVENT",                       /* 5 */
+    "PERF_CNT1_EVENT",                       /* 6 */
+    "COMBO_EVENT_0",                         /* 7 */
+    "COMBO_EVENT_1",                         /* 8 */
+    "COMBO_EVENT_2",                         /* 9 */
+    "COMBO_EVENT_3",                         /* 10 */
+    "EDGE_DETECTION_EVENT_0",                /* 11 */
+    "EDGE_DETECTION_EVENT_1",                /* 12 */
+    "GROUP_NOC_0_DMA_ACTIVITY",              /* 13 */
+    "NOC_0_DMA_S2MM_0_START_TASK",           /* 14 */
+    "NOC_0_DMA_S2MM_1_START_TASK",           /* 15 */
+    "NOC_0_DMA_MM2S_0_START_TASK",           /* 16 */
+    "NOC_0_DMA_MM2S_1_START_TASK",           /* 17 */
+    "NOC_0_DMA_S2MM_0_FINISHED_BD",          /* 18 */
+    "NOC_0_DMA_S2MM_1_FINISHED_BD",          /* 19 */
+    "NOC_0_DMA_MM2S_0_FINISHED_BD",          /* 20 */
+    "NOC_0_DMA_MM2S_1_FINISHED_BD",          /* 21 */
+    "NOC_0_DMA_S2MM_0_FINISHED_TASK",        /* 22 */
+    "NOC_0_DMA_S2MM_1_FINISHED_TASK",        /* 23 */
+    "NOC_0_DMA_MM2S_0_FINISHED_TASK",        /* 24 */
+    "NOC_0_DMA_MM2S_1_FINISHED_TASK",        /* 25 */
+    "NOC_0_DMA_S2MM_0_STALLED_LOCK",         /* 26 */
+    "NOC_0_DMA_S2MM_1_STALLED_LOCK",         /* 27 */
+    "NOC_0_DMA_MM2S_0_STALLED_LOCK",         /* 28 */
+    "NOC_0_DMA_MM2S_1_STALLED_LOCK",         /* 29 */
+    "NOC_0_DMA_S2MM_0_STREAM_STARVATION",    /* 30 */
+    "NOC_0_DMA_S2MM_1_STREAM_STARVATION",    /* 31 */
+    "NOC_0_DMA_MM2S_0_STREAM_BACKPRESSURE",  /* 32 */
+    "NOC_0_DMA_MM2S_1_STREAM_BACKPRESSURE",  /* 33 */
+    "NOC_0_DMA_S2MM_0_MEMORY_BACKPRESSURE",  /* 34 */
+    "NOC_0_DMA_S2MM_1_MEMORY_BACKPRESSURE",  /* 35 */
+    "NOC_0_DMA_MM2S_0_MEMORY_STARVATION",    /* 36 */
+    "NOC_0_DMA_MM2S_1_MEMORY_STARVATION",    /* 37 */
+    "GROUP_NOC_1_DMA_ACTIVITY",              /* 38 */
+    "NOC_1_DMA_S2MM_0_START_TASK",           /* 39 */
+    "NOC_1_DMA_S2MM_1_START_TASK",           /* 40 */
+    "NOC_1_DMA_MM2S_0_START_TASK",           /* 41 */
+    "NOC_1_DMA_MM2S_1_START_TASK",           /* 42 */
+    "NOC_1_DMA_S2MM_0_FINISHED_BD",          /* 43 */
+    "NOC_1_DMA_S2MM_1_FINISHED_BD",          /* 44 */
+    "NOC_1_DMA_MM2S_0_FINISHED_BD",          /* 45 */
+    "NOC_1_DMA_MM2S_1_FINISHED_BD",          /* 46 */
+    "NOC_1_DMA_S2MM_0_FINISHED_TASK",        /* 47 */
+    "NOC_1_DMA_S2MM_1_FINISHED_TASK",        /* 48 */
+    "NOC_1_DMA_MM2S_0_FINISHED_TASK",        /* 49 */
+    "NOC_1_DMA_MM2S_1_FINISHED_TASK",        /* 50 */
+    "NOC_1_DMA_S2MM_0_STALLED_LOCK",         /* 51 */
+    "NOC_1_DMA_S2MM_1_STALLED_LOCK",         /* 52 */
+    "NOC_1_DMA_MM2S_0_STALLED_LOCK",         /* 53 */
+    "NOC_1_DMA_MM2S_1_STALLED_LOCK",         /* 54 */
+    "NOC_1_DMA_S2MM_0_STREAM_STARVATION",    /* 55 */
+    "NOC_1_DMA_S2MM_1_STREAM_STARVATION",    /* 56 */
+    "NOC_1_DMA_MM2S_0_STREAM_BACKPRESSURE",  /* 57 */
+    "NOC_1_DMA_MM2S_1_STREAM_BACKPRESSURE",  /* 58 */
+    "NOC_1_DMA_S2MM_0_MEMORY_BACKPRESSURE",  /* 59 */
+    "NOC_1_DMA_S2MM_1_MEMORY_BACKPRESSURE",  /* 60 */
+    "NOC_1_DMA_MM2S_0_MEMORY_STARVATION",    /* 61 */
+    "NOC_1_DMA_MM2S_1_MEMORY_STARVATION",    /* 62 */
+    "GROUP_NOC_0_LOCK",                      /* 63 */
+    "NOC_0_LOCK_0_ACQ_EQ",                   /* 64 */
+    "NOC_0_LOCK_0_ACQ_GE",                   /* 65 */
+    "NOC_0_LOCK_0_REL",                      /* 66 */
+    "NOC_0_LOCK_0_EQUAL_TO_VALUE",           /* 67 */
+    "NOC_0_LOCK_1_ACQ_EQ",                   /* 68 */
+    "NOC_0_LOCK_1_ACQ_GE",                   /* 69 */
+    "NOC_0_LOCK_1_REL",                      /* 70 */
+    "NOC_0_LOCK_1_EQUAL_TO_VALUE",           /* 71 */
+    "NOC_0_LOCK_2_ACQ_EQ",                   /* 72 */
+    "NOC_0_LOCK_2_ACQ_GE",                   /* 73 */
+    "NOC_0_LOCK_2_REL",                      /* 74 */
+    "NOC_0_LOCK_2_EQUAL_TO_VALUE",           /* 75 */
+    "NOC_0_LOCK_3_ACQ_EQ",                   /* 76 */
+    "NOC_0_LOCK_3_ACQ_GE",                   /* 77 */
+    "NOC_0_LOCK_3_REL",                      /* 78 */
+    "NOC_0_LOCK_3_EQUAL_TO_VALUE",           /* 79 */
+    "NOC_0_LOCK_4_ACQ_EQ",                   /* 80 */
+    "NOC_0_LOCK_4_ACQ_GE",                   /* 81 */
+    "NOC_0_LOCK_4_REL",                      /* 82 */
+    "NOC_0_LOCK_4_EQUAL_TO_VALUE",           /* 83 */
+    "NOC_0_LOCK_5_ACQ_EQ",                   /* 84 */
+    "NOC_0_LOCK_5_ACQ_GE",                   /* 85 */
+    "NOC_0_LOCK_5_REL",                      /* 86 */
+    "NOC_0_LOCK_5_EQUAL_TO_VALUE",           /* 87 */
+    "GROUP_NOC_1_LOCK",                      /* 88 */
+    "NOC_1_LOCK_0_ACQ_EQ",                   /* 89 */
+    "NOC_1_LOCK_0_ACQ_GE",                   /* 90 */
+    "NOC_1_LOCK_0_REL",                      /* 91 */
+    "NOC_1_LOCK_0_EQUAL_TO_VALUE",           /* 92 */
+    "NOC_1_LOCK_1_ACQ_EQ",                   /* 93 */
+    "NOC_1_LOCK_1_ACQ_GE",                   /* 94 */
+    "NOC_1_LOCK_1_REL",                      /* 95 */
+    "NOC_1_LOCK_1_EQUAL_TO_VALUE",           /* 96 */
+    "NOC_1_LOCK_2_ACQ_EQ",                   /* 97 */
+    "NOC_1_LOCK_2_ACQ_GE",                   /* 98 */
+    "NOC_1_LOCK_2_REL",                      /* 99 */
+    "NOC_1_LOCK_2_EQUAL_TO_VALUE",           /* 100 */
+    "NOC_1_LOCK_3_ACQ_EQ",                   /* 101 */
+    "NOC_1_LOCK_3_ACQ_GE",                   /* 102 */
+    "NOC_1_LOCK_3_REL",                      /* 103 */
+    "NOC_1_LOCK_3_EQUAL_TO_VALUE",           /* 104 */
+    "NOC_1_LOCK_4_ACQ_EQ",                   /* 105 */
+    "NOC_1_LOCK_4_ACQ_GE",                   /* 106 */
+    "NOC_1_LOCK_4_REL",                      /* 107 */
+    "NOC_1_LOCK_4_EQUAL_TO_VALUE",           /* 108 */
+    "NOC_1_LOCK_5_ACQ_EQ",                   /* 109 */
+    "NOC_1_LOCK_5_ACQ_GE",                   /* 110 */
+    "NOC_1_LOCK_5_REL",                      /* 111 */
+    "NOC_1_LOCK_5_EQUAL_TO_VALUE",           /* 112 */
+    "GROUP_ERRORS",                          /* 113 */
+    "AXI_MM_SLAVE_TILE_ERROR",               /* 114 */
+    "CONTROL_PKT_ERROR",                     /* 115 */
+    "STREAM_SWITCH_PARITY_ERROR",            /* 116 */
+    "AXI_MM_DECODE_NSU_ERROR",               /* 117 */
+    "AXI_MM_SLAVE_NSU_ERROR",                /* 118 */
+    "AXI_MM_UNSUPPORTED_TRAFFIC",            /* 119 */
+    "AXI_MM_UNSECURE_ACCESS_IN_SECURE_MODE", /* 120 */
+    "AXI_MM_BYTE_STROBE_ERROR",              /* 121 */
+    "NOC_0_DMA_S2MM_ERROR",                  /* 122 */
+    "NOC_1_DMA_S2MM_ERROR",                  /* 123 */
+    "NOC_0_DMA_MM2S_ERROR",                  /* 124 */
+    "NOC_1_DMA_MM2S_ERROR",                  /* 125 */
+    "NOC_0_LOCK_ERROR",                      /* 126 */
+    "NOC_1_LOCK_ERROR",                      /* 127 */
+    "NOC_0_DMA_TASK_TOKEN_STALL",            /* 128 */
+    "NOC_1_DMA_TASK_TOKEN_STALL",            /* 129 */
+    "GROUP_STREAM_SWITCH",                   /* 130 */
+    "PORT_IDLE_0",                           /* 131 */
+    "PORT_RUNNING_0",                        /* 132 */
+    "PORT_STALLED_0",                        /* 133 */
+    "PORT_TLAST_0",                          /* 134 */
+    "PORT_IDLE_1",                           /* 135 */
+    "PORT_RUNNING_1",                        /* 136 */
+    "PORT_STALLED_1",                        /* 137 */
+    "PORT_TLAST_1",                          /* 138 */
+    "PORT_IDLE_2",                           /* 139 */
+    "PORT_RUNNING_2",                        /* 140 */
+    "PORT_STALLED_2",                        /* 141 */
+    "PORT_TLAST_2",                          /* 142 */
+    "PORT_IDLE_3",                           /* 143 */
+    "PORT_RUNNING_3",                        /* 144 */
+    "PORT_STALLED_3",                        /* 145 */
+    "PORT_TLAST_3",                          /* 146 */
+    "PORT_IDLE_4",                           /* 147 */
+    "PORT_RUNNING_4",                        /* 148 */
+    "PORT_STALLED_4",                        /* 149 */
+    "PORT_TLAST_4",                          /* 150 */
+    "PORT_IDLE_5",                           /* 151 */
+    "PORT_RUNNING_5",                        /* 152 */
+    "PORT_STALLED_5",                        /* 153 */
+    "PORT_TLAST_5",                          /* 154 */
+    "PORT_IDLE_6",                           /* 155 */
+    "PORT_RUNNING_6",                        /* 156 */
+    "PORT_STALLED_6",                        /* 157 */
+    "PORT_TLAST_6",                          /* 158 */
+    "PORT_IDLE_7",                           /* 159 */
+    "PORT_RUNNING_7",                        /* 160 */
+    "PORT_STALLED_7",                        /* 161 */
+    "PORT_TLAST_7",                          /* 162 */
+    "GROUP_BROADCAST_A",                     /* 163 */
+    "BROADCAST_A_0",                         /* 164 */
+    "BROADCAST_A_1",                         /* 165 */
+    "BROADCAST_A_2",                         /* 166 */
+    "BROADCAST_A_3",                         /* 167 */
+    "BROADCAST_A_4",                         /* 168 */
+    "BROADCAST_A_5",                         /* 169 */
+    "BROADCAST_A_6",                         /* 170 */
+    "BROADCAST_A_7",                         /* 171 */
+    "BROADCAST_A_8",                         /* 172 */
+    "BROADCAST_A_9",                         /* 173 */
+    "BROADCAST_A_10",                        /* 174 */
+    "BROADCAST_A_11",                        /* 175 */
+    "BROADCAST_A_12",                        /* 176 */
+    "BROADCAST_A_13",                        /* 177 */
+    "BROADCAST_A_14",                        /* 178 */
+    "BROADCAST_A_15",                        /* 179 */
+    "USER_EVENT_0",                          /* 180 */
+    "USER_EVENT_1",                          /* 181 */
 };
-#define AIERT_PL_EVT_MAX 116u
-/* Both AIEML and AIE2PS share the same shim event status register bit layout */
-#define AIERT_PL_EVT_AIEML_MAX AIERT_PL_EVT_MAX
+#define AIERT_PL_EVT_MAX 181u
 #define AIERT_PL_EVT_AIE2PS_MAX AIERT_PL_EVT_MAX
 
 /* --------------------------------------------------------------------------
@@ -514,13 +542,13 @@ const char *AieRt_EventName(XAie_ModuleType module, uint32_t id) {
  * Memory Module event status print — all set bits with names
  *
  * Reads the core tile Memory Module event status registers:
- *   0x00014200 : MEM module event IDs  0-31
- *   0x00014204 : MEM module event IDs 32-63
+ *   0x00014200 : MEM module event IDs   0-31
+ *   0x00014204 : MEM module event IDs  32-63
+ *   0x00014208 : MEM module event IDs  64-95
+ *   0x0001420C : MEM module event IDs  96-127
  *
  * For each set bit, prints: id + name from AieRt_EventName(XAIE_MEM_MOD, id)
  * -------------------------------------------------------------------------- */
-
-#define AIERT_CORE_MEM_EVT_STATUS_REG1 0x00014204u
 
 void AieRt_PrintMemModuleEvents(XAie_DevInst *dev, XAie_LocType tile) {
     if (!s_is_core(tile)) {
@@ -530,26 +558,27 @@ void AieRt_PrintMemModuleEvents(XAie_DevInst *dev, XAie_LocType tile) {
     }
 
     u64 base = ((u64)tile.Col << 25) | ((u64)tile.Row << 20);
-    u32 reg0 = 0, reg1 = 0;
-    XAie_Read32(dev, base | AIERT_CORE_MEM_EVT_STATUS_REG, &reg0);
-    XAie_Read32(dev, base | AIERT_CORE_MEM_EVT_STATUS_REG1, &reg1);
+    u32 reg[4] = {0, 0, 0, 0};
+    XAie_Read32(dev, base | AIERT_CORE_MEM_EVT_STATUS_REG, &reg[0]);
+    XAie_Read32(dev, base | AIERT_CORE_MEM_EVT_STATUS_REG1, &reg[1]);
+    XAie_Read32(dev, base | AIERT_CORE_MEM_EVT_STATUS_REG2, &reg[2]);
+    XAie_Read32(dev, base | AIERT_CORE_MEM_EVT_STATUS_REG3, &reg[3]);
 
     const char *gen_str = (g_aiert_gen == AIERT_GEN_AIE2PS) ? "AIE2PS" : "AIEML";
     printf("[AieRt_Debug] tile(%u,%u) MEM module events [gen=%s]"
-           "  reg0(IDs 0-31)=0x%08X  reg1(IDs 32-63)=0x%08X\n",
-           (unsigned)tile.Col, (unsigned)tile.Row, gen_str, (unsigned)reg0, (unsigned)reg1);
+           "  reg0=0x%08X  reg1=0x%08X  reg2=0x%08X  reg3=0x%08X\n",
+           (unsigned)tile.Col, (unsigned)tile.Row, gen_str, (unsigned)reg[0], (unsigned)reg[1], (unsigned)reg[2],
+           (unsigned)reg[3]);
 
     int any = 0;
-    for (int bit = 0; bit < 32; bit++) {
-        if ((reg0 >> bit) & 1u) {
-            printf("  MEM evt %3d  %s\n", bit, AieRt_EventName(XAIE_MEM_MOD, (uint32_t)bit));
-            any = 1;
-        }
-    }
-    for (int bit = 0; bit < 32; bit++) {
-        if ((reg1 >> bit) & 1u) {
-            int id = 32 + bit;
-            printf("  MEM evt %3d  %s\n", id, AieRt_EventName(XAIE_MEM_MOD, (uint32_t)id));
+    for (uint32_t r = 0; r < 4u; r++) {
+        for (int bit = 0; bit < 32; bit++) {
+            if (!((reg[r] >> bit) & 1u))
+                continue;
+            uint32_t id = r * 32u + (uint32_t)bit;
+            if (id > AIERT_MEM_EVT_MAX)
+                continue;
+            printf("  MEM evt %3u  %s\n", (unsigned)id, AieRt_EventName(XAIE_MEM_MOD, id));
             any = 1;
         }
     }
@@ -570,8 +599,10 @@ void AieRt_PrintMemModuleEventsAll(XAie_DevInst *dev, const XAie_LocType *tiles,
  * Core Module event status print — all set bits with names
  *
  * Reads the core tile Core Module event status registers:
- *   0x00034200 : CORE module event IDs  0-31
- *   0x00034204 : CORE module event IDs 32-63
+ *   0x00034200 : CORE module event IDs   0-31
+ *   0x00034204 : CORE module event IDs  32-63
+ *   0x00034208 : CORE module event IDs  64-95
+ *   0x0003420C : CORE module event IDs  96-127
  *
  * For each set bit, prints: id + name from AieRt_EventName(XAIE_CORE_MOD, id)
  * -------------------------------------------------------------------------- */
@@ -584,26 +615,27 @@ void AieRt_PrintCoreModuleEvents(XAie_DevInst *dev, XAie_LocType tile) {
     }
 
     u64 base = ((u64)tile.Col << 25) | ((u64)tile.Row << 20);
-    u32 reg0 = 0, reg1 = 0;
-    XAie_Read32(dev, base | AIERT_CORE_CORE_EVT_STATUS_REG, &reg0);
-    XAie_Read32(dev, base | AIERT_CORE_CORE_EVT_STATUS_REG1, &reg1);
+    u32 reg[4] = {0, 0, 0, 0};
+    XAie_Read32(dev, base | AIERT_CORE_CORE_EVT_STATUS_REG, &reg[0]);
+    XAie_Read32(dev, base | AIERT_CORE_CORE_EVT_STATUS_REG1, &reg[1]);
+    XAie_Read32(dev, base | AIERT_CORE_CORE_EVT_STATUS_REG2, &reg[2]);
+    XAie_Read32(dev, base | AIERT_CORE_CORE_EVT_STATUS_REG3, &reg[3]);
 
     const char *gen_str = (g_aiert_gen == AIERT_GEN_AIE2PS) ? "AIE2PS" : "AIEML";
     printf("[AieRt_Debug] tile(%u,%u) CORE module events [gen=%s]"
-           "  reg0(IDs 0-31)=0x%08X  reg1(IDs 32-63)=0x%08X\n",
-           (unsigned)tile.Col, (unsigned)tile.Row, gen_str, (unsigned)reg0, (unsigned)reg1);
+           "  reg0=0x%08X  reg1=0x%08X  reg2=0x%08X  reg3=0x%08X\n",
+           (unsigned)tile.Col, (unsigned)tile.Row, gen_str, (unsigned)reg[0], (unsigned)reg[1], (unsigned)reg[2],
+           (unsigned)reg[3]);
 
     int any = 0;
-    for (int bit = 0; bit < 32; bit++) {
-        if ((reg0 >> bit) & 1u) {
-            printf("  CORE evt %3d  %s\n", bit, AieRt_EventName(XAIE_CORE_MOD, (uint32_t)bit));
-            any = 1;
-        }
-    }
-    for (int bit = 0; bit < 32; bit++) {
-        if ((reg1 >> bit) & 1u) {
-            int id = 32 + bit;
-            printf("  CORE evt %3d  %s\n", id, AieRt_EventName(XAIE_CORE_MOD, (uint32_t)id));
+    for (uint32_t r = 0; r < 4u; r++) {
+        for (int bit = 0; bit < 32; bit++) {
+            if (!((reg[r] >> bit) & 1u))
+                continue;
+            uint32_t id = r * 32u + (uint32_t)bit;
+            if (id > AIERT_CORE_EVT_MAX)
+                continue;
+            printf("  CORE evt %3u  %s\n", (unsigned)id, AieRt_EventName(XAIE_CORE_MOD, id));
             any = 1;
         }
     }
@@ -696,43 +728,35 @@ void AieRt_PrintCoreStatus(XAie_DevInst *dev, XAie_LocType tile) {
     if (!in_reset)
         printf("  LR             : 0x%08X\n", (unsigned)lr);
 
-    /* Read core module event status registers for a live activity snapshot.
-     * REG0 (0x00034200): event IDs  0-31
-     * REG1 (0x00034204): event IDs 32-63 — contains stall / active bits */
+    /* Read core module event status register 0 for a live activity snapshot.
+     * REG0 (0x00034200): event IDs  0-31 — contains stall / active bits (AIE2PS) */
     u64 evt_reg0_off = ((u64)tile.Col << 25) | ((u64)tile.Row << 20) | AIERT_CORE_CORE_EVT_STATUS_REG;
-    u64 evt_reg1_off = ((u64)tile.Col << 25) | ((u64)tile.Row << 20) | AIERT_CORE_CORE_EVT_STATUS_REG1;
-    u32 evt0 = 0, evt1 = 0;
+    u32 evt0 = 0;
     AieRC rc_e0 = XAie_Read32(dev, evt_reg0_off, &evt0);
-    AieRC rc_e1 = XAie_Read32(dev, evt_reg1_off, &evt1);
-    if (rc_e0 == XAIE_OK && rc_e1 == XAIE_OK) {
+    if (rc_e0 == XAIE_OK) {
         printf("  CoreEvtReg0  : 0x%08X  (event IDs  0-31)\n", (unsigned)evt0);
-        printf("  CoreEvtReg1  : 0x%08X  (event IDs 32-63)\n", (unsigned)evt1);
-        int active = (int)((evt1 >> AIERT_CORE_EVT1_ACTIVE_BIT) & 1u);
-        int disabled = (int)((evt1 >> AIERT_CORE_EVT1_DISABLED_BIT) & 1u);
-        int ms_stall = (int)((evt1 >> AIERT_CORE_EVT1_MS_STALL_BIT) & 1u);
-        int pm_stall = (int)((evt1 >> AIERT_CORE_EVT1_PM_STALL_BIT) & 1u);
-        int stream_stall = (int)((evt1 >> AIERT_CORE_EVT1_STREAM_STALL_BIT) & 1u);
-        int cascade_stall = (int)((evt1 >> AIERT_CORE_EVT1_CASCADE_STALL_BIT) & 1u);
-        int lock_stall = (int)((evt1 >> AIERT_CORE_EVT1_LOCK_STALL_BIT) & 1u);
-        int ecc_err_stall = (int)((evt1 >> AIERT_CORE_EVT1_ECC_ERR_STALL_BIT) & 1u);
-        int ecc_scrub = (int)((evt1 >> AIERT_CORE_EVT1_ECC_SCRUB_STALL_BIT) & 1u);
-        int stall_nop = (int)((evt1 >> AIERT_CORE_EVT1_STALL_NOP_BIT) & 1u);
+        int active = (int)((evt0 >> AIERT_CORE_EVT0_ACTIVE_BIT) & 1u);
+        int disabled = (int)((evt0 >> AIERT_CORE_EVT0_DISABLED_BIT) & 1u);
+        int ms_stall = (int)((evt0 >> AIERT_CORE_EVT0_MS_STALL_BIT) & 1u);
+        int stream_stall = (int)((evt0 >> AIERT_CORE_EVT0_STREAM_STALL_BIT) & 1u);
+        int cascade_stall = (int)((evt0 >> AIERT_CORE_EVT0_CASCADE_STALL_BIT) & 1u);
+        int lock_stall = (int)((evt0 >> AIERT_CORE_EVT0_LOCK_STALL_BIT) & 1u);
+        int ecc_err_stall = (int)((evt0 >> AIERT_CORE_EVT0_ECC_ERR_STALL_BIT) & 1u);
+        int ecc_scrub = (int)((evt0 >> AIERT_CORE_EVT0_ECC_SCRUB_STALL_BIT) & 1u);
         printf("  ACTIVE       : %s\n", active ? "YES" : "no");
         printf("  DISABLED     : %s\n", disabled ? "YES" : "no");
         printf("  MS_STALL     : %s\n", ms_stall ? "*** STALL ***" : "no");
-        printf("  PM_STALL     : %s\n", pm_stall ? "*** STALL ***" : "no");
         printf("  STREAM_STALL : %s\n", stream_stall ? "*** STALL ***" : "no");
         printf("  CASCADE_STALL: %s\n", cascade_stall ? "*** STALL ***" : "no");
         printf("  LOCK_STALL   : %s\n", lock_stall ? "*** STALL ***" : "no");
         printf("  ECC_ERR_STALL: %s\n", ecc_err_stall ? "*** STALL ***" : "no");
         printf("  ECC_SCRUB    : %s\n", ecc_scrub ? "*** STALL ***" : "no");
-        printf("  STALL_NOP    : %s\n", stall_nop ? "YES" : "no");
         if (disabled)
             printf("  *** WARN: core is DISABLED\n");
-        if (ms_stall || pm_stall || stream_stall || cascade_stall || lock_stall || ecc_err_stall || ecc_scrub)
+        if (ms_stall || stream_stall || cascade_stall || lock_stall || ecc_err_stall || ecc_scrub)
             printf("  *** WARN: core has active stall(s)\n");
     } else {
-        printf("  CoreEvtReg   : read failed (rc0=%d rc1=%d)\n", (int)rc_e0, (int)rc_e1);
+        printf("  CoreEvtReg   : read failed (rc0=%d)\n", (int)rc_e0);
     }
 }
 
@@ -747,25 +771,18 @@ void AieRt_PrintCoreStatusAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint
 /* --------------------------------------------------------------------------
  * Core module activity / stall event analysis
  *
- * Uses AIERT_CORE_CORE_EVT_STATUS_REG  (0x00034200) for event IDs  0-31
- * and   AIERT_CORE_CORE_EVT_STATUS_REG1 (0x00034204) for event IDs 32-63.
+ * Uses AIERT_CORE_CORE_EVT_STATUS_REG (0x00034200) for event IDs 0-31.
  *
- * Address formula from debug.md:
- *   full addr = 0x20000000000 + (col<<25) + (row<<20) + register_offset
- *   tile-relative offset passed to XAie_Read32:
- *     (col<<25) | (row<<20) | offset
- *
- * Relevant events (all in register 1, event IDs 41-55):
- *   bit  9  ID 41  MS_STALL
- *   bit 10  ID 42  PM_STALL (program-memory / instr-load stall)
- *   bit 11  ID 43  STREAM_STALL
- *   bit 12  ID 44  CASCADE_STALL
- *   bit 13  ID 45  LOCK_STALL
- *   bit 15  ID 47  ACTIVE
- *   bit 16  ID 48  DISABLED
- *   bit 17  ID 49  ECC_ERROR_STALL
- *   bit 18  ID 50  ECC_SCRUBBING_STALL
- *   bit 23  ID 55  STALL_NOP
+ * Relevant events (AIE2PS Table 4-8, all in register 0):
+ *   bit 23  ID 23  MEMORY_STALL
+ *   bit 24  ID 24  STREAM_STALL
+ *   bit 25  ID 25  CASCADE_STALL
+ *   bit 26  ID 26  LOCK_STALL
+ *   bit 27  ID 27  DEBUG_HALTED
+ *   bit 28  ID 28  ACTIVE
+ *   bit 29  ID 29  DISABLED
+ *   bit 30  ID 30  ECC_ERROR_STALL
+ *   bit 31  ID 31  ECC_SCRUBBING_STALL
  * -------------------------------------------------------------------------- */
 
 void AieRt_PrintCoreActivityEvents(XAie_DevInst *dev, XAie_LocType tile) {
@@ -775,57 +792,45 @@ void AieRt_PrintCoreActivityEvents(XAie_DevInst *dev, XAie_LocType tile) {
         return;
     }
 
-    /* Read core module event status register 1 (event IDs 32-63) */
-    u64 reg1_off = ((u64)tile.Col << 25) | ((u64)tile.Row << 20) | AIERT_CORE_CORE_EVT_STATUS_REG1;
-    u32 evt1 = 0;
-    AieRC rc = XAie_Read32(dev, reg1_off, &evt1);
+    /* Read core module event status register 0 (event IDs 0-31, contains stall/active bits) */
+    u64 reg0_off = ((u64)tile.Col << 25) | ((u64)tile.Row << 20) | AIERT_CORE_CORE_EVT_STATUS_REG;
+    u32 evt0 = 0;
+    AieRC rc = XAie_Read32(dev, reg0_off, &evt0);
     if (rc != XAIE_OK) {
-        printf("[AieRt_Debug] tile(%u,%u): failed to read core_evt_status1 rc=%d\n", (unsigned)tile.Col,
+        printf("[AieRt_Debug] tile(%u,%u): failed to read core_evt_status0 rc=%d\n", (unsigned)tile.Col,
                (unsigned)tile.Row, (int)rc);
         return;
     }
 
-    /* Also read register 0 for completeness (event IDs 0-31) */
-    u64 reg0_off = ((u64)tile.Col << 25) | ((u64)tile.Row << 20) | AIERT_CORE_CORE_EVT_STATUS_REG;
-    u32 evt0 = 0;
-    XAie_Read32(dev, reg0_off, &evt0); /* best-effort; errors non-fatal here */
+    int active = (int)((evt0 >> AIERT_CORE_EVT0_ACTIVE_BIT) & 1u);
+    int disabled = (int)((evt0 >> AIERT_CORE_EVT0_DISABLED_BIT) & 1u);
+    int ms_stall = (int)((evt0 >> AIERT_CORE_EVT0_MS_STALL_BIT) & 1u);
+    int stream_stall = (int)((evt0 >> AIERT_CORE_EVT0_STREAM_STALL_BIT) & 1u);
+    int cascade_stall = (int)((evt0 >> AIERT_CORE_EVT0_CASCADE_STALL_BIT) & 1u);
+    int lock_stall = (int)((evt0 >> AIERT_CORE_EVT0_LOCK_STALL_BIT) & 1u);
+    int ecc_err_stall = (int)((evt0 >> AIERT_CORE_EVT0_ECC_ERR_STALL_BIT) & 1u);
+    int ecc_scrub = (int)((evt0 >> AIERT_CORE_EVT0_ECC_SCRUB_STALL_BIT) & 1u);
 
-    int active = (int)((evt1 >> AIERT_CORE_EVT1_ACTIVE_BIT) & 1u);
-    int disabled = (int)((evt1 >> AIERT_CORE_EVT1_DISABLED_BIT) & 1u);
-    int ms_stall = (int)((evt1 >> AIERT_CORE_EVT1_MS_STALL_BIT) & 1u);
-    int pm_stall = (int)((evt1 >> AIERT_CORE_EVT1_PM_STALL_BIT) & 1u);
-    int stream_stall = (int)((evt1 >> AIERT_CORE_EVT1_STREAM_STALL_BIT) & 1u);
-    int cascade_stall = (int)((evt1 >> AIERT_CORE_EVT1_CASCADE_STALL_BIT) & 1u);
-    int lock_stall = (int)((evt1 >> AIERT_CORE_EVT1_LOCK_STALL_BIT) & 1u);
-    int ecc_err_stall = (int)((evt1 >> AIERT_CORE_EVT1_ECC_ERR_STALL_BIT) & 1u);
-    int ecc_scrub = (int)((evt1 >> AIERT_CORE_EVT1_ECC_SCRUB_STALL_BIT) & 1u);
-    int stall_nop = (int)((evt1 >> AIERT_CORE_EVT1_STALL_NOP_BIT) & 1u);
-
-    printf("[AieRt_Debug] Core tile(%u,%u) core_evt_status0(0x%llX)=0x%08X  core_evt_status1(0x%llX)=0x%08X\n",
-           (unsigned)tile.Col, (unsigned)tile.Row, (unsigned long long)reg0_off, (unsigned)evt0,
-           (unsigned long long)reg1_off, (unsigned)evt1);
+    printf("[AieRt_Debug] Core tile(%u,%u) core_evt_status0(0x%llX)=0x%08X\n", (unsigned)tile.Col, (unsigned)tile.Row,
+           (unsigned long long)reg0_off, (unsigned)evt0);
 
     /* Activity state */
     printf("  ACTIVE          : %s\n", active ? "YES" : "no");
     printf("  DISABLED        : %s\n", disabled ? "YES" : "no");
 
     /* Stall events */
-    printf("  MS_STALL        : %s\n", ms_stall ? "*** STALL ***" : "no");
-    printf("  PM_STALL(instr) : %s\n", pm_stall ? "*** STALL ***" : "no");
+    printf("  MEMORY_STALL    : %s\n", ms_stall ? "*** STALL ***" : "no");
     printf("  STREAM_STALL    : %s\n", stream_stall ? "*** STALL ***" : "no");
     printf("  CASCADE_STALL   : %s\n", cascade_stall ? "*** STALL ***" : "no");
     printf("  LOCK_STALL      : %s\n", lock_stall ? "*** STALL ***" : "no");
     printf("  ECC_ERR_STALL   : %s\n", ecc_err_stall ? "*** STALL ***" : "no");
     printf("  ECC_SCRUB_STALL : %s\n", ecc_scrub ? "*** STALL ***" : "no");
-    printf("  STALL_NOP       : %s\n", stall_nop ? "YES" : "no");
 
     /* Summary warnings */
     if (disabled)
         printf("  *** WARN: core is DISABLED\n");
-    if (ms_stall || pm_stall || stream_stall || cascade_stall || lock_stall || ecc_err_stall || ecc_scrub)
+    if (ms_stall || stream_stall || cascade_stall || lock_stall || ecc_err_stall || ecc_scrub)
         printf("  *** WARN: core has active stall(s) - check stall lines above\n");
-    if (pm_stall)
-        printf("  *** WARN: PM_STALL - core stalled on instruction load (instr fetch)\n");
 }
 
 void AieRt_PrintCoreActivityEventsAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles) {
@@ -951,6 +956,11 @@ void AieRt_PrintBdInfo(XAie_DevInst *dev, XAie_LocType tile, uint8_t bd_id) {
     /* Packet */
     int pkt_en = (int)desc.PktDesc.PktEn;
     int pkt_id = (int)desc.PktDesc.PktId;
+    int pkt_type = (int)desc.PktDesc.PktType;
+
+    /* Out-of-order BD ID */
+    int ooo_bd_id = (int)desc.BdEnDesc.OutofOrderBdId;
+    int ooo_en = (int)desc.EnOutofOrderBdId;
 
     printf("[AieRt_Debug]   BD%-2u: addr=0x%llx len=%u bytes", (unsigned)bd_id, (unsigned long long)addr,
            (unsigned)len);
@@ -961,7 +971,10 @@ void AieRt_PrintBdInfo(XAie_DevInst *dev, XAie_LocType tile, uint8_t bd_id) {
         printf("  next=(none)");
 
     if (pkt_en)
-        printf("  pkt_id=%u", (unsigned)pkt_id);
+        printf("  pkt_en=%d pkt_id=%u pkt_type=%u", pkt_en, (unsigned)pkt_id, (unsigned)pkt_type);
+
+    if (ooo_en)
+        printf("  ooo_bd_id=%u", (unsigned)ooo_bd_id);
 
     printf("\n");
     printf("         lock acq: en=%d id=%d val=%d  rel: en=%d id=%d val=%d\n", acq_en, acq_lock_id, acq_lock_val,
@@ -1046,8 +1059,10 @@ void AieRt_PrintShimBdRawAll(XAie_DevInst *dev, uint8_t col) {
                 w[wi] = 0;
         }
 
-        /* Skip if Buffer_Length (word0) is zero — BD not configured */
-        if (w[0] == 0)
+        /* Always print the first 8 BDs regardless of content for debug
+         * visibility (post-completion/error state may have zeroed BDs).
+         * Skip remaining BDs only if Buffer_Length (word0) is zero. */
+        if (bd >= 8 && w[0] == 0)
             continue;
 
         /* Decode word 0: Buffer_Length */
@@ -1056,10 +1071,13 @@ void AieRt_PrintShimBdRawAll(XAie_DevInst *dev, uint8_t col) {
         /* Decode word 1: Base_Address_Low */
         uint32_t addr_lo = w[1];
 
-        /* Decode word 2: Base_Address_High[15:0], Packet_ID[28:24], Packet_Type[22:20] */
+        /* Decode word 2: Enable_Packet[30], Out_of_Order_BD_ID[29:24],
+         * Packet_ID[23:19], Packet_Type[18:16], Base_Address_High[15:0] */
         uint32_t addr_hi = w[2] & 0xFFFFu;
-        uint32_t pkt_id = (w[2] >> 24) & 0x1Fu;
-        uint32_t pkt_type = (w[2] >> 20) & 0x7u;
+        uint32_t enable_pkt = (w[2] >> 30) & 0x1u;
+        uint32_t ooo_bd_id = (w[2] >> 24) & 0x3Fu;
+        uint32_t pkt_id = (w[2] >> 19) & 0x1Fu;
+        uint32_t pkt_type = (w[2] >> 16) & 0x7u;
 
         /* Decode word 3: D0_Stepsize[19:0], D0_Wrap[29:20] */
         uint32_t d0_step = w[3] & 0xFFFFFu;
@@ -1103,8 +1121,7 @@ void AieRt_PrintShimBdRawAll(XAie_DevInst *dev, uint8_t col) {
             printf("  next->BD%u", next_bd);
         else
             printf("  next=(none)");
-        if (pkt_id || pkt_type)
-            printf("  pkt_id=%u pkt_type=%u", pkt_id, pkt_type);
+        printf("  enable_pkt=%u pkt_id=%u pkt_type=%u ooo_bd_id=%u", enable_pkt, pkt_id, pkt_type, ooo_bd_id);
         printf("\n");
 
         /* Print dimension strides/wraps */
@@ -1123,15 +1140,49 @@ void AieRt_PrintShimBdRawAll(XAie_DevInst *dev, uint8_t col) {
         printed++;
     }
 
-    if (printed == 0)
-        printf("[AieRt_Debug]   (no configured BDs — all Buffer_Length == 0)\n");
-
+    printf("[AieRt_Debug]   (%d BDs printed, first 8 always shown)\n", printed);
     printf("[AieRt_Debug] ===== End Shim tile(%u,0) Raw BD Dump =====\n", (unsigned)col);
 }
 
 /* --------------------------------------------------------------------------
  * DMA channel status
  * -------------------------------------------------------------------------- */
+
+AieRC AieRt_DmaGetChannelStatusFull(XAie_DevInst *dev, XAie_LocType tile, uint8_t ch, XAie_DmaDirection dir,
+                                    uint32_t *status) {
+    if (dev == NULL || status == NULL)
+        return XAIE_INVALID_ARGS;
+    if (ch > 1u)
+        return XAIE_INVALID_ARGS;
+
+    /* Select S2MM / MM2S base offset depending on tile type.
+     * Core and MemTile offsets are identical across AIEML and AIE2PS.
+     * Shim NOC tile offsets differ: AIEML vs AIE2PS. */
+    u32 s2mm_base, mm2s_base;
+    if (s_is_shim(tile)) {
+        if (g_aiert_gen == AIERT_GEN_AIE2PS) {
+            s2mm_base = AIERT_DMA_SHIM_S2MM_STATUS_BASE_2PS;
+            mm2s_base = AIERT_DMA_SHIM_MM2S_STATUS_BASE_2PS;
+        } else {
+            s2mm_base = AIERT_DMA_SHIM_S2MM_STATUS_BASE_ML;
+            mm2s_base = AIERT_DMA_SHIM_MM2S_STATUS_BASE_ML;
+        }
+    } else if (s_is_memtile(tile)) {
+        s2mm_base = AIERT_DMA_MEM_S2MM_STATUS_BASE;
+        mm2s_base = AIERT_DMA_MEM_MM2S_STATUS_BASE;
+    } else if (s_is_core(tile)) {
+        s2mm_base = AIERT_DMA_CORE_S2MM_STATUS_BASE;
+        mm2s_base = AIERT_DMA_CORE_MM2S_STATUS_BASE;
+    } else {
+        return XAIE_INVALID_TILE;
+    }
+
+    u32 reg_offset = (dir == DMA_S2MM) ? s2mm_base : mm2s_base;
+    reg_offset += ch * AIERT_DMA_CHNUM_OFFSET;
+
+    u64 addr = ((u64)tile.Col << 25) | ((u64)tile.Row << 20) | (u64)reg_offset;
+    return XAie_Read32(dev, addr, status);
+}
 
 AieRt_DmaChStatusDecoded AieRt_DecodeDmaChStatus(uint32_t raw) {
     AieRt_DmaChStatusDecoded d;
@@ -1157,7 +1208,7 @@ AieRt_DmaChStatusDecoded AieRt_DecodeDmaChStatus(uint32_t raw) {
 
 void AieRt_PrintDmaChStatus(XAie_DevInst *dev, XAie_LocType tile, uint8_t ch, XAie_DmaDirection dir) {
     u32 raw = 0;
-    AieRC rc = XAie_DmaGetChannelStatus(dev, tile, ch, dir, &raw);
+    AieRC rc = AieRt_DmaGetChannelStatusFull(dev, tile, ch, dir, &raw);
     if (rc != XAIE_OK) {
         printf("[AieRt_Debug]   tile(%u,%u) ch%u %s: GetChannelStatus failed rc=%d\n", (unsigned)tile.Col,
                (unsigned)tile.Row, (unsigned)ch, s_dir_str(dir), (int)rc);
@@ -1203,19 +1254,23 @@ void AieRt_PrintShimDmaStatus(XAie_DevInst *dev, uint8_t col) {
 
 void AieRt_PrintShimPlModuleEvents(XAie_DevInst *dev, uint8_t col) {
     u64 base = (u64)col << 25; /* shim row=0 */
-    u32 reg[4] = {0, 0, 0, 0};
+    u32 reg[6] = {0, 0, 0, 0, 0, 0};
     XAie_Read32(dev, base | AIERT_SHIM_PL_EVT_STATUS_REG0, &reg[0]);
     XAie_Read32(dev, base | AIERT_SHIM_PL_EVT_STATUS_REG1, &reg[1]);
     XAie_Read32(dev, base | AIERT_SHIM_PL_EVT_STATUS_REG2, &reg[2]);
     XAie_Read32(dev, base | AIERT_SHIM_PL_EVT_STATUS_REG3, &reg[3]);
+    XAie_Read32(dev, base | AIERT_SHIM_PL_EVT_STATUS_REG4, &reg[4]);
+    XAie_Read32(dev, base | AIERT_SHIM_PL_EVT_STATUS_REG5, &reg[5]);
 
     const char *gen_str = (g_aiert_gen == AIERT_GEN_AIE2PS) ? "AIE2PS" : "AIEML";
     printf("[AieRt_Debug] Shim(%u,0) PL module events [gen=%s]"
-           "  reg0=0x%08X  reg1=0x%08X  reg2=0x%08X  reg3=0x%08X\n",
-           (unsigned)col, gen_str, (unsigned)reg[0], (unsigned)reg[1], (unsigned)reg[2], (unsigned)reg[3]);
+           "  reg0=0x%08X  reg1=0x%08X  reg2=0x%08X  reg3=0x%08X"
+           "  reg4=0x%08X  reg5=0x%08X\n",
+           (unsigned)col, gen_str, (unsigned)reg[0], (unsigned)reg[1], (unsigned)reg[2], (unsigned)reg[3],
+           (unsigned)reg[4], (unsigned)reg[5]);
 
     int any = 0;
-    for (uint32_t r = 0; r < 4u; r++) {
+    for (uint32_t r = 0; r < 6u; r++) {
         for (int bit = 0; bit < 32; bit++) {
             if (!((reg[r] >> bit) & 1u))
                 continue;
@@ -1223,23 +1278,32 @@ void AieRt_PrintShimPlModuleEvents(XAie_DevInst *dev, uint8_t col) {
             if (id > AIERT_PL_EVT_MAX)
                 continue;
             const char *name = AieRt_EventName(XAIE_PL_MOD, id);
-            /* Flag ranges per aie2psevent.md §4 hardware register bit layout:
-             *   DMA activity   : IDs 14-33
-             *   Stalled lock   : IDs 22-25  (subset of DMA, more severe)
-             *   Stream stall   : IDs 26-29  (starvation/backpressure)
-             *   SS_STALL/OVERFLOW: IDs 52-60
+            /* Flag ranges per aie2psshimevent.md Table 7-12:
+             *   NoC 0 DMA activity       : IDs 14-37
+             *   NoC 0 DMA stalled lock   : IDs 26-29
+             *   NoC 0 DMA stream starv/bp: IDs 30-33
+             *   NoC 0 DMA memory bp/starv: IDs 34-37
+             *   NoC 1 DMA activity       : IDs 39-62
+             *   NoC 1 DMA stalled lock   : IDs 51-54
+             *   NoC 1 DMA stream starv/bp: IDs 55-58
+             *   NoC 1 DMA memory bp/starv: IDs 59-62
+             *   Errors                   : IDs 114-129
              */
             const char *flag = "";
-            if (id >= 14u && id <= 33u)
+            if ((id >= 14u && id <= 37u) || (id >= 39u && id <= 62u))
                 flag = " [DMA]";
-            if (id >= 22u && id <= 25u)
+            if ((id >= 26u && id <= 29u) || (id >= 51u && id <= 54u))
                 flag = " *** DMA STALLED_LOCK ***";
-            if (id >= 26u && id <= 27u)
+            if (id == 30u || id == 31u || id == 55u || id == 56u)
                 flag = " *** S2MM STREAM STARVATION ***";
-            if (id >= 28u && id <= 29u)
+            if (id == 32u || id == 33u || id == 57u || id == 58u)
                 flag = " *** MM2S STREAM BACKPRESSURE ***";
-            if (id >= 52u && id <= 60u)
-                flag = " *** SS_STALL ***";
+            if ((id >= 34u && id <= 35u) || (id >= 59u && id <= 60u))
+                flag = " *** MEMORY BACKPRESSURE ***";
+            if ((id >= 36u && id <= 37u) || (id >= 61u && id <= 62u))
+                flag = " *** MEMORY STARVATION ***";
+            if (id >= 113u && id <= 129u)
+                flag = " *** ERROR ***";
             printf("  PL evt %3u  %s%s\n", (unsigned)id, name, flag);
             any = 1;
         }
@@ -1272,7 +1336,7 @@ int AieRt_VerifyIoDescriptors(XAie_DevInst *dev, const struct_io *ios, uint32_t 
     for (uint32_t i = 0; i < num_ios; i++) {
         const struct_io *io = &ios[i];
         u32 raw = 0;
-        AieRC rc = XAie_DmaGetChannelStatus(dev, io->tile_loc, io->channel_id, io->direction, &raw);
+        AieRC rc = AieRt_DmaGetChannelStatusFull(dev, io->tile_loc, io->channel_id, io->direction, &raw);
         if (rc != XAIE_OK) {
             printf("[AieRt_Debug] IO[%u] tile(%u,%u) ch%u %s: GetChannelStatus FAILED rc=%d\n", (unsigned)i,
                    (unsigned)io->tile_loc.Col, (unsigned)io->tile_loc.Row, (unsigned)io->channel_id,
@@ -1378,7 +1442,7 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
             }
         }
 
-        if (g_runtime_debug_level >= 1)
+        if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1)
             AieRt_PrintStreamSwitchConfigAll(dev, ss_tiles, ss_count, /*print_all=*/0);
     }
 
@@ -1427,7 +1491,10 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
             AieRt_PrintCoreTileDmaStatus(dev, tiles[i]);
     }
 
-    /* 9. BD contents for all referenced tiles */
+    /* 9. Performance counters (MM2S BD finished counts) */
+    AieRt_PrintCoreTilePerfCountersAll(dev, tiles, num_tiles);
+
+    /* 10. BD contents for all referenced tiles */
     printf("[AieRt_Debug] ===== BD Contents (all referenced tiles) =====\n");
     {
         /* Unique tile list derived from ios + tiles */
@@ -1464,7 +1531,7 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
             AieRt_PrintAllBds(dev, seen[i]);
     }
 
-    /* 10. Raw BD register dump for shim tiles (shows stride/wrap/iteration) */
+    /* 11. Raw BD register dump for shim tiles (shows stride/wrap/iteration) */
     printf("[AieRt_Debug] ===== Shim Raw BD Registers (stride/wrap) =====\n");
     {
         uint8_t shim_seen[64];
@@ -1489,7 +1556,7 @@ void AieRt_DebugSnapshot(XAie_DevInst *dev, const struct_io *ios, uint32_t num_i
             printf("[AieRt_Debug]  (no shim tiles in ios list)\n");
     }
 
-    /* 11. IO verification */
+    /* 12. IO verification */
     AieRt_VerifyIoDescriptors(dev, ios, num_ios);
 
     printf("[AieRt_Debug] ============================================================\n\n");
@@ -1897,4 +1964,180 @@ void AieRt_DebugSnapshotFromCoords(XAie_DevInst *dev, const uint8_t *io_cols, co
     }
 
     AieRt_DebugSnapshot(dev, ios, num_ios, tiles, num_tiles);
+}
+
+/* --------------------------------------------------------------------------
+ * Performance counter debug
+ * -------------------------------------------------------------------------- */
+
+void AieRt_PrintCoreTilePerfCounters(XAie_DevInst *dev, XAie_LocType tile) {
+    if (!s_is_core(tile))
+        return;
+
+    uint32_t val0 = 0, val1 = 0;
+    AieRC rc0 = XAie_PerfCounterGet(dev, tile, XAIE_MEM_MOD, 0, &val0);
+    AieRC rc1 = XAie_PerfCounterGet(dev, tile, XAIE_MEM_MOD, 1, &val1);
+
+    printf("[AieRt_Debug] PerfCnt tile(%u,%u) MEM_MOD: "
+           "cnt0=%u (rc=%d) cnt1=%u (rc=%d)\n",
+           (unsigned)tile.Col, (unsigned)tile.Row, val0, (int)rc0, val1, (int)rc1);
+}
+
+void AieRt_PrintCoreTilePerfCountersAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles) {
+    printf("[AieRt_Debug] ===== Core Tile Perf Counters (MEM_MOD cnt0/cnt1) =====\n");
+    for (uint32_t i = 0; i < num_tiles; i++) {
+        if (s_is_core(tiles[i]))
+            AieRt_PrintCoreTilePerfCounters(dev, tiles[i]);
+    }
+}
+
+/* ==========================================================================
+ * Shim DMA Loopback Debug API
+ *
+ * Performs a DDR→ShimDMA→DDR loopback test on a single shim tile column.
+ * Flow:
+ *   1. Allocate two DDR buffers (src, dst) via XAie_MemAllocate.
+ *   2. Fill src with a known pattern, clear dst.
+ *   3. Configure shim tile stream switch: circuit-switch SOUTH port 3
+ *      back to itself (MM2S output → S2MM input on same port).
+ *   4. Set up two BDs on the shim tile:
+ *        BD 0 — MM2S: reads src buffer from DDR
+ *        BD 1 — S2MM: writes received data to dst buffer in DDR
+ *   5. Push BDs to channel queues, enable channels, poll for completion.
+ *   6. Compare src vs dst; print PASS/FAIL.
+ *   7. Free DDR buffers.
+ *
+ * Reference: aieml-tests/src/xaie_shimdma_loopback.c
+ * ========================================================================== */
+
+int AieRt_ShimDmaLoopback(XAie_DevInst *dev, uint8_t col, uint32_t *srcaddr, uint32_t *dstaddr, uint32_t len) {
+    AieRC RC;
+    uint64_t src_addr = (uint64_t)(uintptr_t)srcaddr;
+    uint64_t dst_addr = (uint64_t)(uintptr_t)dstaddr;
+    uint32_t num_words = len / sizeof(uint32_t);
+
+    printf("[AieRt_ShimDmaLoopback] col=%u src=0x%lx dst=0x%lx len=%u\n", (unsigned)col, (unsigned long)src_addr,
+           (unsigned long)dst_addr, (unsigned)len);
+
+    /* ---- 1. Configure stream switch: SOUTH3 → SOUTH3 circuit loopback ---- */
+    XAie_LocType shim_tile = XAie_TileLoc(col, 0);
+
+    RC = XAie_StrmConnCctEnable(dev, shim_tile, SOUTH, 3, SOUTH, 3);
+    printf("[AieRt_ShimDmaLoopback] StrmConnCctEnable SOUTH3→SOUTH3 rc=%d\n", (int)RC);
+
+    RC = XAie_EnableShimDmaToAieStrmPort(dev, shim_tile, 3);
+    printf("[AieRt_ShimDmaLoopback] EnableShimDmaToAieStrmPort(3) rc=%d\n", (int)RC);
+
+    RC = XAie_EnableAieToShimDmaStrmPort(dev, shim_tile, 3);
+    printf("[AieRt_ShimDmaLoopback] EnableAieToShimDmaStrmPort(3) rc=%d\n", (int)RC);
+
+    /* ---- 2. Configure BDs ----
+     *   BD 0: MM2S — read from src DDR buffer
+     *   BD 1: S2MM — write to dst DDR buffer
+     */
+    XAie_DmaDesc DmaDescMM2S, DmaDescS2MM;
+
+    /* MM2S BD (BD 0): read src from DDR */
+    RC = XAie_DmaDescInit(dev, &DmaDescMM2S, shim_tile);
+    RC = XAie_DmaSetAddrLen(&DmaDescMM2S, src_addr, len);
+    RC = XAie_DmaEnableBd(&DmaDescMM2S);
+    RC = XAie_DmaSetAxi(&DmaDescMM2S, 0U, 16U, 0U, 0U, 0U);
+    RC = XAie_DmaWriteBd(dev, &DmaDescMM2S, shim_tile, 0);
+    printf("[AieRt_ShimDmaLoopback] MM2S BD0 addr=0x%lx len=%u rc=%d\n", (unsigned long)src_addr, (unsigned)len,
+           (int)RC);
+
+    /* S2MM BD (BD 1): write dst to DDR */
+    RC = XAie_DmaDescInit(dev, &DmaDescS2MM, shim_tile);
+    RC = XAie_DmaSetAddrLen(&DmaDescS2MM, dst_addr, len);
+    RC = XAie_DmaEnableBd(&DmaDescS2MM);
+    RC = XAie_DmaSetAxi(&DmaDescS2MM, 0U, 16U, 0U, 0U, 0U);
+    RC = XAie_DmaWriteBd(dev, &DmaDescS2MM, shim_tile, 1);
+    printf("[AieRt_ShimDmaLoopback] S2MM BD1 addr=0x%lx len=%u rc=%d\n", (unsigned long)dst_addr, (unsigned)len,
+           (int)RC);
+
+    /* ---- 3. Push BDs to queues and enable channels ----
+     *   AIEML shim DMA channel-to-port mapping (fixed in HW):
+     *     MM2S ch0 → SOUTH slave port 3   (3, 7)
+     *     S2MM ch1 → SOUTH master port 3  (1, 3)
+     *   We configured circuit-switch on port 3, so must use these channels.
+     *   S2MM must be armed FIRST (receiver ready before sender starts).
+     */
+    RC = XAie_DmaChannelPushBdToQueue(dev, shim_tile, 1, DMA_S2MM, 1);
+    printf("[AieRt_ShimDmaLoopback] S2MM ch1 push BD1 rc=%d\n", (int)RC);
+
+    RC = XAie_DmaChannelPushBdToQueue(dev, shim_tile, 0, DMA_MM2S, 0);
+    printf("[AieRt_ShimDmaLoopback] MM2S ch0 push BD0 rc=%d\n", (int)RC);
+
+    RC = XAie_DmaChannelEnable(dev, shim_tile, 1, DMA_S2MM);
+    printf("[AieRt_ShimDmaLoopback] S2MM ch1 enable rc=%d\n", (int)RC);
+
+    RC = XAie_DmaChannelEnable(dev, shim_tile, 0, DMA_MM2S);
+    printf("[AieRt_ShimDmaLoopback] MM2S ch0 enable rc=%d\n", (int)RC);
+
+    /* ---- 4. Poll for S2MM ch1 completion ---- */
+    u8 pending = 1;
+    uint32_t poll_count = 0;
+    const uint32_t max_polls = 10000;
+    while (pending != 0 && poll_count < max_polls) {
+        RC = XAie_DmaGetPendingBdCount(dev, shim_tile, 1, DMA_S2MM, &pending);
+        if (RC != XAIE_OK) {
+            printf("[AieRt_ShimDmaLoopback] ERROR: GetPendingBdCount failed rc=%d\n", (int)RC);
+            break;
+        }
+        poll_count++;
+    }
+
+    if (pending != 0) {
+        printf("[AieRt_ShimDmaLoopback] TIMEOUT: S2MM still pending after %u polls\n", (unsigned)poll_count);
+        AieRt_PrintShimDmaStatus(dev, col);
+        return -2;
+    }
+
+    printf("[AieRt_ShimDmaLoopback] DMA transfer complete after %u polls\n", (unsigned)poll_count);
+
+    /* ---- 5. Verify: compare src vs dst ---- */
+    int errors = 0;
+    for (uint32_t i = 0; i < num_words; i++) {
+        if (srcaddr[i] != dstaddr[i]) {
+            if (errors < 16) {
+                printf("[AieRt_ShimDmaLoopback] MISMATCH [%u]: src=0x%08x dst=0x%08x\n", (unsigned)i,
+                       (unsigned)srcaddr[i], (unsigned)dstaddr[i]);
+            }
+            errors++;
+        }
+    }
+
+    if (errors == 0) {
+        printf("[AieRt_ShimDmaLoopback] PASS col=%u (%u words verified)\n", (unsigned)col, (unsigned)num_words);
+    } else {
+        printf("[AieRt_ShimDmaLoopback] FAIL col=%u (%d/%u mismatches)\n", (unsigned)col, errors, (unsigned)num_words);
+    }
+
+    /* Print first 16 words of src and dst for visual inspection */
+    uint32_t print_n = (num_words < 16) ? num_words : 16;
+    printf("[AieRt_ShimDmaLoopback] src[0..%u]:", (unsigned)(print_n - 1));
+    for (uint32_t i = 0; i < print_n; i++)
+        printf(" 0x%08x", (unsigned)srcaddr[i]);
+    printf("\n");
+    printf("[AieRt_ShimDmaLoopback] dst[0..%u]:", (unsigned)(print_n - 1));
+    for (uint32_t i = 0; i < print_n; i++)
+        printf(" 0x%08x", (unsigned)dstaddr[i]);
+    printf("\n");
+
+    return errors == 0 ? 0 : -3;
+}
+
+int AieRt_ShimDmaLoopbackAllCols(XAie_DevInst *dev, const uint8_t *cols, int num_cols, uint32_t *srcaddr,
+                                 uint32_t *dstaddr, uint32_t len) {
+    printf("[AieRt_ShimDmaLoopback] ===== Running loopback on %d columns, len=%u =====\n", num_cols, (unsigned)len);
+    int total_fail = 0;
+    for (int i = 0; i < num_cols; i++) {
+        int rc = AieRt_ShimDmaLoopback(dev, cols[i], srcaddr, dstaddr, len);
+        if (rc != 0) {
+            printf("[AieRt_ShimDmaLoopback] Column %u FAILED (rc=%d)\n", (unsigned)cols[i], rc);
+            total_fail++;
+        }
+    }
+    printf("[AieRt_ShimDmaLoopback] ===== Result: %d/%d columns passed =====\n", num_cols - total_fail, num_cols);
+    return total_fail;
 }

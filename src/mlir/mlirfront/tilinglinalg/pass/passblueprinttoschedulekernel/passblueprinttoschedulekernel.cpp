@@ -550,7 +550,8 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
 static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolRefAttr target);
 static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
                                                         Type defaultElementType, int64_t defaultBufferSize,
-                                                        int32_t defaultVectorWidth, double bufferRatio);
+                                                        int32_t defaultVectorWidth, double bufferRatio,
+                                                        int64_t maxPingPongBytes);
 
 // Generate dfschedule.dskernel_receiver function (legacy style)
 // This is kept for backward compatibility and will call generateKernelModule internally
@@ -564,7 +565,7 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
 static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Location loc, Operation *insertBeforeOp,
                                      StringRef kernelName, RankedTensorType tensorType, int64_t bufferLen,
                                      uint32_t basePacketId, int64_t coreChannel, uint32_t flowIndex,
-                                     KernelResourceManager &resourceMgr, double bufferRatio) {
+                                     KernelResourceManager &resourceMgr, double bufferRatio, int64_t maxPingPongBytes) {
 
     // Build kernel generation parameters
     KernelGenParams params;
@@ -587,7 +588,7 @@ static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Locati
     // Walk from the module root to collect all shim<->core data flows
     Operation *rootOp = getModuleOp(insertBeforeOp);
     params.kernelParams = analyzeKernelParams(rootOp, resourceMgr, params.elementType, params.bufferSize,
-                                              params.vectorWidth, bufferRatio);
+                                              params.vectorWidth, bufferRatio, maxPingPongBytes);
 
     // Update params.bufferSize to the max of all per-window sizes
     // (used for kernel_config_def's backward-compat BUF_SZ global define)
@@ -697,7 +698,8 @@ findFlowTransferFor(dfscheblueprint::FlowConfigOp flowConfig, Operation *rootOp,
 // - No flow_transfer or core -> core: Skip (not a kernel parameter)
 static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
                                                         Type defaultElementType, int64_t defaultBufferSize,
-                                                        int32_t defaultVectorWidth, double bufferRatio) {
+                                                        int32_t defaultVectorWidth, double bufferRatio,
+                                                        int64_t maxPingPongBytes) {
 
     SmallVector<KernelParamInfo> params;
 
@@ -807,6 +809,16 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 int64_t pingPongBufSize = static_cast<int64_t>(perCoreSize * bufferRatio);
                 if (pingPongBufSize <= 0)
                     pingPongBufSize = 1;
+                // Clamp to maxPingPongBytes to prevent exceeding core tile memory
+                if (maxPingPongBytes > 0) {
+                    int64_t elemBytes =
+                        paramInfo.elementType.isIntOrFloat() ? paramInfo.elementType.getIntOrFloatBitWidth() / 8 : 1;
+                    if (elemBytes > 0) {
+                        int64_t maxElements = maxPingPongBytes / elemBytes;
+                        if (maxElements > 0 && pingPongBufSize > maxElements)
+                            pingPongBufSize = maxElements;
+                    }
+                }
                 // bufferSize is in units of vectors (BUF_SZ = elements / vectorWidth)
                 paramInfo.bufferSize = pingPongBufSize / defaultVectorWidth;
                 if (paramInfo.bufferSize <= 0)
@@ -901,9 +913,10 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
 // plus core tile DMA IO configuration (ConfigDmaBd, ConfigCreateIo, GetBdId, StartIo).
 struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::FlowTransferOp> {
     double bufferRatio;
+    int64_t maxPingPongBytes;
 
-    FlowTransferConversion(MLIRContext *ctx, double ratio)
-        : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), bufferRatio(ratio) {}
+    FlowTransferConversion(MLIRContext *ctx, double ratio, int64_t maxPPBytes)
+        : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), bufferRatio(ratio), maxPingPongBytes(maxPPBytes) {}
 
     mutable KernelResourceManager resourceMgr;
 
@@ -980,7 +993,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         StringRef kernelName = "dskernel_receiver";
         if (!hasDSKernelReceiver(op.getOperation(), kernelName)) {
             generateDSKernelReceiver(rewriter, loc, op.getOperation(), kernelName, kernelTensorType, bufferLen,
-                                     basePacketId, coreChannel, flowIndex, resourceMgr, bufferRatio);
+                                     basePacketId, coreChannel, flowIndex, resourceMgr, bufferRatio, maxPingPongBytes);
         }
 
         // --- Core tile DMA IO configuration (create_io + start_io) ---
@@ -1019,19 +1032,22 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     rewriter.getI32IntegerAttr(basePacketId + tileIdx), rewriter.getI32IntegerAttr(4294967295),
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0),
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(-1), Value(),
-                    /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+                    rewriter.getI32IntegerAttr(-1), // out_of_order_bd_id
+                    /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                    rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
 
                 auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
                     loc, dfschedule::IoHandleType::get(rewriter.getContext()), coreBdOp.getBdHandle(),
                     coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
-                    rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation));
+                    rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation),
+                    rewriter.getBoolAttr(false)); // enable_out_of_order
 
                 auto getBdIdOp =
                     rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());
 
-                rewriter.create<dfschedule::StartIoOp>(loc, dfschedule::EventType::get(rewriter.getContext()),
-                                                       createIoOp.getIoHandle(), getBdIdOp.getBdId(),
-                                                       rewriter.getI32IntegerAttr(flowIndex));
+                rewriter.create<dfschedule::StartIoOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(),
+                    getBdIdOp.getBdId(), rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(1));
 
                 tileIdx++;
             }
@@ -1087,7 +1103,7 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
     RewritePatternSet patterns(context);
     // FlowTransferConversion converts flow_transfer to dfschedule operations
     // It reads from FlowConfigOps to get DMA configuration
-    patterns.add<FlowTransferConversion>(context, bufferRatio_);
+    patterns.add<FlowTransferConversion>(context, bufferRatio_, maxPingPongBytes_);
     // DataSliceOp replaces with input tensor
     patterns.add<DataSliceOpConversion>(context);
     // Use unified erase pattern for ops that just need to be removed
