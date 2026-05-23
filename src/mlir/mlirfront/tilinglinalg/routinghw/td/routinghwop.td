@@ -181,7 +181,8 @@ def ConnectStreamPktSwitchPort:RoutingHWOp<"connectpktstreamswitchport"> {
         I32Attr:$localdmapktid,
         I32Attr:$localdmapkttype,
         StrAttr:$forwardmasterdirection,
-        I32Attr:$forwardmasterportidx
+        I32Attr:$forwardmasterportidx,
+        OptionalAttr<BoolAttr>:$preserveheader
      );
 
      let results = (outs

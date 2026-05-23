@@ -22,13 +22,30 @@ void RoutingDeadArgPass::runOnOperation()  {
                 continue;
             }
 
-        // Step 1: Analyze arguments to find which ones are dead.
+            // Step 1: Analyze arguments to find which ones are dead.
+            // use_empty() only checks direct uses; we must also check uses inside
+            // nested regions (e.g. emitc.if bodies) by walking all ops in the function.
             llvm::DenseSet<unsigned> deadArgIndices;
             for (unsigned i = 0; i < oldFunc.getNumArguments(); ++i) {
-                if (oldFunc.getArgument(i).use_empty()) {
+                mlir::Value arg = oldFunc.getArgument(i);
+                bool hasUses = !arg.use_empty();
+                if (!hasUses) {
+                    // Walk all nested ops to detect uses inside regions
+                    oldFunc.walk([&](mlir::Operation *op) {
+                        if (hasUses)
+                            return;
+                        for (auto operand : op->getOperands()) {
+                            if (operand == arg) {
+                                hasUses = true;
+                                return;
+                            }
+                        }
+                    });
+                }
+                if (!hasUses) {
                     deadArgIndices.insert(i);
                 }
-            }   
+            }
 
         // If no arguments are dead, there's nothing to do for this function.
             if (deadArgIndices.empty()) {
@@ -69,7 +86,12 @@ void RoutingDeadArgPass::runOnOperation()  {
                 //newFunc->setAttr(attr.getName(), attr.getValue());
             }
 
-        // Step 2c: Clone the body and map the live arguments.
+            // Step 2c: Clone the body and map the live arguments.
+            // addEntryBlock() must be called before getArgument() so the new
+            // function's body has block arguments to index into.
+            mlir::Block *newEntryBlock = newFunc.addEntryBlock();
+            mlir::Block *oldEntryBlock = &oldFunc.front();
+
             mlir::IRMapping mapping;
             unsigned newArgIdx = 0;
             for (unsigned oldArgIdx = 0; oldArgIdx < oldFunc.getNumArguments(); ++oldArgIdx) {
@@ -77,18 +99,27 @@ void RoutingDeadArgPass::runOnOperation()  {
                     mapping.map(oldFunc.getArgument(oldArgIdx), newFunc.getArgument(newArgIdx++));
                 }
             }
-            //copy the content of bb, instead of copy whole bb, as block have arg info too
-            // if copy whole block, it will conflict with arg for func
-            mlir::Block *newEntryBlock = newFunc.addEntryBlock();
-            mlir::Block *oldEntryBlock = &oldFunc.front();
+
             newEntryBlock->getOperations().splice(
                 newEntryBlock->end(),                // Point to insert at
                 oldEntryBlock->getOperations(),      // Source list of ops
                 oldEntryBlock->begin(),              // Start of range to move
                 std::prev(oldEntryBlock->end()));    // End of range (all but terminator)
 
+            // Remap operands of spliced ops: splice moves ops without
+            // remapping SSA values, so any op using an old block arg
+            // (e.g. the XAie_DevInst* dev param) still references the
+            // old function's block arg. Walk ALL ops including those
+            // inside nested regions (e.g. emitc.if bodies) and replace.
+            newFunc.walk([&](mlir::Operation *op) {
+                for (unsigned i = 0; i < op->getNumOperands(); i++) {
+                    auto mapped = mapping.lookupOrNull(op->getOperand(i));
+                    if (mapped)
+                        op->setOperand(i, mapped);
+                }
+            });
+
             // Now, clone the terminator operation, remapping its operands.
-           //lir::OpBuilder builder(&getContext());
             builder.setInsertionPointToEnd(newEntryBlock);
             builder.clone(*oldEntryBlock->getTerminator(), mapping);
             //dFunc.getBody().cloneInto(&newFunc.getBody(), mapping);

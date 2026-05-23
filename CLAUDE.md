@@ -100,13 +100,10 @@ Each dialect has `td/` (TableGen), `gen.sh` (runs mlir-tblgen), and `inc/` (gene
 
 ## Test and Verification
 
-### Unitest CLI (`pass/unitest/test.cpp`)
+### Unitest CLI 
 
 ```bash
-./test dfschedule    # Full pipeline → host.cc + kernel.cc
-./test hw            # Routing path → routing.cc
-./test test          # Path contiguity verification
-./test               # Default: runs both dfschedule and hw
+source script/aiehlc.sh --aie-version 5 --runtime-source-file ./example/tileprogram/ccode/simplematmul.cc
 ```
 
 ### End-to-End Flow

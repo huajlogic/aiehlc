@@ -43,7 +43,8 @@ if [ -z "$XILINX_VITIS" ]; then
 fi
 
 # Clean previous kernel build artifacts--to fix the _main missing error
-rm -f "${BUILD_DIR}"/chesswork/kernel* "${BUILD_DIR}"/kernel* 2>/dev/null || true
+# Only remove kernel.o and kernel ELF (not kernel_*.o from multi-kernel builds)
+rm -f "${BUILD_DIR}"/chesswork/kernel* "${BUILD_DIR}"/kernel.o "${BUILD_DIR}"/kernel 2>/dev/null || true
 
 echo "Kernel func name: ${KERNEL_FUNC_NAME}"
 

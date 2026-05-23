@@ -77,6 +77,14 @@ struct FoldDuplicateShimBdPattern : public OpRewritePattern<dfschedule::ConfigDm
         if (!tileDecl || tileDecl.getRow() != 0)
             return failure();
 
+        // Never merge packet-enabled shim BDs — OOO per-tile shim BDs have
+        // distinct packet IDs and DDR offsets for out-of-order execution.
+        // Also skip BDs with out_of_order_bd_id set (core MM2S OOO BDs).
+        if (op.getEnablePacket())
+            return failure();
+        if (static_cast<int32_t>(op.getOutOfOrderBdId()) >= 0)
+            return failure();
+
         int32_t dataId = static_cast<int32_t>(op.getDataId());
         int64_t offset = static_cast<int64_t>(op.getOffset());
         int32_t len = static_cast<int32_t>(op.getLen());
@@ -457,18 +465,29 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
                                                                         loadOp.getKernelGroup());
         launchEvent = launchOp.getEvent();
 
-        // Move all StartIoOp ops to AFTER the merged LaunchKernelGroupOp.
+        // Move only CORE-tile StartIoOp ops to AFTER the merged LaunchKernelGroupOp.
         // ELF loading (triggered by LoadKernelGroupOp) zeroes BSS in core
         // tile memory.  If core S2MM DMA StartIoOps fire before the ELF load,
-        // DMA-written data gets overwritten with zeros.  By placing StartIoOps
+        // DMA-written data gets overwritten with zeros.  By placing core StartIoOps
         // after the launch, the ELF is fully loaded before DMAs start writing.
-        SmallVector<Operation *> startIoOps;
+        // Shim StartIoOps remain in their original position (before load_kernel_group)
+        // so that shim DMA channels are armed first.
+        SmallVector<Operation *> coreStartIoOps;
         for (Operation &op : *hostBody) {
-            if (isa<dfschedule::StartIoOp>(&op))
-                startIoOps.push_back(&op);
+            if (auto startIo = dyn_cast<dfschedule::StartIoOp>(&op)) {
+                // Trace: StartIoOp → io_handle (ConfigCreateIoOp) → tile (DeclareTileOp)
+                bool isShim = false;
+                if (auto createIo = startIo.getIoHandle().getDefiningOp<dfschedule::ConfigCreateIoOp>()) {
+                    if (auto declareTile = createIo.getTile().getDefiningOp<dfschedule::DeclareTileOp>()) {
+                        isShim = (declareTile.getRow() == 0);
+                    }
+                }
+                if (!isShim)
+                    coreStartIoOps.push_back(&op);
+            }
         }
         Operation *insertAfter = launchOp;
-        for (Operation *op : startIoOps) {
+        for (Operation *op : coreStartIoOps) {
             op->moveAfter(insertAfter);
             insertAfter = op;
         }

@@ -26,13 +26,89 @@
 
   "masters": [
 
+    {
 
+      "index": 12,
+
+      "port": "NORTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x05",
+
+      "raw": "0x80000005"
+
+    },
+
+    {
+
+      "index": 13,
+
+      "port": "NORTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x09",
+
+      "raw": "0x80000009"
+
+    }
 
   ],
 
   "slaves": [
 
+    {
 
+      "index": 5,
+
+      "port": "SOUTH3",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 9,
+
+      "port": "SOUTH7",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    }
 
   ]
 
@@ -46,13 +122,89 @@
 
   "masters": [
 
+    {
 
+      "index": 11,
+
+      "port": "NORTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x07",
+
+      "raw": "0x80000007"
+
+    },
+
+    {
+
+      "index": 12,
+
+      "port": "NORTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x08",
+
+      "raw": "0x80000008"
+
+    }
 
   ],
 
   "slaves": [
 
+    {
 
+      "index": 7,
+
+      "port": "SOUTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 8,
+
+      "port": "SOUTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    }
 
   ]
 
@@ -66,13 +218,89 @@
 
   "masters": [
 
+    {
 
+      "index": 11,
+
+      "port": "NORTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x07",
+
+      "raw": "0x80000007"
+
+    },
+
+    {
+
+      "index": 12,
+
+      "port": "NORTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x08",
+
+      "raw": "0x80000008"
+
+    }
 
   ],
 
   "slaves": [
 
+    {
 
+      "index": 7,
+
+      "port": "SOUTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 8,
+
+      "port": "SOUTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    }
 
   ]
 
@@ -100,9 +328,9 @@
 
       "drop_header": false,
 
-      "config": "0x13",
+      "config": "0x06",
 
-      "raw": "0x80000013"
+      "raw": "0x80000006"
 
     },
 
@@ -120,9 +348,9 @@
 
       "drop_header": false,
 
-      "config": "0x0F",
+      "config": "0x05",
 
-      "raw": "0x8000000F"
+      "raw": "0x80000005"
 
     },
 
@@ -140,9 +368,9 @@
 
       "drop_header": false,
 
-      "config": "0x14",
+      "config": "0x05",
 
-      "raw": "0x80000014"
+      "raw": "0x80000005"
 
     },
 
@@ -160,9 +388,9 @@
 
       "drop_header": false,
 
-      "config": "0x15",
+      "config": "0x13",
 
-      "raw": "0x80000015"
+      "raw": "0x80000013"
 
     },
 
@@ -180,9 +408,29 @@
 
       "drop_header": false,
 
-      "config": "0x16",
+      "config": "0x14",
 
-      "raw": "0x80000016"
+      "raw": "0x80000014"
+
+    },
+
+    {
+
+      "index": 16,
+
+      "port": "NORTH3",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x15",
+
+      "raw": "0x80000015"
 
     },
 
@@ -191,6 +439,26 @@
       "index": 19,
 
       "port": "EAST0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x06",
+
+      "raw": "0x80000006"
+
+    },
+
+    {
+
+      "index": 20,
+
+      "port": "EAST1",
 
       "switch_type": "PKT",
 
@@ -254,9 +522,29 @@
 
     {
 
-      "index": 15,
+      "index": 5,
 
-      "port": "NORTH0",
+      "port": "SOUTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 6,
+
+      "port": "SOUTH1",
 
       "switch_type": "CIRC",
 
@@ -330,26 +618,6 @@
 
       ]
 
-    },
-
-    {
-
-      "index": 22,
-
-      "port": "EAST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
     }
 
   ]
@@ -378,9 +646,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x06",
 
-      "raw": "0x80000005"
+      "raw": "0x80000006"
 
     },
 
@@ -398,29 +666,9 @@
 
       "drop_header": false,
 
-      "config": "0x14",
+      "config": "0x05",
 
-      "raw": "0x80000014"
-
-    },
-
-    {
-
-      "index": 5,
-
-      "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x13",
-
-      "raw": "0x80000013"
+      "raw": "0x80000005"
 
     },
 
@@ -438,9 +686,9 @@
 
       "drop_header": false,
 
-      "config": "0x06",
+      "config": "0x05",
 
-      "raw": "0x80000006"
+      "raw": "0x80000005"
 
     },
 
@@ -478,9 +726,9 @@
 
       "drop_header": false,
 
-      "config": "0x15",
+      "config": "0x08",
 
-      "raw": "0x80000015"
+      "raw": "0x80000008"
 
     },
 
@@ -612,49 +860,9 @@
 
     {
 
-      "index": 19,
+      "index": 8,
 
-      "port": "EAST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 20,
-
-      "port": "EAST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 21,
-
-      "port": "EAST2",
+      "port": "SOUTH3",
 
       "switch_type": "CIRC",
 
@@ -696,9 +904,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x06",
 
-      "raw": "0x80000005"
+      "raw": "0x80000006"
 
     },
 
@@ -716,9 +924,9 @@
 
       "drop_header": false,
 
-      "config": "0x07",
+      "config": "0x05",
 
-      "raw": "0x80000007"
+      "raw": "0x80000005"
 
     },
 
@@ -736,9 +944,9 @@
 
       "drop_header": false,
 
-      "config": "0x06",
+      "config": "0x05",
 
-      "raw": "0x80000006"
+      "raw": "0x80000005"
 
     },
 
@@ -756,9 +964,9 @@
 
       "drop_header": false,
 
-      "config": "0x13",
+      "config": "0x07",
 
-      "raw": "0x80000013"
+      "raw": "0x80000007"
 
     },
 
@@ -776,9 +984,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x06",
 
-      "raw": "0x80000005"
+      "raw": "0x80000006"
 
     },
 
@@ -906,26 +1114,6 @@
 
       ]
 
-    },
-
-    {
-
-      "index": 19,
-
-      "port": "EAST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
     }
 
   ]
@@ -954,9 +1142,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x06",
 
-      "raw": "0x80000005"
+      "raw": "0x80000006"
 
     },
 
@@ -974,9 +1162,9 @@
 
       "drop_header": false,
 
-      "config": "0x06",
+      "config": "0x05",
 
-      "raw": "0x80000006"
+      "raw": "0x80000005"
 
     },
 
@@ -994,9 +1182,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x06",
 
-      "raw": "0x80000005"
+      "raw": "0x80000006"
 
     },
 
@@ -1118,13 +1306,89 @@
 
   "masters": [
 
+    {
 
+      "index": 12,
+
+      "port": "NORTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x05",
+
+      "raw": "0x80000005"
+
+    },
+
+    {
+
+      "index": 13,
+
+      "port": "NORTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x09",
+
+      "raw": "0x80000009"
+
+    }
 
   ],
 
   "slaves": [
 
+    {
 
+      "index": 5,
+
+      "port": "SOUTH3",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 9,
+
+      "port": "SOUTH7",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    }
 
   ]
 
@@ -1138,13 +1402,89 @@
 
   "masters": [
 
+    {
 
+      "index": 11,
+
+      "port": "NORTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x07",
+
+      "raw": "0x80000007"
+
+    },
+
+    {
+
+      "index": 12,
+
+      "port": "NORTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x08",
+
+      "raw": "0x80000008"
+
+    }
 
   ],
 
   "slaves": [
 
+    {
 
+      "index": 7,
+
+      "port": "SOUTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 8,
+
+      "port": "SOUTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    }
 
   ]
 
@@ -1158,13 +1498,89 @@
 
   "masters": [
 
+    {
 
+      "index": 11,
+
+      "port": "NORTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x07",
+
+      "raw": "0x80000007"
+
+    },
+
+    {
+
+      "index": 12,
+
+      "port": "NORTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x08",
+
+      "raw": "0x80000008"
+
+    }
 
   ],
 
   "slaves": [
 
+    {
 
+      "index": 7,
+
+      "port": "SOUTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 8,
+
+      "port": "SOUTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    }
 
   ]
 
@@ -1192,9 +1608,9 @@
 
       "drop_header": false,
 
-      "config": "0x13",
+      "config": "0x0B",
 
-      "raw": "0x80000013"
+      "raw": "0x8000000B"
 
     },
 
@@ -1212,9 +1628,9 @@
 
       "drop_header": false,
 
-      "config": "0x0F",
+      "config": "0x05",
 
-      "raw": "0x8000000F"
+      "raw": "0x80000005"
 
     },
 
@@ -1232,9 +1648,9 @@
 
       "drop_header": false,
 
-      "config": "0x13",
+      "config": "0x06",
 
-      "raw": "0x80000013"
+      "raw": "0x80000006"
 
     },
 
@@ -1252,9 +1668,9 @@
 
       "drop_header": false,
 
-      "config": "0x14",
+      "config": "0x13",
 
-      "raw": "0x80000014"
+      "raw": "0x80000013"
 
     },
 
@@ -1272,29 +1688,9 @@
 
       "drop_header": false,
 
-      "config": "0x15",
+      "config": "0x14",
 
-      "raw": "0x80000015"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "WEST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x16",
-
-      "raw": "0x80000016"
+      "raw": "0x80000014"
 
     },
 
@@ -1312,9 +1708,29 @@
 
       "drop_header": false,
 
-      "config": "0x14",
+      "config": "0x05",
 
-      "raw": "0x80000014"
+      "raw": "0x80000005"
+
+    },
+
+    {
+
+      "index": 14,
+
+      "port": "NORTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x06",
+
+      "raw": "0x80000006"
 
     },
 
@@ -1323,6 +1739,26 @@
       "index": 19,
 
       "port": "EAST0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x0B",
+
+      "raw": "0x8000000B"
+
+    },
+
+    {
+
+      "index": 20,
+
+      "port": "EAST1",
 
       "switch_type": "PKT",
 
@@ -1386,9 +1822,69 @@
 
     {
 
+      "index": 5,
+
+      "port": "SOUTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 6,
+
+      "port": "SOUTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
       "index": 11,
 
       "port": "WEST0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 12,
+
+      "port": "WEST1",
 
       "switch_type": "PKT",
 
@@ -1419,26 +1915,6 @@
           "raw": "0x00000100"
 
         }
-
-      ]
-
-    },
-
-    {
-
-      "index": 15,
-
-      "port": "NORTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
 
       ]
 
@@ -1482,46 +1958,6 @@
 
       ]
 
-    },
-
-    {
-
-      "index": 21,
-
-      "port": "EAST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 22,
-
-      "port": "EAST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
     }
 
   ]
@@ -1550,9 +1986,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x06",
 
-      "raw": "0x80000005"
+      "raw": "0x80000006"
 
     },
 
@@ -1570,69 +2006,9 @@
 
       "drop_header": false,
 
-      "config": "0x15",
+      "config": "0x05",
 
-      "raw": "0x80000015"
-
-    },
-
-    {
-
-      "index": 5,
-
-      "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x14",
-
-      "raw": "0x80000014"
-
-    },
-
-    {
-
-      "index": 10,
-
-      "port": "WEST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x15",
-
-      "raw": "0x80000015"
-
-    },
-
-    {
-
-      "index": 11,
-
-      "port": "WEST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x16",
-
-      "raw": "0x80000016"
+      "raw": "0x80000005"
 
     },
 
@@ -1650,9 +2026,9 @@
 
       "drop_header": false,
 
-      "config": "0x16",
+      "config": "0x05",
 
-      "raw": "0x80000016"
+      "raw": "0x80000005"
 
     },
 
@@ -1661,6 +2037,26 @@
       "index": 19,
 
       "port": "EAST0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x06",
+
+      "raw": "0x80000006"
+
+    },
+
+    {
+
+      "index": 20,
+
+      "port": "EAST1",
 
       "switch_type": "PKT",
 
@@ -1744,6 +2140,26 @@
 
     {
 
+      "index": 6,
+
+      "port": "SOUTH1",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
       "index": 11,
 
       "port": "WEST0",
@@ -1777,66 +2193,6 @@
           "raw": "0x00000100"
 
         }
-
-      ]
-
-    },
-
-    {
-
-      "index": 20,
-
-      "port": "EAST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 21,
-
-      "port": "EAST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 22,
-
-      "port": "EAST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
 
       ]
 
@@ -1896,26 +2252,6 @@
 
     {
 
-      "index": 9,
-
-      "port": "WEST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x13",
-
-      "raw": "0x80000013"
-
-    },
-
-    {
-
       "index": 13,
 
       "port": "NORTH0",
@@ -1928,9 +2264,9 @@
 
       "drop_header": false,
 
-      "config": "0x13",
+      "config": "0x05",
 
-      "raw": "0x80000013"
+      "raw": "0x80000005"
 
     },
 
@@ -2095,26 +2431,6 @@
           "raw": "0x00000100"
 
         }
-
-      ]
-
-    },
-
-    {
-
-      "index": 19,
-
-      "port": "EAST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
 
       ]
 
@@ -2892,9 +3208,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x0B",
 
-      "raw": "0x80000005"
+      "raw": "0x8000000B"
 
     },
 
@@ -2912,9 +3228,9 @@
 
       "drop_header": false,
 
-      "config": "0x15",
+      "config": "0x05",
 
-      "raw": "0x80000015"
+      "raw": "0x80000005"
 
     },
 
@@ -2932,9 +3248,9 @@
 
       "drop_header": false,
 
-      "config": "0x0F",
+      "config": "0x13",
 
-      "raw": "0x8000000F"
+      "raw": "0x80000013"
 
     },
 
@@ -2952,9 +3268,9 @@
 
       "drop_header": false,
 
-      "config": "0x10",
+      "config": "0x15",
 
-      "raw": "0x80000010"
+      "raw": "0x80000015"
 
     },
 
@@ -2972,26 +3288,6 @@
 
       "drop_header": false,
 
-      "config": "0x05",
-
-      "raw": "0x80000005"
-
-    },
-
-    {
-
-      "index": 10,
-
-      "port": "WEST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
       "config": "0x06",
 
       "raw": "0x80000006"
@@ -3000,29 +3296,9 @@
 
     {
 
-      "index": 11,
+      "index": 10,
 
-      "port": "WEST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x13",
-
-      "raw": "0x80000013"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "WEST3",
+      "port": "WEST1",
 
       "switch_type": "CIRC",
 
@@ -3052,69 +3328,9 @@
 
       "drop_header": false,
 
-      "config": "0x06",
+      "config": "0x05",
 
-      "raw": "0x80000006"
-
-    },
-
-    {
-
-      "index": 14,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x15",
-
-      "raw": "0x80000015"
-
-    },
-
-    {
-
-      "index": 15,
-
-      "port": "NORTH2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x15",
-
-      "raw": "0x80000015"
-
-    },
-
-    {
-
-      "index": 16,
-
-      "port": "NORTH3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x16",
-
-      "raw": "0x80000016"
+      "raw": "0x80000005"
 
     },
 
@@ -3132,9 +3348,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x0B",
 
-      "raw": "0x80000005"
+      "raw": "0x8000000B"
 
     },
 
@@ -3250,6 +3466,26 @@
 
       "port": "WEST0",
 
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 12,
+
+      "port": "WEST1",
+
       "switch_type": "PKT",
 
       "enabled": true,
@@ -3279,46 +3515,6 @@
           "raw": "0x00000100"
 
         }
-
-      ]
-
-    },
-
-    {
-
-      "index": 15,
-
-      "port": "NORTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 16,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
 
       ]
 
@@ -3382,26 +3578,6 @@
 
       ]
 
-    },
-
-    {
-
-      "index": 22,
-
-      "port": "EAST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
     }
 
   ]
@@ -3430,9 +3606,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x0B",
 
-      "raw": "0x80000005"
+      "raw": "0x8000000B"
 
     },
 
@@ -3450,109 +3626,9 @@
 
       "drop_header": false,
 
-      "config": "0x08",
+      "config": "0x05",
 
-      "raw": "0x80000008"
-
-    },
-
-    {
-
-      "index": 5,
-
-      "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x15",
-
-      "raw": "0x80000015"
-
-    },
-
-    {
-
-      "index": 6,
-
-      "port": "SOUTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x16",
-
-      "raw": "0x80000016"
-
-    },
-
-    {
-
-      "index": 10,
-
-      "port": "WEST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x07",
-
-      "raw": "0x80000007"
-
-    },
-
-    {
-
-      "index": 11,
-
-      "port": "WEST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x08",
-
-      "raw": "0x80000008"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "WEST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x13",
-
-      "raw": "0x80000013"
+      "raw": "0x80000005"
 
     },
 
@@ -3570,29 +3646,9 @@
 
       "drop_header": false,
 
-      "config": "0x13",
+      "config": "0x05",
 
-      "raw": "0x80000013"
-
-    },
-
-    {
-
-      "index": 14,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x14",
-
-      "raw": "0x80000014"
+      "raw": "0x80000005"
 
     },
 
@@ -3610,9 +3666,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x0B",
 
-      "raw": "0x80000005"
+      "raw": "0x8000000B"
 
     },
 
@@ -3704,49 +3760,29 @@
 
     {
 
-      "index": 7,
-
-      "port": "SOUTH2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 8,
-
-      "port": "SOUTH3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
       "index": 11,
 
       "port": "WEST0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
+      "index": 12,
+
+      "port": "WEST1",
 
       "switch_type": "PKT",
 
@@ -3777,86 +3813,6 @@
           "raw": "0x00000100"
 
         }
-
-      ]
-
-    },
-
-    {
-
-      "index": 19,
-
-      "port": "EAST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 20,
-
-      "port": "EAST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 21,
-
-      "port": "EAST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 22,
-
-      "port": "EAST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
 
       ]
 
@@ -3916,26 +3872,6 @@
 
     {
 
-      "index": 9,
-
-      "port": "WEST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x06",
-
-      "raw": "0x80000006"
-
-    },
-
-    {
-
       "index": 13,
 
       "port": "NORTH0",
@@ -3948,9 +3884,9 @@
 
       "drop_header": false,
 
-      "config": "0x06",
+      "config": "0x05",
 
-      "raw": "0x80000006"
+      "raw": "0x80000005"
 
     },
 
@@ -4045,26 +3981,6 @@
       "index": 5,
 
       "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 6,
-
-      "port": "SOUTH1",
 
       "switch_type": "CIRC",
 
@@ -4217,26 +4133,6 @@
       "index": 20,
 
       "port": "EAST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x05",
-
-      "raw": "0x80000005"
-
-    },
-
-    {
-
-      "index": 21,
-
-      "port": "EAST2",
 
       "switch_type": "PKT",
 
@@ -4952,9 +4848,9 @@
 
       "drop_header": false,
 
-      "config": "0x13",
+      "config": "0x05",
 
-      "raw": "0x80000013"
+      "raw": "0x80000005"
 
     },
 
@@ -4970,13 +4866,13 @@
 
       "packet_switch": true,
 
-      "drop_header": true,
+      "drop_header": false,
 
-      "drop_header_note": "DROP_HEADER (strip pkt hdr before forwarding — last PKT-SW hop)",
+      "drop_header_note": "DONOT_DROP_HEADER (preserve pkt hdr for downstream PKT-SW slave)",
 
       "config": "0x08",
 
-      "raw": "0xC0000088"
+      "raw": "0xC0000008"
 
     },
 
@@ -5014,9 +4910,9 @@
 
       "drop_header": false,
 
-      "config": "0x05",
+      "config": "0x10",
 
-      "raw": "0x80000005"
+      "raw": "0x80000010"
 
     },
 
@@ -5054,29 +4950,9 @@
 
       "drop_header": false,
 
-      "config": "0x13",
+      "config": "0x11",
 
-      "raw": "0x80000013"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "WEST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x14",
-
-      "raw": "0x80000014"
+      "raw": "0x80000011"
 
     },
 
@@ -5094,49 +4970,9 @@
 
       "drop_header": false,
 
-      "config": "0x14",
+      "config": "0x05",
 
-      "raw": "0x80000014"
-
-    },
-
-    {
-
-      "index": 14,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x15",
-
-      "raw": "0x80000015"
-
-    },
-
-    {
-
-      "index": 15,
-
-      "port": "NORTH2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x16",
-
-      "raw": "0x80000016"
+      "raw": "0x80000005"
 
     }
 
@@ -5306,29 +5142,9 @@
 
     {
 
-      "index": 19,
+      "index": 16,
 
-      "port": "EAST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 20,
-
-      "port": "EAST1",
+      "port": "NORTH1",
 
       "switch_type": "CIRC",
 
@@ -5346,29 +5162,9 @@
 
     {
 
-      "index": 21,
+      "index": 17,
 
-      "port": "EAST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 22,
-
-      "port": "EAST3",
+      "port": "NORTH2",
 
       "switch_type": "CIRC",
 
@@ -5448,61 +5244,21 @@
 
       "packet_switch": true,
 
-      "drop_header": true,
+      "drop_header": false,
 
-      "drop_header_note": "DROP_HEADER (strip pkt hdr before forwarding — last PKT-SW hop)",
+      "drop_header_note": "DONOT_DROP_HEADER (preserve pkt hdr for downstream PKT-SW slave)",
 
       "config": "0x08",
 
-      "raw": "0xC0000088"
+      "raw": "0xC0000008"
 
     },
 
     {
 
-      "index": 9,
+      "index": 6,
 
-      "port": "WEST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x06",
-
-      "raw": "0x80000006"
-
-    },
-
-    {
-
-      "index": 10,
-
-      "port": "WEST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x07",
-
-      "raw": "0x80000007"
-
-    },
-
-    {
-
-      "index": 11,
-
-      "port": "WEST2",
+      "port": "SOUTH1",
 
       "switch_type": "CIRC",
 
@@ -5520,9 +5276,9 @@
 
     {
 
-      "index": 12,
+      "index": 7,
 
-      "port": "WEST3",
+      "port": "SOUTH2",
 
       "switch_type": "CIRC",
 
@@ -5552,9 +5308,9 @@
 
       "drop_header": false,
 
-      "config": "0x06",
+      "config": "0x05",
 
-      "raw": "0x80000006"
+      "raw": "0x80000005"
 
     }
 
@@ -5607,46 +5363,6 @@
       "index": 5,
 
       "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 6,
-
-      "port": "SOUTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 7,
-
-      "port": "SOUTH2",
 
       "switch_type": "CIRC",
 
@@ -5826,13 +5542,13 @@
 
       "packet_switch": true,
 
-      "drop_header": true,
+      "drop_header": false,
 
-      "drop_header_note": "DROP_HEADER (strip pkt hdr before forwarding — last PKT-SW hop)",
+      "drop_header_note": "DONOT_DROP_HEADER (preserve pkt hdr for downstream PKT-SW slave)",
 
       "config": "0x08",
 
-      "raw": "0xC0000088"
+      "raw": "0xC0000008"
 
     },
 
@@ -5853,6 +5569,26 @@
       "config": "0x0F",
 
       "raw": "0x8000000F"
+
+    },
+
+    {
+
+      "index": 13,
+
+      "port": "NORTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "packet_switch": false,
+
+      "drop_header": false,
+
+      "config": "0x05",
+
+      "raw": "0x80000005"
 
     }
 
@@ -6046,9 +5782,9 @@
 
       "drop_header": false,
 
-      "config": "0x0C",
+      "config": "0x05",
 
-      "raw": "0x8000000C"
+      "raw": "0x80000005"
 
     },
 
@@ -6064,13 +5800,13 @@
 
       "packet_switch": true,
 
-      "drop_header": true,
+      "drop_header": false,
 
-      "drop_header_note": "DROP_HEADER (strip pkt hdr before forwarding — last PKT-SW hop)",
+      "drop_header_note": "DONOT_DROP_HEADER (preserve pkt hdr for downstream PKT-SW slave)",
 
       "config": "0x08",
 
-      "raw": "0xC0000088"
+      "raw": "0xC0000008"
 
     }
 
@@ -6120,6 +5856,26 @@
 
     {
 
+      "index": 5,
+
+      "port": "SOUTH0",
+
+      "switch_type": "CIRC",
+
+      "enabled": true,
+
+      "raw": "0x80000000",
+
+      "slots": [
+
+
+
+      ]
+
+    },
+
+    {
+
       "index": 11,
 
       "port": "WEST0",
@@ -6143,26 +5899,6 @@
       "index": 12,
 
       "port": "WEST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 13,
-
-      "port": "WEST2",
 
       "switch_type": "PKT",
 
@@ -6197,1566 +5933,6 @@
       ]
 
     }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 4, "row": 0, "type": "SHIM"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 4, "row": 1, "type": "MEMTILE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 4, "row": 2, "type": "MEMTILE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 4, "row": 3, "type": "CORE"},
-
-  "masters": [
-
-    {
-
-      "index": 9,
-
-      "port": "WEST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x13",
-
-      "raw": "0x80000013"
-
-    },
-
-    {
-
-      "index": 10,
-
-      "port": "WEST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x14",
-
-      "raw": "0x80000014"
-
-    },
-
-    {
-
-      "index": 11,
-
-      "port": "WEST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x15",
-
-      "raw": "0x80000015"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "WEST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x16",
-
-      "raw": "0x80000016"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 19,
-
-      "port": "EAST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 20,
-
-      "port": "EAST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 21,
-
-      "port": "EAST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 22,
-
-      "port": "EAST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 4, "row": 4, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 4, "row": 5, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 4, "row": 6, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 5, "row": 0, "type": "SHIM"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 5, "row": 1, "type": "MEMTILE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 5, "row": 2, "type": "MEMTILE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 5, "row": 3, "type": "CORE"},
-
-  "masters": [
-
-    {
-
-      "index": 9,
-
-      "port": "WEST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x13",
-
-      "raw": "0x80000013"
-
-    },
-
-    {
-
-      "index": 10,
-
-      "port": "WEST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x14",
-
-      "raw": "0x80000014"
-
-    },
-
-    {
-
-      "index": 11,
-
-      "port": "WEST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x15",
-
-      "raw": "0x80000015"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "WEST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x16",
-
-      "raw": "0x80000016"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 19,
-
-      "port": "EAST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 20,
-
-      "port": "EAST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 21,
-
-      "port": "EAST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 22,
-
-      "port": "EAST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 5, "row": 4, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 5, "row": 5, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 5, "row": 6, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 6, "row": 0, "type": "SHIM"},
-
-  "masters": [
-
-    {
-
-      "index": 12,
-
-      "port": "NORTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x05",
-
-      "raw": "0x80000005"
-
-    },
-
-    {
-
-      "index": 13,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x09",
-
-      "raw": "0x80000009"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 5,
-
-      "port": "SOUTH3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 9,
-
-      "port": "SOUTH7",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 6, "row": 1, "type": "MEMTILE"},
-
-  "masters": [
-
-    {
-
-      "index": 11,
-
-      "port": "NORTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x07",
-
-      "raw": "0x80000007"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x08",
-
-      "raw": "0x80000008"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 7,
-
-      "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 8,
-
-      "port": "SOUTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 6, "row": 2, "type": "MEMTILE"},
-
-  "masters": [
-
-    {
-
-      "index": 11,
-
-      "port": "NORTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x07",
-
-      "raw": "0x80000007"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x08",
-
-      "raw": "0x80000008"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 7,
-
-      "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 8,
-
-      "port": "SOUTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 6, "row": 3, "type": "CORE"},
-
-  "masters": [
-
-    {
-
-      "index": 9,
-
-      "port": "WEST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x05",
-
-      "raw": "0x80000005"
-
-    },
-
-    {
-
-      "index": 10,
-
-      "port": "WEST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x06",
-
-      "raw": "0x80000006"
-
-    },
-
-    {
-
-      "index": 11,
-
-      "port": "WEST2",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x13",
-
-      "raw": "0x80000013"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "WEST3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x14",
-
-      "raw": "0x80000014"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 5,
-
-      "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 6,
-
-      "port": "SOUTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 19,
-
-      "port": "EAST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 20,
-
-      "port": "EAST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 6, "row": 4, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 6, "row": 5, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 6, "row": 6, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 7, "row": 0, "type": "SHIM"},
-
-  "masters": [
-
-    {
-
-      "index": 12,
-
-      "port": "NORTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x05",
-
-      "raw": "0x80000005"
-
-    },
-
-    {
-
-      "index": 13,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x09",
-
-      "raw": "0x80000009"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 5,
-
-      "port": "SOUTH3",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 9,
-
-      "port": "SOUTH7",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 7, "row": 1, "type": "MEMTILE"},
-
-  "masters": [
-
-    {
-
-      "index": 11,
-
-      "port": "NORTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x07",
-
-      "raw": "0x80000007"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x08",
-
-      "raw": "0x80000008"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 7,
-
-      "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 8,
-
-      "port": "SOUTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 7, "row": 2, "type": "MEMTILE"},
-
-  "masters": [
-
-    {
-
-      "index": 11,
-
-      "port": "NORTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x07",
-
-      "raw": "0x80000007"
-
-    },
-
-    {
-
-      "index": 12,
-
-      "port": "NORTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x08",
-
-      "raw": "0x80000008"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 7,
-
-      "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 8,
-
-      "port": "SOUTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 7, "row": 3, "type": "CORE"},
-
-  "masters": [
-
-    {
-
-      "index": 9,
-
-      "port": "WEST0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x05",
-
-      "raw": "0x80000005"
-
-    },
-
-    {
-
-      "index": 10,
-
-      "port": "WEST1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "packet_switch": false,
-
-      "drop_header": false,
-
-      "config": "0x06",
-
-      "raw": "0x80000006"
-
-    }
-
-  ],
-
-  "slaves": [
-
-    {
-
-      "index": 5,
-
-      "port": "SOUTH0",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    },
-
-    {
-
-      "index": 6,
-
-      "port": "SOUTH1",
-
-      "switch_type": "CIRC",
-
-      "enabled": true,
-
-      "raw": "0x80000000",
-
-      "slots": [
-
-
-
-      ]
-
-    }
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 7, "row": 4, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 7, "row": 5, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
-
-  ]
-
-}
-
-,
-
-{
-
-  "tile": {"col": 7, "row": 6, "type": "CORE"},
-
-  "masters": [
-
-
-
-  ],
-
-  "slaves": [
-
-
 
   ]
 

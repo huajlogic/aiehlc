@@ -47,12 +47,9 @@ struct EnableExtToAieShimPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
             ValueRange{colConstOp, rowConstOp});
 
-        //get the device instance
-        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
-        auto devInstPtrType = emitc::PointerType::get(devInstType);
-        auto deviceInstOp = rewriter.create<emitc::CallOp>(
-                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
-        Value deviceInst = deviceInstOp.getResult(0);
+        // get the device instance from parent function's first argument (XAie_DevInst* dev)
+        auto parentFunc = op->getParentOfType<func::FuncOp>();
+        Value deviceInst = parentFunc.getArgument(0);
 
         StringRef callee = "XAie_EnableShimDmaToAieStrmPort";
         Value arg0 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(portidx));
@@ -104,12 +101,9 @@ struct EnableAieToExtShimPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
             ValueRange{colConstOp, rowConstOp});
 
-        //get the device instance
-        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
-        auto devInstPtrType = emitc::PointerType::get(devInstType);
-        auto deviceInstOp = rewriter.create<emitc::CallOp>(
-                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
-        Value deviceInst = deviceInstOp.getResult(0);
+        // get the device instance from parent function's first argument (XAie_DevInst* dev)
+        auto parentFunc = op->getParentOfType<func::FuncOp>();
+        Value deviceInst = parentFunc.getArgument(0);
 
         StringRef callee = "XAie_EnableAieToShimDmaStrmPort";
         Value arg0 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(portidx));
@@ -215,13 +209,9 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
             ValueRange{colConstOp, rowConstOp});
 
-        
-
-        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
-        auto devInstPtrType = emitc::PointerType::get(devInstType);
-        auto deviceInstOp = rewriter.create<emitc::CallOp>(
-                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
-        Value deviceInst = deviceInstOp.getResult(0);
+        // get the device instance from parent function's first argument (XAie_DevInst* dev)
+        auto parentFunc = op->getParentOfType<func::FuncOp>();
+        Value deviceInst = parentFunc.getArgument(0);
         //slave port enable
         StringRef calleeS = "XAie_StrmPktSwSlaveSlotEnable";
          //string type
@@ -289,15 +279,20 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(1));
             Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
 
-            // DROP_HEADER only at the PKT→CIRC transition (last PKT hop).
+            // DROP_HEADER only at the PKT→CIRC transition (last PKT hop),
+            // UNLESS preserveheader=true (OOO mode needs headers at shim S2MM).
             // The transition op has both slave=NONE and DMA=NONE (it's the second op
             // of the last PKT tile, created by ParseTheCCTRoutingPath).
             // Intermediate PKT hops must preserve the header so the next PKT slave
             // can read it; dropping early causes the downstream PKT switch to consume
             // a data word as a fake header, losing one element per BD.
+            bool preserveHeader = false;
+            if (auto phAttr = op->getAttrOfType<BoolAttr>("preserveheader"))
+                preserveHeader = phAttr.getValue();
             bool isLastPktHop = (slaveportdirectionstr == PortDirectiontoString(PortDirection::NONE) &&
                                  dmadirectionstr == PortDirectiontoString(PortDirection::NONE));
-            auto headerPolicy = isLastPktHop ? dropheader : nodropheader;
+            // When preserveheader=true, always keep headers (OOO BD dispatch needs them)
+            auto headerPolicy = (isLastPktHop && !preserveHeader) ? dropheader : nodropheader;
             Value dropheadervalue = rewriter.create<mlir::emitc::ConstantOp>(
                 op->getLoc(), stringType1, mlir::emitc::OpaqueAttr::get(rewriter.getContext(), headerPolicy));
             auto callOpMport = rewriter.create<mlir::emitc::CallOp>(
@@ -377,11 +372,9 @@ struct ConnectStreamSingleSwitchPortpattern: public ConversionPattern {
             op->getLoc(), "XAie_TileLoc", TypeRange{tileLocType}, 
             ValueRange{colConstOp, rowConstOp});
 
-        auto devInstType = emitc::OpaqueType::get(rewriter.getContext(), "XAie_DevInst");
-        auto devInstPtrType = emitc::PointerType::get(devInstType);
-        auto deviceInstOp = rewriter.create<emitc::CallOp>(
-                op->getLoc(), "getOrCreateDeviceInstance", TypeRange{devInstPtrType}, ValueRange{});
-        Value deviceInst = deviceInstOp.getResult(0);
+        // get the device instance from parent function's first argument (XAie_DevInst* dev)
+        auto parentFunc = op->getParentOfType<func::FuncOp>();
+        Value deviceInst = parentFunc.getArgument(0);
 
         StringRef callee = "XAie_StrmConnCctEnable";
          //string type
@@ -650,9 +643,6 @@ void declareAieTileFunction(mlir::ModuleOp module) {
   auto decl1 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_TileLoc", funcType);
   decl1.setVisibility(SymbolTable::Visibility::Private);
 
-  auto decl2 = builder.create<emitc::FuncOp>(module.getLoc(), "getOrCreateDeviceInstance", getdevInstType);
-  decl2.setVisibility(SymbolTable::Visibility::Private);
-
   auto decl3 = builder.create<emitc::FuncOp>(module.getLoc(), "XAie_EnableShimDmaToAieStrmPort", shimportenableType);
   decl3.setVisibility(SymbolTable::Visibility::Private);
 
@@ -715,16 +705,12 @@ void RoutingHWLowerPass::runOnOperation() {
         llvm::outs() << "applyPartialConversion failed\n";
     }
 
-    std::string cppOutput;
-    llvm::raw_string_ostream os(cppOutput);
-
     //remove the dead code
-    
+
     mlir::RewritePatternSet patternscde(&ctx);
     for (auto* dialect : ctx.getLoadedDialects()) {
         dialect->getCanonicalizationPatterns(patternscde);
     }
-   // /*
     for (mlir::RegisteredOperationName op : ctx.getRegisteredOperations()) {
         op.getCanonicalizationPatterns(patternscde, &ctx);
     }
@@ -733,19 +719,4 @@ void RoutingHWLowerPass::runOnOperation() {
                 // Handle error
         signalPassFailure();
     }
-    
-
-  // This is the core translation call.
-  // It takes the module and an output stream.
-    if (mlir::failed(mlir::emitc::translateToCpp(module, os))) {
-        llvm::errs() << "Failed to translate MLIR to C++.\n";
-        return;
-    }
-    //*/
-
-
-
-  // 4. Print the resulting C++ code.
-    std::cout << "--- Generated C++ Code ---\n" << os.str() << std::endl;
-       // */
 };

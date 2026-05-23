@@ -4,12 +4,16 @@
 ******************************************************************************/
 
 #include "../../include/gcommon.h"
+#include "clang/AST/APValue.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
+#include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/Pragma.h"
+#include "clang/Lex/Preprocessor.h"
 #include "clang/Rewrite/Core/Rewriter.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
@@ -44,18 +48,86 @@ struct ParsedTensorInfo {
     int elementBitWidth;
     bool isInput;
     std::string spatialTag; // "row_broadcast_in", "col_broadcast_in", etc. or "" for default
+    std::string policyName; // "RowBC", "ColBC", "LtoR_Merge", etc. (from aie::port<T, Policy>)
+    // Resolved SpatialPolicy struct fields (from Clang AST constexpr evaluation)
+    int pattern = 0;      // 0=Broadcast, 1=Scatter, 2=Multicast, 3=Gather
+    int distribution = 0; // 0=Row, 1=Col, 2=Grid
+    int mergeOrder = 0;   // 0=Default, 1=LeftToRight, 2=RightToLeft
+    int pingPong = 2;
+    int maxBufferBytes = 4096;   // max per-buffer size (PP_MAX_BYTES equivalent)
+    bool policyResolved = false; // true once AST extraction succeeds
 };
 static std::vector<ParsedTensorInfo> parsedTensors;
 
+// DerivedTilingParams is defined in tilinglinalg_pipeline.h
+static DerivedTilingParams derivedTilingParams;
+
+static int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0; // GEMM dimensions from launch args or macros
+
 static int parsedDebugLevel = -1; // -1 = not set by user, >=0 = #pragma aie_debug_level value
+static std::string userSourceDir; // directory containing the original user source file
+static PartitionDesc parsedPartition; // default: invalid (all -1), set by #pragma aie_partition
+static std::vector<MeshKernelDesc> parsedMeshKernels; // multi-kernel mode: one per <<<mesh>>> launch
 static std::vector<std::string> kernel_name_list;
 static std::unordered_map<std::string, const clang::FunctionDecl*> globalKernelFuncs;
-static std::string userKernelBody;      // raw source text of __global__ function body
-static std::string userKernelFuncName;  // kernel function name from __global__
+static std::string userKernelBody;     // raw source text of __global__ function body (last kernel, backward compat)
+static std::string userKernelFuncName; // kernel function name from __global__ (last kernel, backward compat)
+static std::unordered_map<std::string, std::string> globalKernelBodies; // per-kernel: name -> cleaned body text
 static std::vector<std::string> userMacroDefines; // #define lines from user source
 
 using namespace clang;
 using namespace clang::tooling;
+
+// Extract partition bounds from the 3rd argument of aieDim constructor.
+// Handles InitListExpr {2,7,0,10}, CXXConstructExpr (copy/aggregate), and DeclRefExpr (variable).
+static void extractPartitionFromExpr(const Expr *partExpr, ASTContext *Context) {
+    partExpr = partExpr->IgnoreParenImpCasts();
+    // Try InitListExpr: aiePartition{2,7,0,10} or {2,7,0,10}
+    if (const auto *IL = dyn_cast<InitListExpr>(partExpr)) {
+        if (IL->getNumInits() >= 4) {
+            clang::Expr::EvalResult r0, r1, r2, r3;
+            if (IL->getInit(0)->EvaluateAsInt(r0, *Context) && IL->getInit(1)->EvaluateAsInt(r1, *Context) &&
+                IL->getInit(2)->EvaluateAsInt(r2, *Context) && IL->getInit(3)->EvaluateAsInt(r3, *Context)) {
+                parsedPartition.startCol = r0.Val.getInt().getExtValue();
+                parsedPartition.endCol = r1.Val.getInt().getExtValue();
+                parsedPartition.startRow = r2.Val.getInt().getExtValue();
+                parsedPartition.endRow = r3.Val.getInt().getExtValue();
+                llvm::outs() << "[TilingLinalg] Partition: [" << parsedPartition.startCol << ","
+                             << parsedPartition.endCol << "," << parsedPartition.startRow << ","
+                             << parsedPartition.endRow << "]\n";
+            }
+        }
+        return;
+    }
+    // Try CXXConstructExpr: aggregate or copy constructor
+    if (const auto *CE = dyn_cast<CXXConstructExpr>(partExpr)) {
+        if (CE->getNumArgs() >= 4) {
+            clang::Expr::EvalResult r0, r1, r2, r3;
+            if (CE->getArg(0)->EvaluateAsInt(r0, *Context) && CE->getArg(1)->EvaluateAsInt(r1, *Context) &&
+                CE->getArg(2)->EvaluateAsInt(r2, *Context) && CE->getArg(3)->EvaluateAsInt(r3, *Context)) {
+                parsedPartition.startCol = r0.Val.getInt().getExtValue();
+                parsedPartition.endCol = r1.Val.getInt().getExtValue();
+                parsedPartition.startRow = r2.Val.getInt().getExtValue();
+                parsedPartition.endRow = r3.Val.getInt().getExtValue();
+                llvm::outs() << "[TilingLinalg] Partition: [" << parsedPartition.startCol << ","
+                             << parsedPartition.endCol << "," << parsedPartition.startRow << ","
+                             << parsedPartition.endRow << "]\n";
+            }
+        } else if (CE->getNumArgs() == 1) {
+            // Copy/move ctor — unwrap inner
+            extractPartitionFromExpr(CE->getArg(0), Context);
+        }
+        return;
+    }
+    // Try DeclRefExpr: variable reference like `part`
+    if (const auto *DR = dyn_cast<DeclRefExpr>(partExpr)) {
+        if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
+            if (VD->hasInit())
+                extractPartitionFromExpr(VD->getInit(), Context);
+        }
+    }
+}
+
 class GlobalFunctionVisitor : public RecursiveASTVisitor<GlobalFunctionVisitor> {
 private:
 	std::string GetFuncText(FunctionDecl *f) {
@@ -180,9 +252,44 @@ public:
                  }
              }
 
+             // Strip aie::port<T, Policy> → T (extract first template arg only)
+             {
+                 std::string portPrefix = "aie::port<";
+                 size_t spos;
+                 while ((spos = str.find(portPrefix)) != std::string::npos) {
+                     size_t start = spos;
+                     size_t angleStart = spos + portPrefix.size();
+                     // Find the top-level comma (separating T from Policy) or closing >
+                     int depth = 1;
+                     size_t commaPos = std::string::npos;
+                     size_t end = angleStart;
+                     while (end < str.size() && depth > 0) {
+                         if (str[end] == '<')
+                             depth++;
+                         else if (str[end] == '>')
+                             depth--;
+                         else if (str[end] == ',' && depth == 1 && commaPos == std::string::npos)
+                             commaPos = end;
+                         if (depth > 0)
+                             end++;
+                     }
+                     end++; // skip closing >
+                     // Extract first template arg (the inner type T)
+                     size_t innerEnd = (commaPos != std::string::npos) ? commaPos : (end - 1);
+                     std::string inner = str.substr(angleStart, innerEnd - angleStart);
+                     // Trim whitespace
+                     while (!inner.empty() && inner.front() == ' ')
+                         inner.erase(0, 1);
+                     while (!inner.empty() && inner.back() == ' ')
+                         inner.pop_back();
+                     str.replace(start, end - start, inner);
+                 }
+             }
+
              // Capture cleaned kernel body for tiling mode computekernel.cc emission
              userKernelFuncName = kname;
              userKernelBody = str;
+             globalKernelBodies[kname] = str; // per-kernel map for multi-kernel support
              llvm::outs() << "[TilingLinalg] Captured __global__ kernel body for: " << kname << "\n";
 
              std::string header = "/******************************************************************************"
@@ -401,46 +508,109 @@ public:
 			// Detect __aie_launch("kernelName", mesh, A, B, C, M, N, K) for tiling mode
 			if (Callee && Callee->getNameAsString() == "__aie_launch") {
 				isTilingLinalgMode = true;
-				// Guard: only parse tensor params once (AST visitor may visit the call twice)
-				if (!parsedTensors.empty()) {
-					return true;
-				}
-				// Arg 0: kernel name (string literal after preprocessing)
+
+                // Extract kernel name to check for duplicate AST visits
+                std::string currentLaunchKernel;
+                if (CE->getNumArgs() >= 1) {
+                    if (const auto *SL = dyn_cast<clang::StringLiteral>(CE->getArg(0)->IgnoreParenImpCasts()))
+                        currentLaunchKernel = SL->getString().str();
+                }
+
+                // Guard: skip if this exact kernel was already parsed (AST visitor may visit twice)
+                // Important: do NOT clear globals before this check — a same-name kernel called
+                // twice (e.g. matmul<<<mesh>>>(A,B,C); matmul<<<mesh>>>(C,B,A);) must not
+                // clobber the state captured from the first visit.
+                for (const auto &mk : parsedMeshKernels) {
+                    if (mk.kernelName == currentLaunchKernel)
+                        return true;
+                }
+
+                // For multi-kernel: each launch gets its own parsedTensors / derivedTilingParams.
+                // Clear per-kernel state so this kernel starts fresh.
+                // This must happen AFTER the duplicate check above.
+                bool isFirstKernel = parsedMeshKernels.empty();
+                parsedTensors.clear();
+                derivedTilingParams = DerivedTilingParams();
+
+                // Arg 0: kernel name (string literal after preprocessing)
 				if (CE->getNumArgs() >= 2) {
-					// Try to extract kernel name from first arg (string literal)
-					if (const auto *SL = dyn_cast<clang::StringLiteral>(CE->getArg(0)->IgnoreParenImpCasts())) {
-						llvm::outs() << "[TilingLinalg] Detected kernel launch: " << SL->getString() << "\n";
-					}
-					// Arg 1: aieDim mesh variable — extract rows/cols from CXXConstructExpr
-					const Expr *meshArg = CE->getArg(1)->IgnoreParenImpCasts();
-					if (const auto *Construct = dyn_cast<CXXConstructExpr>(meshArg)) {
-						if (Construct->getNumArgs() >= 2) {
-                            // Direct construction: __aie_launch("k", aieDim(4,4), ...)
+                    if (!currentLaunchKernel.empty()) {
+                        llvm::outs() << "[TilingLinalg] Detected kernel launch: " << currentLaunchKernel << "\n";
+                    }
+                    // Arg 1: aieDim or aieMesh variable — extract rows/cols
+                    const Expr *meshArg = CE->getArg(1)->IgnoreParenImpCasts();
+
+                    // Local vars for this kernel's mesh dims and partition
+                    int localMeshRows = 0, localMeshCols = 0;
+                    PartitionDesc localPartition;
+                    // Helper: extract mesh dims from a CXXConstructExpr (aieDim(rows, cols [, part]))
+                    auto extractDimsFromConstruct = [&](const CXXConstructExpr *Construct) {
+                        if (Construct->getNumArgs() >= 2) {
                             clang::Expr::EvalResult r0, r1;
-							if (Construct->getArg(0)->EvaluateAsInt(r0, *Context) &&
+                            if (Construct->getArg(0)->EvaluateAsInt(r0, *Context) &&
 								Construct->getArg(1)->EvaluateAsInt(r1, *Context)) {
-								tilingMeshRows = r0.Val.getInt().getExtValue();
-								tilingMeshCols = r1.Val.getInt().getExtValue();
-								llvm::outs() << "[TilingLinalg] Mesh: " << tilingMeshRows << " x " << tilingMeshCols << "\n";
-							}
+                                localMeshRows = r0.Val.getInt().getExtValue();
+                                localMeshCols = r1.Val.getInt().getExtValue();
+                            }
+                            if (Construct->getNumArgs() >= 3) {
+                                extractPartitionFromExpr(Construct->getArg(2), Context);
+                                localPartition = parsedPartition;
+                            }
+                        }
+                    };
+
+                    // Helper: extract mesh dims from an aieMesh VarDecl initialized via device.partition(part, rows,
+                    // cols)
+                    auto extractDimsFromAieMeshVar = [&](const VarDecl *VD) -> bool {
+                        if (!VD->hasInit())
+                            return false;
+                        const Expr *init = VD->getInit()->IgnoreParenImpCasts();
+                        // Handle ExprWithCleanups wrapper
+                        if (const auto *EWC = dyn_cast<ExprWithCleanups>(init))
+                            init = EWC->getSubExpr()->IgnoreParenImpCasts();
+                        // Handle MaterializeTemporaryExpr wrapper
+                        if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(init))
+                            init = MTE->getSubExpr()->IgnoreParenImpCasts();
+                        // device.partition({...}, rows, cols) is a CXXMemberCallExpr
+                        if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(init)) {
+                            if (const auto *MD = MCE->getMethodDecl()) {
+                                if (MD->getNameAsString() == "partition" && MCE->getNumArgs() >= 3) {
+                                    // Arg 0: aiePartition, Arg 1: rows, Arg 2: cols
+                                    extractPartitionFromExpr(MCE->getArg(0), Context);
+                                    localPartition = parsedPartition;
+                                    clang::Expr::EvalResult r0, r1;
+                                    if (MCE->getArg(1)->EvaluateAsInt(r0, *Context) &&
+                                        MCE->getArg(2)->EvaluateAsInt(r1, *Context)) {
+                                        localMeshRows = r0.Val.getInt().getExtValue();
+                                        localMeshCols = r1.Val.getInt().getExtValue();
+                                    }
+                                    return true;
+                                }
+                            }
+                        }
+                        // Fallback: CXXConstructExpr (aieDim or aggregate init)
+                        if (const auto *Construct = dyn_cast<CXXConstructExpr>(init)) {
+                            extractDimsFromConstruct(Construct);
+                            return localMeshRows > 0;
+                        }
+                        return false;
+                    };
+
+                    if (const auto *Construct = dyn_cast<CXXConstructExpr>(meshArg)) {
+                        if (Construct->getNumArgs() >= 2) {
+                            // Direct construction: __aie_launch("k", aieDim(4,4), ...)
+                            extractDimsFromConstruct(Construct);
                         } else if (Construct->getNumArgs() == 1) {
                             // Copy/move constructor: __aie_launch("k", mesh, ...) where mesh is by-value
-                            // Look through the copy to find the original DeclRefExpr
                             const Expr *inner = Construct->getArg(0)->IgnoreParenImpCasts();
                             if (const auto *DR = dyn_cast<DeclRefExpr>(inner)) {
                                 if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
-                                    if (VD->hasInit()) {
-                                        if (const auto *InitConstruct =
-                                                dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
-                                            if (InitConstruct->getNumArgs() >= 2) {
-                                                clang::Expr::EvalResult r0, r1;
-                                                if (InitConstruct->getArg(0)->EvaluateAsInt(r0, *Context) &&
-                                                    InitConstruct->getArg(1)->EvaluateAsInt(r1, *Context)) {
-                                                    tilingMeshRows = r0.Val.getInt().getExtValue();
-                                                    tilingMeshCols = r1.Val.getInt().getExtValue();
-                                                    llvm::outs() << "[TilingLinalg] Mesh (from copy-ctor var): "
-                                                                 << tilingMeshRows << " x " << tilingMeshCols << "\n";
-                                                }
+                                    if (!extractDimsFromAieMeshVar(VD)) {
+                                        // Try aieDim ctor inside VarDecl init
+                                        if (VD->hasInit()) {
+                                            if (const auto *IC =
+                                                    dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
+                                                extractDimsFromConstruct(IC);
                                             }
                                         }
                                     }
@@ -448,24 +618,36 @@ public:
                             }
                         }
                     } else if (const auto *DR = dyn_cast<DeclRefExpr>(meshArg)) {
-						// mesh variable already declared — get rows/cols from its initializer
-						if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
-							if (VD->hasInit()) {
-								if (const auto *Construct = dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
-									if (Construct->getNumArgs() >= 2) {
-										clang::Expr::EvalResult r0, r1;
-										if (Construct->getArg(0)->EvaluateAsInt(r0, *Context) &&
-											Construct->getArg(1)->EvaluateAsInt(r1, *Context)) {
-											tilingMeshRows = r0.Val.getInt().getExtValue();
-											tilingMeshCols = r1.Val.getInt().getExtValue();
-											llvm::outs() << "[TilingLinalg] Mesh (from var): " << tilingMeshRows << " x " << tilingMeshCols << "\n";
-										}
-									}
-								}
-							}
-						}
-					}
-					// Extract tensor params from the __global__ kernel function signature
+                        // mesh variable already declared — get rows/cols from initializer
+                        if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl())) {
+                            if (!extractDimsFromAieMeshVar(VD)) {
+                                // Fallback: try CXXConstructExpr (aieDim)
+                                if (VD->hasInit()) {
+                                    if (const auto *Construct =
+                                            dyn_cast<CXXConstructExpr>(VD->getInit()->IgnoreParenImpCasts())) {
+                                        extractDimsFromConstruct(Construct);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (localMeshRows > 0 && localMeshCols > 0) {
+                        llvm::outs() << "[TilingLinalg] Mesh: " << localMeshRows << " x " << localMeshCols << "\n";
+                        if (localPartition.isValid()) {
+                            llvm::outs() << "[TilingLinalg] Partition: [" << localPartition.startCol << ","
+                                         << localPartition.endCol << "," << localPartition.startRow << ","
+                                         << localPartition.endRow << "]\n";
+                        }
+                    }
+
+                    // Update globals for backward compat (first kernel only)
+                    if (isFirstKernel) {
+                        tilingMeshRows = localMeshRows;
+                        tilingMeshCols = localMeshCols;
+                        parsedPartition = localPartition;
+                    }
+                    // Extract tensor params from the __global__ kernel function signature
 					// Args 2+ of __aie_launch correspond to the kernel function parameters
 					std::string launchKernelName;
 					if (const auto *SL2 = dyn_cast<clang::StringLiteral>(CE->getArg(0)->IgnoreParenImpCasts())) {
@@ -478,10 +660,11 @@ public:
 							const FunctionDecl *kernelFD = it->second;
 							unsigned numKernelParams = kernelFD->getNumParams();
 
-							// Semantic validation: check launch arg count vs kernel param count
-							unsigned numLaunchArgs = CE->getNumArgs() - 2; // exclude name and mesh
-							if (numLaunchArgs != numKernelParams) {
-								llvm::errs() << "Error: kernel '" << launchKernelName
+                            // Semantic validation: check launch arg count vs kernel param count
+                            // Extra launch args beyond kernel params are dimension scalars (M, N, K)
+                            unsigned numLaunchArgs = CE->getNumArgs() - 2; // exclude name and mesh
+                            if (numLaunchArgs < numKernelParams) {
+                                llvm::errs() << "Error: kernel '" << launchKernelName
 											 << "' declares " << numKernelParams << " parameters but launch provides "
 											 << numLaunchArgs << " arguments.\n";
 								llvm::errs() << "  __global__ void " << launchKernelName << "(...) has "
@@ -489,7 +672,10 @@ public:
 								llvm::errs() << "  " << launchKernelName << "<<<mesh>>>(...) provides "
 											 << numLaunchArgs << " args\n";
 								// Don't abort — continue with available info
-							}
+                            } else if (numLaunchArgs > numKernelParams) {
+                                llvm::outs() << "[TilingLinalg] " << (numLaunchArgs - numKernelParams)
+                                             << " extra launch args detected (dimension scalars)\n";
+                            }
 
                             // Helper lambda: check if a QualType is a spatial wrapper or pointer type
                             // (i.e. a tensor parameter, not a scalar dimension).
@@ -498,20 +684,20 @@ public:
                             auto isTensorParam = [](clang::QualType qt) -> bool {
                                 if (qt->isPointerType())
                                     return true;
-                                // Check for aie:: spatial wrapper struct
+                                // Check for aie:: spatial wrapper struct (legacy aliases + new port<>)
                                 std::string typeStr = qt.getUnqualifiedType().getAsString();
                                 for (const char *tag :
                                      {"aie::row_broadcast_in", "aie::col_broadcast_in", "aie::tiled_in",
-                                      "aie::row_major_out", "aie::col_major_out", "aie::row_reduce_out"}) {
+                                      "aie::row_major_out", "aie::col_major_out", "aie::row_reduce_out", "aie::port"}) {
                                     if (typeStr.find(tag) != std::string::npos)
                                         return true;
                                 }
                                 return false;
                             };
 
-                            // First pass: collect scalar dimension values from launch args
-							// Launch args start at index 2 (0=name, 1=mesh, 2..=kernel params)
-							std::vector<int64_t> scalarDimValues;
+                            // First pass: collect scalar dimension values from kernel params
+                            // Launch args start at index 2 (0=name, 1=mesh, 2..=kernel params)
+                            std::vector<int64_t> scalarDimValues;
 							for (unsigned i = 0; i < numKernelParams; ++i) {
 								const ParmVarDecl *kp = kernelFD->getParamDecl(i);
 								clang::QualType ptype = kp->getType();
@@ -527,7 +713,22 @@ public:
                                 }
                             }
 
-							// Determine default shape from scalar dims (e.g. M, N, K -> MxN for each tensor)
+                            // Second: collect extra launch args beyond kernel params as dimension scalars
+                            // e.g. matmul<<<mesh>>>(A, B, C, M, N, K) — M,N,K are at indices numKernelParams+2..
+                            for (unsigned i = numKernelParams; i < numLaunchArgs; ++i) {
+                                unsigned launchArgIdx = i + 2;
+                                if (launchArgIdx < CE->getNumArgs()) {
+                                    clang::Expr::EvalResult evalRes;
+                                    if (CE->getArg(launchArgIdx)->EvaluateAsInt(evalRes, *Context)) {
+                                        int64_t val = evalRes.Val.getInt().getExtValue();
+                                        scalarDimValues.push_back(val);
+                                        llvm::outs() << "[TilingLinalg] Extra launch arg[" << (i - numKernelParams)
+                                                     << "] = " << val << "\n";
+                                    }
+                                }
+                            }
+
+                            // Determine default shape from scalar dims (e.g. M, N, K -> MxN for each tensor)
 							// For GEMM: A[M*K], B[K*N], C[M*N] with scalars [M, N, K]
 							// General case: use first two scalars as shape for all tensors
 							int64_t defaultDim0 = 16, defaultDim1 = 16;
@@ -537,6 +738,62 @@ public:
 							} else if (scalarDimValues.size() == 1) {
 								defaultDim0 = defaultDim1 = scalarDimValues[0];
 							}
+
+                            // Map scalar dims to GEMM M, N, K when 3 values available
+                            // (from either kernel params or extra launch args)
+                            macroDimM = 0;
+                            macroDimN = 0;
+                            macroDimK = 0;
+                            if (scalarDimValues.size() >= 3) {
+                                macroDimM = scalarDimValues[0];
+                                macroDimN = scalarDimValues[1];
+                                macroDimK = scalarDimValues[2];
+                                llvm::outs() << "[TilingLinalg] GEMM dims from launch args: M=" << macroDimM
+                                             << " N=" << macroDimN << " K=" << macroDimK << "\n";
+                                defaultDim0 = macroDimM;
+                                defaultDim1 = macroDimK;
+                            }
+                            // Fallback: when no scalar dims found, try to extract M, N, K from
+                            // user #define macros (e.g. #define M 32, #define K 32, #define N 32).
+                            // These are the standard GEMM dimension macros used in the kernel source.
+                            if (macroDimM == 0 && scalarDimValues.empty()) {
+                                for (const auto &macroLine : userMacroDefines) {
+                                    // Parse "#define <NAME> <integer>"
+                                    std::istringstream mss(macroLine);
+                                    std::string tok_define, tok_name, tok_value;
+                                    mss >> tok_define >> tok_name >> tok_value;
+                                    if (tok_define != "#define" || tok_name.empty() || tok_value.empty())
+                                        continue;
+                                    // Only accept pure integer values (no expressions)
+                                    bool allDigits = true;
+                                    for (char c : tok_value) {
+                                        if (!std::isdigit(c)) {
+                                            allDigits = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!allDigits)
+                                        continue;
+                                    int64_t val = std::stoll(tok_value);
+                                    if (tok_name == "M")
+                                        macroDimM = val;
+                                    else if (tok_name == "N")
+                                        macroDimN = val;
+                                    else if (tok_name == "K")
+                                        macroDimK = val;
+                                }
+                                if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0) {
+                                    llvm::outs() << "[TilingLinalg] GEMM dims from macros: M=" << macroDimM
+                                                 << " N=" << macroDimN << " K=" << macroDimK << "\n";
+                                    // Update defaults (used when no per-tensor shape can be determined)
+                                    defaultDim0 = macroDimM;
+                                    defaultDim1 = macroDimK;
+                                } else if (macroDimM > 0) {
+                                    // Partial: at least M is defined
+                                    defaultDim0 = macroDimM;
+                                    defaultDim1 = macroDimN > 0 ? macroDimN : macroDimM;
+                                }
+                            }
 
                             // Second pass: build ParsedTensorInfo for each tensor parameter
                             // Handles both bare pointer types (input_window_int8*) and
@@ -551,17 +808,18 @@ public:
                                 std::string fullTypeStr = ptype.getUnqualifiedType().getAsString();
 
                                 // Check for spatial type wrapper: aie::tag_name<inner_type>
+                                // Also handles aie::port<inner_type, PolicyName>
                                 std::string spatialTag;
                                 std::string innerTypeStr;
-                                static const char *spatialTags[] = {"row_broadcast_in", "col_broadcast_in",
-                                                                    "tiled_in",         "row_major_out",
-                                                                    "col_major_out",    "row_reduce_out"};
+                                std::string policyName;
+                                static const char *spatialTags[] = {
+                                    "row_broadcast_in", "col_broadcast_in", "tiled_in", "row_major_out",
+                                    "col_major_out",    "row_reduce_out",   "port"};
                                 for (const char *tag : spatialTags) {
                                     std::string prefix = std::string("aie::") + tag + "<";
                                     size_t pos = fullTypeStr.find(prefix);
                                     if (pos != std::string::npos) {
-                                        spatialTag = tag;
-                                        // Extract inner type: everything between < and matching >
+                                        // Extract everything between < and matching >
                                         size_t innerStart = pos + prefix.size();
                                         int depth = 1;
                                         size_t innerEnd = innerStart;
@@ -573,8 +831,51 @@ public:
                                             if (depth > 0)
                                                 innerEnd++;
                                         }
-                                        innerTypeStr = fullTypeStr.substr(innerStart, innerEnd - innerStart);
-                                        // Trim whitespace
+                                        std::string templateArgs =
+                                            fullTypeStr.substr(innerStart, innerEnd - innerStart);
+
+                                        if (std::string(tag) == "port") {
+                                            // aie::port<InnerType, PolicyName>
+                                            // Split on top-level comma to get inner type and policy name
+                                            int commaDepth = 0;
+                                            size_t commaPos = std::string::npos;
+                                            for (size_t ci = 0; ci < templateArgs.size(); ++ci) {
+                                                if (templateArgs[ci] == '<')
+                                                    commaDepth++;
+                                                else if (templateArgs[ci] == '>')
+                                                    commaDepth--;
+                                                else if (templateArgs[ci] == ',' && commaDepth == 0) {
+                                                    commaPos = ci;
+                                                    break;
+                                                }
+                                            }
+                                            if (commaPos != std::string::npos) {
+                                                innerTypeStr = templateArgs.substr(0, commaPos);
+                                                policyName = templateArgs.substr(commaPos + 1);
+                                                // Trim whitespace
+                                                while (!policyName.empty() && policyName.front() == ' ')
+                                                    policyName.erase(0, 1);
+                                                while (!policyName.empty() && policyName.back() == ' ')
+                                                    policyName.pop_back();
+                                                // Strip "aie::" namespace prefix if present
+                                                if (policyName.substr(0, 5) == "aie::")
+                                                    policyName = policyName.substr(5);
+                                            } else {
+                                                // aie::port<InnerType> with default policy
+                                                innerTypeStr = templateArgs;
+                                                policyName = "RowBC"; // default policy
+                                            }
+                                            // Don't set spatialTag for port — policyName is used instead
+                                            llvm::outs() << "[TilingLinalg] Policy port: " << policyName
+                                                         << " -> inner type: " << innerTypeStr << "\n";
+                                        } else {
+                                            spatialTag = tag;
+                                            innerTypeStr = templateArgs;
+                                            llvm::outs() << "[TilingLinalg] Spatial tag: " << spatialTag
+                                                         << " -> inner type: " << innerTypeStr << "\n";
+                                        }
+
+                                        // Trim whitespace from innerTypeStr
                                         while (!innerTypeStr.empty() && innerTypeStr.front() == ' ')
                                             innerTypeStr.erase(0, 1);
                                         while (!innerTypeStr.empty() && innerTypeStr.back() == ' ')
@@ -585,14 +886,12 @@ public:
                                             while (!innerTypeStr.empty() && innerTypeStr.back() == ' ')
                                                 innerTypeStr.pop_back();
                                         }
-                                        llvm::outs() << "[TilingLinalg] Spatial tag: " << spatialTag
-                                                     << " -> inner type: " << innerTypeStr << "\n";
                                         break;
                                     }
                                 }
 
-                                // For bare pointer types, use the pointee type string
-                                if (spatialTag.empty() && ptype->isPointerType()) {
+                                // For bare pointer types (no spatial tag or policy), use the pointee type string
+                                if (spatialTag.empty() && policyName.empty() && ptype->isPointerType()) {
                                     clang::QualType pointee = ptype->getPointeeType();
                                     innerTypeStr = pointee.getUnqualifiedType().getAsString();
                                 }
@@ -634,32 +933,274 @@ public:
                                     }
                                 }
 
-                                // For spatial tags, determine input/output from the tag name
+                                // Determine input/output from spatial tag, policy name, or type info
                                 bool isInput;
-                                if (!spatialTag.empty()) {
+                                // Determine input/output: always prefer inner type info
+                                if (isWindowParam) {
+                                    isInput = isInputWindow;
+                                } else if (!spatialTag.empty()) {
                                     isInput = (spatialTag.find("_in") != std::string::npos);
+                                } else if (ptype->isPointerType()) {
+                                    isInput = ptype->getPointeeType().isConstQualified();
                                 } else {
-                                    bool isConst =
-                                        ptype->isPointerType() ? ptype->getPointeeType().isConstQualified() : false;
-                                    isInput = isWindowParam ? isInputWindow : isConst;
+                                    isInput = true; // conservative default
                                 }
 
                                 ParsedTensorInfo pti;
                                 pti.varName = kp->getNameAsString();
-                                pti.shape = {defaultDim0, defaultDim1};
+                                // Assign per-tensor GEMM shapes from M/N/K macros.
+                                // Shape is initially set to defaults; re-assigned after AST
+                                // resolution using resolved policy fields (pattern+distribution).
+                                if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0) {
+                                    bool shapeAssigned = false;
+                                    if (!spatialTag.empty()) {
+                                        if (spatialTag == "row_broadcast_in") {
+                                            pti.shape = {macroDimM, macroDimK};
+                                            shapeAssigned = true;
+                                        } else if (spatialTag == "col_broadcast_in") {
+                                            pti.shape = {macroDimK, macroDimN};
+                                            shapeAssigned = true;
+                                        } else if (spatialTag == "row_major_out" || spatialTag == "col_major_out") {
+                                            pti.shape = {macroDimM, macroDimN};
+                                            shapeAssigned = true;
+                                        }
+                                    }
+                                    if (!shapeAssigned)
+                                        pti.shape = {defaultDim0, defaultDim1};
+                                } else {
+                                    pti.shape = {defaultDim0, defaultDim1};
+                                }
                                 pti.elementBitWidth = bitWidth;
                                 pti.isInput = isInput;
                                 pti.spatialTag = spatialTag;
+                                pti.policyName = policyName;
+
+                                // --- AST-based SpatialPolicy struct extraction ---
+                                // Extract the constexpr SpatialPolicy struct fields from the
+                                // template argument of aie::port<T, Policy>.
+                                //
+                                // After template instantiation, ptype is a RecordType (the
+                                // instantiated aie::port<T,P> struct). We reach the template
+                                // args via ClassTemplateSpecializationDecl.
+                                //
+                                // The policy argument kind depends on the LLVM version:
+                                //   - StructuralValue: the APValue is stored directly
+                                //   - Declaration: a reference to the constexpr VarDecl;
+                                //     we evaluate it to get the APValue
+                                if (!policyName.empty()) {
+                                    const clang::Type *rawType = ptype.getTypePtr();
+                                    rawType = rawType->getUnqualifiedDesugaredType();
+
+                                    const clang::CXXRecordDecl *recDecl = rawType->getAsCXXRecordDecl();
+                                    if (auto *ctsd =
+                                            dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(recDecl)) {
+                                        const auto &targs = ctsd->getTemplateArgs();
+                                        if (targs.size() >= 2) {
+                                            const auto &policyArg = targs[1];
+                                            const APValue *apval = nullptr;
+
+                                            if (policyArg.getKind() == clang::TemplateArgument::StructuralValue) {
+                                                apval = &policyArg.getAsStructuralValue();
+                                            } else if (policyArg.getKind() == clang::TemplateArgument::Declaration) {
+                                                // C++20 struct NTTP: Clang stores the evaluated value as a
+                                                // TemplateParamObjectDecl (a unique'd APValue holder).
+                                                ValueDecl *decl = policyArg.getAsDecl();
+                                                if (auto *tpo = dyn_cast<clang::TemplateParamObjectDecl>(decl)) {
+                                                    apval = &tpo->getValue();
+                                                } else if (auto *vd = dyn_cast<clang::VarDecl>(decl)) {
+                                                    apval = vd->getEvaluatedValue();
+                                                    if (!apval)
+                                                        vd->evaluateValue(), apval = vd->getEvaluatedValue();
+                                                }
+                                            } else if (policyArg.getKind() == clang::TemplateArgument::Expression) {
+                                                // Fallback: evaluate the expression directly
+                                                clang::Expr::EvalResult evalRes;
+                                                if (policyArg.getAsExpr()->EvaluateAsConstantExpr(evalRes, *Context)) {
+                                                    apval = &evalRes.Val;
+                                                }
+                                            }
+
+                                            if (apval && apval->isStruct() && apval->getStructNumFields() >= 4) {
+                                                pti.pattern = (int)apval->getStructField(0).getInt().getExtValue();
+                                                pti.distribution = (int)apval->getStructField(1).getInt().getExtValue();
+                                                pti.mergeOrder = (int)apval->getStructField(2).getInt().getExtValue();
+                                                pti.pingPong = (int)apval->getStructField(3).getInt().getExtValue();
+                                                if (apval->getStructNumFields() >= 5)
+                                                    pti.maxBufferBytes =
+                                                        (int)apval->getStructField(4).getInt().getExtValue();
+                                                pti.policyResolved = true;
+                                                llvm::outs()
+                                                    << "[TilingLinalg] Policy resolved: pattern=" << pti.pattern
+                                                    << " distribution=" << pti.distribution
+                                                    << " mergeOrder=" << pti.mergeOrder << " ppDepth=" << pti.pingPong
+                                                    << " maxBufferBytes=" << pti.maxBufferBytes << "\n";
+                                            } else if (!apval) {
+                                                llvm::errs()
+                                                    << "[TilingLinalg] DEBUG: policy arg kind="
+                                                    << (int)policyArg.getKind() << " — could not obtain APValue\n";
+                                            }
+                                        }
+                                    }
+                                    if (!pti.policyResolved) {
+                                        llvm::errs()
+                                            << "[TilingLinalg] ERROR: Failed to resolve constexpr SpatialPolicy '"
+                                            << policyName << "' from AST\n";
+                                    }
+                                }
+
+                                // Re-assign shape from resolved policy fields
+                                if (pti.policyResolved && macroDimM > 0 && macroDimN > 0 && macroDimK > 0) {
+                                    if (pti.pattern == 0 && pti.distribution == 0) // Broadcast+Row -> A
+                                        pti.shape = {macroDimM, macroDimK};
+                                    else if (pti.pattern == 0 && pti.distribution == 1) // Broadcast+Col -> B
+                                        pti.shape = {macroDimK, macroDimN};
+                                    else // Gather/Scatter -> C
+                                        pti.shape = {macroDimM, macroDimN};
+                                }
 
                                 parsedTensors.push_back(pti);
+                                std::string tagInfo;
+                                if (!policyName.empty())
+                                    tagInfo = " policy=" + policyName;
+                                else if (!spatialTag.empty())
+                                    tagInfo = " spatial=" + spatialTag;
                                 llvm::outs() << "[TilingLinalg] Tensor param: " << pti.varName << " [" << pti.shape[0]
                                              << "x" << pti.shape[1] << "] i" << pti.elementBitWidth
-                                             << (pti.isInput ? " (input)" : " (output)")
-                                             << (spatialTag.empty() ? "" : " spatial=" + spatialTag) << "\n";
+                                             << (pti.isInput ? " (input)" : " (output)") << tagInfo << "\n";
                             }
 						}
 					}
-				}
+
+                    // ---- Compute derived tiling parameters from M/K/N + per-port policy ----
+                    int effectiveMeshRows = localMeshRows > 0 ? localMeshRows : tilingMeshRows;
+                    int effectiveMeshCols = localMeshCols > 0 ? localMeshCols : tilingMeshCols;
+                    if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0 && effectiveMeshRows > 0 &&
+                        effectiveMeshCols > 0 && !parsedTensors.empty()) {
+                        derivedTilingParams.tileRows = macroDimM / effectiveMeshRows;
+                        derivedTilingParams.tileCols = macroDimN / effectiveMeshCols;
+                        derivedTilingParams.kDim = macroDimK;
+
+                        for (auto &pt : parsedTensors) {
+                            DerivedTilingParams::PortParams pp;
+                            int ppDepth = pt.pingPong > 0 ? pt.pingPong : 2;
+                            int maxBuf = pt.maxBufferBytes > 0 ? pt.maxBufferBytes : 4096;
+
+                            if (pt.isInput) {
+                                if (pt.policyResolved) {
+                                    if (pt.pattern == 0 && pt.distribution == 0) {
+                                        // Input A: Broadcast+Row — split along tile rows
+                                        int64_t rowsPerRoundRaw = derivedTilingParams.tileRows / ppDepth;
+                                        int64_t rowsPerRound = rowsPerRoundRaw;
+                                        if (rowsPerRound * macroDimK > maxBuf)
+                                            rowsPerRound = maxBuf / macroDimK;
+                                        if (rowsPerRound <= 0)
+                                            rowsPerRound = 1;
+                                        pp.numRounds = derivedTilingParams.tileRows / rowsPerRound;
+                                        pp.bufferSize = rowsPerRound * macroDimK;
+                                    } else if (pt.pattern == 0 && pt.distribution == 1) {
+                                        // Input B: Broadcast+Col — split along tile cols
+                                        int64_t colsPerRoundRaw = derivedTilingParams.tileCols / ppDepth;
+                                        int64_t colsPerRound = colsPerRoundRaw;
+                                        if (colsPerRound * macroDimK > maxBuf)
+                                            colsPerRound = maxBuf / macroDimK;
+                                        if (colsPerRound <= 0)
+                                            colsPerRound = 1;
+                                        pp.numRounds = derivedTilingParams.tileCols / colsPerRound;
+                                        pp.bufferSize = colsPerRound * macroDimK;
+                                    } else {
+                                        // Other input patterns: default
+                                        int64_t totalElements = 1;
+                                        for (auto d : pt.shape)
+                                            totalElements *= d;
+                                        int64_t perTile = totalElements / (tilingMeshRows * tilingMeshCols);
+                                        pp.bufferSize = std::min(perTile / ppDepth, (int64_t)maxBuf);
+                                        if (pp.bufferSize <= 0)
+                                            pp.bufferSize = perTile;
+                                        pp.numRounds = perTile / pp.bufferSize;
+                                    }
+                                } else {
+                                    // Unresolved policy — use defaults
+                                    int64_t totalElements = pt.shape[0] * pt.shape[1] / effectiveMeshRows;
+                                    pp.bufferSize = std::min(totalElements / ppDepth, (int64_t)maxBuf);
+                                    if (pp.bufferSize <= 0)
+                                        pp.bufferSize = totalElements;
+                                    pp.numRounds = totalElements / pp.bufferSize;
+                                }
+                            } else {
+                                // Output: no K dimension involved
+                                int64_t outputPerCore = derivedTilingParams.tileRows * derivedTilingParams.tileCols;
+                                int64_t bufSzOut = outputPerCore / ppDepth;
+                                if (bufSzOut > maxBuf)
+                                    bufSzOut = maxBuf;
+                                if (bufSzOut <= 0)
+                                    bufSzOut = outputPerCore;
+                                pp.numRounds = outputPerCore / bufSzOut;
+                                pp.bufferSize = bufSzOut;
+                            }
+                            derivedTilingParams.portParams.push_back(pp);
+                        }
+                        derivedTilingParams.valid = true;
+                        llvm::outs() << "[TilingLinalg] Derived tiling: tileRows=" << derivedTilingParams.tileRows
+                                     << " tileCols=" << derivedTilingParams.tileCols
+                                     << " kDim=" << derivedTilingParams.kDim << "\n";
+                        for (size_t i = 0; i < derivedTilingParams.portParams.size(); ++i) {
+                            llvm::outs() << "[TilingLinalg]   port[" << i
+                                         << "]: numRounds=" << derivedTilingParams.portParams[i].numRounds
+                                         << " bufferSize=" << derivedTilingParams.portParams[i].bufferSize << "\n";
+                        }
+                    }
+
+                    // ---- Store MeshKernelDesc for multi-kernel support ----
+                    {
+                        MeshKernelDesc mkd;
+                        mkd.kernelName = currentLaunchKernel;
+                        mkd.kernelFuncName = currentLaunchKernel;
+                        mkd.meshRows = localMeshRows > 0 ? localMeshRows : tilingMeshRows;
+                        mkd.meshCols = localMeshCols > 0 ? localMeshCols : tilingMeshCols;
+                        mkd.partition = localPartition.isValid() ? localPartition : parsedPartition;
+                        mkd.meshId = (int)parsedMeshKernels.size();
+                        for (auto &pt : parsedTensors) {
+                            mkd.tensors.push_back({pt.shape, pt.elementBitWidth, pt.isInput});
+                        }
+                        // Store per-kernel body from globalKernelBodies map
+                        auto bodyIt = globalKernelBodies.find(currentLaunchKernel);
+                        if (bodyIt != globalKernelBodies.end()) {
+                            mkd.kernelBody = bodyIt->second;
+                        }
+                        // Build per-kernel SplitModel from parsedTensors
+                        for (auto &pt : parsedTensors) {
+                            if (pt.policyResolved) {
+                                mkd.splitModel.tensorSplits.push_back(
+                                    SplitModel::fromPolicyFields(pt.pattern, pt.distribution, pt.mergeOrder,
+                                                                 pt.pingPong, pt.isInput, pt.maxBufferBytes));
+                            } else if (!pt.spatialTag.empty()) {
+                                mkd.splitModel.tensorSplits.push_back(
+                                    SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
+                            } else {
+                                mkd.splitModel.tensorSplits.push_back(SplitModel::fromPolicyFields(
+                                    pt.isInput ? 0 : 3, 0, pt.isInput ? 0 : 1, 2, pt.isInput, pt.maxBufferBytes));
+                            }
+                        }
+                        // Store per-kernel maxPPBytes (minimum across ports)
+                        if (!parsedTensors.empty()) {
+                            mkd.maxPPBytes = parsedTensors[0].maxBufferBytes;
+                            for (auto &pt : parsedTensors) {
+                                if (pt.maxBufferBytes > 0 && pt.maxBufferBytes < mkd.maxPPBytes)
+                                    mkd.maxPPBytes = pt.maxBufferBytes;
+                            }
+                        }
+                        // Store per-kernel derivedTilingParams and port var names
+                        // for aie::get_*() replacement in multi-kernel mode
+                        mkd.derivedParams = derivedTilingParams;
+                        for (auto &pt : parsedTensors) {
+                            mkd.portVarNames.push_back(pt.varName);
+                        }
+                        parsedMeshKernels.push_back(mkd);
+                        llvm::outs() << "[TilingLinalg] Registered MeshKernelDesc: kernel=" << mkd.kernelName
+                                     << " mesh=" << mkd.meshRows << "x" << mkd.meshCols << " meshId=" << mkd.meshId
+                                     << "\n";
+                    }
+                }
 				return true;
 			}
 
@@ -856,22 +1397,73 @@ class AieDebugLevelPragmaHandler : public clang::PragmaHandler {
     AieDebugLevelPragmaHandler() : PragmaHandler("aie_debug_level") {}
 
     void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer Introducer, clang::Token &FirstToken) override {
+        // Known flag macros (must match aie_runtime.h definitions)
+        static const std::unordered_map<std::string, int> knownFlags = {
+            {"AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA", 1 << 4},
+            {"AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN", 1 << 5},
+            {"AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER", 1 << 6},
+        };
+
         clang::Token Tok;
         PP.Lex(Tok);
-        if (Tok.is(clang::tok::numeric_constant)) {
-            llvm::SmallString<8> IntegerBuffer;
-            bool Invalid = false;
-            llvm::StringRef Spelling = PP.getSpelling(Tok, IntegerBuffer, &Invalid);
-            if (!Invalid) {
-                int level = 0;
-                if (!Spelling.getAsInteger(10, level)) {
-                    parsedDebugLevel = level;
-                    llvm::outs() << "[aiehlc] Detected #pragma aie_debug_level " << parsedDebugLevel << "\n";
+
+        // Skip optional opening paren: #pragma aie_debug_level(...)
+        bool hasParen = Tok.is(clang::tok::l_paren);
+        if (hasParen)
+            PP.Lex(Tok);
+
+        int result = 0;
+        bool valid = false;
+
+        // Parse: term ( '|' term )*
+        // Each term is a numeric_constant or a known identifier flag
+        while (true) {
+            if (Tok.is(clang::tok::numeric_constant)) {
+                llvm::SmallString<16> IntegerBuffer;
+                bool Invalid = false;
+                llvm::StringRef Spelling = PP.getSpelling(Tok, IntegerBuffer, &Invalid);
+                if (Invalid)
+                    break;
+                int val = 0;
+                // Support decimal, hex (0x...), octal (0...) via base 0
+                if (Spelling.getAsInteger(0, val))
+                    break;
+                result |= val;
+                valid = true;
+            } else if (Tok.is(clang::tok::identifier)) {
+                std::string name = PP.getSpelling(Tok);
+                auto it = knownFlags.find(name);
+                if (it == knownFlags.end()) {
+                    llvm::errs() << "[aiehlc] Warning: unknown flag '" << name
+                                 << "' in #pragma aie_debug_level, ignored\n";
+                } else {
+                    result |= it->second;
+                    valid = true;
                 }
+            } else {
+                break;
+            }
+
+            PP.Lex(Tok);
+            if (Tok.is(clang::tok::pipe)) {
+                PP.Lex(Tok); // consume '|', continue to next term
+            } else {
+                break;
             }
         }
-        // Consume remaining tokens on the pragma line
-        PP.DiscardUntilEndOfDirective();
+
+        // Consume optional closing paren
+        if (hasParen && Tok.is(clang::tok::r_paren))
+            PP.Lex(Tok);
+
+        if (valid) {
+            parsedDebugLevel = result;
+            llvm::outs() << "[aiehlc] Detected #pragma aie_debug_level " << parsedDebugLevel << "\n";
+        }
+
+        // Consume remaining tokens on the pragma line (if any)
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
     }
 };
 
@@ -937,7 +1529,17 @@ public:
 				// Get the file name
 				llvm::StringRef FileName = FileEntryRef->getName();
 
-				// Print or use the file name as needed
+                // Capture source directory for include path propagation
+                {
+                    std::string fnStr = FileName.str();
+                    auto lastSlash = fnStr.rfind('/');
+                    if (lastSlash != std::string::npos)
+                        userSourceDir = fnStr.substr(0, lastSlash);
+                    else
+                        userSourceDir = ".";
+                }
+
+                // Print or use the file name as needed
 				// llvm::outs() << "Processing file: " << FileName << "\n";
 				clang::FileID MainFileID = SourceMgr.getMainFileID();
 
@@ -1148,18 +1750,53 @@ public:
                     ret += "// CUDA-style AIE API stubs for Clang parsing\n";
                     ret += "#ifndef AIEHLC_TILING_STUBS_DEFINED\n";
                     ret += "#define AIEHLC_TILING_STUBS_DEFINED\n";
-                    // Spatial type wrapper stubs for aie:: namespace
+                    // SpatialPolicy struct + port<T, Policy> system (C++20 struct NTTP)
+                    // Types and port template only — policy constants are user-defined
                     ret += "namespace aie {\n";
-                    ret += "template<typename T> struct row_broadcast_in { using type = T; };\n";
-                    ret += "template<typename T> struct col_broadcast_in { using type = T; };\n";
-                    ret += "template<typename T> struct tiled_in         { using type = T; };\n";
-                    ret += "template<typename T> struct row_major_out    { using type = T; };\n";
-                    ret += "template<typename T> struct col_major_out    { using type = T; };\n";
-                    ret += "template<typename T> struct row_reduce_out   { using type = T; };\n";
+                    ret += "enum class Pattern  { Broadcast = 0, Scatter = 1, Multicast = 2, Gather = 3 };\n";
+                    ret += "enum class Layout   { Row = 0, Col = 1, Grid = 2 };\n";
+                    ret += "enum class Flow     { Default = 0, LeftToRight = 1, RightToLeft = 2 };\n";
+                    ret += "struct SpatialPolicy {\n";
+                    ret += "  Pattern pattern      = Pattern::Broadcast;\n";
+                    ret += "  Layout  distribution = Layout::Row;\n";
+                    ret += "  Flow    merge_order  = Flow::Default;\n";
+                    ret += "  int     pp_depth     = 2;\n";
+                    ret += "  int     max_buffer_bytes = 4096;\n";
+                    ret += "};\n";
+                    ret += "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
+                    // Built-in query function stubs — Clang parses these but the compiler
+                    // replaces the calls with computed integer literals during kernel body rewriting.
+                    ret += "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
+                    ret += "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
+                    ret += "constexpr int get_tile_rows() { return 0; }\n";
+                    ret += "constexpr int get_tile_cols() { return 0; }\n";
+                    ret += "constexpr int get_k_dim() { return 0; }\n";
                     ret += "}\n";
+                    ret += "struct aiePartition {\n";
+                    ret += "    int startCol, endCol, startRow, endRow;\n";
+                    ret += "};\n";
+                    // New programming model types: aieMesh + aieArray
+                    ret += "struct aieMesh {\n";
+                    ret += "    int rows, cols;\n";
+                    ret += "    aiePartition partition;\n";
+                    ret += "    int meshId;\n";
+                    ret += "};\n";
+                    ret += "struct aieArray {\n";
+                    ret += "    int nextMeshId = 0;\n";
+                    ret += "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
+                    ret += "        return aieMesh{rows, cols, p, nextMeshId++};\n";
+                    ret += "    }\n";
+                    ret += "    void synchronize() {}\n";
+                    ret += "};\n";
+                    // Backward-compatible aieDim
                     ret += "struct aieDim {\n";
                     ret += "    int rows, cols;\n";
-                    ret += "    aieDim(int r, int c) : rows(r), cols(c) {}\n";
+                    ret += "    aiePartition partition;\n";
+                    ret += "    bool hasPartition;\n";
+                    ret +=
+                        "    aieDim(int r, int c) : rows(r), cols(c), partition{-1,-1,-1,-1}, hasPartition(false) {}\n";
+                    ret += "    aieDim(int r, int c, aiePartition p) : rows(r), cols(c), partition(p), "
+                           "hasPartition(true) {}\n";
                     ret += "};\n";
                     ret += "inline void aieSetDevice(int) {}\n";
                     ret += "inline void aieDeviceSynchronize() {}\n";
@@ -1169,6 +1806,10 @@ public:
                     // generated later by TilingLinalgPipeline::runPipeline when
                     // appending user source to host.cc.
                     ret += "extern void host_canonicalized(...);\n";
+                    ret += "template<typename... Args>\n";
+                    ret += "inline void __aie_launch(const char* kernel, aieMesh mesh, Args... args) {\n";
+                    ret += "    (void)kernel; (void)mesh; (void)sizeof...(args);\n";
+                    ret += "}\n";
                     ret += "template<typename... Args>\n";
                     ret += "inline void __aie_launch(const char* kernel, aieDim mesh, Args... args) {\n";
                     ret += "    (void)kernel; (void)mesh; (void)sizeof...(args);\n";
@@ -1269,95 +1910,460 @@ public:
                     rso.flush();
                 }
 
-                mlir::MLIRContext ctx;
-				TilingLinalgPipeline::registerDialects(ctx);
-
-				// Build tensor params — use defaults matching unitest if not parsed
-				std::vector<TensorParam> tensors;
-				if (parsedTensors.empty()) {
-					// Default: single input tensor 16x16 i8 (same as unitest)
-					tensors.push_back({{16, 16}, 8, true});
-				} else {
-					for (auto &pt : parsedTensors) {
-						tensors.push_back({pt.shape, pt.elementBitWidth, pt.isInput});
-					}
-				}
-
-				// Use default mesh if not parsed
-				int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
-				int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
-
-                // Build SplitModel from parsed spatial tags
-                SplitModel splitModel;
-                if (!parsedTensors.empty()) {
-                    for (auto &pt : parsedTensors) {
-                        if (pt.spatialTag.empty()) {
-                            // default: row_broadcast_in / row_major_out
-                            splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(
-                                pt.isInput ? "row_broadcast_in" : "row_major_out", pt.isInput));
-                        } else {
-                            splitModel.tensorSplits.push_back(SplitModel::fromSpatialTag(pt.spatialTag, pt.isInput));
+                // Derive AIE generation string from the Clang preprocessor's AIE_GEN macro
+                // (set via --extra-arg=-DAIE_GEN=<version> at runtime, not compile-time)
+                std::string aieGenStr = "Gen2"; // default
+                {
+                    auto &PP = getCompilerInstance().getPreprocessor();
+                    auto *II = PP.getIdentifierInfo("AIE_GEN");
+                    if (II && II->hasMacroDefinition()) {
+                        auto *MI = PP.getMacroInfo(II);
+                        if (MI && MI->getNumTokens() == 1 &&
+                            MI->getReplacementToken(0).is(clang::tok::numeric_constant)) {
+                            llvm::StringRef valStr = MI->getReplacementToken(0).getLiteralData()
+                                                         ? llvm::StringRef(MI->getReplacementToken(0).getLiteralData(),
+                                                                           MI->getReplacementToken(0).getLength())
+                                                         : "";
+                            int aieGen = 2;
+                            valStr.getAsInteger(10, aieGen);
+                            if (aieGen == 1)
+                                aieGenStr = "Gen1";
+                            else if (aieGen >= 5)
+                                aieGenStr = "Gen5";
                         }
                     }
-                } else {
-                    splitModel = SplitModel::gemm();
+                }
+            llvm::outs() << "[TilingLinalg] AIE generation: " << aieGenStr << "\n";
+
+            mlir::MLIRContext ctx;
+            TilingLinalgPipeline::registerDialects(ctx);
+
+            std::string outputDir = std::string(AOUT) + "worklocal/";
+            bool isMultiKernel = parsedMeshKernels.size() > 1;
+
+            // ---- Multi-kernel loop: run pipeline per kernel ----
+            if (isMultiKernel) {
+                llvm::outs() << "[TilingLinalg] Multi-kernel mode: " << parsedMeshKernels.size() << " kernels\n";
+
+                for (size_t ki = 0; ki < parsedMeshKernels.size(); ++ki) {
+                    auto &mkd = parsedMeshKernels[ki];
+                    llvm::outs() << "[TilingLinalg] === Pipeline run " << ki << ": kernel=" << mkd.kernelName
+                                 << " mesh=" << mkd.meshRows << "x" << mkd.meshCols << " ===\n";
+
+                    int rows = mkd.meshRows > 0 ? mkd.meshRows : 2;
+                    int cols = mkd.meshCols > 0 ? mkd.meshCols : 2;
+
+                    // Use per-kernel tensors and splitModel
+                    SplitModel &splitModel = mkd.splitModel;
+                    if (splitModel.tensorSplits.empty())
+                        splitModel = SplitModel::gemm();
+
+                    // Build routing IR for this kernel
+                    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, mkd.tensors, splitModel,
+                                                                       mkd.partition, aieGenStr);
+
+                    // Replace aie::get_*() calls in kernel body with computed integer literals
+                    std::string resolvedBody = mkd.kernelBody;
+                    if (mkd.derivedParams.valid && !resolvedBody.empty()) {
+                        llvm::outs() << "[TilingLinalg] Replacing aie::get_*() calls in kernel body for "
+                                     << mkd.kernelName << "\n";
+
+                        // Build port name -> index map from stored varNames
+                        std::unordered_map<std::string, size_t> paramToPort;
+                        for (size_t pi = 0; pi < mkd.portVarNames.size(); ++pi) {
+                            paramToPort[mkd.portVarNames[pi]] = pi;
+                        }
+
+                        // Replace aie::get_num_rounds(win_x) and aie::get_buffer_size(win_x)
+                        for (const auto &funcName : {"aie::get_num_rounds", "aie::get_buffer_size"}) {
+                            std::string prefix = std::string(funcName) + "(";
+                            size_t pos = 0;
+                            while ((pos = resolvedBody.find(prefix, pos)) != std::string::npos) {
+                                size_t argStart = pos + prefix.size();
+                                size_t argEnd = resolvedBody.find(")", argStart);
+                                if (argEnd == std::string::npos)
+                                    break;
+                                std::string argName = resolvedBody.substr(argStart, argEnd - argStart);
+                                while (!argName.empty() && argName.front() == ' ')
+                                    argName.erase(0, 1);
+                                while (!argName.empty() && argName.back() == ' ')
+                                    argName.pop_back();
+                                auto it = paramToPort.find(argName);
+                                if (it != paramToPort.end() && it->second < mkd.derivedParams.portParams.size()) {
+                                    int64_t val;
+                                    if (std::string(funcName) == "aie::get_num_rounds")
+                                        val = mkd.derivedParams.portParams[it->second].numRounds;
+                                    else
+                                        val = mkd.derivedParams.portParams[it->second].bufferSize;
+                                    std::string replacement = std::to_string(val);
+                                    resolvedBody.replace(pos, argEnd + 1 - pos, replacement);
+                                    pos += replacement.size();
+                                } else {
+                                    pos = argEnd + 1;
+                                }
+                            }
+                        }
+
+                        // Replace simple calls: get_tile_rows(), get_tile_cols(), get_k_dim()
+                        auto replaceSimpleCall = [&](const std::string &call, int64_t val) {
+                            std::string replacement = std::to_string(val);
+                            size_t pos = 0;
+                            while ((pos = resolvedBody.find(call, pos)) != std::string::npos) {
+                                resolvedBody.replace(pos, call.size(), replacement);
+                                pos += replacement.size();
+                            }
+                        };
+                        replaceSimpleCall("aie::get_tile_rows()", mkd.derivedParams.tileRows);
+                        replaceSimpleCall("aie::get_tile_cols()", mkd.derivedParams.tileCols);
+                        replaceSimpleCall("aie::get_k_dim()", mkd.derivedParams.kDim);
+                    }
+
+                    // Prepend user macros to kernel body
+                    std::string kernelBodyWithMacros = resolvedBody;
+                    if (!userMacroDefines.empty() && !resolvedBody.empty()) {
+                        std::string macroBlock = "// User macro definitions from source file\n";
+                        for (const auto &macro : userMacroDefines) {
+                            macroBlock += macro + "\n";
+                        }
+                        macroBlock += "\n";
+                        kernelBodyWithMacros = macroBlock + resolvedBody;
+                    }
+
+                    // First kernel writes host.cc fresh; subsequent kernels append
+                    bool appendMode = (ki > 0);
+                    // In multi-kernel mode, always suffix host function with kernel name
+                    std::string hostFuncSuffix = mkd.kernelName;
+                    // Don't pass userRewrittenSource in multi-kernel mode — we emit it ourselves after all runs
+                    unsigned hostDdrArgs = 0;
+                    if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros,
+                                                           mkd.kernelFuncName, parsedDebugLevel,
+                                                           /*userRewrittenSource=*/"", {}, mkd.maxPPBytes, aieGenStr,
+                                                           hostFuncSuffix, appendMode, &hostDdrArgs)) {
+                        llvm::errs() << "[TilingLinalg] Pipeline FAILED for kernel: " << mkd.kernelName << "\n";
+                        std::exit(1);
+                    }
+                    mkd.numHostDdrArgs = hostDdrArgs;
+                    llvm::outs() << "[TilingLinalg] Pipeline completed for kernel: " << mkd.kernelName
+                                 << " (hostDdrArgs=" << hostDdrArgs << ")\n";
                 }
 
+                // ---- Post-pipeline: append user source + unified __aie_launch to host.cc ----
+                {
+                    std::string hostPath = outputDir + "/host.cc";
+                    std::error_code ec;
+                    llvm::raw_fd_ostream stream(hostPath, ec, llvm::sys::fs::OF_Append);
+                    if (ec) {
+                        llvm::errs() << "Failed to open " << hostPath << " for appending: " << ec.message() << "\n";
+                        std::exit(1);
+                    }
+
+                    stream << "\n// ===== User source + multi-kernel __aie_launch dispatch =====\n";
+                    stream << "#define AIEHLC_TILING_STUBS_DEFINED\n";
+                    stream << "#include <cstring>\n";
+                    // Re-emit SpatialPolicy types so user source constexpr definitions compile
+                    stream << "namespace aie {\n";
+                    stream << "enum class Pattern  { Broadcast = 0, Scatter = 1, Multicast = 2, Gather = 3 };\n";
+                    stream << "enum class Layout   { Row = 0, Col = 1, Grid = 2 };\n";
+                    stream << "enum class Flow     { Default = 0, LeftToRight = 1, RightToLeft = 2 };\n";
+                    stream << "struct SpatialPolicy {\n";
+                    stream << "  Pattern pattern      = Pattern::Broadcast;\n";
+                    stream << "  Layout  distribution = Layout::Row;\n";
+                    stream << "  Flow    merge_order  = Flow::Default;\n";
+                    stream << "  int     pp_depth     = 2;\n";
+                    stream << "  int     max_buffer_bytes = 4096;\n";
+                    stream << "};\n";
+                    stream << "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
+                    stream << "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
+                    stream << "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
+                    stream << "constexpr int get_tile_rows() { return 0; }\n";
+                    stream << "constexpr int get_tile_cols() { return 0; }\n";
+                    stream << "constexpr int get_k_dim() { return 0; }\n";
+                    stream << "}\n";
+                    // aiePartition struct
+                    stream << "struct aiePartition {\n";
+                    stream << "    int startCol, endCol, startRow, endRow;\n";
+                    stream << "};\n";
+                    // aieMesh + aieArray
+                    stream << "struct aieMesh {\n";
+                    stream << "    int rows, cols;\n";
+                    stream << "    aiePartition partition;\n";
+                    stream << "    int meshId;\n";
+                    stream << "};\n";
+                    stream << "struct aieArray {\n";
+                    stream << "    int nextMeshId = 0;\n";
+                    stream << "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
+                    stream << "        return aieMesh{rows, cols, p, nextMeshId++};\n";
+                    stream << "    }\n";
+                    stream << "    void synchronize() { /* no-op: each <<<mesh>>> call does its own teardown */ }\n";
+                    stream << "};\n";
+                    // aieDim (backward compat)
+                    stream << "struct aieDim {\n";
+                    stream << "    int rows, cols;\n";
+                    stream << "    aiePartition partition;\n";
+                    stream << "    bool hasPartition;\n";
+                    stream << "    aieDim(int r, int c) : rows(r), cols(c), partition{-1,-1,-1,-1}, "
+                              "hasPartition(false) {}\n";
+                    stream << "    aieDim(int r, int c, aiePartition p) : rows(r), cols(c), partition(p), "
+                              "hasPartition(true) {}\n";
+                    stream << "};\n";
+                    stream << "inline void aieSetDevice(int) {}\n";
+                    stream << "inline void aieDeviceSynchronize() {}\n";
+
+                    // Emit extern declarations for per-kernel binary symbols
+                    // (must appear before __aie_launch which references them)
+                    for (auto &mkd : parsedMeshKernels) {
+                        stream << "extern unsigned char _binary_kernel_" << mkd.kernelName << "_start[];\n";
+                        stream << "extern unsigned char _binary_kernel_" << mkd.kernelName << "_end[];\n";
+                        stream << "extern unsigned int _binary_kernel_" << mkd.kernelName << "_size;\n";
+                    }
+
+                    // Find max DDR args across all kernels for __aie_launch signature
+                    unsigned maxDdrArgs = 0;
+                    for (auto &mkd : parsedMeshKernels) {
+                        if (mkd.numHostDdrArgs > maxDdrArgs)
+                            maxDdrArgs = mkd.numHostDdrArgs;
+                    }
+
+                    // Emit unified __aie_launch with strcmp dispatch (aieMesh overload)
+                    if (maxDdrArgs > 0) {
+                        stream << "inline void __aie_launch(const char* kernel, aieMesh mesh";
+                        for (unsigned i = 0; i < maxDdrArgs; ++i)
+                            stream << ", void* _t" << i;
+                        stream << ", ...) {\n";
+                        for (size_t ki = 0; ki < parsedMeshKernels.size(); ++ki) {
+                            auto &mkd = parsedMeshKernels[ki];
+                            std::string hostFunc = "host_canonicalized_" + mkd.kernelName;
+                            stream << "    " << (ki == 0 ? "if" : "} else if") << " (strcmp(kernel, \""
+                                   << mkd.kernelName << "\") == 0) {\n";
+                            stream
+                                << "        XAie_DevInst* dev = __Runtime_explicit_init_partition("
+                                << "mesh.partition.startCol, mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                            stream << "        __Runtime_set_kernel_elf(_binary_kernel_" << mkd.kernelName
+                                   << "_start);\n";
+                            stream << "        " << hostFunc << "(dev";
+                            for (unsigned i = 0; i < mkd.numHostDdrArgs; ++i)
+                                stream << ", _t" << i;
+                            stream << ");\n";
+                            stream << "        __Runtime_explicit_teardown(dev);\n";
+                        }
+                        stream << "    }\n";
+                        stream << "}\n";
+
+                        // aieDim overload (backward compat)
+                        stream << "inline void __aie_launch(const char* kernel, aieDim mesh";
+                        for (unsigned i = 0; i < maxDdrArgs; ++i)
+                            stream << ", void* _t" << i;
+                        stream << ", ...) {\n";
+                        stream << "    (void)kernel;\n";
+                        stream << "    XAie_DevInst* dev;\n";
+                        stream << "    if (mesh.hasPartition) {\n";
+                        stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
+                                  "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                        stream << "    } else {\n";
+                        stream << "        dev = __Runtime_explicit_init();\n";
+                        stream << "    }\n";
+                        // aieDim only supports single kernel (backward compat) — dispatch first kernel
+                        if (!parsedMeshKernels.empty()) {
+                            std::string hostFunc = "host_canonicalized_" + parsedMeshKernels[0].kernelName;
+                            stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << parsedMeshKernels[0].kernelName
+                                   << "_start);\n";
+                            stream << "    " << hostFunc << "(dev";
+                            for (unsigned i = 0; i < parsedMeshKernels[0].numHostDdrArgs; ++i)
+                                stream << ", _t" << i;
+                            stream << ");\n";
+                        }
+                        stream << "    __Runtime_explicit_teardown(dev);\n";
+                        stream << "}\n";
+                    } else {
+                        // No DDR args variant (template)
+                        stream << "template<typename... Args>\n";
+                        stream << "inline void __aie_launch(const char* kernel, aieMesh mesh, Args... args) {\n";
+                        for (size_t ki = 0; ki < parsedMeshKernels.size(); ++ki) {
+                            auto &mkd = parsedMeshKernels[ki];
+                            std::string hostFunc = "host_canonicalized_" + mkd.kernelName;
+                            stream << "    " << (ki == 0 ? "if" : "} else if") << " (strcmp(kernel, \""
+                                   << mkd.kernelName << "\") == 0) {\n";
+                            stream
+                                << "        XAie_DevInst* dev = __Runtime_explicit_init_partition("
+                                << "mesh.partition.startCol, mesh.partition.endCol - mesh.partition.startCol + 1);\n";
+                            stream << "        __Runtime_set_kernel_elf(_binary_kernel_" << mkd.kernelName
+                                   << "_start);\n";
+                            stream << "        " << hostFunc << "(dev);\n";
+                            stream << "        __Runtime_explicit_teardown(dev);\n";
+                        }
+                        stream << "    }\n";
+                        stream << "}\n";
+                    }
+
+                    // Append user's rewritten source
+                    stream << userRewrittenSource << "\n";
+                    stream.close();
+                    llvm::outs() << "[TilingLinalg] Multi-kernel __aie_launch + user source appended to host.cc\n";
+                }
+            } else {
+                // ---- Single-kernel path (backward compatible) ----
+                // Build tensor params — use defaults matching unitest if not parsed
+                std::vector<TensorParam> tensors;
+                SplitModel splitModel;
+                std::string singleKernelBody = userKernelBody;
+                std::string singleKernelFuncName = userKernelFuncName;
+                int64_t effectiveMaxPPBytes = 4096;
+
+                if (!parsedMeshKernels.empty()) {
+                    // Use data from the single MeshKernelDesc
+                    auto &mkd = parsedMeshKernels[0];
+                    tensors = mkd.tensors;
+                    splitModel = mkd.splitModel;
+                    singleKernelBody = mkd.kernelBody;
+                    singleKernelFuncName = mkd.kernelFuncName;
+                    effectiveMaxPPBytes = mkd.maxPPBytes;
+                } else if (parsedTensors.empty()) {
+                    tensors.push_back({{16, 16}, 8, true});
+                    splitModel = SplitModel::gemm();
+                } else {
+                    for (auto &pt : parsedTensors) {
+                        tensors.push_back({pt.shape, pt.elementBitWidth, pt.isInput});
+                    }
+                    splitModel = SplitModel::gemm();
+                }
+                if (splitModel.tensorSplits.empty())
+                    splitModel = SplitModel::gemm();
+
+                // Use default mesh if not parsed
+                int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
+                int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
+
                 // Build routing IR
-                auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel);
+                auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel,
+                                                                   parsedPartition, aieGenStr);
+
+                // Replace aie::get_*() calls in kernel body with computed integer literals
+                if (derivedTilingParams.valid && !singleKernelBody.empty()) {
+                    llvm::outs() << "[TilingLinalg] Replacing aie::get_*() calls in kernel body\n";
+
+                    std::unordered_map<std::string, size_t> paramToPort;
+                    for (size_t i = 0; i < parsedTensors.size(); ++i) {
+                        paramToPort[parsedTensors[i].varName] = i;
+                    }
+
+                    for (const auto &funcName : {"aie::get_num_rounds", "aie::get_buffer_size"}) {
+                        std::string prefix = std::string(funcName) + "(";
+                        size_t pos = 0;
+                        while ((pos = singleKernelBody.find(prefix, pos)) != std::string::npos) {
+                            size_t argStart = pos + prefix.size();
+                            size_t argEnd = singleKernelBody.find(")", argStart);
+                            if (argEnd == std::string::npos)
+                                break;
+                            std::string argName = singleKernelBody.substr(argStart, argEnd - argStart);
+                            while (!argName.empty() && argName.front() == ' ')
+                                argName.erase(0, 1);
+                            while (!argName.empty() && argName.back() == ' ')
+                                argName.pop_back();
+                            auto it = paramToPort.find(argName);
+                            if (it != paramToPort.end() && it->second < derivedTilingParams.portParams.size()) {
+                                int64_t val;
+                                if (std::string(funcName) == "aie::get_num_rounds")
+                                    val = derivedTilingParams.portParams[it->second].numRounds;
+                                else
+                                    val = derivedTilingParams.portParams[it->second].bufferSize;
+                                std::string replacement = std::to_string(val);
+                                singleKernelBody.replace(pos, argEnd + 1 - pos, replacement);
+                                pos += replacement.size();
+                            } else {
+                                pos = argEnd + 1;
+                            }
+                        }
+                    }
+
+                    auto replaceSimpleCall = [&](const std::string &call, int64_t val) {
+                        std::string replacement = std::to_string(val);
+                        size_t pos = 0;
+                        while ((pos = singleKernelBody.find(call, pos)) != std::string::npos) {
+                            singleKernelBody.replace(pos, call.size(), replacement);
+                            pos += replacement.size();
+                        }
+                    };
+                    replaceSimpleCall("aie::get_tile_rows()", derivedTilingParams.tileRows);
+                    replaceSimpleCall("aie::get_tile_cols()", derivedTilingParams.tileCols);
+                    replaceSimpleCall("aie::get_k_dim()", derivedTilingParams.kDim);
+                }
 
                 // Prepend user macros to kernel body for multi-tile path
-                std::string kernelBodyWithMacros = userKernelBody;
-                if (!userMacroDefines.empty() && !userKernelBody.empty()) {
+                std::string kernelBodyWithMacros = singleKernelBody;
+                if (!userMacroDefines.empty() && !singleKernelBody.empty()) {
                     std::string macroBlock = "// User macro definitions from source file\n";
                     for (const auto &macro : userMacroDefines) {
                         macroBlock += macro + "\n";
                     }
                     macroBlock += "\n";
-                    kernelBodyWithMacros = macroBlock + userKernelBody;
+                    kernelBodyWithMacros = macroBlock + singleKernelBody;
                 }
 
-                // Run pipeline -> writes host.cc, kernel.cc, routing.cc, BCF, PRX
-				std::string outputDir = std::string(AOUT) + "worklocal/";
-                if (TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros, userKernelFuncName,
-                                                      parsedDebugLevel, userRewrittenSource)) {
-                    llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
-                } else {
+                // Run pipeline (single kernel — no suffix, no append mode)
+                if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros,
+                                                       singleKernelFuncName, parsedDebugLevel, userRewrittenSource, {},
+                                                       effectiveMaxPPBytes, aieGenStr)) {
                     llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
                     std::exit(1);
                 }
-            } else {
-				// ---- EXISTING PATH: single-tile ----
-				std::error_code error_code;
-				llvm::outs() << "Exporting File: " << std::string(AOUT)+"./host.cc" << "\n";
-				llvm::raw_fd_ostream outFile(std::string(AOUT)+"./host.cc", error_code, llvm::sys::fs::OF_None);
-				if (error_code) {
-					llvm::errs() << "Error opening file: " << error_code.message() << "\n";
-					return ;  // Exit early if there's an error
-				}
-                // Emit strong g_runtime_debug_level override if user set #pragma aie_debug_level
-                if (parsedDebugLevel >= 0) {
-                    outFile << "// Override runtime debug level (from #pragma aie_debug_level)\n";
-                    outFile << "int g_runtime_debug_level = " << parsedDebugLevel << ";\n\n";
+            }
+
+            llvm::outs() << "[TilingLinalg] Pipeline completed. Output in: " << outputDir << "\n";
+            // Copy user #include "..." headers to outputDir so host.cc is self-contained.
+            if (!userSourceDir.empty() && !userRewrittenSource.empty()) {
+                std::regex includeRegex(R"(#\s*include\s*\"([^\"]+)\")");
+                auto begin = std::sregex_iterator(userRewrittenSource.begin(), userRewrittenSource.end(), includeRegex);
+                auto end = std::sregex_iterator();
+                for (auto it = begin; it != end; ++it) {
+                    std::string headerName = (*it)[1].str();
+                    // Skip runtime headers already on the compiler include path
+                    if (headerName == "aie_runtime.h" || headerName == "aie_runtime_debug.h" ||
+                        headerName == "xaiengine.h")
+                        continue;
+                    std::string srcPath = userSourceDir + "/" + headerName;
+                    std::string dstPath = outputDir + "/" + headerName;
+                    // Only copy if the file exists in the user source directory
+                    std::ifstream src(srcPath, std::ios::binary);
+                    if (src.good()) {
+                        std::ofstream dst(dstPath, std::ios::binary);
+                        dst << src.rdbuf();
+                        llvm::outs() << "[TilingLinalg] Copied user header: " << headerName << " -> " << dstPath
+                                     << "\n";
+                    }
                 }
-                //fd.write(RewriteBuf->data(), RewriteBuf->size());
-				RewriteBuf->write(outFile);
-				/*
-				auto& sc = Rewrite.getSourceMgr();
-				auto mid = sc.getMainFileID();
-				llvm::StringRef sourceCode = sc.getBufferData(mid);
-				llvm::outs() << "Original Source Code:\n" << sourceCode << "\n";
-				*/
-				const std::string fname = "aie.mlir";
-				auto mlirstr = aiefrontend.dumpir();
-				std::ofstream ofs(fname);
-				if (ofs.is_open()) {
-						ofs << mlirstr;
-						ofs.close();
-				}
-				aiefrontend.RunPass(fname);
-			}
-			//  std::cout << "----------------end-----------------" << std::endl;
+            }
+        } else {
+            // ---- EXISTING PATH: single-tile ----
+            std::error_code error_code;
+            llvm::outs() << "Exporting File: " << std::string(AOUT) + "./host.cc" << "\n";
+            llvm::raw_fd_ostream outFile(std::string(AOUT) + "./host.cc", error_code, llvm::sys::fs::OF_None);
+            if (error_code) {
+                llvm::errs() << "Error opening file: " << error_code.message() << "\n";
+                return; // Exit early if there's an error
+            }
+            // Emit strong g_runtime_debug_level override if user set #pragma aie_debug_level
+            if (parsedDebugLevel >= 0) {
+                outFile << "// Override runtime debug level (from #pragma aie_debug_level)\n";
+                outFile << "int g_runtime_debug_level = " << parsedDebugLevel << ";\n\n";
+            }
+            // fd.write(RewriteBuf->data(), RewriteBuf->size());
+            RewriteBuf->write(outFile);
+            /*
+            auto& sc = Rewrite.getSourceMgr();
+            auto mid = sc.getMainFileID();
+            llvm::StringRef sourceCode = sc.getBufferData(mid);
+            llvm::outs() << "Original Source Code:\n" << sourceCode << "\n";
+            */
+            const std::string fname = "aie.mlir";
+            auto mlirstr = aiefrontend.dumpir();
+            std::ofstream ofs(fname);
+            if (ofs.is_open()) {
+                ofs << mlirstr;
+                ofs.close();
+            }
+            aiefrontend.RunPass(fname);
+        }
+        //  std::cout << "----------------end-----------------" << std::endl;
   	}
     std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                    StringRef file) override {
@@ -1459,5 +2465,8 @@ int main(int argc, const char **argv) {
 		Tool.appendArgumentsAdjuster(
 				getInsertArgumentAdjuster(("-I" + IncludePath).c_str(), ArgumentInsertPosition::BEGIN));
 	}
+
+    // Force C++20 for struct NTTP support in aie::port<T, SpatialPolicy>
+    Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster("-std=c++20", ArgumentInsertPosition::BEGIN));
     return Tool.run(newFrontendActionFactory<MyFrontendAction>().get());
 }

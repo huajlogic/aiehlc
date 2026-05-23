@@ -6,6 +6,7 @@
 #include "routinglower.h"
 #include "routing/routingpath.h"
 #include <sstream>
+
 int ioIdx = 0;
 //connectpktstreamswitchport
 
@@ -145,20 +146,26 @@ struct StreamPKTConnection {
         std::cout << "  - MasterSendToNextTileDirection: " << PortDirectiontoString(value.MasterSendToNextTileDirection) << std::endl;
         std::cout << "  - MasterSendToNextTileDirectionPortIdx: " << (int)(value.MasterSendToNextTileDirectionPortIdx) << std::endl;
 
+        // For output gather flows, preserve headers when OOO is enabled
+        bool preserveHdr = true;
         rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
-            op->getLoc(),                   // Operation location
+            op->getLoc(), // Operation location
             output,
-            curTileOp.getResult(),                   // Tile to be configured
-            rewriter.getStringAttr(PortDirectiontoString(value.SlaveReceiveForwardDirection)), // Direction of the port receiving the stream
-            rewriter.getI32IntegerAttr((int)value.SlaveReceiveForwardDirectionPortIdx),     // Index of the receiving port
-            rewriter.getI32IntegerAttr(value.SlaveReceivePktID),// Packet ID to expect
-            rewriter.getI32IntegerAttr(value.SlaveReceivePktType),// Packet Type to expect
-            rewriter.getStringAttr(PortDirectiontoString(PortDirection::DMA)),  // local DMA direction NONE means no DMA
-            rewriter.getI32IntegerAttr(value.localDMAForwardPortIdx),  // Index of the local DMA port to send to
-            rewriter.getI32IntegerAttr(value.localDMAForwardPktID ),    // Packet ID for the DMA transfer
-            rewriter.getI32IntegerAttr(value.localDMAForwardPktType),  // Packet Type for the DMA transfer
-            rewriter.getStringAttr(PortDirectiontoString(value.MasterSendToNextTileDirection)),     // No forwarding: empty master direction
-            rewriter.getI32IntegerAttr((int)(value.MasterSendToNextTileDirectionPortIdx)) // No forwarding: port index 0
+            curTileOp.getResult(), // Tile to be configured
+            rewriter.getStringAttr(PortDirectiontoString(
+                value.SlaveReceiveForwardDirection)), // Direction of the port receiving the stream
+            rewriter.getI32IntegerAttr((int)value.SlaveReceiveForwardDirectionPortIdx), // Index of the receiving port
+            rewriter.getI32IntegerAttr(value.SlaveReceivePktID),                        // Packet ID to expect
+            rewriter.getI32IntegerAttr(value.SlaveReceivePktType),                      // Packet Type to expect
+            rewriter.getStringAttr(PortDirectiontoString(PortDirection::DMA)), // local DMA direction NONE means no DMA
+            rewriter.getI32IntegerAttr(value.localDMAForwardPortIdx),          // Index of the local DMA port to send to
+            rewriter.getI32IntegerAttr(value.localDMAForwardPktID),            // Packet ID for the DMA transfer
+            rewriter.getI32IntegerAttr(value.localDMAForwardPktType),          // Packet Type for the DMA transfer
+            rewriter.getStringAttr(
+                PortDirectiontoString(value.MasterSendToNextTileDirection)), // No forwarding: empty master direction
+            rewriter.getI32IntegerAttr(
+                (int)(value.MasterSendToNextTileDirectionPortIdx)), // No forwarding: port index 0
+            rewriter.getBoolAttr(preserveHdr)                       // preserveheader: keep headers for OOO BD dispatch
         );
     }
     ret.tile = tilist.back();
@@ -329,22 +336,28 @@ void ParseTheCCTRoutingPath(Operation* op,
             if (lastPkttilemap && lastPkttilemap->tile == point) {
                 auto output = rewriter.getI32Type();
                 auto tileOp = dyn_cast<routinghw::TileCreate>((Operation* )lastPkttilemap->tileOp);
+                // Transition op: preserve headers when OOO is enabled
+                bool preserveHdrTransition = true;
                 ///*
                 rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
-                        loc,                   // Operation location
-                        output,
-                        tileOp.getResult(),                   // Tile to be configured
-                        rewriter.getStringAttr(PortDirectiontoString(PortDirection::NONE)), // Direction of the port receiving the stream
-                        rewriter.getI32IntegerAttr(0),     // Index of the receiving port
-                        rewriter.getI32IntegerAttr(0),// Packet ID to expect
-                        rewriter.getI32IntegerAttr(0),// Packet Type to expect
-                        rewriter.getStringAttr(PortDirectiontoString(PortDirection::NONE)),
-                        rewriter.getI32IntegerAttr(0),  // Index of the local DMA port to send to
-                        rewriter.getI32IntegerAttr(0),    // Packet ID for the DMA transfer
-                        rewriter.getI32IntegerAttr(0),  // Packet Type for the DMA transfer
-                        rewriter.getStringAttr(PortDirectiontoString(conn.MasterSendToNextTileDirection)),     // No forwarding: empty master direction
-                        rewriter.getI32IntegerAttr((int)(conn.MasterSendToNextTileDirectionPortIdx)) // No forwarding: port index 0
-                );//*/
+                    loc, // Operation location
+                    output,
+                    tileOp.getResult(), // Tile to be configured
+                    rewriter.getStringAttr(
+                        PortDirectiontoString(PortDirection::NONE)), // Direction of the port receiving the stream
+                    rewriter.getI32IntegerAttr(0),                   // Index of the receiving port
+                    rewriter.getI32IntegerAttr(0),                   // Packet ID to expect
+                    rewriter.getI32IntegerAttr(0),                   // Packet Type to expect
+                    rewriter.getStringAttr(PortDirectiontoString(PortDirection::NONE)),
+                    rewriter.getI32IntegerAttr(0), // Index of the local DMA port to send to
+                    rewriter.getI32IntegerAttr(0), // Packet ID for the DMA transfer
+                    rewriter.getI32IntegerAttr(0), // Packet Type for the DMA transfer
+                    rewriter.getStringAttr(PortDirectiontoString(
+                        conn.MasterSendToNextTileDirection)), // No forwarding: empty master direction
+                    rewriter.getI32IntegerAttr(
+                        (int)(conn.MasterSendToNextTileDirectionPortIdx)), // No forwarding: port index 0
+                    rewriter.getBoolAttr(preserveHdrTransition)            // preserveheader
+                );                                                         //*/
             }
             
             continue;

@@ -20,6 +20,11 @@ struct TensorSplitDesc {
     int splitDim;            // tensor dimension to split (default: 0). Irrelevant when splitnum=1.
     std::string hwAxisOwner; // "row" | "col" | "" — which mesh axis owns this tensor's partition
     std::string replicateOn; // "row" | "col" | "" — which mesh axis to replicate/broadcast on
+    // Spatial policy fields
+    std::string pattern; // "broadcast" | "scatter" | "multicast" | "gather"
+    std::string flow;    // "ltor" | "rtol" | "default"
+    int pingPong = 2;    // ping-pong buffer depth (2, 4, 8)
+    int maxBufferBytes = 4096; // max per-buffer size (PP_MAX_BYTES equivalent)
 };
 
 /// Operation-level split model: one TensorSplitDesc per tensor.
@@ -30,12 +35,71 @@ struct SplitModel {
     /// A: tensor split dim=0, mesh partition by row, broadcast along cols
     /// B: tensor split dim=0, mesh partition by col, broadcast along rows
     /// C: tensor split dim=0, mesh partition by row, gather along cols
-    static SplitModel gemm() { return {{{0, "row", "col"}, {0, "col", "row"}, {0, "row", "col"}}}; }
+    static SplitModel gemm() {
+        return {{{0, "row", "col", "broadcast", "default", 2, 4096},
+                 {0, "col", "row", "broadcast", "default", 2, 4096},
+                 {0, "row", "col", "gather", "ltor", 2, 4096}}};
+    }
 
     /// Construct a TensorSplitDesc from a spatial type tag string.
     /// tag: "row_broadcast_in", "col_broadcast_in", etc.
     /// isInput: used for default when tag is empty.
     static TensorSplitDesc fromSpatialTag(const std::string &tag, bool isInput);
+
+    /// Construct a TensorSplitDesc from resolved SpatialPolicy struct fields.
+    /// pattern: 0=Broadcast, 1=Scatter, 2=Multicast, 3=Gather
+    /// distribution: 0=Row, 1=Col, 2=Grid
+    /// mergeOrder: 0=Default, 1=LeftToRight, 2=RightToLeft
+    static TensorSplitDesc fromPolicyFields(int pattern, int distribution, int mergeOrder, int pingPong, bool isInput,
+                                            int maxBufferBytes = 4096);
+};
+
+/// Partition descriptor: confines tile allocation to a sub-region of the AIE array.
+/// When invalid (all -1), the full mesh is used.
+struct PartitionDesc {
+    int startCol = -1, endCol = -1; // column range [startCol, endCol]
+    int startRow = -1, endRow = -1; // row range [startRow, endRow]
+    bool isValid() const { return startCol >= 0; }
+};
+
+/// Derived tiling parameters computed from M/K/N and per-port SpatialPolicy.
+/// These are resolved after AST extraction and used to replace aie::get_*() calls
+/// in the kernel body with integer literals.
+struct DerivedTilingParams {
+    int64_t tileRows = 0; // M / HW_ROWS
+    int64_t tileCols = 0; // N / HW_COLS
+    int64_t kDim = 0;     // K
+
+    // Per-port derived values (indexed by tensor order: 0=A, 1=B, 2=C for GEMM)
+    struct PortParams {
+        int64_t numRounds = 0;
+        int64_t bufferSize = 0; // elements per round
+    };
+    std::vector<PortParams> portParams;
+    bool valid = false;
+};
+
+/// Descriptor for a kernel launch on a specific mesh.
+/// Used by multi-kernel mode to associate each <<<meshVar>>> launch with
+/// its kernel name, mesh dimensions, partition, and tensor parameters.
+struct MeshKernelDesc {
+    std::string kernelName;  // e.g. "matmul", "relu"
+    std::string meshVarName; // e.g. "meshA", "meshB"
+    int meshRows = 0, meshCols = 0;
+    PartitionDesc partition;
+    std::vector<TensorParam> tensors;
+    int meshId = 0; // compiler-assigned ID for partition tracking
+    // Per-kernel fields for multi-kernel pipeline
+    std::string kernelBody;     // raw source text of __global__ function body
+    std::string kernelFuncName; // kernel function name from __global__
+    SplitModel splitModel;      // per-tensor data distribution strategy
+    int64_t maxPPBytes = 4096;  // max ping-pong buffer bytes
+    /// Number of DDR args on the generated host function (set after pipeline run)
+    unsigned numHostDdrArgs = 0;
+    /// Per-port variable names (e.g. "win_a", "win_b", "win_c") for aie::get_*() replacement
+    std::vector<std::string> portVarNames;
+    /// Derived tiling parameters for this kernel (aie::get_*() replacement)
+    DerivedTilingParams derivedParams;
 };
 
 class TilingLinalgPipeline {
@@ -47,9 +111,11 @@ public:
     /// meshRows/meshCols -> createhwmesh dimensions
     /// tensors -> createscheduletensor + createroutingfuncBySplitModel
     /// splitModel -> per-tensor data distribution strategy
+    /// partition -> optional sub-region for tile allocation
     static mlir::ModuleOp buildRoutingIR(mlir::MLIRContext &ctx, int meshRows, int meshCols,
                                          const std::vector<TensorParam> &tensors,
-                                         const SplitModel &splitModel = SplitModel::gemm());
+                                         const SplitModel &splitModel = SplitModel::gemm(),
+                                         const PartitionDesc &partition = {}, const std::string &aieGen = "Gen2");
 
     /// Run the full pipeline and emit files to outputDir:
     ///   host.cc, kernel.cc, routing.cc, aieml.bcf, aieml.prx
@@ -57,9 +123,19 @@ public:
     /// instead of auto-generating the compute kernel. The function name
     /// in userKernelBody (userKernelFuncName) is renamed to match the
     /// pipeline's expected compute kernel name.
+    /// hostFuncSuffix: when non-empty, the generated host function is named
+    ///   host_canonicalized_<suffix> instead of host_canonicalized.
+    ///   Used by multi-kernel mode to generate per-kernel host functions.
+    /// appendMode: when true, host.cc is opened in append mode (OF_Append) and
+    ///   user source / __aie_launch emission is skipped. Used by multi-kernel mode
+    ///   so that each kernel appends its host_canonicalized_<name> function.
+    /// numHostDdrArgs (out): if non-null, set to the number of DDR pointer args
+    ///   on the generated host function (numArgs - 1, excluding XAie_DevInst* dev).
     /// Returns true on success.
     static bool runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                             const std::string &userKernelBody = "", const std::string &userKernelFuncName = "",
                             int runtimeDebugLevel = -1, const std::string &userRewrittenSource = "",
-                            const std::vector<TensorParam> &tensors = {});
+                            const std::vector<TensorParam> &tensors = {}, int64_t maxPingPongBytes = 4096,
+                            const std::string &aieGen = "Gen2", const std::string &hostFuncSuffix = "",
+                            bool appendMode = false, unsigned *numHostDdrArgs = nullptr);
 };

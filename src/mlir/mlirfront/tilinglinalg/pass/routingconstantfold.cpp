@@ -281,7 +281,7 @@ struct RemoveDeadCallOp : public mlir::OpRewritePattern<mlir::emitc::CallOp> {
         // XAie_* API calls configure hardware registers and must not be
         // removed even when their return value is unused.
         auto callee = callOp.getCallee();
-        if (callee == "XAie_TileLoc" || callee == "getOrCreateDeviceInstance") {
+        if (callee == "XAie_TileLoc") {
             rewriter.eraseOp(callOp);
             return success();
         }
@@ -364,8 +364,7 @@ void RoutingConstantFoldPass::runOnOperation() {
     auto& ctx = getContext();
     mlir::RewritePatternSet patterns(&ctx);
     // Add our pattern to the set of patterns to be applied.
-    //FIXE ME
-    RoutingTopology RR("Gen2");
+    RoutingTopology RR(aieGen_);
     patterns.add<FoldConstantOperandsIntoCall>(&ctx, RR);
     patterns.add<FoldConstantOperandsIntoCallOpaqueOp>(&ctx, RR);
     patterns.add<RemoveDeadCallOp>(&ctx);

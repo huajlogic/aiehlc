@@ -135,6 +135,33 @@ void AieRt_PrintCoreModuleEventsAll(XAie_DevInst *dev, const XAie_LocType *tiles
 #define AIERT_DMA_CUR_BD_MASK 0x0F000000u
 #define AIERT_DMA_CUR_BD_LSB 24u
 
+/* Per-channel register stride (AIEML / AIE2PS: each channel has its own
+ * status register at +0x4 from the previous one) */
+#define AIERT_DMA_CHNUM_OFFSET 0x4u
+
+/* DMA channel status register base offsets (tile-relative).
+ * S2MM_STATUS_0 is the base; ch1 is at base + AIERT_DMA_CHNUM_OFFSET.
+ * MM2S_STATUS_0 is offset from S2MM_STATUS_0 by the direction offset.
+ *
+ * Core tile (MEMORY_MODULE) — same for AIEML and AIE2PS:
+ *   S2MM_STATUS_0 = 0x0001DF00   S2MM_STATUS_1 = 0x0001DF04
+ *   MM2S_STATUS_0 = 0x0001DF10   MM2S_STATUS_1 = 0x0001DF14
+ * Shim NOC tile (NOC_MODULE) — AIEML:
+ *   S2MM_STATUS_0 = 0x0001D220   MM2S_STATUS_0 = 0x0001D228
+ * Shim NOC tile (NOC_MODULE) — AIE2PS:
+ *   S2MM_STATUS_0 = 0x00009320   MM2S_STATUS_0 = 0x00009328
+ * Mem tile (MEM_TILE_MODULE) — same for AIEML and AIE2PS:
+ *   S2MM_STATUS_0 = 0x000A0660   MM2S_STATUS_0 = 0x000A0680
+ */
+#define AIERT_DMA_CORE_S2MM_STATUS_BASE 0x0001DF00u
+#define AIERT_DMA_CORE_MM2S_STATUS_BASE 0x0001DF10u
+#define AIERT_DMA_SHIM_S2MM_STATUS_BASE_ML 0x0001D220u  /* AIEML */
+#define AIERT_DMA_SHIM_MM2S_STATUS_BASE_ML 0x0001D228u  /* AIEML */
+#define AIERT_DMA_SHIM_S2MM_STATUS_BASE_2PS 0x00009320u /* AIE2PS */
+#define AIERT_DMA_SHIM_MM2S_STATUS_BASE_2PS 0x00009328u /* AIE2PS */
+#define AIERT_DMA_MEM_S2MM_STATUS_BASE 0x000A0660u
+#define AIERT_DMA_MEM_MM2S_STATUS_BASE 0x000A0680u
+
 /* STATUS field values */
 #define AIERT_DMA_STATUS_IDLE 0u
 #define AIERT_DMA_STATUS_RUNNING 1u
@@ -190,11 +217,27 @@ typedef struct {
 #define AIERT_CORE_SP_REG 0x00032D20
 #define AIERT_CORE_PC_MASK 0x000FFFFFu
 
+/* Memory module event status registers (tile-relative, on core tiles).
+ *   reg0 (0x00014200): MEM event IDs   0-31
+ *   reg1 (0x00014204): MEM event IDs  32-63
+ *   reg2 (0x00014208): MEM event IDs  64-95
+ *   reg3 (0x0001420C): MEM event IDs  96-127
+ */
 #define AIERT_CORE_MEM_EVT_STATUS_REG 0x00014200u
+#define AIERT_CORE_MEM_EVT_STATUS_REG1 0x00014204u
+#define AIERT_CORE_MEM_EVT_STATUS_REG2 0x00014208u
+#define AIERT_CORE_MEM_EVT_STATUS_REG3 0x0001420Cu
+
+/* Core module event status registers (tile-relative, on core tiles).
+ *   reg0 (0x00034200): Core event IDs   0-31
+ *   reg1 (0x00034204): Core event IDs  32-63
+ *   reg2 (0x00034208): Core event IDs  64-95
+ *   reg3 (0x0003420C): Core event IDs  96-127
+ */
 #define AIERT_CORE_CORE_EVT_STATUS_REG 0x00034200u
-/* Second core-module event status register: covers event IDs 32-63 (bits 32-63
- * of the core module event space, stored as bits [0:31] of this register). */
 #define AIERT_CORE_CORE_EVT_STATUS_REG1 0x00034204u
+#define AIERT_CORE_CORE_EVT_STATUS_REG2 0x00034208u
+#define AIERT_CORE_CORE_EVT_STATUS_REG3 0x0003420Cu
 
 /* Shim tile PL module event status register offsets (tile-relative).
  * Same offsets as CORE module event status registers but accessed on
@@ -204,11 +247,15 @@ typedef struct {
  *   reg1 (0x00034204): PL event IDs  32-63
  *   reg2 (0x00034208): PL event IDs  64-95
  *   reg3 (0x0003420C): PL event IDs  96-127
+ *   reg4 (0x00034210): PL event IDs 128-159
+ *   reg5 (0x00034214): PL event IDs 160-181 (AIE2PS)
  */
 #define AIERT_SHIM_PL_EVT_STATUS_REG0 0x00034200u
 #define AIERT_SHIM_PL_EVT_STATUS_REG1 0x00034204u
 #define AIERT_SHIM_PL_EVT_STATUS_REG2 0x00034208u
 #define AIERT_SHIM_PL_EVT_STATUS_REG3 0x0003420Cu
+#define AIERT_SHIM_PL_EVT_STATUS_REG4 0x00034210u
+#define AIERT_SHIM_PL_EVT_STATUS_REG5 0x00034214u
 
 /* --------------------------------------------------------------------------
  * Core module event status register bit positions (aie2psevent.md IDs 0-63)
@@ -217,30 +264,28 @@ typedef struct {
  * Register 1 (AIERT_CORE_CORE_EVT_STATUS_REG1, 0x00034204): event IDs 32-63
  *   bit N of register 1 = event ID (32 + N)
  *
- * Stall / activity events (all in register 1):
- *   ID 41 (bit  9) : MS_STALL
- *   ID 42 (bit 10) : PM_STALL  (instruction-load / program-memory stall)
- *   ID 43 (bit 11) : STREAM_STALL
- *   ID 44 (bit 12) : CASCADE_STALL
- *   ID 45 (bit 13) : LOCK_STALL
- *   ID 47 (bit 15) : ACTIVE
- *   ID 48 (bit 16) : DISABLED
- *   ID 49 (bit 17) : ECC_ERROR_STALL
- *   ID 50 (bit 18) : ECC_SCRUBBING_STALL
- *   ID 55 (bit 23) : STALL_NOP
+ * Stall / activity events (AIE2PS Table 4-8, all in register 0):
+ *   ID 23 (bit 23) : MEMORY_STALL
+ *   ID 24 (bit 24) : STREAM_STALL
+ *   ID 25 (bit 25) : CASCADE_STALL
+ *   ID 26 (bit 26) : LOCK_STALL
+ *   ID 27 (bit 27) : DEBUG_HALTED
+ *   ID 28 (bit 28) : ACTIVE
+ *   ID 29 (bit 29) : DISABLED
+ *   ID 30 (bit 30) : ECC_ERROR_STALL
+ *   ID 31 (bit 31) : ECC_SCRUBBING_STALL
  * -------------------------------------------------------------------------- */
 
-/* Bits within register 1 (event ID = 32 + bit_pos) */
-#define AIERT_CORE_EVT1_MS_STALL_BIT 9u         /* ID 41 */
-#define AIERT_CORE_EVT1_PM_STALL_BIT 10u        /* ID 42 - instr load stall */
-#define AIERT_CORE_EVT1_STREAM_STALL_BIT 11u    /* ID 43 */
-#define AIERT_CORE_EVT1_CASCADE_STALL_BIT 12u   /* ID 44 */
-#define AIERT_CORE_EVT1_LOCK_STALL_BIT 13u      /* ID 45 */
-#define AIERT_CORE_EVT1_ACTIVE_BIT 15u          /* ID 47 */
-#define AIERT_CORE_EVT1_DISABLED_BIT 16u        /* ID 48 */
-#define AIERT_CORE_EVT1_ECC_ERR_STALL_BIT 17u   /* ID 49 */
-#define AIERT_CORE_EVT1_ECC_SCRUB_STALL_BIT 18u /* ID 50 */
-#define AIERT_CORE_EVT1_STALL_NOP_BIT 23u       /* ID 55 */
+/* Bits within register 0 (event ID = bit_pos, AIE2PS layout) */
+#define AIERT_CORE_EVT0_MS_STALL_BIT 23u        /* ID 23 — MEMORY_STALL */
+#define AIERT_CORE_EVT0_STREAM_STALL_BIT 24u    /* ID 24 */
+#define AIERT_CORE_EVT0_CASCADE_STALL_BIT 25u   /* ID 25 */
+#define AIERT_CORE_EVT0_LOCK_STALL_BIT 26u      /* ID 26 */
+#define AIERT_CORE_EVT0_DEBUG_HALTED_BIT 27u    /* ID 27 */
+#define AIERT_CORE_EVT0_ACTIVE_BIT 28u          /* ID 28 */
+#define AIERT_CORE_EVT0_DISABLED_BIT 29u        /* ID 29 */
+#define AIERT_CORE_EVT0_ECC_ERR_STALL_BIT 30u   /* ID 30 */
+#define AIERT_CORE_EVT0_ECC_SCRUB_STALL_BIT 31u /* ID 31 */
 
 #define AIERT_EVT_DMA_S2MM_0_START_BIT 19u
 #define AIERT_EVT_DMA_S2MM_1_START_BIT 20u
@@ -359,8 +404,9 @@ void AieRt_PrintAllBds(XAie_DevInst *dev, XAie_LocType tile);
  *
  *   Word 0 (BD_0): Buffer_Length [31:0]
  *   Word 1 (BD_1): Base_Address_Low [31:0]
- *   Word 2 (BD_2): Base_Address_High [15:0], Packet_ID [28:24],
- *                   Packet_Type [22:20], Out_of_Order_BD_ID [5:0]
+ *   Word 2 (BD_2): Enable_Packet [30], Out_of_Order_BD_ID [29:24],
+ *                   Packet_ID [23:19], Packet_Type [18:16],
+ *                   Base_Address_High [15:0]
  *   Word 3 (BD_3): D0_Stepsize [19:0], D0_Wrap [29:20]
  *   Word 4 (BD_4): D1_Stepsize [19:0], D1_Wrap [29:20]
  *   Word 5 (BD_5): D2_Stepsize [19:0], D2_Wrap [29:20]
@@ -391,8 +437,29 @@ void AieRt_PrintShimBdRawAll(XAie_DevInst *dev, uint8_t col);
  * -------------------------------------------------------------------------- */
 
 /**
+ * Read the raw DMA channel status register via XAie_Read32 without masking.
+ *
+ * Unlike XAie_DmaGetChannelStatus (which masks the raw value, stripping
+ * STATUS[1:0], CUR_BD[27:24], and error bits), this function returns the
+ * full unmasked register content so AieRt_DecodeDmaChStatus can decode
+ * all fields correctly.
+ *
+ * Targets AIEML (aie version 5) and AIE2PS only.  Register addresses are
+ * selected based on tile type (core, shim, memtile).
+ *
+ * @param dev     Device instance.
+ * @param tile    Tile location.
+ * @param ch      Channel number (0 or 1).
+ * @param dir     DMA_S2MM or DMA_MM2S.
+ * @param status  [out] Raw unmasked 32-bit status register value.
+ * @return        XAIE_OK on success, or an error code.
+ */
+AieRC AieRt_DmaGetChannelStatusFull(XAie_DevInst *dev, XAie_LocType tile, uint8_t ch, XAie_DmaDirection dir,
+                                    uint32_t *status);
+
+/**
  * Decode a raw channel status word into AieRt_DmaChStatusDecoded.
- * @param raw_status  Value returned by XAie_DmaGetChannelStatus.
+ * @param raw_status  Value returned by AieRt_DmaGetChannelStatusFull.
  * @return Decoded status struct.
  */
 AieRt_DmaChStatusDecoded AieRt_DecodeDmaChStatus(uint32_t raw_status);
@@ -591,5 +658,68 @@ void AieRt_PrintStreamSwitchConfig(XAie_DevInst *dev, XAie_LocType tile, int pri
  * @param print_all  Passed through to AieRt_PrintStreamSwitchConfig.
  */
 void AieRt_PrintStreamSwitchConfigAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles, int print_all);
+
+/* --------------------------------------------------------------------------
+ * Performance counter debug
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Read and print memory module perf counter 0 and 1 values for a single
+ * core tile.  These are typically configured (via __Runtime_perfcnt_setup
+ * or __Runtime_perfcnt_setup_mm2s_bd_finished) to count MM2S channel 0
+ * and channel 1 BD finished events respectively.
+ *
+ * @param dev   Device instance.
+ * @param tile  Core tile location (row >= XAIE_AIE_TILE_ROW_START).
+ */
+void AieRt_PrintCoreTilePerfCounters(XAie_DevInst *dev, XAie_LocType tile);
+
+/**
+ * Call AieRt_PrintCoreTilePerfCounters for every core tile in the list.
+ */
+void AieRt_PrintCoreTilePerfCountersAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles);
+
+/* --------------------------------------------------------------------------
+ * Shim DMA Loopback
+ *
+ * Self-contained DDR→ShimDMA→DDR loopback test. Allocates src/dst DDR
+ * buffers, configures a circuit-switch loopback on SOUTH port 3 of the
+ * shim tile, runs a DMA transfer through it, and verifies the data.
+ * Useful for validating that the shim DMA + NoC + DDR path is functional
+ * on a given column before running the full GEMM pipeline.
+ *
+ * Reference: aieml-tests/src/xaie_shimdma_loopback.c
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Run a shim DMA loopback test on a single column.
+ *
+ * Caller provides pre-allocated DDR src and dst buffers. The function
+ * configures a circuit-switch loopback on SOUTH port 3, DMA-reads from
+ * srcaddr into the stream, loops it back, and DMA-writes to dstaddr.
+ * After transfer, compares srcaddr[] vs dstaddr[] word-by-word.
+ *
+ * @param dev      Device instance (must be initialized and partitioned).
+ * @param col      Shim tile column (must have NOC-DDR path enabled).
+ * @param srcaddr  Source DDR buffer (filled by caller with test data).
+ * @param dstaddr  Destination DDR buffer (cleared by caller, receives loopback data).
+ * @param len      Transfer size in bytes (must be multiple of 4).
+ * @return         0 on success (PASS), -2 timeout, -3 mismatch.
+ */
+int AieRt_ShimDmaLoopback(XAie_DevInst *dev, uint8_t col, uint32_t *srcaddr, uint32_t *dstaddr, uint32_t len);
+
+/**
+ * Run shim DMA loopback on multiple columns.
+ *
+ * @param dev      Device instance.
+ * @param cols     Array of column indices to test.
+ * @param num_cols Length of the cols array.
+ * @param srcaddr  Source DDR buffer (filled by caller).
+ * @param dstaddr  Destination DDR buffer (cleared by caller).
+ * @param len      Transfer size in bytes (must be multiple of 4).
+ * @return         Number of failed columns (0 = all passed).
+ */
+int AieRt_ShimDmaLoopbackAllCols(XAie_DevInst *dev, const uint8_t *cols, int num_cols, uint32_t *srcaddr,
+                                 uint32_t *dstaddr, uint32_t len);
 
 #endif /* AIE_RUNTIME_DEBUG_H */

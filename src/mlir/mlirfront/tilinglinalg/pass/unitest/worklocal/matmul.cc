@@ -1,140 +1,96 @@
 // User-provided compute kernel (extracted from __global__ function)
 // User macro definitions from source file
-#define M 16
-#define K 16
-#define N 16
-#define HW_ROWS 4
-#define HW_COLS 4
-#define TILE_ROWS (M / HW_ROWS)                 // 4: total output rows per tile
-#define TILE_COLS (N / HW_COLS)                 // 4: total output cols per tile
-#define ROWS_PER_ROUND (TILE_ROWS / 2)          // 2: A/B rows per DMA input round
-#define COLS_PER_ROUND (TILE_COLS / 2)          // 2: B cols per DMA input round
-#define K_DIM K                                 // 16: inner product dimension
-#define BUF_SZ_OUT (ROWS_PER_ROUND * TILE_COLS) // 8: output bytes per DMA round (2 rows * 4 cols)
 #define DEBUG_OUTPUT_ORDER 0
 
-void matmul(input_window_int8 *window_in_0, input_window_int8 *window_in_1, output_window_int8 *window_out_0) {
+void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_int8 *win_c) {
+
+    // Compiler-resolved tiling parameters
+    const int tile_rows = 64;
+    const int tile_cols = 64;
+    const int k_dim = 256;
+    const int num_a_rounds = 4;
+    const int num_b_rounds = 4;
+    const int num_c_rounds = 2;
+    const int buf_sz_a = 4096;
+    const int buf_sz_b = 4096;
+    const int buf_sz_c = 2048;
+
+    // Derived per-round sizes
+    const int rows_per_round = buf_sz_a / k_dim;
+    const int cols_per_round = buf_sz_b / k_dim;
 
 #if DEBUG_OUTPUT_ORDER
     unsigned coreid = get_coreid();
     int col = coreid >> 16;
     int row = coreid & 0x1F;
     int8_t tag = (int8_t)((row & 0x7) | ((col & 0x7) << 3));
-    klog("DEBUG", 2);
+    klog("DEBUG", 3);
 #endif
 
     // Local buffers
-    int8_t cache_A[ROWS_PER_ROUND * K_DIM];
-    int8_t cache_B[ROWS_PER_ROUND * K_DIM];
-    int8_t local_out[TILE_ROWS * TILE_COLS];
+    int8_t all_A[tile_rows * k_dim];
+    int8_t local_out[tile_rows * tile_cols];
 
-    // ===== Step 1: Receive-only ping — acquire+cache+release inputs =====
-    int8_t *A0 = (int8_t *)acquire_input_window(window_in_0);
-    int8_t *B0 = (int8_t *)acquire_input_window(window_in_1);
-    for (int i = 0; i < ROWS_PER_ROUND * K_DIM; i++) {
-        cache_A[i] = A0[i];
-        cache_B[i] = B0[i];
+    // ===== Phase 1: Receive and cache all A chunks =====
+    for (int ra = 0; ra < num_a_rounds; ra++) {
+        int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
+        for (int i = 0; i < buf_sz_a; i++)
+            all_A[ra * buf_sz_a + i] = A_ptr[i];
+        release_input_window(win_a);
     }
-    release_input_window(window_in_0);
-    release_input_window(window_in_1);
+
 #if DEBUG_OUTPUT_ORDER
-    // Log first COLS_PER_ROUND elements of A and B
-    for (int i = 0; i < K_DIM; i++) {
-        klog("A0  ", (int32_t)cache_A[i]);
-    }
-    for (int i = 0; i < K_DIM; i++) {
-        klog("B0  ", (int32_t)cache_B[i]);
+    for (int i = 0; i < 16; i++) {
+        klog("A0  ", (int32_t)all_A[i]);
     }
 #endif
 
-    // ===== Step 2: Compute top-left quadrant from cached data =====
-    // C[0:RPR-1, 0:CPR-1] = A0 * B0^T (top-left)
-    for (int i = 0; i < ROWS_PER_ROUND; i++) {
-        for (int j = 0; j < COLS_PER_ROUND; j++) {
-            int16_t sum = 0;
-            for (int k = 0; k < K_DIM; k++)
-                sum += (int16_t)cache_A[i * K_DIM + k] * (int16_t)cache_B[j * K_DIM + k];
-            if (sum > 127)
-                sum = 127;
-            else if (sum < -128)
-                sum = -128;
+    // ===== Phase 2: Stream B, compute all sub-blocks =====
+    for (int rb = 0; rb < num_b_rounds; rb++) {
+        int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
+
 #if DEBUG_OUTPUT_ORDER
-            if (j == 0)
-                sum = tag | ((0 & 0x3) << 6);
-#endif
-            local_out[i * TILE_COLS + j] = (int8_t)sum;
+        if (rb == 0) {
+            for (int i = 0; i < 16; i++) {
+                klog("B0  ", (int32_t)B_ptr[i]);
+            }
         }
+#endif
+
+        for (int ra = 0; ra < num_a_rounds; ra++) {
+            for (int i = 0; i < rows_per_round; i++) {
+                for (int j = 0; j < cols_per_round; j++) {
+                    int16_t sum = 0;
+                    for (int k = 0; k < k_dim; k++)
+                        sum += (int16_t)all_A[(ra * rows_per_round + i) * k_dim + k] * (int16_t)B_ptr[j * k_dim + k];
+                    if (sum > 127)
+                        sum = 127;
+                    else if (sum < -128)
+                        sum = -128;
+#if DEBUG_OUTPUT_ORDER
+                    if (j == 0)
+                        sum = tag | (((ra * num_b_rounds + rb) & 0x3) << 6);
+#endif
+                    local_out[(ra * rows_per_round + i) * tile_cols + rb * cols_per_round + j] = (int8_t)sum;
+                }
+            }
+        }
+
+        release_input_window(win_b);
     }
 
-    // ===== Step 3: Receive pong =====
-    int8_t *A1 = (int8_t *)acquire_input_window(window_in_0);
-    int8_t *B1 = (int8_t *)acquire_input_window(window_in_1);
-
-    // ===== Step 4: Compute remaining 3 quadrants =====
-    // C[0:RPR-1, CPR:TILE_COLS-1] = cached_A0 * B1^T (top-right)
-    for (int i = 0; i < ROWS_PER_ROUND; i++) {
-        for (int j = 0; j < COLS_PER_ROUND; j++) {
-            int16_t sum = 0;
-            for (int k = 0; k < K_DIM; k++)
-                sum += (int16_t)cache_A[i * K_DIM + k] * (int16_t)B1[j * K_DIM + k];
-            if (sum > 127)
-                sum = 127;
-            else if (sum < -128)
-                sum = -128;
+    // ===== Phase 3: Output =====
+    for (int rc = 0; rc < num_c_rounds; rc++) {
+        int8_t *out = (int8_t *)acquire_output_window(win_c);
+        for (int i = 0; i < buf_sz_c; i++)
+            out[i] = local_out[rc * buf_sz_c + i];
 #if DEBUG_OUTPUT_ORDER
-            if (j == 0)
-                sum = tag | ((1 & 0x3) << 6);
+        if (rc == 0) {
+            for (int l = 0; l < 8; l++) {
+                klog("C0 ", (int32_t)out[l]);
+            }
+        }
 #endif
-            local_out[i * TILE_COLS + j + COLS_PER_ROUND] = (int8_t)sum;
-        }
-    }
-
-    // C[RPR:TILE_ROWS-1, 0:CPR-1] = A1 * cached_B0^T (bottom-left)
-    for (int i = 0; i < ROWS_PER_ROUND; i++) {
-        for (int j = 0; j < COLS_PER_ROUND; j++) {
-            int16_t sum = 0;
-            for (int k = 0; k < K_DIM; k++)
-                sum += (int16_t)A1[i * K_DIM + k] * (int16_t)cache_B[j * K_DIM + k];
-            if (sum > 127)
-                sum = 127;
-            else if (sum < -128)
-                sum = -128;
-#if DEBUG_OUTPUT_ORDER
-            if (j == 0)
-                sum = tag | ((2 & 0x3) << 6);
-#endif
-            local_out[(i + ROWS_PER_ROUND) * TILE_COLS + j] = (int8_t)sum;
-        }
-    }
-
-    // C[RPR:TILE_ROWS-1, CPR:TILE_COLS-1] = A1 * B1^T (bottom-right)
-    for (int i = 0; i < ROWS_PER_ROUND; i++) {
-        for (int j = 0; j < COLS_PER_ROUND; j++) {
-            int16_t sum = 0;
-            for (int k = 0; k < K_DIM; k++)
-                sum += (int16_t)A1[i * K_DIM + k] * (int16_t)B1[j * K_DIM + k];
-            if (sum > 127)
-                sum = 127;
-            else if (sum < -128)
-                sum = -128;
-#if DEBUG_OUTPUT_ORDER
-            if (j == 0)
-                sum = tag | ((3 & 0x3) << 6);
-#endif
-            local_out[(i + ROWS_PER_ROUND) * TILE_COLS + j + COLS_PER_ROUND] = (int8_t)sum;
-        }
-    }
-
-    // ===== Step 5: Release pong inputs =====
-    release_input_window(window_in_0);
-    release_input_window(window_in_1);
-
-    // ===== Step 6-7: Output 2 rounds (8 bytes each, sequential row-major) =====
-    for (int round = 0; round < 2; round++) {
-        int8_t *out = (int8_t *)acquire_output_window(window_out_0);
-        for (int i = 0; i < BUF_SZ_OUT; i++) {
-            out[i] = local_out[round * BUF_SZ_OUT + i];
-        }
-        release_output_window(window_out_0);
+        release_output_window(win_c);
     }
 }

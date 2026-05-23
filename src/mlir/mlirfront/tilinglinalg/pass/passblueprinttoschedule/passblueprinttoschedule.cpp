@@ -505,6 +505,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
     std::shared_ptr<ResourceMgr> resourceMgr;
     std::shared_ptr<BlueprintPassState> passState;
     double bufferRatio;
+    int64_t maxPingPongBytes;
     // Buffer index mapping keyed by data_id.
     // All tiles share the same kernel ELF (one BCF), so all row partitions
     // of the same input tensor must use the same buffer addresses (e.g.
@@ -516,9 +517,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
     mutable int nextOutputIdx = 0;
 
     FlowTransferConversion(MLIRContext *ctx, std::shared_ptr<ResourceMgr> mgr,
-                           std::shared_ptr<BlueprintPassState> state, double ratio)
+                           std::shared_ptr<BlueprintPassState> state, double ratio, int64_t maxPPBytes)
         : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), resourceMgr(std::move(mgr)),
-          passState(std::move(state)), bufferRatio(ratio) {}
+          passState(std::move(state)), bufferRatio(ratio), maxPingPongBytes(maxPPBytes) {}
 
     LogicalResult
     matchAndRewrite(dfscheblueprint::FlowTransferOp op, OpAdaptor adaptor,
@@ -717,31 +718,213 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         auto shimDimStrides = shimFlowConfig.getShimDimStridesAttr();
         auto shimDimWraps = shimFlowConfig.getShimDimWrapsAttr();
 
-        auto shimBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-            loc, dfschedule::BdHandleType::get(rewriter.getContext()),
-            ddrBuffer,                                  // DDR receive buffer
-            shimTileOp.getTile(),                       // tile
-            shimBdIdConst.getResult(),                  // bd_id
-            rewriter.getI32IntegerAttr(0),              // offset
-            rewriter.getI32IntegerAttr(perTileShimLen), // len (per-tile portion)
-            rewriter.getBoolAttr(false),                // enable_packet = false
-            rewriter.getI32IntegerAttr(0),              // packet_id (unused)
-            rewriter.getI32IntegerAttr(4294967295),     // next_bd = none
-            rewriter.getI32IntegerAttr(0),              // acquire_lock_id
-            rewriter.getI32IntegerAttr(0),              // acquire_lock_val
-            rewriter.getI32IntegerAttr(0),              // release_lock_id
-            rewriter.getI32IntegerAttr(0),              // release_lock_val
-            rewriter.getI32IntegerAttr(dataId),         // data_id
-            Value(),                                    // linked_bd = none
-            /*dim_strides=*/shimDimStrides, /*dim_wraps=*/shimDimWraps);
+        // === Output gather (many_to_one) handling ===
+        // OOO path — per-tile shim BDs with packet headers preserved
+        // (routing uses DONOT_DROP_HEADER), shim S2MM channel enables OOO
+        // mode for non-deterministic tile arrival order.
+        bool isManyToOne = (transferType == "many_to_one");
+        bool useOOO = isManyToOne;
+
+        // Collect shim BD IDs allocated for each tile (used by core MM2S BDs
+        // to set out_of_order_bd_id pointing to the correct shim BD).
+        SmallVector<int32_t> shimPerTileBdIds;
+
+        Value lastShimBdHandle; // The BD handle consumed by ConfigCreateIoOp
+
+        // --- Compute per-round parameters for OOO iteration ---
+        // These values are identical for all tiles in this flow.
+        int64_t ooElementSizeBytes = 1;
+        if (memrefType.getElementType().isIntOrFloat())
+            ooElementSizeBytes = memrefType.getElementTypeBitWidth() / 8;
+        if (ooElementSizeBytes == 0)
+            ooElementSizeBytes = 1;
+
+        int64_t ooFullPartitionElements = shimBdLen / ooElementSizeBytes;
+        int64_t ooPerCoreElements = ooFullPartitionElements;
+        if (isManyToOne)
+            ooPerCoreElements = ooFullPartitionElements / numCoreTiles;
+
+        int64_t ooPingPongSize = static_cast<int64_t>(ooPerCoreElements * bufferRatio);
+        if (ooPingPongSize <= 0)
+            ooPingPongSize = 1;
+        if (maxPingPongBytes > 0 && ooElementSizeBytes > 0) {
+            int64_t maxElements = maxPingPongBytes / ooElementSizeBytes;
+            if (maxElements > 0 && ooPingPongSize > maxElements)
+                ooPingPongSize = maxElements;
+        }
+        // perCoreElements must be evenly divisible by ooPingPongSize
+        if (ooPerCoreElements % ooPingPongSize != 0) {
+            op.emitError("OOO iteration: perCoreElements (")
+                << ooPerCoreElements << ") not divisible by pingPongSize (" << ooPingPongSize << ")";
+            return failure();
+        }
+        int64_t ooNumIterations = ooPerCoreElements / ooPingPongSize;
+        int64_t perRoundBytes = ooPingPongSize * ooElementSizeBytes;
+
+        if (useOOO && numCoreTiles > 1) {
+            // --- OOO path: N per-tile shim BDs ---
+            // Each shim BD receives data from one core tile at the correct DDR
+            // column offset. The shim S2MM channel has OOO mode enabled, so
+            // incoming packets can arrive in any order — the out_of_order_bd_id
+            // in each packet header tells the DMA engine which BD to use.
+
+            // Compute per-tile DDR byte size for offset calculation
+            int64_t perTileDdrBytes = shimBdLen / numCoreTiles;
+
+            // Extract per-tile DDR offset stride from shimDimStrides.
+            // The 3D shimDimStrides encode: D0=intra-tile-row, D1=DDR-row, D2=tile-column.
+            // D2.stride gives the byte distance between adjacent tile columns in DDR.
+            // For per-tile BDs, each BD starts at tile_index * D2.stride.
+            // The BD uses 2D addressing (D0, D1) within its tile column.
+            int64_t perTileStrideFromDims = perTileDdrBytes; // fallback: flat linear
+            if (shimDimStrides && shimDimStrides.size() >= 3) {
+                // D2 (outermost, tile-column) stride gives per-tile DDR offset
+                perTileStrideFromDims = cast<IntegerAttr>(shimDimStrides[2]).getInt();
+            }
+
+            // OOO iteration parameters:
+            // iter_step_size = rows_per_round * DDR_row_stride — the DDR byte
+            //   distance from the start of round N to round N+1 for the same tile.
+            // iter_wrap = ooNumIterations (number of ping/pong rounds per tile).
+            int64_t ddrRowStride = 0;
+            int64_t perTileD1Rows = 0;
+            if (shimDimStrides && shimDimStrides.size() >= 2) {
+                ddrRowStride = cast<IntegerAttr>(shimDimStrides[1]).getInt();
+            }
+            if (shimDimWraps && shimDimWraps.size() >= 2) {
+                // D1 wrap = full partition rows. Tiles split along D2 (columns),
+                // NOT D1 (rows) — each tile writes the same number of rows as
+                // the full partition.
+                perTileD1Rows = cast<IntegerAttr>(shimDimWraps[1]).getInt();
+            }
+            int64_t rowsPerRound = (ooNumIterations > 1) ? perTileD1Rows / ooNumIterations : perTileD1Rows;
+
+            int32_t oooIterStepSize = (int32_t)(rowsPerRound * ddrRowStride);
+            int32_t oooIterWrap = (int32_t)ooNumIterations;
+
+            // Build per-tile addressing from shimDimStrides D0 and D1 only.
+            // D1 wrap is adjusted to rows_per_round (per-round scope, not full partition).
+            ArrayAttr perTileDimStrides = nullptr;
+            ArrayAttr perTileDimWraps = nullptr;
+            if (shimDimStrides && shimDimWraps && shimDimStrides.size() >= 2) {
+                SmallVector<Attribute> strides2d, wraps2d;
+                // D0: intra-tile-row addressing (unchanged)
+                strides2d.push_back(shimDimStrides[0]);
+                wraps2d.push_back(shimDimWraps[0]);
+                // D1: DDR-row addressing — use rows_per_round, NOT full partition rows
+                strides2d.push_back(shimDimStrides[1]);
+                wraps2d.push_back(rewriter.getI32IntegerAttr(rowsPerRound));
+                perTileDimStrides = rewriter.getArrayAttr(strides2d);
+                perTileDimWraps = rewriter.getArrayAttr(wraps2d);
+            }
+
+            // Allocate N shim BD IDs
+            SmallVector<int32_t> shimBdIds;
+            for (int64_t t = 0; t < numCoreTiles; t++) {
+                int32_t bid = -1;
+                if (resourceMgr) {
+                    auto bdOpt = resourceMgr->allocateTileBd(shimRow, shimCol, /*ownerId=*/flowIndex);
+                    if (bdOpt)
+                        bid = *bdOpt;
+                }
+                if (bid < 0)
+                    bid = shimBdIdVal + (int32_t)t; // fallback
+                shimBdIds.push_back(bid);
+            }
+            shimPerTileBdIds = shimBdIds;
+
+            // Create N shim BDs in reverse order (last first, so each can reference previous via SSA).
+            // In OOO mode each BD is independently dispatched by the packet switch based on
+            // packet_id matching. next_bd = -1 (disabled) — iteration handles re-execution
+            // across ping-pong rounds; self-chaining would restart from the beginning.
+            SmallVector<Value> shimBdHandles(numCoreTiles);
+            for (int64_t t = numCoreTiles - 1; t >= 0; t--) {
+                int32_t nextBdId = -1; // no chaining — iteration handles re-execution
+                int32_t thisBdId = shimBdIds[t];
+                // Per-tile DDR offset: use D2 stride from shimDimStrides for correct
+                // GEMM output tile column placement in DDR.
+                int64_t ddrOffset = t * perTileStrideFromDims;
+
+                // linked_bd chain for SSA: BD[i] links to BD[i+1] (or none for last)
+                Value linkedBd = (t < numCoreTiles - 1) ? shimBdHandles[t + 1] : Value();
+
+                auto shimBdIdC = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                    rewriter.getI32IntegerAttr(thisBdId));
+
+                // Per-tile shim BD: enable_packet=false for OOO S2MM receiving.
+                // OOO dispatch uses ooo_bd_id from the packet header to select BDs;
+                // the S2MM BD itself must NOT have PktEn set, otherwise the DMA
+                // engine would try to strip a second header from the data payload,
+                // causing data corruption and stalls.  (Reference:
+                // xaie_conv2d_2core_dataflow_test.c — shim S2MM BD has no XAie_DmaSetPkt.)
+                auto shimBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                    loc, dfschedule::BdHandleType::get(rewriter.getContext()),
+                    ddrBuffer,                                 // DDR buffer
+                    shimTileOp.getTile(),                      // tile
+                    shimBdIdC.getResult(),                     // bd_id
+                    rewriter.getI32IntegerAttr(ddrOffset),     // offset (per-tile DDR position using D2 stride)
+                    rewriter.getI32IntegerAttr(perRoundBytes), // len (per-round, matches src BD)
+                    rewriter.getBoolAttr(false),               // enable_packet = false (OOO dispatch handles packets)
+                    rewriter.getI32IntegerAttr(
+                        basePacketId + (int32_t)t), // packet_id (kept for debug/comments, ignored when PktEn=false)
+                    rewriter.getI32IntegerAttr(nextBdId), // next_bd = -1 (disabled — iteration handles rounds)
+                    rewriter.getI32IntegerAttr(-1), // acquire_lock_id = -1 → no lock (OOO flow control via packets)
+                    rewriter.getI32IntegerAttr(0),  // acquire_lock_val (ignored)
+                    rewriter.getI32IntegerAttr(-1), // release_lock_id = -1 → no lock
+                    rewriter.getI32IntegerAttr(0),  // release_lock_val (ignored)
+                    rewriter.getI32IntegerAttr(dataId), // data_id
+                    linkedBd,                           // linked_bd
+                    rewriter.getI32IntegerAttr(-1),     // out_of_order_bd_id (N/A for shim)
+                    /*dim_strides=*/perTileDimStrides, /*dim_wraps=*/perTileDimWraps,
+                    rewriter.getI32IntegerAttr(oooIterStepSize), // iter_step_size
+                    rewriter.getI32IntegerAttr(oooIterWrap));    // iter_wrap
+
+                shimBdHandles[t] = shimBd.getBdHandle();
+
+                llvm::errs() << "[OOO ShimBD] tile " << t << " bd_id=" << thisBdId << " pkt_id=" << (basePacketId + t)
+                             << " ddr_offset=" << ddrOffset << " len=" << perRoundBytes << " next_bd=" << nextBdId
+                             << " iter_step=" << oooIterStepSize << " iter_wrap=" << oooIterWrap
+                             << " d1_wrap=" << rowsPerRound << "\n";
+            }
+            // Last BD in SSA chain (BD[0]) is consumed by create_io
+            lastShimBdHandle = shimBdHandles[0];
+        } else {
+            // --- Non-OOO path: single shim BD (original behavior) ---
+            auto shimBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                loc, dfschedule::BdHandleType::get(rewriter.getContext()),
+                ddrBuffer,                                  // DDR receive buffer
+                shimTileOp.getTile(),                       // tile
+                shimBdIdConst.getResult(),                  // bd_id
+                rewriter.getI32IntegerAttr(0),              // offset
+                rewriter.getI32IntegerAttr(perTileShimLen), // len (per-tile portion)
+                rewriter.getBoolAttr(false),                // enable_packet = false
+                rewriter.getI32IntegerAttr(0),              // packet_id (unused)
+                rewriter.getI32IntegerAttr(4294967295),     // next_bd = none
+                rewriter.getI32IntegerAttr(0),              // acquire_lock_id
+                rewriter.getI32IntegerAttr(0),              // acquire_lock_val
+                rewriter.getI32IntegerAttr(0),              // release_lock_id
+                rewriter.getI32IntegerAttr(0),              // release_lock_val
+                rewriter.getI32IntegerAttr(dataId),         // data_id
+                Value(),                                    // linked_bd = none
+                rewriter.getI32IntegerAttr(-1),             // out_of_order_bd_id
+                /*dim_strides=*/shimDimStrides, /*dim_wraps=*/shimDimWraps,
+                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+
+            lastShimBdHandle = shimBdOp.getBdHandle();
+            // For single-BD path with OOO (single tile many_to_one), still record
+            if (isManyToOne) {
+                shimPerTileBdIds.push_back(shimBdIdVal);
+            }
+        }
 
         auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
             loc, dfschedule::IoHandleType::get(rewriter.getContext()),
-            shimBdOp.getBdHandle(),                  // single BD
+            lastShimBdHandle,                        // BD handle (first BD in chain or single)
             shimTileOp.getTile(),                    // tile
             rewriter.getI32IntegerAttr(shimChannel), // channel
             rewriter.getStringAttr(dmaDirection),    // direction (MM2S or S2MM)
-            rewriter.getStringAttr(ioOperation));    // io_operation (SEND or RECV)
+            rewriter.getStringAttr(ioOperation),     // io_operation (SEND or RECV)
+            rewriter.getBoolAttr(useOOO));           // enable_out_of_order
 
         // --- CORE TILES: declaretile, kernel_config, and ping-pong DMA config ---
         ArrayAttr coreTilesAttr = coreTileGroup.getTiles();
@@ -845,6 +1028,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             int64_t pingPongBufferSize = static_cast<int64_t>(perCoreElements * bufferRatio);
             if (pingPongBufferSize <= 0)
                 pingPongBufferSize = 1;
+            // Clamp to maxPingPongBytes to prevent exceeding core tile memory
+            if (maxPingPongBytes > 0 && elementSizeBytes > 0) {
+                int64_t maxElements = maxPingPongBytes / elementSizeBytes;
+                if (maxElements > 0 && pingPongBufferSize > maxElements)
+                    pingPongBufferSize = maxElements;
+            }
             // numIterations uses perCoreElements because each core only
             // processes its own share of data.
             int64_t numIterations = (perCoreElements + pingPongBufferSize - 1) / pingPongBufferSize;
@@ -975,6 +1164,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             // (many_to_one) need the same allocation size even though they transfer
                             // fewer elements per core.
                             int64_t kernelBufElements = static_cast<int64_t>(fullPartitionElements * bufferRatio);
+                            // Clamp kernelBufElements to maxPingPongBytes (same as pingPongBufferSize clamping)
+                            if (maxPingPongBytes > 0 && elementSizeBytes > 0) {
+                                int64_t maxElements = maxPingPongBytes / elementSizeBytes;
+                                if (maxElements > 0 && kernelBufElements > maxElements)
+                                    kernelBufElements = maxElements;
+                            }
                             if (kernelBufElements < pingPongBufferSize)
                                 kernelBufElements = pingPongBufferSize;
                             uint32_t bufSizeBytes = ((kernelBufElements * elementSizeBytes) + 3) & ~3;
@@ -1040,6 +1235,15 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                         bool coreBdEnablePacket = isOutputFlow;
                         int32_t coreBdPacketId = isOutputFlow ? (int32_t)(basePacketId + tileIndex) : 0;
 
+                        // Compute out_of_order_bd_id for output (MM2S) core BDs.
+                        // This tells the shim S2MM DMA which BD to use for this tile's data.
+                        int32_t coreOooBdId = -1;
+                        if (isOutputFlow && !shimPerTileBdIds.empty()) {
+                            size_t idx = static_cast<size_t>(tileIndex);
+                            if (idx < shimPerTileBdIds.size())
+                                coreOooBdId = shimPerTileBdIds[idx];
+                        }
+
                         // Pong BD first (no linked_bd): next_bd -> ping
                         auto pongBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
                                                                                 rewriter.getI32IntegerAttr(pongBdId));
@@ -1057,7 +1261,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             rewriter.getI32IntegerAttr(1),               // release_lock_val
                             rewriter.getI32IntegerAttr(-1),              // data_id
                             Value(),                                     // linked_bd = none
-                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+                            rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
+                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                            rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
 
                         // Ping BD second (linked_bd = pong handle): next_bd -> pong
                         auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
@@ -1076,13 +1282,16 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             rewriter.getI32IntegerAttr(1),               // release_lock_val
                             rewriter.getI32IntegerAttr(-1),              // data_id
                             pongBdOp.getBdHandle(),                      // linked_bd = pong BD
-                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
+                            rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
+                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                            rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
 
                         // Create IO handle for core tile
                         auto coreCreateIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
                             loc, dfschedule::IoHandleType::get(rewriter.getContext()), pingBdOp.getBdHandle(),
                             coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
-                            rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation));
+                            rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation),
+                            rewriter.getBoolAttr(false)); // enable_out_of_order=false for core tiles
                         auto coreBdIdOp =
                             rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());
                         // Defer core StartIoOp until after ELF is loaded (LoadKernelGroup)
@@ -1130,47 +1339,41 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         for (size_t i = 0; i < coreTiles.size(); ++i) {
             computeKernelAttrs.push_back(SymbolRefAttr::get(rewriter.getContext(), "compute0"));
             }
-            
-        // Create dfschedule.config.load_kernel_group with distributed_args pointing to kernel configs
-        auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
-                loc,
-            dfschedule::KernelGroupType::get(rewriter.getContext()),
-            coreTiles,
-            rewriter.getArrayAttr(calleeAttrs),
-            rewriter.getArrayAttr(computeKernelAttrs),
-            nullptr,  // kernel_config = nullptr (not used)
-            rewriter.getArrayAttr(kernelConfigSymbols));  // distributed_args = [@kernelconfig0, @kernelconfig1, ...]
-            
-        // Create dfschedule.schedule.launch_kernel_group
-        auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
-            loc,
-            dfschedule::EventType::get(rewriter.getContext()),
-            loadKernelGroupOp.getKernelGroup());
 
-        // Emit deferred core StartIoOp calls AFTER kernel load/launch.
-        // This ensures the ELF BSS initialization (which zeroes buf_in_ping/pong)
-        // completes before core S2MM DMAs start writing data into those buffers.
-        SmallVector<Value> coreStartIoEvents;
-        for (auto &deferred : deferredCoreStartIos) {
-            auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
-                loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
-                rewriter.getI32IntegerAttr(deferred.flowIdx));
-            coreStartIoEvents.push_back(coreStartIo.getEvent());
+            // Create dfschedule.schedule.getbdid for shim tile
+            // Shim start_io is emitted BEFORE load_kernel_group so that shim DMA
+            // channels are armed first.  Core start_io remains after kernel launch
+            // to avoid BSS-zeroing races.
+            auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
+
+            // Create dfschedule.schedule.start_io for shim
+            // For OOO, repeat = numCoreTiles * numPingPong (total source transactions)
+            int32_t repeatCount = useOOO ? (int32_t)(numCoreTiles * 2) : 1;
+            auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
+                loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(), getBdIdOp.getBdId(),
+                rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(repeatCount));
+
+            // Create dfschedule.config.load_kernel_group with distributed_args pointing to kernel configs
+            auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
+                loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
+                rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs),
+                nullptr,                                     // kernel_config = nullptr (not used)
+                rewriter.getArrayAttr(kernelConfigSymbols)); // distributed_args = [@kernelconfig0, @kernelconfig1, ...]
+
+            // Create dfschedule.schedule.launch_kernel_group
+            auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
+                loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
+
+            // Emit deferred core StartIoOp calls AFTER kernel load/launch.
+            // This ensures the ELF BSS initialization (which zeroes buf_in_ping/pong)
+            // completes before core S2MM DMAs start writing data into those buffers.
+            SmallVector<Value> coreStartIoEvents;
+            for (auto &deferred : deferredCoreStartIos) {
+                auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
+                    rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(1));
+                coreStartIoEvents.push_back(coreStartIo.getEvent());
         }
-
-        // Create dfschedule.schedule.getbdid for shim tile
-        auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(
-            loc,
-            rewriter.getI32Type(),
-            shimTileOp.getTile());
-        
-        // Create dfschedule.schedule.start_io for shim
-        auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
-            loc,
-            dfschedule::EventType::get(rewriter.getContext()),
-            createIoOp.getIoHandle(),
-            getBdIdOp.getBdId(),
-            rewriter.getI32IntegerAttr(flowIndex));
 
         // Create dfschedule.schedule.wait with kernel launch + shim IO events only.
         // Core tile IO events are excluded: core DMAs use infinite ping-pong BD
@@ -1267,11 +1470,11 @@ void BlueprintToSchedulePass::runOnOperation() {
     target.addIllegalOp<dfscheblueprint::DeclareDataOp>();
     target.addIllegalOp<dfscheblueprint::FlowTransferOp>();
 
-    auto hwRes = makeResource("Gen2");
+    auto hwRes = makeResource(aieGen_);
     auto resourceMgr = std::make_shared<ResourceMgr>(std::move(hwRes));
 
     RewritePatternSet patterns(context);
-    patterns.add<FlowTransferConversion>(context, resourceMgr, passState, bufferRatio_);
+    patterns.add<FlowTransferConversion>(context, resourceMgr, passState, bufferRatio_, maxPingPongBytes_);
     patterns.add<DataSliceOpConversion>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::FlowConfigOp>>(context);
     patterns.add<EraseOpPattern<dfscheblueprint::TileGroupOp>>(context);

@@ -1056,10 +1056,12 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         // Compute multi-dimensional DMA addressing for shim S2MM (output assembly).
         // Each shim S2MM channel receives a row-strip from multiple cores.
         // The data arrives tile-by-tile but must be written into the correct 2D DDR layout.
-        // The 3D addressing pattern reassembles tiles within one row-strip:
-        //   D0: contiguous elements within a tile row (wrap=tileW, stride=1)
-        //   D1: next row within same tile             (wrap=stripH, stride=outW)
-        //   D2: next tile column                      (wrap=numTileCols, stride=tileW)
+        // The 4D addressing pattern reassembles tiles within one row-strip
+        // across ping-pong rounds:
+        //   D0: contiguous elements within a tile row   (wrap=tileW,             stride=1)
+        //   D1: next row within same core per round     (wrap=coreRowsPerRound,  stride=outW)
+        //   D2: next tile column                        (wrap=numTileCols,        stride=tileW)
+        //   D3: next ping-pong round                    (wrap=pingPongFactor,     stride=coreRowsPerRound*outW)
         ArrayAttr shimDimStrides = nullptr;
         ArrayAttr shimDimWraps = nullptr;
 
@@ -1094,20 +1096,24 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                     int64_t tileW_w = tileW / elemsPerWord; // tile width in words (for D0 wrap)
                     int64_t outW_w = outW / elemsPerWord;   // full output width in words
 
-                    // Per-channel row-strip strides in BYTES (word-stride × 4):
-                    // D0: 1 word stride in bytes
-                    // D1: full output row width in bytes (jump to next row in DDR)
-                    // D2: tile width in bytes (jump to next tile column)
+                    // 3D addressing for shim S2MM output assembly:
+                    //
+                    // Data arrival order: each tile sends all its rows (all
+                    // ping-pong rounds) contiguously before the next tile.
+                    // So: tile0_allrows, tile1_allrows, tile2_allrows, ...
+                    //
+                    // D0: 1 word stride (contiguous within tile row)
+                    // D1: full output row width (jump to next row in DDR)
+                    // D2: tile width (jump to next tile column)
                     SmallVector<int32_t> strides = {static_cast<int32_t>(1 * wordBytes),
                                                     static_cast<int32_t>(outW_w * wordBytes),
                                                     static_cast<int32_t>(tileW_w * wordBytes)};
-                    // Wraps are iteration counts — unchanged
                     SmallVector<int32_t> wraps = {static_cast<int32_t>(tileW_w), static_cast<int32_t>(stripH),
                                                   static_cast<int32_t>(numTileCols)};
                     shimDimStrides = rewriter.getI32ArrayAttr(strides);
                     shimDimWraps = rewriter.getI32ArrayAttr(wraps);
 
-                    llvm::errs() << "[ShimMultiDim] Pull per-channel row-strip: "
+                    llvm::errs() << "[ShimMultiDim] Pull per-channel row-strip (3D): "
                                  << "outW=" << outW << " stripH=" << stripH << " tileW=" << tileW
                                  << " numTileCols=" << numTileCols << " elemsPerWord=" << elemsPerWord << " strides=["
                                  << strides[0] << "," << strides[1] << "," << strides[2] << "]"

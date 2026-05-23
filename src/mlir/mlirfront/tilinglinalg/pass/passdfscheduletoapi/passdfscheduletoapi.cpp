@@ -160,6 +160,7 @@ struct ConversionState {
     SmallVector<IoDebugInfo> debugIos;
     SmallVector<TileDebugInfo> debugTiles;
     bool enableDebug = false;
+    int runtimeDebugLevel = -1;
 
     // Cached values for inner patterns (set before applying inner patterns)
     Value devInstRef;
@@ -285,10 +286,11 @@ struct ArithConstantInnerPattern : public OpConversionPattern<arith::ConstantOp>
 
 /// Inner pattern for dfscheblueprint.declare_data -> XAie_MemAllocate + memcpy
 struct DeclareDataInnerPattern : public OpConversionPattern<dfscheblueprint::DeclareDataOp> {
-    
-    DeclareDataInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx)
-        : OpConversionPattern<dfscheblueprint::DeclareDataOp>(typeConverter, ctx, /*benefit=*/100) {}
-    
+    ConversionState &state;
+
+    DeclareDataInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : OpConversionPattern<dfscheblueprint::DeclareDataOp>(typeConverter, ctx, /*benefit=*/100), state(state) {}
+
     // OpConversionPattern provides OpAdaptor automatically
     LogicalResult matchAndRewrite(dfscheblueprint::DeclareDataOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -330,27 +332,21 @@ struct DeclareDataInnerPattern : public OpConversionPattern<dfscheblueprint::Dec
         Type i32Type = IntegerType::get(ctx, 32);
         Type voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
         Type memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
-        Type devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
-        Type devInstPtrType = emitc::PointerType::get(devInstType);
-
-        // Create g_DevInst reference (from aie_runtime.h)
-        auto devInstRef =
-            rewriter.create<emitc::ConstantOp>(loc, devInstPtrType, emitc::OpaqueAttr::get(ctx, "g_DevInst"));
 
         // Create XAIE_MEM_CACHEABLE constant
         auto cacheableConst = rewriter.create<emitc::ConstantOp>(
             loc, i32Type,
             emitc::OpaqueAttr::get(ctx, "XAIE_MEM_CACHEABLE"));
-        
+
         // Create size constant
         auto sizeConst = rewriter.create<emitc::ConstantOp>(loc, i32Type,
             rewriter.getI32IntegerAttr(byteSize));
-        
-        // Call XAie_MemAllocate
-        auto memInst = rewriter.create<emitc::CallOpaqueOp>(loc,
-            memInstPtrType, "XAie_MemAllocate", nullptr, nullptr,
-            ValueRange{devInstRef.getResult(), sizeConst.getResult(), cacheableConst.getResult()});
-        
+
+        // Call XAie_MemAllocate (use state.devInstRef = host block arg 0)
+        auto memInst = rewriter.create<emitc::CallOpaqueOp>(
+            loc, memInstPtrType, "XAie_MemAllocate", nullptr, nullptr,
+            ValueRange{state.devInstRef, sizeConst.getResult(), cacheableConst.getResult()});
+
         // Call XAie_MemGetVAddr to get void* address
         auto vaddr = rewriter.create<emitc::CallOpaqueOp>(loc,
             voidPtrType, "XAie_MemGetVAddr", nullptr, nullptr,
@@ -372,9 +368,10 @@ struct DeclareDataInnerPattern : public OpConversionPattern<dfscheblueprint::Dec
 /// Inner pattern for dfschedule.alloc_device_mem -> XAie_MemAllocate + memcpy + track_alloc
 /// Mirrors DeclareDataInnerPattern but operates on the new SSA-clean alloc op.
 struct AllocDeviceMemInnerPattern : public OpConversionPattern<dfschedule::AllocDeviceMemOp> {
+    ConversionState &state;
 
-    AllocDeviceMemInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx)
-        : OpConversionPattern<dfschedule::AllocDeviceMemOp>(typeConverter, ctx, /*benefit=*/100) {}
+    AllocDeviceMemInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx, ConversionState &state)
+        : OpConversionPattern<dfschedule::AllocDeviceMemOp>(typeConverter, ctx, /*benefit=*/100), state(state) {}
 
     LogicalResult matchAndRewrite(dfschedule::AllocDeviceMemOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -411,18 +408,15 @@ struct AllocDeviceMemInnerPattern : public OpConversionPattern<dfschedule::Alloc
         Type i32Type = IntegerType::get(ctx, 32);
         Type voidPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "void"));
         Type memInstPtrType = emitc::PointerType::get(emitc::OpaqueType::get(ctx, "XAie_MemInst"));
-        Type devInstType = emitc::OpaqueType::get(ctx, "XAie_DevInst");
-        Type devInstPtrType = emitc::PointerType::get(devInstType);
 
-        auto devInstRef =
-            rewriter.create<emitc::ConstantOp>(loc, devInstPtrType, emitc::OpaqueAttr::get(ctx, "g_DevInst"));
         auto cacheableConst =
             rewriter.create<emitc::ConstantOp>(loc, i32Type, emitc::OpaqueAttr::get(ctx, "XAIE_MEM_CACHEABLE"));
         auto sizeConst = rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(byteSize));
 
+        // Use state.devInstRef (host block arg 0 = XAie_DevInst* dev)
         auto memInst = rewriter.create<emitc::CallOpaqueOp>(
             loc, memInstPtrType, "XAie_MemAllocate", nullptr, nullptr,
-            ValueRange{devInstRef.getResult(), sizeConst.getResult(), cacheableConst.getResult()});
+            ValueRange{state.devInstRef, sizeConst.getResult(), cacheableConst.getResult()});
 
         auto vaddr = rewriter.create<emitc::CallOpaqueOp>(loc, voidPtrType, "XAie_MemGetVAddr", nullptr, nullptr,
                                                           ValueRange{memInst.getResult(0)});
@@ -1219,6 +1213,7 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         int32_t acquireLockVal = static_cast<int32_t>(op.getAcquireLockVal());
         int32_t releaseLockId = static_cast<int32_t>(op.getReleaseLockId());
         int32_t releaseLockVal = static_cast<int32_t>(op.getReleaseLockVal());
+        int32_t outOfOrderBdId = static_cast<int32_t>(op.getOutOfOrderBdId());
 
         // Create comment
         std::string comment =
@@ -1232,7 +1227,8 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             ", next_bd=" + std::to_string(nextBd) + ", acquire_lock_id=" + std::to_string(acquireLockId) +
             ", acquire_lock_val=" + std::to_string(acquireLockVal) +
             ", release_lock_id=" + std::to_string(releaseLockId) +
-            ", release_lock_val=" + std::to_string(releaseLockVal) + " */";
+            ", release_lock_val=" + std::to_string(releaseLockVal) + ", ooo_bd_id=" + std::to_string(outOfOrderBdId) +
+            " */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
         
         // Create constants for parameters
@@ -1259,9 +1255,18 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                                                                     nullptr, ValueRange{buffer});
             bufferVoidPtr = bufferPtrOp.getResult(0);
         }
-        auto u64Type = rewriter.getIntegerType(64);
-        auto addrConst = rewriter.create<emitc::ConstantOp>(
-            loc, u64Type, rewriter.getIntegerAttr(u64Type, offset));
+
+        // Apply byte offset to buffer pointer for shim/DDR addressing.
+        // This bakes the per-BD offset into the pointer so the runtime
+        // sees distinct DDR addresses for each BD slice.
+        if (offset != 0) {
+            auto i64Type = rewriter.getIntegerType(64);
+            auto offsetVal = rewriter.create<emitc::ConstantOp>(loc, i64Type, rewriter.getIntegerAttr(i64Type, offset));
+            auto offsetPtr =
+                rewriter.create<emitc::CallOpaqueOp>(loc, voidPtrType, "__runtime_buffer_offset", nullptr, nullptr,
+                                                     ValueRange{bufferVoidPtr, offsetVal.getResult()});
+            bufferVoidPtr = offsetPtr.getResult(0);
+        }
 
         auto acquireLockIdConst =
             rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(acquireLockId));
@@ -1271,14 +1276,81 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(releaseLockId));
         auto releaseLockValConst =
             rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(releaseLockVal));
+        auto oooIdConst = rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(outOfOrderBdId));
 
         // Check for multi-dimensional addressing attributes
         auto dimStrides = op.getDimStrides();
         auto dimWraps = op.getDimWraps();
         bool useMultiDim = dimStrides && dimWraps && !dimStrides->empty();
 
+        // When DISABLE_MULTID_DIM_DMA flag is set (bit 4), force linear DMA
+        // Only check when runtimeDebugLevel is explicitly set (>= 0); -1 means "not specified"
+        if (useMultiDim && state.runtimeDebugLevel >= 0 && (state.runtimeDebugLevel & (1 << 4))) {
+            llvm::errs() << "  [DISABLE_MULTID_DIM_DMA flag set] Suppressing multi-dim DMA, using linear "
+                            "__Runtime_dma_bd_config\n";
+            useMultiDim = false;
+        }
+
         emitc::CallOpaqueOp configCall;
-        if (useMultiDim) {
+        // Check for OOO iteration attributes
+        int32_t iterStepSize = op.getIterStepSize();
+        int32_t iterWrap = op.getIterWrap();
+        bool useOooIter = useMultiDim && iterWrap > 1;
+
+        if (useOooIter) {
+            // OOO iteration path: __Runtime_dma_bd_config_multidim_ooo
+            // Uses only D0-D2 address dims + separate iter_step_size/iter_wrap
+            int32_t strides[3] = {0, 0, 0};
+            int32_t wraps_arr[3] = {0, 0, 0};
+            int32_t numDims = (int32_t)dimStrides->size();
+            if (numDims > 3)
+                numDims = 3;
+            for (int32_t i = 0; i < numDims; i++) {
+                strides[i] = mlir::cast<IntegerAttr>((*dimStrides)[i]).getInt();
+                wraps_arr[i] = mlir::cast<IntegerAttr>((*dimWraps)[i]).getInt();
+            }
+            auto numDimsConst = rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(numDims));
+            // Create stride/wrap constants for 3 address dims
+            SmallVector<Value, 6> dimArgs;
+            for (int d = 0; d < 3; d++) {
+                dimArgs.push_back(
+                    rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(strides[d]))
+                        .getResult());
+                dimArgs.push_back(
+                    rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(wraps_arr[d]))
+                        .getResult());
+            }
+            // Iteration args
+            auto iterStepConst =
+                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(iterStepSize));
+            auto iterWrapConst = rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(iterWrap));
+
+            SmallVector<Value> allArgs = {
+                state.devInstRef,        // XAie_DevInst* dev
+                tile,                    // XAie_LocType tile
+                bufferVoidPtr,           // void* buffer
+                bdId,                    // bd_id
+                lenConst.getResult(),    // len
+                nextBdConst.getResult(), // next_bd
+                rewriter.create<emitc::ConstantOp>(loc, i32Type,
+                                                   rewriter.getI32IntegerAttr(enablePacket ? 1 : 0))
+                    .getResult(),                // enable_packet
+                packetIdConst.getResult(),       // packet_id
+                acquireLockIdConst.getResult(),  // acquire_lock_id
+                acquireLockValConst.getResult(), // acquire_lock_val
+                releaseLockIdConst.getResult(),  // release_lock_id
+                releaseLockValConst.getResult(), // release_lock_val
+                oooIdConst.getResult(),          // out_of_order_bd_id
+                numDimsConst.getResult(),        // num_dims
+            };
+            allArgs.append(dimArgs.begin(), dimArgs.end()); // stride0,wrap0,...,stride2,wrap2
+            allArgs.push_back(iterStepConst.getResult());   // iter_step_size
+            allArgs.push_back(iterWrapConst.getResult());   // iter_wrap
+            configCall = rewriter.create<emitc::CallOpaqueOp>(loc, dmaDescType, "__Runtime_dma_bd_config_multidim_ooo",
+                                                              nullptr, nullptr, allArgs);
+            llvm::errs() << "  ✓ Created DMA BD config with multi-dim OOO iteration (num_dims=" << numDims
+                         << " iter_step=" << iterStepSize << " iter_wrap=" << iterWrap << ")\n";
+        } else if (useMultiDim) {
             // Extract stride/wrap values (up to 4 dims, pad with 0)
             int32_t strides[4] = {0, 0, 0, 0};
             int32_t wraps[4] = {0, 0, 0, 0};
@@ -1298,11 +1370,10 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                     rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(wraps[d])).getResult());
             }
             SmallVector<Value> allArgs = {
-                state.devInstRef,        // g_DevInst
+                state.devInstRef,        // XAie_DevInst* dev
                 tile,                    // XAie_LocType tile
                 bufferVoidPtr,           // void* buffer
                 bdId,                    // bd_id
-                addrConst.getResult(),   // addr
                 lenConst.getResult(),    // len
                 nextBdConst.getResult(), // next_bd
                 rewriter.create<emitc::ConstantOp>(loc, i32Type,
@@ -1313,6 +1384,7 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                 acquireLockValConst.getResult(), // acquire_lock_val
                 releaseLockIdConst.getResult(),  // release_lock_id
                 releaseLockValConst.getResult(), // release_lock_val
+                oooIdConst.getResult(),          // out_of_order_bd_id
                 numDimsConst.getResult(),        // num_dims
             };
             allArgs.append(dimArgs.begin(), dimArgs.end()); // stride0,wrap0,...,stride3,wrap3
@@ -1323,11 +1395,10 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             configCall = rewriter.create<emitc::CallOpaqueOp>(
                 loc, dmaDescType, "__Runtime_dma_bd_config", nullptr, nullptr,
                 ValueRange{
-                    state.devInstRef,        // g_DevInst
+                    state.devInstRef,        // XAie_DevInst* dev
                     tile,                    // XAie_LocType tile
                     bufferVoidPtr,           // void* (from new ops) or (void*)&pt (legacy)
                     bdId,                    // bd_id
-                    addrConst.getResult(),   // addr (offset within buffer)
                     lenConst.getResult(),    // len
                     nextBdConst.getResult(), // next_bd
                     rewriter.create<emitc::ConstantOp>(loc, i32Type,
@@ -1337,7 +1408,8 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                     acquireLockIdConst.getResult(),  // acquire_lock_id
                     acquireLockValConst.getResult(), // acquire_lock_val
                     releaseLockIdConst.getResult(),  // release_lock_id
-                    releaseLockValConst.getResult()  // release_lock_val
+                    releaseLockValConst.getResult(), // release_lock_val
+                    oooIdConst.getResult()           // out_of_order_bd_id
                 });
             llvm::errs() << "  ✓ Created DMA BD config with full AIE API parameters\n";
         }
@@ -1396,10 +1468,9 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                                                       ") lock=" + std::to_string(kernelAcquireLock) +
                                                       " init_value=2 (kernel output acquire) */";
                             rewriter.create<emitc::VerbatimOp>(loc, lockComment);
-                            std::string lockSetCall = "XAie_LockSetValue(g_DevInst, XAie_TileLoc(" +
-                                                      std::to_string(tileCol) + ", " + std::to_string(tileRow) +
-                                                      "), XAie_LockInit(" + std::to_string(kernelAcquireLock) +
-                                                      ", 2));";
+                            std::string lockSetCall = "XAie_LockSetValue(dev, XAie_TileLoc(" + std::to_string(tileCol) +
+                                                      ", " + std::to_string(tileRow) + "), XAie_LockInit(" +
+                                                      std::to_string(kernelAcquireLock) + ", 2));";
                             rewriter.create<emitc::VerbatimOp>(loc, lockSetCall);
                             llvm::errs() << "  ✓ Emitted XAie_LockSetValue for tile(" << tileCol << "," << tileRow
                                          << ") lock=" << kernelAcquireLock << " init=2 (kernel output acquire)\n";
@@ -1414,10 +1485,10 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                                                   std::to_string(tileRow) + ") lock=" + std::to_string(acquireLockId) +
                                                   " init_value=" + std::to_string(initValue) + " */";
                         rewriter.create<emitc::VerbatimOp>(loc, lockComment);
-                        std::string lockSetCall = "XAie_LockSetValue(g_DevInst, XAie_TileLoc(" +
-                                                  std::to_string(tileCol) + ", " + std::to_string(tileRow) +
-                                                  "), XAie_LockInit(" + std::to_string(acquireLockId) + ", " +
-                                                  std::to_string(initValue) + "));";
+                        std::string lockSetCall = "XAie_LockSetValue(dev, XAie_TileLoc(" + std::to_string(tileCol) +
+                                                  ", " + std::to_string(tileRow) + "), XAie_LockInit(" +
+                                                  std::to_string(acquireLockId) + ", " + std::to_string(initValue) +
+                                                  "));";
                         rewriter.create<emitc::VerbatimOp>(loc, lockSetCall);
                         llvm::errs() << "  ✓ Emitted XAie_LockSetValue for tile(" << tileCol << "," << tileRow
                                      << ") lock=" << acquireLockId << " init=" << initValue << "\n";
@@ -1613,6 +1684,27 @@ struct ConfigCreateIoInnerPattern : public OpConversionPattern<dfschedule::Confi
                             ", direction=" + direction + " */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
 
+        // Emit OOO channel enable if requested
+        bool enableOutOfOrder = op.getEnableOutOfOrder();
+        if (enableOutOfOrder) {
+            std::string oooComment = "/* Enable out-of-order BD on tile(" + std::to_string(tileCol) + "," +
+                                     std::to_string(tileRow) + ") ch=" + std::to_string(allocatedChannelId) +
+                                     " dir=" + direction + " */";
+            rewriter.create<emitc::VerbatimOp>(loc, oooComment);
+
+            auto voidType = emitc::OpaqueType::get(rewriter.getContext(), "void");
+            SmallVector<Value, 4> oooArgs = {
+                state.devInstRef,           // XAie_DevInst* dev
+                tile,                       // XAie_LocType tile
+                channelIdConst.getResult(), // channel
+                dirConst.getResult()        // direction (DMA_MM2S or DMA_S2MM)
+            };
+            rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "__Runtime_dma_channel_enable_ooo", nullptr, nullptr,
+                                                 ValueRange(oooArgs));
+            llvm::errs() << "  ✓ Emitted __Runtime_dma_channel_enable_ooo for tile(" << tileCol << "," << tileRow
+                         << ") ch=" << allocatedChannelId << " dir=" << direction << "\n";
+        }
+
         // Define the IO type (io from aie_runtime.h)
         auto ioStructType = emitc::OpaqueType::get(rewriter.getContext(), "io");
 
@@ -1640,7 +1732,7 @@ struct ConfigCreateIoInnerPattern : public OpConversionPattern<dfschedule::Confi
 
 /// OpConversionPattern for dfschedule.schedule.start_io
 /// Converts StartIo to __Runtime_startio call that returns an ioevent
-/// struct ioevent = __Runtime_startio(io, timer_value);
+/// struct ioevent = __Runtime_startio(io, bd_id, repeat);
 struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
     ConversionState &state;
     
@@ -1655,32 +1747,29 @@ struct StartIoInnerPattern : public OpConversionPattern<dfschedule::StartIoOp> {
         
         // Get operands
         Value ioHandle = adaptor.getIoHandle();  // This should be the "struct io" from config.create_io
-        Value bdId = adaptor.getBdId();          // BD ID (though not used in __Runtime_startio signature shown)
-        // Note: flow_index is available via op.getFlowIndex() but unused in __Runtime_startio currently
-        
+        Value bdId = adaptor.getBdId();          // BD ID
+
         llvm::errs() << "  IO Handle type: " << ioHandle.getType() << "\n";
         llvm::errs() << "  BD ID type: " << bdId.getType() << "\n";
 
         // Define the ioevent type (ioevent from aie_runtime.h)
         auto ioEventType = emitc::OpaqueType::get(rewriter.getContext(), "ioevent");
 
-        //rewriter.eraseOp(op);
-        //return success();
+        // Get repeat count from the op attribute (default 1)
+        uint32_t repeatCount = op.getRepeatCount();
+        auto repeatConst =
+            rewriter.create<emitc::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(repeatCount));
+
         // Create __Runtime_startio call:
-        // struct ioevent = __Runtime_startio(io, timer_or_data_value);
-        // According to the example: __Runtime_startio(io, v4)
-        // The second parameter seems to be some value (maybe from partition or timer)
-        auto startIoCall = rewriter.create<emitc::CallOpaqueOp>(
-            loc,
-            ioEventType,
-            "__Runtime_startio",
-            nullptr,
-            nullptr,
-            ValueRange{
-                ioHandle,  // struct io
-                bdId       // Using bdId as the second parameter (v4 in example)
-            });
-        
+        // struct ioevent = __Runtime_startio(dev, io, bd_id, repeat);
+        auto startIoCall = rewriter.create<emitc::CallOpaqueOp>(loc, ioEventType, "__Runtime_startio", nullptr, nullptr,
+                                                                ValueRange{
+                                                                    state.devInstRef,       // XAie_DevInst* dev
+                                                                    ioHandle,               // struct io
+                                                                    bdId,                   // bd_id
+                                                                    repeatConst.getResult() // repeat count
+                                                                });
+
         llvm::errs() << "  ✓ Created __Runtime_startio call\n";
         
         // Replace the op with the ioevent
@@ -1722,10 +1811,10 @@ struct ScheduleWaitInnerPattern : public OpConversionPattern<dfschedule::Schedul
         std::string comment = "/* Wait for " + std::to_string(events.size()) + " event(s) */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
 
-        // Create __Runtime_wait call for each event (macro in aie_runtime.h dispatches event vs ioevent)
+        // Create __Runtime_wait call for each event (C++ overloads dispatch event vs ioevent)
         for (auto eventVal : events) {
             rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "__Runtime_wait", nullptr, nullptr,
-                                                 ValueRange{eventVal});
+                                                 ValueRange{state.devInstRef, eventVal});
         }
 
         llvm::errs() << "  ✓ Created __Runtime_wait calls for " << events.size() << " event(s)\n";
@@ -1887,9 +1976,10 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         auto i32Type = rewriter.getI32Type();
         auto numTilesConst = rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(numTiles));
         SmallVector<Value> callOperands;
+        callOperands.push_back(state.devInstRef); // XAie_DevInst* dev
         callOperands.append(tiles.begin(), tiles.end());
         // Pad with last tile to fill the positional slots
-        while (callOperands.size() < padTo)
+        while (callOperands.size() < padTo + 1) // +1 for dev parameter
             callOperands.push_back(tiles.back());
         callOperands.push_back(numTilesConst.getResult());
 
@@ -1930,15 +2020,10 @@ struct LaunchKernelGroupInnerPattern : public OpConversionPattern<dfschedule::La
         auto eventType = emitc::OpaqueType::get(rewriter.getContext(), "event");
 
         // Create __Runtime_launch_kernel_group call:
-        // event = __Runtime_launch_kernel_group(kernel_group);
-        auto launchCall = rewriter.create<emitc::CallOpaqueOp>(
-            loc,
-            eventType,
-            "__Runtime_launch_kernel_group",
-            nullptr,
-            nullptr,
-            ValueRange{kernelGroup});
-        
+        // event = __Runtime_launch_kernel_group(dev, kernel_group);
+        auto launchCall = rewriter.create<emitc::CallOpaqueOp>(loc, eventType, "__Runtime_launch_kernel_group", nullptr,
+                                                               nullptr, ValueRange{state.devInstRef, kernelGroup});
+
         llvm::errs() << "  ✓ Created __Runtime_launch_kernel_group call\n";
         
         // Replace the op with the event
@@ -1992,7 +2077,7 @@ static void emitDebugSnapshotVerbatim(OpBuilder &rewriter, Location loc, const C
         rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_dbg_t_cols", tcols));
         rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_dbg_t_rows", trows));
     }
-    std::string call = "  AieRt_DebugSnapshotFromCoords(g_DevInst,\n"
+    std::string call = "  AieRt_DebugSnapshotFromCoords(dev,\n"
                        "      _dbg_io_cols, _dbg_io_rows, _dbg_io_chs, _dbg_io_bds, _dbg_io_dirs, " +
                        std::to_string(N) +
                        ",\n"
@@ -2020,15 +2105,20 @@ struct HostOpOuterPattern : public ConversionPattern {
         }
 
         // Create emitc.func with matching arguments from host block.
-        // Host block args are external DDR pointer memrefs, lowered to void*.
+        // Arg 0 is XAie_DevInst* dev (added by the pass in Phase 3 pre-creation).
+        // Remaining args are external DDR pointer memrefs, lowered to void*.
         SmallVector<Type> argTypes;
         Block *srcBlock = nullptr;
         if (op->getNumRegions() > 0 && !op->getRegion(0).empty()) {
             srcBlock = &op->getRegion(0).front();
             for (auto arg : srcBlock->getArguments()) {
-                // All host block args become emitc.ptr<ui8> (void*)
-                auto ptrType = emitc::PointerType::get(emitc::OpaqueType::get(rewriter.getContext(), "void"));
-                argTypes.push_back(ptrType);
+                // Arg 0 is XAie_DevInst* (already the right type), rest become void*
+                if (isa<emitc::PointerType>(arg.getType())) {
+                    argTypes.push_back(arg.getType());
+                } else {
+                    auto ptrType = emitc::PointerType::get(emitc::OpaqueType::get(rewriter.getContext(), "void"));
+                    argTypes.push_back(ptrType);
+                }
             }
         }
         auto funcType = rewriter.getFunctionType(argTypes, {});
@@ -2038,8 +2128,7 @@ struct HostOpOuterPattern : public ConversionPattern {
         // Move converted operations from host region to new func
         if (srcBlock) {
             // Replace host block arg uses with emitc.func entry block args.
-            // The type converter lowered memref args to void* — the emitc.func
-            // entry block args are already void*.
+            // Arg 0 = XAie_DevInst* dev, args 1+ = DDR void* pointers.
             for (unsigned i = 0; i < srcBlock->getNumArguments(); ++i) {
                 srcBlock->getArgument(i).replaceAllUsesWith(entryBlock->getArgument(i));
             }
@@ -2047,6 +2136,11 @@ struct HostOpOuterPattern : public ConversionPattern {
             // Move all operations except terminator to the new func
             OpBuilder::InsertionGuard guard(rewriter);
             rewriter.setInsertionPointToStart(entryBlock);
+
+            // Create a "dev" alias for the first parameter (XAie_DevInst*) so that
+            // VerbatimOps (XAie_LockSetValue, AieRt_DebugSnapshot, etc.) can reference it
+            // by the well-known name "dev" instead of the auto-generated EmitC name (v1).
+            rewriter.create<emitc::VerbatimOp>(loc, "XAie_DevInst* dev = v1;");
 
             for (Operation &nestedOp : llvm::make_early_inc_range(srcBlock->getOperations())) {
                 if (!nestedOp.hasTrait<OpTrait::IsTerminator>()) {
@@ -2846,6 +2940,7 @@ void DfscheduleToApiPass::runOnOperation() {
     // Shared conversion state
     ConversionState state;
     state.enableDebug = enableDebug_;
+    state.runtimeDebugLevel = runtimeDebugLevel_;
 
     // Type converter
     TypeConverter typeConverter;
@@ -2867,7 +2962,7 @@ void DfscheduleToApiPass::runOnOperation() {
         if (enableDebug_)
             builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "#include \"aie_runtime_debug.h\"");
 
-        /* DevInst: use g_DevInst from aie_runtime.h (set in state.devInstRef below) */
+        /* DevInst: passed as first parameter to host_canonicalized (set in state.devInstRef below) */
     }
     
     llvm::errs() << "[Pass] Phase 1: Helper definitions generated\n";
@@ -2952,7 +3047,7 @@ void DfscheduleToApiPass::runOnOperation() {
     // Higher benefits = run first. We need DeclareTile and DeclareTensor to run before ConfigDmaBd
 
     // New patterns for the buffer ops introduced by BlueprintToSchedulePass refactor
-    innerPatterns.add<AllocDeviceMemInnerPattern>(typeConverter, ctx);
+    innerPatterns.add<AllocDeviceMemInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<BufferViewInnerPattern>(typeConverter, ctx);
     innerPatterns.add<BindCoreBufferInnerPattern>(typeConverter, ctx);
     innerPatterns.add<FreeDeviceMemInnerPattern>(typeConverter, ctx);
@@ -2972,7 +3067,7 @@ void DfscheduleToApiPass::runOnOperation() {
     innerPatterns.add<MemRefDeallocInnerPattern>(typeConverter, ctx);
     innerPatterns.add<MemRefSubviewInnerPattern>(typeConverter, ctx);
 
-    innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx);
+    innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<ExtractSliceInnerPattern>(typeConverter, ctx, state);
 
@@ -3075,15 +3170,17 @@ void DfscheduleToApiPass::runOnOperation() {
     // Create &DevInst and XAIE_MEM_CACHEABLE constants in each host block BEFORE conversion
     moduleOp->walk([&](dfschedule::HostBlockOp hostOp) {
         llvm::errs() << "[Pass] Pre-creating constants in host block\n";
-        
+
         OpBuilder builder(ctx);
         builder.setInsertionPointToStart(&hostOp.getRegion().front());
 
-        // Create g_DevInst reference (from aie_runtime.h)
-        state.devInstRef = builder
-                               .create<emitc::ConstantOp>(hostOp.getLoc(), emitc::PointerType::get(state.devInstType),
-                                                          emitc::OpaqueAttr::get(ctx, "g_DevInst"))
-                               .getResult();
+        // Add XAie_DevInst* dev as a block argument at position 0 of the host block.
+        // This becomes the first parameter of host_canonicalized when HostOpOuterPattern
+        // converts the host block to an emitc.func.
+        auto devInstPtrType = emitc::PointerType::get(state.devInstType);
+        Block &hostBlock = hostOp.getRegion().front();
+        state.devInstRef = hostBlock.insertArgument(
+            /*argNo=*/0u, devInstPtrType, hostOp.getLoc());
 
         // Create XAIE_MEM_CACHEABLE constant
         state.cacheableConst = builder.create<emitc::ConstantOp>(

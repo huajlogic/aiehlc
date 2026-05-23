@@ -125,9 +125,10 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     // port assignment (see section 2b below for the full rationale).
     int funcArgIdx = traceToFuncArgIndex(dataValue);
 
-    // Get topology info - core tile start row
+    // Get topology info - core tile start row and partition column offset
     int core_start_row = (int) router.getRM()->getrsc()->absTileRow(TileType::Core, 0);
-    
+    int partColOffset = router.getRM()->hasPartition() ? router.getRM()->partitionStartCol() : 0;
+
     // dmap.push %data, %stream -> stream is operand 1
     // dmap.pull %data from %stream -> stream is operand 1
     Value streamValue = op->getOperand(1);
@@ -230,10 +231,11 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     SmallVector<dmaphop::port, 4> corePortsOutOps;
     
     for (int i = 0; i < coreGroup.getCoreCount(); ++i) {
-        // Use core_start_row as the base for core tile row calculation
+        // Use core_start_row as the base for core tile row calculation,
+        // and partColOffset to convert mesh-relative col to absolute col
         int row = (coreGroup.getGroupAxis() == "col") ? (i + core_start_row) : (coreGroup.getGroupIdx() + core_start_row);
-        int col = (coreGroup.getGroupAxis() == "row") ? i : coreGroup.getGroupIdx();
-        
+        int col = ((coreGroup.getGroupAxis() == "row") ? i : coreGroup.getGroupIdx()) + partColOffset;
+
         coreTilePoints.push_back(Point{row, col});
         
         auto coreTile = rewriter.create<dmaphop::tile>(loc, rewriter.getStringAttr("core"), rewriter.getI64IntegerAttr(col), rewriter.getI64IntegerAttr(row));

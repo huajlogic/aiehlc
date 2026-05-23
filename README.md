@@ -82,7 +82,7 @@ source script/aiehlc.sh --platform linux --aie-version 2 --runtime-source-file t
 
 ## Runtime Debug Level
 
-Control runtime diagnostic verbosity from your source file using `#pragma aie_debug_level`:
+Control runtime diagnostic verbosity and feature flags from your source file using `#pragma aie_debug_level`:
 
 ```cpp
 #pragma aie_debug_level 2
@@ -96,11 +96,33 @@ int main() {
 }
 ```
 
+The debug level value is a bitfield:
+- **Bits 0-3**: verbosity level (0-15)
+- **Bits 4-31**: feature flags
+
+### Verbosity Levels (bits 0-3)
+
 | Level | Behavior |
 |-------|----------|
 | `0` | Silent (default when pragma is absent) |
 | `1` | BD tracking and IO logs |
 | `2` | Full diagnostics: DMA address log, write pattern, readback |
+
+### Feature Flags (bits 4+)
+
+| Flag | Bit | Value | Behavior |
+|------|-----|-------|----------|
+| `DISABLE_MULTID_DIM_DMA` | 4 | `16` | Suppress multi-dimensional DMA; force linear `__Runtime_dma_bd_config` |
+
+### Examples
+
+| Pragma Value | Verbosity | Flags | Effect |
+|-------------|-----------|-------|--------|
+| `0` | 0 | none | Silent, multi-dim DMA enabled |
+| `1` | 1 | none | BD tracking, multi-dim DMA enabled |
+| `2` | 2 | none | Full diagnostics, multi-dim DMA enabled |
+| `16` | 0 | `DISABLE_MULTID_DIM_DMA` | Silent, multi-dim DMA suppressed |
+| `18` | 2 | `DISABLE_MULTID_DIM_DMA` | Full diagnostics + multi-dim DMA suppressed |
 
 The pragma is detected during preprocessing and emits a strong symbol override of `g_runtime_debug_level` into the generated `host.cc`. The runtime in `aie_runtime.c` defines this variable as a weak symbol with default `0`, so the linker picks the user-specified value when present.
 
