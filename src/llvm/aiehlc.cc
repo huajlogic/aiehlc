@@ -55,6 +55,10 @@ struct ParsedTensorInfo {
     int mergeOrder = 0;   // 0=Default, 1=LeftToRight, 2=RightToLeft
     int pingPong = 2;
     int maxBufferBytes = 4096;   // max per-buffer size (PP_MAX_BYTES equivalent)
+    // Two-level tiling hints (0 = auto-derive from memory budget)
+    int tileM = 0;               // explicit sub-tile rows per core
+    int tileN = 0;               // explicit sub-tile cols per core
+    int tileK = 0;               // explicit K chunk size for temporal tiling
     bool policyResolved = false; // true once AST extraction succeeds
 };
 static std::vector<ParsedTensorInfo> parsedTensors;
@@ -1028,12 +1032,23 @@ public:
                                                 if (apval->getStructNumFields() >= 5)
                                                     pti.maxBufferBytes =
                                                         (int)apval->getStructField(4).getInt().getExtValue();
+                                                // Two-level tiling hints (fields 5,6,7)
+                                                if (apval->getStructNumFields() >= 6)
+                                                    pti.tileM = (int)apval->getStructField(5).getInt().getExtValue();
+                                                if (apval->getStructNumFields() >= 7)
+                                                    pti.tileN = (int)apval->getStructField(6).getInt().getExtValue();
+                                                if (apval->getStructNumFields() >= 8)
+                                                    pti.tileK = (int)apval->getStructField(7).getInt().getExtValue();
                                                 pti.policyResolved = true;
                                                 llvm::outs()
                                                     << "[TilingLinalg] Policy resolved: pattern=" << pti.pattern
                                                     << " distribution=" << pti.distribution
                                                     << " mergeOrder=" << pti.mergeOrder << " ppDepth=" << pti.pingPong
-                                                    << " maxBufferBytes=" << pti.maxBufferBytes << "\n";
+                                                    << " maxBufferBytes=" << pti.maxBufferBytes;
+                                                if (pti.tileM > 0 || pti.tileN > 0 || pti.tileK > 0)
+                                                    llvm::outs() << " tile_m=" << pti.tileM << " tile_n=" << pti.tileN
+                                                                 << " tile_k=" << pti.tileK;
+                                                llvm::outs() << "\n";
                                             } else if (!apval) {
                                                 llvm::errs()
                                                     << "[TilingLinalg] DEBUG: policy arg kind="
@@ -1080,6 +1095,135 @@ public:
                         derivedTilingParams.tileCols = macroDimN / effectiveMeshCols;
                         derivedTilingParams.kDim = macroDimK;
 
+                        // ---- Two-level tiling: compute effective tile_m/tile_n/tile_k ----
+                        // Memory budget for AIEML compute tile data memory (64KB total, ~48KB usable)
+                        constexpr int64_t AIE_DATA_MEM_BYTES = 65536;
+                        constexpr int64_t AIE_USABLE_MEM_BYTES = 49152; // 48KB usable for buffers
+
+                        // Collect explicit tiling hints from any resolved policy
+                        int explicitTileM = 0, explicitTileN = 0, explicitTileK = 0;
+                        int elementBytes = 1; // default int8
+                        for (const auto &pt : parsedTensors) {
+                            if (pt.policyResolved) {
+                                if (pt.tileM > 0)
+                                    explicitTileM = pt.tileM;
+                                if (pt.tileN > 0)
+                                    explicitTileN = pt.tileN;
+                                if (pt.tileK > 0)
+                                    explicitTileK = pt.tileK;
+                            }
+                            int eb = pt.elementBitWidth / 8;
+                            if (eb > elementBytes)
+                                elementBytes = eb;
+                        }
+
+                        int64_t tileM_eff = explicitTileM > 0 ? explicitTileM : derivedTilingParams.tileRows;
+                        int64_t tileN_eff = explicitTileN > 0 ? explicitTileN : derivedTilingParams.tileCols;
+                        int64_t tileK_eff = explicitTileK > 0 ? explicitTileK : macroDimK;
+
+                        // Memory check: A_local[tileM * tileK] + B_local[tileK * tileN] + C_local[tileM * tileN]
+                        auto computeWorkingSet = [&](int64_t tm, int64_t tn, int64_t tk) -> int64_t {
+                            return (tm * tk + tk * tn + tm * tn) * elementBytes;
+                        };
+
+                        int64_t workingSet = computeWorkingSet(tileM_eff, tileN_eff, tileK_eff);
+
+                        if (explicitTileM > 0 || explicitTileN > 0 || explicitTileK > 0) {
+                            // Explicit tiling — validate against memory budget
+                            if (workingSet > AIE_DATA_MEM_BYTES) {
+                                llvm::errs() << "[TilingLinalg] ERROR: Explicit tiling exceeds AIE data memory!\n"
+                                             << "  tile_m=" << tileM_eff << " tile_n=" << tileN_eff
+                                             << " tile_k=" << tileK_eff << " working_set=" << workingSet << " bytes"
+                                             << " (limit=" << AIE_DATA_MEM_BYTES << ")\n"
+                                             << "  A_local=" << tileM_eff * tileK_eff * elementBytes
+                                             << " B_local=" << tileK_eff * tileN_eff * elementBytes
+                                             << " C_local=" << tileM_eff * tileN_eff * elementBytes << "\n";
+                            } else if (workingSet > AIE_USABLE_MEM_BYTES) {
+                                llvm::outs() << "[TilingLinalg] WARNING: Explicit tiling uses " << workingSet
+                                             << " bytes — close to limit, "
+                                             << "little room for stack/ping-pong.\n";
+                            }
+                            derivedTilingParams.autoTiled = false;
+                        } else if (workingSet > AIE_USABLE_MEM_BYTES) {
+                            // Auto-tiling: working set exceeds memory budget, need to sub-tile
+                            llvm::outs() << "[TilingLinalg] Working set " << workingSet
+                                         << " bytes exceeds memory budget " << AIE_USABLE_MEM_BYTES
+                                         << " — auto-tiling enabled.\n";
+
+                            // Strategy: first try tiling K (cheapest — no spatial re-launch)
+                            // Then reduce M/N if still too large
+                            tileK_eff = tileK_eff; // start from full K
+                            int64_t budget = AIE_USABLE_MEM_BYTES / elementBytes;
+
+                            // Phase A: reduce K until A+B fit, keeping C stationary
+                            // C_local = tileM * tileN (fixed), A_local = tileM * tileK, B_local = tileK * tileN
+                            // Constraint: tileM * tileK + tileK * tileN + tileM * tileN <= budget
+                            // => tileK * (tileM + tileN) <= budget - tileM * tileN
+                            int64_t c_size = tileM_eff * tileN_eff;
+                            if (c_size < budget) {
+                                int64_t remaining = budget - c_size;
+                                int64_t maxK = remaining / (tileM_eff + tileN_eff);
+                                if (maxK < tileK_eff && maxK > 0) {
+                                    // Round down to power of 2 for alignment
+                                    int64_t k = 1;
+                                    while (k * 2 <= maxK)
+                                        k *= 2;
+                                    tileK_eff = k;
+                                }
+                            }
+
+                            // Phase B: if C_local alone exceeds budget, reduce M and N
+                            if (c_size >= budget) {
+                                // Solve: 2*tm*tk + tm^2 <= budget (assuming tm=tn, tk=tm for simplicity)
+                                // Use heuristic: start with 64 and validate
+                                for (int64_t candidate : {256, 128, 64, 32, 16, 8}) {
+                                    tileM_eff = std::min((int64_t)candidate, derivedTilingParams.tileRows);
+                                    tileN_eff = std::min((int64_t)candidate, derivedTilingParams.tileCols);
+                                    // Re-derive tileK with new M/N
+                                    c_size = tileM_eff * tileN_eff;
+                                    if (c_size < budget) {
+                                        int64_t remaining = budget - c_size;
+                                        int64_t maxK = remaining / (tileM_eff + tileN_eff);
+                                        int64_t k = 1;
+                                        while (k * 2 <= maxK && k * 2 <= macroDimK)
+                                            k *= 2;
+                                        tileK_eff = k;
+                                        if (computeWorkingSet(tileM_eff, tileN_eff, tileK_eff) <= AIE_USABLE_MEM_BYTES)
+                                            break;
+                                    }
+                                }
+                            }
+
+                            // Final validation
+                            workingSet = computeWorkingSet(tileM_eff, tileN_eff, tileK_eff);
+                            if (workingSet > AIE_DATA_MEM_BYTES) {
+                                llvm::errs() << "[TilingLinalg] ERROR: Auto-tiling failed to fit in memory!\n"
+                                             << "  tile_m=" << tileM_eff << " tile_n=" << tileN_eff
+                                             << " tile_k=" << tileK_eff << " working_set=" << workingSet << " bytes\n";
+                            }
+                            derivedTilingParams.autoTiled = true;
+                        } else {
+                            // Fits in memory without sub-tiling — use full tile dimensions
+                            derivedTilingParams.autoTiled = false;
+                        }
+
+                        // Compute spatial rounds and K rounds
+                        derivedTilingParams.tileM = tileM_eff;
+                        derivedTilingParams.tileN = tileN_eff;
+                        derivedTilingParams.effectiveK = tileK_eff;
+                        derivedTilingParams.spatialMRounds = (tileM_eff > 0 && tileM_eff < derivedTilingParams.tileRows)
+                                                                 ? derivedTilingParams.tileRows / tileM_eff
+                                                                 : 1;
+                        derivedTilingParams.spatialNRounds = (tileN_eff > 0 && tileN_eff < derivedTilingParams.tileCols)
+                                                                 ? derivedTilingParams.tileCols / tileN_eff
+                                                                 : 1;
+                        derivedTilingParams.kRounds =
+                            (tileK_eff > 0 && tileK_eff < macroDimK) ? macroDimK / tileK_eff : 1;
+
+                        // ---- Compute per-port DMA round/buffer parameters ----
+                        // Use effectiveK for DMA buffer sizing (temporal tiling of K)
+                        int64_t dmaK = derivedTilingParams.effectiveK;
+
                         for (auto &pt : parsedTensors) {
                             DerivedTilingParams::PortParams pp;
                             int ppDepth = pt.pingPong > 0 ? pt.pingPong : 2;
@@ -1088,25 +1232,25 @@ public:
                             if (pt.isInput) {
                                 if (pt.policyResolved) {
                                     if (pt.pattern == 0 && pt.distribution == 0) {
-                                        // Input A: Broadcast+Row — split along tile rows
-                                        int64_t rowsPerRoundRaw = derivedTilingParams.tileRows / ppDepth;
+                                        // Input A: Broadcast+Row — split along tileM rows with effectiveK
+                                        int64_t rowsPerRoundRaw = tileM_eff / ppDepth;
                                         int64_t rowsPerRound = rowsPerRoundRaw;
-                                        if (rowsPerRound * macroDimK > maxBuf)
-                                            rowsPerRound = maxBuf / macroDimK;
+                                        if (rowsPerRound * dmaK > maxBuf)
+                                            rowsPerRound = maxBuf / dmaK;
                                         if (rowsPerRound <= 0)
                                             rowsPerRound = 1;
-                                        pp.numRounds = derivedTilingParams.tileRows / rowsPerRound;
-                                        pp.bufferSize = rowsPerRound * macroDimK;
+                                        pp.numRounds = tileM_eff / rowsPerRound;
+                                        pp.bufferSize = rowsPerRound * dmaK;
                                     } else if (pt.pattern == 0 && pt.distribution == 1) {
-                                        // Input B: Broadcast+Col — split along tile cols
-                                        int64_t colsPerRoundRaw = derivedTilingParams.tileCols / ppDepth;
+                                        // Input B: Broadcast+Col — split along tileN cols with effectiveK
+                                        int64_t colsPerRoundRaw = tileN_eff / ppDepth;
                                         int64_t colsPerRound = colsPerRoundRaw;
-                                        if (colsPerRound * macroDimK > maxBuf)
-                                            colsPerRound = maxBuf / macroDimK;
+                                        if (colsPerRound * dmaK > maxBuf)
+                                            colsPerRound = maxBuf / dmaK;
                                         if (colsPerRound <= 0)
                                             colsPerRound = 1;
-                                        pp.numRounds = derivedTilingParams.tileCols / colsPerRound;
-                                        pp.bufferSize = colsPerRound * macroDimK;
+                                        pp.numRounds = tileN_eff / colsPerRound;
+                                        pp.bufferSize = colsPerRound * dmaK;
                                     } else {
                                         // Other input patterns: default
                                         int64_t totalElements = 1;
@@ -1127,8 +1271,8 @@ public:
                                     pp.numRounds = totalElements / pp.bufferSize;
                                 }
                             } else {
-                                // Output: no K dimension involved
-                                int64_t outputPerCore = derivedTilingParams.tileRows * derivedTilingParams.tileCols;
+                                // Output: use tileM * tileN as per-core output
+                                int64_t outputPerCore = tileM_eff * tileN_eff;
                                 int64_t bufSzOut = outputPerCore / ppDepth;
                                 if (bufSzOut > maxBuf)
                                     bufSzOut = maxBuf;
@@ -1143,6 +1287,18 @@ public:
                         llvm::outs() << "[TilingLinalg] Derived tiling: tileRows=" << derivedTilingParams.tileRows
                                      << " tileCols=" << derivedTilingParams.tileCols
                                      << " kDim=" << derivedTilingParams.kDim << "\n";
+                        llvm::outs() << "[TilingLinalg] Two-level tiling: tileM=" << derivedTilingParams.tileM
+                                     << " tileN=" << derivedTilingParams.tileN
+                                     << " effectiveK=" << derivedTilingParams.effectiveK
+                                     << " kRounds=" << derivedTilingParams.kRounds
+                                     << " spatialMRounds=" << derivedTilingParams.spatialMRounds
+                                     << " spatialNRounds=" << derivedTilingParams.spatialNRounds
+                                     << (derivedTilingParams.autoTiled ? " (auto)" : " (explicit/default)") << "\n";
+                        llvm::outs() << "[TilingLinalg] Memory estimate: "
+                                     << computeWorkingSet(tileM_eff, tileN_eff, tileK_eff) << " bytes"
+                                     << " (A=" << tileM_eff * tileK_eff * elementBytes
+                                     << " B=" << tileK_eff * tileN_eff * elementBytes
+                                     << " C=" << tileM_eff * tileN_eff * elementBytes << ")\n";
                         for (size_t i = 0; i < derivedTilingParams.portParams.size(); ++i) {
                             llvm::outs() << "[TilingLinalg]   port[" << i
                                          << "]: numRounds=" << derivedTilingParams.portParams[i].numRounds
@@ -1762,6 +1918,9 @@ public:
                     ret += "  Flow    merge_order  = Flow::Default;\n";
                     ret += "  int     pp_depth     = 2;\n";
                     ret += "  int     max_buffer_bytes = 4096;\n";
+                    ret += "  int     tile_m       = 0;\n";
+                    ret += "  int     tile_n       = 0;\n";
+                    ret += "  int     tile_k       = 0;\n";
                     ret += "};\n";
                     ret += "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
                     // Built-in query function stubs — Clang parses these but the compiler
@@ -1771,6 +1930,12 @@ public:
                     ret += "constexpr int get_tile_rows() { return 0; }\n";
                     ret += "constexpr int get_tile_cols() { return 0; }\n";
                     ret += "constexpr int get_k_dim() { return 0; }\n";
+                    ret += "constexpr int get_tile_m() { return 0; }\n";
+                    ret += "constexpr int get_tile_n() { return 0; }\n";
+                    ret += "constexpr int get_effective_k() { return 0; }\n";
+                    ret += "constexpr int get_k_rounds() { return 0; }\n";
+                    ret += "constexpr int get_spatial_m_rounds() { return 0; }\n";
+                    ret += "constexpr int get_spatial_n_rounds() { return 0; }\n";
                     ret += "}\n";
                     ret += "struct aiePartition {\n";
                     ret += "    int startCol, endCol, startRow, endRow;\n";
@@ -2016,6 +2181,19 @@ public:
                         replaceSimpleCall("aie::get_tile_rows()", mkd.derivedParams.tileRows);
                         replaceSimpleCall("aie::get_tile_cols()", mkd.derivedParams.tileCols);
                         replaceSimpleCall("aie::get_k_dim()", mkd.derivedParams.kDim);
+                        // Two-level tiling query functions
+                        replaceSimpleCall("aie::get_tile_m()", mkd.derivedParams.tileM > 0
+                                                                   ? mkd.derivedParams.tileM
+                                                                   : mkd.derivedParams.tileRows);
+                        replaceSimpleCall("aie::get_tile_n()", mkd.derivedParams.tileN > 0
+                                                                   ? mkd.derivedParams.tileN
+                                                                   : mkd.derivedParams.tileCols);
+                        replaceSimpleCall("aie::get_effective_k()", mkd.derivedParams.effectiveK > 0
+                                                                        ? mkd.derivedParams.effectiveK
+                                                                        : mkd.derivedParams.kDim);
+                        replaceSimpleCall("aie::get_k_rounds()", mkd.derivedParams.kRounds);
+                        replaceSimpleCall("aie::get_spatial_m_rounds()", mkd.derivedParams.spatialMRounds);
+                        replaceSimpleCall("aie::get_spatial_n_rounds()", mkd.derivedParams.spatialNRounds);
                     }
 
                     // Prepend user macros to kernel body
@@ -2071,6 +2249,9 @@ public:
                     stream << "  Flow    merge_order  = Flow::Default;\n";
                     stream << "  int     pp_depth     = 2;\n";
                     stream << "  int     max_buffer_bytes = 4096;\n";
+                    stream << "  int     tile_m       = 0;\n";
+                    stream << "  int     tile_n       = 0;\n";
+                    stream << "  int     tile_k       = 0;\n";
                     stream << "};\n";
                     stream << "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
                     stream << "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
@@ -2078,6 +2259,12 @@ public:
                     stream << "constexpr int get_tile_rows() { return 0; }\n";
                     stream << "constexpr int get_tile_cols() { return 0; }\n";
                     stream << "constexpr int get_k_dim() { return 0; }\n";
+                    stream << "constexpr int get_tile_m() { return 0; }\n";
+                    stream << "constexpr int get_tile_n() { return 0; }\n";
+                    stream << "constexpr int get_effective_k() { return 0; }\n";
+                    stream << "constexpr int get_k_rounds() { return 0; }\n";
+                    stream << "constexpr int get_spatial_m_rounds() { return 0; }\n";
+                    stream << "constexpr int get_spatial_n_rounds() { return 0; }\n";
                     stream << "}\n";
                     // aiePartition struct
                     stream << "struct aiePartition {\n";
@@ -2286,6 +2473,19 @@ public:
                     replaceSimpleCall("aie::get_tile_rows()", derivedTilingParams.tileRows);
                     replaceSimpleCall("aie::get_tile_cols()", derivedTilingParams.tileCols);
                     replaceSimpleCall("aie::get_k_dim()", derivedTilingParams.kDim);
+                    // Two-level tiling query functions
+                    replaceSimpleCall("aie::get_tile_m()", derivedTilingParams.tileM > 0
+                                                               ? derivedTilingParams.tileM
+                                                               : derivedTilingParams.tileRows);
+                    replaceSimpleCall("aie::get_tile_n()", derivedTilingParams.tileN > 0
+                                                               ? derivedTilingParams.tileN
+                                                               : derivedTilingParams.tileCols);
+                    replaceSimpleCall("aie::get_effective_k()", derivedTilingParams.effectiveK > 0
+                                                                    ? derivedTilingParams.effectiveK
+                                                                    : derivedTilingParams.kDim);
+                    replaceSimpleCall("aie::get_k_rounds()", derivedTilingParams.kRounds);
+                    replaceSimpleCall("aie::get_spatial_m_rounds()", derivedTilingParams.spatialMRounds);
+                    replaceSimpleCall("aie::get_spatial_n_rounds()", derivedTilingParams.spatialNRounds);
                 }
 
                 // Prepend user macros to kernel body for multi-tile path

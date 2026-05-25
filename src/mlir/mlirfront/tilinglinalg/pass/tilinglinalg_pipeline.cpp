@@ -525,6 +525,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "  Flow    merge_order  = Flow::Default;\n";
             stream << "  int     pp_depth     = 2;\n";
             stream << "  int     max_buffer_bytes = 4096;\n";
+            stream << "  int     tile_m       = 0;\n";
+            stream << "  int     tile_n       = 0;\n";
+            stream << "  int     tile_k       = 0;\n";
             stream << "};\n";
             stream << "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
             stream << "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
@@ -532,6 +535,12 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "constexpr int get_tile_rows() { return 0; }\n";
             stream << "constexpr int get_tile_cols() { return 0; }\n";
             stream << "constexpr int get_k_dim() { return 0; }\n";
+            stream << "constexpr int get_tile_m() { return 0; }\n";
+            stream << "constexpr int get_tile_n() { return 0; }\n";
+            stream << "constexpr int get_effective_k() { return 0; }\n";
+            stream << "constexpr int get_k_rounds() { return 0; }\n";
+            stream << "constexpr int get_spatial_m_rounds() { return 0; }\n";
+            stream << "constexpr int get_spatial_n_rounds() { return 0; }\n";
             stream << "}\n";
             // aiePartition struct (shared between aieDim and aieMesh)
             stream << "struct aiePartition {\n";

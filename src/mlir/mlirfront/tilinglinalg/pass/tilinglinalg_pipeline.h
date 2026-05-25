@@ -70,6 +70,17 @@ struct DerivedTilingParams {
     int64_t tileCols = 0; // N / HW_COLS
     int64_t kDim = 0;     // K
 
+    // Two-level tiling: L2 temporal tiling within each core
+    // When non-zero, the kernel works on sub-tiles of size tile_m x tile_n
+    // with K streamed in chunks of effective_k.
+    int64_t tileM = 0;          // effective sub-tile rows per core (0 = tileRows, no sub-tiling)
+    int64_t tileN = 0;          // effective sub-tile cols per core (0 = tileCols, no sub-tiling)
+    int64_t effectiveK = 0;     // K chunk size for temporal tiling (0 = kDim, full K)
+    int64_t spatialMRounds = 1; // tileRows / tileM — host re-launch rounds along M
+    int64_t spatialNRounds = 1; // tileCols / tileN — host re-launch rounds along N
+    int64_t kRounds = 1;        // kDim / effectiveK — K-accumulation rounds inside kernel
+    bool autoTiled = false;     // true if compiler auto-derived tileM/tileN/effectiveK
+
     // Per-port derived values (indexed by tensor order: 0=A, 1=B, 2=C for GEMM)
     struct PortParams {
         int64_t numRounds = 0;
