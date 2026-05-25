@@ -196,6 +196,19 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
 
     builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(hostFunc);
+
+    // Store per-tensor pp_depth as module attribute so downstream passes can read it.
+    // Format: "routing.pp_depth_map" = { tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 1 : i32, ... }
+    {
+        NamedAttrList ppDepthEntries;
+        for (unsigned i = 0; i < splitModel.tensorSplits.size(); ++i) {
+            int ppDepth = splitModel.tensorSplits[i].pingPong;
+            std::string key = "tensor_" + std::to_string(i);
+            ppDepthEntries.append(key, builder.getI32IntegerAttr(ppDepth));
+        }
+        m->setAttr("routing.pp_depth_map", DictionaryAttr::get(&ctx, ppDepthEntries));
+    }
+
     llvm::errs() << m;
     return m;
 }
@@ -223,7 +236,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     // Convert absolute partition columns to 0-based partition-relative columns.
     // XAie_SetupPartitionConfig handles the physical mapping, so the pipeline
     // should generate coordinates relative to the partition origin.
-    int relStartCol = 0;
+    // Only enable partition mode when both startCol and endCol are specified;
+    // otherwise keep relStartCol = -1 so RoutingTopology skips setPartitionBounds.
+    int relStartCol = (partStartCol >= 0 && partEndCol >= 0) ? 0 : -1;
     int relEndCol = (partStartCol >= 0 && partEndCol >= 0) ? (partEndCol - partStartCol) : -1;
     RoutingTopology rtopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
 

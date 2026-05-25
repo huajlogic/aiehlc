@@ -744,7 +744,15 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         if (isManyToOne)
             ooPerCoreElements = ooFullPartitionElements / numCoreTiles;
 
-        int64_t ooPingPongSize = static_cast<int64_t>(ooPerCoreElements * bufferRatio);
+        // Read pp_depth from core FlowConfigOp to determine shim iteration parameters.
+        int shimPpDepth = static_cast<int>(1.0 / bufferRatio + 0.5); // default from bufferRatio
+        if (coreFlowConfig.getPpDepth())
+            shimPpDepth = static_cast<int>(*coreFlowConfig.getPpDepth());
+        if (shimPpDepth <= 0)
+            shimPpDepth = 2;
+        double shimEffectiveBufferRatio = 1.0 / shimPpDepth;
+
+        int64_t ooPingPongSize = static_cast<int64_t>(ooPerCoreElements * shimEffectiveBufferRatio);
         if (ooPingPongSize <= 0)
             ooPingPongSize = 1;
         if (maxPingPongBytes > 0 && ooElementSizeBytes > 0) {
@@ -1025,7 +1033,17 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             int64_t perCoreElements = fullPartitionElements;
             if (transferType == "many_to_one")
                 perCoreElements = fullPartitionElements / numCoreTiles;
-            int64_t pingPongBufferSize = static_cast<int64_t>(perCoreElements * bufferRatio);
+
+            // Read pp_depth from FlowConfigOp attribute (set by dmaphop→blueprint pass).
+            // Default: derive from bufferRatio for backward compatibility.
+            int ppDepth = static_cast<int>(1.0 / bufferRatio + 0.5); // e.g. bufferRatio=0.5 → ppDepth=2
+            if (coreFlowConfig.getPpDepth())
+                ppDepth = static_cast<int>(*coreFlowConfig.getPpDepth());
+            if (ppDepth <= 0)
+                ppDepth = 2;
+
+            double effectiveBufferRatio = 1.0 / ppDepth;
+            int64_t pingPongBufferSize = static_cast<int64_t>(perCoreElements * effectiveBufferRatio);
             if (pingPongBufferSize <= 0)
                 pingPongBufferSize = 1;
             // Clamp to maxPingPongBytes to prevent exceeding core tile memory
@@ -1057,13 +1075,17 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             }
 
             // Build config dictionary for this tile
+            // buffer_mode: 0 = single buffer (pp_depth=1), 1 = ping-pong (pp_depth>=2)
+            int bufferMode = (ppDepth == 1) ? 0 : 1;
+            int numBuffers = (ppDepth == 1) ? 1 : 2;
+
             NamedAttrList configAttrs;
             configAttrs.append("tile_index", rewriter.getI32IntegerAttr(tileIndex));
             configAttrs.append("flow_index", rewriter.getI32IntegerAttr(flowIndex));
             configAttrs.append("packet_id", rewriter.getI32IntegerAttr(basePacketId + tileIndex));
             configAttrs.append("dma_channel", rewriter.getI32IntegerAttr(coreChannel));
-            configAttrs.append("buffer_mode", rewriter.getI32IntegerAttr(1)); // 1 = ping-pong
-            configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(2));
+            configAttrs.append("buffer_mode", rewriter.getI32IntegerAttr(bufferMode));
+            configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(numBuffers));
             configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(pingPongBufferSize));
             configAttrs.append("num_iterations", rewriter.getI32IntegerAttr(numIterations));
             configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(bufferOffset));
@@ -1158,12 +1180,13 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 pongName = "buf_out_pong_" + std::to_string(dirIdx);
                             }
                             // Ensure buffer size is int32-aligned for DMA.
-                            // Use fullPartitionElements * bufferRatio (before numCoreTiles division)
+                            // Use fullPartitionElements * effectiveBufferRatio (before numCoreTiles division)
                             // because the kernel uses a single global BUF_SZ for ALL windows,
                             // determined by the largest flow (input one_to_many).  Output buffers
                             // (many_to_one) need the same allocation size even though they transfer
                             // fewer elements per core.
-                            int64_t kernelBufElements = static_cast<int64_t>(fullPartitionElements * bufferRatio);
+                            int64_t kernelBufElements =
+                                static_cast<int64_t>(fullPartitionElements * effectiveBufferRatio);
                             // Clamp kernelBufElements to maxPingPongBytes (same as pingPongBufferSize clamping)
                             if (maxPingPongBytes > 0 && elementSizeBytes > 0) {
                                 int64_t maxElements = maxPingPongBytes / elementSizeBytes;
@@ -1176,13 +1199,22 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             try {
                                 auto &allocator = ResourceMgr::instance()->coreMemAllocator();
                                 auto pingAddr = allocator.allocate(pingName, bufSizeBytes, /*alignment=*/32);
-                                auto pongAddr = allocator.allocate(pongName, bufSizeBytes, /*alignment=*/32);
-                                if (pingAddr && pongAddr) {
-                                    // Convert core processor view (0x78000+) to DMA view (0x08000+)
-                                    // Core DMA engine sees memory starting at 0x00000, not 0x70000
-                                    flowPingL1Offset = static_cast<int64_t>(*pingAddr) - 0x70000;
-                                    flowPongL1Offset = static_cast<int64_t>(*pongAddr) - 0x70000;
-                                    flowAddrsValid = true;
+                                if (ppDepth == 1) {
+                                    // Single buffer mode: only allocate ping buffer, no pong
+                                    if (pingAddr) {
+                                        flowPingL1Offset = static_cast<int64_t>(*pingAddr) - 0x70000;
+                                        flowPongL1Offset = flowPingL1Offset; // unused but set for safety
+                                        flowAddrsValid = true;
+                                    }
+                                } else {
+                                    auto pongAddr = allocator.allocate(pongName, bufSizeBytes, /*alignment=*/32);
+                                    if (pingAddr && pongAddr) {
+                                        // Convert core processor view (0x78000+) to DMA view (0x08000+)
+                                        // Core DMA engine sees memory starting at 0x00000, not 0x70000
+                                        flowPingL1Offset = static_cast<int64_t>(*pingAddr) - 0x70000;
+                                        flowPongL1Offset = static_cast<int64_t>(*pongAddr) - 0x70000;
+                                        flowAddrsValid = true;
+                                    }
                                 }
                             } catch (...) {
                                 // ResourceMgr singleton not initialized; fall back to relative offsets
@@ -1192,30 +1224,6 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             pingL1Offset = flowPingL1Offset;
                             pongL1Offset = flowPongL1Offset;
                         }
-                        auto pingL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
-                            loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
-                            rewriter.getI64IntegerAttr(pingL1Offset));
-                        auto pongL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
-                            loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
-                            rewriter.getI64IntegerAttr(pongL1Offset));
-
-                        // Allocate BD IDs from ResourceMgr per-tile pool
-                        int32_t pingBdId = -1, pongBdId = -1;
-                        if (resourceMgr) {
-                            auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
-                            auto bd1 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
-                            if (bd0 && bd1) {
-                                pingBdId = *bd0;
-                                pongBdId = *bd1;
-                            }
-                        }
-                        if (pingBdId < 0 || pongBdId < 0) {
-                            llvm::errs() << "WARNING: BD allocation failed for tile (" << col << "," << row
-                                         << "), falling back to 0/1\n";
-                            pingBdId = 0;
-                            pongBdId = 1;
-                        }
-
                         // Core BD len in bytes: runtime passes len directly to
                         // XAie_DmaSetAddrLen, so compute the total byte count here.
                         int64_t coreBdLen = pingPongBufferSize * elementSizeBytes;
@@ -1244,51 +1252,119 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 coreOooBdId = shimPerTileBdIds[idx];
                         }
 
-                        // Pong BD first (no linked_bd): next_bd -> ping
-                        auto pongBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
-                                                                                rewriter.getI32IntegerAttr(pongBdId));
-                        auto pongBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-                            loc, dfschedule::BdHandleType::get(rewriter.getContext()), pongL1.getBuffer(),
-                            coreTileOp.getTile(), pongBdIdConst.getResult(),
-                            rewriter.getI32IntegerAttr(0),               // offset
-                            rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
-                            rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
-                            rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
-                            rewriter.getI32IntegerAttr(pingBdId),        // next_bd -> ping
-                            rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
-                            rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
-                            rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
-                            rewriter.getI32IntegerAttr(1),               // release_lock_val
-                            rewriter.getI32IntegerAttr(-1),              // data_id
-                            Value(),                                     // linked_bd = none
-                            rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
-                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
-                            rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                        Value firstCoreBdHandle; // The BD handle consumed by ConfigCreateIoOp
 
-                        // Ping BD second (linked_bd = pong handle): next_bd -> pong
-                        auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
-                                                                                rewriter.getI32IntegerAttr(pingBdId));
-                        auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-                            loc, dfschedule::BdHandleType::get(rewriter.getContext()), pingL1.getBuffer(),
-                            coreTileOp.getTile(), pingBdIdConst.getResult(),
-                            rewriter.getI32IntegerAttr(0),               // offset
-                            rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
-                            rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
-                            rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
-                            rewriter.getI32IntegerAttr(pongBdId),        // next_bd -> pong
-                            rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
-                            rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
-                            rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
-                            rewriter.getI32IntegerAttr(1),               // release_lock_val
-                            rewriter.getI32IntegerAttr(-1),              // data_id
-                            pongBdOp.getBdHandle(),                      // linked_bd = pong BD
-                            rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
-                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
-                            rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                        if (ppDepth == 1) {
+                            // === Single buffer mode (pp_depth=1) ===
+                            // One buffer, one BD, no next_bd chaining, no pong.
+                            auto singleL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
+                                loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
+                                rewriter.getI64IntegerAttr(pingL1Offset));
+
+                            int32_t singleBdId = -1;
+                            if (resourceMgr) {
+                                auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                                if (bd0)
+                                    singleBdId = *bd0;
+                            }
+                            if (singleBdId < 0)
+                                singleBdId = 0;
+
+                            auto singleBdIdConst = rewriter.create<arith::ConstantOp>(
+                                loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(singleBdId));
+                            auto singleBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                                loc, dfschedule::BdHandleType::get(rewriter.getContext()), singleL1.getBuffer(),
+                                coreTileOp.getTile(), singleBdIdConst.getResult(),
+                                rewriter.getI32IntegerAttr(0),               // offset
+                                rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
+                                rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
+                                rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
+                                rewriter.getI32IntegerAttr(-1),              // next_bd = -1 (no chaining)
+                                rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
+                                rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
+                                rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
+                                rewriter.getI32IntegerAttr(1),               // release_lock_val
+                                rewriter.getI32IntegerAttr(-1),              // data_id
+                                Value(),                                     // linked_bd = none
+                                rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
+                                /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+
+                            firstCoreBdHandle = singleBdOp.getBdHandle();
+                        } else {
+                            // === Ping-pong mode (pp_depth>=2, existing behavior) ===
+                            auto pingL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
+                                loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
+                                rewriter.getI64IntegerAttr(pingL1Offset));
+                            auto pongL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
+                                loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
+                                rewriter.getI64IntegerAttr(pongL1Offset));
+
+                            // Allocate BD IDs from ResourceMgr per-tile pool
+                            int32_t pingBdId = -1, pongBdId = -1;
+                            if (resourceMgr) {
+                                auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                                auto bd1 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                                if (bd0 && bd1) {
+                                    pingBdId = *bd0;
+                                    pongBdId = *bd1;
+                                }
+                            }
+                            if (pingBdId < 0 || pongBdId < 0) {
+                                llvm::errs() << "WARNING: BD allocation failed for tile (" << col << "," << row
+                                             << "), falling back to 0/1\n";
+                                pingBdId = 0;
+                                pongBdId = 1;
+                            }
+
+                            // Pong BD first (no linked_bd): next_bd -> ping
+                            auto pongBdIdConst = rewriter.create<arith::ConstantOp>(
+                                loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pongBdId));
+                            auto pongBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                                loc, dfschedule::BdHandleType::get(rewriter.getContext()), pongL1.getBuffer(),
+                                coreTileOp.getTile(), pongBdIdConst.getResult(),
+                                rewriter.getI32IntegerAttr(0),               // offset
+                                rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
+                                rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
+                                rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
+                                rewriter.getI32IntegerAttr(pingBdId),        // next_bd -> ping
+                                rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
+                                rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
+                                rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
+                                rewriter.getI32IntegerAttr(1),               // release_lock_val
+                                rewriter.getI32IntegerAttr(-1),              // data_id
+                                Value(),                                     // linked_bd = none
+                                rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
+                                /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+
+                            // Ping BD second (linked_bd = pong handle): next_bd -> pong
+                            auto pingBdIdConst = rewriter.create<arith::ConstantOp>(
+                                loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pingBdId));
+                            auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                                loc, dfschedule::BdHandleType::get(rewriter.getContext()), pingL1.getBuffer(),
+                                coreTileOp.getTile(), pingBdIdConst.getResult(),
+                                rewriter.getI32IntegerAttr(0),               // offset
+                                rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
+                                rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
+                                rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
+                                rewriter.getI32IntegerAttr(pongBdId),        // next_bd -> pong
+                                rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
+                                rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
+                                rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
+                                rewriter.getI32IntegerAttr(1),               // release_lock_val
+                                rewriter.getI32IntegerAttr(-1),              // data_id
+                                pongBdOp.getBdHandle(),                      // linked_bd = pong BD
+                                rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
+                                /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+
+                            firstCoreBdHandle = pingBdOp.getBdHandle();
+                        }
 
                         // Create IO handle for core tile
                         auto coreCreateIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
-                            loc, dfschedule::IoHandleType::get(rewriter.getContext()), pingBdOp.getBdHandle(),
+                            loc, dfschedule::IoHandleType::get(rewriter.getContext()), firstCoreBdHandle,
                             coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
                             rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation),
                             rewriter.getBoolAttr(false)); // enable_out_of_order=false for core tiles

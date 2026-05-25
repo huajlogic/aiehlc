@@ -1,4 +1,4 @@
-module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
+module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 1 : i32}} {
   func.func @main(%arg0: memref<256x256xi8>, %arg1: memref<256x256xi8>, %arg2: memref<256x256xi8>) {
     %c3_i32 = arith.constant 3 : i32
     %c2_i32 = arith.constant 2 : i32
@@ -226,6 +226,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
           dma = #dfscheblueprint.DMA<channels = [0], direction = MM2S>
           ,slice_symbols = [@producer_slice_17_0, @producer_slice_17_1, @producer_slice_17_2, @producer_slice_17_3]
           ,type = "core"
+          ,pp_depth = 1 : i32
         }
         dfscheblueprint.flowconfig @flow_dst_17 {
           target = @group_dst_17,
@@ -236,6 +237,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
           ,data_id = 2 : i32
           ,shim_dim_strides = [4 : i32, 256 : i32, 64 : i32]
           ,shim_dim_wraps = [16 : i32, 64 : i32, 4 : i32]
+          ,pp_depth = 1 : i32
         }
         dfscheblueprint.flow_transfer @transfer_17 {
           type = "many_to_one",
@@ -298,6 +300,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
           dma = #dfscheblueprint.DMA<channels = [0], direction = MM2S>
           ,slice_symbols = [@producer_slice_19_0, @producer_slice_19_1, @producer_slice_19_2, @producer_slice_19_3]
           ,type = "core"
+          ,pp_depth = 1 : i32
         }
         dfscheblueprint.flowconfig @flow_dst_19 {
           target = @group_dst_19,
@@ -308,6 +311,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
           ,data_id = 2 : i32
           ,shim_dim_strides = [4 : i32, 256 : i32, 64 : i32]
           ,shim_dim_wraps = [16 : i32, 64 : i32, 4 : i32]
+          ,pp_depth = 1 : i32
         }
         dfscheblueprint.flow_transfer @transfer_19 {
           type = "many_to_one",
@@ -370,6 +374,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
           dma = #dfscheblueprint.DMA<channels = [0], direction = MM2S>
           ,slice_symbols = [@producer_slice_21_0, @producer_slice_21_1, @producer_slice_21_2, @producer_slice_21_3]
           ,type = "core"
+          ,pp_depth = 1 : i32
         }
         dfscheblueprint.flowconfig @flow_dst_21 {
           target = @group_dst_21,
@@ -380,6 +385,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
           ,data_id = 2 : i32
           ,shim_dim_strides = [4 : i32, 256 : i32, 64 : i32]
           ,shim_dim_wraps = [16 : i32, 64 : i32, 4 : i32]
+          ,pp_depth = 1 : i32
         }
         dfscheblueprint.flow_transfer @transfer_21 {
           type = "many_to_one",
@@ -442,6 +448,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
           dma = #dfscheblueprint.DMA<channels = [0], direction = MM2S>
           ,slice_symbols = [@producer_slice_23_0, @producer_slice_23_1, @producer_slice_23_2, @producer_slice_23_3]
           ,type = "core"
+          ,pp_depth = 1 : i32
         }
         dfscheblueprint.flowconfig @flow_dst_23 {
           target = @group_dst_23,
@@ -452,6 +459,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
           ,data_id = 2 : i32
           ,shim_dim_strides = [4 : i32, 256 : i32, 64 : i32]
           ,shim_dim_wraps = [16 : i32, 64 : i32, 4 : i32]
+          ,pp_depth = 1 : i32
         }
         dfscheblueprint.flow_transfer @transfer_23 {
           type = "many_to_one",

@@ -1414,13 +1414,15 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             llvm::errs() << "  ✓ Created DMA BD config with full AIE API parameters\n";
         }
 
-        // For core tiles with ping-pong buffer (acquire_lock_id >= 0, next_bd >= 0),
+        // For core tiles with lock-based DMA (acquire_lock_val != 0),
         // emit XAie_LockSetValue to initialize locks.
-        // Input (S2MM on core): DMA acquires lock 0, init lock 0 = 2 (buffers ready for DMA)
+        // Input (S2MM on core): DMA acquires lock 0, init lock 0 = N (N buffers ready for DMA)
         // Output (MM2S on core): DMA acquires lock 1 (swapped in BlueprintToSchedule),
-        //   init lock 0 = 2 (kernel can write) and lock 1 = 0 (no data yet, default)
+        //   init lock 0 = N (kernel can write to N buffers) and lock 1 = 0 (no data yet, default)
+        // N = 1 for single-buffer (pp_depth=1), N = 2 for ping-pong (pp_depth>=2).
         // Only emitted once per (tile, lock_id) to avoid duplicate calls.
-        if (acquireLockId >= 0 && nextBd >= 0) {
+        // Gate on acquireLockVal != 0 to exclude shim BDs (which don't use locks).
+        if (acquireLockId >= 0 && acquireLockVal != 0) {
             int32_t tileCol = -1, tileRow = -1;
             if (auto declareTileOp = op.getTile().getDefiningOp<dfschedule::DeclareTileOp>()) {
                 tileCol = declareTileOp.getCol();
@@ -1454,33 +1456,43 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                         }
                     }
 
+                    // Determine buffer count for lock init value.
+                    // Single buffer (pp_depth=1): init=1; ping-pong (pp_depth>=2): init=2.
+                    // Detect single-buffer mode by checking next_bd: if next_bd==-1 (no chaining),
+                    // and there's no linked_bd, it's a single-buffer flow.
+                    int32_t nextBdVal = static_cast<int32_t>(op.getNextBd());
+                    bool isSingleBuffer = (nextBdVal == -1) && !op.getLinkedBd();
+                    int32_t lockInitValue = isSingleBuffer ? 1 : 2;
+
                     if (isOutput) {
                         // Output (MM2S): BD acquires lock 1 (releaseLockId from kernel perspective).
                         // Lock 1 init = 0 (no data produced yet — DMA waits for kernel).
-                        // Lock 0 init = 2 (kernel can write to both ping/pong buffers).
+                        // Lock 0 init = lockInitValue (kernel can write to buffer(s)).
                         // Lock 1 (DMA's acquire lock) stays at default 0.
                         int32_t kernelAcquireLock = releaseLockId; // lock 0 = BD's release lock
                         auto kernelLockKey = std::make_tuple(tileCol, tileRow, kernelAcquireLock);
                         if (state.initializedLocks.find(kernelLockKey) == state.initializedLocks.end()) {
                             state.initializedLocks.insert(kernelLockKey);
-                            std::string lockComment = "/* Lock init: tile(" + std::to_string(tileCol) + "," +
-                                                      std::to_string(tileRow) +
-                                                      ") lock=" + std::to_string(kernelAcquireLock) +
-                                                      " init_value=2 (kernel output acquire) */";
+                            std::string lockComment =
+                                "/* Lock init: tile(" + std::to_string(tileCol) + "," + std::to_string(tileRow) +
+                                ") lock=" + std::to_string(kernelAcquireLock) +
+                                " init_value=" + std::to_string(lockInitValue) + " (kernel output acquire) */";
                             rewriter.create<emitc::VerbatimOp>(loc, lockComment);
                             std::string lockSetCall = "XAie_LockSetValue(dev, XAie_TileLoc(" + std::to_string(tileCol) +
                                                       ", " + std::to_string(tileRow) + "), XAie_LockInit(" +
-                                                      std::to_string(kernelAcquireLock) + ", 2));";
+                                                      std::to_string(kernelAcquireLock) + ", " +
+                                                      std::to_string(lockInitValue) + "));";
                             rewriter.create<emitc::VerbatimOp>(loc, lockSetCall);
-                            llvm::errs() << "  ✓ Emitted XAie_LockSetValue for tile(" << tileCol << "," << tileRow
-                                         << ") lock=" << kernelAcquireLock << " init=2 (kernel output acquire)\n";
+                            llvm::errs() << "  Emitted XAie_LockSetValue for tile(" << tileCol << "," << tileRow
+                                         << ") lock=" << kernelAcquireLock << " init=" << lockInitValue
+                                         << " (kernel output acquire)\n";
                         }
                         // DMA acquire lock (lock 1) init = 0 (default, no explicit init needed)
-                        llvm::errs() << "  ✓ Output flow: DMA acquire lock " << acquireLockId
+                        llvm::errs() << "  Output flow: DMA acquire lock " << acquireLockId
                                      << " init=0 (default, skipped)\n";
                     } else {
-                        // Input (S2MM): DMA acquires lock 0, init = 2 (ping-pong ready)
-                        int32_t initValue = 2;
+                        // Input (S2MM): DMA acquires lock 0, init = lockInitValue
+                        int32_t initValue = lockInitValue;
                         std::string lockComment = "/* Lock init: tile(" + std::to_string(tileCol) + "," +
                                                   std::to_string(tileRow) + ") lock=" + std::to_string(acquireLockId) +
                                                   " init_value=" + std::to_string(initValue) + " */";

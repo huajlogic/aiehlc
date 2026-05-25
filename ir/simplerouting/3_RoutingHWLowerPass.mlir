@@ -1,4 +1,4 @@
-module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
+module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 1 : i32}} {
   emitc.include <"xaiengine.h">
   emitc.func private @XAie_TileLoc(i32, i32) -> !emitc.opaque<"XAie_LocType">
   emitc.func private @XAie_EnableShimDmaToAieStrmPort(!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, i32) -> i32

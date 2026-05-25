@@ -114,6 +114,7 @@ static bool runSinglePass(MLIRContext &ctx, mlir::ModuleOp module, std::unique_p
 // Unit test function to verify path contiguity for RoutingLowerPass
 // Global AIE generation string, set from --gen CLI argument
 static std::string g_aieGen = "Gen2";
+static int g_outputPpDepth = 2; // pp_depth for output tensor (default: 2 = ping-pong)
 
 void testRoutingLowerPassPathContiguity() {
     std::cout << "\n=== Testing RoutingLowerPass Path Contiguity ===" << std::endl;
@@ -1035,6 +1036,14 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         {{16, 16}, 8, false}, // output C (window_out_0)
     };
 
+    // Build SplitModel with per-tensor pp_depth from CLI
+    SplitModel splitModel = SplitModel::gemm();
+    // Override output tensor's pp_depth from CLI --output-pp-depth
+    if (g_outputPpDepth != 2 && splitModel.tensorSplits.size() >= 3) {
+        splitModel.tensorSplits[2].pingPong = g_outputPpDepth;
+        std::cout << "Output tensor pp_depth overridden to " << g_outputPpDepth << std::endl;
+    }
+
     // Create module: either parse from file or build programmatically
     mlir::OwningOpRef<mlir::ModuleOp> parsedModule;
     mlir::ModuleOp module;
@@ -1044,7 +1053,7 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         module = *parsedModule;
         std::cout << "Parsed module from " << irFilepath << std::endl;
     } else {
-        module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors);
+        module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors, splitModel);
     }
 
     // When startStage==0 and using the default pipeline, delegate to
@@ -1470,7 +1479,7 @@ void testPartition() {
 }
 
 int main(int argc, char* argv[]) {
-    // Parse --gen argument from anywhere in argv
+    // Parse --gen and --output-pp-depth arguments from anywhere in argv
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--gen" && i + 1 < argc) {
@@ -1480,9 +1489,17 @@ int main(int argc, char* argv[]) {
                 argv[j] = argv[j + 2];
             argc -= 2;
             --i; // re-check this index
+        } else if (a == "--output-pp-depth" && i + 1 < argc) {
+            g_outputPpDepth = std::atoi(argv[i + 1]);
+            for (int j = i; j + 2 < argc; ++j)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            --i;
         }
     }
     std::cout << "AIE generation: " << g_aieGen << std::endl;
+    if (g_outputPpDepth != 2)
+        std::cout << "Output pp_depth: " << g_outputPpDepth << std::endl;
 
     if (argc > 1) {
         std::string arg = argv[1];

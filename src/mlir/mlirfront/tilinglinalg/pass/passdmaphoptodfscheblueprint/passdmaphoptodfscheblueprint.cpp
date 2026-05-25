@@ -4,20 +4,21 @@
 ******************************************************************************/
 
 #include "passdmaphoptodfscheblueprint.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include <iostream>
 #include <atomic>
+#include <iostream>
 
 using namespace mlir;
 using namespace dmaphop;
@@ -239,7 +240,8 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getArrayAttr({}), builder.getStringAttr(srcTileType),
         nullptr, // data_id
         nullptr, // shim_dim_strides
-        nullptr  // shim_dim_wraps
+        nullptr, // shim_dim_wraps
+        nullptr  // pp_depth
     );
 
     std::string dstBindName = "flow_dst_" + std::to_string(opId);
@@ -252,7 +254,8 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getStringAttr(dstTileType),
         builder.getI32IntegerAttr(dataId), // data_id for shim BD grouping
         nullptr,                           // shim_dim_strides
-        nullptr                            // shim_dim_wraps
+        nullptr,                           // shim_dim_wraps
+        nullptr                            // pp_depth
     );
 
     // 4. Collective Transfer
@@ -396,7 +399,8 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getStringAttr(srcTileType),
         nullptr, // data_id
         nullptr, // shim_dim_strides
-        nullptr  // shim_dim_wraps
+        nullptr, // shim_dim_wraps
+        nullptr  // pp_depth
     );
 
     std::string dstBindName = "flow_dst_" + std::to_string(opId);
@@ -408,7 +412,8 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getArrayAttr({}), builder.getStringAttr(dstTileType),
         nullptr, // data_id
         nullptr, // shim_dim_strides
-        nullptr  // shim_dim_wraps
+        nullptr, // shim_dim_wraps
+        nullptr  // pp_depth
     );
 
     int32_t basePktId = 0; // Push flows are circuit-switched; no pkt_id
@@ -815,7 +820,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             rewriter.getStringAttr(srcTileType),
             rewriter.getI32IntegerAttr(dataId), // data_id for shim BD grouping/merging
             nullptr,                            // shim_dim_strides (input scatter: contiguous DDR, no multi-dim needed)
-            nullptr                             // shim_dim_wraps
+            nullptr,                            // shim_dim_wraps
+            nullptr                             // pp_depth
         );
 
         std::string dstBindName = "flow_dst_" + std::to_string(opId);
@@ -828,7 +834,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             rewriter.getStringAttr(dstTileType),
             nullptr, // data_id
             nullptr, // shim_dim_strides
-            nullptr  // shim_dim_wraps
+            nullptr, // shim_dim_wraps
+            nullptr  // pp_depth
         );
 
         // 5. Create Collective Transfer - one_to_many for push/scatter
@@ -1038,8 +1045,50 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 rewriter.getArrayAttr(destTiles)
             );
         }
-        
+
         // 4. Create Binds
+        // Look up pp_depth from module attribute for output (Pull) flows.
+        // The pp_depth_map module attribute maps tensor_N -> pp_depth.
+        // For Pull flows (output Gather), we find the matching output tensor.
+        IntegerAttr ppDepthAttr = nullptr;
+        if (auto moduleOp = op->getParentOfType<ModuleOp>()) {
+            if (auto ppDepthMap = moduleOp->getAttrOfType<DictionaryAttr>("routing.pp_depth_map")) {
+                // Trace rootAdaptedView back through the op chain to find
+                // the func arg index, then look up pp_depth from the map.
+                // Chain: routingextract_data -> partitiontensor ->
+                //        createscheduletensor -> to_tensor -> block arg
+                Value traceVal = rootAdaptedView;
+                for (int step = 0; step < 10 && traceVal; ++step) {
+                    if (auto blockArg = dyn_cast<BlockArgument>(traceVal)) {
+                        // Reached func argument — look up pp_depth
+                        unsigned tensorIdx = blockArg.getArgNumber();
+                        std::string key = "tensor_" + std::to_string(tensorIdx);
+                        if (auto attr = ppDepthMap.getAs<IntegerAttr>(key)) {
+                            ppDepthAttr = attr;
+                            llvm::errs() << "[PullOp] Found pp_depth=" << attr.getInt() << " for tensor_" << tensorIdx
+                                         << "\n";
+                        }
+                        break;
+                    }
+                    Operation *defOp = traceVal.getDefiningOp();
+                    if (!defOp)
+                        break;
+                    if (auto extractSlice = dyn_cast<tensor::ExtractSliceOp>(defOp))
+                        traceVal = extractSlice.getSource();
+                    else if (auto extractData = dyn_cast<routing::extract_data>(defOp))
+                        traceVal = extractData.getTensor();
+                    else if (auto partTensor = dyn_cast<routing::partitiontensor>(defOp))
+                        traceVal = partTensor.getTensor();
+                    else if (auto schedTensor = dyn_cast<routing::createscheduletensor>(defOp))
+                        traceVal = schedTensor.getInitTensor();
+                    else if (auto toTensor = dyn_cast<bufferization::ToTensorOp>(defOp))
+                        traceVal = toTensor.getMemref();
+                    else
+                        break; // unknown op
+                }
+            }
+        }
+
         std::string srcBindName = "flow_src_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::FlowConfigOp>(
             op.getLoc(), rewriter.getStringAttr(srcBindName), FlatSymbolRefAttr::get(getContext(), srcGroupName),
@@ -1048,9 +1097,10 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                                           dfscheblueprint::bp_direction::MM2S),
             rewriter.getArrayAttr(sliceSymbols), // slice_symbols
             rewriter.getStringAttr(srcTileType),
-            nullptr, // data_id
-            nullptr, // shim_dim_strides
-            nullptr  // shim_dim_wraps
+            nullptr,    // data_id
+            nullptr,    // shim_dim_strides
+            nullptr,    // shim_dim_wraps
+            ppDepthAttr // pp_depth (from module attribute, for output flows)
         );
 
         // Compute multi-dimensional DMA addressing for shim S2MM (output assembly).
@@ -1132,7 +1182,8 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             rewriter.getStringAttr(dstTileType),
             rewriter.getI32IntegerAttr(dataId), // data_id for shim BD grouping
             shimDimStrides,                     // multi-dim strides for output assembly
-            shimDimWraps                        // multi-dim wraps for output assembly
+            shimDimWraps,                       // multi-dim wraps for output assembly
+            ppDepthAttr                         // pp_depth (same as src for consistency)
         );
 
         // 5. Create Collective Transfer

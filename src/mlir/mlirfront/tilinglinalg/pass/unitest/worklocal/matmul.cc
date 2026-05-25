@@ -10,10 +10,10 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
     const int k_dim = 256;
     const int num_a_rounds = 4;
     const int num_b_rounds = 4;
-    const int num_c_rounds = 2;
+    const int num_c_rounds = 1;
     const int buf_sz_a = 4096;
     const int buf_sz_b = 4096;
-    const int buf_sz_c = 2048;
+    const int buf_sz_c = 4096;
 
     // Derived per-round sizes
     const int rows_per_round = buf_sz_a / k_dim;

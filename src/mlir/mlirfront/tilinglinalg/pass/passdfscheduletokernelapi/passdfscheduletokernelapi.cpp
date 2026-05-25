@@ -31,6 +31,7 @@ struct WindowInfo {
     std::string acquireLock;
     std::string releaseLock;
     int32_t bufferSize = 0; // Per-window buffer size from window_def attribute
+    int32_t numRounds = 0;  // Number of ping-pong rounds (0 = use bufferSize as fallback)
     std::string direction;  // "in" or "out"
 };
 
@@ -61,6 +62,8 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     info.releaseLock = a.getRootReference().getValue().str();
                 if (auto a = winAttrs.getAs<IntegerAttr>("buffer_size"))
                     info.bufferSize = a.getInt();
+                if (auto a = winAttrs.getAs<IntegerAttr>("num_rounds"))
+                    info.numRounds = a.getInt();
                 if (auto a = winAttrs.getAs<StringAttr>("direction"))
                     info.direction = a.getValue().str();
                 windowInfoMap[windowDefOp.getSymName().str()] = info;
@@ -291,13 +294,18 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     acqLock = "LOCK_" + winSym + "_ACQ";
                     relLock = "LOCK_" + winSym + "_REL";
                 }
-                // Use per-window buffer size from window_def attribute
+                // Use per-window buffer size and num_rounds from window_def attribute
                 std::string winBufSzStr = "BUF_SZ"; // fallback
+                std::string winNumRoundsStr = winBufSzStr; // fallback: same as bufferSize
                 if (it != windowInfoMap.end() && it->second.bufferSize > 0)
                     winBufSzStr = std::to_string(it->second.bufferSize);
+                if (it != windowInfoMap.end() && it->second.numRounds > 0)
+                    winNumRoundsStr = std::to_string(it->second.numRounds);
+                else
+                    winNumRoundsStr = winBufSzStr; // backward compat: numRounds = bufferSize
                 rewriter.create<emitc::VerbatimOp>(loc, "window_init(window_" + winSym + ", 1, " + pingBuf + ", " +
                                                             acqLock + ", " + pongBuf + ", " + relLock + ", " +
-                                                            winBufSzStr + ", " + winBufSzStr + ");");
+                                                            winBufSzStr + ", " + winNumRoundsStr + ");");
                 continue;
             }
             if (auto invokeOp = dyn_cast<KernelInvokeOp>(&inner)) {

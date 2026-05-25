@@ -269,6 +269,7 @@ struct KernelParamInfo {
     Type elementType;           // Element type of the buffer
     int64_t bufferSize;         // Size of the buffer
     int32_t vectorWidth;        // Vector width (e.g., 4 for v4int32)
+    int32_t numRounds = 0;      // Number of ping-pong rounds (ppDepth)
     uint32_t pingAddress = 0;   // BCF symbol address for ping buffer (from CoreMemAllocator)
     uint32_t pongAddress = 0;   // BCF symbol address for pong buffer (from CoreMemAllocator)
     int funcArgIndex = -1;      // Function argument index (0=A, 1=B, 2=C)
@@ -393,6 +394,8 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
             winAttrs.append("acquire_lock", SymbolRefAttr::get(rewriter.getContext(), acqLockName));
             winAttrs.append("release_lock", SymbolRefAttr::get(rewriter.getContext(), relLockName));
             winAttrs.append("buffer_size", rewriter.getI32IntegerAttr(paramInfo.bufferSize));
+            if (paramInfo.numRounds > 0)
+                winAttrs.append("num_rounds", rewriter.getI32IntegerAttr(paramInfo.numRounds));
             winAttrs.append("async", rewriter.getBoolAttr(true));
 
             rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr(paramInfo.windowName),
@@ -806,7 +809,17 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 int64_t perCoreSize = partitionSize;
                 if (transferType == "many_to_one")
                     perCoreSize = partitionSize / numCoreTiles;
-                int64_t pingPongBufSize = static_cast<int64_t>(perCoreSize * bufferRatio);
+
+                // Read pp_depth from FlowConfigOp attribute if available.
+                // Default: derive from bufferRatio for backward compatibility.
+                int ppDepth = static_cast<int>(1.0 / bufferRatio + 0.5);
+                if (coreFlowConfig.getPpDepth())
+                    ppDepth = static_cast<int>(*coreFlowConfig.getPpDepth());
+                if (ppDepth <= 0)
+                    ppDepth = 2;
+                double effectiveBufRatio = 1.0 / ppDepth;
+
+                int64_t pingPongBufSize = static_cast<int64_t>(perCoreSize * effectiveBufRatio);
                 if (pingPongBufSize <= 0)
                     pingPongBufSize = 1;
                 // Clamp to maxPingPongBytes to prevent exceeding core tile memory
@@ -823,6 +836,9 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 paramInfo.bufferSize = pingPongBufSize / defaultVectorWidth;
                 if (paramInfo.bufferSize <= 0)
                     paramInfo.bufferSize = 1;
+                // numRounds = total rounds = perCoreSize / pingPongBufSize = ppDepth
+                paramInfo.numRounds =
+                    (pingPongBufSize > 0) ? static_cast<int32_t>(perCoreSize / pingPongBufSize) : ppDepth;
             } else {
                 // Fallback: try declare_data operand
                 Value srcValue = declareDataOp.getOperand();
