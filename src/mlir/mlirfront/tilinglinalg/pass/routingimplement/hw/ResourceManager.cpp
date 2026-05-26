@@ -242,19 +242,6 @@ ResourceMgr::ResourceMgr(std::unique_ptr<IHwResource> resource, TileType defType
     resource_ = std::move(resource);
     lastdioid = 0;
     InitSHIMNocList();
-
-    // Reconfigure CoreMemAllocator based on HW resource limits.
-    // Stack starts at 0x70000; data region starts after stack, up to 0x80000 (end of 64KB tile memory).
-    // Cap data size to usableDataBytes for safety.
-    uint32_t stackEnd = 0x70000 + resource_->getStackReserveBytes(); // e.g. 0x72800 with 10KB stack
-    uint32_t dataStart = (stackEnd + 31) & ~31;                      // align to 32 bytes
-    uint32_t dataEnd = 0x80000;                                      // end of 64KB tile memory
-    uint32_t dataSize = dataEnd - dataStart;
-    if (dataSize > resource_->getUsableDataBytes())
-        dataSize = resource_->getUsableDataBytes();
-    coreMemAllocator_ = CoreMemAllocator(dataStart, dataSize);
-    std::cout << "[ResourceMgr] CoreMemAllocator configured: base=0x" << std::hex << dataStart << " size=0x" << dataSize
-              << std::dec << " (" << dataSize << " bytes)" << std::endl;
 }
 
 void ResourceMgr::setPartitionBounds(int startCol, int endCol, int startRow, int endRow) {

@@ -16,48 +16,48 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %4 = emitc.call_opaque "__Runtime_dma_createio_4"(%1, %3) {args = [0 : index, 1 : index, 0 : i32, 0 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     %5 = emitc.call_opaque "XAie_TileLoc"() {args = [0 : i8, 3 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %6 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %6 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %7 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %5, %6) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,3) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 3), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %8 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %8 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %9 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %5, %8) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(0,3), direction=S2MM */"
     %10 = emitc.call_opaque "__Runtime_dma_createio_4"(%5, %9) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 0 for tile (0,3) */"
     %11 = emitc.call_opaque "XAie_TileLoc"() {args = [0 : i8, 4 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %12 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %12 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %13 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %11, %12) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,4) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 4), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %14 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %14 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %15 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %11, %14) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(0,4), direction=S2MM */"
     %16 = emitc.call_opaque "__Runtime_dma_createio_4"(%11, %15) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 0 for tile (0,4) */"
     %17 = emitc.call_opaque "XAie_TileLoc"() {args = [0 : i8, 5 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %18 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %18 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %19 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %17, %18) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,5) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 5), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %20 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %20 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %21 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %17, %20) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(0,5), direction=S2MM */"
     %22 = emitc.call_opaque "__Runtime_dma_createio_4"(%17, %21) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 0 for tile (0,5) */"
     %23 = emitc.call_opaque "XAie_TileLoc"() {args = [0 : i8, 6 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %24 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %24 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %25 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %23, %24) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,6) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 6), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %26 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %26 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %27 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %23, %26) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(0,6), direction=S2MM */"
     %28 = emitc.call_opaque "__Runtime_dma_createio_4"(%23, %27) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -74,12 +74,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %35 = emitc.call_opaque "XAie_TileLoc"() {args = [1 : i8, 3 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %36 = emitc.call_opaque "__runtime_buffer_offset"(%30) {args = [0 : index, 16384]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %37 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %37 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %38 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %35, %37) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,3) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 3), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %39 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %39 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %40 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %35, %39) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(1,3), direction=S2MM */"
     %41 = emitc.call_opaque "__Runtime_dma_createio_4"(%35, %40) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -87,12 +87,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %42 = emitc.call_opaque "XAie_TileLoc"() {args = [1 : i8, 4 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %43 = emitc.call_opaque "__runtime_buffer_offset"(%30) {args = [0 : index, 16384]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %44 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %44 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %45 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %42, %44) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,4) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 4), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %46 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %46 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %47 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %42, %46) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(1,4), direction=S2MM */"
     %48 = emitc.call_opaque "__Runtime_dma_createio_4"(%42, %47) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -100,12 +100,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %49 = emitc.call_opaque "XAie_TileLoc"() {args = [1 : i8, 5 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %50 = emitc.call_opaque "__runtime_buffer_offset"(%30) {args = [0 : index, 16384]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %51 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %51 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %52 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %49, %51) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,5) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 5), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %53 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %53 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %54 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %49, %53) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(1,5), direction=S2MM */"
     %55 = emitc.call_opaque "__Runtime_dma_createio_4"(%49, %54) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -113,12 +113,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %56 = emitc.call_opaque "XAie_TileLoc"() {args = [1 : i8, 6 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %57 = emitc.call_opaque "__runtime_buffer_offset"(%30) {args = [0 : index, 16384]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %58 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %58 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %59 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %56, %58) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,6) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 6), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %60 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %60 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %61 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %56, %60) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(1,6), direction=S2MM */"
     %62 = emitc.call_opaque "__Runtime_dma_createio_4"(%56, %61) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -135,12 +135,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %69 = emitc.call_opaque "XAie_TileLoc"() {args = [2 : i8, 3 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %70 = emitc.call_opaque "__runtime_buffer_offset"(%64) {args = [0 : index, 32768]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %71 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %71 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %72 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %69, %71) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,3) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 3), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %73 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %73 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %74 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %69, %73) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(2,3), direction=S2MM */"
     %75 = emitc.call_opaque "__Runtime_dma_createio_4"(%69, %74) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -148,12 +148,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %76 = emitc.call_opaque "XAie_TileLoc"() {args = [2 : i8, 4 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %77 = emitc.call_opaque "__runtime_buffer_offset"(%64) {args = [0 : index, 32768]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %78 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %78 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %79 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %76, %78) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,4) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 4), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %80 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %80 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %81 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %76, %80) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(2,4), direction=S2MM */"
     %82 = emitc.call_opaque "__Runtime_dma_createio_4"(%76, %81) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -161,12 +161,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %83 = emitc.call_opaque "XAie_TileLoc"() {args = [2 : i8, 5 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %84 = emitc.call_opaque "__runtime_buffer_offset"(%64) {args = [0 : index, 32768]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %85 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %85 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %86 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %83, %85) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,5) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 5), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %87 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %87 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %88 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %83, %87) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(2,5), direction=S2MM */"
     %89 = emitc.call_opaque "__Runtime_dma_createio_4"(%83, %88) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -174,12 +174,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %90 = emitc.call_opaque "XAie_TileLoc"() {args = [2 : i8, 6 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %91 = emitc.call_opaque "__runtime_buffer_offset"(%64) {args = [0 : index, 32768]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %92 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %92 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %93 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %90, %92) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,6) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 6), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %94 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %94 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %95 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %90, %94) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(2,6), direction=S2MM */"
     %96 = emitc.call_opaque "__Runtime_dma_createio_4"(%90, %95) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -196,12 +196,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %103 = emitc.call_opaque "XAie_TileLoc"() {args = [3 : i8, 3 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %104 = emitc.call_opaque "__runtime_buffer_offset"(%98) {args = [0 : index, 49152]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %105 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %105 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %106 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %103, %105) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,3) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 3), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %107 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %107 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %108 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %103, %107) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(3,3), direction=S2MM */"
     %109 = emitc.call_opaque "__Runtime_dma_createio_4"(%103, %108) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -209,12 +209,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %110 = emitc.call_opaque "XAie_TileLoc"() {args = [3 : i8, 4 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %111 = emitc.call_opaque "__runtime_buffer_offset"(%98) {args = [0 : index, 49152]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %112 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %112 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %113 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %110, %112) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,4) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 4), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %114 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %114 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %115 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %110, %114) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(3,4), direction=S2MM */"
     %116 = emitc.call_opaque "__Runtime_dma_createio_4"(%110, %115) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -222,12 +222,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %117 = emitc.call_opaque "XAie_TileLoc"() {args = [3 : i8, 5 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %118 = emitc.call_opaque "__runtime_buffer_offset"(%98) {args = [0 : index, 49152]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %119 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %119 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %120 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %117, %119) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,5) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 5), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %121 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %121 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %122 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %117, %121) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(3,5), direction=S2MM */"
     %123 = emitc.call_opaque "__Runtime_dma_createio_4"(%117, %122) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -235,12 +235,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %124 = emitc.call_opaque "XAie_TileLoc"() {args = [3 : i8, 6 : i8]} : () -> !emitc.opaque<"XAie_LocType">
     %125 = emitc.call_opaque "__runtime_buffer_offset"(%98) {args = [0 : index, 49152]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %126 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)14336">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %126 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)36864">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %127 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %124, %126) {args = [0 : index, 1 : index, 2 : index, 1 : i32, 4096 : i32, 0 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,6) lock=2 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 6), XAie_LockInit(2, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=1, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
-    %128 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)10240">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %128 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)32768">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %129 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %124, %128) {args = [0 : index, 1 : index, 2 : index, 0 : i32, 4096 : i32, 1 : i32, 0 : i32, 0 : i32, 2 : i32, -1 : i32, 3 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=0, tile=(3,6), direction=S2MM */"
     %130 = emitc.call_opaque "__Runtime_dma_createio_4"(%124, %129) {args = [0 : index, 1 : index, 1 : i32, 0 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -254,45 +254,45 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=1, tile=(0,0), direction=MM2S */"
     %135 = emitc.call_opaque "__Runtime_dma_createio_4"(%1, %134) {args = [0 : index, 1 : index, 1 : i32, 1 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %136 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %136 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %137 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %5, %136) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,3) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 3), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %138 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %138 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %139 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %5, %138) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(0,3), direction=S2MM */"
     %140 = emitc.call_opaque "__Runtime_dma_createio_4"(%5, %139) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (0,3) */"
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %141 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %141 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %142 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %35, %141) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,3) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 3), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %143 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %143 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %144 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %35, %143) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(1,3), direction=S2MM */"
     %145 = emitc.call_opaque "__Runtime_dma_createio_4"(%35, %144) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (1,3) */"
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %146 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %146 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %147 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %69, %146) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,3) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 3), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %148 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %148 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %149 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %69, %148) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(2,3), direction=S2MM */"
     %150 = emitc.call_opaque "__Runtime_dma_createio_4"(%69, %149) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (2,3) */"
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %151 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %151 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %152 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %103, %151) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,3) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 3), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %153 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %153 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %154 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %103, %153) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(3,3), direction=S2MM */"
     %155 = emitc.call_opaque "__Runtime_dma_createio_4"(%103, %154) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -321,48 +321,48 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %169 = emitc.call_opaque "__Runtime_dma_createio_4"(%99, %168) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     %170 = emitc.call_opaque "__runtime_buffer_offset"(%157) {args = [0 : index, 0]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=1, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=2 */"
-    %171 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %171 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %172 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %5, %171) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 1 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 2 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,3) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 3), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=1, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=2 */"
-    %173 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %173 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %174 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %5, %173) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 1 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 2 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(0,3), direction=MM2S */"
     %175 = emitc.call_opaque "__Runtime_dma_createio_4"(%5, %174) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (0,3) */"
     %176 = emitc.call_opaque "__runtime_buffer_offset"(%157) {args = [0 : index, 4096]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=2, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=3 */"
-    %177 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %177 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %178 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %35, %177) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 2 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 3 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,3) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 3), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=2, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=3 */"
-    %179 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %179 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %180 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %35, %179) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 2 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 3 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(1,3), direction=MM2S */"
     %181 = emitc.call_opaque "__Runtime_dma_createio_4"(%35, %180) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (1,3) */"
     %182 = emitc.call_opaque "__runtime_buffer_offset"(%157) {args = [0 : index, 8192]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=3, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=4 */"
-    %183 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %183 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %184 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %69, %183) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 3 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 4 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,3) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 3), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=3, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=4 */"
-    %185 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %185 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %186 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %69, %185) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 3 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 4 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(2,3), direction=MM2S */"
     %187 = emitc.call_opaque "__Runtime_dma_createio_4"(%69, %186) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (2,3) */"
     %188 = emitc.call_opaque "__runtime_buffer_offset"(%157) {args = [0 : index, 12288]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=4, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=5 */"
-    %189 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %189 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %190 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %103, %189) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 4 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 5 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,3) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 3), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=4, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=5 */"
-    %191 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %191 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %192 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %103, %191) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 4 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 5 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(3,3), direction=MM2S */"
     %193 = emitc.call_opaque "__Runtime_dma_createio_4"(%103, %192) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -377,48 +377,48 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %198 = emitc.call_opaque "__Runtime_dma_createio_4"(%31, %197) {args = [0 : index, 1 : index, 1 : i32, 1 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     %199 = emitc.call_opaque "__runtime_buffer_offset"(%195) {args = [0 : index, 16384]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %200 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %200 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %201 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %11, %200) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,4) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 4), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %202 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %202 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %203 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %11, %202) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(0,4), direction=S2MM */"
     %204 = emitc.call_opaque "__Runtime_dma_createio_4"(%11, %203) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (0,4) */"
     %205 = emitc.call_opaque "__runtime_buffer_offset"(%195) {args = [0 : index, 16384]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %206 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %206 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %207 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %42, %206) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,4) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 4), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %208 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %208 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %209 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %42, %208) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(1,4), direction=S2MM */"
     %210 = emitc.call_opaque "__Runtime_dma_createio_4"(%42, %209) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (1,4) */"
     %211 = emitc.call_opaque "__runtime_buffer_offset"(%195) {args = [0 : index, 16384]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %212 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %212 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %213 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %76, %212) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,4) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 4), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %214 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %214 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %215 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %76, %214) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(2,4), direction=S2MM */"
     %216 = emitc.call_opaque "__Runtime_dma_createio_4"(%76, %215) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (2,4) */"
     %217 = emitc.call_opaque "__runtime_buffer_offset"(%195) {args = [0 : index, 16384]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %218 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %218 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %219 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %110, %218) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,4) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 4), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %220 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %220 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %221 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %110, %220) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(3,4), direction=S2MM */"
     %222 = emitc.call_opaque "__Runtime_dma_createio_4"(%110, %221) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -447,48 +447,48 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %236 = emitc.call_opaque "__Runtime_dma_createio_4"(%99, %235) {args = [0 : index, 1 : index, 1 : i32, 7 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     %237 = emitc.call_opaque "__runtime_buffer_offset"(%224) {args = [0 : index, 0]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=5, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=7 */"
-    %238 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %238 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %239 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %11, %238) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 5 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 7 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,4) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 4), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=5, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=7 */"
-    %240 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %240 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %241 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %11, %240) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 5 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 7 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(0,4), direction=MM2S */"
     %242 = emitc.call_opaque "__Runtime_dma_createio_4"(%11, %241) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (0,4) */"
     %243 = emitc.call_opaque "__runtime_buffer_offset"(%224) {args = [0 : index, 4096]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=6, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=8 */"
-    %244 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %244 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %245 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %42, %244) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 6 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 8 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,4) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 4), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=6, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=8 */"
-    %246 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %246 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %247 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %42, %246) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 6 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 8 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(1,4), direction=MM2S */"
     %248 = emitc.call_opaque "__Runtime_dma_createio_4"(%42, %247) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (1,4) */"
     %249 = emitc.call_opaque "__runtime_buffer_offset"(%224) {args = [0 : index, 8192]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=7, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=9 */"
-    %250 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %250 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %251 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %76, %250) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 7 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 9 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,4) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 4), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=7, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=9 */"
-    %252 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %252 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %253 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %76, %252) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 7 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 9 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(2,4), direction=MM2S */"
     %254 = emitc.call_opaque "__Runtime_dma_createio_4"(%76, %253) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (2,4) */"
     %255 = emitc.call_opaque "__runtime_buffer_offset"(%224) {args = [0 : index, 12288]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=8, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=10 */"
-    %256 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %256 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %257 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %110, %256) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 8 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 10 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,4) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 4), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=8, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=10 */"
-    %258 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %258 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %259 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %110, %258) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 8 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 10 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(3,4), direction=MM2S */"
     %260 = emitc.call_opaque "__Runtime_dma_createio_4"(%110, %259) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -503,48 +503,48 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %265 = emitc.call_opaque "__Runtime_dma_createio_4"(%65, %264) {args = [0 : index, 1 : index, 1 : i32, 1 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     %266 = emitc.call_opaque "__runtime_buffer_offset"(%262) {args = [0 : index, 32768]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %267 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %267 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %268 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %17, %267) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,5) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 5), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %269 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %269 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %270 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %17, %269) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(0,5), direction=S2MM */"
     %271 = emitc.call_opaque "__Runtime_dma_createio_4"(%17, %270) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (0,5) */"
     %272 = emitc.call_opaque "__runtime_buffer_offset"(%262) {args = [0 : index, 32768]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %273 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %273 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %274 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %49, %273) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,5) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 5), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %275 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %275 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %276 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %49, %275) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(1,5), direction=S2MM */"
     %277 = emitc.call_opaque "__Runtime_dma_createio_4"(%49, %276) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (1,5) */"
     %278 = emitc.call_opaque "__runtime_buffer_offset"(%262) {args = [0 : index, 32768]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %279 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %279 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %280 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %83, %279) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,5) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 5), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %281 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %281 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %282 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %83, %281) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(2,5), direction=S2MM */"
     %283 = emitc.call_opaque "__Runtime_dma_createio_4"(%83, %282) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (2,5) */"
     %284 = emitc.call_opaque "__runtime_buffer_offset"(%262) {args = [0 : index, 32768]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %285 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %285 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %286 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %117, %285) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,5) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 5), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %287 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %287 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %288 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %117, %287) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(3,5), direction=S2MM */"
     %289 = emitc.call_opaque "__Runtime_dma_createio_4"(%117, %288) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -573,48 +573,48 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %303 = emitc.call_opaque "__Runtime_dma_createio_4"(%65, %302) {args = [0 : index, 1 : index, 0 : i32, 3 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     %304 = emitc.call_opaque "__runtime_buffer_offset"(%291) {args = [0 : index, 0]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=9, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=3 */"
-    %305 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %305 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %306 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %17, %305) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 9 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 3 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,5) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 5), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=9, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=3 */"
-    %307 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %307 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %308 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %17, %307) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 9 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 3 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(0,5), direction=MM2S */"
     %309 = emitc.call_opaque "__Runtime_dma_createio_4"(%17, %308) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (0,5) */"
     %310 = emitc.call_opaque "__runtime_buffer_offset"(%291) {args = [0 : index, 4096]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=10, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=4 */"
-    %311 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %311 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %312 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %49, %311) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 10 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 4 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,5) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 5), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=10, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=4 */"
-    %313 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %313 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %314 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %49, %313) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 10 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 4 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(1,5), direction=MM2S */"
     %315 = emitc.call_opaque "__Runtime_dma_createio_4"(%49, %314) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (1,5) */"
     %316 = emitc.call_opaque "__runtime_buffer_offset"(%291) {args = [0 : index, 8192]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=11, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=5 */"
-    %317 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %317 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %318 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %83, %317) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 11 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 5 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,5) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 5), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=11, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=5 */"
-    %319 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %319 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %320 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %83, %319) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 11 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 5 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(2,5), direction=MM2S */"
     %321 = emitc.call_opaque "__Runtime_dma_createio_4"(%83, %320) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (2,5) */"
     %322 = emitc.call_opaque "__runtime_buffer_offset"(%291) {args = [0 : index, 12288]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=12, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=6 */"
-    %323 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %323 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %324 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %117, %323) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 12 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 6 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,5) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 5), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=12, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=6 */"
-    %325 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %325 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %326 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %117, %325) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 12 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 6 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(3,5), direction=MM2S */"
     %327 = emitc.call_opaque "__Runtime_dma_createio_4"(%117, %326) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -629,48 +629,48 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %332 = emitc.call_opaque "__Runtime_dma_createio_4"(%99, %331) {args = [0 : index, 1 : index, 1 : i32, 11 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     %333 = emitc.call_opaque "__runtime_buffer_offset"(%329) {args = [0 : index, 49152]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %334 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %334 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %335 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %23, %334) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,6) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 6), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %336 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %336 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %337 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %23, %336) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(0,6), direction=S2MM */"
     %338 = emitc.call_opaque "__Runtime_dma_createio_4"(%23, %337) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (0,6) */"
     %339 = emitc.call_opaque "__runtime_buffer_offset"(%329) {args = [0 : index, 49152]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %340 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %340 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %341 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %56, %340) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,6) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 6), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %342 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %342 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %343 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %56, %342) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(1,6), direction=S2MM */"
     %344 = emitc.call_opaque "__Runtime_dma_createio_4"(%56, %343) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (1,6) */"
     %345 = emitc.call_opaque "__runtime_buffer_offset"(%329) {args = [0 : index, 49152]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %346 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %346 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %347 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %90, %346) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,6) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 6), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %348 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %348 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %349 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %90, %348) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(2,6), direction=S2MM */"
     %350 = emitc.call_opaque "__Runtime_dma_createio_4"(%90, %349) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (2,6) */"
     %351 = emitc.call_opaque "__runtime_buffer_offset"(%329) {args = [0 : index, 49152]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %352 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)22528">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %352 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)45056">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %353 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %124, %352) {args = [0 : index, 1 : index, 2 : index, 3 : i32, 4096 : i32, 2 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,6) lock=0 init_value=2 */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 6), XAie_LockInit(0, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=2, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=3, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
-    %354 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)18432">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %354 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)40960">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %355 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %124, %354) {args = [0 : index, 1 : index, 2 : index, 2 : i32, 4096 : i32, 3 : i32, 0 : i32, 0 : i32, 0 : i32, -1 : i32, 1 : i32, 1 : i32, -1 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=2, tile=(3,6), direction=S2MM */"
     %356 = emitc.call_opaque "__Runtime_dma_createio_4"(%124, %355) {args = [0 : index, 1 : index, 0 : i32, 2 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
@@ -699,48 +699,48 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %370 = emitc.call_opaque "__Runtime_dma_createio_4"(%65, %369) {args = [0 : index, 1 : index, 1 : i32, 8 : i32, #emitc.opaque<"DMA_S2MM">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     %371 = emitc.call_opaque "__runtime_buffer_offset"(%358) {args = [0 : index, 0]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=13, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=8 */"
-    %372 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %372 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %373 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %23, %372) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 13 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 8 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(0,6) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(0, 6), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=13, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=8 */"
-    %374 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %374 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %375 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %23, %374) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 13 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 8 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(0,6), direction=MM2S */"
     %376 = emitc.call_opaque "__Runtime_dma_createio_4"(%23, %375) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (0,6) */"
     %377 = emitc.call_opaque "__runtime_buffer_offset"(%358) {args = [0 : index, 4096]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=14, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=9 */"
-    %378 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %378 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %379 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %56, %378) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 14 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 9 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(1,6) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(1, 6), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=14, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=9 */"
-    %380 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %380 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %381 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %56, %380) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 14 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 9 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(1,6), direction=MM2S */"
     %382 = emitc.call_opaque "__Runtime_dma_createio_4"(%56, %381) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (1,6) */"
     %383 = emitc.call_opaque "__runtime_buffer_offset"(%358) {args = [0 : index, 8192]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=15, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=10 */"
-    %384 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %384 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %385 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %90, %384) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 15 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 10 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(2,6) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(2, 6), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=15, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=10 */"
-    %386 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %386 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %387 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %90, %386) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 15 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 10 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(2,6), direction=MM2S */"
     %388 = emitc.call_opaque "__Runtime_dma_createio_4"(%90, %387) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 2 for tile (2,6) */"
     %389 = emitc.call_opaque "__runtime_buffer_offset"(%358) {args = [0 : index, 12288]} : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=16, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=11 */"
-    %390 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)30720">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %390 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)53248">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %391 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %124, %390) {args = [0 : index, 1 : index, 2 : index, 5 : i32, 2048 : i32, 4 : i32, 1 : i32, 16 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 11 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Lock init: tile(3,6) lock=4 init_value=2 (kernel output acquire) */"
     emitc.verbatim "XAie_LockSetValue(dev, XAie_TileLoc(3, 6), XAie_LockInit(4, 2));"
     emitc.verbatim "/* DMA BD Config: bd_id=4, offset=0, len=2048, enable_packet=true, packet_id=16, next_bd=5, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=11 */"
-    %392 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)26624">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %392 = emitc.call_opaque "__runtime_buffer_arg"() {args = [#emitc.opaque<"(void*)49152">]} : () -> !emitc.ptr<!emitc.opaque<"void">>
     %393 = emitc.call_opaque "__Runtime_dma_bd_config"(%arg0, %124, %392) {args = [0 : index, 1 : index, 2 : index, 4 : i32, 2048 : i32, 5 : i32, 1 : i32, 16 : i32, 5 : i32, -1 : i32, 4 : i32, 1 : i32, 11 : i32]} : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"XAie_LocType">, !emitc.ptr<!emitc.opaque<"void">>) -> !emitc.opaque<"XAie_DmaDesc">
     emitc.verbatim "/* Create IO: channel_id=0, bd_id=4, tile=(3,6), direction=MM2S */"
     %394 = emitc.call_opaque "__Runtime_dma_createio_4"(%124, %393) {args = [0 : index, 1 : index, 0 : i32, 4 : i32, #emitc.opaque<"DMA_MM2S">]} : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">) -> !emitc.opaque<"io">

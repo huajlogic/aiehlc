@@ -46,8 +46,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %34 = "emitc.constant"() <{value = 0 : i8}> : () -> i8
     %35 = "emitc.constant"() <{value = 3 : i8}> : () -> i8
     %36 = emitc.call_opaque "XAie_TileLoc"(%34, %35) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
-    %37 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %38 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %37 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %38 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %39 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %40 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -86,8 +86,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %68 = "emitc.constant"() <{value = 0 : i8}> : () -> i8
     %69 = "emitc.constant"() <{value = 4 : i8}> : () -> i8
     %70 = emitc.call_opaque "XAie_TileLoc"(%68, %69) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
-    %71 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %72 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %71 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %72 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %73 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %74 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -126,8 +126,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %102 = "emitc.constant"() <{value = 0 : i8}> : () -> i8
     %103 = "emitc.constant"() <{value = 5 : i8}> : () -> i8
     %104 = emitc.call_opaque "XAie_TileLoc"(%102, %103) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
-    %105 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %106 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %105 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %106 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %107 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %108 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -166,8 +166,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %136 = "emitc.constant"() <{value = 0 : i8}> : () -> i8
     %137 = "emitc.constant"() <{value = 6 : i8}> : () -> i8
     %138 = emitc.call_opaque "XAie_TileLoc"(%136, %137) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
-    %139 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %140 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %139 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %140 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %141 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %142 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -235,8 +235,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %196 = emitc.call_opaque "XAie_TileLoc"(%194, %195) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %197 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %198 = emitc.call_opaque "__runtime_buffer_offset"(%174, %197) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %199 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %200 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %199 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %200 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %201 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %202 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -277,8 +277,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %232 = emitc.call_opaque "XAie_TileLoc"(%230, %231) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %233 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %234 = emitc.call_opaque "__runtime_buffer_offset"(%174, %233) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %235 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %236 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %235 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %236 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %237 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %238 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -319,8 +319,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %268 = emitc.call_opaque "XAie_TileLoc"(%266, %267) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %269 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %270 = emitc.call_opaque "__runtime_buffer_offset"(%174, %269) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %271 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %272 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %271 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %272 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %273 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %274 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -361,8 +361,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %304 = emitc.call_opaque "XAie_TileLoc"(%302, %303) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %305 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %306 = emitc.call_opaque "__runtime_buffer_offset"(%174, %305) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %307 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %308 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %307 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %308 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %309 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %310 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -430,8 +430,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %364 = emitc.call_opaque "XAie_TileLoc"(%362, %363) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %365 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %366 = emitc.call_opaque "__runtime_buffer_offset"(%342, %365) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %367 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %368 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %367 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %368 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %369 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %370 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -472,8 +472,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %400 = emitc.call_opaque "XAie_TileLoc"(%398, %399) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %401 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %402 = emitc.call_opaque "__runtime_buffer_offset"(%342, %401) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %403 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %404 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %403 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %404 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %405 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %406 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -514,8 +514,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %436 = emitc.call_opaque "XAie_TileLoc"(%434, %435) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %437 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %438 = emitc.call_opaque "__runtime_buffer_offset"(%342, %437) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %439 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %440 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %439 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %440 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %441 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %442 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -556,8 +556,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %472 = emitc.call_opaque "XAie_TileLoc"(%470, %471) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %473 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %474 = emitc.call_opaque "__runtime_buffer_offset"(%342, %473) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %475 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %476 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %475 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %476 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %477 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %478 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -625,8 +625,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %532 = emitc.call_opaque "XAie_TileLoc"(%530, %531) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %533 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %534 = emitc.call_opaque "__runtime_buffer_offset"(%510, %533) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %535 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %536 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %535 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %536 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %537 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %538 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -667,8 +667,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %568 = emitc.call_opaque "XAie_TileLoc"(%566, %567) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %569 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %570 = emitc.call_opaque "__runtime_buffer_offset"(%510, %569) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %571 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %572 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %571 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %572 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %573 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %574 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -709,8 +709,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %604 = emitc.call_opaque "XAie_TileLoc"(%602, %603) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %605 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %606 = emitc.call_opaque "__runtime_buffer_offset"(%510, %605) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %607 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %608 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %607 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %608 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %609 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %610 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -751,8 +751,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %640 = emitc.call_opaque "XAie_TileLoc"(%638, %639) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
     %641 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %642 = emitc.call_opaque "__runtime_buffer_offset"(%510, %641) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %643 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %644 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %643 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %644 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=0, acquire_lock_id=2, acquire_lock_val=-1, release_lock_id=3, release_lock_val=1, ooo_bd_id=-1 */"
     %645 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %646 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -812,8 +812,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %693 = "emitc.constant"() <{value = #emitc.opaque<"DMA_MM2S">}> : () -> !emitc.opaque<"XAie_DmaDirection">
     emitc.verbatim "/* Create IO: channel_id=1, bd_id=1, tile=(0,0), direction=MM2S */"
     %694 = emitc.call_opaque "__Runtime_dma_createio_4"(%17, %690, %691, %692, %693) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
-    %695 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %696 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %695 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %696 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %697 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %698 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -849,8 +849,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %724 = emitc.call_opaque "__Runtime_dma_createio_4"(%36, %720, %721, %722, %723) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (0,3) */"
     %725 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
-    %726 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %727 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %726 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %727 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %728 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %729 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -886,8 +886,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %755 = emitc.call_opaque "__Runtime_dma_createio_4"(%196, %751, %752, %753, %754) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (1,3) */"
     %756 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
-    %757 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %758 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %757 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %758 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %759 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %760 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -923,8 +923,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %786 = emitc.call_opaque "__Runtime_dma_createio_4"(%364, %782, %783, %784, %785) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     emitc.verbatim "/* Allocated BD ID 1 for tile (2,3) */"
     %787 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
-    %788 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %789 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %788 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %789 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %790 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %791 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -1069,8 +1069,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %917 = emitc.call_opaque "__Runtime_dma_createio_4"(%513, %913, %914, %915, %916) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     %918 = "emitc.constant"() <{value = 0 : i64}> : () -> i64
     %919 = emitc.call_opaque "__runtime_buffer_offset"(%823, %918) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %920 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %921 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %920 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %921 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=1, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=2 */"
     %922 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %923 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -1108,8 +1108,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %950 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %951 = "emitc.constant"() <{value = 4096 : i64}> : () -> i64
     %952 = emitc.call_opaque "__runtime_buffer_offset"(%823, %951) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %953 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %954 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %953 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %954 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=2, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=3 */"
     %955 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %956 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -1147,8 +1147,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %983 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %984 = "emitc.constant"() <{value = 8192 : i64}> : () -> i64
     %985 = emitc.call_opaque "__runtime_buffer_offset"(%823, %984) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %986 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %987 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %986 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %987 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=3, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=4 */"
     %988 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %989 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -1186,8 +1186,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1016 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %1017 = "emitc.constant"() <{value = 12288 : i64}> : () -> i64
     %1018 = emitc.call_opaque "__runtime_buffer_offset"(%823, %1017) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1019 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1020 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1019 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1020 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=4, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=5 */"
     %1021 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1022 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -1249,8 +1249,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1070 = emitc.call_opaque "__Runtime_dma_createio_4"(%177, %1066, %1067, %1068, %1069) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     %1071 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %1072 = emitc.call_opaque "__runtime_buffer_offset"(%1054, %1071) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1073 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1074 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1073 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1074 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1075 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1076 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -1288,8 +1288,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1103 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     %1104 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %1105 = emitc.call_opaque "__runtime_buffer_offset"(%1054, %1104) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1106 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1107 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1106 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1107 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1108 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1109 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -1327,8 +1327,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1136 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     %1137 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %1138 = emitc.call_opaque "__runtime_buffer_offset"(%1054, %1137) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1139 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1140 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1139 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1140 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1141 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1142 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -1366,8 +1366,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1169 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     %1170 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %1171 = emitc.call_opaque "__runtime_buffer_offset"(%1054, %1170) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1172 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1173 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1172 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1173 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1174 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1175 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -1512,8 +1512,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1301 = emitc.call_opaque "__Runtime_dma_createio_4"(%513, %1297, %1298, %1299, %1300) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     %1302 = "emitc.constant"() <{value = 0 : i64}> : () -> i64
     %1303 = emitc.call_opaque "__runtime_buffer_offset"(%1207, %1302) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1304 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1305 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1304 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1305 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=5, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=7 */"
     %1306 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1307 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -1551,8 +1551,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1334 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %1335 = "emitc.constant"() <{value = 4096 : i64}> : () -> i64
     %1336 = emitc.call_opaque "__runtime_buffer_offset"(%1207, %1335) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1337 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1338 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1337 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1338 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=6, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=8 */"
     %1339 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1340 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -1590,8 +1590,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1367 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %1368 = "emitc.constant"() <{value = 8192 : i64}> : () -> i64
     %1369 = emitc.call_opaque "__runtime_buffer_offset"(%1207, %1368) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1370 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1371 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1370 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1371 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=7, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=9 */"
     %1372 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1373 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -1629,8 +1629,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1400 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %1401 = "emitc.constant"() <{value = 12288 : i64}> : () -> i64
     %1402 = emitc.call_opaque "__runtime_buffer_offset"(%1207, %1401) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1403 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1404 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1403 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1404 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=8, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=10 */"
     %1405 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1406 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -1692,8 +1692,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1454 = emitc.call_opaque "__Runtime_dma_createio_4"(%345, %1450, %1451, %1452, %1453) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     %1455 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %1456 = emitc.call_opaque "__runtime_buffer_offset"(%1438, %1455) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1457 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1458 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1457 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1458 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1459 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1460 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -1731,8 +1731,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1487 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     %1488 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %1489 = emitc.call_opaque "__runtime_buffer_offset"(%1438, %1488) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1490 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1491 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1490 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1491 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1492 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1493 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -1770,8 +1770,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1520 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     %1521 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %1522 = emitc.call_opaque "__runtime_buffer_offset"(%1438, %1521) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1523 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1524 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1523 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1524 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1525 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1526 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -1809,8 +1809,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1553 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     %1554 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %1555 = emitc.call_opaque "__runtime_buffer_offset"(%1438, %1554) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1556 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1557 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1556 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1557 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1558 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1559 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -1955,8 +1955,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1685 = emitc.call_opaque "__Runtime_dma_createio_4"(%345, %1681, %1682, %1683, %1684) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     %1686 = "emitc.constant"() <{value = 0 : i64}> : () -> i64
     %1687 = emitc.call_opaque "__runtime_buffer_offset"(%1591, %1686) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1688 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1689 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1688 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1689 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=9, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=3 */"
     %1690 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1691 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -1994,8 +1994,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1718 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %1719 = "emitc.constant"() <{value = 4096 : i64}> : () -> i64
     %1720 = emitc.call_opaque "__runtime_buffer_offset"(%1591, %1719) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1721 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1722 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1721 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1722 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=10, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=4 */"
     %1723 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1724 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -2033,8 +2033,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1751 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %1752 = "emitc.constant"() <{value = 8192 : i64}> : () -> i64
     %1753 = emitc.call_opaque "__runtime_buffer_offset"(%1591, %1752) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1754 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1755 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1754 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1755 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=11, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=5 */"
     %1756 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1757 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -2072,8 +2072,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1784 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %1785 = "emitc.constant"() <{value = 12288 : i64}> : () -> i64
     %1786 = emitc.call_opaque "__runtime_buffer_offset"(%1591, %1785) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1787 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1788 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1787 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1788 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=12, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=6 */"
     %1789 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1790 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -2135,8 +2135,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1838 = emitc.call_opaque "__Runtime_dma_createio_4"(%513, %1834, %1835, %1836, %1837) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     %1839 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %1840 = emitc.call_opaque "__runtime_buffer_offset"(%1822, %1839) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1841 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1842 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1841 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1842 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1843 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1844 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -2174,8 +2174,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1871 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     %1872 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %1873 = emitc.call_opaque "__runtime_buffer_offset"(%1822, %1872) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1874 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1875 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1874 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1875 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1876 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1877 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -2213,8 +2213,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1904 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     %1905 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %1906 = emitc.call_opaque "__runtime_buffer_offset"(%1822, %1905) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1907 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1908 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1907 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1908 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1909 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1910 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -2252,8 +2252,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1937 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     %1938 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %1939 = emitc.call_opaque "__runtime_buffer_offset"(%1822, %1938) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %1940 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %1941 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1940 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %1941 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=3, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=2, acquire_lock_id=0, acquire_lock_val=-1, release_lock_id=1, release_lock_val=1, ooo_bd_id=-1 */"
     %1942 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1943 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
@@ -2398,8 +2398,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %2069 = emitc.call_opaque "__Runtime_dma_createio_4"(%345, %2065, %2066, %2067, %2068) : (!emitc.opaque<"XAie_LocType">, !emitc.opaque<"XAie_DmaDesc">, i32, i32, !emitc.opaque<"XAie_DmaDirection">) -> !emitc.opaque<"io">
     %2070 = "emitc.constant"() <{value = 0 : i64}> : () -> i64
     %2071 = emitc.call_opaque "__runtime_buffer_offset"(%1975, %2070) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %2072 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %2073 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %2072 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %2073 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=13, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=8 */"
     %2074 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %2075 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -2437,8 +2437,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %2102 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %2103 = "emitc.constant"() <{value = 4096 : i64}> : () -> i64
     %2104 = emitc.call_opaque "__runtime_buffer_offset"(%1975, %2103) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %2105 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %2106 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %2105 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %2106 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=14, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=9 */"
     %2107 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %2108 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -2476,8 +2476,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %2135 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %2136 = "emitc.constant"() <{value = 8192 : i64}> : () -> i64
     %2137 = emitc.call_opaque "__runtime_buffer_offset"(%1975, %2136) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %2138 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %2139 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %2138 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %2139 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=15, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=10 */"
     %2140 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %2141 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
@@ -2515,8 +2515,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %2168 = "emitc.constant"() <{value = 2 : i32}> : () -> i32
     %2169 = "emitc.constant"() <{value = 12288 : i64}> : () -> i64
     %2170 = emitc.call_opaque "__runtime_buffer_offset"(%1975, %2169) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    %2171 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %2172 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %2171 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %2172 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     emitc.verbatim "/* DMA BD Config: bd_id=5, offset=0, len=2048, enable_packet=true, packet_id=16, next_bd=4, acquire_lock_id=5, acquire_lock_val=-1, release_lock_id=4, release_lock_val=1, ooo_bd_id=11 */"
     %2173 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %2174 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32

@@ -1254,7 +1254,7 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
 
             if (!allocations.empty()) {
                 TilingBcf bcf;
-                bcf.setStack(0x70000, 0x1024);
+                bcf.setStack(0x70000, 0x2800);
                 bcf.addReservedDMB(0x40000, 0x10000);
                 // Reserve the last 2KB of DM for kernel_log.h klog() region
                 // (DM absolute 0x7F800-0x7FFFF = DM offset 0xF800, 0x800 bytes)

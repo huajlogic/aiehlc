@@ -933,7 +933,7 @@ after_host_emit:
 
         if (!allocations.empty()) {
             TilingBcf bcf;
-            bcf.setStack(0x70000, 0x1024);
+            bcf.setStack(0x70000, 0x2800);
             bcf.addReservedDMB(0x40000, 0x10000);
             bcf.addReservedDMB(0x7F800, 0x800);
             for (const auto &slot : allocations) {

@@ -28,12 +28,12 @@
 //   _symbol _main_init 0
 //   _symbol buf_out_ping_0 0x78000
 //   _symbol buf_out_pong_0 0x78020
-//   _stack DM_stack 0x70000 0x1024
+//   _stack DM_stack 0x70000 0x2800
 //   _reserved DMb 0x40000 0x10000
 
 class TilingBcf {
   public:
-    TilingBcf() : stackAddr_(0x70000), stackSize_(0x1024) {}
+    TilingBcf() : stackAddr_(0x70000), stackSize_(0x2800) {}
 
     void addSymbol(const std::string &name, uint32_t addr) { symbols_.push_back({name, addr}); }
 

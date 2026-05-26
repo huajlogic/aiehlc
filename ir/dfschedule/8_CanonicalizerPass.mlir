@@ -13,8 +13,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %4 = "emitc.constant"() <{value = 12288 : i64}> : () -> i64
     %5 = "emitc.constant"() <{value = 8192 : i64}> : () -> i64
     %6 = "emitc.constant"() <{value = 4096 : i64}> : () -> i64
-    %7 = "emitc.constant"() <{value = #emitc.opaque<"(void*)30720">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %8 = "emitc.constant"() <{value = #emitc.opaque<"(void*)26624">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %7 = "emitc.constant"() <{value = #emitc.opaque<"(void*)53248">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %8 = "emitc.constant"() <{value = #emitc.opaque<"(void*)49152">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     %9 = "emitc.constant"() <{value = 64 : i64}> : () -> i64
     %10 = "emitc.constant"() <{value = 64 : i32}> : () -> i32
     %11 = "emitc.constant"() <{value = 128 : i64}> : () -> i64
@@ -26,8 +26,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %17 = "emitc.constant"() <{value = 192 : i64}> : () -> i64
     %18 = "emitc.constant"() <{value = 2048 : i32}> : () -> i32
     %19 = "emitc.constant"() <{value = 192 : i32}> : () -> i32
-    %20 = "emitc.constant"() <{value = #emitc.opaque<"(void*)22528">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %21 = "emitc.constant"() <{value = #emitc.opaque<"(void*)18432">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %20 = "emitc.constant"() <{value = #emitc.opaque<"(void*)45056">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %21 = "emitc.constant"() <{value = #emitc.opaque<"(void*)40960">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     %22 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %23 = "emitc.constant"() <{value = 2 : i8}> : () -> i8
     %24 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
@@ -38,8 +38,8 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %29 = "emitc.constant"() <{value = 4 : i8}> : () -> i8
     %30 = "emitc.constant"() <{value = #emitc.opaque<"DMA_S2MM">}> : () -> !emitc.opaque<"XAie_DmaDirection">
     %31 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
-    %32 = "emitc.constant"() <{value = #emitc.opaque<"(void*)14336">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
-    %33 = "emitc.constant"() <{value = #emitc.opaque<"(void*)10240">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %32 = "emitc.constant"() <{value = #emitc.opaque<"(void*)36864">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
+    %33 = "emitc.constant"() <{value = #emitc.opaque<"(void*)32768">}> : () -> !emitc.ptr<!emitc.opaque<"void">>
     %34 = "emitc.constant"() <{value = 3 : i8}> : () -> i8
     %35 = "emitc.constant"() <{value = #emitc.opaque<"DMA_MM2S">}> : () -> !emitc.opaque<"XAie_DmaDirection">
     %36 = "emitc.constant"() <{value = -1 : i32}> : () -> i32
