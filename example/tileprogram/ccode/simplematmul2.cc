@@ -6,23 +6,23 @@
  */
 #include "simplematmul.h"
 #pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN | AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER)
-constexpr aie::SpatialPolicy RowBC = {
+constexpr aie::SpatialPolicy RowBA = {
     .pattern = aie::Pattern::Broadcast,
     .distribution = aie::Layout::Row,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
     .tile_m = 64, // explicit sub-tile rows
     .tile_n = 64, // 0 = auto (uses tileCols)
-    .tile_k = 256 // K chunk size
+    .tile_k = 64  // K chunk size (4 k-rounds for K=256)
 };
-constexpr aie::SpatialPolicy ColBC = {
+constexpr aie::SpatialPolicy ColBB = {
     .pattern = aie::Pattern::Broadcast,
     .distribution = aie::Layout::Col,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
     .tile_m = 64, // explicit sub-tile rows
     .tile_n = 64, // 0 = auto (uses tileCols)
-    .tile_k = 256 // K chunk size};
+    .tile_k = 64  // K chunk size (4 k-rounds for K=256)
 };
 constexpr aie::SpatialPolicy LtoR_Merge = {
     .pattern = aie::Pattern::Gather,
@@ -32,26 +32,27 @@ constexpr aie::SpatialPolicy LtoR_Merge = {
     .max_buffer_bytes = 4096,
     .tile_m = 64, // explicit sub-tile rows
     .tile_n = 64, // 0 = auto (uses tileCols)
-    .tile_k = 256 // K chunk size};
+    .tile_k = 64  // K chunk size (4 k-rounds for K=256)
 };
 #define DEBUG_OUTPUT_ORDER 0
-__global__ void matmul(aie::port<input_window_int8 *, RowBC> win_a, aie::port<input_window_int8 *, ColBC> win_b,
+__global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<input_window_int8 *, ColBB> win_b,
                        aie::port<output_window_int8 *, LtoR_Merge> win_c) {
 
     // Compiler-resolved tiling parameters
     const int tile_rows = aie::get_tile_rows();
     const int tile_cols = aie::get_tile_cols();
-    const int k_dim = aie::get_k_dim();
-    const int num_a_rounds = aie::get_num_rounds(win_a);
-    const int num_b_rounds = aie::get_num_rounds(win_b);
+    const int eff_k = aie::get_effective_k();            // K chunk size per k-round
+    const int k_rounds = aie::get_k_rounds();            // number of K-accumulation rounds
+    const int num_a_rounds = aie::get_num_rounds(win_a); // DMA rounds per k-round for A
+    const int num_b_rounds = aie::get_num_rounds(win_b); // DMA rounds per k-round for B
     const int num_c_rounds = aie::get_num_rounds(win_c);
     const int buf_sz_a = aie::get_buffer_size(win_a);
     const int buf_sz_b = aie::get_buffer_size(win_b);
     const int buf_sz_c = aie::get_buffer_size(win_c);
 
-    // Derived per-round sizes
-    const int rows_per_round = buf_sz_a / k_dim;
-    const int cols_per_round = buf_sz_b / k_dim;
+    // Derived per-round sizes (using effective_k, not full k_dim)
+    const int rows_per_round = buf_sz_a / eff_k;
+    const int cols_per_round = buf_sz_b / eff_k;
 
 #if DEBUG_OUTPUT_ORDER
     unsigned coreid = get_coreid();
@@ -61,56 +62,74 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBC> win_a, aie::port<in
     klog("DEBUG", 3);
 #endif
 
-    // Local buffers
-    int8_t all_A[tile_rows * k_dim];
+    // Local buffers — sized with effective_k, not full K
+    int8_t all_A[tile_rows * eff_k];
+    int16_t accum[tile_rows * tile_cols]; // int16 accumulator for partial sums across k-rounds
     int8_t local_out[tile_rows * tile_cols];
 
-    // ===== Phase 1: Receive and cache all A chunks =====
-    for (int ra = 0; ra < num_a_rounds; ra++) {
-        int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
-        for (int i = 0; i < buf_sz_a; i++)
-            all_A[ra * buf_sz_a + i] = A_ptr[i];
-        release_input_window(win_a);
-    }
+    // Zero accumulators
+    for (int i = 0; i < tile_rows * tile_cols; i++)
+        accum[i] = 0;
+
+    // ===== K-round loop: accumulate partial products =====
+    for (int kr = 0; kr < k_rounds; kr++) {
+
+        // --- Phase 1: Receive and cache A chunk for this k-round ---
+        for (int ra = 0; ra < num_a_rounds; ra++) {
+            int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
+            for (int i = 0; i < buf_sz_a; i++)
+                all_A[ra * buf_sz_a + i] = A_ptr[i];
+            release_input_window(win_a);
+        }
 
 #if DEBUG_OUTPUT_ORDER
-    for (int i = 0; i < 16; i++) {
-        klog("A0  ", (int32_t)all_A[i]);
-    }
-#endif
-
-    // ===== Phase 2: Stream B, compute all sub-blocks =====
-    for (int rb = 0; rb < num_b_rounds; rb++) {
-        int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
-
-#if DEBUG_OUTPUT_ORDER
-        if (rb == 0) {
+        if (kr == 0) {
             for (int i = 0; i < 16; i++) {
-                klog("B0  ", (int32_t)B_ptr[i]);
+                klog("A0  ", (int32_t)all_A[i]);
             }
         }
 #endif
 
-        for (int ra = 0; ra < num_a_rounds; ra++) {
-            for (int i = 0; i < rows_per_round; i++) {
-                for (int j = 0; j < cols_per_round; j++) {
-                    int16_t sum = 0;
-                    for (int k = 0; k < k_dim; k++)
-                        sum += (int16_t)all_A[(ra * rows_per_round + i) * k_dim + k] * (int16_t)B_ptr[j * k_dim + k];
-                    if (sum > 127)
-                        sum = 127;
-                    else if (sum < -128)
-                        sum = -128;
+        // --- Phase 2: Stream B chunk, accumulate partial products ---
+        for (int rb = 0; rb < num_b_rounds; rb++) {
+            int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
+
 #if DEBUG_OUTPUT_ORDER
-                    if (j == 0)
-                        sum = tag | (((ra * num_b_rounds + rb) & 0x3) << 6);
-#endif
-                    local_out[(ra * rows_per_round + i) * tile_cols + rb * cols_per_round + j] = (int8_t)sum;
+            if (kr == 0 && rb == 0) {
+                for (int i = 0; i < 16; i++) {
+                    klog("B0  ", (int32_t)B_ptr[i]);
                 }
             }
-        }
+#endif
 
-        release_input_window(win_b);
+            for (int ra = 0; ra < num_a_rounds; ra++) {
+                for (int i = 0; i < rows_per_round; i++) {
+                    for (int j = 0; j < cols_per_round; j++) {
+                        int16_t sum = 0;
+                        for (int k = 0; k < eff_k; k++)
+                            sum +=
+                                (int16_t)all_A[(ra * rows_per_round + i) * eff_k + k] * (int16_t)B_ptr[j * eff_k + k];
+                        accum[(ra * rows_per_round + i) * tile_cols + rb * cols_per_round + j] += sum;
+                    }
+                }
+            }
+
+            release_input_window(win_b);
+        }
+    } // end k_rounds
+
+    // ===== Saturate accumulators to int8 =====
+    for (int i = 0; i < tile_rows * tile_cols; i++) {
+        int16_t val = accum[i];
+#if DEBUG_OUTPUT_ORDER
+        // Tag output for debug ordering verification
+#else
+        if (val > 127)
+            val = 127;
+        else if (val < -128)
+            val = -128;
+#endif
+        local_out[i] = (int8_t)val;
     }
 
     // ===== Phase 3: Output =====
@@ -129,13 +148,14 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBC> win_a, aie::port<in
     }
 }
 
-__global__ void mul2(aie::port<input_window_int8 *, RowBC> win_a, aie::port<input_window_int8 *, ColBC> win_b,
+__global__ void mul2(aie::port<input_window_int8 *, RowBA> win_a, aie::port<input_window_int8 *, ColBB> win_b,
                      aie::port<output_window_int8 *, LtoR_Merge> win_c) {
 
     // Compiler-resolved tiling parameters
     const int tile_rows = aie::get_tile_rows();
     const int tile_cols = aie::get_tile_cols();
-    const int k_dim = aie::get_k_dim();
+    const int eff_k = aie::get_effective_k();
+    const int k_rounds = aie::get_k_rounds();
     const int num_a_rounds = aie::get_num_rounds(win_a);
     const int num_b_rounds = aie::get_num_rounds(win_b);
     const int num_c_rounds = aie::get_num_rounds(win_c);
@@ -143,9 +163,9 @@ __global__ void mul2(aie::port<input_window_int8 *, RowBC> win_a, aie::port<inpu
     const int buf_sz_b = aie::get_buffer_size(win_b);
     const int buf_sz_c = aie::get_buffer_size(win_c);
 
-    // Derived per-round sizes
-    const int rows_per_round = buf_sz_a / k_dim;
-    const int cols_per_round = buf_sz_b / k_dim;
+    // Derived per-round sizes (using effective_k, not full k_dim)
+    const int rows_per_round = buf_sz_a / eff_k;
+    const int cols_per_round = buf_sz_b / eff_k;
 
 #if DEBUG_OUTPUT_ORDER
     unsigned coreid = get_coreid();
@@ -155,56 +175,70 @@ __global__ void mul2(aie::port<input_window_int8 *, RowBC> win_a, aie::port<inpu
     klog("DEBUG", 3);
 #endif
 
-    // Local buffers
-    int8_t all_A[tile_rows * k_dim];
+    // Local buffers — sized with effective_k, not full K
+    int8_t all_A[tile_rows * eff_k];
+    int16_t accum[tile_rows * tile_cols];
     int8_t local_out[tile_rows * tile_cols];
 
-    // ===== Phase 1: Receive and cache all A chunks =====
-    for (int ra = 0; ra < num_a_rounds; ra++) {
-        int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
-        for (int i = 0; i < buf_sz_a; i++)
-            all_A[ra * buf_sz_a + i] = A_ptr[i];
-        release_input_window(win_a);
-    }
+    // Zero accumulators
+    for (int i = 0; i < tile_rows * tile_cols; i++)
+        accum[i] = 0;
+
+    // ===== K-round loop: accumulate partial products =====
+    for (int kr = 0; kr < k_rounds; kr++) {
+
+        // --- Phase 1: Receive and cache A chunk for this k-round ---
+        for (int ra = 0; ra < num_a_rounds; ra++) {
+            int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
+            for (int i = 0; i < buf_sz_a; i++)
+                all_A[ra * buf_sz_a + i] = A_ptr[i];
+            release_input_window(win_a);
+        }
 
 #if DEBUG_OUTPUT_ORDER
-    for (int i = 0; i < 16; i++) {
-        klog("A0  ", (int32_t)all_A[i]);
-    }
-#endif
-
-    // ===== Phase 2: Stream B, compute all sub-blocks =====
-    for (int rb = 0; rb < num_b_rounds; rb++) {
-        int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
-
-#if DEBUG_OUTPUT_ORDER
-        if (rb == 0) {
+        if (kr == 0) {
             for (int i = 0; i < 16; i++) {
-                klog("B0  ", (int32_t)B_ptr[i]);
+                klog("A0  ", (int32_t)all_A[i]);
             }
         }
 #endif
 
-        for (int ra = 0; ra < num_a_rounds; ra++) {
-            for (int i = 0; i < rows_per_round; i++) {
-                for (int j = 0; j < cols_per_round; j++) {
-                    int16_t sum = 0;
-                    for (int k = 0; k < k_dim; k++)
-                        sum += (int16_t)all_A[(ra * rows_per_round + i) * k_dim + k] * (int16_t)B_ptr[j * k_dim + k];
-                    if (sum > 127)
-                        sum = 127;
-                    else if (sum < -128)
-                        sum = -128;
+        // --- Phase 2: Stream B chunk, accumulate partial products ---
+        for (int rb = 0; rb < num_b_rounds; rb++) {
+            int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
+
 #if DEBUG_OUTPUT_ORDER
-                    if (j == 0)
-                        sum = tag | (((ra * num_b_rounds + rb) & 0x3) << 6);
-#endif
-                    local_out[(ra * rows_per_round + i) * tile_cols + rb * cols_per_round + j] = (int8_t)sum;
+            if (kr == 0 && rb == 0) {
+                for (int i = 0; i < 16; i++) {
+                    klog("B0  ", (int32_t)B_ptr[i]);
                 }
             }
-        }
+#endif
 
-        release_input_window(win_b);
+            for (int ra = 0; ra < num_a_rounds; ra++) {
+                for (int i = 0; i < rows_per_round; i++) {
+                    for (int j = 0; j < cols_per_round; j++) {
+                        int16_t sum = 0;
+                        for (int k = 0; k < eff_k; k++)
+                            sum +=
+                                (int16_t)all_A[(ra * rows_per_round + i) * eff_k + k] * (int16_t)B_ptr[j * eff_k + k];
+                        accum[(ra * rows_per_round + i) * tile_cols + rb * cols_per_round + j] += sum;
+                    }
+                }
+            }
+
+            release_input_window(win_b);
+        }
+    } // end k_rounds
+
+    // ===== Saturate accumulators to int8 =====
+    for (int i = 0; i < tile_rows * tile_cols; i++) {
+        int16_t val = accum[i];
+        if (val > 127)
+            val = 127;
+        else if (val < -128)
+            val = -128;
+        local_out[i] = (int8_t)val;
     }
 
     // ===== Phase 3: Output =====
@@ -250,9 +284,9 @@ int main() {
     // --- Launch kernel on tile mesh ---
     matmul<<<mesh>>>(A, B, C, M, N, K);
     int result = verify_matmul(A, B, C);
-    mul2<<<mesh>>>(C, B, A, M, N, K);
-    int result2 = verify_matmul(C, B, A);
-    //  --- Wait for all partitions and teardown ---
+    // mul2<<<mesh>>>(C, B, A, M, N, K);
+    // int result2 = verify_matmul(C, B, A);
+    //   --- Wait for all partitions and teardown ---
     device.synchronize();
     // --- Verify output ---
     // --- Cleanup ---

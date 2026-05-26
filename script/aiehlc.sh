@@ -315,6 +315,13 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
 
     # Copy worklocal files to the unitest worklocal dir for hostcompile.sh
     UNITEST_WORKLOCAL="${AIEHLC_DIR}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal"
+
+    # Clean stale kernel/BCF/PRX files that may conflict with current pipeline output
+    rm -f "${UNITEST_WORKLOCAL}"/kernel_*.cc
+    rm -f "${UNITEST_WORKLOCAL}"/kernel.cc
+    rm -f "${UNITEST_WORKLOCAL}"/aieml*.bcf
+    rm -f "${UNITEST_WORKLOCAL}"/aieml*.prx
+
     cp -f "${HOST_BUILD_DIR}/worklocal/host.cc" "${UNITEST_WORKLOCAL}/host.cc"
     # Copy kernel.cc (single-kernel) or kernel_*.cc (multi-kernel)
     if [ -f "${HOST_BUILD_DIR}/worklocal/kernel.cc" ]; then

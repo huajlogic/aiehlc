@@ -34,6 +34,7 @@
 #include <regex>
 #include <unordered_map>
 
+#include "routingimplement/include/hw/hwresource.h"
 #include "tilinglinalg_pipeline.h"
 
 class AieFrontEnd;
@@ -1096,9 +1097,10 @@ public:
                         derivedTilingParams.kDim = macroDimK;
 
                         // ---- Two-level tiling: compute effective tile_m/tile_n/tile_k ----
-                        // Memory budget for AIEML compute tile data memory (64KB total, ~48KB usable)
-                        constexpr int64_t AIE_DATA_MEM_BYTES = 65536;
-                        constexpr int64_t AIE_USABLE_MEM_BYTES = 49152; // 48KB usable for buffers
+                        // Memory budget from HW resource model (same for all current AIE generations)
+                        auto hwResForMemCheck = makeResource("Gen2");
+                        const int64_t AIE_DATA_MEM_BYTES = hwResForMemCheck->getTileMemoryBytes();
+                        const int64_t AIE_USABLE_MEM_BYTES = hwResForMemCheck->getUsableDataBytes();
 
                         // Collect explicit tiling hints from any resolved policy
                         int explicitTileM = 0, explicitTileN = 0, explicitTileK = 0;
@@ -1303,6 +1305,63 @@ public:
                             llvm::outs() << "[TilingLinalg]   port[" << i
                                          << "]: numRounds=" << derivedTilingParams.portParams[i].numRounds
                                          << " bufferSize=" << derivedTilingParams.portParams[i].bufferSize << "\n";
+                        }
+
+                        // Check: total ping-pong buffer requirement vs tile data memory
+                        {
+                            uint32_t totalBufBytes = 0;
+                            for (size_t i = 0; i < derivedTilingParams.portParams.size(); i++) {
+                                auto &pp = derivedTilingParams.portParams[i];
+                                auto &pt = parsedTensors[i];
+                                int ppDepth = pt.pingPong > 0 ? pt.pingPong : 2;
+                                int elemBytes = pt.elementBitWidth / 8;
+                                if (elemBytes <= 0)
+                                    elemBytes = 1;
+                                totalBufBytes += ppDepth * pp.bufferSize * elemBytes;
+                            }
+                            std::string errMsg;
+                            if (!hwResForMemCheck->checkDataMemoryFits(totalBufBytes, &errMsg)) {
+                                llvm::errs() << "[TilingLinalg] ERROR: " << errMsg << "\n";
+                                for (size_t i = 0; i < derivedTilingParams.portParams.size(); i++) {
+                                    auto &pp = derivedTilingParams.portParams[i];
+                                    auto &pt = parsedTensors[i];
+                                    int ppDepth = pt.pingPong > 0 ? pt.pingPong : 2;
+                                    int elemBytes = pt.elementBitWidth / 8;
+                                    if (elemBytes <= 0)
+                                        elemBytes = 1;
+                                    llvm::errs() << "  Port " << i << " (" << pt.varName << "): " << ppDepth << " x "
+                                                 << pp.bufferSize << " x " << elemBytes << " = "
+                                                 << ppDepth * pp.bufferSize * elemBytes << " bytes\n";
+                                }
+                            } else {
+                                llvm::outs() << "[TilingLinalg] Buffer memory check passed: " << totalBufBytes << " / "
+                                             << hwResForMemCheck->getUsableDataBytes() << " bytes\n";
+                            }
+                        }
+
+                        // ---- K-round shape adjustment for input tensors ----
+                        // When effectiveK < K (kRounds > 1), change input tensor shapes
+                        // from {M, K}/{K, N} to {M, effectiveK}/{effectiveK, N} so the
+                        // routing pipeline generates correct per-k-round partition slices
+                        // and BD sizes. The kRounds multiplier is passed as a module
+                        // attribute so downstream passes can multiply BD iterations.
+                        if (derivedTilingParams.kRounds > 1) {
+                            int64_t effK = derivedTilingParams.effectiveK;
+                            for (auto &pt : parsedTensors) {
+                                if (pt.isInput && pt.policyResolved) {
+                                    if (pt.pattern == 0 && pt.distribution == 0) {
+                                        // Input A: {M, K} -> {M, effectiveK}
+                                        pt.shape = {macroDimM, effK};
+                                        llvm::outs() << "[TilingLinalg] K-round: A shape adjusted to {" << macroDimM
+                                                     << "," << effK << "}\n";
+                                    } else if (pt.pattern == 0 && pt.distribution == 1) {
+                                        // Input B: {K, N} -> {effectiveK, N}
+                                        pt.shape = {effK, macroDimN};
+                                        llvm::outs() << "[TilingLinalg] K-round: B shape adjusted to {" << effK << ","
+                                                     << macroDimN << "}\n";
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -2127,6 +2186,18 @@ public:
                     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, mkd.tensors, splitModel,
                                                                        mkd.partition, aieGenStr);
 
+                    // Set K-round module attributes for downstream DMA passes
+                    if (mkd.derivedParams.valid && mkd.derivedParams.kRounds > 1) {
+                        mlir::OpBuilder attrBuilder(&ctx);
+                        module->setAttr("routing.effective_k",
+                                        attrBuilder.getI64IntegerAttr(mkd.derivedParams.effectiveK));
+                        module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kRounds));
+                        module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kDim));
+                        llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
+                                     << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
+                                     << " full_k=" << mkd.derivedParams.kDim << "\n";
+                    }
+
                     // Replace aie::get_*() calls in kernel body with computed integer literals
                     std::string resolvedBody = mkd.kernelBody;
                     if (mkd.derivedParams.valid && !resolvedBody.empty()) {
@@ -2423,6 +2494,18 @@ public:
                 // Build routing IR
                 auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel,
                                                                    parsedPartition, aieGenStr);
+
+                // Set K-round module attributes for downstream DMA passes
+                if (derivedTilingParams.valid && derivedTilingParams.kRounds > 1) {
+                    mlir::OpBuilder attrBuilder(&ctx);
+                    module->setAttr("routing.effective_k",
+                                    attrBuilder.getI64IntegerAttr(derivedTilingParams.effectiveK));
+                    module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(derivedTilingParams.kRounds));
+                    module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(derivedTilingParams.kDim));
+                    llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
+                                 << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds
+                                 << " full_k=" << derivedTilingParams.kDim << "\n";
+                }
 
                 // Replace aie::get_*() calls in kernel body with computed integer literals
                 if (derivedTilingParams.valid && !singleKernelBody.empty()) {

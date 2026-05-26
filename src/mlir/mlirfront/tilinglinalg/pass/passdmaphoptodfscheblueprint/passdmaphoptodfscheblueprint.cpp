@@ -808,6 +808,63 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         // For Push: src is one shim tile (FlowConfigOp with partition slice view),
         //           dst is many core tiles (FlowConfigOp with linear and slice_symbols)
         std::string srcBindName = "flow_src_" + std::to_string(opId);
+
+        // Compute multi-dimensional DMA addressing for shim MM2S input when
+        // effectiveK < fullK (K-dimension temporal tiling). In this case, the
+        // routing IR uses tensor shapes with effectiveK, but the DDR data has
+        // full-K row width. The shim DMA must use 2D addressing to extract the
+        // correct K-chunk columns from each DDR row.
+        ArrayAttr inputShimDimStrides = nullptr;
+        ArrayAttr inputShimDimWraps = nullptr;
+
+        if (srcTileType == "shim") {
+            auto moduleOp = op->getParentOfType<ModuleOp>();
+            if (moduleOp) {
+                auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
+                auto fullKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k");
+
+                if (effectiveKAttr && fullKAttr) {
+                    int64_t effectiveK = effectiveKAttr.getInt();
+                    int64_t fullK = fullKAttr.getInt();
+
+                    if (effectiveK > 0 && effectiveK < fullK) {
+                        // Get element bit width from the view tensor type
+                        auto viewType = dyn_cast<RankedTensorType>(viewSplit.getType());
+                        if (viewType && viewType.getRank() == 2) {
+                            unsigned bitWidth = viewType.getElementTypeBitWidth();
+                            int64_t elemsPerWord = 32 / bitWidth; // 4 for i8, 2 for i16
+                            constexpr int64_t wordBytes = 4;
+
+                            // Partition slice shape: {partRows, effectiveK}
+                            int64_t partRows = viewType.getDimSize(0);
+                            int64_t effK_w = effectiveK / elemsPerWord; // effectiveK in words
+                            int64_t fullK_w = fullK / elemsPerWord;     // fullK in words
+
+                            // 2D addressing for shim MM2S:
+                            //   D0: contiguous within K-chunk row
+                            //       wrap = effectiveK in words
+                            //       stride = 1 word (4 bytes)
+                            //   D1: next DDR row (stride = fullK in words)
+                            //       wrap = partRows
+                            //       stride = fullK in words (row stride in DDR)
+                            SmallVector<int32_t> strides = {static_cast<int32_t>(1 * wordBytes),
+                                                            static_cast<int32_t>(fullK_w * wordBytes)};
+                            SmallVector<int32_t> wraps = {static_cast<int32_t>(effK_w), static_cast<int32_t>(partRows)};
+
+                            inputShimDimStrides = rewriter.getI32ArrayAttr(strides);
+                            inputShimDimWraps = rewriter.getI32ArrayAttr(wraps);
+
+                            llvm::errs() << "[ShimMultiDim] Push input (2D K-tiling): "
+                                         << "effectiveK=" << effectiveK << " fullK=" << fullK
+                                         << " partRows=" << partRows << " elemsPerWord=" << elemsPerWord << " strides=["
+                                         << strides[0] << "," << strides[1] << "]"
+                                         << " wraps=[" << wraps[0] << "," << wraps[1] << "]\n";
+                        }
+                    }
+                }
+            }
+        }
+
         // Use viewSplit (partition slice) so the shim BD covers only the data
         // for this round; rootAdaptedView is kept only for data_id assignment.
         rewriter.create<dfscheblueprint::FlowConfigOp>(
@@ -819,8 +876,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             nullptr, // slice_symbols - source is root, no slice
             rewriter.getStringAttr(srcTileType),
             rewriter.getI32IntegerAttr(dataId), // data_id for shim BD grouping/merging
-            nullptr,                            // shim_dim_strides (input scatter: contiguous DDR, no multi-dim needed)
-            nullptr,                            // shim_dim_wraps
+            inputShimDimStrides,                // shim_dim_strides (2D when effectiveK < fullK)
+            inputShimDimWraps,                  // shim_dim_wraps
             nullptr                             // pp_depth
         );
 

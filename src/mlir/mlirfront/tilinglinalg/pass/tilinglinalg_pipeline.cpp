@@ -299,6 +299,42 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         ResourceMgr::init(std::move(hwRes));
     }
 
+    // Early memory check: validate that per-tile buffer requirements fit in tile data memory
+    {
+        auto hwRes = ResourceMgr::instance()->getrsc();
+        uint32_t usableBytes = hwRes->getUsableDataBytes();
+
+        // Estimate per-tile buffer memory from tensor params and ping-pong depth.
+        // Each tensor port on a core tile needs ppDepth * bufferSliceBytes.
+        // bufferSliceBytes = product(tileShape) * elementBytes where tileShape = shape / meshDim.
+        // For a conservative check we use maxPingPongBytes as the per-buffer size.
+        uint32_t totalBufferBytes = 0;
+        for (const auto &tp : tensors) {
+            int ppDepth = 2; // default ping-pong depth
+            // Read pp_depth from module attribute if available
+            if (auto ppMap = module->getAttrOfType<DictionaryAttr>("routing.pp_depth_map")) {
+                unsigned idx = &tp - &tensors[0];
+                std::string key = "tensor_" + std::to_string(idx);
+                if (auto ppAttr = ppMap.getAs<IntegerAttr>(key))
+                    ppDepth = ppAttr.getInt();
+            }
+            uint32_t bufSize = (maxPingPongBytes > 0) ? maxPingPongBytes : 4096;
+            totalBufferBytes += ppDepth * bufSize;
+        }
+
+        std::string errMsg;
+        if (!hwRes->checkDataMemoryFits(totalBufferBytes, &errMsg)) {
+            llvm::errs() << "[TilingLinalg] ERROR: Memory budget exceeded!\n"
+                         << "  " << errMsg << "\n"
+                         << "  maxPingPongBytes=" << maxPingPongBytes << " numTensors=" << tensors.size() << "\n"
+                         << "  Suggestion: reduce maxBufferBytes in SpatialPolicy "
+                         << "or reduce ping-pong depth.\n";
+            return false;
+        }
+        std::cout << "[TilingLinalg] Memory check passed: estimated " << totalBufferBytes << " bytes per tile, limit "
+                  << usableBytes << " bytes" << std::endl;
+    }
+
     // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
     if (!runPipelineSinglePass(ctx, hostModule,
                                std::make_unique<mlir::BlueprintToSchedulePass>(0.5, maxPingPongBytes, aieGen), irDir,

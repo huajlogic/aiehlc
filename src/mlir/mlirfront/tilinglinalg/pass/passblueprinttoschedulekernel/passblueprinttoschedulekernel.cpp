@@ -839,6 +839,24 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 // numRounds = total rounds = perCoreSize / pingPongBufSize = ppDepth
                 paramInfo.numRounds =
                     (pingPongBufSize > 0) ? static_cast<int32_t>(perCoreSize / pingPongBufSize) : ppDepth;
+
+                // K-round multiplication: when effectiveK < K, the kernel runs
+                // kRounds iterations. window_init numRounds must cover the total
+                // acquire/release cycles across all k-rounds.
+                if (paramInfo.isInput) {
+                    auto moduleOp = declareDataOp->getParentOfType<ModuleOp>();
+                    if (moduleOp) {
+                        if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
+                            int64_t kRounds = kRoundsAttr.getInt();
+                            if (kRounds > 1) {
+                                llvm::errs()
+                                    << "[BlueprintToScheduleKernel] K-round: input numRounds " << paramInfo.numRounds
+                                    << " * kRounds " << kRounds << " = " << paramInfo.numRounds * kRounds << "\n";
+                                paramInfo.numRounds *= static_cast<int32_t>(kRounds);
+                            }
+                        }
+                    }
+                }
             } else {
                 // Fallback: try declare_data operand
                 Value srcValue = declareDataOp.getOperand();
@@ -1050,7 +1068,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(-1), Value(),
                     rewriter.getI32IntegerAttr(-1), // out_of_order_bd_id
                     /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
-                    rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                    rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
+                    rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
 
                 auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
                     loc, dfschedule::IoHandleType::get(rewriter.getContext()), coreBdOp.getBdHandle(),

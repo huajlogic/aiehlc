@@ -34,7 +34,7 @@ AIEHLC_DIR="${AIEHLC_ROOT}"
 WORKLOCAL_DIR="${AIEHLC_ROOT}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal"
 BUILD_DIR="${WORKLOCAL_DIR}/build"
 
-KERNEL_FUNC_NAME="computekernel"   # matches the kernel function in host.cc
+KERNEL_FUNC_NAME="computekernel"   # default fallback; overridden by auto-detection below
 
 # Detect multi-kernel mode: check for kernel_<name>.cc files
 MULTI_KERNEL_FILES=()
@@ -82,6 +82,14 @@ if [ ${#MULTI_KERNEL_FILES[@]} -gt 0 ]; then
     popd
 else
     # Single-kernel mode (backward compat)
+    # Auto-detect kernel function name from kernel.cc's "// kernel_decl <name>" comment
+    if [ -f "${WORKLOCAL_DIR}/kernel.cc" ]; then
+        DETECTED_NAME=$(grep -oP '// kernel_decl \K\S+' "${WORKLOCAL_DIR}/kernel.cc" | head -1)
+        if [ -n "$DETECTED_NAME" ]; then
+            KERNEL_FUNC_NAME="$DETECTED_NAME"
+            echo "[Single-kernel] Detected kernel function name: ${KERNEL_FUNC_NAME}"
+        fi
+    fi
     pushd ${WORKLOCAL_DIR}
     source ./compile_kernel.sh "${KERNEL_FUNC_NAME}"
     if [ $? -ne 0 ]; then

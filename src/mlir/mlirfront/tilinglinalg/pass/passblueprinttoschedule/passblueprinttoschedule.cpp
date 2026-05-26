@@ -898,6 +898,40 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             lastShimBdHandle = shimBdHandles[0];
         } else {
             // --- Non-OOO path: single shim BD (original behavior) ---
+            // K-round iteration: when effectiveK < fullK, use iter_step_size and
+            // iter_wrap so the BD repeats kRounds times, advancing the DDR read
+            // address by effectiveK bytes between each k-round.
+            int32_t shimIterStepSize = 0;
+            int32_t shimIterWrap = 0;
+            if (shimIsSender) {
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
+                    auto fullKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k");
+                    auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
+                    if (effectiveKAttr && fullKAttr && kRoundsAttr) {
+                        int64_t effectiveK = effectiveKAttr.getInt();
+                        int64_t fullK = fullKAttr.getInt();
+                        int64_t kRounds = kRoundsAttr.getInt();
+                        if (effectiveK > 0 && effectiveK < fullK && kRounds > 1) {
+                            // Compute element size from the memref type
+                            int64_t elemBytes = 1;
+                            if (memrefType.getElementType().isIntOrFloat())
+                                elemBytes = memrefType.getElementTypeBitWidth() / 8;
+                            if (elemBytes == 0)
+                                elemBytes = 1;
+                            // iter_step_size: advance by effectiveK elements in bytes
+                            // This shifts the DDR base to the next K-chunk column
+                            shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
+                            shimIterWrap = static_cast<int32_t>(kRounds);
+                            llvm::errs() << "[BlueprintToSchedule] K-round shim iteration: "
+                                         << "iter_step_size=" << shimIterStepSize << " iter_wrap=" << shimIterWrap
+                                         << "\n";
+                        }
+                    }
+                }
+            }
+
             auto shimBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
                 loc, dfschedule::BdHandleType::get(rewriter.getContext()),
                 ddrBuffer,                                  // DDR receive buffer
@@ -916,7 +950,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 Value(),                                    // linked_bd = none
                 rewriter.getI32IntegerAttr(-1),             // out_of_order_bd_id
                 /*dim_strides=*/shimDimStrides, /*dim_wraps=*/shimDimWraps,
-                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                rewriter.getI32IntegerAttr(shimIterStepSize), // iter_step_size (K-round advance)
+                rewriter.getI32IntegerAttr(shimIterWrap));    // iter_wrap (kRounds repetitions)
 
             lastShimBdHandle = shimBdOp.getBdHandle();
             // For single-BD path with OOO (single tile many_to_one), still record
@@ -1055,6 +1090,24 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             // numIterations uses perCoreElements because each core only
             // processes its own share of data.
             int64_t numIterations = (perCoreElements + pingPongBufferSize - 1) / pingPongBufferSize;
+
+            // K-round multiplication: when effectiveK < K, the kernel runs
+            // kRounds iterations, each consuming numIterations DMA rounds.
+            // The host must send numIterations * kRounds total BD iterations
+            // for input flows to match the kernel's acquire/release pattern.
+            if (isInput) {
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
+                        int64_t kRounds = kRoundsAttr.getInt();
+                        if (kRounds > 1) {
+                            llvm::errs() << "[BlueprintToSchedule] K-round: input numIterations " << numIterations
+                                         << " * kRounds " << kRounds << " = " << numIterations * kRounds << "\n";
+                            numIterations *= kRounds;
+                        }
+                    }
+                }
+            }
 
             // Compute lock IDs from dirIdx to match the kernel's window ordering.
             // The kernel allocates locks sequentially per sorted window:
@@ -1288,7 +1341,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 Value(),                                     // linked_bd = none
                                 rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
                                 /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
-                                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                                rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
+                                rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
 
                             firstCoreBdHandle = singleBdOp.getBdHandle();
                         } else {
@@ -1336,7 +1390,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 Value(),                                     // linked_bd = none
                                 rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
                                 /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
-                                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                                rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
+                                rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
 
                             // Ping BD second (linked_bd = pong handle): next_bd -> pong
                             auto pingBdIdConst = rewriter.create<arith::ConstantOp>(
@@ -1357,7 +1412,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 pongBdOp.getBdHandle(),                      // linked_bd = pong BD
                                 rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
                                 /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
-                                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                                rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
+                                rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
 
                             firstCoreBdHandle = pingBdOp.getBdHandle();
                         }

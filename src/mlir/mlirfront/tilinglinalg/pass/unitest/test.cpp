@@ -1141,6 +1141,28 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         ResourceMgr::init(std::move(hwRes));
     }
 
+    // Pre-pipeline memory check: validate buffer requirements fit in tile data memory
+    {
+        auto hwResCheck = makeResource(g_aieGen);
+        uint32_t usableBytes = hwResCheck->getUsableDataBytes();
+        // Conservative estimate: each tensor needs ppDepth * maxPingPongBytes (4096 default)
+        uint32_t maxPingPongBytes = 4096;
+        uint32_t totalBufferBytes = 0;
+        for (const auto &tp : tensors) {
+            int ppDepth = 2; // default
+            totalBufferBytes += ppDepth * maxPingPongBytes;
+        }
+        std::string errMsg;
+        if (!hwResCheck->checkDataMemoryFits(totalBufferBytes, &errMsg)) {
+            llvm::errs() << "[unitest] ERROR: Memory budget exceeded!\n"
+                         << "  " << errMsg << "\n"
+                         << "  numTensors=" << tensors.size() << " maxPingPongBytes=" << maxPingPongBytes << "\n";
+        } else {
+            std::cout << "[unitest] Memory check passed: estimated " << totalBufferBytes << " bytes per tile, limit "
+                      << usableBytes << " bytes" << std::endl;
+        }
+    }
+
     // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
     if (doHostPath) {
         if (startStage <= 4) {
