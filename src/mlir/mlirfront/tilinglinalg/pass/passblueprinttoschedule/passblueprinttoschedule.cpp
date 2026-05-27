@@ -696,12 +696,20 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         // No separate alloc needed — partition subview is the correct size.
         int64_t perTileShimLen = shimBdLen;
 
-        // K-round note: do NOT divide perTileShimLen by kRounds here.
-        // The shim BD len must equal the full partition size (e.g. 64*256=16384).
-        // The 3D dim_strides/dim_wraps (set by DmaphopTodfscheblueprintPass)
-        // already describe the per-K-round strided access pattern within DDR.
-        // iter_step/iter_wrap (set below at line ~921) handles K-round
-        // repetition by advancing the DDR base address between rounds.
+        // K-round iteration: when iter_wrap > 1, BD len must be the per-iteration
+        // transfer size (e.g. 4096 = 64*64 per k-round), NOT the full partition
+        // size. The DMA repeats the BD iter_wrap times via channel repeat count,
+        // advancing the base address by iter_step_size between iterations.
+        // Ref: xaie_dmabd_iter.c — XAie_DmaSetAddrLen uses per-iteration len.
+        {
+            auto moduleOp = op->getParentOfType<ModuleOp>();
+            if (moduleOp) {
+                auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
+                if (kRoundsAttr && kRoundsAttr.getInt() > 1 && shimIsSender) {
+                    perTileShimLen = shimBdLen / kRoundsAttr.getInt();
+                }
+            }
+        }
 
         // Single shim BD: sends/receives full data from DDR
         // Allocate BD ID from ResourceMgr to avoid conflicts when a SHIM tile
@@ -1505,7 +1513,18 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             // For OOO, repeat = numCoreTiles * ooNumIterations (total source transactions).
             // Each core sends ooNumIterations BD transactions; the SHIM must receive
             // all of them before the flow is complete.
-            int32_t repeatCount = useOOO ? (int32_t)(numCoreTiles * ooNumIterations) : 1;
+            int32_t repeatCount = 1;
+            if (useOOO) {
+                repeatCount = (int32_t)(numCoreTiles * ooNumIterations);
+            } else if (shimIsSender) {
+                // When using BD iteration for K-rounds, channel repeat = iter_wrap
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
+                    if (kRoundsAttr && kRoundsAttr.getInt() > 1)
+                        repeatCount = (int32_t)kRoundsAttr.getInt();
+                }
+            }
             auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
                 loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(), getBdIdOp.getBdId(),
                 rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(repeatCount));

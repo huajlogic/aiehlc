@@ -79,15 +79,20 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<in
             int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
             for (int i = 0; i < buf_sz_a; i++)
                 all_A[ra * buf_sz_a + i] = A_ptr[i];
+#if DEBUG_OUTPUT_ORDER
+            if (ra == 0) {
+                klog("A0  ", (int32_t)A_ptr[0]);
+            }
+#endif
             release_input_window(win_a);
         }
 
 #if DEBUG_OUTPUT_ORDER
-        if (kr == 0) {
-            for (int i = 0; i < 16; i++) {
-                klog("A0  ", (int32_t)all_A[i]);
-            }
-        }
+        // if (kr == 0) {
+        //     for (int i = 0; i < 16; i++) {
+        //         klog("A0  ", (int32_t)all_A[i]);
+        //     }
+        // }
 #endif
 
         // --- Phase 2: Stream B chunk, accumulate partial products ---
@@ -95,10 +100,10 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<in
             int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
 
 #if DEBUG_OUTPUT_ORDER
-            if (kr == 0 && rb == 0) {
-                for (int i = 0; i < 16; i++) {
-                    klog("B0  ", (int32_t)B_ptr[i]);
-                }
+            if (rb == 0) {
+                // for (int i = 0; i < 16; i++) {
+                klog("B0  ", (int32_t)B_ptr[0]);
+                //}
             }
 #endif
 
@@ -138,11 +143,11 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<in
         for (int i = 0; i < buf_sz_c; i++)
             out[i] = local_out[rc * buf_sz_c + i];
 #if DEBUG_OUTPUT_ORDER
-        if (rc == 0) {
-            for (int l = 0; l < 8; l++) {
-                klog("C0 ", (int32_t)out[l]);
-            }
-        }
+        // if (rc == 0) {
+        // for (int l = 0; l < 8; l++) {
+        klog("C0 ", (int32_t)out[0]);
+        //}
+        //}///
 #endif
         release_output_window(win_c);
     }

@@ -25,9 +25,9 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %15 = "emitc.constant"() <{value = 0 : i8}> : () -> i8
     %16 = "emitc.constant"() <{value = 0 : i8}> : () -> i8
     %17 = emitc.call_opaque "XAie_TileLoc"(%15, %16) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
-    emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=16384, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
+    emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
     %18 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %19 = "emitc.constant"() <{value = 16384 : i32}> : () -> i32
+    %19 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
     %20 = "emitc.constant"() <{value = -1 : i32}> : () -> i32
     %21 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %22 = emitc.call_opaque "__runtime_buffer_arg"(%14) : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -214,16 +214,16 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %178 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     emitc.verbatim "/* Allocated BD ID 0 for tile (0,0) */"
     %179 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %180 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
+    %180 = "emitc.constant"() <{value = 4 : i32}> : () -> i32
     %181 = emitc.call_opaque "__Runtime_startio"(%arg0, %42, %179, %180) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %182 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %183 = emitc.call_opaque "__runtime_buffer_offset"(%arg2, %182) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
     %184 = "emitc.constant"() <{value = 1 : i8}> : () -> i8
     %185 = "emitc.constant"() <{value = 0 : i8}> : () -> i8
     %186 = emitc.call_opaque "XAie_TileLoc"(%184, %185) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
-    emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=16384, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
+    emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
     %187 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %188 = "emitc.constant"() <{value = 16384 : i32}> : () -> i32
+    %188 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
     %189 = "emitc.constant"() <{value = -1 : i32}> : () -> i32
     %190 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %191 = emitc.call_opaque "__runtime_buffer_arg"(%183) : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -418,16 +418,16 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %355 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     emitc.verbatim "/* Allocated BD ID 0 for tile (1,0) */"
     %356 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %357 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
+    %357 = "emitc.constant"() <{value = 4 : i32}> : () -> i32
     %358 = emitc.call_opaque "__Runtime_startio"(%arg0, %211, %356, %357) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %359 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %360 = emitc.call_opaque "__runtime_buffer_offset"(%arg2, %359) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
     %361 = "emitc.constant"() <{value = 2 : i8}> : () -> i8
     %362 = "emitc.constant"() <{value = 0 : i8}> : () -> i8
     %363 = emitc.call_opaque "XAie_TileLoc"(%361, %362) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
-    emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=16384, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
+    emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
     %364 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %365 = "emitc.constant"() <{value = 16384 : i32}> : () -> i32
+    %365 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
     %366 = "emitc.constant"() <{value = -1 : i32}> : () -> i32
     %367 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %368 = emitc.call_opaque "__runtime_buffer_arg"(%360) : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -622,16 +622,16 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %532 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     emitc.verbatim "/* Allocated BD ID 0 for tile (2,0) */"
     %533 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %534 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
+    %534 = "emitc.constant"() <{value = 4 : i32}> : () -> i32
     %535 = emitc.call_opaque "__Runtime_startio"(%arg0, %388, %533, %534) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %536 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %537 = emitc.call_opaque "__runtime_buffer_offset"(%arg2, %536) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
     %538 = "emitc.constant"() <{value = 3 : i8}> : () -> i8
     %539 = "emitc.constant"() <{value = 0 : i8}> : () -> i8
     %540 = emitc.call_opaque "XAie_TileLoc"(%538, %539) : (i8, i8) -> !emitc.opaque<"XAie_LocType">
-    emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=16384, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
+    emitc.verbatim "/* DMA BD Config: bd_id=0, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
     %541 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %542 = "emitc.constant"() <{value = 16384 : i32}> : () -> i32
+    %542 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
     %543 = "emitc.constant"() <{value = -1 : i32}> : () -> i32
     %544 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %545 = emitc.call_opaque "__runtime_buffer_arg"(%537) : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -826,13 +826,13 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %709 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     emitc.verbatim "/* Allocated BD ID 0 for tile (3,0) */"
     %710 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %711 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
+    %711 = "emitc.constant"() <{value = 4 : i32}> : () -> i32
     %712 = emitc.call_opaque "__Runtime_startio"(%arg0, %565, %710, %711) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %713 = "emitc.constant"() <{value = 0 : i64}> : () -> i64
     %714 = emitc.call_opaque "__runtime_buffer_offset"(%arg1, %713) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=16384, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
+    emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
     %715 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %716 = "emitc.constant"() <{value = 16384 : i32}> : () -> i32
+    %716 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
     %717 = "emitc.constant"() <{value = -1 : i32}> : () -> i32
     %718 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %719 = emitc.call_opaque "__runtime_buffer_arg"(%714) : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -1007,7 +1007,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %863 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     emitc.verbatim "/* Allocated BD ID 1 for tile (0,0) */"
     %864 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
-    %865 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
+    %865 = "emitc.constant"() <{value = 4 : i32}> : () -> i32
     %866 = emitc.call_opaque "__Runtime_startio"(%arg0, %739, %864, %865) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %867 = "emitc.constant"() <{value = 0 : i64}> : () -> i64
     %868 = emitc.call_opaque "__runtime_buffer_offset"(%arg3, %867) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -1218,9 +1218,9 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1045 = emitc.call_opaque "__Runtime_startio"(%arg0, %962, %1043, %1044) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %1046 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %1047 = emitc.call_opaque "__runtime_buffer_offset"(%arg1, %1046) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=16384, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
+    emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
     %1048 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %1049 = "emitc.constant"() <{value = 16384 : i32}> : () -> i32
+    %1049 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
     %1050 = "emitc.constant"() <{value = -1 : i32}> : () -> i32
     %1051 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1052 = emitc.call_opaque "__runtime_buffer_arg"(%1047) : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -1403,7 +1403,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1204 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     emitc.verbatim "/* Allocated BD ID 1 for tile (1,0) */"
     %1205 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
-    %1206 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
+    %1206 = "emitc.constant"() <{value = 4 : i32}> : () -> i32
     %1207 = emitc.call_opaque "__Runtime_startio"(%arg0, %1072, %1205, %1206) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %1208 = "emitc.constant"() <{value = 16384 : i64}> : () -> i64
     %1209 = emitc.call_opaque "__runtime_buffer_offset"(%arg3, %1208) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -1614,9 +1614,9 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1386 = emitc.call_opaque "__Runtime_startio"(%arg0, %1303, %1384, %1385) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %1387 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %1388 = emitc.call_opaque "__runtime_buffer_offset"(%arg1, %1387) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=16384, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
+    emitc.verbatim "/* DMA BD Config: bd_id=1, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
     %1389 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %1390 = "emitc.constant"() <{value = 16384 : i32}> : () -> i32
+    %1390 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
     %1391 = "emitc.constant"() <{value = -1 : i32}> : () -> i32
     %1392 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1393 = emitc.call_opaque "__runtime_buffer_arg"(%1388) : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -1799,7 +1799,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1545 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     emitc.verbatim "/* Allocated BD ID 1 for tile (2,0) */"
     %1546 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
-    %1547 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
+    %1547 = "emitc.constant"() <{value = 4 : i32}> : () -> i32
     %1548 = emitc.call_opaque "__Runtime_startio"(%arg0, %1413, %1546, %1547) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %1549 = "emitc.constant"() <{value = 32768 : i64}> : () -> i64
     %1550 = emitc.call_opaque "__runtime_buffer_offset"(%arg3, %1549) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -2010,9 +2010,9 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1727 = emitc.call_opaque "__Runtime_startio"(%arg0, %1644, %1725, %1726) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %1728 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %1729 = emitc.call_opaque "__runtime_buffer_offset"(%arg1, %1728) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>
-    emitc.verbatim "/* DMA BD Config: bd_id=11, offset=0, len=16384, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
+    emitc.verbatim "/* DMA BD Config: bd_id=11, offset=0, len=4096, enable_packet=false, packet_id=0, next_bd=-1, acquire_lock_id=0, acquire_lock_val=0, release_lock_id=0, release_lock_val=0, ooo_bd_id=-1 */"
     %1730 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
-    %1731 = "emitc.constant"() <{value = 16384 : i32}> : () -> i32
+    %1731 = "emitc.constant"() <{value = 4096 : i32}> : () -> i32
     %1732 = "emitc.constant"() <{value = -1 : i32}> : () -> i32
     %1733 = "emitc.constant"() <{value = 0 : i32}> : () -> i32
     %1734 = emitc.call_opaque "__runtime_buffer_arg"(%1729) : (!emitc.ptr<!emitc.opaque<"void">>) -> !emitc.ptr<!emitc.opaque<"void">>
@@ -2195,7 +2195,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %1886 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
     emitc.verbatim "/* Allocated BD ID 3 for tile (3,0) */"
     %1887 = "emitc.constant"() <{value = 3 : i32}> : () -> i32
-    %1888 = "emitc.constant"() <{value = 1 : i32}> : () -> i32
+    %1888 = "emitc.constant"() <{value = 4 : i32}> : () -> i32
     %1889 = emitc.call_opaque "__Runtime_startio"(%arg0, %1754, %1887, %1888) : (!emitc.ptr<!emitc.opaque<"XAie_DevInst">>, !emitc.opaque<"io">, i32, i32) -> !emitc.opaque<"ioevent">
     %1890 = "emitc.constant"() <{value = 49152 : i64}> : () -> i64
     %1891 = emitc.call_opaque "__runtime_buffer_offset"(%arg3, %1890) : (!emitc.ptr<!emitc.opaque<"void">>, i64) -> !emitc.ptr<!emitc.opaque<"void">>

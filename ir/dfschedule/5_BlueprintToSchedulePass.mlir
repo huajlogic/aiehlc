@@ -12,7 +12,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %c0_i32_0 = arith.constant 0 : i32
         %5 = dfschedule.config.dma_bd(%subview, %4, %c0_i32_0) {
           offset = 0 : i32,
-          len = 16384 : i32,
+          len = 4096 : i32,
           enable_packet = false,
           packet_id = 0 : i32,
           next_bd = 4294967295 : i32,
@@ -198,7 +198,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %41 = dfschedule.declare_kernel_config @kernelconfig2 {tile_configs = [{acquire_lock_id = 2 : i32, buffer_mode = 1 : i32, buffer_offset = 8192 : i32, buffer_size = 4096 : i32, dma_channel = 1 : i32, element_size = 1 : i32, flow_index = 0 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 2 : i32, release_lock_id = 3 : i32, tile_index = 2 : i32}]}
         %42 = dfschedule.declare_kernel_config @kernelconfig3 {tile_configs = [{acquire_lock_id = 2 : i32, buffer_mode = 1 : i32, buffer_offset = 12288 : i32, buffer_size = 4096 : i32, dma_channel = 1 : i32, element_size = 1 : i32, flow_index = 0 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 3 : i32, release_lock_id = 3 : i32, tile_index = 3 : i32}]}
         %43 = dfschedule.schedule.getbdid(%4) : (!dfschedule.tile) -> i32
-        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 0 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 0 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
         %45 = dfschedule.config.load_kernel_group(%7, %15, %23, %31) {
           callee = [@dskernel_receiver],
           distributed_compute_kernel_args = [@compute0, @compute0, @compute0, @compute0],
@@ -220,7 +220,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %c0_i32_0 = arith.constant 0 : i32
         %5 = dfschedule.config.dma_bd(%subview, %4, %c0_i32_0) {
           offset = 0 : i32,
-          len = 16384 : i32,
+          len = 4096 : i32,
           enable_packet = false,
           packet_id = 0 : i32,
           next_bd = 4294967295 : i32,
@@ -406,7 +406,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %41 = dfschedule.declare_kernel_config @kernelconfig6 {tile_configs = [{acquire_lock_id = 2 : i32, buffer_mode = 1 : i32, buffer_offset = 8192 : i32, buffer_size = 4096 : i32, dma_channel = 1 : i32, element_size = 1 : i32, flow_index = 1 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 2 : i32, release_lock_id = 3 : i32, tile_index = 2 : i32}]}
         %42 = dfschedule.declare_kernel_config @kernelconfig7 {tile_configs = [{acquire_lock_id = 2 : i32, buffer_mode = 1 : i32, buffer_offset = 12288 : i32, buffer_size = 4096 : i32, dma_channel = 1 : i32, element_size = 1 : i32, flow_index = 1 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 3 : i32, release_lock_id = 3 : i32, tile_index = 3 : i32}]}
         %43 = dfschedule.schedule.getbdid(%4) : (!dfschedule.tile) -> i32
-        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 1 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 1 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
         %45 = dfschedule.config.load_kernel_group(%7, %15, %23, %31) {
           callee = [@dskernel_receiver],
           distributed_compute_kernel_args = [@compute0, @compute0, @compute0, @compute0],
@@ -428,7 +428,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %c0_i32_0 = arith.constant 0 : i32
         %5 = dfschedule.config.dma_bd(%subview, %4, %c0_i32_0) {
           offset = 0 : i32,
-          len = 16384 : i32,
+          len = 4096 : i32,
           enable_packet = false,
           packet_id = 0 : i32,
           next_bd = 4294967295 : i32,
@@ -614,7 +614,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %41 = dfschedule.declare_kernel_config @kernelconfig10 {tile_configs = [{acquire_lock_id = 2 : i32, buffer_mode = 1 : i32, buffer_offset = 8192 : i32, buffer_size = 4096 : i32, dma_channel = 1 : i32, element_size = 1 : i32, flow_index = 2 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 2 : i32, release_lock_id = 3 : i32, tile_index = 2 : i32}]}
         %42 = dfschedule.declare_kernel_config @kernelconfig11 {tile_configs = [{acquire_lock_id = 2 : i32, buffer_mode = 1 : i32, buffer_offset = 12288 : i32, buffer_size = 4096 : i32, dma_channel = 1 : i32, element_size = 1 : i32, flow_index = 2 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 3 : i32, release_lock_id = 3 : i32, tile_index = 3 : i32}]}
         %43 = dfschedule.schedule.getbdid(%4) : (!dfschedule.tile) -> i32
-        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 2 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 2 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
         %45 = dfschedule.config.load_kernel_group(%7, %15, %23, %31) {
           callee = [@dskernel_receiver],
           distributed_compute_kernel_args = [@compute0, @compute0, @compute0, @compute0],
@@ -636,7 +636,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %c0_i32_0 = arith.constant 0 : i32
         %5 = dfschedule.config.dma_bd(%subview, %4, %c0_i32_0) {
           offset = 0 : i32,
-          len = 16384 : i32,
+          len = 4096 : i32,
           enable_packet = false,
           packet_id = 0 : i32,
           next_bd = 4294967295 : i32,
@@ -822,7 +822,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %41 = dfschedule.declare_kernel_config @kernelconfig14 {tile_configs = [{acquire_lock_id = 2 : i32, buffer_mode = 1 : i32, buffer_offset = 8192 : i32, buffer_size = 4096 : i32, dma_channel = 1 : i32, element_size = 1 : i32, flow_index = 3 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 2 : i32, release_lock_id = 3 : i32, tile_index = 2 : i32}]}
         %42 = dfschedule.declare_kernel_config @kernelconfig15 {tile_configs = [{acquire_lock_id = 2 : i32, buffer_mode = 1 : i32, buffer_offset = 12288 : i32, buffer_size = 4096 : i32, dma_channel = 1 : i32, element_size = 1 : i32, flow_index = 3 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 3 : i32, release_lock_id = 3 : i32, tile_index = 3 : i32}]}
         %43 = dfschedule.schedule.getbdid(%4) : (!dfschedule.tile) -> i32
-        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 3 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 3 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
         %45 = dfschedule.config.load_kernel_group(%7, %15, %23, %31) {
           callee = [@dskernel_receiver],
           distributed_compute_kernel_args = [@compute0, @compute0, @compute0, @compute0],
@@ -847,7 +847,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %c1_i32_0 = arith.constant 1 : i32
         %5 = dfschedule.config.dma_bd(%subview, %4, %c1_i32_0) {
           offset = 0 : i32,
-          len = 16384 : i32,
+          len = 4096 : i32,
           enable_packet = false,
           packet_id = 0 : i32,
           next_bd = 4294967295 : i32,
@@ -1033,7 +1033,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %41 = dfschedule.declare_kernel_config @kernelconfig18 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 8192 : i32, buffer_size = 4096 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 4 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 2 : i32, release_lock_id = 1 : i32, tile_index = 2 : i32}]}
         %42 = dfschedule.declare_kernel_config @kernelconfig19 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 12288 : i32, buffer_size = 4096 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 4 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 3 : i32, release_lock_id = 1 : i32, tile_index = 3 : i32}]}
         %43 = dfschedule.schedule.getbdid(%4) : (!dfschedule.tile) -> i32
-        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 4 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
         %45 = dfschedule.config.load_kernel_group(%7, %15, %23, %31) {
           callee = [@dskernel_receiver],
           distributed_compute_kernel_args = [@compute0, @compute0, @compute0, @compute0],
@@ -1254,7 +1254,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %c1_i32_0 = arith.constant 1 : i32
         %5 = dfschedule.config.dma_bd(%subview, %4, %c1_i32_0) {
           offset = 0 : i32,
-          len = 16384 : i32,
+          len = 4096 : i32,
           enable_packet = false,
           packet_id = 0 : i32,
           next_bd = 4294967295 : i32,
@@ -1440,7 +1440,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %41 = dfschedule.declare_kernel_config @kernelconfig26 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 8192 : i32, buffer_size = 4096 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 6 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 2 : i32, release_lock_id = 1 : i32, tile_index = 2 : i32}]}
         %42 = dfschedule.declare_kernel_config @kernelconfig27 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 12288 : i32, buffer_size = 4096 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 6 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 3 : i32, release_lock_id = 1 : i32, tile_index = 3 : i32}]}
         %43 = dfschedule.schedule.getbdid(%4) : (!dfschedule.tile) -> i32
-        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 6 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 6 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
         %45 = dfschedule.config.load_kernel_group(%7, %15, %23, %31) {
           callee = [@dskernel_receiver],
           distributed_compute_kernel_args = [@compute0, @compute0, @compute0, @compute0],
@@ -1661,7 +1661,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %c1_i32_0 = arith.constant 1 : i32
         %5 = dfschedule.config.dma_bd(%subview, %4, %c1_i32_0) {
           offset = 0 : i32,
-          len = 16384 : i32,
+          len = 4096 : i32,
           enable_packet = false,
           packet_id = 0 : i32,
           next_bd = 4294967295 : i32,
@@ -1847,7 +1847,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %41 = dfschedule.declare_kernel_config @kernelconfig34 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 8192 : i32, buffer_size = 4096 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 8 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 2 : i32, release_lock_id = 1 : i32, tile_index = 2 : i32}]}
         %42 = dfschedule.declare_kernel_config @kernelconfig35 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 12288 : i32, buffer_size = 4096 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 8 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 3 : i32, release_lock_id = 1 : i32, tile_index = 3 : i32}]}
         %43 = dfschedule.schedule.getbdid(%4) : (!dfschedule.tile) -> i32
-        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 8 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 8 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
         %45 = dfschedule.config.load_kernel_group(%7, %15, %23, %31) {
           callee = [@dskernel_receiver],
           distributed_compute_kernel_args = [@compute0, @compute0, @compute0, @compute0],
@@ -2068,7 +2068,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %c11_i32 = arith.constant 11 : i32
         %5 = dfschedule.config.dma_bd(%subview, %4, %c11_i32) {
           offset = 0 : i32,
-          len = 16384 : i32,
+          len = 4096 : i32,
           enable_packet = false,
           packet_id = 0 : i32,
           next_bd = 4294967295 : i32,
@@ -2254,7 +2254,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %41 = dfschedule.declare_kernel_config @kernelconfig42 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 8192 : i32, buffer_size = 4096 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 10 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 2 : i32, release_lock_id = 1 : i32, tile_index = 2 : i32}]}
         %42 = dfschedule.declare_kernel_config @kernelconfig43 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 12288 : i32, buffer_size = 4096 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 10 : i32, num_buffers = 2 : i32, num_iterations = 4 : i32, packet_id = 3 : i32, release_lock_id = 1 : i32, tile_index = 3 : i32}]}
         %43 = dfschedule.schedule.getbdid(%4) : (!dfschedule.tile) -> i32
-        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 10 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+        %44 = dfschedule.schedule.start_io(%6, %43) {flow_index = 10 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
         %45 = dfschedule.config.load_kernel_group(%7, %15, %23, %31) {
           callee = [@dskernel_receiver],
           distributed_compute_kernel_args = [@compute0, @compute0, @compute0, @compute0],

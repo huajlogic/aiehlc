@@ -20,7 +20,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %0 = dfschedule.declaretile {col = 0 : i32, row = 0 : i32} : !dfschedule.tile
     %1 = dfschedule.config.dma_bd(%subview, %0, %c0_i32) {
       offset = 0 : i32,
-      len = 16384 : i32,
+      len = 4096 : i32,
       enable_packet = false,
       packet_id = 0 : i32,
       next_bd = 4294967295 : i32,
@@ -190,12 +190,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
     %34 = dfschedule.schedule.getbdid(%27) : (!dfschedule.tile) -> i32
     %35 = dfschedule.schedule.getbdid(%0) : (!dfschedule.tile) -> i32
-    %36 = dfschedule.schedule.start_io(%2, %35) {flow_index = 0 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+    %36 = dfschedule.schedule.start_io(%2, %35) {flow_index = 0 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
     %subview_0 = memref.subview %arg1[64, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1], offset: 16384>>
     %37 = dfschedule.declaretile {col = 1 : i32, row = 0 : i32} : !dfschedule.tile
     %38 = dfschedule.config.dma_bd(%subview_0, %37, %c0_i32) {
       offset = 0 : i32,
-      len = 16384 : i32,
+      len = 4096 : i32,
       enable_packet = false,
       packet_id = 0 : i32,
       next_bd = 4294967295 : i32,
@@ -369,12 +369,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
     %71 = dfschedule.schedule.getbdid(%64) : (!dfschedule.tile) -> i32
     %72 = dfschedule.schedule.getbdid(%37) : (!dfschedule.tile) -> i32
-    %73 = dfschedule.schedule.start_io(%39, %72) {flow_index = 1 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+    %73 = dfschedule.schedule.start_io(%39, %72) {flow_index = 1 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
     %subview_5 = memref.subview %arg1[128, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1], offset: 32768>>
     %74 = dfschedule.declaretile {col = 2 : i32, row = 0 : i32} : !dfschedule.tile
     %75 = dfschedule.config.dma_bd(%subview_5, %74, %c0_i32) {
       offset = 0 : i32,
-      len = 16384 : i32,
+      len = 4096 : i32,
       enable_packet = false,
       packet_id = 0 : i32,
       next_bd = 4294967295 : i32,
@@ -548,12 +548,12 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
     %108 = dfschedule.schedule.getbdid(%101) : (!dfschedule.tile) -> i32
     %109 = dfschedule.schedule.getbdid(%74) : (!dfschedule.tile) -> i32
-    %110 = dfschedule.schedule.start_io(%76, %109) {flow_index = 2 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+    %110 = dfschedule.schedule.start_io(%76, %109) {flow_index = 2 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
     %subview_10 = memref.subview %arg1[192, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1], offset: 49152>>
     %111 = dfschedule.declaretile {col = 3 : i32, row = 0 : i32} : !dfschedule.tile
     %112 = dfschedule.config.dma_bd(%subview_10, %111, %c0_i32) {
       offset = 0 : i32,
-      len = 16384 : i32,
+      len = 4096 : i32,
       enable_packet = false,
       packet_id = 0 : i32,
       next_bd = 4294967295 : i32,
@@ -727,11 +727,11 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
     %145 = dfschedule.schedule.getbdid(%138) : (!dfschedule.tile) -> i32
     %146 = dfschedule.schedule.getbdid(%111) : (!dfschedule.tile) -> i32
-    %147 = dfschedule.schedule.start_io(%113, %146) {flow_index = 3 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+    %147 = dfschedule.schedule.start_io(%113, %146) {flow_index = 3 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
     %subview_15 = memref.subview %arg0[0, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1]>>
     %148 = dfschedule.config.dma_bd(%subview_15, %0, %c1_i32) {
       offset = 0 : i32,
-      len = 16384 : i32,
+      len = 4096 : i32,
       enable_packet = false,
       packet_id = 0 : i32,
       next_bd = 4294967295 : i32,
@@ -897,7 +897,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
     %177 = dfschedule.schedule.getbdid(%114) : (!dfschedule.tile) -> i32
     %178 = dfschedule.schedule.getbdid(%0) : (!dfschedule.tile) -> i32
-    %179 = dfschedule.schedule.start_io(%149, %178) {flow_index = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+    %179 = dfschedule.schedule.start_io(%149, %178) {flow_index = 4 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
     %subview_16 = memref.subview %arg2[0, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1]>>
     %180 = dfschedule.config.dma_bd(%subview_16, %111, %c5_i32) {
       offset = 192 : i32,
@@ -1070,7 +1070,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %subview_21 = memref.subview %arg0[64, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1], offset: 16384>>
     %207 = dfschedule.config.dma_bd(%subview_21, %37, %c1_i32) {
       offset = 0 : i32,
-      len = 16384 : i32,
+      len = 4096 : i32,
       enable_packet = false,
       packet_id = 0 : i32,
       next_bd = 4294967295 : i32,
@@ -1240,7 +1240,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
     %236 = dfschedule.schedule.getbdid(%122) : (!dfschedule.tile) -> i32
     %237 = dfschedule.schedule.getbdid(%37) : (!dfschedule.tile) -> i32
-    %238 = dfschedule.schedule.start_io(%208, %237) {flow_index = 6 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+    %238 = dfschedule.schedule.start_io(%208, %237) {flow_index = 6 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
     %subview_26 = memref.subview %arg2[64, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1], offset: 16384>>
     %239 = dfschedule.config.dma_bd(%subview_26, %111, %c10_i32) {
       offset = 192 : i32,
@@ -1413,7 +1413,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %subview_31 = memref.subview %arg0[128, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1], offset: 32768>>
     %266 = dfschedule.config.dma_bd(%subview_31, %74, %c1_i32) {
       offset = 0 : i32,
-      len = 16384 : i32,
+      len = 4096 : i32,
       enable_packet = false,
       packet_id = 0 : i32,
       next_bd = 4294967295 : i32,
@@ -1583,7 +1583,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
     %295 = dfschedule.schedule.getbdid(%130) : (!dfschedule.tile) -> i32
     %296 = dfschedule.schedule.getbdid(%74) : (!dfschedule.tile) -> i32
-    %297 = dfschedule.schedule.start_io(%267, %296) {flow_index = 8 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+    %297 = dfschedule.schedule.start_io(%267, %296) {flow_index = 8 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
     %subview_36 = memref.subview %arg2[128, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1], offset: 32768>>
     %298 = dfschedule.config.dma_bd(%subview_36, %74, %c6_i32) {
       offset = 192 : i32,
@@ -1756,7 +1756,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %subview_41 = memref.subview %arg0[192, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1], offset: 49152>>
     %325 = dfschedule.config.dma_bd(%subview_41, %111, %c11_i32) {
       offset = 0 : i32,
-      len = 16384 : i32,
+      len = 4096 : i32,
       enable_packet = false,
       packet_id = 0 : i32,
       next_bd = 4294967295 : i32,
@@ -1926,7 +1926,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
     %354 = dfschedule.schedule.getbdid(%138) : (!dfschedule.tile) -> i32
     %355 = dfschedule.schedule.getbdid(%111) : (!dfschedule.tile) -> i32
-    %356 = dfschedule.schedule.start_io(%326, %355) {flow_index = 10 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
+    %356 = dfschedule.schedule.start_io(%326, %355) {flow_index = 10 : i32, repeat_count = 4 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
     %subview_46 = memref.subview %arg2[192, 0] [64, 256] [1, 1] : memref<256x256xi8> to memref<64x256xi8, strided<[256, 1], offset: 49152>>
     %357 = dfschedule.config.dma_bd(%subview_46, %74, %c11_i32) {
       offset = 192 : i32,
