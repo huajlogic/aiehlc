@@ -1234,54 +1234,77 @@ public:
                             if (pt.isInput) {
                                 if (pt.policyResolved) {
                                     if (pt.pattern == 0 && pt.distribution == 0) {
-                                        // Input A: Broadcast+Row — split along tileM rows with effectiveK
-                                        int64_t rowsPerRoundRaw = tileM_eff / ppDepth;
-                                        int64_t rowsPerRound = rowsPerRoundRaw;
-                                        if (rowsPerRound * dmaK > maxBuf)
-                                            rowsPerRound = maxBuf / dmaK;
-                                        if (rowsPerRound <= 0)
-                                            rowsPerRound = 1;
-                                        pp.numRounds = tileM_eff / rowsPerRound;
-                                        pp.bufferSize = rowsPerRound * dmaK;
+                                        // Input A: Broadcast+Row — tileM rows × effectiveK per k-round
+                                        // pp_depth only controls physical ping-pong buffer count,
+                                        // NOT data splitting. Only split when data exceeds maxBuf.
+                                        int64_t perKRoundData = tileM_eff * dmaK;
+                                        if (perKRoundData <= maxBuf) {
+                                            pp.bufferSize = perKRoundData;
+                                            pp.numRounds = 1;
+                                        } else {
+                                            int64_t rowsPerRound = maxBuf / dmaK;
+                                            if (rowsPerRound <= 0)
+                                                rowsPerRound = 1;
+                                            pp.bufferSize = rowsPerRound * dmaK;
+                                            pp.numRounds = (tileM_eff + rowsPerRound - 1) / rowsPerRound;
+                                            llvm::outs() << "[TilingLinalg] WARNING: Input A tile_m(" << tileM_eff
+                                                         << ") * effectiveK(" << dmaK << ") = " << perKRoundData
+                                                         << " exceeds max_buffer_bytes(" << maxBuf
+                                                         << "), splitting into " << pp.numRounds << " rounds\n";
+                                        }
                                     } else if (pt.pattern == 0 && pt.distribution == 1) {
-                                        // Input B: Broadcast+Col — split along tileN cols with effectiveK
-                                        int64_t colsPerRoundRaw = tileN_eff / ppDepth;
-                                        int64_t colsPerRound = colsPerRoundRaw;
-                                        if (colsPerRound * dmaK > maxBuf)
-                                            colsPerRound = maxBuf / dmaK;
-                                        if (colsPerRound <= 0)
-                                            colsPerRound = 1;
-                                        pp.numRounds = tileN_eff / colsPerRound;
-                                        pp.bufferSize = colsPerRound * dmaK;
+                                        // Input B: Broadcast+Col — tileN cols × effectiveK per k-round
+                                        int64_t perKRoundData = tileN_eff * dmaK;
+                                        if (perKRoundData <= maxBuf) {
+                                            pp.bufferSize = perKRoundData;
+                                            pp.numRounds = 1;
+                                        } else {
+                                            int64_t colsPerRound = maxBuf / dmaK;
+                                            if (colsPerRound <= 0)
+                                                colsPerRound = 1;
+                                            pp.bufferSize = colsPerRound * dmaK;
+                                            pp.numRounds = (tileN_eff + colsPerRound - 1) / colsPerRound;
+                                            llvm::outs() << "[TilingLinalg] WARNING: Input B tile_n(" << tileN_eff
+                                                         << ") * effectiveK(" << dmaK << ") = " << perKRoundData
+                                                         << " exceeds max_buffer_bytes(" << maxBuf
+                                                         << "), splitting into " << pp.numRounds << " rounds\n";
+                                        }
                                     } else {
                                         // Other input patterns: default
                                         int64_t totalElements = 1;
                                         for (auto d : pt.shape)
                                             totalElements *= d;
                                         int64_t perTile = totalElements / (tilingMeshRows * tilingMeshCols);
-                                        pp.bufferSize = std::min(perTile / ppDepth, (int64_t)maxBuf);
-                                        if (pp.bufferSize <= 0)
+                                        if (perTile <= maxBuf) {
                                             pp.bufferSize = perTile;
-                                        pp.numRounds = perTile / pp.bufferSize;
+                                            pp.numRounds = 1;
+                                        } else {
+                                            pp.bufferSize = maxBuf;
+                                            pp.numRounds = (perTile + maxBuf - 1) / maxBuf;
+                                        }
                                     }
                                 } else {
                                     // Unresolved policy — use defaults
                                     int64_t totalElements = pt.shape[0] * pt.shape[1] / effectiveMeshRows;
-                                    pp.bufferSize = std::min(totalElements / ppDepth, (int64_t)maxBuf);
-                                    if (pp.bufferSize <= 0)
+                                    if (totalElements <= maxBuf) {
                                         pp.bufferSize = totalElements;
-                                    pp.numRounds = totalElements / pp.bufferSize;
+                                        pp.numRounds = 1;
+                                    } else {
+                                        pp.bufferSize = maxBuf;
+                                        pp.numRounds = (totalElements + maxBuf - 1) / maxBuf;
+                                    }
                                 }
                             } else {
                                 // Output: use tileM * tileN as per-core output
+                                // pp_depth only controls physical buffer count, not data splitting
                                 int64_t outputPerCore = tileM_eff * tileN_eff;
-                                int64_t bufSzOut = outputPerCore / ppDepth;
-                                if (bufSzOut > maxBuf)
-                                    bufSzOut = maxBuf;
-                                if (bufSzOut <= 0)
-                                    bufSzOut = outputPerCore;
-                                pp.numRounds = outputPerCore / bufSzOut;
-                                pp.bufferSize = bufSzOut;
+                                if (outputPerCore <= maxBuf) {
+                                    pp.bufferSize = outputPerCore;
+                                    pp.numRounds = 1;
+                                } else {
+                                    pp.bufferSize = maxBuf;
+                                    pp.numRounds = (outputPerCore + maxBuf - 1) / maxBuf;
+                                }
                             }
                             derivedTilingParams.portParams.push_back(pp);
                         }
@@ -1339,30 +1362,10 @@ public:
                             }
                         }
 
-                        // ---- K-round shape adjustment for input tensors ----
-                        // When effectiveK < K (kRounds > 1), change input tensor shapes
-                        // from {M, K}/{K, N} to {M, effectiveK}/{effectiveK, N} so the
-                        // routing pipeline generates correct per-k-round partition slices
-                        // and BD sizes. The kRounds multiplier is passed as a module
-                        // attribute so downstream passes can multiply BD iterations.
-                        if (derivedTilingParams.kRounds > 1) {
-                            int64_t effK = derivedTilingParams.effectiveK;
-                            for (auto &pt : parsedTensors) {
-                                if (pt.isInput && pt.policyResolved) {
-                                    if (pt.pattern == 0 && pt.distribution == 0) {
-                                        // Input A: {M, K} -> {M, effectiveK}
-                                        pt.shape = {macroDimM, effK};
-                                        llvm::outs() << "[TilingLinalg] K-round: A shape adjusted to {" << macroDimM
-                                                     << "," << effK << "}\n";
-                                    } else if (pt.pattern == 0 && pt.distribution == 1) {
-                                        // Input B: {K, N} -> {effectiveK, N}
-                                        pt.shape = {effK, macroDimN};
-                                        llvm::outs() << "[TilingLinalg] K-round: B shape adjusted to {" << effK << ","
-                                                     << macroDimN << "}\n";
-                                    }
-                                }
-                            }
-                        }
+                        // K-round shape adjustment removed: function args now keep full
+                        // DDR tensor shapes ({M,K}/{K,N}/{M,N}).  K-round slicing is
+                        // handled entirely by module attributes (routing.effective_k,
+                        // routing.full_k, routing.k_rounds) consumed by downstream passes.
                     }
 
                     // ---- Store MeshKernelDesc for multi-kernel support ----

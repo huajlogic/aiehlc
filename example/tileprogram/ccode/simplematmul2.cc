@@ -34,7 +34,7 @@ constexpr aie::SpatialPolicy LtoR_Merge = {
     .tile_n = 64, // 0 = auto (uses tileCols)
     .tile_k = 64  // K chunk size (4 k-rounds for K=256)
 };
-#define DEBUG_OUTPUT_ORDER 0
+#define DEBUG_OUTPUT_ORDER 1
 __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<input_window_int8 *, ColBB> win_b,
                        aie::port<output_window_int8 *, LtoR_Merge> win_c) {
 

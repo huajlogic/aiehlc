@@ -696,6 +696,13 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         // No separate alloc needed — partition subview is the correct size.
         int64_t perTileShimLen = shimBdLen;
 
+        // K-round note: do NOT divide perTileShimLen by kRounds here.
+        // The shim BD len must equal the full partition size (e.g. 64*256=16384).
+        // The 3D dim_strides/dim_wraps (set by DmaphopTodfscheblueprintPass)
+        // already describe the per-K-round strided access pattern within DDR.
+        // iter_step/iter_wrap (set below at line ~921) handles K-round
+        // repetition by advancing the DDR base address between rounds.
+
         // Single shim BD: sends/receives full data from DDR
         // Allocate BD ID from ResourceMgr to avoid conflicts when a SHIM tile
         // is used by both MM2S and S2MM (e.g. input + output on same SHIM).
@@ -744,15 +751,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         if (isManyToOne)
             ooPerCoreElements = ooFullPartitionElements / numCoreTiles;
 
-        // Read pp_depth from core FlowConfigOp to determine shim iteration parameters.
-        int shimPpDepth = static_cast<int>(1.0 / bufferRatio + 0.5); // default from bufferRatio
-        if (coreFlowConfig.getPpDepth())
-            shimPpDepth = static_cast<int>(*coreFlowConfig.getPpDepth());
-        if (shimPpDepth <= 0)
-            shimPpDepth = 2;
-        double shimEffectiveBufferRatio = 1.0 / shimPpDepth;
-
-        int64_t ooPingPongSize = static_cast<int64_t>(ooPerCoreElements * shimEffectiveBufferRatio);
+        // pp_depth controls physical ping-pong buffer count, NOT data splitting.
+        // OOO shim buffer size = full per-core data, clamped only by maxPingPongBytes.
+        int64_t ooPingPongSize = ooPerCoreElements;
         if (ooPingPongSize <= 0)
             ooPingPongSize = 1;
         if (maxPingPongBytes > 0 && ooElementSizeBytes > 0) {
@@ -807,8 +808,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             }
             int64_t rowsPerRound = (ooNumIterations > 1) ? perTileD1Rows / ooNumIterations : perTileD1Rows;
 
-            int32_t oooIterStepSize = (int32_t)(rowsPerRound * ddrRowStride);
+            // When iter_wrap <= 1 (no repetition), set iter_step_size to 0
+            // since the step is meaningless with a single pass.
             int32_t oooIterWrap = (int32_t)ooNumIterations;
+            int32_t oooIterStepSize = (oooIterWrap > 1) ? (int32_t)(rowsPerRound * ddrRowStride) : 0;
 
             // Build per-tile addressing from shimDimStrides D0 and D1 only.
             // D1 wrap is adjusted to rows_per_round (per-round scope, not full partition).
@@ -1068,17 +1071,37 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             int64_t perCoreElements = fullPartitionElements;
             if (transferType == "many_to_one")
                 perCoreElements = fullPartitionElements / numCoreTiles;
+            // K-round adjustment: for input flows with kRounds > 1, the kernel
+            // operates on per-k-round data (tile_rows * effectiveK), not the
+            // full partition (tile_rows * fullK). We must divide perCoreElements
+            // by kRounds so that pingPongBufferSize matches the kernel's
+            // buf_sz_a/b (= rowsPerRound * effectiveK). The numIterations
+            // multiplication by kRounds (below) then correctly recovers the
+            // total number of DMA rounds across all k-rounds.
+            int64_t perCorePerKRound = perCoreElements;
+            if (isInput) {
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
+                        int64_t kRounds = kRoundsAttr.getInt();
+                        if (kRounds > 1) {
+                            perCorePerKRound = perCoreElements / kRounds;
+                        }
+                    }
+                }
+            }
 
             // Read pp_depth from FlowConfigOp attribute (set by dmaphop→blueprint pass).
-            // Default: derive from bufferRatio for backward compatibility.
+            // pp_depth controls physical ping-pong buffer count (for DMA/compute
+            // overlap), NOT data splitting.  Buffer size = full per-k-round data,
+            // clamped only by maxPingPongBytes when the data exceeds tile memory.
             int ppDepth = static_cast<int>(1.0 / bufferRatio + 0.5); // e.g. bufferRatio=0.5 → ppDepth=2
             if (coreFlowConfig.getPpDepth())
                 ppDepth = static_cast<int>(*coreFlowConfig.getPpDepth());
             if (ppDepth <= 0)
                 ppDepth = 2;
 
-            double effectiveBufferRatio = 1.0 / ppDepth;
-            int64_t pingPongBufferSize = static_cast<int64_t>(perCoreElements * effectiveBufferRatio);
+            int64_t pingPongBufferSize = perCorePerKRound;
             if (pingPongBufferSize <= 0)
                 pingPongBufferSize = 1;
             // Clamp to maxPingPongBytes to prevent exceeding core tile memory
@@ -1087,9 +1110,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 if (maxElements > 0 && pingPongBufferSize > maxElements)
                     pingPongBufferSize = maxElements;
             }
-            // numIterations uses perCoreElements because each core only
-            // processes its own share of data.
-            int64_t numIterations = (perCoreElements + pingPongBufferSize - 1) / pingPongBufferSize;
+            // numIterations: use perCorePerKRound (per-k-round data) so that
+            // base iterations count one k-round. The kRounds multiplier below
+            // then scales to the total across all k-rounds.
+            int64_t numIterations = (perCorePerKRound + pingPongBufferSize - 1) / pingPongBufferSize;
 
             // K-round multiplication: when effectiveK < K, the kernel runs
             // kRounds iterations, each consuming numIterations DMA rounds.
@@ -1233,13 +1257,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 pongName = "buf_out_pong_" + std::to_string(dirIdx);
                             }
                             // Ensure buffer size is int32-aligned for DMA.
-                            // Use fullPartitionElements * effectiveBufferRatio (before numCoreTiles division)
-                            // because the kernel uses a single global BUF_SZ for ALL windows,
-                            // determined by the largest flow (input one_to_many).  Output buffers
-                            // (many_to_one) need the same allocation size even though they transfer
-                            // fewer elements per core.
-                            int64_t kernelBufElements =
-                                static_cast<int64_t>(fullPartitionElements * effectiveBufferRatio);
+                            // Use perCorePerKRound (per-k-round data for one core) as the
+                            // allocation size.  The kernel uses a single global BUF_SZ for
+                            // ALL windows, determined by the largest flow (input one_to_many).
+                            // Output buffers (many_to_one) need the same allocation size
+                            // even though they transfer fewer elements per core.
+                            int64_t kernelBufElements = perCorePerKRound;
                             // Clamp kernelBufElements to maxPingPongBytes (same as pingPongBufferSize clamping)
                             if (maxPingPongBytes > 0 && elementSizeBytes > 0) {
                                 int64_t maxElements = maxPingPongBytes / elementSizeBytes;
@@ -1479,8 +1502,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
 
             // Create dfschedule.schedule.start_io for shim
-            // For OOO, repeat = numCoreTiles * numPingPong (total source transactions)
-            int32_t repeatCount = useOOO ? (int32_t)(numCoreTiles * 2) : 1;
+            // For OOO, repeat = numCoreTiles * ooNumIterations (total source transactions).
+            // Each core sends ooNumIterations BD transactions; the SHIM must receive
+            // all of them before the flow is complete.
+            int32_t repeatCount = useOOO ? (int32_t)(numCoreTiles * ooNumIterations) : 1;
             auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
                 loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(), getBdIdOp.getBdId(),
                 rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(repeatCount));

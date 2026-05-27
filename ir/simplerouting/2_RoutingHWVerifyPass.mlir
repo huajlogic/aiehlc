@@ -1,4 +1,4 @@
-module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}} {
+module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.effective_k = 64 : i64, routing.full_k = 256 : i64, routing.k_rounds = 4 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 1 : i32}} {
   func.func @routing(%arg0: !emitc.ptr<!emitc.opaque<"XAie_DevInst">>, %arg1: memref<256x256xi8>, %arg2: memref<256x256xi8>, %arg3: memref<256x256xi8>) {
     %c3_i32 = arith.constant 3 : i32
     %c2_i32 = arith.constant 2 : i32
@@ -14,7 +14,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %8 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 4 : i32} -> i32
         %9 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 5 : i32} -> i32
         %10 = routinghw.tilecreate {col = 0 : i32, comments = "core_tile", row = 6 : i32} -> i32
-        %11 = routinghw.ioshimtilecreate {IOID = 37 : i32, channelused = 0 : i32, col = 0 : i32, comments = "shim_dma_37", dmadirection = 0 : i32, row = 0 : i32} -> i32
+        %11 = routinghw.ioshimtilecreate {IOID = 13 : i32, channelused = 0 : i32, col = 0 : i32, comments = "shim_dma_13", dmadirection = 0 : i32, row = 0 : i32} -> i32
         %12 = routinghw.tilecreate {col = 0 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %13 = routinghw.tilecreate {col = 0 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %14 = routinghw.tilecreate {col = 0 : i32, comments = "tile in path", row = 2 : i32} -> i32
@@ -37,7 +37,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %8 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 4 : i32} -> i32
         %9 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 5 : i32} -> i32
         %10 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 6 : i32} -> i32
-        %11 = routinghw.ioshimtilecreate {IOID = 38 : i32, channelused = 0 : i32, col = 1 : i32, comments = "shim_dma_38", dmadirection = 0 : i32, row = 0 : i32} -> i32
+        %11 = routinghw.ioshimtilecreate {IOID = 14 : i32, channelused = 0 : i32, col = 1 : i32, comments = "shim_dma_14", dmadirection = 0 : i32, row = 0 : i32} -> i32
         %12 = routinghw.tilecreate {col = 1 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %13 = routinghw.tilecreate {col = 1 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %14 = routinghw.tilecreate {col = 1 : i32, comments = "tile in path", row = 2 : i32} -> i32
@@ -60,7 +60,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %8 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 4 : i32} -> i32
         %9 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 5 : i32} -> i32
         %10 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 6 : i32} -> i32
-        %11 = routinghw.ioshimtilecreate {IOID = 39 : i32, channelused = 0 : i32, col = 2 : i32, comments = "shim_dma_39", dmadirection = 0 : i32, row = 0 : i32} -> i32
+        %11 = routinghw.ioshimtilecreate {IOID = 15 : i32, channelused = 0 : i32, col = 2 : i32, comments = "shim_dma_15", dmadirection = 0 : i32, row = 0 : i32} -> i32
         %12 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %13 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %14 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 2 : i32} -> i32
@@ -83,7 +83,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %8 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 4 : i32} -> i32
         %9 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 5 : i32} -> i32
         %10 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 6 : i32} -> i32
-        %11 = routinghw.ioshimtilecreate {IOID = 40 : i32, channelused = 0 : i32, col = 3 : i32, comments = "shim_dma_40", dmadirection = 0 : i32, row = 0 : i32} -> i32
+        %11 = routinghw.ioshimtilecreate {IOID = 16 : i32, channelused = 0 : i32, col = 3 : i32, comments = "shim_dma_16", dmadirection = 0 : i32, row = 0 : i32} -> i32
         %12 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %13 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %14 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 2 : i32} -> i32
@@ -109,7 +109,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %8 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 3 : i32} -> i32
         %9 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 3 : i32} -> i32
         %10 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 3 : i32} -> i32
-        %11 = routinghw.ioshimtilecreate {IOID = 41 : i32, channelused = 1 : i32, col = 0 : i32, comments = "shim_dma_41", dmadirection = 0 : i32, row = 0 : i32} -> i32
+        %11 = routinghw.ioshimtilecreate {IOID = 17 : i32, channelused = 1 : i32, col = 0 : i32, comments = "shim_dma_17", dmadirection = 0 : i32, row = 0 : i32} -> i32
         %12 = routinghw.tilecreate {col = 0 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %13 = routinghw.tilecreate {col = 0 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %14 = routinghw.tilecreate {col = 0 : i32, comments = "tile in path", row = 2 : i32} -> i32
@@ -128,7 +128,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %27 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 3 : i32} -> i32
         %28 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 3 : i32} -> i32
         %29 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 3 : i32} -> i32
-        %30 = routinghw.ioshimtilecreate {IOID = 42 : i32, channelused = 0 : i32, col = 3 : i32, comments = "shim_dma_42", dmadirection = 1 : i32, row = 0 : i32} -> i32
+        %30 = routinghw.ioshimtilecreate {IOID = 18 : i32, channelused = 0 : i32, col = 3 : i32, comments = "shim_dma_18", dmadirection = 1 : i32, row = 0 : i32} -> i32
         %31 = routinghw.connectpktstreamswitchport %26 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 1 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
         %32 = routinghw.connectpktstreamswitchport %27 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 2 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "WEST", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 1 : i32} -> i32
         %33 = routinghw.connectpktstreamswitchport %28 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 3 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "WEST", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 1 : i32} -> i32
@@ -149,7 +149,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %8 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 4 : i32} -> i32
         %9 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 4 : i32} -> i32
         %10 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 4 : i32} -> i32
-        %11 = routinghw.ioshimtilecreate {IOID = 43 : i32, channelused = 1 : i32, col = 1 : i32, comments = "shim_dma_43", dmadirection = 0 : i32, row = 0 : i32} -> i32
+        %11 = routinghw.ioshimtilecreate {IOID = 19 : i32, channelused = 1 : i32, col = 1 : i32, comments = "shim_dma_19", dmadirection = 0 : i32, row = 0 : i32} -> i32
         %12 = routinghw.tilecreate {col = 1 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %13 = routinghw.tilecreate {col = 1 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %14 = routinghw.tilecreate {col = 1 : i32, comments = "tile in path", row = 2 : i32} -> i32
@@ -172,7 +172,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %31 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 4 : i32} -> i32
         %32 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 4 : i32} -> i32
         %33 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 4 : i32} -> i32
-        %34 = routinghw.ioshimtilecreate {IOID = 44 : i32, channelused = 1 : i32, col = 3 : i32, comments = "shim_dma_44", dmadirection = 1 : i32, row = 0 : i32} -> i32
+        %34 = routinghw.ioshimtilecreate {IOID = 20 : i32, channelused = 1 : i32, col = 3 : i32, comments = "shim_dma_20", dmadirection = 1 : i32, row = 0 : i32} -> i32
         %35 = routinghw.connectpktstreamswitchport %30 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 0 : i32, localdmadirection = "DMA", localdmapktid = 5 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
         %36 = routinghw.connectpktstreamswitchport %31 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 6 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "WEST", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
         %37 = routinghw.connectpktstreamswitchport %32 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 7 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "WEST", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 1 : i32} -> i32
@@ -195,7 +195,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %8 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 5 : i32} -> i32
         %9 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 5 : i32} -> i32
         %10 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 5 : i32} -> i32
-        %11 = routinghw.ioshimtilecreate {IOID = 45 : i32, channelused = 1 : i32, col = 2 : i32, comments = "shim_dma_45", dmadirection = 0 : i32, row = 0 : i32} -> i32
+        %11 = routinghw.ioshimtilecreate {IOID = 21 : i32, channelused = 1 : i32, col = 2 : i32, comments = "shim_dma_21", dmadirection = 0 : i32, row = 0 : i32} -> i32
         %12 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %13 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %14 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 2 : i32} -> i32
@@ -222,7 +222,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %35 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 5 : i32} -> i32
         %36 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 5 : i32} -> i32
         %37 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 5 : i32} -> i32
-        %38 = routinghw.ioshimtilecreate {IOID = 46 : i32, channelused = 0 : i32, col = 2 : i32, comments = "shim_dma_46", dmadirection = 1 : i32, row = 0 : i32} -> i32
+        %38 = routinghw.ioshimtilecreate {IOID = 22 : i32, channelused = 0 : i32, col = 2 : i32, comments = "shim_dma_22", dmadirection = 1 : i32, row = 0 : i32} -> i32
         %39 = routinghw.connectpktstreamswitchport %34 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 9 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
         %40 = routinghw.connectpktstreamswitchport %35 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 10 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "WEST", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 1 : i32} -> i32
         %41 = routinghw.connectpktstreamswitchport %36 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 11 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "WEST", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 1 : i32} -> i32
@@ -249,7 +249,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %8 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 6 : i32} -> i32
         %9 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 6 : i32} -> i32
         %10 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 6 : i32} -> i32
-        %11 = routinghw.ioshimtilecreate {IOID = 47 : i32, channelused = 1 : i32, col = 3 : i32, comments = "shim_dma_47", dmadirection = 0 : i32, row = 0 : i32} -> i32
+        %11 = routinghw.ioshimtilecreate {IOID = 23 : i32, channelused = 1 : i32, col = 3 : i32, comments = "shim_dma_23", dmadirection = 0 : i32, row = 0 : i32} -> i32
         %12 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %13 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %14 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 2 : i32} -> i32
@@ -280,7 +280,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %39 = routinghw.tilecreate {col = 1 : i32, comments = "core_tile", row = 6 : i32} -> i32
         %40 = routinghw.tilecreate {col = 2 : i32, comments = "core_tile", row = 6 : i32} -> i32
         %41 = routinghw.tilecreate {col = 3 : i32, comments = "core_tile", row = 6 : i32} -> i32
-        %42 = routinghw.ioshimtilecreate {IOID = 48 : i32, channelused = 1 : i32, col = 2 : i32, comments = "shim_dma_48", dmadirection = 1 : i32, row = 0 : i32} -> i32
+        %42 = routinghw.ioshimtilecreate {IOID = 24 : i32, channelused = 1 : i32, col = 2 : i32, comments = "shim_dma_24", dmadirection = 1 : i32, row = 0 : i32} -> i32
         %43 = routinghw.connectpktstreamswitchport %38 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 13 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
         %44 = routinghw.connectpktstreamswitchport %39 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 14 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "WEST", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 1 : i32} -> i32
         %45 = routinghw.connectpktstreamswitchport %40 : i32 {forwardmasterdirection = "EAST", forwardmasterportidx = 1 : i32, localdmadirection = "DMA", localdmapktid = 15 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "WEST", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 1 : i32} -> i32

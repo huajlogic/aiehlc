@@ -810,16 +810,26 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 if (transferType == "many_to_one")
                     perCoreSize = partitionSize / numCoreTiles;
 
-                // Read pp_depth from FlowConfigOp attribute if available.
-                // Default: derive from bufferRatio for backward compatibility.
-                int ppDepth = static_cast<int>(1.0 / bufferRatio + 0.5);
-                if (coreFlowConfig.getPpDepth())
-                    ppDepth = static_cast<int>(*coreFlowConfig.getPpDepth());
-                if (ppDepth <= 0)
-                    ppDepth = 2;
-                double effectiveBufRatio = 1.0 / ppDepth;
+                // K-round adjustment: for input flows, use per-k-round data
+                // size so pingPongBufSize matches the kernel's buf_sz (which
+                // is computed from effectiveK, not fullK).
+                int64_t perCoreSizeForBuf = perCoreSize;
+                if (paramInfo.isInput) {
+                    auto moduleOp = declareDataOp->getParentOfType<ModuleOp>();
+                    if (moduleOp) {
+                        if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
+                            int64_t kRounds = kRoundsAttr.getInt();
+                            if (kRounds > 1) {
+                                perCoreSizeForBuf = perCoreSize / kRounds;
+                            }
+                        }
+                    }
+                }
 
-                int64_t pingPongBufSize = static_cast<int64_t>(perCoreSize * effectiveBufRatio);
+                // pp_depth controls physical ping-pong buffer count (for DMA/compute
+                // overlap), NOT data splitting.  Buffer size = full per-k-round data,
+                // clamped only by maxPingPongBytes when the data exceeds tile memory.
+                int64_t pingPongBufSize = perCoreSizeForBuf;
                 if (pingPongBufSize <= 0)
                     pingPongBufSize = 1;
                 // Clamp to maxPingPongBytes to prevent exceeding core tile memory
@@ -836,9 +846,10 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 paramInfo.bufferSize = pingPongBufSize / defaultVectorWidth;
                 if (paramInfo.bufferSize <= 0)
                     paramInfo.bufferSize = 1;
-                // numRounds = total rounds = perCoreSize / pingPongBufSize = ppDepth
+                // numRounds = rounds per k-round = perCoreSizeForBuf / pingPongBufSize
+                // The kRounds multiplier below scales to total across all k-rounds.
                 paramInfo.numRounds =
-                    (pingPongBufSize > 0) ? static_cast<int32_t>(perCoreSize / pingPongBufSize) : ppDepth;
+                    (pingPongBufSize > 0) ? static_cast<int32_t>(perCoreSizeForBuf / pingPongBufSize) : 1;
 
                 // K-round multiplication: when effectiveK < K, the kernel runs
                 // kRounds iterations. window_init numRounds must cover the total
