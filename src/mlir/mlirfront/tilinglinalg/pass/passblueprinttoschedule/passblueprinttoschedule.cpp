@@ -1123,6 +1123,22 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             // then scales to the total across all k-rounds.
             int64_t numIterations = (perCorePerKRound + pingPongBufferSize - 1) / pingPongBufferSize;
 
+            // Validate: pp_depth=1 requires numIterations==1.
+            // With single-buffer mode (no BD chaining, no next_bd cycling),
+            // the DMA fires exactly once. If the kernel needs multiple
+            // rounds (numIterations > 1), the DMA cannot re-arm and the
+            // kernel will deadlock on the second acquire_window call.
+            if (ppDepth == 1 && numIterations > 1) {
+                op.emitError("pp_depth=1 (single buffer) incompatible with "
+                             "numIterations=")
+                    << numIterations << " (buffer_size=" << pingPongBufferSize
+                    << " < perCorePerKRound=" << perCorePerKRound
+                    << "). Single-buffer DMA cannot re-arm for multiple rounds. "
+                       "Set pp_depth>=2 to enable ping-pong BD chaining, or "
+                       "increase max_buffer_bytes to fit the full per-k-round data.";
+                return failure();
+            }
+
             // K-round multiplication: when effectiveK < K, the kernel runs
             // kRounds iterations, each consuming numIterations DMA rounds.
             // The host must send numIterations * kRounds total BD iterations

@@ -1,4 +1,4 @@
-module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.effective_k = 64 : i64, routing.full_k = 256 : i64, routing.k_rounds = 4 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 1 : i32}} {
+module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.effective_k = 64 : i64, routing.full_k = 512 : i64, routing.k_rounds = 8 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}} {
   func.func @routing(%arg0: !emitc.ptr<!emitc.opaque<"XAie_DevInst">>) {
     %0 = "emitc.constant"() <{value = true}> : () -> i1
     emitc.verbatim "\0A//round is 0 hw split in : col -----------"

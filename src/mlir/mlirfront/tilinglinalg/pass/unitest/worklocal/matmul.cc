@@ -5,13 +5,13 @@
 void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_int8 *win_c) {
 
     // Compiler-resolved tiling parameters
-    const int tile_rows = 64;
-    const int tile_cols = 64;
+    const int tile_rows = 128;
+    const int tile_cols = 128;
     const int eff_k = 64;       // K chunk size per k-round
-    const int k_rounds = 4;     // number of K-accumulation rounds
-    const int num_a_rounds = 1; // DMA rounds per k-round for A
-    const int num_b_rounds = 1; // DMA rounds per k-round for B
-    const int num_c_rounds = 1;
+    const int k_rounds = 8;     // number of K-accumulation rounds
+    const int num_a_rounds = 2; // DMA rounds per k-round for A
+    const int num_b_rounds = 2; // DMA rounds per k-round for B
+    const int num_c_rounds = 4;
     const int buf_sz_a = 4096;
     const int buf_sz_b = 4096;
     const int buf_sz_c = 4096;

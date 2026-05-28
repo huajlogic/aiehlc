@@ -11,28 +11,28 @@ constexpr aie::SpatialPolicy RowBA = {
     .distribution = aie::Layout::Row,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
-    .tile_m = 64, // explicit sub-tile rows
-    .tile_n = 64, // 0 = auto (uses tileCols)
-    .tile_k = 64  // K chunk size (4 k-rounds for K=256)
+    .tile_m = 128, // explicit sub-tile rows
+    .tile_n = 128, // 0 = auto (uses tileCols)
+    .tile_k = 64   // K chunk size (4 k-rounds for K=256)
 };
 constexpr aie::SpatialPolicy ColBB = {
     .pattern = aie::Pattern::Broadcast,
     .distribution = aie::Layout::Col,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
-    .tile_m = 64, // explicit sub-tile rows
-    .tile_n = 64, // 0 = auto (uses tileCols)
-    .tile_k = 64  // K chunk size (4 k-rounds for K=256)
+    .tile_m = 128, // explicit sub-tile rows
+    .tile_n = 128, // 0 = auto (uses tileCols)
+    .tile_k = 64   // K chunk size (4 k-rounds for K=256)
 };
 constexpr aie::SpatialPolicy LtoR_Merge = {
     .pattern = aie::Pattern::Gather,
     .distribution = aie::Layout::Row,
     .merge_order = aie::Flow::LeftToRight,
-    .pp_depth = 1,
+    .pp_depth = 2,
     .max_buffer_bytes = 4096,
-    .tile_m = 64, // explicit sub-tile rows
-    .tile_n = 64, // 0 = auto (uses tileCols)
-    .tile_k = 64  // K chunk size (4 k-rounds for K=256)
+    .tile_m = 128, // explicit sub-tile rows
+    .tile_n = 128, // 0 = auto (uses tileCols)
+    .tile_k = 64   // K chunk size (4 k-rounds for K=256)
 };
 #define DEBUG_OUTPUT_ORDER 1
 __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<input_window_int8 *, ColBB> win_b,

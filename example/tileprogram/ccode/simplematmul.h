@@ -64,9 +64,9 @@
 #include <stdlib.h>
 
 // GEMM dimensions (user-specified)
-#define M 256
-#define K 256
-#define N 256
+#define M 512
+#define K 512
+#define N 512
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4

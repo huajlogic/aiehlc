@@ -403,6 +403,65 @@ def parse_host_cc(text: str) -> List[SSAOp]:
             ))
             continue
 
+        # --- __Runtime_dma_bd_config_multidim_ooo (22-arg: DevInst, tile, buf, bd_id, len, next_bd,
+        #     enable_packet, packet_id, acq_lock_id, acq_lock_val, rel_lock_id, rel_lock_val, ooo_bd_id,
+        #     num_dims, d0_stride, d0_wrap, d1_stride, d1_wrap, d2_stride, d2_wrap,
+        #     iter_step_size, iter_wrap) ---
+        m = re.search(
+            r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config_multidim_ooo\("
+            r"(\w+),\s*(\w+),\s*(\w+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
+            r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
+            r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
+            r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
+            r"\s*(-?\d+),\s*(-?\d+)\)",
+            stripped,
+        )
+        if m:
+            buf_var = m.group(4)
+            source_pt = buf_arg_map.get(buf_var, buf_var)
+            next_bd = m.group(7)
+            if int(next_bd) < 0 or int(next_bd) > 65535:
+                next_bd = "none"
+            ooo_bd_id = m.group(14)
+            if int(ooo_bd_id) < 0:
+                ooo_bd_id = "none"
+            num_dims = int(m.group(15))
+            # Collect dimension strides/wraps based on num_dims
+            dim_strides = [m.group(16)]
+            dim_wraps = [m.group(17)]
+            if num_dims >= 2:
+                dim_strides.append(m.group(18))
+                dim_wraps.append(m.group(19))
+            if num_dims >= 3:
+                dim_strides.append(m.group(20))
+                dim_wraps.append(m.group(21))
+            iter_step = m.group(22)
+            iter_wrap = m.group(23)
+            bd_attrs = {
+                "bd_id": m.group(5),
+                "len": m.group(6), "next_bd": next_bd,
+                "enable_packet": "true" if int(m.group(8)) else "false",
+                "packet_id": m.group(9),
+                "acquire_lock_id": m.group(10),
+                "acquire_lock_val": m.group(11),
+                "release_lock_id": m.group(12),
+                "release_lock_val": m.group(13),
+                "ooo_bd_id": ooo_bd_id,
+                "multidim": "true",
+                "num_dims": str(num_dims),
+                "dim_strides": ",".join(dim_strides),
+                "dim_wraps": ",".join(dim_wraps),
+                "iter_step": iter_step,
+                "iter_wrap": iter_wrap,
+            }
+            ops.append(SSAOp(
+                result=m.group(1), op_type="config.dma_bd",
+                operands=[buf_var, m.group(3)],
+                attrs=bd_attrs,
+                result_type="XAie_DmaDesc", raw=stripped, line_num=lno,
+            ))
+            continue
+
         # --- __Runtime_dma_bd_config (13-arg: DevInst, tile, buf, bd_id, len, next_bd, enable_packet, packet_id, acq_lock_id, acq_lock_val, rel_lock_id, rel_lock_val, ooo_bd_id) ---
         m = re.search(
             r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config\("
@@ -497,16 +556,23 @@ def parse_host_cc(text: str) -> List[SSAOp]:
                     )
             continue
 
-        # --- __Runtime_startio ---
+        # --- __Runtime_startio (4-arg: DevInst, io, bd_id, repeat_count) ---
         m = re.search(
-            r"ioevent\s+(\w+)\s*=\s*__Runtime_startio\((\w+),\s*(\d+)\)",
+            r"ioevent\s+(\w+)\s*=\s*__Runtime_startio\(\w+,\s*(\w+),\s*(-?\d+),\s*(-?\d+)\)",
             stripped,
         )
+        if not m:
+            # Fallback: 2-arg legacy format (io, bd_id)
+            m = re.search(
+                r"ioevent\s+(\w+)\s*=\s*__Runtime_startio\((\w+),\s*(\d+)\)",
+                stripped,
+            )
         if m:
+            repeat = m.group(4) if m.lastindex >= 4 else "1"
             ops.append(SSAOp(
                 result=m.group(1), op_type="start_io",
                 operands=[m.group(2)],
-                attrs={"bd_id": m.group(3)},
+                attrs={"bd_id": m.group(3), "repeat_count": repeat},
                 result_type="ioevent", raw=stripped, line_num=lno,
             ))
             continue
@@ -1058,6 +1124,13 @@ def _build_subtree(
             detail += f" acq_lock={acq_lk}({acq_val}) rel_lock={rel_lk}({rel_val})"
         if linked_bd_src:
             detail += f" linked_bd=%{linked_bd_src}"
+        if op.attrs.get("multidim") == "true":
+            nd = op.attrs.get("num_dims", "?")
+            ds = op.attrs.get("dim_strides", "?")
+            dw = op.attrs.get("dim_wraps", "?")
+            it_s = op.attrs.get("iter_step", "?")
+            it_w = op.attrs.get("iter_wrap", "?")
+            detail += f" [{nd}D strides=[{ds}] wraps=[{dw}] iter={it_s}/{it_w}]"
     elif "ooo_enable" in op.op_type:
         node_type = "other"
         tile = _resolve_tile(op.operands[0], def_map) if op.operands else "?"
@@ -1082,8 +1155,9 @@ def _build_subtree(
     elif "start_io" in op.op_type:
         node_type = "start_io"
         fi = op.attrs.get("flow_index", op.attrs.get("bd_id", "?"))
+        rc = op.attrs.get("repeat_count", "1")
         label = f"start_io {op.result}"
-        detail = f"target_bd={fi}"
+        detail = f"target_bd={fi} repeat={rc}"
     elif "launch_kernel_group" in op.op_type:
         node_type = "kernel"
         label = f"launch_kernel_group {op.result}"

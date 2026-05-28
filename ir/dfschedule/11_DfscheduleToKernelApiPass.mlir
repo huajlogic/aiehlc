@@ -1,4 +1,4 @@
-module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.effective_k = 64 : i64, routing.full_k = 256 : i64, routing.k_rounds = 4 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 1 : i32}} {
+module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.effective_k = 64 : i64, routing.full_k = 512 : i64, routing.k_rounds = 8 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}} {
   emitc.verbatim "#include <stdint.h>"
   emitc.verbatim "#include <adf.h>"
   emitc.verbatim "#include <aie_api/aie.hpp>"
@@ -39,11 +39,11 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     emitc.verbatim "// sync_buffer_write"
     emitc.verbatim "// log(...)"
     emitc.verbatim "window_internal window_window_in_0[1];"
-    emitc.verbatim "window_init(window_window_in_0, 1, buf_in_ping_0, LOCK_window_in_0_ACQ, buf_in_pong_0, LOCK_window_in_0_REL, 1024, 4);"
+    emitc.verbatim "window_init(window_window_in_0, 1, buf_in_ping_0, LOCK_window_in_0_ACQ, buf_in_pong_0, LOCK_window_in_0_REL, 1024, 16);"
     emitc.verbatim "window_internal window_window_in_1[1];"
-    emitc.verbatim "window_init(window_window_in_1, 1, buf_in_ping_1, LOCK_window_in_1_ACQ, buf_in_pong_1, LOCK_window_in_1_REL, 1024, 4);"
+    emitc.verbatim "window_init(window_window_in_1, 1, buf_in_ping_1, LOCK_window_in_1_ACQ, buf_in_pong_1, LOCK_window_in_1_REL, 1024, 16);"
     emitc.verbatim "window_internal window_window_out_0[1];"
-    emitc.verbatim "window_init(window_window_out_0, 1, buf_out_ping_0, LOCK_window_out_0_ACQ, buf_out_pong_0, LOCK_window_out_0_REL, 1024, 1);"
+    emitc.verbatim "window_init(window_window_out_0, 1, buf_out_ping_0, LOCK_window_out_0_ACQ, buf_out_pong_0, LOCK_window_out_0_REL, 1024, 4);"
     emitc.verbatim "// kernel_invoke matmul"
     emitc.verbatim "matmul(get_input_async_window_int8(window_window_in_0), get_input_async_window_int8(window_window_in_1), get_output_async_window_int8(window_window_out_0));"
     emitc.verbatim "done();"
