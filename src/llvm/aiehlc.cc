@@ -1991,6 +1991,8 @@ public:
                     ret += "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
                     ret += "constexpr int get_tile_rows() { return 0; }\n";
                     ret += "constexpr int get_tile_cols() { return 0; }\n";
+                    ret += "constexpr int get_data_row() { return 0; }\n";
+                    ret += "constexpr int get_data_col() { return 0; }\n";
                     ret += "constexpr int get_k_dim() { return 0; }\n";
                     ret += "constexpr int get_tile_m() { return 0; }\n";
                     ret += "constexpr int get_tile_n() { return 0; }\n";
@@ -2196,9 +2198,15 @@ public:
                                         attrBuilder.getI64IntegerAttr(mkd.derivedParams.effectiveK));
                         module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kRounds));
                         module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kDim));
+                        module->setAttr("routing.tile_m", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileM));
+                        module->setAttr("routing.tile_rows", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileRows));
+                        module->setAttr("routing.m_rounds",
+                                        attrBuilder.getI64IntegerAttr(mkd.derivedParams.spatialMRounds));
                         llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
                                      << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
-                                     << " full_k=" << mkd.derivedParams.kDim << "\n";
+                                     << " full_k=" << mkd.derivedParams.kDim << " tile_m=" << mkd.derivedParams.tileM
+                                     << " tile_rows=" << mkd.derivedParams.tileRows
+                                     << " m_rounds=" << mkd.derivedParams.spatialMRounds << "\n";
                     }
 
                     // Replace aie::get_*() calls in kernel body with computed integer literals
@@ -2252,8 +2260,14 @@ public:
                                 pos += replacement.size();
                             }
                         };
-                        replaceSimpleCall("aie::get_tile_rows()", mkd.derivedParams.tileRows);
-                        replaceSimpleCall("aie::get_tile_cols()", mkd.derivedParams.tileCols);
+                        replaceSimpleCall("aie::get_tile_rows()", mkd.derivedParams.tileM > 0
+                                                                      ? mkd.derivedParams.tileM
+                                                                      : mkd.derivedParams.tileRows);
+                        replaceSimpleCall("aie::get_tile_cols()", mkd.derivedParams.tileN > 0
+                                                                      ? mkd.derivedParams.tileN
+                                                                      : mkd.derivedParams.tileCols);
+                        replaceSimpleCall("aie::get_data_row()", mkd.derivedParams.tileRows);
+                        replaceSimpleCall("aie::get_data_col()", mkd.derivedParams.tileCols);
                         replaceSimpleCall("aie::get_k_dim()", mkd.derivedParams.kDim);
                         // Two-level tiling query functions
                         replaceSimpleCall("aie::get_tile_m()", mkd.derivedParams.tileM > 0
@@ -2332,6 +2346,8 @@ public:
                     stream << "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
                     stream << "constexpr int get_tile_rows() { return 0; }\n";
                     stream << "constexpr int get_tile_cols() { return 0; }\n";
+                    stream << "constexpr int get_data_row() { return 0; }\n";
+                    stream << "constexpr int get_data_col() { return 0; }\n";
                     stream << "constexpr int get_k_dim() { return 0; }\n";
                     stream << "constexpr int get_tile_m() { return 0; }\n";
                     stream << "constexpr int get_tile_n() { return 0; }\n";
@@ -2505,9 +2521,15 @@ public:
                                     attrBuilder.getI64IntegerAttr(derivedTilingParams.effectiveK));
                     module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(derivedTilingParams.kRounds));
                     module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(derivedTilingParams.kDim));
+                    module->setAttr("routing.tile_m", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileM));
+                    module->setAttr("routing.tile_rows", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileRows));
+                    module->setAttr("routing.m_rounds",
+                                    attrBuilder.getI64IntegerAttr(derivedTilingParams.spatialMRounds));
                     llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
                                  << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds
-                                 << " full_k=" << derivedTilingParams.kDim << "\n";
+                                 << " full_k=" << derivedTilingParams.kDim << " tile_m=" << derivedTilingParams.tileM
+                                 << " tile_rows=" << derivedTilingParams.tileRows
+                                 << " m_rounds=" << derivedTilingParams.spatialMRounds << "\n";
                 }
 
                 // Replace aie::get_*() calls in kernel body with computed integer literals
@@ -2556,8 +2578,14 @@ public:
                             pos += replacement.size();
                         }
                     };
-                    replaceSimpleCall("aie::get_tile_rows()", derivedTilingParams.tileRows);
-                    replaceSimpleCall("aie::get_tile_cols()", derivedTilingParams.tileCols);
+                    replaceSimpleCall("aie::get_tile_rows()", derivedTilingParams.tileM > 0
+                                                                  ? derivedTilingParams.tileM
+                                                                  : derivedTilingParams.tileRows);
+                    replaceSimpleCall("aie::get_tile_cols()", derivedTilingParams.tileN > 0
+                                                                  ? derivedTilingParams.tileN
+                                                                  : derivedTilingParams.tileCols);
+                    replaceSimpleCall("aie::get_data_row()", derivedTilingParams.tileRows);
+                    replaceSimpleCall("aie::get_data_col()", derivedTilingParams.tileCols);
                     replaceSimpleCall("aie::get_k_dim()", derivedTilingParams.kDim);
                     // Two-level tiling query functions
                     replaceSimpleCall("aie::get_tile_m()", derivedTilingParams.tileM > 0

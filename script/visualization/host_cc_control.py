@@ -403,12 +403,12 @@ def parse_host_cc(text: str) -> List[SSAOp]:
             ))
             continue
 
-        # --- __Runtime_dma_bd_config_multidim_ooo (22-arg: DevInst, tile, buf, bd_id, len, next_bd,
+        # --- __Runtime_dma_bd_config_multidim[_ooo] (22-arg: DevInst, tile, buf, bd_id, len, next_bd,
         #     enable_packet, packet_id, acq_lock_id, acq_lock_val, rel_lock_id, rel_lock_val, ooo_bd_id,
         #     num_dims, d0_stride, d0_wrap, d1_stride, d1_wrap, d2_stride, d2_wrap,
         #     iter_step_size, iter_wrap) ---
         m = re.search(
-            r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config_multidim_ooo\("
+            r"XAie_DmaDesc\s+(\w+)\s*=\s*__Runtime_dma_bd_config_multidim(?:_ooo)?\("
             r"(\w+),\s*(\w+),\s*(\w+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
             r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"
             r"\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),"

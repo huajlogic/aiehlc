@@ -822,10 +822,12 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             if (moduleOp) {
                 auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
                 auto fullKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k");
+                auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
 
                 if (effectiveKAttr && fullKAttr) {
                     int64_t effectiveK = effectiveKAttr.getInt();
                     int64_t fullK = fullKAttr.getInt();
+                    int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
 
                     if (effectiveK > 0 && effectiveK < fullK) {
                         // Get element bit width from the view tensor type
@@ -840,25 +842,51 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                             int64_t effK_w = effectiveK / elemsPerWord; // effectiveK in words
                             int64_t fullK_w = fullK / elemsPerWord;     // fullK in words
 
-                            // 2D addressing for shim MM2S:
-                            //   D0: contiguous within K-chunk row
-                            //       wrap = effectiveK in words
-                            //       stride = 1 word (4 bytes)
-                            //   D1: next DDR row (stride = fullK in words)
-                            //       wrap = partRows
-                            //       stride = fullK in words (row stride in DDR)
-                            SmallVector<int32_t> strides = {static_cast<int32_t>(1 * wordBytes),
-                                                            static_cast<int32_t>(fullK_w * wordBytes)};
-                            SmallVector<int32_t> wraps = {static_cast<int32_t>(effK_w), static_cast<int32_t>(partRows)};
+                            if (tileM > 0 && tileM < partRows) {
+                                // 3D addressing: D0=K-chunk, D1=tile_m rows, D2=kRounds
+                                // When tile_m < partRows, the kernel processes A data in
+                                // sub-tiles of tile_m x effectiveK. D2 iterates through
+                                // kRounds K-chunks, and BD iteration (set in
+                                // passblueprinttoschedule) handles mRounds m-sub-tiles.
+                                int64_t kRounds = fullK / effectiveK;
+                                SmallVector<int32_t> strides = {
+                                    static_cast<int32_t>(1 * wordBytes),       // D0: 4 bytes
+                                    static_cast<int32_t>(fullK_w * wordBytes), // D1: fullK bytes
+                                    static_cast<int32_t>(effectiveK)           // D2: effectiveK bytes
+                                };
+                                SmallVector<int32_t> wraps = {
+                                    static_cast<int32_t>(effK_w), // D0: effectiveK/4
+                                    static_cast<int32_t>(tileM),  // D1: tile_m rows
+                                    static_cast<int32_t>(kRounds) // D2: kRounds
+                                };
+                                inputShimDimStrides = rewriter.getI32ArrayAttr(strides);
+                                inputShimDimWraps = rewriter.getI32ArrayAttr(wraps);
 
-                            inputShimDimStrides = rewriter.getI32ArrayAttr(strides);
-                            inputShimDimWraps = rewriter.getI32ArrayAttr(wraps);
+                                llvm::errs()
+                                    << "[ShimMultiDim] Push input (3D K-tiling, tile_m<partRows): "
+                                    << "effectiveK=" << effectiveK << " fullK=" << fullK << " partRows=" << partRows
+                                    << " tileM=" << tileM << " kRounds=" << kRounds << " elemsPerWord=" << elemsPerWord
+                                    << " strides=[" << strides[0] << "," << strides[1] << "," << strides[2] << "]"
+                                    << " wraps=[" << wraps[0] << "," << wraps[1] << "," << wraps[2] << "]\n";
+                            } else {
+                                // 2D addressing (existing): D0=K-chunk, D1=partRows
+                                // tile_m == partRows (or unset): no M sub-tiling needed.
+                                // D0+D1 covers one K-chunk across all rows, BD iteration
+                                // handles kRounds.
+                                SmallVector<int32_t> strides = {static_cast<int32_t>(1 * wordBytes),
+                                                                static_cast<int32_t>(fullK_w * wordBytes)};
+                                SmallVector<int32_t> wraps = {static_cast<int32_t>(effK_w),
+                                                              static_cast<int32_t>(partRows)};
 
-                            llvm::errs() << "[ShimMultiDim] Push input (2D K-tiling): "
-                                         << "effectiveK=" << effectiveK << " fullK=" << fullK
-                                         << " partRows=" << partRows << " elemsPerWord=" << elemsPerWord << " strides=["
-                                         << strides[0] << "," << strides[1] << "]"
-                                         << " wraps=[" << wraps[0] << "," << wraps[1] << "]\n";
+                                inputShimDimStrides = rewriter.getI32ArrayAttr(strides);
+                                inputShimDimWraps = rewriter.getI32ArrayAttr(wraps);
+
+                                llvm::errs() << "[ShimMultiDim] Push input (2D K-tiling): "
+                                             << "effectiveK=" << effectiveK << " fullK=" << fullK
+                                             << " partRows=" << partRows << " elemsPerWord=" << elemsPerWord
+                                             << " strides=[" << strides[0] << "," << strides[1] << "]"
+                                             << " wraps=[" << wraps[0] << "," << wraps[1] << "]\n";
+                            }
                         }
                     }
                 }

@@ -697,16 +697,38 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         int64_t perTileShimLen = shimBdLen;
 
         // K-round iteration: when iter_wrap > 1, BD len must be the per-iteration
-        // transfer size (e.g. 4096 = 64*64 per k-round), NOT the full partition
-        // size. The DMA repeats the BD iter_wrap times via channel repeat count,
-        // advancing the base address by iter_step_size between iterations.
+        // transfer size, NOT the full partition size. The DMA repeats the BD
+        // iter_wrap times via channel repeat count, advancing the base address
+        // by iter_step_size between iterations.
         // Ref: xaie_dmabd_iter.c — XAie_DmaSetAddrLen uses per-iteration len.
+        //
+        // When tile_m < tileRows (M sub-tiling), the per-iteration transfer is
+        // tile_m * effectiveK (one sub-tile), NOT shimBdLen / kRounds.
+        // When tile_m == tileRows, the per-iteration transfer is
+        // shimBdLen / kRounds (one K-chunk across all rows).
         {
             auto moduleOp = op->getParentOfType<ModuleOp>();
             if (moduleOp) {
                 auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
+                auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
+                auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+
                 if (kRoundsAttr && kRoundsAttr.getInt() > 1 && shimIsSender) {
-                    perTileShimLen = shimBdLen / kRoundsAttr.getInt();
+                    int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                    int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+
+                    if (tileM > 0 && tileM < tileRows) {
+                        // tile_m < partRows: len covers D0×D1×D2 total
+                        // = tile_m * effectiveK * kRounds
+                        // (iter handles mRounds separately)
+                        int64_t effectiveK = effectiveKAttr ? effectiveKAttr.getInt() : 0;
+                        int64_t kRounds = kRoundsAttr.getInt();
+                        perTileShimLen = tileM * effectiveK * kRounds;
+                    } else {
+                        // tile_m == partRows (or unset): len = shimBdLen / kRounds
+                        perTileShimLen = shimBdLen / kRoundsAttr.getInt();
+                    }
                 }
             }
         }
@@ -821,20 +843,90 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             int32_t oooIterWrap = (int32_t)ooNumIterations;
             int32_t oooIterStepSize = (oooIterWrap > 1) ? (int32_t)(rowsPerRound * ddrRowStride) : 0;
 
-            // Build per-tile addressing from shimDimStrides D0 and D1 only.
-            // D1 wrap is adjusted to rows_per_round (per-round scope, not full partition).
+            // Build per-tile addressing from shimDimStrides.
+            // When tile_m < tileRows (M sub-tiling on output), use 3D strides
+            // with D2 encoding a diagonal shift for m_rounds iteration:
+            //   D0: stride=wordBytes, wrap=tileN_words (words per tile row)
+            //   D1: stride=outW_words*wordBytes, wrap=tileM (rows per sub-tile)
+            //   D2: stride=tileM*outW_words*wordBytes + tileN_words*wordBytes, wrap=mRounds
+            // D2 advances both tile_m rows AND tile_n columns in DDR per m_round.
+            // Otherwise, use 2D strides (D0, D1) with D1 wrap adjusted to rows_per_round.
             ArrayAttr perTileDimStrides = nullptr;
             ArrayAttr perTileDimWraps = nullptr;
-            if (shimDimStrides && shimDimWraps && shimDimStrides.size() >= 2) {
-                SmallVector<Attribute> strides2d, wraps2d;
-                // D0: intra-tile-row addressing (unchanged)
-                strides2d.push_back(shimDimStrides[0]);
-                wraps2d.push_back(shimDimWraps[0]);
-                // D1: DDR-row addressing — use rows_per_round, NOT full partition rows
-                strides2d.push_back(shimDimStrides[1]);
-                wraps2d.push_back(rewriter.getI32IntegerAttr(rowsPerRound));
-                perTileDimStrides = rewriter.getArrayAttr(strides2d);
-                perTileDimWraps = rewriter.getArrayAttr(wraps2d);
+            bool usedMRounds3D = false;
+            {
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                auto tileMAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m") : nullptr;
+                auto tileRowsAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows") : nullptr;
+                int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                int64_t tileRowsVal = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+
+                if (tileM > 0 && tileM < tileRowsVal && !shimIsSender) {
+                    // 3D strides for m_rounds diagonal shift
+                    int64_t mRounds = tileRowsVal / tileM;
+                    unsigned bitWidth = memrefType.getElementTypeBitWidth();
+                    int64_t elemsPerWord = 32 / bitWidth;
+                    constexpr int64_t wordBytes = 4;
+                    int64_t outW = memrefType.getDimSize(1); // full output row width (elements)
+                    int64_t tileN = outW / numCoreTiles;     // per-tile column width (elements)
+                    int64_t tileN_w = tileN / elemsPerWord;  // in words
+                    int64_t outW_w = outW / elemsPerWord;
+
+                    SmallVector<Attribute> strides3d, wraps3d;
+                    strides3d.push_back(rewriter.getI32IntegerAttr(1 * wordBytes));      // D0: word stride
+                    wraps3d.push_back(rewriter.getI32IntegerAttr(1));                    // D0: 1 word (single step)
+                    strides3d.push_back(rewriter.getI32IntegerAttr(outW_w * wordBytes)); // D1: DDR row stride
+                    wraps3d.push_back(rewriter.getI32IntegerAttr(tileM));                // D1: tile_m rows
+                    int64_t d2Stride = tileM * outW_w * wordBytes + 1 * wordBytes;       // row advance + 1 word
+                    strides3d.push_back(rewriter.getI32IntegerAttr(d2Stride));           // D2: m_round stride
+                    wraps3d.push_back(rewriter.getI32IntegerAttr(mRounds));              // D2: m_rounds
+
+                    perTileDimStrides = rewriter.getArrayAttr(strides3d);
+                    perTileDimWraps = rewriter.getArrayAttr(wraps3d);
+                    usedMRounds3D = true;
+
+                    llvm::errs() << "[OOO ShimBD 3D] tileM=" << tileM << " tileRows=" << tileRowsVal
+                                 << " mRounds=" << mRounds << " tileN=" << tileN << " outW=" << outW << " D0=["
+                                 << (1 * wordBytes) << "," << 1 << "]"
+                                 << " D1=[" << (outW_w * wordBytes) << "," << tileM << "]"
+                                 << " D2=[" << d2Stride << "," << mRounds << "]\n";
+                } else if (shimDimStrides && shimDimWraps && shimDimStrides.size() >= 2) {
+                    // 2D strides (original path)
+                    SmallVector<Attribute> strides2d, wraps2d;
+                    // D0: intra-tile-row addressing (unchanged)
+                    strides2d.push_back(shimDimStrides[0]);
+                    wraps2d.push_back(shimDimWraps[0]);
+                    // D1: DDR-row addressing — use rows_per_round, NOT full partition rows
+                    strides2d.push_back(shimDimStrides[1]);
+                    wraps2d.push_back(rewriter.getI32IntegerAttr(rowsPerRound));
+                    perTileDimStrides = rewriter.getArrayAttr(strides2d);
+                    perTileDimWraps = rewriter.getArrayAttr(wraps2d);
+                }
+            }
+
+            // When 3D strides handle m_rounds via D2, BD-level iteration is
+            // not needed — set iter_wrap=1, iter_step_size=0.
+            // Also update perRoundBytes: the BD len must cover the entire
+            // D0×D1×D2 volume (tileN × tileM × mRounds bytes per tile).
+            if (usedMRounds3D) {
+                oooIterWrap = 1;
+                oooIterStepSize = 0;
+
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                auto tileMAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m") : nullptr;
+                auto tileRowsAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows") : nullptr;
+                int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                int64_t tileRowsVal = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                if (tileM > 0 && tileM < tileRowsVal) {
+                    int64_t mRounds = tileRowsVal / tileM;
+                    int64_t outW = memrefType.getDimSize(1);
+                    int64_t tileN = outW / numCoreTiles;
+                    perRoundBytes = tileM * tileN * mRounds * ooElementSizeBytes;
+                    // Also update ooNumIterations to 1 since D2 handles all rounds
+                    ooNumIterations = 1;
+                    llvm::errs() << "[OOO ShimBD 3D] perRoundBytes=" << perRoundBytes
+                                 << " ooNumIterations=" << ooNumIterations << "\n";
+                }
             }
 
             // Allocate N shim BD IDs
@@ -910,8 +1002,16 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         } else {
             // --- Non-OOO path: single shim BD (original behavior) ---
             // K-round iteration: when effectiveK < fullK, use iter_step_size and
-            // iter_wrap so the BD repeats kRounds times, advancing the DDR read
-            // address by effectiveK bytes between each k-round.
+            // iter_wrap so the BD repeats, advancing the DDR read address.
+            //
+            // When tile_m == tileRows (no M sub-tiling):
+            //   iter_step = effectiveK bytes (next K-chunk column)
+            //   iter_wrap = kRounds
+            //
+            // When tile_m < tileRows (M sub-tiling):
+            //   D2 handles kRounds (K-chunk stepping), so iter handles mRounds:
+            //   iter_step = tile_m * fullK bytes (next m-sub-tile block in DDR)
+            //   iter_wrap = mRounds (= tileRows / tileM)
             int32_t shimIterStepSize = 0;
             int32_t shimIterWrap = 0;
             if (shimIsSender) {
@@ -931,13 +1031,30 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 elemBytes = memrefType.getElementTypeBitWidth() / 8;
                             if (elemBytes == 0)
                                 elemBytes = 1;
-                            // iter_step_size: advance by effectiveK elements in bytes
-                            // This shifts the DDR base to the next K-chunk column
-                            shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
-                            shimIterWrap = static_cast<int32_t>(kRounds);
-                            llvm::errs() << "[BlueprintToSchedule] K-round shim iteration: "
-                                         << "iter_step_size=" << shimIterStepSize << " iter_wrap=" << shimIterWrap
-                                         << "\n";
+
+                            int64_t tileM = 0, tileRows = 0;
+                            if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
+                                tileM = a.getInt();
+                            if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows"))
+                                tileRows = a.getInt();
+
+                            if (tileM > 0 && tileM < tileRows) {
+                                // D2 handles kRounds; iter handles mRounds
+                                int64_t mRounds = tileRows / tileM;
+                                shimIterStepSize = static_cast<int32_t>(tileM * fullK * elemBytes);
+                                shimIterWrap = static_cast<int32_t>(mRounds);
+                                llvm::errs()
+                                    << "[BlueprintToSchedule] K-round shim iteration (3D, tile_m<tileRows): "
+                                    << "iter_step_size=" << shimIterStepSize << " iter_wrap=" << shimIterWrap
+                                    << " tileM=" << tileM << " tileRows=" << tileRows << " mRounds=" << mRounds << "\n";
+                            } else {
+                                // D1 covers all rows; iter handles kRounds (existing)
+                                shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
+                                shimIterWrap = static_cast<int32_t>(kRounds);
+                                llvm::errs()
+                                    << "[BlueprintToSchedule] K-round shim iteration (2D): "
+                                    << "iter_step_size=" << shimIterStepSize << " iter_wrap=" << shimIterWrap << "\n";
+                            }
                         }
                     }
                 }
@@ -1035,6 +1152,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             Value ioHandle;
             Value bdId;
             uint32_t flowIdx;
+            int32_t repeatCount;
         };
         SmallVector<DeferredCoreStartIo> deferredCoreStartIos;
         int tileIndex = 0;
@@ -1094,6 +1212,17 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                         int64_t kRounds = kRoundsAttr.getInt();
                         if (kRounds > 1) {
                             perCorePerKRound = perCoreElements / kRounds;
+                            // When tile_m < tileRows, each k-round only needs
+                            // tile_m rows (not partRows). Divide by mRounds
+                            // so pingPongBufferSize = tile_m * effectiveK.
+                            auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                            auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                            int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                            int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                            if (tileM > 0 && tileM < tileRows) {
+                                int64_t mRounds = tileRows / tileM;
+                                perCorePerKRound = perCorePerKRound / mRounds;
+                            }
                         }
                     }
                 }
@@ -1475,7 +1604,22 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());
                         // Defer core StartIoOp until after ELF is loaded (LoadKernelGroup)
                         // to prevent BSS initialization from overwriting DMA data.
-                        deferredCoreStartIos.push_back({coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), flowIndex});
+                        // For output (MM2S) flows, compute mRounds repeat when tile_m < tileRows.
+                        int32_t coreRepeat = 1;
+                        if (!isInput) {
+                            auto moduleOp = op->getParentOfType<ModuleOp>();
+                            if (moduleOp) {
+                                auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                                auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                                int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                                int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                                if (tileM > 0 && tileM < tileRows) {
+                                    coreRepeat = static_cast<int32_t>(tileRows / tileM);
+                                }
+                            }
+                        }
+                        deferredCoreStartIos.push_back(
+                            {coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), flowIndex, coreRepeat});
                     } // end if (passState && ...)
                 }
             }
@@ -1533,12 +1677,26 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             if (useOOO) {
                 repeatCount = (int32_t)(numCoreTiles * ooNumIterations);
             } else if (shimIsSender) {
-                // When using BD iteration for K-rounds, channel repeat = iter_wrap
+                // Channel repeat must match iter_wrap so the DMA engine
+                // re-executes the BD the correct number of times.
                 auto moduleOp = op->getParentOfType<ModuleOp>();
                 if (moduleOp) {
                     auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
-                    if (kRoundsAttr && kRoundsAttr.getInt() > 1)
-                        repeatCount = (int32_t)kRoundsAttr.getInt();
+                    if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
+                        auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                        auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+
+                        if (tileM > 0 && tileM < tileRows) {
+                            // repeat = iter_wrap = mRounds
+                            int64_t mRounds = tileRows / tileM;
+                            repeatCount = static_cast<int32_t>(mRounds);
+                        } else {
+                            // repeat = iter_wrap = kRounds (existing)
+                            repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
+                        }
+                    }
                 }
             }
             auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
@@ -1563,7 +1721,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             for (auto &deferred : deferredCoreStartIos) {
                 auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
                     loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
-                    rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(1));
+                    rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(deferred.repeatCount));
                 coreStartIoEvents.push_back(coreStartIo.getEvent());
         }
 

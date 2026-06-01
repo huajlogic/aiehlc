@@ -938,8 +938,8 @@ void AieRt_PrintBdInfo(XAie_DevInst *dev, XAie_LocType tile, uint8_t bd_id) {
     /* Extract fields from the descriptor struct.
      * XAie_DmaDesc has a union inside (AieMLDma or AieDma); we access
      * the generic fields that are present in both via the AddrDesc. */
-    u64 addr = desc.AddrDesc.Address;
-    u32 len = desc.AddrDesc.Length; /* bytes */
+    u64 addr = desc.AddrDesc.Address * 4; // the value is in 32bits words
+    u32 len = desc.AddrDesc.Length * 4;   // the value is in 32bits words
 
     /* Lock fields */
     int acq_lock_id = (int)desc.LockDesc.LockAcqId;
@@ -962,8 +962,8 @@ void AieRt_PrintBdInfo(XAie_DevInst *dev, XAie_LocType tile, uint8_t bd_id) {
     int ooo_bd_id = (int)desc.BdEnDesc.OutofOrderBdId;
     int ooo_en = (int)desc.EnOutofOrderBdId;
 
-    printf("[AieRt_Debug]   BD%-2u: addr=0x%llx len=%u bytes", (unsigned)bd_id, (unsigned long long)addr,
-           (unsigned)len);
+    printf("[AieRt_Debug]   BD%-2u: addr=0x%llx len=%u bytes (tile=c-%u,r-%u)", (unsigned)bd_id,
+           (unsigned long long)addr, (unsigned)len, (unsigned)tile.Col, (unsigned)tile.Row);
 
     if (next_bd_en)
         printf("  next->BD%u", (unsigned)next_bd_id);

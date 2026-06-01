@@ -64,9 +64,9 @@
 #include <stdlib.h>
 
 // GEMM dimensions (user-specified)
-#define M 512
-#define K 512
-#define N 512
+#define M 64
+#define K 64
+#define N 64
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4
@@ -97,6 +97,7 @@ static void scalar_matmul(int8_t *C_ref, const int8_t *A, const int8_t *B) {
 
 // Verify AIE output C against CPU reference
 static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
+    const int dataprintsize = 32;
     int mismatches = 0;
     int8_t C_ref[M * N];
     scalar_matmul(C_ref, A, B);
@@ -112,7 +113,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     printf("\nA [%dx%d]:\n", M, K);
     for (int i = 0; i < M; i++) {
         printf("  [");
-        for (int j = 0; j < K; j++) {
+        for (int j = 0; j < (K > dataprintsize ? dataprintsize : K); j++) {
             printf("%4d", A[i * K + j]);
             if (j < K - 1)
                 printf(",");
@@ -124,7 +125,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     printf("\nB [%dx%d]:\n", K, N);
     for (int i = 0; i < K; i++) {
         printf("  [");
-        for (int j = 0; j < N; j++) {
+        for (int j = 0; j < (N > dataprintsize ? dataprintsize : N); j++) {
             printf("%4d", B[i * N + j]);
             if (j < N - 1)
                 printf(",");
@@ -136,7 +137,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     printf("\nC [%dx%d]:\n", M, N);
     for (int i = 0; i < M; i++) {
         printf("  [");
-        for (int j = 0; j < N; j++) {
+        for (int j = 0; j < (N > dataprintsize ? dataprintsize : N); j++) {
             printf("%4d", C[i * N + j]);
             if (j < N - 1)
                 printf(",");
@@ -148,7 +149,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     printf("\nC_ref [%dx%d]:\n", M, N);
     for (int i = 0; i < M; i++) {
         printf("  [");
-        for (int j = 0; j < N; j++) {
+        for (int j = 0; j < (N > dataprintsize ? dataprintsize : N); j++) {
             printf("%4d", C_ref[i * N + j]);
             if (j < N - 1)
                 printf(",");

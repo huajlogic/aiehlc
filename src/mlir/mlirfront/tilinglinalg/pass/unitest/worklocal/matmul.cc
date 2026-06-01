@@ -5,20 +5,27 @@
 void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_int8 *win_c) {
 
     // Compiler-resolved tiling parameters
-    const int tile_rows = 128;
-    const int tile_cols = 128;
-    const int eff_k = 64;       // K chunk size per k-round
-    const int k_rounds = 8;     // number of K-accumulation rounds
-    const int num_a_rounds = 2; // DMA rounds per k-round for A
-    const int num_b_rounds = 2; // DMA rounds per k-round for B
-    const int num_c_rounds = 4;
-    const int buf_sz_a = 4096;
-    const int buf_sz_b = 4096;
-    const int buf_sz_c = 4096;
+    const int tile_rows = 4;
+    const int tile_cols = 4;
+    const int eff_k = 16;       // K chunk size per k-round
+    const int k_rounds = 4;     // number of K-accumulation rounds
+    const int num_a_rounds = 1; // DMA rounds per k-round for A
+    const int num_b_rounds = 1; // DMA rounds per k-round for B
+    const int num_c_rounds = 1;
+    const int buf_sz_a = 64;
+    const int buf_sz_b = 64;
+    const int buf_sz_c = 16;
+
+    // Spatial sub-tile iteration counts
+    const int m_rounds = 4;
+    const int n_rounds = 4;
 
     // Derived per-round sizes (using effective_k, not full k_dim)
     const int rows_per_round = buf_sz_a / eff_k;
     const int cols_per_round = buf_sz_b / eff_k;
+
+    // N-partition width across all nr sub-tiles
+    // const int data_cols = n_rounds * tile_cols;
 
 #if DEBUG_OUTPUT_ORDER
     unsigned coreid = get_coreid();
@@ -28,93 +35,79 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
     klog("DEBUG", 3);
 #endif
 
-    // Local buffers — sized with effective_k, not full K
+    // Local buffers — accum/local_out hold one M-sub-tile strip (tile_rows × data_cols)
     int8_t all_A[tile_rows * eff_k];
-    int16_t accum[tile_rows * tile_cols]; // int16 accumulator for partial sums across k-rounds
+    int16_t accum[tile_rows * tile_cols];
     int8_t local_out[tile_rows * tile_cols];
 
-    // Zero accumulators
-    for (int i = 0; i < tile_rows * tile_cols; i++)
-        accum[i] = 0;
+    // ===== M sub-tile loop: each mr gets fresh A data across all k_rounds =====
+    for (int mr = 0; mr < m_rounds; mr++) {
 
-    // ===== K-round loop: accumulate partial products =====
-    for (int kr = 0; kr < k_rounds; kr++) {
+        // Zero accumulators for this M sub-tile
+        for (int i = 0; i < tile_rows * tile_cols; i++)
+            accum[i] = 0;
 
-        // --- Phase 1: Receive and cache A chunk for this k-round ---
-        for (int ra = 0; ra < num_a_rounds; ra++) {
-            int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
-            for (int i = 0; i < buf_sz_a; i++)
-                all_A[ra * buf_sz_a + i] = A_ptr[i];
-#if DEBUG_OUTPUT_ORDER
-            if (ra == 0) {
-                klog("A0  ", (int32_t)A_ptr[0]);
-            }
-#endif
-            release_input_window(win_a);
-        }
+        // ===== K-round loop: accumulate partial products =====
+        for (int kr = 0; kr < k_rounds; kr++) {
 
-#if DEBUG_OUTPUT_ORDER
-        // if (kr == 0) {
-        //     for (int i = 0; i < 16; i++) {
-        //         klog("A0  ", (int32_t)all_A[i]);
-        //     }
-        // }
-#endif
-
-        // --- Phase 2: Stream B chunk, accumulate partial products ---
-        for (int rb = 0; rb < num_b_rounds; rb++) {
-            int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
-
-#if DEBUG_OUTPUT_ORDER
-            if (rb == 0) {
-                // for (int i = 0; i < 16; i++) {
-                klog("B0  ", (int32_t)B_ptr[0]);
-                //}
-            }
-#endif
-
+            // --- Phase 1: Receive and cache A chunk for this (mr, kr) ---
             for (int ra = 0; ra < num_a_rounds; ra++) {
-                for (int i = 0; i < rows_per_round; i++) {
+                int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
+                for (int i = 0; i < buf_sz_a; i++) {
+                    all_A[ra * buf_sz_a + i] = A_ptr[i];
+                }
+#if DEBUG_OUTPUT_ORDER
+                if (kr == 0 && mr == 0) {
+                    klog("A0  ", (int32_t)A_ptr[0]);
+                }
+#endif
+                release_input_window(win_a);
+            }
+
+            for (int rb = 0; rb < num_b_rounds; rb++) {
+                int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
+                for (int i = 0; i < tile_rows; i++) {
                     for (int j = 0; j < cols_per_round; j++) {
                         int16_t sum = 0;
-                        for (int k = 0; k < eff_k; k++)
-                            sum +=
-                                (int16_t)all_A[(ra * rows_per_round + i) * eff_k + k] * (int16_t)B_ptr[j * eff_k + k];
-                        accum[(ra * rows_per_round + i) * tile_cols + rb * cols_per_round + j] += sum;
+                        for (int k = 0; k < eff_k; k++) {
+                            sum += (int16_t)all_A[i * eff_k + k] * (int16_t)B_ptr[j * eff_k + k];
+                        }
+                        accum[i * tile_cols + rb * cols_per_round + j] += sum;
                     }
+                }
+
+#if DEBUG_OUTPUT_ORDER
+                if (kr == 0 && mr == 0 && rb == 0) {
+                    klog("B0  ", (int32_t)B_ptr[0]);
+                }
+#endif
+
+                release_input_window(win_b);
+            }
+        } // end k_rounds
+
+        // ===== Saturate accumulators to int8 for this M sub-tile =====
+        for (int i = 0; i < tile_rows * tile_cols; i++) {
+            int16_t val = accum[i];
+            if (val > 127)
+                val = 127;
+            else if (val < -128)
+                val = -128;
+            local_out[i] = (int8_t)val;
+        }
+        for (int rc = 0; rc < num_c_rounds; rc++) {
+            int8_t *out = (int8_t *)acquire_output_window(win_c);
+            const int rows_per_c_round = buf_sz_c / tile_cols;
+            for (int i = 0; i < rows_per_c_round; i++) {
+                for (int j = 0; j < tile_cols; j++) {
+                    out[i * tile_cols + j] = local_out[rc * buf_sz_c + i * tile_cols + j];
+#if DEBUG_OUTPUT_ORDER
+                    klog("C0 ", (int32_t)out[i * tile_cols + j]);
+#endif
                 }
             }
 
-            release_input_window(win_b);
+            release_output_window(win_c);
         }
-    } // end k_rounds
-
-    // ===== Saturate accumulators to int8 =====
-    for (int i = 0; i < tile_rows * tile_cols; i++) {
-        int16_t val = accum[i];
-#if DEBUG_OUTPUT_ORDER
-        // Tag output for debug ordering verification
-#else
-        if (val > 127)
-            val = 127;
-        else if (val < -128)
-            val = -128;
-#endif
-        local_out[i] = (int8_t)val;
-    }
-
-    // ===== Phase 3: Output =====
-    for (int rc = 0; rc < num_c_rounds; rc++) {
-        int8_t *out = (int8_t *)acquire_output_window(win_c);
-        for (int i = 0; i < buf_sz_c; i++)
-            out[i] = local_out[rc * buf_sz_c + i];
-#if DEBUG_OUTPUT_ORDER
-        // if (rc == 0) {
-        // for (int l = 0; l < 8; l++) {
-        klog("C0 ", (int32_t)out[0]);
-        //}
-        //}///
-#endif
-        release_output_window(win_c);
-    }
+    } // end mr
 }
