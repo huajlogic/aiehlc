@@ -163,6 +163,7 @@ target_link_libraries(aiehlc PRIVATE
 	MLIRMathToLLVM
 			#MLIRROCDLToLLVMIRTranslation
 			#MLIRGPUDialect
+			MLIRSCFToEmitC
 			#MLIRSCFToControlFlow
 			#MLIRIndexToLLVM
 			#MLIRGPUToROCDLTransforms

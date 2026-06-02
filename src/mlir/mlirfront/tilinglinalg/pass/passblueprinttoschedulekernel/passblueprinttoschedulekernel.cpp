@@ -1141,9 +1141,11 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 auto bdIdConst = rewriter.create<arith::ConstantOp>(
                     loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(resourceMgr.allocateBdId()));
 
+                auto kernelOffsetConst =
+                    rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
                 auto coreBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
                     loc, dfschedule::BdHandleType::get(rewriter.getContext()), coreBuf, coreTileOp.getTile(), bdIdConst,
-                    rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(perTileLen), rewriter.getBoolAttr(true),
+                    kernelOffsetConst.getResult(), rewriter.getI32IntegerAttr(perTileLen), rewriter.getBoolAttr(true),
                     rewriter.getI32IntegerAttr(basePacketId + tileIdx), rewriter.getI32IntegerAttr(4294967295),
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0),
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(-1), Value(),

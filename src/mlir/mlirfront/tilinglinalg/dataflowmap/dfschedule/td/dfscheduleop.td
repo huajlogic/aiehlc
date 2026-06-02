@@ -145,7 +145,7 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
     AnyMemRef:$buffer,
     dfschedule_TileHandleType:$tile,
     I32:$bd_id,
-    I32Attr:$offset,
+    I32:$offset,
     I32Attr:$len,
     BoolAttr:$enable_packet,
     I32Attr:$packet_id,

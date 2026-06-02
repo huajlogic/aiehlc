@@ -4,6 +4,7 @@
 ******************************************************************************/
 
 #include "passdfscheduletoapi.h"
+#include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
@@ -1133,16 +1134,15 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
     LogicalResult matchAndRewrite(dfschedule::ConfigDmaBdOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
         auto loc = op.getLoc();
-        
-        // Get attributes
-        int32_t offset = op.getOffset();
+
+        // Get attributes (offset is now an SSA Value operand, not an attribute)
         int32_t len = op.getLen();
         bool enablePacket = op.getEnablePacket();
         int32_t packetId = op.getPacketId();
         int32_t nextBd = static_cast<int32_t>(op.getNextBd()); // signed cast: sentinel 0xFFFFFFFF (-1) means no next BD
 
-        llvm::errs() << "[Pattern] ConfigDmaBd called (offset=" << offset << ", len=" << len
-                     << ", enable_packet=" << enablePacket << ", packet_id=" << packetId << ")\n";
+        llvm::errs() << "[Pattern] ConfigDmaBd called (len=" << len << ", enable_packet=" << enablePacket
+                     << ", packet_id=" << packetId << ")\n";
 
         // Get operands
         Value buffer = adaptor.getBuffer();
@@ -1222,18 +1222,16 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                 op.getBdId().getDefiningOp<arith::ConstantOp>()
                     ? mlir::cast<IntegerAttr>(op.getBdId().getDefiningOp<arith::ConstantOp>().getValue()).getInt()
                     : -1) +
-            ", offset=" + std::to_string(offset) + ", len=" + std::to_string(len) +
-            ", enable_packet=" + (enablePacket ? "true" : "false") + ", packet_id=" + std::to_string(packetId) +
-            ", next_bd=" + std::to_string(nextBd) + ", acquire_lock_id=" + std::to_string(acquireLockId) +
+            ", len=" + std::to_string(len) + ", enable_packet=" + (enablePacket ? "true" : "false") +
+            ", packet_id=" + std::to_string(packetId) + ", next_bd=" + std::to_string(nextBd) +
+            ", acquire_lock_id=" + std::to_string(acquireLockId) +
             ", acquire_lock_val=" + std::to_string(acquireLockVal) +
             ", release_lock_id=" + std::to_string(releaseLockId) +
             ", release_lock_val=" + std::to_string(releaseLockVal) + ", ooo_bd_id=" + std::to_string(outOfOrderBdId) +
             " */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
-        
+
         // Create constants for parameters
-        auto offsetConst = rewriter.create<emitc::ConstantOp>(
-            loc, i32Type, rewriter.getI32IntegerAttr(offset));
         auto lenConst = rewriter.create<emitc::ConstantOp>(
             loc, i32Type, rewriter.getI32IntegerAttr(len));
         auto nextBdConst = rewriter.create<emitc::ConstantOp>(
@@ -1257,14 +1255,23 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         }
 
         // Apply byte offset to buffer pointer for shim/DDR addressing.
-        // This bakes the per-BD offset into the pointer so the runtime
-        // sees distinct DDR addresses for each BD slice.
-        if (offset != 0) {
+        // offset is now an SSA Value; check if it's a known-zero constant to skip the call.
+        Value offset = adaptor.getOffset();
+        bool isZeroOffset = false;
+        if (auto constOp = offset.getDefiningOp<emitc::ConstantOp>()) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                isZeroOffset = intAttr.getInt() == 0;
+        }
+        if (auto constOp = offset.getDefiningOp<arith::ConstantOp>()) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                isZeroOffset = intAttr.getInt() == 0;
+        }
+        if (!isZeroOffset) {
             auto i64Type = rewriter.getIntegerType(64);
-            auto offsetVal = rewriter.create<emitc::ConstantOp>(loc, i64Type, rewriter.getIntegerAttr(i64Type, offset));
+            auto offsetI64 = rewriter.create<emitc::CastOp>(loc, i64Type, offset);
             auto offsetPtr =
                 rewriter.create<emitc::CallOpaqueOp>(loc, voidPtrType, "__runtime_buffer_offset", nullptr, nullptr,
-                                                     ValueRange{bufferVoidPtr, offsetVal.getResult()});
+                                                     ValueRange{bufferVoidPtr, offsetI64.getResult()});
             bufferVoidPtr = offsetPtr.getResult(0);
         }
 
@@ -3088,7 +3095,6 @@ void DfscheduleToApiPass::runOnOperation() {
     
     // ConfigDmaBdOp must run before ConfigCreateIoOp (benefit = 50)
     innerPatterns.add<ConfigDmaBdInnerPattern>(typeConverter, ctx, state, /*benefit=*/50);
-    
     // GetBdIdOp allocates BD IDs and should run with medium priority (benefit = 30)
     innerPatterns.add<GetBdIdInnerPattern>(typeConverter, ctx, state, /*benefit=*/30);
     
@@ -3151,6 +3157,7 @@ void DfscheduleToApiPass::runOnOperation() {
     innerTarget.addIllegalOp<dfschedule::LoadKernelGroupOp>();
     innerTarget.addIllegalOp<dfschedule::ConfigCreateIoOp>();
     innerTarget.addIllegalOp<dfschedule::ConfigDmaBdOp>();  // Converted in Phase 3 with proper benefits
+
     innerTarget.addIllegalOp<dfschedule::DeclareTileOp>();
     // NOTE: LaunchHostOp is handled in Phase 4, not here
     // innerTarget.addIllegalOp<dfschedule::LaunchHostOp>();
@@ -3359,7 +3366,58 @@ void DfscheduleToApiPass::runOnOperation() {
             llvm::errs() << "[Pass] Warning: Some arith.constant ops could not be converted in phase 4.5\n";
         }
     }
-    
+
+    //==========================================================================
+    // Phase 4.55: Convert arith ops inside scf.for → emitc, then scf.for → emitc.for
+    //==========================================================================
+    llvm::errs() << "[Pass] Phase 4.55: Converting scf.for → emitc.for\n";
+
+    {
+        // Step 1: Manually convert arith ops inside scf.for bodies to emitc equivalents.
+        // These survived Phase 3/4.5 because arith dialect was marked legal (only arith.constant
+        // was selectively made illegal). We convert arith.index_cast → emitc.cast and
+        // arith.muli → emitc.mul so the emitc.for region verifier accepts the body.
+        OpBuilder b(ctx);
+        moduleOp.walk([&](scf::ForOp forOp) {
+            // Walk the for body and convert arith.index_cast → emitc.cast
+            SmallVector<arith::IndexCastOp> castOps;
+            forOp.getBody()->walk([&](arith::IndexCastOp op) { castOps.push_back(op); });
+            for (auto castOp : castOps) {
+                b.setInsertionPoint(castOp);
+                auto result = b.create<emitc::CastOp>(castOp.getLoc(), castOp.getResult().getType(), castOp.getIn());
+                castOp.replaceAllUsesWith(result.getResult());
+                castOp.erase();
+            }
+
+            // Walk the for body and convert arith.muli → emitc.mul
+            SmallVector<arith::MulIOp> mulOps;
+            forOp.getBody()->walk([&](arith::MulIOp op) { mulOps.push_back(op); });
+            for (auto mulOp : mulOps) {
+                b.setInsertionPoint(mulOp);
+                auto result =
+                    b.create<emitc::MulOp>(mulOp.getLoc(), mulOp.getResult().getType(), mulOp.getLhs(), mulOp.getRhs());
+                mulOp.replaceAllUsesWith(result.getResult());
+                mulOp.erase();
+            }
+        });
+
+        // Step 2: Convert scf.for → emitc.for using upstream SCFToEmitC patterns.
+        RewritePatternSet scfPatterns(ctx);
+        mlir::populateSCFToEmitCConversionPatterns(scfPatterns);
+
+        ConversionTarget scfTarget(*ctx);
+        scfTarget.addLegalDialect<emitc::EmitCDialect>();
+        scfTarget.addLegalDialect<func::FuncDialect>();
+        scfTarget.addLegalDialect<arith::ArithDialect>();
+        scfTarget.addLegalDialect<bufferization::BufferizationDialect>();
+        scfTarget.addLegalDialect<memref::MemRefDialect>();
+        scfTarget.addIllegalDialect<scf::SCFDialect>();
+
+        if (failed(applyPartialConversion(moduleOp, scfTarget, std::move(scfPatterns)))) {
+            llvm::errs() << "[Pass] Warning: SCF-to-EmitC conversion had issues\n";
+        }
+    }
+
     //==========================================================================
     // Phase 4.6: Remove remaining unconverted ops and orphaned unrealized casts
     //==========================================================================

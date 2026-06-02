@@ -10,6 +10,7 @@
 #include "hw/hwresource.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -494,6 +495,42 @@ static Value resolveMemrefForView(Value viewValue, const BlueprintPassState &sta
     return Value();
 }
 
+// === Tiling Classification ===
+// Determines whether the M-dimension tiling requires host-side SCF loops.
+enum class TilingMode { Match, Multiple, Invalid };
+
+struct TilingClassification {
+    TilingMode mMode;
+    int64_t mRounds; // 1 for Match, tileRows/tileM for Multiple
+};
+
+TilingClassification classifyTiling(ModuleOp moduleOp) {
+    TilingClassification result;
+    result.mMode = TilingMode::Match;
+    result.mRounds = 1;
+
+    if (!moduleOp)
+        return result;
+
+    auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+    auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+
+    int64_t m = tileMAttr ? tileMAttr.getInt() : 0;
+    int64_t rows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+
+    if (m == 0 || m == rows) {
+        result.mMode = TilingMode::Match;
+        result.mRounds = 1;
+    } else if (m < rows && rows % m == 0) {
+        result.mMode = TilingMode::Multiple;
+        result.mRounds = rows / m;
+    } else {
+        result.mMode = TilingMode::Invalid;
+        result.mRounds = 0;
+    }
+    return result;
+}
+
 // Pattern to convert dfscheblueprint::FlowTransferOp to dfschedule operations
 // Logic:
 // 1. Find shim tile from the "from" and "to" FlowConfigOps by checking type="shim"
@@ -800,6 +837,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         int64_t ooNumIterations = ooPerCoreElements / ooPingPongSize;
         int64_t perRoundBytes = ooPingPongSize * ooElementSizeBytes;
 
+        // Shim BD iteration settings for K-round stepping.
+        // Declared here (outside OOO/non-OOO branch) so they are visible
+        // in the Multiple-mode scf.for loop below.
+        int32_t shimIterStepSize = 0;
+        int32_t shimIterWrap = 0;
+
         if (useOOO && numCoreTiles > 1) {
             // --- OOO path: N per-tile shim BDs ---
             // Each shim BD receives data from one core tile at the correct DDR
@@ -968,12 +1011,14 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 // engine would try to strip a second header from the data payload,
                 // causing data corruption and stalls.  (Reference:
                 // xaie_conv2d_2core_dataflow_test.c — shim S2MM BD has no XAie_DmaSetPkt.)
+                auto ddrOffsetConst = rewriter.create<arith::ConstantOp>(
+                    loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(static_cast<int32_t>(ddrOffset)));
                 auto shimBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
                     loc, dfschedule::BdHandleType::get(rewriter.getContext()),
                     ddrBuffer,                                 // DDR buffer
                     shimTileOp.getTile(),                      // tile
                     shimBdIdC.getResult(),                     // bd_id
-                    rewriter.getI32IntegerAttr(ddrOffset),     // offset (per-tile DDR position using D2 stride)
+                    ddrOffsetConst.getResult(),                // offset (per-tile DDR position using D2 stride)
                     rewriter.getI32IntegerAttr(perRoundBytes), // len (per-round, matches src BD)
                     rewriter.getBoolAttr(false),               // enable_packet = false (OOO dispatch handles packets)
                     rewriter.getI32IntegerAttr(
@@ -1012,8 +1057,6 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             //   D2 handles kRounds (K-chunk stepping), so iter handles mRounds:
             //   iter_step = tile_m * fullK bytes (next m-sub-tile block in DDR)
             //   iter_wrap = mRounds (= tileRows / tileM)
-            int32_t shimIterStepSize = 0;
-            int32_t shimIterWrap = 0;
             if (shimIsSender) {
                 auto moduleOp = op->getParentOfType<ModuleOp>();
                 if (moduleOp) {
@@ -1039,14 +1082,16 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 tileRows = a.getInt();
 
                             if (tileM > 0 && tileM < tileRows) {
-                                // D2 handles kRounds; iter handles mRounds
+                                // Multiple mode: host SCF loop handles mRounds.
+                                // BD iter handles K-rounds only (same as Match mode).
+                                shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
+                                shimIterWrap = static_cast<int32_t>(kRounds);
                                 int64_t mRounds = tileRows / tileM;
-                                shimIterStepSize = static_cast<int32_t>(tileM * fullK * elemBytes);
-                                shimIterWrap = static_cast<int32_t>(mRounds);
                                 llvm::errs()
-                                    << "[BlueprintToSchedule] K-round shim iteration (3D, tile_m<tileRows): "
+                                    << "[BlueprintToSchedule] K-round shim iteration (host SCF handles mRounds): "
                                     << "iter_step_size=" << shimIterStepSize << " iter_wrap=" << shimIterWrap
-                                    << " tileM=" << tileM << " tileRows=" << tileRows << " mRounds=" << mRounds << "\n";
+                                    << " tileM=" << tileM << " tileRows=" << tileRows << " mRounds=" << mRounds
+                                    << " (mRounds via host SCF loop)\n";
                             } else {
                                 // D1 covers all rows; iter handles kRounds (existing)
                                 shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
@@ -1060,12 +1105,14 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 }
             }
 
+            auto shimOffsetConst =
+                rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
             auto shimBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
                 loc, dfschedule::BdHandleType::get(rewriter.getContext()),
                 ddrBuffer,                                  // DDR receive buffer
                 shimTileOp.getTile(),                       // tile
                 shimBdIdConst.getResult(),                  // bd_id
-                rewriter.getI32IntegerAttr(0),              // offset
+                shimOffsetConst.getResult(),                // offset
                 rewriter.getI32IntegerAttr(perTileShimLen), // len (per-tile portion)
                 rewriter.getBoolAttr(false),                // enable_packet = false
                 rewriter.getI32IntegerAttr(0),              // packet_id (unused)
@@ -1501,10 +1548,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
 
                             auto singleBdIdConst = rewriter.create<arith::ConstantOp>(
                                 loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(singleBdId));
+                            auto singleOffsetConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                                        rewriter.getI32IntegerAttr(0));
                             auto singleBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
                                 loc, dfschedule::BdHandleType::get(rewriter.getContext()), singleL1.getBuffer(),
                                 coreTileOp.getTile(), singleBdIdConst.getResult(),
-                                rewriter.getI32IntegerAttr(0),               // offset
+                                singleOffsetConst.getResult(),               // offset
                                 rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
                                 rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
                                 rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
@@ -1550,10 +1599,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             // Pong BD first (no linked_bd): next_bd -> ping
                             auto pongBdIdConst = rewriter.create<arith::ConstantOp>(
                                 loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pongBdId));
+                            auto pongOffsetConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                                      rewriter.getI32IntegerAttr(0));
                             auto pongBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
                                 loc, dfschedule::BdHandleType::get(rewriter.getContext()), pongL1.getBuffer(),
                                 coreTileOp.getTile(), pongBdIdConst.getResult(),
-                                rewriter.getI32IntegerAttr(0),               // offset
+                                pongOffsetConst.getResult(),                 // offset
                                 rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
                                 rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
                                 rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
@@ -1572,10 +1623,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             // Ping BD second (linked_bd = pong handle): next_bd -> pong
                             auto pingBdIdConst = rewriter.create<arith::ConstantOp>(
                                 loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pingBdId));
+                            auto pingOffsetConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                                      rewriter.getI32IntegerAttr(0));
                             auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
                                 loc, dfschedule::BdHandleType::get(rewriter.getContext()), pingL1.getBuffer(),
                                 coreTileOp.getTile(), pingBdIdConst.getResult(),
-                                rewriter.getI32IntegerAttr(0),               // offset
+                                pingOffsetConst.getResult(),                 // offset
                                 rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
                                 rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
                                 rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
@@ -1663,76 +1716,192 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             computeKernelAttrs.push_back(SymbolRefAttr::get(rewriter.getContext(), "compute0"));
             }
 
+            // === Schedule emission: classify tiling mode ===
+            auto moduleOp = op->getParentOfType<ModuleOp>();
+            auto classification = classifyTiling(moduleOp);
+
             // Create dfschedule.schedule.getbdid for shim tile
-            // Shim start_io is emitted BEFORE load_kernel_group so that shim DMA
-            // channels are armed first.  Core start_io remains after kernel launch
-            // to avoid BSS-zeroing races.
             auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
 
-            // Create dfschedule.schedule.start_io for shim
-            // For OOO, repeat = numCoreTiles * ooNumIterations (total source transactions).
-            // Each core sends ooNumIterations BD transactions; the SHIM must receive
-            // all of them before the flow is complete.
-            int32_t repeatCount = 1;
-            if (useOOO) {
-                repeatCount = (int32_t)(numCoreTiles * ooNumIterations);
-            } else if (shimIsSender) {
-                // Channel repeat must match iter_wrap so the DMA engine
-                // re-executes the BD the correct number of times.
-                auto moduleOp = op->getParentOfType<ModuleOp>();
+            if (classification.mMode == TilingMode::Multiple && shimIsSender) {
+                // === Multiple mode, input flow: unified scf.for from 0 to mRounds ===
+                // Kernel load/launch and core DMAs armed ONCE outside the loop.
+                // A single scf.for handles ALL iterations uniformly (no special-casing
+                // of iteration 0). Each iteration: config BD → create IO → start IO → wait.
+                llvm::errs() << "[BlueprintToSchedule] Multiple mode input flow: "
+                             << "mRounds=" << classification.mRounds << ", emitting unified SCF loop from 0\n";
+
+                // Erase the initial createIoOp and shimBdOp created above —
+                // they are unused in Multiple mode because the loop body
+                // creates its own BD and create_io each iteration.
+                // In Multiple mode, lastShimBdHandle is only consumed by
+                // createIoOp, so both can be erased unconditionally.
+                {
+                    Operation *shimBdDefOp = lastShimBdHandle ? lastShimBdHandle.getDefiningOp() : nullptr;
+                    rewriter.eraseOp(createIoOp);
+                    if (shimBdDefOp)
+                        rewriter.eraseOp(shimBdDefOp);
+                }
+
+                // Compute per-iteration repeat = kRounds (BD handles K-rounds per SCF iteration)
+                int32_t perIterRepeat = 1;
                 if (moduleOp) {
                     auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
-                    if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
-                        auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                        auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                    if (kRoundsAttr && kRoundsAttr.getInt() > 1)
+                        perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt());
+                }
 
-                        if (tileM > 0 && tileM < tileRows) {
-                            // repeat = iter_wrap = mRounds
-                            int64_t mRounds = tileRows / tileM;
-                            repeatCount = static_cast<int32_t>(mRounds);
-                        } else {
-                            // repeat = iter_wrap = kRounds (existing)
+                // Compute the byte stride per M sub-tile for offset computation
+                // stride = tileM * fullK * elemBytes
+                int64_t elemBytes = 1;
+                if (memrefType.getElementType().isIntOrFloat())
+                    elemBytes = memrefType.getElementTypeBitWidth() / 8;
+                if (elemBytes == 0)
+                    elemBytes = 1;
+                int64_t tileMVal = 0, fullKVal = 0;
+                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
+                    tileMVal = a.getInt();
+                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k"))
+                    fullKVal = a.getInt();
+                int64_t mSubTileStride = tileMVal * fullKVal * elemBytes;
+
+                // 1. load_kernel_group OUTSIDE the loop
+                auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
+                    loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
+                    rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs), nullptr,
+                    rewriter.getArrayAttr(kernelConfigSymbols));
+
+                // 2. launch_kernel_group OUTSIDE the loop (kernel runs continuously,
+                //    stalls at first DMA read until data arrives)
+                auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
+
+                // 3. Core start_io OUTSIDE the loop (core DMAs armed once with total repeat)
+                SmallVector<Value> coreStartIoEvents;
+                for (auto &deferred : deferredCoreStartIos) {
+                    auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
+                        rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(deferred.repeatCount));
+                    coreStartIoEvents.push_back(coreStartIo.getEvent());
+                }
+
+                // 4. Single scf.for from 0 to mRounds (ALL iterations uniform)
+                {
+                    auto lb = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+                    auto ub = rewriter.create<arith::ConstantIndexOp>(loc, classification.mRounds);
+                    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+                    auto forOp = rewriter.create<scf::ForOp>(loc, lb, ub, step);
+                    rewriter.setInsertionPointToStart(forOp.getBody());
+                    Value iv = forOp.getInductionVar(); // index type
+
+                    // Cast index → i32 for arithmetic
+                    auto ivI32 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), iv);
+
+                    // Compute offset = iv * mSubTileStride
+                    auto strideConst = rewriter.create<arith::ConstantIntOp>(loc, static_cast<int32_t>(mSubTileStride),
+                                                                             rewriter.getI32Type());
+                    auto offset = rewriter.create<arith::MulIOp>(loc, ivI32, strideConst);
+
+                    // Config BD with dynamic offset AND correct K-round iter settings
+                    auto loopBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                        loc, dfschedule::BdHandleType::get(rewriter.getContext()),
+                        ddrBuffer,                                  // buffer
+                        shimTileOp.getTile(),                       // tile
+                        shimBdIdConst.getResult(),                  // bd_id
+                        offset.getResult(),                         // offset (dynamic)
+                        rewriter.getI32IntegerAttr(perTileShimLen), // len
+                        rewriter.getBoolAttr(false),                // enable_packet
+                        rewriter.getI32IntegerAttr(0),              // packet_id
+                        rewriter.getI32IntegerAttr(4294967295),     // next_bd = none
+                        rewriter.getI32IntegerAttr(0),              // acquire_lock_id
+                        rewriter.getI32IntegerAttr(0),              // acquire_lock_val
+                        rewriter.getI32IntegerAttr(0),              // release_lock_id
+                        rewriter.getI32IntegerAttr(0),              // release_lock_val
+                        rewriter.getI32IntegerAttr(dataId),         // data_id
+                        Value(),                                    // linked_bd = none
+                        rewriter.getI32IntegerAttr(-1),             // out_of_order_bd_id
+                        shimDimStrides, shimDimWraps,
+                        rewriter.getI32IntegerAttr(shimIterStepSize), // iter_step_size (K-round)
+                        rewriter.getI32IntegerAttr(shimIterWrap));    // iter_wrap (kRounds)
+
+                    // Create IO handle for the BD
+                    auto loopCreateIo = rewriter.create<dfschedule::ConfigCreateIoOp>(
+                        loc, dfschedule::IoHandleType::get(rewriter.getContext()), loopBd.getBdHandle(),
+                        shimTileOp.getTile(), rewriter.getI32IntegerAttr(shimChannel),
+                        rewriter.getStringAttr(dmaDirection), rewriter.getStringAttr(ioOperation),
+                        rewriter.getBoolAttr(false));
+
+                    // Start IO for this iteration
+                    auto loopGetBdId =
+                        rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
+                    auto loopStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), loopCreateIo.getIoHandle(),
+                        loopGetBdId.getBdId(), rewriter.getI32IntegerAttr(flowIndex),
+                        rewriter.getI32IntegerAttr(perIterRepeat));
+
+                    // Wait for this iteration's DMA to complete before next BD re-arm
+                    SmallVector<Value> loopWaitEvents;
+                    loopWaitEvents.push_back(loopStartIo.getEvent());
+                    rewriter.create<dfschedule::ScheduleWaitOp>(loc, loopWaitEvents);
+
+                    rewriter.setInsertionPointAfter(forOp);
+                }
+
+                // 5. After all iterations: wait for kernel launch event
+                SmallVector<Value> finalEvents;
+                finalEvents.push_back(launchKernelGroupOp.getEvent());
+                rewriter.create<dfschedule::ScheduleWaitOp>(loc, finalEvents);
+
+            } else {
+                // === Match mode or output flow: existing straight-line schedule ===
+
+                // Shim start_io is emitted BEFORE load_kernel_group so that shim DMA
+                // channels are armed first.  Core start_io remains after kernel launch
+                // to avoid BSS-zeroing races.
+                int32_t repeatCount = 1;
+                if (useOOO) {
+                    repeatCount = (int32_t)(numCoreTiles * ooNumIterations);
+                } else if (shimIsSender) {
+                    // Channel repeat must match iter_wrap so the DMA engine
+                    // re-executes the BD the correct number of times.
+                    if (moduleOp) {
+                        auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
+                        if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
                             repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
                         }
                     }
                 }
+                auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(),
+                    getBdIdOp.getBdId(), rewriter.getI32IntegerAttr(flowIndex),
+                    rewriter.getI32IntegerAttr(repeatCount));
+
+                // Create dfschedule.config.load_kernel_group
+                auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
+                    loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
+                    rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs), nullptr,
+                    rewriter.getArrayAttr(kernelConfigSymbols));
+
+                // Create dfschedule.schedule.launch_kernel_group
+                auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
+
+                // Emit deferred core StartIoOp calls AFTER kernel load/launch
+                SmallVector<Value> coreStartIoEvents;
+                for (auto &deferred : deferredCoreStartIos) {
+                    auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
+                        rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(deferred.repeatCount));
+                    coreStartIoEvents.push_back(coreStartIo.getEvent());
+                }
+
+                // Wait for kernel launch + shim IO events
+                SmallVector<Value> events;
+                events.push_back(launchKernelGroupOp.getEvent());
+                events.push_back(startIoOp.getEvent());
+                rewriter.create<dfschedule::ScheduleWaitOp>(loc, events);
             }
-            auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
-                loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(), getBdIdOp.getBdId(),
-                rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(repeatCount));
-
-            // Create dfschedule.config.load_kernel_group with distributed_args pointing to kernel configs
-            auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
-                loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
-                rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs),
-                nullptr,                                     // kernel_config = nullptr (not used)
-                rewriter.getArrayAttr(kernelConfigSymbols)); // distributed_args = [@kernelconfig0, @kernelconfig1, ...]
-
-            // Create dfschedule.schedule.launch_kernel_group
-            auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
-                loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
-
-            // Emit deferred core StartIoOp calls AFTER kernel load/launch.
-            // This ensures the ELF BSS initialization (which zeroes buf_in_ping/pong)
-            // completes before core S2MM DMAs start writing data into those buffers.
-            SmallVector<Value> coreStartIoEvents;
-            for (auto &deferred : deferredCoreStartIos) {
-                auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
-                    loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
-                    rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(deferred.repeatCount));
-                coreStartIoEvents.push_back(coreStartIo.getEvent());
-        }
-
-        // Create dfschedule.schedule.wait with kernel launch + shim IO events only.
-        // Core tile IO events are excluded: core DMAs use infinite ping-pong BD
-        // chaining (next_bd cycles BD0→BD1→BD0→...), so wait_io would never
-        // return. The kernel launch event already ensures cores have completed.
-        SmallVector<Value> events;
-        events.push_back(launchKernelGroupOp.getEvent());
-        events.push_back(startIoOp.getEvent());
-        rewriter.create<dfschedule::ScheduleWaitOp>(loc, events);
 
         // Stage 6: free DDR allocation after all transfers complete
         if (ddrBuffer) {
@@ -1813,7 +1982,7 @@ void BlueprintToSchedulePass::runOnOperation() {
     ConversionTarget target(*context);
     target.addLegalDialect<dfschedule::dfscheduledialect, routing::routingdialect, func::FuncDialect,
                            memref::MemRefDialect, arith::ArithDialect, scf::SCFDialect, tensor::TensorDialect,
-                           bufferization::BufferizationDialect, BuiltinDialect>();
+                           bufferization::BufferizationDialect, BuiltinDialect, emitc::EmitCDialect>();
 
     target.addIllegalOp<dfscheblueprint::FlowConfigOp>();
     target.addIllegalOp<dfscheblueprint::TileGroupOp>();

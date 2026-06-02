@@ -179,6 +179,7 @@ target_link_libraries(test PUBLIC
 	MLIRMathToLLVM
 			#MLIRROCDLToLLVMIRTranslation
 			#MLIRGPUDialect
+			MLIRSCFToEmitC
 			#MLIRSCFToControlFlow
 			#MLIRIndexToLLVM
 			#MLIRGPUToROCDLTransforms

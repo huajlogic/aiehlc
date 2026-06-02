@@ -15,7 +15,6 @@
 #include "dfschedulemanager.h"
 #include "dmaphopmanager.h"
 #include "dmapmanager.h"
-#include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "routinghwlower.h"
 #include "routinghwmanager.h"
