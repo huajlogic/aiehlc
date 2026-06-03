@@ -14,6 +14,8 @@
 #include "passdmaphoptodfscheblueprint.h"
 #include "passdmaphoptoroutinghw.h"
 #include "passschedulecanonicalize.h"
+#include "passschedulesequentialop.h"
+#include "passwaitmerge.h"
 #include "routingconstantfold.h"
 #include "routingdeadargclean.h"
 #include "routinghwlower.h"
@@ -341,6 +343,11 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
                        "ScheduleCanonicalizePass"))
+        return false;
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleSequentialOpPass>(), irDir, stage,
+                               "ScheduleSequentialOpPass"))
+        return false;
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::WaitMergePass>(), irDir, stage, "WaitMergePass"))
         return false;
     if (!runPipelineSinglePass(ctx, hostModule,
                                std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true, runtimeDebugLevel),
