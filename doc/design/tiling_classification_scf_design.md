@@ -1113,6 +1113,278 @@ All four cases are handled uniformly by the nested loop — when `mRounds == 1` 
 
 ---
 
+## 12. Shim S2MM Receiving Plan for OOO Output with tile_m/tile_n Sub-Tiling
+
+### Problem: Incorrect 3D Stride for Output Receiving
+
+When both `tile_m < tileRows` and `tile_n < tileCols`, the shim S2MM (output receiving) BD must use **4D addressing** (3 address dimensions + 1 iteration dimension) to correctly place each sub-tile block into the DDR output matrix.
+
+The current code (lines 944-966 of `passblueprinttoschedule.cpp`) uses 3D addressing with a "diagonal shift" D2 stride that conflates the N-column stepping with the M-row stepping. This produces incorrect DDR placement.
+
+### Analysis: Data Arrival Order
+
+The kernel produces output in the order dictated by the host SCF loop (or kernel internal `m_rounds × n_rounds` iteration):
+
+```
+For each m_round (M sub-tile iteration):
+  For each n_round (N sub-tile iteration):
+    Output one tile_m × tile_n block
+```
+
+For a 4-core-column shim receiving with OOO BDs (one BD per source core tile), each BD must independently receive `mRounds × nRounds` sub-tile blocks and place them into the correct DDR positions.
+
+### DDR Output Layout (Per-Tile Column)
+
+Each shim S2MM BD handles one source core tile's output. The core tile produces a `tileRows × tileN` region in DDR, subdivided into `mRounds × nRounds` sub-tile blocks of size `tile_m × tile_n`.
+
+```
+Example: M=64, N=64, HW_ROWS=4, HW_COLS=4, tile_m=8, tile_n=8
+  tileRows = 16, tileCols = 16
+  mRounds = 2, nRounds = 2
+  Per-tile: tileN = 16 columns
+  Output block: 8×8 = 64 elements (int8)
+
+Per-tile DDR layout (16 rows × 16 cols within the tile's column range):
+
+  +--------+--------+
+  | (0,0)  | (0,1)  |   ← m=0: rows 0-7
+  | 8×8    | 8×8    |
+  +--------+--------+
+  | (1,0)  | (1,1)  |   ← m=1: rows 8-15
+  | 8×8    | 8×8    |
+  +--------+--------+
+     n=0      n=1
+
+Block (mr,nr) occupies:
+  rows: [mr*tile_m .. (mr+1)*tile_m)
+  cols: [tile_col_start + nr*tile_n .. tile_col_start + (nr+1)*tile_n)
+```
+
+### DMA Dimension Plan
+
+The kernel sends blocks in the inner loop order: n iterates faster than m (A is repeated, B cycles). So the DMA receives blocks in order: `(0,0), (0,1), (1,0), (1,1)`.
+
+**4D DMA addressing (3 address dims + 1 iteration):**
+
+| Dim | Purpose | Stride (bytes) | Wrap | Formula |
+|-----|---------|---------------|------|---------|
+| D0 | Contiguous word within tile row | `wordBytes` = 4 | `tile_n / elemsPerWord` | For i8: tile_n=8, ePW=4 → wrap=2; but current code uses wrap=1 (no-op, len handles contiguous) |
+| D1 | Next row within sub-tile block | `outW / elemsPerWord * wordBytes` | `tile_m` | DDR row stride in bytes; tile_m rows per block |
+| D2 | Next N sub-tile (column advance) | `tile_n / elemsPerWord * wordBytes` | `nRounds` | Step tile_n elements to next column block |
+| D3 (iter) | Next M sub-tile (row advance) | `tile_m * outW / elemsPerWord * wordBytes` | `mRounds` | Step tile_m DDR rows to next row block |
+
+### Concrete Values (M=64, N=64, HW=4×4, tile_m=8, tile_n=8, int8)
+
+```
+outW = 64 elements = 16 words
+elemsPerWord = 4 (int8)
+wordBytes = 4
+
+D0: stride = 4 bytes,  wrap = 1 (pass-through; contiguous handled by len)
+D1: stride = 16*4 = 64 bytes,  wrap = 8 (tile_m rows)
+D2: stride = 8/4*4 = 8 bytes,  wrap = 2 (nRounds, column advance)
+D3: stride = 8*16*4 = 512 bytes,  wrap = 2 (mRounds, row advance)
+
+len = tile_m * tile_n * mRounds * nRounds = 8*8*2*2 = 256 bytes
+num_dims = 4 (3 address + 1 iteration)
+```
+
+### Expected API Call
+
+```cpp
+__Runtime_dma_bd_config_multidim(dev, shim_tile, buffer,
+    bd_id, 256,          // len = tileM * tileN * mRounds * nRounds
+    -1,                  // next_bd (disabled for OOO)
+    0, pkt_id,           // enable_packet=false, packet_id (for debug)
+    -1, 0, -1, 0, -1,   // no locks, no ooo_bd_id
+    4,                   // num_dims = 4 (3 address + 1 iteration)
+    4, 1,                // D0: stride=4, wrap=1 (contiguous pass-through)
+    64, 8,               // D1: stride=64, wrap=8 (tile_m rows, DDR row stride)
+    8, 2,                // D2: stride=8, wrap=2 (nRounds, column advance by tile_n)
+    512, 2               // D3/iter: stride=512, wrap=2 (mRounds, row advance by tile_m*outW)
+)
+```
+
+### Current (Incorrect) vs Expected (Correct)
+
+| Parameter | Current (3D diagonal) | Expected (4D: N-col + M-iter) |
+|-----------|----------------------|-------------------------------|
+| `num_dims` | 3 | **4** |
+| D0 | stride=4, wrap=1 | stride=4, wrap=1 (same) |
+| D1 | stride=64, wrap=8 | stride=64, wrap=8 (same) |
+| D2 | stride=**516**, wrap=**2** | stride=**8**, wrap=**2** |
+| D3 | stride=0, wrap=0 (unused) | stride=**512**, wrap=**2** |
+
+The current D2 stride=516 = `tileM * outW_w * wordBytes + 1 * wordBytes` = 8×16×4 + 4 = 516 conflates the M-row advance with a 1-word column shift, which is incorrect. The correct approach separates N-column stepping (D2) from M-row stepping (D3/iteration).
+
+### Generalized Formulas
+
+For any combination of tile_m, tile_n, outW, elemsPerWord:
+
+```
+D0_stride = wordBytes                            (= 4)
+D0_wrap   = 1                                    (pass-through)
+
+D1_stride = (outW / elemsPerWord) * wordBytes    (DDR row stride in bytes)
+D1_wrap   = tile_m                               (rows per sub-tile)
+
+D2_stride = (tile_n / elemsPerWord) * wordBytes   (column advance by tile_n)
+D2_wrap   = nRounds                               (= tileCols / tile_n)
+
+D3_stride = tile_m * (outW / elemsPerWord) * wordBytes  (row advance by tile_m DDR rows)
+D3_wrap   = mRounds                                      (= tileRows / tile_m)
+
+num_dims = 4                                     (3 address + 1 iteration)
+len = tile_m * tile_n * mRounds * nRounds * elemBytes
+```
+
+### Edge Cases
+
+| Condition | nRounds | mRounds | Solution |
+|-----------|---------|---------|----------|
+| tile_n == tileCols (N-match) | 1 | >1 | D2 wrap=1 (no-op), D3 handles mRounds. Equivalent to current 2D + iteration. |
+| tile_m == tileRows (M-match) | >1 | 1 | D3 wrap=1 (no-op), D2 handles nRounds. Effectively 3D only. |
+| Both match | 1 | 1 | D2 wrap=1, D3 wrap=1. Degenerates to 2D (current Match mode). |
+| Both sub-tiled | >1 | >1 | Full 4D as described above. |
+
+All four cases are handled uniformly by the 4D formula — when a wrap value is 1, the corresponding dimension is a no-op.
+
+### Verification Trace
+
+For BD on tile (3,0) receiving from core tile column 3 (the user's line 355 example):
+
+```
+M=64, N=64, HW=4×4, tile_m=8, tile_n=8, int8
+Per-tile tileN = 16, tileRows = 16
+mRounds = 2, nRounds = 2
+
+Block (0,0): rows 0-7, cols 0-7 within tile column
+  DDR base + 0 → D1 sweeps 8 rows at stride 64
+Block (0,1): rows 0-7, cols 8-15
+  D2 advances by 8 bytes → same rows, next tile_n columns
+Block (1,0): rows 8-15, cols 0-7
+  D3 (iter) advances by 512 bytes (8 rows × 64 bytes/row)
+  D2 resets to column 0
+Block (1,1): rows 8-15, cols 8-15
+  D2 advances by 8 bytes again
+
+Total: 4 blocks × 64 bytes = 256 bytes ✓
+```
+
+---
+
+## 13. Fix Plan: Shim S2MM OOO BD 4D Addressing
+
+### Root Cause
+
+In `passblueprinttoschedule.cpp` lines 944-966, the OOO shim S2MM BD dimension computation uses 3D addressing with a "diagonal shift" D2 that combines M-row and N-column advances into a single stride. This is incorrect when both `tile_m < tileRows` and `tile_n < tileCols`.
+
+### Fix Location
+
+**File**: `src/mlir/mlirfront/tilinglinalg/pass/passblueprinttoschedule/passblueprinttoschedule.cpp`
+
+**Lines**: 944-972 (the `if (tileM > 0 && tileM < tileRowsVal && !shimIsSender)` block)
+
+### Fix Steps
+
+#### Step 1: Read tile_n and tile_cols attributes
+
+Currently the code only reads `routing.tile_m` and `routing.tile_rows`. Add reading of `routing.tile_n` and `routing.tile_cols` to compute `nRounds`.
+
+```cpp
+auto tileNAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n") : nullptr;
+auto tileColsAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols") : nullptr;
+int64_t tileMVal = tileMAttr ? tileMAttr.getInt() : 0;
+int64_t tileNVal = tileNAttr ? tileNAttr.getInt() : 0;
+int64_t tileRowsVal = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+int64_t tileColsVal = tileColsAttr ? tileColsAttr.getInt() : 0;
+```
+
+#### Step 2: Compute nRounds
+
+```cpp
+int64_t nRounds = 1;
+int64_t tileN_sub = tileN; // per-tile column width (outW / numCoreTiles)
+if (tileNVal > 0 && tileNVal < tileColsVal) {
+    nRounds = tileColsVal / tileNVal;
+    tileN_sub = tileNVal; // use sub-tile width, not full per-tile width
+}
+```
+
+Note: `tileN` (= outW / numCoreTiles) is the per-tile column width. `tile_n` (from module attr) is the sub-tile width. When nRounds > 1, each BD must use `tile_n` for D2 stepping, not `tileN`.
+
+#### Step 3: Replace 3D diagonal with 4D addressing
+
+Replace the current 3D stride computation with:
+
+```cpp
+SmallVector<Attribute> strides4d, wraps4d;
+// D0: contiguous word (pass-through)
+strides4d.push_back(rewriter.getI32IntegerAttr(1 * wordBytes));
+wraps4d.push_back(rewriter.getI32IntegerAttr(1));
+
+// D1: DDR row stride, tile_m rows
+strides4d.push_back(rewriter.getI32IntegerAttr(outW_w * wordBytes));
+wraps4d.push_back(rewriter.getI32IntegerAttr(tileM));
+
+// D2: N column advance by tile_n
+int64_t tileN_sub_w = tileN_sub / elemsPerWord;
+strides4d.push_back(rewriter.getI32IntegerAttr(tileN_sub_w * wordBytes));
+wraps4d.push_back(rewriter.getI32IntegerAttr(nRounds));
+
+// D3: M row advance by tile_m DDR rows (becomes iteration dim)
+int64_t d3Stride = tileM * outW_w * wordBytes;
+strides4d.push_back(rewriter.getI32IntegerAttr(d3Stride));
+wraps4d.push_back(rewriter.getI32IntegerAttr(mRounds));
+
+perTileDimStrides = rewriter.getArrayAttr(strides4d);
+perTileDimWraps = rewriter.getArrayAttr(wraps4d);
+```
+
+#### Step 4: Update perRoundBytes (BD len)
+
+The BD `len` must cover the full D0×D1×D2×D3 volume:
+
+```cpp
+perRoundBytes = tileM * tileN_sub * mRounds * nRounds * ooElementSizeBytes;
+```
+
+This replaces the current `tileM * tileN * mRounds` formula (which didn't account for nRounds and used the wrong tileN).
+
+#### Step 5: Ensure num_dims=4 in ConfigDmaBdOp
+
+The `ConfigDmaBdOp` must emit `num_dims=4` when 4 dimension pairs are provided. Check that `passdfscheduletoapi.cpp` correctly counts dimensions from the dim_strides array length. Since we now push 4 strides + 4 wraps, the op should emit `num_dims=4`.
+
+Verify in `passdfscheduletoapi.cpp` (around ConfigDmaBdInnerPattern) that the dim count is derived from the array size, not hardcoded to 3.
+
+#### Step 6: Handle edge case nRounds=1
+
+When `tile_n == tileCols` (N-match), `nRounds = 1`. The formula still works: D2 wrap=1 is a no-op, and D3 handles mRounds. This degenerates to the equivalent of the current 2D+iteration path, so no special casing is needed.
+
+Similarly, when `tile_m == tileRows` (M-match) but `tile_n < tileCols`, we need D2 for nRounds and D3 wrap=1. The current code path (lines 944) only triggers when `tileM > 0 && tileM < tileRowsVal`, so this case would not enter the 3D block. A separate condition should handle N-only sub-tiling if needed.
+
+### Testing
+
+After the fix, regenerate host.cc and verify:
+
+1. **Line 355 specifically**: The call should become:
+   ```
+   __Runtime_dma_bd_config_multidim(v1, v39, v188, 5, 256, -1, 0, 4, -1, 0, -1, 0, -1, 4, 4, 1, 64, 8, 8, 2, 512, 2)
+   ```
+
+2. **All 4 per-tile OOO BDs** (bd_id=2,3,4,5 on tile (3,0)): same dimension pattern, different packet_ids and buffer offsets.
+
+3. **HW verification**: Run with `apppaltest.py` and check output matrix matches golden reference.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `passblueprinttoschedule.cpp:944-972` | Replace 3D diagonal strides with 4D (D2=N-col, D3=M-iter) |
+| `passblueprinttoschedule.cpp:991-1010` | Update perRoundBytes to include nRounds |
+
+---
+
 ## References
 
 - `src/mlir/mlirfront/tilinglinalg/pass/passblueprinttoschedule/passblueprinttoschedule.cpp` -- host schedule generation (lines 1666-1735: load/launch/start_io/wait pattern; lines 1676-1701: current mRounds repeat logic)

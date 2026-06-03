@@ -942,34 +942,60 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 int64_t tileRowsVal = tileRowsAttr ? tileRowsAttr.getInt() : 0;
 
                 if (tileM > 0 && tileM < tileRowsVal && !shimIsSender) {
-                    // 3D strides for m_rounds diagonal shift
+                    // 4D addressing for tile_m/tile_n sub-tiling on output:
+                    //   D0: stride=wordBytes, wrap=1 (pass-through, contiguous handled by len)
+                    //   D1: stride=outW_w*wordBytes, wrap=tileM (rows per sub-tile)
+                    //   D2: stride=tileN_sub_w*wordBytes, wrap=nRounds (column advance by tile_n)
+                    //   D3: stride=tileM*outW_w*wordBytes, wrap=mRounds (row advance by tile_m)
+                    // D0-D2 are address dimensions; D3 becomes the iteration dimension
+                    // in __Runtime_dma_bd_config_multidim (num_dims=4).
                     int64_t mRounds = tileRowsVal / tileM;
                     unsigned bitWidth = memrefType.getElementTypeBitWidth();
                     int64_t elemsPerWord = 32 / bitWidth;
                     constexpr int64_t wordBytes = 4;
                     int64_t outW = memrefType.getDimSize(1); // full output row width (elements)
-                    int64_t tileN = outW / numCoreTiles;     // per-tile column width (elements)
-                    int64_t tileN_w = tileN / elemsPerWord;  // in words
+                    int64_t tileN_full = outW / numCoreTiles; // per-tile column width (elements)
                     int64_t outW_w = outW / elemsPerWord;
 
-                    SmallVector<Attribute> strides3d, wraps3d;
-                    strides3d.push_back(rewriter.getI32IntegerAttr(1 * wordBytes));      // D0: word stride
-                    wraps3d.push_back(rewriter.getI32IntegerAttr(1));                    // D0: 1 word (single step)
-                    strides3d.push_back(rewriter.getI32IntegerAttr(outW_w * wordBytes)); // D1: DDR row stride
-                    wraps3d.push_back(rewriter.getI32IntegerAttr(tileM));                // D1: tile_m rows
-                    int64_t d2Stride = tileM * outW_w * wordBytes + 1 * wordBytes;       // row advance + 1 word
-                    strides3d.push_back(rewriter.getI32IntegerAttr(d2Stride));           // D2: m_round stride
-                    wraps3d.push_back(rewriter.getI32IntegerAttr(mRounds));              // D2: m_rounds
+                    // Compute nRounds from tile_n attribute
+                    auto tileNAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n") : nullptr;
+                    auto tileColsAttr_mn =
+                        moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols") : nullptr;
+                    int64_t tileNVal = tileNAttr ? tileNAttr.getInt() : 0;
+                    int64_t tileColsVal = tileColsAttr_mn ? tileColsAttr_mn.getInt() : 0;
+                    int64_t nRounds = 1;
+                    int64_t tileN_sub = tileN_full; // default: full per-tile width
+                    if (tileNVal > 0 && tileNVal < tileColsVal) {
+                        nRounds = tileColsVal / tileNVal;
+                        tileN_sub = tileNVal; // use sub-tile width for D2 stepping
+                    }
+                    int64_t tileN_sub_w = tileN_sub / elemsPerWord;
 
-                    perTileDimStrides = rewriter.getArrayAttr(strides3d);
-                    perTileDimWraps = rewriter.getArrayAttr(wraps3d);
+                    SmallVector<Attribute> strides4d, wraps4d;
+                    // D0: contiguous word (pass-through)
+                    strides4d.push_back(rewriter.getI32IntegerAttr(1 * wordBytes));
+                    wraps4d.push_back(rewriter.getI32IntegerAttr(tileN_sub_w));
+                    // D1: DDR row stride, tile_m rows per sub-tile
+                    strides4d.push_back(rewriter.getI32IntegerAttr(outW_w * wordBytes));
+                    wraps4d.push_back(rewriter.getI32IntegerAttr(tileM));
+                    // D2: N column advance by tile_n (nRounds steps)
+                    strides4d.push_back(rewriter.getI32IntegerAttr(tileN_sub_w * wordBytes));
+                    wraps4d.push_back(rewriter.getI32IntegerAttr(nRounds));
+                    // D3: M row advance by tile_m DDR rows (mRounds steps, becomes iteration dim)
+                    int64_t d3Stride = tileM * outW_w * wordBytes;
+                    strides4d.push_back(rewriter.getI32IntegerAttr(d3Stride));
+                    wraps4d.push_back(rewriter.getI32IntegerAttr(mRounds));
+
+                    perTileDimStrides = rewriter.getArrayAttr(strides4d);
+                    perTileDimWraps = rewriter.getArrayAttr(wraps4d);
                     usedMRounds3D = true;
 
-                    llvm::errs() << "[OOO ShimBD 3D] tileM=" << tileM << " tileRows=" << tileRowsVal
-                                 << " mRounds=" << mRounds << " tileN=" << tileN << " outW=" << outW << " D0=["
-                                 << (1 * wordBytes) << "," << 1 << "]"
+                    llvm::errs() << "[OOO ShimBD 4D] tileM=" << tileM << " tileRows=" << tileRowsVal
+                                 << " mRounds=" << mRounds << " tileN_sub=" << tileN_sub << " nRounds=" << nRounds
+                                 << " outW=" << outW << " D0=[" << (1 * wordBytes) << "," << tileN_sub_w << "]"
                                  << " D1=[" << (outW_w * wordBytes) << "," << tileM << "]"
-                                 << " D2=[" << d2Stride << "," << mRounds << "]\n";
+                                 << " D2=[" << (tileN_sub_w * wordBytes) << "," << nRounds << "]"
+                                 << " D3=[" << d3Stride << "," << mRounds << "]\n";
                 } else if (shimDimStrides && shimDimWraps && shimDimStrides.size() >= 2) {
                     // 2D strides (original path)
                     SmallVector<Attribute> strides2d, wraps2d;
@@ -984,10 +1010,11 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 }
             }
 
-            // When 3D strides handle m_rounds via D2, BD-level iteration is
-            // not needed — set iter_wrap=1, iter_step_size=0.
-            // Also update perRoundBytes: the BD len must cover the entire
-            // D0×D1×D2 volume (tileN × tileM × mRounds bytes per tile).
+            // When 4D strides handle m_rounds (D3/iter) and n_rounds (D2),
+            // BD-level OOO iteration is not needed — set iter_wrap=1, iter_step_size=0.
+            // The BD len must cover the full D0×D1×D2 volume per iteration:
+            //   len = tile_m * tile_n_sub * nRounds * mRounds * elemBytes
+            // D3 (iteration dim) handles mRounds repetition with row advancing.
             if (usedMRounds3D) {
                 oooIterWrap = 1;
                 oooIterStepSize = 0;
@@ -995,16 +1022,27 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 auto moduleOp = op->getParentOfType<ModuleOp>();
                 auto tileMAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m") : nullptr;
                 auto tileRowsAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows") : nullptr;
+                auto tileNAttr_pr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n") : nullptr;
+                auto tileColsAttr_pr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols") : nullptr;
                 int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
                 int64_t tileRowsVal = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                int64_t tileNVal_pr = tileNAttr_pr ? tileNAttr_pr.getInt() : 0;
+                int64_t tileColsVal_pr = tileColsAttr_pr ? tileColsAttr_pr.getInt() : 0;
                 if (tileM > 0 && tileM < tileRowsVal) {
                     int64_t mRounds = tileRowsVal / tileM;
                     int64_t outW = memrefType.getDimSize(1);
-                    int64_t tileN = outW / numCoreTiles;
-                    perRoundBytes = tileM * tileN * mRounds * ooElementSizeBytes;
-                    // Also update ooNumIterations to 1 since D2 handles all rounds
+                    int64_t tileN_full = outW / numCoreTiles;
+                    int64_t nRounds = 1;
+                    int64_t tileN_sub = tileN_full;
+                    if (tileNVal_pr > 0 && tileNVal_pr < tileColsVal_pr) {
+                        nRounds = tileColsVal_pr / tileNVal_pr;
+                        tileN_sub = tileNVal_pr;
+                    }
+                    perRoundBytes = tileM * tileN_sub * nRounds * mRounds * ooElementSizeBytes;
+                    // Also update ooNumIterations to 1 since D3 (iter) handles all rounds
                     ooNumIterations = 1;
-                    llvm::errs() << "[OOO ShimBD 3D] perRoundBytes=" << perRoundBytes
+                    llvm::errs() << "[OOO ShimBD 4D] perRoundBytes=" << perRoundBytes << " mRounds=" << mRounds
+                                 << " nRounds=" << nRounds << " tileM=" << tileM << " tileN_sub=" << tileN_sub
                                  << " ooNumIterations=" << ooNumIterations << "\n";
                 }
             }
