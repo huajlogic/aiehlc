@@ -2202,11 +2202,18 @@ public:
                         module->setAttr("routing.tile_rows", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileRows));
                         module->setAttr("routing.m_rounds",
                                         attrBuilder.getI64IntegerAttr(mkd.derivedParams.spatialMRounds));
+                        module->setAttr("routing.tile_n", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileN));
+                        module->setAttr("routing.tile_cols", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileCols));
+                        module->setAttr("routing.n_rounds",
+                                        attrBuilder.getI64IntegerAttr(mkd.derivedParams.spatialNRounds));
                         llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
                                      << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
                                      << " full_k=" << mkd.derivedParams.kDim << " tile_m=" << mkd.derivedParams.tileM
                                      << " tile_rows=" << mkd.derivedParams.tileRows
-                                     << " m_rounds=" << mkd.derivedParams.spatialMRounds << "\n";
+                                     << " m_rounds=" << mkd.derivedParams.spatialMRounds
+                                     << " tile_n=" << mkd.derivedParams.tileN
+                                     << " tile_cols=" << mkd.derivedParams.tileCols
+                                     << " n_rounds=" << mkd.derivedParams.spatialNRounds << "\n";
                     }
 
                     // Replace aie::get_*() calls in kernel body with computed integer literals
@@ -2525,11 +2532,18 @@ public:
                     module->setAttr("routing.tile_rows", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileRows));
                     module->setAttr("routing.m_rounds",
                                     attrBuilder.getI64IntegerAttr(derivedTilingParams.spatialMRounds));
+                    module->setAttr("routing.tile_n", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileN));
+                    module->setAttr("routing.tile_cols", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileCols));
+                    module->setAttr("routing.n_rounds",
+                                    attrBuilder.getI64IntegerAttr(derivedTilingParams.spatialNRounds));
                     llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
                                  << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds
                                  << " full_k=" << derivedTilingParams.kDim << " tile_m=" << derivedTilingParams.tileM
                                  << " tile_rows=" << derivedTilingParams.tileRows
-                                 << " m_rounds=" << derivedTilingParams.spatialMRounds << "\n";
+                                 << " m_rounds=" << derivedTilingParams.spatialMRounds
+                                 << " tile_n=" << derivedTilingParams.tileN
+                                 << " tile_cols=" << derivedTilingParams.tileCols
+                                 << " n_rounds=" << derivedTilingParams.spatialNRounds << "\n";
                 }
 
                 // Replace aie::get_*() calls in kernel body with computed integer literals

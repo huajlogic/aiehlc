@@ -5,20 +5,20 @@
 void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_int8 *win_c) {
 
     // Compiler-resolved tiling parameters
-    const int tile_rows = 4;
-    const int tile_cols = 4;
+    const int tile_rows = 8;
+    const int tile_cols = 8;
     const int eff_k = 16;       // K chunk size per k-round
     const int k_rounds = 4;     // number of K-accumulation rounds
     const int num_a_rounds = 1; // DMA rounds per k-round for A
     const int num_b_rounds = 1; // DMA rounds per k-round for B
     const int num_c_rounds = 1;
-    const int buf_sz_a = 64;
-    const int buf_sz_b = 64;
-    const int buf_sz_c = 16;
+    const int buf_sz_a = 128;
+    const int buf_sz_b = 128;
+    const int buf_sz_c = 64;
 
     // Spatial sub-tile iteration counts
-    const int m_rounds = 4;
-    const int n_rounds = 4;
+    const int m_rounds = 2;
+    const int n_rounds = 2;
 
     // Derived per-round sizes (using effective_k, not full k_dim)
     const int rows_per_round = buf_sz_a / eff_k;
@@ -41,15 +41,16 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
     int8_t local_out[tile_rows * tile_cols];
 
     // ===== M sub-tile loop: each mr gets fresh A data across all k_rounds =====
-    for (int mr = 0; mr < m_rounds; mr++) {
+    for (int mr = 0; mr < m_rounds * n_rounds; mr++) {
 
+        klog("MR  ", (int32_t)mr);
         // Zero accumulators for this M sub-tile
         for (int i = 0; i < tile_rows * tile_cols; i++)
             accum[i] = 0;
 
         // ===== K-round loop: accumulate partial products =====
         for (int kr = 0; kr < k_rounds; kr++) {
-
+            klog("KR  ", (int32_t)kr);
             // --- Phase 1: Receive and cache A chunk for this (mr, kr) ---
             for (int ra = 0; ra < num_a_rounds; ra++) {
                 int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
@@ -57,9 +58,9 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
                     all_A[ra * buf_sz_a + i] = A_ptr[i];
                 }
 #if DEBUG_OUTPUT_ORDER
-                if (kr == 0 && mr == 0) {
-                    klog("A0  ", (int32_t)A_ptr[0]);
-                }
+                // if (kr == 0 && mr == 0) {
+                klog("A0  ", (int32_t)A_ptr[0]);
+                //}
 #endif
                 release_input_window(win_a);
             }
@@ -77,9 +78,9 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
                 }
 
 #if DEBUG_OUTPUT_ORDER
-                if (kr == 0 && mr == 0 && rb == 0) {
-                    klog("B0  ", (int32_t)B_ptr[0]);
-                }
+                // if (kr == 0 && mr == 0 && rb == 0) {
+                klog("B0  ", (int32_t)B_ptr[0]);
+                //}
 #endif
 
                 release_input_window(win_b);
@@ -101,11 +102,11 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
             for (int i = 0; i < rows_per_c_round; i++) {
                 for (int j = 0; j < tile_cols; j++) {
                     out[i * tile_cols + j] = local_out[rc * buf_sz_c + i * tile_cols + j];
-#if DEBUG_OUTPUT_ORDER
-                    klog("C0 ", (int32_t)out[i * tile_cols + j]);
-#endif
                 }
             }
+#if DEBUG_OUTPUT_ORDER
+            klog("C0 ", (int32_t)out[0]);
+#endif
 
             release_output_window(win_c);
         }

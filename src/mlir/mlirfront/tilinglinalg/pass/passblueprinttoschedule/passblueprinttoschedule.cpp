@@ -496,22 +496,27 @@ static Value resolveMemrefForView(Value viewValue, const BlueprintPassState &sta
 }
 
 // === Tiling Classification ===
-// Determines whether the M-dimension tiling requires host-side SCF loops.
+// Determines whether the M/N-dimension tiling requires host-side SCF loops.
 enum class TilingMode { Match, Multiple, Invalid };
 
 struct TilingClassification {
     TilingMode mMode;
     int64_t mRounds; // 1 for Match, tileRows/tileM for Multiple
+    TilingMode nMode;
+    int64_t nRounds; // 1 for Match, tileCols/tileN for Multiple
 };
 
 TilingClassification classifyTiling(ModuleOp moduleOp) {
     TilingClassification result;
     result.mMode = TilingMode::Match;
     result.mRounds = 1;
+    result.nMode = TilingMode::Match;
+    result.nRounds = 1;
 
     if (!moduleOp)
         return result;
 
+    // M-dimension classification
     auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
     auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
 
@@ -528,6 +533,25 @@ TilingClassification classifyTiling(ModuleOp moduleOp) {
         result.mMode = TilingMode::Invalid;
         result.mRounds = 0;
     }
+
+    // N-dimension classification
+    auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+    auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+
+    int64_t n = tileNAttr ? tileNAttr.getInt() : 0;
+    int64_t cols = tileColsAttr ? tileColsAttr.getInt() : 0;
+
+    if (n == 0 || n == cols) {
+        result.nMode = TilingMode::Match;
+        result.nRounds = 1;
+    } else if (n < cols && cols % n == 0) {
+        result.nMode = TilingMode::Multiple;
+        result.nRounds = cols / n;
+    } else {
+        result.nMode = TilingMode::Invalid;
+        result.nRounds = 0;
+    }
+
     return result;
 }
 
@@ -755,8 +779,21 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
                     int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
 
-                    if (tileM > 0 && tileM < tileRows) {
-                        // tile_m < partRows: len covers D0×D1×D2 total
+                    if (dataId == 1) {
+                        // Input B (Col-distributed): use tile_n dimension
+                        auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                        auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                        int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                        int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                        if (tileN > 0 && tileN < tileCols) {
+                            int64_t effectiveK = effectiveKAttr ? effectiveKAttr.getInt() : 0;
+                            int64_t kRounds = kRoundsAttr.getInt();
+                            perTileShimLen = tileN * effectiveK * kRounds;
+                        } else {
+                            perTileShimLen = shimBdLen / kRoundsAttr.getInt();
+                        }
+                    } else if (tileM > 0 && tileM < tileRows) {
+                        // Input A (Row-distributed): len covers D0×D1×D2 total
                         // = tile_m * effectiveK * kRounds
                         // (iter handles mRounds separately)
                         int64_t effectiveK = effectiveKAttr ? effectiveKAttr.getInt() : 0;
@@ -1075,30 +1112,57 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             if (elemBytes == 0)
                                 elemBytes = 1;
 
-                            int64_t tileM = 0, tileRows = 0;
-                            if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
-                                tileM = a.getInt();
-                            if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows"))
-                                tileRows = a.getInt();
+                            if (dataId == 1) {
+                                // Input B (Col-distributed): iter handles nRounds
+                                // D2 handles kRounds; iter advances across n-sub-tiles
+                                auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                                auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                                int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                                int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
 
-                            if (tileM > 0 && tileM < tileRows) {
-                                // Multiple mode: host SCF loop handles mRounds.
-                                // BD iter handles K-rounds only (same as Match mode).
-                                shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
-                                shimIterWrap = static_cast<int32_t>(kRounds);
-                                int64_t mRounds = tileRows / tileM;
-                                llvm::errs()
-                                    << "[BlueprintToSchedule] K-round shim iteration (host SCF handles mRounds): "
-                                    << "iter_step_size=" << shimIterStepSize << " iter_wrap=" << shimIterWrap
-                                    << " tileM=" << tileM << " tileRows=" << tileRows << " mRounds=" << mRounds
-                                    << " (mRounds via host SCF loop)\n";
+                                if (tileN > 0 && tileN < tileCols) {
+                                    int64_t nRounds = tileCols / tileN;
+                                    shimIterStepSize = static_cast<int32_t>(tileN * fullK * elemBytes);
+                                    shimIterWrap = static_cast<int32_t>(nRounds);
+                                    llvm::errs() << "[BlueprintToSchedule] Input B iter (nRounds): "
+                                                 << "iter_step_size=" << shimIterStepSize
+                                                 << " iter_wrap=" << shimIterWrap << " tileN=" << tileN
+                                                 << " tileCols=" << tileCols << " nRounds=" << nRounds << "\n";
+                                } else {
+                                    // No N sub-tiling: fall through to kRounds
+                                    shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
+                                    shimIterWrap = static_cast<int32_t>(kRounds);
+                                    llvm::errs() << "[BlueprintToSchedule] Input B iter (no N sub-tiling, kRounds): "
+                                                 << "iter_step_size=" << shimIterStepSize
+                                                 << " iter_wrap=" << shimIterWrap << "\n";
+                                }
                             } else {
-                                // D1 covers all rows; iter handles kRounds (existing)
-                                shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
-                                shimIterWrap = static_cast<int32_t>(kRounds);
-                                llvm::errs()
-                                    << "[BlueprintToSchedule] K-round shim iteration (2D): "
-                                    << "iter_step_size=" << shimIterStepSize << " iter_wrap=" << shimIterWrap << "\n";
+                                // Input A (Row-distributed): iter handles mRounds
+                                // D2 already handles kRounds; iter advances across m-sub-tiles
+                                int64_t tileM = 0, tileRows = 0;
+                                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
+                                    tileM = a.getInt();
+                                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows"))
+                                    tileRows = a.getInt();
+
+                                if (tileM > 0 && tileM < tileRows) {
+                                    // D2 handles kRounds (K-chunk stepping).
+                                    // iter handles mRounds (m-sub-tile stepping).
+                                    int64_t mRounds = tileRows / tileM;
+                                    shimIterStepSize = static_cast<int32_t>(tileM * fullK * elemBytes);
+                                    shimIterWrap = static_cast<int32_t>(mRounds);
+                                    llvm::errs() << "[BlueprintToSchedule] Input A iter (mRounds): "
+                                                 << "iter_step_size=" << shimIterStepSize
+                                                 << " iter_wrap=" << shimIterWrap << " tileM=" << tileM
+                                                 << " tileRows=" << tileRows << " mRounds=" << mRounds << "\n";
+                                } else {
+                                    // D1 covers all rows; iter handles kRounds
+                                    shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
+                                    shimIterWrap = static_cast<int32_t>(kRounds);
+                                    llvm::errs() << "[BlueprintToSchedule] Input A iter (2D, kRounds): "
+                                                 << "iter_step_size=" << shimIterStepSize
+                                                 << " iter_wrap=" << shimIterWrap << "\n";
+                                }
                             }
                         }
                     }
@@ -1743,12 +1807,38 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                         rewriter.eraseOp(shimBdDefOp);
                 }
 
-                // Compute per-iteration repeat = kRounds (BD handles K-rounds per SCF iteration)
+                // Compute per-iteration repeat: must match iter_wrap
+                // D2 handles kRounds; iter handles spatial sub-tile stepping.
+                // Input A: repeat = mRounds (BD iter handles m-sub-tiles)
+                // Input B: repeat = nRounds (BD iter handles n-sub-tiles)
                 int32_t perIterRepeat = 1;
                 if (moduleOp) {
                     auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
-                    if (kRoundsAttr && kRoundsAttr.getInt() > 1)
-                        perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt());
+                    if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
+                        if (dataId == 1) {
+                            // Input B: repeat = nRounds (matches iter_wrap)
+                            auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                            auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                            int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                            int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                            if (tileN > 0 && tileN < tileCols) {
+                                perIterRepeat = static_cast<int32_t>(tileCols / tileN);
+                            } else {
+                                perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt());
+                            }
+                        } else {
+                            // Input A: repeat = mRounds (matches iter_wrap)
+                            auto tileMAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                            auto tileRowsAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                            int64_t tileM = tileMAttr2 ? tileMAttr2.getInt() : 0;
+                            int64_t tileRows = tileRowsAttr2 ? tileRowsAttr2.getInt() : 0;
+                            if (tileM > 0 && tileM < tileRows) {
+                                perIterRepeat = static_cast<int32_t>(tileRows / tileM);
+                            } else {
+                                perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt());
+                            }
+                        }
+                    }
                 }
 
                 // Compute the byte stride per M sub-tile for offset computation
@@ -1868,7 +1958,29 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     if (moduleOp) {
                         auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
                         if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
-                            repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
+                            if (dataId == 1) {
+                                // Input B: repeat = nRounds (matches iter_wrap)
+                                auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                                auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                                int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                                int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                                if (tileN > 0 && tileN < tileCols) {
+                                    repeatCount = static_cast<int32_t>(tileCols / tileN);
+                                } else {
+                                    repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
+                                }
+                            } else {
+                                // Input A: repeat = mRounds (matches iter_wrap)
+                                auto tileMAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                                auto tileRowsAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                                int64_t tileM = tileMAttr2 ? tileMAttr2.getInt() : 0;
+                                int64_t tileRows = tileRowsAttr2 ? tileRowsAttr2.getInt() : 0;
+                                if (tileM > 0 && tileM < tileRows) {
+                                    repeatCount = static_cast<int32_t>(tileRows / tileM);
+                                } else {
+                                    repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
+                                }
+                            }
                         }
                     }
                 }
@@ -1896,10 +2008,33 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     coreStartIoEvents.push_back(coreStartIo.getEvent());
                 }
 
+                // Determine whether to bypass input sending IO wait.
+                // When tile_m == tile_rows (M-dimension Match) for Row-distributed
+                // inputs (funcArgIdx=0, input A), or tile_n == tile_cols (N-dimension
+                // Match) for Col-distributed inputs (funcArgIdx=1, input B), the shim
+                // DMA iteration handles all rounds autonomously via BD repeat — the
+                // host does not need to wait for the shim IO to complete before
+                // proceeding.
+                bool bypassInputIoWait = false;
+                if (shimIsSender) {
+                    // funcArgIdx 0 = input A (Row-distributed) → M dimension
+                    // funcArgIdx 1 = input B (Col-distributed) → N dimension
+                    if (funcArgIdx == 0 && classification.mMode == TilingMode::Match) {
+                        bypassInputIoWait = true;
+                        llvm::errs() << "[BlueprintToSchedule] Bypassing input IO wait for input A "
+                                     << "(funcArgIdx=0, M-dimension Match: tile_m == tile_rows)\n";
+                    } else if (funcArgIdx == 1 && classification.nMode == TilingMode::Match) {
+                        bypassInputIoWait = true;
+                        llvm::errs() << "[BlueprintToSchedule] Bypassing input IO wait for input B "
+                                     << "(funcArgIdx=1, N-dimension Match: tile_n == tile_cols)\n";
+                    }
+                }
+
                 // Wait for kernel launch + shim IO events
                 SmallVector<Value> events;
                 events.push_back(launchKernelGroupOp.getEvent());
-                events.push_back(startIoOp.getEvent());
+                if (!bypassInputIoWait)
+                    events.push_back(startIoOp.getEvent());
                 rewriter.create<dfschedule::ScheduleWaitOp>(loc, events);
             }
 

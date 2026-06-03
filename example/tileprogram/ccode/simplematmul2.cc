@@ -11,8 +11,8 @@ constexpr aie::SpatialPolicy RowBA = {
     .distribution = aie::Layout::Row,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
-    .tile_m = 4, // explicit sub-tile rows
-    .tile_n = 4, // 0 = auto (uses tileCols)
+    .tile_m = 8, // explicit sub-tile rows
+    .tile_n = 8, // 0 = auto (uses tileCols)
     .tile_k = 16 // K chunk size (4 k-rounds for K=256)
 };
 constexpr aie::SpatialPolicy ColBB = {
@@ -20,8 +20,8 @@ constexpr aie::SpatialPolicy ColBB = {
     .distribution = aie::Layout::Col,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
-    .tile_m = 4, // explicit sub-tile rows
-    .tile_n = 4, // 0 = auto (uses tileCols)
+    .tile_m = 8, // explicit sub-tile rows
+    .tile_n = 8, // 0 = auto (uses tileCols)
     .tile_k = 16 // K chunk size (4 k-rounds for K=256)
 };
 constexpr aie::SpatialPolicy LtoR_Merge = {
@@ -30,8 +30,8 @@ constexpr aie::SpatialPolicy LtoR_Merge = {
     .merge_order = aie::Flow::LeftToRight,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
-    .tile_m = 4, // explicit sub-tile rows
-    .tile_n = 4, // 0 = auto (uses tileCols)
+    .tile_m = 8, // explicit sub-tile rows
+    .tile_n = 8, // 0 = auto (uses tileCols)
     .tile_k = 16 // K chunk size (4 k-rounds for K=256)
 };
 #define DEBUG_OUTPUT_ORDER 1
@@ -75,15 +75,16 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<in
     int8_t local_out[tile_rows * tile_cols];
 
     // ===== M sub-tile loop: each mr gets fresh A data across all k_rounds =====
-    for (int mr = 0; mr < m_rounds; mr++) {
+    for (int mr = 0; mr < m_rounds * n_rounds; mr++) {
 
+        klog("MR  ", (int32_t)mr);
         // Zero accumulators for this M sub-tile
         for (int i = 0; i < tile_rows * tile_cols; i++)
             accum[i] = 0;
 
         // ===== K-round loop: accumulate partial products =====
         for (int kr = 0; kr < k_rounds; kr++) {
-
+            klog("KR  ", (int32_t)kr);
             // --- Phase 1: Receive and cache A chunk for this (mr, kr) ---
             for (int ra = 0; ra < num_a_rounds; ra++) {
                 int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
@@ -91,9 +92,9 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<in
                     all_A[ra * buf_sz_a + i] = A_ptr[i];
                 }
 #if DEBUG_OUTPUT_ORDER
-                if (kr == 0 && mr == 0) {
-                    klog("A0  ", (int32_t)A_ptr[0]);
-                }
+                // if (kr == 0 && mr == 0) {
+                klog("A0  ", (int32_t)A_ptr[0]);
+                //}
 #endif
                 release_input_window(win_a);
             }
@@ -111,9 +112,9 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<in
                 }
 
 #if DEBUG_OUTPUT_ORDER
-                if (kr == 0 && mr == 0 && rb == 0) {
-                    klog("B0  ", (int32_t)B_ptr[0]);
-                }
+                // if (kr == 0 && mr == 0 && rb == 0) {
+                klog("B0  ", (int32_t)B_ptr[0]);
+                //}
 #endif
 
                 release_input_window(win_b);
@@ -135,11 +136,11 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<in
             for (int i = 0; i < rows_per_c_round; i++) {
                 for (int j = 0; j < tile_cols; j++) {
                     out[i * tile_cols + j] = local_out[rc * buf_sz_c + i * tile_cols + j];
-#if DEBUG_OUTPUT_ORDER
-                    klog("C0 ", (int32_t)out[i * tile_cols + j]);
-#endif
                 }
             }
+#if DEBUG_OUTPUT_ORDER
+            klog("C0 ", (int32_t)out[0]);
+#endif
 
             release_output_window(win_c);
         }

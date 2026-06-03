@@ -843,11 +843,16 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                             int64_t fullK_w = fullK / elemsPerWord;     // fullK in words
 
                             if (tileM > 0 && tileM < partRows) {
-                                // 3D addressing: D0=K-chunk, D1=tile_m rows, D2=kRounds
-                                // When tile_m < partRows, the kernel processes A data in
-                                // sub-tiles of tile_m x effectiveK. D2 iterates through
-                                // kRounds K-chunks, and BD iteration (set in
-                                // passblueprinttoschedule) handles mRounds m-sub-tiles.
+                                // 3D addressing: D0=K-chunk, D1=sub-tile rows, D2=kRounds
+                                // Determine the sub-tile dimension based on flow type:
+                                //   Input A (dataId==0): D1 = tile_m (row sub-tiling)
+                                //   Input B (dataId==1): D1 = tile_n (col sub-tiling)
+                                auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                                int64_t subTileDim = tileM; // default: tile_m for input A
+                                if (dataId == 1 && tileNAttr) {
+                                    subTileDim = tileNAttr.getInt(); // input B: use tile_n
+                                }
+
                                 int64_t kRounds = fullK / effectiveK;
                                 SmallVector<int32_t> strides = {
                                     static_cast<int32_t>(1 * wordBytes),       // D0: 4 bytes
@@ -855,18 +860,19 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                                     static_cast<int32_t>(effectiveK)           // D2: effectiveK bytes
                                 };
                                 SmallVector<int32_t> wraps = {
-                                    static_cast<int32_t>(effK_w), // D0: effectiveK/4
-                                    static_cast<int32_t>(tileM),  // D1: tile_m rows
-                                    static_cast<int32_t>(kRounds) // D2: kRounds
+                                    static_cast<int32_t>(effK_w),     // D0: effectiveK/4
+                                    static_cast<int32_t>(subTileDim), // D1: tile_m or tile_n
+                                    static_cast<int32_t>(kRounds)     // D2: kRounds
                                 };
                                 inputShimDimStrides = rewriter.getI32ArrayAttr(strides);
                                 inputShimDimWraps = rewriter.getI32ArrayAttr(wraps);
 
                                 llvm::errs()
-                                    << "[ShimMultiDim] Push input (3D K-tiling, tile_m<partRows): "
+                                    << "[ShimMultiDim] Push input (3D K-tiling, sub-tile<partRows): "
                                     << "effectiveK=" << effectiveK << " fullK=" << fullK << " partRows=" << partRows
-                                    << " tileM=" << tileM << " kRounds=" << kRounds << " elemsPerWord=" << elemsPerWord
-                                    << " strides=[" << strides[0] << "," << strides[1] << "," << strides[2] << "]"
+                                    << " tileM=" << tileM << " subTileDim=" << subTileDim << " dataId=" << dataId
+                                    << " kRounds=" << kRounds << " elemsPerWord=" << elemsPerWord << " strides=["
+                                    << strides[0] << "," << strides[1] << "," << strides[2] << "]"
                                     << " wraps=[" << wraps[0] << "," << wraps[1] << "," << wraps[2] << "]\n";
                             } else {
                                 // 2D addressing (existing): D0=K-chunk, D1=partRows

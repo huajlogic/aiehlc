@@ -1,4 +1,4 @@
-module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.effective_k = 16 : i64, routing.full_k = 64 : i64, routing.k_rounds = 4 : i64, routing.m_rounds = 4 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}, routing.tile_m = 4 : i64, routing.tile_rows = 16 : i64} {
+module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.effective_k = 16 : i64, routing.full_k = 64 : i64, routing.k_rounds = 4 : i64, routing.m_rounds = 2 : i64, routing.n_rounds = 2 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}, routing.tile_cols = 16 : i64, routing.tile_m = 8 : i64, routing.tile_n = 8 : i64, routing.tile_rows = 16 : i64} {
   func.func @main(%arg0: memref<64x64xi8>, %arg1: memref<64x64xi8>, %arg2: memref<64x64xi8>) {
     %c3_i32 = arith.constant 3 : i32
     %c2_i32 = arith.constant 2 : i32
@@ -35,7 +35,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
           ,type = "shim"
           ,data_id = 0 : i32
           ,shim_dim_strides = [4 : i32, 64 : i32, 16 : i32]
-          ,shim_dim_wraps = [4 : i32, 4 : i32, 4 : i32]
+          ,shim_dim_wraps = [4 : i32, 8 : i32, 4 : i32]
         }
         dfscheblueprint.flowconfig @flow_dst_0 {
           target = @group_dst_0,
@@ -72,7 +72,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
           ,type = "shim"
           ,data_id = 0 : i32
           ,shim_dim_strides = [4 : i32, 64 : i32, 16 : i32]
-          ,shim_dim_wraps = [4 : i32, 4 : i32, 4 : i32]
+          ,shim_dim_wraps = [4 : i32, 8 : i32, 4 : i32]
         }
         dfscheblueprint.flowconfig @flow_dst_1 {
           target = @group_dst_1,
@@ -109,7 +109,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
           ,type = "shim"
           ,data_id = 0 : i32
           ,shim_dim_strides = [4 : i32, 64 : i32, 16 : i32]
-          ,shim_dim_wraps = [4 : i32, 4 : i32, 4 : i32]
+          ,shim_dim_wraps = [4 : i32, 8 : i32, 4 : i32]
         }
         dfscheblueprint.flowconfig @flow_dst_2 {
           target = @group_dst_2,
@@ -146,7 +146,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
           ,type = "shim"
           ,data_id = 0 : i32
           ,shim_dim_strides = [4 : i32, 64 : i32, 16 : i32]
-          ,shim_dim_wraps = [4 : i32, 4 : i32, 4 : i32]
+          ,shim_dim_wraps = [4 : i32, 8 : i32, 4 : i32]
         }
         dfscheblueprint.flowconfig @flow_dst_3 {
           target = @group_dst_3,
@@ -202,7 +202,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
           ,type = "shim"
           ,data_id = 1 : i32
           ,shim_dim_strides = [4 : i32, 64 : i32, 16 : i32]
-          ,shim_dim_wraps = [4 : i32, 4 : i32, 4 : i32]
+          ,shim_dim_wraps = [4 : i32, 8 : i32, 4 : i32]
         }
         dfscheblueprint.flowconfig @flow_dst_4 {
           target = @group_dst_4,
@@ -278,7 +278,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
           ,type = "shim"
           ,data_id = 1 : i32
           ,shim_dim_strides = [4 : i32, 64 : i32, 16 : i32]
-          ,shim_dim_wraps = [4 : i32, 4 : i32, 4 : i32]
+          ,shim_dim_wraps = [4 : i32, 8 : i32, 4 : i32]
         }
         dfscheblueprint.flowconfig @flow_dst_6 {
           target = @group_dst_6,
@@ -354,7 +354,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
           ,type = "shim"
           ,data_id = 1 : i32
           ,shim_dim_strides = [4 : i32, 64 : i32, 16 : i32]
-          ,shim_dim_wraps = [4 : i32, 4 : i32, 4 : i32]
+          ,shim_dim_wraps = [4 : i32, 8 : i32, 4 : i32]
         }
         dfscheblueprint.flowconfig @flow_dst_8 {
           target = @group_dst_8,
@@ -430,7 +430,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
           ,type = "shim"
           ,data_id = 1 : i32
           ,shim_dim_strides = [4 : i32, 64 : i32, 16 : i32]
-          ,shim_dim_wraps = [4 : i32, 4 : i32, 4 : i32]
+          ,shim_dim_wraps = [4 : i32, 8 : i32, 4 : i32]
         }
         dfscheblueprint.flowconfig @flow_dst_10 {
           target = @group_dst_10,
