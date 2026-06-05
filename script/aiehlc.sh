@@ -358,6 +358,10 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     for f in "${SOURCE_DIR}"/*.h; do
         [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
     done
+    # Copy JSON analysis files (provenance_map.json, etc.)
+    for f in "${HOST_BUILD_DIR}"/worklocal/*.json; do
+        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
+    done
 
     # Run hostcompile.sh
     export AIE_VERSION="${aie_version}"
