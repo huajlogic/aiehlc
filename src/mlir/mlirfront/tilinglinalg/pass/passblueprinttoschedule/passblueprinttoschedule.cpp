@@ -256,6 +256,15 @@ struct BlueprintPassState {
     // When multiple data tensors exist (e.g. input A, input B, output C),
     // each has its own backing memref.
     llvm::DenseMap<Value, Value> constantToMemref;
+    // Routing module attributes, cached before conversion (module attrs may be
+    // stripped during applyPartialConversion).
+    int64_t tileM = 0;
+    int64_t tileRows = 0;
+    int64_t tileN = 0;
+    int64_t tileCols = 0;
+    int64_t effectiveK = 0;
+    int64_t fullK = 0;
+    int64_t kRounds = 0;
 };
 
 static SmallVector<OpFoldResult> toOpFoldResult(ArrayRef<int64_t> values, OpBuilder &b) {
@@ -841,6 +850,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         SmallVector<int32_t> shimPerTileBdIds;
 
         Value lastShimBdHandle; // The BD handle consumed by ConfigCreateIoOp
+        SmallVector<Value> shimBdHandles; // OOO per-tile BD handles (for loop erasure)
 
         // --- Compute per-round parameters for OOO iteration ---
         // These values are identical for all tiles in this flow.
@@ -880,6 +890,17 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         int32_t shimIterStepSize = 0;
         int32_t shimIterWrap = 0;
 
+        // OOO m_rounds loop variables — declared here so they are visible
+        // in the schedule emission section below.
+        bool usedMRounds3D = false;
+        int64_t oooMRounds = 1;
+        int64_t oooMSubTileStride = 0;
+        int32_t oooIterStepSize = 0;
+        int32_t oooIterWrap = 0;
+        int64_t perTileStrideFromDims = 0;
+        ArrayAttr perTileDimStrides = nullptr;
+        ArrayAttr perTileDimWraps = nullptr;
+
         if (useOOO && numCoreTiles > 1) {
             // --- OOO path: N per-tile shim BDs ---
             // Each shim BD receives data from one core tile at the correct DDR
@@ -895,7 +916,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             // D2.stride gives the byte distance between adjacent tile columns in DDR.
             // For per-tile BDs, each BD starts at tile_index * D2.stride.
             // The BD uses 2D addressing (D0, D1) within its tile column.
-            int64_t perTileStrideFromDims = perTileDdrBytes; // fallback: flat linear
+            perTileStrideFromDims = perTileDdrBytes; // fallback: flat linear
             if (shimDimStrides && shimDimStrides.size() >= 3) {
                 // D2 (outermost, tile-column) stride gives per-tile DDR offset
                 perTileStrideFromDims = cast<IntegerAttr>(shimDimStrides[2]).getInt();
@@ -920,8 +941,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
 
             // When iter_wrap <= 1 (no repetition), set iter_step_size to 0
             // since the step is meaningless with a single pass.
-            int32_t oooIterWrap = (int32_t)ooNumIterations;
-            int32_t oooIterStepSize = (oooIterWrap > 1) ? (int32_t)(rowsPerRound * ddrRowStride) : 0;
+            oooIterWrap = (int32_t)ooNumIterations;
+            oooIterStepSize = (oooIterWrap > 1) ? (int32_t)(rowsPerRound * ddrRowStride) : 0;
 
             // Build per-tile addressing from shimDimStrides.
             // When tile_m < tileRows (M sub-tiling on output), use 3D strides
@@ -931,24 +952,17 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             //   D2: stride=tileM*outW_words*wordBytes + tileN_words*wordBytes, wrap=mRounds
             // D2 advances both tile_m rows AND tile_n columns in DDR per m_round.
             // Otherwise, use 2D strides (D0, D1) with D1 wrap adjusted to rows_per_round.
-            ArrayAttr perTileDimStrides = nullptr;
-            ArrayAttr perTileDimWraps = nullptr;
-            bool usedMRounds3D = false;
             {
-                auto moduleOp = op->getParentOfType<ModuleOp>();
-                auto tileMAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m") : nullptr;
-                auto tileRowsAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows") : nullptr;
-                int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                int64_t tileRowsVal = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                int64_t tileM = passState->tileM;
+                int64_t tileRowsVal = passState->tileRows;
 
                 if (tileM > 0 && tileM < tileRowsVal && !shimIsSender) {
-                    // 4D addressing for tile_m/tile_n sub-tiling on output:
-                    //   D0: stride=wordBytes, wrap=1 (pass-through, contiguous handled by len)
+                    // 2D addressing + iter for OOO output with m/n sub-tiling:
+                    //   D0: stride=wordBytes, wrap=tileN_sub_w (words per tile row)
                     //   D1: stride=outW_w*wordBytes, wrap=tileM (rows per sub-tile)
-                    //   D2: stride=tileN_sub_w*wordBytes, wrap=nRounds (column advance by tile_n)
-                    //   D3: stride=tileM*outW_w*wordBytes, wrap=mRounds (row advance by tile_m)
-                    // D0-D2 are address dimensions; D3 becomes the iteration dimension
-                    // in __Runtime_dma_bd_config_multidim (num_dims=4).
+                    // iter_step_size = tileN_sub_w * wordBytes (column advance for n_rounds)
+                    // iter_wrap = nRounds
+                    // m_rounds handled by scf.for loop (re-configuring BDs per iteration)
                     int64_t mRounds = tileRowsVal / tileM;
                     unsigned bitWidth = memrefType.getElementTypeBitWidth();
                     int64_t elemsPerWord = 32 / bitWidth;
@@ -958,44 +972,43 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     int64_t outW_w = outW / elemsPerWord;
 
                     // Compute nRounds from tile_n attribute
-                    auto tileNAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n") : nullptr;
-                    auto tileColsAttr_mn =
-                        moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols") : nullptr;
-                    int64_t tileNVal = tileNAttr ? tileNAttr.getInt() : 0;
-                    int64_t tileColsVal = tileColsAttr_mn ? tileColsAttr_mn.getInt() : 0;
+                    int64_t tileNVal = passState->tileN;
+                    int64_t tileColsVal = passState->tileCols;
                     int64_t nRounds = 1;
                     int64_t tileN_sub = tileN_full; // default: full per-tile width
                     if (tileNVal > 0 && tileNVal < tileColsVal) {
                         nRounds = tileColsVal / tileNVal;
-                        tileN_sub = tileNVal; // use sub-tile width for D2 stepping
+                        tileN_sub = tileNVal; // use sub-tile width for iter stepping
                     }
                     int64_t tileN_sub_w = tileN_sub / elemsPerWord;
 
-                    SmallVector<Attribute> strides4d, wraps4d;
-                    // D0: contiguous word (pass-through)
-                    strides4d.push_back(rewriter.getI32IntegerAttr(1 * wordBytes));
-                    wraps4d.push_back(rewriter.getI32IntegerAttr(tileN_sub_w));
+                    // 2D strides only (D0 + D1)
+                    SmallVector<Attribute> strides2d, wraps2d;
+                    // D0: contiguous word step
+                    strides2d.push_back(rewriter.getI32IntegerAttr(1 * wordBytes));
+                    wraps2d.push_back(rewriter.getI32IntegerAttr(tileN_sub_w));
                     // D1: DDR row stride, tile_m rows per sub-tile
-                    strides4d.push_back(rewriter.getI32IntegerAttr(outW_w * wordBytes));
-                    wraps4d.push_back(rewriter.getI32IntegerAttr(tileM));
-                    // D2: N column advance by tile_n (nRounds steps)
-                    strides4d.push_back(rewriter.getI32IntegerAttr(tileN_sub_w * wordBytes));
-                    wraps4d.push_back(rewriter.getI32IntegerAttr(nRounds));
-                    // D3: M row advance by tile_m DDR rows (mRounds steps, becomes iteration dim)
-                    int64_t d3Stride = tileM * outW_w * wordBytes;
-                    strides4d.push_back(rewriter.getI32IntegerAttr(d3Stride));
-                    wraps4d.push_back(rewriter.getI32IntegerAttr(mRounds));
+                    strides2d.push_back(rewriter.getI32IntegerAttr(outW_w * wordBytes));
+                    wraps2d.push_back(rewriter.getI32IntegerAttr(tileM));
 
-                    perTileDimStrides = rewriter.getArrayAttr(strides4d);
-                    perTileDimWraps = rewriter.getArrayAttr(wraps4d);
+                    perTileDimStrides = rewriter.getArrayAttr(strides2d);
+                    perTileDimWraps = rewriter.getArrayAttr(wraps2d);
                     usedMRounds3D = true;
 
-                    llvm::errs() << "[OOO ShimBD 4D] tileM=" << tileM << " tileRows=" << tileRowsVal
+                    // iter params for n_rounds column stepping
+                    oooIterStepSize = static_cast<int32_t>(tileN_sub_w * wordBytes);
+                    oooIterWrap = static_cast<int32_t>(nRounds);
+
+                    // Store m_rounds info for scf.for loop generation
+                    oooMRounds = mRounds;
+                    oooMSubTileStride = tileM * outW_w * wordBytes;
+
+                    llvm::errs() << "[OOO ShimBD 2D+iter] tileM=" << tileM << " tileRows=" << tileRowsVal
                                  << " mRounds=" << mRounds << " tileN_sub=" << tileN_sub << " nRounds=" << nRounds
                                  << " outW=" << outW << " D0=[" << (1 * wordBytes) << "," << tileN_sub_w << "]"
                                  << " D1=[" << (outW_w * wordBytes) << "," << tileM << "]"
-                                 << " D2=[" << (tileN_sub_w * wordBytes) << "," << nRounds << "]"
-                                 << " D3=[" << d3Stride << "," << mRounds << "]\n";
+                                 << " iter_step=" << oooIterStepSize << " iter_wrap=" << oooIterWrap
+                                 << " mSubTileStride=" << oooMSubTileStride << "\n";
                 } else if (shimDimStrides && shimDimWraps && shimDimStrides.size() >= 2) {
                     // 2D strides (original path)
                     SmallVector<Attribute> strides2d, wraps2d;
@@ -1010,40 +1023,26 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 }
             }
 
-            // When 4D strides handle m_rounds (D3/iter) and n_rounds (D2),
-            // BD-level OOO iteration is not needed — set iter_wrap=1, iter_step_size=0.
-            // The BD len must cover the full D0×D1×D2 volume per iteration:
-            //   len = tile_m * tile_n_sub * nRounds * mRounds * elemBytes
-            // D3 (iteration dim) handles mRounds repetition with row advancing.
+            // When 2D strides + iter handle n_rounds, and scf.for handles m_rounds,
+            // each BD activation writes one d0×d1 block = tileM × tileN_sub bytes.
+            // BD len = tileM * tileN_sub * ooElementSizeBytes (per single OOO packet).
+            // iter_step/iter_wrap are already set above for n_rounds stepping.
             if (usedMRounds3D) {
-                oooIterWrap = 1;
-                oooIterStepSize = 0;
-
-                auto moduleOp = op->getParentOfType<ModuleOp>();
-                auto tileMAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m") : nullptr;
-                auto tileRowsAttr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows") : nullptr;
-                auto tileNAttr_pr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n") : nullptr;
-                auto tileColsAttr_pr = moduleOp ? moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols") : nullptr;
-                int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                int64_t tileRowsVal = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-                int64_t tileNVal_pr = tileNAttr_pr ? tileNAttr_pr.getInt() : 0;
-                int64_t tileColsVal_pr = tileColsAttr_pr ? tileColsAttr_pr.getInt() : 0;
-                if (tileM > 0 && tileM < tileRowsVal) {
-                    int64_t mRounds = tileRowsVal / tileM;
+                int64_t tileM = passState->tileM;
+                int64_t tileNVal_pr = passState->tileN;
+                int64_t tileColsVal_pr = passState->tileCols;
+                if (tileM > 0) {
                     int64_t outW = memrefType.getDimSize(1);
                     int64_t tileN_full = outW / numCoreTiles;
-                    int64_t nRounds = 1;
                     int64_t tileN_sub = tileN_full;
                     if (tileNVal_pr > 0 && tileNVal_pr < tileColsVal_pr) {
-                        nRounds = tileColsVal_pr / tileNVal_pr;
                         tileN_sub = tileNVal_pr;
                     }
-                    perRoundBytes = tileM * tileN_sub * nRounds * mRounds * ooElementSizeBytes;
-                    // Also update ooNumIterations to 1 since D3 (iter) handles all rounds
-                    ooNumIterations = 1;
-                    llvm::errs() << "[OOO ShimBD 4D] perRoundBytes=" << perRoundBytes << " mRounds=" << mRounds
-                                 << " nRounds=" << nRounds << " tileM=" << tileM << " tileN_sub=" << tileN_sub
-                                 << " ooNumIterations=" << ooNumIterations << "\n";
+                    // One d0×d1 block per BD activation (single OOO packet)
+                    perRoundBytes = tileM * tileN_sub * ooElementSizeBytes;
+                    llvm::errs() << "[OOO ShimBD 2D+iter] perRoundBytes=" << perRoundBytes << " tileM=" << tileM
+                                 << " tileN_sub=" << tileN_sub << " oooIterStepSize=" << oooIterStepSize
+                                 << " oooIterWrap=" << oooIterWrap << " oooMRounds=" << oooMRounds << "\n";
                 }
             }
 
@@ -1066,7 +1065,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             // In OOO mode each BD is independently dispatched by the packet switch based on
             // packet_id matching. next_bd = -1 (disabled) — iteration handles re-execution
             // across ping-pong rounds; self-chaining would restart from the beginning.
-            SmallVector<Value> shimBdHandles(numCoreTiles);
+            shimBdHandles.resize(numCoreTiles);
             for (int64_t t = numCoreTiles - 1; t >= 0; t--) {
                 int32_t nextBdId = -1; // no chaining — iteration handles re-execution
                 int32_t thisBdId = shimBdIds[t];
@@ -1373,6 +1372,26 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 perCorePerKRound = perCorePerKRound / mRounds;
                             }
                         }
+                    }
+                }
+            } else {
+                // Output: the kernel produces one sub-tile (tile_m × tile_n_sub)
+                // per release_output_window call. Divide perCoreElements by
+                // mRounds * nRounds so BD len matches one kernel output window.
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                    auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                    auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                    auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                    int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                    int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                    int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                    int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                    int64_t mRounds = (tileM > 0 && tileM < tileRows) ? (tileRows / tileM) : 1;
+                    int64_t nRounds = (tileN > 0 && tileN < tileCols) ? (tileCols / tileN) : 1;
+                    if (mRounds * nRounds > 1) {
+                        perCorePerKRound = perCoreElements / (mRounds * nRounds);
                     }
                 }
             }
@@ -1759,20 +1778,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());
                         // Defer core StartIoOp until after ELF is loaded (LoadKernelGroup)
                         // to prevent BSS initialization from overwriting DMA data.
-                        // For output (MM2S) flows, compute mRounds repeat when tile_m < tileRows.
+                        // Core tiles use ping-pong BD chaining (next_bd links ping↔pong),
+                        // so the DMA hardware automatically re-arms via the chain.
+                        // repeat=1 is sufficient; the BD chain does the work.
                         int32_t coreRepeat = 1;
-                        if (!isInput) {
-                            auto moduleOp = op->getParentOfType<ModuleOp>();
-                            if (moduleOp) {
-                                auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                                auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                                int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                                int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-                                if (tileM > 0 && tileM < tileRows) {
-                                    coreRepeat = static_cast<int32_t>(tileRows / tileM);
-                                }
-                            }
-                        }
                         deferredCoreStartIos.push_back(
                             {coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), flowIndex, coreRepeat});
                     } // end if (passState && ...)
@@ -1981,6 +1990,151 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 finalEvents.push_back(launchKernelGroupOp.getEvent());
                 rewriter.create<dfschedule::ScheduleWaitOp>(loc, finalEvents);
 
+            } else if (useOOO && usedMRounds3D && oooMRounds > 1) {
+                // === OOO output flow with m_rounds > 1: scf.for loop ===
+                // Each m_round: re-configure N OOO shim BDs with updated DDR offset,
+                // then startio + wait. n_rounds handled by BD iter_step/iter_wrap.
+                llvm::errs() << "[BlueprintToSchedule] OOO output mRounds loop: "
+                             << "oooMRounds=" << oooMRounds << " oooMSubTileStride=" << oooMSubTileStride
+                             << " numCoreTiles=" << numCoreTiles << " nRounds(iter_wrap)=" << oooIterWrap << "\n";
+
+                // Erase the initial createIoOp and N shim BDs created above —
+                // the loop body creates its own BDs and create_io each iteration.
+                {
+                    // The initial shimBdHandles are consumed only by createIoOp
+                    // and each other via linked_bd. Erase createIoOp first, then BDs.
+                    rewriter.eraseOp(createIoOp);
+                    // Erase each initial shim BD (they are in shimBdHandles order)
+                    for (int64_t t = 0; t < numCoreTiles; t++) {
+                        if (shimBdHandles[t]) {
+                            Operation *bdOp = shimBdHandles[t].getDefiningOp();
+                            if (bdOp) {
+                                // Also erase the arith.constant ops for bd_id and offset
+                                // that feed exclusively into this BD op
+                                SmallVector<Operation *, 2> deadConsts;
+                                for (Value operand : bdOp->getOperands()) {
+                                    if (auto constOp = operand.getDefiningOp<arith::ConstantOp>()) {
+                                        if (constOp->hasOneUse())
+                                            deadConsts.push_back(constOp);
+                                    }
+                                }
+                                rewriter.eraseOp(bdOp);
+                                for (auto *dc : deadConsts)
+                                    rewriter.eraseOp(dc);
+                            }
+                        }
+                    }
+                }
+
+                // 1. load_kernel_group OUTSIDE the loop
+                auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
+                    loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
+                    rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs), nullptr,
+                    rewriter.getArrayAttr(kernelConfigSymbols));
+
+                // 2. launch_kernel_group OUTSIDE the loop
+                auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
+
+                // 3. Core start_io OUTSIDE the loop (core DMAs armed once with total repeat)
+                SmallVector<Value> coreStartIoEvents;
+                for (auto &deferred : deferredCoreStartIos) {
+                    auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
+                        rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(deferred.repeatCount));
+                    coreStartIoEvents.push_back(coreStartIo.getEvent());
+                }
+
+                // 4. scf.for from 0 to oooMRounds: per-iteration OOO BD re-config + startio + wait
+                // Each iteration handles one m_round. Per m_round, each of
+                // numCoreTiles cores produces oooIterWrap(=nRounds) outputs.
+                // Total = perIterRepeat * oooMRounds = numCoreTiles * nRounds * mRounds.
+                int32_t perIterRepeat = static_cast<int32_t>(numCoreTiles * oooIterWrap);
+                {
+                    auto lb = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+                    auto ub = rewriter.create<arith::ConstantIndexOp>(loc, oooMRounds);
+                    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+                    auto forOp = rewriter.create<scf::ForOp>(loc, lb, ub, step);
+                    rewriter.setInsertionPointToStart(forOp.getBody());
+                    Value iv = forOp.getInductionVar(); // index type
+
+                    // Cast index → i32 for arithmetic
+                    auto ivI32 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), iv);
+
+                    // mBaseOffset = iv * oooMSubTileStride
+                    auto mStrideConst = rewriter.create<arith::ConstantIntOp>(
+                        loc, static_cast<int32_t>(oooMSubTileStride), rewriter.getI32Type());
+                    auto mBaseOffset = rewriter.create<arith::MulIOp>(loc, ivI32, mStrideConst);
+
+                    // Re-configure N OOO shim BDs with updated DDR offset
+                    SmallVector<Value> loopBdHandles(numCoreTiles);
+                    for (int64_t t = numCoreTiles - 1; t >= 0; t--) {
+                        int32_t thisBdId = shimPerTileBdIds[t];
+                        int64_t perTileOffset = t * perTileStrideFromDims;
+
+                        auto bdIdConst = rewriter.create<arith::ConstantIntOp>(loc, thisBdId, rewriter.getI32Type());
+                        auto perTileOffsetConst = rewriter.create<arith::ConstantIntOp>(
+                            loc, static_cast<int32_t>(perTileOffset), rewriter.getI32Type());
+                        // totalOffset = mBaseOffset + perTileOffset
+                        auto totalOffset = rewriter.create<arith::AddIOp>(loc, mBaseOffset.getResult(),
+                                                                          perTileOffsetConst.getResult());
+
+                        // linked_bd chain for SSA: BD[i] links to BD[i+1] (or none for last)
+                        Value linkedBd = (t < numCoreTiles - 1) ? loopBdHandles[t + 1] : Value();
+
+                        auto loopBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                            loc, dfschedule::BdHandleType::get(rewriter.getContext()),
+                            ddrBuffer,                                 // DDR buffer
+                            shimTileOp.getTile(),                      // tile
+                            bdIdConst.getResult(),                     // bd_id (reused)
+                            totalOffset.getResult(),                   // offset (dynamic: m*stride + tile*step)
+                            rewriter.getI32IntegerAttr(perRoundBytes), // len (one d0×d1 block)
+                            rewriter.getBoolAttr(false),               // enable_packet = false
+                            rewriter.getI32IntegerAttr(basePacketId + (int32_t)t), // packet_id (debug)
+                            rewriter.getI32IntegerAttr(-1),                        // next_bd = -1 (no chaining)
+                            rewriter.getI32IntegerAttr(-1),                        // acquire_lock_id = -1
+                            rewriter.getI32IntegerAttr(0),                         // acquire_lock_val
+                            rewriter.getI32IntegerAttr(-1),                        // release_lock_id = -1
+                            rewriter.getI32IntegerAttr(0),                         // release_lock_val
+                            rewriter.getI32IntegerAttr(dataId),                    // data_id
+                            linkedBd,                                              // linked_bd
+                            rewriter.getI32IntegerAttr(-1),                        // out_of_order_bd_id
+                            /*dim_strides=*/perTileDimStrides, /*dim_wraps=*/perTileDimWraps,
+                            rewriter.getI32IntegerAttr(oooIterStepSize), // iter_step_size
+                            rewriter.getI32IntegerAttr(oooIterWrap));    // iter_wrap
+
+                        loopBdHandles[t] = loopBd.getBdHandle();
+                    }
+
+                    // Create OOO IO handle (first BD in chain = BD[0])
+                    auto loopCreateIo = rewriter.create<dfschedule::ConfigCreateIoOp>(
+                        loc, dfschedule::IoHandleType::get(rewriter.getContext()), loopBdHandles[0],
+                        shimTileOp.getTile(), rewriter.getI32IntegerAttr(shimChannel),
+                        rewriter.getStringAttr(dmaDirection), rewriter.getStringAttr(ioOperation),
+                        rewriter.getBoolAttr(true)); // enable_out_of_order = true
+
+                    // Start IO: repeat = numCoreTiles * nRounds per m_round iteration
+                    auto loopGetBdId =
+                        rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
+                    auto loopStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), loopCreateIo.getIoHandle(),
+                        loopGetBdId.getBdId(), rewriter.getI32IntegerAttr(flowIndex),
+                        rewriter.getI32IntegerAttr(perIterRepeat));
+
+                    // Wait for this m_round's OOO completion before next BD re-arm
+                    SmallVector<Value> loopWaitEvents;
+                    loopWaitEvents.push_back(loopStartIo.getEvent());
+                    rewriter.create<dfschedule::ScheduleWaitOp>(loc, loopWaitEvents);
+
+                    rewriter.setInsertionPointAfter(forOp);
+                }
+
+                // 5. After all iterations: wait for kernel launch event
+                SmallVector<Value> finalEvents;
+                finalEvents.push_back(launchKernelGroupOp.getEvent());
+                rewriter.create<dfschedule::ScheduleWaitOp>(loc, finalEvents);
+
             } else {
                 // === Match mode or output flow: existing straight-line schedule ===
 
@@ -1989,6 +2143,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 // to avoid BSS-zeroing races.
                 int32_t repeatCount = 1;
                 if (useOOO) {
+                    // OOO without m_rounds loop: repeat = numCoreTiles * ooNumIterations
                     repeatCount = (int32_t)(numCoreTiles * ooNumIterations);
                 } else if (shimIsSender) {
                     // Channel repeat must match iter_wrap so the DMA engine
@@ -2149,6 +2304,25 @@ void BlueprintToSchedulePass::runOnOperation() {
     if (failed(preprocessConstantToMemref(getOperation(), passState))) {
         signalPassFailure();
         return;
+    }
+
+    // Cache routing module attributes before conversion (they may be stripped
+    // during applyPartialConversion).
+    {
+        auto moduleOp = dyn_cast<ModuleOp>(getOperation());
+        if (moduleOp) {
+            auto getI64 = [&](StringRef name) -> int64_t {
+                auto attr = moduleOp->getAttrOfType<IntegerAttr>(name);
+                return attr ? attr.getInt() : 0;
+            };
+            passState->tileM = getI64("routing.tile_m");
+            passState->tileRows = getI64("routing.tile_rows");
+            passState->tileN = getI64("routing.tile_n");
+            passState->tileCols = getI64("routing.tile_cols");
+            passState->effectiveK = getI64("routing.effective_k");
+            passState->fullK = getI64("routing.full_k");
+            passState->kRounds = getI64("routing.k_rounds");
+        }
     }
 
     // --- Phase 2: Dialect conversion ---

@@ -9,8 +9,10 @@
 #include "kernelconfig.h"
 #include "passblueprinttoschedule.h"
 #include "passblueprinttoschedulekernel.h"
+#include "passdfscheduleprovenancemap.h"
 #include "passdfscheduletoapi.h"
 #include "passdfscheduletokernelapi.h"
+#include "passdmaphopprovenancemap.h"
 #include "passdmaphoptodfscheblueprint.h"
 #include "passdmaphoptoroutinghw.h"
 #include "passschedulecanonicalize.h"
@@ -257,6 +259,12 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     if (!runPipelineSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage, "DmapToDmaphopPass"))
         return false;
 
+    // Generate provenance map JSON after dmaphop IR is available
+    {
+        auto provenancePass = std::make_unique<DmaphopProvenanceMapPass>(outputDir);
+        runPipelineSinglePass(ctx, module, std::move(provenancePass), irDir, stage, "DmaphopProvenanceMapPass");
+    }
+
     // Clone the module at dmaphop stage for the routing path (Phase 5).
     // This preserves the pkt_ids allocated by DmapToDmaphopPass so that
     // routing.cc and host.cc use the same packet IDs.
@@ -349,6 +357,14 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::WaitMergePass>(), irDir, stage, "WaitMergePass"))
         return false;
+
+    // Generate low-level dfschedule provenance map after WaitMergePass
+    {
+        auto dfscheProvenancePass = std::make_unique<DfscheduleProvenanceMapPass>(outputDir);
+        runPipelineSinglePass(ctx, hostModule, std::move(dfscheProvenancePass), irDir, stage,
+                              "DfscheduleProvenanceMapPass");
+    }
+
     if (!runPipelineSinglePass(ctx, hostModule,
                                std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true, runtimeDebugLevel),
                                irDir, stage, "DfscheduleToApiPass"))

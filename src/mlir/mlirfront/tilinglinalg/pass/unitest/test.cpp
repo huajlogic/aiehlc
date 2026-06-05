@@ -4,8 +4,10 @@
 ******************************************************************************/
 #include "../passblueprinttoschedule/passblueprinttoschedule.h"
 #include "../passblueprinttoschedulekernel/passblueprinttoschedulekernel.h"
+#include "../passdfscheduleprovenancemap/passdfscheduleprovenancemap.h"
 #include "../passdfscheduletoapi/passdfscheduletoapi.h"
 #include "../passdfscheduletokernelapi/passdfscheduletokernelapi.h"
+#include "../passdmaphopprovenancemap/passdmaphopprovenancemap.h"
 #include "../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.h"
 #include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
 #include "../passdmaptodmaphop/dmaptodmaphop.h"
@@ -1029,10 +1031,11 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
     TilingLinalgPipeline::registerDialects(ctx);
 
     // Default tensor config for GEMM: 2 inputs + 1 output
+    // Use 64x64 matrices to match simplematmul2.cc (tile_m=8 sub-tiling)
     std::vector<TensorParam> tensors = {
-        {{16, 16}, 8, true},  // input A (window_in_0)
-        {{16, 16}, 8, true},  // input B (window_in_1)
-        {{16, 16}, 8, false}, // output C (window_out_0)
+        {{64, 64}, 8, true},  // input A (window_in_0)
+        {{64, 64}, 8, true},  // input B (window_in_1)
+        {{64, 64}, 8, false}, // output C (window_out_0)
     };
 
     // Build SplitModel with per-tensor pp_depth from CLI
@@ -1053,6 +1056,26 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         std::cout << "Parsed module from " << irFilepath << std::endl;
     } else {
         module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors, splitModel);
+    }
+
+    // Set routing module attributes for M/N sub-tiling (matching simplematmul2.cc)
+    // These are normally set by aiehlc.cc from SpatialPolicy, but buildRoutingIR
+    // doesn't set them. For 64x64 matmul on 4x4 mesh with tile_m=8, tile_k=16:
+    //   tileRows = 64/4 = 16, tileCols = 64/4 = 16
+    //   tileM = 8 (sub-tile), tileN = 8 (sub-tile)
+    //   effectiveK = 16, fullK = 64, kRounds = 4
+    //   mRounds = tileRows/tileM = 2, nRounds = tileCols/tileN = 2
+    if (irFilepath.empty()) {
+        mlir::OpBuilder attrB(&ctx);
+        module->setAttr("routing.tile_m", attrB.getI64IntegerAttr(8));
+        module->setAttr("routing.tile_rows", attrB.getI64IntegerAttr(16));
+        module->setAttr("routing.tile_n", attrB.getI64IntegerAttr(8));
+        module->setAttr("routing.tile_cols", attrB.getI64IntegerAttr(16));
+        module->setAttr("routing.effective_k", attrB.getI64IntegerAttr(16));
+        module->setAttr("routing.full_k", attrB.getI64IntegerAttr(64));
+        module->setAttr("routing.k_rounds", attrB.getI64IntegerAttr(4));
+        module->setAttr("routing.m_rounds", attrB.getI64IntegerAttr(2));
+        module->setAttr("routing.n_rounds", attrB.getI64IntegerAttr(2));
     }
 
     // When startStage==0 and using the default pipeline, delegate to
@@ -1108,6 +1131,14 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         if (!runSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage,
                            "DmapToDmaphopPass"))
             return;
+        // Generate provenance map JSON after dmaphop IR is available
+        {
+            std::string worklocalDir = setupWorklocalDir();
+            if (!worklocalDir.empty()) {
+                auto provenancePass = std::make_unique<DmaphopProvenanceMapPass>(worklocalDir);
+                runSinglePass(ctx, module, std::move(provenancePass), irDir, stage, "DmaphopProvenanceMapPass");
+            }
+        }
     }
     if (startStage <= 3) {
         if (!runSinglePass(ctx, module, std::make_unique<DmaphopTodfscheblueprintPass>(), irDir, stage,
@@ -1173,6 +1204,15 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
             if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
                                "ScheduleCanonicalizePass"))
                 return;
+            // Generate low-level dfschedule provenance map after ScheduleCanonicalizePass
+            {
+                std::string worklocalDir = setupWorklocalDir();
+                if (!worklocalDir.empty()) {
+                    auto dfscheProvenancePass = std::make_unique<DfscheduleProvenanceMapPass>(worklocalDir);
+                    runSinglePass(ctx, hostModule, std::move(dfscheProvenancePass), irDir, stage,
+                                  "DfscheduleProvenanceMapPass");
+                }
+            }
         }
         if (startStage <= 6) {
             if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true),

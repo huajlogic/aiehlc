@@ -3375,8 +3375,9 @@ void DfscheduleToApiPass::runOnOperation() {
     {
         // Step 1: Manually convert arith ops inside scf.for bodies to emitc equivalents.
         // These survived Phase 3/4.5 because arith dialect was marked legal (only arith.constant
-        // was selectively made illegal). We convert arith.index_cast → emitc.cast and
-        // arith.muli → emitc.mul so the emitc.for region verifier accepts the body.
+        // was selectively made illegal). We convert arith.index_cast → emitc.cast,
+        // arith.muli → emitc.mul, and arith.addi → emitc.add so the emitc.for region
+        // verifier accepts the body.
         OpBuilder b(ctx);
         moduleOp.walk([&](scf::ForOp forOp) {
             // Walk the for body and convert arith.index_cast → emitc.cast
@@ -3398,6 +3399,17 @@ void DfscheduleToApiPass::runOnOperation() {
                     b.create<emitc::MulOp>(mulOp.getLoc(), mulOp.getResult().getType(), mulOp.getLhs(), mulOp.getRhs());
                 mulOp.replaceAllUsesWith(result.getResult());
                 mulOp.erase();
+            }
+
+            // Walk the for body and convert arith.addi → emitc.add
+            SmallVector<arith::AddIOp> addOps;
+            forOp.getBody()->walk([&](arith::AddIOp op) { addOps.push_back(op); });
+            for (auto addOp : addOps) {
+                b.setInsertionPoint(addOp);
+                auto result =
+                    b.create<emitc::AddOp>(addOp.getLoc(), addOp.getResult().getType(), addOp.getLhs(), addOp.getRhs());
+                addOp.replaceAllUsesWith(result.getResult());
+                addOp.erase();
             }
         });
 

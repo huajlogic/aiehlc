@@ -815,20 +815,26 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 // is computed from effectiveK, not fullK).
                 int64_t perCoreSizeForBuf = perCoreSize;
 
-                // M-round adjustment for output: when tile_m < tileRows,
-                // the per-round output buffer is one m-sub-tile (tileM * tileN),
-                // not the full tile output. Divide by mRounds so
-                // pingPongBufSize = tileM * tileN (= perCoreSize / mRounds).
+                // M/N-round adjustment for output: when tile_m < tileRows
+                // or tile_n < tileCols, the per-round output buffer is one
+                // sub-tile (tileM * tileN_sub), not the full tile output.
+                // Divide by mRounds * nRounds so pingPongBufSize matches
+                // one kernel output window.
                 if (!paramInfo.isInput) {
                     auto moduleOp2 = declareDataOp->getParentOfType<ModuleOp>();
                     if (moduleOp2) {
                         auto tileMAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_m");
                         auto tileRowsAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                        auto tileNAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_n");
+                        auto tileColsAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_cols");
                         int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
                         int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-                        if (tileM > 0 && tileM < tileRows) {
-                            int64_t mRounds = tileRows / tileM;
-                            perCoreSizeForBuf = perCoreSize / mRounds;
+                        int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                        int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                        int64_t mRounds = (tileM > 0 && tileM < tileRows) ? (tileRows / tileM) : 1;
+                        int64_t nRounds = (tileN > 0 && tileN < tileCols) ? (tileCols / tileN) : 1;
+                        if (mRounds * nRounds > 1) {
+                            perCoreSizeForBuf = perCoreSize / (mRounds * nRounds);
                         }
                     }
                 }

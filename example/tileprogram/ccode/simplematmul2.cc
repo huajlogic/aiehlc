@@ -84,7 +84,7 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<in
 
         // ===== K-round loop: accumulate partial products =====
         for (int kr = 0; kr < k_rounds; kr++) {
-            klog("KR  ", (int32_t)kr);
+            klog("KRA ", (int32_t)kr);
             // --- Phase 1: Receive and cache A chunk for this (mr, kr) ---
             for (int ra = 0; ra < num_a_rounds; ra++) {
                 int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
