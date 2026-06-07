@@ -643,21 +643,21 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_end[];\n";
             stream << "extern unsigned int _binary_kernel_" << computeKernelName << "_size;\n\n";
 
-            // Helper: emit XAie_MemSync*VAddr calls using _s<i> size params
+            // Helper: emit XAie_MemSyncForDevVAddr calls for ALL buffers before DMA.
+            // On ARM (baremetal), SyncForDev flushes+invalidates cache lines, which is
+            // needed for outputs too: dirty cache lines (e.g. zeroed output buffer) must
+            // be flushed and invalidated BEFORE DMA writes results to DDR, otherwise a
+            // post-DMA invalidate (clean+invalidate) would flush stale zeros over the
+            // DMA results. No post-launch sync is needed.
             auto emitSyncCalls = [&](llvm::raw_fd_ostream &os, unsigned nDdrArgs, const std::string &indent,
                                      bool beforeLaunch) {
+                if (!beforeLaunch)
+                    return; // no post-launch sync needed on ARM
                 unsigned limit = nDdrArgs;
                 if (limit > tensors.size())
                     limit = tensors.size();
                 for (unsigned i = 0; i < limit; ++i) {
-                    bool wantInput = beforeLaunch;
-                    if (tensors[i].isInput != wantInput)
-                        continue;
-                    if (beforeLaunch) {
-                        os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
-                    } else {
-                        os << indent << "XAie_MemSyncForCPUVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
-                    }
+                    os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
                 }
             };
 
@@ -670,13 +670,13 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << ", ...) {\n";
                 stream << "    XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
-                // Sync inputs to DDR before DMA
+                // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
                 emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/true);
                 stream << "    " << hostFuncName << "(dev";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
                     stream << ", _t" << i;
                 stream << ");\n";
-                // Sync outputs from DDR after DMA
+                // No post-launch sync needed (cache lines already invalidated)
                 emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/false);
                 stream << "}\n";
 
@@ -694,13 +694,13 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << "        dev = __Runtime_explicit_init();\n";
                 stream << "    }\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
-                // Sync inputs to DDR before DMA
+                // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
                 emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/true);
                 stream << "    " << hostFuncName << "(dev";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
                     stream << ", _t" << i;
                 stream << ");\n";
-                // Sync outputs from DDR after DMA
+                // No post-launch sync needed (cache lines already invalidated)
                 emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/false);
                 stream << "    __Runtime_explicit_teardown(dev);\n";
                 stream << "}\n";
@@ -808,33 +808,24 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             }
             stream << "\n";
 
-            // Explicit init → sync inputs → host function → sync outputs → teardown
+            // Explicit init → sync ALL buffers → host function → teardown
             stream << "    XAie_DevInst* dev = __Runtime_explicit_init();\n";
-            // Sync inputs to DDR before DMA
+            // Flush+invalidate ALL buffers (inputs AND outputs) before DMA.
+            // On ARM, output buffers may have dirty cache lines (e.g. from memset to zero)
+            // that must be flushed before DMA writes results to DDR.
             for (unsigned i = 0; i < tensors.size(); ++i) {
-                if (tensors[i].isInput) {
-                    int64_t totalElements = 1;
-                    for (auto dim : tensors[i].shape)
-                        totalElements *= dim;
-                    int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
-                    stream << "    XAie_MemSyncForDevVAddr(dev, buf_" << i << ", " << totalBytes << ");\n";
-                }
+                int64_t totalElements = 1;
+                for (auto dim : tensors[i].shape)
+                    totalElements *= dim;
+                int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
+                stream << "    XAie_MemSyncForDevVAddr(dev, buf_" << i << ", " << totalBytes << ");\n";
             }
             stream << "    " << hostFuncName << "(dev";
             for (unsigned i = 0; i < tensors.size(); ++i) {
                 stream << ", buf_" << i;
             }
             stream << ");\n";
-            // Sync outputs from DDR after DMA
-            for (unsigned i = 0; i < tensors.size(); ++i) {
-                if (!tensors[i].isInput) {
-                    int64_t totalElements = 1;
-                    for (auto dim : tensors[i].shape)
-                        totalElements *= dim;
-                    int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
-                    stream << "    XAie_MemSyncForCPUVAddr(dev, buf_" << i << ", " << totalBytes << ");\n";
-                }
-            }
+            // No post-launch sync needed — cache lines already invalidated by SyncForDev
             stream << "\n";
 
             stream << "    printf(\"------------after matmul--------\\n\");\n\n";

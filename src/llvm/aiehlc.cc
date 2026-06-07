@@ -2541,23 +2541,21 @@ public:
                             maxDdrArgs = mkd.numHostDdrArgs;
                     }
 
-                    // Helper: emit XAie_MemSync*VAddr calls using _s<i> size params
+                    // Helper: emit XAie_MemSyncForDevVAddr calls for ALL buffers before DMA.
+                    // On ARM (baremetal), SyncForDev flushes+invalidates cache lines, which is
+                    // needed for outputs too: dirty cache lines (e.g. zeroed output buffer) must
+                    // be flushed and invalidated BEFORE DMA writes results to DDR, otherwise a
+                    // post-DMA invalidate (clean+invalidate) would flush stale zeros over the
+                    // DMA results. No post-launch sync is needed.
                     auto emitSyncCalls = [](llvm::raw_fd_ostream &os, const MeshKernelDesc &mkd,
                                             const std::string &indent, bool beforeLaunch) {
+                        if (!beforeLaunch)
+                            return; // no post-launch sync needed on ARM
                         unsigned limit = mkd.numHostDdrArgs;
                         if (limit > mkd.tensors.size())
                             limit = mkd.tensors.size();
                         for (unsigned i = 0; i < limit; ++i) {
-                            bool wantInput = beforeLaunch; // before: sync inputs; after: sync outputs
-                            if (mkd.tensors[i].isInput != wantInput)
-                                continue;
-                            if (beforeLaunch) {
-                                os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i
-                                   << ");\n";
-                            } else {
-                                os << indent << "XAie_MemSyncForCPUVAddr(dev, _t" << i << ", (uint64_t)_s" << i
-                                   << ");\n";
-                            }
+                            os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
                         }
                     };
 
@@ -2575,13 +2573,13 @@ public:
                                    << mkd.kernelName << "\") == 0) {\n";
                             stream << "        __Runtime_set_kernel_elf(_binary_kernel_" << mkd.kernelName
                                    << "_start);\n";
-                            // Sync inputs to DDR before DMA
+                            // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
                             emitSyncCalls(stream, mkd, "        ", /*beforeLaunch=*/true);
                             stream << "        " << hostFunc << "(dev";
                             for (unsigned i = 0; i < mkd.numHostDdrArgs; ++i)
                                 stream << ", _t" << i;
                             stream << ");\n";
-                            // Sync outputs from DDR after DMA
+                            // No post-launch sync needed (cache lines already invalidated)
                             emitSyncCalls(stream, mkd, "        ", /*beforeLaunch=*/false);
                         }
                         stream << "    }\n";
@@ -2605,13 +2603,13 @@ public:
                             auto &mkd0 = parsedMeshKernels[0];
                             std::string hostFunc = "host_canonicalized_" + mkd0.kernelName;
                             stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << mkd0.kernelName << "_start);\n";
-                            // Sync inputs to DDR before DMA
+                            // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
                             emitSyncCalls(stream, mkd0, "    ", /*beforeLaunch=*/true);
                             stream << "    " << hostFunc << "(dev";
                             for (unsigned i = 0; i < mkd0.numHostDdrArgs; ++i)
                                 stream << ", _t" << i;
                             stream << ");\n";
-                            // Sync outputs from DDR after DMA
+                            // No post-launch sync needed (cache lines already invalidated)
                             emitSyncCalls(stream, mkd0, "    ", /*beforeLaunch=*/false);
                         }
                         stream << "    __Runtime_explicit_teardown(dev);\n";

@@ -305,7 +305,7 @@ int main() {
         C[i] = 0;
     // --- Launch kernel on tile mesh ---
     matmul<<<mesh>>>(A, B, C, M, N, K);
-    device.synchronizecpu(C, M * N * sizeof(int8_t) * 4);
+    // device.synchronizecpu(C, M * N * sizeof(int8_t) * 4);
     int result = verify_matmul(A, B, C);
     // mul2<<<mesh>>>(C, B, A, M, N, K);
     // int result2 = verify_matmul(C, B, A);

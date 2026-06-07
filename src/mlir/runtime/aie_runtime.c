@@ -297,9 +297,9 @@ void __Runtime_platform_init(void) {
     // Flush any pre-existing dirty cache lines to DDR.
     // Cache stays ENABLED — per-buffer sync (__Runtime_sync_for_dev/cpu)
     // handles coherency at launch time instead of globally disabling DCache.
-    Xil_DCacheFlush();
-    Xil_DCacheDisable();
-    Xil_ICacheDisable();
+    // Xil_DCacheFlush();
+    // Xil_DCacheDisable();
+    // Xil_ICacheDisable();
 }
 
 void __Runtime_init(void) {
