@@ -65,9 +65,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 // GEMM dimensions (user-specified)
-#define M 512
-#define K 512
-#define N 512
+#define M 4096
+#define K 4096
+#define N 4096
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4
@@ -123,7 +123,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
     }
     // Print A
     printf("\nA [%dx%d]:\n", M, K);
-    for (int i = 0; i < M; i++) {
+    for (int i = 0; i < (M > dataprintsize ? dataprintsize : M); i++) {
         printf("  [");
         for (int j = 0; j < (K > dataprintsize ? dataprintsize : K); j++) {
             printf("%4d", A[i * K + j]);
@@ -135,7 +135,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
 
     // Print B
     printf("\nB [%dx%d]:\n", K, N);
-    for (int i = 0; i < K; i++) {
+    for (int i = 0; i < (K > dataprintsize ? dataprintsize : K); i++) {
         printf("  [");
         for (int j = 0; j < (N > dataprintsize ? dataprintsize : N); j++) {
             printf("%4d", B[i * N + j]);
@@ -147,7 +147,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
 
     // Print C
     printf("\nC [%dx%d]:\n", M, N);
-    for (int i = 0; i < M; i++) {
+    for (int i = 0; i < (M > dataprintsize ? dataprintsize : M); i++) {
         printf("  [");
         for (int j = 0; j < (N > dataprintsize ? dataprintsize : N); j++) {
             printf("%4d", C[i * N + j]);
@@ -159,7 +159,7 @@ static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
 
     // Print C_ref
     printf("\nC_ref [%dx%d]:\n", M, N);
-    for (int i = 0; i < M; i++) {
+    for (int i = 0; i < (M > dataprintsize ? dataprintsize : M); i++) {
         printf("  [");
         for (int j = 0; j < (N > dataprintsize ? dataprintsize : N); j++) {
             printf("%4d", C_ref[i * N + j]);
