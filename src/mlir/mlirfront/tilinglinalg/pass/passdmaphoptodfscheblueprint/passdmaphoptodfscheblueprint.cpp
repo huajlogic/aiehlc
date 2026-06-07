@@ -845,12 +845,12 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                             if (tileM > 0 && tileM < partRows) {
                                 // 3D addressing: D0=K-chunk, D1=sub-tile rows, D2=kRounds
                                 // Determine the sub-tile dimension based on flow type:
-                                //   Input A (dataId==0): D1 = tile_m (row sub-tiling)
-                                //   Input B (dataId==1): D1 = tile_n (col sub-tiling)
+                                //   Input B (dataId==0): D1 = tile_n (col sub-tiling)
+                                //   Input A (dataId==1): D1 = tile_m (row sub-tiling)
                                 auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
                                 int64_t subTileDim = tileM; // default: tile_m for input A
-                                if (dataId == 1 && tileNAttr) {
-                                    subTileDim = tileNAttr.getInt(); // input B: use tile_n
+                                if (dataId == 0 && tileNAttr) {
+                                    subTileDim = tileNAttr.getInt(); // input B (dataId=0): use tile_n
                                 }
 
                                 int64_t kRounds = fullK / effectiveK;

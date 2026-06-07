@@ -59,14 +59,15 @@
 //   max_buffer_bytes: Maximum per-buffer size in bytes
 // ═══════════════════════════════════════════════════════════════════════════
 
+#include "xil_cache.h"
+#include "xiltimer.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-
 // GEMM dimensions (user-specified)
-#define M 64
-#define K 64
-#define N 64
+#define M 512
+#define K 512
+#define N 512
 
 // HW mesh dimensions (number of AIE tile rows and columns)
 #define HW_ROWS 4
@@ -81,6 +82,8 @@ static int verify_mat_transpose(const int8_t *A, const int8_t *B, const int8_t *
 
 // Pure scalar matmul: C_ref[M][N] = A[M][K] * B^T[N][K]
 static void scalar_matmul(int8_t *C_ref, const int8_t *A, const int8_t *B) {
+    // Xil_DCacheEnable();
+    // Xil_ICacheEnable();
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
             int16_t sum = 0;
@@ -93,14 +96,23 @@ static void scalar_matmul(int8_t *C_ref, const int8_t *A, const int8_t *B) {
             C_ref[i * N + j] = (int8_t)sum;
         }
     }
+    // Xil_DCacheDisable();
+    // Xil_ICacheDisable();
 }
 
 // Verify AIE output C against CPU reference
 static int verify_matmul(const int8_t *A, const int8_t *B, const int8_t *C) {
-    const int dataprintsize = 32;
+    const int dataprintsize = 64;
     int mismatches = 0;
     int8_t C_ref[M * N];
+    printf("before scalar_matmul\n");
+    XTime t_start, t_end;
+    XTime_GetTime(&t_start);
     scalar_matmul(C_ref, A, B);
+    XTime_GetTime(&t_end);
+    double elapsed_ms = 1.0 * (t_end - t_start) / COUNTS_PER_SECOND * 1000.0;
+    printf("after scalar_matmul\n");
+    printf("scalar_matmul time: %.3f ms\n", elapsed_ms);
     for (int i = 0; i < M * N; i++) {
         if (C[i] != C_ref[i]) {
             printf("MISMATCH C[%d]: got %d, expected %d\n", i, C[i], C_ref[i]);

@@ -605,6 +605,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "    int startCol, endCol, startRow, endRow;\n";
             stream << "};\n";
             // New programming model types: aieMesh + aieArray
+            // Note: XAie_DevInst, __Runtime_explicit_init, __Runtime_alloc_buffer,
+            // __Runtime_free_buffer are already declared via #include "aie_runtime.h"
             stream << "struct aieMesh {\n";
             stream << "    int rows, cols;\n";
             stream << "    aiePartition partition;\n";
@@ -612,10 +614,15 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "};\n";
             stream << "struct aieArray {\n";
             stream << "    int nextMeshId = 0;\n";
+            stream << "    XAie_DevInst* _dev = nullptr;\n";
             stream << "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
-            stream << "        return aieMesh{rows, cols, p, nextMeshId++};\n";
+            stream << "        int meshId = nextMeshId++;\n";
+            stream << "        _dev = __Runtime_init_mesh_partition(meshId, p.startCol, p.endCol - p.startCol + 1);\n";
+            stream << "        return aieMesh{rows, cols, p, meshId};\n";
             stream << "    }\n";
-            stream << "    void synchronize() { __Runtime_teardown_all(); }\n";
+            stream << "    void* alloc(size_t size) { return __Runtime_alloc_buffer(_dev, size); }\n";
+            stream << "    void free(void* ptr) { __Runtime_free_buffer(_dev, ptr); }\n";
+            stream << "    void synchronizecpu(void* ptr, size_t size) { __Runtime_sync_for_cpu(_dev, ptr, size); }\n";
             stream << "};\n";
             // Backward-compatible aieDim (maps to aieMesh internally)
             stream << "struct aieDim {\n";
@@ -636,32 +643,47 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_end[];\n";
             stream << "extern unsigned int _binary_kernel_" << computeKernelName << "_size;\n\n";
 
+            // Helper: emit XAie_MemSync*VAddr calls using _s<i> size params
+            auto emitSyncCalls = [&](llvm::raw_fd_ostream &os, unsigned nDdrArgs, const std::string &indent,
+                                     bool beforeLaunch) {
+                unsigned limit = nDdrArgs;
+                if (limit > tensors.size())
+                    limit = tensors.size();
+                for (unsigned i = 0; i < limit; ++i) {
+                    bool wantInput = beforeLaunch;
+                    if (tensors[i].isInput != wantInput)
+                        continue;
+                    if (beforeLaunch) {
+                        os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
+                    } else {
+                        os << indent << "XAie_MemSyncForCPUVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
+                    }
+                }
+            };
+
             // --- __aie_launch with partition registry (init-once, dispatch by kernel name) ---
             if (numDdrArgs > 0) {
                 // aieMesh overload (new programming model)
                 stream << "inline void __aie_launch(const char* kernel, aieMesh mesh";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
-                    stream << ", void* _t" << i;
+                    stream << ", void* _t" << i << ", size_t _s" << i;
                 stream << ", ...) {\n";
-                stream << "    XAie_DevInst* dev;\n";
-                stream << "    if (__Runtime_partition_is_initialized(mesh.meshId)) {\n";
-                stream << "        dev = __Runtime_get_partition_dev(mesh.meshId);\n";
-                stream << "    } else {\n";
-                stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
-                          "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
-                stream << "        __Runtime_register_partition(mesh.meshId, dev);\n";
-                stream << "    }\n";
+                stream << "    XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                // Sync inputs to DDR before DMA
+                emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/true);
                 stream << "    " << hostFuncName << "(dev";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
                     stream << ", _t" << i;
                 stream << ");\n";
+                // Sync outputs from DDR after DMA
+                emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/false);
                 stream << "}\n";
 
                 // aieDim overload (backward compatibility)
                 stream << "inline void __aie_launch(const char* kernel, aieDim mesh";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
-                    stream << ", void* _t" << i;
+                    stream << ", void* _t" << i << ", size_t _s" << i;
                 stream << ", ...) {\n";
                 stream << "    (void)kernel;\n";
                 stream << "    XAie_DevInst* dev;\n";
@@ -672,24 +694,21 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << "        dev = __Runtime_explicit_init();\n";
                 stream << "    }\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                // Sync inputs to DDR before DMA
+                emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/true);
                 stream << "    " << hostFuncName << "(dev";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
                     stream << ", _t" << i;
                 stream << ");\n";
+                // Sync outputs from DDR after DMA
+                emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/false);
                 stream << "    __Runtime_explicit_teardown(dev);\n";
                 stream << "}\n";
             } else {
                 // aieMesh overload (new programming model)
                 stream << "template<typename... Args>\n";
                 stream << "inline void __aie_launch(const char* kernel, aieMesh mesh, Args... args) {\n";
-                stream << "    XAie_DevInst* dev;\n";
-                stream << "    if (__Runtime_partition_is_initialized(mesh.meshId)) {\n";
-                stream << "        dev = __Runtime_get_partition_dev(mesh.meshId);\n";
-                stream << "    } else {\n";
-                stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
-                          "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
-                stream << "        __Runtime_register_partition(mesh.meshId, dev);\n";
-                stream << "    }\n";
+                stream << "    XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
                 stream << "    " << hostFuncName << "(dev);\n";
                 stream << "}\n";
@@ -789,13 +808,34 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             }
             stream << "\n";
 
-            // Explicit init → host function → explicit teardown
+            // Explicit init → sync inputs → host function → sync outputs → teardown
             stream << "    XAie_DevInst* dev = __Runtime_explicit_init();\n";
+            // Sync inputs to DDR before DMA
+            for (unsigned i = 0; i < tensors.size(); ++i) {
+                if (tensors[i].isInput) {
+                    int64_t totalElements = 1;
+                    for (auto dim : tensors[i].shape)
+                        totalElements *= dim;
+                    int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
+                    stream << "    XAie_MemSyncForDevVAddr(dev, buf_" << i << ", " << totalBytes << ");\n";
+                }
+            }
             stream << "    " << hostFuncName << "(dev";
             for (unsigned i = 0; i < tensors.size(); ++i) {
                 stream << ", buf_" << i;
             }
-            stream << ");\n\n";
+            stream << ");\n";
+            // Sync outputs from DDR after DMA
+            for (unsigned i = 0; i < tensors.size(); ++i) {
+                if (!tensors[i].isInput) {
+                    int64_t totalElements = 1;
+                    for (auto dim : tensors[i].shape)
+                        totalElements *= dim;
+                    int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
+                    stream << "    XAie_MemSyncForCPUVAddr(dev, buf_" << i << ", " << totalBytes << ");\n";
+                }
+            }
+            stream << "\n";
 
             stream << "    printf(\"------------after matmul--------\\n\");\n\n";
 

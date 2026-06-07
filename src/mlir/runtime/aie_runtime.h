@@ -87,8 +87,7 @@ void *__Runtime_malloc(size_t bytes);
 void __Runtime_free(void *ptr);
 void __Runtime_memcpy(void *dst, const void *src, size_t bytes);
 
-/* Allocation tracking (implemented in aie_runtime.c) */
-void __Runtime_track_alloc(XAie_MemInst *mem);
+/* Legacy stub (no-op in VAddr mode; kept for backward compat) */
 void __Runtime_free_all_allocs(void);
 
 static inline void __Runtime_Partition_Print(void *data, size_t elem_size, int ndim,
@@ -191,13 +190,7 @@ static inline PartitionTensor __Runtime_extract_slice_strided_2d(XAie_DevInst *d
     result.partition_shape[0] = size0;
     result.partition_shape[1] = size1;
     size_t dst_size = (size_t)size0 * size1 * src.elem_size;
-    XAie_MemInst *mem_inst = XAie_MemAllocate(dev_inst, dst_size, XAIE_MEM_CACHEABLE);
-    if (!mem_inst) {
-        result.data = NULL;
-        return result;
-    }
-    __Runtime_track_alloc(mem_inst);
-    void *dst = XAie_MemGetVAddr(mem_inst);
+    void *dst = (void *)malloc(dst_size);
     result.data = dst;
     if (!dst)
         return result;
@@ -242,6 +235,11 @@ int __Runtime_partition_is_initialized(int meshId);
 XAie_DevInst *__Runtime_get_partition_dev(int meshId);
 void __Runtime_register_partition(int meshId, XAie_DevInst *dev);
 void __Runtime_teardown_all(void);
+
+// Convenience: check-init-register in one call.
+// If meshId is already initialized, returns the existing XAie_DevInst*.
+// Otherwise calls __Runtime_explicit_init_partition() and registers it.
+XAie_DevInst *__Runtime_init_mesh_partition(int meshId, int startCol, int numCols);
 
 // DMA and data movement
 XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void *buffer, int32_t bd_id, int32_t len,
@@ -354,6 +352,23 @@ AieRC __Runtime_perfcnt_setup_mm2s_bd_finished_partition(XAie_DevInst *dev, uint
 // Read and print all MM2S BD finished perf counters across a partition.
 void __Runtime_perfcnt_read_mm2s_bd_finished_partition(XAie_DevInst *dev, uint8_t start_col, uint8_t end_col,
                                                        uint8_t start_row, uint8_t end_row);
+
+// ---------------------------------------------------------------------------
+// DMA-capable buffer allocation with cache sync support
+// ---------------------------------------------------------------------------
+
+// Allocate a DMA-capable buffer via XAie_MemAllocate.
+// dev must not be NULL — call partition() before alloc().
+void *__Runtime_alloc_buffer(XAie_DevInst *dev, size_t size_bytes);
+
+// Free a buffer allocated by __Runtime_alloc_buffer.
+void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);
+
+// Flush dirty cache lines for the buffer to DDR (before DMA reads it).
+void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size);
+
+// Invalidate cache lines for the buffer from DDR (after DMA wrote it).
+void __Runtime_sync_for_cpu(XAie_DevInst *dev, void *ptr, size_t size);
 
 // Data movement wrappers (wraps XAie routing APIs)
 void __Runtime_move_data_to_tile(XAie_RoutingInstance *routing, XAie_LocType shim_tile, XAie_LocType dest_tile,

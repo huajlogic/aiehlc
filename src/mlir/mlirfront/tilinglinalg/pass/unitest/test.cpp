@@ -1076,6 +1076,7 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         module->setAttr("routing.k_rounds", attrB.getI64IntegerAttr(4));
         module->setAttr("routing.m_rounds", attrB.getI64IntegerAttr(2));
         module->setAttr("routing.n_rounds", attrB.getI64IntegerAttr(2));
+        module->setAttr("routing.iter_policy", attrB.getStringAttr("m_outer_n_inner"));
     }
 
     // When startStage==0 and using the default pipeline, delegate to

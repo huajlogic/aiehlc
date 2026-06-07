@@ -461,10 +461,6 @@ struct AllocDeviceMemInnerPattern : public OpConversionPattern<dfschedule::Alloc
         rewriter.create<emitc::CallOpaqueOp>(loc, voidPtrType, "memcpy", nullptr, nullptr,
                                              ValueRange{vaddr.getResult(0), dataPtr, sizeConst.getResult()});
 
-        // Track allocation for cleanup
-        rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "__Runtime_track_alloc", nullptr, nullptr,
-                                             ValueRange{memInst.getResult(0)});
-
         rewriter.replaceOp(op, vaddr.getResult(0));
         return success();
     }

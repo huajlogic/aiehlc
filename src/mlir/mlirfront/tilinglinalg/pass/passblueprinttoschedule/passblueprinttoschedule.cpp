@@ -564,6 +564,16 @@ TilingClassification classifyTiling(ModuleOp moduleOp) {
     return result;
 }
 
+// Returns true if policy is "n_outer_m_inner" (N is outer loop, M is inner/iter)
+bool isNOuterPolicy(ModuleOp moduleOp) {
+    if (!moduleOp)
+        return false;
+    auto attr = moduleOp->getAttrOfType<StringAttr>("routing.iter_policy");
+    if (attr && attr.getValue() == "n_outer_m_inner")
+        return true;
+    return false; // default: m_outer_n_inner
+}
+
 // Pattern to convert dfscheblueprint::FlowTransferOp to dfschedule operations
 // Logic:
 // 1. Find shim tile from the "from" and "to" FlowConfigOps by checking type="shim"
@@ -788,8 +798,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
                     int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
 
-                    if (dataId == 1) {
-                        // Input B (Col-distributed): use tile_n dimension
+                    if (dataId == 0) {
+                        // Input B (Col-distributed, dataId=0): use tile_n dimension
                         auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
                         auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
                         int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
@@ -960,9 +970,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     // 2D addressing + iter for OOO output with m/n sub-tiling:
                     //   D0: stride=wordBytes, wrap=tileN_sub_w (words per tile row)
                     //   D1: stride=outW_w*wordBytes, wrap=tileM (rows per sub-tile)
-                    // iter_step_size = tileN_sub_w * wordBytes (column advance for n_rounds)
-                    // iter_wrap = nRounds
-                    // m_rounds handled by scf.for loop (re-configuring BDs per iteration)
+                    //
+                    // Policy determines which dimension uses iter vs scf.for:
+                    //   m_outer_n_inner (default): iter over nRounds, scf.for over mRounds
+                    //   n_outer_m_inner:           iter over mRounds, scf.for over nRounds
                     int64_t mRounds = tileRowsVal / tileM;
                     unsigned bitWidth = memrefType.getElementTypeBitWidth();
                     int64_t elemsPerWord = 32 / bitWidth;
@@ -995,20 +1006,31 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     perTileDimWraps = rewriter.getArrayAttr(wraps2d);
                     usedMRounds3D = true;
 
-                    // iter params for n_rounds column stepping
-                    oooIterStepSize = static_cast<int32_t>(tileN_sub_w * wordBytes);
-                    oooIterWrap = static_cast<int32_t>(nRounds);
+                    // Policy-aware iter/scf.for assignment for OOO output (C matrix)
+                    auto moduleOp = op->getParentOfType<ModuleOp>();
+                    bool nOuterPolicy = moduleOp ? isNOuterPolicy(moduleOp) : false;
 
-                    // Store m_rounds info for scf.for loop generation
-                    oooMRounds = mRounds;
-                    oooMSubTileStride = tileM * outW_w * wordBytes;
+                    if (nOuterPolicy) {
+                        // n_outer_m_inner: scf.for over nRounds, iter over mRounds
+                        oooIterStepSize = static_cast<int32_t>(tileM * outW_w * wordBytes); // m-row advance via iter
+                        oooIterWrap = static_cast<int32_t>(mRounds);
+                        oooMRounds = nRounds;                        // outer loop = nRounds
+                        oooMSubTileStride = tileN_sub_w * wordBytes; // n-column advance per outer round
+                    } else {
+                        // m_outer_n_inner (default): scf.for over mRounds, iter over nRounds
+                        oooIterStepSize = static_cast<int32_t>(tileN_sub_w * wordBytes); // n-column advance via iter
+                        oooIterWrap = static_cast<int32_t>(nRounds);
+                        oooMRounds = mRounds;                           // outer loop = mRounds
+                        oooMSubTileStride = tileM * outW_w * wordBytes; // m-row advance per outer round
+                    }
 
                     llvm::errs() << "[OOO ShimBD 2D+iter] tileM=" << tileM << " tileRows=" << tileRowsVal
-                                 << " mRounds=" << mRounds << " tileN_sub=" << tileN_sub << " nRounds=" << nRounds
-                                 << " outW=" << outW << " D0=[" << (1 * wordBytes) << "," << tileN_sub_w << "]"
+                                 << " mRounds=" << mRounds << " nRounds=" << nRounds << " tileN_sub=" << tileN_sub
+                                 << " policy=" << (nOuterPolicy ? "n_outer" : "m_outer") << " outW=" << outW << " D0=["
+                                 << (1 * wordBytes) << "," << tileN_sub_w << "]"
                                  << " D1=[" << (outW_w * wordBytes) << "," << tileM << "]"
                                  << " iter_step=" << oooIterStepSize << " iter_wrap=" << oooIterWrap
-                                 << " mSubTileStride=" << oooMSubTileStride << "\n";
+                                 << " outerRounds=" << oooMRounds << " outerStride=" << oooMSubTileStride << "\n";
                 } else if (shimDimStrides && shimDimWraps && shimDimStrides.size() >= 2) {
                     // 2D strides (original path)
                     SmallVector<Attribute> strides2d, wraps2d;
@@ -1149,22 +1171,43 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             if (elemBytes == 0)
                                 elemBytes = 1;
 
-                            if (dataId == 1) {
-                                // Input B (Col-distributed): iter handles nRounds
-                                // D2 handles kRounds; iter advances across n-sub-tiles
+                            bool nOuterPolicy = isNOuterPolicy(moduleOp);
+
+                            if (dataId == 0) {
+                                // Input B (Col-distributed, dataId=0)
                                 auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
                                 auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
                                 int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
                                 int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
 
                                 if (tileN > 0 && tileN < tileCols) {
-                                    int64_t nRounds = tileCols / tileN;
-                                    shimIterStepSize = static_cast<int32_t>(tileN * fullK * elemBytes);
-                                    shimIterWrap = static_cast<int32_t>(nRounds);
-                                    llvm::errs() << "[BlueprintToSchedule] Input B iter (nRounds): "
-                                                 << "iter_step_size=" << shimIterStepSize
-                                                 << " iter_wrap=" << shimIterWrap << " tileN=" << tileN
-                                                 << " tileCols=" << tileCols << " nRounds=" << nRounds << "\n";
+                                    if (nOuterPolicy) {
+                                        // n_outer: B repeats same data; scf.for handles n-sub-tile advancement
+                                        int64_t mRoundsIter = 1;
+                                        auto tileMAttrB = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                                        auto tileRowsAttrB = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                                        if (tileMAttrB && tileRowsAttrB) {
+                                            int64_t tM = tileMAttrB.getInt();
+                                            int64_t tR = tileRowsAttrB.getInt();
+                                            if (tM > 0 && tM < tR)
+                                                mRoundsIter = tR / tM;
+                                        }
+                                        shimIterStepSize = 0;
+                                        shimIterWrap = 0; // step=0 → disable iteration entirely
+                                        llvm::errs() << "[BlueprintToSchedule] Input B iter (n_outer, mRounds repeat): "
+                                                     << "iter_step_size=" << shimIterStepSize
+                                                     << " iter_wrap=" << shimIterWrap << " tileN=" << tileN
+                                                     << " tileCols=" << tileCols << " mRounds=" << mRoundsIter << "\n";
+                                    } else {
+                                        // m_outer (default): B advances through n-sub-tiles via iter
+                                        int64_t nRounds = tileCols / tileN;
+                                        shimIterStepSize = static_cast<int32_t>(tileN * fullK * elemBytes);
+                                        shimIterWrap = static_cast<int32_t>(nRounds);
+                                        llvm::errs() << "[BlueprintToSchedule] Input B iter (m_outer, nRounds): "
+                                                     << "iter_step_size=" << shimIterStepSize
+                                                     << " iter_wrap=" << shimIterWrap << " tileN=" << tileN
+                                                     << " tileCols=" << tileCols << " nRounds=" << nRounds << "\n";
+                                    }
                                 } else {
                                     // No N sub-tiling: fall through to kRounds
                                     shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
@@ -1174,8 +1217,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                                  << " iter_wrap=" << shimIterWrap << "\n";
                                 }
                             } else {
-                                // Input A (Row-distributed): iter handles mRounds
-                                // D2 already handles kRounds; iter advances across m-sub-tiles
+                                // Input A (Row-distributed)
                                 int64_t tileM = 0, tileRows = 0;
                                 if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
                                     tileM = a.getInt();
@@ -1183,15 +1225,34 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                     tileRows = a.getInt();
 
                                 if (tileM > 0 && tileM < tileRows) {
-                                    // D2 handles kRounds (K-chunk stepping).
-                                    // iter handles mRounds (m-sub-tile stepping).
-                                    int64_t mRounds = tileRows / tileM;
-                                    shimIterStepSize = static_cast<int32_t>(tileM * fullK * elemBytes);
-                                    shimIterWrap = static_cast<int32_t>(mRounds);
-                                    llvm::errs() << "[BlueprintToSchedule] Input A iter (mRounds): "
-                                                 << "iter_step_size=" << shimIterStepSize
-                                                 << " iter_wrap=" << shimIterWrap << " tileM=" << tileM
-                                                 << " tileRows=" << tileRows << " mRounds=" << mRounds << "\n";
+                                    if (nOuterPolicy) {
+                                        // n_outer: A advances through m-sub-tiles via iter
+                                        int64_t mRoundsA = tileRows / tileM;
+                                        shimIterStepSize = static_cast<int32_t>(tileM * fullK * elemBytes);
+                                        shimIterWrap = static_cast<int32_t>(mRoundsA);
+                                        llvm::errs()
+                                            << "[BlueprintToSchedule] Input A iter (n_outer, mRounds advance): "
+                                            << "iter_step_size=" << shimIterStepSize << " iter_wrap=" << shimIterWrap
+                                            << " tileM=" << tileM << " tileRows=" << tileRows << " mRounds=" << mRoundsA
+                                            << "\n";
+                                    } else {
+                                        // m_outer (default): A repeats same data; scf.for handles m advancement
+                                        int64_t nRounds2 = 1;
+                                        auto tileNAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                                        auto tileColsAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                                        if (tileNAttr2 && tileColsAttr2) {
+                                            int64_t tN = tileNAttr2.getInt();
+                                            int64_t tC = tileColsAttr2.getInt();
+                                            if (tN > 0 && tN < tC)
+                                                nRounds2 = tC / tN;
+                                        }
+                                        shimIterStepSize = 0; // no advance — repeat same A data
+                                        shimIterWrap = 0;     // step=0 → disable iteration entirely
+                                        llvm::errs() << "[BlueprintToSchedule] Input A iter (m_outer, nRounds repeat): "
+                                                     << "iter_step_size=" << shimIterStepSize
+                                                     << " iter_wrap=" << shimIterWrap << " tileM=" << tileM
+                                                     << " tileRows=" << tileRows << " nRounds=" << nRounds2 << "\n";
+                                    }
                                 } else {
                                     // D1 covers all rows; iter handles kRounds
                                     shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
@@ -1834,13 +1895,23 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             // Create dfschedule.schedule.getbdid for shim tile
             auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
 
-            if (classification.mMode == TilingMode::Multiple && shimIsSender) {
-                // === Multiple mode, input flow: unified scf.for from 0 to mRounds ===
+            bool nOuterPolicy = isNOuterPolicy(moduleOp);
+            bool needsOuterLoop = false;
+            if (nOuterPolicy) {
+                needsOuterLoop = (classification.nMode == TilingMode::Multiple);
+            } else {
+                needsOuterLoop = (classification.mMode == TilingMode::Multiple);
+            }
+
+            if (needsOuterLoop && shimIsSender) {
+                // === Multiple mode, input flow: unified scf.for ===
                 // Kernel load/launch and core DMAs armed ONCE outside the loop.
                 // A single scf.for handles ALL iterations uniformly (no special-casing
                 // of iteration 0). Each iteration: config BD → create IO → start IO → wait.
-                llvm::errs() << "[BlueprintToSchedule] Multiple mode input flow: "
-                             << "mRounds=" << classification.mRounds << ", emitting unified SCF loop from 0\n";
+                int64_t outerRounds = nOuterPolicy ? classification.nRounds : classification.mRounds;
+                llvm::errs() << "[BlueprintToSchedule] Multiple mode input flow (policy="
+                             << (nOuterPolicy ? "n_outer" : "m_outer") << "): "
+                             << "outerRounds=" << outerRounds << ", emitting unified SCF loop from 0\n";
 
                 // Erase the initial createIoOp and shimBdOp created above —
                 // they are unused in Multiple mode because the loop body
@@ -1855,52 +1926,64 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 }
 
                 // Compute per-iteration repeat: must match iter_wrap
-                // D2 handles kRounds; iter handles spatial sub-tile stepping.
-                // Input A: repeat = mRounds (BD iter handles m-sub-tiles)
-                // Input B: repeat = nRounds (BD iter handles n-sub-tiles)
+                // The repeat count equals the number of inner-loop rounds:
+                // m_outer: inner = nRounds (iter handles n-sub-tile stepping)
+                // n_outer: inner = mRounds (iter handles m-sub-tile stepping)
                 int32_t perIterRepeat = 1;
                 if (moduleOp) {
                     auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
                     if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
-                        if (dataId == 1) {
-                            // Input B: repeat = nRounds (matches iter_wrap)
-                            auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
-                            auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
-                            int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
-                            int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
-                            if (tileN > 0 && tileN < tileCols) {
-                                perIterRepeat = static_cast<int32_t>(tileCols / tileN);
+                        if (nOuterPolicy) {
+                            // n_outer: inner loop = mRounds for both A and B
+                            auto tileMAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                            auto tileRowsAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                            int64_t tM = tileMAttrR ? tileMAttrR.getInt() : 0;
+                            int64_t tR = tileRowsAttrR ? tileRowsAttrR.getInt() : 0;
+                            if (tM > 0 && tM < tR) {
+                                perIterRepeat = static_cast<int32_t>(tR / tM); // mRounds
                             } else {
-                                perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt());
+                                perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt()); // fallback
                             }
                         } else {
-                            // Input A: repeat = mRounds (matches iter_wrap)
-                            auto tileMAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                            auto tileRowsAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                            int64_t tileM = tileMAttr2 ? tileMAttr2.getInt() : 0;
-                            int64_t tileRows = tileRowsAttr2 ? tileRowsAttr2.getInt() : 0;
-                            if (tileM > 0 && tileM < tileRows) {
-                                perIterRepeat = static_cast<int32_t>(tileRows / tileM);
+                            // m_outer: inner loop = nRounds for both A and B
+                            auto tileNAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                            auto tileColsAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                            int64_t tN = tileNAttrR ? tileNAttrR.getInt() : 0;
+                            int64_t tC = tileColsAttrR ? tileColsAttrR.getInt() : 0;
+                            if (tN > 0 && tN < tC) {
+                                perIterRepeat = static_cast<int32_t>(tC / tN); // nRounds
                             } else {
-                                perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt());
+                                perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt()); // fallback
                             }
                         }
                     }
                 }
 
-                // Compute the byte stride per M sub-tile for offset computation
-                // stride = tileM * fullK * elemBytes
+                // Compute the byte stride for offset computation (policy+dataId dependent)
+                // m_outer + A(dataId=1): stride = tileM * fullK * elemBytes (A advances via scf.for)
+                // m_outer + B(dataId=0): stride = 0 (B uses iter, not scf.for)
+                // n_outer + B(dataId=0): stride = tileN * fullK * elemBytes (B advances via scf.for)
+                // n_outer + A(dataId=1): stride = 0 (A uses iter, not scf.for)
                 int64_t elemBytes = 1;
                 if (memrefType.getElementType().isIntOrFloat())
                     elemBytes = memrefType.getElementTypeBitWidth() / 8;
                 if (elemBytes == 0)
                     elemBytes = 1;
-                int64_t tileMVal = 0, fullKVal = 0;
+                int64_t tileMVal = 0, tileNVal = 0, fullKVal = 0;
                 if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
                     tileMVal = a.getInt();
+                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n"))
+                    tileNVal = a.getInt();
                 if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k"))
                     fullKVal = a.getInt();
-                int64_t mSubTileStride = tileMVal * fullKVal * elemBytes;
+                int64_t subTileStride = 0; // default: no offset advancement
+                if (!nOuterPolicy && dataId == 1) {
+                    // m_outer, Input A: advance m-sub-tiles
+                    subTileStride = tileMVal * fullKVal * elemBytes;
+                } else if (nOuterPolicy && dataId == 0) {
+                    // n_outer, Input B: advance n-sub-tiles
+                    subTileStride = tileNVal * fullKVal * elemBytes;
+                }
 
                 // 1. load_kernel_group OUTSIDE the loop
                 auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
@@ -1922,10 +2005,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     coreStartIoEvents.push_back(coreStartIo.getEvent());
                 }
 
-                // 4. Single scf.for from 0 to mRounds (ALL iterations uniform)
+                // 4. Single scf.for from 0 to outerRounds (ALL iterations uniform)
                 {
                     auto lb = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-                    auto ub = rewriter.create<arith::ConstantIndexOp>(loc, classification.mRounds);
+                    auto ub = rewriter.create<arith::ConstantIndexOp>(loc, outerRounds);
                     auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
 
                     auto forOp = rewriter.create<scf::ForOp>(loc, lb, ub, step);
@@ -1935,8 +2018,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     // Cast index → i32 for arithmetic
                     auto ivI32 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), iv);
 
-                    // Compute offset = iv * mSubTileStride
-                    auto strideConst = rewriter.create<arith::ConstantIntOp>(loc, static_cast<int32_t>(mSubTileStride),
+                    // Compute offset = iv * subTileStride
+                    auto strideConst = rewriter.create<arith::ConstantIntOp>(loc, static_cast<int32_t>(subTileStride),
                                                                              rewriter.getI32Type());
                     auto offset = rewriter.create<arith::MulIOp>(loc, ivI32, strideConst);
 
@@ -1991,12 +2074,14 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 rewriter.create<dfschedule::ScheduleWaitOp>(loc, finalEvents);
 
             } else if (useOOO && usedMRounds3D && oooMRounds > 1) {
-                // === OOO output flow with m_rounds > 1: scf.for loop ===
-                // Each m_round: re-configure N OOO shim BDs with updated DDR offset,
-                // then startio + wait. n_rounds handled by BD iter_step/iter_wrap.
-                llvm::errs() << "[BlueprintToSchedule] OOO output mRounds loop: "
-                             << "oooMRounds=" << oooMRounds << " oooMSubTileStride=" << oooMSubTileStride
-                             << " numCoreTiles=" << numCoreTiles << " nRounds(iter_wrap)=" << oooIterWrap << "\n";
+                // === OOO output flow with outer_rounds > 1: scf.for loop ===
+                // Each outer round: re-configure N OOO shim BDs with updated DDR offset,
+                // then startio + wait. Inner dimension handled by BD iter_step/iter_wrap.
+                // m_outer: scf.for over mRounds, iter over nRounds
+                // n_outer: scf.for over nRounds, iter over mRounds
+                llvm::errs() << "[BlueprintToSchedule] OOO output outerRounds loop: "
+                             << "outerRounds=" << oooMRounds << " outerStride=" << oooMSubTileStride
+                             << " numCoreTiles=" << numCoreTiles << " iter_wrap=" << oooIterWrap << "\n";
 
                 // Erase the initial createIoOp and N shim BDs created above —
                 // the loop body creates its own BDs and create_io each iteration.
@@ -2045,10 +2130,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                     coreStartIoEvents.push_back(coreStartIo.getEvent());
                 }
 
-                // 4. scf.for from 0 to oooMRounds: per-iteration OOO BD re-config + startio + wait
-                // Each iteration handles one m_round. Per m_round, each of
-                // numCoreTiles cores produces oooIterWrap(=nRounds) outputs.
-                // Total = perIterRepeat * oooMRounds = numCoreTiles * nRounds * mRounds.
+                // 4. scf.for from 0 to oooMRounds (outerRounds): per-iteration OOO BD re-config + startio + wait
+                // Each iteration handles one outer round. Per round, each of
+                // numCoreTiles cores produces oooIterWrap inner-dimension outputs.
+                // Total = perIterRepeat * oooMRounds = numCoreTiles * iterWrap * outerRounds.
                 int32_t perIterRepeat = static_cast<int32_t>(numCoreTiles * oooIterWrap);
                 {
                     auto lb = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -2114,7 +2199,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                         rewriter.getStringAttr(dmaDirection), rewriter.getStringAttr(ioOperation),
                         rewriter.getBoolAttr(true)); // enable_out_of_order = true
 
-                    // Start IO: repeat = numCoreTiles * nRounds per m_round iteration
+                    // Start IO: repeat = numCoreTiles * iterWrap per outer-round iteration
                     auto loopGetBdId =
                         rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
                     auto loopStartIo = rewriter.create<dfschedule::StartIoOp>(
@@ -2122,7 +2207,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                         loopGetBdId.getBdId(), rewriter.getI32IntegerAttr(flowIndex),
                         rewriter.getI32IntegerAttr(perIterRepeat));
 
-                    // Wait for this m_round's OOO completion before next BD re-arm
+                    // Wait for this outer round's OOO completion before next BD re-arm
                     SmallVector<Value> loopWaitEvents;
                     loopWaitEvents.push_back(loopStartIo.getEvent());
                     rewriter.create<dfschedule::ScheduleWaitOp>(loc, loopWaitEvents);
@@ -2148,28 +2233,31 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 } else if (shimIsSender) {
                     // Channel repeat must match iter_wrap so the DMA engine
                     // re-executes the BD the correct number of times.
+                    // Policy determines which dimension is in the inner loop (iter):
+                    // m_outer: iter handles nRounds (B advances, A repeats)
+                    // n_outer: iter handles mRounds (A advances, B repeats)
                     if (moduleOp) {
                         auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
                         if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
-                            if (dataId == 1) {
-                                // Input B: repeat = nRounds (matches iter_wrap)
-                                auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
-                                auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
-                                int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
-                                int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
-                                if (tileN > 0 && tileN < tileCols) {
-                                    repeatCount = static_cast<int32_t>(tileCols / tileN);
+                            if (nOuterPolicy) {
+                                // n_outer: repeat = mRounds (matches iter_wrap) for both A and B
+                                auto tileMAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                                auto tileRowsAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                                int64_t tM = tileMAttrRC ? tileMAttrRC.getInt() : 0;
+                                int64_t tR = tileRowsAttrRC ? tileRowsAttrRC.getInt() : 0;
+                                if (tM > 0 && tM < tR) {
+                                    repeatCount = static_cast<int32_t>(tR / tM); // mRounds
                                 } else {
                                     repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
                                 }
                             } else {
-                                // Input A: repeat = mRounds (matches iter_wrap)
-                                auto tileMAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                                auto tileRowsAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                                int64_t tileM = tileMAttr2 ? tileMAttr2.getInt() : 0;
-                                int64_t tileRows = tileRowsAttr2 ? tileRowsAttr2.getInt() : 0;
-                                if (tileM > 0 && tileM < tileRows) {
-                                    repeatCount = static_cast<int32_t>(tileRows / tileM);
+                                // m_outer: repeat = nRounds (matches iter_wrap) for both A and B
+                                auto tileNAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                                auto tileColsAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                                int64_t tN = tileNAttrRC ? tileNAttrRC.getInt() : 0;
+                                int64_t tC = tileColsAttrRC ? tileColsAttrRC.getInt() : 0;
+                                if (tN > 0 && tN < tC) {
+                                    repeatCount = static_cast<int32_t>(tC / tN); // nRounds
                                 } else {
                                     repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
                                 }

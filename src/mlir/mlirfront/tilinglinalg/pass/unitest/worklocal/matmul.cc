@@ -5,20 +5,20 @@
 void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_int8 *win_c) {
 
     // Compiler-resolved tiling parameters
-    const int tile_rows = 8;
-    const int tile_cols = 8;
-    const int eff_k = 16;       // K chunk size per k-round
-    const int k_rounds = 4;     // number of K-accumulation rounds
+    const int tile_rows = 16;
+    const int tile_cols = 16;
+    const int eff_k = 64;       // K chunk size per k-round
+    const int k_rounds = 8;     // number of K-accumulation rounds
     const int num_a_rounds = 1; // DMA rounds per k-round for A
     const int num_b_rounds = 1; // DMA rounds per k-round for B
     const int num_c_rounds = 1;
-    const int buf_sz_a = 128;
-    const int buf_sz_b = 128;
-    const int buf_sz_c = 64;
+    const int buf_sz_a = 1024;
+    const int buf_sz_b = 1024;
+    const int buf_sz_c = 256;
 
     // Spatial sub-tile iteration counts
-    const int m_rounds = 2;
-    const int n_rounds = 2;
+    const int m_rounds = 8;
+    const int n_rounds = 8;
 
     // Derived per-round sizes (using effective_k, not full k_dim)
     const int rows_per_round = buf_sz_a / eff_k;
@@ -58,9 +58,9 @@ void matmul(input_window_int8 *win_a, input_window_int8 *win_b, output_window_in
                     all_A[ra * buf_sz_a + i] = A_ptr[i];
                 }
 #if DEBUG_OUTPUT_ORDER
-                // if (kr == 0 && mr == 0) {
-                klog("A0  ", (int32_t)A_ptr[0]);
-                //}
+                for (int l = 0; l < (buf_sz_a < 8 ? buf_sz_a : 8); l++) {
+                    klog("A   ", (int32_t)A_ptr[l]);
+                }
 #endif
                 release_input_window(win_a);
             }

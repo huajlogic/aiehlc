@@ -11,18 +11,18 @@ constexpr aie::SpatialPolicy RowBA = {
     .distribution = aie::Layout::Row,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
-    .tile_m = 8, // explicit sub-tile rows
-    .tile_n = 8, // 0 = auto (uses tileCols)
-    .tile_k = 16 // K chunk size (4 k-rounds for K=256)
+    .tile_m = 16, // explicit sub-tile rows
+    .tile_n = 16, // 0 = auto (uses tileCols)
+    .tile_k = 64  // K chunk size (4 k-rounds for K=256)
 };
 constexpr aie::SpatialPolicy ColBB = {
     .pattern = aie::Pattern::Broadcast,
     .distribution = aie::Layout::Col,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
-    .tile_m = 8, // explicit sub-tile rows
-    .tile_n = 8, // 0 = auto (uses tileCols)
-    .tile_k = 16 // K chunk size (4 k-rounds for K=256)
+    .tile_m = 16, // explicit sub-tile rows
+    .tile_n = 16, // 0 = auto (uses tileCols)
+    .tile_k = 64  // K chunk size (4 k-rounds for K=256)
 };
 constexpr aie::SpatialPolicy LtoR_Merge = {
     .pattern = aie::Pattern::Gather,
@@ -30,9 +30,9 @@ constexpr aie::SpatialPolicy LtoR_Merge = {
     .merge_order = aie::Flow::LeftToRight,
     .pp_depth = 2,
     .max_buffer_bytes = 4096,
-    .tile_m = 8, // explicit sub-tile rows
-    .tile_n = 8, // 0 = auto (uses tileCols)
-    .tile_k = 16 // K chunk size (4 k-rounds for K=256)
+    .tile_m = 16, // explicit sub-tile rows
+    .tile_n = 16, // 0 = auto (uses tileCols)
+    .tile_k = 64  // K chunk size (4 k-rounds for K=256)
 };
 #define DEBUG_OUTPUT_ORDER 1
 __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<input_window_int8 *, ColBB> win_b,
@@ -92,9 +92,9 @@ __global__ void matmul(aie::port<input_window_int8 *, RowBA> win_a, aie::port<in
                     all_A[ra * buf_sz_a + i] = A_ptr[i];
                 }
 #if DEBUG_OUTPUT_ORDER
-                // if (kr == 0 && mr == 0) {
-                klog("A0  ", (int32_t)A_ptr[0]);
-                //}
+                for (int l = 0; l < (buf_sz_a < 8 ? buf_sz_a : 8); l++) {
+                    klog("A   ", (int32_t)A_ptr[l]);
+                }
 #endif
                 release_input_window(win_a);
             }
@@ -292,10 +292,10 @@ int main() {
     // Gen2 NoC shim columns {2,3} — enough for a 4x4 GEMM's ~12 DataIOs.
     aieMesh mesh = device.partition({3, 6, 0, 6}, HW_ROWS, HW_COLS);
     // aieDim mesh(HW_ROWS, HW_COLS);
-    //  --- Allocate host memory ---
-    int8_t *A = (int8_t *)malloc(M * K * sizeof(int8_t) * 4);
-    int8_t *B = (int8_t *)malloc(K * N * sizeof(int8_t) * 4);
-    int8_t *C = (int8_t *)malloc(M * N * sizeof(int8_t) * 4);
+    //  --- Allocate DMA-capable host memory (cache stays enabled) ---
+    int8_t *A = (int8_t *)device.alloc(M * K * sizeof(int8_t) * 4);
+    int8_t *B = (int8_t *)device.alloc(K * N * sizeof(int8_t) * 4);
+    int8_t *C = (int8_t *)device.alloc(M * N * sizeof(int8_t) * 4);
     // --- Initialize input matrices ---
     for (int i = 0; i < M * K; i++)
         A[i] = (int8_t)((i % 7) - 3);
@@ -305,15 +305,15 @@ int main() {
         C[i] = 0;
     // --- Launch kernel on tile mesh ---
     matmul<<<mesh>>>(A, B, C, M, N, K);
+    device.synchronizecpu(C, M * N * sizeof(int8_t) * 4);
     int result = verify_matmul(A, B, C);
     // mul2<<<mesh>>>(C, B, A, M, N, K);
     // int result2 = verify_matmul(C, B, A);
     //   --- Wait for all partitions and teardown ---
-    device.synchronize();
     // --- Verify output ---
     // --- Cleanup ---
-    free(A);
-    free(B);
-    free(C);
+    device.free(A);
+    device.free(B);
+    device.free(C);
     return result;
 }
