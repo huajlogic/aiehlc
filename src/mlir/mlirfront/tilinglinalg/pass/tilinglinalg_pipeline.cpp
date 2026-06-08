@@ -9,11 +9,15 @@
 #include "kernelconfig.h"
 #include "passblueprinttoschedule.h"
 #include "passblueprinttoschedulekernel.h"
+#include "passdfscheduleprovenancemap.h"
 #include "passdfscheduletoapi.h"
 #include "passdfscheduletokernelapi.h"
+#include "passdmaphopprovenancemap.h"
 #include "passdmaphoptodfscheblueprint.h"
 #include "passdmaphoptoroutinghw.h"
 #include "passschedulecanonicalize.h"
+#include "passschedulesequentialop.h"
+#include "passwaitmerge.h"
 #include "routingconstantfold.h"
 #include "routingdeadargclean.h"
 #include "routinghwlower.h"
@@ -29,7 +33,6 @@
 #include "dfschedulemanager.h"
 #include "dfscheblueprintmanager.h"
 
-#include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -196,6 +199,19 @@ mlir::ModuleOp TilingLinalgPipeline::buildRoutingIR(mlir::MLIRContext &ctx, int 
 
     builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
     m.push_back(hostFunc);
+
+    // Store per-tensor pp_depth as module attribute so downstream passes can read it.
+    // Format: "routing.pp_depth_map" = { tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 1 : i32, ... }
+    {
+        NamedAttrList ppDepthEntries;
+        for (unsigned i = 0; i < splitModel.tensorSplits.size(); ++i) {
+            int ppDepth = splitModel.tensorSplits[i].pingPong;
+            std::string key = "tensor_" + std::to_string(i);
+            ppDepthEntries.append(key, builder.getI32IntegerAttr(ppDepth));
+        }
+        m->setAttr("routing.pp_depth_map", DictionaryAttr::get(&ctx, ppDepthEntries));
+    }
+
     llvm::errs() << m;
     return m;
 }
@@ -223,7 +239,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     // Convert absolute partition columns to 0-based partition-relative columns.
     // XAie_SetupPartitionConfig handles the physical mapping, so the pipeline
     // should generate coordinates relative to the partition origin.
-    int relStartCol = 0;
+    // Only enable partition mode when both startCol and endCol are specified;
+    // otherwise keep relStartCol = -1 so RoutingTopology skips setPartitionBounds.
+    int relStartCol = (partStartCol >= 0 && partEndCol >= 0) ? 0 : -1;
     int relEndCol = (partStartCol >= 0 && partEndCol >= 0) ? (partEndCol - partStartCol) : -1;
     RoutingTopology rtopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
 
@@ -240,6 +258,12 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     if (!runPipelineSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage, "DmapToDmaphopPass"))
         return false;
+
+    // Generate provenance map JSON after dmaphop IR is available
+    {
+        auto provenancePass = std::make_unique<DmaphopProvenanceMapPass>(outputDir);
+        runPipelineSinglePass(ctx, module, std::move(provenancePass), irDir, stage, "DmaphopProvenanceMapPass");
+    }
 
     // Clone the module at dmaphop stage for the routing path (Phase 5).
     // This preserves the pkt_ids allocated by DmapToDmaphopPass so that
@@ -284,6 +308,42 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         ResourceMgr::init(std::move(hwRes));
     }
 
+    // Early memory check: validate that per-tile buffer requirements fit in tile data memory
+    {
+        auto hwRes = ResourceMgr::instance()->getrsc();
+        uint32_t usableBytes = hwRes->getUsableDataBytes();
+
+        // Estimate per-tile buffer memory from tensor params and ping-pong depth.
+        // Each tensor port on a core tile needs ppDepth * bufferSliceBytes.
+        // bufferSliceBytes = product(tileShape) * elementBytes where tileShape = shape / meshDim.
+        // For a conservative check we use maxPingPongBytes as the per-buffer size.
+        uint32_t totalBufferBytes = 0;
+        for (const auto &tp : tensors) {
+            int ppDepth = 2; // default ping-pong depth
+            // Read pp_depth from module attribute if available
+            if (auto ppMap = module->getAttrOfType<DictionaryAttr>("routing.pp_depth_map")) {
+                unsigned idx = &tp - &tensors[0];
+                std::string key = "tensor_" + std::to_string(idx);
+                if (auto ppAttr = ppMap.getAs<IntegerAttr>(key))
+                    ppDepth = ppAttr.getInt();
+            }
+            uint32_t bufSize = (maxPingPongBytes > 0) ? maxPingPongBytes : 4096;
+            totalBufferBytes += ppDepth * bufSize;
+        }
+
+        std::string errMsg;
+        if (!hwRes->checkDataMemoryFits(totalBufferBytes, &errMsg)) {
+            llvm::errs() << "[TilingLinalg] ERROR: Memory budget exceeded!\n"
+                         << "  " << errMsg << "\n"
+                         << "  maxPingPongBytes=" << maxPingPongBytes << " numTensors=" << tensors.size() << "\n"
+                         << "  Suggestion: reduce maxBufferBytes in SpatialPolicy "
+                         << "or reduce ping-pong depth.\n";
+            return false;
+        }
+        std::cout << "[TilingLinalg] Memory check passed: estimated " << totalBufferBytes << " bytes per tile, limit "
+                  << usableBytes << " bytes" << std::endl;
+    }
+
     // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
     if (!runPipelineSinglePass(ctx, hostModule,
                                std::make_unique<mlir::BlueprintToSchedulePass>(0.5, maxPingPongBytes, aieGen), irDir,
@@ -292,6 +352,19 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
                        "ScheduleCanonicalizePass"))
         return false;
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleSequentialOpPass>(), irDir, stage,
+                               "ScheduleSequentialOpPass"))
+        return false;
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::WaitMergePass>(), irDir, stage, "WaitMergePass"))
+        return false;
+
+    // Generate low-level dfschedule provenance map after WaitMergePass
+    {
+        auto dfscheProvenancePass = std::make_unique<DfscheduleProvenanceMapPass>(outputDir);
+        runPipelineSinglePass(ctx, hostModule, std::move(dfscheProvenancePass), irDir, stage,
+                              "DfscheduleProvenanceMapPass");
+    }
+
     if (!runPipelineSinglePass(ctx, hostModule,
                                std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true, runtimeDebugLevel),
                                irDir, stage, "DfscheduleToApiPass"))
@@ -510,6 +583,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "  Flow    merge_order  = Flow::Default;\n";
             stream << "  int     pp_depth     = 2;\n";
             stream << "  int     max_buffer_bytes = 4096;\n";
+            stream << "  int     tile_m       = 0;\n";
+            stream << "  int     tile_n       = 0;\n";
+            stream << "  int     tile_k       = 0;\n";
             stream << "};\n";
             stream << "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
             stream << "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
@@ -517,12 +593,20 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "constexpr int get_tile_rows() { return 0; }\n";
             stream << "constexpr int get_tile_cols() { return 0; }\n";
             stream << "constexpr int get_k_dim() { return 0; }\n";
+            stream << "constexpr int get_tile_m() { return 0; }\n";
+            stream << "constexpr int get_tile_n() { return 0; }\n";
+            stream << "constexpr int get_effective_k() { return 0; }\n";
+            stream << "constexpr int get_k_rounds() { return 0; }\n";
+            stream << "constexpr int get_spatial_m_rounds() { return 0; }\n";
+            stream << "constexpr int get_spatial_n_rounds() { return 0; }\n";
             stream << "}\n";
             // aiePartition struct (shared between aieDim and aieMesh)
             stream << "struct aiePartition {\n";
             stream << "    int startCol, endCol, startRow, endRow;\n";
             stream << "};\n";
             // New programming model types: aieMesh + aieArray
+            // Note: XAie_DevInst, __Runtime_explicit_init, __Runtime_alloc_buffer,
+            // __Runtime_free_buffer are already declared via #include "aie_runtime.h"
             stream << "struct aieMesh {\n";
             stream << "    int rows, cols;\n";
             stream << "    aiePartition partition;\n";
@@ -530,10 +614,15 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "};\n";
             stream << "struct aieArray {\n";
             stream << "    int nextMeshId = 0;\n";
+            stream << "    XAie_DevInst* _dev = nullptr;\n";
             stream << "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
-            stream << "        return aieMesh{rows, cols, p, nextMeshId++};\n";
+            stream << "        int meshId = nextMeshId++;\n";
+            stream << "        _dev = __Runtime_init_mesh_partition(meshId, p.startCol, p.endCol - p.startCol + 1);\n";
+            stream << "        return aieMesh{rows, cols, p, meshId};\n";
             stream << "    }\n";
-            stream << "    void synchronize() { __Runtime_teardown_all(); }\n";
+            stream << "    void* alloc(size_t size) { return __Runtime_alloc_buffer(_dev, size); }\n";
+            stream << "    void free(void* ptr) { __Runtime_free_buffer(_dev, ptr); }\n";
+            stream << "    void synchronizecpu(void* ptr, size_t size) { __Runtime_sync_for_cpu(_dev, ptr, size); }\n";
             stream << "};\n";
             // Backward-compatible aieDim (maps to aieMesh internally)
             stream << "struct aieDim {\n";
@@ -554,32 +643,47 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_end[];\n";
             stream << "extern unsigned int _binary_kernel_" << computeKernelName << "_size;\n\n";
 
+            // Helper: emit XAie_MemSyncForDevVAddr calls for ALL buffers before DMA.
+            // On ARM (baremetal), SyncForDev flushes+invalidates cache lines, which is
+            // needed for outputs too: dirty cache lines (e.g. zeroed output buffer) must
+            // be flushed and invalidated BEFORE DMA writes results to DDR, otherwise a
+            // post-DMA invalidate (clean+invalidate) would flush stale zeros over the
+            // DMA results. No post-launch sync is needed.
+            auto emitSyncCalls = [&](llvm::raw_fd_ostream &os, unsigned nDdrArgs, const std::string &indent,
+                                     bool beforeLaunch) {
+                if (!beforeLaunch)
+                    return; // no post-launch sync needed on ARM
+                unsigned limit = nDdrArgs;
+                if (limit > tensors.size())
+                    limit = tensors.size();
+                for (unsigned i = 0; i < limit; ++i) {
+                    os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
+                }
+            };
+
             // --- __aie_launch with partition registry (init-once, dispatch by kernel name) ---
             if (numDdrArgs > 0) {
                 // aieMesh overload (new programming model)
                 stream << "inline void __aie_launch(const char* kernel, aieMesh mesh";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
-                    stream << ", void* _t" << i;
+                    stream << ", void* _t" << i << ", size_t _s" << i;
                 stream << ", ...) {\n";
-                stream << "    XAie_DevInst* dev;\n";
-                stream << "    if (__Runtime_partition_is_initialized(mesh.meshId)) {\n";
-                stream << "        dev = __Runtime_get_partition_dev(mesh.meshId);\n";
-                stream << "    } else {\n";
-                stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
-                          "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
-                stream << "        __Runtime_register_partition(mesh.meshId, dev);\n";
-                stream << "    }\n";
+                stream << "    XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
+                emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/true);
                 stream << "    " << hostFuncName << "(dev";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
                     stream << ", _t" << i;
                 stream << ");\n";
+                // No post-launch sync needed (cache lines already invalidated)
+                emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/false);
                 stream << "}\n";
 
                 // aieDim overload (backward compatibility)
                 stream << "inline void __aie_launch(const char* kernel, aieDim mesh";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
-                    stream << ", void* _t" << i;
+                    stream << ", void* _t" << i << ", size_t _s" << i;
                 stream << ", ...) {\n";
                 stream << "    (void)kernel;\n";
                 stream << "    XAie_DevInst* dev;\n";
@@ -590,24 +694,21 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 stream << "        dev = __Runtime_explicit_init();\n";
                 stream << "    }\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
+                // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
+                emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/true);
                 stream << "    " << hostFuncName << "(dev";
                 for (unsigned i = 0; i < numDdrArgs; ++i)
                     stream << ", _t" << i;
                 stream << ");\n";
+                // No post-launch sync needed (cache lines already invalidated)
+                emitSyncCalls(stream, numDdrArgs, "    ", /*beforeLaunch=*/false);
                 stream << "    __Runtime_explicit_teardown(dev);\n";
                 stream << "}\n";
             } else {
                 // aieMesh overload (new programming model)
                 stream << "template<typename... Args>\n";
                 stream << "inline void __aie_launch(const char* kernel, aieMesh mesh, Args... args) {\n";
-                stream << "    XAie_DevInst* dev;\n";
-                stream << "    if (__Runtime_partition_is_initialized(mesh.meshId)) {\n";
-                stream << "        dev = __Runtime_get_partition_dev(mesh.meshId);\n";
-                stream << "    } else {\n";
-                stream << "        dev = __Runtime_explicit_init_partition(mesh.partition.startCol, "
-                          "mesh.partition.endCol - mesh.partition.startCol + 1);\n";
-                stream << "        __Runtime_register_partition(mesh.meshId, dev);\n";
-                stream << "    }\n";
+                stream << "    XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);\n";
                 stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << computeKernelName << "_start);\n";
                 stream << "    " << hostFuncName << "(dev);\n";
                 stream << "}\n";
@@ -707,13 +808,25 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             }
             stream << "\n";
 
-            // Explicit init → host function → explicit teardown
+            // Explicit init → sync ALL buffers → host function → teardown
             stream << "    XAie_DevInst* dev = __Runtime_explicit_init();\n";
+            // Flush+invalidate ALL buffers (inputs AND outputs) before DMA.
+            // On ARM, output buffers may have dirty cache lines (e.g. from memset to zero)
+            // that must be flushed before DMA writes results to DDR.
+            for (unsigned i = 0; i < tensors.size(); ++i) {
+                int64_t totalElements = 1;
+                for (auto dim : tensors[i].shape)
+                    totalElements *= dim;
+                int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
+                stream << "    XAie_MemSyncForDevVAddr(dev, buf_" << i << ", " << totalBytes << ");\n";
+            }
             stream << "    " << hostFuncName << "(dev";
             for (unsigned i = 0; i < tensors.size(); ++i) {
                 stream << ", buf_" << i;
             }
-            stream << ");\n\n";
+            stream << ");\n";
+            // No post-launch sync needed — cache lines already invalidated by SyncForDev
+            stream << "\n";
 
             stream << "    printf(\"------------after matmul--------\\n\");\n\n";
 
@@ -873,7 +986,7 @@ after_host_emit:
 
         if (!allocations.empty()) {
             TilingBcf bcf;
-            bcf.setStack(0x70000, 0x1024);
+            bcf.setStack(0x70000, 0x2800);
             bcf.addReservedDMB(0x40000, 0x10000);
             bcf.addReservedDMB(0x7F800, 0x800);
             for (const auto &slot : allocations) {

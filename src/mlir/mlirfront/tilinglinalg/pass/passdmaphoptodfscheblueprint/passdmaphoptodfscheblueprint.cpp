@@ -4,20 +4,21 @@
 ******************************************************************************/
 
 #include "passdmaphoptodfscheblueprint.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include <iostream>
 #include <atomic>
+#include <iostream>
 
 using namespace mlir;
 using namespace dmaphop;
@@ -239,7 +240,8 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getArrayAttr({}), builder.getStringAttr(srcTileType),
         nullptr, // data_id
         nullptr, // shim_dim_strides
-        nullptr  // shim_dim_wraps
+        nullptr, // shim_dim_wraps
+        nullptr  // pp_depth
     );
 
     std::string dstBindName = "flow_dst_" + std::to_string(opId);
@@ -252,7 +254,8 @@ void processPull(dmaphop::pull op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getStringAttr(dstTileType),
         builder.getI32IntegerAttr(dataId), // data_id for shim BD grouping
         nullptr,                           // shim_dim_strides
-        nullptr                            // shim_dim_wraps
+        nullptr,                           // shim_dim_wraps
+        nullptr                            // pp_depth
     );
 
     // 4. Collective Transfer
@@ -396,7 +399,8 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getStringAttr(srcTileType),
         nullptr, // data_id
         nullptr, // shim_dim_strides
-        nullptr  // shim_dim_wraps
+        nullptr, // shim_dim_wraps
+        nullptr  // pp_depth
     );
 
     std::string dstBindName = "flow_dst_" + std::to_string(opId);
@@ -408,7 +412,8 @@ void processPush(dmaphop::push op, OpBuilder &builder, dfscheblueprint::ConfigOp
         builder.getArrayAttr({}), builder.getStringAttr(dstTileType),
         nullptr, // data_id
         nullptr, // shim_dim_strides
-        nullptr  // shim_dim_wraps
+        nullptr, // shim_dim_wraps
+        nullptr  // pp_depth
     );
 
     int32_t basePktId = 0; // Push flows are circuit-switched; no pkt_id
@@ -803,6 +808,97 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
         // For Push: src is one shim tile (FlowConfigOp with partition slice view),
         //           dst is many core tiles (FlowConfigOp with linear and slice_symbols)
         std::string srcBindName = "flow_src_" + std::to_string(opId);
+
+        // Compute multi-dimensional DMA addressing for shim MM2S input when
+        // effectiveK < fullK (K-dimension temporal tiling). In this case, the
+        // routing IR uses tensor shapes with effectiveK, but the DDR data has
+        // full-K row width. The shim DMA must use 2D addressing to extract the
+        // correct K-chunk columns from each DDR row.
+        ArrayAttr inputShimDimStrides = nullptr;
+        ArrayAttr inputShimDimWraps = nullptr;
+
+        if (srcTileType == "shim") {
+            auto moduleOp = op->getParentOfType<ModuleOp>();
+            if (moduleOp) {
+                auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
+                auto fullKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k");
+                auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+
+                if (effectiveKAttr && fullKAttr) {
+                    int64_t effectiveK = effectiveKAttr.getInt();
+                    int64_t fullK = fullKAttr.getInt();
+                    int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+
+                    if (effectiveK > 0 && effectiveK < fullK) {
+                        // Get element bit width from the view tensor type
+                        auto viewType = dyn_cast<RankedTensorType>(viewSplit.getType());
+                        if (viewType && viewType.getRank() == 2) {
+                            unsigned bitWidth = viewType.getElementTypeBitWidth();
+                            int64_t elemsPerWord = 32 / bitWidth; // 4 for i8, 2 for i16
+                            constexpr int64_t wordBytes = 4;
+
+                            // Partition slice shape: {partRows, effectiveK}
+                            int64_t partRows = viewType.getDimSize(0);
+                            int64_t effK_w = effectiveK / elemsPerWord; // effectiveK in words
+                            int64_t fullK_w = fullK / elemsPerWord;     // fullK in words
+
+                            if (tileM > 0 && tileM < partRows) {
+                                // 3D addressing: D0=K-chunk, D1=sub-tile rows, D2=kRounds
+                                // Determine the sub-tile dimension based on flow type:
+                                //   Input B (dataId==0): D1 = tile_n (col sub-tiling)
+                                //   Input A (dataId==1): D1 = tile_m (row sub-tiling)
+                                auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                                int64_t subTileDim = tileM; // default: tile_m for input A
+                                if (dataId == 0 && tileNAttr) {
+                                    subTileDim = tileNAttr.getInt(); // input B (dataId=0): use tile_n
+                                }
+
+                                int64_t kRounds = fullK / effectiveK;
+                                SmallVector<int32_t> strides = {
+                                    static_cast<int32_t>(1 * wordBytes),       // D0: 4 bytes
+                                    static_cast<int32_t>(fullK_w * wordBytes), // D1: fullK bytes
+                                    static_cast<int32_t>(effectiveK)           // D2: effectiveK bytes
+                                };
+                                SmallVector<int32_t> wraps = {
+                                    static_cast<int32_t>(effK_w),     // D0: effectiveK/4
+                                    static_cast<int32_t>(subTileDim), // D1: tile_m or tile_n
+                                    static_cast<int32_t>(kRounds)     // D2: kRounds
+                                };
+                                inputShimDimStrides = rewriter.getI32ArrayAttr(strides);
+                                inputShimDimWraps = rewriter.getI32ArrayAttr(wraps);
+
+                                llvm::errs()
+                                    << "[ShimMultiDim] Push input (3D K-tiling, sub-tile<partRows): "
+                                    << "effectiveK=" << effectiveK << " fullK=" << fullK << " partRows=" << partRows
+                                    << " tileM=" << tileM << " subTileDim=" << subTileDim << " dataId=" << dataId
+                                    << " kRounds=" << kRounds << " elemsPerWord=" << elemsPerWord << " strides=["
+                                    << strides[0] << "," << strides[1] << "," << strides[2] << "]"
+                                    << " wraps=[" << wraps[0] << "," << wraps[1] << "," << wraps[2] << "]\n";
+                            } else {
+                                // 2D addressing (existing): D0=K-chunk, D1=partRows
+                                // tile_m == partRows (or unset): no M sub-tiling needed.
+                                // D0+D1 covers one K-chunk across all rows, BD iteration
+                                // handles kRounds.
+                                SmallVector<int32_t> strides = {static_cast<int32_t>(1 * wordBytes),
+                                                                static_cast<int32_t>(fullK_w * wordBytes)};
+                                SmallVector<int32_t> wraps = {static_cast<int32_t>(effK_w),
+                                                              static_cast<int32_t>(partRows)};
+
+                                inputShimDimStrides = rewriter.getI32ArrayAttr(strides);
+                                inputShimDimWraps = rewriter.getI32ArrayAttr(wraps);
+
+                                llvm::errs() << "[ShimMultiDim] Push input (2D K-tiling): "
+                                             << "effectiveK=" << effectiveK << " fullK=" << fullK
+                                             << " partRows=" << partRows << " elemsPerWord=" << elemsPerWord
+                                             << " strides=[" << strides[0] << "," << strides[1] << "]"
+                                             << " wraps=[" << wraps[0] << "," << wraps[1] << "]\n";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Use viewSplit (partition slice) so the shim BD covers only the data
         // for this round; rootAdaptedView is kept only for data_id assignment.
         rewriter.create<dfscheblueprint::FlowConfigOp>(
@@ -814,8 +910,9 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             nullptr, // slice_symbols - source is root, no slice
             rewriter.getStringAttr(srcTileType),
             rewriter.getI32IntegerAttr(dataId), // data_id for shim BD grouping/merging
-            nullptr,                            // shim_dim_strides (input scatter: contiguous DDR, no multi-dim needed)
-            nullptr                             // shim_dim_wraps
+            inputShimDimStrides,                // shim_dim_strides (2D when effectiveK < fullK)
+            inputShimDimWraps,                  // shim_dim_wraps
+            nullptr                             // pp_depth
         );
 
         std::string dstBindName = "flow_dst_" + std::to_string(opId);
@@ -828,7 +925,8 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
             rewriter.getStringAttr(dstTileType),
             nullptr, // data_id
             nullptr, // shim_dim_strides
-            nullptr  // shim_dim_wraps
+            nullptr, // shim_dim_wraps
+            nullptr  // pp_depth
         );
 
         // 5. Create Collective Transfer - one_to_many for push/scatter
@@ -1038,8 +1136,50 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                 rewriter.getArrayAttr(destTiles)
             );
         }
-        
+
         // 4. Create Binds
+        // Look up pp_depth from module attribute for output (Pull) flows.
+        // The pp_depth_map module attribute maps tensor_N -> pp_depth.
+        // For Pull flows (output Gather), we find the matching output tensor.
+        IntegerAttr ppDepthAttr = nullptr;
+        if (auto moduleOp = op->getParentOfType<ModuleOp>()) {
+            if (auto ppDepthMap = moduleOp->getAttrOfType<DictionaryAttr>("routing.pp_depth_map")) {
+                // Trace rootAdaptedView back through the op chain to find
+                // the func arg index, then look up pp_depth from the map.
+                // Chain: routingextract_data -> partitiontensor ->
+                //        createscheduletensor -> to_tensor -> block arg
+                Value traceVal = rootAdaptedView;
+                for (int step = 0; step < 10 && traceVal; ++step) {
+                    if (auto blockArg = dyn_cast<BlockArgument>(traceVal)) {
+                        // Reached func argument — look up pp_depth
+                        unsigned tensorIdx = blockArg.getArgNumber();
+                        std::string key = "tensor_" + std::to_string(tensorIdx);
+                        if (auto attr = ppDepthMap.getAs<IntegerAttr>(key)) {
+                            ppDepthAttr = attr;
+                            llvm::errs() << "[PullOp] Found pp_depth=" << attr.getInt() << " for tensor_" << tensorIdx
+                                         << "\n";
+                        }
+                        break;
+                    }
+                    Operation *defOp = traceVal.getDefiningOp();
+                    if (!defOp)
+                        break;
+                    if (auto extractSlice = dyn_cast<tensor::ExtractSliceOp>(defOp))
+                        traceVal = extractSlice.getSource();
+                    else if (auto extractData = dyn_cast<routing::extract_data>(defOp))
+                        traceVal = extractData.getTensor();
+                    else if (auto partTensor = dyn_cast<routing::partitiontensor>(defOp))
+                        traceVal = partTensor.getTensor();
+                    else if (auto schedTensor = dyn_cast<routing::createscheduletensor>(defOp))
+                        traceVal = schedTensor.getInitTensor();
+                    else if (auto toTensor = dyn_cast<bufferization::ToTensorOp>(defOp))
+                        traceVal = toTensor.getMemref();
+                    else
+                        break; // unknown op
+                }
+            }
+        }
+
         std::string srcBindName = "flow_src_" + std::to_string(opId);
         rewriter.create<dfscheblueprint::FlowConfigOp>(
             op.getLoc(), rewriter.getStringAttr(srcBindName), FlatSymbolRefAttr::get(getContext(), srcGroupName),
@@ -1048,9 +1188,10 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
                                           dfscheblueprint::bp_direction::MM2S),
             rewriter.getArrayAttr(sliceSymbols), // slice_symbols
             rewriter.getStringAttr(srcTileType),
-            nullptr, // data_id
-            nullptr, // shim_dim_strides
-            nullptr  // shim_dim_wraps
+            nullptr,    // data_id
+            nullptr,    // shim_dim_strides
+            nullptr,    // shim_dim_wraps
+            ppDepthAttr // pp_depth (from module attribute, for output flows)
         );
 
         // Compute multi-dimensional DMA addressing for shim S2MM (output assembly).
@@ -1132,7 +1273,8 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             rewriter.getStringAttr(dstTileType),
             rewriter.getI32IntegerAttr(dataId), // data_id for shim BD grouping
             shimDimStrides,                     // multi-dim strides for output assembly
-            shimDimWraps                        // multi-dim wraps for output assembly
+            shimDimWraps,                       // multi-dim wraps for output assembly
+            ppDepthAttr                         // pp_depth (same as src for consistency)
         );
 
         // 5. Create Collective Transfer

@@ -10,6 +10,7 @@
 #include "hw/hwresource.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -255,6 +256,15 @@ struct BlueprintPassState {
     // When multiple data tensors exist (e.g. input A, input B, output C),
     // each has its own backing memref.
     llvm::DenseMap<Value, Value> constantToMemref;
+    // Routing module attributes, cached before conversion (module attrs may be
+    // stripped during applyPartialConversion).
+    int64_t tileM = 0;
+    int64_t tileRows = 0;
+    int64_t tileN = 0;
+    int64_t tileCols = 0;
+    int64_t effectiveK = 0;
+    int64_t fullK = 0;
+    int64_t kRounds = 0;
 };
 
 static SmallVector<OpFoldResult> toOpFoldResult(ArrayRef<int64_t> values, OpBuilder &b) {
@@ -494,6 +504,76 @@ static Value resolveMemrefForView(Value viewValue, const BlueprintPassState &sta
     return Value();
 }
 
+// === Tiling Classification ===
+// Determines whether the M/N-dimension tiling requires host-side SCF loops.
+enum class TilingMode { Match, Multiple, Invalid };
+
+struct TilingClassification {
+    TilingMode mMode;
+    int64_t mRounds; // 1 for Match, tileRows/tileM for Multiple
+    TilingMode nMode;
+    int64_t nRounds; // 1 for Match, tileCols/tileN for Multiple
+};
+
+TilingClassification classifyTiling(ModuleOp moduleOp) {
+    TilingClassification result;
+    result.mMode = TilingMode::Match;
+    result.mRounds = 1;
+    result.nMode = TilingMode::Match;
+    result.nRounds = 1;
+
+    if (!moduleOp)
+        return result;
+
+    // M-dimension classification
+    auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+    auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+
+    int64_t m = tileMAttr ? tileMAttr.getInt() : 0;
+    int64_t rows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+
+    if (m == 0 || m == rows) {
+        result.mMode = TilingMode::Match;
+        result.mRounds = 1;
+    } else if (m < rows && rows % m == 0) {
+        result.mMode = TilingMode::Multiple;
+        result.mRounds = rows / m;
+    } else {
+        result.mMode = TilingMode::Invalid;
+        result.mRounds = 0;
+    }
+
+    // N-dimension classification
+    auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+    auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+
+    int64_t n = tileNAttr ? tileNAttr.getInt() : 0;
+    int64_t cols = tileColsAttr ? tileColsAttr.getInt() : 0;
+
+    if (n == 0 || n == cols) {
+        result.nMode = TilingMode::Match;
+        result.nRounds = 1;
+    } else if (n < cols && cols % n == 0) {
+        result.nMode = TilingMode::Multiple;
+        result.nRounds = cols / n;
+    } else {
+        result.nMode = TilingMode::Invalid;
+        result.nRounds = 0;
+    }
+
+    return result;
+}
+
+// Returns true if policy is "n_outer_m_inner" (N is outer loop, M is inner/iter)
+bool isNOuterPolicy(ModuleOp moduleOp) {
+    if (!moduleOp)
+        return false;
+    auto attr = moduleOp->getAttrOfType<StringAttr>("routing.iter_policy");
+    if (attr && attr.getValue() == "n_outer_m_inner")
+        return true;
+    return false; // default: m_outer_n_inner
+}
+
 // Pattern to convert dfscheblueprint::FlowTransferOp to dfschedule operations
 // Logic:
 // 1. Find shim tile from the "from" and "to" FlowConfigOps by checking type="shim"
@@ -696,6 +776,56 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         // No separate alloc needed — partition subview is the correct size.
         int64_t perTileShimLen = shimBdLen;
 
+        // K-round iteration: when iter_wrap > 1, BD len must be the per-iteration
+        // transfer size, NOT the full partition size. The DMA repeats the BD
+        // iter_wrap times via channel repeat count, advancing the base address
+        // by iter_step_size between iterations.
+        // Ref: xaie_dmabd_iter.c — XAie_DmaSetAddrLen uses per-iteration len.
+        //
+        // When tile_m < tileRows (M sub-tiling), the per-iteration transfer is
+        // tile_m * effectiveK (one sub-tile), NOT shimBdLen / kRounds.
+        // When tile_m == tileRows, the per-iteration transfer is
+        // shimBdLen / kRounds (one K-chunk across all rows).
+        {
+            auto moduleOp = op->getParentOfType<ModuleOp>();
+            if (moduleOp) {
+                auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
+                auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
+                auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+
+                if (kRoundsAttr && kRoundsAttr.getInt() > 1 && shimIsSender) {
+                    int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                    int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+
+                    if (dataId == 0) {
+                        // Input B (Col-distributed, dataId=0): use tile_n dimension
+                        auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                        auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                        int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                        int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                        if (tileN > 0 && tileN < tileCols) {
+                            int64_t effectiveK = effectiveKAttr ? effectiveKAttr.getInt() : 0;
+                            int64_t kRounds = kRoundsAttr.getInt();
+                            perTileShimLen = tileN * effectiveK * kRounds;
+                        } else {
+                            perTileShimLen = shimBdLen / kRoundsAttr.getInt();
+                        }
+                    } else if (tileM > 0 && tileM < tileRows) {
+                        // Input A (Row-distributed): len covers D0×D1×D2 total
+                        // = tile_m * effectiveK * kRounds
+                        // (iter handles mRounds separately)
+                        int64_t effectiveK = effectiveKAttr ? effectiveKAttr.getInt() : 0;
+                        int64_t kRounds = kRoundsAttr.getInt();
+                        perTileShimLen = tileM * effectiveK * kRounds;
+                    } else {
+                        // tile_m == partRows (or unset): len = shimBdLen / kRounds
+                        perTileShimLen = shimBdLen / kRoundsAttr.getInt();
+                    }
+                }
+            }
+        }
+
         // Single shim BD: sends/receives full data from DDR
         // Allocate BD ID from ResourceMgr to avoid conflicts when a SHIM tile
         // is used by both MM2S and S2MM (e.g. input + output on same SHIM).
@@ -730,6 +860,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         SmallVector<int32_t> shimPerTileBdIds;
 
         Value lastShimBdHandle; // The BD handle consumed by ConfigCreateIoOp
+        SmallVector<Value> shimBdHandles; // OOO per-tile BD handles (for loop erasure)
 
         // --- Compute per-round parameters for OOO iteration ---
         // These values are identical for all tiles in this flow.
@@ -744,7 +875,9 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         if (isManyToOne)
             ooPerCoreElements = ooFullPartitionElements / numCoreTiles;
 
-        int64_t ooPingPongSize = static_cast<int64_t>(ooPerCoreElements * bufferRatio);
+        // pp_depth controls physical ping-pong buffer count, NOT data splitting.
+        // OOO shim buffer size = full per-core data, clamped only by maxPingPongBytes.
+        int64_t ooPingPongSize = ooPerCoreElements;
         if (ooPingPongSize <= 0)
             ooPingPongSize = 1;
         if (maxPingPongBytes > 0 && ooElementSizeBytes > 0) {
@@ -761,6 +894,23 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         int64_t ooNumIterations = ooPerCoreElements / ooPingPongSize;
         int64_t perRoundBytes = ooPingPongSize * ooElementSizeBytes;
 
+        // Shim BD iteration settings for K-round stepping.
+        // Declared here (outside OOO/non-OOO branch) so they are visible
+        // in the Multiple-mode scf.for loop below.
+        int32_t shimIterStepSize = 0;
+        int32_t shimIterWrap = 0;
+
+        // OOO m_rounds loop variables — declared here so they are visible
+        // in the schedule emission section below.
+        bool usedMRounds3D = false;
+        int64_t oooMRounds = 1;
+        int64_t oooMSubTileStride = 0;
+        int32_t oooIterStepSize = 0;
+        int32_t oooIterWrap = 0;
+        int64_t perTileStrideFromDims = 0;
+        ArrayAttr perTileDimStrides = nullptr;
+        ArrayAttr perTileDimWraps = nullptr;
+
         if (useOOO && numCoreTiles > 1) {
             // --- OOO path: N per-tile shim BDs ---
             // Each shim BD receives data from one core tile at the correct DDR
@@ -776,7 +926,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             // D2.stride gives the byte distance between adjacent tile columns in DDR.
             // For per-tile BDs, each BD starts at tile_index * D2.stride.
             // The BD uses 2D addressing (D0, D1) within its tile column.
-            int64_t perTileStrideFromDims = perTileDdrBytes; // fallback: flat linear
+            perTileStrideFromDims = perTileDdrBytes; // fallback: flat linear
             if (shimDimStrides && shimDimStrides.size() >= 3) {
                 // D2 (outermost, tile-column) stride gives per-tile DDR offset
                 perTileStrideFromDims = cast<IntegerAttr>(shimDimStrides[2]).getInt();
@@ -799,23 +949,123 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             }
             int64_t rowsPerRound = (ooNumIterations > 1) ? perTileD1Rows / ooNumIterations : perTileD1Rows;
 
-            int32_t oooIterStepSize = (int32_t)(rowsPerRound * ddrRowStride);
-            int32_t oooIterWrap = (int32_t)ooNumIterations;
+            // When iter_wrap <= 1 (no repetition), set iter_step_size to 0
+            // since the step is meaningless with a single pass.
+            oooIterWrap = (int32_t)ooNumIterations;
+            oooIterStepSize = (oooIterWrap > 1) ? (int32_t)(rowsPerRound * ddrRowStride) : 0;
 
-            // Build per-tile addressing from shimDimStrides D0 and D1 only.
-            // D1 wrap is adjusted to rows_per_round (per-round scope, not full partition).
-            ArrayAttr perTileDimStrides = nullptr;
-            ArrayAttr perTileDimWraps = nullptr;
-            if (shimDimStrides && shimDimWraps && shimDimStrides.size() >= 2) {
-                SmallVector<Attribute> strides2d, wraps2d;
-                // D0: intra-tile-row addressing (unchanged)
-                strides2d.push_back(shimDimStrides[0]);
-                wraps2d.push_back(shimDimWraps[0]);
-                // D1: DDR-row addressing — use rows_per_round, NOT full partition rows
-                strides2d.push_back(shimDimStrides[1]);
-                wraps2d.push_back(rewriter.getI32IntegerAttr(rowsPerRound));
-                perTileDimStrides = rewriter.getArrayAttr(strides2d);
-                perTileDimWraps = rewriter.getArrayAttr(wraps2d);
+            // Build per-tile addressing from shimDimStrides.
+            // When tile_m < tileRows (M sub-tiling on output), use 3D strides
+            // with D2 encoding a diagonal shift for m_rounds iteration:
+            //   D0: stride=wordBytes, wrap=tileN_words (words per tile row)
+            //   D1: stride=outW_words*wordBytes, wrap=tileM (rows per sub-tile)
+            //   D2: stride=tileM*outW_words*wordBytes + tileN_words*wordBytes, wrap=mRounds
+            // D2 advances both tile_m rows AND tile_n columns in DDR per m_round.
+            // Otherwise, use 2D strides (D0, D1) with D1 wrap adjusted to rows_per_round.
+            {
+                int64_t tileM = passState->tileM;
+                int64_t tileRowsVal = passState->tileRows;
+
+                if (tileM > 0 && tileM < tileRowsVal && !shimIsSender) {
+                    // 2D addressing + iter for OOO output with m/n sub-tiling:
+                    //   D0: stride=wordBytes, wrap=tileN_sub_w (words per tile row)
+                    //   D1: stride=outW_w*wordBytes, wrap=tileM (rows per sub-tile)
+                    //
+                    // Policy determines which dimension uses iter vs scf.for:
+                    //   m_outer_n_inner (default): iter over nRounds, scf.for over mRounds
+                    //   n_outer_m_inner:           iter over mRounds, scf.for over nRounds
+                    int64_t mRounds = tileRowsVal / tileM;
+                    unsigned bitWidth = memrefType.getElementTypeBitWidth();
+                    int64_t elemsPerWord = 32 / bitWidth;
+                    constexpr int64_t wordBytes = 4;
+                    int64_t outW = memrefType.getDimSize(1); // full output row width (elements)
+                    int64_t tileN_full = outW / numCoreTiles; // per-tile column width (elements)
+                    int64_t outW_w = outW / elemsPerWord;
+
+                    // Compute nRounds from tile_n attribute
+                    int64_t tileNVal = passState->tileN;
+                    int64_t tileColsVal = passState->tileCols;
+                    int64_t nRounds = 1;
+                    int64_t tileN_sub = tileN_full; // default: full per-tile width
+                    if (tileNVal > 0 && tileNVal < tileColsVal) {
+                        nRounds = tileColsVal / tileNVal;
+                        tileN_sub = tileNVal; // use sub-tile width for iter stepping
+                    }
+                    int64_t tileN_sub_w = tileN_sub / elemsPerWord;
+
+                    // 2D strides only (D0 + D1)
+                    SmallVector<Attribute> strides2d, wraps2d;
+                    // D0: contiguous word step
+                    strides2d.push_back(rewriter.getI32IntegerAttr(1 * wordBytes));
+                    wraps2d.push_back(rewriter.getI32IntegerAttr(tileN_sub_w));
+                    // D1: DDR row stride, tile_m rows per sub-tile
+                    strides2d.push_back(rewriter.getI32IntegerAttr(outW_w * wordBytes));
+                    wraps2d.push_back(rewriter.getI32IntegerAttr(tileM));
+
+                    perTileDimStrides = rewriter.getArrayAttr(strides2d);
+                    perTileDimWraps = rewriter.getArrayAttr(wraps2d);
+                    usedMRounds3D = true;
+
+                    // Policy-aware iter/scf.for assignment for OOO output (C matrix)
+                    auto moduleOp = op->getParentOfType<ModuleOp>();
+                    bool nOuterPolicy = moduleOp ? isNOuterPolicy(moduleOp) : false;
+
+                    if (nOuterPolicy) {
+                        // n_outer_m_inner: scf.for over nRounds, iter over mRounds
+                        oooIterStepSize = static_cast<int32_t>(tileM * outW_w * wordBytes); // m-row advance via iter
+                        oooIterWrap = static_cast<int32_t>(mRounds);
+                        oooMRounds = nRounds;                        // outer loop = nRounds
+                        oooMSubTileStride = tileN_sub_w * wordBytes; // n-column advance per outer round
+                    } else {
+                        // m_outer_n_inner (default): scf.for over mRounds, iter over nRounds
+                        oooIterStepSize = static_cast<int32_t>(tileN_sub_w * wordBytes); // n-column advance via iter
+                        oooIterWrap = static_cast<int32_t>(nRounds);
+                        oooMRounds = mRounds;                           // outer loop = mRounds
+                        oooMSubTileStride = tileM * outW_w * wordBytes; // m-row advance per outer round
+                    }
+
+                    llvm::errs() << "[OOO ShimBD 2D+iter] tileM=" << tileM << " tileRows=" << tileRowsVal
+                                 << " mRounds=" << mRounds << " nRounds=" << nRounds << " tileN_sub=" << tileN_sub
+                                 << " policy=" << (nOuterPolicy ? "n_outer" : "m_outer") << " outW=" << outW << " D0=["
+                                 << (1 * wordBytes) << "," << tileN_sub_w << "]"
+                                 << " D1=[" << (outW_w * wordBytes) << "," << tileM << "]"
+                                 << " iter_step=" << oooIterStepSize << " iter_wrap=" << oooIterWrap
+                                 << " outerRounds=" << oooMRounds << " outerStride=" << oooMSubTileStride << "\n";
+                } else if (shimDimStrides && shimDimWraps && shimDimStrides.size() >= 2) {
+                    // 2D strides (original path)
+                    SmallVector<Attribute> strides2d, wraps2d;
+                    // D0: intra-tile-row addressing (unchanged)
+                    strides2d.push_back(shimDimStrides[0]);
+                    wraps2d.push_back(shimDimWraps[0]);
+                    // D1: DDR-row addressing — use rows_per_round, NOT full partition rows
+                    strides2d.push_back(shimDimStrides[1]);
+                    wraps2d.push_back(rewriter.getI32IntegerAttr(rowsPerRound));
+                    perTileDimStrides = rewriter.getArrayAttr(strides2d);
+                    perTileDimWraps = rewriter.getArrayAttr(wraps2d);
+                }
+            }
+
+            // When 2D strides + iter handle n_rounds, and scf.for handles m_rounds,
+            // each BD activation writes one d0×d1 block = tileM × tileN_sub bytes.
+            // BD len = tileM * tileN_sub * ooElementSizeBytes (per single OOO packet).
+            // iter_step/iter_wrap are already set above for n_rounds stepping.
+            if (usedMRounds3D) {
+                int64_t tileM = passState->tileM;
+                int64_t tileNVal_pr = passState->tileN;
+                int64_t tileColsVal_pr = passState->tileCols;
+                if (tileM > 0) {
+                    int64_t outW = memrefType.getDimSize(1);
+                    int64_t tileN_full = outW / numCoreTiles;
+                    int64_t tileN_sub = tileN_full;
+                    if (tileNVal_pr > 0 && tileNVal_pr < tileColsVal_pr) {
+                        tileN_sub = tileNVal_pr;
+                    }
+                    // One d0×d1 block per BD activation (single OOO packet)
+                    perRoundBytes = tileM * tileN_sub * ooElementSizeBytes;
+                    llvm::errs() << "[OOO ShimBD 2D+iter] perRoundBytes=" << perRoundBytes << " tileM=" << tileM
+                                 << " tileN_sub=" << tileN_sub << " oooIterStepSize=" << oooIterStepSize
+                                 << " oooIterWrap=" << oooIterWrap << " oooMRounds=" << oooMRounds << "\n";
+                }
             }
 
             // Allocate N shim BD IDs
@@ -837,7 +1087,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             // In OOO mode each BD is independently dispatched by the packet switch based on
             // packet_id matching. next_bd = -1 (disabled) — iteration handles re-execution
             // across ping-pong rounds; self-chaining would restart from the beginning.
-            SmallVector<Value> shimBdHandles(numCoreTiles);
+            shimBdHandles.resize(numCoreTiles);
             for (int64_t t = numCoreTiles - 1; t >= 0; t--) {
                 int32_t nextBdId = -1; // no chaining — iteration handles re-execution
                 int32_t thisBdId = shimBdIds[t];
@@ -857,12 +1107,14 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 // engine would try to strip a second header from the data payload,
                 // causing data corruption and stalls.  (Reference:
                 // xaie_conv2d_2core_dataflow_test.c — shim S2MM BD has no XAie_DmaSetPkt.)
+                auto ddrOffsetConst = rewriter.create<arith::ConstantOp>(
+                    loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(static_cast<int32_t>(ddrOffset)));
                 auto shimBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
                     loc, dfschedule::BdHandleType::get(rewriter.getContext()),
                     ddrBuffer,                                 // DDR buffer
                     shimTileOp.getTile(),                      // tile
                     shimBdIdC.getResult(),                     // bd_id
-                    rewriter.getI32IntegerAttr(ddrOffset),     // offset (per-tile DDR position using D2 stride)
+                    ddrOffsetConst.getResult(),                // offset (per-tile DDR position using D2 stride)
                     rewriter.getI32IntegerAttr(perRoundBytes), // len (per-round, matches src BD)
                     rewriter.getBoolAttr(false),               // enable_packet = false (OOO dispatch handles packets)
                     rewriter.getI32IntegerAttr(
@@ -890,12 +1142,139 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             lastShimBdHandle = shimBdHandles[0];
         } else {
             // --- Non-OOO path: single shim BD (original behavior) ---
+            // K-round iteration: when effectiveK < fullK, use iter_step_size and
+            // iter_wrap so the BD repeats, advancing the DDR read address.
+            //
+            // When tile_m == tileRows (no M sub-tiling):
+            //   iter_step = effectiveK bytes (next K-chunk column)
+            //   iter_wrap = kRounds
+            //
+            // When tile_m < tileRows (M sub-tiling):
+            //   D2 handles kRounds (K-chunk stepping), so iter handles mRounds:
+            //   iter_step = tile_m * fullK bytes (next m-sub-tile block in DDR)
+            //   iter_wrap = mRounds (= tileRows / tileM)
+            if (shimIsSender) {
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
+                    auto fullKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k");
+                    auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
+                    if (effectiveKAttr && fullKAttr && kRoundsAttr) {
+                        int64_t effectiveK = effectiveKAttr.getInt();
+                        int64_t fullK = fullKAttr.getInt();
+                        int64_t kRounds = kRoundsAttr.getInt();
+                        if (effectiveK > 0 && effectiveK < fullK && kRounds > 1) {
+                            // Compute element size from the memref type
+                            int64_t elemBytes = 1;
+                            if (memrefType.getElementType().isIntOrFloat())
+                                elemBytes = memrefType.getElementTypeBitWidth() / 8;
+                            if (elemBytes == 0)
+                                elemBytes = 1;
+
+                            bool nOuterPolicy = isNOuterPolicy(moduleOp);
+
+                            if (dataId == 0) {
+                                // Input B (Col-distributed, dataId=0)
+                                auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                                auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                                int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                                int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+
+                                if (tileN > 0 && tileN < tileCols) {
+                                    if (nOuterPolicy) {
+                                        // n_outer: B repeats same data; scf.for handles n-sub-tile advancement
+                                        int64_t mRoundsIter = 1;
+                                        auto tileMAttrB = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                                        auto tileRowsAttrB = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                                        if (tileMAttrB && tileRowsAttrB) {
+                                            int64_t tM = tileMAttrB.getInt();
+                                            int64_t tR = tileRowsAttrB.getInt();
+                                            if (tM > 0 && tM < tR)
+                                                mRoundsIter = tR / tM;
+                                        }
+                                        shimIterStepSize = 0;
+                                        shimIterWrap = 0; // step=0 → disable iteration entirely
+                                        llvm::errs() << "[BlueprintToSchedule] Input B iter (n_outer, mRounds repeat): "
+                                                     << "iter_step_size=" << shimIterStepSize
+                                                     << " iter_wrap=" << shimIterWrap << " tileN=" << tileN
+                                                     << " tileCols=" << tileCols << " mRounds=" << mRoundsIter << "\n";
+                                    } else {
+                                        // m_outer (default): B advances through n-sub-tiles via iter
+                                        int64_t nRounds = tileCols / tileN;
+                                        shimIterStepSize = static_cast<int32_t>(tileN * fullK * elemBytes);
+                                        shimIterWrap = static_cast<int32_t>(nRounds);
+                                        llvm::errs() << "[BlueprintToSchedule] Input B iter (m_outer, nRounds): "
+                                                     << "iter_step_size=" << shimIterStepSize
+                                                     << " iter_wrap=" << shimIterWrap << " tileN=" << tileN
+                                                     << " tileCols=" << tileCols << " nRounds=" << nRounds << "\n";
+                                    }
+                                } else {
+                                    // No N sub-tiling: fall through to kRounds
+                                    shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
+                                    shimIterWrap = static_cast<int32_t>(kRounds);
+                                    llvm::errs() << "[BlueprintToSchedule] Input B iter (no N sub-tiling, kRounds): "
+                                                 << "iter_step_size=" << shimIterStepSize
+                                                 << " iter_wrap=" << shimIterWrap << "\n";
+                                }
+                            } else {
+                                // Input A (Row-distributed)
+                                int64_t tileM = 0, tileRows = 0;
+                                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
+                                    tileM = a.getInt();
+                                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows"))
+                                    tileRows = a.getInt();
+
+                                if (tileM > 0 && tileM < tileRows) {
+                                    if (nOuterPolicy) {
+                                        // n_outer: A advances through m-sub-tiles via iter
+                                        int64_t mRoundsA = tileRows / tileM;
+                                        shimIterStepSize = static_cast<int32_t>(tileM * fullK * elemBytes);
+                                        shimIterWrap = static_cast<int32_t>(mRoundsA);
+                                        llvm::errs()
+                                            << "[BlueprintToSchedule] Input A iter (n_outer, mRounds advance): "
+                                            << "iter_step_size=" << shimIterStepSize << " iter_wrap=" << shimIterWrap
+                                            << " tileM=" << tileM << " tileRows=" << tileRows << " mRounds=" << mRoundsA
+                                            << "\n";
+                                    } else {
+                                        // m_outer (default): A repeats same data; scf.for handles m advancement
+                                        int64_t nRounds2 = 1;
+                                        auto tileNAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                                        auto tileColsAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                                        if (tileNAttr2 && tileColsAttr2) {
+                                            int64_t tN = tileNAttr2.getInt();
+                                            int64_t tC = tileColsAttr2.getInt();
+                                            if (tN > 0 && tN < tC)
+                                                nRounds2 = tC / tN;
+                                        }
+                                        shimIterStepSize = 0; // no advance — repeat same A data
+                                        shimIterWrap = 0;     // step=0 → disable iteration entirely
+                                        llvm::errs() << "[BlueprintToSchedule] Input A iter (m_outer, nRounds repeat): "
+                                                     << "iter_step_size=" << shimIterStepSize
+                                                     << " iter_wrap=" << shimIterWrap << " tileM=" << tileM
+                                                     << " tileRows=" << tileRows << " nRounds=" << nRounds2 << "\n";
+                                    }
+                                } else {
+                                    // D1 covers all rows; iter handles kRounds
+                                    shimIterStepSize = static_cast<int32_t>(effectiveK * elemBytes);
+                                    shimIterWrap = static_cast<int32_t>(kRounds);
+                                    llvm::errs() << "[BlueprintToSchedule] Input A iter (2D, kRounds): "
+                                                 << "iter_step_size=" << shimIterStepSize
+                                                 << " iter_wrap=" << shimIterWrap << "\n";
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            auto shimOffsetConst =
+                rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
             auto shimBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
                 loc, dfschedule::BdHandleType::get(rewriter.getContext()),
                 ddrBuffer,                                  // DDR receive buffer
                 shimTileOp.getTile(),                       // tile
                 shimBdIdConst.getResult(),                  // bd_id
-                rewriter.getI32IntegerAttr(0),              // offset
+                shimOffsetConst.getResult(),                // offset
                 rewriter.getI32IntegerAttr(perTileShimLen), // len (per-tile portion)
                 rewriter.getBoolAttr(false),                // enable_packet = false
                 rewriter.getI32IntegerAttr(0),              // packet_id (unused)
@@ -908,7 +1287,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 Value(),                                    // linked_bd = none
                 rewriter.getI32IntegerAttr(-1),             // out_of_order_bd_id
                 /*dim_strides=*/shimDimStrides, /*dim_wraps=*/shimDimWraps,
-                rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                rewriter.getI32IntegerAttr(shimIterStepSize), // iter_step_size (K-round advance)
+                rewriter.getI32IntegerAttr(shimIterWrap));    // iter_wrap (kRounds repetitions)
 
             lastShimBdHandle = shimBdOp.getBdHandle();
             // For single-BD path with OOO (single tile many_to_one), still record
@@ -981,6 +1361,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             Value ioHandle;
             Value bdId;
             uint32_t flowIdx;
+            int32_t repeatCount;
         };
         SmallVector<DeferredCoreStartIo> deferredCoreStartIos;
         int tileIndex = 0;
@@ -1025,7 +1406,68 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             int64_t perCoreElements = fullPartitionElements;
             if (transferType == "many_to_one")
                 perCoreElements = fullPartitionElements / numCoreTiles;
-            int64_t pingPongBufferSize = static_cast<int64_t>(perCoreElements * bufferRatio);
+            // K-round adjustment: for input flows with kRounds > 1, the kernel
+            // operates on per-k-round data (tile_rows * effectiveK), not the
+            // full partition (tile_rows * fullK). We must divide perCoreElements
+            // by kRounds so that pingPongBufferSize matches the kernel's
+            // buf_sz_a/b (= rowsPerRound * effectiveK). The numIterations
+            // multiplication by kRounds (below) then correctly recovers the
+            // total number of DMA rounds across all k-rounds.
+            int64_t perCorePerKRound = perCoreElements;
+            if (isInput) {
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
+                        int64_t kRounds = kRoundsAttr.getInt();
+                        if (kRounds > 1) {
+                            perCorePerKRound = perCoreElements / kRounds;
+                            // When tile_m < tileRows, each k-round only needs
+                            // tile_m rows (not partRows). Divide by mRounds
+                            // so pingPongBufferSize = tile_m * effectiveK.
+                            auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                            auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                            int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                            int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                            if (tileM > 0 && tileM < tileRows) {
+                                int64_t mRounds = tileRows / tileM;
+                                perCorePerKRound = perCorePerKRound / mRounds;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Output: the kernel produces one sub-tile (tile_m × tile_n_sub)
+                // per release_output_window call. Divide perCoreElements by
+                // mRounds * nRounds so BD len matches one kernel output window.
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                    auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                    auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                    auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                    int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                    int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                    int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                    int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                    int64_t mRounds = (tileM > 0 && tileM < tileRows) ? (tileRows / tileM) : 1;
+                    int64_t nRounds = (tileN > 0 && tileN < tileCols) ? (tileCols / tileN) : 1;
+                    if (mRounds * nRounds > 1) {
+                        perCorePerKRound = perCoreElements / (mRounds * nRounds);
+                    }
+                }
+            }
+
+            // Read pp_depth from FlowConfigOp attribute (set by dmaphop→blueprint pass).
+            // pp_depth controls physical ping-pong buffer count (for DMA/compute
+            // overlap), NOT data splitting.  Buffer size = full per-k-round data,
+            // clamped only by maxPingPongBytes when the data exceeds tile memory.
+            int ppDepth = static_cast<int>(1.0 / bufferRatio + 0.5); // e.g. bufferRatio=0.5 → ppDepth=2
+            if (coreFlowConfig.getPpDepth())
+                ppDepth = static_cast<int>(*coreFlowConfig.getPpDepth());
+            if (ppDepth <= 0)
+                ppDepth = 2;
+
+            int64_t pingPongBufferSize = perCorePerKRound;
             if (pingPongBufferSize <= 0)
                 pingPongBufferSize = 1;
             // Clamp to maxPingPongBytes to prevent exceeding core tile memory
@@ -1034,9 +1476,44 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 if (maxElements > 0 && pingPongBufferSize > maxElements)
                     pingPongBufferSize = maxElements;
             }
-            // numIterations uses perCoreElements because each core only
-            // processes its own share of data.
-            int64_t numIterations = (perCoreElements + pingPongBufferSize - 1) / pingPongBufferSize;
+            // numIterations: use perCorePerKRound (per-k-round data) so that
+            // base iterations count one k-round. The kRounds multiplier below
+            // then scales to the total across all k-rounds.
+            int64_t numIterations = (perCorePerKRound + pingPongBufferSize - 1) / pingPongBufferSize;
+
+            // Validate: pp_depth=1 requires numIterations==1.
+            // With single-buffer mode (no BD chaining, no next_bd cycling),
+            // the DMA fires exactly once. If the kernel needs multiple
+            // rounds (numIterations > 1), the DMA cannot re-arm and the
+            // kernel will deadlock on the second acquire_window call.
+            if (ppDepth == 1 && numIterations > 1) {
+                op.emitError("pp_depth=1 (single buffer) incompatible with "
+                             "numIterations=")
+                    << numIterations << " (buffer_size=" << pingPongBufferSize
+                    << " < perCorePerKRound=" << perCorePerKRound
+                    << "). Single-buffer DMA cannot re-arm for multiple rounds. "
+                       "Set pp_depth>=2 to enable ping-pong BD chaining, or "
+                       "increase max_buffer_bytes to fit the full per-k-round data.";
+                return failure();
+            }
+
+            // K-round multiplication: when effectiveK < K, the kernel runs
+            // kRounds iterations, each consuming numIterations DMA rounds.
+            // The host must send numIterations * kRounds total BD iterations
+            // for input flows to match the kernel's acquire/release pattern.
+            if (isInput) {
+                auto moduleOp = op->getParentOfType<ModuleOp>();
+                if (moduleOp) {
+                    if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
+                        int64_t kRounds = kRoundsAttr.getInt();
+                        if (kRounds > 1) {
+                            llvm::errs() << "[BlueprintToSchedule] K-round: input numIterations " << numIterations
+                                         << " * kRounds " << kRounds << " = " << numIterations * kRounds << "\n";
+                            numIterations *= kRounds;
+                        }
+                    }
+                }
+            }
 
             // Compute lock IDs from dirIdx to match the kernel's window ordering.
             // The kernel allocates locks sequentially per sorted window:
@@ -1057,13 +1534,17 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             }
 
             // Build config dictionary for this tile
+            // buffer_mode: 0 = single buffer (pp_depth=1), 1 = ping-pong (pp_depth>=2)
+            int bufferMode = (ppDepth == 1) ? 0 : 1;
+            int numBuffers = (ppDepth == 1) ? 1 : 2;
+
             NamedAttrList configAttrs;
             configAttrs.append("tile_index", rewriter.getI32IntegerAttr(tileIndex));
             configAttrs.append("flow_index", rewriter.getI32IntegerAttr(flowIndex));
             configAttrs.append("packet_id", rewriter.getI32IntegerAttr(basePacketId + tileIndex));
             configAttrs.append("dma_channel", rewriter.getI32IntegerAttr(coreChannel));
-            configAttrs.append("buffer_mode", rewriter.getI32IntegerAttr(1)); // 1 = ping-pong
-            configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(2));
+            configAttrs.append("buffer_mode", rewriter.getI32IntegerAttr(bufferMode));
+            configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(numBuffers));
             configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(pingPongBufferSize));
             configAttrs.append("num_iterations", rewriter.getI32IntegerAttr(numIterations));
             configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(bufferOffset));
@@ -1158,12 +1639,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 pongName = "buf_out_pong_" + std::to_string(dirIdx);
                             }
                             // Ensure buffer size is int32-aligned for DMA.
-                            // Use fullPartitionElements * bufferRatio (before numCoreTiles division)
-                            // because the kernel uses a single global BUF_SZ for ALL windows,
-                            // determined by the largest flow (input one_to_many).  Output buffers
-                            // (many_to_one) need the same allocation size even though they transfer
-                            // fewer elements per core.
-                            int64_t kernelBufElements = static_cast<int64_t>(fullPartitionElements * bufferRatio);
+                            // Use perCorePerKRound (per-k-round data for one core) as the
+                            // allocation size.  The kernel uses a single global BUF_SZ for
+                            // ALL windows, determined by the largest flow (input one_to_many).
+                            // Output buffers (many_to_one) need the same allocation size
+                            // even though they transfer fewer elements per core.
+                            int64_t kernelBufElements = perCorePerKRound;
                             // Clamp kernelBufElements to maxPingPongBytes (same as pingPongBufferSize clamping)
                             if (maxPingPongBytes > 0 && elementSizeBytes > 0) {
                                 int64_t maxElements = maxPingPongBytes / elementSizeBytes;
@@ -1176,13 +1657,22 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             try {
                                 auto &allocator = ResourceMgr::instance()->coreMemAllocator();
                                 auto pingAddr = allocator.allocate(pingName, bufSizeBytes, /*alignment=*/32);
-                                auto pongAddr = allocator.allocate(pongName, bufSizeBytes, /*alignment=*/32);
-                                if (pingAddr && pongAddr) {
-                                    // Convert core processor view (0x78000+) to DMA view (0x08000+)
-                                    // Core DMA engine sees memory starting at 0x00000, not 0x70000
-                                    flowPingL1Offset = static_cast<int64_t>(*pingAddr) - 0x70000;
-                                    flowPongL1Offset = static_cast<int64_t>(*pongAddr) - 0x70000;
-                                    flowAddrsValid = true;
+                                if (ppDepth == 1) {
+                                    // Single buffer mode: only allocate ping buffer, no pong
+                                    if (pingAddr) {
+                                        flowPingL1Offset = static_cast<int64_t>(*pingAddr) - 0x70000;
+                                        flowPongL1Offset = flowPingL1Offset; // unused but set for safety
+                                        flowAddrsValid = true;
+                                    }
+                                } else {
+                                    auto pongAddr = allocator.allocate(pongName, bufSizeBytes, /*alignment=*/32);
+                                    if (pingAddr && pongAddr) {
+                                        // Convert core processor view (0x78000+) to DMA view (0x08000+)
+                                        // Core DMA engine sees memory starting at 0x00000, not 0x70000
+                                        flowPingL1Offset = static_cast<int64_t>(*pingAddr) - 0x70000;
+                                        flowPongL1Offset = static_cast<int64_t>(*pongAddr) - 0x70000;
+                                        flowAddrsValid = true;
+                                    }
                                 }
                             } catch (...) {
                                 // ResourceMgr singleton not initialized; fall back to relative offsets
@@ -1192,30 +1682,6 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             pingL1Offset = flowPingL1Offset;
                             pongL1Offset = flowPongL1Offset;
                         }
-                        auto pingL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
-                            loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
-                            rewriter.getI64IntegerAttr(pingL1Offset));
-                        auto pongL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
-                            loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
-                            rewriter.getI64IntegerAttr(pongL1Offset));
-
-                        // Allocate BD IDs from ResourceMgr per-tile pool
-                        int32_t pingBdId = -1, pongBdId = -1;
-                        if (resourceMgr) {
-                            auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
-                            auto bd1 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
-                            if (bd0 && bd1) {
-                                pingBdId = *bd0;
-                                pongBdId = *bd1;
-                            }
-                        }
-                        if (pingBdId < 0 || pongBdId < 0) {
-                            llvm::errs() << "WARNING: BD allocation failed for tile (" << col << "," << row
-                                         << "), falling back to 0/1\n";
-                            pingBdId = 0;
-                            pongBdId = 1;
-                        }
-
                         // Core BD len in bytes: runtime passes len directly to
                         // XAie_DmaSetAddrLen, so compute the total byte count here.
                         int64_t coreBdLen = pingPongBufferSize * elementSizeBytes;
@@ -1244,51 +1710,128 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                                 coreOooBdId = shimPerTileBdIds[idx];
                         }
 
-                        // Pong BD first (no linked_bd): next_bd -> ping
-                        auto pongBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
-                                                                                rewriter.getI32IntegerAttr(pongBdId));
-                        auto pongBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-                            loc, dfschedule::BdHandleType::get(rewriter.getContext()), pongL1.getBuffer(),
-                            coreTileOp.getTile(), pongBdIdConst.getResult(),
-                            rewriter.getI32IntegerAttr(0),               // offset
-                            rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
-                            rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
-                            rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
-                            rewriter.getI32IntegerAttr(pingBdId),        // next_bd -> ping
-                            rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
-                            rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
-                            rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
-                            rewriter.getI32IntegerAttr(1),               // release_lock_val
-                            rewriter.getI32IntegerAttr(-1),              // data_id
-                            Value(),                                     // linked_bd = none
-                            rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
-                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
-                            rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                        Value firstCoreBdHandle; // The BD handle consumed by ConfigCreateIoOp
 
-                        // Ping BD second (linked_bd = pong handle): next_bd -> pong
-                        auto pingBdIdConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
-                                                                                rewriter.getI32IntegerAttr(pingBdId));
-                        auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
-                            loc, dfschedule::BdHandleType::get(rewriter.getContext()), pingL1.getBuffer(),
-                            coreTileOp.getTile(), pingBdIdConst.getResult(),
-                            rewriter.getI32IntegerAttr(0),               // offset
-                            rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
-                            rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
-                            rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
-                            rewriter.getI32IntegerAttr(pongBdId),        // next_bd -> pong
-                            rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
-                            rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
-                            rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
-                            rewriter.getI32IntegerAttr(1),               // release_lock_val
-                            rewriter.getI32IntegerAttr(-1),              // data_id
-                            pongBdOp.getBdHandle(),                      // linked_bd = pong BD
-                            rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
-                            /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
-                            rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                        if (ppDepth == 1) {
+                            // === Single buffer mode (pp_depth=1) ===
+                            // One buffer, one BD, no next_bd chaining, no pong.
+                            auto singleL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
+                                loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
+                                rewriter.getI64IntegerAttr(pingL1Offset));
+
+                            int32_t singleBdId = -1;
+                            if (resourceMgr) {
+                                auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                                if (bd0)
+                                    singleBdId = *bd0;
+                            }
+                            if (singleBdId < 0)
+                                singleBdId = 0;
+
+                            auto singleBdIdConst = rewriter.create<arith::ConstantOp>(
+                                loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(singleBdId));
+                            auto singleOffsetConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                                        rewriter.getI32IntegerAttr(0));
+                            auto singleBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                                loc, dfschedule::BdHandleType::get(rewriter.getContext()), singleL1.getBuffer(),
+                                coreTileOp.getTile(), singleBdIdConst.getResult(),
+                                singleOffsetConst.getResult(),               // offset
+                                rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
+                                rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
+                                rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
+                                rewriter.getI32IntegerAttr(-1),              // next_bd = -1 (no chaining)
+                                rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
+                                rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
+                                rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
+                                rewriter.getI32IntegerAttr(1),               // release_lock_val
+                                rewriter.getI32IntegerAttr(-1),              // data_id
+                                Value(),                                     // linked_bd = none
+                                rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
+                                /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                                rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
+                                rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
+
+                            firstCoreBdHandle = singleBdOp.getBdHandle();
+                        } else {
+                            // === Ping-pong mode (pp_depth>=2, existing behavior) ===
+                            auto pingL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
+                                loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
+                                rewriter.getI64IntegerAttr(pingL1Offset));
+                            auto pongL1 = rewriter.create<dfschedule::BindCoreBufferOp>(
+                                loc, shapedPerTileType, perTileToken, coreTileOp.getTile(),
+                                rewriter.getI64IntegerAttr(pongL1Offset));
+
+                            // Allocate BD IDs from ResourceMgr per-tile pool
+                            int32_t pingBdId = -1, pongBdId = -1;
+                            if (resourceMgr) {
+                                auto bd0 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                                auto bd1 = resourceMgr->allocateTileBd(row, col, /*ownerId=*/flowIndex);
+                                if (bd0 && bd1) {
+                                    pingBdId = *bd0;
+                                    pongBdId = *bd1;
+                                }
+                            }
+                            if (pingBdId < 0 || pongBdId < 0) {
+                                llvm::errs() << "WARNING: BD allocation failed for tile (" << col << "," << row
+                                             << "), falling back to 0/1\n";
+                                pingBdId = 0;
+                                pongBdId = 1;
+                            }
+
+                            // Pong BD first (no linked_bd): next_bd -> ping
+                            auto pongBdIdConst = rewriter.create<arith::ConstantOp>(
+                                loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pongBdId));
+                            auto pongOffsetConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                                      rewriter.getI32IntegerAttr(0));
+                            auto pongBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                                loc, dfschedule::BdHandleType::get(rewriter.getContext()), pongL1.getBuffer(),
+                                coreTileOp.getTile(), pongBdIdConst.getResult(),
+                                pongOffsetConst.getResult(),                 // offset
+                                rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
+                                rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
+                                rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
+                                rewriter.getI32IntegerAttr(pingBdId),        // next_bd -> ping
+                                rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
+                                rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
+                                rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
+                                rewriter.getI32IntegerAttr(1),               // release_lock_val
+                                rewriter.getI32IntegerAttr(-1),              // data_id
+                                Value(),                                     // linked_bd = none
+                                rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
+                                /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                                rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
+                                rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
+
+                            // Ping BD second (linked_bd = pong handle): next_bd -> pong
+                            auto pingBdIdConst = rewriter.create<arith::ConstantOp>(
+                                loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pingBdId));
+                            auto pingOffsetConst = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(),
+                                                                                      rewriter.getI32IntegerAttr(0));
+                            auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                                loc, dfschedule::BdHandleType::get(rewriter.getContext()), pingL1.getBuffer(),
+                                coreTileOp.getTile(), pingBdIdConst.getResult(),
+                                pingOffsetConst.getResult(),                 // offset
+                                rewriter.getI32IntegerAttr(coreBdLen),       // len (bytes)
+                                rewriter.getBoolAttr(coreBdEnablePacket),    // enable_packet
+                                rewriter.getI32IntegerAttr(coreBdPacketId),  // packet_id
+                                rewriter.getI32IntegerAttr(pongBdId),        // next_bd -> pong
+                                rewriter.getI32IntegerAttr(bdAcquireLockId), // acquire_lock_id
+                                rewriter.getI32IntegerAttr(-1),              // acquire_lock_val
+                                rewriter.getI32IntegerAttr(bdReleaseLockId), // release_lock_id
+                                rewriter.getI32IntegerAttr(1),               // release_lock_val
+                                rewriter.getI32IntegerAttr(-1),              // data_id
+                                pongBdOp.getBdHandle(),                      // linked_bd = pong BD
+                                rewriter.getI32IntegerAttr(coreOooBdId),     // out_of_order_bd_id
+                                /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
+                                rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
+                                rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
+
+                            firstCoreBdHandle = pingBdOp.getBdHandle();
+                        }
 
                         // Create IO handle for core tile
                         auto coreCreateIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
-                            loc, dfschedule::IoHandleType::get(rewriter.getContext()), pingBdOp.getBdHandle(),
+                            loc, dfschedule::IoHandleType::get(rewriter.getContext()), firstCoreBdHandle,
                             coreTileOp.getTile(), rewriter.getI32IntegerAttr(coreChannel),
                             rewriter.getStringAttr(coreDmaDirection), rewriter.getStringAttr(coreIoOperation),
                             rewriter.getBoolAttr(false)); // enable_out_of_order=false for core tiles
@@ -1296,7 +1839,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                             rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());
                         // Defer core StartIoOp until after ELF is loaded (LoadKernelGroup)
                         // to prevent BSS initialization from overwriting DMA data.
-                        deferredCoreStartIos.push_back({coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), flowIndex});
+                        // Core tiles use ping-pong BD chaining (next_bd links ping↔pong),
+                        // so the DMA hardware automatically re-arms via the chain.
+                        // repeat=1 is sufficient; the BD chain does the work.
+                        int32_t coreRepeat = 1;
+                        deferredCoreStartIos.push_back(
+                            {coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), flowIndex, coreRepeat});
                     } // end if (passState && ...)
                 }
             }
@@ -1340,49 +1888,436 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
             computeKernelAttrs.push_back(SymbolRefAttr::get(rewriter.getContext(), "compute0"));
             }
 
+            // === Schedule emission: classify tiling mode ===
+            auto moduleOp = op->getParentOfType<ModuleOp>();
+            auto classification = classifyTiling(moduleOp);
+
             // Create dfschedule.schedule.getbdid for shim tile
-            // Shim start_io is emitted BEFORE load_kernel_group so that shim DMA
-            // channels are armed first.  Core start_io remains after kernel launch
-            // to avoid BSS-zeroing races.
             auto getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
 
-            // Create dfschedule.schedule.start_io for shim
-            // For OOO, repeat = numCoreTiles * numPingPong (total source transactions)
-            int32_t repeatCount = useOOO ? (int32_t)(numCoreTiles * 2) : 1;
-            auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
-                loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(), getBdIdOp.getBdId(),
-                rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(repeatCount));
+            bool nOuterPolicy = isNOuterPolicy(moduleOp);
+            bool needsOuterLoop = false;
+            if (nOuterPolicy) {
+                needsOuterLoop = (classification.nMode == TilingMode::Multiple);
+            } else {
+                needsOuterLoop = (classification.mMode == TilingMode::Multiple);
+            }
 
-            // Create dfschedule.config.load_kernel_group with distributed_args pointing to kernel configs
-            auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
-                loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
-                rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs),
-                nullptr,                                     // kernel_config = nullptr (not used)
-                rewriter.getArrayAttr(kernelConfigSymbols)); // distributed_args = [@kernelconfig0, @kernelconfig1, ...]
+            if (needsOuterLoop && shimIsSender) {
+                // === Multiple mode, input flow: unified scf.for ===
+                // Kernel load/launch and core DMAs armed ONCE outside the loop.
+                // A single scf.for handles ALL iterations uniformly (no special-casing
+                // of iteration 0). Each iteration: config BD → create IO → start IO → wait.
+                int64_t outerRounds = nOuterPolicy ? classification.nRounds : classification.mRounds;
+                llvm::errs() << "[BlueprintToSchedule] Multiple mode input flow (policy="
+                             << (nOuterPolicy ? "n_outer" : "m_outer") << "): "
+                             << "outerRounds=" << outerRounds << ", emitting unified SCF loop from 0\n";
 
-            // Create dfschedule.schedule.launch_kernel_group
-            auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
-                loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
+                // Erase the initial createIoOp and shimBdOp created above —
+                // they are unused in Multiple mode because the loop body
+                // creates its own BD and create_io each iteration.
+                // In Multiple mode, lastShimBdHandle is only consumed by
+                // createIoOp, so both can be erased unconditionally.
+                {
+                    Operation *shimBdDefOp = lastShimBdHandle ? lastShimBdHandle.getDefiningOp() : nullptr;
+                    rewriter.eraseOp(createIoOp);
+                    if (shimBdDefOp)
+                        rewriter.eraseOp(shimBdDefOp);
+                }
 
-            // Emit deferred core StartIoOp calls AFTER kernel load/launch.
-            // This ensures the ELF BSS initialization (which zeroes buf_in_ping/pong)
-            // completes before core S2MM DMAs start writing data into those buffers.
-            SmallVector<Value> coreStartIoEvents;
-            for (auto &deferred : deferredCoreStartIos) {
-                auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
-                    loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
-                    rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(1));
-                coreStartIoEvents.push_back(coreStartIo.getEvent());
-        }
+                // Compute per-iteration repeat: must match iter_wrap
+                // The repeat count equals the number of inner-loop rounds:
+                // m_outer: inner = nRounds (iter handles n-sub-tile stepping)
+                // n_outer: inner = mRounds (iter handles m-sub-tile stepping)
+                int32_t perIterRepeat = 1;
+                if (moduleOp) {
+                    auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
+                    if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
+                        if (nOuterPolicy) {
+                            // n_outer: inner loop = mRounds for both A and B
+                            auto tileMAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                            auto tileRowsAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                            int64_t tM = tileMAttrR ? tileMAttrR.getInt() : 0;
+                            int64_t tR = tileRowsAttrR ? tileRowsAttrR.getInt() : 0;
+                            if (tM > 0 && tM < tR) {
+                                perIterRepeat = static_cast<int32_t>(tR / tM); // mRounds
+                            } else {
+                                perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt()); // fallback
+                            }
+                        } else {
+                            // m_outer: inner loop = nRounds for both A and B
+                            auto tileNAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                            auto tileColsAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                            int64_t tN = tileNAttrR ? tileNAttrR.getInt() : 0;
+                            int64_t tC = tileColsAttrR ? tileColsAttrR.getInt() : 0;
+                            if (tN > 0 && tN < tC) {
+                                perIterRepeat = static_cast<int32_t>(tC / tN); // nRounds
+                            } else {
+                                perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt()); // fallback
+                            }
+                        }
+                    }
+                }
 
-        // Create dfschedule.schedule.wait with kernel launch + shim IO events only.
-        // Core tile IO events are excluded: core DMAs use infinite ping-pong BD
-        // chaining (next_bd cycles BD0→BD1→BD0→...), so wait_io would never
-        // return. The kernel launch event already ensures cores have completed.
-        SmallVector<Value> events;
-        events.push_back(launchKernelGroupOp.getEvent());
-        events.push_back(startIoOp.getEvent());
-        rewriter.create<dfschedule::ScheduleWaitOp>(loc, events);
+                // Compute the byte stride for offset computation (policy+dataId dependent)
+                // m_outer + A(dataId=1): stride = tileM * fullK * elemBytes (A advances via scf.for)
+                // m_outer + B(dataId=0): stride = 0 (B uses iter, not scf.for)
+                // n_outer + B(dataId=0): stride = tileN * fullK * elemBytes (B advances via scf.for)
+                // n_outer + A(dataId=1): stride = 0 (A uses iter, not scf.for)
+                int64_t elemBytes = 1;
+                if (memrefType.getElementType().isIntOrFloat())
+                    elemBytes = memrefType.getElementTypeBitWidth() / 8;
+                if (elemBytes == 0)
+                    elemBytes = 1;
+                int64_t tileMVal = 0, tileNVal = 0, fullKVal = 0;
+                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
+                    tileMVal = a.getInt();
+                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n"))
+                    tileNVal = a.getInt();
+                if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k"))
+                    fullKVal = a.getInt();
+                int64_t subTileStride = 0; // default: no offset advancement
+                if (!nOuterPolicy && dataId == 1) {
+                    // m_outer, Input A: advance m-sub-tiles
+                    subTileStride = tileMVal * fullKVal * elemBytes;
+                } else if (nOuterPolicy && dataId == 0) {
+                    // n_outer, Input B: advance n-sub-tiles
+                    subTileStride = tileNVal * fullKVal * elemBytes;
+                }
+
+                // 1. load_kernel_group OUTSIDE the loop
+                auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
+                    loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
+                    rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs), nullptr,
+                    rewriter.getArrayAttr(kernelConfigSymbols));
+
+                // 2. launch_kernel_group OUTSIDE the loop (kernel runs continuously,
+                //    stalls at first DMA read until data arrives)
+                auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
+
+                // 3. Core start_io OUTSIDE the loop (core DMAs armed once with total repeat)
+                SmallVector<Value> coreStartIoEvents;
+                for (auto &deferred : deferredCoreStartIos) {
+                    auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
+                        rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(deferred.repeatCount));
+                    coreStartIoEvents.push_back(coreStartIo.getEvent());
+                }
+
+                // 4. Single scf.for from 0 to outerRounds (ALL iterations uniform)
+                {
+                    auto lb = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+                    auto ub = rewriter.create<arith::ConstantIndexOp>(loc, outerRounds);
+                    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+                    auto forOp = rewriter.create<scf::ForOp>(loc, lb, ub, step);
+                    rewriter.setInsertionPointToStart(forOp.getBody());
+                    Value iv = forOp.getInductionVar(); // index type
+
+                    // Cast index → i32 for arithmetic
+                    auto ivI32 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), iv);
+
+                    // Compute offset = iv * subTileStride
+                    auto strideConst = rewriter.create<arith::ConstantIntOp>(loc, static_cast<int32_t>(subTileStride),
+                                                                             rewriter.getI32Type());
+                    auto offset = rewriter.create<arith::MulIOp>(loc, ivI32, strideConst);
+
+                    // Config BD with dynamic offset AND correct K-round iter settings
+                    auto loopBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                        loc, dfschedule::BdHandleType::get(rewriter.getContext()),
+                        ddrBuffer,                                  // buffer
+                        shimTileOp.getTile(),                       // tile
+                        shimBdIdConst.getResult(),                  // bd_id
+                        offset.getResult(),                         // offset (dynamic)
+                        rewriter.getI32IntegerAttr(perTileShimLen), // len
+                        rewriter.getBoolAttr(false),                // enable_packet
+                        rewriter.getI32IntegerAttr(0),              // packet_id
+                        rewriter.getI32IntegerAttr(4294967295),     // next_bd = none
+                        rewriter.getI32IntegerAttr(0),              // acquire_lock_id
+                        rewriter.getI32IntegerAttr(0),              // acquire_lock_val
+                        rewriter.getI32IntegerAttr(0),              // release_lock_id
+                        rewriter.getI32IntegerAttr(0),              // release_lock_val
+                        rewriter.getI32IntegerAttr(dataId),         // data_id
+                        Value(),                                    // linked_bd = none
+                        rewriter.getI32IntegerAttr(-1),             // out_of_order_bd_id
+                        shimDimStrides, shimDimWraps,
+                        rewriter.getI32IntegerAttr(shimIterStepSize), // iter_step_size (K-round)
+                        rewriter.getI32IntegerAttr(shimIterWrap));    // iter_wrap (kRounds)
+
+                    // Create IO handle for the BD
+                    auto loopCreateIo = rewriter.create<dfschedule::ConfigCreateIoOp>(
+                        loc, dfschedule::IoHandleType::get(rewriter.getContext()), loopBd.getBdHandle(),
+                        shimTileOp.getTile(), rewriter.getI32IntegerAttr(shimChannel),
+                        rewriter.getStringAttr(dmaDirection), rewriter.getStringAttr(ioOperation),
+                        rewriter.getBoolAttr(false));
+
+                    // Start IO for this iteration
+                    auto loopGetBdId =
+                        rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
+                    auto loopStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), loopCreateIo.getIoHandle(),
+                        loopGetBdId.getBdId(), rewriter.getI32IntegerAttr(flowIndex),
+                        rewriter.getI32IntegerAttr(perIterRepeat));
+
+                    // Wait for this iteration's DMA to complete before next BD re-arm
+                    SmallVector<Value> loopWaitEvents;
+                    loopWaitEvents.push_back(loopStartIo.getEvent());
+                    rewriter.create<dfschedule::ScheduleWaitOp>(loc, loopWaitEvents);
+
+                    rewriter.setInsertionPointAfter(forOp);
+                }
+
+                // 5. After all iterations: wait for kernel launch event
+                SmallVector<Value> finalEvents;
+                finalEvents.push_back(launchKernelGroupOp.getEvent());
+                rewriter.create<dfschedule::ScheduleWaitOp>(loc, finalEvents);
+
+            } else if (useOOO && usedMRounds3D && oooMRounds > 1) {
+                // === OOO output flow with outer_rounds > 1: scf.for loop ===
+                // Each outer round: re-configure N OOO shim BDs with updated DDR offset,
+                // then startio + wait. Inner dimension handled by BD iter_step/iter_wrap.
+                // m_outer: scf.for over mRounds, iter over nRounds
+                // n_outer: scf.for over nRounds, iter over mRounds
+                llvm::errs() << "[BlueprintToSchedule] OOO output outerRounds loop: "
+                             << "outerRounds=" << oooMRounds << " outerStride=" << oooMSubTileStride
+                             << " numCoreTiles=" << numCoreTiles << " iter_wrap=" << oooIterWrap << "\n";
+
+                // Erase the initial createIoOp and N shim BDs created above —
+                // the loop body creates its own BDs and create_io each iteration.
+                {
+                    // The initial shimBdHandles are consumed only by createIoOp
+                    // and each other via linked_bd. Erase createIoOp first, then BDs.
+                    rewriter.eraseOp(createIoOp);
+                    // Erase each initial shim BD (they are in shimBdHandles order)
+                    for (int64_t t = 0; t < numCoreTiles; t++) {
+                        if (shimBdHandles[t]) {
+                            Operation *bdOp = shimBdHandles[t].getDefiningOp();
+                            if (bdOp) {
+                                // Also erase the arith.constant ops for bd_id and offset
+                                // that feed exclusively into this BD op
+                                SmallVector<Operation *, 2> deadConsts;
+                                for (Value operand : bdOp->getOperands()) {
+                                    if (auto constOp = operand.getDefiningOp<arith::ConstantOp>()) {
+                                        if (constOp->hasOneUse())
+                                            deadConsts.push_back(constOp);
+                                    }
+                                }
+                                rewriter.eraseOp(bdOp);
+                                for (auto *dc : deadConsts)
+                                    rewriter.eraseOp(dc);
+                            }
+                        }
+                    }
+                }
+
+                // 1. load_kernel_group OUTSIDE the loop
+                auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
+                    loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
+                    rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs), nullptr,
+                    rewriter.getArrayAttr(kernelConfigSymbols));
+
+                // 2. launch_kernel_group OUTSIDE the loop
+                auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
+
+                // 3. Core start_io OUTSIDE the loop (core DMAs armed once with total repeat)
+                SmallVector<Value> coreStartIoEvents;
+                for (auto &deferred : deferredCoreStartIos) {
+                    auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
+                        rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(deferred.repeatCount));
+                    coreStartIoEvents.push_back(coreStartIo.getEvent());
+                }
+
+                // 4. scf.for from 0 to oooMRounds (outerRounds): per-iteration OOO BD re-config + startio + wait
+                // Each iteration handles one outer round. Per round, each of
+                // numCoreTiles cores produces oooIterWrap inner-dimension outputs.
+                // Total = perIterRepeat * oooMRounds = numCoreTiles * iterWrap * outerRounds.
+                int32_t perIterRepeat = static_cast<int32_t>(numCoreTiles * oooIterWrap);
+                {
+                    auto lb = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+                    auto ub = rewriter.create<arith::ConstantIndexOp>(loc, oooMRounds);
+                    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+                    auto forOp = rewriter.create<scf::ForOp>(loc, lb, ub, step);
+                    rewriter.setInsertionPointToStart(forOp.getBody());
+                    Value iv = forOp.getInductionVar(); // index type
+
+                    // Cast index → i32 for arithmetic
+                    auto ivI32 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), iv);
+
+                    // mBaseOffset = iv * oooMSubTileStride
+                    auto mStrideConst = rewriter.create<arith::ConstantIntOp>(
+                        loc, static_cast<int32_t>(oooMSubTileStride), rewriter.getI32Type());
+                    auto mBaseOffset = rewriter.create<arith::MulIOp>(loc, ivI32, mStrideConst);
+
+                    // Re-configure N OOO shim BDs with updated DDR offset
+                    SmallVector<Value> loopBdHandles(numCoreTiles);
+                    for (int64_t t = numCoreTiles - 1; t >= 0; t--) {
+                        int32_t thisBdId = shimPerTileBdIds[t];
+                        int64_t perTileOffset = t * perTileStrideFromDims;
+
+                        auto bdIdConst = rewriter.create<arith::ConstantIntOp>(loc, thisBdId, rewriter.getI32Type());
+                        auto perTileOffsetConst = rewriter.create<arith::ConstantIntOp>(
+                            loc, static_cast<int32_t>(perTileOffset), rewriter.getI32Type());
+                        // totalOffset = mBaseOffset + perTileOffset
+                        auto totalOffset = rewriter.create<arith::AddIOp>(loc, mBaseOffset.getResult(),
+                                                                          perTileOffsetConst.getResult());
+
+                        // linked_bd chain for SSA: BD[i] links to BD[i+1] (or none for last)
+                        Value linkedBd = (t < numCoreTiles - 1) ? loopBdHandles[t + 1] : Value();
+
+                        auto loopBd = rewriter.create<dfschedule::ConfigDmaBdOp>(
+                            loc, dfschedule::BdHandleType::get(rewriter.getContext()),
+                            ddrBuffer,                                 // DDR buffer
+                            shimTileOp.getTile(),                      // tile
+                            bdIdConst.getResult(),                     // bd_id (reused)
+                            totalOffset.getResult(),                   // offset (dynamic: m*stride + tile*step)
+                            rewriter.getI32IntegerAttr(perRoundBytes), // len (one d0×d1 block)
+                            rewriter.getBoolAttr(false),               // enable_packet = false
+                            rewriter.getI32IntegerAttr(basePacketId + (int32_t)t), // packet_id (debug)
+                            rewriter.getI32IntegerAttr(-1),                        // next_bd = -1 (no chaining)
+                            rewriter.getI32IntegerAttr(-1),                        // acquire_lock_id = -1
+                            rewriter.getI32IntegerAttr(0),                         // acquire_lock_val
+                            rewriter.getI32IntegerAttr(-1),                        // release_lock_id = -1
+                            rewriter.getI32IntegerAttr(0),                         // release_lock_val
+                            rewriter.getI32IntegerAttr(dataId),                    // data_id
+                            linkedBd,                                              // linked_bd
+                            rewriter.getI32IntegerAttr(-1),                        // out_of_order_bd_id
+                            /*dim_strides=*/perTileDimStrides, /*dim_wraps=*/perTileDimWraps,
+                            rewriter.getI32IntegerAttr(oooIterStepSize), // iter_step_size
+                            rewriter.getI32IntegerAttr(oooIterWrap));    // iter_wrap
+
+                        loopBdHandles[t] = loopBd.getBdHandle();
+                    }
+
+                    // Create OOO IO handle (first BD in chain = BD[0])
+                    auto loopCreateIo = rewriter.create<dfschedule::ConfigCreateIoOp>(
+                        loc, dfschedule::IoHandleType::get(rewriter.getContext()), loopBdHandles[0],
+                        shimTileOp.getTile(), rewriter.getI32IntegerAttr(shimChannel),
+                        rewriter.getStringAttr(dmaDirection), rewriter.getStringAttr(ioOperation),
+                        rewriter.getBoolAttr(true)); // enable_out_of_order = true
+
+                    // Start IO: repeat = numCoreTiles * iterWrap per outer-round iteration
+                    auto loopGetBdId =
+                        rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), shimTileOp.getTile());
+                    auto loopStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), loopCreateIo.getIoHandle(),
+                        loopGetBdId.getBdId(), rewriter.getI32IntegerAttr(flowIndex),
+                        rewriter.getI32IntegerAttr(perIterRepeat));
+
+                    // Wait for this outer round's OOO completion before next BD re-arm
+                    SmallVector<Value> loopWaitEvents;
+                    loopWaitEvents.push_back(loopStartIo.getEvent());
+                    rewriter.create<dfschedule::ScheduleWaitOp>(loc, loopWaitEvents);
+
+                    rewriter.setInsertionPointAfter(forOp);
+                }
+
+                // 5. After all iterations: wait for kernel launch event
+                SmallVector<Value> finalEvents;
+                finalEvents.push_back(launchKernelGroupOp.getEvent());
+                rewriter.create<dfschedule::ScheduleWaitOp>(loc, finalEvents);
+
+            } else {
+                // === Match mode or output flow: existing straight-line schedule ===
+
+                // Shim start_io is emitted BEFORE load_kernel_group so that shim DMA
+                // channels are armed first.  Core start_io remains after kernel launch
+                // to avoid BSS-zeroing races.
+                int32_t repeatCount = 1;
+                if (useOOO) {
+                    // OOO without m_rounds loop: repeat = numCoreTiles * ooNumIterations
+                    repeatCount = (int32_t)(numCoreTiles * ooNumIterations);
+                } else if (shimIsSender) {
+                    // Channel repeat must match iter_wrap so the DMA engine
+                    // re-executes the BD the correct number of times.
+                    // Policy determines which dimension is in the inner loop (iter):
+                    // m_outer: iter handles nRounds (B advances, A repeats)
+                    // n_outer: iter handles mRounds (A advances, B repeats)
+                    if (moduleOp) {
+                        auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
+                        if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
+                            if (nOuterPolicy) {
+                                // n_outer: repeat = mRounds (matches iter_wrap) for both A and B
+                                auto tileMAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                                auto tileRowsAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                                int64_t tM = tileMAttrRC ? tileMAttrRC.getInt() : 0;
+                                int64_t tR = tileRowsAttrRC ? tileRowsAttrRC.getInt() : 0;
+                                if (tM > 0 && tM < tR) {
+                                    repeatCount = static_cast<int32_t>(tR / tM); // mRounds
+                                } else {
+                                    repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
+                                }
+                            } else {
+                                // m_outer: repeat = nRounds (matches iter_wrap) for both A and B
+                                auto tileNAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
+                                auto tileColsAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                                int64_t tN = tileNAttrRC ? tileNAttrRC.getInt() : 0;
+                                int64_t tC = tileColsAttrRC ? tileColsAttrRC.getInt() : 0;
+                                if (tN > 0 && tN < tC) {
+                                    repeatCount = static_cast<int32_t>(tC / tN); // nRounds
+                                } else {
+                                    repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
+                                }
+                            }
+                        }
+                    }
+                }
+                auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(),
+                    getBdIdOp.getBdId(), rewriter.getI32IntegerAttr(flowIndex),
+                    rewriter.getI32IntegerAttr(repeatCount));
+
+                // Create dfschedule.config.load_kernel_group
+                auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
+                    loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
+                    rewriter.getArrayAttr(calleeAttrs), rewriter.getArrayAttr(computeKernelAttrs), nullptr,
+                    rewriter.getArrayAttr(kernelConfigSymbols));
+
+                // Create dfschedule.schedule.launch_kernel_group
+                auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
+                    loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
+
+                // Emit deferred core StartIoOp calls AFTER kernel load/launch
+                SmallVector<Value> coreStartIoEvents;
+                for (auto &deferred : deferredCoreStartIos) {
+                    auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
+                        loc, dfschedule::EventType::get(rewriter.getContext()), deferred.ioHandle, deferred.bdId,
+                        rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(deferred.repeatCount));
+                    coreStartIoEvents.push_back(coreStartIo.getEvent());
+                }
+
+                // Determine whether to bypass input sending IO wait.
+                // When tile_m == tile_rows (M-dimension Match) for Row-distributed
+                // inputs (funcArgIdx=0, input A), or tile_n == tile_cols (N-dimension
+                // Match) for Col-distributed inputs (funcArgIdx=1, input B), the shim
+                // DMA iteration handles all rounds autonomously via BD repeat — the
+                // host does not need to wait for the shim IO to complete before
+                // proceeding.
+                bool bypassInputIoWait = false;
+                if (shimIsSender) {
+                    // funcArgIdx 0 = input A (Row-distributed) → M dimension
+                    // funcArgIdx 1 = input B (Col-distributed) → N dimension
+                    if (funcArgIdx == 0 && classification.mMode == TilingMode::Match) {
+                        bypassInputIoWait = true;
+                        llvm::errs() << "[BlueprintToSchedule] Bypassing input IO wait for input A "
+                                     << "(funcArgIdx=0, M-dimension Match: tile_m == tile_rows)\n";
+                    } else if (funcArgIdx == 1 && classification.nMode == TilingMode::Match) {
+                        bypassInputIoWait = true;
+                        llvm::errs() << "[BlueprintToSchedule] Bypassing input IO wait for input B "
+                                     << "(funcArgIdx=1, N-dimension Match: tile_n == tile_cols)\n";
+                    }
+                }
+
+                // Wait for kernel launch + shim IO events
+                SmallVector<Value> events;
+                events.push_back(launchKernelGroupOp.getEvent());
+                if (!bypassInputIoWait)
+                    events.push_back(startIoOp.getEvent());
+                rewriter.create<dfschedule::ScheduleWaitOp>(loc, events);
+            }
 
         // Stage 6: free DDR allocation after all transfers complete
         if (ddrBuffer) {
@@ -1459,11 +2394,30 @@ void BlueprintToSchedulePass::runOnOperation() {
         return;
     }
 
+    // Cache routing module attributes before conversion (they may be stripped
+    // during applyPartialConversion).
+    {
+        auto moduleOp = dyn_cast<ModuleOp>(getOperation());
+        if (moduleOp) {
+            auto getI64 = [&](StringRef name) -> int64_t {
+                auto attr = moduleOp->getAttrOfType<IntegerAttr>(name);
+                return attr ? attr.getInt() : 0;
+            };
+            passState->tileM = getI64("routing.tile_m");
+            passState->tileRows = getI64("routing.tile_rows");
+            passState->tileN = getI64("routing.tile_n");
+            passState->tileCols = getI64("routing.tile_cols");
+            passState->effectiveK = getI64("routing.effective_k");
+            passState->fullK = getI64("routing.full_k");
+            passState->kRounds = getI64("routing.k_rounds");
+        }
+    }
+
     // --- Phase 2: Dialect conversion ---
     ConversionTarget target(*context);
     target.addLegalDialect<dfschedule::dfscheduledialect, routing::routingdialect, func::FuncDialect,
                            memref::MemRefDialect, arith::ArithDialect, scf::SCFDialect, tensor::TensorDialect,
-                           bufferization::BufferizationDialect, BuiltinDialect>();
+                           bufferization::BufferizationDialect, BuiltinDialect, emitc::EmitCDialect>();
 
     target.addIllegalOp<dfscheblueprint::FlowConfigOp>();
     target.addIllegalOp<dfscheblueprint::TileGroupOp>();

@@ -269,6 +269,7 @@ struct KernelParamInfo {
     Type elementType;           // Element type of the buffer
     int64_t bufferSize;         // Size of the buffer
     int32_t vectorWidth;        // Vector width (e.g., 4 for v4int32)
+    int32_t numRounds = 0;      // Number of ping-pong rounds (ppDepth)
     uint32_t pingAddress = 0;   // BCF symbol address for ping buffer (from CoreMemAllocator)
     uint32_t pongAddress = 0;   // BCF symbol address for pong buffer (from CoreMemAllocator)
     int funcArgIndex = -1;      // Function argument index (0=A, 1=B, 2=C)
@@ -393,6 +394,8 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
             winAttrs.append("acquire_lock", SymbolRefAttr::get(rewriter.getContext(), acqLockName));
             winAttrs.append("release_lock", SymbolRefAttr::get(rewriter.getContext(), relLockName));
             winAttrs.append("buffer_size", rewriter.getI32IntegerAttr(paramInfo.bufferSize));
+            if (paramInfo.numRounds > 0)
+                winAttrs.append("num_rounds", rewriter.getI32IntegerAttr(paramInfo.numRounds));
             winAttrs.append("async", rewriter.getBoolAttr(true));
 
             rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr(paramInfo.windowName),
@@ -806,7 +809,63 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 int64_t perCoreSize = partitionSize;
                 if (transferType == "many_to_one")
                     perCoreSize = partitionSize / numCoreTiles;
-                int64_t pingPongBufSize = static_cast<int64_t>(perCoreSize * bufferRatio);
+
+                // K-round adjustment: for input flows, use per-k-round data
+                // size so pingPongBufSize matches the kernel's buf_sz (which
+                // is computed from effectiveK, not fullK).
+                int64_t perCoreSizeForBuf = perCoreSize;
+
+                // M/N-round adjustment for output: when tile_m < tileRows
+                // or tile_n < tileCols, the per-round output buffer is one
+                // sub-tile (tileM * tileN_sub), not the full tile output.
+                // Divide by mRounds * nRounds so pingPongBufSize matches
+                // one kernel output window.
+                if (!paramInfo.isInput) {
+                    auto moduleOp2 = declareDataOp->getParentOfType<ModuleOp>();
+                    if (moduleOp2) {
+                        auto tileMAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_m");
+                        auto tileRowsAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                        auto tileNAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_n");
+                        auto tileColsAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_cols");
+                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                        int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
+                        int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                        int64_t mRounds = (tileM > 0 && tileM < tileRows) ? (tileRows / tileM) : 1;
+                        int64_t nRounds = (tileN > 0 && tileN < tileCols) ? (tileCols / tileN) : 1;
+                        if (mRounds * nRounds > 1) {
+                            perCoreSizeForBuf = perCoreSize / (mRounds * nRounds);
+                        }
+                    }
+                }
+
+                if (paramInfo.isInput) {
+                    auto moduleOp = declareDataOp->getParentOfType<ModuleOp>();
+                    if (moduleOp) {
+                        if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
+                            int64_t kRounds = kRoundsAttr.getInt();
+                            if (kRounds > 1) {
+                                perCoreSizeForBuf = perCoreSize / kRounds;
+                                // When tile_m < tileRows, each k-round only needs
+                                // tile_m rows (not partRows). Divide by mRounds
+                                // so pingPongBufSize = tile_m * effectiveK.
+                                auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                                auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                                int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                                int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                                if (tileM > 0 && tileM < tileRows) {
+                                    int64_t mRounds = tileRows / tileM;
+                                    perCoreSizeForBuf = perCoreSizeForBuf / mRounds;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // pp_depth controls physical ping-pong buffer count (for DMA/compute
+                // overlap), NOT data splitting.  Buffer size = full per-k-round data,
+                // clamped only by maxPingPongBytes when the data exceeds tile memory.
+                int64_t pingPongBufSize = perCoreSizeForBuf;
                 if (pingPongBufSize <= 0)
                     pingPongBufSize = 1;
                 // Clamp to maxPingPongBytes to prevent exceeding core tile memory
@@ -823,6 +882,68 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 paramInfo.bufferSize = pingPongBufSize / defaultVectorWidth;
                 if (paramInfo.bufferSize <= 0)
                     paramInfo.bufferSize = 1;
+                // numRounds = rounds per k-round = perCoreSizeForBuf / pingPongBufSize
+                // The kRounds multiplier below scales to total across all k-rounds.
+                paramInfo.numRounds =
+                    (pingPongBufSize > 0) ? static_cast<int32_t>(perCoreSizeForBuf / pingPongBufSize) : 1;
+
+                // M-round multiplication for output: when tile_m < tileRows,
+                // the kernel outputs mRounds sub-tiles per GEMM invocation.
+                // numRounds must cover all m-round iterations.
+                if (!paramInfo.isInput) {
+                    auto moduleOp3 = declareDataOp->getParentOfType<ModuleOp>();
+                    if (moduleOp3) {
+                        auto tileMAttr = moduleOp3->getAttrOfType<IntegerAttr>("routing.tile_m");
+                        auto tileRowsAttr = moduleOp3->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                        if (tileM > 0 && tileM < tileRows) {
+                            int64_t mRounds = tileRows / tileM;
+                            llvm::errs() << "[BlueprintToScheduleKernel] M-round: output numRounds "
+                                         << paramInfo.numRounds << " * mRounds " << mRounds << " = "
+                                         << paramInfo.numRounds * mRounds << "\n";
+                            paramInfo.numRounds *= static_cast<int32_t>(mRounds);
+                        }
+                    }
+                }
+
+                // K-round multiplication: when effectiveK < K, the kernel runs
+                // kRounds iterations. window_init numRounds must cover the total
+                // acquire/release cycles across all k-rounds.
+                if (paramInfo.isInput) {
+                    auto moduleOp = declareDataOp->getParentOfType<ModuleOp>();
+                    if (moduleOp) {
+                        if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
+                            int64_t kRounds = kRoundsAttr.getInt();
+                            if (kRounds > 1) {
+                                llvm::errs()
+                                    << "[BlueprintToScheduleKernel] K-round: input numRounds " << paramInfo.numRounds
+                                    << " * kRounds " << kRounds << " = " << paramInfo.numRounds * kRounds << "\n";
+                                paramInfo.numRounds *= static_cast<int32_t>(kRounds);
+                            }
+                        }
+                    }
+                }
+
+                // M-round multiplication for input: when tile_m < tileRows,
+                // the kernel acquires A data mRounds times per k-round.
+                // window_init numRounds must cover the total across all (mr, kr).
+                if (paramInfo.isInput) {
+                    auto moduleOp4 = declareDataOp->getParentOfType<ModuleOp>();
+                    if (moduleOp4) {
+                        auto tileMAttr = moduleOp4->getAttrOfType<IntegerAttr>("routing.tile_m");
+                        auto tileRowsAttr = moduleOp4->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                        if (tileM > 0 && tileM < tileRows) {
+                            int64_t mRounds = tileRows / tileM;
+                            llvm::errs() << "[BlueprintToScheduleKernel] M-round: input numRounds "
+                                         << paramInfo.numRounds << " * mRounds " << mRounds << " = "
+                                         << paramInfo.numRounds * mRounds << "\n";
+                            paramInfo.numRounds *= static_cast<int32_t>(mRounds);
+                        }
+                    }
+                }
             } else {
                 // Fallback: try declare_data operand
                 Value srcValue = declareDataOp.getOperand();
@@ -1026,15 +1147,18 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 auto bdIdConst = rewriter.create<arith::ConstantOp>(
                     loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(resourceMgr.allocateBdId()));
 
+                auto kernelOffsetConst =
+                    rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
                 auto coreBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
                     loc, dfschedule::BdHandleType::get(rewriter.getContext()), coreBuf, coreTileOp.getTile(), bdIdConst,
-                    rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(perTileLen), rewriter.getBoolAttr(true),
+                    kernelOffsetConst.getResult(), rewriter.getI32IntegerAttr(perTileLen), rewriter.getBoolAttr(true),
                     rewriter.getI32IntegerAttr(basePacketId + tileIdx), rewriter.getI32IntegerAttr(4294967295),
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(0),
                     rewriter.getI32IntegerAttr(0), rewriter.getI32IntegerAttr(-1), Value(),
                     rewriter.getI32IntegerAttr(-1), // out_of_order_bd_id
                     /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
-                    rewriter.getI32IntegerAttr(0)); // iter_step_size (no iteration)
+                    rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
+                    rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
 
                 auto createIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
                     loc, dfschedule::IoHandleType::get(rewriter.getContext()), coreBdOp.getBdHandle(),
@@ -1045,9 +1169,26 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 auto getBdIdOp =
                     rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), coreTileOp.getTile());
 
-                rewriter.create<dfschedule::StartIoOp>(
-                    loc, dfschedule::EventType::get(rewriter.getContext()), createIoOp.getIoHandle(),
-                    getBdIdOp.getBdId(), rewriter.getI32IntegerAttr(flowIndex), rewriter.getI32IntegerAttr(1));
+                // Core MM2S (output) repeat: when tile_m < tileRows, the kernel
+                // outputs mRounds sub-tiles. The DMA must repeat accordingly.
+                int32_t coreRepeatCount = 1;
+                if (coreDmaDir == dfscheblueprint::bp_direction::MM2S) {
+                    auto moduleOp = op->getParentOfType<ModuleOp>();
+                    if (moduleOp) {
+                        auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
+                        auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                        if (tileM > 0 && tileM < tileRows) {
+                            coreRepeatCount = static_cast<int32_t>(tileRows / tileM);
+                        }
+                    }
+                }
+
+                rewriter.create<dfschedule::StartIoOp>(loc, dfschedule::EventType::get(rewriter.getContext()),
+                                                       createIoOp.getIoHandle(), getBdIdOp.getBdId(),
+                                                       rewriter.getI32IntegerAttr(flowIndex),
+                                                       rewriter.getI32IntegerAttr(coreRepeatCount));
 
                 tileIdx++;
             }

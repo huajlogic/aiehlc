@@ -133,7 +133,11 @@ list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdmaphoptoroutinghw/passdmap
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passblueprinttoschedule/passblueprinttoschedule.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passblueprinttoschedulekernel/passblueprinttoschedulekernel.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdmaphopprovenancemap/passdmaphopprovenancemap.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdfscheduleprovenancemap/passdfscheduleprovenancemap.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passschedulecanonicalize/passschedulecanonicalize.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passschedulesequentialop/passschedulesequentialop.cpp)
+list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passwaitmerge/passwaitmerge.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdfscheduletoapi/passdfscheduletoapi.cpp)
 list(APPEND SOURCE_LIB_FILES ./tilinglinalg/pass/passdfscheduletokernelapi/passdfscheduletokernelapi.cpp)
 # tilinglinalg routing implementation
@@ -189,9 +193,13 @@ include_directories(./tilinglinalg/pass/passroutingtodmap/)
 include_directories(./tilinglinalg/pass/passblueprinttoschedule/)
 include_directories(./tilinglinalg/pass/passblueprinttoschedulekernel/)
 include_directories(./tilinglinalg/pass/passdmaphoptodfscheblueprint/)
+include_directories(./tilinglinalg/pass/passdmaphopprovenancemap/)
+include_directories(./tilinglinalg/pass/passdfscheduleprovenancemap/)
 include_directories(./tilinglinalg/pass/passdmaphoptoroutinghw/)
 include_directories(./tilinglinalg/pass/passdmaptodmaphop/)
 include_directories(./tilinglinalg/pass/passschedulecanonicalize/)
+include_directories(./tilinglinalg/pass/passschedulesequentialop/)
+include_directories(./tilinglinalg/pass/passwaitmerge/)
 include_directories(./tilinglinalg/pass/passdfscheduletoapi/)
 include_directories(./tilinglinalg/pass/passdfscheduletokernelapi/)
 include_directories(./tilinglinalg/pass/kernelconfig/)
@@ -278,6 +286,7 @@ target_link_libraries(mlirtest PUBLIC
 	MLIRMathToLLVM
 			#MLIRROCDLToLLVMIRTranslation
 			#MLIRGPUDialect
+			MLIRSCFToEmitC
 			#MLIRSCFToControlFlow
 			#MLIRIndexToLLVM
 			#MLIRGPUToROCDLTransforms

@@ -185,12 +185,17 @@ void dfscheblueprint::FlowConfigOp::print(OpAsmPrinter &printer) {
         printer.printNewline();
         printer << ",shim_dim_wraps = " << getShimDimWraps();
     }
+    if (getPpDepthAttr()) {
+        printer.printNewline();
+        printer << ",pp_depth = " << static_cast<int32_t>(*getPpDepth()) << " : i32";
+    }
     printer.decreaseIndent();
     printer.printNewline();
     printer << "}";
     printer.printOptionalAttrDict(getOperation()->getAttrs(),
                                   /*elidedAttrs=*/{"sym_name", "target", "view", "distribution", "dma", "slice_symbols",
-                                                   "type", "data_id", "shim_dim_strides", "shim_dim_wraps"});
+                                                   "type", "data_id", "shim_dim_strides", "shim_dim_wraps",
+                                                   "pp_depth"});
 }
 
 // FlowConfigOp parser
@@ -247,6 +252,14 @@ ParseResult dfscheblueprint::FlowConfigOp::parse(OpAsmParser &parser, OperationS
                 ArrayAttr shimDimWraps;
                 if (parser.parseAttribute(shimDimWraps, "shim_dim_wraps", result.attributes))
                     return failure();
+            } else if (attrName == "pp_depth") {
+                IntegerAttr ppDepthAttr;
+                if (parser.parseAttribute(ppDepthAttr, "pp_depth", result.attributes))
+                    return failure();
+                if (ppDepthAttr.getType().isSignlessInteger(64)) {
+                    auto i32Attr = IntegerAttr::get(IntegerType::get(parser.getContext(), 32), ppDepthAttr.getInt());
+                    result.attributes.set("pp_depth", i32Attr);
+                }
             } else {
                 return parser.emitError(parser.getCurrentLocation(), "unknown attribute: ") << attrName;
             }
@@ -582,7 +595,8 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
                                                   builder.getStringAttr("shim"), // type
                                                   nullptr,                       // data_id
                                                   nullptr,                       // shim_dim_strides
-                                                  nullptr                        // shim_dim_wraps
+                                                  nullptr,                       // shim_dim_wraps
+                                                  nullptr                        // pp_depth
     );
 
     // Bind Cores Input (S2MM - Receive)
@@ -595,7 +609,8 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
                                                   builder.getStringAttr("core"), // type
                                                   nullptr,                       // data_id
                                                   nullptr,                       // shim_dim_strides
-                                                  nullptr                        // shim_dim_wraps
+                                                  nullptr,                       // shim_dim_wraps
+                                                  nullptr                        // pp_depth
     );
 
     // Bind Cores Output (MM2S - Send)
@@ -608,7 +623,8 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
                                                   builder.getStringAttr("core"),         // type
                                                   nullptr,                               // data_id
                                                   nullptr,                               // shim_dim_strides
-                                                  nullptr                                // shim_dim_wraps
+                                                  nullptr,                               // shim_dim_wraps
+                                                  nullptr                                // pp_depth
     );
 
     // Bind Shim RX
@@ -621,7 +637,8 @@ void dfscheblueprintmanager::createBlueprintExample(OpBuilder& builder, MLIRCont
                                                   builder.getStringAttr("shim"), // type
                                                   nullptr,                       // data_id
                                                   nullptr,                       // shim_dim_strides
-                                                  nullptr                        // shim_dim_wraps
+                                                  nullptr,                       // shim_dim_wraps
+                                                  nullptr                        // pp_depth
     );
 
     // ============================================================

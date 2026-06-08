@@ -201,7 +201,8 @@ def dfscheblueprint_FlowConfigOp : dfscheblueprintop<"flowconfig", [
     OptionalAttr<StrAttr>:$type,
     OptionalAttr<I32Attr>:$data_id,
     OptionalAttr<I32ArrayAttr>:$shim_dim_strides,
-    OptionalAttr<I32ArrayAttr>:$shim_dim_wraps
+    OptionalAttr<I32ArrayAttr>:$shim_dim_wraps,
+    OptionalAttr<I32Attr>:$pp_depth
   );
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;

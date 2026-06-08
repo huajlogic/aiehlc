@@ -34,6 +34,7 @@
 #include <regex>
 #include <unordered_map>
 
+#include "routingimplement/include/hw/hwresource.h"
 #include "tilinglinalg_pipeline.h"
 
 class AieFrontEnd;
@@ -55,6 +56,10 @@ struct ParsedTensorInfo {
     int mergeOrder = 0;   // 0=Default, 1=LeftToRight, 2=RightToLeft
     int pingPong = 2;
     int maxBufferBytes = 4096;   // max per-buffer size (PP_MAX_BYTES equivalent)
+    // Two-level tiling hints (0 = auto-derive from memory budget)
+    int tileM = 0;               // explicit sub-tile rows per core
+    int tileN = 0;               // explicit sub-tile cols per core
+    int tileK = 0;               // explicit K chunk size for temporal tiling
     bool policyResolved = false; // true once AST extraction succeeds
 };
 static std::vector<ParsedTensorInfo> parsedTensors;
@@ -1028,12 +1033,23 @@ public:
                                                 if (apval->getStructNumFields() >= 5)
                                                     pti.maxBufferBytes =
                                                         (int)apval->getStructField(4).getInt().getExtValue();
+                                                // Two-level tiling hints (fields 5,6,7)
+                                                if (apval->getStructNumFields() >= 6)
+                                                    pti.tileM = (int)apval->getStructField(5).getInt().getExtValue();
+                                                if (apval->getStructNumFields() >= 7)
+                                                    pti.tileN = (int)apval->getStructField(6).getInt().getExtValue();
+                                                if (apval->getStructNumFields() >= 8)
+                                                    pti.tileK = (int)apval->getStructField(7).getInt().getExtValue();
                                                 pti.policyResolved = true;
                                                 llvm::outs()
                                                     << "[TilingLinalg] Policy resolved: pattern=" << pti.pattern
                                                     << " distribution=" << pti.distribution
                                                     << " mergeOrder=" << pti.mergeOrder << " ppDepth=" << pti.pingPong
-                                                    << " maxBufferBytes=" << pti.maxBufferBytes << "\n";
+                                                    << " maxBufferBytes=" << pti.maxBufferBytes;
+                                                if (pti.tileM > 0 || pti.tileN > 0 || pti.tileK > 0)
+                                                    llvm::outs() << " tile_m=" << pti.tileM << " tile_n=" << pti.tileN
+                                                                 << " tile_k=" << pti.tileK;
+                                                llvm::outs() << "\n";
                                             } else if (!apval) {
                                                 llvm::errs()
                                                     << "[TilingLinalg] DEBUG: policy arg kind="
@@ -1080,6 +1096,136 @@ public:
                         derivedTilingParams.tileCols = macroDimN / effectiveMeshCols;
                         derivedTilingParams.kDim = macroDimK;
 
+                        // ---- Two-level tiling: compute effective tile_m/tile_n/tile_k ----
+                        // Memory budget from HW resource model (same for all current AIE generations)
+                        auto hwResForMemCheck = makeResource("Gen2");
+                        const int64_t AIE_DATA_MEM_BYTES = hwResForMemCheck->getTileMemoryBytes();
+                        const int64_t AIE_USABLE_MEM_BYTES = hwResForMemCheck->getUsableDataBytes();
+
+                        // Collect explicit tiling hints from any resolved policy
+                        int explicitTileM = 0, explicitTileN = 0, explicitTileK = 0;
+                        int elementBytes = 1; // default int8
+                        for (const auto &pt : parsedTensors) {
+                            if (pt.policyResolved) {
+                                if (pt.tileM > 0)
+                                    explicitTileM = pt.tileM;
+                                if (pt.tileN > 0)
+                                    explicitTileN = pt.tileN;
+                                if (pt.tileK > 0)
+                                    explicitTileK = pt.tileK;
+                            }
+                            int eb = pt.elementBitWidth / 8;
+                            if (eb > elementBytes)
+                                elementBytes = eb;
+                        }
+
+                        int64_t tileM_eff = explicitTileM > 0 ? explicitTileM : derivedTilingParams.tileRows;
+                        int64_t tileN_eff = explicitTileN > 0 ? explicitTileN : derivedTilingParams.tileCols;
+                        int64_t tileK_eff = explicitTileK > 0 ? explicitTileK : macroDimK;
+
+                        // Memory check: A_local[tileM * tileK] + B_local[tileK * tileN] + C_local[tileM * tileN]
+                        auto computeWorkingSet = [&](int64_t tm, int64_t tn, int64_t tk) -> int64_t {
+                            return (tm * tk + tk * tn + tm * tn) * elementBytes;
+                        };
+
+                        int64_t workingSet = computeWorkingSet(tileM_eff, tileN_eff, tileK_eff);
+
+                        if (explicitTileM > 0 || explicitTileN > 0 || explicitTileK > 0) {
+                            // Explicit tiling — validate against memory budget
+                            if (workingSet > AIE_DATA_MEM_BYTES) {
+                                llvm::errs() << "[TilingLinalg] ERROR: Explicit tiling exceeds AIE data memory!\n"
+                                             << "  tile_m=" << tileM_eff << " tile_n=" << tileN_eff
+                                             << " tile_k=" << tileK_eff << " working_set=" << workingSet << " bytes"
+                                             << " (limit=" << AIE_DATA_MEM_BYTES << ")\n"
+                                             << "  A_local=" << tileM_eff * tileK_eff * elementBytes
+                                             << " B_local=" << tileK_eff * tileN_eff * elementBytes
+                                             << " C_local=" << tileM_eff * tileN_eff * elementBytes << "\n";
+                            } else if (workingSet > AIE_USABLE_MEM_BYTES) {
+                                llvm::outs() << "[TilingLinalg] WARNING: Explicit tiling uses " << workingSet
+                                             << " bytes — close to limit, "
+                                             << "little room for stack/ping-pong.\n";
+                            }
+                            derivedTilingParams.autoTiled = false;
+                        } else if (workingSet > AIE_USABLE_MEM_BYTES) {
+                            // Auto-tiling: working set exceeds memory budget, need to sub-tile
+                            llvm::outs() << "[TilingLinalg] Working set " << workingSet
+                                         << " bytes exceeds memory budget " << AIE_USABLE_MEM_BYTES
+                                         << " — auto-tiling enabled.\n";
+
+                            // Strategy: first try tiling K (cheapest — no spatial re-launch)
+                            // Then reduce M/N if still too large
+                            tileK_eff = tileK_eff; // start from full K
+                            int64_t budget = AIE_USABLE_MEM_BYTES / elementBytes;
+
+                            // Phase A: reduce K until A+B fit, keeping C stationary
+                            // C_local = tileM * tileN (fixed), A_local = tileM * tileK, B_local = tileK * tileN
+                            // Constraint: tileM * tileK + tileK * tileN + tileM * tileN <= budget
+                            // => tileK * (tileM + tileN) <= budget - tileM * tileN
+                            int64_t c_size = tileM_eff * tileN_eff;
+                            if (c_size < budget) {
+                                int64_t remaining = budget - c_size;
+                                int64_t maxK = remaining / (tileM_eff + tileN_eff);
+                                if (maxK < tileK_eff && maxK > 0) {
+                                    // Round down to power of 2 for alignment
+                                    int64_t k = 1;
+                                    while (k * 2 <= maxK)
+                                        k *= 2;
+                                    tileK_eff = k;
+                                }
+                            }
+
+                            // Phase B: if C_local alone exceeds budget, reduce M and N
+                            if (c_size >= budget) {
+                                // Solve: 2*tm*tk + tm^2 <= budget (assuming tm=tn, tk=tm for simplicity)
+                                // Use heuristic: start with 64 and validate
+                                for (int64_t candidate : {256, 128, 64, 32, 16, 8}) {
+                                    tileM_eff = std::min((int64_t)candidate, derivedTilingParams.tileRows);
+                                    tileN_eff = std::min((int64_t)candidate, derivedTilingParams.tileCols);
+                                    // Re-derive tileK with new M/N
+                                    c_size = tileM_eff * tileN_eff;
+                                    if (c_size < budget) {
+                                        int64_t remaining = budget - c_size;
+                                        int64_t maxK = remaining / (tileM_eff + tileN_eff);
+                                        int64_t k = 1;
+                                        while (k * 2 <= maxK && k * 2 <= macroDimK)
+                                            k *= 2;
+                                        tileK_eff = k;
+                                        if (computeWorkingSet(tileM_eff, tileN_eff, tileK_eff) <= AIE_USABLE_MEM_BYTES)
+                                            break;
+                                    }
+                                }
+                            }
+
+                            // Final validation
+                            workingSet = computeWorkingSet(tileM_eff, tileN_eff, tileK_eff);
+                            if (workingSet > AIE_DATA_MEM_BYTES) {
+                                llvm::errs() << "[TilingLinalg] ERROR: Auto-tiling failed to fit in memory!\n"
+                                             << "  tile_m=" << tileM_eff << " tile_n=" << tileN_eff
+                                             << " tile_k=" << tileK_eff << " working_set=" << workingSet << " bytes\n";
+                            }
+                            derivedTilingParams.autoTiled = true;
+                        } else {
+                            // Fits in memory without sub-tiling — use full tile dimensions
+                            derivedTilingParams.autoTiled = false;
+                        }
+
+                        // Compute spatial rounds and K rounds
+                        derivedTilingParams.tileM = tileM_eff;
+                        derivedTilingParams.tileN = tileN_eff;
+                        derivedTilingParams.effectiveK = tileK_eff;
+                        derivedTilingParams.spatialMRounds = (tileM_eff > 0 && tileM_eff < derivedTilingParams.tileRows)
+                                                                 ? derivedTilingParams.tileRows / tileM_eff
+                                                                 : 1;
+                        derivedTilingParams.spatialNRounds = (tileN_eff > 0 && tileN_eff < derivedTilingParams.tileCols)
+                                                                 ? derivedTilingParams.tileCols / tileN_eff
+                                                                 : 1;
+                        derivedTilingParams.kRounds =
+                            (tileK_eff > 0 && tileK_eff < macroDimK) ? macroDimK / tileK_eff : 1;
+
+                        // ---- Compute per-port DMA round/buffer parameters ----
+                        // Use effectiveK for DMA buffer sizing (temporal tiling of K)
+                        int64_t dmaK = derivedTilingParams.effectiveK;
+
                         for (auto &pt : parsedTensors) {
                             DerivedTilingParams::PortParams pp;
                             int ppDepth = pt.pingPong > 0 ? pt.pingPong : 2;
@@ -1088,54 +1234,77 @@ public:
                             if (pt.isInput) {
                                 if (pt.policyResolved) {
                                     if (pt.pattern == 0 && pt.distribution == 0) {
-                                        // Input A: Broadcast+Row — split along tile rows
-                                        int64_t rowsPerRoundRaw = derivedTilingParams.tileRows / ppDepth;
-                                        int64_t rowsPerRound = rowsPerRoundRaw;
-                                        if (rowsPerRound * macroDimK > maxBuf)
-                                            rowsPerRound = maxBuf / macroDimK;
-                                        if (rowsPerRound <= 0)
-                                            rowsPerRound = 1;
-                                        pp.numRounds = derivedTilingParams.tileRows / rowsPerRound;
-                                        pp.bufferSize = rowsPerRound * macroDimK;
+                                        // Input A: Broadcast+Row — tileM rows × effectiveK per k-round
+                                        // pp_depth only controls physical ping-pong buffer count,
+                                        // NOT data splitting. Only split when data exceeds maxBuf.
+                                        int64_t perKRoundData = tileM_eff * dmaK;
+                                        if (perKRoundData <= maxBuf) {
+                                            pp.bufferSize = perKRoundData;
+                                            pp.numRounds = 1;
+                                        } else {
+                                            int64_t rowsPerRound = maxBuf / dmaK;
+                                            if (rowsPerRound <= 0)
+                                                rowsPerRound = 1;
+                                            pp.bufferSize = rowsPerRound * dmaK;
+                                            pp.numRounds = (tileM_eff + rowsPerRound - 1) / rowsPerRound;
+                                            llvm::outs() << "[TilingLinalg] WARNING: Input A tile_m(" << tileM_eff
+                                                         << ") * effectiveK(" << dmaK << ") = " << perKRoundData
+                                                         << " exceeds max_buffer_bytes(" << maxBuf
+                                                         << "), splitting into " << pp.numRounds << " rounds\n";
+                                        }
                                     } else if (pt.pattern == 0 && pt.distribution == 1) {
-                                        // Input B: Broadcast+Col — split along tile cols
-                                        int64_t colsPerRoundRaw = derivedTilingParams.tileCols / ppDepth;
-                                        int64_t colsPerRound = colsPerRoundRaw;
-                                        if (colsPerRound * macroDimK > maxBuf)
-                                            colsPerRound = maxBuf / macroDimK;
-                                        if (colsPerRound <= 0)
-                                            colsPerRound = 1;
-                                        pp.numRounds = derivedTilingParams.tileCols / colsPerRound;
-                                        pp.bufferSize = colsPerRound * macroDimK;
+                                        // Input B: Broadcast+Col — tileN cols × effectiveK per k-round
+                                        int64_t perKRoundData = tileN_eff * dmaK;
+                                        if (perKRoundData <= maxBuf) {
+                                            pp.bufferSize = perKRoundData;
+                                            pp.numRounds = 1;
+                                        } else {
+                                            int64_t colsPerRound = maxBuf / dmaK;
+                                            if (colsPerRound <= 0)
+                                                colsPerRound = 1;
+                                            pp.bufferSize = colsPerRound * dmaK;
+                                            pp.numRounds = (tileN_eff + colsPerRound - 1) / colsPerRound;
+                                            llvm::outs() << "[TilingLinalg] WARNING: Input B tile_n(" << tileN_eff
+                                                         << ") * effectiveK(" << dmaK << ") = " << perKRoundData
+                                                         << " exceeds max_buffer_bytes(" << maxBuf
+                                                         << "), splitting into " << pp.numRounds << " rounds\n";
+                                        }
                                     } else {
                                         // Other input patterns: default
                                         int64_t totalElements = 1;
                                         for (auto d : pt.shape)
                                             totalElements *= d;
                                         int64_t perTile = totalElements / (tilingMeshRows * tilingMeshCols);
-                                        pp.bufferSize = std::min(perTile / ppDepth, (int64_t)maxBuf);
-                                        if (pp.bufferSize <= 0)
+                                        if (perTile <= maxBuf) {
                                             pp.bufferSize = perTile;
-                                        pp.numRounds = perTile / pp.bufferSize;
+                                            pp.numRounds = 1;
+                                        } else {
+                                            pp.bufferSize = maxBuf;
+                                            pp.numRounds = (perTile + maxBuf - 1) / maxBuf;
+                                        }
                                     }
                                 } else {
                                     // Unresolved policy — use defaults
                                     int64_t totalElements = pt.shape[0] * pt.shape[1] / effectiveMeshRows;
-                                    pp.bufferSize = std::min(totalElements / ppDepth, (int64_t)maxBuf);
-                                    if (pp.bufferSize <= 0)
+                                    if (totalElements <= maxBuf) {
                                         pp.bufferSize = totalElements;
-                                    pp.numRounds = totalElements / pp.bufferSize;
+                                        pp.numRounds = 1;
+                                    } else {
+                                        pp.bufferSize = maxBuf;
+                                        pp.numRounds = (totalElements + maxBuf - 1) / maxBuf;
+                                    }
                                 }
                             } else {
-                                // Output: no K dimension involved
-                                int64_t outputPerCore = derivedTilingParams.tileRows * derivedTilingParams.tileCols;
-                                int64_t bufSzOut = outputPerCore / ppDepth;
-                                if (bufSzOut > maxBuf)
-                                    bufSzOut = maxBuf;
-                                if (bufSzOut <= 0)
-                                    bufSzOut = outputPerCore;
-                                pp.numRounds = outputPerCore / bufSzOut;
-                                pp.bufferSize = bufSzOut;
+                                // Output: use tileM * tileN as per-core output
+                                // pp_depth only controls physical buffer count, not data splitting
+                                int64_t outputPerCore = tileM_eff * tileN_eff;
+                                if (outputPerCore <= maxBuf) {
+                                    pp.bufferSize = outputPerCore;
+                                    pp.numRounds = 1;
+                                } else {
+                                    pp.bufferSize = maxBuf;
+                                    pp.numRounds = (outputPerCore + maxBuf - 1) / maxBuf;
+                                }
                             }
                             derivedTilingParams.portParams.push_back(pp);
                         }
@@ -1143,11 +1312,60 @@ public:
                         llvm::outs() << "[TilingLinalg] Derived tiling: tileRows=" << derivedTilingParams.tileRows
                                      << " tileCols=" << derivedTilingParams.tileCols
                                      << " kDim=" << derivedTilingParams.kDim << "\n";
+                        llvm::outs() << "[TilingLinalg] Two-level tiling: tileM=" << derivedTilingParams.tileM
+                                     << " tileN=" << derivedTilingParams.tileN
+                                     << " effectiveK=" << derivedTilingParams.effectiveK
+                                     << " kRounds=" << derivedTilingParams.kRounds
+                                     << " spatialMRounds=" << derivedTilingParams.spatialMRounds
+                                     << " spatialNRounds=" << derivedTilingParams.spatialNRounds
+                                     << (derivedTilingParams.autoTiled ? " (auto)" : " (explicit/default)") << "\n";
+                        llvm::outs() << "[TilingLinalg] Memory estimate: "
+                                     << computeWorkingSet(tileM_eff, tileN_eff, tileK_eff) << " bytes"
+                                     << " (A=" << tileM_eff * tileK_eff * elementBytes
+                                     << " B=" << tileK_eff * tileN_eff * elementBytes
+                                     << " C=" << tileM_eff * tileN_eff * elementBytes << ")\n";
                         for (size_t i = 0; i < derivedTilingParams.portParams.size(); ++i) {
                             llvm::outs() << "[TilingLinalg]   port[" << i
                                          << "]: numRounds=" << derivedTilingParams.portParams[i].numRounds
                                          << " bufferSize=" << derivedTilingParams.portParams[i].bufferSize << "\n";
                         }
+
+                        // Check: total ping-pong buffer requirement vs tile data memory
+                        {
+                            uint32_t totalBufBytes = 0;
+                            for (size_t i = 0; i < derivedTilingParams.portParams.size(); i++) {
+                                auto &pp = derivedTilingParams.portParams[i];
+                                auto &pt = parsedTensors[i];
+                                int ppDepth = pt.pingPong > 0 ? pt.pingPong : 2;
+                                int elemBytes = pt.elementBitWidth / 8;
+                                if (elemBytes <= 0)
+                                    elemBytes = 1;
+                                totalBufBytes += ppDepth * pp.bufferSize * elemBytes;
+                            }
+                            std::string errMsg;
+                            if (!hwResForMemCheck->checkDataMemoryFits(totalBufBytes, &errMsg)) {
+                                llvm::errs() << "[TilingLinalg] ERROR: " << errMsg << "\n";
+                                for (size_t i = 0; i < derivedTilingParams.portParams.size(); i++) {
+                                    auto &pp = derivedTilingParams.portParams[i];
+                                    auto &pt = parsedTensors[i];
+                                    int ppDepth = pt.pingPong > 0 ? pt.pingPong : 2;
+                                    int elemBytes = pt.elementBitWidth / 8;
+                                    if (elemBytes <= 0)
+                                        elemBytes = 1;
+                                    llvm::errs() << "  Port " << i << " (" << pt.varName << "): " << ppDepth << " x "
+                                                 << pp.bufferSize << " x " << elemBytes << " = "
+                                                 << ppDepth * pp.bufferSize * elemBytes << " bytes\n";
+                                }
+                            } else {
+                                llvm::outs() << "[TilingLinalg] Buffer memory check passed: " << totalBufBytes << " / "
+                                             << hwResForMemCheck->getUsableDataBytes() << " bytes\n";
+                            }
+                        }
+
+                        // K-round shape adjustment removed: function args now keep full
+                        // DDR tensor shapes ({M,K}/{K,N}/{M,N}).  K-round slicing is
+                        // handled entirely by module attributes (routing.effective_k,
+                        // routing.full_k, routing.k_rounds) consumed by downstream passes.
                     }
 
                     // ---- Store MeshKernelDesc for multi-kernel support ----
@@ -1696,8 +1914,10 @@ public:
 						}
 						std::string args = SourceCodeString.substr(argsOpenParen + 1, argsEnd - argsOpenParen - 1);
 
-						// Build replacement: __aie_launch("funcName", meshVar, args)
-						std::string replacement = "__aie_launch(\"" + funcName + "\", " + meshVar + ", " + args + ")";
+                        // Build replacement: __aie_launch("funcName", meshVar, args)
+                        // Note: byte sizes are injected later in EndSourceFileAction
+                        // (post-AST) when parsedMeshKernels is populated.
+                        std::string replacement = "__aie_launch(\"" + funcName + "\", " + meshVar + ", " + args + ")";
 
 						// Replace from funcEnd to argsEnd+1 (include closing paren)
 						SourceCodeString.replace(funcEnd, argsEnd + 1 - funcEnd, replacement);
@@ -1762,6 +1982,9 @@ public:
                     ret += "  Flow    merge_order  = Flow::Default;\n";
                     ret += "  int     pp_depth     = 2;\n";
                     ret += "  int     max_buffer_bytes = 4096;\n";
+                    ret += "  int     tile_m       = 0;\n";
+                    ret += "  int     tile_n       = 0;\n";
+                    ret += "  int     tile_k       = 0;\n";
                     ret += "};\n";
                     ret += "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
                     // Built-in query function stubs — Clang parses these but the compiler
@@ -1770,11 +1993,29 @@ public:
                     ret += "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
                     ret += "constexpr int get_tile_rows() { return 0; }\n";
                     ret += "constexpr int get_tile_cols() { return 0; }\n";
+                    ret += "constexpr int get_data_row() { return 0; }\n";
+                    ret += "constexpr int get_data_col() { return 0; }\n";
                     ret += "constexpr int get_k_dim() { return 0; }\n";
+                    ret += "constexpr int get_tile_m() { return 0; }\n";
+                    ret += "constexpr int get_tile_n() { return 0; }\n";
+                    ret += "constexpr int get_effective_k() { return 0; }\n";
+                    ret += "constexpr int get_k_rounds() { return 0; }\n";
+                    ret += "constexpr int get_spatial_m_rounds() { return 0; }\n";
+                    ret += "constexpr int get_spatial_n_rounds() { return 0; }\n";
                     ret += "}\n";
                     ret += "struct aiePartition {\n";
                     ret += "    int startCol, endCol, startRow, endRow;\n";
                     ret += "};\n";
+                    // Forward declarations needed by aieArray::partition()/alloc()/free()/synchronizecpu()
+                    ret += "struct XAie_DevInst;\n";
+                    ret += "extern \"C\" XAie_DevInst *__Runtime_init_mesh_partition(int meshId, int startCol, int "
+                           "numCols);\n";
+                    ret += "extern \"C\" XAie_DevInst *__Runtime_get_partition_dev(int meshId);\n";
+                    ret += "extern \"C\" void *__Runtime_alloc_buffer(XAie_DevInst *dev, __SIZE_TYPE__ size_bytes);\n";
+                    ret += "extern \"C\" void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);\n";
+                    ret +=
+                        "extern \"C\" void __Runtime_sync_for_cpu(XAie_DevInst *dev, void *ptr, __SIZE_TYPE__ size);\n";
+                    ret += "extern \"C\" void __Runtime_teardown_all();\n";
                     // New programming model types: aieMesh + aieArray
                     ret += "struct aieMesh {\n";
                     ret += "    int rows, cols;\n";
@@ -1783,10 +2024,17 @@ public:
                     ret += "};\n";
                     ret += "struct aieArray {\n";
                     ret += "    int nextMeshId = 0;\n";
+                    ret += "    XAie_DevInst* _dev = nullptr;\n";
                     ret += "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
-                    ret += "        return aieMesh{rows, cols, p, nextMeshId++};\n";
+                    ret += "        int meshId = nextMeshId++;\n";
+                    ret += "        _dev = __Runtime_init_mesh_partition(meshId, p.startCol, p.endCol - p.startCol + "
+                           "1);\n";
+                    ret += "        return aieMesh{rows, cols, p, meshId};\n";
                     ret += "    }\n";
-                    ret += "    void synchronize() {}\n";
+                    ret += "    void* alloc(__SIZE_TYPE__ size) { return __Runtime_alloc_buffer(_dev, size); }\n";
+                    ret += "    void free(void* ptr) { __Runtime_free_buffer(_dev, ptr); }\n";
+                    ret += "    void synchronizecpu(void* ptr, __SIZE_TYPE__ size) { __Runtime_sync_for_cpu(_dev, ptr, "
+                           "size); }\n";
                     ret += "};\n";
                     // Backward-compatible aieDim
                     ret += "struct aieDim {\n";
@@ -1887,7 +2135,17 @@ public:
 
 		void EndSourceFileAction() override {
 			//  std::cout << "---------EndSourceFileAction---------" << std::endl;
-			 const RewriteBuffer *RewriteBuf = TheRewriter.getRewriteBufferFor(TheRewriter.getSourceMgr().getMainFileID());
+
+            // Stop immediately if Clang reported any compilation errors.
+            // Running the MLIR pipeline on an erroneous AST produces misleading output.
+            if (getCompilerInstance().getDiagnostics().hasErrorOccurred()) {
+                llvm::errs() << "\n=========================================================\n"
+                             << "Error: source file has compilation errors. Stopping.\n"
+                             << "=========================================================\n";
+                return;
+            }
+
+             const RewriteBuffer *RewriteBuf = TheRewriter.getRewriteBufferFor(TheRewriter.getSourceMgr().getMainFileID());
 			 if (RewriteBuf) {
 				 //RewriteBuf->write(llvm::outs());
         //llvm::outs() << "Rewritten Source Code:\n" << RewriteBuf << "\n";
@@ -1908,6 +2166,101 @@ public:
                     llvm::raw_string_ostream rso(userRewrittenSource);
                     RewriteBuf->write(rso);
                     rso.flush();
+                }
+
+                // Post-process userRewrittenSource: inject byte sizes into __aie_launch() calls.
+                // The <<<>>> rewriter ran in BeginSourceFileAction (before AST visit), so
+                // parsedMeshKernels was empty at that time and no sizes were injected.
+                // Now parsedMeshKernels is populated, so we can do it.
+                if (!userRewrittenSource.empty() && !parsedMeshKernels.empty()) {
+                    size_t searchPos = 0;
+                    while ((searchPos = userRewrittenSource.find("__aie_launch(", searchPos)) != std::string::npos) {
+                        // Find the opening paren of __aie_launch(
+                        size_t openParen = searchPos + strlen("__aie_launch");
+                        // Find matching close paren
+                        int depth = 1;
+                        size_t pos = openParen + 1;
+                        while (depth > 0 && pos < userRewrittenSource.size()) {
+                            if (userRewrittenSource[pos] == '(')
+                                depth++;
+                            if (userRewrittenSource[pos] == ')')
+                                depth--;
+                            if (depth > 0)
+                                pos++;
+                        }
+                        // Extract full arg string between parens
+                        std::string allArgs = userRewrittenSource.substr(openParen + 1, pos - openParen - 1);
+
+                        // Split by commas respecting nested parens
+                        auto splitComma = [](const std::string &s) -> std::vector<std::string> {
+                            std::vector<std::string> result;
+                            int d = 0;
+                            size_t start = 0;
+                            for (size_t j = 0; j < s.size(); ++j) {
+                                if (s[j] == '(')
+                                    d++;
+                                else if (s[j] == ')')
+                                    d--;
+                                else if (s[j] == ',' && d == 0) {
+                                    std::string a = s.substr(start, j - start);
+                                    size_t b = a.find_first_not_of(" \t\n\r");
+                                    size_t e = a.find_last_not_of(" \t\n\r");
+                                    if (b != std::string::npos)
+                                        result.push_back(a.substr(b, e - b + 1));
+                                    start = j + 1;
+                                }
+                            }
+                            std::string a = s.substr(start);
+                            size_t b = a.find_first_not_of(" \t\n\r");
+                            size_t e = a.find_last_not_of(" \t\n\r");
+                            if (b != std::string::npos)
+                                result.push_back(a.substr(b, e - b + 1));
+                            return result;
+                        };
+                        std::vector<std::string> args = splitComma(allArgs);
+
+                        // args[0] = kernel name string, args[1] = mesh variable, args[2..] = user args
+                        // Extract kernel name from the quoted string literal (strip quotes)
+                        if (args.size() >= 3) {
+                            std::string kernelLit = args[0];
+                            // Remove surrounding quotes: "matmul" -> matmul
+                            size_t q1 = kernelLit.find('"');
+                            size_t q2 = kernelLit.rfind('"');
+                            std::string kernelName;
+                            if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1)
+                                kernelName = kernelLit.substr(q1 + 1, q2 - q1 - 1);
+
+                            const MeshKernelDesc *mkdPtr = nullptr;
+                            for (auto &mk : parsedMeshKernels) {
+                                if (mk.kernelName == kernelName) {
+                                    mkdPtr = &mk;
+                                    break;
+                                }
+                            }
+
+                            if (mkdPtr) {
+                                unsigned numPtrArgs = (unsigned)mkdPtr->tensors.size();
+                                // Rebuild the call with interleaved sizes
+                                std::string newCall = "__aie_launch(" + args[0] + ", " + args[1];
+                                for (unsigned ai = 2; ai < args.size(); ++ai) {
+                                    newCall += ", " + args[ai];
+                                    unsigned tensorIdx = ai - 2;
+                                    if (tensorIdx < numPtrArgs) {
+                                        int64_t bytes = 1;
+                                        for (auto dim : mkdPtr->tensors[tensorIdx].shape)
+                                            bytes *= dim;
+                                        bytes *= mkdPtr->tensors[tensorIdx].elementBitWidth / 8;
+                                        newCall += ", (size_t)" + std::to_string(bytes);
+                                    }
+                                }
+                                newCall += ")";
+                                userRewrittenSource.replace(searchPos, pos + 1 - searchPos, newCall);
+                                searchPos += newCall.size();
+                                continue;
+                            }
+                        }
+                        searchPos = pos + 1;
+                    }
                 }
 
                 // Derive AIE generation string from the Clang preprocessor's AIE_GEN macro
@@ -1962,6 +2315,31 @@ public:
                     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, mkd.tensors, splitModel,
                                                                        mkd.partition, aieGenStr);
 
+                    // Set K-round module attributes for downstream DMA passes
+                    if (mkd.derivedParams.valid && mkd.derivedParams.kRounds > 1) {
+                        mlir::OpBuilder attrBuilder(&ctx);
+                        module->setAttr("routing.effective_k",
+                                        attrBuilder.getI64IntegerAttr(mkd.derivedParams.effectiveK));
+                        module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kRounds));
+                        module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kDim));
+                        module->setAttr("routing.tile_m", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileM));
+                        module->setAttr("routing.tile_rows", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileRows));
+                        module->setAttr("routing.m_rounds",
+                                        attrBuilder.getI64IntegerAttr(mkd.derivedParams.spatialMRounds));
+                        module->setAttr("routing.tile_n", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileN));
+                        module->setAttr("routing.tile_cols", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileCols));
+                        module->setAttr("routing.n_rounds",
+                                        attrBuilder.getI64IntegerAttr(mkd.derivedParams.spatialNRounds));
+                        llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
+                                     << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
+                                     << " full_k=" << mkd.derivedParams.kDim << " tile_m=" << mkd.derivedParams.tileM
+                                     << " tile_rows=" << mkd.derivedParams.tileRows
+                                     << " m_rounds=" << mkd.derivedParams.spatialMRounds
+                                     << " tile_n=" << mkd.derivedParams.tileN
+                                     << " tile_cols=" << mkd.derivedParams.tileCols
+                                     << " n_rounds=" << mkd.derivedParams.spatialNRounds << "\n";
+                    }
+
                     // Replace aie::get_*() calls in kernel body with computed integer literals
                     std::string resolvedBody = mkd.kernelBody;
                     if (mkd.derivedParams.valid && !resolvedBody.empty()) {
@@ -2013,9 +2391,28 @@ public:
                                 pos += replacement.size();
                             }
                         };
-                        replaceSimpleCall("aie::get_tile_rows()", mkd.derivedParams.tileRows);
-                        replaceSimpleCall("aie::get_tile_cols()", mkd.derivedParams.tileCols);
+                        replaceSimpleCall("aie::get_tile_rows()", mkd.derivedParams.tileM > 0
+                                                                      ? mkd.derivedParams.tileM
+                                                                      : mkd.derivedParams.tileRows);
+                        replaceSimpleCall("aie::get_tile_cols()", mkd.derivedParams.tileN > 0
+                                                                      ? mkd.derivedParams.tileN
+                                                                      : mkd.derivedParams.tileCols);
+                        replaceSimpleCall("aie::get_data_row()", mkd.derivedParams.tileRows);
+                        replaceSimpleCall("aie::get_data_col()", mkd.derivedParams.tileCols);
                         replaceSimpleCall("aie::get_k_dim()", mkd.derivedParams.kDim);
+                        // Two-level tiling query functions
+                        replaceSimpleCall("aie::get_tile_m()", mkd.derivedParams.tileM > 0
+                                                                   ? mkd.derivedParams.tileM
+                                                                   : mkd.derivedParams.tileRows);
+                        replaceSimpleCall("aie::get_tile_n()", mkd.derivedParams.tileN > 0
+                                                                   ? mkd.derivedParams.tileN
+                                                                   : mkd.derivedParams.tileCols);
+                        replaceSimpleCall("aie::get_effective_k()", mkd.derivedParams.effectiveK > 0
+                                                                        ? mkd.derivedParams.effectiveK
+                                                                        : mkd.derivedParams.kDim);
+                        replaceSimpleCall("aie::get_k_rounds()", mkd.derivedParams.kRounds);
+                        replaceSimpleCall("aie::get_spatial_m_rounds()", mkd.derivedParams.spatialMRounds);
+                        replaceSimpleCall("aie::get_spatial_n_rounds()", mkd.derivedParams.spatialNRounds);
                     }
 
                     // Prepend user macros to kernel body
@@ -2071,19 +2468,32 @@ public:
                     stream << "  Flow    merge_order  = Flow::Default;\n";
                     stream << "  int     pp_depth     = 2;\n";
                     stream << "  int     max_buffer_bytes = 4096;\n";
+                    stream << "  int     tile_m       = 0;\n";
+                    stream << "  int     tile_n       = 0;\n";
+                    stream << "  int     tile_k       = 0;\n";
                     stream << "};\n";
                     stream << "template<typename T, SpatialPolicy P> struct port { using type = T; };\n";
                     stream << "template<typename T> constexpr int get_num_rounds(T) { return 0; }\n";
                     stream << "template<typename T> constexpr int get_buffer_size(T) { return 0; }\n";
                     stream << "constexpr int get_tile_rows() { return 0; }\n";
                     stream << "constexpr int get_tile_cols() { return 0; }\n";
+                    stream << "constexpr int get_data_row() { return 0; }\n";
+                    stream << "constexpr int get_data_col() { return 0; }\n";
                     stream << "constexpr int get_k_dim() { return 0; }\n";
+                    stream << "constexpr int get_tile_m() { return 0; }\n";
+                    stream << "constexpr int get_tile_n() { return 0; }\n";
+                    stream << "constexpr int get_effective_k() { return 0; }\n";
+                    stream << "constexpr int get_k_rounds() { return 0; }\n";
+                    stream << "constexpr int get_spatial_m_rounds() { return 0; }\n";
+                    stream << "constexpr int get_spatial_n_rounds() { return 0; }\n";
                     stream << "}\n";
                     // aiePartition struct
                     stream << "struct aiePartition {\n";
                     stream << "    int startCol, endCol, startRow, endRow;\n";
                     stream << "};\n";
                     // aieMesh + aieArray
+                    // Note: XAie_DevInst, __Runtime_explicit_init, __Runtime_alloc_buffer,
+                    // __Runtime_free_buffer are already declared via #include "aie_runtime.h"
                     stream << "struct aieMesh {\n";
                     stream << "    int rows, cols;\n";
                     stream << "    aiePartition partition;\n";
@@ -2091,10 +2501,17 @@ public:
                     stream << "};\n";
                     stream << "struct aieArray {\n";
                     stream << "    int nextMeshId = 0;\n";
+                    stream << "    XAie_DevInst* _dev = nullptr;\n";
                     stream << "    aieMesh partition(aiePartition p, int rows, int cols) {\n";
-                    stream << "        return aieMesh{rows, cols, p, nextMeshId++};\n";
+                    stream << "        int meshId = nextMeshId++;\n";
+                    stream << "        _dev = __Runtime_init_mesh_partition(meshId, p.startCol, p.endCol - p.startCol "
+                              "+ 1);\n";
+                    stream << "        return aieMesh{rows, cols, p, meshId};\n";
                     stream << "    }\n";
-                    stream << "    void synchronize() { /* no-op: each <<<mesh>>> call does its own teardown */ }\n";
+                    stream << "    void* alloc(size_t size) { return __Runtime_alloc_buffer(_dev, size); }\n";
+                    stream << "    void free(void* ptr) { __Runtime_free_buffer(_dev, ptr); }\n";
+                    stream << "    void synchronizecpu(void* ptr, size_t size) { __Runtime_sync_for_cpu(_dev, ptr, "
+                              "size); }\n";
                     stream << "};\n";
                     // aieDim (backward compat)
                     stream << "struct aieDim {\n";
@@ -2124,27 +2541,46 @@ public:
                             maxDdrArgs = mkd.numHostDdrArgs;
                     }
 
+                    // Helper: emit XAie_MemSyncForDevVAddr calls for ALL buffers before DMA.
+                    // On ARM (baremetal), SyncForDev flushes+invalidates cache lines, which is
+                    // needed for outputs too: dirty cache lines (e.g. zeroed output buffer) must
+                    // be flushed and invalidated BEFORE DMA writes results to DDR, otherwise a
+                    // post-DMA invalidate (clean+invalidate) would flush stale zeros over the
+                    // DMA results. No post-launch sync is needed.
+                    auto emitSyncCalls = [](llvm::raw_fd_ostream &os, const MeshKernelDesc &mkd,
+                                            const std::string &indent, bool beforeLaunch) {
+                        if (!beforeLaunch)
+                            return; // no post-launch sync needed on ARM
+                        unsigned limit = mkd.numHostDdrArgs;
+                        if (limit > mkd.tensors.size())
+                            limit = mkd.tensors.size();
+                        for (unsigned i = 0; i < limit; ++i) {
+                            os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
+                        }
+                    };
+
                     // Emit unified __aie_launch with strcmp dispatch (aieMesh overload)
                     if (maxDdrArgs > 0) {
                         stream << "inline void __aie_launch(const char* kernel, aieMesh mesh";
                         for (unsigned i = 0; i < maxDdrArgs; ++i)
-                            stream << ", void* _t" << i;
+                            stream << ", void* _t" << i << ", size_t _s" << i;
                         stream << ", ...) {\n";
+                        stream << "    XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);\n";
                         for (size_t ki = 0; ki < parsedMeshKernels.size(); ++ki) {
                             auto &mkd = parsedMeshKernels[ki];
                             std::string hostFunc = "host_canonicalized_" + mkd.kernelName;
                             stream << "    " << (ki == 0 ? "if" : "} else if") << " (strcmp(kernel, \""
                                    << mkd.kernelName << "\") == 0) {\n";
-                            stream
-                                << "        XAie_DevInst* dev = __Runtime_explicit_init_partition("
-                                << "mesh.partition.startCol, mesh.partition.endCol - mesh.partition.startCol + 1);\n";
                             stream << "        __Runtime_set_kernel_elf(_binary_kernel_" << mkd.kernelName
                                    << "_start);\n";
+                            // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
+                            emitSyncCalls(stream, mkd, "        ", /*beforeLaunch=*/true);
                             stream << "        " << hostFunc << "(dev";
                             for (unsigned i = 0; i < mkd.numHostDdrArgs; ++i)
                                 stream << ", _t" << i;
                             stream << ");\n";
-                            stream << "        __Runtime_explicit_teardown(dev);\n";
+                            // No post-launch sync needed (cache lines already invalidated)
+                            emitSyncCalls(stream, mkd, "        ", /*beforeLaunch=*/false);
                         }
                         stream << "    }\n";
                         stream << "}\n";
@@ -2152,7 +2588,7 @@ public:
                         // aieDim overload (backward compat)
                         stream << "inline void __aie_launch(const char* kernel, aieDim mesh";
                         for (unsigned i = 0; i < maxDdrArgs; ++i)
-                            stream << ", void* _t" << i;
+                            stream << ", void* _t" << i << ", size_t _s" << i;
                         stream << ", ...) {\n";
                         stream << "    (void)kernel;\n";
                         stream << "    XAie_DevInst* dev;\n";
@@ -2164,13 +2600,17 @@ public:
                         stream << "    }\n";
                         // aieDim only supports single kernel (backward compat) — dispatch first kernel
                         if (!parsedMeshKernels.empty()) {
-                            std::string hostFunc = "host_canonicalized_" + parsedMeshKernels[0].kernelName;
-                            stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << parsedMeshKernels[0].kernelName
-                                   << "_start);\n";
+                            auto &mkd0 = parsedMeshKernels[0];
+                            std::string hostFunc = "host_canonicalized_" + mkd0.kernelName;
+                            stream << "    __Runtime_set_kernel_elf(_binary_kernel_" << mkd0.kernelName << "_start);\n";
+                            // Flush+invalidate ALL buffers (inputs AND outputs) before DMA
+                            emitSyncCalls(stream, mkd0, "    ", /*beforeLaunch=*/true);
                             stream << "    " << hostFunc << "(dev";
-                            for (unsigned i = 0; i < parsedMeshKernels[0].numHostDdrArgs; ++i)
+                            for (unsigned i = 0; i < mkd0.numHostDdrArgs; ++i)
                                 stream << ", _t" << i;
                             stream << ");\n";
+                            // No post-launch sync needed (cache lines already invalidated)
+                            emitSyncCalls(stream, mkd0, "    ", /*beforeLaunch=*/false);
                         }
                         stream << "    __Runtime_explicit_teardown(dev);\n";
                         stream << "}\n";
@@ -2178,18 +2618,15 @@ public:
                         // No DDR args variant (template)
                         stream << "template<typename... Args>\n";
                         stream << "inline void __aie_launch(const char* kernel, aieMesh mesh, Args... args) {\n";
+                        stream << "    XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);\n";
                         for (size_t ki = 0; ki < parsedMeshKernels.size(); ++ki) {
                             auto &mkd = parsedMeshKernels[ki];
                             std::string hostFunc = "host_canonicalized_" + mkd.kernelName;
                             stream << "    " << (ki == 0 ? "if" : "} else if") << " (strcmp(kernel, \""
                                    << mkd.kernelName << "\") == 0) {\n";
-                            stream
-                                << "        XAie_DevInst* dev = __Runtime_explicit_init_partition("
-                                << "mesh.partition.startCol, mesh.partition.endCol - mesh.partition.startCol + 1);\n";
                             stream << "        __Runtime_set_kernel_elf(_binary_kernel_" << mkd.kernelName
                                    << "_start);\n";
                             stream << "        " << hostFunc << "(dev);\n";
-                            stream << "        __Runtime_explicit_teardown(dev);\n";
                         }
                         stream << "    }\n";
                         stream << "}\n";
@@ -2237,6 +2674,31 @@ public:
                 auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel,
                                                                    parsedPartition, aieGenStr);
 
+                // Set K-round module attributes for downstream DMA passes
+                if (derivedTilingParams.valid && derivedTilingParams.kRounds > 1) {
+                    mlir::OpBuilder attrBuilder(&ctx);
+                    module->setAttr("routing.effective_k",
+                                    attrBuilder.getI64IntegerAttr(derivedTilingParams.effectiveK));
+                    module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(derivedTilingParams.kRounds));
+                    module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(derivedTilingParams.kDim));
+                    module->setAttr("routing.tile_m", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileM));
+                    module->setAttr("routing.tile_rows", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileRows));
+                    module->setAttr("routing.m_rounds",
+                                    attrBuilder.getI64IntegerAttr(derivedTilingParams.spatialMRounds));
+                    module->setAttr("routing.tile_n", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileN));
+                    module->setAttr("routing.tile_cols", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileCols));
+                    module->setAttr("routing.n_rounds",
+                                    attrBuilder.getI64IntegerAttr(derivedTilingParams.spatialNRounds));
+                    llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
+                                 << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds
+                                 << " full_k=" << derivedTilingParams.kDim << " tile_m=" << derivedTilingParams.tileM
+                                 << " tile_rows=" << derivedTilingParams.tileRows
+                                 << " m_rounds=" << derivedTilingParams.spatialMRounds
+                                 << " tile_n=" << derivedTilingParams.tileN
+                                 << " tile_cols=" << derivedTilingParams.tileCols
+                                 << " n_rounds=" << derivedTilingParams.spatialNRounds << "\n";
+                }
+
                 // Replace aie::get_*() calls in kernel body with computed integer literals
                 if (derivedTilingParams.valid && !singleKernelBody.empty()) {
                     llvm::outs() << "[TilingLinalg] Replacing aie::get_*() calls in kernel body\n";
@@ -2283,9 +2745,28 @@ public:
                             pos += replacement.size();
                         }
                     };
-                    replaceSimpleCall("aie::get_tile_rows()", derivedTilingParams.tileRows);
-                    replaceSimpleCall("aie::get_tile_cols()", derivedTilingParams.tileCols);
+                    replaceSimpleCall("aie::get_tile_rows()", derivedTilingParams.tileM > 0
+                                                                  ? derivedTilingParams.tileM
+                                                                  : derivedTilingParams.tileRows);
+                    replaceSimpleCall("aie::get_tile_cols()", derivedTilingParams.tileN > 0
+                                                                  ? derivedTilingParams.tileN
+                                                                  : derivedTilingParams.tileCols);
+                    replaceSimpleCall("aie::get_data_row()", derivedTilingParams.tileRows);
+                    replaceSimpleCall("aie::get_data_col()", derivedTilingParams.tileCols);
                     replaceSimpleCall("aie::get_k_dim()", derivedTilingParams.kDim);
+                    // Two-level tiling query functions
+                    replaceSimpleCall("aie::get_tile_m()", derivedTilingParams.tileM > 0
+                                                               ? derivedTilingParams.tileM
+                                                               : derivedTilingParams.tileRows);
+                    replaceSimpleCall("aie::get_tile_n()", derivedTilingParams.tileN > 0
+                                                               ? derivedTilingParams.tileN
+                                                               : derivedTilingParams.tileCols);
+                    replaceSimpleCall("aie::get_effective_k()", derivedTilingParams.effectiveK > 0
+                                                                    ? derivedTilingParams.effectiveK
+                                                                    : derivedTilingParams.kDim);
+                    replaceSimpleCall("aie::get_k_rounds()", derivedTilingParams.kRounds);
+                    replaceSimpleCall("aie::get_spatial_m_rounds()", derivedTilingParams.spatialMRounds);
+                    replaceSimpleCall("aie::get_spatial_n_rounds()", derivedTilingParams.spatialNRounds);
                 }
 
                 // Prepend user macros to kernel body for multi-tile path
@@ -2301,8 +2782,8 @@ public:
 
                 // Run pipeline (single kernel — no suffix, no append mode)
                 if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros,
-                                                       singleKernelFuncName, parsedDebugLevel, userRewrittenSource, {},
-                                                       effectiveMaxPPBytes, aieGenStr)) {
+                                                       singleKernelFuncName, parsedDebugLevel, userRewrittenSource,
+                                                       tensors, effectiveMaxPPBytes, aieGenStr)) {
                     llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
                     std::exit(1);
                 }

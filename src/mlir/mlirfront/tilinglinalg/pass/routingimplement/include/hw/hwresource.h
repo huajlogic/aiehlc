@@ -112,6 +112,11 @@ struct AIEDeviceLayout
     std::map<::TileType, std::vector<PortTemplate>> portTemplates;
     std::map<::TileType, TileDmaLimits> dmaLimits;
 
+    // Per-tile data memory limits (core tiles)
+    uint32_t tileMemoryBytes = 65536;   // 64KB total per core tile
+    uint32_t stackReserveBytes = 10240; // 10KB stack reservation
+    uint32_t usableDataBytes = 49152;   // 48KB practical limit for ping-pong buffers
+
     // helpers -------------------------------------------------
     uint64_t tilePhysAddr(uint32_t r, uint32_t c) const
     {
@@ -183,6 +188,28 @@ public:
     /// Single source of truth for the byte-to-word conversion factor
     /// used when IR byte-unit strides are converted to HW word-unit strides.
     virtual uint32_t getDmaWordBytes() const { return 4; }
+
+    // Per-tile data memory limits
+    virtual uint32_t getTileMemoryBytes() const = 0;   // total tile memory (e.g. 64KB)
+    virtual uint32_t getStackReserveBytes() const = 0; // stack reservation (e.g. 10KB)
+    virtual uint32_t getUsableDataBytes() const = 0;   // usable for data buffers (e.g. 48KB)
+
+    /// Check if the total buffer memory requirement fits within tile data memory.
+    /// totalBufferBytes = sum of all ping-pong buffer allocations per core tile.
+    /// Returns true if it fits, false if it exceeds the limit.
+    bool checkDataMemoryFits(uint32_t totalBufferBytes, std::string *errMsg = nullptr) const {
+        uint32_t limit = getUsableDataBytes();
+        if (totalBufferBytes > limit) {
+            if (errMsg) {
+                *errMsg = "Total buffer requirement (" + std::to_string(totalBufferBytes) +
+                          " bytes) exceeds tile data memory limit (" + std::to_string(limit) +
+                          " bytes). Stack=" + std::to_string(getStackReserveBytes()) +
+                          " Total=" + std::to_string(getTileMemoryBytes());
+            }
+            return false;
+        }
+        return true;
+    }
 
     virtual std::string name() const = 0;
 };

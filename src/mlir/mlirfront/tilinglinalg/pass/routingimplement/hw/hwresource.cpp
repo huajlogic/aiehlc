@@ -94,17 +94,22 @@ template<> struct GenTraits<1>
     {
         static const std::unordered_map<std::string, AIEDeviceLayout> db = {
             {"XCVC190",
-             {8,
-              8,
-              0x2000'0000'000,
-              23,
-              18,
-              {{0, 0, TileType::Shim}, {1, 2, TileType::Mem}, {3, 7, TileType::Core}},
-              {2, 3, 6, 7, 10, 11, 18, 19, 26, 27, 34, 35, 42, 43, 46, 47}, // enabled noc shim
-              {3, 7},                                                       // mux
-              {2, 3},                                                       // demux
-              defaultPortTemplates(),
-              defaultDmaLimits()}}};
+             {
+                 8,
+                 8,
+                 0x2000'0000'000,
+                 23,
+                 18,
+                 {{0, 0, TileType::Shim}, {1, 2, TileType::Mem}, {3, 7, TileType::Core}},
+                 {2, 3, 6, 7, 10, 11, 18, 19, 26, 27, 34, 35, 42, 43, 46, 47}, // enabled noc shim
+                 {3, 7},                                                       // mux
+                 {2, 3},                                                       // demux
+                 defaultPortTemplates(),
+                 defaultDmaLimits(),
+                 65536, // tileMemoryBytes (64KB)
+                 10240, // stackReserveBytes (10KB)
+                 49152  // usableDataBytes (48KB)
+             }}};
         return db;
     }
 };
@@ -182,21 +187,26 @@ template<> struct GenTraits<2>
     {
         static const std::unordered_map<std::string, AIEDeviceLayout> db = {
             {"XCVE2802",
-             {11,
-              38,
-              0x2000'0000000,
-              25,
-              20,
-              {
-                  {0, 0, TileType::Shim},
-                  {1, 2, TileType::Mem},
-                  {3, 11, TileType::Core},
-              },
-              {2, 3, 6, 7, 14, 15, 22, 23, 30, 31, 34, 35}, // noc shim support
-              {3, 7},                                       // mux (ext→AIE) - AIE2PS: ports 3,7
-              {1, 3},                                       // demux (AIE→ext) - AIE2PS: ports 1,3
-              defaultPortTemplates(),
-              defaultDmaLimits()}}};
+             {
+                 11,
+                 38,
+                 0x2000'0000000,
+                 25,
+                 20,
+                 {
+                     {0, 0, TileType::Shim},
+                     {1, 2, TileType::Mem},
+                     {3, 11, TileType::Core},
+                 },
+                 {2, 3, 6, 7, 14, 15, 22, 23, 30, 31, 34, 35}, // noc shim support
+                 {3, 7},                                       // mux (ext→AIE) - AIE2PS: ports 3,7
+                 {1, 3},                                       // demux (AIE→ext) - AIE2PS: ports 1,3
+                 defaultPortTemplates(),
+                 defaultDmaLimits(),
+                 65536, // tileMemoryBytes (64KB)
+                 10240, // stackReserveBytes (10KB)
+                 49152  // usableDataBytes (48KB)
+             }}};
         return db;
     }
 };
@@ -279,37 +289,47 @@ template <> struct GenTraits<5> {
     static const std::unordered_map<std::string, AIEDeviceLayout> &table() {
         static const std::unordered_map<std::string, AIEDeviceLayout> db = {
             {"PALMYRA",
-             {7,  // rows: shim(0) + mem(1-2) + core(3-6)
-              12, // columns
-              0x2000'0000'000,
-              25,
-              20,
-              {
-                  {0, 0, TileType::Shim},
-                  {1, 2, TileType::Mem},
-                  {3, 6, TileType::Core},
-              },
-              allColumnsNoc(12), // all 12 shim tiles are ShimNOC
-              {3, 7},            // mux (ext→AIE)
-              {1, 3},            // demux (AIE→ext)
-              defaultPortTemplates(),
-              defaultDmaLimits()}},
+             {
+                 7,  // rows: shim(0) + mem(1-2) + core(3-6)
+                 12, // columns
+                 0x2000'0000'000,
+                 25,
+                 20,
+                 {
+                     {0, 0, TileType::Shim},
+                     {1, 2, TileType::Mem},
+                     {3, 6, TileType::Core},
+                 },
+                 allColumnsNoc(12), // all 12 shim tiles are ShimNOC
+                 {3, 7},            // mux (ext→AIE)
+                 {1, 3},            // demux (AIE→ext)
+                 defaultPortTemplates(),
+                 defaultDmaLimits(),
+                 65536, // tileMemoryBytes (64KB)
+                 10240, // stackReserveBytes (10KB)
+                 49152  // usableDataBytes (48KB)
+             }},
             {"VEK385",
-             {7,  // rows: shim(0) + mem(1-2) + core(3-6)
-              38, // columns
-              0x2000'0000'000,
-              25,
-              20,
-              {
-                  {0, 0, TileType::Shim},
-                  {1, 2, TileType::Mem},
-                  {3, 6, TileType::Core},
-              },
-              allColumnsNoc(38), // all 38 shim tiles are ShimNOC
-              {3, 7},            // mux (ext→AIE)
-              {1, 3},            // demux (AIE→ext)
-              defaultPortTemplates(),
-              defaultDmaLimits()}}};
+             {
+                 7,  // rows: shim(0) + mem(1-2) + core(3-6)
+                 38, // columns
+                 0x2000'0000'000,
+                 25,
+                 20,
+                 {
+                     {0, 0, TileType::Shim},
+                     {1, 2, TileType::Mem},
+                     {3, 6, TileType::Core},
+                 },
+                 allColumnsNoc(38), // all 38 shim tiles are ShimNOC
+                 {3, 7},            // mux (ext→AIE)
+                 {1, 3},            // demux (AIE→ext)
+                 defaultPortTemplates(),
+                 defaultDmaLimits(),
+                 65536, // tileMemoryBytes (64KB)
+                 10240, // stackReserveBytes (10KB)
+                 49152  // usableDataBytes (48KB)
+             }}};
         return db;
     }
 };
@@ -354,6 +374,10 @@ public:
     TileDmaLimits getDmaLimits(TileType type) const override { return layout_.getDmaLimits(type); }
 
     uint32_t getDmaWordBytes() const override { return 4; } // 32-bit DMA word = 4 bytes
+
+    uint32_t getTileMemoryBytes() const override { return layout_.tileMemoryBytes; }
+    uint32_t getStackReserveBytes() const override { return layout_.stackReserveBytes; }
+    uint32_t getUsableDataBytes() const override { return layout_.usableDataBytes; }
 
     const std::unordered_set<uint32_t>& getShimNoc() const override{
         return layout_.getShimNoc();

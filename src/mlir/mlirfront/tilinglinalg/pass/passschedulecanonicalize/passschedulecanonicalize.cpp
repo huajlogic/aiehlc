@@ -86,12 +86,13 @@ struct FoldDuplicateShimBdPattern : public OpRewritePattern<dfschedule::ConfigDm
             return failure();
 
         int32_t dataId = static_cast<int32_t>(op.getDataId());
-        int64_t offset = static_cast<int64_t>(op.getOffset());
         int32_t len = static_cast<int32_t>(op.getLen());
 
-        // bd_id is an SSA i32 value; extract the constant if available.
+        // bd_id and offset are SSA i32 values; extract the constants if available.
         APInt bdIdVal;
         bool hasBdId = matchPattern(op.getBdId(), m_ConstantInt(&bdIdVal));
+        APInt offsetVal;
+        bool hasOffset = matchPattern(op.getOffset(), m_ConstantInt(&offsetVal));
 
         for (Operation &prior : *op->getBlock()) {
             if (&prior == op.getOperation())
@@ -106,9 +107,11 @@ struct FoldDuplicateShimBdPattern : public OpRewritePattern<dfschedule::ConfigDm
                 bool otherHasBdId = matchPattern(other.getBdId(), m_ConstantInt(&otherBdIdVal));
                 if (!hasBdId || !otherHasBdId || bdIdVal != otherBdIdVal)
                     continue;
+                APInt otherOffsetVal;
+                bool otherHasOffset = matchPattern(other.getOffset(), m_ConstantInt(&otherOffsetVal));
                 if (otherTile.getCol() == tileDecl.getCol() && otherTile.getRow() == tileDecl.getRow() &&
-                    static_cast<int32_t>(other.getDataId()) == dataId &&
-                    static_cast<int64_t>(other.getOffset()) == offset && static_cast<int32_t>(other.getLen()) == len) {
+                    static_cast<int32_t>(other.getDataId()) == dataId && hasOffset && otherHasOffset &&
+                    offsetVal == otherOffsetVal && static_cast<int32_t>(other.getLen()) == len) {
                     rewriter.replaceOp(op, other.getBdHandle());
                     return success();
                 }

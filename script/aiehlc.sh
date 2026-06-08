@@ -13,7 +13,7 @@ dbg_echo() {
 run_cmd() {
     local command="$1"
     if [ "$DEBUG_OUTPUT" = 0 ]; then
-        $command > /dev/null 2>&1
+        $command > /dev/null
     else
         $command
     fi
@@ -88,6 +88,7 @@ build_hw_lib() {
 
 
 main() {
+set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AIEHLC_DIR="${SCRIPT_DIR}/../"
 runtime_source_file=""
@@ -276,35 +277,43 @@ echo -e "    ${runtime_source_file}\n"
 #Convert the host&kernel merged source code
 # Add the source file's directory to include path so relative includes resolve
 SOURCE_DIR="$(cd "$(dirname "${runtime_source_file}")" && pwd)"
-set -x
+AIEHLC_ERRLOG=$(mktemp /tmp/aiehlc_err.XXXXXX)
 if [[ "$use_llvm_aie" == "true" ]]; then
+    dbg_echo "+ $LD_SO --library-path ${LIB_PATH}:${LIB_BASE_PATH} ${AIEHLC} --use-llvm-aie --extra-arg=-DAIE_GEN=${aie_version} ... ${runtime_source_file} --"
     "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" --use-llvm-aie --extra-arg="-DAIE_GEN=${aie_version}" \
         --extra-arg="-D__AIE_ARCH__=${AIE_ARCH_MACRO}" \
         --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
         --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
         --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
         --extra-arg="-I${SOURCE_DIR}" --extra-arg="-I${AIEHLC_DIR}/src/mlir/runtime" \
-        ${runtime_source_file} --
+        ${runtime_source_file} -- 2> >(tee "$AIEHLC_ERRLOG" >&2)
     AIEHLC_RC=$?
 else
+    dbg_echo "+ $LD_SO --library-path ${LIB_PATH}:${LIB_BASE_PATH} ${AIEHLC} --extra-arg=-DAIE_GEN=${aie_version} ... ${runtime_source_file} --"
     "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" --extra-arg="-DAIE_GEN=${aie_version}" \
         --extra-arg="-D__AIE_ARCH__=${AIE_ARCH_MACRO}" \
         --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
         --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
         --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
         --extra-arg="-I${SOURCE_DIR}" --extra-arg="-I${AIEHLC_DIR}/src/mlir/runtime" \
-        ${runtime_source_file} --
+        ${runtime_source_file} -- 2> >(tee "$AIEHLC_ERRLOG" >&2)
     AIEHLC_RC=$?
 fi
-set +x
 if [ $AIEHLC_RC -ne 0 ]; then
     echo ""
     echo "==========================================================="
     echo "Error: aiehlc code generation failed (exit code $AIEHLC_RC)."
-    echo "Check the output above for details (e.g. RoutingHWVerifyPass errors)."
     echo "==========================================================="
+    if [ -s "$AIEHLC_ERRLOG" ]; then
+        echo ""
+        echo "--- Error details ---"
+        cat "$AIEHLC_ERRLOG"
+        echo "--- End of error details ---"
+    fi
+    rm -f "$AIEHLC_ERRLOG"
     return $AIEHLC_RC
 fi
+rm -f "$AIEHLC_ERRLOG"
 HOST_BUILD_DIR=$(pwd)/aout/
 mkdir -p $HOST_BUILD_DIR
 
@@ -315,6 +324,13 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
 
     # Copy worklocal files to the unitest worklocal dir for hostcompile.sh
     UNITEST_WORKLOCAL="${AIEHLC_DIR}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal"
+
+    # Clean stale kernel/BCF/PRX files that may conflict with current pipeline output
+    rm -f "${UNITEST_WORKLOCAL}"/kernel_*.cc
+    rm -f "${UNITEST_WORKLOCAL}"/kernel.cc
+    rm -f "${UNITEST_WORKLOCAL}"/aieml*.bcf
+    rm -f "${UNITEST_WORKLOCAL}"/aieml*.prx
+
     cp -f "${HOST_BUILD_DIR}/worklocal/host.cc" "${UNITEST_WORKLOCAL}/host.cc"
     # Copy kernel.cc (single-kernel) or kernel_*.cc (multi-kernel)
     if [ -f "${HOST_BUILD_DIR}/worklocal/kernel.cc" ]; then
@@ -349,6 +365,10 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     # Also copy headers directly from SOURCE_DIR to ensure freshness
     # (guards against stale copies from aiehlc output)
     for f in "${SOURCE_DIR}"/*.h; do
+        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
+    done
+    # Copy JSON analysis files (provenance_map.json, etc.)
+    for f in "${HOST_BUILD_DIR}"/worklocal/*.json; do
         [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
     done
 
@@ -409,7 +429,7 @@ while IFS= read -r kernel_source_file; do
         compile_args+=(--debug-output)
     fi
 
-    "source" "$SCRIPT_DIR/kc.sh" "${compile_args[@]}"
+    source "$SCRIPT_DIR/kc.sh" "${compile_args[@]}"
 done < "$kernel_list_file"
 
 #Compile host
@@ -439,10 +459,10 @@ echo "Linking kernels..."
 echo "    ${temp_obj_files[@]}"
 # opt_flags="-O2"
 opt_flags="-Os"
-set -x
 if [[ "$platform" == "baremetal" ]]; then
     dbg_echo ${TOOL_PREFIX}g++ $opt_flags -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
     ${TOOL_PREFIX}g++ $opt_flags -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
+    GPP_RC=$?
 elif [[ "$platform" == "linux" ]]; then
     dbg_echo ${TOOL_PREFIX}g++ $opt_flags -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
         -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I${AIE_DRIVER_DIR}/include -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime \
@@ -454,8 +474,15 @@ elif [[ "$platform" == "linux" ]]; then
         -L${AIE_DRIVER_DIR}/src -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -L$AIE_DRIVER_PARENT_DIR/aie-rt/driver/src/  \
         -o $HOST_BUILD_DIR/main.elf $host_file ${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c ${temp_obj_files[@]} \
         -Wl,--start-group,-lxaiengine,-lxil,--end-group
+    GPP_RC=$?
 fi
-set +x
+if [ ${GPP_RC:-1} -ne 0 ]; then
+    echo ""
+    echo "==========================================================="
+    echo "Error: host g++ compilation failed (exit code ${GPP_RC})."
+    echo "==========================================================="
+    return ${GPP_RC}
+fi
 echo "Stripping extra ELF symbols..."
 ${TOOL_PREFIX}strip $HOST_BUILD_DIR/main.elf
 

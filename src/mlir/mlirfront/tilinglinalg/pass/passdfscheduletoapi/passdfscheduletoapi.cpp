@@ -4,6 +4,7 @@
 ******************************************************************************/
 
 #include "passdfscheduletoapi.h"
+#include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
@@ -459,10 +460,6 @@ struct AllocDeviceMemInnerPattern : public OpConversionPattern<dfschedule::Alloc
 
         rewriter.create<emitc::CallOpaqueOp>(loc, voidPtrType, "memcpy", nullptr, nullptr,
                                              ValueRange{vaddr.getResult(0), dataPtr, sizeConst.getResult()});
-
-        // Track allocation for cleanup
-        rewriter.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "__Runtime_track_alloc", nullptr, nullptr,
-                                             ValueRange{memInst.getResult(0)});
 
         rewriter.replaceOp(op, vaddr.getResult(0));
         return success();
@@ -1133,16 +1130,15 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
     LogicalResult matchAndRewrite(dfschedule::ConfigDmaBdOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
         auto loc = op.getLoc();
-        
-        // Get attributes
-        int32_t offset = op.getOffset();
+
+        // Get attributes (offset is now an SSA Value operand, not an attribute)
         int32_t len = op.getLen();
         bool enablePacket = op.getEnablePacket();
         int32_t packetId = op.getPacketId();
         int32_t nextBd = static_cast<int32_t>(op.getNextBd()); // signed cast: sentinel 0xFFFFFFFF (-1) means no next BD
 
-        llvm::errs() << "[Pattern] ConfigDmaBd called (offset=" << offset << ", len=" << len
-                     << ", enable_packet=" << enablePacket << ", packet_id=" << packetId << ")\n";
+        llvm::errs() << "[Pattern] ConfigDmaBd called (len=" << len << ", enable_packet=" << enablePacket
+                     << ", packet_id=" << packetId << ")\n";
 
         // Get operands
         Value buffer = adaptor.getBuffer();
@@ -1222,18 +1218,16 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                 op.getBdId().getDefiningOp<arith::ConstantOp>()
                     ? mlir::cast<IntegerAttr>(op.getBdId().getDefiningOp<arith::ConstantOp>().getValue()).getInt()
                     : -1) +
-            ", offset=" + std::to_string(offset) + ", len=" + std::to_string(len) +
-            ", enable_packet=" + (enablePacket ? "true" : "false") + ", packet_id=" + std::to_string(packetId) +
-            ", next_bd=" + std::to_string(nextBd) + ", acquire_lock_id=" + std::to_string(acquireLockId) +
+            ", len=" + std::to_string(len) + ", enable_packet=" + (enablePacket ? "true" : "false") +
+            ", packet_id=" + std::to_string(packetId) + ", next_bd=" + std::to_string(nextBd) +
+            ", acquire_lock_id=" + std::to_string(acquireLockId) +
             ", acquire_lock_val=" + std::to_string(acquireLockVal) +
             ", release_lock_id=" + std::to_string(releaseLockId) +
             ", release_lock_val=" + std::to_string(releaseLockVal) + ", ooo_bd_id=" + std::to_string(outOfOrderBdId) +
             " */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
-        
+
         // Create constants for parameters
-        auto offsetConst = rewriter.create<emitc::ConstantOp>(
-            loc, i32Type, rewriter.getI32IntegerAttr(offset));
         auto lenConst = rewriter.create<emitc::ConstantOp>(
             loc, i32Type, rewriter.getI32IntegerAttr(len));
         auto nextBdConst = rewriter.create<emitc::ConstantOp>(
@@ -1257,14 +1251,23 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
         }
 
         // Apply byte offset to buffer pointer for shim/DDR addressing.
-        // This bakes the per-BD offset into the pointer so the runtime
-        // sees distinct DDR addresses for each BD slice.
-        if (offset != 0) {
+        // offset is now an SSA Value; check if it's a known-zero constant to skip the call.
+        Value offset = adaptor.getOffset();
+        bool isZeroOffset = false;
+        if (auto constOp = offset.getDefiningOp<emitc::ConstantOp>()) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                isZeroOffset = intAttr.getInt() == 0;
+        }
+        if (auto constOp = offset.getDefiningOp<arith::ConstantOp>()) {
+            if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                isZeroOffset = intAttr.getInt() == 0;
+        }
+        if (!isZeroOffset) {
             auto i64Type = rewriter.getIntegerType(64);
-            auto offsetVal = rewriter.create<emitc::ConstantOp>(loc, i64Type, rewriter.getIntegerAttr(i64Type, offset));
+            auto offsetI64 = rewriter.create<emitc::CastOp>(loc, i64Type, offset);
             auto offsetPtr =
                 rewriter.create<emitc::CallOpaqueOp>(loc, voidPtrType, "__runtime_buffer_offset", nullptr, nullptr,
-                                                     ValueRange{bufferVoidPtr, offsetVal.getResult()});
+                                                     ValueRange{bufferVoidPtr, offsetI64.getResult()});
             bufferVoidPtr = offsetPtr.getResult(0);
         }
 
@@ -1414,13 +1417,15 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
             llvm::errs() << "  ✓ Created DMA BD config with full AIE API parameters\n";
         }
 
-        // For core tiles with ping-pong buffer (acquire_lock_id >= 0, next_bd >= 0),
+        // For core tiles with lock-based DMA (acquire_lock_val != 0),
         // emit XAie_LockSetValue to initialize locks.
-        // Input (S2MM on core): DMA acquires lock 0, init lock 0 = 2 (buffers ready for DMA)
+        // Input (S2MM on core): DMA acquires lock 0, init lock 0 = N (N buffers ready for DMA)
         // Output (MM2S on core): DMA acquires lock 1 (swapped in BlueprintToSchedule),
-        //   init lock 0 = 2 (kernel can write) and lock 1 = 0 (no data yet, default)
+        //   init lock 0 = N (kernel can write to N buffers) and lock 1 = 0 (no data yet, default)
+        // N = 1 for single-buffer (pp_depth=1), N = 2 for ping-pong (pp_depth>=2).
         // Only emitted once per (tile, lock_id) to avoid duplicate calls.
-        if (acquireLockId >= 0 && nextBd >= 0) {
+        // Gate on acquireLockVal != 0 to exclude shim BDs (which don't use locks).
+        if (acquireLockId >= 0 && acquireLockVal != 0) {
             int32_t tileCol = -1, tileRow = -1;
             if (auto declareTileOp = op.getTile().getDefiningOp<dfschedule::DeclareTileOp>()) {
                 tileCol = declareTileOp.getCol();
@@ -1454,33 +1459,43 @@ struct ConfigDmaBdInnerPattern : public OpConversionPattern<dfschedule::ConfigDm
                         }
                     }
 
+                    // Determine buffer count for lock init value.
+                    // Single buffer (pp_depth=1): init=1; ping-pong (pp_depth>=2): init=2.
+                    // Detect single-buffer mode by checking next_bd: if next_bd==-1 (no chaining),
+                    // and there's no linked_bd, it's a single-buffer flow.
+                    int32_t nextBdVal = static_cast<int32_t>(op.getNextBd());
+                    bool isSingleBuffer = (nextBdVal == -1) && !op.getLinkedBd();
+                    int32_t lockInitValue = isSingleBuffer ? 1 : 2;
+
                     if (isOutput) {
                         // Output (MM2S): BD acquires lock 1 (releaseLockId from kernel perspective).
                         // Lock 1 init = 0 (no data produced yet — DMA waits for kernel).
-                        // Lock 0 init = 2 (kernel can write to both ping/pong buffers).
+                        // Lock 0 init = lockInitValue (kernel can write to buffer(s)).
                         // Lock 1 (DMA's acquire lock) stays at default 0.
                         int32_t kernelAcquireLock = releaseLockId; // lock 0 = BD's release lock
                         auto kernelLockKey = std::make_tuple(tileCol, tileRow, kernelAcquireLock);
                         if (state.initializedLocks.find(kernelLockKey) == state.initializedLocks.end()) {
                             state.initializedLocks.insert(kernelLockKey);
-                            std::string lockComment = "/* Lock init: tile(" + std::to_string(tileCol) + "," +
-                                                      std::to_string(tileRow) +
-                                                      ") lock=" + std::to_string(kernelAcquireLock) +
-                                                      " init_value=2 (kernel output acquire) */";
+                            std::string lockComment =
+                                "/* Lock init: tile(" + std::to_string(tileCol) + "," + std::to_string(tileRow) +
+                                ") lock=" + std::to_string(kernelAcquireLock) +
+                                " init_value=" + std::to_string(lockInitValue) + " (kernel output acquire) */";
                             rewriter.create<emitc::VerbatimOp>(loc, lockComment);
                             std::string lockSetCall = "XAie_LockSetValue(dev, XAie_TileLoc(" + std::to_string(tileCol) +
                                                       ", " + std::to_string(tileRow) + "), XAie_LockInit(" +
-                                                      std::to_string(kernelAcquireLock) + ", 2));";
+                                                      std::to_string(kernelAcquireLock) + ", " +
+                                                      std::to_string(lockInitValue) + "));";
                             rewriter.create<emitc::VerbatimOp>(loc, lockSetCall);
-                            llvm::errs() << "  ✓ Emitted XAie_LockSetValue for tile(" << tileCol << "," << tileRow
-                                         << ") lock=" << kernelAcquireLock << " init=2 (kernel output acquire)\n";
+                            llvm::errs() << "  Emitted XAie_LockSetValue for tile(" << tileCol << "," << tileRow
+                                         << ") lock=" << kernelAcquireLock << " init=" << lockInitValue
+                                         << " (kernel output acquire)\n";
                         }
                         // DMA acquire lock (lock 1) init = 0 (default, no explicit init needed)
-                        llvm::errs() << "  ✓ Output flow: DMA acquire lock " << acquireLockId
+                        llvm::errs() << "  Output flow: DMA acquire lock " << acquireLockId
                                      << " init=0 (default, skipped)\n";
                     } else {
-                        // Input (S2MM): DMA acquires lock 0, init = 2 (ping-pong ready)
-                        int32_t initValue = 2;
+                        // Input (S2MM): DMA acquires lock 0, init = lockInitValue
+                        int32_t initValue = lockInitValue;
                         std::string lockComment = "/* Lock init: tile(" + std::to_string(tileCol) + "," +
                                                   std::to_string(tileRow) + ") lock=" + std::to_string(acquireLockId) +
                                                   " init_value=" + std::to_string(initValue) + " */";
@@ -3076,7 +3091,6 @@ void DfscheduleToApiPass::runOnOperation() {
     
     // ConfigDmaBdOp must run before ConfigCreateIoOp (benefit = 50)
     innerPatterns.add<ConfigDmaBdInnerPattern>(typeConverter, ctx, state, /*benefit=*/50);
-    
     // GetBdIdOp allocates BD IDs and should run with medium priority (benefit = 30)
     innerPatterns.add<GetBdIdInnerPattern>(typeConverter, ctx, state, /*benefit=*/30);
     
@@ -3139,6 +3153,7 @@ void DfscheduleToApiPass::runOnOperation() {
     innerTarget.addIllegalOp<dfschedule::LoadKernelGroupOp>();
     innerTarget.addIllegalOp<dfschedule::ConfigCreateIoOp>();
     innerTarget.addIllegalOp<dfschedule::ConfigDmaBdOp>();  // Converted in Phase 3 with proper benefits
+
     innerTarget.addIllegalOp<dfschedule::DeclareTileOp>();
     // NOTE: LaunchHostOp is handled in Phase 4, not here
     // innerTarget.addIllegalOp<dfschedule::LaunchHostOp>();
@@ -3347,7 +3362,70 @@ void DfscheduleToApiPass::runOnOperation() {
             llvm::errs() << "[Pass] Warning: Some arith.constant ops could not be converted in phase 4.5\n";
         }
     }
-    
+
+    //==========================================================================
+    // Phase 4.55: Convert arith ops inside scf.for → emitc, then scf.for → emitc.for
+    //==========================================================================
+    llvm::errs() << "[Pass] Phase 4.55: Converting scf.for → emitc.for\n";
+
+    {
+        // Step 1: Manually convert arith ops inside scf.for bodies to emitc equivalents.
+        // These survived Phase 3/4.5 because arith dialect was marked legal (only arith.constant
+        // was selectively made illegal). We convert arith.index_cast → emitc.cast,
+        // arith.muli → emitc.mul, and arith.addi → emitc.add so the emitc.for region
+        // verifier accepts the body.
+        OpBuilder b(ctx);
+        moduleOp.walk([&](scf::ForOp forOp) {
+            // Walk the for body and convert arith.index_cast → emitc.cast
+            SmallVector<arith::IndexCastOp> castOps;
+            forOp.getBody()->walk([&](arith::IndexCastOp op) { castOps.push_back(op); });
+            for (auto castOp : castOps) {
+                b.setInsertionPoint(castOp);
+                auto result = b.create<emitc::CastOp>(castOp.getLoc(), castOp.getResult().getType(), castOp.getIn());
+                castOp.replaceAllUsesWith(result.getResult());
+                castOp.erase();
+            }
+
+            // Walk the for body and convert arith.muli → emitc.mul
+            SmallVector<arith::MulIOp> mulOps;
+            forOp.getBody()->walk([&](arith::MulIOp op) { mulOps.push_back(op); });
+            for (auto mulOp : mulOps) {
+                b.setInsertionPoint(mulOp);
+                auto result =
+                    b.create<emitc::MulOp>(mulOp.getLoc(), mulOp.getResult().getType(), mulOp.getLhs(), mulOp.getRhs());
+                mulOp.replaceAllUsesWith(result.getResult());
+                mulOp.erase();
+            }
+
+            // Walk the for body and convert arith.addi → emitc.add
+            SmallVector<arith::AddIOp> addOps;
+            forOp.getBody()->walk([&](arith::AddIOp op) { addOps.push_back(op); });
+            for (auto addOp : addOps) {
+                b.setInsertionPoint(addOp);
+                auto result =
+                    b.create<emitc::AddOp>(addOp.getLoc(), addOp.getResult().getType(), addOp.getLhs(), addOp.getRhs());
+                addOp.replaceAllUsesWith(result.getResult());
+                addOp.erase();
+            }
+        });
+
+        // Step 2: Convert scf.for → emitc.for using upstream SCFToEmitC patterns.
+        RewritePatternSet scfPatterns(ctx);
+        mlir::populateSCFToEmitCConversionPatterns(scfPatterns);
+
+        ConversionTarget scfTarget(*ctx);
+        scfTarget.addLegalDialect<emitc::EmitCDialect>();
+        scfTarget.addLegalDialect<func::FuncDialect>();
+        scfTarget.addLegalDialect<arith::ArithDialect>();
+        scfTarget.addLegalDialect<bufferization::BufferizationDialect>();
+        scfTarget.addLegalDialect<memref::MemRefDialect>();
+        scfTarget.addIllegalDialect<scf::SCFDialect>();
+
+        if (failed(applyPartialConversion(moduleOp, scfTarget, std::move(scfPatterns)))) {
+            llvm::errs() << "[Pass] Warning: SCF-to-EmitC conversion had issues\n";
+        }
+    }
+
     //==========================================================================
     // Phase 4.6: Remove remaining unconverted ops and orphaned unrealized casts
     //==========================================================================

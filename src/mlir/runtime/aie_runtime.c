@@ -88,32 +88,7 @@ static int __bd_is_shim(uint8_t tt) { return (tt == XAIEGBL_TILE_TYPE_SHIMNOC ||
 #define BD_TRACK_MAX 64
 static BdTrackEntry g_bd_track[BD_TRACK_MAX];
 static int g_bd_track_count = 0;
-
-/* ---------------------------------------------------------------------------
- * Allocation tracking for PartitionTensor strided-slice allocations
- * __Runtime_extract_slice_strided_2d allocates via XAie_MemAllocate;
- * we track those here so __Runtime_free_all_allocs can release them.
- * ----------------------------------------------------------------------- */
-#define ALLOC_LIST_MAX_SIZE 256
-static XAie_MemInst *g_alloc_mem_list[ALLOC_LIST_MAX_SIZE];
-static int g_alloc_mem_count = 0;
-static bool g_dumped_done = false;
-
-void __Runtime_track_alloc(XAie_MemInst *mem) {
-    if (g_alloc_mem_count < ALLOC_LIST_MAX_SIZE) {
-        g_alloc_mem_list[g_alloc_mem_count++] = mem;
-    }
-}
-
-void __Runtime_free_all_allocs(void) {
-    for (int i = 0; i < g_alloc_mem_count; i++) {
-        if (g_alloc_mem_list[i]) {
-            XAie_MemFree(g_alloc_mem_list[i]);
-            g_alloc_mem_list[i] = NULL;
-        }
-    }
-    g_alloc_mem_count = 0;
-}
+static int g_dumped_done = 0;
 
 /* ---------------------------------------------------------------------------
  * Kernel log reader: reads the last 2KB of core tile data memory where
@@ -213,7 +188,7 @@ void __Runtime_free(void *ptr) {
         printf("\n");
     }
     if (AIE_DEBUG_LEVEL(g_runtime_debug_level) >= 1 && !g_dumped_done) {
-        g_dumped_done = true;
+        g_dumped_done = 1;
         printf("[aie_runtime] BD tracking dump (%d entries):\n", g_bd_track_count);
         for (int i = 0; i < g_bd_track_count; i++) {
             BdTrackEntry *e = &g_bd_track[i];
@@ -251,6 +226,63 @@ void __Runtime_memcpy(void *dst, const void *src, size_t bytes) {
     printf("\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * DMA-capable buffer allocation and VAddr-based sync/free.
+ * The driver tracks vaddr → MemInst mappings internally; no buffer registry
+ * is needed on the runtime side.
+ * ----------------------------------------------------------------------- */
+
+void *__Runtime_alloc_buffer(XAie_DevInst *dev, size_t size_bytes) {
+    if (!dev) {
+        printf("[aie_runtime] ERROR: alloc_buffer called with dev=NULL. "
+               "Call partition() before alloc().\n");
+        return NULL;
+    }
+    XAie_MemInst *mem = XAie_MemAllocate(dev, size_bytes, XAIE_MEM_CACHEABLE);
+    if (!mem) {
+        printf("[aie_runtime] alloc_buffer: XAie_MemAllocate(%zu) failed\n", size_bytes);
+        return NULL;
+    }
+    void *vaddr = XAie_MemGetVAddr(mem);
+    printf("[aie_runtime] alloc_buffer(%zu) = %p (mem=%p)\n", size_bytes, vaddr, (void *)mem);
+    return vaddr;
+}
+
+void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr) {
+    if (!ptr)
+        return;
+    if (!dev) {
+        printf("[aie_runtime] ERROR: free_buffer called with dev=NULL\n");
+        return;
+    }
+    AieRC rc = XAie_MemFreeVAddr(dev, ptr);
+    printf("[aie_runtime] free_buffer(%p) via XAie_MemFreeVAddr rc=%d\n", ptr, rc);
+}
+
+void __Runtime_free_all_allocs(void) {
+    printf("[aie_runtime] free_all_allocs: no-op (VAddr mode, driver tracks allocations)\n");
+}
+
+void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size) {
+    if (dev) {
+        AieRC rc = XAie_MemSyncForDevVAddr(dev, ptr, (uint64_t)size);
+        printf("[aie_runtime] sync_for_dev(%p, %zu) via VAddr rc=%d\n", ptr, size, rc);
+    } else {
+        Xil_DCacheFlushRange((UINTPTR)ptr, size);
+        printf("[aie_runtime] sync_for_dev(%p, %zu) via DCacheFlushRange\n", ptr, size);
+    }
+}
+
+void __Runtime_sync_for_cpu(XAie_DevInst *dev, void *ptr, size_t size) {
+    if (dev) {
+        AieRC rc = XAie_MemSyncForCPUVAddr(dev, ptr, (uint64_t)size);
+        printf("[aie_runtime] sync_for_cpu(%p, %zu) via VAddr rc=%d\n", ptr, size, rc);
+    } else {
+        Xil_DCacheInvalidateRange((UINTPTR)ptr, size);
+        printf("[aie_runtime] sync_for_cpu(%p, %zu) via DCacheInvalidateRange\n", ptr, size);
+    }
+}
+
 /* Active kernel ELF pointer — set by __Runtime_set_kernel_elf() before load_kernel_group.
  * In single-kernel mode, host.cc declares the extern and calls set_kernel_elf once.
  * In multi-kernel mode, each __aie_launch dispatch calls set_kernel_elf with the
@@ -262,12 +294,12 @@ void __Runtime_set_kernel_elf(unsigned char *elf_start) { s_active_kernel_elf = 
 /**
  */
 void __Runtime_platform_init(void) {
-    // Flush all dirty cache lines to DDR BEFORE disabling cache.
-    // User data (malloc'd A, B, C arrays) may have been written with cache enabled,
-    // so dirty lines must be written back to physical DDR before DMA can read them.
-    Xil_DCacheFlush();
-    Xil_DCacheDisable();
-    Xil_ICacheDisable();
+    // Flush any pre-existing dirty cache lines to DDR.
+    // Cache stays ENABLED — per-buffer sync (__Runtime_sync_for_dev/cpu)
+    // handles coherency at launch time instead of globally disabling DCache.
+    // Xil_DCacheFlush();
+    // Xil_DCacheDisable();
+    // Xil_ICacheDisable();
 }
 
 void __Runtime_init(void) {
@@ -541,6 +573,20 @@ void __Runtime_register_partition(int meshId, XAie_DevInst *dev) {
     g_partition_registry_count++;
     printf("[aie_runtime] register_partition meshId=%d dev=%p (total=%d)\n", meshId, (void *)dev,
            g_partition_registry_count);
+}
+
+XAie_DevInst *__Runtime_init_mesh_partition(int meshId, int startCol, int numCols) {
+    if (__Runtime_partition_is_initialized(meshId)) {
+        return __Runtime_get_partition_dev(meshId);
+    }
+    XAie_DevInst *dev = __Runtime_explicit_init_partition(startCol, numCols);
+    if (!dev) {
+        printf("[aie_runtime] ERROR: init_mesh_partition failed meshId=%d startCol=%d numCols=%d\n", meshId, startCol,
+               numCols);
+        return NULL;
+    }
+    __Runtime_register_partition(meshId, dev);
+    return dev;
 }
 
 void __Runtime_teardown_all(void) {

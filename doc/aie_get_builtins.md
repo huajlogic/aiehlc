@@ -10,8 +10,10 @@ The `aie::get_num_rounds()`, `aie::get_buffer_size()`, `aie::get_tile_rows()`, `
 |----------|-----------|---------|
 | `aie::get_num_rounds(win)` | A port parameter (e.g. `win_a`) | Number of DMA input/output rounds for that port |
 | `aie::get_buffer_size(win)` | A port parameter | Elements transferred per round |
-| `aie::get_tile_rows()` | None | Output rows per tile (`M / HW_ROWS`) |
-| `aie::get_tile_cols()` | None | Output cols per tile (`N / HW_COLS`) |
+| `aie::get_tile_rows()` | None | Sub-tile rows (`tile_m`, falls back to `M / HW_ROWS` if unset) |
+| `aie::get_tile_cols()` | None | Sub-tile cols (`tile_n`, falls back to `N / HW_COLS` if unset) |
+| `aie::get_data_row()` | None | Partition rows per tile (`M / HW_ROWS`) |
+| `aie::get_data_col()` | None | Partition cols per tile (`N / HW_COLS`) |
 | `aie::get_k_dim()` | None | Inner product dimension `K` |
 
 ## Example Usage
@@ -43,6 +45,8 @@ namespace aie {
     template<typename T> constexpr int get_buffer_size(T) { return 0; }
     constexpr int get_tile_rows() { return 0; }
     constexpr int get_tile_cols() { return 0; }
+    constexpr int get_data_row() { return 0; }
+    constexpr int get_data_col() { return 0; }
     constexpr int get_k_dim() { return 0; }
 }
 ```

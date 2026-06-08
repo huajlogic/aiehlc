@@ -4,8 +4,10 @@
 ******************************************************************************/
 #include "../passblueprinttoschedule/passblueprinttoschedule.h"
 #include "../passblueprinttoschedulekernel/passblueprinttoschedulekernel.h"
+#include "../passdfscheduleprovenancemap/passdfscheduleprovenancemap.h"
 #include "../passdfscheduletoapi/passdfscheduletoapi.h"
 #include "../passdfscheduletokernelapi/passdfscheduletokernelapi.h"
+#include "../passdmaphopprovenancemap/passdmaphopprovenancemap.h"
 #include "../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.h"
 #include "../passdmaphoptoroutinghw/passdmaphoptoroutinghw.h"
 #include "../passdmaptodmaphop/dmaptodmaphop.h"
@@ -15,7 +17,6 @@
 #include "dfschedulemanager.h"
 #include "dmaphopmanager.h"
 #include "dmapmanager.h"
-#include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "routinghwlower.h"
 #include "routinghwmanager.h"
@@ -114,6 +115,7 @@ static bool runSinglePass(MLIRContext &ctx, mlir::ModuleOp module, std::unique_p
 // Unit test function to verify path contiguity for RoutingLowerPass
 // Global AIE generation string, set from --gen CLI argument
 static std::string g_aieGen = "Gen2";
+static int g_outputPpDepth = 2; // pp_depth for output tensor (default: 2 = ping-pong)
 
 void testRoutingLowerPassPathContiguity() {
     std::cout << "\n=== Testing RoutingLowerPass Path Contiguity ===" << std::endl;
@@ -1029,11 +1031,20 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
     TilingLinalgPipeline::registerDialects(ctx);
 
     // Default tensor config for GEMM: 2 inputs + 1 output
+    // Use 64x64 matrices to match simplematmul2.cc (tile_m=8 sub-tiling)
     std::vector<TensorParam> tensors = {
-        {{16, 16}, 8, true},  // input A (window_in_0)
-        {{16, 16}, 8, true},  // input B (window_in_1)
-        {{16, 16}, 8, false}, // output C (window_out_0)
+        {{64, 64}, 8, true},  // input A (window_in_0)
+        {{64, 64}, 8, true},  // input B (window_in_1)
+        {{64, 64}, 8, false}, // output C (window_out_0)
     };
+
+    // Build SplitModel with per-tensor pp_depth from CLI
+    SplitModel splitModel = SplitModel::gemm();
+    // Override output tensor's pp_depth from CLI --output-pp-depth
+    if (g_outputPpDepth != 2 && splitModel.tensorSplits.size() >= 3) {
+        splitModel.tensorSplits[2].pingPong = g_outputPpDepth;
+        std::cout << "Output tensor pp_depth overridden to " << g_outputPpDepth << std::endl;
+    }
 
     // Create module: either parse from file or build programmatically
     mlir::OwningOpRef<mlir::ModuleOp> parsedModule;
@@ -1044,7 +1055,28 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         module = *parsedModule;
         std::cout << "Parsed module from " << irFilepath << std::endl;
     } else {
-        module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors);
+        module = TilingLinalgPipeline::buildRoutingIR(ctx, 4, 4, tensors, splitModel);
+    }
+
+    // Set routing module attributes for M/N sub-tiling (matching simplematmul2.cc)
+    // These are normally set by aiehlc.cc from SpatialPolicy, but buildRoutingIR
+    // doesn't set them. For 64x64 matmul on 4x4 mesh with tile_m=8, tile_k=16:
+    //   tileRows = 64/4 = 16, tileCols = 64/4 = 16
+    //   tileM = 8 (sub-tile), tileN = 8 (sub-tile)
+    //   effectiveK = 16, fullK = 64, kRounds = 4
+    //   mRounds = tileRows/tileM = 2, nRounds = tileCols/tileN = 2
+    if (irFilepath.empty()) {
+        mlir::OpBuilder attrB(&ctx);
+        module->setAttr("routing.tile_m", attrB.getI64IntegerAttr(8));
+        module->setAttr("routing.tile_rows", attrB.getI64IntegerAttr(16));
+        module->setAttr("routing.tile_n", attrB.getI64IntegerAttr(8));
+        module->setAttr("routing.tile_cols", attrB.getI64IntegerAttr(16));
+        module->setAttr("routing.effective_k", attrB.getI64IntegerAttr(16));
+        module->setAttr("routing.full_k", attrB.getI64IntegerAttr(64));
+        module->setAttr("routing.k_rounds", attrB.getI64IntegerAttr(4));
+        module->setAttr("routing.m_rounds", attrB.getI64IntegerAttr(2));
+        module->setAttr("routing.n_rounds", attrB.getI64IntegerAttr(2));
+        module->setAttr("routing.iter_policy", attrB.getStringAttr("m_outer_n_inner"));
     }
 
     // When startStage==0 and using the default pipeline, delegate to
@@ -1100,6 +1132,14 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         if (!runSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage,
                            "DmapToDmaphopPass"))
             return;
+        // Generate provenance map JSON after dmaphop IR is available
+        {
+            std::string worklocalDir = setupWorklocalDir();
+            if (!worklocalDir.empty()) {
+                auto provenancePass = std::make_unique<DmaphopProvenanceMapPass>(worklocalDir);
+                runSinglePass(ctx, module, std::move(provenancePass), irDir, stage, "DmaphopProvenanceMapPass");
+            }
+        }
     }
     if (startStage <= 3) {
         if (!runSinglePass(ctx, module, std::make_unique<DmaphopTodfscheblueprintPass>(), irDir, stage,
@@ -1132,6 +1172,28 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
         ResourceMgr::init(std::move(hwRes));
     }
 
+    // Pre-pipeline memory check: validate buffer requirements fit in tile data memory
+    {
+        auto hwResCheck = makeResource(g_aieGen);
+        uint32_t usableBytes = hwResCheck->getUsableDataBytes();
+        // Conservative estimate: each tensor needs ppDepth * maxPingPongBytes (4096 default)
+        uint32_t maxPingPongBytes = 4096;
+        uint32_t totalBufferBytes = 0;
+        for (const auto &tp : tensors) {
+            int ppDepth = 2; // default
+            totalBufferBytes += ppDepth * maxPingPongBytes;
+        }
+        std::string errMsg;
+        if (!hwResCheck->checkDataMemoryFits(totalBufferBytes, &errMsg)) {
+            llvm::errs() << "[unitest] ERROR: Memory budget exceeded!\n"
+                         << "  " << errMsg << "\n"
+                         << "  numTensors=" << tensors.size() << " maxPingPongBytes=" << maxPingPongBytes << "\n";
+        } else {
+            std::cout << "[unitest] Memory check passed: estimated " << totalBufferBytes << " bytes per tile, limit "
+                      << usableBytes << " bytes" << std::endl;
+        }
+    }
+
     // Phase 2: host path (blueprint -> schedule -> API -> EmitC)
     if (doHostPath) {
         if (startStage <= 4) {
@@ -1143,6 +1205,15 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
             if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::ScheduleCanonicalizePass>(), irDir, stage,
                                "ScheduleCanonicalizePass"))
                 return;
+            // Generate low-level dfschedule provenance map after ScheduleCanonicalizePass
+            {
+                std::string worklocalDir = setupWorklocalDir();
+                if (!worklocalDir.empty()) {
+                    auto dfscheProvenancePass = std::make_unique<DfscheduleProvenanceMapPass>(worklocalDir);
+                    runSinglePass(ctx, hostModule, std::move(dfscheProvenancePass), irDir, stage,
+                                  "DfscheduleProvenanceMapPass");
+                }
+            }
         }
         if (startStage <= 6) {
             if (!runSinglePass(ctx, hostModule, std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true),
@@ -1223,7 +1294,7 @@ void routingtodfschedule(const std::string &irFilepath = "", int startStage = 0)
 
             if (!allocations.empty()) {
                 TilingBcf bcf;
-                bcf.setStack(0x70000, 0x1024);
+                bcf.setStack(0x70000, 0x2800);
                 bcf.addReservedDMB(0x40000, 0x10000);
                 // Reserve the last 2KB of DM for kernel_log.h klog() region
                 // (DM absolute 0x7F800-0x7FFFF = DM offset 0xF800, 0x800 bytes)
@@ -1470,7 +1541,7 @@ void testPartition() {
 }
 
 int main(int argc, char* argv[]) {
-    // Parse --gen argument from anywhere in argv
+    // Parse --gen and --output-pp-depth arguments from anywhere in argv
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--gen" && i + 1 < argc) {
@@ -1480,9 +1551,17 @@ int main(int argc, char* argv[]) {
                 argv[j] = argv[j + 2];
             argc -= 2;
             --i; // re-check this index
+        } else if (a == "--output-pp-depth" && i + 1 < argc) {
+            g_outputPpDepth = std::atoi(argv[i + 1]);
+            for (int j = i; j + 2 < argc; ++j)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            --i;
         }
     }
     std::cout << "AIE generation: " << g_aieGen << std::endl;
+    if (g_outputPpDepth != 2)
+        std::cout << "Output pp_depth: " << g_outputPpDepth << std::endl;
 
     if (argc > 1) {
         std::string arg = argv[1];

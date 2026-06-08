@@ -72,8 +72,12 @@ include_directories(../passdmaphoptodfscheblueprint/)
 include_directories(../passdmaphoptoroutinghw/)
 include_directories(../passdmaptodmaphop/)
 include_directories(../passschedulecanonicalize/)
+include_directories(../passschedulesequentialop/)
+include_directories(../passwaitmerge/)
 include_directories(../passdfscheduletoapi/)
 include_directories(../passdfscheduletokernelapi/)
+include_directories(../passdmaphopprovenancemap/)
+include_directories(../passdfscheduleprovenancemap/)
 include_directories(../kernelconfig/)
 include_directories(../../dataflowmap/dmap/inc/)
 include_directories(../../dataflowmap/dmap/)
@@ -107,8 +111,12 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedulekernel/passblueprinttoschedulekernel.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passschedulecanonicalize/passschedulecanonicalize.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passschedulesequentialop/passschedulesequentialop.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passwaitmerge/passwaitmerge.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdfscheduletoapi/passdfscheduletoapi.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdfscheduletokernelapi/passdfscheduletokernelapi.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphopprovenancemap/passdmaphopprovenancemap.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passdfscheduleprovenancemap/passdfscheduleprovenancemap.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingpath.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/hwresource.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/ResourceManager.cpp
@@ -179,6 +187,7 @@ target_link_libraries(test PUBLIC
 	MLIRMathToLLVM
 			#MLIRROCDLToLLVMIRTranslation
 			#MLIRGPUDialect
+			MLIRSCFToEmitC
 			#MLIRSCFToControlFlow
 			#MLIRIndexToLLVM
 			#MLIRGPUToROCDLTransforms

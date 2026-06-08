@@ -18,7 +18,9 @@
       "Skill(superpowers:subagent-driven-development)",
       "Skill(writing-plans)",
       "Skill(subagent-driven-development)",
-      "Skill(brainstorming)"
+      "Skill(brainstorming)",
+      "WebFetch(domain:gitenterprise.xilinx.com)",
+      "Skill(data-mismatch-debug)"
     ],
     "deny": []
   },

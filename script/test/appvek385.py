@@ -82,7 +82,8 @@ host = f"{username}@{vek385ip}"
 PALBOARD_SCRIPTS_DIR = f"/proj/xsjsswstaff/{username}/palboard_scripts"
 VEK385PDI = f"/home/{username}/aiehlc/vek385.pdi"
 #XSDB_ALT_PATH = "/everest/set_vnc_bkup/vnc/t50/es1/tools/Labtools/9999.0/bin/xsdb"
-XSDB_ALT_PATH = "/proj/xbuilds/SWIP/2025.2_1114_2157/installs/lin64/2025.2/Vitis/bin/xsdb"
+XSDB_ALT_PATH = "/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/Vitis/bin/xsdb"
+VITIS_SETTINGS = "/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/Vitis/settings64.sh"
 
 # Queue to collect console output from second connection
 console_output_queue = queue.Queue()
@@ -290,12 +291,16 @@ def setup_first_connection():
     child.sendline("power 1")
     child.expect(r'Systest[#>]', timeout=60)  # Wait for power cycle to complete
     time.sleep(3)  # Extra wait for board to initialize
-    print("[Connection 1] Power on complete, starting xsdb...")
-    
+    print("[Connection 1] Power on complete, sourcing Vitis and starting xsdb...")
+
+    # Step 5b: Source Vitis environment so xsdb is on PATH
+    child.sendline(f"source {VITIS_SETTINGS}")
+    child.expect(r'Systest[#>]', timeout=30)
+
     # Step 6: Start xsdb (try default first, then alternative path)
     child.sendline("xsdb")
-    index = child.expect([r'xsdb%', r'Unrecognized', pexpect.TIMEOUT], timeout=15)
-    
+    index = child.expect([r'xsdb%', r'command not found', r'Unrecognized', pexpect.TIMEOUT], timeout=15)
+
     if index != 0:
         print("[Connection 1] xsdb not found, trying alternative path...")
         child.sendline(XSDB_ALT_PATH)
