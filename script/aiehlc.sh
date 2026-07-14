@@ -1,7 +1,7 @@
 #!/usr/bin/env bash  
 ###############################################################################
 # Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 ###############################################################################
 
 dbg_echo() {
@@ -20,7 +20,7 @@ run_cmd() {
 }
 
 usage() {
-    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only]"
+    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug]"
     return 1
 }
 
@@ -98,6 +98,7 @@ DEBUG_OUTPUT=0
 platform="baremetal"
 COMPILE_AIELIB_ONLY=0
 USE_LOCAL_AIERT_BSP=0
+PRETTY_DEBUG=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -help)
@@ -130,6 +131,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --aielib-only)
             COMPILE_AIELIB_ONLY=1
+            shift
+            ;;
+        --prettydebug)
+            PRETTY_DEBUG=1
             shift
             ;;
         *)
@@ -322,60 +327,18 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     echo -e "\n[TilingLinalg] Detected multi-tile pipeline output in aout/worklocal/"
     echo "Delegating to hostcompile.sh for tiling mode compilation..."
 
-    # Copy worklocal files to the unitest worklocal dir for hostcompile.sh
-    UNITEST_WORKLOCAL="${AIEHLC_DIR}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal"
+    # Build directly in aout/worklocal/ — no copy to the unitest sandbox.
+    WORKLOCAL_DIR="${HOST_BUILD_DIR}/worklocal"
 
-    # Clean stale kernel/BCF/PRX files that may conflict with current pipeline output
-    rm -f "${UNITEST_WORKLOCAL}"/kernel_*.cc
-    rm -f "${UNITEST_WORKLOCAL}"/kernel.cc
-    rm -f "${UNITEST_WORKLOCAL}"/aieml*.bcf
-    rm -f "${UNITEST_WORKLOCAL}"/aieml*.prx
-
-    cp -f "${HOST_BUILD_DIR}/worklocal/host.cc" "${UNITEST_WORKLOCAL}/host.cc"
-    # Copy kernel.cc (single-kernel) or kernel_*.cc (multi-kernel)
-    if [ -f "${HOST_BUILD_DIR}/worklocal/kernel.cc" ]; then
-        cp -f "${HOST_BUILD_DIR}/worklocal/kernel.cc" "${UNITEST_WORKLOCAL}/kernel.cc"
-    fi
-    for f in "${HOST_BUILD_DIR}"/worklocal/kernel_*.cc; do
-        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
-    done
-    if [ -f "${HOST_BUILD_DIR}/worklocal/routing.cc" ]; then
-        cp -f "${HOST_BUILD_DIR}/worklocal/routing.cc" "${UNITEST_WORKLOCAL}/routing.cc"
-    fi
-    # Copy BCF/PRX files (single-kernel: aieml.bcf, multi-kernel: aieml_*.bcf)
-    for f in "${HOST_BUILD_DIR}"/worklocal/aieml*.bcf; do
-        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
-    done
-    for f in "${HOST_BUILD_DIR}"/worklocal/aieml*.prx; do
-        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
-    done
-    # Copy compute kernel source (any .cc not already copied)
-    for f in "${HOST_BUILD_DIR}"/worklocal/*.cc; do
-        fname="$(basename "$f")"
-        case "$fname" in
-            host.cc|routing.cc) continue ;;
-            kernel.cc|kernel_*.cc) continue ;;
-        esac
-        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/${fname}"
-    done
-    # Copy user headers (.h) so host.cc picks up the latest definitions (e.g. M/K/N)
-    for f in "${HOST_BUILD_DIR}"/worklocal/*.h; do
-        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
-    done
-    # Also copy headers directly from SOURCE_DIR to ensure freshness
-    # (guards against stale copies from aiehlc output)
+    # Copy user headers directly from SOURCE_DIR to ensure freshness
+    # (guards against stale definitions, e.g. M/K/N).
     for f in "${SOURCE_DIR}"/*.h; do
-        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
-    done
-    # Copy JSON analysis files (provenance_map.json, etc.)
-    for f in "${HOST_BUILD_DIR}"/worklocal/*.json; do
-        [ -f "$f" ] && cp -f "$f" "${UNITEST_WORKLOCAL}/$(basename "$f")"
+        [ -f "$f" ] && cp -f "$f" "${WORKLOCAL_DIR}/$(basename "$f")"
     done
 
-    # Run hostcompile.sh
-    export AIE_VERSION="${aie_version}"
-    export PLATFORM="${platform}"
-    bash "${UNITEST_WORKLOCAL}/hostcompile.sh"
+    # Run hostcompile.sh with WORKLOCAL_DIR pointing at aout/worklocal.
+    WORKLOCAL_DIR="${WORKLOCAL_DIR}" AIE_VERSION="${aie_version}" PLATFORM="${platform}" \
+        bash "${AIEHLC_DIR}/script/hostcompile.sh"
     TILING_RC=$?
     if [ $TILING_RC -ne 0 ]; then
         echo "Error: tiling mode compilation failed."
@@ -383,11 +346,38 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     fi
 
     # Copy the built ELF to the standard output location
-    TILING_BUILD_DIR="${UNITEST_WORKLOCAL}/build"
+    TILING_BUILD_DIR="${WORKLOCAL_DIR}/build"
     if [ -f "${TILING_BUILD_DIR}/host" ]; then
         cp -f "${TILING_BUILD_DIR}/host" "${HOST_BUILD_DIR}/main.elf"
         echo "Build complete (tiling mode)."
         echo "    ${HOST_BUILD_DIR}/main.elf"
+    fi
+
+    # Generate the readable schedule view (schedule_view.json + host_schedule.html).
+    # Non-fatal: view generation must never break the build (set -e is active).
+    if [ -f "${WORKLOCAL_DIR}/dfscheduleprovenancemap.json" ] && [ -f "${WORKLOCAL_DIR}/host.cc" ]; then
+        echo "Generating readable schedule view..."
+        if python3 "${AIEHLC_DIR}/src/tool/debug/schedule_view.py" "${WORKLOCAL_DIR}"; then
+            echo "    ${WORKLOCAL_DIR}/host_schedule.html"
+        else
+            echo "    warning: schedule_view.py failed (non-fatal); skipping view."
+        fi
+    fi
+
+    # --prettydebug: launch the live schedule-debug server (stdlib http.server) and
+    # open the browser so the user can deploy/test + inspect tile DMA/core/event status
+    # live. Runs in the foreground for the interactive debug session; Ctrl-C to stop.
+    if [ "$PRETTY_DEBUG" -eq 1 ]; then
+        if [ -f "${WORKLOCAL_DIR}/host_schedule.html" ]; then
+            echo "Launching live schedule-debug server (--prettydebug)..."
+            python3 "${AIEHLC_DIR}/src/tool/debug/schedule_debug_server.py" \
+                "${WORKLOCAL_DIR}" \
+                --elf "${HOST_BUILD_DIR}/main.elf" \
+                --aie-version "${aie_version}" \
+                --open
+        else
+            echo "    warning: --prettydebug requested but host_schedule.html missing; skipping server."
+        fi
     fi
     return 0
 fi
@@ -430,6 +420,21 @@ while IFS= read -r kernel_source_file; do
     fi
 
     source "$SCRIPT_DIR/kc.sh" "${compile_args[@]}"
+    KC_RC=$?
+    if [ $KC_RC -ne 0 ]; then
+        echo ""
+        echo "==========================================================="
+        echo "Error: kernel compilation failed for $func_name (exit code $KC_RC)."
+        echo "==========================================================="
+        return $KC_RC
+    fi
+    if [ ! -f "$obj_file" ]; then
+        echo ""
+        echo "==========================================================="
+        echo "Error: kernel object not produced: $obj_file"
+        echo "==========================================================="
+        return 1
+    fi
 done < "$kernel_list_file"
 
 #Compile host

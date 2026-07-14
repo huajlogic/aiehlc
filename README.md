@@ -80,6 +80,39 @@ source ./script/setup.sh --bsp-use-git-repo=https://path/to/aie-rt.git
 source script/aiehlc.sh --platform linux --aie-version 2 --runtime-source-file tutorial/example.cpp
 ```
 
+## rcom: ROCm/HIP GEMM Front End
+
+`rcom` is a standalone Python front end that reads a canonical ROCm/HIP int8
+GEMM source, recognizes it as a GEMM, and emits a CUDA-style `<name>.cc/.h`
+(the same dialect as `example/tileprogram/ccode/simplematmul2.cc`). It then
+hands the generated `.cc` to the unchanged `script/aiehlc.sh` pipeline to build
+host + kernel ELFs.
+
+```
+matmul_hip.cpp --(rcom.py)--> <name>.cc + <name>.h --(aiehlc.sh)--> aout/main.elf
+```
+
+The HIP kernel body is *recognized and templated* (the proven AIE cache-A /
+stream-B matmul), not translated line-for-line. v1 supports **int8 only** and
+defaults to the HW-validated `M=N=K=256`, `4x4` mesh config; `M/N/K` and mesh
+are overridable but deviations are heuristic (untested on HW) and emit a
+warning.
+
+```bash
+source script/setup.sh
+
+# One-shot: HIP source -> generated .cc/.h -> ELF (aout/main.elf)
+source script/rcom.sh --rocm-source-file example/tileprogram/rocm/matmul_hip.cpp --aie-version 5
+
+# Emit only (no build), e.g. for inspection:
+python3 src/tool/frontend/rcom.py example/tileprogram/rocm/matmul_hip.cpp \
+    --emit-only --out ./gen
+
+# Overrides: kernel name, mesh, dims
+python3 src/tool/frontend/rcom.py example/tileprogram/rocm/matmul_hip.cpp \
+    --name gemm --mesh 4x4 --M 256 --N 256 --K 256 --out ./gen
+```
+
 ## Runtime Debug Level
 
 Control runtime diagnostic verbosity and feature flags from your source file using `#pragma aie_debug_level`:
@@ -113,6 +146,8 @@ The debug level value is a bitfield:
 | Flag | Bit | Value | Behavior |
 |------|-----|-------|----------|
 | `DISABLE_MULTID_DIM_DMA` | 4 | `16` | Suppress multi-dimensional DMA; force linear `__Runtime_dma_bd_config` |
+| `DISABLE_PARTITIONTEARDOWN` | 5 | `32` | Skip `XAie_PartitionTeardown` in `__Runtime_device_teardown` |
+| `AIE_DMA_ISSUE_COUNT` | 7 | `128` | Use `XAie_PartitionInitialize_v2`/`_v2` teardown to arm DMA txn perf counters (whole partition, MM2S ch0) |
 
 ### Examples
 
@@ -123,6 +158,7 @@ The debug level value is a bitfield:
 | `2` | 2 | none | Full diagnostics, multi-dim DMA enabled |
 | `16` | 0 | `DISABLE_MULTID_DIM_DMA` | Silent, multi-dim DMA suppressed |
 | `18` | 2 | `DISABLE_MULTID_DIM_DMA` | Full diagnostics + multi-dim DMA suppressed |
+| `128` | 0 | `AIE_DMA_ISSUE_COUNT` | Silent, DMA txn counters armed via `PartitionInitialize_v2` (MM2S ch0) |
 
 The pragma is detected during preprocessing and emits a strong symbol override of `g_runtime_debug_level` into the generated `host.cc`. The runtime in `aie_runtime.c` defines this variable as a weak symbol with default `0`, so the linker picks the user-specified value when present.
 
@@ -132,7 +168,7 @@ This works for both single-tile (`aiehlc`) and multi-tile (`tilinglinalg`) compi
 
 ### aiediag — Flow-Aware DMA Diagnostic
 
-`aiediag` (`script/aiediag.py`) is a post-deployment diagnostic tool for debugging DMA stalls and data flow issues on live AIE hardware. It reads DMA status registers via `aiedbg`, cross-references them with compile-time provenance JSONs to identify connected tiles and routing paths, and prints an automated diagnosis.
+`aiediag` (`src/tool/debug/aiediag.py`) is a post-deployment diagnostic tool for debugging DMA stalls and data flow issues on live AIE hardware. It reads DMA status registers via `aiedbg`, cross-references them with compile-time provenance JSONs to identify connected tiles and routing paths, and prints an automated diagnosis.
 
 #### When to Use
 
@@ -145,16 +181,16 @@ This works for both single-tile (`aiehlc`) and multi-tile (`tilinglinalg`) compi
 
 ```bash
 # Basic: diagnose MM2S ch0 on logical tile (1,4) with startcol offset 3
-python3 script/aiediag.py dig 1 4 -mm2s0 startcol 3 -dev pal
+python3 src/tool/debug/aiediag.py dig 1 4 -mm2s0 startcol 3 -dev pal
 
 # Dry-run (no HW access, prints what would be read)
-python3 script/aiediag.py dig 1 4 -mm2s0 startcol 3 --dry-run
+python3 src/tool/debug/aiediag.py dig 1 4 -mm2s0 startcol 3 --dry-run
 
 # Specify AIE version and custom JSON directory
-python3 script/aiediag.py dig 0 3 -s2mm1 --aie-version 2ps --json-dir ./my_worklocal
+python3 src/tool/debug/aiediag.py dig 0 3 -s2mm1 --aie-version 2ps --json-dir ./my_worklocal
 
 # Custom shim events JSON location
-python3 script/aiediag.py dig 0 0 -mm2s0 --shim-events-json /path/to/shimtile_events.json -dev pal
+python3 src/tool/debug/aiediag.py dig 0 0 -mm2s0 --shim-events-json /path/to/shimtile_events.json -dev pal
 ```
 
 #### Arguments
@@ -176,8 +212,8 @@ python3 script/aiediag.py dig 0 0 -mm2s0 --shim-events-json /path/to/shimtile_ev
 
 The tool runs 7 steps in sequence:
 
-1. **DMA Status** — Read the queried tile's DMA status register (running/idle/stalled, stall cause, current BD, queue size)
-2. **BD Chain** — Show the buffer descriptor chain from JSON (BD IDs, lengths, locks, ping-pong, packet IDs, repeat count)
+1. **DMA Status** — Read the queried tile's DMA status register (running/idle/stalled, stall cause, current BD, queue size). For core tiles (row != 0), also decode memory-module DMA start/finish/error events for all 4 channels and any active core-module error events.
+2. **BD Chain** — Show the buffer descriptor chain from JSON (BD IDs, lengths, locks, ping-pong, packet IDs, repeat count), the total intended data volume (sum of BD lengths × repeat), and an intended-vs-real comparison of each BD's `Buffer_Length` read back from hardware (`OK` / `MISMATCH` / `hw not configured`)
 3. **Connected Tiles** — Use the flow summary to find all senders/receivers in the same data flow
 4. **Connected Tile DMA Status** — Read DMA status registers of all connected tiles
 4b. **Shim Event Status** — For shim tiles (row=0), read hardware event status registers to determine whether DMA start/finish/stall events have fired
@@ -252,6 +288,106 @@ Key DMA event IDs used by aiediag (all in the shim PL event status registers at 
 
 The `~/aiejson/` directory also contains event JSONs for other tile types (`core_events.json`, `memtile_events.json`) and register address maps (`aie2ps*.json`). If `shimtile_events.json` is missing, aiediag prints a warning and skips the shim event check; all other diagnostic steps still run.
 
+### schedule_debug_server — Live Schedule View + Debug/Test Daemon
+
+`schedule_debug_server` (`src/tool/debug/schedule_debug_server.py`) is a
+zero-dependency local daemon (stdlib `http.server`, bound to `127.0.0.1`) that turns
+the static `host_schedule.html` schedule view into a live debug/test console. It serves
+the enhanced HTML, exposes JSON endpoints, imports `aiediag.py` as a library for register
+offsets/decoders/provenance, and orchestrates `apppaltest.py`. Design rationale:
+[doc/design/live_debug_framework.md](doc/design/live_debug_framework.md).
+
+It lets you, from a single browser page:
+
+1. **Run the test** — deploy the compiled ELF via `apppaltest.py -nonreboot` and watch the
+   console + pass/fail/hang verdict.
+2. **Live overlay** — poll each tile's **DMA / core / event** status and colorize the grid
+   in near real time (switchable tabs, ~2s interval).
+3. **Per-tile console** — click a tile and issue whitelisted read-only ops
+   (`dma`, `core`, `event`, `pc`, `reg <off>`) to inspect its registers.
+
+When the daemon is not running, opening `host_schedule.html` from disk still works — it
+degrades gracefully to the static offline schedule view (live controls become inert).
+
+#### Quickest path: `--prettydebug`
+
+Add `--prettydebug` to the tiling build and the server launches automatically (and opens
+your browser) once the schedule view is generated:
+
+```bash
+source script/aiehlc.sh --aie-version 5 \
+  --runtime-source-file ./example/tileprogram/ccode/simplematmul.cc --prettydebug
+```
+
+This runs the full flow, then serves `aout/worklocal/host_schedule.html` live. Ctrl-C
+stops the server.
+
+#### Manual launch
+
+```bash
+# Live reads (grid overlay + per-tile /cmd) need a JTAG target. Set it once:
+export AIEDBG_TARGET=xsdb://10.23.224.213:3121   # or pass --target below
+
+# Serve an existing worklocal (must contain host_schedule.html + provenance JSONs)
+python3 src/tool/debug/schedule_debug_server.py aout/worklocal --open
+
+# Point at a specific ELF and shim startcol offset
+python3 src/tool/debug/schedule_debug_server.py aout/worklocal \
+  --elf aout/main.elf --startcol 3 --aie-version 5 --device pal --port 8091
+```
+
+#### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `workdir` | Dir with `host_schedule.html` + `schedule_view.json` + provenance JSONs (default `aout/worklocal`) |
+| `--elf` | ELF to deploy via the Run button (default `<workdir>/../main.elf`) |
+| `--port` | HTTP port (default `8091`) |
+| `--aie-version` | Register offset set: `5` (AIEML, default) or `2ps` |
+| `--device` | `aiedbg --device` (default `pal`) |
+| `--target` | `aiedbg --target` (e.g. `xsdb://10.23.224.213:3121`); resolution order: `--target` → `$AIEDBG_TARGET` → `~/.aiedbg_env` (the file `aiedbg-setup` writes). Without any, live grid/`/cmd` reads fail with "timed out" / "connection closed" |
+| `--startcol` | Physical column offset: `phys_col = col + startcol` |
+| `--apppaltest` | Path to `apppaltest.py` (default `script/test/apppaltest.py`) |
+| `--open` | Open the served URL in a browser after binding |
+
+#### Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/` | Serves the enhanced `host_schedule.html` |
+| `GET` | `/schedule_view.json` | The static `DATA` blob |
+| `POST` | `/run` | Spawn the board test `-y -nonreboot <elf>` (`-u` unbuffered) → `applog`. Body `{device, board_host}`: `palmyra` → `apppaltest.py` (inherit env); `vek385` → `appvek385.py` with env `USERNAME=getpass.getuser()` + `VEK385IP=<board_host>` (host required) |
+| `POST` | `/stop` | Force-kill the running test's process group (SIGTERM→SIGKILL); appends a `[force-stop]` line to `applog` |
+| `GET` | `/applog?offset=N` | Realtime tail of the `applog` file → `{data, next, running, status}`; poll stops on `running=false` (process exit), not on derived `pass\|fail` |
+| `GET` | `/ping?device=&host=` | Connection test → `{ok, aiedbg, target, detail}`. Confirms `aiedbg` is in PATH **and** the resolved JTAG target actually answers (one read-only register read on the first schedule tile). Drives the UI's "Test connect" gating |
+| `GET` | `/grid?what=dma\|cores\|events&device=&host=` | Whole-array status survey for the overlay; `device`/`host` pick the aiedbg target (`palmyra` → `xsdb://$PALIP:3121`, `vek385` → `xsdb://<host>:3121`) |
+| `POST` | `/cmd` | Whitelisted op (`dma`/`core`/`event`/`pc`/`reg`/`chans`/`chanevent`); body may carry `device`/`host` for device-aware target. `chans` lists a tile's channels + coarse live DMA state; `chanevent` (needs `dir_ch`) decodes per-channel start/finish/(stall/error) events → `{events, summary}` |
+
+The browser UI has a **Board selector** (`palmyra` / `vek385`). Selecting a device
+enables a **"Test connect"** button (and, for `vek385`, reveals a board-hostname
+text box). Clicking **Test connect** hits `/ping`; only on a passing test does the
+"Live status overlay" checkbox unlock **and** the drill-down console appear. The
+"Run test" button (spawns `apppaltest`) is enabled as soon as a device is chosen.
+
+The right panel has a **drill-down command console** (pinned bottom, revealed after
+a passing connection test): clicking a tile sets it as the console TARGET and
+auto-lists its channels; clicking a channel narrows the target to that channel,
+after which `status` (DMA status) and `event` (per-channel DMA events) operate on
+it. Commands: `channels | status | event | core | pc | reg <off>`. The console
+persists while the overlay checkbox is toggled off (it is tied to the connection,
+not the overlay), and is hidden again when the device changes or the connection
+test fails.
+
+#### Safety
+
+- Binds `127.0.0.1` only; `/cmd` uses an op **whitelist** (no arbitrary shell; `reg` offset
+  parsed as an integer).
+- Issues **read-only** register reads only (never `stop`/`con`/writes), so it cannot perturb
+  a running target sharing the same JTAG bridge.
+- Reuses aiediag's `--json` `value_hex` parsing (avoids the offset-as-value Pitfall). If
+  `aiedbg` is not in `PATH`, live reads are disabled and endpoints report `unreachable`
+  rather than fake zeros.
+
 ## Compiling aiehlc (Optional)
 
 Building aiehlc is only necessary if you intend to develop or compile aiehlc itself. If your aim is simply to use aiehlc, this step is not required.
@@ -266,4 +402,235 @@ If you plan to contibute code then make sure you set up the clang-format pre-com
 source script/precommitsetup.sh
 ```
 
-<p align="center">Copyright&copy; 2025 Advanced Micro Devices, Inc</p>
+## Project Module Analysis
+
+### 9-Module Breakdown
+
+```
+                          User C++ Source
+                               |
+                    +----------+----------+
+                    |                     |
+              [M1] aiehlc           [M2] Frontend
+           (single-kernel)        (Clang AST->MLIR)
+                    |                     |
+                    |              [M3] Pipeline Orchestrator
+                    |                     |
+                    v         +-----------+-----------+
+              host+kernel     |                       |
+              ELF             v                       v
+                    [M4] Spatial Routing       [M5] Dataflow Mapping
+                    (routing + routinghw)      (dmap + dmaphop)
+                              |                       |
+                              v                       v
+                    [M6] Routing Engine        [M7] Schedule Generation
+                    (BFS, ResourceMgr)         (blueprint + dfschedule)
+                              |                       |
+                              +-------+-------+-------+
+                                      |
+                              [M8] AIE Runtime
+                              (XAie driver wrapper)
+                                      |
+                              [M9] Build & Test Infra
+                              (scripts, unitest, HW run)
+```
+
+---
+
+#### M1 - aiehlc Compiler Driver (Single-Kernel Path)
+**Responsibility:** Clang-based tool that compiles user C++ into host ELF + kernel ELF for single-tile AIE apps
+**Key Files:**
+| File | Lines | Role |
+|------|-------|------|
+| `src/llvm/aiehlc.cc` | 3,091 | Main driver: parses C++, invokes xchesscc for kernel, aarch64-g++ for host |
+
+**Inputs:** User C++ with AIE driver API calls
+**Outputs:** `host` ELF (ARM) + `kernel` ELF (AIE core)
+**Dependencies:** M2 (Frontend), M8 (Runtime)
+
+---
+
+#### M2 - MLIR Frontend (Clang AST to MLIR)
+**Responsibility:** Parse user C++ into MLIR; define the base AIE dialect (LoadKernel, etc.)
+**Key Files:**
+| File | Lines | Role |
+|------|-------|------|
+| `src/mlir/mlirfront/AieFrontEnd.cc` | 527 | Clang AST visitor -> MLIR IR generation |
+| `src/mlir/mlirfront/AieFrontEnd.h` | - | Frontend interface |
+| `src/mlir/mlirfront/AieDialect.cc` | 671 | AIE dialect ops, types, attrs definition |
+| `src/mlir/mlirfront/AieDialect.h` | - | Dialect header |
+| `src/mlir/mlirfront/AieLinkDialect.h` | - | Link-time dialect |
+| `include/aie_spatial_types.h` | 70 | Spatial type tags for mesh partitioning |
+
+**Inputs:** Clang AST from user C++
+**Outputs:** MLIR ModuleOp with AIE dialect ops
+**Dependencies:** LLVM/Clang, MLIR core
+
+---
+
+#### M3 - Pipeline Orchestrator
+**Responsibility:** Wire all passes together, build initial routing IR, manage host/kernel/routing code emission
+**Key Files:**
+| File | Lines | Role |
+|------|-------|------|
+| `tilinglinalg/pass/tilinglinalg_pipeline.cpp` | 1,167 | `TilingLinalgPipeline::runPipeline()` - orchestrates all 15+ passes |
+| `tilinglinalg/pass/tilinglinalg_pipeline.h` | 163 | Pipeline API + TensorParam/SplitModel/MeshKernelDesc structs |
+| `tilinglinalg/pass/kernelconfig/kernelconfig.h` | 141 | Kernel configuration parameters |
+
+**Inputs:** MLIR ModuleOp from M2, mesh/tensor/split parameters
+**Outputs:** `host.cc`, `kernel.cc`, `routing.cc`, `aieml.bcf`, `aieml.prx`
+**Dependencies:** M4, M5, M6, M7 (all dialects & passes)
+
+---
+
+#### M4 - Spatial Routing Dialects (routing + routinghw)
+**Responsibility:** Model abstract tile arrays & physical stream-switch routing
+**Key Files:**
+| File | Lines | Role |
+|------|-------|------|
+| `routing/routingmanager.cpp` | 874 | **routing dialect** - abstract mesh, data IO, broadcast, partitioning |
+| `routing/routingmanager.h` | - | Routing dialect interface |
+| `routing/td/*.td` | 4 files | TableGen: ops, types, attrs, interfaces |
+| `routinghw/routinghwmanager.cpp` | 94 | **routinghw dialect** - physical tiles, stream switch ports, packet flows |
+| `routinghw/routinghwmanager.h` | - | RoutingHW dialect interface |
+| `routinghw/td/*.td` | 3 files | TableGen: ops, types, attrs |
+
+**Lowering passes in this module's domain:**
+| Pass | Lines | Direction |
+|------|-------|-----------|
+| `passroutingtodmap/routingtodmap.cpp` | 1,218 | routing -> dmap |
+| `passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp` | 1,245 | dmaphop -> routinghw (Path A) |
+
+---
+
+#### M5 - Dataflow Mapping Dialects (dmap + dmaphop)
+**Responsibility:** Model logical dataflow (ports, streams, push/pull) and physical hop-by-hop paths (tile-to-tile DMA, buffers)
+**Key Files:**
+| File | Lines | Role |
+|------|-------|------|
+| `dataflowmap/dmap/dmapmanager.cpp` | 311 | **dmap dialect** - logical ports, streams, push/pull |
+| `dataflowmap/dmap/td/*.td` | 3 files | TableGen: ops, types, attrs |
+| `dataflowmap/dmaphop/dmaphopmanager.cpp` | 392 | **dmaphop dialect** - physical hops, DMA configs, buffers |
+| `dataflowmap/dmaphop/td/*.td` | 3 files | TableGen: ops, types, attrs |
+
+**Lowering passes in this module's domain:**
+| Pass | Lines | Direction |
+|------|-------|-----------|
+| `passdmaptodmaphop/dmaptodmaphop.cpp` | 653 | dmap -> dmaphop |
+| `passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp` | 1,456 | dmaphop -> dfscheblueprint |
+| `passdmaphopprovenancemap/passdmaphopprovenancemap.cpp` | 970 | dmaphop provenance tracking (debug) |
+
+---
+
+#### M6 - Routing Engine (BFS + Resource Management)
+**Responsibility:** Concrete routing algorithm - BFS path finding across AIE topology, port/link resource tracking
+**Key Files:**
+| File | Lines | Role |
+|------|-------|------|
+| `pass/routingimplement/routing/routingpath.cpp` | 263 | BFS path finding (priority: Memory > SHIM > Core) |
+| `pass/routingimplement/routing/routingtopology.cpp` | 103 | Gen2 AIE tile topology model |
+| `pass/routingimplement/routing/routingcontruct.cpp` | 4 | Routing graph construction |
+| `pass/routingimplement/routing/routingtile.cpp` | 4 | Tile type definitions |
+| `pass/routingimplement/hw/hwresource.cpp` | 421 | Port templates, HW resource definitions |
+| `pass/routingimplement/hw/ResourceManager.cpp` | 814 | Resource allocation, conflict avoidance |
+| `pass/routingimplement/include/` | - | Headers for routing & hw modules |
+
+**Dependencies:** M4 (uses routing/routinghw dialect types)
+
+---
+
+#### M7 - Schedule Generation (dfscheblueprint + dfschedule)
+**Responsibility:** Blueprint -> executable DMA/lock/kernel-launch schedule; final EmitC code generation
+**Key Files:**
+| File | Lines | Role |
+|------|-------|------|
+| `dataflowmap/dfscheblueprint/dfscheblueprintmanager.cpp` | 671 | **dfscheblueprint dialect** - transfer manifests, flow configs |
+| `dataflowmap/dfscheblueprint/td/*.td` | 3 files | TableGen: ops, types, attrs |
+| `dataflowmap/dfschedule/dfschedulemanager.cpp` | 1,286 | **dfschedule dialect** - DMA BD, kernel launch, locks, waits |
+| `dataflowmap/dfschedule/td/*.td` | 3 files | TableGen: ops, types, attrs |
+
+**Lowering passes in this module's domain:**
+| Pass | Lines | Direction |
+|------|-------|-----------|
+| `passblueprinttoschedule/passblueprinttoschedule.cpp` | 2,471 | blueprint -> dfschedule (host path) |
+| `passblueprinttoschedulekernel/passblueprinttoschedulekernel.cpp` | 1,280 | blueprint -> dfschedule (kernel path) |
+| `passschedulecanonicalize/passschedulecanonicalize.cpp` | 644 | Schedule optimization |
+| `passschedulesequentialop/passschedulesequentialop.cpp` | 283 | Sequential ordering |
+| `passwaitmerge/passwaitmerge.cpp` | 185 | Merge wait operations |
+| `passdfscheduletoapi/passdfscheduletoapi.cpp` | 3,595 | dfschedule -> EmitC (host.cc) **LARGEST PASS** |
+| `passdfscheduletokernelapi/passdfscheduletokernelapi.cpp` | 369 | dfschedule -> EmitC (kernel.cc) |
+| `passdfscheduleprovenancemap/passdfscheduleprovenancemap.cpp` | 800 | Provenance tracking (debug) |
+
+---
+
+#### M8 - AIE Runtime
+**Responsibility:** C wrapper layer over XAie driver APIs; device init/teardown, DMA, locks, kernel load
+**Key Files:**
+| File | Lines | Role |
+|------|-------|------|
+| `src/mlir/runtime/aie_runtime.c` | 1,363 | Core runtime: device_init, load_kernel, dma_bd_config, wait_event |
+| `src/mlir/runtime/aie_runtime.h` | 380 | Runtime API declarations |
+| `src/mlir/runtime/aie_runtime_common.c` | 585 | Common utilities |
+| `src/mlir/runtime/aie_runtime_debug.c` | 2,143 | Debug/diagnostic wrappers |
+| `src/mlir/runtime/aie_runtime_stream_debug.c` | 42 | Stream debug |
+| `src/mlir/runtime/kernel_log.h` | 80 | Kernel logging |
+| `include/aie_device_map.h` | 40 | Device tile-type mapping |
+| `thirdparty/alib/` | - | XAie driver library (external) |
+
+---
+
+#### M9 - Build, Test & Deployment Infrastructure
+**Responsibility:** Build system, test harness, HW board deployment, diagnostic tools
+**Key Files:**
+| File | Lines | Role |
+|------|-------|------|
+| `script/aiehlc.sh` | 492 | Main build script (source to run unitest) |
+| `script/kc.sh` | 278 | Kernel compilation script |
+| `script/setup.sh` | 210 | Environment setup |
+| `script/verify_env.sh` | - | Environment validation |
+| `script/test/apppaltest.py` | - | HW board test (SSH+xsdb+console) |
+| `src/tool/debug/aiediag.py` | - | DMA diagnostic tool |
+| `script/verify_generated.py` | - | Generated code verification |
+| `pass/unitest/test.cpp` | 1,810 | Integration test driver |
+| `pass/unitest/piplinerun.sh` | - | End-to-end pipeline automation |
+| `example/tileprogram/ccode/` | - | Example programs (simplematmul, simpleconv2d) |
+| `CMakeLists.txt` (various) | - | Build system |
+| `doc/` | - | Architecture & API documentation |
+
+---
+
+### Summary Table
+
+| # | Module | Responsibility | LOC (approx) | Key Artifact |
+|---|--------|---------------|--------------|--------------|
+| M1 | aiehlc Driver | Single-kernel C++ -> ELF compiler | 3,100 | `aiehlc` binary |
+| M2 | MLIR Frontend | Clang AST -> MLIR + AIE dialect | 1,200 | MLIR ModuleOp |
+| M3 | Pipeline Orchestrator | Wires 15+ passes, manages emission | 1,500 | host/kernel/routing.cc |
+| M4 | Spatial Routing Dialects | Abstract & physical routing IR | 2,500 | routing/routinghw ops |
+| M5 | Dataflow Mapping Dialects | Logical & physical dataflow IR | 3,800 | dmap/dmaphop ops |
+| M6 | Routing Engine | BFS path finding + resource mgmt | 1,600 | Concrete routes |
+| M7 | Schedule Generation | Blueprint->schedule->EmitC | 10,600 | DMA/lock C code |
+| M8 | AIE Runtime | XAie driver C wrappers | 5,700 | libruntime |
+| M9 | Build & Test Infra | Scripts, tests, HW deployment | 3,000+ | test harness |
+
+### Data Flow Through Modules
+
+```
+User C++ --(M1/M2)--> MLIR IR --(M3)--> routing IR
+  --(M4: routing->routinghw)--> physical routing --(M6: BFS)--> resolved routes
+  --(M4: routing->dmap)------> logical dataflow
+  --(M5: dmap->dmaphop)------> physical hops
+  --(M5: dmaphop->blueprint)--> schedule blueprint
+  --(M7: blueprint->schedule)--> DMA/lock/kernel schedule
+  --(M7: schedule->EmitC)-----> host.cc + kernel.cc + routing.cc
+  --(M8: runtime)--------------> linked into final ELF
+  --(M9: build+HW run)--------> deployed on AIE hardware
+```
+
+For the full module analysis with detailed file listings, see [doc/module_analysis.md](doc/module_analysis.md).
+
+## License
+
+This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+<p align="center">Copyright&copy; 2025-2026 Advanced Micro Devices, Inc.</p>

@@ -12,5 +12,28 @@
       "mcp__*"
     ],
     "deny": []
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf '%s' '{\"decision\":\"block\",\"reason\":\"CONFIDENCE GATE: A plan was just approved. Before executing ANY non-readonly tool, invoke the honest skill (Phase A) on the approved plan. Default threshold 90% unless the user passed an override. Drive each row to threshold via concrete actions (file reads, probes, AskUserQuestion) \u2014 never by inflating numbers. See the Forbidden phrasings section of the skill. Only after every row is at or above threshold (or user-accepted) may you proceed with execution.\"}'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/skills/honest/stop-audit-gate.py\""
+          }
+        ]
+      }
+    ]
   }
 }
