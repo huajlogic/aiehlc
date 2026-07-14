@@ -24,6 +24,33 @@ usage() {
     return 1
 }
 
+check_bsp_environment() {
+    # Verify the one-time BSP setup (source ./script/setup.sh) has been run.
+    # $1 = target aie_version, used to pick the version-specific BSP dir.
+    local ver="$1"
+    local proc
+    case "$ver" in
+        1|2) proc="psv_cortexa72_0" ;;
+        5)   proc="cortexa78_0" ;;
+        *)   proc="" ;;   # unknown version handled later by existing check
+    esac
+    [ -z "$proc" ] && return 0
+
+    local bsp_ws="${AIEHLC_DIR}/thirdparty/arch/${proc}/workspace"
+    if [ ! -d "$bsp_ws" ]; then
+        echo ""
+        echo "==========================================================="
+        echo "Error: AIE BSP not found -- environment is not set up."
+        echo "  Missing: ${bsp_ws}"
+        echo ""
+        echo "Please run the one-time environment setup first:"
+        echo "    source ./script/setup.sh"
+        echo "==========================================================="
+        return 1
+    fi
+    return 0
+}
+
 build_hw_lib() {
     set -e
 
@@ -159,6 +186,9 @@ fi
 
 #set up env
 run_cmd "source $SCRIPT_DIR/setup.sh --path-set-only"
+
+# Verify one-time BSP setup was done (source ./script/setup.sh).
+check_bsp_environment "$aie_version" || return 1
 
 if [[ "$platform" == "linux" ]]; then
     TOOL_PREFIX="aarch64-linux-gnu-"
