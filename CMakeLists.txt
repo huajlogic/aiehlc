@@ -15,8 +15,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-# set(CMAKE_BUILD_TYPE Debug)
-set(CMAKE_BUILD_TYPE Release)
+# Default to Release, but let the user override on the command line
+# (e.g. -DCMAKE_BUILD_TYPE=Debug / RelWithDebInfo) to get a debuggable aiehlc.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
 
 # ---- Size reduction flags ----
 # -ffunction-sections/-fdata-sections: put each function/data in its own ELF section
@@ -124,10 +127,15 @@ set(mlirfrontend src/mlir/mlirfront/)
 
 add_executable(aiehlc ${SOURCE_FILES})
 
-add_custom_command(TARGET aiehlc POST_BUILD
-    COMMAND ${CMAKE_STRIP} $<TARGET_FILE:aiehlc>
-    COMMENT "Stripping binary..."
-)
+# Strip only for non-debug builds. In Debug / RelWithDebInfo we keep the symbol
+# table + DWARF so gdb (e.g. `source script/aiehlc.sh -gdb ...`) can resolve
+# functions like buildOutputTileDescriptor and set real breakpoints.
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    add_custom_command(TARGET aiehlc POST_BUILD
+        COMMAND ${CMAKE_STRIP} $<TARGET_FILE:aiehlc>
+        COMMENT "Stripping binary..."
+    )
+endif()
 
 llvm_map_components_to_libnames(llvm_libs support core irreader)
 # this will cause "LLVM Option 'help-list' registered more than once“ issue

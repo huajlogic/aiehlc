@@ -334,7 +334,16 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
         int64_t tileM = passState->tileM;
         int64_t tileRowsVal = passState->tileRows;
 
-        if (tileM > 0 && tileM < tileRowsVal && !c.shimIsSender && isFullConnectAuto(op->getParentOfType<ModuleOp>())) {
+        auto moduleOpGuard = op->getParentOfType<ModuleOp>();
+        // The generic GEMM 3D path fires when tile_m sub-tiles the M dimension under
+        // fullconnect_auto. The conv2d width-split (spatial-halo) path drops
+        // tile_m/tile_rows and fullconnect_auto, so it is triggered separately by the
+        // presence of a width-split halo on a receiving (S2MM gather) shim channel.
+        ConvHaloGeom convHalo = detectConvHalo(moduleOpGuard);
+        bool convWidthSplit = convHalo.valid && !c.shimIsSender;
+        bool gemm3D = tileM > 0 && tileM < tileRowsVal && !c.shimIsSender && isFullConnectAuto(moduleOpGuard);
+
+        if (gemm3D || convWidthSplit) {
             auto moduleOp = op->getParentOfType<ModuleOp>();
             c.outDesc =
                 buildOutputTileDescriptor(*passState, c.memrefType, numCoreTiles, moduleOp, c.ooElementSizeBytes);

@@ -356,6 +356,34 @@ __global__(conv_policy) void conv2d_spatial(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Deterministic value generator (shared with conv2d_debug.py)
+//
+// The host input/filter buffers are filled with small ZERO-MEAN samples so the
+// conv accumulator (49 taps x 3 real channels) stays inside int8 and the output
+// tile is ~normally distributed instead of saturating at 127/-128.
+//
+// Values come from an index-keyed integer hash (lowbias32) rather than libc
+// rand(), so conv2d_debug.py can reproduce them BYTE-FOR-BYTE (same keys, same
+// hash, same seeds) — the Python replay then predicts the HW output exactly.
+//   input  = mix32(real_idx + INPUT_SEED)  % 9 - 4  -> uniform int in [-4, 4]
+//   filter = mix32(filt_key + FILTER_SEED) % 3 - 1  -> uniform int in {-1,0,1}
+// ═══════════════════════════════════════════════════════════════════════════
+#ifndef INPUT_SEED
+#define INPUT_SEED 1234u
+#endif
+#ifndef FILTER_SEED
+#define FILTER_SEED 5678u
+#endif
+static inline uint32_t mix32(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // HOST
 // ═══════════════════════════════════════════════════════════════════════════
 int main() {
@@ -386,32 +414,37 @@ int main() {
     int8_t *output = (int8_t *)malloc(OUTPUT_H * OUTPUT_W * NUM_FILTERS * sizeof(int8_t));
 
     // --- Initialize test data ---
-    // Input: sequential values for the real channels (identical to the cin=3 run),
-    // zero for the padding channel and the spatial-border pad. Real value at
-    // (h,w,c) keeps the old flat index ((h*W+w)*INPUT_C + c) + 1 so the output is
-    // bit-identical to the cin=3 case; the pixel is written at the padded position
-    // (h+PAD, w+PAD) with the padded row pitch INPUT_W_PAD.
+    // Input: small ZERO-MEAN samples in [-4, 4] for the real channels (see the
+    // mix32 note above); zero for the padding channel and the spatial-border pad.
+    // The value is keyed by the SAME flat index real_idx = (h*W+w)*INPUT_C + c as
+    // conv2d_debug.py, written at the padded position (h+PAD, w+PAD) with padded
+    // row pitch INPUT_W_PAD. Small magnitude keeps the accumulator in int8 range
+    // so the output tile is ~normally distributed instead of saturating.
     memset(input, 0, INPUT_H_PAD * INPUT_W_PAD * INPUT_C_ALIGN * sizeof(int8_t));
     for (int h = 0; h < INPUT_H; h++) {
         for (int w = 0; w < INPUT_W; w++) {
             for (int c = 0; c < INPUT_C; c++) {
                 int real_idx = (h * INPUT_W + w) * INPUT_C + c;
-                input[((h + PAD) * INPUT_W_PAD + (w + PAD)) * INPUT_C_ALIGN + c] = (int8_t)(real_idx + 1);
+                int val = (int)(mix32((uint32_t)real_idx + INPUT_SEED) % 9u) - 4; // [-4, 4]
+                input[((h + PAD) * INPUT_W_PAD + (w + PAD)) * INPUT_C_ALIGN + c] = (int8_t)val;
             }
             // padding channels [INPUT_C, INPUT_C_ALIGN) and spatial border left at 0
         }
     }
 
-    // Filter: all 1s for the real channels, 0 for the padding channel. Stored in
-    // B^T [N, K] layout. The padding weight is zeroed for defense-in-depth (the
-    // zero input channel already nulls every padding-channel product).
+    // Filter: zero-mean samples in {-1, 0, 1} for the real channels, 0 for the
+    // padding channel, stored in B^T [N, K] layout. Keyed by filt_key (the same
+    // logical (f,kh,kw,c) index conv2d_debug.py uses) so the two agree byte-for-
+    // byte. Mixed signs let taps partially cancel -> accumulator centers on 0.
     memset(filter, 0, KERNEL_H * KERNEL_W * INPUT_C_ALIGN * NUM_FILTERS * sizeof(int8_t));
     for (int f = 0; f < NUM_FILTERS; f++) {
         for (int kh = 0; kh < KERNEL_H; kh++) {
             for (int kw = 0; kw < KERNEL_W; kw++) {
                 for (int c = 0; c < INPUT_C; c++) {
                     int kk = (kh * KERNEL_W + kw) * INPUT_C_ALIGN + c;
-                    filter[f * K + kk] = 1;
+                    int filt_key = ((f * KERNEL_H + kh) * KERNEL_W + kw) * INPUT_C + c;
+                    int val = (int)(mix32((uint32_t)filt_key + FILTER_SEED) % 3u) - 1; // {-1,0,1}
+                    filter[f * K + kk] = (int8_t)val;
                 }
                 // padding channel c == INPUT_C..INPUT_C_ALIGN-1 left at 0
             }

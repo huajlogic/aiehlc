@@ -374,6 +374,40 @@ bool isNOuterPolicy(ModuleOp moduleOp) {
     return false; // default: m_outer_n_inner
 }
 
+// Scan moduleOp attrs for a conv width-split halo. Returns {valid=false} otherwise.
+// The width-split halo is announced by any "tensor_N.halo" dict carrying w_rounds>1,
+// gated on routing.spatial_halo_buf_size>0.
+ConvHaloGeom detectConvHalo(ModuleOp moduleOp) {
+    ConvHaloGeom g;
+    if (!moduleOp)
+        return g;
+    int64_t convBufSize = 0;
+    if (auto b = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_halo_buf_size"))
+        convBufSize = b.getInt();
+    if (convBufSize <= 0)
+        return g;
+    for (const NamedAttribute &na : moduleOp->getAttrs()) {
+        if (!na.getName().getValue().ends_with(".halo"))
+            continue;
+        auto hd = dyn_cast<DictionaryAttr>(na.getValue());
+        if (!hd)
+            continue;
+        auto wr = hd.getAs<IntegerAttr>("w_rounds");
+        auto ot = hd.getAs<IntegerAttr>("ow_t");
+        if (wr && wr.getInt() > 1 && ot) {
+            g.valid = true;
+            g.wRounds = wr.getInt();
+            g.owT = ot.getInt();
+            if (auto l2 = hd.getAs<IntegerAttr>("l2_rounds"))
+                g.l2Rounds = l2.getInt();
+            if (g.l2Rounds < 1)
+                g.l2Rounds = 1;
+            break;
+        }
+    }
+    return g;
+}
+
 // Build the output tile descriptor from the true output geometry. All conv-vs-gemm
 // geometry knowledge lives here. The output memref is modeled as [M, N] (row-major),
 // with N = output row width (= OC for conv) and M split into mRounds x tileM. The
@@ -382,16 +416,75 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
                                                int64_t numCoreTiles, ModuleOp moduleOp, int64_t ooElementSizeBytes) {
     OutputTileDescriptor desc;
 
-    int64_t tileM = passState.tileM;
-    int64_t tileRows = passState.tileRows;
-    int64_t mRounds = tileRows / tileM;
-
     unsigned bitWidth = memrefType.getElementTypeBitWidth();
     int64_t elemsPerWord = 32 / bitWidth;
     constexpr int64_t wordBytes = 4;
     int64_t outW = memrefType.getDimSize(1);  // full output row width (elements)
     int64_t outW_w = outW / elemsPerWord;     // ... in 32-bit words
     int64_t tileN_full = outW / numCoreTiles; // per-tile column width (elements)
+
+    int64_t elemBytes = bitWidth / 8;
+    if (elemBytes == 0)
+        elemBytes = 1;
+
+    // Conv2D width-split halo takes precedence: the spatial-halo path drops
+    // routing.tile_m/tile_rows, so ALL geometry (tileM, mRounds, iter) is derived
+    // from the halo attrs. Each core produces an [oh_per_row, OW_T, OC_PER_G] tile
+    // scattered into the full [OH, OW, OC] image, across wRounds L->R x l2Rounds T->B.
+    ConvHaloGeom halo = detectConvHalo(moduleOp);
+    if (halo.valid) {
+        int64_t haloOwT = halo.owT;             // OW_T columns per width-round (e.g. 28)
+        int64_t haloWRounds = halo.wRounds;     // L->R rounds (e.g. 4)
+        int64_t hChunks = halo.l2Rounds;        // T->B rounds (e.g. 4)
+        int64_t fullOW = haloOwT * haloWRounds; // full output width (e.g. 112)
+        // OC per channel-group == full row width / numCoreTiles == tileN_full.
+        int64_t tileN_sub = tileN_full;
+        int64_t tileN_sub_w = tileN_sub / elemsPerWord;
+
+        // ohPerRow (image rows produced per BD fire / per on-core slab) is derived
+        // from the authoritative per-core slab count so it always matches the core
+        // MM2S sender. Total fires per core = spatial_out_rounds (= wRounds*l2Rounds).
+        // perCoreElems = product(memref dims) / numCoreTiles;  each slab is
+        //   [ohPerRow, OW_T, tileN_sub] => ohPerRow = slabElems / (OW_T * tileN_sub).
+        int64_t totalElems = 1;
+        for (int64_t d = 0; d < memrefType.getRank(); ++d)
+            totalElems *= memrefType.getDimSize(d);
+        int64_t perCoreElems = (numCoreTiles > 0) ? (totalElems / numCoreTiles) : totalElems;
+        int64_t outRounds = haloWRounds * hChunks; // = spatial_out_rounds
+        if (auto orAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds"))
+            if (orAttr.getInt() > 0)
+                outRounds = orAttr.getInt();
+        int64_t slabElems = (outRounds > 0) ? (perCoreElems / outRounds) : perCoreElems;
+        int64_t colElems = haloOwT * tileN_sub; // OW_T columns * OC-per-group
+        int64_t ohPerRow = (colElems > 0) ? (slabElems / colElems) : 1;
+        if (ohPerRow <= 0)
+            ohPerRow = 1;
+
+        // One BD activation = one [ohPerRow, OW_T, tileN_sub] scattered block.
+        desc.bdLenBytes = ohPerRow * haloOwT * tileN_sub * ooElementSizeBytes;
+
+        // BD scatter dims, innermost-first.
+        desc.bdDims.push_back({1 * wordBytes, tileN_sub_w});          // D0: channel-group words
+        desc.bdDims.push_back({outW * elemBytes, haloOwT});           // D1: OW_T columns, one pixel (OC) apart
+        desc.bdDims.push_back({fullOW * outW * elemBytes, ohPerRow}); // D2: oh_per_row rows, one image row apart
+
+        // The width (L->R) rounds are folded into the BD iteration dim; the height
+        // (T->B) rounds become the scf.for outer round loop.
+        desc.iterStep = static_cast<int32_t>(haloOwT * outW * elemBytes); // advance OW_T columns
+        desc.iterWrap = static_cast<int32_t>(haloWRounds);
+        desc.totalRounds = hChunks;
+
+        // Per-round base-offset dims, outermost-first: only the height (T->B) chunks
+        // move the base; the width rounds are already folded into iter above.
+        desc.roundDims.push_back({hChunks, ohPerRow * fullOW * outW * elemBytes}); // hc stride
+
+        return desc;
+    }
+
+    // === Non-halo (GEMM) path ===
+    int64_t tileM = passState.tileM;
+    int64_t tileRows = passState.tileRows;
+    int64_t mRounds = (tileM > 0) ? (tileRows / tileM) : 1;
 
     // Per-tile N sub-tiling (nRounds): when tile_n < tile_cols, the per-tile width is
     // further split into nRounds iterations of tileN_sub columns.
@@ -403,16 +496,11 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
     }
     int64_t tileN_sub_w = tileN_sub / elemsPerWord;
 
-    int64_t elemBytes = bitWidth / 8;
-    if (elemBytes == 0)
-        elemBytes = 1;
-
     // One d0xd1(xd2) block per BD activation (single OOO packet).
     desc.bdLenBytes = tileM * tileN_sub * ooElementSizeBytes;
 
-    // Policy-aware iteration assignment (shared by conv + gemm). The "outer" loop is
-    // the scf.for round dimension; the "inner" dimension is folded into the BD's
-    // iter_step/iter_wrap.
+    // Policy-aware iteration assignment. The "outer" loop is the scf.for round
+    // dimension; the "inner" dimension is folded into the BD's iter_step/iter_wrap.
     bool nOuterPolicy = moduleOp ? isNOuterPolicy(moduleOp) : false;
     int64_t outerRounds;
     int64_t outerStrideBytes;
@@ -431,51 +519,10 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
     }
     desc.totalRounds = outerRounds;
 
-    // Detect conv 2D width-split halo: any tensor_N.halo with w_rounds>1 (gated on
-    // routing.spatial_halo_buf_size>0) means the per-round output is a scattered
-    // [oh_per_row, OW_T] sub-block of the [OH, OW, OC] image.
-    int64_t haloOwT = 0, haloWRounds = 0;
-    if (moduleOp) {
-        int64_t convBufSize = 0;
-        if (auto b = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_halo_buf_size"))
-            convBufSize = b.getInt();
-        if (convBufSize > 0) {
-            for (const NamedAttribute &na : moduleOp->getAttrs()) {
-                if (!na.getName().getValue().ends_with(".halo"))
-                    continue;
-                auto hd = dyn_cast<DictionaryAttr>(na.getValue());
-                if (!hd)
-                    continue;
-                auto wr = hd.getAs<IntegerAttr>("w_rounds");
-                auto ot = hd.getAs<IntegerAttr>("ow_t");
-                if (wr && wr.getInt() > 1 && ot) {
-                    haloWRounds = wr.getInt();
-                    haloOwT = ot.getInt();
-                    break;
-                }
-            }
-        }
-    }
-
-    if (haloWRounds > 1 && haloOwT > 0 && (tileM % haloOwT) == 0) {
-        // Conv width-split scatter. The kernel streams
-        // local_out[oh_per_row][OW_T][OC_PER_G] (channel innermost):
-        int64_t ohPerRow = tileM / haloOwT;     // e.g. 196/28 = 7
-        int64_t fullOW = haloOwT * haloWRounds; // e.g. 28*4 = 112
-        // BD scatter dims, innermost-first.
-        desc.bdDims.push_back({1 * wordBytes, tileN_sub_w});          // D0: channel-group words
-        desc.bdDims.push_back({outW * elemBytes, haloOwT});           // D1: OW_T columns, one pixel (OC) apart
-        desc.bdDims.push_back({fullOW * outW * elemBytes, ohPerRow}); // D2: oh_per_row rows, one image row apart
-        // Per-round base-offset dims, outermost-first.
-        int64_t hChunks = outerRounds / haloWRounds;
-        desc.roundDims.push_back({hChunks, ohPerRow * fullOW * outW * elemBytes}); // hc stride
-        desc.roundDims.push_back({haloWRounds, haloOwT * outW * elemBytes});       // wc stride
-    } else {
-        // GEMM contiguous-M: each round writes tileM contiguous M-rows.
-        desc.bdDims.push_back({1 * wordBytes, tileN_sub_w}); // D0: contiguous word step
-        desc.bdDims.push_back({outW_w * wordBytes, tileM});  // D1: DDR row stride, tileM rows
-        desc.roundDims.push_back({outerRounds, outerStrideBytes});
-    }
+    // GEMM contiguous-M: each round writes tileM contiguous M-rows.
+    desc.bdDims.push_back({1 * wordBytes, tileN_sub_w}); // D0: contiguous word step
+    desc.bdDims.push_back({outW_w * wordBytes, tileM});  // D1: DDR row stride, tileM rows
+    desc.roundDims.push_back({outerRounds, outerStrideBytes});
 
     return desc;
 }

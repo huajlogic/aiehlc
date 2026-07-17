@@ -173,6 +173,22 @@ Value resolveMemrefForView(Value viewValue, const BlueprintPassState &state);
 bool isFullConnectAuto(ModuleOp moduleOp);
 TilingClassification classifyTiling(ModuleOp moduleOp);
 bool isNOuterPolicy(ModuleOp moduleOp);
+
+// === Conv2D width-split halo geometry ===
+// Extracted from the "tensor_N.halo" module dict (set by DmaphopTodfscheblueprint /
+// tilinglinalg_pipeline). Present only when the output is a scattered conv image
+// (spatial_halo_buf_size>0 and w_rounds>1). The spatial-halo path drops
+// routing.tile_m / routing.tile_rows (they are 0), so the output-gather BD geometry
+// must be derived entirely from these halo attrs rather than passState.tileM/tileRows.
+struct ConvHaloGeom {
+    bool valid = false;   // true if a width-split conv halo was found
+    int64_t owT = 0;      // OW_T: output columns produced per width-round per core
+    int64_t wRounds = 0;  // number of L->R width rounds (e.g. 4)
+    int64_t l2Rounds = 1; // number of T->B height rounds (e.g. 4); 1 if absent
+};
+// Scan moduleOp attrs for a conv width-split halo. Returns {valid=false} otherwise.
+ConvHaloGeom detectConvHalo(ModuleOp moduleOp);
+
 OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passState, MemRefType memrefType,
                                                int64_t numCoreTiles, ModuleOp moduleOp, int64_t ooElementSizeBytes);
 
