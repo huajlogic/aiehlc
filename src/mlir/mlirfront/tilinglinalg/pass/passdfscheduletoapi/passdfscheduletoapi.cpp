@@ -14,6 +14,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Target/Cpp/CppEmitter.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -585,19 +586,43 @@ struct MemRefSubviewInnerPattern : public OpConversionPattern<memref::SubViewOp>
         auto staticOffsets = op.getStaticOffsets();
         auto srcType = cast<MemRefType>(op.getSource().getType());
         auto srcShape = srcType.getShape();
-        // Compute linearized byte offset from static offsets and source strides.
-        // Row-major strides: stride[i] = product of srcShape[i+1..end].
         int64_t byteOffset = 0;
         int64_t elemBytes = getElemSize(srcType.getElementType());
-        int64_t stride = elemBytes;
-        // Accumulate strides from innermost dimension outward.
-        SmallVector<int64_t> strides(srcShape.size(), stride);
-        for (int i = (int)srcShape.size() - 2; i >= 0; --i)
-            strides[i] = strides[i + 1] * srcShape[i + 1];
-        for (size_t i = 0; i < staticOffsets.size(); ++i) {
-            if (ShapedType::isDynamic(staticOffsets[i]))
-                return failure(); // Give up on dynamic offsets
-            byteOffset += staticOffsets[i] * strides[i];
+        // Prefer the subview RESULT type's encoded strided offset. When the DDR
+        // root carries a non-identity strided layout (e.g. the NCHW conv-output
+        // view), the subview op has already folded the offsets into the result
+        // type's `offset:` field using the layout strides — which the naive
+        // row-major-from-shape math below would get wrong.
+        //
+        // The runtime chains __runtime_buffer_offset(parent, delta) calls, so the
+        // parent (already-offset source) contributes its own offset. We must emit
+        // the offset RELATIVE to the immediate source: delta = resOffset - srcOffset.
+        // For identity layouts both paths agree, so this is a superset (no regression).
+        auto resType = cast<MemRefType>(op.getType());
+        SmallVector<int64_t> resStrides, srcStrides;
+        int64_t resOffset = 0, srcOffset = 0;
+        if (!resType.getLayout().isIdentity() && succeeded(getStridesAndOffset(resType, resStrides, resOffset)) &&
+            !ShapedType::isDynamic(resOffset)) {
+            if (!srcType.getLayout().isIdentity() && succeeded(getStridesAndOffset(srcType, srcStrides, srcOffset)) &&
+                !ShapedType::isDynamic(srcOffset)) {
+                // relative to the offset carried by the immediate source
+            } else {
+                srcOffset = 0; // identity source: absolute == relative
+            }
+            byteOffset = (resOffset - srcOffset) * elemBytes;
+        } else {
+            // Compute linearized byte offset from static offsets and source strides.
+            // Row-major strides: stride[i] = product of srcShape[i+1..end].
+            int64_t stride = elemBytes;
+            // Accumulate strides from innermost dimension outward.
+            SmallVector<int64_t> strides(srcShape.size(), stride);
+            for (int i = (int)srcShape.size() - 2; i >= 0; --i)
+                strides[i] = strides[i + 1] * srcShape[i + 1];
+            for (size_t i = 0; i < staticOffsets.size(); ++i) {
+                if (ShapedType::isDynamic(staticOffsets[i]))
+                    return failure(); // Give up on dynamic offsets
+                byteOffset += staticOffsets[i] * strides[i];
+            }
         }
         // Ensure byte offset is int32-aligned (DMA transfers require 4-byte alignment).
         byteOffset = (byteOffset + 3) & ~3;
@@ -692,6 +717,28 @@ struct UnrealizedConversionCastInnerPattern : public OpConversionPattern<Unreali
                                   ConversionPatternRewriter &rewriter) const override {
         // The input has already been converted by a prior pattern (e.g. DeclareDataInnerPattern ->
         // void*). Simply forward the first converted operand as the result.
+        if (adaptor.getOperands().empty())
+            return failure();
+        rewriter.replaceOp(op, adaptor.getOperands()[0]);
+        return success();
+    }
+};
+
+/// Pass-through pattern for memref.reinterpret_cast produced by BlueprintToSchedulePass
+/// (Part D: NCHW conv-output view). The reinterpret_cast only re-labels the strided
+/// layout with a zero offset — the underlying base pointer is unchanged — so at API
+/// lowering time we forward the converted (void*) source operand directly. The NCHW
+/// strides it introduced are already baked into the downstream subview's result-type
+/// offset, which MemRefSubviewInnerPattern reads.
+struct MemRefReinterpretCastInnerPattern : public OpConversionPattern<memref::ReinterpretCastOp> {
+
+    MemRefReinterpretCastInnerPattern(TypeConverter &typeConverter, MLIRContext *ctx)
+        : OpConversionPattern<memref::ReinterpretCastOp>(typeConverter, ctx, /*benefit=*/85) {}
+
+    LogicalResult matchAndRewrite(memref::ReinterpretCastOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (!op->getParentOfType<dfschedule::HostBlockOp>())
+            return failure();
         if (adaptor.getOperands().empty())
             return failure();
         rewriter.replaceOp(op, adaptor.getOperands()[0]);
@@ -3099,6 +3146,7 @@ void DfscheduleToApiPass::runOnOperation() {
     innerPatterns.add<MemRefCopyInnerPattern>(typeConverter, ctx);
     innerPatterns.add<MemRefDeallocInnerPattern>(typeConverter, ctx);
     innerPatterns.add<MemRefSubviewInnerPattern>(typeConverter, ctx);
+    innerPatterns.add<MemRefReinterpretCastInnerPattern>(typeConverter, ctx);
 
     innerPatterns.add<DeclareDataInnerPattern>(typeConverter, ctx, state);
     innerPatterns.add<PartitionTensorInnerPattern>(typeConverter, ctx, state);
@@ -3197,6 +3245,8 @@ void DfscheduleToApiPass::runOnOperation() {
         [](memref::DeallocOp op) { return !op->getParentOfType<dfschedule::HostBlockOp>(); });
     innerTarget.addDynamicallyLegalOp<memref::SubViewOp>(
         [](memref::SubViewOp op) { return !op->getParentOfType<dfschedule::HostBlockOp>(); });
+    innerTarget.addDynamicallyLegalOp<memref::ReinterpretCastOp>(
+        [](memref::ReinterpretCastOp op) { return !op->getParentOfType<dfschedule::HostBlockOp>(); });
 
     // Use dynamic legality for string-named ops without C++ types
     

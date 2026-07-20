@@ -354,8 +354,14 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
 
         if (gemm3D || convWidthSplit) {
             auto moduleOp = op->getParentOfType<ModuleOp>();
-            c.outDesc =
-                buildOutputTileDescriptor(*passState, c.memrefType, numCoreTiles, moduleOp, c.ooElementSizeBytes);
+            // Thread the partition #routing.tiling descriptor (if present) so the
+            // NCHW conv-output BD geometry is derived from the authoritative tiling
+            // attr rather than the detectConvHalo heuristic.
+            mlir::Attribute tilingAttr;
+            if (c.partExtractSlice)
+                tilingAttr = c.partExtractSlice->getAttr("tiling");
+            c.outDesc = buildOutputTileDescriptor(*passState, c.memrefType, numCoreTiles, moduleOp,
+                                                  c.ooElementSizeBytes, tilingAttr);
 
             SmallVector<Attribute> strideAttrs, wrapAttrs;
             for (const auto &d : c.outDesc.bdDims) {

@@ -28,10 +28,12 @@ Design reference: doc/design/live_debug_framework.md
 """
 
 import argparse
+import errno
 import getpass
 import hmac
 import json
 import os
+import pwd
 import queue
 import re
 import shutil
@@ -1461,6 +1463,143 @@ def _lan_ip():
         return "127.0.0.1"
 
 
+# ── occupied-port policy (same-user => exit + list pid; else pick next port) ──
+
+def _username(uid):
+    """Resolve a numeric uid to a login name, falling back to the number."""
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except (KeyError, OSError):
+        return str(uid)
+
+
+def _listen_sockets_on_port(port):
+    """Scan /proc/net/tcp{,6} for LISTEN sockets bound to `port`.
+
+    Returns a list of (uid:int, inode:str) for every match. The socket owner's
+    uid is world-readable in /proc/net/tcp, so this works even when the port is
+    held by another user's process (unlike `ss -p`, which needs root to show
+    other users' pids).
+    """
+    out = []
+    for pf in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(pf) as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for line in lines[1:]:  # skip header
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            if parts[3] != "0A":  # TCP_LISTEN
+                continue
+            hexport = parts[1].rsplit(":", 1)[-1]
+            try:
+                if int(hexport, 16) != port:
+                    continue
+                uid = int(parts[7])
+            except ValueError:
+                continue
+            out.append((uid, parts[9]))
+    return out
+
+
+def _pids_for_inode(inode):
+    """Return pids whose /proc/<pid>/fd contains socket:[<inode>] (only those
+    the current user can see — sufficient for the same-user case)."""
+    target = f"socket:[{inode}]"
+    pids = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        fdd = os.path.join("/proc", name, "fd")
+        try:
+            fds = os.listdir(fdd)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fdd, fd)) == target:
+                    pids.append(int(name))
+                    break
+            except OSError:
+                continue
+    return pids
+
+
+def _proc_cmdline(pid):
+    """Best-effort command line for a pid ('' -> comm fallback -> None)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+        cmd = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+        if cmd:
+            return cmd
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def make_server(host, requested_port, handler, max_scan=50):
+    """Bind the daemon's HTTP server, applying the occupied-port policy.
+
+    * requested_port free            -> bind and return it.
+    * busy, held by the SAME user    -> print the offending pid(s)/cmdline and
+                                        exit(1) (it's this user's own daemon).
+    * busy, held by a DIFFERENT user -> scan upward for the next free port.
+
+    Returns (server, actual_port).
+    """
+    try:
+        return ThreadingHTTPServer((host, requested_port), handler), \
+            requested_port
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
+
+    owners = _listen_sockets_on_port(requested_port)
+    my_uid = os.getuid()
+    if any(uid == my_uid for uid, _ in owners):
+        print(f"error: port {requested_port} is already in use by YOU "
+              f"(user '{_username(my_uid)}').", file=sys.stderr)
+        printed = False
+        for uid, inode in owners:
+            if uid != my_uid:
+                continue
+            for pid in _pids_for_inode(inode):
+                cmd = _proc_cmdline(pid) or "(unknown command)"
+                print(f"  pid {pid}: {cmd}", file=sys.stderr)
+                printed = True
+        if not printed:
+            print("  (could not resolve the owning pid from /proc)",
+                  file=sys.stderr)
+        print("Stop that process or pass a different --port.", file=sys.stderr)
+        sys.exit(1)
+
+    # Held by another user (or owner unknown): find the next free port.
+    other = f" (used by user '{_username(owners[0][0])}')" if owners else ""
+    for port in range(requested_port + 1, requested_port + 1 + max_scan):
+        try:
+            server = ThreadingHTTPServer((host, port), handler)
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                continue
+            raise
+        print(f"notice: port {requested_port} busy{other}; "
+              f"using port {port} instead.", file=sys.stderr)
+        return server, port
+
+    print(f"error: port {requested_port} busy{other} and no free port found "
+          f"in [{requested_port + 1}, {requested_port + max_scan}].",
+          file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Live AIE debug/test daemon for host_schedule.html")
@@ -1577,14 +1716,17 @@ def main():
                                claude_model=args.claude_model,
                                llm_enabled=not args.no_llm,
                                llm_password=llm_password)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    # Bind the server, applying the occupied-port policy: exit + list pid(s) if
+    # this same user already holds the port, else fall forward to the next free
+    # port when another user holds it.
+    server, port = make_server(args.host, args.port, Handler)
     # When bound to all interfaces, show the LAN IP so the URL is reachable from
     # another machine (0.0.0.0 is not itself a connectable address).
     disp_host = _lan_ip() if args.host in ("0.0.0.0", "") else args.host
-    url = f"http://{disp_host}:{args.port}/"
+    url = f"http://{disp_host}:{port}/"
     print(f"schedule_debug_server serving {workdir}")
     print(f"  URL:        {url}")
-    print(f"  bind:       {args.host}:{args.port}")
+    print(f"  bind:       {args.host}:{port}")
     print(f"  ELF:        {elf or 'auto (apppaltest -y default)'}")
     print(f"  applog:     {applog}")
     print(f"  aiedbg:     {'found' if _hw_available() else 'NOT FOUND (live reads disabled)'}")

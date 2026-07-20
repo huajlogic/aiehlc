@@ -128,7 +128,8 @@ static void scalar_conv2d(const int8_t *input, const int8_t *filter, int8_t *out
                     acc = 127;
                 else if (acc < -128)
                     acc = -128;
-                output[(oh * OUTPUT_W + ow) * NUM_FILTERS + f] = (int8_t)acc;
+                // NCHW [F, OH, OW]: C-plane outer, row H, col W inner.
+                output[(f * OUTPUT_H + oh) * OUTPUT_W + ow] = (int8_t)acc;
             }
         }
     }
@@ -138,8 +139,8 @@ static void scalar_conv2d(const int8_t *input, const int8_t *filter, int8_t *out
 // Verify AIE conv2d output against CPU reference
 //
 // Computes naive conv2d on CPU, then compares flat output arrays.
-// The AIE output is in GEMM layout [M, N] = [OH*OW, F], which is the same
-// as [OH, OW, F] in row-major when F (N) is the fastest-varying dimension.
+// Both the AIE output and the CPU reference are in NCHW layout [F, OH, OW]
+// (C-plane outer, W fastest-varying), so a flat element-wise compare is valid.
 // ═══════════════════════════════════════════════════════════════════════════
 static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t *output_aie) {
     const int total = OUTPUT_H * OUTPUT_W * NUM_FILTERS;
@@ -156,10 +157,12 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
 
     for (int i = 0; i < total; i++) {
         if (output_aie[i] != ref[i]) {
-            int oh = i / (OUTPUT_W * NUM_FILTERS);
-            int ow = (i / NUM_FILTERS) % OUTPUT_W;
-            int f = i % NUM_FILTERS;
-            printf("MISMATCH output[%d,%d,%d] (flat %d): got %d, expected %d\n", oh, ow, f, i, output_aie[i], ref[i]);
+            // NCHW [F, OH, OW] decode: f outer, oh middle, ow inner.
+            int f = i / (OUTPUT_H * OUTPUT_W);
+            int oh = (i / OUTPUT_W) % OUTPUT_H;
+            int ow = i % OUTPUT_W;
+            printf("MISMATCH output[f=%d,oh=%d,ow=%d] (flat %d): got %d, expected %d\n", f, oh, ow, i, output_aie[i],
+                   ref[i]);
             mismatches++;
             if (mismatches > 128)
                 break;
@@ -191,24 +194,24 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
         printf("]\n");
     }
 
-    // Print output
-    printf("\nOutput AIE [%dx%dx%d]:\n", OUTPUT_H, OUTPUT_W, NUM_FILTERS);
+    // Print output (NCHW: plane f=0 = output[0*OH*OW + oh*OW + ow])
+    printf("\nOutput AIE [%dx%dx%d] (f=0 plane):\n", NUM_FILTERS, OUTPUT_H, OUTPUT_W);
     for (int oh = 0; oh < OUTPUT_H; oh++) {
         printf("  [");
         for (int ow = 0; ow < OUTPUT_W; ow++) {
-            printf("%4d", output_aie[(oh * OUTPUT_W + ow) * NUM_FILTERS]);
+            printf("%4d", output_aie[oh * OUTPUT_W + ow]);
             if (ow < OUTPUT_W - 1)
                 printf(",");
         }
         printf("]\n");
     }
 
-    // Print reference
-    printf("\nOutput REF [%dx%dx%d]:\n", OUTPUT_H, OUTPUT_W, NUM_FILTERS);
+    // Print reference (NCHW: plane f=0)
+    printf("\nOutput REF [%dx%dx%d] (f=0 plane):\n", NUM_FILTERS, OUTPUT_H, OUTPUT_W);
     for (int oh = 0; oh < OUTPUT_H; oh++) {
         printf("  [");
         for (int ow = 0; ow < OUTPUT_W; ow++) {
-            printf("%4d", ref[(oh * OUTPUT_W + ow) * NUM_FILTERS]);
+            printf("%4d", ref[oh * OUTPUT_W + ow]);
             if (ow < OUTPUT_W - 1)
                 printf(",");
         }
@@ -261,7 +264,7 @@ static int verify_im2col_equivalence(const int8_t *input, const int8_t *filter) 
     int mismatches = 0;
     for (int i = 0; i < M * N; i++) {
         if (gemm_out[i] != conv_out[i]) {
-            printf("IM2COL SANITY FAIL at %d: im2col+matmul=%d, naive=%d\n", i, gemm_out[i], conv_out[i]);
+            // printf("IM2COL SANITY FAIL at %d: im2col+matmul=%d, naive=%d\n", i, gemm_out[i], conv_out[i]);
             mismatches++;
         }
     }

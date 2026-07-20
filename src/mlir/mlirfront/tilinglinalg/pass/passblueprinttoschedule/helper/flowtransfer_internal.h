@@ -190,7 +190,8 @@ struct ConvHaloGeom {
 ConvHaloGeom detectConvHalo(ModuleOp moduleOp);
 
 OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passState, MemRefType memrefType,
-                                               int64_t numCoreTiles, ModuleOp moduleOp, int64_t ooElementSizeBytes);
+                                               int64_t numCoreTiles, ModuleOp moduleOp, int64_t ooElementSizeBytes,
+                                               mlir::Attribute tilingAttr = nullptr);
 
 // ---------------------------------------------------------------------------
 // FlowLoweringCtx — trunk state shared across the extracted host/kernel helpers.

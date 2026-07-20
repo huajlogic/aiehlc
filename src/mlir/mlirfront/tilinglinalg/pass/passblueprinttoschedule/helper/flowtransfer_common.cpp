@@ -413,7 +413,8 @@ ConvHaloGeom detectConvHalo(ModuleOp moduleOp) {
 // with N = output row width (= OC for conv) and M split into mRounds x tileM. The
 // per-tile column split (numCoreTiles) handles the N dimension via per-tile offsets.
 OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passState, MemRefType memrefType,
-                                               int64_t numCoreTiles, ModuleOp moduleOp, int64_t ooElementSizeBytes) {
+                                               int64_t numCoreTiles, ModuleOp moduleOp, int64_t ooElementSizeBytes,
+                                               mlir::Attribute tilingAttr) {
     OutputTileDescriptor desc;
 
     unsigned bitWidth = memrefType.getElementTypeBitWidth();
@@ -433,62 +434,97 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
     // scattered into the full [OH, OW, OC] image, across wRounds L->R x l2Rounds T->B.
     ConvHaloGeom halo = detectConvHalo(moduleOp);
     if (halo.valid && memrefType.getRank() == 3) {
-        // === 3D conv output, channel-split (LtoR_Merge mesh_tiling_group2=C) ===
-        // The DDR partition VIEW for one shim channel is now ALREADY channel-split
-        // (Part 1): [H_meshrow, W, C_per_group] row-major (e.g. [28,112,16]). The
-        // numCoreTiles gathered cores are the mesh COLS, each owning C_per_group
-        // contiguous channels (group2 split). Each core fires spatial_out_rounds
-        // times, one [ohPerRow, OW_T, cPerCore] block per fire, interleaved on C
-        // into the FULL row-major image (NOT a contiguous block).
+        // === 3D conv output, channel-split (LtoR_Merge), NCHW DDR layout ===
+        // The C (output) DDR tensor is laid out NCHW [F, OH, OW] (C-plane outer,
+        // row H, col W innermost/contiguous). Each mesh-COL core owns cPerCore
+        // contiguous C-planes (group2 split) and fires wRounds(W) x hChunks(H)
+        // times, one [cPerCore, ohPerRow, owT] block per fire, scattered into the
+        // full NCHW image. The shim S2MM gather BD therefore addresses:
+        //   D0 = W word    (contiguous run owT elements, in 32-bit words)
+        //   D1 = H row     (one image row OUTPUT_W apart)
+        //   D2 = C plane   (one C-plane OUTPUT_H*OUTPUT_W apart)
         //
-        // The DESTINATION image layout is the full <OH, OW, OC> row-major buffer,
-        // so all stride constants must use the FULL channel count OC = C_per_group *
-        // numCoreTiles (the memref view only exposes one group's C, C_per_group).
-        int64_t haloOwT = halo.owT;         // OW_T columns per width-round (e.g. 28)
-        int64_t haloWRounds = halo.wRounds; // L->R (W) rounds (e.g. 4)
-        int64_t hChunks = halo.l2Rounds;    // T->B (H) rounds (e.g. 4)
+        // ALL geometry is derived from the partition #routing.tiling attr:
+        //   d0 (H): outer{base=OUTPUT_H,slice,step,rounds}, slice_tiling{slice=ohPerRow,rounds=hChunks}
+        //   d1 (W): outer{base=OUTPUT_W,slice=owT,rounds=wRounds}
+        //   d2 (C): outer{base=fullC,slice=cPerCore}
+        // Fallback to detectConvHalo + memref shape only when the attr is absent.
+        int64_t OUTPUT_H = 0, OUTPUT_W = 0, fullC = 0;
+        int64_t ohPerRow = 0, owT = 0, wRounds = 0, hChunks = 0, cPerCore = 0;
 
-        int64_t fullW = memrefType.getDimSize(1);                                // 112
-        int64_t cPerCore = memrefType.getDimSize(2);                             // 16 (already split)
-        int64_t fullC = (numCoreTiles > 0) ? cPerCore * numCoreTiles : cPerCore; // 64 (dest image OC)
-        int64_t cPerCore_w = cPerCore / elemsPerWord;                            // 4 (i8)
+        auto tiling = tilingAttr ? dyn_cast_or_null<routing::TilingAttr>(tilingAttr) : routing::TilingAttr();
+        if (tiling && tiling.getDims().size() >= 3) {
+            auto dims = tiling.getDims();
+            routing::LevelAttr d0Outer = dims[0].getOuter(); // H
+            routing::LevelAttr d1Outer = dims[1].getOuter(); // W
+            routing::LevelAttr d2Outer = dims[2].getOuter(); // C
+            OUTPUT_H = d0Outer.getBase();
+            OUTPUT_W = d1Outer.getBase();
+            fullC = d2Outer.getBase();
+            owT = d1Outer.getSlice();
+            wRounds = d1Outer.getRounds();
+            cPerCore = d2Outer.getSlice();
+            if (routing::LevelAttr d0Inner = d0Outer.getSliceTiling()) {
+                ohPerRow = d0Inner.getSlice();
+                hChunks = d0Inner.getRounds();
+            }
+        }
 
-        // ohPerRow (image rows per BD fire) from the authoritative per-core slab.
-        // The view is one core's full data (channel already split), so perCoreElems
-        // is the whole view (do NOT divide by numCoreTiles: those are the C groups,
-        // already excluded from this view).
-        int64_t perCoreElems = 1;
-        for (int64_t d = 0; d < memrefType.getRank(); ++d)
-            perCoreElems *= memrefType.getDimSize(d);
-        int64_t outRounds = haloWRounds * hChunks;
-        if (auto orAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds"))
-            if (orAttr.getInt() > 0)
-                outRounds = orAttr.getInt();
-        int64_t slabElems = (outRounds > 0) ? (perCoreElems / outRounds) : perCoreElems;
-        int64_t colElems = haloOwT * cPerCore; // OW_T columns * C-per-group
-        int64_t ohPerRow = (colElems > 0) ? (slabElems / colElems) : 1;
-        if (ohPerRow <= 0)
-            ohPerRow = 1;
+        // Fallback derivation (no tiling attr): reuse the detectConvHalo heuristic
+        // and the (channel-split) memref view + numCoreTiles, matching the tiling
+        // attr values on the working conv (OUTPUT_H = ohPerRow*hChunks*meshRows is
+        // not directly known, so approximate via the view's dim0 * numCoreTiles is
+        // NOT valid for H; the tiling attr is the authoritative source and is
+        // always present on the conv output partition).
+        if (!(ohPerRow > 0 && owT > 0 && wRounds > 0 && hChunks > 0 && cPerCore > 0 && OUTPUT_H > 0 && OUTPUT_W > 0 &&
+              fullC > 0)) {
+            owT = halo.owT;
+            wRounds = halo.wRounds;
+            hChunks = halo.l2Rounds;
+            OUTPUT_W = memrefType.getDimSize(1);
+            cPerCore = memrefType.getDimSize(2);
+            fullC = (numCoreTiles > 0) ? cPerCore * numCoreTiles : cPerCore;
+            int64_t perCoreElems = 1;
+            for (int64_t d = 0; d < memrefType.getRank(); ++d)
+                perCoreElems *= memrefType.getDimSize(d);
+            int64_t outRounds = wRounds * hChunks;
+            if (auto orAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds"))
+                if (orAttr.getInt() > 0)
+                    outRounds = orAttr.getInt();
+            int64_t slabElems = (outRounds > 0) ? (perCoreElems / outRounds) : perCoreElems;
+            int64_t colElems = owT * cPerCore;
+            ohPerRow = (colElems > 0) ? (slabElems / colElems) : 1;
+            if (ohPerRow <= 0)
+                ohPerRow = 1;
+            // OUTPUT_H = per-mesh-row H (dim0) * mesh rows; mesh rows = ohPerRow*hChunks
+            // rows-per-shim-view / ohPerRow-per-fire is ambiguous without the attr, so
+            // fall back to the full-image H = ohPerRow * hChunks (single mesh row).
+            OUTPUT_H = ohPerRow * hChunks;
+        }
 
-        // One BD fire = one [ohPerRow, OW_T, cPerCore] channel-interleaved block.
-        desc.bdLenBytes = ohPerRow * haloOwT * cPerCore * ooElementSizeBytes;
+        int64_t owT_w = owT / elemsPerWord; // OW_T columns in 32-bit words (contiguous)
 
-        // BD scatter dims, innermost-first (row-major [H,W,C]):
-        desc.bdDims.push_back({1 * wordBytes, cPerCore_w});           // D0: C-group words (contiguous)
-        desc.bdDims.push_back({fullC * elemBytes, haloOwT});          // D1: OW_T pixels, one pixel (C) apart
-        desc.bdDims.push_back({fullW * fullC * elemBytes, ohPerRow}); // D2: oh_per_row rows, one image row apart
+        // One BD fire = one [cPerCore, ohPerRow, owT] NCHW block.
+        desc.bdLenBytes = ohPerRow * owT * cPerCore * ooElementSizeBytes;
 
-        // The width (L->R) rounds are folded into the BD iteration dim; the height
-        // (T->B) rounds become the scf.for outer round loop.
-        desc.iterStep = static_cast<int32_t>(haloOwT * fullC * elemBytes); // advance OW_T pixels
-        desc.iterWrap = static_cast<int32_t>(haloWRounds);
+        // BD scatter dims, innermost-first (NCHW [C,H,W], W contiguous):
+        desc.bdDims.push_back({wordBytes, owT_w});                          // D0: W words (contiguous run)
+        desc.bdDims.push_back({OUTPUT_W * elemBytes, ohPerRow});            // D1: H rows, one image row apart
+        desc.bdDims.push_back({OUTPUT_H * OUTPUT_W * elemBytes, cPerCore}); // D2: C planes, one plane apart
+
+        // Width (L->R) rounds fold into the BD iteration; height (T->B) rounds
+        // become the scf.for outer round loop.
+        desc.iterStep = static_cast<int32_t>(owT * elemBytes); // advance OW_T columns (W)
+        desc.iterWrap = static_cast<int32_t>(wRounds);
         desc.totalRounds = hChunks;
 
-        // Per-round base-offset: only the height (T->B) chunks move the base.
-        desc.roundDims.push_back({hChunks, ohPerRow * fullW * fullC * elemBytes});
+        // Per-round base-offset: only the height (T->B) chunks move the base, by
+        // ohPerRow image rows.
+        desc.roundDims.push_back({hChunks, ohPerRow * OUTPUT_W * elemBytes});
 
-        // Per-mesh-col tile offset advances by the owned channel group (group2 split).
-        desc.perTileStrideBytes = cPerCore * elemBytes;
+        // Per-mesh-col tile offset advances by the owned C-group = cPerCore planes,
+        // each plane OUTPUT_H*OUTPUT_W bytes.
+        desc.perTileStrideBytes = cPerCore * OUTPUT_H * OUTPUT_W * elemBytes;
 
         return desc;
     }
