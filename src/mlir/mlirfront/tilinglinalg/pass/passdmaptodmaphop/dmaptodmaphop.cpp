@@ -503,9 +503,67 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
     }
     // Calculate slice size and offsets for each tile
     if (direction == DataflowDirection::Pull) {
+        // ----- Atomic kernel-fire slab (group2 conv OUTPUT) -----
+        // Default (matmul / non-tiled): each producer is the even row split
+        // <shape[splitDim]/numTiles, ...full...>. For the group2 conv OUTPUT the
+        // per-core view is already channel-split (Part 1), and the on-core H/W
+        // iteration lives in the partition tiling attr. In that case the atomic
+        // per-fire slab is <H_slice x W_slice x C_full>:
+        //   H_slice = d[splitDim].outer.slice_tiling.slice  (e.g. 7)
+        //   W_slice = d[wDim].outer.slice                   (e.g. 28)
+        //   C_full  = shape[cDim]                           (e.g. 16, already split)
+        // Each producer sits at local offset [0,0,0]; the DDR gather strides
+        // (shim S2MM BD) realise the 4x4 H/W placement, not the subslice offset.
+        int64_t atomHSlice = -1; // <0 => fall back to even split
+        int64_t atomWSlice = -1;
+        int wDimIdx = -1;
+        if (rank >= 3) {
+            // Trace dataId (extract_data) -> partitiontensor -> tiling attr.
+            routing::TilingAttr tiling;
+            if (auto extractOp = dataValue.getDefiningOp<routing::extract_data>()) {
+                if (auto part = extractOp.getTensor().getDefiningOp<routing::partitiontensor>()) {
+                    tiling = part.getTilingAttr();
+                }
+            }
+            if (tiling) {
+                auto dims = tiling.getDims();
+                if (splitDim < (int64_t)dims.size()) {
+                    // H atomic slice = on-core slice_tiling slice under the split dim.
+                    if (auto inner = dims[splitDim].getOuter().getSliceTiling()) {
+                        if (inner.getSlice() > 0)
+                            atomHSlice = inner.getSlice(); // e.g. 7
+                    }
+                }
+                // W = the first non-split, non-channel dim (channel is the last dim).
+                for (int64_t d = 0; d < rank; ++d) {
+                    if (d == splitDim || d == rank - 1)
+                        continue;
+                    if (d < (int64_t)dims.size()) {
+                        int64_t ws = dims[d].getOuter().getSlice();
+                        if (ws > 0 && ws < shape[d]) {
+                            atomWSlice = ws; // e.g. 28
+                            wDimIdx = (int)d;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        bool atomicSlab = (atomHSlice > 0);
+
         for (size_t i = 0; i < coreTiles.size(); ++i) {
             for (int64_t d = 0; d < rank; ++d) {
-                if (d == splitDim) {
+                if (atomicSlab) {
+                    // Atomic slab: local offset 0 on every dim; size is the atomic
+                    // extent (H slice / W chunk / full channel).
+                    offsets[d] = rewriter.getIndexAttr(0);
+                    if (d == splitDim)
+                        sizes[d] = rewriter.getIndexAttr(atomHSlice);
+                    else if (d == wDimIdx && atomWSlice > 0)
+                        sizes[d] = rewriter.getIndexAttr(atomWSlice);
+                    else
+                        sizes[d] = rewriter.getIndexAttr(shape[d]);
+                } else if (d == splitDim) {
                     // Sliced dimension - Static calculation
                     int64_t dimSize = shape[d];
                     // Assuming static shape for now as requested
@@ -520,11 +578,18 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
                     sizes[d] = rewriter.getIndexAttr(shape[d]);
                 }
             }
-            
+
             // Calculate result type for this slice
             SmallVector<int64_t> sliceShape;
             for (int64_t d = 0; d < rank; ++d) {
-                if (d == splitDim) {
+                if (atomicSlab) {
+                    if (d == splitDim)
+                        sliceShape.push_back(atomHSlice);
+                    else if (d == wDimIdx && atomWSlice > 0)
+                        sliceShape.push_back(atomWSlice);
+                    else
+                        sliceShape.push_back(shape[d]);
+                } else if (d == splitDim) {
                     if (shape[d] == ShapedType::kDynamic)
                         sliceShape.push_back(ShapedType::kDynamic);
                     else
@@ -534,20 +599,13 @@ static LogicalResult lowerDataMovementOp(Operation *op, ConversionPatternRewrite
                 }
             }
             auto sliceType = RankedTensorType::get(sliceShape, rankedType.getElementType());
-            
-            auto slice = rewriter.create<tensor::ExtractSliceOp>(
-                loc, 
-                sliceType,
-                dataId, 
-                offsets, 
-                sizes, 
-                strides
-            );
-            
+
+            auto slice = rewriter.create<tensor::ExtractSliceOp>(loc, sliceType, dataId, offsets, sizes, strides);
+
             std::string tagName = (direction == DataflowDirection::Push) ? "consumer" : "producer";
             tagName += std::to_string(i);
             slice->setAttr("tag", rewriter.getStringAttr(tagName));
-            
+
             coreBuffers.push_back(slice.getResult());
         }
     } else {

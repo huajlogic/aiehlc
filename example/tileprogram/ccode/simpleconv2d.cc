@@ -101,6 +101,10 @@ constexpr int OC_PER_G = 16;       // 64 / 4 (tile cols per filter group, for N=
 #ifndef INPUT_C_ALIGN
 #define INPUT_C_ALIGN 4
 #endif
+// OUTPUT logic
+#define OUTPUT_FULL_H 112
+#define OUTPUT_FULL_W 112
+#define OUTPUT_FULL_C 64
 
 // kernel
 constexpr int KERNEL_ROWS = OC_PER_G;             // 16
@@ -216,12 +220,21 @@ constexpr aie::GemmSpace ColBC = {
            .padsize = INPUT_C_ALIGN - INPUT_C}}; // K
 
 constexpr aie::GemmSpace LtoR_Merge = {
-    .policy = {.map = {.layout = aie::Layout::Row, .merge_order = aie::Flow::LeftToRight},
+    .policy = {.map = {.layout = aie::Layout::Row,
+                       .merge_order = aie::Flow::LeftToRight,
+                       .mesh_tiling_group1_dim = 1 /*d1 = H, split across mesh rows*/,
+                       .mesh_tiling_group2_dim = 3 /*d3 = channel, split across mesh cols*/},
                .mat = {.pad = aie::PadMaterialize::DDR, .im2col = aie::Im2col::None},
                .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
-    .d1 = {.tile_size = OH_T, .stride = OH_T}, // M-tile (output tile rows)
-    .d2 = {.tile_size = OW_T, .stride = OW_T},
-    .d3 = {.tile_size = OC_PER_G, .stride = OC_PER_G},
+    .d1 = {.fullsize = OUTPUT_FULL_H, // 230 padded H
+           .tile_round = 4,
+           .tile_size = 28, // outer height slice (rows per mesh row)
+           .stride = 28,
+           .slice_tiling = {.tile_size = 7, // 19 rows per on-core round
+                            .stride = 7,    // 14 row step between rounds
+                            .rounds = 4}},
+    .d2 = {.fullsize = OUTPUT_FULL_W, .tile_round = 4, .tile_size = 28, .stride = 28},
+    .d3 = {.fullsize = 64, .tile_round = 4, .tile_size = 16},
 }; // N-tile (output tile cols)
 // Note: C output space must be described with the FULL output tile size, not the per-tile sub-split, because the
 // compiler needs to know the full tile coverage

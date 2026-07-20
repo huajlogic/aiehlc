@@ -224,7 +224,16 @@ LogicalResult FlowTransferConversion::computeShimBdParams(FlowLoweringCtx &c) co
 
     c.ooFullPartitionElements = shimBdLen / c.ooElementSizeBytes;
     c.ooPerCoreElements = c.ooFullPartitionElements;
-    if (c.isManyToOne)
+    // group2 conv OUTPUT (channel-split): the partition VIEW is ALREADY channel-
+    // split (Part 1), so shimBdLen == ONE core's full output (one channel group).
+    // Do NOT re-divide by numCoreTiles (kept in lockstep with flowtransfer_kernel.cpp).
+    bool ooGroup2ConvOutput = false;
+    if (c.isManyToOne && memrefType.getRank() == 3) {
+        auto moduleOpG2 = op->getParentOfType<ModuleOp>();
+        if (detectConvHalo(moduleOpG2).valid)
+            ooGroup2ConvOutput = true;
+    }
+    if (c.isManyToOne && !ooGroup2ConvOutput)
         c.ooPerCoreElements = c.ooFullPartitionElements / numCoreTiles;
 
     c.ooPingPongSize = c.ooPerCoreElements;
@@ -359,6 +368,11 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
             c.oooIterWrap = c.outDesc.iterWrap;
             c.oooMRounds = c.outDesc.totalRounds;
             c.usedMRounds3D = true;
+
+            // 3D channel-split (LtoR conv) overrides the per-tile DDR offset: the
+            // gathered cores are mesh COLS interleaved on C, not contiguous blocks.
+            if (c.outDesc.perTileStrideBytes > 0)
+                c.perTileStrideFromDims = c.outDesc.perTileStrideBytes;
 
             llvm::errs() << "[OOO ShimBD desc] tileM=" << tileM << " tileRows=" << tileRowsVal
                          << " bdDims=" << c.outDesc.bdDims.size() << " roundDims=" << c.outDesc.roundDims.size()

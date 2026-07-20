@@ -134,7 +134,18 @@ LogicalResult FlowTransferConversion::emitCoreTileParams(FlowLoweringCtx &c, Cor
     // one_to_many (broadcast/input): each core receives the full partition.
     t.fullPartitionElements = t.bufferSize / t.elementSizeBytes;
     t.perCoreElements = t.fullPartitionElements;
-    if (c.transferType == "many_to_one")
+    // group2 conv OUTPUT (channel-split): the partition VIEW is ALREADY channel-
+    // split (Part 1, e.g. [28,112,16]), so bufferLen == ONE core's full output
+    // (one channel group). Do NOT re-divide by numCoreTiles: the other cores' data
+    // is a *different* channel group, not part of this view. The rank-3 conv-halo
+    // many_to_one gather is the exclusive signal.
+    bool group2ConvOutput = false;
+    {
+        auto moduleOpG2 = op->getParentOfType<ModuleOp>();
+        if (c.transferType == "many_to_one" && c.memrefType.getRank() == 3 && detectConvHalo(moduleOpG2).valid)
+            group2ConvOutput = true;
+    }
+    if (c.transferType == "many_to_one" && !group2ConvOutput)
         t.perCoreElements = t.fullPartitionElements / c.numCoreTiles;
     // K-round adjustment: for input flows with kRounds > 1, the kernel
     // operates on per-k-round data (tile_rows * effectiveK), not the

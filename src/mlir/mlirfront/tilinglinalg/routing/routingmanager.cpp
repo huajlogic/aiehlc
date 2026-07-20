@@ -950,6 +950,121 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                     partTensor.setTilingAttr(routing::TilingAttr::get(ctx2, dims));
                 }
 
+                // Second mesh-axis (group2) split for the OUTPUT (row-owned) tensor:
+                // within each mesh ROW the tensor is further split across mesh COLS
+                // along a *different* tensor dim than the row split (e.g. channel d3).
+                // Emit a #routing.tiling whose channel dim encodes the group2 split so
+                // DmaphopTodfscheblueprintPass can build a channel-interleave shim S2MM
+                // reassembly BD instead of the default width interleave.
+                //
+                // The per-tile split SHAPE is ALSO channel-reduced below (splitShape):
+                // each mesh COL only produces group2Slice channels (e.g. 64/4=16), so
+                // the partition tensor's per-tile view is <H/meshRows x W x group2Slice>
+                // (e.g. [28,112,16]). The on-core H/W iteration (group1 L2 rounds, d2 W
+                // chunk) still lives in the tiling attr's slice_tiling levels.
+                bool isGroup2 = (!isHalo && split.group2Dim > 0 && split.group2Slice > 0 && split.group2Full > 0 &&
+                                 splitnum > 1 && split.hwAxisOwner == "row");
+                if (isGroup2 && tensorType.getShape().size() >= 3) {
+                    // 3D conv OUTPUT tensor <H x W x C>: build a genuine 3-dim
+                    // #routing.tiling that follows LtoR_Merge d1/d2/d3 directly
+                    // (no H*W flattening). Each tensor dim is independent:
+                    //   d0 = H : mesh-row split (outer slice=H/meshRows) + optional
+                    //            on-core L2 slice_tiling (group1L2Slice/Step/Rounds).
+                    //   d1 = W : on-core chunk (d2Slice/d2Step/d2Rounds).
+                    //   d2 = C : group2 mesh-col split (group2Slice, rounds=meshCols).
+                    auto *ctx2 = builder.getContext();
+                    auto shape = tensorType.getShape();
+                    int sd = (split.splitDim == 0) ? 0 : 1; // mesh-row (H) split dim
+                    int64_t rowSlice = (shape[sd] != ShapedType::kDynamic) ? shape[sd] / (int64_t)splitnum : shape[sd];
+                    // d0 = H : on-core L2 nested slice (pure H rows, no rowPitch scaling).
+                    routing::LevelAttr hOnCore;
+                    if (split.group1L2Rounds > 1 && split.group1L2Slice > 0) {
+                        hOnCore = routing::LevelAttr::get(
+                            ctx2, /*base=*/rowSlice,
+                            /*total=*/(int64_t)split.group1L2Slice * split.group1L2Rounds,
+                            /*slice=*/(int64_t)split.group1L2Slice, /*step=*/(int64_t)split.group1L2Step,
+                            /*rounds=*/(int64_t)split.group1L2Rounds, /*slice_tiling=*/routing::LevelAttr{});
+                    }
+                    auto hOuter =
+                        routing::LevelAttr::get(ctx2, /*base=*/shape[sd], /*total=*/rowSlice * (int64_t)splitnum,
+                                                /*slice=*/rowSlice, /*step=*/rowSlice, /*rounds=*/(int64_t)splitnum,
+                                                /*slice_tiling=*/hOnCore);
+                    auto hDim = routing::DimAttr::get(ctx2, hOuter);
+                    // d1 = W : on-core width chunk. Degenerates to a single full-dim
+                    // slice when d2 rounds are absent.
+                    int64_t wSlice = (split.d2Rounds > 1 && split.d2Slice > 0) ? (int64_t)split.d2Slice : shape[1];
+                    int64_t wStep = (split.d2Rounds > 1 && split.d2Step > 0) ? (int64_t)split.d2Step : shape[1];
+                    int64_t wRounds = (split.d2Rounds > 1) ? (int64_t)split.d2Rounds : 1;
+                    auto wOuter = routing::LevelAttr::get(ctx2, /*base=*/shape[1], /*total=*/wSlice * wRounds,
+                                                          /*slice=*/wSlice, /*step=*/wStep, /*rounds=*/wRounds,
+                                                          /*slice_tiling=*/routing::LevelAttr{});
+                    auto wDim = routing::DimAttr::get(ctx2, wOuter);
+                    // d2 = C : group2 mesh-col split (each of meshCols tiles owns
+                    // group2Slice channels of group2Full).
+                    int64_t g2Rounds = meshCols;
+                    auto cOuter = routing::LevelAttr::get(ctx2, /*base=*/(int64_t)split.group2Full,
+                                                          /*total=*/(int64_t)split.group2Slice * g2Rounds,
+                                                          /*slice=*/(int64_t)split.group2Slice,
+                                                          /*step=*/(int64_t)split.group2Slice,
+                                                          /*rounds=*/g2Rounds, /*slice_tiling=*/routing::LevelAttr{});
+                    auto cDim = routing::DimAttr::get(ctx2, cOuter);
+                    llvm::SmallVector<routing::DimAttr> dims{hDim, wDim, cDim};
+                    partTensor.setTilingAttr(routing::TilingAttr::get(ctx2, dims));
+                } else if (isGroup2) {
+                    auto *ctx2 = builder.getContext();
+                    auto shape = tensorType.getShape();
+                    int sd = (split.splitDim == 0) ? 0 : 1; // mesh-row (H) split dim
+                    int colTensorDim = 1 - sd;              // flattened W*C dim carries channel
+                    // Row (mesh-row) outer level: even split of H across mesh rows.
+                    int64_t rowSlice = (shape[sd] != ShapedType::kDynamic) ? shape[sd] / (int64_t)splitnum : shape[sd];
+                    // Nested output row-dim chain (innermost first). The flat M dim is
+                    // H-major (flat = h * rowPitch + w); encode the group1 (d1) on-core
+                    // H rounds as L2 and the d2 (W) chunk as L3. Logical W cols and H
+                    // rows are recorded; the row pitch is implicit from the parent
+                    // base/rounds (same convention as the input halo slice_tiling).
+                    int64_t rowPitch = (split.d2Full > 0) ? (int64_t)split.d2Full : 1; // e.g. 112
+                    // L3: d2 W chunk (logical cols; row pitch implicit from parent).
+                    routing::LevelAttr wLevel;
+                    if (split.d2Rounds > 1 && split.d2Slice > 0) {
+                        wLevel = routing::LevelAttr::get(
+                            ctx2, /*base=*/rowPitch,
+                            /*total=*/(int64_t)split.d2Slice * split.d2Rounds,
+                            /*slice=*/(int64_t)split.d2Slice, /*step=*/(int64_t)split.d2Step,
+                            /*rounds=*/(int64_t)split.d2Rounds, /*slice_tiling=*/routing::LevelAttr{});
+                    }
+                    // L2: d1 on-core H round (flat = logicalRows * rowPitch).
+                    routing::LevelAttr hOnCore;
+                    if (split.group1L2Rounds > 1 && split.group1L2Slice > 0) {
+                        int64_t fSlice = (int64_t)split.group1L2Slice * rowPitch; // e.g. 7*112=784
+                        int64_t fStep = (int64_t)split.group1L2Step * rowPitch;   // e.g. 784
+                        hOnCore = routing::LevelAttr::get(
+                            ctx2, /*base=*/rowSlice, /*total=*/fSlice * split.group1L2Rounds,
+                            /*slice=*/fSlice, /*step=*/fStep, /*rounds=*/(int64_t)split.group1L2Rounds,
+                            /*slice_tiling=*/wLevel);
+                    }
+                    // Outer level unchanged (slice==step==rowSlice) so the downstream
+                    // haloStep = outer.getStep() read stays == sliceSize.
+                    auto rowOuter =
+                        routing::LevelAttr::get(ctx2, /*base=*/shape[sd], /*total=*/rowSlice * (int64_t)splitnum,
+                                                /*slice=*/rowSlice, /*step=*/rowSlice, /*rounds=*/(int64_t)splitnum,
+                                                /*slice_tiling=*/hOnCore);
+                    auto rowDim = routing::DimAttr::get(ctx2, rowOuter);
+                    // Channel (group2) col level: base=group2Full (e.g. 64),
+                    // slice/step=group2Slice (e.g. 16), rounds=meshCols. Each of the
+                    // meshCols tiles in a row owns group2Slice channels of group2Full.
+                    int64_t g2Rounds = meshCols;
+                    auto colOuter = routing::LevelAttr::get(ctx2, /*base=*/(int64_t)split.group2Full,
+                                                            /*total=*/(int64_t)split.group2Slice * g2Rounds,
+                                                            /*slice=*/(int64_t)split.group2Slice,
+                                                            /*step=*/(int64_t)split.group2Slice,
+                                                            /*rounds=*/g2Rounds, /*slice_tiling=*/routing::LevelAttr{});
+                    auto colDim = routing::DimAttr::get(ctx2, colOuter);
+                    llvm::SmallVector<routing::DimAttr> dims(2);
+                    dims[sd] = rowDim;
+                    dims[colTensorDim] = colDim;
+                    partTensor.setTilingAttr(routing::TilingAttr::get(ctx2, dims));
+                }
+
                 // Calculate split tensor shape
                 SmallVector<int64_t> splitShape(tensorType.getShape());
                 if (splitnum > 1) {
@@ -959,6 +1074,18 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                             splitShape[sd] = split.haloSlice; // overlapping slice (e.g. 61)
                         else
                             splitShape[sd] /= splitnum; // even split
+                    }
+                    // group2 (mesh-col) channel split: each mesh COL owns only
+                    // group2Slice channels of the group2Full dim. Reduce that tensor
+                    // dim too so the per-tile view is channel-split (e.g. [28,112,64]
+                    // -> [28,112,16]). Tight guard: isGroup2 already excludes halo /
+                    // 2D-matmul / non-row-owner paths.
+                    if (isGroup2) {
+                        // 3D <H,W,C>: channel is dim 2; 2D flattened W*C: channel dim
+                        // is colTensorDim (1 - sd). Matches the tiling-attr channel dim.
+                        int cDimIdx = (tensorType.getShape().size() >= 3) ? 2 : (1 - sd);
+                        if (splitShape[cDimIdx] != ShapedType::kDynamic)
+                            splitShape[cDimIdx] = split.group2Slice; // e.g. 16
                     }
                 }
                 auto splitTensorType =

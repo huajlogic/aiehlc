@@ -94,6 +94,32 @@ struct TensorSplitDesc {
     int kAccumSlice = 0;
     int kAccumStep = 0;
     int kAccumRounds = 1;
+    // Second mesh-axis (group2) split: within each mesh ROW, the output is
+    // further split across mesh COLS along a *different* tensor dim than the
+    // group1/row split (e.g. channel d3). group2Dim is 1-based; 0/-1 = no
+    // second-axis split. Only the OUTPUT (gather) tensor carries this; inputs
+    // unchanged. Consumed by the shim S2MM reassembly BD to interleave on the
+    // channel dim instead of width. (group1Dim is implicit = splitDim +
+    // hwAxisOwner="row"; stored for validation only.)
+    int group1Dim = 0;   // 1-based tensor dim split across mesh rows (validation)
+    int group2Dim = 0;   // 1-based tensor dim split across mesh cols (e.g. 3 = channel)
+    int group2Slice = 0; // elements per col-tile along group2Dim (e.g. 16)
+    int group2Full = 0;  // full extent of group2Dim (e.g. 64)
+    // Output row-dim (group1 = d1) on-core slice_tiling + d2 (W) chunk. Carried into
+    // the output tensor's #routing.tiling row-dim nested levels (mirrors haloL2* for
+    // input). group1 = mesh-row split dim (e.g. output H); its slice_tiling records
+    // the on-core H rounds. d2 = a non-mesh on-core chunk dim (e.g. output W). These
+    // are *logical* descriptors carried for traceability; consuming them to reshape
+    // the output reassembly BD is separate downstream work.
+    int group1Full = 0;     // d1.fullsize  (output H extent, e.g. 112)
+    int group1Rounds = 0;   // d1.tile_round (mesh-row rounds, e.g. 4)
+    int group1L2Slice = 0;  // d1.slice_tiling.tile_size (logical H rows/round, e.g. 7)
+    int group1L2Step = 0;   // d1.slice_tiling.stride (e.g. 7)
+    int group1L2Rounds = 0; // d1.slice_tiling.rounds (e.g. 4); 0/1 = no on-core H split
+    int d2Slice = 0;        // d2.tile_size (W chunk cols, e.g. 28)
+    int d2Step = 0;         // d2.stride (e.g. 28)
+    int d2Rounds = 0;       // d2.tile_round (e.g. 4); 0/1 = no W chunk
+    int d2Full = 0;         // d2.fullsize (W extent = flat row pitch, e.g. 112)
 };
 
 /// Operation-level split model: one TensorSplitDesc per tensor.

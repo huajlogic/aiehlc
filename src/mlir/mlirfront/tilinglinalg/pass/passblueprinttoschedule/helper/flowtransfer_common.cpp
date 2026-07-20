@@ -432,6 +432,66 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
     // from the halo attrs. Each core produces an [oh_per_row, OW_T, OC_PER_G] tile
     // scattered into the full [OH, OW, OC] image, across wRounds L->R x l2Rounds T->B.
     ConvHaloGeom halo = detectConvHalo(moduleOp);
+    if (halo.valid && memrefType.getRank() == 3) {
+        // === 3D conv output, channel-split (LtoR_Merge mesh_tiling_group2=C) ===
+        // The DDR partition VIEW for one shim channel is now ALREADY channel-split
+        // (Part 1): [H_meshrow, W, C_per_group] row-major (e.g. [28,112,16]). The
+        // numCoreTiles gathered cores are the mesh COLS, each owning C_per_group
+        // contiguous channels (group2 split). Each core fires spatial_out_rounds
+        // times, one [ohPerRow, OW_T, cPerCore] block per fire, interleaved on C
+        // into the FULL row-major image (NOT a contiguous block).
+        //
+        // The DESTINATION image layout is the full <OH, OW, OC> row-major buffer,
+        // so all stride constants must use the FULL channel count OC = C_per_group *
+        // numCoreTiles (the memref view only exposes one group's C, C_per_group).
+        int64_t haloOwT = halo.owT;         // OW_T columns per width-round (e.g. 28)
+        int64_t haloWRounds = halo.wRounds; // L->R (W) rounds (e.g. 4)
+        int64_t hChunks = halo.l2Rounds;    // T->B (H) rounds (e.g. 4)
+
+        int64_t fullW = memrefType.getDimSize(1);                                // 112
+        int64_t cPerCore = memrefType.getDimSize(2);                             // 16 (already split)
+        int64_t fullC = (numCoreTiles > 0) ? cPerCore * numCoreTiles : cPerCore; // 64 (dest image OC)
+        int64_t cPerCore_w = cPerCore / elemsPerWord;                            // 4 (i8)
+
+        // ohPerRow (image rows per BD fire) from the authoritative per-core slab.
+        // The view is one core's full data (channel already split), so perCoreElems
+        // is the whole view (do NOT divide by numCoreTiles: those are the C groups,
+        // already excluded from this view).
+        int64_t perCoreElems = 1;
+        for (int64_t d = 0; d < memrefType.getRank(); ++d)
+            perCoreElems *= memrefType.getDimSize(d);
+        int64_t outRounds = haloWRounds * hChunks;
+        if (auto orAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.spatial_out_rounds"))
+            if (orAttr.getInt() > 0)
+                outRounds = orAttr.getInt();
+        int64_t slabElems = (outRounds > 0) ? (perCoreElems / outRounds) : perCoreElems;
+        int64_t colElems = haloOwT * cPerCore; // OW_T columns * C-per-group
+        int64_t ohPerRow = (colElems > 0) ? (slabElems / colElems) : 1;
+        if (ohPerRow <= 0)
+            ohPerRow = 1;
+
+        // One BD fire = one [ohPerRow, OW_T, cPerCore] channel-interleaved block.
+        desc.bdLenBytes = ohPerRow * haloOwT * cPerCore * ooElementSizeBytes;
+
+        // BD scatter dims, innermost-first (row-major [H,W,C]):
+        desc.bdDims.push_back({1 * wordBytes, cPerCore_w});           // D0: C-group words (contiguous)
+        desc.bdDims.push_back({fullC * elemBytes, haloOwT});          // D1: OW_T pixels, one pixel (C) apart
+        desc.bdDims.push_back({fullW * fullC * elemBytes, ohPerRow}); // D2: oh_per_row rows, one image row apart
+
+        // The width (L->R) rounds are folded into the BD iteration dim; the height
+        // (T->B) rounds become the scf.for outer round loop.
+        desc.iterStep = static_cast<int32_t>(haloOwT * fullC * elemBytes); // advance OW_T pixels
+        desc.iterWrap = static_cast<int32_t>(haloWRounds);
+        desc.totalRounds = hChunks;
+
+        // Per-round base-offset: only the height (T->B) chunks move the base.
+        desc.roundDims.push_back({hChunks, ohPerRow * fullW * fullC * elemBytes});
+
+        // Per-mesh-col tile offset advances by the owned channel group (group2 split).
+        desc.perTileStrideBytes = cPerCore * elemBytes;
+
+        return desc;
+    }
     if (halo.valid) {
         int64_t haloOwT = halo.owT;             // OW_T columns per width-round (e.g. 28)
         int64_t haloWRounds = halo.wRounds;     // L->R rounds (e.g. 4)
