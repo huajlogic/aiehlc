@@ -539,10 +539,15 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
         
         auto inputShape = inputType.getShape();
         auto resultShape = resultType.getShape();
-        
-        if (inputShape.size() != 2 || resultShape.size() != 2) {
-            return op.emitError("ExtractDataConversion: tensors must be 2D");
+
+        // Support N-D tensors (>=2). The 3D conv OUTPUT <H x W x C> flows through
+        // here as a genuine rank-3 tensor; matmul/2D paths stay rank-2. The split
+        // happens along exactly ONE dim (the mesh-row split); all other dims take
+        // their full extent.
+        if (inputShape.size() != resultShape.size() || inputShape.size() < 2) {
+            return op.emitError("ExtractDataConversion: input and result must have equal rank >= 2");
         }
+        const int64_t rank = (int64_t)inputShape.size();
 
         int64_t splitDim = 0;
         int64_t sliceSize = 0;
@@ -557,9 +562,8 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
         if (auto partitionOp = dyn_cast_or_null<routing::partitiontensor>(op.getTensor().getDefiningOp())) {
             splitDim = partitionOp.getPartition().getSplitdim();
             int64_t splitNum = partitionOp.getPartition().getSplitnum();
-            if (splitNum > 0) {
-                 if (splitDim == 0) sliceSize = inputShape[0] / splitNum;
-                 else sliceSize = inputShape[1] / splitNum;
+            if (splitNum > 0 && splitDim >= 0 && splitDim < rank) {
+                sliceSize = inputShape[splitDim] / splitNum;
             }
             partitionFound = true;
             // Read halo step from the optional #routing.tiling attr propagated from
@@ -570,17 +574,22 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
             }
         }
 
-        // 2. Infer/Override from result shape (Crucial for validity)
-        if (resultShape[0] != inputShape[0]) {
-             splitDim = 0;
-             sliceSize = resultShape[0];
-        } else if (resultShape[1] != inputShape[1]) {
-             splitDim = 1;
-             sliceSize = resultShape[1];
-        } else if (!partitionFound) {
-             // Identity default
-             splitDim = 0;
-             sliceSize = inputShape[0];
+        // 2. Infer/Override from result shape (Crucial for validity).
+        // The slice differs from the full tensor on exactly one dim (the mesh-row
+        // split); find it. All other dims match input (full extent).
+        bool diffFound = false;
+        for (int64_t d = 0; d < rank; ++d) {
+            if (resultShape[d] != inputShape[d]) {
+                splitDim = d;
+                sliceSize = resultShape[d];
+                diffFound = true;
+                break;
+            }
+        }
+        if (!diffFound && !partitionFound) {
+            // Identity default
+            splitDim = 0;
+            sliceSize = inputShape[0];
         }
 
         // 3. Constant Index Analysis
@@ -611,15 +620,16 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
                 }
             }
         }
-        
-        // 4. Build ExtractSlice operands
-        SmallVector<OpFoldResult> offsets(2);
-        SmallVector<OpFoldResult> sizes(2);
-        SmallVector<OpFoldResult> strides(2, rewriter.getIndexAttr(1));
-        
+
+        // 4. Build ExtractSlice operands (N-D). Full extent on every dim except
+        // splitDim; on splitDim the offset advances per tile index.
+        SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
+        SmallVector<OpFoldResult> sizes(rank);
+        SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+
         // Always use resultShape for sizes to ensure type match
-        sizes[0] = rewriter.getIndexAttr(resultShape[0]);
-        sizes[1] = rewriter.getIndexAttr(resultShape[1]);
+        for (int64_t d = 0; d < rank; ++d)
+            sizes[d] = rewriter.getIndexAttr(resultShape[d]);
 
         // Halo mode: offset advances by haloStep (overlap), size stays sliceSize.
         // Non-halo: offset advances by sliceSize (contiguous, non-overlapping).
@@ -628,32 +638,17 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
         if (isConstIndex) {
              // Static offset calculation
              int64_t offset = constIndex * offsetStride;
-             Attribute offsetAttr = rewriter.getIndexAttr(offset);
-             
-             if (splitDim == 0) {
-                 offsets[0] = offsetAttr;
-                 offsets[1] = rewriter.getIndexAttr(0);
-             } else {
-                 offsets[0] = rewriter.getIndexAttr(0);
-                 offsets[1] = offsetAttr;
-             }
+             offsets[splitDim] = rewriter.getIndexAttr(offset);
         } else {
              // Dynamic calculation using arith ops
-        Value indexVal = adaptor.getIdx();
-        if (!indexVal.getType().isIndex()) {
-            indexVal = rewriter.create<arith::IndexCastOp>(op.getLoc(), rewriter.getIndexType(), indexVal);
-        }
+             Value indexVal = adaptor.getIdx();
+             if (!indexVal.getType().isIndex()) {
+                 indexVal = rewriter.create<arith::IndexCastOp>(op.getLoc(), rewriter.getIndexType(), indexVal);
+             }
 
-        Value sliceSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), offsetStride);
-        Value offsetVal = rewriter.create<arith::MulIOp>(op.getLoc(), indexVal, sliceSizeVal);
-
-        if (splitDim == 0) {
-            offsets[0] = offsetVal;
-            offsets[1] = rewriter.getIndexAttr(0);
-        } else {
-            offsets[0] = rewriter.getIndexAttr(0);
-            offsets[1] = offsetVal;
-        }
+             Value sliceSizeVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), offsetStride);
+             Value offsetVal = rewriter.create<arith::MulIOp>(op.getLoc(), indexVal, sliceSizeVal);
+             offsets[splitDim] = offsetVal;
         }
         
         // Create tensor.extract_slice with "partitionsliceN" tag
@@ -1238,9 +1233,15 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
         Value viewSplit = adaptor.getData();
 
         // Find the root (pre-split) view for data_id keying.
+        // The partition view (%extracted_slice_0, the ExtractDataConversion output)
+        // carries the #routing.tiling descriptor (H slice_tiling rounds=4/step=7,
+        // W rounds=4/step=28). Propagate it onto each producer data_slice so the
+        // downstream shim S2MM BD builder can realise the on-core 4x4 H/W iteration.
         Value rootAdaptedView = viewSplit;
+        Attribute producerTiling; // null unless the partition view is tiled
         if (auto extractSlice = viewSplit.getDefiningOp<tensor::ExtractSliceOp>()) {
             rootAdaptedView = extractSlice.getSource();
+            producerTiling = extractSlice->getAttr("tiling");
         }
 
         // Assign data_id: same ID for all pull sub-flows sharing the same root tensor.
@@ -1273,12 +1274,17 @@ struct PullOpConversion : public OpConversionPattern<dmaphop::pull> {
             if (!tensorType) continue;
 
             std::string sliceName = "producer_slice_" + std::to_string(opId) + "_" + std::to_string(i);
-            rewriter.create<dfscheblueprint::DataSliceOp>(
+            auto dataSlice = rewriter.create<dfscheblueprint::DataSliceOp>(
                 op.getLoc(),
                 tensorType, // Result type
                 rewriter.getStringAttr(sliceName),
                 buffer // Use adapted producer buffer (DeclareDataOp result)
             );
+
+            // Carry the partition-view tiling descriptor onto the producer slice so
+            // the shim S2MM reassembly BD can realise the on-core H/W iteration.
+            if (producerTiling)
+                dataSlice->setAttr("tiling", producerTiling);
 
             // Collect slice symbol reference for flow_group
             sliceSymbols.push_back(FlatSymbolRefAttr::get(getContext(), sliceName));

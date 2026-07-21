@@ -54,6 +54,12 @@ struct ParsedTensorInfo {
     int pattern = 0;      // 0=Broadcast, 1=Scatter, 2=Multicast, 3=Gather
     int distribution = 0; // 0=Row, 1=Col, 2=Grid
     int mergeOrder = 0;   // 0=Default, 1=LeftToRight, 2=RightToLeft
+    // Two-level mesh tiling axes (SpatialMap.map fields 4/5). 1-based tensor
+    // d-index (d1/d2/d3). group1 = mesh-ROW split axis (implicit today via
+    // hwAxisOwner="row"); group2 = within-row mesh-COL split axis (e.g. 3 =
+    // channel). -1 / 0 = unset.
+    int meshTilingGroup1Dim = -1;
+    int meshTilingGroup2Dim = -1;
     int pingPong = 2;
     int maxBufferBytes = 4096;   // max per-buffer size (PP_MAX_BYTES equivalent)
     // Two-level tiling hints (structured per-dimension descriptor).
@@ -1300,6 +1306,13 @@ public:
                                                     if (mf >= 4)
                                                         pti.mergeOrder =
                                                             (int)m.getStructField(3).getInt().getExtValue();
+                                                    // Two-level mesh tiling axes (map fields 4/5).
+                                                    if (mf >= 5)
+                                                        pti.meshTilingGroup1Dim =
+                                                            (int)m.getStructField(4).getInt().getExtValue();
+                                                    if (mf >= 6)
+                                                        pti.meshTilingGroup2Dim =
+                                                            (int)m.getStructField(5).getInt().getExtValue();
                                                     // Role-aware pattern resolution.
                                                     if (!pti.isInput)
                                                         pti.pattern = 3; // Gather
@@ -1902,6 +1915,25 @@ public:
                                         pti.shape = {macroDimM, macroDimN};
                                 }
 
+                                // 3D conv OUTPUT shape: when the output port's GemmSpace
+                                // declares a full 3D iteration space (d1=H, d2=W, d3=C, each
+                                // with a full extent via tile_level.fullsize -> TileDim.base),
+                                // emit the genuine 3D output memref <H x W x C> instead of the
+                                // flattened 2D [H*W, C]. The #routing.tiling built in
+                                // createroutingfuncBySplitModel then follows LtoR_Merge's
+                                // d1/d2/d3 directly (H mesh-row split + on-core L2, W on-core
+                                // chunk, C group2 mesh-col split). Only the OUTPUT is lifted;
+                                // inputs keep their (halo / filter) shapes, and matmul outputs
+                                // (no d3 full extent) stay 2D.
+                                if (!pti.isInput && pti.perPort2D && pti.tdD1.base > 0 && pti.tdD2.base > 0 &&
+                                    pti.tdD3.base > 0) {
+                                    pti.shape = {(int64_t)pti.tdD1.base, (int64_t)pti.tdD2.base,
+                                                 (int64_t)pti.tdD3.base};
+                                    llvm::outs() << "[TilingLinalg] 3D conv output shape: " << pti.varName << " ["
+                                                 << pti.shape[0] << "x" << pti.shape[1] << "x" << pti.shape[2]
+                                                 << "] (from GemmSpace d1/d2/d3)\n";
+                                }
+
                                 // Conv2dSpace-derived shim DMA. The Conv2dSpace carries the
                                 // conv iteration space; when the port's explicit DmaTransform
                                 // is flat() (num_dims==0 && mode==0) we synthesize the same
@@ -2274,11 +2306,19 @@ public:
                         // d2.tile_size = ow_t (output cols per width-chunk). These supply ow_t
                         // (needed by the output width-split scatter) and cross-check the
                         // halo-derived flat per-slab M-tile below.
+                        //
+                        // The halo-derived flatTileM (tile_rows/spatialMRounds) is a PER-ON-CORE-
+                        // ROUND quantity (one slab produced per (w_round, l2_round) pair). The C
+                        // output d1 carries TWO levels: the OUTER per-mesh-row rows (tile_size,
+                        // e.g. 28) AND the inner slice_tiling.tile_size = per-round rows (l2Size,
+                        // e.g. 7). Use the inner per-round rows for the cross-check so it matches
+                        // flatTileM's granularity; fall back to the outer tile_size only when the
+                        // output has no on-core L2 split (l2Size == 0).
                         int64_t convOutOhPerRow = 0, convOutOwT = 0;
                         if (isSpatialHaloConv) {
                             for (const auto &pt : parsedTensors) {
                                 if (!pt.isInput && pt.perPort2D && pt.tdD1.size > 0 && pt.tdD2.size > 0) {
-                                    convOutOhPerRow = pt.tdD1.size;
+                                    convOutOhPerRow = pt.tdD1.l2Size > 0 ? pt.tdD1.l2Size : pt.tdD1.size;
                                     convOutOwT = pt.tdD2.size;
                                     break;
                                 }
@@ -2700,6 +2740,102 @@ public:
                                 ts.haloL2Slice = pt.shimDma.l2Slice;
                                 ts.haloL2Step = pt.shimDma.l2Step;
                                 ts.haloL2Rounds = pt.shimDma.l2Rounds;
+                            }
+                            // Second mesh-axis (group2) split on the OUTPUT (gather)
+                            // tensor: within each mesh row, split a *different* tensor
+                            // dim (e.g. d3=channel) across mesh cols. Read the parsed
+                            // tile for that dim (base=full extent, size=per-col slice)
+                            // and stash it on the split desc; createroutingfuncBySplitModel
+                            // emits the col=channel #routing.tiling dim from these.
+                            if (!pt.isInput && pt.meshTilingGroup2Dim > 0) {
+                                auto &ts = mkd.splitModel.tensorSplits.back();
+                                const ParsedTensorInfo::TileDim *g2 = nullptr;
+                                switch (pt.meshTilingGroup2Dim) {
+                                case 1:
+                                    g2 = &pt.tdD1;
+                                    break;
+                                case 2:
+                                    g2 = &pt.tdD2;
+                                    break;
+                                case 3:
+                                    g2 = &pt.tdD3;
+                                    break;
+                                case 4:
+                                    g2 = &pt.tdD4;
+                                    break;
+                                default:
+                                    g2 = nullptr;
+                                    break;
+                                }
+                                if (g2 && g2->base > 0 && g2->size > 0) {
+                                    // Validate the second-axis split evenly covers the
+                                    // full extent across the mesh columns. group2Slice
+                                    // (per-col elements) * meshCols must equal group2Full
+                                    // (full extent), and group2Full must divide by meshCols.
+                                    int cols = mkd.meshCols > 0 ? mkd.meshCols : 1;
+                                    bool okDivide = (g2->base % cols == 0);
+                                    bool okCover = (g2->size * cols == g2->base);
+                                    if (!okDivide || !okCover) {
+                                        llvm::errs()
+                                            << "[TilingLinalg] ERROR: mesh_tiling_group2_dim=" << pt.meshTilingGroup2Dim
+                                            << " invalid split: full=" << g2->base << " slice=" << g2->size
+                                            << " meshCols=" << cols
+                                            << " (require full % meshCols == 0 and slice * meshCols "
+                                               "== full). Skipping group2 split.\n";
+                                    } else {
+                                        ts.group1Dim = pt.meshTilingGroup1Dim;
+                                        ts.group2Dim = pt.meshTilingGroup2Dim;
+                                        ts.group2Full = g2->base;
+                                        ts.group2Slice = g2->size;
+                                        llvm::outs() << "[TilingLinalg] output group2 split: dim=" << ts.group2Dim
+                                                     << " full=" << ts.group2Full << " slice=" << ts.group2Slice
+                                                     << " meshCols=" << cols << "\n";
+                                        // Carry the group1 (mesh-row = d1) on-core
+                                        // slice_tiling and d2 (W on-core chunk) into the
+                                        // split desc so createroutingfuncBySplitModel can
+                                        // build the nested output row-dim #routing.tiling
+                                        // chain. Traceability-only (see TensorSplitDesc).
+                                        const ParsedTensorInfo::TileDim *g1 = nullptr;
+                                        switch (pt.meshTilingGroup1Dim) {
+                                        case 1:
+                                            g1 = &pt.tdD1;
+                                            break;
+                                        case 2:
+                                            g1 = &pt.tdD2;
+                                            break;
+                                        case 3:
+                                            g1 = &pt.tdD3;
+                                            break;
+                                        case 4:
+                                            g1 = &pt.tdD4;
+                                            break;
+                                        default:
+                                            g1 = nullptr;
+                                            break;
+                                        }
+                                        if (g1 && g1->base > 0) {
+                                            ts.group1Full = g1->base;
+                                            ts.group1Rounds = g1->groups;
+                                            if (g1->l2Groups > 1 && g1->l2Size > 0) {
+                                                ts.group1L2Slice = g1->l2Size;
+                                                ts.group1L2Step = g1->l2Stride > 0 ? g1->l2Stride : g1->l2Size;
+                                                ts.group1L2Rounds = g1->l2Groups;
+                                            }
+                                        }
+                                        if (pt.tdD2.size > 0) { // d2 = W on-core chunk
+                                            ts.d2Full = pt.tdD2.base;
+                                            ts.d2Slice = pt.tdD2.size;
+                                            ts.d2Step = pt.tdD2.stride > 0 ? pt.tdD2.stride : pt.tdD2.size;
+                                            ts.d2Rounds = pt.tdD2.groups;
+                                        }
+                                        llvm::outs()
+                                            << "[TilingLinalg] output group1/d2: g1Full=" << ts.group1Full
+                                            << " g1Rounds=" << ts.group1Rounds
+                                            << " g1L2(slice/step/rounds)=" << ts.group1L2Slice << "/" << ts.group1L2Step
+                                            << "/" << ts.group1L2Rounds << " d2(full/slice/step/rounds)=" << ts.d2Full
+                                            << "/" << ts.d2Slice << "/" << ts.d2Step << "/" << ts.d2Rounds << "\n";
+                                    }
+                                }
                             }
                         }
                         // Store per-kernel maxPPBytes (minimum across ports)
@@ -3386,6 +3522,8 @@ public:
                     ret += "  Pattern wgt         = Pattern::Broadcast;\n";
                     ret += "  Layout  layout      = Layout::Row;\n";
                     ret += "  Flow    merge_order = Flow::Default;\n";
+                    ret += "  int     mesh_tiling_group1_dim = -1;\n";
+                    ret += "  int     mesh_tiling_group2_dim = -1;\n";
                     ret += "};\n";
                     ret += "struct Materialize {\n";
                     ret += "  PadMaterialize pad    = PadMaterialize::DDR;\n";
@@ -4170,6 +4308,8 @@ public:
                     stream << "  Pattern wgt         = Pattern::Broadcast;\n";
                     stream << "  Layout  layout      = Layout::Row;\n";
                     stream << "  Flow    merge_order = Flow::Default;\n";
+                    stream << "  int     mesh_tiling_group1_dim = -1;\n";
+                    stream << "  int     mesh_tiling_group2_dim = -1;\n";
                     stream << "};\n";
                     stream << "struct Materialize {\n";
                     stream << "  PadMaterialize pad    = PadMaterialize::DDR;\n";

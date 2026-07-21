@@ -20,7 +20,7 @@ run_cmd() {
 }
 
 usage() {
-    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug]"
+    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug] [-gdb]"
     return 1
 }
 
@@ -157,6 +157,7 @@ COMPILE_AIELIB_ONLY=0
 USE_LOCAL_AIERT_BSP=0
 PRETTY_DEBUG=0
 SIM_TILES=""
+GDB_MODE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -help)
@@ -197,6 +198,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --prettydebug)
             PRETTY_DEBUG=1
+            shift
+            ;;
+        -gdb|--gdb)
+            GDB_MODE=1
             shift
             ;;
         *)
@@ -365,33 +370,52 @@ echo -e "    ${runtime_source_file}\n"
 # Add the source file's directory to include path so relative includes resolve
 SOURCE_DIR="$(cd "$(dirname "${runtime_source_file}")" && pwd)"
 AIEHLC_ERRLOG=$(mktemp /tmp/aiehlc_err.XXXXXX)
+# Simulator builds need the __AIESIM__ define passed through to clang.
 AIEHLC_SIM_DEFINE=""
 if [[ "$platform" == "sim" ]]; then
     AIEHLC_SIM_DEFINE='--extra-arg=-D__AIESIM__'
 fi
 
+# Build the aiehlc argument list once, then run it either directly through the
+# custom loader or under gdb (-gdb). This keeps the two invocation paths in sync.
+AIEHLC_ARGS=()
 if [[ "$use_llvm_aie" == "true" ]]; then
-    dbg_echo "+ $LD_SO --library-path ${LIB_PATH}:${LIB_BASE_PATH} ${AIEHLC} --use-llvm-aie --extra-arg=-DAIE_GEN=${aie_version} ... ${runtime_source_file} --"
-    "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" --use-llvm-aie --extra-arg="-DAIE_GEN=${aie_version}" \
-        --extra-arg="-D__AIE_ARCH__=${AIE_ARCH_MACRO}" \
-        ${AIEHLC_SIM_DEFINE} \
-        --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
-        --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
-        --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
-        --extra-arg="-I${SOURCE_DIR}" --extra-arg="-I${AIEHLC_DIR}/src/mlir/runtime" \
-        --extra-arg="-I${AIEHLC_DIR}/include" \
-        ${runtime_source_file} -- 2> >(tee "$AIEHLC_ERRLOG" >&2)
+    AIEHLC_ARGS+=(--use-llvm-aie)
+fi
+AIEHLC_ARGS+=(
+    --extra-arg="-DAIE_GEN=${aie_version}"
+    --extra-arg="-D__AIE_ARCH__=${AIE_ARCH_MACRO}"
+    --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE"
+    --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}"
+    --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm"
+    --extra-arg="-I${SOURCE_DIR}" --extra-arg="-I${AIEHLC_DIR}/src/mlir/runtime"
+    --extra-arg="-I${AIEHLC_DIR}/include"
+)
+if [ -n "$AIEHLC_SIM_DEFINE" ]; then
+    AIEHLC_ARGS+=("$AIEHLC_SIM_DEFINE")
+fi
+
+if [ "$GDB_MODE" -eq 1 ]; then
+    # Debug aiehlc under gdb. aiehlc is passed directly as the *exec file* so gdb
+    # loads its symbols ('i files' shows aiehlc) AND breakpoints actually trigger.
+    #
+    # NOTE: do NOT use 'set exec-wrapper $LD_SO --library-path ...' here. Launching
+    # aiehlc through the explicit SDK loader breaks gdb's breakpoint handling
+    # ("During startup program exited normally" - no breakpoint ever hits, even
+    # main). On this host aiehlc runs fine under the system loader, so gdb runs it
+    # directly. If a future host truly needs the SDK glibc, run the direct-loader
+    # path (non -gdb) instead, or patchelf the binary's PT_INTERP/RPATH.
+    echo "Launching aiehlc under gdb (-gdb)..."
+    echo "  Tip: 'run' to start, 'bt' on crash, 'break <fn>' before run. aiehlc args are pre-set."
+    dbg_echo "+ gdb --args ${AIEHLC} ${AIEHLC_ARGS[*]} ${runtime_source_file} --"
+    gdb --args "${AIEHLC}" \
+        "${AIEHLC_ARGS[@]}" \
+        ${runtime_source_file} --
     AIEHLC_RC=$?
 else
-    dbg_echo "+ $LD_SO --library-path ${LIB_PATH}:${LIB_BASE_PATH} ${AIEHLC} --extra-arg=-DAIE_GEN=${aie_version} ... ${runtime_source_file} --"
-    "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" --extra-arg="-DAIE_GEN=${aie_version}" \
-        --extra-arg="-D__AIE_ARCH__=${AIE_ARCH_MACRO}" \
-        ${AIEHLC_SIM_DEFINE} \
-        --extra-arg="-I${AIETOOLS_INCLUDE_BASE}" --extra-arg="-I$BAREMETAL_AIENGINE_INCLUDE" \
-        --extra-arg="-I${ARCH_APU_AINC}" --extra-arg="-I${SECONDARY_ARCH_APU_AINC}" \
-        --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm" \
-        --extra-arg="-I${SOURCE_DIR}" --extra-arg="-I${AIEHLC_DIR}/src/mlir/runtime" \
-        --extra-arg="-I${AIEHLC_DIR}/include" \
+    dbg_echo "+ $LD_SO --library-path ${LIB_PATH}:${LIB_BASE_PATH} ${AIEHLC} ${AIEHLC_ARGS[*]} ${runtime_source_file} --"
+    "$LD_SO" --library-path "${LIB_PATH}:${LIB_BASE_PATH}" "${AIEHLC}" \
+        "${AIEHLC_ARGS[@]}" \
         ${runtime_source_file} -- 2> >(tee "$AIEHLC_ERRLOG" >&2)
     AIEHLC_RC=$?
 fi
@@ -410,6 +434,15 @@ if [ $AIEHLC_RC -ne 0 ]; then
     return $AIEHLC_RC
 fi
 rm -f "$AIEHLC_ERRLOG"
+
+# -gdb is for debugging aiehlc / inspecting the generated IR only. Once the gdb
+# session ends, skip the rest of the flow (tiling delegation, kernel + host
+# compilation, prettydebug). The IR is already emitted under aout/.
+if [ "$GDB_MODE" -eq 1 ]; then
+    echo "gdb session finished (-gdb): skipping kernel/host build. Generated IR is under aout/."
+    return 0
+fi
+
 HOST_BUILD_DIR=$(pwd)/aout/
 mkdir -p $HOST_BUILD_DIR
 

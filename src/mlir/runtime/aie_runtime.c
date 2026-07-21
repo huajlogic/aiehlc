@@ -555,7 +555,7 @@ XAie_DevInst *__Runtime_explicit_init(void) {
     }
 
 #if AIE_GEN == 5 && !defined(__AIESIM__)
-    XAie_SetXprodEnable(dev, XAIE_DISABLE);
+    // XAie_SetXprodEnable(dev, XAIE_DISABLE);
 #endif
     AieRC RC = XAie_CfgInitialize(dev, &g_Config);
     if (RC != XAIE_OK) {
@@ -631,7 +631,7 @@ XAie_DevInst *__Runtime_explicit_init_partition(int startCol, int numCols) {
     }
 
 #if AIE_GEN == 5 && !defined(__AIESIM__)
-    XAie_SetXprodEnable(dev, XAIE_DISABLE);
+    // XAie_SetXprodEnable(dev, XAIE_DISABLE);
 #endif
     RC = XAie_CfgInitialize(dev, &g_Config);
     if (RC != XAIE_OK) {

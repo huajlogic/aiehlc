@@ -224,7 +224,16 @@ LogicalResult FlowTransferConversion::computeShimBdParams(FlowLoweringCtx &c) co
 
     c.ooFullPartitionElements = shimBdLen / c.ooElementSizeBytes;
     c.ooPerCoreElements = c.ooFullPartitionElements;
-    if (c.isManyToOne)
+    // group2 conv OUTPUT (channel-split): the partition VIEW is ALREADY channel-
+    // split (Part 1), so shimBdLen == ONE core's full output (one channel group).
+    // Do NOT re-divide by numCoreTiles (kept in lockstep with flowtransfer_kernel.cpp).
+    bool ooGroup2ConvOutput = false;
+    if (c.isManyToOne && memrefType.getRank() == 3) {
+        auto moduleOpG2 = op->getParentOfType<ModuleOp>();
+        if (detectConvHalo(moduleOpG2).valid)
+            ooGroup2ConvOutput = true;
+    }
+    if (c.isManyToOne && !ooGroup2ConvOutput)
         c.ooPerCoreElements = c.ooFullPartitionElements / numCoreTiles;
 
     c.ooPingPongSize = c.ooPerCoreElements;
@@ -334,10 +343,25 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
         int64_t tileM = passState->tileM;
         int64_t tileRowsVal = passState->tileRows;
 
-        if (tileM > 0 && tileM < tileRowsVal && !c.shimIsSender && isFullConnectAuto(op->getParentOfType<ModuleOp>())) {
+        auto moduleOpGuard = op->getParentOfType<ModuleOp>();
+        // The generic GEMM 3D path fires when tile_m sub-tiles the M dimension under
+        // fullconnect_auto. The conv2d width-split (spatial-halo) path drops
+        // tile_m/tile_rows and fullconnect_auto, so it is triggered separately by the
+        // presence of a width-split halo on a receiving (S2MM gather) shim channel.
+        ConvHaloGeom convHalo = detectConvHalo(moduleOpGuard);
+        bool convWidthSplit = convHalo.valid && !c.shimIsSender;
+        bool gemm3D = tileM > 0 && tileM < tileRowsVal && !c.shimIsSender && isFullConnectAuto(moduleOpGuard);
+
+        if (gemm3D || convWidthSplit) {
             auto moduleOp = op->getParentOfType<ModuleOp>();
-            c.outDesc =
-                buildOutputTileDescriptor(*passState, c.memrefType, numCoreTiles, moduleOp, c.ooElementSizeBytes);
+            // Thread the partition #routing.tiling descriptor (if present) so the
+            // NCHW conv-output BD geometry is derived from the authoritative tiling
+            // attr rather than the detectConvHalo heuristic.
+            mlir::Attribute tilingAttr;
+            if (c.partExtractSlice)
+                tilingAttr = c.partExtractSlice->getAttr("tiling");
+            c.outDesc = buildOutputTileDescriptor(*passState, c.memrefType, numCoreTiles, moduleOp,
+                                                  c.ooElementSizeBytes, tilingAttr);
 
             SmallVector<Attribute> strideAttrs, wrapAttrs;
             for (const auto &d : c.outDesc.bdDims) {
@@ -350,6 +374,11 @@ void FlowTransferConversion::emitShimBdOoo(FlowLoweringCtx &c) const {
             c.oooIterWrap = c.outDesc.iterWrap;
             c.oooMRounds = c.outDesc.totalRounds;
             c.usedMRounds3D = true;
+
+            // 3D channel-split (LtoR conv) overrides the per-tile DDR offset: the
+            // gathered cores are mesh COLS interleaved on C, not contiguous blocks.
+            if (c.outDesc.perTileStrideBytes > 0)
+                c.perTileStrideFromDims = c.outDesc.perTileStrideBytes;
 
             llvm::errs() << "[OOO ShimBD desc] tileM=" << tileM << " tileRows=" << tileRowsVal
                          << " bdDims=" << c.outDesc.bdDims.size() << " roundDims=" << c.outDesc.roundDims.size()

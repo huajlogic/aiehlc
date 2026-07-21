@@ -510,3 +510,46 @@ source piplinerun.sh
 | Example routing | `pass/routingimplement/codegenexample/aie_control.cpp` |
 
 All paths relative to `src/mlir/mlirfront/tilinglinalg/` unless otherwise noted.
+
+## 7. Two-Level Mesh Tiling (`mesh_tiling_group1_dim` / `mesh_tiling_group2_dim`)
+
+The output `GemmSpace`/`SpatialPolicy.map` can declare **two independent mesh-tiling
+axes** for the output tensor:
+
+```cpp
+.policy = {.map = {..., .mesh_tiling_group1_dim = 1, .mesh_tiling_group2_dim = 3}, ...}
+```
+
+- Values are **1-based d-indices** (`d1`/`d2`/`d3`/`d4`). Default `-1` (unset).
+- `mesh_tiling_group1_dim` = tensor dim split across **mesh ROWS** (e.g. `1` = H).
+- `mesh_tiling_group2_dim` = tensor dim split **within each row across mesh COLS**
+  (e.g. `3` = channel). Each of the `meshCols` col-tiles owns `d3.tile_size` of the
+  full `d3.fullsize` (e.g. 16 of 64 channels).
+
+### End-to-end plumbing
+
+| Stage | File | What happens |
+|-------|------|--------------|
+| Policy struct | `pass/tilinglinalg_pipeline.cpp`, `llvm/aiehlc.cc` (×2) | `SpatialMap` string gains `mesh_tiling_group1_dim` / `mesh_tiling_group2_dim` (int, default -1). Emitted byte-for-byte in **three** synced places. |
+| AST extraction | `llvm/aiehlc.cc` `readPolicy` | Reads map struct fields 4/5 into `ParsedTensorInfo::meshTilingGroup{1,2}Dim`. Positional — field order matters. |
+| Split model | `llvm/aiehlc.cc` (mkd loop) | For the **output** (`!isInput`) tensor with `meshTilingGroup2Dim > 0`, copies the parsed d-tile (`base`=full extent, `size`=per-col slice) into `TensorSplitDesc::group2{Dim,Full,Slice}`. Guards: `group2Full % meshCols == 0` and `group2Slice * meshCols == group2Full` (else diagnostic + skip). |
+| Routing IR | `routing/routingmanager.cpp` `createroutingfuncBySplitModel` | For a row-owned output split, emits a **2-dim `#routing.tiling`** on the output `partitiontensor`: `d0` = row split, `d<colDim>` = channel split (`base=group2Full, slice=group2Slice, step=group2Slice, rounds=meshCols`). |
+
+### Shim reassembly — why no new S2MM branch was needed
+
+The conv/gemm output tensor is 2D `[M = H*W, N = C]` — **the innermost dim IS the
+channel**. The existing shim S2MM "width-split" reassembly
+(`pass/passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp`, `dstTileType == "shim"`)
+computes `outW = N = C` and `tileW = C / numTileCols`, so splitting `N` across mesh
+columns **is** the channel split. For `simpleconv2d.cc` (C=64, 4 mesh cols) it emits
+`strides=[4,64,16] wraps=[4,3136,4]`, which `emitShimBdOoo`
+(`pass/passblueprinttoschedule/helper/flowtransfer_host.cpp`, `shimDimStrides` branch)
+lowers to per-tile shim BDs with **16-channel DDR offsets `0/16/32/48`** — i.e. each
+mesh-col tile writes its own contiguous 16-channel band, striding by the full 64
+channels per pixel. This is already channel-interleave-correct.
+
+The `#routing.tiling` `colDim` is therefore currently a **descriptive** annotation
+(makes the two-axis intent explicit in IR); the shim BD math derives the same split
+from the `[M, C]` tensor shape. A future refactor could make the shim BD read the
+`colDim` explicitly to decouple correctness from the `width == channel` layout
+coincidence (e.g. for a 3D `[H, W, C]` output where width ≠ channel).

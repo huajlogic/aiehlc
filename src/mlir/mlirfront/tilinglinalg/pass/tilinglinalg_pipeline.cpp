@@ -740,6 +740,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "  Pattern wgt         = Pattern::Broadcast;\n";
             stream << "  Layout  layout      = Layout::Row;\n";
             stream << "  Flow    merge_order = Flow::Default;\n";
+            stream << "  int     mesh_tiling_group1_dim = -1;\n";
+            stream << "  int     mesh_tiling_group2_dim = -1;\n";
             stream << "};\n";
             stream << "struct Materialize {\n";
             stream << "  PadMaterialize pad    = PadMaterialize::DDR;\n";
