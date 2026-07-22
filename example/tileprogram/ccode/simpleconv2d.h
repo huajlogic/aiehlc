@@ -157,7 +157,12 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
 
     for (int i = 0; i < total; i++) {
         if (output_aie[i] != ref[i]) {
-            // NCHW [F, OH, OW] decode: f outer, oh middle, ow inner.
+            int col = output_aie[i] / 10;
+            int row = output_aie[i] % 10;
+            // if (col >7 || col < 0 || row < 3 || row > 6) {
+            //     break;
+            // }
+            //  NCHW [F, OH, OW] decode: f outer, oh middle, ow inner.
             int f = i / (OUTPUT_H * OUTPUT_W);
             int oh = (i / OUTPUT_W) % OUTPUT_H;
             int ow = i % OUTPUT_W;
@@ -195,29 +200,45 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
     }
 
     // Print output (NCHW: plane f=0 = output[0*OH*OW + oh*OW + ow])
-    printf("\nOutput AIE [%dx%dx%d] (f=0 plane):\n", NUM_FILTERS, OUTPUT_H, OUTPUT_W);
-    for (int oh = 0; oh < OUTPUT_H; oh++) {
-        printf("  [");
-        for (int ow = 0; ow < OUTPUT_W; ow++) {
-            printf("%4d", output_aie[oh * OUTPUT_W + ow]);
-            if (ow < OUTPUT_W - 1)
-                printf(",");
+    for (int f = 0; f < NUM_FILTERS; f++) {
+        printf("\nOutput AIE [%dx%dx%d] (f=%d plane):\n", NUM_FILTERS, OUTPUT_H, OUTPUT_W, f);
+        for (int oh = 0; oh < OUTPUT_H; oh++) {
+            printf("  [");
+            if ((oh % 4) != 0) {
+                printf("...");
+                continue;
+            }
+            for (int ow = 0; ow < OUTPUT_W; ow++) {
+                int var = output_aie[f * OUTPUT_H * OUTPUT_W + oh * OUTPUT_W + ow];
+                int col = var / 10;
+                int row = var % 10;
+                // if (col >7 || col < 0 || row < 3 || row > 6) {
+                //     printf("ERROR: output value out of expected range: %d\n", var);
+                // }
+                // if (oh == 0 && ow == 0) {
+                //     printf("DEBUG: rest is all reproduce for debug...\n");
+                //     printf("DEBUG: output value at (f=%d,oh=%d,ow=%d) = %d\n", f, oh, ow, var);
+                // }
+                printf("%4d", output_aie[f * OUTPUT_H * OUTPUT_W + oh * OUTPUT_W + ow]);
+                if (ow < OUTPUT_W - 1)
+                    printf(",");
+            }
+            printf("]\n");
         }
-        printf("]\n");
-    }
-
-    // Print reference (NCHW: plane f=0)
-    printf("\nOutput REF [%dx%dx%d] (f=0 plane):\n", NUM_FILTERS, OUTPUT_H, OUTPUT_W);
-    for (int oh = 0; oh < OUTPUT_H; oh++) {
-        printf("  [");
-        for (int ow = 0; ow < OUTPUT_W; ow++) {
-            printf("%4d", ref[oh * OUTPUT_W + ow]);
-            if (ow < OUTPUT_W - 1)
-                printf(",");
+        /*
+        // Print reference (NCHW: plane f=0)
+        printf("\nOutput REF [%dx%dx%d] (f=%d plane):\n", NUM_FILTERS, OUTPUT_H, OUTPUT_W, f);
+        for (int oh = 0; oh < OUTPUT_H; oh++) {
+            printf("  [");
+            for (int ow = 0; ow < OUTPUT_W; ow++) {
+                printf("%4d", ref[f * OUTPUT_H * OUTPUT_W + oh * OUTPUT_W + ow]);
+                if (ow < OUTPUT_W - 1)
+                    printf(",");
+            }
+            printf("]\n");
         }
-        printf("]\n");
+            */
     }
-
     if (mismatches == 0)
         printf("PASS: all %d output elements match.\n", total);
     else
