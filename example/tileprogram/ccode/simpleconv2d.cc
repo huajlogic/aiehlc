@@ -428,13 +428,13 @@ int main() {
     //     INPUT_W_PAD, INPUT_C_ALIGN]. Real pixel (h,w) sits at (h+PAD, w+PAD), so
     //     the CPU reference windows (oh*S+kh, ow*S+kw) index the padded buffer
     //     directly and implement true padded conv (no out-of-bounds reads).
-    int8_t *input = (int8_t *)malloc(INPUT_H_PAD * INPUT_W_PAD * INPUT_C_ALIGN * sizeof(int8_t));
+    int8_t *input = (int8_t *)__Runtime_Alloc(INPUT_H_PAD * INPUT_W_PAD * INPUT_C_ALIGN * sizeof(int8_t));
     // Filter in B^T [N, K] layout with K = KH*KW*INPUT_C_ALIGN (matches kernel
     // B_ptr[f*K + ((kh*KW+kw)*INPUT_C_ALIGN + c)]).
-    int8_t *filter = (int8_t *)malloc(KERNEL_H * KERNEL_W * INPUT_C_ALIGN * NUM_FILTERS * sizeof(int8_t));
+    int8_t *filter = (int8_t *)__Runtime_Alloc(KERNEL_H * KERNEL_W * INPUT_C_ALIGN * NUM_FILTERS * sizeof(int8_t));
     // Output in NCHW [F, OH, OW] layout (total size = M*N, unchanged); the C
     // tensor DDR layout is NCHW so the shim S2MM gather writes C-planes.
-    int8_t *output = (int8_t *)malloc(OUTPUT_H * OUTPUT_W * NUM_FILTERS * sizeof(int8_t));
+    int8_t *output = (int8_t *)__Runtime_Alloc(OUTPUT_H * OUTPUT_W * NUM_FILTERS * sizeof(int8_t));
 
     // --- Initialize test data ---
     // Input: small ZERO-MEAN samples in [-4, 4] for the real channels (see the

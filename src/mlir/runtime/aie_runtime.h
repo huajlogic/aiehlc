@@ -95,6 +95,9 @@ void *__Runtime_malloc(size_t bytes);
 void __Runtime_free(void *ptr);
 void __Runtime_memcpy(void *dst, const void *src, size_t bytes);
 
+/* 64-byte aligned allocation for DDR buffers requiring alignment. */
+void *__Runtime_Alloc(size_t bytes);
+
 /* Legacy stub (no-op in VAddr mode; kept for backward compat) */
 void __Runtime_free_all_allocs(void);
 

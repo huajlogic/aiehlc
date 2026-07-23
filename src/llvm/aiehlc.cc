@@ -3762,6 +3762,7 @@ public:
                     ret += "extern \"C\" XAie_DevInst *__Runtime_get_partition_dev(int meshId);\n";
                     ret += "extern \"C\" void *__Runtime_alloc_buffer(XAie_DevInst *dev, __SIZE_TYPE__ size_bytes);\n";
                     ret += "extern \"C\" void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);\n";
+                    ret += "extern \"C\" void *__Runtime_Alloc(__SIZE_TYPE__ bytes);\n";
                     ret +=
                         "extern \"C\" void __Runtime_sync_for_cpu(XAie_DevInst *dev, void *ptr, __SIZE_TYPE__ size);\n";
                     ret += "extern \"C\" void __Runtime_teardown_all();\n";

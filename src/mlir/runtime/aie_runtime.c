@@ -200,6 +200,14 @@ void *__Runtime_malloc(size_t bytes) {
     return ptr;
 }
 
+void *__Runtime_Alloc(size_t bytes) {
+    /* aligned_alloc requires the size be a multiple of the alignment. */
+    size_t aligned_bytes = (bytes + 63) & ~(size_t)63;
+    void *ptr = aligned_alloc(64, aligned_bytes);
+    printf("[aie_runtime] Alloc(%zu -> %zu, align=64) = %p\n", bytes, aligned_bytes, ptr);
+    return ptr;
+}
+
 void __Runtime_free(void *ptr) {
     printf("[aie_runtime] free(%p)\n", ptr);
     /* Dump key regions of buffer: offset 0-63 (round0 out), 256-319 (round1 out) */
