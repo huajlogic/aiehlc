@@ -4549,7 +4549,7 @@ public:
                             maxDdrArgs = mkd.numHostDdrArgs;
                     }
 
-                    // Helper: emit XAie_MemSyncForDevVAddr calls for ALL buffers before DMA.
+                    // Helper: emit __Runtime_sync_for_dev calls for ALL buffers before DMA.
                     // On ARM (baremetal), SyncForDev flushes+invalidates cache lines, which is
                     // needed for outputs too: dirty cache lines (e.g. zeroed output buffer) must
                     // be flushed and invalidated BEFORE DMA writes results to DDR, otherwise a
@@ -4563,7 +4563,7 @@ public:
                         if (limit > mkd.tensors.size())
                             limit = mkd.tensors.size();
                         for (unsigned i = 0; i < limit; ++i) {
-                            os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
+                            os << indent << "__Runtime_sync_for_dev(dev, _t" << i << ", _s" << i << ");\n";
                         }
                     };
 

@@ -976,7 +976,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_end[];\n";
             stream << "extern unsigned int _binary_kernel_" << computeKernelName << "_size;\n\n";
 
-            // Helper: emit XAie_MemSyncForDevVAddr calls for ALL buffers before DMA.
+            // Helper: emit __Runtime_sync_for_dev calls for ALL buffers before DMA.
             // On ARM (baremetal), SyncForDev flushes+invalidates cache lines, which is
             // needed for outputs too: dirty cache lines (e.g. zeroed output buffer) must
             // be flushed and invalidated BEFORE DMA writes results to DDR, otherwise a
@@ -990,7 +990,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 if (limit > tensors.size())
                     limit = tensors.size();
                 for (unsigned i = 0; i < limit; ++i) {
-                    os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
+                    os << indent << "__Runtime_sync_for_dev(dev, _t" << i << ", _s" << i << ");\n";
                 }
             };
 
@@ -1151,7 +1151,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 for (auto dim : tensors[i].shape)
                     totalElements *= dim;
                 int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
-                stream << "    XAie_MemSyncForDevVAddr(dev, buf_" << i << ", " << totalBytes << ");\n";
+                stream << "    __Runtime_sync_for_dev(dev, buf_" << i << ", " << totalBytes << ");\n";
             }
             stream << "    " << hostFuncName << "(dev";
             for (unsigned i = 0; i < tensors.size(); ++i) {

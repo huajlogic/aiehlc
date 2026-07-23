@@ -146,7 +146,13 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
     const int total = OUTPUT_H * OUTPUT_W * NUM_FILTERS;
     int8_t ref[OUTPUT_H * OUTPUT_W * NUM_FILTERS];
     int mismatches = 0;
+    /*
+    for (int i = total - 160; i < total; i++) {
+        printf("DEBUG: output_aie[%d] = %d\n", i, output_aie[i]);
+    }
 
+    return 0;
+    */
     printf("Computing CPU reference conv2d...\n");
     XTime t_start, t_end;
     XTime_GetTime(&t_start);
@@ -205,7 +211,7 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
         for (int oh = 0; oh < OUTPUT_H; oh++) {
             printf("  [");
             if ((oh % 4) != 0) {
-                printf("...");
+                printf("...]\n");
                 continue;
             }
             for (int ow = 0; ow < OUTPUT_W; ow++) {

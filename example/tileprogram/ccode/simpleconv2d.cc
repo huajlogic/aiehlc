@@ -370,7 +370,7 @@ __global__(conv_policy) void conv2d_spatial(
         for (int rc = 0; rc < num_c_rounds; rc++) {
             int8_t *out = (int8_t *)acquire_output_window(win_c);
             for (int i = 0; i < buf_sz_c; i++)
-                // out[i] = out_c_num*10+ tile_rows; //local_out[rc * buf_sz_c + i];
+                // out[i] = col*10+ row; //local_out[rc * buf_sz_c + i];
                 out[i] = local_out[rc * buf_sz_c + i];
             release_output_window(win_c);
         }
