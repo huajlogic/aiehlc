@@ -214,7 +214,8 @@ constexpr aie::GemmSpace ColBC = {
            .tile_size = OC_PER_G,
            .stride = OC_PER_G},                                     // N-tile (divides K for B^T layout)
     .d2 = {.fullsize = SP_KW, .tile_size = SP_KH, .stride = SP_KW}, // N-tile (divides K for B^T layout)
-    .d3 = {.fullsize = INPUT_C_ALIGN,
+    .d3 = {.fullsize = SP_KH, .tile_size = SP_KH, .stride = SP_KH}, // N-tile (divides K for B^T layout)
+    .d4 = {.fullsize = INPUT_C_ALIGN,
            .tile_size = INPUT_C_ALIGN,
            .stride = INPUT_C_ALIGN,
            .padsize = INPUT_C_ALIGN - INPUT_C}}; // K

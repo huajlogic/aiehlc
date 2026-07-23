@@ -1,65 +1,65 @@
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.fullconnect_auto = 0 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}, routing.spatial_halo_buf_size = 4636 : i64, routing.spatial_out_rounds = 16 : i64, tensor_0.halo = {k_rounds = 4 : i32, k_slice = 244 : i32, k_step = 224 : i32, l2_rounds = 4 : i32, l2_slice = 19 : i32, l2_step = 14 : i32, ow_t = 28 : i32, row_pitch = 920 : i32, slice = 61 : i32, split_dim = 0 : i32, step = 56 : i32, w_rounds = 4 : i32, w_slice = 61 : i32, w_step = 56 : i32}, tensor_0.layout_transform = "dma_shuffle", tensor_1.layout_transform = "dma_shuffle"} {
-  func.func @main(%arg0: memref<230x920xi8>, %arg1: memref<196x64xi8>, %arg2: memref<112x112x64xi8>) {
+  func.func @main(%arg0: memref<230x920xi8>, %arg1: memref<64x7x7x4xi8>, %arg2: memref<112x112x64xi8>) {
     %c3_i32 = arith.constant 3 : i32
     %c2_i32 = arith.constant 2 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
     %0 = bufferization.to_tensor %arg0 : memref<230x920xi8>
     %1 = routing.routingcreatescheduletensor %0 : tensor<230x920xi8> shape = [230, 920], dim = 2 -> tensor<230x920xi8>
-    %2 = bufferization.to_tensor %arg1 : memref<196x64xi8>
-    %3 = routing.routingcreatescheduletensor %2 : tensor<196x64xi8> shape = [196, 64], dim = 2 -> tensor<196x64xi8>
+    %2 = bufferization.to_tensor %arg1 : memref<64x7x7x4xi8>
+    %3 = routing.routingcreatescheduletensor %2 : tensor<64x7x7x4xi8> shape = [64, 7, 7, 4], dim = 4 -> tensor<64x7x7x4xi8>
     %4 = bufferization.to_tensor %arg2 : memref<112x112x64xi8>
     %5 = routing.routingcreatescheduletensor %4 : tensor<112x112x64xi8> shape = [112, 112, 64], dim = 3 -> tensor<112x112x64xi8>
     scf.execute_region {
-      %6 = routing.partitiontensor %3 : tensor<196x64xi8> {
+      %6 = routing.partitiontensor %3 : tensor<64x7x7x4xi8> {
   partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "col", replicateOn = "row", singleTileOwner = "">
-} -> tensor<196x64xi8>
+} -> tensor<64x7x7x4xi8>
       %7 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %11 = routing.routingextract_data %6, %arg3 : tensor<196x64xi8>, i32 -> tensor<49x64xi8>
+        %11 = routing.routingextract_data %6, %arg3 : tensor<64x7x7x4xi8>, i32 -> tensor<16x7x7x4xi8>
         %12 = dmap.define_io_engine {io_id = 0 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
         %13 = dmap.define_core_group {core_count = 4 : i32, group_axis = "col", group_idx = 0 : i32} -> !dmap.dmacoreenginegroupType
         %14 = dmap.define_port_configure @receive_port_0 : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
         %15 = dmap.create_io_engin_with_config %12 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
         %16 = dmap.create_core_group_with_config %13{[{0, @receive_port_0}, {1, @receive_port_0}, {2, @receive_port_0}, {3, @receive_port_0}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
         %17 = dmap.create_stream src = %15, dst = %16, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.push %11 : tensor<49x64xi8> to %17 : !dmap.dmapportstream
+        dmap.push %11 : tensor<16x7x7x4xi8> to %17 : !dmap.dmapportstream
         "routing.yield"() : () -> ()
       }
       %8 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %11 = routing.routingextract_data %6, %arg3 : tensor<196x64xi8>, i32 -> tensor<49x64xi8>
+        %11 = routing.routingextract_data %6, %arg3 : tensor<64x7x7x4xi8>, i32 -> tensor<16x7x7x4xi8>
         %12 = dmap.define_io_engine {io_id = 1 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
         %13 = dmap.define_core_group {core_count = 4 : i32, group_axis = "col", group_idx = 1 : i32} -> !dmap.dmacoreenginegroupType
         %14 = dmap.define_port_configure @receive_port_1 : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
         %15 = dmap.create_io_engin_with_config %12 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
         %16 = dmap.create_core_group_with_config %13{[{0, @receive_port_1}, {1, @receive_port_1}, {2, @receive_port_1}, {3, @receive_port_1}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
         %17 = dmap.create_stream src = %15, dst = %16, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.push %11 : tensor<49x64xi8> to %17 : !dmap.dmapportstream
+        dmap.push %11 : tensor<16x7x7x4xi8> to %17 : !dmap.dmapportstream
         "routing.yield"() : () -> ()
       }
       %9 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c2_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %11 = routing.routingextract_data %6, %arg3 : tensor<196x64xi8>, i32 -> tensor<49x64xi8>
+        %11 = routing.routingextract_data %6, %arg3 : tensor<64x7x7x4xi8>, i32 -> tensor<16x7x7x4xi8>
         %12 = dmap.define_io_engine {io_id = 2 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
         %13 = dmap.define_core_group {core_count = 4 : i32, group_axis = "col", group_idx = 2 : i32} -> !dmap.dmacoreenginegroupType
         %14 = dmap.define_port_configure @receive_port_2 : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
         %15 = dmap.create_io_engin_with_config %12 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
         %16 = dmap.create_core_group_with_config %13{[{0, @receive_port_2}, {1, @receive_port_2}, {2, @receive_port_2}, {3, @receive_port_2}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
         %17 = dmap.create_stream src = %15, dst = %16, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.push %11 : tensor<49x64xi8> to %17 : !dmap.dmapportstream
+        dmap.push %11 : tensor<16x7x7x4xi8> to %17 : !dmap.dmapportstream
         "routing.yield"() : () -> ()
       }
       %10 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c3_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %11 = routing.routingextract_data %6, %arg3 : tensor<196x64xi8>, i32 -> tensor<49x64xi8>
+        %11 = routing.routingextract_data %6, %arg3 : tensor<64x7x7x4xi8>, i32 -> tensor<16x7x7x4xi8>
         %12 = dmap.define_io_engine {io_id = 3 : i32, ioattr = "SHIM"} -> !dmap.dmapioenginetype
         %13 = dmap.define_core_group {core_count = 4 : i32, group_axis = "col", group_idx = 3 : i32} -> !dmap.dmacoreenginegroupType
         %14 = dmap.define_port_configure @receive_port_3 : {"RECEIVE", 16, 1, 1} -> !dmap.dmapportconfig
         %15 = dmap.create_io_engin_with_config %12 : !dmap.dmapioenginetype {accesspattern = #dmap<dataaccesspattern{"SEND", 16, 1, 1}>} -> !dmap.dmapioconfig
         %16 = dmap.create_core_group_with_config %13{[{0, @receive_port_3}, {1, @receive_port_3}, {2, @receive_port_3}, {3, @receive_port_3}], "row"} : !dmap.dmacoreenginegroupType -> !dmap.dmacoregroupconfig
         %17 = dmap.create_stream src = %15, dst = %16, !dmap.dmapioconfig !dmap.dmacoregroupconfig {streamType = #dmap.io<DMAP_SHIMIO>, stream_group_index = 0 : i32, stream_id = 1 : i32} -> !dmap.dmapportstream
-        dmap.push %11 : tensor<49x64xi8> to %17 : !dmap.dmapportstream
+        dmap.push %11 : tensor<16x7x7x4xi8> to %17 : !dmap.dmapportstream
         "routing.yield"() : () -> ()
       }
       scf.yield

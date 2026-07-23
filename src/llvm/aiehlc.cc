@@ -1934,6 +1934,35 @@ public:
                                                  << "] (from GemmSpace d1/d2/d3)\n";
                                 }
 
+                                // 4D conv FILTER (B) shape: when the col-broadcast filter port
+                                // declares the conv kernel sub-dims (ColBC: d1=F, d2=KW, d3=KH,
+                                // d4=C via tile_level.fullsize -> TileDim.base), emit the genuine
+                                // 4D filter memref <F x KH x KW x C> instead of the flattened 2D
+                                // [K, N]. Each mesh COLUMN owns F/HW_COLS filters, so the d0 (F)
+                                // split matches the host DDR F-major layout filter[f*K + kk] and
+                                // the kernel's B_local[j*K + kk] indexing (the 2D [K,N] form was
+                                // the TRANSPOSE of the real DDR buffer). The downstream
+                                // split-shape (splitShape[0]/=splitnum) and flat shim BD (product
+                                // of all dims) are rank-generic, so [F/cols, KH, KW, C] flows
+                                // through unchanged. Only the col-broadcast filter is lifted;
+                                // plain matmul B (no d3/d4) stays 2D. Fires only when the conv
+                                // sub-dims are present and F*KH*KW*C == K*N (consistency guard).
+                                if (pti.policyResolved && pti.isInput && pti.perPort2D && pti.pattern == 0 &&
+                                    pti.distribution == 1 && pti.tdD1.base > 0 && pti.tdD2.base > 0 &&
+                                    pti.tdD3.base > 0 && pti.tdD4.base > 0) {
+                                    int64_t Ff = pti.tdD1.base;  // d1 = F (output filters, col-split)
+                                    int64_t KWf = pti.tdD2.base; // d2 = KW
+                                    int64_t KHf = pti.tdD3.base; // d3 = KH
+                                    int64_t Cf = pti.tdD4.base;  // d4 = C (padded channel)
+                                    if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0 && Ff == macroDimN &&
+                                        KHf * KWf * Cf == macroDimK) {
+                                        pti.shape = {Ff, KHf, KWf, Cf}; // [F, KH, KW, C]
+                                        llvm::outs() << "[TilingLinalg] 4D conv filter shape: " << pti.varName << " ["
+                                                     << Ff << "x" << KHf << "x" << KWf << "x" << Cf
+                                                     << "] (from GemmSpace d1/d3/d2/d4)\n";
+                                    }
+                                }
+
                                 // Conv2dSpace-derived shim DMA. The Conv2dSpace carries the
                                 // conv iteration space; when the port's explicit DmaTransform
                                 // is flat() (num_dims==0 && mode==0) we synthesize the same
@@ -2030,9 +2059,11 @@ public:
                                     tagInfo = " policy=" + policyName;
                                 else if (!spatialTag.empty())
                                     tagInfo = " spatial=" + spatialTag;
-                                llvm::outs() << "[TilingLinalg] Tensor param: " << pti.varName << " [" << pti.shape[0]
-                                             << "x" << pti.shape[1] << "] i" << pti.elementBitWidth
-                                             << (pti.isInput ? " (input)" : " (output)") << tagInfo << "\n";
+                                llvm::outs() << "[TilingLinalg] Tensor param: " << pti.varName << " [";
+                                for (size_t sdi = 0; sdi < pti.shape.size(); ++sdi)
+                                    llvm::outs() << (sdi ? "x" : "") << pti.shape[sdi];
+                                llvm::outs() << "] i" << pti.elementBitWidth << (pti.isInput ? " (input)" : " (output)")
+                                             << tagInfo << "\n";
                             }
 						}
 					}

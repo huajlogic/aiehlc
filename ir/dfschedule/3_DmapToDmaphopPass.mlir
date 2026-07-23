@@ -1,22 +1,22 @@
 module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.fullconnect_auto = 0 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}, routing.spatial_halo_buf_size = 4636 : i64, routing.spatial_out_rounds = 16 : i64, tensor_0.halo = {k_rounds = 4 : i32, k_slice = 244 : i32, k_step = 224 : i32, l2_rounds = 4 : i32, l2_slice = 19 : i32, l2_step = 14 : i32, ow_t = 28 : i32, row_pitch = 920 : i32, slice = 61 : i32, split_dim = 0 : i32, step = 56 : i32, w_rounds = 4 : i32, w_slice = 61 : i32, w_step = 56 : i32}, tensor_0.layout_transform = "dma_shuffle", tensor_1.layout_transform = "dma_shuffle"} {
-  func.func @main(%arg0: memref<230x920xi8>, %arg1: memref<196x64xi8>, %arg2: memref<112x112x64xi8>) {
+  func.func @main(%arg0: memref<230x920xi8>, %arg1: memref<64x7x7x4xi8>, %arg2: memref<112x112x64xi8>) {
     %c3_i32 = arith.constant 3 : i32
     %c2_i32 = arith.constant 2 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
     %0 = bufferization.to_tensor %arg0 : memref<230x920xi8>
     %1 = routing.routingcreatescheduletensor %0 : tensor<230x920xi8> shape = [230, 920], dim = 2 -> tensor<230x920xi8>
-    %2 = bufferization.to_tensor %arg1 : memref<196x64xi8>
-    %3 = routing.routingcreatescheduletensor %2 : tensor<196x64xi8> shape = [196, 64], dim = 2 -> tensor<196x64xi8>
+    %2 = bufferization.to_tensor %arg1 : memref<64x7x7x4xi8>
+    %3 = routing.routingcreatescheduletensor %2 : tensor<64x7x7x4xi8> shape = [64, 7, 7, 4], dim = 4 -> tensor<64x7x7x4xi8>
     %4 = bufferization.to_tensor %arg2 : memref<112x112x64xi8>
     %5 = routing.routingcreatescheduletensor %4 : tensor<112x112x64xi8> shape = [112, 112, 64], dim = 3 -> tensor<112x112x64xi8>
     scf.execute_region {
-      %6 = routing.partitiontensor %3 : tensor<196x64xi8> {
+      %6 = routing.partitiontensor %3 : tensor<64x7x7x4xi8> {
   partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "col", replicateOn = "row", singleTileOwner = "">
-} -> tensor<196x64xi8>
+} -> tensor<64x7x7x4xi8>
       %7 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %11 = routing.routingextract_data %6, %arg3 : tensor<196x64xi8>, i32 -> tensor<49x64xi8>
+        %11 = routing.routingextract_data %6, %arg3 : tensor<64x7x7x4xi8>, i32 -> tensor<16x7x7x4xi8>
         %12 = dmaphop.tile{TILETYPE = "core", col = 0, row = 3} -> !dmaphop.tile
         %13 = dmaphop.port @f0_corePortIn0 on %12 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %14 = dmaphop.port @f0_corePortOut0 on %12 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -41,13 +41,13 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %33 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
         %34 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
         %35 = dmaphop.create_path[%31, %32, %33, %34] {producers = [[@f0_shimPortIn]], consumers = [[@f0_consumer0, @f0_consumer1, @f0_consumer2, @f0_consumer3]], tee_points = [[]]} -> !dmaphop.path
-        dmaphop.push %11 into %35 consumer(%11, %11, %11, %11 at %13, %16, %19, %22) : tensor<49x64xi8> !dmaphop.path tensor<49x64xi8>, tensor<49x64xi8>, tensor<49x64xi8>, tensor<49x64xi8> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.push %11 into %35 consumer(%11, %11, %11, %11 at %13, %16, %19, %22) : tensor<16x7x7x4xi8> !dmaphop.path tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
         dmaphop.sync %35
         "routing.yield"() : () -> ()
       }
       %8 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %11 = routing.routingextract_data %6, %arg3 : tensor<196x64xi8>, i32 -> tensor<49x64xi8>
+        %11 = routing.routingextract_data %6, %arg3 : tensor<64x7x7x4xi8>, i32 -> tensor<16x7x7x4xi8>
         %12 = dmaphop.tile{TILETYPE = "core", col = 1, row = 3} -> !dmaphop.tile
         %13 = dmaphop.port @f1_corePortIn0 on %12 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %14 = dmaphop.port @f1_corePortOut0 on %12 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -72,13 +72,13 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %33 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
         %34 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
         %35 = dmaphop.create_path[%31, %32, %33, %34] {producers = [[@f1_shimPortIn]], consumers = [[@f1_consumer0, @f1_consumer1, @f1_consumer2, @f1_consumer3]], tee_points = [[]]} -> !dmaphop.path
-        dmaphop.push %11 into %35 consumer(%11, %11, %11, %11 at %13, %16, %19, %22) : tensor<49x64xi8> !dmaphop.path tensor<49x64xi8>, tensor<49x64xi8>, tensor<49x64xi8>, tensor<49x64xi8> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.push %11 into %35 consumer(%11, %11, %11, %11 at %13, %16, %19, %22) : tensor<16x7x7x4xi8> !dmaphop.path tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
         dmaphop.sync %35
         "routing.yield"() : () -> ()
       }
       %9 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c2_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %11 = routing.routingextract_data %6, %arg3 : tensor<196x64xi8>, i32 -> tensor<49x64xi8>
+        %11 = routing.routingextract_data %6, %arg3 : tensor<64x7x7x4xi8>, i32 -> tensor<16x7x7x4xi8>
         %12 = dmaphop.tile{TILETYPE = "core", col = 2, row = 3} -> !dmaphop.tile
         %13 = dmaphop.port @f2_corePortIn0 on %12 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %14 = dmaphop.port @f2_corePortOut0 on %12 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -103,13 +103,13 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %33 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
         %34 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
         %35 = dmaphop.create_path[%31, %32, %33, %34] {producers = [[@f2_shimPortIn]], consumers = [[@f2_consumer0, @f2_consumer1, @f2_consumer2, @f2_consumer3]], tee_points = [[]]} -> !dmaphop.path
-        dmaphop.push %11 into %35 consumer(%11, %11, %11, %11 at %13, %16, %19, %22) : tensor<49x64xi8> !dmaphop.path tensor<49x64xi8>, tensor<49x64xi8>, tensor<49x64xi8>, tensor<49x64xi8> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.push %11 into %35 consumer(%11, %11, %11, %11 at %13, %16, %19, %22) : tensor<16x7x7x4xi8> !dmaphop.path tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
         dmaphop.sync %35
         "routing.yield"() : () -> ()
       }
       %10 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c3_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %11 = routing.routingextract_data %6, %arg3 : tensor<196x64xi8>, i32 -> tensor<49x64xi8>
+        %11 = routing.routingextract_data %6, %arg3 : tensor<64x7x7x4xi8>, i32 -> tensor<16x7x7x4xi8>
         %12 = dmaphop.tile{TILETYPE = "core", col = 3, row = 3} -> !dmaphop.tile
         %13 = dmaphop.port @f3_corePortIn0 on %12 { direction = "In", direction_channel = 1 } : !dmaphop.tile -> !dmaphop.port
         %14 = dmaphop.port @f3_corePortOut0 on %12 { direction = "Out", direction_channel = 0 } : !dmaphop.tile -> !dmaphop.port
@@ -134,7 +134,7 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %33 = dmaphop.create_hop %17 -> %19 -> !dmaphop.hop
         %34 = dmaphop.create_hop %20 -> %22 -> !dmaphop.hop
         %35 = dmaphop.create_path[%31, %32, %33, %34] {producers = [[@f3_shimPortIn]], consumers = [[@f3_consumer0, @f3_consumer1, @f3_consumer2, @f3_consumer3]], tee_points = [[]]} -> !dmaphop.path
-        dmaphop.push %11 into %35 consumer(%11, %11, %11, %11 at %13, %16, %19, %22) : tensor<49x64xi8> !dmaphop.path tensor<49x64xi8>, tensor<49x64xi8>, tensor<49x64xi8>, tensor<49x64xi8> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
+        dmaphop.push %11 into %35 consumer(%11, %11, %11, %11 at %13, %16, %19, %22) : tensor<16x7x7x4xi8> !dmaphop.path tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8>, tensor<16x7x7x4xi8> !dmaphop.port, !dmaphop.port, !dmaphop.port, !dmaphop.port
         dmaphop.sync %35
         "routing.yield"() : () -> ()
       }
