@@ -637,7 +637,9 @@ void FlowTransferConversion::classifyScheduleMode(FlowLoweringCtx &c) const {
 
     // === Schedule emission: classify tiling mode ===
     auto moduleOp = op->getParentOfType<ModuleOp>();
-    c.classification = classifyTiling(moduleOp);
+    // Tiling scalars were read once at pass entry from the #routing.tiling op into
+    // passState->tilingScalars (empty for conv); do not re-walk partitiontensor here.
+    c.classification = classifyTiling(passState->tilingScalars);
 
     // Create dfschedule.schedule.getbdid for shim tile
     c.getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), c.shimTileOp.getTile());

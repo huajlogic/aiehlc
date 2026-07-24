@@ -310,27 +310,20 @@ bool isFullConnectAuto(ModuleOp moduleOp) {
     return true;
 }
 
-TilingClassification classifyTiling(ModuleOp moduleOp) {
+TilingClassification classifyTiling(const routing::GemmTilingScalars &t) {
     TilingClassification result;
     result.mMode = TilingMode::Match;
     result.mRounds = 1;
     result.nMode = TilingMode::Match;
     result.nRounds = 1;
 
-    if (!moduleOp)
-        return result;
-
-    // fca=0: no M/N round auto-generation. Force Match/1/1 even if tile_m/tile_rows
-    // are present (result is already initialized to Match, mRounds=1, nRounds=1).
-    if (!isFullConnectAuto(moduleOp))
-        return result;
+    // The tiling scalars come from the partitiontensor #routing.tiling op (read
+    // once at pass entry). When fullconnect_auto==0 (conv) the reader returns all
+    // zeros, so m==0 / n==0 below correctly yields Match/1/1 (no M/N round split).
 
     // M-dimension classification
-    auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-    auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-
-    int64_t m = tileMAttr ? tileMAttr.getInt() : 0;
-    int64_t rows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+    int64_t m = t.tileM;
+    int64_t rows = t.tileRows;
 
     if (m == 0 || m == rows) {
         result.mMode = TilingMode::Match;
@@ -344,11 +337,8 @@ TilingClassification classifyTiling(ModuleOp moduleOp) {
     }
 
     // N-dimension classification
-    auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
-    auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
-
-    int64_t n = tileNAttr ? tileNAttr.getInt() : 0;
-    int64_t cols = tileColsAttr ? tileColsAttr.getInt() : 0;
+    int64_t n = t.tileN;
+    int64_t cols = t.tileCols;
 
     if (n == 0 || n == cols) {
         result.nMode = TilingMode::Match;
