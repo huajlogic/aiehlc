@@ -2048,9 +2048,25 @@ public:
                                 // full DDR buffer dim1 is the PADDED row pitch (row_pitch); prefer
                                 // it so @main arg1 spans the whole padded buffer (e.g. 230x920).
                                 if (pti.shimDma.mode == 1 && pti.shimDma.raw_h > 0 && pti.shimDma.raw_wc > 0) {
-                                    int64_t dim1 = pti.shimDma.row_pitch > 0 ? (int64_t)pti.shimDma.row_pitch
-                                                                             : (int64_t)pti.shimDma.raw_wc;
-                                    pti.shape = {(int64_t)pti.shimDma.raw_h, dim1};
+                                    int64_t rowPitch = pti.shimDma.row_pitch > 0 ? (int64_t)pti.shimDma.row_pitch
+                                                                                 : (int64_t)pti.shimDma.raw_wc;
+                                    // 3D conv INPUT shape: the padded row pitch flattens W_pad*C.
+                                    // When the channel stride (input_c from RowBC_spatial.d3) evenly
+                                    // divides row_pitch, emit the genuine 3D input memref
+                                    // <H_pad x W_pad x C> instead of the flattened 2D [H_pad, W_pad*C].
+                                    // The DMA is byte-identical (one contiguous padded slab); only the
+                                    // rank changes. The halo tiling (routingmanager) and DDR base-offset
+                                    // math (flowtransfer_host, rawWc = product of trailing dims) are
+                                    // rank-generic, so [H_pad, W_pad, C] flows through unchanged.
+                                    int64_t Cf = pti.shimDma.input_c;
+                                    if (Cf > 1 && rowPitch % Cf == 0) {
+                                        pti.shape = {(int64_t)pti.shimDma.raw_h, rowPitch / Cf, Cf};
+                                        llvm::outs() << "[TilingLinalg] 3D conv input shape: " << pti.varName << " ["
+                                                     << pti.shape[0] << "x" << pti.shape[1] << "x" << pti.shape[2]
+                                                     << "] (H_pad x W_pad x C, from row_pitch/input_c)\n";
+                                    } else {
+                                        pti.shape = {(int64_t)pti.shimDma.raw_h, rowPitch};
+                                    }
                                 }
 
                                 parsedTensors.push_back(pti);

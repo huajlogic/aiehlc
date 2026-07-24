@@ -917,7 +917,6 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                     auto *ctx2 = builder.getContext();
                     auto shape = tensorType.getShape();
                     int sd = (split.splitDim == 0) ? 0 : 1; // HW-split (row) tensor dim
-                    int otherDim = 1 - sd;                  // K-accum dim
 
                     // Row (HW-split) dim: outer L1 level + optional nested L2 slice_tiling.
                     routing::LevelAttr rowSliceTiling;
@@ -933,20 +932,37 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                         /*slice_tiling=*/rowSliceTiling);
                     auto rowDim = routing::DimAttr::get(ctx2, rowOuter);
 
-                    // K-accum dim: single outer level (no slice_tiling). When there is no
-                    // K-accum split (kRounds<=1) this degenerates to a full-dim single slice.
-                    int64_t kSl = (kRounds > 1) ? kSlice : shape[otherDim];
-                    int64_t kSt = (kRounds > 1) ? kStep : shape[otherDim];
-                    int64_t kRn = (kRounds > 1) ? kRounds : 1;
-                    auto colOuter = routing::LevelAttr::get(ctx2, /*base=*/shape[otherDim], /*total=*/kSl * kRn,
-                                                            /*slice=*/kSl, /*step=*/kSt, /*rounds=*/kRn,
-                                                            /*slice_tiling=*/routing::LevelAttr{});
-                    auto colDim = routing::DimAttr::get(ctx2, colOuter);
-
-                    // Order DimAttrs by tensor dimension index (d0, d1, ...).
-                    llvm::SmallVector<routing::DimAttr> dims(2);
+                    // Order DimAttrs by tensor dimension index (d0, d1, ...). d0 (the
+                    // HW-split row/height dim) is always the halo rowDim; every other
+                    // tensor dim is a full-extent level. Rank-generic: a 2D flattened
+                    // input [H, W*C] keeps its single K-accum d1; a genuine 3D input
+                    // [H, W, C] gets d1=W and d2=C as full-extent structural levels.
+                    // Downstream reads only d0's step + the module `tensor_N.halo` dict
+                    // (row_pitch/k_slice/...) for the shim BD, so d1+ are structural and
+                    // carry no K-accum split (which would be in flattened W*C units).
+                    int rank = (int)shape.size();
+                    llvm::SmallVector<routing::DimAttr> dims(rank);
                     dims[sd] = rowDim;
-                    dims[otherDim] = colDim;
+                    for (int di = 0; di < rank; ++di) {
+                        if (di == sd)
+                            continue;
+                        int64_t kSl, kSt, kRn;
+                        if (rank == 2) {
+                            // 2D flattened [H, W*C]: preserve the K-accum split on d1.
+                            kSl = (kRounds > 1) ? kSlice : shape[di];
+                            kSt = (kRounds > 1) ? kStep : shape[di];
+                            kRn = (kRounds > 1) ? kRounds : 1;
+                        } else {
+                            // 3D [H, W, C]: full-extent structural level (no split).
+                            kSl = shape[di];
+                            kSt = shape[di];
+                            kRn = 1;
+                        }
+                        auto dimOuter = routing::LevelAttr::get(ctx2, /*base=*/shape[di], /*total=*/kSl * kRn,
+                                                                /*slice=*/kSl, /*step=*/kSt, /*rounds=*/kRn,
+                                                                /*slice_tiling=*/routing::LevelAttr{});
+                        dims[di] = routing::DimAttr::get(ctx2, dimOuter);
+                    }
                     partTensor.setTilingAttr(routing::TilingAttr::get(ctx2, dims));
                 }
 

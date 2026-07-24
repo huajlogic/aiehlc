@@ -134,9 +134,15 @@ LogicalResult FlowTransferConversion::computeShimBdParams(FlowLoweringCtx &c) co
                 auto kSliceA = haloDictL2.getAs<IntegerAttr>("k_slice");
                 auto kRoundsA = haloDictL2.getAs<IntegerAttr>("k_rounds");
                 if (l2RoundsA && l2RoundsA.getInt() > 1 && l2SliceA && l2SliceA.getInt() > 0) {
+                    // Row width = product of all dims after dim 0. Rank-generic: a 2D
+                    // flattened input [H, W*C] gives shape[1]; a genuine 3D input
+                    // [H, W, C] gives W*C — the same contiguous padded row pitch.
                     int64_t rawWcL2 = 1;
-                    if (memrefType.getRank() >= 1)
-                        rawWcL2 = memrefType.getShape()[memrefType.getRank() - 1];
+                    if (memrefType.getRank() >= 2)
+                        for (int64_t di = 1; di < memrefType.getRank(); ++di)
+                            rawWcL2 *= memrefType.getShape()[di];
+                    else if (memrefType.getRank() == 1)
+                        rawWcL2 = memrefType.getShape()[0];
                     if (kRoundsA && kRoundsA.getInt() > 1 && kSliceA && kSliceA.getInt() > 0) {
                         c.perTileShimLen = l2SliceA.getInt() * kSliceA.getInt() * kRoundsA.getInt() *
                                            elementSizeBytesShim; // 19*244*4 = 18544
@@ -774,9 +780,15 @@ void FlowTransferConversion::computeMultipleInputOffsetParams(FlowLoweringCtx &c
                     haloWSlice = a.getInt();
             }
         }
+        // Row width = product of all dims after dim 0. Rank-generic: a 2D
+        // flattened input [H, W*C] gives shape[1]; a genuine 3D input [H, W, C]
+        // gives W*C — the same contiguous padded row pitch (e.g. 920).
         int64_t rawWc = 1;
-        if (memrefType.getRank() >= 1)
-            rawWc = memrefType.getShape()[memrefType.getRank() - 1];
+        if (memrefType.getRank() >= 2)
+            for (int64_t di = 1; di < memrefType.getRank(); ++di)
+                rawWc *= memrefType.getShape()[di];
+        else if (memrefType.getRank() == 1)
+            rawWc = memrefType.getShape()[0];
         subTileStride = haloStep * rawWc * elemBytes;
         if (haloWRounds > 1 && haloRowPitch > 0 && haloSlice > 0 && haloWSlice > 0) {
             int64_t bufSize = 0;
