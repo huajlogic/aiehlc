@@ -120,6 +120,25 @@ struct TensorSplitDesc {
     int d2Step = 0;         // d2.stride (e.g. 28)
     int d2Rounds = 0;       // d2.tile_round (e.g. 4); 0/1 = no W chunk
     int d2Full = 0;         // d2.fullsize (W extent = flat row pitch, e.g. 112)
+    // GEMM (fullconnect_auto=1) per-dim on-core tiling. One GemmDimTile per tensor
+    // dim, mirroring the isHalo #routing.tiling builder but for the even mesh/GEMM
+    // path. Each dim describes an outer level (mesh split: slice=meshSlice,
+    // rounds=meshRounds) plus an optional nested on-core level (slice=coreSlice,
+    // rounds=coreRounds; coreRounds<=1 => leaf, no slice_tiling). Empty vector =>
+    // no GEMM TilingAttr emitted (keeps conv/halo/group2 paths and non-GEMM
+    // kernels unchanged). The on-core per-round slice consumed by
+    // get_arg_per_round_size_in_dim(dim, port) is coreSlice (or meshSlice when no
+    // nested level).
+    struct GemmDimTile {
+        int64_t base = 0;       // full tensor extent this dim partitions
+        int64_t meshSlice = 0;  // outer slice (mesh split); == base when not mesh-split
+        int64_t meshStep = 0;   // outer stride between mesh steps
+        int64_t meshRounds = 1; // outer rounds (mesh splitnum); 1 when not mesh-split
+        int64_t coreSlice = 0;  // on-core per-round slice (0/absent => no nested level)
+        int64_t coreStep = 0;   // on-core stride between rounds
+        int64_t coreRounds = 1; // on-core rounds (0/1 => leaf, no slice_tiling)
+    };
+    std::vector<GemmDimTile> gemmTiling;
 };
 
 /// Operation-level split model: one TensorSplitDesc per tensor.
@@ -280,10 +299,15 @@ public:
     /// numHostDdrArgs (out): if non-null, set to the number of DDR pointer args
     ///   on the generated host function (numArgs - 1, excluding XAie_DevInst* dev).
     /// Returns true on success.
+    /// portVarNames: per-port variable names (e.g. "win_a"), indexed by tensor
+    ///   order. Used to resolve IR-sourced builtins whose value comes from the
+    ///   routing.partitiontensor TilingAttr (get_arg_per_round_size_in_dim(dim,
+    ///   port)) rather than frontend scalars. Empty => no IR-sourced resolution.
     static bool runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                             const std::string &userKernelBody = "", const std::string &userKernelFuncName = "",
                             int runtimeDebugLevel = -1, const std::string &userRewrittenSource = "",
                             const std::vector<TensorParam> &tensors = {}, int64_t maxPingPongBytes = 4096,
                             const std::string &aieGen = "Gen2", const std::string &hostFuncSuffix = "",
-                            bool appendMode = false, unsigned *numHostDdrArgs = nullptr);
+                            bool appendMode = false, unsigned *numHostDdrArgs = nullptr,
+                            const std::vector<std::string> &portVarNames = {});
 };

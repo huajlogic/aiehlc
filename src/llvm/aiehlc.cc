@@ -192,6 +192,74 @@ static std::vector<std::string> userMacroDefines; // #define lines from user sou
 using namespace clang;
 using namespace clang::tooling;
 
+// Populate SplitModel.tensorSplits[i].gemmTiling for the even-mesh GEMM path
+// (fullconnect_auto=1) from the derived M/N/K tiling. Each tensor gets one
+// GemmDimTile per tensor dim so routingmanager::buildGemmTilingAttr can emit a
+// #routing.tiling that carries the same slice sizes the flat module attrs do.
+// Role is derived from the split descriptor (hwAxisOwner/isInput) + shape:
+//   input + row  -> A [M, K] : d(splitDim)=M mesh split + on-core tileM;
+//                              contraction dim=K (no mesh split) + effectiveK.
+//   input + col  -> B [N, K] : d(splitDim)=N mesh split + on-core tileN; d=K.
+//   output       -> C [M, N] : d(splitDim)=M mesh split + tileM; other dim=N
+//                              (mesh-col gather rounds) + on-core tileN.
+// Only 2D tensors get the GEMM tiling; higher-rank (lifted 3D/4D) tensors keep
+// full-extent structural levels on the non-split dims. No-op when tiling is
+// invalid so conv / non-GEMM kernels are unaffected.
+static void populateGemmTiling(SplitModel &splitModel, const std::vector<TensorParam> &tensors,
+                               const DerivedTilingParams &dp, int meshRows, int meshCols) {
+    if (!dp.valid || meshRows <= 0 || meshCols <= 0)
+        return;
+    int64_t tileM = dp.tileM > 0 ? dp.tileM : dp.tileRows; // on-core M slice
+    int64_t tileN = dp.tileN > 0 ? dp.tileN : dp.tileCols; // on-core N slice
+    int64_t effK = dp.effectiveK > 0 ? dp.effectiveK : dp.kDim;
+    int64_t mRounds = dp.spatialMRounds > 0 ? dp.spatialMRounds : 1;
+    int64_t nRounds = dp.spatialNRounds > 0 ? dp.spatialNRounds : 1;
+    int64_t kRounds = dp.kRounds > 0 ? dp.kRounds : 1;
+
+    auto meshLevel = [](int64_t base, int64_t meshSlice, int64_t meshRounds, int64_t coreSlice, int64_t coreRounds) {
+        TensorSplitDesc::GemmDimTile t;
+        t.base = base;
+        t.meshSlice = meshSlice;
+        t.meshStep = meshSlice;
+        t.meshRounds = meshRounds;
+        t.coreSlice = coreSlice;
+        t.coreStep = coreSlice;
+        t.coreRounds = coreRounds;
+        return t;
+    };
+
+    for (size_t i = 0; i < splitModel.tensorSplits.size() && i < tensors.size(); ++i) {
+        auto &split = splitModel.tensorSplits[i];
+        const auto &shape = tensors[i].shape;
+        split.gemmTiling.clear();
+        // GEMM tiling only for 2D tensors (rank-generic higher dims stay flat).
+        if (shape.size() != 2)
+            continue;
+        int sd = (split.splitDim == 0) ? 0 : 1; // mesh-split tensor dim
+        int od = 1 - sd;                        // the other tensor dim
+        bool isRow = (split.hwAxisOwner == "row");
+        bool isCol = (split.hwAxisOwner == "col");
+        std::vector<TensorSplitDesc::GemmDimTile> dims(2);
+        if (tensors[i].isInput && isRow) {
+            // A [M, K]: split dim = M (mesh rows, on-core tileM); other = K.
+            dims[sd] = meshLevel(shape[sd], dp.tileRows, meshRows, tileM, mRounds);
+            dims[od] = meshLevel(shape[od], shape[od], 1, effK, kRounds);
+        } else if (tensors[i].isInput && isCol) {
+            // B [N, K]: split dim = N (mesh cols, on-core tileN); other = K.
+            dims[sd] = meshLevel(shape[sd], dp.tileCols, meshCols, tileN, nRounds);
+            dims[od] = meshLevel(shape[od], shape[od], 1, effK, kRounds);
+        } else if (!tensors[i].isInput) {
+            // C [M, N]: split dim = M (mesh rows, tileM); other = N (mesh-col
+            // gather rounds, on-core tileN).
+            dims[sd] = meshLevel(shape[sd], dp.tileRows, meshRows, tileM, mRounds);
+            dims[od] = meshLevel(shape[od], dp.tileCols, meshCols, tileN, nRounds);
+        } else {
+            continue; // unknown role: leave flat
+        }
+        split.gemmTiling = std::move(dims);
+    }
+}
+
 // Extract partition bounds from the 3rd argument of aieDim constructor.
 // Handles InitListExpr {2,7,0,10}, CXXConstructExpr (copy/aggregate), and DeclRefExpr (variable).
 static void extractPartitionFromExpr(const Expr *partExpr, ASTContext *Context) {
@@ -3789,6 +3857,10 @@ public:
                     ret += "constexpr int get_spatial_m_rounds() { return 0; }\n";
                     ret += "constexpr int get_spatial_n_rounds() { return 0; }\n";
                     ret += "template<typename T> constexpr int get_spatial_multiple_rounds(T) { return 0; }\n";
+                    // IR-sourced per-dim per-round on-core slice size for a port.
+                    // Resolved from the routing.partitiontensor TilingAttr inside runPipeline
+                    // (NOT from frontend scalars), so the stub returns 0 here.
+                    ret += "template<typename T> constexpr int get_arg_per_round_size_in_dim(int, T) { return 0; }\n";
                     // Conv accessors (spatial-halo kernel): resolved to integer literals
                     // during kernel body rewriting (DerivedTilingParams).
                     ret += "constexpr int get_kernel_h() { return 0; }\n";
@@ -4118,6 +4190,12 @@ public:
                     if (splitModel.tensorSplits.empty())
                         splitModel = SplitModel::gemm();
 
+                    // Emit per-dim GEMM #routing.tiling for the even-mesh path (only
+                    // when fullconnect_auto=1) so the partitiontensor op carries the
+                    // on-core per-round slice (get_arg_per_round_size_in_dim + Phase D).
+                    if (mkd.fullConnectAuto)
+                        populateGemmTiling(splitModel, mkd.tensors, mkd.derivedParams, rows, cols);
+
                     // Build routing IR for this kernel
                     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, mkd.tensors, splitModel,
                                                                        mkd.partition, aieGenStr);
@@ -4298,10 +4376,10 @@ public:
                     std::string hostFuncSuffix = mkd.kernelName;
                     // Don't pass userRewrittenSource in multi-kernel mode — we emit it ourselves after all runs
                     unsigned hostDdrArgs = 0;
-                    if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros,
-                                                           mkd.kernelFuncName, parsedDebugLevel,
-                                                           /*userRewrittenSource=*/"", {}, mkd.maxPPBytes, aieGenStr,
-                                                           hostFuncSuffix, appendMode, &hostDdrArgs)) {
+                    if (!TilingLinalgPipeline::runPipeline(
+                            ctx, module, outputDir, kernelBodyWithMacros, mkd.kernelFuncName, parsedDebugLevel,
+                            /*userRewrittenSource=*/"", {}, mkd.maxPPBytes, aieGenStr, hostFuncSuffix, appendMode,
+                            &hostDdrArgs, mkd.portVarNames)) {
                         llvm::errs() << "[TilingLinalg] Pipeline FAILED for kernel: " << mkd.kernelName << "\n";
                         std::exit(1);
                     }
@@ -4530,6 +4608,9 @@ public:
                     stream << "constexpr int get_spatial_m_rounds() { return 0; }\n";
                     stream << "constexpr int get_spatial_n_rounds() { return 0; }\n";
                     stream << "template<typename T> constexpr int get_spatial_multiple_rounds(T) { return 0; }\n";
+                    // IR-sourced per-dim per-round on-core slice size (resolved in runPipeline).
+                    stream
+                        << "template<typename T> constexpr int get_arg_per_round_size_in_dim(int, T) { return 0; }\n";
                     stream << "constexpr int get_kernel_h() { return 0; }\n";
                     stream << "constexpr int get_kernel_w() { return 0; }\n";
                     stream << "constexpr int get_input_c() { return 0; }\n";
@@ -4733,13 +4814,27 @@ public:
                 int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
                 int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
 
+                // Full-connect auto flag (aie::GlobalPolicy <kernel>_policy). Resolved
+                // here (before buildRoutingIR) so it can gate both the emitted GEMM
+                // #routing.tiling and the M×N tiling module attrs.
+                bool singleFullConnectAuto = true;
+                {
+                    auto fcaItPre = kernelFullConnectAuto.find(singleKernelFuncName);
+                    if (fcaItPre != kernelFullConnectAuto.end())
+                        singleFullConnectAuto = fcaItPre->second;
+                }
+
+                // Emit per-dim GEMM #routing.tiling for the even-mesh path so the IR
+                // op carries the on-core per-round slice (consumed by
+                // get_arg_per_round_size_in_dim + Phase-D schedule). Only when
+                // fullconnect_auto=1 (conv/halo path keeps its own TilingAttr).
+                if (singleFullConnectAuto)
+                    populateGemmTiling(splitModel, tensors, derivedTilingParams, rows, cols);
+
                 // Build routing IR
                 auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel,
                                                                    parsedPartition, aieGenStr);
 
-                // Full-connect auto flag (aie::GlobalPolicy <kernel>_policy). Resolved
-                // here (before the K-round block) so it can gate the M×N tiling attrs.
-                bool singleFullConnectAuto = true;
                 {
                     auto fcaIt = kernelFullConnectAuto.find(singleKernelFuncName);
                     if (fcaIt != kernelFullConnectAuto.end())
@@ -4936,10 +5031,18 @@ public:
                     kernelBodyWithMacros = macroBlock + singleKernelBody;
                 }
 
+                // Port var names (indexed by tensor order) for IR-sourced builtin
+                // resolution (get_arg_per_round_size_in_dim) inside runPipeline.
+                std::vector<std::string> singlePortVarNames;
+                singlePortVarNames.reserve(parsedTensors.size());
+                for (const auto &pt : parsedTensors)
+                    singlePortVarNames.push_back(pt.varName);
+
                 // Run pipeline (single kernel — no suffix, no append mode)
-                if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros,
-                                                       singleKernelFuncName, parsedDebugLevel, userRewrittenSource,
-                                                       tensors, effectiveMaxPPBytes, aieGenStr)) {
+                if (!TilingLinalgPipeline::runPipeline(
+                        ctx, module, outputDir, kernelBodyWithMacros, singleKernelFuncName, parsedDebugLevel,
+                        userRewrittenSource, tensors, effectiveMaxPPBytes, aieGenStr, /*hostFuncSuffix=*/"",
+                        /*appendMode=*/false, /*numHostDdrArgs=*/nullptr, singlePortVarNames)) {
                     llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
                     std::exit(1);
                 }

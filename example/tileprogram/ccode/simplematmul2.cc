@@ -72,6 +72,13 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
     int row = coreid & 0x1F;
     int8_t tag = (int8_t)((row & 0x7) | ((col & 0x7) << 3));
     klog("DEBUG", 3);
+    // IR-sourced per-round tiling (read from routing.partitiontensor TilingAttr)
+    klog("PRA0", (int32_t)aie::get_arg_per_round_size_in_dim(0, win_a));
+    klog("PRA1", (int32_t)aie::get_arg_per_round_size_in_dim(1, win_a));
+    klog("PRB0", (int32_t)aie::get_arg_per_round_size_in_dim(0, win_b));
+    klog("PRB1", (int32_t)aie::get_arg_per_round_size_in_dim(1, win_b));
+    klog("PRC0", (int32_t)aie::get_arg_per_round_size_in_dim(0, win_c));
+    klog("PRC1", (int32_t)aie::get_arg_per_round_size_in_dim(1, win_c));
 #endif
 
     // Local buffers — accum/local_out hold one M-sub-tile strip (tile_rows × data_cols)

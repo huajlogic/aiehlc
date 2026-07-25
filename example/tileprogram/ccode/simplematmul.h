@@ -44,6 +44,10 @@
 //   - aie::get_tile_rows()      -> output rows per tile (M / HW_ROWS)
 //   - aie::get_tile_cols()      -> output cols per tile (N / HW_COLS)
 //   - aie::get_k_dim()          -> inner product dimension K
+//   - aie::get_arg_per_round_size_in_dim(dim, win)
+//                                -> IR-sourced on-core per-round slice size for
+//                                   port `win` along tensor dimension `dim`
+//                                   (read from routing.partitiontensor TilingAttr)
 //
 // Per-tile computation:
 //   C_tile[tile_rows x tile_cols] = A_tile[tile_rows x K] * B_tile^T[tile_cols x K]

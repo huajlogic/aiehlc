@@ -10,7 +10,8 @@ module attributes {routing.effective_k = 64 : i64, routing.full_k = 256 : i64, r
     scf.execute_region {
       %7 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "col" : i32 -> i32
       %8 = routing.partitiontensor %4 : tensor<256x256xi8> {
-  partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "col", replicateOn = "row", singleTileOwner = "">
+  partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "col", replicateOn = "row", singleTileOwner = "">,
+  tiling = #routing.tiling<d0 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4, slice_tiling = #routing.level<base = 64, total = 256, slice = 16, step = 16, rounds = 16>>>, d1 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 256, step = 256, rounds = 1, slice_tiling = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4>>>>
 } -> tensor<256x256xi8>
       %c0 = arith.constant 0 : index
       %c4 = arith.constant 4 : index
@@ -31,10 +32,12 @@ module attributes {routing.effective_k = 64 : i64, routing.full_k = 256 : i64, r
     scf.execute_region {
       %7 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
       %8 = routing.partitiontensor %2 : tensor<256x256xi8> {
-  partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "row", replicateOn = "col", singleTileOwner = "">
+  partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "row", replicateOn = "col", singleTileOwner = "">,
+  tiling = #routing.tiling<d0 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4, slice_tiling = #routing.level<base = 64, total = 256, slice = 16, step = 16, rounds = 16>>>, d1 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 256, step = 256, rounds = 1, slice_tiling = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4>>>>
 } -> tensor<256x256xi8>
       %9 = routing.partitiontensor %6 : tensor<256x256xi8> {
-  partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "row", replicateOn = "col", singleTileOwner = "">
+  partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "row", replicateOn = "col", singleTileOwner = "">,
+  tiling = #routing.tiling<d0 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4, slice_tiling = #routing.level<base = 64, total = 256, slice = 16, step = 16, rounds = 16>>>, d1 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4, slice_tiling = #routing.level<base = 64, total = 256, slice = 16, step = 16, rounds = 16>>>>
 } -> tensor<256x256xi8>
       %c0 = arith.constant 0 : index
       %c4 = arith.constant 4 : index
