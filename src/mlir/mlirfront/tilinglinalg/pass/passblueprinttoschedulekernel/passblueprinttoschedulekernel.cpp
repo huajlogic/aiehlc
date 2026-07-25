@@ -17,6 +17,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "routingmanager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include <iostream>
@@ -559,7 +560,8 @@ static dfscheblueprint::FlowConfigOp lookupFlowConfig(Operation *rootOp, SymbolR
 static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
                                                         Type defaultElementType, int64_t defaultBufferSize,
                                                         int32_t defaultVectorWidth, double bufferRatio,
-                                                        int64_t maxPingPongBytes);
+                                                        int64_t maxPingPongBytes,
+                                                        const routing::GemmTilingScalars &tiling);
 
 // Generate dfschedule.dskernel_receiver function (legacy style)
 // This is kept for backward compatibility and will call generateKernelModule internally
@@ -573,7 +575,8 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
 static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Location loc, Operation *insertBeforeOp,
                                      StringRef kernelName, RankedTensorType tensorType, int64_t bufferLen,
                                      uint32_t basePacketId, int64_t coreChannel, uint32_t flowIndex,
-                                     KernelResourceManager &resourceMgr, double bufferRatio, int64_t maxPingPongBytes) {
+                                     KernelResourceManager &resourceMgr, double bufferRatio, int64_t maxPingPongBytes,
+                                     const routing::GemmTilingScalars &tiling) {
 
     // Build kernel generation parameters
     KernelGenParams params;
@@ -596,7 +599,7 @@ static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Locati
     // Walk from the module root to collect all shim<->core data flows
     Operation *rootOp = getModuleOp(insertBeforeOp);
     params.kernelParams = analyzeKernelParams(rootOp, resourceMgr, params.elementType, params.bufferSize,
-                                              params.vectorWidth, bufferRatio, maxPingPongBytes);
+                                              params.vectorWidth, bufferRatio, maxPingPongBytes, tiling);
 
     // Update params.bufferSize to the max of all per-window sizes
     // (used for kernel_config_def's backward-compat BUF_SZ global define)
@@ -707,7 +710,8 @@ findFlowTransferFor(dfscheblueprint::FlowConfigOp flowConfig, Operation *rootOp,
 static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, KernelResourceManager &resourceMgr,
                                                         Type defaultElementType, int64_t defaultBufferSize,
                                                         int32_t defaultVectorWidth, double bufferRatio,
-                                                        int64_t maxPingPongBytes) {
+                                                        int64_t maxPingPongBytes,
+                                                        const routing::GemmTilingScalars &tiling) {
 
     SmallVector<KernelParamInfo> params;
 
@@ -828,14 +832,10 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 if (!paramInfo.isInput) {
                     auto moduleOp2 = declareDataOp->getParentOfType<ModuleOp>();
                     if (moduleOp2) {
-                        auto tileMAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_m");
-                        auto tileRowsAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                        auto tileNAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_n");
-                        auto tileColsAttr = moduleOp2->getAttrOfType<IntegerAttr>("routing.tile_cols");
-                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-                        int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
-                        int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                        int64_t tileM = tiling.tileM;
+                        int64_t tileRows = tiling.tileRows;
+                        int64_t tileN = tiling.tileN;
+                        int64_t tileCols = tiling.tileCols;
                         int64_t mRounds = (tileM > 0 && tileM < tileRows) ? (tileRows / tileM) : 1;
                         int64_t nRounds = (tileN > 0 && tileN < tileCols) ? (tileCols / tileN) : 1;
                         int64_t outDivisor = mRounds * nRounds;
@@ -858,24 +858,17 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 }
 
                 if (paramInfo.isInput) {
-                    auto moduleOp = declareDataOp->getParentOfType<ModuleOp>();
-                    if (moduleOp) {
-                        if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
-                            int64_t kRounds = kRoundsAttr.getInt();
-                            if (kRounds > 1) {
-                                perCoreSizeForBuf = perCoreSize / kRounds;
-                                // When tile_m < tileRows, each k-round only needs
-                                // tile_m rows (not partRows). Divide by mRounds
-                                // so pingPongBufSize = tile_m * effectiveK.
-                                auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                                auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                                int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                                int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-                                if (tileM > 0 && tileM < tileRows) {
-                                    int64_t mRounds = tileRows / tileM;
-                                    perCoreSizeForBuf = perCoreSizeForBuf / mRounds;
-                                }
-                            }
+                    int64_t kRounds = tiling.kRounds;
+                    if (kRounds > 1) {
+                        perCoreSizeForBuf = perCoreSize / kRounds;
+                        // When tile_m < tileRows, each k-round only needs
+                        // tile_m rows (not partRows). Divide by mRounds
+                        // so pingPongBufSize = tile_m * effectiveK.
+                        int64_t tileM = tiling.tileM;
+                        int64_t tileRows = tiling.tileRows;
+                        if (tileM > 0 && tileM < tileRows) {
+                            int64_t mRounds = tileRows / tileM;
+                            perCoreSizeForBuf = perCoreSizeForBuf / mRounds;
                         }
                     }
                 }
@@ -1001,10 +994,8 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 if (!paramInfo.isInput) {
                     auto moduleOp3 = declareDataOp->getParentOfType<ModuleOp>();
                     if (moduleOp3) {
-                        auto tileMAttr = moduleOp3->getAttrOfType<IntegerAttr>("routing.tile_m");
-                        auto tileRowsAttr = moduleOp3->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
+                        int64_t tileM = tiling.tileM;
+                        int64_t tileRows = tiling.tileRows;
                         int64_t mRounds = (tileM > 0 && tileM < tileRows) ? (tileRows / tileM) : 1;
                         // Spatial-halo conv (fullconnect_auto=0): tile_m/tile_rows dropped
                         // so mRounds collapses to 1; use the authoritative per-slab round
@@ -1028,17 +1019,11 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 // kRounds iterations. window_init numRounds must cover the total
                 // acquire/release cycles across all k-rounds.
                 if (paramInfo.isInput) {
-                    auto moduleOp = declareDataOp->getParentOfType<ModuleOp>();
-                    if (moduleOp) {
-                        if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
-                            int64_t kRounds = kRoundsAttr.getInt();
-                            if (kRounds > 1) {
-                                llvm::errs()
-                                    << "[BlueprintToScheduleKernel] K-round: input numRounds " << paramInfo.numRounds
-                                    << " * kRounds " << kRounds << " = " << paramInfo.numRounds * kRounds << "\n";
-                                paramInfo.numRounds *= static_cast<int32_t>(kRounds);
-                            }
-                        }
+                    int64_t kRounds = tiling.kRounds;
+                    if (kRounds > 1) {
+                        llvm::errs() << "[BlueprintToScheduleKernel] K-round: input numRounds " << paramInfo.numRounds
+                                     << " * kRounds " << kRounds << " = " << paramInfo.numRounds * kRounds << "\n";
+                        paramInfo.numRounds *= static_cast<int32_t>(kRounds);
                     }
                 }
 
@@ -1046,19 +1031,13 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
                 // the kernel acquires A data mRounds times per k-round.
                 // window_init numRounds must cover the total across all (mr, kr).
                 if (paramInfo.isInput) {
-                    auto moduleOp4 = declareDataOp->getParentOfType<ModuleOp>();
-                    if (moduleOp4) {
-                        auto tileMAttr = moduleOp4->getAttrOfType<IntegerAttr>("routing.tile_m");
-                        auto tileRowsAttr = moduleOp4->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-                        if (tileM > 0 && tileM < tileRows) {
-                            int64_t mRounds = tileRows / tileM;
-                            llvm::errs() << "[BlueprintToScheduleKernel] M-round: input numRounds "
-                                         << paramInfo.numRounds << " * mRounds " << mRounds << " = "
-                                         << paramInfo.numRounds * mRounds << "\n";
-                            paramInfo.numRounds *= static_cast<int32_t>(mRounds);
-                        }
+                    int64_t tileM = tiling.tileM;
+                    int64_t tileRows = tiling.tileRows;
+                    if (tileM > 0 && tileM < tileRows) {
+                        int64_t mRounds = tileRows / tileM;
+                        llvm::errs() << "[BlueprintToScheduleKernel] M-round: input numRounds " << paramInfo.numRounds
+                                     << " * mRounds " << mRounds << " = " << paramInfo.numRounds * mRounds << "\n";
+                        paramInfo.numRounds *= static_cast<int32_t>(mRounds);
                     }
                 }
             } else {
@@ -1154,9 +1133,11 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
 struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::FlowTransferOp> {
     double bufferRatio;
     int64_t maxPingPongBytes;
+    routing::GemmTilingScalars tiling;
 
-    FlowTransferConversion(MLIRContext *ctx, double ratio, int64_t maxPPBytes)
-        : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), bufferRatio(ratio), maxPingPongBytes(maxPPBytes) {}
+    FlowTransferConversion(MLIRContext *ctx, double ratio, int64_t maxPPBytes, routing::GemmTilingScalars tiling)
+        : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), bufferRatio(ratio), maxPingPongBytes(maxPPBytes),
+          tiling(tiling) {}
 
     mutable KernelResourceManager resourceMgr;
 
@@ -1233,7 +1214,8 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         StringRef kernelName = "dskernel_receiver";
         if (!hasDSKernelReceiver(op.getOperation(), kernelName)) {
             generateDSKernelReceiver(rewriter, loc, op.getOperation(), kernelName, kernelTensorType, bufferLen,
-                                     basePacketId, coreChannel, flowIndex, resourceMgr, bufferRatio, maxPingPongBytes);
+                                     basePacketId, coreChannel, flowIndex, resourceMgr, bufferRatio, maxPingPongBytes,
+                                     tiling);
         }
 
         // --- Core tile DMA IO configuration (create_io + start_io) ---
@@ -1292,15 +1274,10 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
                 // outputs mRounds sub-tiles. The DMA must repeat accordingly.
                 int32_t coreRepeatCount = 1;
                 if (coreDmaDir == dfscheblueprint::bp_direction::MM2S) {
-                    auto moduleOp = op->getParentOfType<ModuleOp>();
-                    if (moduleOp) {
-                        auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                        auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                        int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-                        if (tileM > 0 && tileM < tileRows) {
-                            coreRepeatCount = static_cast<int32_t>(tileRows / tileM);
-                        }
+                    int64_t tileM = tiling.tileM;
+                    int64_t tileRows = tiling.tileRows;
+                    if (tileM > 0 && tileM < tileRows) {
+                        coreRepeatCount = static_cast<int32_t>(tileRows / tileM);
                     }
                 }
 
@@ -1360,10 +1337,31 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
         return MemRefType::get(tensorType.getShape(), tensorType.getElementType());
     });
 
+    // Cache the tiling scalars before conversion. For fullconnect_auto=1, source
+    // them from the routing.partitiontensor #routing.tiling op (still live here,
+    // before conversion). The flat module attrs remain the fallback for conv.
+    routing::GemmTilingScalars tiling;
+    if (auto moduleOp = dyn_cast<ModuleOp>(getOperation())) {
+        auto getI64 = [&](StringRef name) -> int64_t {
+            auto attr = moduleOp->getAttrOfType<IntegerAttr>(name);
+            return attr ? attr.getInt() : 0;
+        };
+        tiling.tileM = getI64("routing.tile_m");
+        tiling.tileRows = getI64("routing.tile_rows");
+        tiling.tileN = getI64("routing.tile_n");
+        tiling.tileCols = getI64("routing.tile_cols");
+        tiling.effectiveK = getI64("routing.effective_k");
+        tiling.fullK = getI64("routing.full_k");
+        tiling.kRounds = getI64("routing.k_rounds");
+        routing::GemmTilingScalars ir = routing::readGemmTilingScalars(moduleOp);
+        if (ir.found)
+            tiling = ir;
+    }
+
     RewritePatternSet patterns(context);
     // FlowTransferConversion converts flow_transfer to dfschedule operations
     // It reads from FlowConfigOps to get DMA configuration
-    patterns.add<FlowTransferConversion>(context, bufferRatio_, maxPingPongBytes_);
+    patterns.add<FlowTransferConversion>(context, bufferRatio_, maxPingPongBytes_, tiling);
     // DataSliceOp replaces with input tensor
     patterns.add<DataSliceOpConversion>(context);
     // Use unified erase pattern for ops that just need to be removed

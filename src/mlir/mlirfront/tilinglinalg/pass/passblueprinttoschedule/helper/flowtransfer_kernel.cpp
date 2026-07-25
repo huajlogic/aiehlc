@@ -156,24 +156,17 @@ LogicalResult FlowTransferConversion::emitCoreTileParams(FlowLoweringCtx &c, Cor
     // total number of DMA rounds across all k-rounds.
     t.perCorePerKRound = t.perCoreElements;
     if (c.isInput) {
-        auto moduleOp = op->getParentOfType<ModuleOp>();
-        if (moduleOp) {
-            if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
-                int64_t kRounds = kRoundsAttr.getInt();
-                if (kRounds > 1) {
-                    t.perCorePerKRound = t.perCoreElements / kRounds;
-                    // When tile_m < tileRows, each k-round only needs
-                    // tile_m rows (not partRows). Divide by mRounds
-                    // so pingPongBufferSize = tile_m * effectiveK.
-                    auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                    auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                    int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                    int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-                    if (tileM > 0 && tileM < tileRows) {
-                        int64_t mRounds = tileRows / tileM;
-                        t.perCorePerKRound = t.perCorePerKRound / mRounds;
-                    }
-                }
+        int64_t kRounds = passState->kRounds;
+        if (kRounds > 1) {
+            t.perCorePerKRound = t.perCoreElements / kRounds;
+            // When tile_m < tileRows, each k-round only needs
+            // tile_m rows (not partRows). Divide by mRounds
+            // so pingPongBufferSize = tile_m * effectiveK.
+            int64_t tileM = passState->tileM;
+            int64_t tileRows = passState->tileRows;
+            if (tileM > 0 && tileM < tileRows) {
+                int64_t mRounds = tileRows / tileM;
+                t.perCorePerKRound = t.perCorePerKRound / mRounds;
             }
         }
     } else {
@@ -182,14 +175,10 @@ LogicalResult FlowTransferConversion::emitCoreTileParams(FlowLoweringCtx &c, Cor
         // mRounds * nRounds so BD len matches one kernel output window.
         auto moduleOp = op->getParentOfType<ModuleOp>();
         if (moduleOp) {
-            auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-            auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-            auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
-            auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
-            int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-            int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-            int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
-            int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+            int64_t tileM = passState->tileM;
+            int64_t tileRows = passState->tileRows;
+            int64_t tileN = passState->tileN;
+            int64_t tileCols = passState->tileCols;
             int64_t mRounds = (tileM > 0 && tileM < tileRows) ? (tileRows / tileM) : 1;
             int64_t nRounds = (tileN > 0 && tileN < tileCols) ? (tileCols / tileN) : 1;
             int64_t outDivisor = mRounds * nRounds;
@@ -351,16 +340,11 @@ LogicalResult FlowTransferConversion::computeCoreIterations(FlowLoweringCtx &c, 
     // The host must send numIterations * kRounds total BD iterations
     // for input flows to match the kernel's acquire/release pattern.
     if (c.isInput) {
-        auto moduleOp = op->getParentOfType<ModuleOp>();
-        if (moduleOp) {
-            if (auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds")) {
-                int64_t kRounds = kRoundsAttr.getInt();
-                if (kRounds > 1) {
-                    llvm::errs() << "[BlueprintToSchedule] K-round: input numIterations " << t.numIterations
-                                 << " * kRounds " << kRounds << " = " << t.numIterations * kRounds << "\n";
-                    t.numIterations *= kRounds;
-                }
-            }
+        int64_t kRounds = passState->kRounds;
+        if (kRounds > 1) {
+            llvm::errs() << "[BlueprintToSchedule] K-round: input numIterations " << t.numIterations << " * kRounds "
+                         << kRounds << " = " << t.numIterations * kRounds << "\n";
+            t.numIterations *= kRounds;
         }
     }
 
