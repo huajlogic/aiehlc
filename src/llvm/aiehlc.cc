@@ -3861,6 +3861,10 @@ public:
                     // Resolved from the routing.partitiontensor TilingAttr inside runPipeline
                     // (NOT from frontend scalars), so the stub returns 0 here.
                     ret += "template<typename T> constexpr int get_arg_per_round_size_in_dim(int, T) { return 0; }\n";
+                    // IR-sourced per-dim total on-core rounds to cover the full tensor dim
+                    // for a port. Resolved from the routing.partitiontensor TilingAttr inside
+                    // runPipeline (NOT from frontend scalars), so the stub returns 0 here.
+                    ret += "template<typename T> constexpr int get_arg_total_rounds_in_dim(int, T) { return 0; }\n";
                     // Conv accessors (spatial-halo kernel): resolved to integer literals
                     // during kernel body rewriting (DerivedTilingParams).
                     ret += "constexpr int get_kernel_h() { return 0; }\n";
@@ -4611,6 +4615,8 @@ public:
                     // IR-sourced per-dim per-round on-core slice size (resolved in runPipeline).
                     stream
                         << "template<typename T> constexpr int get_arg_per_round_size_in_dim(int, T) { return 0; }\n";
+                    // IR-sourced per-dim total on-core rounds over the dim (resolved in runPipeline).
+                    stream << "template<typename T> constexpr int get_arg_total_rounds_in_dim(int, T) { return 0; }\n";
                     stream << "constexpr int get_kernel_h() { return 0; }\n";
                     stream << "constexpr int get_kernel_w() { return 0; }\n";
                     stream << "constexpr int get_input_c() { return 0; }\n";

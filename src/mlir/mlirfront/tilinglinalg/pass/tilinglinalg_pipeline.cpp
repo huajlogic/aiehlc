@@ -74,16 +74,18 @@ static std::string setupPipelineIRDir(const std::string &subdir) {
     return dir;
 }
 
-// Resolve IR-sourced builtin calls `aie::get_arg_per_round_size_in_dim(<dim>, <portvar>)`
-// in the kernel body to integer literals read from the routing.partitiontensor
-// TilingAttr (perTensorTiling[tensorIdx][dim] = on-core per-round slice).
+// Resolve IR-sourced builtin calls `<fnName>(<dim>, <portvar>)` in the kernel body
+// to integer literals read from the routing.partitiontensor TilingAttr.
+//   fnName               -> builtin name, e.g. "aie::get_arg_per_round_size_in_dim"
+//                           or "aie::get_arg_total_rounds_in_dim"
 //   portVarNames[t]      -> kernel port variable name for tensor index t
-//   perTensorTiling[t][d] -> resolved slice for tensor t, dim d
+//   perTensorData[t][d]  -> resolved value for tensor t, dim d (slice or rounds)
 // Unresolvable calls (unknown port, missing dim) are left as-is so the missing
 // attribute is visible rather than silently wrong.
-static std::string resolveArgPerRoundBuiltin(const std::string &body, const std::vector<std::string> &portVarNames,
-                                             const std::map<int, std::map<int, int64_t>> &perTensorTiling) {
-    static const std::string kFn = "aie::get_arg_per_round_size_in_dim(";
+static std::string resolveArgDimBuiltin(const std::string &body, const std::string &fnName,
+                                        const std::vector<std::string> &portVarNames,
+                                        const std::map<int, std::map<int, int64_t>> &perTensorData) {
+    const std::string kFn = fnName + "(";
     if (body.find(kFn) == std::string::npos)
         return body;
     // port variable name -> tensor index
@@ -124,8 +126,8 @@ static std::string resolveArgPerRoundBuiltin(const std::string &body, const std:
             pos = argEnd + 1;
             continue;
         }
-        auto tIt = perTensorTiling.find(pit->second);
-        if (tIt == perTensorTiling.end()) {
+        auto tIt = perTensorData.find(pit->second);
+        if (tIt == perTensorData.end()) {
             pos = argEnd + 1;
             continue;
         }
@@ -461,6 +463,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     // createscheduletensor/to_tensor to the func block-argument number, which is
     // the tensor (port) index used by portVarNames.
     std::map<int, std::map<int, int64_t>> perTensorTiling;
+    // Parallel map: total on-core rounds to cover the full tensor dim for each
+    // (tensor, dim): level.slice_tiling.rounds, or level.rounds when no nested level.
+    std::map<int, std::map<int, int64_t>> perTensorRounds;
     {
         // Trace a partitiontensor tensor operand back to its func arg number.
         auto tensorArgIndex = [](mlir::Value v) -> int {
@@ -485,12 +490,15 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 return;
             auto dims = tiling.getDims();
             auto &dimMap = perTensorTiling[tIdx];
+            auto &roundsMap = perTensorRounds[tIdx];
             for (int d = 0; d < (int)dims.size(); ++d) {
                 routing::LevelAttr outer = dims[d].getOuter();
                 if (!outer)
                     continue;
                 int64_t onCore = outer.getSliceTiling() ? outer.getSliceTiling().getSlice() : outer.getSlice();
                 dimMap[d] = onCore;
+                int64_t onCoreRounds = outer.getSliceTiling() ? outer.getSliceTiling().getRounds() : outer.getRounds();
+                roundsMap[d] = onCoreRounds;
             }
         });
     }
@@ -1332,9 +1340,13 @@ after_host_emit:
 
         if (!userKernelBody.empty()) {
             // Write the user's __global__ kernel body verbatim, first resolving
-            // IR-sourced builtins (get_arg_per_round_size_in_dim) from the routing
-            // partitiontensor TilingAttr captured in perTensorTiling above.
-            std::string resolvedKernelBody = resolveArgPerRoundBuiltin(userKernelBody, portVarNames, perTensorTiling);
+            // IR-sourced builtins (get_arg_per_round_size_in_dim /
+            // get_arg_total_rounds_in_dim) from the routing partitiontensor
+            // TilingAttr captured in perTensorTiling / perTensorRounds above.
+            std::string resolvedKernelBody = resolveArgDimBuiltin(userKernelBody, "aie::get_arg_per_round_size_in_dim",
+                                                                  portVarNames, perTensorTiling);
+            resolvedKernelBody = resolveArgDimBuiltin(resolvedKernelBody, "aie::get_arg_total_rounds_in_dim",
+                                                      portVarNames, perTensorRounds);
             stream << "// User-provided compute kernel (extracted from __global__ function)\n";
             stream << resolvedKernelBody << "\n";
             std::cout << "Compute kernel (user-provided) written to " << computePath << std::endl;

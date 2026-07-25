@@ -283,7 +283,8 @@ __global__(conv_policy) void conv2d_spatial(
     int coreid = get_coreid();
     int row = coreid & 0x1F; // bits [0:4]  -> 5 bits
     int col = (coreid >> 16) & 0x7F;
-    const int out_c_num = aie::get_tile_cols(); // output channel number in this tile 16
+    // const int out_c_num = aie::get_tile_cols(); // output channel number in this tile 16
+    const int out_c_num = aie::get_arg_per_round_size_in_dim(2, win_c);
 
     const int num_a_rounds = aie::get_num_rounds(win_a);
     const int num_b_rounds = aie::get_num_rounds(win_b);
