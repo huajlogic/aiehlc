@@ -4207,21 +4207,22 @@ public:
                     // Set K-round module attributes for downstream DMA passes
                     if (mkd.derivedParams.valid && mkd.derivedParams.kRounds > 1) {
                         mlir::OpBuilder attrBuilder(&ctx);
-                        // K-accumulation attrs are orthogonal to M×N tiling — always emit.
-                        module->setAttr("routing.effective_k",
-                                        attrBuilder.getI64IntegerAttr(mkd.derivedParams.effectiveK));
-                        module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kRounds));
-                        module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kDim));
                         // M×N cartesian repeat / spatial sub-tiling attrs are only meaningful
                         // when fullconnect_auto is enabled. Dropping them for fullconnect_auto=0
                         // lets the downstream passes fall through to the pure-K-round path.
+                        // The K-triple (effective_k/k_rounds/full_k) is sourced from the
+                        // #routing.tiling op (populateGemmTiling) when fullconnect_auto=1, so it
+                        // is only emitted as a module attr on the fullconnect_auto=0 else-branch
+                        // (no tiling op exists there).
                         if (mkd.fullConnectAuto) {
-                            module->setAttr("routing.tile_m", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileM));
+                            // tile_m/tile_n are sourced from the #routing.tiling op
+                            // (readGemmTilingScalars) by all downstream consumers, so they
+                            // are no longer emitted as module attrs. tile_rows/tile_cols/
+                            // m_rounds/n_rounds remain module attrs for now.
                             module->setAttr("routing.tile_rows",
                                             attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileRows));
                             module->setAttr("routing.m_rounds",
                                             attrBuilder.getI64IntegerAttr(mkd.derivedParams.spatialMRounds));
-                            module->setAttr("routing.tile_n", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileN));
                             module->setAttr("routing.tile_cols",
                                             attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileCols));
                             module->setAttr("routing.n_rounds",
@@ -4229,13 +4230,18 @@ public:
                             llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
                                          << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
                                          << " full_k=" << mkd.derivedParams.kDim
-                                         << " tile_m=" << mkd.derivedParams.tileM
                                          << " tile_rows=" << mkd.derivedParams.tileRows
                                          << " m_rounds=" << mkd.derivedParams.spatialMRounds
-                                         << " tile_n=" << mkd.derivedParams.tileN
                                          << " tile_cols=" << mkd.derivedParams.tileCols
                                          << " n_rounds=" << mkd.derivedParams.spatialNRounds << "\n";
                         } else {
+                            // fullconnect_auto=0 pure-K-round path: no #routing.tiling op is
+                            // emitted here, so the K-triple must be carried as module attrs.
+                            module->setAttr("routing.effective_k",
+                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.effectiveK));
+                            module->setAttr("routing.k_rounds",
+                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.kRounds));
+                            module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kDim));
                             llvm::outs() << "[TilingLinalg] Set K-round module attrs (fullconnect_auto=0, "
                                             "tile_*/m_rounds/n_rounds dropped): effective_k="
                                          << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
@@ -4850,21 +4856,22 @@ public:
                 // Set K-round module attributes for downstream DMA passes
                 if (derivedTilingParams.valid && derivedTilingParams.kRounds > 1) {
                     mlir::OpBuilder attrBuilder(&ctx);
-                    // K-accumulation attrs are orthogonal to M×N tiling — always emit.
-                    module->setAttr("routing.effective_k",
-                                    attrBuilder.getI64IntegerAttr(derivedTilingParams.effectiveK));
-                    module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(derivedTilingParams.kRounds));
-                    module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(derivedTilingParams.kDim));
                     // M×N cartesian repeat / spatial sub-tiling attrs are only meaningful
                     // when fullconnect_auto is enabled. Dropping them for fullconnect_auto=0
                     // lets the downstream passes fall through to the pure-K-round path.
+                    // The K-triple (effective_k/k_rounds/full_k) is sourced from the
+                    // #routing.tiling op (populateGemmTiling) when fullconnect_auto=1, so it
+                    // is only emitted as a module attr on the fullconnect_auto=0 else-branch
+                    // (no tiling op exists there).
                     if (singleFullConnectAuto) {
-                        module->setAttr("routing.tile_m", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileM));
+                        // tile_m/tile_n are sourced from the #routing.tiling op
+                        // (readGemmTilingScalars) by all downstream consumers, so they are
+                        // no longer emitted as module attrs. tile_rows/tile_cols/m_rounds/
+                        // n_rounds remain module attrs for now.
                         module->setAttr("routing.tile_rows",
                                         attrBuilder.getI64IntegerAttr(derivedTilingParams.tileRows));
                         module->setAttr("routing.m_rounds",
                                         attrBuilder.getI64IntegerAttr(derivedTilingParams.spatialMRounds));
-                        module->setAttr("routing.tile_n", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileN));
                         module->setAttr("routing.tile_cols",
                                         attrBuilder.getI64IntegerAttr(derivedTilingParams.tileCols));
                         module->setAttr("routing.n_rounds",
@@ -4872,13 +4879,17 @@ public:
                         llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
                                      << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds
                                      << " full_k=" << derivedTilingParams.kDim
-                                     << " tile_m=" << derivedTilingParams.tileM
                                      << " tile_rows=" << derivedTilingParams.tileRows
                                      << " m_rounds=" << derivedTilingParams.spatialMRounds
-                                     << " tile_n=" << derivedTilingParams.tileN
                                      << " tile_cols=" << derivedTilingParams.tileCols
                                      << " n_rounds=" << derivedTilingParams.spatialNRounds << "\n";
                     } else {
+                        // fullconnect_auto=0 pure-K-round path: no #routing.tiling op is
+                        // emitted here, so the K-triple must be carried as module attrs.
+                        module->setAttr("routing.effective_k",
+                                        attrBuilder.getI64IntegerAttr(derivedTilingParams.effectiveK));
+                        module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(derivedTilingParams.kRounds));
+                        module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(derivedTilingParams.kDim));
                         llvm::outs() << "[TilingLinalg] Set K-round module attrs (fullconnect_auto=0, "
                                         "tile_*/m_rounds/n_rounds dropped): effective_k="
                                      << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds

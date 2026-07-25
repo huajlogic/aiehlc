@@ -358,15 +358,33 @@ void DfscheduleProvenanceMapPass::runOnOperation() {
     // === Extract module attributes ===
     int64_t tileM = 0, tileN = 0, effectiveK = 0, fullK = 0;
     int64_t kRounds = 0, mRounds = 0, nRounds = 0;
-    if (auto attr = module->getAttrOfType<IntegerAttr>("routing.tile_m"))
+    // tile_m/tile_n: prefer the value threaded in from the pipeline (derived from the
+    // #routing.tiling op before conversion, since the routing dialect/op is gone on this
+    // host module). A zero threaded value means fullconnect_auto=0 (no tiling op) → fall
+    // back to the flat module attr.
+    if (ctorTileM)
+        tileM = ctorTileM;
+    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.tile_m"))
         tileM = attr.getInt();
-    if (auto attr = module->getAttrOfType<IntegerAttr>("routing.tile_n"))
+    if (ctorTileN)
+        tileN = ctorTileN;
+    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.tile_n"))
         tileN = attr.getInt();
-    if (auto attr = module->getAttrOfType<IntegerAttr>("routing.effective_k"))
+    // K-triple: prefer the value threaded in from the pipeline (derived from the
+    // #routing.tiling op before conversion, since the routing dialect/op is gone on this
+    // host module). A zero threaded value means fullconnect_auto=0 (no tiling op) → fall
+    // back to the flat module attr.
+    if (ctorEffectiveK)
+        effectiveK = ctorEffectiveK;
+    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.effective_k"))
         effectiveK = attr.getInt();
-    if (auto attr = module->getAttrOfType<IntegerAttr>("routing.full_k"))
+    if (ctorFullK)
+        fullK = ctorFullK;
+    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.full_k"))
         fullK = attr.getInt();
-    if (auto attr = module->getAttrOfType<IntegerAttr>("routing.k_rounds"))
+    if (ctorKRounds)
+        kRounds = ctorKRounds;
+    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.k_rounds"))
         kRounds = attr.getInt();
     if (auto attr = module->getAttrOfType<IntegerAttr>("routing.m_rounds"))
         mRounds = attr.getInt();

@@ -26,6 +26,15 @@ class DfscheduleProvenanceMapPass : public PassWrapper<DfscheduleProvenanceMapPa
         : outputDir(outputDir), startCol(startCol) {}
     DfscheduleProvenanceMapPass(const std::string &outputDir, int startCol, const std::string &aieGen)
         : outputDir(outputDir), startCol(startCol), aieGen(aieGen) {}
+    // K-triple threaded in from the pipeline: on the dfschedule/host module the routing
+    // dialect is not registered, so the #routing.tiling op is gone. The pipeline reads it
+    // once (on the pre-conversion module) and passes the derived K-triple here. A zero value
+    // means "not threaded" → fall back to the flat module attr (fullconnect_auto=0 path).
+    DfscheduleProvenanceMapPass(const std::string &outputDir, int startCol, const std::string &aieGen,
+                                int64_t effectiveK, int64_t fullK, int64_t kRounds, int64_t tileM = 0,
+                                int64_t tileN = 0)
+        : outputDir(outputDir), startCol(startCol), aieGen(aieGen), ctorEffectiveK(effectiveK), ctorFullK(fullK),
+          ctorKRounds(kRounds), ctorTileM(tileM), ctorTileN(tileN) {}
 
     void runOnOperation() override;
 
@@ -44,6 +53,11 @@ class DfscheduleProvenanceMapPass : public PassWrapper<DfscheduleProvenanceMapPa
     std::string outputDir;
     int startCol = -1;
     std::string aieGen;
+    int64_t ctorEffectiveK = 0;
+    int64_t ctorFullK = 0;
+    int64_t ctorKRounds = 0;
+    int64_t ctorTileM = 0;
+    int64_t ctorTileN = 0;
 };
 
 } // namespace mlir

@@ -518,6 +518,18 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         runPipelineSinglePass(ctx, module, std::move(provenancePass), irDir, stage, "DmaphopProvenanceMapPass");
     }
 
+    // Read the GEMM K-triple from the #routing.tiling op while the partitiontensor op is
+    // still alive on `module` (the routing dialect is dropped on the post-conversion
+    // hostModule, so the op is gone by the time DfscheduleProvenanceMapPass runs). Values
+    // are module-global, so reading here matches hostModule. found=false (fullconnect_auto=0)
+    // leaves the K-triple at 0 → DfscheduleProvenanceMapPass falls back to the module attr.
+    routing::GemmTilingScalars kTile = routing::readGemmTilingScalars(module);
+    int64_t provEffectiveK = kTile.effectiveK;
+    int64_t provFullK = kTile.fullK;
+    int64_t provKRounds = kTile.kRounds;
+    int64_t provTileM = kTile.tileM;
+    int64_t provTileN = kTile.tileN;
+
     // Clone the module at dmaphop stage for the routing path (Phase 5).
     // This preserves the pkt_ids allocated by DmapToDmaphopPass so that
     // routing.cc and host.cc use the same packet IDs.
@@ -613,7 +625,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
     // Generate low-level dfschedule provenance map after WaitMergePass
     {
-        auto dfscheProvenancePass = std::make_unique<DfscheduleProvenanceMapPass>(outputDir, partStartCol, aieGen);
+        auto dfscheProvenancePass = std::make_unique<DfscheduleProvenanceMapPass>(
+            outputDir, partStartCol, aieGen, provEffectiveK, provFullK, provKRounds, provTileM, provTileN);
         runPipelineSinglePass(ctx, hostModule, std::move(dfscheProvenancePass), irDir, stage,
                               "DfscheduleProvenanceMapPass");
     }

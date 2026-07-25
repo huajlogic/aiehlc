@@ -77,13 +77,13 @@
 #include <stdlib.h>
 // GEMM dimensions (user-specified, overridable via -D)
 #ifndef M
-#define M 4096
+#define M 256 // 4096
 #endif
 #ifndef K
-#define K 4096
+#define K 256 // 4096
 #endif
 #ifndef N
-#define N 4096
+#define N 256 // 4096
 #endif
 
 #ifndef HW_ROWS

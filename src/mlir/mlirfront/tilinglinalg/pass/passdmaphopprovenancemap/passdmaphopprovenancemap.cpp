@@ -907,13 +907,18 @@ void DmaphopProvenanceMapPass::runOnOperation() {
         return 0;
     };
 
-    modAttrs.tile_m = getI64Attr("routing.tile_m");
-    modAttrs.tile_n = getI64Attr("routing.tile_n");
+    // Tiling scalars: for fullconnect_auto=1 the #routing.tiling op on partitiontensor is
+    // the source of truth (tile_m/tile_n and the K-triple are no longer emitted as module
+    // attrs); fall back to the flat module attr on the fullconnect_auto=0 path (no GEMM
+    // tiling op exists there).
+    routing::GemmTilingScalars ir = routing::readGemmTilingScalars(moduleOp);
+    modAttrs.tile_m = ir.found ? ir.tileM : getI64Attr("routing.tile_m");
+    modAttrs.tile_n = ir.found ? ir.tileN : getI64Attr("routing.tile_n");
     modAttrs.tile_rows = getI64Attr("routing.tile_rows");
     modAttrs.tile_cols = getI64Attr("routing.tile_cols");
-    modAttrs.effective_k = getI64Attr("routing.effective_k");
-    modAttrs.full_k = getI64Attr("routing.full_k");
-    modAttrs.k_rounds = getI64Attr("routing.k_rounds");
+    modAttrs.effective_k = ir.found ? ir.effectiveK : getI64Attr("routing.effective_k");
+    modAttrs.full_k = ir.found ? ir.fullK : getI64Attr("routing.full_k");
+    modAttrs.k_rounds = ir.found ? ir.kRounds : getI64Attr("routing.k_rounds");
     modAttrs.m_rounds = getI64Attr("routing.m_rounds");
     modAttrs.n_rounds = getI64Attr("routing.n_rounds");
 

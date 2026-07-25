@@ -1,12 +1,12 @@
-module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.effective_k = 64 : i64, routing.full_k = 4096 : i64, routing.fullconnect_auto = 1 : i64, routing.k_rounds = 64 : i64, routing.m_rounds = 256 : i64, routing.n_rounds = 256 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}, routing.tile_cols = 1024 : i64, routing.tile_m = 16 : i64, routing.tile_n = 16 : i64, routing.tile_rows = 1024 : i64} {
-  func.func @routing(%arg0: !emitc.ptr<!emitc.opaque<"XAie_DevInst">>, %arg1: memref<4096x4096xi8>, %arg2: memref<4096x4096xi8>, %arg3: memref<4096x4096xi8>) {
+module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], routing.fullconnect_auto = 1 : i64, routing.m_rounds = 16 : i64, routing.n_rounds = 16 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}, routing.tile_cols = 64 : i64, routing.tile_rows = 64 : i64} {
+  func.func @routing(%arg0: !emitc.ptr<!emitc.opaque<"XAie_DevInst">>, %arg1: memref<256x256xi8>, %arg2: memref<256x256xi8>, %arg3: memref<256x256xi8>) {
     %c3_i32 = arith.constant 3 : i32
     %c2_i32 = arith.constant 2 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    %0 = bufferization.to_tensor %arg1 : memref<4096x4096xi8>
-    %1 = bufferization.to_tensor %arg2 : memref<4096x4096xi8>
-    %2 = bufferization.to_tensor %arg3 : memref<4096x4096xi8>
+    %0 = bufferization.to_tensor %arg1 : memref<256x256xi8>
+    %1 = bufferization.to_tensor %arg2 : memref<256x256xi8>
+    %2 = bufferization.to_tensor %arg3 : memref<256x256xi8>
     scf.execute_region {
       %3 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg4: i32):
