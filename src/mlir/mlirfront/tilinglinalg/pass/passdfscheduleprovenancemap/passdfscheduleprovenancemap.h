@@ -32,9 +32,9 @@ class DfscheduleProvenanceMapPass : public PassWrapper<DfscheduleProvenanceMapPa
     // means "not threaded" → fall back to the flat module attr (fullconnect_auto=0 path).
     DfscheduleProvenanceMapPass(const std::string &outputDir, int startCol, const std::string &aieGen,
                                 int64_t effectiveK, int64_t fullK, int64_t kRounds, int64_t tileM = 0,
-                                int64_t tileN = 0)
+                                int64_t tileN = 0, int64_t mRounds = 0, int64_t nRounds = 0)
         : outputDir(outputDir), startCol(startCol), aieGen(aieGen), ctorEffectiveK(effectiveK), ctorFullK(fullK),
-          ctorKRounds(kRounds), ctorTileM(tileM), ctorTileN(tileN) {}
+          ctorKRounds(kRounds), ctorTileM(tileM), ctorTileN(tileN), ctorMRounds(mRounds), ctorNRounds(nRounds) {}
 
     void runOnOperation() override;
 
@@ -58,6 +58,8 @@ class DfscheduleProvenanceMapPass : public PassWrapper<DfscheduleProvenanceMapPa
     int64_t ctorKRounds = 0;
     int64_t ctorTileM = 0;
     int64_t ctorTileN = 0;
+    int64_t ctorMRounds = 0;
+    int64_t ctorNRounds = 0;
 };
 
 } // namespace mlir

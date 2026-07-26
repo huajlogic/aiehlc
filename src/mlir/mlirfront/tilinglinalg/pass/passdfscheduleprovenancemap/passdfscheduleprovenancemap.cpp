@@ -386,9 +386,16 @@ void DfscheduleProvenanceMapPass::runOnOperation() {
         kRounds = ctorKRounds;
     else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.k_rounds"))
         kRounds = attr.getInt();
-    if (auto attr = module->getAttrOfType<IntegerAttr>("routing.m_rounds"))
+    // M/N spatial rounds: prefer the pipeline-threaded value (derived from the #routing.tiling
+    // op before conversion). A zero threaded value means fullconnect_auto=0 (no GEMM tiling op)
+    // → fall back to the flat module attr (e.g. the spatial-halo conv path still emits it).
+    if (ctorMRounds)
+        mRounds = ctorMRounds;
+    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.m_rounds"))
         mRounds = attr.getInt();
-    if (auto attr = module->getAttrOfType<IntegerAttr>("routing.n_rounds"))
+    if (ctorNRounds)
+        nRounds = ctorNRounds;
+    else if (auto attr = module->getAttrOfType<IntegerAttr>("routing.n_rounds"))
         nRounds = attr.getInt();
 
     // === Find host block ===

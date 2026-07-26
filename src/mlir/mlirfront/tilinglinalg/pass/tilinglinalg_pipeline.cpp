@@ -529,6 +529,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     int64_t provKRounds = kTile.kRounds;
     int64_t provTileM = kTile.tileM;
     int64_t provTileN = kTile.tileN;
+    int64_t provMRounds = kTile.mRounds;
+    int64_t provNRounds = kTile.nRounds;
 
     // Clone the module at dmaphop stage for the routing path (Phase 5).
     // This preserves the pkt_ids allocated by DmapToDmaphopPass so that
@@ -625,8 +627,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
     // Generate low-level dfschedule provenance map after WaitMergePass
     {
-        auto dfscheProvenancePass = std::make_unique<DfscheduleProvenanceMapPass>(
-            outputDir, partStartCol, aieGen, provEffectiveK, provFullK, provKRounds, provTileM, provTileN);
+        auto dfscheProvenancePass =
+            std::make_unique<DfscheduleProvenanceMapPass>(outputDir, partStartCol, aieGen, provEffectiveK, provFullK,
+                                                          provKRounds, provTileM, provTileN, provMRounds, provNRounds);
         runPipelineSinglePass(ctx, hostModule, std::move(dfscheProvenancePass), irDir, stage,
                               "DfscheduleProvenanceMapPass");
     }
