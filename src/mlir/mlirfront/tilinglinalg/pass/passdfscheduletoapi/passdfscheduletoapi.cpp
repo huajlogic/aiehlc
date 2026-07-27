@@ -2146,8 +2146,8 @@ static void emitDebugSnapshotVerbatim(OpBuilder &rewriter, Location loc, const C
         trows.push_back(std::to_string(t.row));
     }
 
-    rewriter.create<emitc::VerbatimOp>(loc, "/* AieRt debug snapshot */");
-    rewriter.create<emitc::VerbatimOp>(loc, "{");
+    rewriter.create<emitc::VerbatimOp>(loc, "/* AieRt debug snapshot (gated by AIE_DEBUG_LOG flag) */");
+    rewriter.create<emitc::VerbatimOp>(loc, "if (AIEHLC_LOG_ENABLED()) {");
     rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_dbg_io_cols", cols));
     rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_dbg_io_rows", rows));
     rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_dbg_io_chs", chs));
