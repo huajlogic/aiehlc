@@ -134,9 +134,15 @@ LogicalResult FlowTransferConversion::computeShimBdParams(FlowLoweringCtx &c) co
                 auto kSliceA = haloDictL2.getAs<IntegerAttr>("k_slice");
                 auto kRoundsA = haloDictL2.getAs<IntegerAttr>("k_rounds");
                 if (l2RoundsA && l2RoundsA.getInt() > 1 && l2SliceA && l2SliceA.getInt() > 0) {
+                    // Row width = product of all dims after dim 0. Rank-generic: a 2D
+                    // flattened input [H, W*C] gives shape[1]; a genuine 3D input
+                    // [H, W, C] gives W*C — the same contiguous padded row pitch.
                     int64_t rawWcL2 = 1;
-                    if (memrefType.getRank() >= 1)
-                        rawWcL2 = memrefType.getShape()[memrefType.getRank() - 1];
+                    if (memrefType.getRank() >= 2)
+                        for (int64_t di = 1; di < memrefType.getRank(); ++di)
+                            rawWcL2 *= memrefType.getShape()[di];
+                    else if (memrefType.getRank() == 1)
+                        rawWcL2 = memrefType.getShape()[0];
                     if (kRoundsA && kRoundsA.getInt() > 1 && kSliceA && kSliceA.getInt() > 0) {
                         c.perTileShimLen = l2SliceA.getInt() * kSliceA.getInt() * kRoundsA.getInt() *
                                            elementSizeBytesShim; // 19*244*4 = 18544
@@ -155,37 +161,28 @@ LogicalResult FlowTransferConversion::computeShimBdParams(FlowLoweringCtx &c) co
     }
 
     // K-round iteration: per-iteration transfer size for iter_wrap>1.
+    // Tiling scalars come from passState (read once at pass entry from the
+    // #routing.tiling op, flat-attr fallback). A missing attr previously read as
+    // 0, matching the struct default, so the value-based guards are equivalent.
     {
-        auto moduleOp = op->getParentOfType<ModuleOp>();
-        if (moduleOp) {
-            auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
-            auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-            auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
-            auto tileRowsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
+        int64_t kRounds = passState->kRounds;
+        int64_t tileM = passState->tileM;
+        int64_t effectiveK = passState->effectiveK;
+        int64_t tileRows = passState->tileRows;
 
-            if (!c.isHaloSlab && kRoundsAttr && kRoundsAttr.getInt() > 1 && c.shimIsSender) {
-                int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
-                int64_t tileRows = tileRowsAttr ? tileRowsAttr.getInt() : 0;
-
-                if (dataId == 0) {
-                    auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
-                    auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
-                    int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
-                    int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
-                    if (tileN > 0 && tileN < tileCols) {
-                        int64_t effectiveK = effectiveKAttr ? effectiveKAttr.getInt() : 0;
-                        int64_t kRounds = kRoundsAttr.getInt();
-                        c.perTileShimLen = tileN * effectiveK * kRounds;
-                    } else {
-                        c.perTileShimLen = shimBdLen / kRoundsAttr.getInt();
-                    }
-                } else if (tileM > 0 && tileM < tileRows) {
-                    int64_t effectiveK = effectiveKAttr ? effectiveKAttr.getInt() : 0;
-                    int64_t kRounds = kRoundsAttr.getInt();
-                    c.perTileShimLen = tileM * effectiveK * kRounds;
+        if (!c.isHaloSlab && kRounds > 1 && c.shimIsSender) {
+            if (dataId == 0) {
+                int64_t tileN = passState->tileN;
+                int64_t tileCols = passState->tileCols;
+                if (tileN > 0 && tileN < tileCols) {
+                    c.perTileShimLen = tileN * effectiveK * kRounds;
                 } else {
-                    c.perTileShimLen = shimBdLen / kRoundsAttr.getInt();
+                    c.perTileShimLen = shimBdLen / kRounds;
                 }
+            } else if (tileM > 0 && tileM < tileRows) {
+                c.perTileShimLen = tileM * effectiveK * kRounds;
+            } else {
+                c.perTileShimLen = shimBdLen / kRounds;
             }
         }
     }
@@ -490,13 +487,13 @@ void FlowTransferConversion::emitShimBdNonOoo(FlowLoweringCtx &c) const {
     if (c.shimIsSender && !c.isHaloSlab) {
         auto moduleOp = op->getParentOfType<ModuleOp>();
         if (moduleOp) {
-            auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
-            auto fullKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k");
-            auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
-            if (effectiveKAttr && fullKAttr && kRoundsAttr) {
-                int64_t effectiveK = effectiveKAttr.getInt();
-                int64_t fullK = fullKAttr.getInt();
-                int64_t kRounds = kRoundsAttr.getInt();
+            // Tiling scalars from passState (entry-read #routing.tiling op, flat-attr
+            // fallback). GEMM emits all three K scalars; conv leaves them 0, so the
+            // effectiveK>0 guard skips this block exactly like the old presence check.
+            int64_t effectiveK = passState->effectiveK;
+            int64_t fullK = passState->fullK;
+            int64_t kRounds = passState->kRounds;
+            {
                 if (effectiveK > 0 && effectiveK < fullK && kRounds > 1) {
                     int64_t elemBytes = 1;
                     if (memrefType.getElementType().isIntOrFloat())
@@ -507,22 +504,16 @@ void FlowTransferConversion::emitShimBdNonOoo(FlowLoweringCtx &c) const {
                     bool nOuterPolicy = isNOuterPolicy(moduleOp);
 
                     if (dataId == 0) {
-                        auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
-                        auto tileColsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
-                        int64_t tileN = tileNAttr ? tileNAttr.getInt() : 0;
-                        int64_t tileCols = tileColsAttr ? tileColsAttr.getInt() : 0;
+                        int64_t tileN = passState->tileN;
+                        int64_t tileCols = passState->tileCols;
 
                         if (tileN > 0 && tileN < tileCols) {
                             if (nOuterPolicy) {
                                 int64_t mRoundsIter = 1;
-                                auto tileMAttrB = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                                auto tileRowsAttrB = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                                if (tileMAttrB && tileRowsAttrB) {
-                                    int64_t tM = tileMAttrB.getInt();
-                                    int64_t tR = tileRowsAttrB.getInt();
-                                    if (tM > 0 && tM < tR)
-                                        mRoundsIter = tR / tM;
-                                }
+                                int64_t tM = passState->tileM;
+                                int64_t tR = passState->tileRows;
+                                if (tM > 0 && tM < tR)
+                                    mRoundsIter = tR / tM;
                                 c.shimIterStepSize = 0;
                                 c.shimIterWrap = 0;
                                 llvm::errs() << "[BlueprintToSchedule] Input B iter (n_outer, mRounds repeat): "
@@ -546,11 +537,8 @@ void FlowTransferConversion::emitShimBdNonOoo(FlowLoweringCtx &c) const {
                                          << "\n";
                         }
                     } else {
-                        int64_t tileM = 0, tileRows = 0;
-                        if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
-                            tileM = a.getInt();
-                        if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows"))
-                            tileRows = a.getInt();
+                        int64_t tileM = passState->tileM;
+                        int64_t tileRows = passState->tileRows;
 
                         if (tileM > 0 && tileM < tileRows) {
                             if (nOuterPolicy) {
@@ -563,14 +551,10 @@ void FlowTransferConversion::emitShimBdNonOoo(FlowLoweringCtx &c) const {
                                              << " tileRows=" << tileRows << " mRounds=" << mRoundsA << "\n";
                             } else {
                                 int64_t nRounds2 = 1;
-                                auto tileNAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
-                                auto tileColsAttr2 = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
-                                if (tileNAttr2 && tileColsAttr2) {
-                                    int64_t tN = tileNAttr2.getInt();
-                                    int64_t tC = tileColsAttr2.getInt();
-                                    if (tN > 0 && tN < tC)
-                                        nRounds2 = tC / tN;
-                                }
+                                int64_t tN = passState->tileN;
+                                int64_t tC = passState->tileCols;
+                                if (tN > 0 && tN < tC)
+                                    nRounds2 = tC / tN;
                                 c.shimIterStepSize = 0;
                                 c.shimIterWrap = 0;
                                 llvm::errs() << "[BlueprintToSchedule] Input A iter (m_outer, nRounds repeat): "
@@ -631,7 +615,9 @@ void FlowTransferConversion::classifyScheduleMode(FlowLoweringCtx &c) const {
 
     // === Schedule emission: classify tiling mode ===
     auto moduleOp = op->getParentOfType<ModuleOp>();
-    c.classification = classifyTiling(moduleOp);
+    // Tiling scalars were read once at pass entry from the #routing.tiling op into
+    // passState->tilingScalars (empty for conv); do not re-walk partitiontensor here.
+    c.classification = classifyTiling(passState->tilingScalars);
 
     // Create dfschedule.schedule.getbdid for shim tile
     c.getBdIdOp = rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), c.shimTileOp.getTile());
@@ -710,27 +696,25 @@ void FlowTransferConversion::computeMultipleInputOffsetParams(FlowLoweringCtx &c
     if (c.isHaloSlab) {
         perIterRepeat = 1;
     } else if (moduleOp) {
-        auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
-        if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
+        // Tiling scalars from passState (entry-read #routing.tiling op, flat-attr
+        // fallback). A missing attr read as 0, matching the struct default.
+        int64_t kRounds = passState->kRounds;
+        if (kRounds > 1) {
             if (nOuterPolicy) {
-                auto tileMAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                auto tileRowsAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                int64_t tM = tileMAttrR ? tileMAttrR.getInt() : 0;
-                int64_t tR = tileRowsAttrR ? tileRowsAttrR.getInt() : 0;
+                int64_t tM = passState->tileM;
+                int64_t tR = passState->tileRows;
                 if (tM > 0 && tM < tR) {
                     perIterRepeat = static_cast<int32_t>(tR / tM); // mRounds
                 } else {
-                    perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt()); // fallback
+                    perIterRepeat = static_cast<int32_t>(kRounds); // fallback
                 }
             } else {
-                auto tileNAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
-                auto tileColsAttrR = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
-                int64_t tN = tileNAttrR ? tileNAttrR.getInt() : 0;
-                int64_t tC = tileColsAttrR ? tileColsAttrR.getInt() : 0;
+                int64_t tN = passState->tileN;
+                int64_t tC = passState->tileCols;
                 if (tN > 0 && tN < tC) {
                     perIterRepeat = static_cast<int32_t>(tC / tN); // nRounds
                 } else {
-                    perIterRepeat = static_cast<int32_t>(kRoundsAttr.getInt()); // fallback
+                    perIterRepeat = static_cast<int32_t>(kRounds); // fallback
                 }
             }
         }
@@ -742,13 +726,11 @@ void FlowTransferConversion::computeMultipleInputOffsetParams(FlowLoweringCtx &c
         elemBytes = memrefType.getElementTypeBitWidth() / 8;
     if (elemBytes == 0)
         elemBytes = 1;
-    int64_t tileMVal = 0, tileNVal = 0, fullKVal = 0;
-    if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m"))
-        tileMVal = a.getInt();
-    if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n"))
-        tileNVal = a.getInt();
-    if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k"))
-        fullKVal = a.getInt();
+    // Tiling scalars from passState (entry-read #routing.tiling op, flat-attr
+    // fallback; 0 when absent, matching the old getAttrOfType default).
+    int64_t tileMVal = passState->tileM;
+    int64_t tileNVal = passState->tileN;
+    int64_t fullKVal = passState->fullK;
     int64_t subTileStride = 0; // default: no offset advancement
     bool halo2D = false;
     int64_t haloHStrideBytes = 0;
@@ -774,9 +756,15 @@ void FlowTransferConversion::computeMultipleInputOffsetParams(FlowLoweringCtx &c
                     haloWSlice = a.getInt();
             }
         }
+        // Row width = product of all dims after dim 0. Rank-generic: a 2D
+        // flattened input [H, W*C] gives shape[1]; a genuine 3D input [H, W, C]
+        // gives W*C — the same contiguous padded row pitch (e.g. 920).
         int64_t rawWc = 1;
-        if (memrefType.getRank() >= 1)
-            rawWc = memrefType.getShape()[memrefType.getRank() - 1];
+        if (memrefType.getRank() >= 2)
+            for (int64_t di = 1; di < memrefType.getRank(); ++di)
+                rawWc *= memrefType.getShape()[di];
+        else if (memrefType.getRank() == 1)
+            rawWc = memrefType.getShape()[0];
         subTileStride = haloStep * rawWc * elemBytes;
         if (haloWRounds > 1 && haloRowPitch > 0 && haloSlice > 0 && haloWSlice > 0) {
             int64_t bufSize = 0;
@@ -1145,27 +1133,25 @@ void FlowTransferConversion::emitScheduleStraightLine(FlowLoweringCtx &c) const 
         repeatCount = (int32_t)(numCoreTiles * c.ooNumIterations);
     } else if (c.shimIsSender) {
         if (moduleOp) {
-            auto kRoundsAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.k_rounds");
-            if (kRoundsAttr && kRoundsAttr.getInt() > 1) {
+            // Tiling scalars from passState (entry-read #routing.tiling op, flat-attr
+            // fallback). A missing attr read as 0, matching the struct default.
+            int64_t kRounds = passState->kRounds;
+            if (kRounds > 1) {
                 if (nOuterPolicy) {
-                    auto tileMAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-                    auto tileRowsAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_rows");
-                    int64_t tM = tileMAttrRC ? tileMAttrRC.getInt() : 0;
-                    int64_t tR = tileRowsAttrRC ? tileRowsAttrRC.getInt() : 0;
+                    int64_t tM = passState->tileM;
+                    int64_t tR = passState->tileRows;
                     if (tM > 0 && tM < tR) {
                         repeatCount = static_cast<int32_t>(tR / tM); // mRounds
                     } else {
-                        repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
+                        repeatCount = static_cast<int32_t>(kRounds);
                     }
                 } else {
-                    auto tileNAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
-                    auto tileColsAttrRC = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_cols");
-                    int64_t tN = tileNAttrRC ? tileNAttrRC.getInt() : 0;
-                    int64_t tC = tileColsAttrRC ? tileColsAttrRC.getInt() : 0;
+                    int64_t tN = passState->tileN;
+                    int64_t tC = passState->tileCols;
                     if (tN > 0 && tN < tC) {
                         repeatCount = static_cast<int32_t>(tC / tN); // nRounds
                     } else {
-                        repeatCount = static_cast<int32_t>(kRoundsAttr.getInt());
+                        repeatCount = static_cast<int32_t>(kRounds);
                     }
                 }
             }

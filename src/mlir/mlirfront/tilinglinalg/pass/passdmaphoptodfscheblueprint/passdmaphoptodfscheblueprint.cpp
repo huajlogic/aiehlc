@@ -684,8 +684,13 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
 };
 
 struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
-    PushOpConversion(MLIRContext *context) 
-        : OpConversionPattern<dmaphop::push>(context) {}
+    // Tiling scalars read once at pass entry from the #routing.tiling op (see
+    // runOnOperation). The K-tiling shim-addressing block below consumes these
+    // instead of re-reading routing.tile_*/effective_k/full_k module attrs.
+    routing::GemmTilingScalars tiling;
+
+    PushOpConversion(MLIRContext *context, routing::GemmTilingScalars tiling)
+        : OpConversionPattern<dmaphop::push>(context), tiling(tiling) {}
 
     LogicalResult matchAndRewrite(dmaphop::push op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
@@ -980,16 +985,15 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                     }
                 }
 
-                // K-tiling multi-dim addressing (only if no user DmaTransform was set)
+                // K-tiling multi-dim addressing (only if no user DmaTransform was set).
+                // Tiling scalars come from the entry-read #routing.tiling struct;
+                // effectiveK==0 (conv / no GEMM tiling) skips this block exactly like
+                // the old effective_k/full_k attr-presence check.
                 if (!inputShimDimStrides) {
-                    auto effectiveKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.effective_k");
-                    auto fullKAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.full_k");
-                    auto tileMAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_m");
-
-                    if (effectiveKAttr && fullKAttr) {
-                        int64_t effectiveK = effectiveKAttr.getInt();
-                        int64_t fullK = fullKAttr.getInt();
-                        int64_t tileM = tileMAttr ? tileMAttr.getInt() : 0;
+                    {
+                        int64_t effectiveK = tiling.effectiveK;
+                        int64_t fullK = tiling.fullK;
+                        int64_t tileM = tiling.tileM;
 
                         if (effectiveK > 0 && effectiveK < fullK) {
                             // Get element bit width from the view tensor type
@@ -1009,10 +1013,9 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                                     // Determine the sub-tile dimension based on flow type:
                                     //   Input B (dataId==0): D1 = tile_n (col sub-tiling)
                                     //   Input A (dataId==1): D1 = tile_m (row sub-tiling)
-                                    auto tileNAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.tile_n");
                                     int64_t subTileDim = tileM; // default: tile_m for input A
-                                    if (dataId == 0 && tileNAttr) {
-                                        subTileDim = tileNAttr.getInt(); // input B (dataId=0): use tile_n
+                                    if (dataId == 0 && tiling.tileN > 0) {
+                                        subTileDim = tiling.tileN; // input B (dataId=0): use tile_n
                                     }
 
                                     int64_t kRounds = fullK / effectiveK;
@@ -1607,10 +1610,18 @@ void DmaphopTodfscheblueprintPass::runOnOperation() {
                  EraseOpLowering<dmaphop::sync>, EraseOpLowering<dmaphop::dealloc_buffer>,
                  EraseOpLowering<dmaphop::consumer>, EraseOpLowering<dmaphop::producer>>(context);
 
+    // Read the #routing.tiling scalars once here, before applyPartialConversion,
+    // and hand them to PushOpConversion. The partitiontensor op survives this pass
+    // (its conversion is disabled above), but reading at entry keeps the K-tiling
+    // block independent of conversion order and consistent with the other passes.
+    routing::GemmTilingScalars gemmTiling;
+    if (auto moduleOp = dyn_cast<ModuleOp>(module))
+        gemmTiling = routing::readGemmTilingScalars(moduleOp);
+
     patterns.add<CreateScheduleTensorConversion>(context);
     //patterns.add<PartitionTensorConversion>(context);
     patterns.add<ExtractDataConversion>(context);
-    patterns.add<PushOpConversion>(context);
+    patterns.add<PushOpConversion>(context, gemmTiling);
     patterns.add<PullOpConversion>(context);
 
     target.addIllegalOp<routing::createscheduletensor>();

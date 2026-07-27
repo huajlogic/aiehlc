@@ -315,6 +315,7 @@ void BlueprintToSchedulePass::runOnOperation() {
                 auto attr = moduleOp->getAttrOfType<IntegerAttr>(name);
                 return attr ? attr.getInt() : 0;
             };
+            // Flat module attrs are the fallback source.
             passState->tileM = getI64("routing.tile_m");
             passState->tileRows = getI64("routing.tile_rows");
             passState->tileN = getI64("routing.tile_n");
@@ -322,6 +323,22 @@ void BlueprintToSchedulePass::runOnOperation() {
             passState->effectiveK = getI64("routing.effective_k");
             passState->fullK = getI64("routing.full_k");
             passState->kRounds = getI64("routing.k_rounds");
+
+            // TilingAttr-primary: for fullconnect_auto=1 source the tiling scalars
+            // directly from the routing.partitiontensor #routing.tiling op (still live
+            // in this Phase-1 pre-processing step, before conversion erases it). The
+            // flat attrs above remain the fallback when no TilingAttr is present.
+            routing::GemmTilingScalars ir = routing::readGemmTilingScalars(moduleOp);
+            passState->tilingScalars = ir; // raw reader output (empty for conv)
+            if (ir.found) {
+                passState->tileM = ir.tileM;
+                passState->tileRows = ir.tileRows;
+                passState->tileN = ir.tileN;
+                passState->tileCols = ir.tileCols;
+                passState->effectiveK = ir.effectiveK;
+                passState->fullK = ir.fullK;
+                passState->kRounds = ir.kRounds;
+            }
         }
     }
 

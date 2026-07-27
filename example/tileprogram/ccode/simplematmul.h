@@ -44,6 +44,15 @@
 //   - aie::get_tile_rows()      -> output rows per tile (M / HW_ROWS)
 //   - aie::get_tile_cols()      -> output cols per tile (N / HW_COLS)
 //   - aie::get_k_dim()          -> inner product dimension K
+//   - aie::get_arg_per_round_size_in_dim(dim, win)
+//                                -> IR-sourced on-core per-round slice size for
+//                                   port `win` along tensor dimension `dim`
+//                                   (read from routing.partitiontensor TilingAttr)
+//   - aie::get_arg_total_rounds_in_dim(dim, win)
+//                                -> IR-sourced total number of on-core rounds to
+//                                   cover the full tensor dimension `dim` for port
+//                                   `win` (read from routing.partitiontensor
+//                                   TilingAttr; sibling of per_round_size_in_dim)
 //
 // Per-tile computation:
 //   C_tile[tile_rows x tile_cols] = A_tile[tile_rows x K] * B_tile^T[tile_cols x K]
@@ -68,13 +77,13 @@
 #include <stdlib.h>
 // GEMM dimensions (user-specified, overridable via -D)
 #ifndef M
-#define M 256 // 4096
+#define M 4096
 #endif
 #ifndef K
-#define K 256 // 4096
+#define K 4096
 #endif
 #ifndef N
-#define N 256 // 4096
+#define N 4096
 #endif
 
 #ifndef HW_ROWS

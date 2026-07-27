@@ -69,6 +69,11 @@ struct BlueprintPassState {
     int64_t effectiveK = 0;
     int64_t fullK = 0;
     int64_t kRounds = 0;
+    // Raw #routing.tiling reader output (found=false for conv / fullconnect_auto=0),
+    // read once at pass entry. classifyTiling consumes this so it never re-walks the
+    // partitiontensor op during conversion. Empty for conv, mirroring the old
+    // !isFullConnectAuto Match/1/1 behavior.
+    routing::GemmTilingScalars tilingScalars;
 };
 
 // === Tiling Classification ===
@@ -171,7 +176,7 @@ SmallVector<OpFoldResult> toOpFoldResult(ArrayRef<int64_t> values, OpBuilder &b)
 LogicalResult preprocessConstantToMemref(Operation *topLevel, std::shared_ptr<BlueprintPassState> state);
 Value resolveMemrefForView(Value viewValue, const BlueprintPassState &state);
 bool isFullConnectAuto(ModuleOp moduleOp);
-TilingClassification classifyTiling(ModuleOp moduleOp);
+TilingClassification classifyTiling(const routing::GemmTilingScalars &t);
 bool isNOuterPolicy(ModuleOp moduleOp);
 
 // === Conv2D width-split halo geometry ===

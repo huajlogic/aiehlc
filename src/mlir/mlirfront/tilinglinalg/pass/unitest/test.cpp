@@ -2108,6 +2108,91 @@ void testPartition() {
     std::cout << "=== Partition Test DONE ===" << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// testReadGemmTilingScalars — verify readGemmTilingScalars reconstructs every
+// GEMM tiling scalar (including the new mRounds/nRounds) from a #routing.tiling
+// op on a routing.partitiontensor, with no reliance on the flat module attrs.
+// ---------------------------------------------------------------------------
+void testReadGemmTilingScalars() {
+    std::cout << "\n=== readGemmTilingScalars Test ===" << std::endl;
+
+    MLIRContext ctx;
+    TilingLinalgPipeline::registerDialects(ctx);
+    mlir::OpBuilder b(&ctx);
+    auto loc = b.getUnknownLoc();
+
+    // fullconnect_auto=1 gate: reader is active only for the even-mesh GEMM path.
+    auto module = mlir::ModuleOp::create(loc);
+    module->setAttr("routing.fullconnect_auto", b.getI64IntegerAttr(1));
+    b.setInsertionPointToStart(module.getBody());
+
+    // Golden geometry mirrors simplematmul2.cc 256x256 on 4x4 mesh (from
+    // ir/dfschedule/0_initial.mlir): tile_rows=tile_cols=64, tile_m=tile_n=16,
+    // m_rounds=n_rounds=16, full_k=256, effective_k=64, k_rounds=4.
+    //   split dim (M or N): outer slice=64 rounds=4 (mesh), nested slice=16
+    //                       rounds=16 (on-core) → tileRows/Cols=64, tileM/N=16,
+    //                       m/nRounds=16.
+    //   K dim:              outer rounds=1 total=256, nested slice=64 rounds=4.
+    // A helper to build a #routing.level.
+    auto mkLevel = [&](int64_t base, int64_t total, int64_t slice, int64_t step, int64_t rounds,
+                       routing::LevelAttr nested) {
+        return routing::LevelAttr::get(&ctx, base, total, slice, step, rounds, nested);
+    };
+    // Mesh split dim (identical for row-M and col-N): outer 64x4, nested 16x16.
+    auto meshCore = mkLevel(64, 256, 16, 16, 16, routing::LevelAttr{});
+    auto meshOuter = mkLevel(256, 256, 64, 64, 4, meshCore);
+    // K dim: outer rounds=1 total=256, nested slice=64 rounds=4.
+    auto kCore = mkLevel(256, 256, 64, 64, 4, routing::LevelAttr{});
+    auto kOuter = mkLevel(256, 256, 256, 256, 1, kCore);
+
+    // A tensor (owner="col", splitdim=0): d0=mesh(N), d1=K.
+    llvm::SmallVector<routing::DimAttr> aDims = {routing::DimAttr::get(&ctx, meshOuter),
+                                                 routing::DimAttr::get(&ctx, kOuter)};
+    auto aTiling = routing::TilingAttr::get(&ctx, aDims);
+    // B/input tensor (owner="row", splitdim=0): d0=mesh(M), d1=K.
+    llvm::SmallVector<routing::DimAttr> bDims = {routing::DimAttr::get(&ctx, meshOuter),
+                                                 routing::DimAttr::get(&ctx, kOuter)};
+    auto bTiling = routing::TilingAttr::get(&ctx, bDims);
+
+    auto tensorTy = mlir::RankedTensorType::get({256, 256}, b.getI8Type());
+    auto src = b.create<mlir::tensor::EmptyOp>(loc, mlir::ArrayRef<int64_t>{256, 256}, b.getI8Type());
+    // Col-owner partition (N): split dim 0.
+    b.create<routing::partitiontensor>(loc, tensorTy, src.getResult(),
+                                       routing::PartitionAttr::get(&ctx, /*splitnum=*/4, /*splitdim=*/0,
+                                                                   /*hwAxisOwner=*/"col",
+                                                                   /*replicateOn=*/"row", /*singleTileOwner=*/""),
+                                       aTiling);
+    // Row-owner partition (M): split dim 0.
+    b.create<routing::partitiontensor>(loc, tensorTy, src.getResult(),
+                                       routing::PartitionAttr::get(&ctx, /*splitnum=*/4, /*splitdim=*/0,
+                                                                   /*hwAxisOwner=*/"row",
+                                                                   /*replicateOn=*/"col", /*singleTileOwner=*/""),
+                                       bTiling);
+
+    routing::GemmTilingScalars t = routing::readGemmTilingScalars(module);
+
+    struct Check {
+        const char *name;
+        int64_t got;
+        int64_t want;
+    };
+    Check checks[] = {
+        {"found", t.found ? 1 : 0, 1}, {"tileM", t.tileM, 16},           {"tileRows", t.tileRows, 64},
+        {"mRounds", t.mRounds, 16},    {"tileN", t.tileN, 16},           {"tileCols", t.tileCols, 64},
+        {"nRounds", t.nRounds, 16},    {"effectiveK", t.effectiveK, 64}, {"fullK", t.fullK, 256},
+        {"kRounds", t.kRounds, 4},
+    };
+    bool allPass = true;
+    for (const auto &c : checks) {
+        bool ok = (c.got == c.want);
+        allPass &= ok;
+        std::cout << "  " << c.name << " = " << c.got << " (want " << c.want << "): " << (ok ? "PASS" : "FAIL")
+                  << std::endl;
+    }
+    std::cout << "=== readGemmTilingScalars Test " << (allPass ? "PASS" : "FAIL") << " ===" << std::endl;
+    module->erase();
+}
+
 int main(int argc, char* argv[]) {
     // Parse --gen and --output-pp-depth arguments from anywhere in argv
     for (int i = 1; i < argc; ++i) {
@@ -2272,6 +2357,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "partition") {
             std::cout << "Executing partition test..." << std::endl;
             testPartition();
+        } else if (arg == "readtiling") {
+            std::cout << "Executing readGemmTilingScalars test..." << std::endl;
+            testReadGemmTilingScalars();
         } else {
             std::cout << "Invalid argument. Please use hw, test, dfschedule, dmaphw, conv2d, conv2d_spatial, "
                          "dilated, pool, "

@@ -560,6 +560,75 @@ void routingmanager::loaddialect(MLIRContext* ctx) {
     ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
     ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
 }
+
+routing::GemmTilingScalars routing::readGemmTilingScalars(mlir::ModuleOp moduleOp) {
+    routing::GemmTilingScalars out;
+    if (!moduleOp)
+        return out;
+    auto fca = moduleOp->getAttrOfType<mlir::IntegerAttr>("routing.fullconnect_auto");
+    if (!fca || fca.getInt() != 1)
+        return out; // conv / non-GEMM: caller keeps flat module-attr behavior
+
+    moduleOp.walk([&](routing::partitiontensor pt) {
+        auto tiling = pt.getTilingAttr();
+        if (!tiling)
+            return;
+        auto dims = tiling.getDims();
+        if (dims.empty())
+            return;
+        auto part = pt.getPartition();
+        if (!part)
+            return;
+        llvm::StringRef owner = part.getHwAxisOwner();
+        int64_t splitdim = part.getSplitdim();
+        if (splitdim < 0 || splitdim >= (int64_t)dims.size())
+            return;
+
+        routing::LevelAttr splitLevel = dims[splitdim].getOuter();
+        if (!splitLevel)
+            return;
+        routing::LevelAttr onCore = splitLevel.getSliceTiling();
+        int64_t meshSlice = splitLevel.getSlice();
+        int64_t coreSlice = onCore ? onCore.getSlice() : meshSlice;
+        // On-core rounds: the nested slice_tiling.rounds is authoritative and
+        // matches the old routing.m_rounds/n_rounds (e.g. 256x256 GEMM: nested
+        // rounds=16 = full_M/tile_m, NOT tile_rows/tile_m). Fall back to
+        // full-dim total/coreSlice only when the nested level is absent.
+        int64_t onCoreRounds = onCore ? onCore.getRounds() : 0;
+        if (onCoreRounds <= 0 && coreSlice > 0)
+            onCoreRounds = splitLevel.getTotal() / coreSlice;
+        if (owner == "row") {
+            out.tileM = coreSlice;
+            out.tileRows = meshSlice;
+            out.mRounds = onCoreRounds;
+            out.found = true;
+        } else if (owner == "col") {
+            out.tileN = coreSlice;
+            out.tileCols = meshSlice;
+            out.nRounds = onCoreRounds;
+            out.found = true;
+        }
+
+        // K dimension: the un-meshed non-split dim (outer.rounds==1) that carries a
+        // nested on-core slice_tiling (the K-contraction rounds). The output tensor's
+        // non-split dim is meshed (rounds>1) so it is correctly skipped here.
+        for (int64_t d = 0; d < (int64_t)dims.size(); ++d) {
+            if (d == splitdim)
+                continue;
+            routing::LevelAttr kl = dims[d].getOuter();
+            if (!kl)
+                continue;
+            routing::LevelAttr kOn = kl.getSliceTiling();
+            if (kl.getRounds() == 1 && kOn) {
+                out.effectiveK = kOn.getSlice();
+                out.fullK = kl.getTotal();
+                out.kRounds = kOn.getRounds();
+                out.found = true;
+            }
+        }
+    });
+    return out;
+}
 mlir::func::FuncOp routingmanager::createroutingfunc(MLIRContext* ctx, int totalN, bool purefunc) {
         OpBuilder builder(ctx);
         auto location = builder.getUnknownLoc();
@@ -803,6 +872,39 @@ TensorSplitDesc SplitModel::fromPolicyFields(int pattern, int distribution, int 
 }
 
 // ---------------------------------------------------------------------------
+// buildGemmTilingAttr — build a #routing.tiling for the even-mesh GEMM path
+// (fullconnect_auto=1) from a per-dim GemmDimTile list. Each dim becomes one
+// #routing.dim whose outer #routing.level records the mesh split and whose
+// optional nested slice_tiling records the on-core per-round slice. Returns a
+// null attr when the descriptor is empty (caller keeps the empty TilingAttr{}).
+// ---------------------------------------------------------------------------
+static routing::TilingAttr buildGemmTilingAttr(MLIRContext *ctx, ArrayRef<TensorSplitDesc::GemmDimTile> gemmTiling) {
+    if (gemmTiling.empty())
+        return {};
+    llvm::SmallVector<routing::DimAttr> dims;
+    dims.reserve(gemmTiling.size());
+    for (const auto &d : gemmTiling) {
+        int64_t meshSlice = d.meshSlice > 0 ? d.meshSlice : d.base;
+        int64_t meshStep = d.meshStep > 0 ? d.meshStep : meshSlice;
+        int64_t meshRounds = d.meshRounds > 0 ? d.meshRounds : 1;
+        // Nested on-core level: only when the dim is chunked on-core (>1 round).
+        routing::LevelAttr coreLevel;
+        if (d.coreRounds > 1 && d.coreSlice > 0) {
+            int64_t coreStep = d.coreStep > 0 ? d.coreStep : d.coreSlice;
+            coreLevel = routing::LevelAttr::get(ctx, /*base=*/meshSlice,
+                                                /*total=*/d.coreSlice * d.coreRounds,
+                                                /*slice=*/d.coreSlice, /*step=*/coreStep,
+                                                /*rounds=*/d.coreRounds, /*slice_tiling=*/routing::LevelAttr{});
+        }
+        auto outer = routing::LevelAttr::get(ctx, /*base=*/d.base, /*total=*/meshSlice * meshRounds,
+                                             /*slice=*/meshSlice, /*step=*/meshStep, /*rounds=*/meshRounds,
+                                             /*slice_tiling=*/coreLevel);
+        dims.push_back(routing::DimAttr::get(ctx, outer));
+    }
+    return routing::TilingAttr::get(ctx, dims);
+}
+
+// ---------------------------------------------------------------------------
 // createroutingfuncBySplitModel — generalized routing driven by SplitModel
 // Creates separate scf.execute_region per mesh axis. Tensors sharing
 // the same hwAxisOwner (or assigned to an axis via replicateOn when
@@ -917,7 +1019,6 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                     auto *ctx2 = builder.getContext();
                     auto shape = tensorType.getShape();
                     int sd = (split.splitDim == 0) ? 0 : 1; // HW-split (row) tensor dim
-                    int otherDim = 1 - sd;                  // K-accum dim
 
                     // Row (HW-split) dim: outer L1 level + optional nested L2 slice_tiling.
                     routing::LevelAttr rowSliceTiling;
@@ -933,20 +1034,37 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                         /*slice_tiling=*/rowSliceTiling);
                     auto rowDim = routing::DimAttr::get(ctx2, rowOuter);
 
-                    // K-accum dim: single outer level (no slice_tiling). When there is no
-                    // K-accum split (kRounds<=1) this degenerates to a full-dim single slice.
-                    int64_t kSl = (kRounds > 1) ? kSlice : shape[otherDim];
-                    int64_t kSt = (kRounds > 1) ? kStep : shape[otherDim];
-                    int64_t kRn = (kRounds > 1) ? kRounds : 1;
-                    auto colOuter = routing::LevelAttr::get(ctx2, /*base=*/shape[otherDim], /*total=*/kSl * kRn,
-                                                            /*slice=*/kSl, /*step=*/kSt, /*rounds=*/kRn,
-                                                            /*slice_tiling=*/routing::LevelAttr{});
-                    auto colDim = routing::DimAttr::get(ctx2, colOuter);
-
-                    // Order DimAttrs by tensor dimension index (d0, d1, ...).
-                    llvm::SmallVector<routing::DimAttr> dims(2);
+                    // Order DimAttrs by tensor dimension index (d0, d1, ...). d0 (the
+                    // HW-split row/height dim) is always the halo rowDim; every other
+                    // tensor dim is a full-extent level. Rank-generic: a 2D flattened
+                    // input [H, W*C] keeps its single K-accum d1; a genuine 3D input
+                    // [H, W, C] gets d1=W and d2=C as full-extent structural levels.
+                    // Downstream reads only d0's step + the module `tensor_N.halo` dict
+                    // (row_pitch/k_slice/...) for the shim BD, so d1+ are structural and
+                    // carry no K-accum split (which would be in flattened W*C units).
+                    int rank = (int)shape.size();
+                    llvm::SmallVector<routing::DimAttr> dims(rank);
                     dims[sd] = rowDim;
-                    dims[otherDim] = colDim;
+                    for (int di = 0; di < rank; ++di) {
+                        if (di == sd)
+                            continue;
+                        int64_t kSl, kSt, kRn;
+                        if (rank == 2) {
+                            // 2D flattened [H, W*C]: preserve the K-accum split on d1.
+                            kSl = (kRounds > 1) ? kSlice : shape[di];
+                            kSt = (kRounds > 1) ? kStep : shape[di];
+                            kRn = (kRounds > 1) ? kRounds : 1;
+                        } else {
+                            // 3D [H, W, C]: full-extent structural level (no split).
+                            kSl = shape[di];
+                            kSt = shape[di];
+                            kRn = 1;
+                        }
+                        auto dimOuter = routing::LevelAttr::get(ctx2, /*base=*/shape[di], /*total=*/kSl * kRn,
+                                                                /*slice=*/kSl, /*step=*/kSt, /*rounds=*/kRn,
+                                                                /*slice_tiling=*/routing::LevelAttr{});
+                        dims[di] = routing::DimAttr::get(ctx2, dimOuter);
+                    }
                     partTensor.setTilingAttr(routing::TilingAttr::get(ctx2, dims));
                 }
 
@@ -1063,6 +1181,15 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                     dims[sd] = rowDim;
                     dims[colTensorDim] = colDim;
                     partTensor.setTilingAttr(routing::TilingAttr::get(ctx2, dims));
+                }
+
+                // GEMM / fullconnect_auto=1 even-mesh path: build a per-dim
+                // #routing.tiling from the frontend-threaded gemmTiling descriptor
+                // (outer mesh split + optional nested on-core round). Guarded so it
+                // never overrides the conv halo / group2 attrs above.
+                if (!isHalo && !isGroup2 && !split.gemmTiling.empty()) {
+                    if (auto gemmAttr = buildGemmTilingAttr(builder.getContext(), split.gemmTiling))
+                        partTensor.setTilingAttr(gemmAttr);
                 }
 
                 // Calculate split tensor shape

@@ -192,6 +192,74 @@ static std::vector<std::string> userMacroDefines; // #define lines from user sou
 using namespace clang;
 using namespace clang::tooling;
 
+// Populate SplitModel.tensorSplits[i].gemmTiling for the even-mesh GEMM path
+// (fullconnect_auto=1) from the derived M/N/K tiling. Each tensor gets one
+// GemmDimTile per tensor dim so routingmanager::buildGemmTilingAttr can emit a
+// #routing.tiling that carries the same slice sizes the flat module attrs do.
+// Role is derived from the split descriptor (hwAxisOwner/isInput) + shape:
+//   input + row  -> A [M, K] : d(splitDim)=M mesh split + on-core tileM;
+//                              contraction dim=K (no mesh split) + effectiveK.
+//   input + col  -> B [N, K] : d(splitDim)=N mesh split + on-core tileN; d=K.
+//   output       -> C [M, N] : d(splitDim)=M mesh split + tileM; other dim=N
+//                              (mesh-col gather rounds) + on-core tileN.
+// Only 2D tensors get the GEMM tiling; higher-rank (lifted 3D/4D) tensors keep
+// full-extent structural levels on the non-split dims. No-op when tiling is
+// invalid so conv / non-GEMM kernels are unaffected.
+static void populateGemmTiling(SplitModel &splitModel, const std::vector<TensorParam> &tensors,
+                               const DerivedTilingParams &dp, int meshRows, int meshCols) {
+    if (!dp.valid || meshRows <= 0 || meshCols <= 0)
+        return;
+    int64_t tileM = dp.tileM > 0 ? dp.tileM : dp.tileRows; // on-core M slice
+    int64_t tileN = dp.tileN > 0 ? dp.tileN : dp.tileCols; // on-core N slice
+    int64_t effK = dp.effectiveK > 0 ? dp.effectiveK : dp.kDim;
+    int64_t mRounds = dp.spatialMRounds > 0 ? dp.spatialMRounds : 1;
+    int64_t nRounds = dp.spatialNRounds > 0 ? dp.spatialNRounds : 1;
+    int64_t kRounds = dp.kRounds > 0 ? dp.kRounds : 1;
+
+    auto meshLevel = [](int64_t base, int64_t meshSlice, int64_t meshRounds, int64_t coreSlice, int64_t coreRounds) {
+        TensorSplitDesc::GemmDimTile t;
+        t.base = base;
+        t.meshSlice = meshSlice;
+        t.meshStep = meshSlice;
+        t.meshRounds = meshRounds;
+        t.coreSlice = coreSlice;
+        t.coreStep = coreSlice;
+        t.coreRounds = coreRounds;
+        return t;
+    };
+
+    for (size_t i = 0; i < splitModel.tensorSplits.size() && i < tensors.size(); ++i) {
+        auto &split = splitModel.tensorSplits[i];
+        const auto &shape = tensors[i].shape;
+        split.gemmTiling.clear();
+        // GEMM tiling only for 2D tensors (rank-generic higher dims stay flat).
+        if (shape.size() != 2)
+            continue;
+        int sd = (split.splitDim == 0) ? 0 : 1; // mesh-split tensor dim
+        int od = 1 - sd;                        // the other tensor dim
+        bool isRow = (split.hwAxisOwner == "row");
+        bool isCol = (split.hwAxisOwner == "col");
+        std::vector<TensorSplitDesc::GemmDimTile> dims(2);
+        if (tensors[i].isInput && isRow) {
+            // A [M, K]: split dim = M (mesh rows, on-core tileM); other = K.
+            dims[sd] = meshLevel(shape[sd], dp.tileRows, meshRows, tileM, mRounds);
+            dims[od] = meshLevel(shape[od], shape[od], 1, effK, kRounds);
+        } else if (tensors[i].isInput && isCol) {
+            // B [N, K]: split dim = N (mesh cols, on-core tileN); other = K.
+            dims[sd] = meshLevel(shape[sd], dp.tileCols, meshCols, tileN, nRounds);
+            dims[od] = meshLevel(shape[od], shape[od], 1, effK, kRounds);
+        } else if (!tensors[i].isInput) {
+            // C [M, N]: split dim = M (mesh rows, tileM); other = N (mesh-col
+            // gather rounds, on-core tileN).
+            dims[sd] = meshLevel(shape[sd], dp.tileRows, meshRows, tileM, mRounds);
+            dims[od] = meshLevel(shape[od], dp.tileCols, meshCols, tileN, nRounds);
+        } else {
+            continue; // unknown role: leave flat
+        }
+        split.gemmTiling = std::move(dims);
+    }
+}
+
 // Extract partition bounds from the 3rd argument of aieDim constructor.
 // Handles InitListExpr {2,7,0,10}, CXXConstructExpr (copy/aggregate), and DeclRefExpr (variable).
 static void extractPartitionFromExpr(const Expr *partExpr, ASTContext *Context) {
@@ -1934,6 +2002,35 @@ public:
                                                  << "] (from GemmSpace d1/d2/d3)\n";
                                 }
 
+                                // 4D conv FILTER (B) shape: when the col-broadcast filter port
+                                // declares the conv kernel sub-dims (ColBC: d1=F, d2=KW, d3=KH,
+                                // d4=C via tile_level.fullsize -> TileDim.base), emit the genuine
+                                // 4D filter memref <F x KH x KW x C> instead of the flattened 2D
+                                // [K, N]. Each mesh COLUMN owns F/HW_COLS filters, so the d0 (F)
+                                // split matches the host DDR F-major layout filter[f*K + kk] and
+                                // the kernel's B_local[j*K + kk] indexing (the 2D [K,N] form was
+                                // the TRANSPOSE of the real DDR buffer). The downstream
+                                // split-shape (splitShape[0]/=splitnum) and flat shim BD (product
+                                // of all dims) are rank-generic, so [F/cols, KH, KW, C] flows
+                                // through unchanged. Only the col-broadcast filter is lifted;
+                                // plain matmul B (no d3/d4) stays 2D. Fires only when the conv
+                                // sub-dims are present and F*KH*KW*C == K*N (consistency guard).
+                                if (pti.policyResolved && pti.isInput && pti.perPort2D && pti.pattern == 0 &&
+                                    pti.distribution == 1 && pti.tdD1.base > 0 && pti.tdD2.base > 0 &&
+                                    pti.tdD3.base > 0 && pti.tdD4.base > 0) {
+                                    int64_t Ff = pti.tdD1.base;  // d1 = F (output filters, col-split)
+                                    int64_t KWf = pti.tdD2.base; // d2 = KW
+                                    int64_t KHf = pti.tdD3.base; // d3 = KH
+                                    int64_t Cf = pti.tdD4.base;  // d4 = C (padded channel)
+                                    if (macroDimM > 0 && macroDimN > 0 && macroDimK > 0 && Ff == macroDimN &&
+                                        KHf * KWf * Cf == macroDimK) {
+                                        pti.shape = {Ff, KHf, KWf, Cf}; // [F, KH, KW, C]
+                                        llvm::outs() << "[TilingLinalg] 4D conv filter shape: " << pti.varName << " ["
+                                                     << Ff << "x" << KHf << "x" << KWf << "x" << Cf
+                                                     << "] (from GemmSpace d1/d3/d2/d4)\n";
+                                    }
+                                }
+
                                 // Conv2dSpace-derived shim DMA. The Conv2dSpace carries the
                                 // conv iteration space; when the port's explicit DmaTransform
                                 // is flat() (num_dims==0 && mode==0) we synthesize the same
@@ -2019,9 +2116,25 @@ public:
                                 // full DDR buffer dim1 is the PADDED row pitch (row_pitch); prefer
                                 // it so @main arg1 spans the whole padded buffer (e.g. 230x920).
                                 if (pti.shimDma.mode == 1 && pti.shimDma.raw_h > 0 && pti.shimDma.raw_wc > 0) {
-                                    int64_t dim1 = pti.shimDma.row_pitch > 0 ? (int64_t)pti.shimDma.row_pitch
-                                                                             : (int64_t)pti.shimDma.raw_wc;
-                                    pti.shape = {(int64_t)pti.shimDma.raw_h, dim1};
+                                    int64_t rowPitch = pti.shimDma.row_pitch > 0 ? (int64_t)pti.shimDma.row_pitch
+                                                                                 : (int64_t)pti.shimDma.raw_wc;
+                                    // 3D conv INPUT shape: the padded row pitch flattens W_pad*C.
+                                    // When the channel stride (input_c from RowBC_spatial.d3) evenly
+                                    // divides row_pitch, emit the genuine 3D input memref
+                                    // <H_pad x W_pad x C> instead of the flattened 2D [H_pad, W_pad*C].
+                                    // The DMA is byte-identical (one contiguous padded slab); only the
+                                    // rank changes. The halo tiling (routingmanager) and DDR base-offset
+                                    // math (flowtransfer_host, rawWc = product of trailing dims) are
+                                    // rank-generic, so [H_pad, W_pad, C] flows through unchanged.
+                                    int64_t Cf = pti.shimDma.input_c;
+                                    if (Cf > 1 && rowPitch % Cf == 0) {
+                                        pti.shape = {(int64_t)pti.shimDma.raw_h, rowPitch / Cf, Cf};
+                                        llvm::outs() << "[TilingLinalg] 3D conv input shape: " << pti.varName << " ["
+                                                     << pti.shape[0] << "x" << pti.shape[1] << "x" << pti.shape[2]
+                                                     << "] (H_pad x W_pad x C, from row_pitch/input_c)\n";
+                                    } else {
+                                        pti.shape = {(int64_t)pti.shimDma.raw_h, rowPitch};
+                                    }
                                 }
 
                                 parsedTensors.push_back(pti);
@@ -2030,9 +2143,11 @@ public:
                                     tagInfo = " policy=" + policyName;
                                 else if (!spatialTag.empty())
                                     tagInfo = " spatial=" + spatialTag;
-                                llvm::outs() << "[TilingLinalg] Tensor param: " << pti.varName << " [" << pti.shape[0]
-                                             << "x" << pti.shape[1] << "] i" << pti.elementBitWidth
-                                             << (pti.isInput ? " (input)" : " (output)") << tagInfo << "\n";
+                                llvm::outs() << "[TilingLinalg] Tensor param: " << pti.varName << " [";
+                                for (size_t sdi = 0; sdi < pti.shape.size(); ++sdi)
+                                    llvm::outs() << (sdi ? "x" : "") << pti.shape[sdi];
+                                llvm::outs() << "] i" << pti.elementBitWidth << (pti.isInput ? " (input)" : " (output)")
+                                             << tagInfo << "\n";
                             }
 						}
 					}
@@ -3742,6 +3857,14 @@ public:
                     ret += "constexpr int get_spatial_m_rounds() { return 0; }\n";
                     ret += "constexpr int get_spatial_n_rounds() { return 0; }\n";
                     ret += "template<typename T> constexpr int get_spatial_multiple_rounds(T) { return 0; }\n";
+                    // IR-sourced per-dim per-round on-core slice size for a port.
+                    // Resolved from the routing.partitiontensor TilingAttr inside runPipeline
+                    // (NOT from frontend scalars), so the stub returns 0 here.
+                    ret += "template<typename T> constexpr int get_arg_per_round_size_in_dim(int, T) { return 0; }\n";
+                    // IR-sourced per-dim total on-core rounds to cover the full tensor dim
+                    // for a port. Resolved from the routing.partitiontensor TilingAttr inside
+                    // runPipeline (NOT from frontend scalars), so the stub returns 0 here.
+                    ret += "template<typename T> constexpr int get_arg_total_rounds_in_dim(int, T) { return 0; }\n";
                     // Conv accessors (spatial-halo kernel): resolved to integer literals
                     // during kernel body rewriting (DerivedTilingParams).
                     ret += "constexpr int get_kernel_h() { return 0; }\n";
@@ -3762,6 +3885,7 @@ public:
                     ret += "extern \"C\" XAie_DevInst *__Runtime_get_partition_dev(int meshId);\n";
                     ret += "extern \"C\" void *__Runtime_alloc_buffer(XAie_DevInst *dev, __SIZE_TYPE__ size_bytes);\n";
                     ret += "extern \"C\" void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);\n";
+                    ret += "extern \"C\" void *__Runtime_Alloc(__SIZE_TYPE__ bytes);\n";
                     ret +=
                         "extern \"C\" void __Runtime_sync_for_cpu(XAie_DevInst *dev, void *ptr, __SIZE_TYPE__ size);\n";
                     ret += "extern \"C\" void __Runtime_teardown_all();\n";
@@ -4070,6 +4194,12 @@ public:
                     if (splitModel.tensorSplits.empty())
                         splitModel = SplitModel::gemm();
 
+                    // Emit per-dim GEMM #routing.tiling for the even-mesh path (only
+                    // when fullconnect_auto=1) so the partitiontensor op carries the
+                    // on-core per-round slice (get_arg_per_round_size_in_dim + Phase D).
+                    if (mkd.fullConnectAuto)
+                        populateGemmTiling(splitModel, mkd.tensors, mkd.derivedParams, rows, cols);
+
                     // Build routing IR for this kernel
                     auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, mkd.tensors, splitModel,
                                                                        mkd.partition, aieGenStr);
@@ -4077,35 +4207,34 @@ public:
                     // Set K-round module attributes for downstream DMA passes
                     if (mkd.derivedParams.valid && mkd.derivedParams.kRounds > 1) {
                         mlir::OpBuilder attrBuilder(&ctx);
-                        // K-accumulation attrs are orthogonal to M×N tiling — always emit.
-                        module->setAttr("routing.effective_k",
-                                        attrBuilder.getI64IntegerAttr(mkd.derivedParams.effectiveK));
-                        module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kRounds));
-                        module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kDim));
                         // M×N cartesian repeat / spatial sub-tiling attrs are only meaningful
                         // when fullconnect_auto is enabled. Dropping them for fullconnect_auto=0
                         // lets the downstream passes fall through to the pure-K-round path.
+                        // The K-triple (effective_k/k_rounds/full_k) is sourced from the
+                        // #routing.tiling op (populateGemmTiling) when fullconnect_auto=1, so it
+                        // is only emitted as a module attr on the fullconnect_auto=0 else-branch
+                        // (no tiling op exists there).
                         if (mkd.fullConnectAuto) {
-                            module->setAttr("routing.tile_m", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileM));
-                            module->setAttr("routing.tile_rows",
-                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileRows));
-                            module->setAttr("routing.m_rounds",
-                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.spatialMRounds));
-                            module->setAttr("routing.tile_n", attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileN));
-                            module->setAttr("routing.tile_cols",
-                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.tileCols));
-                            module->setAttr("routing.n_rounds",
-                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.spatialNRounds));
-                            llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
+                            // tile_m/tile_n, tile_rows/tile_cols, the M/N spatial rounds, and
+                            // the K-triple are all sourced from the #routing.tiling op on
+                            // partitiontensor (readGemmTilingScalars) by every downstream
+                            // consumer, so none are emitted as flat module attrs here.
+                            llvm::outs() << "[TilingLinalg] fullconnect_auto=1: tiling scalars sourced from "
+                                            "#routing.tiling op (effective_k="
                                          << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
                                          << " full_k=" << mkd.derivedParams.kDim
-                                         << " tile_m=" << mkd.derivedParams.tileM
                                          << " tile_rows=" << mkd.derivedParams.tileRows
                                          << " m_rounds=" << mkd.derivedParams.spatialMRounds
-                                         << " tile_n=" << mkd.derivedParams.tileN
                                          << " tile_cols=" << mkd.derivedParams.tileCols
-                                         << " n_rounds=" << mkd.derivedParams.spatialNRounds << "\n";
+                                         << " n_rounds=" << mkd.derivedParams.spatialNRounds << ")\n";
                         } else {
+                            // fullconnect_auto=0 pure-K-round path: no #routing.tiling op is
+                            // emitted here, so the K-triple must be carried as module attrs.
+                            module->setAttr("routing.effective_k",
+                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.effectiveK));
+                            module->setAttr("routing.k_rounds",
+                                            attrBuilder.getI64IntegerAttr(mkd.derivedParams.kRounds));
+                            module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(mkd.derivedParams.kDim));
                             llvm::outs() << "[TilingLinalg] Set K-round module attrs (fullconnect_auto=0, "
                                             "tile_*/m_rounds/n_rounds dropped): effective_k="
                                          << mkd.derivedParams.effectiveK << " k_rounds=" << mkd.derivedParams.kRounds
@@ -4250,10 +4379,10 @@ public:
                     std::string hostFuncSuffix = mkd.kernelName;
                     // Don't pass userRewrittenSource in multi-kernel mode — we emit it ourselves after all runs
                     unsigned hostDdrArgs = 0;
-                    if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros,
-                                                           mkd.kernelFuncName, parsedDebugLevel,
-                                                           /*userRewrittenSource=*/"", {}, mkd.maxPPBytes, aieGenStr,
-                                                           hostFuncSuffix, appendMode, &hostDdrArgs)) {
+                    if (!TilingLinalgPipeline::runPipeline(
+                            ctx, module, outputDir, kernelBodyWithMacros, mkd.kernelFuncName, parsedDebugLevel,
+                            /*userRewrittenSource=*/"", {}, mkd.maxPPBytes, aieGenStr, hostFuncSuffix, appendMode,
+                            &hostDdrArgs, mkd.portVarNames)) {
                         llvm::errs() << "[TilingLinalg] Pipeline FAILED for kernel: " << mkd.kernelName << "\n";
                         std::exit(1);
                     }
@@ -4482,6 +4611,11 @@ public:
                     stream << "constexpr int get_spatial_m_rounds() { return 0; }\n";
                     stream << "constexpr int get_spatial_n_rounds() { return 0; }\n";
                     stream << "template<typename T> constexpr int get_spatial_multiple_rounds(T) { return 0; }\n";
+                    // IR-sourced per-dim per-round on-core slice size (resolved in runPipeline).
+                    stream
+                        << "template<typename T> constexpr int get_arg_per_round_size_in_dim(int, T) { return 0; }\n";
+                    // IR-sourced per-dim total on-core rounds over the dim (resolved in runPipeline).
+                    stream << "template<typename T> constexpr int get_arg_total_rounds_in_dim(int, T) { return 0; }\n";
                     stream << "constexpr int get_kernel_h() { return 0; }\n";
                     stream << "constexpr int get_kernel_w() { return 0; }\n";
                     stream << "constexpr int get_input_c() { return 0; }\n";
@@ -4549,7 +4683,7 @@ public:
                             maxDdrArgs = mkd.numHostDdrArgs;
                     }
 
-                    // Helper: emit XAie_MemSyncForDevVAddr calls for ALL buffers before DMA.
+                    // Helper: emit __Runtime_sync_for_dev calls for ALL buffers before DMA.
                     // On ARM (baremetal), SyncForDev flushes+invalidates cache lines, which is
                     // needed for outputs too: dirty cache lines (e.g. zeroed output buffer) must
                     // be flushed and invalidated BEFORE DMA writes results to DDR, otherwise a
@@ -4563,7 +4697,7 @@ public:
                         if (limit > mkd.tensors.size())
                             limit = mkd.tensors.size();
                         for (unsigned i = 0; i < limit; ++i) {
-                            os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
+                            os << indent << "__Runtime_sync_for_dev(dev, _t" << i << ", _s" << i << ");\n";
                         }
                     };
 
@@ -4685,13 +4819,27 @@ public:
                 int rows = tilingMeshRows > 0 ? tilingMeshRows : 2;
                 int cols = tilingMeshCols > 0 ? tilingMeshCols : 2;
 
+                // Full-connect auto flag (aie::GlobalPolicy <kernel>_policy). Resolved
+                // here (before buildRoutingIR) so it can gate both the emitted GEMM
+                // #routing.tiling and the M×N tiling module attrs.
+                bool singleFullConnectAuto = true;
+                {
+                    auto fcaItPre = kernelFullConnectAuto.find(singleKernelFuncName);
+                    if (fcaItPre != kernelFullConnectAuto.end())
+                        singleFullConnectAuto = fcaItPre->second;
+                }
+
+                // Emit per-dim GEMM #routing.tiling for the even-mesh path so the IR
+                // op carries the on-core per-round slice (consumed by
+                // get_arg_per_round_size_in_dim + Phase-D schedule). Only when
+                // fullconnect_auto=1 (conv/halo path keeps its own TilingAttr).
+                if (singleFullConnectAuto)
+                    populateGemmTiling(splitModel, tensors, derivedTilingParams, rows, cols);
+
                 // Build routing IR
                 auto module = TilingLinalgPipeline::buildRoutingIR(ctx, rows, cols, tensors, splitModel,
                                                                    parsedPartition, aieGenStr);
 
-                // Full-connect auto flag (aie::GlobalPolicy <kernel>_policy). Resolved
-                // here (before the K-round block) so it can gate the M×N tiling attrs.
-                bool singleFullConnectAuto = true;
                 {
                     auto fcaIt = kernelFullConnectAuto.find(singleKernelFuncName);
                     if (fcaIt != kernelFullConnectAuto.end())
@@ -4701,35 +4849,33 @@ public:
                 // Set K-round module attributes for downstream DMA passes
                 if (derivedTilingParams.valid && derivedTilingParams.kRounds > 1) {
                     mlir::OpBuilder attrBuilder(&ctx);
-                    // K-accumulation attrs are orthogonal to M×N tiling — always emit.
-                    module->setAttr("routing.effective_k",
-                                    attrBuilder.getI64IntegerAttr(derivedTilingParams.effectiveK));
-                    module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(derivedTilingParams.kRounds));
-                    module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(derivedTilingParams.kDim));
                     // M×N cartesian repeat / spatial sub-tiling attrs are only meaningful
                     // when fullconnect_auto is enabled. Dropping them for fullconnect_auto=0
                     // lets the downstream passes fall through to the pure-K-round path.
+                    // The K-triple (effective_k/k_rounds/full_k) is sourced from the
+                    // #routing.tiling op (populateGemmTiling) when fullconnect_auto=1, so it
+                    // is only emitted as a module attr on the fullconnect_auto=0 else-branch
+                    // (no tiling op exists there).
                     if (singleFullConnectAuto) {
-                        module->setAttr("routing.tile_m", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileM));
-                        module->setAttr("routing.tile_rows",
-                                        attrBuilder.getI64IntegerAttr(derivedTilingParams.tileRows));
-                        module->setAttr("routing.m_rounds",
-                                        attrBuilder.getI64IntegerAttr(derivedTilingParams.spatialMRounds));
-                        module->setAttr("routing.tile_n", attrBuilder.getI64IntegerAttr(derivedTilingParams.tileN));
-                        module->setAttr("routing.tile_cols",
-                                        attrBuilder.getI64IntegerAttr(derivedTilingParams.tileCols));
-                        module->setAttr("routing.n_rounds",
-                                        attrBuilder.getI64IntegerAttr(derivedTilingParams.spatialNRounds));
-                        llvm::outs() << "[TilingLinalg] Set K-round module attrs: effective_k="
+                        // tile_m/tile_n, tile_rows/tile_cols, the M/N spatial rounds, and the
+                        // K-triple are all sourced from the #routing.tiling op on partitiontensor
+                        // (readGemmTilingScalars) by every downstream consumer, so none are
+                        // emitted as flat module attrs here.
+                        llvm::outs() << "[TilingLinalg] fullconnect_auto=1: tiling scalars sourced from "
+                                        "#routing.tiling op (effective_k="
                                      << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds
                                      << " full_k=" << derivedTilingParams.kDim
-                                     << " tile_m=" << derivedTilingParams.tileM
                                      << " tile_rows=" << derivedTilingParams.tileRows
                                      << " m_rounds=" << derivedTilingParams.spatialMRounds
-                                     << " tile_n=" << derivedTilingParams.tileN
                                      << " tile_cols=" << derivedTilingParams.tileCols
-                                     << " n_rounds=" << derivedTilingParams.spatialNRounds << "\n";
+                                     << " n_rounds=" << derivedTilingParams.spatialNRounds << ")\n";
                     } else {
+                        // fullconnect_auto=0 pure-K-round path: no #routing.tiling op is
+                        // emitted here, so the K-triple must be carried as module attrs.
+                        module->setAttr("routing.effective_k",
+                                        attrBuilder.getI64IntegerAttr(derivedTilingParams.effectiveK));
+                        module->setAttr("routing.k_rounds", attrBuilder.getI64IntegerAttr(derivedTilingParams.kRounds));
+                        module->setAttr("routing.full_k", attrBuilder.getI64IntegerAttr(derivedTilingParams.kDim));
                         llvm::outs() << "[TilingLinalg] Set K-round module attrs (fullconnect_auto=0, "
                                         "tile_*/m_rounds/n_rounds dropped): effective_k="
                                      << derivedTilingParams.effectiveK << " k_rounds=" << derivedTilingParams.kRounds
@@ -4888,10 +5034,18 @@ public:
                     kernelBodyWithMacros = macroBlock + singleKernelBody;
                 }
 
+                // Port var names (indexed by tensor order) for IR-sourced builtin
+                // resolution (get_arg_per_round_size_in_dim) inside runPipeline.
+                std::vector<std::string> singlePortVarNames;
+                singlePortVarNames.reserve(parsedTensors.size());
+                for (const auto &pt : parsedTensors)
+                    singlePortVarNames.push_back(pt.varName);
+
                 // Run pipeline (single kernel — no suffix, no append mode)
-                if (!TilingLinalgPipeline::runPipeline(ctx, module, outputDir, kernelBodyWithMacros,
-                                                       singleKernelFuncName, parsedDebugLevel, userRewrittenSource,
-                                                       tensors, effectiveMaxPPBytes, aieGenStr)) {
+                if (!TilingLinalgPipeline::runPipeline(
+                        ctx, module, outputDir, kernelBodyWithMacros, singleKernelFuncName, parsedDebugLevel,
+                        userRewrittenSource, tensors, effectiveMaxPPBytes, aieGenStr, /*hostFuncSuffix=*/"",
+                        /*appendMode=*/false, /*numHostDdrArgs=*/nullptr, singlePortVarNames)) {
                     llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
                     std::exit(1);
                 }

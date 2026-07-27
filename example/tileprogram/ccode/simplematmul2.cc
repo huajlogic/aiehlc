@@ -44,10 +44,13 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
                                       aie::port<output_window_int8 *, LtoR_Merge> win_c) {
 
     // Compiler-resolved tiling parameters
-    const int tile_rows = aie::get_tile_rows();
-    const int tile_cols = aie::get_tile_cols();
-    const int eff_k = aie::get_effective_k();            // K chunk size per k-round
-    const int k_rounds = aie::get_k_rounds();            // number of K-accumulation rounds
+    // const int eff_k = aie::get_effective_k();            // K chunk size per k-round
+    // const int k_rounds = aie::get_k_rounds();            // number of K-accumulation rounds
+    const int k_rounds = aie::get_arg_total_rounds_in_dim(1, win_a);
+    const int eff_k = aie::get_arg_per_round_size_in_dim(1, win_a);
+    const int eff_k_b = aie::get_arg_per_round_size_in_dim(1, win_b);
+    assert(eff_k == eff_k_b);
+
     const int num_a_rounds = aie::get_num_rounds(win_a); // DMA rounds per k-round for A
     const int num_b_rounds = aie::get_num_rounds(win_b); // DMA rounds per k-round for B
     const int num_c_rounds = aie::get_num_rounds(win_c);
@@ -58,6 +61,12 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
     // Spatial sub-tile iteration counts (per-port: A->M rounds, B->N rounds)
     const int m_rounds = aie::get_spatial_multiple_rounds(win_a);
     const int n_rounds = aie::get_spatial_multiple_rounds(win_b);
+
+    // const int tile_rows = aie::get_tile_rows();
+    // const int tile_cols = aie::get_tile_cols();
+
+    const int tile_rows = aie::get_arg_per_round_size_in_dim(0, win_a);
+    const int tile_cols = aie::get_arg_per_round_size_in_dim(0, win_b);
 
     // Derived per-round sizes (using effective_k, not full k_dim)
     const int rows_per_round = buf_sz_a / eff_k;
@@ -72,6 +81,16 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
     int row = coreid & 0x1F;
     int8_t tag = (int8_t)((row & 0x7) | ((col & 0x7) << 3));
     klog("DEBUG", 3);
+    // IR-sourced per-round tiling (read from routing.partitiontensor TilingAttr)
+    klog("PRA0", (int32_t)aie::get_arg_per_round_size_in_dim(0, win_a));
+    klog("PRA1", (int32_t)aie::get_arg_per_round_size_in_dim(1, win_a));
+    klog("PRB0", (int32_t)aie::get_arg_per_round_size_in_dim(0, win_b));
+    klog("PRB1", (int32_t)aie::get_arg_per_round_size_in_dim(1, win_b));
+    klog("PRC0", (int32_t)aie::get_arg_per_round_size_in_dim(0, win_c));
+    klog("PRC1", (int32_t)aie::get_arg_per_round_size_in_dim(1, win_c));
+    // IR-sourced total on-core rounds over the dim (sibling of per_round_size_in_dim)
+    klog("TRA0", (int32_t)aie::get_arg_total_rounds_in_dim(0, win_a)); // expect 16
+    klog("TRA1", (int32_t)aie::get_arg_total_rounds_in_dim(1, win_a)); // expect 4
 #endif
 
     // Local buffers — accum/local_out hold one M-sub-tile strip (tile_rows × data_cols)

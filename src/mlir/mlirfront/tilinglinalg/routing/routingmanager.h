@@ -70,6 +70,33 @@ using namespace routing;
 #undef GET_OP_DECLS
 #undef GET_OP_CLASSEST
 
+namespace routing {
+// GEMM per-dim tiling scalars sourced from routing.partitiontensor TilingAttr.
+// These mirror the flat module attrs (routing.tile_m / tile_rows / tile_n /
+// tile_cols / effective_k / full_k / k_rounds) but come from the IR op, making
+// the TilingAttr the single source of truth for the fullconnect_auto=1 schedule.
+struct GemmTilingScalars {
+    int64_t tileM = 0;
+    int64_t tileRows = 0;
+    int64_t mRounds = 0;
+    int64_t tileN = 0;
+    int64_t tileCols = 0;
+    int64_t nRounds = 0;
+    int64_t effectiveK = 0;
+    int64_t fullK = 0;
+    int64_t kRounds = 0;
+    bool found = false; // true when at least one usable TilingAttr was read
+};
+
+// Walk the module's routing.partitiontensor ops and extract GEMM tiling scalars
+// from their #routing.tiling TilingAttr. Role is resolved by PartitionAttr's
+// hwAxisOwner ("row" -> M, "col" -> N); the K dimension is the un-meshed non-split
+// dim (outer.rounds==1) carrying a nested on-core slice_tiling. Only active when
+// routing.fullconnect_auto==1; otherwise returns {found=false} so callers fall
+// back to the flat module attrs.
+GemmTilingScalars readGemmTilingScalars(mlir::ModuleOp moduleOp);
+} // namespace routing
+
 class routingmanager{
 public:
     routingmanager(){};

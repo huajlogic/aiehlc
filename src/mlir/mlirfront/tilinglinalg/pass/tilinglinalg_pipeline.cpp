@@ -51,6 +51,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <iostream>
+#include <map>
 
 using namespace mlir;
 
@@ -71,6 +72,75 @@ static std::string setupPipelineIRDir(const std::string &subdir) {
     }
     std::cout << "IR output directory: " << dir << std::endl;
     return dir;
+}
+
+// Resolve IR-sourced builtin calls `<fnName>(<dim>, <portvar>)` in the kernel body
+// to integer literals read from the routing.partitiontensor TilingAttr.
+//   fnName               -> builtin name, e.g. "aie::get_arg_per_round_size_in_dim"
+//                           or "aie::get_arg_total_rounds_in_dim"
+//   portVarNames[t]      -> kernel port variable name for tensor index t
+//   perTensorData[t][d]  -> resolved value for tensor t, dim d (slice or rounds)
+// Unresolvable calls (unknown port, missing dim) are left as-is so the missing
+// attribute is visible rather than silently wrong.
+static std::string resolveArgDimBuiltin(const std::string &body, const std::string &fnName,
+                                        const std::vector<std::string> &portVarNames,
+                                        const std::map<int, std::map<int, int64_t>> &perTensorData) {
+    const std::string kFn = fnName + "(";
+    if (body.find(kFn) == std::string::npos)
+        return body;
+    // port variable name -> tensor index
+    std::map<std::string, int> portToIdx;
+    for (int i = 0; i < (int)portVarNames.size(); ++i)
+        portToIdx[portVarNames[i]] = i;
+    auto trim = [](std::string s) {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
+            s.erase(0, 1);
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))
+            s.pop_back();
+        return s;
+    };
+    std::string out = body;
+    size_t pos = 0;
+    while ((pos = out.find(kFn, pos)) != std::string::npos) {
+        size_t argStart = pos + kFn.size();
+        size_t argEnd = out.find(")", argStart);
+        if (argEnd == std::string::npos)
+            break;
+        std::string args = out.substr(argStart, argEnd - argStart);
+        size_t comma = args.find(',');
+        if (comma == std::string::npos) {
+            pos = argEnd + 1;
+            continue;
+        }
+        std::string dimStr = trim(args.substr(0, comma));
+        std::string portStr = trim(args.substr(comma + 1));
+        int dim = -1;
+        try {
+            dim = std::stoi(dimStr);
+        } catch (...) {
+            pos = argEnd + 1;
+            continue;
+        }
+        auto pit = portToIdx.find(portStr);
+        if (pit == portToIdx.end()) {
+            pos = argEnd + 1;
+            continue;
+        }
+        auto tIt = perTensorData.find(pit->second);
+        if (tIt == perTensorData.end()) {
+            pos = argEnd + 1;
+            continue;
+        }
+        auto dIt = tIt->second.find(dim);
+        if (dIt == tIt->second.end()) {
+            pos = argEnd + 1;
+            continue;
+        }
+        std::string replacement = std::to_string(dIt->second);
+        out.replace(pos, argEnd + 1 - pos, replacement);
+        pos += replacement.size();
+    }
+    return out;
 }
 
 static void dumpPipelineIRToFile(mlir::ModuleOp module, const std::string &dir, int stage, const std::string &passName) {
@@ -355,7 +425,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                                        int runtimeDebugLevel, const std::string &userRewrittenSource,
                                        const std::vector<TensorParam> &tensors, int64_t maxPingPongBytes,
                                        const std::string &aieGen, const std::string &hostFuncSuffix, bool appendMode,
-                                       unsigned *numHostDdrArgs) {
+                                       unsigned *numHostDdrArgs, const std::vector<std::string> &portVarNames) {
 
     // Extract partition bounds from createhwmesh op in the IR (if present)
     int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
@@ -384,6 +454,55 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
     dumpPipelineIRToFile(module, irDir, stage++, "initial");
 
+    // ── IR-sourced builtin resolution (get_arg_per_round_size_in_dim) ──
+    // Read the on-core per-round slice for each (tensor, dim) directly from the
+    // routing.partitiontensor TilingAttr *before* RoutingUnrollingLowerPass
+    // erases those ops. perTensorTiling[tensorArgIdx][dim] = onCoreRoundSlice
+    // (= level.slice_tiling.slice, or level.slice when there is no nested level).
+    // The partitiontensor's tensor operand is traced back through
+    // createscheduletensor/to_tensor to the func block-argument number, which is
+    // the tensor (port) index used by portVarNames.
+    std::map<int, std::map<int, int64_t>> perTensorTiling;
+    // Parallel map: total on-core rounds to cover the full tensor dim for each
+    // (tensor, dim): level.slice_tiling.rounds, or level.rounds when no nested level.
+    std::map<int, std::map<int, int64_t>> perTensorRounds;
+    {
+        // Trace a partitiontensor tensor operand back to its func arg number.
+        auto tensorArgIndex = [](mlir::Value v) -> int {
+            for (int guard = 0; guard < 8 && v; ++guard) {
+                if (auto ba = v.dyn_cast<mlir::BlockArgument>())
+                    return (int)ba.getArgNumber();
+                mlir::Operation *def = v.getDefiningOp();
+                if (!def)
+                    return -1;
+                if (def->getNumOperands() == 0)
+                    return -1;
+                v = def->getOperand(0); // createscheduletensor / to_tensor chain
+            }
+            return -1;
+        };
+        module.walk([&](routing::partitiontensor pt) {
+            auto tiling = pt.getTilingAttr();
+            if (!tiling)
+                return;
+            int tIdx = tensorArgIndex(pt.getTensor());
+            if (tIdx < 0)
+                return;
+            auto dims = tiling.getDims();
+            auto &dimMap = perTensorTiling[tIdx];
+            auto &roundsMap = perTensorRounds[tIdx];
+            for (int d = 0; d < (int)dims.size(); ++d) {
+                routing::LevelAttr outer = dims[d].getOuter();
+                if (!outer)
+                    continue;
+                int64_t onCore = outer.getSliceTiling() ? outer.getSliceTiling().getSlice() : outer.getSlice();
+                dimMap[d] = onCore;
+                int64_t onCoreRounds = outer.getSliceTiling() ? outer.getSliceTiling().getRounds() : outer.getRounds();
+                roundsMap[d] = onCoreRounds;
+            }
+        });
+    }
+
     // Phase 1: routing -> dmap -> dmaphop -> dfscheblueprint
     if (!runPipelineSinglePass(ctx, module, std::make_unique<RoutingUnrollingLowerPass>(), irDir, stage,
                        "RoutingUnrollingLowerPass"))
@@ -398,6 +517,20 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         auto provenancePass = std::make_unique<DmaphopProvenanceMapPass>(outputDir, partStartCol, aieGen);
         runPipelineSinglePass(ctx, module, std::move(provenancePass), irDir, stage, "DmaphopProvenanceMapPass");
     }
+
+    // Read the GEMM K-triple from the #routing.tiling op while the partitiontensor op is
+    // still alive on `module` (the routing dialect is dropped on the post-conversion
+    // hostModule, so the op is gone by the time DfscheduleProvenanceMapPass runs). Values
+    // are module-global, so reading here matches hostModule. found=false (fullconnect_auto=0)
+    // leaves the K-triple at 0 → DfscheduleProvenanceMapPass falls back to the module attr.
+    routing::GemmTilingScalars kTile = routing::readGemmTilingScalars(module);
+    int64_t provEffectiveK = kTile.effectiveK;
+    int64_t provFullK = kTile.fullK;
+    int64_t provKRounds = kTile.kRounds;
+    int64_t provTileM = kTile.tileM;
+    int64_t provTileN = kTile.tileN;
+    int64_t provMRounds = kTile.mRounds;
+    int64_t provNRounds = kTile.nRounds;
 
     // Clone the module at dmaphop stage for the routing path (Phase 5).
     // This preserves the pkt_ids allocated by DmapToDmaphopPass so that
@@ -494,7 +627,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
     // Generate low-level dfschedule provenance map after WaitMergePass
     {
-        auto dfscheProvenancePass = std::make_unique<DfscheduleProvenanceMapPass>(outputDir, partStartCol, aieGen);
+        auto dfscheProvenancePass =
+            std::make_unique<DfscheduleProvenanceMapPass>(outputDir, partStartCol, aieGen, provEffectiveK, provFullK,
+                                                          provKRounds, provTileM, provTileN, provMRounds, provNRounds);
         runPipelineSinglePass(ctx, hostModule, std::move(dfscheProvenancePass), irDir, stage,
                               "DfscheduleProvenanceMapPass");
     }
@@ -976,7 +1111,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             stream << "extern unsigned char _binary_kernel_" << computeKernelName << "_end[];\n";
             stream << "extern unsigned int _binary_kernel_" << computeKernelName << "_size;\n\n";
 
-            // Helper: emit XAie_MemSyncForDevVAddr calls for ALL buffers before DMA.
+            // Helper: emit __Runtime_sync_for_dev calls for ALL buffers before DMA.
             // On ARM (baremetal), SyncForDev flushes+invalidates cache lines, which is
             // needed for outputs too: dirty cache lines (e.g. zeroed output buffer) must
             // be flushed and invalidated BEFORE DMA writes results to DDR, otherwise a
@@ -990,7 +1125,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 if (limit > tensors.size())
                     limit = tensors.size();
                 for (unsigned i = 0; i < limit; ++i) {
-                    os << indent << "XAie_MemSyncForDevVAddr(dev, _t" << i << ", (uint64_t)_s" << i << ");\n";
+                    os << indent << "__Runtime_sync_for_dev(dev, _t" << i << ", _s" << i << ");\n";
                 }
             };
 
@@ -1151,7 +1286,7 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                 for (auto dim : tensors[i].shape)
                     totalElements *= dim;
                 int64_t totalBytes = totalElements * (tensors[i].elementBitWidth / 8);
-                stream << "    XAie_MemSyncForDevVAddr(dev, buf_" << i << ", " << totalBytes << ");\n";
+                stream << "    __Runtime_sync_for_dev(dev, buf_" << i << ", " << totalBytes << ");\n";
             }
             stream << "    " << hostFuncName << "(dev";
             for (unsigned i = 0; i < tensors.size(); ++i) {
@@ -1220,9 +1355,16 @@ after_host_emit:
         }
 
         if (!userKernelBody.empty()) {
-            // Write the user's __global__ kernel body verbatim
+            // Write the user's __global__ kernel body verbatim, first resolving
+            // IR-sourced builtins (get_arg_per_round_size_in_dim /
+            // get_arg_total_rounds_in_dim) from the routing partitiontensor
+            // TilingAttr captured in perTensorTiling / perTensorRounds above.
+            std::string resolvedKernelBody = resolveArgDimBuiltin(userKernelBody, "aie::get_arg_per_round_size_in_dim",
+                                                                  portVarNames, perTensorTiling);
+            resolvedKernelBody = resolveArgDimBuiltin(resolvedKernelBody, "aie::get_arg_total_rounds_in_dim",
+                                                      portVarNames, perTensorRounds);
             stream << "// User-provided compute kernel (extracted from __global__ function)\n";
-            stream << userKernelBody << "\n";
+            stream << resolvedKernelBody << "\n";
             std::cout << "Compute kernel (user-provided) written to " << computePath << std::endl;
         } else {
             // Auto-generate compute kernel

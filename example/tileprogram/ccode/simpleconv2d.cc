@@ -17,7 +17,7 @@
  *
  * Data distribution (same as GEMM):
  *   A (im2col patches): broadcast per row — each tile row gets TILE_ROWS x K
- *   B (filter):         broadcast per col — each tile col gets TILE_COLS x K
+ *   B (filter):         broadcast per col — each tile col gets out_c_num x K
  *   C (output):         gathered per row — merged left-to-right
  *
  * For this example:
@@ -214,7 +214,8 @@ constexpr aie::GemmSpace ColBC = {
            .tile_size = OC_PER_G,
            .stride = OC_PER_G},                                     // N-tile (divides K for B^T layout)
     .d2 = {.fullsize = SP_KW, .tile_size = SP_KH, .stride = SP_KW}, // N-tile (divides K for B^T layout)
-    .d3 = {.fullsize = INPUT_C_ALIGN,
+    .d3 = {.fullsize = SP_KH, .tile_size = SP_KH, .stride = SP_KH}, // N-tile (divides K for B^T layout)
+    .d4 = {.fullsize = INPUT_C_ALIGN,
            .tile_size = INPUT_C_ALIGN,
            .stride = INPUT_C_ALIGN,
            .padsize = INPUT_C_ALIGN - INPUT_C}}; // K
@@ -279,7 +280,11 @@ __global__(conv_policy) void conv2d_spatial(
     const int ow_dim = OW_T;                    // per-chunk output cols (28), was SP_OW=112
     const int oh_per_row = SP_OHR;              // OUTPUT_H / HW_ROWS
     const int k_dim = SP_K;                     // KH*KW*C
-    const int tile_cols = aie::get_tile_cols(); // tile_N (GEMM N tiling)
+    int coreid = get_coreid();
+    int row = coreid & 0x1F; // bits [0:4]  -> 5 bits
+    int col = (coreid >> 16) & 0x7F;
+    // const int out_c_num = aie::get_tile_cols(); // output channel number in this tile 16
+    const int out_c_num = aie::get_arg_per_round_size_in_dim(2, win_c);
 
     const int num_a_rounds = aie::get_num_rounds(win_a);
     const int num_b_rounds = aie::get_num_rounds(win_b);
@@ -304,7 +309,7 @@ __global__(conv_policy) void conv2d_spatial(
     const int buf_sz_b = aie::get_buffer_size(win_b);
 
     int8_t slab[buf_sz_a]; // raw input slab [halo_slice, raw_wc]
-    int8_t local_out[oh_per_row * ow_dim * tile_cols];
+    int8_t local_out[oh_per_row * ow_dim * out_c_num];
 
     // ===== Receive B (filter) ONCE, before the slab loop =====
     // The filter is streamed a single time (win_b num_rounds == 1). Acquiring it
@@ -319,9 +324,11 @@ __global__(conv_policy) void conv2d_spatial(
         release_input_window(win_b);
     }
 
+    klog("M_ROU", m_rounds);
+    klog("C_ROUN", num_c_rounds);
     // ===== M sub-tile loop: one slab -> one output tile per iteration =====
     for (int mr = 0; mr < m_rounds; mr++) {
-
+        klog("MRIDX", mr);
         // ===== Phase 1: receive the raw input slab =====
         for (int ra = 0; ra < num_a_rounds; ra++) {
             int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
@@ -333,7 +340,7 @@ __global__(conv_policy) void conv2d_spatial(
         // ===== Phase 2: on-chip windowing (im2col) + matmul (reads B_local) =====
         for (int oh = 0; oh < oh_per_row; oh++) {
             for (int ow = 0; ow < ow_dim; ow++) {
-                for (int j = 0; j < tile_cols; j++) {
+                for (int j = 0; j < out_c_num; j++) {
                     int16_t sum = 0;
                     // local im2col: gather KH*KW*C patch from the slab
                     int kk = 0;
@@ -354,7 +361,7 @@ __global__(conv_policy) void conv2d_spatial(
                     else if (sum < -128)
                         sum = -128;
                     // NCHW slab [c,oh,ow]: c=j outer, ow inner, so the MM2S
-                    // stream is (c,h,w). buf_sz_c (=oh_per_row*ow_dim*tile_cols)
+                    // stream is (c,h,w). buf_sz_c (=oh_per_row*ow_dim*out_c_num)
                     // is unchanged; only the linear write order differs.
                     local_out[(j * oh_per_row + oh) * ow_dim + ow] = (int8_t)sum;
                 }
@@ -365,6 +372,7 @@ __global__(conv_policy) void conv2d_spatial(
         for (int rc = 0; rc < num_c_rounds; rc++) {
             int8_t *out = (int8_t *)acquire_output_window(win_c);
             for (int i = 0; i < buf_sz_c; i++)
+                // out[i] = col*10+ row; //local_out[rc * buf_sz_c + i];
                 out[i] = local_out[rc * buf_sz_c + i];
             release_output_window(win_c);
         }
@@ -422,13 +430,13 @@ int main() {
     //     INPUT_W_PAD, INPUT_C_ALIGN]. Real pixel (h,w) sits at (h+PAD, w+PAD), so
     //     the CPU reference windows (oh*S+kh, ow*S+kw) index the padded buffer
     //     directly and implement true padded conv (no out-of-bounds reads).
-    int8_t *input = (int8_t *)malloc(INPUT_H_PAD * INPUT_W_PAD * INPUT_C_ALIGN * sizeof(int8_t));
+    int8_t *input = (int8_t *)__Runtime_Alloc(INPUT_H_PAD * INPUT_W_PAD * INPUT_C_ALIGN * sizeof(int8_t));
     // Filter in B^T [N, K] layout with K = KH*KW*INPUT_C_ALIGN (matches kernel
     // B_ptr[f*K + ((kh*KW+kw)*INPUT_C_ALIGN + c)]).
-    int8_t *filter = (int8_t *)malloc(KERNEL_H * KERNEL_W * INPUT_C_ALIGN * NUM_FILTERS * sizeof(int8_t));
+    int8_t *filter = (int8_t *)__Runtime_Alloc(KERNEL_H * KERNEL_W * INPUT_C_ALIGN * NUM_FILTERS * sizeof(int8_t));
     // Output in NCHW [F, OH, OW] layout (total size = M*N, unchanged); the C
     // tensor DDR layout is NCHW so the shim S2MM gather writes C-planes.
-    int8_t *output = (int8_t *)malloc(OUTPUT_H * OUTPUT_W * NUM_FILTERS * sizeof(int8_t));
+    int8_t *output = (int8_t *)__Runtime_Alloc(OUTPUT_H * OUTPUT_W * NUM_FILTERS * sizeof(int8_t));
 
     // --- Initialize test data ---
     // Input: small ZERO-MEAN samples in [-4, 4] for the real channels (see the
@@ -494,6 +502,7 @@ int main() {
     //                                 kernel does on-chip windowing + matmul.
     printf("\n--- Launching conv2d_spatial (spatial-halo) on AIE ---\n");
     conv2d_spatial<<<mesh>>>(input, filter, output, M, N, K);
+    // sleep(5);
 
     // --- Wait and verify ---
     // device.synchronize();
