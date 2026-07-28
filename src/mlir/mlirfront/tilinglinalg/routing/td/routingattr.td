@@ -102,7 +102,8 @@ def DimAttr : routingattr<"Dim"> {
   let summary = "per-dimension tiling descriptor";
   let cppNamespace = "routing";
   let parameters = (ins
-    "routing::LevelAttr":$outer
+    "routing::LevelAttr":$outer,
+    DefaultValuedParameter<"int64_t", "0">:$axis   // 0=on-core, 1=mesh_row(group1), 2=mesh_col(group2)
   );
   let hasCustomAssemblyFormat = 1;
 }

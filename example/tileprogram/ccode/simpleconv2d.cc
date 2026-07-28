@@ -360,10 +360,11 @@ __global__(conv_policy) void conv2d_spatial(
                         sum = 127;
                     else if (sum < -128)
                         sum = -128;
-                    // NCHW slab [c,oh,ow]: c=j outer, ow inner, so the MM2S
-                    // stream is (c,h,w). buf_sz_c (=oh_per_row*ow_dim*out_c_num)
-                    // is unchanged; only the linear write order differs.
-                    local_out[(j * oh_per_row + oh) * ow_dim + ow] = (int8_t)sum;
+                    // HWC slab [oh,ow,c]: channel j innermost/contiguous, so the
+                    // MM2S stream is (h,w,c) matching the declared output dim
+                    // order. buf_sz_c (=oh_per_row*ow_dim*out_c_num) is unchanged;
+                    // only the linear write order differs from the legacy CHW form.
+                    local_out[(oh * ow_dim + ow) * out_c_num + j] = (int8_t)sum;
                 }
             }
         }
