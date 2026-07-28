@@ -3180,6 +3180,7 @@ class AieDebugLevelPragmaHandler : public clang::PragmaHandler {
             {"AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA", 1 << 4},
             {"AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN", 1 << 5},
             {"AIE_DMA_ISSUE_COUNT", 1 << 7},
+            {"AIE_DEBUG_LOG", 1 << 9},
         };
 
         clang::Token Tok;

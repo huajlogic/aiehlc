@@ -55,8 +55,21 @@ XAie_DevInst *getOrCreateDeviceInstance(void);
 // back. These are the same counters aiegdb.py "dma counter" reads (0x11020/24).
 #define AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER (1 << 6)
 // bit 7 reserved
+// bit 8 reserved
+/* When set, enable informational runtime log output (AIEHLC_LOG).
+ * Usage: #pragma aie_debug_level(AIE_DEBUG_LOG) */
+#define AIE_DEBUG_LOG (1 << 9)
 #define AIE_DEBUG_HAS_FLAG(v, flag) (((v) & (flag)) != 0)
 extern int g_runtime_debug_level;
+
+/* Gate for informational runtime logs.
+ * Enable with: #pragma aie_debug_level(AIE_DEBUG_LOG)
+ * Errors/failures print unconditionally regardless of this flag.
+ * Usage:  AIEHLC_LOG(printf("...", args)); */
+#define AIEHLC_LOG_ENABLED() AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_LOG)
+/* clang-format off */
+#define AIEHLC_LOG(stmt) do { if (AIEHLC_LOG_ENABLED()) { stmt; } } while (0)
+/* clang-format on */
 
 // Type aliases for emitted host code (uses "io", "event", etc. without "struct" prefix)
 typedef struct_io io;
