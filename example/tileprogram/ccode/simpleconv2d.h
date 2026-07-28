@@ -128,8 +128,8 @@ static void scalar_conv2d(const int8_t *input, const int8_t *filter, int8_t *out
                     acc = 127;
                 else if (acc < -128)
                     acc = -128;
-                // NCHW [F, OH, OW]: C-plane outer, row H, col W inner.
-                output[(f * OUTPUT_H + oh) * OUTPUT_W + ow] = (int8_t)acc;
+                // HWC [OH, OW, F]: row H outer, col W middle, channel F inner.
+                output[(oh * OUTPUT_W + ow) * NUM_FILTERS + f] = (int8_t)acc;
             }
         }
     }
@@ -139,8 +139,8 @@ static void scalar_conv2d(const int8_t *input, const int8_t *filter, int8_t *out
 // Verify AIE conv2d output against CPU reference
 //
 // Computes naive conv2d on CPU, then compares flat output arrays.
-// Both the AIE output and the CPU reference are in NCHW layout [F, OH, OW]
-// (C-plane outer, W fastest-varying), so a flat element-wise compare is valid.
+// Both the AIE output and the CPU reference are in HWC layout [OH, OW, F]
+// (channel F fastest-varying), so a flat element-wise compare is valid.
 // ═══════════════════════════════════════════════════════════════════════════
 static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t *output_aie) {
     const int total = OUTPUT_H * OUTPUT_W * NUM_FILTERS;
@@ -168,10 +168,10 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
             // if (col >7 || col < 0 || row < 3 || row > 6) {
             //     break;
             // }
-            //  NCHW [F, OH, OW] decode: f outer, oh middle, ow inner.
-            int f = i / (OUTPUT_H * OUTPUT_W);
-            int oh = (i / OUTPUT_W) % OUTPUT_H;
-            int ow = i % OUTPUT_W;
+            //  HWC [OH, OW, F] decode: oh outer, ow middle, f inner.
+            int oh = i / (OUTPUT_W * NUM_FILTERS);
+            int ow = (i / NUM_FILTERS) % OUTPUT_W;
+            int f = i % NUM_FILTERS;
             printf("MISMATCH output[f=%d,oh=%d,ow=%d] (flat %d): got %d, expected %d\n", f, oh, ow, i, output_aie[i],
                    ref[i]);
             mismatches++;
@@ -205,7 +205,7 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
         printf("]\n");
     }
 
-    // Print output (NCHW: plane f=0 = output[0*OH*OW + oh*OW + ow])
+    // Print output (HWC: plane f=0 = output_aie[(oh*OW + ow)*NUM_FILTERS + 0])
     for (int f = 0; f < NUM_FILTERS; f++) {
         printf("\nOutput AIE [%dx%dx%d] (f=%d plane):\n", NUM_FILTERS, OUTPUT_H, OUTPUT_W, f);
         for (int oh = 0; oh < OUTPUT_H; oh++) {
@@ -215,7 +215,7 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
                 continue;
             }
             for (int ow = 0; ow < OUTPUT_W; ow++) {
-                int var = output_aie[f * OUTPUT_H * OUTPUT_W + oh * OUTPUT_W + ow];
+                int var = output_aie[(oh * OUTPUT_W + ow) * NUM_FILTERS + f];
                 int col = var / 10;
                 int row = var % 10;
                 // if (col >7 || col < 0 || row < 3 || row > 6) {
@@ -225,19 +225,19 @@ static int verify_conv2d(const int8_t *input, const int8_t *filter, const int8_t
                 //     printf("DEBUG: rest is all reproduce for debug...\n");
                 //     printf("DEBUG: output value at (f=%d,oh=%d,ow=%d) = %d\n", f, oh, ow, var);
                 // }
-                printf("%4d", output_aie[f * OUTPUT_H * OUTPUT_W + oh * OUTPUT_W + ow]);
+                printf("%4d", output_aie[(oh * OUTPUT_W + ow) * NUM_FILTERS + f]);
                 if (ow < OUTPUT_W - 1)
                     printf(",");
             }
             printf("]\n");
         }
         /*
-        // Print reference (NCHW: plane f=0)
+        // Print reference (HWC: plane f=0)
         printf("\nOutput REF [%dx%dx%d] (f=%d plane):\n", NUM_FILTERS, OUTPUT_H, OUTPUT_W, f);
         for (int oh = 0; oh < OUTPUT_H; oh++) {
             printf("  [");
             for (int ow = 0; ow < OUTPUT_W; ow++) {
-                printf("%4d", ref[f * OUTPUT_H * OUTPUT_W + oh * OUTPUT_W + ow]);
+                printf("%4d", ref[(oh * OUTPUT_W + ow) * NUM_FILTERS + f]);
                 if (ow < OUTPUT_W - 1)
                     printf(",");
             }

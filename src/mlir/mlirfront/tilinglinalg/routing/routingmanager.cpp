@@ -219,17 +219,29 @@ mlir::Attribute routing::LevelAttr::parse(mlir::AsmParser &parser, mlir::Type) {
     return routing::LevelAttr::get(parser.getContext(), base, total, slice, step, rounds, sliceTiling);
 }
 
-// DimAttr custom printer: prints <outer = #routing.level<...>> with the full
-// nested-level mnemonic (auto struct(params) would strip the prefix).
-void routing::DimAttr::print(mlir::AsmPrinter &printer) const { printer << "<outer = " << getOuter() << ">"; }
+// DimAttr custom printer: prints <outer = #routing.level<...>[, axis = N]> with
+// the full nested-level mnemonic (auto struct(params) would strip the prefix).
+// axis is printed only when non-zero so existing IR text stays byte-stable.
+void routing::DimAttr::print(mlir::AsmPrinter &printer) const {
+    printer << "<outer = " << getOuter();
+    if (getAxis() != 0)
+        printer << ", axis = " << getAxis();
+    printer << ">";
+}
 
-// DimAttr custom parser: reads <outer = #routing.level<...>>.
+// DimAttr custom parser: reads <outer = #routing.level<...>[, axis = N]>.
 mlir::Attribute routing::DimAttr::parse(mlir::AsmParser &parser, mlir::Type) {
     routing::LevelAttr outer;
-    if (parser.parseLess() || parser.parseKeyword("outer") || parser.parseEqual() || parser.parseAttribute(outer) ||
-        parser.parseGreater())
+    if (parser.parseLess() || parser.parseKeyword("outer") || parser.parseEqual() || parser.parseAttribute(outer))
         return {};
-    return routing::DimAttr::get(parser.getContext(), outer);
+    int64_t axis = 0;
+    if (succeeded(parser.parseOptionalComma())) {
+        if (parser.parseKeyword("axis") || parser.parseEqual() || parser.parseInteger(axis))
+            return {};
+    }
+    if (parser.parseGreater())
+        return {};
+    return routing::DimAttr::get(parser.getContext(), outer, axis);
 }
 
 // TilingAttr custom printer: prints <d0 = #routing.dim<...>, d1 = ...>.
@@ -899,7 +911,7 @@ static routing::TilingAttr buildGemmTilingAttr(MLIRContext *ctx, ArrayRef<Tensor
         auto outer = routing::LevelAttr::get(ctx, /*base=*/d.base, /*total=*/meshSlice * meshRounds,
                                              /*slice=*/meshSlice, /*step=*/meshStep, /*rounds=*/meshRounds,
                                              /*slice_tiling=*/coreLevel);
-        dims.push_back(routing::DimAttr::get(ctx, outer));
+        dims.push_back(routing::DimAttr::get(ctx, outer, /*axis=*/0));
     }
     return routing::TilingAttr::get(ctx, dims);
 }
@@ -1032,7 +1044,7 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                         ctx2, /*base=*/shape[sd], /*total=*/(int64_t)split.haloSlice * splitnum,
                         /*slice=*/split.haloSlice, /*step=*/split.haloStep, /*rounds=*/(int64_t)splitnum,
                         /*slice_tiling=*/rowSliceTiling);
-                    auto rowDim = routing::DimAttr::get(ctx2, rowOuter);
+                    auto rowDim = routing::DimAttr::get(ctx2, rowOuter, /*axis=*/0);
 
                     // Order DimAttrs by tensor dimension index (d0, d1, ...). d0 (the
                     // HW-split row/height dim) is always the halo rowDim; every other
@@ -1063,7 +1075,7 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                         auto dimOuter = routing::LevelAttr::get(ctx2, /*base=*/shape[di], /*total=*/kSl * kRn,
                                                                 /*slice=*/kSl, /*step=*/kSt, /*rounds=*/kRn,
                                                                 /*slice_tiling=*/routing::LevelAttr{});
-                        dims[di] = routing::DimAttr::get(ctx2, dimOuter);
+                        dims[di] = routing::DimAttr::get(ctx2, dimOuter, /*axis=*/0);
                     }
                     partTensor.setTilingAttr(routing::TilingAttr::get(ctx2, dims));
                 }
@@ -1107,7 +1119,7 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                         routing::LevelAttr::get(ctx2, /*base=*/shape[sd], /*total=*/rowSlice * (int64_t)splitnum,
                                                 /*slice=*/rowSlice, /*step=*/rowSlice, /*rounds=*/(int64_t)splitnum,
                                                 /*slice_tiling=*/hOnCore);
-                    auto hDim = routing::DimAttr::get(ctx2, hOuter);
+                    auto hDim = routing::DimAttr::get(ctx2, hOuter, /*axis=mesh_row*/ 1);
                     // d1 = W : on-core width chunk. Degenerates to a single full-dim
                     // slice when d2 rounds are absent.
                     int64_t wSlice = (split.d2Rounds > 1 && split.d2Slice > 0) ? (int64_t)split.d2Slice : shape[1];
@@ -1116,7 +1128,7 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                     auto wOuter = routing::LevelAttr::get(ctx2, /*base=*/shape[1], /*total=*/wSlice * wRounds,
                                                           /*slice=*/wSlice, /*step=*/wStep, /*rounds=*/wRounds,
                                                           /*slice_tiling=*/routing::LevelAttr{});
-                    auto wDim = routing::DimAttr::get(ctx2, wOuter);
+                    auto wDim = routing::DimAttr::get(ctx2, wOuter, /*axis=on-core*/ 0);
                     // d2 = C : group2 mesh-col split (each of meshCols tiles owns
                     // group2Slice channels of group2Full).
                     int64_t g2Rounds = meshCols;
@@ -1125,7 +1137,7 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                                                           /*slice=*/(int64_t)split.group2Slice,
                                                           /*step=*/(int64_t)split.group2Slice,
                                                           /*rounds=*/g2Rounds, /*slice_tiling=*/routing::LevelAttr{});
-                    auto cDim = routing::DimAttr::get(ctx2, cOuter);
+                    auto cDim = routing::DimAttr::get(ctx2, cOuter, /*axis=mesh_col*/ 2);
                     llvm::SmallVector<routing::DimAttr> dims{hDim, wDim, cDim};
                     partTensor.setTilingAttr(routing::TilingAttr::get(ctx2, dims));
                 } else if (isGroup2) {
@@ -1166,7 +1178,7 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                         routing::LevelAttr::get(ctx2, /*base=*/shape[sd], /*total=*/rowSlice * (int64_t)splitnum,
                                                 /*slice=*/rowSlice, /*step=*/rowSlice, /*rounds=*/(int64_t)splitnum,
                                                 /*slice_tiling=*/hOnCore);
-                    auto rowDim = routing::DimAttr::get(ctx2, rowOuter);
+                    auto rowDim = routing::DimAttr::get(ctx2, rowOuter, /*axis=*/0);
                     // Channel (group2) col level: base=group2Full (e.g. 64),
                     // slice/step=group2Slice (e.g. 16), rounds=meshCols. Each of the
                     // meshCols tiles in a row owns group2Slice channels of group2Full.
@@ -1176,7 +1188,7 @@ void routingmanager::createroutingfuncBySplitModel(OpBuilder &builder, MLIRConte
                                                             /*slice=*/(int64_t)split.group2Slice,
                                                             /*step=*/(int64_t)split.group2Slice,
                                                             /*rounds=*/g2Rounds, /*slice_tiling=*/routing::LevelAttr{});
-                    auto colDim = routing::DimAttr::get(ctx2, colOuter);
+                    auto colDim = routing::DimAttr::get(ctx2, colOuter, /*axis=*/0);
                     llvm::SmallVector<routing::DimAttr> dims(2);
                     dims[sd] = rowDim;
                     dims[colTensorDim] = colDim;

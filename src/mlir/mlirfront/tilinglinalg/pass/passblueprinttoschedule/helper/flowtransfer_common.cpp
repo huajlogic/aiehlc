@@ -15,6 +15,7 @@
 
 #include "flowtransfer_internal.h"
 #include "routingmanager.h"
+#include <cassert>
 
 namespace blueprint_sched {
 
@@ -424,41 +425,85 @@ OutputTileDescriptor buildOutputTileDescriptor(const BlueprintPassState &passSta
     // scattered into the full [OH, OW, OC] image, across wRounds L->R x l2Rounds T->B.
     ConvHaloGeom halo = detectConvHalo(moduleOp);
     if (halo.valid && memrefType.getRank() == 3) {
-        // === 3D conv output, channel-split (LtoR_Merge), NCHW DDR layout ===
-        // The C (output) DDR tensor is laid out NCHW [F, OH, OW] (C-plane outer,
-        // row H, col W innermost/contiguous). Each mesh-COL core owns cPerCore
-        // contiguous C-planes (group2 split) and fires wRounds(W) x hChunks(H)
-        // times, one [cPerCore, ohPerRow, owT] block per fire, scattered into the
-        // full NCHW image. The shim S2MM gather BD therefore addresses:
-        //   D0 = W word    (contiguous run owT elements, in 32-bit words)
-        //   D1 = H row     (one image row OUTPUT_W apart)
-        //   D2 = C plane   (one C-plane OUTPUT_H*OUTPUT_W apart)
-        //
-        // ALL geometry is derived from the partition #routing.tiling attr:
-        //   d0 (H): outer{base=OUTPUT_H,slice,step,rounds}, slice_tiling{slice=ohPerRow,rounds=hChunks}
-        //   d1 (W): outer{base=OUTPUT_W,slice=owT,rounds=wRounds}
-        //   d2 (C): outer{base=fullC,slice=cPerCore}
-        // Fallback to detectConvHalo + memref shape only when the attr is absent.
+        // === 3D conv output, channel-split (LtoR_Merge) ===
+        // Generic gather descriptor: honor the DECLARED dim order in the
+        // partition #routing.tiling attr and lay the DDR tensor out row-major of
+        // that order (innermost declared dim contiguous). Each dim carries an
+        // `axis` role: 1=mesh_row (T->B scf.for round loop), 2=mesh_col (per-tile
+        // base offset), 0=on-core (folded into the BD iteration). Because every
+        // BD stride is a row-major stride of the declared shape, the SAME code
+        // emits the correct descriptor for CHW, HWC, or any permutation with no
+        // layout special-casing. Falls back to the legacy detectConvHalo + memref
+        // heuristic only when no 3-dim tiling attr is present.
+        auto tiling = tilingAttr ? dyn_cast_or_null<routing::TilingAttr>(tilingAttr) : routing::TilingAttr();
+        if (tiling && tiling.getDims().size() == 3) {
+            auto dims = tiling.getDims();
+            constexpr int n = 3;
+            routing::LevelAttr outer[n];
+            int64_t F[n], blk[n], rounds[n], axis[n];
+            for (int k = 0; k < n; ++k) {
+                outer[k] = dims[k].getOuter();
+                F[k] = outer[k].getBase();
+                axis[k] = dims[k].getAxis();
+                if (routing::LevelAttr st = outer[k].getSliceTiling()) {
+                    blk[k] = st.getSlice();
+                    rounds[k] = st.getRounds();
+                } else {
+                    blk[k] = outer[k].getSlice();
+                    rounds[k] = outer[k].getRounds();
+                }
+            }
+            // Row-major strides (elements) of the declared shape F[].
+            int64_t rmStride[n];
+            rmStride[n - 1] = 1;
+            for (int k = n - 2; k >= 0; --k)
+                rmStride[k] = rmStride[k + 1] * F[k + 1];
+
+            // Resolve dim roles from axis; positional H,W,C fallback on ambiguity.
+            int rowDim = -1, colDim = -1, iterDim = -1;
+            for (int k = 0; k < n; ++k) {
+                if (axis[k] == 1)
+                    rowDim = k;
+                else if (axis[k] == 2)
+                    colDim = k;
+                else
+                    iterDim = k;
+            }
+            if (rowDim < 0 || colDim < 0 || iterDim < 0) {
+                rowDim = 0;
+                iterDim = 1;
+                colDim = 2;
+            }
+
+            assert(blk[n - 1] % elemsPerWord == 0 && "innermost per-fire block must be word-aligned");
+
+            int64_t prod = 1;
+            for (int k = 0; k < n; ++k)
+                prod *= blk[k];
+            desc.bdLenBytes = prod * ooElementSizeBytes;
+
+            // BD scatter dims innermost-first: contiguous innermost dim counted in
+            // 32-bit words, the outer dims by their row-major element stride.
+            for (int k = n - 1; k >= 0; --k) {
+                if (k == n - 1)
+                    desc.bdDims.push_back({wordBytes, blk[k] / elemsPerWord});
+                else
+                    desc.bdDims.push_back({rmStride[k] * elemBytes, blk[k]});
+            }
+
+            // On-core (iter) dim folds into the BD iteration; mesh-row dim drives
+            // the scf.for round loop; mesh-col dim advances the per-tile base.
+            desc.iterStep = static_cast<int32_t>(blk[iterDim] * rmStride[iterDim] * elemBytes);
+            desc.iterWrap = static_cast<int32_t>(outer[iterDim].getRounds());
+            desc.totalRounds = rounds[rowDim];
+            desc.roundDims.push_back({rounds[rowDim], blk[rowDim] * rmStride[rowDim] * elemBytes});
+            desc.perTileStrideBytes = blk[colDim] * rmStride[colDim] * elemBytes;
+            return desc;
+        }
+
+        // --- Legacy attr-less fallback (NCHW derivation) ---
         int64_t OUTPUT_H = 0, OUTPUT_W = 0, fullC = 0;
         int64_t ohPerRow = 0, owT = 0, wRounds = 0, hChunks = 0, cPerCore = 0;
-
-        auto tiling = tilingAttr ? dyn_cast_or_null<routing::TilingAttr>(tilingAttr) : routing::TilingAttr();
-        if (tiling && tiling.getDims().size() >= 3) {
-            auto dims = tiling.getDims();
-            routing::LevelAttr d0Outer = dims[0].getOuter(); // H
-            routing::LevelAttr d1Outer = dims[1].getOuter(); // W
-            routing::LevelAttr d2Outer = dims[2].getOuter(); // C
-            OUTPUT_H = d0Outer.getBase();
-            OUTPUT_W = d1Outer.getBase();
-            fullC = d2Outer.getBase();
-            owT = d1Outer.getSlice();
-            wRounds = d1Outer.getRounds();
-            cPerCore = d2Outer.getSlice();
-            if (routing::LevelAttr d0Inner = d0Outer.getSliceTiling()) {
-                ohPerRow = d0Inner.getSlice();
-                hChunks = d0Inner.getRounds();
-            }
-        }
 
         // Fallback derivation (no tiling attr): reuse the detectConvHalo heuristic
         // and the (channel-split) memref view + numCoreTiles, matching the tiling

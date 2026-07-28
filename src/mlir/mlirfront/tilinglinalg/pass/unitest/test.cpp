@@ -2146,12 +2146,12 @@ void testReadGemmTilingScalars() {
     auto kOuter = mkLevel(256, 256, 256, 256, 1, kCore);
 
     // A tensor (owner="col", splitdim=0): d0=mesh(N), d1=K.
-    llvm::SmallVector<routing::DimAttr> aDims = {routing::DimAttr::get(&ctx, meshOuter),
-                                                 routing::DimAttr::get(&ctx, kOuter)};
+    llvm::SmallVector<routing::DimAttr> aDims = {routing::DimAttr::get(&ctx, meshOuter, /*axis=*/0),
+                                                 routing::DimAttr::get(&ctx, kOuter, /*axis=*/0)};
     auto aTiling = routing::TilingAttr::get(&ctx, aDims);
     // B/input tensor (owner="row", splitdim=0): d0=mesh(M), d1=K.
-    llvm::SmallVector<routing::DimAttr> bDims = {routing::DimAttr::get(&ctx, meshOuter),
-                                                 routing::DimAttr::get(&ctx, kOuter)};
+    llvm::SmallVector<routing::DimAttr> bDims = {routing::DimAttr::get(&ctx, meshOuter, /*axis=*/0),
+                                                 routing::DimAttr::get(&ctx, kOuter, /*axis=*/0)};
     auto bTiling = routing::TilingAttr::get(&ctx, bDims);
 
     auto tensorTy = mlir::RankedTensorType::get({256, 256}, b.getI8Type());

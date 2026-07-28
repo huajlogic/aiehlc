@@ -72,42 +72,6 @@ struct DeclareDataOpConversion : public OpConversionPattern<dfscheblueprint::Dec
     }
 };
 
-// Part D (NCHW conv output): reinterpret the rank-3 conv-output DDR root memref
-// with an NCHW strided layout so the per-mesh-row memref.subview yields an
-// NCHW base offset (R*OUTPUT_W per H-slab) instead of the NHWC row-major offset.
-//
-// The logical shape stays [H, W, C] (row order preserved), only the strides
-// change from row-major NHWC [W*C, C, 1] to NCHW [W, 1, H*W]. A subview
-// [R*ohSlab, 0, 0] then legally carries offset R*ohSlab*W (elements).
-//
-// Returns the reinterpret_cast result, or the original `root` if the tiling
-// attr is absent/malformed (safe fallback to NHWC).
-static mlir::Value reinterpretRootAsNchw(ConversionPatternRewriter &rewriter, Location loc, mlir::Value root,
-                                         mlir::Attribute tilingAttr) {
-    auto rootType = dyn_cast<MemRefType>(root.getType());
-    if (!rootType || rootType.getRank() != 3)
-        return root;
-    auto tiling = tilingAttr ? dyn_cast_or_null<routing::TilingAttr>(tilingAttr) : routing::TilingAttr();
-    if (!tiling || tiling.getDims().size() < 3)
-        return root;
-    routing::LevelAttr d0Outer = tiling.getDims()[0].getOuter(); // H
-    routing::LevelAttr d1Outer = tiling.getDims()[1].getOuter(); // W
-    if (!d0Outer || !d1Outer)
-        return root;
-    int64_t OUTPUT_H = d0Outer.getBase();
-    int64_t OUTPUT_W = d1Outer.getBase();
-    ArrayRef<int64_t> shape = rootType.getShape(); // [H, W, C]
-    if (OUTPUT_H <= 0 || OUTPUT_W <= 0 || shape.size() != 3)
-        return root;
-    // NCHW strides over the logical [H, W, C] shape.
-    SmallVector<int64_t> nchwStrides = {OUTPUT_W, 1, OUTPUT_H * OUTPUT_W};
-    auto layout = StridedLayoutAttr::get(rewriter.getContext(), /*offset=*/0, nchwStrides);
-    auto nchwType = MemRefType::get(shape, rootType.getElementType(), layout, rootType.getMemorySpace());
-    SmallVector<int64_t> sizes(shape.begin(), shape.end());
-    auto reOp = rewriter.create<memref::ReinterpretCastOp>(loc, nchwType, root, /*offset=*/0, sizes, nchwStrides);
-    return reOp.getResult();
-}
-
 } // namespace
 
 namespace blueprint_sched {
@@ -181,16 +145,11 @@ LogicalResult FlowTransferConversion::matchAndRewrite(dfscheblueprint::FlowTrans
         auto partSizes = c.partExtractSlice.getStaticSizes();
         auto partStrides = c.partExtractSlice.getStaticStrides();
 
-        // Part D: for the rank-3 conv OUTPUT flow (cores -> shim, S2MM receiver),
-        // reinterpret the DDR root with an NCHW strided layout so the per-mesh-row
-        // subview base offset becomes NCHW (R*OUTPUT_W) rather than NHWC row-major.
-        // Guarded by a tiling attr on the partition extract_slice; falls back to the
-        // NHWC root when absent (matmul / input halo paths are untouched).
+        // The partition subview folds its byte offset against the root memref's own
+        // strides, which reflect the actual declared output tensor layout (NHWC
+        // row-major today). This is layout-agnostic: whatever the root layout is, the
+        // subview base offset follows it automatically.
         mlir::Value subviewRoot = c.flowRootMemref;
-        if (!c.shimIsSender) {
-            mlir::Attribute tilingAttr = c.partExtractSlice->getAttr("tiling");
-            subviewRoot = reinterpretRootAsNchw(rewriter, loc, c.flowRootMemref, tilingAttr);
-        }
 
         auto partSubviewOp = rewriter.create<memref::SubViewOp>(loc, subviewRoot, toOpFoldResult(partOffsets, rewriter),
                                                                 toOpFoldResult(partSizes, rewriter),
