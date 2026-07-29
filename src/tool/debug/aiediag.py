@@ -58,6 +58,16 @@ CORE_PC_MASK   = 0xFFFFF
 CORE_STATUS_OFFSET  = {"5": 0x32004, "2ps": 0x38004}
 CORE_CONTROL_OFFSET = {"5": 0x32000, "2ps": 0x38000}
 
+# Kernel data-memory log (klog) region. Mirrors src/mlir/runtime/kernel_log.h:
+# the last 2 KB of core-tile data memory hold 512 int32 slots at DM byte offset
+# 0xF800.  slot[0] = write_index (count of int32s written, NOT entries);
+# entries are [tag_packed, value] pairs at slot[1..].  klog_init() writes a first
+# entry with tag "KLOG" and value KLOG_MAGIC.  Core tiles only (data memory).
+KLOG_DM_OFFSET   = 0xF800   # DM byte offset (== XAie_DataMemBlockRead offset)
+KLOG_REGION_WORDS = 512     # total int32 slots in the 2 KB region
+KLOG_MAX_SLOTS   = 511      # slot 0 = write_index, slots 1..511 = data
+KLOG_MAGIC       = 0x4B4C4F47  # "KLOG" ASCII big-endian
+
 # Core_Status bit fields: name -> bit position (LSB). All width 1.
 # Order chosen so the decoded print reads high-level state first, then stalls.
 # Source: XAIE*GBL_CORE_MODULE_CORE_STATUS_*_LSB.
@@ -577,6 +587,136 @@ def run_aiedbg_reg_read(phys_col, row, offset, target=None, device=None,
         return _traced(int(tokens[-1], 16))
     print(f"Warning: could not parse aiedbg output: {out}", file=sys.stderr)
     return _traced(None)
+
+# ─── Memory read + klog decode ─────────────────────────────────────────────────
+
+def run_aiedbg_mem_read(phys_col, row, addr, nwords, target=None, device=None,
+                        dry_run=False):
+    """Run `aiedbg mem read` and return the words as a list of ints.
+
+    Mirrors run_aiedbg_reg_read's house style.  aiedbg reads at most 256 words
+    per request; callers must chunk larger reads.  `addr` is a byte offset into
+    the tile (data memory base = tile offset 0), matching _tile_to_mmio.  In
+    dry_run the command is printed and [] returned.
+    """
+    nwords = min(int(nwords), 256)
+    cmd = ["aiedbg", "--json"]
+    if target:
+        cmd += ["--target", target]
+    if device:
+        cmd += ["--device", device]
+    cmd += ["mem", "read", str(phys_col), str(row), f"0x{addr:X}", str(nwords)]
+
+    if dry_run:
+        print(f"  [dry-run] would execute: {' '.join(cmd)}")
+        return []
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        print("Error: 'aiedbg' not found in PATH", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"Error: aiedbg timed out for tile({phys_col},{row})", file=sys.stderr)
+        return []
+
+    if result.returncode != 0:
+        print(f"Warning: aiedbg returned error for tile({phys_col},{row}): "
+              f"{result.stderr.strip()}", file=sys.stderr)
+        return []
+
+    out = result.stdout.strip()
+    try:
+        data = json.loads(out)
+        if "words" in data and isinstance(data["words"], list):
+            vals = []
+            for w in data["words"]:
+                if isinstance(w, str):
+                    vals.append(int(w, 16) if w.lower().startswith("0x") else int(w))
+                else:
+                    vals.append(int(w))
+            return vals
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    # Fallback for older aiedbg without --json: scrape hex tokens.
+    tokens = re.findall(r"0x[0-9a-fA-F]+", out)
+    if tokens:
+        return [int(t, 16) for t in tokens]
+    print(f"Warning: could not parse aiedbg mem output: {out}", file=sys.stderr)
+    return []
+
+def read_klog(phys_col, row, target=None, device=None, dry_run=False):
+    """Read the klog region from a core tile.
+
+    Returns (write_index, words) where `words` is the int32 slot array starting
+    at slot 0, or None if nothing could be read.  Reads slot[0] first; if the
+    write_index is out of range, returns (wi, []) so the caller can report "no
+    log".  Otherwise reads min(wi+1, 512) words in <=256-word chunks.
+    """
+    head = run_aiedbg_mem_read(phys_col, row, KLOG_DM_OFFSET, 1,
+                               target=target, device=device, dry_run=dry_run)
+    if dry_run:
+        return (0, [])
+    if not head:
+        return None
+    wi = head[0]
+    if wi <= 0 or wi > KLOG_MAX_SLOTS:
+        return (wi, [])
+
+    total = min(wi + 1, KLOG_REGION_WORDS)
+    words = []
+    read = 0
+    while read < total:
+        chunk = min(256, total - read)
+        addr = KLOG_DM_OFFSET + read * 4
+        got = run_aiedbg_mem_read(phys_col, row, addr, chunk,
+                                  target=target, device=device, dry_run=False)
+        if not got:
+            break
+        words.extend(got)
+        read += len(got)
+        if len(got) < chunk:
+            break
+    return (wi, words)
+
+def _klog_decode_tag(tag_raw):
+    """Decode a packed int32 tag into an ASCII string (big-endian).
+
+    Mirrors kernel_log.h's printf("%s"): stops at the first null byte (tags
+    shorter than 4 chars are null-padded), and renders non-printable bytes as
+    '.' so binary junk stays readable.
+    """
+    out = []
+    for shift in (24, 16, 8, 0):
+        c = (tag_raw >> shift) & 0xFF
+        if c == 0:
+            break
+        out.append(chr(c) if 32 <= c < 127 else ".")
+    return "".join(out)
+
+def format_klog(phys_col, row, wi, words):
+    """Render the klog contents, mirroring kernel_log.h klog_read()."""
+    if wi <= 0 or wi > KLOG_MAX_SLOTS:
+        return f"[klog] tile({phys_col},{row}): no log (write_index={wi})"
+
+    lines = [f"[klog] tile({phys_col},{row}): {wi // 2} entries"]
+    n = 0
+    for i in range(0, wi, 2):
+        if i + 2 >= len(words):
+            break
+        tag_raw = words[i + 1]
+        val = words[i + 2]
+        tag = _klog_decode_tag(tag_raw)
+        sval = val - (1 << 32) if val & 0x80000000 else val
+        lines.append(f"  [{i // 2}] {tag} = {sval} (0x{val & 0xFFFFFFFF:08x})")
+        n += 1
+    if n and words[1] == KLOG_MAGIC:
+        lines.append(green("  (klog_init magic OK)"))
+    elif n:
+        lines.append(yellow("  (warning: first entry is not the KLOG magic; "
+                            "klog_init may not have run)"))
+    return "\n".join(lines)
 
 # ─── Status decode ────────────────────────────────────────────────────────────
 
