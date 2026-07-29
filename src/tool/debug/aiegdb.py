@@ -422,6 +422,9 @@ class AieGdb:
         if verb == "event":
             self._tile_events()
             return
+        if verb in ("log", "klog"):
+            self._klog()
+            return
         if verb in ("channels", "chans"):
             self._list_channels()
             return
@@ -474,6 +477,18 @@ class AieGdb:
             return
         dec = aiediag.decode_core_status(raw)
         print(aiediag.format_core_status(self.phys_col, self.tile["row"], dec))
+
+    def _klog(self):
+        if self.tile["row"] == 0:
+            print("error: shim tiles (row 0) have no core klog buffer")
+            return
+        res = aiediag.read_klog(self.phys_col, self.tile["row"],
+                                self.target, self.device, self.dry_run)
+        if res is None:
+            print(f"  klog read failed for tile({self.phys_col},{self.tile['row']})")
+            return
+        wi, words = res
+        print(aiediag.format_klog(self.phys_col, self.tile["row"], wi, words))
 
     def _tile_events(self):
         ttype = self.tile["type"]
@@ -531,6 +546,9 @@ class AieGdb:
             return
         if verb == "event":
             self._channel_events()
+            return
+        if verb in ("log", "klog"):
+            self._klog()
             return
         if verb == "reg" and args and args[0] in ("read", "write"):
             self._passthrough(["reg", args[0], str(pc), str(row)] + args[1:])
@@ -688,6 +706,7 @@ class AieGdb:
             print("  event                   per-channel DMA start/finish/error")
             print("  dma counter | counter   AIE perf counters (read-only)")
             print("  dma counter setup [finished|started]   (INTRUSIVE write)")
+            print("  log | klog              dump kernel klog buffer (core tiles only)")
             print("  reg read OFF            passthrough (col/row auto-filled)")
         elif self.tile is not None:
             print("Tile scope (col/row auto-injected):")
@@ -695,6 +714,7 @@ class AieGdb:
             print("  pc                      core PC -> source (linemap)")
             print("  status | core [status]  decoded core status (enable/reset/stall)")
             print("  event                   event-status regs (decoded)")
+            print("  log | klog              dump kernel klog buffer (core tiles only)")
             print("  channels | chans        list this tile's channels")
             print("  reg read OFF | reg write OFF VAL | mem read ADDR LEN")
             print("  scan .. | tile list | show ..   (array-wide passthrough)")
@@ -714,6 +734,7 @@ class AieGdb:
             print("  event                   per-channel DMA start/finish/error")
             print("  dma counter | counter   AIE perf counters (read-only)")
             print("  dma counter setup [finished|started]   (INTRUSIVE write)")
+            print("  log | klog              dump kernel klog buffer (core tiles only)")
             print("  reg read OFF | reg write OFF VAL | mem read ADDR LEN")
             print("  up | ..    -> tile scope     top -> partition")
         elif self.tile is not None:
@@ -722,6 +743,7 @@ class AieGdb:
             print("  pc                      core PC -> source (linemap)")
             print("  status | core [status]  decoded core status (enable/reset/stall)")
             print("  event                   event-status regs (decoded)")
+            print("  log | klog              dump kernel klog buffer (core tiles only)")
             print("  channels | chans        list this tile's channels")
             print("  reg read OFF | reg write OFF VAL | mem read ADDR LEN")
             print("  scan .. | tile list | show ..   (array-wide passthrough)")

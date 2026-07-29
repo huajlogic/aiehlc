@@ -2348,19 +2348,25 @@ public:
                         derivedTilingParams.tileM = tileM_eff;
                         derivedTilingParams.tileN = tileN_eff;
                         derivedTilingParams.effectiveK = tileK_eff;
-                        // Prefer the explicit tile_dim.groups when the user pinned it;
-                        // otherwise fall back to the (total / size) formula. Both must
-                        // agree for a valid Partition (checked by validateDim above).
-                        derivedTilingParams.spatialMRounds =
-                            explicitGroupsM > 0 ? explicitGroupsM
-                                                : ((tileM_eff > 0 && tileM_eff < derivedTilingParams.tileRows)
-                                                       ? derivedTilingParams.tileRows / tileM_eff
-                                                       : 1);
-                        derivedTilingParams.spatialNRounds =
-                            explicitGroupsN > 0 ? explicitGroupsN
-                                                : ((tileN_eff > 0 && tileN_eff < derivedTilingParams.tileCols)
-                                                       ? derivedTilingParams.tileCols / tileN_eff
-                                                       : 1);
+                        // explicitGroups{M,N} come from a per-port .fullsize field and are
+                        // therefore GLOBAL counts (over the full M/N dim). The mesh split
+                        // (meshRows/meshCols) is applied separately downstream
+                        // (populateGemmTiling meshRounds), so convert the global groups to
+                        // PER-CORE here by dividing out the mesh factor. When no explicit
+                        // groups were given, fall back to the (per-core extent / size) formula.
+                        auto perCoreSpatialRounds = [](int globalGroups, int64_t meshFactor, int64_t tileEff,
+                                                       int64_t perCoreExtent) -> int64_t {
+                            if (globalGroups > 0) {
+                                if (meshFactor > 0 && (globalGroups % meshFactor) == 0)
+                                    return globalGroups / meshFactor; // global -> per-core
+                                return globalGroups;                  // not mesh-divisible: use as-is
+                            }
+                            return (tileEff > 0 && tileEff < perCoreExtent) ? perCoreExtent / tileEff : 1;
+                        };
+                        derivedTilingParams.spatialMRounds = perCoreSpatialRounds(
+                            explicitGroupsM, effectiveMeshRows, tileM_eff, derivedTilingParams.tileRows);
+                        derivedTilingParams.spatialNRounds = perCoreSpatialRounds(
+                            explicitGroupsN, effectiveMeshCols, tileN_eff, derivedTilingParams.tileCols);
                         derivedTilingParams.kRounds =
                             explicitGroupsK > 0
                                 ? explicitGroupsK

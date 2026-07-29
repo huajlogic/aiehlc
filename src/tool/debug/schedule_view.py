@@ -1512,10 +1512,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
            color:#ddd; font-family:monospace; padding:0; }
   /* highlight of the most recent command + result, pinned at the top of the
      terminal box just under the prompt/input line (before the scrolling log) */
+  /* cap + scroll the "last result" so a big command output (help/bd/event/klog)
+     scrolls inside this box instead of ballooning past #conterm and getting
+     clipped by its overflow:hidden (which left no scrollbar and squeezed the
+     #conout log to zero height). */
   #conlast { flex:0 0 auto; margin-bottom:6px; padding:6px 8px; background:#161616;
              border:1px solid #444; border-radius:4px; font-family:monospace;
              font-size:11px; font-weight:700; white-space:pre-wrap;
-             word-break:break-word; }
+             word-break:break-word; max-height:96px; overflow:auto; }
   #conlastlbl { color:#789; font-weight:700; margin-right:6px; }
   #conlastcmd { color:#8ec; font-weight:700; }
   #conlastres { color:#f5b942; font-weight:700; }

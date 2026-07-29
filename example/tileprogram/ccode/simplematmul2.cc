@@ -5,7 +5,8 @@
  * AIE Programming Model — Matrix Multiplication (Parameterized Kernel API)
  */
 #include "simplematmul.h"
-#pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
+// #pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
+#pragma aie_debug_level(0 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
 // Composition-based spatial spaces: a generic SpatialPolicy composed with a
 // PER-PORT 2D iteration space. Each port describes its OWN matrix via d1/d2:
 //   win_a A=[M,K] -> d1 = M-tile,  d2 = K-chunk
@@ -32,12 +33,12 @@ constexpr aie::GemmSpace LtoR_Merge = {
                .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
     .d1 = {.fullsize = M, .tile_size = 16, .stride = 16},  // C: M-tile
     .d2 = {.fullsize = N, .tile_size = 16, .stride = 16}}; // C: N-tile
-#define DEBUG_OUTPUT_ORDER 1
-// Per-kernel GLOBAL policy, bound explicitly at the declaration site via
-// __global__(matmul_policy). The <kernel>_policy naming convention still works
-// as a fallback when no explicit binding is given.
-// fullconnect_auto = 0 -> disable the M×N cartesian DMA repeat: A and B are
-// each sent once following the tiling distribution (no host round loop).
+// #define DEBUG_OUTPUT_ORDER 1
+//  Per-kernel GLOBAL policy, bound explicitly at the declaration site via
+//  __global__(matmul_policy). The <kernel>_policy naming convention still works
+//  as a fallback when no explicit binding is given.
+//  fullconnect_auto = 0 -> disable the M×N cartesian DMA repeat: A and B are
+//  each sent once following the tiling distribution (no host round loop).
 constexpr aie::GlobalPolicy matmul_policy = {.fullconnect_auto = 1};
 __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_a,
                                       aie::port<input_window_int8 *, ColBB> win_b,
@@ -108,8 +109,8 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
 
         // ===== K-round loop: accumulate partial products =====
         for (int kr = 0; kr < k_rounds; kr++) {
-            klog("KRA ", (int32_t)kr);
-            // --- Phase 1: Receive and cache A chunk for this (mr, kr) ---
+            // klog("KRA ", (int32_t)kr);
+            //  --- Phase 1: Receive and cache A chunk for this (mr, kr) ---
             for (int ra = 0; ra < num_a_rounds; ra++) {
                 int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
                 for (int i = 0; i < buf_sz_a; i++) {
@@ -327,8 +328,16 @@ int main() {
         B[i] = (int8_t)((i % 5) - 2);
     for (int i = 0; i < M * N; i++)
         C[i] = 0;
+
+    // time start
+    XTime t_start, t_end;
+    XTime_GetTime(&t_start);
     // --- Launch kernel on tile mesh ---
     matmul<<<mesh>>>(A, B, C, M, N, K);
+    //
+    XTime_GetTime(&t_end);
+    double elapsed_ms = 1.0 * (t_end - t_start) / COUNTS_PER_SECOND * 1000.0;
+    printf("aie matmul time: %.3f ms\n", elapsed_ms);
     // stlkernel<<mesh>>>(A, B, C);
     //  device.synchronizecpu(C, M * N * sizeof(int8_t) * 4);
     int result = verify_matmul(A, B, C);
