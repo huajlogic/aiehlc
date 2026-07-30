@@ -497,4 +497,4 @@ proposal3.cc
 2. **Integration**: `cd build && cmake .. && make -j$(nproc)` — aiehlc must compile with all new sources
 3. **End-to-end**: `./aiehlc example/tileprogram/design/proposal3.cc` — must produce `worklocal/{host,kernel,routing}.cc` + `aieml.{bcf,prx}`
 4. **Diff test**: Compare `worklocal/host.cc` from step 3 with `worklocal/host.cc` from step 1 — should match for same mesh(2,2) + tensor(16x16, i32)
-5. **HW test**: `cd worklocal && source compile_kernel.sh && source hostcompile.sh && python3 script/test/apppaltest.py build/host`
+5. **HW test**: `cd worklocal && source hostcompile.sh && python3 script/test/apppaltest.py build/host` (hostcompile.sh builds kernel + host)

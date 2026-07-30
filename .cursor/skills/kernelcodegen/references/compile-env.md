@@ -1,7 +1,7 @@
 <!-- Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
      SPDX-License-Identifier: Apache-2.0 -->
 
-# Kernel compile environment and compile_kernel.sh
+# Kernel compile environment (kernel-only build via hostcompile.sh)
 
 ## Setup
 
@@ -12,12 +12,15 @@ Source the repo env before compiling:
 source script/setup.sh --path-set-only
 ```
 
-Requires `XILINX_VITIS` (Vitis with aietools). compile_kernel.sh sources setup.sh from the repo when run from worklocal.
+Requires `XILINX_VITIS` (Vitis with aietools). `hostcompile.sh` sources setup.sh from the repo when run from worklocal.
 
-## compile_kernel.sh
+## Kernel-only build (KERNEL_ONLY=1 hostcompile.sh)
 
-- **Location**: `src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal/compile_kernel.sh`
-- **Usage**: Run from worklocal. Requires `kernel.cc` in worklocal (generate first via unitest). If kernel.cc includes it, the pre-existing `compute_kernel.cc` must also be present.
+The kernel build lives in `script/hostcompile.sh` as the `compile_one_kernel()`
+function. To build just the kernel (no host build), source it with `KERNEL_ONLY=1`.
+
+- **Script**: `script/hostcompile.sh` (function `compile_one_kernel`, which calls `script/kc.sh`)
+- **Usage**: `WORKLOCAL_DIR=<worklocal> KERNEL_ONLY=1 source script/hostcompile.sh [func_name]`. Requires `kernel.cc` in worklocal (generate first via unitest). If kernel.cc includes it, the pre-existing `compute_kernel.cc` must also be present.
 
 **Steps** (AIE2PS):
 
@@ -35,9 +38,9 @@ Requires `XILINX_VITIS` (Vitis with aietools). compile_kernel.sh sources setup.s
 | Symptom | Cause | Fix |
 |---------|--------|-----|
 | kernel.cc not found | Unitest not run or wrong worklocal | Run unitest (`./test`) from unitest build dir first. |
-| XILINX_VITIS not set | Env not sourced | source script/setup.sh from repo root; compile_kernel.sh also sources it if AIEHLC_DIR/script/setup.sh exists. |
+| XILINX_VITIS not set | Env not sourced | source script/setup.sh from repo root; hostcompile.sh also sources it if AIEHLC_ROOT/script/setup.sh exists. |
 | xchesscc/opt/xchessmk not found | Vitis/aietools not in PATH | Ensure Vitis settings64.sh or script/setup.sh sets PATH to include aietools. |
-| Undefined symbol / API mismatch | kernel.cc and aie_api or driver headers mismatch | Align kernel code with AIE version (aie2ps); check include paths in compile_kernel.sh. |
+| Undefined symbol / API mismatch | kernel.cc and aie_api or driver headers mismatch | Align kernel code with AIE version (aie2ps); check include paths in kc.sh / hostcompile.sh. |
 | `unknown type name 'window_internal'` or `undeclared identifier 'window_out_0_ping'/'window_out_0_pong'` | Codegen does not emit window types/helpers or uses wrong buffer names | In kernel.cc: (1) Add typedef for `window_internal`, `output_window_int8`, and inline `window_init`, `get_output_async_window_int8`, `acquire_output_window`, `release_output_window` (see kernel.bak.cc or example/work/kernel.cc). (2) Use `buf_out_ping_0`/`buf_out_pong_0` in `window_init`, not `window_out_0_ping`/`window_out_0_pong`. (3) Call `compute_kernel(get_output_async_window_int8(window_window_out_0))`. (4) Add `#include "compute_kernel.cc"` before main. |
 
 ## Quick check
@@ -46,7 +49,7 @@ From repo root after generating kernel.cc:
 
 ```bash
 source script/setup.sh --path-set-only
-cd src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal
-./compile_kernel.sh
-# Kernel ELF: build/kernel
+WORKLOCAL_DIR=src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal \
+    KERNEL_ONLY=1 source script/hostcompile.sh
+# Kernel ELF: <worklocal>/build/kernel
 ```

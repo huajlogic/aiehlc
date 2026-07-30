@@ -982,7 +982,7 @@ flowchart TB
 
 ### Phase 7 (Optional): HW Round-Trip Test
 
-- **7.1** Compile kernel: `cd worklocal && source compile_kernel.sh`
+- **7.1** Compile kernel: `cd worklocal && WORKLOCAL_DIR=$(pwd) KERNEL_ONLY=1 source ../script/hostcompile.sh`
   - Expected: `build/kernel` ELF produced, no xchesscc errors
 - **7.2** Compile host: `cd worklocal && source hostcompile.sh`
   - Expected: `build/host` ELF produced, no linker errors for `__runtime_buffer_offset` or `__Runtime_track_alloc`

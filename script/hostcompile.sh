@@ -26,12 +26,97 @@ PASSTHROUGH_ARGS=()
 # Repo root: this script always lives in script/ -> one level up.
 AIEHLC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AIEHLC_DIR="${AIEHLC_ROOT}"
-# WORKLOCAL_DIR comes from the caller (default: current dir). Generated
-# host.cc/kernel.cc and all build artifacts live here.
-WORKLOCAL_DIR="${WORKLOCAL_DIR:-$(pwd)}"
+# WORKLOCAL_DIR comes from the caller. Generated host.cc/kernel.cc and all build
+# artifacts live here. When not explicitly set, prefer the current dir if it holds
+# the generated sources, otherwise fall back to the aiehlc default aout/worklocal
+# (so running `source ./script/hostcompile.sh` from the repo root just works).
+if [ -z "${WORKLOCAL_DIR:-}" ]; then
+    if [ -f "$(pwd)/host.cc" ] || [ -f "$(pwd)/kernel.cc" ]; then
+        WORKLOCAL_DIR="$(pwd)"
+    elif [ -f "$(pwd)/aout/worklocal/host.cc" ] || [ -f "$(pwd)/aout/worklocal/kernel.cc" ]; then
+        WORKLOCAL_DIR="$(pwd)/aout/worklocal"
+        echo "[hostcompile] WORKLOCAL_DIR not set; using detected ${WORKLOCAL_DIR}"
+    else
+        WORKLOCAL_DIR="$(pwd)"
+    fi
+fi
 BUILD_DIR="${WORKLOCAL_DIR}/build"
 
 KERNEL_FUNC_NAME="computekernel"   # default fallback; overridden by auto-detection below
+
+# ---------------------------------------------------------------------------
+# compile_one_kernel: build a single kernel ELF + kernel.o from kernel.cc.
+#
+#   $1  kernel function name for binary symbols (default: compute_kernel)
+#       Produces kernel.o with _binary_kernel_<func_name>_{start,end,size}
+#
+# Standalone kernel-only build (no host build): source this file with
+# KERNEL_ONLY=1, e.g.
+#     WORKLOCAL_DIR=$(pwd) KERNEL_ONLY=1 source script/hostcompile.sh <func>
+# ---------------------------------------------------------------------------
+compile_one_kernel() {
+    local KERNEL_FUNC_NAME="${1:-compute_kernel}"
+
+    # Fail early (before the chess toolchain) if the generated kernel source is missing.
+    if [ ! -f "${WORKLOCAL_DIR}/kernel.cc" ]; then
+        echo "Error: kernel.cc not found in ${WORKLOCAL_DIR}"
+        echo "Generate it first (run aiehlc / the unitest), or point WORKLOCAL_DIR at the"
+        echo "worklocal dir that holds host.cc/kernel.cc, e.g.:"
+        echo "  WORKLOCAL_DIR=\$(pwd)/aout/worklocal source script/hostcompile.sh"
+        exit 1
+    fi
+
+    # Source setup.sh to set XILINX_VITIS and other environment variables
+    if [ -f "${AIEHLC_ROOT}/script/setup.sh" ]; then
+        echo "Sourcing Vitis environment from ${AIEHLC_ROOT}/script/setup.sh..."
+        # Save current directory to restore after sourcing
+        local SAVED_PWD="$(pwd)"
+        source "${AIEHLC_ROOT}/script/setup.sh" --path-set-only
+        # Restore directory
+        cd "${SAVED_PWD}"
+        echo "✓ Environment loaded: XILINX_VITIS=${XILINX_VITIS}"
+    else
+        echo "Warning: setup.sh not found at ${AIEHLC_ROOT}/script/setup.sh"
+        echo "Checking if XILINX_VITIS is already set..."
+    fi
+
+    # Check XILINX_VITIS is set
+    if [ -z "$XILINX_VITIS" ]; then
+        echo "Error: XILINX_VITIS environment variable not set"
+        echo "Please source Vitis settings: source /path/to/Vitis/settings64.sh"
+        exit 1
+    fi
+
+    # Clean previous kernel build artifacts--to fix the _main missing error
+    # Only remove kernel.o and kernel ELF (not kernel_*.o from multi-kernel builds)
+    rm -f "${BUILD_DIR}"/chesswork/kernel* "${BUILD_DIR}"/kernel.o "${BUILD_DIR}"/kernel 2>/dev/null || true
+
+    echo "Kernel func name: ${KERNEL_FUNC_NAME}"
+
+    # Use generated BCF/PRX if available (from tilinglinalg pipeline), fall back to stock
+    local PRX_FILE
+    if [ -f "${WORKLOCAL_DIR}/aieml.prx" ]; then
+        PRX_FILE="${WORKLOCAL_DIR}/aieml.prx"
+        echo "Using generated PRX: ${PRX_FILE}"
+    else
+        PRX_FILE="aie2ps.prx"
+        echo "Using stock PRX: ${PRX_FILE}"
+    fi
+
+    # Build from WORKLOCAL_DIR so the relative --kernel-cc ./kernel.cc resolves there.
+    cd "${WORKLOCAL_DIR}"
+    local _KC_PLATFORM="${PLATFORM:-baremetal}"
+    source ${AIEHLC_ROOT}/script/kc.sh --kernel-cc ./kernel.cc --func-name "${KERNEL_FUNC_NAME}" --aie-version 5 --platform "${_KC_PLATFORM}" --debug-output --output-dir $BUILD_DIR --prx "${PRX_FILE}"
+}
+
+# Kernel-only mode: source this file with KERNEL_ONLY=1 to build just the kernel
+# (standalone kernel-only build; no host build).
+if [ "${KERNEL_ONLY:-0}" = "1" ]; then
+    compile_one_kernel "${1:-compute_kernel}"
+    _kret=$?
+    # 'return' when sourced (the normal wrapper case), 'exit' when run directly.
+    return $_kret 2>/dev/null || exit $_kret
+fi
 
 # Detect multi-kernel mode: check for kernel_<name>.cc files
 MULTI_KERNEL_FILES=()
@@ -58,15 +143,15 @@ if [ ${#MULTI_KERNEL_FILES[@]} -gt 0 ]; then
             KPRX="${WORKLOCAL_DIR}/aieml.prx"
         fi
 
-        # compile_kernel.sh compiles kernel.cc — for multi-kernel, temporarily symlink
+        # compile_one_kernel builds kernel.cc — for multi-kernel, temporarily symlink
         ln -sf "${kfname}" "${WORKLOCAL_DIR}/kernel.cc"
         if [ -n "$KPRX" ]; then
             ln -sf "$(basename "$KPRX")" "${WORKLOCAL_DIR}/aieml.prx"
         fi
 
-        WORKLOCAL_DIR="${WORKLOCAL_DIR}" source "${AIEHLC_ROOT}/script/compile_kernel.sh" "${kname}"
+        compile_one_kernel "${kname}"
         if [ $? -ne 0 ]; then
-            echo "Error: compile_kernel.sh failed for kernel ${kname}"
+            echo "Error: kernel build failed for kernel ${kname}"
             exit 1
         fi
         # Rename kernel.o to kernel_<name>.o to avoid overwriting
@@ -88,9 +173,9 @@ else
         fi
     fi
     pushd ${WORKLOCAL_DIR}
-    WORKLOCAL_DIR="${WORKLOCAL_DIR}" source "${AIEHLC_ROOT}/script/compile_kernel.sh" "${KERNEL_FUNC_NAME}"
+    compile_one_kernel "${KERNEL_FUNC_NAME}"
     if [ $? -ne 0 ]; then
-        echo "Error: compile_kernel.sh failed"
+        echo "Error: kernel build failed"
         exit 1
     fi
     echo "✓ Compiled kernel: ${BUILD_DIR}/kernel.o (func: ${KERNEL_FUNC_NAME})"
@@ -269,7 +354,7 @@ DEFS="-DAIE_GEN=${aie_version}"
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# Kernel .o file(s) are already built by compile_kernel.sh with canonical symbols
+# Kernel .o file(s) are already built by compile_one_kernel with canonical symbols
 # (_binary_kernel_<func_name>_{start,end,size})
 # KERNEL_OBJ_LIST is set above (single file or multiple files for multi-kernel)
 

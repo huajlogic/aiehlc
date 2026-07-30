@@ -124,8 +124,7 @@ Compilation happens at the `matmul[grid](...)` call. Output files are written to
 `./worklocal/`. From there, cross-compile with the normal scripts:
 
 ```bash
-WORKLOCAL_DIR=worklocal source script/compile_kernel.sh   # kernel ELF
-WORKLOCAL_DIR=worklocal source script/hostcompile.sh      # host ELF
+WORKLOCAL_DIR=worklocal source script/hostcompile.sh      # kernel + host ELF
 python3 script/test/apppaltest.py worklocal/build/host    # run on board
 ```
 
