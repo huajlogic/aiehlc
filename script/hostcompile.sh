@@ -42,6 +42,13 @@ if [ -z "${WORKLOCAL_DIR:-}" ]; then
 fi
 BUILD_DIR="${WORKLOCAL_DIR}/build"
 
+# Remember where the caller invoked us from. Several stages 'cd' into WORKLOCAL_DIR
+# and BUILD_DIR to resolve relative paths; when this script is *sourced* those cds
+# would otherwise leak into the caller's shell (leaving it in aout/worklocal/build).
+# Restore this at every return/exit point so 'source ./script/hostcompile.sh' keeps
+# the caller's working directory unchanged.
+_HOSTCOMPILE_ORIG_PWD="$(pwd)"
+
 KERNEL_FUNC_NAME="computekernel"   # default fallback; overridden by auto-detection below
 
 # ---------------------------------------------------------------------------
@@ -114,6 +121,8 @@ compile_one_kernel() {
 if [ "${KERNEL_ONLY:-0}" = "1" ]; then
     compile_one_kernel "${1:-compute_kernel}"
     _kret=$?
+    # compile_one_kernel cd'd into WORKLOCAL_DIR; restore the caller's dir before leaving.
+    cd "${_HOSTCOMPILE_ORIG_PWD}" 2>/dev/null || true
     # 'return' when sourced (the normal wrapper case), 'exit' when run directly.
     return $_kret 2>/dev/null || exit $_kret
 fi
@@ -494,3 +503,15 @@ echo "============================================"
 echo "Host built successfully: ${BUILD_DIR}/host"
 echo "============================================"
 ls -l host
+
+# Publish the freshly built ELF as aout/main.elf (the parent of WORKLOCAL_DIR is the
+# aout dir; apppaltest.py deploys aout/main.elf). Doing it here makes a plain
+# 'source ./script/hostcompile.sh' self-sufficient — no separate cp step needed.
+AOUT_DIR="$(dirname "${WORKLOCAL_DIR}")"
+cp -f "${BUILD_DIR}/host" "${AOUT_DIR}/main.elf"
+echo "Published: ${AOUT_DIR}/main.elf"
+ls -l "${AOUT_DIR}/main.elf"
+
+# Restore the caller's working directory (we cd'd into BUILD_DIR above). This keeps
+# 'source ./script/hostcompile.sh' from leaving the shell inside aout/worklocal/build.
+cd "${_HOSTCOMPILE_ORIG_PWD}"
