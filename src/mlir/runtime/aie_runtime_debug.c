@@ -1992,6 +1992,148 @@ void AieRt_PrintCoreTilePerfCountersAll(XAie_DevInst *dev, const XAie_LocType *t
 }
 
 /* ==========================================================================
+ * Performance profiling timeline (APU / DMA / Core busy)
+ *
+ * Whole-run cycle accounting; emits [PERF] lines parsed by aieperf.py.
+ * See aie_runtime_debug.h for the counter-allocation rationale.
+ * ========================================================================== */
+
+#include "aie_timer.h"
+#include <stdlib.h>
+
+/* CORE-module counter -> event allocation (whole-run level counting). */
+#define AIERT_PERF_C_ACTIVE 0u /* C0: ACTIVE            */
+#define AIERT_PERF_C_GSTALL 1u /* C1: GROUP_CORE_STALL  */
+#define AIERT_PERF_C_LOCK 2u   /* C2: LOCK_STALL        */
+#define AIERT_PERF_C_STREAM 3u /* C3: STREAM_STALL      */
+
+int AieRt_PerfEnabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("AIEHLC_PERF");
+        int env_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+        /* Also enabled via #pragma aie_debug_level(AIE_DEBUG_PERF). */
+        int flag_on = AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_PERF) ? 1 : 0;
+        cached = (env_on || flag_on) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Arm one CORE counter with Start==Stop==event, Reset=NONE, cleared to 0. */
+static void s_perf_arm_counter(XAie_DevInst *dev, XAie_LocType tile, u8 counter, XAie_Events event) {
+    XAie_PerfCounterReset(dev, tile, XAIE_CORE_MOD, counter);
+    XAie_PerfCounterControlReset(dev, tile, XAIE_CORE_MOD, counter);
+    XAie_PerfCounterResetControlReset(dev, tile, XAIE_CORE_MOD, counter);
+    XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, counter, event, event);
+}
+
+void AieRt_PerfProfileSetup(XAie_DevInst *dev, const uint8_t *cols, const uint8_t *rows, uint32_t num_tiles) {
+    if (!AieRt_PerfEnabled())
+        return;
+    printf("[PERF] setup ntiles=%u\n", (unsigned)num_tiles);
+    for (uint32_t i = 0; i < num_tiles; i++) {
+        XAie_LocType tile = XAie_TileLoc(cols[i], rows[i]);
+        if (!s_is_core(tile))
+            continue;
+        s_perf_arm_counter(dev, tile, AIERT_PERF_C_ACTIVE, XAIE_EVENT_ACTIVE_CORE);
+        s_perf_arm_counter(dev, tile, AIERT_PERF_C_GSTALL, XAIE_EVENT_GROUP_CORE_STALL_CORE);
+        s_perf_arm_counter(dev, tile, AIERT_PERF_C_LOCK, XAIE_EVENT_LOCK_STALL_CORE);
+        s_perf_arm_counter(dev, tile, AIERT_PERF_C_STREAM, XAIE_EVENT_STREAM_STALL_CORE);
+        /* Reset the tile timer so total window starts near zero. */
+        XAie_ResetTimer(dev, tile, XAIE_CORE_MOD);
+    }
+}
+
+/* Read one core tile's timer + 4 counters and print a [PERF] core line. */
+static void s_perf_collect_core(XAie_DevInst *dev, XAie_LocType tile) {
+    u64 total = 0;
+    uint32_t active = 0, gstall = 0, lock = 0, stream = 0;
+    XAie_ReadTimer(dev, tile, XAIE_CORE_MOD, &total);
+    XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, AIERT_PERF_C_ACTIVE, &active);
+    XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, AIERT_PERF_C_GSTALL, &gstall);
+    XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, AIERT_PERF_C_LOCK, &lock);
+    XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, AIERT_PERF_C_STREAM, &stream);
+    printf("[PERF] core c=%u r=%u total=%llu active=%u gstall=%u lock=%u stream=%u\n", (unsigned)tile.Col,
+           (unsigned)tile.Row, (unsigned long long)total, active, gstall, lock, stream);
+}
+
+/* Read one DMA channel's status and print a [PERF] dma line. */
+static void s_perf_collect_dma(XAie_DevInst *dev, XAie_LocType tile, uint8_t ch, XAie_DmaDirection dir) {
+    uint32_t raw = 0;
+    AieRC rc = AieRt_DmaGetChannelStatusFull(dev, tile, ch, dir, &raw);
+    AieRt_DmaChStatusDecoded d = AieRt_DecodeDmaChStatus(raw);
+    printf("[PERF] dma c=%u r=%u dir=%s ch=%u status=%u cur_bd=%u qsize=%u "
+           "stall_lock=%u stall_stream=%u rc=%d\n",
+           (unsigned)tile.Col, (unsigned)tile.Row, s_dir_str(dir), (unsigned)ch, (unsigned)d.status, (unsigned)d.cur_bd,
+           (unsigned)d.task_q_size, (unsigned)(d.stall_lock_acq || d.stall_lock_rel), (unsigned)d.stall_stream,
+           (int)rc);
+}
+
+void AieRt_PerfProfileCollect(XAie_DevInst *dev, const uint8_t *cols, const uint8_t *rows, uint32_t num_tiles,
+                              const uint8_t *io_cols, const uint8_t *io_rows, const uint8_t *io_chs,
+                              const uint8_t *io_dirs, uint32_t num_ios) {
+    if (!AieRt_PerfEnabled())
+        return;
+    printf("[PERF] collect ntiles=%u nios=%u\n", (unsigned)num_tiles, (unsigned)num_ios);
+    for (uint32_t i = 0; i < num_tiles; i++) {
+        XAie_LocType tile = XAie_TileLoc(cols[i], rows[i]);
+        if (s_is_core(tile))
+            s_perf_collect_core(dev, tile);
+    }
+    for (uint32_t i = 0; i < num_ios; i++) {
+        XAie_LocType tile = XAie_TileLoc(io_cols[i], io_rows[i]);
+        s_perf_collect_dma(dev, tile, io_chs[i], (XAie_DmaDirection)io_dirs[i]);
+    }
+}
+
+/* ---- APU (host) phase timing ---------------------------------------------
+ * Small name-keyed stack of open phases. XTime is converted to nanoseconds
+ * using COUNTS_PER_SECOND from aie_timer.h so all lanes share a ns axis.
+ */
+typedef struct {
+    const char *name;
+    XTime start;
+    int used;
+} AieRt_PerfPhase;
+
+static AieRt_PerfPhase s_perf_phases[AIERT_PERF_MAX_PHASES];
+
+static uint64_t s_xtime_to_ns(XTime t) {
+    /* ns = t * 1e9 / COUNTS_PER_SECOND; done in 128-bit-safe order. */
+    long double secs = (long double)t / (long double)COUNTS_PER_SECOND;
+    return (uint64_t)(secs * 1000000000.0L);
+}
+
+void AieRt_PerfPhaseBegin(const char *name) {
+    if (!AieRt_PerfEnabled() || !name)
+        return;
+    for (uint32_t i = 0; i < AIERT_PERF_MAX_PHASES; i++) {
+        if (!s_perf_phases[i].used) {
+            s_perf_phases[i].used = 1;
+            s_perf_phases[i].name = name;
+            XTime_GetTime(&s_perf_phases[i].start);
+            return;
+        }
+    }
+}
+
+void AieRt_PerfPhaseEnd(const char *name) {
+    if (!AieRt_PerfEnabled() || !name)
+        return;
+    XTime end;
+    XTime_GetTime(&end);
+    for (uint32_t i = 0; i < AIERT_PERF_MAX_PHASES; i++) {
+        if (s_perf_phases[i].used && s_perf_phases[i].name && strcmp(s_perf_phases[i].name, name) == 0) {
+            printf("[PERF] apu phase=%s start_ns=%llu end_ns=%llu\n", name,
+                   (unsigned long long)s_xtime_to_ns(s_perf_phases[i].start), (unsigned long long)s_xtime_to_ns(end));
+            s_perf_phases[i].used = 0;
+            s_perf_phases[i].name = 0;
+            return;
+        }
+    }
+}
+
+/* ==========================================================================
  * Shim DMA Loopback Debug API
  *
  * Performs a DDR→ShimDMA→DDR loopback test on a single shim tile column.

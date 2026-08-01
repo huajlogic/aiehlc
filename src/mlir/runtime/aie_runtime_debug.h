@@ -680,6 +680,83 @@ void AieRt_PrintCoreTilePerfCounters(XAie_DevInst *dev, XAie_LocType tile);
 void AieRt_PrintCoreTilePerfCountersAll(XAie_DevInst *dev, const XAie_LocType *tiles, uint32_t num_tiles);
 
 /* --------------------------------------------------------------------------
+ * Performance profiling timeline (APU / DMA / Core busy)
+ *
+ * Whole-run cycle accounting for a low-performance diagnosis. Emits
+ * structured [PERF] lines to stdout that src/tool/debug/aieperf.py parses
+ * into a Chrome trace (perfetto) with three lanes:
+ *   - APU   : host wall-clock per runtime phase.
+ *   - DMA   : per shim/mem channel finished-BD counts.
+ *   - core  : per-core cycle accounting (active vs stall-by-type).
+ *
+ * Counter allocation (CORE module, 4 counters, whole-run level counting):
+ *   C0 = ACTIVE            (compute cycles)
+ *   C1 = GROUP_CORE_STALL  (total stall cycles)
+ *   C2 = LOCK_STALL        (sync / data-dependency stall)
+ *   C3 = STREAM_STALL      (DMA-starved / stream stall)
+ * Each counter uses Start==Stop==event so it increments every cycle the
+ * event is asserted over the whole run; Reset event = NONE. Total window
+ * cycles come from XAie_ReadTimer (a separate 64-bit timer, no counter slot).
+ * DISABLED and MEMORY+CASCADE stall are derived arithmetically downstream.
+ *
+ * All entry points are no-ops unless AieRt_PerfEnabled() (env AIEHLC_PERF=1).
+ * -------------------------------------------------------------------------- */
+
+/* Max number of concurrently-open APU phases tracked by name. */
+#define AIERT_PERF_MAX_PHASES 32
+
+/**
+ * Returns non-zero when perf profiling is enabled (env AIEHLC_PERF=1).
+ * The environment is read once and cached.
+ */
+int AieRt_PerfEnabled(void);
+
+/**
+ * Arm the 4 CORE-module perf counters and reset the timer on each core tile.
+ * Non-core tiles in the list are skipped. No-op unless AieRt_PerfEnabled().
+ *
+ * @param dev        Device instance.
+ * @param cols       Column of each tile.
+ * @param rows       Row of each tile (parallel to cols).
+ * @param num_tiles  Length of cols/rows.
+ */
+void AieRt_PerfProfileSetup(XAie_DevInst *dev, const uint8_t *cols, const uint8_t *rows, uint32_t num_tiles);
+
+/**
+ * Read the timer + 4 CORE counters per core tile and the finished-BD counts
+ * per DMA channel, printing one [PERF] core / [PERF] dma line each.
+ * No-op unless AieRt_PerfEnabled().
+ *
+ * @param dev        Device instance.
+ * @param cols       Column of each core tile.
+ * @param rows       Row of each core tile (parallel to cols).
+ * @param num_tiles  Length of cols/rows.
+ * @param io_cols    Column of each DMA channel endpoint.
+ * @param io_rows    Row of each DMA channel endpoint (parallel to io_cols).
+ * @param io_chs     Channel id of each endpoint.
+ * @param io_dirs    Direction of each endpoint (0=MM2S, 1=S2MM).
+ * @param num_ios    Length of the io_* arrays.
+ */
+void AieRt_PerfProfileCollect(XAie_DevInst *dev, const uint8_t *cols, const uint8_t *rows, uint32_t num_tiles,
+                              const uint8_t *io_cols, const uint8_t *io_rows, const uint8_t *io_chs,
+                              const uint8_t *io_dirs, uint32_t num_ios);
+
+/**
+ * Mark the start of a host (APU) phase. Captures a wall-clock timestamp
+ * under the given name. Pair with AieRt_PerfPhaseEnd(name). Names are matched
+ * by pointer/content; up to AIERT_PERF_MAX_PHASES concurrent phases.
+ * No-op unless AieRt_PerfEnabled().
+ */
+void AieRt_PerfPhaseBegin(const char *name);
+
+/**
+ * Mark the end of a host (APU) phase started with AieRt_PerfPhaseBegin(name).
+ * Prints: [PERF] apu phase=<name> start_ns=<..> end_ns=<..>
+ * No-op unless AieRt_PerfEnabled().
+ */
+void AieRt_PerfPhaseEnd(const char *name);
+
+/* --------------------------------------------------------------------------
  * Shim DMA Loopback
  *
  * Self-contained DDR→ShimDMA→DDR loopback test. Allocates src/dst DDR

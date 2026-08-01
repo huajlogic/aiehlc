@@ -55,7 +55,10 @@ XAie_DevInst *getOrCreateDeviceInstance(void);
 // back. These are the same counters aiegdb.py "dma counter" reads (0x11020/24).
 #define AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER (1 << 6)
 // bit 7 reserved
-// bit 8 reserved
+/* When set, enable perf profiling (CORE perf counters + timer + phase timing)
+ * without requiring the AIEHLC_PERF=1 env var. Makes AieRt_PerfEnabled() true.
+ * Usage: #pragma aie_debug_level(AIE_DEBUG_PERF) */
+#define AIE_DEBUG_PERF (1 << 8)
 /* When set, enable informational runtime log output (AIEHLC_LOG).
  * Usage: #pragma aie_debug_level(AIE_DEBUG_LOG) */
 #define AIE_DEBUG_LOG (1 << 9)

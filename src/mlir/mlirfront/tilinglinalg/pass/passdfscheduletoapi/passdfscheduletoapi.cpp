@@ -2167,6 +2167,66 @@ static void emitDebugSnapshotVerbatim(OpBuilder &rewriter, Location loc, const C
     rewriter.create<emitc::VerbatimOp>(loc, "}");
 }
 
+/// Helper: emit AieRt_PerfProfileSetup or AieRt_PerfProfileCollect verbatim.
+/// Reuses the same tile/io coordinate lists as the debug snapshot. Setup arms
+/// the CORE perf counters + timer before the cores run; Collect reads them
+/// (plus per-channel DMA status) after the wait. Both are no-ops at runtime
+/// unless AIEHLC_PERF=1, but we also gate emission-side output on the perf
+/// helpers themselves (they self-check AieRt_PerfEnabled()).
+static void emitPerfProfileVerbatim(OpBuilder &rewriter, Location loc, const ConversionState &state, bool isSetup) {
+    auto buildArrayInit = [](const std::string &type, const std::string &name,
+                             const std::vector<std::string> &vals) -> std::string {
+        std::string s = type + " " + name + "[] = {";
+        for (size_t i = 0; i < vals.size(); ++i) {
+            if (i)
+                s += ", ";
+            s += vals[i];
+        }
+        return s + "};";
+    };
+
+    std::vector<std::string> tcols, trows;
+    for (auto &t : state.debugTiles) {
+        tcols.push_back(std::to_string(t.col));
+        trows.push_back(std::to_string(t.row));
+    }
+    if (tcols.empty())
+        return; /* nothing to profile */
+
+    size_t M = state.debugTiles.size();
+    std::string suffix = isSetup ? "_perf_s" : "_perf_c";
+
+    rewriter.create<emitc::VerbatimOp>(loc, std::string("/* AieRt perf profile ") + (isSetup ? "setup" : "collect") +
+                                                " (gated by AIEHLC_PERF=1) */");
+    rewriter.create<emitc::VerbatimOp>(loc, "{");
+    rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_t_cols" + suffix, tcols));
+    rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_t_rows" + suffix, trows));
+
+    if (isSetup) {
+        std::string call =
+            "  AieRt_PerfProfileSetup(dev, _t_cols" + suffix + ", _t_rows" + suffix + ", " + std::to_string(M) + ");";
+        rewriter.create<emitc::VerbatimOp>(loc, call);
+    } else {
+        std::vector<std::string> cols, rows, chs, dirs;
+        for (auto &io : state.debugIos) {
+            cols.push_back(std::to_string(io.col));
+            rows.push_back(std::to_string(io.row));
+            chs.push_back(std::to_string(io.channel));
+            dirs.push_back(io.direction);
+        }
+        size_t N = state.debugIos.size();
+        rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_io_cols" + suffix, cols));
+        rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_io_rows" + suffix, rows));
+        rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_io_chs" + suffix, chs));
+        rewriter.create<emitc::VerbatimOp>(loc, "  " + buildArrayInit("uint8_t", "_io_dirs" + suffix, dirs));
+        std::string call = "  AieRt_PerfProfileCollect(dev, _t_cols" + suffix + ", _t_rows" + suffix + ", " +
+                           std::to_string(M) + ",\n      _io_cols" + suffix + ", _io_rows" + suffix + ", _io_chs" +
+                           suffix + ", _io_dirs" + suffix + ", " + std::to_string(N) + ");";
+        rewriter.create<emitc::VerbatimOp>(loc, call);
+    }
+    rewriter.create<emitc::VerbatimOp>(loc, "}");
+}
+
 /// Outer pattern for dfschedule.host -> emitc.func (simple shell only)
 /// The inner ops are already converted by the host inner pattern phase
 struct HostOpOuterPattern : public ConversionPattern {
@@ -2222,6 +2282,11 @@ struct HostOpOuterPattern : public ConversionPattern {
             // by the well-known name "dev" instead of the auto-generated EmitC name (v1).
             rewriter.create<emitc::VerbatimOp>(loc, "XAie_DevInst* dev = v1;");
 
+            // Arm CORE perf counters + timer before the launch/wait ops run.
+            // No-op at runtime unless AIEHLC_PERF=1.
+            emitPerfProfileVerbatim(rewriter, loc, state, /*isSetup=*/true);
+            rewriter.create<emitc::VerbatimOp>(loc, "AieRt_PerfPhaseBegin(\"kernel_window\");");
+
             for (Operation &nestedOp : llvm::make_early_inc_range(srcBlock->getOperations())) {
                 if (!nestedOp.hasTrait<OpTrait::IsTerminator>()) {
                     nestedOp.moveBefore(entryBlock, entryBlock->end());
@@ -2231,6 +2296,11 @@ struct HostOpOuterPattern : public ConversionPattern {
 
         // Add return at the end (optionally preceded by debug snapshot)
         rewriter.setInsertionPointToEnd(entryBlock);
+
+        // Close the kernel-window APU phase, then read perf counters after the
+        // wait (all launch/wait ops now precede us).
+        rewriter.create<emitc::VerbatimOp>(loc, "AieRt_PerfPhaseEnd(\"kernel_window\");");
+        emitPerfProfileVerbatim(rewriter, loc, state, /*isSetup=*/false);
 
         if (state.enableDebug && !state.debugIos.empty()) {
             emitDebugSnapshotVerbatim(rewriter, loc, state);
