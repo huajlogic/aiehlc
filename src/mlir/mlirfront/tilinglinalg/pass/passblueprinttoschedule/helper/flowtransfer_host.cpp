@@ -1163,10 +1163,6 @@ void FlowTransferConversion::emitScheduleStraightLine(FlowLoweringCtx &c) const 
                          << "repeatCount " << repeatCount << " -> 1\n";
         repeatCount = 1;
     }
-    auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
-        loc, dfschedule::EventType::get(rewriter.getContext()), c.createIoOp.getIoHandle(), c.getBdIdOp.getBdId(),
-        rewriter.getI32IntegerAttr(c.flowIndex), rewriter.getI32IntegerAttr(repeatCount));
-
     auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
         loc, dfschedule::KernelGroupType::get(rewriter.getContext()), c.coreTiles, rewriter.getArrayAttr(c.calleeAttrs),
         rewriter.getArrayAttr(c.computeKernelAttrs), nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
@@ -1175,6 +1171,8 @@ void FlowTransferConversion::emitScheduleStraightLine(FlowLoweringCtx &c) const 
         loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());
 
     // Emit deferred core StartIoOp calls AFTER kernel load/launch
+    llvm::errs() << "[emitScheduleStraightLine] flowIdx=" << c.flowIndex << " shimIsSender=" << c.shimIsSender
+                 << " deferredCoreStartIos.size()=" << c.deferredCoreStartIos.size() << "\n";
     SmallVector<Value> coreStartIoEvents;
     for (auto &deferred : c.deferredCoreStartIos) {
         auto coreStartIo = rewriter.create<dfschedule::StartIoOp>(
@@ -1182,6 +1180,10 @@ void FlowTransferConversion::emitScheduleStraightLine(FlowLoweringCtx &c) const 
             rewriter.getI32IntegerAttr(deferred.flowIdx), rewriter.getI32IntegerAttr(deferred.repeatCount));
         coreStartIoEvents.push_back(coreStartIo.getEvent());
     }
+
+    auto startIoOp = rewriter.create<dfschedule::StartIoOp>(
+        loc, dfschedule::EventType::get(rewriter.getContext()), c.createIoOp.getIoHandle(), c.getBdIdOp.getBdId(),
+        rewriter.getI32IntegerAttr(c.flowIndex), rewriter.getI32IntegerAttr(repeatCount));
 
     // Determine whether to bypass input sending IO wait.
     bool bypassInputIoWait = false;
