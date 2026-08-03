@@ -31,6 +31,7 @@ Protocol smoke test:               mcp dev src/tool/debug/debug_ui_mcp.py
 import json
 import os
 import sys
+import urllib.request
 
 from mcp.server.fastmcp import FastMCP
 
@@ -40,9 +41,55 @@ mcp = FastMCP("debugui")
 _VIEW_CACHE = {"path": None, "data": None}
 
 
+def _daemon_url():
+    return (os.environ.get("DEBUGUI_SERVER_URL") or "").rstrip("/")
+
+
+def _daemon_get(path, timeout=3.0):
+    """GET JSON from the schedule_debug_server. Returns None when the daemon is
+    unreachable, so every tool degrades to the static env-dir behaviour."""
+    base = _daemon_url()
+    if not base:
+        return None
+    try:
+        with urllib.request.urlopen(base + path, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _daemon_post(path, payload, timeout=5.0):
+    base = _daemon_url()
+    if not base:
+        return None
+    try:
+        req = urllib.request.Request(
+            base + path, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _current_app_dir():
+    """Workdir of the app the user currently has loaded, asked of the daemon so
+    the agent follows the human's app selection. None when standalone."""
+    apps = _daemon_get("/apps")
+    if not apps:
+        return None
+    for a in apps.get("apps", []):
+        if a.get("current"):
+            return a.get("path")
+    return None
+
+
 def _view_candidates():
     """Candidate schedule_view.json paths, in priority order."""
     out = []
+    cur = _current_app_dir()
+    if cur:
+        out.append(os.path.join(cur, "schedule_view.json"))
     for env in ("DEBUGUI_JSON_DIR", "AIEMCP_JSON_DIR"):
         d = os.environ.get(env)
         if d:
@@ -774,6 +821,141 @@ def get_ipc_log(lines: int = 100, side: str = "both") -> str:
         else:
             parts.append("--- server IPC log (%s) ---\n%s" % (server_log, "\n".join(rows)))
     return "\n\n".join(parts) if parts else "(no logs found)"
+
+
+@mcp.tool()
+def list_apps() -> str:
+    """List the compiled apps the debug UI can load, newest first.
+
+    Apps come from both producer flows: aiehlc_aiesim builds under aout/, and
+    naiebaremetal examples whose provenance was generated from an aiecompiler
+    Work/ dir. The one marked (current) is what the UI is showing now.
+    """
+    apps = _daemon_get("/apps")
+    if apps is None:
+        return ("daemon not reachable (DEBUGUI_SERVER_URL unset or server down); "
+                "running against %s" % (_VIEW_CACHE.get("path") or "auto-detected dir"))
+    rows = []
+    for a in apps.get("apps", []):
+        caps = [k for k in ("has_sim", "has_hw") if a.get(k)]
+        rows.append("%s %-22s %-14s %s" % ("*" if a.get("current") else " ",
+                                           a.get("id"),
+                                           ",".join(c[4:] for c in caps) or "view-only",
+                                           a.get("path")))
+    return "\n".join(rows) if rows else "(no apps registered)"
+
+
+@mcp.tool()
+def current_app() -> str:
+    """Which app the UI currently has loaded, with its capabilities."""
+    apps = _daemon_get("/apps")
+    if apps is None:
+        p = _VIEW_CACHE.get("path")
+        return "daemon not reachable; static view = %s" % (p or "auto-detected")
+    for a in apps.get("apps", []):
+        if a.get("current"):
+            return json.dumps(a, indent=2)
+    return "(no app selected)"
+
+
+@mcp.tool()
+def select_app(app_id: str) -> str:
+    """Switch the debug UI to another app. The browser picks it up on reload.
+
+    Refused while a run is in progress: an app carries its own board/PDI/ELF
+    profile, so swapping mid-run could target the wrong hardware config.
+    """
+    r = _daemon_post("/apps/select", {"id": app_id})
+    if r is None:
+        return "daemon not reachable (DEBUGUI_SERVER_URL unset or server down)"
+    if r.get("error"):
+        return "error: %s" % r["error"]
+    _VIEW_CACHE["path"] = None
+    _VIEW_CACHE["data"] = None
+    return "switched to %s (%s)" % (r.get("id"), r.get("path"))
+
+
+@mcp.tool()
+def get_ui_state() -> str:
+    """What the user currently has open in the debug UI.
+
+    Reports the selected tile, active tile tab (hi/mid/lo), active net-detail
+    tab, which console pane is showing, and the selected channel/flow — so you
+    can answer questions about the view in front of the human instead of
+    guessing.
+    """
+    st = _daemon_get("/uistate")
+    if st is None:
+        return "daemon not reachable (DEBUGUI_SERVER_URL unset or server down)"
+    if not st:
+        return "(no UI state reported yet — the user has not interacted, or the page predates this feature)"
+    return json.dumps(st, indent=2)
+
+
+_PANES = {
+    "grid":        "tile grid overview (no selector)",
+    "tile.hi":     "tile high-level pane — needs col,row",
+    "tile.mid":    "tile middle IR (dfschedule) pane — needs col,row",
+    "tile.lo":     "tile low-level host.cc pane — needs col,row",
+    "tile.kernel": "tile kernel match/source pane — needs col,row",
+    "tile.supply": "tile supply/demand rollup — needs col,row",
+    "net.flow":    "flow / communication-path detail — needs flow",
+    "search":      "search results — needs query",
+}
+
+
+@mcp.tool()
+def list_panes() -> str:
+    """List the UI panes you can read with get_pane, and their selectors."""
+    return "\n".join("%-14s %s" % (k, v) for k, v in _PANES.items())
+
+
+@mcp.tool()
+def get_pane(pane: str, col: int = -1, row: int = -1, flow: int = -1,
+             query: str = "") -> str:
+    """Read the content of a major UI pane for the currently loaded app.
+
+    This is the same content the human sees in that pane. Use list_panes() for
+    the pane ids and which selector each needs, and get_ui_state() to find out
+    what the user currently has selected.
+    """
+    view = _load_view()
+    if view is None:
+        return "error: no schedule_view.json found for the current app"
+    if pane not in _PANES:
+        return "unknown pane %r; known: %s" % (pane, ", ".join(sorted(_PANES)))
+
+    if pane == "grid":
+        return tile_list()
+    if pane == "search":
+        if not query:
+            return "error: pane 'search' needs query"
+        return symbol_search(query)
+    if pane == "net.flow":
+        if flow < 0:
+            return "error: pane 'net.flow' needs flow"
+        return get_flow_detail(flow)
+
+    if col < 0 or row < 0:
+        return "error: pane %r needs col and row" % pane
+    tile = _find_tile(view, col, row)
+    if tile is None:
+        return "error: no tile (%d,%d) in the current app" % (col, row)
+    # The _section_*/_fmt_* helpers return line lists (tile_info joins them).
+    sections = {
+        "tile.hi": _section_hi,
+        "tile.mid": _section_mid,
+        "tile.lo": _section_lo,
+        "tile.kernel": _fmt_kernel_match,
+        "tile.supply": _fmt_supply_demand,
+    }
+    fn = sections.get(pane)
+    if fn is None:
+        return "unhandled pane %r" % pane
+    out = fn(tile)
+    if not out:
+        return "(pane %s is empty for tile (%d,%d) in this app)" % (pane, col, row)
+    return "\n".join(out) if isinstance(out, list) else str(out)
 
 
 if __name__ == "__main__":
