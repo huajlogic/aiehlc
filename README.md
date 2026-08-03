@@ -372,6 +372,73 @@ the enhanced HTML, exposes JSON endpoints, imports `aiediag.py` as a library for
 offsets/decoders/provenance, and orchestrates `apppaltest.py`. Design rationale:
 [doc/design/live_debug_framework.md](doc/design/live_debug_framework.md).
 
+#### Multi-app mode
+
+The daemon is not tied to one compiled app. It discovers app *bundles* — any directory
+holding a `schedule_view.json` — and injects the selected app's data into the page when
+serving it, so switching apps in the **App** dropdown reloads the whole UI against a
+different build. One daemon can therefore serve builds from several repos at once.
+
+```bash
+# standalone: auto-discovers aout/** and opens the most recently compiled app
+python3 src/tool/debug/schedule_debug_server.py
+
+# add apps from another repo (naiebaremetal examples) and a saved snapshot
+python3 src/tool/debug/schedule_debug_server.py \
+    --app-root ../naiebaremetal/example \
+    --app doc/debug/int32_deadlock_snapshot/worklocal=int32-deadlock
+```
+
+| flag | meaning |
+|---|---|
+| *(positional)* `workdir` | still accepted; registered as an app (backwards compatible) |
+| `--app PATH[=LABEL]` | register one app explicitly, repeatable, may live in another repo |
+| `--app-root DIR` | scan a tree for app workdirs, repeatable |
+
+Switching an app also switches that app's **run profile** — the `extra_devices`
+(simulator / board, `hw_env`, PDI and ELF paths) from its `debug_ui_config.json` — plus
+`startcol` and `aie_version` from its provenance JSONs. Switching is refused while a run
+is in progress, since the profile carries board and image paths.
+
+Endpoints: `GET /apps`, `POST /apps/select {id}`, `POST /apps/add {path,label,select}`,
+`GET|POST /uistate`. Note these are unauthenticated, like the daemon's other non-LLM
+endpoints (`--password` gates only the LLM tab).
+
+Both producer flows feed the same consumer:
+
+```
+aiehlc_aiesim: compiler passes ────────────────► provenance JSONs ─┐
+                                                                   ├─► schedule_view.py ─► app bundle
+naiebaremetal: aiecompiler Work/ ─► work2provenance.py ────────────┘
+```
+
+`schedule_view.py <workdir> --json-only` writes just `schedule_view.json` (+ the per-app
+code cache) and skips the ~1.6 MB standalone HTML, which is what the daemon-served flow
+wants. naiebaremetal's `src/tool/run_debug_ui.sh` uses this and registers the result with
+an already-running daemon via `/apps/add` instead of starting a second server.
+
+Note the per-tile code cache lives under `<workdir>/debugcache/code` so two apps cannot
+overwrite each other's pieces (the paths are handed to the embedded agent to read).
+
+#### debug_ui_mcp — the embedded agent's view of the UI
+
+`src/tool/debug/debug_ui_mcp.py` is the MCP server the browser's LLM tab talks to. It
+follows whatever app the human has selected (the daemon tells it via
+`DEBUGUI_SERVER_URL`) and can read both the UI's contents and its current state:
+
+| tool | purpose |
+|---|---|
+| `list_apps` / `current_app` / `select_app` | see and change which compiled app is loaded |
+| `list_panes` | which panes are readable and what selector each needs |
+| `get_pane(pane, col, row, flow, query)` | the content of a pane: `grid`, `tile.hi`, `tile.mid`, `tile.lo`, `tile.kernel`, `tile.supply`, `net.flow`, `search` |
+| `get_ui_state` | what the user has open right now — selected tile, active tile tab, net tab, console pane, channel, flow |
+| `tile_info`, `tile_list`, `symbol_search`, `get_design_overview`, `get_flow_detail`, `get_applog`, `get_sim_log`, `get_backend_status` | existing static-schedule tools, now app-aware |
+
+The browser reports selection changes to `POST /uistate`, so the agent can answer
+questions about the view in front of you rather than guessing. Tools degrade gracefully
+when an app lacks optional data (e.g. naiebaremetal bundles have no `invariant_checks`,
+and `backend_status.json` is only present once a run profile exists).
+
 It lets you, from a single browser page:
 
 1. **Run the test** — deploy the compiled ELF via `apppaltest.py -nonreboot` and watch the
