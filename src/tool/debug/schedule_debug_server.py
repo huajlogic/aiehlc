@@ -172,6 +172,30 @@ def _load_ui_config(workdir):
         return {}
 
 
+def _detect_aiesim_device(workdir):
+    """Synthesize a Simulator device for aiehlc apps built with --platform sim.
+
+    naiebaremetal declares its IPC simulator in debug_ui_config.json; aiehlc has
+    a different simulator (script/runsim.sh driving the Vitis aie2pssimmsm
+    model) and writes no such config. It is detectable instead: aiehlc.sh's
+    write_sim_config drops a sim_config.sh next to the build. Returns a device
+    dict tagged sim_kind='aiesim', or None when this app has no sim build.
+    """
+    runsim = os.path.join(_REPO_ROOT, "script", "runsim.sh")
+    if not os.path.isfile(runsim):
+        return None
+    for cand in (workdir, os.path.dirname(workdir.rstrip(os.sep))):
+        if cand and os.path.isfile(os.path.join(cand, "sim_config.sh")):
+            return {
+                "value": "simulator",
+                "label": "Simulator (aiesim)",
+                "sim_script": runsim,
+                "sim_example_dir": cand,
+                "sim_kind": "aiesim",
+            }
+    return None
+
+
 def _resolve_default_elf(workdir):
     """Pick the project's default tiling ELF when --elf is omitted.
 
@@ -193,6 +217,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 import aiediag  # noqa: E402
 import aiegdb  # noqa: E402
+import schedule_view  # noqa: E402  (render_html for server-side app injection)
 
 # pexpect drives the interactive ssh -> systest -> xsdb -> hw_server recovery
 # session (see DebugState.start_hwserver_async). Optional: without it the auto-start
@@ -231,6 +256,129 @@ def _parse_dir_ch(dir_ch):
             if tail.isdigit():
                 return d, int(tail)
     return None, None
+
+
+class App:
+    """One loadable app: a workdir bundle produced by schedule_view.py.
+
+    Both producer flows land here — aiehlc's compiler passes emit the provenance
+    JSONs directly, naiebaremetal's work2provenance.py derives them from an
+    aiecompiler Work/ dir — so an app is identified purely by the bundle it
+    contains, not by which repo built it.
+    """
+
+    def __init__(self, path, label=None):
+        self.path = os.path.abspath(path)
+        base = os.path.basename(self.path)
+        parent = os.path.basename(os.path.dirname(self.path))
+        self.id = parent if base == "worklocal" and parent else base
+        self.label = label or self.id
+        self._view = None
+        self._view_mtime = None
+
+    @property
+    def view_json(self):
+        return os.path.join(self.path, "schedule_view.json")
+
+    @property
+    def mtime(self):
+        try:
+            return os.path.getmtime(self.view_json)
+        except OSError:
+            return 0.0
+
+    def caps(self):
+        """Per-app capabilities. The two producer flows differ only in optional
+        bundle files, so consumers must check rather than assume. Must agree
+        with what _load_app_profile puts in /devices, including the aiesim
+        device auto-detected from sim_config.sh."""
+        ui_cfg = _load_ui_config(self.path)
+        devs = list(ui_cfg.get("extra_devices", []) or [])
+        if not any(d.get("value") == "simulator" for d in devs):
+            auto = _detect_aiesim_device(self.path)
+            if auto:
+                devs.append(auto)
+        return {
+            "has_ui_config": bool(ui_cfg),
+            "has_backend_status": os.path.isfile(
+                os.path.join(self.path, "backend_status.json")),
+            "has_sim": any(d.get("sim_script") for d in devs),
+            "has_hw": any(d.get("hw_run_script") for d in devs),
+        }
+
+    def load_view(self):
+        """Parsed schedule_view.json, cached until the file changes on disk so a
+        rebuild is picked up on the next page load."""
+        m = self.mtime
+        if self._view is None or self._view_mtime != m:
+            with open(self.view_json) as f:
+                self._view = json.load(f)
+            self._view_mtime = m
+        return self._view
+
+    def info(self, current=False):
+        d = {"id": self.id, "label": self.label, "path": self.path,
+             "mtime": self.mtime, "current": current}
+        d.update(self.caps())
+        return d
+
+
+class AppRegistry:
+    """Discovers loadable apps: aout/** in this repo, plus explicit --app paths
+    and --app-root trees (e.g. ../naiebaremetal/example)."""
+
+    def __init__(self, explicit=None, roots=None, auto_roots=None):
+        self._apps = {}
+        self._order = []
+        for spec in (explicit or []):
+            path, _, label = spec.partition("=")
+            self._add(path, label or None)
+        for root in (roots or []):
+            self._scan(root)
+        for root in (auto_roots or []):
+            self._scan(root)
+
+    def _add(self, path, label=None):
+        path = os.path.abspath(path)
+        if not os.path.isfile(os.path.join(path, "schedule_view.json")):
+            return None
+        app = App(path, label)
+        if app.id in self._apps and self._apps[app.id].path != path:
+            n = 2
+            while f"{app.id}-{n}" in self._apps:
+                n += 1
+            app.id = f"{app.id}-{n}"
+        if app.id not in self._apps:
+            self._apps[app.id] = app
+            self._order.append(app.id)
+        return self._apps[app.id]
+
+    def _scan(self, root, max_depth=4):
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            return
+        root_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath.count(os.sep) - root_depth > max_depth:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames
+                           if d not in (".git", "debugcache", "build", "Work")]
+            if "schedule_view.json" in filenames:
+                self._add(dirpath)
+                dirnames[:] = []
+
+    def list(self):
+        """Apps newest-first by schedule_view.json mtime."""
+        return sorted((self._apps[i] for i in self._order),
+                      key=lambda a: a.mtime, reverse=True)
+
+    def get(self, app_id):
+        return self._apps.get(app_id)
+
+    def default(self):
+        apps = self.list()
+        return apps[0] if apps else None
 
 
 class DebugState:
@@ -307,16 +455,16 @@ class DebugState:
         self._mcp_config_path = None
         self._mcp_config_backend = None
 
-        ui_cfg = _load_ui_config(self.workdir)
-        self._extra_devices = ui_cfg.get("extra_devices", [])
-        sim_dev = next((d for d in self._extra_devices
-                        if d.get("value") == "simulator"), None)
-        self.sim_script = sim_dev.get("sim_script") if sim_dev else None
-        self.sim_example_dir = sim_dev.get("sim_example_dir") if sim_dev else None
-        self.sim_log = (os.path.join(self.sim_example_dir, "ipc_sim.log")
-                        if self.sim_example_dir else None)
-        self.sim_applog = (os.path.join(self.sim_example_dir, "ipc_app.log")
-                           if self.sim_example_dir else None)
+        # App registry + last-reported browser UI state (set by main()).
+        # self_url is filled in once the port is known so the debugui MCP can
+        # call back for /apps and /uistate.
+        self.registry = None
+        self.app = None
+        self.self_url = None
+        self._uistate = {}
+        self._uistate_lock = threading.Lock()
+
+        self._load_app_profile(self.workdir)
         self._sim_lock = threading.Lock()
         self._sim_proc = None     # subprocess.Popen or None
         self._sim_fh = None
@@ -327,6 +475,107 @@ class DebugState:
             _load_aie_addr_params(self.sim_example_dir)
             if self.sim_example_dir else None
         )
+
+    # ---- per-app profile -------------------------------------------------
+    def _load_app_profile(self, workdir):
+        """(Re)resolve everything that belongs to one app: its run profile from
+        debug_ui_config.json plus the sim paths derived from it. Called at
+        construction and again on every /apps/select."""
+        ui_cfg = _load_ui_config(workdir)
+        self._extra_devices = list(ui_cfg.get("extra_devices", []))
+        sim_dev = next((d for d in self._extra_devices
+                        if d.get("value") == "simulator"), None)
+        if sim_dev is None:
+            sim_dev = _detect_aiesim_device(workdir)
+            if sim_dev:
+                self._extra_devices.append(sim_dev)
+        self.sim_kind = (sim_dev or {}).get("sim_kind", "ipc")
+        self.sim_script = sim_dev.get("sim_script") if sim_dev else None
+        self.sim_example_dir = sim_dev.get("sim_example_dir") if sim_dev else None
+        if self.sim_example_dir and self.sim_kind == "aiesim":
+            # runsim.sh streams everything to stdout; there is no separate app log.
+            self.sim_log = os.path.join(workdir, "aiesim.log")
+            self.sim_applog = None
+        else:
+            self.sim_log = (os.path.join(self.sim_example_dir, "ipc_sim.log")
+                            if self.sim_example_dir else None)
+            self.sim_applog = (os.path.join(self.sim_example_dir, "ipc_app.log")
+                               if self.sim_example_dir else None)
+
+    def select_app(self, app_id):
+        """Switch the whole server to another app. Refuses mid-run because the
+        run profile carries board IPs / PDIs / ELF paths — swapping it under a
+        live run could deploy one app's image against another's board config."""
+        if self.registry is None:
+            return {"error": "app registry not initialised"}
+        app = self.registry.get(app_id)
+        if app is None:
+            return {"error": f"unknown app: {app_id}"}
+        if self.run_in_progress() or self.sim_running():
+            return {"error": "cannot switch apps while a run is in progress"}
+
+        self.app = app
+        self.workdir = app.path
+        self._tiles = None
+        self._llm_log_dir = app.path
+        self.elf = _resolve_default_elf(app.path)
+        self._load_app_profile(app.path)
+        self._sim_addr_params = (_load_aie_addr_params(self.sim_example_dir)
+                                 if self.sim_example_dir else None)
+        # startcol / aie_version come from this app's provenance JSONs.
+        dfsche, dmaphop = aiediag.load_jsons(app.path)
+        sc = aiediag.startcol_from_jsons(dfsche, dmaphop)
+        if sc is not None:
+            self.startcol = int(sc)
+        av = aiediag.aie_version_from_jsons(dfsche, dmaphop)
+        if av:
+            self.aie_version = str(av)
+        # The MCP config embeds the app dir; force a rewrite on next spawn.
+        self._mcp_config_path = None
+        with self._uistate_lock:
+            self._uistate = {}
+        return {"ok": True, **app.info(current=True),
+                "startcol": self.startcol, "aie_version": self.aie_version}
+
+    def add_app(self, path, label=None, select=False):
+        """Register an app workdir with a running daemon. Lets a producer flow
+        (e.g. naiebaremetal's run_debug_ui.sh) hand its freshly generated bundle
+        to the shared server instead of starting a second one."""
+        if self.registry is None:
+            return {"error": "app registry not initialised"}
+        if not path:
+            return {"error": "path required"}
+        app = self.registry._add(path, label)
+        if app is None:
+            return {"error": f"no schedule_view.json in {path}"}
+        if select:
+            return self.select_app(app.id)
+        return {"ok": True, **app.info(current=bool(self.app and self.app.id == app.id))}
+
+    def apps_info(self):
+        if self.registry is None:
+            return []
+        cur = self.app.id if self.app else None
+        return [a.info(current=(a.id == cur)) for a in self.registry.list()]
+
+    def set_uistate(self, state):
+        """Record what the browser currently has open so the agent can see it."""
+        if not isinstance(state, dict):
+            return {"error": "uistate must be an object"}
+        state = dict(state)
+        state["app"] = self.app.id if self.app else None
+        state["ts"] = time.time()
+        with self._uistate_lock:
+            self._uistate = state
+        return {"ok": True}
+
+    def get_uistate(self):
+        with self._uistate_lock:
+            return dict(self._uistate)
+
+    def sim_running(self):
+        with self._sim_lock:
+            return bool(self._sim_proc and self._sim_proc.poll() is None)
 
     # ---- static data -----------------------------------------------------
     def html_path(self):
@@ -560,14 +809,15 @@ class DebugState:
             if self._sim_proc and self._sim_proc.poll() is None:
                 return {"error": "simulator already running",
                         "run_id": self._sim_run_id}
-            ipc_dir = os.path.join(self.sim_example_dir, "ipc")
-            if os.path.isdir(ipc_dir):
-                for f in os.listdir(ipc_dir):
-                    if f.endswith(".sock.dbg"):
-                        try:
-                            os.unlink(os.path.join(ipc_dir, f))
-                        except OSError:
-                            pass
+            if self.sim_kind == "ipc":
+                ipc_dir = os.path.join(self.sim_example_dir, "ipc")
+                if os.path.isdir(ipc_dir):
+                    for f in os.listdir(ipc_dir):
+                        if f.endswith(".sock.dbg"):
+                            try:
+                                os.unlink(os.path.join(ipc_dir, f))
+                            except OSError:
+                                pass
             self._sim_ipc_ready = False
             self._sim_dbg_socket = None
             self._sim_run_id += 1
@@ -592,10 +842,14 @@ class DebugState:
                 fh.close()
                 return {"error": f"cannot launch sim script: {e}"}
             self._sim_fh = fh
-        threading.Thread(target=self._sim_watch_dbg_socket, args=(run_id,),
-                         daemon=True).start()
+        # The dbg-socket watcher is IPC-only: it retargets aiegdb at the ISS
+        # socket that runsim_ipc.sh creates. The aiesim backend exposes no such
+        # socket, so live debug stays on whatever target is configured.
+        if self.sim_kind == "ipc":
+            threading.Thread(target=self._sim_watch_dbg_socket, args=(run_id,),
+                             daemon=True).start()
         return {"run_id": run_id, "sim_log": self.sim_log,
-                "example_dir": self.sim_example_dir}
+                "example_dir": self.sim_example_dir, "sim_kind": self.sim_kind}
 
     def stop_sim(self):
         """Kill the running simulator and its process group."""
@@ -1134,6 +1388,9 @@ class DebugState:
             "AIEDBG_TARGET": self.target or "",
             "DEBUGUI_APPLOG": self.applog,
             "DEBUGUI_SIM_APPLOG": self.sim_applog or "",
+            # Lets the debugui MCP follow app switches and read live UI state
+            # instead of being frozen to the workdir it was spawned with.
+            "DEBUGUI_SERVER_URL": self.self_url or "",
         }
         if sim_ready and dbg_socket:
             debugui_env["AEG_PS_IPC_DBG_SOCKET"] = dbg_socket
@@ -2119,13 +2376,41 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_page(self, st):
+        """Serve the UI with the selected app's data injected server-side.
+
+        The template's JS consumes DATA synchronously at parse time, so the data
+        is substituted here rather than fetched by the client. Falls back to a
+        pre-generated host_schedule.html when no app is registered (e.g. a bare
+        workdir with only the old artifact)."""
+        app = st.app
+        if app is None:
+            self._send_file(st.html_path(), "text/html; charset=utf-8")
+            return
+        try:
+            html = schedule_view.render_html(app.load_view())
+        except (OSError, ValueError) as e:
+            self._send_json({"error": f"cannot render app {app.id}: {e}"}, code=500)
+            return
+        data = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         st = self.state
         u = urlparse(self.path)
         q = parse_qs(u.query)
         path = u.path
         if path in ("/", "/index.html", "/host_schedule.html"):
-            self._send_file(st.html_path(), "text/html; charset=utf-8")
+            self._send_page(st)
+        elif path == "/apps":
+            self._send_json({"apps": st.apps_info()})
+        elif path == "/uistate":
+            self._send_json(st.get_uistate())
         elif path == "/schedule_view.json":
             self._send_file(st.json_path(), "application/json")
         elif path == "/config":
@@ -2223,6 +2508,13 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             self._send_json(st.start_run(device=body.get("device"),
                                          board_host=body.get("board_host")))
+        elif u.path == "/apps/select":
+            self._send_json(st.select_app(body.get("id")))
+        elif u.path == "/apps/add":
+            self._send_json(st.add_app(body.get("path"), body.get("label"),
+                                       bool(body.get("select"))))
+        elif u.path == "/uistate":
+            self._send_json(st.set_uistate(body))
         elif u.path == "/stop":
             self._send_json(st.stop_run())
         elif u.path == "/sim/run":
@@ -2613,6 +2905,13 @@ def main():
     ap.add_argument("workdir", nargs="?", default="aout/worklocal",
                     help="dir with host_schedule.html + schedule_view.json "
                          "+ provenance JSONs (default: aout/worklocal)")
+    ap.add_argument("--app", action="append", default=[], metavar="PATH[=LABEL]",
+                    help="register an app workdir explicitly (repeatable); "
+                         "works across repos, e.g. "
+                         "--app ../naiebaremetal/example/testkernel/worklocal=testkernel")
+    ap.add_argument("--app-root", action="append", default=[], metavar="DIR",
+                    help="scan DIR for app workdirs (repeatable), e.g. "
+                         "--app-root ../naiebaremetal/example")
     ap.add_argument("--elf", default=None,
                     help="ELF to deploy via /run (default: project aout ELF "
                          "<workdir>/build/host or aout/main.elf; falls back to "
@@ -2659,7 +2958,18 @@ def main():
                          "claude can reach the aiegdb MCP server")
     args = ap.parse_args()
 
-    workdir = os.path.abspath(args.workdir)
+    # Build the app registry first: the positional workdir is treated as an
+    # explicit app so the historical single-app invocation keeps working, and
+    # aout/ is auto-scanned so a bare `schedule_debug_server.py` finds the most
+    # recent build on its own.
+    explicit = list(args.app)
+    if args.workdir:
+        explicit.insert(0, os.path.abspath(args.workdir))
+    registry = AppRegistry(explicit=explicit, roots=args.app_root,
+                           auto_roots=[os.path.join(_REPO_ROOT, "aout")])
+    selected = registry.default()
+
+    workdir = os.path.abspath(selected.path if selected else args.workdir)
     elf = os.path.abspath(args.elf) if args.elf else _resolve_default_elf(workdir)
     apppaltest = args.apppaltest or os.path.join(
         _REPO_ROOT, "script", "test", "apppaltest.py")
@@ -2722,6 +3032,8 @@ def main():
                                claude_model=args.claude_model,
                                llm_enabled=not args.no_llm,
                                llm_password=llm_password)
+    Handler.state.registry = registry
+    Handler.state.app = selected
     # Bind the server, applying the occupied-port policy: exit + list pid(s) if
     # this same user already holds the port, else fall forward to the next free
     # port when another user holds it.
@@ -2730,7 +3042,18 @@ def main():
     # another machine (0.0.0.0 is not itself a connectable address).
     disp_host = _lan_ip() if args.host in ("0.0.0.0", "") else args.host
     url = f"http://{disp_host}:{port}/"
+    # Loopback callback URL for the debugui MCP (always reachable regardless of
+    # what interface the server advertises).
+    Handler.state.self_url = f"http://127.0.0.1:{port}"
     print(f"schedule_debug_server serving {workdir}")
+    _apps = registry.list()
+    print(f"  apps:       {len(_apps)} registered"
+          f"{' (current: ' + selected.id + ')' if selected else ''}")
+    for _a in _apps:
+        _c = _a.caps()
+        _flags = ",".join(k[4:] for k in ("has_sim", "has_hw") if _c[k]) or "view-only"
+        print(f"    {'*' if selected and _a.id == selected.id else ' '} "
+              f"{_a.id:22} {_flags:12} {_a.path}")
     print(f"  URL:        {url}")
     print(f"  bind:       {args.host}:{port}")
     print(f"  ELF:        {elf or 'auto (apppaltest -y default)'}")
