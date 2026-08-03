@@ -2388,6 +2388,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="lhsplitter" title="Drag to resize (top / bottom)"></div>
   <div id="leftbottom">
   <div id="live">
+    <div id="approw" style="margin-bottom:6px;">
+      <label>App:
+        <select id="appSel"><option value="">&mdash; loading &mdash;</option></select>
+      </label>
+      <span id="appinfo" style="margin-left:8px;color:#888;font-size:11px;"></span>
+    </div>
     <div id="devrow" style="margin-bottom:6px;">
       <label>Board:
         <select id="deviceSel">
@@ -2474,6 +2480,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 <script>
 const DATA = /*__DATA__*/ null;
+// What the user currently has open, mirrored to the daemon so the embedded
+// agent can answer questions about the view in front of the human. Declared
+// here so it precedes every reportUIState() call site.
+const UISTATE = {selected_tile:null, tile_tab:null, net_tab:null,
+                 console_pane:'conpane', flow:null, channel:null, search:null};
 
 function esc(s){ return (s==null?'':(''+s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 const KIND_LABEL = {bd_config:'BD', createio:'IO', startio:'START', wait:'WAIT',
@@ -3661,6 +3672,7 @@ function renderNetDetail(p){
     tab.onclick=()=>{
       panel.querySelectorAll('.tab').forEach(t=>t.classList.remove('act'));
       tab.classList.add('act');
+      reportUIState({net_tab: tab.dataset.t});
       const id='tab-'+tab.dataset.t;
       panel.querySelectorAll('.tabbody>div').forEach(d=>{
         d.classList.toggle('hide',d.id!==id);
@@ -4323,6 +4335,9 @@ let selBadge = null;
 function select(t, el, ch, badgeEl){
   if (selEl) selEl.classList.remove('sel');
   selEl = el; el.classList.add('sel');
+  reportUIState({selected_tile: t.loc,
+                 channel: ch ? (ch.direction + ch.channel) : null,
+                 flow: ch ? ch.flow_index : null});
   // Persistent channel selection: keep the clicked badge highlighted after the
   // cursor moves out, and clear it only when another item (tile or channel) is
   // clicked. A tile-only click (no badgeEl) clears any previous badge highlight.
@@ -4440,6 +4455,7 @@ function select(t, el, ch, badgeEl){
     tab.classList.add('act');
     Object.entries(panes).forEach(([k,sel]) =>
       p.querySelector(sel).classList.toggle('hide', tab.dataset.t!==k));
+    reportUIState({tile_tab: tab.dataset.t});
   });
   p.querySelectorAll('.subtab').forEach(st => st.onclick = () => {
     p.querySelectorAll('.subtab').forEach(x=>x.classList.remove('act'));
@@ -4840,6 +4856,7 @@ document.querySelectorAll('#contabs .contab').forEach(tab => tab.onclick = () =>
     const el = document.getElementById(id);
     if (el) el.classList.toggle('hide', id !== pane);
   });
+  reportUIState({console_pane: pane});
   if (pane === 'llmpane') llmCheckAuth();
   if (pane === 'searchpane') document.getElementById('sr-input').focus();
 });
@@ -5498,6 +5515,50 @@ if (location.protocol === 'http:' || location.protocol === 'https:') {
   updateDeviceUI();
 }
 
+// ── app switching ────────────────────────────────────────────────────────────
+// The daemon owns app selection and injects the chosen app's DATA when serving
+// this page, so switching is: POST the choice, then reload.
+const appSel = document.getElementById('appSel');
+function loadApps(){
+  api('/apps').then(r => {
+    if (!r || !r.apps || !appSel) return;
+    appSel.innerHTML = '';
+    r.apps.forEach(a => {
+      const o = document.createElement('option');
+      o.value = a.id;
+      o.textContent = a.label + (a.has_hw ? '  [hw]' : '') + (a.has_sim ? '  [sim]' : '');
+      if (a.current) { o.selected = true;
+        const info = document.getElementById('appinfo');
+        if (info) info.textContent = a.path;
+      }
+      appSel.appendChild(o);
+    });
+  }).catch(() => {});
+}
+if (appSel) appSel.onchange = () => {
+  api('/apps/select', {method:'POST', headers:{'Content-Type':'application/json'},
+                       body: JSON.stringify({id: appSel.value})})
+    .then(r => {
+      if (r && r.error) { setStatus('app switch failed: ' + r.error); loadApps(); return; }
+      location.reload();
+    }).catch(() => {});
+};
+
+// ── UI state reporting ───────────────────────────────────────────────────────
+// Tell the daemon what the user currently has open so the embedded agent can
+// answer questions about the view the human is actually looking at.
+let _uiStateTimer = null;
+function reportUIState(patch){
+  if (patch) Object.assign(UISTATE, patch);
+  if (location.protocol === 'file:') return;
+  clearTimeout(_uiStateTimer);
+  _uiStateTimer = setTimeout(() => {
+    api('/uistate', {method:'POST', headers:{'Content-Type':'application/json'},
+                     body: JSON.stringify(UISTATE)}).catch(() => {});
+  }, 250);
+}
+if (location.protocol === 'http:' || location.protocol === 'https:') loadApps();
+
 // LLM tab is independent of the JTAG connection: probe /llm/poll on load and,
 // if the daemon answers (and the tab is enabled), reveal the console and
 // default-select the LLM tab. The aiegdb tab stays gated on LIVE.connected.
@@ -5625,9 +5686,16 @@ def _channel_cache_content(t, c):
     return '\n'.join(out) + '\n'
 
 
-def write_code_cache(view, cache_dir='debugcache/code'):
+def write_code_cache(view, cache_dir=None, workdir=None):
     """Write one code-piece file per tile and per channel; annotate the view
-    with absolute `code_file` paths. Returns (cache_dir_abs, file_count)."""
+    with absolute `code_file` paths. Returns (cache_dir_abs, file_count).
+
+    Defaults to <workdir>/debugcache/code so each app owns its pieces. A
+    CWD-relative default would make two apps generated from the same directory
+    overwrite each other, and the paths are handed to the LLM to read."""
+    if cache_dir is None:
+        base = workdir if workdir else '.'
+        cache_dir = os.path.join(base, 'debugcache', 'code')
     cache_dir = os.path.abspath(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
     count = 0
@@ -5650,32 +5718,41 @@ def write_code_cache(view, cache_dir='debugcache/code'):
     return cache_dir, count
 
 
-def write_html(view, out_path):
+def render_html(view):
+    """Return the full UI page with `view` injected. Used both to write the
+    standalone file and to serve a selected app live from
+    schedule_debug_server."""
     data_json = json.dumps(view, indent=None)
     html = HTML_TEMPLATE.replace('/*__DATA__*/ null', data_json)
     palmyra_opt = ('          <option value="palmyra">palmyra</option>\n'
                    if _palmyra_enabled() else '')
-    html = html.replace('<!--__PALMYRA_OPTION__-->', palmyra_opt)
+    return html.replace('<!--__PALMYRA_OPTION__-->', palmyra_opt)
+
+
+def write_html(view, out_path):
     with open(out_path, 'w') as f:
-        f.write(html)
+        f.write(render_html(view))
 
 
 def main():
-    workdir = sys.argv[1] if len(sys.argv) > 1 else 'aout/worklocal'
+    args = [a for a in sys.argv[1:] if not a.startswith('-')]
+    json_only = '--json-only' in sys.argv[1:]
+    workdir = args[0] if args else 'aout/worklocal'
     view = build_view(workdir)
     # Materialize per-tile/channel code pieces (annotates view with code_file
     # paths) BEFORE serializing so both the JSON and the embedded HTML DATA carry
     # the paths for the file-frame header + LLM auto-notify.
-    cache_dir, ncode = write_code_cache(view)
+    cache_dir, ncode = write_code_cache(view, workdir=workdir)
     json_out = os.path.join(workdir, 'schedule_view.json')
-    html_out = os.path.join(workdir, 'host_schedule.html')
     with open(json_out, 'w') as f:
         json.dump(view, f, indent=2)
-    write_html(view, html_out)
     ntiles = len(view['tiles'])
     covered = sum(len(t['low_level']['ranges']) for t in view['tiles'])
     print('wrote %s (%d tiles, %d line-ranges attributed)' % (json_out, ntiles, covered))
-    print('wrote %s' % html_out)
+    if not json_only:
+        html_out = os.path.join(workdir, 'host_schedule.html')
+        write_html(view, html_out)
+        print('wrote %s' % html_out)
     print('wrote %d code pieces to %s' % (ncode, cache_dir))
 
 
