@@ -302,6 +302,8 @@ The tool runs 7 steps in sequence:
 
 `aiedbg` must be in `PATH`. It is the Xilinx/AMD AIE debug CLI that reads/writes AIE tile registers over JTAG or network. It is part of the Vitis installation (`$XILINX_VITIS/bin/aiedbg`) or can be installed separately.
 
+The live debug server (`schedule_debug_server.py` / `aiehlc.sh --prettydebug`) **bootstraps** `aiedbg` automatically on first launch: clones into `thirdparty/aiedbg`, runs `pip install --user`, and writes `.aiehlc/aiedbg_env.sh` for PATH. Manual install/update: `script/debug/bootstrap_aiedbg.sh` (`--update` to refresh). Use `--skip-aiedbg-bootstrap` to skip auto-install (e.g. when using Vitis's copy).
+
 The tool invokes it as:
 ```
 aiedbg [--target TARGET] [--device DEVICE] reg read PHYS_COL ROW 0xOFFSET
@@ -370,7 +372,7 @@ zero-dependency local daemon (stdlib `http.server`, bound to `127.0.0.1`) that t
 the static `host_schedule.html` schedule view into a live debug/test console. It serves
 the enhanced HTML, exposes JSON endpoints, imports `aiediag.py` as a library for register
 offsets/decoders/provenance, and orchestrates `apppaltest.py`. Design rationale:
-[doc/design/live_debug_framework.md](doc/design/live_debug_framework.md).
+[doc/design/aiegdb_live_debug_framework.md](doc/design/aiegdb_live_debug_framework.md).
 
 #### Multi-app mode
 
@@ -501,15 +503,68 @@ python3 src/tool/debug/schedule_debug_server.py aout/worklocal \
 | `POST` | `/run` | Spawn the board test `-y -nonreboot <elf>` (`-u` unbuffered) → `applog`. Body `{device, board_host}`: `palmyra` → `apppaltest.py` (inherit env); `vek385` → `appvek385.py` with env `USERNAME=getpass.getuser()` + `VEK385IP=<board_host>` (host required) |
 | `POST` | `/stop` | Force-kill the running test's process group (SIGTERM→SIGKILL); appends a `[force-stop]` line to `applog` |
 | `GET` | `/applog?offset=N` | Realtime tail of the `applog` file → `{data, next, running, status}`; poll stops on `running=false` (process exit), not on derived `pass\|fail` |
-| `GET` | `/ping?device=&host=` | Connection test → `{ok, aiedbg, target, detail}`. Confirms `aiedbg` is in PATH **and** the resolved JTAG target actually answers (one read-only register read on the first schedule tile). Drives the UI's "Test connect" gating |
+| `GET` | `/ping?device=&host=` | Connection test → `{ok, aiedbg, target, detail}`. Confirms `aiedbg` is in PATH **and** the resolved JTAG target actually answers (one read-only register read on the first schedule tile). Drives the UI's "Connect" gating; a passing probe records session mode `connected` |
+| `POST` | `/attach` | "Open Current Session": same link probe as `/ping`, but records session mode `attached` — for a run the user started outside the UI (CLI, or an already-programmed board). Body `{device, board_host}` → `{ok, detail, session}` |
+| `GET` | `/aiegdb/spec` | `aiegdb.COMMAND_SPEC` as JSON — the console autocomplete's command grammar. Served from the imported module (not the aiegdb subprocess) so it answers before any command has run |
 | `GET` | `/grid?what=dma\|cores\|events&device=&host=` | Whole-array status survey for the overlay; `device`/`host` pick the aiedbg target (`palmyra` → `xsdb://$PALIP:3121`, `vek385` → `xsdb://<host>:3121`) |
 | `POST` | `/cmd` | Whitelisted op (`dma`/`core`/`event`/`pc`/`reg`/`chans`/`chanevent`); body may carry `device`/`host` for device-aware target. `chans` lists a tile's channels + coarse live DMA state; `chanevent` (needs `dir_ch`) decodes per-channel start/finish/(stall/error) events → `{events, summary}` |
 
 The browser UI has a **Board selector** (`palmyra` / `vek385`). Selecting a device
-enables a **"Test connect"** button (and, for `vek385`, reveals a board-hostname
-text box). Clicking **Test connect** hits `/ping`; only on a passing test does the
+enables a **"Connect"** button (and, for `vek385`, reveals a board-hostname
+text box). Clicking **Connect** hits `/ping`; only on a passing test does the
 "Live status overlay" checkbox unlock **and** the drill-down console appear. The
 "Run test" button (spawns `apppaltest`) is enabled as soon as a device is chosen.
+
+#### Session provenance — why a target is not a connection
+
+`AIEDBG_TARGET` is exported by `script/test/envlocal.sh`, so the daemon has a target
+from the moment it starts, with no user action. That is *not* evidence that a board is
+live or that anything has been run — and a physically reachable board still holds
+registers from whatever ran on it last, possibly days ago or by another user. The
+daemon therefore tracks how the current session earned its access:
+
+| State | Earned by | Meaning for live reads and logs |
+|---|---|---|
+| `none` | default at startup, even with `AIEDBG_TARGET` set | reads refused; nothing may be inferred about the board |
+| `connected` | **Connect** (a verified `/ping`) | link is real, but registers are pre-existing state, not the result of a run here |
+| `attached` | **Open Current Session** (`/attach`) | a real run is in play, started outside the UI — the daemon cannot vouch for what came before |
+| `ran` | **Run test** | only here are live state and the `applog` the current run |
+
+`hw_authorized()` gates the live overlay (`/grid`) and the `aiegdb` MCP server's device
+commands; navigation, `help` and `?` stay available so the console is still useful
+offline. The state is published in `backend_status.json` (`session`, `session_summary`),
+injected into every LLM message, and enforced by a precondition block in the agent's
+system prompt.
+
+Log provenance is tracked the same way. `applog` is a fixed repo-root path that the
+manual CLI flow also writes, so a file being present proves nothing — `get_applog`
+prefixes a banner such as:
+
+```
+[STALE: written 2026-08-04 17:12, BEFORE this debug session started (2026-08-05 09:40).
+ This describes a PREVIOUS run, not the current one.]
+```
+
+Without it, a leftover `PASS: all 65536 elements match` reads exactly like a fresh
+result — which is precisely how the embedded agent once reported a successful run that
+had never happened in that session.
+
+#### aiegdb console tab
+
+The `aiegdb` tab renders each command as a foldable block (command as header, output
+below), colorized by line kind — scope changes, errors, warnings, `OK`/`PASS` verdicts,
+`PC -> file:line`, hex literals and `key:` labels. The `[registers read] { … }` appendix
+that aiegdb appends after most decoded commands collapses into a `<details>`.
+
+Typing offers scope-aware suggestions (name · args · summary), with a red **WRITES HW**
+badge on the intrusive commands (`reg write`, `dma counter setup`). Tab/Enter fills the
+command and leaves the caret for its arguments; ↑/↓ moves through suggestions when the
+popup is open and through command history when it is closed. **⌘ Commands** opens a
+searchable palette of everything valid at the current scope.
+
+The grammar comes from `aiegdb.COMMAND_SPEC` — the same dict that renders the CLI's `?`
+listing — fetched from `/aiegdb/spec`, with a copy baked into the generated HTML so
+autocomplete still works when opening `host_schedule.html` with no daemon.
 
 The right panel has a **drill-down command console** (pinned bottom, revealed after
 a passing connection test): clicking a tile sets it as the console TARGET and
@@ -525,7 +580,13 @@ test fails.
 - Binds `127.0.0.1` only; `/cmd` uses an op **whitelist** (no arbitrary shell; `reg` offset
   parsed as an integer).
 - Issues **read-only** register reads only (never `stop`/`con`/writes), so it cannot perturb
-  a running target sharing the same JTAG bridge.
+  a running target sharing the same JTAG bridge. The two commands that *do* write —
+  `reg write` and `dma counter setup` — are reachable only by typing them explicitly in the
+  aiegdb console, and are flagged **WRITES HW** wherever they are suggested.
+- Live reads require a **board session** (Connect / Run test / Open Current Session). A
+  target inherited from `$AIEDBG_TARGET` does not authorize reads, so neither the overlay
+  nor the embedded agent can silently report another run's leftover register state as
+  current — see *Session provenance* above.
 - Reuses aiediag's `--json` `value_hex` parsing (avoids the offset-as-value Pitfall). If
   `aiedbg` is not in `PATH`, live reads are disabled and endpoints report `unreachable`
   rather than fake zeros.

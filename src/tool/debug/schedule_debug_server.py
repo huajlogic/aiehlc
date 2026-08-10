@@ -28,9 +28,12 @@ Design reference: doc/design/live_debug_framework.md
 """
 
 import argparse
+import collections
 import errno
 import getpass
 import hmac
+import html
+import ipaddress
 import json
 import os
 import pwd
@@ -46,7 +49,16 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
+
+try:
+    from pygments import highlight as _pyg_highlight
+    from pygments.lexers import get_lexer_for_filename, get_lexer_by_name
+    from pygments.formatters import HtmlFormatter
+    from pygments.util import ClassNotFound
+    _HAVE_PYGMENTS = True
+except ImportError:      # viewer still works, just monochrome
+    _HAVE_PYGMENTS = False
 
 # Import aiediag as a library (offsets, reg read, decoders, provenance, startcol).
 # aiediag.py lives in the same directory (src/tool/debug/); it guards main()
@@ -55,6 +67,14 @@ from urllib.parse import urlparse, parse_qs
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 # This file lives at src/tool/debug/ → repo root is three levels up.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS_DIR)))
+# Skills written FOR the embedded LLM (not for Claude Code sessions in this repo).
+# Laid out as a Claude Code *plugin* so the spawned assistant loads them natively
+# via --plugin-dir: that keeps one copy, versioned beside the tooling it documents,
+# instead of a duplicate under .claude/skills/ that would drift. Being explicit
+# also survives the announced change making `--bare` (no auto-discovery) the
+# default for `claude -p`.
+_LLM_PLUGIN_DIR = os.path.join(_THIS_DIR, "dbg_llm_skills")
+_LLM_SKILLS_DIR = os.path.join(_LLM_PLUGIN_DIR, "skills")
 
 
 import struct as _struct
@@ -175,11 +195,10 @@ def _load_ui_config(workdir):
 def _detect_aiesim_device(workdir):
     """Synthesize a Simulator device for aiehlc apps built with --platform sim.
 
-    naiebaremetal declares its IPC simulator in debug_ui_config.json; aiehlc has
-    a different simulator (script/runsim.sh driving the Vitis aie2pssimmsm
-    model) and writes no such config. It is detectable instead: aiehlc.sh's
-    write_sim_config drops a sim_config.sh next to the build. Returns a device
-    dict tagged sim_kind='aiesim', or None when this app has no sim build.
+    aiehlc's simulator is script/runsim.sh driving the Vitis aie2pssimmsm model.
+    It is detectable rather than declared: aiehlc.sh's write_sim_config drops a
+    sim_config.sh next to the build. Returns a device dict tagged
+    sim_kind='aiesim', or None when this app has no sim build.
     """
     runsim = os.path.join(_REPO_ROOT, "script", "runsim.sh")
     if not os.path.isfile(runsim):
@@ -196,16 +215,659 @@ def _detect_aiesim_device(workdir):
     return None
 
 
-def _resolve_default_elf(workdir):
-    """Pick the project's default tiling ELF when --elf is omitted.
+def _find_up(start, relpath, levels=8):
+    """Walk up from `start` looking for `relpath`; return the absolute hit."""
+    d = os.path.abspath(start)
+    for _ in range(levels):
+        cand = os.path.join(d, relpath)
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
 
-    The tiling build emits the host ELF to <workdir>/build/host and copies it to
-    aout/main.elf (see script/aiehlc.sh). Probe those canonical locations so the
-    UI deploys the freshly-built ELF instead of falling back to apppaltest's own
-    default. Returns an absolute path, or None if nothing is found.
+
+def _detect_ipcsim_device(workdir):
+    """Simulator device for a naiebaremetal example (IPC flow), or None.
+
+    The two path checks are runsim_ipc.sh's own preconditions, so a detected
+    device can never fail at launch for a missing build.
+    """
+    example = os.path.dirname(workdir.rstrip(os.sep))
+    if not example:
+        return None
+    if not os.path.isfile(os.path.join(example, "ipc", "build_sim.env")):
+        return None
+    if not os.path.isdir(os.path.join(example, "Work", "ps", "c_rts", "systemC")):
+        return None
+    script = _find_up(example, os.path.join("script", "runsim_ipc.sh"))
+    if not script:
+        return None
+    return {
+        "value": "simulator",
+        "label": "Simulator (IPC)",
+        "sim_script": script,
+        "sim_example_dir": example,
+        "sim_kind": "ipc",
+    }
+
+
+def _detect_sim_device(workdir):
+    """Shared by caps() and _load_app_profile() so the app list and /devices
+    can never disagree about whether an app has a simulator."""
+    return _detect_aiesim_device(workdir) or _detect_ipcsim_device(workdir)
+
+
+def _hwlocal_env(runner):
+    path = os.path.join(os.path.dirname(runner), "hwlocal.sh")
+    if not os.path.isfile(path):
+        return {}
+    env = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("export ") or line.startswith("#"):
+                    continue
+                key, _, val = line[len("export "):].partition("=")
+                key, val = key.strip(), val.split("#")[0].strip().strip('"\'')
+                if key and val:
+                    # hwlocal.sh interpolates ${USERNAME} / ${VEK385IP}.
+                    for k2, v2 in list(env.items()):
+                        val = val.replace("${%s}" % k2, v2).replace("$" + k2, v2)
+                    env[key] = val
+    except OSError:
+        return {}
+    return env
+
+
+def _detect_vek385_device(workdir):
+    """VEK385 device for a naiebaremetal example, or None.
+
+    Carries no board on purpose: the host is chosen per run in the UI, and
+    freezing one here is what makes a written debug_ui_config.json go stale.
+    """
+    example = os.path.dirname(workdir.rstrip(os.sep))
+    if not example:
+        return None
+    boot_bin = os.path.join(example, "build", "vek385.BIN")
+    if not os.path.isfile(boot_bin):
+        return None
+    runner = _find_up(example, os.path.join("src", "tool", "test",
+                                            "runhw_vek385.py"))
+    if not runner:
+        return None
+    hw_env = {"VEK385_LOCAL_BIN": boot_bin}
+    elf = os.path.join(example, "vek385.elf")
+    if os.path.isfile(elf):
+        hw_env["VEK385_LOCAL_ELF"] = elf
+    return {
+        "value": "vek385",
+        "label": "vek385",
+        "hw_run_script": runner,
+        "hw_env": hw_env,
+    }
+
+
+# A declared hw_env is a snapshot of $VEK385IP/hwlocal.sh from whenever
+# run_debug_ui.sh wrote the file, so these keys are stale by construction.
+_BOARD_KEYS = ("VEK385IP", "AIEDBG_TARGET")
+
+
+def _board_run_env(base_env, cfg_dev, board_host, workdir):
+    """Overlay a hw profile onto base_env, deriving the board from live sources
+    only: UI hostname box -> $VEK385IP -> hwlocal.sh. Returns (env, host)."""
+    env = dict(base_env)
+    for k, v in (cfg_dev.get("hw_env") or {}).items():
+        if k in _BOARD_KEYS:
+            continue
+        env[k] = str(v)
+    host = (board_host or "").strip() or _expected_board_host(workdir, base_env)
+    if not host:
+        return env, ""
+    env["VEK385IP"] = host
+    # Keeping a target that names another board would program one machine and
+    # debug another; matching hosts preserves a non-default hw_server port.
+    tgt = base_env.get("AIEDBG_TARGET", "")
+    m = re.match(r"xsdb://([^:/]+)", tgt or "")
+    env["AIEDBG_TARGET"] = (tgt if m and m.group(1) == host
+                            else f"xsdb://{host}:3121")
+    env.setdefault("USERNAME", getpass.getuser())
+    return env, host
+
+
+def _device_label(dev):
+    """Device label with its own board name stripped — run_debug_ui.sh bakes
+    "VEK385 (${VEK385IP})" into the config, which then advertises a board the
+    app has nothing to do with. A custom label survives."""
+    label = (dev.get("label") or dev.get("value") or "").strip()
+    value = dev.get("value") or ""
+    host = ((dev.get("hw_env") or {}).get("VEK385IP") or "").strip()
+    if host:
+        label = re.sub(r"\s*\(\s*" + re.escape(host) + r"\s*\)", "", label)
+        label = label.replace(host, "").strip(" -—")
+    label = label.strip()
+    if dev.get("hw_run_script") and label.lower() == value.lower():
+        return value
+    return label or value
+
+
+def _detect_hw_device(workdir):
+    """Shared by caps() and _load_app_profile(), as _detect_sim_device is."""
+    return _detect_vek385_device(workdir)
+
+
+def _expected_board_host(workdir, env=None):
+    """The board this checkout points at: $VEK385IP, else its hwlocal.sh."""
+    host = (env if env is not None else os.environ).get("VEK385IP", "").strip()
+    if host:
+        return host
+    example = os.path.dirname(workdir.rstrip(os.sep))
+    runner = _find_up(example, os.path.join("src", "tool", "test",
+                                            "runhw_vek385.py")) if example else None
+    return _hwlocal_env(runner).get("VEK385IP", "") if runner else ""
+
+
+_AIEDBG_PATHS_CACHE = None
+
+
+def _aiedbg_paths():
+    """Locate the aiedbg clone, so the assistant can read its docs.
+
+    aiedbg's ~2600 lines of documentation exist ONLY in a git clone — the
+    pip-installed package in site-packages ships no .md files — and the
+    aiedbg-reference skill is useless without a real path to point at.
+
+    Resolution order, first hit wins:
+      1. $AIEHLC_AIEDBG_SRC        — the override ensure_aiedbg.py honours
+      2. <repo>/thirdparty/aiedbg  — where ensure_aiedbg.py clones on first run
+      3. the installed dist's direct_url.json — covers a machine that was set up
+         against a clone living somewhere else entirely, which is otherwise
+         invisible to us
+    A candidate only counts if it actually holds the docs, so a half-made
+    directory does not get advertised as the reference.
+    """
+    global _AIEDBG_PATHS_CACHE
+    # Scans dist metadata; ~150 ms. /source needs it per request, so
+    # memoise for the process rather than re-resolving a static layout.
+    if _AIEDBG_PATHS_CACHE is not None:
+        return _AIEDBG_PATHS_CACHE
+    cands = []
+    override = os.environ.get("AIEHLC_AIEDBG_SRC", "").strip()
+    if override:
+        cands.append(os.path.abspath(override))
+    cands.append(os.path.join(_REPO_ROOT, "thirdparty", "aiedbg"))
+    try:
+        import importlib.metadata as _md
+        for dist in _md.distributions():
+            if (dist.metadata.get("Name") or "").lower() != "aiedbg":
+                continue
+            raw = dist.read_text("direct_url.json")
+            if not raw:
+                continue
+            url = (json.loads(raw).get("url") or "")
+            if url.startswith("file://"):
+                cands.append(unquote(url[len("file://"):]))
+    except Exception:  # metadata layout varies; never block startup on it
+        pass
+
+    src = ""
+    for c in cands:
+        if c and os.path.isfile(os.path.join(c, "CLAUDE.md")):
+            src = c
+            break
+    _AIEDBG_PATHS_CACHE = {"src": src, "bin": shutil.which("aiedbg") or ""}
+    return _AIEDBG_PATHS_CACHE
+
+
+# ── source viewer ────────────────────────────────────────────────────────────
+# Serves a file from a small allowlist of roots, Pygments-highlighted, so the UI
+# can open a source reference the LLM or the aiegdb console printed.
+
+_SRC_MAX_BYTES   = 4 * 1024 * 1024
+_SRC_FULL_LINES  = 2000      # whole file at or below this (~940 KB of HTML)
+_SRC_WINDOW      = 400       # lines each side of the target beyond that
+_SRC_STYLE       = "one-dark"
+_SRC_BINARY_EXTS = {".elf", ".o", ".a", ".so", ".bin", ".pdi", ".png", ".jpg", ".pdf"}
+# get_lexer_for_filename picks POVRay for .inc, and has nothing for the rest.
+_SRC_LEXER_OVERRIDE = {".mlir": "text", ".bcf": "text", ".td": "text",
+                       ".log": "text", ".inc": "c"}
+_SRC_CACHE = collections.OrderedDict()
+_SRC_CACHE_MAX = 16
+_SRC_CACHE_LOCK = threading.Lock()
+_SRC_CSS_CACHE = None
+
+
+def _source_roots(st):
+    """Ordered [(name, realpath)] that /source may read under.
+
+    Recomputed per request: select_app() reassigns st.workdir, so a cached list
+    would keep serving a de-selected app. Callers that need it more than once
+    per request must hoist it — _aiedbg_paths() alone costs ~150 ms.
+    """
+    ap = st.app_paths()
+    cands = [("app", ap.get("app_dir")), ("bundle", ap.get("bundle_dir")),
+             ("work", ap.get("work_dir"))]
+    if st.registry is not None:          # None until main() builds it
+        for a in st.registry.list():
+            cands.append(("app", a.path))
+            if os.path.basename(a.path) == "worklocal":
+                cands.append(("app", os.path.dirname(a.path)))
+    cands.append(("sim", getattr(st, "sim_example_dir", None)))
+    cands.append(("repo", _REPO_ROOT))
+    cands.append(("aiedbg", _aiedbg_paths().get("src")))
+
+    banned = {"/", "/home", "/tmp", "/usr", "/etc", "/var",
+              os.path.realpath(os.path.expanduser("~"))}
+    out = []
+    for name, p in cands:
+        if not p:
+            continue
+        rp = os.path.realpath(p)
+        # A shallow root would hand out most of the filesystem.
+        if rp in banned or len([x for x in rp.split(os.sep) if x]) < 2:
+            continue
+        if not os.path.isdir(rp) or any(rp == e for _n, e in out):
+            continue
+        out.append((name, rp))
+    # Nested roots are kept on purpose. They are also the join bases for a
+    # relative citation, and dropping aout/worklocal because it sits under the
+    # repo root would make `worklocal/host.cc` unresolvable. It widens nothing:
+    # a root inside another root reaches no file the outer one did not already.
+    return out
+
+
+def _path_within(rp, root):
+    """True when rp is root or below it. commonpath, not startswith: the latter
+    says /a/bc is inside /a/b. Callers must realpath rp FIRST — that is what
+    defeats `..` and a symlink pointing out of the tree."""
+    try:
+        return os.path.commonpath([rp, root]) == root
+    except ValueError:      # different drives / one is relative
+        return False
+
+
+_SRC_NAME_IDX = (None, None, 0.0)     # (cache key, index, built_at)
+_SRC_IDX_TTL = 20.0
+_SRC_WALK_SKIP = {".git", "__pycache__", "node_modules", ".Xil", "ipc",
+                  "aiesimulator_output", "Release", "Debug"}
+_SRC_WALK_EXT = {".cc", ".cpp", ".cxx", ".c", ".h", ".hpp", ".py", ".md",
+                 ".mlir", ".sh", ".td", ".inc", ".bcf", ".json", ".txt"}
+
+
+def _source_walk(root, idx, max_depth=6, cap=4000):
+    """Add basename -> abspath for source-like files under root, first wins."""
+    root = os.path.realpath(root)
+    if not os.path.isdir(root):
+        return
+    n = 0
+    for dirpath, dirnames, files in os.walk(root):
+        if dirpath[len(root):].count(os.sep) >= max_depth:
+            dirnames[:] = []
+        dirnames[:] = [d for d in dirnames
+                       if d not in _SRC_WALK_SKIP and not d.startswith(".")]
+        for f in files:
+            if os.path.splitext(f)[1].lower() in _SRC_WALK_EXT:
+                idx.setdefault(f, os.path.join(dirpath, f))
+                n += 1
+                if n >= cap:
+                    return
+
+
+def _source_name_index(st):
+    """basename -> abspath, so a bare `graph.cpp` from the LLM resolves.
+
+    Two tiers, view first so a generated file the tools actually cite wins over
+    a same-named file elsewhere in the tree:
+      1. paths the view names (host.cc, kernel.cc, the .bcf, per-tile code_file)
+      2. a bounded walk of the app's own dirs — the app root, the bundle and
+         Work/ — which is what makes hand-written sources like `src/graph.cpp`
+         clickable. Joining a bare name against a root only ever found files
+         sitting directly at that root.
+
+    The repo root and the aiedbg clone are deliberately NOT walked: too large,
+    and citations into them are repo-relative rather than bare. Measured at
+    ~4 ms for a full naiebaremetal example, cached for _SRC_IDX_TTL because a
+    directory tree has no single mtime to key on.
+    """
+    global _SRC_NAME_IDX
+    jp = st.json_path()
+    ap = st.app_paths()
+    try:
+        key = (jp, os.path.getmtime(jp), ap.get("app_dir"), ap.get("work_dir"))
+    except OSError:
+        key = (jp, 0, ap.get("app_dir"), ap.get("work_dir"))
+    if _SRC_NAME_IDX[0] == key and (time.time() - _SRC_NAME_IDX[2]) < _SRC_IDX_TTL:
+        return _SRC_NAME_IDX[1]
+
+    idx = {}
+    try:
+        with open(jp) as f:
+            view = json.load(f)
+    except (OSError, ValueError):
+        return idx
+
+    def add(p):
+        if p and os.path.isabs(p):
+            idx.setdefault(os.path.basename(p), p)
+
+    src = view.get("source") or {}
+    add(src.get("host_cc"))
+    add(src.get("provenance"))
+    for sect in ("kernel", "bcf", "dfschedule_ir"):
+        sub = view.get(sect) or {}
+        add(sub.get("path"))
+        add((sub.get("source") or {}).get("path"))
+    for t in view.get("tiles") or []:
+        add(t.get("code_file"))
+        for c in t.get("dma_channels") or []:
+            add(c.get("code_file"))
+
+    for d in (ap.get("app_dir"), ap.get("bundle_dir"), ap.get("work_dir")):
+        if d:
+            _source_walk(d, idx)
+    _SRC_NAME_IDX = (key, idx, time.time())
+    return idx
+
+
+def _resolve_source(st, raw, roots=None):
+    """(realpath, root_name) or (None, reason). Accepts an absolute path, a path
+    relative to any root, or a bare basename present in the view."""
+    raw = (raw or "").strip()
+    if not raw or "\x00" in raw or len(raw) > 4096:
+        return None, "bad path"
+    if raw.startswith("./"):
+        raw = raw[2:]
+
+    if roots is None:
+        roots = _source_roots(st)
+    cands = []
+    if os.path.isabs(raw):
+        cands.append(raw)
+    else:
+        if os.sep not in raw:
+            hit = _source_name_index(st).get(raw)
+            if hit:
+                cands.append(hit)
+        cands.extend(os.path.join(root, raw) for _n, root in roots)
+
+    for cand in cands:
+        rp = os.path.realpath(cand)       # BEFORE containment — see _path_within
+        if not os.path.isfile(rp):
+            continue
+        for name, root in roots:
+            if _path_within(rp, root):
+                return rp, name
+    return None, "outside"
+
+
+def _source_lexer(rp):
+    """A lexer for rp, never guess_lexer (slow, and wrong on IR dumps)."""
+    ext = os.path.splitext(rp)[1].lower()
+    alias = _SRC_LEXER_OVERRIDE.get(ext)
+    try:
+        if alias:
+            return get_lexer_by_name(alias, stripnl=False)
+        return get_lexer_for_filename(os.path.basename(rp), stripnl=False)
+    except ClassNotFound:
+        return get_lexer_by_name("text", stripnl=False)
+
+
+def _source_css():
+    """Pygments style defs with every selector forced under .srcview.
+
+    get_style_defs(prefix) leaks unscoped rules — `pre { line-height:125% }`,
+    `span.linenos`, `td.linenos .normal|.special` — which would otherwise
+    restyle pre.code, .bdpretty, .md-block and the aiegdb console app-wide.
+    """
+    global _SRC_CSS_CACHE
+    if _SRC_CSS_CACHE is not None:
+        return _SRC_CSS_CACHE
+    if not _HAVE_PYGMENTS:
+        _SRC_CSS_CACHE = ""
+        return _SRC_CSS_CACHE
+    out = []
+    for line in HtmlFormatter(style=_SRC_STYLE).get_style_defs(".srcview").splitlines():
+        head, brace, tail = line.partition("{")
+        if not brace:
+            out.append(line)
+            continue
+        sels = [s.strip() for s in head.split(",") if s.strip()]
+        sels = [s if s.startswith(".srcview") else ".srcview " + s for s in sels]
+        out.append("%s {%s" % (", ".join(sels), tail))
+    _SRC_CSS_CACHE = "\n".join(out)
+    return _SRC_CSS_CACHE
+
+
+def _source_plain(text, start):
+    """Monochrome fallback with the same DOM shape Pygments produces, so the
+    client's #SL-<n> highlight and scroll work without Pygments installed."""
+    rows = []
+    for i, ln in enumerate(text.splitlines(), start):
+        rows.append('<span id="SL-%d"><span class="linenos">%d</span>%s\n</span>'
+                    % (i, i, html.escape(ln)))
+    return '<div class="srcview"><pre>%s</pre></div>' % "".join(rows)
+
+
+def _source_render(rp, text, start):
+    """Highlighted HTML. linespans (not hl_lines) so the render is independent
+    of the requested line and therefore cacheable; hl_lines is also
+    slice-relative while the gutter follows linenostart, which silently
+    off-by-ones any windowed file."""
+    if not _HAVE_PYGMENTS:
+        return _source_plain(text, start), "plain text"
+    lexer = _source_lexer(rp)
+    fmt = HtmlFormatter(style=_SRC_STYLE, cssclass="srcview",
+                        linenos="inline", linespans="SL", linenostart=start)
+    return _pyg_highlight(text, lexer, fmt), lexer.name
+
+
+def _serve_source(st, q):
+    """(payload, http_code) for GET /source. Errors never echo the input path."""
+    raw = (q.get("path") or [""])[0]
+    try:
+        line = int((q.get("line") or ["0"])[0] or 0)
+    except (TypeError, ValueError):
+        line = 0
+    if not raw:
+        return {"error": "path required"}, 400
+
+    roots = _source_roots(st)          # hoisted: ~150 ms, needed 2-3 times below
+    rp, why = _resolve_source(st, raw, roots)
+    if rp is None:
+        if why == "bad path":
+            return {"error": "bad path"}, 400
+        # Names only — an absolute path here would leak the layout to a caller
+        # who just proved they cannot read it. Deduped so the count of
+        # registered apps is not inferable either.
+        return {"error": "not found, or outside the readable roots",
+                "roots": sorted({n for n, _r in roots})}, 404
+
+    if os.path.splitext(rp)[1].lower() in _SRC_BINARY_EXTS:
+        return {"error": "binary file"}, 415
+    try:
+        stt = os.stat(rp)
+        if stt.st_size > _SRC_MAX_BYTES:
+            return {"error": "file too large", "bytes": stt.st_size,
+                    "limit": _SRC_MAX_BYTES}, 413
+        with open(rp, "rb") as f:
+            head = f.read(8192)
+            if b"\x00" in head:
+                return {"error": "binary file"}, 415
+            body = head + f.read()
+    except OSError:
+        return {"error": "unreadable"}, 404
+
+    text = body.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    n = len(lines)
+    first, last, truncated = 1, n, False
+    if n > _SRC_FULL_LINES:
+        centre = line if 1 <= line <= n else 1
+        first = max(1, centre - _SRC_WINDOW)
+        last = min(n, centre + _SRC_WINDOW)
+        truncated = True
+    span = "\n".join(lines[first - 1:last])
+
+    key = (rp, stt.st_mtime_ns, stt.st_size, first, last, _SRC_STYLE)
+    with _SRC_CACHE_LOCK:
+        hit = _SRC_CACHE.get(key)
+        if hit is not None:
+            _SRC_CACHE.move_to_end(key)
+    if hit is None:
+        try:
+            hit = _source_render(rp, span, first)
+        except Exception as e:
+            return {"error": "highlight failed: %s" % type(e).__name__}, 500
+        with _SRC_CACHE_LOCK:
+            _SRC_CACHE[key] = hit
+            while len(_SRC_CACHE) > _SRC_CACHE_MAX:
+                _SRC_CACHE.popitem(last=False)
+    body_html, lang = hit
+
+    rel = rp
+    for _name, root in roots:
+        if _path_within(rp, root):
+            rel = os.path.relpath(rp, root)
+            break
+    return {"ok": True, "path": rp, "display": os.path.basename(rp), "rel": rel,
+            "root": why, "lang": lang, "lines": n, "first": first, "last": last,
+            "truncated": truncated, "line": line or None, "html": body_html,
+            "css": _source_css(), "css_ver": "%s/%s" % (_SRC_STYLE, _HAVE_PYGMENTS)}, 200
+
+
+def _read_skill_frontmatter(path):
+    """Pull (name, description) out of a SKILL.md YAML header.
+
+    Deliberately a hand-rolled scan rather than a YAML dependency: the header is
+    a fixed two-key shape and the daemon is stdlib-only. Returns (None, None) if
+    the file does not match the expected shape, so a malformed skill is skipped
+    rather than breaking prompt construction.
+    """
+    try:
+        with open(path) as f:
+            text = f.read(8192)
+    except OSError:
+        return None, None
+    # Header is the first `---` fenced block; a copyright comment may precede it.
+    start = text.find("---")
+    if start < 0:
+        return None, None
+    end = text.find("\n---", start + 3)
+    if end < 0:
+        return None, None
+    block = text[start + 3:end]
+    name = desc = None
+    key = None
+    for line in block.splitlines():
+        m = re.match(r"^(name|description):\s*(.*)$", line)
+        if m:
+            key = m.group(1)
+            val = m.group(2).strip()
+            if key == "name":
+                name = val
+            else:
+                desc = val
+        elif key == "description" and line.startswith((" ", "\t")):
+            # Folded continuation line of a multi-line description.
+            desc = (desc + " " + line.strip()).strip()
+        elif line.strip():
+            key = None
+    return name, desc
+
+
+def _llm_tool_args(inp, max_keys=8, max_val=80):
+    """Compact tool arguments for the browser's tool row.
+
+    Truncates each VALUE rather than the finished string, so the result is
+    always parseable JSON — the browser renders one labelled chip per key and
+    falls back to raw text when a parse fails.
+    """
+    out = {}
+    for k, v in list((inp or {}).items())[:max_keys]:
+        if isinstance(v, bool) or isinstance(v, (int, float)) or v is None:
+            out[k] = v
+            continue
+        if isinstance(v, str):
+            s = " ".join(v.split())
+        else:
+            try:
+                s = json.dumps(v, separators=(",", ":"))
+            except (TypeError, ValueError):
+                s = str(v)
+        out[k] = s if len(s) <= max_val else s[:max_val - 1] + "…"
+    try:
+        return json.dumps(out, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return "{}"
+
+
+def _llm_skills():
+    """Discover skills written for the embedded LLM. Returns [(name, desc, path)]."""
+    out = []
+    try:
+        entries = sorted(os.listdir(_LLM_SKILLS_DIR))
+    except OSError:
+        return out
+    for d in entries:
+        path = os.path.join(_LLM_SKILLS_DIR, d, "SKILL.md")
+        if not os.path.isfile(path):
+            continue
+        name, desc = _read_skill_frontmatter(path)
+        if name and desc:
+            out.append((name, desc, path))
+    return out
+
+
+def _resolve_work_dir(workdir):
+    """Locate the aiecompiler Work/ directory for a given app workdir.
+
+    For naiebaremetal apps, workdir is <example>/worklocal and Work/ sits at
+    <example>/Work.  For aiehlc apps there is no Work/ at all (the compiler
+    emits provenance JSONs directly).  Returns the absolute path to Work/ if
+    found, otherwise None.
+    """
+    # Direct child: aiehlc-style layout (rare but kept for symmetry)
+    direct = os.path.join(workdir, "Work")
+    if os.path.isdir(direct):
+        return direct
+    # Sibling: naiebaremetal worklocal sits beside Work/
+    if os.path.basename(workdir) == "worklocal":
+        sibling = os.path.join(os.path.dirname(workdir), "Work")
+        if os.path.isdir(sibling):
+            return sibling
+    return None
+
+
+def _resolve_default_elf(workdir):
+    """Pick the project's default host ELF when --elf is omitted.
+
+    Search order:
+      1. <workdir>/build/host              — aiehlc tiling build output
+      2. parent of workdir: *.elf          — naiebaremetal: vek385.elf sits beside Work/
+      3. aout/main.elf                     — global aiehlc fallback
+      4. aout/worklocal/build/host         — aiehlc worklocal fallback
+
+    Returns an absolute path, or None if nothing is found.
     """
     candidates = [
         os.path.join(workdir, "build", "host"),
+    ]
+    # naiebaremetal style: workdir is <example>/worklocal, ELF is in <example>/
+    parent = os.path.dirname(workdir)
+    if os.path.basename(workdir) == "worklocal" and os.path.isdir(parent):
+        for name in ("vek385.elf", "main.elf"):
+            candidates.append(os.path.join(parent, name))
+        # also accept any single *.elf in parent
+        try:
+            elfs = [f for f in os.listdir(parent) if f.endswith(".elf")]
+            if len(elfs) == 1:
+                candidates.append(os.path.join(parent, elfs[0]))
+        except OSError:
+            pass
+    candidates += [
         os.path.join(_REPO_ROOT, "aout", "main.elf"),
         os.path.join(_REPO_ROOT, "aout", "worklocal", "build", "host"),
     ]
@@ -218,6 +880,7 @@ if _THIS_DIR not in sys.path:
 import aiediag  # noqa: E402
 import aiegdb  # noqa: E402
 import schedule_view  # noqa: E402  (render_html for server-side app injection)
+import work2provenance  # noqa: E402  (auto-generate worklocal/ from Work/)
 
 # pexpect drives the interactive ssh -> systest -> xsdb -> hw_server recovery
 # session (see DebugState.start_hwserver_async). Optional: without it the auto-start
@@ -233,6 +896,16 @@ VITIS_SETTINGS = ("/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/"
                   "Vitis/settings64.sh")
 XSDB_ALT_PATH = ("/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/"
                  "Vitis/bin/xsdb")
+
+
+# Written for the LLM as much as the user: the model must not fill the gap with
+# assumptions about board state when a read is refused.
+_NO_SESSION_MSG = (
+    "not connected — no board session has been established in this UI. "
+    "Press \"Connect\" to verify the JTAG link, \"Run test\" to start a run, or "
+    "\"Open Current Session\" to attach to a run started outside the UI. "
+    "Nothing was read; do NOT infer board state."
+)
 
 
 def _strip_ansi(s):
@@ -289,22 +962,56 @@ class App:
 
     def caps(self):
         """Per-app capabilities. The two producer flows differ only in optional
-        bundle files, so consumers must check rather than assume. Must agree
-        with what _load_app_profile puts in /devices, including the aiesim
-        device auto-detected from sim_config.sh."""
+        bundle files, so consumers must check rather than assume. Shares
+        _detect_sim_device with _load_app_profile so the label in the app list
+        cannot disagree with the devices actually offered in /devices."""
         ui_cfg = _load_ui_config(self.path)
         devs = list(ui_cfg.get("extra_devices", []) or [])
         if not any(d.get("value") == "simulator" for d in devs):
-            auto = _detect_aiesim_device(self.path)
+            auto = _detect_sim_device(self.path)
             if auto:
                 devs.append(auto)
+        if not any(d.get("hw_run_script") for d in devs):
+            auto = _detect_hw_device(self.path)
+            if auto:
+                devs.append(auto)
+        has_sim = any(d.get("sim_script") for d in devs)
+        stale = ""
+        declared_hw = next((d for d in (ui_cfg.get("extra_devices") or [])
+                            if d.get("hw_run_script")), None)
+        if declared_hw:
+            named = (declared_hw.get("hw_env") or {}).get("VEK385IP", "")
+            expected = _expected_board_host(self.path)
+            if named and expected and named != expected:
+                stale = (f"debug_ui_config.json names VEK385IP={named} — ignored; "
+                         f"the board comes from the UI box / $VEK385IP / "
+                         f"hwlocal.sh (currently {expected})")
         return {
             "has_ui_config": bool(ui_cfg),
             "has_backend_status": os.path.isfile(
                 os.path.join(self.path, "backend_status.json")),
-            "has_sim": any(d.get("sim_script") for d in devs),
+            "has_sim": has_sim,
             "has_hw": any(d.get("hw_run_script") for d in devs),
+            "hw_stale": stale,
+            "no_sim_reason": "" if has_sim else self._no_sim_reason(),
         }
+
+    def _no_sim_reason(self):
+        """Which precondition sim detection missed, so a `view-only` row in the
+        startup listing is actionable. Flow is picked by the same up-tree probe
+        the detectors use."""
+        example = os.path.dirname(self.path.rstrip(os.sep))
+        if _find_up(example, os.path.join("script", "runsim_ipc.sh")):
+            if not os.path.isfile(os.path.join(example, "ipc",
+                                               "build_sim.env")):
+                return ("no ipc/build_sim.env — not built for sim "
+                        "(run build_sim.sh <example>)")
+            if not os.path.isdir(os.path.join(example, "Work", "ps", "c_rts",
+                                              "systemC")):
+                return "no Work/ps/c_rts/systemC — aiecompiler output missing"
+            return "IPC sim detection failed"
+        return ("no sim_config.sh — not built for sim "
+                "(rebuild with aiehlc.sh --platform sim)")
 
     def load_view(self):
         """Parsed schedule_view.json, cached until the file changes on disk so a
@@ -323,6 +1030,40 @@ class App:
         return d
 
 
+def _try_generate_worklocal(example_dir):
+    """If example_dir has a Work/ but no up-to-date worklocal/schedule_view.json,
+    run work2provenance + schedule_view to produce it.
+    Returns the worklocal path on success (whether generated or already current),
+    None on failure."""
+    work_dir = os.path.join(example_dir, "Work")
+    worklocal = os.path.join(example_dir, "worklocal")
+    svjson = os.path.join(worklocal, "schedule_view.json")
+    if not os.path.isdir(work_dir):
+        return None
+    # Use the mtime of aie_control_config.json as a cheap proxy for Work/ freshness —
+    # avoids walking the whole tree on every scan.
+    control_cfg = os.path.join(work_dir, "ps", "c_rts", "aie_control_config.json")
+    work_mtime = (os.path.getmtime(control_cfg)
+                  if os.path.isfile(control_cfg) else 0)
+    sv_mtime = os.path.getmtime(svjson) if os.path.isfile(svjson) else 0
+    if sv_mtime >= work_mtime and sv_mtime > 0:
+        return worklocal  # already up-to-date
+    try:
+        print(f"[AppRegistry] generating worklocal for {os.path.basename(example_dir)} ...")
+        work2provenance.work_to_provenance(work_dir, worklocal)
+        view = schedule_view.build_view(worklocal)
+        schedule_view.write_code_cache(view, workdir=worklocal)
+        sv_path = os.path.join(worklocal, "schedule_view.json")
+        with open(sv_path, "w") as _f:
+            json.dump(view, _f, indent=2)
+        print(f"[AppRegistry]   wrote {sv_path}")
+        return worklocal
+    except Exception as e:
+        print(f"[AppRegistry] warning: could not generate worklocal for "
+              f"{os.path.basename(example_dir)}: {e}", file=sys.stderr)
+        return None
+
+
 class AppRegistry:
     """Discovers loadable apps: aout/** in this repo, plus explicit --app paths
     and --app-root trees (e.g. ../naiebaremetal/example)."""
@@ -330,9 +1071,14 @@ class AppRegistry:
     def __init__(self, explicit=None, roots=None, auto_roots=None):
         self._apps = {}
         self._order = []
+        # Apps the user actually named (positional workdir, then --app), in the
+        # order given. default() prefers these; discovered ones are a fallback.
+        self._explicit = []
         for spec in (explicit or []):
             path, _, label = spec.partition("=")
-            self._add(path, label or None)
+            app = self._add(path, label or None)
+            if app is not None and app.id not in self._explicit:
+                self._explicit.append(app.id)
         for root in (roots or []):
             self._scan(root)
         for root in (auto_roots or []):
@@ -367,6 +1113,12 @@ class AppRegistry:
             if "schedule_view.json" in filenames:
                 self._add(dirpath)
                 dirnames[:] = []
+            elif "Work" in os.listdir(dirpath):
+                # aiecompiler example without a worklocal yet — auto-generate
+                wl = _try_generate_worklocal(dirpath)
+                if wl:
+                    self._add(wl)
+                dirnames[:] = []
 
     def list(self):
         """Apps newest-first by schedule_view.json mtime."""
@@ -377,6 +1129,19 @@ class AppRegistry:
         return self._apps.get(app_id)
 
     def default(self):
+        """The app to open with.
+
+        An explicitly named one wins. list() is newest-first by
+        schedule_view.json mtime, so without this a positional workdir — the
+        historical single-app invocation, and what run_debug_ui.sh passes on a
+        cold start — lost to whichever unrelated app happened to be rebuilt
+        most recently. That also silently scoped bare-filename lookups to the
+        wrong app.
+        """
+        for app_id in self._explicit:
+            app = self._apps.get(app_id)
+            if app is not None:
+                return app
         apps = self.list()
         return apps[0] if apps else None
 
@@ -405,6 +1170,25 @@ class DebugState:
         self._run_proc = None         # subprocess.Popen or None
         self._run_fh = None           # open applog file handle (subprocess stdout)
         self._run_id = 0
+
+        # ---- session provenance ------------------------------------------
+        # self.target is populated at startup from $AIEDBG_TARGET (envlocal.sh),
+        # so its mere presence proves nothing about whether THIS session ever
+        # reached the board. Without the flags below every consumer answered
+        # "are we connected?" with bool(self.target) — which is true from process
+        # start — and the LLM would read a physically reachable board still
+        # holding a previous run's state and report it as the current run.
+        #
+        # _hw_session is None until the user does one of three things:
+        #   connected  a /ping probe succeeded         ("Connect")
+        #   ran        a run was started from this UI  ("Run test")
+        #   attached   the user adopted a run they started outside the UI
+        #              ("Open Current Session") — the board's prior history is
+        #              explicitly unknown in this mode, which is why it is not
+        #              folded into "ran".
+        self._session_started_at = time.time()
+        self._hw_session = None       # None | {mode, at, target, detail}
+        self._last_run = None         # None | {run_id, started_at, device}
 
         # hw_server auto-launch session, started on the connect-failure recovery
         # path (/launch_hwserver). One long-lived pexpect ssh child runs
@@ -486,9 +1270,13 @@ class DebugState:
         sim_dev = next((d for d in self._extra_devices
                         if d.get("value") == "simulator"), None)
         if sim_dev is None:
-            sim_dev = _detect_aiesim_device(workdir)
+            sim_dev = _detect_sim_device(workdir)
             if sim_dev:
                 self._extra_devices.append(sim_dev)
+        if not any(d.get("hw_run_script") for d in self._extra_devices):
+            hw_dev = _detect_hw_device(workdir)
+            if hw_dev:
+                self._extra_devices.append(hw_dev)
         self.sim_kind = (sim_dev or {}).get("sim_kind", "ipc")
         self.sim_script = sim_dev.get("sim_script") if sim_dev else None
         self.sim_example_dir = sim_dev.get("sim_example_dir") if sim_dev else None
@@ -511,8 +1299,19 @@ class DebugState:
         app = self.registry.get(app_id)
         if app is None:
             return {"error": f"unknown app: {app_id}"}
-        if self.run_in_progress() or self.sim_running():
-            return {"error": "cannot switch apps while a run is in progress"}
+        # Name the blocker and the remedy. A bare "a run is in progress" leaves
+        # the user staring at a dropdown that snapped back, with no idea which
+        # of the two processes to stop.
+        if self.run_in_progress():
+            return {"error": "cannot switch apps while a board run is in "
+                             "progress — press Stop on the run first"}
+        if self.sim_running():
+            return {"error": "cannot switch apps while the simulator is "
+                             "running — press Stop sim first. (Switching would "
+                             "repoint startcol/aie_version and the provenance "
+                             "JSONs at another app, so live reads from this "
+                             "simulator would be decoded against the wrong "
+                             "design.)"}
 
         self.app = app
         self.workdir = app.path
@@ -592,6 +1391,85 @@ class DebugState:
             self._tiles = view.get("tiles", [])
         return self._tiles
 
+    # ---- session provenance ----------------------------------------------
+    def mark_hw_session(self, mode, detail="", target=None):
+        """Record that this session legitimately reached the board. Called by
+        the /ping probe, start_run, and /attach — never by target resolution."""
+        with self._lock:
+            self._hw_session = {"mode": mode, "at": time.time(),
+                                "target": target or self.target or "",
+                                "detail": detail}
+        self._write_backend_status()
+
+    def hw_authorized(self):
+        """True once the user has connected, run, or attached in this session.
+        Gates every live register read so nothing reports stale board state as
+        if it were current."""
+        return self._hw_session is not None
+
+    def applog_provenance(self):
+        """Classify the applog on disk relative to this session.
+
+        `applog` is a fixed repo-root path that the manual CLI flow writes too,
+        so a file sitting there is NOT evidence that this session ran anything —
+        which is exactly how a previous run's "PASS" gets read as current."""
+        if not os.path.isfile(self.applog):
+            return {"exists": False, "state": "absent"}
+        mtime = os.path.getmtime(self.applog)
+        if self._last_run is not None:
+            state = "current"          # this session started the run that wrote it
+        elif mtime < self._session_started_at:
+            state = "predates_session"
+        else:
+            state = "foreign"          # written while we were up, but not by us
+        return {"exists": True, "state": state, "mtime": mtime,
+                "mtime_iso": time.strftime("%Y-%m-%d %H:%M:%S",
+                                           time.localtime(mtime)),
+                "session_start_iso": time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(self._session_started_at))}
+
+    def session_state(self):
+        """Canonical session provenance, published to backend_status.json and
+        every model-visible surface. One builder so the UI, the MCP servers and
+        the LLM context line can never disagree about what happened."""
+        s = self._hw_session
+        return {
+            "authorized": s is not None,
+            "mode": (s or {}).get("mode", "none"),
+            "since_iso": (time.strftime("%Y-%m-%d %H:%M:%S",
+                                        time.localtime(s["at"])) if s else ""),
+            "detail": (s or {}).get("detail", ""),
+            "session_start_iso": time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(self._session_started_at)),
+            "run_started": self._last_run is not None,
+            "run_in_progress": self.run_in_progress(),
+            "last_run": self._last_run or {},
+            "applog": self.applog_provenance(),
+        }
+
+    def session_summary(self):
+        """One-line, model-facing rendering of session_state()."""
+        st = self.session_state()
+        if not st["authorized"]:
+            return ("NO BOARD SESSION — the user has not connected, run, or "
+                    "attached in this UI. Live reads are blocked and any on-disk "
+                    "log predates this session.")
+        mode = st["mode"]
+        if mode == "attached":
+            base = (f"ATTACHED at {st['since_iso']} to a run started OUTSIDE this "
+                    f"UI — the board's earlier history is unknown to the daemon")
+        elif mode == "ran":
+            base = f"RAN from this UI at {st['since_iso']}"
+        else:
+            base = (f"CONNECTED at {st['since_iso']} (link verified) but NO run "
+                    f"has been started in this session")
+        ap = st["applog"]
+        if ap["state"] == "predates_session":
+            base += f"; the applog on disk was written {ap['mtime_iso']}, BEFORE this session"
+        elif ap["state"] == "absent":
+            base += "; no applog on disk"
+        return base
+
     # ---- run orchestration ----------------------------------------------
     def run_in_progress(self):
         """True while a board run is live. Used to gate aiedbg endpoints so
@@ -599,6 +1477,41 @@ class DebugState:
         download over the single serialized xsdb://<PALIP>:3121 link."""
         with self._lock:
             return self._run_proc is not None and self._run_proc.poll() is None
+
+    def run_state(self):
+        """Run bookkeeping for the browser to reconcile against. No JTAG, so it
+        is safe to poll; /ping, /settarget and /run all refuse while a run is
+        live, so a browser that lost track of one has no other way back."""
+        with self._lock:
+            proc = self._run_proc
+            running = proc is not None and proc.poll() is None
+            pid = proc.pid if proc is not None else None
+            last = dict(self._last_run or {})
+            run_id = self._run_id
+        started = last.get("started_at")
+        status, text = "idle", ""
+        if os.path.isfile(self.applog):
+            try:
+                with open(self.applog, "rb") as f:
+                    text = f.read().decode("utf-8", errors="replace")
+                status = self._derive_status(text, running,
+                                             os.path.getmtime(self.applog))
+            except OSError:
+                pass
+        return {
+            "running": running,
+            "run_id": run_id if running else last.get("run_id", 0),
+            "pid": pid if running else None,
+            "device": last.get("device", ""),
+            "started_iso": last.get("started_iso", ""),
+            "age_s": (int(time.time() - started)
+                      if running and started else None),
+            "status": status,
+            "stale": bool(running and status == "hang"),
+            "debuggable": self._is_debuggable(text, status) if running else False,
+            "applog": self.applog,
+            "session": self.session_state(),
+        }
 
     def run_blocks_debug(self):
         """True only while a live run still holds the JTAG link EXCLUSIVELY, i.e.
@@ -630,13 +1543,13 @@ class DebugState:
              top of os.environ.  board_host (if provided) is set as VEK385IP.
           2. vek385 (built-in): appvek385.py in the same dir as apppaltest;
              requires board_host → VEK385IP.
-          3. palmyra (default): apppaltest.py; inherits the daemon's env.
+          3. pal (default): apppaltest.py; inherits the daemon's env.
 
         The elf positional is omitted unless configured (--elf); with -y, the
         script auto-picks its default elf, matching the manual
         `<script>.py -y -nonreboot` invocation.
         """
-        device = (device or "palmyra").strip().lower()
+        device = (device or "pal").strip().lower()
         with self._lock:
             if self._run_proc and self._run_proc.poll() is None:
                 return {"error": "a run is already in progress",
@@ -653,26 +1566,33 @@ class DebugState:
                 script = cfg_dev["hw_run_script"]
                 if not os.path.isfile(script):
                     return {"error": f"hw_run_script not found: {script}"}
-                env = os.environ.copy()
-                for k, v in (cfg_dev.get("hw_env") or {}).items():
-                    env[k] = str(v)
-                if board_host:
-                    env["VEK385IP"] = board_host
+                # The UI's hostname box wins over anything the profile carries.
+                env, _host = _board_run_env(os.environ, cfg_dev, board_host,
+                                            self.workdir)
 
             elif device == "vek385":
                 script = os.path.join(os.path.dirname(self.apppaltest),
                                       "appvek385.py")
-                if not board_host:
+                # Same resolution order as the profile path, so the built-in
+                # runner also picks up the checkout's board when the UI's box
+                # is empty instead of refusing outright.
+                host = (board_host or "").strip() or _expected_board_host(
+                    self.workdir)
+                if not host:
                     return {"error": "vek385 requires a board hostname"}
                 if not os.path.isfile(script):
                     return {"error": f"appvek385.py not found: {script}"}
-                env = os.environ.copy()
-                env["USERNAME"] = getpass.getuser()
-                env["VEK385IP"] = board_host
+                env, _host = _board_run_env(os.environ, {}, host, self.workdir)
+
+            elif device in ("pal", "palmyra", ""):
+                device = "pal"
+                script = self.apppaltest
 
             else:
-                device = "palmyra"
-                script = self.apppaltest
+                # No runner for this board. Falling through to apppaltest would
+                # have quietly deployed the palmyra test to whatever was picked.
+                return {"error": f"no run script for {device}; add one via "
+                                 f"debug_ui_config.json (hw_run_script)"}
 
             self._run_id += 1
             run_id = self._run_id
@@ -689,8 +1609,10 @@ class DebugState:
                 return {"error": f"cannot open applog {self.applog}: {e}"}
             fh.write(f"$ {' '.join(cmd)}\n")
             if env and "VEK385IP" in env:
+                # The board is a per-run choice, so the log must name it.
                 fh.write(f"# env: USERNAME={env.get('USERNAME', '')} "
-                         f"VEK385IP={env['VEK385IP']}\n")
+                         f"VEK385IP={env['VEK385IP']} "
+                         f"AIEDBG_TARGET={env.get('AIEDBG_TARGET', '')}\n")
             fh.flush()
             try:
                 # start_new_session=True → child leads its own process group so
@@ -703,6 +1625,12 @@ class DebugState:
                 fh.close()
                 return {"error": f"cannot launch {os.path.basename(script)}: {e}"}
             self._run_fh = fh
+            # This session now owns the applog, so its contents describe the
+            # current run rather than whatever was on disk beforehand.
+            self._last_run = {"run_id": run_id, "device": device,
+                              "started_at": time.time(),
+                              "started_iso": time.strftime("%Y-%m-%d %H:%M:%S")}
+        self.mark_hw_session("ran", f"run #{run_id} on {device}")
         return {"run_id": run_id, "applog": self.applog, "device": device}
 
     def stop_run(self):
@@ -710,7 +1638,9 @@ class DebugState:
         with self._lock:
             proc = self._run_proc
             if proc is None or proc.poll() is not None:
-                return {"stopped": False, "error": "no run in progress"}
+                self._run_proc = None
+                return {"stopped": False, "error": "no run in progress",
+                        "running": False}
             pid = proc.pid
             run_id = self._run_id
             try:
@@ -730,6 +1660,11 @@ class DebugState:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 pass
+        # A child parked in an uninterruptible syscall survives SIGKILL and
+        # poll() then returns None forever. run_in_progress() gates /ping, /run
+        # and /settarget, so holding the handle would wedge every recovery path
+        # until a daemon restart. Release it regardless.
+        abandoned = proc.poll() is None
         with self._lock:
             if self._run_fh:
                 try:
@@ -737,13 +1672,21 @@ class DebugState:
                 except OSError:
                     pass
                 self._run_fh = None
+            if self._run_proc is proc:
+                self._run_proc = None
         # Note the kill in the applog so the live tail reflects it.
         try:
             with open(self.applog, "a") as f:
-                f.write(f"\n[force-stop: killed run {run_id} (pid {pid})]\n")
+                if abandoned:
+                    f.write(f"\n[force-stop: run {run_id} (pid {pid}) did not "
+                            f"die after SIGKILL — handle released; the process "
+                            f"may still be alive and holding the JTAG link]\n")
+                else:
+                    f.write(f"\n[force-stop: killed run {run_id} (pid {pid})]\n")
         except OSError:
             pass
-        return {"stopped": True, "run_id": run_id, "pid": pid}
+        return {"stopped": True, "run_id": run_id, "pid": pid,
+                "abandoned": abandoned, "running": False}
 
     def sim_in_progress(self):
         with self._sim_lock:
@@ -959,14 +1902,17 @@ class DebugState:
         session buffer so the browser can stream live progress.
 
         Per-device sequence (as specified by the user):
-          palmyra: ssh <USERNAME>@<PALIP> -> /bin/systest -> become "<BOARD>"
-          vek385 : ssh <host>             -> /proj/systest/bin/systest
+          pal: ssh <USERNAME>@<PALIP> -> /bin/systest -> become "<BOARD>"
+          others : ssh <host>             -> /proj/systest/bin/systest
         both then: xsdb -> exec hw_server -stcp:0.0.0.0:3121
         """
         device = (device or "").strip().lower()
-        if device == "vek385":
+        if device != "pal":
+            # Every board except pal is reached by its hostname. Keyed on the
+            # host rather than on `vek385` specifically, so vek280/vck190 do not
+            # fall through and ssh to $PALIP instead of the board the user picked.
             if not host:
-                raise RuntimeError("vek385 requires a board hostname")
+                raise RuntimeError(f"{device or 'board'} requires a hostname")
             ssh_target = host
             systest = "/proj/systest/bin/systest"
             board = None
@@ -1113,8 +2059,8 @@ class DebugState:
                 "debuggable": self._is_debuggable(full_text, status)}
 
     _DEBUGGABLE_MARKERS = (
-        "ELF download complete!",
-        "Execution started!",
+        "ELF download complete",
+        "Execution started",
         "board stays powered on for debug",
         "wait_io TIMEOUT",
         "Waiting for console output",
@@ -1152,6 +2098,11 @@ class DebugState:
                "--startcol", str(self.startcol), "--device", self.device,
                "--aie-version", str(self.aie_version),
                "--json-dir", self.workdir]
+        # Auto-inject --work-dir for aiecompiler apps (naiebaremetal and similar).
+        # aiehlc apps emit provenance JSONs directly and have no Work/ tree.
+        _work_dir = _resolve_work_dir(self.workdir)
+        if _work_dir:
+            cmd += ["--work-dir", _work_dir]
         if self.target:
             cmd += ["--target", self.target]
         self._gdb_proc = subprocess.Popen(
@@ -1192,6 +2143,10 @@ class DebugState:
 
     def gdb_command(self, cmd):
         """Send one command to the aiegdb REPL; return {output, scope}."""
+        # callstack commands open a fresh XSDB connection to read a live PC,
+        # which can take 2-3 min through a farm host.  Give them extra room.
+        stripped = cmd.strip().lower()
+        read_timeout = 300 if stripped.startswith("callstack") else 60
         with self._gdb_lock:
             if self._gdb_proc is None or self._gdb_proc.poll() is not None:
                 self._gdb_spawn()
@@ -1202,7 +2157,7 @@ class DebugState:
                 self._gdb_proc = None
                 return {"output": "[aiegdb: pipe broken; retry]",
                         "scope": self._gdb_scope}
-            out = self._gdb_read_until_marker()
+            out = self._gdb_read_until_marker(timeout=read_timeout)
             return {"output": _strip_ansi(out), "scope": self._gdb_scope}
 
     def gdb_reload(self):
@@ -1223,9 +2178,9 @@ class DebugState:
             self._gdb_spawn()
             return {"ok": True, "scope": self._gdb_scope}
 
-    def retarget(self, tgt):
-        """Point live debug at a new JTAG target and drop the aiegdb REPL so its
-        next command respawns against it.
+    def retarget(self, tgt, device=None):
+        """Point live debug at a new JTAG target (and aiedbg device) and drop the
+        aiegdb REPL so its next command respawns against them.
 
         Called from /settarget after the browser's `Test connect` (/ping) has
         already verified `tgt` is reachable — so this only *switches* the target,
@@ -1234,9 +2189,17 @@ class DebugState:
         new target to take effect; the next gdb_command lazily respawns it. Also
         invalidates the cached MCP config (which embeds the old target) so the
         LLM tab picks up the new target on its next spawn.
+
+        `device` is the aiedbg -d name, which the dropdown now carries directly.
+        It is set here rather than only at startup because it feeds four places
+        at once — the aiegdb subprocess, the MCP config the LLM tab spawns with,
+        do_cmd's aiediag reads and backend_status.json — and staying on the
+        launch value left aiedbg decoding a 38-column part as a 12-column one.
         """
         with self._gdb_lock:
             self.target = tgt or None
+            if device:
+                self.device = device
             proc = self._gdb_proc
             if proc is not None:
                 try:
@@ -1249,9 +2212,13 @@ class DebugState:
                         pass
                 self._gdb_proc = None
         self._invalidate_mcp_config()
+        # backend_status.json carries target+device to the out-of-process MCP
+        # servers; without this refresh get_backend_status() keeps reporting the
+        # startup device long after Connect switched boards.
+        self._write_backend_status()
         if self.llm_enabled:
             self.llm_reset()
-        return {"ok": True, "target": self.target}
+        return {"ok": True, "target": self.target, "device": self.device}
 
     # ---- Claude Code (LLM) streaming subprocess --------------------------
     # `claude -p --input-format stream-json --output-format stream-json ...`
@@ -1298,6 +2265,26 @@ class DebugState:
             except OSError:
                 pass
 
+    def app_paths(self):
+        """Resolved filesystem locations for the currently selected app.
+
+        The LLM is served out of the provenance bundle, which for both producer
+        flows is a *subdirectory* (`worklocal/`) of the app, with the aiecompiler
+        `Work/` tree as a sibling. Neither the app root nor Work/ is discoverable
+        from the bundle path alone, so an assistant told only the workdir cannot
+        find the app's sources — it has to be told all three.
+        """
+        bundle = self.workdir
+        app_dir = (os.path.dirname(bundle)
+                   if os.path.basename(bundle) == "worklocal" else bundle)
+        return {
+            "app": (self.app.label if self.app else os.path.basename(app_dir)),
+            "app_dir": app_dir,
+            "bundle_dir": bundle,
+            "work_dir": _resolve_work_dir(bundle) or "",
+            "elf": self.elf or "",
+        }
+
     def _write_backend_status(self):
         """Write workdir/backend_status.json with live backend state.
 
@@ -1324,6 +2311,15 @@ class DebugState:
             "sim_base_addr": str(addr_params[0]) if addr_params else "",
             "sim_col_shift": str(addr_params[1]) if addr_params else "",
             "sim_row_shift": str(addr_params[2]) if addr_params else "",
+            # Provenance travels with the status so the MCP servers (separate
+            # processes) can refuse or caveat reads without a daemon round-trip.
+            "session": self.session_state(),
+            "session_summary": self.session_summary(),
+            # Travels with the status for the same reason as session state: the
+            # app can be switched mid-conversation, and the system prompt is
+            # only sent on the first turn.
+            "app_paths": self.app_paths(),
+            "aiedbg_paths": _aiedbg_paths(),
         }
         path = os.path.join(self.workdir, "backend_status.json")
         try:
@@ -1364,12 +2360,14 @@ class DebugState:
         aiemcp = os.path.join(_THIS_DIR, "aiemcp.py")
         debugui = os.path.join(_THIS_DIR, "debug_ui_mcp.py")
 
+        _mcp_work_dir = _resolve_work_dir(self.workdir) or ""
         aiegdb_env = {
             "AIEDBG_TARGET": self.target or "",
             "AIEMCP_DEVICE": self.device or "pal",
             "AIEMCP_STARTCOL": str(self.startcol),
             "AIEMCP_AIE_VERSION": str(self.aie_version),
             "AIEMCP_JSON_DIR": self.workdir,
+            "AIEMCP_WORK_DIR": _mcp_work_dir,
             "AIEMCP_BACKEND": want_backend,
         }
 
@@ -1478,16 +2476,116 @@ class DebugState:
             except (OSError, ValueError):
                 view = None
 
+        _ap = self.app_paths()
+        _work_dir_str = _ap["work_dir"] or "(none — this app has no aiecompiler Work/ tree)"
+        _elf_str = _ap["elf"] or "(not resolved)"
+        _abp = _aiedbg_paths()
+        _aiedbg_str = _abp["src"] or (
+            "(not found — run src/tool/debug/ensure_aiedbg.py to clone it, "
+            "or start the daemon without --skip-aiedbg-bootstrap)")
+
+        # The plugin already puts each skill's name+description in your context,
+        # so this block deliberately does NOT repeat the descriptions — it only
+        # names them and gives the on-disk fallback. Two reasons it exists at all:
+        # skill descriptions get truncated when the listing exceeds its context
+        # budget, and if plugin loading ever fails the assistant can still Read
+        # the files directly.
+        _skills = _llm_skills()
+        if _skills:
+            _skills_block = (
+                "\n## Debug skills (loaded as the `dbg-llm-skills` plugin)\n\n"
+                "These are verified, step-by-step procedures for THIS debug UI — "
+                "exact commands, register-decoding pitfalls, and preconditions you "
+                "will otherwise get wrong. Invoke one with the Skill tool as soon as "
+                "a task matches it; do not improvise a procedure a skill already covers.\n\n"
+                + "\n".join(f"- `{n}`" for n, _d, _p in _skills)
+                + f"\n\nIf the Skill tool cannot see these, read them directly from "
+                  f"{_LLM_SKILLS_DIR}/<name>/SKILL.md.\n"
+            )
+        else:
+            _skills_block = ""
+
         grid_summary = ""
         if view:
             grid = view.get("grid") or {}
             n_flows = len(view.get("comm_paths") or [])
             n_tiles = len(view.get("tiles") or [])
             grid_summary = (
-                f"\nThe loaded design has {n_tiles} tiles "
+                f"\n- Design: {n_tiles} tiles "
                 f"({grid.get('cols')} cols × {grid.get('rows')} rows, "
                 f"startcol={grid.get('startcol')}), {n_flows} communication flows."
             )
+
+        if self.sim_example_dir:
+            _sed = self.sim_example_dir
+            _sim_section = (
+                "## PS process and simulator debugging\n\n"
+                "This app has an IPC simulator. The run has two processes:\n"
+                f"- **ipc_app** (PS client): `{_sed}/ipc/ipc_app`\n"
+                "  Drives graph init, GMIO transfers, and result checks.\n"
+                "  stdout/stderr -> `get_sim_log()` (tails `ipc_app.log`).\n"
+                "- **aiesimulator** (server): Synopsys AIE functional simulator.\n"
+                "  stdout -> `ipc_sim.log` (shown in the Run console).\n"
+                "  Receives `WRITE32`/`READ32`/`WRITE_GM` etc. from ipc_app over a Unix socket.\n"
+                "\n"
+                "### Finding what the simulator run is currently doing\n\n"
+                "To check whether the simulator is still running and what it last did:\n"
+                "1. Call `get_sim_log(lines=20)` — last 20 lines of `ipc_app.log` (PS app output).\n"
+                "2. Call `get_ipc_log(lines=20)` — last 20 IPC transactions; the final client entry\n"
+                "   is the transaction ipc_app is currently blocked waiting for a response to.\n"
+                f"3. The simulator PID file is at: `{_sed}/ipc_sim.pid`\n"
+                "\n"
+                "### Inspecting what the PS process is doing (hung/stalled)\n\n"
+                "When ipc_app appears hung, read its kernel wait state from /proc\n"
+                "(use the Bash tool, not `aie_exec`, which takes aiegdb commands):\n\n"
+                "```bash\n"
+                f"cat {_sed}/ipc_sim.pid        # simulator PID\n"
+                "pgrep -f ipc_app               # ipc_app PID\n"
+                "cat /proc/<ipc_app_pid>/wchan  # syscall blocking the main thread\n"
+                "```\n\n"
+                "Common wchan values:\n"
+                "- `unix_stream_data_wait` — blocked in recv() waiting for simulator ack\n"
+                "- `futex_wait_queue_me` — waiting on a mutex/condvar\n"
+                "- `ep_poll` — epoll_wait (sim socket-dispatch thread)\n"
+                "- `0` — thread running or runnable\n"
+                "\n"
+                "### IPC transaction log\n\n"
+                "Every run writes timestamped CSV logs:\n"
+                f"- `{_sed}/ipc_client.log` — transactions from ipc_app\n"
+                f"- `{_sed}/ipc_server.log` — same transactions as dispatched by simulator\n\n"
+                "CSV columns: `seq, ts_ns, side, cmd, arg1, arg2, status, value, note`\n\n"
+                "To find a hang:\n"
+                "1. Call `get_ipc_log(lines=20)` — last client entry is what ipc_app is blocked on.\n"
+                "2. If server log has matching seq with OK but client doesn't -> response in flight or socket broken.\n"
+                "3. If neither has it -> simulator hasn't dispatched it yet (SystemC scheduling lag).\n\n"
+                "Key IPC commands:\n"
+                "- `GRAPH_INIT` — loads AIE ELFs + runs graph init (BD programming). Must finish before GMIO.\n"
+                "- `WRITE_GM` / `READ_GM` — GMIO data transfer. arg1=AIE addr, arg2=byte count.\n"
+                "- `WRITE32` / `READ32` — single AIE register r/w.\n"
+                "- `START_PLIO` — starts PLIO streams after graph init.\n"
+                "- `EXIT` — ipc_app teardown; sim shuts down after ack.\n"
+                "\n"
+                "### addr2line for ipc_app\n\n"
+                f"The binary `{_sed}/ipc/ipc_app` has DWARF debug symbols. Map an address to source:\n\n"
+                "```bash\n"
+                f"addr2line -e {_sed}/ipc/ipc_app -f -p 0x<addr>\n"
+                "```\n\n"
+                f"PS app source: `{_sed}/src/graph.cpp`\n"
+                "IPC backend: `src/ipc/aeg_ps_ipc_backend.cpp` — `do_transaction()` is the central send/recv loop.\n\n"
+            )
+        else:
+            _sim_section = ""
+
+        _workflow_step6 = (
+            "6. For a hang or stall on the **simulator**, call `get_ipc_log()` to find"
+            " the last IPC transaction, then use `aie_exec` (`dma status`, `bd`, `event`)"
+            " to trace the stall through the producer → hop → consumer chain;"
+            " or inspect `/proc/<pid>/wchan` to confirm what the PS process is waiting on."
+        ) if self.sim_example_dir else (
+            "6. For a hang or stall, use `aie_exec` (`dma status`, `bd`, `event`) to trace"
+            " the stall through the producer → hop → consumer chain."
+            " Check `get_applog()` for timeout or error messages."
+        )
 
         return f"""\
 You are an embedded AIE (AI Engine) debug assistant running inside the naiebaremetal \
@@ -1518,8 +2616,31 @@ Typical debug scenarios you should handle proactively:
 - **Performance**: use BD counters and the supply/demand verdict from `tile_info` to \
   identify the bottleneck stage.
 
-Always prefer concrete register evidence over speculation. If you are not connected \
-to hardware or the simulator, say so and explain what you would check once connected.
+Always prefer concrete register evidence over speculation.
+
+## MANDATORY precondition: check session provenance first
+
+A debug target is configured from the environment at startup, so the presence of a \
+target does NOT mean a board is live or that anything has been run. Every message you \
+receive carries a `Session:` line. Before reading hardware or interpreting any log:
+
+- **"NO BOARD SESSION"** — the user has not connected, run, or attached. Live reads are \
+  blocked and will return an error. Do NOT speculate about board state. Tell the user to \
+  press "Connect", "Run test", or "Open Current Session", and say what you would check once \
+  they do.
+- **"CONNECTED … but NO run has been started"** — the JTAG link is verified, but whatever \
+  the registers hold is left over from some earlier run, possibly days old or from another \
+  user. You may read, but you MUST label the findings as pre-existing board state, not the \
+  result of a run in this session.
+- **"ATTACHED … started OUTSIDE this UI"** — a real run is in play but the daemon did not \
+  start it and cannot vouch for what came before. Trust live registers; do not assume the \
+  run began cleanly.
+- **"RAN from this UI"** — only here may you treat live state and the applog as describing \
+  the current run.
+
+The same rule governs logs: if `get_applog` reports the file predates this session, it \
+describes a PREVIOUS run. A "PASS" in a stale log is not evidence that anything succeeded \
+now. Never present stale state as current — say plainly which it is.
 
 ## Your role (overview)
 Help the user understand their compiled AIE design, interpret DMA schedule data, \
@@ -1529,56 +2650,98 @@ schedule and live register state via MCP tools.
 
 ## The debug UI — what the user sees
 
-The browser is divided into two halves:
+The window is four panes, each with its name printed at its top-left. Use these \
+names when you refer to the UI, and expect the user to use them too — "the Info \
+pane", "the Tools pane". The table maps each one to the tool that answers \
+questions about it; `get_ui_state()` tells you what is selected in them right now \
+(`view`, `selected_tile`, `tile_tab`, `net_tab`, `flow`, `channel`, `console_pane`).
 
-**Left panel — AIE tile grid (Schedule View)**
-A grid of clickable tiles representing the AIE array. Each cell shows:
-- Tile type (shim / mem tile / core)
-- DMA channel badges (click to select a specific channel)
-- Colour coding: contract balance status (green=OK, amber/red=imbalance)
-Clicking a tile or channel badge opens its detail panel (right side) and \
-pre-loads context for your next message.
+| Pane | Position | Contains | Ask which tool |
+|---|---|---|---|
+| **AIE Debug** | top-left | the array itself, in one of two views | `get_design_overview`, `tile_list`, `get_flow_detail` |
+| **Run** | bottom-left | app + board selection, run buttons, run log | `get_backend_status`, `get_applog`, `get_sim_log` |
+| **Info** | top-right | detail for whatever is selected | `tile_info`, `get_flow_detail`, `get_pane` |
+| **Tools** | bottom-right | aiegdb console, this chat, Search | `aie_exec`, `symbol_search` |
 
-**Right panel — tile detail**
-Shows three sections (High / Middle / Low) for the selected tile:
-- High: role, kernel name, transfer summary, supply/demand verdict, channel↔kernel arg map
-- Middle: dfschedule IR slice
-- Low: attributed host.cc source lines
+**AIE Debug (top-left)** — a `Grid` / `Device Map` switcher over the same array; \
+`get_ui_state().view` is `"grid"` or `"map"`.
+- *Grid*: one clickable cell per tile — type (shim / mem / core), DMA channel \
+badges, colour-coded contract balance (green OK, amber/red imbalance).
+- *Device Map*: SVG of the physical array with each DMA flow drawn as a coloured \
+arc (f0, f1, …). Clicking an arc highlights every tile it touches and opens its \
+net detail in **Info**; the "All nets / f0 / f1 …" chips filter what is drawn.
+- Clicking a tile or channel badge in either view opens it in **Info** and \
+prepends context to your next message. A tile with no compiled schedule clears \
+**Info** and says "no schedule info" — that is a real empty selection, not a bug.
+- Live overlay controls sit here: the `DMA / Cores / Events` pills **select** what \
+to read, `Scan` reads it **once**, and the `live` checkbox re-reads every 2s. \
+Picking a pill does not itself read the board unless live is on.
 
-**Right panel — Device Map tab**
-An SVG map showing the physical AIE array and communication paths (flows). \
-Each coloured arc or arrow is one DMA flow (f0, f1, …). Clicking a flow arc \
-highlights all tiles it touches and opens a net detail panel. \
-The "All nets / f0 / f1 …" chip buttons filter which flows are highlighted.
+**Run (bottom-left)** — `App:` and `Board:` selectors, then `Connect`, \
+`Open Current Session`, `Run test`, `Force stop`, and the run log beneath them.
+- The board is chosen in the hostname box beside the `Board:` selector, per run — \
+the device entry itself names no board.
+- A run banner reports `run #N on <device> started <time> (<age> ago) — <status>`, \
+and flags a run whose log has gone quiet as stale.
+- Everything the log shows is `get_applog` (hardware) or `get_sim_log` (simulator).
 
-**Bottom-right pane — three tabs**
+**Info (top-right)** — detail for the current selection, as a strip of tabs (the \
+user can keep several tiles and nets open at once; ctrl+click adds).
+- For a tile: *High* (role, kernel, transfer summary, supply/demand verdict, \
+channel↔kernel arg map), *Middle* (dfschedule IR slice), *Low* (attributed \
+host.cc lines) — `tile_info(col, row, section)`, or `get_pane("tile.hi"|…)`.
+- For a net: producer/consumer stages and hop routing — `get_flow_detail(flow)`.
 
-1. **aiegdb** — interactive AIE debug console. Type commands like `dma status`, \
-`bd 0`, `pc`, `event`, `target tile 4 3`, `target channel S2MM 0`. \
-Use `help` for the full command reference.
+**Tools (bottom-right)** — three tabs; `get_ui_state().console_pane` says which is \
+open (`conpane` / `llmpane` / `searchpane`).
+1. **aiegdb** — the interactive console. The same commands you run with `aie_exec`, \
+so anything you can do the user can reproduce there verbatim.
+2. **LLM** — this chat.
+3. **Search** — symbol search over the compiled design (kernel, window, net, buffer, \
+BD length, flow, GMIO); matches highlight on the map. Same index as `symbol_search`.
 
-2. **LLM (this chat)** — you. The user can ask questions; clicking a tile or \
-flow first automatically prepends context to the next message you receive.
+When a user asks about "this pane" or "what I'm looking at", call `get_ui_state()` \
+first and resolve it against the table above rather than guessing.
 
-3. **Search** — symbol search across the compiled design. Type any kernel name, \
-window, net ID, buffer symbol, BD length, flow index, or GMIO name. \
-Matching tiles and flows are highlighted on the grid.
+**Where this app lives on disk**
+- App: {_ap["app"]}
+- App directory: {_ap["app_dir"]}
+  The app root. Sources, build scripts and the host ELF live here — this is the \
+directory to search when the user asks about kernel code, host code or build config.
+- Provenance bundle: {_ap["bundle_dir"]}
+  A subdirectory of the app holding the generated schedule JSONs the static tools \
+read. It is NOT the app root; do not look for sources here.
+- aiecompiler Work/: {_work_dir_str}
+  Sibling of the bundle. Holds aiecompiler output — generated kernel wrappers, \
+.bcf buffer maps, ps/c_rts/aie_control_config.json.
+- Host ELF: {_elf_str}
+- aiedbg clone: {_aiedbg_str}
+  Not part of the app — the debug tool itself. Its docs live ONLY in the clone \
+(the pip-installed package ships none); the `aiedbg-reference` skill indexes them.
 
-**Top-right — Run controls**
-- Device selector: choose "Simulator" or a hardware board (e.g. VEK385 portobello13)
-- Board hostname field (hardware only)
-- "Test connect" / "Activate" — probe the JTAG or IPC connection; \
-  must succeed before Run/overlay are enabled
-- "Run test" — flash BOOT.BIN (hardware) or start the simulator binary; \
-  streams stdout to the Run console below
-- "Live status overlay" — when checked, polls DMA/core/event registers \
-  every 2 s and overlays colour on the grid tiles
+Your working directory is the aiehlc_aiesim repo root, {_REPO_ROOT} — so a repo-relative \
+path like `src/tool/debug/aiegdb.py` (which is how the skills below refer to repo files) \
+resolves as-is, while app paths above are outside it and must be used absolute.
 
-**Current session state**
-- Working directory: {self.workdir}{grid_summary}
-- Debug target: {target_str}
+You may read any of these with your file tools. Paths above are absolute; prefer them \
+over guessing relative paths.
+
+**Cite source locations as `<file>:<line>`** — `host.cc:412`, \
+`src/tool/debug/aiegdb.py:88`, or an absolute path. The UI turns that into a click \
+that opens the file in the Info pane, highlighted at that line, so the user can read \
+the code you are describing without leaving the page. A bare filename with the line \
+mentioned separately ("host.cc, line 412") is NOT clickable. For files outside the \
+loaded app, give a path rather than a bare filename. If the user switches apps mid-conversation these change — \
+the `App:` field on each message's context line is authoritative.
+
+**Current session state**{grid_summary}
+- Configured debug target: {target_str}  (from the environment — NOT proof of a live board)
 - Backend: {backend_str}{"  (simulator available)" if sim_avail else ""}
+- Session at spawn: {self.session_summary()}
 
+This block is a snapshot from when this conversation started. The `Session:` line on each \
+message is authoritative and current — prefer it.
+{_skills_block}
 ## MCP tools available to you
 
 ### Static schedule tools (debugui server)
@@ -1610,87 +2773,7 @@ Matching tiles and flows are highlighted on the grid.
 - `aie_commands()` — list commands valid at current scope
 - `aie_help()` — full aiegdb command reference
 
-## PS process and simulator debugging
-
-The simulator run has two processes:
-- **ipc_app** (PS client): `{self.sim_example_dir + "/ipc/ipc_app" if self.sim_example_dir else "<sim_example_dir>/ipc/ipc_app"}` \
-  Drives graph init, GMIO transfers, and result checks. \
-  stdout/stderr → `get_sim_log()` (tails `ipc_app.log`).
-- **aiesimulator** (server): Synopsys AIE functional simulator. \
-  stdout → `ipc_sim.log` (shown in the Run console). \
-  Receives `WRITE32`/`READ32`/`WRITE_GM` etc. from ipc_app over a Unix socket.
-
-### Finding what the simulator run is currently doing
-
-To check whether the simulator is still running and what it last did:
-1. Call `get_sim_log(lines=20)` — last 20 lines of `ipc_app.log` (PS app output).
-2. Call `get_ipc_log(lines=20)` — last 20 IPC transactions; the final client entry \
-   is the transaction ipc_app is currently blocked waiting for a response to.
-3. The simulator PID file is at: \
-   `{self.sim_example_dir + "/ipc_sim.pid" if self.sim_example_dir else "<sim_example_dir>/ipc_sim.pid"}`
-
-### Inspecting what the PS process is doing (hung/stalled)
-
-When ipc_app appears hung, read its kernel wait state from /proc \
-(use `aie_exec` with a bash command, or the aiegdb console Bash tab):
-
-```bash
-# Simulator PID:
-cat {self.sim_example_dir + "/ipc_sim.pid" if self.sim_example_dir else "<sim_example_dir>/ipc_sim.pid"}
-
-# ipc_app PID (find via socket or binary name):
-pgrep -f ipc_app
-
-# What syscall is the main thread blocking on?
-cat /proc/<ipc_app_pid>/wchan
-
-# All threads:
-for tid in $(ls /proc/<ipc_app_pid>/task/); do echo "=== tid $tid ==="; cat /proc/<ipc_app_pid>/task/$tid/wchan; echo; done
-
-# Stack trace (if perf_event_paranoid allows):
-cat /proc/<ipc_app_pid>/task/<tid>/stack
-```
-
-Common wchan values:
-- `unix_stream_data_wait` — blocked in `recv()` waiting for simulator ack (normal mid-transaction)
-- `futex_wait_queue_me` — waiting on a mutex/condvar (normal for idle sim threads)
-- `ep_poll` — epoll_wait (normal for sim's socket-dispatch thread)
-- `0` — thread running or runnable
-
-### IPC transaction log
-
-Every run writes timestamped CSV logs:
-- `{self.sim_example_dir + "/ipc_client.log" if self.sim_example_dir else "ipc_client.log"}` — transactions from ipc_app
-- `{self.sim_example_dir + "/ipc_server.log" if self.sim_example_dir else "ipc_server.log"}` — same transactions as dispatched by simulator
-
-CSV columns: `seq, ts_ns, side, cmd, arg1, arg2, status, value, note`
-
-`ts_ns` is CLOCK_MONOTONIC nanoseconds. Delta between client and server rows = round-trip latency.
-
-To find a hang:
-1. Call `get_ipc_log(lines=20)` — last client entry is what ipc_app is blocked on.
-2. If server log has matching seq with OK but client doesn't → response in flight or socket broken.
-3. If neither has it → simulator hasn't dispatched it yet (SystemC scheduling lag).
-
-Key IPC commands:
-- `GRAPH_INIT` — loads AIE ELFs + runs graph init (BD programming). Must finish before GMIO.
-- `WRITE_GM` / `READ_GM` — GMIO data transfer. arg1=AIE addr, arg2=byte count.
-- `WRITE32` / `READ32` — single AIE register r/w (high-frequency during graph init).
-- `START_PLIO` — starts PLIO streams after graph init.
-- `EXIT` — ipc_app teardown; sim shuts down after ack.
-
-### addr2line for ipc_app
-
-The binary `{self.sim_example_dir + "/ipc/ipc_app" if self.sim_example_dir else "<sim_example_dir>/ipc/ipc_app"}` \
-has DWARF debug symbols. Map an address to source:
-
-```bash
-addr2line -e {self.sim_example_dir + "/ipc/ipc_app" if self.sim_example_dir else "<sim_example_dir>/ipc/ipc_app"} -f -p 0x<addr>
-```
-
-PS app source: `{self.sim_example_dir + "/src/graph.cpp" if self.sim_example_dir else "example/*/src/graph.cpp"}` \
-IPC backend: `src/ipc/aeg_ps_ipc_backend.cpp` — `do_transaction()` is the central send/recv loop.
-
+{_sim_section}
 ## Suggested workflow
 
 1. Call `get_design_overview()` to orient yourself.
@@ -1702,9 +2785,7 @@ IPC backend: `src/ipc/aeg_ps_ipc_backend.cpp` — `do_transaction()` is the cent
    commands to read DMA/core registers.
 5. If the user has just run and wants to check results, call `get_applog()` or \
    `get_sim_log()` depending on the backend.
-6. For a hang or stall, call `get_ipc_log()` to find the last IPC transaction, \
-   then use `/proc/<pid>/wchan` inspection via `aie_exec` Bash or the aiegdb console \
-   to confirm what each process is waiting on.
+{_workflow_step6}
 """
 
     def _llm_backend_context(self):
@@ -1719,12 +2800,30 @@ IPC backend: `src/ipc/aeg_ps_ipc_backend.cpp` — `do_transaction()` is the cent
         backend = s.get("backend", "unknown")
         ipc_ready = s.get("ipc_ready", False)
         target = s.get("target", "")
+        # The hardware branch used to report only the target — which is set from
+        # $AIEDBG_TARGET at startup — so every message asserted a live board even
+        # when the user had done nothing. Session provenance is now mandatory on
+        # both branches.
+        summary = s.get("session_summary", "")
+        # The app can be switched mid-conversation but the system prompt is only
+        # sent on the first turn, so the app's location rides along on every
+        # message the same way session provenance does.
+        ap = s.get("app_paths") or {}
+        app_str = ""
+        if ap.get("app_dir"):
+            app_str = f" App: {ap.get('app', '?')} at {ap['app_dir']}"
+            if ap.get("work_dir"):
+                app_str += f" (Work/: {ap['work_dir']})"
+            app_str += "."
         if backend == "simulator":
-            state = "IPC ready — live register reads active" if ipc_ready else "IPC not ready — simulator not started yet"
-            return f"[context] Backend: simulator ({state})"
+            state = ("IPC ready — live register reads active" if ipc_ready
+                     else "IPC not ready — simulator not started yet")
+            return (f"[context] Backend: simulator ({state}). "
+                    f"Session: {summary}{app_str}")
         elif backend == "hardware":
-            return f"[context] Backend: hardware, target={target or 'unknown'}"
-        return f"[context] Backend: {backend}"
+            return (f"[context] Backend: hardware, target={target or 'unknown'}. "
+                    f"Session: {summary}{app_str}")
+        return f"[context] Backend: {backend}. Session: {summary}{app_str}"
 
     def _llm_spawn(self):
         """Spawn the persistent claude streaming subprocess + reader thread.
@@ -1737,6 +2836,10 @@ IPC backend: `src/ipc/aeg_ps_ipc_backend.cpp` — `do_transaction()` is the cent
         # Deterministically bind the aiegdb MCP server (src/tool/debug/aiemcp.py) so the
         # LLM tab connects regardless of cwd; --strict-mcp-config ignores any
         # other .mcp.json and --allowedTools grants the four aiegdb tools.
+        # Load the debug-skill plugin explicitly rather than relying on cwd
+        # auto-discovery, which `--bare` will eventually switch off by default.
+        if os.path.isdir(_LLM_SKILLS_DIR):
+            cmd += ["--plugin-dir", _LLM_PLUGIN_DIR]
         mcp_cfg = self._write_mcp_config()
         if mcp_cfg:
             cmd += ["--mcp-config", mcp_cfg, "--strict-mcp-config",
@@ -1750,7 +2853,25 @@ IPC backend: `src/ipc/aeg_ps_ipc_backend.cpp` — `do_transaction()` is the cent
                     "mcp__debugui__get_flow_detail",
                     "mcp__debugui__get_sim_log",
                     "mcp__debugui__get_applog",
-                    "mcp__debugui__get_ipc_log"]
+                    "mcp__debugui__get_ipc_log",
+                    # App / UI awareness. These were registered in debug_ui_mcp
+                    # but never granted, so the assistant could not answer "which
+                    # app is this?" or see what the user had open — the very
+                    # context it needs to follow along. select_app is deliberately
+                    # NOT granted: switching the app reconfigures the whole
+                    # server and belongs to the user, not the assistant.
+                    "mcp__debugui__list_apps",
+                    "mcp__debugui__current_app",
+                    "mcp__debugui__get_ui_state",
+                    "mcp__debugui__list_panes",
+                    "mcp__debugui__get_pane"]
+            # --allowedTools is only a permission allowlist, and permission-mode
+            # bypassPermissions already waives prompting — so omitting a tool from
+            # the list above does NOT make it uncallable. Denying is the only way
+            # to actually withhold one, and select_app is worth withholding: it
+            # reconfigures the whole server (board IPs, PDIs, ELF paths) out from
+            # under the user mid-conversation.
+            cmd += ["--disallowedTools", "mcp__debugui__select_app"]
         self._llm_system_prompt_text = self._llm_system_prompt()
         self._llm_first_turn = True
         if self.claude_model:
@@ -1856,12 +2977,7 @@ IPC backend: `src/ipc/aeg_ps_ipc_backend.cpp` — `do_transaction()` is the cent
                 if isinstance(blk, dict) and blk.get("type") == "tool_use":
                     name = blk.get("name", "?")
                     inp = blk.get("input", {})
-                    try:
-                        compact = json.dumps(inp, separators=(",", ":"))
-                    except (TypeError, ValueError):
-                        compact = str(inp)
-                    if len(compact) > 200:
-                        compact = compact[:197] + "..."
+                    compact = _llm_tool_args(inp)
                     try:
                         full_json = json.dumps(inp, indent=2)
                     except (TypeError, ValueError):
@@ -1890,7 +3006,13 @@ IPC backend: `src/ipc/aeg_ps_ipc_backend.cpp` — `do_transaction()` is the cent
                             self._llm_log_write("\n=== TOOL RESULT ===\n")
                             if result_text:
                                 self._llm_log_write(result_text + "\n")
-                        self._llm_append("\n[tool result]\n")
+                        # A size/outcome tag, not the payload: results run to
+                        # register dumps, and the browser renders this inline
+                        # on the call's own row.
+                        n = len(result_text.splitlines()) if result_text else 0
+                        tag = ("error" if blk.get("is_error")
+                               else f"{n} lines" if n else "empty")
+                        self._llm_append(f"\n[tool result: {tag}]\n")
             return
         if t == "result":
             with self._llm_lock:
@@ -2053,6 +3175,30 @@ def run_xsdb_connect(target, timeout=30):
     return False, f"{detail} (TCP:{host}:{port})"
 
 
+def _run_aiedbg_scan(what, st, target, device=None):
+    """Run 'aiedbg --json scan <what>' and return the parsed JSON dict, or an error dict."""
+    tgt = target or st.target
+    dev = device or st.device
+    cmd = ["aiedbg", "--json"]
+    if tgt:
+        cmd += ["--target", tgt]
+    if dev:
+        cmd += ["-d", dev]
+    cmd += ["scan", what]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        return {"error": "aiedbg not found in PATH"}
+    except subprocess.TimeoutExpired:
+        return {"error": f"aiedbg scan {what} timed out"}
+    if r.returncode != 0:
+        return {"error": r.stderr.strip() or f"aiedbg scan {what} failed"}
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {"error": f"bad json from aiedbg scan {what}"}
+
+
 def _dma_state(decoded):
     if decoded is None:
         return "unreachable"
@@ -2145,89 +3291,186 @@ def _worst(states):
 def _make_reg_read_fn(st, device, target):
     """Return a reg-read callable for (phys_col, row, offset) -> int|None.
 
-    For the simulator device, use the IPC debug socket directly (no aiedbg).
-    For all other devices, delegate to aiediag.run_aiedbg_reg_read with target.
+    Only returns a function for the simulator (IPC socket reads).
+    Hardware uses the batch aiedbg scan path (reg_read_fn=None) so the
+    grid functions call _run_aiedbg_scan once instead of one subprocess per tile.
     """
     if (device or "").strip().lower() == "simulator":
         return st.sim_ipc_reg_read
-    tgt = target or st.target
-    def _aiedbg_read(phys_col, row, offset):
-        return aiediag.run_aiedbg_reg_read(phys_col, row, offset,
-                                           target=tgt, device=st.device)
-    return _aiedbg_read
+    return None
 
 
-def grid_dma(st, target=None, reg_read_fn=None):
+_DMA_CH_STATE_MAP = {
+    "started": "running", "done": "idle", "idle": "idle",
+    "running": "running", "stalled": "stalled", "error": "error",
+}
+
+
+def grid_dma(st, target=None, reg_read_fn=None, device=None):
     cells = {}
+
+    # Simulator path: per-channel IPC reads (no xsdb).
+    if reg_read_fn is not None:
+        for t in st.tiles():
+            col, row = t["loc"][0], t["loc"][1]
+            phys_col = col + st.startcol
+            chans = {}
+            for ch in t.get("dma_channels", []):
+                d = str(ch.get("direction", "")).lower()
+                c = int(ch.get("channel", 0))
+                if d not in ("mm2s", "s2mm"):
+                    continue
+                chans[f"{d}{c}"] = _read_dma_channel(st, t["type"], phys_col,
+                                                     row, d, c,
+                                                     target=target or st.target,
+                                                     reg_read_fn=reg_read_fn)
+            state = _worst([v["state"] for v in chans.values()]) if chans else "idle"
+            cells[f"{col},{row}"] = {"state": state, "type": t["type"],
+                                     "phys_col": phys_col, "channels": chans}
+        return {"what": "dma", "cells": cells}
+
+    # Hardware path: single 'aiedbg --json scan dma' subprocess.
+    data = _run_aiedbg_scan("dma", st, target, device)
+    if "error" in data:
+        return {"what": "dma", "cells": {}, "error": data["error"]}
+    # scan dma uses underscore channel keys (s2mm_0); grid uses no-underscore (s2mm0).
+    scan_by_phys = {(int(t["col"]), int(t["row"])): t for t in data.get("tiles", [])}
     for t in st.tiles():
         col, row = t["loc"][0], t["loc"][1]
         phys_col = col + st.startcol
+        entry = scan_by_phys.get((phys_col, row))
+        if entry is None:
+            cells[f"{col},{row}"] = {"state": "unreachable", "type": t["type"],
+                                     "phys_col": phys_col, "channels": {}}
+            continue
         chans = {}
-        for ch in t.get("dma_channels", []):
-            d = str(ch.get("direction", "")).lower()
-            c = int(ch.get("channel", 0))
-            if d not in ("mm2s", "s2mm"):
-                continue
-            chans[f"{d}{c}"] = _read_dma_channel(st, t["type"], phys_col,
-                                                 row, d, c,
-                                                 target=target or st.target,
-                                                 reg_read_fn=reg_read_fn)
+        for ch_key, ch_val in entry.get("channels", {}).items():
+            key = ch_key.replace("_", "")  # s2mm_0 -> s2mm0
+            raw_state = ch_val.get("state", "idle")
+            active_evts = ch_val.get("active_events", [])
+            # Derive human-readable stall/error lists from the event names that
+            # aiedbg scan dma includes in active_events (e.g. "STALLED_LOCK",
+            # "STREAM_STARVATION", "BD_UNAVAILABLE", "BD_INVALID").
+            stalls = []
+            errors = []
+            for ev in active_evts:
+                ev_up = ev.upper()
+                if "STALLED_LOCK" in ev_up or "LOCK_STALL" in ev_up:
+                    if "lock_acq" not in stalls:
+                        stalls.append("lock_acq")
+                if "STREAM_STARVATION" in ev_up or "STREAM_BACKPRESSURE" in ev_up or "STREAM_STALL" in ev_up:
+                    if "stream" not in stalls:
+                        stalls.append("stream")
+                if "MEMORY_BACKPRESSURE" in ev_up or "MEMORY_STARVATION" in ev_up or "MEMORY_STALL" in ev_up:
+                    if "tct" not in stalls:
+                        stalls.append("tct")
+                if "BD_UNAVAIL" in ev_up or "BD_UNAVAILABLE" in ev_up:
+                    if "bd_unavail" not in errors:
+                        errors.append("bd_unavail")
+                if "BD_INVALID" in ev_up:
+                    if "bd_invalid" not in errors:
+                        errors.append("bd_invalid")
+            chans[key] = {"state": _DMA_CH_STATE_MAP.get(raw_state, "unknown"),
+                          "active_events": active_evts,
+                          "stalls": stalls,
+                          "errors": errors}
         state = _worst([v["state"] for v in chans.values()]) if chans else "idle"
         cells[f"{col},{row}"] = {"state": state, "type": t["type"],
                                  "phys_col": phys_col, "channels": chans}
     return {"what": "dma", "cells": cells}
 
 
-def grid_cores(st, target=None, reg_read_fn=None):
+def grid_cores(st, target=None, reg_read_fn=None, device=None):
     cells = {}
-    entries, _ = aiediag.load_linemap()
+
+    # Simulator path: per-tile IPC reads via reg_read_fn (no xsdb involved).
+    if reg_read_fn is not None:
+        entries, _ = aiediag.load_linemap()
+        for t in st.tiles():
+            col, row = t["loc"][0], t["loc"][1]
+            if t["type"] != "core":
+                continue
+            phys_col = col + st.startcol
+            raw = reg_read_fn(phys_col, row, aiediag.CORE_PC_OFFSET)
+            if raw is None:
+                cells[f"{col},{row}"] = {"state": "unreachable"}
+                continue
+            pc = raw & aiediag.CORE_PC_MASK
+            src = aiediag.pc_to_source(entries, pc) if entries else None
+            cells[f"{col},{row}"] = {
+                "state": "running" if pc else "idle",
+                "pc": f"0x{pc:05X}",
+                "source": (f"{os.path.basename(src['file'])}:{src['line']}"
+                           if src else None),
+            }
+        return {"what": "cores", "cells": cells}
+
+    # Hardware path: single 'aiedbg --json scan cores' subprocess.
+    _CORE_STATE_MAP = {
+        "enabled": "running", "disabled": "idle", "stalled": "stalled",
+        "done": "idle", "error_halt": "error", "debug_halt": "stalled",
+        "reset": "idle",
+    }
+    data = _run_aiedbg_scan("cores", st, target, device)
+    if "error" in data:
+        return {"what": "cores", "cells": {}, "error": data["error"]}
+    scan_by_phys = {(int(c["col"]), int(c["row"])): c for c in data.get("cores", [])}
     for t in st.tiles():
         col, row = t["loc"][0], t["loc"][1]
         if t["type"] != "core":
             continue
         phys_col = col + st.startcol
-        if reg_read_fn is not None:
-            raw = reg_read_fn(phys_col, row, aiediag.CORE_PC_OFFSET)
-        else:
-            raw = aiediag.run_aiedbg_reg_read(phys_col, row,
-                                              aiediag.CORE_PC_OFFSET,
-                                              target=target or st.target,
-                                              device=st.device)
-        if raw is None:
+        entry = scan_by_phys.get((phys_col, row))
+        if entry is None:
             cells[f"{col},{row}"] = {"state": "unreachable"}
             continue
-        pc = raw & aiediag.CORE_PC_MASK
-        src = aiediag.pc_to_source(entries, pc) if entries else None
+        raw_state = entry.get("state", "unknown")
         cells[f"{col},{row}"] = {
-            "state": "running" if pc else "idle",
-            "pc": f"0x{pc:05X}",
-            "source": (f"{os.path.basename(src['file'])}:{src['line']}"
-                       if src else None),
+            "state": _CORE_STATE_MAP.get(raw_state, "unknown"),
+            "core_status": raw_state,
+            "reg": f"0x{entry.get('core_status_reg', 0):08X}",
         }
     return {"what": "cores", "cells": cells}
 
 
-def grid_events(st, target=None, reg_read_fn=None):
+def grid_events(st, target=None, reg_read_fn=None, device=None):
     cells = {}
+
+    # Simulator path: per-tile IPC reads (no xsdb).
+    if reg_read_fn is not None:
+        for t in st.tiles():
+            col, row = t["loc"][0], t["loc"][1]
+            phys_col = col + st.startcol
+            if t["type"] == "shim":
+                regs = (aiediag.SHIM_EVT_STATUS_REG0, aiediag.SHIM_EVT_STATUS_REG1)
+            else:
+                regs = aiediag.MEM_EVT_STATUS_REGS
+            words = []
+            for off in regs:
+                raw = reg_read_fn(phys_col, row, off)
+                words.append(None if raw is None else f"0x{raw:08X}")
+            if all(w is None for w in words):
+                cells[f"{col},{row}"] = {"state": "unreachable"}
+                continue
+            any_set = any(w not in (None, "0x00000000") for w in words)
+            cells[f"{col},{row}"] = {"state": "running" if any_set else "idle",
+                                     "words": words}
+        return {"what": "events", "cells": cells}
+
+    # Hardware path: reuse 'aiedbg --json scan dma' — it includes event_status_hex
+    # for every tile in a single batched xsdb call.
+    data = _run_aiedbg_scan("dma", st, target, device)
+    if "error" in data:
+        return {"what": "events", "cells": {}, "error": data["error"]}
+    scan_by_phys = {(int(t["col"]), int(t["row"])): t for t in data.get("tiles", [])}
     for t in st.tiles():
         col, row = t["loc"][0], t["loc"][1]
         phys_col = col + st.startcol
-        if t["type"] == "shim":
-            regs = (aiediag.SHIM_EVT_STATUS_REG0, aiediag.SHIM_EVT_STATUS_REG1)
-        else:
-            regs = aiediag.MEM_EVT_STATUS_REGS
-        words = []
-        for off in regs:
-            if reg_read_fn is not None:
-                raw = reg_read_fn(phys_col, row, off)
-            else:
-                raw = aiediag.run_aiedbg_reg_read(phys_col, row, off,
-                                                  target=target or st.target,
-                                                  device=st.device)
-            words.append(None if raw is None else f"0x{raw:08X}")
-        if all(w is None for w in words):
+        entry = scan_by_phys.get((phys_col, row))
+        if entry is None:
             cells[f"{col},{row}"] = {"state": "unreachable"}
             continue
+        words = entry.get("event_status_hex", [])
         any_set = any(w not in (None, "0x00000000") for w in words)
         cells[f"{col},{row}"] = {"state": "running" if any_set else "idle",
                                  "words": words}
@@ -2337,6 +3580,13 @@ def do_cmd(st, body, target=None, reg_read_fn=None):
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
+def _is_loopback(handler):
+    try:
+        return ipaddress.ip_address(handler.client_address[0]).is_loopback
+    except (ValueError, IndexError, TypeError):
+        return False
+
+
 def _check_llm_auth(st, handler):
     """Return True if the request may use the LLM endpoints.
 
@@ -2415,6 +3665,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_file(st.json_path(), "application/json")
         elif path == "/config":
             self._send_json(_ui_defaults(st))
+        elif path == "/aiegdb/spec":
+            # Served straight from the imported module, not the aiegdb
+            # subprocess: the console's autocomplete must populate on page load
+            # even before a command has been run or a board is reachable.
+            self._send_json({"spec": aiegdb.command_spec()})
+        elif path == "/aiegdb/arghelp":
+            # Per-argument help for ONE command, fetched lazily by the console
+            # when the user reaches an argument — doing all of them up front
+            # would cost a subprocess call per command on every page render.
+            self._send_json({"args": aiegdb.arg_help(q.get("cmd", [""])[0])})
         elif path == "/applog":
             offset = int(q.get("offset", ["0"])[0])
             self._send_json(st.applog_since(offset))
@@ -2431,7 +3691,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(st.sim_status())
         elif path == "/devices":
             self._send_json({"devices": [
-                {"value": d["value"], "label": d["label"]}
+                {"value": d["value"], "label": _device_label(d)}
                 for d in st._extra_devices
                 if d.get("value") and d.get("label")
             ]})
@@ -2454,17 +3714,40 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 offset = 0
             self._send_json(st.llm_poll(offset))
+        elif path == "/source":
+            if not _check_llm_auth(st, self):
+                self._send_json({"error": "unauthorized", "auth": True}, code=401)
+                return
+            obj, code = _serve_source(st, q)
+            self._send_json(obj, code=code)
+        elif path == "/runstate":
+            self._send_json(st.run_state())
         elif path == "/ping":
             if st.run_in_progress():
-                self._send_json({"ok": False, "detail": "disabled during run"})
+                # `busy` distinguishes "a run owns the link" from "the link is
+                # dead"; without it the UI ssh'd to the board to restart a
+                # working hw_server.
+                self._send_json({"ok": False, "busy": True,
+                                 "detail": "disabled during run",
+                                 "run": st.run_state()})
                 return
             device = q.get("device", [""])[0]
             host = q.get("host", [""])[0]
-            self._send_json(ping(st, device, host))
+            res = ping(st, device, host)
+            # A verified probe is the weakest form of authorization: the link is
+            # real, but nothing has been run, so live reads stay clearly labelled
+            # as "connected, no run this session".
+            if res.get("ok"):
+                st.mark_hw_session("connected", res.get("detail", ""),
+                                   res.get("target"))
+            self._send_json(res)
         elif path == "/grid":
             what = q.get("what", ["dma"])[0]
-            if st.run_in_progress():
-                self._send_json({"error": "disabled during run", "cells": {}})
+            if st.run_blocks_debug():
+                self._send_json({"error": "disabled during run setup", "cells": {}})
+                return
+            if not st.hw_authorized():
+                self._send_json({"error": _NO_SESSION_MSG, "cells": {}})
                 return
             device = q.get("device", [""])[0]
             host = q.get("host", [""])[0]
@@ -2474,17 +3757,18 @@ class Handler(BaseHTTPRequestHandler):
                                  "cells": {}})
                 return
             tgt = resolve_target(st, device, host)
+            dev = resolve_device(st, device)
             rrfn = _make_reg_read_fn(st, device, tgt)
             try:
                 if what == "cores":
                     self._send_json(grid_cores(st, target=tgt,
-                                               reg_read_fn=rrfn))
+                                               reg_read_fn=rrfn, device=dev))
                 elif what == "events":
                     self._send_json(grid_events(st, target=tgt,
-                                                reg_read_fn=rrfn))
+                                                reg_read_fn=rrfn, device=dev))
                 else:
                     self._send_json(grid_dma(st, target=tgt,
-                                             reg_read_fn=rrfn))
+                                             reg_read_fn=rrfn, device=dev))
             except Exception as e:  # never crash the poll loop
                 self._send_json({"error": str(e), "cells": {}}, code=500)
         else:
@@ -2506,17 +3790,29 @@ class Handler(BaseHTTPRequestHandler):
                     st.startcol = int(body["startcol"])
                 except (ValueError, TypeError):
                     pass
-            self._send_json(st.start_run(device=body.get("device"),
-                                         board_host=body.get("board_host")))
+            res = st.start_run(device=body.get("device"),
+                               board_host=body.get("board_host"))
+            if res.get("error"):
+                res.setdefault("run", st.run_state())
+            self._send_json(res)
         elif u.path == "/apps/select":
             self._send_json(st.select_app(body.get("id")))
         elif u.path == "/apps/add":
+            # Takes an arbitrary path and, with select=true, repoints workdir —
+            # which rewrites /source's root allowlist. Loopback is allowed
+            # unauthenticated because run_debug_ui.sh registers over 127.0.0.1
+            # with no header; anything off-box needs the password.
+            if not (_is_loopback(self) or _check_llm_auth(st, self)):
+                self._send_json({"error": "unauthorized", "auth": True}, code=401)
+                return
             self._send_json(st.add_app(body.get("path"), body.get("label"),
                                        bool(body.get("select"))))
         elif u.path == "/uistate":
             self._send_json(st.set_uistate(body))
         elif u.path == "/stop":
-            self._send_json(st.stop_run())
+            res = st.stop_run()
+            res["run"] = st.run_state()
+            self._send_json(res)
         elif u.path == "/sim/run":
             self._send_json(st.start_sim())
         elif u.path == "/sim/stop":
@@ -2546,7 +3842,9 @@ class Handler(BaseHTTPRequestHandler):
             dev = body.get("device", "")
             is_sim = (dev or "").strip().lower() == "simulator"
             if not is_sim and st.run_in_progress():
-                self._send_json({"ok": False, "detail": "disabled during run"})
+                self._send_json({"ok": False, "busy": True,
+                                 "detail": "disabled during run",
+                                 "run": st.run_state()})
                 return
             if is_sim:
                 ready = st._sim_ipc_ready
@@ -2563,7 +3861,7 @@ class Handler(BaseHTTPRequestHandler):
                                  "detail": "no target configured"})
                 return
             try:
-                self._send_json(st.retarget(tgt))
+                self._send_json(st.retarget(tgt, resolve_device(st, dev)))
             except Exception as e:
                 self._send_json({"ok": False, "target": tgt,
                                  "detail": str(e)}, code=500)
@@ -2577,6 +3875,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(st.gdb_command(body.get("cmd", "")))
             except Exception as e:
                 self._send_json({"error": str(e)}, code=500)
+        elif u.path == "/attach":
+            # "Open Current Session": the user ran the app themselves (CLI, or a
+            # board already programmed) and then opened the UI. Probe the link so
+            # we don't authorize a dead target, but record the mode as `attached`
+            # — the daemon did not start this run and cannot vouch for what the
+            # board did before now.
+            if st.run_in_progress():
+                # Nothing to adopt, and probing JTAG would collide with it.
+                self._send_json({"ok": False, "busy": True,
+                                 "detail": "this daemon is already running a "
+                                           "test — stop it first",
+                                 "run": st.run_state()})
+                return
+            res = ping(st, body.get("device", ""), body.get("board_host", ""))
+            if res.get("ok"):
+                st.mark_hw_session("attached",
+                                   "adopted a session started outside the UI",
+                                   res.get("target"))
+                res["session"] = st.session_state()
+            self._send_json(res)
         elif u.path == "/aiegdb/reload":
             if st.run_blocks_debug():
                 self._send_json({"error": "disabled during run setup"})
@@ -2692,19 +4010,30 @@ def _hwsrv_drain(child):
 def resolve_target(st, device, host):
     """Device-aware aiedbg target for live reads.
 
-    * vek385 + host → xsdb://<host>:3121 (the board hostname from the UI).
-    * palmyra       → xsdb://<PALIP>:3121 ($PALIP, fallback xx.xx.xx.213).
+    * pal           → xsdb://<PALIP>:3121 ($PALIP, fallback xx.xx.xx.213).
     * simulator     → None (reads go through IPC debug socket, not aiedbg).
+    * any other board + host → xsdb://<host>:3121 (hostname from the UI).
     * otherwise     → the daemon's configured/env target (st.target).
     """
     device = (device or "").strip().lower()
-    if device == "vek385" and host:
-        return f"xsdb://{host}:3121"
-    if device == "palmyra":
+    if device == "pal":
         return f"xsdb://{os.environ.get('PALIP', 'xx.xx.xx.213')}:3121"
     if device == "simulator":
         return None
+    if device and host:
+        return f"xsdb://{host}:3121"
     return st.target
+
+
+# The dropdown now carries aiedbg's own device names, so the UI selection IS the
+# `aiedbg -d` value — the two used to be separate namespaces that never synced,
+# leaving aiedbg on `pal` (12 columns) while the user worked a vek385 (38).
+def resolve_device(st, device):
+    """aiedbg -d name for a UI board selection, or None when it does not apply."""
+    device = (device or "").strip().lower()
+    if not device or device == "simulator":
+        return None
+    return device
 
 
 def _ui_defaults(st):
@@ -2720,7 +4049,12 @@ def _ui_defaults(st):
         m = re.match(r"xsdb://([^:/]+)", st.target)
         if m:
             host = m.group(1)
-    return {"device": "vek385" if host else "", "board_host": host}
+    if not host:
+        # Last resort: the checkout's own hwlocal.sh. This is a PREFILL, not a
+        # binding — the box stays editable and the typed value wins per run.
+        host = _expected_board_host(st.workdir)
+    return {"device": "vek385" if host else "", "board_host": host,
+            "source_viewer": True}
 
 
 def _target_from_aiedbg_env():
@@ -2956,7 +4290,22 @@ def main():
     ap.add_argument("--no-mcp-probe", action="store_true",
                     help="skip the startup probe that verifies the LLM tab's "
                          "claude can reach the aiegdb MCP server")
+    ap.add_argument("--skip-aiedbg-bootstrap", action="store_true",
+                    help="do not auto-clone/install aiedbg when missing from PATH")
+    ap.add_argument("--update-aiedbg", action="store_true",
+                    help="git pull thirdparty/aiedbg and pip install --upgrade "
+                         "before starting the server")
     args = ap.parse_args()
+
+    if not args.skip_aiedbg_bootstrap:
+        import ensure_aiedbg as _ensure_aiedbg
+        _abr = _ensure_aiedbg.ensure_aiedbg(_REPO_ROOT, update=args.update_aiedbg)
+        if not _abr.get("ok"):
+            print(f"warning: aiedbg bootstrap failed "
+                  f"({_abr.get('action')}): {_abr.get('error', 'unknown')}",
+                  file=sys.stderr)
+        elif _abr.get("action") != "present":
+            print(f"aiedbg bootstrap: {_abr['action']} -> {_abr.get('path')}")
 
     # Build the app registry first: the positional workdir is treated as an
     # explicit app so the historical single-app invocation keeps working, and
@@ -2966,7 +4315,8 @@ def main():
     if args.workdir:
         explicit.insert(0, os.path.abspath(args.workdir))
     registry = AppRegistry(explicit=explicit, roots=args.app_root,
-                           auto_roots=[os.path.join(_REPO_ROOT, "aout")])
+                           auto_roots=[os.path.join(_REPO_ROOT, "aout"),
+                                       os.path.join(_REPO_ROOT, "example")])
     selected = registry.default()
 
     workdir = os.path.abspath(selected.path if selected else args.workdir)
@@ -3054,6 +4404,10 @@ def main():
         _flags = ",".join(k[4:] for k in ("has_sim", "has_hw") if _c[k]) or "view-only"
         print(f"    {'*' if selected and _a.id == selected.id else ' '} "
               f"{_a.id:22} {_flags:12} {_a.path}")
+        if not _c["has_sim"] and _c.get("no_sim_reason"):
+            print(f"      {'':22} {'':12} ↳ {_c['no_sim_reason']}")
+        if _c.get("hw_stale"):
+            print(f"      {'':22} {'':12} ! {_c['hw_stale']}")
     print(f"  URL:        {url}")
     print(f"  bind:       {args.host}:{port}")
     print(f"  ELF:        {elf or 'auto (apppaltest -y default)'}")
@@ -3069,6 +4423,12 @@ def main():
               f"model={args.claude_model or 'CLI default'})")
         # Never print the password itself.
         print(f"  LLM auth:   {'enabled' if llm_password else 'disabled'}")
+    print(f"  source:     /source "
+          f"({'pygments ' + _SRC_STYLE if _HAVE_PYGMENTS else 'plain (pygments not installed)'})")
+    if args.host == "0.0.0.0" and not llm_password:
+        print("  WARNING: bound to all interfaces with no password — /source lets "
+              "anyone on the\n           network read files under the app, Work/ and "
+              "repo roots. Use --password\n           or --host 127.0.0.1.")
         if not args.no_mcp_probe and _claude:
             ok, detail = Handler.state.probe_mcp()
             status = "connected" if ok else "NOT connected"

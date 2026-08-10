@@ -148,6 +148,12 @@ main() {
 set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AIEHLC_DIR="${SCRIPT_DIR}/../"
+
+# aiedbg pip install PATH (written by ensure_aiedbg.py on first bootstrap)
+if [[ -f "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh"
+fi
 runtime_source_file=""
 aie_version="2"
 use_llvm_aie="false"
@@ -507,6 +513,16 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     # live. Runs in the foreground for the interactive debug session; Ctrl-C to stop.
     if [ "$PRETTY_DEBUG" -eq 1 ]; then
         if [ -f "${WORKLOCAL_DIR}/host_schedule.html" ]; then
+            if ! command -v aiedbg &>/dev/null; then
+                echo "aiedbg not found — bootstrapping (clone + pip install)..."
+                python3 "${AIEHLC_DIR}src/tool/debug/ensure_aiedbg.py" \
+                    --repo-root "${AIEHLC_DIR}" || \
+                    echo "    warning: aiedbg bootstrap failed; live HW reads disabled."
+                if [[ -f "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh" ]]; then
+                    # shellcheck disable=SC1091
+                    source "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh"
+                fi
+            fi
             echo "Launching live schedule-debug server (--prettydebug)..."
             python3 "${AIEHLC_DIR}/src/tool/debug/schedule_debug_server.py" \
                 "${WORKLOCAL_DIR}" \

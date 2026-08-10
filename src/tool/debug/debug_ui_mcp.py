@@ -167,14 +167,23 @@ def _fmt_kernel_match(tile):
     return out
 
 
-def _fmt_lines(records, prefix="L"):
-    """Render a list of {line, code} rows (line may be None)."""
+def _fmt_lines(records, src=None, prefix="L"):
+    """Render a list of {line, code} rows (line may be None).
+
+    With `src`, each row is tagged `<basename>:<line>` — a form the debug UI
+    turns into a click that opens the file at that line. The basename, not the
+    absolute path: a 45-character path on every row would swamp the digest, and
+    both the browser and the daemon resolve basenames against the current app.
+    """
     out = []
+    tag_w = (len(src) + 7) if src else 6
     for rec in records or []:
         ln = rec.get("line")
         code = rec.get("code", "")
         if ln is None:
             out.append("        %s" % code)
+        elif src:
+            out.append("  %-*s %s" % (tag_w, "%s:%s" % (src, ln), code))
         else:
             out.append("  %s%-5s %s" % (prefix, ln, code))
     return out
@@ -203,20 +212,36 @@ def _section_hi(tile):
     return out
 
 
+def _source_path(key):
+    """Absolute path of a source the view names, or "". Uses the cached view, so
+    the _section_* helpers keep their single-argument signatures."""
+    view = _load_view() or {}
+    if key == "host_cc":
+        return (view.get("source") or {}).get("host_cc") or ""
+    return (view.get(key) or {}).get("path") or ""
+
+
 def _section_mid(tile):
     mid = tile.get("middle_ir")
     if isinstance(mid, str):
         return [mid]
-    return _fmt_lines(mid) or ["(no dfschedule IR slice)"]
+    path = _source_path("dfschedule_ir")
+    rows = _fmt_lines(mid, src=os.path.basename(path) if path else None)
+    if not rows:
+        return ["(no dfschedule IR slice)"]
+    return ([("file: %s" % path)] if path else []) + rows
 
 
 def _section_lo(tile):
     lo = tile.get("low_level") or {}
-    rows = _fmt_lines(lo.get("code_lines"))
+    path = _source_path("host_cc")
+    rows = _fmt_lines(lo.get("code_lines"),
+                      src=os.path.basename(path) if path else None)
     if not rows:
         return ["(no attributed host.cc lines)"]
-    hdr = "host.cc lines %s-%s:" % (lo.get("line_start"), lo.get("line_end"))
-    return [hdr] + rows
+    hdr = "%s lines %s-%s:" % (os.path.basename(path) or "host.cc",
+                               lo.get("line_start"), lo.get("line_end"))
+    return ([("file: %s" % path)] if path else []) + [hdr] + rows
 
 
 @mcp.tool()
@@ -330,8 +355,18 @@ def get_backend_status() -> dict:
             note = ("Simulator backend selected but IPC debug socket not yet ready. "
                     "Start the simulator from the Run button in the UI, then retry.")
     elif backend == "hardware":
-        note = ("Hardware board backend. Live reads go through aiedbg/xsdb. "
-                "Use aie_exec/aie_scope to read DMA, core, and event registers.")
+        # The old note asserted live reads unconditionally. `hardware` is just
+        # the not-simulator fallback and `target` comes from the environment, so
+        # neither implies a board session — defer to the daemon's provenance.
+        sess = live.get("session") or {}
+        if sess and not sess.get("authorized"):
+            note = ("Hardware backend is CONFIGURED but NO board session exists in "
+                    "this UI. aie_exec will refuse device reads. The user must press "
+                    "\"Connect\", \"Run test\", or \"Open Current Session\" first. "
+                    "Do not describe board state until then.")
+        else:
+            note = ("Hardware board backend. Live reads go through aiedbg/xsdb. "
+                    "Use aie_exec/aie_scope to read DMA, core, and event registers.")
     else:
         note = "Backend unknown — debug server may not be running."
 
@@ -345,6 +380,8 @@ def get_backend_status() -> dict:
         "aie_version": aie_version,
         "sim_log": sim_log,
         "sim_applog": sim_applog,
+        "session": live.get("session") or {},
+        "session_summary": live.get("session_summary", ""),
         "note": note,
     }
 
@@ -649,20 +686,44 @@ def get_flow_detail(flow_index: int) -> str:
 
     routing = path.get("routing_connections") or []
     if routing:
-        out.append("")
-        out.append("  [stream-switch connections]")
-        for c in routing:
-            kind = c.get("kind", "?")
-            t = c.get("tile") or {}
-            if kind == "circuit_connect":
-                sl = c.get("slave") or {}
-                ms = c.get("master") or {}
-                out.append("    (%s,%s) %s/%s → %s/%s"
-                           % (t.get("col"), t.get("row"),
-                              sl.get("dir"), sl.get("idx"),
-                              ms.get("dir"), ms.get("idx")))
-            else:
-                out.append("    (%s,%s) %s" % (t.get("col"), t.get("row"), kind))
+        direction = path.get("direction", "push")
+        shim_kinds = {"shim_aie_to_ext", "shim_ext_to_aie"}
+        gmio_conns = [c for c in routing if c.get("kind") in shim_kinds]
+        sw_conns = [c for c in routing if c.get("kind") not in shim_kinds]
+        sw_conns.sort(key=lambda c: (-(c.get("tile") or {}).get("row", 0)
+                                     if direction == "pull"
+                                     else (c.get("tile") or {}).get("row", 0)))
+        kind_label = {"circuit_connect": "circuit", "packet_connect": "packet"}
+        if sw_conns:
+            out.append("")
+            out.append("  [stream-switch connections]")
+            for c in sw_conns:
+                kind = c.get("kind", "?")
+                t = c.get("tile") or {}
+                label = kind_label.get(kind, kind)
+                if kind == "circuit_connect":
+                    sl = c.get("slave") or {}
+                    ms = c.get("master") or {}
+                    out.append("    (%s,%s) %s  %s/%s → %s/%s"
+                               % (t.get("col"), t.get("row"), label,
+                                  sl.get("dir"), sl.get("idx"),
+                                  ms.get("dir"), ms.get("idx")))
+                else:
+                    out.append("    (%s,%s) %s" % (t.get("col"), t.get("row"), label))
+        if gmio_conns:
+            gmio_dir = {
+                "shim_aie_to_ext": "S2MM (array → DDR)",
+                "shim_ext_to_aie": "MM2S (DDR → array)",
+            }
+            out.append("")
+            out.append("  [GMIO channel]  (DMA engine on shim; data path: MemTile SRAM → NoC → DDR)")
+            for c in gmio_conns:
+                t = c.get("tile") or {}
+                direction_label = gmio_dir.get(c.get("kind", ""), c.get("kind", "?"))
+                sid = c.get("stream_id")
+                out.append("    (%s,%s) %s  stream_id=%s"
+                           % (t.get("col"), t.get("row"), direction_label,
+                              sid if sid is not None else "?"))
 
     sd_list = view.get("supply_demand") or []
     sd = next((s for s in sd_list if s and s.get("flow_index") == flow_index), None)
@@ -719,6 +780,30 @@ def get_sim_log(lines: int = 50) -> str:
         return "error reading simulator applog: %s" % e
 
 
+def _applog_banner(live):
+    """Provenance banner for applog output.
+
+    Without this a leftover log reads exactly like a fresh one — the concrete
+    failure it prevents is a stale "PASS: all N elements match" being reported as
+    the result of a run that never happened in this session."""
+    sess = (live or {}).get("session") or {}
+    ap = sess.get("applog") or {}
+    state = ap.get("state")
+    if state == "current":
+        return "[FRESH: written by the run started from this UI]\n"
+    if state == "predates_session":
+        return ("[STALE: written %s, BEFORE this debug session started (%s). "
+                "This describes a PREVIOUS run, not the current one.]\n"
+                % (ap.get("mtime_iso", "?"), ap.get("session_start_iso", "?")))
+    if state == "foreign":
+        return ("[UNVERIFIED: written %s by something other than this UI — no run "
+                "was started here. Treat as an external run.]\n"
+                % ap.get("mtime_iso", "?"))
+    if not sess:
+        return ""            # daemon too old / not running — say nothing
+    return "[UNVERIFIED: no run has been started from this UI in this session.]\n"
+
+
 @mcp.tool()
 def get_applog(lines: int = 50) -> str:
     """Return the last N lines of the application run log.
@@ -728,11 +813,16 @@ def get_applog(lines: int = 50) -> str:
     see what the running application printed, check for runtime errors, or confirm
     that the application completed normally.
 
+    IMPORTANT: the applog is a fixed path that the manual CLI flow writes too, so
+    a file being present does NOT mean this session ran anything. The response is
+    prefixed with a provenance banner; when it says the log predates this session,
+    the contents describe a PREVIOUS run and a "PASS" in it proves nothing about
+    now. Report which it is rather than presenting stale output as current.
+
     Args:
       lines: number of lines to return from the end of the log (default: 50)
 
     Returns the log tail as a string, or an error message if no log exists yet.
-    Logs are only present after a run has been started from the UI Run button.
     """
     live = _read_live_status()
     backend = live.get("backend", "").strip().lower()
@@ -754,7 +844,8 @@ def get_applog(lines: int = 50) -> str:
         if len(tail) > lines:
             tail = tail[-lines:]
         result = "\n".join(tail) if tail else "(applog is empty)"
-        return "[source: %s path=%s]\n%s" % (source_note, applog, result)
+        return "[source: %s path=%s]\n%s%s" % (
+            source_note, applog, _applog_banner(live), result)
     except OSError as e:
         return "error reading applog: %s" % e
 
@@ -879,10 +970,22 @@ def select_app(app_id: str) -> str:
 def get_ui_state() -> str:
     """What the user currently has open in the debug UI.
 
-    Reports the selected tile, active tile tab (hi/mid/lo), active net-detail
-    tab, which console pane is showing, and the selected channel/flow — so you
-    can answer questions about the view in front of the human instead of
-    guessing.
+    Call this first whenever the user says "this pane", "this tile", "that
+    flow", or "what I'm looking at". Keys:
+
+      view          "grid" | "map"  — which view the AIE Debug pane (top-left)
+                    is showing
+      selected_tile [col, row] of the tile open in the Info pane (top-right)
+      tile_tab      "hi" | "mid" | "lo" — active tab of that tile's detail
+      net_tab       active tab when a net (flow) is the Info selection
+      flow          selected flow index; channel: selected DMA channel
+      console_pane  "conpane" | "llmpane" | "searchpane" — which tab of the
+                    Tools pane (bottom-right) is open
+      search        current search query
+
+    The four named panes are AIE Debug (top-left, the array), Run (bottom-left,
+    app/board selection + run buttons + run log), Info (top-right, detail for
+    the selection) and Tools (bottom-right, aiegdb / LLM / Search).
     """
     st = _daemon_get("/uistate")
     if st is None:
@@ -892,22 +995,35 @@ def get_ui_state() -> str:
     return json.dumps(st, indent=2)
 
 
+# Content regions, each named by the window pane it appears in, so a question
+# about "the Info pane" resolves to an id without guessing.
 _PANES = {
-    "grid":        "tile grid overview (no selector)",
-    "tile.hi":     "tile high-level pane — needs col,row",
-    "tile.mid":    "tile middle IR (dfschedule) pane — needs col,row",
-    "tile.lo":     "tile low-level host.cc pane — needs col,row",
-    "tile.kernel": "tile kernel match/source pane — needs col,row",
-    "tile.supply": "tile supply/demand rollup — needs col,row",
-    "net.flow":    "flow / communication-path detail — needs flow",
-    "search":      "search results — needs query",
+    "grid":        "AIE Debug pane (top-left), Grid view — tile overview (no selector)",
+    "tile.hi":     "Info pane (top-right), tile High tab — needs col,row",
+    "tile.mid":    "Info pane, tile Middle tab (dfschedule IR) — needs col,row",
+    "tile.lo":     "Info pane, tile Low tab (host.cc) — needs col,row",
+    "tile.kernel": "Info pane, tile kernel match/source — needs col,row",
+    "tile.supply": "Info pane, tile supply/demand rollup — needs col,row",
+    "net.flow":    "Info pane, net detail for one flow — needs flow",
+    "search":      "Tools pane (bottom-right), Search tab — needs query",
 }
+
+_PANE_LAYOUT = """\
+Window panes (each is labelled with this name in the UI):
+  AIE Debug  top-left      the AIE array — Grid or Device Map view, plus the
+                           DMA/Cores/Events + Scan + live overlay controls
+  Run        bottom-left   app + board selection, Connect / Run test /
+                           Force stop, and the run log (see get_applog)
+  Info       top-right     detail for the current selection (tile or net)
+  Tools      bottom-right  aiegdb console, this LLM chat, Search
+get_ui_state() reports which view and selection are live in them."""
 
 
 @mcp.tool()
 def list_panes() -> str:
-    """List the UI panes you can read with get_pane, and their selectors."""
-    return "\n".join("%-14s %s" % (k, v) for k, v in _PANES.items())
+    """The window panes, and the get_pane ids with the selector each needs."""
+    return (_PANE_LAYOUT + "\n\nget_pane ids:\n"
+            + "\n".join("  %-13s %s" % (k, v) for k, v in _PANES.items()))
 
 
 @mcp.tool()

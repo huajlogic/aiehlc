@@ -1633,6 +1633,29 @@ def _load_comm_paths(workdir):
             dma_tiles_out    = []
             packet_tiles_out = []
 
+        # Synthesize the missing shim-edge: routing_edges_for_flow drops the
+        # DMA tile (row 0 shim) because it has master.dir=='DMA' and skips it.
+        # Connect the shim to its row-1 neighbour so the arc reaches row 0.
+        if shim_col is not None:
+            shim_key  = (shim_col, shim_row_val)
+            edge_set  = {(e[0][0], e[0][1], e[1][0], e[1][1]) for e in edges_out}
+            edge_set |= {(e[1][0], e[1][1], e[0][0], e[0][1]) for e in edges_out}
+            row1_key  = (shim_col, shim_row_val + 1)
+            shim_edge_missing = (
+                shim_key not in {(e[0][0], e[0][1]) for e in edges_out} and
+                shim_key not in {(e[1][0], e[1][1]) for e in edges_out}
+            )
+            row1_present = row1_key in (
+                {(e[0][0], e[0][1]) for e in edges_out} |
+                {(e[1][0], e[1][1]) for e in edges_out}
+            )
+            if shim_edge_missing and row1_present:
+                if direction == 'pull':
+                    edges_out.append([list(row1_key), list(shim_key)])
+                else:
+                    edges_out.insert(0, [list(shim_key), list(row1_key)])
+                tiles_list.append(list(shim_key))
+
         routing_edge_set = {(e[0][0], e[0][1], e[1][0], e[1][1]) for e in routing_edges}
         packet_tile_set  = {(t[0], t[1]) for t in routing_packet_tiles}
         hops_out = []
@@ -1938,415 +1961,882 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>AIE Schedule View</title>
+<title>AIE Debug</title>
 <style>
-  :root { --shim:#2d6a9f; --core:#3a7d44; --sel:#e0a800; }
+  /* ── design tokens ───────────────────────────────────────────── */
+  :root {
+    /* tile identity colors — saturated enough to read on a dark base */
+    --shim: #2a5a90;
+    --core: #2a5a3a;
+    --sel: #f0b840;
+    /* backgrounds — three-level stack with clear contrast steps */
+    --bg-base:    #282828;
+    --bg-surface: #323232;
+    --bg-raised:  #3e3e3e;
+    --bg-code:    #1e1e1e;
+    --bg-input:   #242424;
+    --bg-hover:   #484848;
+    /* borders */
+    --bd:        #555555;
+    --bd-soft:   #404040;
+    --bd-subtle: #333333;
+    --bd-accent: #3a5070;
+    /* text */
+    --tx-hi:   #f0f0f0;
+    --tx-mid:  #a8a8a8;
+    --tx-lo:   #686868;
+    /* accent — electric blue */
+    --accent:     #5ab0ff;
+    --accent-dim: #2a3a48;
+    --accent-fg:  #a0d0ff;
+    /* status */
+    --green-bg: #0c2018; --green-fg: #7aefa0;
+    --red-bg:   #1e0c10; --red-fg:   #ff9090;
+    --amber-fg: #f0c040;
+    /* peer highlight colors */
+    --peer-send-border: #d058c0;
+    --peer-recv-border: #38d0e0;
+  }
+
   * { box-sizing: border-box; }
-  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
-         background:#1e1e1e; color:#ddd; display:flex; height:100vh; }
+  body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+         background:var(--bg-base); color:var(--tx-hi); display:flex; height:100vh;
+         font-size:14px; line-height:1.45; }
+
+  /* ── layout skeleton ─────────────────────────────────────────── */
   #left { flex:0 0 50%; min-width:200px; display:flex; flex-direction:column;
-          overflow:hidden; }
-  #lefttop { flex:0 1 auto; overflow:auto; padding:16px; min-height:0; }
-  /* flex-basis:0 so the bottom frame is sized only by leftover space, never by
-     its console content (which would otherwise inflate the frame). */
-  #leftbottom { flex:1 1 0; overflow:auto; padding:16px; min-height:80px;
-                display:flex; flex-direction:column; }
-  #lhsplitter { flex:0 0 6px; cursor:row-resize; background:#333;
-                border-top:1px solid #444; border-bottom:1px solid #444; }
-  #lhsplitter:hover, #lhsplitter.drag { background:#5a5a5a; }
-  #splitter { flex:0 0 6px; cursor:col-resize; background:#333;
-              border-left:1px solid #444; border-right:1px solid #444; }
-  #splitter:hover, #splitter.drag { background:#5a5a5a; }
+          overflow:hidden; border-right:1px solid var(--bd); }
+  #lefttop { flex:3 1 0; overflow:auto; padding:16px; min-height:80px; }
+  #leftbottom { flex:1 1 0; overflow:hidden; min-height:60px;
+               display:flex; flex-direction:column; }
   #right { flex:1 1 0; min-width:200px; padding:16px; overflow:hidden;
            display:flex; flex-direction:column; }
   #panel { flex:1 1 0; overflow:auto; min-height:0; }
-  #rhsplitter { display:none; flex:0 0 6px; cursor:row-resize; background:#333;
-                margin-top:8px; border-top:1px solid #444; border-bottom:1px solid #444; }
+  /* Title + item tabs share one row, and it sits OUTSIDE #panel: the strip used
+     to scroll away with the body, and hoisting it costs no extra height. */
+  #panel-hdr { flex:0 0 auto; display:flex; align-items:baseline; flex-wrap:wrap;
+               gap:8px; padding:0 0 6px; margin-bottom:6px;
+               border-bottom:1px solid var(--bd-soft); }
+  /* ── panel item tabs (multi-select net/tile strip) ─────────── */
+  #panel-itemtabs { display:flex; flex-wrap:wrap; gap:4px; }
+  #panel-itemtabs:empty { display:none; }
+  .pitab { display:inline-flex; align-items:center; gap:5px; padding:2px 8px 2px 6px;
+           border-radius:9999px; font-size:10px; font-weight:500; cursor:pointer;
+           border:1px solid var(--bd); background:var(--bg-raised);
+           color:var(--tx-lo); user-select:none; transition:opacity .12s, border-color .12s; }
+  .pitab.act { border-color:rgba(228,228,228,.5); color:var(--tx-hi);
+               background:rgba(228,228,228,.07); }
+  .pitab:hover:not(.act) { color:var(--tx-mid); }
+  .pitab .pit-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
+  .pitab .pit-x { margin-left:3px; font-size:12px; line-height:1; color:var(--tx-lo);
+                  cursor:pointer; }
+  .pitab .pit-x:hover { color:var(--tx-hi); }
+
+  /* ── splitters ───────────────────────────────────────────────── */
+  #splitter { flex:0 0 5px; cursor:col-resize; background:var(--bg-base);
+              border-left:1px solid var(--bd); border-right:1px solid var(--bd);
+              transition:background .15s; position:relative; }
+  #splitter:hover, #splitter.drag { background:var(--accent-dim); border-color:var(--accent); }
+  #splitter::after { content:''; position:absolute; top:50%; left:50%;
+                     transform:translate(-50%,-50%);
+                     width:1px; height:20px; background:var(--bd); border-radius:1px; }
+  #splitter:hover::after, #splitter.drag::after { background:var(--accent); }
+
+  #lhsplitter { flex:0 0 5px; cursor:row-resize; background:var(--bg-base);
+                border-top:1px solid var(--bd); border-bottom:1px solid var(--bd);
+                transition:background .15s; position:relative; }
+  #lhsplitter:hover, #lhsplitter.drag { background:var(--accent-dim); border-color:var(--accent); }
+  #lhsplitter::after { content:''; position:absolute; left:50%; top:50%;
+                       transform:translate(-50%,-50%);
+                       height:1px; width:20px; background:var(--bd); border-radius:1px; }
+  #lhsplitter:hover::after, #lhsplitter.drag::after { background:var(--accent); }
+
+  #rhsplitter { display:none; flex:0 0 5px; cursor:row-resize; background:var(--bg-base);
+                margin-top:8px; border-top:1px solid var(--bd); border-bottom:1px solid var(--bd);
+                transition:background .15s; position:relative; }
   #right:has(#cmdconsole:not(.hide)) #rhsplitter { display:block; }
-  #rhsplitter:hover, #rhsplitter.drag { background:#5a5a5a; }
-  /* fixed default height + flex column so console output scrolls inside the
-     frame instead of inflating it; drag #rhsplitter to resize. */
-  #cmdconsole { flex:0 0 260px; border-top:1px solid #333; margin-top:8px;
-                padding-top:8px; display:flex; flex-direction:column;
-                min-height:0; overflow:hidden; }
-  /* keep the header/help at natural height; the terminal box (#conterm)
-     flexes and holds both the scrolling output and the inline prompt. */
-  #conhdr, #conhelp { flex:0 0 auto; }
-  #conhdr { font-weight:700; margin-bottom:4px; }
-  #contarget { color:#8ec; }
-  #conhelp { color:#789; font-size:10px; margin-bottom:6px; }
-  #conreload { margin-left:8px; padding:3px 10px; cursor:pointer; }
-  #conterm { flex:1 1 0; display:flex; flex-direction:column; min-height:0;
-             margin-top:6px; padding:6px; background:#111; border:1px solid #444;
-             border-radius:4px; overflow:hidden; cursor:text; }
-  #conout { flex:1 1 auto; min-height:0; overflow:auto; margin:0;
-            background:transparent; }
-  #conpromptline { flex:0 0 auto; display:flex; align-items:center;
-                   margin-bottom:4px; padding-bottom:4px;
-                   border-bottom:1px solid #333; }
-  #conprompt { color:#8ec; margin-right:6px; white-space:nowrap;
-               font-family:monospace; }
-  #conin { flex:1 1 auto; background:transparent; border:none; outline:none;
-           color:#ddd; font-family:monospace; padding:0; }
-  /* highlight of the most recent command + result, pinned at the top of the
-     terminal box just under the prompt/input line (before the scrolling log) */
-  /* cap + scroll the "last result" so a big command output (help/bd/event/klog)
-     scrolls inside this box instead of ballooning past #conterm and getting
-     clipped by its overflow:hidden (which left no scrollbar and squeezed the
-     #conout log to zero height). */
-  #conlast { flex:0 0 auto; margin-bottom:6px; padding:6px 8px; background:#161616;
-             border:1px solid #444; border-radius:4px; font-family:monospace;
-             font-size:11px; font-weight:700; white-space:pre-wrap;
-             word-break:break-word; max-height:96px; overflow:auto; }
-  #conlastlbl { color:#789; font-weight:700; margin-right:6px; }
-  #conlastcmd { color:#8ec; font-weight:700; }
-  #conlastres { color:#f5b942; font-weight:700; }
+  #rhsplitter:hover, #rhsplitter.drag { background:var(--accent-dim); border-color:var(--accent); }
+
   body.resizing { cursor:col-resize; user-select:none; }
   body.vresizing { cursor:row-resize; user-select:none; }
-  h1 { font-size:16px; margin:0 0 4px; }
-  .sub { color:#888; font-size:12px; margin-bottom:12px; }
-  #grid { display:grid; gap:6px; }
-  .tile { border:1px solid #444; border-radius:6px; padding:8px; cursor:pointer;
-          font-size:11px; line-height:1.35; transition:.1s; min-height:64px; }
-  .tile.shim { background:var(--shim); }
-  .tile.core { background:var(--core); }
-  .tile:hover { outline:2px solid #fff6; }
-  .tile.sel { outline:3px solid var(--sel); }
-  .tile.sdmismatch { box-shadow:0 0 0 2px #d64545 inset; }
-  .tile .badge.sdwarn { background:#5a2020; color:#ffb0b0; cursor:default; }
-  .tile .loc { font-weight:700; font-size:12px; }
-  .tile .badge { display:inline-block; background:#0006; border-radius:3px;
-                 padding:0 4px; margin:1px 2px 0 0; font-size:10px; }
-  .tile .badge { cursor:pointer; }
-  .tile .badge:hover { outline:1px solid #fff; }
-  /* persistent selection: the clicked channel badge stays highlighted (survives
-     mouseout) until another item (tile or channel) is clicked. */
-  .tile .badge.selbadge { outline:2px solid var(--sel); background:#0009; }
-  /* peer channel badges of the same flow as the clicked channel: partner =
-     opposite direction (the source/destination), coop = same direction
-     (cooperating group, e.g. broadcast peers / ping-pong). Distinct dotted vs
-     dashed lines and colors so they read differently from the solid selbadge. */
-  .tile .badge.peerbadge-partner { outline:2px dotted #ffb347; background:#0009; }  /* source/dest = amber dotted */
-  .tile .badge.peerbadge-coop    { outline:2px dashed #7ee081; background:#0009; }  /* same group  = green dashed */
-  .tile.peer-recv { outline:3px solid #35d0e0; }          /* receivers = cyan  */
-  .tile.peer-send { outline:3px dashed #e05fd0; }          /* senders  = magenta*/
-  .tile.flowsel   { box-shadow:0 0 0 2px #fff inset; }     /* the clicked badge's tile */
-  .legend { margin-top:14px; font-size:12px; color:#aaa; }
-  .legend .sw { display:inline-block; width:12px; height:12px; border-radius:3px;
-                vertical-align:-2px; margin-right:4px; }
-  .panel h2 { font-size:14px; margin:14px 0 6px; border-bottom:1px solid #333;
-              padding-bottom:4px; }
-  .kv { font-size:13px; margin:2px 0; }
-  .kv b { color:#9cc; }
-  ul.sum { margin:4px 0; padding-left:18px; font-size:13px; }
+
+  /* ── typography ──────────────────────────────────────────────── */
+  #lefttop-header { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
+  h1 { font-size:17px; font-weight:600; margin:0; letter-spacing:-.01em; }
+  /* One name per pane. Each rides the pane's existing first row — a control
+     row or a tab strip — rather than taking a row of its own. */
+  .pane-title { flex:0 0 auto; font-size:13px; font-weight:600; margin:0;
+                color:var(--tx-mid); letter-spacing:.01em; white-space:nowrap; }
+  #contabs > .pane-title { display:inline-block; vertical-align:bottom;
+                           padding-bottom:3px; margin-right:8px; }
+  .sub { color:var(--tx-lo); font-size:11px; letter-spacing:.01em; }
+  .panel h2 { font-size:12px; font-weight:600; margin:16px 0 6px;
+              padding-bottom:5px; border-bottom:1px solid var(--bd-soft);
+              color:var(--tx-mid); text-transform:uppercase; letter-spacing:.06em; }
+
+  /* ── tile grid ───────────────────────────────────────────────── */
+  #grid { display:grid; gap:5px; }
+  .tile { border:1px solid var(--bd); border-radius:5px; padding:8px 9px;
+          cursor:pointer; font-size:11px; line-height:1.35;
+          transition:box-shadow .12s, border-color .12s; min-height:60px;
+          position:relative; user-select:none; }
+  .tile.shim { background:var(--shim); border-color:#3a6898; }
+  .tile.core { background:var(--core); border-color:#386848; }
+  .tile:hover { border-color:var(--tx-lo); box-shadow:0 0 0 1px var(--tx-lo) inset; }
+  /* selected tile: inner ring glow — the "precision instrument" signature */
+  .tile.sel { border-color:var(--sel);
+              box-shadow:0 0 0 1px var(--sel) inset, 0 0 14px 0 rgba(240,184,64,.25); }
+  .tile.sdmismatch { border-color:#e04040;
+                     box-shadow:0 0 0 1px #e04040 inset, 0 0 12px 0 rgba(224,64,64,.22); }
+  .tile .badge.sdwarn { background:var(--red-bg); color:var(--red-fg); cursor:default; }
+  .tile .loc { font-weight:700; font-size:11.5px; color:var(--tx-hi); }
+  .tile .badge { display:inline-block; background:rgba(0,0,0,.32);
+                 border:1px solid rgba(255,255,255,.10);
+                 border-radius:3px; padding:0 4px; margin:2px 2px 0 0;
+                 font-size:10px; font-family:ui-monospace,monospace; cursor:pointer; }
+  .tile .badge:hover { border-color:rgba(255,255,255,.35); }
+  .tile .badge.selbadge { border-color:var(--sel); background:rgba(0,0,0,.45);
+                           box-shadow:0 0 4px 0 rgba(232,168,64,.35); }
+  .tile .badge.peerbadge-partner { border-color:#e8943a; border-style:dotted; background:rgba(0,0,0,.45); }
+  .tile .badge.peerbadge-coop    { border-color:#6cd080; border-style:dashed; background:rgba(0,0,0,.45); }
+  .tile.peer-recv { border-color:var(--peer-recv-border);
+                    box-shadow:0 0 0 1px var(--peer-recv-border) inset,
+                               0 0 12px 0 rgba(56,208,224,.25); }
+  .tile.peer-send { border-color:var(--peer-send-border); border-style:dashed;
+                    box-shadow:0 0 12px 0 rgba(208,88,192,.25); }
+  .tile.flowsel   { box-shadow:0 0 0 1px rgba(255,255,255,.25) inset; }
+  .livebar { display:block; margin-top:4px; font-size:9px; font-weight:700; color:#fff;
+             border-radius:2px; padding:0 4px; text-align:center; letter-spacing:.5px; }
+
+  /* ── legend ──────────────────────────────────────────────────── */
+  .legend { margin-top:14px; font-size:11px; color:var(--tx-mid); }
+  .legend .sw { display:inline-block; width:11px; height:11px; border-radius:2px;
+                vertical-align:-2px; margin-right:4px; border:1px solid rgba(255,255,255,.1); }
+
+  /* ── key-value pairs ─────────────────────────────────────────── */
+  .kv { font-size:12px; margin:3px 0; }
+  .kv b { color:var(--accent-fg); font-weight:500; }
+  ul.sum { margin:4px 0; padding-left:18px; font-size:12px; }
   ul.sum li { margin:2px 0; }
-  .contract { color:#c9a; font-size:12px; }
-  /* supply/demand balance flags */
-  .sdrow { margin:3px 0 6px; }
+  .contract { color:#c9a; font-size:11.5px; }
+
+  /* ── supply/demand badges ────────────────────────────────────── */
+  .sdrow { margin:4px 0 7px; }
   .sdbadge { display:inline-block; font-size:10px; font-weight:700; padding:1px 6px;
-             border-radius:3px; margin-right:6px; vertical-align:1px; }
-  .sdbadge.sdok  { background:#1f4d2e; color:#8fe0a8; }
-  .sdbadge.sdbad { background:#5a2020; color:#ff9a9a; }
-  .sdbadge.sdna  { background:#3a3a3a; color:#bbb; }
-  .sdmeta { color:#9aa; font-size:11px; }
-  .sdfig  { color:#ccd; font-size:12px; margin:2px 0 0 2px; }
-  .sdnote { color:#888; font-size:11px; font-style:italic; margin-left:2px; }
-  pre.code { background:#111; border:1px solid #333; border-radius:6px; padding:10px;
-             overflow:auto; font-size:12px; line-height:1.4; white-space:pre; }
-  .lref { color:#888; font-size:12px; margin:4px 0; }
-  /* code-piece file path banner shown at the top of the file (host.cc) frame */
-  .codepath { color:#8ec; font-size:11px; margin:2px 0 8px; word-break:break-all;
-              padding:4px 8px; background:#12252b; border:1px solid #244;
-              border-radius:4px; }
-  .codepath b { color:#6ab; font-weight:600; }
-  .codepath .cpath { color:#bfe; -webkit-user-select:all; user-select:all; }
-  .tabs { margin-top:8px; }
-  .tab { display:inline-block; padding:4px 10px; border:1px solid #333;
-         border-bottom:none; cursor:pointer; background:#252525; border-radius:6px 6px 0 0; }
-  .tab.act { background:#111; color:#fff; }
-  .tabbody { border:1px solid #333; padding:10px; border-radius:0 6px 6px 6px; }
+             border-radius:3px; margin-right:6px; vertical-align:1px;
+             letter-spacing:.02em; }
+  .sdbadge.sdok  { background:var(--green-bg); color:var(--green-fg);
+                   border:1px solid #205a30; }
+  .sdbadge.sdbad { background:var(--red-bg); color:var(--red-fg);
+                   border:1px solid #582020; }
+  .sdbadge.sdna  { background:var(--bg-raised); color:var(--tx-mid);
+                   border:1px solid var(--bd); }
+  .sdmeta, .sdnote { color:var(--tx-lo); font-size:11px; }
+  .sdfig  { color:var(--tx-mid); font-size:12px; margin:2px 0 0 2px; }
+  .sdnote { font-style:italic; margin-left:2px; }
+
+  /* ── code / pre blocks ───────────────────────────────────────── */
+  pre.code { background:var(--bg-code); border:1px solid var(--bd-subtle);
+             border-radius:5px; padding:10px; overflow:auto;
+             font-size:11.5px; line-height:1.45; white-space:pre;
+             font-family:ui-monospace, 'Cascadia Code', monospace; }
+  .lref { color:var(--tx-lo); font-size:11px; margin:4px 0; }
+
+  /* ── source viewer ───────────────────────────────────────────── */
+  .srcref { cursor:pointer; }
+  .srcref:hover { text-decoration:underline dotted; }
+  .con-ln.con-src { cursor:pointer; }
+  .srcwrap { overflow:auto; border:1px solid var(--bd-subtle); border-radius:4px;
+             padding:6px 0; background:var(--bg-code); }
+  /* One id of specificity, so these beat the style sheet the daemon injects
+     regardless of which <style> the browser saw last. */
+  #panel-body .srcview { background:var(--bg-code); margin:0;
+                         font-family:ui-monospace,'Cascadia Code',monospace;
+                         font-size:11.5px; line-height:1.55; }
+  #panel-body .srcview pre { margin:0; padding:0; border:none; background:none;
+                             line-height:inherit; white-space:pre; }
+  /* user-select:none mirrors .lno, so copying out of the viewer (which feeds
+     "+ Add context") yields code without line numbers. */
+  #panel-body .srcview .linenos { display:inline-block; min-width:5ch;
+                                  text-align:right; margin-right:12px;
+                                  color:var(--tx-lo); user-select:none; }
+  /* inset shadow, not border-left: a border would shift the highlighted line
+     horizontally relative to its neighbours inside the <pre>. */
+  #panel-body .srcview .hlline { display:block; background:#26240e;
+                                 box-shadow:inset 3px 0 0 var(--amber-fg); }
+  .srcbanner .srcmeta { color:var(--tx-lo); margin-left:8px; font-weight:400; }
+  .srcbanner .srcmore { font-size:10px; padding:1px 7px; margin-left:4px;
+                        border-radius:3px; cursor:pointer; }
+  .srcnote { color:#f6c177; font-size:11px; margin:4px 0; }
+
+  /* context echoed into the transcript after sending */
+  .llm-msg-sctx { background:transparent; border-left:2px solid var(--bd-subtle);
+                  padding:3px 9px; }
+  .sctx-lead { color:var(--tx-lo); font-size:10.5px; margin-right:6px; }
+  .llm-sent-pill { display:inline-block; margin:1px 4px 1px 0; padding:0 7px;
+                   border-radius:9999px; font-size:10.5px; cursor:pointer;
+                   background:var(--bg-raised); color:var(--tx-mid);
+                   border:1px solid var(--bd-subtle); }
+  .llm-sent-pill:hover { color:var(--tx-hi); border-color:var(--bd); }
+  .llm-sent-pill.act { border-color:var(--accent); color:var(--accent-fg); }
+  .sctx-body { margin:4px 0 2px; padding:5px 8px; max-height:220px; overflow:auto;
+               background:var(--bg-code); border:1px solid var(--bd-subtle);
+               border-radius:4px; font-size:11px; white-space:pre-wrap; }
+  .codepath { color:var(--accent-fg); font-size:11px; margin:2px 0 10px;
+              word-break:break-all; padding:5px 9px;
+              background:var(--accent-dim); border:1px solid var(--bd-accent); border-radius:4px; }
+  .codepath b { color:var(--accent); font-weight:600; }
+  .codepath .cpath { color:#b0d8f8; -webkit-user-select:all; user-select:all; }
+  .placeholder { color:var(--tx-lo); margin-top:40px; font-size:12px; }
+
+  /* ── unified button ──────────────────────────────────────────── */
+  button, .btn {
+    padding:3px 11px; cursor:pointer; font-size:12px;
+    background:var(--bg-raised); color:var(--tx-mid);
+    border:1px solid var(--bd); border-radius:4px;
+    transition:background .12s, border-color .12s, color .12s;
+    font-family:inherit;
+  }
+  button:hover, .btn:hover { background:var(--bg-hover); color:var(--tx-hi); border-color:var(--bd); }
+  button:disabled, .btn:disabled { opacity:.38; cursor:not-allowed; }
+  #stopbtn { background:#2a1516; color:#f8b0b0; border-color:#5c2828; }
+  #stopbtn:hover { background:#3a1e1e; border-color:#7a3535; }
+
+  /* ── unified input ───────────────────────────────────────────── */
+  input[type=text], input[type=password], .ui-input, #boardHost, #dbgcmd {
+    background:var(--bg-input); color:var(--tx-hi);
+    border:1px solid var(--bd); border-radius:4px;
+    padding:3px 7px; font-family:ui-monospace,monospace; font-size:12px;
+    outline:none; transition:border-color .15s;
+  }
+  input[type=text]:focus, input[type=password]:focus, .ui-input:focus,
+  #boardHost:focus, #dbgcmd:focus { border-color:var(--accent); }
+  #dbgcmd { padding-top:4px; }
+
+  /* ── unified tab system ──────────────────────────────────────── */
+  /* One accent identity for every tab family: inactive tabs are raised-grey,
+     hover lifts them, and the selected one takes the blue accent. Shape still
+     varies (pill / folder / segmented) because it encodes what the strip does,
+     but the *color* language is shared so "selected" reads the same anywhere.
+     Note: .pitab (the net/tile chip strip) is deliberately NOT part of this —
+     its chips carry per-item identity dots and stay neutral. */
+  .ltab.act, .vsw.act, .tab.act, .contab.act, .subtab.act {
+    background:var(--accent-dim); color:var(--accent-fg); border-color:var(--bd-accent); }
+  .ltab:hover:not(.act), .vsw:hover:not(.act), .tab:hover:not(.act),
+  .contab:hover:not(.act), .subtab:hover:not(.act) {
+    color:var(--tx-mid); background:var(--bg-hover); }
+
+  /* Pill tabs (.ltab, .vsw overlay tabs) */
+  .ltab { display:inline-block; padding:2px 9px; margin:5px 3px 0 0;
+          border:1px solid var(--bd); border-radius:4px;
+          background:var(--bg-raised); color:var(--tx-lo);
+          cursor:pointer; font-size:11px; transition:background .12s, color .12s, border-color .12s; }
+
+  /* Folder tabs (.tab, .contab — top-edge tabs that connect to a content border) */
+  .tabs { margin-top:10px; }
+  .tab { display:inline-block; padding:4px 11px; border:1px solid var(--bd);
+         border-bottom:none; cursor:pointer; background:var(--bg-raised);
+         color:var(--tx-lo); border-radius:5px 5px 0 0; font-size:12px;
+         margin-right:3px; transition:color .12s, background .12s, border-color .12s; }
+  /* The active folder tab no longer matches .tabbody's background, so give the
+     body an accent top edge — that line is what keeps the tab reading as
+     attached to the box below it now that the two surfaces differ. */
+  .tabbody { border:1px solid var(--bd); border-top-color:var(--bd-accent); padding:10px;
+             border-radius:0 5px 5px 5px; background:var(--bg-code); }
+
+  /* Subtabs (.subtab — compact secondary tabs) */
+  .subtabs { margin:3px 0 9px; }
+  .subtab { display:inline-block; padding:2px 9px; border:1px solid var(--bd);
+            cursor:pointer; background:var(--bg-raised); color:var(--tx-lo);
+            border-radius:4px; margin-right:5px; font-size:11.5px;
+            transition:background .12s, color .12s, border-color .12s; }
+
+  /* Segmented control (.vsw — Grid/Device Map switcher) */
+  #viewswitcher { display:flex; gap:0; }
+  .vsw { padding:3px 14px; font-size:12px; font-weight:500;
+         border:1px solid var(--bd); background:var(--bg-raised);
+         color:var(--tx-lo); cursor:pointer; transition:background .12s, color .12s, border-color .12s; }
+  .vsw:first-child { border-radius:4px 0 0 4px; }
+  .vsw:last-child  { border-radius:0 4px 4px 0; }
+  .vsw + .vsw { border-left:none; }
+  /* Segments share borders, so an active segment would show accent on only
+     three sides; paint the left edge of the following segment to close it. */
+  .vsw.act + .vsw { border-left:1px solid var(--bd-accent); }
+
+  /* Console header tabs (#contabs) — folder style */
+  #contabs { flex:0 0 auto; margin-bottom:6px; }
+  .contab { display:inline-block; padding:3px 12px; border:1px solid var(--bd);
+            border-bottom:none; cursor:pointer; background:var(--bg-raised);
+            color:var(--tx-lo); border-radius:5px 5px 0 0; font-size:12px; margin-right:3px;
+            transition:color .12s, background .12s, border-color .12s; }
+
   .hide { display:none; }
-  .kw { color:#569cd6; } .fn { color:#dcdcaa; } .num { color:#b5cea8; }
-  .cm { color:#6a9955; }
-  .pann { color:#8a8; font-style:italic; margin-left:1ch; }
-  .gap { color:#c8905a; font-style:italic; opacity:0.75; }
-  .bdpretty { font-family:monospace; font-size:11.5px; line-height:1.4; color:#6a9955;
-              background:#0f1a10; border-left:3px solid #4a5a2a; border-radius:4px;
-              margin:2px 0 8px 22px; padding:6px 10px; white-space:pre; overflow-x:auto; }
-  .placeholder { color:#666; margin-top:40px; }
-  /* kernel channel<->argument mapping table (High level tab, core tiles) */
-  .kmap { border-collapse:collapse; margin:6px 0 8px; font-size:12px; }
-  .kmap th, .kmap td { border:1px solid #333; padding:3px 8px; text-align:left; }
-  .kmap th { background:#252525; color:#bbb; font-weight:600; }
-  .kmap td.arrow { color:#8ec; text-align:center; }
-  .kmap .win { color:#dcdcaa; }
-  .kmap .mlock { color:#6a9; }
-  .kmap .morder { color:#c93; }
-  .kmap .mnone { color:#a55; }
-  /* net detail panel tables (stream-switch connections, hops, channels) */
-  .rctbl { border-collapse:collapse; margin:6px 0 8px; font-size:12px; width:100%; }
-  .rctbl th, .rctbl td { border:1px solid #333; padding:3px 7px; text-align:left;
-                          white-space:nowrap; }
-  .rctbl th { background:#252525; color:#bbb; font-weight:600; }
-  .rctbl td:first-child { color:#9cc; font-family:monospace; }
-  .dimtxt { color:#888; font-size:12px; }
-  /* search chip shared style (used in #sr-chips) */
-  .lk-chip { display:inline-flex; align-items:center; gap:4px;
-             background:#2a1e0a; border:1px solid #c8905a; border-radius:12px;
-             color:#f0c070; font-size:11px; padding:1px 8px 1px 6px;
-             font-family:monospace; }
-  .lk-chip .lk-x { cursor:pointer; color:#c8905a; font-size:13px;
-                    line-height:1; margin-left:2px; }
-  .lk-chip .lk-x:hover { color:#ff9a6c; }
-  /* kernel source view (Low level tab, core tiles) */
-  .khl { background:#3a3410; border-left:3px solid #e0a800; }
-  .kshowall { margin:4px 0 8px; padding:3px 10px; font-size:12px; cursor:pointer;
-              background:#252525; color:#ddd; border:1px solid #444; border-radius:4px; }
-  .kshowall:hover { background:#333; }
-  .kfileref { color:#8ec; font-size:11px; }
-  /* merged "kernel code" sub-tab: stacked source/wrapper/bcf sections */
-  .ksec { margin:0 0 6px; }
-  .ksechdr { color:#8ec; font-size:11px; text-transform:uppercase; letter-spacing:.5px;
-             margin:6px 0 2px; opacity:.8; }
-  .ksecsep { border-top:1px dashed #444; margin:10px 0; }
-  .subtabs { margin:2px 0 8px; }
-  .subtab { display:inline-block; padding:2px 9px; border:1px solid #444; cursor:pointer;
-            background:#252525; border-radius:4px; margin-right:6px; font-size:12px; }
-  .subtab.act { background:#0d3a2a; color:#fff; border-color:#3a7d44; }
-  .rline { font-family:monospace; font-size:12px; line-height:1.55; white-space:pre-wrap; }
-  .lno { color:#666; user-select:none; margin-right:6px; }
-  /* right-aligned gutter for the dfschedule Middle IR original line numbers */
-  .mlno { color:#666; user-select:none; display:inline-block; min-width:3.2em;
-          text-align:right; margin-right:10px; }
-  .midctrls { margin:6px 0; }
-  .midctrls button { margin-right:8px; padding:3px 10px; cursor:pointer; }
-  .irfull { max-height:420px; overflow:auto; }
-  .irln { display:block; }
-  .irlno { color:#555; user-select:none; display:inline-block; min-width:3.6em;
-           text-align:right; margin-right:10px; }
-  .irhi { background:#3a3320; }              /* highlighted tile/channel line */
-  .irhi .irlno { color:#e0a800; }
-  .irhidden { display:block; }               /* revealed folded lines */
-  .irhidden.hide { display:none; }           /* beats global .hide (equal spec) */
-  .irfold { display:block; color:#7fb0ff; cursor:pointer; user-select:none;
-            background:#1b2330; padding:0 6px; }
-  .irfold:hover { background:#243043; }
-  .irfold.irfold-open { color:#88cc88; }
-  .kb { display:inline-block; border-radius:3px; padding:0 4px; margin-right:5px;
-        font-size:10px; font-weight:700; vertical-align:1px; }
-  .kb.bd_config{background:#4a5a2a;color:#dfffb0} .kb.createio{background:#2d4a6a;color:#cfe6ff}
-  .kb.startio{background:#6a4a2d;color:#ffe0c0} .kb.lock{background:#5a2d5a;color:#f0c0f0}
-  .kb.wait{background:#6a2d2d;color:#ffc0c0}
-  .kb.enable_ooo{background:#2d5a5a;color:#c0f0f0}
-  .kb.loop{background:#3a3a6a;color:#cfd0ff}
-  .kb.loopidx{background:#33334d;color:#b0b0e0}
-  .kb.loopend{background:#3a3a6a;color:#cfd0ff}
-  .rnote{color:#9a9ad0;font-style:italic;margin-left:8px;font-size:11px;}
-  /* ── live debug overlay (active only when served by schedule_debug_server) ── */
-  #live { font-size:12px; flex:1 1 auto; display:flex; flex-direction:column;
-          min-height:0; }
-  #live label, #overlayctl label { cursor:pointer; }
-  /* overlay controls live in the top-left array/partition view (after #grid) */
-  #overlayctl { margin-top:8px; font-size:12px; }
-  .ltab { display:inline-block; padding:2px 8px; margin:6px 4px 0 0; border:1px solid #444;
-          border-radius:4px; background:#252525; cursor:pointer; font-size:11px; }
-  .ltab.act { background:#0d2a3a; color:#fff; border-color:#2d6a9f; }
-  #runbtn { margin-left:6px; padding:4px 12px; cursor:pointer; }
-  #stopbtn { margin-left:6px; padding:4px 12px; cursor:pointer;
-             background:#5a2d2d; color:#fdd; border:1px solid #843; border-radius:4px; }
-  #loadlogbtn { margin-left:6px; padding:4px 12px; cursor:pointer; }
-  #stopbtn:hover { background:#7a3535; }
-  #runbtn:disabled, #stopbtn:disabled { opacity:.4; cursor:not-allowed; }
-  #testconn:disabled, #conreload:disabled { opacity:.4; cursor:not-allowed; }
+
+  /* ── console / terminal ──────────────────────────────────────── */
+  #cmdconsole { flex:0 0 260px; border-top:1px solid var(--bd); margin-top:8px;
+                padding-top:10px; display:flex; flex-direction:column;
+                min-height:0; overflow:hidden; }
+  #conhdr, #conhelp { flex:0 0 auto; }
+  #conhdr { font-weight:600; margin-bottom:4px; font-size:12px; }
+  #contarget { color:var(--accent-fg); }
+  #conhelp { display:flex; flex-wrap:wrap; align-items:center; gap:2px;
+             margin-bottom:6px; }
+  .qcmd-sep { display:inline-block; width:1px; height:14px; background:var(--bd);
+              margin:0 4px; vertical-align:middle; flex-shrink:0; }
+  #conreload { margin-left:8px; }
+  /* aiegdb header: name, live scope and every action on ONE row, reclaiming the
+     vertical strip the separate #conhelp button row used to take. Scoped by
+     class because #conhdr/#conhelp are reused by the LLM and Search panes. */
+  #conhdr.conhdr-row { display:flex; align-items:center; gap:4px;
+                       flex-wrap:nowrap; margin-bottom:5px; overflow:hidden; }
+  .conhdr-row .chname { flex:0 0 auto; }
+  /* the scope breadcrumb is the only elastic item — it ellipsizes so the
+     buttons never wrap to a second row */
+  .conhdr-row #contarget { flex:0 1 auto; min-width:0; font-size:11px;
+                           font-weight:400; white-space:nowrap;
+                           overflow:hidden; text-overflow:ellipsis; }
+  .conhdr-row .chgap { flex:1 1 auto; min-width:4px; }
+  .conhdr-row .qcmd { flex:0 0 auto; }
+  .conhdr-row #conreload { margin-left:0; }
+  #conterm { flex:1 1 0; display:flex; flex-direction:column; min-height:0;
+             margin-top:6px; padding:7px; background:var(--bg-code);
+             border:1px solid var(--bd-subtle); border-radius:5px;
+             overflow:hidden; cursor:text; }
+  #conout { flex:1 1 auto; min-height:0; overflow:auto; margin:0; background:transparent; }
+  #conpromptline { flex:0 0 auto; display:flex; align-items:center;
+                   margin-bottom:5px; padding-bottom:5px;
+                   border-bottom:1px solid var(--bd-subtle); }
+  #conprompt { color:var(--accent-fg); margin-right:6px; white-space:nowrap;
+               font-family:ui-monospace,monospace; font-size:11.5px; }
+  #conin { flex:1 1 auto; background:transparent; border:none; outline:none;
+           color:var(--tx-hi); font-family:ui-monospace,monospace;
+           font-size:11.5px; padding:0; }
   #conin.disabled, #conin:disabled { opacity:.4; cursor:not-allowed; }
-  #live label.disabled, #overlayctl label.disabled { opacity:.5; }
-  #boardHost { background:#111; color:#ddd; border:1px solid #444; border-radius:4px;
-               padding:3px 6px; font-family:monospace; }
-  #livestatus { color:#8ab; font-size:11px; margin-top:6px; min-height:14px; }
-  .consolebox { background:#0a0a0a; border:1px solid #333; border-radius:6px; padding:8px;
-                font-size:11px; line-height:1.35; max-height:220px; overflow:auto;
-                white-space:pre-wrap; word-break:break-word; max-width:100%;
-                min-width:0; margin-top:8px; }
-  /* the run/log console fills the resizable bottom-left region */
-  #console { flex:1 1 auto; max-height:none; min-height:100px; }
-  .livebar { display:block; margin-top:3px; font-size:9px; font-weight:700; color:#fff;
-             border-radius:3px; padding:0 4px; text-align:center; letter-spacing:.5px; }
-  /* ── view switcher (Grid / Device Map) ─────────────────────── */
-  #viewswitcher { display:flex; gap:0; margin-bottom:10px; }
-  .vsw { padding:4px 14px; font-size:12px; font-weight:600; border:1px solid #444;
-         background:#252525; color:#888; cursor:pointer; transition:all .12s; }
-  .vsw:first-child { border-radius:5px 0 0 5px; }
-  .vsw:last-child  { border-radius:0 5px 5px 0; }
-  .vsw.act { background:#0d2a3a; color:#7ec8e3; border-color:#2d6a9f; }
-  /* ── Device Map panel ───────────────────────────────────────── */
+  #conpane { flex:1 1 0; display:flex; flex-direction:column; min-height:0; }
+  #llmpane { flex:1 1 0; display:flex; flex-direction:column; min-height:0;
+             position:relative; }
+  #conpane.hide, #llmpane.hide { display:none; }
+
+  /* ── aiegdb console: per-command blocks ──────────────────────────
+     #conout was a <pre class="code">; it is a <div> now so each command can be
+     its own foldable block, so the typography pre.code used to supply is
+     re-declared here. pre-wrap on .con-ln keeps aiegdb's leading indentation,
+     which is load-bearing both for reading and for the line classifier. */
+  #conout { flex:1 1 auto; min-height:0; overflow:auto; margin:0;
+            background:transparent; font-family:ui-monospace,monospace;
+            font-size:11.5px; line-height:1.5; color:var(--tx-mid); }
+  .con-blk { border:1px solid var(--bd-subtle); border-radius:4px;
+             margin:0 0 5px; background:#00000026; overflow:hidden; }
+  .con-blk.err { border-color:#5a2a2a; }
+  .con-echo { display:flex; align-items:center; gap:6px; cursor:pointer;
+              padding:2px 7px; background:var(--bg-surface);
+              border-bottom:1px solid var(--bd-subtle); user-select:none; }
+  .con-echo:hover { background:var(--bg-hover); }
+  .con-echo .cf { color:var(--tx-lo); width:9px; flex:0 0 9px; }
+  .con-echo .cs { color:var(--tx-lo); }
+  .con-echo .cc { color:var(--accent-fg); font-weight:600; }
+  .con-echo .cn { margin-left:auto; color:var(--tx-lo); font-size:10px; }
+  .con-blk.fold .con-body { display:none; }
+  .con-body { padding:3px 7px 4px; }
+  .con-ln { white-space:pre-wrap; word-break:break-word; }
+  /* line kinds — mapped from aiegdb/aiediag output shapes */
+  .con-hdr   { color:var(--tx-hi); font-weight:600; }
+  .con-key   { color:var(--tx-lo); }
+  .con-val   { color:var(--tx-hi); }
+  .con-hex   { color:#c8a0f0; }
+  .con-ok    { color:var(--green-fg); }
+  .con-bad   { color:var(--red-fg); }
+  .con-warn  { color:var(--amber-fg); }
+  .con-scope { color:var(--accent-fg); }
+  .con-dim   { color:var(--tx-lo); }
+  .con-src   { color:#7fd0c0; }
+  /* the "[registers read] { … }" appendix aiegdb adds after most commands —
+     the single biggest source of crowding, so it folds away by default */
+  .con-reg { margin:3px 0 0; border-left:2px solid var(--bd-soft);
+             padding-left:6px; }
+  .con-reg > summary { cursor:pointer; color:var(--tx-lo); font-size:10.5px;
+                       list-style:none; user-select:none; }
+  .con-reg > summary:hover { color:var(--tx-mid); }
+  .con-reg[open] > summary { color:var(--tx-mid); }
+
+  /* ── aiegdb console: autocomplete popup ──────────────────────── */
+  /* position:fixed, not absolute: #conterm sets overflow:hidden and the prompt
+     line is its FIRST child, so an absolutely-positioned popup gets clipped away
+     entirely. Fixed + viewport coords from getBoundingClientRect escapes every
+     overflow container; conSugPlace() sets left/top/width. */
+  #consug { position:fixed; z-index:60; max-height:190px; overflow:auto;
+            background:var(--bg-raised); border:1px solid var(--bd);
+            border-radius:5px; box-shadow:0 6px 18px #00000070; }
+  #consug.hide { display:none; }
+  .con-sug { display:flex; align-items:baseline; gap:7px; padding:3px 8px;
+             cursor:pointer; font-family:ui-monospace,monospace;
+             font-size:11px; }
+  .con-sug.act { background:var(--accent-dim); }
+  .con-sug:hover { background:var(--bg-hover); }
+  .con-sug .sname { color:var(--tx-hi); font-weight:600; white-space:nowrap; }
+  .con-sug .sargs { color:var(--amber-fg); white-space:nowrap; }
+  .con-sug .ssum  { color:var(--tx-lo); margin-left:auto; font-size:10px;
+                    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .con-sug .swrite { color:var(--red-fg); font-size:9.5px; border:1px solid #5a2a2a;
+                     border-radius:3px; padding:0 3px; white-space:nowrap; }
+  /* dimmed + struck-through: these cannot run here at all (live TUI grids) */
+  .con-sug.blocked .sname { color:var(--tx-lo); text-decoration:line-through; }
+  .con-sug .sblock { color:var(--tx-lo); font-size:9.5px; border:1px solid var(--bd-soft);
+                     border-radius:3px; padding:0 3px; white-space:nowrap; }
+  .con-sug .sslow  { color:var(--amber-fg); font-size:9.5px; border:1px solid #5a4a1a;
+                     border-radius:3px; padding:0 3px; white-space:nowrap; }
+  .con-sug .sscope { color:var(--tx-lo); font-size:9.5px; opacity:.75; }
+  /* an argument description, not a completion — nothing to click */
+  .con-sug.hintrow { cursor:default; background:none; }
+  .con-sug.hintrow:hover { background:none; }
+  .con-sug.hintrow .sname { color:var(--amber-fg); font-weight:400; }
+  .con-sug.hintrow .ssum { color:var(--tx-mid); margin-left:0; }
+
+  /* ── aiegdb console: ⌘ Commands palette ──────────────────────── */
+  /* fixed for the same reason as #consug — conPalOpen() computes viewport coords */
+  #conpal { position:fixed; z-index:60; width:340px; max-height:280px;
+            display:flex; flex-direction:column;
+            background:var(--bg-raised); border:1px solid var(--bd);
+            border-radius:6px; box-shadow:0 8px 24px #00000080; }
+  #conpal.hide { display:none; }
+  #conpalq { flex:0 0 auto; margin:6px; padding:4px 7px;
+             background:var(--bg-input); border:1px solid var(--bd-soft);
+             border-radius:4px; color:var(--tx-hi);
+             font-family:ui-monospace,monospace; font-size:11.5px; outline:none; }
+  #conpalq:focus { border-color:var(--accent); }
+  #conpallist { flex:1 1 auto; overflow:auto; padding:0 4px 5px; }
+  .con-palgrp { color:var(--tx-lo); font-size:9.5px; text-transform:uppercase;
+                letter-spacing:.05em; padding:5px 6px 2px; }
+
+  /* ── live debug ──────────────────────────────────────────────── */
+  #leftbottom label, #overlayctl label { cursor:pointer; }
+  #overlayctl { font-size:12px; }
+  #testconn:disabled { opacity:.38; cursor:not-allowed; }
+  #leftbottom label.disabled, #overlayctl label.disabled { opacity:.45; pointer-events:none; }
+  #livestatus { color:var(--accent-fg); font-size:11px; margin-top:6px; min-height:14px; }
+  #runstatus  { color:var(--tx-mid);   font-size:11px; min-height:14px; }
+  /* ── DMA issue bar ───────────────────────────────────────────── */
+  #issue-bar { display:none; margin-top:6px; border:1px solid #6b2222;
+               border-radius:4px; background:#2a1212; padding:5px 8px;
+               font-size:11px; max-height:120px; overflow-y:auto; }
+  #issue-bar .ib-hdr { color:#e06060; font-weight:700; margin-bottom:4px;
+                       display:flex; align-items:center; gap:6px; }
+  #issue-bar .ib-hdr .ib-clear { margin-left:auto; cursor:pointer;
+                                  color:var(--tx-lo); font-size:10px;
+                                  background:none; border:none; padding:0; }
+  #issue-bar .ib-hdr .ib-clear:hover { color:var(--tx-hi); }
+  #issue-bar .ib-row { display:flex; align-items:center; gap:6px;
+                       padding:2px 0; border-top:1px solid #3a1a1a;
+                       cursor:pointer; }
+  #issue-bar .ib-row:first-of-type { border-top:none; }
+  #issue-bar .ib-row:hover { background:#3a1818; border-radius:3px; }
+  #issue-bar .ib-icon { font-size:12px; flex:0 0 14px; text-align:center; }
+  #issue-bar .ib-loc  { color:var(--tx-hi); font-weight:700; min-width:46px; }
+  #issue-bar .ib-ch   { color:#d4a0a0; min-width:52px; }
+  #issue-bar .ib-msg  { color:var(--tx-mid); flex:1; }
+  #issue-bar .ib-flow { color:var(--tx-lo); font-size:10px; margin-left:auto; }
+  .consolebox { background:var(--bg-code); border:1px solid var(--bd-subtle);
+                border-radius:5px; padding:9px; font-size:11px; line-height:1.4;
+                max-height:220px; overflow:auto; white-space:pre-wrap;
+                word-break:break-word; max-width:100%; min-width:0; margin-top:9px;
+                font-family:ui-monospace,monospace; }
+  #console { flex:1 1 0; max-height:none; min-height:0; overflow:auto; }
+
+  /* ── device map ──────────────────────────────────────────────── */
   #devmap { display:none; flex-direction:column; }
   #devmap.show { display:flex; }
-  #devmap-netlabel { font-size:10px; color:#888; margin-bottom:4px; user-select:none; }
-  #devmap-netbar { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:6px; align-items:center; }
+  /* nowrap + min-width:0 on the netbar: the net pills wrap *inside* their own
+     box, so the scan controls stay pinned to the right of the same row instead
+     of being pushed onto a second line by a long net list. */
+  #devmap-topbar { display:flex; flex-wrap:nowrap; align-items:flex-start; gap:8px;
+                   margin-bottom:8px; }
+  #devmap-netbar { display:flex; flex-wrap:wrap; gap:4px; align-items:center;
+                   flex:1 1 auto; min-width:0; }
+  #devmap-scan { display:flex; align-items:center; gap:4px;
+                 flex:0 0 auto; margin-left:auto; }
+  #devmap-scan .ltab { margin:0; }
+  /* Scan is an ACTION, not a selection. It deliberately avoids both tab states:
+     --accent-dim fill would read as a selected tab, and the default button
+     surface (--bg-raised on --bd) is nearly identical to an *un*selected .ltab.
+     A solid accent fill is used nowhere else, so it can only read as a verb. */
+  #dmScanBtn, #gridScanBtn {
+               font-size:11px; padding:3px 13px; border-radius:4px; cursor:pointer;
+               border:1px solid var(--accent); background:var(--accent);
+               color:var(--bg-code); font-weight:600; letter-spacing:.02em;
+               transition:filter .12s; }
+  #gridScanBtn { margin-left:6px; vertical-align:middle; }
+  #dmScanBtn:hover:not(:disabled), #gridScanBtn:hover:not(:disabled) { filter:brightness(1.12); }
+  #dmScanBtn:active:not(:disabled), #gridScanBtn:active:not(:disabled) { filter:brightness(.92); }
+  #dmScanBtn:disabled, #gridScanBtn:disabled { opacity:.38; cursor:not-allowed; filter:none; }
+  /* Secondary to Scan: same size, neutral surface, so the filled accent stays
+     the one thing in the row that reads as the primary action. */
+  #dmClearBtn { font-size:11px; padding:3px 11px; border-radius:4px; }
+  #dmLiveWrap { font-size:10px; color:var(--tx-lo); cursor:pointer; display:flex;
+                align-items:center; gap:3px; }
+  #dmLiveWrap input { margin:0; }
+  #dmScanStatus { font-size:10px; color:var(--accent-fg); min-width:0; white-space:nowrap;
+                  overflow:hidden; text-overflow:ellipsis; max-width:260px; }
+  #dmScanStatus.err { color:var(--red-fg); }
+  .dm-vsep { width:1px; height:16px; background:var(--bd-soft); flex-shrink:0; }
+  /* Status ring on a net chip — sits left of the identity dot so the net's own
+     color stays readable next to it. */
+  .dm-chip .chstat { width:7px; height:7px; border-radius:50%; flex-shrink:0;
+                     border:1.5px solid transparent; }
   .dm-chip { display:inline-flex; align-items:center; gap:4px; padding:2px 8px 2px 6px;
-             border-radius:9999px; font-size:10px; font-weight:500;
-             cursor:pointer; border:1px solid var(--stroke,#e4e4e433); user-select:none;
+             border-radius:9999px; font-size:10px; font-weight:500; cursor:pointer;
+             border:1px solid var(--stroke,rgba(228,228,228,.2)); user-select:none;
              transition:opacity .15s, background .15s; white-space:nowrap;
              background:transparent; color:var(--fg,#e4e4e4); }
   .dm-chip .chdot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
-  .dm-chip.all-chip { border-color:#e4e4e433; }
-  .dm-chip.all-chip.act { background:#e4e4e41e; border-color:#e4e4e488; }
-  .dm-chip.net-chip.act { background:#e4e4e411; border-color:#e4e4e433; opacity:1; }
-  .dm-chip.net-chip:not(.act) { opacity:0.25; }
+  .dm-chip.all-chip { border-color:rgba(228,228,228,.2); }
+  .dm-chip.all-chip.act { background:rgba(228,228,228,.12); border-color:rgba(228,228,228,.5); }
+  .dm-chip.net-chip.act { background:rgba(228,228,228,.07); border-color:rgba(228,228,228,.2); opacity:1; }
+  .dm-chip.net-chip:not(.act) { opacity:0.22; }
   #devmap-vp { overflow:hidden; position:relative; height:calc(100vh - 280px); min-height:420px;
-               border:1px solid #e4e4e420; border-radius:6px; background:#181818;
-               cursor:grab; }
+               border:1px solid rgba(228,228,228,.1); border-radius:5px;
+               background:#0f1018; cursor:grab; }
   #devmap-vp.panning { cursor:grabbing; }
   #devmap-canvas { position:absolute; top:0; left:0; transform-origin:0 0; }
-  #devmap-hint { position:absolute; bottom:6px; right:8px; font-size:9px;
-                 color:#e4e4e45e; pointer-events:none; letter-spacing:.2px; }
-  #devmap-spacehint { position:absolute; top:6px; left:8px; font-size:9px;
-                      color:#e4e4e45e; pointer-events:none; }
-  #devmap-reset { position:absolute; top:6px; right:7px; font-size:10px; padding:2px 9px;
-                  border:1px solid #e4e4e433; background:#e4e4e411; color:#e4e4e4bb;
-                  border-radius:4px; cursor:pointer; z-index:10; }
-  #devmap-reset:hover { background:#e4e4e41e; color:#e4e4e4; }
-  #devmap-legend { display:flex; gap:10px; flex-wrap:wrap; margin-top:5px; font-size:10px;
-                   color:#e4e4e45e; align-items:center; }
+  #devmap-hint { position:absolute; bottom:7px; right:9px; font-size:9px;
+                 color:rgba(228,228,228,.35); pointer-events:none; letter-spacing:.2px; }
+  #devmap-spacehint { position:absolute; top:7px; left:9px; font-size:9px;
+                      color:rgba(228,228,228,.35); pointer-events:none; }
+  #devmap-reset { position:absolute; top:7px; right:8px; font-size:10px; padding:2px 9px;
+                  border:1px solid rgba(228,228,228,.2); background:rgba(228,228,228,.07);
+                  color:rgba(228,228,228,.7); border-radius:4px; cursor:pointer; z-index:10; }
+  #devmap-reset:hover { background:rgba(228,228,228,.13); color:rgba(228,228,228,.95); }
+  #devmap-legend { display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; font-size:10px;
+                   color:rgba(228,228,228,.35); align-items:center; }
   .dml-item { display:flex; align-items:center; gap:4px; }
   .dml-swatch { width:16px; height:7px; border-radius:2px; }
   .dml-line { width:18px; height:0; }
   .dml-dot { width:7px; height:7px; border-radius:50%; }
-  .dbgpanel { margin-top:10px; border:1px solid #333; border-radius:6px; padding:10px; }
+  .dbgpanel { margin-top:10px; border:1px solid var(--bd); border-radius:5px; padding:10px;
+              background:var(--bg-surface); }
   .dbgpanel h2 { margin-top:0; }
   .dbgpresets { margin-bottom:6px; }
   .dbgpresets .ltab { margin-top:0; }
-  #dbgcmd { background:#111; color:#ddd; border:1px solid #444; border-radius:4px;
-            padding:4px 6px; font-family:monospace; }
-  #dbgrun { margin-left:6px; padding:3px 10px; cursor:pointer; }
-  /* ── tabbed command console (aiegdb | LLM) ── */
-  #contabs { flex:0 0 auto; margin-bottom:6px; }
-  .contab { display:inline-block; padding:3px 12px; border:1px solid #444;
-            border-bottom:none; cursor:pointer; background:#252525;
-            border-radius:6px 6px 0 0; font-size:12px; margin-right:4px; }
-  .contab.act { background:#111; color:#fff; }
-  #conpane { flex:1 1 0; display:flex; flex-direction:column; min-height:0; }
-  #llmpane { flex:1 1 0; display:flex; flex-direction:column; min-height:0;
-             position:relative; }
-  /* ID rules above (specificity 1,0,0) beat the base .hide (0,1,0); this
-     ID-qualified rule (1,1,0) lets the tab switch actually hide a pane. */
-  #conpane.hide, #llmpane.hide { display:none; }
-  /* LLM (embedded Claude Code) pane */
-  #llmterm { flex:1 1 0; display:flex; flex-direction:column; min-height:0;
-             margin-top:6px; padding:6px; background:#111; border:1px solid #444;
-             border-radius:4px; overflow:hidden; cursor:text; }
-  /* Scrolling message list */
-  #llmmsg { flex:1 1 0; min-height:0; overflow-y:auto; padding:2px 0; }
-  /* Per-message bubbles */
-  .llm-msg { margin:3px 0; padding:5px 8px; border-radius:3px;
-             font-family:monospace; font-size:12px; line-height:1.45;
-             white-space:pre-wrap; word-break:break-word; }
-  .llm-msg-you { background:#152015; border-left:2px solid #6ab; color:#cee; }
-  .llm-msg-ai  { background:transparent; color:#ccc; border-left:2px solid #333; }
-  .llm-msg-ctx { background:transparent; color:#555; font-style:italic;
-                 border-left:2px solid #2a2a2a; font-size:11px; }
-  /* Marker colors inside AI bubbles */
-  .llm-msg-ai .llm-you       { color:#8ec; font-weight:bold; }
-  .llm-msg-ai .llm-tool      { color:#7aa2f7; }
-  .llm-msg-ai .llm-toolname  { color:#e0af68; font-weight:bold; }
-  .llm-msg-ai .llm-toolresult{ color:#555; }
-  .llm-msg-ai .llm-error     { color:#f7768e; font-weight:bold; }
-  .llm-msg-ai .llm-file      { color:#9ece6a; }
-  .llm-msg-ai .llm-line      { color:#e0af68; }
-  /* Markdown inside AI bubbles */
-  .llm-msg-ai .md-h      { color:#7dcfff; font-weight:bold; display:block; margin-top:4px; }
-  .llm-msg-ai .md-bullet { color:#7aa2f7; }
-  .llm-msg-ai strong     { color:#c0caf5; font-weight:bold; }
-  .llm-msg-ai .md-code   { background:#1b1b2b; color:#e0af68; padding:0 3px; border-radius:3px; }
-  .llm-msg-ai .md-block  { background:#0d0d16; border:1px solid #2a2a3a; border-radius:3px;
-                            padding:5px 8px; margin:3px 0; overflow-x:auto; white-space:pre; }
-  .llm-msg-ai .md-block code { background:none; padding:0; color:#c0caf5; }
-  .llm-msg-ai .cm-keyword { color:#bb9af7; }
-  .llm-msg-ai .cm-string  { color:#9ece6a; }
-  .llm-msg-ai .cm-comment { color:#565f89; font-style:italic; }
-  .llm-msg-ai .cm-number  { color:#ff9e64; }
-  /* Thinking indicator */
-  #llmthink { padding:4px 8px 2px; }
-  .llm-dot  { display:inline-block; width:4px; height:4px; border-radius:50%;
-              background:#555; margin-right:3px;
-              animation:llmblink 1.1s ease-in-out infinite; }
-  .llm-dot:nth-child(2){ animation-delay:.18s; }
-  .llm-dot:nth-child(3){ animation-delay:.36s; }
-  @keyframes llmblink{ 0%,80%,100%{opacity:.15} 40%{opacity:.8} }
-  /* Input row */
-  #llminline { flex:0 0 auto; display:flex; align-items:flex-start; margin-top:5px;
-               border-top:1px solid #2a2a2a; padding-top:5px; }
-  #llmprompt { color:#6ab; margin-right:6px; white-space:nowrap;
-               font-family:monospace; padding-top:2px; }
-  #llmin { flex:1 1 auto; background:transparent; border:none; outline:none;
-           color:#ddd; font-family:monospace; padding:0; resize:none;
-           overflow-y:auto; max-height:120px; line-height:1.4;
-           font-size:inherit; }
-  #llmsend, #llmreset { margin-left:6px; padding:3px 10px; cursor:pointer; }
-  /* LLM password modal overlay (matches the #llmout dark palette). */
-  #llmauth { position:absolute; inset:0; display:flex; align-items:center;
-             justify-content:center; background:rgba(0,0,0,0.7); z-index:50; }
-  /* ID rule (1,0,0) beats base .hide (0,1,0); this ID-qualified rule (1,1,0)
-     lets the JS actually hide the modal (same trap as #llmpane.hide above). */
-  #llmauth.hide { display:none; }
-  #llmauthbox { background:#111; border:1px solid #444; border-radius:6px;
-                padding:16px 18px; width:280px; font-family:monospace;
-                color:#ddd; box-shadow:0 4px 20px rgba(0,0,0,0.6); }
-  #llmauthbox .t { color:#8ec; font-weight:bold; margin-bottom:8px; }
-  #llmauthin { width:100%; box-sizing:border-box; background:#0d0d16;
-               border:1px solid #2a2a3a; border-radius:4px; color:#ddd;
-               font-family:monospace; padding:5px 6px; outline:none; }
-  #llmauthok { margin-top:10px; padding:4px 12px; cursor:pointer; }
-  #llmautherr { color:#f7768e; font-size:11px; margin-top:6px; min-height:14px; }
-  /* ── Search pane ── */
+
+  /* ── op-kind label badges ────────────────────────────────────── */
+  .kb { display:inline-block; border-radius:3px; padding:0 5px; margin-right:4px;
+        font-size:10px; font-weight:600; vertical-align:1px;
+        border:1px solid transparent; font-family:ui-monospace,monospace; }
+  .kb.bd_config  { background:#162a08; color:#c8ff80; border-color:#3a6010; }
+  .kb.createio   { background:#0c2048; color:#80d0ff; border-color:#1e50a0; }
+  .kb.startio    { background:#301800; color:#ffc860; border-color:#704000; }
+  .kb.lock       { background:#280a30; color:#e890ff; border-color:#602878; }
+  .kb.wait       { background:#300808; color:#ff9090; border-color:#702020; }
+  .kb.enable_ooo { background:#082828; color:#60f0f0; border-color:#106060; }
+  .kb.loop, .kb.loopend { background:#101038; color:#c0c0ff; border-color:#303088; }
+  .kb.loopidx    { background:#0c0c28; color:#9898e0; border-color:#282860; }
+  .rnote { color:#9090c0; font-style:italic; margin-left:8px; font-size:11px; }
+
+  /* ── code viewer tokens ──────────────────────────────────────── */
+  .kw { color:#7faadf; } .fn { color:#dcdcaa; } .num { color:#a8cfa0; }
+  .cm { color:#5c7a50; }
+  .pann { color:#7aaf7a; font-style:italic; margin-left:1ch; }
+  .gap { color:#c89050; font-style:italic; opacity:0.75; }
+  .bdpretty { font-family:ui-monospace,monospace; font-size:11.5px; line-height:1.45;
+              color:#80e060; background:#081808; border-left:3px solid #206010;
+              border-radius:4px; margin:2px 0 9px 22px;
+              padding:6px 10px; white-space:pre; overflow-x:auto; }
+  .rline { font-family:ui-monospace,monospace; font-size:11.5px; line-height:1.55;
+           white-space:pre-wrap; }
+  .lno, .mlno { color:var(--tx-lo); user-select:none; }
+  .lno  { margin-right:6px; }
+  .mlno { display:inline-block; min-width:3.2em; text-align:right; margin-right:10px; }
+  .midctrls { margin:6px 0; }
+  .midctrls button { margin-right:8px; }
+  .irfull { max-height:420px; overflow:auto; }
+  .irln { display:block; }
+  .irlno { color:#40445a; user-select:none; display:inline-block;
+           min-width:3.6em; text-align:right; margin-right:10px; }
+  .irhi { background:#26240e; }
+  .irhi .irlno { color:var(--amber-fg); }
+  .irhidden { display:block; }
+  .irhidden.hide { display:none; }
+  .irfold { display:block; color:#6890d8; cursor:pointer; user-select:none;
+            background:#141a2c; padding:0 6px; }
+  .irfold:hover { background:#1c2438; }
+  .irfold.irfold-open { color:#80c880; }
+  .khl { background:#26240e; border-left:3px solid var(--amber-fg); }
+  .kshowall { margin:4px 0 9px; padding:3px 11px; font-size:12px; cursor:pointer; }
+  .kfileref { color:var(--accent-fg); font-size:11px; }
+  .ksec { margin:0 0 6px; }
+  .ksechdr { color:var(--accent-fg); font-size:10.5px; text-transform:uppercase;
+             letter-spacing:.06em; margin:7px 0 3px; opacity:.75; }
+  .ksecsep { border-top:1px dashed var(--bd); margin:10px 0; }
+
+  /* ── selection-to-LLM popup ─────────────────────────────────── */
+  #sel-popup { position:fixed; z-index:900; display:none;
+               background:var(--accent); color:#000; font-size:11px; font-weight:600;
+               padding:3px 10px; border-radius:10px; cursor:pointer;
+               box-shadow:0 2px 8px rgba(0,0,0,.5); white-space:nowrap;
+               transform:translateX(-50%); pointer-events:auto; }
+  #sel-popup:hover { background:var(--accent-fg); }
+  /* ── LLM context pills ───────────────────────────────────────── */
+
+  /* ── search pane ─────────────────────────────────────────────── */
   #searchpane { flex:1 1 0; display:flex; flex-direction:column; min-height:0; }
   #searchpane.hide { display:none; }
   #sr-inputrow { flex:0 0 auto; display:flex; align-items:center; gap:6px;
-                 margin-bottom:6px; position:relative; }
-  #sr-input { flex:1 1 auto; background:#111; border:1px solid #444; border-radius:4px;
-              color:#ddd; font-size:12px; font-family:monospace; padding:4px 8px;
-              outline:none; }
-  #sr-input:focus { border-color:#7ac; }
+                 margin-bottom:7px; position:relative; }
+  #sr-input { flex:1 1 auto; background:var(--bg-input); border:1px solid var(--bd);
+              border-radius:4px; color:var(--tx-hi); font-size:12px;
+              font-family:ui-monospace,monospace; padding:4px 9px; outline:none;
+              transition:border-color .15s; }
+  #sr-input:focus { border-color:var(--accent); }
   #sr-suggest { position:absolute; top:100%; left:0; right:0; z-index:200;
-                background:#1a1a1a; border:1px solid #555; border-radius:0 0 6px 6px;
-                max-height:200px; overflow-y:auto; font-size:12px; font-family:monospace;
-                box-shadow:0 4px 12px rgba(0,0,0,0.5); }
+                background:var(--bg-surface); border:1px solid var(--bd);
+                border-radius:0 0 5px 5px; max-height:200px; overflow-y:auto;
+                font-size:12px; font-family:ui-monospace,monospace;
+                box-shadow:0 6px 20px rgba(0,0,0,.5); }
   .sr-sug-item { padding:4px 10px; cursor:pointer; display:flex; gap:8px;
                  align-items:baseline; white-space:nowrap; overflow:hidden; }
-  .sr-sug-item:hover, .sr-sug-item.sel { background:#2a2a2a; }
-  .sr-sug-kind { color:#7ac; font-size:10px; min-width:52px; }
-  .sr-sug-label { color:#ddd; overflow:hidden; text-overflow:ellipsis; }
-  .sr-sug-match { color:#ffd200; }
-  .sr-sug-tile { color:#666; font-size:10px; margin-left:auto; white-space:nowrap; }
-  #sr-chips { flex:0 0 auto; display:flex; flex-wrap:wrap; gap:4px; margin-bottom:6px; }
+  .sr-sug-item:hover, .sr-sug-item.sel { background:var(--bg-raised); }
+  .sr-sug-kind { color:var(--accent-fg); font-size:10px; min-width:52px; }
+  .sr-sug-label { color:var(--tx-hi); overflow:hidden; text-overflow:ellipsis; }
+  .sr-sug-match { color:#f8d040; }
+  .sr-sug-tile { color:var(--tx-lo); font-size:10px; margin-left:auto; white-space:nowrap; }
+  #sr-chips { flex:0 0 auto; display:flex; flex-wrap:wrap; gap:4px; margin-bottom:7px; }
   #sr-results { flex:1 1 0; overflow-y:auto; min-height:0; }
   #sr-results table { border-collapse:collapse; width:100%; font-size:12px; }
-  #sr-results th, #sr-results td { border:1px solid #2a2a2a; padding:3px 7px;
+  #sr-results th, #sr-results td { border:1px solid var(--bd-subtle); padding:3px 7px;
                                     text-align:left; white-space:nowrap; }
-  #sr-results th { background:#1c1c1c; color:#888; font-weight:600; font-size:11px; }
-  #sr-results td:first-child { font-family:monospace; }
-  .sr-group-hdr { padding:5px 7px 2px; color:#7ac; font-size:11px; font-weight:700;
-                  background:#141414; border-bottom:1px solid #222; }
-  .sr-empty { color:#555; font-size:12px; padding:8px; }
-  .sr-stat { color:#666; font-size:11px; padding:2px 7px 6px; }
+  #sr-results th { background:var(--bg-surface); color:var(--tx-lo); font-weight:600;
+                   font-size:11px; }
+  #sr-results td:first-child { font-family:ui-monospace,monospace; }
+  .sr-group-hdr { padding:5px 8px 3px; color:var(--accent-fg); font-size:11px;
+                  font-weight:700; background:var(--bg-base); border-bottom:1px solid var(--bd-subtle); }
+  .sr-empty { color:var(--tx-lo); font-size:12px; padding:10px; }
+  .sr-stat  { color:var(--tx-lo); font-size:11px; padding:2px 8px 6px; }
+
+  /* ── search chip ─────────────────────────────────────────────── */
+  .lk-chip { display:inline-flex; align-items:center; gap:4px;
+             background:#1e1600; border:1px solid #7a5a20; border-radius:10px;
+             color:#d8a840; font-size:11px; padding:1px 8px 1px 6px;
+             font-family:ui-monospace,monospace; }
+  .lk-chip .lk-x { cursor:pointer; color:#a08030; font-size:13px;
+                    line-height:1; margin-left:2px; }
+  .lk-chip .lk-x:hover { color:#e0a840; }
+
+  /* ── table styles ────────────────────────────────────────────── */
+  /* ── right panel sections ────────────────────────────────────── */
+  .sec { margin:14px 0 4px; padding-top:10px; border-top:1px solid var(--bd-subtle); }
+  .sec:first-child { margin-top:4px; padding-top:0; border-top:none; }
+  .sec-hdr { font-size:10px; font-weight:700; text-transform:uppercase;
+             letter-spacing:.07em; color:var(--tx-lo); margin-bottom:6px; }
+  /* ── mismatch status bar ─────────────────────────────────────── */
+  .statusbar { display:flex; align-items:center; gap:8px; padding:7px 10px;
+               border-radius:4px; margin-bottom:10px; font-size:12px; }
+  .statusbar.ok   { background:var(--green-bg); border:1px solid #205a30; color:var(--green-fg); }
+  .statusbar.bad  { background:var(--red-bg);   border:1px solid #582020; color:var(--red-fg); }
+  .statusbar .sb-icon { font-size:14px; flex-shrink:0; }
+  .statusbar .sb-detail { color:var(--tx-mid); font-size:11px; }
+  /* ── collapsible code sections ───────────────────────────────── */
+  details.codesec { margin:10px 0; }
+  details.codesec > summary { cursor:pointer; font-size:11px; font-weight:600;
+                               color:var(--accent-fg); user-select:none;
+                               padding:4px 0; list-style:none; display:flex;
+                               align-items:center; gap:5px; }
+  details.codesec > summary::before { content:'\25B6'; font-size:9px;
+                                       color:var(--tx-lo); transition:transform .15s; }
+  details.codesec[open] > summary::before { transform:rotate(90deg); }
+  details.codesec > summary:hover { color:var(--accent); }
+  .kmap { border-collapse:collapse; margin:7px 0 9px; font-size:12px; }
+  .kmap th, .kmap td { border:1px solid var(--bd); padding:3px 9px; text-align:left; }
+  .kmap th, .rctbl th { background:var(--bg-raised); color:var(--tx-mid); font-weight:600; }
+  .kmap td.arrow { color:var(--accent-fg); text-align:center; }
+  .kmap .win   { color:#dcdcaa; }
+  .kmap .mlock { color:#6aaa80; }
+  .kmap .morder { color:#c8a030; }
+  .kmap .mnone  { color:#a05050; }
+  .rctbl { border-collapse:collapse; margin:7px 0 9px; font-size:12px; width:100%; }
+  .rctbl th, .rctbl td { border:1px solid var(--bd); padding:3px 8px; text-align:left;
+                           white-space:nowrap; }
+  .rctbl td:first-child { color:var(--accent-fg); font-family:ui-monospace,monospace; }
+
+  .dimtxt { color:var(--tx-lo); font-size:12px; }
+
+  /* ── LLM pane ────────────────────────────────────────────────── */
+  #llmterm { flex:1 1 0; display:flex; flex-direction:column; min-height:0;
+             margin-top:7px; padding:7px; background:var(--bg-code);
+             border:1px solid var(--bd-subtle); border-radius:5px;
+             overflow:hidden; cursor:text; }
+  #llmmsg { flex:1 1 0; min-height:0; overflow-y:auto; padding:2px 0; }
+  .llm-msg { margin:3px 0; padding:5px 9px; border-radius:3px;
+             font-family:ui-monospace,monospace; font-size:12px; line-height:1.45;
+             white-space:pre-wrap; word-break:break-word; }
+  .llm-msg-you { background:#0d1c10; border-left:2px solid var(--accent-fg); color:#b8ddf0; }
+  .llm-msg-ai  { background:transparent; color:#c0c4d8; border-left:2px solid var(--bd); }
+  .llm-msg-ctx { background:transparent; color:var(--tx-lo); font-style:italic;
+                 border-left:2px solid var(--bd-subtle); font-size:11px; }
+  .llm-msg-ai .llm-you       { color:var(--accent-fg); font-weight:bold; }
+  .llm-msg-ai .llm-error     { color:#f07880; font-weight:bold; }
+  /* One row per tool call, result folded onto the same row. white-space:normal
+     escapes the bubble's pre-wrap so the row cannot wrap or inherit the blank
+     lines the markers arrive surrounded by. */
+  .llm-tools { margin:3px 0; white-space:normal; }
+  .llm-tc { display:flex; align-items:baseline; gap:6px; padding:0 6px;
+            font-size:10.5px; line-height:1.65; border-radius:0 3px 3px 0;
+            background:var(--bg-surface); border-left:2px solid var(--bd); }
+  .llm-tc + .llm-tc { margin-top:1px; }
+  /* Sans for the prettified name, monospace for the argument values. */
+  .llm-tc .tn { flex:0 0 auto; color:#e0af68; font-weight:600;
+                font-family:ui-sans-serif, system-ui, sans-serif; }
+  .llm-tc .ta { flex:1 1 auto; min-width:0; overflow:hidden; white-space:nowrap;
+                text-overflow:ellipsis; color:var(--tx-lo); }
+  /* Background-only boxes: a border would grow the row height. */
+  .llm-tc .tg { display:inline-block; margin-right:4px; padding:0 5px;
+                border-radius:3px; background:var(--bg-raised); color:var(--tx-mid); }
+  .llm-tc .tg i { font-style:normal; margin-right:5px; color:var(--tx-lo);
+                  opacity:.75; font-family:ui-sans-serif, system-ui, sans-serif; }
+  .llm-tc .targ { color:var(--tx-lo); }
+  .llm-tc .tr { flex:0 0 auto; color:var(--tx-lo); opacity:.85; }
+  .llm-tc.done { border-left-color:var(--accent); }
+  .llm-tc.err  { border-left-color:#f07880; }
+  .llm-tc.err .tr { color:#f07880; opacity:1; }
+  .llm-msg-ai .llm-file      { color:#9ece6a; }
+  .llm-msg-ai .llm-line      { color:#e0af68; }
+  .llm-msg-ai .md-h      { color:#7dcfff; font-weight:bold; display:block; margin-top:4px; }
+  .llm-msg-ai .md-bullet { color:#7aa2f7; }
+  .llm-msg-ai strong     { color:#c0caf5; font-weight:bold; }
+  .llm-msg-ai .md-code   { background:#181828; color:#e0af68; padding:0 3px; border-radius:3px; }
+  .llm-msg-ai .md-block  { background:#0c0c18; border:1px solid var(--bd-subtle);
+                            border-radius:4px; padding:5px 9px; margin:3px 0;
+                            overflow-x:auto; white-space:pre; }
+  .llm-msg-ai .md-block code { background:none; padding:0; color:#c0caf5; }
+  .llm-msg-ai .md-table  { border-collapse:collapse; margin:4px 0; font-size:.85em; }
+  .llm-msg-ai .md-table th,
+  .llm-msg-ai .md-table td { border:1px solid var(--bd-subtle); padding:3px 8px; text-align:left; }
+  .llm-msg-ai .md-table th { background:var(--bg-surface); color:#7dcfff; font-weight:bold; }
+  .llm-msg-ai em           { color:#c0caf5; font-style:italic; }
+  .llm-msg-ai .md-ol       { margin:2px 0 2px 18px; }
+  .llm-msg-ai .md-a        { color:#7aa2f7; text-decoration:underline; cursor:pointer; }
+  .llm-msg-ai .cm-keyword { color:#bb9af7; }
+  .llm-msg-ai .cm-string  { color:#9ece6a; }
+  .llm-msg-ai .cm-comment { color:#485070; font-style:italic; }
+  .llm-msg-ai .cm-number  { color:#ff9e64; }
+  #llmthink { padding:4px 8px 2px; }
+  .llm-dot  { display:inline-block; width:4px; height:4px; border-radius:50%;
+              background:var(--accent); margin-right:3px;
+              animation:llmblink 1.1s ease-in-out infinite; }
+  .llm-dot:nth-child(2){ animation-delay:.18s; }
+  .llm-dot:nth-child(3){ animation-delay:.36s; }
+  @keyframes llmblink{ 0%,80%,100%{opacity:.15} 40%{opacity:.85} }
+  #llminline { flex:0 0 auto; display:flex; align-items:flex-start; margin-top:6px;
+               border-top:1px solid var(--bd-subtle); padding-top:6px; }
+  #llmprompt { color:var(--accent-fg); margin-right:6px; white-space:nowrap;
+               font-family:ui-monospace,monospace; padding-top:2px; font-size:11.5px; }
+  /* contenteditable, not a textarea: context pills are real elements sitting
+     inline in the message, which a textarea cannot hold. */
+  #llmin { flex:1 1 auto; background:transparent; border:none; outline:none;
+           color:var(--tx-hi); font-family:ui-monospace,monospace; padding:0;
+           overflow-y:auto; max-height:120px; line-height:1.5; font-size:inherit;
+           white-space:pre-wrap; word-break:break-word; min-height:1.5em; }
+  #llmin:empty::before { content:attr(data-ph); color:var(--tx-lo); }
+  .msg-pill { display:inline-flex; align-items:baseline; gap:4px; margin:0 2px;
+              padding:0 6px; border-radius:9999px; font-size:10.5px;
+              font-family:ui-sans-serif,system-ui,sans-serif;
+              background:var(--accent-dim); color:var(--accent-fg);
+              border:1px solid var(--bd-accent);
+              vertical-align:baseline; white-space:nowrap; }
+  /* Only the × is unselectable — the chip itself must highlight and copy like
+     the text around it. */
+  .msg-pill .mp-x { cursor:pointer; opacity:.6; font-size:11px; user-select:none; }
+  .msg-pill .mp-x:hover { opacity:1; color:var(--tx-hi); }
+  #llmsend, #llmreset { margin-left:6px; }
+  #llmauth { position:absolute; inset:0; display:flex; align-items:center;
+             justify-content:center; background:rgba(0,0,0,.72); z-index:50; }
+  #llmauth.hide { display:none; }
+  #llmauthbox { background:var(--bg-surface); border:1px solid var(--bd);
+                border-radius:6px; padding:18px 20px; width:290px;
+                font-family:ui-monospace,monospace; color:var(--tx-hi);
+                box-shadow:0 8px 32px rgba(0,0,0,.7); }
+  #llmauthbox .t { color:var(--accent-fg); font-weight:600; margin-bottom:10px; font-size:13px; }
+  #llmauthin { width:100%; box-sizing:border-box; background:var(--bg-input);
+               border:1px solid var(--bd); border-radius:4px; color:var(--tx-hi);
+               font-family:ui-monospace,monospace; padding:5px 7px; outline:none; }
+  #llmauthin:focus { border-color:var(--accent); }
+  #llmauthok { margin-top:11px; }
+  #llmautherr { color:var(--red-fg); font-size:11px; margin-top:7px; min-height:14px; }
+
+  /* ── run controls toolbar ────────────────────────────────────── */
+  #ctrlbar { flex:0 0 auto; padding:10px 14px; background:var(--bg-surface); }
+  .ctrlrow { display:flex; align-items:center; flex-wrap:wrap; gap:6px;
+             margin-bottom:5px; }
+  .ctrlrow:last-child { margin-bottom:0; }
+  #connhint { margin-top:6px; padding:6px 8px; font-size:11px; color:#f6c177;
+              background:#2a1f14; border:1px solid #5a3d1a; border-radius:4px; }
+
+  /* ── overlay toolbar above grid ─────────────────────────────── */
+  #overlaybar { flex:0 0 auto; display:flex; align-items:center; gap:8px;
+                padding:4px 0 6px; font-size:12px; }
+
+  /* ── collapsible legend ──────────────────────────────────────── */
+  #legend-detail { margin-bottom:8px; }
+  #legend-detail summary { cursor:pointer; font-size:11px; color:var(--tx-lo);
+                            user-select:none; padding:2px 0; }
+  #legend-detail summary:hover { color:var(--tx-mid); }
+  #legend-detail .legend { margin-top:8px; }
+  #legend-detail .legend-actions { margin-top:8px; }
+
+  /* ── aiegdb quick-command chips ─────────────────────────────── */
+  .qcmd { padding:1px 7px; font-size:11px; margin:2px 2px 2px 0;
+          font-family:ui-monospace,monospace; background:var(--bg-raised);
+          border:1px solid var(--bd); border-radius:3px; color:var(--tx-mid);
+          cursor:pointer; transition:background .1s, color .1s; }
+  .qcmd:hover { background:var(--bg-hover); color:var(--tx-hi); }
 </style>
 </head>
 <body>
 <div id="left">
+  <!-- ── grid area ─────────────────────────────────────────────── -->
   <div id="lefttop">
-  <h1>AIE Schedule View</h1>
-  <div class="sub" id="meta"></div>
-  <div id="viewswitcher">
-    <span class="vsw act" onclick="switchView('grid',this)">Grid</span>
-    <span class="vsw" onclick="switchView('map',this)">Device Map</span>
+  <div id="lefttop-header">
+    <h1>AIE Debug</h1>
+    <div id="viewswitcher">
+      <span class="vsw" data-v="grid" onclick="switchView('grid')">Grid</span>
+      <span class="vsw act" data-v="map" onclick="switchView('map')">Device Map</span>
+    </div>
+  </div>
+  <div class="sub" id="meta" style="display:none"></div>
+  <!-- live status overlay: pinned above the tile grid -->
+  <div id="overlayctl" style="margin-bottom:6px;">
+    <label><input type="checkbox" id="liveToggle"> Live status overlay</label>
+    <div id="overlaytabs" style="display:inline-flex;gap:4px;margin-left:8px;">
+      <span class="ltab act" data-w="dma">DMA</span>
+      <span class="ltab" data-w="cores">Cores</span>
+      <span class="ltab" data-w="events">Events</span>
+    </div>
+    <button id="gridScanBtn" title="read live status from the board / simulator">Scan</button>
+    <div id="livestatus"></div>
+    <div id="runstatus"></div>
+    <div id="issue-bar"></div>
   </div>
   <div id="grid"></div>
   <div id="devmap">
-    <div id="devmap-netlabel">Click a stream to isolate its route in the map below.</div>
-    <div id="devmap-netbar"></div>
+    <!-- Scan controls live in their own static container: buildNetBar() wipes
+         #devmap-netbar on every rebuild, so anything placed inside it would be
+         destroyed the first time a net chip is clicked. -->
+    <div id="devmap-topbar">
+      <div id="devmap-netbar"></div>
+      <span class="dm-vsep"></span>
+      <div id="devmap-scan">
+        <span id="dmScanStatus"></span>
+        <label id="dmLiveWrap" title="re-scan every 2s"><input type="checkbox" id="dmLiveToggle"> live</label>
+        <span id="dmScanWhat">
+          <span class="ltab act" data-w="dma">DMA</span>
+          <span class="ltab" data-w="cores">Cores</span>
+          <span class="ltab" data-w="events">Events</span>
+        </span>
+        <button id="dmScanBtn" title="read live status from the board / simulator">Scan</button>
+        <button id="dmClearBtn" title="clear scan status and search highlights">Clear</button>
+      </div>
+    </div>
     <div id="devmap-vp">
-      <button id="devmap-reset" onclick="dmReset()">Reset view</button>
-      <div id="devmap-spacehint">double-drag · space+drag · right-drag to pan · scroll to zoom · click tile to inspect</div>
+      <button id="devmap-reset" onclick="dmReset(true)">Reset view</button>
+      <div id="devmap-spacehint">scroll to zoom · click tile to inspect · click stream to isolate</div>
       <div id="devmap-canvas"><svg id="devmap-svg"></svg></div>
       <div id="devmap-hint">col 0–3 · row 0 (shim) at bottom</div>
     </div>
@@ -2359,102 +2849,118 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="dml-item"><div class="dml-line" style="border-top:2px dashed #599ce7"></div>dashed = direct shared-memory (DMA&harr;kernel)</div>
       <div class="dml-item"><div class="dml-dot" style="background:#599ce7;border:1.2px solid #181818"></div>● solid = injects into stream (source / contributor)</div>
       <div class="dml-item"><div class="dml-dot" style="background:#181818;border:2.2px solid #599ce7"></div>○ hollow = takes from stream (destination / tap)</div>
+      <!-- Live-status swatches: hidden until a scan returns, so the legend does
+           not advertise colors that are not on screen yet. Colors are injected
+           from LSTATE at load so this list cannot drift from the renderer. -->
+      <span id="devmap-stlegend" class="hide"></span>
     </div>
   </div>
-  <!-- live status overlay controls belong to the array/partition view: they
-       drive the per-tile overlay rendered onto #grid above. -->
-  <div id="overlayctl">
-    <label><input type="checkbox" id="liveToggle"> Live status overlay</label>
-    <div id="overlaytabs">
-      <span class="ltab act" data-w="dma">DMA</span>
-      <span class="ltab" data-w="cores">Cores</span>
-      <span class="ltab" data-w="events">Events</span>
+  <!-- collapsible legend — collapsed by default -->
+  <details id="legend-detail">
+    <summary>Legend &amp; interaction guide</summary>
+    <div class="legend">
+      <div><span class="sw" style="background:var(--shim)"></span>shim (row 0, host&lt;-&gt;array)</div>
+      <div><span class="sw" style="background:var(--core)"></span>core (compute)</div>
+      <div>badge = channel dir (S2MM recv / MM2S send)</div>
+      <div>click a badge to highlight its flow peers:</div>
+      <div><span class="sw" style="background:#30c0d0"></span>receivers (S2MM) of the clicked flow</div>
+      <div><span class="sw" style="background:#c050b0"></span>senders (MM2S) of the clicked flow (dashed)</div>
+      <div>peer channel badges of the clicked flow:</div>
+      <div><span class="sw" style="border:2px dotted #e8943a;background:transparent"></span>source/destination channel (opposite dir, dotted)</div>
+      <div><span class="sw" style="border:2px dashed #6cd080;background:transparent"></span>cooperating channel (same dir group, dashed)</div>
     </div>
-    <div id="livestatus"></div>
+    <div class="legend-actions">
+      <button id="gbtn">Show global / kernel-group code</button>
+    </div>
+  </details>
   </div>
-  <div id="gridlegend" class="legend">
-    <div><span class="sw" style="background:var(--shim)"></span>shim (row 0, host&lt;-&gt;array)</div>
-    <div><span class="sw" style="background:var(--core)"></span>core (compute)</div>
-    <div>badge = channel dir (S2MM recv / MM2S send)</div>
-    <div>click a badge to highlight its flow peers:</div>
-    <div><span class="sw" style="background:#35d0e0"></span>receivers (S2MM) of the clicked flow</div>
-    <div><span class="sw" style="background:#e05fd0"></span>senders (MM2S) of the clicked flow (dashed)</div>
-    <div>peer channel badges of the clicked flow:</div>
-    <div><span class="sw" style="border:2px dotted #ffb347;background:transparent"></span>source/destination channel (opposite dir, dotted)</div>
-    <div><span class="sw" style="border:2px dashed #7ee081;background:transparent"></span>cooperating channel (same dir group, dashed)</div>
-    <button id="gbtn" style="margin-top:10px">Show global / kernel-group code</button>
-  </div>
-  </div>
+  <!-- ── run controls ─────────────────────────────────────────── -->
   <div id="lhsplitter" title="Drag to resize (top / bottom)"></div>
   <div id="leftbottom">
-  <div id="live">
-    <div id="approw" style="margin-bottom:6px;">
+  <div id="ctrlbar">
+    <div class="ctrlrow">
+      <span class="pane-title">Run</span>
       <label>App:
         <select id="appSel"><option value="">&mdash; loading &mdash;</option></select>
       </label>
-      <span id="appinfo" style="margin-left:8px;color:#888;font-size:11px;"></span>
-    </div>
-    <div id="devrow" style="margin-bottom:6px;">
-      <label>Board:
+      <span id="appinfo" style="color:var(--tx-lo);font-size:11px;"></span>
+      <label style="margin-left:4px;">Board:
         <select id="deviceSel">
           <option value="">&mdash; select device &mdash;</option>
-<!--__PALMYRA_OPTION__-->          <option value="vek385">vek385</option>
+<!--__DEVICE_OPTIONS__-->
         </select>
       </label>
-      <input type="text" id="boardHost" class="hide"
-             placeholder="vek385 board hostname" style="margin-left:6px;">
-      <button id="testconn" disabled style="margin-left:6px;">Test connect</button>
+      <input type="text" id="boardHost" class="hide" placeholder="vek385 board hostname">
+    </div>
+    <div class="ctrlrow">
+      <button id="testconn" disabled>Connect</button>
+      <button id="attachbtn" disabled
+        title="Attach to a run you started outside this UI (CLI / already-programmed board)">Open Current Session</button>
       <button id="runbtn" disabled>Run test</button>
       <button id="stopbtn" disabled>Force stop</button>
-      <button id="loadlogbtn">Load log</button>
-      <span id="connstatus" style="margin-left:6px; font-size:11px; color:#8ab;"></span>
-      <div id="connhint" class="hide" style="margin-top:6px; padding:6px 8px;
-           font-size:11px; color:#f6c177; background:#2a1f14;
-           border:1px solid #5a3d1a; border-radius:4px;">
-        Connection failed. On the target test board, start the hw_server via xsdb:
-        <code style="color:#e0def4; background:#1a1622; padding:1px 4px;
-              border-radius:3px;">exec hw_server -stcp:0.0.0.0:3121</code>
-      </div>
+      <span id="connstatus" style="font-size:11px; color:var(--accent-fg);"></span>
     </div>
-    <pre id="console" class="consolebox hide"></pre>
+    <div id="connhint" class="hide">
+      Connection failed. On the target test board, start the hw_server via xsdb:
+      <code style="color:#e0def4; background:#1a1622; padding:1px 4px;
+            border-radius:3px;">exec hw_server -stcp:0.0.0.0:3121</code>
+    </div>
   </div>
+  <pre id="console" class="consolebox hide"></pre>
   </div>
 </div>
 <div id="splitter" title="Drag to resize"></div>
 <div id="right">
+  <div id="panel-hdr">
+    <span class="pane-title">Info</span>
+    <div id="panel-itemtabs"></div>
+  </div>
   <div id="panel" class="panel">
-    <div class="placeholder">Click a tile or a net (in device map) to see details.</div>
+    <div id="panel-body"><div class="placeholder">Select a tile or net for details.</div></div>
   </div>
   <div id="rhsplitter" title="Drag to resize (panel / console)"></div>
   <div id="cmdconsole" class="hide">
     <div id="contabs">
+      <span class="pane-title">Tools</span>
       <span class="contab act" data-pane="conpane">aiegdb</span>
       <span class="contab" data-pane="llmpane">LLM</span>
       <span class="contab" data-pane="searchpane">Search</span>
     </div>
     <div id="conpane">
-    <div id="conhdr">aiegdb &mdash; <span id="contarget">partition</span>
-      <button id="conreload" title="kill + restart aiegdb.py (reloads edited code)">Reload aiegdb.py</button></div>
-    <div id="conhelp">aiegdb commands: target tile 0 0 | target channel mm2s0 | dma status |
-      bd | event | pc | dma counter | reg read OFF | up | top | help</div>
+    <div id="conhdr" class="conhdr-row">
+      <span class="chname">aiegdb</span>
+      <span id="contarget" title="current scope">partition</span>
+      <span class="chgap"></span>
+      <button class="qcmd" id="conpalbtn" title="browse every command for this scope">&#8984; Commands</button>
+      <button class="qcmd" onclick="conSend('where')">where</button>
+      <button class="qcmd" onclick="conSend('up')">up</button>
+      <button class="qcmd" onclick="conSend('top')">top</button>
+      <button class="qcmd" id="confoldall" title="collapse every output block">Fold</button>
+      <button class="qcmd" id="conclear" title="clear the console">Clear</button>
+      <button class="qcmd" id="conreload" title="kill + restart aiegdb.py (reloads edited code)">Reload</button>
+    </div>
     <div id="conterm">
       <div id="conpromptline"><span id="conprompt">partition&gt;</span><input id="conin"
-        placeholder="type an aiegdb command, press Enter (e.g. dma status, help)"></div>
-      <div id="conlast"><span id="conlastlbl">last:</span><span id="conlastcmd">&mdash;</span>
-        <span id="conlastres"></span></div>
-      <pre id="conout" class="code">(aiegdb console &mdash; click a tile or type 'help')</pre>
+          placeholder="type a command — suggestions appear as you type (Tab to accept)"
+          autocomplete="off" spellcheck="false">
+        <div id="consug" class="hide"></div></div>
+      <div id="conout"><div class="con-ln con-dim">(aiegdb console &mdash; click a tile, press &#8984; Commands, or type 'help')</div></div>
+    </div>
+    <div id="conpal" class="hide">
+      <input id="conpalq" placeholder="search commands…" autocomplete="off" spellcheck="false">
+      <div id="conpallist"></div>
     </div>
     </div>
     <div id="llmpane" class="hide">
-      <div id="conhdr">LLM &mdash; embedded Claude Code (repo-aware AIE debug agent)
+      <div id="conhdr">Claude Code
         <button id="llmreset" title="kill + respawn claude (new conversation)">New chat</button></div>
-      <div id="conhelp">Ask about this schedule, the applog, or the codebase.
-        Tool calls appear as [tool: ...] markers. Streams live.</div>
+      <div id="conhelp">Ask about anything related to this design, application, or the codebase.</div>
       <div id="llmterm">
         <div id="llmmsg"></div>
         <div id="llmthink" class="hide"><span class="llm-dot"></span><span class="llm-dot"></span><span class="llm-dot"></span></div>
-        <div id="llminline"><span id="llmprompt">you&gt;</span><textarea id="llmin"
-          rows="1" placeholder="ask about this design — Enter to send, Shift+Enter for newline"></textarea>
+        <div id="llminline"><span id="llmprompt">you&gt;</span><div id="llmin"
+          contenteditable="true" spellcheck="false"
+          data-ph="ask about this design. Enter to send, Shift+Enter for newline"></div>
           <button id="llmsend">Send</button></div>
       </div>
       <div id="llmauth" class="hide">
@@ -2480,11 +2986,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 <script>
 const DATA = /*__DATA__*/ null;
+// aiegdb's command grammar, baked in at render time from aiegdb.COMMAND_SPEC.
+// The daemon also serves a live copy at /aiegdb/spec; this copy is what makes
+// the console's autocomplete work in the standalone (daemon-less) HTML.
+const GDBSPEC_STATIC = /*__GDBSPEC__*/ null;
 // What the user currently has open, mirrored to the daemon so the embedded
 // agent can answer questions about the view in front of the human. Declared
 // here so it precedes every reportUIState() call site.
-const UISTATE = {selected_tile:null, tile_tab:null, net_tab:null,
-                 console_pane:'conpane', flow:null, channel:null, search:null};
+const UISTATE = {view:'map', selected_tile:null, tile_tab:null, net_tab:null,
+                 console_pane:'conpane', flow:null, channel:null, search:null,
+                 source:null};
 
 function esc(s){ return (s==null?'':(''+s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 const KIND_LABEL = {bd_config:'BD', createio:'IO', startio:'START', wait:'WAIT',
@@ -2543,8 +3054,7 @@ function renderKernelMatch(t){
   const hint = src
     ? '<div class="lref">see the <b>'+esc(src.file)+'</b> sub-tab in Low level for the kernel body; click a channel to isolate its argument\u2019s code.</div>'
     : '';
-  return '<div class="kv"><b>channel \u2194 kernel argument (by BD buffer address):</b></div>'+
-         table+fn+hint;
+  return table+fn+hint;
 }
 // Kernel function source (Low level tab, core tiles). For a focused channel it
 // isolates the "code piece" = the lines that directly use the mapped parameter
@@ -2565,7 +3075,8 @@ function renderKernelSource(t, ch, focused){
       argn = m.arg;
     }
   }
-  const hdr = '<div class="lref">kernel: <b>'+esc(src.file)+'</b> &mdash; '+
+  const hdr = '<div class="lref">kernel: <b class="srcref" data-p="'+esc(src.path||'')+'"'
+    +' data-l="'+(src.start_line||'')+'">'+esc(src.file)+'</b> &mdash; '+
     esc(src.function)+'() lines '+src.start_line+'-'+src.end_line+'</div>';
   const full = (src.lines||[]).map(r => {
     const hlcls = (refset && refset[r.line]) ? ' khl' : '';
@@ -2612,7 +3123,8 @@ function renderKernelCC(t, ch, focused){
     if(win.def_line) hset[win.def_line]=1;
     if(win.init_line) hset[win.init_line]=1;
   }
-  const hdr = '<div class="lref">kernel: <b>'+esc(k.file||'kernel.cc')+'</b>'+
+  const hdr = '<div class="lref">kernel: <b class="srcref" data-p="'+esc(k.path||'')+'"'
+    +(win&&win.def_line?' data-l="'+win.def_line+'"':'')+'>'+esc(k.file||'kernel.cc')+'</b>'+
     (win ? ' &mdash; window <span class="win">'+esc(win.name)+'</span>'+
       ' (buffers '+esc((win.buffers||[]).join(', ')||'-')+')' : '')+'</div>';
   // Focused (window matched): show only the window's lines, fold the rest.
@@ -2634,7 +3146,8 @@ function renderBcf(t, ch, focused){
     const bufs = {}; (win.buffers||[]).forEach(x => bufs[x]=1);
     (b.symbols||[]).forEach(s => { if(bufs[s.name]) hset[s.line]=1; });
   }
-  const hdr = '<div class="lref">bcf: <b>'+esc(b.file)+'</b>'+
+  const hdr = '<div class="lref">bcf: <b class="srcref" data-p="'+esc(b.path||'')+'">'
+    +esc(b.file)+'</b>'+
     (win ? ' &mdash; buffers for <span class="win">'+esc(win.name)+'</span>' : '')+'</div>';
   // Focused (window matched): show only this window's buffer lines, fold the rest.
   const body = win
@@ -2880,7 +3393,8 @@ function renderFullIr(highlightLines){
   const rowHtml = (code, n) =>
     '<span class="'+(hi.has(n)?'irln irhi':'irln')+'">' +
     '<span class="irlno">'+n+'</span>'+esc(code)+'</span>';
-  const hdr = '<div class="lref">'+esc(ir.name||'')+' &mdash; '+N+
+  const hdr = '<div class="lref"><b class="srcref" data-p="'+esc(ir.path||'')+'">'
+    +esc(ir.name||'')+'</b> &mdash; '+N+
     ' lines, '+hi.size+' highlighted'+(hi.size?' (non-target folded)':'')+'</div>';
   // No highlights -> nothing to locate; show the whole file unfolded.
   if (!hi.size){
@@ -2940,11 +3454,7 @@ function wireFolds(box, onChange){
 
 const g = DATA.grid;
 document.getElementById('meta').textContent =
-  DATA.source.function + '  (host.cc lines ' + DATA.source.function_lines[0] +
-  '-' + DATA.source.function_lines[1] + ')  grid ' + g.cols + '\u00d7' + g.rows +
-  ((g.startcol !== null && g.startcol !== undefined)
-    ? '  partition startcol=' + g.startcol + ' (phys_col = col + ' + g.startcol + ')'
-    : '');
+  'AIE Debug  ' + g.cols + '\u00d7' + g.rows + ' grid';
 
 // build a loc->tile map
 const byLoc = {};
@@ -3022,13 +3532,14 @@ rowsDesc.forEach(r => {
     cell.appendChild(lbar);
     liveBar[c+','+r] = lbar;
     cell.onclick = (ev) => {
+      const ctrl = ev.ctrlKey || ev.metaKey || ctrlHeld;
       const b = ev.target.closest('.badge');
       if (b && b.dataset.idx !== undefined) {
         const ch = (t.dma_channels||[])[+b.dataset.idx];
-        select(t, cell, ch, b);
+        select(t, cell, ch, b, ctrl);
         highlightFlow(+b.dataset.flow, t.loc, b);
       } else {
-        select(t, cell);
+        select(t, cell, null, null, ctrl);
         clearPeers();
       }
     };
@@ -3037,15 +3548,17 @@ rowsDesc.forEach(r => {
 });
 
 // ── View switcher (Grid / Device Map) ────────────────────────
-function switchView(name, btn){
-  document.querySelectorAll('.vsw').forEach(b=>b.classList.remove('act'));
-  btn.classList.add('act');
+// Device Map is the default view; the initial call at the bottom of this script
+// runs through here too, so the shown/hidden state has exactly one definition.
+function switchView(name){
+  document.querySelectorAll('.vsw').forEach(b=>b.classList.toggle('act', b.dataset.v===name));
   const showGrid = name==='grid';
   document.getElementById('grid').style.display = showGrid ? '' : 'none';
   document.getElementById('overlayctl').style.display = showGrid ? '' : 'none';
-  document.getElementById('gridlegend').style.display = showGrid ? '' : 'none';
+  document.getElementById('legend-detail').style.display = showGrid ? '' : 'none';
   document.getElementById('devmap').classList.toggle('show', !showGrid);
   if(!showGrid) buildDeviceMap();
+  reportUIState({view: name});
 }
 
 // ── Device Map (SVG, pan/zoom) ────────────────────────────────
@@ -3054,21 +3567,46 @@ const DM_COLORS = [
   '#3FA266','#F1B467','#DD7F76','#FC6B83',
   '#88C0D0','#A3BE8C','#EBCB8B','#BF616A',
 ];
-const dmFlowIds = Object.keys(flowMembers).map(Number).sort((a,b)=>a-b);
+// Build from comm_paths so flows that appear in edges but have no core-tile DMA
+// entries (e.g. GMIO-to-memtile flows absent from flow_summary) still get a color.
+const dmFlowIds = [...new Set([
+  ...Object.keys(flowMembers).map(Number),
+  ...(DATA.comm_paths||[]).map(p=>p.flow_index),
+])].sort((a,b)=>a-b);
 function dmColor(fi){ return DM_COLORS[dmFlowIds.indexOf(fi)%DM_COLORS.length]; }
 
-let dmActiveFi = -1;
+let dmActiveNets = new Set();   // empty = all nets active (unless dmHideAll)
+let dmHideAll = false;          // true = All Flows toggled off
 let dmBuilt = false;
+// Map tile selection lives at module scope so it survives a buildDeviceMap()
+// rebuild (e.g. triggered by a net click) instead of being wiped each time.
+let dmSelKeys = new Set();      // 'c,r' keys of highlighted map tiles
+const dmTileStroke = {};        // key -> current rect stroke, for deselect/hover-out restore
+const dmTileFill = {};          // key -> base rect fill, for status-tint restore
+
+// Live scan results for the map. Same payload the grid overlay consumes, kept
+// at module scope because buildDeviceMap() wipes the SVG — the paint pass is
+// re-run after every rebuild instead of the colors living only in the DOM.
+// nets[] is derived, not served: /grid reports per-tile and per-channel state,
+// so a flow's state is the worst state across the DMA channels carrying it.
+let dmStatus = { what:null, cells:null, nets:{}, err:null, ts:null };
 
 // Pan/zoom state
 let dmTx=20, dmTy=20, dmScale=0.9, dmDragging=false, dmLx=0, dmLy=0;
 let dmSpaceHeld=false;
 
+// Ctrl state captured at mousedown (before Linux keyup races with click).
+let ctrlHeld=false;
+document.addEventListener('keydown',  e=>{ if(e.key==='Control'||e.key==='Meta') ctrlHeld=true; });
+document.addEventListener('keyup',    e=>{ if(e.key==='Control'||e.key==='Meta') ctrlHeld=false; });
+window.addEventListener('blur',       ()=>{ ctrlHeld=false; });
+document.addEventListener('mousedown',e=>{ ctrlHeld = e.ctrlKey||e.metaKey; });
+
 function dmApply(){
   document.getElementById('devmap-canvas').style.transform=
     'translate('+dmTx+'px,'+dmTy+'px) scale('+dmScale+')';
 }
-function dmReset(){
+function dmReset(rebuild){
   const vp=document.getElementById('devmap-vp');
   const svg=document.getElementById('devmap-svg');
   const vpW=vp.clientWidth, vpH=vp.clientHeight;
@@ -3081,18 +3619,30 @@ function dmReset(){
     dmTy=(vpH-svgH*dmScale)/2;
   } else { dmTx=20; dmTy=20; dmScale=0.9; }
   dmApply();
+  // Reset filter state only when called from the Reset button, not from buildDeviceMap itself.
+  if(rebuild){
+    dmActiveNets=new Set();
+    dmHideAll=false;
+    dmSelKeys=new Set();
+    const allChip=document.querySelector('.dm-chip.all-chip');
+    if(allChip) allChip.classList.add('act');
+    document.querySelectorAll('.dm-chip.net-chip').forEach(c=>c.classList.add('act'));
+    buildDeviceMap();
+  }
 }
 
 (function initPanZoom(){
   const vp = document.getElementById('devmap-vp');
 
   // Spacebar: suppress page scroll when devmap is active (capture phase).
-  // Skip when focus is on an input/textarea so the search bar can type spaces.
+  // Skip whenever focus is somewhere typeable. isContentEditable matters as
+  // much as the tag check: the LLM prompt box is a contenteditable div, so a
+  // tag-only test ate every space typed into it while the map was showing.
   document.addEventListener('keydown',e=>{
     if(e.code!=='Space'||e.repeat) return;
     if(!document.getElementById('devmap').classList.contains('show')) return;
-    const tag=(document.activeElement||{}).tagName||'';
-    if(tag==='INPUT'||tag==='TEXTAREA') return;
+    const ae=document.activeElement||{}, tag=ae.tagName||'';
+    if(tag==='INPUT'||tag==='TEXTAREA'||ae.isContentEditable) return;
     e.preventDefault();
   }, true);
 
@@ -3404,7 +3954,7 @@ function srPinTerm(raw){
   srSearchTerms.add(raw.trim());
   srRenderChips();
   srRenderResults();
-  buildDeviceMap();
+  if(document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
   if(srSearchTerms.size>0)
     llmPushCtx('[context] Search: pinned "'+[...srSearchTerms].join('", "')+'"');
 }
@@ -3418,10 +3968,11 @@ function srRenderChips(){
     chip.appendChild(document.createTextNode(term));
     const x=document.createElement('span');
     x.className='lk-x'; x.textContent='×';
-    x.onclick=()=>{ srSearchTerms.delete(term); srRenderChips(); srRenderResults(); buildDeviceMap(); };
+    x.onclick=()=>{ srSearchTerms.delete(term); srRenderChips(); srRenderResults(); if(document.getElementById('devmap').classList.contains('show')) buildDeviceMap(); };
     chip.appendChild(x);
     wrap.appendChild(chip);
   });
+  dmSyncClearBtn();
 }
 
 function srRenderResults(){
@@ -3434,7 +3985,7 @@ function srRenderResults(){
   srSearchTerms.forEach(term=>{
     const hits=srResolve(term);
     html+='<div class="sr-group-hdr">'+esc(term)
-      +(hits.length?' <span style="color:#555;font-weight:400">('+hits.length+' match'+(hits.length!==1?'es':'')+')</span>':'')
+      +(hits.length?' <span style="color:var(--tx-lo);font-weight:400">('+hits.length+' match'+(hits.length!==1?'es':'')+')</span>':'')
       +'</div>';
     if(!hits.length){ html+='<div class="sr-empty">no matches</div>'; return; }
     html+='<table><thead><tr>'
@@ -3451,7 +4002,7 @@ function srRenderResults(){
         +'<td>('+esc(tc)+','+esc(tr)+')</td>'
         +'<td>'+(h.fi!=null?'f'+h.fi:'—')+'</td>'
         +'<td style="font-family:monospace;max-width:120px;overflow:hidden;text-overflow:ellipsis">'+esc(h.labelRaw)+'</td>'
-        +'<td style="color:#666;font-size:11px">'+esc(h.description)+'</td>'
+        +'<td style="color:var(--tx-lo);font-size:11px">'+esc(h.description)+'</td>'
         +'</tr>';
     });
     html+='</tbody></table>';
@@ -3486,14 +4037,174 @@ function srRenderResults(){
   inp.addEventListener('blur',()=>{ setTimeout(()=>{ sug.classList.add('hide'); sug.innerHTML=''; srSugIdx=-1; },150); });
 })();
 
+// ── Device-map live status ────────────────────────────────────
+// Worst-wins ordering, mirroring the server's _worst(): a flow carrying one
+// stalled channel is stalled even if its other channels are running.
+const DM_ST_ORDER = ['unreachable','error','stalled','running','idle'];
+function dmWorst(states){
+  for(const s of DM_ST_ORDER) if(states.indexOf(s)>=0) return s;
+  return states.length?states[0]:null;
+}
+// A flow's state, from the channels that carry it. Only meaningful for the
+// 'dma' scan — 'cores'/'events' report nothing per-flow, so nets stay uncolored.
+function dmDeriveNets(cells){
+  const out={};
+  if(!cells) return out;
+  (DATA.tiles||[]).forEach(t=>{
+    const cell=cells[t.loc[0]+','+t.loc[1]];
+    if(!cell||!cell.channels) return;
+    (t.dma_channels||[]).forEach(ch=>{
+      if(ch.flow_index==null||!ch.direction) return;
+      const c=cell.channels[ch.direction.toLowerCase()+ch.channel];
+      if(!c||!c.state) return;
+      (out[ch.flow_index]=out[ch.flow_index]||[]).push(c.state);
+    });
+  });
+  const nets={};
+  Object.keys(out).forEach(fi=>{ nets[fi]=dmWorst(out[fi]); });
+  return nets;
+}
+function dmStColor(state){ return (LSTATE[state]||LSTATE.unknown)[0]; }
+function dmStLabel(state){ return (LSTATE[state]||LSTATE.unknown)[1]; }
+
+// Paint scan results onto the already-built SVG. Deliberately a DOM patch
+// rather than a rebuild: buildDeviceMap() ends in dmReset(), which re-fits the
+// zoom, so rebuilding on every 2s poll would yank the view out from under a
+// user who has panned in.
+function dmPaintStatus(){
+  const cells = dmStatus.cells;
+  const svg = document.getElementById('devmap-svg');
+  if(!svg) return;
+  // Tiles.
+  svg.querySelectorAll('.dm-tile').forEach(g => {
+    const key = g.getAttribute('data-key');
+    const rect = g.querySelector('rect');
+    const lbl  = g.querySelector('.dm-stlabel');
+    const cell = cells ? cells[key] : null;
+    const base = dmTileFill[key];
+    if(!cell || !cell.state){
+      if(rect && base!=null) rect.setAttribute('fill', base);
+      dmTileStroke[key] = g.getAttribute('data-basestroke') || dmTileStroke[key];
+      if(rect && !dmSelKeys.has(key)){
+        rect.setAttribute('stroke', dmTileStroke[key]);
+        rect.setAttribute('stroke-width','1');
+      }
+      if(lbl){ lbl.textContent=''; }
+      g.removeAttribute('data-state');
+      return;
+    }
+    const col = dmStColor(cell.state);
+    g.setAttribute('data-state', cell.state);
+    if(rect){
+      rect.setAttribute('fill', col+'33');
+      // Selection outranks status on the stroke, but the fill tint still shows
+      // through — so a selected tile does not go blind to its own state.
+      dmTileStroke[key] = col;
+      if(!dmSelKeys.has(key)){
+        rect.setAttribute('stroke', col);
+        rect.setAttribute('stroke-width','2');
+      }
+    }
+    if(lbl){
+      lbl.textContent = dmStLabel(cell.state);
+      lbl.setAttribute('fill', col);
+    }
+  });
+  // Net casings: a wider translucent stroke *under* each edge, so the net keeps
+  // its identity color on top and the status reads as a glow around it.
+  svg.querySelectorAll('.dm-edgecase').forEach(ln => {
+    const st = dmStatus.nets[ln.getAttribute('data-fi')];
+    ln.setAttribute('stroke', st ? dmStColor(st) : 'transparent');
+  });
+  // Net chips.
+  document.querySelectorAll('#devmap-netbar .net-chip').forEach(chip => {
+    let dot = chip.querySelector('.chstat');
+    const st = dmStatus.nets[chip.dataset.fi];
+    if(!st){ if(dot) dot.remove(); return; }
+    if(!dot){
+      dot = document.createElement('span');
+      dot.className = 'chstat';
+      chip.insertBefore(dot, chip.firstChild);
+    }
+    dot.style.background = dmStColor(st);
+    dot.title = 'net'+chip.dataset.fi+': '+st;
+  });
+  dmSyncLegend();
+  dmSyncClearBtn();
+}
+// Legend lists only the states actually on screen — a fixed six-swatch strip
+// would be mostly noise on a healthy run.
+function dmSyncLegend(){
+  const el = document.getElementById('devmap-stlegend');
+  if(!el) return;
+  const seen = [];
+  if(dmStatus.cells){
+    Object.values(dmStatus.cells).forEach(c => {
+      if(c && c.state && seen.indexOf(c.state)<0) seen.push(c.state);
+    });
+  }
+  Object.values(dmStatus.nets).forEach(s => { if(s && seen.indexOf(s)<0) seen.push(s); });
+  if(!seen.length){ el.className='hide'; el.innerHTML=''; return; }
+  seen.sort((a,b)=>DM_ST_ORDER.indexOf(a)-DM_ST_ORDER.indexOf(b));
+  el.className = 'dml-item';
+  el.innerHTML = '<span style="margin-right:2px">'+esc(dmStatus.what||'')+':</span>' +
+    seen.map(s => '<span class="dml-item" style="margin-right:7px">' +
+      '<span class="dml-dot" style="background:'+dmStColor(s)+'"></span>' +
+      esc(dmStLabel(s))+'</span>').join('');
+}
+function dmSetScanStatus(msg, isErr){
+  const e = document.getElementById('dmScanStatus');
+  if(!e) return;
+  e.textContent = msg;
+  e.className = isErr ? 'err' : '';
+}
+// Entry point called from applyGrid() so both views share one fetch.
+function dmApplyStatus(res){
+  dmStatus.what  = res.error ? dmStatus.what : (res.what || LIVE.what);
+  dmStatus.cells = res.error ? null : (res.cells || {});
+  dmStatus.nets  = res.error ? {} : dmDeriveNets(dmStatus.cells);
+  dmStatus.err   = res.error || null;
+  dmStatus.ts    = new Date().toLocaleTimeString();
+  dmSetScanStatus(res.error ? res.error
+                            : (dmStatus.what+' @ '+dmStatus.ts), !!res.error);
+  dmPaintStatus();
+}
+function dmClearStatus(){
+  dmStatus = { what:null, cells:null, nets:{}, err:null, ts:null };
+  dmSetScanStatus('');
+  dmPaintStatus();
+}
+// Greyed out when there is nothing to clear, so the button reports whether the
+// map is actually carrying any overlay.
+function dmSyncClearBtn(){
+  const b = document.getElementById('dmClearBtn');
+  if (b) b.disabled = !dmStatus.cells && !srSearchTerms.size;
+}
+// "Back to normal" for the two things that tint the map: a live scan and pinned
+// search terms. Net isolation and pan/zoom are deliberately left alone — the
+// "Reset view" button in the viewport already owns those, and clearing them
+// here would silently throw away a filter the user set up by hand.
+function dmClearAll(){
+  // Stop the poll first: clearing while live is on just gets repainted 2s later.
+  if (LIVE.enabled) setLive(false);
+  else dmClearStatus();
+  if (srSearchTerms.size){
+    srSearchTerms.clear();
+    srRenderChips();
+    srRenderResults();
+    if (document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
+  }
+  dmSyncClearBtn();
+}
+
 function buildNetBar(){
   const bar=document.getElementById('devmap-netbar');
   bar.innerHTML='';
-  // "All nets" chip
+  // "All Flows" chip
   const allc=document.createElement('button');
-  allc.className='dm-chip all-chip'+(dmActiveFi===-1?' act':'');
-  allc.textContent='All nets';
-  allc.onclick=()=>dmSelectNet(-1);
+  allc.className='dm-chip all-chip'+(!dmHideAll&&dmActiveNets.size===0?' act':'');
+  allc.textContent='All Flows';
+  allc.onclick=()=>dmSelectNet(-1,false);
   bar.appendChild(allc);
   // Per-flow chips — derive label from flow_summary if available
   const fsSummary={};
@@ -3501,7 +4212,7 @@ function buildNetBar(){
   const fiDir={};
   (DATA.comm_paths||[]).forEach(p=>{ fiDir[p.flow_index]=p.direction; });
   dmFlowIds.forEach(fi=>{
-    const isAct=dmActiveFi===-1||dmActiveFi===fi;
+    const isAct=!dmHideAll&&(dmActiveNets.size===0||dmActiveNets.has(fi));
     const chip=document.createElement('button');
     chip.className='dm-chip net-chip'+(isAct?' act':'');
     chip.dataset.fi=fi;
@@ -3511,39 +4222,61 @@ function buildNetBar(){
     const dir=fiDir[fi]==='push'?'→':'←';
     chip.appendChild(document.createTextNode('net'+fi+' '+dir));
     chip.style.color=dmColor(fi);
-    chip.title='Click to isolate net '+fi+' in map';
-    chip.onclick=()=>dmSelectNet(dmActiveFi===fi?-1:fi);
+    chip.title='Click to isolate net '+fi+' · Ctrl+click to multi-select';
+    chip.onclick=ev=>dmSelectNet(fi,ev.ctrlKey||ev.metaKey);
     bar.appendChild(chip);
   });
 }
 
-function dmSelectNet(fi){
-  dmActiveFi=fi;
-  document.querySelector('.dm-chip.all-chip').classList.toggle('act',fi===-1);
+function dmSelectNet(fi, ctrl){
+  if(fi===-1){
+    // "All Flows" chip: if all are already showing, hide all (toggle); otherwise restore all
+    if(!dmHideAll&&dmActiveNets.size===0) { dmHideAll=true; }
+    else { dmHideAll=false; dmActiveNets=new Set(); }
+  } else if(ctrl){
+    // Ctrl+click: toggle this net in/out of multi-selection
+    dmHideAll=false;
+    if(dmActiveNets.has(fi)) dmActiveNets.delete(fi);
+    else dmActiveNets.add(fi);
+  } else {
+    // Plain click: exclusively select this net, or clear if it was the only one
+    dmHideAll=false;
+    if(dmActiveNets.size===1&&dmActiveNets.has(fi)) dmActiveNets=new Set();
+    else { dmActiveNets=new Set(); dmActiveNets.add(fi); }
+  }
+  const allActive=!dmHideAll&&dmActiveNets.size===0;
+  document.querySelector('.dm-chip.all-chip').classList.toggle('act',allActive);
   document.querySelectorAll('.dm-chip.net-chip').forEach(c=>{
-    c.classList.toggle('act',fi===-1||parseInt(c.dataset.fi)===fi);
+    c.classList.toggle('act',!dmHideAll&&(allActive||dmActiveNets.has(parseInt(c.dataset.fi))));
   });
   buildDeviceMap();
-  if(fi===-1){ renderNetDetail(null); llmPushCtx(null); }
-  else {
-    const path=(DATA.comm_paths||[]).find(p=>p.flow_index===fi)||null;
-    renderNetDetail(path);
-    if(path){
-      const prod=path.producer?(path.producer.gmio_name||path.producer.logical_name||'?'):'?';
-      const cons=path.consumer?(path.consumer.gmio_name||path.consumer.logical_name||'?'):'?';
-      llmPushCtx('[context] Selected net/flow f'+fi+' — producer: '+prod+', consumer: '+cons
-        +(path.direction?' ('+path.direction+')':''));
+  // Sync panelItems: remove net entries no longer selected, add newly selected ones.
+  // Preserve existing tile entries.
+  panelItems.forEach((_,key)=>{ if(key.startsWith('net:')&&!dmActiveNets.has(parseInt(key.slice(4)))) panelItems.delete(key); });
+  dmActiveNets.forEach(fi2=>{
+    const key=panelKey('net',fi2);
+    if(!panelItems.has(key)){
+      const path=(DATA.comm_paths||[]).find(p=>p.flow_index===fi2)||null;
+      const color=dmColor(fi2);
+      const dir=path?(path.direction==='push'?'push →':'pull ←'):'';
+      const prod=path&&path.producer?(path.producer.gmio_name||path.producer.logical_name||'?'):'?';
+      const cons=path&&path.consumer?(path.consumer.gmio_name||path.consumer.logical_name||'?'):'?';
+      panelItems.set(key,{
+        kind:'net', label:'net'+fi2+(dir?' '+dir:''), color,
+        buildBody:()=>buildNetBody(path),
+        llmCtx:'net f'+fi2+(dir?' ('+dir+')':'')+' producer:'+prod+' consumer:'+cons
+      });
     }
+    panelActiveKey = panelKey('net',fi2);  // last added becomes active
+  });
+  if(!dmActiveNets.size){
+    panelItems.forEach((_,key)=>{ if(key.startsWith('net:')) panelItems.delete(key); });
   }
+  panelSync();
 }
 
-function renderNetDetail(p){
-  const panel=document.getElementById('panel');
-  if(!p){
-    // Deselected — restore placeholder
-    panel.innerHTML='<div class="placeholder">Click a tile or net for details</div>';
-    return;
-  }
+function buildNetBody(p){
+  if(!p) return '<div class="placeholder">Click a tile or net for details</div>';
   const fi=p.flow_index;
   const color=dmColor(fi);
   const dir=p.direction==='push'?'push (host → array)':'pull (array → host)';
@@ -3606,22 +4339,46 @@ function renderNetDetail(p){
       +'<tbody>'+chanRows+'</tbody></table>'
     :'<div class="placeholder">(no DMA channels on participating tiles)</div>';
 
-  // ── Stream-switch connections (routing_connections) ───────────────────────
+  // ── Stream-switch connections + GMIO (routing_connections) ──────────────
+  // Split: circuit_connect/packet_connect are stream-switch port configs;
+  // shim_aie_to_ext/shim_ext_to_aie are GMIO DMA channel registrations —
+  // different hardware, different config, kept separate.
+  const shimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
+  const gmioConns=(p.routing_connections||[]).filter(c=>shimKinds.has(c.kind));
+  const swConnsRaw=(p.routing_connections||[]).filter(c=>!shimKinds.has(c.kind));
+  // Sort stream-switch in data-flow order: pull → high row first; push → low row first.
+  const swConns=[...swConnsRaw].sort((a,b)=>
+    p.direction==='pull'
+      ?(b.tile?.row??0)-(a.tile?.row??0)
+      :(a.tile?.row??0)-(b.tile?.row??0)
+  );
+  const connKindLabel={'circuit_connect':'circuit','packet_connect':'packet'};
   let swRows='';
-  const connKindLabel={'circuit_connect':'circuit','packet_connect':'packet',
-    'shim_ext_to_aie':'shim→AIE','shim_aie_to_ext':'AIE→shim'};
-  (p.routing_connections||[]).forEach(c=>{
+  swConns.forEach(c=>{
     const t=c.tile||{};
     const kind=connKindLabel[c.kind]||esc(c.kind);
     let detail='';
     if(c.slave&&c.master) detail=esc(c.slave.dir)+'['+c.slave.idx+'] → '+esc(c.master.dir)+'['+c.master.idx+']';
-    else if(c.stream_id!=null) detail='stream_id='+c.stream_id;
     swRows+='<tr><td>('+t.col+','+t.row+')</td><td>'+kind+'</td><td>'+detail+'</td></tr>';
   });
   const swTable=swRows
     ?'<table class="rctbl"><thead><tr><th>tile</th><th>kind</th><th>ports</th></tr></thead>'
       +'<tbody>'+swRows+'</tbody></table>'
-    :'<div class="placeholder">(no routing data)</div>';
+    :'<div class="placeholder">(no stream-switch connections)</div>';
+
+  // GMIO channel table — separate from stream switch
+  const gmioDir={'shim_aie_to_ext':'S2MM (array → DDR)','shim_ext_to_aie':'MM2S (DDR → array)'};
+  let gmioRows='';
+  gmioConns.forEach(c=>{
+    const t=c.tile||{};
+    const dir=gmioDir[c.kind]||esc(c.kind);
+    gmioRows+='<tr><td>('+t.col+','+t.row+')</td><td>'+dir+'</td>'
+      +'<td>'+(c.stream_id!=null?c.stream_id:'-')+'</td></tr>';
+  });
+  const gmioTable=gmioRows
+    ?'<table class="rctbl"><thead><tr><th>tile</th><th>direction</th><th>stream_id</th></tr></thead>'
+      +'<tbody>'+gmioRows+'</tbody></table>'
+    :'';
 
   // ── All hops (stream + shmem) ─────────────────────────────────────────────
   let hopRows='';
@@ -3644,9 +4401,7 @@ function renderNetDetail(p){
   const bal=(DATA.supply_demand||[]).find(b=>b.flow_index===fi);
   const balHtml=bal?renderFlowBalance(bal):'';
 
-  panel.innerHTML=
-    '<h2>'+dot+'net'+fi+' &mdash; '+esc(dir)+'</h2>'+
-    '<div class="tabs">'+
+  return '<div class="tabs">'+
       '<span class="tab act" data-t="nd-hi">Overview</span>'+
       '<span class="tab" data-t="nd-sw">Stream switch</span>'+
       '<span class="tab" data-t="nd-hops">All hops</span>'+
@@ -3660,25 +4415,15 @@ function renderNetDetail(p){
       '<div id="tab-nd-sw" class="hide">'+
         '<div class="lref">stream-switch connections from routingprovenancemap</div>'+
         swTable+
-      '</div>'+
+        (gmioTable?'<div class="kv" style="margin-top:10px"><b>GMIO channel</b>'
+          +' <span class="dimtxt">(DMA engine on shim — data path is MemTile SRAM → NoC → DDR)</span></div>'
+          +gmioTable:'')
+      +'</div>'+
       '<div id="tab-nd-hops" class="hide">'+
         '<div class="lref">hop-by-hop path from dmaphopprovenacemap</div>'+
         hopTable+
       '</div>'+
     '</div>';
-
-  // Attach tab switching (reuses same logic as tile panel)
-  panel.querySelectorAll('.tab').forEach(tab=>{
-    tab.onclick=()=>{
-      panel.querySelectorAll('.tab').forEach(t=>t.classList.remove('act'));
-      tab.classList.add('act');
-      reportUIState({net_tab: tab.dataset.t});
-      const id='tab-'+tab.dataset.t;
-      panel.querySelectorAll('.tabbody>div').forEach(d=>{
-        d.classList.toggle('hide',d.id!==id);
-      });
-    };
-  });
 }
 
 function svgN(tag,attrs){
@@ -3694,9 +4439,9 @@ function dmShowTip(clientX, clientY, lines){
   dmHideTip();
   const d=document.createElement('div');
   d.style.cssText='position:fixed;z-index:9999;pointer-events:none;'
-    +'background:#252525;border:1px solid #e4e4e433;border-radius:4px;'
-    +'padding:5px 9px;font:10px/1.5 monospace;color:#e4e4e4;'
-    +'white-space:nowrap;box-shadow:0 2px 10px #0008;';
+    +'background:#1a1c27;border:1px solid #2a2e46;border-radius:4px;'
+    +'padding:5px 9px;font:10px/1.5 ui-monospace,monospace;color:#e2e4f0;'
+    +'white-space:nowrap;box-shadow:0 4px 16px rgba(0,0,0,.6);';
   d.innerHTML=lines.map(l=>'<div>'+l+'</div>').join('');
   document.body.appendChild(d);
   const tw=d.offsetWidth, th=d.offsetHeight;
@@ -3731,7 +4476,13 @@ function buildDeviceMap(){
   // Merge DATA.tiles with every tile referenced in comm_paths (waypoints + hops)
   const tileMap={};
   DATA.tiles.forEach(t=>{ tileMap[t.loc[0]+','+t.loc[1]]=t; });
+  // Track which tiles are shmem hop endpoints so they always get a box.
+  const shmemEndKeys=new Set();
   (DATA.comm_paths||[]).forEach(p=>{
+    (p.hops||[]).filter(h=>h.type==='shmem').forEach(h=>{
+      shmemEndKeys.add(h.from_col+','+h.from_row);
+      shmemEndKeys.add(h.to_col+','+h.to_row);
+    });
     // Register tiles from both edges and the tiles list
     (p.tiles||[]).forEach(([c,r])=>{
       const k=c+','+r;
@@ -3740,9 +4491,20 @@ function buildDeviceMap(){
     (p.edges||[]).forEach(([src,dst])=>{
       [[src[0],src[1]],[dst[0],dst[1]]].forEach(([c,r])=>{
         const k=c+','+r;
-        if(!tileMap[k]) tileMap[k]={loc:[c,r],type:'mem',dma_channels:[]};
+        if(!tileMap[k]) tileMap[k]={loc:[c,r],type:r===0?'shim':'mem',dma_channels:[]};
       });
     });
+  });
+  // Pure stream-switch waypoints: tiles synthesised from comm_paths only (not in
+  // DATA.tiles), with no DMA channels, not a shim row, and not a shmem endpoint.
+  // These are intermediate column hops (e.g. row 1–2 pass-through tiles) that
+  // should not render a box — the stream line passes through them invisibly.
+  const waypointKeys=new Set();
+  const dataTileKeys=new Set(DATA.tiles.map(t=>t.loc[0]+','+t.loc[1]));
+  Object.values(tileMap).forEach(t=>{
+    const k=t.loc[0]+','+t.loc[1];
+    if(!dataTileKeys.has(k) && t.loc[1]!==0 && !shmemEndKeys.has(k) && !(t.dma_channels&&t.dma_channels.length))
+      waypointKeys.add(k);
   });
 
   // Synthesize MEM tiles (rows 1–2) for columns that have a shim (row 0) and a
@@ -3778,16 +4540,36 @@ function buildDeviceMap(){
   const cx=c=>tx(c)+TW/2;
   const cy=r=>ty(r)+TH/2;
 
-  // Per-flow (ox,oy) offsets — spreads parallel polylines apart so they're all visible.
-  // Mirrors the reference: evenly stepped from -MAX to +MAX across all flows.
+  // Lane spacing. Scaled down as the flow count grows so the whole fan stays a
+  // fraction of the tile pitch: 12 flows at a fixed 5px would span 55px of a
+  // 72px row step and stray off the tiles.
+  const OX_STEP=Math.max(3, Math.min(8,
+    Math.round(0.40*COLSTEP/Math.max(1, dmFlowIds.length-1))));
+  const OY_STEP=Math.max(2, Math.min(5,
+    Math.round(0.40*ROWSTEP/Math.max(1, dmFlowIds.length-1))));
+  // One lane per flow, held for the whole path.
+  //
+  // This used to fan flows out per EDGE, by how many flows shared that
+  // particular hop — so a flow's own offset changed from segment to segment as
+  // the sharing changed along its route, and the line arrived at a tile on one
+  // lane and left on another. That is the gap-and-jog: e.g. net3 ran its first
+  // hop unshared at offset 0 and the rest at -12, a 12px break mid-route.
+  //
+  // A global lane also removes an overlap the per-edge scheme allowed: two
+  // flows that never share an edge both got offset 0 and drew on top of each
+  // other. The band is the same width the surrounding code already reserves
+  // for streams (streamMaxX/Y = OX_STEP*(N-1)/2).
+  function flowLane(fi){
+    const i=dmFlowIds.indexOf(fi), n=dmFlowIds.length;
+    return {
+      ox: Math.round((i-(n-1)/2)*OX_STEP),
+      oy: Math.round((i-(n-1)/2)*OY_STEP),
+    };
+  }
+  function edgeOffset(e, fi){ return flowLane(fi); }
+  function dotOffset(p, tc, tr){ return flowLane(p.flow_index); }
+  // N is used by shmem streamMaxX/Y to reserve lanes outside the stream offset band.
   const N=dmFlowIds.length;
-  const dmOx={}, dmOy={};
-  const OX_STEP=8, OY_STEP=5;           // pixels between adjacent lines
-  const OX_MAX=OX_STEP*(N-1)/2;
-  dmFlowIds.forEach((fi,i)=>{
-    dmOx[fi]=Math.round((i-(N-1)/2)*OX_STEP);
-    dmOy[fi]=Math.round((i-(N-1)/2)*OY_STEP);
-  });
 
   // ── Defs: arrowhead markers (userSpaceOnUse = no scale distortion) ──
   const defs=svgN('defs',{});
@@ -3820,24 +4602,42 @@ function buildDeviceMap(){
     return 'core';
   };
   const usedKeys=new Set(DATA.tiles.map(t=>t.loc[0]+','+t.loc[1]));
-  let dmSelKey=null;
   const tileGroups={};
 
   allTiles.forEach(t=>{
     const [tc,tr]=t.loc;
     const key=tc+','+tr;
+    // Pure stream-switch waypoints: no box, but still register in tileGroups so
+    // the hover and click handlers can find them (they show pass-through info).
+    if(waypointKeys.has(key)){
+      const g=svgN('g',{class:'dm-tile','data-key':key,'data-waypoint':'1',
+        opacity:'0',cursor:'pointer'});
+      tileGroups[key]=g;
+      dmTileStroke[key]='';
+      dmTileFill[key]='';
+      svg.appendChild(g);
+      return;
+    }
     const ttype=tileType(tr);
     const used=usedKeys.has(key);
     const fill=ttype==='mem'?'var(--fill,#e4e4e411)':'var(--fill2,#e4e4e41e)';
     const stroke=used?'var(--stroke,#e4e4e433)':'var(--stroke2,#e4e4e41f)';
     const baseOp=used?1:0.32;
 
-    const g=svgN('g',{opacity:baseOp,cursor:'pointer',class:'dm-tile','data-key':key});
+    const g=svgN('g',{opacity:baseOp,cursor:'pointer',class:'dm-tile','data-key':key,
+      'data-basestroke':stroke});
     tileGroups[key]=g;
+    dmTileStroke[key]=stroke;
+    dmTileFill[key]=fill;
 
     const rect=svgN('rect',{x:tx(tc),y:ty(tr),width:TW,height:TH,rx:'6',
       fill,stroke,'stroke-width':'1'});
     g.appendChild(rect);
+    // Empty placeholder so dmPaintStatus() only has to set textContent — it must
+    // not add nodes, since it runs on every poll.
+    g.appendChild(svgN('text',{class:'dm-stlabel',x:tx(tc)+TW-6,y:ty(tr)+TH-6,
+      'text-anchor':'end','font-size':'9','font-family':'monospace',
+      'font-weight':'700','pointer-events':'none'}));
 
     // Coord top-left, type badge top-right
     const typStr=ttype==='shim'?'SHIM':ttype==='mem'?'MEM':'AIE';
@@ -3851,8 +4651,8 @@ function buildDeviceMap(){
     // Show only terminal DMA channels (S2MM=input, MM2S=output) — not pass-through.
     // Each line: colored arrow + "f{fi}" compactly at bottom of tile.
     if(used&&t.dma_channels&&t.dma_channels.length){
-      const chans=dmActiveFi===-1?t.dma_channels
-        :t.dma_channels.filter(ch=>ch.flow_index===dmActiveFi);
+      const chans=(!dmHideAll&&dmActiveNets.size===0)?t.dma_channels
+        :t.dma_channels.filter(ch=>!dmHideAll&&dmActiveNets.has(ch.flow_index));
       // Split into inputs (S2MM) and outputs (MM2S)
       const ins=chans.filter(ch=>ch.direction==='S2MM');
       const outs=chans.filter(ch=>ch.direction==='MM2S');
@@ -3881,8 +4681,8 @@ function buildDeviceMap(){
       rect.setAttribute('stroke-width','1.5');
       const lines=['('+tc+','+tr+') '+typStr];
       if(t.dma_channels&&t.dma_channels.length){
-        const vis=dmActiveFi===-1?t.dma_channels
-          :t.dma_channels.filter(ch=>ch.flow_index===dmActiveFi);
+        const vis=(!dmHideAll&&dmActiveNets.size===0)?t.dma_channels
+          :t.dma_channels.filter(ch=>!dmHideAll&&dmActiveNets.has(ch.flow_index));
         // Terminal channels
         vis.filter(ch=>ch.direction==='S2MM').forEach(ch=>lines.push('in  f'+ch.flow_index));
         vis.filter(ch=>ch.direction==='MM2S').forEach(ch=>lines.push('out f'+ch.flow_index));
@@ -3891,7 +4691,7 @@ function buildDeviceMap(){
         const tileInEdges=p=>(p.edges||[]).some(e=>
           (e[0][0]===tc&&e[0][1]===tr)||(e[1][0]===tc&&e[1][1]===tr));
         const thru=(DATA.comm_paths||[]).filter(p=>{
-          if(dmActiveFi!==-1&&p.flow_index!==dmActiveFi) return false;
+          if(dmHideAll||dmActiveNets.size>0&&!dmActiveNets.has(p.flow_index)) return false;
           return tileInEdges(p)&&!termFis.has(p.flow_index);
         });
         if(thru.length) lines.push('── pass-through ──');
@@ -3901,11 +4701,24 @@ function buildDeviceMap(){
         const tileInEdgesG=p=>(p.edges||[]).some(e=>
           (e[0][0]===tc&&e[0][1]===tr)||(e[1][0]===tc&&e[1][1]===tr));
         const thru=(DATA.comm_paths||[]).filter(p=>{
-          if(dmActiveFi!==-1&&p.flow_index!==dmActiveFi) return false;
+          if(dmHideAll||dmActiveNets.size>0&&!dmActiveNets.has(p.flow_index)) return false;
           return tileInEdgesG(p);
         });
         if(thru.length) thru.slice(0,4).forEach(p=>lines.push('pass f'+p.flow_index));
         else lines.push('routing tile');
+      }
+      // Live scan detail, appended to the existing hover card rather than a
+      // native SVG <title> — two tooltips on one element fight each other.
+      const stCell = dmStatus.cells ? dmStatus.cells[key] : null;
+      if(stCell && stCell.state){
+        lines.push('── '+(dmStatus.what||'scan')+': '+stCell.state+' ──');
+        if(stCell.channels){
+          Object.keys(stCell.channels).forEach(cn =>
+            lines.push('    '+cn+': '+(stCell.channels[cn].state||'?')));
+        }
+        if(stCell.pc) lines.push('    pc '+stCell.pc+(stCell.source?' · '+stCell.source:''));
+        if(stCell.core_status) lines.push('    core '+stCell.core_status);
+        if(stCell.words) lines.push('    events '+stCell.words.join(' '));
       }
       dmShowTip(e.clientX, e.clientY, lines);
     });
@@ -3918,34 +4731,62 @@ function buildDeviceMap(){
       dmTooltipEl.style.left=lx+'px'; dmTooltipEl.style.top=ly+'px';
     });
     g.addEventListener('mouseleave',()=>{
-      if(dmSelKey!==key){
-        rect.setAttribute('stroke',stroke);
-        rect.setAttribute('stroke-width','1');
+      if(!dmSelKeys.has(key)){
+        // Restore from dmTileStroke, not the captured `stroke`: a live scan may
+        // have recolored this tile since it was built, and hovering out must
+        // not wipe the status color.
+        const cur=dmTileStroke[key]||stroke;
+        rect.setAttribute('stroke',cur);
+        rect.setAttribute('stroke-width', g.getAttribute('data-state')?'2':'1');
       }
       dmHideTip();
     });
     g.addEventListener('click',e=>{
       if(dmDragging) return;
-      if(dmSelKey&&tileGroups[dmSelKey]){
-        const prev=tileGroups[dmSelKey];
-        const pr=prev.querySelector('rect');
-        if(pr){ pr.setAttribute('stroke','var(--stroke,#e4e4e433)'); pr.setAttribute('stroke-width','1'); }
-      }
-      if(dmSelKey===key){ dmSelKey=null; return; }
-      dmSelKey=key;
-      rect.setAttribute('stroke','#599ce7'); rect.setAttribute('stroke-width','2');
+      const ctrl=e.ctrlKey||e.metaKey||ctrlHeld;
+      const selOn=k=>{ const gr=tileGroups[k]; if(!gr) return;
+        const r=gr.querySelector('rect'); if(!r) return;
+        r.setAttribute('stroke','#599ce7'); r.setAttribute('stroke-width','2'); };
+      const selOff=k=>{ const gr=tileGroups[k]; if(!gr) return;
+        const r=gr.querySelector('rect'); if(!r) return;
+        r.setAttribute('stroke',dmTileStroke[k]||'var(--stroke,#e4e4e433)');
+        r.setAttribute('stroke-width','1'); };
       const match=DATA.tiles.find(dt=>dt.loc[0]===tc&&dt.loc[1]===tr);
-      if(match){
-        const cells=document.querySelectorAll('#grid .tile');
-        let found=null;
-        cells.forEach(cell=>{
+      // Mirror the map click onto the grid cell so .sel highlighting stays in sync.
+      const gridCell=()=>{ let found=null;
+        document.querySelectorAll('#grid .tile').forEach(cell=>{
           const locEl=cell.querySelector('.loc');
-          if(locEl&&locEl.textContent==='('+tc+','+tr+')') found=cell;
-        });
-        select(match, found||g);
+          if(locEl&&locEl.textContent==='('+tc+','+tr+')') found=cell; });
+        return found; };
+      if(ctrl){
+        // Ctrl+click: toggle this tile in/out of the selection, keep the rest.
+        if(dmSelKeys.has(key)){
+          dmSelKeys.delete(key); selOff(key);
+          panelRemove(panelKey('tile', tc+','+tr));
+          return;
+        }
+        dmSelKeys.add(key); selOn(key);
+        if(match) select(match, gridCell()||g, null, null, true);
+      } else {
+        // Plain click: clear the selection; clicking the only selected tile deselects.
+        const wasOnly = dmSelKeys.size===1 && dmSelKeys.has(key);
+        dmSelKeys.forEach(k=>selOff(k));
+        dmSelKeys.clear();
+        if(wasOnly){ panelRemove(panelKey('tile', tc+','+tr)); return; }
+        dmSelKeys.add(key); selOn(key);
+        if(match) select(match, gridCell()||g, null, null, false);
+        else panelClearTiles('tile ('+tc+','+tr+') — no schedule info');
       }
     });
     svg.appendChild(g);
+  });
+
+  // Re-apply tile selection highlights: the rects above were just recreated, so a
+  // rebuild (net click, filter change) would otherwise drop the ctrl+click selection.
+  dmSelKeys.forEach(k=>{
+    const gr=tileGroups[k]; if(!gr) return;
+    const r=gr.querySelector('rect'); if(!r) return;
+    r.setAttribute('stroke','#599ce7'); r.setAttribute('stroke-width','2');
   });
 
   // ── LAYER 3: packet-switched and shmem links ──────────────────────
@@ -3994,7 +4835,7 @@ function buildDeviceMap(){
   }
 
   // ── LAYER 2.5: symbol-search highlights ──────────────────────────
-  // Drawn here (after edgeCoords/shIndex/shOffset/dmOx/dmOy are all defined)
+  // Drawn here (after edgeCoords/shIndex/shOffset/edgeOffset are all defined)
   // so halos use the exact same coordinates as the actual drawn lines.
   if(srSearchTerms.size){
     const {tileLockKeys,flowLockFis}=lkActiveSets();
@@ -4009,12 +4850,12 @@ function buildDeviceMap(){
         'pointer-events':'none'}));
     });
 
-    // Stream edge halos — match the per-flow (ox,oy) spread offset used by LAYER 4.
+    // Stream edge halos — match the per-edge (ox,oy) spread offset used by LAYER 4.
     (DATA.comm_paths||[]).forEach(p=>{
       if(!flowLockFis.has(p.flow_index)) return;
       const fi=p.flow_index;
-      const ox=dmOx[fi]||0, oy=dmOy[fi]||0;
       (p.edges||[]).forEach(e=>{
+        const {ox,oy}=edgeOffset(e,fi);
         const [fc,fr]=e[0],[tc,tr]=e[1];
         svg.appendChild(svgN('line',{
           x1:cx(fc)+ox,y1:cy(fr)+oy,x2:cx(tc)+ox,y2:cy(tr)+oy,
@@ -4044,7 +4885,7 @@ function buildDeviceMap(){
 
   (DATA.comm_paths||[]).forEach(p=>{
     const fi=p.flow_index;
-    const dim=dmActiveFi!==-1&&dmActiveFi!==fi;
+    const dim=dmHideAll||(dmActiveNets.size>0&&!dmActiveNets.has(fi));
     if(dim) return;
     const color=dmColor(fi);
     const RAIL=2.4;   // half-gap between the two rails of a ping-pong window link
@@ -4095,7 +4936,7 @@ function buildDeviceMap(){
       hit.addEventListener('click',ev=>{
         if(dmDragging) return;
         ev.stopPropagation();
-        dmSelectNet(dmActiveFi===fi?-1:fi);
+        dmSelectNet(fi,ev.ctrlKey||ev.metaKey);
       });
       svg.appendChild(hit);
     });
@@ -4107,20 +4948,27 @@ function buildDeviceMap(){
   function drawEdges(p, dim){
     const fi=p.flow_index;
     const color=dmColor(fi);
-    const ox=dmOx[fi]||0, oy=dmOy[fi]||0;
     const edges=p.edges||[];
     const srcKeys=new Set(edges.map(e=>e[0][0]+','+e[0][1]));
     edges.forEach(e=>{
       const [fc,fr]=e[0], [tc,tr]=e[1];
+      const {ox,oy}=edgeOffset(e,fi);
       const isTerminal=!srcKeys.has(tc+','+tr);
       const x1=cx(fc)+ox, y1=cy(fr)+oy, x2=cx(tc)+ox, y2=cy(tr)+oy;
+      // Status casing, drawn first so it sits under the identity-colored line.
+      // Starts transparent; dmPaintStatus() fills it in when a scan lands.
+      if(!dim){
+        svg.appendChild(svgN('line',{
+          x1, y1, x2, y2, class:'dm-edgecase', 'data-fi':fi,
+          stroke:'transparent', 'stroke-width':'9', 'stroke-opacity':'0.55',
+          'stroke-linecap':'round', 'pointer-events':'none'}));
+      }
       svg.appendChild(svgN('line',{
         x1, y1, x2, y2,
         stroke:color,
         'stroke-width':dim?'1':'3',
         'stroke-opacity':dim?'0.05':'0.95',
-        'stroke-linecap':'round',
-        'marker-end':(dim||!isTerminal)?'':'url(#ar-'+fi+')'}));
+        'stroke-linecap':'round'}));
       // Wide transparent hit area — only on active lines so dim flows aren't clickable.
       if(!dim){
         const hit=svgN('line',{x1,y1,x2,y2,stroke:'transparent','stroke-width':'12',
@@ -4128,24 +4976,56 @@ function buildDeviceMap(){
         hit.addEventListener('click',e=>{
           if(dmDragging) return;
           e.stopPropagation();
-          dmSelectNet(dmActiveFi===fi?-1:fi);
+          dmSelectNet(fi,e.ctrlKey||e.metaKey);
         });
         svg.appendChild(hit);
       }
     });
   }
-  if(dmActiveFi===-1){
-    // All-nets mode: draw every flow (all bright, no dimming needed since all active).
+  if(dmHideAll){
+    // Hide-all mode: draw nothing.
+  } else if(dmActiveNets.size===0){
+    // All-nets mode: draw every flow bright.
     (DATA.comm_paths||[]).forEach(p=>drawEdges(p, false));
   } else {
-    // Single-net mode: draw dim flows first, active on top.
-    // Dim lines are very faint so shared segments don't occlude the active color.
+    // Filtered mode: draw dim flows first, active on top.
     (DATA.comm_paths||[]).forEach(p=>{
-      if(p.flow_index!==dmActiveFi) drawEdges(p, true);
+      if(!dmActiveNets.has(p.flow_index)) drawEdges(p, true);
     });
     (DATA.comm_paths||[]).forEach(p=>{
-      if(p.flow_index===dmActiveFi) drawEdges(p, false);
+      if(dmActiveNets.has(p.flow_index)) drawEdges(p, false);
     });
+  }
+
+  // Small directional arrow drawn next to source/destination dots.
+  // (dx,dy) is the unit direction the arrow points (toward next tile for sources,
+  // away from prev tile for destinations — i.e. always "the direction data travels").
+  // outward=true  → source: base just outside dot, tip points away (data leaving)
+  // outward=false → dest:   tip just outside dot, base further back (data arriving)
+  // (dx,dy) = unit vector in the direction data flows.
+  // outward=true  (source):      arrow exits the dot — base just outside on downstream side, tip further downstream.
+  // outward=false (destination): arrow on the line upstream — tip just outside dot on upstream side, base further back.
+  // gap overrides the clearance from dot centre (default 7px, just past r=4.5px dot edge).
+  function svgArrow(x, y, dx, dy, color, outward, gap=7){
+    const LEN=9, HALF=3.5;
+    const nx=-dy, ny=dx;
+    let tx, ty, bx, by;
+    if(outward){
+      bx=x+dx*gap;   by=y+dy*gap;
+      tx=bx+dx*LEN;  ty=by+dy*LEN;
+    } else {
+      tx=x-dx*gap;   ty=y-dy*gap;
+      bx=tx-dx*LEN;  by=ty-dy*LEN;
+    }
+    const b1x=bx+nx*HALF, b1y=by+ny*HALF;
+    const b2x=bx-nx*HALF, b2y=by-ny*HALF;
+    svg.appendChild(svgN('polygon',{points:`${tx},${ty} ${b1x},${b1y} ${b2x},${b2y}`,fill:color,opacity:'0.9'}));
+  }
+  // Normalise a grid-space direction vector to unit length (Manhattan tiles only).
+  function gridDir(fromC, fromR, toC, toR){
+    const dc=toC-fromC, dr=toR-fromR;
+    const len=Math.sqrt(dc*dc+dr*dr)||1;
+    return [dc/len, -dr/len];   // -dr because SVG y is inverted relative to row index
   }
 
   // ── LAYER 5a: solid dots (sources, contributors, forks) ──────────
@@ -4154,10 +5034,9 @@ function buildDeviceMap(){
   // Drawn before hollow dots so hollow dots always render on top.
   (DATA.comm_paths||[]).forEach(p=>{
     const fi=p.flow_index;
-    const active=dmActiveFi===-1||dmActiveFi===fi;
+    const active=!dmHideAll&&(dmActiveNets.size===0||dmActiveNets.has(fi));
     if(!active) return;
     const color=dmColor(fi);
-    const ox=dmOx[fi]||0, oy=dmOy[fi]||0;
     const edges=p.edges||[];
     if(!edges.length) return;
 
@@ -4177,21 +5056,30 @@ function buildDeviceMap(){
     if(srcTile){
       const [sc,sr]=srcTile[0];
       if(!(isPull&&pktTileSet.has(sc+','+sr))){
+        const {ox,oy}=dotOffset(p,sc,sr);
         svg.appendChild(svgN('circle',{cx:cx(sc)+ox,cy:cy(sr)+oy,r:'4.5',
           fill:color,stroke:'#181818','stroke-width':'1.2'}));
+        // Arrow at source dot (push flows only — pull contributors use solid dot without arrow).
+        if(!isPull){
+          const [tc2,tr2]=srcTile[1];
+          if(tr2>=0){ const [dx,dy]=gridDir(sc,sr,tc2,tr2); svgArrow(cx(sc)+ox,cy(sr)+oy,dx,dy,color,true); }
+        }
       }
     }
 
     // Contributor dots (pull flows) — solid: each packet_tile injects computed results
-    // into the gather stream. Same solid style as source (both are injectors).
+    // into the gather stream. Outward arrow shows data leaving toward the collector.
     if(isPull){
       const seen=new Set();
       (p.packet_tiles||[]).forEach(t=>{
         const [tc,tr]=t, k=tc+','+tr;
         if(seen.has(k)) return;
         seen.add(k);
+        const {ox,oy}=dotOffset(p,tc,tr);
         svg.appendChild(svgN('circle',{cx:cx(tc)+ox,cy:cy(tr)+oy,r:'4.5',
           fill:color,stroke:'#181818','stroke-width':'1.2'}));
+        const outEdge=edges.find(e=>e[0][0]===tc&&e[0][1]===tr);
+        if(outEdge){ const [dx,dy]=gridDir(tc,tr,outEdge[1][0],outEdge[1][1]); svgArrow(cx(tc)+ox,cy(tr)+oy,dx,dy,color,true); }
       });
     }
 
@@ -4203,6 +5091,7 @@ function buildDeviceMap(){
       const outC=outCount[k]||0, inC=inCount[k]||0;
       if(outC>=2 && inC===1 && !dmaTileSet.has(k) && !forkSeen.has(k)){
         forkSeen.add(k);
+        const {ox,oy}=dotOffset(p,fc,fr);
         svg.appendChild(svgN('circle',{
           cx:cx(fc)+ox,cy:cy(fr)+oy,
           r:'5',fill:color,stroke:'#e4e4e4','stroke-width':'1.5'}));
@@ -4211,15 +5100,22 @@ function buildDeviceMap(){
   });
 
   // ── LAYER 5b: hollow dots — drawn LAST so they always sit on top of lines ──
-  // Hollow = takes from stream: terminal consumer or mid-stream tap (receives + relays).
-  // All hollow dots use fill:'#181818' so the opaque background covers any line passing
-  // through the dot center, making the ring visually "cut into" the stream.
+  // Pre-collect all terminal tiles across all active flows so tap drawing can skip them.
+  // A tile that is a terminal in one flow must not also get a tap arrow from another flow.
+  const globalTerminals=new Set();
+  (DATA.comm_paths||[]).forEach(p=>{
+    const active=!dmHideAll&&(dmActiveNets.size===0||dmActiveNets.has(p.flow_index));
+    if(!active) return;
+    const edges=p.edges||[];
+    const outCount={};
+    edges.forEach(e=>{ const sk=e[0][0]+','+e[0][1]; outCount[sk]=(outCount[sk]||0)+1; });
+    edges.forEach(e=>{ const [tc,tr]=e[1]; if(!outCount[tc+','+tr]&&tr>=0) globalTerminals.add(tc+','+tr); });
+  });
   (DATA.comm_paths||[]).forEach(p=>{
     const fi=p.flow_index;
-    const active=dmActiveFi===-1||dmActiveFi===fi;
+    const active=!dmHideAll&&(dmActiveNets.size===0||dmActiveNets.has(fi));
     if(!active) return;
     const color=dmColor(fi);
-    const ox=dmOx[fi]||0, oy=dmOy[fi]||0;
     const edges=p.edges||[];
     if(!edges.length) return;
 
@@ -4235,11 +5131,15 @@ function buildDeviceMap(){
     // Terminal dots — hollow ring, opaque background: final consumer, no outgoing edges.
     const dstSeen=new Set();
     edges.forEach(e=>{
-      const [tc,tr]=e[1], dk=tc+','+tr;
+      const [sc2,sr2]=e[0], [tc,tr]=e[1], dk=tc+','+tr;
       if(!outCount[dk] && tr>=0 && !dstSeen.has(dk)){
         dstSeen.add(dk);
+        const {ox,oy}=dotOffset(p,tc,tr);
         svg.appendChild(svgN('circle',{cx:cx(tc)+ox,cy:cy(tr)+oy,r:'4.5',
           fill:'#181818',stroke:color,'stroke-width':'2.2'}));
+        // Arrow pointing into the dot (data flows in from the previous tile).
+        const [dx,dy]=gridDir(sc2,sr2,tc,tr);
+        svgArrow(cx(tc)+ox,cy(tr)+oy,dx,dy,color,false,5);
       }
     });
 
@@ -4250,15 +5150,22 @@ function buildDeviceMap(){
     const tapSeen=new Set();
     edges.forEach(e=>{
       const [sc,sr]=e[0], sk=sc+','+sr;
-      if(sr>=0 && dmaTileSet.has(sk) && outCount[sk] && inCount[sk] && !tapSeen.has(sk)){
+      if(sr>=0 && dmaTileSet.has(sk) && outCount[sk] && inCount[sk] && !tapSeen.has(sk) && !globalTerminals.has(sk)){
         tapSeen.add(sk);
+        const {ox,oy}=dotOffset(p,sc,sr);
         svg.appendChild(svgN('circle',{cx:cx(sc)+ox,cy:cy(sr)+oy,r:'5',
           fill:'#181818',stroke:color,'stroke-width':'2.5'}));
+        // Inward arrow only — tap is a consumer (output node), data flows in.
+        const inEdge=edges.find(e2=>e2[1][0]===sc&&e2[1][1]===sr);
+        if(inEdge){ const [dx,dy]=gridDir(inEdge[0][0],inEdge[0][1],sc,sr); svgArrow(cx(sc)+ox,cy(sr)+oy,dx,dy,color,false,5); }
       }
     });
   });
 
   dmReset();
+  // The SVG was recreated from scratch above, so any live status painted on the
+  // previous DOM is gone — re-apply it from module state.
+  dmPaintStatus();
   dmBuilt=true;
 }
 
@@ -4332,8 +5239,11 @@ function renderChannelLines(ch){
 
 let selEl = null;
 let selBadge = null;
-function select(t, el, ch, badgeEl){
-  if (selEl) selEl.classList.remove('sel');
+function select(t, el, ch, badgeEl, ctrl){
+  if (!ctrl){
+    // plain click: deselect old tile highlight
+    if (selEl) selEl.classList.remove('sel');
+  }
   selEl = el; el.classList.add('sel');
   reportUIState({selected_tile: t.loc,
                  channel: ch ? (ch.direction + ch.channel) : null,
@@ -4348,7 +5258,6 @@ function select(t, el, ch, badgeEl){
   const focused = !!ch;
   // Full-block source: channel-scoped when a channel is focused, else the tile.
   const flo = (focused && ch.low_level) ? ch.low_level : lo;
-  const p = document.getElementById('panel');
 
   // --- title ---
   const title = focused
@@ -4360,24 +5269,55 @@ function select(t, el, ch, badgeEl){
   let hiBody;
   if (focused) {
     const con = ch.contract ? '<div class="contract">'+esc(ch.contract)+'</div>' : '';
-    const sd = ch.flow_balance ? renderFlowBalance(ch.flow_balance) : '';
+    const fb = ch.flow_balance;
+    const bad = fb && fb.balanced === false;
+    const ok  = fb && fb.balanced === true;
+    const statusBar = fb
+      ? '<div class="statusbar '+(bad?'bad':'ok')+'">'+
+          '<span class="sb-icon">'+(bad?'&#9888;':'&#10003;')+'</span>'+
+          '<span>'+(bad?(fb.supply_per_round>fb.demand_per_round?'Over-supply':'Under-supply')+' on flow '+fb.flow_index:'Flow '+fb.flow_index+' balanced')+'</span>'+
+          (fb.supply_per_round!=null?'<span class="sb-detail">'+fb.supply_per_round+'B/round supplied &rarr; '+fb.demand_per_round+'B/round demanded'+(bad?' (Δ '+(fb.supply_per_round-fb.demand_per_round)+'B)':'')+'</span>':'')+
+        '</div>'
+      : '';
     hiBody =
-      '<div class="kv"><b>role:</b> '+esc(hlv.role)+'</div>' +
-      (hlv.kernel?'<div class="kv"><b>kernel:</b> '+esc(hlv.kernel)+'</div>':'') +
-      '<div class="kv"><b>channel:</b> '+ch.direction+ch.channel+' (flow '+ch.flow_index+')</div>' +
-      '<div class="kv"><b>transfer:</b> '+esc(chanSummary(ch))+'</div>' +
-      (sd?'<div class="kv"><b>supply / demand:</b></div>'+sd:'') +
-      (con?'<div class="kv"><b>contract:</b></div>'+con:'');
+      (bad ? statusBar : '') +
+      '<div class="sec"><div class="sec-hdr">Channel</div>' +
+        '<div class="kv"><b>role:</b> '+esc(hlv.role)+'</div>' +
+        (hlv.kernel?'<div class="kv"><b>kernel:</b> '+esc(hlv.kernel)+'</div>':'') +
+        '<div class="kv"><b>channel:</b> '+ch.direction+ch.channel+' &mdash; flow '+ch.flow_index+'</div>' +
+        '<div class="kv"><b>transfer:</b> '+esc(chanSummary(ch))+'</div>' +
+      '</div>' +
+      (con?'<div class="sec"><div class="sec-hdr">Contract</div>'+con+'</div>':'');
   } else {
     const sum = (hlv.summary||[]).map(s=>'<li>'+esc(s)+'</li>').join('');
     const con = (hlv.contracts||[]).map(s=>'<div class="contract">'+esc(s)+'</div>').join('');
+    // Build status bar from tile-level balances
+    const balRows = [];
+    const bseen = {};
+    (t.dma_channels||[]).forEach(c => {
+      const b = c.flow_balance;
+      if (b && !(b.flow_index in bseen)){ bseen[b.flow_index]=1; balRows.push(b); }
+    });
+    balRows.sort((a,b)=>a.flow_index-b.flow_index);
+    const anyBad = balRows.some(b=>b.balanced===false);
+    const allOk  = balRows.length && balRows.every(b=>b.balanced===true);
+    const statusBar = balRows.length
+      ? '<div class="statusbar '+(anyBad?'bad':'ok')+'">'+
+          '<span class="sb-icon">'+(anyBad?'&#9888;':'&#10003;')+'</span>'+
+          '<span>'+(anyBad?'Supply/demand mismatch on '+balRows.filter(b=>b.balanced===false).length+' flow(s)':'All '+balRows.length+' flow(s) balanced')+'</span>'+
+        '</div>'
+      : '';
+    const kmatch = renderKernelMatch(t);
     hiBody =
-      '<div class="kv"><b>role:</b> '+esc(hlv.role)+'</div>' +
-      (hlv.kernel?'<div class="kv"><b>kernel:</b> '+esc(hlv.kernel)+'</div>':'') +
-      '<div class="kv"><b>transfers:</b></div><ul class="sum">'+sum+'</ul>' +
-      renderTileBalances(t) +
-      (con?'<div class="kv"><b>contracts:</b></div>'+con:'') +
-      renderKernelMatch(t);
+      (anyBad ? statusBar : '') +
+      '<div class="sec"><div class="sec-hdr">Tile</div>' +
+        '<div class="kv"><b>role:</b> '+esc(hlv.role)+'</div>' +
+        (hlv.kernel?'<div class="kv"><b>kernel:</b> '+esc(hlv.kernel)+'</div>':'') +
+        '<div class="kv"><b>transfers:</b></div><ul class="sum">'+sum+'</ul>' +
+      '</div>' +
+      (balRows.length?'<div class="sec"><div class="sec-hdr">Supply / Demand</div>'+balRows.map(renderFlowBalance).join('')+'</div>':'') +
+      (con?'<div class="sec"><div class="sec-hdr">Contracts</div>'+con+'</div>':'') +
+      (kmatch?'<div class="sec"><div class="sec-hdr">Kernel &harr; Channel Arguments</div>'+kmatch+'</div>':'');
   }
 
   // --- relevant lines body ---
@@ -4404,19 +5344,22 @@ function select(t, el, ch, badgeEl){
      (tbf && tbf.lines)));
   const kfile = ksrc ? ksrc.file : '';
   const kfileTag = isCore
-    ? ' <span class="kfileref">+ kernel '+esc(kfile)+'</span>' : '';
+    ? ' <span class="kfileref srcref" data-p="'+esc(ksrc.path||'')+'"'
+      +' data-l="'+(ksrc.start_line||'')+'">+ kernel '+esc(kfile)+'</span>' : '';
   const codePathBanner = codeFile
-    ? '<div class="codepath"><b>code piece:</b> <span class="cpath">'+esc(codeFile)+'</span>'+kfileTag+'</div>'
+    ? '<div class="codepath"><b>code piece:</b> <span class="cpath srcref" data-p="'+esc(codeFile)+'"'
+      +' title="open in the source viewer">'+esc(codeFile)+'</span>'+kfileTag+'</div>'
     : (isCore
-       ? '<div class="codepath"><b>kernel:</b> <span class="cpath">'+esc(kfile)+'</span></div>'
+       ? '<div class="codepath"><b>kernel:</b> <span class="cpath srcref" data-p="'
+         +esc((ksrc&&ksrc.path)||'')+'" data-l="'+((ksrc&&ksrc.start_line)||'')+'">'
+         +esc(kfile)+'</span></div>'
        : '');
 
-  p.innerHTML =
-    '<h2>'+title+'</h2>' +
+  const buildTileHtml = () =>
     '<div class="tabs">' +
-      '<span class="tab act" data-t="hi">High level</span>' +
-      '<span class="tab" data-t="mid">Middle (dfschedule)</span>' +
-      '<span class="tab" data-t="lo">Low level (host.cc)</span>' +
+      '<span class="tab act" data-t="hi">Schedule</span>' +
+      '<span class="tab" data-t="mid">IR</span>' +
+      '<span class="tab" data-t="lo">Code</span>' +
     '</div>' +
     '<div class="tabbody">' +
       '<div id="tab-hi">' + hiBody + '</div>' +
@@ -4431,46 +5374,55 @@ function select(t, el, ch, badgeEl){
       '</div>' +
       '<div id="tab-lo" class="hide">' +
         codePathBanner +
-        '<div class="subtabs">' +
-          '<span class="subtab act" data-lo="rel">Relevant only</span>' +
-          '<span class="subtab" data-lo="full">Full block</span>' +
-          (kcodeOn ? '<span class="subtab" data-lo="kern">kernel code</span>' : '') +
-        '</div>' +
-        '<div id="lo-rel">' +
-          '<div class="lref">'+relLabel+'</div>' +
+        '<details class="codesec" open><summary>Relevant lines &mdash; '+relLabel+'</summary>' +
           relBody +
-        '</div>' +
-        '<div id="lo-full" class="hide">' +
-          '<div class="lref">host.cc lines '+ (flo.line_start||'?') +'-'+ (flo.line_end||'?') +
-            '  ('+(flo.ranges||[]).length+' range(s))' +
-            (focused ? ' &mdash; channel '+ch.direction+ch.channel+' scope' : '') + '</div>' +
+        '</details>' +
+        '<details class="codesec"><summary>Full block &mdash; host.cc '+
+          (flo.line_start||'?')+'–'+(flo.line_end||'?')+
+          ' ('+(flo.ranges||[]).length+' range(s))'+
+          (focused?' &mdash; '+ch.direction+ch.channel+' scope':'')+
+        '</summary>' +
           renderFullBlock(flo.code_lines, focused ? ((ch.low_level||{}).params||null) : null) +
-        '</div>' +
-        (kcodeOn ? '<div id="lo-kern" class="hide">'+renderKernelCode(t, ch, focused)+'</div>' : '') +
+        '</details>' +
+        (kcodeOn ? '<details class="codesec"><summary>Kernel code</summary>'+renderKernelCode(t, ch, focused)+'</details>' : '') +
       '</div>' +
     '</div>';
-  const panes = {hi:'#tab-hi', mid:'#tab-mid', lo:'#tab-lo'};
-  p.querySelectorAll('.tab').forEach(tab => tab.onclick = () => {
-    p.querySelectorAll('.tab').forEach(x=>x.classList.remove('act'));
-    tab.classList.add('act');
-    Object.entries(panes).forEach(([k,sel]) =>
-      p.querySelector(sel).classList.toggle('hide', tab.dataset.t!==k));
-    reportUIState({tile_tab: tab.dataset.t});
-  });
-  p.querySelectorAll('.subtab').forEach(st => st.onclick = () => {
-    p.querySelectorAll('.subtab').forEach(x=>x.classList.remove('act'));
-    st.classList.add('act');
-    p.querySelector('#lo-rel').classList.toggle('hide', st.dataset.lo!=='rel');
-    p.querySelector('#lo-full').classList.toggle('hide', st.dataset.lo!=='full');
-    const kp = p.querySelector('#lo-kern');
-    if (kp) kp.classList.toggle('hide', st.dataset.lo!=='kern');
-  });
+
+  const tileKey = panelKey('tile', t.loc[0]+','+t.loc[1]+(ch?'/'+ch.direction+ch.channel:''));
+  const tileLabel = focused
+    ? '('+t.loc[0]+','+t.loc[1]+') '+ch.direction+ch.channel
+    : '('+t.loc[0]+','+t.loc[1]+') '+t.type;
+  const tileLlmCtx = '[context] tile ('+t.loc[0]+','+t.loc[1]+') type:'+t.type
+    +(ch?' ch:'+ch.direction+ch.channel+' flow:'+ch.flow_index:'')
+    +' role:'+(hlv.role||'?')+(hlv.kernel?' kernel:'+hlv.kernel:'');
+
+  if(ctrl){
+    // Ctrl+click: toggle this tile in/out of panelItems
+    if(panelItems.has(tileKey)){ panelRemove(tileKey); return; }
+    panelItems.set(tileKey,{kind:'tile',label:tileLabel,color:null,
+      buildBody:buildTileHtml, wireBody:wireTileExtra.bind(null,t,ch,focused,flo,midIR,kcodeOn),
+      llmCtx:tileLlmCtx});
+    panelActiveKey = tileKey;
+  } else {
+    // Plain click: clear all tile entries, keep nets, add this tile
+    panelItems.forEach((_,k)=>{ if(k.startsWith('tile:')) panelItems.delete(k); });
+    panelItems.set(tileKey,{kind:'tile',label:tileLabel,color:null,
+      buildBody:buildTileHtml, wireBody:wireTileExtra.bind(null,t,ch,focused,flo,midIR,kcodeOn),
+      llmCtx:tileLlmCtx});
+    panelActiveKey = tileKey;
+  }
+  panelSync();
   // Kernel source "Show all" toggle: swap the isolated param code-piece for the
-  // whole function body (with the param's lines highlighted), and back.
-  const kbtn = p.querySelector('.kshowall');
+  // Wire aiegdb console on click (before panelSync so it runs for the active tile)
+  if (LIVE.connected) setConTarget(t, ch);
+}
+
+// Extra DOM wiring for tile body — called by panelRenderBody via item.wireBody(body).
+function wireTileExtra(t, ch, focused, flo, midIR, kcodeOn, body){
+  const kbtn = body.querySelector('.kshowall');
   if (kbtn) {
-    const kpiece = p.querySelector('#kern-piece');
-    const kfull  = p.querySelector('#kern-full');
+    const kpiece = body.querySelector('#kern-piece');
+    const kfull  = body.querySelector('#kern-full');
     kbtn.onclick = () => {
       const showAll = kfull.classList.contains('hide');
       kfull.classList.toggle('hide', !showAll);
@@ -4478,23 +5430,16 @@ function select(t, el, ch, badgeEl){
       kbtn.textContent = showAll ? 'Show piece only' : 'Show all';
     };
   }
-  // Kernel-code sub-tab: make the "//line a-b" fold markers (non-related code,
-  // collapsed by default) clickable to expand/collapse in place.
-  const klo = p.querySelector('#lo-kern');
+  const klo = body.querySelector('#lo-kern');
   if (klo) wireFolds(klo);
 
-  // --- full dfschedule IR (embedded) load/highlight/fold ---
-  // The slice rows carry the ORIGINAL 6_BlueprintToSchedule.mlir line numbers;
-  // reuse them as the highlight set for the full-file view. The button toggles
-  // the SAME window (#midContent) between the slice piece and the full IR (with
-  // non-target runs folded); a second button expands/collapses all folds.
   const midLines = Array.isArray(midIR)
     ? midIR.filter(r => r.line != null).map(r => r.line) : [];
-  const loadBtn    = p.querySelector('#loadFullIr');
-  const foldAllBtn = p.querySelector('#foldAll');
-  const midContent = p.querySelector('#midContent');
+  const loadBtn    = body.querySelector('#loadFullIr');
+  const foldAllBtn = body.querySelector('#foldAll');
+  const midContent = body.querySelector('#midContent');
   if (loadBtn && midContent) {
-    const sliceHtml = midContent.innerHTML;     // cache the slice view
+    const sliceHtml = midContent.innerHTML;
     let showingFull = false;
     const refreshFoldAll = () => {
       if (!foldAllBtn) return;
@@ -4528,16 +5473,6 @@ function select(t, el, ch, badgeEl){
       };
     }
   }
-
-  // --- aiegdb console (only after a passing connection test) ---
-  // Clicking a tile runs `target tile <col> <row>`; a channel click chains
-  // `target channel <dir_ch>` so the console scope follows the UI.
-  if (LIVE.connected) setConTarget(t, ch);
-
-  // --- local-LLM cooperation: prepare (do NOT send) the tile/file location
-  // context for the clicked tile/channel. It is attached to the NEXT user chat
-  // message, and only if it differs from the last one attached (see llmSend). ---
-  setLLMContext(t, ch, codeFile);
 }
 
 // Set LLM context from anywhere; llmSend attaches it to the next message (deduped).
@@ -4557,48 +5492,445 @@ function setLLMContext(t, ch, codeFile){
   LLM.ctx = parts.join('; ');
 }
 
+// ─── multi-item panel (net + tile tabs) ───────────────────────────────────────
+// panelItems: ordered Map of key → {kind:'net'|'tile', label, color, buildBody}
+// panelActiveKey: which item is shown in the body below the tab strip
+const panelItems = new Map();
+let panelActiveKey = null;
+
+function panelKey(kind, id){ return kind+':'+id; }
+
+function panelRenderTabs(){
+  const strip = document.getElementById('panel-itemtabs');
+  strip.innerHTML = '';
+  panelItems.forEach((item, key) => {
+    const tab = document.createElement('span');
+    tab.className = 'pitab' + (key===panelActiveKey?' act':'');
+    if(item.color){
+      const dot = document.createElement('span');
+      dot.className = 'pit-dot';
+      dot.style.background = item.color;
+      tab.appendChild(dot);
+    }
+    tab.appendChild(document.createTextNode(item.label));
+    const x = document.createElement('span');
+    x.className = 'pit-x'; x.textContent = '×';
+    x.onclick = ev => { ev.stopPropagation(); panelRemove(key); };
+    tab.appendChild(x);
+    tab.onclick = () => panelShow(key);
+    strip.appendChild(tab);
+  });
+}
+
+function panelRenderBody(key){
+  const body = document.getElementById('panel-body');
+  const item = panelItems.get(key);
+  if(!item){ body.innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; return; }
+  body.innerHTML = item.buildBody();
+  // wire folder tabs inside body
+  body.querySelectorAll('.tab').forEach(tab=>{
+    tab.onclick=()=>{
+      body.querySelectorAll('.tab').forEach(t=>t.classList.remove('act'));
+      tab.classList.add('act');
+      const tabField = {net:'net_tab', tile:'tile_tab', src:'src_tab'}[item.kind];
+      if (tabField) reportUIState({[tabField]: tab.dataset.t});
+      const id='tab-'+tab.dataset.t;
+      body.querySelectorAll('.tabbody>div').forEach(d=>d.classList.toggle('hide',d.id!==id));
+    };
+  });
+  // wire any extra handlers the item needs
+  if(item.wireBody) item.wireBody(body);
+}
+
+function panelShow(key){
+  panelActiveKey = key;
+  panelRenderTabs();
+  panelRenderBody(key);
+  panelUpdateLLM();
+}
+
+function panelRemove(key){
+  panelItems.delete(key);
+  if(panelActiveKey===key){
+    // activate the last remaining item, or nothing
+    panelActiveKey = panelItems.size ? [...panelItems.keys()].at(-1) : null;
+  }
+  panelRenderTabs();
+  if(panelActiveKey) panelRenderBody(panelActiveKey);
+  else document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>';
+  panelUpdateLLM();
+}
+
+// A device-map tile with no DATA.tiles entry. Without this the pane keeps the
+// PREVIOUS tile's detail on screen, reading as if it belonged to the one just
+// clicked. Nets stay: they are a separate selection.
+function panelClearTiles(note){
+  panelItems.forEach((_,k)=>{ if(k.startsWith('tile:')) panelItems.delete(k); });
+  panelSync();
+  if(!panelItems.size && note)
+    document.getElementById('panel-body').innerHTML =
+      '<div class="placeholder">'+esc(note)+'</div>';
+}
+
+function panelSync(){
+  // After panelItems is mutated, refresh tabs and body (keeping active key if still valid).
+  if(!panelItems.has(panelActiveKey)) panelActiveKey = panelItems.size ? [...panelItems.keys()][0] : null;
+  panelRenderTabs();
+  if(panelActiveKey) panelRenderBody(panelActiveKey);
+  else document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>';
+  panelUpdateLLM();
+}
+
+function panelUpdateLLM(){
+  if(!panelItems.size){ LLM.ctx=null; return; }
+  const parts=[];
+  panelItems.forEach((item,key)=>{
+    const active = key===panelActiveKey;
+    parts.push((active?'[viewing] ':'[also open] ')+item.llmCtx);
+  });
+  LLM.ctx = parts.join(' | ');
+}
+
+// ─── source viewer ────────────────────────────────────────────────────────────
+// Click a source reference anywhere in the UI and the file opens here, in the
+// Info pane, highlighted at that line. Needs the daemon: the page has no way to
+// read a file at file://, so SRC.on gates every entry point.
+const SRC = { on:(location.protocol === 'http:' || location.protocol === 'https:'),
+              idx:null, note:null,
+              // raw citation -> the absolute path the daemon resolved it to.
+              // The panel is keyed on the resolved path, so clicking `graph.cpp`
+              // and later its full path reuses one tab instead of opening two.
+              alias:{} };
+
+function srcNote(msg){
+  const b = document.getElementById('panel-body');
+  if (!b) return;
+  let n = b.querySelector('.srcnote');
+  if (!n){ n = document.createElement('div'); n.className = 'srcnote';
+           b.insertBefore(n, b.firstChild); }
+  n.textContent = msg;
+  clearTimeout(SRC.note);
+  SRC.note = setTimeout(() => n.remove(), 6000);
+}
+// basename -> abspath from DATA, mirroring the daemon's index, so a bare
+// `host.cc` becomes absolute before the fetch instead of round-tripping.
+function srcIndex(){
+  if (SRC.idx) return SRC.idx;
+  const idx = {};
+  const add = p => { if (p && p.charAt(0) === '/' && !idx[p.split('/').pop()])
+                       idx[p.split('/').pop()] = p; };
+  const s = DATA.source || {};
+  add(s.host_cc); add(s.provenance);
+  ['kernel','bcf','dfschedule_ir'].forEach(k => {
+    const sub = DATA[k] || {}; add(sub.path); add((sub.source||{}).path); });
+  (DATA.tiles || []).forEach(t => {
+    add(t.code_file);
+    (t.dma_channels || []).forEach(c => add(c.code_file)); });
+  SRC.idx = idx;
+  return idx;
+}
+function srcParseRef(raw){
+  let s = (raw || '').trim().replace(/^[`'"(\[]+/, '').replace(/[`'")\],.;:]+$/, '');
+  if (!s) return null;
+  let line = null, endLine = null;
+  // file:line, file:line:col, file:line-line2 (hyphen or en dash)
+  const m = s.match(/^(.*?):(\d+)(?:\s*[-\u2013]\s*(\d+)|:\d+)?$/);
+  if (m){ s = m[1]; line = +m[2]; if (m[3]) endLine = +m[3]; }
+  if (s.indexOf('?') >= 0 || s.indexOf('<') >= 0) return null;   // ??, <unknown>
+  if (s.indexOf('.') < 0 && s.indexOf('/') < 0) return null;
+  if (s.slice(0,2) === './') s = s.slice(2);
+  if (s.charAt(0) !== '/' && s.indexOf('/') < 0){
+    const hit = srcIndex()[s];
+    if (hit) s = hit;
+  }
+  return {path:s, line:line, endLine:endLine};
+}
+function srcInjectCss(r){
+  if (!r.css) return;
+  let el = document.getElementById('pygstyle');
+  if (!el){ el = document.createElement('style'); el.id = 'pygstyle';
+            document.head.appendChild(el); }
+  if (el.dataset.ver !== r.css_ver){ el.textContent = r.css; el.dataset.ver = r.css_ver; }
+}
+function srcBuildBody(item){
+  const m = item.meta;
+  const win = m.truncated
+    ? ' &middot; showing '+m.first+'–'+m.last+' of '+m.lines
+    : ' &middot; '+m.lines+' lines';
+  return '<div class="codepath srcbanner">'
+     + '<b>' + esc(m.display) + '</b> <span class="cpath">' + esc(m.path) + '</span>'
+     + '<span class="srcmeta">' + esc(m.lang) + win + '</span>'
+     + (m.truncated ? '<button class="srcmore" data-dir="up">▲</button>'
+                    + '<button class="srcmore" data-dir="down">▼</button>' : '')
+     + '</div><div class="srcwrap">' + m.html + '</div>';
+}
+function srcWireBody(item, body){
+  const panel = document.getElementById('panel');
+  let row = null;
+  if (item.line){
+    for (let n = item.line; n <= (item.endLine || item.line); n++){
+      const el = body.querySelector('#SL-' + n);
+      if (!el) continue;
+      el.classList.add('hlline');
+      if (!row) row = el;
+    }
+  }
+  // Not scrollIntoView (it walks ancestors and would move the outer flex column
+  // and the page), and not offsetTop either: #panel is position:static, so
+  // offsetParent is <body> and offsetTop measures from the top of the document.
+  // Rect deltas are correct whatever the offsetParent turns out to be.
+  if (panel){
+    if (row && item.scrollTop == null){
+      const pr = panel.getBoundingClientRect(), rr = row.getBoundingClientRect();
+      panel.scrollTop += (rr.top - pr.top) - (panel.clientHeight - rr.height) / 2;
+    } else if (item.scrollTop != null){
+      panel.scrollTop = item.scrollTop;
+    }
+    panel.onscroll = () => { item.scrollTop = panel.scrollTop; };
+  }
+  body.querySelectorAll('.srcmore').forEach(b => b.onclick = () => {
+    const step = (b.dataset.dir === 'up') ? -400 : 400;
+    srcOpen(item.path, item.line, {first:Math.max(1, item.meta.first + step),
+                                   last:item.meta.last + step});
+  });
+}
+function srcOpen(rawPath, line, span, endLine){
+  const ref = srcParseRef(rawPath);
+  if (!ref) return;
+  if (line == null) line = ref.line;
+  if (endLine == null) endLine = ref.endLine;
+  if (endLine && line && endLine < line){ const t = line; line = endLine; endLine = t; }
+  const tag = line ? (':' + line + (endLine ? '-' + endLine : '')) : '';
+  if (!SRC.on){ srcNote('source viewer needs the debug daemon'); return; }
+  const key = panelKey('src', SRC.alias[ref.path] || ref.path);
+  const open = panelItems.get(key);
+  // Already open and the window covers the line: no fetch, just re-highlight.
+  if (open && !span && (!line || (line >= open.meta.first && line <= open.meta.last))){
+    open.line = line || open.line;
+    open.endLine = endLine;
+    open.scrollTop = null;
+    open.label = open.meta.display + tag;
+    panelActiveKey = key; panelSync();
+    reportUIState({source:{path:ref.path, line:open.line}});
+    return;
+  }
+  let qs = '/source?path=' + encodeURIComponent(ref.path);
+  if (line) qs += '&line=' + line;
+  if (span) qs += '&first=' + span.first + '&last=' + span.last;
+  api(qs).then(r => {
+    if (!r || r.error){ srcNote(('cannot open ' + ref.path.split('/').pop() + ': ')
+                                + ((r && r.error) || 'unknown')); return; }
+    srcInjectCss(r);
+    SRC.alias[ref.path] = r.path;
+    const rkey = panelKey('src', r.path);
+    const item = {
+      kind:'src', label:r.display + tag, color:null,
+      path:r.path, line:line, endLine:endLine, meta:r, scrollTop:null,
+      buildBody:() => srcBuildBody(item),
+      wireBody:(el) => srcWireBody(item, el),
+      llmCtx:'[context] source ' + r.rel + tag
+    };
+    panelItems.set(rkey, item);
+    panelActiveKey = rkey;
+    panelSync();
+    reportUIState({source:{path:r.path, line:line}});
+  }).catch(() => srcNote('daemon offline: cannot open source'));
+}
+// Shared by every click delegate: never hijack a link, and never fire when the
+// user is drag-selecting text for "+ Add context".
+function srcClickOk(e){
+  if (e.target.closest && e.target.closest('a')) return false;
+  const s = window.getSelection();
+  return !(s && String(s).trim());
+}
+document.getElementById('llmmsg').addEventListener('click', e => {
+  if (!srcClickOk(e)) return;
+  const r = e.target.closest && e.target.closest('.srcref');
+  if (!r || !r.dataset.p) return;
+  srcOpen(r.dataset.p, r.dataset.l ? +r.dataset.l : null, null,
+          r.dataset.l2 ? +r.dataset.l2 : null);
+});
+// conRender keeps classified lines as textContent so "+ Add context" copies
+// aiegdb verbatim; re-parse on click rather than switching it to innerHTML.
+document.getElementById('conout').addEventListener('click', e => {
+  if (!srcClickOk(e)) return;
+  const ln = e.target.closest && e.target.closest('.con-ln.con-src');
+  if (!ln) return;
+  const m = ln.textContent.match(/->\s*(\S+):(\d+)/);
+  if (m) srcOpen(m[1], +m[2]);
+});
+document.getElementById('panel-body').addEventListener('click', e => {
+  if (!srcClickOk(e)) return;
+  const r = e.target.closest && e.target.closest('.srcref');
+  if (!r || !r.dataset.p) return;
+  e.stopPropagation();          // a srcref inside <summary> must not fold it
+  srcOpen(r.dataset.p, r.dataset.l ? +r.dataset.l : null, null,
+          r.dataset.l2 ? +r.dataset.l2 : null);
+});
+
 // ─── aiegdb console (right-bottom, drives aiegdb.py --server) ─────────────────
 // A terminal-style console over the daemon's persistent aiegdb REPL subprocess.
 // The user types any aiegdb command; scope (partition->tile->channel) is kept by
 // the subprocess and reported back via r.scope. Tile/channel clicks send
 // `target ...` so the console follows the UI. "Reload aiegdb.py" respawns the
 // subprocess (reloads edited code), resetting to partition scope.
-const CON = { scope:'partition' };
-function conAppend(text){
+const CON = { scope:'partition', hist:[], histIdx:-1, draft:'', spec:GDBSPEC_STATIC };
+// A live spec beats the baked-in copy (the daemon may be running an edited
+// aiegdb.py); the static one keeps autocomplete working with no daemon at all.
+function conLoadSpec(){
+  api('/aiegdb/spec').then(r => { if (r && r.spec) CON.spec = r.spec; })
+                     .catch(() => {});   // static fallback already in place
+}
+if (location.protocol === 'http:' || location.protocol === 'https:') conLoadSpec();
+
+// Bare scope level from the decorated prompt breadcrumb, e.g.
+// 'partition(startcol=3)/tile(0,0)/mm2s0' -> 'channel'. This is the COMMAND_SPEC key.
+function conScopeLevel(){
+  const depth = ((CON.scope || '').match(/\//g) || []).length;
+  return depth >= 2 ? 'channel' : depth === 1 ? 'tile' : 'partition';
+}
+
+// ─── output colorizing ───────────────────────────────────────────────────────
+// Matched in order against one plain-text line; first hit wins. A table rather
+// than an if-chain so a new aiegdb output shape is a one-line addition.
+const CON_RULES = [
+  [/^scope ->/,                                     'con-scope'],
+  [/^(partition|tile|channel) scope commands/,      'con-hdr'],
+  [/^(Navigation|Channel scope|Tile scope|Partition scope|Universal)/, 'con-hdr'],
+  // dry-run echoes are scaffolding, not results — dim them before anything else
+  // gets a chance to color them by keyword.
+  [/^\s*\[dry-run\]/,                               'con-dim'],
+  // failures must win over the generic key:value shape below
+  [/^\s*(error|Error|ERROR)\b/,                     'con-bad'],
+  [/^\s*(usage|warning|WARN)\b/,                    'con-warn'],
+  [/\[aiegdb:/,                                     'con-bad'],
+  [/\b(STALLED?|FAULT|TIMEOUT|not found|failed)\b/, 'con-bad'],
+  // INTRUSIVE only ever appears as a caution in a help listing, so it is a
+  // warning rather than an error.
+  [/\bINTRUSIVE\b/,                                 'con-warn'],
+  [/\b(OK|PASS|DONE|RUNNING|ready|enabled)\b/,      'con-ok'],
+  [/->\s*\S+:\d+/,                                  'con-src'],   // PC -> file:line
+];
+function conClassify(line){
+  for (const r of CON_RULES) if (r[0].test(line)) return r[1];
+  return null;
+}
+// Inline spans for lines with no whole-line class: hex literals, and the
+// "  key : value" shape aiediag's decoders print.
+function conInline(escaped){
+  let s = escaped.replace(/\b(0x[0-9A-Fa-f]+)\b/g, '<span class="con-hex">$1</span>');
+  // Leading indent is optional: `where` prints "scope:     ..." at column 0
+  // while the decoders indent their key/value rows by two.
+  return s.replace(/^(\s*)([A-Za-z_][\w .\/-]*?)(\s*:\s)/,
+                   (m, ind, k, sep) => ind + '<span class="con-key">' + k + sep + '</span>');
+}
+// Render aiegdb text into `body`, folding the "[registers read] { ... }" appendix
+// into a <details>: run_line appends it after nearly every decoded command and it
+// is the single biggest source of the crowding this rework is fixing.
+function conRender(body, text){
+  let reg = null;
+  (text || '').split('\n').forEach(line => {
+    if (/^\s*\[registers read\]\s*\{\s*$/.test(line)){
+      reg = document.createElement('details');
+      reg.className = 'con-reg';
+      const sum = document.createElement('summary');
+      sum.textContent = 'registers read';
+      reg.appendChild(sum);
+      body.appendChild(reg);
+      return;
+    }
+    if (reg && /^\s*\}\s*$/.test(line)){ reg = null; return; }
+    const div = document.createElement('div');
+    div.className = 'con-ln';
+    const cls = conClassify(line);
+    // textContent (not innerHTML) on classified lines keeps the "+ Add context"
+    // selection copying exactly what aiegdb printed.
+    if (cls){ div.classList.add(cls); div.textContent = line; }
+    else div.innerHTML = conInline(esc(line));
+    (reg || body).appendChild(div);
+  });
+}
+// One foldable block per command; returns its .con-body for conRender to fill.
+function conBlock(cmd){
   const out = document.getElementById('conout');
-  if (!out) return;
-  out.textContent += (out.textContent && !out.textContent.endsWith('\n') ? '\n' : '') + text;
-  out.scrollTop = out.scrollHeight;
+  if (!out) return null;
+  if (!out.querySelector('.con-blk')) out.innerHTML = '';   // drop placeholder
+  const blk = document.createElement('div');
+  blk.className = 'con-blk';
+  const echo = document.createElement('div');
+  echo.className = 'con-echo';
+  echo.innerHTML = '<span class="cf">▾</span>' +
+                   '<span class="cs">' + esc(CON.scope) + '&gt;</span>' +
+                   '<span class="cc">' + esc(cmd) + '</span>';
+  echo.onclick = () => {
+    const folded = blk.classList.toggle('fold');
+    echo.querySelector('.cf').textContent = folded ? '▸' : '▾';
+  };
+  const body = document.createElement('div');
+  body.className = 'con-body';
+  blk.appendChild(echo); blk.appendChild(body);
+  out.appendChild(blk);
+  return body;
+}
+function conScroll(){
+  const out = document.getElementById('conout');
+  if (out) out.scrollTop = out.scrollHeight;
+}
+// Only auto-scroll when already near the bottom, so the pane stops yanking the
+// view away while the user is reading scrollback.
+function conNearBottom(){
+  const out = document.getElementById('conout');
+  return !out || (out.scrollHeight - out.scrollTop - out.clientHeight) < 60;
+}
+// Retained for the few non-command notices ([reloaded aiegdb.py], daemon offline).
+function conAppend(text){
+  const body = conBlock('');
+  if (!body) return;
+  body.parentNode.querySelector('.con-echo').style.display = 'none';
+  conRender(body, text);
+  conScroll();
 }
 function conSetScope(s){
   CON.scope = s || 'partition';
   const tgt = document.getElementById('contarget');
-  if (tgt) tgt.textContent = CON.scope;
+  // The header ellipsizes a long breadcrumb, so keep the full text on hover.
+  if (tgt){ tgt.textContent = CON.scope; tgt.title = CON.scope; }
   const pr = document.getElementById('conprompt');
   if (pr) pr.textContent = CON.scope + '>';
-}
-function conSetLast(cmd, res){
-  const c = document.getElementById('conlastcmd');
-  const r = document.getElementById('conlastres');
-  if (c) c.textContent = CON.scope + '> ' + cmd;
-  if (r) r.textContent = res == null ? '' : (' \u2192 ' + res);
 }
 // applyScope=false lets a caller keep an already-set (optimistic) scope instead
 // of adopting this command's returned r.scope — used for the intermediate
 // `target tile` step of a channel selection so it doesn't downgrade the prompt.
 function conSend(cmd, echo, applyScope){
-  if (echo !== false) conAppend(CON.scope + '> ' + cmd);
-  conSetLast(cmd, null);
+  // setConTarget probes with an empty command purely to spawn aiegdb and learn
+  // the scope — that must not emit an empty block.
+  const body = (echo !== false && cmd) ? conBlock(cmd) : null;
+  const stick = conNearBottom();
+  if (body) conScroll();
   return api('/aiegdb', {method:'POST', headers:{'Content-Type':'application/json'},
                          body: JSON.stringify({cmd:cmd})})
     .then(r => {
       const out = r.output ? r.output.replace(/\n+$/,'') : '';
-      if (out) conAppend(out);
+      if (body){
+        if (out) conRender(body, out);
+        else { const d = document.createElement('div');
+               d.className = 'con-ln con-dim'; d.textContent = '(no output)';
+               body.appendChild(d); }
+        if (/^\s*error/im.test(out)) body.parentNode.classList.add('err');
+      } else if (out) conAppend(out);
       if (applyScope !== false && r.scope) conSetScope(r.scope);
-      conSetLast(cmd, out || '(no output)');
+      if (stick) conScroll();
     })
-    .catch(() => { conAppend('daemon offline (static mode)');
-                   conSetLast(cmd, 'daemon offline (static mode)'); });
+    .catch(() => {
+      if (body){
+        const d = document.createElement('div');
+        d.className = 'con-ln con-bad';
+        d.textContent = 'daemon offline (static mode)';
+        body.appendChild(d);
+        body.parentNode.classList.add('err');
+      } else conAppend('daemon offline (static mode)');
+      if (stick) conScroll();
+    });
 }
 // Tile/channel click: run `target tile c r`, then chain `target channel dir_ch`.
 // The prompt is updated optimistically from the UI selection first, so the
@@ -4624,10 +5956,390 @@ function setConTarget(t, ch){
   if (ch) p.then(() => conSend('target channel ' +
                                ch.direction.toLowerCase() + ch.channel));
 }
-document.getElementById('conin').addEventListener('keydown', e => {
-  if (e.key === 'Enter'){ const v = e.target.value.trim();
-    if (v){ conSend(v); e.target.value=''; } }
+// ─── autocomplete ────────────────────────────────────────────────────────────
+// Candidates = the current scope's commands plus the universal ones, drawn from
+// COMMAND_SPEC so they can never drift from what aiegdb actually dispatches.
+function conCandidates(){
+  const sp = CON.spec;
+  if (!sp) return [];
+  const lvl = conScopeLevel();
+  const out = [];
+  (sp[lvl] || []).forEach(c => out.push(Object.assign({scope:lvl}, c)));
+  (sp.universal || []).forEach(c => out.push(Object.assign({scope:'any'}, c)));
+  return out;
+}
+// Match on the command name and its aliases; a typed alias shows the canonical
+// name so the user learns it. Prefix hits rank above substring hits.
+function conMatch(q){
+  const s = q.trim().toLowerCase();
+  const hits = [];
+  conCandidates().forEach(c => {
+    const names = [c.name].concat(c.aliases || []);
+    let best = -1;
+    names.forEach(n => {
+      const ln = n.toLowerCase();
+      if (ln.indexOf(s) === 0){ best = Math.max(best, 2); return; }
+      // Word-prefix, not bare substring: typing "d" should offer "dma counter",
+      // not "reg read" merely because it contains a d.
+      if (ln.split(/[ _-]+/).some(w => w.indexOf(s) === 0)) best = Math.max(best, 1);
+    });
+    if (!s || best >= 0) hits.push({c:c, rank: s ? best : 2});
+  });
+  // Stable within a rank, so the spec's own ordering (most-used first) survives.
+  hits.sort((a, b) => b.rank - a.rank);
+  return hits.map(h => h.c);
+}
+// ─── argument completion ─────────────────────────────────────────────────────
+// A template like "<scope> <register>" says nothing about what to actually type.
+// Two sources fill that in: aiedbg's own per-argument help (lazily fetched), and
+// — better where it applies — the loaded design itself, which knows exactly which
+// tiles and channels exist.
+const ARGH = {};                       // command name -> [{name,desc,values}]
+function conArgHelp(name, cb){
+  if (ARGH[name]){ cb(ARGH[name]); return; }
+  api('/aiegdb/arghelp?cmd=' + encodeURIComponent(name))
+    .then(r => { ARGH[name] = (r && r.args) || []; cb(ARGH[name]); })
+    .catch(() => { ARGH[name] = []; cb([]); });   // offline: no arg values
+}
+function conCurTile(){
+  const m = /tile\((\d+),(\d+)\)/.exec(CON.scope || '');
+  return m ? [+m[1], +m[2]] : null;
+}
+// Values drawn from DATA — the tiles/channels this app actually has, which beats
+// anything aiedbg's generic help can offer.
+function conDesignValues(cmd, idx, typed){
+  const tiles = (DATA && DATA.tiles) || [];
+  if (cmd === 'target tile' || cmd === 'tile'){
+    if (idx === 0){
+      const cols = [...new Set(tiles.map(t => t.loc[0]))].sort((a, b) => a - b);
+      return cols.map(c => ({ v:String(c), d:'column — ' +
+        tiles.filter(t => t.loc[0] === c).length + ' tile(s)' }));
+    }
+    if (idx === 1){
+      const col = parseInt((typed || '').trim().split(/\s+/)[0], 10);
+      return tiles.filter(t => isNaN(col) || t.loc[0] === col)
+        .sort((a, b) => a.loc[1] - b.loc[1])
+        .map(t => ({ v:String(t.loc[1]), d:t.type +
+          (t.high_level && t.high_level.role ? ' — ' + t.high_level.role : '') }));
+    }
+  }
+  if (cmd === 'target channel' || cmd === 'channel' || cmd === 'dma'){
+    if (idx !== 0) return null;
+    const loc = conCurTile();
+    if (!loc) return null;
+    const t = tiles.find(x => x.loc[0] === loc[0] && x.loc[1] === loc[1]);
+    if (!t) return null;
+    return (t.dma_channels || []).map(ch => ({
+      v: ch.direction.toLowerCase() + ch.channel,
+      d: 'flow ' + ch.flow_index + (ch.contract ? ' — ' + ch.contract : '') }));
+  }
+  return null;
+}
+// Split "reg lookup shi" into {cmd:'reg lookup', idx:0, partial:'shi'} — i.e.
+// which argument is being typed right now. Returns null when the text is still
+// a command name.
+function conArgContext(q){
+  let best = null;
+  conCandidates().forEach(c => {
+    if (!c.args) return;
+    [c.name].concat(c.aliases || []).forEach(n => {
+      if (q.toLowerCase().startsWith(n.toLowerCase() + ' ') &&
+          (!best || n.length > best.n.length)) best = { c:c, n:n };
+    });
+  });
+  if (!best) return null;
+  const rest = q.slice(best.n.length).replace(/^\s+/, '');
+  // Tokenise the TRIMMED text: "shim " would otherwise split to ["shim",""] and
+  // report the next argument index one too high.
+  const trimmed = rest.trim();
+  const toks = trimmed.length ? trimmed.split(/\s+/) : [];
+  const trailing = /\s$/.test(q) || rest.length === 0;
+  return { cmd: best.c.name, spec: best.c, rest: rest,
+           idx: trailing ? toks.length : toks.length - 1,
+           partial: trailing ? '' : (toks[toks.length - 1] || '') };
+}
+
+const SUG = { open:false, idx:0, items:[], mode:'cmd', ctx:null };
+function conSugHide(){
+  SUG.open = false; SUG.items = []; SUG.idx = 0;
+  const el = document.getElementById('consug');
+  if (el) el.classList.add('hide');
+}
+// Anchor the fixed-position popup to the input. Prefers dropping below (the
+// prompt sits at the TOP of the console box), flipping above only when the
+// viewport bottom would cut it off.
+function conSugPlace(){
+  const el = document.getElementById('consug');
+  const inp = document.getElementById('conin');
+  if (!el || !inp) return;
+  const r = inp.getBoundingClientRect();
+  const line = document.getElementById('conpromptline').getBoundingClientRect();
+  el.style.left  = line.left + 'px';
+  el.style.width = line.width + 'px';
+  const below = window.innerHeight - r.bottom;
+  const h = Math.min(el.scrollHeight || 190, 190);
+  if (below < h + 12 && r.top > h + 12) el.style.top = (r.top - h - 6) + 'px';
+  else el.style.top = (r.bottom + 6) + 'px';
+}
+function conSugRender(){
+  const el = document.getElementById('consug');
+  if (!el) return;
+  if (!SUG.items.length){ conSugHide(); return; }
+  el.innerHTML = '';
+  SUG.items.forEach((c, i) => {
+    const row = document.createElement('div');
+    row.className = 'con-sug' + (i === SUG.idx && !c.hint ? ' act' : '') +
+                    (c.blocking ? ' blocked' : '') + (c.hint ? ' hintrow' : '');
+    if (c.blocking) row.title = 'Live aiedbg view — never exits, so it cannot run '
+                             + 'in this console. Run it in a terminal instead.';
+    row.innerHTML =
+      '<span class="sname">' + esc(c.name) + '</span>' +
+      (c.args ? '<span class="sargs">' + esc(c.args) + '</span>' : '') +
+      (c.intrusive ? '<span class="swrite">WRITES HW</span>' : '') +
+      (c.blocking ? '<span class="sblock">NOT HERE</span>' : '') +
+      (c.slow && !c.blocking ? '<span class="sslow">SLOW</span>' : '') +
+      (c.scope === 'any' ? '<span class="sscope">any</span>' : '') +
+      '<span class="ssum">' + esc(c.summary) + '</span>';
+    // mousedown, not click: the input's blur would tear the popup down first.
+    row.onmousedown = ev => { ev.preventDefault(); conSugAccept(i); };
+    el.appendChild(row);
+  });
+  el.classList.remove('hide');
+  SUG.open = true;
+  conSugPlace();
+  const act = el.querySelector('.con-sug.act');
+  if (act) act.scrollIntoView({block:'nearest'});
+}
+function conSugShow(q){
+  const ctx = conArgContext(q);
+  if (ctx){ conSugShowArgs(q, ctx); return; }
+  SUG.mode = 'cmd'; SUG.ctx = null;
+  SUG.items = conMatch(q).slice(0, 40);
+  SUG.idx = 0;
+  conSugRender();
+}
+// Offer values for the argument being typed: the design's own tiles/channels
+// where we have them, otherwise aiedbg's documented choices. When neither
+// enumerates, still show the argument's description — knowing "nwords: number of
+// 32-bit words to read (1-256)" beats staring at "<nwords>".
+function conSugShowArgs(q, ctx){
+  SUG.mode = 'arg'; SUG.ctx = ctx; SUG.idx = 0;
+  const emit = rows => {
+    const p = (ctx.partial || '').toLowerCase();
+    SUG.items = rows.filter(r => !p || r.name.toLowerCase().startsWith(p)).slice(0, 40);
+    conSugRender();
+  };
+  const design = conDesignValues(ctx.cmd, ctx.idx, ctx.rest);
+  if (design && design.length){
+    emit(design.map(d => ({ name:d.v, summary:d.d, args:'', argvalue:true })));
+    return;
+  }
+  conArgHelp(ctx.cmd, list => {
+    // aiedbg still lists col/row for commands where aiegdb injects them.
+    const a = list[ctx.idx + (ctx.spec.coord_skip || 0)];
+    if (!a){ conSugHide(); return; }
+    if (a.values && a.values.length){
+      emit(a.values.map(v => ({ name:v, summary:a.desc, args:'', argvalue:true })));
+      return;
+    }
+    // Not enumerable — one informational row, not a completion.
+    SUG.items = [{ name:a.name, summary:a.desc, args:'', hint:true }];
+    conSugRender();
+  });
+}
+// Accept = fill in the command name and leave the caret ready for its args,
+// rather than running it — the user still confirms with Enter.
+function conSugAccept(i){
+  const c = SUG.items[i];
+  if (!c || c.hint) return;              // informational row, nothing to insert
+  const inp = document.getElementById('conin');
+  if (c.argvalue){
+    // Replace only the partial token being typed, keeping the command and any
+    // earlier arguments intact.
+    const cut = inp.value.length - (SUG.ctx ? (SUG.ctx.partial || '').length : 0);
+    inp.value = inp.value.slice(0, cut) + c.name + ' ';
+  } else {
+    inp.value = c.name + (c.args ? ' ' : '');
+  }
+  conSugHide();
+  inp.focus();
+  // Chain straight into the next argument's values.
+  conSugShow(inp.value);
+}
+function conRun(cmd){
+  const v = (cmd || '').trim();
+  if (!v) return;
+  CON.hist.push(v);
+  if (CON.hist.length > 200) CON.hist.shift();
+  CON.histIdx = -1;
+  conSend(v);
+}
+const conin = document.getElementById('conin');
+conin.addEventListener('input', e => {
+  // Match the WHOLE input as a command prefix rather than stopping at the first
+  // space: plenty of commands are multi-word ("scan dma", "reg write",
+  // "dma counter setup"), so typing "scan " must still offer its completions.
+  // Once the text stops being a prefix of anything — i.e. real arguments are
+  // being typed, like "reg read 0x1DF10" — conMatch returns nothing and the
+  // popup closes on its own.
+  conSugShow(e.target.value);
 });
+conin.addEventListener('blur', () => setTimeout(conSugHide, 120));
+// The popup is viewport-anchored, so it has to follow layout changes.
+window.addEventListener('resize', () => { if (SUG.open) conSugPlace(); });
+conin.addEventListener('keydown', e => {
+  if (e.key === 'Escape'){ conSugHide(); return; }
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp'){
+    const dir = e.key === 'ArrowDown' ? 1 : -1;
+    if (SUG.open){
+      e.preventDefault();
+      SUG.idx = (SUG.idx + dir + SUG.items.length) % SUG.items.length;
+      conSugRender();
+      return;
+    }
+    // Popup closed: Up/Down walk command history instead.
+    if (!CON.hist.length) return;
+    e.preventDefault();
+    if (CON.histIdx === -1){
+      if (dir === -1){ CON.draft = e.target.value; CON.histIdx = CON.hist.length - 1; }
+      else return;
+    } else {
+      CON.histIdx += dir;
+      if (CON.histIdx >= CON.hist.length){ CON.histIdx = -1; e.target.value = CON.draft; return; }
+      if (CON.histIdx < 0) CON.histIdx = 0;
+    }
+    e.target.value = CON.hist[CON.histIdx];
+    return;
+  }
+  if (e.key === 'Tab'){
+    if (SUG.open){ e.preventDefault(); conSugAccept(SUG.idx); }
+    return;
+  }
+  if (e.key === 'Enter'){
+    const typed = e.target.value.trim().toLowerCase();
+    const exact = conCandidates().some(c => [c.name].concat(c.aliases || [])
+      .some(n => n.toLowerCase() === typed));
+    // Completing a partial command fills the input rather than running it —
+    // "scan " must not silently fire "scan dma" (an array-wide, slow read the
+    // user may not have meant). A second Enter then runs the completed command.
+    // An exact command, or text the spec doesn't know (aiedbg passthrough,
+    // or a command plus its arguments), runs immediately.
+    // Fill rather than run when completing a COMMAND name, or when the user has
+    // deliberately arrowed onto a suggestion. While typing ARGUMENTS, Enter runs
+    // what was typed — argument values are freeform, so silently substituting
+    // the top row would be wrong.
+    const sel = SUG.items[SUG.idx];
+    if (SUG.open && sel && !sel.hint &&
+        (SUG.idx > 0 || (SUG.mode === 'cmd' && !exact))){
+      e.preventDefault();
+      conSugAccept(SUG.idx);
+      return;
+    }
+    conSugHide();
+    conRun(e.target.value);
+    e.target.value = '';
+  }
+});
+
+// ─── command palette (the "⌘ Commands" button) ───────────────────────────────
+// Replaces the old fixed quick-command row: every command for the current scope,
+// searchable, with the same spec-derived metadata the autocomplete uses.
+const PAL = { open:false };
+function conPalRender(){
+  const list = document.getElementById('conpallist');
+  const q = (document.getElementById('conpalq').value || '').trim().toLowerCase();
+  const items = conMatch(q);
+  list.innerHTML = '';
+  let lastScope = null;
+  if (!items.length){
+    list.innerHTML = '<div class="con-palgrp">no match</div>';
+    return;
+  }
+  items.forEach(c => {
+    if (c.scope !== lastScope){
+      lastScope = c.scope;
+      const g2 = document.createElement('div');
+      g2.className = 'con-palgrp';
+      g2.textContent = c.scope === 'any' ? 'universal' : (c.scope + ' scope');
+      list.appendChild(g2);
+    }
+    const row = document.createElement('div');
+    row.className = 'con-sug' + (c.blocking ? ' blocked' : '');
+    row.innerHTML =
+      '<span class="sname">' + esc(c.name) + '</span>' +
+      (c.args ? '<span class="sargs">' + esc(c.args) + '</span>' : '') +
+      (c.intrusive ? '<span class="swrite">WRITES HW</span>' : '') +
+      (c.blocking ? '<span class="sblock">NOT HERE</span>' : '') +
+      (c.slow && !c.blocking ? '<span class="sslow">SLOW</span>' : '') +
+      '<span class="ssum">' + esc(c.summary) + '</span>';
+    row.onclick = () => {
+      conPalClose();
+      const inp = document.getElementById('conin');
+      // A live TUI view can never run here — staging it in the prompt would just
+      // invite the user to hit Enter and hang the console, so explain instead.
+      if (c.blocking){
+        const body = conBlock(c.name);
+        if (body) conRender(body,
+          'error: ' + c.name + ' is a live aiedbg view that never exits, so it '
+          + 'cannot run in this console.\n'
+          + '  Run it in a terminal:  aiedbg -d <device> ' + c.name + '\n'
+          + '  For a live view here, use the grid overlay above.');
+        conScroll();
+        return;
+      }
+      // Commands needing args are staged for editing; complete ones just run.
+      if (c.args){ inp.value = c.name + ' '; inp.focus(); }
+      else conRun(c.name);
+    };
+    list.appendChild(row);
+  });
+}
+function conPalOpen(){
+  const pal = document.getElementById('conpal');
+  const btn = document.getElementById('conpalbtn');
+  const r = btn.getBoundingClientRect();
+  pal.classList.remove('hide');
+  // Anchor under the button, clamped to the viewport.
+  pal.style.left = Math.max(6, Math.min(r.left, window.innerWidth - 348)) + 'px';
+  pal.style.top  = (r.bottom + 4) + 'px';
+  const q = document.getElementById('conpalq');
+  q.value = ''; conPalRender(); q.focus();
+  PAL.open = true;
+}
+function conPalClose(){
+  document.getElementById('conpal').classList.add('hide');
+  PAL.open = false;
+}
+document.getElementById('conpalbtn').onclick = ev => {
+  ev.stopPropagation();
+  PAL.open ? conPalClose() : conPalOpen();
+};
+document.getElementById('conpalq').addEventListener('input', conPalRender);
+document.getElementById('conpalq').addEventListener('keydown', e => {
+  if (e.key === 'Escape') conPalClose();
+  if (e.key === 'Enter'){
+    const first = document.querySelector('#conpallist .con-sug');
+    if (first) first.click();
+  }
+});
+document.addEventListener('mousedown', e => {
+  if (PAL.open && !e.target.closest('#conpal') && !e.target.closest('#conpalbtn'))
+    conPalClose();
+});
+document.getElementById('confoldall').onclick = () => {
+  const blks = document.querySelectorAll('#conout .con-blk');
+  // Mixed state folds everything; all-folded unfolds.
+  const anyOpen = [...blks].some(b => !b.classList.contains('fold'));
+  blks.forEach(b => {
+    b.classList.toggle('fold', anyOpen);
+    const cf = b.querySelector('.cf');
+    if (cf) cf.textContent = anyOpen ? '▸' : '▾';
+  });
+};
+document.getElementById('conclear').onclick = () => {
+  document.getElementById('conout').innerHTML =
+    '<div class="con-ln con-dim">(cleared)</div>';
+};
 // Clicking anywhere in the terminal focuses the inline prompt, but don't
 // steal focus mid-drag while the user is selecting text in the output.
 document.getElementById('conterm').onclick = () => {
@@ -4651,19 +6363,81 @@ let llmMsgIdCtr = 0;
 function llmEscape(s){
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+function llmAttr(s){ return llmEscape(s).replace(/"/g,'&quot;'); }
+// Args may embed ']' (a JSON list), so take the LAST ']' on the line; the name
+// stops at whitespace or '{' so `name{...}` parses the same as `name {...}`.
+const LLM_TOOL_CALL = /^\[tool:\s*([^\s\]{]+)\s*(.*)\]$/;
+const LLM_TOOL_RES  = /^\[tool result(?::\s*(.*))?\]$/;
+const LLM_ACRONYM = {aie:'AIE', dma:'DMA', bd:'BD', pc:'PC', ir:'IR', elf:'ELF',
+  gmio:'GMIO', ui:'UI', llm:'LLM', ipc:'IPC', mcp:'MCP', json:'JSON', url:'URL',
+  id:'ID', hw:'HW', api:'API', cpu:'CPU', io:'IO'};
+// mcp__debugui__get_ui_state -> "Get UI state"; WebFetch -> "Web fetch".
+function llmToolName(raw){
+  const words = raw.replace(/^mcp__[\s\S]*?__/, '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[_\s]+/).filter(Boolean);
+  if (!words.length) return raw;
+  return words.map((w, i) => {
+    const a = LLM_ACRONYM[w.toLowerCase()];
+    if (a) return a;
+    return i === 0 ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+                   : w.toLowerCase();
+  }).join(' ');
+}
+// One labelled chip per argument. Raw text only when the JSON will not parse.
+function llmToolArgs(args){
+  args = (args || '').trim();
+  if (!args) return '';
+  let obj = null;
+  try { obj = JSON.parse(args); } catch (e) { obj = null; }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj))
+    return '<span class="targ">' + llmEscape(args) + '</span>';
+  return Object.keys(obj).map(k => {
+    const v = obj[k];
+    let s = v === null ? 'null'
+          : typeof v === 'object' ? JSON.stringify(v) : String(v);
+    if (s.length > 60) s = s.slice(0, 59) + '…';
+    return '<span class="tg"><i>' + llmEscape(k) + '</i>' + llmEscape(s) + '</span>';
+  }).join('');
+}
+function llmBuildTools(rows){
+  return '<div class="llm-tools">' + rows.map(r => {
+    const err = /error/i.test(r.res || '');
+    const mark = r.res == null ? '…' : (err ? '✗ ' : '✓ ') + r.res;
+    return '<div class="llm-tc' + (r.res == null ? '' : err ? ' err' : ' done')
+      + '" title="' + llmAttr((r.name + ' ' + r.args).trim()) + '">'
+      + '<span class="tn">'
+      + (r.name ? llmEscape(llmToolName(r.name)) : '↳') + '</span>'
+      + '<span class="ta">' + llmToolArgs(r.args) + '</span>'
+      + '<span class="tr">' + mark + '</span></div>';
+  }).join('') + '</div>';
+}
 // Colorize an ALREADY-escaped prose string: tool calls, tool results, you>
 // prompts, error/offline markers, and file / file:line references.
 function llmColorizeMarkers(s){
   s = s.replace(/^you&gt;.*$/gm, m => '<span class="llm-you">' + m + '</span>');
-  s = s.replace(/\[tool: ([^\s\]]+)([^\]]*)\]/g,
-    (m,name,rest) => '<span class="llm-tool">[tool: <span class="llm-toolname">'
-      + name + '</span>' + rest + ']</span>');
-  s = s.replace(/\[tool result\]/g, '<span class="llm-toolresult">[tool result]</span>');
   s = s.replace(/\[(llm error[^\]]*|daemon offline[^\]]*)\]/g,
     (m,inner) => '<span class="llm-error">[' + inner + ']</span>');
-  s = s.replace(/\b([A-Za-z0-9_./-]+\.(?:py|cc|cpp|cxx|h|hpp|c|md|mlir|sh|json|txt|inc|td|html|elf|log))(?::(\d+))?\b/g,
-    (m,file,line) => '<span class="llm-file">' + file + '</span>'
-      + (line ? ':<span class="llm-line">' + line + '</span>' : ''));
+  // Wrap the pair in one carrier so a click has the path and line together.
+  // The char class excludes " < > &, so the attributes cannot be broken out of;
+  // widening it would require llmAttr(). elf is gone (binary, always refused).
+  // Lookbehind, not \b: \b never matches between a space and '/', so a leading
+  // slash was dropped and every absolute path the model cited resolved nowhere.
+  s = s.replace(/(?<![\w./-])([A-Za-z0-9_./-]+\.(?:py|cc|cpp|cxx|h|hpp|c|md|mlir|sh|json|txt|inc|td|html|log|bcf))(?::(\d+)(?:\s*[-\u2013]\s*(\d+))?)?\b/g,
+    (m,file,line,line2) => {
+      // Show the basename only — an absolute app path runs to ~60 characters and
+      // swamps the sentence around it. data-p keeps the full path for the click,
+      // and title exposes it on hover.
+      const shown = file.slice(file.lastIndexOf('/') + 1);
+      return '<span class="srcref" data-p="' + file + '"'
+        + (line ? ' data-l="' + line + '"' : '')
+        + (line2 ? ' data-l2="' + line2 + '"' : '')
+        + (shown !== file ? ' title="' + file + '"' : '') + '>'
+        + '<span class="llm-file">' + shown + '</span>'
+        + (line ? ':<span class="llm-line">' + line
+                  + (line2 ? '-' + line2 : '') + '</span>' : '')
+        + '</span>';
+    });
   return s;
 }
 // Minimal offline highlighter for one fenced code block.
@@ -4675,17 +6449,94 @@ function llmHighlightCode(raw){
     n ? '<span class="cm-number">'  + n + '</span>' :
     k ? '<span class="cm-keyword">' + k + '</span>' : m);
 }
+function llmBuildTable(lines){
+  // lines: array of raw (unescaped) pipe-delimited rows
+  const rows = lines.map(l => l.replace(/^\s*\|/, '').replace(/\|?\s*$/, '').split('|').map(c => c.trim()));
+  const isSep = r => r.every(c => /^:?-+:?$/.test(c));
+  let html = '<table class="md-table">';
+  let inHead = rows.length > 1 && isSep(rows[1]);
+  rows.forEach((r, i) => {
+    if (isSep(r)) return;
+    const isHead = inHead && i === 0;
+    const tag = isHead ? 'th' : 'td';
+    html += '<tr>' + r.map(c => '<' + tag + '>' + llmEscape(c) + '</' + tag + '>').join('') + '</tr>';
+  });
+  return html + '</table>';
+}
+// Pre-built block HTML, keyed by placeholder index. Render-scoped rather than
+// local to llmProse: the placeholders must outlive llmColorizeMarkers, whose
+// file-path regex would otherwise rewrite the inside of a block's title="".
+let _llmBlocks = [];
 function llmProse(raw){
-  let s = llmEscape(raw);
+  // Process line-by-line to group block elements (tables, ordered lists) without
+  // regex alternation or nested quantifiers that cause catastrophic backtracking.
+  const blocks = _llmBlocks;
+  const outLines = [];  // lines after block extraction (may contain placeholders)
+
+  const lines = raw.split('\n');
+  let i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    // Tool block: a run of call/result markers plus the blank lines the daemon
+    // wraps them in, collapsed to one row per call. Left as prose they cost
+    // three lines each and the result never pairs with its call.
+    if (LLM_TOOL_CALL.test(l.trim()) || LLM_TOOL_RES.test(l.trim())) {
+      const rows = [];
+      while (i < lines.length) {
+        const t = lines[i].trim();
+        if (!t) { i++; continue; }
+        let m = t.match(LLM_TOOL_CALL);
+        if (m) { rows.push({name:m[1], args:(m[2]||'').trim(), res:null}); i++; continue; }
+        m = t.match(LLM_TOOL_RES);
+        if (!m) break;
+        // Fill the FIRST unresolved call, not the last. A parallel batch emits
+        // N calls back to back and then N results, so pairing to the last row
+        // left every earlier call stuck on '…' and the extra results orphaned.
+        const open = rows.find(x => x.res == null);
+        if (open) open.res = m[1] || 'done';
+        else rows.push({name:'', args:'', res:m[1] || 'done'});
+        i++;
+      }
+      while (outLines.length && !outLines[outLines.length-1].trim()) outLines.pop();
+      outLines.push('\x00BLK' + blocks.length + '\x00');
+      blocks.push(llmBuildTools(rows));
+      continue;
+    }
+    // Table block: consecutive lines starting with |
+    if (l.trimStart().startsWith('|')) {
+      const group = [];
+      while (i < lines.length && lines[i].trimStart().startsWith('|')) group.push(lines[i++]);
+      outLines.push('\x00BLK' + blocks.length + '\x00');
+      blocks.push(llmBuildTable(group));
+      continue;
+    }
+    // Ordered list block: consecutive lines matching /^\d+\. /
+    if (/^\d+\.\s/.test(l)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s/.test(lines[i]))
+        items.push('<li>' + llmEscape(lines[i++].replace(/^\d+\.\s+/, '')) + '</li>');
+      outLines.push('\x00BLK' + blocks.length + '\x00');
+      blocks.push('<ol class="md-ol">' + items.join('') + '</ol>');
+      continue;
+    }
+    outLines.push(l);
+    i++;
+  }
+
+  let s = llmEscape(outLines.join('\n'));
   s = s.replace(/^(#{1,6})\s+(.*)$/gm, (m,h,t) => '<span class="md-h">' + t + '</span>');
   s = s.replace(/^(\s*)[-*+]\s+/gm, '$1<span class="md-bullet">\u2022 </span>');
   s = s.replace(/`([^`\n]+)`/g, (m,c) => '<code class="md-code">' + c + '</code>');
+  // Links before bold/italic so brackets aren't consumed by other patterns.
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m,t,u) => '<a class="md-a" href="' + u + '" target="_blank" rel="noopener">' + t + '</a>');
   s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-  return llmColorizeMarkers(s);
+  s = s.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
+  return s;
 }
 // Split on ``` fences: even segments are prose, odd are code blocks.
 // Unclosed trailing fence mid-stream is treated as code for safe partial renders.
-function llmRenderText(raw){
+function llmRenderText(raw, colorize){
+  _llmBlocks = [];
   const parts = raw.split('```');
   let html = '';
   for (let i = 0; i < parts.length; i++){
@@ -4694,7 +6545,8 @@ function llmRenderText(raw){
     const body = nl >= 0 ? blk.slice(nl + 1) : blk;
     html += '<pre class="md-block"><code>' + llmHighlightCode(body) + '</code></pre>';
   }
-  return html;
+  if (colorize) html = llmColorizeMarkers(html);
+  return html.replace(/\x00BLK(\d+)\x00/g, (m, idx) => _llmBlocks[+idx] || '');
 }
 
 // Append a new message bubble; returns its DOM id.
@@ -4713,22 +6565,52 @@ function llmAddMsg(role, html){
   if (near) list.scrollTop = list.scrollHeight;
   return id;
 }
-// Stream raw text into an existing AI bubble, re-rendering markdown each chunk.
-function llmAppendToMsg(id, rawChunk){
+// Stream raw text into an existing AI bubble, throttled to one render per animation frame.
+// llmColorizeMarkers (expensive filename regex) is deferred until streaming ends.
+const _llmPending = new Map(); // id -> rafHandle
+function llmAppendToMsg(id, rawChunk, finalize){
   const rec = llmMessages.find(x => x.id === id);
   if (!rec) return;
-  const list = document.getElementById('llmmsg');
-  const near = list ? (list.scrollHeight - list.scrollTop - list.clientHeight < 60) : false;
   rec._raw += rawChunk;
-  rec.html = llmRenderText(rec._raw);
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.innerHTML = rec.html;
-  if (near && list) list.scrollTop = list.scrollHeight;
+  if (finalize){
+    // Cancel any pending frame; do one final full render including colorization.
+    if (_llmPending.has(id)){ cancelAnimationFrame(_llmPending.get(id)); _llmPending.delete(id); }
+    rec.html = llmRenderText(rec._raw, true);
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = rec.html;
+    const list = document.getElementById('llmmsg');
+    if (list && list.scrollHeight - list.scrollTop - list.clientHeight < 60)
+      list.scrollTop = list.scrollHeight;
+    return;
+  }
+  if (_llmPending.has(id)) return; // already scheduled for this frame
+  _llmPending.set(id, requestAnimationFrame(() => {
+    _llmPending.delete(id);
+    rec.html = llmRenderText(rec._raw, false);
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.innerHTML = rec.html;
+    const list = document.getElementById('llmmsg');
+    if (list && list.scrollHeight - list.scrollTop - list.clientHeight < 60)
+      list.scrollTop = list.scrollHeight;
+  }));
+}
+// #llmmsg shares a flex column with the think dots, the context pills and the
+// input box. Anything that changes their height shrinks the transcript, and a
+// view pinned to the bottom keeps its scrollTop — so the last lines slide out
+// of sight. Re-pin whatever was at the bottom. Reading scrollHeight after the
+// mutation forces the reflow, so the new geometry is what we scroll against.
+function llmKeepBottom(mutate){
+  const list = document.getElementById('llmmsg');
+  const atBottom = !list ||
+    (list.scrollHeight - list.scrollTop - list.clientHeight) < 60;
+  mutate();
+  if (atBottom && list) list.scrollTop = list.scrollHeight;
 }
 function llmShowThink(on){
   const t = document.getElementById('llmthink');
-  if (t) t.classList.toggle('hide', !on);
+  if (!t) return;
+  llmKeepBottom(() => t.classList.toggle('hide', !on));
 }
 
 function llmStopPoll(){ if (LLM.poll){ clearInterval(LLM.poll); LLM.poll = null; } }
@@ -4737,24 +6619,62 @@ function llmPollOnce(){
   LLM.busy = true;
   api('/llm/poll?offset=' + LLM.off).then(r => {
     if (r.auth){ llmLock(); return; }
-    if (r.error){ llmStopPoll(); return; }
-    if (r.data && LLM.pendingId){ llmShowThink(false); llmAppendToMsg(LLM.pendingId, r.data); }
+    if (r.error){ llmStopPoll(); llmShowThink(false); return; }
+    const done = r.active === false;
+    if (r.data && LLM.pendingId) llmAppendToMsg(LLM.pendingId, r.data, done);
+    else if (done && LLM.pendingId) llmAppendToMsg(LLM.pendingId, '', true);
     if (r.next != null) LLM.off = r.next;
-    if (r.active === false){ llmStopPoll(); LLM.pendingId = null; llmShowThink(false); }
+    // Tracks the turn, not the first chunk: the model keeps working through
+    // tool calls and further text long after the opening tokens land.
+    llmShowThink(!done);
+    if (done){ llmStopPoll(); LLM.pendingId = null; }
   }).catch(() => { llmStopPoll(); llmShowThink(false); })
     .finally(() => { LLM.busy = false; });
 }
-function llmSend(prompt){
+// Echo the context that just went out, as read-only pills above the message.
+// Without this the blocks vanished from the transcript the moment they were
+// drained, leaving no record of what the model was actually given.
+function llmAddSentCtx(sent){
+  if (!sent || !sent.length) return;
+  const html = '<span class="sctx-lead">context sent:</span>'
+    + sent.map(s => '<span class="llm-sent-pill" title="' + llmAttr(s.text) + '">'
+        + llmEscape(s.label) + '</span>').join('');
+  const id = llmAddMsg('sctx', html);
+  const el = document.getElementById(id);
+  if (!el) return;
+  // Click a pill to reveal exactly what was sent under that label.
+  el.querySelectorAll('.llm-sent-pill').forEach((p, i) => p.onclick = () => {
+    const open = p.nextElementSibling &&
+                 p.nextElementSibling.classList.contains('sctx-body');
+    el.querySelectorAll('.sctx-body').forEach(b => b.remove());
+    p.classList.toggle('act', !open);
+    if (open) return;
+    const pre = document.createElement('pre');
+    pre.className = 'sctx-body';
+    pre.textContent = sent[i].text;
+    el.appendChild(pre);
+  });
+}
+// fromInput: the message is whatever is in the editable box, pills included.
+// A programmatic caller passes a literal string instead, so it cannot drain a
+// half-written message out from under the user.
+function llmSend(prompt, fromInput){
   prompt = (prompt || '').trim();
-  if (!prompt) return;
+  const drained = (fromInput && window._drainCtxSnippets)
+    ? window._drainCtxSnippets() : {text:prompt, sent:[]};
+  if (!drained.text.trim() && !drained.sent.length) return;
   llmStopPoll();
-  let toSend = prompt;
+  let toSend = drained.text;
   if (LLM.ctx && LLM.ctx !== LLM.ctxSent){
-    toSend = LLM.ctx + '\n' + prompt;
+    toSend = LLM.ctx + '\n' + toSend;
     LLM.ctxSent = LLM.ctx;
     llmAddMsg('ctx', llmEscape(LLM.ctx));
   }
-  llmAddMsg('you', llmEscape(prompt));
+  llmAddSentCtx(drained.sent);
+  // The prompt is echoed with pills reduced to [[label]] — showing the expanded
+  // blocks here would bury the question the user actually asked.
+  if (prompt) llmAddMsg('you', llmEscape(prompt));
+  if (fromInput && window._llmClearInput) window._llmClearInput();
   const aiId = llmAddMsg('ai', '');
   LLM.pendingId = aiId;
   llmShowThink(true);
@@ -4810,20 +6730,74 @@ function llmCheckAuth(){
   const snd = document.getElementById('llmsend');
   const rst = document.getElementById('llmreset');
   const term = document.getElementById('llmterm');
-  function autoGrow(){
-    if (!inp) return;
-    inp.style.height = 'auto';
-    inp.style.height = inp.scrollHeight + 'px';
-  }
   function submitLLM(){
     if (!inp) return;
-    const v = inp.value.trim();
-    if (v){ llmSend(v); inp.value=''; autoGrow(); }
+    const v = window._llmInputText ? window._llmInputText() : '';
+    if (v || (window._hasCtxSnippets && window._hasCtxSnippets())) llmSend(v, true);
   }
   if (inp) inp.addEventListener('keydown', e => {
+    // Backspace over a chip removes the whole chip in one press. Left to the
+    // browser it would eat the flanking zero-width space first, so the first
+    // press looked like it did nothing.
+    if (e.key === 'Backspace' || e.key === 'Delete'){
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount && sel.isCollapsed && window._ctxChipBefore){
+        const r = sel.getRangeAt(0);
+        const pill = (e.key === 'Backspace')
+          ? window._ctxChipBefore(r)
+          : (r.startContainer.nodeType === 1
+             ? r.startContainer.childNodes[r.startOffset] : null);
+        if (pill && pill.classList && pill.classList.contains('msg-pill')){
+          e.preventDefault();
+          window._ctxRemoveChip(pill);
+          return;
+        }
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); submitLLM(); }
+    // Shift+Enter: a plain newline. Left to the browser this produces a <div>
+    // or <br> soup that the reader would then have to normalise.
+    if (e.key === 'Enter' && e.shiftKey){
+      e.preventDefault();
+      document.execCommand('insertLineBreak');
+    }
   });
-  if (inp) inp.addEventListener('input', autoGrow);
+  // Copy/cut: a chip is part of the text. Write both flavours — plain text so
+  // it lands as [[label]] anywhere else, and HTML so pasting back into the box
+  // rebuilds a real chip instead of dropping to a token.
+  const clipOut = (e, cut) => {
+    if (!window._ctxSelectionClip) return;
+    const c = window._ctxSelectionClip();
+    if (!c) return;
+    e.preventDefault();
+    const cd = e.clipboardData || window.clipboardData;
+    cd.setData('text/plain', c.text);
+    cd.setData('text/html', c.html);
+    if (cut){ c.range.deleteContents(); inp.dispatchEvent(new Event('input')); }
+  };
+  if (inp) inp.addEventListener('copy', e => clipOut(e, false));
+  if (inp) inp.addEventListener('cut',  e => clipOut(e, true));
+  // Paste rebuilds chips from our own HTML flavour; anything else is inserted
+  // as plain text, so foreign markup never enters the box.
+  if (inp) inp.addEventListener('paste', e => {
+    e.preventDefault();
+    const cd = e.clipboardData || window.clipboardData;
+    const html = cd.getData('text/html');
+    if (html && html.indexOf('msg-pill') >= 0 && window._ctxFragFromHtml){
+      window._ctxInsertFrag(window._ctxFragFromHtml(html));
+      return;
+    }
+    document.execCommand('insertText', false, cd.getData('text'));
+  });
+  // Removing a pill by its ×; the caret can also just backspace over it.
+  if (inp) inp.addEventListener('click', e => {
+    const x = e.target.closest && e.target.closest('.mp-x');
+    if (!x) return;
+    const pill = x.closest('.msg-pill');
+    if (pill && window._ctxRemoveChip) window._ctxRemoveChip(pill);
+  });
+  // The box grows with its content, which shrinks the transcript above it.
+  if (inp) inp.addEventListener('input', () => llmKeepBottom(() => {}));
   if (snd) snd.onclick = submitLLM;
   if (rst) rst.onclick = llmReset;
   if (term) term.onclick = () => {
@@ -4865,7 +6839,9 @@ document.getElementById('gbtn').onclick = () => {
   clearPeers();
   if (selEl){ selEl.classList.remove('sel'); selEl=null; }
   const gl = DATA.global;
-  document.getElementById('panel').innerHTML =
+  // #panel-body, not #panel: overwriting the pane destroys the container
+  // panelRenderBody() writes into, so the next tile click hits a null.
+  document.getElementById('panel-body').innerHTML =
     '<h2>Global / kernel-group</h2>' +
     '<div class="kv">'+esc(gl.note)+'</div>' +
     '<pre class="code">'+hl(gl.code||'')+'</pre>';
@@ -4875,9 +6851,13 @@ document.getElementById('gbtn').onclick = () => {
 // All additive: when opened as a static file:// (no daemon) every fetch fails
 // and the page silently stays in static mode.
 const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
-               conTimer:null, logoff:0, gridBusy:false, logBusy:false,
+               conTimer:null, logoff:0, gridBusy:false, rescan:false, logBusy:false,
                runActive:false, debugUnlocked:false, device:'', host:'',
-               hwsrvOff:0, hwsrvTimer:null, hwsrvBusy:false };
+               hwsrvOff:0, hwsrvTimer:null, hwsrvBusy:false,
+               // runOwned mirrors the DAEMON's bookkeeping (/runstate), not this
+               // page's: a reload or dropped tail must not convince the UI that
+               // a live run is over.
+               runOwned:false, daemonRun:null, rsBusy:false, rsTimer:null };
 const LSTATE = {
   running:['#2e7d32','RUN'], stalled:['#b8860b','STALL'], error:['#c62828','ERR'],
   idle:['#3a3a3a','idle'], unreachable:['#5a2d2d','n/a'], unknown:['#3a3a3a','?']
@@ -4890,13 +6870,95 @@ function api(path, opts){
   return fetch(path, opts).then(r => r.json());
 }
 function setStatus(msg){ const e=document.getElementById('livestatus'); if(e) e.textContent=msg; }
+function setRunStatus(msg){ const e=document.getElementById('runstatus'); if(e) e.textContent=msg; }
 
 function clearBars(){
   Object.values(liveBar).forEach(b => { b.className='livebar hide'; b.textContent=''; });
+  applyIssues([]);
 }
+
+
+// Build a lookup: "col,row,chankey" → flow_index, from the static schedule data.
+function _buildFlowLookup(){
+  const m = {};
+  (DATA.tiles||[]).forEach(t => {
+    const [tc, tr] = t.loc;
+    (t.dma_channels||[]).forEach(ch => {
+      if (ch.flow_index != null)
+        m[tc+','+tr+','+(ch.direction.toLowerCase()+ch.channel)] = ch.flow_index;
+    });
+  });
+  return m;
+}
+
+// Render the issue bar. issues = [] hides it; non-empty shows it.
+// Each issue: {key, col, row, chan, state, stalls, errors, flow_index}
+function applyIssues(issues){
+  const bar = document.getElementById('issue-bar');
+  if (!bar) return;
+  if (!issues || !issues.length){ bar.style.display='none'; bar.innerHTML=''; return; }
+  const icon = st => st === 'error' ? '\u2297' : '\u26a0';  // ⊗ or ⚠
+  const rows = issues.map(iss => {
+    const detail = iss.errors.length ? iss.errors.join(',')
+                 : iss.stalls.length ? iss.stalls.join(',')
+                 : iss.state;
+    const fi = iss.flow_index != null ? 'f'+iss.flow_index : '';
+    return '<div class="ib-row" data-key="'+iss.key+'" data-col="'+iss.col+'" data-row="'+iss.row+'">'
+      + '<span class="ib-icon">'+icon(iss.state)+'</span>'
+      + '<span class="ib-loc">('+iss.col+','+iss.row+')</span>'
+      + '<span class="ib-ch">'+iss.chan.toUpperCase()+'</span>'
+      + '<span class="ib-msg">'+iss.state+' ['+detail+']</span>'
+      + (fi ? '<span class="ib-flow">'+fi+'</span>' : '')
+      + '</div>';
+  }).join('');
+  bar.innerHTML = '<div class="ib-hdr">'
+    + '\u26a0 '+issues.length+' DMA issue'+(issues.length>1?'s':'')
+    + '<button class="ib-clear" title="Dismiss">clear</button>'
+    + '</div>' + rows;
+  bar.style.display = '';
+  // Clicking a row selects the tile in the grid view.
+  bar.querySelectorAll('.ib-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const col = parseInt(row.dataset.col), r2 = parseInt(row.dataset.row);
+      const cell = cellByLoc[col+','+r2];
+      if (cell) cell.click();
+    });
+  });
+  bar.querySelector('.ib-clear').addEventListener('click', e => {
+    e.stopPropagation();
+    applyIssues([]);
+  });
+}
+
+// Extract issues from a /grid response and render the bar.
+function _updateIssueBar(res){
+  if (res.what && res.what !== 'dma'){ applyIssues([]); return; }
+  const cells = res.cells || {};
+  const flowLookup = _buildFlowLookup();
+  const issues = [];
+  Object.entries(cells).forEach(([key, cell]) => {
+    if (!cell || !cell.channels) return;
+    const [col, row] = key.split(',').map(Number);
+    Object.entries(cell.channels).forEach(([chan, ch]) => {
+      if (ch.state !== 'stalled' && ch.state !== 'error') return;
+      issues.push({
+        key, col, row, chan,
+        state: ch.state,
+        stalls: ch.stalls || [],
+        errors: ch.errors || [],
+        flow_index: flowLookup[col+','+row+','+chan] != null
+                    ? flowLookup[col+','+row+','+chan] : null,
+      });
+    });
+  });
+  applyIssues(issues);
+}
+
 function applyGrid(res){
   if (res.error){ setStatus('live: '+res.error); }
   else setStatus('live '+LIVE.what+' @ '+new Date().toLocaleTimeString());
+  // One fetch feeds both views; the device map paints from the same payload.
+  dmApplyStatus(res);
   const cells = res.cells || {};
   Object.keys(liveBar).forEach(k => {
     const b = liveBar[k], c = cells[k];
@@ -4907,26 +6969,57 @@ function applyGrid(res){
     b.textContent = m[1];
     b.title = JSON.stringify(c, null, 2);
   });
+  _updateIssueBar(res);
 }
-function pollGridOnce(){
-  // Belt-and-suspenders: never poll the JTAG while a board run is live; the
-  // aiedbg reads would collide with apppaltest's device program/reset/download.
-  if (LIVE.runActive) return;
-  // Skip if a /grid is still in flight: aiedbg reads can take longer than the
-  // 2s tick, and piled-up requests would exhaust the browser's ~6-connection
-  // limit and starve /applog (freezing the run console).
-  if (LIVE.gridBusy) return;
+// userInitiated: a click (mode pill, Scan button, live checkbox) rather than the
+// 2s timer. Only user scans queue a retry when the guard rejects them — letting
+// skipped auto-polls retry would busy-loop the board back-to-back with no gap.
+function scanOnce(userInitiated){
+  // One-shot scan, always runs (user-triggered). Skips the runActive guard so
+  // the user can read core/DMA state even while a run is parked on the board —
+  // the same window where 'scan cores' in the aiegdb console works fine.
+  if (LIVE.gridBusy){ if (userInitiated) LIVE.rescan = true; return; }
   LIVE.gridBusy = true;
+  LIVE.rescan = false;
+  // Pin the mode for this request. A scan can easily outlive the 2s poll, so by
+  // the time it lands the user may have picked a different one.
+  const what = LIVE.what;
+  setStatus('scanning '+what+'…');
   const dev = deviceSel ? deviceSel.value : '';
   const host = boardHost ? boardHost.value.trim() : '';
-  const qs = '/grid?what='+LIVE.what +
+  const qs = '/grid?what='+what +
              '&device='+encodeURIComponent(dev) +
              '&host='+encodeURIComponent(host);
-  api(qs).then(applyGrid)
+  api(qs).then(res => {
+      // Drop a response for a mode the user has already moved off of, instead of
+      // repainting the old mode's data over the new selection.
+      if (what !== LIVE.what) return;
+      applyGrid(res);
+    })
     .catch(() => setStatus('daemon offline (static mode)'))
-    .finally(() => { LIVE.gridBusy = false; });
+    .finally(() => {
+      LIVE.gridBusy = false;
+      // A swallowed click always retries. A mode changed mid-scan only retries
+      // under live — with the poll off, picking a mode must not read the board.
+      if (LIVE.rescan || (LIVE.enabled && what !== LIVE.what)){
+        LIVE.rescan = false; scanOnce(true);
+      }
+    });
 }
-function startGridPoll(){ pollGridOnce(); LIVE.gridTimer = setInterval(pollGridOnce, 2000); }
+function pollGridOnce(){
+  // Automatic poll: skip while a board run holds JTAG exclusively during
+  // device program / reset / download. The user can still trigger scanOnce()
+  // manually once the board is past that phase (app running / parked).
+  if (LIVE.runActive) return;
+  scanOnce();
+}
+function startGridPoll(){
+  // Clear first: setLive(true) can be reached from either checkbox, and
+  // overwriting gridTimer without clearing orphans the old interval forever.
+  stopGridPoll();
+  scanOnce(true);
+  LIVE.gridTimer = setInterval(pollGridOnce, 2000);
+}
 function stopGridPoll(){ if(LIVE.gridTimer){ clearInterval(LIVE.gridTimer); LIVE.gridTimer=null; } }
 function hideConsole(){
   CON.scope = 'partition';
@@ -4939,9 +7032,12 @@ function hideConsole(){
 }
 function setLive(on){
   LIVE.enabled = on;
+  // Both views expose the same poll as a checkbox; keep them mirrored so the
+  // one that did not initiate the change does not lie about the poll state.
   const cb = document.getElementById('liveToggle'); if(cb) cb.checked = on;
+  const dmcb = document.getElementById('dmLiveToggle'); if(dmcb) dmcb.checked = on;
   if (on) startGridPoll();
-  else { stopGridPoll(); clearBars(); setStatus(''); }
+  else { stopGridPoll(); clearBars(); setStatus(''); dmClearStatus(); }
   // Console visibility is tied to LIVE.connected (the connection test), NOT to
   // the overlay toggle, so it persists while the overlay is switched off.
 }
@@ -4959,7 +7055,9 @@ function unlockConsoleForDebug(){
   const ci = document.getElementById('conin');
   if (cr) cr.disabled = false;
   if (ci){ ci.disabled = false; ci.classList.remove('disabled'); }
-  setStatus('run parked \u2014 aiegdb console unlocked for live debug (overlay stays off)');
+  if (LIVE.runOwned && LIVE.daemonRun) renderRunBanner();
+  else setRunStatus('run parked \u2014 aiegdb console unlocked for live debug '
+                  + '(overlay stays off)');
 }
 function setDebugEnabled(on){
   const cb = document.getElementById('liveToggle');
@@ -4969,23 +7067,20 @@ function setDebugEnabled(on){
   if (!on){
     LIVE.runActive = true;
     LIVE.debugUnlocked = false;   // new run → re-lock until it's debuggable again
-    stopGridPoll(); clearBars();
-    if (cb){ cb.checked = false; cb.disabled = true;
-      cb.closest('label').classList.toggle('disabled', true); }
-    if (tc) tc.disabled = true;
+    clearBars();
     if (cr) cr.disabled = true;
     if (ci){ ci.disabled = true; ci.classList.add('disabled'); }
-    setStatus('debug disabled during run setup');
+    setRunStatus('');
   } else {
     LIVE.runActive = false;
-    if (tc) tc.disabled = false;
     if (cr) cr.disabled = false;
     if (ci){ ci.disabled = false; ci.classList.remove('disabled'); }
     // Re-enable the overlay toggle only if the connection is still valid
     // (mirrors the testConnect gating).
     if (cb){ cb.disabled = !LIVE.connected;
       cb.closest('label').classList.toggle('disabled', !LIVE.connected); }
-    setStatus('');
+    updateRunButtons();
+    setRunStatus('');
   }
 }
 
@@ -4998,9 +7093,75 @@ const liveToggle = document.getElementById('liveToggle');
 const runbtn = document.getElementById('runbtn');
 const stopbtn = document.getElementById('stopbtn');
 const testconn = document.getElementById('testconn');
+const attachbtn = document.getElementById('attachbtn');
 function setConnStatus(msg){ const e=document.getElementById('connstatus'); if(e) e.textContent=msg; }
 // Show/hide the "start hw_server on the target board" hint (shown on failure).
 function setConnHint(show){ const e=document.getElementById('connhint'); if(e) e.classList.toggle('hide', !show); }
+
+// ── run-state reconciliation (UI ⇄ daemon) ───────────────────────────────────
+// Force stop is NOT gated on LIVE.connected: the daemon refuses /ping while a
+// run is live, so "connect first" would be unsatisfiable in the one case where
+// Force stop is the way out.
+function updateRunButtons(){
+  const dev = deviceSel ? deviceSel.value : '';
+  if (dev === 'simulator') return;    // the /sim/* handlers own those buttons
+  if (runbtn)  runbtn.disabled  = !LIVE.connected || LIVE.runOwned;
+  if (stopbtn) stopbtn.disabled = !LIVE.runOwned;
+}
+function fmtAge(s){
+  if (s == null) return '';
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm' + (s%60 ? ' ' + (s%60) + 's' : '');
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+}
+// One writer for #runstatus: the 5s heartbeat and the 1s tail both know part of
+// the story and would otherwise flip the line between them.
+function renderRunBanner(){
+  const rs = LIVE.daemonRun;
+  if (!LIVE.runOwned || !rs){ setRunStatus(''); return; }
+  let s = 'run #' + rs.run_id + (rs.device ? ' on ' + rs.device : '')
+        + (rs.started_iso ? ' started ' + rs.started_iso : '')
+        + (rs.age_s != null ? ' (' + fmtAge(rs.age_s) + ' ago)' : '')
+        + ' — ' + (rs.status || 'running');
+  if (rs.stale) s += ' — no new output for a while; press "Force stop" to '
+                   + 'release the board';
+  if (LIVE.debugUnlocked) s += ' — aiegdb console unlocked for live debug '
+                             + '(overlay stays off)';
+  setRunStatus(s);
+}
+// Edge-triggered on `running` so it can't fight the tail pollLog already drives.
+function applyRunState(rs){
+  if (!rs) return;
+  const was = LIVE.runOwned;
+  LIVE.runOwned = !!rs.running;
+  LIVE.daemonRun = rs;
+  if (rs.running){
+    if (!was){
+      setDebugEnabled(false);
+      if (LIVE.conTimer) clearInterval(LIVE.conTimer);
+      LIVE.logoff = 0;
+      const con = document.getElementById('console');
+      if (con){ con.classList.remove('hide'); con.textContent = ''; }
+      LIVE.conTimer = setInterval(pollLog, 1000);
+      pollLog();
+    }
+    renderRunBanner();
+  } else if (was){
+    if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
+    setDebugEnabled(true);          // clears LIVE.runActive + the run banner
+  }
+  updateRunButtons();
+}
+// Runs unconditionally, not just while a tail is up: the point is to notice runs
+// this page is not tracking. No JTAG, so it is cheap.
+function syncRunState(){
+  if (LIVE.rsBusy) return Promise.resolve(null);
+  LIVE.rsBusy = true;
+  return api('/runstate')
+    .then(rs => { if (rs && !rs.error) applyRunState(rs); return rs; })
+    .catch(() => null)
+    .finally(() => { LIVE.rsBusy = false; });
+}
 // Selecting a device only enables the "Test connect" button. The live overlay
 // checkbox + the drill-down console stay locked until a connection test passes
 // (LIVE.connected). Changing the device invalidates any prior test.
@@ -5012,12 +7173,15 @@ function updateDeviceUI(){
   hideConsole();                               // connection invalidated
   if (liveToggle){ liveToggle.disabled = true;
     liveToggle.closest('label').classList.toggle('disabled', true); }
-  // Run test / Force stop stay gray until "Test connect" passes; changing the
-  // device invalidates any prior test (LIVE.connected cleared above).
+  // Also the simulator's reset: updateRunButtons leaves /sim/*'s buttons alone.
   if (runbtn) runbtn.disabled = true;
   if (stopbtn) stopbtn.disabled = true;
+  updateRunButtons();
   if (testconn) testconn.disabled = !has;
-  if (boardHost) boardHost.classList.toggle('hide', dev !== 'vek385');
+  // Attaching is only meaningful for a real board: the simulator has no run to
+  // adopt — it is started by this UI or not at all.
+  if (attachbtn) attachbtn.disabled = !has || dev === 'simulator';
+  if (boardHost) boardHost.classList.toggle('hide', !has || dev === 'pal' || dev === 'simulator');
   // For simulator, "Test connect" label stays but skips JTAG; still require
   // the test step so the user explicitly enables Run/Stop for it.
   if (testconn) testconn.textContent = (dev === 'simulator') ? 'Activate' : 'Test connect';
@@ -5029,12 +7193,15 @@ function updateDeviceUI(){
   }
 }
 if (deviceSel) deviceSel.onchange = updateDeviceUI;
+// Editing the hostname invalidates any prior connection test — reset to the
+// "click Test connect" state so stale LIVE.connected doesn't let a Run start
+// against a host the user just changed.
+if (boardHost) boardHost.oninput = updateDeviceUI;
 // Apply a successful connection: unlock Run test / Force stop / overlay and
 // reveal the aiegdb console. Shared by the direct test and the auto-launch path.
 function applyConnected(r){
   LIVE.connected = true;
-  if (runbtn) runbtn.disabled = false;    // unlock Run test now
-  if (stopbtn) stopbtn.disabled = false;  // unlock Force stop now
+  updateRunButtons();                     // unlock Run test now
   if (liveToggle){ liveToggle.disabled = false;
     liveToggle.closest('label').classList.remove('disabled'); }
   const box = document.getElementById('cmdconsole');
@@ -5068,8 +7235,7 @@ function applyConnected(r){
 // Mark disconnected: re-gray Run test / Force stop / overlay and hide console.
 function markDisconnected(){
   LIVE.connected = false;
-  if (runbtn) runbtn.disabled = true;      // keep Run test gray
-  if (stopbtn) stopbtn.disabled = true;    // keep Force stop gray
+  updateRunButtons();                      // keep Run test gray
   if (liveToggle) liveToggle.disabled = true;
   hideConsole();
 }
@@ -5133,8 +7299,7 @@ function pollHwSrv(){
         // user still sees the launch steps, and append the original
         // "connection failed -> start hw_server manually" guidance in place.
         LIVE.connected = false;
-        if (runbtn) runbtn.disabled = true;
-        if (stopbtn) stopbtn.disabled = true;
+        updateRunButtons();
         if (liveToggle) liveToggle.disabled = true;
         if (con){
           con.textContent += '\n[auto-start failed \u2014 connection still down: '
@@ -5190,7 +7355,7 @@ function testConnect(){
     return;
   }
   const host = boardHost ? boardHost.value.trim() : '';
-  if (dev === 'vek385' && !host){ setConnStatus('enter vek385 board hostname'); return; }
+  if (dev !== 'pal' && !host){ setConnStatus('enter the ' + dev + ' board hostname'); return; }
   // Remember the selection so applyConnected can tell the daemon which target
   // to switch the aiegdb console to (mirrors autoLaunchHwServer's closure).
   LIVE.device = dev; LIVE.host = host;
@@ -5199,6 +7364,13 @@ function testConnect(){
   api('/ping'+qs).then(r => {
     if (r && r.ok){
       applyConnected(r);
+    } else if (r && r.busy){
+      // A live run holds the link; the link is not dead. Auto-starting
+      // hw_server would reset a working service and refuse again anyway.
+      applyRunState(r.run);
+      setConnStatus('a board run is still in progress — press "Force stop", '
+                  + 'then Connect again');
+      setConnHint(false);
     } else {
       // Daemon answered but the JTAG connect failed → try to auto-start
       // hw_server on the board and retry once.
@@ -5214,26 +7386,101 @@ function testConnect(){
 }
 if (testconn) testconn.onclick = testConnect;
 
+// "Open Current Session": adopt a run the user started outside this UI (CLI, or
+// a board already programmed). Same link probe as Connect, but the daemon
+// records mode=attached — it did not start this run and cannot vouch for what
+// the board did beforehand, and the LLM is told exactly that.
+function attachSession(){
+  const dev  = deviceSel ? deviceSel.value : '';
+  const host = boardHost ? boardHost.value.trim() : '';
+  if (!dev) return;
+  LIVE.device = dev; LIVE.host = host;
+  setConnStatus('attaching…');
+  api('/attach', {method:'POST', headers:{'Content-Type':'application/json'},
+                  body: JSON.stringify({device:dev, board_host:host})})
+    .then(r => {
+      if (r && r.ok){
+        applyConnected(r);
+        setConnStatus('attached to existing session — board state predates this UI');
+        llmPushCtx('[context] User attached to a board session started outside the UI; '
+                 + 'prior board history is unknown to the daemon.');
+      } else if (r && r.busy){
+        applyRunState(r.run);
+        setConnStatus('this UI is already running a test — press "Force stop" first');
+        setConnHint(false);
+      } else {
+        markDisconnected();
+        setConnStatus('attach failed: ' + ((r && r.detail) || 'no response'));
+        setConnHint(true);
+      }
+    })
+    .catch(() => { markDisconnected();
+                   setConnStatus('daemon offline (static mode)'); });
+}
+if (attachbtn) attachbtn.onclick = attachSession;
+
 document.getElementById('liveToggle').onchange = e => setLive(e.target.checked);
-document.querySelectorAll('#overlaytabs .ltab').forEach(tab => tab.onclick = () => {
-  document.querySelectorAll('#overlaytabs .ltab').forEach(x => x.classList.remove('act'));
-  tab.classList.add('act');
-  LIVE.what = tab.dataset.w;
-  // Make the tab self-activating: if the overlay is already live, just refetch
-  // for the new 'what'. Otherwise auto-enable the overlay when we're connected,
-  // so clicking Cores/Events actually shows its data (core PCs / DMA events)
-  // without also having to tick the "Live status overlay" box. If we can't poll
-  // (no connection or a run is holding the JTAG) explain why nothing appears.
-  if (LIVE.enabled){ pollGridOnce(); return; }
-  if (LIVE.runActive){ setStatus('overlay paused during run (JTAG busy)'); return; }
-  if (LIVE.connected){
-    const cb = document.getElementById('liveToggle');
-    if (cb) cb.checked = true;
-    setLive(true);   // flips LIVE.enabled + starts the grid poll for this 'what'
-  } else {
-    setStatus('pick a device, "Test connect", then this tab shows live '+LIVE.what);
+
+// LIVE.what is shared by the grid overlay and the device-map scanner — there is
+// one /grid fetch and one selection, so both pill strips mirror each other.
+function setOverlayWhat(w){
+  const changed = LIVE.what !== w;
+  LIVE.what = w;
+  document.querySelectorAll('#overlaytabs .ltab, #dmScanWhat .ltab').forEach(
+    x => x.classList.toggle('act', x.dataset.w === w));
+  if (!changed) return;
+  // Drop the previous mode's colors immediately: leaving DMA tints on screen
+  // under a "Cores" selection reads as live data for a mode never read.
+  dmClearStatus();
+  const msg = LIVE.enabled ? 'scanning '+w+'…' : 'click "Scan" to read '+w;
+  dmSetScanStatus(msg);
+  setStatus(msg);
+}
+// Picking a mode is a SELECTION, not an action. It reads the board only while
+// the live poll is on; otherwise "Scan" is the trigger.
+function pickOverlayWhat(w, setMsg){
+  setOverlayWhat(w);
+  if (!LIVE.connected){
+    setMsg('not connected — use Connect in the debug panel below', true);
+    return;
   }
-});
+  if (LIVE.enabled) scanOnce(true);
+}
+document.querySelectorAll('#overlaytabs .ltab').forEach(tab => tab.onclick = () =>
+  pickOverlayWhat(tab.dataset.w, setStatus));
+
+// ── Device-map scan controls ──────────────────────────────────
+// Deliberately routed through the same scanOnce()/setLive() pair as the grid
+// overlay rather than a parallel fetch path: LIVE.gridBusy is a single-flight
+// guard and LIVE.gridTimer a single handle, so a second poller here would
+// fight the first for the one aiedbg subprocess the daemon runs per scan.
+document.querySelectorAll('#dmScanWhat .ltab').forEach(tab => tab.onclick = () =>
+  pickOverlayWhat(tab.dataset.w, dmSetScanStatus));
+function runScanNow(setMsg){
+  if (!LIVE.connected){
+    setMsg('not connected — use Connect in the debug panel below', true);
+    return;
+  }
+  setMsg('scanning '+LIVE.what+'…');
+  scanOnce(true);
+}
+(function(){
+  const btn = document.getElementById('dmScanBtn');
+  if (btn) btn.onclick = () => runScanNow(dmSetScanStatus);
+  const gbtn = document.getElementById('gridScanBtn');
+  if (gbtn) gbtn.onclick = () => runScanNow(setStatus);
+  const clr = document.getElementById('dmClearBtn');
+  if (clr) clr.onclick = dmClearAll;
+  const live = document.getElementById('dmLiveToggle');
+  if (live) live.onchange = e => {
+    if (e.target.checked && !LIVE.connected){
+      e.target.checked = false;
+      dmSetScanStatus('not connected — use Connect in the debug panel below', true);
+      return;
+    }
+    setLive(e.target.checked);
+  };
+})();
 
 function pollLog(){
   // Guard against overlapping tails so a slow response can't pile up.
@@ -5245,7 +7492,13 @@ function pollLog(){
     if (r.data){ con.textContent += r.data; }
     if (r.next != null) LIVE.logoff = r.next;
     if (atBottom) con.scrollTop = con.scrollHeight;
-    setStatus('run: ' + r.status);
+    if (LIVE.runOwned && LIVE.daemonRun){
+      LIVE.daemonRun.status = r.status;
+      LIVE.daemonRun.stale = (r.status === 'hang');
+      renderRunBanner();
+    } else {
+      setRunStatus('run: ' + r.status);
+    }
     // Auto-unlock the aiegdb console mid-run once the daemon reports the run is
     // past the exclusive-JTAG setup phase (download/program/reset done → app
     // running/parked/hung). Only typed commands hit JTAG; the live overlay
@@ -5257,9 +7510,16 @@ function pollLog(){
     if (r.running === false){
       if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer=null; }
       // Run ended (force-stop OR natural completion) → re-enable aiedbg features.
+      LIVE.runOwned = false;
       setDebugEnabled(true);
+      setRunStatus('');
     }
-  }).catch(() => {}).finally(() => { LIVE.logBusy = false; });
+  }).catch(() => {
+    // Daemon went offline mid-run. The run process is no longer observable, so
+    // unblock all aiedbg features — JTAG is not held by anything we can see.
+    if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
+    setDebugEnabled(true);
+  }).finally(() => { LIVE.logBusy = false; });
 }
 document.getElementById('runbtn').onclick = () => {
   const dev = deviceSel ? deviceSel.value : '';
@@ -5288,7 +7548,7 @@ document.getElementById('runbtn').onclick = () => {
     return;
   }
   const host = boardHost ? boardHost.value.trim() : '';
-  if (dev === 'vek385' && !host){ setStatus('enter vek385 board hostname'); return; }
+  if (dev !== 'pal' && !host){ setStatus('enter the ' + dev + ' board hostname'); return; }
   LIVE.logoff = 0;
   // Stop aiedbg polling/console BEFORE the download starts so its JTAG reads
   // don't collide with device program/reset/dow -force. Re-enabled in pollLog
@@ -5298,7 +7558,17 @@ document.getElementById('runbtn').onclick = () => {
                body: JSON.stringify({device:dev, board_host:host})})
     .then(r => {
       // Run didn't actually start → re-enable debug (no pollLog will run).
-      if (r.error){ con.textContent = 'run error: ' + r.error; setDebugEnabled(true); return; }
+      // A refusal usually means an earlier run is still held; adopt its state
+      // so Force stop lights up.
+      if (r.error){ con.textContent = 'run error: ' + r.error;
+        setDebugEnabled(true);
+        if (r.run) applyRunState(r.run); else syncRunState();
+        return; }
+      // Own it now so the heartbeat doesn't re-adopt it as an unknown run.
+      LIVE.runOwned = true;
+      LIVE.daemonRun = {run_id:r.run_id, device:dev, status:'starting',
+                        started_iso:'', age_s:null, stale:false};
+      updateRunButtons();
       con.textContent = '[run ' + r.run_id + ' started \u2192 ' + (r.applog||'applog') + ']\n';
       llmPushCtx('[context] Hardware run '+r.run_id+' started on '+dev);
       if (LIVE.conTimer) clearInterval(LIVE.conTimer);
@@ -5320,49 +7590,30 @@ document.getElementById('stopbtn').onclick = () => {
   }
   api('/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
     .then(r => {
-      if (r.error){ setStatus('stop: ' + r.error); return; }
-      setStatus('run: stopped (pid ' + r.pid + ')');
-      // The next pollLog tick sees running=false, drains the force-stop line,
-      // and clears the timer. Force one immediate tail so it shows at once.
-      if (typeof pollLog === 'function') pollLog();
+      // Re-enable debug features immediately — don't wait for the next pollLog
+      // tick, which may never fire if the run was in a bad state.
+      if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
+      // "no run in progress" is not a failure: the board is free, which is what
+      // the click asked for. Clearing on that answer is what unwedges the UI.
+      LIVE.runOwned = false;
+      setDebugEnabled(true);
+      setRunStatus('');
+      if (r.run) applyRunState(r.run);
+      updateRunButtons();
+      if (r.error){ setStatus('stop: ' + r.error); }
+      else if (r.abandoned){
+        // #livestatus is hidden in Device Map view, so use the banner too.
+        const msg = 'run ' + r.run_id + ' (pid ' + r.pid + ') survived SIGKILL — '
+                  + 'the daemon released it, but it may still hold the board';
+        setStatus(msg); setRunStatus(msg);
+      } else {
+        setStatus('run: stopped (pid ' + r.pid + ')');
+      }
     })
-    .catch(() => { setStatus('daemon offline: cannot stop a run.'); });
+    .catch(() => { setStatus('daemon offline: cannot stop a run.'); setDebugEnabled(true); });
 };
 // Load the existing applog from the start (one-shot, no live tail). Useful for
 // inspecting the last run without launching a new one.
-document.getElementById('loadlogbtn').onclick = () => {
-  const dev = deviceSel ? deviceSel.value : '';
-  const con = document.getElementById('console');
-  con.classList.remove('hide'); con.textContent = '';
-  if (dev === 'simulator'){
-    SIM.logoff = 0; SIM.applogoff = 0; SIM.applogSeen = false;
-    if (SIM.timer){ clearInterval(SIM.timer); SIM.timer=null; }
-    Promise.all([
-      api('/sim/log?offset=0'),
-      api('/sim/applog?offset=0').catch(() => ({data:'',next:0}))
-    ]).then(([r, ra]) => {
-      con.textContent = r.data || '(sim log is empty)';
-      if (r.next != null) SIM.logoff = r.next;
-      if (ra.data){
-        con.textContent += '\n--- PS application output (ipc_app.log) ---\n' + ra.data;
-        SIM.applogSeen = true;
-      }
-      if (ra.next != null) SIM.applogoff = ra.next;
-      con.scrollTop = con.scrollHeight;
-      setStatus('loaded sim log (' + (r.running ? 'running' : 'idle') + ')');
-    }).catch(() => { con.textContent = 'daemon offline: cannot load sim log.'; });
-    return;
-  }
-  LIVE.logoff = 0;
-  // Cancel any active tail so the one-shot load isn't fought by polling.
-  if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer=null; }
-  api('/applog?offset=0').then(r => {
-    con.textContent = r.data || '(applog is empty)';
-    if (r.next != null) LIVE.logoff = r.next;
-    con.scrollTop = con.scrollHeight;
-    setStatus('loaded existing log (' + (r.status || 'idle') + ')');
-  }).catch(() => { con.textContent = 'daemon offline: cannot load applog.'; });
-};
 
 // ── Extra devices (simulator etc): populated from /devices at startup ──
 // The server reads debug_ui_config.json from the workdir and returns any
@@ -5410,9 +7661,13 @@ function pollSimLog(){
     }
   }).catch(() => {}).finally(() => { SIM.logBusy = false; });
 }
+// The template bakes in aiedbg's device names, so a profile naming one must
+// replace that option rather than append a duplicate value.
 api('/devices').then(r => {
   if (!r || !r.devices || !deviceSel) return;
   r.devices.forEach(d => {
+    const existing = Array.from(deviceSel.options).find(o => o.value === d.value);
+    if (existing){ existing.textContent = d.label; return; }
     const opt = document.createElement('option');
     opt.value = d.value; opt.textContent = d.label;
     deviceSel.appendChild(opt);
@@ -5504,12 +7759,15 @@ function applyBoardDefaults(){
       if (has) deviceSel.value = c.device;
     }
     if (c.board_host && boardHost) boardHost.value = c.board_host;
+    if (c.source_viewer === false) SRC.on = false;
     updateDeviceUI();   // reveal/enable controls for the preselected device
   }).catch(() => {});
 }
 if (location.protocol === 'http:' || location.protocol === 'https:') {
   updateDeviceUI();   // device empty ⇒ controls disabled, overlay off
   applyBoardDefaults();
+  syncRunState();
+  LIVE.rsTimer = setInterval(syncRunState, 5000);
 } else {
   setStatus('static mode — open via schedule_debug_server.py for live status');
   updateDeviceUI();
@@ -5519,6 +7777,15 @@ if (location.protocol === 'http:' || location.protocol === 'https:') {
 // The daemon owns app selection and injects the chosen app's DATA when serving
 // this page, so switching is: POST the choice, then reload.
 const appSel = document.getElementById('appSel');
+// #appinfo sits beside the selector in #ctrlbar, which is visible in every view
+// — unlike #livestatus. On success it goes back to showing the app's path.
+function setAppMsg(msg, isErr){
+  const info = document.getElementById('appinfo');
+  if (!info) return;
+  info.textContent = msg;
+  info.style.color = isErr ? 'var(--red-fg)' : 'var(--tx-lo)';
+  info.dataset.err = isErr ? '1' : '';
+}
 function loadApps(){
   api('/apps').then(r => {
     if (!r || !r.apps || !appSel) return;
@@ -5529,19 +7796,26 @@ function loadApps(){
       o.textContent = a.label + (a.has_hw ? '  [hw]' : '') + (a.has_sim ? '  [sim]' : '');
       if (a.current) { o.selected = true;
         const info = document.getElementById('appinfo');
-        if (info) info.textContent = a.path;
+        // Keep a visible error: loadApps() is called by the failure path itself.
+        if (info && !info.dataset.err) info.textContent = a.path;
       }
       appSel.appendChild(o);
     });
   }).catch(() => {});
 }
 if (appSel) appSel.onchange = () => {
+  setAppMsg('');            // drop a previous failure before retrying
   api('/apps/select', {method:'POST', headers:{'Content-Type':'application/json'},
                        body: JSON.stringify({id: appSel.value})})
     .then(r => {
-      if (r && r.error) { setStatus('app switch failed: ' + r.error); loadApps(); return; }
+      // Report next to the selector, NOT via setStatus(): #livestatus lives
+      // inside #overlayctl, which switchView() hides in Device Map view — the
+      // default — so a failure there is completely invisible and the dropdown
+      // just silently snaps back.
+      if (r && r.error) { setAppMsg(r.error, true); loadApps(); return; }
+      setAppMsg('');
       location.reload();
-    }).catch(() => {});
+    }).catch(() => setAppMsg('daemon offline — cannot switch apps', true));
 };
 
 // ── UI state reporting ───────────────────────────────────────────────────────
@@ -5572,26 +7846,421 @@ function probeLLM(){
     // Default-select the LLM tab.
     const tab = document.querySelector('#contabs .contab[data-pane="llmpane"]');
     if (tab) tab.click();
-    // Show any transcript already buffered (e.g. after a page reload).
-    if (r.data){ llmAddMsg('ai', llmRenderText(r.data)); }
+    // Skip past any existing transcript — it's gone from the DOM on page reload.
+    // Replaying the full history would block the main thread on large sessions.
     if (r.next != null) LLM.off = r.next;
+    if (r.active){
+      // Reloaded mid-turn: adopt the in-flight answer instead of letting it
+      // land in a transcript nobody is tailing.
+      LLM.pendingId = llmAddMsg('ai', '');
+      llmShowThink(true);
+      llmStopPoll();
+      LLM.poll = setInterval(llmPollOnce, 700);
+    }
   }).catch(() => {});   // no daemon → stay static
 }
 if (location.protocol === 'http:' || location.protocol === 'https:') probeLLM();
+
+// ── Selection → LLM popup ──────────────────────────────────────────────────
+(function(){
+  const popup = document.createElement('div');
+  popup.id = 'sel-popup';
+  popup.textContent = '+ Add context';
+  document.body.appendChild(popup);
+
+  // Accumulated context snippets: unique id -> {label, text}. Keyed by id rather
+  // than label so several selections from the same pane accumulate instead of
+  // overwriting each other; the "#n" suffix is derived at render time.
+  const ctxSnippets = new Map();
+  let ctxSeq = 0;
+
+  // Regions where a selection is meaningful to send to the LLM.
+  const REGIONS = [
+    { id:'panel',  pane:'Info pane' },
+    { id:'conout', pane:'aiegdb output' },
+    { id:'llmmsg', pane:'LLM history' },
+  ];
+
+  function selectionRegion(){
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.toString().trim()) return null;
+    const anchor = sel.anchorNode;
+    if (!anchor) return null;
+    for (const r of REGIONS){
+      const el = document.getElementById(r.id);
+      if (el && el.contains(anchor)) return r;
+    }
+    return null;
+  }
+
+  // Build a human-readable source label describing exactly where the text came from.
+  function buildSourceLabel(region){
+    const parts = [region.pane];
+    if (UISTATE.selected_tile){
+      const [c, r] = UISTATE.selected_tile;
+      parts.push('tile('+c+','+r+')');
+      if (UISTATE.channel) parts.push(UISTATE.channel);
+    } else if (UISTATE.flow != null){
+      parts.push('flow f'+UISTATE.flow);
+    }
+    if (region.id === 'panel' && UISTATE.tile_tab){
+      const tabNames = {hi:'Schedule tab', mid:'IR tab', lo:'Code tab'};
+      parts.push(tabNames[UISTATE.tile_tab] || UISTATE.tile_tab);
+    }
+    if (UISTATE.console_pane === 'searchpane' && UISTATE.search){
+      parts.push('search "'+UISTATE.search+'"');
+    }
+    return parts.join(' · ');
+  }
+
+  function ctxBlock(label, text){ return '[context from ' + label + ']\n' + text; }
+
+  // Labels are assigned once, at creation, and never renumbered: a pill is a
+  // real element in the message, and renaming it under the user is worse than
+  // a stale "#2".
+  function ctxUniqueLabel(base){
+    let n = 0;
+    ctxSnippets.forEach(s => { if (s.base === base) n++; });
+    return n ? base + ' #' + (n + 1) : base;
+  }
+
+  // Build the inline chip. contenteditable="false" makes it an atom: the caret
+  // steps over it and backspace removes the whole thing.
+  function ctxPillNode(id, snip){
+    const pill = document.createElement('span');
+    pill.className = 'msg-pill';
+    pill.contentEditable = 'false';
+    pill.dataset.cid = id;
+    pill.title = ctxBlock(snip.label, snip.text);
+    const t = document.createElement('span');
+    t.textContent = snip.label;
+    const x = document.createElement('span');
+    x.className = 'mp-x';
+    x.textContent = '\u00d7';
+    pill.appendChild(t);
+    pill.appendChild(x);
+    return pill;
+  }
+
+  // Zero-width space. Every chip is flanked by one so the caret always has a
+  // text position on each side: without them the browser cannot put the caret
+  // before a chip that starts the message, or between two adjacent chips.
+  const ZW = '\u200b';
+
+  // The caret inside #llmin, remembered across focus loss. Selecting text in
+  // another pane moves the document selection out of the box, so by the time
+  // "+ Add context" is clicked there is no live caret to insert at — which is
+  // why every pill used to land at the end regardless of where you were typing.
+  let ctxCaret = null;
+  document.addEventListener('selectionchange', () => {
+    const inp = document.getElementById('llmin');
+    const sel = window.getSelection();
+    if (!inp || !sel || !sel.rangeCount) return;
+    const r = sel.getRangeAt(0);
+    if (inp.contains(r.startContainer)) ctxCaret = r.cloneRange();
+  });
+
+  function ctxPlaceCaret(node, offset){
+    const sel = window.getSelection();
+    const r = document.createRange();
+    r.setStart(node, offset);
+    r.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(r);
+    ctxCaret = r.cloneRange();
+  }
+
+  // Insert a chip at the remembered caret, then put the caret after it.
+  function ctxInsertNode(node){
+    const inp = document.getElementById('llmin');
+    if (!inp) return;
+    let range = (ctxCaret && inp.contains(ctxCaret.startContainer))
+      ? ctxCaret.cloneRange() : null;
+    if (!range){
+      range = document.createRange();
+      range.selectNodeContents(inp);
+      range.collapse(false);
+    }
+    range.deleteContents();
+    const before = document.createTextNode(ZW);
+    const after  = document.createTextNode(ZW);
+    const frag = document.createDocumentFragment();
+    frag.appendChild(before);
+    frag.appendChild(node);
+    frag.appendChild(after);
+    range.insertNode(frag);
+    inp.focus();
+    ctxPlaceCaret(after, after.nodeValue.length);
+    inp.dispatchEvent(new Event('input'));
+  }
+
+  // The chip immediately before a collapsed caret, or null. Only the flanking
+  // ZW counts as "nothing in between" — a space the user typed is real text and
+  // must be deleted first, so backspace stays predictable.
+  function ctxChipBefore(range){
+    let n = range.startContainer;
+    if (n.nodeType === 3){
+      if (n.nodeValue.slice(0, range.startOffset) !== ZW) return null;
+      n = n.previousSibling;
+    } else {
+      n = n.childNodes[range.startOffset - 1] || null;
+    }
+    return (n && n.nodeType === 1 && n.classList
+            && n.classList.contains('msg-pill')) ? n : null;
+  }
+
+  // Remove a chip together with the ZW flanks we added around it.
+  function ctxRemoveChip(pill){
+    const inp = document.getElementById('llmin');
+    const prev = pill.previousSibling, next = pill.nextSibling;
+    const anchor = (prev && prev.nodeType === 3) ? prev : null;
+    if (next && next.nodeType === 3 && next.nodeValue === ZW) next.remove();
+    if (prev && prev.nodeType === 3 && prev.nodeValue === ZW) prev.remove();
+    pill.remove();
+    if (inp){
+      if (anchor && anchor.parentNode) ctxPlaceCaret(anchor, anchor.nodeValue.length);
+      else ctxPlaceCaret(inp, inp.childNodes.length);
+      inp.dispatchEvent(new Event('input'));
+    }
+  }
+
+  // Read the message back out: text as typed, pills as whatever `pill` maps them
+  // to. One walker serves both the outgoing prompt (full context blocks) and the
+  // plain-text check for "is there anything to send".
+  function ctxReadInput(pill){
+    const inp = document.getElementById('llmin');
+    if (!inp) return {text:'', sent:[]};
+    return ctxReadNode(inp, pill);
+  }
+
+  function ctxReadNode(root, pill){
+    const sent = [], out = [];
+    (function walk(node){
+      node.childNodes.forEach(n => {
+        if (n.nodeType === 3){
+          out.push(n.nodeValue.replace(/\u200b/g, '').replace(/\u00a0/g, ' '));
+          return;
+        }
+        if (n.nodeType !== 1) return;
+        if (n.classList && n.classList.contains('msg-pill')){
+          const snip = ctxSnippets.get(+n.dataset.cid);
+          if (snip){ sent.push(snip); out.push(pill(snip)); }
+          return;
+        }
+        if (n.tagName === 'BR'){ out.push('\n'); return; }
+        // A block the browser produced (paste, or an Enter we did not intercept)
+        // starts its own line, so it needs a break before as well as after.
+        const block = (n.tagName === 'DIV' || n.tagName === 'P');
+        if (block && out.length && !/\n$/.test(out[out.length - 1])) out.push('\n');
+        walk(n);
+        if (block) out.push('\n');
+      });
+    })(root);
+    return {text:out.join(''), sent:sent};
+  }
+
+  // Insert a whole fragment (paste) at the remembered caret.
+  function ctxInsertFrag(frag){
+    const inp = document.getElementById('llmin');
+    if (!inp || !frag.childNodes.length) return;
+    const last = frag.childNodes[frag.childNodes.length - 1];
+    let range = (ctxCaret && inp.contains(ctxCaret.startContainer))
+      ? ctxCaret.cloneRange() : null;
+    if (!range){
+      range = document.createRange();
+      range.selectNodeContents(inp);
+      range.collapse(false);
+    }
+    range.deleteContents();
+    range.insertNode(frag);
+    inp.focus();
+    if (last.nodeType === 3) ctxPlaceCaret(last, last.nodeValue.length);
+    else if (last.parentNode)
+      ctxPlaceCaret(last.parentNode, Array.prototype.indexOf.call(
+        last.parentNode.childNodes, last) + 1);
+    inp.dispatchEvent(new Event('input'));
+  }
+
+  // Rebuild a pasted selection. Chips are recreated from data-cid; EVERYTHING
+  // else becomes plain text, so foreign markup can never enter the box. Parsed
+  // with DOMParser rather than innerHTML: that document is inert, so a pasted
+  // <img onerror> neither loads nor fires.
+  function ctxFragFromHtml(html){
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const frag = document.createDocumentFragment();
+    // A newline goes BEFORE a block, never after. Emitting one after each block
+    // added a trailing blank line per wrapper — and a copy out of the box is
+    // wrapped, so every paste grew by a line.
+    //
+    // A chip is inline text and must never start or end a line of its own. The
+    // wrapper markup around a copied chip would otherwise put a break on each
+    // side, dropping the pasted chip onto its own line. `justPill` swallows the
+    // wrapper break that follows one, `dropNl` removes the one that preceded
+    // it. An explicit <br> is user intent and always stands.
+    let justPill = false;
+    const nl = () => {
+      if (!frag.childNodes.length) return;
+      if (justPill){ justPill = false; return; }
+      const last = frag.childNodes[frag.childNodes.length - 1];
+      if (last && last.nodeType === 3 && /\n$/.test(last.nodeValue)) return;
+      frag.appendChild(document.createTextNode('\n'));
+    };
+    const dropNl = () => {
+      const last = frag.childNodes[frag.childNodes.length - 1];
+      if (last && last.nodeType === 3 && /^\n+$/.test(last.nodeValue))
+        frag.removeChild(last);
+    };
+    (function walk(node){
+      node.childNodes.forEach(n => {
+        if (n.nodeType === 3){
+          const t = n.nodeValue.replace(/\u200b/g, '');
+          if (t) justPill = false;
+          frag.appendChild(document.createTextNode(t));
+          return;
+        }
+        if (n.nodeType !== 1) return;
+        if (n.classList && n.classList.contains('msg-pill')){
+          const cid = +n.dataset.cid;
+          const snip = ctxSnippets.get(cid);
+          dropNl();
+          if (snip){
+            frag.appendChild(document.createTextNode(ZW));
+            frag.appendChild(ctxPillNode(cid, snip));
+            frag.appendChild(document.createTextNode(ZW));
+          } else {
+            // Pasted from another page/session: the snippet is gone, so keep
+            // the readable token rather than a chip that resolves to nothing.
+            frag.appendChild(document.createTextNode(
+              '[[' + (n.textContent || '').replace(/\u00d7/g, '').trim() + ']]'));
+          }
+          justPill = true;
+          return;
+        }
+        if (n.tagName === 'BR'){
+          justPill = false;
+          frag.appendChild(document.createTextNode('\n'));
+          return;
+        }
+        if (n.tagName === 'DIV' || n.tagName === 'P') nl();
+        walk(n);
+      });
+    })(doc.body);
+    return frag;
+  }
+
+  // The selection inside the box, as {text, html} — text via the same walker
+  // the sender uses (so a chip reads as [[label]], never as its × glyph).
+  function ctxSelectionClip(){
+    const sel = window.getSelection();
+    const inp = document.getElementById('llmin');
+    if (!inp || !sel || !sel.rangeCount || sel.isCollapsed) return null;
+    const r = sel.getRangeAt(0);
+    if (!inp.contains(r.commonAncestorContainer)) return null;
+    const frag = r.cloneContents();
+    const holder = document.createElement('div');
+    holder.appendChild(frag.cloneNode(true));
+    return {range:r,
+            text: ctxReadNode(frag, s => '[[' + s.label + ']]').text,
+            html: holder.innerHTML};
+  }
+
+  function ctxClearInput(){
+    const inp = document.getElementById('llmin');
+    if (inp) inp.innerHTML = '';
+    ctxCaret = null;      // its containers are detached now
+  }
+
+  // llmSend calls this: the pills ARE the message, so substitution is just the
+  // walk above with pills rendered as their context block.
+  function drainCtxSnippets(){
+    const r = ctxReadInput(s => '\n' + ctxBlock(s.label, s.text) + '\n');
+    ctxSnippets.clear();
+    return r;
+  }
+  window._drainCtxSnippets = drainCtxSnippets;
+  // Plain text of the message, pills reduced to their label — used for the
+  // transcript echo and the "is there anything to send" check.
+  window._llmInputText = () => ctxReadInput(s => '[[' + s.label + ']]').text.trim();
+  window._hasCtxSnippets = () => {
+    const inp = document.getElementById('llmin');
+    return !!(inp && inp.querySelector('.msg-pill'));
+  };
+  window._llmClearInput = ctxClearInput;
+  // The keydown wiring lives with the input; it needs these internals.
+  window._ctxChipBefore = ctxChipBefore;
+  window._ctxRemoveChip = ctxRemoveChip;
+  window._ctxSelectionClip = ctxSelectionClip;
+  window._ctxFragFromHtml = ctxFragFromHtml;
+  window._ctxInsertFrag = ctxInsertFrag;
+
+  function hidePopup(){ popup.style.display = 'none'; }
+
+  document.addEventListener('mouseup', e => {
+    if (e.target === popup) return;
+    hidePopup();
+    if (!selectionRegion()) return;
+    const sel = window.getSelection();
+    const range = sel.getRangeAt(0);
+    const rect  = range.getBoundingClientRect();
+    if (!rect.width && !rect.height) return;
+    popup.style.left = (rect.left + rect.width / 2) + 'px';
+    popup.style.top  = (rect.top + window.scrollY - 30) + 'px';
+    popup.style.display = 'block';
+  });
+
+  document.addEventListener('mousedown', e => {
+    if (e.target !== popup) hidePopup();
+  });
+  document.addEventListener('scroll', hidePopup, true);
+
+  popup.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); });
+  popup.addEventListener('click', e => {
+    e.preventDefault();
+    const region = selectionRegion();
+    const sel = window.getSelection();
+    const text = sel ? sel.toString().trim() : '';
+    if (!text || !region){ hidePopup(); return; }
+    const label = buildSourceLabel(region);
+    // Every selection becomes its own pill; the same text from the same place
+    // twice is two pills, which is what placing it in two spots means now.
+    const id = ++ctxSeq;
+    const snip = {base:label, label:ctxUniqueLabel(label), text:text};
+    ctxSnippets.set(id, snip);
+    const cmdconsole = document.getElementById('cmdconsole');
+    if (cmdconsole && cmdconsole.classList.contains('hide'))
+      cmdconsole.classList.remove('hide');
+    const llmTab = document.querySelector('#contabs .contab[data-pane="llmpane"]');
+    if (llmTab) llmTab.click();
+    sel.removeAllRanges();
+    ctxInsertNode(ctxPillNode(id, snip));
+    hidePopup();
+  });
+})();
+
+// Open on the Device Map. Deferred to the very end of the script because
+// buildDeviceMap() reaches for consts (DM_COLORS et al) declared above it —
+// calling any earlier would hit their temporal dead zone.
+switchView('map');
 </script>
 </body>
 </html>
 """
 
 
-def _palmyra_enabled():
-    """The palmyra board option is shown only when ~/USERENV/ENABLEPAL holds '1'.
-    Missing/unreadable file (or any other value) hides it."""
+_AIEDBG_DEVICE_FALLBACK = ("pal", "vck190", "vek280", "vek385")
+
+
+def _aiedbg_devices():
+    """Board options for the dropdown, taken from aiedbg's own device table.
+
+    These values ARE the `aiedbg -d` names, so the UI selection and the debug
+    device can no longer drift apart. Falls back to a fixed tuple when aiedbg
+    is not importable (static host_schedule.html generation)."""
     try:
-        with open(os.path.expanduser('~/USERENV/ENABLEPAL')) as f:
-            return f.read().strip() == '1'
-    except OSError:
-        return False
+        from aiedbg.device_config import DEVICE_CONFIGS
+        return sorted(DEVICE_CONFIGS)
+    except Exception:
+        return list(_AIEDBG_DEVICE_FALLBACK)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5718,15 +8387,29 @@ def write_code_cache(view, cache_dir=None, workdir=None):
     return cache_dir, count
 
 
+def _aiegdb_spec_json():
+    """The aiegdb command grammar, baked into the page as the autocomplete's
+    offline fallback. The daemon serves a live copy at /aiegdb/spec; the
+    standalone host_schedule.html has no daemon, so it needs this. Importing
+    aiegdb must never be fatal — the viewer is useful without a console."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import aiegdb
+        return json.dumps(aiegdb.command_spec(), indent=None)
+    except Exception:
+        return 'null'
+
+
 def render_html(view):
     """Return the full UI page with `view` injected. Used both to write the
     standalone file and to serve a selected app live from
     schedule_debug_server."""
     data_json = json.dumps(view, indent=None)
     html = HTML_TEMPLATE.replace('/*__DATA__*/ null', data_json)
-    palmyra_opt = ('          <option value="palmyra">palmyra</option>\n'
-                   if _palmyra_enabled() else '')
-    return html.replace('<!--__PALMYRA_OPTION__-->', palmyra_opt)
+    html = html.replace('/*__GDBSPEC__*/ null', _aiegdb_spec_json())
+    opts = "".join('          <option value="%s">%s</option>\n' % (d, d)
+                   for d in _aiedbg_devices())
+    return html.replace('<!--__DEVICE_OPTIONS__-->', opts)
 
 
 def write_html(view, out_path):

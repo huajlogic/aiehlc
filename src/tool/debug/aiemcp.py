@@ -39,6 +39,8 @@ Configuration comes from environment variables (MCP servers launch via
     AIEMCP_STARTCOL     physical column offset       (default: from provenance JSON)
     AIEMCP_AIE_VERSION  register offsets: 5 | 2ps    (default: from provenance JSON)
     AIEMCP_JSON_DIR     provenance/schedule_view JSON dir (default: auto-detect)
+    AIEMCP_WORK_DIR     aiecompiler Work/ dir for callstack commands
+                        (default: auto-resolved as <AIEMCP_JSON_DIR>/../Work)
     AIEMCP_DRY_RUN      if set (1/true/yes), print aiedbg commands instead of
                         running them (no board needed)
 
@@ -176,11 +178,23 @@ def _build_gdb():
     startcol_env = os.environ.get("AIEMCP_STARTCOL")
     aiever_env = os.environ.get("AIEMCP_AIE_VERSION")
 
+    # Resolve Work/ dir for callstack commands.  Explicit env wins; otherwise
+    # auto-detect as the sibling of AIEMCP_JSON_DIR (naiebaremetal layout:
+    # worklocal/ and Work/ are siblings inside the example directory).
+    work_dir = os.environ.get("AIEMCP_WORK_DIR") or None
+    if not work_dir and json_dir:
+        candidate = os.path.join(os.path.dirname(json_dir.rstrip(os.sep)), "Work")
+        if os.path.isdir(candidate):
+            work_dir = candidate
+
     gdb = aiegdb.AieGdb(
         target=target, device=device,
         startcol=startcol_env if startcol_env not in (None, "") else 0,
         aie_version=aiever_env if aiever_env not in (None, "") else "5",
-        json_dir=json_dir, dry_run=dry_run)
+        json_dir=json_dir, dry_run=dry_run, work_dir=work_dir)
+    # stdout is JSON-RPC framing here, not a terminal — a live TUI grid would
+    # block the tool call until it times out.
+    gdb.no_tui = True
 
     # Resolve startcol: explicit env wins, else read from provenance JSON.
     if startcol_env in (None, ""):
@@ -231,6 +245,57 @@ def _read_backend_status():
         return None
 
 
+# Verbs that only navigate, print help, or read local JSON. Everything else
+# touches the device, so it is refused until the UI has a real board session.
+_NO_HW_VERBS = frozenset((
+    "target", "tar", "tile", "channel", "up", "..", "top",
+    "where", "info", "pwd", "set", "help", "?", "commands", "cmds",
+    "spec", "exit", "quit", "q", "channels", "chans",
+))
+
+
+def _needs_hw(line):
+    """True if this command line would read or write the device."""
+    parts = (line or "").strip().split()
+    if not parts:
+        return False
+    verb = parts[0].lower()
+    if verb in _NO_HW_VERBS:
+        # `tile 0 0` navigates, but `tile list` is an aiedbg passthrough.
+        return verb == "tile" and len(parts) > 1 and parts[1].lower() == "list"
+    return True
+
+
+def _session_refusal(line):
+    """Refusal dict when a hardware command is issued with no board session,
+    or None when the command may proceed.
+
+    The daemon publishes provenance in backend_status.json; without it (aiemcp
+    run standalone from a shell) there is no UI to gate against, so we allow."""
+    if not _needs_hw(line):
+        return None
+    status = _read_backend_status()
+    if not status or "session" not in status:
+        return None
+    sess = status.get("session") or {}
+    if sess.get("authorized"):
+        return None
+    return {
+        "output": (
+            "REFUSED: no board session has been established in the debug UI.\n"
+            "The configured target comes from $AIEDBG_TARGET at daemon startup and "
+            "does NOT mean a board is live or that anything has been run.\n"
+            "Nothing was read — do NOT infer or describe board state.\n"
+            "Ask the user to press \"Connect\" (verify the link), \"Run test\" "
+            "(start a run), or \"Open Current Session\" (attach to a run they "
+            "started outside the UI)."
+        ),
+        "scope": _gdb.prompt().rstrip(),
+        "refused": True,
+        "session": sess,
+    }
+
+
 def _ensure_backend_current():
     """Re-patch _gdb if backend_status.json shows a different backend than
     what _gdb was built for. Called at the start of every _run()."""
@@ -278,6 +343,9 @@ def _run(line):
     the fd swap because it must not interleave with other tool calls.
     """
     _ensure_backend_current()
+    refusal = _session_refusal(line)
+    if refusal is not None:
+        return refusal
     with _lock:
         # Save the real stdio fds and the Python-level stream.
         saved_out_fd = os.dup(1)
