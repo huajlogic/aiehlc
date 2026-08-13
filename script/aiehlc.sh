@@ -20,7 +20,9 @@ run_cmd() {
 }
 
 usage() {
-    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug] [-gdb]"
+    echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug] [-gdb] [--profiling] [--skip-bss]"
+    echo "  --profiling   build the host with the PMU profiling layer (-DAIEHLC_PROFILING=1)"
+    echo "  --skip-bss    skip .bss zero-init on kernel load (-DAIEHLC_SKIP_BSS_DEFAULT=1)"
     return 1
 }
 
@@ -165,6 +167,10 @@ USE_LOCAL_AIERT_BSP=0
 PRETTY_DEBUG=0
 SIM_TILES=""
 GDB_MODE=0
+# Reset every run: this script is sourced, so a flag from a previous invocation
+# in the same shell would otherwise persist.
+PROFILING=0
+SKIP_BSS=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -help)
@@ -213,6 +219,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         -gdb|--gdb)
             GDB_MODE=1
+            shift
+            ;;
+        --profiling)
+            PROFILING=1
+            shift
+            ;;
+        --skip-bss)
+            SKIP_BSS=1
             shift
             ;;
         *)
@@ -487,8 +501,13 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     echo "${runtime_source_file}" > "${WORKLOCAL_DIR}/app_source.txt"
 
     # Run hostcompile.sh with WORKLOCAL_DIR pointing at aout/worklocal.
+    hc_extra_defs="${EXTRA_DEFS:-}"
+    if [ "${SKIP_BSS}" -eq 1 ]; then
+        hc_extra_defs="${hc_extra_defs} -DAIEHLC_SKIP_BSS_DEFAULT=1"
+    fi
     WORKLOCAL_DIR="${WORKLOCAL_DIR}" AIE_VERSION="${aie_version}" PLATFORM="${platform}" \
         SIM_TILES="${SIM_TILES:-}" DEBUG_SYMS="${DEBUG_SYMS}" \
+        AIEHLC_PROFILING="${PROFILING}" EXTRA_DEFS="${hc_extra_defs}" \
         bash "${AIEHLC_DIR}/script/hostcompile.sh"
     TILING_RC=$?
     if [ $TILING_RC -ne 0 ]; then

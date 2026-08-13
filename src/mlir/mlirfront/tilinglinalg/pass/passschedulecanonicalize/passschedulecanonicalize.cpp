@@ -468,25 +468,24 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
                                                                         loadOp.getKernelGroup());
         launchEvent = launchOp.getEvent();
 
-        // Move only CORE-tile StartIoOp ops to AFTER the merged LaunchKernelGroupOp.
-        // ELF loading (triggered by LoadKernelGroupOp) zeroes BSS in core
-        // tile memory.  If core S2MM DMA StartIoOps fire before the ELF load,
-        // DMA-written data gets overwritten with zeros.  By placing core StartIoOps
-        // after the launch, the ELF is fully loaded before DMAs start writing.
-        // Shim StartIoOps remain in their original position (before load_kernel_group)
-        // so that shim DMA channels are armed first.
         SmallVector<Operation *> coreStartIoOps;
+        SmallVector<Operation *> shimSenderStartIoOps;
         for (Operation &op : *hostBody) {
             if (auto startIo = dyn_cast<dfschedule::StartIoOp>(&op)) {
-                // Trace: StartIoOp → io_handle (ConfigCreateIoOp) → tile (DeclareTileOp)
                 bool isShim = false;
+                bool isMM2S = false;
                 if (auto createIo = startIo.getIoHandle().getDefiningOp<dfschedule::ConfigCreateIoOp>()) {
                     if (auto declareTile = createIo.getTile().getDefiningOp<dfschedule::DeclareTileOp>()) {
                         isShim = (declareTile.getRow() == 0);
                     }
+                    if (auto dirAttr = createIo->getAttrOfType<mlir::StringAttr>("direction"))
+                        isMM2S = (dirAttr.getValue() == "MM2S");
                 }
-                if (!isShim)
+                if (!isShim) {
                     coreStartIoOps.push_back(&op);
+                } else if (isMM2S) {
+                    shimSenderStartIoOps.push_back(&op);
+                }
             }
         }
         Operation *insertAfter = launchOp;
@@ -494,6 +493,12 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
             op->moveAfter(insertAfter);
             insertAfter = op;
         }
+        for (Operation *op : shimSenderStartIoOps) {
+            op->moveAfter(insertAfter);
+            insertAfter = op;
+        }
+        llvm::errs() << "[ScheduleCanonicalize] StartIo ordering: " << coreStartIoOps.size() << " core, "
+                     << shimSenderStartIoOps.size() << " shim-MM2S moved after launch\n";
     }
 
     // Prepend launch event so wait covers it first.

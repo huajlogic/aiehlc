@@ -46,6 +46,218 @@ XAie_DevInst *g_DevInst = NULL;
 
 XAie_DevInst *getOrCreateDeviceInstance(void) { return g_DevInst; }
 
+#ifndef AIEHLC_PROFILING
+#define AIEHLC_PROFILING 0
+#endif
+
+#if AIEHLC_PROFILING && defined(__aarch64__) && !defined(__AIESIM__)
+static inline unsigned long long __rt_pmccntr(void) {
+    unsigned long long v;
+    __asm__ volatile("mrs %0, pmccntr_el0" : "=r"(v));
+    return v;
+}
+#else
+static inline unsigned long long __rt_pmccntr(void) { return 0ULL; }
+#endif
+
+#if AIEHLC_PROFILING
+#define RT_PROF_TIC() __rt_pmccntr()
+#define RT_PROF_ADD(cyc, n, t0)                                                                                        \
+    do {                                                                                                               \
+        (cyc) += (__rt_pmccntr() - (t0));                                                                              \
+        (n)++;                                                                                                         \
+    } while (0)
+#define RT_PROF_PHASE(ph, t0) __rt_ph_add((ph), (t0))
+#define RT_PROF_INC(v)                                                                                                 \
+    do {                                                                                                               \
+        (v)++;                                                                                                         \
+    } while (0)
+#else
+#define RT_PROF_TIC() 0ULL
+#define RT_PROF_ADD(cyc, n, t0)                                                                                        \
+    do {                                                                                                               \
+        (void)(t0);                                                                                                    \
+    } while (0)
+#define RT_PROF_PHASE(ph, t0)                                                                                          \
+    do {                                                                                                               \
+        (void)(t0);                                                                                                    \
+    } while (0)
+#define RT_PROF_INC(v)                                                                                                 \
+    do {                                                                                                               \
+    } while (0)
+#endif
+
+static unsigned long long g_wait_io_cycles = 0ULL;
+static unsigned int g_wait_io_calls = 0U;
+static unsigned long long g_wait_io_iters = 0ULL;
+
+enum { PH_KLOAD = 0, PH_BDCFG = 1, PH_COREEN = 2, PH_STARTIO = 3, PH_N = 4 };
+static unsigned long long g_ph_cyc[PH_N] = {0, 0, 0, 0};
+static unsigned int g_ph_calls[PH_N] = {0, 0, 0, 0};
+
+static unsigned long long g_bd_init_cyc = 0ULL, g_bd_write_cyc = 0ULL;
+static unsigned int g_bd_init_n = 0U, g_bd_write_n = 0U;
+static unsigned long long g_bd_mid_cyc = 0ULL, g_bd_tail_cyc = 0ULL;
+static unsigned int g_bd_mid_n = 0U, g_bd_tail_n = 0U;
+static unsigned long long g_bd_gtt_cyc = 0ULL, g_bd_saddr_cyc = 0ULL, g_bd_en_cyc = 0ULL;
+static unsigned int g_bd_gtt_n = 0U, g_bd_saddr_n = 0U, g_bd_en_n = 0U;
+static unsigned long long g_kl_elf_cyc = 0ULL, g_kl_rst_cyc = 0ULL;
+static unsigned int g_kl_elf_n = 0U, g_kl_rst_n = 0U;
+
+#if AIEHLC_PROFILING
+static inline void __rt_ph_add(int ph, unsigned long long t0) {
+    g_ph_cyc[ph] += (__rt_pmccntr() - t0);
+    g_ph_calls[ph]++;
+}
+#endif
+
+void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls) {
+    if (cycles)
+        *cycles = g_wait_io_cycles;
+    if (calls)
+        *calls = g_wait_io_calls;
+}
+void __Runtime_wait_io_iters(unsigned long long *iters) {
+    if (iters)
+        *iters = g_wait_io_iters;
+}
+void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls) {
+    for (int i = 0; i < PH_N; i++) {
+        if (cyc)
+            cyc[i] = g_ph_cyc[i];
+        if (calls)
+            calls[i] = g_ph_calls[i];
+    }
+}
+void __Runtime_bd_subphase_cycles(unsigned long long *init_cyc, unsigned int *init_n, unsigned long long *write_cyc,
+                                  unsigned int *write_n) {
+    if (init_cyc)
+        *init_cyc = g_bd_init_cyc;
+    if (init_n)
+        *init_n = g_bd_init_n;
+    if (write_cyc)
+        *write_cyc = g_bd_write_cyc;
+    if (write_n)
+        *write_n = g_bd_write_n;
+}
+void __Runtime_bd_midtail_cycles(unsigned long long *mid_cyc, unsigned int *mid_n, unsigned long long *tail_cyc,
+                                 unsigned int *tail_n) {
+    if (mid_cyc)
+        *mid_cyc = g_bd_mid_cyc;
+    if (mid_n)
+        *mid_n = g_bd_mid_n;
+    if (tail_cyc)
+        *tail_cyc = g_bd_tail_cyc;
+    if (tail_n)
+        *tail_n = g_bd_tail_n;
+}
+void __Runtime_bd_mid3_cycles(unsigned long long *gtt_cyc, unsigned int *gtt_n, unsigned long long *saddr_cyc,
+                              unsigned int *saddr_n, unsigned long long *en_cyc, unsigned int *en_n) {
+    if (gtt_cyc)
+        *gtt_cyc = g_bd_gtt_cyc;
+    if (gtt_n)
+        *gtt_n = g_bd_gtt_n;
+    if (saddr_cyc)
+        *saddr_cyc = g_bd_saddr_cyc;
+    if (saddr_n)
+        *saddr_n = g_bd_saddr_n;
+    if (en_cyc)
+        *en_cyc = g_bd_en_cyc;
+    if (en_n)
+        *en_n = g_bd_en_n;
+}
+void __Runtime_kload_split_cycles(unsigned long long *elf_cyc, unsigned int *elf_n, unsigned long long *rst_cyc,
+                                  unsigned int *rst_n) {
+    if (elf_cyc)
+        *elf_cyc = g_kl_elf_cyc;
+    if (elf_n)
+        *elf_n = g_kl_elf_n;
+    if (rst_cyc)
+        *rst_cyc = g_kl_rst_cyc;
+    if (rst_n)
+        *rst_n = g_kl_rst_n;
+}
+
+static int s_core_perf_probe_valid = 0;
+static XAie_LocType s_core_perf_probe_tile;
+static XAie_DevInst *s_core_perf_probe_dev = NULL;
+
+AieRC __Runtime_core_perf_setup(XAie_DevInst *dev, XAie_LocType tile) {
+    AieRC rc;
+    rc = XAie_PerfCounterSet(dev, tile, XAIE_CORE_MOD, 0, 0);
+    if (rc != XAIE_OK)
+        return rc;
+    rc = XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, 0, XAIE_EVENT_ACTIVE_CORE, XAIE_EVENT_ACTIVE_CORE);
+    if (rc != XAIE_OK)
+        return rc;
+    rc = XAie_PerfCounterSet(dev, tile, XAIE_CORE_MOD, 1, 0);
+    if (rc != XAIE_OK)
+        return rc;
+    rc = XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, 1, XAIE_EVENT_INSTR_VECTOR_CORE,
+                                    XAIE_EVENT_INSTR_VECTOR_CORE);
+    if (rc != XAIE_OK)
+        return rc;
+    rc = XAie_PerfCounterSet(dev, tile, XAIE_CORE_MOD, 2, 0);
+    if (rc != XAIE_OK)
+        return rc;
+    rc = XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, 2, XAIE_EVENT_STREAM_STALL_CORE,
+                                    XAIE_EVENT_STREAM_STALL_CORE);
+    if (rc != XAIE_OK)
+        return rc;
+    rc = XAie_PerfCounterSet(dev, tile, XAIE_CORE_MOD, 3, 0);
+    if (rc != XAIE_OK)
+        return rc;
+    rc =
+        XAie_PerfCounterControlSet(dev, tile, XAIE_CORE_MOD, 3, XAIE_EVENT_LOCK_STALL_CORE, XAIE_EVENT_LOCK_STALL_CORE);
+    if (rc != XAIE_OK)
+        return rc;
+    AIEHLC_LOG(printf("[aie_runtime] core_perf_setup OK tile(%u,%u)\n", (unsigned)tile.Col, (unsigned)tile.Row));
+    return XAIE_OK;
+}
+
+int __Runtime_core_perf_probe_valid(void) { return s_core_perf_probe_valid; }
+
+void __Runtime_core_perf_read_probe(uint32_t *active, uint32_t *vec_instr, uint32_t *stream_stall,
+                                    uint32_t *lock_stall) {
+    if (!s_core_perf_probe_valid) {
+        if (active)
+            *active = 0;
+        if (vec_instr)
+            *vec_instr = 0;
+        if (stream_stall)
+            *stream_stall = 0;
+        if (lock_stall)
+            *lock_stall = 0;
+        return;
+    }
+    XAie_LocType tile = s_core_perf_probe_tile;
+    XAie_DevInst *dev = s_core_perf_probe_dev;
+    if (active)
+        XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, 0, active);
+    if (vec_instr)
+        XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, 1, vec_instr);
+    if (stream_stall)
+        XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, 2, stream_stall);
+    if (lock_stall)
+        XAie_PerfCounterGet(dev, tile, XAIE_CORE_MOD, 3, lock_stall);
+}
+
+void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1) {
+    if (!s_core_perf_probe_valid) {
+        if (ch0)
+            *ch0 = 0;
+        if (ch1)
+            *ch1 = 0;
+        return;
+    }
+    XAie_LocType tile = s_core_perf_probe_tile;
+    XAie_DevInst *dev = s_core_perf_probe_dev;
+    if (ch0)
+        __Runtime_perfcnt_read(dev, tile, 0, ch0);
+    if (ch1)
+        __Runtime_perfcnt_read(dev, tile, 1, ch1);
+}
+
 // Global routing instance (kept for legacy path)
 XAie_RoutingInstance *g_RoutingInst = NULL;
 
@@ -614,11 +826,6 @@ XAie_DevInst *__Runtime_explicit_init(void) {
 
     __Runtime_routing_init(dev);
 
-    if (AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER)) {
-        __Runtime_perfcnt_setup_mm2s_bd_finished_partition(dev, 0, XAIE_NUM_COLS - 1, XAIE_AIE_TILE_ROW_START,
-                                                           XAIE_AIE_TILE_ROW_START + XAIE_AIE_TILE_NUM_ROWS - 1);
-    }
-
     AIEHLC_LOG(printf("[aie_runtime] explicit_init OK dev=%p\n", (void *)dev););
     g_DevInst = dev;
     return dev;
@@ -710,11 +917,6 @@ XAie_DevInst *__Runtime_explicit_init_partition(int startCol, int numCols) {
     }
     */
     __Runtime_routing_init(dev);
-
-    if (AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER)) {
-        __Runtime_perfcnt_setup_mm2s_bd_finished_partition(dev, 0, XAIE_NUM_COLS - 1, XAIE_AIE_TILE_ROW_START,
-                                                           XAIE_AIE_TILE_ROW_START + XAIE_AIE_TILE_NUM_ROWS - 1);
-    }
 
     AIEHLC_LOG(printf("[aie_runtime] explicit_init_partition OK startCol=%d numCols=%d dev=%p\n", startCol, numCols,
                       (void *)dev););
@@ -858,6 +1060,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
                                      int32_t next_bd, int32_t enable_packet, int32_t packet_id, int32_t acquire_lock_id,
                                      int32_t acquire_lock_val, int32_t release_lock_id, int32_t release_lock_val,
                                      int32_t out_of_order_bd_id) {
+    unsigned long long __bd_t0 = RT_PROF_TIC();
     XAie_DmaDesc DmaInst;
     XAie_DmaDescInit(dev, &DmaInst, tile);
     uint8_t tile_type = XAie_GetTileTypefromLoc(dev, tile);
@@ -958,6 +1161,7 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
         }
     }
 
+    RT_PROF_PHASE(PH_BDCFG, __bd_t0);
     return DmaInst;
 }
 
@@ -976,6 +1180,7 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
                                               int32_t dim_stride2, int32_t dim_wrap2, int32_t dim_stride3,
                                               int32_t dim_wrap3) {
 
+    unsigned long long __bd_t0 = RT_PROF_TIC();
     XAie_DmaDesc DmaInst;
     XAie_DmaDescInit(dev, &DmaInst, tile);
     uint8_t tile_type = XAie_GetTileTypefromLoc(dev, tile);
@@ -1069,6 +1274,7 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim(XAie_DevInst *dev, XAie_LocType ti
         e->next_bd = (int8_t)next_bd;
     }
 
+    RT_PROF_PHASE(PH_BDCFG, __bd_t0);
     return DmaInst;
 }
 
@@ -1092,6 +1298,7 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim_ooo(XAie_DevInst *dev, XAie_LocTyp
                                                   int32_t dim_stride2, int32_t dim_wrap2, int32_t iter_step_size,
                                                   int32_t iter_wrap) {
 
+    unsigned long long __bd_t0 = RT_PROF_TIC();
     XAie_DmaDesc DmaInst;
     XAie_DmaDescInit(dev, &DmaInst, tile);
     uint8_t tile_type = XAie_GetTileTypefromLoc(dev, tile);
@@ -1186,6 +1393,7 @@ XAie_DmaDesc __Runtime_dma_bd_config_multidim_ooo(XAie_DevInst *dev, XAie_LocTyp
         e->next_bd = (int8_t)next_bd;
     }
 
+    RT_PROF_PHASE(PH_BDCFG, __bd_t0);
     return DmaInst;
 }
 
@@ -1268,6 +1476,7 @@ void __Runtime_dma_channel_enable_ooo(XAie_DevInst *dev, XAie_LocType tile, int3
  *         pass it to __Runtime_wait_io/__Runtime_wait to block until completion.
  */
 struct_ioevent __Runtime_startio(XAie_DevInst *dev, struct_io io, int32_t bd_id, int32_t repeat) {
+    unsigned long long __sio_t0 = RT_PROF_TIC();
     struct_ioevent evt;
     evt.io = io;
     evt.timeout_us = 10000;
@@ -1316,6 +1525,7 @@ struct_ioevent __Runtime_startio(XAie_DevInst *dev, struct_io io, int32_t bd_id,
                (unsigned)io.bd_id);
     }
 
+    RT_PROF_PHASE(PH_STARTIO, __sio_t0);
     return evt;
 }
 
@@ -1332,6 +1542,53 @@ struct_ioevent _Runtime_startio_ooo(XAie_DevInst *dev, struct_io io, int32_t bd_
  * Load kernel ELF into tiles
  * Reference: aieml_perf.cc lines 123-125
  */
+#if !defined(__AIESIM__)
+static AieRC __Runtime_load_elf_mem_skip_bss(XAie_DevInst *dev, XAie_LocType loc, const unsigned char *elfmem) {
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elfmem;
+    u32 skipped = 0, loaded = 0;
+    for (u32 ph = 0; ph < ehdr->e_phnum; ph++) {
+        const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elfmem + ehdr->e_phoff + (u64)ph * sizeof(Elf32_Phdr));
+        if (phdr->p_type != (u32)PT_LOAD)
+            continue;
+        if (phdr->p_filesz == 0U) {
+            skipped++;
+            continue;
+        }
+        AieRC rc = XAie_LoadElfSection(dev, loc, elfmem + phdr->p_offset, phdr);
+        if (rc != XAIE_OK)
+            return rc;
+        loaded++;
+    }
+    AIEHLC_LOG(printf("[aie_runtime] skip-bss load: %u segs loaded, %u bss segs skipped\n", loaded, skipped));
+    return XAIE_OK;
+}
+#endif
+
+#if !defined(__AIESIM__)
+static int __Runtime_skip_bss_enabled(void) {
+#if defined(AIEHLC_SKIP_BSS_DEFAULT)
+    return (AIEHLC_SKIP_BSS_DEFAULT);
+#else
+    static int s_skip_bss = -1;
+    if (s_skip_bss < 0) {
+        const char *e = getenv("AIEHLC_SKIP_BSS");
+        s_skip_bss = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return s_skip_bss;
+#endif
+}
+#endif
+
+static void __Runtime_load_kernel_elf(XAie_DevInst *dev, XAie_LocType loc, unsigned char *elfmem) {
+#if !defined(__AIESIM__)
+    if (__Runtime_skip_bss_enabled()) {
+        __Runtime_load_elf_mem_skip_bss(dev, loc, elfmem);
+        return;
+    }
+#endif
+    XAie_LoadElfMem(dev, loc, elfmem);
+}
+
 struct_kernel_group __Runtime_load_kernel_group(XAie_DevInst *dev, XAie_LocType *tiles, int32_t num_tiles,
                                                 unsigned char **elf_buffers) {
     struct_kernel_group kg;
@@ -1352,7 +1609,7 @@ struct_kernel_group __Runtime_load_kernel_group(XAie_DevInst *dev, XAie_LocType 
             // #else
             XAie_CoreDisable(dev, tiles[i]);
             XAie_CoreReset(dev, tiles[i]);
-            XAie_LoadElfMem(dev, tiles[i], elf_buffers[i]);
+            __Runtime_load_kernel_elf(dev, tiles[i], elf_buffers[i]);
             XAie_CoreUnreset(dev, tiles[i]);
             // #endif
         }
@@ -1364,6 +1621,7 @@ struct_kernel_group __Runtime_load_kernel_group(XAie_DevInst *dev, XAie_LocType 
 /** Array-based variant: copies caller-provided tile array into the static buffer
  *  and loads the kernel ELF into each core tile. Supports up to MAX_KERNEL_TILES. */
 struct_kernel_group __Runtime_load_kernel_group_nt(XAie_DevInst *dev, XAie_LocType *tiles, int n) {
+    unsigned long long __kl_t0 = RT_PROF_TIC();
     AIEHLC_LOG(printf("[aie_runtime] load_kernel_group_nt n=%d\n", n););
     if (n > MAX_KERNEL_TILES) {
         printf("[aie_runtime] WARNING: tile count %d exceeds MAX_KERNEL_TILES %d, clamping\n", n, MAX_KERNEL_TILES);
@@ -1385,16 +1643,23 @@ struct_kernel_group __Runtime_load_kernel_group_nt(XAie_DevInst *dev, XAie_LocTy
         //   XAie_LoadElfMem(dev, s_kernel_tiles[i], s_active_kernel_elf);
         //   XAie_CoreUnreset(dev, s_kernel_tiles[i]);
         // #else
+        unsigned long long __kr0 = RT_PROF_TIC();
         XAie_CoreDisable(dev, s_kernel_tiles[i]);
         XAie_CoreReset(dev, s_kernel_tiles[i]);
-        XAie_LoadElfMem(dev, s_kernel_tiles[i], s_active_kernel_elf);
+        RT_PROF_ADD(g_kl_rst_cyc, g_kl_rst_n, __kr0);
+        unsigned long long __ke0 = RT_PROF_TIC();
+        __Runtime_load_kernel_elf(dev, s_kernel_tiles[i], s_active_kernel_elf);
+        RT_PROF_ADD(g_kl_elf_cyc, g_kl_elf_n, __ke0);
+        unsigned long long __ku0 = RT_PROF_TIC();
         XAie_CoreUnreset(dev, s_kernel_tiles[i]);
+        RT_PROF_ADD(g_kl_rst_cyc, g_kl_rst_n, __ku0);
         // #endif
     }
     struct_kernel_group kg;
     kg.tiles = s_kernel_tiles;
     kg.num_tiles = n;
     kg.elf_buffers = NULL;
+    RT_PROF_PHASE(PH_KLOAD, __kl_t0);
     return kg;
 }
 
@@ -1453,7 +1718,35 @@ struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_grou
     evt.timeout_us = 100000;
 
     AIEHLC_LOG(printf("[aie_runtime] launch_kernel_group num_tiles=%u\n", (unsigned)kg.num_tiles););
+
+#if AIEHLC_PROFILING
+    if (AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER)) {
+        for (uint32_t i = 0; i < kg.num_tiles; i++) {
+            if (__Runtime_is_aie_core_tile(kg.tiles[i]))
+                __Runtime_perfcnt_setup_mm2s_bd_finished(dev, kg.tiles[i]);
+        }
+    }
+    if (AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_CORE_PERF_COUNTER)) {
+        int chosen = 0;
+        for (uint32_t i = 0; i < kg.num_tiles; i++) {
+            if (__Runtime_is_aie_core_tile(kg.tiles[i])) {
+                __Runtime_core_perf_setup(dev, kg.tiles[i]);
+                if (!chosen) {
+                    s_core_perf_probe_tile = kg.tiles[i];
+                    s_core_perf_probe_valid = 1;
+                    s_core_perf_probe_dev = dev;
+                    chosen = 1;
+                    AIEHLC_LOG(printf("[aie_runtime] core_perf probe tile=(%u,%u)\n", (unsigned)kg.tiles[i].Col,
+                                      (unsigned)kg.tiles[i].Row));
+                }
+            }
+        }
+    }
+#endif
+
+    unsigned long long __ce_t0 = RT_PROF_TIC();
     __Runtime_core_run(dev, kg.tiles, kg.num_tiles);
+    RT_PROF_PHASE(PH_COREEN, __ce_t0);
 
     return evt;
 }
@@ -1500,25 +1793,23 @@ void __Runtime_wait_event(XAie_DevInst *dev, struct_event event) {
             printf("[aie_runtime] wait_event TIMEOUT after %u iters - continuing to debug snapshot\n", iter);
     }
 #else
-    uint32_t timeout_iters = 100;
-    uint32_t iter = 0;
-    do {
-        allDone = 1;
+    (void)allDone;
+    AIEHLC_LOG(printf("[aie_runtime] wait_event: not polling Core_Done (completion gated on"
+                      " output-DMA drain in wait_io)\n"));
+    if (AIEHLC_LOG_ENABLED()) {
         for (uint32_t i = 0; i < event.num_tiles; i++) {
-            if (!__Runtime_is_aie_core_tile(event.tiles[i])) {
+            if (!__Runtime_is_aie_core_tile(event.tiles[i]))
                 continue;
-            }
-            AieRC RC = XAie_CoreWaitForDone(dev, event.tiles[i], 0);
-            if (RC != XAIE_OK) {
-                allDone = 0;
-            }
+            u32 cs = 0;
+            u8 doneb = 0;
+            u32 pc = 0;
+            AieRC rcs = XAie_CoreGetStatus(dev, event.tiles[i], &cs);
+            XAie_CoreReadDoneBit(dev, event.tiles[i], &doneb);
+            XAie_CoreGetPCValue(dev, event.tiles[i], &pc);
+            printf("[corestat] tile(%u,%u) rc=%d status=0x%08x done=%u pc=0x%08x\n", (unsigned)event.tiles[i].Col,
+                   (unsigned)event.tiles[i].Row, (int)rcs, (unsigned)cs, (unsigned)doneb, (unsigned)pc);
         }
-        iter++;
-    } while (!allDone && iter < timeout_iters);
-    if (allDone)
-        AIEHLC_LOG(printf("[aie_runtime] wait_event done\n"););
-    else
-        printf("[aie_runtime] wait_event TIMEOUT after %u iters - continuing to debug snapshot\n", iter);
+    }
 #endif
 }
 
@@ -1529,6 +1820,7 @@ void __Runtime_wait_event(XAie_DevInst *dev, struct_event event) {
  * Reference: aeg_runtime_api.cpp waitDMAChannelTaskQueue / waitDMAChannelDone
  */
 void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
+    unsigned long long __wio_t0 = RT_PROF_TIC();
     XAie_LocType tile = io_event.io.tile_loc;
     uint8_t channel = io_event.io.channel_id;
     XAie_DmaDirection dir = io_event.io.direction;
@@ -1558,11 +1850,11 @@ void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
         }
     }
 #else
-    const uint32_t poll_interval_us = 1000 * 1000;
-    const uint32_t max_iters = 5;
+    const uint32_t max_iters = 50000000U;
     u8 numPendingBDs = 1;
     uint32_t iter = 0;
     while (numPendingBDs > 0) {
+        RT_PROF_INC(g_wait_io_iters);
         AieRC rc = XAie_DmaGetPendingBdCount(dev, tile, channel, dir, &numPendingBDs);
         if (rc != XAIE_OK) {
             printf("[aie_runtime] wait_io ERROR: XAie_DmaGetPendingBdCount "
@@ -1570,19 +1862,10 @@ void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
                    (int)rc, (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)channel, (int)dir);
             return;
         }
-        if (numPendingBDs > 0) {
-            if (++iter >= max_iters) {
-                printf("[aie_runtime] wait_io TIMEOUT after %u ms "
-                       "tile(%u,%u) ch=%u dir=%d pending=%u\n",
-                       (unsigned)(max_iters * poll_interval_us / 1000), (unsigned)tile.Col, (unsigned)tile.Row,
-                       (unsigned)channel, (int)dir, (unsigned)numPendingBDs);
-                return;
-            } else if (AIEHLC_LOG_ENABLED()) {
-                printf("[aie_runtime] wait_io pending tile(%u,%u) ch=%u dir=%d pending=%u iter=%u\n",
-                       (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)channel, (int)dir, (unsigned)numPendingBDs,
-                       (unsigned)iter);
-            }
-            usleep(poll_interval_us);
+        if (numPendingBDs > 0 && ++iter >= max_iters) {
+            printf("[aie_runtime] wait_io TIMEOUT tile(%u,%u) ch=%u dir=%d pending=%u\n", (unsigned)tile.Col,
+                   (unsigned)tile.Row, (unsigned)channel, (int)dir, (unsigned)numPendingBDs);
+            return;
         }
     }
 #endif
@@ -1610,6 +1893,7 @@ void __Runtime_wait_io(XAie_DevInst *dev, struct_ioevent io_event) {
         }
     }
 #endif
+    RT_PROF_ADD(g_wait_io_cycles, g_wait_io_calls, __wio_t0);
 }
 
 /**
