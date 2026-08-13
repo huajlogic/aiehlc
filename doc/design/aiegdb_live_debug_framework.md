@@ -341,8 +341,9 @@ Browser LLM tab  ── POST /llm/reset ────────►  daemon kill
 
 The reader thread decodes each stdout JSON line and appends readable text to an
 in-memory buffer (`_llm_buf`); `/llm/poll` returns `{data: _llm_buf[offset:],
-next, active}`; the browser polls until `active === false` — exactly the
-`/applog?offset=N` tail pattern used for the run console.
+next, active, llm_generation, llm_reset_reason}`; the browser polls until
+`active === false` — exactly the `/applog?offset=N` tail pattern used for the
+run console.
 
 ### 10.3 Daemon — `DebugState` LLM members (`schedule_debug_server.py`)
 
@@ -350,9 +351,9 @@ next, active}`; the browser polls until `active === false` — exactly the
 |--------|------|
 | `_llm_spawn()` | `Popen([claude ...streaming...], cwd=repo_root, stdin/stdout=PIPE, text, bufsize=1)` + reader thread that parses each JSON line via `_llm_handle_event`. |
 | `_llm_handle_event(obj)` | `text_delta` → raw text; `tool_use` → `\n[tool: <name> <compact input>]`; `tool_result` → `\n[tool result]`; `result` → clear `_llm_active`. Non-JSON lines are skipped. |
-| `llm_send(prompt)` | spawn if dead; set `_llm_active=True`; write the user JSON line + flush; return `{ok, offset}` (current buffer length). |
-| `llm_poll(offset)` | return `{data: _llm_buf[offset:], next, active}`. |
-| `llm_reset()` | terminate + respawn; clear the buffer; return `{ok}`. |
+| `llm_send(prompt)` | spawn if dead; set `_llm_active=True`; write the user JSON line + flush; return `{ok, offset, llm_generation}`. |
+| `llm_poll(offset)` | return `{data: _llm_buf[offset:], next, active, llm_generation, llm_reset_reason}`. |
+| `llm_reset(reason)` | terminate + respawn; clear the buffer; advance the generation; return the new generation and reason. |
 
 Config fields: `claude_bin` (default `"claude"`), `claude_cwd` (default repo
 root = `os.path.dirname(_SCRIPT_DIR)`), `claude_model` (default → CLI default),
@@ -406,6 +407,10 @@ password itself).
 - `llmPollOnce()` GETs `/llm/poll?offset=N`, appends `data`, advances the
   offset, and stops when `active === false` (reentrancy guarded by a busy flag),
   reusing the applog poll idiom.
+- The browser tracks `llm_generation` so an actual Claude crash or explicit
+  **New chat** cannot leave a pending answer attached to the wrong process.
+  `/settarget` never changes the generation: board and device changes preserve
+  the Claude process, transcript, and conversation context.
 - `llmReset()` POSTs `/llm/reset` and clears `#llmout`.
 - Enter-to-send on `#llmin`; click-to-focus on `#llmterm`.
 - **Reveal logic:** the LLM tab is independent of the JTAG "Test connect". On
@@ -496,6 +501,12 @@ MCP servers launch via `.mcp.json`, not argv, so config comes from env vars:
 Unset `startcol`/`aie_version` are auto-resolved from provenance JSON exactly as
 `aiegdb.main()`. The repo-root `.mcp.json` registers the server as `aiegdb`
 (`python3 src/tool/debug/aiemcp.py`); Claude Code auto-discovers it on start.
+
+The embedded server also reads `backend_status.json` before every tool call.
+When `/settarget` changes the target, device, start column, or AIE version,
+`aiemcp` refreshes the existing in-process `AieGdb` configuration and its bound
+hardware-read methods. The `AieGdb` object and its tile/channel scope remain
+alive, so Claude does not need to restart and its conversation is preserved.
 
 Dependency: the `mcp` Python SDK (`pip install "mcp[cli]"`); no other new deps.
 Dry-run the whole flow with **no** hardware: `AIEMCP_DRY_RUN=1 mcp dev

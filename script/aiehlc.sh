@@ -150,10 +150,17 @@ main() {
 set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AIEHLC_DIR="${SCRIPT_DIR}/../"
+
+# aiedbg pip install PATH (written by ensure_aiedbg.py on first bootstrap)
+if [[ -f "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh"
+fi
 runtime_source_file=""
 aie_version="2"
 use_llvm_aie="false"
 DEBUG_OUTPUT=0
+DEBUG_SYMS=0
 platform="baremetal"
 COMPILE_AIELIB_ONLY=0
 USE_LOCAL_AIERT_BSP=0
@@ -196,6 +203,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --debug-output)
             DEBUG_OUTPUT=1
+            shift
+            ;;
+        --debug-syms)
+            DEBUG_SYMS=1
             shift
             ;;
         --aielib-only)
@@ -487,13 +498,15 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
         [ -f "$f" ] && cp -f "$f" "${WORKLOCAL_DIR}/$(basename "$f")"
     done
 
+    echo "${runtime_source_file}" > "${WORKLOCAL_DIR}/app_source.txt"
+
     # Run hostcompile.sh with WORKLOCAL_DIR pointing at aout/worklocal.
     hc_extra_defs="${EXTRA_DEFS:-}"
     if [ "${SKIP_BSS}" -eq 1 ]; then
         hc_extra_defs="${hc_extra_defs} -DAIEHLC_SKIP_BSS_DEFAULT=1"
     fi
     WORKLOCAL_DIR="${WORKLOCAL_DIR}" AIE_VERSION="${aie_version}" PLATFORM="${platform}" \
-        SIM_TILES="${SIM_TILES:-}" \
+        SIM_TILES="${SIM_TILES:-}" DEBUG_SYMS="${DEBUG_SYMS}" \
         AIEHLC_PROFILING="${PROFILING}" EXTRA_DEFS="${hc_extra_defs}" \
         bash "${AIEHLC_DIR}/script/hostcompile.sh"
     TILING_RC=$?
@@ -526,6 +539,16 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
     # live. Runs in the foreground for the interactive debug session; Ctrl-C to stop.
     if [ "$PRETTY_DEBUG" -eq 1 ]; then
         if [ -f "${WORKLOCAL_DIR}/host_schedule.html" ]; then
+            if ! command -v aiedbg &>/dev/null; then
+                echo "aiedbg not found — bootstrapping (clone + pip install)..."
+                python3 "${AIEHLC_DIR}src/tool/debug/ensure_aiedbg.py" \
+                    --repo-root "${AIEHLC_DIR}" || \
+                    echo "    warning: aiedbg bootstrap failed; live HW reads disabled."
+                if [[ -f "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh" ]]; then
+                    # shellcheck disable=SC1091
+                    source "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh"
+                fi
+            fi
             echo "Launching live schedule-debug server (--prettydebug)..."
             python3 "${AIEHLC_DIR}/src/tool/debug/schedule_debug_server.py" \
                 "${WORKLOCAL_DIR}" \
@@ -623,6 +646,7 @@ echo "Linking kernels..."
 echo "    ${temp_obj_files[@]}"
 # opt_flags="-O2"
 opt_flags="-Os"
+[ "${DEBUG_SYMS}" -eq 1 ] && opt_flags="${opt_flags} -g"
 if [[ "$platform" == "sim" ]]; then
     echo -e "\n[sim] Writing sim config (no auto-run)..."
     rm -f  "${SCRIPT_DIR}/sim/build/aiehlc_ps.so" \
@@ -653,8 +677,10 @@ if [ ${GPP_RC:-1} -ne 0 ]; then
     echo "==========================================================="
     return ${GPP_RC}
 fi
-echo "Stripping extra ELF symbols..."
-${TOOL_PREFIX}strip $HOST_BUILD_DIR/main.elf
+if [ "${DEBUG_SYMS}" -eq 0 ]; then
+    echo "Stripping extra ELF symbols..."
+    ${TOOL_PREFIX}strip $HOST_BUILD_DIR/main.elf
+fi
 
 echo "Build complete."
 echo "    $HOST_BUILD_DIR/main.elf"

@@ -10,12 +10,17 @@
 
 # Your username for SSH login to the PAL board server
 export USERNAME="h***"
+export VEK385IP="" # for example: "crimini5"
 
 # IP address of the PAL board server
 export PALIP="10.23.***.***"
-
 # Board name to use with 'become' command in systest
 export BOARDNAME="pal***"
+
+export AIEDBG_TARGET=xsdb://${VEK385IP}:3121
+
+source /proj/xbuilds/HEAD_daily_latest/installs/lin64/HEAD/Vitis/settings64.sh
+
 
 # =============================================================================
 # Verify settings

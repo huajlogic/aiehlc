@@ -39,6 +39,8 @@ Configuration comes from environment variables (MCP servers launch via
     AIEMCP_STARTCOL     physical column offset       (default: from provenance JSON)
     AIEMCP_AIE_VERSION  register offsets: 5 | 2ps    (default: from provenance JSON)
     AIEMCP_JSON_DIR     provenance/schedule_view JSON dir (default: auto-detect)
+    AIEMCP_WORK_DIR     aiecompiler Work/ dir for callstack commands
+                        (default: auto-resolved as <AIEMCP_JSON_DIR>/../Work)
     AIEMCP_DRY_RUN      if set (1/true/yes), print aiedbg commands instead of
                         running them (no board needed)
 
@@ -48,6 +50,8 @@ Protocol smoke test:               mcp dev src/tool/debug/aiemcp.py
 
 import os
 import re
+import socket
+import struct
 import sys
 import threading
 
@@ -63,6 +67,95 @@ import aiegdb  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 mcp = FastMCP("aiegdb")
+
+_IPC_READ32   = 0x11
+_IPC_STATUS_OK = 0x00
+_IPC_REQ_FMT  = "<BxxxQI"
+_IPC_RESP_FMT = "<BxxxxxxxQ"
+_IPC_REQ_SIZE  = struct.calcsize(_IPC_REQ_FMT)
+_IPC_RESP_SIZE = struct.calcsize(_IPC_RESP_FMT)
+
+
+def _ipc_recvall(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _sim_ipc_read32(dbg_socket_path, addr):
+    """Send one READ32 request over the IPC debug socket and return the value."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        s.connect(dbg_socket_path)
+        req = struct.pack(_IPC_REQ_FMT, _IPC_READ32, addr, 0)
+        s.sendall(req)
+        raw = _ipc_recvall(s, _IPC_RESP_SIZE)
+        s.close()
+        if raw is None or len(raw) < _IPC_RESP_SIZE:
+            return None
+        status, value = struct.unpack(_IPC_RESP_FMT, raw)
+        return int(value) if status == _IPC_STATUS_OK else None
+    except OSError:
+        return None
+
+
+def _sim_tile_addr(phys_col, row, offset, base_addr, col_shift, row_shift):
+    return base_addr + (phys_col << col_shift) + (row << row_shift) + offset
+
+
+def _make_sim_reg_read(dbg_socket, base, col_shift, row_shift):
+    """Return a _reg_read replacement that reads via IPC."""
+    def _sim_reg_read(self_gdb, phys_col, row, offset):
+        addr = _sim_tile_addr(phys_col, row, offset, base, col_shift, row_shift)
+        val = _sim_ipc_read32(dbg_socket, addr)
+        if val is None:
+            print(f"ipc: READ32 failed at 0x{addr:016x} (col={phys_col} row={row} off=0x{offset:x})",
+                  file=sys.stderr)
+        return val
+    return _sim_reg_read
+
+
+def _patch_gdb_for_simulator(gdb_instance):
+    """Monkeypatch gdb._reg_read and gdb._passthrough for simulator IPC reads.
+
+    Called when AIEMCP_BACKEND=simulator. After patching:
+    - Decoded-path reads (dma, pc, event, channels, bd) go via IPC READ32.
+    - Raw passthrough commands (reg read, mem read, scan) return an error
+      message instead of spawning aiedbg (which has no sim target).
+    """
+    dbg_socket = os.environ.get("AEG_PS_IPC_DBG_SOCKET", "").strip()
+    if not dbg_socket:
+        print("warning: AIEMCP_BACKEND=simulator but AEG_PS_IPC_DBG_SOCKET not set; "
+              "register reads will return None", file=sys.stderr)
+        return
+
+    base_s = os.environ.get("AEG_SIM_BASE_ADDR", "").strip()
+    col_shift_s = os.environ.get("AEG_SIM_COL_SHIFT", "").strip()
+    row_shift_s = os.environ.get("AEG_SIM_ROW_SHIFT", "").strip()
+    try:
+        base = int(base_s, 0) if base_s else 0
+        col_shift = int(col_shift_s) if col_shift_s else 25
+        row_shift = int(row_shift_s) if row_shift_s else 20
+    except ValueError:
+        print("warning: invalid AEG_SIM_* address params; using defaults",
+              file=sys.stderr)
+        base, col_shift, row_shift = 0, 25, 20
+
+    import types
+    sim_read = _make_sim_reg_read(dbg_socket, base, col_shift, row_shift)
+    gdb_instance._reg_read = types.MethodType(sim_read, gdb_instance)
+
+    def _blocked_passthrough(self_gdb, args):
+        cmd = " ".join(str(a) for a in args)
+        print(f"[simulator] passthrough '{cmd}' not supported via IPC; "
+              f"use decoded commands (dma, pc, event, channels, bd) instead.")
+
+    gdb_instance._passthrough = types.MethodType(_blocked_passthrough, gdb_instance)
 
 # ── strip ANSI color (aiediag disables color off-tty, but be defensive) ───────
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -85,11 +178,23 @@ def _build_gdb():
     startcol_env = os.environ.get("AIEMCP_STARTCOL")
     aiever_env = os.environ.get("AIEMCP_AIE_VERSION")
 
+    # Resolve Work/ dir for callstack commands.  Explicit env wins; otherwise
+    # auto-detect as the sibling of AIEMCP_JSON_DIR (naiebaremetal layout:
+    # worklocal/ and Work/ are siblings inside the example directory).
+    work_dir = os.environ.get("AIEMCP_WORK_DIR") or None
+    if not work_dir and json_dir:
+        candidate = os.path.join(os.path.dirname(json_dir.rstrip(os.sep)), "Work")
+        if os.path.isdir(candidate):
+            work_dir = candidate
+
     gdb = aiegdb.AieGdb(
         target=target, device=device,
         startcol=startcol_env if startcol_env not in (None, "") else 0,
         aie_version=aiever_env if aiever_env not in (None, "") else "5",
-        json_dir=json_dir, dry_run=dry_run)
+        json_dir=json_dir, dry_run=dry_run, work_dir=work_dir)
+    # stdout is JSON-RPC framing here, not a terminal — a live TUI grid would
+    # block the tool call until it times out.
+    gdb.no_tui = True
 
     # Resolve startcol: explicit env wins, else read from provenance JSON.
     if startcol_env in (None, ""):
@@ -114,11 +219,140 @@ def _build_gdb():
               file=sys.stderr)
     gdb.aie_version = ver
 
+    if os.environ.get("AIEMCP_BACKEND", "").strip().lower() == "simulator":
+        _patch_gdb_for_simulator(gdb)
+
     return gdb
 
 
 _gdb = _build_gdb()
 _lock = threading.Lock()
+_current_config = (
+    os.environ.get("AIEMCP_BACKEND", "hardware").strip().lower(),
+    os.environ.get("AIEDBG_TARGET", "").strip(),
+    os.environ.get("AIEMCP_DEVICE", "pal").strip(),
+    os.environ.get("AIEMCP_STARTCOL", "0").strip(),
+    os.environ.get("AIEMCP_AIE_VERSION", "5").strip(),
+    os.environ.get("AEG_PS_IPC_DBG_SOCKET", "").strip(),
+)
+
+
+def _read_backend_status():
+    """Read workdir/backend_status.json for live backend state.
+    Returns a dict or None if unavailable."""
+    json_dir = os.environ.get("AIEMCP_JSON_DIR", "").strip()
+    if not json_dir:
+        return None
+    path = os.path.join(json_dir, "backend_status.json")
+    try:
+        import json as _json
+        with open(path) as f:
+            return _json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# Verbs that only navigate, print help, or read local JSON. Everything else
+# touches the device, so it is refused until the UI has a real board session.
+_NO_HW_VERBS = frozenset((
+    "target", "tar", "tile", "channel", "up", "..", "top",
+    "where", "info", "pwd", "set", "help", "?", "commands", "cmds",
+    "spec", "exit", "quit", "q", "channels", "chans",
+))
+
+
+def _needs_hw(line):
+    """True if this command line would read or write the device."""
+    parts = (line or "").strip().split()
+    if not parts:
+        return False
+    verb = parts[0].lower()
+    if verb in _NO_HW_VERBS:
+        # `tile 0 0` navigates, but `tile list` is an aiedbg passthrough.
+        return verb == "tile" and len(parts) > 1 and parts[1].lower() == "list"
+    return True
+
+
+def _session_refusal(line):
+    """Refusal dict when a hardware command is issued with no board session,
+    or None when the command may proceed.
+
+    The daemon publishes provenance in backend_status.json; without it (aiemcp
+    run standalone from a shell) there is no UI to gate against, so we allow."""
+    if not _needs_hw(line):
+        return None
+    status = _read_backend_status()
+    if not status or "session" not in status:
+        return None
+    sess = status.get("session") or {}
+    if sess.get("authorized"):
+        return None
+    return {
+        "output": (
+            "REFUSED: no board session has been established in the debug UI.\n"
+            "The configured target comes from $AIEDBG_TARGET at daemon startup and "
+            "does NOT mean a board is live or that anything has been run.\n"
+            "Nothing was read — do NOT infer or describe board state.\n"
+            "Ask the user to press \"Connect\" (verify the link), \"Run test\" "
+            "(start a run), or \"Open Current Session\" (attach to a run they "
+            "started outside the UI)."
+        ),
+        "scope": _gdb.prompt().rstrip(),
+        "refused": True,
+        "session": sess,
+    }
+
+
+def _ensure_backend_current():
+    """Refresh _gdb when the daemon's live backend configuration changes."""
+    global _current_config
+    status = _read_backend_status()
+    if not status:
+        return
+    want = status.get("backend", "hardware").strip().lower()
+    want_target = status.get("target", "").strip()
+    want_device = status.get("device", "pal").strip()
+    want_startcol = str(status.get("startcol", 0)).strip()
+    want_aie_version = str(status.get("aie_version", "5")).strip()
+    dbg_socket = status.get("dbg_socket", "").strip()
+    config = (want, want_target, want_device, want_startcol,
+              want_aie_version, dbg_socket)
+    if config == _current_config:
+        return
+    _current_config = config
+    os.environ["AIEMCP_BACKEND"] = want
+    os.environ["AIEMCP_DEVICE"] = want_device
+    os.environ["AIEMCP_STARTCOL"] = want_startcol
+    os.environ["AIEMCP_AIE_VERSION"] = want_aie_version
+    if want == "simulator":
+        _gdb.device = want_device
+        _gdb.startcol = int(want_startcol or 0)
+        _gdb.aie_version = want_aie_version
+        if dbg_socket:
+            import os as _os
+            _os.environ["AEG_PS_IPC_DBG_SOCKET"] = dbg_socket
+            base_s = status.get("sim_base_addr", "")
+            col_s  = status.get("sim_col_shift", "")
+            row_s  = status.get("sim_row_shift", "")
+            if base_s: _os.environ["AEG_SIM_BASE_ADDR"] = str(base_s)
+            if col_s:  _os.environ["AEG_SIM_COL_SHIFT"] = str(col_s)
+            if row_s:  _os.environ["AEG_SIM_ROW_SHIFT"] = str(row_s)
+        _patch_gdb_for_simulator(_gdb)
+        print(f"[aiemcp] switched to simulator backend (socket={dbg_socket})",
+              file=sys.stderr)
+    else:
+        os.environ["AIEDBG_TARGET"] = want_target
+        fresh = _build_gdb()
+        _gdb.target = fresh.target
+        _gdb.device = fresh.device
+        _gdb.startcol = fresh.startcol
+        _gdb.aie_version = fresh.aie_version
+        _gdb._reg_read = fresh._reg_read
+        _gdb._passthrough = fresh._passthrough
+        print(f"[aiemcp] hardware backend retargeted to {want_target} "
+              f"(device={want_device}, startcol={fresh.startcol}, "
+              f"aie={fresh.aie_version})",
+              file=sys.stderr)
 
 
 def _run(line):
@@ -131,6 +365,10 @@ def _run(line):
     the fd swap because it must not interleave with other tool calls.
     """
     with _lock:
+        _ensure_backend_current()
+        refusal = _session_refusal(line)
+        if refusal is not None:
+            return refusal
         # Save the real stdio fds and the Python-level stream.
         saved_out_fd = os.dup(1)
         saved_err_fd = os.dup(2)
@@ -184,8 +422,11 @@ def _run(line):
 
 @mcp.tool()
 def aie_exec(cmd: str) -> dict:
-    """Run one aiegdb command line against the live AIE board and return its
+    """Run one aiegdb command line against the live AIE device and return its
     output plus the resulting scope.
+
+    Works for both hardware (via aiedbg/xsdb) and simulator (via IPC debug
+    socket). Check get_backend_status first to know which backend is active.
 
     The console is stateful and scoped: partition -> tile -> channel. Scope
     persists across calls, so descend with `target ...` first, then issue
@@ -202,8 +443,8 @@ def aie_exec(cmd: str) -> dict:
       pc                             core PC -> source line (linemap)
       event                          event-status regs (decoded)
       channels                       list this tile's DMA channels
-      reg read OFF | reg write OFF VAL | mem read ADDR LEN
-      scan dma|cores | tile list | show ...   (array-wide aiedbg passthrough)
+      reg read OFF | reg write OFF VAL | mem read ADDR LEN  [hardware only]
+      scan dma|cores | tile list | show ...   [hardware only, passthrough]
 
     Channel scope (direction/channel also auto-injected):
       dma status | status            decoded DMA status register
@@ -211,6 +452,10 @@ def aie_exec(cmd: str) -> dict:
       event                          per-channel DMA start/finish/error
       dma counter                    AIE perf counters (read-only)
       dma counter setup [finished|started]   (INTRUSIVE write)
+
+    Note: when backend is "simulator", raw passthrough commands (reg read,
+    mem read, scan) are not available — use decoded commands (dma, pc, event,
+    channels, bd) which read directly from the IPC debug socket.
 
     Example session:
       aie_exec("target tile 0 3")
