@@ -1800,6 +1800,10 @@ def build_view(workdir):
     rows = sorted({t['row'] for t in prov['tiles']})
     shim_rows = sorted({t['row'] for t in prov['tiles'] if t['type'] == 'shim'})
     core_rows = sorted({t['row'] for t in prov['tiles'] if t['type'] == 'core'})
+    # Physical device core start row: for all known AIE generations (Gen2, Gen5)
+    # rows 0=shim, 1-2=mem, 3+=core. Emit this so the device map can synthesize
+    # phantom mem tiles only for the real mem rows (1-2), not schedule-derived ones.
+    _AIE_DEVICE_CORE_MIN_ROW = 3
 
     def code_for(line_nums):
         ordered = sorted(line_nums)
@@ -1926,6 +1930,7 @@ def build_view(workdir):
             'row_list': rows,
             'shim_rows': shim_rows,
             'core_rows': core_rows,
+            'device_core_min_row': _AIE_DEVICE_CORE_MIN_ROW,
             # Partition origin (absolute physical start column) from the
             # provenance map; phys_col = col + startcol. None = no partition.
             'startcol': prov.get('startcol'),
@@ -5166,6 +5171,9 @@ function buildDeviceMap(){
   DATA.tiles.forEach(t=>{ tileMap[t.loc[0]+','+t.loc[1]]=t; });
   // Track which tiles are shmem hop endpoints so they always get a box.
   const shmemEndKeys=new Set();
+  // Track tiles explicitly listed in comm_paths.tiles — these are named routing
+  // tiles that must render a box regardless of whether they appear in DATA.tiles.
+  const routedTileKeys=new Set();
   (DATA.comm_paths||[]).forEach(p=>{
     (p.hops||[]).filter(h=>h.type==='shmem').forEach(h=>{
       shmemEndKeys.add(h.from_col+','+h.from_row);
@@ -5174,6 +5182,7 @@ function buildDeviceMap(){
     // Register tiles from both edges and the tiles list
     (p.tiles||[]).forEach(([c,r])=>{
       const k=c+','+r;
+      routedTileKeys.add(k);
       if(!tileMap[k]) tileMap[k]={loc:[c,r],type:'mem',dma_channels:[]};
     });
     (p.edges||[]).forEach(([src,dst])=>{
@@ -5183,33 +5192,55 @@ function buildDeviceMap(){
       });
     });
   });
-  // Pure stream-switch waypoints: tiles synthesised from comm_paths only (not in
-  // DATA.tiles), with no DMA channels, not a shim row, and not a shmem endpoint.
-  // These are intermediate column hops (e.g. row 1–2 pass-through tiles) that
-  // should not render a box — the stream line passes through them invisibly.
+  // Pure stream-switch waypoints: tiles synthesised from comm_paths edges only
+  // (not in DATA.tiles, not in comm_paths.tiles, not a shim, not a shmem endpoint,
+  // no DMA channels). These are implicit path endpoints that the stream line passes
+  // through invisibly. Tiles in comm_paths.tiles are explicitly named routing tiles
+  // and must always render a visible box.
   const waypointKeys=new Set();
   const dataTileKeys=new Set(DATA.tiles.map(t=>t.loc[0]+','+t.loc[1]));
   Object.values(tileMap).forEach(t=>{
     const k=t.loc[0]+','+t.loc[1];
-    if(!dataTileKeys.has(k) && t.loc[1]!==0 && !shmemEndKeys.has(k) && !(t.dma_channels&&t.dma_channels.length))
+    if(!dataTileKeys.has(k) && !routedTileKeys.has(k) && t.loc[1]!==0 && !shmemEndKeys.has(k) && !(t.dma_channels&&t.dma_channels.length))
       waypointKeys.add(k);
   });
 
-  // Synthesize MEM tiles (rows 1–2) for columns that have a shim (row 0) and a
-  // core (row 3+). The stream-switch path always traverses these rows physically
-  // even when the abstract hop chain skips them.
+  // Synthesize MEM tiles for columns that have a shim (row 0) and a core row.
+  // The stream-switch path always traverses these rows physically even when the
+  // abstract hop chain skips them. Use device_core_min_row (physical device
+  // geometry) rather than the schedule's lowest core row — the schedule may only
+  // mention a core tile at row 4 while the device's mem rows are only 1-2.
+  const coreRowSet=new Set(DATA.grid.core_rows||[]);
+  const deviceCoreMinRow=DATA.grid.device_core_min_row||3;
   const shimCols=new Set(), coreCols=new Set();
   Object.values(tileMap).forEach(t=>{
     if(t.loc[1]===0) shimCols.add(t.loc[0]);
-    if(t.loc[1]>=3) coreCols.add(t.loc[0]);
+    if(coreRowSet.has(t.loc[1])) coreCols.add(t.loc[0]);
   });
   const memCols=new Set([...shimCols].filter(c=>coreCols.has(c)));
+  // Mem rows are 1..(deviceCoreMinRow-1) inclusive — fixed device geometry.
+  const memRowsToSynth=[];
+  for(let r=1;r<deviceCoreMinRow;r++) memRowsToSynth.push(r);
   memCols.forEach(c=>{
-    [1,2].forEach(r=>{
+    memRowsToSynth.forEach(r=>{
       const k=c+','+r;
       if(!tileMap[k]) tileMap[k]={loc:[c,r],type:'mem',dma_channels:[]};
     });
   });
+  // Drop synthesized MEM tiles whose row exceeds the declared grid — these are
+  // implicit waypoints the edge-tracing added with the wrong type. But keep any
+  // tile that was explicitly named in comm_paths.tiles, a shmem endpoint, or a
+  // DATA.tiles entry — those are real tiles the schedule uses.
+  const gridMaxRow=(DATA.grid.rows||0)-1;
+  Object.keys(tileMap).forEach(k=>{
+    const t=tileMap[k];
+    if(t.loc[1]>gridMaxRow
+       && !dataTileKeys.has(k)
+       && !routedTileKeys.has(k)
+       && !shmemEndKeys.has(k))
+      delete tileMap[k];
+  });
+
   const allTiles=Object.values(tileMap);
   const allCols=[...new Set(allTiles.map(t=>t.loc[0]))].sort((a,b)=>a-b);
   const allRows=[...new Set(allTiles.map(t=>t.loc[1]))].sort((a,b)=>a-b);
@@ -5286,8 +5317,8 @@ function buildDeviceMap(){
   // ── LAYER 2: tile rectangles (drawn first → lines go on top) ─────
   const tileType=r=>{
     if(r===0) return 'shim';
-    if(r<=2)  return 'mem';
-    return 'core';
+    if(r>=deviceCoreMinRow) return 'core';
+    return 'mem';
   };
   const usedKeys=new Set(DATA.tiles.map(t=>t.loc[0]+','+t.loc[1]));
   const tileGroups={};
@@ -7056,7 +7087,8 @@ document.getElementById('conreload').onclick = () => {
 // One persistent `claude -p --output-format stream-json` process in the repo
 // root. Each user turn becomes a .llm-msg-you bubble; streamed reply tokens
 // accumulate into a .llm-msg-ai bubble via llmAppendToMsg.
-const LLM = { off:0, poll:null, busy:false, pendingId:null, ctx:null, ctxSent:null };
+const LLM = { off:0, poll:null, busy:false, pendingId:null, ctx:null, ctxSent:null,
+  generation:null };
 let llmMessages = [];
 let llmMsgIdCtr = 0;
 function llmEscape(s){
@@ -7313,12 +7345,31 @@ function llmShowThink(on){
 }
 
 function llmStopPoll(){ if (LLM.poll){ clearInterval(LLM.poll); LLM.poll = null; } }
+function llmAdoptGeneration(r, announce){
+  if (!r || r.llm_generation == null) return false;
+  const previous = LLM.generation;
+  LLM.generation = r.llm_generation;
+  if (previous == null || previous === LLM.generation) return false;
+  llmStopPoll();
+  llmShowThink(false);
+  LLM.off = 0;
+  LLM.ctxSent = null;
+  const reason = r.llm_reset_reason || 'the LLM process restarted';
+  if (LLM.pendingId){
+    llmAppendToMsg(LLM.pendingId, '\n[interrupted: ' + reason + ']', true);
+    LLM.pendingId = null;
+  } else if (announce !== false){
+    llmAddMsg('ctx', reason + ' — agent context reset');
+  }
+  return true;
+}
 function llmPollOnce(){
   if (LLM.busy) return;
   LLM.busy = true;
   api('/llm/poll?offset=' + LLM.off).then(r => {
     if (r.auth){ llmLock(); return; }
     if (r.error){ llmStopPoll(); llmShowThink(false); return; }
+    if (llmAdoptGeneration(r)) return;
     if (r.stuck){
       // Watchdog: the daemon received no output from claude for _LLM_STUCK_S seconds.
       // The turn is declared over; show a recovery notice and a Reset button.
@@ -7397,6 +7448,7 @@ function llmSend(prompt, fromInput){
       if (r.auth){ llmLock(); return; }
       if (!r.ok){ llmShowThink(false);
         llmAppendToMsg(aiId, '[llm error: ' + (r.error || 'unknown') + ']'); return; }
+      if (r.llm_generation != null) LLM.generation = r.llm_generation;
       if (r.offset != null) LLM.off = r.offset;
       llmStopPoll();
       llmPollOnce();
@@ -7410,6 +7462,7 @@ function llmReset(){
   api('/llm/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
     .then(r => {
       if (r && r.auth){ llmLock(); return; }
+      if (r && r.llm_generation != null) LLM.generation = r.llm_generation;
       LLM.ctxSent = null; LLM.off = 0; LLM.pendingId = null;
       llmMessages = [];
       const list = document.getElementById('llmmsg');
@@ -7859,9 +7912,49 @@ function renderRunBanner(){
                              + '(overlay stays off)';
   setRunStatus(s);
 }
+// The simulator half of run-state reconciliation. The page learned a sim
+// existed only from the /sim/log tail it started itself, so a reload — or a sim
+// started in another tab — left Run lit and Stop grey while the daemon refused
+// to switch apps. Edge-triggered on `running`, exactly like applyRunState, so
+// it never fights a tail that is already up.
+function applySimState(ss){
+  if (!ss) return;
+  if (ss.kind) SIM.kind = ss.kind;
+  if (ss.available === false && simRow()) simRow().available = false;
+  const was = SIM.owned;
+  SIM.owned = !!ss.running;
+  if (ss.running && !was){
+    // Adopt it: point the dropdown at the simulator so the /sim/* handlers own
+    // the buttons, and start the tail from the top of the log.
+    if (deviceSel && deviceSel.value !== 'simulator'){
+      deviceSel.value = 'simulator';
+      LIVE.device = 'simulator'; LIVE.host = '';
+      if (testconn) testconn.textContent = 'Activate';
+      if (boardHost) boardHost.classList.add('hide');
+      if (attachbtn) attachbtn.disabled = true;
+    }
+    SIM.logoff = 0; SIM.applogoff = 0; SIM.applogSeen = false;
+    const con = document.getElementById('console');
+    if (con){ con.classList.remove('hide');
+      con.textContent = '[adopted running simulator #' + ss.run_id
+        + (ss.kind ? ' (' + ss.kind + ')' : '') + ' → '
+        + (ss.sim_log || '') + ']\n'; }
+    if (SIM.timer) clearInterval(SIM.timer);
+    SIM.timer = setInterval(pollSimLog, 1000);
+    pollSimLog();
+  }
+  if (deviceSel && deviceSel.value === 'simulator'){
+    if (runbtn) runbtn.disabled = SIM.owned;
+    if (stopbtn) stopbtn.disabled = !SIM.owned;
+  }
+  if (!ss.running && was && SIM.timer){
+    clearInterval(SIM.timer); SIM.timer = null;
+  }
+}
 // Edge-triggered on `running` so it can't fight the tail pollLog already drives.
 function applyRunState(rs){
   if (!rs) return;
+  applySimState(rs.sim);
   const was = LIVE.runOwned;
   LIVE.runOwned = !!rs.running;
   LIVE.daemonRun = rs;
@@ -7892,6 +7985,36 @@ function syncRunState(){
     .catch(() => null)
     .finally(() => { LIVE.rsBusy = false; });
 }
+// One writer for the device row's status line and the Connect/Activate gate.
+// Called from updateDeviceUI and again when /devices lands, because the rows
+// arrive asynchronously and the selection is usually already made by then.
+function refreshDeviceStatus(){
+  const dev = deviceSel ? deviceSel.value : '';
+  if (!dev){ if (testconn) testconn.disabled = true; setConnStatus(''); return; }
+  if (dev !== 'simulator'){
+    if (testconn) testconn.disabled = false;
+    setConnStatus('click "Connect" to enable live features');
+    return;
+  }
+  const sr = simRow();
+  if (sr && sr.available === false){
+    // Offered, but nothing to run. Naming the missing artifact here is the
+    // whole point of keeping the option visible — otherwise the only way to
+    // learn why is to press Run and read an error.
+    if (testconn) testconn.disabled = true;
+    if (runbtn) runbtn.disabled = true;
+    setConnStatus('no simulator for this app — ' + (sr.reason || 'not built'));
+    return;
+  }
+  if (testconn) testconn.disabled = false;
+  // A sim started before this selection keeps owning the buttons.
+  if (SIM.owned){
+    if (runbtn) runbtn.disabled = true;
+    if (stopbtn) stopbtn.disabled = false;
+  }
+  setConnStatus('click "Activate" to use the simulator'
+    + ((sr && sr.note) ? ' — ' + sr.note : ''));
+}
 // Selecting a device only enables the "Connect" button. The live overlay
 // checkbox + the drill-down console stay locked until a connection test passes
 // (LIVE.connected). Changing the device invalidates any prior test.
@@ -7907,14 +8030,13 @@ function updateDeviceUI(){
   if (runbtn) runbtn.disabled = true;
   if (stopbtn) stopbtn.disabled = true;
   updateRunButtons();
-  if (testconn) testconn.disabled = !has;
   // Attaching is only meaningful for a real board: the simulator has no run to
   // adopt — it is started by this UI or not at all.
   if (attachbtn) attachbtn.disabled = !has || dev === 'simulator';
   if (boardHost) boardHost.classList.toggle('hide', !has || dev === 'pal' || dev === 'simulator');
   // For simulator, "Activate" label skips JTAG; for hardware, "Connect".
   if (testconn) testconn.textContent = (dev === 'simulator') ? 'Activate' : 'Connect';
-  setConnStatus(has ? 'click "Connect" to enable live features' : '');
+  refreshDeviceStatus();
   setConnHint(false);
   if(deviceSel&&has){
     const opt=deviceSel.options[deviceSel.selectedIndex];
@@ -7947,6 +8069,7 @@ function applyConnected(r){
       body: JSON.stringify({device:LIVE.device, host:LIVE.host})})
     .then(sr => {
       if (sr && sr.ok){
+        llmAdoptGeneration(sr);
         setConnStatus('connected \u2014 ' + (sr.target || ((r && r.detail) || 'ok')));
         llmPushCtx('[context] Connected to '+(LIVE.host||LIVE.device)
           +' \u2014 AIEDBG_TARGET: '+(sr.target||'unknown'));
@@ -8056,23 +8179,42 @@ function testConnect(){
   // Otherwise, unlock Run/Stop so the user can start the sim and the aiegdb
   // console will auto-connect once the IPC debug socket appears.
   if (dev === 'simulator'){
+    const sr0 = simRow();
+    if (sr0 && sr0.available === false){
+      setConnStatus('no simulator for this app — ' + (sr0.reason || 'not built'));
+      return;
+    }
     LIVE.device = dev; LIVE.host = '';
     api('/sim/status').then(ss => {
+      if (ss && ss.kind) SIM.kind = ss.kind;
+      if (ss && ss.available === false){
+        setConnStatus('no simulator for this app — ' + (ss.reason || 'not built'));
+        return;
+      }
       if (ss && ss.ipc_ready){
         applyConnected({detail: 'simulator IPC ready'});
-      } else {
-        // Not ready yet — still unlock all live controls so Run sim works and
-        // the overlay checkbox is available once the sim is running.
-        LIVE.connected = true;
-        if (runbtn) runbtn.disabled = false;
-        if (stopbtn) stopbtn.disabled = true;
+        return;
+      }
+      // Not ready (or never will be) — still unlock Run and reveal the console.
+      LIVE.connected = true;
+      if (runbtn) runbtn.disabled = !!SIM.owned;
+      if (stopbtn) stopbtn.disabled = !SIM.owned;
+      const box = document.getElementById('cmdconsole');
+      if (box) box.classList.remove('hide');
+      const rsp = document.getElementById('rhsplitter');
+      if (rsp) rsp.classList.remove('hide');
+      if (simHasLiveReads()){
         if (liveToggle){ liveToggle.disabled = false;
           liveToggle.closest('label').classList.remove('disabled'); }
-        const box = document.getElementById('cmdconsole');
-        if (box) box.classList.remove('hide');
-        const rsp = document.getElementById('rhsplitter');
-        if (rsp) rsp.classList.remove('hide');
         setConnStatus('simulator activated — run it to enable live grid reads');
+      } else {
+        // aiesim exposes no debug socket, so the overlay stays locked. Saying
+        // "run it to enable live grid reads" here promised something the
+        // backend can never deliver, and left the user waiting for it.
+        if (liveToggle){ liveToggle.disabled = true;
+          liveToggle.closest('label').classList.add('disabled'); }
+        setConnStatus('simulator activated (aiesim) — console output only; '
+                    + 'this backend has no debug socket, so no live grid reads');
       }
     }).catch(() => {
       LIVE.connected = true;
@@ -8262,11 +8404,22 @@ document.getElementById('runbtn').onclick = () => {
     if (stopbtn) stopbtn.disabled = false;
     api('/sim/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
       .then(r => {
-        if (r.error){ con.textContent = 'sim error: ' + r.error;
-          if (runbtn) runbtn.disabled = false; if (stopbtn) stopbtn.disabled = true; return; }
-        con.textContent = '[simulator started \u2192 ' + (r.sim_log||'ipc_sim.log') + ']\n'
-          + '[waiting for IPC debug socket\u2026]\n';
-        llmPushCtx('[context] Simulator run started');
+        if (r.error){ con.textContent = 'sim error: ' + r.error + '\n';
+          if (runbtn) runbtn.disabled = false; if (stopbtn) stopbtn.disabled = true;
+          setConnStatus(r.reason ? ('no simulator for this app \u2014 ' + r.reason)
+                                 : 'simulator did not start');
+          return; }
+        if (r.sim_kind) SIM.kind = r.sim_kind;
+        SIM.owned = true;
+        con.textContent = '[simulator (' + (r.sim_kind||'?') + ') started \u2192 '
+          + (r.sim_log||'') + ']\n'
+          // aiesim never opens a debug socket, so announcing a wait for one
+          // described a different backend's flow and read as a hang.
+          + (simHasLiveReads() ? '[waiting for IPC debug socket\u2026]\n'
+                               : '[console output only \u2014 this backend has no '
+                                 + 'debug socket]\n')
+          + (r.engine_log ? '[simulator engine log: ' + r.engine_log + ']\n' : '');
+        llmPushCtx('[context] Simulator run started (' + (r.sim_kind||'?') + ')');
         SIM.ipcReady = false;
         if (SIM.timer) clearInterval(SIM.timer);
         SIM.timer = setInterval(pollSimLog, 1000);
@@ -8310,6 +8463,11 @@ document.getElementById('stopbtn').onclick = () => {
   if (dev === 'simulator'){
     api('/sim/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
       .then(r => {
+        // "no simulator running" is not a failure: nothing holds the sim, which
+        // is what the click asked for. Clearing on it unwedges the buttons.
+        SIM.owned = false;
+        if (runbtn) runbtn.disabled = false;
+        if (stopbtn) stopbtn.disabled = true;
         if (r.error){ setStatus('stop: ' + r.error); return; }
         setStatus('simulator stopped (pid ' + r.pid + ')');
         pollSimLog();
@@ -8350,7 +8508,14 @@ document.getElementById('stopbtn').onclick = () => {
 // as an <option> in the board dropdown; selecting "simulator" short-circuits
 // the JTAG "Connect" and routes Run/Stop/Load-log to /sim/* endpoints.
 const SIM = { timer: null, logoff: 0, logBusy: false, ipcReady: false,
-              applogoff: 0, applogSeen: false };
+              applogoff: 0, applogSeen: false, kind: '', owned: false };
+// value -> row from /devices. The simulator row is always present; `available`
+// says whether it can run and `reason` says what to build if it cannot, so a
+// greyed-out simulator names its own remedy instead of just vanishing.
+const DEVINFO = {};
+function simRow(){ return DEVINFO['simulator'] || null; }
+// aiesim has no debug socket and never will; only the IPC flow unlocks reads.
+function simHasLiveReads(){ return (SIM.kind || (simRow()||{}).sim_kind) === 'ipc'; }
 function pollSimLog(){
   if (SIM.logBusy) return;
   SIM.logBusy = true;
@@ -8361,6 +8526,7 @@ function pollSimLog(){
     api('/sim/applog?offset='+SIM.applogoff).catch(() => ({data:'',next:SIM.applogoff,running:false}))
   ]).then(([r, ra]) => {
     const atBottom = con ? (con.scrollHeight - con.scrollTop - con.clientHeight) < 4 : true;
+    if (r.kind) SIM.kind = r.kind;
     if (r.data && con){ con.textContent += r.data; }
     if (r.next != null) SIM.logoff = r.next;
     // PS app output: prefix with a header the first time it appears, then stream.
@@ -8381,7 +8547,9 @@ function pollSimLog(){
         liveToggle.closest('label').classList.remove('disabled'); }
       setConnStatus('simulator IPC ready \u2014 live grid reads active');
     }
-    setStatus('sim: ' + (r.running ? 'running' : 'stopped'));
+    setStatus('sim: ' + (r.running ? 'running' : 'stopped')
+            + (SIM.kind ? ' (' + SIM.kind + ')' : ''));
+    SIM.owned = !!r.running;
     if (!r.running){
       if (SIM.timer){ clearInterval(SIM.timer); SIM.timer = null; }
       SIM.ipcReady = false;
@@ -8390,18 +8558,30 @@ function pollSimLog(){
     }
   }).catch(() => {}).finally(() => { SIM.logBusy = false; });
 }
-// The template bakes in aiedbg's device names, so a profile naming one must
-// replace that option rather than append a duplicate value.
-api('/devices').then(r => {
-  if (!r || !r.devices || !deviceSel) return;
-  r.devices.forEach(d => {
-    const existing = Array.from(deviceSel.options).find(o => o.value === d.value);
-    if (existing){ existing.textContent = d.label; return; }
-    const opt = document.createElement('option');
-    opt.value = d.value; opt.textContent = d.label;
-    deviceSel.appendChild(opt);
-  });
-}).catch(() => {});
+// The template bakes in aiedbg's device names AND `simulator`, so a row naming
+// one must replace that option rather than append a duplicate value.
+function loadDevices(){
+  return api('/devices').then(r => {
+    if (!r || !r.devices || !deviceSel) return;
+    r.devices.forEach(d => {
+      DEVINFO[d.value] = d;
+      const existing = Array.from(deviceSel.options).find(o => o.value === d.value);
+      if (existing){ existing.textContent = d.label; return; }
+      const opt = document.createElement('option');
+      opt.value = d.value; opt.textContent = d.label;
+      deviceSel.appendChild(opt);
+    });
+    const sr = simRow();
+    if (sr && sr.sim_kind) SIM.kind = sr.sim_kind;
+    // The labels just changed under whatever is already selected; re-derive the
+    // status line so a picked-but-unbuildable simulator says why straight away.
+    if (deviceSel.value) refreshDeviceStatus();
+  }).catch(() => {});
+}
+// Once per page. Switching apps reloads the page (see appSel.onchange), which
+// is what re-reads these for the newly selected bundle — a different app has a
+// different simulator, or none.
+loadDevices();
 // Splitter helper: pointer-capture drag with anchor-relative sizing.
 // onStart(e) → opaque state recorded at pointerdown.
 // onMove(e, state) → applies the drag delta using that state.
@@ -8578,6 +8758,7 @@ function probeLLM(){
     // Skip past any existing transcript — it's gone from the DOM on page reload.
     // Replaying the full history would block the main thread on large sessions.
     if (r.next != null) LLM.off = r.next;
+    if (r.llm_generation != null) LLM.generation = r.llm_generation;
     if (r.active){
       // Reloaded mid-turn: adopt the in-flight answer instead of letting it
       // land in a transcript nobody is tailing.
@@ -9138,6 +9319,12 @@ def render_html(view):
     html = html.replace('/*__GDBSPEC__*/ null', _aiegdb_spec_json())
     opts = "".join('          <option value="%s">%s</option>\n' % (d, d)
                    for d in _aiedbg_devices())
+    # `simulator` is baked in beside the boards rather than appended by
+    # /devices, so it is present in the static page and before the daemon
+    # answers. Whether it can RUN is a separate question /devices answers by
+    # relabelling this option; an option that only appears when it happens to
+    # be buildable reads as a UI that cannot simulate at all.
+    opts += '          <option value="simulator">simulator</option>\n'
     return html.replace('<!--__DEVICE_OPTIONS__-->', opts)
 
 

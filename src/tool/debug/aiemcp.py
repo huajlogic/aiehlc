@@ -227,7 +227,14 @@ def _build_gdb():
 
 _gdb = _build_gdb()
 _lock = threading.Lock()
-_current_backend = os.environ.get("AIEMCP_BACKEND", "hardware").strip().lower()
+_current_config = (
+    os.environ.get("AIEMCP_BACKEND", "hardware").strip().lower(),
+    os.environ.get("AIEDBG_TARGET", "").strip(),
+    os.environ.get("AIEMCP_DEVICE", "pal").strip(),
+    os.environ.get("AIEMCP_STARTCOL", "0").strip(),
+    os.environ.get("AIEMCP_AIE_VERSION", "5").strip(),
+    os.environ.get("AEG_PS_IPC_DBG_SOCKET", "").strip(),
+)
 
 
 def _read_backend_status():
@@ -297,18 +304,30 @@ def _session_refusal(line):
 
 
 def _ensure_backend_current():
-    """Re-patch _gdb if backend_status.json shows a different backend than
-    what _gdb was built for. Called at the start of every _run()."""
-    global _current_backend
+    """Refresh _gdb when the daemon's live backend configuration changes."""
+    global _current_config
     status = _read_backend_status()
     if not status:
         return
     want = status.get("backend", "hardware").strip().lower()
-    if want == _current_backend:
+    want_target = status.get("target", "").strip()
+    want_device = status.get("device", "pal").strip()
+    want_startcol = str(status.get("startcol", 0)).strip()
+    want_aie_version = str(status.get("aie_version", "5")).strip()
+    dbg_socket = status.get("dbg_socket", "").strip()
+    config = (want, want_target, want_device, want_startcol,
+              want_aie_version, dbg_socket)
+    if config == _current_config:
         return
-    _current_backend = want
+    _current_config = config
+    os.environ["AIEMCP_BACKEND"] = want
+    os.environ["AIEMCP_DEVICE"] = want_device
+    os.environ["AIEMCP_STARTCOL"] = want_startcol
+    os.environ["AIEMCP_AIE_VERSION"] = want_aie_version
     if want == "simulator":
-        dbg_socket = status.get("dbg_socket", "").strip()
+        _gdb.device = want_device
+        _gdb.startcol = int(want_startcol or 0)
+        _gdb.aie_version = want_aie_version
         if dbg_socket:
             import os as _os
             _os.environ["AEG_PS_IPC_DBG_SOCKET"] = dbg_socket
@@ -322,14 +341,17 @@ def _ensure_backend_current():
         print(f"[aiemcp] switched to simulator backend (socket={dbg_socket})",
               file=sys.stderr)
     else:
-        import types as _types
-        target = status.get("target", "").strip()
-        if target:
-            os.environ["AIEDBG_TARGET"] = target
+        os.environ["AIEDBG_TARGET"] = want_target
         fresh = _build_gdb()
+        _gdb.target = fresh.target
+        _gdb.device = fresh.device
+        _gdb.startcol = fresh.startcol
+        _gdb.aie_version = fresh.aie_version
         _gdb._reg_read = fresh._reg_read
         _gdb._passthrough = fresh._passthrough
-        print(f"[aiemcp] switched to hardware backend (target={target})",
+        print(f"[aiemcp] hardware backend retargeted to {want_target} "
+              f"(device={want_device}, startcol={fresh.startcol}, "
+              f"aie={fresh.aie_version})",
               file=sys.stderr)
 
 
@@ -342,11 +364,11 @@ def _run(line):
     *and* child-process output) and restore before returning. A lock serializes
     the fd swap because it must not interleave with other tool calls.
     """
-    _ensure_backend_current()
-    refusal = _session_refusal(line)
-    if refusal is not None:
-        return refusal
     with _lock:
+        _ensure_backend_current()
+        refusal = _session_refusal(line)
+        if refusal is not None:
+            return refusal
         # Save the real stdio fds and the Python-level stream.
         saved_out_fd = os.dup(1)
         saved_err_fd = os.dup(2)

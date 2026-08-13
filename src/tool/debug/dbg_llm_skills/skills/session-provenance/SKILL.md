@@ -2,7 +2,7 @@
      SPDX-License-Identifier: Apache-2.0 -->
 ---
 name: session-provenance
-description: PRECEDENCE - this skill alone owns "may I read the board, and is what I read current?"; every other skill defers here instead of re-deciding it. Read before the FIRST mcp__aiegdb__aie_exec device read of a conversation, before writing "the board is ..." / "the run passed" / "channel X is stalled", before quoting mcp__debugui__get_applog / get_sim_log / get_ipc_log, and whenever aie_exec returns {"refused": true}. The debug target is resolved from $AIEDBG_TARGET at daemon startup and backend:"hardware" is only the not-simulator fallback, so neither proves a board is live nor that anything ran - and a reachable board still holds the PREVIOUS run's registers. Covers the four session.mode values (none / connected / attached / ran) and the exact phrasing each one entitles you to, the four session.applog.state values (current / predates_session / foreign / absent), why "PASS: all N elements match" under a [STALE:/[UNVERIFIED: banner is not evidence, the refusal payload plus the _NO_HW_VERBS verbs it does NOT gate (and that `tile list` IS gated), and the backend_status.json keys `session` / `session_summary` to read via mcp__debugui__get_backend_status. Entitlement to claim, nothing else: command spelling is aiegdb-console's, backend capability is simulator-vs-hardware's.
+description: PRECEDENCE - this skill alone owns "may I read the board, and is what I read current?"; every other skill defers here instead of re-deciding it. Read before the FIRST mcp__aiegdb__aie_exec device read of a conversation, before writing "the board is ..." / "the run passed" / "channel X is stalled", before quoting mcp__debugui__get_applog / get_sim_log / get_ipc_log, and whenever aie_exec returns {"refused": true}. The debug target is resolved from $AIEDBG_TARGET at daemon startup and backend:"hardware" is only the not-simulator fallback, so neither proves a board is live nor that anything ran - and a reachable board still holds the PREVIOUS run's registers. Covers the five session.mode values (none / connected / attached / ran / simulator) and the exact phrasing each one entitles you to, the four session.applog.state values (current / predates_session / foreign / absent), why "PASS: all N elements match" under a [STALE:/[UNVERIFIED: banner is not evidence, the refusal payload plus the _NO_HW_VERBS verbs it does NOT gate (and that `tile list` IS gated), and the backend_status.json keys `session` / `session_summary` to read via mcp__debugui__get_backend_status. Entitlement to claim, nothing else: command spelling is aiegdb-console's, backend capability is simulator-vs-hardware's.
 ---
 
 # Session provenance — what you may claim about board state
@@ -40,7 +40,7 @@ prevent.
 
 Never substitute `target`, `device`, or `backend` for this check.
 
-## The four session states
+## The five session states
 
 Source: `DebugState.session_state()` → `session.mode` and `session.authorized`.
 `mark_hw_session()` is the ONLY writer; target resolution never calls it.
@@ -89,6 +89,23 @@ Also check `session.run_in_progress` — true while the child process is alive.
 - Note `run_blocks_debug()`: while a run still holds the JTAG link exclusively,
   `/grid` and `/aiegdb` answer `"disabled during run setup"`. That is a timing
   gate, not a provenance problem — wait and retry.
+
+### `mode: "simulator"` — summary `SIMULATOR SESSION at <t> via IPC socket`
+`_sim_watch_dbg_socket` polled `<sim_example_dir>/ipc/` until a `*.sock.dbg`
+file answered a ping, then called `mark_hw_session("simulator", …)`. Revoked by
+`clear_sim_session()` when the simulator process exits. **No board Connect
+is needed and none was required** — the daemon started the process and owns it.
+
+- Reads are authorized. `sim_kind` is `"ipc"` — only the IPC simulator grants
+  this mode; aiesim has no socket and stays at `mode: "none"`.
+- Provenance is **stronger than a board session**: the daemon started this
+  process, so the registers are current by construction. Say "the simulator
+  currently shows …" rather than the board phrasing.
+- The **applog is unrelated**. It is a hardware board log. Nothing the simulator
+  wrote appears there; do not quote it as simulator output.
+- If `ipc_ready` drops to false mid-conversation (process exited), the session
+  is revoked and subsequent reads will be refused. Use
+  `mcp__debugui__get_sim_log` to confirm the simulator is still running.
 
 ## applog provenance — a stale "PASS" is not evidence
 

@@ -346,9 +346,20 @@ def get_backend_status() -> dict:
     aie_version = live.get("aie_version") or os.environ.get("AIEMCP_AIE_VERSION", "").strip() or None
     sim_log = live.get("sim_log") or ""
     sim_applog = live.get("sim_applog") or ""
+    sim_kind = (live.get("sim_kind") or "").strip().lower()
+    sim_reason = live.get("sim_reason") or ""
 
     if backend == "simulator":
-        if ipc_ready:
+        if sim_kind == "aiesim":
+            # A different backend entirely, and the difference is load-bearing:
+            # it has no debug socket, so "not ready yet, retry" would be advice
+            # to wait for something that is never coming.
+            note = ("Simulator backend is the aiehlc aiesim (aie2pssimmsm) flow. "
+                    "It has NO debug socket, so aie_exec register reads do not "
+                    "work here at all — this is not a timing issue and will not "
+                    "become ready. Read the run output with get_sim_log() and "
+                    "reason from the schedule tools plus the app source.")
+        elif ipc_ready:
             note = ("Simulator is running and IPC debug socket is active. "
                     "Live register reads are available via aie_exec/aie_scope.")
         else:
@@ -380,6 +391,11 @@ def get_backend_status() -> dict:
         "aie_version": aie_version,
         "sim_log": sim_log,
         "sim_applog": sim_applog,
+        # Which simulator this app has, or why it has none. The two backends
+        # differ in what they can answer, so the kind must not be inferred.
+        "sim_kind": sim_kind,
+        "sim_available": bool(live.get("sim_available")),
+        "sim_reason": sim_reason,
         "session": live.get("session") or {},
         "session_summary": live.get("session_summary", ""),
         "note": note,
@@ -749,12 +765,13 @@ def get_flow_detail(flow_index: int) -> str:
 
 @mcp.tool()
 def get_sim_log(lines: int = 50) -> str:
-    """Return the last N lines of the simulator application log (ipc_app.log).
+    """Return the last N lines of the simulator run output.
 
-    This is the stdout/stderr from the PS application running inside the AIE
-    simulator, equivalent to the simulator applog the browser tails in the Run
-    console. Use it to check for application output, errors, or OOB test results
-    when running in simulator mode.
+    Which file that is depends on the backend, so the answer names it:
+      - IPC simulator: `ipc_app.log`, the stdout/stderr of the PS application
+        running against the simulator.
+      - aiesim (aiehlc `aie2pssimmsm`): there is no separate PS process, so the
+        whole run — build, Work/ packaging and simulator output — is one stream.
 
     For the board run log (hardware mode), use get_applog instead.
 
@@ -762,22 +779,30 @@ def get_sim_log(lines: int = 50) -> str:
       lines: number of lines to return from the end of the log (default: 50)
     """
     live = _read_live_status()
-    sim_applog = live.get("sim_applog") or os.environ.get("DEBUGUI_SIM_APPLOG", "").strip()
-    if not sim_applog:
-        return ("error: simulator applog path not set — start the debug server "
-                "with a simulator-capable config and activate the simulator")
-    if not os.path.isfile(sim_applog):
-        return "simulator applog not found at %s — start the simulator first" % sim_applog
+    # sim_applog is the PS client's output and only exists on the IPC flow;
+    # falling back to sim_log is what makes this tool answer at all on aiesim,
+    # where it used to claim the path was "not set".
+    path = (live.get("sim_applog")
+            or os.environ.get("DEBUGUI_SIM_APPLOG", "").strip()
+            or live.get("sim_log") or "")
+    if not path:
+        reason = live.get("sim_reason") or ""
+        return ("error: no simulator log for this app"
+                + (" — %s" % reason if reason else
+                   " — start the debug server with a simulator-capable app"))
+    if not os.path.isfile(path):
+        return "simulator log not found at %s — start the simulator first" % path
     try:
-        with open(sim_applog, "rb") as f:
+        with open(path, "rb") as f:
             raw = f.read()
         text = raw.decode("utf-8", errors="replace")
         tail = text.splitlines()
         if len(tail) > lines:
             tail = tail[-lines:]
-        return "\n".join(tail) if tail else "(simulator applog is empty)"
+        body = "\n".join(tail) if tail else "(empty)"
+        return "%s (last %d lines):\n%s" % (path, min(lines, len(tail)), body)
     except OSError as e:
-        return "error reading simulator applog: %s" % e
+        return "error reading simulator log: %s" % e
 
 
 def _applog_banner(live):
@@ -827,8 +852,13 @@ def get_applog(lines: int = 50) -> str:
     live = _read_live_status()
     backend = live.get("backend", "").strip().lower()
     if backend == "simulator":
-        applog = live.get("sim_applog") or os.environ.get("DEBUGUI_SIM_APPLOG", "").strip()
-        source_note = "(simulator ipc_app.log)"
+        # Same fallback as get_sim_log: only the IPC flow has a separate PS log.
+        applog = (live.get("sim_applog")
+                  or os.environ.get("DEBUGUI_SIM_APPLOG", "").strip()
+                  or live.get("sim_log") or "")
+        source_note = ("(simulator run log)"
+                       if (live.get("sim_kind") or "") == "aiesim"
+                       else "(simulator ipc_app.log)")
     else:
         applog = live.get("applog") or os.environ.get("DEBUGUI_APPLOG", "").strip()
         source_note = "(hardware applog)"

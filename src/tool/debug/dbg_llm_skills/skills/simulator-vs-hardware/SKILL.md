@@ -2,7 +2,7 @@
      SPDX-License-Identifier: Apache-2.0 -->
 ---
 name: simulator-vs-hardware
-description: Read when a SIMULATOR is or might be in play: the user says sim / aiesim / IPC, mcp__debugui__get_backend_status reports backend="simulator" or ipc_ready, you need sim_log / ipc_app.log / ipc_client.log / ipc_server.log, or a decoded aie_exec command behaved strangely and you must establish which READ PATH you are on. Two different simulators exist and only one flips the flag: the IPC simulator (sim_kind="ipc", a `*.sock.dbg` socket) yields backend="simulator" and live IPC register reads, while aiesim (sim_kind="aiesim", script/runsim.sh driving aie2pssimmsm) exposes NO debug socket, reports backend="hardware", leaves sim_applog empty, and cannot be register-read at all - debug it from <bundle_dir>/aiesim.log alone. Covers the discriminator keys (backend / ipc_ready / dbg_socket / sim_applog), one batched `aiedbg --json scan` per hardware grid poll versus one AF_UNIX READ32 per register on IPC, the two different per-channel grid payload shapes (hardware has no raw/q_size/cur_bd; simulator has no core_status/active_events), which aie_exec commands IPC blocks cleanly (every raw aiedbg passthrough - `reg read`, `mem read`, `scan`, `tile list`) versus the one that does NOT refuse cleanly (`log`/`klog` spawns aiedbg directly: a 30 s stall per chunk or SystemExit: 1 - do not run it when backend=="simulator"), why get_sim_log can work where get_ipc_log answers "simulator not configured", and the grep that separates a PS.so-load crash from a runtime crash. Backend capability and read-path only - authorization to read at all is session-provenance's, command spelling is aiegdb-console's.
+description: Read when a SIMULATOR is or might be in play: the user says sim / aiesim / IPC, mcp__debugui__get_backend_status reports backend="simulator" or ipc_ready, you need sim_log / ipc_app.log / ipc_client.log / ipc_server.log, or a decoded aie_exec command behaved strangely and you must establish which READ PATH you are on. Two different simulators exist and only one flips the flag: the IPC simulator (sim_kind="ipc", a `*.sock.dbg` socket) yields backend="simulator" and live IPC register reads, while aiesim (sim_kind="aiesim", script/runsim.sh driving aie2pssimmsm) exposes NO debug socket, reports backend="hardware", leaves sim_applog empty, and cannot be register-read at all - debug it from <bundle_dir>/aiesim.log alone. Also read when the UI offers a Simulator that will not start: the option is shown for EVERY app, so sim_available=false means this bundle was never built for sim and sim_reason names the build command - not a broken simulator. Covers the discriminator keys (sim_kind first, then backend / ipc_ready / dbg_socket / sim_applog / sim_available / sim_reason), the two-file IPC log split (ipc_runsim.log the launcher script, ipc_sim.log the simulator engine), one batched `aiedbg --json scan` per hardware grid poll versus one AF_UNIX READ32 per register on IPC, the two different per-channel grid payload shapes (hardware has no raw/q_size/cur_bd; simulator has no core_status/active_events), which aie_exec commands IPC blocks cleanly (every raw aiedbg passthrough - `reg read`, `mem read`, `scan`, `tile list`) versus the one that does NOT refuse cleanly (`log`/`klog` spawns aiedbg directly: a 30 s stall per chunk or SystemExit: 1 - do not run it when backend=="simulator"), why get_sim_log can work where get_ipc_log answers "simulator not configured", and the grep that separates a PS.so-load crash from a runtime crash. Backend capability and read-path only - authorization to read at all is session-provenance's, command spelling is aiegdb-console's.
 ---
 
 # Simulator and hardware are different debug targets
@@ -21,15 +21,24 @@ Keys that decide everything (`_write_backend_status`, schedule_debug_server.py):
 | `ipc_ready` | same flag: the `*.sock.dbg` debug socket answered a ping |
 | `dbg_socket` | path of that socket, in `<sim_example_dir>/ipc/` |
 | `target` | `xsdb://host:port` — from `$AIEDBG_TARGET` at startup, proves nothing |
-| `sim_log` | simulator stdout log |
+| `sim_log` | run log the UI console tails: `ipc_runsim.log` (IPC) / `aiesim.log` |
 | `sim_applog` | PS-app log (`ipc_app.log`) — **empty string for aiesim apps** |
+| `sim_engine_log` | IPC only: `ipc_sim.log`, the aiesimulator process's own stdout |
+| `sim_kind` | `"ipc"` / `"aiesim"` / `""` — **the discriminator; do not infer it** |
+| `sim_available` | whether this app can run a simulator at all |
+| `sim_reason` | when it cannot: which artifact is missing, and what builds it |
 | `session`, `session_summary` | provenance; see the `session-provenance` skill |
+
+`sim_kind` answers §1 in one key. The older route — inferring aiesim from
+`backend == "hardware"` **and** an empty `sim_applog` — still works, but it
+cannot distinguish an aiesim app from a genuine board, and this key can.
 
 **`backend == "hardware"` does not mean a board.** It is the not-simulator
 fallback. Two different simulators exist and only one of them ever flips
 `backend` to `"simulator"`:
 
-- **IPC simulator** (`sim_kind == "ipc"`, naiebaremetal-style, declared in the
+- **IPC simulator** (`sim_kind == "ipc"`, naiebaremetal-style; detected from
+  `<example>/ipc/build_sim.env` + `Work/ps/c_rts/systemC`, or declared in the
   app's `debug_ui_config.json`). Starting it spawns a watcher
   (`_sim_watch_dbg_socket`) that polls `<sim_example_dir>/ipc/` for a
   `*.sock.dbg` file and sets `ipc_ready`. This is the only path that yields
@@ -39,7 +48,15 @@ fallback. Two different simulators exist and only one of them ever flips
   exposes **no debug socket**: no watcher is started, `ipc_ready` stays false,
   `backend` stays `"hardware"`, `sim_applog` is `""`, and `sim_log` is
   `<bundle_dir>/aiesim.log`. There is **no live register read** for aiesim —
-  debug it from logs only (§6).
+  debug it from logs only (§6). This is not a readiness race: nothing will
+  ever open a socket, so do not tell the user to wait and retry.
+
+**A missing simulator is not the same as a simulator that cannot be reached.**
+The Simulator option appears in the UI for every app, so `sim_available ==
+false` means this bundle was never built for sim; `sim_reason` names the
+artifact and the command that produces it (`build_sim.sh <example>` for IPC,
+`aiehlc.sh --platform sim` for aiesim). Quote the reason rather than reporting
+the simulator as broken.
 
 Do not trust the `Backend:` line in your own system prompt for this: it is a
 first-turn snapshot computed as "hardware if a target is configured". The
@@ -47,11 +64,19 @@ first-turn snapshot computed as "hardware if a target is configured". The
 current; prefer them.
 
 The session gate applies to the simulator too: `aie_exec` refuses device
-commands until the UI has a session (`_session_refusal`, aiemcp.py). For the
-simulator the user gets one by pressing "Test connect"/"Activate" with device =
-Simulator — the daemon pings the `*.sock.dbg` socket. If `ipc_ready` is false
-the probe answers `"simulator running but IPC not ready yet"` or `"simulator not
-running — press Run to start it"`.
+commands until the UI has a session (`_session_refusal`, aiemcp.py). The
+daemon grants one **itself** the moment the IPC socket answers a ping —
+`_sim_watch_dbg_socket` calls `mark_hw_session("simulator", …)`, so
+`session.mode == "simulator"` and no board Connect is needed. It is also
+revoked when the sim exits (`clear_sim_session`): unlike a board, the process
+that vouched for those reads is gone. The user can still press
+"Activate" to probe; if `ipc_ready` is false that answers `"simulator running
+but IPC not ready yet"` or `"simulator not running — press Run to start it"`.
+
+A `simulator` session says something stronger than a board one, and the
+summary line says it: these reads come from a process this daemon started, so
+they are current by construction. The **applog is not** — it is a hardware log
+and unrelated to the simulator run.
 
 ## 2. Read path: batched subprocess vs per-register socket
 
@@ -118,23 +143,31 @@ replaces `_passthrough` with a stub. So:
 
 | file | what | how you read it |
 |---|---|---|
-| `sim_log` (from `get_backend_status`) | simulator stdout: `ipc_sim.log` for IPC apps, `<bundle_dir>/aiesim.log` for aiesim | `Read` / `Bash grep` on the path — no MCP tool tails it |
+| `sim_log` (from `get_backend_status`) | the run log the UI console tails: `<sim_example_dir>/ipc_runsim.log` (IPC launcher script) or `<bundle_dir>/aiesim.log` (aiesim, the whole run) | `mcp__debugui__get_sim_log()` on aiesim; `Read` / `Bash grep` otherwise |
+| `sim_engine_log` — `<sim_example_dir>/ipc_sim.log` | IPC only: the aiesimulator process's own stdout | `Read` / `Bash grep` on the path |
 | `<sim_example_dir>/ipc_app.log` | PS application (`ipc_app`) stdout/stderr | `mcp__debugui__get_sim_log(lines=N)` |
 | `<sim_example_dir>/ipc_client.log`, `ipc_server.log` | CSV IPC transaction logs | `mcp__debugui__get_ipc_log(lines=N, side="client"\|"server"\|"both")` |
 | repo-root `applog` | **hardware** board run | `mcp__debugui__get_applog(lines=N)` |
 
-`get_applog` branches on `backend`: it returns `ipc_app.log` only when
-`backend == "simulator"`. On an **aiesim** app (`backend == "hardware"`) it
-returns the repo-root `applog`, which the aiesim run never wrote — that content
-is from some other run. Say so; read `sim_log` instead.
-The two log tools resolve their path differently, so they can disagree:
-`get_sim_log` reads `sim_applog` from `backend_status.json`, falling back to
-`$DEBUGUI_SIM_APPLOG`; `get_ipc_log` reads **only** `$DEBUGUI_SIM_APPLOG` and
-takes its `dirname` as the log directory — it never consults
-`backend_status.json`. So on an IPC app whose daemon was started without that
-env var, `get_sim_log` works while `get_ipc_log` returns "simulator not
-configured". Both are unusable on aiesim apps, where `sim_applog` is empty by
-construction: "simulator applog path not set" / "simulator not configured".
+**`ipc_runsim.log` and `ipc_sim.log` are two files on purpose.** `runsim_ipc.sh`
+redirects the simulator process to `ipc_sim.log` itself, so the daemon captures
+the *script's* stdout to `ipc_runsim.log` and hands the script its own path via
+`$AEG_SIM_LOG`. Both writing one path gave it two file offsets and they
+overwrote each other — measured at 63 of 80 lines surviving, some spliced
+mid-line. If you are reading a shredded IPC sim log, it predates this split.
+
+`get_sim_log` returns the path it read as its first line, and falls back from
+`sim_applog` to `sim_log` — which is what makes it work on **aiesim**, where
+there is no separate PS process and `sim_applog` is `""` by construction.
+`get_ipc_log` has no such fallback: it reads **only** `$DEBUGUI_SIM_APPLOG` and
+takes its `dirname` as the log directory, never consulting
+`backend_status.json`, so on an IPC app whose daemon started without that env
+var `get_sim_log` works while `get_ipc_log` returns "simulator not configured".
+On aiesim `get_ipc_log` is meaningless — there are no IPC transactions.
+
+`get_applog` branches on `backend`, and on an **aiesim** app (`backend ==
+"hardware"`) it returns the repo-root `applog`, which the aiesim run never
+wrote — that content is from some other run. Say so; use `get_sim_log()`.
 
 ## 6. IPC transaction log and PS process inspection
 

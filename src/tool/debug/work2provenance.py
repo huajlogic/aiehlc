@@ -40,7 +40,7 @@ def _hw_gen_str(hw_gen):
 
 
 def _tile_type(row, dcfg):
-    if row < dcfg["mem_tile_row_start"]:
+    if row == dcfg.get("shim_row", 0):
         return "shim"
     if row < dcfg["aie_tile_row_start"]:
         return "mem"
@@ -522,7 +522,7 @@ def gen_dfschedule(dcfg, bds, channels, gmios, aie_gen, startcol,
 # ---------------------------------------------------------------------------
 
 def gen_dmaphop(dcfg, router_soln, gmios, net_flow_map, aie_gen, startcol,
-                stream_info=None, shmem_edges=None):
+                stream_info=None, shmem_edges=None, kernel_tiles=None):
     """Build dmaphopprovenacemap structure from router_soln.json.
 
     In addition to the stream-routed shim<->core hops, this appends the
@@ -535,6 +535,15 @@ def gen_dmaphop(dcfg, router_soln, gmios, net_flow_map, aie_gen, startcol,
     shim_row     = dcfg.get("shim_row", 0)
     stream_info  = stream_info or {}
     shmem_edges  = shmem_edges or []
+    kernel_tiles = kernel_tiles or {}
+
+    # Build a col -> set of known abs_rows index so we can fix off-by-one rows
+    # in router_soln AIE port names (aiecompiler sometimes emits R1 for the first
+    # core tile when the correct compiler-relative row is R0, yielding abs_row =
+    # aie_tile_row_start + 1 instead of aie_tile_row_start + 0).
+    _ktile_rows_by_col = {}
+    for (c, r) in kernel_tiles:
+        _ktile_rows_by_col.setdefault(c, set()).add(r)
 
     # Forward adjacency for the systolic chain (src kernel tile -> dst kernel tile).
     shmem_next = {}
@@ -591,6 +600,14 @@ def gen_dmaphop(dcfg, router_soln, gmios, net_flow_map, aie_gen, startcol,
         end_p       = parse_port_name(end_port_name)
         end_col     = end_p["col"] if end_p else 0
         end_row_abs = port_abs_row(end_p, dcfg) if end_p else 0
+        # Correct a known aiecompiler off-by-one: the router_soln sometimes uses
+        # R1 for the first core tile (should be R0), making end_row_abs one too
+        # high.  If the computed row is not a known kernel tile but there is
+        # exactly one kernel tile in that column, use its row instead.
+        if end_p and end_p["tile_class"] == "aie":
+            col_rows = _ktile_rows_by_col.get(end_col, set())
+            if (end_col, end_row_abs) not in kernel_tiles and len(col_rows) == 1:
+                end_row_abs = next(iter(col_rows))
 
         # Single abstract hop: shim ↔ DMA tile.
         # _load_comm_paths in schedule_view.py builds nonshim_tiles from hop
@@ -1154,7 +1171,16 @@ def build_graph_topology(work_dir, compiler_report, router_soln, dcfg):
             kinst, port = n.get("srcInstance"), n.get("srcPort")
         ktile = inst2tile.get(kinst)
         di    = pm.get(port, {}).get("dmaInfo")
-        hw    = (di["column"], aie_start + di["row"]) if di and di.get("tile") == "aie" else ktile
+        if di and di.get("tile") == "aie":
+            hw_col, hw_row = di["column"], aie_start + di["row"]
+            # aiecompiler sometimes emits row+1 for the output DMA port of the
+            # first core tile; if the result is not a known kernel tile but the
+            # source kernel tile is in the same column, use the kernel tile row.
+            if (hw_col, hw_row) not in kernel_tiles and ktile and ktile[0] == hw_col:
+                hw_row = ktile[1]
+            hw = (hw_col, hw_row)
+        else:
+            hw = ktile
         stream_info[name] = {
             "flow_index":  fi,
             "direction":   direction,
@@ -1340,7 +1366,8 @@ def work_to_provenance(work_dir, out_dir):
         kernel_tiles=kernel_tiles,
     )
     dmaphop = gen_dmaphop(dcfg, router_soln, gmios, net_flow_map, aie_gen, startcol,
-                          stream_info=stream_info, shmem_edges=shmem_edges)
+                          stream_info=stream_info, shmem_edges=shmem_edges,
+                          kernel_tiles=kernel_tiles)
     routing = gen_routing(dcfg, shim_mux, shim_demux, router_soln, aie_gen, startcol)
 
     # --- write JSONs ---

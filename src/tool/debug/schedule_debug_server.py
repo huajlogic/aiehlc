@@ -261,6 +261,27 @@ def _detect_sim_device(workdir):
     return _detect_aiesim_device(workdir) or _detect_ipcsim_device(workdir)
 
 
+def _sim_unavailable_reason(workdir):
+    """Which precondition sim detection missed.
+
+    The Simulator option is offered for every app, so this is the text that
+    makes an unavailable one actionable: an option that silently disappears
+    reads as "this UI cannot simulate" when the real answer is one build
+    command. Flow is picked by the same up-tree probe the detectors use.
+    """
+    example = os.path.dirname(workdir.rstrip(os.sep)) if workdir else ""
+    if example and _find_up(example, os.path.join("script", "runsim_ipc.sh")):
+        if not os.path.isfile(os.path.join(example, "ipc", "build_sim.env")):
+            return ("no ipc/build_sim.env — not built for sim "
+                    "(run build_sim.sh <example>)")
+        if not os.path.isdir(os.path.join(example, "Work", "ps", "c_rts",
+                                          "systemC")):
+            return "no Work/ps/c_rts/systemC — aiecompiler output missing"
+        return "IPC sim detection failed"
+    return ("no sim_config.sh — not built for sim (rebuild with "
+            "aiehlc.sh --platform sim, which writes one beside the bundle)")
+
+
 def _hwlocal_env(runner):
     path = os.path.join(os.path.dirname(runner), "hwlocal.sh")
     if not os.path.isfile(path):
@@ -358,6 +379,46 @@ def _device_label(dev):
 def _detect_hw_device(workdir):
     """Shared by caps() and _load_app_profile(), as _detect_sim_device is."""
     return _detect_vek385_device(workdir)
+
+
+# Backend -> what the row means once selected. The aiesim model exposes no debug
+# socket, so promising live reads there is a promise the backend cannot keep.
+_SIM_KIND_NOTE = {
+    "ipc": "IPC simulator — opens a debug socket, so live register reads work",
+    "aiesim": ("aiesim (aie2pssimmsm) — console output only, no debug socket "
+               "and no live register reads"),
+}
+
+
+def _devices_for_ui(st):
+    """Rows for the board dropdown, Simulator included unconditionally.
+
+    Detection decides whether a simulator can RUN, never whether the option is
+    offered: an option that silently disappears reads as "this UI cannot
+    simulate" when the real answer is one build command, and the user has no
+    way to discover which. An unavailable row carries the reason instead.
+    """
+    out = []
+    for d in st._extra_devices:
+        if not d.get("value") or not d.get("label"):
+            continue
+        row = {"value": d["value"], "label": _device_label(d),
+               "available": True, "reason": ""}
+        if d.get("value") == "simulator":
+            # st.sim_kind, not d["sim_kind"]: a declared debug_ui_config.json
+            # predates the field and carries none, and _load_app_profile
+            # defaults it to "ipc". Reading the resolved value is what keeps
+            # the label from disagreeing with the backend that will actually
+            # run — the same rule caps() follows for the app listing.
+            kind = st.sim_kind if st.sim_script else ""
+            row["sim_kind"] = kind
+            row["note"] = _SIM_KIND_NOTE.get(kind, "")
+        out.append(row)
+    if not any(r["value"] == "simulator" for r in out):
+        out.append({"value": "simulator", "label": "simulator (not built)",
+                    "available": False, "sim_kind": "", "note": "",
+                    "reason": st.sim_reason})
+    return out
 
 
 def _expected_board_host(workdir, env=None):
@@ -1291,20 +1352,9 @@ class App:
 
     def _no_sim_reason(self):
         """Which precondition sim detection missed, so a `view-only` row in the
-        startup listing is actionable. Flow is picked by the same up-tree probe
-        the detectors use."""
-        example = os.path.dirname(self.path.rstrip(os.sep))
-        if _find_up(example, os.path.join("script", "runsim_ipc.sh")):
-            if not os.path.isfile(os.path.join(example, "ipc",
-                                               "build_sim.env")):
-                return ("no ipc/build_sim.env — not built for sim "
-                        "(run build_sim.sh <example>)")
-            if not os.path.isdir(os.path.join(example, "Work", "ps", "c_rts",
-                                              "systemC")):
-                return "no Work/ps/c_rts/systemC — aiecompiler output missing"
-            return "IPC sim detection failed"
-        return ("no sim_config.sh — not built for sim "
-                "(rebuild with aiehlc.sh --platform sim)")
+        startup listing is actionable. Shared with the Simulator dropdown row,
+        which is now always present and needs the same sentence."""
+        return _sim_unavailable_reason(self.path)
 
     def load_view(self):
         """Parsed schedule_view.json, cached until the file changes on disk so a
@@ -1525,6 +1575,8 @@ class DebugState:
         self._llm_log_in_asst = False
         self._llm_system_prompt_text = None
         self._llm_first_turn = True
+        self._llm_generation = 0
+        self._llm_reset_reason = ""
         # Watchdog: timestamp of the last byte received from claude stdout.
         # None when no turn is active.  Set on every _llm_append/_llm_handle_event
         # call; if _llm_active is True and now - _llm_last_output > _LLM_STUCK_S
@@ -1578,15 +1630,28 @@ class DebugState:
         self.sim_kind = (sim_dev or {}).get("sim_kind", "ipc")
         self.sim_script = sim_dev.get("sim_script") if sim_dev else None
         self.sim_example_dir = sim_dev.get("sim_example_dir") if sim_dev else None
-        if self.sim_example_dir and self.sim_kind == "aiesim":
+        # Why the Simulator row is offered but not runnable. Resolved once here
+        # so /devices, the dropdown, start_sim and the startup listing all give
+        # the same sentence instead of the option simply going missing.
+        self.sim_reason = "" if self.sim_script else _sim_unavailable_reason(workdir)
+        if not self.sim_example_dir:
+            self.sim_log = self.sim_applog = self.sim_engine_log = None
+        elif self.sim_kind == "aiesim":
             # runsim.sh streams everything to stdout; there is no separate app log.
             self.sim_log = os.path.join(workdir, "aiesim.log")
             self.sim_applog = None
+            self.sim_engine_log = None
         else:
-            self.sim_log = (os.path.join(self.sim_example_dir, "ipc_sim.log")
-                            if self.sim_example_dir else None)
-            self.sim_applog = (os.path.join(self.sim_example_dir, "ipc_app.log")
-                               if self.sim_example_dir else None)
+            # runsim_ipc.sh redirects the aiesimulator process to
+            # <example>/ipc_sim.log ITSELF, so capturing the script's stdout to
+            # that same path gave one file two writers with independent offsets
+            # — they overwrote each other and the console showed shredded text.
+            # Keep the engine log where the CLI leaves it (handed over via
+            # $AEG_SIM_LOG) and take a separate file for the script.
+            self.sim_log = os.path.join(self.sim_example_dir, "ipc_runsim.log")
+            self.sim_applog = os.path.join(self.sim_example_dir, "ipc_app.log")
+            self.sim_engine_log = os.path.join(self.sim_example_dir,
+                                               "ipc_sim.log")
 
     def select_app(self, app_id):
         """Switch the whole server to another app. Refuses mid-run because the
@@ -1674,6 +1739,35 @@ class DebugState:
         with self._sim_lock:
             return bool(self._sim_proc and self._sim_proc.poll() is None)
 
+    def sim_state(self):
+        """Simulator bookkeeping for the browser to reconcile against, the exact
+        counterpart of run_state() for the board.
+
+        The UI learned a sim existed only from the /sim/log tail it started
+        itself, so a reload — or a sim started from another tab — left it
+        believing nothing was running while select_app refused to switch apps
+        and Run stayed lit. Cheap to poll: no JTAG, no subprocess."""
+        with self._sim_lock:
+            proc = self._sim_proc
+            running = proc is not None and proc.poll() is None
+            ready = self._sim_ipc_ready
+            dbg = self._sim_dbg_socket
+            run_id = self._sim_run_id
+        return {
+            "available": bool(self.sim_script),
+            "reason": self.sim_reason,
+            "kind": self.sim_kind if self.sim_script else "",
+            "running": running,
+            "run_id": run_id,
+            "pid": proc.pid if running else None,
+            "ipc_ready": ready,
+            "dbg_socket": dbg,
+            "sim_log": self.sim_log or "",
+            "applog": self.sim_applog or "",
+            "engine_log": self.sim_engine_log or "",
+            "example_dir": self.sim_example_dir or "",
+        }
+
     # ---- static data -----------------------------------------------------
     def html_path(self):
         return os.path.join(self.workdir, "host_schedule.html")
@@ -1699,10 +1793,21 @@ class DebugState:
                                 "detail": detail}
         self._write_backend_status()
 
+    def clear_sim_session(self):
+        """Drop the authorization a simulator granted, once it exits. Unlike a
+        board — which keeps answering after the run that programmed it — the
+        process that vouched for those reads is gone, so the grant must go too."""
+        cleared = False
+        with self._lock:
+            if (self._hw_session or {}).get("mode") == "simulator":
+                self._hw_session = None
+                cleared = True
+        return cleared
+
     def hw_authorized(self):
-        """True once the user has connected, run, or attached in this session.
-        Gates every live register read so nothing reports stale board state as
-        if it were current."""
+        """True once the user has connected, run, attached, or brought up a
+        simulator in this session. Gates every live register read so nothing
+        reports stale board state as if it were current."""
         return self._hw_session is not None
 
     def applog_provenance(self):
@@ -1753,6 +1858,15 @@ class DebugState:
                     "attached in this UI. Live reads are blocked and any on-disk "
                     "log predates this session.")
         mode = st["mode"]
+        if mode == "simulator":
+            # Returns early: the applog suffix below describes a board run, and
+            # appending it here would invite reading a board log as this
+            # simulator's output.
+            return (f"SIMULATOR SESSION since {st['since_iso']} — a simulator "
+                    f"started from this UI is live on its IPC debug socket. "
+                    f"Live register reads come from the simulator, not a board, "
+                    f"and are current by construction; any applog on disk is a "
+                    f"hardware run and unrelated to it.")
         if mode == "attached":
             base = (f"ATTACHED at {st['since_iso']} to a run started OUTSIDE this "
                     f"UI — the board's earlier history is unknown to the daemon")
@@ -1809,6 +1923,9 @@ class DebugState:
             "debuggable": self._is_debuggable(text, status) if running else False,
             "applog": self.applog,
             "session": self.session_state(),
+            # Rides the same heartbeat as the board run for the same reason: a
+            # reloaded page has no other way to learn a simulator is live.
+            "sim": self.sim_state(),
         }
 
     def run_blocks_debug(self):
@@ -2019,6 +2136,18 @@ class DebugState:
                                 self._sim_ipc_ready = True
                             print(f"[sim] IPC debug socket ready → {dbg_path}",
                                   flush=True)
+                            # Authorize live reads. /grid and the MCP servers
+                            # gate on hw_authorized(), which only /ping, /run
+                            # and /attach ever set — so a working simulator was
+                            # refused unless the user had also connected to a
+                            # board. This socket belongs to a process we own,
+                            # which is a stronger guarantee than any board can
+                            # give, not a weaker one.
+                            self.mark_hw_session(
+                                "simulator",
+                                f"IPC debug socket ready "
+                                f"({os.path.basename(dbg_path)})",
+                                "simulator-ipc")
                             self._invalidate_mcp_config()
                             self._write_backend_status()
                             break
@@ -2033,6 +2162,7 @@ class DebugState:
             if self._sim_run_id == run_id:
                 self._sim_ipc_ready = False
                 self._sim_dbg_socket = None
+        self.clear_sim_session()
         self._invalidate_mcp_config()
         self._write_backend_status()
 
@@ -2041,7 +2171,12 @@ class DebugState:
         and start a watcher thread that retargets aiegdb once the ISS port file
         appears."""
         if not self.sim_script:
-            return {"error": "simulator not configured (no debug_ui_config.json)"}
+            # The old text blamed a missing debug_ui_config.json, which has not
+            # been how a simulator is found since detection replaced declaration
+            # — and left the user with nothing to act on.
+            return {"error": f"simulator unavailable for this app: "
+                             f"{self.sim_reason}",
+                    "reason": self.sim_reason, "available": False}
         if not os.path.isfile(self.sim_script):
             return {"error": f"sim script not found: {self.sim_script}"}
         if not self.sim_example_dir:
@@ -2073,11 +2208,21 @@ class DebugState:
                 fh = open(self.sim_log, "w")
             except OSError as e:
                 return {"error": f"cannot open sim log {self.sim_log}: {e}"}
+            env = dict(os.environ)
+            if self.sim_engine_log:
+                # Hand runsim_ipc.sh its own path for the aiesimulator process
+                # so it stops writing the file this capture owns (see
+                # _load_app_profile). Same default location as the CLI leaves
+                # it, so `less <example>/ipc_sim.log` still works.
+                env["AEG_SIM_LOG"] = self.sim_engine_log
             fh.write(f"$ {' '.join(cmd)}\n")
+            if self.sim_engine_log:
+                fh.write(f"[simulator engine log: {self.sim_engine_log}]\n")
             fh.flush()
             try:
                 self._sim_proc = subprocess.Popen(
                     cmd, stdout=fh, stderr=subprocess.STDOUT,
+                    cwd=self.sim_example_dir, env=env,
                     start_new_session=True)
             except FileNotFoundError as e:
                 fh.close()
@@ -2089,8 +2234,12 @@ class DebugState:
         if self.sim_kind == "ipc":
             threading.Thread(target=self._sim_watch_dbg_socket, args=(run_id,),
                              daemon=True).start()
+        self._write_backend_status()
         return {"run_id": run_id, "sim_log": self.sim_log,
-                "example_dir": self.sim_example_dir, "sim_kind": self.sim_kind}
+                "example_dir": self.sim_example_dir, "sim_kind": self.sim_kind,
+                "applog": self.sim_applog or "",
+                "engine_log": self.sim_engine_log or "",
+                "sim": self.sim_state()}
 
     def stop_sim(self):
         """Kill the running simulator and its process group."""
@@ -2130,34 +2279,41 @@ class DebugState:
         with self._sim_lock:
             self._sim_ipc_ready = False
             self._sim_dbg_socket = None
-        return {"stopped": True, "run_id": run_id, "pid": pid}
+        self.clear_sim_session()
+        self._write_backend_status()
+        return {"stopped": True, "run_id": run_id, "pid": pid,
+                "sim": self.sim_state()}
 
     def sim_status(self):
-        """Return current simulator state including IPC debug socket readiness."""
-        with self._sim_lock:
-            running = (self._sim_proc is not None
-                       and self._sim_proc.poll() is None)
-            ready = self._sim_ipc_ready
-            dbg = self._sim_dbg_socket
-        return {"running": running, "ipc_ready": ready, "dbg_socket": dbg}
+        """Current simulator state: availability + why not, which backend, run
+        and IPC-socket readiness. A superset of what it used to return."""
+        return self.sim_state()
 
     def simlog_since(self, offset):
-        """Tail the sim log file from byte offset; includes IPC readiness."""
+        """Tail the sim log file from byte offset; includes IPC readiness.
+
+        `kind` rides along because the two backends behave differently at the
+        far end: the IPC sim opens a debug socket and unlocks live reads, the
+        aiesim model never will, and the browser must not promise one while
+        tailing the other."""
         if not self.sim_log or not os.path.isfile(self.sim_log):
             return {"data": "", "next": 0, "running": False,
-                    "ipc_ready": False, "dbg_socket": None}
+                    "ipc_ready": False, "dbg_socket": None,
+                    "kind": self.sim_kind if self.sim_script else ""}
         with self._sim_lock:
             running = (self._sim_proc is not None
                        and self._sim_proc.poll() is None)
             ipc_ready = self._sim_ipc_ready
             dbg_socket = self._sim_dbg_socket
+            run_id = self._sim_run_id
         with open(self.sim_log, "rb") as f:
             full = f.read()
         chunk = full[offset:]
         data = chunk.decode("utf-8", errors="replace")
         nxt = offset + len(chunk)
         return {"data": data, "next": nxt, "running": running,
-                "ipc_ready": ipc_ready, "dbg_socket": dbg_socket}
+                "ipc_ready": ipc_ready, "dbg_socket": dbg_socket,
+                "kind": self.sim_kind, "run_id": run_id}
 
     def sim_applog_since(self, offset):
         """Tail ipc_app.log (PS application stdout) from byte offset."""
@@ -2494,10 +2650,17 @@ class DebugState:
         do_cmd's aiediag reads and backend_status.json — and staying on the
         launch value left aiedbg decoding a 38-column part as a 12-column one.
         """
+        next_target = tgt or None
+        next_device = device or self.device
+        if next_target == self.target and next_device == self.device:
+            return {
+                "ok": True, "target": self.target, "device": self.device,
+                "llm_reset": False, "llm_generation": self._llm_generation,
+            }
+
         with self._gdb_lock:
-            self.target = tgt or None
-            if device:
-                self.device = device
+            self.target = next_target
+            self.device = next_device
             proc = self._gdb_proc
             if proc is not None:
                 try:
@@ -2514,9 +2677,10 @@ class DebugState:
         # servers; without this refresh get_backend_status() keeps reporting the
         # startup device long after Connect switched boards.
         self._write_backend_status()
-        if self.llm_enabled:
-            self.llm_reset()
-        return {"ok": True, "target": self.target, "device": self.device}
+        return {
+            "ok": True, "target": self.target, "device": self.device,
+            "llm_reset": False, "llm_generation": self._llm_generation,
+        }
 
     # ---- Claude Code (LLM) streaming subprocess --------------------------
     # `claude -p --input-format stream-json --output-format stream-json ...`
@@ -2616,6 +2780,13 @@ class DebugState:
             "aie_version": str(self.aie_version),
             "sim_log": self.sim_log or "",
             "sim_applog": self.sim_applog or "",
+            # Which simulator, and why there isn't one. The MCP servers are
+            # separate processes, so the same rule as session/app_paths applies:
+            # anything the model must not guess at travels in this file.
+            "sim_kind": self.sim_kind if self.sim_script else "",
+            "sim_available": bool(self.sim_script),
+            "sim_reason": self.sim_reason,
+            "sim_engine_log": self.sim_engine_log or "",
             "applog": self.applog,
             "sim_base_addr": str(addr_params[0]) if addr_params else "",
             "sim_col_shift": str(addr_params[1]) if addr_params else "",
@@ -2780,7 +2951,12 @@ class DebugState:
         """Build the system prompt describing the debug UI context and available tools."""
         target_str = self.target or "not connected"
         backend_str = "hardware" if self.target else "simulator"
-        sim_avail = bool(self.sim_script)
+        # Name the backend and, when there isn't one, what is missing — the bare
+        # "(simulator available)" told the model nothing it could act on and
+        # nothing about which of the two very different backends it would get.
+        _sim_avail_str = (
+            f"  (simulator available: {self.sim_kind})" if self.sim_script
+            else f"  (no simulator for this app — {self.sim_reason})")
 
         view = None
         view_path = os.path.join(self.workdir, "schedule_view.json")
@@ -2838,7 +3014,26 @@ class DebugState:
                 f"startcol={grid.get('startcol')}), {n_flows} communication flows."
             )
 
-        if self.sim_example_dir:
+        if self.sim_example_dir and self.sim_kind == "aiesim":
+            # The IPC block below describes a two-process flow with a debug
+            # socket and transaction logs. None of it exists here, and handing
+            # it over would send the model looking for files that never appear.
+            _sim_section = (
+                "## Simulator debugging (aiesim backend)\n\n"
+                "This app's simulator is the aiehlc `aie2pssimmsm` flow driven by\n"
+                f"`{self.sim_script}` from `{self.sim_example_dir}/sim_config.sh`.\n"
+                "It is NOT the IPC simulator:\n"
+                "- One process. The host code is compiled into `aiehlc_ps.so` and\n"
+                "  runs inside the simulator, so there is no separate PS client,\n"
+                "  no `ipc_app`, no `ipc_*.log` and no `get_ipc_log()`.\n"
+                "- **No debug socket, so no live register reads.** `aie_exec`\n"
+                "  register commands have nothing to talk to on this backend —\n"
+                f"  read `{self.sim_log}` (the Run console tails it) instead, and\n"
+                "  say so rather than reporting a read that did not happen.\n"
+                "- A crash before `AIEHLC PS IP started` is a PS.so load failure;\n"
+                "  the `aiesimloaddebug` skill in this repo covers it.\n\n"
+            )
+        elif self.sim_example_dir:
             _sed = self.sim_example_dir
             _sim_section = (
                 "## PS process and simulator debugging\n\n"
@@ -2847,7 +3042,10 @@ class DebugState:
                 "  Drives graph init, GMIO transfers, and result checks.\n"
                 "  stdout/stderr -> `get_sim_log()` (tails `ipc_app.log`).\n"
                 "- **aiesimulator** (server): Synopsys AIE functional simulator.\n"
-                "  stdout -> `ipc_sim.log` (shown in the Run console).\n"
+                f"  stdout -> `{_sed}/ipc_sim.log`.\n"
+                f"  The Run console tails `{_sed}/ipc_runsim.log`, the launcher\n"
+                "  script's own output — a separate file, because two writers on\n"
+                "  one path overwrite each other.\n"
                 "  Receives `WRITE32`/`READ32`/`WRITE_GM` etc. from ipc_app over a Unix socket.\n"
                 "\n"
                 "### Finding what the simulator run is currently doing\n\n"
@@ -3111,7 +3309,7 @@ the `App:` field on each message's context line is authoritative.
 
 **Current session state**{grid_summary}
 - Configured debug target: {target_str}  (from the environment — NOT proof of a live board)
-- Backend: {backend_str}{"  (simulator available)" if sim_avail else ""}
+- Backend: {backend_str}{_sim_avail_str}
 - Session at spawn: {self.session_summary()}
 
 This block is a snapshot from when this conversation started. The `Session:` line on each \
@@ -3263,6 +3461,7 @@ message is authoritative and current — prefer it.
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1)
         proc = self._llm_proc
+        self._llm_generation += 1
 
         try:
             import datetime
@@ -3319,7 +3518,8 @@ message is authoritative and current — prefer it.
                     print(f"warning: _llm_handle_event error: {e}", file=sys.stderr)
             # stdout closed → process exited; end any in-flight turn.
             with self._llm_lock:
-                self._llm_active = False
+                if self._llm_proc is proc:
+                    self._llm_active = False
 
         self._llm_reader_thread = threading.Thread(target=_reader, daemon=True)
         self._llm_reader_thread.start()
@@ -3460,7 +3660,10 @@ message is authoritative and current — prefer it.
             with self._llm_lock:
                 self._llm_active = False
             return {"ok": False, "error": f"claude pipe broken: {e}"}
-        return {"ok": True, "offset": offset}
+        return {
+            "ok": True, "offset": offset,
+            "llm_generation": self._llm_generation,
+        }
 
     def llm_poll(self, offset):
         """Return the transcript slice past `offset` plus the turn-active flag.
@@ -3490,13 +3693,17 @@ message is authoritative and current — prefer it.
                 stuck_s = None
         if offset < 0:
             offset = 0
-        result = {"data": buf[offset:], "next": len(buf), "active": active}
+        result = {
+            "data": buf[offset:], "next": len(buf), "active": active,
+            "llm_generation": self._llm_generation,
+            "llm_reset_reason": self._llm_reset_reason,
+        }
         if stuck:
             result["stuck"] = True
             result["stuck_s"] = stuck_s
         return result
 
-    def llm_reset(self):
+    def llm_reset(self, reason="new chat"):
         """Terminate + respawn the claude subprocess (new conversation);
         clear the transcript buffer."""
         with self._llm_lock:
@@ -3517,6 +3724,7 @@ message is authoritative and current — prefer it.
             self._llm_last_output = None
             self._llm_log_in_asst = False
             self._llm_first_turn = True
+            self._llm_reset_reason = reason
             old_fh = self._llm_log_fh
             self._llm_log_fh = None
         if old_fh:
@@ -3527,7 +3735,11 @@ message is authoritative and current — prefer it.
                 pass
         if self.llm_enabled:
             self._llm_spawn()
-        return {"ok": True}
+        return {
+            "ok": True,
+            "llm_generation": self._llm_generation,
+            "llm_reset_reason": self._llm_reset_reason,
+        }
 
 
 # ── hardware read helpers (read-only) ─────────────────────────────────────────
@@ -4499,11 +4711,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/sim/status":
             self._send_json(st.sim_status())
         elif path == "/devices":
-            self._send_json({"devices": [
-                {"value": d["value"], "label": _device_label(d)}
-                for d in st._extra_devices
-                if d.get("value") and d.get("label")
-            ]})
+            self._send_json({"devices": _devices_for_ui(st)})
         elif path == "/llm/auth":
             # Unprotected: lets the browser learn whether to prompt for a password.
             self._send_json({"required": st.llm_auth_required()})
@@ -5322,10 +5530,15 @@ def main():
     st = Handler.state
     st._write_backend_status()
     if st.sim_script:
-        print(f"  sim:        {st.sim_script}")
+        print(f"  sim:        {st.sim_script}  ({st.sim_kind})")
         print(f"  sim-dir:    {st.sim_example_dir or 'NOT SET'}")
+        print(f"  sim-log:    {st.sim_log}"
+              + (f"  (engine: {st.sim_engine_log})" if st.sim_engine_log else ""))
     else:
-        print("  sim:        not configured (add debug_ui_config.json to workdir)")
+        # The Simulator option is still offered; say what to build, not that it
+        # is missing a config file nothing has used since detection replaced
+        # declaration.
+        print(f"  sim:        unavailable for this app — {st.sim_reason}")
     print(f"  target:     {target or 'NONE'}")
     print(f"  startcol:   {startcol}{'' if args.startcol is not None else ' (from provenance JSON)'}   device={args.device}   aie={aie_version}{'' if args.aie_version is not None else ' (from provenance JSON)'}")
     if _hw_available() and not target:
