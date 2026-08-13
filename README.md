@@ -326,6 +326,8 @@ The tool runs 7 steps in sequence:
 
 `aiedbg` must be in `PATH`. It is the Xilinx/AMD AIE debug CLI that reads/writes AIE tile registers over JTAG or network. It is part of the Vitis installation (`$XILINX_VITIS/bin/aiedbg`) or can be installed separately.
 
+The live debug server (`schedule_debug_server.py` / `aiehlc.sh --prettydebug`) **bootstraps** `aiedbg` automatically on first launch: clones into `thirdparty/aiedbg`, runs `pip install --user`, and writes `.aiehlc/aiedbg_env.sh` for PATH. Manual install/update: `script/debug/bootstrap_aiedbg.sh` (`--update` to refresh). Use `--skip-aiedbg-bootstrap` to skip auto-install (e.g. when using Vitis's copy).
+
 The tool invokes it as:
 ```
 aiedbg [--target TARGET] [--device DEVICE] reg read PHYS_COL ROW 0xOFFSET
@@ -394,7 +396,93 @@ zero-dependency local daemon (stdlib `http.server`, bound to `127.0.0.1`) that t
 the static `host_schedule.html` schedule view into a live debug/test console. It serves
 the enhanced HTML, exposes JSON endpoints, imports `aiediag.py` as a library for register
 offsets/decoders/provenance, and orchestrates `apppaltest.py`. Design rationale:
-[doc/design/live_debug_framework.md](doc/design/live_debug_framework.md).
+[doc/design/aiegdb_live_debug_framework.md](doc/design/aiegdb_live_debug_framework.md).
+
+#### Multi-app mode
+
+The daemon is not tied to one compiled app. It discovers app *bundles* — any directory
+holding a `schedule_view.json` — and injects the selected app's data into the page when
+serving it, so switching apps in the **App** dropdown reloads the whole UI against a
+different build. One daemon can therefore serve builds from several repos at once.
+
+```bash
+# standalone: auto-discovers aout/** and opens the most recently compiled app
+python3 src/tool/debug/schedule_debug_server.py
+
+# add apps from another repo (naiebaremetal examples) and a saved snapshot
+python3 src/tool/debug/schedule_debug_server.py \
+    --app-root ../naiebaremetal/example \
+    --app doc/debug/int32_deadlock_snapshot/worklocal=int32-deadlock
+```
+
+| flag | meaning |
+|---|---|
+| *(positional)* `workdir` | still accepted; registered as an app (backwards compatible) |
+| `--app PATH[=LABEL]` | register one app explicitly, repeatable, may live in another repo |
+| `--app-root DIR` | scan a tree for app workdirs, repeatable |
+
+Switching an app also switches that app's **run profile** — the `extra_devices`
+(simulator / board, `hw_env`, PDI and ELF paths) from its `debug_ui_config.json` — plus
+`startcol` and `aie_version` from its provenance JSONs. Switching is refused while a run
+is in progress, since the profile carries board and image paths.
+
+Endpoints: `GET /apps`, `POST /apps/select {id}`, `POST /apps/add {path,label,select}`,
+`GET|POST /uistate`. Note these are unauthenticated, like the daemon's other non-LLM
+endpoints (`--password` gates only the LLM tab).
+
+Both producer flows feed the same consumer:
+
+```
+aiehlc_aiesim: compiler passes ────────────────► provenance JSONs ─┐
+                                                                   ├─► schedule_view.py ─► app bundle
+naiebaremetal: aiecompiler Work/ ─► work2provenance.py ────────────┘
+```
+
+`schedule_view.py <workdir> --json-only` writes just `schedule_view.json` (+ the per-app
+code cache) and skips the ~1.6 MB standalone HTML, which is what the daemon-served flow
+wants. naiebaremetal's `src/tool/run_debug_ui.sh` uses this and registers the result with
+an already-running daemon via `/apps/add` instead of starting a second server.
+
+Note the per-tile code cache lives under `<workdir>/debugcache/code` so two apps cannot
+overwrite each other's pieces (the paths are handed to the embedded agent to read).
+
+#### debug_ui_mcp — the embedded agent's view of the UI
+
+`src/tool/debug/debug_ui_mcp.py` is the MCP server the browser's LLM tab talks to. It
+follows whatever app the human has selected (the daemon tells it via
+`DEBUGUI_SERVER_URL`) and can read both the UI's contents and its current state:
+
+| tool | purpose |
+|---|---|
+| `list_apps` / `current_app` / `select_app` | see and change which compiled app is loaded |
+| `app_sources` | that app's own source files, grouped, plus the `file:line` defining each kernel the schedule runs — so an answer can cite the user's code instead of stopping at the schedule |
+| `list_panes` | which panes are readable and what selector each needs |
+| `get_pane(pane, col, row, flow, query)` | the content of a pane: `grid`, `tile.hi`, `tile.mid`, `tile.lo`, `tile.kernel`, `tile.supply`, `net.flow`, `search` |
+| `get_ui_state` | what the user has open right now — selected tile, active tile tab, net tab, console pane, channel, flow |
+| `tile_info`, `tile_list`, `symbol_search`, `get_design_overview`, `get_flow_detail`, `get_applog`, `get_sim_log`, `get_backend_status` | existing static-schedule tools, now app-aware |
+
+The browser reports selection changes to `POST /uistate`, so the agent can answer
+questions about the view in front of you rather than guessing. Tools degrade gracefully
+when an app lacks optional data (e.g. naiebaremetal bundles have no `invariant_checks`,
+and `backend_status.json` is only present once a run profile exists).
+
+##### Answers cite your source, not just registers
+
+The agent is told what the app is *made of*, not only where it lives: the same
+inventory `app_sources` returns is inlined into its system prompt, including the
+file and line defining each kernel the schedule runs (`kernel: conv2` →
+`src/convolution2.cc:19`). Its instructions and the `source-grounding` skill make
+reading and quoting that source the default rather than an extra step, on the
+principle that a register value is the symptom while the user's source is where
+the cause lives and where the fix has to go. Citations are written `<file>:<line>`,
+which the UI turns into a click that opens the file in the Info pane.
+
+Hand-written and generated files are kept apart, because proposing an edit to
+`host.cc` or `kernel.cc` wastes the user's time twice — those are overwritten on
+the next build, so they are evidence of what the compiler decided, never the place
+to fix anything. For the aiehlc flow, whose `aout/` holds no hand-written code at
+all, `aiehlc.sh` records the `--runtime-source-file` it built from in
+`worklocal/app_source.txt`; without that the agent has nothing of yours to read.
 
 It lets you, from a single browser page:
 
@@ -458,15 +546,68 @@ python3 src/tool/debug/schedule_debug_server.py aout/worklocal \
 | `POST` | `/run` | Spawn the board test `-y -nonreboot <elf>` (`-u` unbuffered) → `applog`. Body `{device, board_host}`: `palmyra` → `apppaltest.py` (inherit env); `vek385` → `appvek385.py` with env `USERNAME=getpass.getuser()` + `VEK385IP=<board_host>` (host required) |
 | `POST` | `/stop` | Force-kill the running test's process group (SIGTERM→SIGKILL); appends a `[force-stop]` line to `applog` |
 | `GET` | `/applog?offset=N` | Realtime tail of the `applog` file → `{data, next, running, status}`; poll stops on `running=false` (process exit), not on derived `pass\|fail` |
-| `GET` | `/ping?device=&host=` | Connection test → `{ok, aiedbg, target, detail}`. Confirms `aiedbg` is in PATH **and** the resolved JTAG target actually answers (one read-only register read on the first schedule tile). Drives the UI's "Test connect" gating |
+| `GET` | `/ping?device=&host=` | Connection test → `{ok, aiedbg, target, detail}`. Confirms `aiedbg` is in PATH **and** the resolved JTAG target actually answers (one read-only register read on the first schedule tile). Drives the UI's "Connect" gating; a passing probe records session mode `connected` |
+| `POST` | `/attach` | "Open Current Session": same link probe as `/ping`, but records session mode `attached` — for a run the user started outside the UI (CLI, or an already-programmed board). Body `{device, board_host}` → `{ok, detail, session}` |
+| `GET` | `/aiegdb/spec` | `aiegdb.COMMAND_SPEC` as JSON — the console autocomplete's command grammar. Served from the imported module (not the aiegdb subprocess) so it answers before any command has run |
 | `GET` | `/grid?what=dma\|cores\|events&device=&host=` | Whole-array status survey for the overlay; `device`/`host` pick the aiedbg target (`palmyra` → `xsdb://$PALIP:3121`, `vek385` → `xsdb://<host>:3121`) |
 | `POST` | `/cmd` | Whitelisted op (`dma`/`core`/`event`/`pc`/`reg`/`chans`/`chanevent`); body may carry `device`/`host` for device-aware target. `chans` lists a tile's channels + coarse live DMA state; `chanevent` (needs `dir_ch`) decodes per-channel start/finish/(stall/error) events → `{events, summary}` |
 
 The browser UI has a **Board selector** (`palmyra` / `vek385`). Selecting a device
-enables a **"Test connect"** button (and, for `vek385`, reveals a board-hostname
-text box). Clicking **Test connect** hits `/ping`; only on a passing test does the
+enables a **"Connect"** button (and, for `vek385`, reveals a board-hostname
+text box). Clicking **Connect** hits `/ping`; only on a passing test does the
 "Live status overlay" checkbox unlock **and** the drill-down console appear. The
 "Run test" button (spawns `apppaltest`) is enabled as soon as a device is chosen.
+
+#### Session provenance — why a target is not a connection
+
+`AIEDBG_TARGET` is exported by `script/test/envlocal.sh`, so the daemon has a target
+from the moment it starts, with no user action. That is *not* evidence that a board is
+live or that anything has been run — and a physically reachable board still holds
+registers from whatever ran on it last, possibly days ago or by another user. The
+daemon therefore tracks how the current session earned its access:
+
+| State | Earned by | Meaning for live reads and logs |
+|---|---|---|
+| `none` | default at startup, even with `AIEDBG_TARGET` set | reads refused; nothing may be inferred about the board |
+| `connected` | **Connect** (a verified `/ping`) | link is real, but registers are pre-existing state, not the result of a run here |
+| `attached` | **Open Current Session** (`/attach`) | a real run is in play, started outside the UI — the daemon cannot vouch for what came before |
+| `ran` | **Run test** | only here are live state and the `applog` the current run |
+
+`hw_authorized()` gates the live overlay (`/grid`) and the `aiegdb` MCP server's device
+commands; navigation, `help` and `?` stay available so the console is still useful
+offline. The state is published in `backend_status.json` (`session`, `session_summary`),
+injected into every LLM message, and enforced by a precondition block in the agent's
+system prompt.
+
+Log provenance is tracked the same way. `applog` is a fixed repo-root path that the
+manual CLI flow also writes, so a file being present proves nothing — `get_applog`
+prefixes a banner such as:
+
+```
+[STALE: written 2026-08-04 17:12, BEFORE this debug session started (2026-08-05 09:40).
+ This describes a PREVIOUS run, not the current one.]
+```
+
+Without it, a leftover `PASS: all 65536 elements match` reads exactly like a fresh
+result — which is precisely how the embedded agent once reported a successful run that
+had never happened in that session.
+
+#### aiegdb console tab
+
+The `aiegdb` tab renders each command as a foldable block (command as header, output
+below), colorized by line kind — scope changes, errors, warnings, `OK`/`PASS` verdicts,
+`PC -> file:line`, hex literals and `key:` labels. The `[registers read] { … }` appendix
+that aiegdb appends after most decoded commands collapses into a `<details>`.
+
+Typing offers scope-aware suggestions (name · args · summary), with a red **WRITES HW**
+badge on the intrusive commands (`reg write`, `dma counter setup`). Tab/Enter fills the
+command and leaves the caret for its arguments; ↑/↓ moves through suggestions when the
+popup is open and through command history when it is closed. **⌘ Commands** opens a
+searchable palette of everything valid at the current scope.
+
+The grammar comes from `aiegdb.COMMAND_SPEC` — the same dict that renders the CLI's `?`
+listing — fetched from `/aiegdb/spec`, with a copy baked into the generated HTML so
+autocomplete still works when opening `host_schedule.html` with no daemon.
 
 The right panel has a **drill-down command console** (pinned bottom, revealed after
 a passing connection test): clicking a tile sets it as the console TARGET and
@@ -482,7 +623,13 @@ test fails.
 - Binds `127.0.0.1` only; `/cmd` uses an op **whitelist** (no arbitrary shell; `reg` offset
   parsed as an integer).
 - Issues **read-only** register reads only (never `stop`/`con`/writes), so it cannot perturb
-  a running target sharing the same JTAG bridge.
+  a running target sharing the same JTAG bridge. The two commands that *do* write —
+  `reg write` and `dma counter setup` — are reachable only by typing them explicitly in the
+  aiegdb console, and are flagged **WRITES HW** wherever they are suggested.
+- Live reads require a **board session** (Connect / Run test / Open Current Session). A
+  target inherited from `$AIEDBG_TARGET` does not authorize reads, so neither the overlay
+  nor the embedded agent can silently report another run's leftover register state as
+  current — see *Session provenance* above.
 - Reuses aiediag's `--json` `value_hex` parsing (avoids the offset-as-value Pitfall). If
   `aiedbg` is not in `PATH`, live reads are disabled and endpoints report `unreachable`
   rather than fake zeros.

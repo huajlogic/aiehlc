@@ -23,6 +23,13 @@ thirdparty/llvm-aie/
 # thirdparty dependencies
 thirdparty/alib/
 thirdparty/cardano/
+thirdparty/aiedbg/
+
+# debug UI bootstrap (ensure_aiedbg.py)
+.aiehlc/
+
+# the dbg-llm-skills plugin manifest is source, not a generated *.json
+!src/tool/debug/dbg_llm_skills/.claude-plugin/plugin.json
 
 # Personal config
 .bash_profile
