@@ -293,17 +293,22 @@ std::shared_ptr<DataIO> ResourceMgr::createDataIO(IOType tp, int r, int c, DMADI
     return dataioptr;
 }
 // ---------- linkAvailable ----------
-//link a to link b means same port number of A slave and B master should both exist
 bool ResourceMgr::linkAvailable(Point a, Point b, int& portIdx) const {
     PortDirection dir=getDir(a,b), odir=opposite(dir);
-    const auto& va = tile(a.r,a.c).bank(dir).slave;
-    const auto& vb = tile(b.r,b.c).bank(odir).master;
-    int lim = std::min<int>(va.size(), vb.size());
-    std::cout << "[linkAvailable] (" << a.r << "," << a.c << ")->(" << b.r << "," << b.c << ") dir=" << (int)dir
-              << " va.size=" << va.size() << " vb.size=" << vb.size() << " lim=" << lim << std::endl;
+    const auto &va_slave = tile(a.r, a.c).bank(dir).slave;
+    const auto &vb_master = tile(b.r, b.c).bank(odir).master;
+    const auto &va_master = tile(a.r, a.c).bank(dir).master;
+    const auto &vb_slave = tile(b.r, b.c).bank(odir).slave;
+    int lim = std::min<int>(va_slave.size(), vb_master.size());
     for (int ch = 0; ch < lim; ++ch) {
-        std::cout << "  ch=" << ch << " va[ch].used=" << va[ch].used << " vb[ch].used=" << vb[ch].used << std::endl;
-        if(!va[ch].used && !vb[ch].used){ portIdx=ch; return true; }
+        if (va_slave[ch].used || vb_master[ch].used)
+            continue;
+        bool a_reverse_used = (ch < (int)va_master.size()) && va_master[ch].used;
+        bool b_reverse_used = (ch < (int)vb_slave.size()) && vb_slave[ch].used;
+        if (a_reverse_used || b_reverse_used)
+            continue;
+        portIdx = ch;
+        return true;
     }
     return false;
 }
