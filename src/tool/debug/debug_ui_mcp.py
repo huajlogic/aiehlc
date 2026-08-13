@@ -950,6 +950,45 @@ def current_app() -> str:
 
 
 @mcp.tool()
+def app_sources() -> str:
+    """List the source files of the application currently being debugged.
+
+    Use this to find the code behind whatever you are looking at, and read it
+    before explaining a tile, a transfer or a failure — the compiled schedule
+    says what the tools built, the source says what the developer asked for, and
+    a diagnosis needs both. The system prompt carries this same inventory for the
+    app that was loaded at spawn; call this after an app switch, or when you want
+    it refreshed.
+
+    Groups returned:
+      Entry source     the file the app was built from (aiehlc flow)
+      Kernels          each kernel the schedule runs -> the file:line defining it
+                       (matched by name; treat the line as approximate)
+      Application      hand-written .cc/.cpp — kernels, graph, PS host code
+      Headers          hand-written .h/.hpp
+      Build            build.sh / Makefile / .bif at the app root
+      Generated        host.cc, kernel.cc, .bcf, MLIR — compiler output. Read as
+                       evidence of what the compiler decided; never propose
+                       editing these, they are overwritten on the next build.
+
+    Paths are relative to the app directory (see get_backend_status / the App
+    line on each message). Read them with your file tools and cite what you find
+    as <file>:<line> so the user can click through to it.
+    """
+    live = _read_live_status()
+    text = (live.get("app_sources_text") or "").strip()
+    if text:
+        ap = live.get("app_paths") or {}
+        head = "App: %s at %s" % (ap.get("app", "?"), ap.get("app_dir", "?"))
+        return "%s\n\n%s" % (head, text)
+    if live:
+        return ("no sources found for the current app (%s). Say so rather than "
+                "guessing filenames." % (live.get("app_paths") or {}).get("app_dir", "?"))
+    return ("daemon not reachable (DEBUGUI_JSON_DIR unset or server down) — "
+            "no source inventory available")
+
+
+@mcp.tool()
 def select_app(app_id: str) -> str:
     """Switch the debug UI to another app. The browser picks it up on reload.
 

@@ -464,6 +464,199 @@ view parse behind the basename index is memoised on mtime. Warm requests went
 **320 ms → 0.6 ms**. Cold render of a 1586-line `host.cc` is ~495 ms / 726 KB,
 which is why `_SRC_FULL_LINES` is 2000 and larger files are windowed ±400 lines.
 
+### `aieprofile.sh` — AIE hardware performance counters on a running board
+
+`script/debug/aieprofile.sh` + `aieprofile.tcl` drive the Vitis `aieprofile`
+package (`$XILINX_VITIS/scripts/vitis/util/aie_profile.tcl`, 4717 lines) against
+a board over JTAG. It is the only Vitis profiling path that reaches a
+**baremetal** run: `aiesimulator --profile` is simulator-only, and both
+`aiecompiler --event-trace` and `adf::event::start_profiling` need an adf graph,
+which the aiehlc tiling flow does not build.
+
+```bash
+source script/test/envlocal.sh                 # XILINX_VITIS + VEK385IP
+python3 ../naiebaremetal/src/tool/test/runhw_vek385.py -nonreboot &
+./script/debug/aieprofile.sh --example ../naiebaremetal/example/example_oob_4x4
+vitis_analyzer aout/profile/example_oob_4x4_*/aie_trace_profile.run_summary
+```
+
+It is a **second JTAG client** on the board's `hw_server`, exactly like the debug
+UI's aiedbg reads — the app is started separately and this attaches while it
+runs. Unlike aiedbg it *writes*: configuring a counter is a register write
+(`mwr -force`), so it must not run alongside anything else owning the
+performance counters. The vendor script says so itself (`aie_profile.tcl:1476`,
+"turn off other usages of counters (e.g., ECC, trace)"); in this repo the
+conflict to avoid is `aiegdb`'s `dma counter setup`.
+
+Board host resolution is the same live chain the daemon uses — `--host` →
+`$VEK385IP` → `hwlocal.sh` — because a board is a per-run choice and must never
+be baked into a config file. Metric sets come from `aieprofile start -help`:
+`heat_map`, `stalls`, `execution`, `floating_point`, `stream_put_get` and the
+throughput sets for AIE tiles; `conflicts`, `dma_locks`, `dma_stalls_mm2s`,
+`dma_stalls_s2mm` for the memory module; stall/throughput/`packets`/
+`start_to_bytes_transferred` for interface tiles; channel and conflict stats for
+memory tiles. Pass them with repeatable `--metric "-flag value"`.
+
+Four vendor behaviours the wrapper exists to handle, each verified:
+
+- **`-interval` does not default to 20 ms.** The help says it does, but the
+  option carries no `default` clause, so an omitted `-interval` falls through to
+  `0` and the loop polls flat out. The wrapper always passes it explicitly.
+- **`start` connects to *localhost*.** It calls bare `connect` only when
+  `[connect -list]` is empty — and that same branch is what selects the target,
+  so connecting first (as we must, to reach a remote board) means we also have
+  to select the target ourselves. Worse, a bare `connect` to a machine with no
+  hw_server **launches one locally**, so the failure is a silent connection to
+  the wrong device rather than an error.
+- **Output goes to CWD, not `-work-dir`.** `write_run_summary` carries the
+  comment "NOTE: for now, use pwd", so the wrapper cds into `--out` first.
+  Default is `aout/profile/<example>_<stamp>/` in *this* repo, since the
+  naiebaremetal checkout is often on a read-only mount.
+- **`targets -filter {name =~ "$var"}` really does substitute.** Braces would
+  normally prevent it, and xsdb echoes the filter *pre*-substitution so a failed
+  match prints `name =~ "$targetName"` verbatim and reads like a bug. Confirmed
+  by discriminator: an undefined variable in the same position fails with
+  `can't read "...": no such variable`. Do not "fix" it to an interpolated
+  string.
+
+Three sibling packages ship in the same directory and take the same shape:
+`aie_trace.tcl` (`aietrace start|stop|clearconfig`), `aie_status.tcl`
+(`aiestatus examine` — AMD's own decode of the registers `aiediag.py`
+reimplements, and a useful second opinion when a decode is in doubt), and
+`aie_debug.tcl` / `aie_mem_dump.tcl`, alongside per-generation register maps
+(`aie2ps_registers.h`, `aie2ps_attributes.h`).
+
+#### The ordering constraint, and `aierun_retrigger.tcl`
+
+`aieprofile start` configures the counters and then **blocks in its own polling
+loop**, so it cannot start the application; and a PDI reprogram reconfigures the
+AIE array, wiping any counter setup that preceded it. Both facts together fix the
+order:
+
+```
+1. program once            runhw_vek385.py            PDI + ELF + run
+2. reload ELF, stay halted aierun_retrigger.tcl load  slow — before the profiler
+3. configure + poll        aieprofile.sh
+4. resume                  aierun_retrigger.tcl go    instant
+```
+
+`aierun_retrigger.tcl` exists only for steps 2 and 4: halt the A78, `dow -force`
+the host ELF, and later `con` — no PDI reprogram, so the counters survive. The
+download is deliberately step 2 rather than folded into step 4 because it runs at
+JTAG rate and would otherwise consume the whole sampling window.
+
+Getting this wrong produces an **all-zero CSV**: every tile present in
+`METRIC_SETS`, sampled the full count, every value 0 — the counters were
+configured after the application had already finished. Verified on
+`example_oob_4x4`: the first capture (kept as `aout/profile/probe/`) is exactly
+that, and the corrected ordering gave 15/16 tiles of live data.
+
+Also note the board's `hw_server` is commonly bound `tcp:127.0.0.1:3121`, so an
+external client cannot reach it — tunnel (`ssh -N -L 13121:127.0.0.1:3121 <board>`,
+then `--host 127.0.0.1 --port 13121`) or start one with `-stcp:0.0.0.0:3121`.
+
+#### A fourth trap: the module offset
+
+Event ids carry their module as a **decimal offset** — `memory_event_offset 1000`,
+`shim_event_offset 2000` (`aie_profile.tcl:77-78`). Load-bearing rather than
+cosmetic: interface tiles are `(0,0)`/`(1,0)`, core tiles are `(0,0)`..`(3,3)`,
+they collide in the CSV's `column,row`, and **the CSV has no module column**.
+Without splitting on the offset a shim port counter is silently added to a core
+tile's row. So `1031` is memory `dma_stall_s2mm_chan0` (31) and `2134` is shim
+`port_running_0` (134).
+
+#### Rendering: `aieprofile_summary.py` and `aieprofile_report.py`
+
+Two readers over the same captures, both decoding event names from the Vitis
+install's own `aie2ps_attributes.h` rather than a copied table, so a decode
+cannot drift from the tool that produced the numbers:
+
+- **`aieprofile_summary.py <dir>`** — tabular. One section per run: what it
+  enabled (module → metric set → tile count) and the per-tile counters.
+- **`aieprofile_report.py <dir>`** — visual. Hero figure, KPI tiles, the array
+  drawn as the grid it physically is with a metric toggle, a ranked stall bar
+  chart, and computed findings. Follows the house data-viz method: one sequential
+  hue with a toggle rather than several ramps at once, palette validated in both
+  modes, status colours reserved for callouts.
+
+Two things the visual pass got wrong first, both invisible until rendered. The
+ramp was anchored at 0, but these counters cluster in a narrow band far above it
+(active cycles vary 670k–700k, a 4% spread) so the array came out as one flat
+wash — it now spans the **non-zero data range**, with exact zero given its own
+neutral swatch, since "never incremented" is a different statement from "small",
+and the legend states the domain. And the ramp **reverses on the dark surface**:
+"darker is more" is right on white where the high end is furthest from the
+surface, but on near-black it points the largest values at the background and the
+busiest tiles recede.
+
+### Source grounding — the assistant cites the app's code, not just registers
+
+Three layers describe an AIE design, and only two of them were reachable by the
+embedded assistant:
+
+| Layer | Answers | Comes from |
+|---|---|---|
+| live registers | what the hardware **did** | `aie_exec` |
+| compiled schedule | what the tools **built** | `tile_info`, `get_flow_detail` |
+| application source | what the developer **asked for** | the app's own `.cc` / `.cpp` |
+
+The first two arrive free from tool calls, so answers settled there — accurate
+about BD chains and DMA channels, and unusable, because nothing in them is a line
+the user can change. `app_paths()` named the app *directory*, but a directory is
+not an inventory: "read the kernel for this tile" meant guessing a filename, and a
+wrong guess is indistinguishable from the app having no sources, so the assistant
+quietly stopped trying.
+
+`_app_source_manifest()` builds the inventory. It walks `app_dir` (skipping
+`build/`, `Work/`, `worklocal/`, `aiesimulator_output/`, `.Xil/`, `arch/`, `ipc/`)
+for `.cc`/`.cpp`/`.h`, drops anything whose banner says a tool wrote it, and
+groups the rest as **Application**, **Headers**, **Build**, **Entry source** and
+**Generated**. It is published three ways — inline in the system prompt, as
+`backend_status.json > app_sources` (structured) and `app_sources_text`
+(rendered, so the out-of-process MCP server needs no second formatter, exactly as
+`session` / `session_summary` already pair), and through the
+`mcp__debugui__app_sources()` tool, which is what refreshes it after an app
+switch. Measured at ~2 ms for a naiebaremetal example, ~12 ms for `aout/`
+(more files to read banners from), cached 20 s.
+
+**Kernel name → definition site** is the part that makes it operational.
+`_app_kernel_defs()` takes the kernel names the schedule attributes to tiles and
+finds each one's definition, so `tile_info` saying `kernel: conv2` becomes
+`src/convolution2.cc:19` — one Read away from an answer that quotes the user's
+loop. `_app_def_line()` prefers a match whose line does not end in `;`, which
+separates a signature with a body from a prototype or a call site; verified
+against `conv2`, `stream_accum` and `matmul`, all landing exactly on the
+definition. It is a name match, not a parse, and both the prompt and the
+`source-grounding` skill say so — the line is a jump target to confirm, not a
+citation to emit unread.
+
+**Two flows, and only one of them can be walked.** A naiebaremetal example keeps
+its sources in `<app>/src/`, so the walk finds them. The aiehlc flow's `app_dir`
+is `aout/` — generated code only — while its real source is whatever
+`--runtime-source-file` pointed at, anywhere in the tree. Nothing recorded that,
+so `aiehlc.sh` now writes `worklocal/app_source.txt` at build time and
+`_app_entry_source()` reads it (falling back to `sim_config.sh`'s `HOST_SRC` for
+builds that predate it). Without it that flow's inventory is generated files and
+nothing else. Its per-tile kernel labels are roles (`dskernel_receiver`), which no
+source defines, so `_app_kernel_names()` also takes `view.kernel.function` — the
+function the frontend actually lifted, and the only name that appears in the
+user's file.
+
+**Generated files stay in the inventory, labelled.** `host.cc`, `kernel.cc`, the
+`.bcf` and the dfschedule MLIR are the best evidence of what the compiler decided
+and the static tools already quote them — but they are overwritten on the next
+build, so proposing an edit to one costs the user their time twice. The prompt
+states that as a rule, and the group header repeats it where it is read.
+
+The behavioural half lives in the prompt (a *Ground every explanation in the
+application's source* section, plus a final workflow step) and in the
+`source-grounding` skill, which carries the four chains worth following —
+transfer size ↔ window declaration, repetition count ↔ graph run count, lock ids
+↔ acquire/release calls, BD address ↔ the buffer the kernel writes — and two
+rules that override the rest: never cite a line you have not read, and when the
+source and the registers disagree, report the gap rather than reconciling it,
+because that gap is usually the bug.
+
 ### Device map — one lane per flow
 
 Flow lines are drawn as straight segments between tile centres, offset

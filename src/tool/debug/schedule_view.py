@@ -2263,6 +2263,115 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      three sides; paint the left edge of the following segment to close it. */
   .vsw.act + .vsw { border-left:1px solid var(--bd-accent); }
 
+  /* ── Targets panel ───────────────────────────────────────────── */
+  #targetsview { display:none; flex-direction:column; gap:0; }
+  #targetsview.show { display:flex; }
+  #tgt-toolbar { display:flex; align-items:center; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  #tgtRefreshBtn { font-size:11px; padding:3px 13px; border-radius:4px; cursor:pointer;
+                   border:1px solid var(--accent); background:var(--accent);
+                   color:var(--bg-code); font-weight:600; letter-spacing:.02em;
+                   transition:filter .12s; }
+  #tgtRefreshBtn:hover { filter:brightness(1.12); }
+  #tgtRefreshBtn:active { filter:brightness(.92); }
+  #tgt-status { font-size:11.5px; color:var(--tx-lo); }
+  #tgt-list { flex:1 1 auto; overflow:auto; }
+
+  /* Card: left-border is the primary state color so you can skim at a glance */
+  .tgt-card { border:1px solid var(--bd); border-left-width:4px; border-radius:6px;
+              margin-bottom:8px; background:var(--bg-raised); overflow:hidden; }
+  .tgt-card.tc-running   { border-left-color:#3fb950; }
+  .tgt-card.tc-suspended { border-left-color:#d29922; }
+  .tgt-card.tc-crashed   { border-left-color:#f85149; }
+  .tgt-card.tc-noelf     { border-left-color:#484f58; }
+  .tgt-card.tc-other     { border-left-color:var(--bd); }
+  .tgt-card.tgt-sel      { outline:2px solid var(--accent); outline-offset:-2px; }
+
+  /* Header row: always visible */
+  .tgt-hdr { display:flex; align-items:center; gap:8px; padding:7px 10px 6px;
+             background:var(--bg-raised); }
+
+  /* State badge (pill) */
+  .tgt-badge { font-size:10px; font-weight:700; padding:2px 8px; border-radius:10px;
+               letter-spacing:.04em; white-space:nowrap; flex-shrink:0; }
+  .tgt-badge.running   { background:#1a3c1e; color:#3fb950; }
+  .tgt-badge.suspended { background:#3b2800; color:#d29922; }
+  .tgt-badge.crashed   { background:#3b0a0a; color:#f85149; }
+  .tgt-badge.noelf     { background:var(--bg-code); color:#484f58; }
+  .tgt-badge.other     { background:var(--bg-code); color:var(--tx-lo); }
+
+  /* Name + id */
+  .tgt-name { font-size:12.5px; font-weight:600; flex:1 1 auto; overflow:hidden;
+              text-overflow:ellipsis; white-space:nowrap; }
+  .tgt-id   { font-size:11px; color:var(--tx-lo); opacity:.55; flex-shrink:0; }
+
+  /* PC row: monospace line below the header, visible whenever PC is known */
+  .tgt-pcrow { display:flex; align-items:baseline; gap:8px;
+               padding:0 10px 5px; font-family:ui-monospace,monospace; font-size:11px; }
+  .tgt-pclabel { color:var(--tx-lo); flex-shrink:0; }
+  .tgt-pcval   { color:#a8d8ff; flex-shrink:0; }
+  .tgt-pcsrc   { color:var(--accent-fg); overflow:hidden; text-overflow:ellipsis;
+                 white-space:nowrap; cursor:pointer; }
+  .tgt-pcsrc:hover { text-decoration:underline dotted; }
+
+  /* Stack trace: collapsible <details> below the PC row */
+  .tgt-btdetails { padding:0; border-top:1px solid var(--bd); }
+  .tgt-btsummary { font-size:11px; color:var(--tx-lo); padding:4px 10px;
+                   cursor:pointer; user-select:none; list-style:none; }
+  .tgt-btsummary::-webkit-details-marker { display:none; }
+  .tgt-btsummary::before { content:'▶'; font-size:9px; margin-right:5px;
+                            display:inline-block; transition:transform .15s; }
+  .tgt-btdetails[open] .tgt-btsummary::before { transform:rotate(90deg); }
+  .tgt-stack { font-family:ui-monospace,monospace; font-size:11px; width:100%;
+               border-collapse:collapse; }
+  .tgt-stack tr { border-bottom:1px solid var(--bd); }
+  .tgt-stack tr:last-child { border-bottom:none; }
+  .tgt-stack td { padding:3px 8px; vertical-align:top; }
+  .tgt-stack .sf-frame { color:var(--tx-lo); width:2ch; text-align:right; padding-right:8px;
+                         font-size:10px; }
+  .tgt-stack .sf-addr  { color:#6e8fa8; width:9ch; white-space:nowrap; }
+  .tgt-stack .sf-func  { font-weight:500; color:var(--tx); }
+  /* top frame gets accent color so it stands out */
+  .tgt-stack tr:first-child .sf-func { color:var(--accent-fg); }
+  .tgt-stack .sf-loc   { color:var(--tx-lo); cursor:pointer; }
+  .tgt-stack .sf-loc:hover { color:var(--accent-fg); text-decoration:underline dotted; }
+  .tgt-stack .sf-raw   { color:var(--tx-lo); font-style:italic; }
+
+  .tgt-elfdot { font-size:10px; flex-shrink:0; margin-left:2px; }
+  .tgt-elfdot.sym   { color:#3fb950; }
+  .tgt-elfdot.nosym { color:#d29922; }
+  .tgt-elfdot.none  { color:#484f58; }
+  .tgt-nonote { padding:4px 10px 8px; font-size:11px; color:var(--tx-lo); font-style:italic; }
+
+  .tgt-haltrow { display:flex; align-items:center; gap:8px; padding:4px 10px 6px; }
+  .tgt-haltbtn { font-size:11px; padding:3px 10px; border-radius:4px; cursor:pointer;
+                 background:#3b2800; color:#d29922; border:1px solid #5c4200;
+                 transition:filter .12s; }
+  .tgt-haltbtn:hover { filter:brightness(1.2); }
+  .tgt-haltbtn:active { filter:brightness(.85); }
+  .tgt-haltbtn:disabled { opacity:.45; cursor:default; filter:none; }
+  .tgt-haltnote { font-size:10px; color:var(--tx-lo); }
+
+  .tgt-empty { color:var(--tx-lo); font-size:12px; padding:24px 0; text-align:center; }
+
+  /* Cluster (APU/RPU group) headers */
+  .tgt-cluster { margin-bottom:4px; }
+  .tgt-cluster-hdr { display:flex; align-items:center; gap:6px; padding:4px 6px 4px 8px;
+                     border-radius:4px; background:var(--bg-raised); cursor:pointer;
+                     user-select:none; }
+  .tgt-cluster-hdr:hover { background:var(--bg-hover,var(--bg-raised)); filter:brightness(1.1); }
+  .tgt-cluster-arrow { font-size:9px; color:var(--tx-lo); transition:transform .15s;
+                       flex-shrink:0; display:inline-block; }
+  details.tgt-cluster[open] > summary .tgt-cluster-arrow { transform:rotate(90deg); }
+  .tgt-cluster-name { font-size:12px; font-weight:600; color:var(--tx); flex:1 1 auto; }
+  .tgt-cluster-badge { font-size:10px; padding:1px 7px; border-radius:10px;
+                       background:var(--bg-code); color:var(--tx-lo); flex-shrink:0; }
+  .tgt-cluster-badge.cl-running { background:#1a3c1e; color:#3fb950; }
+  .tgt-cluster-body { padding-left:10px; padding-top:3px; display:flex;
+                      flex-direction:column; gap:4px; }
+  details.tgt-cluster:not([open]) > .tgt-cluster-body { display:none; }
+  details.tgt-cluster > summary { list-style:none; }
+  details.tgt-cluster > summary::-webkit-details-marker { display:none; }
+
   /* Console header tabs (#contabs) — folder style */
   #contabs { flex:0 0 auto; margin-bottom:6px; }
   .contab { display:inline-block; padding:3px 12px; border:1px solid var(--bd);
@@ -2798,6 +2907,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="viewswitcher">
       <span class="vsw" data-v="grid" onclick="switchView('grid')">Grid</span>
       <span class="vsw act" data-v="map" onclick="switchView('map')">Device Map</span>
+      <span class="vsw" data-v="targets" onclick="switchView('targets')">Host</span>
     </div>
   </div>
   <div class="sub" id="meta" style="display:none"></div>
@@ -2854,6 +2964,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
            from LSTATE at load so this list cannot drift from the renderer. -->
       <span id="devmap-stlegend" class="hide"></span>
     </div>
+  </div>
+  <!-- ── Targets panel ───────────────────────────────────────────── -->
+  <div id="targetsview">
+    <div id="tgt-toolbar">
+      <button id="tgtRefreshBtn" onclick="tgtRefresh()">Refresh</button>
+      <label><input type="checkbox" id="tgtLiveToggle" onchange="tgtSetLive(this.checked)"> Live</label>
+      <span id="tgt-status"></span>
+    </div>
+    <div id="tgt-list"><div class="tgt-empty">Click Refresh to read targets from the board.</div></div>
   </div>
   <!-- collapsible legend — collapsed by default -->
   <details id="legend-detail">
@@ -3547,19 +3666,588 @@ rowsDesc.forEach(r => {
   }
 });
 
-// ── View switcher (Grid / Device Map) ────────────────────────
+// ── View switcher (Grid / Device Map / Targets) ──────────────
 // Device Map is the default view; the initial call at the bottom of this script
 // runs through here too, so the shown/hidden state has exactly one definition.
 function switchView(name){
   document.querySelectorAll('.vsw').forEach(b=>b.classList.toggle('act', b.dataset.v===name));
-  const showGrid = name==='grid';
+  const showGrid    = name==='grid';
+  const showMap     = name==='map';
+  const showTargets = name==='targets';
   document.getElementById('grid').style.display = showGrid ? '' : 'none';
   document.getElementById('overlayctl').style.display = showGrid ? '' : 'none';
   document.getElementById('legend-detail').style.display = showGrid ? '' : 'none';
-  document.getElementById('devmap').classList.toggle('show', !showGrid);
-  if(!showGrid) buildDeviceMap();
+  document.getElementById('devmap').classList.toggle('show', showMap);
+  document.getElementById('targetsview').classList.toggle('show', showTargets);
+  if(showMap) buildDeviceMap();
+  if(showTargets) tgtMaybeAutoRefresh();
   reportUIState({view: name});
 }
+
+// ── Targets panel ─────────────────────────────────────────────
+const TGT = { live: false, timer: null, loading: false, data: [] };
+
+function tgtSetLive(on){
+  TGT.live = on;
+  clearInterval(TGT.timer);
+  TGT.timer = null;
+  if(on){ tgtRefresh(); TGT.timer = setInterval(tgtRefresh, 4000); }
+}
+
+function tgtMaybeAutoRefresh(){
+  // Refresh once when first opening the panel if there are no results yet.
+  const list = document.getElementById('tgt-list');
+  if(list && list.querySelector('.tgt-empty')) tgtRefresh();
+}
+
+function tgtRefresh(){
+  if(TGT.loading) return;
+  TGT.loading = true;
+  const st = document.getElementById('tgt-status');
+  if(st) st.textContent = 'Reading…';
+  const btn = document.getElementById('tgtRefreshBtn');
+  if(btn) btn.disabled = true;
+  const dev  = deviceSel   ? deviceSel.value            : '';
+  const host = boardHost   ? boardHost.value.trim()      : '';
+  const base = '?device=' + encodeURIComponent(dev) + '&host=' + encodeURIComponent(host);
+  api('/targets' + base)
+    .then(data => {
+      TGT.loading = false;
+      if(btn) btn.disabled = false;
+      if(data.error){
+        if(st) st.textContent = '⚠ ' + data.error;
+        tgtRenderError(data.error);
+        return;
+      }
+      TGT.data = data.targets || [];
+      if(data.raw) console.log('[tgtRaw xsdb output]\n' + data.raw);
+      tgtRender(TGT.data);
+      tgtSyncPanel();
+
+      // Fan out detail reads in parallel for all stopped targets.
+      const stopped = TGT.data.filter(t => t.suspended);
+      if(!stopped.length){ if(st) st.textContent = 'Updated ' + new Date().toLocaleTimeString(); return; }
+      if(st) st.textContent = 'Reading registers (' + stopped.length + ' stopped)…';
+      let done = 0;
+      stopped.forEach(t => {
+        fetch('/targets/detail?id=' + t.id + '&' + base.slice(1))
+          .then(r => r.json())
+          .then(d => {
+            if(!d.error){
+              if(d.pc)    t.pc   = d.pc;
+              if(d.sp)    t.sp   = d.sp;
+              if(d.lr)    t.lr   = d.lr;
+              if(d.cpsr)  t.cpsr = d.cpsr;
+              if(d.elf)   t.elf  = true;
+              if(d.stack && d.stack.length) t.stack = d.stack;
+              tgtRender(TGT.data);
+              tgtSyncPanel();
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            done++;
+            if(done === stopped.length && st)
+              st.textContent = 'Updated ' + new Date().toLocaleTimeString();
+          });
+      });
+    })
+    .catch(e => {
+      TGT.loading = false;
+      if(btn) btn.disabled = false;
+      if(st) st.textContent = '⚠ ' + e.message;
+    });
+}
+
+function tgtSyncPanel(){
+  TGT.data.forEach(t => {
+    const key = 'tgt:' + t.id;
+    if(panelItems.has(key)){
+      panelItems.get(key).buildBody = () => tgtBuildBody(t);
+      panelItems.get(key).llmCtx = tgtLlmCtx(t);
+      if(panelActiveKey === key) panelRenderBody(key);
+    }
+  });
+}
+
+// Whether the stack trace carries real symbol names (ELF with debug info loaded).
+function tgtHasSymbols(t){
+  if(!t.stack || !t.stack.length) return false;
+  const f = t.stack[0];
+  if(f.raw) return false;
+  return f.func && f.func !== '??' && !f.func.startsWith('0x');
+}
+
+// Whether any ELF was loaded at all.
+// Server sets t.elf=true when memmap returns data; also infer from PC / symbol.
+function tgtElfLoaded(t){
+  return !!(t.elf || t.pc || tgtHasSymbols(t));
+}
+
+// State class drives the left border and badge color.
+// running+ELF = green, stopped = amber, stopped+no-symbols = red, no-ELF = grey.
+function tgtStateClass(t){
+  const s = (t.state||'').toLowerCase();
+  // Server-parsed booleans are authoritative; fall back to state string scan.
+  const running = t.running  || s.includes('run');
+  const stopped = t.suspended || s.includes('sus') || s.includes('stop') || s.includes('halt');
+  if(running)  return 'running';
+  if(stopped && !tgtHasSymbols(t) && t.stack && t.stack.length) return 'crashed';
+  if(stopped)  return 'suspended';
+  if(!tgtElfLoaded(t)) return 'noelf';
+  return 'other';
+}
+
+function tgtBadgeLabel(t){
+  const s = (t.state||'').toLowerCase();
+  const running = t.running  || s.includes('run');
+  const stopped = t.suspended || s.includes('sus') || s.includes('stop') || s.includes('halt');
+  if(running) return 'RUNNING';
+  if(stopped) return 'STOPPED';
+  return (t.state||'IDLE').toUpperCase();
+}
+
+// Halt one running core, read its registers, resume, then patch TGT.data
+// and re-render the card + Info pane in place.
+function tgtHaltRead(e, tid){
+  if(e) e.stopPropagation();
+  // Disable the button immediately to prevent double-clicks.
+  const btn = e && e.currentTarget;
+  if(btn){ btn.disabled = true; btn.textContent = 'Halting…'; }
+
+  const params = new URLSearchParams({id: tid});
+  const dv = document.getElementById('deviceSel');
+  if(dv && dv.value) params.set('device', dv.value);
+  const hv = document.getElementById('hostInput');
+  if(hv && hv.value) params.set('host', hv.value);
+
+  fetch('/targets/halt_read?' + params)
+    .then(r => r.json())
+    .then(data => {
+      if(data.error){
+        if(btn){ btn.disabled = false; btn.textContent = 'Halt & read registers'; }
+        alert('Halt-read failed: ' + data.error);
+        return;
+      }
+      // Merge result into the target object in TGT.data.
+      const t = TGT.data.find(x => x.id === tid);
+      if(!t) return;
+      if(data.pc)    t.pc   = data.pc;
+      if(data.sp)    t.sp   = data.sp;
+      if(data.lr)    t.lr   = data.lr;
+      if(data.cpsr)   t.cpsr   = data.cpsr;
+      if(data.elf)    t.elf    = true;
+      if(data.pc_loc) t.pc_loc = data.pc_loc;
+      if(data.pc_sym) t.pc_sym = data.pc_sym;
+      if(data.stack && data.stack.length) t.stack = data.stack;
+      // Re-render the full list (preserves open state) and refresh Info pane.
+      tgtRender(TGT.data);
+      if(panelActiveKey === 'tgt:' + tid) tgtSelectCard(t);
+    })
+    .catch(err => {
+      if(btn){ btn.disabled = false; btn.textContent = 'Halt & read registers'; }
+      alert('Halt-read error: ' + err);
+    });
+}
+
+function tgtRenderError(msg){
+  const list = document.getElementById('tgt-list');
+  if(!list) return;
+  list.innerHTML = '<div class="tgt-empty">Error: ' + esc(msg) + '</div>';
+}
+
+// Build a tree from the flat targets list.
+//
+// Primary strategy: use xsdb indent depth (works when xsdb emits explicit
+// group rows like "APU" / "RPU" at indent 0 with cores indented under them).
+//
+// Fallback strategy: if all entries have the same indent (flat list — xsdb
+// version that emits only leaf cores), group by core-family prefix:
+//   "Cortex-A*"  → APU cluster
+//   "Cortex-R*"  → RPU cluster
+//   "Cortex-M*"  → MCU cluster
+//   anything else → top-level
+//
+// Either way every cluster node auto-collapses when all descendants are idle.
+function tgtBuildTree(targets){
+  if(!targets.length) return [];
+
+  // --- Primary: indent-based tree ---
+  const allSameIndent = targets.every(t => (t.indent || 0) === (targets[0].indent || 0));
+  if(!allSameIndent){
+    const nodes = targets.map(t => ({ t, children: [] }));
+    const roots = [];
+    const stack = []; // [{indent, node}]
+    for(const node of nodes){
+      const ind = node.t.indent || 0;
+      while(stack.length && stack[stack.length-1].indent >= ind) stack.pop();
+      if(stack.length) stack[stack.length-1].node.children.push(node);
+      else             roots.push(node);
+      stack.push({indent: ind, node});
+    }
+    return roots;
+  }
+
+  // --- Fallback: name-prefix grouping for flat lists ---
+  function clusterKey(name){
+    if(/cortex-a/i.test(name)) return 'APU (Cortex-A)';
+    if(/cortex-r/i.test(name)) return 'RPU (Cortex-R)';
+    if(/cortex-m/i.test(name)) return 'MCU (Cortex-M)';
+    if(/microblaze/i.test(name)) return 'MicroBlaze';
+    return null;  // top-level
+  }
+  const clusterMap = {};   // key → synthetic group node
+  const clusterOrder = []; // insertion order
+  const roots = [];
+  for(const t of targets){
+    const key = clusterKey(t.name);
+    if(key){
+      if(!clusterMap[key]){
+        // Synthetic group target: not a real xsdb target, just a label.
+        clusterMap[key] = { t: {id: -1, indent: 0, name: key, state: '', running: false,
+                                suspended: false, pc: null, sp: null, lr: null,
+                                cpsr: null, elf: false, stack: []},
+                            children: [], synthetic: true };
+        clusterOrder.push(key);
+        roots.push(clusterMap[key]);
+      }
+      clusterMap[key].children.push({ t, children: [] });
+    } else {
+      roots.push({ t, children: [] });
+    }
+  }
+  // Update synthetic group's running flag to reflect children.
+  clusterOrder.forEach(key => {
+    const grp = clusterMap[key];
+    grp.t.running = grp.children.some(c => c.t.running);
+  });
+  return roots;
+}
+
+function tgtClusterAllIdle(node){
+  // True when this subtree has no Running descendants.
+  if(node.children.length === 0) return !node.t.running;
+  return node.children.every(tgtClusterAllIdle);
+}
+
+function tgtRender(targets){
+  const list = document.getElementById('tgt-list');
+  if(!list) return;
+  if(!targets.length){
+    list.innerHTML = '<div class="tgt-empty">No targets found.</div>';
+    return;
+  }
+  console.log('[tgtRender] targets:', JSON.stringify(targets.map(t=>({id:t.id,indent:t.indent,name:t.name,running:t.running}))));
+  console.log('[tgtRender] tree:', JSON.stringify(tgtBuildTree(targets).map(function s(n){return {id:n.t.id,name:n.t.name,children:n.children.map(s)};})));
+  // Preserve open/closed state across live refreshes.
+  const bodyOpen     = new Set();
+  const clusterOpen  = new Set();
+  const clusterClosed = new Set();
+  list.querySelectorAll('.tgt-body-det[open]').forEach(d => bodyOpen.add(+d.dataset.id));
+  list.querySelectorAll('details.tgt-cluster[open]').forEach(d => clusterOpen.add(d.dataset.cname));
+  list.querySelectorAll('details.tgt-cluster:not([open])').forEach(d => clusterClosed.add(d.dataset.cname));
+
+  const roots = tgtBuildTree(targets);
+  list.innerHTML = '';
+
+  function renderNode(node, container){
+    const t = node.t;
+    if(node.children.length > 0){
+      // Group node → cluster <details>
+      const allIdle = tgtClusterAllIdle(node);
+      // User-overridden state wins; default: collapse when all idle.
+      let openAttr = '';
+      if(clusterOpen.has(t.name))        openAttr = ' open';
+      else if(clusterClosed.has(t.name)) openAttr = '';
+      else if(!allIdle)                   openAttr = ' open';
+
+      const runningCount = node.children.filter(n => n.t.running).length;
+      const badgeCls = runningCount ? ' cl-running' : '';
+      const badgeTxt = runningCount
+        ? runningCount + ' running'
+        : node.children.length + ' core' + (node.children.length !== 1 ? 's' : '') + ' idle';
+
+      const det = document.createElement('details');
+      det.className = 'tgt-cluster';
+      det.dataset.cname = t.name;
+      if(openAttr) det.open = true;
+
+      det.innerHTML = '<summary class="tgt-cluster-hdr">'
+        + '<span class="tgt-cluster-arrow">&#9654;</span>'
+        + '<span class="tgt-cluster-name">' + esc(t.name) + '</span>'
+        + '<span class="tgt-cluster-badge' + badgeCls + '">' + badgeTxt + '</span>'
+        + '</summary>';
+
+      const body = document.createElement('div');
+      body.className = 'tgt-cluster-body';
+      node.children.forEach(child => renderNode(child, body));
+      det.appendChild(body);
+      container.appendChild(det);
+      return;
+    }
+
+    // Leaf node → card (same as before, no indent margin needed — nesting handles it)
+    const sc  = tgtStateClass(t);
+    const lbl = tgtBadgeLabel(t);
+    const hasStack = t.stack && t.stack.length;
+    const elfLoaded = tgtElfLoaded(t);
+    const hasSyms   = tgtHasSymbols(t);
+
+    const card = document.createElement('div');
+    card.className = 'tgt-card tc-' + sc;
+    card.dataset.id = t.id;
+    card.title = 'Click to view in Info pane';
+    card.style.cursor = 'pointer';
+
+    // ── Header: badge + name + id + ELF indicator (always visible) ──
+    const elfDot = elfLoaded
+      ? (hasSyms
+          ? '<span class="tgt-elfdot sym" title="ELF loaded, debug symbols present">&#9679;</span>'
+          : '<span class="tgt-elfdot nosym" title="ELF loaded, no debug symbols">&#9675;</span>')
+      : '<span class="tgt-elfdot none" title="No ELF loaded">&#8212;</span>';
+    let html = '<div class="tgt-hdr">'
+      + '<span class="tgt-badge ' + sc + '">' + lbl + '</span>'
+      + '<span class="tgt-name">' + esc(t.name) + '</span>'
+      + elfDot
+      + '<span class="tgt-id">#' + t.id + '</span>'
+      + '</div>';
+
+    // ── Halt & read button: only for running cores with no register data ──
+    if(sc === 'running' && !t.pc){
+      html += '<div class="tgt-haltrow">'
+        + '<button class="tgt-haltbtn" data-tid="' + t.id + '" onclick="tgtHaltRead(event,' + t.id + ')">'
+        + 'Halt &amp; read registers'
+        + '</button>'
+        + '<span class="tgt-haltnote">briefly halts the core (~100 ms)</span>'
+        + '</div>';
+    }
+
+    // ── PC row: shown whenever PC data is available ───────────────
+    if(t.pc){
+      let srcHtml = '';
+      // Prefer addr2line-resolved pc_loc (server-side), then top stack frame.
+      const pcLoc = t.pc_loc || (hasStack && t.stack[0].file ? t.stack[0] : null);
+      if(pcLoc && pcLoc.file){
+        srcHtml = '<span class="tgt-pcsrc srcref"'
+          + ' data-p="' + esc(pcLoc.file) + '"'
+          + ' data-l="' + pcLoc.line + '"'
+          + ' title="' + esc(pcLoc.file + ':' + pcLoc.line) + '">'
+          + esc(pcLoc.file.split('/').pop()) + ':' + pcLoc.line
+          + '</span>';
+        if(pcLoc.func && pcLoc.func !== '??')
+          srcHtml += '<span class="tgt-pcsrc" style="color:var(--tx-lo)"> in ' + esc(pcLoc.func) + '</span>';
+      } else {
+        const sym = (t.pc_sym) || (hasStack && t.stack[0].func) || '';
+        if(sym) srcHtml = '<span class="tgt-pcsrc" style="color:var(--tx-lo)">in ' + esc(sym) + '</span>';
+      }
+      html += '<div class="tgt-pcrow">'
+        + '<span class="tgt-pclabel">PC</span>'
+        + '<span class="tgt-pcval">' + esc(t.pc) + '</span>'
+        + srcHtml
+        + '</div>';
+    }
+
+    // ── Body <details>: open by default when stopped, preserved on refresh ──
+    // Always rendered so the user has a clickable element on every card.
+    const wasOpen = bodyOpen.has(t.id);
+    const openAttr = (t.suspended || wasOpen) ? ' open' : '';
+    html += '<details class="tgt-body-det" data-id="' + t.id + '"' + openAttr + '>';
+
+    if(hasStack){
+      const fc = t.stack.length;
+      html += '<summary class="tgt-btsummary">Stack trace (' + fc + ' frame' + (fc !== 1 ? 's' : '') + ')</summary>';
+      html += '<table class="tgt-stack">';
+      t.stack.forEach(function(f){
+        if(f.raw !== undefined){
+          html += '<tr><td colspan="4" class="sf-raw">' + esc(f.raw) + '</td></tr>';
+        } else {
+          const locStr = f.file ? f.file + ':' + f.line : '';
+          const locCell = locStr
+            ? '<span class="sf-loc srcref" data-p="' + esc(f.file) + '" data-l="' + f.line + '" title="' + esc(locStr) + '">' + esc(locStr) + '</span>'
+            : '';
+          html += '<tr>'
+            + '<td class="sf-frame">' + f.frame + '</td>'
+            + '<td class="sf-addr">' + esc(f.addr || '') + '</td>'
+            + '<td class="sf-func">' + esc(f.func || '') + '</td>'
+            + '<td>' + locCell + '</td>'
+            + '</tr>';
+        }
+      });
+      html += '</table>';
+    } else {
+      const bodyNote = t.suspended
+        ? 'Stopped — no backtrace available.'
+        : t.pc ? 'Running — backtrace not captured.' : 'No debug info.';
+      html += '<summary class="tgt-btsummary">Details</summary>'
+        + '<div class="tgt-nonote">' + bodyNote + '</div>';
+    }
+
+    html += '</details>';
+
+    card.innerHTML = html;
+    container.appendChild(card);
+  }
+
+  roots.forEach(node => renderNode(node, list));
+}
+
+// ── Target Info pane integration ──────────────────────────────
+// Clicking a target card opens it in the Info pane (top-right), same model
+// as tile/net clicks.  The card is highlighted with .tgt-sel; the Info pane
+// shows PC, ELF/symbol status, full stack trace with clickable file:line links.
+
+function tgtLlmCtx(t){
+  const sc  = tgtStateClass(t);
+  const sym = tgtHasSymbols(t) ? 'symbols present' : 'no debug symbols';
+  const elf = tgtElfLoaded(t) ? 'ELF loaded' : 'no ELF';
+  let ctx = 'Processor ' + t.name + ' #' + t.id + ' — ' + (t.state || 'unknown') + ', ' + elf + ', ' + sym;
+  if(t.pc){
+    ctx += '; PC ' + t.pc;
+    const loc = t.pc_loc;
+    if(loc && loc.file) ctx += ' (' + loc.file + ':' + loc.line + (loc.func ? ' in ' + loc.func : '') + ')';
+    else if(t.pc_sym)   ctx += ' (in ' + t.pc_sym + ')';
+  }
+  if(t.sp)   ctx += '; SP ' + t.sp;
+  if(t.lr)   ctx += '; LR ' + t.lr;
+  if(t.cpsr) ctx += '; CPSR ' + t.cpsr;
+  if(t.stack && t.stack.length && t.stack[0].func)
+    ctx += '; top frame: ' + t.stack[0].func;
+  if(t.stack && t.stack.length && t.stack[0].file)
+    ctx += ' at ' + t.stack[0].file + ':' + t.stack[0].line;
+  return ctx;
+}
+
+function tgtBuildBody(t){
+  const sc   = tgtStateClass(t);
+  const lbl  = tgtBadgeLabel(t);
+  const sym  = tgtHasSymbols(t);
+  const elf  = tgtElfLoaded(t);
+  const hasStack = t.stack && t.stack.length;
+
+  // Status line
+  const stateColor = {
+    running:'#3fb950', suspended:'#d29922', crashed:'#f85149', noelf:'#484f58', other:'var(--tx-lo)'
+  }[sc] || 'var(--tx-lo)';
+
+  let h = '<div class="sec">'
+    + '<div class="sec-hdr">' + esc(t.name) + ' &mdash; Target #' + t.id + '</div>'
+    + '<div class="kv"><b>State:</b> <span style="color:' + stateColor + ';font-weight:600">' + lbl + '</span>'
+    + (t.state ? ' <span style="color:var(--tx-lo);font-size:11px">(' + esc(t.state) + ')</span>' : '') + '</div>'
+    + '<div class="kv"><b>ELF:</b> '
+    + (elf ? (sym ? '<span style="color:#3fb950">loaded, debug symbols present</span>'
+                  : '<span style="color:#d29922">loaded, no debug symbols</span>')
+           : '<span style="color:#484f58">not loaded</span>')
+    + '</div>'
+    + '</div>';
+
+  // Halt & read button in Info pane (running core, no register data yet)
+  if(sc === 'running' && !t.pc && !t.sp){
+    h += '<div class="sec"><div style="display:flex;align-items:center;gap:10px">'
+      + '<button class="tgt-haltbtn" onclick="tgtHaltRead(null,' + t.id + ')">Halt &amp; read registers</button>'
+      + '<span style="color:var(--tx-lo);font-size:11px">briefly halts the core (~100 ms) then resumes</span>'
+      + '</div></div>';
+  }
+
+  // Registers section (PC, SP, LR, CPSR) + source location
+  if(t.pc || t.sp || t.lr || t.cpsr){
+    // PC source: prefer server addr2line result, fall back to top stack frame.
+    const pcLoc = t.pc_loc || (hasStack && t.stack[0].file ? t.stack[0] : null);
+    let pcLocHtml = '';
+    if(pcLoc && pcLoc.file){
+      pcLocHtml = ' &mdash; <span class="srcref" data-p="' + esc(pcLoc.file) + '" data-l="' + pcLoc.line
+        + '" style="color:var(--accent-fg);cursor:pointer" title="' + esc(pcLoc.file+':'+pcLoc.line) + '">'
+        + esc(pcLoc.file.split('/').pop()) + ':' + pcLoc.line + '</span>';
+      if(pcLoc.func && pcLoc.func !== '??')
+        pcLocHtml += ' <span style="color:var(--tx-lo)">in ' + esc(pcLoc.func) + '</span>';
+    } else {
+      const sym = t.pc_sym || (hasStack && t.stack[0].func) || '';
+      if(sym) pcLocHtml = ' &mdash; <span style="color:var(--tx-lo)">in ' + esc(sym) + '</span>';
+    }
+    h += '<div class="sec"><div class="sec-hdr">Registers</div>'
+      + '<table style="font-family:ui-monospace,monospace;font-size:12px;border-collapse:collapse">';
+    const regs = [['PC',t.pc,pcLocHtml],['SP',t.sp,''],['LR',t.lr,''],['CPSR',t.cpsr,'']];
+    regs.forEach(function(r){
+      if(!r[1]) return;
+      h += '<tr>'
+        + '<td style="padding:2px 12px 2px 4px;color:var(--tx-lo);width:4ch">' + r[0] + '</td>'
+        + '<td style="padding:2px 8px;color:#a8d8ff;font-weight:600">' + esc(r[1]) + '</td>'
+        + '<td style="padding:2px 4px">' + r[2] + '</td>'
+        + '</tr>';
+    });
+    h += '</table></div>';
+  }
+
+  // Stack trace
+  if(hasStack){
+    h += '<div class="sec"><div class="sec-hdr">Stack Trace</div>'
+      + '<table style="font-family:ui-monospace,monospace;font-size:11px;width:100%;border-collapse:collapse">';
+    t.stack.forEach(function(f, i){
+      if(f.raw !== undefined){
+        h += '<tr><td colspan="4" style="padding:3px 6px;color:var(--tx-lo);font-style:italic">' + esc(f.raw) + '</td></tr>';
+      } else {
+        const locStr  = f.file ? f.file + ':' + f.line : '';
+        const locCell = locStr
+          ? '<span class="srcref" data-p="' + esc(f.file) + '" data-l="' + f.line
+            + '" style="color:var(--tx-lo);cursor:pointer" title="' + esc(locStr) + '">' + esc(locStr) + '</span>'
+          : '';
+        const funcColor = i === 0 ? 'color:var(--accent-fg);font-weight:600' : 'color:var(--tx)';
+        h += '<tr style="border-bottom:1px solid var(--bd)">'
+          + '<td style="padding:3px 8px 3px 4px;color:var(--tx-lo);text-align:right;width:2ch">' + f.frame + '</td>'
+          + '<td style="padding:3px 8px;color:#6e8fa8;width:9ch;white-space:nowrap">' + esc(f.addr||'') + '</td>'
+          + '<td style="padding:3px 8px;' + funcColor + '">' + esc(f.func||'??') + '</td>'
+          + '<td style="padding:3px 8px">' + locCell + '</td>'
+          + '</tr>';
+      }
+    });
+    h += '</table></div>';
+  } else if(sc === 'running'){
+    // Running and no stack yet — "Halt & read" button already shown above.
+    h += '<div class="sec"><div style="color:var(--tx-lo);font-size:12px">Use <b>Halt &amp; read registers</b> above to capture the current stack.</div></div>';
+  } else if(!elf && (t.suspended || sc === 'suspended')){
+    // Stopped but memmap/ELF probe returned nothing — genuinely no ELF.
+    h += '<div class="sec"><div style="color:var(--tx-lo);font-size:12px">No ELF loaded on this processor.</div></div>';
+  } else if(t.suspended || sc === 'suspended'){
+    h += '<div class="sec"><div style="color:var(--tx-lo);font-size:12px">Stopped but backtrace unavailable (debug symbols may be stripped).</div></div>';
+  } else {
+    // Unknown / idle container node — no register data expected.
+    h += '<div class="sec"><div style="color:var(--tx-lo);font-size:12px">No debug data available for this target.</div></div>';
+  }
+
+  return h;
+}
+
+function tgtSelectCard(t){
+  // Highlight the clicked card.
+  document.querySelectorAll('#tgt-list .tgt-card').forEach(c => c.classList.remove('tgt-sel'));
+  const clicked = document.querySelector('#tgt-list .tgt-card[data-id="' + t.id + '"]');
+  if(clicked) clicked.classList.add('tgt-sel');
+
+  const key = 'tgt:' + t.id;
+  const label = t.name + ' #' + t.id;
+  panelItems.forEach((_,k) => { if(k.startsWith('tgt:')) panelItems.delete(k); });
+  panelItems.set(key, {
+    kind: 'tgt',
+    label: label,
+    color: null,
+    buildBody: () => tgtBuildBody(t),
+    llmCtx: tgtLlmCtx(t),
+  });
+  panelActiveKey = key;
+  panelSync();
+}
+
+// Delegated click on the targets list.
+// Cards can be nested inside cluster <details> elements, so we must NOT guard
+// on 'details' — that would catch the cluster wrapper and kill every card click.
+// We DO guard on 'summary' (the native toggle) and 'button'/'a' (their own actions).
+document.getElementById('tgt-list').addEventListener('click', function(e){
+  if(e.target.closest('summary, a, button')) return;
+  const card = e.target.closest('.tgt-card');
+  if(!card) return;
+  const id = +card.dataset.id;
+  const t = TGT.data.find(x => x.id === id);
+  if(t) tgtSelectCard(t);
+});
 
 // ── Device Map (SVG, pan/zoom) ────────────────────────────────
 const DM_COLORS = [
@@ -4040,7 +4728,7 @@ function srRenderResults(){
 // ── Device-map live status ────────────────────────────────────
 // Worst-wins ordering, mirroring the server's _worst(): a flow carrying one
 // stalled channel is stalled even if its other channels are running.
-const DM_ST_ORDER = ['unreachable','error','stalled','running','idle'];
+const DM_ST_ORDER = ['unreachable','error','stalled','running','completed','idle'];
 function dmWorst(states){
   for(const s of DM_ST_ORDER) if(states.indexOf(s)>=0) return s;
   return states.length?states[0]:null;
@@ -4096,7 +4784,7 @@ function dmPaintStatus(){
     const col = dmStColor(cell.state);
     g.setAttribute('data-state', cell.state);
     if(rect){
-      rect.setAttribute('fill', col+'33');
+      rect.setAttribute('fill', col+'55');
       // Selection outranks status on the stroke, but the fill tint still shows
       // through — so a selected tile does not go blind to its own state.
       dmTileStroke[key] = col;
@@ -4713,8 +5401,13 @@ function buildDeviceMap(){
       if(stCell && stCell.state){
         lines.push('── '+(dmStatus.what||'scan')+': '+stCell.state+' ──');
         if(stCell.channels){
-          Object.keys(stCell.channels).forEach(cn =>
-            lines.push('    '+cn+': '+(stCell.channels[cn].state||'?')));
+          Object.keys(stCell.channels).forEach(cn => {
+            const ch = stCell.channels[cn];
+            let detail = ch.state || '?';
+            if(ch.cur_bd != null) detail += '  last bd=' + ch.cur_bd;
+            if(ch.stalls && ch.stalls.length) detail += '  [' + ch.stalls.join(',') + ']';
+            lines.push('    '+cn+': '+detail);
+          });
         }
         if(stCell.pc) lines.push('    pc '+stCell.pc+(stCell.source?' · '+stCell.source:''));
         if(stCell.core_status) lines.push('    core '+stCell.core_status);
@@ -5767,6 +6460,12 @@ document.getElementById('panel-body').addEventListener('click', e => {
   srcOpen(r.dataset.p, r.dataset.l ? +r.dataset.l : null, null,
           r.dataset.l2 ? +r.dataset.l2 : null);
 });
+document.getElementById('targetsview').addEventListener('click', e => {
+  if (!srcClickOk(e)) return;
+  const r = e.target.closest && e.target.closest('.srcref');
+  if (!r || !r.dataset.p) return;
+  srcOpen(r.dataset.p, r.dataset.l ? +r.dataset.l : null);
+});
 
 // ─── aiegdb console (right-bottom, drives aiegdb.py --server) ─────────────────
 // A terminal-style console over the daemon's persistent aiegdb REPL subprocess.
@@ -6620,6 +7319,20 @@ function llmPollOnce(){
   api('/llm/poll?offset=' + LLM.off).then(r => {
     if (r.auth){ llmLock(); return; }
     if (r.error){ llmStopPoll(); llmShowThink(false); return; }
+    if (r.stuck){
+      // Watchdog: the daemon received no output from claude for _LLM_STUCK_S seconds.
+      // The turn is declared over; show a recovery notice and a Reset button.
+      llmStopPoll();
+      llmShowThink(false);
+      if (LLM.pendingId){
+        const s = r.stuck_s ? r.stuck_s + 's' : '2min';
+        llmAppendToMsg(LLM.pendingId,
+          `\n[no response after ${s} — the turn may be stuck. Use **Reset chat** to start a fresh conversation.]`,
+          true);
+        LLM.pendingId = null;
+      }
+      return;
+    }
     const done = r.active === false;
     if (r.data && LLM.pendingId) llmAppendToMsg(LLM.pendingId, r.data, done);
     else if (done && LLM.pendingId) llmAppendToMsg(LLM.pendingId, '', true);
@@ -6859,8 +7572,9 @@ const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
                // a live run is over.
                runOwned:false, daemonRun:null, rsBusy:false, rsTimer:null };
 const LSTATE = {
-  running:['#2e7d32','RUN'], stalled:['#b8860b','STALL'], error:['#c62828','ERR'],
-  idle:['#3a3a3a','idle'], unreachable:['#5a2d2d','n/a'], unknown:['#3a3a3a','?']
+  running:['#4caf50','RUN'], stalled:['#ffca28','STALL'], error:['#ef5350','ERR'],
+  completed:['#26a69a','done'], idle:['#546e7a','idle'],
+  unreachable:['#8d6e63','n/a'], unknown:['#546e7a','?']
 };
 function llmToken(){ return sessionStorage.getItem('LLM_AUTH') || ''; }
 function api(path, opts){
@@ -6962,7 +7676,23 @@ function applyGrid(res){
   const cells = res.cells || {};
   Object.keys(liveBar).forEach(k => {
     const b = liveBar[k], c = cells[k];
-    if (!c){ b.className='livebar hide'; return; }
+    const cell = cellByLoc[k];
+    // Only badge tiles with actionable states — idle/completed channels
+    // finished cleanly and should not display a coloured bar.
+    if (!c || c.state === 'idle' || c.state === 'completed'){
+      b.className='livebar hide';
+      // Still surface last-BD info on the tile hover for completed channels.
+      if(c && c.channels && cell){
+        if(!cell._baseTitle) cell._baseTitle = cell.title;
+        const bdLines = Object.entries(c.channels).map(([cn, ch]) => {
+          let s = cn + ': ' + (ch.state || '?');
+          if(ch.cur_bd != null) s += '  last bd=' + ch.cur_bd;
+          return s;
+        });
+        if(bdLines.length) cell.title = cell._baseTitle + '\n── dma (completed) ──\n' + bdLines.join('\n');
+      }
+      return;
+    }
     const m = LSTATE[c.state] || LSTATE.unknown;
     b.className = 'livebar';
     b.style.background = m[0];
@@ -7162,7 +7892,7 @@ function syncRunState(){
     .catch(() => null)
     .finally(() => { LIVE.rsBusy = false; });
 }
-// Selecting a device only enables the "Test connect" button. The live overlay
+// Selecting a device only enables the "Connect" button. The live overlay
 // checkbox + the drill-down console stay locked until a connection test passes
 // (LIVE.connected). Changing the device invalidates any prior test.
 function updateDeviceUI(){
@@ -7182,10 +7912,9 @@ function updateDeviceUI(){
   // adopt — it is started by this UI or not at all.
   if (attachbtn) attachbtn.disabled = !has || dev === 'simulator';
   if (boardHost) boardHost.classList.toggle('hide', !has || dev === 'pal' || dev === 'simulator');
-  // For simulator, "Test connect" label stays but skips JTAG; still require
-  // the test step so the user explicitly enables Run/Stop for it.
-  if (testconn) testconn.textContent = (dev === 'simulator') ? 'Activate' : 'Test connect';
-  setConnStatus(has ? 'click "Test connect" to enable live features' : '');
+  // For simulator, "Activate" label skips JTAG; for hardware, "Connect".
+  if (testconn) testconn.textContent = (dev === 'simulator') ? 'Activate' : 'Connect';
+  setConnStatus(has ? 'click "Connect" to enable live features' : '');
   setConnHint(false);
   if(deviceSel&&has){
     const opt=deviceSel.options[deviceSel.selectedIndex];
@@ -7194,7 +7923,7 @@ function updateDeviceUI(){
 }
 if (deviceSel) deviceSel.onchange = updateDeviceUI;
 // Editing the hostname invalidates any prior connection test — reset to the
-// "click Test connect" state so stale LIVE.connected doesn't let a Run start
+// "click Connect" state so stale LIVE.connected doesn't let a Run start
 // against a host the user just changed.
 if (boardHost) boardHost.oninput = updateDeviceUI;
 // Apply a successful connection: unlock Run test / Force stop / overlay and
@@ -7619,7 +8348,7 @@ document.getElementById('stopbtn').onclick = () => {
 // The server reads debug_ui_config.json from the workdir and returns any
 // extra devices (e.g. simulator) that it can run.  Each entry is injected
 // as an <option> in the board dropdown; selecting "simulator" short-circuits
-// the JTAG "Test connect" and routes Run/Stop/Load-log to /sim/* endpoints.
+// the JTAG "Connect" and routes Run/Stop/Load-log to /sim/* endpoints.
 const SIM = { timer: null, logoff: 0, logBusy: false, ipcReady: false,
               applogoff: 0, applogSeen: false };
 function pollSimLog(){

@@ -71,6 +71,13 @@ row 3 below do not exist; say so instead of hunting.
 
 Paths are relative to `bundle_dir` / `work_dir` / `app_dir` as marked.
 
+Before hand-resolving a source path, try `mcp__debugui__app_sources()` — it returns the
+app's hand-written files already grouped, plus the `file:line` defining each kernel the
+schedule names, which is faster and less error-prone than the table for the "where is this
+kernel?" case. This table remains the authority for everything it does not cover (the
+provenance JSONs, `Work/` artifacts, per-tile caches) and for cross-checking what it
+returns. **`source-grounding`** covers when to open these files at all and how to cite them.
+
 | Question | Open |
 |---|---|
 | What algorithm does the kernel on tile (C,R) run? | `app_dir/src/*.cc` (the human source), and `bundle_dir/kernels/<C>_<R>/src/…` — `work2provenance` copies each `#include "*.cc"` dependency alongside the wrapper (`_copy_kernel_with_includes`) |
@@ -87,6 +94,7 @@ Paths are relative to `bundle_dir` / `work_dir` / `app_dir` as marked.
 | Which host.cc lines implement tile (C,R) / channel X | `bundle_dir/debugcache/code/tile_c<C>_r<R>.cc` and `tile_c<C>_r<R>_<dir><n>.cc` (e.g. `tile_c4_r4_mm2s0.cc`) — written by `write_code_cache`; the same path is in `schedule_view.json` as the tile's/channel's `code_file` |
 | Absolute path of a tile's own kernel.cc / .bcf, already resolved | `schedule_view.json` -> `tiles[i].kernel.path`, `tiles[i].bcf.path` (`mcp__debugui__tile_info` does *not* surface these) |
 | Raw router solution, compiler + DMA/lock reports | `work_dir/temp/router_soln.json`, `work_dir/reports/{compiler_report.json,dma_lock_report.json}` |
+| Which source an **aiehlc** app was built from | `bundle_dir/app_source.txt` — one absolute path, written by `aiehlc.sh` from `--runtime-source-file`. The only record of it: `app_dir` is `aout/`, which holds generated code only. Fallback for older builds: `HOST_SRC="…"` in `sim_config.sh` |
 | Which devices / sim script this app can run | `bundle_dir/debug_ui_config.json` (`extra_devices[]`), optional |
 | Run profile + session/app state as the daemon sees it now | `bundle_dir/backend_status.json` |
 

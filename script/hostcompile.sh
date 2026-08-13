@@ -31,6 +31,9 @@ AIEHLC_DIR="${AIEHLC_ROOT}"
 WORKLOCAL_DIR="${WORKLOCAL_DIR:-$(pwd)}"
 BUILD_DIR="${WORKLOCAL_DIR}/build"
 
+OPT_FLAGS="-Os"
+[ "${DEBUG_SYMS:-0}" -eq 1 ] && OPT_FLAGS="${OPT_FLAGS} -g"
+
 KERNEL_FUNC_NAME="computekernel"   # default fallback; overridden by auto-detection below
 
 # Detect multi-kernel mode: check for kernel_<name>.cc files
@@ -312,7 +315,7 @@ HOST_SRC="${HOST_FIXED}"
 if [ "${REBUILD}" -eq 1 ] || [ ! -f host.o ]; then
     set -x
     echo "Compiling host..."
-    ${TOOL_PREFIX}g++ -Os -std=c++20 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${HOST_SRC}" -o host.o
+    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++20 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${HOST_SRC}" -o host.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile host.cc"
         exit 1
@@ -325,7 +328,7 @@ fi
 # Compile aie_runtime.c
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime.o ]; then
     echo "Compiling aie_runtime.c..."
-    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime.c" -o aie_runtime.o
+    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime.c" -o aie_runtime.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime.c"
         exit 1
@@ -337,7 +340,7 @@ fi
 # Compile aie_runtime_debug.c
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_debug.o ]; then
     echo "Compiling aie_runtime_debug.c..."
-    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_debug.c" -o aie_runtime_debug.o
+    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_debug.c" -o aie_runtime_debug.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime_debug.c"
         exit 1
@@ -349,7 +352,7 @@ fi
 # Compile aie_runtime_stream_debug.c
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_stream_debug.o ]; then
     echo "Compiling aie_runtime_stream_debug.c..."
-    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_stream_debug.c" -o aie_runtime_stream_debug.o
+    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_stream_debug.c" -o aie_runtime_stream_debug.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime_stream_debug.c"
         exit 1
@@ -361,7 +364,7 @@ fi
 # Compile aie_runtime_common.c
 if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_common.o ]; then
     echo "Compiling aie_runtime_common.c..."
-    ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_common.c" -o aie_runtime_common.o
+    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_common.c" -o aie_runtime_common.o
     if [ $? -ne 0 ]; then
         echo "Error: failed to compile aie_runtime_common.c"
         exit 1
@@ -375,7 +378,7 @@ ROUTING_OBJ=""
 if [ "${HAS_ROUTING}" -eq 1 ]; then
     if [ "${REBUILD}" -eq 1 ] || [ ! -f routing.o ]; then
         echo "Compiling routing.cc..."
-        ${TOOL_PREFIX}g++ -Os -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${WORKLOCAL_DIR}/routing.cc" -o routing.o
+        ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${WORKLOCAL_DIR}/routing.cc" -o routing.o
         if [ $? -ne 0 ]; then
             echo "Error: failed to compile routing.cc"
             exit 1
@@ -390,7 +393,7 @@ set -x
 # --specs=nosys.specs provides stubs for _exit, _close, _fstat, etc. (baremetal/newlib)
 # -Wl,--defsym,end=__bss_end__ defines 'end' for newlib _sbrk (lscript.ld defines __bss_end__)
 echo "Linking host (with embedded kernel binary)..."
-${TOOL_PREFIX}g++ -Os -o host host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o ${ROUTING_OBJ} ${KERNEL_OBJ_LIST} \
+${TOOL_PREFIX}g++ ${OPT_FLAGS} -o host host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o ${ROUTING_OBJ} ${KERNEL_OBJ_LIST} \
     --specs=nosys.specs \
     -Wl,--defsym,end=__bss_end__ \
     -Wl,-T -Wl,${ARCH_APU_LD} \

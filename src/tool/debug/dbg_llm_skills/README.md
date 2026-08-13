@@ -79,6 +79,7 @@ never shows up, check the header first.
 | `debugui-tools` | The fourteen granted `mcp__debugui__*` tools (9 static-schedule + 5 app/UI-state) — names, params, returns, and which question each answers. |
 | `dma-stall-triage` | Ordered producer→hop→consumer procedure for a hang, stall or data mismatch. |
 | `app-layout` | Which file answers which question, and where the app actually is on disk. |
+| `source-grounding` | *Why am I not citing their code?* When to leave the register dump and open the app's own source, the hand-written vs generated split, the four schedule-number → declaration chains, and the `<file>:<line>` citation form the UI makes clickable. |
 | `simulator-vs-hardware` | Discriminating the two backends and their different read paths and logs. |
 | `aiedbg-reference` | Index into the external aiedbg clone — raw CLI, named registers, device matrix, and the authority when aiediag's decode is in doubt. |
 | `root-cause-workflow` | HOW to reason from UI observations to a root cause: paired-channel stall interpretation, idle-finished vs idle-never-started, static-balanced-but-dynamically-stalled, when to stop reading hardware and go to source. Includes a worked example from a stream-stall session. |

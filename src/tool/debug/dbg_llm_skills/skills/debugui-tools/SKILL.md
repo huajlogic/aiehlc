@@ -2,7 +2,7 @@
      SPDX-License-Identifier: Apache-2.0 -->
 ---
 name: debugui-tools
-description: Catalogue of the FOURTEEN granted `mcp__debugui__*` tools - exact names, parameter names/types/defaults, return shapes, and the error string each one emits. Read when you need a fact out of the COMPILED STATIC SCHEDULE (which tiles exist; a tile's role, kernel and channel<->kernel-argument map; a flow's hops and stream-switch pairs; per-flow supply/demand; BD lengths; where a symbol occurs) or out of WHAT THE USER HAS ON SCREEN (`get_ui_state` is how "this tile" / "that flow" resolves to real coords; `get_pane` returns one UI pane verbatim; `list_apps` / `current_app` answer "which app is loaded, and what else could be"), and when a debugui call returned something you must interpret: "daemon not reachable" from the three daemon-backed tools, `_load_view()`'s tried-paths error, or a `kinds=` filter that is never validated and so silently matches nothing on a typo. None of the fourteen touch the board or the IPC socket, none are session-gated, none write hardware. `select_app` is registered in debug_ui_mcp.py but deliberately NOT granted - never call it; ask the user to switch apps in the UI. Also documents the get_applog FRESH/STALE/UNVERIFIED banner and the get_ipc_log CSV columns. A tool catalogue, not a procedure: symptom triage is dma-stall-triage's, an on-disk file's absolute path is app-layout's, what a banner lets you claim is session-provenance's.
+description: Catalogue of the FIFTEEN granted `mcp__debugui__*` tools - exact names, parameter names/types/defaults, return shapes, and the error string each one emits. Read when you need a fact out of the COMPILED STATIC SCHEDULE (which tiles exist; a tile's role, kernel and channel<->kernel-argument map; a flow's hops and stream-switch pairs; per-flow supply/demand; BD lengths; where a symbol occurs) or out of WHAT THE USER HAS ON SCREEN (`get_ui_state` is how "this tile" / "that flow" resolves to real coords; `get_pane` returns one UI pane verbatim; `list_apps` / `current_app` answer "which app is loaded, and what else could be"; `app_sources` lists that app's own source files so an explanation can cite code instead of stopping at the schedule), and when a debugui call returned something you must interpret: "daemon not reachable" from the three daemon-backed tools, `_load_view()`'s tried-paths error, or a `kinds=` filter that is never validated and so silently matches nothing on a typo. None of the fifteen touch the board or the IPC socket, none are session-gated, none write hardware. `select_app` is registered in debug_ui_mcp.py but deliberately NOT granted - never call it; ask the user to switch apps in the UI. Also documents the get_applog FRESH/STALE/UNVERIFIED banner and the get_ipc_log CSV columns. A tool catalogue, not a procedure: symptom triage is dma-stall-triage's, an on-disk file's absolute path is app-layout's, what a banner lets you claim is session-provenance's.
 ---
 
 # debugui MCP tools — the cheap static-schedule and UI-state layer
@@ -14,22 +14,23 @@ sets `--permission-mode bypassPermissions` — so a tool the server exposes is c
 or not it is listed. Withholding one requires `--disallowedTools`, which the spawn uses for
 exactly one tool (below).
 
-**Fourteen** `mcp__debugui__*` tools are granted, in two groups:
+**Fifteen** `mcp__debugui__*` tools are granted, in two groups:
 
 - **Schedule-view tools** (9) — `get_design_overview`, `tile_list`, `tile_info`,
   `get_flow_detail`, `symbol_search`, `get_backend_status`, `get_applog`, `get_sim_log`,
   `get_ipc_log`. These read the **static compiled schedule** (`schedule_view.json`, the
   same blob that renders `host_schedule.html`) or a log file on disk.
-- **App / UI tools** (5) — `list_apps`, `current_app`, `get_ui_state`, `list_panes`,
-  `get_pane`. See the second section below. The first three are **daemon-backed**, not
-  `schedule_view.json`-backed, and fail differently; `list_panes` is a static table and
-  `get_pane` reads `schedule_view.json`.
+- **App / UI tools** (6) — `list_apps`, `current_app`, `app_sources`, `get_ui_state`,
+  `list_panes`, `get_pane`. See the second section below. None reads
+  `schedule_view.json` except `get_pane`, and they fail differently:
+  `list_apps` / `current_app` / `get_ui_state` are **daemon-backed** (HTTP),
+  `app_sources` reads `backend_status.json` off disk, and `list_panes` is a static table.
 
-None of the fourteen touch the board or the simulator IPC socket, none are gated by the
+None of the fifteen touch the board or the simulator IPC socket, none are gated by the
 session-authorization check that `mcp__aiegdb__aie_exec` enforces, none write hardware, and
 none can fail a run. Use them freely.
 
-`debug_ui_mcp.py` registers a fifteenth tool, `select_app(app_id)`, which the spawn
+`debug_ui_mcp.py` registers a sixteenth tool, `select_app(app_id)`, which the spawn
 explicitly **denies** via `--disallowedTools mcp__debugui__select_app` — switching the app
 reconfigures the whole server (board IPs, PDIs, ELF paths) and belongs to the user. Calling
 it will be refused; if the user needs a different app, tell them to pick it in the UI.
@@ -148,8 +149,10 @@ Answers: *what was the last transaction before the hang, and which address is it
 `list_apps`, `current_app` and `get_ui_state` do **not** read `schedule_view.json` — they
 HTTP-GET the daemon (`/apps`, `/uistate`) via `$DEBUGUI_SERVER_URL`. When that variable is
 unset or the server is down they return a `daemon not reachable …` string instead of data;
-that is a *connectivity* answer, not "no apps exist". `list_panes` is a static table and
-`get_pane` reads `schedule_view.json` like the tools above.
+that is a *connectivity* answer, not "no apps exist". `app_sources` reads
+`$DEBUGUI_JSON_DIR/backend_status.json`, which the daemon rewrites on every backend change —
+so it needs no HTTP but does need the daemon to have written the file at least once.
+`list_panes` is a static table and `get_pane` reads `schedule_view.json` like the tools above.
 
 ### `mcp__debugui__list_apps()` → str
 No parameters. One row per registered app, newest first:
@@ -163,6 +166,21 @@ No parameters. JSON dump of the current app's info dict: `id`, `label`, `path`, 
 `current`, plus the capability flags `has_ui_config`, `has_backend_status`, `has_sim`,
 `has_hw`. `(no app selected)` if none is current. `path` is the app workdir — the anchor
 every path in the app-layout skill hangs off. Answers: *which app am I actually looking at?*
+
+### `mcp__debugui__app_sources()` → str
+No parameters. The current app's own source files, grouped: **Entry source** (the file the
+app was built from — aiehlc flow only), **Kernels** (each kernel name the schedule runs →
+the `file:line` defining it, matched *by name*, so treat the line as a jump target and
+confirm it), **Application** / **Headers** (hand-written `.cc`/`.cpp` and `.h`/`.hpp` found
+under `app_dir`, with generated files filtered out), **Build** (`build.sh`, `Makefile`,
+`.bif`), and **Generated** (`host.cc`, `kernel.cc`, the `.bcf`, the dfschedule MLIR —
+compiler output, overwritten on the next build, never the place to propose a fix). Paths are
+relative to `app_dir`. Answers: *what code is this app actually made of, and which file do I
+open to explain this tile?* The system prompt carries the same inventory for the app loaded
+at spawn — call this after an app switch to refresh it. Returns a
+`no sources found …` or `daemon not reachable …` string rather than an empty list; when it
+does, say so instead of guessing filenames. **Reading what this names, and citing it, is the
+`source-grounding` skill** — that is where the rules for using it live.
 
 ### `mcp__debugui__get_ui_state()` → str
 No parameters. JSON of what the browser last reported it had open. Keys: `selected_tile`
@@ -240,6 +258,7 @@ something on screen and you want *just* that pane (pair it with `get_ui_state`);
 | "what am I looking at?" / "this tile", "that flow" | `get_ui_state()` → `get_pane(...)` on what it reports |
 | "what's in the Info / Run / Tools pane?" | `list_panes()` for the layout, then the tool that pane maps to |
 | "which app is loaded?" / "what else can I load?" | `current_app()` / `list_apps()` |
+| "what does this kernel actually do?" / "where is this in my code?" | `app_sources()` → Read the file it names → cite `<file>:<line>` |
 | "what's on tile (0,3)?" | `tile_list()` → `tile_info(0,3,"hi")` → `"mid"`/`"lo"` only if pressed |
 | "why is the output wrong / zero?" | `get_design_overview()` (find the unbalanced flow) → `get_flow_detail(<fi>)` (participants table) → `tile_info` on the offending endpoint |
 | "where is `<name>`?" | `symbol_search("<name>")` → `tile_info(col,row)` |
@@ -257,6 +276,9 @@ refused.
 it is a large blob and every field above is already rendered for you.
 
 **These tools return names and summaries, not file contents.** `tile_info` gives you the
-kernel's *name*; when the question needs the kernel's actual source, its `.bcf` address map,
-or any other on-disk artifact, switch to the **app-layout** skill for the absolute paths
-(anchored on the `path` from `current_app()`) and open the file.
+kernel's *name*; `app_sources()` maps that name to the file and line defining it. For any
+other on-disk artifact — the `.bcf` address map, `aie_control_config.json`, a per-tile
+wrapper — switch to the **app-layout** skill for the absolute paths (anchored on the `path`
+from `current_app()`) and open the file. **When** to open source rather than stop at the
+schedule, and how to cite it, is **source-grounding** — the short version is that an answer
+which never leaves the register dump is not finished.

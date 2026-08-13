@@ -431,6 +431,7 @@ follows whatever app the human has selected (the daemon tells it via
 | tool | purpose |
 |---|---|
 | `list_apps` / `current_app` / `select_app` | see and change which compiled app is loaded |
+| `app_sources` | that app's own source files, grouped, plus the `file:line` defining each kernel the schedule runs — so an answer can cite the user's code instead of stopping at the schedule |
 | `list_panes` | which panes are readable and what selector each needs |
 | `get_pane(pane, col, row, flow, query)` | the content of a pane: `grid`, `tile.hi`, `tile.mid`, `tile.lo`, `tile.kernel`, `tile.supply`, `net.flow`, `search` |
 | `get_ui_state` | what the user has open right now — selected tile, active tile tab, net tab, console pane, channel, flow |
@@ -440,6 +441,24 @@ The browser reports selection changes to `POST /uistate`, so the agent can answe
 questions about the view in front of you rather than guessing. Tools degrade gracefully
 when an app lacks optional data (e.g. naiebaremetal bundles have no `invariant_checks`,
 and `backend_status.json` is only present once a run profile exists).
+
+##### Answers cite your source, not just registers
+
+The agent is told what the app is *made of*, not only where it lives: the same
+inventory `app_sources` returns is inlined into its system prompt, including the
+file and line defining each kernel the schedule runs (`kernel: conv2` →
+`src/convolution2.cc:19`). Its instructions and the `source-grounding` skill make
+reading and quoting that source the default rather than an extra step, on the
+principle that a register value is the symptom while the user's source is where
+the cause lives and where the fix has to go. Citations are written `<file>:<line>`,
+which the UI turns into a click that opens the file in the Info pane.
+
+Hand-written and generated files are kept apart, because proposing an edit to
+`host.cc` or `kernel.cc` wastes the user's time twice — those are overwritten on
+the next build, so they are evidence of what the compiler decided, never the place
+to fix anything. For the aiehlc flow, whose `aout/` holds no hand-written code at
+all, `aiehlc.sh` records the `--runtime-source-file` it built from in
+`worklocal/app_source.txt`; without that the agent has nothing of yours to read.
 
 It lets you, from a single browser page:
 

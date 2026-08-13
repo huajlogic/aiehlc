@@ -158,6 +158,7 @@ runtime_source_file=""
 aie_version="2"
 use_llvm_aie="false"
 DEBUG_OUTPUT=0
+DEBUG_SYMS=0
 platform="baremetal"
 COMPILE_AIELIB_ONLY=0
 USE_LOCAL_AIERT_BSP=0
@@ -196,6 +197,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --debug-output)
             DEBUG_OUTPUT=1
+            shift
+            ;;
+        --debug-syms)
+            DEBUG_SYMS=1
             shift
             ;;
         --aielib-only)
@@ -479,9 +484,11 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
         [ -f "$f" ] && cp -f "$f" "${WORKLOCAL_DIR}/$(basename "$f")"
     done
 
+    echo "${runtime_source_file}" > "${WORKLOCAL_DIR}/app_source.txt"
+
     # Run hostcompile.sh with WORKLOCAL_DIR pointing at aout/worklocal.
     WORKLOCAL_DIR="${WORKLOCAL_DIR}" AIE_VERSION="${aie_version}" PLATFORM="${platform}" \
-        SIM_TILES="${SIM_TILES:-}" \
+        SIM_TILES="${SIM_TILES:-}" DEBUG_SYMS="${DEBUG_SYMS}" \
         bash "${AIEHLC_DIR}/script/hostcompile.sh"
     TILING_RC=$?
     if [ $TILING_RC -ne 0 ]; then
@@ -620,6 +627,7 @@ echo "Linking kernels..."
 echo "    ${temp_obj_files[@]}"
 # opt_flags="-O2"
 opt_flags="-Os"
+[ "${DEBUG_SYMS}" -eq 1 ] && opt_flags="${opt_flags} -g"
 if [[ "$platform" == "sim" ]]; then
     echo -e "\n[sim] Writing sim config (no auto-run)..."
     rm -f  "${SCRIPT_DIR}/sim/build/aiehlc_ps.so" \
@@ -650,8 +658,10 @@ if [ ${GPP_RC:-1} -ne 0 ]; then
     echo "==========================================================="
     return ${GPP_RC}
 fi
-echo "Stripping extra ELF symbols..."
-${TOOL_PREFIX}strip $HOST_BUILD_DIR/main.elf
+if [ "${DEBUG_SYMS}" -eq 0 ]; then
+    echo "Stripping extra ELF symbols..."
+    ${TOOL_PREFIX}strip $HOST_BUILD_DIR/main.elf
+fi
 
 echo "Build complete."
 echo "    $HOST_BUILD_DIR/main.elf"
