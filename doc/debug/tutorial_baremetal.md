@@ -1,4 +1,4 @@
-# Debug UI Tutorial — naiebaremetal Flow
+# Debug UI Tutorial — Baremetal Flow
 
 ## 1. Build the app
 
@@ -6,7 +6,7 @@ From the aiebaremetal checkout:
 
 ```bash
 cd aiebaremetal/example/example_oob
-./build.sh 5 -bootgen
+source build.sh 5 -bootgen
 ```
 
 
@@ -22,7 +22,7 @@ source script/test/envlocal.sh
 
 ## 3. Open the UI
 
-Pass the naiebaremetal example directory as `--app-root`:
+Pass the aiebaremetal example directory as `--app-root`:
 
 ```bash
 cd /path/to/aiehlc
