@@ -361,7 +361,7 @@ cd build
 ### 5.4 Compile Kernel (xchesscc flow)
 
 ```bash
-WORKLOCAL_DIR="$(pwd)/aout/worklocal" source script/compile_kernel.sh dskernel_receiver
+WORKLOCAL_DIR="$(pwd)/aout/worklocal" KERNEL_ONLY=1 source script/hostcompile.sh dskernel_receiver
 ```
 
 Internally calls `script/kc.sh`:
@@ -387,7 +387,7 @@ Output: `build/kernel.o` (relocatable for host linking)
 | `build/kernel.linemap.json` | `script/parse_linemap.py` | sorted addr→{file,line} for tooling |
 
 > **Artifact location (tiling pipeline):** the kernel is compiled by `kc.sh` via
-> `aiehlc.sh → script/hostcompile.sh → script/compile_kernel.sh`, which build directly in
+> `aiehlc.sh → script/hostcompile.sh` (its `compile_one_kernel` step), which build directly in
 > `WORKLOCAL_DIR` (set to `aout/worklocal` by `aiehlc.sh`). The ELF and DWARF artifacts
 > therefore land under **`aout/worklocal/build/`**. Verified end-to-end on
 > `example/tileprogram/ccode/simplematmul2.cc` (kernel ELF + `.debug_line`,
@@ -431,7 +431,7 @@ WORKLOCAL_DIR="$(pwd)/aout/worklocal" source script/hostcompile.sh
 ```
 
 Steps:
-1. Source `script/compile_kernel.sh` (kernel.o)
+1. Build kernel via `hostcompile.sh`'s `compile_one_kernel` step (kernel.o)
 2. Fix `host.cc` → `host_fixed.cc` (sed: add forward decl, fix `void main→int main`)
 3. `aarch64-none-elf-g++ -Os -std=c++17 -DAIE_GEN=5 -mcpu=cortex-a78 -c host_fixed.cc -o host.o`
 4. `aarch64-none-elf-g++ ... -c aie_runtime.c -o aie_runtime.o`
@@ -504,7 +504,7 @@ source piplinerun.sh
 | Build | `pass/unitest/CMakeLists.txt` |
 | Automation | `pass/unitest/piplinerun.sh` |
 | Host compile | `script/hostcompile.sh` |
-| Kernel compile | `script/compile_kernel.sh`, `script/kc.sh` |
+| Kernel compile | `script/hostcompile.sh` (`compile_one_kernel`, or `KERNEL_ONLY=1`), `script/kc.sh` |
 | HW run | `script/test/apppaltest.py` |
 | Verification | `.cursor/skills/hostcodegen/scripts/verify_host.sh` |
 | Example routing | `pass/routingimplement/codegenexample/aie_control.cpp` |

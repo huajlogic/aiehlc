@@ -22,11 +22,11 @@ Run from unitest dir: `cd build && make`, then `./test` (e.g. `./test dfschedule
 | Worklocal directory | `src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal` |
 | Generated kernel | `src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal/kernel.cc` |
 | Compute kernel (pre-existing, hand-written) | `src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal/compute_kernel.cc` |
-| Kernel compile script | `src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal/compile_kernel.sh` |
+| Kernel compile script | `script/hostcompile.sh` (`compile_one_kernel`; kernel-only via `KERNEL_ONLY=1`) |
 | Kernel ELF output | `src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal/build/kernel` |
 | AIE2PS project file | `src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal/aie2ps.prx` |
 
-Run `compile_kernel.sh` from worklocal after generating kernel.cc.
+Run `WORKLOCAL_DIR=<worklocal> KERNEL_ONLY=1 source script/hostcompile.sh` after generating kernel.cc.
 
 ## Codegen (for bug fixes)
 

@@ -324,7 +324,7 @@ grep "__Runtime_dma_bd_config_multidim" worklocal/host.cc  # len should be divid
 grep "__Runtime_startio" worklocal/host.cc                  # repeat should be kRounds
 
 # Full HW run
-cd worklocal && source compile_kernel.sh && source hostcompile.sh
+cd worklocal && source hostcompile.sh   # builds kernel + host
 python3 script/test/apppaltest.py build/host
 # Expected: 0 mismatches, "device_teardown done"
 ```

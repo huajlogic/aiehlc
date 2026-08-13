@@ -460,7 +460,7 @@ Expected:
 ### 6.5 HW Run
 
 ```bash
-cd worklocal && source compile_kernel.sh && source hostcompile.sh
+cd worklocal && source hostcompile.sh   # builds kernel + host
 python3 script/test/apppaltest.py build/host
 ```
 

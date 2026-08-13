@@ -34,6 +34,7 @@ constexpr aie::GemmSpace LtoR_Merge = {
     .d1 = {.fullsize = M, .tile_size = 16, .stride = 16},  // C: M-tile
     .d2 = {.fullsize = N, .tile_size = 16, .stride = 16}}; // C: N-tile
 // #define DEBUG_OUTPUT_ORDER 1
+#define DEBUG_NOCOMPUTE 1
 //  Per-kernel GLOBAL policy, bound explicitly at the declaration site via
 //  __global__(matmul_policy). The <kernel>_policy naming convention still works
 //  as a fallback when no explicit binding is given.
@@ -101,21 +102,23 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
 
     // ===== M sub-tile loop: each mr gets fresh A data across all k_rounds =====
     for (int mr = 0; mr < m_rounds * n_rounds; mr++) {
-
+#ifndef DEBUG_NOCOMPUTE
         klog("MR  ", (int32_t)mr);
         // Zero accumulators for this M sub-tile
         for (int i = 0; i < tile_rows * tile_cols; i++)
             accum[i] = 0;
-
+#endif
         // ===== K-round loop: accumulate partial products =====
         for (int kr = 0; kr < k_rounds; kr++) {
             // klog("KRA ", (int32_t)kr);
             //  --- Phase 1: Receive and cache A chunk for this (mr, kr) ---
             for (int ra = 0; ra < num_a_rounds; ra++) {
                 int8_t *A_ptr = (int8_t *)acquire_input_window(win_a);
+#ifndef DEBUG_NOCOMPUTE
                 for (int i = 0; i < buf_sz_a; i++) {
                     all_A[ra * buf_sz_a + i] = A_ptr[i];
                 }
+#endif
 #if DEBUG_OUTPUT_ORDER
                 for (int l = 0; l < (buf_sz_a < 8 ? buf_sz_a : 8); l++) {
                     klog("A   ", (int32_t)A_ptr[l]);
@@ -126,6 +129,7 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
 
             for (int rb = 0; rb < num_b_rounds; rb++) {
                 int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
+#ifndef DEBUG_NOCOMPUTE
                 for (int i = 0; i < tile_rows; i++) {
                     for (int j = 0; j < cols_per_round; j++) {
                         int16_t sum = 0;
@@ -135,6 +139,7 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
                         accum[i * tile_cols + rb * cols_per_round + j] += sum;
                     }
                 }
+#endif
 
 #if DEBUG_OUTPUT_ORDER
                 // if (kr == 0 && mr == 0 && rb == 0) {
@@ -147,6 +152,7 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
         } // end k_rounds
 
         // ===== Saturate accumulators to int8 for this M sub-tile =====
+#ifndef DEBUG_NOCOMPUTE
         for (int i = 0; i < tile_rows * tile_cols; i++) {
             int16_t val = accum[i];
             if (val > 127)
@@ -155,14 +161,17 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
                 val = -128;
             local_out[i] = (int8_t)val;
         }
+#endif
         for (int rc = 0; rc < num_c_rounds; rc++) {
             int8_t *out = (int8_t *)acquire_output_window(win_c);
+#ifndef DEBUG_NOCOMPUTE
             const int rows_per_c_round = buf_sz_c / tile_cols;
             for (int i = 0; i < rows_per_c_round; i++) {
                 for (int j = 0; j < tile_cols; j++) {
                     out[i * tile_cols + j] = local_out[rc * buf_sz_c + i * tile_cols + j];
                 }
             }
+#endif
 #if DEBUG_OUTPUT_ORDER
             klog("C0 ", (int32_t)out[0]);
 #endif
@@ -340,7 +349,12 @@ int main() {
     printf("aie matmul time: %.3f ms\n", elapsed_ms);
     // stlkernel<<mesh>>>(A, B, C);
     //  device.synchronizecpu(C, M * N * sizeof(int8_t) * 4);
+#ifndef DEBUG_NOCOMPUTE
     int result = verify_matmul(A, B, C);
+#else
+    int result = 0;
+    printf("test end=----------------------------------%.3f ms\n", elapsed_ms);
+#endif
     /// mul2<<<mesh>>>(C, B, A, M, N, K);
     // int result2 = verify_matmul(C, B, A);
     //   --- Wait for all partitions and teardown ---

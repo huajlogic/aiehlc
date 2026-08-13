@@ -3053,6 +3053,25 @@ void DfscheduleToApiPass::runOnOperation() {
         if (enableDebug_)
             builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "#include \"aie_runtime_debug.h\"");
 
+        // Timer helpers: aie_timer.h provides XTime / XTime_GetTime /
+        // COUNTS_PER_SECOND. Emit global start/end timers plus timerStart()/
+        // timerEnd() helpers so the host can measure elapsed kernel time.
+        // timerEnd() computes the delta and prints it in milliseconds.
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "#include \"aie_timer.h\"");
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "XTime g_xtimer_start;");
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "XTime g_xtimer_end;");
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "static inline void timerStart() {");
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "    XTime_GetTime(&g_xtimer_start);");
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "}");
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "static inline void timerEnd() {");
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "    XTime_GetTime(&g_xtimer_end);");
+        builder.create<emitc::VerbatimOp>(
+            moduleOp.getLoc(),
+            "    double elapsed_ms = 1.0 * (g_xtimer_end - g_xtimer_start) / COUNTS_PER_SECOND * 1000.0;");
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(),
+                                          "    printf(\"aie kernel time: %.3f ms\\n\", elapsed_ms);");
+        builder.create<emitc::VerbatimOp>(moduleOp.getLoc(), "}");
+
         /* DevInst: passed as first parameter to host_canonicalized (set in state.devInstRef below) */
     }
     
