@@ -2910,8 +2910,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="lefttop-header">
     <h1>AIE Debug</h1>
     <div id="viewswitcher">
-      <span class="vsw" data-v="grid" onclick="switchView('grid')">Grid</span>
-      <span class="vsw act" data-v="map" onclick="switchView('map')">Device Map</span>
+      <span class="vsw act" data-v="grid" onclick="switchView('grid')">Grid</span>
+      <span class="vsw" data-v="map" onclick="switchView('map')">Device Map</span>
       <span class="vsw" data-v="targets" onclick="switchView('targets')">Host</span>
     </div>
   </div>
@@ -3117,7 +3117,7 @@ const GDBSPEC_STATIC = /*__GDBSPEC__*/ null;
 // What the user currently has open, mirrored to the daemon so the embedded
 // agent can answer questions about the view in front of the human. Declared
 // here so it precedes every reportUIState() call site.
-const UISTATE = {view:'map', selected_tile:null, tile_tab:null, net_tab:null,
+const UISTATE = {view:'grid', selected_tile:null, tile_tab:null, net_tab:null,
                  console_pane:'conpane', flow:null, channel:null, search:null,
                  source:null};
 
@@ -9147,10 +9147,10 @@ if (location.protocol === 'http:' || location.protocol === 'https:') probeLLM();
   });
 })();
 
-// Open on the Device Map. Deferred to the very end of the script because
-// buildDeviceMap() reaches for consts (DM_COLORS et al) declared above it —
-// calling any earlier would hit their temporal dead zone.
-switchView('map');
+// Open on the Grid. Deferred to the very end of the script for symmetry with
+// the previous default (buildDeviceMap() reaches for consts declared above it
+// and would hit their temporal dead zone if called any earlier).
+switchView('grid');
 </script>
 </body>
 </html>
