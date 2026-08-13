@@ -1022,7 +1022,7 @@ struct PushOpConversion : public OpConversionPattern<dmaphop::push> {
                                     SmallVector<int32_t> strides = {
                                         static_cast<int32_t>(1 * wordBytes),       // D0: 4 bytes
                                         static_cast<int32_t>(fullK_w * wordBytes), // D1: fullK bytes
-                                        static_cast<int32_t>(effectiveK)           // D2: effectiveK bytes
+                                        static_cast<int32_t>(effK_w * wordBytes)   // D2: effectiveK bytes
                                     };
                                     SmallVector<int32_t> wraps = {
                                         static_cast<int32_t>(effK_w),     // D0: effectiveK/4

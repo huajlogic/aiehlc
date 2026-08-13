@@ -205,6 +205,12 @@ def console_reader(child, output_queue, stop_event):
             if output:
                 buffer += output
                 output_queue.put(output)
+                if "telnet>" in output:
+                    output_queue.put("[console_reader] telnet escape detected — resuming session\n")
+                    try:
+                        child.send("\r")
+                    except Exception:
+                        pass
         except pexpect.TIMEOUT:
             # No data available, continue polling
             continue
@@ -301,22 +307,30 @@ def setup_first_connection():
     index = child.expect([r'xsdb%', r'command not found', r'Unrecognized', pexpect.TIMEOUT], timeout=15)
 
     if index != 0:
-        print("[Connection 1] xsdb not found, trying alternative path...")
+        print("[Connection 1] xsdb not found / timed-out, exiting and trying alternative path...")
+        child.sendline("exit")
+        try:
+            child.expect(r'Systest[#>]', timeout=15)
+        except pexpect.TIMEOUT:
+            child.sendcontrol('c')
+            time.sleep(1)
+            child.sendline("exit")
+            child.expect(r'Systest[#>]', timeout=15)
         child.sendline(XSDB_ALT_PATH)
         child.expect(r'xsdb%', timeout=60)
-    
+
     print("[Connection 1] In xsdb, connecting...")
-    
+
     # Step 7: Connect
     child.sendline("conn")
     child.expect(r'xsdb%', timeout=60)
     print("[Connection 1] Connected, targeting device 1...")
-    
+
     # Step 8: Target 1
     child.sendline("tar 1")
     child.expect(r'xsdb%', timeout=60)
-    print("[Connection 1] Programming Palboard.BIN...")
-    
+    print("[Connection 1] Programming PDI...")
+
     # Step 9: Program device – detect PLM stall and abort early
     child.sendline(f"device program {VEK385PDI}")
     index = child.expect([r'xsdb%', r'PLM stalled'], timeout=120)
@@ -324,20 +338,25 @@ def setup_first_connection():
         # Consume the rest of the error output up to the prompt
         child.expect(r'xsdb%', timeout=60)
         raise RuntimeError(
-            "PLM stalled during BOOT.BIN programming. "
+            "PLM stalled during PDI programming. "
             "The board may need a power cycle. Run 'plm log' for details."
         )
-    time.sleep(5)  # allow PLM to fully initialise before continuing
-    print("[Connection 1] Device programmed, targeting device 20...")
-    
+    print("[Connection 1] PDI programmed, waiting for PS POR release...")
+    time.sleep(15)  # allow PLM to fully initialise before continuing
+    print("[Connection 1] Targeting APU core (Cortex-A78AE #0.0)...")
+
     # Step 10: Target 20
     child.sendline("tar 20")
-    child.expect(r'xsdb%', timeout=60)
+    child.expect(r'xsdb%', timeout=30)
     print("[Connection 1] Resetting processor...")
-    
+
     # Step 11: Reset processor
-    child.sendline("rst -proc")
+    child.sendline("tar 18")
+    child.expect(r'xsdb%', timeout=30)
+    child.sendline("rst -cores")
     child.expect(r'xsdb%', timeout=60)
+    child.sendline("tar 20")
+    child.expect(r'xsdb%', timeout=30)
 
     # Drain any stale xsdb% prompts left in the buffer.
     # xsdb sometimes emits double prompts after rst -proc; if the second
@@ -365,19 +384,18 @@ def setup_second_connection():
     
     # Wait for shell prompt
     child.expect([r'\$\s*$', r'#\s*$', r'>\s*$'], timeout=60)
-    #print("[Connection 2] Connected, starting systest...")
-    
+    print("[Connection 2] Connected, starting systest...")
+
     # Step 2: Run systest
-    #child.sendline("/opt/systest/common/bin/systest-client")
-    #child.expect(r'Systest[#>]', timeout=60)
-    #print("[Connection 2] In systest, connecting to com0...")
-    
+    child.sendline("/opt/systest/common/bin/systest-client")
+    child.expect(r'Systest[#>]', timeout=60)
+    print("[Connection 2] In systest, connecting to com3...")
+
     # Step 3: Connect to com0 (no output until ELF runs on first connection)
-    #child.sendline("connect com0")
-    child.sendline("telnet 10.10.71.1 4001")
-    child.expect(r'Versal PS UART0', timeout=60)
-    print("[Connection 2] Connected to com0, listening for output...")
-    
+    child.sendline("connect com3")
+    child.expect(r'Connecting to device com3.*escape', timeout=60)
+    print("[Connection 2] Connected to com3, listening for output...")
+
     return child
 
 
@@ -491,7 +509,7 @@ Examples:
     parser.add_argument(
         "-y", "--yes",
         action="store_true",
-        default=False,
+        default=True,
         help="Non-interactive mode: auto-confirm all prompts"
     )
     parser.add_argument(

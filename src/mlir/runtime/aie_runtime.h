@@ -7,6 +7,15 @@
 #define AIE_RUNTIME_H
 
 #include "xaiengine.h"
+#ifndef XAIE_ROUTING_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <aie_codegen_inc/xaie_routing.h>
+#ifdef __cplusplus
+}
+#endif
+#endif
 #include <stdio.h>
 #include <string.h>
 // #include <stdint.h>
@@ -54,6 +63,7 @@ XAie_DevInst *getOrCreateDeviceInstance(void);
 // __Runtime_perfcnt_setup_mm2s_bd_finished_partition(); teardown reads them
 // back. These are the same counters aiegdb.py "dma counter" reads (0x11020/24).
 #define AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER (1 << 6)
+#define AIE_DEBUG_FLAG_CORE_PERF_COUNTER (1 << 8)
 // bit 7 reserved
 // bit 8 reserved
 /* When set, enable informational runtime log output (AIEHLC_LOG).
@@ -394,6 +404,17 @@ AieRC __Runtime_perfcnt_setup_mm2s_bd_finished_partition(XAie_DevInst *dev, uint
 // Read and print all MM2S BD finished perf counters across a partition.
 void __Runtime_perfcnt_read_mm2s_bd_finished_partition(XAie_DevInst *dev, uint8_t start_col, uint8_t end_col,
                                                        uint8_t start_row, uint8_t end_row);
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+AieRC __Runtime_core_perf_setup(XAie_DevInst *dev, XAie_LocType tile);
+AieRC __Runtime_core_perf_read(XAie_DevInst *dev, XAie_LocType tile, uint32_t *active, uint32_t *vec_instr,
+                               uint32_t *stream_stall, uint32_t *lock_stall);
+int __Runtime_core_perf_probe_valid(void);
+void __Runtime_core_perf_read_probe(uint32_t *active, uint32_t *vec_instr, uint32_t *stream_stall,
+                                    uint32_t *lock_stall);
+void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 
 // ---------------------------------------------------------------------------
 // DMA-capable buffer allocation with cache sync support

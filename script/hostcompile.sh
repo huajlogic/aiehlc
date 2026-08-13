@@ -358,7 +358,11 @@ if [ -d "${XAIE_INCLUDE}" ]; then
 fi
 # User headers are copied to worklocal/ by aiehlc alongside host.cc
 INCLUDE_OPTS="${INCLUDE_OPTS} -I${WORKLOCAL_DIR}"
-DEFS="-DAIE_GEN=${aie_version}"
+DEFS="-DAIE_GEN=${aie_version} ${EXTRA_DEFS:-}"
+if [ "${AIEHLC_PROFILING:-0}" != "0" ]; then
+    DEFS="${DEFS} -DAIEHLC_PROFILING=1"
+    echo "[hostcompile] profiling runtime layer ENABLED (-DAIEHLC_PROFILING=1)"
+fi
 
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
