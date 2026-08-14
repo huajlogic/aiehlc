@@ -684,6 +684,57 @@ fi
 
 echo "Build complete."
 echo "    $HOST_BUILD_DIR/main.elf"
+
+# --- Static provenance + schedule view for the raw-XAie single-kernel flow. ---
+# The raw-XAie flow produces main.elf but no IR/provenance, so the debug UI has
+# nothing to render. Statically parse the generated host.cc into the provenance
+# schema schedule_view.py consumes, then build host_schedule.html. Non-fatal:
+# never change the build's exit code, and reuse the tiling-flow view/server.
+if [[ "$platform" != "sim" ]] && [ -f "$host_file" ]; then
+    SK_WORKLOCAL="${HOST_BUILD_DIR}/worklocal"
+    mkdir -p "${SK_WORKLOCAL}"
+    cp -f "$host_file" "${SK_WORKLOCAL}/host.cc" 2>/dev/null || true
+    echo "${runtime_source_file}" > "${SK_WORKLOCAL}/app_source.txt" 2>/dev/null || true
+
+    echo "Generating static provenance (raw-XAie flow)..."
+    if python3 "${AIEHLC_DIR}/src/tool/debug/xaiehost2provenance.py" \
+            "${SK_WORKLOCAL}/host.cc" --out-dir "${SK_WORKLOCAL}" \
+            --aie-version "${aie_version}" --platform "${platform}"; then
+        if [ -f "${SK_WORKLOCAL}/dfscheduleprovenancemap.json" ]; then
+            echo "Generating readable schedule view..."
+            if python3 "${AIEHLC_DIR}/src/tool/debug/schedule_view.py" "${SK_WORKLOCAL}"; then
+                echo "    ${SK_WORKLOCAL}/host_schedule.html"
+            else
+                echo "    warning: schedule_view.py failed (non-fatal); skipping view."
+            fi
+        fi
+    else
+        echo "    warning: provenance generation failed (non-fatal)."
+    fi
+
+    if [ "$PRETTY_DEBUG" -eq 1 ]; then
+        if [ -f "${SK_WORKLOCAL}/host_schedule.html" ]; then
+            if ! command -v aiedbg &>/dev/null; then
+                echo "aiedbg not found — bootstrapping (clone + pip install)..."
+                python3 "${AIEHLC_DIR}src/tool/debug/ensure_aiedbg.py" \
+                    --repo-root "${AIEHLC_DIR}" || \
+                    echo "    warning: aiedbg bootstrap failed; live HW reads disabled."
+                if [[ -f "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh" ]]; then
+                    # shellcheck disable=SC1091
+                    source "${AIEHLC_DIR}.aiehlc/aiedbg_env.sh"
+                fi
+            fi
+            echo "Launching live schedule-debug server (--prettydebug)..."
+            python3 "${AIEHLC_DIR}/src/tool/debug/schedule_debug_server.py" \
+                "${SK_WORKLOCAL}" \
+                --elf "${HOST_BUILD_DIR}/main.elf" \
+                --aie-version "${aie_version}" \
+                --open
+        else
+            echo "    warning: --prettydebug requested but host_schedule.html missing; skipping server."
+        fi
+    fi
+fi
 }
 
 main "$@"

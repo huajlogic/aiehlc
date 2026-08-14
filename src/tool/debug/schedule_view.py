@@ -1742,7 +1742,18 @@ def build_view(workdir):
             _bcf_cache[rel] = parse_bcf(p) if os.path.isfile(p) else None
         return _bcf_cache[rel]
 
-    fstart, fend = find_function_range(host_lines)
+    # The tiling flow names its function host_canonicalized; the raw-XAie
+    # single-kernel flow (static-xaie provenance) wraps its calls in a
+    # differently named function surfaced as host_entry_fn. Fall back to the
+    # default, then to the whole file, so the view renders rather than crashing.
+    _entry_fn = prov.get('host_entry_fn') or 'host_canonicalized'
+    try:
+        fstart, fend = find_function_range(host_lines, _entry_fn)
+    except RuntimeError:
+        try:
+            fstart, fend = find_function_range(host_lines)
+        except RuntimeError:
+            fstart, fend = 0, len(host_lines) - 1
     owner, var2loc, _ = attribute_lines(host_lines, fstart, fend)
 
     # for-loop context (headers + per-iteration index math), computed once.
