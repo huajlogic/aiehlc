@@ -67,6 +67,7 @@ except ImportError:      # viewer still works, just monochrome
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 # This file lives at src/tool/debug/ → repo root is three levels up.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS_DIR)))
+_DEFAULT_WORKDIR = "aout/worklocal"
 # Skills written FOR the embedded LLM (not for Claude Code sessions in this repo).
 # Laid out as a Claude Code *plugin* so the spawned assistant loads them natively
 # via --plugin-dir: that keeps one copy, versioned beside the tooling it documents,
@@ -388,6 +389,27 @@ _SIM_KIND_NOTE = {
     "aiesim": ("aiesim (aie2pssimmsm) — console output only, no debug socket "
                "and no live register reads"),
 }
+_AIESIM_LIVE_ERROR = (
+    "live register reads are unavailable for aiesim (aie2pssimmsm): "
+    "this simulator exposes no debug socket. DMA/Cores/Events scans and "
+    "aiedbg register commands require the AEG IPC simulator or hardware.")
+
+
+_AIEGDB_LOCAL_VERBS = frozenset((
+    "target", "tar", "tile", "channel", "up", "..", "top",
+    "where", "info", "pwd", "set", "help", "?", "commands", "cmds",
+    "spec", "exit", "quit", "q", "channels", "chans",
+))
+
+
+def _aiegdb_needs_live_transport(line):
+    parts = (line or "").strip().split()
+    if not parts:
+        return False
+    verb = parts[0].lower()
+    if verb in _AIEGDB_LOCAL_VERBS:
+        return verb == "tile" and len(parts) > 1 and parts[1].lower() == "list"
+    return True
 
 
 def _devices_for_ui(st):
@@ -412,11 +434,13 @@ def _devices_for_ui(st):
             # run — the same rule caps() follows for the app listing.
             kind = st.sim_kind if st.sim_script else ""
             row["sim_kind"] = kind
+            row["live_reads"] = kind == "ipc"
             row["note"] = _SIM_KIND_NOTE.get(kind, "")
         out.append(row)
     if not any(r["value"] == "simulator" for r in out):
         out.append({"value": "simulator", "label": "simulator (not built)",
-                    "available": False, "sim_kind": "", "note": "",
+                    "available": False, "sim_kind": "", "live_reads": False,
+                    "note": "",
                     "reason": st.sim_reason})
     return out
 
@@ -1259,7 +1283,7 @@ XSDB_ALT_PATH = ("/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/"
 
 # Written for the LLM as much as the user: the model must not fill the gap with
 # assumptions about board state when a read is refused.
-_NO_SESSION_MSG = "not connected — press Connect first"
+_NO_SESSION_MSG = "not connected; press Connect first"
 
 
 def _strip_ansi(s):
@@ -1381,6 +1405,7 @@ def _try_generate_worklocal(example_dir):
     work_dir = os.path.join(example_dir, "Work")
     worklocal = os.path.join(example_dir, "worklocal")
     svjson = os.path.join(worklocal, "schedule_view.json")
+    html = os.path.join(worklocal, "host_schedule.html")
     if not os.path.isdir(work_dir):
         return None
     # Use the mtime of aie_control_config.json as a cheap proxy for Work/ freshness —
@@ -1390,6 +1415,10 @@ def _try_generate_worklocal(example_dir):
                   if os.path.isfile(control_cfg) else 0)
     sv_mtime = os.path.getmtime(svjson) if os.path.isfile(svjson) else 0
     if sv_mtime >= work_mtime and sv_mtime > 0:
+        if not os.path.isfile(html):
+            with open(svjson) as f:
+                schedule_view.write_html(json.load(f), html)
+            print(f"[AppRegistry]   wrote {html}")
         return worklocal  # already up-to-date
     try:
         print(f"[AppRegistry] generating worklocal for {os.path.basename(example_dir)} ...")
@@ -1400,6 +1429,8 @@ def _try_generate_worklocal(example_dir):
         with open(sv_path, "w") as _f:
             json.dump(view, _f, indent=2)
         print(f"[AppRegistry]   wrote {sv_path}")
+        schedule_view.write_html(view, html)
+        print(f"[AppRegistry]   wrote {html}")
         return worklocal
     except Exception as e:
         print(f"[AppRegistry] warning: could not generate worklocal for "
@@ -1408,8 +1439,6 @@ def _try_generate_worklocal(example_dir):
 
 
 class AppRegistry:
-    """Discovers loadable apps: aout/** in this repo, plus explicit --app paths
-    and --app-root trees (e.g. ../naiebaremetal/example)."""
 
     def __init__(self, explicit=None, roots=None, auto_roots=None):
         self._apps = {}
@@ -1419,13 +1448,30 @@ class AppRegistry:
         self._explicit = []
         for spec in (explicit or []):
             path, _, label = spec.partition("=")
-            app = self._add(path, label or None)
+            bundle = self._resolve_explicit(path)
+            app = self._add(bundle, label or None) if bundle else None
+            if app is None:
+                print(f"[AppRegistry] warning: {path} is neither a provenance "
+                      f"bundle nor an app directory containing Work/",
+                      file=sys.stderr)
             if app is not None and app.id not in self._explicit:
                 self._explicit.append(app.id)
         for root in (roots or []):
             self._scan(root)
         for root in (auto_roots or []):
             self._scan(root)
+
+    @staticmethod
+    def _resolve_explicit(path):
+        path = os.path.abspath(path)
+        if os.path.isfile(os.path.join(path, "schedule_view.json")):
+            return path
+        if os.path.isdir(os.path.join(path, "Work")):
+            return _try_generate_worklocal(path)
+        worklocal = os.path.join(path, "worklocal")
+        if os.path.isfile(os.path.join(worklocal, "schedule_view.json")):
+            return worklocal
+        return None
 
     def _add(self, path, label=None):
         path = os.path.abspath(path)
@@ -1495,7 +1541,7 @@ class DebugState:
     def __init__(self, workdir, elf, aie_version, device, target,
                  apppaltest, startcol, applog,
                  claude_bin="claude", claude_cwd=None, claude_model=None,
-                 llm_enabled=True, llm_password=None):
+                 llm_enabled=True, llm_password=None, sim_only=False):
         self.workdir = os.path.abspath(workdir)
         self.elf = elf
         self.aie_version = str(aie_version)
@@ -1504,6 +1550,7 @@ class DebugState:
         self.apppaltest = apppaltest
         self.startcol = int(startcol)
         self.applog = os.path.abspath(applog)
+        self.sim_only = bool(sim_only)
 
         # Cached schedule tiles from schedule_view.json.
         self._tiles = None
@@ -1524,7 +1571,7 @@ class DebugState:
         #
         # _hw_session is None until the user does one of three things:
         #   connected  a /ping probe succeeded         ("Connect")
-        #   ran        a run was started from this UI  ("Run test")
+        #   ran        a run was started from this UI  ("Run")
         #   attached   the user adopted a run they started outside the UI
         #              ("Open Current Session") — the board's prior history is
         #              explicitly unknown in this mode, which is why it is not
@@ -1667,10 +1714,10 @@ class DebugState:
         # of the two processes to stop.
         if self.run_in_progress():
             return {"error": "cannot switch apps while a board run is in "
-                             "progress — press Stop on the run first"}
+                             "progress; press Stop on the run first"}
         if self.sim_running():
             return {"error": "cannot switch apps while the simulator is "
-                             "running — press Stop sim first. (Switching would "
+                             "running; press Stop sim first. (Switching would "
                              "repoint startcol/aie_version and the provenance "
                              "JSONs at another app, so live reads from this "
                              "simulator would be decoded against the wrong "
@@ -1848,12 +1895,19 @@ class DebugState:
             "run_in_progress": self.run_in_progress(),
             "last_run": self._last_run or {},
             "applog": self.applog_provenance(),
+            "sim_only": self.sim_only,
         }
 
     def session_summary(self):
         """One-line, model-facing rendering of session_state()."""
         st = self.session_state()
         if not st["authorized"]:
+            if st["sim_only"]:
+                return ("NO SESSION — this daemon runs with --sim-only: it "
+                        "reaches no board, and connect/attach/board-run are "
+                        "refused. Activate the simulator to get live state. "
+                        "Any applog on disk is from some earlier board run, "
+                        "not from anything this daemon can do.")
             return ("NO BOARD SESSION — the user has not connected, run, or "
                     "attached in this UI. Live reads are blocked and any on-disk "
                     "log predates this session.")
@@ -3188,7 +3242,7 @@ receive carries a `Session:` line. Before reading hardware or interpreting any l
 
 - **"NO BOARD SESSION"** — the user has not connected, run, or attached. Live reads are \
   blocked and will return an error. Do NOT speculate about board state. Tell the user to \
-  press "Connect", "Run test", or "Open Current Session", and say what you would check once \
+  press "Connect", "Run", or "Open Current Session", and say what you would check once \
   they do.
 - **"CONNECTED … but NO run has been started"** — the JTAG link is verified, but whatever \
   the registers hold is left over from some earlier run, possibly days old or from another \
@@ -3221,7 +3275,7 @@ questions about it; `get_ui_state()` tells you what is selected in them right no
 | Pane | Position | Contains | Ask which tool |
 |---|---|---|---|
 | **AIE Debug** | top-left | the array itself, in one of two views | `get_design_overview`, `tile_list`, `get_flow_detail` |
-| **Run** | bottom-left | app + board selection, run buttons, run log | `get_backend_status`, `get_applog`, `get_sim_log` |
+| **Execution** | bottom-left | app + board selection, run buttons, run log | `get_backend_status`, `get_applog`, `get_sim_log` |
 | **Info** | top-right | detail for whatever is selected | `tile_info`, `get_flow_detail`, `get_pane` |
 | **Tools** | bottom-right | aiegdb console, this chat, Search | `aie_exec`, `symbol_search` |
 
@@ -3239,19 +3293,32 @@ prepends context to your next message. A tile with no compiled schedule clears \
 to read, `Scan` reads it **once**, and the `live` checkbox re-reads every 2s. \
 Picking a pill does not itself read the board unless live is on.
 
-**Run (bottom-left)** — `App:` and `Board:` selectors, then `Connect`, \
-`Open Current Session`, `Run test`, `Force stop`, and the run log beneath them.
+**Execution (bottom-left)** — `App:` and `Board:` selectors, then `Connect`, \
+`Open Current Session`, `Run`, `Force stop`, and the run log beneath them.
 - The board is chosen in the hostname box beside the `Board:` selector, per run — \
 the device entry itself names no board.
+- Controls are absent when there is nothing to choose. Serving ONE app removes the \
+`App:` row (its name moves beside the `AIE Debug` pane title). `--sim-only` removes \
+the whole `Board:` row AND `Connect` AND `Attach existing run` — the simulator is \
+activated automatically on load, so `Run` is the only button, and the daemon \
+REFUSES connect / attach / board-run / retarget / hw_server with `sim_only: true`. \
+Check `get_backend_status()` before telling the user to pick a board or press \
+Connect: under sim-only neither exists and those endpoints will not answer.
 - A run banner reports `run #N on <device> started <time> (<age> ago) — <status>`, \
 and flags a run whose log has gone quiet as stale.
 - Everything the log shows is `get_applog` (hardware) or `get_sim_log` (simulator).
 
 **Info (top-right)** — detail for the current selection, as a strip of tabs (the \
 user can keep several tiles and nets open at once; ctrl+click adds).
-- For a tile: *High* (role, kernel, transfer summary, supply/demand verdict, \
-channel↔kernel arg map), *Middle* (dfschedule IR slice), *Low* (attributed \
-host.cc lines) — `tile_info(col, row, section)`, or `get_pane("tile.hi"|…)`.
+- For a tile: *Schedule* (role, kernel, transfer summary, supply/demand verdict, \
+channel↔kernel arg map) = `tile.hi`, *IR* (dfschedule IR slice) = `tile.mid`, \
+*Code* = `tile.lo` — `tile_info(col, row, section)`, or `get_pane("tile.hi"|…)`.
+- The tab strip follows what the app carries. Only the aiehlc pipeline emits a \
+dfschedule IR and a line-attributed host.cc, so for those apps *Code* leads with \
+the tile's host.cc lines and folds the kernel sources beneath. A naiebaremetal \
+app has neither: it shows **no IR tab at all**, and *Code* is the kernel source \
+the developer wrote, the .bcf buffer address map, then the generated wrapper. \
+Do not tell the user to open a tab their app does not have.
 - For a net: producer/consumer stages and hop routing — `get_flow_detail(flow)`.
 
 **Tools (bottom-right)** — three tabs; `get_ui_state().console_pane` says which is \
@@ -4633,6 +4700,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _refuse_sim_only(self, what):
+        if not self.state.sim_only:
+            return False
+        self._send_json({"ok": False, "sim_only": True,
+                         "error": f"{what} is unavailable: this daemon was "
+                                  f"started with --sim-only and reaches no "
+                                  f"board. Use the simulator, or restart "
+                                  f"without --sim-only."})
+        return True
+
     def _send_file(self, path, content_type):
         if not os.path.isfile(path):
             self._send_json({"error": f"not found: {path}"}, code=404)
@@ -4740,6 +4817,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/runstate":
             self._send_json(st.run_state())
         elif path == "/ping":
+            if self._refuse_sim_only("connecting to a board"):
+                return
             if st.run_in_progress():
                 # `busy` distinguishes "a run owns the link" from "the link is
                 # dead"; without it the UI ssh'd to the board to restart a
@@ -4759,6 +4838,8 @@ class Handler(BaseHTTPRequestHandler):
                                    res.get("target"))
             self._send_json(res)
         elif path == "/targets":
+            if self._refuse_sim_only("listing JTAG targets"):
+                return
             if not st.hw_authorized():
                 self._send_json({"error": _NO_SESSION_MSG, "targets": []})
                 return
@@ -4833,15 +4914,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(data)
         elif path == "/grid":
             what = q.get("what", ["dma"])[0]
+            device = q.get("device", [""])[0]
+            host = q.get("host", [""])[0]
+            is_sim = (device or "").strip().lower() == "simulator"
+            if is_sim and st.sim_kind == "aiesim":
+                self._send_json({"error": _AIESIM_LIVE_ERROR, "cells": {},
+                                 "live_reads": False, "sim_kind": "aiesim"})
+                return
             if st.run_blocks_debug():
                 self._send_json({"error": "disabled during run setup", "cells": {}})
                 return
             if not st.hw_authorized():
                 self._send_json({"error": _NO_SESSION_MSG, "cells": {}})
                 return
-            device = q.get("device", [""])[0]
-            host = q.get("host", [""])[0]
-            is_sim = (device or "").strip().lower() == "simulator"
             if not is_sim and not _hw_available():
                 self._send_json({"error": "aiedbg not found in PATH",
                                  "cells": {}})
@@ -4875,6 +4960,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid JSON body"}, code=400)
             return
         if u.path == "/run":
+            if self._refuse_sim_only("starting a board run"):
+                return
             if "startcol" in body:
                 try:
                     st.startcol = int(body["startcol"])
@@ -4913,6 +5000,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             dev = body.get("device", "")
             is_sim = (dev or "").strip().lower() == "simulator"
+            if is_sim and st.sim_kind == "aiesim":
+                self._send_json({"error": _AIESIM_LIVE_ERROR,
+                                 "live_reads": False, "sim_kind": "aiesim"})
+                return
             if not is_sim and not _hw_available():
                 self._send_json({"error": "aiedbg not found in PATH"})
                 return
@@ -4923,6 +5014,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, code=500)
         elif u.path == "/settarget":
+            if self._refuse_sim_only("retargeting live debug at a board"):
+                return
             # Switch the live-debug target (and respawn the aiegdb console so its
             # reads/aiedbg use it). The browser only POSTs here AFTER a
             # successful /ping, so the resolved target is already known reachable;
@@ -4959,13 +5052,24 @@ class Handler(BaseHTTPRequestHandler):
             if st.run_blocks_debug():
                 self._send_json({"error": "disabled during run setup"})
                 return
+            cmd = body.get("cmd", "")
+            dev = (body.get("device", "") or "").strip().lower()
+            if (dev == "simulator" and st.sim_kind == "aiesim"
+                    and _aiegdb_needs_live_transport(cmd)):
+                self._send_json({"error": _AIESIM_LIVE_ERROR,
+                                 "output": "ERROR: " + _AIESIM_LIVE_ERROR,
+                                 "live_reads": False,
+                                 "sim_kind": "aiesim"})
+                return
             # No _hw_available hard-gate: navigation/help work without aiedbg;
             # live reads fail gracefully inside aiegdb.
             try:
-                self._send_json(st.gdb_command(body.get("cmd", "")))
+                self._send_json(st.gdb_command(cmd))
             except Exception as e:
                 self._send_json({"error": str(e)}, code=500)
         elif u.path == "/attach":
+            if self._refuse_sim_only("attaching to a board run"):
+                return
             # "Open Current Session": the user ran the app themselves (CLI, or a
             # board already programmed) and then opened the UI. Probe the link so
             # we don't authorize a dead target, but record the mode as `attached`
@@ -5021,6 +5125,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, code=500)
         elif u.path == "/launch_hwserver":
+            if self._refuse_sim_only("starting hw_server on a board"):
+                return
             # Connect-failure recovery: kick off (async) an ssh session that
             # starts hw_server on the board, then re-probes JTAG once. Returns
             # immediately with {started}; the browser tails per-step progress
@@ -5134,6 +5240,9 @@ def _ui_defaults(st):
     (xsdb://<host>:port). When a hostname is known we preselect the vek385 device
     so the user doesn't have to pick it manually on every load.
     """
+    if st.sim_only:
+        return {"device": "simulator", "board_host": "", "sim_only": True,
+                "source_viewer": True}
     host = os.environ.get("VEK385IP", "").strip()
     if not host and st.target:
         m = re.match(r"xsdb://([^:/]+)", st.target)
@@ -5144,7 +5253,7 @@ def _ui_defaults(st):
         # binding — the box stays editable and the typed value wins per run.
         host = _expected_board_host(st.workdir)
     return {"device": "vek385" if host else "", "board_host": host,
-            "source_viewer": True}
+            "sim_only": False, "source_viewer": True}
 
 
 def _target_from_aiedbg_env():
@@ -5326,16 +5435,19 @@ def make_server(host, requested_port, handler, max_scan=50):
 def main():
     ap = argparse.ArgumentParser(
         description="Live AIE debug/test daemon for host_schedule.html")
-    ap.add_argument("workdir", nargs="?", default="aout/worklocal",
-                    help="dir with host_schedule.html + schedule_view.json "
-                         "+ provenance JSONs (default: aout/worklocal)")
-    ap.add_argument("--app", action="append", default=[], metavar="PATH[=LABEL]",
-                    help="register an app workdir explicitly (repeatable); "
-                         "works across repos, e.g. "
-                         "--app ../naiebaremetal/example/testkernel/worklocal=testkernel")
+    ap.add_argument("workdir", nargs="?", default=None,
+                    help="provenance bundle, or app dir containing Work/ "
+                         "(default: aout/worklocal)")
+    ap.add_argument("--app", default=None, metavar="PATH[=LABEL]",
+                    help="open one app from its directory or provenance bundle; "
+                         "generates worklocal from Work/ when needed")
     ap.add_argument("--app-root", action="append", default=[], metavar="DIR",
                     help="scan DIR for app workdirs (repeatable), e.g. "
                          "--app-root ../naiebaremetal/example")
+    ap.add_argument("--sim-only", action="store_true",
+                    help="this daemon reaches no board: drop the Board "
+                         "selector from the UI and refuse connect / "
+                         "attach / board-run / retarget / hw_server")
     ap.add_argument("--elf", default=None,
                     help="ELF to deploy via /run (default: project aout ELF "
                          "<workdir>/build/host or aout/main.elf; falls back to "
@@ -5386,6 +5498,8 @@ def main():
                     help="git pull thirdparty/aiedbg and pip install --upgrade "
                          "before starting the server")
     args = ap.parse_args()
+    if args.workdir and args.app:
+        ap.error("pass either positional workdir/app directory or --app, not both")
 
     if not args.skip_aiedbg_bootstrap:
         import ensure_aiedbg as _ensure_aiedbg
@@ -5401,15 +5515,19 @@ def main():
     # explicit app so the historical single-app invocation keeps working, and
     # aout/ is auto-scanned so a bare `schedule_debug_server.py` finds the most
     # recent build on its own.
-    explicit = list(args.app)
+    explicit = [args.app] if args.app else []
     if args.workdir:
         explicit.insert(0, os.path.abspath(args.workdir))
+    auto_roots = [] if (explicit and not args.app_root) else [
+        os.path.join(_REPO_ROOT, "aout"), os.path.join(_REPO_ROOT, "example")]
     registry = AppRegistry(explicit=explicit, roots=args.app_root,
-                           auto_roots=[os.path.join(_REPO_ROOT, "aout"),
-                                       os.path.join(_REPO_ROOT, "example")])
+                           auto_roots=auto_roots)
     selected = registry.default()
+    if explicit and selected is None:
+        ap.error("explicit app has no schedule_view.json and no usable Work/ tree")
 
-    workdir = os.path.abspath(selected.path if selected else args.workdir)
+    workdir = os.path.abspath(selected.path if selected
+                              else (args.workdir or _DEFAULT_WORKDIR))
     elf = os.path.abspath(args.elf) if args.elf else _resolve_default_elf(workdir)
     apppaltest = args.apppaltest or os.path.join(
         _REPO_ROOT, "script", "test", "apppaltest.py")
@@ -5471,7 +5589,8 @@ def main():
                                claude_cwd=claude_cwd,
                                claude_model=args.claude_model,
                                llm_enabled=not args.no_llm,
-                               llm_password=llm_password)
+                               llm_password=llm_password,
+                               sim_only=args.sim_only)
     Handler.state.registry = registry
     Handler.state.app = selected
     # Bind the server, applying the occupied-port policy: exit + list pid(s) if
@@ -5539,9 +5658,17 @@ def main():
         # is missing a config file nothing has used since detection replaced
         # declaration.
         print(f"  sim:        unavailable for this app — {st.sim_reason}")
-    print(f"  target:     {target or 'NONE'}")
+    if st.sim_only:
+        print("  sim-only:   yes — no Board selector; connect / attach / "
+              "board-run / retarget / hw_server all refuse")
+        if not st.sim_script:
+            print("  WARNING: --sim-only but no simulator was detected for "
+                  "this app, so nothing can be run at all.\n"
+                  f"           {st.sim_reason}", file=sys.stderr)
+    else:
+        print(f"  target:     {target or 'NONE'}")
     print(f"  startcol:   {startcol}{'' if args.startcol is not None else ' (from provenance JSON)'}   device={args.device}   aie={aie_version}{'' if args.aie_version is not None else ' (from provenance JSON)'}")
-    if _hw_available() and not target:
+    if _hw_available() and not target and not st.sim_only:
         print("  WARNING: no aiedbg target set — live grid/cmd reads will fail with "
               "'timed out' / 'connection closed'.\n"
               "           Fix: export AIEDBG_TARGET=xsdb://<host>:3121  (or pass "

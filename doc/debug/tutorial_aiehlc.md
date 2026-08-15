@@ -33,6 +33,8 @@ python3 src/tool/debug/schedule_debug_server.py --open --no-password
 
 ## 4. UI basics
 
+![debug UI four-pane layout](debug_ui.png)
+
 Four panes: **AIE Debug** (top-left, tile grid/map), **Run** (bottom-left, run controls and applog), **Info** (top-right, per-tile detail), **Tools** (bottom-right, aiegdb console and LLM).
 
 **Run the app:** Click **Connect** to verify the JTAG link, then **Run test** to deploy and run. The applog streams live in the Run pane. Use **Force stop** if needed.

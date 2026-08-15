@@ -28,8 +28,7 @@ AIEHLC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AIEHLC_DIR="${AIEHLC_ROOT}"
 # WORKLOCAL_DIR comes from the caller. Generated host.cc/kernel.cc and all build
 # artifacts live here. When not explicitly set, prefer the current dir if it holds
-# the generated sources, otherwise fall back to the aiehlc default aout/worklocal
-# (so running `source ./script/hostcompile.sh` from the repo root just works).
+# the generated sources, otherwise fall back to the aiehlc default aout/worklocal.
 if [ -z "${WORKLOCAL_DIR:-}" ]; then
     if [ -f "$(pwd)/host.cc" ] || [ -f "$(pwd)/kernel.cc" ]; then
         WORKLOCAL_DIR="$(pwd)"
@@ -41,91 +40,57 @@ if [ -z "${WORKLOCAL_DIR:-}" ]; then
     fi
 fi
 BUILD_DIR="${WORKLOCAL_DIR}/build"
-
-# Remember where the caller invoked us from. Several stages 'cd' into WORKLOCAL_DIR
-# and BUILD_DIR to resolve relative paths; when this script is *sourced* those cds
-# would otherwise leak into the caller's shell (leaving it in aout/worklocal/build).
-# Restore this at every return/exit point so 'source ./script/hostcompile.sh' keeps
-# the caller's working directory unchanged.
 _HOSTCOMPILE_ORIG_PWD="$(pwd)"
+
 OPT_FLAGS="-Os"
 [ "${DEBUG_SYMS:-0}" -eq 1 ] && OPT_FLAGS="${OPT_FLAGS} -g"
 
 KERNEL_FUNC_NAME="computekernel"   # default fallback; overridden by auto-detection below
 
-# ---------------------------------------------------------------------------
-# compile_one_kernel: build a single kernel ELF + kernel.o from kernel.cc.
-#
-#   $1  kernel function name for binary symbols (default: compute_kernel)
-#       Produces kernel.o with _binary_kernel_<func_name>_{start,end,size}
-#
-# Standalone kernel-only build (no host build): source this file with
-# KERNEL_ONLY=1, e.g.
-#     WORKLOCAL_DIR=$(pwd) KERNEL_ONLY=1 source script/hostcompile.sh <func>
-# ---------------------------------------------------------------------------
 compile_one_kernel() {
-    local KERNEL_FUNC_NAME="${1:-compute_kernel}"
+    local kernel_func_name="${1:-compute_kernel}"
 
-    # Fail early (before the chess toolchain) if the generated kernel source is missing.
     if [ ! -f "${WORKLOCAL_DIR}/kernel.cc" ]; then
         echo "Error: kernel.cc not found in ${WORKLOCAL_DIR}"
-        echo "Generate it first (run aiehlc / the unitest), or point WORKLOCAL_DIR at the"
-        echo "worklocal dir that holds host.cc/kernel.cc, e.g.:"
-        echo "  WORKLOCAL_DIR=\$(pwd)/aout/worklocal source script/hostcompile.sh"
         exit 1
     fi
 
-    # Source setup.sh to set XILINX_VITIS and other environment variables
     if [ -f "${AIEHLC_ROOT}/script/setup.sh" ]; then
-        echo "Sourcing Vitis environment from ${AIEHLC_ROOT}/script/setup.sh..."
-        # Save current directory to restore after sourcing
-        local SAVED_PWD="$(pwd)"
+        local saved_pwd
+        saved_pwd="$(pwd)"
         source "${AIEHLC_ROOT}/script/setup.sh" --path-set-only
-        # Restore directory
-        cd "${SAVED_PWD}"
-        echo "✓ Environment loaded: XILINX_VITIS=${XILINX_VITIS}"
-    else
-        echo "Warning: setup.sh not found at ${AIEHLC_ROOT}/script/setup.sh"
-        echo "Checking if XILINX_VITIS is already set..."
+        cd "${saved_pwd}"
     fi
-
-    # Check XILINX_VITIS is set
     if [ -z "$XILINX_VITIS" ]; then
         echo "Error: XILINX_VITIS environment variable not set"
-        echo "Please source Vitis settings: source /path/to/Vitis/settings64.sh"
         exit 1
     fi
 
-    # Clean previous kernel build artifacts--to fix the _main missing error
-    # Only remove kernel.o and kernel ELF (not kernel_*.o from multi-kernel builds)
-    rm -f "${BUILD_DIR}"/chesswork/kernel* "${BUILD_DIR}"/kernel.o "${BUILD_DIR}"/kernel 2>/dev/null || true
+    rm -f "${BUILD_DIR}"/chesswork/kernel* "${BUILD_DIR}"/kernel.o \
+          "${BUILD_DIR}"/kernel 2>/dev/null || true
 
-    echo "Kernel func name: ${KERNEL_FUNC_NAME}"
-
-    # Use generated BCF/PRX if available (from tilinglinalg pipeline), fall back to stock
-    local PRX_FILE
+    local prx_file
     if [ -f "${WORKLOCAL_DIR}/aieml.prx" ]; then
-        PRX_FILE="${WORKLOCAL_DIR}/aieml.prx"
-        echo "Using generated PRX: ${PRX_FILE}"
+        prx_file="${WORKLOCAL_DIR}/aieml.prx"
     else
-        PRX_FILE="aie2ps.prx"
-        echo "Using stock PRX: ${PRX_FILE}"
+        prx_file="aie2ps.prx"
     fi
 
-    # Build from WORKLOCAL_DIR so the relative --kernel-cc ./kernel.cc resolves there.
     cd "${WORKLOCAL_DIR}"
-    local _KC_PLATFORM="${PLATFORM:-baremetal}"
-    source ${AIEHLC_ROOT}/script/kc.sh --kernel-cc ./kernel.cc --func-name "${KERNEL_FUNC_NAME}" --aie-version 5 --platform "${_KC_PLATFORM}" --debug-output --output-dir $BUILD_DIR --prx "${PRX_FILE}"
+    source "${AIEHLC_ROOT}/script/kc.sh" \
+        --kernel-cc ./kernel.cc \
+        --func-name "${kernel_func_name}" \
+        --aie-version "${AIE_VERSION:-5}" \
+        --platform "${PLATFORM:-baremetal}" \
+        --debug-output \
+        --output-dir "${BUILD_DIR}" \
+        --prx "${prx_file}"
 }
 
-# Kernel-only mode: source this file with KERNEL_ONLY=1 to build just the kernel
-# (standalone kernel-only build; no host build).
 if [ "${KERNEL_ONLY:-0}" = "1" ]; then
     compile_one_kernel "${1:-compute_kernel}"
     _kret=$?
-    # compile_one_kernel cd'd into WORKLOCAL_DIR; restore the caller's dir before leaving.
     cd "${_HOSTCOMPILE_ORIG_PWD}" 2>/dev/null || true
-    # 'return' when sourced (the normal wrapper case), 'exit' when run directly.
     return $_kret 2>/dev/null || exit $_kret
 fi
 
@@ -243,6 +208,11 @@ fi
 
 if [[ "$platform" == "sim" ]]; then
     SIM_DIR="${AIEHLC_ROOT}/script/sim"
+    RUNSIM="${AIEHLC_ROOT}/script/runsim.sh"
+    if [ ! -f "${RUNSIM}" ]; then
+        echo "Error: runsim.sh not found at ${RUNSIM}"
+        exit 1
+    fi
     KERNEL_NAMES_LIST=""
     for kobj in ${KERNEL_OBJ_LIST}; do
         bname="$(basename "$kobj" .o)"
@@ -250,15 +220,21 @@ if [[ "$platform" == "sim" ]]; then
         [ "$fname" == "kernel" ] && fname="${KERNEL_FUNC_NAME}"
         KERNEL_NAMES_LIST="${KERNEL_NAMES_LIST:+$KERNEL_NAMES_LIST }${fname}"
     done
-    echo "[sim] Tilinglinalg — handing off to runsim.sh (kernel objs: ${KERNEL_OBJ_LIST})"
+    echo "[sim] Tilinglinalg — building simulator artifacts (kernel objs: ${KERNEL_OBJ_LIST})"
     SIM_HOST_FIXED="${WORKLOCAL_DIR}/host_sim_fixed.cc"
     sed 's/int main()/int main(int, char**)/' "${WORKLOCAL_DIR}/host.cc" > "${SIM_HOST_FIXED}"
     SIM_TILES_ARG="${SIM_TILES:-}"
-    bash "${SIM_DIR}/runsim.sh" \
+    # shellcheck disable=SC1090
+    source "${SIM_DIR}/write_sim_config.sh"
+    write_sim_config "${WORKLOCAL_DIR}" "${SIM_HOST_FIXED}" "${KERNEL_OBJ_LIST}" \
+                     "${KERNEL_NAMES_LIST}" "${aie_version}" "${SIM_TILES_ARG}"
+
+    bash "${RUNSIM}" \
         --host-src     "${SIM_HOST_FIXED}" \
         --kernel-objs  "${KERNEL_OBJ_LIST}" \
         --kernel-names "${KERNEL_NAMES_LIST}" \
         --aie-gen      "${aie_version}" \
+        --no-launch \
         $([ -n "$SIM_TILES_ARG" ] && echo "--stub-tiles $SIM_TILES_ARG" || echo "--stub-all")
     exit $?
 fi
@@ -510,14 +486,9 @@ echo "Host built successfully: ${BUILD_DIR}/host"
 echo "============================================"
 ls -l host
 
-# Publish the freshly built ELF as aout/main.elf (the parent of WORKLOCAL_DIR is the
-# aout dir; apppaltest.py deploys aout/main.elf). Doing it here makes a plain
-# 'source ./script/hostcompile.sh' self-sufficient — no separate cp step needed.
 AOUT_DIR="$(dirname "${WORKLOCAL_DIR}")"
 cp -f "${BUILD_DIR}/host" "${AOUT_DIR}/main.elf"
 echo "Published: ${AOUT_DIR}/main.elf"
 ls -l "${AOUT_DIR}/main.elf"
 
-# Restore the caller's working directory (we cd'd into BUILD_DIR above). This keeps
-# 'source ./script/hostcompile.sh' from leaving the shell inside aout/worklocal/build.
 cd "${_HOSTCOMPILE_ORIG_PWD}"
