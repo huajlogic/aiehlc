@@ -718,6 +718,13 @@ RE_KWININIT_BC = re.compile(
 RE_KARG_BC = re.compile(r'get_(input|output)_async_window\w*\(\s*window_(\w+)\s*\)')
 RE_KINVOKE_BC = re.compile(r'//\s*Kernel call\s*:\s*\w+:(\w+)')
 RE_KBUF_BC = re.compile(r'\b(buf\w+)\b')
+RE_KWININIT_RAW = re.compile(
+    r'window_init\(\s*\w+\s*,\s*\d+\s*,\s*(\w+)\s*,\s*([^,\s]+)')
+RE_KARG_RAW = re.compile(
+    r'(input|output)_window\w*\s*\*\s*(\w+)_win_ptr\s*='
+    r'\s*get_(?:input|output)_async_window\w*\(')
+RE_KINVOKE_RAW = re.compile(
+    r'^\s*(\w+)\s*\([^;]*\b\w+_win_ptr\b[^;]*\)\s*;\s*$')
 
 
 def _win_dir(name):
@@ -884,6 +891,11 @@ def parse_kernel(kernel_cc_path):
     except OSError:
         return None
     src = text.split('\n')
+    raw_defs = {}
+    for ln in src:
+        match = re.match(r'\s*#define\s+(\w+)\s+(\d+)\s*$', ln)
+        if match:
+            raw_defs[match.group(1)] = int(match.group(2))
 
     windows = {}         # name -> window dict
     order = []           # window names in first-seen order
@@ -940,12 +952,25 @@ def parse_kernel(kernel_cc_path):
                     w['buffers'].append(buf)
             marker_lines.append({'line': i, 'code': ln})
             continue
+        m = RE_KWININIT_RAW.search(ln)
+        if m:
+            w = _win(m.group(1))
+            w['buffers'].append(m.group(1))
+            w['buf_size'] = raw_defs.get(m.group(2))
+            w['init_line'] = i
+            marker_lines.append({'line': i, 'code': ln})
+            continue
         m = RE_KINVOKE.search(ln)
         if m:
             function = m.group(1)
             marker_lines.append({'line': i, 'code': ln})
             continue
         m = RE_KINVOKE_BC.search(ln)
+        if m and function is None:
+            function = m.group(1)
+            marker_lines.append({'line': i, 'code': ln})
+            continue
+        m = RE_KINVOKE_RAW.search(ln)
         if m and function is None:
             function = m.group(1)
             marker_lines.append({'line': i, 'code': ln})
@@ -970,6 +995,11 @@ def parse_kernel(kernel_cc_path):
             win_dir_by_line[i] = (d, wn)
             if wn in windows:
                 windows[wn]['dir'] = d
+        for am in RE_KARG_RAW.finditer(ln):
+            d = 'input' if am.group(1) == 'input' else 'output'
+            wn = am.group(2)
+            win_dir_by_line[i] = (d, wn)
+            _win(wn)['dir'] = d
     if function:
         call_re = re.compile(r'\b' + re.escape(function) + r'\s*\(')
         for i, ln in enumerate(src, 1):
@@ -1219,7 +1249,6 @@ def find_dfschedule_ir(workdir):
     wd = os.path.abspath(workdir)
     for up in ('ir/dfschedule', '../ir/dfschedule', '../../ir/dfschedule'):
         candidates.append(os.path.join(wd, up, DFSCHED_IR_NAME))
-    candidates.append(os.path.join(os.getcwd(), 'ir/dfschedule', DFSCHED_IR_NAME))
     for c in candidates:
         if os.path.isfile(c):
             return c
@@ -1769,8 +1798,8 @@ def build_view(workdir):
     cmap = build_const_map(host_lines, fstart, fend)
     var_def = build_var_def_map(host_lines, fstart, fend)
 
-    # Middle tab: verbatim dfschedule IR slicer (built once, graceful if absent).
-    ir_path = find_dfschedule_ir(workdir)
+    ir_path = None if prov.get('provenance_source') == 'static-xaie' \
+        else find_dfschedule_ir(workdir)
     slicer = None
     ir_text = None
     if ir_path:
@@ -1923,11 +1952,21 @@ def build_view(workdir):
                 tile_out['bcf'] = tb
         tiles_out.append(tile_out)
 
+    host_mapped = any(t['relevant_lines'] or t['low_level']['ranges']
+                      for t in tiles_out)
+    kernel_code = any(t.get('kernel') or t.get('bcf') for t in tiles_out) \
+        or bool(kernel_view) or bool(bcf_view)
+
     # global (non-tile) lines: kernel group load/launch, final wait, dbg snapshot
     glns = owner_lines.get('__global__', [])
     granges, gcode, _ = code_for(glns) if glns else ([], '', [])
 
     view = {
+        'capabilities': {
+            'host_lines': bool(host_mapped),
+            'ir': slicer is not None,
+            'kernel_code': bool(kernel_code),
+        },
         'source': {
             'host_cc': os.path.abspath(host_path),
             'provenance': os.path.abspath(prov_path),
@@ -2078,11 +2117,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   /* ── typography ──────────────────────────────────────────────── */
   #lefttop-header { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
-  h1 { font-size:17px; font-weight:600; margin:0; letter-spacing:-.01em; }
+  h1 { font-size:17px; font-weight:700; margin:0; letter-spacing:-.01em; }
   /* One name per pane. Each rides the pane's existing first row — a control
      row or a tab strip — rather than taking a row of its own. */
-  .pane-title { flex:0 0 auto; font-size:13px; font-weight:600; margin:0;
-                color:var(--tx-mid); letter-spacing:.01em; white-space:nowrap; }
+  .pane-title { flex:0 0 auto; font-size:13px; font-weight:700; margin:0;
+                color:var(--tx-hi); letter-spacing:.01em; white-space:nowrap; }
   #contabs > .pane-title { display:inline-block; vertical-align:bottom;
                            padding-bottom:3px; margin-right:8px; }
   .sub { color:var(--tx-lo); font-size:11px; letter-spacing:.01em; }
@@ -2215,6 +2254,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   button:hover, .btn:hover { background:var(--bg-hover); color:var(--tx-hi); border-color:var(--bd); }
   button:disabled, .btn:disabled { opacity:.38; cursor:not-allowed; }
+  #runbtn { font-weight:600; }
+  #ctrlbar[data-connected="true"] #runbtn,
+  #ctrlbar:not([data-connected="true"]) #testconn {
+    background:var(--accent); color:#101820; border-color:var(--accent);
+  }
+  #ctrlbar[data-connected="true"] #runbtn:hover,
+  #ctrlbar:not([data-connected="true"]) #testconn:hover {
+    filter:brightness(1.12);
+  }
   #stopbtn { background:#2a1516; color:#f8b0b0; border-color:#5c2828; }
   #stopbtn:hover { background:#3a1e1e; border-color:#7a3535; }
 
@@ -2266,6 +2314,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             cursor:pointer; background:var(--bg-raised); color:var(--tx-lo);
             border-radius:4px; margin-right:5px; font-size:11.5px;
             transition:background .12s, color .12s, border-color .12s; }
+  .codefile-tabs { display:flex; gap:5px; margin:0 0 10px; padding-bottom:2px;
+                   overflow-x:auto; scrollbar-width:thin; }
+  .codefile-tabs .subtab { flex:0 0 auto; margin-right:0; white-space:nowrap;
+                           font-family:ui-monospace,'Cascadia Code',monospace;
+                           font-size:10.5px; }
+  .codefile-tabs .subtab:first-child { font-family:inherit; }
+  .codefile-view { min-width:0; }
 
   /* Segmented control (.vsw — Grid/Device Map switcher) */
   #viewswitcher { display:flex; gap:0; }
@@ -2451,10 +2506,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             background:transparent; font-family:ui-monospace,monospace;
             font-size:11.5px; line-height:1.5; color:var(--tx-mid); }
   .con-blk { border:1px solid var(--bd-subtle); border-radius:4px;
-             margin:0 0 5px; background:#00000026; overflow:hidden; }
+             margin:0 0 5px; background:#00000026; }
   .con-blk.err { border-color:#5a2a2a; }
-  .con-echo { display:flex; align-items:center; gap:6px; cursor:pointer;
+  .con-blk.cur { border-color:var(--accent-fg); }
+  .con-blk.cur.err { border-color:#8a3a3a; }
+  .con-blk.cur > .con-echo { background:var(--bg-hover); cursor:default; }
+  .con-blk.cur > .con-echo .cf { display:none; }
+  .con-echo { position:sticky; top:0; z-index:2;
+              display:flex; align-items:center; gap:6px; cursor:pointer;
               padding:2px 7px; background:var(--bg-surface);
+              border-radius:3px 3px 0 0;
               border-bottom:1px solid var(--bd-subtle); user-select:none; }
   .con-echo:hover { background:var(--bg-hover); }
   .con-echo .cf { color:var(--tx-lo); width:9px; flex:0 0 9px; }
@@ -2472,7 +2533,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .con-ok    { color:var(--green-fg); }
   .con-bad   { color:var(--red-fg); }
   .con-warn  { color:var(--amber-fg); }
-  .con-scope { color:var(--accent-fg); }
+  .con-scope { color:var(--tx-hi); }
   .con-dim   { color:var(--tx-lo); }
   .con-src   { color:#7fd0c0; }
   /* the "[registers read] { … }" appendix aiegdb adds after most commands —
@@ -2659,6 +2720,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* ── code viewer tokens ──────────────────────────────────────── */
   .kw { color:#7faadf; } .fn { color:#dcdcaa; } .num { color:#a8cfa0; }
   .cm { color:#5c7a50; }
+  .str { color:#c99070; } .pp { color:#b48ac0; } .ty { color:#5fb3b3; }
   .pann { color:#7aaf7a; font-style:italic; margin-left:1ch; }
   .gap { color:#c89050; font-style:italic; opacity:0.75; }
   .bdpretty { font-family:ui-monospace,monospace; font-size:11.5px; line-height:1.45;
@@ -2687,11 +2749,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .khl { background:#26240e; border-left:3px solid var(--amber-fg); }
   .kshowall { margin:4px 0 9px; padding:3px 11px; font-size:12px; cursor:pointer; }
   .kfileref { color:var(--accent-fg); font-size:11px; }
-  .ksec { margin:0 0 6px; }
-  .ksechdr { color:var(--accent-fg); font-size:10.5px; text-transform:uppercase;
-             letter-spacing:.06em; margin:7px 0 3px; opacity:.75; }
-  .ksecsep { border-top:1px dashed var(--bd); margin:10px 0; }
-
   /* ── selection-to-LLM popup ─────────────────────────────────── */
   #sel-popup { position:fixed; z-index:900; display:none;
                background:var(--accent); color:#000; font-size:11px; font-weight:600;
@@ -2768,6 +2825,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                        color:var(--tx-lo); transition:transform .15s; }
   details.codesec[open] > summary::before { transform:rotate(90deg); }
   details.codesec > summary:hover { color:var(--accent); }
+  details.codesec > .codesec-body { min-width:0; padding:2px 0 4px 14px; }
   .kmap { border-collapse:collapse; margin:7px 0 9px; font-size:12px; }
   .kmap th, .kmap td { border:1px solid var(--bd); padding:3px 9px; text-align:left; }
   .kmap th, .rctbl th { background:var(--bg-raised); color:var(--tx-mid); font-weight:600; }
@@ -2888,9 +2946,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   /* ── run controls toolbar ────────────────────────────────────── */
   #ctrlbar { flex:0 0 auto; padding:10px 14px; background:var(--bg-surface); }
-  .ctrlrow { display:flex; align-items:center; flex-wrap:wrap; gap:6px;
-             margin-bottom:5px; }
-  .ctrlrow:last-child { margin-bottom:0; }
+  .run-head { display:flex; align-items:center; flex-wrap:wrap;
+              gap:6px 10px; margin-bottom:8px; }
+  #connstatus { display:inline-flex; align-items:center; gap:6px; min-width:0;
+                margin-left:auto; flex:0 1 auto;
+                max-width:100%; color:var(--tx-lo); font-size:10px;
+                overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #connstatus::before { content:""; flex:0 0 7px; width:7px; height:7px;
+                        border-radius:50%; background:var(--tx-lo); }
+  #connstatus[data-state="connected"] { color:var(--accent-fg); }
+  #connstatus[data-state="connected"]::before { background:var(--accent); }
+  #connstatus[data-state="busy"] { color:var(--amber-fg); }
+  #connstatus[data-state="busy"]::before { background:var(--amber-fg); }
+  #connstatus[data-state="error"] { color:var(--red-fg); }
+  #connstatus[data-state="error"]::before { background:var(--red-fg); }
+  .run-fields { display:flex; flex-direction:column; gap:5px; }
+  .run-row { display:flex; align-items:center; gap:8px; min-width:0; }
+  .run-label { flex:0 0 46px; color:var(--tx-mid); font-size:11px; font-weight:600; }
+  .run-row > select { flex:0 1 210px; min-width:110px; }
+  #appinfo { flex:1 1 auto; min-width:0; overflow:hidden;
+             text-overflow:ellipsis; white-space:nowrap; color:var(--tx-lo);
+             font-size:11px; }
+  #boardHost { flex:1 1 auto; min-width:0; box-sizing:border-box; }
+  #ctrlbar[data-apps="one"] #row-app { display:none; }
+  #ctrlbar[data-simonly="true"] #row-board,
+  #ctrlbar[data-simonly="true"] #attachbtn,
+  #ctrlbar[data-simonly="true"] #testconn,
+  #ctrlbar[data-simonly="true"] #connhint { display:none; }
+  #ctrlbar[data-apps="one"][data-simonly="true"] .run-fields { display:none; }
+  #appbadge { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+              white-space:nowrap; font-size:12px; color:var(--tx-mid); }
+  #appbadge::before { content:'\2014\00a0'; color:var(--tx-lo); }
+  .run-actions { display:flex; align-items:center; flex-wrap:wrap; gap:6px;
+                 margin-top:0; }
+  .run-actions #attachbtn { margin-left:4px; }
   #connhint { margin-top:6px; padding:6px 8px; font-size:11px; color:#f6c177;
               background:#2a1f14; border:1px solid #5a3d1a; border-radius:4px; }
 
@@ -2920,6 +3009,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="lefttop">
   <div id="lefttop-header">
     <h1>AIE Debug</h1>
+    <span id="appbadge" class="hide" title=""></span>
     <div id="viewswitcher">
       <span class="vsw act" data-v="grid" onclick="switchView('grid')">Grid</span>
       <span class="vsw" data-v="map" onclick="switchView('map')">Device Map</span>
@@ -3012,28 +3102,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <!-- ── run controls ─────────────────────────────────────────── -->
   <div id="lhsplitter" title="Drag to resize (top / bottom)"></div>
   <div id="leftbottom">
-  <div id="ctrlbar">
-    <div class="ctrlrow">
-      <span class="pane-title">Run</span>
-      <label>App:
-        <select id="appSel"><option value="">&mdash; loading &mdash;</option></select>
-      </label>
-      <span id="appinfo" style="color:var(--tx-lo);font-size:11px;"></span>
-      <label style="margin-left:4px;">Board:
+  <div id="ctrlbar" data-connected="false">
+    <!-- The buttons ride the pane-title row: they are the pane's whole point,
+         and under --sim-only with one app they are the ONLY thing left, so a
+         title row of their own would be a wasted line. #connstatus is pushed
+         right by margin-left:auto and wraps to its own line when the pane is
+         too narrow, rather than squeezing the buttons. -->
+    <div class="run-head">
+      <span class="pane-title">Execution</span>
+      <div class="run-actions">
+        <button id="testconn" disabled>Connect</button>
+        <button id="runbtn" disabled>Run</button>
+        <button id="attachbtn" disabled
+          title="Attach to a run you started outside this UI (CLI / already-programmed board)">Attach existing run</button>
+        <button id="stopbtn" disabled title="Terminate the run owned by this UI">Stop run</button>
+      </div>
+      <span id="connstatus" data-state="idle">Not connected</span>
+    </div>
+    <!-- One flex row per selector, below the buttons — Board first, App under
+         it. Whole rows, not grid cells, so hiding one (sim-only / single app)
+         takes its row-gap with it instead of leaving a seam. -->
+    <div class="run-fields">
+      <div class="run-row" id="row-board">
+        <label class="run-label" for="deviceSel">Target</label>
         <select id="deviceSel">
-          <option value="">&mdash; select device &mdash;</option>
+          <option value="">&mdash; select target &mdash;</option>
 <!--__DEVICE_OPTIONS__-->
         </select>
-      </label>
-      <input type="text" id="boardHost" class="hide" placeholder="vek385 board hostname">
-    </div>
-    <div class="ctrlrow">
-      <button id="testconn" disabled>Connect</button>
-      <button id="attachbtn" disabled
-        title="Attach to a run you started outside this UI (CLI / already-programmed board)">Open Current Session</button>
-      <button id="runbtn" disabled>Run test</button>
-      <button id="stopbtn" disabled>Force stop</button>
-      <span id="connstatus" style="font-size:11px; color:var(--accent-fg);"></span>
+        <input type="text" id="boardHost" class="hide" placeholder="vek385 board hostname">
+      </div>
+      <div class="run-row" id="row-app">
+        <label class="run-label" for="appSel">App</label>
+        <select id="appSel"><option value="">&mdash; loading &mdash;</option></select>
+        <span id="appinfo" title=""></span>
+      </div>
     </div>
     <div id="connhint" class="hide">
       Connection failed. On the target test board, start the hw_server via xsdb:
@@ -3070,13 +3172,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <button class="qcmd" onclick="conSend('where')">where</button>
       <button class="qcmd" onclick="conSend('up')">up</button>
       <button class="qcmd" onclick="conSend('top')">top</button>
-      <button class="qcmd" id="confoldall" title="collapse every output block">Fold</button>
       <button class="qcmd" id="conclear" title="clear the console">Clear</button>
       <button class="qcmd" id="conreload" title="kill + restart aiegdb.py (reloads edited code)">Reload</button>
     </div>
     <div id="conterm">
       <div id="conpromptline"><span id="conprompt">partition&gt;</span><input id="conin"
-          placeholder="type a command — suggestions appear as you type (Tab to accept)"
+          placeholder="type a command (Tab to accept suggestions)"
           autocomplete="off" spellcheck="false">
         <div id="consug" class="hide"></div></div>
       <div id="conout"><div class="con-ln con-dim">(aiegdb console &mdash; click a tile, press &#8984; Commands, or type 'help')</div></div>
@@ -3121,6 +3222,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 <script>
 const DATA = /*__DATA__*/ null;
+const CAPS = Object.assign({host_lines:true, ir:true, kernel_code:true},
+                           (DATA && DATA.capabilities) || {});
 // aiegdb's command grammar, baked in at render time from aiegdb.COMMAND_SPEC.
 // The daemon also serves a live copy at /aiegdb/spec; this copy is what makes
 // the console's autocomplete work in the standalone (daemon-less) HTML.
@@ -3156,6 +3259,10 @@ function renderRelevant(t){
 // global fallback (native aiehlc: shared kernel).
 function tileKernel(t){ return (t && t.kernel) || DATA.kernel; }
 function tileBcf(t){ return (t && t.bcf) || DATA.bcf; }
+function tileHasKernel(t){
+  return !!(t && t.type === 'core' &&
+    (((t.high_level||{}).kernel) || t.kernel));
+}
 function renderKernelMatch(t){
   const km = t.high_level && t.high_level.kernel_match;
   const kv = tileKernel(t);
@@ -3213,27 +3320,27 @@ function renderKernelSource(t, ch, focused){
   const hdr = '<div class="lref">kernel: <b class="srcref" data-p="'+esc(src.path||'')+'"'
     +' data-l="'+(src.start_line||'')+'">'+esc(src.file)+'</b> &mdash; '+
     esc(src.function)+'() lines '+src.start_line+'-'+src.end_line+'</div>';
+  const hs = hlSeq();
   const full = (src.lines||[]).map(r => {
     const hlcls = (refset && refset[r.line]) ? ' khl' : '';
     return '<div class="rline'+hlcls+'"><span class="lno">L'+r.line+'</span>'+
-      hl(r.code)+'</div>';
+      hs(r.code)+'</div>';
   }).join('');
   if(focused && refset && param){
     // Show the related lines; fold the rest into "//line a-b" markers.
-    const piece = renderKFolded(src.lines||[], refset, 'src');
+    const piece = renderKFolded(src.lines||[], refset, 'src', hlSeq());
     return hdr +
       '<div class="kv">channel <b>'+esc(ch.direction)+esc(''+ch.channel)+
         '</b> \u2192 arg'+argn+' <span class="win">'+esc(param.name)+'</span> ('+
         esc(param.dir)+')</div>' +
       '<button class="kshowall">Show all</button>' +
-      '<div id="kern-piece">'+
+      '<div class="kern-piece">'+
         (piece||'<div class="placeholder">(no direct uses found)</div>')+'</div>' +
-      '<div id="kern-full" class="hide">'+full+'</div>';
+      '<div class="kern-full hide">'+full+'</div>';
   }
-  return hdr + '<div id="kern-full">'+full+'</div>';
+  return hdr + '<div class="kern-full">'+full+'</div>';
 }
 // Resolve the kernel window a focused channel maps to (via kernel_match), or
-// null when not focused / no match. Shared by the kernel.cc + .bcf sub-tabs.
 function focusedWindow(t, ch, focused){
   if(!focused || !ch) return null;
   const km = t.high_level && t.high_level.kernel_match;
@@ -3263,11 +3370,12 @@ function renderKernelCC(t, ch, focused){
     (win ? ' &mdash; window <span class="win">'+esc(win.name)+'</span>'+
       ' (buffers '+esc((win.buffers||[]).join(', ')||'-')+')' : '')+'</div>';
   // Focused (window matched): show only the window's lines, fold the rest.
+  const hs = hlSeq();
   const body = win
-    ? renderKFolded(k.kernel_lines||[], hset, 'kcc')
+    ? renderKFolded(k.kernel_lines||[], hset, 'kcc', hs)
     : (k.kernel_lines||[]).map(r =>
         '<div class="rline"><span class="lno">L'+r.line+'</span>'+
-        hl(r.code)+'</div>').join('');
+        hs(r.code)+'</div>').join('');
   return hdr + '<div>'+body+'</div>';
 }
 // "*.bcf" sub-tab: buffer name -> tile address map. When a channel is focused,
@@ -3285,11 +3393,12 @@ function renderBcf(t, ch, focused){
     +esc(b.file)+'</b>'+
     (win ? ' &mdash; buffers for <span class="win">'+esc(win.name)+'</span>' : '')+'</div>';
   // Focused (window matched): show only this window's buffer lines, fold the rest.
+  const hs = hlSeq();
   const body = win
-    ? renderKFolded(b.lines||[], hset, 'bcf')
+    ? renderKFolded(b.lines||[], hset, 'bcf', hs)
     : (b.lines||[]).map(r =>
         '<div class="rline"><span class="lno">L'+r.line+'</span>'+
-        hl(r.code)+'</div>').join('');
+        hs(r.code)+'</div>').join('');
   return hdr + '<div>'+body+'</div>';
 }
 // Render a list of {line,code} rows with only the highlighted (hset) lines shown
@@ -3297,10 +3406,11 @@ function renderBcf(t, ch, focused){
 // fold marker (default collapsed). `prefix` keeps fold ids unique across the
 // stacked kernel-code sections. Reuses the shared fold machinery (wireFolds /
 // setFold / foldLabel).
-function renderKFolded(lines, hset, prefix){
+function renderKFolded(lines, hset, prefix, h){
   const N = lines.length;
+  const hf = h || hl;
   const row = r => '<div class="rline'+(hset[r.line]?' khl':'')+'">'+
-    '<span class="lno">L'+r.line+'</span>'+hl(r.code)+'</div>';
+    '<span class="lno">L'+r.line+'</span>'+hf(r.code)+'</div>';
   let out = [], i = 0, fid = 0;
   while(i < N){
     const r = lines[i];
@@ -3316,32 +3426,120 @@ function renderKFolded(lines, hset, prefix){
   }
   return out.join('');
 }
-// Merged "kernel code" sub-tab content. Sections are stacked in dependency
-// order (bcf buffer addresses -> generated kernel.cc wrapper -> conv2d_spatial.cc
-// source) so the reader follows the data from where it lands in tile memory up
-// to where the kernel body consumes it.
-function renderKernelCode(t, ch, focused){
+function renderCodeSection(title, html, open){
+  return '<details class="codesec"'+(open?' open':'')+'>'+
+    '<summary>'+title+'</summary><div class="codesec-body">'+html+'</div></details>';
+}
+function renderKernelCode(t, ch, focused, openFirst){
   const sections = [];
   const kv = tileKernel(t), b = tileBcf(t);
-  if(b && b.lines)
-    sections.push(['buffer address map', renderBcf(t, ch, focused)]);
-  if(kv && kv.kernel_lines)
-    sections.push(['generated wrapper', renderKernelCC(t, ch, focused)]);
   if(kv && kv.source)
-    sections.push(['kernel source', renderKernelSource(t, ch, focused)]);
+    sections.push([(kv.source.file||'kernel source')+' — kernel source',
+                   renderKernelSource(t, ch, focused)]);
+  if(kv && kv.kernel_lines)
+    sections.push([(kv.file||'kernel.cc')+' — generated wrapper',
+                   renderKernelCC(t, ch, focused)]);
+  if(b && b.lines)
+    sections.push([(b.file||'.bcf')+' — buffer address map',
+                   renderBcf(t, ch, focused)]);
   if(!sections.length)
     return '<div class="placeholder">(no kernel code found)</div>';
-  return sections.map(s =>
-    '<div class="ksec"><div class="ksechdr">'+esc(s[0])+'</div>'+s[1]+'</div>'
-  ).join('<div class="ksecsep"></div>');
+  return sections.map((s, i) =>
+    renderCodeSection(esc(s[0]), s[1], !!openFirst && i===0)
+  ).join('');
 }
-function hl(code){
-  let s = esc(code);
-  s = s.replace(/\/\*[\s\S]*?\*\//g, m=>'<span class="cm">'+m+'</span>');
-  s = s.replace(/\b(void|int|int32_t|int64_t|size_t|for|return|uint8_t)\b/g,'<span class="kw">$1</span>');
-  s = s.replace(/\b(__Runtime_[a-zA-Z0-9_]+|XAie_[A-Za-z0-9_]+|__runtime_[a-z_]+)\b/g,'<span class="fn">$1</span>');
-  s = s.replace(/\b(\d+)\b/g,'<span class="num">$1</span>');
-  return s;
+function renderTileCodeKernelFirst(t, ch, focused, banner){
+  const hasKernel = tileHasKernel(t);
+  const kv = hasKernel ? tileKernel(t) : null;
+  const b = hasKernel ? tileBcf(t) : null;
+  let out = banner || '';
+  let any = false;
+  if(kv && kv.source){
+    const f = kv.source.file || 'kernel source';
+    out += renderCodeSection('Kernel source &mdash; '+esc(f)+
+      (kv.source.function?' &mdash; '+esc(kv.source.function)+'()':''),
+      renderKernelSource(t, ch, focused), true);
+    any = true;
+  }
+  if(kv && kv.kernel_lines){
+    out += renderCodeSection('Generated wrapper &mdash; '+esc(kv.file||'kernel.cc'),
+      renderKernelCC(t, ch, focused), false);
+    any = true;
+  }
+  if(b && b.lines){
+    out += renderCodeSection('Buffer address map &mdash; '+esc(b.file||'.bcf'),
+      renderBcf(t, ch, focused), false);
+    any = true;
+  }
+  if(!any)
+    out += '<div class="placeholder">(no code for this tile &mdash; '+
+      esc(t.type)+' tiles carry no kernel; see the Schedule tab for its '+
+      'transfers)</div>';
+  return out;
+}
+function renderCodeFileTabs(t, ch, focused, defaultHtml, hostHtml){
+  const hasKernel = tileHasKernel(t);
+  const kv = hasKernel ? tileKernel(t) : null;
+  const b = hasKernel ? tileBcf(t) : null;
+  const views = [{key:'default', label:'Default', path:'', html:defaultHtml}];
+  if(CAPS.host_lines && hostHtml)
+    views.push({key:'host', label:'host.cc',
+                path:(DATA.source||{}).host_cc||'', html:hostHtml});
+  if((kv && (kv.source || kv.kernel_lines)) || (b && b.lines))
+    views.push({key:'kernel', label:'Kernel files', path:'',
+                html:renderKernelCode(t, ch, focused, true)});
+  const tabs = views.map((v, i) =>
+    '<button type="button" class="subtab codefile-tab'+(i?'':' act')+
+    '" data-codefile="'+v.key+'" title="'+
+    esc(v.path||v.label).replace(/"/g,'&quot;')+'">'+
+    esc(v.label)+'</button>').join('');
+  const bodies = views.map((v, i) =>
+    '<div class="codefile-view'+(i?' hide':'')+'" data-codefile="'+v.key+'">'+
+    v.html+'</div>').join('');
+  return '<div class="subtabs codefile-tabs" role="tablist" '+
+    'aria-label="Code files">'+tabs+'</div>'+bodies;
+}
+const HL_TOK = new RegExp([
+  '(\\/\\*[\\s\\S]*?(?:\\*\\/|$)|\\/\\/.*$)',                        // 1 comment
+  '("(?:[^"\\\\]|\\\\.)*"|\'(?:[^\'\\\\]|\\\\.)*\')',                // 2 string
+  '(^\\s*#\\s*[a-z_]+)',                                             // 3 preproc
+  '\\b(__Runtime_\\w+|XAie_\\w+|__runtime_[a-z_]+|_symbol|_stack|_reserved)\\b',
+  '\\b(alignas|auto|bool|break|case|catch|class|const|constexpr|continue|' +
+    'default|delete|do|else|enum|explicit|extern|false|for|goto|if|inline|' +
+    'namespace|new|nullptr|operator|private|protected|public|register|' +
+    'return|sizeof|static|struct|switch|template|this|throw|true|try|' +
+    'typedef|typename|union|using|virtual|volatile|while)\\b',       // 5 keyword
+  '\\b(char|double|float|int|long|short|signed|unsigned|void|size_t|' +
+    'ptrdiff_t|u?int(?:8|16|32|64)_t)\\b',                           // 6 type
+  '\\b(0[xX][0-9a-fA-F]+|\\d+(?:\\.\\d+)?(?:[uUlLfF]+)?)\\b',        // 7 number
+].join('|'), 'g');
+function hlOpen(code, open){
+  let s = (code == null ? '' : '' + code), pre = '';
+  if(open){
+    const e = s.indexOf('*/');
+    if(e < 0) return {html: '<span class="cm">'+esc(s)+'</span>', open: true};
+    pre = '<span class="cm">'+esc(s.slice(0, e+2))+'</span>';
+    s = s.slice(e+2);
+  }
+  let stillOpen = false;
+  const html = esc(s).replace(HL_TOK, (m, c, str, p, f, k, t, n) => {
+    if(c){
+      if(c.slice(0,2) === '/*' && c.slice(-2) !== '*/') stillOpen = true;
+      return '<span class="cm">' + c + '</span>';
+    }
+    return str ? '<span class="str">' + str + '</span>' :
+           p   ? '<span class="pp">'  + p   + '</span>' :
+           f   ? '<span class="fn">'  + f   + '</span>' :
+           k   ? '<span class="kw">'  + k   + '</span>' :
+           t   ? '<span class="ty">'  + t   + '</span>' :
+           n   ? '<span class="num">' + n   + '</span>' : m;
+  });
+  return {html: pre + html, open: stillOpen};
+}
+function hl(code){ return hlOpen(code, false).html; }
+function hlSeq(){
+  let open = false;
+  return code => { const r = hlOpen(code, open); open = r.open; return r.html; };
 }
 // Reformat a "/* DMA BD Config: k=v, ... */" comment into a friendly multi-line block.
 // Returns the block text (to be placed in a <pre>), or '' when code is not a BD comment.
@@ -3578,7 +3776,8 @@ function setFold(f, h, collapsed){
 // Expand-all/Collapse-all label.
 function wireFolds(box, onChange){
   box.querySelectorAll('.irfold').forEach(f => {
-    const h = box.querySelector('.irhidden[data-fold="'+f.dataset.fold+'"]');
+    const scope = f.closest('.codesec-body') || box;
+    const h = scope.querySelector('.irhidden[data-fold="'+f.dataset.fold+'"]');
     if (!h) return;
     f.onclick = () => {
       setFold(f, h, !h.classList.contains('hide'));   // toggle to opposite state
@@ -4092,8 +4291,8 @@ function tgtRender(targets){
       html += '</table>';
     } else {
       const bodyNote = t.suspended
-        ? 'Stopped — no backtrace available.'
-        : t.pc ? 'Running — backtrace not captured.' : 'No debug info.';
+        ? 'Stopped, no backtrace available.'
+        : t.pc ? 'Running, backtrace not captured.' : 'No debug info.';
       html += '<summary class="tgt-btsummary">Details</summary>'
         + '<div class="tgt-nonote">' + bodyNote + '</div>';
     }
@@ -4116,7 +4315,7 @@ function tgtLlmCtx(t){
   const sc  = tgtStateClass(t);
   const sym = tgtHasSymbols(t) ? 'symbols present' : 'no debug symbols';
   const elf = tgtElfLoaded(t) ? 'ELF loaded' : 'no ELF';
-  let ctx = 'Processor ' + t.name + ' #' + t.id + ' — ' + (t.state || 'unknown') + ', ' + elf + ', ' + sym;
+  let ctx = 'Processor ' + t.name + ' #' + t.id + ': ' + (t.state || 'unknown') + ', ' + elf + ', ' + sym;
   if(t.pc){
     ctx += '; PC ' + t.pc;
     const loc = t.pc_loc;
@@ -4660,7 +4859,8 @@ function srPinTerm(raw){
   srRenderResults();
   if(document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
   if(srSearchTerms.size>0)
-    llmPushCtx('[context] Search: pinned "'+[...srSearchTerms].join('", "')+'"');
+    llmPushCtx('[context] Search: pinned "'+[...srSearchTerms].join('", "')+'"',
+                 'search');
 }
 
 function srRenderChips(){
@@ -4704,7 +4904,7 @@ function srRenderResults(){
       html+='<tr>'
         +'<td><span style="color:'+kc+'">'+esc(h.kind)+'</span></td>'
         +'<td>('+esc(tc)+','+esc(tr)+')</td>'
-        +'<td>'+(h.fi!=null?'f'+h.fi:'—')+'</td>'
+        +'<td>'+(h.fi!=null?'f'+h.fi:'-')+'</td>'
         +'<td style="font-family:monospace;max-width:120px;overflow:hidden;text-overflow:ellipsis">'+esc(h.labelRaw)+'</td>'
         +'<td style="color:var(--tx-lo);font-size:11px">'+esc(h.description)+'</td>'
         +'</tr>';
@@ -5120,7 +5320,7 @@ function buildNetBody(p){
         '<div class="lref">stream-switch connections from routingprovenancemap</div>'+
         swTable+
         (gmioTable?'<div class="kv" style="margin-top:10px"><b>GMIO channel</b>'
-          +' <span class="dimtxt">(DMA engine on shim — data path is MemTile SRAM → NoC → DDR)</span></div>'
+          +' <span class="dimtxt">(DMA engine on shim, data path: MemTile SRAM to NoC to DDR)</span></div>'
           +gmioTable:'')
       +'</div>'+
       '<div id="tab-nd-hops" class="hide">'+
@@ -5502,6 +5702,7 @@ function buildDeviceMap(){
         }
         dmSelKeys.add(key); selOn(key);
         if(match) select(match, gridCell()||g, null, null, true);
+        else setConTargetLoc(tc, tr, null);
       } else {
         // Plain click: clear the selection; clicking the only selected tile deselects.
         const wasOnly = dmSelKeys.size===1 && dmSelKeys.has(key);
@@ -5510,7 +5711,8 @@ function buildDeviceMap(){
         if(wasOnly){ panelRemove(panelKey('tile', tc+','+tr)); return; }
         dmSelKeys.add(key); selOn(key);
         if(match) select(match, gridCell()||g, null, null, false);
-        else panelClearTiles('tile ('+tc+','+tr+') — no schedule info');
+        else { panelClearTiles('tile ('+tc+','+tr+'): no schedule info');
+               setConTargetLoc(tc, tr, null); }
       }
     });
     svg.appendChild(g);
@@ -6050,9 +6252,9 @@ function select(t, el, ch, badgeEl, ctrl){
         (hlv.kernel?'<div class="kv"><b>kernel:</b> '+esc(hlv.kernel)+'</div>':'') +
         '<div class="kv"><b>transfers:</b></div><ul class="sum">'+sum+'</ul>' +
       '</div>' +
+      (kmatch?'<div class="sec"><div class="sec-hdr">Kernel &harr; Channel Arguments</div>'+kmatch+'</div>':'') +
       (balRows.length?'<div class="sec"><div class="sec-hdr">Supply / Demand</div>'+balRows.map(renderFlowBalance).join('')+'</div>':'') +
-      (con?'<div class="sec"><div class="sec-hdr">Contracts</div>'+con+'</div>':'') +
-      (kmatch?'<div class="sec"><div class="sec-hdr">Kernel &harr; Channel Arguments</div>'+kmatch+'</div>':'');
+      (con?'<div class="sec"><div class="sec-hdr">Contracts</div>'+con+'</div>':'');
   }
 
   // --- relevant lines body ---
@@ -6068,36 +6270,59 @@ function select(t, el, ch, badgeEl, ctrl){
   // --- code-piece file (debugcache/code) for the file-frame header + LLM ---
   const codeFile = focused ? (ch.code_file||'') : (t.code_file||'');
   // Core tiles carry a parsed kernel function body; surface its file name.
-  const tkv = tileKernel(t), tbf = tileBcf(t);
-  const ksrc = (t.type==='core' && tkv && tkv.source) ? tkv.source : null;
-  const isCore = !!ksrc;
+  const hasKernel = tileHasKernel(t);
+  const tkv = hasKernel ? tileKernel(t) : null;
+  const tbf = hasKernel ? tileBcf(t) : null;
+  const ksrc = (tkv && tkv.source) ? tkv.source : null;
   // Single "kernel code" sub-tab (core tiles): merges the kernel source
   // (conv2d_spatial.cc), the generated wrapper (kernel.cc) and the buffer
   // address map (.bcf) into one stacked view, each section headed by its file.
-  const kcodeOn = (t.type==='core' &&
+  const kcodeOn = hasKernel &&
     ((tkv && (tkv.source || tkv.kernel_lines)) ||
-     (tbf && tbf.lines)));
+     (tbf && tbf.lines));
   const kfile = ksrc ? ksrc.file : '';
-  const kfileTag = isCore
+  const kfileTag = ksrc
     ? ' <span class="kfileref srcref" data-p="'+esc(ksrc.path||'')+'"'
       +' data-l="'+(ksrc.start_line||'')+'">+ kernel '+esc(kfile)+'</span>' : '';
   const codePathBanner = codeFile
     ? '<div class="codepath"><b>code piece:</b> <span class="cpath srcref" data-p="'+esc(codeFile)+'"'
       +' title="open in the source viewer">'+esc(codeFile)+'</span>'+kfileTag+'</div>'
-    : (isCore
+    : (ksrc
        ? '<div class="codepath"><b>kernel:</b> <span class="cpath srcref" data-p="'
          +esc((ksrc&&ksrc.path)||'')+'" data-l="'+((ksrc&&ksrc.start_line)||'')+'">'
          +esc(kfile)+'</span></div>'
        : '');
 
+  const defaultCodeBody = CAPS.host_lines
+    ? codePathBanner +
+      renderCodeSection('Relevant lines &mdash; '+relLabel, relBody, true) +
+      renderCodeSection('Full block &mdash; host.cc '+
+        (flo.line_start||'?')+'–'+(flo.line_end||'?')+
+        ' ('+(flo.ranges||[]).length+' range(s))'+
+        (focused?' &mdash; '+ch.direction+ch.channel+' scope':''),
+        renderFullBlock(flo.code_lines,
+          focused ? ((ch.low_level||{}).params||null) : null), false) +
+      (kcodeOn ? renderKernelCode(t, ch, focused, false) : '')
+    : renderTileCodeKernelFirst(t, ch, focused, codePathBanner);
+  const hostFileBody = CAPS.host_lines
+    ? codePathBanner +
+      renderCodeSection('host.cc &mdash; '+(focused
+          ? 'channel '+ch.direction+ch.channel : 'tile')+' scope',
+        renderFullBlock(flo.code_lines,
+          focused ? ((ch.low_level||{}).params||null) : null), true)
+    : '';
+  const loBody = renderCodeFileTabs(
+    t, ch, focused, defaultCodeBody, hostFileBody);
+
   const buildTileHtml = () =>
     '<div class="tabs">' +
       '<span class="tab act" data-t="hi">Schedule</span>' +
-      '<span class="tab" data-t="mid">IR</span>' +
+      (CAPS.ir ? '<span class="tab" data-t="mid">IR</span>' : '') +
       '<span class="tab" data-t="lo">Code</span>' +
     '</div>' +
     '<div class="tabbody">' +
       '<div id="tab-hi">' + hiBody + '</div>' +
+      (CAPS.ir ?
       '<div id="tab-mid" class="hide">' +
         '<div class="lref">dfschedule IR (6_BlueprintToSchedule) &mdash; ' +
           (focused ? 'channel '+ch.direction+ch.channel : 'tile') + ' scope</div>' +
@@ -6106,21 +6331,8 @@ function select(t, el, ch, badgeEl, ctrl){
           '<button id="foldAll" class="hide">Expand all</button>' +
         '</div>' +
         '<div id="midContent">' + renderMiddleIR(midIR) + '</div>' +
-      '</div>' +
-      '<div id="tab-lo" class="hide">' +
-        codePathBanner +
-        '<details class="codesec" open><summary>Relevant lines &mdash; '+relLabel+'</summary>' +
-          relBody +
-        '</details>' +
-        '<details class="codesec"><summary>Full block &mdash; host.cc '+
-          (flo.line_start||'?')+'–'+(flo.line_end||'?')+
-          ' ('+(flo.ranges||[]).length+' range(s))'+
-          (focused?' &mdash; '+ch.direction+ch.channel+' scope':'')+
-        '</summary>' +
-          renderFullBlock(flo.code_lines, focused ? ((ch.low_level||{}).params||null) : null) +
-        '</details>' +
-        (kcodeOn ? '<details class="codesec"><summary>Kernel code</summary>'+renderKernelCode(t, ch, focused)+'</details>' : '') +
-      '</div>' +
+      '</div>' : '') +
+      '<div id="tab-lo" class="hide">' + loBody + '</div>' +
     '</div>';
 
   const tileKey = panelKey('tile', t.loc[0]+','+t.loc[1]+(ch?'/'+ch.direction+ch.channel:''));
@@ -6147,25 +6359,33 @@ function select(t, el, ch, badgeEl, ctrl){
     panelActiveKey = tileKey;
   }
   panelSync();
-  // Kernel source "Show all" toggle: swap the isolated param code-piece for the
-  // Wire aiegdb console on click (before panelSync so it runs for the active tile)
-  if (LIVE.connected) setConTarget(t, ch);
+  setConTarget(t, ch);
 }
 
 // Extra DOM wiring for tile body — called by panelRenderBody via item.wireBody(body).
 function wireTileExtra(t, ch, focused, flo, midIR, kcodeOn, body){
-  const kbtn = body.querySelector('.kshowall');
-  if (kbtn) {
-    const kpiece = body.querySelector('#kern-piece');
-    const kfull  = body.querySelector('#kern-full');
+  body.querySelectorAll('.codefile-tab').forEach(tab => {
+    tab.onclick = () => {
+      const key = tab.dataset.codefile;
+      body.querySelectorAll('.codefile-tab').forEach(
+        other => other.classList.toggle('act', other === tab));
+      body.querySelectorAll('.codefile-view').forEach(
+        view => view.classList.toggle('hide', view.dataset.codefile !== key));
+    };
+  });
+  body.querySelectorAll('.kshowall').forEach(kbtn => {
+    const section = kbtn.closest('.codesec-body') || kbtn.parentElement;
+    const kpiece = section.querySelector('.kern-piece');
+    const kfull  = section.querySelector('.kern-full');
+    if (!kfull) return;
     kbtn.onclick = () => {
       const showAll = kfull.classList.contains('hide');
       kfull.classList.toggle('hide', !showAll);
       if (kpiece) kpiece.classList.toggle('hide', showAll);
       kbtn.textContent = showAll ? 'Show piece only' : 'Show all';
     };
-  }
-  const klo = body.querySelector('#lo-kern');
+  });
+  const klo = body.querySelector('#tab-lo');
   if (klo) wireFolds(klo);
 
   const midLines = Array.isArray(midIR)
@@ -6210,8 +6430,10 @@ function wireTileExtra(t, ch, focused, flo, midIR, kcodeOn, body){
   }
 }
 
-// Set LLM context from anywhere; llmSend attaches it to the next message (deduped).
-function llmPushCtx(text){ LLM.ctx = text || null; }
+function llmPushCtx(text, chan){
+  const k = chan || 'session';
+  if (text) LLM.ctx.set(k, text); else LLM.ctx.delete(k);
+}
 
 // Richer tile/channel context: include role, kernel, contract, port.
 function setLLMContext(t, ch, codeFile){
@@ -6219,12 +6441,12 @@ function setLLMContext(t, ch, codeFile){
   const loc = t ? 'tile ('+t.loc[0]+','+t.loc[1]+')' : '';
   const parts = ['[context] Selected: '+loc
     + (ch ? ' channel '+ch.direction+ch.channel : '')
-    + ' — type: '+(t&&t.type||'?')+', role: '+(hl.role||'?')];
+    + ' type: '+(t&&t.type||'?')+', role: '+(hl.role||'?')];
   if (hl.kernel) parts.push('kernel: '+hl.kernel);
   if (ch && ch.contract) parts.push('contract: '+ch.contract);
   if (ch && ch.kernel_port) parts.push('port: '+ch.kernel_port);
   if (codeFile) parts.push('code: '+codeFile);
-  LLM.ctx = parts.join('; ');
+  llmPushCtx(parts.join('; '), 'selection');
 }
 
 // ─── multi-item panel (net + tile tabs) ───────────────────────────────────────
@@ -6317,13 +6539,13 @@ function panelSync(){
 }
 
 function panelUpdateLLM(){
-  if(!panelItems.size){ LLM.ctx=null; return; }
+  if(!panelItems.size){ llmPushCtx(null, 'selection'); return; }
   const parts=[];
   panelItems.forEach((item,key)=>{
     const active = key===panelActiveKey;
     parts.push((active?'[viewing] ':'[also open] ')+item.llmCtx);
   });
-  LLM.ctx = parts.join(' | ');
+  llmPushCtx(parts.join(' | '), 'selection');
 }
 
 // ─── source viewer ────────────────────────────────────────────────────────────
@@ -6360,6 +6582,8 @@ function srcIndex(){
     const sub = DATA[k] || {}; add(sub.path); add((sub.source||{}).path); });
   (DATA.tiles || []).forEach(t => {
     add(t.code_file);
+    ['kernel', 'bcf'].forEach(k => {
+      const sub = t[k] || {}; add(sub.path); add((sub.source || {}).path); });
     (t.dma_channels || []).forEach(c => add(c.code_file)); });
   SRC.idx = idx;
   return idx;
@@ -6598,38 +6822,50 @@ function conBlock(cmd){
   if (!out.querySelector('.con-blk')) out.innerHTML = '';   // drop placeholder
   const blk = document.createElement('div');
   blk.className = 'con-blk';
+  if (cmd){
+    const prev = out.querySelector('.con-blk.cur');
+    if (prev) prev.classList.remove('cur');
+    blk.classList.add('cur');
+  }
   const echo = document.createElement('div');
   echo.className = 'con-echo';
   echo.innerHTML = '<span class="cf">▾</span>' +
                    '<span class="cs">' + esc(CON.scope) + '&gt;</span>' +
                    '<span class="cc">' + esc(cmd) + '</span>';
   echo.onclick = () => {
+    if (blk.classList.contains('cur')) return;
     const folded = blk.classList.toggle('fold');
     echo.querySelector('.cf').textContent = folded ? '▸' : '▾';
   };
   const body = document.createElement('div');
   body.className = 'con-body';
   blk.appendChild(echo); blk.appendChild(body);
-  out.appendChild(blk);
+  const current = out.querySelector('.con-blk.cur');
+  if (cmd || !current) out.insertBefore(blk, out.firstChild);
+  else out.insertBefore(blk, current.nextSibling);
   return body;
 }
-function conScroll(){
+function conReveal(blk){
   const out = document.getElementById('conout');
-  if (out) out.scrollTop = out.scrollHeight;
+  if (!out || !blk) return;
+  out.scrollTop = 0;
 }
-// Only auto-scroll when already near the bottom, so the pane stops yanking the
-// view away while the user is reading scrollback.
-function conNearBottom(){
+function conNewestVisible(){
   const out = document.getElementById('conout');
-  return !out || (out.scrollHeight - out.scrollTop - out.clientHeight) < 60;
+  if (!out) return true;
+  const newest = out.querySelector('.con-blk.cur, .con-blk');
+  if (!newest) return true;
+  const ob = out.getBoundingClientRect(), nb = newest.getBoundingClientRect();
+  return nb.bottom > ob.top && nb.top < ob.bottom;
 }
 // Retained for the few non-command notices ([reloaded aiegdb.py], daemon offline).
 function conAppend(text){
+  const stick = conNewestVisible();
   const body = conBlock('');
   if (!body) return;
   body.parentNode.querySelector('.con-echo').style.display = 'none';
   conRender(body, text);
-  conScroll();
+  if (stick) conReveal(body.parentNode);
 }
 function conSetScope(s){
   CON.scope = s || 'partition';
@@ -6646,21 +6882,22 @@ function conSend(cmd, echo, applyScope){
   // setConTarget probes with an empty command purely to spawn aiegdb and learn
   // the scope — that must not emit an empty block.
   const body = (echo !== false && cmd) ? conBlock(cmd) : null;
-  const stick = conNearBottom();
-  if (body) conScroll();
+  if (body) conReveal(body.parentNode);
+  const dev = deviceSel ? deviceSel.value : '';
   return api('/aiegdb', {method:'POST', headers:{'Content-Type':'application/json'},
-                         body: JSON.stringify({cmd:cmd})})
+                         body: JSON.stringify({cmd:cmd, device:dev})})
     .then(r => {
-      const out = r.output ? r.output.replace(/\n+$/,'') : '';
+      const out = r.output ? r.output.replace(/\n+$/,'')
+                : r.error ? 'ERROR: '+r.error : '';
       if (body){
         if (out) conRender(body, out);
         else { const d = document.createElement('div');
                d.className = 'con-ln con-dim'; d.textContent = '(no output)';
                body.appendChild(d); }
-        if (/^\s*error/im.test(out)) body.parentNode.classList.add('err');
+        if (r.error || /^\s*error/im.test(out)) body.parentNode.classList.add('err');
       } else if (out) conAppend(out);
       if (applyScope !== false && r.scope) conSetScope(r.scope);
-      if (stick) conScroll();
+      if (body) conReveal(body.parentNode);   // else: conAppend already scrolled
     })
     .catch(() => {
       if (body){
@@ -6669,8 +6906,8 @@ function conSend(cmd, echo, applyScope){
         d.textContent = 'daemon offline (static mode)';
         body.appendChild(d);
         body.parentNode.classList.add('err');
+        conReveal(body.parentNode);
       } else conAppend('daemon offline (static mode)');
-      if (stick) conScroll();
     });
 }
 // Tile/channel click: run `target tile c r`, then chain `target channel dir_ch`.
@@ -6681,22 +6918,24 @@ function conSend(cmd, echo, applyScope){
 // response still confirms/refines the scope via r.scope. The optimistic string
 // mirrors aiegdb's prompt format exactly: partition(startcol=N)/tile(c,r)/dir_ch
 // (direction lowercased, matching _parse_dir_ch).
-function setConTarget(t, ch){
+function setConTargetLoc(col, row, ch){
+  if (location.protocol === 'file:') return;   // no daemon, nothing to drive
   const box = document.getElementById('cmdconsole');
   if (box) box.classList.remove('hide');
   const rsp = document.getElementById('rhsplitter');
   if (rsp) rsp.classList.remove('hide');
   const sc = (g.startcol !== null && g.startcol !== undefined) ? g.startcol : 0;
-  let optScope = 'partition(startcol=' + sc + ')/tile(' + t.loc[0] + ',' + t.loc[1] + ')';
+  let optScope = 'partition(startcol=' + sc + ')/tile(' + col + ',' + row + ')';
   if (ch) optScope += '/' + ch.direction.toLowerCase() + ch.channel;
   conSetScope(optScope);
   // For a channel selection, suppress the intermediate tile step's scope apply
   // (applyScope=false) so it can't downgrade the optimistic channel prompt; the
   // chained `target channel` then confirms it. A tile-only click applies scope.
-  const p = conSend('target tile ' + t.loc[0] + ' ' + t.loc[1], undefined, !ch);
+  const p = conSend('target tile ' + col + ' ' + row, undefined, !ch);
   if (ch) p.then(() => conSend('target channel ' +
                                ch.direction.toLowerCase() + ch.channel));
 }
+function setConTarget(t, ch){ setConTargetLoc(t.loc[0], t.loc[1], ch); }
 // ─── autocomplete ────────────────────────────────────────────────────────────
 // Candidates = the current scope's commands plus the universal ones, drawn from
 // COMMAND_SPEC so they can never drift from what aiegdb actually dispatches.
@@ -6753,7 +6992,7 @@ function conDesignValues(cmd, idx, typed){
   if (cmd === 'target tile' || cmd === 'tile'){
     if (idx === 0){
       const cols = [...new Set(tiles.map(t => t.loc[0]))].sort((a, b) => a - b);
-      return cols.map(c => ({ v:String(c), d:'column — ' +
+      return cols.map(c => ({ v:String(c), d:'column ' +
         tiles.filter(t => t.loc[0] === c).length + ' tile(s)' }));
     }
     if (idx === 1){
@@ -6761,7 +7000,7 @@ function conDesignValues(cmd, idx, typed){
       return tiles.filter(t => isNaN(col) || t.loc[0] === col)
         .sort((a, b) => a.loc[1] - b.loc[1])
         .map(t => ({ v:String(t.loc[1]), d:t.type +
-          (t.high_level && t.high_level.role ? ' — ' + t.high_level.role : '') }));
+          (t.high_level && t.high_level.role ? ' ' + t.high_level.role : '') }));
     }
   }
   if (cmd === 'target channel' || cmd === 'channel' || cmd === 'dma'){
@@ -6772,7 +7011,7 @@ function conDesignValues(cmd, idx, typed){
     if (!t) return null;
     return (t.dma_channels || []).map(ch => ({
       v: ch.direction.toLowerCase() + ch.channel,
-      d: 'flow ' + ch.flow_index + (ch.contract ? ' — ' + ch.contract : '') }));
+      d: 'flow ' + ch.flow_index + (ch.contract ? ': ' + ch.contract : '') }));
   }
   return null;
 }
@@ -6831,8 +7070,7 @@ function conSugRender(){
     const row = document.createElement('div');
     row.className = 'con-sug' + (i === SUG.idx && !c.hint ? ' act' : '') +
                     (c.blocking ? ' blocked' : '') + (c.hint ? ' hintrow' : '');
-    if (c.blocking) row.title = 'Live aiedbg view — never exits, so it cannot run '
-                             + 'in this console. Run it in a terminal instead.';
+    if (c.blocking) row.title = 'Live aiedbg view (never exits). Run it in a terminal instead.';
     row.innerHTML =
       '<span class="sname">' + esc(c.name) + '</span>' +
       (c.args ? '<span class="sargs">' + esc(c.args) + '</span>' : '') +
@@ -7025,7 +7263,7 @@ function conPalRender(){
           + 'cannot run in this console.\n'
           + '  Run it in a terminal:  aiedbg -d <device> ' + c.name + '\n'
           + '  For a live view here, use the grid overlay above.');
-        conScroll();
+        if (body) conReveal(body.parentNode);
         return;
       }
       // Commands needing args are staged for editing; complete ones just run.
@@ -7067,16 +7305,6 @@ document.addEventListener('mousedown', e => {
   if (PAL.open && !e.target.closest('#conpal') && !e.target.closest('#conpalbtn'))
     conPalClose();
 });
-document.getElementById('confoldall').onclick = () => {
-  const blks = document.querySelectorAll('#conout .con-blk');
-  // Mixed state folds everything; all-folded unfolds.
-  const anyOpen = [...blks].some(b => !b.classList.contains('fold'));
-  blks.forEach(b => {
-    b.classList.toggle('fold', anyOpen);
-    const cf = b.querySelector('.cf');
-    if (cf) cf.textContent = anyOpen ? '▸' : '▾';
-  });
-};
 document.getElementById('conclear').onclick = () => {
   document.getElementById('conout').innerHTML =
     '<div class="con-ln con-dim">(cleared)</div>';
@@ -7098,8 +7326,9 @@ document.getElementById('conreload').onclick = () => {
 // One persistent `claude -p --output-format stream-json` process in the repo
 // root. Each user turn becomes a .llm-msg-you bubble; streamed reply tokens
 // accumulate into a .llm-msg-ai bubble via llmAppendToMsg.
-const LLM = { off:0, poll:null, busy:false, pendingId:null, ctx:null, ctxSent:null,
-  generation:null };
+const LLM = { off:0, poll:null, busy:false, pendingId:null,
+  ctx:new Map(), ctxSent:new Map(), generation:null };
+const LLM_CTX_ORDER = ['session', 'run', 'search', 'selection'];
 let llmMessages = [];
 let llmMsgIdCtr = 0;
 function llmEscape(s){
@@ -7364,13 +7593,13 @@ function llmAdoptGeneration(r, announce){
   llmStopPoll();
   llmShowThink(false);
   LLM.off = 0;
-  LLM.ctxSent = null;
+  LLM.ctxSent.clear();
   const reason = r.llm_reset_reason || 'the LLM process restarted';
   if (LLM.pendingId){
     llmAppendToMsg(LLM.pendingId, '\n[interrupted: ' + reason + ']', true);
     LLM.pendingId = null;
   } else if (announce !== false){
-    llmAddMsg('ctx', reason + ' — agent context reset');
+    llmAddMsg('ctx', reason + ' (agent context reset)');
   }
   return true;
 }
@@ -7440,10 +7669,20 @@ function llmSend(prompt, fromInput){
   if (!drained.text.trim() && !drained.sent.length) return;
   llmStopPoll();
   let toSend = drained.text;
-  if (LLM.ctx && LLM.ctx !== LLM.ctxSent){
-    toSend = LLM.ctx + '\n' + toSend;
-    LLM.ctxSent = LLM.ctx;
-    llmAddMsg('ctx', llmEscape(LLM.ctx));
+  const fresh = [];
+  const chans = LLM_CTX_ORDER.concat(
+    [...LLM.ctx.keys()].filter(k => LLM_CTX_ORDER.indexOf(k) < 0));
+  chans.forEach(chan => {
+    const text = LLM.ctx.get(chan);
+    if (text && LLM.ctxSent.get(chan) !== text){
+      fresh.push(text);
+      LLM.ctxSent.set(chan, text);
+    }
+  });
+  if (fresh.length){
+    const blob = fresh.join('\n');
+    toSend = blob + '\n' + toSend;
+    llmAddMsg('ctx', llmEscape(blob));
   }
   llmAddSentCtx(drained.sent);
   // The prompt is echoed with pills reduced to [[label]] — showing the expanded
@@ -7474,7 +7713,7 @@ function llmReset(){
     .then(r => {
       if (r && r.auth){ llmLock(); return; }
       if (r && r.llm_generation != null) LLM.generation = r.llm_generation;
-      LLM.ctxSent = null; LLM.off = 0; LLM.pendingId = null;
+      LLM.ctxSent.clear(); LLM.off = 0; LLM.pendingId = null;
       llmMessages = [];
       const list = document.getElementById('llmmsg');
       if (list) list.innerHTML = '';
@@ -7634,7 +7873,8 @@ const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
                // runOwned mirrors the DAEMON's bookkeeping (/runstate), not this
                // page's: a reload or dropped tail must not convince the UI that
                // a live run is over.
-               runOwned:false, daemonRun:null, rsBusy:false, rsTimer:null };
+               runOwned:false, daemonRun:null, rsBusy:false, rsTimer:null,
+               simOnly:false };
 const LSTATE = {
   running:['#4caf50','RUN'], stalled:['#ffca28','STALL'], error:['#ef5350','ERR'],
   completed:['#26a69a','done'], idle:['#546e7a','idle'],
@@ -7772,6 +8012,10 @@ function scanOnce(userInitiated){
   // One-shot scan, always runs (user-triggered). Skips the runActive guard so
   // the user can read core/DMA state even while a run is parked on the board —
   // the same window where 'scan cores' in the aiegdb console works fine.
+  if (deviceSel && deviceSel.value === 'simulator' && !simHasLiveReads()){
+    showSimLiveUnavailable();
+    return;
+  }
   if (LIVE.gridBusy){ if (userInitiated) LIVE.rescan = true; return; }
   LIVE.gridBusy = true;
   LIVE.rescan = false;
@@ -7825,6 +8069,10 @@ function hideConsole(){
   if (tgt) tgt.textContent = 'partition';
 }
 function setLive(on){
+  if (on && deviceSel && deviceSel.value === 'simulator' && !simHasLiveReads()){
+    showSimLiveUnavailable();
+    on = false;
+  }
   LIVE.enabled = on;
   // Both views expose the same poll as a checkbox; keep them mirrored so the
   // one that did not initiate the change does not lie about the poll state.
@@ -7879,7 +8127,7 @@ function setDebugEnabled(on){
 }
 
 // Device selection gates the live controls (item #4/#5). A device must be
-// chosen before the "Live status overlay" checkbox and "Run test" button work;
+// chosen before the "Live status overlay" checkbox and "Run" button work;
 // picking vek385 also reveals the board-hostname text box.
 const deviceSel = document.getElementById('deviceSel');
 const boardHost = document.getElementById('boardHost');
@@ -7888,14 +8136,31 @@ const runbtn = document.getElementById('runbtn');
 const stopbtn = document.getElementById('stopbtn');
 const testconn = document.getElementById('testconn');
 const attachbtn = document.getElementById('attachbtn');
-function setConnStatus(msg){ const e=document.getElementById('connstatus'); if(e) e.textContent=msg; }
+function setConnStatus(msg){
+  const e = document.getElementById('connstatus');
+  if (!e) return;
+  const text = msg || 'Not connected';
+  let state = 'idle';
+  if (/^(connected|attached|simulator activated)/i.test(text)) state = 'connected';
+  else if (/(testing|attaching|starting|setting target|in progress)/i.test(text)) state = 'busy';
+  else if (/(failed|failure|error|offline|no simulator|cannot|enter the|select a)/i.test(text)) state = 'error';
+  e.textContent = text;
+  e.title = text;
+  e.dataset.state = state;
+}
+function updateConnectionPresentation(){
+  const ctrl = document.getElementById('ctrlbar');
+  if (ctrl) ctrl.dataset.connected = LIVE.connected ? 'true' : 'false';
+  if (!testconn) return;
+  const sim = deviceSel && deviceSel.value === 'simulator';
+  testconn.textContent = LIVE.connected
+    ? (sim ? 'Reactivate' : 'Reconnect')
+    : (sim ? 'Activate' : 'Connect');
+}
 // Show/hide the "start hw_server on the target board" hint (shown on failure).
 function setConnHint(show){ const e=document.getElementById('connhint'); if(e) e.classList.toggle('hide', !show); }
 
 // ── run-state reconciliation (UI ⇄ daemon) ───────────────────────────────────
-// Force stop is NOT gated on LIVE.connected: the daemon refuses /ping while a
-// run is live, so "connect first" would be unsatisfiable in the one case where
-// Force stop is the way out.
 function updateRunButtons(){
   const dev = deviceSel ? deviceSel.value : '';
   if (dev === 'simulator') return;    // the /sim/* handlers own those buttons
@@ -7916,11 +8181,9 @@ function renderRunBanner(){
   let s = 'run #' + rs.run_id + (rs.device ? ' on ' + rs.device : '')
         + (rs.started_iso ? ' started ' + rs.started_iso : '')
         + (rs.age_s != null ? ' (' + fmtAge(rs.age_s) + ' ago)' : '')
-        + ' — ' + (rs.status || 'running');
-  if (rs.stale) s += ' — no new output for a while; press "Force stop" to '
-                   + 'release the board';
-  if (LIVE.debugUnlocked) s += ' — aiegdb console unlocked for live debug '
-                             + '(overlay stays off)';
+        + ', ' + (rs.status || 'running');
+  if (rs.stale) s += '; no new output for a while (press "Stop run" to release the board)';
+  if (LIVE.debugUnlocked) s += '; aiegdb console unlocked for live debug (overlay stays off)';
   setRunStatus(s);
 }
 // The simulator half of run-state reconciliation. The page learned a sim
@@ -8001,7 +8264,7 @@ function syncRunState(){
 // arrive asynchronously and the selection is usually already made by then.
 function refreshDeviceStatus(){
   const dev = deviceSel ? deviceSel.value : '';
-  if (!dev){ if (testconn) testconn.disabled = true; setConnStatus(''); return; }
+  if (!dev){ if (testconn) testconn.disabled = true; setConnStatus('Not connected'); return; }
   if (dev !== 'simulator'){
     if (testconn) testconn.disabled = false;
     setConnStatus('click "Connect" to enable live features');
@@ -8014,7 +8277,7 @@ function refreshDeviceStatus(){
     // learn why is to press Run and read an error.
     if (testconn) testconn.disabled = true;
     if (runbtn) runbtn.disabled = true;
-    setConnStatus('no simulator for this app — ' + (sr.reason || 'not built'));
+    setConnStatus('no simulator for this app: ' + (sr.reason || 'not built'));
     return;
   }
   if (testconn) testconn.disabled = false;
@@ -8023,8 +8286,9 @@ function refreshDeviceStatus(){
     if (runbtn) runbtn.disabled = true;
     if (stopbtn) stopbtn.disabled = false;
   }
-  setConnStatus('click "Activate" to use the simulator'
-    + ((sr && sr.note) ? ' — ' + sr.note : ''));
+  setConnStatus((LIVE.simOnly ? 'simulator \u2014 press "Run"'
+                              : 'click "Activate" to use the simulator')
+    + ((sr && sr.note) ? ': ' + sr.note : ''));
 }
 // Selecting a device only enables the "Connect" button. The live overlay
 // checkbox + the drill-down console stay locked until a connection test passes
@@ -8033,6 +8297,7 @@ function updateDeviceUI(){
   const dev = deviceSel ? deviceSel.value : '';
   const has = !!dev;
   LIVE.connected = false;
+  updateConnectionPresentation();
   setLive(false);                              // uncheck overlay + stop poll
   hideConsole();                               // connection invalidated
   if (liveToggle){ liveToggle.disabled = true;
@@ -8045,13 +8310,12 @@ function updateDeviceUI(){
   // adopt — it is started by this UI or not at all.
   if (attachbtn) attachbtn.disabled = !has || dev === 'simulator';
   if (boardHost) boardHost.classList.toggle('hide', !has || dev === 'pal' || dev === 'simulator');
-  // For simulator, "Activate" label skips JTAG; for hardware, "Connect".
-  if (testconn) testconn.textContent = (dev === 'simulator') ? 'Activate' : 'Connect';
+  updateLiveReadControls();
   refreshDeviceStatus();
   setConnHint(false);
   if(deviceSel&&has){
     const opt=deviceSel.options[deviceSel.selectedIndex];
-    llmPushCtx('[context] Device selected: '+(opt?opt.text:dev));
+    llmPushCtx('[context] Device selected: '+(opt?opt.text:dev), 'session');
   }
 }
 if (deviceSel) deviceSel.onchange = updateDeviceUI;
@@ -8059,13 +8323,13 @@ if (deviceSel) deviceSel.onchange = updateDeviceUI;
 // "click Connect" state so stale LIVE.connected doesn't let a Run start
 // against a host the user just changed.
 if (boardHost) boardHost.oninput = updateDeviceUI;
-// Apply a successful connection: unlock Run test / Force stop / overlay and
-// reveal the aiegdb console. Shared by the direct test and the auto-launch path.
 function applyConnected(r){
   LIVE.connected = true;
-  updateRunButtons();                     // unlock Run test now
+  updateConnectionPresentation();
+  updateRunButtons();                     // unlock Run now
   if (liveToggle){ liveToggle.disabled = false;
     liveToggle.closest('label').classList.remove('disabled'); }
+  updateLiveReadControls();
   const box = document.getElementById('cmdconsole');
   if (box) box.classList.remove('hide');   // reveal the aiegdb console
   const rsp = document.getElementById('rhsplitter');
@@ -8083,7 +8347,7 @@ function applyConnected(r){
         llmAdoptGeneration(sr);
         setConnStatus('connected \u2014 ' + (sr.target || ((r && r.detail) || 'ok')));
         llmPushCtx('[context] Connected to '+(LIVE.host||LIVE.device)
-          +' \u2014 AIEDBG_TARGET: '+(sr.target||'unknown'));
+          +' \u2014 AIEDBG_TARGET: '+(sr.target||'unknown'), 'session');
         conSend('', false);   // spawn aiegdb with the new target; shows scope
       } else {
         setConnStatus('target switch failed: ' + ((sr && sr.detail) || 'unknown'));
@@ -8095,10 +8359,10 @@ function applyConnected(r){
       conSend('', false);
     });
 }
-// Mark disconnected: re-gray Run test / Force stop / overlay and hide console.
 function markDisconnected(){
   LIVE.connected = false;
-  updateRunButtons();                      // keep Run test gray
+  updateConnectionPresentation();
+  updateRunButtons();                      // keep Run gray
   if (liveToggle) liveToggle.disabled = true;
   hideConsole();
 }
@@ -8139,6 +8403,13 @@ function autoLaunchHwServer(dev, host, why){
       setConnHint(true);
     });
 }
+const LOG_FOLLOW_FRAC = 0.5, LOG_FOLLOW_MIN = 160;
+function logFollowing(el){
+  if (!el) return true;
+  const slack = Math.max(LOG_FOLLOW_MIN, el.clientHeight * LOG_FOLLOW_FRAC);
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) <= slack;
+}
+function logFollow(el, was){ if (el && was) el.scrollTop = el.scrollHeight; }
 // Tail the daemon's hw_server launch session into #console and, once the
 // background worker is done, apply the connect result (single-retry outcome).
 function pollHwSrv(){
@@ -8147,9 +8418,9 @@ function pollHwSrv(){
   api('/hwsrv_log?offset='+LIVE.hwsrvOff).then(r => {
     const con = document.getElementById('console');
     if (con){
-      const atBottom = (con.scrollHeight - con.scrollTop - con.clientHeight) < 4;
+      const follow = logFollowing(con);
       if (r.data){ con.textContent += r.data; }
-      if (atBottom) con.scrollTop = con.scrollHeight;
+      logFollow(con, follow);
     }
     if (r.next != null) LIVE.hwsrvOff = r.next;
     setConnStatus('hw_server: ' + (r.status || 'starting') + '\u2026');
@@ -8157,11 +8428,8 @@ function pollHwSrv(){
       if (LIVE.hwsrvTimer){ clearInterval(LIVE.hwsrvTimer); LIVE.hwsrvTimer=null; }
       if (r.ok){ applyConnected(r); }    // connected on the single retry
       else {
-        // Final retry still failed. Re-gray Run test / Force stop, but KEEP the
-        // console visible (don't call markDisconnected -> hideConsole) so the
-        // user still sees the launch steps, and append the original
-        // "connection failed -> start hw_server manually" guidance in place.
         LIVE.connected = false;
+        updateConnectionPresentation();
         updateRunButtons();
         if (liveToggle) liveToggle.disabled = true;
         if (con){
@@ -8199,7 +8467,7 @@ function testConnect(){
     api('/sim/status').then(ss => {
       if (ss && ss.kind) SIM.kind = ss.kind;
       if (ss && ss.available === false){
-        setConnStatus('no simulator for this app — ' + (ss.reason || 'not built'));
+        setConnStatus('no simulator for this app: ' + (ss.reason || 'not built'));
         return;
       }
       if (ss && ss.ipc_ready){
@@ -8208,6 +8476,7 @@ function testConnect(){
       }
       // Not ready (or never will be) — still unlock Run and reveal the console.
       LIVE.connected = true;
+      updateConnectionPresentation();
       if (runbtn) runbtn.disabled = !!SIM.owned;
       if (stopbtn) stopbtn.disabled = !SIM.owned;
       const box = document.getElementById('cmdconsole');
@@ -8217,18 +8486,26 @@ function testConnect(){
       if (simHasLiveReads()){
         if (liveToggle){ liveToggle.disabled = false;
           liveToggle.closest('label').classList.remove('disabled'); }
-        setConnStatus('simulator activated — run it to enable live grid reads');
+        setConnStatus(LIVE.simOnly
+          ? 'simulator ready'
+          : 'simulator activated; run it to enable live grid reads');
       } else {
         // aiesim exposes no debug socket, so the overlay stays locked. Saying
         // "run it to enable live grid reads" here promised something the
         // backend can never deliver, and left the user waiting for it.
         if (liveToggle){ liveToggle.disabled = true;
           liveToggle.closest('label').classList.add('disabled'); }
-        setConnStatus('simulator activated (aiesim) — console output only; '
-                    + 'this backend has no debug socket, so no live grid reads');
+        updateLiveReadControls();
+        setConnStatus(LIVE.simOnly
+          ? 'simulator ready \u2014 no live register access'
+          : 'aiesim activated \u2014 no live register access');
+        conAppend('aiesim has no debug socket: DMA/Cores/Events scans and '
+          +'aiedbg register commands are unavailable. aiegdb navigation and '
+          +'help commands still work.');
       }
     }).catch(() => {
       LIVE.connected = true;
+      updateConnectionPresentation();
       if (runbtn) runbtn.disabled = false;
       if (liveToggle){ liveToggle.disabled = false;
         liveToggle.closest('label').classList.remove('disabled'); }
@@ -8250,8 +8527,7 @@ function testConnect(){
       // A live run holds the link; the link is not dead. Auto-starting
       // hw_server would reset a working service and refuse again anyway.
       applyRunState(r.run);
-      setConnStatus('a board run is still in progress — press "Force stop", '
-                  + 'then Connect again');
+      setConnStatus('a board run is still in progress; press "Stop run" then Connect again');
       setConnHint(false);
     } else {
       // Daemon answered but the JTAG connect failed → try to auto-start
@@ -8268,10 +8544,6 @@ function testConnect(){
 }
 if (testconn) testconn.onclick = testConnect;
 
-// "Open Current Session": adopt a run the user started outside this UI (CLI, or
-// a board already programmed). Same link probe as Connect, but the daemon
-// records mode=attached — it did not start this run and cannot vouch for what
-// the board did beforehand, and the LLM is told exactly that.
 function attachSession(){
   const dev  = deviceSel ? deviceSel.value : '';
   const host = boardHost ? boardHost.value.trim() : '';
@@ -8283,12 +8555,12 @@ function attachSession(){
     .then(r => {
       if (r && r.ok){
         applyConnected(r);
-        setConnStatus('attached to existing session — board state predates this UI');
+        setConnStatus('attached to existing session; board state predates this UI');
         llmPushCtx('[context] User attached to a board session started outside the UI; '
-                 + 'prior board history is unknown to the daemon.');
+                 + 'prior board history is unknown to the daemon.', 'session');
       } else if (r && r.busy){
         applyRunState(r.run);
-        setConnStatus('this UI is already running a test — press "Force stop" first');
+        setConnStatus('this UI is already running a test; press "Stop run" first');
         setConnHint(false);
       } else {
         markDisconnected();
@@ -8323,7 +8595,7 @@ function setOverlayWhat(w){
 function pickOverlayWhat(w, setMsg){
   setOverlayWhat(w);
   if (!LIVE.connected){
-    setMsg('not connected — use Connect in the debug panel below', true);
+    setMsg('not connected; use Connect in the debug panel below', true);
     return;
   }
   if (LIVE.enabled) scanOnce(true);
@@ -8339,8 +8611,13 @@ document.querySelectorAll('#overlaytabs .ltab').forEach(tab => tab.onclick = () 
 document.querySelectorAll('#dmScanWhat .ltab').forEach(tab => tab.onclick = () =>
   pickOverlayWhat(tab.dataset.w, dmSetScanStatus));
 function runScanNow(setMsg){
+  if (deviceSel && deviceSel.value === 'simulator' && !simHasLiveReads()){
+    setMsg(simLiveUnavailableText(), true);
+    updateLiveReadControls();
+    return;
+  }
   if (!LIVE.connected){
-    setMsg('not connected — use Connect in the debug panel below', true);
+    setMsg('not connected; use Connect in the debug panel below', true);
     return;
   }
   setMsg('scanning '+LIVE.what+'…');
@@ -8357,7 +8634,7 @@ function runScanNow(setMsg){
   if (live) live.onchange = e => {
     if (e.target.checked && !LIVE.connected){
       e.target.checked = false;
-      dmSetScanStatus('not connected — use Connect in the debug panel below', true);
+      dmSetScanStatus('not connected; use Connect in the debug panel below', true);
       return;
     }
     setLive(e.target.checked);
@@ -8370,10 +8647,10 @@ function pollLog(){
   LIVE.logBusy = true;
   api('/applog?offset='+LIVE.logoff).then(r => {
     const con = document.getElementById('console');
-    const atBottom = (con.scrollHeight - con.scrollTop - con.clientHeight) < 4;
+    const follow = logFollowing(con);
     if (r.data){ con.textContent += r.data; }
     if (r.next != null) LIVE.logoff = r.next;
-    if (atBottom) con.scrollTop = con.scrollHeight;
+    logFollow(con, follow);
     if (LIVE.runOwned && LIVE.daemonRun){
       LIVE.daemonRun.status = r.status;
       LIVE.daemonRun.stale = (r.status === 'hang');
@@ -8430,7 +8707,7 @@ document.getElementById('runbtn').onclick = () => {
                                : '[console output only \u2014 this backend has no '
                                  + 'debug socket]\n')
           + (r.engine_log ? '[simulator engine log: ' + r.engine_log + ']\n' : '');
-        llmPushCtx('[context] Simulator run started (' + (r.sim_kind||'?') + ')');
+        llmPushCtx('[context] Simulator run started (' + (r.sim_kind||'?') + ')', 'run');
         SIM.ipcReady = false;
         if (SIM.timer) clearInterval(SIM.timer);
         SIM.timer = setInterval(pollSimLog, 1000);
@@ -8452,7 +8729,6 @@ document.getElementById('runbtn').onclick = () => {
     .then(r => {
       // Run didn't actually start → re-enable debug (no pollLog will run).
       // A refusal usually means an earlier run is still held; adopt its state
-      // so Force stop lights up.
       if (r.error){ con.textContent = 'run error: ' + r.error;
         setDebugEnabled(true);
         if (r.run) applyRunState(r.run); else syncRunState();
@@ -8463,7 +8739,7 @@ document.getElementById('runbtn').onclick = () => {
                         started_iso:'', age_s:null, stale:false};
       updateRunButtons();
       con.textContent = '[run ' + r.run_id + ' started \u2192 ' + (r.applog||'applog') + ']\n';
-      llmPushCtx('[context] Hardware run '+r.run_id+' started on '+dev);
+      llmPushCtx('[context] Hardware run '+r.run_id+' started on '+dev, 'run');
       if (LIVE.conTimer) clearInterval(LIVE.conTimer);
       LIVE.conTimer = setInterval(pollLog, 1000);
     })
@@ -8501,8 +8777,8 @@ document.getElementById('stopbtn').onclick = () => {
       if (r.error){ setStatus('stop: ' + r.error); }
       else if (r.abandoned){
         // #livestatus is hidden in Device Map view, so use the banner too.
-        const msg = 'run ' + r.run_id + ' (pid ' + r.pid + ') survived SIGKILL — '
-                  + 'the daemon released it, but it may still hold the board';
+        const msg = 'run ' + r.run_id + ' (pid ' + r.pid + ') survived SIGKILL; '
+                  + 'the daemon released it but it may still hold the board';
         setStatus(msg); setRunStatus(msg);
       } else {
         setStatus('run: stopped (pid ' + r.pid + ')');
@@ -8526,7 +8802,42 @@ const SIM = { timer: null, logoff: 0, logBusy: false, ipcReady: false,
 const DEVINFO = {};
 function simRow(){ return DEVINFO['simulator'] || null; }
 // aiesim has no debug socket and never will; only the IPC flow unlocks reads.
-function simHasLiveReads(){ return (SIM.kind || (simRow()||{}).sim_kind) === 'ipc'; }
+function simHasLiveReads(){
+  const row = simRow() || {};
+  if (row.live_reads !== undefined) return !!row.live_reads;
+  return (SIM.kind || row.sim_kind) === 'ipc';
+}
+function simLiveUnavailableText(){
+  return 'live scans unavailable: aiesim exposes no debug socket';
+}
+function showSimLiveUnavailable(){
+  const msg = simLiveUnavailableText();
+  setStatus(msg);
+  dmSetScanStatus(msg, true);
+}
+function updateLiveReadControls(){
+  const blocked = !!(deviceSel && deviceSel.value === 'simulator'
+    && !simHasLiveReads());
+  ['gridScanBtn','dmScanBtn'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.disabled = blocked;
+    el.title = blocked
+      ? 'Unavailable: aiesim (aie2pssimmsm) has no live register transport'
+      : 'read live status from the board / simulator';
+  });
+  ['liveToggle','dmLiveToggle'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (blocked) el.checked = false;
+    el.disabled = blocked || !LIVE.connected;
+    const label = el.closest('label');
+    if (label) label.classList.toggle('disabled', el.disabled);
+  });
+  const name = document.querySelector('#conhdr .chname');
+  if (name) name.textContent = blocked ? 'aiegdb (navigation only)' : 'aiegdb';
+  if (blocked) showSimLiveUnavailable();
+}
 function pollSimLog(){
   if (SIM.logBusy) return;
   SIM.logBusy = true;
@@ -8536,7 +8847,7 @@ function pollSimLog(){
     api('/sim/log?offset='+SIM.logoff),
     api('/sim/applog?offset='+SIM.applogoff).catch(() => ({data:'',next:SIM.applogoff,running:false}))
   ]).then(([r, ra]) => {
-    const atBottom = con ? (con.scrollHeight - con.scrollTop - con.clientHeight) < 4 : true;
+    const follow = logFollowing(con);
     if (r.kind) SIM.kind = r.kind;
     if (r.data && con){ con.textContent += r.data; }
     if (r.next != null) SIM.logoff = r.next;
@@ -8549,7 +8860,7 @@ function pollSimLog(){
       con.textContent += ra.data;
     }
     if (ra.next != null) SIM.applogoff = ra.next;
-    if (atBottom && con) con.scrollTop = con.scrollHeight;
+    logFollow(con, follow);
     // Enable live grid reads once the IPC debug socket is ready.
     if (r.ipc_ready && !SIM.ipcReady){
       SIM.ipcReady = true;
@@ -8558,8 +8869,12 @@ function pollSimLog(){
         liveToggle.closest('label').classList.remove('disabled'); }
       setConnStatus('simulator IPC ready \u2014 live grid reads active');
     }
-    setStatus('sim: ' + (r.running ? 'running' : 'stopped')
-            + (SIM.kind ? ' (' + SIM.kind + ')' : ''));
+    if (simHasLiveReads())
+      setStatus('sim: ' + (r.running ? 'running' : 'stopped')
+              + (SIM.kind ? ' (' + SIM.kind + ')' : ''));
+    else
+      setStatus('sim: ' + (r.running ? 'running' : 'stopped')
+              + ' \u2014 live scans unavailable');
     SIM.owned = !!r.running;
     if (!r.running){
       if (SIM.timer){ clearInterval(SIM.timer); SIM.timer = null; }
@@ -8584,6 +8899,7 @@ function loadDevices(){
     });
     const sr = simRow();
     if (sr && sr.sim_kind) SIM.kind = sr.sim_kind;
+    updateLiveReadControls();
     // The labels just changed under whatever is already selected; re-derive the
     // status line so a picked-but-unbuildable simulator says why straight away.
     if (deviceSel.value) refreshDeviceStatus();
@@ -8674,13 +8990,18 @@ function _makeSplitter(spId, bodyCls, onStart, onMove){
 function applyBoardDefaults(){
   api('/config').then(c => {
     if (!c || c.error) return;
-    if (c.device && deviceSel){
+    LIVE.simOnly = !!c.sim_only;
+    const bar = document.getElementById('ctrlbar');
+    if (bar) bar.dataset.simonly = LIVE.simOnly ? 'true' : 'false';
+    if (LIVE.simOnly && deviceSel) deviceSel.value = 'simulator';
+    else if (c.device && deviceSel){
       const has = Array.from(deviceSel.options).some(o => o.value === c.device);
       if (has) deviceSel.value = c.device;
     }
     if (c.board_host && boardHost) boardHost.value = c.board_host;
     if (c.source_viewer === false) SRC.on = false;
     updateDeviceUI();   // reveal/enable controls for the preselected device
+    if (LIVE.simOnly) testConnect();
   }).catch(() => {});
 }
 if (location.protocol === 'http:' || location.protocol === 'https:') {
@@ -8689,7 +9010,7 @@ if (location.protocol === 'http:' || location.protocol === 'https:') {
   syncRunState();
   LIVE.rsTimer = setInterval(syncRunState, 5000);
 } else {
-  setStatus('static mode — open via schedule_debug_server.py for live status');
+  setStatus('static mode; open via schedule_debug_server.py for live status');
   updateDeviceUI();
 }
 
@@ -8703,12 +9024,23 @@ function setAppMsg(msg, isErr){
   const info = document.getElementById('appinfo');
   if (!info) return;
   info.textContent = msg;
+  info.title = msg;
   info.style.color = isErr ? 'var(--red-fg)' : 'var(--tx-lo)';
   info.dataset.err = isErr ? '1' : '';
 }
 function loadApps(){
   api('/apps').then(r => {
     if (!r || !r.apps || !appSel) return;
+    const one = r.apps.length <= 1;
+    const bar = document.getElementById('ctrlbar');
+    if (bar) bar.dataset.apps = one ? 'one' : 'many';
+    const badge = document.getElementById('appbadge');
+    const cur = r.apps.find(a => a.current) || r.apps[0];
+    if (cur) document.title = 'AIE Debug — ' + cur.label;
+    if (badge){
+      badge.classList.toggle('hide', !(one && cur));
+      if (cur){ badge.textContent = cur.label; badge.title = cur.path; }
+    }
     appSel.innerHTML = '';
     r.apps.forEach(a => {
       const o = document.createElement('option');
@@ -8717,7 +9049,10 @@ function loadApps(){
       if (a.current) { o.selected = true;
         const info = document.getElementById('appinfo');
         // Keep a visible error: loadApps() is called by the failure path itself.
-        if (info && !info.dataset.err) info.textContent = a.path;
+        if (info && !info.dataset.err){
+          info.textContent = a.path;
+          info.title = a.path;
+        }
       }
       appSel.appendChild(o);
     });
@@ -8735,7 +9070,7 @@ if (appSel) appSel.onchange = () => {
       if (r && r.error) { setAppMsg(r.error, true); loadApps(); return; }
       setAppMsg('');
       location.reload();
-    }).catch(() => setAppMsg('daemon offline — cannot switch apps', true));
+    }).catch(() => setAppMsg('daemon offline; cannot switch apps', true));
 };
 
 // ── UI state reporting ───────────────────────────────────────────────────────

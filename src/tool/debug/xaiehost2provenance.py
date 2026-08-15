@@ -6,7 +6,7 @@ calls in a generated aout/host.cc and emits the dfscheduleprovenancemap.json +
 dmaphopprovenacemap.json schema consumed by schedule_view.py. Runtime-decided
 BD/lock/port values are NOT statically visible and are emitted as placeholders.
 """
-import argparse, json, os, re, sys
+import argparse, json, os, re, shutil, sys
 
 
 _SIZEOF = {"u32": 4, "uint32_t": 4, "int32_t": 4, "int": 4, "float": 4,
@@ -230,7 +230,48 @@ def placeholder_bd(length):
             "release_lock": [{"id": -1, "val": 0}]}
 
 
-def build_dfschedule(model, aie_gen):
+def _kernel_name(symbol):
+    match = re.fullmatch(r"_binary_kernel_(.+)_start", symbol or "")
+    return match.group(1) if match else symbol
+
+
+def collect_kernel_artifacts(model, artifacts_dir, out_dir):
+    found = {}
+    if not artifacts_dir:
+        return found
+    for loc, symbol in model["kernel_placements"].items():
+        name = _kernel_name(symbol)
+        if not name:
+            continue
+        sources = {
+            "source": os.path.join(artifacts_dir, "%s.cc" % name),
+            "kernel_cc": os.path.join(
+                artifacts_dir, "kernelcfg", name, "wrapper.cc"),
+            "bcf": os.path.join(
+                artifacts_dir, "kernelcfg", name, "aieml.bcf"),
+            "dm_offsets": os.path.join(
+                artifacts_dir, "kernelcfg", name, "dm_offsets.h"),
+        }
+        rels = {
+            "source": "%s.cc" % name,
+            "kernel_cc": os.path.join("kernelcfg", name, "wrapper.cc"),
+            "bcf": os.path.join("kernelcfg", name, "aieml.bcf"),
+            "dm_offsets": os.path.join("kernelcfg", name, "dm_offsets.h"),
+        }
+        copied = {}
+        for kind, source in sources.items():
+            if not os.path.isfile(source):
+                continue
+            dest = os.path.join(out_dir, rels[kind])
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(source, dest)
+            copied[kind] = rels[kind]
+        if copied:
+            found[loc] = copied
+    return found
+
+
+def build_dfschedule(model, aie_gen, tile_artifacts=None):
     tiles_out, ch_counter = [], {}
     for t in model["tiles"]:
         key = (t["col"], t["row"])
@@ -246,8 +287,14 @@ def build_dfschedule(model, aie_gen):
                           "enable_out_of_order": False, "flow_index": fi,
                           "bd_chain": [placeholder_bd(f["len"])],
                           "start_io": [{"repeat_count": 1}]})
-        tiles_out.append({"col": t["col"], "row": t["row"], "type": t["type"],
-                          "dma_channels": chans})
+        tile = {"col": t["col"], "row": t["row"], "type": t["type"],
+                "dma_channels": chans}
+        artifact = (tile_artifacts or {}).get(key, {})
+        if artifact.get("kernel_cc"):
+            tile["kernel_cc"] = artifact["kernel_cc"]
+        if artifact.get("bcf"):
+            tile["bcf"] = artifact["bcf"]
+        tiles_out.append(tile)
     kernel_cfgs, kg_tiles = [], []
     for (c, r), name in model["kernel_placements"].items():
         kernel_cfgs.append({"sym_name": name, "flow_index": 0, "packet_id": 0,
@@ -305,6 +352,7 @@ def main(argv=None):
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--aie-version", type=int, required=True)
     ap.add_argument("--platform", default="baremetal")
+    ap.add_argument("--artifacts-dir")
     a = ap.parse_args(argv)
     with open(a.host_cc) as f:
         raw = f.read()
@@ -313,8 +361,9 @@ def main(argv=None):
         print("[xaiehost2provenance] no XAie routing found - skipping provenance")
         return 0
     os.makedirs(a.out_dir, exist_ok=True)
+    artifacts = collect_kernel_artifacts(model, a.artifacts_dir, a.out_dir)
     with open(os.path.join(a.out_dir, "dfscheduleprovenancemap.json"), "w") as f:
-        json.dump(build_dfschedule(model, a.aie_version), f, indent=2)
+        json.dump(build_dfschedule(model, a.aie_version, artifacts), f, indent=2)
     with open(os.path.join(a.out_dir, "dmaphopprovenacemap.json"), "w") as f:
         json.dump(build_dmaphop(model), f, indent=2)
     print("[xaiehost2provenance] wrote provenance to %s" % a.out_dir)
