@@ -417,6 +417,41 @@ void __Runtime_core_perf_read_probe(uint32_t *active, uint32_t *vec_instr, uint3
 void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 
 // ---------------------------------------------------------------------------
+// Core event trace: capture an ACTIVE/stall timeline from a core tile and drain
+// it DOWN through the intervening core tiles into the same-column top MemTile's
+// memory via a circuit-switched TRACE -> (SOUTH/NORTH hops) -> S2MM DMA path.
+// The MemTile's larger memory (512 KB on AIE2PS) lets the trace run deep without
+// stealing core data memory.
+// ---------------------------------------------------------------------------
+
+// Configure the core trace unit on `tile`: capture window ACTIVE_CORE..
+// DISABLED_CORE, EVENT_TIME mode (delta-cycle timestamps), trace slots 0..3 =
+// ACTIVE / LOCK_STALL / STREAM_STALL / MEMORY_STALL, then route the TRACE stream
+// down to the top MemTile in the same column and land it via the MemTile's S2MM
+// channel `s2mm_ch` into [buf_addr, buf_addr+buf_len) of MemTile memory.
+//   strm_ch  physical stream channel (0..3) used for every SOUTH/NORTH hop from
+//            the core down to the MemTile; caller must ensure it is free.
+//   s2mm_ch  the MemTile's S2MM DMA channel the trace drains into.
+//   buf_addr/buf_len are bytes into MemTile memory; buf_addr is the DMA-view
+//            address (same value __Runtime_core_trace_read passes to
+//            XAie_DataMemBlockRead for the MemTile loc).
+// Call BEFORE enabling the core; the caller must reserve the MemTile buffer
+// region and the strm_ch/s2mm_ch so they do not clash with data traffic.
+AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t buf_len,
+                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum = 0);
+
+// Read raw trace words back from the MemTile buffer. Pass the MemTile loc (the
+// same-column top MemTile, row XAIE_AIE_TILE_ROW_START-1) and buf_addr used in
+// setup. Call AFTER the core has disabled (XAie_CoreWaitForDone +
+// XAie_CoreDisable) so the trace is flushed. Loc-generic: XAie_DataMemBlockRead
+// dispatches on tile type, so a MemTile loc reads MemTile memory.
+AieRC __Runtime_core_trace_read(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t *dst,
+                                uint32_t len_words);
+
+// Decode+print the ACTIVE/*_STALL timeline from raw trace words (host-side).
+void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords);
+
+// ---------------------------------------------------------------------------
 // DMA-capable buffer allocation with cache sync support
 // ---------------------------------------------------------------------------
 

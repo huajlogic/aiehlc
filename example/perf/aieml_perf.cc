@@ -62,6 +62,34 @@
 #define CORE_OP_MEM 0x6000
 #endif
 
+// Core event trace capture buffer, in the same-column top MemTile's memory
+// (not tile (4,4)'s own data mem). The trace stream is routed DOWN from the core
+// through the intervening core tiles into the MemTile's S2MM DMA, so the deep
+// trace no longer steals space from the kernel's own data regions.
+#define TRC_ADDR 0x8000u
+#define TRC_LEN 0x1000u /* 4 KB of raw trace words, in MemTile memory */
+
+// Master switch for the core event-trace flow. The trace unit is routed down
+// into the MemTile's S2MM DMA channel (see TRC_S2MM_CH below). Set to 0 to fully
+// compile out trace setup/read and isolate whether the hang is trace-induced;
+// set to 1 to re-enable.
+#define TRACE_ENABLE 1
+// Physical stream channel used for every hop of the core->MemTile trace route
+// (core SOUTH-master / NORTH-slave and MemTile NORTH-slave port range is 0..3).
+#define TRC_STRM_CH 1
+// S2MM DMA channel the trace stream drains into on the MemTile. MemTile DMA
+// couples channel parity to the BD number: an EVEN channel requires BD < 24, an
+// odd channel requires BD >= 24 (driver _XAieMl_MemTileDmaCheckBdChValidity).
+// The setup call below uses BD 4, so this must be an even channel. On the
+// MemTile there is no clash with the movedata channel (that is on the core tile).
+#define TRC_S2MM_CH 0
+
+// Core trace API from src/mlir/runtime/aie_runtime.c (linked into this host by
+// aiehlc.sh's RUNTIME_SRCS). Pulled in via the runtime header, which is on the
+// host compile include path (-I src/mlir/runtime). aie_runtime.h's guarded
+// <aie_codegen_inc/xaie_routing.h> include is skipped because xaiengine.h above
+// already defined XAIE_ROUTING_H.
+#include "aie_runtime.h"
 // Reduced for simulator
 // #define N 16
 #define N 4
@@ -121,7 +149,7 @@ int test_routing(XAie_DevInst *DevInst)
 #ifndef __AIESIM__
     XTime tStart, tEnd;
 #endif
-    printf("Starting test_routing 02/2 -1\n");
+    printf("Starting test_routing 08/14 -2\n");
     breakprint("core reset--");
 #ifdef __AIESIM__
     int shimcol = 3;
@@ -156,6 +184,22 @@ int test_routing(XAie_DevInst *DevInst)
     }
 
     const int count = 2; // iterations for perf measurement
+    printf("before runtimerace\n");
+
+    // Arm the core trace unit on tile (4,4) BEFORE the core runs: capture the
+    // ACTIVE/stall timeline and route it DOWN through the intervening core tiles
+    // into the same-column top MemTile's memory [TRC_ADDR, TRC_ADDR+TRC_LEN) via
+    // stream channel TRC_STRM_CH and the MemTile's S2MM channel TRC_S2MM_CH. Must
+    // precede XAie_Run (which makes the core active and fires ACTIVE_CORE, opening
+    // the trace window).
+#if TRACE_ENABLE
+    if (__Runtime_core_trace_setup(DevInst, XAie_TileLoc(4, 4), TRC_ADDR, TRC_LEN, /*strm_ch=*/TRC_STRM_CH,
+                                   /*s2mm_ch=*/TRC_S2MM_CH, 4) != XAIE_OK) {
+        printf("[perf] core_trace_setup failed\n");
+    }
+#endif
+
+    printf("after runtimerace\n");
 
 #ifndef __AIESIM__
     XTime_GetTime(&tStart);
@@ -172,6 +216,8 @@ int test_routing(XAie_DevInst *DevInst)
 
         XAie_MemSyncForDev(in);
 
+        printf("after XAie_MemSyncForDev\n");
+
         breakprint("Starting to Move data\n");
         // step 3: move data to destination tile
         // XTime_GetTime(&tStart);
@@ -181,7 +227,7 @@ int test_routing(XAie_DevInst *DevInst)
                                   CORE_IP_MEM, /*dest=*/XAie_TileLoc(4, 4));
         XAie_RouteDmaWait(routingInstance, XAie_TileLoc(shimcol, 0), XAie_TileLoc(4, 4), true);
         XAie_Run(routingInstance, 1);
-
+        printf("XAie_Run\n");
 #ifdef __AIESIM__
         while (XAie_CoreWaitForDone(DevInst, XAie_TileLoc(4, 4), 1) != XAIE_OK) {
         }
@@ -190,6 +236,7 @@ int test_routing(XAie_DevInst *DevInst)
 #endif
 
         breakprint("fflush\n");
+        printf("after XAie_CoreWaitForDone\n");
 
 #ifndef __AIESIM__
         Xil_DCacheFlushRange((INTPTR)vmem_out, mlen * sizeof(int32_t));
@@ -217,6 +264,7 @@ int test_routing(XAie_DevInst *DevInst)
         int32_t B_mat[N][N];  // Matrix B
         int32_t result[N][N] = {0};  // Result matrix
 
+        printf("after Xil_DCacheInvalidateRange\n");
         // Extract matrix A (row major)
         for (int i = 0; i < N; i++) {
             for (int j = 0; j < N; j++) {
@@ -264,6 +312,24 @@ int test_routing(XAie_DevInst *DevInst)
         fflush(stdout);
         //*/
     }
+
+    // Core finished: read back the captured trace words from the top MemTile's
+    // memory (row XAIE_AIE_TILE_ROW_START-1 = 2 in the same column) and decode
+    // them into a "cycle EVENT" timeline. The trace was routed there by
+    // __Runtime_core_trace_setup above; the read takes the MemTile loc, not the
+    // core loc.
+#if TRACE_ENABLE
+    {
+        uint32_t trc_buf[TRC_LEN / 4];
+        if (__Runtime_core_trace_read(DevInst, XAie_TileLoc(4, 2), TRC_ADDR, trc_buf, TRC_LEN / 4) == XAIE_OK) {
+            printf("[perf] core trace timeline (core 4,4 -> memtile 4,2):\n");
+            __Runtime_core_trace_decode(trc_buf, TRC_LEN / 4);
+        } else {
+            printf("[perf] core_trace_read failed\n");
+        }
+    }
+#endif
+
 #ifndef __AIESIM__
     XTime_GetTime(&tEnd);
     printf("Transferred %u bytes (%d iter) in %.2f us.\n", (unsigned)(count * mlen * sizeof(u32)), count,
@@ -338,7 +404,7 @@ int main(int argc, char* argv[]) {
 #endif /* __AIESIM__ */
 
     test_routing(&DevInst);
-
+    return 1;
     RC = XAie_PartitionTeardown(&DevInst);
     if(RC != XAIE_OK) {
         printf("Failed to Teardown partition\n");
