@@ -22,6 +22,7 @@ STUB_TILES=""
 NOC_ALL=0
 SKIP_BUILD=0
 SKIP_WORK=0
+NO_LAUNCH=0
 SIM_OPTS=""
 
 CONFIG_DIR=""
@@ -55,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --noc-all)       NOC_ALL=1;           shift ;;
         --skip-build)    SKIP_BUILD=1;        shift ;;
         --skip-work)     SKIP_WORK=1;         shift ;;
+        --no-launch)     NO_LAUNCH=1;         shift ;;
         --sim-opts)      SIM_OPTS="$2";       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -128,6 +130,14 @@ if [ "$SKIP_WORK" -eq 0 ]; then
         $([ "$NOC_ALL"  -eq 1 ] && echo --noc-all)
 else
     echo "=== [2/3] Skipping Work/ generation (--skip-work) ==="
+fi
+
+if [ "$NO_LAUNCH" -eq 1 ]; then
+    echo "=== [3/3] Skipping launch (--no-launch) ==="
+    echo "  Work dir: ${WORK_DIR}"
+    echo "  Artifacts are ready; re-run this script without --no-launch to start"
+    echo "  the simulator, or press Run in the debug UI."
+    exit 0
 fi
 
 echo "=== [3/3] Launching aiesimulator ==="
