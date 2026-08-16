@@ -303,12 +303,33 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
                                  uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum) {
     AieRC rc;
 
+    rc = XAie_TraceControlConfigReset(dev, tile, XAIE_CORE_MOD);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TraceControlConfigReset failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
+    rc = XAie_TracePktConfigReset(dev, tile, XAIE_CORE_MOD);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TracePktConfigReset failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
+    rc = XAie_TraceEventReset(dev, tile, XAIE_CORE_MOD, 4);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TraceEventReset failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
     /* 1. Control: start when the core goes active, stop when it is disabled,
      * timestamp mode. NOTE: the driver has no ENABLE_CORE/DISABLE_CORE events;
      * ACTIVE_CORE (core running) and DISABLED_CORE (core halted) are the closest
      * available window edges. */
-    rc = XAie_TraceControlConfig(dev, tile, XAIE_CORE_MOD, XAIE_EVENT_ACTIVE_CORE, XAIE_EVENT_DISABLED_CORE,
-                                 XAIE_TRACE_EVENT_TIME);
+    rc = XAie_TraceControlConfig(dev, tile, XAIE_CORE_MOD, XAIE_EVENT_ACTIVE_CORE,
+                                 /*XAIE_EVENT_DISABLED_CORE*/ XAIE_EVENT_ECC_ERROR_STALL_CORE, XAIE_TRACE_EVENT_TIME);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: TraceControlConfig failed rc=%d tile(%u,%u)\n", (int)rc,
                (unsigned)tile.Col, (unsigned)tile.Row);
@@ -327,6 +348,24 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
         }
     }
 
+    XAie_Packet Pkt = XAie_PacketInit(1, 1);
+    rc = XAie_TracePktConfig(dev, tile, XAIE_CORE_MOD, Pkt);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TracePktConfig failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)tile.Col,
+               (unsigned)tile.Row);
+        return rc;
+    }
+
+    XAie_TraceState Status;
+    rc = XAie_TraceGetState(dev, tile, XAIE_CORE_MOD, &Status);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TraceGetState failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)tile.Col,
+               (unsigned)tile.Row);
+        return rc;
+    }
+    printf("[aie_runtime] core_trace_setup: TraceGetState tile(%u,%u) state=%d\n", (unsigned)tile.Col,
+           (unsigned)tile.Row, (int)Status);
+
     /* 3. Route the core TRACE stream DOWN through the intervening core tiles into
      * the same-column top MemTile's S2MM DMA channel. Every hop rides one
      * physical stream channel strm_ch: an upper tile's SOUTH master port is
@@ -340,10 +379,32 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
     uint8_t mt_row = (uint8_t)(XAIE_AIE_TILE_ROW_START - 1); /* top memtile, directly below cores */
     XAie_LocType mt = XAie_TileLoc(tile.Col, mt_row);
 
-    /* 3a. Source core tile: TRACE port 0 -> SOUTH master strm_ch (send downward). */
-    rc = XAie_StrmConnCctEnable(dev, tile, TRACE, 0, SOUTH, strm_ch);
+    /* 3a. Source core tile: packet-switch the TRACE stream onto SOUTH master
+     * strm_ch. The trace stream is emitted as packets (see TracePktConfig above,
+     * Pkt id=1), so the source tile's stream switch must run in packet mode: a
+     * slave slot on the TRACE port matches the trace packet id, the TRACE slave
+     * port is enabled, and the SOUTH master forwards the matched packets
+     * downward keeping the header so the downstream trace parser can identify
+     * the stream. Every downstream hop (3b/3c) then rides the same physical
+     * channel in plain circuit-switched mode. slot/msel/arbiter are 0 and
+     * MSelEn = (1 << msel) = 0x1; mask 0x1F matches the full 5-bit packet id. */
+    rc = XAie_StrmPktSwSlaveSlotEnable(dev, tile, TRACE, 0, /*slot=*/0, Pkt,
+                                       /*mask=*/0x1F, /*msel=*/0, /*arbiter=*/0);
     if (rc != XAIE_OK) {
-        printf("[aie_runtime] core_trace_setup: StrmConnCctEnable TRACE->SOUTH ch=%u failed rc=%d tile(%u,%u)\n",
+        printf("[aie_runtime] core_trace_setup: StrmPktSwSlaveSlotEnable TRACE ch=%u failed rc=%d tile(%u,%u)\n",
+               (unsigned)strm_ch, (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+    rc = XAie_StrmPktSwSlavePortEnable(dev, tile, TRACE, 0);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: StrmPktSwSlavePortEnable TRACE failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+    rc = XAie_StrmPktSwMstrPortEnable(dev, tile, SOUTH, strm_ch, XAIE_SS_PKT_DONOT_DROP_HEADER,
+                                      /*arbiter=*/0, /*MSelEn=*/0x1);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: StrmPktSwMstrPortEnable SOUTH ch=%u failed rc=%d tile(%u,%u)\n",
                (unsigned)strm_ch, (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
         return rc;
     }
