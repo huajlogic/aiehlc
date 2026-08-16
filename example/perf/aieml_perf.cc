@@ -10,11 +10,14 @@
 #ifndef __AIESIM__
 #include "xil_cache.h"
 #include "xil_printf.h"
+#include "sleep.h" /* usleep() in the standalone BSP */
 #if AIE_GEN <= 2
 #include "xtime_l.h"
 #else
 #include "xiltimer.h"
 #endif
+#else
+#include <unistd.h> /* usleep() on the host (aiesim) */
 #endif /* __AIESIM__ */
 
 #define uint_TYPE uint32_t
@@ -67,6 +70,7 @@
 // through the intervening core tiles into the MemTile's S2MM DMA, so the deep
 // trace no longer steals space from the kernel's own data regions.
 #define TRC_ADDR 0x8000u
+#define TRC_MEMTILE_DMA_LOAL_OFFSET_ADDR 0x80000u
 #define TRC_LEN 0x1000u /* 4 KB of raw trace words, in MemTile memory */
 
 // Master switch for the core event-trace flow. The trace unit is routed down
@@ -193,7 +197,8 @@ int test_routing(XAie_DevInst *DevInst)
     // precede XAie_Run (which makes the core active and fires ACTIVE_CORE, opening
     // the trace window).
 #if TRACE_ENABLE
-    if (__Runtime_core_trace_setup(DevInst, XAie_TileLoc(4, 4), TRC_ADDR, TRC_LEN, /*strm_ch=*/TRC_STRM_CH,
+    if (__Runtime_core_trace_setup(DevInst, XAie_TileLoc(4, 4), TRC_ADDR | TRC_MEMTILE_DMA_LOAL_OFFSET_ADDR, TRC_LEN,
+                                   /*strm_ch=*/TRC_STRM_CH,
                                    /*s2mm_ch=*/TRC_S2MM_CH, 4) != XAIE_OK) {
         printf("[perf] core_trace_setup failed\n");
     }
@@ -320,6 +325,7 @@ int test_routing(XAie_DevInst *DevInst)
     // core loc.
 #if TRACE_ENABLE
     {
+        usleep(1000 * 1000 * 5); // give the S2MM DMA a moment to finish writing the last trace words
         uint32_t trc_buf[TRC_LEN / 4];
         if (__Runtime_core_trace_read(DevInst, XAie_TileLoc(4, 2), TRC_ADDR, trc_buf, TRC_LEN / 4) == XAIE_OK) {
             printf("[perf] core trace timeline (core 4,4 -> memtile 4,2):\n");

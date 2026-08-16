@@ -27,7 +27,8 @@
       "WebFetch(domain:llm-api.amd.com)",
       "WebFetch(domain:pypi.org)",
       "Skill(superpowers:using-git-worktrees)",
-      "mcp__aiegdb__aie_scope"
+      "mcp__aiegdb__aie_scope",
+      "WebFetch(domain:files.pythonhosted.org)"
     ],
     "deny": []
   },
