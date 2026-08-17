@@ -35,15 +35,26 @@ def yellow(t): return _c("33", t)
 def lightyellow(t): return _c("93", t)  # bright/light yellow
 def cyan(t):   return _c("36", t)
 def bold(t):   return _c("1", t)
+def dim(t):    return _c("2", t)   # faint/dim
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 DMA_STATUS_OFFSETS = {
     "core":    {"s2mm": 0x1DF00, "mm2s": 0x1DF10},
+    # MemTile has its OWN register map (MEM_TILE_MODULE), distinct from a core
+    # tile's memory module (MEMORY_MODULE). Source: XAIE2PSGBL_MEM_TILE_MODULE_
+    # DMA_{S2MM,MM2S}_STATUS_0 = 0xA0660 / 0xA0680 (per-channel stride 0x4).
+    "memtile": {"s2mm": 0xA0660, "mm2s": 0xA0680},
     "shim_5":  {"s2mm": 0x1D220, "mm2s": 0x1D228},
     "shim_2ps": {"s2mm": 0x9320, "mm2s": 0x9328},
 }
 CH_STRIDE = 0x4
+
+# Row -> tile type. Row 0 is the shim; rows 1..(AIE_TILE_ROW_START-1) are
+# MemTiles; the rest are AIE core tiles. gen5/aie2ps cores start at row 3 (two
+# MemTile rows 1,2); aieml cores start at row 2 (one MemTile row 1). gen1 has no
+# MemTiles. Keyed by aie_version string as passed through the tools.
+AIE_TILE_ROW_START = {"5": 3, "2ps": 3, "2": 2, "1": 1}
 
 # Core module Program Counter register (AIE2PS / AIEML core tiles, row != 0).
 # Source: XAIE2PSGBL_CORE_MODULE_CORE_PC = 0x00030F00, value mask 0x000FFFFF.
@@ -98,12 +109,16 @@ CORE_STATUS_BITS = [
 # tile_type -> (bd0_base, bd_stride)
 BD_BASE_STRIDE = {
     "core":     (0x1D000, 0x20),
+    # MemTile: XAIE2PSGBL_MEM_TILE_MODULE_DMA_BD0_0 = 0xA0000, BD stride 0x20.
+    "memtile":  (0xA0000, 0x20),
     "shim_5":   (0x9000,  0x30),
     "shim_2ps": (0x9000,  0x30),
 }
-# Buffer_Length field mask in word 0. Core: bits[13:0]; shim: bits[31:0].
+# Buffer_Length field mask in word 0. Core: bits[13:0]; memtile: bits[16:0]
+# (MEM_TILE_MODULE_DMA_BD0_0_BUFFER_LENGTH width 17); shim: bits[31:0].
 # Value is in 32-bit words; bytes = words * 4.
-BD_LEN_MASK = {"core": 0x3FFF, "shim_5": 0xFFFFFFFF, "shim_2ps": 0xFFFFFFFF}
+BD_LEN_MASK = {"core": 0x3FFF, "memtile": 0x1FFFF,
+               "shim_5": 0xFFFFFFFF, "shim_2ps": 0xFFFFFFFF}
 
 # Shim PL module event status registers
 SHIM_EVT_STATUS_REG0 = 0x00034200  # event IDs 0-31
@@ -161,6 +176,37 @@ CORE_MEM_DMA_EVENT_IDS = {
 }
 CORE_DMA_CHANNELS = [("s2mm", 0), ("s2mm", 1), ("mm2s", 0), ("mm2s", 1)]
 
+# ─── MemTile module event decode (AIE2PS) ────────────────────────────────────
+# MemTile has 6 event status registers (events 0-191) vs the core memory
+# module's 4. XAIE2PSGBL_MEM_TILE_MODULE_EVENT_STATUS0..5.
+MEMTILE_EVT_STATUS_REGS = (0x94200, 0x94204, 0x94208, 0x9420C, 0x94210, 0x94214)
+
+# MemTile has 6 S2MM + 6 MM2S DMA channels but the event hardware exposes only
+# two *selectable* event slots per direction (SEL0/SEL1). The
+# DMA_EVENT_CHANNEL_SELECTION register (0xA06A0) picks which physical channel
+# (0-5) drives each slot. Event ids (driver xaie_events_aie2ps.h,
+# XAIE2PS_EVENTS_MEM_TILE_DMA_*):
+#   START_TASK    : S2MM SEL0=21 SEL1=22   MM2S SEL0=23 SEL1=24
+#   FINISHED_BD   : S2MM SEL0=25 SEL1=26   MM2S SEL0=27 SEL1=28
+#   FINISHED_TASK : S2MM SEL0=29 SEL1=30   MM2S SEL0=31 SEL1=32
+#   ERROR         : S2MM=133 MM2S=134  (direction-wide, NOT per-slot)
+# Keyed by (direction, sel_slot) -> dict of event_name -> event_id.
+MEMTILE_DMA_EVENT_IDS = {
+    ("s2mm", 0): {"START_TASK": 21, "FINISHED_BD": 25, "FINISHED_TASK": 29, "ERROR": 133},
+    ("s2mm", 1): {"START_TASK": 22, "FINISHED_BD": 26, "FINISHED_TASK": 30, "ERROR": 133},
+    ("mm2s", 0): {"START_TASK": 23, "FINISHED_BD": 27, "FINISHED_TASK": 31, "ERROR": 134},
+    ("mm2s", 1): {"START_TASK": 24, "FINISHED_BD": 28, "FINISHED_TASK": 32, "ERROR": 134},
+}
+MEMTILE_DMA_SEL_SLOTS = [("s2mm", 0), ("s2mm", 1), ("mm2s", 0), ("mm2s", 1)]
+
+# DMA_EVENT_CHANNEL_SELECTION register: physical channel (0-5, 3-bit field)
+# mapped into each SEL slot. Field LSBs per (direction, sel_slot).
+MEMTILE_DMA_EVENT_SEL_REG = 0xA06A0
+MEMTILE_DMA_EVENT_SEL_LSB = {
+    ("s2mm", 0): 0, ("s2mm", 1): 8, ("mm2s", 0): 16, ("mm2s", 1): 24,
+}
+MEMTILE_DMA_EVENT_SEL_FIELD = 0x7  # 3-bit channel id
+
 # Core-module error events (from core_events.json)
 CORE_ERROR_EVENT_IDS = {
     "GROUP_ERRORS_0": 46, "GROUP_ERRORS_1": 47,
@@ -169,6 +215,52 @@ CORE_ERROR_EVENT_IDS = {
     "PM_ECC_ERROR_SCRUB_2BIT": 62, "PM_ECC_ERROR_1BIT": 63,
     "PM_ECC_ERROR_2BIT": 64,
 }
+
+# Full core-module event id -> name map (events 0-127), authoritative:
+# driver s_core_evt_names[] in aie_runtime_debug.c. Read from
+# CORE_EVT_STATUS_REGS (0x34200..0x3420C). None entries are reserved ids.
+CORE_EVT_NAMES = [
+    "NONE", "TRUE", "GROUP_0", "TIMER_SYNC", "TIMER_VALUE_REACHED",        # 0-4
+    "PERF_CNT_0", "PERF_CNT_1", "PERF_CNT_2", "PERF_CNT_3",                # 5-8
+    "COMBO_EVENT_0", "COMBO_EVENT_1", "COMBO_EVENT_2", "COMBO_EVENT_3",    # 9-12
+    "EDGE_DETECTION_EVENT_0", "EDGE_DETECTION_EVENT_1", "GROUP_PC_EVENT",  # 13-15
+    "PC_0", "PC_1", "PC_2", "PC_3", "PC_RANGE_0_1", "PC_RANGE_2_3",        # 16-21
+    "GROUP_CORE_STALL", "MEMORY_STALL", "STREAM_STALL", "CASCADE_STALL",   # 22-25
+    "LOCK_STALL", "DEBUG_HALTED", "ACTIVE", "DISABLED",                    # 26-29
+    "ECC_ERROR_STALL", "ECC_SCRUBBING_STALL", "GROUP_CORE_PROGRAM_FLOW",   # 30-32
+    "INSTR_EVENT_0", "INSTR_EVENT_1", "INSTR_CALL", "INSTR_RETURN",        # 33-36
+    "INSTR_VECTOR", "INSTR_LOAD", "INSTR_STORE", "INSTR_STREAM_GET",       # 37-40
+    "INSTR_STREAM_PUT", "INSTR_CASCADE_GET", "INSTR_CASCADE_PUT",          # 41-43
+    "INSTR_LOCK_ACQUIRE_REQ", "INSTR_LOCK_RELEASE_REQ",                    # 44-45
+    "GROUP_ERRORS_0", "GROUP_ERRORS_1", "SRS_OVERFLOW", "UPS_OVERFLOW",    # 46-49
+    "FP_HUGE", "INT_FP_ZERO", "FP_INVALID", "FP_INF", None,               # 50-54 (54 reserved)
+    "PM_REG_ACCESS_FAILURE", "STREAM_PKT_PARITY_ERROR", "CONTROL_PKT_ERROR", # 55-57
+    "AXI_MM_SLAVE_ERROR", "INSTR_DECOMPRESSION_ERROR",                     # 58-59
+    "DM_ADDRESS_OUT_OF_RANGE", "PM_ECC_ERROR_SCRUB_CORRECTED",             # 60-61
+    "PM_ECC_ERROR_SCRUB_2BIT", "PM_ECC_ERROR_1BIT", "PM_ECC_ERROR_2BIT",   # 62-64
+    "PM_ADDRESS_OUT_OF_RANGE", "DM_ACCESS_TO_UNAVAILABLE",                 # 65-66
+    "LOCK_ACCESS_TO_UNAVAILABLE", "INSTR_WARNING", "INSTR_ERROR",          # 67-69
+    "SPARSITY_OVERFLOW", "STREAM_SWITCH_PORT_PARITY_ERROR",                # 70-71
+    "PROCESSOR_BUS_ERROR", "GROUP_STREAM_SWITCH",                          # 72-73
+    "PORT_IDLE_0", "PORT_RUNNING_0", "PORT_STALLED_0", "PORT_TLAST_0",     # 74-77
+    "PORT_IDLE_1", "PORT_RUNNING_1", "PORT_STALLED_1", "PORT_TLAST_1",     # 78-81
+    "PORT_IDLE_2", "PORT_RUNNING_2", "PORT_STALLED_2", "PORT_TLAST_2",     # 82-85
+    "PORT_IDLE_3", "PORT_RUNNING_3", "PORT_STALLED_3", "PORT_TLAST_3",     # 86-89
+    "PORT_IDLE_4", "PORT_RUNNING_4", "PORT_STALLED_4", "PORT_TLAST_4",     # 90-93
+    "PORT_IDLE_5", "PORT_RUNNING_5", "PORT_STALLED_5", "PORT_TLAST_5",     # 94-97
+    "PORT_IDLE_6", "PORT_RUNNING_6", "PORT_STALLED_6", "PORT_TLAST_6",     # 98-101
+    "PORT_IDLE_7", "PORT_RUNNING_7", "PORT_STALLED_7", "PORT_TLAST_7",     # 102-105
+    "GROUP_BROADCAST", "BROADCAST_0", "BROADCAST_1", "BROADCAST_2",        # 106-109
+    "BROADCAST_3", "BROADCAST_4", "BROADCAST_5", "BROADCAST_6",            # 110-113
+    "BROADCAST_7", "BROADCAST_8", "BROADCAST_9", "BROADCAST_10",           # 114-117
+    "BROADCAST_11", "BROADCAST_12", "BROADCAST_13", "BROADCAST_14",        # 118-121
+    "BROADCAST_15", "GROUP_USER_EVENT", "USER_EVENT_0", "USER_EVENT_1",    # 122-125
+    "USER_EVENT_2", "USER_EVENT_3",                                        # 126-127
+]
+
+# Events that are always/normally asserted (id 1 TRUE) or reflect steady core
+# state rather than a discrete occurrence; noted so the listing can flag them.
+CORE_EVT_STEADY = {1, 28, 29}  # TRUE, ACTIVE, DISABLED
 
 STATUS_NAMES = {0: "Idle", 1: "Running", 2: "Paused"}
 
@@ -423,13 +515,21 @@ def pc_to_source(entries, pc):
 
 # ─── Register access ─────────────────────────────────────────────────────────
 
+def tile_type_for_row(row, aie_version="5"):
+    """Classify a tile by its row: row 0 = shim, rows 1..(start-1) = memtile,
+    the rest = core. `start` is the AIE-core row start for the generation."""
+    if row == 0:
+        return "shim"
+    start = AIE_TILE_ROW_START.get(str(aie_version), 3)
+    return "memtile" if row < start else "core"
+
 def compute_reg_offset(tile_type, direction, channel, aie_version):
     """Compute the register offset for DMA status."""
-    if tile_type == "core":
-        base_map = DMA_STATUS_OFFSETS["core"]
-    elif tile_type == "shim":
+    if tile_type == "shim":
         key = "shim_5" if aie_version == "5" else "shim_2ps"
         base_map = DMA_STATUS_OFFSETS[key]
+    elif tile_type == "memtile":
+        base_map = DMA_STATUS_OFFSETS["memtile"]
     else:
         base_map = DMA_STATUS_OFFSETS["core"]
     base = base_map[direction]
@@ -439,6 +539,8 @@ def _bd_type_key(tile_type, aie_version):
     """Map tile_type+aie_version to a BD_BASE_STRIDE / BD_LEN_MASK key."""
     if tile_type == "shim":
         return "shim_5" if aie_version == "5" else "shim_2ps"
+    if tile_type == "memtile":
+        return "memtile"
     return "core"
 
 def bd_length_offset(tile_type, aie_version, bd_id):
@@ -935,6 +1037,63 @@ def format_core_mem_dma_events(phys_col, row, regs4):
             lines.append(yellow(f"      >> {direction.upper()} ch{channel} never started (start_io not issued?)"))
     return "\n".join(lines)
 
+def memtile_dma_sel_for_channel(sel_reg, direction, channel):
+    """Return the SEL slot (0 or 1) currently mapped to physical `channel`.
+
+    The DMA_EVENT_CHANNEL_SELECTION register maps a physical channel (0-5) into
+    each of the two selectable event slots. Returns None if `channel` is not
+    currently observed by either slot."""
+    if sel_reg is None:
+        return None
+    for sel in (0, 1):
+        lsb = MEMTILE_DMA_EVENT_SEL_LSB[(direction, sel)]
+        if ((sel_reg >> lsb) & MEMTILE_DMA_EVENT_SEL_FIELD) == channel:
+            return sel
+    return None
+
+def _memtile_evt_verdict(label, started, finished_bd, finished, error):
+    if error:
+        return red(f"      >> {label} DMA ERROR event active")
+    if started and finished:
+        return green(f"      >> {label} started and finished (DMA completed)")
+    if started and finished_bd:
+        return yellow(f"      >> {label} started, some BD(s) finished, but task "
+                      f"never finished (still running or stuck)")
+    if started:
+        return yellow(f"      >> {label} started but never finished (stuck)")
+    return yellow(f"      >> {label} never started (start_io not issued?)")
+
+def format_memtile_dma_events(phys_col, row, regs, sel_reg=None):
+    """Format MemTile DMA start/finish/error for the two selectable event slots.
+
+    MemTile has 6 S2MM + 6 MM2S DMA channels but only two selectable event slots
+    per direction (SEL0/SEL1). `regs` is the 6-register event-status vector
+    (events 0-191). `sel_reg` is the value of DMA_EVENT_CHANNEL_SELECTION
+    (0xA06A0); when provided, each slot is annotated with the physical channel it
+    currently observes. The ERROR event is direction-wide (shared by both slots
+    of a direction), not per-slot."""
+    lines = []
+    lines.append(f"  MemTile DMA events tile({phys_col},{row}):")
+    for direction, sel in MEMTILE_DMA_SEL_SLOTS:
+        emap = MEMTILE_DMA_EVENT_IDS[(direction, sel)]
+        started = _evt_active(emap["START_TASK"], regs)
+        finished_bd = _evt_active(emap["FINISHED_BD"], regs)
+        finished = _evt_active(emap["FINISHED_TASK"], regs)
+        error = _evt_active(emap["ERROR"], regs)
+        label = f"{direction.upper()} SEL{sel}"
+        if sel_reg is not None:
+            lsb = MEMTILE_DMA_EVENT_SEL_LSB[(direction, sel)]
+            phys = (sel_reg >> lsb) & MEMTILE_DMA_EVENT_SEL_FIELD
+            label += f" (-> ch{phys})"
+        lines.append(f"    {label}:")
+        lines.append(f"      {'START_TASK:':<16s} {red('SET') if started else 'not set'}")
+        lines.append(f"      {'FINISHED_BD:':<16s} {red('SET') if finished_bd else 'not set'}")
+        lines.append(f"      {'FINISHED_TASK:':<16s} {red('SET') if finished else 'not set'}")
+        lines.append(f"      {'ERROR:':<16s} {red('SET') if error else 'not set'}"
+                     f"{'  (S2MM/MM2S direction-wide)' if error else ''}")
+        lines.append(_memtile_evt_verdict(label, started, finished_bd, finished, error))
+    return "\n".join(lines)
+
 def format_core_module_errors(phys_col, row, regs4):
     """List any active core-module error events."""
     lines = []
@@ -946,6 +1105,38 @@ def format_core_module_errors(phys_col, row, regs4):
             lines.append(red(f"    {name}: SET"))
     else:
         lines.append(green("    no core errors"))
+    return "\n".join(lines)
+
+def core_event_name(eid):
+    """Name for core-module event id (0-127), or None for reserved/out-of-range."""
+    if 0 <= eid < len(CORE_EVT_NAMES):
+        return CORE_EVT_NAMES[eid]
+    return None
+
+def format_core_module_events(phys_col, row, regs4):
+    """List every active core-module event (id + name) from the 4 event-status
+    registers (events 0-127; driver s_core_evt_names[]).
+
+    Unlike format_core_module_errors (errors only), this is the full event list:
+    error events are flagged red, steady-state events (TRUE/ACTIVE/DISABLED)
+    dimmed, everything else plain."""
+    lines = []
+    lines.append(f"  Core-module events tile({phys_col},{row}):")
+    active = [eid for eid in range(128) if _evt_active(eid, regs4)]
+    if not active:
+        lines.append(green("    no active core-module events"))
+        return "\n".join(lines)
+    err_ids = set(CORE_ERROR_EVENT_IDS.values())
+    for eid in active:
+        name = core_event_name(eid) or f"EVENT_{eid}"
+        is_err = eid in err_ids or "ERROR" in name or name.startswith("GROUP_ERRORS")
+        text = f"    [{eid:3d}] {name}"
+        if is_err:
+            lines.append(red(text + "  <-- error"))
+        elif eid in CORE_EVT_STEADY:
+            lines.append(dim(text))
+        else:
+            lines.append(text)
     return "\n".join(lines)
 
 # ─── JSON lookup helpers ──────────────────────────────────────────────────────
@@ -1447,7 +1638,6 @@ def main(argv=None):
                 print(f"Error: unexpected argument '{args.startcol_kw}'", file=sys.stderr)
                 sys.exit(1)
 
-    tile_type = "shim" if row == 0 else "core"
     aie_version = args.aie_version
     aie_version_source = "explicit"
     dry_run = args.dry_run
@@ -1480,6 +1670,10 @@ def main(argv=None):
         else:
             aie_version = "5"
             aie_version_source = "default"
+
+    # Classify only after aie_version is resolved: the MemTile row band depends
+    # on the generation (see tile_type_for_row / AIE_TILE_ROW_START).
+    tile_type = tile_type_for_row(row, aie_version)
 
     # ── Header ────────────────────────────────────────────────────────────
     print(bold("=" * 58))
@@ -1592,7 +1786,7 @@ def main(argv=None):
         cr = c["tile_row"]
         c_dir = c["io_direction"].lower()
         c_ch = c["channel"]
-        c_type = "shim" if cr == 0 else "core"
+        c_type = tile_type_for_row(cr, aie_version)
         c_phys_col = cc + startcol
         c_offset = compute_reg_offset(c_type, c_dir, c_ch, aie_version)
 

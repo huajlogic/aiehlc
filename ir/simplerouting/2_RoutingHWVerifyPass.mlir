@@ -137,10 +137,10 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %36 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %37 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %38 = routinghw.enableaietoextshimport %30 : i32 {portdirection = "NORTH", portidx = 1 : i32} -> i32
-        %39 = routinghw.connectpktstreamswitchport %29 : i32 {forwardmasterdirection = "SOUTH", forwardmasterportidx = 0 : i32, localdmadirection = "NONE", localdmapktid = 0 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
-        %40 = routinghw.connectsinglestreamswitchport %35 : {slaveportdirection = "NORTH", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 0} : i32
-        %41 = routinghw.connectsinglestreamswitchport %36 : {slaveportdirection = "NORTH", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 0} : i32
-        %42 = routinghw.connectsinglestreamswitchport %30 : {slaveportdirection = "NORTH", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 1} : i32
+        %39 = routinghw.connectpktstreamswitchport %29 : i32 {forwardmasterdirection = "SOUTH", forwardmasterportidx = 1 : i32, localdmadirection = "NONE", localdmapktid = 0 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
+        %40 = routinghw.connectsinglestreamswitchport %35 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 1} : i32
+        %41 = routinghw.connectsinglestreamswitchport %36 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 1} : i32
+        %42 = routinghw.connectsinglestreamswitchport %30 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 1} : i32
         "routing.yield"() : () -> ()
       }
       %4 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
@@ -159,9 +159,9 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %18 = routinghw.connectsinglestreamswitchport %11 : {slaveportdirection = "SOUTH", slaveportidx = 7, masterportdirection = "NORTH", masterportidx = 1} : i32
         %19 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "NORTH", masterportidx = 1} : i32
         %20 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "NORTH", masterportidx = 1} : i32
-        %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "WEST", masterportidx = 0} : i32
+        %21 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "WEST", masterportidx = 2} : i32
         %22 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "NORTH", masterportidx = 1} : i32
-        %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "EAST", slaveportidx = 0, masterportdirection = "NORTH", masterportidx = 1} : i32
+        %23 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "EAST", slaveportidx = 2, masterportdirection = "NORTH", masterportidx = 1} : i32
         %24 = routinghw.connectsinglestreamswitchport %7 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "DMA", masterportidx = 0} : i32
         %25 = routinghw.connectsinglestreamswitchport %8 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "EAST", masterportidx = 0} : i32
         %26 = routinghw.connectsinglestreamswitchport %8 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "DMA", masterportidx = 0} : i32
@@ -182,11 +182,11 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %41 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %42 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %43 = routinghw.enableaietoextshimport %34 : i32 {portdirection = "NORTH", portidx = 3 : i32} -> i32
-        %44 = routinghw.connectpktstreamswitchport %33 : i32 {forwardmasterdirection = "SOUTH", forwardmasterportidx = 0 : i32, localdmadirection = "NONE", localdmapktid = 0 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
-        %45 = routinghw.connectsinglestreamswitchport %39 : {slaveportdirection = "NORTH", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 1} : i32
-        %46 = routinghw.connectsinglestreamswitchport %40 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 1} : i32
-        %47 = routinghw.connectsinglestreamswitchport %41 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 1} : i32
-        %48 = routinghw.connectsinglestreamswitchport %34 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 3} : i32
+        %44 = routinghw.connectpktstreamswitchport %33 : i32 {forwardmasterdirection = "SOUTH", forwardmasterportidx = 1 : i32, localdmadirection = "NONE", localdmapktid = 0 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
+        %45 = routinghw.connectsinglestreamswitchport %39 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 2} : i32
+        %46 = routinghw.connectsinglestreamswitchport %40 : {slaveportdirection = "NORTH", slaveportidx = 2, masterportdirection = "SOUTH", masterportidx = 2} : i32
+        %47 = routinghw.connectsinglestreamswitchport %41 : {slaveportdirection = "NORTH", slaveportidx = 2, masterportdirection = "SOUTH", masterportidx = 2} : i32
+        %48 = routinghw.connectsinglestreamswitchport %34 : {slaveportdirection = "NORTH", slaveportidx = 2, masterportdirection = "SOUTH", masterportidx = 3} : i32
         "routing.yield"() : () -> ()
       }
       %5 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
@@ -207,9 +207,9 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %20 = routinghw.connectsinglestreamswitchport %11 : {slaveportdirection = "SOUTH", slaveportidx = 7, masterportdirection = "NORTH", masterportidx = 1} : i32
         %21 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "NORTH", masterportidx = 1} : i32
         %22 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "NORTH", masterportidx = 1} : i32
-        %23 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "WEST", masterportidx = 0} : i32
-        %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "EAST", slaveportidx = 0, masterportdirection = "WEST", masterportidx = 1} : i32
-        %25 = routinghw.connectsinglestreamswitchport %17 : {slaveportdirection = "EAST", slaveportidx = 1, masterportdirection = "NORTH", masterportidx = 2} : i32
+        %23 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "WEST", masterportidx = 2} : i32
+        %24 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "EAST", slaveportidx = 2, masterportdirection = "WEST", masterportidx = 3} : i32
+        %25 = routinghw.connectsinglestreamswitchport %17 : {slaveportdirection = "EAST", slaveportidx = 3, masterportdirection = "NORTH", masterportidx = 2} : i32
         %26 = routinghw.connectsinglestreamswitchport %18 : {slaveportdirection = "SOUTH", slaveportidx = 2, masterportdirection = "NORTH", masterportidx = 1} : i32
         %27 = routinghw.connectsinglestreamswitchport %7 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "EAST", masterportidx = 0} : i32
         %28 = routinghw.connectsinglestreamswitchport %7 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "DMA", masterportidx = 0} : i32
@@ -234,13 +234,13 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %47 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %48 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %49 = routinghw.enableaietoextshimport %38 : i32 {portdirection = "NORTH", portidx = 1 : i32} -> i32
-        %50 = routinghw.connectpktstreamswitchport %37 : i32 {forwardmasterdirection = "SOUTH", forwardmasterportidx = 0 : i32, localdmadirection = "NONE", localdmapktid = 0 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
-        %51 = routinghw.connectsinglestreamswitchport %43 : {slaveportdirection = "NORTH", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 1} : i32
-        %52 = routinghw.connectsinglestreamswitchport %44 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "WEST", masterportidx = 0} : i32
-        %53 = routinghw.connectsinglestreamswitchport %45 : {slaveportdirection = "EAST", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 0} : i32
-        %54 = routinghw.connectsinglestreamswitchport %46 : {slaveportdirection = "NORTH", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 0} : i32
-        %55 = routinghw.connectsinglestreamswitchport %47 : {slaveportdirection = "NORTH", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 0} : i32
-        %56 = routinghw.connectsinglestreamswitchport %38 : {slaveportdirection = "NORTH", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 1} : i32
+        %50 = routinghw.connectpktstreamswitchport %37 : i32 {forwardmasterdirection = "SOUTH", forwardmasterportidx = 1 : i32, localdmadirection = "NONE", localdmapktid = 0 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
+        %51 = routinghw.connectsinglestreamswitchport %43 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 2} : i32
+        %52 = routinghw.connectsinglestreamswitchport %44 : {slaveportdirection = "NORTH", slaveportidx = 2, masterportdirection = "WEST", masterportidx = 2} : i32
+        %53 = routinghw.connectsinglestreamswitchport %45 : {slaveportdirection = "EAST", slaveportidx = 2, masterportdirection = "SOUTH", masterportidx = 2} : i32
+        %54 = routinghw.connectsinglestreamswitchport %46 : {slaveportdirection = "NORTH", slaveportidx = 2, masterportdirection = "SOUTH", masterportidx = 2} : i32
+        %55 = routinghw.connectsinglestreamswitchport %47 : {slaveportdirection = "NORTH", slaveportidx = 2, masterportdirection = "SOUTH", masterportidx = 2} : i32
+        %56 = routinghw.connectsinglestreamswitchport %38 : {slaveportdirection = "NORTH", slaveportidx = 2, masterportdirection = "SOUTH", masterportidx = 1} : i32
         "routing.yield"() : () -> ()
       }
       %6 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
@@ -256,18 +256,18 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %15 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 3 : i32} -> i32
         %16 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 3 : i32} -> i32
         %17 = routinghw.tilecreate {col = 1 : i32, comments = "tile in path", row = 3 : i32} -> i32
-        %18 = routinghw.tilecreate {col = 0 : i32, comments = "tile in path", row = 3 : i32} -> i32
+        %18 = routinghw.tilecreate {col = 1 : i32, comments = "tile in path", row = 4 : i32} -> i32
         %19 = routinghw.tilecreate {col = 0 : i32, comments = "tile in path", row = 4 : i32} -> i32
         %20 = routinghw.tilecreate {col = 0 : i32, comments = "tile in path", row = 5 : i32} -> i32
         %21 = routinghw.enableexttoaieshimport %11 : i32 {portdirection = "SOUTH", portidx = 7 : i32} -> i32
-        %22 = routinghw.connectsinglestreamswitchport %11 : {slaveportdirection = "SOUTH", slaveportidx = 7, masterportdirection = "NORTH", masterportidx = 1} : i32
-        %23 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "NORTH", masterportidx = 1} : i32
-        %24 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "NORTH", masterportidx = 1} : i32
-        %25 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "WEST", masterportidx = 1} : i32
-        %26 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "EAST", slaveportidx = 1, masterportdirection = "WEST", masterportidx = 1} : i32
-        %27 = routinghw.connectsinglestreamswitchport %17 : {slaveportdirection = "EAST", slaveportidx = 1, masterportdirection = "WEST", masterportidx = 2} : i32
-        %28 = routinghw.connectsinglestreamswitchport %18 : {slaveportdirection = "EAST", slaveportidx = 2, masterportdirection = "NORTH", masterportidx = 3} : i32
-        %29 = routinghw.connectsinglestreamswitchport %19 : {slaveportdirection = "SOUTH", slaveportidx = 3, masterportdirection = "NORTH", masterportidx = 2} : i32
+        %22 = routinghw.connectsinglestreamswitchport %11 : {slaveportdirection = "SOUTH", slaveportidx = 7, masterportdirection = "NORTH", masterportidx = 3} : i32
+        %23 = routinghw.connectsinglestreamswitchport %13 : {slaveportdirection = "SOUTH", slaveportidx = 3, masterportdirection = "NORTH", masterportidx = 3} : i32
+        %24 = routinghw.connectsinglestreamswitchport %14 : {slaveportdirection = "SOUTH", slaveportidx = 3, masterportdirection = "NORTH", masterportidx = 3} : i32
+        %25 = routinghw.connectsinglestreamswitchport %15 : {slaveportdirection = "SOUTH", slaveportidx = 3, masterportdirection = "WEST", masterportidx = 3} : i32
+        %26 = routinghw.connectsinglestreamswitchport %16 : {slaveportdirection = "EAST", slaveportidx = 3, masterportdirection = "WEST", masterportidx = 3} : i32
+        %27 = routinghw.connectsinglestreamswitchport %17 : {slaveportdirection = "EAST", slaveportidx = 3, masterportdirection = "NORTH", masterportidx = 2} : i32
+        %28 = routinghw.connectsinglestreamswitchport %18 : {slaveportdirection = "SOUTH", slaveportidx = 2, masterportdirection = "WEST", masterportidx = 1} : i32
+        %29 = routinghw.connectsinglestreamswitchport %19 : {slaveportdirection = "EAST", slaveportidx = 1, masterportdirection = "NORTH", masterportidx = 2} : i32
         %30 = routinghw.connectsinglestreamswitchport %20 : {slaveportdirection = "SOUTH", slaveportidx = 2, masterportdirection = "NORTH", masterportidx = 1} : i32
         %31 = routinghw.connectsinglestreamswitchport %7 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "EAST", masterportidx = 0} : i32
         %32 = routinghw.connectsinglestreamswitchport %7 : {slaveportdirection = "SOUTH", slaveportidx = 1, masterportdirection = "DMA", masterportidx = 0} : i32
@@ -287,20 +287,20 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
         %46 = routinghw.connectpktstreamswitchport %41 : i32 {forwardmasterdirection = "NONE", forwardmasterportidx = 0 : i32, localdmadirection = "DMA", localdmapktid = 16 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "WEST", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 1 : i32} -> i32
         %47 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 5 : i32} -> i32
         %48 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 4 : i32} -> i32
-        %49 = routinghw.tilecreate {col = 3 : i32, comments = "tile in path", row = 3 : i32} -> i32
+        %49 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 4 : i32} -> i32
         %50 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 3 : i32} -> i32
         %51 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 2 : i32} -> i32
         %52 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 1 : i32} -> i32
         %53 = routinghw.tilecreate {col = 2 : i32, comments = "tile in path", row = 0 : i32} -> i32
         %54 = routinghw.enableaietoextshimport %42 : i32 {portdirection = "NORTH", portidx = 3 : i32} -> i32
-        %55 = routinghw.connectpktstreamswitchport %41 : i32 {forwardmasterdirection = "SOUTH", forwardmasterportidx = 0 : i32, localdmadirection = "NONE", localdmapktid = 0 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
-        %56 = routinghw.connectsinglestreamswitchport %47 : {slaveportdirection = "NORTH", slaveportidx = 0, masterportdirection = "SOUTH", masterportidx = 1} : i32
-        %57 = routinghw.connectsinglestreamswitchport %48 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 2} : i32
-        %58 = routinghw.connectsinglestreamswitchport %49 : {slaveportdirection = "NORTH", slaveportidx = 2, masterportdirection = "WEST", masterportidx = 2} : i32
-        %59 = routinghw.connectsinglestreamswitchport %50 : {slaveportdirection = "EAST", slaveportidx = 2, masterportdirection = "SOUTH", masterportidx = 1} : i32
-        %60 = routinghw.connectsinglestreamswitchport %51 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 1} : i32
-        %61 = routinghw.connectsinglestreamswitchport %52 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 1} : i32
-        %62 = routinghw.connectsinglestreamswitchport %42 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 3} : i32
+        %55 = routinghw.connectpktstreamswitchport %41 : i32 {forwardmasterdirection = "SOUTH", forwardmasterportidx = 1 : i32, localdmadirection = "NONE", localdmapktid = 0 : i32, localdmapkttype = 0 : i32, localdmaportidx = 0 : i32, preserveheader = true, receiveslavedirection = "NONE", receiveslavepktid = 0 : i32, receiveslavepkttype = 0 : i32, receiveslaveportidx = 0 : i32} -> i32
+        %56 = routinghw.connectsinglestreamswitchport %47 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 2} : i32
+        %57 = routinghw.connectsinglestreamswitchport %48 : {slaveportdirection = "NORTH", slaveportidx = 2, masterportdirection = "WEST", masterportidx = 2} : i32
+        %58 = routinghw.connectsinglestreamswitchport %49 : {slaveportdirection = "EAST", slaveportidx = 2, masterportdirection = "SOUTH", masterportidx = 1} : i32
+        %59 = routinghw.connectsinglestreamswitchport %50 : {slaveportdirection = "NORTH", slaveportidx = 1, masterportdirection = "SOUTH", masterportidx = 3} : i32
+        %60 = routinghw.connectsinglestreamswitchport %51 : {slaveportdirection = "NORTH", slaveportidx = 3, masterportdirection = "SOUTH", masterportidx = 3} : i32
+        %61 = routinghw.connectsinglestreamswitchport %52 : {slaveportdirection = "NORTH", slaveportidx = 3, masterportdirection = "SOUTH", masterportidx = 3} : i32
+        %62 = routinghw.connectsinglestreamswitchport %42 : {slaveportdirection = "NORTH", slaveportidx = 3, masterportdirection = "SOUTH", masterportidx = 3} : i32
         "routing.yield"() : () -> ()
       }
       scf.yield

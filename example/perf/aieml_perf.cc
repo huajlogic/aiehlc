@@ -10,11 +10,14 @@
 #ifndef __AIESIM__
 #include "xil_cache.h"
 #include "xil_printf.h"
+#include "sleep.h" /* usleep() in the standalone BSP */
 #if AIE_GEN <= 2
 #include "xtime_l.h"
 #else
 #include "xiltimer.h"
 #endif
+#else
+#include <unistd.h> /* usleep() on the host (aiesim) */
 #endif /* __AIESIM__ */
 
 #define uint_TYPE uint32_t
@@ -62,6 +65,45 @@
 #define CORE_OP_MEM 0x6000
 #endif
 
+// Core event trace capture buffer, in the same-column top MemTile's memory
+// (not tile (4,4)'s own data mem). The trace stream is routed DOWN from the core
+// through the intervening core tiles into the MemTile's S2MM DMA, so the deep
+// trace no longer steals space from the kernel's own data regions.
+#define TRC_ADDR 0x8000u
+#define TRC_MEMTILE_DMA_LOAL_OFFSET_ADDR 0x80000u
+#define TRC_LEN 0x1000u /* 4 KB of raw trace words, in MemTile memory */
+
+// Master switch for the core event-trace flow. The trace unit is routed down
+// into the MemTile's S2MM DMA channel (see TRC_S2MM_CH below). Set to 0 to fully
+// compile out trace setup/read and isolate whether the hang is trace-induced;
+// set to 1 to re-enable.
+#define TRACE_ENABLE 1
+// Physical stream channel used for every hop of the core->MemTile trace route
+// (core SOUTH-master / NORTH-slave and MemTile NORTH-slave port range is 0..3).
+#define TRC_STRM_CH 1
+// S2MM DMA channel the trace stream drains into on the MemTile. MemTile DMA
+// couples channel parity to the BD number: an EVEN channel requires BD < 24, an
+// odd channel requires BD >= 24 (driver _XAieMl_MemTileDmaCheckBdChValidity).
+// The setup call below uses BD 4, so this must be an even channel. On the
+// MemTile there is no clash with the movedata channel (that is on the core tile).
+#define TRC_S2MM_CH 0
+
+// Host<->AIE time-sync instrumentation. Emits a machine-readable [TIMESYNC]
+// block (host anchors, per-tile AIE-timer anchors, host phase events, raw trace
+// hex) that src/tool/debug/host_aie_timeline.py correlates into one microsecond
+// axis. Host-side only (XTime), so it is compiled out under the simulator.
+#ifndef __AIESIM__
+#define TIMESYNC 1
+#else
+#define TIMESYNC 0
+#endif
+
+// Core trace API from src/mlir/runtime/aie_runtime.c (linked into this host by
+// aiehlc.sh's RUNTIME_SRCS). Pulled in via the runtime header, which is on the
+// host compile include path (-I src/mlir/runtime). aie_runtime.h's guarded
+// <aie_codegen_inc/xaie_routing.h> include is skipped because xaiengine.h above
+// already defined XAIE_ROUTING_H.
+#include "aie_runtime.h"
 // Reduced for simulator
 // #define N 16
 #define N 4
@@ -121,7 +163,7 @@ int test_routing(XAie_DevInst *DevInst)
 #ifndef __AIESIM__
     XTime tStart, tEnd;
 #endif
-    printf("Starting test_routing 02/2 -1\n");
+    printf("Starting test_routing 08/14 -2\n");
     breakprint("core reset--");
 #ifdef __AIESIM__
     int shimcol = 3;
@@ -155,12 +197,85 @@ int test_routing(XAie_DevInst *DevInst)
         vmem_out[j] = j;
     }
 
-    const int count = 2; // iterations for perf measurement
+    const int count = 4; // iterations for perf measurement
+    printf("before runtimerace\n");
+
+    // ---- Host<->AIE time-sync + AIE core-trace: one container -------------
+    // trc_prof holds BOTH the host phase timeline (TS_EVT), the per-tile
+    // host<->AIE anchors (TS_ANCHOR) and the decoded core-trace intervals. A
+    // single __Runtime_aie_trace_profile_dump emits the whole [TIMESYNC] block.
+    // Traced-tile list: only (4,4) computes here; to place more tiles on the
+    // timeline, arm each via __Runtime_core_trace_setup with distinct trace
+    // buffers/channels, read each back, add it to ts_tiles[], and decode each
+    // into this same profile.
+#if (TIMESYNC || TRACE_ENABLE)
+    static AieTraceProfile trc_prof; // fixed-capacity sink (no malloc)
+    __Runtime_aie_trace_profile_init(&trc_prof);
+#endif
+#if TIMESYNC
+    XAie_LocType ts_tiles[] = {XAie_TileLoc(4, 4)};
+    const int ts_ntiles = (int)(sizeof(ts_tiles) / sizeof(ts_tiles[0]));
+    __Runtime_aie_trace_profile_set_clock(&trc_prof, (uint64_t)COUNTS_PER_SECOND);
+// Record a host phase event into the profile (bounded internally).
+#define TS_EVT(it, ph)                                                                                                 \
+    do {                                                                                                               \
+        XTime _h;                                                                                                      \
+        XTime_GetTime(&_h);                                                                                            \
+        __Runtime_aie_trace_profile_event(&trc_prof, (it), (ph), (uint64_t)_h);                                        \
+    } while (0)
+// Capture an anchor (which=0 before loop, 1 after): host-before -> read every
+// tile timer -> host-after; the anchor's host value is the midpoint
+// (XAie_ReadTimer has ~us AXI-MM latency).
+#define TS_ANCHOR(which)                                                                                               \
+    do {                                                                                                               \
+        XTime _hb, _ha;                                                                                                \
+        uint64_t _av[8] = {0};                                                                                         \
+        XTime_GetTime(&_hb);                                                                                           \
+        for (int _t = 0; _t < ts_ntiles; _t++) {                                                                       \
+            uint64_t _v = 0;                                                                                           \
+            __Runtime_read_aie_timer(DevInst, ts_tiles[_t], &_v);                                                      \
+            _av[_t] = _v;                                                                                              \
+        }                                                                                                              \
+        XTime_GetTime(&_ha);                                                                                           \
+        uint64_t _hm = (uint64_t)_hb + ((uint64_t)_ha - (uint64_t)_hb) / 2;                                            \
+        for (int _t = 0; _t < ts_ntiles; _t++)                                                                         \
+            __Runtime_aie_trace_profile_anchor(&trc_prof, (which), ts_tiles[_t], _av[_t], _hm);                        \
+    } while (0)
+#else
+#define TS_EVT(it, ph)                                                                                                 \
+    do {                                                                                                               \
+    } while (0)
+#endif
+
+    // Arm the core trace unit on tile (4,4) BEFORE the core runs: capture the
+    // ACTIVE/stall timeline and route it DOWN through the intervening core tiles
+    // into the same-column top MemTile's memory [TRC_ADDR, TRC_ADDR+TRC_LEN) via
+    // stream channel TRC_STRM_CH and the MemTile's S2MM channel TRC_S2MM_CH. Must
+    // precede XAie_Run (which makes the core active and fires ACTIVE_CORE, opening
+    // the trace window).
+#if TRACE_ENABLE
+    if (__Runtime_core_trace_setup(DevInst, XAie_TileLoc(4, 4), TRC_ADDR | TRC_MEMTILE_DMA_LOAL_OFFSET_ADDR, TRC_LEN,
+                                   /*strm_ch=*/TRC_STRM_CH,
+                                   /*s2mm_ch=*/TRC_S2MM_CH, 4) != XAIE_OK) {
+        printf("[perf] core_trace_setup failed\n");
+    }
+#endif
+
+    printf("after runtimerace\n");
 
 #ifndef __AIESIM__
     XTime_GetTime(&tStart);
 #endif
+
+    // Anchor0: bracket each tile's free-running timer with the host clock right
+    // before the run loop. Pairs with Anchor1 (after the loop) to fit AIE
+    // cycles -> host microseconds per tile.
+#if TIMESYNC
+    TS_ANCHOR(0);
+#endif
+
     for (int i = 0; i < count; i++) {
+        TS_EVT(i, "iter_start");
 
 #ifdef __AIESIM__
         if (i > 0) {
@@ -172,31 +287,41 @@ int test_routing(XAie_DevInst *DevInst)
 
         XAie_MemSyncForDev(in);
 
+        printf("after XAie_MemSyncForDev\n");
+
         breakprint("Starting to Move data\n");
         // step 3: move data to destination tile
         // XTime_GetTime(&tStart);
         // printf("vmem = 0x%p\n",vmem);
 
+        TS_EVT(i, "dma_in_start");
         XAie_MoveDataExternal2Aie(routingInstance, /*src=*/XAie_TileLoc(shimcol, 0), in, mlen * sizeof(u32),
                                   CORE_IP_MEM, /*dest=*/XAie_TileLoc(4, 4));
         XAie_RouteDmaWait(routingInstance, XAie_TileLoc(shimcol, 0), XAie_TileLoc(4, 4), true);
-        XAie_Run(routingInstance, 1);
+        TS_EVT(i, "dma_in_done");
+        TS_EVT(i, "run");
 
+        XAie_Run(routingInstance, 1);
+        printf("XAie_Run\n");
 #ifdef __AIESIM__
         while (XAie_CoreWaitForDone(DevInst, XAie_TileLoc(4, 4), 1) != XAIE_OK) {
         }
 #else
         XAie_CoreWaitForDone(DevInst, XAie_TileLoc(4, 4), 0);
 #endif
+        TS_EVT(i, "wait_done");
 
         breakprint("fflush\n");
+        printf("after XAie_CoreWaitForDone\n");
 
 #ifndef __AIESIM__
         Xil_DCacheFlushRange((INTPTR)vmem_out, mlen * sizeof(int32_t));
 #endif
+        TS_EVT(i, "dma_out_start");
         XAie_MoveDataAie2External(routingInstance, XAie_TileLoc(4, 4), CORE_OP_MEM, mlen * sizeof(u32), out,
                                   XAie_TileLoc(shimcol, 0));
         XAie_RouteDmaWait(routingInstance, XAie_TileLoc(4, 4), XAie_TileLoc(shimcol, 0), false);
+        TS_EVT(i, "dma_out_done");
         XAie_MemSyncForCPU(out);
 #ifndef __AIESIM__
         Xil_DCacheInvalidateRange((INTPTR)vmem_out, mlen * sizeof(int32_t));
@@ -217,6 +342,7 @@ int test_routing(XAie_DevInst *DevInst)
         int32_t B_mat[N][N];  // Matrix B
         int32_t result[N][N] = {0};  // Result matrix
 
+        printf("after Xil_DCacheInvalidateRange\n");
         // Extract matrix A (row major)
         for (int i = 0; i < N; i++) {
             for (int j = 0; j < N; j++) {
@@ -264,6 +390,50 @@ int test_routing(XAie_DevInst *DevInst)
         fflush(stdout);
         //*/
     }
+
+    // Anchor1: bracket the tile timers again immediately after the run loop.
+    // Together with Anchor0 this gives one continuous per-tile AIE-cycle ->
+    // host-us fit spanning all iterations (tile timers free-run from device
+    // init and are NOT reset between iterations on hardware).
+#if TIMESYNC
+    TS_ANCHOR(1);
+#endif
+
+    // Core finished: read back the captured trace words from the top MemTile's
+    // memory (row XAIE_AIE_TILE_ROW_START-1 = 2 in the same column) and decode
+    // them into a "cycle EVENT" timeline. The trace was routed there by
+    // __Runtime_core_trace_setup above; the read takes the MemTile loc, not the
+    // core loc.
+#if TRACE_ENABLE
+    uint32_t trc_buf[TRC_LEN / 4];
+    int trc_valid = 0;
+    {
+        usleep(1000 * 1000 * 5); // give the S2MM DMA a moment to finish writing the last trace words
+        if (__Runtime_core_trace_read(DevInst, XAie_TileLoc(4, 2), TRC_ADDR, trc_buf, TRC_LEN / 4) == XAIE_OK) {
+            trc_valid = 1;
+            printf("[perf] core trace timeline (core 4,4 -> memtile 4,2):\n");
+            // Tag intervals with the traced core (4,4), not the MemTile read loc.
+            __Runtime_aie_trace_profile_attach(&trc_prof, XAie_TileLoc(4, 4));
+            __Runtime_core_trace_decode(trc_buf, TRC_LEN / 4, &trc_prof);
+            __Runtime_aie_trace_profile_set_trace_words(&trc_prof, XAie_TileLoc(4, 4), TRC_LEN / 4);
+        } else {
+            printf("[perf] core_trace_read failed\n");
+        }
+    }
+#endif
+
+    // Emit the whole run as ONE machine-readable [TIMESYNC] block straight from
+    // the profile: host clock frequency, the two anchor records (host + per-tile
+    // AIE timer), every host phase event, the effective AIE Hz, the trace-word
+    // count, and one "[TIMESYNC] trace tile=c,r <start> -- <end> EVENT (N cyc)"
+    // line per decoded core-trace interval. src/tool/debug/host_aie_timeline.py
+    // parses these lines, fits each tile's AIE-cycle->host-us map from the
+    // anchors, and emits a merged host+AIE timeline as CSV/JSON.
+#if (TIMESYNC || TRACE_ENABLE)
+    __Runtime_aie_trace_profile_dump(&trc_prof);
+    fflush(stdout);
+#endif
+
 #ifndef __AIESIM__
     XTime_GetTime(&tEnd);
     printf("Transferred %u bytes (%d iter) in %.2f us.\n", (unsigned)(count * mlen * sizeof(u32)), count,
@@ -338,7 +508,7 @@ int main(int argc, char* argv[]) {
 #endif /* __AIESIM__ */
 
     test_routing(&DevInst);
-
+    return 1;
     RC = XAie_PartitionTeardown(&DevInst);
     if(RC != XAIE_OK) {
         printf("Failed to Teardown partition\n");
