@@ -564,6 +564,7 @@ typedef struct {
     int open;
     uint64_t start, end;
     uint32_t mask;
+    AieTraceProfile *prof; /* optional sink; NULL = print only */
 } __core_trace_run;
 
 /* Build the '|'-joined slot names of an 8-bit event mask into out[cap]
@@ -605,6 +606,20 @@ static void __core_trace_flush(__core_trace_run *run) {
     else
         printf("%llu -- %llu  %s  (%llu cyc)\n", (unsigned long long)run->start, (unsigned long long)run->end, names,
                (unsigned long long)(run->end - run->start + 1u));
+    /* Append the same coalesced interval into the optional profile. */
+    if (run->prof) {
+        AieTraceProfile *p = run->prof;
+        if (p->count < AIE_TRACE_PROFILE_CAP) {
+            AieTraceInterval *v = &p->iv[p->count++];
+            v->col = p->cur_col;
+            v->row = p->cur_row;
+            v->mask = run->mask;
+            v->start_cycle = run->start;
+            v->end_cycle = run->end;
+        } else {
+            p->dropped++;
+        }
+    }
     run->open = 0;
 }
 
@@ -642,7 +657,7 @@ static void __core_trace_repeat(__core_trace_run *run, uint64_t *cycle, uint32_t
     }
 }
 
-void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords) {
+void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof) {
     printf("[aie_runtime] core_trace_decode: buf=%p nwords=%u\n", (const void *)buf, nwords);
     if (!buf)
         return;
@@ -669,6 +684,7 @@ void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords) {
     int last_kind = -1;         /* -1 none, 0 single, 1 multiple, 2 sync */
     uint32_t last_events = 0;   /* single: slot index; multiple: 8-bit mask */
     __core_trace_run run = {0}; /* run-length coalescer for per-cycle events */
+    run.prof = prof;            /* optional interval sink */
 
     while (bitpos + 8u <= total_bits) {
         uint32_t b0 = __core_trace_peek8(buf, bitpos), v;
@@ -754,6 +770,142 @@ void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords) {
         }
     }
     __core_trace_flush(&run);
+}
+
+void __Runtime_aie_trace_profile_init(AieTraceProfile *p) {
+    if (!p)
+        return;
+    p->count = 0;
+    p->dropped = 0;
+    p->cur_col = 0;
+    p->cur_row = 0;
+    p->attached = 0;
+    p->cps = 0;
+    p->host0 = 0;
+    p->host1 = 0;
+    p->nanchor = 0;
+    p->nevt = 0;
+    p->evt_dropped = 0;
+    p->words_col = 0;
+    p->words_row = 0;
+    p->nwords = 0;
+}
+
+void __Runtime_aie_trace_profile_attach(AieTraceProfile *p, XAie_LocType tile) {
+    if (!p)
+        return;
+    p->cur_col = tile.Col;
+    p->cur_row = tile.Row;
+    p->attached = 1;
+}
+
+void __Runtime_aie_trace_profile_set_clock(AieTraceProfile *p, uint64_t cps) {
+    if (!p)
+        return;
+    p->cps = cps;
+}
+
+/* Find the anchor slot for (col,row), creating it if new; NULL if the table is
+ * full. */
+static AieTraceAnchor *__aie_trace_anchor_slot(AieTraceProfile *p, uint8_t col, uint8_t row) {
+    for (uint32_t i = 0; i < p->nanchor; i++) {
+        if (p->anchor[i].col == col && p->anchor[i].row == row)
+            return &p->anchor[i];
+    }
+    if (p->nanchor >= AIE_TRACE_ANCHOR_CAP)
+        return NULL;
+    AieTraceAnchor *a = &p->anchor[p->nanchor++];
+    a->col = col;
+    a->row = row;
+    a->aie0 = 0;
+    a->aie1 = 0;
+    return a;
+}
+
+void __Runtime_aie_trace_profile_anchor(AieTraceProfile *p, int which, XAie_LocType tile, uint64_t aie, uint64_t host) {
+    if (!p)
+        return;
+    AieTraceAnchor *a = __aie_trace_anchor_slot(p, tile.Col, tile.Row);
+    if (a) {
+        if (which == 0)
+            a->aie0 = aie;
+        else
+            a->aie1 = aie;
+    }
+    if (which == 0)
+        p->host0 = host;
+    else
+        p->host1 = host;
+}
+
+void __Runtime_aie_trace_profile_event(AieTraceProfile *p, int iter, const char *phase, uint64_t host) {
+    if (!p)
+        return;
+    if (p->nevt >= AIE_TRACE_EVENT_CAP) {
+        p->evt_dropped++;
+        return;
+    }
+    AieTraceHostEvt *e = &p->evt[p->nevt++];
+    e->iter = iter;
+    e->phase = phase;
+    e->host = host;
+}
+
+void __Runtime_aie_trace_profile_set_trace_words(AieTraceProfile *p, XAie_LocType tile, uint32_t nwords) {
+    if (!p)
+        return;
+    p->words_col = tile.Col;
+    p->words_row = tile.Row;
+    p->nwords = nwords;
+}
+
+void __Runtime_aie_trace_profile_dump(AieTraceProfile *p) {
+    if (!p) {
+        printf("[aie_runtime] trace_profile_dump: NULL profile\n");
+        return;
+    }
+    printf("[aie_runtime] trace_profile_dump: %u intervals (dropped=%u)\n", (unsigned)p->count, (unsigned)p->dropped);
+
+    /* Host<->AIE time-sync block: only when something was recorded, so a
+     * decode-only profile keeps emitting just the interval lines below. */
+    if (p->cps)
+        printf("[TIMESYNC] cps=%llu\n", (unsigned long long)p->cps);
+    if (p->nanchor) {
+        printf("[TIMESYNC] anchor0 host=%llu\n", (unsigned long long)p->host0);
+        for (uint32_t i = 0; i < p->nanchor; i++)
+            printf("[TIMESYNC] anchor0 tile=%u,%u aie=%llu\n", (unsigned)p->anchor[i].col, (unsigned)p->anchor[i].row,
+                   (unsigned long long)p->anchor[i].aie0);
+        printf("[TIMESYNC] anchor1 host=%llu\n", (unsigned long long)p->host1);
+        for (uint32_t i = 0; i < p->nanchor; i++)
+            printf("[TIMESYNC] anchor1 tile=%u,%u aie=%llu\n", (unsigned)p->anchor[i].col, (unsigned)p->anchor[i].row,
+                   (unsigned long long)p->anchor[i].aie1);
+    }
+    for (uint32_t e = 0; e < p->nevt; e++)
+        printf("[TIMESYNC] hostevt iter=%d phase=%s host=%llu\n", p->evt[e].iter,
+               p->evt[e].phase ? p->evt[e].phase : "?", (unsigned long long)p->evt[e].host);
+    /* Effective AIE Hz from the empirical slope (sanity only). */
+    if (p->host1 > p->host0 && p->cps) {
+        for (uint32_t i = 0; i < p->nanchor; i++)
+            printf("[TIMESYNC] aiehz tile=%u,%u hz=%.3f\n", (unsigned)p->anchor[i].col, (unsigned)p->anchor[i].row,
+                   (double)(p->anchor[i].aie1 - p->anchor[i].aie0) / (double)(p->host1 - p->host0) * (double)p->cps);
+    }
+    if (p->nwords)
+        printf("[TIMESYNC] trace tile=%u,%u words=%u\n", (unsigned)p->words_col, (unsigned)p->words_row,
+               (unsigned)p->nwords);
+
+    /* Decoded AIE intervals, one machine-readable [TIMESYNC] trace line each. */
+    for (uint32_t i = 0; i < p->count; i++) {
+        AieTraceInterval *v = &p->iv[i];
+        char names[128];
+        __core_trace_names(v->mask, names, sizeof(names));
+        if (v->start_cycle == v->end_cycle)
+            printf("[TIMESYNC] trace tile=%u,%u %llu  %s\n", (unsigned)v->col, (unsigned)v->row,
+                   (unsigned long long)v->start_cycle, names);
+        else
+            printf("[TIMESYNC] trace tile=%u,%u %llu -- %llu  %s  (%llu cyc)\n", (unsigned)v->col, (unsigned)v->row,
+                   (unsigned long long)v->start_cycle, (unsigned long long)v->end_cycle, names,
+                   (unsigned long long)(v->end_cycle - v->start_cycle + 1u));
+    }
 }
 
 // Global routing instance (kept for legacy path)
@@ -1099,6 +1251,30 @@ AieRC __Runtime_perfcnt_read(XAie_DevInst *dev, XAie_LocType tile, uint8_t count
                           (unsigned)tile.Row, (unsigned)counter_id, (unsigned)*value));
     }
     return rc;
+}
+
+/**
+ * Read the free-running core timer of `tile` (XAIE_CORE_MOD). This is the same
+ * clock domain as the core event trace: the Start frame's 56-bit timer base and
+ * the delta-cycle accumulation in __Runtime_core_trace_decode. Reading it from
+ * the host lets a caller anchor AIE cycles against the ARM host clock (XTime)
+ * and place both on one time axis. Portable wrapper only — host-time capture
+ * and correlation stay host-side.
+ */
+AieRC __Runtime_read_aie_timer(XAie_DevInst *dev, XAie_LocType tile, uint64_t *val) {
+    if (!val)
+        return XAIE_INVALID_ARGS;
+    u64 t = 0;
+    AieRC rc = XAie_ReadTimer(dev, tile, XAIE_CORE_MOD, &t);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] read_aie_timer: XAie_ReadTimer failed tile(%u,%u) rc=%d\n", (unsigned)tile.Col,
+               (unsigned)tile.Row, (int)rc);
+        return rc;
+    }
+    *val = (uint64_t)t;
+    AIEHLC_LOG(printf("[aie_runtime] read_aie_timer tile(%u,%u) timer=%llu\n", (unsigned)tile.Col, (unsigned)tile.Row,
+                      (unsigned long long)*val));
+    return XAIE_OK;
 }
 
 /**

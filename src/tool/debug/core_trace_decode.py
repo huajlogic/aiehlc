@@ -4,10 +4,13 @@
 Decodes AIE2ps Event-Time trace frames (Architecture Spec, Figure 4-14). The C
 function's signature is:
 
-    void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords);
+    void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords,
+                                     AieTraceProfile *prof);
 
 and the caller (example/perf/aieml_perf.cc) passes nwords = TRC_LEN/4, i.e. the
-FULL buffer capacity, so the all-zero packet check terminates decoding.
+FULL buffer capacity, so the all-zero packet check terminates decoding. The
+optional prof sink (C-side interval capture) does not affect decode output and
+is not modelled here; this simulator mirrors the printed timeline only.
 
 TRANSPORT FRAMING (hardware-defined): the trace unit output is a packet-switched
 stream hardened to 8-word packets:

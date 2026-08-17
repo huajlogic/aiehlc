@@ -4,8 +4,10 @@
 The C decoder cannot be linked standalone (aie_runtime.c pulls in xaiengine.h),
 so this test extracts ONLY the self-contained decoder region from the real
 source -- the `s_core_trace_slot_name[]` table plus everything from
-`#define XAIE_TRACE_SYNC_CYCLES` down to the end of __Runtime_core_trace_decode
--- wraps it in a tiny main() harness, compiles it with gcc, and runs it. It is
+`#define XAIE_TRACE_SYNC_CYCLES` down through the trace-profile API (init/attach/
+dump) that follows __Runtime_core_trace_decode -- wraps it in a tiny main()
+harness (with a minimal AieTraceProfile/XAie_LocType shim), compiles it with
+gcc, and runs it. It is
 the actual production bytes that are exercised, so a regression in aie_runtime.c
 fails this test.
 
@@ -47,13 +49,86 @@ def _extract_c_decoder(src):
     return slot_tbl, block
 
 
+# Minimal shim for the types the profile path references. The real defs live in
+# aie_runtime.h (which pulls in xaiengine.h and cannot be included standalone);
+# only the fields the extracted code touches matter here. Must match the header.
+_PROFILE_SHIM = r"""
+typedef struct { uint8_t Col, Row; } XAie_LocType;
+
+typedef struct {
+    uint8_t  col, row;
+    uint32_t mask;
+    uint64_t start_cycle, end_cycle;
+} AieTraceInterval;
+
+typedef struct {
+    uint8_t  col, row;
+    uint64_t aie0, aie1;
+} AieTraceAnchor;
+
+typedef struct {
+    int         iter;
+    const char *phase;
+    uint64_t    host;
+} AieTraceHostEvt;
+
+#define AIE_TRACE_PROFILE_CAP 512u
+#define AIE_TRACE_ANCHOR_CAP    8u
+#define AIE_TRACE_EVENT_CAP    64u
+typedef struct {
+    AieTraceInterval iv[AIE_TRACE_PROFILE_CAP];
+    uint32_t count;
+    uint32_t dropped;
+    uint8_t  cur_col, cur_row;
+    int      attached;
+    uint64_t cps;
+    uint64_t host0, host1;
+    AieTraceAnchor anchor[AIE_TRACE_ANCHOR_CAP];
+    uint32_t nanchor;
+    AieTraceHostEvt evt[AIE_TRACE_EVENT_CAP];
+    uint32_t nevt;
+    uint32_t evt_dropped;
+    uint8_t  words_col, words_row;
+    uint32_t nwords;
+} AieTraceProfile;
+"""
+
+
+# Default path calls decode with a NULL profile so existing transcripts are
+# byte-identical. "--profile" builds a profile, attaches tile (4,4), decodes
+# into it, then dumps -- exercising the real flush-append + dump bytes.
+# "--profile-host" additionally records the host<->AIE time-sync fields
+# (set_clock/anchor/event/set_trace_words) so the dump emits the full
+# [TIMESYNC] host block ahead of the interval lines.
 _HARNESS_MAIN = r"""
 int main(int argc, char **argv) {
     static uint32_t buf[8192];
     uint32_t n = 0;
-    for (int i = 1; i < argc && n < 8192; i++)
+    int prof_mode = 0, host_mode = 0, first = 1;
+    if (argc > 1 && strcmp(argv[1], "--profile") == 0) { prof_mode = 1; first = 2; }
+    else if (argc > 1 && strcmp(argv[1], "--profile-host") == 0) { prof_mode = 1; host_mode = 1; first = 2; }
+    for (int i = first; i < argc && n < 8192; i++)
         buf[n++] = (uint32_t)strtoul(argv[i], NULL, 0);
-    __Runtime_core_trace_decode(buf, n);
+    if (prof_mode) {
+        static AieTraceProfile prof;
+        XAie_LocType t; t.Col = 4; t.Row = 4;
+        __Runtime_aie_trace_profile_init(&prof);
+        __Runtime_aie_trace_profile_attach(&prof, t);
+        if (host_mode) {
+            /* Known anchors: cps=1000000, host 0..500, tile(4,4) aie 2000..3000.
+             * Effective Hz = (3000-2000)/(500-0)*1000000 = 2000000000. */
+            __Runtime_aie_trace_profile_set_clock(&prof, 1000000ull);
+            __Runtime_aie_trace_profile_anchor(&prof, 0, t, 2000ull, 0ull);
+            __Runtime_aie_trace_profile_anchor(&prof, 1, t, 3000ull, 500ull);
+            __Runtime_aie_trace_profile_event(&prof, 0, "iter_start", 10ull);
+            __Runtime_aie_trace_profile_event(&prof, 0, "run", 20ull);
+            __Runtime_aie_trace_profile_set_trace_words(&prof, t, n);
+        }
+        __Runtime_core_trace_decode(buf, n, &prof);
+        __Runtime_aie_trace_profile_dump(&prof);
+    } else {
+        __Runtime_core_trace_decode(buf, n, NULL);
+    }
     return 0;
 }
 """
@@ -67,8 +142,9 @@ def _build_harness():
     with open(_RUNTIME_C) as f:
         src = f.read()
     slot_tbl, block = _extract_c_decoder(src)
-    prog = ("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n\n"
-            + slot_tbl + "\n\n" + block + "\n" + _HARNESS_MAIN)
+    prog = ("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n"
+            "#include <string.h>\n\n"
+            + _PROFILE_SHIM + "\n" + slot_tbl + "\n\n" + block + "\n" + _HARNESS_MAIN)
 
     d = tempfile.mkdtemp(prefix="ctd_ut_")
     cpath = os.path.join(d, "harness.c")
@@ -212,6 +288,25 @@ def run_c(words):
     return _norm(r.stdout)
 
 
+def run_c_profile(words):
+    """Run the decoder with an attached AieTraceProfile (tile 4,4) and dump it."""
+    b = _cc_bin()
+    assert b is not None
+    r = subprocess.run([b, "--profile"] + [hex(w) for w in words], capture_output=True, text=True)
+    assert r.returncode == 0, f"harness crashed: {r.stderr}"
+    return _norm(r.stdout)
+
+
+def run_c_profile_host(words):
+    """Run the decoder with a profile that ALSO carries host time-sync fields
+    (cps/anchor/event/words), so the dump emits the full [TIMESYNC] host block."""
+    b = _cc_bin()
+    assert b is not None
+    r = subprocess.run([b, "--profile-host"] + [hex(w) for w in words], capture_output=True, text=True)
+    assert r.returncode == 0, f"harness crashed: {r.stderr}"
+    return _norm(r.stdout)
+
+
 def run_py(words):
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -238,6 +333,40 @@ def timeline(text):
         for cyc in range(start, end + 1):
             for nm in names:
                 out.append((cyc, nm))
+    return out
+
+
+def raw_intervals(text):
+    """The decoder's own printed intervals as (start, end, names) tuples --
+    NOT expanded per-cycle. Dump lines (leading spaces) never match _EVT."""
+    out = []
+    for ln in text.splitlines():
+        m = _EVT.match(ln)
+        if not m:
+            continue
+        s = int(m.group(1))
+        e = int(m.group(2)) if m.group(2) else s
+        out.append((s, e, m.group(3)))
+    return out
+
+
+# Profile dump interval line:
+#   "[TIMESYNC] trace tile=<c>,<r> <start>[ -- <end>]  <events>[  (<N> cyc)]".
+# The "[TIMESYNC] trace tile=c,r words=N" header line has "words=" (not a digit)
+# after the tile, so it never matches this interval regex.
+_PROF = re.compile(r"^\[TIMESYNC\] trace tile=(\d+),(\d+) (\d+)(?:\s+--\s+(\d+))?  (\S+?)(?:  \(\d+ cyc\))?$")
+
+
+def profile_intervals(text):
+    """Parse __Runtime_aie_trace_profile_dump output into
+    (col, row, start, end, names) tuples."""
+    out = []
+    for ln in text.splitlines():
+        m = _PROF.match(ln)
+        if not m:
+            continue
+        out.append((int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                    int(m.group(4)) if m.group(4) else int(m.group(3)), m.group(5)))
     return out
 
 
@@ -306,6 +435,86 @@ def test_extract_regions_present():
     assert "ACTIVE" in slot_tbl and "MEMORY_STALL" in slot_tbl
     assert "__core_trace_bits" in block
     assert "void __Runtime_core_trace_decode(" in block
+    # The profile API travels with the decoder (same extracted region).
+    assert "__Runtime_aie_trace_profile_dump" in block
+
+
+# --------------------------------------------------------------------------
+# Trace-profile capture (AieTraceProfile: init/attach/decode-into/dump).
+# --------------------------------------------------------------------------
+def test_profile_captures_single_cycle_events():
+    _skip_if_no_cc()
+    words = pack(start(1000), single(0, 10), single(2, 100), multiple(0x03, 5))
+    out = run_c_profile(words)
+    ivs = profile_intervals(out)
+    # Three non-contiguous 1-cycle events, tagged with the attached tile (4,4).
+    assert [(c, r, s, e, nm) for c, r, s, e, nm in ivs] == [
+        (4, 4, 1010, 1010, "ACTIVE"),
+        (4, 4, 1110, 1110, "STREAM_STALL"),
+        (4, 4, 1115, 1115, "ACTIVE|LOCK_STALL"),
+    ]
+    assert "trace_profile_dump: 3 intervals (dropped=0)" in out
+
+
+def test_profile_coalesces_and_matches_printed_intervals():
+    _skip_if_no_cc()
+    # Contiguous same-slot cycles 1010..1012 coalesce; then a lone STREAM_STALL.
+    words = pack(start(1000), single(0, 10), single(0, 1), single(0, 1), single(2, 100))
+    out = run_c_profile(words)
+    captured = [(s, e, nm) for _, _, s, e, nm in profile_intervals(out)]
+    assert captured == [(1010, 1012, "ACTIVE"), (1112, 1112, "STREAM_STALL")]
+    # The profile holds EXACTLY the decoder's own printed intervals.
+    assert captured == raw_intervals(out)
+    # Every captured interval carries the attached tile.
+    assert all((c, r) == (4, 4) for c, r, *_ in profile_intervals(out))
+
+
+def test_profile_null_leaves_output_unchanged():
+    # The default (NULL-profile) path must be byte-identical to the plain run.
+    _skip_if_no_cc()
+    words = pack(start(1000), single(0, 10), single(2, 100))
+    assert run_c(words) == run_py(words)     # existing invariant, NULL path
+    # A --profile run's decode section prints the same intervals, plus a dump.
+    prof_out = run_c_profile(words)
+    assert raw_intervals(prof_out) == raw_intervals(run_c(words))
+
+
+def test_profile_host_block_emits_timesync_fields():
+    # The unified dump emits the host time-sync block (cps/anchors/hostevt/aiehz/
+    # words) ahead of the [TIMESYNC] trace interval lines.
+    _skip_if_no_cc()
+    words = pack(start(1000), single(0, 10), single(2, 100))
+    out = run_c_profile_host(words)
+    assert "[TIMESYNC] cps=1000000" in out
+    assert "[TIMESYNC] anchor0 host=0" in out
+    assert "[TIMESYNC] anchor0 tile=4,4 aie=2000" in out
+    assert "[TIMESYNC] anchor1 host=500" in out
+    assert "[TIMESYNC] anchor1 tile=4,4 aie=3000" in out
+    assert "[TIMESYNC] hostevt iter=0 phase=iter_start host=10" in out
+    assert "[TIMESYNC] hostevt iter=0 phase=run host=20" in out
+    # Effective Hz = (3000-2000)/(500-0)*1e6 = 2e6.
+    assert "[TIMESYNC] aiehz tile=4,4 hz=2000000.000" in out
+    # words = number of trace words passed on the command line.
+    assert ("[TIMESYNC] trace tile=4,4 words=%u" % len(words)) in out
+    # Interval lines still parse and are tagged with tile (4,4).
+    ivs = profile_intervals(out)
+    assert ivs == [(4, 4, 1010, 1010, "ACTIVE"), (4, 4, 1110, 1110, "STREAM_STALL")]
+
+
+def test_profile_host_block_absent_without_host_fields():
+    # A decode-only --profile run records no host fields, so NO [TIMESYNC] host
+    # lines appear -- only the [TIMESYNC] trace interval lines.
+    _skip_if_no_cc()
+    words = pack(start(1000), single(0, 10), single(2, 100))
+    out = run_c_profile(words)
+    assert "[TIMESYNC] cps=" not in out
+    assert "[TIMESYNC] anchor0" not in out
+    assert "[TIMESYNC] hostevt" not in out
+    assert "[TIMESYNC] aiehz" not in out
+    assert "[TIMESYNC] trace tile=4,4 words=" not in out
+    # But the interval lines are still present and parseable.
+    assert profile_intervals(out) == [(4, 4, 1010, 1010, "ACTIVE"),
+                                       (4, 4, 1110, 1110, "STREAM_STALL")]
 
 
 # --------------------------------------------------------------------------

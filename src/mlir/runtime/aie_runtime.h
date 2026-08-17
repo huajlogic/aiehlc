@@ -392,6 +392,11 @@ AieRC __Runtime_perfcnt_setup(XAie_DevInst *dev, XAie_LocType tile, uint8_t coun
 // Read a perf counter value from a core tile memory module.
 AieRC __Runtime_perfcnt_read(XAie_DevInst *dev, XAie_LocType tile, uint8_t counter_id, uint32_t *value);
 
+// Read the free-running core timer of `tile` (XAIE_CORE_MOD) — the same clock
+// domain as the core event trace. Lets the host anchor AIE cycles against the
+// ARM host clock (XTime) so both land on one time axis. Portable wrapper only.
+AieRC __Runtime_read_aie_timer(XAie_DevInst *dev, XAie_LocType tile, uint64_t *val);
+
 // Set perf counters for MM2S channel 0 BD finished (counter 0) and
 // MM2S channel 1 BD finished (counter 1) on a single core tile.
 AieRC __Runtime_perfcnt_setup_mm2s_bd_finished(XAie_DevInst *dev, XAie_LocType tile);
@@ -448,8 +453,94 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
 AieRC __Runtime_core_trace_read(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t *dst,
                                 uint32_t len_words);
 
+// ---------------------------------------------------------------------------
+// Trace profile: capture decoded intervals instead of only printing them.
+// ---------------------------------------------------------------------------
+// One coalesced trace interval: cycles [start_cycle, end_cycle] all carried the
+// identical 8-bit event mask. Cycles are raw AIE core-timer cycles (the same
+// domain as the Start-frame timer); cycle->us correlation is done off-device
+// from the [TIMESYNC] anchors.
+typedef struct {
+    uint8_t col, row; // tile that produced it (set by attach)
+    uint32_t mask;    // 8-bit event mask (ACTIVE/*_STALL/...)
+    uint64_t start_cycle, end_cycle;
+} AieTraceInterval;
+
+// One host<->AIE anchor pair for a tile: the tile's free-running AIE core-timer
+// value sampled before (aie0) and after (aie1) the run loop. The matching host
+// counts are shared across tiles (single host clock) and live in host0/host1.
+typedef struct {
+    uint8_t col, row;
+    uint64_t aie0, aie1;
+} AieTraceAnchor;
+
+// One host-side phase event: the host clock count (XTime) at a named boundary
+// of iteration `iter` (e.g. "dma_in_done", "run", "wait_done"). `phase` points
+// to a string literal, so it is stored by pointer (no copy).
+typedef struct {
+    int iter;
+    const char *phase;
+    uint64_t host;
+} AieTraceHostEvt;
+
+#define AIE_TRACE_PROFILE_CAP 512u
+#define AIE_TRACE_ANCHOR_CAP 8u
+#define AIE_TRACE_EVENT_CAP 64u
+// Fixed-capacity, no-malloc collector (baremetal-safe). One container for a run:
+// the decoded AIE core-trace intervals AND the host<->AIE time-sync record
+// (clock, anchors, phase events). __core_trace_decode appends intervals; the
+// host-side helpers below record the rest; __..._dump emits everything as one
+// [TIMESYNC] block so external tools parse a single artifact.
+typedef struct {
+    AieTraceInterval iv[AIE_TRACE_PROFILE_CAP];
+    uint32_t count;           // valid intervals in iv[]
+    uint32_t dropped;         // intervals discarded past CAP
+    uint8_t cur_col, cur_row; // tag applied to appended intervals
+    int attached;             // nonzero after attach()
+    // --- host<->AIE time-sync ---
+    uint64_t cps;          // host COUNTS_PER_SECOND (0 = unset)
+    uint64_t host0, host1; // host anchor counts (midpoint), 0 = unset
+    AieTraceAnchor anchor[AIE_TRACE_ANCHOR_CAP];
+    uint32_t nanchor; // valid entries in anchor[]
+    AieTraceHostEvt evt[AIE_TRACE_EVENT_CAP];
+    uint32_t nevt;                // valid entries in evt[]
+    uint32_t evt_dropped;         // host events discarded past CAP
+    uint8_t words_col, words_row; // tile whose raw-trace word count is recorded
+    uint32_t nwords;              // raw trace words read (0 = unset)
+} AieTraceProfile;
+
+// Zero the profile (no allocation).
+void __Runtime_aie_trace_profile_init(AieTraceProfile *p);
+
+// Set the tile the next decode's intervals are tagged with.
+void __Runtime_aie_trace_profile_attach(AieTraceProfile *p, XAie_LocType tile);
+
+// Record the host clock frequency (COUNTS_PER_SECOND) for the time-sync block.
+void __Runtime_aie_trace_profile_set_clock(AieTraceProfile *p, uint64_t cps);
+
+// Record one anchor sample: which=0 (before loop) or 1 (after loop), the tile's
+// AIE core-timer value `aie`, and the shared host count `host`. Finds/creates
+// the per-tile anchor slot and also stores host into host0 (which=0) / host1.
+void __Runtime_aie_trace_profile_anchor(AieTraceProfile *p, int which, XAie_LocType tile, uint64_t aie, uint64_t host);
+
+// Append one host phase event (iter, phase name, host count). Bounded; silently
+// counts drops past AIE_TRACE_EVENT_CAP into evt_dropped.
+void __Runtime_aie_trace_profile_event(AieTraceProfile *p, int iter, const char *phase, uint64_t host);
+
+// Record how many raw trace words were read for `tile` (count only; the words
+// themselves are already decoded into intervals and are not stored).
+void __Runtime_aie_trace_profile_set_trace_words(AieTraceProfile *p, XAie_LocType tile, uint32_t nwords);
+
+// Emit the whole run as one [TIMESYNC] block: an interval-count summary, then
+// (when present) cps / anchor0 / anchor1 / hostevt / aiehz / trace-word count,
+// then one "[TIMESYNC] trace tile=c,r <start> -- <end> EVENT (N cyc)" line per
+// captured interval. Host lines are skipped when their fields are unset, so a
+// decode-only profile dumps just the interval lines.
+void __Runtime_aie_trace_profile_dump(AieTraceProfile *p);
+
 // Decode+print the ACTIVE/*_STALL timeline from raw trace words (host-side).
-void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords);
+// If prof is non-NULL, each coalesced interval is also appended into it.
+void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof);
 
 // ---------------------------------------------------------------------------
 // DMA-capable buffer allocation with cache sync support

@@ -4,9 +4,10 @@
 Unlike test_core_trace_decode.py (which compiles a main() harness and shells
 out), this builds a Cython extension that binds the C API
 
-    void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords);
+    void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords,
+                                     AieTraceProfile *prof);
 
-and calls it DIRECTLY in-process. The decoder body is extracted from the real
+and calls it DIRECTLY in-process (with prof=NULL, the print-only path). The decoder body is extracted from the real
 aie_runtime.c (the self-contained region only -- it cannot be linked whole
 because aie_runtime.c pulls in xaiengine.h). Because the API returns void and
 reports through printf, the test captures C-level fd 1 around each call.
@@ -38,7 +39,9 @@ from libc.stdio cimport fflush, stdout
 from libc.stdlib cimport malloc, free
 
 cdef extern from "ctd_impl.h":
-    void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords)
+    ctypedef struct AieTraceProfile:
+        pass
+    void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof)
 
 def decode(list words):
     """Call the C API in-process with an array built from `words`."""
@@ -50,14 +53,18 @@ def decode(list words):
     try:
         for i in range(n):
             buf[i] = <uint32_t>(int(words[i]) & 0xFFFFFFFF)
-        __Runtime_core_trace_decode(buf, n)
+        __Runtime_core_trace_decode(buf, n, NULL)   # NULL = print-only path
         fflush(stdout)                 # flush C stdio before fd 1 is restored
     finally:
         free(buf)
 '''
 
+# Opaque AieTraceProfile in the extern header: the in-process test only ever
+# passes NULL, so the generated C needs the type name, not its layout. The impl
+# TU defines the real struct via base._PROFILE_SHIM; the two never meet.
 _IMPL_H = ("#ifndef CTD_IMPL_H\n#define CTD_IMPL_H\n#include <stdint.h>\n"
-           "void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords);\n"
+           "typedef struct AieTraceProfile AieTraceProfile;\n"
+           "void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof);\n"
            "#endif\n")
 
 _SETUP = (
@@ -84,7 +91,10 @@ def _build_cy_module():
     with open(base._RUNTIME_C) as f:
         src = f.read()
     slot_tbl, block = base._extract_c_decoder(src)
-    impl_c = "#include <stdint.h>\n#include <stdio.h>\n\n" + slot_tbl + "\n\n" + block + "\n"
+    # The extracted region now includes the profile API, which references
+    # AieTraceProfile/XAie_LocType; provide the same shim the subprocess suite uses.
+    impl_c = ("#include <stdint.h>\n#include <stdio.h>\n\n"
+              + base._PROFILE_SHIM + "\n" + slot_tbl + "\n\n" + block + "\n")
 
     d = tempfile.mkdtemp(prefix="ctd_cy_")
     for name, text in (("ctd_impl.h", _IMPL_H), ("ctd_impl.c", impl_c),
