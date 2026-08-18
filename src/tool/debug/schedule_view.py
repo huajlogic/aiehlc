@@ -1453,6 +1453,8 @@ class DfscheduleSlicer:
 
 import re as _re
 
+
+
 def _load_comm_paths(workdir):
     """Load comm_paths from dmaphopprovenacemap.json + optional routingprovenancemap.json.
 
@@ -2066,7 +2068,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                display:flex; flex-direction:column; }
   #right { flex:1 1 0; min-width:200px; padding:16px; overflow:hidden;
            display:flex; flex-direction:column; }
-  #panel { flex:1 1 0; overflow:auto; min-height:0; }
+  #panel { flex:1 1 0; min-height:0; display:flex; flex-direction:column; position:relative; }
+  #panel-body { flex:1 1 0; overflow-y:auto; min-height:0; }
+  #panel-toc { position:absolute; right:0; top:0; width:112px; overflow-y:auto;
+               max-height:100%; background:rgba(28,28,28,0.40);
+               border-left:1px solid rgba(255,255,255,0.08);
+               padding:0; z-index:5; transition:width 0.15s ease; }
+  #panel-toc.no-items { display:none; }
+  #panel-toc.collapsed { width:22px; overflow:hidden; }
+  #panel-toc.collapsed .ptoc-item { display:none; }
+  .ptoc-toggle { display:block; width:100%; padding:4px 0; text-align:center;
+                 font-size:14px; color:var(--tx); background:none; border:none;
+                 border-bottom:1px solid rgba(255,255,255,0.08); cursor:pointer; line-height:1; }
+  .ptoc-toggle:hover { color:var(--accent); }
+  .ptoc-top { display:block; width:100%; padding:3px 0; text-align:center;
+              font-size:13px; color:var(--tx); background:none; border:none;
+              border-bottom:1px solid rgba(255,255,255,0.06); cursor:pointer; line-height:1; }
+  .ptoc-top:hover { color:var(--tx-hi); }
+  .ptoc-item { display:block; padding:2px 8px; font-size:10px; color:var(--tx);
+               cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+               line-height:1.5; }
+  .ptoc-item:hover { color:var(--tx-hi); background:rgba(255,255,255,0.06); }
   /* Title + item tabs share one row, and it sits OUTSIDE #panel: the strip used
      to scroll away with the body, and hoisting it costs no extra height. */
   #panel-hdr { flex:0 0 auto; display:flex; align-items:baseline; flex-wrap:wrap;
@@ -2839,6 +2861,39 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                            white-space:nowrap; }
   .rctbl td:first-child { color:var(--accent-fg); font-family:ui-monospace,monospace; }
 
+  /* ── tile routing + DMA BD mini-sections ─────────────────────── */
+  .rt-row { display:flex; align-items:center; gap:6px; font-size:11px;
+            font-family:ui-monospace,monospace; padding:2px 4px;
+            border-radius:2px; margin:1px 0; }
+  .rt-row .rt-kind { flex:0 0 32px; font-size:9px; font-weight:700;
+                      text-transform:uppercase; color:var(--tx-lo); }
+  .rt-row .rt-ports { flex:1; color:var(--tx-hi); }
+  .rt-row .rt-flow  { flex:0 0 auto; color:var(--tx-lo); font-size:9px; }
+  .rt-row .rt-pktid { flex:0 0 auto; font-size:9px; color:#c07fd4;
+                       background:#1a0d24; border-radius:2px; padding:0 3px; margin-left:2px; }
+  .rt-row .rt-dma   { flex:0 0 auto; font-size:9px; color:#40c4a0;
+                       background:#081812; border-radius:2px; padding:0 3px; margin-left:2px; }
+  .rt-row .rt-fwd   { color:var(--tx-lo); font-size:9px; margin-left:2px; }
+  .rt-row.cct  { border-left:2px solid #4a7fd4; }
+  .rt-row.pkt  { border-left:2px solid #9c4fd4; }
+  .rt-row.shim { border-left:2px solid #4aa4d4; }
+  .rt-row.sw-issue { background:rgba(200,40,40,.13); }
+  .sw-warn-hdr { font-size:10px; color:var(--amber-fg); margin-bottom:6px;
+                 display:flex; flex-direction:column; gap:2px; }
+  .sw-warn-hdr .sw-issue-line { margin-left:12px; opacity:.85; }
+  .tile.swwarn { border-color:#f0c040;
+                 box-shadow:0 0 0 1px #f0c04060 inset, 0 0 12px 0 rgba(240,192,64,.18); }
+  .tile .badge.swwarn { background:#2a2000; color:var(--amber-fg); cursor:default;
+                        border-color:#f0c04060; }
+  .bd-mini { font-size:11px; font-family:ui-monospace,monospace;
+             padding:2px 4px; margin:1px 0; border-left:2px solid var(--bd); }
+  .bd-mini .bd-id, .bd-id   { color:var(--accent-fg); font-weight:700; margin-right:3px; }
+  .bd-mini .bd-len, .bd-len { color:var(--tx-hi); margin-right:3px; }
+  .bd-mini .bd-next,.bd-next{ color:var(--tx-lo); margin-right:3px; }
+  .bd-mini .bd-lock,.bd-lock{ color:#6aaa80; font-size:10px; }
+  .bd-mini-ch { font-size:11px; font-weight:600; margin:6px 0 2px;
+                color:var(--tx-mid); }
+
   .dimtxt { color:var(--tx-lo); font-size:12px; }
 
   /* ── LLM pane ────────────────────────────────────────────────── */
@@ -3154,6 +3209,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div id="panel" class="panel">
     <div id="panel-body"><div class="placeholder">Select a tile or net for details.</div></div>
+    <div id="panel-toc" class="collapsed"></div>
   </div>
   <div id="rhsplitter" title="Drag to resize (panel / console)"></div>
   <div id="cmdconsole" class="hide">
@@ -3445,7 +3501,7 @@ function renderKernelCode(t, ch, focused, openFirst){
   if(!sections.length)
     return '<div class="placeholder">(no kernel code found)</div>';
   return sections.map((s, i) =>
-    renderCodeSection(esc(s[0]), s[1], !!openFirst && i===0)
+    renderCodeSection(esc(s[0]), s[1], !!openFirst)
   ).join('');
 }
 function renderTileCodeKernelFirst(t, ch, focused, banner){
@@ -3463,12 +3519,12 @@ function renderTileCodeKernelFirst(t, ch, focused, banner){
   }
   if(kv && kv.kernel_lines){
     out += renderCodeSection('Generated wrapper &mdash; '+esc(kv.file||'kernel.cc'),
-      renderKernelCC(t, ch, focused), false);
+      renderKernelCC(t, ch, focused), true);
     any = true;
   }
   if(b && b.lines){
     out += renderCodeSection('Buffer address map &mdash; '+esc(b.file||'.bcf'),
-      renderBcf(t, ch, focused), false);
+      renderBcf(t, ch, focused), true);
     any = true;
   }
   if(!any)
@@ -3856,10 +3912,16 @@ rowsDesc.forEach(r => {
     const sdBad = (t.dma_channels||[]).some(ch => ch.flow_balance && ch.flow_balance.balanced===false);
     if (sdBad){ cell.classList.add('sdmismatch');
       badges += '<span class="badge sdwarn" title="supply/demand mismatch">&#9888;</span>'; }
+    const swIssues = _swIssues(t.loc[0], t.loc[1]);
+    if(swIssues.length){
+      cell.classList.add('swwarn');
+      badges += '<span class="badge swwarn" title="stream switch: '+swIssues.map(i=>i.msg).join('\n')+'">&#9888; sw</span>';
+    }
     cell.innerHTML = '<div class="loc">('+t.loc[0]+','+t.loc[1]+')</div>' +
                      '<div>'+t.type+'</div>' + badges;
     cell.title = (t.high_level.contracts||[]).join('\n') || t.type;
     if (sdBad) cell.title += '\n\u26a0 supply/demand mismatch on a flow';
+    if (swIssues.length) cell.title += '\n\u26a0 stream switch config issues: '+swIssues.map(i=>i.msg).join('; ');
     cellByLoc[c+','+r] = cell;
     const lbar = document.createElement('div');
     lbar.className = 'livebar hide';
@@ -4554,7 +4616,7 @@ function dmReset(rebuild){
     e.preventDefault();
     const r=vp.getBoundingClientRect();
     const mx=e.clientX-r.left, my=e.clientY-r.top;
-    const d=e.deltaY<0?1.12:1/1.12;
+    const d=Math.pow(1.0025,-e.deltaY);
     const ns=Math.max(0.12,Math.min(6,dmScale*d));
     dmTx=mx-(mx-dmTx)*(ns/dmScale);
     dmTy=my-(my-dmTy)*(ns/dmScale);
@@ -4872,7 +4934,7 @@ function srRenderChips(){
     chip.appendChild(document.createTextNode(term));
     const x=document.createElement('span');
     x.className='lk-x'; x.textContent='×';
-    x.onclick=()=>{ srSearchTerms.delete(term); srRenderChips(); srRenderResults(); if(document.getElementById('devmap').classList.contains('show')) buildDeviceMap(); };
+    x.onclick=()=>{ srSearchTerms.delete(term); srRenderChips(); srRenderResults(); if(document.getElementById('devmap').classList.contains('show')) buildDeviceMap(); if(!srSearchTerms.size) llmPushCtx(null,'search'); };
     chip.appendChild(x);
     wrap.appendChild(chip);
   });
@@ -5094,6 +5156,7 @@ function dmClearAll(){
   else dmClearStatus();
   if (srSearchTerms.size){
     srSearchTerms.clear();
+    llmPushCtx(null, 'search');
     srRenderChips();
     srRenderResults();
     if (document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
@@ -5224,22 +5287,34 @@ function buildNetBody(p){
     const t=tileMap[key]; if(!t) return;
     const ch=(t.dma_channels||[]).filter(c=>c.flow_index===fi);
     ch.forEach(c=>{
-      const bd=(c.bd_chain||[])[0]||{};
-      const acq=(bd.acquire_lock||[])[0]||{};
-      const rel=(bd.release_lock||[])[0]||{};
-      const lock=(acq.id!=null||rel.id!=null)?' lock '+acq.id+'/'+rel.id:'';
-      chanRows+='<tr><td>('+t.loc[0]+','+t.loc[1]+')</td><td>'+esc(t.type)+'</td>'
+      const bds=c.bd_chain||[];
+      const bdChain=bds.slice(0,4).map((bd,i)=>{
+        const hasNext=bd.next_bd!=null&&bd.next_bd>=0&&i<bds.length-1;
+        return '<span class="bd-id">BD'+bd.bd_id+'</span>'
+          +'<span class="bd-len">['+bd.len+'B]</span>'
+          +(hasNext?'<span class="bd-next">→</span>':'');
+      }).join('')+(bds.length>4?'…':'');
+      const acqSet=new Set(), relSet=new Set();
+      bds.forEach(bd=>{
+        (bd.acquire_lock||[]).forEach(l=>l.id!=null&&acqSet.add('L'+l.id+'('+l.val+')'));
+        (bd.release_lock||[]).forEach(l=>l.id!=null&&relSet.add('L'+l.id+'('+l.val+')'));
+      });
+      const lockStr=(acqSet.size||relSet.size)
+        ?'<span class="bd-lock">acq:'+[...acqSet].join(',')+' rel:'+[...relSet].join(',')+'</span>'
+        :'-';
+      chanRows+='<tr>'
+        +'<td>('+t.loc[0]+','+t.loc[1]+')</td>'
+        +'<td>'+esc(t.type)+'</td>'
         +'<td>'+esc(c.direction)+' ch'+c.channel+'</td>'
-        +'<td>'+(bd.len!=null?bd.len+'B':'?')+'</td>'
-        +'<td>'+(c.bd_chain||[]).length+'</td>'
-        +'<td>'+esc(lock)+'</td>'
+        +'<td style="font-family:ui-monospace,monospace;white-space:nowrap">'+(bdChain||'—')+'</td>'
+        +'<td style="font-size:10px">'+lockStr+'</td>'
         +(c.kernel_port?'<td>'+esc(c.kernel_port)+'</td>':'<td>-</td>')
         +'</tr>';
     });
   });
   const chanTable=chanRows
     ?'<table class="rctbl"><thead><tr><th>tile</th><th>type</th><th>ch</th>'
-      +'<th>len</th><th>BDs</th><th>lock acq/rel</th><th>port</th></tr></thead>'
+      +'<th>BD chain</th><th>locks</th><th>port</th></tr></thead>'
       +'<tbody>'+chanRows+'</tbody></table>'
     :'<div class="placeholder">(no DMA channels on participating tiles)</div>';
 
@@ -5256,14 +5331,28 @@ function buildNetBody(p){
       ?(b.tile?.row??0)-(a.tile?.row??0)
       :(a.tile?.row??0)-(b.tile?.row??0)
   );
-  const connKindLabel={'circuit_connect':'circuit','packet_connect':'packet'};
   let swRows='';
   swConns.forEach(c=>{
     const t=c.tile||{};
-    const kind=connKindLabel[c.kind]||esc(c.kind);
-    let detail='';
-    if(c.slave&&c.master) detail=esc(c.slave.dir)+'['+c.slave.idx+'] → '+esc(c.master.dir)+'['+c.master.idx+']';
-    swRows+='<tr><td>('+t.col+','+t.row+')</td><td>'+kind+'</td><td>'+detail+'</td></tr>';
+    let kind='', detail='', extra='';
+    if(c.kind==='packet_connect'){
+      kind='PKT';
+      const rs=c.recv_slave||{}, ld=c.local_dma||{}, fm=c.forward_master||{};
+      const inPort=rs.dir&&rs.dir!=='NONE'?esc(rs.dir)+':'+rs.idx+'&rarr;':'&rarr;';
+      detail=inPort+esc(ld.dir||'DMA')+':'+ld.idx;
+      if(ld.pktid!=null) extra=' <span class="rt-pktid">pkt'+ld.pktid+'</span>';
+      if(fm.dir&&fm.dir!=='NONE') extra+=' <span class="rt-fwd">fwd&rarr;'+esc(fm.dir)+':'+fm.idx+'</span>';
+    } else {
+      kind='CCT';
+      const s=c.slave||{}, m=c.master||{};
+      if(s.dir!=null&&m.dir!=null){
+        detail=esc(s.dir)+':'+s.idx+' &rarr; '+esc(m.dir)+':'+m.idx;
+      }
+    }
+    const dmaLbl=_flowDmaLabel(c.flow_index,t.col,t.row);
+    if(dmaLbl) extra+=' <span class="rt-dma">'+esc(dmaLbl)+'</span>';
+    swRows+='<tr><td>('+t.col+','+t.row+')</td><td>'+kind+'</td>'
+      +'<td>'+detail+extra+'</td></tr>';
   });
   const swTable=swRows
     ?'<table class="rctbl"><thead><tr><th>tile</th><th>kind</th><th>ports</th></tr></thead>'
@@ -5374,7 +5463,7 @@ function buildDeviceMap(){
   // Compute col/row counts first (need tileMap for this)
   // Defer sizing until after tileMap is built — use temp values here,
   // then recalculate SVG size after allCols/allRows are known.
-  const TW=148, TH=56, GX=24, GY=16;
+  const TW=148, TH=92, GX=24, GY=14;
   const COLSTEP=TW+GX, ROWSTEP=TH+GY;
 
   // Merge DATA.tiles with every tile referenced in comm_paths (waypoints + hops)
@@ -5469,14 +5558,15 @@ function buildDeviceMap(){
   const ty=r=>MT+(maxR-r)*ROWSTEP;
   const cx=c=>tx(c)+TW/2;
   const cy=r=>ty(r)+TH/2;
+  const fcx=c=>tx(c)+Math.round(TW*0.80);
 
   // Lane spacing. Scaled down as the flow count grows so the whole fan stays a
   // fraction of the tile pitch: 12 flows at a fixed 5px would span 55px of a
   // 72px row step and stray off the tiles.
-  const OX_STEP=Math.max(3, Math.min(8,
-    Math.round(0.40*COLSTEP/Math.max(1, dmFlowIds.length-1))));
-  const OY_STEP=Math.max(2, Math.min(5,
-    Math.round(0.40*ROWSTEP/Math.max(1, dmFlowIds.length-1))));
+  const OX_STEP=Math.max(2, Math.min(5,
+    Math.round(0.25*COLSTEP/Math.max(1, dmFlowIds.length-1))));
+  const OY_STEP=Math.max(1, Math.min(3,
+    Math.round(0.25*ROWSTEP/Math.max(1, dmFlowIds.length-1))));
   // One lane per flow, held for the whole path.
   //
   // This used to fan flows out per EDGE, by how many flows shared that
@@ -5565,44 +5655,111 @@ function buildDeviceMap(){
     g.appendChild(rect);
     // Empty placeholder so dmPaintStatus() only has to set textContent — it must
     // not add nodes, since it runs on every poll.
-    g.appendChild(svgN('text',{class:'dm-stlabel',x:tx(tc)+TW-6,y:ty(tr)+TH-6,
-      'text-anchor':'end','font-size':'9','font-family':'monospace',
+    g.appendChild(svgN('text',{class:'dm-stlabel',x:tx(tc)+TW-6,y:ty(tr)+TH-5,
+      'text-anchor':'end','font-size':'8','font-family':'monospace',
       'font-weight':'700','pointer-events':'none'}));
 
     // Coord top-left, type badge top-right
     const typStr=ttype==='shim'?'SHIM':ttype==='mem'?'MEM':'AIE';
-    g.appendChild(svgT(svgN('text',{x:tx(tc)+6,y:ty(tr)+13,
-      'font-size':'9','font-family':'monospace',fill:'#e4e4e848'}),
+    g.appendChild(svgT(svgN('text',{x:tx(tc)+6,y:ty(tr)+12,
+      'font-size':'8','font-family':'monospace',fill:'#e4e4e848'}),
       '('+tc+','+tr+')'));
-    g.appendChild(svgT(svgN('text',{x:tx(tc)+TW-6,y:ty(tr)+13,
-      'text-anchor':'end','font-size':'8','font-family':'monospace',fill:'#e4e4e43a'}),
+    g.appendChild(svgT(svgN('text',{x:tx(tc)+TW-6,y:ty(tr)+12,
+      'text-anchor':'end','font-size':'7','font-family':'monospace',fill:'#e4e4e43a'}),
       typStr));
 
-    // Show only terminal DMA channels (S2MM=input, MM2S=output) — not pass-through.
-    // Each line: colored arrow + "f{fi}" compactly at bottom of tile.
+    {
+      const shimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
+      const rconns=[];
+      const rcSeen=new Set();
+      (DATA.comm_paths||[]).forEach(p=>{
+        if(dmHideAll) return;
+        if(dmActiveNets.size>0&&!dmActiveNets.has(p.flow_index)) return;
+        const fts=_flowTileSet(p);
+        if(fts.size>0&&!fts.has(tc+','+tr)) return;
+        (p.routing_connections||[]).forEach(c=>{
+          const ct=c.tile||{};
+          if(ct.col!==tc||ct.row!==tr||shimKinds.has(c.kind)) return;
+          let key;
+          if(c.kind==='packet_connect'){
+            const rs=c.recv_slave||{},ld=c.local_dma||{},fm=c.forward_master||{};
+            key='pkt|'+rs.dir+'|'+rs.idx+'|'+ld.dir+'|'+ld.idx+'|'+fm.dir+'|'+fm.idx;
+          } else {
+            const s=c.slave||{},m=c.master||{};
+            key=c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
+          }
+          if(rcSeen.has(key)) return;
+          rcSeen.add(key);
+          rconns.push({...c, flow_index:p.flow_index});
+        });
+      });
+      const shortDir=d=>d==='NORTH'?'N':d==='SOUTH'?'S':d==='EAST'?'E':d==='WEST'?'W':d?d[0]:'?';
+      rconns.slice(0,4).forEach((c,i)=>{
+        const isCct=c.kind==='circuit_connect';
+        const kc=isCct?'#4a7fd4':'#9c4fd4';
+        const y=ty(tr)+22+i*9;
+        g.appendChild(svgN('rect',{x:tx(tc)+5,y:y-7,width:'2',height:'7',
+          fill:kc,rx:'1','pointer-events':'none'}));
+        let label;
+        if(c.kind==='packet_connect'){
+          const rs=c.recv_slave||{}, ld=c.local_dma||{};
+          const inP=rs.dir&&rs.dir!=='NONE'?shortDir(rs.dir)+':'+rs.idx+'→':'→';
+          label='PKT '+inP+shortDir(ld.dir||'DMA')+':'+ld.idx;
+        } else {
+          const s=c.slave||{}, m=c.master||{};
+          label='CCT '+shortDir(s.dir)+':'+s.idx+'→'+shortDir(m.dir)+':'+m.idx;
+        }
+        g.appendChild(svgT(svgN('text',{x:tx(tc)+10,y,
+          'font-size':'7','font-family':'monospace',fill:'#c8cad8',
+          'pointer-events':'none'}), label));
+        const dmaLbl=_flowDmaLabel(c.flow_index,tc,tr);
+        if(dmaLbl){
+          const bw=dmaLbl.length*4.2+4;
+          const bx=tx(tc)+TW-bw-4;
+          g.appendChild(svgN('rect',{x:bx,y:y-6,width:String(Math.round(bw)),height:'8',
+            rx:'2',fill:'#082018','pointer-events':'none'}));
+          g.appendChild(svgT(svgN('text',{x:bx+2,y,
+            'font-size':'6','font-family':'monospace',fill:'#40c4a0',
+            'pointer-events':'none'}), dmaLbl));
+        }
+      });
+    }
+
+    {
+      const dmWarnIssues=_swIssues(tc,tr);
+      if(dmWarnIssues.length){
+        g.appendChild(svgN('rect',{x:tx(tc)+1,y:ty(tr)+1,width:TW-2,height:TH-2,rx:'5',
+          fill:'none',stroke:'#f0c040','stroke-width':'1.2','stroke-dasharray':'3 2',
+          'pointer-events':'none'}));
+        g.appendChild(svgT(svgN('text',{x:tx(tc)+TW-6,y:ty(tr)+22,
+          'text-anchor':'end','font-size':'8','font-family':'monospace',
+          fill:'var(--amber-fg)','pointer-events':'none'}),'⚠'));
+      }
+    }
+
     if(used&&t.dma_channels&&t.dma_channels.length){
       const chans=(!dmHideAll&&dmActiveNets.size===0)?t.dma_channels
         :t.dma_channels.filter(ch=>!dmHideAll&&dmActiveNets.has(ch.flow_index));
-      // Split into inputs (S2MM) and outputs (MM2S)
       const ins=chans.filter(ch=>ch.direction==='S2MM');
       const outs=chans.filter(ch=>ch.direction==='MM2S');
-      // Render inputs on left half, outputs on right half, centered vertically
-      const midY=ty(tr)+TH/2+4;
+      const dmaBaseY=ty(tr)+62;
       ins.slice(0,3).forEach((ch,i)=>{
         const fc=dmColor(ch.flow_index);
-        const y=midY+(i-(ins.length-1)/2)*11;
-        // Arrow pointing in: ▶ f{fi}
+        const y=dmaBaseY+i*10;
+        const bd0=(ch.bd_chain||[])[0];
+        const bdTag=bd0?' BD'+bd0.bd_id:'';
         g.appendChild(svgT(svgN('text',{x:tx(tc)+7,y,
-          'font-size':'8.5','font-family':'monospace',fill:fc}),
-          '▶ f'+ch.flow_index));
+          'font-size':'7.5','font-family':'monospace',fill:fc}),
+          '▶f'+ch.flow_index+bdTag));
       });
       outs.slice(0,3).forEach((ch,i)=>{
         const fc=dmColor(ch.flow_index);
-        const y=midY+(i-(outs.length-1)/2)*11;
-        // Arrow pointing out: f{fi} ▶
+        const y=dmaBaseY+i*10;
+        const bd0=(ch.bd_chain||[])[0];
+        const bdTag=bd0?' BD'+bd0.bd_id:'';
         g.appendChild(svgT(svgN('text',{x:tx(tc)+TW-7,y,
-          'text-anchor':'end','font-size':'8.5','font-family':'monospace',fill:fc}),
-          'f'+ch.flow_index+' ▶'));
+          'text-anchor':'end','font-size':'7.5','font-family':'monospace',fill:fc}),
+          'f'+ch.flow_index+bdTag+'▶'));
       });
     }
 
@@ -5736,8 +5893,8 @@ function buildDeviceMap(){
     const dc=tc-fc, dr=tr-fr;
     if(dc>0)       return [tx(fc)+TW, cy(fr), tx(tc),    cy(tr)];
     if(dc<0)       return [tx(fc),    cy(fr), tx(tc)+TW, cy(tr)];
-    if(dr>0)       return [cx(fc), ty(fr),    cx(tc), ty(tr)+TH];
-    /* dr<0 */     return [cx(fc), ty(fr)+TH, cx(tc), ty(tr)   ];
+    if(dr>0)       return [fcx(fc), ty(fr),    fcx(tc), ty(tr)+TH];
+    /* dr<0 */     return [fcx(fc), ty(fr)+TH, fcx(tc), ty(tr)   ];
   }
   // Shmem links live in a RESERVED lane outside the stream-edge offset band, so
   // dashed shared-memory links never draw on top of the solid stream edges.
@@ -5795,7 +5952,7 @@ function buildDeviceMap(){
         const {ox,oy}=edgeOffset(e,fi);
         const [fc,fr]=e[0],[tc,tr]=e[1];
         svg.appendChild(svgN('line',{
-          x1:cx(fc)+ox,y1:cy(fr)+oy,x2:cx(tc)+ox,y2:cy(tr)+oy,
+          x1:fcx(fc)+ox,y1:cy(fr)+oy,x2:fcx(tc)+ox,y2:cy(tr)+oy,
           stroke:'rgba(255,210,0,0.40)','stroke-width':'10',
           'stroke-linecap':'round','pointer-events':'none'}));
       });
@@ -5891,7 +6048,7 @@ function buildDeviceMap(){
       const [fc,fr]=e[0], [tc,tr]=e[1];
       const {ox,oy}=edgeOffset(e,fi);
       const isTerminal=!srcKeys.has(tc+','+tr);
-      const x1=cx(fc)+ox, y1=cy(fr)+oy, x2=cx(tc)+ox, y2=cy(tr)+oy;
+      const x1=fcx(fc)+ox, y1=cy(fr)+oy, x2=fcx(tc)+ox, y2=cy(tr)+oy;
       // Status casing, drawn first so it sits under the identity-colored line.
       // Starts transparent; dmPaintStatus() fills it in when a scan lands.
       if(!dim){
@@ -5903,8 +6060,8 @@ function buildDeviceMap(){
       svg.appendChild(svgN('line',{
         x1, y1, x2, y2,
         stroke:color,
-        'stroke-width':dim?'1':'3',
-        'stroke-opacity':dim?'0.05':'0.95',
+        'stroke-width':dim?'0.7':'1.5',
+        'stroke-opacity':dim?'0.05':'0.6',
         'stroke-linecap':'round'}));
       // Wide transparent hit area — only on active lines so dim flows aren't clickable.
       if(!dim){
@@ -5943,8 +6100,9 @@ function buildDeviceMap(){
   // outward=true  (source):      arrow exits the dot — base just outside on downstream side, tip further downstream.
   // outward=false (destination): arrow on the line upstream — tip just outside dot on upstream side, base further back.
   // gap overrides the clearance from dot centre (default 7px, just past r=4.5px dot edge).
-  function svgArrow(x, y, dx, dy, color, outward, gap=7){
-    const LEN=9, HALF=3.5;
+  let dotsG = null;
+  function svgArrow(x, y, dx, dy, color, outward, gap=4){
+    const LEN=4, HALF=1.5;
     const nx=-dy, ny=dx;
     let tx, ty, bx, by;
     if(outward){
@@ -5956,7 +6114,7 @@ function buildDeviceMap(){
     }
     const b1x=bx+nx*HALF, b1y=by+ny*HALF;
     const b2x=bx-nx*HALF, b2y=by-ny*HALF;
-    svg.appendChild(svgN('polygon',{points:`${tx},${ty} ${b1x},${b1y} ${b2x},${b2y}`,fill:color,opacity:'0.9'}));
+    (dotsG||svg).appendChild(svgN('polygon',{points:`${tx},${ty} ${b1x},${b1y} ${b2x},${b2y}`,fill:color,opacity:'0.9'}));
   }
   // Normalise a grid-space direction vector to unit length (Manhattan tiles only).
   function gridDir(fromC, fromR, toC, toR){
@@ -5969,6 +6127,7 @@ function buildDeviceMap(){
   // Solid = injects into stream: source (push origin) or contributor (pull gather inject).
   // Fork = pure routing split (not a data producer or consumer).
   // Drawn before hollow dots so hollow dots always render on top.
+  dotsG = svgN('g',{'pointer-events':'none'});
   (DATA.comm_paths||[]).forEach(p=>{
     const fi=p.flow_index;
     const active=!dmHideAll&&(dmActiveNets.size===0||dmActiveNets.has(fi));
@@ -5994,12 +6153,12 @@ function buildDeviceMap(){
       const [sc,sr]=srcTile[0];
       if(!(isPull&&pktTileSet.has(sc+','+sr))){
         const {ox,oy}=dotOffset(p,sc,sr);
-        svg.appendChild(svgN('circle',{cx:cx(sc)+ox,cy:cy(sr)+oy,r:'4.5',
-          fill:color,stroke:'#181818','stroke-width':'1.2'}));
+        dotsG.appendChild(svgN('circle',{cx:fcx(sc)+ox,cy:cy(sr)+oy,r:'1.8',
+          fill:color,stroke:'#181818','stroke-width':'0.7'}));
         // Arrow at source dot (push flows only — pull contributors use solid dot without arrow).
         if(!isPull){
           const [tc2,tr2]=srcTile[1];
-          if(tr2>=0){ const [dx,dy]=gridDir(sc,sr,tc2,tr2); svgArrow(cx(sc)+ox,cy(sr)+oy,dx,dy,color,true); }
+          if(tr2>=0){ const [dx,dy]=gridDir(sc,sr,tc2,tr2); svgArrow(fcx(sc)+ox,cy(sr)+oy,dx,dy,color,true); }
         }
       }
     }
@@ -6013,10 +6172,10 @@ function buildDeviceMap(){
         if(seen.has(k)) return;
         seen.add(k);
         const {ox,oy}=dotOffset(p,tc,tr);
-        svg.appendChild(svgN('circle',{cx:cx(tc)+ox,cy:cy(tr)+oy,r:'4.5',
-          fill:color,stroke:'#181818','stroke-width':'1.2'}));
+        dotsG.appendChild(svgN('circle',{cx:fcx(tc)+ox,cy:cy(tr)+oy,r:'1.8',
+          fill:color,stroke:'#181818','stroke-width':'0.7'}));
         const outEdge=edges.find(e=>e[0][0]===tc&&e[0][1]===tr);
-        if(outEdge){ const [dx,dy]=gridDir(tc,tr,outEdge[1][0],outEdge[1][1]); svgArrow(cx(tc)+ox,cy(tr)+oy,dx,dy,color,true); }
+        if(outEdge){ const [dx,dy]=gridDir(tc,tr,outEdge[1][0],outEdge[1][1]); svgArrow(fcx(tc)+ox,cy(tr)+oy,dx,dy,color,true); }
       });
     }
 
@@ -6029,9 +6188,9 @@ function buildDeviceMap(){
       if(outC>=2 && inC===1 && !dmaTileSet.has(k) && !forkSeen.has(k)){
         forkSeen.add(k);
         const {ox,oy}=dotOffset(p,fc,fr);
-        svg.appendChild(svgN('circle',{
-          cx:cx(fc)+ox,cy:cy(fr)+oy,
-          r:'5',fill:color,stroke:'#e4e4e4','stroke-width':'1.5'}));
+        dotsG.appendChild(svgN('circle',{
+          cx:fcx(fc)+ox,cy:cy(fr)+oy,
+          r:'2',fill:color,stroke:'#e4e4e4','stroke-width':'0.8'}));
       }
     });
   });
@@ -6072,11 +6231,11 @@ function buildDeviceMap(){
       if(!outCount[dk] && tr>=0 && !dstSeen.has(dk)){
         dstSeen.add(dk);
         const {ox,oy}=dotOffset(p,tc,tr);
-        svg.appendChild(svgN('circle',{cx:cx(tc)+ox,cy:cy(tr)+oy,r:'4.5',
-          fill:'#181818',stroke:color,'stroke-width':'2.2'}));
+        dotsG.appendChild(svgN('circle',{cx:fcx(tc)+ox,cy:cy(tr)+oy,r:'1.8',
+          fill:'#181818',stroke:color,'stroke-width':'1.2'}));
         // Arrow pointing into the dot (data flows in from the previous tile).
         const [dx,dy]=gridDir(sc2,sr2,tc,tr);
-        svgArrow(cx(tc)+ox,cy(tr)+oy,dx,dy,color,false,5);
+        svgArrow(fcx(tc)+ox,cy(tr)+oy,dx,dy,color,false,4);
       }
     });
 
@@ -6090,14 +6249,16 @@ function buildDeviceMap(){
       if(sr>=0 && dmaTileSet.has(sk) && outCount[sk] && inCount[sk] && !tapSeen.has(sk) && !globalTerminals.has(sk)){
         tapSeen.add(sk);
         const {ox,oy}=dotOffset(p,sc,sr);
-        svg.appendChild(svgN('circle',{cx:cx(sc)+ox,cy:cy(sr)+oy,r:'5',
-          fill:'#181818',stroke:color,'stroke-width':'2.5'}));
+        dotsG.appendChild(svgN('circle',{cx:fcx(sc)+ox,cy:cy(sr)+oy,r:'2',
+          fill:'#181818',stroke:color,'stroke-width':'1.2'}));
         // Inward arrow only — tap is a consumer (output node), data flows in.
         const inEdge=edges.find(e2=>e2[1][0]===sc&&e2[1][1]===sr);
-        if(inEdge){ const [dx,dy]=gridDir(inEdge[0][0],inEdge[0][1],sc,sr); svgArrow(cx(sc)+ox,cy(sr)+oy,dx,dy,color,false,5); }
+        if(inEdge){ const [dx,dy]=gridDir(inEdge[0][0],inEdge[0][1],sc,sr); svgArrow(fcx(sc)+ox,cy(sr)+oy,dx,dy,color,false,4); }
       }
     });
   });
+
+  svg.appendChild(dotsG);
 
   dmReset();
   // The SVG was recreated from scratch above, so any live status painted on the
@@ -6107,6 +6268,218 @@ function buildDeviceMap(){
 }
 
 buildNetBar();
+
+
+let _flowDmaLookup = null;
+function _flowDmaLabel(fi, col, row){
+  if(!_flowDmaLookup){
+    _flowDmaLookup = {};
+    (DATA.comm_paths||[]).forEach(p=>{
+      const pfi = p.flow_index;
+      if(pfi==null) return;
+      (p.stages||[]).forEach(st=>{
+        if(st.role==='producer' && st.tile){
+          const t=st.tile;
+          _flowDmaLookup[pfi+'|'+t.col+'|'+t.row]='mm2s'+(st.channel??'');
+        } else if(st.role==='consumer'){
+          (st.tiles||[]).forEach(t=>{
+            _flowDmaLookup[pfi+'|'+t.col+'|'+t.row]='s2mm'+(t.dma_port??'');
+          });
+        }
+      });
+    });
+  }
+  if(fi==null) return '';
+  return _flowDmaLookup[fi+'|'+col+'|'+row]||'';
+}
+
+function _swIssues(col, row){
+  const conns=_tileRoutingConns(col,row).filter(c=>{
+    const s=c.slave||{}, m=c.master||{};
+    return s.dir!=null && s.idx!=null && m.dir!=null && m.idx!=null;
+  });
+  const issues=[];
+
+  const cctMasterSlave=new Map(); // 'dir|idx' -> Set<'slaveDir|slaveIdx'>
+  conns.forEach(c=>{
+    if(c.kind!=='circuit_connect') return;
+    const s=c.slave||{}, m=c.master||{};
+    const mk=m.dir+'|'+m.idx;
+    const sv=s.dir+'|'+s.idx;
+    if(!cctMasterSlave.has(mk)) cctMasterSlave.set(mk,new Set());
+    cctMasterSlave.get(mk).add(sv);
+  });
+  cctMasterSlave.forEach((slaves,mk)=>{
+    if(slaves.size<2) return;
+    const [dir,idx]=mk.split('|');
+    issues.push({type:'cct-master-reuse',mk,
+      msg:'CCT master '+dir+'['+idx+'] driven by '+slaves.size+' slaves — only one can win'});
+  });
+
+  const slaveKinds=new Map(); // 'dir|idx' -> Set<kind>
+  const masterKinds=new Map();
+  conns.forEach(c=>{
+    const s=c.slave||{}, m=c.master||{};
+    const sk=s.dir+'|'+s.idx, mk=m.dir+'|'+m.idx;
+    if(!slaveKinds.has(sk)) slaveKinds.set(sk,new Set());
+    slaveKinds.get(sk).add(c.kind);
+    if(!masterKinds.has(mk)) masterKinds.set(mk,new Set());
+    masterKinds.get(mk).add(c.kind);
+  });
+  slaveKinds.forEach((kinds,pk)=>{
+    if(kinds.size<2) return;
+    const [dir,idx]=pk.split('|');
+    issues.push({type:'cct-pkt-conflict',port:pk,
+      msg:'Slave port '+dir+'['+idx+'] used as both CCT and PKT — mutually exclusive modes'});
+  });
+  masterKinds.forEach((kinds,pk)=>{
+    if(kinds.size<2) return;
+    const [dir,idx]=pk.split('|');
+    issues.push({type:'cct-pkt-conflict',port:pk,
+      msg:'Master port '+dir+'['+idx+'] targeted by both CCT and PKT — mutually exclusive modes'});
+  });
+
+  return issues;
+}
+
+function _flowTileSet(p){
+  const s=new Set();
+  (p.edges||[]).forEach(e=>{ s.add(e[0][0]+','+e[0][1]); s.add(e[1][0]+','+e[1][1]); });
+  (p.tiles||[]).forEach(t=>s.add(t[0]+','+t[1]));
+  (p.dma_tiles||[]).forEach(t=>s.add(t[0]+','+t[1]));
+  return s;
+}
+function _tileRoutingConns(col, row){
+  const shimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
+  const seen=new Set();
+  const out=[];
+  (DATA.comm_paths||[]).forEach(p=>{
+    const fts=_flowTileSet(p);
+    if(fts.size>0 && !fts.has(col+','+row)) return;
+    (p.routing_connections||[]).forEach(c=>{
+      const t=c.tile||{};
+      if(t.col!==col || t.row!==row || shimKinds.has(c.kind)) return;
+      let key;
+      if(c.kind==='packet_connect'){
+        const rs=c.recv_slave||{}, ld=c.local_dma||{}, fm=c.forward_master||{};
+        key='pkt|'+rs.dir+'|'+rs.idx+'|'+ld.dir+'|'+ld.idx+'|'+fm.dir+'|'+fm.idx;
+      } else {
+        const s=c.slave||{}, m=c.master||{};
+        key=c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
+      }
+      if(seen.has(key)) return;
+      seen.add(key);
+      out.push({...c, flow_index:p.flow_index});
+    });
+  });
+  return out;
+}
+
+function renderTileRoutingSection(col, row, focusFlowIdx){
+  const allRaw=_tileRoutingConns(col,row);
+
+  const cctConns=allRaw.filter(c=>{
+    const s=c.slave||{}, m=c.master||{};
+    return c.kind==='circuit_connect' && s.dir!=null && s.idx!=null && m.dir!=null && m.idx!=null;
+  });
+  const cctMasterSlave=new Map();
+  const slaveKinds=new Map(), masterKindsMap=new Map();
+  cctConns.forEach(c=>{
+    const s=c.slave||{}, m=c.master||{};
+    const mk=m.dir+'|'+m.idx, sk=s.dir+'|'+s.idx;
+    if(!cctMasterSlave.has(mk)) cctMasterSlave.set(mk,new Set());
+    cctMasterSlave.get(mk).add(sk);
+    if(!slaveKinds.has(sk)) slaveKinds.set(sk,new Set());
+    slaveKinds.get(sk).add(c.kind);
+    if(!masterKindsMap.has(mk)) masterKindsMap.set(mk,new Set());
+    masterKindsMap.get(mk).add(c.kind);
+  });
+  const isConflict=c=>{
+    if(c.kind!=='circuit_connect') return false;
+    const s=c.slave||{}, m=c.master||{};
+    const mk=m.dir+'|'+m.idx, sk=s.dir+'|'+s.idx;
+    if((cctMasterSlave.get(mk)||new Set()).size>1) return true;
+    if((slaveKinds.get(sk)||new Set()).size>1) return true;
+    if((masterKindsMap.get(mk)||new Set()).size>1) return true;
+    return false;
+  };
+
+  let conns=allRaw.filter(c=>{
+    if(c.kind==='packet_connect') return true;
+    const s=c.slave||{}, m=c.master||{};
+    return s.dir!=null && s.idx!=null && m.dir!=null && m.idx!=null;
+  });
+  if(focusFlowIdx!=null) conns=conns.filter(c=>c.flow_index===focusFlowIdx);
+  if(!conns.length) return '';
+
+  const issues=_swIssues(col,row);
+  const warnHdr=issues.length
+    ?'<div class="sw-warn-hdr">&#9888;&ensp;'+issues.length+' stream switch issue'+(issues.length>1?'s':'')
+      +issues.map(i=>'<span class="sw-issue-line">'+esc(i.msg)+'</span>').join('')
+      +'</div>'
+    :'';
+
+  const rows=conns.map(c=>{
+    if(c.kind==='packet_connect'){
+      const rs=c.recv_slave||{}, ld=c.local_dma||{}, fm=c.forward_master||{};
+      const fwd=fm.dir&&fm.dir!=='NONE'
+        ?' <span class="rt-fwd">fwd&rarr;'+esc(fm.dir)+':'+fm.idx+'</span>':'';
+      const pktid=ld.pktid!=null?'<span class="rt-pktid">pkt'+ld.pktid+'</span>':'';
+      const inPort=rs.dir&&rs.dir!=='NONE'
+        ?esc(rs.dir)+':'+rs.idx+'&rarr;':'&rarr;';
+      const ports=inPort+esc(ld.dir||'DMA')+':'+ld.idx;
+      const flow=(c.flow_index!=null)?'<span class="rt-flow">fl'+c.flow_index+'</span>':'';
+      const dmaLbl=_flowDmaLabel(c.flow_index,col,row);
+      const dmaSpan=dmaLbl?'<span class="rt-dma">'+esc(dmaLbl)+'</span>':'';
+      return '<div class="rt-row pkt">'
+        +'<span class="rt-kind">PKT</span>'
+        +'<span class="rt-ports">'+ports+'</span>'
+        +pktid+dmaSpan+fwd+flow+'</div>';
+    }
+    const s=c.slave||{}, m=c.master||{};
+    const ports=esc(s.dir)+':'+s.idx+' &rarr; '+esc(m.dir)+':'+m.idx;
+    const flow=(c.flow_index!=null)?'<span class="rt-flow">fl'+c.flow_index+'</span>':'';
+    const dmaLbl=_flowDmaLabel(c.flow_index,col,row);
+    const dmaSpan=dmaLbl?'<span class="rt-dma">'+esc(dmaLbl)+'</span>':'';
+    const issueCls=isConflict(c)?' sw-issue':'';
+    return '<div class="rt-row cct'+issueCls+'">'
+      +'<span class="rt-kind">CCT</span>'
+      +'<span class="rt-ports">'+ports+'</span>'
+      +dmaSpan+flow+'</div>';
+  });
+  return '<div class="sec"><div class="sec-hdr">Stream switch</div>'+warnHdr+rows.join('')+'</div>';
+}
+
+function renderTileDmaBdSection(t, ch, focused){
+  const chans=focused?[ch]:(t.dma_channels||[]);
+  if(!chans.length) return '';
+  const parts=chans.map(c=>{
+    const bds=c.bd_chain||[];
+    if(!bds.length) return '';
+    const bdRows=bds.map(bd=>{
+      const nxt=(bd.next_bd!=null && bd.next_bd>=0)?' &rarr;BD'+bd.next_bd:'';
+      const acq=(bd.acquire_lock||[])[0];
+      const rel=(bd.release_lock||[])[0];
+      const locks=(acq||rel)
+        ?'<span class="bd-lock">'
+          +(acq?'acq=L'+acq.id+'('+acq.val+')':'')
+          +(acq&&rel?' ':'')
+          +(rel?'rel=L'+rel.id+'('+rel.val+')':'')
+          +'</span>':'';
+      return '<div class="bd-mini">'
+        +'<span class="bd-id">BD'+bd.bd_id+'</span>'
+        +'<span class="bd-len">len='+bd.len+'</span>'
+        +(nxt?'<span class="bd-next">'+nxt+'</span>':'')
+        +locks+'</div>';
+    });
+    const hdr=focused?''
+      :'<div class="bd-mini-ch">'+esc(c.direction)+' ch'+c.channel
+        +(c.flow_index!=null?' fl'+c.flow_index:'')+'</div>';
+    return hdr+bdRows.join('');
+  }).filter(Boolean);
+  if(!parts.length) return '';
+  return '<div class="sec"><div class="sec-hdr">DMA BDs</div>'+parts.join('')+'</div>';
+}
 
 // One-line summary for a single channel (mirrors build_summary in schedule_view.py).
 function chanSummary(ch){
@@ -6224,6 +6597,8 @@ function select(t, el, ch, badgeEl, ctrl){
         '<div class="kv"><b>channel:</b> '+ch.direction+ch.channel+' &mdash; flow '+ch.flow_index+'</div>' +
         '<div class="kv"><b>transfer:</b> '+esc(chanSummary(ch))+'</div>' +
       '</div>' +
+      renderTileRoutingSection(t.loc[0], t.loc[1], ch.flow_index) +
+      renderTileDmaBdSection(t, ch, true) +
       (con?'<div class="sec"><div class="sec-hdr">Contract</div>'+con+'</div>':'');
   } else {
     const sum = (hlv.summary||[]).map(s=>'<li>'+esc(s)+'</li>').join('');
@@ -6252,6 +6627,8 @@ function select(t, el, ch, badgeEl, ctrl){
         (hlv.kernel?'<div class="kv"><b>kernel:</b> '+esc(hlv.kernel)+'</div>':'') +
         '<div class="kv"><b>transfers:</b></div><ul class="sum">'+sum+'</ul>' +
       '</div>' +
+      renderTileRoutingSection(t.loc[0], t.loc[1]) +
+      renderTileDmaBdSection(t, null, false) +
       (kmatch?'<div class="sec"><div class="sec-hdr">Kernel &harr; Channel Arguments</div>'+kmatch+'</div>':'') +
       (balRows.length?'<div class="sec"><div class="sec-hdr">Supply / Demand</div>'+balRows.map(renderFlowBalance).join('')+'</div>':'') +
       (con?'<div class="sec"><div class="sec-hdr">Contracts</div>'+con+'</div>':'');
@@ -6301,8 +6678,8 @@ function select(t, el, ch, badgeEl, ctrl){
         ' ('+(flo.ranges||[]).length+' range(s))'+
         (focused?' &mdash; '+ch.direction+ch.channel+' scope':''),
         renderFullBlock(flo.code_lines,
-          focused ? ((ch.low_level||{}).params||null) : null), false) +
-      (kcodeOn ? renderKernelCode(t, ch, focused, false) : '')
+          focused ? ((ch.low_level||{}).params||null) : null), true) +
+      (kcodeOn ? renderKernelCode(t, ch, focused, true) : '')
     : renderTileCodeKernelFirst(t, ch, focused, codePathBanner);
   const hostFileBody = CAPS.host_lines
     ? codePathBanner +
@@ -6371,6 +6748,7 @@ function wireTileExtra(t, ch, focused, flo, midIR, kcodeOn, body){
         other => other.classList.toggle('act', other === tab));
       body.querySelectorAll('.codefile-view').forEach(
         view => view.classList.toggle('hide', view.dataset.codefile !== key));
+      panelBuildToc();
     };
   });
   body.querySelectorAll('.kshowall').forEach(kbtn => {
@@ -6457,6 +6835,49 @@ let panelActiveKey = null;
 
 function panelKey(kind, id){ return kind+':'+id; }
 
+function panelBuildToc(){
+  const toc = document.getElementById('panel-toc');
+  const pb  = document.getElementById('panel-body');
+  if(!toc || !pb){ return; }
+  function notHidden(el){
+    let p = el;
+    while(p && p !== pb){ if(p.classList.contains('hide')) return false; p = p.parentElement; }
+    return true;
+  }
+  const entries = [];
+  pb.querySelectorAll('.sec-hdr, details.codesec > summary').forEach(el => {
+    if(notHidden(el)) entries.push({ label: el.textContent.trim(), el });
+  });
+  if(!entries.length){ toc.innerHTML = ''; toc.classList.add('no-items'); return; }
+  toc.classList.remove('no-items');
+  const collapsed = toc.classList.contains('collapsed');
+  toc.innerHTML =
+    '<button class="ptoc-toggle" title="'+(collapsed?'Expand':'Collapse')+' table of contents">'+(collapsed?'◀':'▶')+'</button>' +
+    '<button class="ptoc-top" title="Scroll to top">▲</button>' +
+    entries.map((e, i) => '<span class="ptoc-item" data-i="'+i+'">'+esc(e.label)+'</span>').join('');
+  toc.querySelector('.ptoc-toggle').onclick = () => {
+    toc.classList.toggle('collapsed');
+    const btn = toc.querySelector('.ptoc-toggle');
+    const now = toc.classList.contains('collapsed');
+    btn.textContent = now ? '◀' : '▶';
+    btn.title = now ? 'Expand table of contents' : 'Collapse table of contents';
+  };
+  const topBtn = toc.querySelector('.ptoc-top');
+  topBtn.onclick = () => pb.scrollTo({ top: 0, behavior: 'smooth' });
+  const syncTopBtn = () => { topBtn.style.display = pb.scrollTop > 40 ? '' : 'none'; };
+  if(pb._ptocScroll) pb.removeEventListener('scroll', pb._ptocScroll);
+  pb._ptocScroll = syncTopBtn;
+  pb.addEventListener('scroll', syncTopBtn, { passive: true });
+  syncTopBtn();
+  toc.querySelectorAll('.ptoc-item').forEach(span => {
+    const target = entries[+span.dataset.i].el;
+    span.onclick = () => {
+      const off = target.getBoundingClientRect().top - pb.getBoundingClientRect().top + pb.scrollTop - 6;
+      pb.scrollTo({ top: Math.max(0, off), behavior: 'smooth' });
+    };
+  });
+}
+
 function panelRenderTabs(){
   const strip = document.getElementById('panel-itemtabs');
   strip.innerHTML = '';
@@ -6482,7 +6903,7 @@ function panelRenderTabs(){
 function panelRenderBody(key){
   const body = document.getElementById('panel-body');
   const item = panelItems.get(key);
-  if(!item){ body.innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; return; }
+  if(!item){ body.innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; panelBuildToc(); return; }
   body.innerHTML = item.buildBody();
   // wire folder tabs inside body
   body.querySelectorAll('.tab').forEach(tab=>{
@@ -6493,10 +6914,12 @@ function panelRenderBody(key){
       if (tabField) reportUIState({[tabField]: tab.dataset.t});
       const id='tab-'+tab.dataset.t;
       body.querySelectorAll('.tabbody>div').forEach(d=>d.classList.toggle('hide',d.id!==id));
+      panelBuildToc();
     };
   });
   // wire any extra handlers the item needs
   if(item.wireBody) item.wireBody(body);
+  panelBuildToc();
 }
 
 function panelShow(key){
@@ -6514,7 +6937,7 @@ function panelRemove(key){
   }
   panelRenderTabs();
   if(panelActiveKey) panelRenderBody(panelActiveKey);
-  else document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>';
+  else { document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; panelBuildToc(); }
   panelUpdateLLM();
 }
 
@@ -6524,9 +6947,11 @@ function panelRemove(key){
 function panelClearTiles(note){
   panelItems.forEach((_,k)=>{ if(k.startsWith('tile:')) panelItems.delete(k); });
   panelSync();
-  if(!panelItems.size && note)
+  if(!panelItems.size && note){
     document.getElementById('panel-body').innerHTML =
       '<div class="placeholder">'+esc(note)+'</div>';
+    panelBuildToc();
+  }
 }
 
 function panelSync(){
@@ -6534,7 +6959,7 @@ function panelSync(){
   if(!panelItems.has(panelActiveKey)) panelActiveKey = panelItems.size ? [...panelItems.keys()][0] : null;
   panelRenderTabs();
   if(panelActiveKey) panelRenderBody(panelActiveKey);
-  else document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>';
+  else { document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; panelBuildToc(); }
   panelUpdateLLM();
 }
 
@@ -6624,7 +7049,7 @@ function srcBuildBody(item){
      + '</div><div class="srcwrap">' + m.html + '</div>';
 }
 function srcWireBody(item, body){
-  const panel = document.getElementById('panel');
+  const panel = document.getElementById('panel-body');
   let row = null;
   if (item.line){
     for (let n = item.line; n <= (item.endLine || item.line); n++){
@@ -6635,7 +7060,6 @@ function srcWireBody(item, body){
     }
   }
   // Not scrollIntoView (it walks ancestors and would move the outer flex column
-  // and the page), and not offsetTop either: #panel is position:static, so
   // offsetParent is <body> and offsetTop measures from the top of the document.
   // Rect deltas are correct whatever the offsetParent turns out to be.
   if (panel){
@@ -7861,6 +8285,7 @@ document.getElementById('gbtn').onclick = () => {
     '<h2>Global / kernel-group</h2>' +
     '<div class="kv">'+esc(gl.note)+'</div>' +
     '<pre class="code">'+hl(gl.code||'')+'</pre>';
+  panelBuildToc();
 };
 
 // ─── Live debug overlay (talks to schedule_debug_server on the same origin) ───
@@ -9450,6 +9875,12 @@ if (location.protocol === 'http:' || location.protocol === 'https:') probeLLM();
   window._ctxInsertFrag = ctxInsertFrag;
 
   function hidePopup(){ popup.style.display = 'none'; }
+
+  document.addEventListener('selectionchange', () => {
+    if (popup.style.display === 'none') return;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.toString().trim()) hidePopup();
+  });
 
   document.addEventListener('mouseup', e => {
     if (e.target === popup) return;
