@@ -309,9 +309,246 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1) {
  * programmed in __Runtime_core_trace_setup. */
 static const char *const s_core_trace_slot_name[4] = {"ACTIVE", "LOCK_STALL", "STREAM_STALL", "MEMORY_STALL"};
 
+#ifdef AIE_HAVE_RESOURCE_MAP
+/* -------------------------------------------------------------------------
+ * Resource-map queries for core-trace channel selection. Each helper scans the
+ * flat __aie_resource_map table (passed in as rm[0..n)) filtered by (col,row)
+ * and answers whether a given port / packet id / DMA channel is already used by
+ * the data-plane routing. Absent map (raw/single-kernel flow) -> not compiled;
+ * the caller falls back to convention values.
+ * ------------------------------------------------------------------------- */
+
+/* Any MASTER-side port on (col,row) equal to (dir,idx)? Master-side = a
+ * packet forward_master or a generic circuit/shim master port. */
+static int resmap_master_used(const struct AieResourceEntry *rm, int n, int col, int row, const char *dir, int idx) {
+    for (int i = 0; i < n; i++) {
+        const struct AieResourceEntry *e = &rm[i];
+        if (e->col != col || e->row != row)
+            continue;
+        if (e->fwd_dir && strcmp(e->fwd_dir, dir) == 0 && e->fwd_idx == idx)
+            return 1;
+        if (e->master_dir && strcmp(e->master_dir, dir) == 0 && e->master_idx == idx)
+            return 1;
+    }
+    return 0;
+}
+
+/* Any SLAVE-side port on (col,row) equal to (dir,idx)? Slave-side = a packet
+ * recv_slave or local_dma slot, or a generic circuit/shim slave port. */
+static int resmap_slave_used(const struct AieResourceEntry *rm, int n, int col, int row, const char *dir, int idx) {
+    for (int i = 0; i < n; i++) {
+        const struct AieResourceEntry *e = &rm[i];
+        if (e->col != col || e->row != row)
+            continue;
+        if (e->recv_dir && strcmp(e->recv_dir, dir) == 0 && e->recv_idx == idx)
+            return 1;
+        if (e->dma_dir && strcmp(e->dma_dir, dir) == 0 && e->dma_idx == idx)
+            return 1;
+        if (e->slave_dir && strcmp(e->slave_dir, dir) == 0 && e->slave_idx == idx)
+            return 1;
+    }
+    return 0;
+}
+
+/* Is packet id `id` already used on (col,row) (recv or dma slot)? */
+static int resmap_pktid_used(const struct AieResourceEntry *rm, int n, int col, int row, int id) {
+    for (int i = 0; i < n; i++) {
+        const struct AieResourceEntry *e = &rm[i];
+        if (e->col != col || e->row != row)
+            continue;
+        if (e->recv_pktid == id || e->dma_pktid == id)
+            return 1;
+    }
+    return 0;
+}
+
+/* Is MemTile DMA channel `ch` already used on (col,row)? Any recorded port whose
+ * direction is "DMA" with idx==ch. */
+static int resmap_dma_used(const struct AieResourceEntry *rm, int n, int col, int row, int ch) {
+    for (int i = 0; i < n; i++) {
+        const struct AieResourceEntry *e = &rm[i];
+        if (e->col != col || e->row != row)
+            continue;
+        if (e->recv_dir && strcmp(e->recv_dir, "DMA") == 0 && e->recv_idx == ch)
+            return 1;
+        if (e->dma_dir && strcmp(e->dma_dir, "DMA") == 0 && e->dma_idx == ch)
+            return 1;
+        if (e->fwd_dir && strcmp(e->fwd_dir, "DMA") == 0 && e->fwd_idx == ch)
+            return 1;
+        if (e->slave_dir && strcmp(e->slave_dir, "DMA") == 0 && e->slave_idx == ch)
+            return 1;
+        if (e->master_dir && strcmp(e->master_dir, "DMA") == 0 && e->master_idx == ch)
+            return 1;
+    }
+    return 0;
+}
+
+/* Per-column record of trace stream / S2MM channels already handed out by
+ * earlier trace setups in THIS run. The const data-plane map cannot record the
+ * trace's own usage, so without this two traced tiles in the same column would
+ * re-pick the same first-free strm_ch / s2mm_ch and collide on the shared
+ * pass-through segment and MemTile NORTH-slave / S2MM channel. `col` is
+ * partition-relative and bounded by AIE_TRACE_MAX_COLS (64, defined later near
+ * _begin_ch); keep the same width here. Indices out of range simply skip the
+ * claim check (the map + convention slot allocation still apply). */
+#define AIE_TRACE_CLAIM_COLS 64
+static uint8_t s_trace_strm_claim[AIE_TRACE_CLAIM_COLS]; /* bit ch => strm_ch ch taken on this col's route  */
+static uint8_t s_trace_s2mm_claim[AIE_TRACE_CLAIM_COLS]; /* bit ch => s2mm_ch ch taken on this col's memtile */
+
+static int resmap_strm_claimed(int col, int ch) {
+    return (col >= 0 && col < AIE_TRACE_CLAIM_COLS) ? (s_trace_strm_claim[col] & (1u << ch)) != 0 : 0;
+}
+static int resmap_s2mm_claimed(int col, int ch) {
+    return (col >= 0 && col < AIE_TRACE_CLAIM_COLS) ? (s_trace_s2mm_claim[col] & (1u << ch)) != 0 : 0;
+}
+/* Record the resources this trace setup consumed so later picks avoid them. */
+static void resmap_claim_trace(int col, uint8_t strm, uint8_t s2mm) {
+    if (col < 0 || col >= AIE_TRACE_CLAIM_COLS)
+        return;
+    s_trace_strm_claim[col] |= (uint8_t)(1u << strm);
+    s_trace_s2mm_claim[col] |= (uint8_t)(1u << s2mm);
+}
+
+/* Pick a stream channel / MemTile S2MM channel / packet id / BD for the core
+ * trace route that avoid the data-plane ports the map records for this column
+ * AND the trace resources earlier setups in this run already claimed.
+ * Returns 1 with the out params written, or 0 (caller keeps convention values)
+ * when no free candidate exists. srcRow is the source core row, mtRow the top
+ * MemTile row (srcRow > pass-through rows > mtRow). Physical channel sharing: an
+ * upper tile's SOUTH master idx IS the NORTH slave idx of the tile below, so a
+ * free strm_ch must clear SOUTH-master on the source, NORTH-slave + SOUTH-master
+ * on every pass-through core, and NORTH-slave on the MemTile.
+ *
+ * NOTE: the map records no BDs, so a trace BD colliding with a data-plane DMA BD
+ * is NOT detectable here; the BD is chosen parity-correct (MemTile channel rule)
+ * and distinct per channel, matching today's convention (see _begin_ch). */
+static int resmap_pick_trace_resources(const struct AieResourceEntry *rm, int n, int col, uint8_t srcRow, uint8_t mtRow,
+                                       uint8_t *out_strm, uint8_t *out_s2mm, uint8_t *out_bd, uint8_t *out_pkt) {
+    /* Core SOUTH-master / NORTH-slave and MemTile NORTH-slave ports are 0..3
+     * (== AIE_TRACE_SLOTS_PER_COL, defined later near _begin_ch). */
+    enum { TRACE_STRM_CH_RANGE = 4 };
+    int strm = -1;
+    for (int ch = 0; ch < TRACE_STRM_CH_RANGE; ch++) {
+        if (resmap_strm_claimed(col, ch) || resmap_master_used(rm, n, col, srcRow, "SOUTH", ch))
+            continue;
+        int ok = 1;
+        for (uint8_t r = (uint8_t)(srcRow - 1); r > mtRow && ok; r--)
+            if (resmap_slave_used(rm, n, col, r, "NORTH", ch) || resmap_master_used(rm, n, col, r, "SOUTH", ch))
+                ok = 0;
+        if (!ok)
+            continue;
+        if (resmap_slave_used(rm, n, col, mtRow, "NORTH", ch))
+            continue;
+        strm = ch;
+        break;
+    }
+    if (strm < 0)
+        return 0;
+
+    int s2mm = -1;
+    for (int ch = 0; ch < TRACE_STRM_CH_RANGE; ch++)
+        if (!resmap_s2mm_claimed(col, ch) && !resmap_dma_used(rm, n, col, mtRow, ch)) {
+            s2mm = ch;
+            break;
+        }
+    if (s2mm < 0)
+        return 0;
+
+    int pkt = -1;
+    for (int id = 1; id < 32; id++)
+        if (!resmap_pktid_used(rm, n, col, srcRow, id)) {
+            pkt = id;
+            break;
+        }
+    if (pkt < 0)
+        return 0;
+
+    /* Parity-correct + distinct-per-channel BD (MemTile rule: even ch -> BD<24,
+     * odd ch -> BD>=24). Matches convention k_bd_for_slot {4,25,6,27}: even ch
+     * -> 4+ch, odd ch -> 24+ch. Distinct s2mm (enforced above) => distinct BD. */
+    *out_bd = ((s2mm % 2) == 0) ? (uint8_t)(4 + s2mm) : (uint8_t)(24 + s2mm);
+    *out_strm = (uint8_t)strm;
+    *out_s2mm = (uint8_t)s2mm;
+    *out_pkt = (uint8_t)pkt;
+    return 1;
+}
+
+/* Apply map-driven selection for the source `tile`: on success overwrite
+ * *strm/*s2mm/*bd/*pkt with collision-free values, otherwise leave them (the
+ * caller's convention fallback) and warn. This ONLY selects -- the claim is
+ * recorded later, once the stream connections actually succeed (see
+ * resmap_claim_trace at the end of section 3 in __Runtime_core_trace_setup), so a
+ * route that fails part-way does not leak a claim on a channel it never occupied.
+ * Keeps __Runtime_core_trace_setup short (CLAUDE 200-line rule). No-op when the
+ * map is absent/empty. */
+static void resmap_apply_trace_resources(const struct AieResourceEntry *rm, int n, XAie_LocType tile, uint8_t mt_row,
+                                         uint8_t *strm, uint8_t *s2mm, uint8_t *bd, uint8_t *pkt) {
+    if (!rm || n <= 0)
+        return;
+    uint8_t p_strm, p_s2mm, p_bd, p_pkt;
+    if (resmap_pick_trace_resources(rm, n, (int)tile.Col, tile.Row, mt_row, &p_strm, &p_s2mm, &p_bd, &p_pkt)) {
+        *strm = p_strm;
+        *s2mm = p_s2mm;
+        *bd = p_bd;
+        *pkt = p_pkt;
+        printf(
+            "[aie_runtime] core_trace_setup: resource-map picked strm_ch=%u s2mm_ch=%u bd=%u pkt_id=%u tile(%u,%u)\n",
+            (unsigned)*strm, (unsigned)*s2mm, (unsigned)*bd, (unsigned)*pkt, (unsigned)tile.Col, (unsigned)tile.Row);
+    } else {
+        printf("[aie_runtime] core_trace_setup: resource-map found no free trace resources; keeping convention "
+               "strm_ch=%u s2mm_ch=%u bd=%u tile(%u,%u)\n",
+               (unsigned)*strm, (unsigned)*s2mm, (unsigned)*bd, (unsigned)tile.Col, (unsigned)tile.Row);
+    }
+}
+#endif /* AIE_HAVE_RESOURCE_MAP */
+
+/* Emit the trace-stream routing setup to the applog for host-side tooling.
+ * Two forms are printed:
+ *   1. a grep-friendly [TRACESTREAMCONFIG] one-liner carrying the packet-switch
+ *      slot config on the source TRACE port (port / slot / pkt / mask / msel /
+ *      arbiter -- mirroring section 3a) plus the SOUTH master and MemTile S2MM
+ *      channels the stream rides / lands on;
+ *   2. the existing core_trace_stream_json line with the full hop-by-hop route.
+ * The slot/mask/msel/arbiter literals mirror the XAie_StrmPktSw* enable calls in
+ * __Runtime_core_trace_setup section 3a (slot 0, mask 0x1F, msel 0, arbiter 0). */
+static void trace_emit_stream_config(XAie_LocType tile, XAie_LocType mt, uint8_t mt_row, uint8_t strm_ch,
+                                     uint8_t s2mm_ch, uint8_t bdnum, uint32_t buf_addr, uint32_t buf_len,
+                                     uint8_t pkt_id) {
+    printf("[TRACESTREAMCONFIG] src_tile=(%u,%u) in_port=TRACE:0 out_port=SOUTH:%u memtile=(%u,%u) "
+           "mt_in_port=NORTH:%u dma=S2MM:%u bd=%u pkt_id=%u slot=0 mask=0x1F msel=0 arbiter=0 "
+           "buf_addr=0x%x buf_len=%u\n",
+           (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)strm_ch, (unsigned)mt.Col, (unsigned)mt.Row,
+           (unsigned)strm_ch, (unsigned)s2mm_ch, (unsigned)bdnum, (unsigned)pkt_id, buf_addr, buf_len);
+
+    printf("[aie_runtime] core_trace_stream_json: {"
+           "\"src_tile\":[%u,%u],\"memtile\":[%u,%u],\"strm_ch\":%u,\"s2mm_ch\":%u,\"bd\":%u,"
+           "\"buf_addr\":\"0x%x\",\"buf_len\":%u,\"pkt_id\":%u,\"mask\":\"0x1F\","
+           "\"slots\":[\"%s\",\"%s\",\"%s\",\"%s\"],\"hops\":[",
+           (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)mt.Col, (unsigned)mt.Row, (unsigned)strm_ch,
+           (unsigned)s2mm_ch, (unsigned)bdnum, buf_addr, buf_len, (unsigned)pkt_id, s_core_trace_slot_name[0],
+           s_core_trace_slot_name[1], s_core_trace_slot_name[2], s_core_trace_slot_name[3]);
+    printf("{\"tile\":[%u,%u],\"in\":\"TRACE\",\"out\":\"SOUTH\",\"ch\":%u,\"mode\":\"packet\"}", (unsigned)tile.Col,
+           (unsigned)tile.Row, (unsigned)strm_ch);
+    for (uint8_t r = (uint8_t)(tile.Row - 1); r > mt_row; r--)
+        printf(",{\"tile\":[%u,%u],\"in\":\"NORTH\",\"out\":\"SOUTH\",\"ch\":%u,\"mode\":\"circuit\"}",
+               (unsigned)tile.Col, (unsigned)r, (unsigned)strm_ch);
+    printf(
+        ",{\"tile\":[%u,%u],\"in\":\"NORTH\",\"in_ch\":%u,\"out\":\"DMA_S2MM\",\"out_ch\":%u,\"mode\":\"circuit\"}]}\n",
+        (unsigned)mt.Col, (unsigned)mt.Row, (unsigned)strm_ch, (unsigned)s2mm_ch);
+}
+
 AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t buf_len,
-                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum) {
+                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum, const struct AieResourceEntry *resmap,
+                                 int resmap_count) {
     AieRC rc;
+    uint8_t pkt_id = 1;                                      /* trace pkt id; map may override below */
+    uint8_t mt_row = (uint8_t)(XAIE_AIE_TILE_ROW_START - 1); /* top memtile, directly below cores */
+    (void)resmap, (void)resmap_count;
+#ifdef AIE_HAVE_RESOURCE_MAP
+    /* When a routing map is passed, re-pick strm_ch/s2mm_ch/bdnum/pkt_id to avoid
+     * this column's recorded data-plane ports; otherwise keep the passed values. */
+    resmap_apply_trace_resources(resmap, resmap_count, tile, mt_row, &strm_ch, &s2mm_ch, &bdnum, &pkt_id);
+#endif
 
     rc = XAie_TraceControlConfigReset(dev, tile, XAIE_CORE_MOD);
     if (rc != XAIE_OK) {
@@ -358,7 +595,7 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
         }
     }
 
-    XAie_Packet Pkt = XAie_PacketInit(1, 1);
+    XAie_Packet Pkt = XAie_PacketInit(pkt_id, 1);
     rc = XAie_TracePktConfig(dev, tile, XAIE_CORE_MOD, Pkt);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: TracePktConfig failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)tile.Col,
@@ -386,12 +623,12 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
         printf("[aie_runtime] core_trace_setup: device has no MemTile (gen1); cannot route trace\n");
         return XAIE_ERR;
     }
-    uint8_t mt_row = (uint8_t)(XAIE_AIE_TILE_ROW_START - 1); /* top memtile, directly below cores */
+    /* mt_row computed at function entry (top memtile, directly below cores). */
     XAie_LocType mt = XAie_TileLoc(tile.Col, mt_row);
 
     /* 3a. Source core tile: packet-switch the TRACE stream onto SOUTH master
      * strm_ch. The trace stream is emitted as packets (see TracePktConfig above,
-     * Pkt id=1), so the source tile's stream switch must run in packet mode: a
+     * Pkt id = pkt_id), so the source tile's stream switch must run in packet mode: a
      * slave slot on the TRACE port matches the trace packet id, the TRACE slave
      * port is enabled, and the SOUTH master forwards the matched packets
      * downward keeping the header so the downstream trace parser can identify
@@ -399,20 +636,22 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
      * channel in plain circuit-switched mode. slot/msel/arbiter are 0 and
      * MSelEn = (1 << msel) = 0x1; mask 0x1F matches the full 5-bit packet id. */
     rc = XAie_StrmPktSwSlaveSlotEnable(dev, tile, TRACE, 0, /*slot=*/0, Pkt,
-                                       /*mask=*/0x1F, /*msel=*/0, /*arbiter=*/0);
+                                       /*mask=*/0x1F, /*msel=*/0, /*arbiter=*/1);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: StrmPktSwSlaveSlotEnable TRACE ch=%u failed rc=%d tile(%u,%u)\n",
                (unsigned)strm_ch, (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
         return rc;
     }
+    // return rc;//ok
     rc = XAie_StrmPktSwSlavePortEnable(dev, tile, TRACE, 0);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: StrmPktSwSlavePortEnable TRACE failed rc=%d tile(%u,%u)\n", (int)rc,
                (unsigned)tile.Col, (unsigned)tile.Row);
         return rc;
     }
+    // return rc;
     rc = XAie_StrmPktSwMstrPortEnable(dev, tile, SOUTH, strm_ch, XAIE_SS_PKT_DONOT_DROP_HEADER,
-                                      /*arbiter=*/0, /*MSelEn=*/0x1);
+                                      /*arbiter=*/1, /*MSelEn=*/1);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: StrmPktSwMstrPortEnable SOUTH ch=%u failed rc=%d tile(%u,%u)\n",
                (unsigned)strm_ch, (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
@@ -438,6 +677,16 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
                (unsigned)s2mm_ch, (int)rc, (unsigned)mt.Col, (unsigned)mt.Row);
         return rc;
     }
+
+#ifdef AIE_HAVE_RESOURCE_MAP
+    /* The whole vertical stream route (3a source SOUTH-master, 3b each pass-through
+     * NORTH-slave->SOUTH-master, 3c MemTile NORTH-slave->S2MM) is now physically
+     * occupied. Record the FINAL strm_ch / s2mm_ch (whether map-picked or the
+     * caller's convention fallback) in the per-column claim tracker so the next
+     * trace setup on this column avoids them. Deferred to here -- not the
+     * selection step -- so a route that failed at 3a/3b/3c leaks no claim. */
+    resmap_claim_trace((int)tile.Col, strm_ch, s2mm_ch);
+#endif
 
     /* MemTile DMA BD/channel parity rule (_XAieMl_MemTileDmaCheckBdChValidity,
      * xaie_dma_aieml.c:1420): an even S2MM channel requires BD < 24, an odd
@@ -473,25 +722,10 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
         return rc;
     }
 
-    /* Emit the full trace-stream routing setting as one JSON line so the
-     * host-side timeline/decoder tooling can parse the core->MemTile route,
-     * channels and trace slots straight from the applog. The `hops` array walks
-     * the physical path: source core (TRACE->SOUTH, packet mode), each pass-thru
-     * core (NORTH->SOUTH, circuit), and the top MemTile (NORTH->DMA S2MM). */
-    printf("[aie_runtime] core_trace_stream_json: {"
-           "\"src_tile\":[%u,%u],\"memtile\":[%u,%u],\"strm_ch\":%u,\"s2mm_ch\":%u,\"bd\":%u,"
-           "\"buf_addr\":\"0x%x\",\"buf_len\":%u,\"pkt_id\":1,\"slots\":[\"%s\",\"%s\",\"%s\",\"%s\"],\"hops\":[",
-           (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)mt.Col, (unsigned)mt.Row, (unsigned)strm_ch,
-           (unsigned)s2mm_ch, (unsigned)bdnum, buf_addr, buf_len, s_core_trace_slot_name[0], s_core_trace_slot_name[1],
-           s_core_trace_slot_name[2], s_core_trace_slot_name[3]);
-    printf("{\"tile\":[%u,%u],\"in\":\"TRACE\",\"out\":\"SOUTH\",\"ch\":%u,\"mode\":\"packet\"}", (unsigned)tile.Col,
-           (unsigned)tile.Row, (unsigned)strm_ch);
-    for (uint8_t r = (uint8_t)(tile.Row - 1); r > mt_row; r--)
-        printf(",{\"tile\":[%u,%u],\"in\":\"NORTH\",\"out\":\"SOUTH\",\"ch\":%u,\"mode\":\"circuit\"}",
-               (unsigned)tile.Col, (unsigned)r, (unsigned)strm_ch);
-    printf(
-        ",{\"tile\":[%u,%u],\"in\":\"NORTH\",\"in_ch\":%u,\"out\":\"DMA_S2MM\",\"out_ch\":%u,\"mode\":\"circuit\"}]}\n",
-        (unsigned)mt.Col, (unsigned)mt.Row, (unsigned)strm_ch, (unsigned)s2mm_ch);
+    /* Emit the trace-stream routing setup ([TRACESTREAMCONFIG] one-liner +
+     * core_trace_stream_json) so host-side timeline/decoder tooling can parse the
+     * core->MemTile route, ports, slot/pkt/mask and channels from the applog. */
+    trace_emit_stream_config(tile, mt, mt_row, strm_ch, s2mm_ch, bdnum, buf_addr, buf_len, pkt_id);
 
     AIEHLC_LOG(printf("[aie_runtime] core_trace_setup OK core(%u,%u) -> memtile(%u,%u) buf=0x%x len=%u strm_ch=%u "
                       "s2mm_ch=%u\n",
@@ -1041,7 +1275,17 @@ void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, 
     uint32_t setup_addr = read_addr | AIE_TRACE_DMA_HI;
 
     XAie_LocType tile = XAie_TileLoc(col, row);
-    AieRC rc = __Runtime_core_trace_setup(dev, tile, setup_addr, AIE_TRACE_BUF_LEN, strm_ch, s2mm_ch, bdnum);
+    /* Pass the generated routing resource map when this flow has one so the trace
+     * route's strm_ch/s2mm_ch/pkt id dodge the recorded data-plane ports; absent
+     * (raw/single-kernel flow) -> NULL/0 keeps the convention values above. */
+#ifdef AIE_HAVE_RESOURCE_MAP
+    const struct AieResourceEntry *rm = __aie_resource_map;
+    int rmn = __aie_resource_map_count;
+#else
+    const struct AieResourceEntry *rm = 0;
+    int rmn = 0;
+#endif
+    AieRC rc = __Runtime_core_trace_setup(dev, tile, setup_addr, AIE_TRACE_BUF_LEN, strm_ch, s2mm_ch, bdnum, rm, rmn);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_begin: core_trace_setup failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)col,
                (unsigned)row);

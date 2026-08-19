@@ -442,8 +442,16 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 //            XAie_DataMemBlockRead for the MemTile loc).
 // Call BEFORE enabling the core; the caller must reserve the MemTile buffer
 // region and the strm_ch/s2mm_ch so they do not clash with data traffic.
+//
+// When a generated routing resource map is passed (resmap != NULL && count > 0),
+// the trace route's stream channel, MemTile S2MM channel and packet id are
+// re-selected to avoid the data-plane ports the map records for this column;
+// strm_ch/s2mm_ch/bdnum are then treated as fallbacks. NULL/0 (raw/single-kernel
+// flow) keeps the convention values the caller passed in.
+struct AieResourceEntry; /* generated in aie_resource_map.h; opaque here */
 AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t buf_len,
-                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum = 0);
+                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum = 0,
+                                 const struct AieResourceEntry *resmap = 0, int resmap_count = 0);
 
 // Read raw trace words back from the MemTile buffer. Pass the MemTile loc (the
 // same-column top MemTile, row XAIE_AIE_TILE_ROW_START-1) and buf_addr used in
