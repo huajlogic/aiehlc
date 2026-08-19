@@ -104,7 +104,10 @@ COMMAND_SPEC = {
         _cmd("pc", "core PC resolved to source via the line map"),
         _cmd("status", "decoded core status (enable/reset/stall)",
              aliases=("core", "core status")),
-        _cmd("event", "decoded event-status registers"),
+        _cmd("event", "memory-module DMA event-status registers",
+             aliases=("event mem",)),
+        _cmd("core event", "full core-module event list (0x34200..; core tiles)",
+             aliases=("core events", "event core")),
         _cmd("channels", "list this tile's DMA channels", aliases=("chans",)),
         _cmd("log", "dump the kernel klog buffer (core tiles only)",
              aliases=("klog",)),
@@ -697,7 +700,7 @@ class AieGdb:
                 return
             col, row = int(rest[0]), int(rest[1])
             self.tile = {"col": col, "row": row,
-                         "type": "shim" if row == 0 else "core"}
+                         "type": aiediag.tile_type_for_row(row, self.aie_version)}
             self.channel = None
             print(f"scope -> {self.prompt().rstrip()}  "
                   f"(phys_col={self.phys_col}, row={row})")
@@ -790,11 +793,17 @@ class AieGdb:
         if verb == "pc":
             self._pc()
             return
+        if verb == "core" and args and args[0] in ("event", "events"):
+            self._core_events()
+            return
         if verb == "status" or (verb == "core" and (not args or args[0] == "status")):
             self._core_status()
             return
         if verb == "event":
-            self._tile_events()
+            if args and args[0] in ("core", "module"):
+                self._core_events()
+            else:
+                self._tile_events()
             return
         if verb in ("log", "klog"):
             self._klog()
@@ -842,8 +851,8 @@ class AieGdb:
                                         d, c, dec))
 
     def _pc(self):
-        if self.tile["row"] == 0:
-            print("error: shim tiles (row 0) have no core PC register")
+        if self.tile["type"] != "core":
+            print(f"error: {self.tile['type']} tiles have no core PC register")
             return
         raw = self._reg_read(self.phys_col, self.tile["row"],
                              aiediag.CORE_PC_OFFSET)
@@ -858,8 +867,8 @@ class AieGdb:
             print(f"  PC=0x{pc:05X} (no line-map match)")
 
     def _core_status(self):
-        if self.tile["row"] == 0:
-            print("error: shim tiles (row 0) have no core status register")
+        if self.tile["type"] != "core":
+            print(f"error: {self.tile['type']} tiles have no core status register")
             return
         off = aiediag.core_status_offset(self.aie_version)
         raw = self._reg_read(self.phys_col, self.tile["row"], off)
@@ -869,8 +878,8 @@ class AieGdb:
         print(aiediag.format_core_status(self.phys_col, self.tile["row"], dec))
 
     def _klog(self):
-        if self.tile["row"] == 0:
-            print("error: shim tiles (row 0) have no core klog buffer")
+        if self.tile["type"] != "core":
+            print(f"error: {self.tile['type']} tiles have no core klog buffer")
             return
         res = aiediag.read_klog(self.phys_col, self.tile["row"],
                                 self.target, self.device, self.dry_run)
@@ -888,11 +897,29 @@ class AieGdb:
             for off in (aiediag.SHIM_EVT_STATUS_REG0,
                         aiediag.SHIM_EVT_STATUS_REG1):
                 self._reg_read(pc, row, off)
+        elif ttype == "memtile":
+            regs = [self._reg_read(pc, row, off)
+                    for off in aiediag.MEMTILE_EVT_STATUS_REGS]
+            sel_reg = self._reg_read(pc, row, aiediag.MEMTILE_DMA_EVENT_SEL_REG)
+            if not all(v is None for v in regs):
+                print(aiediag.format_memtile_dma_events(pc, row, regs, sel_reg))
         else:
             regs4 = [self._reg_read(pc, row, off)
                      for off in aiediag.MEM_EVT_STATUS_REGS]
             if not all(v is None for v in regs4):
                 print(aiediag.format_core_mem_dma_events(pc, row, regs4))
+
+    def _core_events(self):
+        """Full core-MODULE event list (0x34200..) — distinct from `event`,
+        which decodes the memory-module DMA events (0x14200..)."""
+        if self.tile["type"] != "core":
+            print(f"error: {self.tile['type']} tiles have no core module events")
+            return
+        pc, row = self.phys_col, self.tile["row"]
+        regs4 = [self._reg_read(pc, row, off)
+                 for off in aiediag.CORE_EVT_STATUS_REGS]
+        if not all(v is None for v in regs4):
+            print(aiediag.format_core_module_events(pc, row, regs4))
 
     def _list_channels(self):
         col, row = self.tile["col"], self.tile["row"]
@@ -986,6 +1013,33 @@ class AieGdb:
             bits = aiediag.decode_shim_event_status(d, c, reg0, reg1)
             if bits:
                 print(aiediag.format_shim_event_status(pc, d, c, bits, shim_ev))
+        elif ttype == "memtile":
+            regs = [self._reg_read(pc, row, off)
+                    for off in aiediag.MEMTILE_EVT_STATUS_REGS]
+            sel_reg = self._reg_read(pc, row, aiediag.MEMTILE_DMA_EVENT_SEL_REG)
+            if all(v is None for v in regs):
+                return
+            sel = aiediag.memtile_dma_sel_for_channel(sel_reg, d, c)
+            if sel is None:
+                print(f"  {d.upper()} ch{c} is not currently mapped to an event "
+                      f"slot (DMA_EVENT_CHANNEL_SELECTION=0x{(sel_reg or 0):08X}); "
+                      f"showing all slots:")
+                print(aiediag.format_memtile_dma_events(pc, row, regs, sel_reg))
+                return
+            emap = aiediag.MEMTILE_DMA_EVENT_IDS[(d, sel)]
+            started = aiediag._evt_active(emap["START_TASK"], regs)
+            finished_bd = aiediag._evt_active(emap["FINISHED_BD"], regs)
+            finished = aiediag._evt_active(emap["FINISHED_TASK"], regs)
+            error = aiediag._evt_active(emap["ERROR"], regs)
+            label = f"{d.upper()} ch{c} (SEL{sel})"
+            print(f"  {label} events tile({pc},{row}):")
+            print(f"    START_TASK:    {'SET' if started else 'not set'}")
+            print(f"    FINISHED_BD:   {'SET' if finished_bd else 'not set'}")
+            print(f"    FINISHED_TASK: {'SET' if finished else 'not set'}")
+            print(f"    ERROR:         {'SET' if error else 'not set'}"
+                  f"{'  (S2MM/MM2S direction-wide)' if error else ''}")
+            print(aiediag._memtile_evt_verdict(label, started, finished_bd,
+                                               finished, error))
         else:
             emap = aiediag.CORE_MEM_DMA_EVENT_IDS.get((d, c))
             if emap is None:
@@ -1027,6 +1081,10 @@ class AieGdb:
         c = self.channel["channel"]
         ttype = self.tile["type"]
         pc, row = self.phys_col, self.tile["row"]
+        if ttype == "memtile":
+            print("  memtile perf counters not supported (MEM_TILE module uses a "
+                  "different counter bank than the core memory module)")
+            return
         bank = PERF_OFFSETS[_perf_key(ttype)]
         print(f"  Perf counters ({_perf_key(ttype)}) tile({pc},{row}) "
               f"for {d.upper()} ch{c}:")
@@ -1063,6 +1121,10 @@ class AieGdb:
         c = self.channel["channel"]
         ttype = self.tile["type"]
         pc, row = self.phys_col, self.tile["row"]
+        if ttype == "memtile":
+            print("  memtile perf counters not supported (MEM_TILE module uses a "
+                  "different counter bank than the core memory module)")
+            return
         which = (args[0].lower() if args else "finished")
         evt_name = "START_TASK" if which.startswith("start") else "FINISHED_TASK"
         if ttype == "shim":

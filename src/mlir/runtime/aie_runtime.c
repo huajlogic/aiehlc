@@ -258,6 +258,656 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1) {
         __Runtime_perfcnt_read(dev, tile, 1, ch1);
 }
 
+/* ---------------------------------------------------------------------------
+ * Core event trace: capture an ACTIVE/stall timeline from a core tile and drain
+ * it DOWN through the intervening core tiles into the same-column top MemTile's
+ * memory via a circuit-switched TRACE -> (SOUTH/NORTH hops) -> S2MM DMA path,
+ * then read it back from the MemTile and decode on the host.
+ *
+ * Why a MemTile and not the core's own data memory: the MemTile has far more
+ * memory (512 KB on AIE2PS vs the core tile's small data mem), so a deep trace
+ * no longer has to steal space from kernel data.
+ *
+ * Flow (per the AIE2/AIE2PS core module trace unit):
+ *   1. TraceControlConfig: window = ENABLE_CORE .. DISABLE_CORE, mode
+ *      EVENT_TIME so packets carry delta-cycles (not PC, not instr count).
+ *   2. TraceEvent slots 0..3 = ACTIVE / LOCK_STALL / STREAM_STALL / MEMORY_STALL.
+ *   3. Multi-hop circuit-switched route on ONE physical stream channel `strm_ch`
+ *      (a tile's SOUTH master port k IS the NORTH slave port k of the tile below,
+ *      so the same index chains cleanly). `strm_ch` must be 0..3 (core SOUTH-
+ *      master / NORTH-slave and MemTile NORTH-slave port range):
+ *        3a. source core tile:  TRACE port 0     -> SOUTH master strm_ch
+ *        3b. each intervening core tile: NORTH slave strm_ch -> SOUTH master strm_ch
+ *        3c. top MemTile:       NORTH slave strm_ch -> DMA master (S2MM `s2mm_ch`)
+ *   4. S2MM BD -> [buf_addr, buf_len) in the MemTile's memory, then enable the
+ *      channel. `buf_addr`/`buf_len` are bytes into MemTile memory; buf_addr is
+ *      the DMA-view address, the same value __Runtime_core_trace_read passes to
+ *      XAie_DataMemBlockRead for the MemTile loc.
+ *
+ * NOTE: the MemTile DMA-port index is taken to equal `s2mm_ch` (mirrors the
+ * single-hop TRACE->DMA convention this replaces). Like the packet decode
+ * below, that mapping is worth confirming against one HW capture.
+ *
+ * The caller MUST reserve [buf_addr, buf_addr+buf_len) in MemTile memory and a
+ * free `strm_ch`/`s2mm_ch`, and MUST call this BEFORE enabling the core. Trace
+ * only flushes once the core disables (DISABLE_CORE closes the window), so read
+ * back with __Runtime_core_trace_read (passing the MemTile loc) after
+ * XAie_CoreWaitForDone + XAie_CoreDisable.
+ * ------------------------------------------------------------------------- */
+
+/* Slot -> event name, for the decoder. Order must match the TraceEvent slots
+ * programmed in __Runtime_core_trace_setup. */
+static const char *const s_core_trace_slot_name[4] = {"ACTIVE", "LOCK_STALL", "STREAM_STALL", "MEMORY_STALL"};
+
+AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t buf_len,
+                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum) {
+    AieRC rc;
+
+    rc = XAie_TraceControlConfigReset(dev, tile, XAIE_CORE_MOD);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TraceControlConfigReset failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
+    rc = XAie_TracePktConfigReset(dev, tile, XAIE_CORE_MOD);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TracePktConfigReset failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
+    rc = XAie_TraceEventReset(dev, tile, XAIE_CORE_MOD, 4);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TraceEventReset failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
+    /* 1. Control: start when the core goes active, stop when it is disabled,
+     * timestamp mode. NOTE: the driver has no ENABLE_CORE/DISABLE_CORE events;
+     * ACTIVE_CORE (core running) and DISABLED_CORE (core halted) are the closest
+     * available window edges. */
+    rc = XAie_TraceControlConfig(dev, tile, XAIE_CORE_MOD, XAIE_EVENT_ACTIVE_CORE,
+                                 XAIE_EVENT_DISABLED_CORE /*XAIE_EVENT_ECC_ERROR_STALL_CORE */, XAIE_TRACE_EVENT_TIME);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TraceControlConfig failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
+    /* 2. Map the events we care about into trace slots 0..3. */
+    static const XAie_Events trace_events[4] = {XAIE_EVENT_ACTIVE_CORE, XAIE_EVENT_LOCK_STALL_CORE,
+                                                XAIE_EVENT_STREAM_STALL_CORE, XAIE_EVENT_MEMORY_STALL_CORE};
+    for (uint8_t slot = 0; slot < 4; slot++) {
+        rc = XAie_TraceEvent(dev, tile, XAIE_CORE_MOD, trace_events[slot], slot);
+        if (rc != XAIE_OK) {
+            printf("[aie_runtime] core_trace_setup: TraceEvent slot=%u failed rc=%d tile(%u,%u)\n", (unsigned)slot,
+                   (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
+            return rc;
+        }
+    }
+
+    XAie_Packet Pkt = XAie_PacketInit(1, 1);
+    rc = XAie_TracePktConfig(dev, tile, XAIE_CORE_MOD, Pkt);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TracePktConfig failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)tile.Col,
+               (unsigned)tile.Row);
+        return rc;
+    }
+
+    XAie_TraceState Status;
+    rc = XAie_TraceGetState(dev, tile, XAIE_CORE_MOD, &Status);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: TraceGetState failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)tile.Col,
+               (unsigned)tile.Row);
+        return rc;
+    }
+    printf("[aie_runtime] core_trace_setup: TraceGetState tile(%u,%u) state=%d\n", (unsigned)tile.Col,
+           (unsigned)tile.Row, (int)Status);
+
+    /* 3. Route the core TRACE stream DOWN through the intervening core tiles into
+     * the same-column top MemTile's S2MM DMA channel. Every hop rides one
+     * physical stream channel strm_ch: an upper tile's SOUTH master port is
+     * physically the NORTH slave port of the tile directly below it, so the same
+     * index chains cleanly. strm_ch must be 0..3 (core SOUTH-master / NORTH-slave
+     * and MemTile NORTH-slave port range). */
+    if (XAIE_RES_TILE_NUM_ROWS == 0) { /* gen1: device has no MemTiles */
+        printf("[aie_runtime] core_trace_setup: device has no MemTile (gen1); cannot route trace\n");
+        return XAIE_ERR;
+    }
+    uint8_t mt_row = (uint8_t)(XAIE_AIE_TILE_ROW_START - 1); /* top memtile, directly below cores */
+    XAie_LocType mt = XAie_TileLoc(tile.Col, mt_row);
+
+    /* 3a. Source core tile: packet-switch the TRACE stream onto SOUTH master
+     * strm_ch. The trace stream is emitted as packets (see TracePktConfig above,
+     * Pkt id=1), so the source tile's stream switch must run in packet mode: a
+     * slave slot on the TRACE port matches the trace packet id, the TRACE slave
+     * port is enabled, and the SOUTH master forwards the matched packets
+     * downward keeping the header so the downstream trace parser can identify
+     * the stream. Every downstream hop (3b/3c) then rides the same physical
+     * channel in plain circuit-switched mode. slot/msel/arbiter are 0 and
+     * MSelEn = (1 << msel) = 0x1; mask 0x1F matches the full 5-bit packet id. */
+    rc = XAie_StrmPktSwSlaveSlotEnable(dev, tile, TRACE, 0, /*slot=*/0, Pkt,
+                                       /*mask=*/0x1F, /*msel=*/0, /*arbiter=*/0);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: StrmPktSwSlaveSlotEnable TRACE ch=%u failed rc=%d tile(%u,%u)\n",
+               (unsigned)strm_ch, (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+    rc = XAie_StrmPktSwSlavePortEnable(dev, tile, TRACE, 0);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: StrmPktSwSlavePortEnable TRACE failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+    rc = XAie_StrmPktSwMstrPortEnable(dev, tile, SOUTH, strm_ch, XAIE_SS_PKT_DONOT_DROP_HEADER,
+                                      /*arbiter=*/0, /*MSelEn=*/0x1);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: StrmPktSwMstrPortEnable SOUTH ch=%u failed rc=%d tile(%u,%u)\n",
+               (unsigned)strm_ch, (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
+    /* 3b. Each intervening core tile passes it straight through:
+     * NORTH slave strm_ch -> SOUTH master strm_ch, for rows (tile.Row-1)..(mt_row+1). */
+    for (uint8_t r = (uint8_t)(tile.Row - 1); r > mt_row; r--) {
+        XAie_LocType thru = XAie_TileLoc(tile.Col, r);
+        rc = XAie_StrmConnCctEnable(dev, thru, NORTH, strm_ch, SOUTH, strm_ch);
+        if (rc != XAIE_OK) {
+            printf("[aie_runtime] core_trace_setup: StrmConnCctEnable NORTH->SOUTH ch=%u failed rc=%d tile(%u,%u)\n",
+                   (unsigned)strm_ch, (int)rc, (unsigned)thru.Col, (unsigned)thru.Row);
+            return rc;
+        }
+    }
+
+    /* 3c. Top MemTile: NORTH slave strm_ch -> DMA master (S2MM channel s2mm_ch). */
+    rc = XAie_StrmConnCctEnable(dev, mt, NORTH, strm_ch, DMA, s2mm_ch);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: StrmConnCctEnable memtile NORTH->DMA ch=%u failed rc=%d tile(%u,%u)\n",
+               (unsigned)s2mm_ch, (int)rc, (unsigned)mt.Col, (unsigned)mt.Row);
+        return rc;
+    }
+
+    /* MemTile DMA BD/channel parity rule (_XAieMl_MemTileDmaCheckBdChValidity,
+     * xaie_dma_aieml.c:1420): an even S2MM channel requires BD < 24, an odd
+     * channel requires BD >= 24. Catch a bad pair here with a precise message
+     * instead of the driver's opaque XAIE_ERROR. */
+    if (((s2mm_ch % 2u) == 0u && bdnum >= 24u) || ((s2mm_ch % 2u) == 1u && bdnum < 24u)) {
+        printf("[aie_runtime] core_trace_setup: invalid MemTile BD/channel pair bd=%u s2mm_ch=%u "
+               "(even ch needs bd<24, odd ch needs bd>=24)\n",
+               (unsigned)bdnum, (unsigned)s2mm_ch);
+        return XAIE_INVALID_ARGS;
+    }
+
+    /* 4. S2MM BD in the MemTile pointing at the trace buffer, then enable the channel. */
+    XAie_DmaDesc bd;
+    rc = XAie_DmaDescInit(dev, &bd, mt);
+    if (rc != XAIE_OK)
+        return rc;
+    XAie_DmaSetAddrLen(&bd, (uint64_t)buf_addr, buf_len);
+    XAie_DmaEnableBd(&bd);
+    rc = XAie_DmaWriteBd(dev, &bd, mt, /*bdNum=*/bdnum);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: DmaWriteBd failed rc=%d memtile(%u,%u)\n", (int)rc, (unsigned)mt.Col,
+               (unsigned)mt.Row);
+        return rc;
+    }
+    rc = XAie_DmaChannelSetStartQueue(dev, mt, s2mm_ch, DMA_S2MM, /*bdNum=*/bdnum, /*repeat=*/1, XAIE_DISABLE);
+    if (rc != XAIE_OK)
+        return rc;
+    rc = XAie_DmaChannelEnable(dev, mt, s2mm_ch, DMA_S2MM);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: DmaChannelEnable ch=%u failed rc=%d memtile(%u,%u)\n",
+               (unsigned)s2mm_ch, (int)rc, (unsigned)mt.Col, (unsigned)mt.Row);
+        return rc;
+    }
+
+    AIEHLC_LOG(printf("[aie_runtime] core_trace_setup OK core(%u,%u) -> memtile(%u,%u) buf=0x%x len=%u strm_ch=%u "
+                      "s2mm_ch=%u\n",
+                      (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)mt.Col, (unsigned)mt.Row, buf_addr, buf_len,
+                      (unsigned)strm_ch, (unsigned)s2mm_ch));
+    return XAIE_OK;
+}
+
+AieRC __Runtime_core_trace_read(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t *dst,
+                                uint32_t len_words) {
+    if (!dst || len_words == 0)
+        return XAIE_INVALID_ARGS;
+    /*
+    AieRC rc;
+    for(int i = 0; i < len_words; i++) {
+        rc = XAie_Read32(dev, XAie_GetTileAddr(dev,tile.Row, tile.Col) + buf_addr + i * sizeof(uint32_t), &dst[i]);
+        if (rc != XAIE_OK) {
+            printf("[aie_runtime] core_trace_read: Read32 failed rc=%d tile(%u,%u) addr=0x%x\n", (int)rc,
+                   (unsigned)tile.Col, (unsigned)tile.Row, XAie_GetTileAddr(dev,tile.Row, tile.Col) + buf_addr + i *
+    sizeof(uint32_t)); return rc;
+        }
+        printf("[aie_runtime] core_trace_read: Read32 tile(%u,%u) addr=0x%x data=0x%x\n", (unsigned)tile.Col,
+    (unsigned)tile.Row, XAie_GetTileAddr(dev,tile.Row, tile.Col) + buf_addr + i * sizeof(uint32_t), dst[i]);
+    }
+    */
+    AieRC rc = XAie_DataMemBlockRead(dev, tile, buf_addr, dst, len_words * (uint32_t)sizeof(uint32_t));
+    if (rc != XAIE_OK)
+        printf("[aie_runtime] core_trace_read: DataMemBlockRead failed rc=%d tile(%u,%u) addr=0x%x\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row, buf_addr);
+    return rc;
+}
+
+/* Decode raw core trace words into an ACTIVE/*_STALL timeline.
+ *
+ * TRANSPORT FRAMING (hardware-defined):
+ * The trace unit outputs a packet-switched stream hardened to 8-word packets:
+ *   word[0]    = stream-packet routing header (packet ID + packet type)
+ *   word[1..7] = 7 x 32-bit trace payload
+ * __Runtime_core_trace_setup routes with XAIE_SS_PKT_DONOT_DROP_HEADER, so the
+ * header word IS present in the DMA'd buffer and is skipped. The 7 payload words
+ * of every packet are concatenated into one contiguous frame stream. An all-zero
+ * 8-word packet marks the untouched buffer tail and stops decoding (the caller
+ * passes the full buffer capacity, not the DMA'd word count).
+ *
+ * PAYLOAD ENCODING -- Event-Time trace frames (AIE2ps Architecture Spec, Figure
+ * 4-14). Frames are variable width and packed MSB-first (bit 31 first); the
+ * trace unit aligns them to its 32-bit output words with 8-bit Filler frames, so
+ * no non-Start frame straddles a word. Mode bits [25:24] = 0b00 (Event-Time).
+ *
+ *   Frame      Width  Prefix (from bit31)      Fields
+ *   Single0     8b    0                        event(3)  cycles(4)
+ *   Single1    16b    100                      event(3)  cycles(10)
+ *   Single2    24b    101                      event(3)  cycles(18)
+ *   Multiple0  16b    1100                     mask(8)   cycles(4)
+ *   Multiple1  24b    110100                   mask(8)   cycles(10)
+ *   Multiple2  32b    110101                   mask(8)   cycles(18)
+ *   Repeat0     8b    1110                     repeats(4)
+ *   Repeat1    16b    110110                   repeats(10)
+ *   Start      64b    11110 <OR> 00            timer(56, absolute cycle base)
+ *   Stop       32b    110111  x(8)             cycles(18)
+ *   Filler      8b    11111110 (0xFE)          32-bit alignment pad (skipped)
+ *   Sync        8b    11111111 (0xFF)          0x3FFFF idle cycles
+ *
+ * "cycles" is the count since the previous frame -> cycle += cycles, then the
+ * event(s) are emitted at the new cycle. Single carries a 3-bit event index;
+ * Multiple carries an 8-bit event bitmap. Event index -> slot name follows the
+ * slots programmed by __Runtime_core_trace_setup (0..3 = ACTIVE, LOCK_STALL,
+ * STREAM_STALL, MEMORY_STALL). Repeat re-emits the previous frame's event set
+ * for `repeats` more consecutive cycles (or, after a Sync, adds that many
+ * 0x3FFFF idle periods). The frame bit layouts are high confidence (Figure
+ * 4-14); the Repeat/Sync cycle accumulation is the documented compression
+ * semantics. */
+
+#define XAIE_TRACE_SYNC_CYCLES 0x3FFFFu /* Sync frame = 18-bit count wrap */
+
+/* Payload-word index (packet headers skipped) -> absolute buffer word index. */
+static uint32_t __core_trace_pw(uint32_t pwi) { return (pwi / 7u) * 8u + 1u + (pwi % 7u); }
+
+/* Read nbits MSB-first from the header-stripped payload stream at *bitpos. */
+static uint32_t __core_trace_bits(const uint32_t *buf, uint64_t *bitpos, uint32_t nbits) {
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < nbits; i++) {
+        uint64_t bp = *bitpos + i;
+        uint32_t w = __core_trace_pw((uint32_t)(bp >> 5));
+        uint32_t off = (uint32_t)(bp & 31u);
+        v = (v << 1) | ((buf[w] >> (31u - off)) & 1u);
+    }
+    *bitpos += nbits;
+    return v;
+}
+
+/* Peek the next 8 bits (the type byte) without advancing. */
+static uint32_t __core_trace_peek8(const uint32_t *buf, uint64_t bitpos) {
+    return __core_trace_bits(buf, &bitpos, 8u); /* bitpos is a by-value copy */
+}
+
+/* Run-length tracker: a maximal set of contiguous cycles carrying the identical
+ * 8-bit event mask is rendered as one interval line instead of one per cycle. */
+typedef struct {
+    int open;
+    uint64_t start, end;
+    uint32_t mask;
+    AieTraceProfile *prof; /* optional sink; NULL = print only */
+} __core_trace_run;
+
+/* Build the '|'-joined slot names of an 8-bit event mask into out[cap]
+ * (slot <4 -> configured name, else EVENT<s>), following the emit ordering
+ * (slot 0..7). */
+static void __core_trace_names(uint32_t mask, char *out, size_t cap) {
+    size_t n = 0;
+    if (cap)
+        out[0] = '\0';
+    for (uint32_t s = 0; s < 8u; s++) {
+        if (!(mask & (1u << s)))
+            continue;
+        char tmp[16];
+        const char *nm;
+        if (s < 4u) {
+            nm = s_core_trace_slot_name[s];
+        } else {
+            snprintf(tmp, sizeof(tmp), "EVENT%u", (unsigned)s);
+            nm = tmp;
+        }
+        if (n && n + 1 < cap)
+            out[n++] = '|';
+        while (*nm && n + 1 < cap)
+            out[n++] = *nm++;
+        if (n < cap)
+            out[n] = '\0';
+    }
+}
+
+/* Print the open run and close it: compact "<cycle>  <events>" for a single
+ * cycle, else "<start> -- <end>  <events>  (<N> cyc)". */
+static void __core_trace_flush(__core_trace_run *run) {
+    if (!run->open)
+        return;
+    char names[128];
+    __core_trace_names(run->mask, names, sizeof(names));
+    if (run->start == run->end)
+        printf("%llu  %s\n", (unsigned long long)run->start, names);
+    else
+        printf("%llu -- %llu  %s  (%llu cyc)\n", (unsigned long long)run->start, (unsigned long long)run->end, names,
+               (unsigned long long)(run->end - run->start + 1u));
+    /* Append the same coalesced interval into the optional profile. */
+    if (run->prof) {
+        AieTraceProfile *p = run->prof;
+        if (p->count < AIE_TRACE_PROFILE_CAP) {
+            AieTraceInterval *v = &p->iv[p->count++];
+            v->col = p->cur_col;
+            v->row = p->cur_row;
+            v->mask = run->mask;
+            v->start_cycle = run->start;
+            v->end_cycle = run->end;
+        } else {
+            p->dropped++;
+        }
+    }
+    run->open = 0;
+}
+
+/* Route one per-cycle event mask through the run tracker. Extends the open run
+ * when the cycle is contiguous and the mask identical, else flushes and opens a
+ * new run. mask==0 is a no-op (matches the old empty emit). */
+static void __core_trace_mark(__core_trace_run *run, uint64_t cycle, uint32_t mask) {
+    if (mask == 0u)
+        return;
+    if (run->open && cycle == run->end + 1u && mask == run->mask) {
+        run->end = cycle;
+        return;
+    }
+    __core_trace_flush(run);
+    run->open = 1;
+    run->start = run->end = cycle;
+    run->mask = mask;
+}
+
+/* Expand a Repeat frame against the previous frame (kind: 0 single, 1 multiple,
+ * 2 sync, -1 none). Single carries a slot index; Multiple an 8-bit mask. */
+static void __core_trace_repeat(__core_trace_run *run, uint64_t *cycle, uint32_t rep, int kind, uint32_t events) {
+    if (kind == 2) {
+        *cycle += (uint64_t)rep * XAIE_TRACE_SYNC_CYCLES;
+    } else if (kind == 0) {
+        for (uint32_t r = 0; r < rep; r++) {
+            (*cycle)++;
+            __core_trace_mark(run, *cycle, 1u << events);
+        }
+    } else if (kind == 1) {
+        for (uint32_t r = 0; r < rep; r++) {
+            (*cycle)++;
+            __core_trace_mark(run, *cycle, events);
+        }
+    }
+}
+
+void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof) {
+    printf("[aie_runtime] core_trace_decode: buf=%p nwords=%u\n", (const void *)buf, nwords);
+    if (!buf)
+        return;
+
+    /* Outer transport: count valid 8-word packets up to the untouched tail. */
+    uint32_t whole = nwords - (nwords % 8u);
+    uint32_t npkts = 0;
+    for (uint32_t p = 0; p < whole; p += 8u) {
+        int all_zero = 1;
+        for (uint32_t k = 0; k < 8u; k++) {
+            if (buf[p + k] != 0u) {
+                all_zero = 0;
+                break;
+            }
+        }
+        if (all_zero)
+            break;
+        npkts++;
+    }
+    uint64_t total_bits = (uint64_t)npkts * 7u * 32u;
+
+    /* Inner: Event-Time frame stream (AIE2ps Arch Spec, Figure 4-14). */
+    uint64_t bitpos = 0, cycle = 0;
+    int last_kind = -1;         /* -1 none, 0 single, 1 multiple, 2 sync */
+    uint32_t last_events = 0;   /* single: slot index; multiple: 8-bit mask */
+    __core_trace_run run = {0}; /* run-length coalescer for per-cycle events */
+    run.prof = prof;            /* optional interval sink */
+
+    while (bitpos + 8u <= total_bits) {
+        uint32_t b0 = __core_trace_peek8(buf, bitpos), v;
+
+        if ((b0 & 0x80u) == 0u) { /* Single0 8b: 0 eee cccc */
+            v = __core_trace_bits(buf, &bitpos, 8u);
+            cycle += (v & 0xFu);
+            last_events = (v >> 4) & 0x7u;
+            last_kind = 0;
+            __core_trace_mark(&run, cycle, 1u << last_events);
+        } else if ((b0 & 0x40u) == 0u) { /* Single1/2: 10x */
+            uint32_t nb = (b0 & 0x20u) ? 24u : 16u;
+            if (bitpos + nb > total_bits)
+                break;
+            v = __core_trace_bits(buf, &bitpos, nb);
+            uint32_t sh = (nb == 24u) ? 18u : 10u;
+            cycle += (v & ((1u << sh) - 1u));
+            last_events = (v >> sh) & 0x7u;
+            last_kind = 0;
+            __core_trace_mark(&run, cycle, 1u << last_events);
+        } else if ((b0 & 0x20u) == 0u) { /* 110... */
+            if ((b0 & 0x10u) == 0u) {    /* Multiple0 16b: 1100 mmmmmmmm cccc */
+                if (bitpos + 16u > total_bits)
+                    break;
+                v = __core_trace_bits(buf, &bitpos, 16u);
+                cycle += (v & 0xFu);
+                last_events = (v >> 4) & 0xFFu;
+                last_kind = 1;
+                __core_trace_mark(&run, cycle, last_events);
+            } else {
+                uint32_t sel = (b0 >> 2) & 0x3u; /* 1101 xx */
+                if (sel == 0u) {                 /* Multiple1 24b */
+                    if (bitpos + 24u > total_bits)
+                        break;
+                    v = __core_trace_bits(buf, &bitpos, 24u);
+                    cycle += (v & 0x3FFu);
+                    last_events = (v >> 10) & 0xFFu;
+                    last_kind = 1;
+                    __core_trace_mark(&run, cycle, last_events);
+                } else if (sel == 1u) { /* Multiple2 32b */
+                    if (bitpos + 32u > total_bits)
+                        break;
+                    v = __core_trace_bits(buf, &bitpos, 32u);
+                    cycle += (v & 0x3FFFFu);
+                    last_events = (v >> 18) & 0xFFu;
+                    last_kind = 1;
+                    __core_trace_mark(&run, cycle, last_events);
+                } else if (sel == 2u) { /* Repeat1 16b */
+                    if (bitpos + 16u > total_bits)
+                        break;
+                    v = __core_trace_bits(buf, &bitpos, 16u);
+                    __core_trace_repeat(&run, &cycle, v & 0x3FFu, last_kind, last_events);
+                } else { /* Stop 32b: 110111 x(8) c(18) */
+                    if (bitpos + 32u > total_bits)
+                        break;
+                    v = __core_trace_bits(buf, &bitpos, 32u);
+                    cycle += (v & 0x3FFFFu);
+                    __core_trace_flush(&run);
+                    printf("[aie_runtime] core_trace_decode: STOP @ %llu\n", (unsigned long long)cycle);
+                    last_kind = -1;
+                }
+            }
+        } else if ((b0 & 0x10u) == 0u) { /* Repeat0 8b: 1110 rrrr */
+            v = __core_trace_bits(buf, &bitpos, 8u);
+            __core_trace_repeat(&run, &cycle, v & 0xFu, last_kind, last_events);
+        } else if ((b0 & 0x08u) == 0u) { /* Start 64b: 11110 O 00 + timer56 */
+            if (bitpos + 64u > total_bits)
+                break;
+            uint32_t w0 = __core_trace_bits(buf, &bitpos, 32u);
+            uint32_t w1 = __core_trace_bits(buf, &bitpos, 32u);
+            cycle = ((uint64_t)(w0 & 0x00FFFFFFu) << 32) | w1;
+            __core_trace_flush(&run);
+            printf("[aie_runtime] core_trace_decode: START timer=%llu overrun=%u\n", (unsigned long long)cycle,
+                   (unsigned)((w0 >> 26) & 1u));
+            last_kind = -1;
+        } else { /* Filler (0xFE) / Sync (0xFF) 8b */
+            v = __core_trace_bits(buf, &bitpos, 8u);
+            if (v == 0xFFu) {
+                cycle += XAIE_TRACE_SYNC_CYCLES;
+                last_kind = 2;
+            }
+            /* else Filler: alignment pad, no effect */
+        }
+    }
+    __core_trace_flush(&run);
+}
+
+void __Runtime_aie_trace_profile_init(AieTraceProfile *p) {
+    if (!p)
+        return;
+    p->count = 0;
+    p->dropped = 0;
+    p->cur_col = 0;
+    p->cur_row = 0;
+    p->attached = 0;
+    p->cps = 0;
+    p->host0 = 0;
+    p->host1 = 0;
+    p->nanchor = 0;
+    p->nevt = 0;
+    p->evt_dropped = 0;
+    p->words_col = 0;
+    p->words_row = 0;
+    p->nwords = 0;
+}
+
+void __Runtime_aie_trace_profile_attach(AieTraceProfile *p, XAie_LocType tile) {
+    if (!p)
+        return;
+    p->cur_col = tile.Col;
+    p->cur_row = tile.Row;
+    p->attached = 1;
+}
+
+void __Runtime_aie_trace_profile_set_clock(AieTraceProfile *p, uint64_t cps) {
+    if (!p)
+        return;
+    p->cps = cps;
+}
+
+/* Find the anchor slot for (col,row), creating it if new; NULL if the table is
+ * full. */
+static AieTraceAnchor *__aie_trace_anchor_slot(AieTraceProfile *p, uint8_t col, uint8_t row) {
+    for (uint32_t i = 0; i < p->nanchor; i++) {
+        if (p->anchor[i].col == col && p->anchor[i].row == row)
+            return &p->anchor[i];
+    }
+    if (p->nanchor >= AIE_TRACE_ANCHOR_CAP)
+        return NULL;
+    AieTraceAnchor *a = &p->anchor[p->nanchor++];
+    a->col = col;
+    a->row = row;
+    a->aie0 = 0;
+    a->aie1 = 0;
+    return a;
+}
+
+void __Runtime_aie_trace_profile_anchor(AieTraceProfile *p, int which, XAie_LocType tile, uint64_t aie, uint64_t host) {
+    if (!p)
+        return;
+    AieTraceAnchor *a = __aie_trace_anchor_slot(p, tile.Col, tile.Row);
+    if (a) {
+        if (which == 0)
+            a->aie0 = aie;
+        else
+            a->aie1 = aie;
+    }
+    if (which == 0)
+        p->host0 = host;
+    else
+        p->host1 = host;
+}
+
+void __Runtime_aie_trace_profile_event(AieTraceProfile *p, int iter, const char *phase, uint64_t host) {
+    if (!p)
+        return;
+    if (p->nevt >= AIE_TRACE_EVENT_CAP) {
+        p->evt_dropped++;
+        return;
+    }
+    AieTraceHostEvt *e = &p->evt[p->nevt++];
+    e->iter = iter;
+    e->phase = phase;
+    e->host = host;
+}
+
+void __Runtime_aie_trace_profile_set_trace_words(AieTraceProfile *p, XAie_LocType tile, uint32_t nwords) {
+    if (!p)
+        return;
+    p->words_col = tile.Col;
+    p->words_row = tile.Row;
+    p->nwords = nwords;
+}
+
+void __Runtime_aie_trace_profile_dump(AieTraceProfile *p) {
+    if (!p) {
+        printf("[aie_runtime] trace_profile_dump: NULL profile\n");
+        return;
+    }
+    printf("[aie_runtime] trace_profile_dump: %u intervals (dropped=%u)\n", (unsigned)p->count, (unsigned)p->dropped);
+
+    /* Host<->AIE time-sync block: only when something was recorded, so a
+     * decode-only profile keeps emitting just the interval lines below. */
+    if (p->cps)
+        printf("[TIMESYNC] cps=%llu\n", (unsigned long long)p->cps);
+    if (p->nanchor) {
+        printf("[TIMESYNC] anchor0 host=%llu\n", (unsigned long long)p->host0);
+        for (uint32_t i = 0; i < p->nanchor; i++)
+            printf("[TIMESYNC] anchor0 tile=%u,%u aie=%llu\n", (unsigned)p->anchor[i].col, (unsigned)p->anchor[i].row,
+                   (unsigned long long)p->anchor[i].aie0);
+        printf("[TIMESYNC] anchor1 host=%llu\n", (unsigned long long)p->host1);
+        for (uint32_t i = 0; i < p->nanchor; i++)
+            printf("[TIMESYNC] anchor1 tile=%u,%u aie=%llu\n", (unsigned)p->anchor[i].col, (unsigned)p->anchor[i].row,
+                   (unsigned long long)p->anchor[i].aie1);
+    }
+    for (uint32_t e = 0; e < p->nevt; e++)
+        printf("[TIMESYNC] hostevt iter=%d phase=%s host=%llu\n", p->evt[e].iter,
+               p->evt[e].phase ? p->evt[e].phase : "?", (unsigned long long)p->evt[e].host);
+    /* Effective AIE Hz from the empirical slope (sanity only). */
+    if (p->host1 > p->host0 && p->cps) {
+        for (uint32_t i = 0; i < p->nanchor; i++)
+            printf("[TIMESYNC] aiehz tile=%u,%u hz=%.3f\n", (unsigned)p->anchor[i].col, (unsigned)p->anchor[i].row,
+                   (double)(p->anchor[i].aie1 - p->anchor[i].aie0) / (double)(p->host1 - p->host0) * (double)p->cps);
+    }
+    if (p->nwords)
+        printf("[TIMESYNC] trace tile=%u,%u words=%u\n", (unsigned)p->words_col, (unsigned)p->words_row,
+               (unsigned)p->nwords);
+
+    /* Decoded AIE intervals, one machine-readable [TIMESYNC] trace line each. */
+    for (uint32_t i = 0; i < p->count; i++) {
+        AieTraceInterval *v = &p->iv[i];
+        char names[128];
+        __core_trace_names(v->mask, names, sizeof(names));
+        if (v->start_cycle == v->end_cycle)
+            printf("[TIMESYNC] trace tile=%u,%u %llu  %s\n", (unsigned)v->col, (unsigned)v->row,
+                   (unsigned long long)v->start_cycle, names);
+        else
+            printf("[TIMESYNC] trace tile=%u,%u %llu -- %llu  %s  (%llu cyc)\n", (unsigned)v->col, (unsigned)v->row,
+                   (unsigned long long)v->start_cycle, (unsigned long long)v->end_cycle, names,
+                   (unsigned long long)(v->end_cycle - v->start_cycle + 1u));
+    }
+}
+
 // Global routing instance (kept for legacy path)
 XAie_RoutingInstance *g_RoutingInst = NULL;
 
@@ -601,6 +1251,30 @@ AieRC __Runtime_perfcnt_read(XAie_DevInst *dev, XAie_LocType tile, uint8_t count
                           (unsigned)tile.Row, (unsigned)counter_id, (unsigned)*value));
     }
     return rc;
+}
+
+/**
+ * Read the free-running core timer of `tile` (XAIE_CORE_MOD). This is the same
+ * clock domain as the core event trace: the Start frame's 56-bit timer base and
+ * the delta-cycle accumulation in __Runtime_core_trace_decode. Reading it from
+ * the host lets a caller anchor AIE cycles against the ARM host clock (XTime)
+ * and place both on one time axis. Portable wrapper only — host-time capture
+ * and correlation stay host-side.
+ */
+AieRC __Runtime_read_aie_timer(XAie_DevInst *dev, XAie_LocType tile, uint64_t *val) {
+    if (!val)
+        return XAIE_INVALID_ARGS;
+    u64 t = 0;
+    AieRC rc = XAie_ReadTimer(dev, tile, XAIE_CORE_MOD, &t);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] read_aie_timer: XAie_ReadTimer failed tile(%u,%u) rc=%d\n", (unsigned)tile.Col,
+               (unsigned)tile.Row, (int)rc);
+        return rc;
+    }
+    *val = (uint64_t)t;
+    AIEHLC_LOG(printf("[aie_runtime] read_aie_timer tile(%u,%u) timer=%llu\n", (unsigned)tile.Col, (unsigned)tile.Row,
+                      (unsigned long long)*val));
+    return XAIE_OK;
 }
 
 /**

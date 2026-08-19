@@ -710,6 +710,36 @@ else
 fi
 dbg_echo "BAREMETAL_AIENGINE_LIB: ${BAREMETAL_AIENGINE_LIB}"
 
+# Full src/mlir/runtime set to link into the single-kernel (raw-XAie) host.
+# Previously only aie_runtime_common.c was linked; the tiling flow
+# (script/hostcompile.sh) links all four. Kept in ONE array so the baremetal
+# and linux link branches below cannot drift. The raw aout/host.cc references
+# no __Runtime_* symbols, so -Wl,--gc-sections (added on the links) dead-strips
+# the unused runtime, including __Runtime_routing_init's unconditional call to
+# routing() — a symbol defined only in the tiling flow's routing.cc. As a
+# belt-and-suspenders for any future single-kernel host.cc that DOES call the
+# routing path, emit a weak no-op routing() stub (real routing.cc, never
+# present here, would still win); no-op is correct because the raw flow does
+# its routing inline in test_routing().
+RUNTIME_SRCS=(
+    "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime.c"
+    "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_debug.c"
+    "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_stream_debug.c"
+    "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c"
+)
+RT_ROUTING_STUB="$(pwd)/aout/rt_routing_stub.c"
+cat > "${RT_ROUTING_STUB}" <<'EOF'
+#include "xaiengine.h"
+/* Weak no-op routing() for the single-kernel (raw-XAie) flow, which does its
+ * routing inline in test_routing(). Resolves the unconditional call in
+ * aie_runtime.c's __Runtime_routing_init if that path is ever retained. A real
+ * routing.cc (tiling flow only) overrides this. */
+__attribute__((weak)) void routing(XAie_DevInst *dev) { (void)dev; }
+EOF
+RUNTIME_SRCS+=("${RT_ROUTING_STUB}")
+# Dead-strip unused runtime code; keep C++ std consistent with hostcompile.sh.
+RUNTIME_LINK_FLAGS="-std=c++17 -ffunction-sections -fdata-sections"
+
 echo -e "\n"
 echo "Targeting $platform platform..."
 echo "Compiling host..."
@@ -729,20 +759,20 @@ if [[ "$platform" == "sim" ]]; then
         "$aie_version" "$platform"
     return 0
 elif [[ "$platform" == "baremetal" || "$platform" == "baremetal_debug" ]]; then
-    dbg_echo ${TOOL_PREFIX}g++ $opt_flags -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime -I${AIEHLC_DIR}/include -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
-    ${TOOL_PREFIX}g++ $opt_flags -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime -I${AIEHLC_DIR}/include -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file ${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c ${temp_obj_files[@]} -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
+    dbg_echo ${TOOL_PREFIX}g++ $opt_flags ${RUNTIME_LINK_FLAGS} -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime -I${AIEHLC_DIR}/include -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file "${RUNTIME_SRCS[@]}" ${temp_obj_files[@]} -Wl,--gc-sections -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
+    ${TOOL_PREFIX}g++ $opt_flags ${RUNTIME_LINK_FLAGS} -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime -I${AIEHLC_DIR}/include -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file "${RUNTIME_SRCS[@]}" ${temp_obj_files[@]} -Wl,--gc-sections -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
     GPP_RC=$?
 elif [[ "$platform" == "linux" ]]; then
-    dbg_echo ${TOOL_PREFIX}g++ $opt_flags -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
+    dbg_echo ${TOOL_PREFIX}g++ $opt_flags ${RUNTIME_LINK_FLAGS} -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
         -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I${AIE_DRIVER_DIR}/include -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime \
         -L${AIE_DRIVER_DIR}/src -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -L$AIE_DRIVER_PARENT_DIR/aie-rt/driver/src/ \
-        -o $HOST_BUILD_DIR/main.elf $host_file ${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c ${temp_obj_files[@]} \
-        -Wl,--start-group,-lxaiengine,-lxil,--end-group
-    ${TOOL_PREFIX}g++ $opt_flags -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
+        -o $HOST_BUILD_DIR/main.elf $host_file "${RUNTIME_SRCS[@]}" ${temp_obj_files[@]} \
+        -Wl,--gc-sections -Wl,--start-group,-lxaiengine,-lxil,--end-group
+    ${TOOL_PREFIX}g++ $opt_flags ${RUNTIME_LINK_FLAGS} -D__AIELINUX__ -DAIE_GEN=${aie_version} ${compiler_cpu_flag} \
         -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I${AIE_DRIVER_DIR}/include -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime -I${AIEHLC_DIR}/include \
         -L${AIE_DRIVER_DIR}/src -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -L$AIE_DRIVER_PARENT_DIR/aie-rt/driver/src/  \
-        -o $HOST_BUILD_DIR/main.elf $host_file ${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c ${temp_obj_files[@]} \
-        -Wl,--start-group,-lxaiengine,-lxil,--end-group
+        -o $HOST_BUILD_DIR/main.elf $host_file "${RUNTIME_SRCS[@]}" ${temp_obj_files[@]} \
+        -Wl,--gc-sections -Wl,--start-group,-lxaiengine,-lxil,--end-group
     GPP_RC=$?
 fi
 if [ ${GPP_RC:-1} -ne 0 ]; then

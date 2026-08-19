@@ -76,9 +76,9 @@ Four panes: **AIE Debug** (top-left, tile grid/map), **Execution**
 (bottom-left, run controls and simulator log), **Info** (top-right, per-tile
 detail), and **Tools** (bottom-right, aiegdb console and LLM).
 
-**Run the app:** Click **Run**. The simulator log streams live in the
-Execution pane. Use **Stop run** if needed. Simulator-only mode has no Board,
-Connect, or Attach controls.
+![debug UI four-pane layout](debug_ui.png)
+
+Four panes: **AIE Debug** (top-left, tile grid/map), **Run** (bottom-left, run controls and applog), **Info** (top-right, per-tile detail), **Tools** (bottom-right, aiegdb console and LLM).
 
 **Read tile state:** Once the simulator is running, pick **DMA**, **Cores**, or
 **Events**, then click **Scan** for a one-shot read overlaid on the grid. Toggle
