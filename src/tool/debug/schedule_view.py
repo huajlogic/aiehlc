@@ -1455,6 +1455,31 @@ import re as _re
 
 
 
+def _normalize_pkt_connect(conn):
+    """Fill PKT slot metadata matching routinghwlower.cpp constants."""
+    if conn.get('kind') != 'packet_connect':
+        return
+    for leg, defaults in (
+        ('recv_slave', {'mask': 0, 'msel': 0, 'arbiter': 0, 'slot': 0}),
+        ('local_dma', {'mask': 0x1f, 'msel': 0, 'arbiter': 0, 'slot': 0}),
+    ):
+        port = conn.setdefault(leg, {})
+        if port.get('dir') in (None, 'NONE'):
+            continue
+        for k, v in defaults.items():
+            port.setdefault(k, v)
+    fm = conn.setdefault('forward_master', {})
+    if fm.get('dir') not in (None, 'NONE'):
+        fm.setdefault('arbiter', 0)
+        fm.setdefault('msel_en', 1)
+
+
+def _normalize_routing_groups(groups):
+    for g in groups:
+        for c in g.get('connections', []):
+            _normalize_pkt_connect(c)
+
+
 def _load_comm_paths(workdir):
     """Load comm_paths from dmaphopprovenacemap.json + optional routingprovenancemap.json.
 
@@ -1493,6 +1518,7 @@ def _load_comm_paths(workdir):
         try:
             with open(rp_path) as f:
                 rp_groups = json.load(f).get('routing_groups', [])
+            _normalize_routing_groups(rp_groups)
         except Exception:
             pass
 
@@ -2022,9 +2048,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <style>
   /* ── design tokens ───────────────────────────────────────────── */
   :root {
-    /* tile identity colors — saturated enough to read on a dark base */
     --shim: #2a5a90;
     --core: #2a5a3a;
+    --tile-shim-fill: rgba(42, 90, 144, 0.11);
+    --tile-shim-stroke: rgba(58, 104, 152, 0.36);
+    --tile-core-fill: rgba(42, 90, 58, 0.11);
+    --tile-core-stroke: rgba(56, 104, 72, 0.36);
+    --tile-mem-fill: rgba(72, 64, 104, 0.12);
+    --tile-mem-stroke: rgba(88, 88, 120, 0.36);
     --sel: #f0b840;
     /* backgrounds — three-level stack with clear contrast steps */
     --bg-base:    #282828;
@@ -2139,13 +2170,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   /* ── typography ──────────────────────────────────────────────── */
   #lefttop-header { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
-  h1 { font-size:17px; font-weight:700; margin:0; letter-spacing:-.01em; }
+  h1 { font-size:17px; font-weight:700; margin:0; letter-spacing:-.01em;
+       transform:scale(1.118); transform-origin:left center;
+       margin-right:calc((1.118 - 1) * 10ch); }
   /* One name per pane. Each rides the pane's existing first row — a control
-     row or a tab strip — rather than taking a row of its own. */
+     row or a tab strip — rather than taking a row of its own. Scale up visually
+     without changing the flex/inline footprint (font-size drives layout box);
+     margin-right absorbs the scaled overflow to the right. */
   .pane-title { flex:0 0 auto; font-size:13px; font-weight:700; margin:0;
-                color:var(--tx-hi); letter-spacing:.01em; white-space:nowrap; }
+                color:var(--tx-hi); letter-spacing:.01em; white-space:nowrap;
+                transform:scale(1.154); transform-origin:left center;
+                margin-right:calc((1.154 - 1) * 9ch); }
   #contabs > .pane-title { display:inline-block; vertical-align:bottom;
-                           padding-bottom:3px; margin-right:8px; }
+                           padding-bottom:3px;
+                           margin-right:calc(8px + (1.154 - 1) * 5ch);
+                           transform-origin:left bottom; }
   .sub { color:var(--tx-lo); font-size:11px; letter-spacing:.01em; }
   .panel h2 { font-size:12px; font-weight:600; margin:16px 0 6px;
               padding-bottom:5px; border-bottom:1px solid var(--bd-soft);
@@ -2196,6 +2235,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   ul.sum { margin:4px 0; padding-left:18px; font-size:12px; }
   ul.sum li { margin:2px 0; }
   .contract { color:#c9a; font-size:11.5px; }
+  .contract .ct-pktid { display:inline-block; font-size:9px; color:#c07fd4;
+                        background:#1a0d24; border-radius:2px; padding:0 3px;
+                        margin-left:3px; vertical-align:middle; }
 
   /* ── supply/demand badges ────────────────────────────────────── */
   .sdrow { margin:4px 0 7px; }
@@ -2480,6 +2522,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 min-height:0; overflow:hidden; }
   #conhdr, #conhelp { flex:0 0 auto; }
   #conhdr { font-weight:600; margin-bottom:4px; font-size:12px; }
+  #llmpane #conhdr { display:flex; align-items:center; gap:0; }
+  .llm-hint { font-size:11px; font-weight:400; color:var(--tx-lo); margin-left:10px; }
   #contarget { color:var(--accent-fg); }
   #conhelp { display:flex; flex-wrap:wrap; align-items:center; gap:2px;
              margin-bottom:6px; }
@@ -2713,6 +2757,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   border:1px solid rgba(228,228,228,.2); background:rgba(228,228,228,.07);
                   color:rgba(228,228,228,.7); border-radius:4px; cursor:pointer; z-index:10; }
   #devmap-reset:hover { background:rgba(228,228,228,.13); color:rgba(228,228,228,.95); }
+  #dmSwWrap { position:absolute; top:34px; right:8px; font-size:10px;
+              color:rgba(228,228,228,.6); cursor:pointer; z-index:10;
+              display:flex; align-items:center; gap:4px; user-select:none; }
+  #dmSwWrap:hover { color:rgba(228,228,228,.9); }
+  #dmSwWrap input { cursor:pointer; margin:0; }
   #devmap-legend { display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; font-size:10px;
                    color:rgba(228,228,228,.35); align-items:center; }
   .dml-item { display:flex; align-items:center; gap:4px; }
@@ -2859,6 +2908,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .rctbl { border-collapse:collapse; margin:7px 0 9px; font-size:12px; width:100%; }
   .rctbl th, .rctbl td { border:1px solid var(--bd); padding:3px 8px; text-align:left;
                            white-space:nowrap; }
+  .rctbl td:last-child { white-space:normal; }
   .rctbl td:first-child { color:var(--accent-fg); font-family:ui-monospace,monospace; }
 
   /* ── tile routing + DMA BD mini-sections ─────────────────────── */
@@ -2869,22 +2919,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                       text-transform:uppercase; color:var(--tx-lo); }
   .rt-row .rt-ports { flex:1; color:var(--tx-hi); }
   .rt-row .rt-flow  { flex:0 0 auto; color:var(--tx-lo); font-size:9px; }
-  .rt-row .rt-pktid { flex:0 0 auto; font-size:9px; color:#c07fd4;
-                       background:#1a0d24; border-radius:2px; padding:0 3px; margin-left:2px; }
-  .rt-row .rt-dma   { flex:0 0 auto; font-size:9px; color:#40c4a0;
-                       background:#081812; border-radius:2px; padding:0 3px; margin-left:2px; }
+  .rt-pktid { font-size:9px; color:#c07fd4; background:#1a0d24; border-radius:2px;
+              padding:1px 5px; margin-left:6px; display:inline-block; white-space:nowrap; }
+  .rt-pktmask { font-size:9px; color:#e87850; background:#3a1010; border-radius:2px;
+                padding:1px 5px; margin-left:6px; display:inline-block; white-space:nowrap; }
+  .rt-row .rt-pktid, .rt-row .rt-pktmask { flex:0 0 auto; margin-left:0; }
+  .rt-s2mm { font-size:9px; color:#30c0d0; background:#0a2830; border-radius:2px;
+             padding:1px 4px; margin-left:6px; display:inline-block; white-space:nowrap; }
+  .rt-mm2s { font-size:9px; color:#c050b0; background:#2a1028; border-radius:2px;
+             padding:1px 4px; margin-left:6px; display:inline-block; white-space:nowrap; }
+  .rt-row .rt-s2mm, .rt-row .rt-mm2s { flex:0 0 auto; margin-left:0; }
+  .rt-route { font-size:9px; color:#687080; background:#141820; border-radius:2px;
+              padding:1px 4px; margin-left:6px; display:inline-block; white-space:nowrap;
+              font-style:italic; opacity:.88; }
+  .rt-row .rt-route { flex:0 0 auto; margin-left:0; }
   .rt-row .rt-fwd   { color:var(--tx-lo); font-size:9px; margin-left:2px; }
   .rt-row.cct  { border-left:2px solid #4a7fd4; }
   .rt-row.pkt  { border-left:2px solid #9c4fd4; }
+  .rt-row.mst  { border-left:2px solid #7a5098; opacity:.92; }
   .rt-row.shim { border-left:2px solid #4aa4d4; }
-  .rt-row.sw-issue { background:rgba(200,40,40,.13); }
-  .sw-warn-hdr { font-size:10px; color:var(--amber-fg); margin-bottom:6px;
-                 display:flex; flex-direction:column; gap:2px; }
-  .sw-warn-hdr .sw-issue-line { margin-left:12px; opacity:.85; }
-  .tile.swwarn { border-color:#f0c040;
-                 box-shadow:0 0 0 1px #f0c04060 inset, 0 0 12px 0 rgba(240,192,64,.18); }
-  .tile .badge.swwarn { background:#2a2000; color:var(--amber-fg); cursor:default;
-                        border-color:#f0c04060; }
+  .rt-mst-hdr { font-size:10px; color:var(--tx-lo); margin:8px 0 3px 4px;
+                text-transform:uppercase; letter-spacing:.04em; }
   .bd-mini { font-size:11px; font-family:ui-monospace,monospace;
              padding:2px 4px; margin:1px 0; border-left:2px solid var(--bd); }
   .bd-mini .bd-id, .bd-id   { color:var(--accent-fg); font-weight:700; margin-right:3px; }
@@ -3107,19 +3162,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div id="devmap-vp">
       <button id="devmap-reset" onclick="dmReset(true)">Reset view</button>
+      <label id="dmSwWrap" title="show/hide CCT/PKT routing config inside tiles"><input type="checkbox" id="dmSwToggle" checked> routing info</label>
       <div id="devmap-spacehint">scroll to zoom · click tile to inspect · click stream to isolate</div>
       <div id="devmap-canvas"><svg id="devmap-svg"></svg></div>
       <div id="devmap-hint">col 0–3 · row 0 (shim) at bottom</div>
     </div>
     <div id="devmap-legend">
-      <div class="dml-item"><div class="dml-swatch" style="background:#e4e4e41e;border:1px solid #e4e4e433"></div>SHIM = PL/NoC gateway</div>
-      <div class="dml-item"><div class="dml-swatch" style="background:#e4e4e411;border:1px solid #e4e4e41f"></div>MEM = memory tiles</div>
-      <div class="dml-item"><div class="dml-swatch" style="background:#e4e4e41e;border:1px solid #e4e4e433"></div>AIE = compute cores</div>
+      <div class="dml-item"><div class="dml-swatch" style="background:var(--tile-shim-fill);border:1px solid var(--tile-shim-stroke)"></div>SHIM = PL/NoC gateway</div>
+      <div class="dml-item"><div class="dml-swatch" style="background:var(--tile-mem-fill);border:1px solid var(--tile-mem-stroke)"></div>MEM = memory tiles</div>
+      <div class="dml-item"><div class="dml-swatch" style="background:var(--tile-core-fill);border:1px solid var(--tile-core-stroke)"></div>AIE = compute cores</div>
       <div class="dml-item"><div class="dml-line" style="border-top:2.5px solid #599ce7"></div>solid = stream-switch route</div>
       <div class="dml-item"><div class="dml-line" style="border-top:2px solid #599ce7;border-bottom:2px solid #599ce7;height:5px"></div><span style="color:#599ce7">&#9642;</span> double line + square = ping-pong window (kernel&harr;kernel)</div>
       <div class="dml-item"><div class="dml-line" style="border-top:2px dashed #599ce7"></div>dashed = direct shared-memory (DMA&harr;kernel)</div>
       <div class="dml-item"><div class="dml-dot" style="background:#599ce7;border:1.2px solid #181818"></div>● solid = injects into stream (source / contributor)</div>
       <div class="dml-item"><div class="dml-dot" style="background:#181818;border:2.2px solid #599ce7"></div>○ hollow = takes from stream (destination / tap)</div>
+      <div class="dml-item"><span style="font:600 9px monospace;color:#30c0d0;background:#0a2830;padding:0 3px;border-radius:2px">s2mm</span> receive &nbsp; <span style="font:600 9px monospace;color:#c050b0;background:#2a1028;padding:0 3px;border-radius:2px">mm2s</span> send &nbsp; <span style="font:600 9px monospace;color:#687080;background:#141820;padding:0 3px;border-radius:2px;font-style:italic">route</span> passthrough</div>
       <!-- Live-status swatches: hidden until a scan returns, so the legend does
            not advertise colors that are not on screen yet. Colors are injected
            from LSTATE at load so this list cannot drift from the renderer. -->
@@ -3245,8 +3302,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div id="llmpane" class="hide">
       <div id="conhdr">Claude Code
-        <button id="llmreset" title="kill + respawn claude (new conversation)">New chat</button></div>
-      <div id="conhelp">Ask about anything related to this design, application, or the codebase.</div>
+        <button id="llmreset" title="kill + respawn claude (new conversation)">New chat</button>
+        <span class="llm-hint">Ask about anything related to this design, application, or the codebase.</span></div>
       <div id="llmterm">
         <div id="llmmsg"></div>
         <div id="llmthink" class="hide"><span class="llm-dot"></span><span class="llm-dot"></span><span class="llm-dot"></span></div>
@@ -3912,16 +3969,10 @@ rowsDesc.forEach(r => {
     const sdBad = (t.dma_channels||[]).some(ch => ch.flow_balance && ch.flow_balance.balanced===false);
     if (sdBad){ cell.classList.add('sdmismatch');
       badges += '<span class="badge sdwarn" title="supply/demand mismatch">&#9888;</span>'; }
-    const swIssues = _swIssues(t.loc[0], t.loc[1]);
-    if(swIssues.length){
-      cell.classList.add('swwarn');
-      badges += '<span class="badge swwarn" title="stream switch: '+swIssues.map(i=>i.msg).join('\n')+'">&#9888; sw</span>';
-    }
     cell.innerHTML = '<div class="loc">('+t.loc[0]+','+t.loc[1]+')</div>' +
                      '<div>'+t.type+'</div>' + badges;
     cell.title = (t.high_level.contracts||[]).join('\n') || t.type;
     if (sdBad) cell.title += '\n\u26a0 supply/demand mismatch on a flow';
-    if (swIssues.length) cell.title += '\n\u26a0 stream switch config issues: '+swIssues.map(i=>i.msg).join('; ');
     cellByLoc[c+','+r] = cell;
     const lbar = document.createElement('div');
     lbar.className = 'livebar hide';
@@ -4542,6 +4593,7 @@ function dmColor(fi){ return DM_COLORS[dmFlowIds.indexOf(fi)%DM_COLORS.length]; 
 
 let dmActiveNets = new Set();   // empty = all nets active (unless dmHideAll)
 let dmHideAll = false;          // true = All Flows toggled off
+let dmShowSW = true;
 let dmBuilt = false;
 // Map tile selection lives at module scope so it survives a buildDeviceMap()
 // rebuild (e.g. triggered by a net click) instead of being wiped each time.
@@ -4579,7 +4631,7 @@ function dmReset(rebuild){
   const svgH=parseFloat(svg.getAttribute('height')||'300');
   if(svgW>0&&svgH>0){
     const scaleX=vpW/svgW, scaleY=vpH/svgH;
-    dmScale=Math.min(scaleX,scaleY)*0.92;
+    dmScale=Math.max(scaleX*0.88, Math.min(scaleX,scaleY)*0.92);
     dmTx=(vpW-svgW*dmScale)/2;
     dmTy=(vpH-svgH*dmScale)/2;
   } else { dmTx=20; dmTy=20; dmScale=0.9; }
@@ -5170,7 +5222,7 @@ function buildNetBar(){
   // "All Flows" chip
   const allc=document.createElement('button');
   allc.className='dm-chip all-chip'+(!dmHideAll&&dmActiveNets.size===0?' act':'');
-  allc.textContent='All Flows';
+  allc.textContent='Toggle All Flows';
   allc.onclick=()=>dmSelectNet(-1,false);
   bar.appendChild(allc);
   // Per-flow chips — derive label from flow_summary if available
@@ -5326,31 +5378,37 @@ function buildNetBody(p){
   const gmioConns=(p.routing_connections||[]).filter(c=>shimKinds.has(c.kind));
   const swConnsRaw=(p.routing_connections||[]).filter(c=>!shimKinds.has(c.kind));
   // Sort stream-switch in data-flow order: pull → high row first; push → low row first.
-  const swConns=[...swConnsRaw].sort((a,b)=>
+  const pktOnPath=swConnsRaw.filter(c=>c.kind==='packet_connect');
+  const sharedPktFwd=_sharedPktForwardMaster(pktOnPath);
+  const swExpanded=[];
+  swConnsRaw.forEach(c=>{
+    if(c.kind!=='packet_connect'){ swExpanded.push(c); return; }
+    _expandPktConnectRows(c,sharedPktFwd).forEach(row=>{
+      swExpanded.push({kind:'packet_hw', tile:c.tile, flow_index:c.flow_index, ...row});
+    });
+  });
+  swExpanded.sort((a,b)=>
     p.direction==='pull'
       ?(b.tile?.row??0)-(a.tile?.row??0)
       :(a.tile?.row??0)-(b.tile?.row??0)
   );
   let swRows='';
-  swConns.forEach(c=>{
+  swExpanded.forEach(c=>{
     const t=c.tile||{};
     let kind='', detail='', extra='';
-    if(c.kind==='packet_connect'){
+    if(c.kind==='packet_hw'){
       kind='PKT';
-      const rs=c.recv_slave||{}, ld=c.local_dma||{}, fm=c.forward_master||{};
-      const inPort=rs.dir&&rs.dir!=='NONE'?esc(rs.dir)+':'+rs.idx+'&rarr;':'&rarr;';
-      detail=inPort+esc(ld.dir||'DMA')+':'+ld.idx;
-      if(ld.pktid!=null) extra=' <span class="rt-pktid">pkt'+ld.pktid+'</span>';
-      if(fm.dir&&fm.dir!=='NONE') extra+=' <span class="rt-fwd">fwd&rarr;'+esc(fm.dir)+':'+fm.idx+'</span>';
+      detail=esc(c.slave.dir)+':'+c.slave.idx+'&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx;
+      if(c.pktid!=null) extra='<span class="rt-pktid" title="packet match id">pkt'+c.pktid+'</span>';
+      extra+=_fmtPktMaskBadge(c.mask,c.leg);
     } else {
       kind='CCT';
       const s=c.slave||{}, m=c.master||{};
       if(s.dir!=null&&m.dir!=null){
-        detail=esc(s.dir)+':'+s.idx+' &rarr; '+esc(m.dir)+':'+m.idx;
+        detail=esc(s.dir)+':'+s.idx+'&nbsp;&rarr;&nbsp;'+esc(m.dir)+':'+m.idx;
       }
     }
-    const dmaLbl=_flowDmaLabel(c.flow_index,t.col,t.row);
-    if(dmaLbl) extra+=' <span class="rt-dma">'+esc(dmaLbl)+'</span>';
+    extra+=_flowDmaSpanHtml(c.flow_index,t.col,t.row);
     swRows+='<tr><td>('+t.col+','+t.row+')</td><td>'+kind+'</td>'
       +'<td>'+detail+extra+'</td></tr>';
   });
@@ -5426,8 +5484,58 @@ function svgN(tag,attrs){
 }
 function svgT(el, txt){ el.textContent=txt; return el; }
 
-// ── Hover tooltip state ────────────────────────────────────────
 let dmTooltipEl=null;
+let dmFlowHoverFi=null;
+let dmFlowHoverTimer=null;
+function dmTagFlowLine(el, fi, cls, normW, normO, hoverW, hoverO){
+  el.setAttribute('class', cls);
+  el.setAttribute('data-fi', String(fi));
+  el.dataset.normW=normW; el.dataset.normO=normO;
+  el.dataset.hoverW=hoverW; el.dataset.hoverO=hoverO;
+}
+function dmTagFlowSq(el, fi, normFo, hoverFo){
+  el.setAttribute('class', 'dm-shmemsq');
+  el.setAttribute('data-fi', String(fi));
+  el.dataset.normFo=normFo; el.dataset.hoverFo=hoverFo;
+}
+function dmApplyFlowHover(fi, on){
+  const svg=document.getElementById('devmap-svg');
+  if(!svg||fi==null) return;
+  svg.querySelectorAll('.dm-flowvis[data-fi="'+fi+'"],.dm-shmemvis[data-fi="'+fi+'"]')
+    .forEach(v=>{
+      v.setAttribute('stroke-width', on?v.dataset.hoverW:v.dataset.normW);
+      v.setAttribute('stroke-opacity', on?v.dataset.hoverO:v.dataset.normO);
+    });
+  svg.querySelectorAll('.dm-shmemsq[data-fi="'+fi+'"]').forEach(r=>{
+    r.setAttribute('fill-opacity', on?r.dataset.hoverFo:r.dataset.normFo);
+  });
+}
+function dmFlowHoverIn(fi, e, tipLines){
+  if(dmFlowHoverTimer){ clearTimeout(dmFlowHoverTimer); dmFlowHoverTimer=null; }
+  if(dmFlowHoverFi!==fi){
+    if(dmFlowHoverFi!=null) dmApplyFlowHover(dmFlowHoverFi, false);
+    dmFlowHoverFi=fi;
+    dmApplyFlowHover(fi, true);
+  }
+  if(tipLines&&tipLines.length) dmShowTip(e.clientX, e.clientY, tipLines);
+}
+function dmFlowHoverLeave(fi){
+  if(dmFlowHoverTimer) clearTimeout(dmFlowHoverTimer);
+  dmFlowHoverTimer=setTimeout(()=>{
+    if(dmFlowHoverFi===fi){
+      dmApplyFlowHover(fi, false);
+      dmFlowHoverFi=null;
+      dmHideTip();
+    }
+    dmFlowHoverTimer=null;
+  }, 40);
+}
+function dmWireFlowHit(hit, fi, tipLines){
+  if(!hit) return;
+  hit.addEventListener('mouseenter', e=>dmFlowHoverIn(fi, e, tipLines));
+  hit.addEventListener('mousemove', dmMoveTip);
+  hit.addEventListener('mouseleave', ()=>dmFlowHoverLeave(fi));
+}
 function dmShowTip(clientX, clientY, lines){
   dmHideTip();
   const d=document.createElement('div');
@@ -5447,9 +5555,20 @@ function dmShowTip(clientX, clientY, lines){
 function dmHideTip(){
   if(dmTooltipEl){ dmTooltipEl.remove(); dmTooltipEl=null; }
 }
+function dmMoveTip(e){
+  if(!dmTooltipEl) return;
+  const tw=dmTooltipEl.offsetWidth, th=dmTooltipEl.offsetHeight;
+  let lx=e.clientX+14, ly=e.clientY-th-10;
+  if(lx+tw>window.innerWidth-8) lx=e.clientX-tw-14;
+  if(ly<8) ly=e.clientY+14;
+  dmTooltipEl.style.left=lx+'px'; dmTooltipEl.style.top=ly+'px';
+}
 
 function buildDeviceMap(){
   if(!DATA.tiles||!DATA.tiles.length){ console.warn('buildDeviceMap: no tiles'); return; }
+  dmFlowHoverFi=null;
+  if(dmFlowHoverTimer){ clearTimeout(dmFlowHoverTimer); dmFlowHoverTimer=null; }
+  dmHideTip();
   buildNetBar();
   const svg=document.getElementById('devmap-svg');
   svg.innerHTML='';
@@ -5460,10 +5579,41 @@ function buildDeviceMap(){
   const vpW=vp.clientWidth||800, vpH=vp.clientHeight||600;
   const ML=44, MT=28, MR=16, MB=12;
 
+  const _swShimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
+  const _tileConnKeys=new Map();
+  if(dmShowSW&&!dmHideAll){
+    (DATA.comm_paths||[]).forEach(p=>{
+      if(dmActiveNets.size>0&&!dmActiveNets.has(p.flow_index)) return;
+      const fts=_flowTileSet(p);
+      const pathPkt=(p.routing_connections||[]).filter(c=>c.kind==='packet_connect');
+      const sharedPktFwd=_sharedPktForwardMaster(pathPkt);
+      (p.routing_connections||[]).forEach(c=>{
+        const t=c.tile||{};
+        if(_swShimKinds.has(c.kind)) return;
+        const tkey=t.col+','+t.row;
+        if(fts.size>0&&!fts.has(tkey)) return;
+        let ck;
+        if(c.kind==='packet_connect'){
+          _expandPktConnectRows(c,sharedPktFwd).forEach(row=>{
+            if(!_tileConnKeys.has(tkey)) _tileConnKeys.set(tkey,new Set());
+            _tileConnKeys.get(tkey).add(p.flow_index+'|'+_pktRowKey(row));
+          });
+          return;
+        }
+        const s=c.slave||{},m=c.master||{};
+        ck=p.flow_index+'|'+c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
+        if(!_tileConnKeys.has(tkey)) _tileConnKeys.set(tkey,new Set());
+        _tileConnKeys.get(tkey).add(ck);
+      });
+    });
+  }
+  const _maxConns=_tileConnKeys.size?Math.max(...[..._tileConnKeys.values()].map(s=>s.size)):0;
+  const SW_ROWS=dmShowSW?Math.min(24,Math.max(4,_maxConns)):0;
+
   // Compute col/row counts first (need tileMap for this)
   // Defer sizing until after tileMap is built — use temp values here,
   // then recalculate SVG size after allCols/allRows are known.
-  const TW=148, TH=92, GX=24, GY=14;
+  const TW=148, TH=dmShowSW?(52+SW_ROWS*8):72, GX=24, GY=14;
   const COLSTEP=TW+GX, ROWSTEP=TH+GY;
 
   // Merge DATA.tiles with every tile referenced in comm_paths (waypoints + hops)
@@ -5558,7 +5708,8 @@ function buildDeviceMap(){
   const ty=r=>MT+(maxR-r)*ROWSTEP;
   const cx=c=>tx(c)+TW/2;
   const cy=r=>ty(r)+TH/2;
-  const fcx=c=>tx(c)+Math.round(TW*0.80);
+  const fcx=c=>tx(c)+Math.round(TW*0.70);
+  const fcy=r=>ty(r)+Math.round(TH*0.38);
 
   // Lane spacing. Scaled down as the flow count grows so the whole fan stays a
   // fraction of the tile pitch: 12 flows at a fixed 5px would span 55px of a
@@ -5621,7 +5772,13 @@ function buildDeviceMap(){
     if(r>=deviceCoreMinRow) return 'core';
     return 'mem';
   };
-  const usedKeys=new Set(DATA.tiles.map(t=>t.loc[0]+','+t.loc[1]));
+  function dmTileStyle(ttype){
+    if(ttype==='shim') return {fill:'var(--tile-shim-fill)', stroke:'var(--tile-shim-stroke)',
+      label:'#78a8e0'};
+    if(ttype==='mem') return {fill:'var(--tile-mem-fill)', stroke:'var(--tile-mem-stroke)',
+      label:'#a898d8'};
+    return {fill:'var(--tile-core-fill)', stroke:'var(--tile-core-stroke)', label:'#78c890'};
+  }
   const tileGroups={};
 
   allTiles.forEach(t=>{
@@ -5639,12 +5796,11 @@ function buildDeviceMap(){
       return;
     }
     const ttype=tileType(tr);
-    const used=usedKeys.has(key);
-    const fill=ttype==='mem'?'var(--fill,#e4e4e411)':'var(--fill2,#e4e4e41e)';
-    const stroke=used?'var(--stroke,#e4e4e433)':'var(--stroke2,#e4e4e41f)';
-    const baseOp=used?1:0.32;
+    const ts=dmTileStyle(ttype);
+    const fill=ts.fill;
+    const stroke=ts.stroke;
 
-    const g=svgN('g',{opacity:baseOp,cursor:'pointer',class:'dm-tile','data-key':key,
+    const g=svgN('g',{opacity:'1',cursor:'pointer',class:'dm-tile','data-key':key,
       'data-basestroke':stroke});
     tileGroups[key]=g;
     dmTileStroke[key]=stroke;
@@ -5665,10 +5821,10 @@ function buildDeviceMap(){
       'font-size':'8','font-family':'monospace',fill:'#e4e4e848'}),
       '('+tc+','+tr+')'));
     g.appendChild(svgT(svgN('text',{x:tx(tc)+TW-6,y:ty(tr)+12,
-      'text-anchor':'end','font-size':'7','font-family':'monospace',fill:'#e4e4e43a'}),
+      'text-anchor':'end','font-size':'7','font-family':'monospace',fill:ts.label}),
       typStr));
 
-    {
+    if(dmShowSW){
       const shimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
       const rconns=[];
       const rcSeen=new Set();
@@ -5680,69 +5836,74 @@ function buildDeviceMap(){
         (p.routing_connections||[]).forEach(c=>{
           const ct=c.tile||{};
           if(ct.col!==tc||ct.row!==tr||shimKinds.has(c.kind)) return;
-          let key;
-          if(c.kind==='packet_connect'){
-            const rs=c.recv_slave||{},ld=c.local_dma||{},fm=c.forward_master||{};
-            key='pkt|'+rs.dir+'|'+rs.idx+'|'+ld.dir+'|'+ld.idx+'|'+fm.dir+'|'+fm.idx;
-          } else {
-            const s=c.slave||{},m=c.master||{};
-            key=c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
-          }
+          if(c.kind==='packet_connect') return;
+          const s=c.slave||{},m=c.master||{};
+          const key=p.flow_index+'|'+c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
           if(rcSeen.has(key)) return;
           rcSeen.add(key);
           rconns.push({...c, flow_index:p.flow_index});
         });
+        const pathPkt=(p.routing_connections||[]).filter(c=>{
+          const ct=c.tile||{};
+          return ct.col===tc&&ct.row===tr&&c.kind==='packet_connect';
+        });
+        const sharedPktFwd=_sharedPktForwardMaster(pathPkt);
+        pathPkt.forEach(c=>{
+          _expandPktConnectRows(c,sharedPktFwd).forEach(row=>{
+            const key=p.flow_index+'|'+_pktRowKey(row);
+            if(rcSeen.has(key)) return;
+            rcSeen.add(key);
+            rconns.push({kind:'packet_hw', tile:c.tile, flow_index:p.flow_index, ...row});
+          });
+        });
       });
-      const shortDir=d=>d==='NORTH'?'N':d==='SOUTH'?'S':d==='EAST'?'E':d==='WEST'?'W':d?d[0]:'?';
-      rconns.slice(0,4).forEach((c,i)=>{
+      const shortDir=_shortDir;
+      rconns.slice(0,SW_ROWS).forEach((c,i)=>{
         const isCct=c.kind==='circuit_connect';
         const kc=isCct?'#4a7fd4':'#9c4fd4';
-        const y=ty(tr)+22+i*9;
-        g.appendChild(svgN('rect',{x:tx(tc)+5,y:y-7,width:'2',height:'7',
-          fill:kc,rx:'1','pointer-events':'none'}));
-        let label;
-        if(c.kind==='packet_connect'){
-          const rs=c.recv_slave||{}, ld=c.local_dma||{};
-          const inP=rs.dir&&rs.dir!=='NONE'?shortDir(rs.dir)+':'+rs.idx+'→':'→';
-          label='PKT '+inP+shortDir(ld.dir||'DMA')+':'+ld.idx;
+        const y=ty(tr)+20+i*8;
+        let label; let pktBadges=[];
+        if(c.kind==='packet_hw'){
+          label=_fmtPktLabel(c, true);
+          pktBadges=_dmPktBadges(c);
         } else {
           const s=c.slave||{}, m=c.master||{};
-          label='CCT '+shortDir(s.dir)+':'+s.idx+'→'+shortDir(m.dir)+':'+m.idx;
+          label='CCT '+shortDir(s.dir)+':'+s.idx+' → '+shortDir(m.dir)+':'+m.idx;
         }
+        g.appendChild(svgN('rect',{x:tx(tc)+5,y:y-6,width:'2',height:'6',
+          fill:kc,rx:'1','pointer-events':'none'}));
         g.appendChild(svgT(svgN('text',{x:tx(tc)+10,y,
-          'font-size':'7','font-family':'monospace',fill:'#c8cad8',
+          'font-size':'6.5','font-family':'monospace',fill:'#c8cad8',
           'pointer-events':'none'}), label));
+        let badgeX=tx(tc)+10+label.length*3.9;
+        pktBadges.forEach(b=>{
+          const bw=_svgBadgeWidth(b.text);
+          g.appendChild(svgN('rect',{x:badgeX,y:y-5,width:String(bw),height:'7',
+            rx:'2',fill:b.bg,'pointer-events':'none'}));
+          g.appendChild(svgT(svgN('text',{x:badgeX+2,y,
+            'font-size':'6','font-family':'monospace',fill:b.fg,
+            'pointer-events':'none'}), b.text));
+          badgeX+=bw+2;
+        });
         const dmaLbl=_flowDmaLabel(c.flow_index,tc,tr);
-        if(dmaLbl){
-          const bw=dmaLbl.length*4.2+4;
-          const bx=tx(tc)+TW-bw-4;
-          g.appendChild(svgN('rect',{x:bx,y:y-6,width:String(Math.round(bw)),height:'8',
-            rx:'2',fill:'#082018','pointer-events':'none'}));
-          g.appendChild(svgT(svgN('text',{x:bx+2,y,
-            'font-size':'6','font-family':'monospace',fill:'#40c4a0',
-            'pointer-events':'none'}), dmaLbl));
-        }
+        const dmaSt=_flowDmaBadgeStyle(dmaLbl);
+        const badgeText=dmaSt.text;
+        const bw=_svgBadgeWidth(badgeText);
+        const bx=tx(tc)+TW-bw-4;
+        g.appendChild(svgN('rect',{x:bx,y:y-5,width:String(bw),height:'7',
+          rx:'2',fill:dmaSt.bg,'pointer-events':'none'}));
+        g.appendChild(svgT(svgN('text',{x:bx+2,y,
+          'font-size':'6','font-family':'monospace',
+          fill:dmaSt.fg,'pointer-events':'none'}), badgeText));
       });
     }
 
-    {
-      const dmWarnIssues=_swIssues(tc,tr);
-      if(dmWarnIssues.length){
-        g.appendChild(svgN('rect',{x:tx(tc)+1,y:ty(tr)+1,width:TW-2,height:TH-2,rx:'5',
-          fill:'none',stroke:'#f0c040','stroke-width':'1.2','stroke-dasharray':'3 2',
-          'pointer-events':'none'}));
-        g.appendChild(svgT(svgN('text',{x:tx(tc)+TW-6,y:ty(tr)+22,
-          'text-anchor':'end','font-size':'8','font-family':'monospace',
-          fill:'var(--amber-fg)','pointer-events':'none'}),'⚠'));
-      }
-    }
-
-    if(used&&t.dma_channels&&t.dma_channels.length){
+    if(t.dma_channels&&t.dma_channels.length){
       const chans=(!dmHideAll&&dmActiveNets.size===0)?t.dma_channels
         :t.dma_channels.filter(ch=>!dmHideAll&&dmActiveNets.has(ch.flow_index));
       const ins=chans.filter(ch=>ch.direction==='S2MM');
       const outs=chans.filter(ch=>ch.direction==='MM2S');
-      const dmaBaseY=ty(tr)+62;
+      const dmaBaseY=ty(tr)+(dmShowSW?(22+SW_ROWS*8):22);
       ins.slice(0,3).forEach((ch,i)=>{
         const fc=dmColor(ch.flow_index);
         const y=dmaBaseY+i*10;
@@ -5814,14 +5975,7 @@ function buildDeviceMap(){
       }
       dmShowTip(e.clientX, e.clientY, lines);
     });
-    g.addEventListener('mousemove',e=>{
-      if(!dmTooltipEl) return;
-      const tw=dmTooltipEl.offsetWidth, th=dmTooltipEl.offsetHeight;
-      let lx=e.clientX+14, ly=e.clientY-th-10;
-      if(lx+tw>window.innerWidth-8) lx=e.clientX-tw-14;
-      if(ly<8) ly=e.clientY+14;
-      dmTooltipEl.style.left=lx+'px'; dmTooltipEl.style.top=ly+'px';
-    });
+    g.addEventListener('mousemove',dmMoveTip);
     g.addEventListener('mouseleave',()=>{
       if(!dmSelKeys.has(key)){
         // Restore from dmTileStroke, not the captured `stroke`: a live scan may
@@ -5859,7 +6013,7 @@ function buildDeviceMap(){
         }
         dmSelKeys.add(key); selOn(key);
         if(match) select(match, gridCell()||g, null, null, true);
-        else setConTargetLoc(tc, tr, null);
+        else { selectRoutingTile(tc, tr, true); setConTargetLoc(tc, tr, null); }
       } else {
         // Plain click: clear the selection; clicking the only selected tile deselects.
         const wasOnly = dmSelKeys.size===1 && dmSelKeys.has(key);
@@ -5868,8 +6022,7 @@ function buildDeviceMap(){
         if(wasOnly){ panelRemove(panelKey('tile', tc+','+tr)); return; }
         dmSelKeys.add(key); selOn(key);
         if(match) select(match, gridCell()||g, null, null, false);
-        else { panelClearTiles('tile ('+tc+','+tr+'): no schedule info');
-               setConTargetLoc(tc, tr, null); }
+        else { selectRoutingTile(tc, tr, false); setConTargetLoc(tc, tr, null); }
       }
     });
     svg.appendChild(g);
@@ -5952,7 +6105,7 @@ function buildDeviceMap(){
         const {ox,oy}=edgeOffset(e,fi);
         const [fc,fr]=e[0],[tc,tr]=e[1];
         svg.appendChild(svgN('line',{
-          x1:fcx(fc)+ox,y1:cy(fr)+oy,x2:fcx(tc)+ox,y2:cy(tr)+oy,
+          x1:fcx(fc)+ox,y1:fcy(fr)+oy,x2:fcx(tc)+ox,y2:fcy(tr)+oy,
           stroke:'rgba(255,210,0,0.40)','stroke-width':'10',
           'stroke-linecap':'round','pointer-events':'none'}));
       });
@@ -5998,35 +6151,44 @@ function buildDeviceMap(){
       //             two parallel rails (the ping/pong buffers) + a filled
       //             square (buffer glyph) at the midpoint.
       if(h.kind==='dma'){
-        svg.appendChild(svgN('line',{
+        const vis=svgN('line',{
           x1, y1, x2, y2,
           stroke:color,
           'stroke-width':'1.5',
           'stroke-opacity':'0.6',
           'stroke-dasharray':'5 3',
           'stroke-linecap':'round',
-          'marker-end':'url(#ar-'+fi+')'}));
+          'marker-end':'url(#ar-'+fi+')'});
+        svg.appendChild(vis);
+        dmTagFlowLine(vis, fi, 'dm-shmemvis', '1.5', '0.6', '2.6', '0.95');
       } else {
-        const dx = vertical ? RAIL : 0;   // rails offset perpendicular to the link
+        const dx = vertical ? RAIL : 0;
         const dy = vertical ? 0 : RAIL;
         [-1, 1].forEach(s=>{
-          svg.appendChild(svgN('line',{
+          const ln=svgN('line',{
             x1:x1+s*dx, y1:y1+s*dy, x2:x2+s*dx, y2:y2+s*dy,
             stroke:color,
             'stroke-width':'1.6',
             'stroke-opacity':'0.8',
             'stroke-linecap':'round',
-            'marker-end':'url(#ar-'+fi+')'}));
+            'marker-end':'url(#ar-'+fi+')'});
+          svg.appendChild(ln);
+          dmTagFlowLine(ln, fi, 'dm-shmemvis', '1.6', '0.8', '2.8', '0.98');
         });
         const mx=(x1+x2)/2, my=(y1+y2)/2;
-        svg.appendChild(svgN('rect',{
+        const sq=svgN('rect',{
           x:mx-BUFSZ/2, y:my-BUFSZ/2, width:BUFSZ, height:BUFSZ,
           fill:color, 'fill-opacity':'0.9',
-          stroke:'#181818', 'stroke-width':'0.8'}));
+          stroke:'#181818', 'stroke-width':'0.8'});
+        svg.appendChild(sq);
+        dmTagFlowSq(sq, fi, '0.9', '1');
       }
       // Wide transparent hit area (covers both rails for window links).
       const hit=svgN('line',{x1,y1,x2,y2,stroke:'transparent','stroke-width':'12',
         cursor:'pointer','pointer-events':'stroke'});
+      const kindLbl=h.kind==='window'?'shmem window (ping-pong)':'shmem dma bridge';
+      const flowTip=['flow f'+fi+(p.id?' ('+p.id+')':'')+' · '+p.direction, kindLbl];
+      dmWireFlowHit(hit, fi, flowTip);
       hit.addEventListener('click',ev=>{
         if(dmDragging) return;
         ev.stopPropagation();
@@ -6048,7 +6210,7 @@ function buildDeviceMap(){
       const [fc,fr]=e[0], [tc,tr]=e[1];
       const {ox,oy}=edgeOffset(e,fi);
       const isTerminal=!srcKeys.has(tc+','+tr);
-      const x1=fcx(fc)+ox, y1=cy(fr)+oy, x2=fcx(tc)+ox, y2=cy(tr)+oy;
+      const x1=fcx(fc)+ox, y1=fcy(fr)+oy, x2=fcx(tc)+ox, y2=fcy(tr)+oy;
       // Status casing, drawn first so it sits under the identity-colored line.
       // Starts transparent; dmPaintStatus() fills it in when a scan lands.
       if(!dim){
@@ -6057,16 +6219,20 @@ function buildDeviceMap(){
           stroke:'transparent', 'stroke-width':'9', 'stroke-opacity':'0.55',
           'stroke-linecap':'round', 'pointer-events':'none'}));
       }
-      svg.appendChild(svgN('line',{
+      const vis=svgN('line',{
         x1, y1, x2, y2,
         stroke:color,
         'stroke-width':dim?'0.7':'1.5',
         'stroke-opacity':dim?'0.05':'0.6',
-        'stroke-linecap':'round'}));
+        'stroke-linecap':'round'});
+      svg.appendChild(vis);
+      if(!dim) dmTagFlowLine(vis, fi, 'dm-flowvis', '1.5', '0.6', '2.8', '0.95');
       // Wide transparent hit area — only on active lines so dim flows aren't clickable.
       if(!dim){
         const hit=svgN('line',{x1,y1,x2,y2,stroke:'transparent','stroke-width':'12',
           cursor:'pointer','pointer-events':'stroke'});
+        const flowTip=['flow f'+fi+(p.id?' ('+p.id+')':'')+' · '+p.direction];
+        dmWireFlowHit(hit, fi, flowTip);
         hit.addEventListener('click',e=>{
           if(dmDragging) return;
           e.stopPropagation();
@@ -6153,12 +6319,12 @@ function buildDeviceMap(){
       const [sc,sr]=srcTile[0];
       if(!(isPull&&pktTileSet.has(sc+','+sr))){
         const {ox,oy}=dotOffset(p,sc,sr);
-        dotsG.appendChild(svgN('circle',{cx:fcx(sc)+ox,cy:cy(sr)+oy,r:'1.8',
+        dotsG.appendChild(svgN('circle',{cx:fcx(sc)+ox,cy:fcy(sr)+oy,r:'1.8',
           fill:color,stroke:'#181818','stroke-width':'0.7'}));
         // Arrow at source dot (push flows only — pull contributors use solid dot without arrow).
         if(!isPull){
           const [tc2,tr2]=srcTile[1];
-          if(tr2>=0){ const [dx,dy]=gridDir(sc,sr,tc2,tr2); svgArrow(fcx(sc)+ox,cy(sr)+oy,dx,dy,color,true); }
+          if(tr2>=0){ const [dx,dy]=gridDir(sc,sr,tc2,tr2); svgArrow(fcx(sc)+ox,fcy(sr)+oy,dx,dy,color,true); }
         }
       }
     }
@@ -6172,10 +6338,10 @@ function buildDeviceMap(){
         if(seen.has(k)) return;
         seen.add(k);
         const {ox,oy}=dotOffset(p,tc,tr);
-        dotsG.appendChild(svgN('circle',{cx:fcx(tc)+ox,cy:cy(tr)+oy,r:'1.8',
+        dotsG.appendChild(svgN('circle',{cx:fcx(tc)+ox,cy:fcy(tr)+oy,r:'1.8',
           fill:color,stroke:'#181818','stroke-width':'0.7'}));
         const outEdge=edges.find(e=>e[0][0]===tc&&e[0][1]===tr);
-        if(outEdge){ const [dx,dy]=gridDir(tc,tr,outEdge[1][0],outEdge[1][1]); svgArrow(fcx(tc)+ox,cy(tr)+oy,dx,dy,color,true); }
+        if(outEdge){ const [dx,dy]=gridDir(tc,tr,outEdge[1][0],outEdge[1][1]); svgArrow(fcx(tc)+ox,fcy(tr)+oy,dx,dy,color,true); }
       });
     }
 
@@ -6189,7 +6355,7 @@ function buildDeviceMap(){
         forkSeen.add(k);
         const {ox,oy}=dotOffset(p,fc,fr);
         dotsG.appendChild(svgN('circle',{
-          cx:fcx(fc)+ox,cy:cy(fr)+oy,
+          cx:fcx(fc)+ox,cy:fcy(fr)+oy,
           r:'2',fill:color,stroke:'#e4e4e4','stroke-width':'0.8'}));
       }
     });
@@ -6231,11 +6397,11 @@ function buildDeviceMap(){
       if(!outCount[dk] && tr>=0 && !dstSeen.has(dk)){
         dstSeen.add(dk);
         const {ox,oy}=dotOffset(p,tc,tr);
-        dotsG.appendChild(svgN('circle',{cx:fcx(tc)+ox,cy:cy(tr)+oy,r:'1.8',
+        dotsG.appendChild(svgN('circle',{cx:fcx(tc)+ox,cy:fcy(tr)+oy,r:'1.8',
           fill:'#181818',stroke:color,'stroke-width':'1.2'}));
         // Arrow pointing into the dot (data flows in from the previous tile).
         const [dx,dy]=gridDir(sc2,sr2,tc,tr);
-        svgArrow(fcx(tc)+ox,cy(tr)+oy,dx,dy,color,false,4);
+        svgArrow(fcx(tc)+ox,fcy(tr)+oy,dx,dy,color,false,4);
       }
     });
 
@@ -6249,11 +6415,11 @@ function buildDeviceMap(){
       if(sr>=0 && dmaTileSet.has(sk) && outCount[sk] && inCount[sk] && !tapSeen.has(sk) && !globalTerminals.has(sk)){
         tapSeen.add(sk);
         const {ox,oy}=dotOffset(p,sc,sr);
-        dotsG.appendChild(svgN('circle',{cx:fcx(sc)+ox,cy:cy(sr)+oy,r:'2',
+        dotsG.appendChild(svgN('circle',{cx:fcx(sc)+ox,cy:fcy(sr)+oy,r:'2',
           fill:'#181818',stroke:color,'stroke-width':'1.2'}));
         // Inward arrow only — tap is a consumer (output node), data flows in.
         const inEdge=edges.find(e2=>e2[1][0]===sc&&e2[1][1]===sr);
-        if(inEdge){ const [dx,dy]=gridDir(inEdge[0][0],inEdge[0][1],sc,sr); svgArrow(fcx(sc)+ox,cy(sr)+oy,dx,dy,color,false,4); }
+        if(inEdge){ const [dx,dy]=gridDir(inEdge[0][0],inEdge[0][1],sc,sr); svgArrow(fcx(sc)+ox,fcy(sr)+oy,dx,dy,color,false,4); }
       }
     });
   });
@@ -6270,76 +6436,37 @@ function buildDeviceMap(){
 buildNetBar();
 
 
-let _flowDmaLookup = null;
-function _flowDmaLabel(fi, col, row){
-  if(!_flowDmaLookup){
-    _flowDmaLookup = {};
-    (DATA.comm_paths||[]).forEach(p=>{
-      const pfi = p.flow_index;
-      if(pfi==null) return;
-      (p.stages||[]).forEach(st=>{
-        if(st.role==='producer' && st.tile){
-          const t=st.tile;
-          _flowDmaLookup[pfi+'|'+t.col+'|'+t.row]='mm2s'+(st.channel??'');
-        } else if(st.role==='consumer'){
-          (st.tiles||[]).forEach(t=>{
-            _flowDmaLookup[pfi+'|'+t.col+'|'+t.row]='s2mm'+(t.dma_port??'');
-          });
-        }
-      });
-    });
-  }
-  if(fi==null) return '';
-  return _flowDmaLookup[fi+'|'+col+'|'+row]||'';
+function _fmtDmaChanBadge(ch){
+  const p=ch.direction==='S2MM'?'s2mm':'mm2s';
+  return p+(ch.channel??0);
 }
-
-function _swIssues(col, row){
-  const conns=_tileRoutingConns(col,row).filter(c=>{
-    const s=c.slave||{}, m=c.master||{};
-    return s.dir!=null && s.idx!=null && m.dir!=null && m.idx!=null;
-  });
-  const issues=[];
-
-  const cctMasterSlave=new Map(); // 'dir|idx' -> Set<'slaveDir|slaveIdx'>
-  conns.forEach(c=>{
-    if(c.kind!=='circuit_connect') return;
-    const s=c.slave||{}, m=c.master||{};
-    const mk=m.dir+'|'+m.idx;
-    const sv=s.dir+'|'+s.idx;
-    if(!cctMasterSlave.has(mk)) cctMasterSlave.set(mk,new Set());
-    cctMasterSlave.get(mk).add(sv);
-  });
-  cctMasterSlave.forEach((slaves,mk)=>{
-    if(slaves.size<2) return;
-    const [dir,idx]=mk.split('|');
-    issues.push({type:'cct-master-reuse',mk,
-      msg:'CCT master '+dir+'['+idx+'] driven by '+slaves.size+' slaves — only one can win'});
-  });
-
-  const slaveKinds=new Map(); // 'dir|idx' -> Set<kind>
-  const masterKinds=new Map();
-  conns.forEach(c=>{
-    const s=c.slave||{}, m=c.master||{};
-    const sk=s.dir+'|'+s.idx, mk=m.dir+'|'+m.idx;
-    if(!slaveKinds.has(sk)) slaveKinds.set(sk,new Set());
-    slaveKinds.get(sk).add(c.kind);
-    if(!masterKinds.has(mk)) masterKinds.set(mk,new Set());
-    masterKinds.get(mk).add(c.kind);
-  });
-  slaveKinds.forEach((kinds,pk)=>{
-    if(kinds.size<2) return;
-    const [dir,idx]=pk.split('|');
-    issues.push({type:'cct-pkt-conflict',port:pk,
-      msg:'Slave port '+dir+'['+idx+'] used as both CCT and PKT — mutually exclusive modes'});
-  });
-  masterKinds.forEach((kinds,pk)=>{
-    if(kinds.size<2) return;
-    const [dir,idx]=pk.split('|');
-    issues.push({type:'cct-pkt-conflict',port:pk,
-      msg:'Master port '+dir+'['+idx+'] targeted by both CCT and PKT — mutually exclusive modes'});
-  });
-
-  return issues;
+function _flowDmaLabel(fi, col, row){
+  if(fi==null) return '';
+  const tile=(DATA.tiles||[]).find(t=>t.loc[0]===col && t.loc[1]===row);
+  if(!tile) return '';
+  const chans=(tile.dma_channels||[]).filter(c=>c.flow_index===fi);
+  if(chans.length===1) return _fmtDmaChanBadge(chans[0]);
+  if(chans.length>1){
+    return chans.map(_fmtDmaChanBadge).join(' ');
+  }
+  return '';
+}
+function _flowDmaBadgeStyle(lbl){
+  if(!lbl){
+    return {cls:'rt-route', bg:'#141820', fg:'#687080', text:'route',
+      title:'stream-switch routing only — no local DMA for this flow on this tile'};
+  }
+  if(lbl.startsWith('mm2s')){
+    return {cls:'rt-mm2s', bg:'#2a1028', fg:'#c050b0', text:lbl,
+      title:'MM2S — tile memory to stream (send)'};
+  }
+  return {cls:'rt-s2mm', bg:'#0a2830', fg:'#30c0d0', text:lbl,
+    title:'S2MM — stream to tile memory (receive)'};
+}
+function _flowDmaSpanHtml(fi, col, row){
+  const lbl=_flowDmaLabel(fi,col,row);
+  const st=_flowDmaBadgeStyle(lbl);
+  return '<span class="'+st.cls+'" title="'+esc(st.title)+'">'+esc(st.text)+'</span>';
 }
 
 function _flowTileSet(p){
@@ -6349,27 +6476,150 @@ function _flowTileSet(p){
   (p.dma_tiles||[]).forEach(t=>s.add(t[0]+','+t[1]));
   return s;
 }
+function _isPktPort(p){ return p&&p.dir&&p.dir!=='NONE'; }
+function _sharedPktForwardMaster(pktConns){
+  for(const c of pktConns){
+    const fm=c.forward_master||{};
+    if(_isPktPort(fm)) return fm;
+  }
+  return null;
+}
+function _defaultPktMask(leg){ return leg==='dma'?0x1f:0; }
+function _resolvePktMask(leg, port){
+  if(port&&port.mask!=null) return port.mask;
+  return _defaultPktMask(leg);
+}
+function _shortDir(d){
+  return d==='NORTH'?'N':d==='SOUTH'?'S':d==='EAST'?'E':d==='WEST'?'W':d?d[0]:'?';
+}
+function _fmtPktMaskHex(mask, leg){
+  const m=(mask!=null)?mask:_defaultPktMask(leg);
+  return '0x'+Number(m).toString(16).toUpperCase();
+}
+function _fmtPktMaskHtml(mask, leg){
+  return _fmtPktMaskBadge(mask, leg);
+}
+function _fmtPktMaskBadge(mask, leg){
+  return '<span class="rt-pktmask" title="slave slot match mask (XAie_StrmPktSwSlaveSlotEnable)">'
+    +_fmtPktMaskHex(mask, leg)+'</span>';
+}
+function _expandPktConnectRows(c, sharedFwd){
+  const rs=c.recv_slave||{}, ld=c.local_dma||{}, fm=c.forward_master||{};
+  const master=_isPktPort(fm)?fm:sharedFwd;
+  if(!master) return [];
+  const rows=[];
+  if(_isPktPort(rs))
+    rows.push({leg:'recv', slave:{dir:rs.dir, idx:rs.idx},
+               master:{dir:master.dir, idx:master.idx},
+               pktid:rs.pktid, mask:_resolvePktMask('recv', rs)});
+  if(_isPktPort(ld))
+    rows.push({leg:'dma', slave:{dir:ld.dir, idx:ld.idx},
+               master:{dir:master.dir, idx:master.idx},
+               pktid:ld.pktid, mask:_resolvePktMask('dma', ld)});
+  return rows;
+}
+function _pktRowKey(row){
+  return 'pkt|'+row.leg+'|'+row.slave.dir+'|'+row.slave.idx+'|'+(row.pktid??'?')
+    +'|'+row.mask+'|'+row.master.dir+'|'+row.master.idx;
+}
+function _fmtPktLabel(row, compact){
+  const dir=compact?_shortDir:(d=>d);
+  const arr=' → ';
+  let s='PKT '+dir(row.slave.dir)+':'+row.slave.idx+arr+dir(row.master.dir)+':'+row.master.idx;
+  if(!compact){
+    if(row.pktid!=null) s+=' pkt'+row.pktid;
+    s+=' '+_fmtPktMaskHex(row.mask, row.leg);
+  }
+  return s;
+}
+function _dmPktBadges(row){
+  const badges=[];
+  if(row.pktid!=null) badges.push({text:'pkt'+row.pktid, bg:'#2a0838', fg:'#c07fd4'});
+  badges.push({text:_fmtPktMaskHex(row.mask, row.leg), bg:'#3a1010', fg:'#e87850'});
+  return badges;
+}
+function _svgBadgeWidth(text){
+  return Math.round(text.length*3.55+4);
+}
+function _fmtMselEnHex(v){
+  return '0x'+Number(v!=null?v:1).toString(16).toUpperCase();
+}
+function _tilePktMasters(col, row, focusFlowIdx){
+  const out=new Map();
+  (DATA.comm_paths||[]).forEach(p=>{
+    if(focusFlowIdx!=null && p.flow_index!==focusFlowIdx) return;
+    const fts=_flowTileSet(p);
+    if(fts.size>0 && !fts.has(col+','+row)) return;
+    (p.routing_connections||[]).forEach(c=>{
+      if(c.kind!=='packet_connect') return;
+      const t=c.tile||{};
+      if(t.col!==col || t.row!==row) return;
+      const fm=c.forward_master||{};
+      if(!_isPktPort(fm)) return;
+      const key=fm.dir+'|'+fm.idx;
+      if(!out.has(key)){
+        out.set(key, {
+          dir:fm.dir, idx:fm.idx,
+          arbiter:(fm.arbiter!=null)?fm.arbiter:0,
+          msel_en:(fm.msel_en!=null)?fm.msel_en:1,
+          flow_indices:[],
+        });
+      }
+      const e=out.get(key);
+      if(p.flow_index!=null && !e.flow_indices.includes(p.flow_index))
+        e.flow_indices.push(p.flow_index);
+    });
+  });
+  return [...out.values()].sort((a,b)=>
+    a.dir.localeCompare(b.dir)||a.idx-b.idx);
+}
+function _renderPktMasterBlock(col, row, focusFlowIdx){
+  const masters=_tilePktMasters(col, row, focusFlowIdx);
+  if(!masters.length) return '';
+  const rows=masters.map(m=>{
+    const flows=m.flow_indices.map(fi=>'fl'+fi).join(' ');
+    const flow=flows?'<span class="rt-flow">'+esc(flows)+'</span>':'';
+    return '<div class="rt-row mst">'
+      +'<span class="rt-kind">MST</span>'
+      +'<span class="rt-ports">'+esc(m.dir)+':'+m.idx+'</span>'
+      +'<span class="rt-pktid" title="XAie_StrmPktSwMstrPortEnable Arbitor">arb:'
+        +m.arbiter+'</span>'
+      +'<span class="rt-pktid" title="XAie_StrmPktSwMstrPortEnable MSelEn (bitmask of slave MSel lines)">msel_en:'
+        +_fmtMselEnHex(m.msel_en)+'</span>'
+      +flow+'</div>';
+  }).join('');
+  return '<div class="rt-mst-hdr">PKT master ports</div>'
+    +rows;
+}
 function _tileRoutingConns(col, row){
   const shimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
-  const seen=new Set();
+  const keyIdx=new Map();
   const out=[];
   (DATA.comm_paths||[]).forEach(p=>{
     const fts=_flowTileSet(p);
     if(fts.size>0 && !fts.has(col+','+row)) return;
+    const pathPkt=(p.routing_connections||[]).filter(c=>{
+      const t=c.tile||{};
+      return t.col===col && t.row===row && c.kind==='packet_connect';
+    });
+    const sharedPktFwd=_sharedPktForwardMaster(pathPkt);
+    pathPkt.forEach(c=>{
+      _expandPktConnectRows(c,sharedPktFwd).forEach(row=>{
+        const key=p.flow_index+'|'+_pktRowKey(row);
+        if(keyIdx.has(key)) return;
+        keyIdx.set(key, out.length);
+        out.push({kind:'packet_hw', ...row, flow_index:p.flow_index, flow_indices:[p.flow_index]});
+      });
+    });
     (p.routing_connections||[]).forEach(c=>{
       const t=c.tile||{};
       if(t.col!==col || t.row!==row || shimKinds.has(c.kind)) return;
-      let key;
-      if(c.kind==='packet_connect'){
-        const rs=c.recv_slave||{}, ld=c.local_dma||{}, fm=c.forward_master||{};
-        key='pkt|'+rs.dir+'|'+rs.idx+'|'+ld.dir+'|'+ld.idx+'|'+fm.dir+'|'+fm.idx;
-      } else {
-        const s=c.slave||{}, m=c.master||{};
-        key=c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
-      }
-      if(seen.has(key)) return;
-      seen.add(key);
-      out.push({...c, flow_index:p.flow_index});
+      if(c.kind==='packet_connect') return;
+      const s=c.slave||{}, m=c.master||{};
+      const key=p.flow_index+'|'+c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
+      if(keyIdx.has(key)) return;
+      keyIdx.set(key, out.length);
+      out.push({...c, flow_index:p.flow_index, flow_indices:[p.flow_index]});
     });
   });
   return out;
@@ -6378,76 +6628,104 @@ function _tileRoutingConns(col, row){
 function renderTileRoutingSection(col, row, focusFlowIdx){
   const allRaw=_tileRoutingConns(col,row);
 
-  const cctConns=allRaw.filter(c=>{
-    const s=c.slave||{}, m=c.master||{};
-    return c.kind==='circuit_connect' && s.dir!=null && s.idx!=null && m.dir!=null && m.idx!=null;
-  });
-  const cctMasterSlave=new Map();
-  const slaveKinds=new Map(), masterKindsMap=new Map();
-  cctConns.forEach(c=>{
-    const s=c.slave||{}, m=c.master||{};
-    const mk=m.dir+'|'+m.idx, sk=s.dir+'|'+s.idx;
-    if(!cctMasterSlave.has(mk)) cctMasterSlave.set(mk,new Set());
-    cctMasterSlave.get(mk).add(sk);
-    if(!slaveKinds.has(sk)) slaveKinds.set(sk,new Set());
-    slaveKinds.get(sk).add(c.kind);
-    if(!masterKindsMap.has(mk)) masterKindsMap.set(mk,new Set());
-    masterKindsMap.get(mk).add(c.kind);
-  });
-  const isConflict=c=>{
-    if(c.kind!=='circuit_connect') return false;
-    const s=c.slave||{}, m=c.master||{};
-    const mk=m.dir+'|'+m.idx, sk=s.dir+'|'+s.idx;
-    if((cctMasterSlave.get(mk)||new Set()).size>1) return true;
-    if((slaveKinds.get(sk)||new Set()).size>1) return true;
-    if((masterKindsMap.get(mk)||new Set()).size>1) return true;
-    return false;
-  };
-
   let conns=allRaw.filter(c=>{
-    if(c.kind==='packet_connect') return true;
+    if(c.kind==='packet_hw') return true;
     const s=c.slave||{}, m=c.master||{};
     return s.dir!=null && s.idx!=null && m.dir!=null && m.idx!=null;
   });
-  if(focusFlowIdx!=null) conns=conns.filter(c=>c.flow_index===focusFlowIdx);
+  if(focusFlowIdx!=null) conns=conns.filter(c=>(c.flow_indices||[c.flow_index]).includes(focusFlowIdx));
   if(!conns.length) return '';
 
-  const issues=_swIssues(col,row);
-  const warnHdr=issues.length
-    ?'<div class="sw-warn-hdr">&#9888;&ensp;'+issues.length+' stream switch issue'+(issues.length>1?'s':'')
-      +issues.map(i=>'<span class="sw-issue-line">'+esc(i.msg)+'</span>').join('')
-      +'</div>'
-    :'';
-
   const rows=conns.map(c=>{
-    if(c.kind==='packet_connect'){
-      const rs=c.recv_slave||{}, ld=c.local_dma||{}, fm=c.forward_master||{};
-      const fwd=fm.dir&&fm.dir!=='NONE'
-        ?' <span class="rt-fwd">fwd&rarr;'+esc(fm.dir)+':'+fm.idx+'</span>':'';
-      const pktid=ld.pktid!=null?'<span class="rt-pktid">pkt'+ld.pktid+'</span>':'';
-      const inPort=rs.dir&&rs.dir!=='NONE'
-        ?esc(rs.dir)+':'+rs.idx+'&rarr;':'&rarr;';
-      const ports=inPort+esc(ld.dir||'DMA')+':'+ld.idx;
-      const flow=(c.flow_index!=null)?'<span class="rt-flow">fl'+c.flow_index+'</span>':'';
-      const dmaLbl=_flowDmaLabel(c.flow_index,col,row);
-      const dmaSpan=dmaLbl?'<span class="rt-dma">'+esc(dmaLbl)+'</span>':'';
+    const dfi=(focusFlowIdx!=null&&(c.flow_indices||[]).includes(focusFlowIdx))?focusFlowIdx:c.flow_index;
+    if(c.kind==='packet_hw'){
+      const ports=esc(c.slave.dir)+':'+c.slave.idx+'&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx;
+      const pktSpan=(c.pktid!=null)
+        ?'<span class="rt-pktid" title="packet match id">pkt'+c.pktid+'</span>':'';
+      const maskSpan=_fmtPktMaskBadge(c.mask,c.leg);
+      const flow=(dfi!=null)?'<span class="rt-flow">fl'+dfi+'</span>':'';
+      const dmaSpan=_flowDmaSpanHtml(dfi,col,row);
       return '<div class="rt-row pkt">'
         +'<span class="rt-kind">PKT</span>'
         +'<span class="rt-ports">'+ports+'</span>'
-        +pktid+dmaSpan+fwd+flow+'</div>';
+        +pktSpan+maskSpan+dmaSpan+flow+'</div>';
     }
     const s=c.slave||{}, m=c.master||{};
-    const ports=esc(s.dir)+':'+s.idx+' &rarr; '+esc(m.dir)+':'+m.idx;
-    const flow=(c.flow_index!=null)?'<span class="rt-flow">fl'+c.flow_index+'</span>':'';
-    const dmaLbl=_flowDmaLabel(c.flow_index,col,row);
-    const dmaSpan=dmaLbl?'<span class="rt-dma">'+esc(dmaLbl)+'</span>':'';
-    const issueCls=isConflict(c)?' sw-issue':'';
-    return '<div class="rt-row cct'+issueCls+'">'
+    const ports=esc(s.dir)+':'+s.idx+'&nbsp;&rarr;&nbsp;'+esc(m.dir)+':'+m.idx;
+    const flow=(dfi!=null)?'<span class="rt-flow">fl'+dfi+'</span>':'';
+    const dmaSpan=_flowDmaSpanHtml(dfi,col,row);
+    return '<div class="rt-row cct">'
       +'<span class="rt-kind">CCT</span>'
       +'<span class="rt-ports">'+ports+'</span>'
       +dmaSpan+flow+'</div>';
   });
-  return '<div class="sec"><div class="sec-hdr">Stream switch</div>'+warnHdr+rows.join('')+'</div>';
+  const mstBlock=_renderPktMasterBlock(col, row, focusFlowIdx);
+  return '<div class="sec"><div class="sec-hdr">Stream switch</div>'
+    +rows.filter(Boolean).join('')+mstBlock+'</div>';
+}
+
+function _routingTileType(row){
+  const deviceCoreMinRow=DATA.grid.device_core_min_row||3;
+  if(row===0) return 'shim';
+  if(row>=deviceCoreMinRow) return 'core';
+  return 'mem';
+}
+function _tileCommPaths(col, row){
+  const inPath=p=>(p.edges||[]).some(e=>
+    (e[0][0]===col&&e[0][1]===row)||(e[1][0]===col&&e[1][1]===row));
+  return (DATA.comm_paths||[]).filter(inPath);
+}
+function _tileShmemHops(col, row){
+  const out=[];
+  (DATA.comm_paths||[]).forEach(p=>{
+    (p.hops||[]).filter(h=>h.type==='shmem').forEach(h=>{
+      if((h.from_col===col&&h.from_row===row)||(h.to_col===col&&h.to_row===row))
+        out.push({flow_index:p.flow_index, ...h});
+    });
+  });
+  return out;
+}
+function buildRoutingTileHtml(col, row){
+  const ttype=_routingTileType(row);
+  const flows=_tileCommPaths(col, row);
+  const flowRows=flows.map(p=>'<tr><td>f'+p.flow_index+'</td><td>'
+    +esc(p.direction||'')+'</td><td>'+esc(p.id||'')+'</td></tr>').join('');
+  const flowTable=flowRows
+    ?'<table class="rctbl"><thead><tr><th>flow</th><th>dir</th><th>net</th></tr></thead>'
+      +'<tbody>'+flowRows+'</tbody></table>'
+    :'<div class="placeholder">(no comm paths through this tile)</div>';
+  const shmem=_tileShmemHops(col, row);
+  const shmemRows=shmem.map(h=>'<tr><td>f'+h.flow_index+'</td><td>('+h.from_col+','+h.from_row
+    +')</td><td>→</td><td>('+h.to_col+','+h.to_row+')</td><td>'
+    +esc(h.kind||'shmem')+'</td></tr>').join('');
+  const shmemSec=shmemRows
+    ?'<div class="sec"><div class="sec-hdr">Shared memory</div>'
+      +'<table class="rctbl"><thead><tr><th>flow</th><th>from</th><th></th><th>to</th>'
+      +'<th>kind</th></tr></thead><tbody>'+shmemRows+'</tbody></table></div>'
+    :'';
+  const swSec=renderTileRoutingSection(col, row);
+  return '<div class="placeholder dimtxt">No kernel or DMA schedule for this tile — routing path only.</div>'
+    +'<div class="sec"><div class="sec-hdr">Tile</div>'
+    +'<div class="kv"><b>location:</b> ('+col+','+row+')</div>'
+    +'<div class="kv"><b>geometry:</b> '+ttype+'</div></div>'
+    +'<div class="sec"><div class="sec-hdr">Flows</div>'+flowTable+'</div>'
+    +shmemSec+(swSec||'');
+}
+function selectRoutingTile(col, row, ctrl){
+  reportUIState({selected_tile:[col,row], channel:null, flow:null});
+  const tileKey=panelKey('tile', col+','+row);
+  const label='('+col+','+row+') routing';
+  const llmCtx='tile ('+col+','+row+') routing-only (no schedule bundle)';
+  const buildBody=()=>buildRoutingTileHtml(col, row);
+  if(ctrl){
+    if(panelItems.has(tileKey)){ panelRemove(tileKey); return; }
+    panelItems.set(tileKey,{kind:'tile',label,color:null,buildBody,wireBody:()=>{},llmCtx});
+  } else {
+    panelItems.forEach((_,k)=>{ if(k.startsWith('tile:')) panelItems.delete(k); });
+    panelItems.set(tileKey,{kind:'tile',label,color:null,buildBody,wireBody:()=>{},llmCtx});
+  }
+  panelActiveKey=tileKey;
+  panelSync();
 }
 
 function renderTileDmaBdSection(t, ch, focused){
@@ -6602,7 +6880,9 @@ function select(t, el, ch, badgeEl, ctrl){
       (con?'<div class="sec"><div class="sec-hdr">Contract</div>'+con+'</div>':'');
   } else {
     const sum = (hlv.summary||[]).map(s=>'<li>'+esc(s)+'</li>').join('');
-    const con = (hlv.contracts||[]).map(s=>'<div class="contract">'+esc(s)+'</div>').join('');
+    const con = (hlv.contracts||[]).map(s=>{
+      return '<div class="contract">'+esc(s)+'</div>';
+    }).join('');
     // Build status bar from tile-level balances
     const balRows = [];
     const bseen = {};
@@ -6939,19 +7219,6 @@ function panelRemove(key){
   if(panelActiveKey) panelRenderBody(panelActiveKey);
   else { document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; panelBuildToc(); }
   panelUpdateLLM();
-}
-
-// A device-map tile with no DATA.tiles entry. Without this the pane keeps the
-// PREVIOUS tile's detail on screen, reading as if it belonged to the one just
-// clicked. Nets stay: they are a separate selection.
-function panelClearTiles(note){
-  panelItems.forEach((_,k)=>{ if(k.startsWith('tile:')) panelItems.delete(k); });
-  panelSync();
-  if(!panelItems.size && note){
-    document.getElementById('panel-body').innerHTML =
-      '<div class="placeholder">'+esc(note)+'</div>';
-    panelBuildToc();
-  }
 }
 
 function panelSync(){
@@ -7751,7 +8018,7 @@ document.getElementById('conreload').onclick = () => {
 // root. Each user turn becomes a .llm-msg-you bubble; streamed reply tokens
 // accumulate into a .llm-msg-ai bubble via llmAppendToMsg.
 const LLM = { off:0, poll:null, busy:false, pendingId:null,
-  ctx:new Map(), ctxSent:new Map(), generation:null };
+  ctx:new Map(), ctxSent:new Map(), generation:null, pollErrors:0 };
 const LLM_CTX_ORDER = ['session', 'run', 'search', 'selection'];
 let llmMessages = [];
 let llmMsgIdCtr = 0;
@@ -8031,16 +8298,15 @@ function llmPollOnce(){
   if (LLM.busy) return;
   LLM.busy = true;
   api('/llm/poll?offset=' + LLM.off).then(r => {
+    LLM.pollErrors = 0;
     if (r.auth){ llmLock(); return; }
     if (r.error){ llmStopPoll(); llmShowThink(false); return; }
     if (llmAdoptGeneration(r)) return;
     if (r.stuck){
-      // Watchdog: the daemon received no output from claude for _LLM_STUCK_S seconds.
-      // The turn is declared over; show a recovery notice and a Reset button.
+      const s = r.stuck_s ? r.stuck_s + 's' : '2min';
       llmStopPoll();
       llmShowThink(false);
       if (LLM.pendingId){
-        const s = r.stuck_s ? r.stuck_s + 's' : '2min';
         llmAppendToMsg(LLM.pendingId,
           `\n[no response after ${s} — the turn may be stuck. Use **Reset chat** to start a fresh conversation.]`,
           true);
@@ -8056,8 +8322,10 @@ function llmPollOnce(){
     // tool calls and further text long after the opening tokens land.
     llmShowThink(!done);
     if (done){ llmStopPoll(); LLM.pendingId = null; }
-  }).catch(() => { llmStopPoll(); llmShowThink(false); })
-    .finally(() => { LLM.busy = false; });
+  }).catch(() => {
+    LLM.pollErrors += 1;
+    if (LLM.pollErrors > 4){ llmStopPoll(); llmShowThink(false); }
+  }).finally(() => { LLM.busy = false; });
 }
 // Echo the context that just went out, as read-only pills above the message.
 // Without this the blocks vanished from the transcript the moment they were
@@ -9063,6 +9331,11 @@ function runScanNow(setMsg){
       return;
     }
     setLive(e.target.checked);
+  };
+  const swToggle = document.getElementById('dmSwToggle');
+  if (swToggle) swToggle.onchange = e => {
+    dmShowSW = e.target.checked;
+    buildDeviceMap();
   };
 })();
 

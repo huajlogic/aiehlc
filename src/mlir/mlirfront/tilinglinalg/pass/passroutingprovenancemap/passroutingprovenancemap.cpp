@@ -189,6 +189,37 @@ static void writePort(JsonWriter &jw, StringRef key, StringRef dir, int64_t idx)
     jw.endObject();
 }
 
+static bool isNonePktDir(StringRef dir) { return dir.empty() || dir == "NONE"; }
+
+static void writePktSlaveLeg(JsonWriter &jw, StringRef key, StringRef dir, int64_t idx, int64_t pktid, int64_t pkttype,
+                             int64_t mask, int64_t msel, int64_t arbiter, int64_t slot) {
+    jw.key(key);
+    jw.beginObject();
+    jw.keyValue("dir", dir);
+    jw.keyValue("idx", idx);
+    jw.keyValue("pktid", pktid);
+    jw.keyValue("pkttype", pkttype);
+    if (!isNonePktDir(dir)) {
+        jw.keyValue("mask", mask);
+        jw.keyValue("msel", msel);
+        jw.keyValue("arbiter", arbiter);
+        jw.keyValue("slot", slot);
+    }
+    jw.endObject();
+}
+
+static void writePktForwardMaster(JsonWriter &jw, StringRef dir, int64_t idx) {
+    jw.key("forward_master");
+    jw.beginObject();
+    jw.keyValue("dir", dir);
+    jw.keyValue("idx", idx);
+    if (!isNonePktDir(dir)) {
+        jw.keyValue("arbiter", (int64_t)0);
+        jw.keyValue("msel_en", (int64_t)1);
+    }
+    jw.endObject();
+}
+
 static bool writeConnectionOp(JsonWriter &jw, Operation *op) {
     if (auto c = dyn_cast<ConnectStreamSingleSwitchPort>(op)) {
         TileInfo t = resolveTile(op->getOperand(0));
@@ -205,22 +236,12 @@ static bool writeConnectionOp(JsonWriter &jw, Operation *op) {
         jw.beginObjectInline();
         jw.keyValue("kind", "packet_connect");
         writeTileRef(jw, "tile", t);
-        jw.key("recv_slave");
-        jw.beginObject();
-        jw.keyValue("dir", getStrAttr(op, "receiveslavedirection"));
-        jw.keyValue("idx", getIntAttr(op, "receiveslaveportidx"));
-        jw.keyValue("pktid", getIntAttr(op, "receiveslavepktid"));
-        jw.keyValue("pkttype", getIntAttr(op, "receiveslavepkttype"));
-        jw.endObject();
-        jw.key("local_dma");
-        jw.beginObject();
-        jw.keyValue("dir", getStrAttr(op, "localdmadirection"));
-        jw.keyValue("idx", getIntAttr(op, "localdmaportidx"));
-        jw.keyValue("pktid", getIntAttr(op, "localdmapktid"));
-        jw.keyValue("pkttype", getIntAttr(op, "localdmapkttype"));
-        jw.endObject();
-        writePort(jw, "forward_master", getStrAttr(op, "forwardmasterdirection"),
-                  getIntAttr(op, "forwardmasterportidx"));
+        writePktSlaveLeg(jw, "recv_slave", getStrAttr(op, "receiveslavedirection"),
+                         getIntAttr(op, "receiveslaveportidx"), getIntAttr(op, "receiveslavepktid"),
+                         getIntAttr(op, "receiveslavepkttype"), 0, 0, 0, 0);
+        writePktSlaveLeg(jw, "local_dma", getStrAttr(op, "localdmadirection"), getIntAttr(op, "localdmaportidx"),
+                         getIntAttr(op, "localdmapktid"), getIntAttr(op, "localdmapkttype"), 0x1f, 0, 0, 0);
+        writePktForwardMaster(jw, getStrAttr(op, "forwardmasterdirection"), getIntAttr(op, "forwardmasterportidx"));
         bool preserve = false;
         if (auto a = op->getAttrOfType<BoolAttr>("preserveheader"))
             preserve = a.getValue();

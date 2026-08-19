@@ -76,7 +76,8 @@ _DEFAULT_WORKDIR = "aout/worklocal"
 # default for `claude -p`.
 _LLM_PLUGIN_DIR = os.path.join(_THIS_DIR, "dbg_llm_skills")
 _LLM_SKILLS_DIR = os.path.join(_LLM_PLUGIN_DIR, "skills")
-_LLM_STUCK_S = 120   # seconds without output from claude before declaring a turn stuck
+_LLM_STUCK_S = 120
+_LLM_STUCK_HARD_S = 600
 
 
 import struct as _struct
@@ -1624,10 +1625,6 @@ class DebugState:
         self._llm_first_turn = True
         self._llm_generation = 0
         self._llm_reset_reason = ""
-        # Watchdog: timestamp of the last byte received from claude stdout.
-        # None when no turn is active.  Set on every _llm_append/_llm_handle_event
-        # call; if _llm_active is True and now - _llm_last_output > _LLM_STUCK_S
-        # the turn is declared stuck and the client is told to show a recovery UI.
         self._llm_last_output = None   # float (time.monotonic) or None
 
         # Path to the auto-generated MCP config handed to the claude subprocess
@@ -3732,32 +3729,42 @@ message is authoritative and current — prefer it.
             "llm_generation": self._llm_generation,
         }
 
+    def _llm_proc_alive(self):
+        proc = self._llm_proc
+        return proc is not None and proc.poll() is None
+
     def llm_poll(self, offset):
         """Return the transcript slice past `offset` plus the turn-active flag.
 
-        When active is True but no output has arrived for _LLM_STUCK_S seconds,
-        sets stuck=True and clears _llm_active so the browser can show recovery UI.
+        When active is True but no stdout has arrived, the turn stays active while
+        the claude subprocess is running (no client signal).  stuck=True is returned
+        only when the turn is hard-abandoned: subprocess exited with no recent
+        output, or silence exceeds _LLM_STUCK_HARD_S.
         """
         with self._llm_lock:
             buf = self._llm_buf
             active = self._llm_active
             last = self._llm_last_output
+            stuck = False
+            stuck_s = None
             if active and last is not None:
                 age = time.monotonic() - last
-                if age >= _LLM_STUCK_S:
-                    self._llm_active = False
-                    active = False
+                if age >= _LLM_STUCK_HARD_S:
                     stuck = True
                     stuck_s = int(age)
+                    self._llm_active = False
+                    active = False
                     self._llm_log_write(
-                        f"\n[watchdog: no output for {stuck_s}s — turn declared stuck]\n"
+                        f"\n[watchdog: no output for {stuck_s}s — turn abandoned]\n"
                     )
-                else:
-                    stuck = False
-                    stuck_s = None
-            else:
-                stuck = False
-                stuck_s = None
+                elif age >= _LLM_STUCK_S and not self._llm_proc_alive():
+                    stuck = True
+                    stuck_s = int(age)
+                    self._llm_active = False
+                    active = False
+                    self._llm_log_write(
+                        f"\n[watchdog: no output for {stuck_s}s — claude exited]\n"
+                    )
         if offset < 0:
             offset = 0
         result = {
