@@ -132,6 +132,7 @@ source script/aiehlc.sh --platform sim --aie-version 5 --runtime-source-file tut
 # or explicitly stub only tiles you used, e.g. col=0 row=3
 source script/aiehlc.sh --platform sim --aie-version 5 --sim-tiles "0:3" --runtime-source-file tutorial/example.cpp
 
+# aiehlc only builds the artifacts; launch separately
 bash script/runsim.sh
 ```
 
@@ -143,6 +144,9 @@ bash script/runsim.sh
 
 # 2. Specific aout dir: point it at any aout/ containing a sim_config.sh
 bash script/runsim.sh path/to/aout
+
+# TilingLinalg writes its config in the provenance bundle
+bash script/runsim.sh aout/worklocal
 
 # 3. Direct (no config file): pass the inputs yourself (not recommended)
 bash script/runsim.sh \
@@ -556,7 +560,7 @@ The browser UI has a **Board selector** (`palmyra` / `vek385`). Selecting a devi
 enables a **"Connect"** button (and, for `vek385`, reveals a board-hostname
 text box). Clicking **Connect** hits `/ping`; only on a passing test does the
 "Live status overlay" checkbox unlock **and** the drill-down console appear. The
-"Run test" button (spawns `apppaltest`) is enabled as soon as a device is chosen.
+"Run" button (spawns `apppaltest`) is enabled as soon as a device is chosen.
 
 #### Session provenance — why a target is not a connection
 
@@ -571,7 +575,7 @@ daemon therefore tracks how the current session earned its access:
 | `none` | default at startup, even with `AIEDBG_TARGET` set | reads refused; nothing may be inferred about the board |
 | `connected` | **Connect** (a verified `/ping`) | link is real, but registers are pre-existing state, not the result of a run here |
 | `attached` | **Open Current Session** (`/attach`) | a real run is in play, started outside the UI — the daemon cannot vouch for what came before |
-| `ran` | **Run test** | only here are live state and the `applog` the current run |
+| `ran` | **Run** | only here are live state and the `applog` the current run |
 
 `hw_authorized()` gates the live overlay (`/grid`) and the `aiegdb` MCP server's device
 commands; navigation, `help` and `?` stay available so the console is still useful
@@ -626,7 +630,7 @@ test fails.
   a running target sharing the same JTAG bridge. The two commands that *do* write —
   `reg write` and `dma counter setup` — are reachable only by typing them explicitly in the
   aiegdb console, and are flagged **WRITES HW** wherever they are suggested.
-- Live reads require a **board session** (Connect / Run test / Open Current Session). A
+- Live reads require a **board session** (Connect / Run / Open Current Session). A
   target inherited from `$AIEDBG_TARGET` does not authorize reads, so neither the overlay
   nor the embedded agent can silently report another run's leftover register state as
   current — see *Session provenance* above.

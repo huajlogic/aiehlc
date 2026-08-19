@@ -114,7 +114,7 @@ Read `note` and `session` **before** any `aie_exec` that touches the device:
 - `backend="simulator"`, `ipc_ready=false` → the sim is not running; live reads will fail.
   Tell the user to press Run.
 - `backend="hardware"` with `session.authorized` falsy → `aie_exec` will *refuse* device
-  reads. The user must press "Connect", "Run test" or "Open Current Session" first. Do
+  reads. The user must press "Connect", "Run" or "Open Current Session" first. Do
   not describe board state.
 Answers: *is a live read even possible right now?*
 
@@ -212,12 +212,23 @@ by name, so map the name to the tool before answering:
 | Pane | Position | Contains | Ask |
 |---|---|---|---|
 | **AIE Debug** | top-left | the array (Grid / Device Map views) + the DMA/Cores/Events pills, `Scan`, `live` overlay | `get_design_overview`, `tile_list`, `get_flow_detail` |
-| **Run** | bottom-left | app + board selection, `Connect` / `Run test` / `Force stop`, run log | `get_backend_status`, `get_applog`, `get_sim_log` |
-| **Info** | top-right | detail for the current selection, tile (High/Middle/Low) or net | `tile_info`, `get_flow_detail`, `get_pane` |
+| **Execution** | bottom-left | app + board selection, `Connect` / `Run` / `Force stop`, run log | `get_backend_status`, `get_applog`, `get_sim_log` |
+| **Info** | top-right | detail for the current selection, tile (Schedule/IR/Code) or net | `tile_info`, `get_flow_detail`, `get_pane` |
 | **Tools** | bottom-right | aiegdb console, LLM chat, Search | `aie_exec`, `symbol_search` |
 
 `get_ui_state()` resolves what is live in them; `get_pane` ids carry their pane in the
 table below.
+
+**The Execution pane's controls are not fixed.** A daemon serving ONE app has no
+`App:` row at all — the app's name sits beside the `AIE Debug` pane title instead.
+A daemon started `--sim-only` has no `Board:` row, no `Connect` and no `Attach
+existing run`: the simulator is activated automatically on load so **`Run` is
+the only button**, and `/ping`, `/attach`, `/run`, `/settarget` and
+`/launch_hwserver` all refuse with `sim_only: true`. So before you tell the user to
+"pick the board" or "press Connect", check `get_backend_status()`: under sim-only
+neither control exists, and the simulator is the only thing that can produce live
+state.
+
 
 ### `mcp__debugui__list_panes()` → str
 No parameters. Prints the four window panes and their contents, then the
@@ -230,9 +241,9 @@ Returns exactly the content of one UI pane. Valid `pane` ids (anything else retu
 | `pane` | selector | window pane | content |
 |---|---|---|---|
 | `grid` | none | AIE Debug | tile grid overview (same as `tile_list()`) |
-| `tile.hi` | `col`,`row` | Info | tile High tab |
-| `tile.mid` | `col`,`row` | Info | tile Middle tab, `dfschedule` IR |
-| `tile.lo` | `col`,`row` | Info | tile Low tab, `host.cc` (rows tagged `host.cc:<line>`) |
+| `tile.hi` | `col`,`row` | Info | tile **Schedule** tab |
+| `tile.mid` | `col`,`row` | Info | tile **IR** tab, `dfschedule` IR — aiehlc apps only |
+| `tile.lo` | `col`,`row` | Info | tile **Code** tab: `host.cc` (rows tagged `host.cc:<line>`) under aiehlc, kernel source + `.bcf` + generated wrapper under naiebaremetal |
 | `tile.kernel` | `col`,`row` | Info | kernel match / source |
 | `tile.supply` | `col`,`row` | Info | tile supply/demand rollup |
 | `net.flow` | `flow` | Info | flow / communication-path detail |
