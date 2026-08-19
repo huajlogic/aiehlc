@@ -25,6 +25,7 @@
 #include "../mlir/mlirfront/AieFrontEnd.h"
 #include <boost/algorithm/string.hpp>
 
+#include <algorithm>
 #include <ios>
 #include <iostream>
 #include <fstream>
@@ -33,6 +34,8 @@
 #include <cstdlib>
 #include <regex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "routingimplement/include/hw/hwresource.h"
 #include "tilinglinalg_pipeline.h"
@@ -174,6 +177,9 @@ static DerivedTilingParams derivedTilingParams;
 static int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0; // GEMM dimensions from launch args or macros
 
 static int parsedDebugLevel = -1; // -1 = not set by user, >=0 = #pragma aie_debug_level value
+// Compute tiles to core-trace, from #pragma aie_trace(col,row) (mesh/partition-
+// relative). Repeatable and range-expanded (col:col2, row:row2 -> rectangle).
+static std::vector<std::pair<int, int>> parsedTraceTiles;
 static std::string userSourceDir; // directory containing the original user source file
 static PartitionDesc parsedPartition; // default: invalid (all -1), set by #pragma aie_partition
 static std::vector<MeshKernelDesc> parsedMeshKernels; // multi-kernel mode: one per <<<mesh>>> launch
@@ -3251,6 +3257,101 @@ class AieDebugLevelPragmaHandler : public clang::PragmaHandler {
     }
 };
 
+// #pragma aie_trace(col, row) — declare compute tile(s) to core-trace.
+// Coordinates are mesh/partition-relative (the same space the generated host
+// uses). Each of col and row may be a single value N or a range N:M; the
+// col x row rectangle is expanded into (col,row) pairs and accumulated across
+// repeated pragmas. Only compute-tile coords are meaningful; the runtime
+// rejects non-compute rows at __Runtime_core_trace_begin.
+//   #pragma aie_trace(2, 3)     -> (2,3)
+//   #pragma aie_trace(1:2, 3)   -> (1,3),(2,3)
+class AieTracePragmaHandler : public clang::PragmaHandler {
+  public:
+    AieTracePragmaHandler() : PragmaHandler("aie_trace") {}
+
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer Introducer, clang::Token &FirstToken) override {
+        clang::Token Tok;
+        PP.Lex(Tok);
+
+        if (!Tok.is(clang::tok::l_paren)) {
+            llvm::errs() << "[aiehlc] Warning: #pragma aie_trace expects '(col, row)', ignored\n";
+            if (Tok.isNot(clang::tok::eod))
+                PP.DiscardUntilEndOfDirective();
+            return;
+        }
+        PP.Lex(Tok); // consume '('
+
+        // Parse one spec: a numeric_constant, optionally 'N : M'. Returns false
+        // on a malformed token stream; leaves Tok at the token after the spec.
+        auto parseSpec = [&](int &lo, int &hi) -> bool {
+            if (!Tok.is(clang::tok::numeric_constant))
+                return false;
+            {
+                llvm::SmallString<16> Buf;
+                bool Invalid = false;
+                llvm::StringRef Spelling = PP.getSpelling(Tok, Buf, &Invalid);
+                if (Invalid || Spelling.getAsInteger(0, lo))
+                    return false;
+            }
+            hi = lo;
+            PP.Lex(Tok);
+            if (Tok.is(clang::tok::colon)) {
+                PP.Lex(Tok); // consume ':'
+                if (!Tok.is(clang::tok::numeric_constant))
+                    return false;
+                llvm::SmallString<16> Buf;
+                bool Invalid = false;
+                llvm::StringRef Spelling = PP.getSpelling(Tok, Buf, &Invalid);
+                if (Invalid || Spelling.getAsInteger(0, hi))
+                    return false;
+                PP.Lex(Tok);
+            }
+            return true;
+        };
+
+        int colLo = 0, colHi = 0, rowLo = 0, rowHi = 0;
+        bool ok = parseSpec(colLo, colHi);
+        if (ok && Tok.is(clang::tok::comma)) {
+            PP.Lex(Tok); // consume ','
+            ok = parseSpec(rowLo, rowHi);
+        } else {
+            ok = false;
+        }
+        if (ok && Tok.is(clang::tok::r_paren))
+            PP.Lex(Tok); // consume ')'
+
+        if (!ok) {
+            llvm::errs() << "[aiehlc] Warning: malformed #pragma aie_trace(col, row), ignored\n";
+            if (Tok.isNot(clang::tok::eod))
+                PP.DiscardUntilEndOfDirective();
+            return;
+        }
+
+        if (colLo > colHi)
+            std::swap(colLo, colHi);
+        if (rowLo > rowHi)
+            std::swap(rowLo, rowHi);
+
+        unsigned added = 0;
+        for (int c = colLo; c <= colHi; c++) {
+            for (int r = rowLo; r <= rowHi; r++) {
+                std::pair<int, int> t{c, r};
+                if (std::find(parsedTraceTiles.begin(), parsedTraceTiles.end(), t) == parsedTraceTiles.end()) {
+                    parsedTraceTiles.push_back(t);
+                    added++;
+                }
+            }
+        }
+        llvm::outs() << "[aiehlc] Detected #pragma aie_trace col=" << colLo << ":" << colHi << " row=" << rowLo << ":"
+                     << rowHi << " (+" << added << " tiles, total " << parsedTraceTiles.size() << ")\n";
+        for (const auto &t : parsedTraceTiles)
+            llvm::outs() << "[aiehlc]   trace tile (" << t.first << "," << t.second << ")\n";
+
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
 class MyFrontendAction : public ASTFrontendAction {
 public:
 		MyFrontendAction() {
@@ -3300,6 +3401,7 @@ public:
 
             clang::Preprocessor &PP = CI.getPreprocessor();
             PP.AddPragmaHandler(new AieDebugLevelPragmaHandler());
+            PP.AddPragmaHandler(new AieTracePragmaHandler());
 
             return true;
 		}
@@ -4388,7 +4490,7 @@ public:
                     if (!TilingLinalgPipeline::runPipeline(
                             ctx, module, outputDir, kernelBodyWithMacros, mkd.kernelFuncName, parsedDebugLevel,
                             /*userRewrittenSource=*/"", {}, mkd.maxPPBytes, aieGenStr, hostFuncSuffix, appendMode,
-                            &hostDdrArgs, mkd.portVarNames)) {
+                            &hostDdrArgs, mkd.portVarNames, parsedTraceTiles)) {
                         llvm::errs() << "[TilingLinalg] Pipeline FAILED for kernel: " << mkd.kernelName << "\n";
                         std::exit(1);
                     }
@@ -5051,7 +5153,7 @@ public:
                 if (!TilingLinalgPipeline::runPipeline(
                         ctx, module, outputDir, kernelBodyWithMacros, singleKernelFuncName, parsedDebugLevel,
                         userRewrittenSource, tensors, effectiveMaxPPBytes, aieGenStr, /*hostFuncSuffix=*/"",
-                        /*appendMode=*/false, /*numHostDdrArgs=*/nullptr, singlePortVarNames)) {
+                        /*appendMode=*/false, /*numHostDdrArgs=*/nullptr, singlePortVarNames, parsedTraceTiles)) {
                     llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
                     std::exit(1);
                 }

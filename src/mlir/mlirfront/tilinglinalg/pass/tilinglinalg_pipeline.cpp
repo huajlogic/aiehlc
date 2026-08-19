@@ -9,6 +9,7 @@
 #include "kernelconfig.h"
 #include "passblueprinttoschedule.h"
 #include "passblueprinttoschedulekernel.h"
+#include "passcoretraceinsert/passcoretraceinsert.h"
 #include "passdfscheduleprovenancemap.h"
 #include "passdfscheduletoapi.h"
 #include "passdfscheduletokernelapi.h"
@@ -16,6 +17,7 @@
 #include "passdmaphoptodfscheblueprint.h"
 #include "passdmaphoptoroutinghw.h"
 #include "passroutingprovenancemap.h"
+#include "passroutingresourcemap.h"
 #include "passschedulecanonicalize.h"
 #include "passschedulesequentialop.h"
 #include "passwaitmerge.h"
@@ -426,7 +428,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                                        int runtimeDebugLevel, const std::string &userRewrittenSource,
                                        const std::vector<TensorParam> &tensors, int64_t maxPingPongBytes,
                                        const std::string &aieGen, const std::string &hostFuncSuffix, bool appendMode,
-                                       unsigned *numHostDdrArgs, const std::vector<std::string> &portVarNames) {
+                                       unsigned *numHostDdrArgs, const std::vector<std::string> &portVarNames,
+                                       const std::vector<std::pair<int, int>> &traceTiles) {
 
     // Extract partition bounds from createhwmesh op in the IR (if present)
     int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
@@ -643,6 +646,14 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<RoutingConstantFoldPass>(aieGen), irDir, stage,
                                "RoutingConstantFoldPass"))
+        return false;
+
+    // Inject declarative per-tile core trace (#pragma aie_trace) into the host
+    // dispatch function. Runs on the pure-emitc host module so the injected
+    // __Runtime_core_trace_begin/_end calls survive to translateToCpp. No-op
+    // when no trace tiles were requested.
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<CoreTraceInsertPass>(traceTiles), irDir, stage,
+                               "CoreTraceInsertPass"))
         return false;
 
     // Phase 3: kernel path (blueprint -> kernel schedule -> kernel API)
@@ -1537,6 +1548,14 @@ after_host_emit:
             auto routingProvenancePass = std::make_unique<RoutingProvenanceMapPass>(outputDir, partStartCol, aieGen);
             runPipelineSinglePass(ctx, routingDmaphopModule, std::move(routingProvenancePass), routingIrDir, rstage,
                                   "RoutingProvenanceMapPass");
+        }
+
+        // Emit the routing resource map JSON (tile/port/pktid/pkt-mask). Must run
+        // BEFORE RoutingHWLowerPass, while the routinghw connection ops still exist.
+        {
+            auto routingResourcePass = std::make_unique<RoutingResourceMapPass>(outputDir, partStartCol, aieGen);
+            runPipelineSinglePass(ctx, routingDmaphopModule, std::move(routingResourcePass), routingIrDir, rstage,
+                                  "RoutingResourceMapPass");
         }
 
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(routingPathTopology),

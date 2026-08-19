@@ -65,28 +65,15 @@
 #define CORE_OP_MEM 0x6000
 #endif
 
-// Core event trace capture buffer, in the same-column top MemTile's memory
-// (not tile (4,4)'s own data mem). The trace stream is routed DOWN from the core
-// through the intervening core tiles into the MemTile's S2MM DMA, so the deep
-// trace no longer steals space from the kernel's own data regions.
-#define TRC_ADDR 0x8000u
-#define TRC_MEMTILE_DMA_LOAL_OFFSET_ADDR 0x80000u
-#define TRC_LEN 0x1000u /* 4 KB of raw trace words, in MemTile memory */
-
 // Master switch for the core event-trace flow. The trace unit is routed down
-// into the MemTile's S2MM DMA channel (see TRC_S2MM_CH below). Set to 0 to fully
-// compile out trace setup/read and isolate whether the hang is trace-induced;
-// set to 1 to re-enable.
+// from the core through the intervening core tiles into the same-column top
+// MemTile's S2MM DMA. The __Runtime_core_trace_begin_ch/_end_into session
+// helpers own the fixed-reserved MemTile drain convention (buffer offset, stream
+// channel, S2MM channel, BD), so no buffer/channel macros are needed here; the
+// _ch form only pins the trace stream channel away from this tile's data DMA. Set
+// to 0 to fully compile out trace setup/read and isolate whether the hang is
+// trace-induced; set to 1 to re-enable.
 #define TRACE_ENABLE 1
-// Physical stream channel used for every hop of the core->MemTile trace route
-// (core SOUTH-master / NORTH-slave and MemTile NORTH-slave port range is 0..3).
-#define TRC_STRM_CH 1
-// S2MM DMA channel the trace stream drains into on the MemTile. MemTile DMA
-// couples channel parity to the BD number: an EVEN channel requires BD < 24, an
-// odd channel requires BD >= 24 (driver _XAieMl_MemTileDmaCheckBdChValidity).
-// The setup call below uses BD 4, so this must be an even channel. On the
-// MemTile there is no clash with the movedata channel (that is on the core tile).
-#define TRC_S2MM_CH 0
 
 // Host<->AIE time-sync instrumentation. Emits a machine-readable [TIMESYNC]
 // block (host anchors, per-tile AIE-timer anchors, host phase events, raw trace
@@ -249,16 +236,18 @@ int test_routing(XAie_DevInst *DevInst)
 
     // Arm the core trace unit on tile (4,4) BEFORE the core runs: capture the
     // ACTIVE/stall timeline and route it DOWN through the intervening core tiles
-    // into the same-column top MemTile's memory [TRC_ADDR, TRC_ADDR+TRC_LEN) via
-    // stream channel TRC_STRM_CH and the MemTile's S2MM channel TRC_S2MM_CH. Must
-    // precede XAie_Run (which makes the core active and fires ACTIVE_CORE, opening
-    // the trace window).
+    // into the same-column top MemTile's S2MM DMA. The session helper owns the
+    // fixed-reserved MemTile drain convention (buffer offset, stream channel,
+    // S2MM channel, BD) that the hand code used to spell out. Must precede
+    // XAie_Run (which makes the core active and fires ACTIVE_CORE, opening the
+    // trace window).
 #if TRACE_ENABLE
-    if (__Runtime_core_trace_setup(DevInst, XAie_TileLoc(4, 4), TRC_ADDR | TRC_MEMTILE_DMA_LOAL_OFFSET_ADDR, TRC_LEN,
-                                   /*strm_ch=*/TRC_STRM_CH,
-                                   /*s2mm_ch=*/TRC_S2MM_CH, 4) != XAIE_OK) {
-        printf("[perf] core_trace_setup failed\n");
-    }
+    // Pin the trace stream channel to 1: this tile's output data DMA egresses on
+    // SOUTH channel 0, and the core-trace route is programmed directly (outside
+    // the routing engine's resource manager), so letting it default to slot 0
+    // would put both flows on SOUTH ch 0 and deadlock XAie_RouteDmaWait on the
+    // output DMA. Channel 1 is free here (matches the old hand-coded TRC_STRM_CH).
+    __Runtime_core_trace_begin_ch(DevInst, /*col=*/4, /*row=*/4, /*strm_ch=*/1);
 #endif
 
     printf("after runtimerace\n");
@@ -399,27 +388,15 @@ int test_routing(XAie_DevInst *DevInst)
     TS_ANCHOR(1);
 #endif
 
-    // Core finished: read back the captured trace words from the top MemTile's
-    // memory (row XAIE_AIE_TILE_ROW_START-1 = 2 in the same column) and decode
-    // them into a "cycle EVENT" timeline. The trace was routed there by
-    // __Runtime_core_trace_setup above; the read takes the MemTile loc, not the
-    // core loc.
+    // Core finished: read back and decode every tile armed by
+    // __Runtime_core_trace_begin into the SHARED profile (trc_prof), so the core
+    // trace lands in the same container as the host clock, anchors and phase
+    // events and a single dump below emits one coherent [TIMESYNC] block. The
+    // session helper reads via the MemTile loc, attaches the (col,row) tag and
+    // decodes; it does not init or dump (the caller owns both).
 #if TRACE_ENABLE
-    uint32_t trc_buf[TRC_LEN / 4];
-    int trc_valid = 0;
-    {
-        usleep(1000 * 1000 * 5); // give the S2MM DMA a moment to finish writing the last trace words
-        if (__Runtime_core_trace_read(DevInst, XAie_TileLoc(4, 2), TRC_ADDR, trc_buf, TRC_LEN / 4) == XAIE_OK) {
-            trc_valid = 1;
-            printf("[perf] core trace timeline (core 4,4 -> memtile 4,2):\n");
-            // Tag intervals with the traced core (4,4), not the MemTile read loc.
-            __Runtime_aie_trace_profile_attach(&trc_prof, XAie_TileLoc(4, 4));
-            __Runtime_core_trace_decode(trc_buf, TRC_LEN / 4, &trc_prof);
-            __Runtime_aie_trace_profile_set_trace_words(&trc_prof, XAie_TileLoc(4, 4), TRC_LEN / 4);
-        } else {
-            printf("[perf] core_trace_read failed\n");
-        }
-    }
+    usleep(1000 * 1000 * 5); // give the S2MM DMA a moment to finish writing the last trace words
+    __Runtime_core_trace_end_into(DevInst, &trc_prof);
 #endif
 
     // Emit the whole run as ONE machine-readable [TIMESYNC] block straight from

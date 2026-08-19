@@ -543,6 +543,50 @@ void __Runtime_aie_trace_profile_dump(AieTraceProfile *p);
 void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof);
 
 // ---------------------------------------------------------------------------
+// Declarative core-trace session (auto-injected by #pragma aie_trace).
+// ---------------------------------------------------------------------------
+// A thin session layer over __Runtime_core_trace_setup/read/decode that hides
+// the MemTile drain-resource bookkeeping so the compiler-injected host code is
+// just two opaque calls. The fixed-reserved MemTile convention (S2MM channel,
+// BD parity, high buffer offset) lives entirely inside these two functions.
+//
+// Arm the core trace unit on the compute tile at mesh/partition-relative
+// (col,row) BEFORE the core runs. Reserves this column's trace drain resources
+// by a fixed convention, routes the TRACE stream DOWN into the same-column top
+// MemTile's S2MM DMA, and records the tile in a small static registry (cap
+// AIE_TRACE_SESSION_CAP). Multiple tiles in the SAME column each take a distinct
+// strm_ch/s2mm_ch/BD slot. Silently caps/warns past the registry or per-column
+// slot limits. Idempotent-safe: a repeated (col,row) is ignored.
+void __Runtime_core_trace_begin(XAie_DevInst *dev, uint8_t col, uint8_t row);
+
+// Same as __Runtime_core_trace_begin but PINS the physical stream channel the
+// core->MemTile trace route rides (every hop; 0..3). Pass AIE_TRACE_STRM_CH_AUTO
+// for the default (= per-column slot, what the 3-arg form uses). Pin an explicit
+// channel when a data-plane DMA shares this tile's SOUTH egress: the trace route
+// is programmed directly, outside the routing engine's resource manager, so an
+// auto strm_ch that collides with a data flow on the same SOUTH channel deadlocks
+// that DMA (e.g. example/perf/aieml_perf.cc pins ch 1 to clear its output DMA).
+// Independent of the MemTile S2MM channel/BD (still slot-derived).
+#define AIE_TRACE_STRM_CH_AUTO 0xFFu
+void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch);
+
+// Read back, decode and dump every tile armed by __Runtime_core_trace_begin.
+// Owns a static AieTraceProfile; for each registered tile reads the MemTile
+// trace buffer, attaches the (col,row) tag, decodes into the profile, then
+// emits one [TIMESYNC] block via __Runtime_aie_trace_profile_dump. Clears the
+// registry. Call AFTER the cores have finished (post kernel-group wait), before
+// device teardown. No-op when no tile was armed.
+void __Runtime_core_trace_end(XAie_DevInst *dev);
+
+// Same read+decode as __Runtime_core_trace_end, but decodes every armed tile
+// into a CALLER-supplied profile and does NOT init or dump it. Use this when the
+// core trace must be unified with other timeline data (host clock, TS_ANCHOR
+// host<->AIE anchors, TS_EVT phase events) inside ONE AieTraceProfile so a single
+// __Runtime_aie_trace_profile_dump emits one coherent [TIMESYNC] block (e.g.
+// example/perf/aieml_perf.cc). Clears the registry. No-op when no tile was armed.
+void __Runtime_core_trace_end_into(XAie_DevInst *dev, AieTraceProfile *prof);
+
+// ---------------------------------------------------------------------------
 // DMA-capable buffer allocation with cache sync support
 // ---------------------------------------------------------------------------
 

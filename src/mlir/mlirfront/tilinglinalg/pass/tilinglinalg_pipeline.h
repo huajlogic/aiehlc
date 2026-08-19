@@ -303,11 +303,15 @@ public:
     ///   order. Used to resolve IR-sourced builtins whose value comes from the
     ///   routing.partitiontensor TilingAttr (get_arg_per_round_size_in_dim(dim,
     ///   port)) rather than frontend scalars. Empty => no IR-sourced resolution.
+    /// traceTiles: compute tiles (mesh/partition-relative {col,row}) to core-trace,
+    ///   from #pragma aie_trace. When non-empty, CoreTraceInsertPass injects
+    ///   __Runtime_core_trace_begin/_end into the generated host.cc. Empty => no-op.
     static bool runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp module, const std::string &outputDir,
                             const std::string &userKernelBody = "", const std::string &userKernelFuncName = "",
                             int runtimeDebugLevel = -1, const std::string &userRewrittenSource = "",
                             const std::vector<TensorParam> &tensors = {}, int64_t maxPingPongBytes = 4096,
                             const std::string &aieGen = "Gen2", const std::string &hostFuncSuffix = "",
                             bool appendMode = false, unsigned *numHostDdrArgs = nullptr,
-                            const std::vector<std::string> &portVarNames = {});
+                            const std::vector<std::string> &portVarNames = {},
+                            const std::vector<std::pair<int, int>> &traceTiles = {});
 };

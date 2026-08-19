@@ -528,6 +528,19 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
 
     echo "${runtime_source_file}" > "${WORKLOCAL_DIR}/app_source.txt"
 
+    # Convert the routing resource map JSON into a C header compiled into the host.
+    # Non-fatal: header generation must never break the build (set -e is active).
+    if [ -f "${WORKLOCAL_DIR}/routingresourcemap.json" ]; then
+        echo "Generating routing resource map header..."
+        if python3 "${AIEHLC_DIR}/src/tool/debug/resource_json_to_header.py" \
+                "${WORKLOCAL_DIR}/routingresourcemap.json" \
+                --out "${WORKLOCAL_DIR}/aie_resource_map.h"; then
+            echo "    ${WORKLOCAL_DIR}/aie_resource_map.h"
+        else
+            echo "    warning: resource_json_to_header.py failed (non-fatal); skipping header."
+        fi
+    fi
+
     # Run hostcompile.sh with WORKLOCAL_DIR pointing at aout/worklocal.
     hc_extra_defs="${EXTRA_DEFS:-}"
     if [ "${SKIP_BSS}" -eq 1 ]; then

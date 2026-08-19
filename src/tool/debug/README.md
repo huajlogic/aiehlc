@@ -149,6 +149,33 @@ helpers `dma status`, `bd`, `event`, `pc`. Flags mirror `aiediag`
 (`--startcol`, `--aie-version`, `--json-dir`, `--device`). `--server` runs a
 framed stdin/stdout REPL used by the debug daemon.
 
+### Tile scope: `show switch` / `scan switch` (stream-switch read-back)
+
+Two **read-only** tile-scope commands decode the AIE stream switch from its
+configuration registers (`aiediag.read_switch` / `format_switch`):
+
+```bash
+# Decode THIS tile's stream switch: every enabled master, the slave feeding it,
+# circuit vs packet mode, enabled slaves and their packet slots.
+python3 src/tool/debug/aiegdb.py -c "tile 0 3; show switch"   # alias: switch
+
+# Flow-trace every configured connection through this tile: BFS the reachable
+# set of tiles along enabled directional ports (up + downstream), read each
+# switch, then print the assembled end-to-end flows, e.g.
+#   DMA0@(0,3) -> NORTH0@(0,3) -> NORTH0@(0,4) -> CORE0@(0,5)
+python3 src/tool/debug/aiegdb.py -c "tile 0 3; scan switch"
+```
+
+A master-config register's `CONFIGURATION` field is the *physical slave index*
+feeding it (driver `_XAie_StreamSwitchConfigureCct`), so the decode maps each
+enabled master directly back to its source slave. Register bases are identical
+for gen5 (aieml) and gen 2ps: core/shim master `0x3F000` / slave `0x3F100` /
+slot `0x3F200`; memtile `0xB0000` / `0xB0100` / `0xB0200`. Port maps and
+inter-tile wiring (NORTH↔SOUTH, EAST↔WEST; shim SOUTH = PL/NoC/DDR terminal;
+memtiles have no EAST/WEST) are transcribed from `xaie2psgbl_reginit.c`. Both
+commands are non-intrusive (no writes) and cycle-safe (BFS `visited` +
+per-branch recursion guard).
+
 ### `COMMAND_SPEC` — the one grammar definition
 
 `COMMAND_SPEC` (module level, keyed `universal` / `partition` / `tile` /

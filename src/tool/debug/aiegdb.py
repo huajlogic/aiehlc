@@ -109,6 +109,10 @@ COMMAND_SPEC = {
         _cmd("core event", "full core-module event list (0x34200..; core tiles)",
              aliases=("core events", "event core")),
         _cmd("channels", "list this tile's DMA channels", aliases=("chans",)),
+        _cmd("show switch", "decoded stream-switch config for this tile",
+             aliases=("switch", "switches")),
+        _cmd("scan switch", "flow-trace all stream connections through this tile",
+             aliases=("scanswitch",)),
         _cmd("log", "dump the kernel klog buffer (core tiles only)",
              aliases=("klog",)),
     ],
@@ -811,6 +815,17 @@ class AieGdb:
         if verb in ("channels", "chans"):
             self._list_channels()
             return
+        # `show switch` / `switch` -> decoded stream-switch config. Intercepted
+        # BEFORE the generic passthrough so aiedbg's `show cores`/`scan dma`
+        # still pass through untouched.
+        if (verb in ("switch", "switches")
+                or (verb == "show" and args and args[0] in ("switch", "switches"))):
+            self._show_switch()
+            return
+        if (verb == "scanswitch"
+                or (verb == "scan" and args and args[0] == "switch")):
+            self._scan_switch()
+            return
         if verb == "reg" and args and args[0] in ("read", "write"):
             self._passthrough(["reg", args[0], str(pc), str(row)] + args[1:])
             return
@@ -937,6 +952,182 @@ class AieGdb:
                 break
         if not found:
             print(f"  tile ({col},{row}) not found in schedule_view.json")
+
+    # ---- stream switch (show switch / scan switch) -----------------------
+    def _read_switch_at(self, col, row):
+        """Read+decode the stream switch of the tile at logical (col,row).
+        phys_col = col + startcol; tile type derived from the row."""
+        phys_col = col + self.startcol
+        ttype = aiediag.tile_type_for_row(row, self.aie_version)
+        dec = aiediag.read_switch(ttype, lambda off: self._reg_read(phys_col, row, off))
+        return phys_col, ttype, dec
+
+    def _show_switch(self):
+        col, row = self.tile["col"], self.tile["row"]
+        phys_col, ttype, dec = self._read_switch_at(col, row)
+        print(aiediag.format_switch(phys_col, row, ttype, dec))
+
+    def _switch_neighbors(self, col, row, dec):
+        """On-array neighbor tiles reachable from this tile's enabled
+        directional ports. An enabled MASTER hops out; an enabled directional
+        SLAVE means an upstream neighbor feeds in (walk it too). Returns a set
+        of (ncol, nrow)."""
+        out = set()
+        for m in dec["masters"]:
+            if not m["enable"]:
+                continue
+            nb = aiediag.master_neighbor(col, row, m["type"], m["num"],
+                                         self.aie_version)
+            if nb and nb[0] == "tile":
+                out.add((nb[1], nb[2]))
+        # Upstream: a directional enabled slave is fed by the opposite-direction
+        # master of the adjacent tile — same delta as a master hop of that dir.
+        for s in dec["slaves"]:
+            if not s["enable"] or s["type"] not in aiediag._DIR_DELTA:
+                continue
+            if s["type"] == "SOUTH" and row == 0:
+                continue  # shim SOUTH = PL/NoC boundary, no tile there
+            dcr = aiediag._DIR_DELTA[s["type"]]
+            ncol, nrow = col + dcr[0], row + dcr[1]
+            if ncol >= 0 and nrow >= 0:
+                out.add((ncol, nrow))
+        return out
+
+    def _scan_switch(self):
+        """Flow-trace: BFS the reachable set of tiles from this one along
+        enabled directional ports, read each switch, then assemble the
+        end-to-end flows that pass through the origin tile."""
+        origin = (self.tile["col"], self.tile["row"])
+        switches = {}          # (col,row) -> decoded switch
+        meta = {}              # (col,row) -> (phys_col, ttype)
+        visited = set()
+        queue = [origin]
+        while queue:
+            cr = queue.pop(0)
+            if cr in visited:
+                continue
+            visited.add(cr)
+            col, row = cr
+            phys_col, ttype, dec = self._read_switch_at(col, row)
+            switches[cr] = dec
+            meta[cr] = (phys_col, ttype)
+            for nb in self._switch_neighbors(col, row, dec):
+                if nb not in visited:
+                    queue.append(nb)
+        # Per-tile decoded config.
+        print(aiediag.bold(f"== stream switches reachable from tile{origin} "
+                           f"({len(visited)} tiles) =="))
+        for cr in sorted(visited):
+            phys_col, ttype = meta[cr]
+            print(aiediag.format_switch(phys_col, cr[1], ttype, switches[cr]))
+        # Assemble end-to-end flows for every enabled master of the origin tile.
+        print(aiediag.bold(f"== flows through tile{origin} =="))
+        chains = self._assemble_flows(origin, switches)
+        if not chains:
+            print("  (no enabled connections through this tile)")
+        for chain in chains:
+            print("  " + chain)
+
+    def _slave_source(self, cr, slave_type, slave_num, switches):
+        """Walk one hop UPSTREAM from a directional slave port of tile `cr`: the
+        neighbor whose opposite-direction master feeds it. Returns
+        (upstream_cr, master_port_label) or None (terminal / off-grid / not
+        discovered)."""
+        if slave_type not in aiediag._OPPOSITE_DIR:
+            return None
+        if slave_type == "SOUTH" and cr[1] == 0:
+            return None
+        dcr = aiediag._DIR_DELTA[slave_type]
+        up = (cr[0] + dcr[0], cr[1] + dcr[1])
+        if up[0] < 0 or up[1] < 0 or up not in switches:
+            return None
+        return up, aiediag.port_label(aiediag._OPPOSITE_DIR[slave_type], slave_num)
+
+    def _port_at(self, cr):
+        """'(phys_col,row)' for readability."""
+        return f"({cr[0] + self.startcol},{cr[1]})"
+
+    def _assemble_flows(self, origin, switches):
+        """For each enabled master of the origin tile, walk upstream to its
+        source and downstream to its sink(s); return printable chain strings.
+        Nodes are `PORT@(c,r)`; upstream ends at the origin master and each
+        downstream tail lists the nodes after it, so nothing is duplicated."""
+        chains = []
+        dec = switches.get(origin)
+        if not dec:
+            return chains
+        for m in dec["masters"]:
+            if not m["enable"]:
+                continue
+            up_nodes = self._trace_upstream(origin, m, switches, set())
+            for tail in self._trace_downstream(origin, m, switches, set()):
+                chains.append(" -> ".join(up_nodes + tail))
+        return chains
+
+    def _trace_upstream(self, cr, master, switches, guard):
+        """Follow master.config (its source slave) back toward the flow origin.
+        Returns a node list ending with this master, e.g.
+        ['DMA0@(0,2)', 'NORTH0@(0,2)']. `guard` makes a cycle terminate."""
+        here = f"{master['port']}@{self._port_at(cr)}"
+        if cr in guard:
+            return [here]
+        guard = guard | {cr}
+        slave_ports = aiediag.STRM_SW_SLAVE_PORTS[
+            aiediag.tile_type_for_row(cr[1], self.aie_version)]
+        idx = master["config"]
+        if not (0 <= idx < len(slave_ports)):
+            return [f"slave#{idx}?@{self._port_at(cr)}", here]
+        st, sn = slave_ports[idx]
+        src_label = f"{aiediag.port_label(st, sn)}@{self._port_at(cr)}"
+        if st in aiediag.STRM_SW_TERMINALS:
+            return [src_label, here]
+        src = self._slave_source(cr, st, sn, switches)
+        if src is None:
+            return [src_label, here]
+        up_cr, up_label = src
+        up_dec = switches.get(up_cr)
+        up_master = next((mm for mm in up_dec["masters"]
+                          if mm["port"] == up_label and mm["enable"]),
+                         None) if up_dec else None
+        if up_master is None:
+            return [src_label, here]
+        return self._trace_upstream(up_cr, up_master, switches, guard) + [here]
+
+    def _trace_downstream(self, cr, master, switches, guard):
+        """From an enabled master, hop to the neighbor and follow every enabled
+        master the arriving slave feeds. Returns a list of node-lists (the nodes
+        AFTER master@cr). `guard` on (tile,slave) makes a cycle terminate."""
+        nb = aiediag.master_neighbor(cr[0], cr[1], master["type"], master["num"],
+                                     self.aie_version)
+        if nb is None:
+            return [["<off-grid>"]]
+        if nb[0] == "terminal":
+            # A non-directional master IS the endpoint (already in the chain);
+            # the shim SOUTH boundary adds an explicit PL/NoC/DDR terminal.
+            if master["type"] in aiediag.STRM_SW_TERMINALS:
+                return [[]]
+            return [[nb[1]]]
+        ncr, arr = (nb[1], nb[2]), (nb[3], nb[4])
+        arr_lbl = aiediag.port_label(*arr)
+        key = (ncr, arr_lbl)
+        if key in guard:
+            return [[f"[{arr_lbl}]@{self._port_at(ncr)} (cycle)"]]
+        guard = guard | {key}
+        ndec = switches.get(ncr)
+        if ndec is None:
+            return [[f"[{arr_lbl}]@{self._port_at(ncr)}"]]
+        nttype = aiediag.tile_type_for_row(ncr[1], self.aie_version)
+        try:
+            arr_idx = aiediag.STRM_SW_SLAVE_PORTS[nttype].index(arr)
+        except ValueError:
+            return [[f"[{arr_lbl}]@{self._port_at(ncr)}"]]
+        tails = []
+        for mm in ndec["masters"]:
+            if mm["enable"] and mm["config"] == arr_idx:
+                node = f"{mm['port']}@{self._port_at(ncr)}"
+                for sub in self._trace_downstream(ncr, mm, switches, guard):
+                    tails.append([node] + sub)
+        return tails or [[f"[{arr_lbl}]@{self._port_at(ncr)} (sink)"]]
 
     # ---- channel scope ---------------------------------------------------
     def _channel_cmd(self, verb, args, parts):
@@ -1175,6 +1366,8 @@ class AieGdb:
             print("  event                   event-status regs (decoded)")
             print("  log | klog              dump kernel klog buffer (core tiles only)")
             print("  channels | chans        list this tile's channels")
+            print("  show switch | switch    decoded stream-switch config")
+            print("  scan switch             flow-trace connections through this tile")
             print("  reg read OFF | reg write OFF VAL | mem read ADDR LEN")
             print("  scan .. | tile list | show ..   (array-wide passthrough)")
         else:
