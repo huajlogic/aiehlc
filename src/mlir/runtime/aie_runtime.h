@@ -578,12 +578,24 @@ void __Runtime_core_trace_begin(XAie_DevInst *dev, uint8_t col, uint8_t row);
 #define AIE_TRACE_STRM_CH_AUTO 0xFFu
 void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch);
 
+// Start host<->AIE time correlation for the tiles armed by
+// __Runtime_core_trace_begin. Inits a process-global AieTraceProfile, records
+// the host clock (cps) and anchor0 (host time + each armed tile's AIE core
+// timer). Call AFTER all __Runtime_core_trace_begin calls and just BEFORE the
+// cores run (before __Runtime_launch_kernel_group). When present, the paired
+// __Runtime_core_trace_end captures anchor1 and dumps the FULL [TIMESYNC] block
+// (cps/anchor0/anchor1/trace) that host_aie_timeline.correlate() needs; when
+// absent, __Runtime_core_trace_end stays decode-only (trace lines only). No-op
+// when no tile was armed, or (cps=0, so still decode-only) under the simulator.
+void __Runtime_core_trace_sync_begin(XAie_DevInst *dev);
+
 // Read back, decode and dump every tile armed by __Runtime_core_trace_begin.
 // Owns a static AieTraceProfile; for each registered tile reads the MemTile
 // trace buffer, attaches the (col,row) tag, decodes into the profile, then
 // emits one [TIMESYNC] block via __Runtime_aie_trace_profile_dump. Clears the
 // registry. Call AFTER the cores have finished (post kernel-group wait), before
-// device teardown. No-op when no tile was armed.
+// device teardown. No-op when no tile was armed. If __Runtime_core_trace_sync_begin
+// ran this session, uses that correlated profile (adds anchor1) instead.
 void __Runtime_core_trace_end(XAie_DevInst *dev);
 
 // Same read+decode as __Runtime_core_trace_end, but decodes every armed tile

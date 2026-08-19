@@ -1211,6 +1211,71 @@ static uint32_t s_trace_session_n = 0;
 #define AIE_TRACE_MAX_COLS 64u
 static uint8_t s_trace_col_used[AIE_TRACE_MAX_COLS];
 
+/* ---------------------------------------------------------------------------
+ * Host<->AIE time-sync for the auto-injected core-trace session.
+ *
+ * When __Runtime_core_trace_sync_begin is called before the kernels run, the
+ * decode-only path (a fresh local profile in __Runtime_core_trace_end) is
+ * upgraded to a correlated one: a process-global profile carries the host clock
+ * (cps) plus two anchors (anchor0 before launch, anchor1 at end), so
+ * __Runtime_aie_trace_profile_dump emits the FULL [TIMESYNC] block
+ * (cps/anchor0/anchor1/trace) that host_aie_timeline.correlate() needs to map
+ * AIE core cycles onto the host microsecond axis. Mirrors the hand-written
+ * TS_ANCHOR/TS_EVT wiring in example/perf/aieml_perf.cc, but reuses the armed
+ * s_trace_session registry so the generated host only emits one extra call.
+ * ------------------------------------------------------------------------- */
+static AieTraceProfile s_trace_sync_prof; /* correlated sink; fixed capacity   */
+static int s_trace_sync_active = 0;       /* 1 once sync_begin ran this run     */
+
+/* Host wall clock. On baremetal the Xilinx global timer (XTime) is the same
+ * source aieml_perf.cc uses; under the simulator there is no board clock, so
+ * cps=0 keeps the dump in decode-only mode (the cps/anchor lines are gated on a
+ * non-zero cps in __Runtime_aie_trace_profile_dump). */
+#ifndef __AIESIM__
+/* BSP header split: newer cortexa78/VEK385 BSPs expose XTime via the XilTimer
+ * library (xiltimer.h + COUNTS_PER_SECOND in xtimer_config.h); older psv_*
+ * (VCK190-class) BSPs use the legacy xtime_l.h. Both declare XTime and
+ * XTime_GetTime, so pick the header that is actually present. */
+#if defined(__has_include) && __has_include("xiltimer.h")
+#include "xiltimer.h"
+#include "xtimer_config.h"
+#else
+#include "xtime_l.h"
+#endif
+static inline uint64_t __aie_host_now(void) {
+    XTime t;
+    XTime_GetTime(&t);
+    return (uint64_t)t;
+}
+static inline uint64_t __aie_host_cps(void) { return (uint64_t)COUNTS_PER_SECOND; }
+#else
+static inline uint64_t __aie_host_now(void) { return 0; }
+static inline uint64_t __aie_host_cps(void) { return 0; }
+#endif
+
+/* Capture one anchor (which=0 before launch, 1 at end) for every armed tile:
+ * host-before -> read each armed tile's AIE core timer -> host-after; the
+ * anchor's host value is the midpoint, since XAie_ReadTimer has ~us AXI-MM
+ * latency (same rationale as aieml_perf.cc TS_ANCHOR). */
+static void __aie_trace_anchor_all(XAie_DevInst *dev, int which) {
+    if (!dev || s_trace_session_n == 0)
+        return;
+    uint64_t hb = __aie_host_now();
+    uint64_t av[AIE_TRACE_SESSION_CAP] = {0};
+    for (uint32_t i = 0; i < s_trace_session_n; i++) {
+        XAie_LocType core = XAie_TileLoc(s_trace_session[i].col, s_trace_session[i].row);
+        uint64_t v = 0;
+        __Runtime_read_aie_timer(dev, core, &v);
+        av[i] = v;
+    }
+    uint64_t ha = __aie_host_now();
+    uint64_t hm = hb + (ha - hb) / 2;
+    for (uint32_t i = 0; i < s_trace_session_n; i++) {
+        XAie_LocType core = XAie_TileLoc(s_trace_session[i].col, s_trace_session[i].row);
+        __Runtime_aie_trace_profile_anchor(&s_trace_sync_prof, which, core, av[i], hm);
+    }
+}
+
 void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg) {
     if (!dev) {
         printf("[aie_runtime] core_trace_begin: NULL dev, ignored\n");
@@ -1348,9 +1413,35 @@ void __Runtime_core_trace_end_into(XAie_DevInst *dev, AieTraceProfile *prof) {
         s_trace_col_used[c] = 0;
 }
 
+void __Runtime_core_trace_sync_begin(XAie_DevInst *dev) {
+    if (s_trace_session_n == 0)
+        return; /* nothing armed: sync stays off, decode-only path unaffected */
+    if (!dev) {
+        printf("[aie_runtime] core_trace_sync_begin: NULL dev; time-sync disabled\n");
+        return;
+    }
+    __Runtime_aie_trace_profile_init(&s_trace_sync_prof);
+    __Runtime_aie_trace_profile_set_clock(&s_trace_sync_prof, __aie_host_cps());
+    __aie_trace_anchor_all(dev, 0); /* anchor0: just before the cores run */
+    s_trace_sync_active = 1;
+    printf("[aie_runtime] core_trace_sync_begin: armed %u tile(s), cps=%llu\n", (unsigned)s_trace_session_n,
+           (unsigned long long)__aie_host_cps());
+}
+
 void __Runtime_core_trace_end(XAie_DevInst *dev) {
     if (s_trace_session_n == 0)
         return; /* nothing armed: clean no-op */
+    /* Correlated path: sync_begin recorded cps + anchor0 into the global
+     * profile, so capture anchor1 now, drain the trace into that SAME profile
+     * and dump the full [TIMESYNC] block (cps/anchor0/anchor1/trace). */
+    if (s_trace_sync_active) {
+        __aie_trace_anchor_all(dev, 1); /* anchor1: cores have finished */
+        __Runtime_core_trace_end_into(dev, &s_trace_sync_prof);
+        __Runtime_aie_trace_profile_dump(&s_trace_sync_prof);
+        s_trace_sync_active = 0;
+        return;
+    }
+    /* Decode-only path (no sync_begin): fresh local profile, trace lines only. */
     static AieTraceProfile trc_prof;
     __Runtime_aie_trace_profile_init(&trc_prof);
     __Runtime_core_trace_end_into(dev, &trc_prof);
