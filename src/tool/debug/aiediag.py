@@ -888,6 +888,198 @@ def format_dma_status(col, row, direction, channel, decoded):
 
     return "\n".join(lines)
 
+# ─── Stream-switch config (show switch / scan switch) ─────────────────────────
+# Base offsets are identical for gen5 (aieml) and gen 2ps (verified
+# xaie2psgbl_params.h vs xaiemlgbl_params.h). One table serves both. Per tile:
+#   core/shim  master 0x3F000  slave 0x3F100  slot 0x3F200
+#   memtile    master 0xB0000  slave 0xB0100  slot 0xB0200
+# Config regs stride 0x4, indexed by physical port number. Slot regs: 4 slots
+# per slave, stride 0x4 (0x10 per slave).  Source: xaie2psgbl_params.h:3990+
+# (master), :4450+ (slave), :4750+ (slot).
+STRM_SW_BASE = {
+    "core":    {"master": 0x3F000, "slave": 0x3F100, "slot": 0x3F200},
+    "shim":    {"master": 0x3F000, "slave": 0x3F100, "slot": 0x3F200},
+    "memtile": {"master": 0xB0000, "slave": 0xB0100, "slot": 0xB0200},
+}
+STRM_SW_CFG_STRIDE = 0x4     # between adjacent master (or slave) config regs
+STRM_SW_SLOT_STRIDE = 0x4    # between adjacent slots of the same slave
+STRM_SW_SLOTS_PER_SLAVE = 4
+
+
+def _ports(*spec):
+    """Expand (port_type, count) pairs into an ordered [(port_type, num), ...]
+    list matching the driver's PhyPort tables (xaie2psgbl_reginit.c)."""
+    out = []
+    for ptype, count in spec:
+        for n in range(count):
+            out.append((ptype, n))
+    return out
+
+# Physical port maps transcribed from xaie2psgbl_reginit.c. Index = PhyPort.
+# Core master reginit.c:740, slave :859; Shim master :988, slave :1102;
+# MemTile master :1221, slave :1310.
+STRM_SW_MASTER_PORTS = {
+    "core": _ports(("CORE", 1), ("DMA", 2), ("CTRL", 1), ("FIFO", 1),
+                   ("SOUTH", 4), ("WEST", 4), ("NORTH", 6), ("EAST", 4)),
+    "shim": _ports(("CTRL", 1), ("FIFO", 1),
+                   ("SOUTH", 6), ("WEST", 4), ("NORTH", 6), ("EAST", 4)),
+    "memtile": _ports(("DMA", 6), ("CTRL", 1), ("SOUTH", 4), ("NORTH", 6)),
+}
+STRM_SW_SLAVE_PORTS = {
+    "core": _ports(("CORE", 1), ("DMA", 2), ("CTRL", 1), ("FIFO", 1),
+                   ("SOUTH", 6), ("WEST", 4), ("NORTH", 4), ("EAST", 4),
+                   ("TRACE", 2)),
+    "shim": _ports(("CTRL", 1), ("FIFO", 1),
+                   ("SOUTH", 8), ("WEST", 4), ("NORTH", 4), ("EAST", 4),
+                   ("TRACE", 1)),
+    "memtile": _ports(("DMA", 6), ("CTRL", 1), ("SOUTH", 4), ("NORTH", 6),
+                      ("TRACE", 1)),
+}
+# Non-directional terminal port types: a flow ends here (kernel/DMA/etc), it
+# does not hop to a neighbor tile.
+STRM_SW_TERMINALS = {"CORE", "DMA", "CTRL", "TRACE", "FIFO"}
+
+
+def strm_master_off(tile_type, phy_idx):
+    """Register offset of master-config reg for physical master port index."""
+    return STRM_SW_BASE[tile_type]["master"] + phy_idx * STRM_SW_CFG_STRIDE
+
+def strm_slave_off(tile_type, phy_idx):
+    """Register offset of slave-config reg for physical slave port index."""
+    return STRM_SW_BASE[tile_type]["slave"] + phy_idx * STRM_SW_CFG_STRIDE
+
+def strm_slot_off(tile_type, slave_idx, slot):
+    """Register offset of slot `slot` (0..3) of physical slave `slave_idx`."""
+    base = STRM_SW_BASE[tile_type]["slot"]
+    return base + slave_idx * (STRM_SW_SLOTS_PER_SLAVE * STRM_SW_SLOT_STRIDE) \
+        + slot * STRM_SW_SLOT_STRIDE
+
+def port_label(port_type, num):
+    """e.g. ("NORTH", 2) -> 'NORTH2', ("DMA", 0) -> 'DMA0'."""
+    return f"{port_type}{num}"
+
+def decode_strm_master(raw):
+    """Decode a master-config reg. CONFIGURATION = physical slave index feeding
+    this master (driver _StrmConfigMstr writes SlaveIdx there; xaie_ss.c:154)."""
+    return {
+        "raw": raw,
+        "enable": bool(raw & 0x80000000),
+        "packet": bool(raw & 0x40000000),
+        "drop_header": bool(raw & 0x00000080),
+        "config": raw & 0x7F,   # source slave physical index
+    }
+
+def decode_strm_slave(raw):
+    """Decode a slave-config reg (SLAVE_ENABLE bit31, PACKET_ENABLE bit30)."""
+    return {
+        "raw": raw,
+        "enable": bool(raw & 0x80000000),
+        "packet": bool(raw & 0x40000000),
+    }
+
+def decode_strm_slot(raw):
+    """Decode a slave slot reg: ID[28:24] MASK[20:16] ENABLE[8] MSEL[5:4]
+    ARBITER[2:0]."""
+    return {
+        "raw": raw,
+        "id": (raw >> 24) & 0x1F,
+        "mask": (raw >> 16) & 0x1F,
+        "enable": bool(raw & (1 << 8)),
+        "msel": (raw >> 4) & 0x3,
+        "arbiter": raw & 0x7,
+    }
+
+def read_switch(tile_type, reader):
+    """Read + decode the whole stream switch of one tile.
+
+    `reader(off)` returns the raw 32-bit value at register offset `off` (aiegdb
+    passes a live read; tests inject a fake). Returns a structured dict:
+      {"masters": [{"idx","port","type","num", <master fields>}...],
+       "slaves":  [{"idx","port","type","num", <slave fields>,
+                    "slots":[<slot fields>...]}...]}
+    Only enabled masters read their source slot detail (best-effort)."""
+    masters = []
+    for i, (ptype, num) in enumerate(STRM_SW_MASTER_PORTS[tile_type]):
+        raw = reader(strm_master_off(tile_type, i))
+        dec = decode_strm_master(0 if raw is None else raw)
+        dec.update({"idx": i, "type": ptype, "num": num,
+                    "port": port_label(ptype, num)})
+        masters.append(dec)
+    slaves = []
+    for i, (ptype, num) in enumerate(STRM_SW_SLAVE_PORTS[tile_type]):
+        raw = reader(strm_slave_off(tile_type, i))
+        dec = decode_strm_slave(0 if raw is None else raw)
+        dec.update({"idx": i, "type": ptype, "num": num,
+                    "port": port_label(ptype, num), "slots": []})
+        if dec["packet"] and dec["enable"]:
+            for s in range(STRM_SW_SLOTS_PER_SLAVE):
+                sraw = reader(strm_slot_off(tile_type, i, s))
+                sdec = decode_strm_slot(0 if sraw is None else sraw)
+                if sdec["enable"]:
+                    sdec["slot"] = s
+                    dec["slots"].append(sdec)
+        slaves.append(dec)
+    return {"masters": masters, "slaves": slaves}
+
+# Inter-tile adjacency: a directional MASTER crosses to the neighbor's SLAVE of
+# the opposite direction, same PortNum (fixed physical wiring).
+_OPPOSITE_DIR = {"NORTH": "SOUTH", "SOUTH": "NORTH",
+                 "EAST": "WEST", "WEST": "EAST"}
+_DIR_DELTA = {"NORTH": (0, 1), "SOUTH": (0, -1),
+              "EAST": (1, 0), "WEST": (-1, 0)}
+
+
+def master_neighbor(col, row, port_type, num, aie_version="5"):
+    """Where a directional master port leads. Returns
+    ("tile", ncol, nrow, slave_type, num) for an on-array hop, or
+    ("terminal", label) for a flow endpoint (non-directional port or the shim
+    SOUTH boundary = PL/NoC/DDR). Returns None for an off-grid hop."""
+    if port_type in STRM_SW_TERMINALS:
+        return ("terminal", port_label(port_type, num))
+    if port_type not in _DIR_DELTA:
+        return None
+    # Shim (row 0) SOUTH master is the PL/NoC/DDR boundary, not a tile hop.
+    if port_type == "SOUTH" and row == 0:
+        return ("terminal", f"PL/NoC/DDR:{port_label(port_type, num)}")
+    dc, dr = _DIR_DELTA[port_type]
+    ncol, nrow = col + dc, row + dr
+    if ncol < 0 or nrow < 0:
+        return None
+    return ("tile", ncol, nrow, _OPPOSITE_DIR[port_type], num)
+
+
+def format_switch(phys_col, row, tile_type, decoded):
+    """Render `show switch`: each enabled master, the slave feeding it, circuit
+    vs packet mode, plus enabled slaves and their packet slots."""
+    slave_ports = STRM_SW_SLAVE_PORTS[tile_type]
+    lines = [f"  stream switch tile({phys_col},{row})  [{tile_type}]"]
+    en_masters = [m for m in decoded["masters"] if m["enable"]]
+    if not en_masters:
+        lines.append(dim("    (no enabled master ports)"))
+    for m in en_masters:
+        src_idx = m["config"]
+        if 0 <= src_idx < len(slave_ports):
+            st, sn = slave_ports[src_idx]
+            src = port_label(st, sn)
+        else:
+            src = f"slave#{src_idx}?"
+        mode = "packet" if m["packet"] else "circuit"
+        extra = "  drop_header" if m["drop_header"] else ""
+        lines.append(green(f"    {src:>8} -> {m['port']:<8}  [{mode}]{extra}"))
+    en_slaves = [s for s in decoded["slaves"] if s["enable"]]
+    if en_slaves:
+        lines.append("    enabled slaves: " +
+                     ", ".join(f"{s['port']}"
+                               f"{'(pkt)' if s['packet'] else ''}"
+                               for s in en_slaves))
+    for s in en_slaves:
+        for slot in s["slots"]:
+            lines.append(cyan(
+                f"      slot {s['port']} #{slot['slot']}: id=0x{slot['id']:X} "
+                f"mask=0x{slot['mask']:X} msel={slot['msel']} "
+                f"arbiter={slot['arbiter']}"))
+    return "\n".join(lines)
+
 # ─── Shim event status ────────────────────────────────────────────────────
 
 def load_shim_events_json(path):

@@ -7,6 +7,9 @@
 #include "simplematmul.h"
 // #pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
 #pragma aie_debug_level(0 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
+// Declarative per-tile core trace: mesh/partition-relative (col,row) of the
+// compute tile to trace. Repeatable; supports ranges e.g. #pragma aie_trace(1:2, 3).
+#pragma aie_trace(0, 3)
 // Composition-based spatial spaces: a generic SpatialPolicy composed with a
 // PER-PORT 2D iteration space. Each port describes its OWN matrix via d1/d2:
 //   win_a A=[M,K] -> d1 = M-tile,  d2 = K-chunk

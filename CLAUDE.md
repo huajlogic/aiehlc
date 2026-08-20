@@ -101,7 +101,7 @@ Each dialect has `td/` (TableGen), `gen.sh` (runs mlir-tblgen), and `inc/` (gene
 
 ## Test and Verification
 
-### Unitest CLI 
+### Unitest CLI
 
 ```bash
 source script/aiehlc.sh --aie-version 5 --runtime-source-file ./example/tileprogram/ccode/simplematmul.cc

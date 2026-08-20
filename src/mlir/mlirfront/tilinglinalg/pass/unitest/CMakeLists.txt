@@ -76,6 +76,7 @@ include_directories(../passschedulesequentialop/)
 include_directories(../passwaitmerge/)
 include_directories(../passdfscheduletoapi/)
 include_directories(../passdfscheduletokernelapi/)
+include_directories(../passcoretraceinsert/)
 include_directories(../passdmaphopprovenancemap/)
 include_directories(../passdfscheduleprovenancemap/)
 include_directories(../passroutingprovenancemap/)
@@ -119,6 +120,7 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passwaitmerge/passwaitmerge.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdfscheduletoapi/passdfscheduletoapi.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdfscheduletokernelapi/passdfscheduletokernelapi.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passcoretraceinsert/passcoretraceinsert.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphopprovenancemap/passdmaphopprovenancemap.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdfscheduleprovenancemap/passdfscheduleprovenancemap.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passroutingprovenancemap/passroutingprovenancemap.cpp

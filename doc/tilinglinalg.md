@@ -295,6 +295,48 @@ Used only for `routing.cc` generation (stream switch configuration C code).
 |------|---------|
 | `RoutingDeadArgPass` | Remove unused function arguments and update call sites |
 | `RoutingConstantFoldPass` | Fold constant operands into `emitc.call` args, remove dead EmitC ops |
+| `CoreTraceInsertPass` | Inject `__Runtime_core_trace_begin/_end` for `#pragma aie_trace` tiles (host path, after `RoutingConstantFoldPass`) |
+
+### 3.12 Declarative core trace (`#pragma aie_trace`)
+
+A user of the tilinglinalg flow can request per-tile core trace with a pragma in
+the runtime source (mesh/partition-relative compute-tile `col,row`):
+
+```cpp
+#pragma aie_trace(2, 3)      // trace one compute tile (col=2, row=3)
+#pragma aie_trace(1:2, 3)    // column range -> tiles (1,3),(2,3)
+```
+
+Repeatable; each line accumulates and the col×row rectangle is expanded and
+deduplicated. `aiehlc.cc`'s `AieTracePragmaHandler` collects the tiles into
+`parsedTraceTiles`, threaded through `TilingLinalgPipeline::runPipeline` to
+`CoreTraceInsertPass`, which emits into `emitc.func @host_canonicalized`:
+
+- `__Runtime_core_trace_begin(dev, col, row)` before `__Runtime_launch_kernel_group`
+- `__Runtime_core_trace_end(dev)` before `__Runtime_device_teardown` (or the
+  function terminator if none)
+
+The runtime session helpers (`src/mlir/runtime/aie_runtime.c`) hide the
+fixed-reserved MemTile drain convention (per-column S2MM channel/BD/buffer slot)
+and the `AieTraceProfile` capture/decode/dump bookkeeping. The pass is a clean
+no-op when no `#pragma aie_trace` is present.
+
+`__Runtime_core_trace_end(dev)` owns a private profile and dumps one `[TIMESYNC]`
+block. For callers that must merge the core trace with other timeline data (host
+clock, host<->AIE anchors, phase events) in a single profile and dump — e.g.
+`example/perf/aieml_perf.cc` — the "decode into caller profile, no dump" variant
+`__Runtime_core_trace_end_into(dev, prof)` does the same read+decode but leaves
+init and `__Runtime_aie_trace_profile_dump` to the caller.
+
+`__Runtime_core_trace_begin(dev, col, row)` is likewise a thin wrapper over
+`__Runtime_core_trace_begin_ch(dev, col, row, strm_ch)`; the pass emits the 3-arg
+form (`strm_ch = AIE_TRACE_STRM_CH_AUTO` = per-column slot). The core->MemTile
+trace route is programmed directly, outside the routing engine's ResourceManager,
+so an auto stream channel that collides with a data-plane DMA on the same tile's
+SOUTH egress deadlocks that DMA. Callers that trace a tile whose data DMA shares
+the default channel pin an explicit channel via `_ch` — e.g.
+`example/perf/aieml_perf.cc` pins `strm_ch=1` because its output DMA uses SOUTH
+channel 0.
 
 ---
 
