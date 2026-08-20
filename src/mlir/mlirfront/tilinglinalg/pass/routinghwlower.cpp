@@ -4,6 +4,7 @@
  ******************************************************************************/
 
 #include "routinghwlower.h"
+#include "routinghw_pkt_slot.h"
 struct EnableExtToAieShimPortpattern: public ConversionPattern {
     explicit EnableExtToAieShimPortpattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
         ConversionPattern(routinghw::EnableExtToAieShimPort::getOperationName(), 1, ctx), typeconverter(converter), router_(router) {
@@ -193,6 +194,11 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             dma_port_num = pn.getInt();
         }
 
+        auto recvSlot = routinghw::pktslot::recvSlaveFromOp(op);
+        auto dmaSlot = routinghw::pktslot::localDmaFromOp(op);
+        auto fwdMaster = routinghw::pktslot::forwardMasterFromOp(op);
+        dma_port_slot_num = dmaSlot.slot;
+
         auto dropheader = "XAIE_SS_PKT_DROP_HEADER";
         auto nodropheader = "XAIE_SS_PKT_DONOT_DROP_HEADER";
 
@@ -234,13 +240,19 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
                                         mlir::emitc::OpaqueAttr::get(rewriter.getContext(), slaveportdirectionstr));
         Value dmaport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
                                         mlir::emitc::OpaqueAttr::get(rewriter.getContext(), "DMA"));
-        Value mask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
-        Value msel = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
-        Value abitr = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
+        Value mask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                              rewriter.getI32IntegerAttr(recvSlot.mask));
+        Value msel = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                              rewriter.getI32IntegerAttr(recvSlot.msel));
+        Value abitr = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                               rewriter.getI32IntegerAttr(recvSlot.arbiter));
 
-        Value slaveidx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(slaveportidx));
-        Value slaveslotnum = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
-        Value dmamask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0x1f));
+        Value slaveidx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                  rewriter.getI32IntegerAttr(slaveportidx));
+        Value slaveslotnum = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                      rewriter.getI32IntegerAttr(recvSlot.slot));
+        Value dmamask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                 rewriter.getI32IntegerAttr(dmaSlot.mask));
         StringRef calleeSPE = "XAie_StrmPktSwSlavePortEnable";
         //receive pkt from neighbor
         if (PortDirectiontoString(PortDirection::NONE) != slaveportdirectionstr) {
@@ -276,8 +288,10 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
                                             mlir::emitc::OpaqueAttr::get(rewriter.getContext(), masterportdirectionstr));
             Value masteridx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(masterportidx));
 
-            Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(1));
-            Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
+            Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                   rewriter.getI32IntegerAttr(fwdMaster.mselEn));
+            Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                    rewriter.getI32IntegerAttr(fwdMaster.arbiter));
 
             // DROP_HEADER only at the PKT→CIRC transition (last PKT hop),
             // UNLESS preserveheader=true (OOO mode needs headers at shim S2MM).

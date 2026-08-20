@@ -115,6 +115,16 @@ restarting the daemon.
 the daemon spawn the aiegdb subprocess and report the real starting scope (e.g.
 `partition(startcol=3)`), so the prompt is correct before the user types anything.
 
+### 2.5 Run pane control hierarchy
+
+The bottom-left Run pane separates configuration, connection state, and actions.
+Its header owns the connection-status badge; aligned App and Target rows keep the
+selected app path and board hostname visible without mixing them into the action
+toolbar. Connect is the primary action before a session exists and becomes
+Reconnect afterward, when Run becomes primary. Attach existing run adopts
+an externally started board session, while Stop run is enabled only for a run
+owned by this UI.
+
 ---
 
 ## 3. Tier 2 — the daemon (`schedule_debug_server.py`)

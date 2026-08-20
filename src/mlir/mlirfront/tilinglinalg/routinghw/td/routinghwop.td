@@ -182,7 +182,17 @@ def ConnectStreamPktSwitchPort:RoutingHWOp<"connectpktstreamswitchport"> {
         I32Attr:$localdmapkttype,
         StrAttr:$forwardmasterdirection,
         I32Attr:$forwardmasterportidx,
-        OptionalAttr<BoolAttr>:$preserveheader
+        OptionalAttr<BoolAttr>:$preserveheader,
+        DefaultValuedAttr<I32Attr, "0">:$receiveslavemask,
+        DefaultValuedAttr<I32Attr, "0">:$receiveslavemsel,
+        DefaultValuedAttr<I32Attr, "0">:$receiveslavearbiter,
+        DefaultValuedAttr<I32Attr, "0">:$receiveslaveslot,
+        DefaultValuedAttr<I32Attr, "31">:$localdmamask,
+        DefaultValuedAttr<I32Attr, "0">:$localdmamsel,
+        DefaultValuedAttr<I32Attr, "0">:$localdmaarbiter,
+        DefaultValuedAttr<I32Attr, "0">:$localdmaslot,
+        DefaultValuedAttr<I32Attr, "0">:$forwardmasterarbiter,
+        DefaultValuedAttr<I32Attr, "1">:$forwardmastermselen
      );
 
      let results = (outs

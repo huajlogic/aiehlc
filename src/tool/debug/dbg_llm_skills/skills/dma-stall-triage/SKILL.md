@@ -17,7 +17,7 @@ the worst failure mode here.
    **succeeding** does not mean the registers belong to the run you are debugging:
    - `mode == "none"` (`authorized` false) => `mcp__aiegdb__aie_exec` returns
      `{"refused": true}` for any hardware command. Say so and ask the user to press
-     **Connect**, **Run test**, or **Open Current Session**. Do NOT describe board state.
+     **Connect**, **Run**, or **Open Current Session**. Do NOT describe board state.
    - `mode == "connected"` => the link was probed, but **no run was started in this
      session**. Reads work and return whatever the board is still holding from an
      earlier run. Tell the user this before step 1, and phrase every finding as

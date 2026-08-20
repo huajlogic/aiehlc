@@ -15,6 +15,7 @@
 #include "routing/routingpath.h"
 #include "routinghwmanager.h"
 #include "routingmanager.h"
+#include "routinghw_pkt_slot.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include <iostream>
@@ -289,6 +290,7 @@ std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
         // For output gather flows, preserve packet headers when OOO is enabled
         // so shim S2MM DMA can do OOO BD dispatch based on packet_id.
         bool preserveHdr = true;
+        auto pktSlot = routinghw::pktslot::makePktSlotAttrs(rewriter);
         rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
             op->getLoc(), // Operation location
             output,
@@ -306,8 +308,7 @@ std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
                 PortDirectiontoString(value.MasterSendToNextTileDirection)), // No forwarding: empty master direction
             rewriter.getI32IntegerAttr(
                 (int)(value.MasterSendToNextTileDirectionPortIdx)), // No forwarding: port index 0
-            rewriter.getBoolAttr(preserveHdr)                       // preserveheader: keep headers for OOO BD dispatch
-        );
+            rewriter.getBoolAttr(preserveHdr), ROUTINGHW_PKT_SLOT_ATTRS(pktSlot));
     }
     ret.tile = tilist.back();
     ret.pktconn = pktswitchmap[ret.tile];
@@ -580,6 +581,7 @@ void ParseTheCCTRoutingPath(Operation *op, std::optional<TileListPktRoutingNode>
                 // preserve headers so shim S2MM DMA can read packet_id for
                 // OOO BD dispatch.
                 bool preserveHdrTransition = true;
+                auto pktSlot = routinghw::pktslot::makePktSlotAttrs(rewriter);
                 rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
                     loc, // Operation location
                     output,
@@ -597,8 +599,7 @@ void ParseTheCCTRoutingPath(Operation *op, std::optional<TileListPktRoutingNode>
                         conn.MasterSendToNextTileDirection)), // No forwarding: empty master direction
                     rewriter.getI32IntegerAttr(
                         (int)(conn.MasterSendToNextTileDirectionPortIdx)), // No forwarding: port index 0
-                    rewriter.getBoolAttr(preserveHdrTransition)            // preserveheader
-                );
+                    rewriter.getBoolAttr(preserveHdrTransition), ROUTINGHW_PKT_SLOT_ATTRS(pktSlot));
             }
             continue;
         }

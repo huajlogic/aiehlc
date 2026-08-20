@@ -124,47 +124,59 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 
 ## Additional Documentation
 
-Concise index — open the referenced file/skill for full detail.
+### Design docs
 
-### Design & architecture docs
-- **[doc/module_analysis.md](doc/module_analysis.md)** — 9-module (M1–M9) breakdown: key files, line counts, I/O, dependencies, data flow.
-- **[doc/aieapi.md](doc/aieapi.md)** — XAie driver API guide: single-tile, multi-tile manual routing/DMA/locks, production call patterns.
-- **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: 6 dialects, 15 passes, routing engine, test/build/HW-run flow.
-- **[doc/lowering.md](doc/lowering.md)** — Concrete IR lowering trace through every dialect stage with IR snippets and op→API tables.
-- **[doc/design/tile_dim_structured_design.md](doc/design/tile_dim_structured_design.md)** — Structured `tile_dim` (size/stride/groups) for `aie::SpatialPolicy`; conv halo/overlap unification.
-- **[doc/design/spatial_space_composition.md](doc/design/spatial_space_composition.md)** — Composition-based spatial op spaces (GemmSpace/Conv2dSpace compose a lean policy).
-- **[doc/llvm_mlir_pitfalls.md](doc/llvm_mlir_pitfalls.md)** — Known LLVM/MLIR API pitfalls (ArrayRef, StringRef lifetime, RTTI, constant folding, etc.).
-- **[doc/design/aiegdb_live_debug_framework.md](doc/design/aiegdb_live_debug_framework.md)** — Design for a live AIE debug/test daemon + polling JSON endpoints unifying static viewer with runtime tools.
+- **[doc/module_analysis.md](doc/module_analysis.md)** — 9-module project breakdown (M1–M9), key files, dependencies, data-flow diagram
+- **[doc/aieapi.md](doc/aieapi.md)** — XAie driver API guide (single-tile, multi-tile manual, production AEG patterns)
+- **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: dialects, passes, routing engine, build/HW-run flow
+- **[doc/lowering.md](doc/lowering.md)** — Concrete IR lowering trace with snippets and op-to-API mapping
+- **[doc/debug/tutorial_aiehlc.md](doc/debug/tutorial_aiehlc.md)** — aiehlc simulator + debug UI (`--platform sim`, `--sim-only`)
+- **[doc/debug/tutorial_baremetal.md](doc/debug/tutorial_baremetal.md)** — naiebaremetal VEK385 boot + debug UI
+- **[doc/design/tile_dim_structured_design.md](doc/design/tile_dim_structured_design.md)** — Structured `tile_dim` for `aie::SpatialPolicy`
+- **[doc/design/spatial_space_composition.md](doc/design/spatial_space_composition.md)** — Composition-based spatial op spaces (GemmSpace, Conv2dSpace)
+- **[doc/design/aiegdb_live_debug_framework.md](doc/design/aiegdb_live_debug_framework.md)** — Live debug framework design (static view + daemon)
+- **[doc/llvm_mlir_pitfalls.md](doc/llvm_mlir_pitfalls.md)** — Known LLVM/MLIR API pitfalls
+- **[doc/aiedifferentview.md](doc/aiedifferentview.md)** — Memory and lock semantics
 
-### Verification skills (static, pre-HW)
-- **Skill xaieapiverify** (`.cursor/skills/xaieapiverify/SKILL.md`) — Static verification of XAie API calls in generated code (ports, DMA/lock, path connectivity).
-- **Skill routinghwdebug** (`.cursor/skills/routinghwdebug/SKILL.md`) — End-to-end routing debug: trace errors back EmitC→routinghw→dmaphop→dmap→routing.
-- **Skill dmabdverify** (`.cursor/skills/dmabdverify/SKILL.md`) — Static verification of DMA BD config in host.cc (BD/lock IDs, ping-pong, lengths, packet IDs).
-- **Skill datacorrectness** (`.cursor/skills/datacorrectness/SKILL.md`) — Pre-HW-run data-correctness checklist (type widths, direction, banks, addresses, locks).
-- **Skill aiedriverkb** (`.cursor/skills/aiedriverkb/SKILL.md`) — AIE Driver Knowledge Base for XAie driver internals (ELF loading, bounds checking).
-- **Command data-mismatch-debug** (`.claude/commands/data-mismatch-debug.md`) — Systematic DMA data-mismatch debug (supply/demand tables, root-cause patterns).
+### Agent skills (`.cursor/skills/<name>/SKILL.md`)
 
-### Live HW / simulator debug skills
-- **Skill aiehwdmadebug** (`.cursor/skills/aiehwdmadebug/SKILL.md`) — Live DMA debug over JTAG/XSDB; decodes AIE2PS DMA status regs; offset-as-value decode pitfall.
-- **Skill aieswitchtrace** (`.cursor/skills/aieswitchtrace/SKILL.md`) — Live stream-switch read-back/flow-trace via aiegdb `show switch`/`scan switch`.
-- **Skill aiesimloaddebug** (`.cursor/skills/aiesimloaddebug/SKILL.md`) — Debug AIE simulator segfaults at PS.so load (stale kernel_elf_init.cc symbol, missing stub).
-- **Skill aiehwprofile** (`.cursor/skills/aiehwprofile/SKILL.md`) — Capture AIE HW perf counters via the Vitis `aieprofile` XSDB package; all-zero-CSV troubleshooting.
-- **Skill debugui-llm-reset** (`.cursor/skills/debugui-llm-reset/SKILL.md`) — Diagnoses embedded-LLM context loss / stale live tools on dynamic target changes.
-- **Skill plugin dbg-llm-skills** (`src/tool/debug/dbg_llm_skills/`) — Nine live-debug procedures for the embedded debug-UI assistant; loadable locally via `--plugin-dir`.
-- **External aiedbg clone** (`/scratch/staff/bkirinci/aiedbg`, on PATH) — Tool that reaches hardware; ~2600 lines of docs live only in the clone; `reg lookup` runs offline (use `--device-type pal`).
+Read the matching skill when the task fits:
 
-### Debug tooling (source)
-- **[src/tool/debug/aiediag.py](src/tool/debug/aiediag.py)** — Flow-aware DMA diagnostic: reads DMA status regs via aiedbg, cross-refs provenance JSONs, prints root cause.
-- **[src/tool/debug/aiegdb.py](src/tool/debug/aiegdb.py)** — GDB-like scoped CLI over aiedbg (partition→tile→channel); `COMMAND_SPEC` is the machine-readable grammar.
-- **[src/tool/debug/aiemcp.py](src/tool/debug/aiemcp.py)** — MCP server exposing aiegdb live debug to Claude Code (`aie_exec`, etc.); fd-level capture; session gating.
-- **[src/tool/debug/xaiehost2provenance.py](src/tool/debug/xaiehost2provenance.py)** — Static provenance generator for the raw-XAie single-kernel aiehlc flow (no worklocal bundle).
-- **[src/tool/debug/schedule_debug_server.py](src/tool/debug/schedule_debug_server.py)** — Live debug daemon. Notable areas: session provenance (states none/connected/attached/ran; app_paths); app capability detection (tags sim/hw; board resolved live, never baked into a profile); run-state reconciliation (`/runstate`, busy flags, unconditional `stop_run`); one-device-namespace (`st.device` unified with board dropdown); source viewer (`/source` Pygments + two-tier path resolution, auth-gated); source grounding (app source manifest + kernel→definition map).
-- **[src/tool/debug/schedule_view.py](src/tool/debug/schedule_view.py)** — Static/live HTML viewer. Notable areas: aiegdb console tab (foldable per-command blocks, CON_RULES classifier); device-map flow lanes (one lane per flow); pane names (AIE Debug/Run/Info/Tools) + empty-tile handling; scan controls (pills select, Scan reads once, live polls 2s); LLM tool-call rendering (collapse markers, FIFO pairing); context pills inline (contenteditable prompt box); transcript bottom-pinning; working indicator driven by `/llm/poll` active flag.
-- **[src/tool/debug/debug_ui_mcp.py](src/tool/debug/debug_ui_mcp.py)** — MCP tools for the debug UI (`get_pane`, `list_panes`, `app_sources`, `get_backend_status`).
+| Topic | Skill |
+|-------|-------|
+| Debug UI, daemon, live session, browser UI features | **debug-ui-framework** (+ [reference.md](.cursor/skills/debug-ui-framework/reference.md)) |
+| Embedded LLM context loss on retarget | debugui-llm-reset |
+| Static XAie API verify (routing.cc, host.cc) | xaieapiverify |
+| Routing debug (IR → generated code) | routinghwdebug |
+| DMA BD verify in host.cc | dmabdverify |
+| Pre-HW data correctness | datacorrectness |
+| XAie driver internals | aiedriverkb |
+| Live HW DMA stall debug | aiehwdmadebug |
+| Sim PS.so load segfault | aiesimloaddebug |
+| HW performance counters | aiehwprofile |
+| Raw-XAie sim debug bundle | raw-xaie-sim-debug-bundle |
+| Sim build/run separation | sim-build-run-separation |
+| hostcompile / missing compile_kernel.sh | hostcompile-entrypoint |
+| AEG IPC sim C++ headers | aeg-sim-cxx-headers |
+| Host codegen | hostcodegen |
+| Kernel codegen | kernelcodegen |
 
-### Build/profile scripts
-- **[script/verify_env.sh](script/verify_env.sh)** — Environment verification (Vitis, LLVM, toolchain, aie-rt, BSP, board vars).
-- **[script/debug/aieprofile.sh](script/debug/aieprofile.sh)** (+ `aieprofile.tcl`, `aierun_retrigger.tcl`, `aieprofile_summary.py`, `aieprofile_report.py`) — AIE HW performance-counter capture wrapper: the only Vitis path reaching a baremetal run; ordering (program-once→reload-ELF→profile→resume); event-id module offsets; tabular + visual readers.
+**Embedded LLM plugin** (`src/tool/debug/dbg_llm_skills/`): nine skills for the browser LLM tab. Launch locally with `claude --plugin-dir src/tool/debug/dbg_llm_skills`. Listed in **debug-ui-framework** reference.
+
+**External:** aiedbg clone at `/scratch/staff/bkirinci/aiedbg` — see plugin skill `aiedbg-reference`.
+
+**Command:** [data-mismatch-debug](.claude/commands/data-mismatch-debug.md) — systematic DMA data-mismatch triage.
+
+### Debug tools
+
+- **[src/tool/debug/README.md](src/tool/debug/README.md)** — user guide and CLI for all debug tools
+- **Skill: debug-ui-framework** — implementation map for `schedule_debug_server.py`, `schedule_view.py`, `aiegdb.py`, `aiemcp.py`, `aiediag.py`, `xaiehost2provenance.py` (detail in [reference.md](.cursor/skills/debug-ui-framework/reference.md))
+
+### Build notes
+
+- **[script/verify_env.sh](script/verify_env.sh)** — validate Vitis, LLVM, toolchain, board vars before build
+- **[script/hostcompile.sh](script/hostcompile.sh)** — kernel build via `compile_one_kernel()` → `kc.sh`; do not restore deleted `compile_kernel.sh` (skill: hostcompile-entrypoint)
+- **[script/aiehlc.sh](script/aiehlc.sh)** — `--platform sim` is build-only; launch sim separately via `runsim.sh` or debug UI **Run** (skills: sim-build-run-separation, raw-xaie-sim-debug-bundle)
 
 ## Key Terms
 
@@ -189,5 +201,3 @@ Concise index — open the referenced file/skill for full detail.
 - Maintain and update architecture doc and keep update after do some changes
 ## Process transperent rule
 - after each task done, list all files that change or new created
-## Memory and Lock
-- ./doc/aiedifferentview.md

@@ -127,7 +127,7 @@ gated even though it only navigates — use `target channel mm2s0` instead.
 
 Everything else is gated on `backend_status.json > session.authorized`, written by the daemon
 (`DebugState.session_state`). Authorized means the user pressed **Connect** (`connected`),
-**Run test** (`ran`), or **Open Current Session** (`attached`). If not authorized, `aie_exec`
+**Run** (`ran`), or **Open Current Session** (`attached`). If not authorized, `aie_exec`
 returns:
 
 ```json
@@ -136,7 +136,7 @@ returns:
 
 When you see `refused: true`: **nothing was read.** Do not describe, infer, or guess board
 state, and do not fall back to the `applog` as if it were this run. Tell the user to press
-Connect / Run test / Open Current Session. (If `backend_status.json` has no `session` key —
+Connect / Run / Open Current Session. (If `backend_status.json` has no `session` key —
 aiemcp launched standalone — the gate is skipped and commands proceed.)
 
 ## Worked navigation

@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import time
 import unittest
 from unittest.mock import Mock
 
@@ -66,6 +67,49 @@ class LlmRetargetTest(unittest.TestCase):
         self.assertEqual(result["llm_generation"], 7)
         self.assertEqual(result["llm_reset_reason"], "debug target changed")
         self.assertEqual(result["data"], "partial answer")
+
+    def _make_poll_state(self, *, active, age_s, proc_alive=True):
+        state = DebugState.__new__(DebugState)
+        state._llm_lock = threading.Lock()
+        state._llm_buf = "partial answer"
+        state._llm_active = active
+        state._llm_last_output = time.monotonic() - age_s
+        state._llm_generation = 1
+        state._llm_reset_reason = ""
+        state._llm_log_write = Mock()
+        proc = Mock()
+        proc.poll.return_value = None if proc_alive else 0
+        state._llm_proc = proc
+        return state
+
+    def test_poll_soft_stuck_keeps_active_when_proc_alive(self):
+        state = self._make_poll_state(active=True, age_s=150, proc_alive=True)
+
+        result = state.llm_poll(0)
+
+        self.assertTrue(result["active"])
+        self.assertNotIn("stuck", result)
+        state._llm_log_write.assert_not_called()
+
+    def test_poll_hard_stuck_clears_active_when_proc_dead(self):
+        state = self._make_poll_state(active=True, age_s=150, proc_alive=False)
+
+        result = state.llm_poll(0)
+
+        self.assertFalse(result["active"])
+        self.assertTrue(result["stuck"])
+        state._llm_log_write.assert_called_once()
+
+    def test_poll_hard_stuck_after_long_silence_even_if_proc_alive(self):
+        from schedule_debug_server import _LLM_STUCK_HARD_S
+        state = self._make_poll_state(
+            active=True, age_s=_LLM_STUCK_HARD_S + 5, proc_alive=True)
+
+        result = state.llm_poll(0)
+
+        self.assertFalse(result["active"])
+        self.assertTrue(result["stuck"])
+        state._llm_log_write.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ The user has not connected, run, or attached in this UI. `_hw_session is None`.
   `tile_list`, `get_flow_detail`, `symbol_search`, and file tools under
   the repo root. Navigation/help via `aie_exec` still
   works (see the allowed-verb list below).
-- Tell the user to press **Connect**, **Run test**, or **Open Current Session**,
+- Tell the user to press **Connect**, **Run**, or **Open Current Session**,
   and state which registers you would read once they do.
 
 ### `mode: "connected"` — summary `CONNECTED at <t> (link verified) but NO run has been started in this session`
@@ -170,4 +170,4 @@ state from the refusal itself.
 - Say "the board currently holds" (connected) vs "this run produced" (ran).
 - If you did not read a register, do not name a register value.
 - If you are refused, say what you would have read and which button unblocks it:
-  Connect / Run test / Open Current Session.
+  Connect / Run / Open Current Session.
