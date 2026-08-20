@@ -31,15 +31,68 @@ def test_event_color_known_slots():
     assert tg.event_color("MEMORY_STALL") == tg.EVENT_COLORS["MEMORY_STALL"]
 
 
-def test_event_color_multi_uses_first_known():
-    # First recognised token wins.
-    assert tg.event_color("ACTIVE|LOCK_STALL") == tg.EVENT_COLORS["ACTIVE"]
+def test_event_color_multi_prefers_stall():
+    # A stall token wins over ACTIVE (core is ACTIVE even while blocked).
+    assert tg.event_color("ACTIVE|LOCK_STALL") == tg.EVENT_COLORS["LOCK_STALL"]
+    assert tg.event_color("ACTIVE|STREAM_STALL") == tg.EVENT_COLORS["STREAM_STALL"]
+    assert tg.event_color("ACTIVE|MEMORY_STALL") == tg.EVENT_COLORS["MEMORY_STALL"]
+    # No stall token: first recognised token wins.
     assert tg.event_color("STREAM_STALL|EVENT5") == tg.EVENT_COLORS["STREAM_STALL"]
+    assert tg.event_color("ACTIVE|EVENT5") == tg.EVENT_COLORS["ACTIVE"]
 
 
 def test_event_color_unknown_is_other():
     assert tg.event_color("EVENT5") == tg.OTHER_COLOR
     assert tg.event_color("EVENT6|EVENT7") == tg.OTHER_COLOR
+
+
+def test_rasterize_dominant_active_over_minority_stall():
+    # One bin covering [0,20]: 19.95us ACTIVE vs 0.05us LOCK_STALL -> green.
+    events = [
+        {"start_us": 0.0, "end_us": 10.0, "event": "ACTIVE"},
+        {"start_us": 10.0, "end_us": 10.05, "event": "LOCK_STALL"},
+        {"start_us": 10.05, "end_us": 20.0, "event": "ACTIVE"},
+    ]
+    assert tg.rasterize_lane(events, 0.0, 20.0, 1) == \
+        [(0.0, 20.0, tg.EVENT_COLORS["ACTIVE"])]
+
+
+def test_rasterize_dominant_stall():
+    # A stall-dominated bin colours orange (event_color prefers the stall).
+    events = [{"start_us": 0.0, "end_us": 20.0, "event": "ACTIVE|LOCK_STALL"}]
+    assert tg.rasterize_lane(events, 0.0, 20.0, 1) == \
+        [(0.0, 20.0, tg.EVENT_COLORS["LOCK_STALL"])]
+
+
+def test_rasterize_merges_adjacent_and_splits_on_color():
+    # 4 bins over [0,20]: first half ACTIVE, second half LOCK_STALL.
+    events = [
+        {"start_us": 0.0, "end_us": 10.0, "event": "ACTIVE"},
+        {"start_us": 10.0, "end_us": 20.0, "event": "LOCK_STALL"},
+    ]
+    assert tg.rasterize_lane(events, 0.0, 20.0, 4) == [
+        (0.0, 10.0, tg.EVENT_COLORS["ACTIVE"]),
+        (10.0, 20.0, tg.EVENT_COLORS["LOCK_STALL"]),
+    ]
+
+
+def test_rasterize_skips_empty_bins():
+    # bins [0,5] and [5,10] have no events -> no segment there.
+    events = [{"start_us": 12.0, "end_us": 18.0, "event": "ACTIVE"}]
+    assert tg.rasterize_lane(events, 0.0, 20.0, 4) == \
+        [(10.0, 20.0, tg.EVENT_COLORS["ACTIVE"])]
+
+
+def test_rasterize_short_active_burst_visible_when_dominant():
+    # The real bug: a sub-pixel ACTIVE run interrupted by a 1-cycle stall.
+    # Per-pixel dominance keeps the bin green instead of losing it to overpaint.
+    events = [
+        {"start_us": 0.0, "end_us": 0.05, "event": "ACTIVE"},
+        {"start_us": 0.05, "end_us": 0.051, "event": "ACTIVE|LOCK_STALL"},
+        {"start_us": 0.051, "end_us": 0.10, "event": "ACTIVE"},
+    ]
+    assert tg.rasterize_lane(events, 0.0, 0.10, 1) == \
+        [(0.0, 0.10, tg.EVENT_COLORS["ACTIVE"])]
 
 
 def test_lane_helpers_split_host_and_tiles():
@@ -108,14 +161,6 @@ def test_host_intervals_empty_without_host():
     model["lanes"] = tg.tile_lanes(model)
     assert tg.host_lane(model) is None
     assert tg.host_intervals(None) == []
-
-
-def test_bar_draw_span_left_anchored():
-    # A sub-pixel bar is widened to min_w by growing RIGHTWARD only: the drawn
-    # left edge stays at the true start, so it can never appear before `run`.
-    assert tg._bar_draw_span(2266.69, 0.37, 77.1) == (2266.69, 77.1)
-    # An already-wide bar is untouched.
-    assert tg._bar_draw_span(100.0, 50.0, 10.0) == (100.0, 50.0)
 
 
 def test_self_test_entry_point():

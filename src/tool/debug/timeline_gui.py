@@ -39,6 +39,9 @@ EVENT_COLORS = {
     "STREAM_STALL": "#d62728",  # red
     "MEMORY_STALL": "#9467bd",  # purple
 }
+# Stall slots take colour priority over ACTIVE in a combined label: a core is
+# reported ACTIVE even while blocked, so the stall should be what you see.
+STALL_ORDER = ("LOCK_STALL", "STREAM_STALL", "MEMORY_STALL")
 OTHER_COLOR = "#7f7f7f"         # grey (multi-event or unknown)
 HOST_LINE_COLOR = "#1f77b4"     # blue guide lines / host-running bars
 HOST_RUNNING_COLOR = "#1f77b4"  # blue: host busy (setup / DMA / verify)
@@ -49,10 +52,65 @@ HOST_WAIT_COLOR = "#c7c7c7"     # grey hatched: host idle-waiting on the AIE
 HOST_WAIT_PHASES = {"run"}
 
 
+def rasterize_lane(events, x_lo, x_hi, nbins):
+    """Per-pixel dominant-state colouring for one tile lane.
+
+    Splits [x_lo, x_hi] into `nbins` equal bins (one per rendered pixel column)
+    and, for each bin, sums how long each colour occupies it; the colour with
+    the most time wins. This makes a short burst survive as its bin's dominant
+    colour instead of being overpainted by an adjacent bar (the failure mode of
+    per-event rectangles). Empty bins produce no segment. Adjacent bins with the
+    same colour are merged into one span.
+
+    Returns [(seg_start_us, seg_end_us, color_hex), ...] left-to-right.
+    """
+    if nbins < 1 or x_hi <= x_lo or not events:
+        return []
+    bw = (x_hi - x_lo) / nbins
+    # Per-bin colour->overlap-duration accumulator.
+    acc = [dict() for _ in range(nbins)]
+    for ev in events:
+        s = max(ev["start_us"], x_lo)
+        e = min(ev["end_us"], x_hi)
+        if e <= s:
+            continue
+        col = event_color(ev["event"])
+        b0 = int((s - x_lo) / bw)
+        b1 = int((e - x_lo) / bw)
+        if b1 >= nbins:
+            b1 = nbins - 1
+        for b in range(b0, b1 + 1):
+            bin_lo = x_lo + b * bw
+            bin_hi = bin_lo + bw
+            overlap = min(e, bin_hi) - max(s, bin_lo)
+            if overlap > 0.0:
+                acc[b][col] = acc[b].get(col, 0.0) + overlap
+
+    # Dominant colour per bin (None when empty), then merge adjacent runs.
+    segs = []
+    for b in range(nbins):
+        if not acc[b]:
+            continue
+        col = max(acc[b].items(), key=lambda kv: kv[1])[0]
+        bin_lo = x_lo + b * bw
+        bin_hi = bin_lo + bw
+        if segs and segs[-1][2] == col and abs(segs[-1][1] - bin_lo) < bw * 1e-6:
+            segs[-1] = (segs[-1][0], bin_hi, col)
+        else:
+            segs.append((bin_lo, bin_hi, col))
+    return segs
+
+
 def event_color(event):
-    """Colour for an event label. A '|'-joined multi-event uses the first
-    recognised token's colour, else grey."""
-    for tok in str(event).split("|"):
+    """Colour for an event label. A '|'-joined multi-event prefers a stall
+    token over ACTIVE, so an ACTIVE|LOCK_STALL span shows the stall colour
+    (a core can be ACTIVE while blocked on a lock/stream/memory). Falls back
+    to the first recognised token, else grey."""
+    toks = str(event).split("|")
+    for tok in toks:
+        if tok in STALL_ORDER:
+            return EVENT_COLORS[tok]
+    for tok in toks:
         if tok in EVENT_COLORS:
             return EVENT_COLORS[tok]
     return OTHER_COLOR
@@ -123,12 +181,6 @@ def host_intervals(hl):
 # --------------------------------------------------------------------------
 # Rendering.
 # --------------------------------------------------------------------------
-def _bar_draw_span(x0, w, min_w):
-    """(dx, dw) for a bar of true width w at x0, floored to min_w by growing
-    RIGHTWARD only, so the drawn left edge == true start (temporal order safe)."""
-    return x0, max(w, min_w)
-
-
 def _pick_backend(save, want_window):
     """Choose a matplotlib backend BEFORE importing pyplot. Returns
     (show_window, save_path_or_None)."""
@@ -140,9 +192,12 @@ def _pick_backend(save, want_window):
     return True, None
 
 
-def _draw(ax, model):
+def _draw(ax, model, nbins=2000):
     """Draw all lanes onto ax as HORIZONTAL timelines on one us axis. Returns a
     hover index: a list of (x0, x1, y0, y1, event_dict, lane_name) tuples.
+
+    `nbins` is the number of rasterisation columns for tile lanes (set by
+    render() to the figure's pixel width).
 
     Row 0 is the host lane: one bar per gap between consecutive phase markers,
     BLUE where the host is running and GREY HATCHED where it is idle-waiting on
@@ -157,13 +212,12 @@ def _draw(ax, model):
     row_h = 0.8
     hover = []  # (x0, x1, y0, y1, event, lane_name)
 
-    # A minimum *visual* bar width so a very short event (e.g. a 0.4 us ACTIVE
-    # burst on a 20 ms axis) is still visible as a hairline. The true span stays
-    # in the hover/detail; only the drawn rectangle is widened.
+    # Full x-range across every lane; tile lanes are rasterised into `nbins`
+    # columns over this range so per-pixel dominant colouring is stable.
     all_x = [e["start_us"] for l in model["lanes"] for e in l["events"]] + \
             [e["end_us"] for l in model["lanes"] for e in l["events"]]
-    span = (max(all_x) - min(all_x)) if all_x else 0.0
-    min_draw_w = span * 0.004  # ~0.4% of the axis
+    x_lo = min(all_x) if all_x else 0.0
+    x_hi = max(all_x) if all_x else 1.0
 
     # Host lane (row 0): running vs idle-waiting bars.
     if hl is not None:
@@ -183,22 +237,21 @@ def _draw(ax, model):
                   "end_us": bar["end_us"], "detail": bar["detail"]}
             hover.append((x0, x0 + w, y0, y0 + row_h, ev, "host"))
 
-    # Tile lanes: one row each, bars coloured by event type. A bar narrower than
-    # min_draw_w is widened by growing RIGHTWARD from its true start (never
-    # centred), so the drawn left edge always equals the real start time and a
-    # short bar can never appear before the host's run marker; the hover box
-    # still reports the true start/end.
+    # Tile lanes: one row each, drawn with per-pixel dominant-state colouring.
+    # Each bin (~one screen column) is filled with the colour that occupies most
+    # of its time, so a short burst survives as its bin's dominant colour instead
+    # of being overpainted by an adjacent bar. Hover still reports true per-event
+    # spans (unaffected by rasterisation).
     for i, lane in enumerate(tiles):
         row = tile_row0 + i
         y0 = row - row_h / 2.0
+        for s_us, e_us, color in rasterize_lane(lane["events"], x_lo, x_hi, nbins):
+            ax.broken_barh([(s_us, e_us - s_us)], (y0, row_h),
+                           facecolors=color, edgecolors="none")
         for ev in lane["events"]:
             x0 = ev["start_us"]
-            w = max(ev["end_us"] - ev["start_us"], 0.0)
-            dx, dw = _bar_draw_span(x0, w, min_draw_w)
-            ax.broken_barh([(dx, dw)], (y0, row_h),
-                           facecolors=event_color(ev["event"]),
-                           edgecolors="black", linewidth=0.3)
-            hover.append((x0, x0 + w, y0, y0 + row_h, ev, lane["name"]))
+            x1 = x0 + max(ev["end_us"] - ev["start_us"], 0.0)
+            hover.append((x0, x1, y0, y0 + row_h, ev, lane["name"]))
 
     # Light dashed vertical guides at each host phase boundary, across all rows.
     if hl is not None and n_rows > 0:
@@ -301,7 +354,9 @@ def render(model, save=None, want_window=True):
     n = len(tile_lanes(model)) + (1 if host_lane(model) is not None else 0)
     n = max(n, 1)
     fig, ax = plt.subplots(figsize=(12, 1.2 + 0.6 * n))
-    hover = _draw(ax, model)
+    # One rasterisation bin per horizontal pixel of the figure.
+    nbins = max(int(fig.get_figwidth() * fig.dpi), 100)
+    hover = _draw(ax, model, nbins)
     _add_legend(ax, model)
     ax.grid(True, axis="x", linestyle=":", alpha=0.4)
     fig.tight_layout()
