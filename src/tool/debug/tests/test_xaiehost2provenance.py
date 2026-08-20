@@ -92,6 +92,30 @@ def test_build_dfschedule_json():
     assert {"col": 4, "row": 4} in grp["tiles"]
 
 
+def test_collect_kernel_artifacts_populates_code_view(tmp_path):
+    artifacts = tmp_path / "aout"
+    kernel_cfg = artifacts / "kernelcfg" / "perf"
+    kernel_cfg.mkdir(parents=True)
+    (artifacts / "perf.cc").write_text("void perf() {}\n")
+    (kernel_cfg / "wrapper.cc").write_text('#include "../../perf.cc"\n')
+    (kernel_cfg / "aieml.bcf").write_text("_symbol 0x1000 0x20 win_ping\n")
+    (kernel_cfg / "dm_offsets.h").write_text("#define CORE_IP_MEM 0x1000\n")
+
+    model = x.extract_model(PERF_SNIPPET, aie_gen=5, aiesim=False)
+    bundle = tmp_path / "worklocal"
+    bundle.mkdir()
+    copied = x.collect_kernel_artifacts(model, str(artifacts), str(bundle))
+    doc = x.build_dfschedule(model, aie_gen=5, tile_artifacts=copied)
+    core = next(t for t in doc["tiles"] if (t["col"], t["row"]) == (4, 4))
+
+    assert core["kernel_cc"] == "kernelcfg/perf/wrapper.cc"
+    assert core["bcf"] == "kernelcfg/perf/aieml.bcf"
+    assert (bundle / core["kernel_cc"]).is_file()
+    assert (bundle / core["bcf"]).is_file()
+    assert (bundle / "perf.cc").is_file()
+    assert (bundle / "kernelcfg/perf/dm_offsets.h").is_file()
+
+
 COMMENTED_SNIPPET = """
     int shimcol = 10;
     XAie_LoadElfMem(DevInst, XAie_TileLoc(4, 4), (unsigned char *)perf);

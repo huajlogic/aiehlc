@@ -293,7 +293,7 @@ def _session_refusal(line):
             "The configured target comes from $AIEDBG_TARGET at daemon startup and "
             "does NOT mean a board is live or that anything has been run.\n"
             "Nothing was read — do NOT infer or describe board state.\n"
-            "Ask the user to press \"Connect\" (verify the link), \"Run test\" "
+            "Ask the user to press \"Connect\" (verify the link), \"Run\" "
             "(start a run), or \"Open Current Session\" (attach to a run they "
             "started outside the UI)."
         ),

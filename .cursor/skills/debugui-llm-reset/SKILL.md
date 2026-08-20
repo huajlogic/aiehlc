@@ -9,7 +9,11 @@ description: Diagnoses embedded debug UI LLM context loss and replies that stop 
 
 1. Find the latest matching `llm_*.log` under the selected app's `worklocal`.
 2. Inspect the final marker:
-   - `[watchdog: ... turn declared stuck]` means no Claude output reached the daemon for 120 seconds.
+   - `[watchdog: ... turn abandoned]` or `[watchdog: ... claude exited]` means the
+     daemon hard-stopped the turn (process gone, or 600s silence).
+   - While the claude subprocess is still running, the UI keeps polling silently
+     with the working indicator — no interim warning. Multi-tool turns can go
+     minutes between stream-json lines while the model processes tool results.
    - `[session end]` means `llm_reset()` terminated the process.
    - No marker plus closed output means the Claude process exited independently.
 3. Compare the transcript target with the next transcript and the daemon process timeline.

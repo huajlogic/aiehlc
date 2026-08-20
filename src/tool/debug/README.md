@@ -215,12 +215,18 @@ live DMA/core/event overlays, and drives an in-browser LLM tab wired to the
 ```bash
 python3 src/tool/debug/schedule_debug_server.py <workdir> \
     --elf <path/to/main.elf> --aie-version 5 --open
+
+# Open one aiecompiler app directly and generate worklocal/ when needed.
+python3 src/tool/debug/schedule_debug_server.py \
+    --app ../naiebaremetal/example/example_oob_4x4 --open
 ```
 
 Key flags: `--port 8091`, `--host 0.0.0.0`, `--target xsdb://...`, `--device pal`,
 `--startcol N`, `--apppaltest PATH` (default `script/test/apppaltest.py`),
 `--applog PATH` (default repo-root `applog`), `--no-llm`, `--password` /
-`--no-password`, `--no-mcp-probe`. Launched automatically by
+`--no-password`, `--no-mcp-probe`. `--app PATH` selects exactly one app and
+accepts either its root directory or an existing provenance bundle;
+`--app-root DIR` remains the multi-app discovery mode. Launched automatically by
 `script/aiehlc.sh --prettydebug`.
 
 ### Session provenance — a target is not a connection
@@ -240,7 +246,7 @@ The daemon tracks how the session earned its access, via one builder
 | `none` | startup default, target notwithstanding | reads refused |
 | `connected` | **Connect** → a passing `/ping` | link real; registers are pre-existing state |
 | `attached` | **Open Current Session** → `POST /attach` | real run, started outside the UI; earlier history unknown |
-| `ran` | **Run test** → `start_run` | live state *and* `applog` describe the current run |
+| `ran` | **Run** → `start_run` | live state *and* `applog` describe the current run |
 
 `hw_authorized()` gates `/grid` and the `aiegdb` MCP server's device commands
 (navigation, `help` and `?` stay open so the console works offline).
@@ -441,7 +447,51 @@ every example's own `src/graph.cpp` resolves to its own copy. Relatedly,
 then `--app`) over `list()`'s newest-by-mtime ordering: a cold
 `run_debug_ui.sh` passes the app's worklocal positionally, and it used to lose
 to whichever unrelated app was rebuilt most recently — which silently scoped
-bare-filename lookups to the wrong app. Roots are recomputed per
+bare-filename lookups to the wrong app. Going further: when the invocation
+*names* an app (positional workdir or `--app`) and passes no `--app-root`, the
+`aout/` + `example/` auto-scan is skipped entirely. That scan exists so a bare
+`schedule_debug_server.py` finds the newest build on its own; once you have said
+what to debug and asked for no tree to browse, its hits are noise from whichever
+repo the daemon was started in — launching on a naiebaremetal bundle listed this
+repo's `aout` and `example/stream` in the App dropdown. The positional `workdir`
+therefore defaults to `None`, not `"aout/worklocal"`: whether the user named a
+work dir is the deciding input, and a default string makes every bare invocation
+look explicit (`_DEFAULT_WORKDIR` is the fallback when the registry is empty).
+An explicit positional path or `--app PATH` may name either a provenance bundle
+or an app directory containing `Work/`. The app-directory form regenerates
+`worklocal` when `aie_control_config.json` is newer, writes
+`schedule_view.json` plus `host_schedule.html`, and registers only that app.
+`--app` is singular; `--app-root` remains the multi-app discovery mode.
+The browser follows from the app *count*, not a launch flag — `loadApps()` sets
+`#ctrlbar[data-apps="one"]` at `apps.length <= 1` and CSS drops the whole App row
+(label, select, path), so a later `POST /apps/add` brings it back on the next load
+with no extra plumbing. `--sim-only` is the same shape for the Board row:
+`/config` reports `sim_only`, the page sets `#ctrlbar[data-simonly="true"]` and CSS
+drops `#row-board`, `Connect`, `Attach existing run` and the start-hw_server hint;
+when both rows go, `.run-fields` goes with them. The buttons are NOT in that block
+— they sit on the pane-title row (`.run-head`), since they are the pane's point and
+under sim-only + one app they are all that is left; `#connstatus` is pushed right
+with `margin-left:auto` and wraps to its own line on a narrow pane rather than
+crushing them. Below the buttons is one flex `.run-row` per selector, Board then
+App, deliberately not a grid: a hidden grid row still leaves its `row-gap` behind,
+a hidden flex child does not. `#deviceSel`
+stays in the DOM pinned to `simulator` because every connect/run path in the page
+branches on its value — hiding the row, not deleting the control, is what keeps
+those paths untouched. Hiding is not enforcement, so the daemon refuses `/ping`,
+`/targets`, `/run`, `/attach`, `/settarget` and `/launch_hwserver` with
+`sim_only: true` (an MCP client, a page loaded before the flag, and curl all reach
+the same handlers), `session_state()` publishes `sim_only`, and `session_summary()`
+gains a sim-only "NO SESSION" wording so the model does not suggest Connect.
+`Connect` goes too, leaving `Run` as the only button — but Connect is what
+*unlocks* Run, so `applyBoardDefaults()` calls `testConnect()` on load when
+`sim_only`. Its simulator branch touches no board (it probes `/sim/status`, reveals
+the console and enables the run buttons), so firing it automatically is safe, and
+it runs after `updateDeviceUI()` because that resets exactly the state it sets.
+`Stop run` stays: a simulator you cannot stop is a trap. The status line drops the
+word "activated" under sim-only — it names a step the user no longer takes — for
+`simulator ready — press "Run"`. With
+the App row gone the identity moves to `#appbadge` beside the `AIE Debug` pane
+title, and `document.title` carries it too. Roots are recomputed per
 request because `select_app` reassigns `workdir`; nested roots are kept
 deliberately — they are also the join bases for a relative citation, and dropping
 `aout/worklocal` because it sits under the repo root made `worklocal/host.cc`
@@ -942,7 +992,7 @@ restarted.
 ### Run state — the UI must not keep its own copy
 
 The browser used to learn about a board run from exactly one place: the `/applog`
-tail *it* started after clicking **Run test**. Nothing else told it a run existed.
+tail *it* started after clicking **Run**. Nothing else told it a run existed.
 So a page reload, a dropped tail, or a run started from another tab left the
 browser believing the board was free while `_run_proc` was still live in the
 daemon — and every recovery path is gated on the daemon's belief, not the
@@ -951,7 +1001,7 @@ browser's:
 | Control | Refused mid-run because | Result when the two disagree |
 |---|---|---|
 | **Connect** | `/ping` returns "disabled during run" | reads as a dead link → the UI ssh'd to the board to restart `hw_server` (touching hardware for nothing), retried, failed again |
-| **Run test** | `start_run` → "a run is already in progress" | dead end |
+| **Run** | `start_run` → "a run is already in progress" | dead end |
 | **Force stop** | *not* refused — but the button is only ungrayed by a successful Connect | unclickable, so the one control that fixes it is unreachable |
 
 The result was a UI that could only be unwedged by restarting the daemon.
