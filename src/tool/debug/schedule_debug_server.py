@@ -5302,6 +5302,15 @@ def _lan_ip():
         return "127.0.0.1"
 
 
+# ── per-user applog (shared checkout hosts) ──
+
+def _default_applog_path():
+    raw = os.environ.get("SCHEDULE_DEBUG_APPLOG")
+    if raw:
+        return os.path.abspath(raw)
+    return os.path.join(_REPO_ROOT, f"applog.{getpass.getuser()}")
+
+
 # ── occupied-port policy (same-user => exit + list pid; else pick next port) ──
 
 def _username(uid):
@@ -5478,13 +5487,17 @@ def main():
     ap.add_argument("--apppaltest", default=None,
                     help="path to apppaltest.py (default: script/test/apppaltest.py)")
     ap.add_argument("--applog", default=None,
-                    help="run log file to write + tail (default: repo-root applog)")
+                    help="run log file to write + tail (default: repo-root "
+                         "applog.$USER, or $SCHEDULE_DEBUG_APPLOG)")
     ap.add_argument("--open", action="store_true",
                     help="open the served URL in a browser after binding")
     ap.add_argument("--claude-bin", default="claude",
                     help="path to the claude CLI for the LLM tab (default: claude)")
-    ap.add_argument("--claude-model", default=None,
-                    help="model for the LLM tab (default: claude CLI default)")
+    ap.add_argument("--claude-model",
+                    default=os.environ.get("SCHEDULE_DEBUG_CLAUDE_MODEL",
+                                           "claude-opus-5[1m]"),
+                    help="model for the LLM tab (default: claude-opus-5[1m], or "
+                         "$SCHEDULE_DEBUG_CLAUDE_MODEL; pass '' for the CLI default)")
     ap.add_argument("--claude-cwd", default=None,
                     help="working dir for the claude subprocess so it loads "
                          "CLAUDE.md/skills (default: repo root)")
@@ -5538,7 +5551,7 @@ def main():
     elf = os.path.abspath(args.elf) if args.elf else _resolve_default_elf(workdir)
     apppaltest = args.apppaltest or os.path.join(
         _REPO_ROOT, "script", "test", "apppaltest.py")
-    applog = args.applog or os.path.join(_REPO_ROOT, "applog")
+    applog = args.applog or _default_applog_path()
     # aiedbg needs a JTAG target. Resolve in priority: --target, then
     # $AIEDBG_TARGET, then ~/.aiedbg_env (the file aiedbg-setup writes) so a
     # restart works without a manual `source`. Without any, aiedbg uses its own

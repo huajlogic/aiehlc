@@ -23,6 +23,8 @@ package). None of them modify `host.cc` or any generated source.
 | `schedule_view.py` | Generates `schedule_view.json` + `host_schedule.html` from provenance JSON + `host.cc` | none (stdlib) |
 | `ensure_aiedbg.py` | Clone/install/update `aiedbg` + write `.aiehlc/aiedbg_env.sh` for PATH | none (stdlib) |
 | `schedule_debug_server.py` | **Live debug daemon** (`http.server`) behind `host_schedule.html`; deploys ELF, tails `applog`, overlays live DMA/core/event status, drives an LLM tab | `aiediag`, `aiegdb`, `ensure_aiedbg`; spawns `aiemcp.py` |
+| `streamswitch_crossref.py` | **Accuracy check + CLI** — cross-references the UI's per-tile Stream switch panel against the `XAie_Strm*` calls in generated source | `schedule_view`, `node` |
+| `flow_crossref.py` | **Attribution check + CLI** — checks that every tile and flow is shown the right information, against `routing.cc` groups + `dmaphop` endpoints | `streamswitch_crossref`, `schedule_view`, `node` |
 
 ### Dependency graph
 
@@ -250,7 +252,7 @@ python3 src/tool/debug/schedule_debug_server.py \
 
 Key flags: `--port 8091`, `--host 0.0.0.0`, `--target xsdb://...`, `--device pal`,
 `--startcol N`, `--apppaltest PATH` (default `script/test/apppaltest.py`),
-`--applog PATH` (default repo-root `applog`), `--no-llm`, `--password` /
+`--applog PATH` (default repo-root `applog.$USER`, or `$SCHEDULE_DEBUG_APPLOG`), `--no-llm`, `--password` /
 `--no-password`, `--no-mcp-probe`. `--app PATH` selects exactly one app and
 accepts either its root directory or an existing provenance bundle;
 `--app-root DIR` remains the multi-app discovery mode. Launched automatically by
@@ -1063,11 +1065,114 @@ root.
 
 ---
 
+## 6. `streamswitch_crossref.py` — is the Stream switch panel telling the truth?
+
+The tile panel's **Stream switch** section is three hops away from hardware:
+`routingprovenancemap.json` → `_load_comm_paths()` → browser JS. Nothing in that
+chain reads the code that actually programs the switch. This tool closes the
+loop by deriving the same facts from the generated source and diffing them.
+
+```bash
+python3 src/tool/debug/streamswitch_crossref.py aout/worklocal
+python3 src/tool/debug/streamswitch_crossref.py aout/worklocal -v   # + view artifacts
+```
+
+Two extractors, no shared input:
+
+| Side | Input | Method |
+|------|-------|--------|
+| source | `routing.cc`, `host.cc` | parse `XAie_StrmConnCctEnable`, `XAie_StrmPktSwSlaveSlotEnable`, `XAie_StrmPktSwSlavePortEnable`, `XAie_StrmPktSwMstrPortEnable`, `XAie_Enable{Shim,Aie}*StrmPort` |
+| ui | `routingprovenancemap.json` | run the real `renderTileRoutingSection()` from `schedule_view.HTML_TEMPLATE` under `node`, parse the rows back out |
+
+Packet routes are resolved the way the switch resolves them: a slave slot drives
+every master port on its tile whose **arbiter** matches and whose **MSelEn** has
+the slot's **msel** line set. The UI instead borrows a "shared forward master"
+from a sibling provenance record — the two agree only while that heuristic is
+right, which is exactly what this checks.
+
+Exit code is 0 on MATCH, 1 on deviation. Reported separately:
+
+- **missing from UI** — programmed in source, never rendered
+- **the UI invents** — rendered with nothing behind it
+- **rows no flow focus can reach** — visible unfocused, lost under every flow filter
+- **shim port enables absent from every UI surface** — dropped before any view
+- **NO UI DATA** — `routingprovenancemap.json` absent, so the panel is empty by
+  construction; a pipeline gap rather than a misreporting UI
+
+`tests/test_streamswitch_crossref.py` runs this against two committed fixtures
+(`tests/fixtures/streamswitch/{tiling,rawxaie}`) plus the parser and pairing unit
+tests. Known deviations live in `KNOWN_DEVIATIONS` with their root cause and are
+asserted in both directions, so fixing one makes the test ask to be updated.
+Point it at a fresh build with:
+
+```bash
+AIE_XREF_WORKDIR=aout/worklocal python3 -m pytest \
+  src/tool/debug/tests/test_streamswitch_crossref.py -q
+```
+
+Static parsing sees generated code only — switch writes issued at runtime with
+computed arguments (core-trace setup, shim loopback) are out of scope.
+
+---
+
+## 7. `flow_crossref.py` — is the right info on the right tile and flow?
+
+Section 6 asks whether a connection is real. This asks whether the UI puts it
+on the flow and the tile it belongs to — the failure a user actually notices,
+because a connection shown under the wrong flow looks entirely plausible.
+
+```bash
+python3 src/tool/debug/flow_crossref.py aout/worklocal
+python3 src/tool/debug/flow_crossref.py aout/worklocal -v   # full lists
+```
+
+**The oracle.** `routing.cc` emits one `if (v2) { ... }` block per routing
+group, in the same order as `routing_groups`, and each block's
+`XAie_EnableAieToShimDmaStrmPort` splits it exactly where `shim_aie_to_ext`
+splits the group — so a block yields a push record set and a pull record set.
+Blocks are joined to flows on DMA endpoints (tile **and** port index) plus shim
+column, taken from `dmaphopprovenacemap.json`. Neither input is what the UI
+uses: groups carry no `flow_index` in the tiling flow, so `_load_comm_paths`
+falls back to a frozenset of DMA tiles, which its own comments call ambiguous.
+
+**What it checks**
+
+| Check | Question |
+|---|---|
+| group structure | does each provenance group hold exactly its source block's connections? |
+| flow connections | does flow N's panel show flow N's connections and no others? |
+| flow tiles | does flow N's tile set match the tiles its block programs? |
+| tile flows | do the Flows table, the focused Stream switch rows, and source agree per tile? |
+| DMA badges | does each channel badge name the flow that channel serves? |
+| focus badges | after focusing flow N, does any row still wear flow M's badge? |
+| net panel badges | does the net panel agree with the tile panel about the same connection? |
+| hop coverage | does every stream hop land on a tile in the flow? |
+| shmem flows | does a tile listing a shared-memory hop for flow N admit to carrying N? |
+| shim attribution | is every shim port enable owned by exactly one flow? |
+| search anchor | does a search hit point at a tile the flow touches? |
+| group key collisions | can two groups be confused by the DMA-tile key the UI joins on? |
+
+It degrades rather than errors: without `routing.cc` blocks only whole-design
+attribution is checkable, and without `dfscheduleprovenancemap.json` the DMA
+badge checks are skipped. Both cases are stated in the output.
+
+`tests/test_flow_crossref.py` pins the checks that pass today as regression
+guards and the known defects in `KNOWN_DEFECTS` with their root cause, asserted
+in both directions.
+
+---
+
 ## Quick reference
 
 ```bash
 # Offline: generate the static schedule view
 python3 src/tool/debug/schedule_view.py aout/worklocal
+
+# Offline: check the Stream switch panel against the generated source
+python3 src/tool/debug/streamswitch_crossref.py aout/worklocal
+
+# Offline: check per-tile / per-flow attribution
+python3 src/tool/debug/flow_crossref.py aout/worklocal
 
 # Offline: dry-run the live tools (no board)
 python3 src/tool/debug/aiegdb.py --dry-run -c "target tile 0 3; dma status"

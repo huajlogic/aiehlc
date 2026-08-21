@@ -727,8 +727,28 @@ def get_flow_detail(flow_index: int) -> str:
                                % (t.get("col"), t.get("row"), label,
                                   sl.get("dir"), sl.get("idx"),
                                   ms.get("dir"), ms.get("idx")))
-                else:
-                    out.append("    (%s,%s) %s" % (t.get("col"), t.get("row"), label))
+                else:  # packet_connect — expand each leg
+                    rs = c.get("recv_slave") or {}
+                    ld = c.get("local_dma") or {}
+                    fm = c.get("forward_master") or {}
+                    fwd_str = "%s:%s" % (fm.get("dir", "?"), fm.get("idx", 0))
+                    legs = []
+                    if rs.get("dir") not in (None, "NONE"):
+                        pkt = (" pkt%d" % rs["pktid"]) if rs.get("pktid") is not None else ""
+                        legs.append("recv %s:%s%s → fwd %s" % (
+                            rs.get("dir"), rs.get("idx", 0), pkt, fwd_str))
+                    if ld.get("dir") not in (None, "NONE"):
+                        pkt = (" pkt%d" % ld["pktid"]) if ld.get("pktid") is not None else ""
+                        legs.append("dma %s:%s%s → fwd %s" % (
+                            ld.get("dir"), ld.get("idx", 0), pkt, fwd_str))
+                    if not legs and fm.get("dir") not in (None, "NONE"):
+                        legs.append("fwd → %s" % fwd_str)
+                    if legs:
+                        for leg in legs:
+                            out.append("    (%s,%s) packet  %s"
+                                       % (t.get("col"), t.get("row"), leg))
+                    else:
+                        out.append("    (%s,%s) packet" % (t.get("col"), t.get("row")))
         if gmio_conns:
             gmio_dir = {
                 "shim_aie_to_ext": "S2MM (array → DDR)",

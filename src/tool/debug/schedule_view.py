@@ -1743,7 +1743,28 @@ def _load_comm_paths(workdir):
             rg = rp_by_flow_index.get(flow_index)
         if rg is None:
             rg = rp_by_dma_tiles.get(frozenset(nonshim_tiles))
-        rg_connections = rg.get('connections', []) if rg else []
+        rg_conns_all = rg.get('connections', []) if rg else []
+        if rg_conns_all:
+            _split = next((i for i, c in enumerate(rg_conns_all)
+                           if c.get('kind') == 'shim_aie_to_ext'), None)
+            if _split is not None:
+                if direction == 'push':
+                    rg_connections = rg_conns_all[:_split]
+                else:
+                    # Pull flows: keep only packet_connect entries from the push
+                    # section (packet-switch gather config is shared) plus all
+                    # entries after shim_aie_to_ext (the pull-side routing).
+                    # Exclude push-section circuit_connect entries: they configure
+                    # the input distribution stream switch and must not appear on
+                    # pull flows or they get wrongly attributed to both.
+                    push_pkts = [c for c in rg_conns_all[:_split]
+                                 if c.get('kind') == 'packet_connect']
+                    pull_conns = rg_conns_all[_split + 1:]
+                    rg_connections = push_pkts + pull_conns
+            else:
+                rg_connections = rg_conns_all
+        else:
+            rg_connections = []
 
         stages_raw = p.get('stages', [])
 
@@ -3163,7 +3184,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="devmap-vp">
       <button id="devmap-reset" onclick="dmReset(true)">Reset view</button>
       <label id="dmSwWrap" title="show/hide CCT/PKT routing config inside tiles"><input type="checkbox" id="dmSwToggle" checked> routing info</label>
-      <div id="devmap-spacehint">scroll to zoom · click tile to inspect · click stream to isolate</div>
+      <div id="devmap-spacehint">scroll to zoom · click tile to inspect · right-click tile for routing/isolate menu · click stream to isolate</div>
       <div id="devmap-canvas"><svg id="devmap-svg"></svg></div>
       <div id="devmap-hint">col 0–3 · row 0 (shim) at bottom</div>
     </div>
@@ -4594,7 +4615,16 @@ function dmColor(fi){ return DM_COLORS[dmFlowIds.indexOf(fi)%DM_COLORS.length]; 
 let dmActiveNets = new Set();   // empty = all nets active (unless dmHideAll)
 let dmHideAll = false;          // true = All Flows toggled off
 let dmShowSW = true;
+// Per-tile routing-info overrides, driven by the tile right-click menu. The
+// dmSwToggle checkbox stays the master switch; this set carves individual tiles
+// out of it so a dense map can be thinned one tile/row/column at a time.
+// Collapsed tiles also drop out of the SW_ROWS max, so collapsing everything in
+// view shrinks the boxes instead of leaving a field of empty rows.
+let dmSwCollapsed = new Set();  // 'c,r' keys whose routing rows are hidden
 let dmBuilt = false;
+// One-shot: refit on the next rebuild. Set only by "Reset view" — every other
+// rebuild (net chips, tile menu, search, filters) keeps the user's pan/zoom.
+let dmRefitNext = false;
 // Map tile selection lives at module scope so it survives a buildDeviceMap()
 // rebuild (e.g. triggered by a net click) instead of being wiped each time.
 let dmSelKeys = new Set();      // 'c,r' keys of highlighted map tiles
@@ -4623,7 +4653,9 @@ function dmApply(){
   document.getElementById('devmap-canvas').style.transform=
     'translate('+dmTx+'px,'+dmTy+'px) scale('+dmScale+')';
 }
-function dmReset(rebuild){
+// Centre the map at fit-zoom. Reads the SVG's current width/height, so it must
+// run *after* a rebuild has resized it, never before.
+function dmFitView(){
   const vp=document.getElementById('devmap-vp');
   const svg=document.getElementById('devmap-svg');
   const vpW=vp.clientWidth, vpH=vp.clientHeight;
@@ -4636,16 +4668,25 @@ function dmReset(rebuild){
     dmTy=(vpH-svgH*dmScale)/2;
   } else { dmTx=20; dmTy=20; dmScale=0.9; }
   dmApply();
+}
+
+function dmReset(rebuild){
   // Reset filter state only when called from the Reset button, not from buildDeviceMap itself.
   if(rebuild){
     dmActiveNets=new Set();
     dmHideAll=false;
     dmSelKeys=new Set();
+    dmSwCollapsed=new Set();
     const allChip=document.querySelector('.dm-chip.all-chip');
     if(allChip) allChip.classList.add('act');
     document.querySelectorAll('.dm-chip.net-chip').forEach(c=>c.classList.add('act'));
+    // Refit after the rebuild, not before: clearing the filters changes the tile
+    // geometry, so fitting against the old SVG size would land slightly wrong.
+    dmRefitNext=true;
     buildDeviceMap();
+    return;
   }
+  dmFitView();
 }
 
 (function initPanZoom(){
@@ -4668,7 +4709,7 @@ function dmReset(rebuild){
     e.preventDefault();
     const r=vp.getBoundingClientRect();
     const mx=e.clientX-r.left, my=e.clientY-r.top;
-    const d=Math.pow(1.0025,-e.deltaY);
+    const d=Math.pow(1.0016,-e.deltaY);
     const ns=Math.max(0.12,Math.min(6,dmScale*d));
     dmTx=mx-(mx-dmTx)*(ns/dmScale);
     dmTy=my-(my-dmTy)*(ns/dmScale);
@@ -5086,9 +5127,9 @@ function dmStColor(state){ return (LSTATE[state]||LSTATE.unknown)[0]; }
 function dmStLabel(state){ return (LSTATE[state]||LSTATE.unknown)[1]; }
 
 // Paint scan results onto the already-built SVG. Deliberately a DOM patch
-// rather than a rebuild: buildDeviceMap() ends in dmReset(), which re-fits the
-// zoom, so rebuilding on every 2s poll would yank the view out from under a
-// user who has panned in.
+// rather than a rebuild: a rebuild is far more work than setting a few
+// attributes, and doing it on every 2s poll would churn the whole SVG under a
+// user who is mid-interaction.
 function dmPaintStatus(){
   const cells = dmStatus.cells;
   const svg = document.getElementById('devmap-svg');
@@ -5263,6 +5304,13 @@ function dmSelectNet(fi, ctrl){
     if(dmActiveNets.size===1&&dmActiveNets.has(fi)) dmActiveNets=new Set();
     else { dmActiveNets=new Set(); dmActiveNets.add(fi); }
   }
+  dmSyncNetSelection();
+}
+
+// Repaint the chip bar, rebuild the map and reconcile the side panel against
+// whatever dmActiveNets/dmHideAll now say. Split out of dmSelectNet so the tile
+// right-click menu can set the selection itself and still land in one place.
+function dmSyncNetSelection(){
   const allActive=!dmHideAll&&dmActiveNets.size===0;
   document.querySelector('.dm-chip.all-chip').classList.toggle('act',allActive);
   document.querySelectorAll('.dm-chip.net-chip').forEach(c=>{
@@ -5293,6 +5341,112 @@ function dmSelectNet(fi, ctrl){
   }
   panelSync();
 }
+
+// ── Tile right-click menu ─────────────────────────────────────
+// Two actions the chip bar can't express: thinning routing rows per tile/row/
+// column, and isolating by tile instead of by net.
+
+// Flow indices whose path touches (tc,tr). Uses the same _flowTileSet() the
+// renderer uses to decide which tiles a flow draws through, so the isolated set
+// is exactly the flows that would still paint this tile.
+function dmFlowsAtTile(tc, tr){
+  const key=tc+','+tr, out=new Set();
+  (DATA.comm_paths||[]).forEach(p=>{
+    if(_flowTileSet(p).has(key)) out.add(p.flow_index);
+  });
+  return out;
+}
+
+// Keys of every rendered tile box in a row / column / the whole map. Waypoint
+// tiles are excluded: they draw no box and so have no routing rows to collapse.
+function dmTileKeysIn(scope, tc, tr){
+  const svg=document.getElementById('devmap-svg');
+  const out=[];
+  svg.querySelectorAll('.dm-tile').forEach(g=>{
+    if(g.getAttribute('data-waypoint')==='1') return;
+    const k=g.getAttribute('data-key'); if(!k) return;
+    const [c,r]=k.split(',').map(Number);
+    if(scope==='row'&&r!==tr) return;
+    if(scope==='col'&&c!==tc) return;
+    out.push(k);
+  });
+  return out;
+}
+
+// Collapse unless every key in scope is already collapsed, in which case expand.
+// One menu entry per scope that reads as a toggle, matching the net chips.
+function dmToggleRouting(keys){
+  if(!keys.length) return;
+  const allHidden=keys.every(k=>dmSwCollapsed.has(k));
+  keys.forEach(k=>{ if(allHidden) dmSwCollapsed.delete(k); else dmSwCollapsed.add(k); });
+  buildDeviceMap();
+}
+
+function dmHideMenu(){
+  const m=document.getElementById('dm-ctxmenu');
+  if(m) m.remove();
+}
+
+function dmShowTileMenu(clientX, clientY, tc, tr){
+  dmHideMenu();
+  dmHideTip();
+  const key=tc+','+tr;
+  const rowKeys=dmTileKeysIn('row',tc,tr), colKeys=dmTileKeysIn('col',tc,tr);
+  const flows=dmFlowsAtTile(tc,tr);
+  const lbl=(keys,what)=>(keys.every(k=>dmSwCollapsed.has(k))?'Expand ':'Collapse ')+what;
+
+  const items=[
+    {head:'routing info'},
+    {text:lbl([key],'this tile'), on:()=>dmToggleRouting([key])},
+    {text:lbl(rowKeys,'row '+tr+'  ('+rowKeys.length+' tiles)'), on:()=>dmToggleRouting(rowKeys)},
+    {text:lbl(colKeys,'column '+tc+'  ('+colKeys.length+' tiles)'), on:()=>dmToggleRouting(colKeys)},
+    {sep:true},
+    {head:'flows'},
+    {text:'Isolate flows through this tile  ('+flows.size+')',
+     dis:flows.size===0,
+     on:()=>{ dmHideAll=false; dmActiveNets=new Set(flows); dmSyncNetSelection(); }},
+    {text:'Show all flows', dis:!dmHideAll&&dmActiveNets.size===0,
+     on:()=>{ dmHideAll=false; dmActiveNets=new Set(); dmSyncNetSelection(); }},
+  ];
+
+  const m=document.createElement('div');
+  m.id='dm-ctxmenu';
+  m.style.cssText='position:fixed;z-index:10000;min-width:210px;'
+    +'background:#1a1c27;border:1px solid #2a2e46;border-radius:5px;padding:4px 0;'
+    +'font:11px/1.6 ui-monospace,monospace;color:#e2e4f0;'
+    +'box-shadow:0 6px 22px rgba(0,0,0,.7);';
+  items.forEach(it=>{
+    const d=document.createElement('div');
+    if(it.sep){
+      d.style.cssText='height:1px;background:#2a2e46;margin:4px 0;';
+    } else if(it.head){
+      d.style.cssText='padding:2px 10px;color:#7c8099;font-size:9px;'
+        +'letter-spacing:.08em;text-transform:uppercase;';
+      d.textContent=it.head;
+    } else {
+      d.style.cssText='padding:3px 12px;cursor:'+(it.dis?'default':'pointer')
+        +';color:'+(it.dis?'#5a5e74':'#e2e4f0')+';white-space:nowrap;';
+      d.textContent=it.text;
+      if(!it.dis){
+        d.onmouseenter=()=>d.style.background='#262a3d';
+        d.onmouseleave=()=>d.style.background='';
+        d.onclick=()=>{ dmHideMenu(); it.on(); };
+      }
+    }
+    m.appendChild(d);
+  });
+  document.body.appendChild(m);
+  // Flip against the viewport edges the same way dmShowTip does.
+  let lx=clientX+2, ly=clientY+2;
+  if(lx+m.offsetWidth>window.innerWidth-8) lx=clientX-m.offsetWidth-2;
+  if(ly+m.offsetHeight>window.innerHeight-8) ly=Math.max(8,clientY-m.offsetHeight-2);
+  m.style.left=lx+'px'; m.style.top=ly+'px';
+}
+document.addEventListener('mousedown',e=>{
+  const m=document.getElementById('dm-ctxmenu');
+  if(m&&!m.contains(e.target)) dmHideMenu();
+});
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') dmHideMenu(); });
 
 function buildNetBody(p){
   if(!p) return '<div class="placeholder">Click a tile or net for details</div>';
@@ -5398,9 +5552,12 @@ function buildNetBody(p){
     let kind='', detail='', extra='';
     if(c.kind==='packet_hw'){
       kind='PKT';
-      detail=esc(c.slave.dir)+':'+c.slave.idx+'&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx;
+      const sl=c.slave||{};
+      detail=sl.dir
+        ?esc(sl.dir)+':'+sl.idx+'&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx
+        :'fwd&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx;
       if(c.pktid!=null) extra='<span class="rt-pktid" title="packet match id">pkt'+c.pktid+'</span>';
-      extra+=_fmtPktMaskBadge(c.mask,c.leg);
+      if(c.mask!=null) extra+=_fmtPktMaskBadge(c.mask,c.leg);
     } else {
       kind='CCT';
       const s=c.slave||{}, m=c.master||{};
@@ -5591,6 +5748,7 @@ function buildDeviceMap(){
         const t=c.tile||{};
         if(_swShimKinds.has(c.kind)) return;
         const tkey=t.col+','+t.row;
+        if(dmSwCollapsed.has(tkey)) return;
         if(fts.size>0&&!fts.has(tkey)) return;
         let ck;
         if(c.kind==='packet_connect'){
@@ -5608,12 +5766,24 @@ function buildDeviceMap(){
     });
   }
   const _maxConns=_tileConnKeys.size?Math.max(...[..._tileConnKeys.values()].map(s=>s.size)):0;
-  const SW_ROWS=dmShowSW?Math.min(24,Math.max(4,_maxConns)):0;
+  // No rows to draw anywhere (routing info off, all flows hidden, or every tile
+  // collapsed) → zero rows, so the boxes shrink instead of reserving dead space.
+  const SW_ROWS=(dmShowSW&&_maxConns)?Math.min(24,Math.max(4,_maxConns)):0;
 
-  // Compute col/row counts first (need tileMap for this)
-  // Defer sizing until after tileMap is built — use temp values here,
-  // then recalculate SVG size after allCols/allRows are known.
-  const TW=148, TH=dmShowSW?(52+SW_ROWS*8):72, GX=24, GY=14;
+  // Max number of DMA badges any single SW row needs (one per flow with a local DMA channel).
+  let _maxDmaBadges=1;
+  if(dmShowSW){
+    (DATA.tiles||[]).forEach(t=>{
+      if(dmSwCollapsed.has(t.loc[0]+','+t.loc[1])) return;
+      const localFiSet=new Set((t.dma_channels||[]).map(ch=>ch.flow_index));
+      _tileRoutingConns(t.loc[0],t.loc[1]).forEach(c=>{
+        const withDma=(c.flow_indices||[c.flow_index]).filter(fi=>localFiSet.has(fi));
+        if(withDma.length>_maxDmaBadges) _maxDmaBadges=withDma.length;
+      });
+    });
+  }
+  // Extra tile width: each additional badge is ~28px (label ≤7 chars * 3.55 + 4 + 2px gap).
+  const TW=148+(_maxDmaBadges-1)*30, TH=dmShowSW?(52+SW_ROWS*8):72, GX=24, GY=14;
   const COLSTEP=TW+GX, ROWSTEP=TH+GY;
 
   // Merge DATA.tiles with every tile referenced in comm_paths (waypoints + hops)
@@ -5824,39 +5994,13 @@ function buildDeviceMap(){
       'text-anchor':'end','font-size':'7','font-family':'monospace',fill:ts.label}),
       typStr));
 
-    if(dmShowSW){
-      const shimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
-      const rconns=[];
-      const rcSeen=new Set();
-      (DATA.comm_paths||[]).forEach(p=>{
-        if(dmHideAll) return;
-        if(dmActiveNets.size>0&&!dmActiveNets.has(p.flow_index)) return;
-        const fts=_flowTileSet(p);
-        if(fts.size>0&&!fts.has(tc+','+tr)) return;
-        (p.routing_connections||[]).forEach(c=>{
-          const ct=c.tile||{};
-          if(ct.col!==tc||ct.row!==tr||shimKinds.has(c.kind)) return;
-          if(c.kind==='packet_connect') return;
-          const s=c.slave||{},m=c.master||{};
-          const key=p.flow_index+'|'+c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
-          if(rcSeen.has(key)) return;
-          rcSeen.add(key);
-          rconns.push({...c, flow_index:p.flow_index});
-        });
-        const pathPkt=(p.routing_connections||[]).filter(c=>{
-          const ct=c.tile||{};
-          return ct.col===tc&&ct.row===tr&&c.kind==='packet_connect';
-        });
-        const sharedPktFwd=_sharedPktForwardMaster(pathPkt);
-        pathPkt.forEach(c=>{
-          _expandPktConnectRows(c,sharedPktFwd).forEach(row=>{
-            const key=p.flow_index+'|'+_pktRowKey(row);
-            if(rcSeen.has(key)) return;
-            rcSeen.add(key);
-            rconns.push({kind:'packet_hw', tile:c.tile, flow_index:p.flow_index, ...row});
-          });
-        });
-      });
+    if(dmShowSW&&!dmSwCollapsed.has(key)){
+      let rconns=_tileRoutingConns(tc,tr);
+      if(dmHideAll){
+        rconns=[];
+      } else if(dmActiveNets.size>0){
+        rconns=rconns.filter(c=>(c.flow_indices||[c.flow_index]).some(fi=>dmActiveNets.has(fi)));
+      }
       const shortDir=_shortDir;
       rconns.slice(0,SW_ROWS).forEach((c,i)=>{
         const isCct=c.kind==='circuit_connect';
@@ -5885,16 +6029,23 @@ function buildDeviceMap(){
             'pointer-events':'none'}), b.text));
           badgeX+=bw+2;
         });
-        const dmaLbl=_flowDmaLabel(c.flow_index,tc,tr);
-        const dmaSt=_flowDmaBadgeStyle(dmaLbl);
-        const badgeText=dmaSt.text;
-        const bw=_svgBadgeWidth(badgeText);
-        const bx=tx(tc)+TW-bw-4;
-        g.appendChild(svgN('rect',{x:bx,y:y-5,width:String(bw),height:'7',
-          rx:'2',fill:dmaSt.bg,'pointer-events':'none'}));
-        g.appendChild(svgT(svgN('text',{x:bx+2,y,
-          'font-size':'6','font-family':'monospace',
-          fill:dmaSt.fg,'pointer-events':'none'}), badgeText));
+        // Draw one badge per flow that has a local DMA channel on this tile, right-aligned.
+        const localFiSet=new Set((t.dma_channels||[]).map(ch=>ch.flow_index));
+        const dmaCandidates=(c.flow_indices||[c.flow_index]).filter(fi=>localFiSet.has(fi));
+        const dmaBadges=dmaCandidates.length
+          ?dmaCandidates.map(fi=>{const lbl=_flowDmaLabel(fi,tc,tr);return _flowDmaBadgeStyle(lbl);})
+          :[_flowDmaBadgeStyle('')];
+        let bx=tx(tc)+TW-4;
+        dmaBadges.forEach(dmaSt=>{
+          const bw=_svgBadgeWidth(dmaSt.text);
+          bx-=bw;
+          g.appendChild(svgN('rect',{x:bx,y:y-5,width:String(bw),height:'7',
+            rx:'2',fill:dmaSt.bg,'pointer-events':'none'}));
+          g.appendChild(svgT(svgN('text',{x:bx+2,y,
+            'font-size':'6','font-family':'monospace',
+            fill:dmaSt.fg,'pointer-events':'none'}), dmaSt.text));
+          bx-=2;
+        });
       });
     }
 
@@ -5903,7 +6054,10 @@ function buildDeviceMap(){
         :t.dma_channels.filter(ch=>!dmHideAll&&dmActiveNets.has(ch.flow_index));
       const ins=chans.filter(ch=>ch.direction==='S2MM');
       const outs=chans.filter(ch=>ch.direction==='MM2S');
-      const dmaBaseY=ty(tr)+(dmShowSW?(22+SW_ROWS*8):22);
+      // A collapsed tile drew no routing rows, so pull its DMA badges up into
+      // the freed space instead of leaving a gap the height of the global rows.
+      const swRowsHere=(dmShowSW&&!dmSwCollapsed.has(key))?SW_ROWS:0;
+      const dmaBaseY=ty(tr)+(swRowsHere?(22+swRowsHere*8):22);
       ins.slice(0,3).forEach((ch,i)=>{
         const fc=dmColor(ch.flow_index);
         const y=dmaBaseY+i*10;
@@ -5987,12 +6141,19 @@ function buildDeviceMap(){
       }
       dmHideTip();
     });
+    // Right-click menu. stopPropagation keeps the viewport's blanket
+    // preventDefault from being the only handler that sees this event.
+    g.addEventListener('contextmenu',e=>{
+      e.preventDefault(); e.stopPropagation();
+      dmShowTileMenu(e.clientX,e.clientY,tc,tr);
+    });
+
     g.addEventListener('click',e=>{
       if(dmDragging) return;
       const ctrl=e.ctrlKey||e.metaKey||ctrlHeld;
       const selOn=k=>{ const gr=tileGroups[k]; if(!gr) return;
         const r=gr.querySelector('rect'); if(!r) return;
-        r.setAttribute('stroke','#599ce7'); r.setAttribute('stroke-width','2'); };
+        r.setAttribute('stroke','var(--sel)'); r.setAttribute('stroke-width','2'); };
       const selOff=k=>{ const gr=tileGroups[k]; if(!gr) return;
         const r=gr.querySelector('rect'); if(!r) return;
         r.setAttribute('stroke',dmTileStroke[k]||'var(--stroke,#e4e4e433)');
@@ -6033,7 +6194,7 @@ function buildDeviceMap(){
   dmSelKeys.forEach(k=>{
     const gr=tileGroups[k]; if(!gr) return;
     const r=gr.querySelector('rect'); if(!r) return;
-    r.setAttribute('stroke','#599ce7'); r.setAttribute('stroke-width','2');
+    r.setAttribute('stroke','var(--sel)'); r.setAttribute('stroke-width','2');
   });
 
   // ── LAYER 3: packet-switched and shmem links ──────────────────────
@@ -6426,7 +6587,12 @@ function buildDeviceMap(){
 
   svg.appendChild(dotsG);
 
-  dmReset();
+  // Fit only on the first build or an explicit "Reset view". Rebuilds triggered
+  // by the net chips, the tile right-click menu or a search must not throw away
+  // the pan/zoom the user set up — the transform is independent of the geometry,
+  // so reapplying it keeps the view anchored even when tile heights change.
+  if(dmRefitNext||!dmBuilt){ dmRefitNext=false; dmFitView(); }
+  else dmApply();
   // The SVG was recreated from scratch above, so any live status painted on the
   // previous DOM is gone — re-apply it from module state.
   dmPaintStatus();
@@ -6464,9 +6630,21 @@ function _flowDmaBadgeStyle(lbl){
     title:'S2MM — stream to tile memory (receive)'};
 }
 function _flowDmaSpanHtml(fi, col, row){
-  const lbl=_flowDmaLabel(fi,col,row);
-  const st=_flowDmaBadgeStyle(lbl);
-  return '<span class="'+st.cls+'" title="'+esc(st.title)+'">'+esc(st.text)+'</span>';
+  if(fi==null){
+    const st=_flowDmaBadgeStyle('');
+    return '<span class="'+st.cls+'" title="'+esc(st.title)+'">'+esc(st.text)+'</span>';
+  }
+  const tile=(DATA.tiles||[]).find(t=>t.loc[0]===col && t.loc[1]===row);
+  const chans=tile?(tile.dma_channels||[]).filter(c=>c.flow_index===fi):[];
+  if(!chans.length){
+    const st=_flowDmaBadgeStyle('');
+    return '<span class="'+st.cls+'" title="'+esc(st.title)+'">'+esc(st.text)+'</span>';
+  }
+  return chans.map(ch=>{
+    const lbl=_fmtDmaChanBadge(ch);
+    const st=_flowDmaBadgeStyle(lbl);
+    return '<span class="'+st.cls+'" title="'+esc(st.title)+'">'+esc(st.text)+'</span>';
+  }).join('');
 }
 
 function _flowTileSet(p){
@@ -6506,36 +6684,43 @@ function _fmtPktMaskBadge(mask, leg){
 function _expandPktConnectRows(c, sharedFwd){
   const rs=c.recv_slave||{}, ld=c.local_dma||{}, fm=c.forward_master||{};
   const master=_isPktPort(fm)?fm:sharedFwd;
-  if(!master) return [];
   const rows=[];
-  if(_isPktPort(rs))
+  if(_isPktPort(rs) && master)
     rows.push({leg:'recv', slave:{dir:rs.dir, idx:rs.idx},
                master:{dir:master.dir, idx:master.idx},
                pktid:rs.pktid, mask:_resolvePktMask('recv', rs)});
-  if(_isPktPort(ld))
+  if(_isPktPort(ld) && master)
     rows.push({leg:'dma', slave:{dir:ld.dir, idx:ld.idx},
                master:{dir:master.dir, idx:master.idx},
                pktid:ld.pktid, mask:_resolvePktMask('dma', ld)});
+  // Forward-only entry: no recv/dma slave but a valid forward_master (e.g. the
+  // terminal gather tile that hands off from the packet segment to circuit-switch).
+  if(!rows.length && _isPktPort(fm))
+    rows.push({leg:'fwd', slave:null, master:{dir:fm.dir, idx:fm.idx},
+               pktid:null, mask:null});
   return rows;
 }
 function _pktRowKey(row){
-  return 'pkt|'+row.leg+'|'+row.slave.dir+'|'+row.slave.idx+'|'+(row.pktid??'?')
+  const sl=row.slave||{};
+  return 'pkt|'+row.leg+'|'+(sl.dir??'none')+'|'+(sl.idx??'-')+'|'+(row.pktid??'?')
     +'|'+row.mask+'|'+row.master.dir+'|'+row.master.idx;
 }
 function _fmtPktLabel(row, compact){
   const dir=compact?_shortDir:(d=>d);
   const arr=' → ';
-  let s='PKT '+dir(row.slave.dir)+':'+row.slave.idx+arr+dir(row.master.dir)+':'+row.master.idx;
+  const sl=row.slave||{};
+  const slavePart=sl.dir?dir(sl.dir)+':'+sl.idx:'fwd';
+  let s='PKT '+slavePart+arr+dir(row.master.dir)+':'+row.master.idx;
   if(!compact){
     if(row.pktid!=null) s+=' pkt'+row.pktid;
-    s+=' '+_fmtPktMaskHex(row.mask, row.leg);
+    if(row.mask!=null) s+=' '+_fmtPktMaskHex(row.mask, row.leg);
   }
   return s;
 }
 function _dmPktBadges(row){
   const badges=[];
   if(row.pktid!=null) badges.push({text:'pkt'+row.pktid, bg:'#2a0838', fg:'#c07fd4'});
-  badges.push({text:_fmtPktMaskHex(row.mask, row.leg), bg:'#3a1010', fg:'#e87850'});
+  if(row.mask!=null) badges.push({text:_fmtPktMaskHex(row.mask, row.leg), bg:'#3a1010', fg:'#e87850'});
   return badges;
 }
 function _svgBadgeWidth(text){
@@ -6605,8 +6790,12 @@ function _tileRoutingConns(col, row){
     const sharedPktFwd=_sharedPktForwardMaster(pathPkt);
     pathPkt.forEach(c=>{
       _expandPktConnectRows(c,sharedPktFwd).forEach(row=>{
-        const key=p.flow_index+'|'+_pktRowKey(row);
-        if(keyIdx.has(key)) return;
+        const key=_pktRowKey(row);
+        if(keyIdx.has(key)){
+          const existing=out[keyIdx.get(key)];
+          if(!(existing.flow_indices||[]).includes(p.flow_index)) existing.flow_indices.push(p.flow_index);
+          return;
+        }
         keyIdx.set(key, out.length);
         out.push({kind:'packet_hw', ...row, flow_index:p.flow_index, flow_indices:[p.flow_index]});
       });
@@ -6616,8 +6805,12 @@ function _tileRoutingConns(col, row){
       if(t.col!==col || t.row!==row || shimKinds.has(c.kind)) return;
       if(c.kind==='packet_connect') return;
       const s=c.slave||{}, m=c.master||{};
-      const key=p.flow_index+'|'+c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
-      if(keyIdx.has(key)) return;
+      const key=c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
+      if(keyIdx.has(key)){
+        const existing=out[keyIdx.get(key)];
+        if(!(existing.flow_indices||[]).includes(p.flow_index)) existing.flow_indices.push(p.flow_index);
+        return;
+      }
       keyIdx.set(key, out.length);
       out.push({...c, flow_index:p.flow_index, flow_indices:[p.flow_index]});
     });
@@ -6637,27 +6830,33 @@ function renderTileRoutingSection(col, row, focusFlowIdx){
   if(!conns.length) return '';
 
   const rows=conns.map(c=>{
-    const dfi=(focusFlowIdx!=null&&(c.flow_indices||[]).includes(focusFlowIdx))?focusFlowIdx:c.flow_index;
+    const tile=(DATA.tiles||[]).find(t=>t.loc[0]===col&&t.loc[1]===row);
+    const localFis=new Set((tile&&tile.dma_channels||[]).map(ch=>ch.flow_index));
+    const candidates=(c.flow_indices||[c.flow_index]);
+    const withDma=candidates.filter(fi=>localFis.has(fi));
+    // Show one badge per flow that has a local DMA channel; fall back to route badge.
+    const dmaSpan=withDma.length
+      ?withDma.map(fi=>_flowDmaSpanHtml(fi,col,row)).join('')
+      :_flowDmaSpanHtml(null,col,row);
     if(c.kind==='packet_hw'){
-      const ports=esc(c.slave.dir)+':'+c.slave.idx+'&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx;
+      const sl=c.slave||{};
+      const ports=sl.dir
+        ?esc(sl.dir)+':'+sl.idx+'&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx
+        :'fwd&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx;
       const pktSpan=(c.pktid!=null)
         ?'<span class="rt-pktid" title="packet match id">pkt'+c.pktid+'</span>':'';
-      const maskSpan=_fmtPktMaskBadge(c.mask,c.leg);
-      const flow=(dfi!=null)?'<span class="rt-flow">fl'+dfi+'</span>':'';
-      const dmaSpan=_flowDmaSpanHtml(dfi,col,row);
+      const maskSpan=(c.mask!=null)?_fmtPktMaskBadge(c.mask,c.leg):'';
       return '<div class="rt-row pkt">'
         +'<span class="rt-kind">PKT</span>'
         +'<span class="rt-ports">'+ports+'</span>'
-        +pktSpan+maskSpan+dmaSpan+flow+'</div>';
+        +pktSpan+maskSpan+dmaSpan+'</div>';
     }
     const s=c.slave||{}, m=c.master||{};
     const ports=esc(s.dir)+':'+s.idx+'&nbsp;&rarr;&nbsp;'+esc(m.dir)+':'+m.idx;
-    const flow=(dfi!=null)?'<span class="rt-flow">fl'+dfi+'</span>':'';
-    const dmaSpan=_flowDmaSpanHtml(dfi,col,row);
     return '<div class="rt-row cct">'
       +'<span class="rt-kind">CCT</span>'
       +'<span class="rt-ports">'+ports+'</span>'
-      +dmaSpan+flow+'</div>';
+      +dmaSpan+'</div>';
   });
   const mstBlock=_renderPktMasterBlock(col, row, focusFlowIdx);
   return '<div class="sec"><div class="sec-hdr">Stream switch</div>'
