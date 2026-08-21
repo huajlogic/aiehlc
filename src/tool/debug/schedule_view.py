@@ -2755,6 +2755,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .scan-what:hover { color:var(--tx-hi); background:var(--bg-hover); }
   .scan-what:focus-visible { outline:1px solid var(--bd-accent); outline-offset:1px; }
   #overlayWhat { margin-left:8px; vertical-align:middle; }
+  /* Scan progress. A switch scan costs one board round-trip per tile, so the
+     status text alone leaves the page looking hung. Revealed on a delay (see
+     setScanBusy) so the 2s DMA poll does not blink it. */
+  .spin { display:inline-block; width:11px; height:11px; margin-left:7px;
+          vertical-align:-1px; box-sizing:border-box;
+          border:2px solid var(--bd); border-top-color:var(--accent);
+          border-radius:50%; animation:scanspin .7s linear infinite; }
+  .spin[hidden] { display:none; }
+  @keyframes scanspin { to { transform:rotate(360deg); } }
+  /* Reduced motion: the ring appearing at all is the signal; spinning it is
+     decoration the user has asked not to see. */
+  @media (prefers-reduced-motion: reduce) { .spin { animation:none; } }
   /* Scan is an ACTION, not a selection. It deliberately avoids both tab states:
      --accent-dim fill would read as a selected tab, and the default button
      surface (--bg-raised on --bd) is nearly identical to an *un*selected .ltab.
@@ -3195,7 +3207,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <option value="events" title="DMA start/finish/error events">Events</option>
       <option value="switch" title="stream-switch registers, diffed against the routing map">Switch</option>
     </select>
-    <button id="gridScanBtn" title="read live status from the board / simulator">Scan</button>
+    <button id="gridScanBtn" title="read live status from the board / simulator">Scan</button><span class="spin" id="gridSpin" hidden title="scan in progress"></span>
     <div id="livestatus"></div>
     <div id="runstatus"></div>
     <div id="issue-bar"></div>
@@ -3217,7 +3229,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <option value="events" title="DMA start/finish/error events">Events</option>
           <option value="switch" title="stream-switch registers, diffed against the routing map">Switch</option>
         </select>
-        <button id="dmScanBtn" title="read live status from the board / simulator">Scan</button>
+        <button id="dmScanBtn" title="read live status from the board / simulator">Scan</button><span class="spin" id="dmSpin" hidden title="scan in progress"></span>
         <button id="dmClearBtn" title="clear scan status and search highlights">Clear</button>
       </div>
     </div>
@@ -9015,6 +9027,19 @@ function applyGrid(res){
 // userInitiated: a click (mode pill, Scan button, live checkbox) rather than the
 // 2s timer. Only user scans queue a retry when the guard rejects them — letting
 // skipped auto-polls retry would busy-loop the board back-to-back with no gap.
+// Scan progress indicator, shared by both views.
+let SCAN_SPIN_T = null;
+function setScanBusy(on){
+  clearTimeout(SCAN_SPIN_T); SCAN_SPIN_T = null;
+  const els = ['gridSpin','dmSpin']
+    .map(id => document.getElementById(id)).filter(Boolean);
+  if (!on){ els.forEach(e => e.hidden = true); return; }
+  // Delayed reveal: a DMA poll usually lands well inside this, and a spinner
+  // that blinks every 2s reads as a fault rather than as progress. A switch
+  // scan (one board round-trip per tile) is always slower than the delay.
+  SCAN_SPIN_T = setTimeout(() => els.forEach(e => e.hidden = false), 250);
+}
+
 function scanOnce(userInitiated){
   // One-shot scan, always runs (user-triggered). Skips the runActive guard so
   // the user can read core/DMA state even while a run is parked on the board —
@@ -9026,6 +9051,7 @@ function scanOnce(userInitiated){
   if (LIVE.gridBusy){ if (userInitiated) LIVE.rescan = true; return; }
   LIVE.gridBusy = true;
   LIVE.rescan = false;
+  setScanBusy(true);
   // Pin the mode for this request. A scan can easily outlive the 2s poll, so by
   // the time it lands the user may have picked a different one.
   const what = LIVE.what;
@@ -9046,8 +9072,13 @@ function scanOnce(userInitiated){
       LIVE.gridBusy = false;
       // A swallowed click always retries. A mode changed mid-scan only retries
       // under live — with the poll off, picking a mode must not read the board.
-      if (LIVE.rescan || (LIVE.enabled && what !== LIVE.what)){
+      const chained = LIVE.rescan || (LIVE.enabled && what !== LIVE.what);
+      if (chained){
+        // Leave the spinner up across the handoff; hiding it here would blink
+        // it off and on for a scan that never actually stopped.
         LIVE.rescan = false; scanOnce(true);
+      } else {
+        setScanBusy(false);
       }
     });
 }
