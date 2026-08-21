@@ -958,15 +958,33 @@ def port_label(port_type, num):
     """e.g. ("NORTH", 2) -> 'NORTH2', ("DMA", 0) -> 'DMA0'."""
     return f"{port_type}{num}"
 
+# Packet-mode CONFIGURATION field split (xaie_ss.c:45-48).
+STRM_MASTER_ARBITER_MASK = 0x7
+STRM_MASTER_MSELEN_LSB   = 3
+STRM_MASTER_MSELEN_MASK  = 0x78
+
+
 def decode_strm_master(raw):
-    """Decode a master-config reg. CONFIGURATION = physical slave index feeding
-    this master (driver _StrmConfigMstr writes SlaveIdx there; xaie_ss.c:154)."""
+    """Decode a master-config reg.
+
+    CONFIGURATION means two different things depending on the packet bit: in
+    circuit mode it is the physical slave index feeding this master (driver
+    _StrmConfigMstr writes SlaveIdx there; xaie_ss.c:154), in packet mode it is
+    arbiter[2:0] | msel_en[6:3] (xaie_ss.c:627-630) and names no slave at all.
+    """
+    config = raw & 0x7F
+    packet = bool(raw & 0x40000000)
     return {
         "raw": raw,
         "enable": bool(raw & 0x80000000),
-        "packet": bool(raw & 0x40000000),
+        "packet": packet,
         "drop_header": bool(raw & 0x00000080),
-        "config": raw & 0x7F,   # source slave physical index
+        "config": config,
+        # Only one of these is meaningful, picked by "packet".
+        "slave_idx": None if packet else config,
+        "arbiter": (config & STRM_MASTER_ARBITER_MASK) if packet else None,
+        "msel_en": ((config & STRM_MASTER_MSELEN_MASK) >> STRM_MASTER_MSELEN_LSB)
+                   if packet else None,
     }
 
 def decode_strm_slave(raw):
@@ -1057,15 +1075,21 @@ def format_switch(phys_col, row, tile_type, decoded):
     if not en_masters:
         lines.append(dim("    (no enabled master ports)"))
     for m in en_masters:
-        src_idx = m["config"]
+        extra = "  drop_header" if m["drop_header"] else ""
+        if m["packet"]:
+            # A packet master names no source slave: it is fed by whichever
+            # slave slots match its arbiter and MSel line.
+            lines.append(green(
+                f"    {'(arbiter)':>8} -> {m['port']:<8}  [packet] "
+                f"arbiter={m['arbiter']} msel_en=0x{m['msel_en']:X}{extra}"))
+            continue
+        src_idx = m["slave_idx"]
         if 0 <= src_idx < len(slave_ports):
             st, sn = slave_ports[src_idx]
             src = port_label(st, sn)
         else:
             src = f"slave#{src_idx}?"
-        mode = "packet" if m["packet"] else "circuit"
-        extra = "  drop_header" if m["drop_header"] else ""
-        lines.append(green(f"    {src:>8} -> {m['port']:<8}  [{mode}]{extra}"))
+        lines.append(green(f"    {src:>8} -> {m['port']:<8}  [circuit]{extra}"))
     en_slaves = [s for s in decoded["slaves"] if s["enable"]]
     if en_slaves:
         lines.append("    enabled slaves: " +

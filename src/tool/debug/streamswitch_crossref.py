@@ -391,8 +391,12 @@ UI_FUNCS = (
     '_resolvePktMask', '_fmtPktMaskHex', '_fmtPktMaskBadge',
     '_expandPktConnectRows', '_pktRowKey', '_fmtMselEnHex', '_tilePktMasters',
     '_renderPktMasterBlock', '_tileRoutingConns', 'renderTileRoutingSection',
-    '_tileCommPaths',
+    '_tileCommPaths', '_swKey', '_swScanTile', '_swMissingKeys', '_swMarkHtml',
+    '_swExtraRowsHtml',
 )
+
+# Top-level declarations the extracted functions close over.
+UI_PRELUDE = ('SWSCAN',)
 
 _JS_DRIVER = r'''
 const fs = require('fs');
@@ -460,8 +464,10 @@ def extract_js_expression(template, anchor):
     raise ValueError('unterminated expression %r' % anchor)
 
 
-def build_ui_script(template, names=UI_FUNCS):
-    return '\n'.join(extract_js_function(template, n) for n in names) + _JS_DRIVER
+def build_ui_script(template, names=UI_FUNCS, prelude=UI_PRELUDE):
+    parts = [extract_js_statement(template, n) for n in prelude]
+    parts += [extract_js_function(template, n) for n in names]
+    return '\n'.join(parts) + _JS_DRIVER
 
 
 def _ui_data(workdir, schedule_view):

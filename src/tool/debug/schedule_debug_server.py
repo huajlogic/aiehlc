@@ -1263,6 +1263,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 import aiediag  # noqa: E402
 import aiegdb  # noqa: E402
+import switch_scan  # noqa: E402  (live stream-switch read + provenance diff)
 import schedule_view  # noqa: E402  (render_html for server-side app injection)
 import work2provenance  # noqa: E402  (auto-generate worklocal/ from Work/)
 
@@ -1553,8 +1554,10 @@ class DebugState:
         self.applog = os.path.abspath(applog)
         self.sim_only = bool(sim_only)
 
-        # Cached schedule tiles from schedule_view.json.
+        # Cached slices of schedule_view.json.
         self._tiles = None
+        self._comm_paths = None
+        self._grid_info = None
 
         # Live run bookkeeping.
         self._lock = threading.Lock()
@@ -1723,6 +1726,8 @@ class DebugState:
         self.app = app
         self.workdir = app.path
         self._tiles = None
+        self._comm_paths = None
+        self._grid_info = None
         self._llm_log_dir = app.path
         self.elf = _resolve_default_elf(app.path)
         self._load_app_profile(app.path)
@@ -1822,10 +1827,27 @@ class DebugState:
     def tiles(self):
         """Return the tile list from schedule_view.json (cached)."""
         if self._tiles is None:
-            with open(self.json_path()) as f:
-                view = json.load(f)
-            self._tiles = view.get("tiles", [])
+            self._load_view_parts()
         return self._tiles
+
+    def comm_paths(self):
+        """Return the comm_paths list from schedule_view.json (cached)."""
+        if self._comm_paths is None:
+            self._load_view_parts()
+        return self._comm_paths
+
+    def grid_info(self):
+        """Return the grid geometry block from schedule_view.json (cached)."""
+        if self._grid_info is None:
+            self._load_view_parts()
+        return self._grid_info
+
+    def _load_view_parts(self):
+        with open(self.json_path()) as f:
+            view = json.load(f)
+        self._tiles = view.get("tiles", [])
+        self._comm_paths = view.get("comm_paths", [])
+        self._grid_info = view.get("grid", {})
 
     # ---- session provenance ----------------------------------------------
     def mark_hw_session(self, mode, detail="", target=None):
@@ -4526,6 +4548,56 @@ def grid_cores(st, target=None, reg_read_fn=None, device=None):
     return {"what": "cores", "cells": cells}
 
 
+def _switch_tiles(st):
+    """[(col, row, tile_type)] for every tile with a stream switch to read.
+
+    Not st.tiles(): memtile rows carry real circuit connections but never
+    appear in the schedule grid, so the routing map has to be consulted too.
+    """
+    core_min = st.grid_info().get("device_core_min_row") or 3
+    locs = {tuple(t["loc"]) for t in st.tiles()}
+    for p in st.comm_paths():
+        for e in p.get("edges", []):
+            locs.add((e[0][0], e[0][1]))
+            locs.add((e[1][0], e[1][1]))
+        for c in p.get("routing_connections", []):
+            t = c.get("tile") or {}
+            if t.get("col") is not None:
+                locs.add((t["col"], t["row"]))
+    out = []
+    for col, row in sorted(locs):
+        ttype = "shim" if row == 0 else ("core" if row >= core_min else "memtile")
+        out.append((col, row, ttype))
+    return out
+
+
+def grid_switch(st, target=None, reg_read_fn=None, device=None):
+    """Live stream-switch config per tile, diffed against the provenance map.
+
+    This is static configuration, not per-cycle state, so it is a scan and
+    never a poll.  On hardware each tile costs a single `aiedbg mem read` of
+    the whole switch register block; reading it the way aiegdb's `show switch`
+    does would be ~230 `reg read` subprocesses per tile.
+    """
+    cells = {}
+    comm_paths = st.comm_paths()
+    for col, row, ttype in _switch_tiles(st):
+        phys_col = col + st.startcol
+        try:
+            cells[f"{col},{row}"] = switch_scan.scan_tile(
+                ttype, col, row, phys_col, comm_paths,
+                reg_read_fn=reg_read_fn, target=target or st.target,
+                device=device)
+        except Exception as e:
+            cells[f"{col},{row}"] = {"state": switch_scan.UNREACHABLE,
+                                     "phys_col": phys_col, "matched": 0,
+                                     "missing": [], "unexpected": [],
+                                     "error": str(e)}
+        cells[f"{col},{row}"]["type"] = ttype
+    n_bad = sum(1 for c in cells.values() if c["state"] == switch_scan.MISMATCH)
+    return {"what": "switch", "cells": cells, "mismatch_tiles": n_bad}
+
+
 def grid_events(st, target=None, reg_read_fn=None, device=None):
     cells = {}
 
@@ -4947,6 +5019,9 @@ class Handler(BaseHTTPRequestHandler):
                                                reg_read_fn=rrfn, device=dev))
                 elif what == "events":
                     self._send_json(grid_events(st, target=tgt,
+                                                reg_read_fn=rrfn, device=dev))
+                elif what == "switch":
+                    self._send_json(grid_switch(st, target=tgt,
                                                 reg_read_fn=rrfn, device=dev))
                 else:
                     self._send_json(grid_dma(st, target=tgt,

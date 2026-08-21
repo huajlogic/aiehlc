@@ -2962,6 +2962,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .rt-pktmask { font-size:9px; color:#e87850; background:#3a1010; border-radius:2px;
                 padding:1px 5px; margin-left:6px; display:inline-block; white-space:nowrap; }
   .rt-row .rt-pktid, .rt-row .rt-pktmask { flex:0 0 auto; margin-left:0; }
+  /* stream-switch scan verdicts */
+  .sw-ok { font-size:9px; color:#7fd48a; background:#0f2413; border-radius:2px;
+           padding:0 3px; margin-left:4px; flex:0 0 auto; }
+  .sw-bad { font-size:9px; color:#ff9270; background:#361208; border-radius:2px;
+            padding:0 3px; margin-left:4px; flex:0 0 auto; }
+  .rt-row.sw-extra { opacity:0.95; }
+  .sw-state { font-size:9px; border-radius:2px; padding:0 4px; margin-left:6px; }
+  .sw-state.verified { color:#7fd48a; background:#0f2413; }
+  .sw-state.mismatch { color:#ff9270; background:#361208; }
+  .sw-state.unreachable { color:#c0a080; background:#2a2118; }
+  .sw-state.idle { color:#8a94a0; background:#1a1e24; }
   .rt-s2mm { font-size:9px; color:#30c0d0; background:#0a2830; border-radius:2px;
              padding:1px 4px; margin-left:6px; display:inline-block; white-space:nowrap; }
   .rt-mm2s { font-size:9px; color:#c050b0; background:#2a1028; border-radius:2px;
@@ -3172,6 +3183,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <span class="ltab act" data-w="dma">DMA</span>
       <span class="ltab" data-w="cores">Cores</span>
       <span class="ltab" data-w="events">Events</span>
+      <span class="ltab" data-w="switch" title="read the stream-switch registers and diff them against the routing map">Switch</span>
     </div>
     <button id="gridScanBtn" title="read live status from the board / simulator">Scan</button>
     <div id="livestatus"></div>
@@ -3193,6 +3205,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <span class="ltab act" data-w="dma">DMA</span>
           <span class="ltab" data-w="cores">Cores</span>
           <span class="ltab" data-w="events">Events</span>
+          <span class="ltab" data-w="switch" title="read the stream-switch registers and diff them against the routing map">Switch</span>
         </span>
         <button id="dmScanBtn" title="read live status from the board / simulator">Scan</button>
         <button id="dmClearBtn" title="clear scan status and search highlights">Clear</button>
@@ -6845,8 +6858,42 @@ function _tileRoutingConns(col, row){
   return out;
 }
 
+// ── live switch scan overlay ────────────────────────────────────────────────
+// A scanned tile carries the set of rows the hardware is NOT programmed with
+// (missing) and the rows it has that no flow accounts for (unexpected).  Rows
+// are keyed the same way both sides build them: kind + slave + master.
+function _swKey(kind, slave, master){ return kind+'|'+(slave||'fwd')+'|'+master; }
+function _swScanTile(col, row){
+  return SWSCAN ? SWSCAN[col+','+row] : null;
+}
+function _swMissingKeys(scan){
+  const s=new Set();
+  (scan&&scan.missing||[]).forEach(r=>s.add(_swKey(r.kind,r.slave,r.master)));
+  return s;
+}
+function _swMarkHtml(scan, kind, slave, master){
+  if(!scan || scan.state==='unreachable') return '';
+  if(_swMissingKeys(scan).has(_swKey(kind,slave,master)))
+    return '<span class="sw-bad" title="the routing map claims this connection '
+      +'but the stream-switch registers are not programmed with it">not in HW</span>';
+  return '<span class="sw-ok" title="this connection is programmed in the '
+    +'stream-switch registers">in HW</span>';
+}
+function _swExtraRowsHtml(scan){
+  if(!scan) return '';
+  return (scan.unexpected||[]).map(r=>{
+    const ports=(r.slave?esc(r.slave):'fwd')+'&nbsp;&rarr;&nbsp;'+esc(r.master);
+    return '<div class="rt-row sw-extra">'
+      +'<span class="rt-kind">'+esc(r.kind)+'</span>'
+      +'<span class="rt-ports">'+ports+'</span>'
+      +'<span class="sw-bad" title="programmed in hardware but no flow in the '
+      +'routing map accounts for it">HW only</span></div>';
+  }).join('');
+}
+
 function renderTileRoutingSection(col, row, focusFlowIdx){
   const allRaw=_tileRoutingConns(col,row);
+  const swScan=_swScanTile(col,row);
 
   let conns=allRaw.filter(c=>{
     if(c.kind==='packet_hw') return true;
@@ -6877,21 +6924,27 @@ function renderTileRoutingSection(col, row, focusFlowIdx){
       const pktSpan=(c.pktid!=null)
         ?'<span class="rt-pktid" title="packet match id">pkt'+c.pktid+'</span>':'';
       const maskSpan=(c.mask!=null)?_fmtPktMaskBadge(c.mask,c.leg):'';
+      const swSpan=_swMarkHtml(swScan,'PKT',
+        sl.dir?sl.dir+':'+sl.idx:null, c.master.dir+':'+c.master.idx);
       return '<div class="rt-row pkt">'
         +'<span class="rt-kind">PKT</span>'
         +'<span class="rt-ports">'+ports+'</span>'
-        +pktSpan+maskSpan+dmaSpan+'</div>';
+        +pktSpan+maskSpan+dmaSpan+swSpan+'</div>';
     }
     const s=c.slave||{}, m=c.master||{};
     const ports=esc(s.dir)+':'+s.idx+'&nbsp;&rarr;&nbsp;'+esc(m.dir)+':'+m.idx;
+    const swSpan=_swMarkHtml(swScan,'CCT',s.dir+':'+s.idx,m.dir+':'+m.idx);
     return '<div class="rt-row cct">'
       +'<span class="rt-kind">CCT</span>'
       +'<span class="rt-ports">'+ports+'</span>'
-      +dmaSpan+'</div>';
+      +dmaSpan+swSpan+'</div>';
   });
   const mstBlock=_renderPktMasterBlock(col, row, focusFlowIdx);
-  return '<div class="sec"><div class="sec-hdr">Stream switch</div>'
-    +rows.filter(Boolean).join('')+mstBlock+'</div>';
+  const swHdr=swScan
+    ?' <span class="sw-state '+esc(swScan.state)+'">'+esc(swScan.state)+'</span>'
+    :'';
+  return '<div class="sec"><div class="sec-hdr">Stream switch'+swHdr+'</div>'
+    +rows.filter(Boolean).join('')+mstBlock+_swExtraRowsHtml(swScan)+'</div>';
 }
 
 function _routingTileType(row){
@@ -8806,8 +8859,14 @@ const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
 const LSTATE = {
   running:['#4caf50','RUN'], stalled:['#ffca28','STALL'], error:['#ef5350','ERR'],
   completed:['#26a69a','done'], idle:['#546e7a','idle'],
-  unreachable:['#8d6e63','n/a'], unknown:['#546e7a','?']
+  unreachable:['#8d6e63','n/a'], unknown:['#546e7a','?'],
+  // switch scan: the routing map and the registers agree / disagree
+  verified:['#2e7d32','sw ok'], mismatch:['#d84315','sw ≠']
 };
+// Last switch scan, keyed 'col,row' — the tile panel annotates its Stream
+// switch rows from this so a scanned tile shows which rows the hardware
+// actually has. Cleared with the rest of the overlay state.
+let SWSCAN = null;
 function llmToken(){ return sessionStorage.getItem('LLM_AUTH') || ''; }
 function api(path, opts){
   opts = opts || {};
@@ -8902,6 +8961,16 @@ function _updateIssueBar(res){
 
 function applyGrid(res){
   if (res.error){ setStatus('live: '+res.error); }
+  else if (res.what === 'switch'){
+    const n = res.mismatch_tiles || 0;
+    SWSCAN = res.cells || {};
+    setStatus(n
+      ? ('switch: '+(n===1?'1 tile disagrees':n+' tiles disagree')
+         +' with the routing map')
+      : 'switch: every tile matches the routing map');
+    // Repaint the open panel so a scan annotates the rows already on screen.
+    if (panelActiveKey) panelRenderBody(panelActiveKey);
+  }
   else setStatus('live '+LIVE.what+' @ '+new Date().toLocaleTimeString());
   // One fetch feeds both views; the device map paints from the same payload.
   dmApplyStatus(res);
@@ -8999,6 +9068,14 @@ function hideConsole(){
 function setLive(on){
   if (on && deviceSel && deviceSel.value === 'simulator' && !simHasLiveReads()){
     showSimLiveUnavailable();
+    on = false;
+  }
+  // The switch is static configuration, not per-cycle state: polling it every
+  // 2s would spend a board round-trip per tile to re-read bits that only the
+  // host program changes. Scan it on demand instead.
+  if (on && LIVE.what === 'switch'){
+    setStatus('switch config is static — use Scan, not the live poll');
+    dmSetScanStatus('switch config is static — use Scan, not the live poll');
     on = false;
   }
   LIVE.enabled = on;
@@ -9514,6 +9591,12 @@ function setOverlayWhat(w){
   // Drop the previous mode's colors immediately: leaving DMA tints on screen
   // under a "Cores" selection reads as live data for a mode never read.
   dmClearStatus();
+  // Same reasoning for the per-row switch verdicts: they are only true for the
+  // scan that produced them.
+  SWSCAN = null;
+  if (panelActiveKey) panelRenderBody(panelActiveKey);
+  // Static config: never let the 2s poll carry over into this mode.
+  if (w === 'switch' && LIVE.enabled) setLive(false);
   const msg = LIVE.enabled ? 'scanning '+w+'…' : 'click "Scan" to read '+w;
   dmSetScanStatus(msg);
   setStatus(msg);

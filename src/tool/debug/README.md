@@ -25,6 +25,7 @@ package). None of them modify `host.cc` or any generated source.
 | `schedule_debug_server.py` | **Live debug daemon** (`http.server`) behind `host_schedule.html`; deploys ELF, tails `applog`, overlays live DMA/core/event status, drives an LLM tab | `aiediag`, `aiegdb`, `ensure_aiedbg`; spawns `aiemcp.py` |
 | `streamswitch_crossref.py` | **Accuracy check + CLI** — cross-references the UI's per-tile Stream switch panel against the `XAie_Strm*` calls in generated source | `schedule_view`, `node` |
 | `flow_crossref.py` | **Attribution check + CLI** — checks that every tile and flow is shown the right information, against `routing.cc` groups + `dmaphop` endpoints | `streamswitch_crossref`, `schedule_view`, `node` |
+| `switch_scan.py` | **Live switch read + diff** — reads the stream-switch registers off the board/sim and diffs them against the routing map; backs the UI's `Switch` scan | `aiediag`, `streamswitch_crossref` |
 
 ### Dependency graph
 
@@ -1159,6 +1160,54 @@ badge checks are skipped. Both cases are stated in the output.
 `tests/test_flow_crossref.py` pins the checks that pass today as regression
 guards and the known defects in `KNOWN_DEFECTS` with their root cause, asserted
 in both directions.
+
+---
+
+## 8. `Switch` scan — what the hardware is actually programmed with
+
+Sections 6 and 7 check the UI against the *source*. This checks it against the
+**board**: a fourth live-overlay mode next to DMA / Cores / Events that reads
+the stream-switch registers and diffs them against the routing map.
+
+Pick **Switch**, press **Scan**. Every tile gets a verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `verified` | every connection the routing map claims is programmed, and nothing else is |
+| `mismatch` | see the per-row markers below |
+| `idle` | no connections expected and none found |
+| `unreachable` | the tile's registers could not be read |
+
+The tile panel's **Stream switch** section then annotates each row:
+
+- **in HW** — this connection is programmed in the registers
+- **not in HW** — the routing map claims it, the switch is not programmed with
+  it. A flow that never moves data looks exactly like this.
+- **HW only** — programmed on the device with no flow accounting for it; left
+  over from a previous design still resident on the board, or a routing bug
+  the provenance map cannot see.
+
+**Cost.** aiegdb's `show switch` reads one register per `aiedbg reg read`
+subprocess — 228 of them for a core tile. The switch register block is
+contiguous and fits inside aiedbg's 256-word limit, so the scan issues a single
+`aiedbg mem read` per tile instead. The simulator uses its per-register IPC
+reader directly.
+
+**Not polled.** Switch configuration is static — only the host program changes
+it — so selecting `Switch` turns the 2 s live poll off. Re-scan explicitly
+after a run programs the array.
+
+Decoding matches the driver: a **circuit** master's `CONFIGURATION` field is
+the source slave index, but a **packet** master's is `arbiter[2:0] |
+msel_en[6:3]` ([xaie_ss.c:45-48](../../../thirdparty/alib/aie-rt/driver/src/stream_switch/xaie_ss.c))
+and names no slave at all. Packet routes are then resolved the way the arbiters
+do — a slave slot drives every master whose arbiter matches and whose MSelEn
+has the slot's msel line set.
+
+`tests/test_switch_scan.py` encodes the frozen fixture's real `routing.cc` into
+a register image, decodes it back through the same helpers the board path uses,
+and asserts all 28 tiles verify against the provenance map — so a wrong
+register layout, field split or pairing rule fails the suite without a board.
 
 ---
 
