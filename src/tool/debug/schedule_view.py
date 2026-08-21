@@ -1610,6 +1610,13 @@ def _load_comm_paths(workdir):
             tiles_seen.add((fc, fr))
             tiles_seen.add((tc, tr))
 
+        # Groups that name their DMA endpoints directly (work2provenance) are
+        # taken at their word; deriving them from a master.dir=='DMA' entry
+        # only works for push, where the DMA is the master.
+        for t in g.get('dma_tiles', []):
+            dma_tiles.add((t[0], t[1]))
+            tiles_seen.add((t[0], t[1]))
+
         if direction == 'pull' and split_idx is not None:
             for c in push_conns:
                 if c.get('kind') != 'packet_connect':
@@ -1749,7 +1756,14 @@ def _load_comm_paths(workdir):
                            if c.get('kind') == 'shim_aie_to_ext'), None)
             if _split is not None:
                 if direction == 'push':
-                    rg_connections = rg_conns_all[:_split]
+                    # Packet entries in a split group are the gather segment:
+                    # local_dma is a packet *slave*, i.e. the tile sourcing
+                    # into the stream, which only happens on the way out.  A
+                    # push consumer takes delivery on a circuit_connect whose
+                    # master is DMA.  Leaving them in attributed the pull
+                    # flow's gather config to the push flow as well.
+                    rg_connections = [c for c in rg_conns_all[:_split]
+                                      if c.get('kind') != 'packet_connect']
                 else:
                     # Pull flows: keep only packet_connect entries from the push
                     # section (packet-switch gather config is shared) plus all
@@ -1759,7 +1773,10 @@ def _load_comm_paths(workdir):
                     # pull flows or they get wrongly attributed to both.
                     push_pkts = [c for c in rg_conns_all[:_split]
                                  if c.get('kind') == 'packet_connect']
-                    pull_conns = rg_conns_all[_split + 1:]
+                    # Keep the shim_aie_to_ext marker itself: it is this pull
+                    # flow's egress port, and dropping it left pull nets with
+                    # no GMIO section and the port attributed to no flow.
+                    pull_conns = rg_conns_all[_split:]
                     rg_connections = push_pkts + pull_conns
             else:
                 rg_connections = rg_conns_all
@@ -4830,10 +4847,17 @@ const searchIndex = [];
   (DATA.comm_paths||[]).forEach(p=>{
     if(!p) return;
     const fi=p.flow_index!=null?p.flow_index:null;
-    // Derive a representative tkey from the first DMA tile
-    const dmaTiles=(p.dma_tiles||[]);
-    const repTile=dmaTiles[0]||null;
-    const tkey=repTile?repTile[0]+','+repTile[1]:'0,0';
+    // Representative tile for the hit. Prefer a DMA tile, but pull flows have
+    // none (routing_edges_for_flow fills dma_tiles only from circuit_connects
+    // whose master is DMA, and a pull source has DMA as the slave), so fall
+    // back to a tile the flow actually touches instead of the literal 0,0.
+    // Sorted because dma_tiles is serialized from a Python set.
+    const cand=[...(p.dma_tiles||[]), ...(p.tiles||[]),
+                ...(p.edges||[]).map(e=>e[0])].filter(t=>t&&t.length===2);
+    const repTile=cand.length
+      ?cand.slice().sort((a,b)=>(a[0]-b[0])||(a[1]-b[1]))[0]
+      :null;
+    const tkey=repTile?repTile[0]+','+repTile[1]:null;
 
     // Net ID: "net7"
     if(p.net_id) add('net',tkey,fi,p.net_id,'net ('+p.net_id+') f'+fi);
@@ -4896,7 +4920,7 @@ function lkActiveSets(){
   const flowLockFis=new Set();
   srSearchTerms.forEach(term=>{
     srResolve(term).forEach(h=>{
-      tileLockKeys.add(h.tkey);
+      if(h.tkey) tileLockKeys.add(h.tkey);
       if(h.fi!=null) flowLockFis.add(h.fi);
     });
   });
@@ -5565,7 +5589,10 @@ function buildNetBody(p){
         detail=esc(s.dir)+':'+s.idx+'&nbsp;&rarr;&nbsp;'+esc(m.dir)+':'+m.idx;
       }
     }
-    extra+=_flowDmaSpanHtml(c.flow_index,t.col,t.row);
+    // The panel is already scoped to one net: use its flow, not c.flow_index —
+    // routing_connections records carry no flow_index, so that was always null
+    // and every row fell back to the grey "no local DMA" badge.
+    extra+=_flowDmaSpanHtml(p.flow_index,t.col,t.row);
     swRows+='<tr><td>('+t.col+','+t.row+')</td><td>'+kind+'</td>'
       +'<td>'+detail+extra+'</td></tr>';
   });
@@ -6832,7 +6859,11 @@ function renderTileRoutingSection(col, row, focusFlowIdx){
   const rows=conns.map(c=>{
     const tile=(DATA.tiles||[]).find(t=>t.loc[0]===col&&t.loc[1]===row);
     const localFis=new Set((tile&&tile.dma_channels||[]).map(ch=>ch.flow_index));
-    const candidates=(c.flow_indices||[c.flow_index]);
+    // Under focus the row is claimed by one flow only; badging every flow that
+    // shares the row would put another flow's channel on it.
+    const candidates=(focusFlowIdx!=null)
+      ?[focusFlowIdx]
+      :(c.flow_indices||[c.flow_index]);
     const withDma=candidates.filter(fi=>localFis.has(fi));
     // Show one badge per flow that has a local DMA channel; fall back to route badge.
     const dmaSpan=withDma.length
@@ -6870,9 +6901,14 @@ function _routingTileType(row){
   return 'mem';
 }
 function _tileCommPaths(col, row){
-  const inPath=p=>(p.edges||[]).some(e=>
+  // Stream edges plus shared-memory hops: a tile reached only through shared
+  // memory still carries the flow, and printing "(no comm paths through this
+  // tile)" above its own Shared memory table contradicted itself.
+  const onEdge=p=>(p.edges||[]).some(e=>
     (e[0][0]===col&&e[0][1]===row)||(e[1][0]===col&&e[1][1]===row));
-  return (DATA.comm_paths||[]).filter(inPath);
+  const onShmem=p=>(p.hops||[]).some(h=>h.type==='shmem'&&
+    ((h.from_col===col&&h.from_row===row)||(h.to_col===col&&h.to_row===row)));
+  return (DATA.comm_paths||[]).filter(p=>onEdge(p)||onShmem(p));
 }
 function _tileShmemHops(col, row){
   const out=[];

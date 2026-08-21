@@ -391,6 +391,7 @@ UI_FUNCS = (
     '_resolvePktMask', '_fmtPktMaskHex', '_fmtPktMaskBadge',
     '_expandPktConnectRows', '_pktRowKey', '_fmtMselEnHex', '_tilePktMasters',
     '_renderPktMasterBlock', '_tileRoutingConns', 'renderTileRoutingSection',
+    '_tileCommPaths',
 )
 
 _JS_DRIVER = r'''
@@ -398,8 +399,11 @@ const fs = require('fs');
 const inp = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const DATA = inp.data;
 const key = t => t[0] + ',' + t[1];
-const out = {none: {}, focus: {}};
-for (const t of inp.tiles) out.none[key(t)] = renderTileRoutingSection(t[0], t[1], null);
+const out = {none: {}, focus: {}, flows_table: {}};
+for (const t of inp.tiles) {
+  out.none[key(t)] = renderTileRoutingSection(t[0], t[1], null);
+  out.flows_table[key(t)] = _tileCommPaths(t[0], t[1]).map(p => p.flow_index);
+}
 for (const fi of inp.flows) {
   const m = {};
   for (const t of inp.tiles) m[key(t)] = renderTileRoutingSection(t[0], t[1], fi);
@@ -482,6 +486,9 @@ def _ui_tile_list(data, extra_tiles=()):
             seen.add((e[1][0], e[1][1]))
         for group in ('tiles', 'dma_tiles', 'packet_tiles'):
             seen.update((t[0], t[1]) for t in p.get(group, []))
+        for h in p.get('hops', []):
+            seen.add((h['from_col'], h['from_row']))
+            seen.add((h['to_col'], h['to_row']))
         for c in p.get('routing_connections', []):
             t = c.get('tile') or {}
             if t.get('col') is not None:

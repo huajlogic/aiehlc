@@ -316,6 +316,7 @@ class UiFlows(object):
         self.focus_rows = focus_rows
         self.focus_html = {}
         self.net_html = {}
+        self.flows_table_html = {}
 
     def channel_owners(self):
         """{(tile, badge_label): {flow_index}} — who each DMA badge belongs to."""
@@ -350,9 +351,13 @@ class UiFlows(object):
         return out
 
     def search_rep_tile(self, flow_index):
-        """searchIndex's representative tile: dma_tiles[0], else literal 0,0."""
-        dma = self.paths[flow_index].get('dma_tiles') or []
-        return (tuple(dma[0]), True) if dma else ((0, 0), False)
+        """searchIndex's representative tile: lowest DMA tile, else any tile."""
+        p = self.paths[flow_index]
+        cand = ([tuple(t) for t in p.get('dma_tiles') or []] +
+                [tuple(t) for t in p.get('tiles') or []] +
+                [(e[0][0], e[0][1]) for e in p.get('edges') or []])
+        cand = [t for t in cand if len(t) == 2]
+        return (min(cand), bool(p.get('dma_tiles'))) if cand else (None, False)
 
     def connections(self, flow_index):
         return _conn_records(self.paths[flow_index].get('routing_connections', []))
@@ -368,11 +373,8 @@ class UiFlows(object):
         return out
 
     def flows_table(self, col, row):
-        """The tile panel's Flows table: _tileCommPaths, edges only."""
-        return {fi for fi, p in self.paths.items()
-                if any((e[0][0], e[0][1]) == (col, row) or
-                       (e[1][0], e[1][1]) == (col, row)
-                       for e in p.get('edges', []))}
+        """The tile panel's Flows table, from the real _tileCommPaths()."""
+        return set(self.flows_table_html.get('%d,%d' % (col, row), []))
 
     def panel_flows(self, col, row):
         """Flows whose focus selection leaves at least one row on this tile."""
@@ -415,6 +417,7 @@ def load_ui(workdir):
     rendered = sx.render_ui_html(workdir)
     ui = UiFlows(comm_paths, tiles, sx.parse_ui_html(rendered).focus_rows)
     ui.focus_html = rendered['focus']
+    ui.flows_table_html = rendered.get('flows_table', {})
     ui.net_html = render_net_panels(view) if view else {}
     return ui
 
@@ -737,13 +740,25 @@ class Report(object):
         return out
 
     def _check_dma_badges(self):
+        """Does each DMA badge name the flow that channel serves?
+
+        Some dmaphop stages carry no dma_port; those endpoints are matched on
+        the tile alone rather than reported as a channel-number mismatch.
+        """
         badges = self.ui.dma_endpoints()
         out = {}
         for flow in self.flows:
             want = flow.producers | flow.consumers
             got = badges.get(flow.index, set())
-            if want != got:
-                out[flow.index] = (sorted(want - got), sorted(got - want))
+            loose = {(e.col, e.row) for e in want if e.port is None}
+            want_exact = {e for e in want if e.port is not None}
+            got_exact = {e for e in got if (e.col, e.row) not in loose}
+            got_tiles = {(e.col, e.row) for e in got}
+            missing = (sorted(want_exact - got_exact) +
+                       sorted(t for t in loose if t not in got_tiles))
+            extra = sorted(got_exact - want_exact)
+            if missing or extra:
+                out[flow.index] = (missing, extra)
         return out
 
     # -- verdict --------------------------------------------------------------
@@ -758,6 +773,8 @@ class Report(object):
                 for f, e in sorted(self.flow_unbacked.items())]
         out += [('flow f%d tiles' % f, m, e)
                 for f, (m, e) in sorted(self.flow_tiles.items())]
+        out += [('flow f%d shows the other direction\'s packet config' % f, r, [])
+                for f, r in sorted(self.cross_direction.items())]
         out += [('flow f%d dma badges' % f, m, e)
                 for f, (m, e) in sorted(self.dma_badges.items())]
         out += [('tile %s flows' % (t,), p, s)
