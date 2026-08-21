@@ -2744,7 +2744,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                    flex:1 1 auto; min-width:0; }
   #devmap-scan { display:flex; align-items:center; gap:4px;
                  flex:0 0 auto; margin-left:auto; }
-  #devmap-scan .ltab { margin:0; }
+  /* Scan mode is a one-of-N selection that grew past the width a pill strip
+     can spend on it, so it is a dropdown wearing the unselected .ltab skin —
+     it is a selection, and must not read as the accent-filled active tab or as
+     the solid-accent Scan verb beside it. */
+  .scan-what { padding:2px 6px; border:1px solid var(--bd); border-radius:4px;
+               background:var(--bg-raised); color:var(--tx-mid);
+               cursor:pointer; font-size:11px; font-family:inherit;
+               transition:background .12s, color .12s, border-color .12s; }
+  .scan-what:hover { color:var(--tx-hi); background:var(--bg-hover); }
+  .scan-what:focus-visible { outline:1px solid var(--bd-accent); outline-offset:1px; }
+  #overlayWhat { margin-left:8px; vertical-align:middle; }
   /* Scan is an ACTION, not a selection. It deliberately avoids both tab states:
      --accent-dim fill would read as a selected tab, and the default button
      surface (--bg-raised on --bd) is nearly identical to an *un*selected .ltab.
@@ -3179,12 +3189,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <!-- live status overlay: pinned above the tile grid -->
   <div id="overlayctl" style="margin-bottom:6px;">
     <label><input type="checkbox" id="liveToggle"> Live status overlay</label>
-    <div id="overlaytabs" style="display:inline-flex;gap:4px;margin-left:8px;">
-      <span class="ltab act" data-w="dma">DMA</span>
-      <span class="ltab" data-w="cores">Cores</span>
-      <span class="ltab" data-w="events">Events</span>
-      <span class="ltab" data-w="switch" title="read the stream-switch registers and diff them against the routing map">Switch</span>
-    </div>
+    <select id="overlayWhat" class="scan-what" title="what to read on the next scan">
+      <option value="dma" title="DMA channel state and BD progress">DMA</option>
+      <option value="cores" title="core status per tile">Cores</option>
+      <option value="events" title="DMA start/finish/error events">Events</option>
+      <option value="switch" title="stream-switch registers, diffed against the routing map">Switch</option>
+    </select>
     <button id="gridScanBtn" title="read live status from the board / simulator">Scan</button>
     <div id="livestatus"></div>
     <div id="runstatus"></div>
@@ -3201,12 +3211,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="devmap-scan">
         <span id="dmScanStatus"></span>
         <label id="dmLiveWrap" title="re-scan every 2s"><input type="checkbox" id="dmLiveToggle"> live</label>
-        <span id="dmScanWhat">
-          <span class="ltab act" data-w="dma">DMA</span>
-          <span class="ltab" data-w="cores">Cores</span>
-          <span class="ltab" data-w="events">Events</span>
-          <span class="ltab" data-w="switch" title="read the stream-switch registers and diff them against the routing map">Switch</span>
-        </span>
+        <select id="dmScanWhat" class="scan-what" title="what to read on the next scan">
+          <option value="dma" title="DMA channel state and BD progress">DMA</option>
+          <option value="cores" title="core status per tile">Cores</option>
+          <option value="events" title="DMA start/finish/error events">Events</option>
+          <option value="switch" title="stream-switch registers, diffed against the routing map">Switch</option>
+        </select>
         <button id="dmScanBtn" title="read live status from the board / simulator">Scan</button>
         <button id="dmClearBtn" title="clear scan status and search highlights">Clear</button>
       </div>
@@ -9585,8 +9595,12 @@ document.getElementById('liveToggle').onchange = e => setLive(e.target.checked);
 function setOverlayWhat(w){
   const changed = LIVE.what !== w;
   LIVE.what = w;
-  document.querySelectorAll('#overlaytabs .ltab, #dmScanWhat .ltab').forEach(
-    x => x.classList.toggle('act', x.dataset.w === w));
+  // Both views expose the same selection; keep them mirrored so the one that
+  // did not initiate the change does not name a mode it is not showing.
+  ['overlayWhat','dmScanWhat'].forEach(id => {
+    const s = document.getElementById(id);
+    if (s && s.value !== w) s.value = w;
+  });
   if (!changed) return;
   // Drop the previous mode's colors immediately: leaving DMA tints on screen
   // under a "Cores" selection reads as live data for a mode never read.
@@ -9611,16 +9625,20 @@ function pickOverlayWhat(w, setMsg){
   }
   if (LIVE.enabled) scanOnce(true);
 }
-document.querySelectorAll('#overlaytabs .ltab').forEach(tab => tab.onclick = () =>
-  pickOverlayWhat(tab.dataset.w, setStatus));
+(function(){
+  const s = document.getElementById('overlayWhat');
+  if (s) s.onchange = () => pickOverlayWhat(s.value, setStatus);
+})();
 
 // ── Device-map scan controls ──────────────────────────────────
 // Deliberately routed through the same scanOnce()/setLive() pair as the grid
 // overlay rather than a parallel fetch path: LIVE.gridBusy is a single-flight
 // guard and LIVE.gridTimer a single handle, so a second poller here would
 // fight the first for the one aiedbg subprocess the daemon runs per scan.
-document.querySelectorAll('#dmScanWhat .ltab').forEach(tab => tab.onclick = () =>
-  pickOverlayWhat(tab.dataset.w, dmSetScanStatus));
+(function(){
+  const s = document.getElementById('dmScanWhat');
+  if (s) s.onchange = () => pickOverlayWhat(s.value, dmSetScanStatus);
+})();
 function runScanNow(setMsg){
   if (deviceSel && deviceSel.value === 'simulator' && !simHasLiveReads()){
     setMsg(simLiveUnavailableText(), true);
