@@ -186,8 +186,8 @@ def test_cy_multiple_event_slots():
     words = base.pack(base.start(0), base.multiple(0xFF, 500),
                       base.multiple(0x81, 200000))
     golden = [(500, "ACTIVE"), (500, "LOCK_STALL"), (500, "STREAM_STALL"),
-              (500, "MEMORY_STALL"), (500, "EVENT4"), (500, "EVENT5"),
-              (500, "EVENT6"), (500, "EVENT7"),
+              (500, "MEMORY_STALL"), (500, "PORT_IDLE_0"), (500, "PORT_RUNNING_0"),
+              (500, "PORT_STALLED_0"), (500, "EVENT7"),
               (200500, "ACTIVE"), (200500, "EVENT7")]
     _check(words, golden)
 
@@ -250,7 +250,7 @@ def test_cy_user_capture_8word_packet():
     assert tl[0] == (0, "ACTIVE")
     assert len(tl) == 1522
     assert dict(collections.Counter(n for _, n in tl)) == {
-        "ACTIVE": 412, "STREAM_STALL": 370, "EVENT5": 370, "EVENT6": 370}
+        "ACTIVE": 412, "STREAM_STALL": 370, "PORT_RUNNING_0": 370, "PORT_STALLED_0": 370}
 
 
 def test_cy_user_capture_8word_no_pkt_header():

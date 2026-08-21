@@ -8567,6 +8567,9 @@ const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
                // page's: a reload or dropped tail must not convince the UI that
                // a live run is over.
                runOwned:false, daemonRun:null, rsBusy:false, rsTimer:null,
+               // tlFired: guard so the timeline auto-launch fires at most once
+               // per run (both natural-finish and force-stop paths can race).
+               tlFired:false,
                simOnly:false };
 const LSTATE = {
   running:['#4caf50','RUN'], stalled:['#ffca28','STALL'], error:['#ef5350','ERR'],
@@ -8579,6 +8582,17 @@ function api(path, opts){
   const tok = llmToken();
   if (tok) opts.headers = Object.assign({}, opts.headers, {'X-LLM-Auth': tok});
   return fetch(path, opts).then(r => r.json());
+}
+// Auto-launch `timeline.py <applog> --show` on the server once a run ends
+// (natural finish or force-stop). Guarded by LIVE.tlFired so racing callers
+// launch it only once; the flag resets when the next run starts.
+function triggerTimeline(){
+  if (LIVE.tlFired) return;
+  LIVE.tlFired = true;
+  api('/timeline', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:'{}'})
+    .then(r => { if (r && r.started) setStatus('timeline: opened on server'); })
+    .catch(() => {});
 }
 function setStatus(msg){ const e=document.getElementById('livestatus'); if(e) e.textContent=msg; }
 function setRunStatus(msg){ const e=document.getElementById('runstatus'); if(e) e.textContent=msg; }
@@ -9370,6 +9384,7 @@ function pollLog(){
       LIVE.runOwned = false;
       setDebugEnabled(true);
       setRunStatus('');
+      triggerTimeline();   // auto-open the host+AIE timeline for this run.
     }
   }).catch(() => {
     // Daemon went offline mid-run. The run process is no longer observable, so
@@ -9418,6 +9433,7 @@ document.getElementById('runbtn').onclick = () => {
   const host = boardHost ? boardHost.value.trim() : '';
   if (dev !== 'pal' && !host){ setStatus('enter the ' + dev + ' board hostname'); return; }
   LIVE.logoff = 0;
+  LIVE.tlFired = false;   // new run → allow the timeline to auto-launch again.
   // Stop aiedbg polling/console BEFORE the download starts so its JTAG reads
   // don't collide with device program/reset/dow -force. Re-enabled in pollLog
   // when the run ends (force-stop or natural completion).
@@ -9470,6 +9486,7 @@ document.getElementById('stopbtn').onclick = () => {
       LIVE.runOwned = false;
       setDebugEnabled(true);
       setRunStatus('');
+      triggerTimeline();   // force-stop → auto-open the timeline for this run.
       if (r.run) applyRunState(r.run);
       updateRunButtons();
       if (r.error){ setStatus('stop: ' + r.error); }

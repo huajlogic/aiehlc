@@ -2154,6 +2154,23 @@ class DebugState:
         return {"stopped": True, "run_id": run_id, "pid": pid,
                 "abandoned": abandoned, "running": False}
 
+    def launch_timeline(self):
+        """Spawn `timeline.py <applog> --show` detached so the blocking matplotlib
+        window runs independently of the daemon. The window opens on the server
+        host (the machine running this daemon). No-op when no applog exists yet."""
+        if not os.path.isfile(self.applog):
+            return {"started": False, "applog": self.applog,
+                    "error": "no applog on disk yet"}
+        script = os.path.join(_THIS_DIR, "timeline.py")
+        try:
+            subprocess.Popen(
+                [sys.executable, script, self.applog, "--show"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        except OSError as e:
+            return {"started": False, "applog": self.applog, "error": str(e)}
+        return {"started": True, "applog": self.applog}
+
     def sim_in_progress(self):
         with self._sim_lock:
             return (self._sim_proc is not None
@@ -4997,6 +5014,8 @@ class Handler(BaseHTTPRequestHandler):
             res = st.stop_run()
             res["run"] = st.run_state()
             self._send_json(res)
+        elif u.path == "/timeline":
+            self._send_json(st.launch_timeline())
         elif u.path == "/sim/run":
             self._send_json(st.start_sim())
         elif u.path == "/sim/stop":

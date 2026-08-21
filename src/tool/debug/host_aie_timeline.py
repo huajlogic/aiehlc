@@ -67,11 +67,43 @@ _TS = re.compile(r"^\[TIMESYNC\]\s+(.*)$")
 _TRACE_IV = re.compile(
     r"^trace tile=(\d+),(\d+) (\d+)(?:\s+--\s+(\d+))?\s+(\S+?)(?:\s+\(\d+ cyc\))?$")
 
+# The runtime prints one core_trace_stream_json line per traced tile carrying the
+# monitored event-port selection, e.g.
+#   [aie_runtime] core_trace_stream_json: {..."evt_port":{"tile":[0,3],
+#     "port":"south","intf":"slave","num":0},...}
+# whose PORT_*_0 IDLE/RUNNING/STALLED state feeds the port lane. Parsed to name
+# that lane after the physical port ("tile 0,3 south slave 0").
+_STREAM_JSON = re.compile(r"core_trace_stream_json:\s*(\{.*\})\s*$")
+
 
 def _tile_key(s):
     """'4,4' -> (4, 4)."""
     c, r = s.split(",")
     return (int(c), int(r))
+
+
+def _split_names(names):
+    """Partition a trace interval's slot names into (core, port), mirroring the
+    decoder's category rule: the stream-switch PORT_* events are the 'event'
+    (port) category, everything else (ACTIVE / *_STALL / LOCK) is 'core'.
+    Order within each subset is preserved so the '|'-joined label is stable."""
+    core = [n for n in names if not n.startswith("PORT_")]
+    port = [n for n in names if n.startswith("PORT_")]
+    return core, port
+
+
+def _evt_port_from_json(obj):
+    """Extract ((col,row), 'south slave 0') from a core_trace_stream_json object's
+    evt_port field, or None if it's absent/malformed. The tuple keys the traced
+    tile; the string is the port-lane suffix (port direction, interface, index)."""
+    ep = obj.get("evt_port")
+    if not isinstance(ep, dict):
+        return None
+    tl = ep.get("tile")
+    if not (isinstance(tl, list) and len(tl) == 2):
+        return None
+    suffix = "%s %s %s" % (ep.get("port", "?"), ep.get("intf", "?"), ep.get("num", "?"))
+    return (int(tl[0]), int(tl[1])), suffix
 
 
 def parse_timesync(text):
@@ -85,14 +117,28 @@ def parse_timesync(text):
         aiehz     : {(c,r): float}  (empirical, optional)
         traces    : {(c,r): [(start_cycle, end_cycle, [names]), ...]}
                     absolute-AIE-cycle intervals, in emission order
+        evt_ports : {(c,r): "south slave 0"}  monitored port-lane suffix, from
+                    the core_trace_stream_json evt_port field (may be empty)
     """
     cps = None
     anchors = {0: {"host": None, "tiles": {}}, 1: {"host": None, "tiles": {}}}
     hostevts = []
     aiehz = {}
     traces = {}
+    evt_ports = {}
 
     for line in text.splitlines():
+        # The evt_port descriptor rides a plain [aie_runtime] line, not a
+        # [TIMESYNC] one, so scan for it before the TIMESYNC gate below.
+        sj = _STREAM_JSON.search(line)
+        if sj:
+            try:
+                ep = _evt_port_from_json(json.loads(sj.group(1)))
+            except (ValueError, KeyError):
+                ep = None
+            if ep:
+                evt_ports[ep[0]] = ep[1]
+            continue
         m = _TS.match(line.strip())
         if not m:
             continue
@@ -126,7 +172,7 @@ def parse_timesync(text):
             # else: "trace tile=4,4 words=N" header -- count only, ignored.
 
     return {"cps": cps, "anchors": anchors, "hostevts": hostevts,
-            "aiehz": aiehz, "traces": traces}
+            "aiehz": aiehz, "traces": traces, "evt_ports": evt_ports}
 
 
 # --------------------------------------------------------------------------
@@ -174,8 +220,10 @@ def correlate(ts):
 
     Returns {meta, anchors, fit_per_tile, lanes}. Lanes:
       - "host": zero-width phase markers (start_us == end_us).
-      - "tile C,R": ACTIVE/stall spans; end_us covers the interval width
+      - "tile C,R core": ACTIVE/stall spans; end_us covers the interval width
         (end_cycle+1) so a single-cycle event has non-zero duration.
+      - "tile C,R <port> <intf> <num>": the monitored stream-switch port's
+        PORT_* spans (falls back to "tile C,R port" without an evt_port record).
     """
     cps = ts["cps"]
     if cps is None:
@@ -204,20 +252,35 @@ def correlate(ts):
                             "detail": "iter=%d phase=%s host=%d" % (it, phase, counts)})
     lanes.append({"name": "host", "events": host_events})
 
-    # One lane per traced tile with a fit.
+    # Per traced tile: a core lane ("tile C,R core") and, directly beneath it, a
+    # port lane. The decoder combines core-state and stream-switch PORT_* events
+    # into one run-length interval, so each interval is split by category and its
+    # span emitted into whichever lane(s) its subset is non-empty. The port lane
+    # is named after the monitored physical port ("tile C,R south slave 0") when
+    # the evt_port descriptor is present, else "tile C,R port". A lane with no
+    # events across the whole run is dropped, so port-less captures still render.
+    evt_ports = ts.get("evt_ports", {})
     for tile in sorted(ts["traces"]):
         fit = fits.get(tile)
         intervals = ts["traces"][tile]
-        tile_events = []
+        core_events, port_events = [], []
         if fit is not None:
             for s_cyc, e_cyc, names in intervals:
-                tile_events.append({
-                    "event": "|".join(names),
+                core_names, port_names = _split_names(names)
+                span = {
                     "start_us": fit.cycle_to_us(s_cyc),
                     "end_us": fit.cycle_to_us(e_cyc + 1),
                     "detail": "cycles %d..%d (%d cyc)" % (s_cyc, e_cyc, e_cyc - s_cyc + 1),
-                })
-        lanes.append({"name": "tile %d,%d" % tile, "events": tile_events})
+                }
+                if core_names:
+                    core_events.append({"event": "|".join(core_names), **span})
+                if port_names:
+                    port_events.append({"event": "|".join(port_names), **span})
+        lanes.append({"name": "tile %d,%d core" % tile, "events": core_events})
+        if port_events:
+            suffix = evt_ports.get(tile, "port")
+            lanes.append({"name": "tile %d,%d %s" % (tile[0], tile[1], suffix),
+                          "events": port_events})
 
     meta = {"cps": cps, "counts_per_us": cps / 1e6,
             "host_span_us": host_counts_to_us(h1, cps, h0),
@@ -279,25 +342,50 @@ def _self_test():
         "[TIMESYNC] hostevt iter=0 phase=iter_start host=1000",
         "[TIMESYNC] hostevt iter=0 phase=run host=1500",
         "[TIMESYNC] aiehz tile=4,4 hz=1000000.000",
+        # evt_port descriptor: names the port lane after the monitored port.
+        '[aie_runtime] core_trace_stream_json: {"src_tile":[4,4],'
+        '"evt_port":{"tile":[4,4],"port":"south","intf":"slave","num":0},'
+        '"slots":["ACTIVE"],"hops":[]}',
         "[TIMESYNC] trace tile=4,4 words=16",
         "[TIMESYNC] trace tile=4,4 10  ACTIVE",
         "[TIMESYNC] trace tile=4,4 108 -- 112  STREAM_STALL  (5 cyc)",
+        # Combined core+port interval: splits into the core lane (ACTIVE) and the
+        # port lane (PORT_RUNNING_0) sharing the same span.
+        "[TIMESYNC] trace tile=4,4 200 -- 209  ACTIVE|PORT_RUNNING_0  (10 cyc)",
+        "[TIMESYNC] trace tile=4,4 210 -- 219  PORT_IDLE_0  (10 cyc)",
     ])
     ts = parse_timesync(block)
     assert ts["cps"] == 1000000
-    assert ts["traces"][(4, 4)] == [(10, 10, ["ACTIVE"]), (108, 112, ["STREAM_STALL"])], ts["traces"]
+    assert ts["evt_ports"] == {(4, 4): "south slave 0"}, ts["evt_ports"]
+    assert ts["traces"][(4, 4)] == [
+        (10, 10, ["ACTIVE"]), (108, 112, ["STREAM_STALL"]),
+        (200, 209, ["ACTIVE", "PORT_RUNNING_0"]), (210, 219, ["PORT_IDLE_0"])], ts["traces"]
     model = correlate(ts)
     host = next(l for l in model["lanes"] if l["name"] == "host")
     assert host["events"][0]["start_us"] == 0.0
     assert host["events"][1]["start_us"] == 500.0
-    tile = next(l for l in model["lanes"] if l["name"] == "tile 4,4")
-    spans = {e["event"]: (e["start_us"], e["end_us"]) for e in tile["events"]}
-    # us(cycle)==cycle; interval end covers end_cycle+1.
-    assert spans["ACTIVE"] == (10.0, 11.0), spans
-    assert spans["STREAM_STALL"] == (108.0, 113.0), spans
-    print("self-test OK: host and AIE lanes on one us axis")
+    tile = next(l for l in model["lanes"] if l["name"] == "tile 4,4 core")
+    # Two ACTIVE intervals share the same event name, so collect tuples (a dict
+    # keyed by name would collapse them). us(cycle)==cycle; end covers end_cycle+1.
+    spans = [(e["event"], e["start_us"], e["end_us"]) for e in tile["events"]]
+    assert ("ACTIVE", 10.0, 11.0) in spans, spans
+    assert ("STREAM_STALL", 108.0, 113.0) in spans, spans
+    # The combined interval contributed ACTIVE to the core lane, not PORT_*.
+    assert ("ACTIVE", 200.0, 210.0) in spans, spans
+    assert not any("PORT_" in e for e, _, _ in spans), spans
+    # The port lane is named after the monitored port and carries only PORT_*.
+    port = next(l for l in model["lanes"] if l["name"] == "tile 4,4 south slave 0")
+    pspans = {e["event"]: (e["start_us"], e["end_us"]) for e in port["events"]}
+    assert pspans == {"PORT_RUNNING_0": (200.0, 210.0),
+                      "PORT_IDLE_0": (210.0, 220.0)}, pspans
+    # The port lane sits directly beneath its tile's core lane.
+    names = [l["name"] for l in model["lanes"]]
+    assert names.index("tile 4,4 south slave 0") == names.index("tile 4,4 core") + 1, names
+    print("self-test OK: host, AIE core, and AIE port lanes on one us axis")
     print("  host events:", [(e["event"], e["start_us"]) for e in host["events"]])
-    print("  tile 4,4   :", [(e["event"], e["start_us"], e["end_us"]) for e in tile["events"]])
+    print("  tile 4,4 core:", [(e["event"], e["start_us"], e["end_us"]) for e in tile["events"]])
+    print("  tile 4,4 port:", port["name"],
+          [(e["event"], e["start_us"], e["end_us"]) for e in port["events"]])
     return 0
 
 

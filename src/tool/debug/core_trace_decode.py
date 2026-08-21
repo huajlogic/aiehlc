@@ -43,7 +43,8 @@ Mode bits [25:24] = 0b00 (Event-Time).
 "cycles" is the count since the previous frame -> cycle += cycles, then event(s)
 are emitted at the new cycle. Single carries a 3-bit event index; Multiple an
 8-bit event bitmap. Event index -> slot name follows __Runtime_core_trace_setup
-(0..3 = ACTIVE, LOCK_STALL, STREAM_STALL, MEMORY_STALL). Repeat re-emits the
+(0..3 = ACTIVE, LOCK_STALL, STREAM_STALL, MEMORY_STALL;
+4..6 = PORT_IDLE_0, PORT_RUNNING_0, PORT_STALLED_0). Repeat re-emits the
 previous frame's event set for `repeats` more consecutive cycles (or, after a
 Sync, adds that many 0x3FFFF idle periods). Frame bit layouts are high confidence
 (Figure 4-14); Repeat/Sync cycle accumulation is the documented compression.
@@ -67,13 +68,22 @@ PACKET_WORDS = 8          # 1 header + 7 payload
 PAYLOAD_WORDS = 7
 SYNC_CYCLES = 0x3FFFF     # Sync frame = 18-bit count wrap
 
-# s_core_trace_slot_name[4] from aie_runtime.c:300
-SLOT_NAMES = ("ACTIVE", "LOCK_STALL", "STREAM_STALL", "MEMORY_STALL")
+# s_core_trace_slot_name[8] from aie_runtime.c. Slots 0..3 are core-state
+# events; 4..6 are the stream-switch port-0 event group; slot 7 is unused.
+SLOT_NAMES = ("ACTIVE", "LOCK_STALL", "STREAM_STALL", "MEMORY_STALL",
+              "PORT_IDLE_0", "PORT_RUNNING_0", "PORT_STALLED_0", "EVENT7")
 
 
 def slot_name(s):
-    """Event index -> slot name (0..3 configured; 4..7 unconfigured here)."""
-    return SLOT_NAMES[s] if s < 4 else f"EVENT{s}"
+    """Event index -> slot name (0..6 configured; 7 unused here)."""
+    return SLOT_NAMES[s] if s < 8 else f"EVENT{s}"
+
+
+def event_category(name):
+    """Trace-slot event -> category. The stream-switch PORT_* events describe
+    port activity, so they are the 'event' category; ACTIVE and the *_STALL /
+    LOCK states describe the core itself, so they are the 'core' category."""
+    return "event" if name.startswith("PORT_") else "core"
 
 
 class CoreTraceDecoder:
@@ -143,20 +153,23 @@ class CoreTraceDecoder:
 
     def _mark(self, cycle, mask):
         """Route one per-cycle event mask. Always records the per-bit
-        (cycle, name) timeline (the semantic return value, unchanged); in
-        faithful mode drives the run tracker, in verbose mode keeps the
-        per-slot '-> cycle name' lines. mask==0 is a no-op."""
+        (cycle, name, category) timeline (the semantic return value); category
+        is 'event' for PORT_* and 'core' otherwise. In faithful mode drives the
+        run tracker, in verbose mode keeps the per-slot '-> cycle name' lines.
+        mask==0 is a no-op."""
         if mask == 0:
             return
         for s in range(8):
             if mask & (1 << s):
-                self.timeline.append((cycle, slot_name(s)))
+                name = slot_name(s)
+                self.timeline.append((cycle, name, event_category(name)))
         if self.mode == "faithful":
             self._run_add(cycle, mask)
         elif self.mode == "verbose":
             for s in range(8):
                 if mask & (1 << s):
-                    print(f"        -> {cycle}  {slot_name(s)}")
+                    name = slot_name(s)
+                    print(f"        -> {cycle}  {name}  [{event_category(name)}]")
 
     def _repeat(self, rep):
         if self.mode == "verbose":
@@ -280,7 +293,8 @@ class CoreTraceDecoder:
 
         Strips the packet headers (every 8th word) up to the first all-zero
         packet, concatenates the payload words, and decodes the frame stream.
-        Returns the [(cycle, slot_name), ...] timeline."""
+        Returns the [(cycle, slot_name, category), ...] timeline, where category
+        is 'event' for PORT_* and 'core' for ACTIVE / *_STALL / LOCK."""
         words = [w & 0xFFFFFFFF for w in words]
         if nwords is None:
             nwords = len(words)
@@ -355,11 +369,11 @@ def main(argv):
     dec = CoreTraceDecoder(mode="verbose" if verbose else "faithful")
     timeline = dec.decode(words)
 
-    print("\n=== decoded timeline (cycle  slot) ===")
+    print("\n=== decoded timeline (cycle  slot  category) ===")
     if not timeline:
         print("(no events)")
-    for cyc, name in timeline:
-        print(f"{cyc}  {name}")
+    for cyc, name, category in timeline:
+        print(f"{cyc}  {name}  [{category}]")
     return 0
 
 

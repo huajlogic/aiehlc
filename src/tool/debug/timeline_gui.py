@@ -38,6 +38,10 @@ EVENT_COLORS = {
     "LOCK_STALL": "#ff7f0e",    # orange
     "STREAM_STALL": "#d62728",  # red
     "MEMORY_STALL": "#9467bd",  # purple
+    # Stream-switch port state (slots 4..6), rendered on the per-tile port lane.
+    "PORT_RUNNING_0": "#17becf",  # teal
+    "PORT_STALLED_0": "#e377c2",  # pink
+    "PORT_IDLE_0": "#bcbcbc",     # light grey
 }
 # Stall slots take colour priority over ACTIVE in a combined label: a core is
 # reported ACTIVE even while blocked, so the stall should be what you see.
@@ -294,9 +298,15 @@ def _add_legend(ax, model):
     for lane in tile_lanes(model):
         for ev in lane["events"]:
             present.add(ev["event"])
+    friendly = {
+        "ACTIVE": "AIE running",
+        "PORT_RUNNING_0": "port running",
+        "PORT_STALLED_0": "port stalled",
+        "PORT_IDLE_0": "port idle",
+    }
     for name, col in EVENT_COLORS.items():
         if any(name in p.split("|") for p in present):
-            label = "AIE running" if name == "ACTIVE" else name
+            label = friendly.get(name, name)
             handles.append(Patch(facecolor=col, edgecolor="black", label=label))
     if any(not set(p.split("|")) & set(EVENT_COLORS) for p in present):
         handles.append(Patch(facecolor=OTHER_COLOR, edgecolor="black", label="other"))

@@ -431,9 +431,11 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 
 // Configure the core trace unit on `tile`: capture window ACTIVE_CORE..
 // DISABLED_CORE, EVENT_TIME mode (delta-cycle timestamps), trace slots 0..3 =
-// ACTIVE / LOCK_STALL / STREAM_STALL / MEMORY_STALL, then route the TRACE stream
-// down to the top MemTile in the same column and land it via the MemTile's S2MM
-// channel `s2mm_ch` into [buf_addr, buf_addr+buf_len) of MemTile memory.
+// ACTIVE / LOCK_STALL / STREAM_STALL / MEMORY_STALL and slots 4..6 =
+// PORT_IDLE_0 / PORT_RUNNING_0 / PORT_STALLED_0 (the stream-switch port-0 event
+// group), then route the TRACE stream down to the top MemTile in the same column
+// and land it via the MemTile's S2MM channel `s2mm_ch` into
+// [buf_addr, buf_addr+buf_len) of MemTile memory.
 //   strm_ch  physical stream channel (0..3) used for every SOUTH/NORTH hop from
 //            the core down to the MemTile; caller must ensure it is free.
 //   s2mm_ch  the MemTile's S2MM DMA channel the trace drains into.
@@ -443,6 +445,11 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 // Call BEFORE enabling the core; the caller must reserve the MemTile buffer
 // region and the strm_ch/s2mm_ch so they do not clash with data traffic.
 //
+// The PORT_*_0 events only fire once the core's stream-switch event port 0 is
+// bound to a physical port; port_intf/port/port_num pick which one (default
+// core MASTER port 0 = the core's outgoing stream). Pass XAIE_STRMSW_SLAVE /
+// a different StrmSwPortType / index to watch another port.
+//
 // When a generated routing resource map is passed (resmap != NULL && count > 0),
 // the trace route's stream channel, MemTile S2MM channel and packet id are
 // re-selected to avoid the data-plane ports the map records for this column;
@@ -451,7 +458,9 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 struct AieResourceEntry; /* generated in aie_resource_map.h; opaque here */
 AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t buf_len,
                                  uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum = 0,
-                                 const struct AieResourceEntry *resmap = 0, int resmap_count = 0);
+                                 const struct AieResourceEntry *resmap = 0, int resmap_count = 0,
+                                 XAie_StrmPortIntf port_intf = XAIE_STRMSW_SLAVE, StrmSwPortType port = SOUTH,
+                                 uint8_t port_num = 0);
 
 // Read raw trace words back from the MemTile buffer. Pass the MemTile loc (the
 // same-column top MemTile, row XAIE_AIE_TILE_ROW_START-1) and buf_addr used in

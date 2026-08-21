@@ -38,8 +38,8 @@ _RUNTIME_C = os.path.normpath(
 # Extract the real decoder from aie_runtime.c and build a compilable harness.
 # --------------------------------------------------------------------------
 def _extract_c_decoder(src):
-    m = re.search(r"static const char \*const s_core_trace_slot_name\[4\][^;]*;", src)
-    assert m, "s_core_trace_slot_name[4] table not found in aie_runtime.c"
+    m = re.search(r"static const char \*const s_core_trace_slot_name\[8\][^;]*;", src)
+    assert m, "s_core_trace_slot_name[8] table not found in aie_runtime.c"
     slot_tbl = m.group(0)
 
     start = src.index("#define XAIE_TRACE_SYNC_CYCLES")
@@ -544,8 +544,8 @@ def test_single2_wide_cycle():
 def test_multiple1_and_multiple2_with_event_slots():
     words = pack(start(0), multiple(0xFF, 500), multiple(0x81, 200000))
     golden = [(500, "ACTIVE"), (500, "LOCK_STALL"), (500, "STREAM_STALL"),
-              (500, "MEMORY_STALL"), (500, "EVENT4"), (500, "EVENT5"),
-              (500, "EVENT6"), (500, "EVENT7"),
+              (500, "MEMORY_STALL"), (500, "PORT_IDLE_0"), (500, "PORT_RUNNING_0"),
+              (500, "PORT_STALLED_0"), (500, "EVENT7"),
               (200500, "ACTIVE"), (200500, "EVENT7")]
     _check(words, golden)
 
@@ -645,13 +645,13 @@ def test_user_capture_8word_packet():
     # buf[0]=0xf0000000 skipped as header; first payload byte 0x00 -> Single0
     # event 0, cycle 0.
     assert tl[0] == (0, "ACTIVE")
-    assert tl[1:4] == [(142848, "STREAM_STALL"), (142848, "EVENT5"),
-                       (142848, "EVENT6")]
+    assert tl[1:4] == [(142848, "STREAM_STALL"), (142848, "PORT_RUNNING_0"),
+                       (142848, "PORT_STALLED_0")]
     assert tl[-1] == (13854729, "ACTIVE")
     assert len(tl) == 1522
     assert max(cyc for cyc, _ in tl) == 13854729
     assert dict(collections.Counter(n for _, n in tl)) == {
-        "ACTIVE": 412, "STREAM_STALL": 370, "EVENT5": 370, "EVENT6": 370}
+        "ACTIVE": 412, "STREAM_STALL": 370, "PORT_RUNNING_0": 370, "PORT_STALLED_0": 370}
 
 
 # --------------------------------------------------------------------------
