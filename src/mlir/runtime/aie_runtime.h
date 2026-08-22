@@ -429,6 +429,10 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 // stealing core data memory.
 // ---------------------------------------------------------------------------
 
+// DMA direction selector for the memory-module trace unit (see
+// __Runtime_mem_trace_setup / the mem_dma_kind param of core_trace_setup).
+enum { AIE_TRACE_DMA_NONE = 0, AIE_TRACE_DMA_S2MM = 1, AIE_TRACE_DMA_MM2S = 2 };
+
 // Configure the core trace unit on `tile`: capture window ACTIVE_CORE..
 // DISABLED_CORE, EVENT_TIME mode (delta-cycle timestamps), trace slots 0..3 =
 // ACTIVE / LOCK_STALL / STREAM_STALL / MEMORY_STALL and slots 4..6 =
@@ -455,12 +459,36 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 // re-selected to avoid the data-plane ports the map records for this column;
 // strm_ch/s2mm_ch/bdnum are then treated as fallbacks. NULL/0 (raw/single-kernel
 // flow) keeps the convention values the caller passed in.
+//
+// mem_dma_kind/mem_dma_ch additionally arm the tile's MEMORY-module trace unit
+// (packet id 2) capturing a DMA channel's BD/stall/lock events; it rides the
+// SAME TRACE->SOUTH->MemTile drain and lands in the SAME buffer as the core
+// stream (pkt id 1), demuxed by packet id on read. AIE_TRACE_DMA_NONE disables
+// it; the default is S2MM channel 0. See __Runtime_mem_trace_setup.
 struct AieResourceEntry; /* generated in aie_resource_map.h; opaque here */
 AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t buf_len,
                                  uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum = 0,
                                  const struct AieResourceEntry *resmap = 0, int resmap_count = 0,
                                  XAie_StrmPortIntf port_intf = XAIE_STRMSW_SLAVE, StrmSwPortType port = SOUTH,
-                                 uint8_t port_num = 0);
+                                 uint8_t port_num = 0, int mem_dma_kind = AIE_TRACE_DMA_S2MM, uint8_t mem_dma_ch = 0);
+
+// Arm the compute tile's MEMORY-module trace unit and merge its packet stream
+// (packet id 2) onto the core trace's shared TRACE->SOUTH->MemTile drain.
+//   dma_kind  AIE_TRACE_DMA_S2MM / _MM2S selects which DMA direction to trace
+//             (AIE_TRACE_DMA_NONE is a no-op that returns XAIE_OK).
+//   dma_ch    DMA channel index (0 or 1) whose BD/stall/lock events are traced.
+//   arbiter   the packet-switch arbiter the core stream already claimed on this
+//             tile's SOUTH master (both streams share ONE arbiter).
+//   msel      the MASTER-select line for THIS (mem) stream; must differ from the
+//             core stream's msel so the shared SOUTH master's MSelEn bitmask can
+//             round-robin between the two packet ids.
+// Programs the MEM_MOD trace unit (8 slots: DMA start/finish/stall/lock),
+// installs packet id 2, and enables the MEM_TRACE stream-switch slave port
+// (TRACE port index 1; TRACE:0 is the core AIE_TRACE port). The caller
+// (__Runtime_core_trace_setup) must have already enabled the SOUTH master with
+// an MSelEn covering both msels. Call BEFORE enabling the core.
+AieRC __Runtime_mem_trace_setup(XAie_DevInst *dev, XAie_LocType tile, int dma_kind, uint8_t dma_ch, uint8_t arbiter,
+                                uint8_t msel);
 
 // Read raw trace words back from the MemTile buffer. Pass the MemTile loc (the
 // same-column top MemTile, row XAIE_AIE_TILE_ROW_START-1) and buf_addr used in
@@ -481,6 +509,9 @@ typedef struct {
     uint8_t col, row; // tile that produced it (set by attach)
     uint32_t mask;    // 8-bit event mask (ACTIVE/*_STALL/...)
     uint64_t start_cycle, end_cycle;
+    const char *const *names; // 8-slot name table of the producing stream
+                              // (core vs mem); set by the decoder on flush so
+                              // the dump labels each pkt-id stream correctly.
 } AieTraceInterval;
 
 // One host<->AIE anchor pair for a tile: the tile's free-running AIE core-timer
@@ -500,7 +531,13 @@ typedef struct {
     uint64_t host;
 } AieTraceHostEvt;
 
-#define AIE_TRACE_PROFILE_CAP 512u
+#define AIE_TRACE_PROFILE_CAP 4096u
+// Per-stream reservation: when the shared buffer holds several demuxed streams
+// (core pkt-1 + mem pkt-2), each stream still not yet decoded is guaranteed at
+// least this many interval slots so a chatty earlier stream (the core port
+// toggles) cannot starve a later one (the mem DMA events). See the reserve
+// bookkeeping in __Runtime_core_trace_decode / __core_trace_flush.
+#define AIE_TRACE_PROFILE_MIN_PER_STREAM 1024u
 #define AIE_TRACE_ANCHOR_CAP 8u
 #define AIE_TRACE_EVENT_CAP 64u
 // Fixed-capacity, no-malloc collector (baremetal-safe). One container for a run:
@@ -512,6 +549,8 @@ typedef struct {
     AieTraceInterval iv[AIE_TRACE_PROFILE_CAP];
     uint32_t count;           // valid intervals in iv[]
     uint32_t dropped;         // intervals discarded past CAP
+    uint32_t reserve;         // slots held back for not-yet-decoded streams
+                              // (set per stream by __Runtime_core_trace_decode)
     uint8_t cur_col, cur_row; // tag applied to appended intervals
     int attached;             // nonzero after attach()
     // --- host<->AIE time-sync ---

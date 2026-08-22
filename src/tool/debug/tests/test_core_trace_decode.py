@@ -42,11 +42,21 @@ def _extract_c_decoder(src):
     assert m, "s_core_trace_slot_name[8] table not found in aie_runtime.c"
     slot_tbl = m.group(0)
 
+    # The demux (__core_trace_table_for_id) also references the mem-module slot
+    # table for pkt id 2, so pull it in too or the harness will not link.
+    mm = re.search(r"static const char \*const s_mem_trace_slot_name\[8\][^;]*;", src)
+    assert mm, "s_mem_trace_slot_name[8] table not found in aie_runtime.c"
+    mem_tbl = mm.group(0)
+
     start = src.index("#define XAIE_TRACE_SYNC_CYCLES")
-    end = src.index("// Global routing instance", start)
+    # Stop right after the trace-profile dump: the declarative-session code that
+    # follows pulls in board headers (xtime_l.h / xiltimer.h) that cannot be
+    # compiled standalone. The harness only needs init/attach/.../decode/dump.
+    end = src.index("Declarative core-trace session", start)
+    end = src.rindex("/*", start, end)  # back up to that comment block's opener
     block = src[start:end].rstrip()
     assert "__Runtime_core_trace_decode" in block, "decoder body not captured"
-    return slot_tbl, block
+    return slot_tbl, mem_tbl, block
 
 
 # Minimal shim for the types the profile path references. The real defs live in
@@ -59,6 +69,7 @@ typedef struct {
     uint8_t  col, row;
     uint32_t mask;
     uint64_t start_cycle, end_cycle;
+    const char *const *names;
 } AieTraceInterval;
 
 typedef struct {
@@ -72,13 +83,15 @@ typedef struct {
     uint64_t    host;
 } AieTraceHostEvt;
 
-#define AIE_TRACE_PROFILE_CAP 512u
+#define AIE_TRACE_PROFILE_CAP 4096u
+#define AIE_TRACE_PROFILE_MIN_PER_STREAM 1024u
 #define AIE_TRACE_ANCHOR_CAP    8u
 #define AIE_TRACE_EVENT_CAP    64u
 typedef struct {
     AieTraceInterval iv[AIE_TRACE_PROFILE_CAP];
     uint32_t count;
     uint32_t dropped;
+    uint32_t reserve;
     uint8_t  cur_col, cur_row;
     int      attached;
     uint64_t cps;
@@ -141,10 +154,10 @@ def _build_harness():
         return None
     with open(_RUNTIME_C) as f:
         src = f.read()
-    slot_tbl, block = _extract_c_decoder(src)
+    slot_tbl, mem_tbl, block = _extract_c_decoder(src)
     prog = ("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n"
             "#include <string.h>\n\n"
-            + _PROFILE_SHIM + "\n" + slot_tbl + "\n\n" + block + "\n" + _HARNESS_MAIN)
+            + _PROFILE_SHIM + "\n" + slot_tbl + "\n" + mem_tbl + "\n\n" + block + "\n" + _HARNESS_MAIN)
 
     d = tempfile.mkdtemp(prefix="ctd_ut_")
     cpath = os.path.join(d, "harness.c")
@@ -351,10 +364,13 @@ def raw_intervals(text):
 
 
 # Profile dump interval line:
-#   "[TIMESYNC] trace tile=<c>,<r> <start>[ -- <end>]  <events>[  (<N> cyc)]".
-# The "[TIMESYNC] trace tile=c,r words=N" header line has "words=" (not a digit)
-# after the tile, so it never matches this interval regex.
-_PROF = re.compile(r"^\[TIMESYNC\] trace tile=(\d+),(\d+) (\d+)(?:\s+--\s+(\d+))?  (\S+?)(?:  \(\d+ cyc\))?$")
+#   "[TIMESYNC] trace tile=<c>,<r> [stream=<tag> ]<start>[ -- <end>]  <events>[  (<N> cyc)]".
+# The optional "stream=<tag>" marks the mem-module DMA stream (pkt id 2); it is
+# non-capturing here so core lines keep their 5-group layout. The
+# "[TIMESYNC] trace tile=c,r words=N" header has "words=" after the tile, so it
+# never matches this interval regex.
+_PROF = re.compile(
+    r"^\[TIMESYNC\] trace tile=(\d+),(\d+) (?:stream=\w+ )?(\d+)(?:\s+--\s+(\d+))?  (\S+?)(?:  \(\d+ cyc\))?$")
 
 
 def profile_intervals(text):
@@ -431,10 +447,12 @@ def _check(words, golden):
 def test_extract_regions_present():
     with open(_RUNTIME_C) as f:
         src = f.read()
-    slot_tbl, block = _extract_c_decoder(src)
+    slot_tbl, mem_tbl, block = _extract_c_decoder(src)
     assert "ACTIVE" in slot_tbl and "MEMORY_STALL" in slot_tbl
+    assert "DMA_START" in mem_tbl and "LOCK_REL" in mem_tbl
     assert "__core_trace_bits" in block
     assert "void __Runtime_core_trace_decode(" in block
+    assert "__core_trace_table_for_id" in block  # demux by pkt id
     # The profile API travels with the decoder (same extracted region).
     assert "__Runtime_aie_trace_profile_dump" in block
 
@@ -612,6 +630,74 @@ def test_empty_buffer_is_header_only():
     c_out = run_c(words)
     assert timeline(c_out) == []
     assert run_c(words) == run_py(words)
+
+
+# --------------------------------------------------------------------------
+# Packet-id demux: a shared MemTile buffer carrying the core stream (pkt id 1)
+# and the mem-module DMA stream (pkt id 2) must decode each with its OWN slot
+# table, ascending by id (core before mem). Legacy single-id buffers are
+# unchanged (covered by every other case, which uses id 1 / id 0).
+# --------------------------------------------------------------------------
+MEM_HDR = 0x00000002  # packet id=2, type=0 (mem-module DMA trace)
+
+
+def test_demux_core_and_mem_streams():
+    # id 1 (core): ACTIVE @1010; id 2 (mem): slot0 DMA_START @2005. The two
+    # streams share one buffer; the demux splits them by header id and labels
+    # each with its table. Decoded ascending -> core interval then mem interval.
+    _skip_if_no_cc()
+    core = pack(start(1000), single(0, 10), header=PKT_HDR, terminate=False)
+    mem = pack(start(2000), single(0, 5), header=MEM_HDR, terminate=False)
+    words = core + mem + [0] * 8
+    _check(words, [(1010, "ACTIVE"), (2005, "DMA_START")])
+
+
+def test_demux_mem_slot_names_and_category():
+    # Exercise several mem slots and assert the Python model tags them with the
+    # mem name table and the 'mem' timeline category (distinct from core).
+    mem = pack(start(0), multiple(0x0F, 5), header=MEM_HDR, terminate=False)
+    words = mem + [0] * 8
+    tl = ctd.CoreTraceDecoder(mode="quiet").decode(words)
+    assert tl == [
+        (5, "DMA_START", "mem"),
+        (5, "DMA_FINISH", "mem"),
+        (5, "DMA_STALL_LOCK", "mem"),
+        (5, "STREAM_STALL", "mem"),
+    ]
+
+
+def test_demux_core_and_mem_categories_distinct():
+    # Same STREAM_STALL slot name appears in BOTH tables (core slot 2, mem slot
+    # 3); only the category disambiguates the stream. Core STREAM_STALL is
+    # 'core', mem STREAM_STALL is 'mem'.
+    core = pack(start(0), single(2, 7), header=PKT_HDR, terminate=False)
+    mem = pack(start(0), single(3, 7), header=MEM_HDR, terminate=False)
+    words = core + mem + [0] * 8
+    tl = ctd.CoreTraceDecoder(mode="quiet").decode(words)
+    assert (7, "STREAM_STALL", "core") in tl
+    assert (7, "STREAM_STALL", "mem") in tl
+
+
+def test_profile_dump_tags_mem_stream():
+    # The profile dump must tag mem-module intervals (pkt id 2) with "stream=mem"
+    # so the off-device timeline can route them to their own lane -- STREAM_STALL
+    # collides with the core table, so the slot name alone cannot disambiguate.
+    # Core intervals stay untagged (backward compatible with existing parsers).
+    _skip_if_no_cc()
+    core = pack(start(1000), single(0, 10), header=PKT_HDR, terminate=False)
+    mem = pack(start(2000), single(0, 5), single(3, 2), header=MEM_HDR, terminate=False)
+    words = core + mem + [0] * 8
+    out = run_c_profile(words)
+    lines = [l for l in out.splitlines() if l.startswith("[TIMESYNC] trace tile=")]
+    core_lines = [l for l in lines if "stream=" not in l]
+    mem_lines = [l for l in lines if "stream=mem " in l]
+    assert any(l.endswith(" 1010  ACTIVE") for l in core_lines), core_lines
+    assert any(l.endswith(" DMA_START") for l in mem_lines), mem_lines
+    assert any(l.endswith(" STREAM_STALL") for l in mem_lines), mem_lines
+    # The dump still parses into intervals (stream tag is non-capturing there).
+    ivs = [(s, e, nm) for _, _, s, e, nm in profile_intervals(out)]
+    assert (2005, 2005, "DMA_START") in ivs, ivs
+    assert (2007, 2007, "STREAM_STALL") in ivs, ivs
 
 
 # --------------------------------------------------------------------------

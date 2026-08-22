@@ -60,12 +60,14 @@ import sys
 _TS = re.compile(r"^\[TIMESYNC\]\s+(.*)$")
 
 # A decoded AIE interval line body:
-#   "trace tile=4,4 1010  ACTIVE"                       (1-cycle event)
-#   "trace tile=4,4 1010 -- 1012  ACTIVE|LOCK  (3 cyc)" (interval)
-# The "trace tile=4,4 words=N" header has "words=" (not a digit) after the
-# tile, so it never matches this interval regex.
+#   "trace tile=4,4 1010  ACTIVE"                        (core, 1-cycle event)
+#   "trace tile=4,4 1010 -- 1012  ACTIVE|LOCK  (3 cyc)"  (core interval)
+#   "trace tile=4,4 stream=mem 2005  DMA_START"          (mem-module DMA stream)
+# The optional "stream=<tag>" marks the mem-module DMA trace (pkt id 2); it is
+# absent on core lines (pkt id 1). The "trace tile=4,4 words=N" header has
+# "words=" (not "stream="/a digit) after the tile, so it never matches here.
 _TRACE_IV = re.compile(
-    r"^trace tile=(\d+),(\d+) (\d+)(?:\s+--\s+(\d+))?\s+(\S+?)(?:\s+\(\d+ cyc\))?$")
+    r"^trace tile=(\d+),(\d+) (?:stream=(\w+) )?(\d+)(?:\s+--\s+(\d+))?\s+(\S+?)(?:\s+\(\d+ cyc\))?$")
 
 # The runtime prints one core_trace_stream_json line per traced tile carrying the
 # monitored event-port selection, e.g.
@@ -165,10 +167,11 @@ def parse_timesync(text):
             iv = _TRACE_IV.match(body)
             if iv:
                 tile = (int(iv.group(1)), int(iv.group(2)))
-                s_cyc = int(iv.group(3))
-                e_cyc = int(iv.group(4)) if iv.group(4) else s_cyc
-                names = iv.group(5).split("|")
-                traces.setdefault(tile, []).append((s_cyc, e_cyc, names))
+                stream = iv.group(3) or "core"  # "mem" for the DMA stream, else core
+                s_cyc = int(iv.group(4))
+                e_cyc = int(iv.group(5)) if iv.group(5) else s_cyc
+                names = iv.group(6).split("|")
+                traces.setdefault(tile, []).append((s_cyc, e_cyc, names, stream))
             # else: "trace tile=4,4 words=N" header -- count only, ignored.
 
     return {"cps": cps, "anchors": anchors, "hostevts": hostevts,
@@ -263,15 +266,21 @@ def correlate(ts):
     for tile in sorted(ts["traces"]):
         fit = fits.get(tile)
         intervals = ts["traces"][tile]
-        core_events, port_events = [], []
+        core_events, port_events, mem_events = [], [], []
         if fit is not None:
-            for s_cyc, e_cyc, names in intervals:
-                core_names, port_names = _split_names(names)
+            for s_cyc, e_cyc, names, stream in intervals:
                 span = {
                     "start_us": fit.cycle_to_us(s_cyc),
                     "end_us": fit.cycle_to_us(e_cyc + 1),
                     "detail": "cycles %d..%d (%d cyc)" % (s_cyc, e_cyc, e_cyc - s_cyc + 1),
                 }
+                # The mem-module DMA stream (pkt id 2) is its own lane: its slot
+                # names (DMA_START/.../LOCK_REL, and a STREAM_STALL that
+                # collides with the core one) are NOT the core/port categories.
+                if stream == "mem":
+                    mem_events.append({"event": "|".join(names), **span})
+                    continue
+                core_names, port_names = _split_names(names)
                 if core_names:
                     core_events.append({"event": "|".join(core_names), **span})
                 if port_names:
@@ -281,6 +290,8 @@ def correlate(ts):
             suffix = evt_ports.get(tile, "port")
             lanes.append({"name": "tile %d,%d %s" % (tile[0], tile[1], suffix),
                           "events": port_events})
+        if mem_events:
+            lanes.append({"name": "tile %d,%d mem dma" % tile, "events": mem_events})
 
     meta = {"cps": cps, "counts_per_us": cps / 1e6,
             "host_span_us": host_counts_to_us(h1, cps, h0),
@@ -353,13 +364,18 @@ def _self_test():
         # port lane (PORT_RUNNING_0) sharing the same span.
         "[TIMESYNC] trace tile=4,4 200 -- 209  ACTIVE|PORT_RUNNING_0  (10 cyc)",
         "[TIMESYNC] trace tile=4,4 210 -- 219  PORT_IDLE_0  (10 cyc)",
+        # Mem-module DMA stream (pkt id 2): its own lane, own event names. Note
+        # STREAM_STALL collides with the core table but stream=mem disambiguates.
+        "[TIMESYNC] trace tile=4,4 stream=mem 300  DMA_START",
+        "[TIMESYNC] trace tile=4,4 stream=mem 305 -- 309  STREAM_STALL  (5 cyc)",
     ])
     ts = parse_timesync(block)
     assert ts["cps"] == 1000000
     assert ts["evt_ports"] == {(4, 4): "south slave 0"}, ts["evt_ports"]
     assert ts["traces"][(4, 4)] == [
-        (10, 10, ["ACTIVE"]), (108, 112, ["STREAM_STALL"]),
-        (200, 209, ["ACTIVE", "PORT_RUNNING_0"]), (210, 219, ["PORT_IDLE_0"])], ts["traces"]
+        (10, 10, ["ACTIVE"], "core"), (108, 112, ["STREAM_STALL"], "core"),
+        (200, 209, ["ACTIVE", "PORT_RUNNING_0"], "core"), (210, 219, ["PORT_IDLE_0"], "core"),
+        (300, 300, ["DMA_START"], "mem"), (305, 309, ["STREAM_STALL"], "mem")], ts["traces"]
     model = correlate(ts)
     host = next(l for l in model["lanes"] if l["name"] == "host")
     assert host["events"][0]["start_us"] == 0.0
@@ -381,11 +397,19 @@ def _self_test():
     # The port lane sits directly beneath its tile's core lane.
     names = [l["name"] for l in model["lanes"]]
     assert names.index("tile 4,4 south slave 0") == names.index("tile 4,4 core") + 1, names
-    print("self-test OK: host, AIE core, and AIE port lanes on one us axis")
+    # The mem-module DMA stream is its OWN lane; its STREAM_STALL (cyc 305) must
+    # NOT leak into the core lane (which only holds the core STREAM_STALL @108).
+    mem = next(l for l in model["lanes"] if l["name"] == "tile 4,4 mem dma")
+    mspans = {e["event"]: (e["start_us"], e["end_us"]) for e in mem["events"]}
+    assert mspans == {"DMA_START": (300.0, 301.0),
+                      "STREAM_STALL": (305.0, 310.0)}, mspans
+    assert ("STREAM_STALL", 305.0, 310.0) not in spans, spans
+    print("self-test OK: host, AIE core, AIE port, and AIE mem-dma lanes on one us axis")
     print("  host events:", [(e["event"], e["start_us"]) for e in host["events"]])
     print("  tile 4,4 core:", [(e["event"], e["start_us"], e["end_us"]) for e in tile["events"]])
     print("  tile 4,4 port:", port["name"],
           [(e["event"], e["start_us"], e["end_us"]) for e in port["events"]])
+    print("  tile 4,4 mem :", [(e["event"], e["start_us"], e["end_us"]) for e in mem["events"]])
     return 0
 
 

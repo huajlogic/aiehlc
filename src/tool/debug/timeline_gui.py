@@ -42,7 +42,30 @@ EVENT_COLORS = {
     "PORT_RUNNING_0": "#17becf",  # teal
     "PORT_STALLED_0": "#e377c2",  # pink
     "PORT_IDLE_0": "#bcbcbc",     # light grey
+    # Mem-module DMA trace (pkt id 2), rendered on the per-tile "mem dma" lane.
+    # s_mem_trace_slot_name: DMA_START/FINISH/STALL_LOCK, STREAM_STALL, MEM_BP,
+    # LOCK_GRP/ACQ/REL. STREAM_STALL reuses the red above (a stall is a stall).
+    "DMA_START": "#00e676",       # spring green (task started; distinct from ACTIVE)
+    "DMA_FINISH": "#1f77b4",      # blue   (BD finished)
+    "DMA_STALL_LOCK": "#ff7f0e",  # orange (blocked acquiring a lock)
+    "MEM_BP": "#9467bd",          # purple (memory back-pressure)
+    "LOCK_GRP": "#8c564b",        # brown  (lock group event)
+    "LOCK_ACQ": "#bcbd22",        # olive  (lock acquire)
+    "LOCK_REL": "#7f7f7f",        # grey   (lock release)
 }
+# Pulse / edge events: single-cycle markers (BD start/finish, lock group /
+# acquire / release). A span rectangle cannot show a zero-width pulse, so these
+# are overlaid as VERTICAL LINE markers coloured by EVENT_COLORS -- visible even
+# when the pulse rides in a combined label alongside a held stall level.
+PULSE_EVENTS = ("DMA_START", "DMA_FINISH", "LOCK_GRP", "LOCK_ACQ", "LOCK_REL")
+# Some pulses also get a point marker at the top of their line so a LONE
+# occurrence pops out of the dense pulse cluster. The DMA task-start
+# (DMA_S2MM_0_START_TASK) fires once per run, unlike the per-iteration FINISH,
+# so without a marker its single line is easily lost.
+PULSE_MARKERS = {"DMA_START": "v"}
+# Mem DMA stall slots take colour priority over DMA_START in a combined label,
+# mirroring STALL_ORDER for the core lane (a BD can be "running" yet blocked).
+MEM_STALL_ORDER = ("DMA_STALL_LOCK", "STREAM_STALL", "MEM_BP")
 # Stall slots take colour priority over ACTIVE in a combined label: a core is
 # reported ACTIVE even while blocked, so the stall should be what you see.
 STALL_ORDER = ("LOCK_STALL", "STREAM_STALL", "MEMORY_STALL")
@@ -112,12 +135,22 @@ def event_color(event):
     to the first recognised token, else grey."""
     toks = str(event).split("|")
     for tok in toks:
-        if tok in STALL_ORDER:
+        if tok in STALL_ORDER or tok in MEM_STALL_ORDER:
             return EVENT_COLORS[tok]
     for tok in toks:
         if tok in EVENT_COLORS:
             return EVENT_COLORS[tok]
     return OTHER_COLOR
+
+
+def pulse_tokens(event):
+    """Return the pulse/edge tokens present in a (possibly '|'-joined) event
+    label, in EVENT_COLORS declaration order, de-duplicated. Level/state tokens
+    (ACTIVE, stalls, back-pressure) are excluded. Used to overlay a coloured
+    vertical marker per pulse -- a zero-width event no span rectangle can show."""
+    toks = set(str(event).split("|"))
+    return [name for name in EVENT_COLORS
+            if name in PULSE_EVENTS and name in toks]
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +289,24 @@ def _draw(ax, model, nbins=2000):
             x0 = ev["start_us"]
             x1 = x0 + max(ev["end_us"] - ev["start_us"], 0.0)
             hover.append((x0, x1, y0, y0 + row_h, ev, lane["name"]))
+            # Overlay each pulse/edge token as its own coloured vertical marker
+            # at the event's start. A single-cycle DMA_FINISH (lone or riding a
+            # stall label) is invisible as a span; the line makes it show. When
+            # several pulses share a label they stack within the row height.
+            ptoks = pulse_tokens(ev["event"])
+            if ptoks:
+                seg = row_h / len(ptoks)
+                for k, tok in enumerate(ptoks):
+                    ya = y0 + k * seg
+                    col = EVENT_COLORS[tok]
+                    ax.plot([x0, x0], [ya, ya + seg],
+                            color=col, linewidth=1.2, zorder=6)
+                    mk = PULSE_MARKERS.get(tok)
+                    if mk:
+                        # Point marker at the (visual) top of the line; the axis
+                        # is inverted so the smaller y sits highest on screen.
+                        ax.plot([x0], [ya], marker=mk, color=col, markersize=5,
+                                linestyle="none", zorder=7)
 
     # Light dashed vertical guides at each host phase boundary, across all rows.
     if hl is not None and n_rows > 0:
@@ -283,6 +334,7 @@ def _draw(ax, model, nbins=2000):
 
 def _add_legend(ax, model):
     from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
     handles = []
     # Host running/waiting bars, if a host lane is present.
     hl = host_lane(model)
@@ -303,15 +355,33 @@ def _add_legend(ax, model):
         "PORT_RUNNING_0": "port running",
         "PORT_STALLED_0": "port stalled",
         "PORT_IDLE_0": "port idle",
+        "DMA_START": "DMA start",
+        "DMA_FINISH": "DMA finished",
+        "DMA_STALL_LOCK": "DMA lock stall",
+        "MEM_BP": "mem back-pressure",
+        "LOCK_GRP": "lock group",
+        "LOCK_ACQ": "lock acquire",
+        "LOCK_REL": "lock release",
     }
     for name, col in EVENT_COLORS.items():
         if any(name in p.split("|") for p in present):
             label = friendly.get(name, name)
-            handles.append(Patch(facecolor=col, edgecolor="black", label=label))
+            mk = PULSE_MARKERS.get(name)
+            if mk:
+                # Match the on-plot look: a coloured line + its point marker so
+                # the DMA-start swatch reads the same as the drawn event.
+                handles.append(Line2D([0], [0], color=col, marker=mk,
+                                      linestyle="-", markersize=6, label=label))
+            else:
+                handles.append(Patch(facecolor=col, edgecolor="black", label=label))
     if any(not set(p.split("|")) & set(EVENT_COLORS) for p in present):
         handles.append(Patch(facecolor=OTHER_COLOR, edgecolor="black", label="other"))
     if handles:
-        ax.legend(handles=handles, loc="upper right", fontsize=7, framealpha=0.9)
+        # Anchor the legend OUTSIDE the axes on the right so its colour swatches
+        # never overlay the timeline bars (render() saves with bbox_inches=tight
+        # so the outside box is not clipped).
+        ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                  fontsize=7, framealpha=0.9, borderaxespad=0.0)
 
 
 def _attach_hover(fig, ax, hover):
@@ -375,7 +445,8 @@ def render(model, save=None, want_window=True):
         _attach_hover(fig, ax, hover)
         plt.show()
         return None
-    fig.savefig(save_path, dpi=130)
+    # bbox_inches="tight" keeps the outside-right legend from being clipped.
+    fig.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
     return save_path
 

@@ -73,16 +73,35 @@ SYNC_CYCLES = 0x3FFFF     # Sync frame = 18-bit count wrap
 SLOT_NAMES = ("ACTIVE", "LOCK_STALL", "STREAM_STALL", "MEMORY_STALL",
               "PORT_IDLE_0", "PORT_RUNNING_0", "PORT_STALLED_0", "EVENT7")
 
+# s_mem_trace_slot_name[8] from aie_runtime.c: the memory-module DMA trace unit
+# (pkt id 2). Slots 0..4 are the DMA BD/stall events, 5..7 are the lock group /
+# acquire (SEL0 ACQ_GE) / release (LOCK_0_REL, event 46 -- valid on the
+# compute-tile mem module for both AIE-ML and AIE2PS). The channel+direction
+# (S2MM/MM2S) is carried in the [TRACESTREAMCONFIG] line, not the slot names, so
+# these are generic.
+MEM_SLOT_NAMES = ("DMA_START", "DMA_FINISH", "DMA_STALL_LOCK", "STREAM_STALL",
+                  "MEM_BP", "LOCK_GRP", "LOCK_ACQ", "LOCK_REL")
 
-def slot_name(s):
-    """Event index -> slot name (0..6 configured; 7 unused here)."""
-    return SLOT_NAMES[s] if s < 8 else f"EVENT{s}"
+
+def table_for_id(pkt_id):
+    """Map a stream packet id to its 8-slot event name table: pkt 2 = mem-module
+    DMA trace, everything else (pkt 1 core, or legacy id 0 no-header captures) =
+    core trace. Mirrors __core_trace_table_for_id in aie_runtime.c."""
+    return MEM_SLOT_NAMES if pkt_id == 2 else SLOT_NAMES
 
 
-def event_category(name):
-    """Trace-slot event -> category. The stream-switch PORT_* events describe
-    port activity, so they are the 'event' category; ACTIVE and the *_STALL /
-    LOCK states describe the core itself, so they are the 'core' category."""
+def slot_name(s, names=SLOT_NAMES):
+    """Event index -> slot name using the active table (0..7 configured)."""
+    return names[s] if s < 8 else f"EVENT{s}"
+
+
+def event_category(name, stream="core"):
+    """Trace-slot event -> category. The mem-module DMA stream is its own 'mem'
+    category (distinct timeline lane). Within the core stream, the stream-switch
+    PORT_* events describe port activity ('event' category); ACTIVE and the
+    *_STALL / LOCK states describe the core itself ('core' category)."""
+    if stream == "mem":
+        return "mem"
     return "event" if name.startswith("PORT_") else "core"
 
 
@@ -105,6 +124,8 @@ class CoreTraceDecoder:
         self.bitpos = 0
         self.timeline = []
         self.run = None         # open run-length interval: (start, end, mask)
+        self.names = SLOT_NAMES  # active slot-name table (set per pkt-id group)
+        self.stream = "core"     # active stream tag ("core" | "mem")
 
     # -- bit reader (MSB-first over the header-stripped payload stream) ------
     def _read(self, nbits, advance=True):
@@ -123,8 +144,9 @@ class CoreTraceDecoder:
 
     # -- run-length interval tracker (mirrors __core_trace_run in the C code) -
     def _names(self, mask):
-        """'|'-joined slot names of an 8-bit event mask (slot 0..7 order)."""
-        return "|".join(slot_name(s) for s in range(8) if mask & (1 << s))
+        """'|'-joined slot names of an 8-bit event mask (slot 0..7 order), using
+        the active pkt-id group's slot-name table."""
+        return "|".join(slot_name(s, self.names) for s in range(8) if mask & (1 << s))
 
     def _run_flush(self):
         """Print the open run and close it: compact for a single cycle, else
@@ -161,15 +183,15 @@ class CoreTraceDecoder:
             return
         for s in range(8):
             if mask & (1 << s):
-                name = slot_name(s)
-                self.timeline.append((cycle, name, event_category(name)))
+                name = slot_name(s, self.names)
+                self.timeline.append((cycle, name, event_category(name, self.stream)))
         if self.mode == "faithful":
             self._run_add(cycle, mask)
         elif self.mode == "verbose":
             for s in range(8):
                 if mask & (1 << s):
-                    name = slot_name(s)
-                    print(f"        -> {cycle}  {name}  [{event_category(name)}]")
+                    name = slot_name(s, self.names)
+                    print(f"        -> {cycle}  {name}  [{event_category(name, self.stream)}]")
 
     def _repeat(self, rep):
         if self.mode == "verbose":
@@ -287,14 +309,37 @@ class CoreTraceDecoder:
                 print("    Filler  (alignment pad)")
         return True
 
+    def _decode_group(self, payload, names, stream):
+        """Decode ONE pkt-id stream's concatenated payload words with its own
+        slot-name table. Resets the per-stream frame state (cycle/bitpos/run/
+        last_*), runs the frame loop, and appends to self.timeline. Mirrors
+        __core_trace_decode_group in aie_runtime.c."""
+        self.names = names
+        self.stream = stream
+        self.payload = payload
+        self.total_bits = len(payload) * 32
+        self.bitpos = 0
+        self.cycle = 0
+        self.run = None
+        self.last_kind = None
+        self.last_events = 0
+        while self.bitpos + 8 <= self.total_bits:
+            if not self.step_frame():
+                break
+        self._run_flush()
+
     # -- the whole call: __Runtime_core_trace_decode(buf, nwords) -----------
     def decode(self, words, nwords=None):
         """Faithful port of __Runtime_core_trace_decode(buf, nwords).
 
-        Strips the packet headers (every 8th word) up to the first all-zero
-        packet, concatenates the payload words, and decodes the frame stream.
-        Returns the [(cycle, slot_name, category), ...] timeline, where category
-        is 'event' for PORT_* and 'core' for ACTIVE / *_STALL / LOCK."""
+        Collects the 8-word packets up to the first all-zero (untouched-tail)
+        packet, then DEMUXES them by header packet id (low 5 bits): each id's 7
+        payload words are concatenated into its own frame stream and decoded with
+        the matching slot-name table (pkt 2 = mem-module DMA, else core). Ids are
+        decoded ascending so core (1) precedes mem (2); a lone id (incl. legacy
+        id 0) yields a single group == the old behavior. Returns the combined
+        [(cycle, slot_name, category), ...] timeline (category 'mem' for the
+        mem stream, else 'event' for PORT_* / 'core')."""
         words = [w & 0xFFFFFFFF for w in words]
         if nwords is None:
             nwords = len(words)
@@ -302,9 +347,10 @@ class CoreTraceDecoder:
         if self.mode == "faithful":
             print(f"[aie_runtime] core_trace_decode: buf=<sim> nwords={nwords}")
 
-        # Outer transport: gather payload words up to the untouched tail.
+        # Outer transport: gather each valid packet (header + payload) up to the
+        # untouched all-zero tail, grouped by header pkt id (header & 0x1F).
         whole = nwords - (nwords % PACKET_WORDS)
-        self.payload = []
+        groups = {}          # pkt_id -> concatenated payload words
         for p in range(0, whole, PACKET_WORDS):
             if p + PACKET_WORDS > len(words):
                 break
@@ -313,20 +359,18 @@ class CoreTraceDecoder:
                 if self.mode == "verbose":
                     print(f"packet {p // PACKET_WORDS}: all-zero -> untouched tail: STOP")
                 break
+            pid = pkt[0] & 0x1F
             if self.mode == "verbose":
-                hdr = pkt[0]
-                print(f"packet {p // PACKET_WORDS}: hdr=0x{hdr:08X} "
-                      f"id={hdr & 0x1F} type={(hdr >> 12) & 0x7}")
-            self.payload.extend(pkt[1:])           # drop word[0] header
+                print(f"packet {p // PACKET_WORDS}: hdr=0x{pkt[0]:08X} "
+                      f"id={pid} type={(pkt[0] >> 12) & 0x7}")
+            groups.setdefault(pid, []).extend(pkt[1:])   # drop word[0] header
 
-        self.total_bits = len(self.payload) * 32
-        self.bitpos = 0
-        self.cycle = 0
-        self.run = None
-        while self.bitpos + 8 <= self.total_bits:
-            if not self.step_frame():
-                break
-        self._run_flush()
+        # Demux: decode each pkt id ascending, each with its own name table.
+        self.timeline = []
+        for pid in sorted(groups):
+            names = table_for_id(pid)
+            stream = "mem" if pid == 2 else "core"
+            self._decode_group(groups[pid], names, stream)
         return self.timeline
 
     # Back-compat alias for callers that used the old name.

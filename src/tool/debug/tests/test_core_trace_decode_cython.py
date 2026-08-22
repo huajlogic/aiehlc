@@ -90,11 +90,12 @@ def _build_cy_module():
 
     with open(base._RUNTIME_C) as f:
         src = f.read()
-    slot_tbl, block = base._extract_c_decoder(src)
+    slot_tbl, mem_tbl, block = base._extract_c_decoder(src)
     # The extracted region now includes the profile API, which references
     # AieTraceProfile/XAie_LocType; provide the same shim the subprocess suite uses.
+    # The demux (__core_trace_table_for_id) also needs the mem-module slot table.
     impl_c = ("#include <stdint.h>\n#include <stdio.h>\n\n"
-              + base._PROFILE_SHIM + "\n" + slot_tbl + "\n\n" + block + "\n")
+              + base._PROFILE_SHIM + "\n" + slot_tbl + "\n" + mem_tbl + "\n\n" + block + "\n")
 
     d = tempfile.mkdtemp(prefix="ctd_cy_")
     for name, text in (("ctd_impl.h", _IMPL_H), ("ctd_impl.c", impl_c),
@@ -277,6 +278,18 @@ def test_cy_user_capture_8word_no_pkt_header():
     assert tl[-1] == (27708471, "ACTIVE")
     assert len(tl) == 781
     assert dict(collections.Counter(n for _, n in tl)) == {"ACTIVE": 781}
+
+
+def test_cy_demux_core_and_mem_streams():
+    """A shared buffer carrying the core stream (pkt id 1) and the mem-module
+    DMA stream (pkt id 2) must decode each with its OWN slot table, ascending by
+    id (core before mem), via the in-process C API."""
+    core = base.pack(base.start(1000), base.single(0, 10),
+                     header=base.PKT_HDR, terminate=False)
+    mem = base.pack(base.start(2000), base.single(0, 5),
+                    header=base.MEM_HDR, terminate=False)
+    words = core + mem + [0] * 8
+    _check(words, [(1010, "ACTIVE"), (2005, "DMA_START")])
 
 
 def test_cy_matches_subprocess_harness():

@@ -135,6 +135,75 @@ def test_render_real_correlated_model():
         assert os.path.getsize(png) > 0
 
 
+# --------------------------------------------------------------------------
+# Pulse / edge events (DMA_FINISH, LOCK_*): single-cycle markers a span
+# rectangle cannot show. They must be drawn as VERTICAL LINE markers.
+# --------------------------------------------------------------------------
+def test_pulse_tokens_extraction():
+    # Combined with a stall level: only the pulse token(s) are returned.
+    assert tg.pulse_tokens("DMA_FINISH|DMA_STALL_LOCK") == ["DMA_FINISH"]
+    # A pure-pulse combo returns both, in EVENT_COLORS order (LOCK_GRP before REL).
+    assert tg.pulse_tokens("LOCK_REL|LOCK_GRP") == ["LOCK_GRP", "LOCK_REL"]
+    # A single pulse alone.
+    assert tg.pulse_tokens("DMA_FINISH") == ["DMA_FINISH"]
+    # No pulse: level/state events only.
+    assert tg.pulse_tokens("ACTIVE|LOCK_STALL") == []
+    assert tg.pulse_tokens("DMA_STALL_LOCK") == []
+
+
+def _vertical_lines_by_color(ax):
+    """Map colour-hex -> list of x for every vertical (x0==x1) Line2D on ax."""
+    import matplotlib.colors as mcolors
+    out = {}
+    for ln in ax.get_lines():
+        xd = ln.get_xdata()
+        if len(xd) == 2 and xd[0] == xd[1]:
+            hexc = mcolors.to_hex(ln.get_color())
+            out.setdefault(hexc, []).append(xd[0])
+    return out
+
+
+def test_pulse_events_drawn_as_vertical_lines():
+    import matplotlib.pyplot as plt
+    # A mem-dma lane: a lone DMA_FINISH pulse, and one combined with a stall.
+    model = {
+        "meta": {}, "anchors": {}, "fit_per_tile": {},
+        "lanes": [
+            {"name": "tile 0,3 mem dma", "events": [
+                {"event": "DMA_STALL_LOCK", "start_us": 0.0, "end_us": 50.0, "detail": ""},
+                {"event": "DMA_FINISH", "start_us": 20.0, "end_us": 20.001, "detail": ""},
+                {"event": "DMA_FINISH|DMA_STALL_LOCK", "start_us": 40.0, "end_us": 40.001, "detail": ""},
+            ]},
+        ],
+    }
+    fig, ax = plt.subplots()
+    tg._draw(ax, model, nbins=100)
+    vlines = _vertical_lines_by_color(ax)
+    xs = vlines.get(tg.EVENT_COLORS["DMA_FINISH"], [])
+    # Both DMA_FINISH pulses (lone + combined-with-stall) get a blue vline.
+    assert 20.0 in xs and 40.0 in xs
+    plt.close(fig)
+
+
+def test_pulse_stacks_multiple_tokens():
+    import matplotlib.pyplot as plt
+    model = {
+        "meta": {}, "anchors": {}, "fit_per_tile": {},
+        "lanes": [
+            {"name": "tile 0,3 mem dma", "events": [
+                {"event": "LOCK_GRP|LOCK_REL", "start_us": 10.0, "end_us": 10.001, "detail": ""},
+            ]},
+        ],
+    }
+    fig, ax = plt.subplots()
+    tg._draw(ax, model, nbins=100)
+    vlines = _vertical_lines_by_color(ax)
+    # Both pulse tokens draw their own coloured vertical marker at x=10.
+    assert 10.0 in vlines.get(tg.EVENT_COLORS["LOCK_GRP"], [])
+    assert 10.0 in vlines.get(tg.EVENT_COLORS["LOCK_REL"], [])
+    plt.close(fig)
+
+
 def test_parse_host_marker():
     assert tg._parse_host_marker("iter0.run") == (0, "run")
     assert tg._parse_host_marker("iter3.dma_in_done") == (3, "dma_in_done")

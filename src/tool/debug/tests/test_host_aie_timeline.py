@@ -30,8 +30,10 @@ import host_aie_timeline as hat  # noqa: E402
 #   tile 5,5: a0=500,  a1=1500  -> us(cycle) = cycle - 500   (offset by 500)
 # Decoded trace intervals (both tiles): ACTIVE@10 (1 cyc), STREAM_STALL@110.
 # --------------------------------------------------------------------------
-# What parse_timesync should yield for each tile's interval list.
-_TRACE_INTERVALS = [(10, 10, ["ACTIVE"]), (110, 110, ["STREAM_STALL"])]
+# What parse_timesync should yield for each tile's interval list. Each interval
+# is (start_cycle, end_cycle, slot_names, stream); core lines carry no
+# "stream=" tag so the parser defaults the stream to "core".
+_TRACE_INTERVALS = [(10, 10, ["ACTIVE"], "core"), (110, 110, ["STREAM_STALL"], "core")]
 
 
 def _trace_lines(tile):
@@ -120,13 +122,13 @@ def test_host_events_land_at_expected_us():
 
 def test_tile_intervals_mapped():
     model = hat.correlate(hat.parse_timesync(_block()))
-    t44 = next(l for l in model["lanes"] if l["name"] == "tile 4,4")
+    t44 = next(l for l in model["lanes"] if l["name"] == "tile 4,4 core")
     ev = {e["event"]: e for e in t44["events"]}
     assert ev["ACTIVE"]["start_us"] == 10.0
     assert ev["ACTIVE"]["end_us"] == 11.0        # end_cycle+1 -> 1-cycle width
     assert ev["STREAM_STALL"]["start_us"] == 110.0
     # Offset tile maps the same cycles 500 us earlier.
-    t55 = next(l for l in model["lanes"] if l["name"] == "tile 5,5")
+    t55 = next(l for l in model["lanes"] if l["name"] == "tile 5,5 core")
     ev5 = {e["event"]: e for e in t55["events"]}
     assert ev5["ACTIVE"]["start_us"] == -490.0
     assert ev5["STREAM_STALL"]["start_us"] == -390.0
@@ -135,7 +137,7 @@ def test_tile_intervals_mapped():
 def test_lane_ordering_host_first_then_tiles_sorted():
     model = hat.correlate(hat.parse_timesync(_block()))
     names = [l["name"] for l in model["lanes"]]
-    assert names == ["host", "tile 4,4", "tile 5,5"]
+    assert names == ["host", "tile 4,4 core", "tile 5,5 core"]
 
 
 def test_csv_json_row_counts_and_ordering():
@@ -152,8 +154,8 @@ def test_csv_json_row_counts_and_ordering():
         assert lines[1].startswith("host,")
         assert lines[2].startswith("host,")
         assert lines[3].startswith("host,")
-        assert lines[4].startswith('"tile 4,4"')
-        assert lines[6].startswith('"tile 5,5"')
+        assert lines[4].startswith('"tile 4,4 core"')
+        assert lines[6].startswith('"tile 5,5 core"')
 
         with open(json_path) as f:
             model2 = json.load(f)
@@ -161,14 +163,40 @@ def test_csv_json_row_counts_and_ordering():
         assert model2["meta"]["num_tiles"] == 2
         assert set(model2["fit_per_tile"]) == {"4,4", "5,5"}
         assert model2["fit_per_tile"]["4,4"]["counts_per_cycle"] == 1.0
-        assert [l["name"] for l in model2["lanes"]] == ["host", "tile 4,4", "tile 5,5"]
+        assert [l["name"] for l in model2["lanes"]] == ["host", "tile 4,4 core", "tile 5,5 core"]
 
 
 def test_single_tile_block():
     model = hat.correlate(hat.parse_timesync(_block(two_tiles=False)))
     names = [l["name"] for l in model["lanes"]]
-    assert names == ["host", "tile 4,4"]
+    assert names == ["host", "tile 4,4 core"]
     assert model["meta"]["num_tiles"] == 1
+
+
+def test_mem_stream_gets_own_lane():
+    # A mem-module DMA stream (pkt id 2) is tagged "stream=mem" on the dump line
+    # and must land in its own "tile C,R mem dma" lane, separate from the core
+    # lane -- even though STREAM_STALL also appears in the core slot table.
+    block = _block(two_tiles=False).rstrip("\n") + "\n" + "\n".join([
+        "[TIMESYNC] trace tile=4,4 stream=mem 300  DMA_START",
+        "[TIMESYNC] trace tile=4,4 stream=mem 305 -- 309  STREAM_STALL",
+    ]) + "\n"
+    ts = hat.parse_timesync(block)
+    # Parser keeps the stream tag on the 4-tuple.
+    streams = {iv[3] for iv in ts["traces"][(4, 4)]}
+    assert streams == {"core", "mem"}
+    model = hat.correlate(ts)
+    names = [l["name"] for l in model["lanes"]]
+    assert "tile 4,4 core" in names
+    assert "tile 4,4 mem dma" in names
+    mem = next(l for l in model["lanes"] if l["name"] == "tile 4,4 mem dma")
+    mspans = {e["event"]: (e["start_us"], e["end_us"]) for e in mem["events"]}
+    assert mspans["DMA_START"] == (300.0, 301.0)
+    assert mspans["STREAM_STALL"] == (305.0, 310.0)
+    # The core lane must NOT contain the mem-stream STREAM_STALL span.
+    core = next(l for l in model["lanes"] if l["name"] == "tile 4,4 core")
+    core_stall = [e for e in core["events"] if e["event"] == "STREAM_STALL"]
+    assert all(e["start_us"] != 305.0 for e in core_stall)
 
 
 def test_missing_cps_raises():
