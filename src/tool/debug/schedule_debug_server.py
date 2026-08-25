@@ -1263,7 +1263,9 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 import aiediag  # noqa: E402
 import aiegdb  # noqa: E402
-import switch_scan  # noqa: E402  (live stream-switch read + provenance diff)
+import switch_scan  # noqa: E402
+import switch_reconstruct  # noqa: E402
+import live_scan_summary  # noqa: E402
 import schedule_view  # noqa: E402  (render_html for server-side app injection)
 import work2provenance  # noqa: E402  (auto-generate worklocal/ from Work/)
 
@@ -1274,6 +1276,11 @@ try:
     import pexpect  # noqa: E402
 except ImportError:
     pexpect = None
+
+_SSH_PEXPECT_DIR = os.path.join(_REPO_ROOT, "script", "test")
+if _SSH_PEXPECT_DIR not in sys.path:
+    sys.path.insert(0, _SSH_PEXPECT_DIR)
+from ssh_pexpect import expect_shell_after_ssh, ssh_command  # noqa: E402
 
 # Vitis settings + xsdb fallback for the hw_server-launch recovery path, kept in
 # sync with script/test/apppaltest.py and script/test/connecttest.py.
@@ -1558,6 +1565,9 @@ class DebugState:
         self._tiles = None
         self._comm_paths = None
         self._grid_info = None
+        self._last_scan = None
+        self._last_dynamic_routing = None
+        self._scan_lock = threading.Lock()
 
         # Live run bookkeeping.
         self._lock = threading.Lock()
@@ -1783,6 +1793,19 @@ class DebugState:
     def get_uistate(self):
         with self._uistate_lock:
             return dict(self._uistate)
+
+    def record_live_scan(self, what, res, device="", host=""):
+        """Remember the latest /grid result for the LLM tab and debugui MCP."""
+        summary = live_scan_summary.summarize_live_scan(what, res or {})
+        summary["device"] = (device or "").strip()
+        summary["host"] = (host or "").strip()
+        with self._scan_lock:
+            self._last_scan = summary
+        self._write_backend_status()
+
+    def get_live_scan(self):
+        with self._scan_lock:
+            return dict(self._last_scan) if self._last_scan else None
 
     def sim_running(self):
         with self._sim_lock:
@@ -2453,10 +2476,10 @@ class DebugState:
             board = os.environ.get("BOARDNAME", "palmyra")
 
         self._hwsrv_log(f"[hwserver] ssh -X {ssh_target} ...\n")
-        child = pexpect.spawn(f"ssh -X {ssh_target}", encoding="utf-8",
+        child = pexpect.spawn(ssh_command(ssh_target), encoding="utf-8",
                               timeout=60)
         child.logfile_read = logsink            # stream the raw session output
-        child.expect([r'\$\s*$', r'#\s*$', r'>\s*$'], timeout=60)  # shell prompt
+        expect_shell_after_ssh(child, timeout=60)
         self._hwsrv_log(f"\n[hwserver] launch {systest} ...\n")
         child.sendline(systest)
         child.expect(r'Systest[#>]', timeout=60)
@@ -2880,6 +2903,9 @@ class DebugState:
             "app_sources_text": _fmt_app_sources(_srcs, rel_to=_ap.get("app_dir")),
             "aiedbg_paths": _aiedbg_paths(),
         }
+        with self._scan_lock:
+            if self._last_scan:
+                data["last_scan"] = dict(self._last_scan)
         path = os.path.join(self.workdir, "backend_status.json")
         try:
             tmp = path + ".tmp"
@@ -3308,9 +3334,11 @@ net detail in **Info**; the "All nets / f0 / f1 …" chips filter what is drawn.
 - Clicking a tile or channel badge in either view opens it in **Info** and \
 prepends context to your next message. A tile with no compiled schedule clears \
 **Info** and says "no schedule info" — that is a real empty selection, not a bug.
-- Live overlay controls sit here: the `DMA / Cores / Events` pills **select** what \
-to read, `Scan` reads it **once**, and the `live` checkbox re-reads every 2s. \
-Picking a pill does not itself read the board unless live is on.
+- Live overlay controls sit here: the `DMA / Cores / Events / Switch` selector \
+**chooses** what to read, `Scan` reads it **once**, and the `live` checkbox \
+re-reads every 2s. Each scan is summarized for you — call `get_live_scan()` \
+to read the latest result and how to interpret it (see the `live-scan-results` \
+skill). Picking a mode does not itself read the board unless live is on.
 
 **Execution (bottom-left)** — `App:` and `Board:` selectors, then `Connect`, \
 `Open Current Session`, `Run`, `Force stop`, and the run log beneath them.
@@ -3417,6 +3445,10 @@ message is authoritative and current — prefer it.
   file:line defining each kernel the schedule runs. Refreshes the inventory below \
   after an app switch. Read what it names; do not guess filenames.
 - `get_backend_status()` — current backend, AIEDBG_TARGET, IPC readiness
+- `get_live_scan(detail)` — latest DMA/Cores/Events/Switch scan the user ran \
+  in the AIE Debug pane (counts, stalled tiles, switch mismatches). \
+  **Call this when the user asks about scan colours, stalls, or routing \
+  mismatches** — do not re-scan with aie_exec unless you need finer detail.
 - `get_applog(lines)` — last N lines of the hardware run log
 - `get_sim_log(lines)` — last N lines of the simulator application log (ipc_app.log)
 - `get_ipc_log(lines, side)` — recent IPC transaction CSV log; side="client"|"server"|"both"
@@ -3443,9 +3475,11 @@ message is authoritative and current — prefer it.
    call `tile_info(C, R)` for the full detail.
 3. When the user clicks a flow, you receive `[context] Selected net/flow fN …` — \
    call `get_flow_detail(N)` for the routing detail.
-4. For live AIE state, check `get_backend_status()` first; if connected, use `aie_exec` \
-   commands to read DMA/core registers.
-5. If the user has just run and wants to check results, call `get_applog()` or \
+4. When the user has scanned the array (or asks about coloured tiles / stalls / \
+   switch mismatches), call `get_live_scan()` before issuing your own reads.
+5. For finer per-register detail after a scan, check `get_backend_status()` first; \
+   if connected, use `aie_exec` commands to read DMA/core registers.
+6. If the user has just run and wants to check results, call `get_applog()` or \
    `get_sim_log()` depending on the backend.
 {_workflow_step6}
 7. Before you answer, read the application source behind whatever you found — the \
@@ -3519,6 +3553,7 @@ message is authoritative and current — prefer it.
                     "mcp__debugui__get_sim_log",
                     "mcp__debugui__get_applog",
                     "mcp__debugui__get_ipc_log",
+                    "mcp__debugui__get_live_scan",
                     # App / UI awareness. These were registered in debug_ui_mcp
                     # but never granted, so the assistant could not answer "which
                     # app is this?" or see what the user had open — the very
@@ -4553,9 +4588,20 @@ def _switch_tiles(st):
 
     Not st.tiles(): memtile rows carry real circuit connections but never
     appear in the schedule grid, so the routing map has to be consulted too.
+
+    The whole grid rectangle is included as well, because reconstruction has to
+    work when the routing map is missing or wrong -- seeding the tile list from
+    that map would make discovery find only what the map already claims.  Note
+    the rows come from the grid extent, not `row_list`: that list skips the
+    memtile rows, which routing demonstrably crosses.
     """
-    core_min = st.grid_info().get("device_core_min_row") or 3
+    grid = st.grid_info()
+    core_min = grid.get("device_core_min_row") or 3
     locs = {tuple(t["loc"]) for t in st.tiles()}
+    cols = grid.get("col_list") or list(range(grid.get("cols") or 0))
+    for col in cols:
+        for row in range(grid.get("rows") or 0):
+            locs.add((col, row))
     for p in st.comm_paths():
         for e in p.get("edges", []):
             locs.add((e[0][0], e[0][1]))
@@ -4571,8 +4617,13 @@ def _switch_tiles(st):
     return out
 
 
-def grid_switch(st, target=None, reg_read_fn=None, device=None):
-    """Live stream-switch config per tile, diffed against the provenance map.
+def grid_switch(st, target=None, reg_read_fn=None, device=None,
+                routing_map='static'):
+    """Live stream-switch config per tile, diffed against a routing map.
+
+    `routing_map` selects which comm_paths expected_records uses:
+      static  — the compiler map in schedule_view.json (default)
+      dynamic — flows reconstructed from the registers just read on this scan
 
     This is static configuration, not per-cycle state, so it is a scan and
     never a poll.  On hardware each tile costs a single `aiedbg mem read` of
@@ -4580,22 +4631,77 @@ def grid_switch(st, target=None, reg_read_fn=None, device=None):
     does would be ~230 `reg read` subprocesses per tile.
     """
     cells = {}
-    comm_paths = st.comm_paths()
+    switches = {}
     for col, row, ttype in _switch_tiles(st):
         phys_col = col + st.startcol
         try:
-            cells[f"{col},{row}"] = switch_scan.scan_tile(
-                ttype, col, row, phys_col, comm_paths,
+            decoded = switch_scan.read_tile_switch(
+                ttype, phys_col, row,
                 reg_read_fn=reg_read_fn, target=target or st.target,
                 device=device)
+            if decoded is None:
+                cells[f"{col},{row}"] = {
+                    "state": switch_scan.UNREACHABLE,
+                    "phys_col": phys_col, "matched": 0,
+                    "missing": [], "unexpected": []}
+            else:
+                switches[(col, row)] = (ttype, decoded)
         except Exception as e:
-            cells[f"{col},{row}"] = {"state": switch_scan.UNREACHABLE,
-                                     "phys_col": phys_col, "matched": 0,
-                                     "missing": [], "unexpected": [],
-                                     "error": str(e)}
-        cells[f"{col},{row}"]["type"] = ttype
+            cells[f"{col},{row}"] = {
+                "state": switch_scan.UNREACHABLE,
+                "phys_col": phys_col, "matched": 0,
+                "missing": [], "unexpected": [], "error": str(e)}
+        if f"{col},{row}" in cells:
+            cells[f"{col},{row}"]["type"] = ttype
+
+    dynamic = _dynamic_routing(st, switches)
+    st._last_dynamic_routing = dynamic
+
+    comm_paths = st.comm_paths()
+    if (routing_map or "static").strip().lower() == "dynamic":
+        if dynamic and dynamic.get("comm_paths"):
+            comm_paths = dynamic["comm_paths"]
+
+    for (col, row), (ttype, decoded) in switches.items():
+        phys_col = col + st.startcol
+        live = switch_scan.live_records(ttype, col, row, decoded)
+        expected = switch_scan.expected_records(comm_paths, col, row)
+        cell = switch_scan.compare_tile(live, expected)
+        cell["phys_col"] = phys_col
+        cell["type"] = ttype
+        cells[f"{col},{row}"] = cell
+
     n_bad = sum(1 for c in cells.values() if c["state"] == switch_scan.MISMATCH)
-    return {"what": "switch", "cells": cells, "mismatch_tiles": n_bad}
+    return {"what": "switch", "cells": cells, "mismatch_tiles": n_bad,
+            "dynamic": dynamic, "routing_map": routing_map or "static"}
+
+
+def _dynamic_routing(st, switches):
+    """Rebuild the routing map from the switches just read.
+
+    Never raises: a reconstruction problem must not cost the user the scan
+    result they asked for, which is still valid on its own.
+    """
+    if not switches:
+        return None
+    try:
+        flows = switch_reconstruct.discover_flows(switches, st.aie_version)
+        flows = switch_reconstruct.reconcile(flows, st.comm_paths())
+        groups = switch_reconstruct.to_routing_groups(flows, st.startcol)
+        out = {"n_flows": len(flows),
+               "comm_paths": switch_reconstruct.to_comm_paths(flows),
+               "routing_groups": groups,
+               "scanned_tiles": len(switches)}
+    except Exception as e:
+        return {"error": str(e)}
+    path = os.path.join(st.workdir, "routingprovenancemap.dynamic.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(groups, f, indent=1)
+        out["path"] = path
+    except OSError as e:
+        out["write_error"] = str(e)
+    return out
 
 
 def grid_events(st, target=None, reg_read_fn=None, device=None):
@@ -4995,6 +5101,7 @@ class Handler(BaseHTTPRequestHandler):
             what = q.get("what", ["dma"])[0]
             device = q.get("device", [""])[0]
             host = q.get("host", [""])[0]
+            routing_map = q.get("routing", ["static"])[0]
             is_sim = (device or "").strip().lower() == "simulator"
             if is_sim and st.sim_kind == "aiesim":
                 self._send_json({"error": _AIESIM_LIVE_ERROR, "cells": {},
@@ -5015,19 +5122,32 @@ class Handler(BaseHTTPRequestHandler):
             rrfn = _make_reg_read_fn(st, device, tgt)
             try:
                 if what == "cores":
-                    self._send_json(grid_cores(st, target=tgt,
-                                               reg_read_fn=rrfn, device=dev))
+                    res = grid_cores(st, target=tgt,
+                                     reg_read_fn=rrfn, device=dev)
                 elif what == "events":
-                    self._send_json(grid_events(st, target=tgt,
-                                                reg_read_fn=rrfn, device=dev))
+                    res = grid_events(st, target=tgt,
+                                      reg_read_fn=rrfn, device=dev)
                 elif what == "switch":
-                    self._send_json(grid_switch(st, target=tgt,
-                                                reg_read_fn=rrfn, device=dev))
+                    res = grid_switch(st, target=tgt,
+                                      reg_read_fn=rrfn, device=dev,
+                                      routing_map=routing_map)
                 else:
-                    self._send_json(grid_dma(st, target=tgt,
-                                             reg_read_fn=rrfn, device=dev))
+                    res = grid_dma(st, target=tgt,
+                                   reg_read_fn=rrfn, device=dev)
+                st.record_live_scan(what, res, device=device, host=host)
+                summary = st.get_live_scan()
+                if summary:
+                    res["llm_summary"] = live_scan_summary.format_for_llm(summary)
+                self._send_json(res)
             except Exception as e:  # never crash the poll loop
                 self._send_json({"error": str(e), "cells": {}}, code=500)
+        elif path == "/live_scan":
+            summary = st.get_live_scan()
+            if not summary:
+                self._send_json({"ok": False, "detail": "no scan recorded yet"})
+                return
+            self._send_json({"ok": True, "summary": summary,
+                             "text": live_scan_summary.format_for_llm(summary)})
         else:
             self._send_json({"error": f"unknown path: {path}"}, code=404)
 
@@ -5324,7 +5444,7 @@ def _ui_defaults(st):
     """
     if st.sim_only:
         return {"device": "simulator", "board_host": "", "sim_only": True,
-                "source_viewer": True}
+                "source_viewer": True, "jtag_host": ""}
     host = os.environ.get("VEK385IP", "").strip()
     if not host and st.target:
         m = re.match(r"xsdb://([^:/]+)", st.target)
@@ -5334,8 +5454,19 @@ def _ui_defaults(st):
         # Last resort: the checkout's own hwlocal.sh. This is a PREFILL, not a
         # binding — the box stays editable and the typed value wins per run.
         host = _expected_board_host(st.workdir)
-    return {"device": "vek385" if host else "", "board_host": host,
-            "sim_only": False, "source_viewer": True}
+    device = "vek385" if host else ""
+    return {"device": device, "board_host": host,
+            "sim_only": False, "source_viewer": True,
+            "jtag_host": _jtag_host_for(device, host)}
+
+
+def _jtag_host_for(device, board_host):
+    """TCP host the browser's Connect probe uses (matches resolve_target)."""
+    device = (device or "").strip().lower()
+    if device == "pal":
+        return os.environ.get("PALIP", "xx.xx.xx.213")
+    host = (board_host or "").strip()
+    return host
 
 
 def _target_from_aiedbg_env():

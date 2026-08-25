@@ -26,6 +26,7 @@ package). None of them modify `host.cc` or any generated source.
 | `streamswitch_crossref.py` | **Accuracy check + CLI** — cross-references the UI's per-tile Stream switch panel against the `XAie_Strm*` calls in generated source | `schedule_view`, `node` |
 | `flow_crossref.py` | **Attribution check + CLI** — checks that every tile and flow is shown the right information, against `routing.cc` groups + `dmaphop` endpoints | `streamswitch_crossref`, `schedule_view`, `node` |
 | `switch_scan.py` | **Live switch read + diff** — reads the stream-switch registers off the board/sim and diffs them against the routing map; backs the UI's `Switch` scan | `aiediag`, `streamswitch_crossref` |
+| `switch_reconstruct.py` | **Routing rebuilt from the board** — turns those same registers into flows with no provenance map involved, for when the map is absent, stale, or was changed at runtime; backs the UI's `Dynamic` routing source | `aiediag` |
 
 ### Dependency graph
 
@@ -1167,25 +1168,16 @@ in both directions.
 
 Sections 6 and 7 check the UI against the *source*. This checks it against the
 **board**: a fourth live-overlay mode next to DMA / Cores / Events that reads
-the stream-switch registers and diffs them against the routing map.
+the stream-switch registers off every tile.
 
-Pick **Switch**, press **Scan**. Every tile gets a verdict:
+Pick **Switch**, press **Scan**. The payoff is the `Dynamic (n)` routing source
+that appears next to the scan button (§9) — a map rebuilt from what the array is
+actually programmed with. Tiles are left untinted, except `unreachable` for any
+whose registers could not be read.
 
-| Verdict | Meaning |
-|---|---|
-| `verified` | every connection the routing map claims is programmed, and nothing else is |
-| `mismatch` | see the per-row markers below |
-| `idle` | no connections expected and none found |
-| `unreachable` | the tile's registers could not be read |
-
-The tile panel's **Stream switch** section then annotates each row:
-
-- **in HW** — this connection is programmed in the registers
-- **not in HW** — the routing map claims it, the switch is not programmed with
-  it. A flow that never moves data looks exactly like this.
-- **HW only** — programmed on the device with no flow accounting for it; left
-  over from a previous design still resident on the board, or a routing bug
-  the provenance map cannot see.
+There is deliberately no "this tile has switch config" tint: that is true of
+nearly every tile in the array, so it would be a colour that never varies.
+Comparing the two maps is the **diff** checkbox in §9.
 
 **Cost.** aiegdb's `show switch` reads one register per `aiedbg reg read`
 subprocess — 228 of them for a core tile. The switch register block is
@@ -1208,6 +1200,80 @@ has the slot's msel line set.
 a register image, decodes it back through the same helpers the board path uses,
 and asserts all 28 tiles verify against the provenance map — so a wrong
 register layout, field split or pairing rule fails the suite without a board.
+
+---
+
+## 9. Dynamic routing — rebuilding the map from the board
+
+The `Switch` scan above can only answer *relative to the routing map*. That
+leaves three cases where it has nothing to say:
+
+- there is no `routingprovenancemap.json` (raw-XAie flows, a bare workdir),
+- the map is stale — the board holds a different binary than the workdir
+  describes,
+- routing was reprogrammed at runtime, so the map was never right.
+
+The same registers a scan already reads are enough to rebuild the flows from
+scratch, so every `Switch` scan also reconstructs one. When it finds anything, a
+**routing: `diff` | `Static` | `Dynamic (n)` | `Save JSON`** control appears next
+to the scan button.
+
+| Source | What you are looking at |
+|---|---|
+| `Static` | the map the compiler emitted — `routingprovenancemap.json` |
+| `Dynamic` | flows rebuilt from the live stream-switch registers, with no reference to that map |
+
+Switching source repoints every routing panel at once — device map, net panels
+and each tile's **Stream switch** section — because they all read the same
+`comm_paths`. **Clear** returns to `Static`.
+
+**The `diff` checkbox owns every verdict.** With it off you are reading one map,
+plainly: no badges on the rows and no tint on the tiles. Tick it and the *same*
+rows — still the map you selected — get annotated against the other one, and the
+tiles go `sw ok` / `sw ≠`.
+
+Diff is relative to the source you picked, so it reads in the direction you are
+looking:
+
+| Selected | Rows drawn from | Badge on a row the other map lacks | Extra rows |
+|---|---|---|---|
+| `Static` | the compiler's map | `static only` | `dynamic only` |
+| `Dynamic` | the rebuild from registers | `dynamic only` | `static only` |
+
+Note that `dynamic` *is* the hardware, rebuilt from the registers the scan read,
+so "board vs static map" and "dynamic vs static" are the same comparison — which
+is why there is one control for it rather than a verdict that follows you around.
+The two maps disagreeing is the ordinary case (a flow that never moved data is
+enough to do it), so it stays behind the checkbox instead of painting the array
+red on every scan.
+
+**How a flow is recovered.** Intra-tile edges come from the master config
+(circuit) or the arbiter/msel pairing (packet); inter-tile edges from the fixed
+port wiring. A DFS from every terminal slave gives one fan-out tree per source,
+and trees are then grouped by their **shim endpoint** — which is what the
+compiler's map calls a flow. A broadcast to four cores is one push flow with
+four sinks; four DMAs draining to one shim port are one pull flow, not four.
+
+**Identity.** A reconstructed flow that matches a static one tile-for-tile and
+edge-for-edge adopts its `id` and `flow_index`, so the DMA and lock tables keyed
+off that index keep working. A flow that does *not* match keeps its own — it is
+genuinely not that flow, and an empty BD table is the honest answer.
+
+**Artifact.** Each scan writes `routingprovenancemap.dynamic.json` into the
+workdir, and `Save JSON` downloads the same thing. It is emitted in the standard
+`routing_groups` shape, so `streamswitch_crossref.py` and `flow_crossref.py`
+read it like any other map.
+
+Two limits worth knowing: a slot register carries no packet type, so `pkttype`
+is reported as `0`; and a flow crossing a tile that could not be read splits
+into fragments marked `partial` rather than being bridged over the gap.
+
+`tests/test_switch_reconstruct.py` drives three round trips off the fixture's
+own `routing.cc`: the rebuilt flows must reproduce the static `comm_paths`
+edges (12/12 on `tiling`, 2/2 on `rawxaie`), the production `scan_tile` diff
+must come back clean against the rebuilt map, and the written artifact must
+survive being reloaded — that last one pins the connection *ordering*, which
+`routing_edges_for_flow` is sensitive to.
 
 ---
 

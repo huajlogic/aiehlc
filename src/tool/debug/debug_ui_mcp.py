@@ -35,6 +35,8 @@ import urllib.request
 
 from mcp.server.fastmcp import FastMCP
 
+import live_scan_summary
+
 mcp = FastMCP("debugui")
 
 
@@ -1056,6 +1058,42 @@ def select_app(app_id: str) -> str:
     _VIEW_CACHE["path"] = None
     _VIEW_CACHE["data"] = None
     return "switched to %s (%s)" % (r.get("id"), r.get("path"))
+
+
+@mcp.tool()
+def get_live_scan(detail: bool = True) -> str:
+    """Return the latest live overlay scan from the AIE Debug pane.
+
+    The user runs these with the DMA / Cores / Events / Switch selector plus
+    Scan (once) or live (every 2s). This tool returns what that scan found —
+    you do NOT need to repeat the read with aie_exec unless you need register-
+    level detail on one tile.
+
+    Covers four scan modes:
+      dma     — per-tile DMA channel state (running/stalled/error/idle) plus
+                stall hints (lock_acq, stream, memory) and current BD id
+      cores   — whether each core tile reports running vs idle
+      events  — which tiles have DMA event status bits set
+      switch  — stream-switch register diff vs the static routing map, plus
+                how many flows were reconstructed (Dynamic routing)
+
+    Call this when the user mentions coloured tiles, stalls, the issue bar,
+    switch mismatches, or "what did the scan show". Pair with the
+    `live-scan-results` skill for interpretation. Defer to `session-provenance`
+    before treating the scan as current board state.
+
+    Args:
+      detail: when False, return only the headline line (default: full text)
+    """
+    live = _read_live_status()
+    summary = (live or {}).get("last_scan")
+    if not summary:
+        r = _daemon_get("/live_scan")
+        if r and r.get("text"):
+            return r["text"] if detail else (r.get("summary") or {}).get("one_line", r["text"])
+        return ("no live scan recorded yet — the user has not pressed Scan or "
+                "enabled live overlay in the AIE Debug pane")
+    return live_scan_summary.format_for_llm(summary, include_detail=detail)
 
 
 @mcp.tool()

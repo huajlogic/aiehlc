@@ -183,13 +183,26 @@ def _json(rec):
 def scan_tile(tile_type, col, row, phys_col, comm_paths, reg_read_fn=None,
               target=None, device=None):
     """Read one tile's switch and diff it against the provenance map."""
+    cell, _ = scan_tile_decoded(tile_type, col, row, phys_col, comm_paths,
+                               reg_read_fn=reg_read_fn, target=target,
+                               device=device)
+    return cell
+
+
+def scan_tile_decoded(tile_type, col, row, phys_col, comm_paths,
+                      reg_read_fn=None, target=None, device=None):
+    """(cell, decoded) -- the diff plus the registers it was derived from.
+
+    `switch_reconstruct` needs the decoded switch and the diff needs the same
+    read; handing both back keeps a scan at one board round-trip per tile.
+    """
     decoded = read_tile_switch(tile_type, phys_col, row,
                                reg_read_fn=reg_read_fn, target=target,
                                device=device)
     if decoded is None:
-        return {'state': UNREACHABLE, 'phys_col': phys_col, 'matched': 0,
-                'missing': [], 'unexpected': []}
+        return ({'state': UNREACHABLE, 'phys_col': phys_col, 'matched': 0,
+                 'missing': [], 'unexpected': []}, None)
     result = compare_tile(live_records(tile_type, col, row, decoded),
                           expected_records(comm_paths, col, row))
     result['phys_col'] = phys_col
-    return result
+    return result, decoded

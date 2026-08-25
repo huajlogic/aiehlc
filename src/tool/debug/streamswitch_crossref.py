@@ -390,9 +390,13 @@ UI_FUNCS = (
     '_flowTileSet', '_isPktPort', '_sharedPktForwardMaster', '_defaultPktMask',
     '_resolvePktMask', '_fmtPktMaskHex', '_fmtPktMaskBadge',
     '_expandPktConnectRows', '_pktRowKey', '_fmtMselEnHex', '_tilePktMasters',
-    '_renderPktMasterBlock', '_tileRoutingConns', 'renderTileRoutingSection',
-    '_tileCommPaths', '_swKey', '_swScanTile', '_swMissingKeys', '_swMarkHtml',
-    '_swExtraRowsHtml',
+    '_renderPktMasterBlock', '_tileRoutingConns', '_filterRoutingConns',
+    'renderTileRoutingSection', '_tileCommPaths', '_routingDiffSides',
+    '_routingSrcDiffTile', '_swKey', '_swNormSlave', '_swRecordKey',
+    '_swCoarseKey', '_swConnCoarseKey', '_swScanTile', '_swMissingRecordKeys',
+    '_swMissingKeys', '_swOnlyLabel', '_swDiffBadHtml', '_swBadHtml',
+    '_swOkHtml', '_swMarkHtmlCct', '_swMarkHtmlPkt', '_swMarkHtmlMst',
+    '_swExtraRowHtml', '_swExtraRowsHtml', '_swExtraMstHtml',
 )
 
 # Top-level declarations the extracted functions close over.
@@ -402,6 +406,10 @@ _JS_DRIVER = r'''
 const fs = require('fs');
 const inp = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const DATA = inp.data;
+const STATIC_PATHS = DATA.comm_paths || [];
+const ROUTING_DIFF = false;
+const ROUTING_SRC = 'static';
+let DYNAMIC = null;
 const key = t => t[0] + ',' + t[1];
 const out = {none: {}, focus: {}, flows_table: {}};
 for (const t of inp.tiles) {

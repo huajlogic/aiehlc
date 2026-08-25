@@ -2122,6 +2122,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     /* peer highlight colors */
     --peer-send-border: #d058c0;
     --peer-recv-border: #38d0e0;
+    --right-pad: 16px;
   }
 
   * { box-sizing: border-box; }
@@ -2135,7 +2136,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #lefttop { flex:3 1 0; overflow:auto; padding:16px; min-height:80px; }
   #leftbottom { flex:1 1 0; overflow:hidden; min-height:60px;
                display:flex; flex-direction:column; }
-  #right { flex:1 1 0; min-width:200px; padding:16px; overflow:hidden;
+  #right { flex:1 1 0; min-width:200px; padding:var(--right-pad); overflow:hidden;
            display:flex; flex-direction:column; }
   #panel { flex:1 1 0; min-height:0; display:flex; flex-direction:column; position:relative; }
   #panel-body { flex:1 1 0; overflow-y:auto; min-height:0; }
@@ -2198,7 +2199,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #lhsplitter:hover::after, #lhsplitter.drag::after { background:var(--accent); }
 
   #rhsplitter { display:none; flex:0 0 5px; cursor:row-resize; background:var(--bg-base);
-                margin-top:8px; border-top:1px solid var(--bd); border-bottom:1px solid var(--bd);
+                margin:8px calc(-1 * var(--right-pad)) 0;
+                border-top:1px solid var(--bd); border-bottom:1px solid var(--bd);
                 transition:background .15s; position:relative; }
   #right:has(#cmdconsole:not(.hide)) #rhsplitter { display:block; }
   #rhsplitter:hover, #rhsplitter.drag { background:var(--accent-dim); border-color:var(--accent); }
@@ -2555,8 +2557,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .hide { display:none; }
 
   /* ── console / terminal ──────────────────────────────────────── */
-  #cmdconsole { flex:0 0 260px; border-top:1px solid var(--bd); margin-top:8px;
-                padding-top:10px; display:flex; flex-direction:column;
+  #cmdconsole { flex:0 0 260px; border-top:1px solid var(--bd);
+                margin:8px calc(-1 * var(--right-pad)) 0;
+                padding:10px var(--right-pad) 0; display:flex; flex-direction:column;
                 min-height:0; overflow:hidden; }
   #conhdr, #conhelp { flex:0 0 auto; }
   #conhdr { font-weight:600; margin-bottom:4px; font-size:12px; }
@@ -2703,7 +2706,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #overlayctl { font-size:12px; }
   #testconn:disabled { opacity:.38; cursor:not-allowed; }
   #leftbottom label.disabled, #overlayctl label.disabled { opacity:.45; pointer-events:none; }
-  #livestatus { color:var(--accent-fg); font-size:11px; margin-top:6px; min-height:14px; }
+  #livestatus { color:var(--accent-fg); font-size:11px; margin-top:4px; min-height:0; }
+  #livestatus:empty { display:none; }
   #runstatus  { color:var(--tx-mid);   font-size:11px; min-height:14px; }
   /* ── DMA issue bar ───────────────────────────────────────────── */
   #issue-bar { display:none; margin-top:6px; border:1px solid #6b2222;
@@ -2735,15 +2739,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* ── device map ──────────────────────────────────────────────── */
   #devmap { display:none; flex-direction:column; }
   #devmap.show { display:flex; }
-  /* nowrap + min-width:0 on the netbar: the net pills wrap *inside* their own
-     box, so the scan controls stay pinned to the right of the same row instead
-     of being pushed onto a second line by a long net list. */
+  /* The topbar stays nowrap so the scan controls keep their pinned-right slot
+     no matter how long the net list gets; each half absorbs pressure inside
+     its own box. #devmap-scan has to be shrinkable or the first control added
+     to it starves the netbar to zero, and the netbar needs a real basis: with
+     basis:auto its shrink factor scales with its content width, so it absorbs
+     essentially all of the overflow on its own. */
+  /* Two columns: pills left, controls right. The topbar itself never wraps —
+     each side absorbs its own growth, the pills by wrapping to more rows and
+     the controls by stacking down the right column. */
   #devmap-topbar { display:flex; flex-wrap:nowrap; align-items:flex-start; gap:8px;
                    margin-bottom:8px; }
+  /* min-content floor so a control row can never be squeezed narrower than the
+     buttons on it; below that the pills give way rather than Clear sliding out
+     of the pane. */
+  /* max-width:50% is what actually holds the split. A column flex box sizes to
+     its widest row and will not yield on its own, so without a cap the scan
+     status text — which is perfectly able to ellipsize — silently takes width
+     from the pills and they pay for it in rows. */
+  #devmap-right { display:flex; flex-direction:column; align-items:flex-end;
+                  gap:4px; flex:0 1 auto; min-width:min-content; max-width:50%;
+                  margin-left:auto; }
+  #dmRsrc { margin-left:0; }
+  /* A half-width basis: the pills are navigation and claim their own half,
+     rather than being left whatever the scan status text — transient, and able
+     to ellipsize — happens not to want. */
   #devmap-netbar { display:flex; flex-wrap:wrap; gap:4px; align-items:center;
-                   flex:1 1 auto; min-width:0; }
-  #devmap-scan { display:flex; align-items:center; gap:4px;
-                 flex:0 0 auto; margin-left:auto; }
+                   flex:1 1 50%; min-width:0; }
+  /* Deliberately not flex-wrap: the status text changes length every 2s in
+     live mode, so a wrapping cluster would move the Scan button between rows
+     while the user is aiming at it. */
+  #devmap-scan { display:flex; align-items:center; gap:4px; }
   /* Scan mode is a one-of-N selection that grew past the width a pill strip
      can spend on it, so it is a dropdown wearing the unselected .ltab skin —
      it is a selection, and must not read as the accent-filled active tab or as
@@ -2767,6 +2793,41 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* Reduced motion: the ring appearing at all is the signal; spinning it is
      decoration the user has asked not to see. */
   @media (prefers-reduced-motion: reduce) { .spin { animation:none; } }
+  /* Routing source. Hidden until a switch scan has actually reconstructed a
+     map, because until then there is nothing to switch to. It is a one-of-2
+     selection whose label carries the flow count, so a pill strip would cost
+     width proportional to the design — the same reason scan mode above became
+     a dropdown. Save is a verb, so it stays a button beside it. */
+  /* flex:0 0 auto, not min-width:0: as a shrinkable flex child this collapsed
+     to the width of the selector alone and the Save button spilled out on top
+     of the next control. The status text next to it is the one that gives. */
+  .rsrc { display:inline-flex; align-items:center; gap:6px; flex:0 0 auto;
+          margin-left:10px; font-size:11px; vertical-align:middle; }
+  .rsrc[hidden] { display:none; }
+  .rsrc-diff-wrap { color:var(--tx-dim); white-space:nowrap; cursor:pointer;
+                     flex:0 0 auto; }
+  .rsrc-diff-wrap input { margin:0 4px 0 0; vertical-align:middle; }
+  .rsrc-diff-wrap:has(input:checked) { color:var(--tx-hi); }
+  /* A floor, not min-width:0: the whole point of the label is the source name
+     and the flow count, and a selector shrunk to "rout…" carries neither. The
+     status text beside it already ellipsizes, so it absorbs the pressure. */
+  .rsrc-sel { flex:0 0 auto; min-width:112px; }
+  /* Dynamic stays selected across every panel and view, so the selector has
+     to carry that state at rest. Border and text only: an --accent-dim fill
+     here is the active-tab reading the .scan-what skin exists to avoid. */
+  .rsrc-sel[data-src="dynamic"] { color:var(--tx-hi); border-color:var(--bd-accent); }
+  .rsrc .rs-dl { flex:0 0 auto; font-size:11px; padding:2px 8px;
+                 border-radius:4px; cursor:pointer; font-family:inherit;
+                 color:var(--tx-dim); border:1px solid var(--bd);
+                 background:var(--bg-raised); }
+  .rsrc .rs-dl:hover { color:var(--tx-hi); background:var(--bg-hover); }
+  /* nowrap: the failure message is longer than the selector it replaces, and
+     wrapping it would push the Scan button onto a second row — the one thing
+     the surrounding layout is built to prevent. */
+  .rsrc-err { color:var(--tx-dim); white-space:nowrap; overflow:hidden;
+              text-overflow:ellipsis; min-width:0; }
+  .rsrc-sel[hidden], .rsrc .rs-dl[hidden], .rsrc-err[hidden] { display:none; }
+  #gridRsrc { margin-left:8px; }
   /* Scan is an ACTION, not a selection. It deliberately avoids both tab states:
      --accent-dim fill would read as a selected tab, and the default button
      surface (--bg-raised on --bd) is nearly identical to an *un*selected .ltab.
@@ -2786,8 +2847,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #dmLiveWrap { font-size:10px; color:var(--tx-lo); cursor:pointer; display:flex;
                 align-items:center; gap:3px; }
   #dmLiveWrap input { margin:0; }
+  /* A px cap, not a percentage: nowrap text contributes its full width to the
+     column's min-content, and min-width beats max-width — so a percentage cap
+     on the column cannot hold it back. Capped here it ellipsizes instead, and
+     the column's width stops depending on how long the last message was. */
   #dmScanStatus { font-size:10px; color:var(--accent-fg); min-width:0; white-space:nowrap;
-                  overflow:hidden; text-overflow:ellipsis; max-width:260px; }
+                  overflow:hidden; text-overflow:ellipsis; max-width:100%; margin-top:4px;
+                  align-self:stretch; }
+  /* No empty line above the buttons on the runs where there is no status yet. */
+  #dmScanStatus:empty { display:none; }
   #dmScanStatus.err { color:var(--red-fg); }
   .dm-vsep { width:1px; height:16px; background:var(--bd-soft); flex-shrink:0; }
   /* Status ring on a net chip — sits left of the identity dot so the net's own
@@ -3201,6 +3269,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <!-- live status overlay: pinned above the tile grid -->
   <div id="overlayctl" style="margin-bottom:6px;">
     <label><input type="checkbox" id="liveToggle"> Live status overlay</label>
+    <span class="rsrc" id="gridRsrc" hidden></span>
     <select id="overlayWhat" class="scan-what" title="what to read on the next scan">
       <option value="dma" title="DMA channel state and BD progress">DMA</option>
       <option value="cores" title="core status per tile">Cores</option>
@@ -3220,8 +3289,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="devmap-topbar">
       <div id="devmap-netbar"></div>
       <span class="dm-vsep"></span>
+      <!-- Right column. The net pills own the left and grow downward there;
+           anything control-shaped stacks on this side instead of stealing
+           width from them. -->
+      <div id="devmap-right">
       <div id="devmap-scan">
-        <span id="dmScanStatus"></span>
         <label id="dmLiveWrap" title="re-scan every 2s"><input type="checkbox" id="dmLiveToggle"> live</label>
         <select id="dmScanWhat" class="scan-what" title="what to read on the next scan">
           <option value="dma" title="DMA channel state and BD progress">DMA</option>
@@ -3231,6 +3303,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </select>
         <button id="dmScanBtn" title="read live status from the board / simulator">Scan</button><span class="spin" id="dmSpin" hidden title="scan in progress"></span>
         <button id="dmClearBtn" title="clear scan status and search highlights">Clear</button>
+      </div>
+        <!-- Second row of the right column: this selects which routing map the
+             whole view reads, and the scan row has no width left to lend it. -->
+        <span class="rsrc" id="dmRsrc" hidden></span>
+        <span id="dmScanStatus"></span>
       </div>
     </div>
     <div id="devmap-vp">
@@ -4658,10 +4735,19 @@ const DM_COLORS = [
 ];
 // Build from comm_paths so flows that appear in edges but have no core-tile DMA
 // entries (e.g. GMIO-to-memtile flows absent from flow_summary) still get a color.
-const dmFlowIds = [...new Set([
-  ...Object.keys(flowMembers).map(Number),
-  ...(DATA.comm_paths||[]).map(p=>p.flow_index),
-])].sort((a,b)=>a-b);
+// Declared here: recomputeFlowIds() runs at module scope and reads it.
+let ROUTING_SRC = 'static';
+let ROUTING_DIFF = false;
+let dmFlowIds = [];
+function recomputeFlowIds(){
+  const base = ROUTING_SRC === 'dynamic'
+    ? [] : Object.keys(flowMembers).map(Number);
+  dmFlowIds = [...new Set([
+    ...base,
+    ...(DATA.comm_paths||[]).map(p=>p.flow_index),
+  ])].sort((a,b)=>a-b);
+}
+recomputeFlowIds();
 function dmColor(fi){ return DM_COLORS[dmFlowIds.indexOf(fi)%DM_COLORS.length]; }
 
 let dmActiveNets = new Set();   // empty = all nets active (unless dmHideAll)
@@ -5306,6 +5392,7 @@ function dmClearAll(){
   // Stop the poll first: clearing while live is on just gets repainted 2s later.
   if (LIVE.enabled) setLive(false);
   else dmClearStatus();
+  if (ROUTING_SRC !== 'static') setRoutingSource('static');
   if (srSearchTerms.size){
     srSearchTerms.clear();
     llmPushCtx(null, 'search');
@@ -6057,7 +6144,7 @@ function buildDeviceMap(){
       typStr));
 
     if(dmShowSW&&!dmSwCollapsed.has(key)){
-      let rconns=_tileRoutingConns(tc,tr);
+      let rconns=_tileRoutingConns(tc,tr, ROUTING_DIFF ? STATIC_PATHS : undefined);
       if(dmHideAll){
         rconns=[];
       } else if(dmActiveNets.size>0){
@@ -6820,12 +6907,14 @@ function _tilePktMasters(col, row, focusFlowIdx){
   return [...out.values()].sort((a,b)=>
     a.dir.localeCompare(b.dir)||a.idx-b.idx);
 }
-function _renderPktMasterBlock(col, row, focusFlowIdx){
+function _renderPktMasterBlock(col, row, focusFlowIdx, scan){
   const masters=_tilePktMasters(col, row, focusFlowIdx);
-  if(!masters.length) return '';
+  const mstExtra=_swExtraMstHtml(scan, masters);
+  if(!masters.length && !mstExtra) return '';
   const rows=masters.map(m=>{
     const flows=m.flow_indices.map(fi=>'fl'+fi).join(' ');
     const flow=flows?'<span class="rt-flow">'+esc(flows)+'</span>':'';
+    const swSpan=_swMarkHtmlMst(scan, m.dir+':'+m.idx, m.arbiter, m.msel_en);
     return '<div class="rt-row mst">'
       +'<span class="rt-kind">MST</span>'
       +'<span class="rt-ports">'+esc(m.dir)+':'+m.idx+'</span>'
@@ -6833,16 +6922,17 @@ function _renderPktMasterBlock(col, row, focusFlowIdx){
         +m.arbiter+'</span>'
       +'<span class="rt-pktid" title="XAie_StrmPktSwMstrPortEnable MSelEn (bitmask of slave MSel lines)">msel_en:'
         +_fmtMselEnHex(m.msel_en)+'</span>'
-      +flow+'</div>';
+      +flow+swSpan+'</div>';
   }).join('');
   return '<div class="rt-mst-hdr">PKT master ports</div>'
-    +rows;
+    +rows+mstExtra;
 }
-function _tileRoutingConns(col, row){
+function _tileRoutingConns(col, row, paths){
+  paths = paths || DATA.comm_paths || [];
   const shimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
   const keyIdx=new Map();
   const out=[];
-  (DATA.comm_paths||[]).forEach(p=>{
+  (paths||[]).forEach(p=>{
     const fts=_flowTileSet(p);
     if(fts.size>0 && !fts.has(col+','+row)) return;
     const pathPkt=(p.routing_connections||[]).filter(c=>{
@@ -6880,50 +6970,235 @@ function _tileRoutingConns(col, row){
   return out;
 }
 
+function _routingConnDiffRecord(c){
+  if(c.kind==='packet_hw'){
+    const sl=c.slave||{};
+    return {kind:'PKT',
+      slave: sl.dir ? sl.dir+':'+sl.idx : null,
+      master: c.master.dir+':'+c.master.idx};
+  }
+  const s=c.slave||{}, m=c.master||{};
+  return {kind:'CCT', slave:s.dir+':'+s.idx, master:m.dir+':'+m.idx};
+}
+function _routingConnDiffKey(c){
+  const r=_routingConnDiffRecord(c);
+  return _swKey(r.kind, r.slave, r.master);
+}
+function _filterRoutingConns(conns){
+  return conns.filter(c=>{
+    if(c.kind==='packet_hw') return true;
+    const s=c.slave||{}, m=c.master||{};
+    return s.dir!=null && s.idx!=null && m.dir!=null && m.idx!=null;
+  });
+}
+function _routingDiffSides(){
+  const base = ROUTING_SRC==='dynamic' ? 'dynamic' : 'static';
+  return {base, other: base==='dynamic' ? 'static' : 'dynamic'};
+}
+function _routingSrcDiffTile(col, row){
+  if(!(DYNAMIC && DYNAMIC.comm_paths)) return null;
+  const d=_routingDiffSides();
+  const basePaths=d.base==='dynamic' ? DYNAMIC.comm_paths : STATIC_PATHS;
+  const otherPaths=d.base==='dynamic' ? STATIC_PATHS : DYNAMIC.comm_paths;
+  const baseConns=_filterRoutingConns(_tileRoutingConns(col, row, basePaths));
+  const otherConns=_filterRoutingConns(_tileRoutingConns(col, row, otherPaths));
+  const bMap=new Map();
+  baseConns.forEach(c=>{ const k=_routingConnDiffKey(c); if(!bMap.has(k)) bMap.set(k, _routingConnDiffRecord(c)); });
+  const oMap=new Map();
+  otherConns.forEach(c=>{ const k=_routingConnDiffKey(c); if(!oMap.has(k)) oMap.set(k, _routingConnDiffRecord(c)); });
+  const missing=[], unexpected=[];
+  bMap.forEach((rec, k)=>{ if(!oMap.has(k)) missing.push(rec); });
+  oMap.forEach((rec, k)=>{ if(!bMap.has(k)) unexpected.push(rec); });
+  let state='verified';
+  if(!bMap.size && !oMap.size) state='idle';
+  else if(missing.length || unexpected.length) state='mismatch';
+  return {state, missing, unexpected};
+}
+
 // ── live switch scan overlay ────────────────────────────────────────────────
 // A scanned tile carries the set of rows the hardware is NOT programmed with
 // (missing) and the rows it has that no flow accounts for (unexpected).  Rows
 // are keyed the same way both sides build them: kind + slave + master.
 function _swKey(kind, slave, master){ return kind+'|'+(slave||'fwd')+'|'+master; }
+function _swNormSlave(slave){
+  return (!slave || slave==='fwd') ? 'fwd' : slave;
+}
+function _swRecordKey(r){
+  if(!r) return '';
+  if(r.kind==='PKT'){
+    return 'PKT|'+_swNormSlave(r.slave)+'|'+r.master
+      +'|'+(r.pktid!=null?r.pktid:'?')+'|'+(r.mask!=null?r.mask:'?');
+  }
+  if(r.kind==='MST'){
+    return 'MST|'+r.master+'|'+(r.arbiter!=null?r.arbiter:0)
+      +'|'+(r.msel_en!=null?r.msel_en:1);
+  }
+  return _swKey(r.kind, r.slave, r.master);
+}
+function _swCoarseKey(r){
+  if(!r) return '';
+  if(r.kind==='PKT'){
+    const sl = (r.slave==='fwd'||!r.slave) ? null : r.slave;
+    return _swKey('PKT', sl, r.master);
+  }
+  if(r.kind==='MST') return _swKey('MST', null, r.master);
+  return _swKey(r.kind, r.slave, r.master);
+}
+function _swConnCoarseKey(c){
+  if(c.kind==='packet_hw'){
+    const sl=c.slave||{};
+    return _swKey('PKT', sl.dir?sl.dir+':'+sl.idx:null,
+                  c.master.dir+':'+c.master.idx);
+  }
+  const s=c.slave||{}, m=c.master||{};
+  return _swKey('CCT', s.dir+':'+s.idx, m.dir+':'+m.idx);
+}
 function _swScanTile(col, row){
   return SWSCAN ? SWSCAN[col+','+row] : null;
 }
-function _swMissingKeys(scan){
+function _swMissingRecordKeys(scan){
   const s=new Set();
-  (scan&&scan.missing||[]).forEach(r=>s.add(_swKey(r.kind,r.slave,r.master)));
+  (scan&&scan.missing||[]).forEach(r=>s.add(_swRecordKey(r)));
   return s;
 }
-function _swMarkHtml(scan, kind, slave, master){
-  if(!scan || scan.state==='unreachable') return '';
-  if(_swMissingKeys(scan).has(_swKey(kind,slave,master)))
-    return '<span class="sw-bad" title="the routing map claims this connection '
-      +'but the stream-switch registers are not programmed with it">not in HW</span>';
-  return '<span class="sw-ok" title="this connection is programmed in the '
-    +'stream-switch registers">in HW</span>';
+function _swMissingKeys(scan){
+  const s=new Set();
+  (scan&&scan.missing||[]).forEach(r=>s.add(_swCoarseKey(r)));
+  return s;
 }
-function _swExtraRowsHtml(scan){
+function _swOnlyLabel(){
+  if(!ROUTING_DIFF){
+    return {text:'HW only',
+            title:'programmed in hardware but no flow in the routing map accounts for it'};
+  }
+  const d=_routingDiffSides();
+  return {text:d.other+' only',
+          title:'in the '+d.other+' map but not in the '+d.base+' map'};
+}
+function _swDiffBadHtml(){
+  const d=_routingDiffSides();
+  return _swBadHtml('in the '+d.base+' map but not in the '+d.other+' map',
+                    d.base+' only');
+}
+function _swBadHtml(title, text){
+  return '<span class="sw-bad" title="'+esc(title)+'">'+text+'</span>';
+}
+function _swOkHtml(title, text){
+  return '<span class="sw-ok" title="'+esc(title)+'">'+text+'</span>';
+}
+function _swMarkHtmlCct(scan, slave, master){
+  if(!scan || scan.state==='unreachable') return '';
+  const rec={kind:'CCT', slave:slave, master:master};
+  if(_swMissingRecordKeys(scan).has(_swRecordKey(rec))){
+    if(ROUTING_DIFF) return _swDiffBadHtml();
+    return _swBadHtml('the routing map claims this connection '
+      +'but the stream-switch registers are not programmed with it',
+                      'not in HW');
+  }
+  if(ROUTING_DIFF){
+    return _swOkHtml('present in both the static and dynamic maps', 'match');
+  }
+  return _swOkHtml('this connection is programmed in the stream-switch registers',
+                   'in HW');
+}
+function _swMarkHtmlPkt(scan, slave, master, pktid, mask){
+  if(!scan || scan.state==='unreachable') return '';
+  const sl = slave || 'fwd';
+  const rec={kind:'PKT', slave:sl, master:master, pktid:pktid, mask:mask};
+  if(_swMissingRecordKeys(scan).has(_swRecordKey(rec))){
+    if(ROUTING_DIFF) return _swDiffBadHtml();
+    return _swBadHtml('the routing map claims this connection '
+      +'but the stream-switch registers are not programmed with it',
+                      'not in HW');
+  }
+  if(ROUTING_DIFF){
+    return _swOkHtml('present in both the static and dynamic maps', 'match');
+  }
+  return _swOkHtml('this connection is programmed in the stream-switch registers',
+                   'in HW');
+}
+function _swMarkHtmlMst(scan, master, arbiter, msel_en){
+  if(!scan || scan.state==='unreachable') return '';
+  const rec={kind:'MST', slave:null, master:master,
+             arbiter:arbiter, msel_en:msel_en};
+  if(_swMissingRecordKeys(scan).has(_swRecordKey(rec))){
+    if(ROUTING_DIFF) return '';
+    return _swBadHtml('the routing map claims this master port '
+      +'but the stream-switch registers are not programmed with it',
+                      'not in HW');
+  }
+  if(ROUTING_DIFF) return '';
+  return _swOkHtml('this master port is programmed in the stream-switch registers',
+                   'in HW');
+}
+function _swExtraRowHtml(r, only){
+  const ports=(r.slave?esc(r.slave):'fwd')+'&nbsp;&rarr;&nbsp;'+esc(r.master);
+  return '<div class="rt-row sw-extra">'
+    +'<span class="rt-kind">'+esc(r.kind)+'</span>'
+    +'<span class="rt-ports">'+ports+'</span>'
+    +_swBadHtml(only.title, only.text)+'</div>';
+}
+function _swExtraRowsHtml(scan, mainConns){
   if(!scan) return '';
-  return (scan.unexpected||[]).map(r=>{
+  const only=_swOnlyLabel();
+  const mainCoarse=new Set((mainConns||[]).map(_swConnCoarseKey));
+  const missingCoarse=_swMissingKeys(scan);
+  const seen=new Set();
+  return (scan.unexpected||[]).filter(r=>{
+    if(!r || r.kind==='MST') return false;
+    const ck=_swCoarseKey(r);
+    if(mainCoarse.has(ck) && !missingCoarse.has(ck)) return false;
+    const fk=_swRecordKey(r);
+    if(seen.has(fk)) return false;
+    seen.add(fk);
+    return true;
+  }).map(r=>_swExtraRowHtml(r, only)).join('');
+}
+function _swExtraMstHtml(scan, masters){
+  if(!scan) return '';
+  const only=_swOnlyLabel();
+  const mainCoarse=new Set((masters||[]).map(m=>_swKey('MST', null, m.dir+':'+m.idx)));
+  const missingCoarse=_swMissingKeys(scan);
+  const seen=new Set();
+  return (scan.unexpected||[]).filter(r=>{
+    if(!r || r.kind!=='MST') return false;
+    const ck=_swCoarseKey(r);
+    if(mainCoarse.has(ck) && !missingCoarse.has(ck)) return false;
+    const fk=_swRecordKey(r);
+    if(seen.has(fk)) return false;
+    seen.add(fk);
+    return true;
+  }).map(r=>{
     const ports=(r.slave?esc(r.slave):'fwd')+'&nbsp;&rarr;&nbsp;'+esc(r.master);
-    return '<div class="rt-row sw-extra">'
-      +'<span class="rt-kind">'+esc(r.kind)+'</span>'
+    let tail='';
+    if(r.arbiter!=null){
+      tail+=' <span class="rt-pktid" title="arbiter">arb:'+r.arbiter+'</span>';
+    }
+    if(r.msel_en!=null){
+      tail+=' <span class="rt-pktid" title="msel_en">msel_en:'
+        +_fmtMselEnHex(r.msel_en)+'</span>';
+    }
+    return '<div class="rt-row mst sw-extra">'
+      +'<span class="rt-kind">MST</span>'
       +'<span class="rt-ports">'+ports+'</span>'
-      +'<span class="sw-bad" title="programmed in hardware but no flow in the '
-      +'routing map accounts for it">HW only</span></div>';
+      +tail+_swBadHtml(only.title, only.text)+'</div>';
   }).join('');
 }
 
 function renderTileRoutingSection(col, row, focusFlowIdx){
-  const allRaw=_tileRoutingConns(col,row);
-  const swScan=_swScanTile(col,row);
+  const scan = ROUTING_DIFF
+    ? (_routingSrcDiffTile(col, row) || _swScanTile(col, row))
+    : null;
+  const allRaw=_tileRoutingConns(col, row);
 
-  let conns=allRaw.filter(c=>{
-    if(c.kind==='packet_hw') return true;
-    const s=c.slave||{}, m=c.master||{};
-    return s.dir!=null && s.idx!=null && m.dir!=null && m.idx!=null;
-  });
+  let conns=_filterRoutingConns(allRaw);
   if(focusFlowIdx!=null) conns=conns.filter(c=>(c.flow_indices||[c.flow_index]).includes(focusFlowIdx));
-  if(!conns.length) return '';
+  conns=conns.slice().sort((a,b)=>{
+    const rank=c=>(c.kind==='packet_hw'?1:0);
+    return rank(a)-rank(b);
+  });
+  if(!conns.length && !scan) return '';
+  if(!conns.length && scan && !(scan.unexpected||[]).length) return '';
 
   const rows=conns.map(c=>{
     const tile=(DATA.tiles||[]).find(t=>t.loc[0]===col&&t.loc[1]===row);
@@ -6946,8 +7221,9 @@ function renderTileRoutingSection(col, row, focusFlowIdx){
       const pktSpan=(c.pktid!=null)
         ?'<span class="rt-pktid" title="packet match id">pkt'+c.pktid+'</span>':'';
       const maskSpan=(c.mask!=null)?_fmtPktMaskBadge(c.mask,c.leg):'';
-      const swSpan=_swMarkHtml(swScan,'PKT',
-        sl.dir?sl.dir+':'+sl.idx:null, c.master.dir+':'+c.master.idx);
+      const swSpan=_swMarkHtmlPkt(scan,
+        sl.dir?sl.dir+':'+sl.idx:null, c.master.dir+':'+c.master.idx,
+        c.pktid, c.mask);
       return '<div class="rt-row pkt">'
         +'<span class="rt-kind">PKT</span>'
         +'<span class="rt-ports">'+ports+'</span>'
@@ -6955,18 +7231,20 @@ function renderTileRoutingSection(col, row, focusFlowIdx){
     }
     const s=c.slave||{}, m=c.master||{};
     const ports=esc(s.dir)+':'+s.idx+'&nbsp;&rarr;&nbsp;'+esc(m.dir)+':'+m.idx;
-    const swSpan=_swMarkHtml(swScan,'CCT',s.dir+':'+s.idx,m.dir+':'+m.idx);
+    const swSpan=_swMarkHtmlCct(scan, s.dir+':'+s.idx, m.dir+':'+m.idx);
     return '<div class="rt-row cct">'
       +'<span class="rt-kind">CCT</span>'
       +'<span class="rt-ports">'+ports+'</span>'
       +dmaSpan+swSpan+'</div>';
   });
-  const mstBlock=_renderPktMasterBlock(col, row, focusFlowIdx);
-  const swHdr=swScan
-    ?' <span class="sw-state '+esc(swScan.state)+'">'+esc(swScan.state)+'</span>'
+  const mstBlock=_renderPktMasterBlock(col, row, focusFlowIdx, scan);
+  const swHdr=scan
+    ?' <span class="sw-state '+esc(scan.state)+'">'+esc(scan.state)+'</span>'
     :'';
+  const extra=_swExtraRowsHtml(scan, conns);
+  if(!rows.filter(Boolean).join('') && !mstBlock && !extra) return '';
   return '<div class="sec"><div class="sec-hdr">Stream switch'+swHdr+'</div>'
-    +rows.filter(Boolean).join('')+mstBlock+_swExtraRowsHtml(swScan)+'</div>';
+    +rows.filter(Boolean).join('')+mstBlock+extra+'</div>';
 }
 
 function _routingTileType(row){
@@ -8329,7 +8607,7 @@ document.getElementById('conreload').onclick = () => {
 // accumulate into a .llm-msg-ai bubble via llmAppendToMsg.
 const LLM = { off:0, poll:null, busy:false, pendingId:null,
   ctx:new Map(), ctxSent:new Map(), generation:null, pollErrors:0 };
-const LLM_CTX_ORDER = ['session', 'run', 'search', 'selection'];
+const LLM_CTX_ORDER = ['session', 'run', 'search', 'selection', 'scan'];
 let llmMessages = [];
 let llmMsgIdCtr = 0;
 function llmEscape(s){
@@ -8877,18 +9155,100 @@ const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
                // page's: a reload or dropped tail must not convince the UI that
                // a live run is over.
                runOwned:false, daemonRun:null, rsBusy:false, rsTimer:null,
-               simOnly:false };
+               simOnly:false, jtagHost:'' };
+const HW_SERVER_CMD = 'exec hw_server -stcp:0.0.0.0:3121';
 const LSTATE = {
   running:['#4caf50','RUN'], stalled:['#ffca28','STALL'], error:['#ef5350','ERR'],
   completed:['#26a69a','done'], idle:['#546e7a','idle'],
   unreachable:['#8d6e63','n/a'], unknown:['#546e7a','?'],
-  // switch scan: the routing map and the registers agree / disagree
   verified:['#2e7d32','sw ok'], mismatch:['#d84315','sw ≠']
 };
-// Last switch scan, keyed 'col,row' — the tile panel annotates its Stream
-// switch rows from this so a scanned tile shows which rows the hardware
-// actually has. Cleared with the rest of the overlay state.
 let SWSCAN = null;
+let SWSCAN_RES = null;
+
+const STATIC_PATHS = DATA.comm_paths || [];
+let DYNAMIC = null;
+
+function setRoutingSource(which){
+  if (which === 'dynamic' && !(DYNAMIC && DYNAMIC.comm_paths)) {
+    syncRoutingSource(); return;
+  }
+  ROUTING_SRC = which;
+  DATA.comm_paths = which === 'dynamic' ? DYNAMIC.comm_paths : STATIC_PATHS;
+  recomputeFlowIds();
+  syncRoutingSource();
+  if (document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
+  if (panelActiveKey) panelRenderBody(panelActiveKey);
+  reapplySwitchScan();
+}
+
+function setRoutingDiff(on){
+  ROUTING_DIFF = !!on;
+  syncRoutingSource();
+  if (document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
+  if (panelActiveKey) panelRenderBody(panelActiveKey);
+  reapplySwitchScan();
+}
+
+// No interpolation: the markup is fixed and every varying string is written as
+// a property below, so the reconstructor's error text never reaches an HTML
+// parser.
+const RSRC_HTML =
+    '<label class="rsrc-diff-wrap" title="annotate the selected map\'s stream-switch rows with what the other map does or does not have">'
+  + '<input type="checkbox" class="rsrc-diff" onchange="setRoutingDiff(this.checked)"> diff</label>'
+  + '<select class="scan-what rsrc-sel" title="which routing map every panel reads"'
+  + ' onchange="setRoutingSource(this.value)">'
+  + '<option value="static" title="the map the compiler emitted"></option>'
+  + '<option value="dynamic"></option>'
+  + '</select>'
+  + '<button class="rs-dl" title="save the reconstructed routing map as JSON"'
+  + ' onclick="downloadDynamic()">Save JSON</button>'
+  + '<span class="rsrc-err" hidden></span>';
+
+function syncRoutingSource(){
+  ['gridRsrc','dmRsrc'].forEach(id=>{
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.hidden = !DYNAMIC;
+    if (!DYNAMIC) return;
+    // applyGrid() calls this on every switch scan and `live` re-scans every 2s,
+    // so the nodes are built once: replacing the markup would slam an open
+    // dropdown shut under the cursor mid-selection.
+    if (!el.firstChild) el.innerHTML = RSRC_HTML;
+    const diff = el.querySelector('.rsrc-diff');
+    const sel = el.querySelector('.rsrc-sel');
+    const dl  = el.querySelector('.rs-dl');
+    const msg = el.querySelector('.rsrc-err');
+    const err = DYNAMIC.error || '';
+    sel.hidden = !!err; dl.hidden = !!err; msg.hidden = !err;
+    if (diff){ diff.checked = ROUTING_DIFF; diff.disabled = !!err; }
+    if (err){ msg.textContent = 'routing: reconstruct failed'; msg.title = err; return; }
+    const n = DYNAMIC.n_flows || 0;
+    sel.querySelector('option[value="static"]').textContent =
+      'static · ' + n + ' found';
+    const od = sel.querySelector('option[value="dynamic"]');
+    od.textContent = 'dynamic (' + n + ')';
+    od.title = n + ' flow' + (n===1?'':'s') + ' reconstructed from the live switch'
+             + ' registers — independent of the provenance map';
+    sel.value = ROUTING_SRC;
+    sel.dataset.src = ROUTING_SRC;
+    sel.title = ROUTING_DIFF
+      ? 'which routing map every panel reads — and the side diff annotates from'
+      : 'which routing map every panel reads';
+  });
+}
+
+function downloadDynamic(){
+  if (!(DYNAMIC && DYNAMIC.routing_groups)) return;
+  const blob = new Blob([JSON.stringify(DYNAMIC.routing_groups, null, 1)],
+                        {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'routingprovenancemap.dynamic.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function llmToken(){ return sessionStorage.getItem('LLM_AUTH') || ''; }
 function api(path, opts){
   opts = opts || {};
@@ -8981,28 +9341,65 @@ function _updateIssueBar(res){
   applyIssues(issues);
 }
 
+function _swDisplayRes(res){
+  const cells = {};
+  Object.entries(res.cells || {}).forEach(([k, c]) => {
+    if (!c) return;
+    if (c.state === 'unreachable'){ cells[k] = c; return; }
+    if (ROUTING_DIFF){
+      const parts = k.split(',').map(Number);
+      const d = _routingSrcDiffTile(parts[0], parts[1]);
+      cells[k] = d ? Object.assign({}, c, d) : c;
+      return;
+    }
+    const plain = Object.assign({}, c);
+    delete plain.state;
+    cells[k] = plain;
+  });
+  return Object.assign({}, res, { cells });
+}
+function reapplySwitchScan(){
+  if (!SWSCAN_RES) return;
+  const again = Object.assign({}, SWSCAN_RES);
+  delete again.llm_summary;
+  applyGrid(again);
+}
+
 function applyGrid(res){
+  if (res.llm_summary){
+    llmPushCtx('[context] '+res.llm_summary, 'scan');
+  }
+  const isSwitch = res.what === 'switch' && !res.error;
+  if (isSwitch) SWSCAN_RES = res;
+  const disp = isSwitch ? _swDisplayRes(res) : res;
   if (res.error){ setStatus('live: '+res.error); }
   else if (res.what === 'switch'){
-    const n = res.mismatch_tiles || 0;
     SWSCAN = res.cells || {};
-    setStatus(n
-      ? ('switch: '+(n===1?'1 tile disagrees':n+' tiles disagree')
-         +' with the routing map')
-      : 'switch: every tile matches the routing map');
-    // Repaint the open panel so a scan annotates the rows already on screen.
+    if (ROUTING_DIFF){
+      const n = Object.values(disp.cells || {})
+        .filter(c => c && c.state === 'mismatch').length;
+      setStatus(n
+        ? ('switch: '+(n===1?'1 tile differs':n+' tiles differ')
+           +' between static and dynamic')
+        : 'switch: static and dynamic agree on every tile');
+    } else {
+      const n = Object.keys(disp.cells || {}).length;
+      setStatus('switch: '+n+' tile'+(n===1?'':'s')+' read · showing '+ROUTING_SRC
+                +' routing — tick diff to compare the two maps');
+    }
+    if (res.dynamic){ DYNAMIC = res.dynamic; syncRoutingSource(); }
     if (panelActiveKey) panelRenderBody(panelActiveKey);
   }
   else setStatus('live '+LIVE.what+' @ '+new Date().toLocaleTimeString());
   // One fetch feeds both views; the device map paints from the same payload.
-  dmApplyStatus(res);
-  const cells = res.cells || {};
+  dmApplyStatus(disp);
+  const cells = disp.cells || {};
   Object.keys(liveBar).forEach(k => {
     const b = liveBar[k], c = cells[k];
     const cell = cellByLoc[k];
     // Only badge tiles with actionable states — idle/completed channels
     // finished cleanly and should not display a coloured bar.
-    if (!c || c.state === 'idle' || c.state === 'completed'){
+    if (!c || !c.state || c.state === 'idle' || c.state === 'completed'){
       b.className='livebar hide';
       // Still surface last-BD info on the tile hover for completed channels.
       if(c && c.channels && cell){
@@ -9115,8 +9512,6 @@ function setLive(on){
   // 2s would spend a board round-trip per tile to re-read bits that only the
   // host program changes. Scan it on demand instead.
   if (on && LIVE.what === 'switch'){
-    setStatus('switch config is static — use Scan, not the live poll');
-    dmSetScanStatus('switch config is static — use Scan, not the live poll');
     on = false;
   }
   LIVE.enabled = on;
@@ -9205,6 +9600,50 @@ function updateConnectionPresentation(){
 }
 // Show/hide the "start hw_server on the target board" hint (shown on failure).
 function setConnHint(show){ const e=document.getElementById('connhint'); if(e) e.classList.toggle('hide', !show); }
+
+function connectTcpHost(dev, host){
+  if (dev === 'pal') return LIVE.jtagHost || null;
+  return host || null;
+}
+function boardConnectGuideText(dev, host){
+  const tcp = connectTcpHost(dev, host);
+  const lines = [
+    '[board setup — run on the target in xsdb, then press Connect here]',
+    '',
+    'On the target board, in xsdb, start hw_server:',
+    '',
+    '    ' + HW_SERVER_CMD,
+    '',
+  ];
+  if (tcp){
+    lines.push('This UI will probe from here (same as Connect):');
+    lines.push('');
+    lines.push('    connect -url TCP:' + tcp + ':3121');
+    lines.push('');
+  } else if (dev !== 'pal'){
+    lines.push('Enter the board hostname above first.');
+    lines.push('');
+  }
+  lines.push('Then press Connect.');
+  return lines.join('\n');
+}
+function showBoardConnectGuide(dev, host){
+  if (LIVE.simOnly || !dev || dev === 'simulator' || LIVE.connected) return hideRunConsole();
+  if (LIVE.conTimer || LIVE.hwsrvTimer || SIM.timer) return;
+  const con = document.getElementById('console');
+  if (!con) return;
+  con.textContent = boardConnectGuideText(dev, host);
+  con.classList.remove('hide');
+}
+function hideRunConsole(){
+  if (LIVE.conTimer || LIVE.hwsrvTimer || SIM.timer) return;
+  const con = document.getElementById('console');
+  if (!con) return;
+  con.classList.add('hide');
+  if (!con.textContent.startsWith('[run ') && !con.textContent.startsWith('[adopted ')
+      && !con.textContent.startsWith('[auto-starting'))
+    con.textContent = '';
+}
 
 // ── run-state reconciliation (UI ⇄ daemon) ───────────────────────────────────
 function updateRunButtons(){
@@ -9310,12 +9749,15 @@ function syncRunState(){
 // arrive asynchronously and the selection is usually already made by then.
 function refreshDeviceStatus(){
   const dev = deviceSel ? deviceSel.value : '';
-  if (!dev){ if (testconn) testconn.disabled = true; setConnStatus('Not connected'); return; }
+  const host = boardHost ? boardHost.value.trim() : '';
+  if (!dev){ if (testconn) testconn.disabled = true; setConnStatus('Not connected'); hideRunConsole(); return; }
   if (dev !== 'simulator'){
     if (testconn) testconn.disabled = false;
     setConnStatus('click "Connect" to enable live features');
+    if (!LIVE.connected) showBoardConnectGuide(dev, host);
     return;
   }
+  hideRunConsole();
   const sr = simRow();
   if (sr && sr.available === false){
     // Offered, but nothing to run. Naming the missing artifact here is the
@@ -9376,6 +9818,7 @@ function applyConnected(r){
   if (liveToggle){ liveToggle.disabled = false;
     liveToggle.closest('label').classList.remove('disabled'); }
   updateLiveReadControls();
+  hideRunConsole();
   const box = document.getElementById('cmdconsole');
   if (box) box.classList.remove('hide');   // reveal the aiegdb console
   const rsp = document.getElementById('rhsplitter');
@@ -9639,21 +10082,24 @@ function setOverlayWhat(w){
   // Same reasoning for the per-row switch verdicts: they are only true for the
   // scan that produced them.
   SWSCAN = null;
+  SWSCAN_RES = null;
   if (panelActiveKey) panelRenderBody(panelActiveKey);
   // Static config: never let the 2s poll carry over into this mode.
   if (w === 'switch' && LIVE.enabled) setLive(false);
-  const msg = LIVE.enabled ? 'scanning '+w+'…' : 'click "Scan" to read '+w;
-  dmSetScanStatus(msg);
-  setStatus(msg);
+  if (LIVE.enabled){
+    const msg = 'scanning '+w+'…';
+    dmSetScanStatus(msg);
+    setStatus(msg);
+  } else {
+    dmSetScanStatus('');
+    setStatus('');
+  }
 }
 // Picking a mode is a SELECTION, not an action. It reads the board only while
 // the live poll is on; otherwise "Scan" is the trigger.
 function pickOverlayWhat(w, setMsg){
   setOverlayWhat(w);
-  if (!LIVE.connected){
-    setMsg('not connected; use Connect in the debug panel below', true);
-    return;
-  }
+  if (!LIVE.connected) return;
   if (LIVE.enabled) scanOnce(true);
 }
 (function(){
@@ -9672,14 +10118,10 @@ function pickOverlayWhat(w, setMsg){
 })();
 function runScanNow(setMsg){
   if (deviceSel && deviceSel.value === 'simulator' && !simHasLiveReads()){
-    setMsg(simLiveUnavailableText(), true);
     updateLiveReadControls();
     return;
   }
-  if (!LIVE.connected){
-    setMsg('not connected; use Connect in the debug panel below', true);
-    return;
-  }
+  if (!LIVE.connected) return;
   setMsg('scanning '+LIVE.what+'…');
   scanOnce(true);
 }
@@ -9694,7 +10136,6 @@ function runScanNow(setMsg){
   if (live) live.onchange = e => {
     if (e.target.checked && !LIVE.connected){
       e.target.checked = false;
-      dmSetScanStatus('not connected; use Connect in the debug panel below', true);
       return;
     }
     setLive(e.target.checked);
@@ -9876,9 +10317,7 @@ function simLiveUnavailableText(){
   return 'live scans unavailable: aiesim exposes no debug socket';
 }
 function showSimLiveUnavailable(){
-  const msg = simLiveUnavailableText();
-  setStatus(msg);
-  dmSetScanStatus(msg, true);
+  updateLiveReadControls();
 }
 function updateLiveReadControls(){
   const blocked = !!(deviceSel && deviceSel.value === 'simulator'
@@ -9901,7 +10340,6 @@ function updateLiveReadControls(){
   });
   const name = document.querySelector('#conhdr .chname');
   if (name) name.textContent = blocked ? 'aiegdb (navigation only)' : 'aiegdb';
-  if (blocked) showSimLiveUnavailable();
 }
 function pollSimLog(){
   if (SIM.logBusy) return;
@@ -10064,6 +10502,7 @@ function applyBoardDefaults(){
       if (has) deviceSel.value = c.device;
     }
     if (c.board_host && boardHost) boardHost.value = c.board_host;
+    if (c.jtag_host) LIVE.jtagHost = c.jtag_host;
     if (c.source_viewer === false) SRC.on = false;
     updateDeviceUI();   // reveal/enable controls for the preselected device
     if (LIVE.simOnly) testConnect();

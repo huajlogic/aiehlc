@@ -932,7 +932,7 @@ STRM_SW_SLAVE_PORTS = {
     "shim": _ports(("CTRL", 1), ("FIFO", 1),
                    ("SOUTH", 8), ("WEST", 4), ("NORTH", 4), ("EAST", 4),
                    ("TRACE", 1)),
-    "memtile": _ports(("DMA", 6), ("CTRL", 1), ("SOUTH", 4), ("NORTH", 6),
+    "memtile": _ports(("DMA", 6), ("CTRL", 1), ("SOUTH", 6), ("NORTH", 4),
                       ("TRACE", 1)),
 }
 # Non-directional terminal port types: a flow ends here (kernel/DMA/etc), it
