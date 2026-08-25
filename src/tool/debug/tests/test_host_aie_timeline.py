@@ -199,6 +199,69 @@ def test_mem_stream_gets_own_lane():
     assert all(e["start_us"] != 305.0 for e in core_stall)
 
 
+def test_trace_line_event_value_suffix_stripped():
+    # The [TIMESYNC] profile dump appends a "{event value v1:v2:...}" suffix that
+    # encodes the raw physical HW event ids. The parser must strip it so the event
+    # name stays clean and the interval still maps -- otherwise the whole line is
+    # silently dropped.
+    block = _block(two_tiles=False).rstrip("\n") + "\n" + "\n".join([
+        "[TIMESYNC] trace tile=4,4 stream=mem 300 -- 301  "
+        "DMA_MM2S_0_STALLED_LOCK_MEM{event value 20:21}  (1 cyc)",
+        "[TIMESYNC] trace tile=4,4 305 -- 309  ACTIVE{event value 28}  (4 cyc)",
+    ]) + "\n"
+    ts = hat.parse_timesync(block)
+    ivs = ts["traces"][(4, 4)]
+    # iv[2] is the list of "|"-split event names.
+    flat = [n for iv in ivs for n in iv[2]]
+    # Both suffixed lines survived parsing (not silently dropped).
+    assert "DMA_MM2S_0_STALLED_LOCK_MEM" in flat, flat
+    assert "ACTIVE" in flat, flat
+    # No residual "{event value ...}" text leaks into the event name.
+    assert all("event value" not in n for n in flat), flat
+    assert all("{" not in n and "}" not in n for n in flat), flat
+
+
+def test_mem_dma_config_names_lane_and_metadata():
+    # A pkt_id=2 [TRACESTREAMCONFIG] line carries the watched tile-DMA
+    # (dir+channel); the mem lane is named after it ("tile C,R dma mm2s 0") and
+    # tagged role="mem"/ident="mm2s 0" so the renderer can build DMA-aware labels.
+    # pkt_id and dma appear in either order across the two config lines.
+    block = _block(two_tiles=False).rstrip("\n") + "\n" + "\n".join([
+        "[TRACESTREAMCONFIG] src_tile=(4,4) in_port=TRACE:1 out_port=SOUTH(shared) "
+        "pkt_id=2 slot=0 mask=0x1F msel=1 arbiter=1 dma=MM2S:0 slots=DMA_START,STREAM_STALL",
+        "[TIMESYNC] trace tile=4,4 stream=mem 300  DMA_START",
+        "[TIMESYNC] trace tile=4,4 stream=mem 305 -- 309  STREAM_STALL",
+    ]) + "\n"
+    ts = hat.parse_timesync(block)
+    assert ts["mem_dmas"] == {(4, 4): "mm2s 0"}, ts["mem_dmas"]
+    model = hat.correlate(ts)
+    mem = next(l for l in model["lanes"] if l["name"] == "tile 4,4 dma mm2s 0")
+    assert mem["role"] == "mem" and mem["ident"] == "mm2s 0"
+    # The core/port lanes still carry role metadata too.
+    core = next(l for l in model["lanes"] if l["name"] == "tile 4,4 core")
+    assert core["role"] == "core"
+
+
+def test_evt_port_map_names_port_lane_east_master():
+    # With the routed-port re-target (resmap_lookup_dma_port), a traced mm2s0 on
+    # tile (4,4) reports evt_port {east,master,1} instead of the trace-stream
+    # ingress. The port lane must be named after that physical port ("tile 4,4
+    # east master 1") and carry the PORT_* spans.
+    block = _block(two_tiles=False).rstrip("\n") + "\n" + "\n".join([
+        '[aie_runtime] core_trace_stream_json: {"src_tile":[4,4],'
+        '"evt_port":{"tile":[4,4],"port":"east","intf":"master","num":1},'
+        '"slots":["PORT_RUNNING_0"],"hops":[]}',
+        "[TIMESYNC] trace tile=4,4 200 -- 204  PORT_RUNNING_0",
+    ]) + "\n"
+    ts = hat.parse_timesync(block)
+    assert ts["evt_ports"] == {(4, 4): "east master 1"}, ts["evt_ports"]
+    model = hat.correlate(ts)
+    port = next(l for l in model["lanes"] if l["name"] == "tile 4,4 east master 1")
+    assert port["role"] == "port" and port["ident"] == "east master 1"
+    spans = {e["event"]: (e["start_us"], e["end_us"]) for e in port["events"]}
+    assert spans["PORT_RUNNING_0"] == (200.0, 205.0), spans
+
+
 def test_missing_cps_raises():
     ts = hat.parse_timesync("[TIMESYNC] anchor0 host=1\n[TIMESYNC] anchor1 host=2\n")
     try:

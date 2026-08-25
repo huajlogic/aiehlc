@@ -626,6 +626,16 @@ void __Runtime_core_trace_begin(XAie_DevInst *dev, uint8_t col, uint8_t row);
 #define AIE_TRACE_STRM_CH_AUTO 0xFFu
 void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch);
 
+// Same as __Runtime_core_trace_begin but additionally selects which tile DMA the
+// MEMORY-module trace unit watches (see __Runtime_core_trace_setup /
+// __Runtime_mem_trace_setup). mem_dma_kind is AIE_TRACE_DMA_S2MM/_MM2S (or
+// _NONE to disable), mem_dma_ch is the DMA channel index (0/1). The physical
+// stream channel is AUTO (per-column slot). Emitted by CoreTraceInsertPass for
+// `#pragma aie_trace((col,row),(STREAM,...))` / `(PARAMETER,...)`; the default
+// (no second tuple) is still S2MM ch0, so plain __Runtime_core_trace_begin is
+// equivalent to __Runtime_core_trace_begin_dma(dev,col,row,AIE_TRACE_DMA_S2MM,0).
+void __Runtime_core_trace_begin_dma(XAie_DevInst *dev, uint8_t col, uint8_t row, int mem_dma_kind, uint8_t mem_dma_ch);
+
 // Start host<->AIE time correlation for the tiles armed by
 // __Runtime_core_trace_begin. Inits a process-global AieTraceProfile, records
 // the host clock (cps) and anchor0 (host time + each armed tile's AIE core

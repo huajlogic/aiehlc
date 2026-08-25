@@ -5,6 +5,7 @@
 #pragma once
 
 #include "mlir/IR/BuiltinOps.h"
+#include "passcoretraceinsert/passcoretraceinsert.h"
 #include <string>
 #include <vector>
 
@@ -313,5 +314,5 @@ public:
                             const std::string &aieGen = "Gen2", const std::string &hostFuncSuffix = "",
                             bool appendMode = false, unsigned *numHostDdrArgs = nullptr,
                             const std::vector<std::string> &portVarNames = {},
-                            const std::vector<std::pair<int, int>> &traceTiles = {});
+                            const std::vector<TraceTileSpec> &traceTiles = {});
 };

@@ -53,6 +53,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <iostream>
 #include <map>
 
@@ -61,6 +62,120 @@ using namespace mlir;
 // ---------------------------------------------------------------------------
 // Helpers (same as unitest/test.cpp)
 // ---------------------------------------------------------------------------
+
+// Resolve and validate `#pragma aie_trace` mem-DMA selections against the
+// dfschedule create_io provenance on `hostModule` (still present before
+// DfscheduleToApiPass). Returns false on a fatal user error so the caller aborts:
+//   * PARAMETER "name" that is not a kernel window/port, or whose direction has no
+//     DMA channel assigned on the traced tile.
+//   * STREAM dir/ch whose channel the app never uses on the traced tile (covers
+//     both hardware-invalid indices and valid-but-unused channels).
+// A kernel window/port name maps to a direction via `tensors[i].isInput` (input =>
+// S2MM, output => MM2S) using the tensor-ordered `portVarNames`, then to the
+// create_io channel that direction was assigned on the tile, matched by
+// declaration order within the direction. Default specs are left untouched (S2MM
+// ch0, unchecked). Reads IR only.
+static bool resolveTraceParameterSpecs(mlir::ModuleOp hostModule, const std::vector<std::string> &portVarNames,
+                                       const std::vector<TensorParam> &tensors,
+                                       std::vector<TraceTileSpec> &traceTiles) {
+    bool needCheck = false;
+    for (const auto &t : traceTiles)
+        if (t.sel == TraceDmaSel::Parameter || t.sel == TraceDmaSel::Stream)
+            needCheck = true;
+    if (!needCheck)
+        return true;
+
+    // Build per-tile ordered channel lists per direction from create_io.
+    // key = (col,row); value = channels in IR order for S2MM / MM2S respectively.
+    std::map<std::pair<int, int>, std::vector<int>> s2mmCh, mm2sCh;
+    hostModule.walk([&](dfschedule::ConfigCreateIoOp io) {
+        auto tileOp = io.getTile().getDefiningOp<dfschedule::DeclareTileOp>();
+        if (!tileOp)
+            return;
+        std::pair<int, int> key{(int)tileOp.getCol(), (int)tileOp.getRow()};
+        std::string dir = io.getDirection().str();
+        if (dir == "S2MM")
+            s2mmCh[key].push_back((int)io.getChannel());
+        else if (dir == "MM2S")
+            mm2sCh[key].push_back((int)io.getChannel());
+    });
+
+    // Map a port name -> (isInput, ordinalWithinDirection) from tensors order.
+    auto lookupPort = [&](const std::string &name, bool &isInput, int &ordinal) -> bool {
+        int inOrd = 0, outOrd = 0;
+        for (size_t i = 0; i < portVarNames.size(); i++) {
+            bool in = (i < tensors.size()) ? tensors[i].isInput : true;
+            if (portVarNames[i] == name) {
+                isInput = in;
+                ordinal = in ? inOrd : outOrd;
+                return true;
+            }
+            if (in)
+                inOrd++;
+            else
+                outOrd++;
+        }
+        return false;
+    };
+
+    auto joinCh = [](const std::vector<int> &lst) -> std::string {
+        if (lst.empty())
+            return "(none)";
+        std::string s;
+        for (size_t i = 0; i < lst.size(); i++)
+            s += (i ? ", ch" : "ch") + std::to_string(lst[i]);
+        return s;
+    };
+
+    bool ok = true;
+    for (auto &t : traceTiles) {
+        std::pair<int, int> key{t.col, t.row};
+
+        // Skip specs whose tile has no create_io in this module: in multi-kernel
+        // mode each kernel gets its own module, and a traced tile may belong to a
+        // different kernel (or be an out-of-mesh coord). Validating it here would
+        // spuriously abort. The kernel that owns the tile validates it.
+        if (!s2mmCh.count(key) && !mm2sCh.count(key))
+            continue;
+
+        if (t.sel == TraceDmaSel::Stream) {
+            const auto &chList = (t.dmaKind == 2) ? mm2sCh[key] : s2mmCh[key];
+            const char *dirName = (t.dmaKind == 2) ? "mm2s" : "s2mm";
+            if (std::find(chList.begin(), chList.end(), t.dmaCh) == chList.end()) {
+                std::cerr << "[aiehlc] Error: #pragma aie_trace STREAM " << dirName << " ch" << t.dmaCh
+                          << " is not used by the app on tile(" << t.col << "," << t.row << "). Available " << dirName
+                          << " channels: " << joinCh(chList) << std::endl;
+                ok = false;
+            }
+            continue;
+        }
+
+        if (t.sel != TraceDmaSel::Parameter)
+            continue;
+
+        bool isInput = true;
+        int ordinal = 0;
+        if (!lookupPort(t.paramName, isInput, ordinal)) {
+            std::cerr << "[aiehlc] Error: #pragma aie_trace PARAMETER \"" << t.paramName
+                      << "\" is not a kernel window/port name." << std::endl;
+            ok = false;
+            continue;
+        }
+        const auto &chList = isInput ? s2mmCh[key] : mm2sCh[key];
+        if (ordinal >= (int)chList.size()) {
+            std::cerr << "[aiehlc] Error: #pragma aie_trace PARAMETER \"" << t.paramName << "\" ("
+                      << (isInput ? "S2MM" : "MM2S") << ") has no DMA channel on tile(" << t.col << "," << t.row
+                      << "). Available channels: " << joinCh(chList) << std::endl;
+            ok = false;
+            continue;
+        }
+        t.dmaKind = isInput ? 1 : 2; // S2MM : MM2S
+        t.dmaCh = chList[ordinal];
+        std::cout << "[CoreTraceInsert] PARAMETER \"" << t.paramName << "\" -> tile(" << t.col << "," << t.row << ") "
+                  << (isInput ? "S2MM" : "MM2S") << " ch" << t.dmaCh << std::endl;
+    }
+    return ok;
+}
 
 static std::string setupPipelineIRDir(const std::string &subdir) {
     llvm::SmallString<256> cwdPath;
@@ -429,7 +544,10 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                                        const std::vector<TensorParam> &tensors, int64_t maxPingPongBytes,
                                        const std::string &aieGen, const std::string &hostFuncSuffix, bool appendMode,
                                        unsigned *numHostDdrArgs, const std::vector<std::string> &portVarNames,
-                                       const std::vector<std::pair<int, int>> &traceTiles) {
+                                       const std::vector<TraceTileSpec> &traceTilesIn) {
+    // Mutable copy so the PARAMETER resolver (below) can stamp resolved dmaKind/
+    // dmaCh back into the specs before CoreTraceInsertPass consumes them.
+    std::vector<TraceTileSpec> traceTiles = traceTilesIn;
 
     // Extract partition bounds from createhwmesh op in the IR (if present)
     int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
@@ -636,6 +754,16 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                                                           provKRounds, provTileM, provTileN, provMRounds, provNRounds);
         runPipelineSinglePass(ctx, hostModule, std::move(dfscheProvenancePass), irDir, stage,
                               "DfscheduleProvenanceMapPass");
+    }
+
+    // Resolve + validate #pragma aie_trace mem-DMA selections to physical
+    // (dmaKind, dmaCh) while dfschedule create_io provenance is still present
+    // (DfscheduleToApiPass below erases it). Stamps resolved values back into
+    // traceTiles; aborts the build on an invalid PARAMETER name or an unused
+    // STREAM channel.
+    if (!resolveTraceParameterSpecs(hostModule, portVarNames, tensors, traceTiles)) {
+        llvm::errs() << "[TilingLinalg] ERROR: invalid #pragma aie_trace mem-DMA selection.\n";
+        return false;
     }
 
     if (!runPipelineSinglePass(ctx, hostModule,

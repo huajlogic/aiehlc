@@ -13,6 +13,11 @@ a Gantt-style diagram of HORIZONTAL timelines on ONE microsecond axis:
   * every tile event is a horizontal bar start_us..end_us, COLOURED by event
     type (ACTIVE=AIE running / LOCK_STALL / STREAM_STALL / MEMORY_STALL / other),
     so the tile's green ACTIVE bar lines up UNDER the host's waiting bar,
+  * a mem-DMA lane ("tile C,R dma <dir> <ch>") draws the lock stall
+    (DMA_*_STALLED_LOCK_MEM, orange) as a full-height background band and marks
+    EVERY stream stall event (MM2S back-pressure / S2MM starvation, red) as its
+    own full-height per-event vertical tick on top, so all occurrences are
+    plotted instead of merging into a few blobs,
   * light dashed vertical guides mark the host phase boundaries across all lanes,
   * pan/zoom via matplotlib's built-in toolbar, hover for per-event detail.
 
@@ -28,6 +33,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 
 # --------------------------------------------------------------------------
@@ -60,15 +66,64 @@ EVENT_COLORS = {
 PULSE_EVENTS = ("DMA_START", "DMA_FINISH", "LOCK_GRP", "LOCK_ACQ", "LOCK_REL")
 # Some pulses also get a point marker at the top of their line so a LONE
 # occurrence pops out of the dense pulse cluster. The DMA task-start
-# (DMA_S2MM_0_START_TASK) fires once per run, unlike the per-iteration FINISH,
-# so without a marker its single line is easily lost.
-PULSE_MARKERS = {"DMA_START": "v"}
+# (DMA_S2MM_0_START_TASK) fires once per run. The per-BD FINISH needs a marker
+# for a different reason: it often coincides with a stream back-pressure event,
+# whose full-height opaque tick would otherwise paint over the finish line -- the
+# glyph is drawn above the ticks (higher zorder) so the finish still shows.
+# Start uses a down-triangle, finish an up-triangle (mirrored, and coloured
+# differently) so the two edges of a BD read at a glance.
+PULSE_MARKERS = {"DMA_START": "v", "DMA_FINISH": "^"}
 # Mem DMA stall slots take colour priority over DMA_START in a combined label,
 # mirroring STALL_ORDER for the core lane (a BD can be "running" yet blocked).
 MEM_STALL_ORDER = ("DMA_STALL_LOCK", "STREAM_STALL", "MEM_BP")
 # Stall slots take colour priority over ACTIVE in a combined label: a core is
 # reported ACTIVE even while blocked, so the stall should be what you see.
 STALL_ORDER = ("LOCK_STALL", "STREAM_STALL", "MEMORY_STALL")
+# Port-lane rasterisation priority (high->low colours winning a pixel bin by
+# PRESENCE, not duration). RUNNING is the actual-data-movement signal but fires
+# in very short, frequent bursts that pure duration dominance drowns under the
+# long IDLE/STALLED background; STALLED likewise should surface over IDLE. So a
+# bin showing any RUNNING renders RUNNING, else any STALLED renders STALLED,
+# else IDLE.
+PORT_RASTER_PRIORITY = (EVENT_COLORS["PORT_RUNNING_0"], EVENT_COLORS["PORT_STALLED_0"])
+# Core-lane rasterisation priority: genuine "core running" is an ACTIVE span with
+# NO stall bit (LOCK/STREAM/MEMORY) -- event_color already returns the ACTIVE
+# colour only for those, and a stall colour whenever a stall bit is present. But
+# those pure-ACTIVE bursts are brief (a few % of the run) and vanish under the
+# long stall background in duration-dominance rasterisation. Give the ACTIVE
+# colour presence-priority so any bin containing a real running burst renders
+# green; stall-only bins stay their stall colour.
+CORE_RASTER_PRIORITY = (EVENT_COLORS["ACTIVE"],)
+# Mem-lane rendering: a mem-DMA lane stacks its concurrent stall states as
+# per-column horizontal slices (see MEM_LANE_STACK below). ALL three stall states
+# are HELD-duration bands with real start->end spans: lock stall, memory
+# back-pressure, and stream stall (DMA_*_STREAM_BACKPRESSURE_MEM on MM2S /
+# DMA_*_STREAM_STARVATION_MEM on S2MM, both canonicalising to STREAM_STALL). A
+# long stream-starvation region (tens of us) therefore fills its whole span as a
+# red band rather than collapsing to a single tick at its start. Stream ALSO
+# keeps a per-event vertical tick overlay -- one line per event at its true start,
+# confined to the stream slice -- because binning would merge its many
+# nanosecond-scale bursts into a blob; the tick plots every occurrence. Band and
+# ticks share the stream slice and colour, so they do not conflict. The axis is
+# inverted (host on top). When several states are concurrent on the same lane --
+# e.g. a BD both lock-stalled AND memory back-pressured (DMA_*_STALLED_LOCK_MEM |
+# DMA_*_MEMORY_BACKPRESSURE_MEM) -- neither hides the other: the row is split
+# top->bottom into one horizontal sub-band per PRESENT category, in a fixed order
+# (lock on top, mem back-pressure, then stream) for a stable, readable layout.
+# Full top->bottom stack order for a mem-DMA lane. All three stall states can be
+# concurrent on one BD (lock-stalled AND memory-back-pressured AND stream-starved
+# at once); each gets its own horizontal slice so none hides another. The split
+# is PER COLUMN and adaptive: a column paints only the states active there,
+# dividing the row height equally among them, so a lone state fills the full
+# height (no reserved-but-empty white strip) while two or three concurrent states
+# stack. Held-band membership is exactly this tuple.
+MEM_LANE_STACK = ("DMA_STALL_LOCK", "MEM_BP", "STREAM_STALL")
+# Floor for the lock / mem-bp band segment width as a fraction of the visible
+# x-span so a very brief stall still rasterises to a visible width instead of
+# anti-aliasing into invisibility. Stream is painted at its TRUE span (no floor)
+# because it has hundreds of nanosecond bursts that padding would inflate into
+# one lane-wide blob; genuinely long stream regions already span many columns.
+MEM_MIN_SEG_FRAC = 0.01
 OTHER_COLOR = "#7f7f7f"         # grey (multi-event or unknown)
 HOST_LINE_COLOR = "#1f77b4"     # blue guide lines / host-running bars
 HOST_RUNNING_COLOR = "#1f77b4"  # blue: host busy (setup / DMA / verify)
@@ -78,8 +133,123 @@ HOST_WAIT_COLOR = "#c7c7c7"     # grey hatched: host idle-waiting on the AIE
 # the bar from the "run" marker to the next marker ("wait_done") is host-idle.
 HOST_WAIT_PHASES = {"run"}
 
+# --------------------------------------------------------------------------
+# Driver-specific event names. The runtime now emits the XAie driver's exact
+# event string per slot (via XAie_EventGetString) instead of a generic alias --
+# e.g. DMA_S2MM_0_STREAM_STARVATION_MEM rather than STREAM_STALL. These come in
+# three families, each canonicalised by regex to a generic EVENT_COLORS token
+# (so colouring / pulse markers / legend keep working) plus a short human phrase
+# for the legend + hover label. Without this every specific name falls through
+# to grey "other" and the lane loses all meaning; the regexes also absorb the
+# index / suffix variation seen across different applogs (channel 0..N, lock
+# index 0..15 / SEL0..7, port index 0..7, _CORE/_MEM/_PL suffix).
+#   DMA:  DMA_<S2MM|MM2S>_<ch>_<KIND>_MEM
+#   LOCK: LOCK_<n>_<ACQ|REL>_MEM, LOCK_SEL<n>_<...>_MEM, LOCK_ACQUIRE/ERROR_MEM
+#   PORT: PORT_<RUNNING|STALLED|IDLE|TLAST>_<n>[_CORE|_MEM|_PL]
+# --------------------------------------------------------------------------
+_MEM_DMA_RE = re.compile(r"^DMA_(S2MM|MM2S)_(\d+)_(.+?)_MEM$")
+# (kind-substring regex, canonical EVENT_COLORS token or None, human word),
+# matched in order -- specific stalls before generic START/FINISH.
+_MEM_KIND_RULES = (
+    (re.compile(r"STALLED_LOCK"),        "DMA_STALL_LOCK", "lock stall"),
+    (re.compile(r"STREAM_STARVATION"),   "STREAM_STALL",   "stream starving"),
+    (re.compile(r"STREAM_BACKPRESSURE"), "STREAM_STALL",   "stream back-pressure"),
+    (re.compile(r"MEMORY_BACKPRESSURE"), "MEM_BP",         "mem back-pressure"),
+    (re.compile(r"MEMORY_STARVATION"),   "MEM_BP",         "mem starvation"),
+    (re.compile(r"MEMORY_CONFLICT"),     "MEM_BP",         "mem conflict"),
+    (re.compile(r"FINISHED"),            "DMA_FINISH",     "finished"),
+    (re.compile(r"START"),               "DMA_START",      "start"),
+    (re.compile(r"GO_TO_IDLE"),          None,             "idle"),
+    (re.compile(r"ERROR"),               None,             "error"),
+)
+# Driver lock events: LOCK_<idx>_<KIND>_MEM. <idx> is either a bare number
+# (LOCK_0_REL) or SEL<n> group selector (LOCK_SEL0_ACQ_GE); LOCK_ACQUIRE / ERROR
+# carry no index. KIND collapses onto the three generic lock pulse tokens.
+_MEM_LOCK_RE = re.compile(r"^LOCK_(.+?)_MEM$")
+_LOCK_KIND_RULES = (
+    (re.compile(r"EQUAL_TO_VALUE"), "LOCK_GRP", "value"),
+    (re.compile(r"REL"),            "LOCK_REL", "release"),
+    (re.compile(r"ACQ|ACQUIRE"),    "LOCK_ACQ", "acquire"),
+    (re.compile(r"ERROR"),          None,       "error"),
+)
+# Stream-switch port events at any index / module suffix.
+_PORT_RE = re.compile(r"^PORT_(RUNNING|STALLED|IDLE|TLAST)_(\d+)(?:_(?:CORE|MEM|PL))?$")
+_PORT_STATE_CANON = {"RUNNING": "PORT_RUNNING_0", "STALLED": "PORT_STALLED_0",
+                     "IDLE": "PORT_IDLE_0"}  # TLAST has no colour slot
 
-def rasterize_lane(events, x_lo, x_hi, nbins):
+
+def _parse_mem_dma(tok):
+    """Parse a driver mem-DMA event name into (dir, ch, canon, word), or None if
+    `tok` is not a DMA_<dir>_<ch>_<KIND>_MEM name. `canon` is the EVENT_COLORS
+    category the KIND maps to (None when uncategorised, e.g. ERROR/idle); `word`
+    is the short label phrase ('stream starving')."""
+    m = _MEM_DMA_RE.match(tok)
+    if not m:
+        return None
+    direction, ch, kind = m.group(1).lower(), m.group(2), m.group(3)
+    for rx, canon, word in _MEM_KIND_RULES:
+        if rx.search(kind):
+            return direction, ch, canon, word
+    return direction, ch, None, kind.lower().replace("_", " ")
+
+
+def _parse_mem_lock(tok):
+    """Parse a driver lock event name into (idx, canon, word), or None if `tok`
+    is not a LOCK_<...>_MEM name. `idx` is the lock/group index phrase ('0',
+    'sel 3', or '' when absent); `canon` is the generic lock pulse token the
+    kind maps to (None when uncategorised, e.g. ERROR); `word` is the short
+    label phrase ('release')."""
+    m = _MEM_LOCK_RE.match(tok)
+    if not m:
+        return None
+    inner = m.group(1)
+    idx = ""
+    im = re.match(r"^SEL(\d+)", inner)
+    if im:
+        idx = "sel %s" % im.group(1)
+    else:
+        im = re.match(r"^(\d+)", inner)
+        if im:
+            idx = im.group(1)
+    for rx, canon, word in _LOCK_KIND_RULES:
+        if rx.search(inner):
+            return idx, canon, word
+    return idx, None, inner.lower().replace("_", " ")
+
+
+def _parse_port(tok):
+    """Parse a stream-switch port event name into (state, idx, canon), or None
+    if `tok` is not a PORT_<STATE>_<n>[_module] name. `canon` is the generic
+    PORT_*_0 colour slot (None for TLAST, which has no colour)."""
+    m = _PORT_RE.match(tok)
+    if not m:
+        return None
+    state, idx = m.group(1), m.group(2)
+    return state.lower(), idx, _PORT_STATE_CANON.get(state)
+
+
+def canon_token(tok):
+    """Reduce a raw slot token to the canonical EVENT_COLORS category it belongs
+    to. Generic / core / port tokens pass through unchanged; a driver-specific
+    name collapses to its generic equivalent
+    (DMA_S2MM_0_STREAM_STARVATION_MEM -> STREAM_STALL, LOCK_0_REL_MEM ->
+    LOCK_REL, PORT_IDLE_3_CORE -> PORT_IDLE_0). Uncategorised names return
+    unchanged (so they still read as grey 'other')."""
+    if tok in EVENT_COLORS:
+        return tok
+    parsed = _parse_mem_dma(tok)
+    if parsed and parsed[2]:
+        return parsed[2]
+    lk = _parse_mem_lock(tok)
+    if lk and lk[1]:
+        return lk[1]
+    p = _parse_port(tok)
+    if p and p[2]:
+        return p[2]
+    return tok
+
+
+def rasterize_lane(events, x_lo, x_hi, nbins, priority=None, surface_colors=None):
     """Per-pixel dominant-state colouring for one tile lane.
 
     Splits [x_lo, x_hi] into `nbins` equal bins (one per rendered pixel column)
@@ -89,10 +259,29 @@ def rasterize_lane(events, x_lo, x_hi, nbins):
     per-event rectangles). Empty bins produce no segment. Adjacent bins with the
     same colour are merged into one span.
 
+    `priority` is an optional high->low list of colour hexes that win a bin by
+    *presence* rather than duration: if any priority colour has non-zero time in
+    a bin, the highest-priority present one is chosen (ignoring duration); bins
+    with no priority colour fall back to plain max-duration. This keeps short but
+    important states visible -- e.g. a port lane's brief RUNNING bursts that the
+    long IDLE/STALLED background would otherwise drown out. With no `priority`
+    (the default) behaviour is pure duration dominance.
+
+    `surface_colors` is an optional set of colour hexes treated as a foreground
+    surface over the rest (the "background"): in any bin where at least one
+    surface colour is present, the surface colour with the most time wins
+    (ignoring non-surface background colours); bins with no surface colour fall
+    back to plain max-duration. This lets a port lane pick whichever of
+    RUNNING/STALLED occupied a pixel longer, showing it full-height over the IDLE
+    background, without one fixed colour always winning. `surface_colors` takes
+    precedence over `priority` when both are given.
+
     Returns [(seg_start_us, seg_end_us, color_hex), ...] left-to-right.
     """
     if nbins < 1 or x_hi <= x_lo or not events:
         return []
+    priority = priority or ()
+    surface_colors = surface_colors or frozenset()
     bw = (x_hi - x_lo) / nbins
     # Per-bin colour->overlap-duration accumulator.
     acc = [dict() for _ in range(nbins)]
@@ -113,12 +302,25 @@ def rasterize_lane(events, x_lo, x_hi, nbins):
             if overlap > 0.0:
                 acc[b][col] = acc[b].get(col, 0.0) + overlap
 
-    # Dominant colour per bin (None when empty), then merge adjacent runs.
+    # Winning colour per bin: a surface colour by max-duration-among-present,
+    # else a priority colour by presence, else plain max-duration.
+    # Then merge adjacent runs of the same colour.
     segs = []
     for b in range(nbins):
         if not acc[b]:
             continue
-        col = max(acc[b].items(), key=lambda kv: kv[1])[0]
+        col = None
+        present_surface = [(c, t) for c, t in acc[b].items()
+                           if c in surface_colors and t > 0.0]
+        if present_surface:
+            col = max(present_surface, key=lambda ct: ct[1])[0]
+        if col is None:
+            for pc in priority:
+                if acc[b].get(pc, 0.0) > 0.0:
+                    col = pc
+                    break
+        if col is None:
+            col = max(acc[b].items(), key=lambda kv: kv[1])[0]
         bin_lo = x_lo + b * bw
         bin_hi = bin_lo + bw
         if segs and segs[-1][2] == col and abs(segs[-1][1] - bin_lo) < bw * 1e-6:
@@ -128,12 +330,57 @@ def rasterize_lane(events, x_lo, x_hi, nbins):
     return segs
 
 
+def rasterize_lane_category(events, canon, x_lo, x_hi, nbins):
+    """Rasterise a lane using ONLY the tokens that canonicalise to `canon`.
+
+    Each event label may be a '|'-joined set of slot tokens (e.g.
+    "DMA_MM2S_0_STALLED_LOCK_MEM|DMA_MM2S_0_STREAM_BACKPRESSURE_MEM"). The mem
+    lane split renders one horizontal band per stall category, so a band must
+    count an interval's time ONLY when that interval carries a token of its
+    category -- a lock-stall band ignores the stream-stall token in the same
+    interval and vice versa. Intervals lacking the category contribute nothing.
+
+    Returns the same [(seg_start_us, seg_end_us, color_hex), ...] shape as
+    `rasterize_lane`, always coloured with EVENT_COLORS[canon].
+    """
+    masked = []
+    for ev in events:
+        toks = str(ev["event"]).split("|")
+        if any(canon_token(t) == canon for t in toks):
+            masked.append({"start_us": ev["start_us"], "end_us": ev["end_us"],
+                           "event": canon})
+    # A single-category masked lane has one colour, so plain duration dominance
+    # (no priority) merges adjacent bins into contiguous spans.
+    return rasterize_lane(masked, x_lo, x_hi, nbins)
+
+
+def widen_segments(segs, min_w):
+    """Floor each rasterised segment to `min_w` microseconds wide, centred on its
+    midpoint. A brief mem-DMA stall burst rasterises to a sub-pixel-thin span
+    that matplotlib anti-aliases into the background (the "bottom-half stream
+    back-pressure not illustrated" case: real stalls totalling a few us over a
+    several-hundred-us run vanish). Widening thin segments to a visible floor
+    keeps the burst on screen; already-wide segments pass through untouched.
+
+    Returns a new [(seg_start_us, seg_end_us, color_hex), ...] list.
+    """
+    out = []
+    for s, e, c in segs:
+        if e - s < min_w:
+            mid = (s + e) / 2.0
+            s, e = mid - min_w / 2.0, mid + min_w / 2.0
+        out.append((s, e, c))
+    return out
+
+
 def event_color(event):
     """Colour for an event label. A '|'-joined multi-event prefers a stall
     token over ACTIVE, so an ACTIVE|LOCK_STALL span shows the stall colour
     (a core can be ACTIVE while blocked on a lock/stream/memory). Falls back
-    to the first recognised token, else grey."""
-    toks = str(event).split("|")
+    to the first recognised token, else grey. Driver-specific mem-DMA names are
+    canonicalised first, so DMA_S2MM_0_STREAM_STARVATION_MEM colours as a
+    stream stall instead of falling through to grey 'other'."""
+    toks = [canon_token(t) for t in str(event).split("|")]
     for tok in toks:
         if tok in STALL_ORDER or tok in MEM_STALL_ORDER:
             return EVENT_COLORS[tok]
@@ -147,10 +394,114 @@ def pulse_tokens(event):
     """Return the pulse/edge tokens present in a (possibly '|'-joined) event
     label, in EVENT_COLORS declaration order, de-duplicated. Level/state tokens
     (ACTIVE, stalls, back-pressure) are excluded. Used to overlay a coloured
-    vertical marker per pulse -- a zero-width event no span rectangle can show."""
-    toks = set(str(event).split("|"))
+    vertical marker per pulse -- a zero-width event no span rectangle can show.
+    Driver-specific mem-DMA names are canonicalised first so a
+    DMA_S2MM_0_START_TASK_MEM still registers as a DMA_START pulse."""
+    toks = set(canon_token(t) for t in str(event).split("|"))
     return [name for name in EVENT_COLORS
             if name in PULSE_EVENTS and name in toks]
+
+
+# --------------------------------------------------------------------------
+# Human-readable event labels (legend + on-plot text). A lane's role/ident
+# (from host_aie_timeline.correlate) turns a raw slot into a port/DMA-aware
+# phrase: PORT_RUNNING_0 on a "south slave 0" port lane -> "south slave port 0
+# running"; STREAM_STALL on a "s2mm 0" mem lane -> "dma s2mm 0 stream starving".
+# --------------------------------------------------------------------------
+# Core-lane fallback names (no role/ident context).
+FRIENDLY = {
+    "ACTIVE": "AIE running",
+    "LOCK_STALL": "lock stall",
+    "STREAM_STALL": "stream stall",
+    "MEMORY_STALL": "memory stall",
+    "PORT_RUNNING_0": "port running",
+    "PORT_STALLED_0": "port stalled",
+    "PORT_IDLE_0": "port idle",
+    "DMA_START": "DMA start",
+    "DMA_FINISH": "DMA finished",
+    "DMA_STALL_LOCK": "DMA lock stall",
+    "MEM_BP": "mem back-pressure",
+    "LOCK_GRP": "lock group",
+    "LOCK_ACQ": "lock acquire",
+    "LOCK_REL": "lock release",
+}
+# Port-lane state word per PORT_*_0 slot.
+PORT_STATE = {"PORT_RUNNING_0": "running", "PORT_STALLED_0": "stalled",
+              "PORT_IDLE_0": "idle"}
+# Mem-DMA-lane event word per mem slot. STREAM_STALL reads "stream starving"
+# (the S2MM starvation domain term); the rest mirror FRIENDLY.
+MEM_WORD = {
+    "DMA_START": "start", "DMA_FINISH": "finished", "DMA_STALL_LOCK": "lock stall",
+    "STREAM_STALL": "stream starving", "MEM_BP": "back-pressure",
+    "LOCK_GRP": "lock group", "LOCK_ACQ": "lock acquire", "LOCK_REL": "lock release",
+}
+
+
+def _port_prefix(ident):
+    """'south slave 0' -> 'south slave port 0' (insert 'port' before the index)."""
+    parts = ident.split()
+    if len(parts) == 3:
+        return "%s %s port %s" % (parts[0], parts[1], parts[2])
+    return (ident + " port").strip() if ident else "port"
+
+
+def token_label(tok, role, ident):
+    """Enriched label for a single slot token given its lane's role/ident.
+    Port lanes -> '<port> <intf> port <num> <state>'; mem lanes -> 'dma <dir>
+    <ch> <word>'; core/host or missing context -> the FRIENDLY name.
+
+    A driver-specific mem-DMA or lock name carries its own direction/channel or
+    lock index, so it is parsed straight into 'dma <dir> <ch> <word>' /
+    'lock <idx> <word>' (e.g. DMA_S2MM_0_STREAM_STARVATION_MEM -> 'dma s2mm 0
+    stream starving', LOCK_SEL0_ACQ_GE_MEM -> 'lock sel 0 acquire'), independent
+    of the lane's ident. Port names at any index/module suffix fold into the
+    lane's port phrase via their canonical state."""
+    parsed = _parse_mem_dma(tok)
+    if parsed:
+        direction, ch, _canon, word = parsed
+        return "dma %s %s %s" % (direction, ch, word)
+    lk = _parse_mem_lock(tok)
+    if lk:
+        idx, _canon, word = lk
+        return ("lock %s %s" % (idx, word)) if idx else ("lock %s" % word)
+    if role == "port":
+        state_word = PORT_STATE.get(tok)
+        if state_word is None:
+            p = _parse_port(tok)
+            if p and p[2]:
+                state_word = PORT_STATE[p[2]]
+        if state_word is not None:
+            if ident:
+                return "%s %s" % (_port_prefix(ident), state_word)
+            return "port %s" % state_word
+    if role == "mem" and tok in MEM_WORD:
+        return "%s %s" % (("dma %s" % ident) if ident else "dma", MEM_WORD[tok])
+    return FRIENDLY.get(tok, tok)
+
+
+def _dominant_token(event):
+    """The token that colours a '|'-joined span (event_color priority): a stall
+    over ACTIVE/DMA_START, else the first recognised slot, else the first token.
+    The RAW token is returned (not its canonical form) so token_label can still
+    recover a mem-DMA name's direction/channel; canonicalisation is used only to
+    decide priority."""
+    toks = str(event).split("|")
+    for tok in toks:
+        c = canon_token(tok)
+        if c in STALL_ORDER or c in MEM_STALL_ORDER:
+            return tok
+    for tok in toks:
+        if canon_token(tok) in EVENT_COLORS:
+            return tok
+    return toks[0] if toks else ""
+
+
+def event_label(event, lane):
+    """On-plot label for a span: the dominant token rendered through the lane's
+    role/ident (falls back gracefully for lanes lacking role/ident)."""
+    lane = lane or {}
+    return token_label(_dominant_token(event), lane.get("role", ""),
+                       lane.get("ident", ""))
 
 
 # --------------------------------------------------------------------------
@@ -268,11 +619,10 @@ def _draw(ax, model, nbins=2000):
             else:
                 kw.update(facecolors=HOST_RUNNING_COLOR)
             ax.broken_barh([(x0, w)], (y0, row_h), **kw)
-            ax.text(x0 + w / 2.0, host_row, bar["label"], fontsize=6,
-                    color="black", va="center", ha="center", zorder=5)
+            # No on-bar text: the phase word is available via hover instead.
             ev = {"event": bar["label"], "start_us": bar["start_us"],
                   "end_us": bar["end_us"], "detail": bar["detail"]}
-            hover.append((x0, x0 + w, y0, y0 + row_h, ev, "host"))
+            hover.append((x0, x0 + w, y0, y0 + row_h, ev, None))
 
     # Tile lanes: one row each, drawn with per-pixel dominant-state colouring.
     # Each bin (~one screen column) is filled with the colour that occupies most
@@ -282,13 +632,110 @@ def _draw(ax, model, nbins=2000):
     for i, lane in enumerate(tiles):
         row = tile_row0 + i
         y0 = row - row_h / 2.0
-        for s_us, e_us, color in rasterize_lane(lane["events"], x_lo, x_hi, nbins):
-            ax.broken_barh([(s_us, e_us - s_us)], (y0, row_h),
-                           facecolors=color, edgecolors="none")
+        # A mem-DMA lane draws all three held-duration stall states (lock stall,
+        # memory back-pressure, stream stall) as rasterised bands over their real
+        # spans, and additionally overlays stream as per-event ticks. When several
+        # states are present in the same column the row is split top->bottom into
+        # one sub-band per present category (lock, mem-bp, stream) so concurrent
+        # stalls read as a vertical stack instead of one hiding the other. With a
+        # single category present the band fills the full row height.
+        # Every other lane fills the full row height with per-pixel dominant
+        # colouring; some prioritise brief bursts by presence (a port lane's
+        # RUNNING/STALLED over IDLE, a core lane's ACTIVE over the long stall
+        # background).
+        if lane.get("role") == "mem":
+            # Per-column adaptive stack of the mem-DMA stall states (lock stall,
+            # memory back-pressure, stream stall). A single BD can be blocked on
+            # all three at once, so any column paints every state active there,
+            # dividing the row height equally among them (MEM_LANE_STACK order,
+            # top->bottom). A lone state fills the full height (no white gap); two
+            # or three concurrent states stack. This is what makes the lock band,
+            # the purple mem-back-pressure band, and the red stream band all
+            # visible together (the "lock/mem-bp/50984-cyc not shown" and the long
+            # stream-starvation region drawn as blank white cases), instead of one
+            # full-height layer hiding the others.
+            bw = (x_hi - x_lo) / max(nbins, 1)
+            stream_canon = "STREAM_STALL"
+            # EVERY stall state on a mem-DMA lane is a HELD-duration band: lock
+            # stall, memory back-pressure AND stream stall (starvation /
+            # back-pressure) all carry real start->end spans and must fill their
+            # duration. A long stream-starvation region (tens of us) was
+            # previously drawn as a single tick, leaving its whole span blank
+            # ("illustration not correct"); it is now a full band, matching the
+            # s2mm.png ground truth (clean stacked bands, no per-event ticks).
+            # Per-column PRESENCE floor: lock / mem-bp widen by `pad` so a sub-us
+            # stall is still a visible run of columns. Stream is painted at its
+            # TRUE span (pad 0): with hundreds of nanosecond bursts, padding would
+            # inflate them into one lane-wide red blob, while genuinely long stream
+            # regions already span many columns on their own.
+            pad = max(int(round(MEM_MIN_SEG_FRAC * nbins / 2.0)), 1)
+            cat_pad = {c: pad for c in MEM_LANE_STACK}
+            cat_pad[stream_canon] = 0
+            pres = {c: bytearray(nbins) for c in MEM_LANE_STACK}
+            for ev in lane["events"]:
+                cats = set(canon_token(t) for t in str(ev["event"]).split("|"))
+                if not (cats & pres.keys()):
+                    continue
+                s = max(ev["start_us"], x_lo)
+                e = min(ev["end_us"], x_hi)
+                b0 = int(((s if e > s else max(ev["start_us"], x_lo)) - x_lo) / bw)
+                b1 = int((e - x_lo) / bw) if e > s else b0
+                for c in cats & pres.keys():
+                    p = cat_pad[c]
+                    a = pres[c]
+                    for b in range(max(b0 - p, 0), min(b1 + p, nbins - 1) + 1):
+                        a[b] = 1
+
+            def _active(b):
+                return tuple(c for c in MEM_LANE_STACK if pres[c][b])
+
+            # Held bands (lock, mem-bp, stream): draw one filled rect per
+            # contiguous run of columns with an identical active-set, each present
+            # state in its own equal horizontal slice (MEM_LANE_STACK order,
+            # top->bottom). A lone state fills the full row height; two or three
+            # concurrent states stack.
+            b = 0
+            while b < nbins:
+                act = _active(b)
+                if not act:
+                    b += 1
+                    continue
+                b2 = b
+                while b2 + 1 < nbins and _active(b2 + 1) == act:
+                    b2 += 1
+                seg = row_h / len(act)
+                x_start = x_lo + b * bw
+                width = (b2 - b + 1) * bw
+                for j, c in enumerate(act):
+                    ax.broken_barh([(x_start, width)], (y0 + j * seg, seg),
+                                   facecolors=EVENT_COLORS[c],
+                                   edgecolors="none")
+                b = b2 + 1
+        elif lane.get("role") == "port":
+            # One full-height row, coloured per pixel by whichever of RUNNING or
+            # STALLED occupied that pixel column longer (the "surface" over the
+            # IDLE background). Sequential stall-then-run bursts thus render as
+            # adjacent per-pixel marks -- no overlay, no fixed running priority --
+            # so a stall is shown wherever it out-lasted the run in its column.
+            surface = {EVENT_COLORS["PORT_RUNNING_0"],
+                       EVENT_COLORS["PORT_STALLED_0"]}
+            for s_us, e_us, color in rasterize_lane(
+                    lane["events"], x_lo, x_hi, nbins, surface_colors=surface):
+                ax.broken_barh([(s_us, e_us - s_us)], (y0, row_h),
+                               facecolors=color, edgecolors="none")
+        else:
+            prio = {"core": CORE_RASTER_PRIORITY}.get(lane.get("role"))
+            for s_us, e_us, color in rasterize_lane(lane["events"], x_lo, x_hi, nbins, prio):
+                ax.broken_barh([(s_us, e_us - s_us)], (y0, row_h),
+                               facecolors=color, edgecolors="none")
         for ev in lane["events"]:
             x0 = ev["start_us"]
-            x1 = x0 + max(ev["end_us"] - ev["start_us"], 0.0)
-            hover.append((x0, x1, y0, y0 + row_h, ev, lane["name"]))
+            w = max(ev["end_us"] - ev["start_us"], 0.0)
+            x1 = x0 + w
+            hover.append((x0, x1, y0, y0 + row_h, ev, lane))
+            # No on-plot bar text: the port/DMA-aware label is available via the
+            # legend (per event type) and hover (per span) instead of overlaying
+            # the bars, which crowded narrow spans and long driver names.
             # Overlay each pulse/edge token as its own coloured vertical marker
             # at the event's start. A single-cycle DMA_FINISH (lone or riding a
             # stall label) is invisible as a span; the line makes it show. When
@@ -305,8 +752,12 @@ def _draw(ax, model, nbins=2000):
                     if mk:
                         # Point marker at the (visual) top of the line; the axis
                         # is inverted so the smaller y sits highest on screen.
+                        # zorder 9 keeps the glyph ABOVE the stream-stall ticks
+                        # (zorder 8): a DMA_FINISH that coincides with a back-
+                        # pressure event would otherwise be hidden under the red
+                        # tick, so the glyph must poke out on top to stay visible.
                         ax.plot([x0], [ya], marker=mk, color=col, markersize=5,
-                                linestyle="none", zorder=7)
+                                linestyle="none", zorder=9)
 
     # Light dashed vertical guides at each host phase boundary, across all rows.
     if hl is not None and n_rows > 0:
@@ -316,8 +767,8 @@ def _draw(ax, model, nbins=2000):
             x = ev["start_us"]
             ax.plot([x, x], [ybot, ytop], linestyle="--", linewidth=0.6,
                     color=HOST_LINE_COLOR, alpha=0.35, zorder=0)
-            ax.text(x, ybot, ev["event"], rotation=90, fontsize=5,
-                    color=HOST_LINE_COLOR, va="top", ha="center", alpha=0.8)
+            # No phase-name text at the guide: the dashed line marks the boundary;
+            # the phase word is available via the host-bar hover.
 
     ax.set_yticks(range(n_rows))
     ax.set_yticklabels(row_names)
@@ -346,35 +797,36 @@ def _add_legend(ax, model):
         if any(b["waiting"] for b in bars):
             handles.append(Patch(facecolor=HOST_WAIT_COLOR, edgecolor="black",
                                  hatch="//", label="host waiting (AIE)"))
-    present = set()
+    # One legend entry per distinct enriched LABEL present across the tile lanes,
+    # so the same slot on different lanes reads differently ("stream stall" on a
+    # core lane vs. "dma s2mm 0 stream starving" on a mem lane, "south slave port
+    # 0 running" on a port lane). Ordered by the token's EVENT_COLORS index so
+    # related states group together; deduped by label.
+    order = {name: i for i, name in enumerate(EVENT_COLORS)}
+    seen = {}  # label -> (order_index, color_hex, pulse_marker)
+    other = False
     for lane in tile_lanes(model):
+        role = lane.get("role", "")
+        ident = lane.get("ident", "")
         for ev in lane["events"]:
-            present.add(ev["event"])
-    friendly = {
-        "ACTIVE": "AIE running",
-        "PORT_RUNNING_0": "port running",
-        "PORT_STALLED_0": "port stalled",
-        "PORT_IDLE_0": "port idle",
-        "DMA_START": "DMA start",
-        "DMA_FINISH": "DMA finished",
-        "DMA_STALL_LOCK": "DMA lock stall",
-        "MEM_BP": "mem back-pressure",
-        "LOCK_GRP": "lock group",
-        "LOCK_ACQ": "lock acquire",
-        "LOCK_REL": "lock release",
-    }
-    for name, col in EVENT_COLORS.items():
-        if any(name in p.split("|") for p in present):
-            label = friendly.get(name, name)
-            mk = PULSE_MARKERS.get(name)
-            if mk:
-                # Match the on-plot look: a coloured line + its point marker so
-                # the DMA-start swatch reads the same as the drawn event.
-                handles.append(Line2D([0], [0], color=col, marker=mk,
-                                      linestyle="-", markersize=6, label=label))
-            else:
-                handles.append(Patch(facecolor=col, edgecolor="black", label=label))
-    if any(not set(p.split("|")) & set(EVENT_COLORS) for p in present):
+            for tok in str(ev["event"]).split("|"):
+                canon = canon_token(tok)
+                if canon in EVENT_COLORS:
+                    label = token_label(tok, role, ident)
+                    if label not in seen:
+                        seen[label] = (order[canon], EVENT_COLORS[canon],
+                                       PULSE_MARKERS.get(canon))
+                else:
+                    other = True
+    for label, (_, col, mk) in sorted(seen.items(), key=lambda kv: kv[1][0]):
+        if mk:
+            # Match the on-plot look: a coloured line + its point marker so
+            # the DMA-start swatch reads the same as the drawn event.
+            handles.append(Line2D([0], [0], color=col, marker=mk,
+                                  linestyle="-", markersize=6, label=label))
+        else:
+            handles.append(Patch(facecolor=col, edgecolor="black", label=label))
+    if other:
         handles.append(Patch(facecolor=OTHER_COLOR, edgecolor="black", label="other"))
     if handles:
         # Anchor the legend OUTSIDE the axes on the right so its colour swatches
@@ -416,9 +868,14 @@ def _attach_hover(fig, ax, hover):
                 fig.canvas.draw_idle()
             return
         ev, lane = hit
+        # `lane` is the lane dict for tile rows, None for the host lane. Show the
+        # enriched label (canonicalised DMA name -> "dma s2mm 0 stream starving")
+        # alongside the raw event, since the bars no longer carry on-plot text.
+        lane_name = lane["name"] if lane else "host"
+        friendly = event_label(ev["event"], lane) if lane else ev["event"]
         ann.xy = (event.xdata, event.ydata)
         ann.set_text("%s / %s\n%.3f .. %.3f us\n%s" % (
-            lane, ev["event"], ev["start_us"], ev["end_us"], ev.get("detail", "")))
+            lane_name, friendly, ev["start_us"], ev["end_us"], ev.get("detail", "")))
         ann.set_visible(True)
         fig.canvas.draw_idle()
 

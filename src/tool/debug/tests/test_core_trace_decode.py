@@ -48,6 +48,17 @@ def _extract_c_decoder(src):
     assert mm, "s_mem_trace_slot_name[8] table not found in aie_runtime.c"
     mem_tbl = mm.group(0)
 
+    # The profile dump appends each slot's physical HW event id from two parallel
+    # event-value tables. Both are now filled at trace-setup time (device-only),
+    # so their declarations are plain uninitialized arrays; the harness never runs
+    # setup, so they stay zero and the dump prints "{event value 0:...}".
+    ce = re.search(r"static uint16_t s_core_trace_slot_event\[8\][^;]*;", src)
+    assert ce, "s_core_trace_slot_event[8] table not found in aie_runtime.c"
+    core_evt_tbl = ce.group(0)
+    me = re.search(r"static uint16_t s_mem_trace_slot_event\[8\][^;]*;", src)
+    assert me, "s_mem_trace_slot_event[8] table not found in aie_runtime.c"
+    mem_evt_tbl = me.group(0)
+
     start = src.index("#define XAIE_TRACE_SYNC_CYCLES")
     # Stop right after the trace-profile dump: the declarative-session code that
     # follows pulls in board headers (xtime_l.h / xiltimer.h) that cannot be
@@ -56,13 +67,22 @@ def _extract_c_decoder(src):
     end = src.rindex("/*", start, end)  # back up to that comment block's opener
     block = src[start:end].rstrip()
     assert "__Runtime_core_trace_decode" in block, "decoder body not captured"
-    return slot_tbl, mem_tbl, block
+    return slot_tbl, mem_tbl, core_evt_tbl, mem_evt_tbl, block
 
 
 # Minimal shim for the types the profile path references. The real defs live in
 # aie_runtime.h (which pulls in xaiengine.h and cannot be included standalone);
 # only the fields the extracted code touches matter here. Must match the header.
 _PROFILE_SHIM = r"""
+/* The event-value tables (s_core/s_mem_trace_slot_event) are filled on-device at
+ * trace setup via XAie_EventLogicalToPhysicalConv, which the standalone harness
+ * never runs -- so they stay zero here and the dump prints "{event value 0:..}".
+ * The mem-module dynamic-name table is likewise populated on-device from
+ * XAie_EventGetString; NULL here, so the dump falls back to the generic
+ * s_mem_trace_slot_name labels. Declared here because its declaration in
+ * aie_runtime.c lives outside the extracted decoder region. */
+static const char *s_mem_trace_slot_dynname[8];
+
 typedef struct { uint8_t Col, Row; } XAie_LocType;
 
 typedef struct {
@@ -154,10 +174,11 @@ def _build_harness():
         return None
     with open(_RUNTIME_C) as f:
         src = f.read()
-    slot_tbl, mem_tbl, block = _extract_c_decoder(src)
+    slot_tbl, mem_tbl, core_evt_tbl, mem_evt_tbl, block = _extract_c_decoder(src)
     prog = ("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n"
             "#include <string.h>\n\n"
-            + _PROFILE_SHIM + "\n" + slot_tbl + "\n" + mem_tbl + "\n\n" + block + "\n" + _HARNESS_MAIN)
+            + _PROFILE_SHIM + "\n" + slot_tbl + "\n" + mem_tbl + "\n"
+            + core_evt_tbl + "\n" + mem_evt_tbl + "\n\n" + block + "\n" + _HARNESS_MAIN)
 
     d = tempfile.mkdtemp(prefix="ctd_ut_")
     cpath = os.path.join(d, "harness.c")
@@ -364,13 +385,16 @@ def raw_intervals(text):
 
 
 # Profile dump interval line:
-#   "[TIMESYNC] trace tile=<c>,<r> [stream=<tag> ]<start>[ -- <end>]  <events>[  (<N> cyc)]".
+#   "[TIMESYNC] trace tile=<c>,<r> [stream=<tag> ]<start>[ -- <end>]  <events>[{event value ...}][  (<N> cyc)]".
 # The optional "stream=<tag>" marks the mem-module DMA stream (pkt id 2); it is
-# non-capturing here so core lines keep their 5-group layout. The
+# non-capturing here so core lines keep their 5-group layout. The trailing
+# "{event value v1:v2:...}" carries each set slot's raw XAie event value and is
+# stripped (non-capturing) so the names group stays clean. The
 # "[TIMESYNC] trace tile=c,r words=N" header has "words=" after the tile, so it
 # never matches this interval regex.
 _PROF = re.compile(
-    r"^\[TIMESYNC\] trace tile=(\d+),(\d+) (?:stream=\w+ )?(\d+)(?:\s+--\s+(\d+))?  (\S+?)(?:  \(\d+ cyc\))?$")
+    r"^\[TIMESYNC\] trace tile=(\d+),(\d+) (?:stream=\w+ )?(\d+)(?:\s+--\s+(\d+))?  "
+    r"(\S+?)(?:\{event value [^}]*\})?(?:  \(\d+ cyc\))?$")
 
 
 def profile_intervals(text):
@@ -447,9 +471,11 @@ def _check(words, golden):
 def test_extract_regions_present():
     with open(_RUNTIME_C) as f:
         src = f.read()
-    slot_tbl, mem_tbl, block = _extract_c_decoder(src)
+    slot_tbl, mem_tbl, core_evt_tbl, mem_evt_tbl, block = _extract_c_decoder(src)
     assert "ACTIVE" in slot_tbl and "MEMORY_STALL" in slot_tbl
     assert "DMA_START" in mem_tbl and "LOCK_REL" in mem_tbl
+    assert "s_core_trace_slot_event" in core_evt_tbl
+    assert "s_mem_trace_slot_event" in mem_evt_tbl
     assert "__core_trace_bits" in block
     assert "void __Runtime_core_trace_decode(" in block
     assert "__core_trace_table_for_id" in block  # demux by pkt id
@@ -691,13 +717,32 @@ def test_profile_dump_tags_mem_stream():
     lines = [l for l in out.splitlines() if l.startswith("[TIMESYNC] trace tile=")]
     core_lines = [l for l in lines if "stream=" not in l]
     mem_lines = [l for l in lines if "stream=mem " in l]
-    assert any(l.endswith(" 1010  ACTIVE") for l in core_lines), core_lines
-    assert any(l.endswith(" DMA_START") for l in mem_lines), mem_lines
-    assert any(l.endswith(" STREAM_STALL") for l in mem_lines), mem_lines
-    # The dump still parses into intervals (stream tag is non-capturing there).
+    # Each set slot now carries an "{event value ...}" suffix after the names.
+    assert any("1010  ACTIVE{event value" in l for l in core_lines), core_lines
+    assert any("DMA_START{event value" in l for l in mem_lines), mem_lines
+    assert any("STREAM_STALL{event value" in l for l in mem_lines), mem_lines
+    # The dump still parses into intervals (stream tag + suffix are non-capturing).
     ivs = [(s, e, nm) for _, _, s, e, nm in profile_intervals(out)]
     assert (2005, 2005, "DMA_START") in ivs, ivs
     assert (2007, 2007, "STREAM_STALL") in ivs, ivs
+
+
+def test_profile_dump_appends_event_value_suffix():
+    # Every set slot's raw AIE event value is appended after the joined names as
+    # "{event value v1:v2:...}" in slot order. A core interval covering slots 0
+    # and 2 (ACTIVE|STREAM_STALL) yields the two core event values, colon-joined.
+    _skip_if_no_cc()
+    core = pack(start(1000), multiple(0x05, 10), header=PKT_HDR, terminate=False)
+    words = core + [0] * 8
+    out = run_c_profile(words)
+    lines = [l for l in out.splitlines() if l.startswith("[TIMESYNC] trace tile=")]
+    ev = [l for l in lines if "ACTIVE" in l and "STREAM_STALL" in l]
+    assert ev, lines
+    m = re.search(r"\{event value ([0-9:]+)\}", ev[0])
+    assert m, ev[0]
+    vals = m.group(1).split(":")
+    assert len(vals) == 2, ev[0]  # two set slots -> two colon-joined values
+    assert all(v.isdigit() for v in vals), ev[0]
 
 
 # --------------------------------------------------------------------------

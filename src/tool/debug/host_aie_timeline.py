@@ -63,11 +63,17 @@ _TS = re.compile(r"^\[TIMESYNC\]\s+(.*)$")
 #   "trace tile=4,4 1010  ACTIVE"                        (core, 1-cycle event)
 #   "trace tile=4,4 1010 -- 1012  ACTIVE|LOCK  (3 cyc)"  (core interval)
 #   "trace tile=4,4 stream=mem 2005  DMA_START"          (mem-module DMA stream)
+#   "trace tile=0,3 stream=mem 5 -- 7  DMA_MM2S_0_STALLED_LOCK_MEM"
+#           "{event value 41:43}  (3 cyc)"               (with HW event-value tag)
 # The optional "stream=<tag>" marks the mem-module DMA trace (pkt id 2); it is
-# absent on core lines (pkt id 1). The "trace tile=4,4 words=N" header has
-# "words=" (not "stream="/a digit) after the tile, so it never matches here.
+# absent on core lines (pkt id 1). The names group is followed by an optional
+# "{event value v1:v2:...}" suffix carrying each set slot's physical HW event id
+# -- stripped (non-capturing) so the names group stays clean. The
+# "trace tile=4,4 words=N" header has "words=" (not "stream="/a digit) after the
+# tile, so it never matches here.
 _TRACE_IV = re.compile(
-    r"^trace tile=(\d+),(\d+) (?:stream=(\w+) )?(\d+)(?:\s+--\s+(\d+))?\s+(\S+?)(?:\s+\(\d+ cyc\))?$")
+    r"^trace tile=(\d+),(\d+) (?:stream=(\w+) )?(\d+)(?:\s+--\s+(\d+))?\s+(\S+?)"
+    r"(?:\{event value [^}]*\})?(?:\s+\(\d+ cyc\))?$")
 
 # The runtime prints one core_trace_stream_json line per traced tile carrying the
 # monitored event-port selection, e.g.
@@ -76,6 +82,18 @@ _TRACE_IV = re.compile(
 # whose PORT_*_0 IDLE/RUNNING/STALLED state feeds the port lane. Parsed to name
 # that lane after the physical port ("tile 0,3 south slave 0").
 _STREAM_JSON = re.compile(r"core_trace_stream_json:\s*(\{.*\})\s*$")
+
+# The runtime prints one [TRACESTREAMCONFIG] line per configured trace stream.
+# The mem-module DMA stream (pkt_id=2) carries the watched tile-DMA selection as
+# "dma=<DIR>:<CH>" (DIR=S2MM/MM2S), e.g.
+#   [TRACESTREAMCONFIG] src_tile=(0,3) ... pkt_id=2 ... dma=MM2S:0 slots=...
+# Parsed to name the mem lane after its DMA ("tile 0,3 dma mm2s 0"). The core
+# stream (pkt_id=1) also has a dma= field but names the core/port lanes, so only
+# pkt_id=2 lines seed the mem-DMA map. pkt_id and dma appear in either order
+# across the two lines, so match the tile prefix then search each field.
+_TRACE_CFG = re.compile(r"^\[TRACESTREAMCONFIG\].*?src_tile=\((\d+),(\d+)\)")
+_CFG_PKT = re.compile(r"pkt_id=(\d+)")
+_CFG_DMA = re.compile(r"dma=(\w+):(\d+)")
 
 
 def _tile_key(s):
@@ -121,6 +139,9 @@ def parse_timesync(text):
                     absolute-AIE-cycle intervals, in emission order
         evt_ports : {(c,r): "south slave 0"}  monitored port-lane suffix, from
                     the core_trace_stream_json evt_port field (may be empty)
+        mem_dmas  : {(c,r): "mm2s 0"}  watched tile-DMA (dir+channel) for the
+                    mem-module trace stream, from the pkt_id=2 [TRACESTREAMCONFIG]
+                    line (may be empty)
     """
     cps = None
     anchors = {0: {"host": None, "tiles": {}}, 1: {"host": None, "tiles": {}}}
@@ -128,6 +149,7 @@ def parse_timesync(text):
     aiehz = {}
     traces = {}
     evt_ports = {}
+    mem_dmas = {}
 
     for line in text.splitlines():
         # The evt_port descriptor rides a plain [aie_runtime] line, not a
@@ -140,6 +162,16 @@ def parse_timesync(text):
                 ep = None
             if ep:
                 evt_ports[ep[0]] = ep[1]
+            continue
+        # The mem-module DMA stream config also rides a plain (non-TIMESYNC)
+        # line; capture its dma=<dir>:<ch> for pkt_id=2 to name the mem lane.
+        cfg = _TRACE_CFG.match(line)
+        if cfg:
+            pk = _CFG_PKT.search(line)
+            dm = _CFG_DMA.search(line)
+            if pk and dm and pk.group(1) == "2":
+                mem_dmas[(int(cfg.group(1)), int(cfg.group(2)))] = \
+                    "%s %s" % (dm.group(1).lower(), dm.group(2))
             continue
         m = _TS.match(line.strip())
         if not m:
@@ -175,7 +207,8 @@ def parse_timesync(text):
             # else: "trace tile=4,4 words=N" header -- count only, ignored.
 
     return {"cps": cps, "anchors": anchors, "hostevts": hostevts,
-            "aiehz": aiehz, "traces": traces, "evt_ports": evt_ports}
+            "aiehz": aiehz, "traces": traces, "evt_ports": evt_ports,
+            "mem_dmas": mem_dmas}
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +260,13 @@ def correlate(ts):
         (end_cycle+1) so a single-cycle event has non-zero duration.
       - "tile C,R <port> <intf> <num>": the monitored stream-switch port's
         PORT_* spans (falls back to "tile C,R port" without an evt_port record).
+      - "tile C,R dma <dir> <ch>": the mem-module DMA stream's spans (falls back
+        to "tile C,R mem dma" without a pkt_id=2 [TRACESTREAMCONFIG] record).
+
+    Each lane also carries "role" (host/core/port/mem) and "ident" (the
+    port suffix "south slave 0" or the DMA "mm2s 0"), so the renderer can build
+    direction/channel-aware labels ("south slave port 0 running", "dma mm2s 0
+    stream starving") without re-parsing the lane name.
     """
     cps = ts["cps"]
     if cps is None:
@@ -253,7 +293,7 @@ def correlate(ts):
         host_events.append({"event": "iter%d.%s" % (it, phase),
                             "start_us": us, "end_us": us,
                             "detail": "iter=%d phase=%s host=%d" % (it, phase, counts)})
-    lanes.append({"name": "host", "events": host_events})
+    lanes.append({"name": "host", "events": host_events, "role": "host", "ident": ""})
 
     # Per traced tile: a core lane ("tile C,R core") and, directly beneath it, a
     # port lane. The decoder combines core-state and stream-switch PORT_* events
@@ -263,6 +303,7 @@ def correlate(ts):
     # the evt_port descriptor is present, else "tile C,R port". A lane with no
     # events across the whole run is dropped, so port-less captures still render.
     evt_ports = ts.get("evt_ports", {})
+    mem_dmas = ts.get("mem_dmas", {})
     for tile in sorted(ts["traces"]):
         fit = fits.get(tile)
         intervals = ts["traces"][tile]
@@ -285,13 +326,19 @@ def correlate(ts):
                     core_events.append({"event": "|".join(core_names), **span})
                 if port_names:
                     port_events.append({"event": "|".join(port_names), **span})
-        lanes.append({"name": "tile %d,%d core" % tile, "events": core_events})
+        lanes.append({"name": "tile %d,%d core" % tile, "events": core_events,
+                      "role": "core", "ident": ""})
         if port_events:
-            suffix = evt_ports.get(tile, "port")
+            ident = evt_ports.get(tile, "")
+            suffix = ident if ident else "port"
             lanes.append({"name": "tile %d,%d %s" % (tile[0], tile[1], suffix),
-                          "events": port_events})
+                          "events": port_events, "role": "port", "ident": ident})
         if mem_events:
-            lanes.append({"name": "tile %d,%d mem dma" % tile, "events": mem_events})
+            ident = mem_dmas.get(tile, "")
+            name = ("tile %d,%d dma %s" % (tile[0], tile[1], ident)
+                    if ident else "tile %d,%d mem dma" % tile)
+            lanes.append({"name": name, "events": mem_events,
+                          "role": "mem", "ident": ident})
 
     meta = {"cps": cps, "counts_per_us": cps / 1e6,
             "host_span_us": host_counts_to_us(h1, cps, h0),
@@ -357,6 +404,11 @@ def _self_test():
         '[aie_runtime] core_trace_stream_json: {"src_tile":[4,4],'
         '"evt_port":{"tile":[4,4],"port":"south","intf":"slave","num":0},'
         '"slots":["ACTIVE"],"hops":[]}',
+        # mem-module DMA stream config (pkt_id=2): names the mem lane after its
+        # watched tile-DMA ("dma s2mm 0"). pkt_id and dma order differ per line.
+        "[TRACESTREAMCONFIG] src_tile=(4,4) in_port=TRACE:1 out_port=SOUTH(shared) "
+        "pkt_id=2 slot=0 mask=0x1F msel=1 arbiter=1 dma=S2MM:0 "
+        "slots=DMA_START,DMA_FINISH,DMA_STALL_LOCK,STREAM_STALL,MEM_BP,LOCK_GRP,LOCK_ACQ,LOCK_REL",
         "[TIMESYNC] trace tile=4,4 words=16",
         "[TIMESYNC] trace tile=4,4 10  ACTIVE",
         "[TIMESYNC] trace tile=4,4 108 -- 112  STREAM_STALL  (5 cyc)",
@@ -372,6 +424,7 @@ def _self_test():
     ts = parse_timesync(block)
     assert ts["cps"] == 1000000
     assert ts["evt_ports"] == {(4, 4): "south slave 0"}, ts["evt_ports"]
+    assert ts["mem_dmas"] == {(4, 4): "s2mm 0"}, ts["mem_dmas"]
     assert ts["traces"][(4, 4)] == [
         (10, 10, ["ACTIVE"], "core"), (108, 112, ["STREAM_STALL"], "core"),
         (200, 209, ["ACTIVE", "PORT_RUNNING_0"], "core"), (210, 219, ["PORT_IDLE_0"], "core"),
@@ -399,11 +452,14 @@ def _self_test():
     assert names.index("tile 4,4 south slave 0") == names.index("tile 4,4 core") + 1, names
     # The mem-module DMA stream is its OWN lane; its STREAM_STALL (cyc 305) must
     # NOT leak into the core lane (which only holds the core STREAM_STALL @108).
-    mem = next(l for l in model["lanes"] if l["name"] == "tile 4,4 mem dma")
+    mem = next(l for l in model["lanes"] if l["name"] == "tile 4,4 dma s2mm 0")
+    assert mem["role"] == "mem" and mem["ident"] == "s2mm 0", mem
     mspans = {e["event"]: (e["start_us"], e["end_us"]) for e in mem["events"]}
     assert mspans == {"DMA_START": (300.0, 301.0),
                       "STREAM_STALL": (305.0, 310.0)}, mspans
     assert ("STREAM_STALL", 305.0, 310.0) not in spans, spans
+    # Lane role/ident metadata drives the renderer's enriched labels.
+    assert port["role"] == "port" and port["ident"] == "south slave 0", port
     print("self-test OK: host, AIE core, AIE port, and AIE mem-dma lanes on one us axis")
     print("  host events:", [(e["event"], e["start_us"]) for e in host["events"]])
     print("  tile 4,4 core:", [(e["event"], e["start_us"], e["end_us"]) for e in tile["events"]])
