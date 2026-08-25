@@ -976,8 +976,11 @@ struct RoutingmovedatabyioConvertdmap : public ConversionPattern {
         int row = createhwmesh.getRow();
         auto shape = createscheduletensor.getShape();
 
-        int tensor_x = shape[0].cast<mlir::IntegerAttr>().getInt();
-        int tensor_y = shape[1].cast<mlir::IntegerAttr>().getInt();
+        // These are only used for the debug print below; read them rank-aware so
+        // a 1-D schedule tensor (shape=[N], as the TVM frontend emits) does not
+        // read shape[1] out of bounds (garbage attr -> getInt/type-storage crash).
+        int tensor_x = shape.size() > 0 ? shape[0].cast<mlir::IntegerAttr>().getInt() : 0;
+        int tensor_y = shape.size() > 1 ? shape[1].cast<mlir::IntegerAttr>().getInt() : 1;
 
         llvm::StringRef split_axis = partitionmesh.getSplitaxis();
         llvm::StringRef hw_axis_owner = partitiontensor.getPartition().getHwAxisOwner();

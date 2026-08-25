@@ -540,12 +540,14 @@ struct ExtractDataConversion : public OpConversionPattern<routing::extract_data>
         auto inputShape = inputType.getShape();
         auto resultShape = resultType.getShape();
 
-        // Support N-D tensors (>=2). The 3D conv OUTPUT <H x W x C> flows through
-        // here as a genuine rank-3 tensor; matmul/2D paths stay rank-2. The split
-        // happens along exactly ONE dim (the mesh-row split); all other dims take
-        // their full extent.
-        if (inputShape.size() != resultShape.size() || inputShape.size() < 2) {
-            return op.emitError("ExtractDataConversion: input and result must have equal rank >= 2");
+        // Support N-D tensors (>=1). The 3D conv OUTPUT <H x W x C> flows through
+        // here as a genuine rank-3 tensor; matmul/2D paths stay rank-2; the TVM
+        // frontend emits flat rank-1 int8 buffers (tensor<Nxi8>). The split happens
+        // along exactly ONE dim (the mesh-row split); all other dims take their
+        // full extent. The offsets/sizes/strides below are sized to `rank`, so the
+        // slicing math is rank-generic.
+        if (inputShape.size() != resultShape.size() || inputShape.size() < 1) {
+            return op.emitError("ExtractDataConversion: input and result must have equal rank >= 1");
         }
         const int64_t rank = (int64_t)inputShape.size();
 

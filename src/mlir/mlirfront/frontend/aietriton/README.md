@@ -291,4 +291,7 @@ cd src/mlir/mlirfront/frontend && python3 -m aietriton.aie_pass.test_ast_to_c --
 
 - `architecture.md` — full stage-by-stage lowering trace and Triton↔C tables.
 - `../rcom/README.md` — the sibling ROCm/HIP front end (pipeline-external).
+- `../tvm/README.md`, `doc/design/tvm_frontend.md` — the TVM ResNet-18 front end,
+  which **reuses this package's `_aietriton_core`** to emit a full CNN as one
+  `run_aie_pipeline` call per layer (a third frontend into `TilingLinalgPipeline`).
 - `doc/tilinglinalg.md`, `doc/lowering.md` — the C++ pipeline this front end drives.

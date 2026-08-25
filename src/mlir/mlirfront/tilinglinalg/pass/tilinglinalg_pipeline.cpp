@@ -33,6 +33,7 @@
 #include "dmaphopmanager.h"
 #include "dfschedulemanager.h"
 #include "dfscheblueprintmanager.h"
+#include "aiegraphmanager.h"
 
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -190,6 +191,8 @@ void TilingLinalgPipeline::registerDialects(mlir::MLIRContext &ctx) {
     dmaphoptest.loaddialect(&ctx);
     dfscheduletest.loaddialect(&ctx);
     dfscheblueprinttest.loaddialect(&ctx);
+    // High-level graph dialect (TVM/Relay -> aiegraph -> per-op routing).
+    aiegraphmanager::loaddialect(&ctx);
 
     ctx.getOrLoadDialect<arith::ArithDialect>();
     ctx.getOrLoadDialect<mlir::func::FuncDialect>();
