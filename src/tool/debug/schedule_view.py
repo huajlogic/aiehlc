@@ -9446,14 +9446,30 @@ function runScanNow(setMsg){
   };
 })();
 
+// Keep the console DOM bounded so a long AIE trace run (multi-MB of
+// STREAM_STALL/DMA_FINISH lines) doesn't jank the tab with an ever-growing
+// textContent. Trim from the front, keeping the most recent MAX lines.
+function capConsole(con){
+  const MAX = 5000;
+  const txt = con.textContent;
+  if (txt.length < 400000) return;   // cheap: only split when it's large enough
+  const nl = txt.split('\n');
+  if (nl.length > MAX) con.textContent = nl.slice(nl.length - MAX).join('\n');
+}
+
 function pollLog(){
-  // Guard against overlapping tails so a slow response can't pile up.
+  // Guard against overlapping tails so a slow response can't pile up. A stuck
+  // fetch can no longer wedge the tail forever: an AbortController aborts it
+  // after a timeout, so `.finally()` always runs and clears logBusy — the next
+  // 1s tick then retries instead of early-returning forever.
   if (LIVE.logBusy) return;
   LIVE.logBusy = true;
-  api('/applog?offset='+LIVE.logoff).then(r => {
+  const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const abTimer = ctrl ? setTimeout(() => ctrl.abort(), 8000) : null;
+  api('/applog?offset='+LIVE.logoff, ctrl ? {signal: ctrl.signal} : undefined).then(r => {
     const con = document.getElementById('console');
     const follow = logFollowing(con);
-    if (r.data){ con.textContent += r.data; }
+    if (r.data){ con.textContent += r.data; capConsole(con); }
     // TIMESYNC-idle trigger: the first [TIMESYNC] line arms a 5s "quiet" window;
     // each new TIMESYNC-bearing chunk re-arms it. When a full 5 seconds pass with
     // no further [TIMESYNC] output the block is complete → render the timeline.
@@ -9495,11 +9511,20 @@ function pollLog(){
       triggerTimeline(true);   // safety net; gated by tsSeen, dedups via tlDone.
     }
   }).catch(() => {
-    // Daemon went offline mid-run. The run process is no longer observable, so
-    // unblock all aiedbg features — JTAG is not held by anything we can see.
-    if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
-    setDebugEnabled(true);
-  }).finally(() => { LIVE.logBusy = false; });
+    // Transient tail failure: a slow/interrupted/aborted poll or a brief daemon
+    // hiccup over a remote link. While the run is still ours, DO NOT tear down
+    // the tail — one bad poll must not permanently freeze the console. Note it
+    // and let the next 1s tick retry; the tail is only stopped on a confirmed
+    // `running === false` response in the then-branch above.
+    if (LIVE.runOwned){
+      setRunStatus('run: tail retrying…');
+    } else {
+      // Not a live run we own (adopted run already ended, or never running) →
+      // the daemon is gone and nothing holds JTAG, so unblock aiedbg features.
+      if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
+      setDebugEnabled(true);
+    }
+  }).finally(() => { if (abTimer) clearTimeout(abTimer); LIVE.logBusy = false; });
 }
 document.getElementById('runbtn').onclick = () => {
   const dev = deviceSel ? deviceSel.value : '';
