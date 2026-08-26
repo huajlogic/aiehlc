@@ -590,6 +590,49 @@ def _pick_backend(save, want_window):
     return True, None
 
 
+# Fraction of the run span a tile event may extend past the host window before
+# it is treated as a garbled trace-decode outlier rather than real activity.
+_XRANGE_MARGIN_FRAC = 1.0
+# Percentile clip used only when there is no host lane to anchor the axis.
+_XRANGE_CLIP_LO, _XRANGE_CLIP_HI = 0.01, 0.99
+
+
+def _robust_xrange(model):
+    """X-axis range that ignores stray trace-decode outliers.
+
+    A single garbled memory/DMA-trace packet can decode to a cycle far outside
+    the run (e.g. a stray event at -123620 us while the run spans 5900..6540 us).
+    Left unclamped, min()/max() stretch the axis over ~130000 us and squash every
+    lane into one column. The host lane is the ground-truth axis (its times come
+    straight from host counts, never from trace-cycle decode), so tile events are
+    kept only when they fall within `_XRANGE_MARGIN_FRAC` of the host span; the
+    outlier is clamped out. With no host lane, fall back to a wide percentile
+    clip so one point still can't dominate.
+
+    Returns (x_lo, x_hi)."""
+    all_x = [e["start_us"] for l in model["lanes"] for e in l["events"]] + \
+            [e["end_us"] for l in model["lanes"] for e in l["events"]]
+    if not all_x:
+        return 0.0, 1.0
+    host = host_lane(model)
+    if host is not None and host["events"]:
+        hx = [e["start_us"] for e in host["events"]] + \
+             [e["end_us"] for e in host["events"]]
+        h_lo, h_hi = min(hx), max(hx)
+        margin = max(h_hi - h_lo, 1.0) * _XRANGE_MARGIN_FRAC
+        lo_ok, hi_ok = h_lo - margin, h_hi + margin
+        kept = [x for x in all_x if lo_ok <= x <= hi_ok]
+        if kept:
+            return min(kept), max(kept)
+        return h_lo, h_hi
+    # No host lane: clip to a wide percentile so a lone outlier can't dominate.
+    xs = sorted(all_x)
+    n = len(xs)
+    lo = xs[int(_XRANGE_CLIP_LO * (n - 1))]
+    hi = xs[int(_XRANGE_CLIP_HI * (n - 1))]
+    return (lo, hi) if hi > lo else (xs[0], xs[-1])
+
+
 def _draw(ax, model, nbins=2000):
     """Draw all lanes onto ax as HORIZONTAL timelines on one us axis. Returns a
     hover index: a list of (x0, x1, y0, y1, event_dict, lane_name) tuples.
@@ -610,12 +653,11 @@ def _draw(ax, model, nbins=2000):
     row_h = 0.8
     hover = []  # (x0, x1, y0, y1, event, lane_name)
 
-    # Full x-range across every lane; tile lanes are rasterised into `nbins`
-    # columns over this range so per-pixel dominant colouring is stable.
-    all_x = [e["start_us"] for l in model["lanes"] for e in l["events"]] + \
-            [e["end_us"] for l in model["lanes"] for e in l["events"]]
-    x_lo = min(all_x) if all_x else 0.0
-    x_hi = max(all_x) if all_x else 1.0
+    # X-range across every lane, with stray trace-decode outliers clamped out so
+    # one garbled packet can't stretch the axis and squash the run to a line
+    # (see _robust_xrange). Tile lanes are rasterised into `nbins` columns over
+    # this range so per-pixel dominant colouring is stable.
+    x_lo, x_hi = _robust_xrange(model)
 
     # Host lane (row 0): one bar per gap between consecutive phase markers,
     # painted from a phase START to the NEXT phase START (the host records only
@@ -801,6 +843,11 @@ def _draw(ax, model, nbins=2000):
     ax.set_yticklabels(row_names)
     ax.set_ylim(-1.0, max(n_rows - 1 + 1.0, 1.0))
     ax.invert_yaxis()  # host on top, then tiles
+    # Pin the axis to the clamped range so a stray off-range event (host guide or
+    # per-event pulse marker drawn at its true position) can't re-expand it via
+    # matplotlib autoscale; out-of-range artists are simply clipped.
+    if x_hi > x_lo:
+        ax.set_xlim(x_lo, x_hi)
     ax.set_xlabel("time (us, t=0 at host anchor0)")
 
     meta = model.get("meta", {})
