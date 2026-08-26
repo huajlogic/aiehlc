@@ -35,6 +35,7 @@ import json
 import os
 import re
 import sys
+from collections import OrderedDict
 
 # --------------------------------------------------------------------------
 # Event-type -> colour. Slots 0..3 follow __Runtime_core_trace_setup.
@@ -543,9 +544,15 @@ def _parse_host_marker(event):
 def host_intervals(hl):
     """Turn the host lane's phase markers into horizontal bars, one per gap
     between consecutive markers. Each bar is a dict:
-        {start_us, end_us, phase, iter, waiting, label, detail}
-    'waiting' is True for the run->wait_done gap (host blocked in
-    XAie_CoreWaitForDone); every other gap is host-running work."""
+        {start_us, end_us, phase, iter, waiting, label, detail,
+         color, api, hostcc_line}
+    The bar spans from a phase's START marker to the NEXT phase's START (the host
+    records only starts, not API durations). 'waiting' is True for the
+    run->wait_done gap (host blocked in XAie_CoreWaitForDone); every other gap is
+    host-running work. 'color'/'api'/'hostcc_line' are carried through from the
+    leading marker when host_aie_timeline enriched it (colour-by-API + host.cc
+    line); they are None for a bare model (e.g. the synthetic self-test), which
+    then falls back to the running/waiting rendering."""
     if hl is None:
         return []
     evs = sorted(hl["events"], key=lambda e: e["start_us"])
@@ -562,6 +569,9 @@ def host_intervals(hl):
             "waiting": waiting,
             "label": ("wait" if waiting else phase),
             "detail": "%s -> %s" % (cur["event"], nxt["event"]),
+            "color": cur.get("color"),
+            "api": cur.get("api"),
+            "hostcc_line": cur.get("hostcc_line"),
         })
     return bars
 
@@ -607,18 +617,35 @@ def _draw(ax, model, nbins=2000):
     x_lo = min(all_x) if all_x else 0.0
     x_hi = max(all_x) if all_x else 1.0
 
-    # Host lane (row 0): running vs idle-waiting bars.
+    # Host lane (row 0): one bar per gap between consecutive phase markers,
+    # painted from a phase START to the NEXT phase START (the host records only
+    # starts, not API durations). When host_aie_timeline enriched the markers,
+    # the bar is COLOURED BY ITS HOST API (per-phase colour) and annotated with
+    # the host.cc:line that issued it; otherwise it falls back to the blue
+    # running / grey-hatched waiting rendering. Only iteration <=0 markers are
+    # annotated so a multi-iteration run does not stack duplicate labels.
     if hl is not None:
         y0 = host_row - row_h / 2.0
         for bar in host_intervals(hl):
             x0 = bar["start_us"]
             w = bar["end_us"] - bar["start_us"]
             kw = dict(edgecolors="black", linewidth=0.4)
-            if bar["waiting"]:
+            if bar.get("color"):
+                kw.update(facecolors=bar["color"])
+            elif bar["waiting"]:
                 kw.update(facecolors=HOST_WAIT_COLOR, hatch="//")
             else:
                 kw.update(facecolors=HOST_RUNNING_COLOR)
             ax.broken_barh([(x0, w)], (y0, row_h), **kw)
+            line = bar.get("hostcc_line")
+            if line is not None and bar.get("iter") in (None, -1, 0):
+                # Offset points are display-space (up on screen), independent of
+                # the inverted y-axis, so va="bottom" places the label just above
+                # the host row's top edge; bbox_inches="tight" keeps it visible.
+                ax.annotate("host.cc:%d" % line, xy=(x0, y0),
+                            xytext=(0, 6), textcoords="offset points",
+                            rotation=45, fontsize=6, ha="left", va="bottom",
+                            color="#333333", zorder=7)
             # No on-bar text: the phase word is available via hover instead.
             ev = {"event": bar["label"], "start_us": bar["start_us"],
                   "end_us": bar["end_us"], "detail": bar["detail"]}
@@ -787,16 +814,34 @@ def _add_legend(ax, model):
     from matplotlib.patches import Patch
     from matplotlib.lines import Line2D
     handles = []
-    # Host running/waiting bars, if a host lane is present.
+    # Host bars, if a host lane is present. When the markers are enriched
+    # (colour-by-API), one legend entry per distinct phase carries its API and
+    # host.cc line ("dma_start  (host.cc:710  startio (issue DMAs))"); otherwise
+    # fall back to the plain running / waiting swatches.
     hl = host_lane(model)
     if hl is not None:
         bars = host_intervals(hl)
-        if any(not b["waiting"] for b in bars):
-            handles.append(Patch(facecolor=HOST_RUNNING_COLOR, edgecolor="black",
-                                 label="host running"))
-        if any(b["waiting"] for b in bars):
-            handles.append(Patch(facecolor=HOST_WAIT_COLOR, edgecolor="black",
-                                 hatch="//", label="host waiting (AIE)"))
+        api_bars = [b for b in bars if b.get("color")]
+        if api_bars:
+            seen_phase = OrderedDict()
+            for b in api_bars:
+                ph = b.get("phase")
+                if ph in seen_phase:
+                    continue
+                api = b.get("api") or ph
+                line = b.get("hostcc_line")
+                lbl = ("%s  (host.cc:%d  %s)" % (ph, line, api)) if line is not None \
+                    else ("%s  (%s)" % (ph, api))
+                seen_phase[ph] = (b["color"], lbl)
+            for ph, (col, lbl) in seen_phase.items():
+                handles.append(Patch(facecolor=col, edgecolor="black", label=lbl))
+        else:
+            if any(not b["waiting"] for b in bars):
+                handles.append(Patch(facecolor=HOST_RUNNING_COLOR, edgecolor="black",
+                                     label="host running"))
+            if any(b["waiting"] for b in bars):
+                handles.append(Patch(facecolor=HOST_WAIT_COLOR, edgecolor="black",
+                                     hatch="//", label="host waiting (AIE)"))
     # One legend entry per distinct enriched LABEL present across the tile lanes,
     # so the same slot on different lanes reads differently ("stream stall" on a
     # core lane vs. "dma s2mm 0 stream starving" on a mem lane, "south slave port

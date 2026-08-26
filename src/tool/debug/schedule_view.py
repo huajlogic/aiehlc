@@ -4019,6 +4019,11 @@ rowsDesc.forEach(r => {
 // Device Map is the default view; the initial call at the bottom of this script
 // runs through here too, so the shown/hidden state has exactly one definition.
 function switchView(name){
+  // The Profile tab's enabled state is owned by the run lifecycle, not by which
+  // view is showing. Re-assert it from LIVE.profileReady on every switch so a
+  // view change (Device Map, Host, Grid) can never leave the tab stuck disabled
+  // once a timeline has rendered — it clears only when the next Run starts.
+  if(LIVE.profileReady) setProfileTabEnabled(true);
   // The Profile tab is inert until a run renders a timeline — ignore clicks
   // on it while disabled so a disabled tab can never take over the view.
   if(name==='profile'){
@@ -4056,6 +4061,9 @@ function clearTimelineProfile(){
   const st =document.getElementById('profile-status');
   if(img){ img.removeAttribute('src'); img.classList.add('hide'); }
   if(st){ st.textContent='Run in progress — timeline will appear when it finishes.'; }
+  // Clear the flag BEFORE disabling: setProfileTabEnabled(false) may bounce the
+  // view to Grid via switchView, which re-reads this flag.
+  LIVE.profileReady = false;
   setProfileTabEnabled(false);
 }
 // A run ended and the server rendered timeline.png: show it and unlock the tab.
@@ -4064,6 +4072,9 @@ function showTimelineProfile(){
   const st =document.getElementById('profile-status');
   if(img){ img.src='/timeline.png?ts='+Date.now(); img.classList.remove('hide'); }
   if(st){ st.textContent=''; }
+  // Latch the tab ON: from here it stays enabled across any view switch until
+  // the next Run calls clearTimelineProfile().
+  LIVE.profileReady = true;
   setProfileTabEnabled(true);
 }
 function profileImgError(){
@@ -8631,9 +8642,14 @@ const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
                // Timeline auto-launch. tlDone dedups the final render across the
                // TIMESYNC-idle timer, natural run-end and force-stop paths.
                // tsSeen: the first [TIMESYNC] line has appeared this run.
-               // tsIdleTimer: the 1s "quiet" timer that fires the render once no
-               // new [TIMESYNC] line has arrived for a full second.
+               // tsIdleTimer: the 5s "quiet" timer that fires the render once no
+               // new [TIMESYNC] line has arrived for a full 5 seconds.
                tlDone:false, tsSeen:false, tsIdleTimer:null,
+               // profileReady is the single source of truth for the Profile tab:
+               // true once a timeline has rendered, false again only when a new
+               // Run starts. switchView re-asserts the tab from this flag so no
+               // view switch (e.g. Device Map) can leave the tab stuck disabled.
+               profileReady:false,
                simOnly:false };
 const LSTATE = {
   running:['#4caf50','RUN'], stalled:['#ffca28','STALL'], error:['#ef5350','ERR'],
@@ -8650,7 +8666,7 @@ function api(path, opts){
 // Render `timeline.py <applog>` to timeline.png on the server and show it in the
 // Profile tab. Trigger model: TIMESYNC-idle. The render only happens once real
 // [TIMESYNC] data has been seen this run (LIVE.tsSeen) — the primary caller is
-// the 1s "quiet" timer armed in pollLog when [TIMESYNC] lines stop arriving.
+// the 5s "quiet" timer armed in pollLog when [TIMESYNC] lines stop arriving.
 // The run-end and force-stop callers are gated safety nets: on a run with no
 // TIMESYNC output they no-op (tsSeen stays false), which is what avoids the
 // `no [TIMESYNC] cps= record found` error. LIVE.tlDone dedups across all three
@@ -9438,8 +9454,8 @@ function pollLog(){
     const con = document.getElementById('console');
     const follow = logFollowing(con);
     if (r.data){ con.textContent += r.data; }
-    // TIMESYNC-idle trigger: the first [TIMESYNC] line arms a 1s "quiet" window;
-    // each new TIMESYNC-bearing chunk re-arms it. When a full second passes with
+    // TIMESYNC-idle trigger: the first [TIMESYNC] line arms a 5s "quiet" window;
+    // each new TIMESYNC-bearing chunk re-arms it. When a full 5 seconds pass with
     // no further [TIMESYNC] output the block is complete → render the timeline.
     if (r.data && /\[TIMESYNC\]/.test(r.data)){
       LIVE.tsSeen = true;
@@ -9447,7 +9463,7 @@ function pollLog(){
       LIVE.tsIdleTimer = setTimeout(() => {
         LIVE.tsIdleTimer = null;
         triggerTimeline(true);   // gated by tsSeen; dedups via tlDone
-      }, 1000);
+      }, 5000);
     }
     if (r.next != null) LIVE.logoff = r.next;
     logFollow(con, follow);
@@ -9585,7 +9601,11 @@ document.getElementById('stopbtn').onclick = () => {
       LIVE.runOwned = false;
       setDebugEnabled(true);
       setRunStatus('');
-      triggerTimeline(true);   // safety net; gated by tsSeen, dedups via tlDone.
+      // Every Stop click should re-render and reload timeline.png. Clearing
+      // tlDone defeats the dedup so triggerTimeline regenerates from the final
+      // applog and showTimelineProfile re-fetches the image (cache-busted ts).
+      LIVE.tlDone = false;
+      triggerTimeline(true);   // gated by tsSeen; forced fresh render on Stop.
       if (r.run) applyRunState(r.run);
       updateRunButtons();
       if (r.error){ setStatus('stop: ' + r.error); }

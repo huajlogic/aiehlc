@@ -271,6 +271,74 @@ def test_missing_cps_raises():
         pass
 
 
+def test_resolve_hostcc_lines_maps_phase_to_emit_call():
+    # The two-line codegen pattern: a phase string literal bound to a var, passed
+    # as the 3rd arg of __Runtime_core_trace_event on the following line. The
+    # resolver maps each phase to that emit-call's 1-based line number, keeping
+    # the FIRST occurrence per phase (loop-body first iteration).
+    src = "\n".join([
+        "  event v89 = __Runtime_launch_kernel_group(v1, v84);",   # 1
+        '  const char* v91 = "launch";',                            # 2
+        "  __Runtime_core_trace_event(v1, v90, v91);",              # 3
+        "  for (size_t v380 = v7; v380 < v6; v380 += v5) {",        # 4
+        '    const char* v381 = "iter_start";',                     # 5
+        "    __Runtime_core_trace_event(v1, v380, v381);",          # 6
+        '    const char* v385 = "dma_start";',                      # 7
+        "    __Runtime_core_trace_event(v1, v380, v385);",          # 8
+        # A second (later-iteration-style) dma_start emit must NOT overwrite.
+        '    const char* v999 = "dma_start";',                      # 9
+        "    __Runtime_core_trace_event(v1, v380, v999);",          # 10
+        "  }",                                                      # 11
+    ])
+    with tempfile.NamedTemporaryFile("w", suffix="host.cc", delete=False) as f:
+        f.write(src)
+        path = f.name
+    try:
+        m = hat.resolve_hostcc_lines(path)
+    finally:
+        os.unlink(path)
+    assert m == {"launch": 3, "iter_start": 6, "dma_start": 8}, m
+
+
+def test_resolve_hostcc_lines_missing_file_is_empty():
+    assert hat.resolve_hostcc_lines("/no/such/host.cc") == {}
+    assert hat.resolve_hostcc_lines(None) == {}
+
+
+def test_host_phase_style_known_and_default():
+    assert hat.host_phase_style("dma_start") == hat.HOST_PHASE_STYLE["dma_start"]
+    # Unknown phase -> neutral colour + its own name as the description.
+    assert hat.host_phase_style("mystery") == (hat.HOST_PHASE_DEFAULT_COLOR, "mystery")
+
+
+def test_correlate_enriches_host_markers_with_api_and_line():
+    # With a phase->line map, each zero-width host marker gains phase/api/color and
+    # (when mapped) hostcc_line -- but stays zero-width so the model contract holds.
+    hostcc = {"iter_start": 6, "run": 8}
+    model = hat.correlate(hat.parse_timesync(_block()), hostcc)
+    host = next(l for l in model["lanes"] if l["name"] == "host")
+    by_phase = {e["phase"]: e for e in host["events"]}
+    assert by_phase["iter_start"]["color"] == hat.HOST_PHASE_STYLE["iter_start"][0]
+    assert by_phase["iter_start"]["api"] == hat.HOST_PHASE_STYLE["iter_start"][1]
+    assert by_phase["iter_start"]["hostcc_line"] == 6
+    assert by_phase["run"]["hostcc_line"] == 8
+    # dma_out_done had no mapping -> no hostcc_line key, still enriched + zero-width.
+    assert "hostcc_line" not in by_phase["dma_out_done"]
+    for e in host["events"]:
+        assert e["start_us"] == e["end_us"]
+        assert "color" in e and "api" in e and "phase" in e
+
+
+def test_correlate_without_hostcc_still_enriches_color_no_line():
+    # No host.cc supplied: markers still get colour/api (so the render is coloured
+    # by API), just no line annotation.
+    model = hat.correlate(hat.parse_timesync(_block()))
+    host = next(l for l in model["lanes"] if l["name"] == "host")
+    for e in host["events"]:
+        assert "color" in e and "api" in e
+        assert "hostcc_line" not in e
+
+
 def test_self_test_entry_point():
     assert hat._self_test() == 0
 

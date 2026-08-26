@@ -52,6 +52,87 @@ import json
 import os
 import re
 import sys
+from collections import OrderedDict
+
+
+# --------------------------------------------------------------------------
+# Host phase -> (bar colour, short API / section description).
+#
+# The host records only a START counter per phase; the renderer paints each
+# phase's bar from its start to the NEXT phase's start (start-to-start, NOT the
+# API's own duration) and colours it by the API named here. An unlisted phase
+# falls back to a neutral colour and its own name (host_phase_style). The colours
+# match the standalone prototype so the production render reads the same.
+# --------------------------------------------------------------------------
+HOST_PHASE_STYLE = OrderedDict([
+    ("launch",     ("#9467bd", "launch_kernel_group")),
+    ("iter_start", ("#1f77b4", "input DMA BD config")),
+    ("dma_start",  ("#17becf", "startio (issue DMAs)")),
+    ("wait_start", ("#e377c2", "wait(events) [AIE compute]")),
+    ("wait_done",  ("#2ca02c", "iter end")),
+])
+HOST_PHASE_DEFAULT_COLOR = "#8c8c8c"
+
+
+def host_phase_style(phase):
+    """(colour_hex, api-description) for a host phase name. Known phases use the
+    HOST_PHASE_STYLE table; an unlisted phase gets a neutral colour and its own
+    name as the description, so a new phase still renders (just uncoloured-by-API
+    and unlabelled) instead of breaking."""
+    return HOST_PHASE_STYLE.get(phase, (HOST_PHASE_DEFAULT_COLOR, phase))
+
+
+# host.cc codegen for a phase marker is a two-line pattern:
+#     const char* vNN = "<phase>";
+#     __Runtime_core_trace_event(<dev>, <iter>, vNN);
+# i.e. the phase string literal is bound to a variable that the emit call passes
+# as its third argument. Mapping phase -> the emit-call line number lets the
+# timeline annotate each host bar with the exact host.cc:line that issued it.
+_HOSTCC_STR = re.compile(r'const\s+char\s*\*\s*(\w+)\s*=\s*"([^"]+)"\s*;')
+_HOSTCC_EVT = re.compile(r'__Runtime_core_trace_event\s*\([^,]+,[^,]+,\s*(\w+)\s*\)')
+
+
+def resolve_hostcc_lines(path):
+    """Parse a generated host.cc for the phase -> emit-call line mapping.
+
+    Returns {phase: line_number} (1-based, FIRST occurrence per phase, so the
+    iteration-loop body's first emit wins over later iterations). A missing or
+    unreadable file yields {} so line annotation is simply skipped."""
+    mapping = {}
+    if not path:
+        return mapping
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError:
+        return mapping
+    var_phase = {}
+    for i, line in enumerate(lines, 1):
+        sm = _HOSTCC_STR.search(line)
+        if sm:
+            var_phase[sm.group(1)] = sm.group(2)
+        em = _HOSTCC_EVT.search(line)
+        if em:
+            phase = var_phase.get(em.group(1))
+            if phase and phase not in mapping:
+                mapping[phase] = i
+    return mapping
+
+
+def autodetect_host_cc(applog):
+    """Guess the generated host.cc path from the applog location. Checks the
+    applog's own directory and the usual aout/worklocal build dir (relative to
+    the applog and to the CWD). Returns the first existing path, or None."""
+    cands = []
+    if applog:
+        d = os.path.dirname(os.path.abspath(applog))
+        cands.append(os.path.join(d, "host.cc"))
+        cands.append(os.path.join(d, "aout", "worklocal", "host.cc"))
+    cands.append(os.path.join(os.getcwd(), "aout", "worklocal", "host.cc"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -251,11 +332,18 @@ def host_counts_to_us(counts, cps, h0):
 # --------------------------------------------------------------------------
 # Correlate everything onto one us axis.
 # --------------------------------------------------------------------------
-def correlate(ts):
+def correlate(ts, hostcc_lines=None):
     """Build the merged timeline model from a parsed TIMESYNC dict.
 
+    `hostcc_lines` is an optional {phase: host.cc-line} map (from
+    resolve_hostcc_lines); when given, each host marker is tagged with its
+    emit-call line number so the renderer can annotate the bar.
+
     Returns {meta, anchors, fit_per_tile, lanes}. Lanes:
-      - "host": zero-width phase markers (start_us == end_us).
+      - "host": zero-width phase markers (start_us == end_us). Each marker also
+        carries "phase", "api" (short API description) and "color" (bar colour by
+        API), plus "hostcc_line" when resolved, so the renderer can paint each
+        start-to-start span by API and label it with its host.cc line.
       - "tile C,R core": ACTIVE/stall spans; end_us covers the interval width
         (end_cycle+1) so a single-cycle event has non-zero duration.
       - "tile C,R <port> <intf> <num>": the monitored stream-switch port's
@@ -286,13 +374,21 @@ def correlate(ts):
 
     lanes = []
 
-    # Host lane: one zero-width marker per phase event.
+    # Host lane: one zero-width marker per phase event, tagged with its API
+    # colour / description and (when resolved) its host.cc emit-call line.
+    hostcc_lines = hostcc_lines or {}
     host_events = []
     for it, phase, counts in ts["hostevts"]:
         us = host_counts_to_us(counts, cps, h0)
-        host_events.append({"event": "iter%d.%s" % (it, phase),
-                            "start_us": us, "end_us": us,
-                            "detail": "iter=%d phase=%s host=%d" % (it, phase, counts)})
+        color, api = host_phase_style(phase)
+        ev = {"event": "iter%d.%s" % (it, phase),
+              "start_us": us, "end_us": us,
+              "detail": "iter=%d phase=%s host=%d" % (it, phase, counts),
+              "phase": phase, "api": api, "color": color}
+        line = hostcc_lines.get(phase)
+        if line is not None:
+            ev["hostcc_line"] = line
+        host_events.append(ev)
     lanes.append({"name": "host", "events": host_events, "role": "host", "ident": ""})
 
     # Per traced tile: a core lane ("tile C,R core") and, directly beneath it, a
@@ -429,10 +525,33 @@ def _self_test():
         (10, 10, ["ACTIVE"], "core"), (108, 112, ["STREAM_STALL"], "core"),
         (200, 209, ["ACTIVE", "PORT_RUNNING_0"], "core"), (210, 219, ["PORT_IDLE_0"], "core"),
         (300, 300, ["DMA_START"], "mem"), (305, 309, ["STREAM_STALL"], "mem")], ts["traces"]
-    model = correlate(ts)
+    # A synthetic host.cc exercises the phase->line resolver and its two-line
+    # codegen pattern (string literal bound to a var, passed to the emit call).
+    hostcc_src = "\n".join([
+        "  event v89 = __Runtime_launch_kernel_group(v1, v84);",
+        '  const char* v91 = "iter_start";',
+        "  __Runtime_core_trace_event(v1, v90, v91);",
+        '  const char* v92 = "run";',
+        "  __Runtime_core_trace_event(v1, v90, v92);",
+    ])
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile("w", suffix="host.cc", delete=False) as hf:
+        hf.write(hostcc_src)
+        hostcc_path = hf.name
+    hostcc_lines = resolve_hostcc_lines(hostcc_path)
+    os.unlink(hostcc_path)
+    assert hostcc_lines == {"iter_start": 3, "run": 5}, hostcc_lines
+    model = correlate(ts, hostcc_lines)
     host = next(l for l in model["lanes"] if l["name"] == "host")
     assert host["events"][0]["start_us"] == 0.0
     assert host["events"][1]["start_us"] == 500.0
+    # Host markers stay zero-width but now carry API colour + host.cc line.
+    assert host["events"][0]["end_us"] == host["events"][0]["start_us"]
+    assert host["events"][0]["phase"] == "iter_start"
+    assert host["events"][0]["color"] == HOST_PHASE_STYLE["iter_start"][0]
+    assert host["events"][0]["api"] == HOST_PHASE_STYLE["iter_start"][1]
+    assert host["events"][0]["hostcc_line"] == 3
+    assert host["events"][1]["hostcc_line"] == 5
     tile = next(l for l in model["lanes"] if l["name"] == "tile 4,4 core")
     # Two ACTIVE intervals share the same event name, so collect tuples (a dict
     # keyed by name would collapse them). us(cycle)==cycle; end covers end_cycle+1.
@@ -476,6 +595,9 @@ def main(argv):
     ap = argparse.ArgumentParser(description="Merge host + AIE timelines from a [TIMESYNC] applog.")
     ap.add_argument("applog", nargs="?", help="applog / stdout capture containing the [TIMESYNC] block")
     ap.add_argument("--out-dir", default="/tmp/claude/tl", help="output directory for timeline.csv/json")
+    ap.add_argument("--host-cc", metavar="PATH",
+                    help="generated host.cc to resolve phase->line numbers "
+                         "(auto-detected next to the applog / aout/worklocal if omitted)")
     ap.add_argument("--self-test", action="store_true", help="run the built-in synthetic self-test and exit")
     args = ap.parse_args(argv[1:])
 
@@ -488,9 +610,15 @@ def main(argv):
     with open(args.applog) as f:
         text = f.read()
 
+    host_cc = args.host_cc or autodetect_host_cc(args.applog)
+    hostcc_lines = resolve_hostcc_lines(host_cc)
     ts = parse_timesync(text)
-    model = correlate(ts)
+    model = correlate(ts, hostcc_lines)
     csv_path, json_path, nrows = emit(model, args.out_dir)
+
+    if host_cc:
+        print("[host_aie_timeline] host.cc %s: resolved %d phase line(s)" % (
+            host_cc, len(hostcc_lines)))
 
     m = model["meta"]
     print("[host_aie_timeline] cps=%d  tiles=%d  host_events=%d  rows=%d" % (

@@ -29,7 +29,8 @@
       "Skill(superpowers:using-git-worktrees)",
       "mcp__aiegdb__aie_scope",
       "WebFetch(domain:files.pythonhosted.org)",
-      "Skill(superpowers:test-driven-development)"
+      "Skill(superpowers:test-driven-development)",
+      "Skill(commands)"
     ],
     "deny": []
   },

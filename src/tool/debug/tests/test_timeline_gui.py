@@ -1004,6 +1004,85 @@ def test_host_intervals_empty_without_host():
     assert tg.host_intervals(None) == []
 
 
+def _enriched_host_model():
+    """A host lane whose markers carry the host_aie_timeline enrichment
+    (colour-by-API + host.cc line), for the colour/annotation/legend tests."""
+    return {
+        "meta": {}, "anchors": {}, "fit_per_tile": {},
+        "lanes": [
+            {"name": "host", "role": "host", "ident": "", "events": [
+                {"event": "iter-1.launch", "start_us": 0.0, "end_us": 0.0,
+                 "detail": "", "phase": "launch", "api": "launch_kernel_group",
+                 "color": "#9467bd", "hostcc_line": 267},
+                {"event": "iter0.iter_start", "start_us": 100.0, "end_us": 100.0,
+                 "detail": "", "phase": "iter_start", "api": "input DMA BD config",
+                 "color": "#1f77b4", "hostcc_line": 702},
+                {"event": "iter0.dma_start", "start_us": 110.0, "end_us": 110.0,
+                 "detail": "", "phase": "dma_start", "api": "startio (issue DMAs)",
+                 "color": "#17becf", "hostcc_line": 710},
+                {"event": "iter0.wait_done", "start_us": 200.0, "end_us": 200.0,
+                 "detail": "", "phase": "wait_done", "api": "iter end",
+                 "color": "#2ca02c", "hostcc_line": 928},
+            ]},
+        ],
+    }
+
+
+def test_host_intervals_carry_api_color_and_line():
+    model = _enriched_host_model()
+    bars = tg.host_intervals(tg.host_lane(model))
+    assert len(bars) == 3  # 4 markers -> 3 gaps
+    first = bars[0]
+    assert first["phase"] == "launch"
+    assert first["color"] == "#9467bd"
+    assert first["api"] == "launch_kernel_group"
+    assert first["hostcc_line"] == 267
+    # Start-to-next-start span.
+    assert first["start_us"] == 0.0 and first["end_us"] == 100.0
+
+
+def test_draw_colors_host_bars_by_api():
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    model = _enriched_host_model()
+    fig, ax = plt.subplots()
+    tg._draw(ax, model, nbins=100)
+    bar_colors = set()
+    for coll in ax.collections:
+        for c in coll.get_facecolors():
+            bar_colors.add(mcolors.to_hex(c))
+    # Each host bar takes its LEADING phase's API colour (not the old blue/grey
+    # binary). The trailing wait_done marker forms no bar, so its colour is absent.
+    assert "#9467bd" in bar_colors      # launch -> iter_start
+    assert "#1f77b4" in bar_colors      # iter_start -> dma_start
+    assert "#17becf" in bar_colors      # dma_start -> wait_done
+    plt.close(fig)
+
+
+def test_draw_annotates_hostcc_line_when_present():
+    import matplotlib.pyplot as plt
+    model = _enriched_host_model()
+    fig, ax = plt.subplots()
+    tg._draw(ax, model, nbins=100)
+    texts = [t.get_text() for t in ax.texts]
+    # The first-iteration host bars are annotated with their host.cc line.
+    assert "host.cc:267" in texts
+    assert "host.cc:702" in texts
+    plt.close(fig)
+
+
+def test_legend_has_per_phase_host_entries():
+    import matplotlib.pyplot as plt
+    model = _enriched_host_model()
+    fig, ax = plt.subplots()
+    tg._draw(ax, model, nbins=100)
+    tg._add_legend(ax, model)
+    labels = {t.get_text() for t in ax.get_legend().get_texts()}
+    assert "launch  (host.cc:267  launch_kernel_group)" in labels
+    assert "dma_start  (host.cc:710  startio (issue DMAs))" in labels
+    plt.close(fig)
+
+
 def test_self_test_entry_point():
     assert tg._self_test() == 0
 

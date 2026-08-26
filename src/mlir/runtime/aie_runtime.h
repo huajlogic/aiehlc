@@ -647,6 +647,12 @@ void __Runtime_core_trace_begin_dma(XAie_DevInst *dev, uint8_t col, uint8_t row,
 // when no tile was armed, or (cps=0, so still decode-only) under the simulator.
 void __Runtime_core_trace_sync_begin(XAie_DevInst *dev);
 
+// Record one host phase event (iter, phase name) into the auto-injected
+// core-trace session's process-global profile. Captures the host clock now.
+// No-op unless __Runtime_core_trace_sync_begin has armed the correlated session
+// (so it is safe to call unconditionally from generated host code).
+void __Runtime_core_trace_event(XAie_DevInst *dev, int iter, const char *phase);
+
 // Read back, decode and dump every tile armed by __Runtime_core_trace_begin.
 // Owns a static AieTraceProfile; for each registered tile reads the MemTile
 // trace buffer, attaches the (col,row) tag, decodes into the profile, then

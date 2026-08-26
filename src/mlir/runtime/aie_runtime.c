@@ -2019,6 +2019,13 @@ void __Runtime_core_trace_sync_begin(XAie_DevInst *dev) {
            (unsigned long long)__aie_host_cps());
 }
 
+void __Runtime_core_trace_event(XAie_DevInst *dev, int iter, const char *phase) {
+    (void)dev;
+    if (!s_trace_sync_active)
+        return;
+    __Runtime_aie_trace_profile_event(&s_trace_sync_prof, iter, phase, __aie_host_now());
+}
+
 void __Runtime_core_trace_end(XAie_DevInst *dev) {
     if (s_trace_session_n == 0)
         return; /* nothing armed: clean no-op */
