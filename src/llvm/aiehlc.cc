@@ -179,7 +179,12 @@ static int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0; // GEMM dimensions f
 static int parsedDebugLevel = -1; // -1 = not set by user, >=0 = #pragma aie_debug_level value
 // Compute tiles to core-trace, from #pragma aie_trace(col,row) (mesh/partition-
 // relative). Repeatable and range-expanded (col:col2, row:row2 -> rectangle).
-static std::vector<std::pair<int, int>> parsedTraceTiles;
+// Each spec may carry an optional mem-module DMA/stream selection (2nd tuple).
+static std::vector<TraceTileSpec> parsedTraceTiles;
+// Set when a #pragma aie_trace directive is unrecoverably invalid (e.g. a STREAM
+// direction that is neither "s2mm" nor "mm2s"). Checked before the pipeline runs
+// so the build aborts with a clear error instead of silently mis-tracing.
+static bool parsedTraceFatal = false;
 static std::string userSourceDir; // directory containing the original user source file
 static PartitionDesc parsedPartition; // default: invalid (all -1), set by #pragma aie_partition
 static std::vector<MeshKernelDesc> parsedMeshKernels; // multi-kernel mode: one per <<<mesh>>> launch
@@ -3265,6 +3270,15 @@ class AieDebugLevelPragmaHandler : public clang::PragmaHandler {
 // rejects non-compute rows at __Runtime_core_trace_begin.
 //   #pragma aie_trace(2, 3)     -> (2,3)
 //   #pragma aie_trace(1:2, 3)   -> (1,3),(2,3)
+//
+// An optional SECOND tuple selects which tile DMA the memory-module trace unit
+// watches. It requires the coord to be its own nested tuple:
+//   #pragma aie_trace((0,3),(STREAM,"s2mm",0))    // explicit dir + channel
+//   #pragma aie_trace((0,3),(STREAM,"mm2s",1))
+//   #pragma aie_trace((0,3),(PARAMETER,"win_a"))  // named window -> resolved
+// The selection applies to every (col,row) expanded from the first tuple. No
+// second tuple keeps the runtime default (S2MM ch0). A malformed second tuple
+// warns and falls back to Default without dropping the tile.
 class AieTracePragmaHandler : public clang::PragmaHandler {
   public:
     AieTracePragmaHandler() : PragmaHandler("aie_trace") {}
@@ -3279,10 +3293,16 @@ class AieTracePragmaHandler : public clang::PragmaHandler {
                 PP.DiscardUntilEndOfDirective();
             return;
         }
-        PP.Lex(Tok); // consume '('
+        PP.Lex(Tok); // consume outer '('
 
-        // Parse one spec: a numeric_constant, optionally 'N : M'. Returns false
-        // on a malformed token stream; leaves Tok at the token after the spec.
+        // Detect nested-tuple form ((col,row),(SEL,...)) vs. flat (col,row): the
+        // nested form opens a second '(' immediately after the first.
+        bool nested = Tok.is(clang::tok::l_paren);
+        if (nested)
+            PP.Lex(Tok); // consume the inner '(' of ((col,row),...)
+
+        // Parse one coord spec: a numeric_constant, optionally 'N : M'. Returns
+        // false on a malformed token stream; leaves Tok after the spec.
         auto parseSpec = [&](int &lo, int &hi) -> bool {
             if (!Tok.is(clang::tok::numeric_constant))
                 return false;
@@ -3309,6 +3329,20 @@ class AieTracePragmaHandler : public clang::PragmaHandler {
             return true;
         };
 
+        // Strip surrounding quotes from a string_literal spelling.
+        auto stringLitValue = [&](std::string &out) -> bool {
+            if (!Tok.is(clang::tok::string_literal))
+                return false;
+            llvm::SmallString<32> Buf;
+            bool Invalid = false;
+            llvm::StringRef Spelling = PP.getSpelling(Tok, Buf, &Invalid);
+            if (Invalid || Spelling.size() < 2)
+                return false;
+            out = Spelling.substr(1, Spelling.size() - 2).str(); // drop quotes
+            PP.Lex(Tok);
+            return true;
+        };
+
         int colLo = 0, colHi = 0, rowLo = 0, rowHi = 0;
         bool ok = parseSpec(colLo, colHi);
         if (ok && Tok.is(clang::tok::comma)) {
@@ -3318,7 +3352,9 @@ class AieTracePragmaHandler : public clang::PragmaHandler {
             ok = false;
         }
         if (ok && Tok.is(clang::tok::r_paren))
-            PP.Lex(Tok); // consume ')'
+            PP.Lex(Tok); // consume ')' closing (col,row)
+        else
+            ok = false;
 
         if (!ok) {
             llvm::errs() << "[aiehlc] Warning: malformed #pragma aie_trace(col, row), ignored\n";
@@ -3326,6 +3362,80 @@ class AieTracePragmaHandler : public clang::PragmaHandler {
                 PP.DiscardUntilEndOfDirective();
             return;
         }
+
+        // Parse the optional second tuple (only in nested form). Malformed ->
+        // warn + Default (do not drop the tile).
+        TraceDmaSel sel = TraceDmaSel::Default;
+        int dmaKind = 1; // AIE_TRACE_DMA_S2MM
+        int dmaCh = 0;
+        std::string paramName;
+        if (nested && Tok.is(clang::tok::comma)) {
+            PP.Lex(Tok); // consume ',' between the two tuples
+            bool selOk = false;
+            if (Tok.is(clang::tok::l_paren)) {
+                PP.Lex(Tok); // consume '(' of the sel tuple
+                if (Tok.is(clang::tok::identifier)) {
+                    llvm::StringRef kw = Tok.getIdentifierInfo()->getName();
+                    PP.Lex(Tok);
+                    if (kw == "STREAM" && Tok.is(clang::tok::comma)) {
+                        PP.Lex(Tok);
+                        std::string dir;
+                        if (stringLitValue(dir) && Tok.is(clang::tok::comma)) {
+                            std::string dl = dir;
+                            std::transform(dl.begin(), dl.end(), dl.begin(), ::tolower);
+                            PP.Lex(Tok);
+                            int idx = 0;
+                            if (Tok.is(clang::tok::numeric_constant)) {
+                                llvm::SmallString<16> Buf;
+                                bool Invalid = false;
+                                llvm::StringRef Sp = PP.getSpelling(Tok, Buf, &Invalid);
+                                if (!Invalid && !Sp.getAsInteger(0, idx)) {
+                                    PP.Lex(Tok);
+                                    if (dl == "s2mm" || dl == "mm2s") {
+                                        sel = TraceDmaSel::Stream;
+                                        dmaKind = (dl == "mm2s") ? 2 : 1;
+                                        dmaCh = idx;
+                                        selOk = Tok.is(clang::tok::r_paren);
+                                        if (selOk)
+                                            PP.Lex(Tok); // consume ')'
+                                    } else {
+                                        // Recognizable STREAM tuple but an invalid direction
+                                        // name (e.g. "s3mm"): hard error, not a silent
+                                        // fallback. Consume ')' so the rest parses cleanly.
+                                        llvm::errs() << "[aiehlc] Error: #pragma aie_trace STREAM direction \"" << dir
+                                                     << "\" is invalid (expected \"s2mm\" or \"mm2s\")\n";
+                                        parsedTraceFatal = true;
+                                        selOk = true; // suppress the generic malformed warning
+                                        if (Tok.is(clang::tok::r_paren))
+                                            PP.Lex(Tok); // consume ')'
+                                    }
+                                }
+                            }
+                        }
+                    } else if (kw == "PARAMETER" && Tok.is(clang::tok::comma)) {
+                        PP.Lex(Tok);
+                        std::string nm;
+                        if (stringLitValue(nm)) {
+                            sel = TraceDmaSel::Parameter;
+                            paramName = nm;
+                            selOk = Tok.is(clang::tok::r_paren);
+                            if (selOk)
+                                PP.Lex(Tok); // consume ')'
+                        }
+                    }
+                }
+            }
+            if (!selOk) {
+                llvm::errs() << "[aiehlc] Warning: malformed 2nd tuple in #pragma aie_trace; "
+                                "using default mem trace (S2MM ch0)\n";
+                sel = TraceDmaSel::Default;
+                dmaKind = 1;
+                dmaCh = 0;
+                paramName.clear();
+            }
+        }
+        if (nested && Tok.is(clang::tok::r_paren))
+            PP.Lex(Tok); // consume outer ')'
 
         if (colLo > colHi)
             std::swap(colLo, colHi);
@@ -3335,17 +3445,37 @@ class AieTracePragmaHandler : public clang::PragmaHandler {
         unsigned added = 0;
         for (int c = colLo; c <= colHi; c++) {
             for (int r = rowLo; r <= rowHi; r++) {
-                std::pair<int, int> t{c, r};
-                if (std::find(parsedTraceTiles.begin(), parsedTraceTiles.end(), t) == parsedTraceTiles.end()) {
-                    parsedTraceTiles.push_back(t);
+                // Dedup on (col,row); a later sel overrides an earlier Default.
+                auto it = std::find_if(parsedTraceTiles.begin(), parsedTraceTiles.end(),
+                                       [&](const TraceTileSpec &s) { return s.col == c && s.row == r; });
+                if (it == parsedTraceTiles.end()) {
+                    TraceTileSpec s;
+                    s.col = c;
+                    s.row = r;
+                    s.sel = sel;
+                    s.dmaKind = dmaKind;
+                    s.dmaCh = dmaCh;
+                    s.paramName = paramName;
+                    parsedTraceTiles.push_back(std::move(s));
                     added++;
+                } else if (it->sel == TraceDmaSel::Default && sel != TraceDmaSel::Default) {
+                    it->sel = sel;
+                    it->dmaKind = dmaKind;
+                    it->dmaCh = dmaCh;
+                    it->paramName = paramName;
                 }
             }
         }
         llvm::outs() << "[aiehlc] Detected #pragma aie_trace col=" << colLo << ":" << colHi << " row=" << rowLo << ":"
                      << rowHi << " (+" << added << " tiles, total " << parsedTraceTiles.size() << ")\n";
-        for (const auto &t : parsedTraceTiles)
-            llvm::outs() << "[aiehlc]   trace tile (" << t.first << "," << t.second << ")\n";
+        for (const auto &t : parsedTraceTiles) {
+            llvm::outs() << "[aiehlc]   trace tile (" << t.col << "," << t.row << ")";
+            if (t.sel == TraceDmaSel::Stream)
+                llvm::outs() << " mem=" << (t.dmaKind == 2 ? "MM2S" : "S2MM") << ":ch" << t.dmaCh;
+            else if (t.sel == TraceDmaSel::Parameter)
+                llvm::outs() << " mem=param(" << t.paramName << ")";
+            llvm::outs() << "\n";
+        }
 
         if (Tok.isNot(clang::tok::eod))
             PP.DiscardUntilEndOfDirective();
@@ -4487,6 +4617,10 @@ public:
                     std::string hostFuncSuffix = mkd.kernelName;
                     // Don't pass userRewrittenSource in multi-kernel mode — we emit it ourselves after all runs
                     unsigned hostDdrArgs = 0;
+                    if (parsedTraceFatal) {
+                        llvm::errs() << "[aiehlc] Aborting: invalid #pragma aie_trace directive(s).\n";
+                        std::exit(1);
+                    }
                     if (!TilingLinalgPipeline::runPipeline(
                             ctx, module, outputDir, kernelBodyWithMacros, mkd.kernelFuncName, parsedDebugLevel,
                             /*userRewrittenSource=*/"", {}, mkd.maxPPBytes, aieGenStr, hostFuncSuffix, appendMode,
@@ -5150,6 +5284,10 @@ public:
                     singlePortVarNames.push_back(pt.varName);
 
                 // Run pipeline (single kernel — no suffix, no append mode)
+                if (parsedTraceFatal) {
+                    llvm::errs() << "[aiehlc] Aborting: invalid #pragma aie_trace directive(s).\n";
+                    std::exit(1);
+                }
                 if (!TilingLinalgPipeline::runPipeline(
                         ctx, module, outputDir, kernelBodyWithMacros, singleKernelFuncName, parsedDebugLevel,
                         userRewrittenSource, tensors, effectiveMaxPPBytes, aieGenStr, /*hostFuncSuffix=*/"",

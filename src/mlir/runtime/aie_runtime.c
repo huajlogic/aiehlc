@@ -306,8 +306,48 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1) {
  * ------------------------------------------------------------------------- */
 
 /* Slot -> event name, for the decoder. Order must match the TraceEvent slots
- * programmed in __Runtime_core_trace_setup. */
-static const char *const s_core_trace_slot_name[4] = {"ACTIVE", "LOCK_STALL", "STREAM_STALL", "MEMORY_STALL"};
+ * programmed in __Runtime_core_trace_setup: 0..3 are core-state events, 4..6 are
+ * the stream-switch port-0 event group, slot 7 is unused. */
+#define AIE_CORE_TRACE_NSLOTS 7u /* slots 0..6 programmed; unit has 8 slots */
+static const char *const s_core_trace_slot_name[8] = {"ACTIVE",      "LOCK_STALL",     "STREAM_STALL",   "MEMORY_STALL",
+                                                      "PORT_IDLE_0", "PORT_RUNNING_0", "PORT_STALLED_0", "EVENT7"};
+
+/* Slot -> event name for the MEMORY-module trace stream (packet id 2), decoded
+ * with these names when a pkt-id-2 stream is present in the shared buffer. Order
+ * MUST match the slot events programmed in mem_trace_program_unit: 0 DMA start,
+ * 1 DMA finish, 2 DMA lock stall, 3 stream stall (S2MM starvation / MM2S
+ * backpressure), 4 memory backpressure (S2MM) / starvation (MM2S), 5 lock group,
+ * 6 lock acquire (SEL0 ACQ_GE), 7 lock release (LOCK_0_REL, event 46 -- valid on
+ * the compute-tile mem module for both AIE-ML and AIE2PS). The channel/direction
+ * is carried in the emitted [TRACESTREAMCONFIG] line, so these names stay
+ * channel-generic. */
+#define AIE_MEM_TRACE_NSLOTS 8u /* all 8 slots programmed */
+static const char *const s_mem_trace_slot_name[8] = {"DMA_START", "DMA_FINISH", "DMA_STALL_LOCK", "STREAM_STALL",
+                                                     "MEM_BP",    "LOCK_GRP",   "LOCK_ACQ",       "LOCK_REL"};
+
+/* Slot -> PHYSICAL hardware event id, parallel to the two name tables above, so
+ * the decoder can print the real trace-unit event number beside each name
+ * ("STREAM_STALL{event value 45}"). These MUST be the per-module hardware event
+ * ids (0..127, the value the trace unit actually emits) -- NOT the flat global
+ * XAie_Events enum index, which runs into the hundreds for mem-tile DMA events
+ * (e.g. XAIE_EVENT_DMA_S2MM_0_STALLED_LOCK_MEM ~374). Both tables are therefore
+ * filled at trace-setup time via XAie_EventLogicalToPhysicalConv (see
+ * trace_fill_event_labels), from the events actually programmed into the slots.
+ * They reflect the MOST RECENT trace setup; when several tiles trace DIFFERENT
+ * DMAs the values reflect the last-armed tile (the common single-DMA-per-tile
+ * case is exact). Zero until the corresponding *_trace setup runs. */
+static uint16_t s_core_trace_slot_event[8]; /* filled at core trace setup */
+static uint16_t s_mem_trace_slot_event[8];  /* filled at mem trace setup */
+
+/* Slot -> the driver's SPECIFIC event name for the MEMORY-module stream (e.g.
+ * "DMA_MM2S_0_STALLED_LOCK_MEM"), filled at mem_trace_program_unit time from
+ * XAie_EventGetString on the actually-programmed events. The static
+ * s_mem_trace_slot_name table above stays channel/direction-generic (used by the
+ * standalone decoder + Python reference model, which cannot know the watched
+ * DMA); the [TIMESYNC] dump prefers this specific name when present and falls
+ * back to the generic label otherwise (e.g. in the decoder unit-test harness,
+ * where setup never runs so these stay NULL). */
+static const char *s_mem_trace_slot_dynname[8];
 
 #ifdef AIE_HAVE_RESOURCE_MAP
 /* -------------------------------------------------------------------------
@@ -362,6 +402,26 @@ static int resmap_pktid_used(const struct AieResourceEntry *rm, int n, int col, 
     return 0;
 }
 
+/* Is packet arbiter `arb` already used on (col,row) by any data-plane slave
+ * slot (recv/dma) or forward master? Used to dedicate a whole arbiter to the
+ * trace stream so no data slave/master can share it. */
+static int resmap_arbiter_used(const struct AieResourceEntry *rm, int n, int col, int row, int arb) {
+    for (int i = 0; i < n; i++) {
+        const struct AieResourceEntry *e = &rm[i];
+        if (e->col != col || e->row != row)
+            continue;
+        /* only packet_connect rows carry arbiter fields; circuit rows leave
+         * them at 0, so guard on the matching port being present (idx>=0). */
+        if (e->recv_idx >= 0 && e->recv_arbiter == arb)
+            return 1;
+        if (e->dma_idx >= 0 && e->dma_arbiter == arb)
+            return 1;
+        if (e->fwd_idx >= 0 && e->fwd_arbiter == arb)
+            return 1;
+    }
+    return 0;
+}
+
 /* Is MemTile DMA channel `ch` already used on (col,row)? Any recorded port whose
  * direction is "DMA" with idx==ch. */
 static int resmap_dma_used(const struct AieResourceEntry *rm, int n, int col, int row, int ch) {
@@ -379,6 +439,86 @@ static int resmap_dma_used(const struct AieResourceEntry *rm, int n, int col, in
             return 1;
         if (e->master_dir && strcmp(e->master_dir, "DMA") == 0 && e->master_idx == ch)
             return 1;
+    }
+    return 0;
+}
+
+/* Reverse of strm_port_type_name for the UPPERCASE direction strings the
+ * resource map stores ("DMA","SOUTH","WEST","NORTH","EAST","CORE","TRACE",...).
+ * Enum order per xaiegbl.h: CORE=0,DMA,CTRL,FIFO,SOUTH,WEST,NORTH,EAST,TRACE,
+ * UCTRLR. Returns SS_PORT_TYPE_MAX when the string is NULL or unrecognized. */
+static StrmSwPortType resmap_dir_to_port_type(const char *dir) {
+    if (!dir)
+        return SS_PORT_TYPE_MAX;
+    if (strcmp(dir, "CORE") == 0)
+        return CORE;
+    if (strcmp(dir, "DMA") == 0)
+        return DMA;
+    if (strcmp(dir, "CTRL") == 0)
+        return CTRL;
+    if (strcmp(dir, "FIFO") == 0)
+        return FIFO;
+    if (strcmp(dir, "SOUTH") == 0)
+        return SOUTH;
+    if (strcmp(dir, "WEST") == 0)
+        return WEST;
+    if (strcmp(dir, "NORTH") == 0)
+        return NORTH;
+    if (strcmp(dir, "EAST") == 0)
+        return EAST;
+    if (strcmp(dir, "TRACE") == 0)
+        return TRACE;
+    return SS_PORT_TYPE_MAX;
+}
+
+/* Resolve the routed stream-switch port that carries mem-DMA (kind,ch) on
+ * (col,row) so the trace event port can watch the REAL data link instead of the
+ * trace-stream ingress. mem_dma_kind is AIE_TRACE_DMA_MM2S / _S2MM.
+ *   MM2S ch = a DMA SLAVE injection -> the routed link is its MASTER egress:
+ *     packet_connect  dma_dir=="DMA"   && dma_idx==ch    -> MASTER fwd_dir:fwd_idx
+ *     circuit_connect slave_dir=="DMA" && slave_idx==ch  -> MASTER master_dir:master_idx
+ *   S2MM ch = a DMA MASTER drain -> the routed link is its SLAVE ingress:
+ *     circuit_connect master_dir=="DMA" && master_idx==ch -> SLAVE slave_dir:slave_idx
+ *     packet_connect  dma_dir=="DMA"    && dma_idx==ch     -> SLAVE recv_dir:recv_idx
+ * Returns 1 with out_intf/out_type/out_idx set on the first hit whose dir maps
+ * to a real port type, else 0 (caller keeps its fallback). */
+static int resmap_lookup_dma_port(const struct AieResourceEntry *rm, int n, int col, int row, int mem_dma_kind,
+                                  int mem_dma_ch, XAie_StrmPortIntf *out_intf, StrmSwPortType *out_type, int *out_idx) {
+    for (int i = 0; i < n; i++) {
+        const struct AieResourceEntry *e = &rm[i];
+        if (e->col != col || e->row != row)
+            continue;
+        const char *dir = 0;
+        int idx = -1;
+        XAie_StrmPortIntf intf;
+        if (mem_dma_kind == AIE_TRACE_DMA_MM2S) {
+            intf = XAIE_STRMSW_MASTER;
+            if (e->dma_dir && strcmp(e->dma_dir, "DMA") == 0 && e->dma_idx == mem_dma_ch && e->fwd_idx >= 0) {
+                dir = e->fwd_dir;
+                idx = e->fwd_idx;
+            } else if (e->slave_dir && strcmp(e->slave_dir, "DMA") == 0 && e->slave_idx == mem_dma_ch) {
+                dir = e->master_dir;
+                idx = e->master_idx;
+            }
+        } else {
+            intf = XAIE_STRMSW_SLAVE;
+            if (e->master_dir && strcmp(e->master_dir, "DMA") == 0 && e->master_idx == mem_dma_ch) {
+                dir = e->slave_dir;
+                idx = e->slave_idx;
+            } else if (e->dma_dir && strcmp(e->dma_dir, "DMA") == 0 && e->dma_idx == mem_dma_ch && e->recv_idx >= 0) {
+                dir = e->recv_dir;
+                idx = e->recv_idx;
+            }
+        }
+        if (!dir || idx < 0)
+            continue;
+        StrmSwPortType t = resmap_dir_to_port_type(dir);
+        if (t == SS_PORT_TYPE_MAX)
+            continue;
+        *out_intf = intf;
+        *out_type = t;
+        *out_idx = idx;
+        return 1;
     }
     return 0;
 }
@@ -423,7 +563,8 @@ static void resmap_claim_trace(int col, uint8_t strm, uint8_t s2mm) {
  * is NOT detectable here; the BD is chosen parity-correct (MemTile channel rule)
  * and distinct per channel, matching today's convention (see _begin_ch). */
 static int resmap_pick_trace_resources(const struct AieResourceEntry *rm, int n, int col, uint8_t srcRow, uint8_t mtRow,
-                                       uint8_t *out_strm, uint8_t *out_s2mm, uint8_t *out_bd, uint8_t *out_pkt) {
+                                       uint8_t *out_strm, uint8_t *out_s2mm, uint8_t *out_bd, uint8_t *out_pkt,
+                                       uint8_t *out_arb, uint8_t *out_msel, uint8_t *out_mselen) {
     /* Core SOUTH-master / NORTH-slave and MemTile NORTH-slave ports are 0..3
      * (== AIE_TRACE_SLOTS_PER_COL, defined later near _begin_ch). */
     enum { TRACE_STRM_CH_RANGE = 4 };
@@ -463,6 +604,22 @@ static int resmap_pick_trace_resources(const struct AieResourceEntry *rm, int n,
     if (pkt < 0)
         return 0;
 
+    /* Dedicate a WHOLE packet arbiter to the trace stream on the source tile:
+     * pick the lowest arbiter (0..XAIE_SS_ARBITOR_MAX==7) used by NO data-plane
+     * recv/dma slave slot and NO forward master on this tile. With the arbiter
+     * exclusive, msel=0 is unambiguous and MSelEn = (1 << msel) reaches only the
+     * trace master. If none is free, fail the whole pick so the caller keeps the
+     * convention value (arbiter=1) and warns. */
+    enum { TRACE_ARB_MAX = 7 };
+    int arb = -1;
+    for (int a = 0; a <= TRACE_ARB_MAX; a++)
+        if (!resmap_arbiter_used(rm, n, col, srcRow, a)) {
+            arb = a;
+            break;
+        }
+    if (arb < 0)
+        return 0;
+
     /* Parity-correct + distinct-per-channel BD (MemTile rule: even ch -> BD<24,
      * odd ch -> BD>=24). Matches convention k_bd_for_slot {4,25,6,27}: even ch
      * -> 4+ch, odd ch -> 24+ch. Distinct s2mm (enforced above) => distinct BD. */
@@ -470,6 +627,9 @@ static int resmap_pick_trace_resources(const struct AieResourceEntry *rm, int n,
     *out_strm = (uint8_t)strm;
     *out_s2mm = (uint8_t)s2mm;
     *out_pkt = (uint8_t)pkt;
+    *out_arb = (uint8_t)arb;
+    *out_msel = 0;
+    *out_mselen = (uint8_t)(1u << *out_msel);
     return 1;
 }
 
@@ -482,18 +642,24 @@ static int resmap_pick_trace_resources(const struct AieResourceEntry *rm, int n,
  * Keeps __Runtime_core_trace_setup short (CLAUDE 200-line rule). No-op when the
  * map is absent/empty. */
 static void resmap_apply_trace_resources(const struct AieResourceEntry *rm, int n, XAie_LocType tile, uint8_t mt_row,
-                                         uint8_t *strm, uint8_t *s2mm, uint8_t *bd, uint8_t *pkt) {
+                                         uint8_t *strm, uint8_t *s2mm, uint8_t *bd, uint8_t *pkt, uint8_t *arb,
+                                         uint8_t *msel, uint8_t *mselen) {
     if (!rm || n <= 0)
         return;
-    uint8_t p_strm, p_s2mm, p_bd, p_pkt;
-    if (resmap_pick_trace_resources(rm, n, (int)tile.Col, tile.Row, mt_row, &p_strm, &p_s2mm, &p_bd, &p_pkt)) {
+    uint8_t p_strm, p_s2mm, p_bd, p_pkt, p_arb, p_msel, p_mselen;
+    if (resmap_pick_trace_resources(rm, n, (int)tile.Col, tile.Row, mt_row, &p_strm, &p_s2mm, &p_bd, &p_pkt, &p_arb,
+                                    &p_msel, &p_mselen)) {
         *strm = p_strm;
         *s2mm = p_s2mm;
         *bd = p_bd;
         *pkt = p_pkt;
-        printf(
-            "[aie_runtime] core_trace_setup: resource-map picked strm_ch=%u s2mm_ch=%u bd=%u pkt_id=%u tile(%u,%u)\n",
-            (unsigned)*strm, (unsigned)*s2mm, (unsigned)*bd, (unsigned)*pkt, (unsigned)tile.Col, (unsigned)tile.Row);
+        *arb = p_arb;
+        *msel = p_msel;
+        *mselen = p_mselen;
+        printf("[aie_runtime] core_trace_setup: resource-map picked strm_ch=%u s2mm_ch=%u bd=%u pkt_id=%u arbiter=%u "
+               "msel=%u mselen=%u tile(%u,%u)\n",
+               (unsigned)*strm, (unsigned)*s2mm, (unsigned)*bd, (unsigned)*pkt, (unsigned)*arb, (unsigned)*msel,
+               (unsigned)*mselen, (unsigned)tile.Col, (unsigned)tile.Row);
     } else {
         printf("[aie_runtime] core_trace_setup: resource-map found no free trace resources; keeping convention "
                "strm_ch=%u s2mm_ch=%u bd=%u tile(%u,%u)\n",
@@ -509,24 +675,44 @@ static void resmap_apply_trace_resources(const struct AieResourceEntry *rm, int 
  *      arbiter -- mirroring section 3a) plus the SOUTH master and MemTile S2MM
  *      channels the stream rides / lands on;
  *   2. the existing core_trace_stream_json line with the full hop-by-hop route.
- * The slot/mask/msel/arbiter literals mirror the XAie_StrmPktSw* enable calls in
- * __Runtime_core_trace_setup section 3a (slot 0, mask 0x1F, msel 0, arbiter 0). */
+ * The slot/mask literals and the msel/arbiter/mselen values mirror the
+ * XAie_StrmPktSw* enable calls in __Runtime_core_trace_setup section 3a (slot 0,
+ * mask 0x1F; msel/arbiter/mselen are the map-picked dedicated-arbiter values). */
+/* Lower-case names for the stream-switch port enums, so host tooling can label
+ * the monitored PORT_*_0 event port (e.g. "south slave 0"). Indexed by the
+ * StrmSwPortType / XAie_StrmPortIntf enum value; out-of-range folds to "?". */
+static const char *strm_port_type_name(StrmSwPortType p) {
+    static const char *names[] = {"core", "dma", "ctrl", "fifo", "south", "west", "north", "east", "trace", "uctrlr"};
+    return (p >= 0 && p < (int)(sizeof(names) / sizeof(names[0]))) ? names[p] : "?";
+}
+static const char *strm_port_intf_name(XAie_StrmPortIntf i) { return i == XAIE_STRMSW_MASTER ? "master" : "slave"; }
+
 static void trace_emit_stream_config(XAie_LocType tile, XAie_LocType mt, uint8_t mt_row, uint8_t strm_ch,
                                      uint8_t s2mm_ch, uint8_t bdnum, uint32_t buf_addr, uint32_t buf_len,
-                                     uint8_t pkt_id) {
+                                     uint8_t pkt_id, uint8_t msel, uint8_t arbiter, uint8_t mselen,
+                                     XAie_StrmPortIntf port_intf, StrmSwPortType port, uint8_t port_num) {
     printf("[TRACESTREAMCONFIG] src_tile=(%u,%u) in_port=TRACE:0 out_port=SOUTH:%u memtile=(%u,%u) "
-           "mt_in_port=NORTH:%u dma=S2MM:%u bd=%u pkt_id=%u slot=0 mask=0x1F msel=0 arbiter=0 "
+           "mt_in_port=NORTH:%u dma=S2MM:%u bd=%u pkt_id=%u slot=0 mask=0x1F msel=%u arbiter=%u mselen=%u "
            "buf_addr=0x%x buf_len=%u\n",
            (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)strm_ch, (unsigned)mt.Col, (unsigned)mt.Row,
-           (unsigned)strm_ch, (unsigned)s2mm_ch, (unsigned)bdnum, (unsigned)pkt_id, buf_addr, buf_len);
+           (unsigned)strm_ch, (unsigned)s2mm_ch, (unsigned)bdnum, (unsigned)pkt_id, (unsigned)msel, (unsigned)arbiter,
+           (unsigned)mselen, buf_addr, buf_len);
 
+    /* evt_port: the physical stream-switch port bound to event port 0, whose
+     * IDLE/RUNNING/STALLED state the PORT_*_0 slots (4..6) trace. It lives on
+     * the core `tile`, so host tooling labels the port lane "<tile> <dir>
+     * <intf> <num>" (e.g. "tile 0,3 south slave 0"). */
     printf("[aie_runtime] core_trace_stream_json: {"
            "\"src_tile\":[%u,%u],\"memtile\":[%u,%u],\"strm_ch\":%u,\"s2mm_ch\":%u,\"bd\":%u,"
-           "\"buf_addr\":\"0x%x\",\"buf_len\":%u,\"pkt_id\":%u,\"mask\":\"0x1F\","
-           "\"slots\":[\"%s\",\"%s\",\"%s\",\"%s\"],\"hops\":[",
+           "\"buf_addr\":\"0x%x\",\"buf_len\":%u,\"pkt_id\":%u,\"mask\":\"0x1F\",\"msel\":%u,\"arbiter\":%u,"
+           "\"mselen\":%u,\"evt_port\":{\"tile\":[%u,%u],\"port\":\"%s\",\"intf\":\"%s\",\"num\":%u},"
+           "\"slots\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"],\"hops\":[",
            (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)mt.Col, (unsigned)mt.Row, (unsigned)strm_ch,
-           (unsigned)s2mm_ch, (unsigned)bdnum, buf_addr, buf_len, (unsigned)pkt_id, s_core_trace_slot_name[0],
-           s_core_trace_slot_name[1], s_core_trace_slot_name[2], s_core_trace_slot_name[3]);
+           (unsigned)s2mm_ch, (unsigned)bdnum, buf_addr, buf_len, (unsigned)pkt_id, (unsigned)msel, (unsigned)arbiter,
+           (unsigned)mselen, (unsigned)tile.Col, (unsigned)tile.Row, strm_port_type_name(port),
+           strm_port_intf_name(port_intf), (unsigned)port_num, s_core_trace_slot_name[0], s_core_trace_slot_name[1],
+           s_core_trace_slot_name[2], s_core_trace_slot_name[3], s_core_trace_slot_name[4], s_core_trace_slot_name[5],
+           s_core_trace_slot_name[6]);
     printf("{\"tile\":[%u,%u],\"in\":\"TRACE\",\"out\":\"SOUTH\",\"ch\":%u,\"mode\":\"packet\"}", (unsigned)tile.Col,
            (unsigned)tile.Row, (unsigned)strm_ch);
     for (uint8_t r = (uint8_t)(tile.Row - 1); r > mt_row; r--)
@@ -537,20 +723,38 @@ static void trace_emit_stream_config(XAie_LocType tile, XAie_LocType mt, uint8_t
         (unsigned)mt.Col, (unsigned)mt.Row, (unsigned)strm_ch, (unsigned)s2mm_ch);
 }
 
-AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t buf_len,
-                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum, const struct AieResourceEntry *resmap,
-                                 int resmap_count) {
-    AieRC rc;
-    uint8_t pkt_id = 1;                                      /* trace pkt id; map may override below */
-    uint8_t mt_row = (uint8_t)(XAIE_AIE_TILE_ROW_START - 1); /* top memtile, directly below cores */
-    (void)resmap, (void)resmap_count;
-#ifdef AIE_HAVE_RESOURCE_MAP
-    /* When a routing map is passed, re-pick strm_ch/s2mm_ch/bdnum/pkt_id to avoid
-     * this column's recorded data-plane ports; otherwise keep the passed values. */
-    resmap_apply_trace_resources(resmap, resmap_count, tile, mt_row, &strm_ch, &s2mm_ch, &bdnum, &pkt_id);
-#endif
+/* Fill the parallel decode-time label tables for the `n` trace slots programmed
+ * with `ev[]` on (tile, mod). For each slot: convert the XAie_Events enum to its
+ * PHYSICAL hardware event id (the 0..127 value the trace unit emits, via
+ * XAie_EventLogicalToPhysicalConv) into evout[], and -- when nmout is non-NULL --
+ * record the driver's specific event name (XAie_EventGetString, e.g.
+ * "DMA_MM2S_0_STALLED_LOCK_MEM") into nmout[]. On conversion failure the raw
+ * enum is kept so the slot still prints something. Lets the [TIMESYNC] dump show
+ * the true HW event number and exact watched event instead of a global enum
+ * index / generic slot label. */
+static void trace_fill_event_labels(XAie_DevInst *dev, XAie_LocType tile, XAie_ModuleType mod, const XAie_Events *ev,
+                                    uint8_t n, uint16_t *evout, const char **nmout) {
+    for (uint8_t slot = 0; slot < n; slot++) {
+        uint16_t hw = 0;
+        if (XAie_EventLogicalToPhysicalConv(dev, tile, mod, ev[slot], &hw) == XAIE_OK)
+            evout[slot] = hw;
+        else
+            evout[slot] = (uint16_t)ev[slot];
+        if (nmout)
+            nmout[slot] = XAie_EventGetString(ev[slot]);
+    }
+}
 
-    rc = XAie_TraceControlConfigReset(dev, tile, XAIE_CORE_MOD);
+/* Program the core-module trace unit on `tile` (split out of
+ * __Runtime_core_trace_setup for the 200-line rule): reset control/pkt/event
+ * config, bind stream-switch event port 0 so PORT_*_0 reflect real traffic on
+ * the caller-chosen physical port, set the ACTIVE_CORE..DISABLED_CORE capture
+ * window in EVENT_TIME mode, map the traced events into slots 0..6 (0..3 =
+ * core-state ACTIVE/LOCK/STREAM/MEMORY stall, 4..6 = port-0 IDLE/RUNNING/
+ * STALLED), install the trace packet id `Pkt` and read back the unit state. */
+static AieRC core_trace_program_unit(XAie_DevInst *dev, XAie_LocType tile, XAie_Packet Pkt, XAie_StrmPortIntf port_intf,
+                                     StrmSwPortType port, uint8_t port_num) {
+    AieRC rc = XAie_TraceControlConfigReset(dev, tile, XAIE_CORE_MOD);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: TraceControlConfigReset failed rc=%d tile(%u,%u)\n", (int)rc,
                (unsigned)tile.Col, (unsigned)tile.Row);
@@ -564,9 +768,19 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
         return rc;
     }
 
-    rc = XAie_TraceEventReset(dev, tile, XAIE_CORE_MOD, 4);
+    rc = XAie_TraceEventReset(dev, tile, XAIE_CORE_MOD, AIE_CORE_TRACE_NSLOTS);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: TraceEventReset failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
+    /* Bind event-port 0 to a physical stream-switch port so the PORT_IDLE_0 /
+     * PORT_RUNNING_0 / PORT_STALLED_0 events in slots 4..6 track real traffic
+     * (default core MASTER port 0 = the core's outgoing stream). */
+    rc = XAie_EventSelectStrmPort(dev, tile, /*SelectId=*/0, port_intf, port, port_num);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] core_trace_setup: EventSelectStrmPort failed rc=%d tile(%u,%u)\n", (int)rc,
                (unsigned)tile.Col, (unsigned)tile.Row);
         return rc;
     }
@@ -583,10 +797,13 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
         return rc;
     }
 
-    /* 2. Map the events we care about into trace slots 0..3. */
-    static const XAie_Events trace_events[4] = {XAIE_EVENT_ACTIVE_CORE, XAIE_EVENT_LOCK_STALL_CORE,
-                                                XAIE_EVENT_STREAM_STALL_CORE, XAIE_EVENT_MEMORY_STALL_CORE};
-    for (uint8_t slot = 0; slot < 4; slot++) {
+    /* 2. Map the events we care about into trace slots 0..6 (order MUST match
+     * s_core_trace_slot_name so the decoder names them correctly). */
+    static const XAie_Events trace_events[AIE_CORE_TRACE_NSLOTS] = {
+        XAIE_EVENT_ACTIVE_CORE,        XAIE_EVENT_LOCK_STALL_CORE,  XAIE_EVENT_STREAM_STALL_CORE,
+        XAIE_EVENT_MEMORY_STALL_CORE,  XAIE_EVENT_PORT_IDLE_0_CORE, XAIE_EVENT_PORT_RUNNING_0_CORE,
+        XAIE_EVENT_PORT_STALLED_0_CORE};
+    for (uint8_t slot = 0; slot < AIE_CORE_TRACE_NSLOTS; slot++) {
         rc = XAie_TraceEvent(dev, tile, XAIE_CORE_MOD, trace_events[slot], slot);
         if (rc != XAIE_OK) {
             printf("[aie_runtime] core_trace_setup: TraceEvent slot=%u failed rc=%d tile(%u,%u)\n", (unsigned)slot,
@@ -594,8 +811,11 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
             return rc;
         }
     }
+    /* Record each slot's physical HW event id for the decode-time "{event value}"
+     * suffix (core names are already specific, so no dynamic name table). */
+    trace_fill_event_labels(dev, tile, XAIE_CORE_MOD, trace_events, AIE_CORE_TRACE_NSLOTS, s_core_trace_slot_event,
+                            NULL);
 
-    XAie_Packet Pkt = XAie_PacketInit(pkt_id, 1);
     rc = XAie_TracePktConfig(dev, tile, XAIE_CORE_MOD, Pkt);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: TracePktConfig failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)tile.Col,
@@ -612,6 +832,202 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
     }
     printf("[aie_runtime] core_trace_setup: TraceGetState tile(%u,%u) state=%d\n", (unsigned)tile.Col,
            (unsigned)tile.Row, (int)Status);
+    return XAIE_OK;
+}
+
+/* Fill the 8 MEMORY-module trace slot events for DMA (kind, ch). Slots 5..7 are
+ * always GROUP_LOCK / LOCK_0 acquire / LOCK_0 release; slots 0..4 select the DMA
+ * direction+channel BD/stall events. S2MM slot3/4 = stream starvation / memory
+ * backpressure; MM2S slot3/4 = stream backpressure / memory starvation (the
+ * direction-mirrored events). Order MUST match s_mem_trace_slot_name. Only DMA
+ * channels 0 and 1 exist; ch>=1 folds to channel 1. */
+static void mem_trace_events_for_chan(int kind, uint8_t ch, XAie_Events out[8]) {
+    /* mem_trace_setup only runs on gen2+ (gen1 has no MemTile and bails out of
+     * core_trace_setup at the XAIE_RES_TILE_NUM_ROWS==0 guard). On gen2 the
+     * lock-ACQUIRE event was split into selectable-lock variants
+     * (LOCK_SEL0_ACQ_EQ=44 / LOCK_SEL0_ACQ_GE=45), so the classic gen1
+     * LOCK_0_ACQ enum maps to XAIE_EVENT_INVALID and XAie_TraceEvent rejects it.
+     * The RELEASE event was NOT split: the plain LOCK_0_REL (event 46) survives
+     * on the compute-tile memory module for both AIE-ML and AIE2PS (there is no
+     * LOCK_SEL0_REL on the compute-tile mem module -- only the MemTile has that).
+     * So slot 6 traces the acquire (SEL0 ACQ_GE, the one that actually fires) and
+     * slot 7 traces the real lock release (LOCK_0_REL). */
+    out[5] = XAIE_EVENT_LOCK_SEL0_ACQ_EQ_MEM;
+    out[6] = XAIE_EVENT_LOCK_SEL0_ACQ_GE_MEM;
+    out[7] = XAIE_EVENT_LOCK_0_REL_MEM;
+    if (kind == AIE_TRACE_DMA_MM2S) {
+        if (ch >= 1u) {
+            out[0] = XAIE_EVENT_DMA_MM2S_1_START_TASK_MEM;
+            out[1] = XAIE_EVENT_DMA_MM2S_1_FINISHED_BD_MEM;
+            out[2] = XAIE_EVENT_DMA_MM2S_1_STALLED_LOCK_MEM;
+            out[3] = XAIE_EVENT_DMA_MM2S_1_STREAM_BACKPRESSURE_MEM;
+            out[4] = XAIE_EVENT_DMA_MM2S_1_MEMORY_STARVATION_MEM;
+        } else {
+            out[0] = XAIE_EVENT_DMA_MM2S_0_START_TASK_MEM;
+            out[1] = XAIE_EVENT_DMA_MM2S_0_FINISHED_BD_MEM;
+            out[2] = XAIE_EVENT_DMA_MM2S_0_STALLED_LOCK_MEM;
+            out[3] = XAIE_EVENT_DMA_MM2S_0_STREAM_BACKPRESSURE_MEM;
+            out[4] = XAIE_EVENT_DMA_MM2S_0_MEMORY_STARVATION_MEM;
+        }
+    } else { /* AIE_TRACE_DMA_S2MM (default) */
+        if (ch >= 1u) {
+            out[0] = XAIE_EVENT_DMA_S2MM_1_START_TASK_MEM;
+            out[1] = XAIE_EVENT_DMA_S2MM_1_FINISHED_BD_MEM;
+            out[2] = XAIE_EVENT_DMA_S2MM_1_STALLED_LOCK_MEM;
+            out[3] = XAIE_EVENT_DMA_S2MM_1_STREAM_STARVATION_MEM;
+            out[4] = XAIE_EVENT_DMA_S2MM_1_MEMORY_BACKPRESSURE_MEM;
+        } else {
+            out[0] = XAIE_EVENT_DMA_S2MM_0_START_TASK_MEM;
+            out[1] = XAIE_EVENT_DMA_S2MM_0_FINISHED_BD_MEM;
+            out[2] = XAIE_EVENT_DMA_S2MM_0_STALLED_LOCK_MEM;
+            out[3] = XAIE_EVENT_DMA_S2MM_0_STREAM_STARVATION_MEM;
+            out[4] = XAIE_EVENT_DMA_S2MM_0_MEMORY_BACKPRESSURE_MEM;
+        }
+    }
+}
+
+/* Program the MEMORY-module trace unit on `tile` (mirror of
+ * core_trace_program_unit for XAIE_MEM_MOD; split out for the 200-line rule):
+ * reset control/pkt/event config, set a free-running TRUE_MEM..NONE_MEM capture
+ * window in EVENT_TIME mode (mem-module has no core ACTIVE window and ModeConfig
+ * is unavailable on AIE-ML, so TRUE/NONE arms it from setup), map the 8 DMA
+ * (kind,ch) events into slots 0..7, install the trace packet id `Pkt` and read
+ * back the unit state. */
+static AieRC mem_trace_program_unit(XAie_DevInst *dev, XAie_LocType tile, XAie_Packet Pkt, int kind, uint8_t ch) {
+    AieRC rc = XAie_TraceControlConfigReset(dev, tile, XAIE_MEM_MOD);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] mem_trace_setup: TraceControlConfigReset failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+    rc = XAie_TracePktConfigReset(dev, tile, XAIE_MEM_MOD);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] mem_trace_setup: TracePktConfigReset failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+    rc = XAie_TraceEventReset(dev, tile, XAIE_MEM_MOD, AIE_MEM_TRACE_NSLOTS);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] mem_trace_setup: TraceEventReset failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)tile.Col,
+               (unsigned)tile.Row);
+        return rc;
+    }
+    /* Free-running window: start on TRUE (always) with no stop event, EVENT_TIME
+     * timestamps. DMA events only fire during activity, so the timeline stays
+     * meaningful; both units share the tile timer for a common time base. */
+    rc = XAie_TraceControlConfig(dev, tile, XAIE_MEM_MOD, XAIE_EVENT_TRUE_MEM, XAIE_EVENT_NONE_MEM,
+                                 XAIE_TRACE_EVENT_TIME);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] mem_trace_setup: TraceControlConfig failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+    XAie_Events ev[8];
+    mem_trace_events_for_chan(kind, ch, ev);
+    /* Remember each slot's physical HW event id + specific driver name for
+     * decode-time labelling (the "{event value}" suffix and the [TIMESYNC] dump's
+     * direction/channel-accurate names, e.g. DMA_MM2S_0_STALLED_LOCK_MEM). */
+    trace_fill_event_labels(dev, tile, XAIE_MEM_MOD, ev, AIE_MEM_TRACE_NSLOTS, s_mem_trace_slot_event,
+                            s_mem_trace_slot_dynname);
+    for (uint8_t slot = 0; slot < AIE_MEM_TRACE_NSLOTS; slot++) {
+        rc = XAie_TraceEvent(dev, tile, XAIE_MEM_MOD, ev[slot], slot);
+        if (rc != XAIE_OK) {
+            printf("[aie_runtime] mem_trace_setup: TraceEvent slot=%u failed rc=%d tile(%u,%u)\n", (unsigned)slot,
+                   (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
+            return rc;
+        }
+    }
+    rc = XAie_TracePktConfig(dev, tile, XAIE_MEM_MOD, Pkt);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] mem_trace_setup: TracePktConfig failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)tile.Col,
+               (unsigned)tile.Row);
+        return rc;
+    }
+    XAie_TraceState Status;
+    rc = XAie_TraceGetState(dev, tile, XAIE_MEM_MOD, &Status);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] mem_trace_setup: TraceGetState failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)tile.Col,
+               (unsigned)tile.Row);
+        return rc;
+    }
+    printf("[aie_runtime] mem_trace_setup: TraceGetState tile(%u,%u) state=%d\n", (unsigned)tile.Col,
+           (unsigned)tile.Row, (int)Status);
+    return XAIE_OK;
+}
+
+AieRC __Runtime_mem_trace_setup(XAie_DevInst *dev, XAie_LocType tile, int dma_kind, uint8_t dma_ch, uint8_t arbiter,
+                                uint8_t msel) {
+    if (dma_kind == AIE_TRACE_DMA_NONE)
+        return XAIE_OK; /* mem trace disabled: no-op */
+
+    /* Packet id 2 is FIXED for the mem-module trace stream (core events use 1),
+     * so the shared-buffer decoder can demux the two streams by packet id. */
+    XAie_Packet Pkt2 = XAie_PacketInit(2, 1);
+    AieRC rc = mem_trace_program_unit(dev, tile, Pkt2, dma_kind, dma_ch);
+    if (rc != XAIE_OK)
+        return rc;
+
+    /* Enable the MEM_TRACE stream-switch slave port (TRACE port index 1;
+     * TRACE:0 is the core AIE_TRACE port) and add a pkt-2 slot onto the SAME
+     * arbiter the core stream claimed, but with a DISTINCT msel, so both packet
+     * ids round-robin onto the shared SOUTH master and land in one MemTile
+     * buffer. The caller enabled the master with an MSelEn covering both msels. */
+    rc = XAie_StrmPktSwSlaveSlotEnable(dev, tile, TRACE, 1, /*slot=*/0, Pkt2, /*mask=*/0x1F, msel, arbiter);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] mem_trace_setup: StrmPktSwSlaveSlotEnable TRACE:1 failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+    rc = XAie_StrmPktSwSlavePortEnable(dev, tile, TRACE, 1);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] mem_trace_setup: StrmPktSwSlavePortEnable TRACE:1 failed rc=%d tile(%u,%u)\n", (int)rc,
+               (unsigned)tile.Col, (unsigned)tile.Row);
+        return rc;
+    }
+
+    /* Emit a mem-stream config line so host tooling can parse the 2nd (pkt id 2)
+     * stream that shares the core drain: same route, distinguished by pkt_id and
+     * the DMA direction/channel carried here, with the mem slot-name table. */
+    printf("[TRACESTREAMCONFIG] src_tile=(%u,%u) in_port=TRACE:1 out_port=SOUTH(shared) pkt_id=2 slot=0 mask=0x1F "
+           "msel=%u arbiter=%u dma=%s:%u slots=%s,%s,%s,%s,%s,%s,%s,%s\n",
+           (unsigned)tile.Col, (unsigned)tile.Row, (unsigned)msel, (unsigned)arbiter,
+           (dma_kind == AIE_TRACE_DMA_MM2S) ? "MM2S" : "S2MM", (unsigned)dma_ch, s_mem_trace_slot_name[0],
+           s_mem_trace_slot_name[1], s_mem_trace_slot_name[2], s_mem_trace_slot_name[3], s_mem_trace_slot_name[4],
+           s_mem_trace_slot_name[5], s_mem_trace_slot_name[6], s_mem_trace_slot_name[7]);
+    return XAIE_OK;
+}
+
+AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t buf_len,
+                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum, const struct AieResourceEntry *resmap,
+                                 int resmap_count, XAie_StrmPortIntf port_intf, StrmSwPortType port, uint8_t port_num,
+                                 int mem_dma_kind, uint8_t mem_dma_ch) {
+    AieRC rc;
+    uint8_t pkt_id = 1; /* core-event trace pkt id: FIXED at 1, never map-overridden */
+    uint8_t mt_row = (uint8_t)(XAIE_AIE_TILE_ROW_START - 1); /* top memtile, directly below cores */
+    /* Source TRACE port packet-switch slot: default to the raw/single-kernel
+     * convention (arbiter 1, msel 0, MSelEn 1); map path picks a dedicated one. */
+    uint8_t arbiter = 1, msel = 0, mselen = 1;
+    (void)resmap, (void)resmap_count;
+#ifdef AIE_HAVE_RESOURCE_MAP
+    /* Map present: re-pick strm_ch/s2mm_ch/bdnum plus a dedicated
+     * arbiter/msel/mselen to avoid this column's data-plane ports and arbiters.
+     * pkt_id is intentionally excluded: core events always use a fixed pkt id 1,
+     * so pass a throwaway that the picker may write but we discard. */
+    uint8_t map_pkt_id = pkt_id;
+    resmap_apply_trace_resources(resmap, resmap_count, tile, mt_row, &strm_ch, &s2mm_ch, &bdnum, &map_pkt_id, &arbiter,
+                                 &msel, &mselen);
+    (void)map_pkt_id; /* discarded: pkt_id stays fixed at 1 for core events */
+    pkt_id = 1;       /* enforce fixed core-event pkt id after map apply */
+#endif
+
+    /* Program the trace unit (resets, port-0 binding, capture window, the 7
+     * slot events, packet id, state read-back) in one helper -- keeps this
+     * function under the 200-line rule. Pkt is reused by the section-3a
+     * packet-switch slot below, so build it here. */
+    XAie_Packet Pkt = XAie_PacketInit(pkt_id, 1);
+    rc = core_trace_program_unit(dev, tile, Pkt, port_intf, port, port_num);
+    if (rc != XAIE_OK)
+        return rc;
 
     /* 3. Route the core TRACE stream DOWN through the intervening core tiles into
      * the same-column top MemTile's S2MM DMA channel. Every hop rides one
@@ -633,29 +1049,46 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
      * port is enabled, and the SOUTH master forwards the matched packets
      * downward keeping the header so the downstream trace parser can identify
      * the stream. Every downstream hop (3b/3c) then rides the same physical
-     * channel in plain circuit-switched mode. slot/msel/arbiter are 0 and
-     * MSelEn = (1 << msel) = 0x1; mask 0x1F matches the full 5-bit packet id. */
+     * channel in plain circuit-switched mode. The slave slot and SOUTH master
+     * share a DEDICATED arbiter (map-picked collision-free vs. every data-plane
+     * slave/master on this tile; convention arbiter=1 raw), so no data slot can
+     * cross-route in. msel=0, MSelEn=1<<msel (arbiter exclusive); mask 0x1F. */
     rc = XAie_StrmPktSwSlaveSlotEnable(dev, tile, TRACE, 0, /*slot=*/0, Pkt,
-                                       /*mask=*/0x1F, /*msel=*/0, /*arbiter=*/1);
+                                       /*mask=*/0x1F, msel, arbiter);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: StrmPktSwSlaveSlotEnable TRACE ch=%u failed rc=%d tile(%u,%u)\n",
                (unsigned)strm_ch, (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
         return rc;
     }
-    // return rc;//ok
     rc = XAie_StrmPktSwSlavePortEnable(dev, tile, TRACE, 0);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: StrmPktSwSlavePortEnable TRACE failed rc=%d tile(%u,%u)\n", (int)rc,
                (unsigned)tile.Col, (unsigned)tile.Row);
         return rc;
     }
-    // return rc;
-    rc = XAie_StrmPktSwMstrPortEnable(dev, tile, SOUTH, strm_ch, XAIE_SS_PKT_DONOT_DROP_HEADER,
-                                      /*arbiter=*/1, /*MSelEn=*/1);
+    /* If the memory-module DMA trace is also requested, it rides the SAME SOUTH
+     * master drain (one physical channel, one shared DMA buffer) but is demuxed
+     * downstream by packet id (core=1, mem=2). To merge two packet streams onto
+     * one master arbiter, each stream gets a DISTINCT MSel and the master's
+     * MSelEn is the OR of both MSel bits. Core uses msel; mem uses mem_msel. */
+    uint8_t mem_enabled = (mem_dma_kind != AIE_TRACE_DMA_NONE) ? 1u : 0u;
+    uint8_t mem_msel = (uint8_t)((msel == 0) ? 1u : 0u); /* distinct from core msel */
+    uint8_t master_mselen = mem_enabled ? (uint8_t)((1u << msel) | (1u << mem_msel)) : mselen;
+    rc = XAie_StrmPktSwMstrPortEnable(dev, tile, SOUTH, strm_ch, XAIE_SS_PKT_DONOT_DROP_HEADER, arbiter, master_mselen);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_setup: StrmPktSwMstrPortEnable SOUTH ch=%u failed rc=%d tile(%u,%u)\n",
                (unsigned)strm_ch, (int)rc, (unsigned)tile.Col, (unsigned)tile.Row);
         return rc;
+    }
+    /* Arm the mem-module trace unit and its TRACE:1 slave slot (pkt id 2) sharing
+     * this arbiter. Runs after the master is up so both streams merge cleanly. */
+    if (mem_enabled) {
+        rc = __Runtime_mem_trace_setup(dev, tile, mem_dma_kind, mem_dma_ch, arbiter, mem_msel);
+        if (rc != XAIE_OK) {
+            printf("[aie_runtime] core_trace_setup: mem_trace_setup failed rc=%d tile(%u,%u)\n", (int)rc,
+                   (unsigned)tile.Col, (unsigned)tile.Row);
+            return rc;
+        }
     }
 
     /* 3b. Each intervening core tile passes it straight through:
@@ -725,7 +1158,8 @@ AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t 
     /* Emit the trace-stream routing setup ([TRACESTREAMCONFIG] one-liner +
      * core_trace_stream_json) so host-side timeline/decoder tooling can parse the
      * core->MemTile route, ports, slot/pkt/mask and channels from the applog. */
-    trace_emit_stream_config(tile, mt, mt_row, strm_ch, s2mm_ch, bdnum, buf_addr, buf_len, pkt_id);
+    trace_emit_stream_config(tile, mt, mt_row, strm_ch, s2mm_ch, bdnum, buf_addr, buf_len, pkt_id, msel, arbiter,
+                             mselen, port_intf, port, port_num);
 
     AIEHLC_LOG(printf("[aie_runtime] core_trace_setup OK core(%u,%u) -> memtile(%u,%u) buf=0x%x len=%u strm_ch=%u "
                       "s2mm_ch=%u\n",
@@ -793,33 +1227,49 @@ AieRC __Runtime_core_trace_read(XAie_DevInst *dev, XAie_LocType tile, uint32_t b
  * event(s) are emitted at the new cycle. Single carries a 3-bit event index;
  * Multiple carries an 8-bit event bitmap. Event index -> slot name follows the
  * slots programmed by __Runtime_core_trace_setup (0..3 = ACTIVE, LOCK_STALL,
- * STREAM_STALL, MEMORY_STALL). Repeat re-emits the previous frame's event set
+ * STREAM_STALL, MEMORY_STALL; 4..6 = PORT_IDLE_0, PORT_RUNNING_0,
+ * PORT_STALLED_0). Repeat re-emits the previous frame's event set
  * for `repeats` more consecutive cycles (or, after a Sync, adds that many
  * 0x3FFFF idle periods). The frame bit layouts are high confidence (Figure
  * 4-14); the Repeat/Sync cycle accumulation is the documented compression
  * semantics. */
 
 #define XAIE_TRACE_SYNC_CYCLES 0x3FFFFu /* Sync frame = 18-bit count wrap */
+#define AIE_TRACE_MAX_PKTS 256u         /* 4 KB buf = 128 pkts; headroom for demux */
 
-/* Payload-word index (packet headers skipped) -> absolute buffer word index. */
-static uint32_t __core_trace_pw(uint32_t pwi) { return (pwi / 7u) * 8u + 1u + (pwi % 7u); }
+/* Decode context for ONE packet-id stream: the raw buffer plus the ordered list
+ * of that stream's packet-header word indices (bases). A shared MemTile buffer
+ * can interleave core (pkt 1) and mem (pkt 2) packets, so the payload-word ->
+ * absolute-word map walks this per-stream base list instead of assuming every
+ * 8-word packet belongs to the stream being decoded. */
+typedef struct {
+    const uint32_t *buf;
+    const uint32_t *bases; /* absolute word index of each header for THIS pkt id */
+    uint32_t npkts;
+} __core_trace_ctx;
+
+/* Payload-word index (packet headers skipped) -> absolute buffer word index,
+ * following this stream's packet base list (7 payload words per packet). */
+static uint32_t __core_trace_pw(const __core_trace_ctx *ctx, uint32_t pwi) {
+    return ctx->bases[pwi / 7u] + 1u + (pwi % 7u);
+}
 
 /* Read nbits MSB-first from the header-stripped payload stream at *bitpos. */
-static uint32_t __core_trace_bits(const uint32_t *buf, uint64_t *bitpos, uint32_t nbits) {
+static uint32_t __core_trace_bits(const __core_trace_ctx *ctx, uint64_t *bitpos, uint32_t nbits) {
     uint32_t v = 0;
     for (uint32_t i = 0; i < nbits; i++) {
         uint64_t bp = *bitpos + i;
-        uint32_t w = __core_trace_pw((uint32_t)(bp >> 5));
+        uint32_t w = __core_trace_pw(ctx, (uint32_t)(bp >> 5));
         uint32_t off = (uint32_t)(bp & 31u);
-        v = (v << 1) | ((buf[w] >> (31u - off)) & 1u);
+        v = (v << 1) | ((ctx->buf[w] >> (31u - off)) & 1u);
     }
     *bitpos += nbits;
     return v;
 }
 
 /* Peek the next 8 bits (the type byte) without advancing. */
-static uint32_t __core_trace_peek8(const uint32_t *buf, uint64_t bitpos) {
-    return __core_trace_bits(buf, &bitpos, 8u); /* bitpos is a by-value copy */
+static uint32_t __core_trace_peek8(const __core_trace_ctx *ctx, uint64_t bitpos) {
+    return __core_trace_bits(ctx, &bitpos, 8u); /* bitpos is a by-value copy */
 }
 
 /* Run-length tracker: a maximal set of contiguous cycles carrying the identical
@@ -828,31 +1278,50 @@ typedef struct {
     int open;
     uint64_t start, end;
     uint32_t mask;
-    AieTraceProfile *prof; /* optional sink; NULL = print only */
+    AieTraceProfile *prof;    /* optional sink; NULL = print only */
+    const char *const *names; /* active 8-slot name table for this stream */
 } __core_trace_run;
 
 /* Build the '|'-joined slot names of an 8-bit event mask into out[cap]
- * (slot <4 -> configured name, else EVENT<s>), following the emit ordering
- * (slot 0..7). */
-static void __core_trace_names(uint32_t mask, char *out, size_t cap) {
+ * (each set slot -> configured name from the passed 8-entry table `names`),
+ * following the emit ordering (slot 0..7). `names` selects the stream's table
+ * (core vs mem) so a shared buffer decodes each pkt id with its own labels.
+ * When `events` is non-NULL, appends the raw XAie event value of each set slot,
+ * colon-separated in slot order, as a "{event value v1:v2:...}" suffix
+ * (e.g. "DMA_STALL_LOCK|STREAM_STALL{event value 12:45}"). */
+static void __core_trace_names(const char *const *names, const uint16_t *events, uint32_t mask, char *out, size_t cap) {
     size_t n = 0;
     if (cap)
         out[0] = '\0';
     for (uint32_t s = 0; s < 8u; s++) {
         if (!(mask & (1u << s)))
             continue;
-        char tmp[16];
-        const char *nm;
-        if (s < 4u) {
-            nm = s_core_trace_slot_name[s];
-        } else {
-            snprintf(tmp, sizeof(tmp), "EVENT%u", (unsigned)s);
-            nm = tmp;
-        }
+        const char *nm = names[s];
         if (n && n + 1 < cap)
             out[n++] = '|';
         while (*nm && n + 1 < cap)
             out[n++] = *nm++;
+        if (n < cap)
+            out[n] = '\0';
+    }
+    if (events && mask) {
+        const char *tag = "{event value ";
+        for (const char *t = tag; *t && n + 1 < cap; t++)
+            out[n++] = *t;
+        int first = 1;
+        for (uint32_t s = 0; s < 8u; s++) {
+            if (!(mask & (1u << s)))
+                continue;
+            if (!first && n + 1 < cap)
+                out[n++] = ':';
+            first = 0;
+            char num[8];
+            int m = snprintf(num, sizeof(num), "%u", (unsigned)events[s]);
+            for (int k = 0; k < m && n + 1 < cap; k++)
+                out[n++] = num[k];
+        }
+        if (n + 1 < cap)
+            out[n++] = '}';
         if (n < cap)
             out[n] = '\0';
     }
@@ -864,22 +1333,30 @@ static void __core_trace_flush(__core_trace_run *run) {
     if (!run->open)
         return;
     char names[128];
-    __core_trace_names(run->mask, names, sizeof(names));
+    /* Live decode keeps the plain "<names>" form (no event-value suffix) so it
+     * stays byte-identical to the Python reference model; the [TIMESYNC] profile
+     * dump below is the surface that appends the event values. */
+    __core_trace_names(run->names, NULL, run->mask, names, sizeof(names));
     if (run->start == run->end)
         printf("%llu  %s\n", (unsigned long long)run->start, names);
     else
         printf("%llu -- %llu  %s  (%llu cyc)\n", (unsigned long long)run->start, (unsigned long long)run->end, names,
                (unsigned long long)(run->end - run->start + 1u));
-    /* Append the same coalesced interval into the optional profile. */
+    /* Append the same coalesced interval into the optional profile. The current
+     * stream may only fill up to CAP minus the slots reserved for streams that
+     * have not been decoded yet (fair-share: keeps a chatty core stream from
+     * starving the mem stream decoded after it -- see __Runtime_core_trace_decode). */
     if (run->prof) {
         AieTraceProfile *p = run->prof;
-        if (p->count < AIE_TRACE_PROFILE_CAP) {
+        uint32_t eff_cap = (p->reserve < AIE_TRACE_PROFILE_CAP) ? (AIE_TRACE_PROFILE_CAP - p->reserve) : 0u;
+        if (p->count < eff_cap) {
             AieTraceInterval *v = &p->iv[p->count++];
             v->col = p->cur_col;
             v->row = p->cur_row;
             v->mask = run->mask;
             v->start_cycle = run->start;
             v->end_cycle = run->end;
+            v->names = run->names; /* stream's table, for the dump labels */
         } else {
             p->dropped++;
         }
@@ -921,13 +1398,126 @@ static void __core_trace_repeat(__core_trace_run *run, uint64_t *cycle, uint32_t
     }
 }
 
+/* Decode one packet-id stream (ctx = its buffer + base list) into the ACTIVE/
+ * *_STALL timeline, labelling event slots with `names`. Factored out of the
+ * public entry so a shared buffer can be demuxed by pkt id and each stream
+ * decoded with its own slot-name table. */
+static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *const *names, AieTraceProfile *prof) {
+    uint64_t total_bits = (uint64_t)ctx->npkts * 7u * 32u;
+
+    /* Inner: Event-Time frame stream (AIE2ps Arch Spec, Figure 4-14). */
+    uint64_t bitpos = 0, cycle = 0;
+    int last_kind = -1;         /* -1 none, 0 single, 1 multiple, 2 sync */
+    uint32_t last_events = 0;   /* single: slot index; multiple: 8-bit mask */
+    __core_trace_run run = {0}; /* run-length coalescer for per-cycle events */
+    run.prof = prof;            /* optional interval sink */
+    run.names = names;          /* this stream's slot-name table */
+
+    while (bitpos + 8u <= total_bits) {
+        uint32_t b0 = __core_trace_peek8(ctx, bitpos), v;
+
+        if ((b0 & 0x80u) == 0u) { /* Single0 8b: 0 eee cccc */
+            v = __core_trace_bits(ctx, &bitpos, 8u);
+            cycle += (v & 0xFu);
+            last_events = (v >> 4) & 0x7u;
+            last_kind = 0;
+            __core_trace_mark(&run, cycle, 1u << last_events);
+        } else if ((b0 & 0x40u) == 0u) { /* Single1/2: 10x */
+            uint32_t nb = (b0 & 0x20u) ? 24u : 16u;
+            if (bitpos + nb > total_bits)
+                break;
+            v = __core_trace_bits(ctx, &bitpos, nb);
+            uint32_t sh = (nb == 24u) ? 18u : 10u;
+            cycle += (v & ((1u << sh) - 1u));
+            last_events = (v >> sh) & 0x7u;
+            last_kind = 0;
+            __core_trace_mark(&run, cycle, 1u << last_events);
+        } else if ((b0 & 0x20u) == 0u) { /* 110... */
+            if ((b0 & 0x10u) == 0u) {    /* Multiple0 16b: 1100 mmmmmmmm cccc */
+                if (bitpos + 16u > total_bits)
+                    break;
+                v = __core_trace_bits(ctx, &bitpos, 16u);
+                cycle += (v & 0xFu);
+                last_events = (v >> 4) & 0xFFu;
+                last_kind = 1;
+                __core_trace_mark(&run, cycle, last_events);
+            } else {
+                uint32_t sel = (b0 >> 2) & 0x3u; /* 1101 xx */
+                if (sel == 0u) {                 /* Multiple1 24b */
+                    if (bitpos + 24u > total_bits)
+                        break;
+                    v = __core_trace_bits(ctx, &bitpos, 24u);
+                    cycle += (v & 0x3FFu);
+                    last_events = (v >> 10) & 0xFFu;
+                    last_kind = 1;
+                    __core_trace_mark(&run, cycle, last_events);
+                } else if (sel == 1u) { /* Multiple2 32b */
+                    if (bitpos + 32u > total_bits)
+                        break;
+                    v = __core_trace_bits(ctx, &bitpos, 32u);
+                    cycle += (v & 0x3FFFFu);
+                    last_events = (v >> 18) & 0xFFu;
+                    last_kind = 1;
+                    __core_trace_mark(&run, cycle, last_events);
+                } else if (sel == 2u) { /* Repeat1 16b */
+                    if (bitpos + 16u > total_bits)
+                        break;
+                    v = __core_trace_bits(ctx, &bitpos, 16u);
+                    __core_trace_repeat(&run, &cycle, v & 0x3FFu, last_kind, last_events);
+                } else { /* Stop 32b: 110111 x(8) c(18) */
+                    if (bitpos + 32u > total_bits)
+                        break;
+                    v = __core_trace_bits(ctx, &bitpos, 32u);
+                    cycle += (v & 0x3FFFFu);
+                    __core_trace_flush(&run);
+                    printf("[aie_runtime] core_trace_decode: STOP @ %llu\n", (unsigned long long)cycle);
+                    last_kind = -1;
+                }
+            }
+        } else if ((b0 & 0x10u) == 0u) { /* Repeat0 8b: 1110 rrrr */
+            v = __core_trace_bits(ctx, &bitpos, 8u);
+            __core_trace_repeat(&run, &cycle, v & 0xFu, last_kind, last_events);
+        } else if ((b0 & 0x08u) == 0u) { /* Start 64b: 11110 O 00 + timer56 */
+            if (bitpos + 64u > total_bits)
+                break;
+            uint32_t w0 = __core_trace_bits(ctx, &bitpos, 32u);
+            uint32_t w1 = __core_trace_bits(ctx, &bitpos, 32u);
+            cycle = ((uint64_t)(w0 & 0x00FFFFFFu) << 32) | w1;
+            __core_trace_flush(&run);
+            printf("[aie_runtime] core_trace_decode: START timer=%llu overrun=%u\n", (unsigned long long)cycle,
+                   (unsigned)((w0 >> 26) & 1u));
+            last_kind = -1;
+        } else { /* Filler (0xFE) / Sync (0xFF) 8b */
+            v = __core_trace_bits(ctx, &bitpos, 8u);
+            if (v == 0xFFu) {
+                cycle += XAIE_TRACE_SYNC_CYCLES;
+                last_kind = 2;
+            }
+            /* else Filler: alignment pad, no effect */
+        }
+    }
+    __core_trace_flush(&run);
+}
+
+/* Map a stream packet id to its 8-slot event name table: pkt 2 = mem-module DMA
+ * trace, everything else (pkt 1 core, or legacy id 0 no-header captures) = core
+ * trace. */
+static const char *const *__core_trace_table_for_id(uint32_t id) {
+    return (id == 2u) ? s_mem_trace_slot_name : s_core_trace_slot_name;
+}
+
 void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof) {
     printf("[aie_runtime] core_trace_decode: buf=%p nwords=%u\n", (const void *)buf, nwords);
     if (!buf)
         return;
 
-    /* Outer transport: count valid 8-word packets up to the untouched tail. */
+    /* Outer transport: collect valid 8-word packet header indices up to the
+     * untouched (all-zero) buffer tail. The MemTile drain can interleave the
+     * core (pkt 1) and mem (pkt 2) streams in one buffer, so record every
+     * packet base; the streams are demuxed by header pkt id (low 5 bits) below.
+     * A lone pkt id (incl. legacy id 0) yields a single group == old behavior. */
     uint32_t whole = nwords - (nwords % 8u);
+    uint32_t bases[AIE_TRACE_MAX_PKTS];
     uint32_t npkts = 0;
     for (uint32_t p = 0; p < whole; p += 8u) {
         int all_zero = 1;
@@ -939,101 +1529,47 @@ void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceP
         }
         if (all_zero)
             break;
-        npkts++;
+        if (npkts < AIE_TRACE_MAX_PKTS)
+            bases[npkts++] = p;
     }
-    uint64_t total_bits = (uint64_t)npkts * 7u * 32u;
 
-    /* Inner: Event-Time frame stream (AIE2ps Arch Spec, Figure 4-14). */
-    uint64_t bitpos = 0, cycle = 0;
-    int last_kind = -1;         /* -1 none, 0 single, 1 multiple, 2 sync */
-    uint32_t last_events = 0;   /* single: slot index; multiple: 8-bit mask */
-    __core_trace_run run = {0}; /* run-length coalescer for per-cycle events */
-    run.prof = prof;            /* optional interval sink */
-
-    while (bitpos + 8u <= total_bits) {
-        uint32_t b0 = __core_trace_peek8(buf, bitpos), v;
-
-        if ((b0 & 0x80u) == 0u) { /* Single0 8b: 0 eee cccc */
-            v = __core_trace_bits(buf, &bitpos, 8u);
-            cycle += (v & 0xFu);
-            last_events = (v >> 4) & 0x7u;
-            last_kind = 0;
-            __core_trace_mark(&run, cycle, 1u << last_events);
-        } else if ((b0 & 0x40u) == 0u) { /* Single1/2: 10x */
-            uint32_t nb = (b0 & 0x20u) ? 24u : 16u;
-            if (bitpos + nb > total_bits)
+    /* Pre-count distinct pkt-id streams present so the profile can reserve a fair
+     * share for each stream not yet decoded (see reserve bookkeeping below). */
+    uint32_t nstreams = 0;
+    for (uint32_t id = 0; id < 32u; id++) {
+        for (uint32_t i = 0; i < npkts; i++) {
+            if ((buf[bases[i]] & 0x1Fu) == id) {
+                nstreams++;
                 break;
-            v = __core_trace_bits(buf, &bitpos, nb);
-            uint32_t sh = (nb == 24u) ? 18u : 10u;
-            cycle += (v & ((1u << sh) - 1u));
-            last_events = (v >> sh) & 0x7u;
-            last_kind = 0;
-            __core_trace_mark(&run, cycle, 1u << last_events);
-        } else if ((b0 & 0x20u) == 0u) { /* 110... */
-            if ((b0 & 0x10u) == 0u) {    /* Multiple0 16b: 1100 mmmmmmmm cccc */
-                if (bitpos + 16u > total_bits)
-                    break;
-                v = __core_trace_bits(buf, &bitpos, 16u);
-                cycle += (v & 0xFu);
-                last_events = (v >> 4) & 0xFFu;
-                last_kind = 1;
-                __core_trace_mark(&run, cycle, last_events);
-            } else {
-                uint32_t sel = (b0 >> 2) & 0x3u; /* 1101 xx */
-                if (sel == 0u) {                 /* Multiple1 24b */
-                    if (bitpos + 24u > total_bits)
-                        break;
-                    v = __core_trace_bits(buf, &bitpos, 24u);
-                    cycle += (v & 0x3FFu);
-                    last_events = (v >> 10) & 0xFFu;
-                    last_kind = 1;
-                    __core_trace_mark(&run, cycle, last_events);
-                } else if (sel == 1u) { /* Multiple2 32b */
-                    if (bitpos + 32u > total_bits)
-                        break;
-                    v = __core_trace_bits(buf, &bitpos, 32u);
-                    cycle += (v & 0x3FFFFu);
-                    last_events = (v >> 18) & 0xFFu;
-                    last_kind = 1;
-                    __core_trace_mark(&run, cycle, last_events);
-                } else if (sel == 2u) { /* Repeat1 16b */
-                    if (bitpos + 16u > total_bits)
-                        break;
-                    v = __core_trace_bits(buf, &bitpos, 16u);
-                    __core_trace_repeat(&run, &cycle, v & 0x3FFu, last_kind, last_events);
-                } else { /* Stop 32b: 110111 x(8) c(18) */
-                    if (bitpos + 32u > total_bits)
-                        break;
-                    v = __core_trace_bits(buf, &bitpos, 32u);
-                    cycle += (v & 0x3FFFFu);
-                    __core_trace_flush(&run);
-                    printf("[aie_runtime] core_trace_decode: STOP @ %llu\n", (unsigned long long)cycle);
-                    last_kind = -1;
-                }
             }
-        } else if ((b0 & 0x10u) == 0u) { /* Repeat0 8b: 1110 rrrr */
-            v = __core_trace_bits(buf, &bitpos, 8u);
-            __core_trace_repeat(&run, &cycle, v & 0xFu, last_kind, last_events);
-        } else if ((b0 & 0x08u) == 0u) { /* Start 64b: 11110 O 00 + timer56 */
-            if (bitpos + 64u > total_bits)
-                break;
-            uint32_t w0 = __core_trace_bits(buf, &bitpos, 32u);
-            uint32_t w1 = __core_trace_bits(buf, &bitpos, 32u);
-            cycle = ((uint64_t)(w0 & 0x00FFFFFFu) << 32) | w1;
-            __core_trace_flush(&run);
-            printf("[aie_runtime] core_trace_decode: START timer=%llu overrun=%u\n", (unsigned long long)cycle,
-                   (unsigned)((w0 >> 26) & 1u));
-            last_kind = -1;
-        } else { /* Filler (0xFE) / Sync (0xFF) 8b */
-            v = __core_trace_bits(buf, &bitpos, 8u);
-            if (v == 0xFFu) {
-                cycle += XAIE_TRACE_SYNC_CYCLES;
-                last_kind = 2;
-            }
-            /* else Filler: alignment pad, no effect */
         }
     }
-    __core_trace_flush(&run);
+
+    /* Demux: for each distinct pkt id (0..31, header & 0x1F) build that stream's
+     * ordered base list and decode it with the matching slot-name table. Ids are
+     * walked ascending so core (1) prints before mem (2). Before each stream, hold
+     * back AIE_TRACE_PROFILE_MIN_PER_STREAM slots for every stream still undecoded
+     * so a chatty earlier stream cannot starve the profile of a later one. */
+    uint32_t decoded = 0;
+    for (uint32_t id = 0; id < 32u; id++) {
+        uint32_t gbases[AIE_TRACE_MAX_PKTS];
+        uint32_t gn = 0;
+        for (uint32_t i = 0; i < npkts; i++) {
+            if ((buf[bases[i]] & 0x1Fu) == id)
+                gbases[gn++] = bases[i];
+        }
+        if (gn == 0u)
+            continue;
+        if (prof) {
+            uint32_t remaining_after = nstreams - decoded - 1u; /* streams after this one */
+            prof->reserve = remaining_after * AIE_TRACE_PROFILE_MIN_PER_STREAM;
+        }
+        __core_trace_ctx ctx = {buf, gbases, gn};
+        __core_trace_decode_group(&ctx, __core_trace_table_for_id(id), prof);
+        decoded++;
+    }
+    if (prof)
+        prof->reserve = 0u; /* leave no reservation held after the last stream */
 }
 
 void __Runtime_aie_trace_profile_init(AieTraceProfile *p) {
@@ -1041,6 +1577,7 @@ void __Runtime_aie_trace_profile_init(AieTraceProfile *p) {
         return;
     p->count = 0;
     p->dropped = 0;
+    p->reserve = 0;
     p->cur_col = 0;
     p->cur_row = 0;
     p->attached = 0;
@@ -1160,14 +1697,39 @@ void __Runtime_aie_trace_profile_dump(AieTraceProfile *p) {
     /* Decoded AIE intervals, one machine-readable [TIMESYNC] trace line each. */
     for (uint32_t i = 0; i < p->count; i++) {
         AieTraceInterval *v = &p->iv[i];
-        char names[128];
-        __core_trace_names(v->mask, names, sizeof(names));
+        /* Wide enough for up to 8 specific mem event names (e.g.
+         * DMA_MM2S_0_STALLED_LOCK_MEM) joined with '|' plus the event-value
+         * suffix; __core_trace_names still bounds-checks against this cap. */
+        char names[384];
+        const char *const *tbl = v->names ? v->names : s_core_trace_slot_name;
+        /* Tag the mem-module DMA stream (pkt id 2) so the off-device timeline
+         * can route it to its own lane: STREAM_STALL exists in BOTH tables, so
+         * the slot name alone cannot disambiguate. Core lines stay unchanged
+         * (empty tag) for backward compatibility with existing parsers. */
+        int is_mem = (tbl == s_mem_trace_slot_name);
+        const char *strm = is_mem ? "stream=mem " : "";
+        /* Event-value table parallel to the name table, so each set slot's
+         * physical HW event id is appended as "{event value v1:v2:...}". */
+        const uint16_t *evtbl = is_mem ? s_mem_trace_slot_event : s_core_trace_slot_event;
+        /* For the mem stream, prefer the specific per-event name captured at
+         * setup (e.g. DMA_MM2S_0_STALLED_LOCK_MEM) over the generic slot label,
+         * so DMA direction/channel is visible. Falls back to the generic name
+         * per slot when unset (setup never ran, e.g. the decoder test harness).
+         * Core names are already specific, so they use the static table as-is. */
+        const char *merged[8];
+        const char *const *use = tbl;
+        if (is_mem) {
+            for (int s = 0; s < 8; s++)
+                merged[s] = s_mem_trace_slot_dynname[s] ? s_mem_trace_slot_dynname[s] : tbl[s];
+            use = merged;
+        }
+        __core_trace_names(use, evtbl, v->mask, names, sizeof(names));
         if (v->start_cycle == v->end_cycle)
-            printf("[TIMESYNC] trace tile=%u,%u %llu  %s\n", (unsigned)v->col, (unsigned)v->row,
+            printf("[TIMESYNC] trace tile=%u,%u %s%llu  %s\n", (unsigned)v->col, (unsigned)v->row, strm,
                    (unsigned long long)v->start_cycle, names);
         else
-            printf("[TIMESYNC] trace tile=%u,%u %llu -- %llu  %s  (%llu cyc)\n", (unsigned)v->col, (unsigned)v->row,
-                   (unsigned long long)v->start_cycle, (unsigned long long)v->end_cycle, names,
+            printf("[TIMESYNC] trace tile=%u,%u %s%llu -- %llu  %s  (%llu cyc)\n", (unsigned)v->col, (unsigned)v->row,
+                   strm, (unsigned long long)v->start_cycle, (unsigned long long)v->end_cycle, names,
                    (unsigned long long)(v->end_cycle - v->start_cycle + 1u));
     }
 }
@@ -1192,7 +1754,7 @@ void __Runtime_aie_trace_profile_dump(AieTraceProfile *p) {
 
 #define AIE_TRACE_SESSION_CAP 16u     /* max tiles armed per run            */
 #define AIE_TRACE_SLOTS_PER_COL 4u    /* strm_ch / S2MM ch range 0..3       */
-#define AIE_TRACE_BUF_LEN 0x1000u     /* 4 KB raw trace words per tile      */
+#define AIE_TRACE_BUF_LEN 0x2000u     /* 8 KB raw trace words per tile      */
 #define AIE_TRACE_REGION_BASE 0x8000u /* MemTile-loc read view base offset  */
 #define AIE_TRACE_DMA_HI 0x80000u     /* OR'd in for the DMA-view (setup)   */
 
@@ -1276,7 +1838,13 @@ static void __aie_trace_anchor_all(XAie_DevInst *dev, int which) {
     }
 }
 
-void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg) {
+// Shared implementation for the three public core_trace_begin entry points.
+// strm_ch_arg pins the physical stream channel (AIE_TRACE_STRM_CH_AUTO = slot).
+// mem_dma_kind/mem_dma_ch select which tile DMA the memory-module trace unit
+// watches; the _begin/_begin_ch entry points pass the S2MM/0 defaults so their
+// behaviour is unchanged, while _begin_dma threads the pragma-driven selection.
+static void trace_begin_impl(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg, int mem_dma_kind,
+                             uint8_t mem_dma_ch) {
     if (!dev) {
         printf("[aie_runtime] core_trace_begin: NULL dev, ignored\n");
         return;
@@ -1350,7 +1918,21 @@ void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, 
     const struct AieResourceEntry *rm = 0;
     int rmn = 0;
 #endif
-    AieRC rc = __Runtime_core_trace_setup(dev, tile, setup_addr, AIE_TRACE_BUF_LEN, strm_ch, s2mm_ch, bdnum, rm, rmn);
+    /* Choose the event port to monitor. Default to the trace-stream ingress
+     * (SOUTH slave 0), but when a resource map is present re-target it to the
+     * ROUTED switch port that actually carries this mem-DMA (kind,ch) -- e.g.
+     * mm2s0 -> MASTER EAST:1, s2mm0 -> SLAVE SOUTH:1 -- resolved at runtime from
+     * __aie_resource_map[], nothing hardcoded. No map / no matching entry keeps
+     * the SOUTH-slave-0 fallback (raw/single-kernel flow). */
+    XAie_StrmPortIntf ev_intf = XAIE_STRMSW_SLAVE;
+    StrmSwPortType ev_port = SOUTH;
+    int ev_idx = 0;
+#ifdef AIE_HAVE_RESOURCE_MAP
+    if (rm && rmn)
+        resmap_lookup_dma_port(rm, rmn, col, row, mem_dma_kind, mem_dma_ch, &ev_intf, &ev_port, &ev_idx);
+#endif
+    AieRC rc = __Runtime_core_trace_setup(dev, tile, setup_addr, AIE_TRACE_BUF_LEN, strm_ch, s2mm_ch, bdnum, rm, rmn,
+                                          ev_intf, ev_port, (uint8_t)ev_idx, mem_dma_kind, mem_dma_ch);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] core_trace_begin: core_trace_setup failed rc=%d tile(%u,%u)\n", (int)rc, (unsigned)col,
                (unsigned)row);
@@ -1365,13 +1947,22 @@ void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, 
     e->len_bytes = AIE_TRACE_BUF_LEN;
     s_trace_col_used[col] = (uint8_t)(slot + 1u);
     printf("[aie_runtime] core_trace_begin: armed tile(%u,%u) slot=%u strm_ch=%u s2mm_ch=%u bd=%u "
-           "read_addr=0x%x\n",
+           "mem_dma_kind=%d mem_dma_ch=%u ev_port=%s %s %u read_addr=0x%x\n",
            (unsigned)col, (unsigned)row, (unsigned)slot, (unsigned)strm_ch, (unsigned)s2mm_ch, (unsigned)bdnum,
-           read_addr);
+           mem_dma_kind, (unsigned)mem_dma_ch, strm_port_type_name(ev_port), strm_port_intf_name(ev_intf),
+           (unsigned)ev_idx, read_addr);
 }
 
 void __Runtime_core_trace_begin(XAie_DevInst *dev, uint8_t col, uint8_t row) {
-    __Runtime_core_trace_begin_ch(dev, col, row, AIE_TRACE_STRM_CH_AUTO);
+    trace_begin_impl(dev, col, row, AIE_TRACE_STRM_CH_AUTO, AIE_TRACE_DMA_S2MM, 0);
+}
+
+void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg) {
+    trace_begin_impl(dev, col, row, strm_ch_arg, AIE_TRACE_DMA_S2MM, 0);
+}
+
+void __Runtime_core_trace_begin_dma(XAie_DevInst *dev, uint8_t col, uint8_t row, int mem_dma_kind, uint8_t mem_dma_ch) {
+    trace_begin_impl(dev, col, row, AIE_TRACE_STRM_CH_AUTO, mem_dma_kind, mem_dma_ch);
 }
 
 void __Runtime_core_trace_end_into(XAie_DevInst *dev, AieTraceProfile *prof) {
@@ -1426,6 +2017,13 @@ void __Runtime_core_trace_sync_begin(XAie_DevInst *dev) {
     s_trace_sync_active = 1;
     printf("[aie_runtime] core_trace_sync_begin: armed %u tile(s), cps=%llu\n", (unsigned)s_trace_session_n,
            (unsigned long long)__aie_host_cps());
+}
+
+void __Runtime_core_trace_event(XAie_DevInst *dev, int iter, const char *phase) {
+    (void)dev;
+    if (!s_trace_sync_active)
+        return;
+    __Runtime_aie_trace_profile_event(&s_trace_sync_prof, iter, phase, __aie_host_now());
 }
 
 void __Runtime_core_trace_end(XAie_DevInst *dev) {
@@ -1953,7 +2551,7 @@ void __Runtime_routing_init(XAie_DevInst *dev) {
     g_RoutingInst = XAie_InitRoutingHandler(dev);
     routing(dev);
 #ifdef AIE_HAVE_RESOURCE_MAP
-    __Runtime_print_resource_map();
+    //__Runtime_print_resource_map();
 #endif
     AIEHLC_LOG(printf("[aie_runtime] 2-routing_init OK----\n"));
 }

@@ -470,12 +470,23 @@ def setup_second_connection():
     log.debug("setup_second_connection: starting")
     print(f"[Connection 2] Connecting to {host}...")
 
-    # Start SSH with X forwarding
-    child = pexpect.spawn(f"ssh -X {host}", encoding='utf-8', timeout=60)
+    # No X forwarding: this connection only tails console text (systest-client ->
+    # connect com0), so it needs no X GUI. Dropping -X also avoids the tcsh
+    # login-script X11 setup (Xinventory/xauth), which could intermittently
+    # stall a second concurrent -X session and hang the prompt wait below.
+    child = pexpect.spawn(f"ssh {host}", encoding='utf-8', timeout=60)
+    # Mirror connection 1 so this connection's raw output is visible; otherwise a
+    # prompt-wait hang shows nothing after "waiting for shell prompt".
+    child.logfile_read = sys.stdout
 
     # Wait for shell prompt
     log.debug("setup_second_connection: waiting for shell prompt...")
-    child.expect([r'\$\s*$', r'#\s*$', r'>\s*$'], timeout=60)
+    try:
+        child.expect([r'\$\s*$', r'#\s*$', r'>\s*$'], timeout=60)
+    except pexpect.TIMEOUT:
+        log.error("setup_second_connection: shell prompt TIMEOUT; buffer so "
+                  "far:\n%s", child.before)
+        raise
     log.debug("setup_second_connection: shell prompt received")
     print("[Connection 2] Connected, starting systest...")
 

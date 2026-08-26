@@ -31,14 +31,20 @@ import host_aie_timeline as hat   # noqa: E402  (#1 parse/correlate/emit)
 import timeline_gui as tg         # noqa: E402  (#2 render PNG)
 
 
-def run(applog_path, out_dir, png_path=None, show=False):
+def run(applog_path, out_dir, png_path=None, show=False, host_cc=None):
     """applog -> (model, csv_path, json_path, png_or_None). Writes json+csv into
-    out_dir, then a PNG (default <out-dir>/timeline.png) unless show=True."""
+    out_dir, then a PNG (default <out-dir>/timeline.png) unless show=True.
+
+    `host_cc` is the generated host.cc used to resolve phase->line numbers for
+    the colour-by-API host lane; auto-detected next to the applog when omitted."""
     with open(applog_path) as f:
         text = f.read()
 
-    # #1: parse + correlate + emit json/csv.
-    model = hat.correlate(hat.parse_timesync(text))
+    # #1: parse + correlate + emit json/csv. Resolve host.cc phase lines so the
+    # host lane is coloured by API and annotated with its emit-call line.
+    host_cc = host_cc or hat.autodetect_host_cc(applog_path)
+    hostcc_lines = hat.resolve_hostcc_lines(host_cc)
+    model = hat.correlate(hat.parse_timesync(text), hostcc_lines)
     csv_path, json_path, nrows = hat.emit(model, out_dir)
 
     # #2: render the PNG (or open a window).
@@ -91,6 +97,9 @@ def main(argv):
                     help="PNG path (default <out-dir>/timeline.png)")
     ap.add_argument("--show", action="store_true",
                     help="open an interactive window instead of writing a PNG")
+    ap.add_argument("--host-cc", metavar="PATH",
+                    help="generated host.cc to resolve host phase->line numbers "
+                         "(auto-detected next to the applog / aout/worklocal if omitted)")
     ap.add_argument("--self-test", action="store_true",
                     help="run a synthetic end-to-end test and exit")
     args = ap.parse_args(argv[1:])
@@ -101,7 +110,8 @@ def main(argv):
         ap.error("applog is required (or use --self-test)")
 
     model, csv_path, json_path, png, nrows = run(
-        args.applog, args.out_dir, png_path=args.png, show=args.show)
+        args.applog, args.out_dir, png_path=args.png, show=args.show,
+        host_cc=args.host_cc)
 
     m = model["meta"]
     print("[timeline] cps=%d  tiles=%d  host_events=%d  rows=%d  host_span=%.2f us" % (

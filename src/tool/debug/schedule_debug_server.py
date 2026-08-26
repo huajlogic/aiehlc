@@ -1575,6 +1575,15 @@ class DebugState:
         self._run_fh = None           # open applog file handle (subprocess stdout)
         self._run_id = 0
 
+        # applog tail bookkeeping. Deriving the run status no longer decodes the
+        # whole file each poll; instead we remember which status markers have
+        # been seen so far in this tail and update that set from each new chunk.
+        # `_applog_scan_tail` carries the last few hundred bytes so a marker
+        # split across a chunk boundary is still caught. Both reset when the
+        # client restarts the tail from offset 0 (a new run).
+        self._applog_seen = set()
+        self._applog_scan_tail = ""
+
         # ---- session provenance ------------------------------------------
         # self.target is populated at startup from $AIEDBG_TARGET (envlocal.sh),
         # so its mere presence proves nothing about whether THIS session ever
@@ -2199,6 +2208,37 @@ class DebugState:
         return {"stopped": True, "run_id": run_id, "pid": pid,
                 "abandoned": abandoned, "running": False}
 
+    def timeline_png_path(self):
+        """Where `timeline.py` writes the rendered PNG — next to the applog so it
+        travels with the run artifacts and is served by GET /timeline.png."""
+        out_dir = os.path.dirname(self.applog) or "."
+        return os.path.join(out_dir, "timeline.png")
+
+    def launch_timeline(self):
+        """Render `timeline.py <applog>` to a PNG on disk (no interactive window)
+        so the browser can show it in the Profile tab via GET /timeline.png.
+
+        Runs synchronously and waits for the render so the caller can report
+        whether the PNG is ready. No-op when no applog exists yet."""
+        if not os.path.isfile(self.applog):
+            return {"started": False, "applog": self.applog,
+                    "error": "no applog on disk yet"}
+        script = os.path.join(_THIS_DIR, "timeline.py")
+        out_dir = os.path.dirname(self.applog) or "."
+        png_path = self.timeline_png_path()
+        try:
+            proc = subprocess.run(
+                [sys.executable, script, self.applog,
+                 "--out-dir", out_dir, "--png", png_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            return {"started": False, "applog": self.applog, "error": str(e)}
+        if proc.returncode != 0 or not os.path.isfile(png_path):
+            detail = (proc.stdout or b"").decode("utf-8", "replace").strip()
+            return {"started": False, "applog": self.applog,
+                    "error": detail[-400:] or "timeline render failed"}
+        return {"started": True, "applog": self.applog, "png": png_path}
+
     def sim_in_progress(self):
         with self._sim_lock:
             return (self._sim_proc is not None
@@ -2597,16 +2637,73 @@ class DebugState:
             return {"data": "", "next": 0, "status": "idle", "running": False}
         with self._lock:
             running = self._run_proc is not None and self._run_proc.poll() is None
+        # A fresh tail (client reset to offset 0 for a new run) invalidates the
+        # cached marker state carried over from the previous run's file.
+        if offset <= 0:
+            offset = 0
+            self._applog_seen = set()
+            self._applog_scan_tail = ""
+        size = os.path.getsize(self.applog)
+        # Read ONLY the new bytes, not the whole file, so poll cost stays flat as
+        # the AIE event trace grows to many MB.
         with open(self.applog, "rb") as f:
-            full = f.read()
-        chunk = full[offset:]
-        data = chunk.decode("utf-8", errors="replace")
+            f.seek(offset)
+            chunk = f.read()
         nxt = offset + len(chunk)
+        truncated = False
+        # Safety cap: if the client fell far behind (multi-MB backlog), ship only
+        # the last CAP bytes + a truncated flag instead of tens of MB in one hop.
+        if len(chunk) > self._APPLOG_TAIL_CAP:
+            chunk = chunk[-self._APPLOG_TAIL_CAP:]
+            truncated = True
+        data = chunk.decode("utf-8", errors="replace")
+        # Update the seen-marker set from this chunk only (plus a small carry so a
+        # marker split across the previous boundary is still caught). No full-file
+        # decode.
+        scan = self._applog_scan_tail + data
+        for m in self._STATUS_MARKERS:
+            if m not in self._applog_seen and m in scan:
+                self._applog_seen.add(m)
+        self._applog_scan_tail = scan[-256:]
         last_ts = os.path.getmtime(self.applog)
-        full_text = full.decode("utf-8", errors="replace")
-        status = self._derive_status(full_text, running, last_ts)
+        status = self._derive_status_markers(self._applog_seen, running, last_ts,
+                                             size > 0)
         return {"data": data, "next": nxt, "status": status, "running": running,
-                "debuggable": self._is_debuggable(full_text, status)}
+                "truncated": truncated,
+                "debuggable": self._is_debuggable_markers(self._applog_seen,
+                                                          status)}
+
+    # Cap on bytes shipped in a single /applog poll. Beyond this the client has
+    # fallen too far behind to catch up in one hop, so we send the last CAP bytes
+    # and flag the gap rather than blocking the link on a huge payload.
+    _APPLOG_TAIL_CAP = 2 * 1024 * 1024
+
+    # Pass/fail markers plus the debuggable markers, scanned out of each tail
+    # chunk so status derivation never re-reads the whole file.
+    _STATUS_MARKERS = ("device_teardown done", "Not tearing down partition",
+                       "AIE ERROR", "ELF download complete", "Execution started",
+                       "board stays powered on for debug", "wait_io TIMEOUT",
+                       "Waiting for console output")
+
+    @staticmethod
+    def _derive_status_markers(seen, running, last_ts, has_content):
+        """Marker-set equivalent of _derive_status (no whole-file decode)."""
+        if "device_teardown done" in seen or "Not tearing down partition" in seen:
+            return "pass"
+        if "AIE ERROR" in seen:
+            return "fail"
+        if running:
+            if last_ts and (time.time() - last_ts) > 60:
+                return "hang"
+            return "running"
+        return "fail" if has_content else "idle"
+
+    @classmethod
+    def _is_debuggable_markers(cls, seen, status):
+        """Marker-set equivalent of _is_debuggable."""
+        if status in ("hang", "pass", "fail"):
+            return True
+        return any(m in seen for m in cls._DEBUGGABLE_MARKERS)
 
     _DEBUGGABLE_MARKERS = (
         "ELF download complete",
@@ -4877,6 +4974,35 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter default logging
         sys.stderr.write("[schedule_debug_server] " + (fmt % args) + "\n")
 
+    def handle(self):
+        # This is a plain-HTTP server. A browser that connects with https://
+        # sends a TLS ClientHello, whose binary bytes the base parser logs as a
+        # "Bad request version (<garbage>)" 400. Peek the first byte (without
+        # consuming it) and, if it is a TLS handshake record (content type
+        # 0x16), reply with a plaintext hint and log one clean line instead of
+        # the binary noise. Normal HTTP requests fall through untouched.
+        try:
+            first = self.connection.recv(1, socket.MSG_PEEK)
+        except OSError:
+            first = b""
+        if first[:1] == b"\x16":
+            self.log_message("%s", "rejected TLS/https:// connection on plain "
+                                    "HTTP port; use http:// instead")
+            body = (b"This is a plain HTTP debug server. You connected with "
+                    b"https:// (TLS). Reload the page using http:// instead.\n")
+            try:
+                self.connection.sendall(
+                    b"HTTP/1.0 400 Bad Request\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                    b"\r\n" + body)
+            except OSError:
+                pass
+            self.close_connection = True
+            return
+        return super().handle()
+
     def _send_json(self, obj, code=200):
         payload = json.dumps(obj).encode("utf-8")
         self.send_response(code)
@@ -4946,6 +5072,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(st.get_uistate())
         elif path == "/schedule_view.json":
             self._send_file(st.json_path(), "application/json")
+        elif path == "/timeline.png":
+            # Rendered by launch_timeline() when a run ends; the Profile tab
+            # fetches it with a cache-busting ?ts= so a new run shows a new PNG.
+            self._send_file(st.timeline_png_path(), "image/png")
         elif path == "/config":
             self._send_json(_ui_defaults(st))
         elif path == "/aiegdb/spec":
@@ -5192,6 +5322,8 @@ class Handler(BaseHTTPRequestHandler):
             res = st.stop_run()
             res["run"] = st.run_state()
             self._send_json(res)
+        elif u.path == "/timeline":
+            self._send_json(st.launch_timeline())
         elif u.path == "/sim/run":
             self._send_json(st.start_sim())
         elif u.path == "/sim/stop":

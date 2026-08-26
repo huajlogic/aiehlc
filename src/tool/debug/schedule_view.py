@@ -2438,6 +2438,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      three sides; paint the left edge of the following segment to close it. */
   .vsw.act + .vsw { border-left:1px solid var(--bd-accent); }
 
+  /* Profile tab is inert until a run renders a timeline.png. */
+  .vsw-disabled { opacity:.4; pointer-events:none; cursor:default; }
+
+  /* ── Profile panel ───────────────────────────────────────────── */
+  #profileview { display:none; flex-direction:column; gap:8px; }
+  #profileview.show { display:flex; }
+  #profile-status { font-size:12px; color:var(--tx-mid); }
+  #profile-img { max-width:100%; height:auto; border:1px solid var(--bd);
+                 border-radius:4px; background:#fff; }
+
   /* ── Targets panel ───────────────────────────────────────────── */
   #targetsview { display:none; flex-direction:column; gap:0; }
   #targetsview.show { display:flex; }
@@ -3263,6 +3273,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <span class="vsw act" data-v="grid" onclick="switchView('grid')">Grid</span>
       <span class="vsw" data-v="map" onclick="switchView('map')">Device Map</span>
       <span class="vsw" data-v="targets" onclick="switchView('targets')">Host</span>
+      <!-- Profile tab: disabled until a run finishes and timeline.png renders. -->
+      <span class="vsw vsw-disabled" id="vsw-profile" data-v="profile"
+            onclick="switchView('profile')" title="Timeline appears after a run finishes">Profile</span>
     </div>
   </div>
   <div class="sub" id="meta" style="display:none"></div>
@@ -3341,6 +3354,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <span id="tgt-status"></span>
     </div>
     <div id="tgt-list"><div class="tgt-empty">Click Refresh to read targets from the board.</div></div>
+  </div>
+  <!-- ── Profile panel ───────────────────────────────────────────── -->
+  <!-- Shows the host+AIE timeline.png rendered on the server when a run ends
+       (natural finish or Stop run). Cleared and the tab disabled on a new run. -->
+  <div id="profileview">
+    <div id="profile-status">No timeline yet — it appears after a run finishes.</div>
+    <img id="profile-img" class="hide" alt="host + AIE execution timeline"
+         onerror="profileImgError()"/>
   </div>
   <!-- collapsible legend — collapsed by default -->
   <details id="legend-detail">
@@ -4148,18 +4169,69 @@ rowsDesc.forEach(r => {
 // Device Map is the default view; the initial call at the bottom of this script
 // runs through here too, so the shown/hidden state has exactly one definition.
 function switchView(name){
+  // The Profile tab's enabled state is owned by the run lifecycle, not by which
+  // view is showing. Re-assert it from LIVE.profileReady on every switch so a
+  // view change (Device Map, Host, Grid) can never leave the tab stuck disabled
+  // once a timeline has rendered — it clears only when the next Run starts.
+  if(LIVE.profileReady) setProfileTabEnabled(true);
+  // The Profile tab is inert until a run renders a timeline — ignore clicks
+  // on it while disabled so a disabled tab can never take over the view.
+  if(name==='profile'){
+    const t=document.getElementById('vsw-profile');
+    if(t && t.classList.contains('vsw-disabled')) return;
+  }
   document.querySelectorAll('.vsw').forEach(b=>b.classList.toggle('act', b.dataset.v===name));
   const showGrid    = name==='grid';
   const showMap     = name==='map';
   const showTargets = name==='targets';
+  const showProfile = name==='profile';
   document.getElementById('grid').style.display = showGrid ? '' : 'none';
   document.getElementById('overlayctl').style.display = showGrid ? '' : 'none';
   document.getElementById('legend-detail').style.display = showGrid ? '' : 'none';
   document.getElementById('devmap').classList.toggle('show', showMap);
   document.getElementById('targetsview').classList.toggle('show', showTargets);
+  document.getElementById('profileview').classList.toggle('show', showProfile);
   if(showMap) buildDeviceMap();
   if(showTargets) tgtMaybeAutoRefresh();
   reportUIState({view: name});
+}
+
+// ── Profile tab (host+AIE timeline.png) ───────────────────────────
+// Enable/disable the Profile tab; disabling also flips the view back to Grid
+// if the Profile panel is the one on screen.
+function setProfileTabEnabled(on){
+  const t=document.getElementById('vsw-profile');
+  if(!t) return;
+  t.classList.toggle('vsw-disabled', !on);
+  if(!on && t.classList.contains('act')) switchView('grid');
+}
+// A run started: wipe any prior timeline image and lock the Profile tab.
+function clearTimelineProfile(){
+  const img=document.getElementById('profile-img');
+  const st =document.getElementById('profile-status');
+  if(img){ img.removeAttribute('src'); img.classList.add('hide'); }
+  if(st){ st.textContent='Run in progress — timeline will appear when it finishes.'; }
+  // Clear the flag BEFORE disabling: setProfileTabEnabled(false) may bounce the
+  // view to Grid via switchView, which re-reads this flag.
+  LIVE.profileReady = false;
+  setProfileTabEnabled(false);
+}
+// A run ended and the server rendered timeline.png: show it and unlock the tab.
+function showTimelineProfile(){
+  const img=document.getElementById('profile-img');
+  const st =document.getElementById('profile-status');
+  if(img){ img.src='/timeline.png?ts='+Date.now(); img.classList.remove('hide'); }
+  if(st){ st.textContent=''; }
+  // Latch the tab ON: from here it stays enabled across any view switch until
+  // the next Run calls clearTimelineProfile().
+  LIVE.profileReady = true;
+  setProfileTabEnabled(true);
+}
+function profileImgError(){
+  const img=document.getElementById('profile-img');
+  const st =document.getElementById('profile-status');
+  if(img) img.classList.add('hide');
+  if(st) st.textContent='timeline.png could not be loaded.';
 }
 
 // ── Targets panel ─────────────────────────────────────────────
@@ -9155,6 +9227,18 @@ const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
                // page's: a reload or dropped tail must not convince the UI that
                // a live run is over.
                runOwned:false, daemonRun:null, rsBusy:false, rsTimer:null,
+               // Timeline auto-launch. tlDone dedups the final render across the
+               // TIMESYNC-idle timer, natural run-end and force-stop paths.
+               // tsSeen: the first [TIMESYNC] line has appeared this run.
+               // tsIdleTimer: the 5s "quiet" timer that fires the render once no
+               // new [TIMESYNC] line has arrived for a full 5 seconds.
+               tlDone:false, tsSeen:false, tsIdleTimer:null,
+               // profileReady is the single source of truth for the Profile tab:
+               // true once a timeline has rendered, false again only when a new
+               // Run starts. switchView re-asserts the tab from this flag so no
+               // view switch (e.g. Device Map) can leave the tab stuck disabled.
+               profileReady:false,
+               simOnly:false };
                simOnly:false, jtagHost:'' };
 const HW_SERVER_CMD = 'exec hw_server -stcp:0.0.0.0:3121';
 const LSTATE = {
@@ -9255,6 +9339,27 @@ function api(path, opts){
   const tok = llmToken();
   if (tok) opts.headers = Object.assign({}, opts.headers, {'X-LLM-Auth': tok});
   return fetch(path, opts).then(r => r.json());
+}
+// Render `timeline.py <applog>` to timeline.png on the server and show it in the
+// Profile tab. Trigger model: TIMESYNC-idle. The render only happens once real
+// [TIMESYNC] data has been seen this run (LIVE.tsSeen) — the primary caller is
+// the 5s "quiet" timer armed in pollLog when [TIMESYNC] lines stop arriving.
+// The run-end and force-stop callers are gated safety nets: on a run with no
+// TIMESYNC output they no-op (tsSeen stays false), which is what avoids the
+// `no [TIMESYNC] cps= record found` error. LIVE.tlDone dedups across all three
+// callers; both flags reset when the next run starts.
+function triggerTimeline(final){
+  if (!LIVE.tsSeen) return;      // no TIMESYNC data this run → nothing to render.
+  if (LIVE.tlDone) return;
+  LIVE.tlDone = true;
+  setStatus('timeline: rendering…');
+  api('/timeline', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:'{}'})
+    .then(r => {
+      if (r && r.started){ showTimelineProfile(); setStatus('timeline: ready (Profile tab)'); }
+      else { setStatus('timeline: ' + ((r && r.error) || 'not generated')); }
+    })
+    .catch(() => {});
 }
 function setStatus(msg){ const e=document.getElementById('livestatus'); if(e) e.textContent=msg; }
 function setRunStatus(msg){ const e=document.getElementById('runstatus'); if(e) e.textContent=msg; }
@@ -9538,6 +9643,9 @@ function unlockConsoleForDebug(){
   const ci = document.getElementById('conin');
   if (cr) cr.disabled = false;
   if (ci){ ci.disabled = false; ci.classList.remove('disabled'); }
+  // The run has parked (compute done, applog flushed). Timeline rendering is no
+  // longer tied to this park event — it's driven by the TIMESYNC-idle timer in
+  // pollLog, so a run with no TIMESYNC output never renders.
   if (LIVE.runOwned && LIVE.daemonRun) renderRunBanner();
   else setRunStatus('run parked \u2014 aiegdb console unlocked for live debug '
                   + '(overlay stays off)');
@@ -10147,14 +10255,41 @@ function runScanNow(setMsg){
   };
 })();
 
+// Keep the console DOM bounded so a long AIE trace run (multi-MB of
+// STREAM_STALL/DMA_FINISH lines) doesn't jank the tab with an ever-growing
+// textContent. Trim from the front, keeping the most recent MAX lines.
+function capConsole(con){
+  const MAX = 5000;
+  const txt = con.textContent;
+  if (txt.length < 400000) return;   // cheap: only split when it's large enough
+  const nl = txt.split('\n');
+  if (nl.length > MAX) con.textContent = nl.slice(nl.length - MAX).join('\n');
+}
+
 function pollLog(){
-  // Guard against overlapping tails so a slow response can't pile up.
+  // Guard against overlapping tails so a slow response can't pile up. A stuck
+  // fetch can no longer wedge the tail forever: an AbortController aborts it
+  // after a timeout, so `.finally()` always runs and clears logBusy — the next
+  // 1s tick then retries instead of early-returning forever.
   if (LIVE.logBusy) return;
   LIVE.logBusy = true;
-  api('/applog?offset='+LIVE.logoff).then(r => {
+  const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const abTimer = ctrl ? setTimeout(() => ctrl.abort(), 8000) : null;
+  api('/applog?offset='+LIVE.logoff, ctrl ? {signal: ctrl.signal} : undefined).then(r => {
     const con = document.getElementById('console');
     const follow = logFollowing(con);
-    if (r.data){ con.textContent += r.data; }
+    if (r.data){ con.textContent += r.data; capConsole(con); }
+    // TIMESYNC-idle trigger: the first [TIMESYNC] line arms a 5s "quiet" window;
+    // each new TIMESYNC-bearing chunk re-arms it. When a full 5 seconds pass with
+    // no further [TIMESYNC] output the block is complete → render the timeline.
+    if (r.data && /\[TIMESYNC\]/.test(r.data)){
+      LIVE.tsSeen = true;
+      if (LIVE.tsIdleTimer) clearTimeout(LIVE.tsIdleTimer);
+      LIVE.tsIdleTimer = setTimeout(() => {
+        LIVE.tsIdleTimer = null;
+        triggerTimeline(true);   // gated by tsSeen; dedups via tlDone
+      }, 5000);
+    }
     if (r.next != null) LIVE.logoff = r.next;
     logFollow(con, follow);
     if (LIVE.runOwned && LIVE.daemonRun){
@@ -10169,28 +10304,45 @@ function pollLog(){
     // running/parked/hung). Only typed commands hit JTAG; the live overlay
     // grid-poll stays OFF so we don't compete with the run's own reads.
     if (r.running === true && r.debuggable) unlockConsoleForDebug();
+    // Timeline rendering is driven by the TIMESYNC-idle timer above, not by the
+    // derived pass/fail status — a run with no TIMESYNC output never renders.
     // Stop only when the subprocess has actually exited — NOT on a derived
     // pass/fail. apppaltest keeps writing (summary/cleanup/reboot) long after
     // the teardown marker first appears mid-run.
     if (r.running === false){
       if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer=null; }
+      // Drop any pending idle timer so it can't fire into the next run.
+      if (LIVE.tsIdleTimer){ clearTimeout(LIVE.tsIdleTimer); LIVE.tsIdleTimer=null; }
       // Run ended (force-stop OR natural completion) → re-enable aiedbg features.
       LIVE.runOwned = false;
       setDebugEnabled(true);
       setRunStatus('');
+      triggerTimeline(true);   // safety net; gated by tsSeen, dedups via tlDone.
     }
   }).catch(() => {
-    // Daemon went offline mid-run. The run process is no longer observable, so
-    // unblock all aiedbg features — JTAG is not held by anything we can see.
-    if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
-    setDebugEnabled(true);
-  }).finally(() => { LIVE.logBusy = false; });
+    // Transient tail failure: a slow/interrupted/aborted poll or a brief daemon
+    // hiccup over a remote link. While the run is still ours, DO NOT tear down
+    // the tail — one bad poll must not permanently freeze the console. Note it
+    // and let the next 1s tick retry; the tail is only stopped on a confirmed
+    // `running === false` response in the then-branch above.
+    if (LIVE.runOwned){
+      setRunStatus('run: tail retrying…');
+    } else {
+      // Not a live run we own (adopted run already ended, or never running) →
+      // the daemon is gone and nothing holds JTAG, so unblock aiedbg features.
+      if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
+      setDebugEnabled(true);
+    }
+  }).finally(() => { if (abTimer) clearTimeout(abTimer); LIVE.logBusy = false; });
 }
 document.getElementById('runbtn').onclick = () => {
   const dev = deviceSel ? deviceSel.value : '';
   if (!dev){ setStatus('select a device first'); return; }
   const con = document.getElementById('console');
   con.classList.remove('hide'); con.textContent = '';
+  // New run → drop the previous run's timeline and lock the Profile tab; it
+  // re-populates when this run ends and the server re-renders timeline.png.
+  clearTimelineProfile();
   // Simulator path: route to /sim/run and tail /sim/log.
   if (dev === 'simulator'){
     SIM.logoff = 0; SIM.applogoff = 0; SIM.applogSeen = false;
@@ -10226,6 +10378,9 @@ document.getElementById('runbtn').onclick = () => {
   const host = boardHost ? boardHost.value.trim() : '';
   if (dev !== 'pal' && !host){ setStatus('enter the ' + dev + ' board hostname'); return; }
   LIVE.logoff = 0;
+  // New run → reset the TIMESYNC-idle trigger state and drop any stale timer.
+  LIVE.tlDone = false; LIVE.tsSeen = false;
+  if (LIVE.tsIdleTimer){ clearTimeout(LIVE.tsIdleTimer); LIVE.tsIdleTimer = null; }
   // Stop aiedbg polling/console BEFORE the download starts so its JTAG reads
   // don't collide with device program/reset/dow -force. Re-enabled in pollLog
   // when the run ends (force-stop or natural completion).
@@ -10273,11 +10428,18 @@ document.getElementById('stopbtn').onclick = () => {
       // Re-enable debug features immediately — don't wait for the next pollLog
       // tick, which may never fire if the run was in a bad state.
       if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
+      // Drop any pending idle timer so it can't fire into the next run.
+      if (LIVE.tsIdleTimer){ clearTimeout(LIVE.tsIdleTimer); LIVE.tsIdleTimer = null; }
       // "no run in progress" is not a failure: the board is free, which is what
       // the click asked for. Clearing on that answer is what unwedges the UI.
       LIVE.runOwned = false;
       setDebugEnabled(true);
       setRunStatus('');
+      // Every Stop click should re-render and reload timeline.png. Clearing
+      // tlDone defeats the dedup so triggerTimeline regenerates from the final
+      // applog and showTimelineProfile re-fetches the image (cache-busted ts).
+      LIVE.tlDone = false;
+      triggerTimeline(true);   // gated by tsSeen; forced fresh render on Stop.
       if (r.run) applyRunState(r.run);
       updateRunButtons();
       if (r.error){ setStatus('stop: ' + r.error); }
