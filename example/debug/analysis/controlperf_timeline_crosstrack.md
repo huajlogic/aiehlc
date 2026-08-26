@@ -87,22 +87,82 @@ it **lasts**, what each track is doing, and — most importantly — **what on o
 what on the others** at that time-point group. Windows run back-to-back and sum to the whole
 core-boot → `iter0.wait_done` span (5905.982 → 6255.972 = **349.990 µs**).
 
-| Window (µs) | Lasts | What each track does in this window | Cross-track cause → effect |
-|-------------|-------|-------------------------------------|----------------------------|
-| **5905.982 → 5906.107** | **0.125 µs** | **core** `ACTIVE` prologue (125 cyc), then requests the input lock | Core boots and asks for the lock the **host** has not released → this *arms* the stall that follows |
-| **5906.107 → 6163.843** | **257.7 µs** (cold stall) | **core** in one cold `LOCK_STALL`; **host** does `iter-1.launch` 5918.409, `iter0.iter_start` 6154.571, `iter0.dma_start` 6160.972; **DMA** `START_TASK` 6141.228 → `STREAM_STARVATION`; **port** idle | **HOST** is busy streaming the kernel group + arming BDs word-by-word over serial MMIO → it **never releases the core's input lock** → **CORE** lock-stalls the entire setup → the **DMA** it armed at 6141.228 has no core output to drain, so it **STARVES** → **PORT** stays idle. One host cause, three stalled tracks. |
-| **6163.843 → 6164.003** | **~0.16 µs** (the synchronized wake) | **DMA** first `FINISHED_BD` 6163.843; **port** first `PORT_RUNNING` 6163.994; **core** exits cold stall → `ACTIVE` 6163.995 | **HOST** finally releases the lock (its `dma_start` MMIO landed) → **CORE** grabs it and produces its first output → **PORT** carries that output → **DMA** drains the first BD. All three HW tracks wake **within ~0.16 µs of each other**, cascaded off the single host lock-release. |
-| **6164.003 → 6178.624** | **14.6 µs** | **core** back in `LOCK_STALL` (6164.524→6178.625); **host** still issuing MMIO; **DMA**/**port** idle/starved | After the first grab the **HOST** is still serially arming the next BDs → **CORE** re-stalls waiting on the next lock → DMA/port go quiet again |
-| **6178.624 → 6178.7** | **~0.08 µs** | **core** brief first compute blip (~50-cyc `ACTIVE` bursts) | A momentary lock-release lets the **CORE** compute a handful of cycles, then it re-stalls immediately |
-| **6178.7 → 6229.732** | **~51.0 µs** | **core** two long `LOCK_STALL`s (6195.984→6213.211 ≈17.2 µs, 6213.217→6230.551 ≈17.3 µs); **host** issuing BD/startio MMIO up to `wait_start` 6229.732 | This is the bulk of the ~68 µs **HOST issue window** → **CORE** is lock-stalled and **DMA** stream-starved almost the whole time. The issue window is **wait, not compute.** |
-| **6229.732 → 6240** | **~10 µs** (compute+drain cluster) | **host** `wait_start` 6229.732 (stops issuing, polls); **core** dense `ACTIVE` ~50-cyc bursts; **DMA** repeated `FINISHED_BD`; **port** repeated `PORT_RUNNING` | The instant the **HOST** stops issuing MMIO and starts polling, the lock frees → **CORE** computes in a tight burst → **PORT** carries the outputs → **DMA** drains them. **The real compute+drain clusters *here*, at `wait_start`** — not spread evenly across the iteration. |
-| **6240 → 6255.972** | **~16 µs** | **host** polling to `wait_done` 6255.972; HW tracks quiescing | **HOST** finishes polling the DMA it programmed → `iter0.wait_done`; `iter1` begins immediately at 6256.002 |
+**What the host is actually doing** (from the companion cost model,
+[`controlperf_analysis.md`](controlperf_analysis.md) §2–§4). Every host action is a burst of
+**blocking, non-posted 32-bit MMIO stores** over the NoC, **~365 ns each, no batching** — the
+ARM stalls on every single word:
+
+| Host op (marker / API) | What it programs | Cost |
+|------------------------|------------------|------|
+| `__Runtime_load_kernel_group` | streams 16 kernel ELFs into tiles word-by-word | ~7369 µs/call (one-time) |
+| `__Runtime_launch_kernel_group` → `iter-1.launch` | ~16 core-enable writes | ~13.8 µs |
+| `__Runtime_dma_bd_config` | one BD = 6 words (tile) / 9 words (shim) | ~2.29 / ~3.34 µs each (×120/iter) |
+| `__Runtime_dma_createio_4` | CPU-side descriptor build (no MMIO) | ~0.04 µs (×60/iter) |
+| `__Runtime_startio` (SetStartQueue) | single register write to arm the DMA queue | ~0.365 µs (×60/iter) |
+| `wait_io` idle-poll | reads DMA status register in a loop | ~0.88 µs/poll |
+
+So a host "release the lock / start the DMA" is never instantaneous: it is the **tail of a
+long serial train** of these stores, and the HW tracks can only move after the relevant word
+lands.
+
+| Window (µs) | Lasts | Host operation (the driver) | Core / DMA / Port (the followers) | Cross-track cause → effect |
+|-------------|-------|-----------------------------|-----------------------------------|----------------------------|
+| **5905.982 → 5906.107** | **0.125 µs** | idle (device already inited) | **core** `ACTIVE` prologue (125 cyc), then requests the input lock | Core boots and asks for the lock the host has not released → this *arms* the stall that follows |
+| **5906.107 → 6163.843** | **257.7 µs** (cold stall) | **`load_kernel_group`** streaming 16 ELFs word-by-word (the ~248 µs setup), then **`launch_kernel_group`** (`iter-1.launch` 5918.409, ~16 enables), then **`iter0.iter_start`** 6154.571 and the first burst of **`dma_bd_config`/`createio`/`startio`** up to **`dma_start`** 6160.972 | **core** one cold `LOCK_STALL`; **DMA** `START_TASK` 6141.228 → `STREAM_STARVATION`; **port** idle | The host is **still mid-train** of ELF-load + BD-config MMIO stores → it has **not released the core's input lock** → **CORE** lock-stalls the entire setup → the **DMA** its `startio` armed at 6141.228 has no core output to drain, so it **STARVES** → **PORT** stays idle. One host train, three stalled tracks. |
+| **6163.843 → 6164.003** | **~0.16 µs** (the synchronized wake) | the **final lock-release word** of the `dma_start` train lands | **DMA** first `FINISHED_BD` 6163.843; **port** first `PORT_RUNNING` 6163.994; **core** exits cold stall → `ACTIVE` 6163.995 | The single host store that releases the lock finally lands → **CORE** grabs it and produces its first output → **PORT** carries that output → **DMA** drains the first BD. All three HW tracks wake **within ~0.16 µs of each other**, cascaded off that one host word. |
+| **6164.003 → 6178.624** | **14.6 µs** | host still issuing the **next iteration's `dma_bd_config`** train (9-word shim BDs, ~3.34 µs each) | **core** back in `LOCK_STALL` (6164.524→6178.625); **DMA**/**port** idle/starved | Because the host serially re-arms BDs word-by-word, the next lock is not freed → **CORE** re-stalls → DMA/port go quiet again |
+| **6178.624 → 6178.7** | **~0.08 µs** | a lock word momentarily lands between BD writes | **core** brief first compute blip (~50-cyc `ACTIVE` bursts) | A momentary lock-release lets the **CORE** compute a handful of cycles, then it re-stalls as the host resumes its BD train |
+| **6178.7 → 6229.732** | **~51.0 µs** | bulk of the **`dma_bd_config` + `startio` issue train** (~68 µs `dma_start`→`wait_start` total) — 120 BD writes × ~3 µs dominate | **core** two long `LOCK_STALL`s (6195.984→6213.211 ≈17.2 µs, 6213.217→6230.551 ≈17.3 µs); **DMA** stream-starved | This is the host **issue window**, and it is **wait, not compute**: while the ARM serially writes hundreds of BD words, the **CORE** is lock-stalled and the **DMA** stream-starved almost the whole time |
+| **6229.732 → 6240** | **~10 µs** (compute+drain cluster) | **`wait_start`** 6229.732 — host **stops issuing** and enters the `wait_io` poll loop | **core** dense `ACTIVE` ~50-cyc bursts; **DMA** repeated `FINISHED_BD`; **port** repeated `PORT_RUNNING` | The instant the host stops its MMIO train and only polls, the last-armed lock frees → **CORE** computes in a tight burst → **PORT** carries the outputs → **DMA** drains them. **The real compute+drain clusters *here*, at `wait_start`** — not spread across the iteration. |
+| **6240 → 6255.972** | **~16 µs** | host **`wait_io` poll loop** (~0.88 µs/poll) reading DMA status until done | **DMA**/**port** finishing the last descriptors, then quiescing | The host polls the DMA it just programmed until completion → **`iter0.wait_done`** 6255.972; `iter1` begins immediately at 6256.002 |
 
 **The key insight:** the ~68 µs window between `dma_start` (6160.972) and `wait_start`
-(6229.732) is **mostly core `LOCK_STALL` / DMA `STREAM_STARVATION`**, driven by the host's
-serial MMIO — not compute. The actual compute+drain burst is a short ~10 µs cluster that
-only fires once the host stops issuing and starts polling, and every HW-track event traces
-back to a host lock-release cause.
+(6229.732) is the host **serially issuing 120 `dma_bd_config` + 60 `startio` MMIO writes**
+with no batching; during it the core is **lock-stalled** and the DMA **stream-starved** — it
+is *host issue*, not compute. The real compute+drain burst is a short ~10 µs cluster that
+only fires once the host stops issuing and enters its `wait_io` poll, and every HW-track
+event traces back to a specific host register-write landing.
+
+#### Continuing through the steady iterations (iter1 → iter3)
+
+Once iter0's cold-start is paid, iter1–iter3 **repeat the same shape at full detail** — only
+without the one-time ELF load. Each is a contiguous window chain summing to its `iter_start
+→ wait_done` span (~94.9 µs), with the identical cross-track cause as iter0 (a host
+lock-release word lands → core computes → port carries → DMA drains).
+
+**iter1 (6256.002 → 6350.873, span 94.871 µs)**
+
+| Window (µs) | Lasts | Host operation (the driver) | Core / DMA / Port (the followers) | Cross-track cause → effect |
+|-------------|-------|-----------------------------|-----------------------------------|----------------------------|
+| **6256.002 → 6256.713** | **0.711 µs** | `iter1.iter_start` → begins the `dma_bd_config` train (`dma_start`) | **core** `LOCK_STALL`; **DMA** starved | Host starts re-arming BDs → nothing frees the lock yet |
+| **6256.713 → 6326.444** | **69.731 µs** (issue window) | serial `dma_bd_config` + `startio` MMIO train (120 BD writes × ~3 µs); `wait_start` 6324.863 near the end | **core** four back-to-back `LOCK_STALL`s — 6260.431→6274.668 (14.24 µs), 6275.042→6291.873 (16.83 µs), 6291.879→6309.113 (17.23 µs), 6309.119→6326.444 (17.33 µs); **DMA** `STREAM_STARVATION`; **port** idle | While the ARM serially writes BD words, the input lock is never freed → **CORE** lock-stalls the whole issue window → **DMA** starves, **PORT** idle. Pure host issue, no compute. |
+| **6326.444 → ~6336** | **~10 µs** (compute+drain cluster) | host now in `wait_io` poll (stopped issuing at `wait_start`) | **core** `ACTIVE` ~50-cyc bursts (first 6326.533) with a brief 1.3 µs re-stall 6327.189→6328.513; **DMA** `FINISHED_BD`; **port** `PORT_RUNNING` | Host stops its MMIO train → last-armed lock frees → **CORE** computes in a tight burst → **PORT** carries → **DMA** drains. Compute clusters **at `wait_start`**. |
+| **~6336 → 6350.873** | **~15 µs** | `wait_io` poll loop until `wait_done` 6350.873 | **DMA**/**port** finishing last descriptors, then quiescing | Host polls the DMA it programmed to completion → `iter1.wait_done`; `iter2` begins 6350.903 |
+
+**iter2 (6350.903 → 6445.014, span 94.111 µs)**
+
+| Window (µs) | Lasts | Host operation (the driver) | Core / DMA / Port (the followers) | Cross-track cause → effect |
+|-------------|-------|-----------------------------|-----------------------------------|----------------------------|
+| **6350.903 → 6351.173** | **0.270 µs** | `iter2.iter_start` → `dma_start` | **core** `LOCK_STALL`; **DMA** starved | Host begins re-arming BDs |
+| **6351.173 → 6420.622** | **69.449 µs** (issue window) | serial `dma_bd_config` + `startio` train; `wait_start` 6419.324 near the end | **core** four back-to-back `LOCK_STALL`s — 6354.592→6368.685 (14.09 µs), 6369.208→6386.025 (16.82 µs), 6386.031→6403.398 (17.37 µs), 6403.404→6420.622 (17.22 µs); **DMA** `STREAM_STARVATION`; **port** idle | Same as iter1: host serial MMIO holds the lock → all three HW tracks stalled through the issue window |
+| **6420.622 → ~6430** | **~10 µs** (compute+drain cluster) | host in `wait_io` poll | **core** `ACTIVE` bursts (first 6420.711) + **DMA** `FINISHED_BD` + **port** `PORT_RUNNING` | Host stops issuing → lock frees → compute+drain cluster fires at `wait_start` |
+| **~6430 → 6445.014** | **~15 µs** | `wait_io` poll until `wait_done` 6445.014 | HW tracks quiescing (last S2MM event ~6451.675) | Poll to completion → `iter2.wait_done`; `iter3` begins 6445.034. **iter2 is the last fully HW-observed iteration.** |
+
+**iter3 (6445.034 → 6539.475, span 94.441 µs) — HW trace truncates mid-iteration**
+
+| Window (µs) | Lasts | Host operation (the driver) | Core / DMA / Port (the followers) | Cross-track cause → effect |
+|-------------|-------|-----------------------------|-----------------------------------|----------------------------|
+| **6445.034 → 6445.644** | **0.610 µs** | `iter3.iter_start` → `dma_start` | **core** `LOCK_STALL`; **DMA** starved | Host begins re-arming BDs |
+| **6445.644 → 6448.716** | **~3.07 µs** (last HW-visible) | serial `dma_bd_config` train begins | **core** `LOCK_STALL`; **port** stalled — **last HW rows at 6448.716** | Same stall pattern starts, but the **core/port 8k trace buffer fills at 6448.716** and stops emitting (§5) |
+| **6448.716 → 6513.775** | **~65 µs** (HW blind) | host still issuing the BD/`startio` train | *(no HW trace)* — core/port silent | Host is still mid-issue, but there is **no HW evidence**; only the host lane continues |
+| **6513.775 → 6539.475** | **25.700 µs** | `wait_start` 6513.775 → `wait_io` poll → `wait_done` 6539.475 | *(compute+drain cluster not captured)* | The iter3 cluster would fire at `wait_start` as before, but it is **beyond the trace horizon**; host `wait_done` 6539.475 = **run ends** |
+
+**Trace-truncation caveat (iter3).** The core/port HW trace buffers fill at **6448.716 µs**
+(8k trace-mem limit, §5), which lands inside iter3's issue window — so iter3's compute+drain
+cluster and port activity are **not captured**. Only the **host** lane survives to
+`wait_done` 6539.475. That is why the run's **HW picture ends at 6448.716** while its **host
+picture ends at 6539.475**, and why iter2 is the last iteration with full four-track
+evidence.
 
 ### (b) One steady iteration as a sequence (iter1, 6256 → 6351)
 

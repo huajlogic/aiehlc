@@ -9238,7 +9238,6 @@ const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
                // Run starts. switchView re-asserts the tab from this flag so no
                // view switch (e.g. Device Map) can leave the tab stuck disabled.
                profileReady:false,
-               simOnly:false };
                simOnly:false, jtagHost:'' };
 const HW_SERVER_CMD = 'exec hw_server -stcp:0.0.0.0:3121';
 const LSTATE = {
