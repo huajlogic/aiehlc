@@ -76,7 +76,8 @@ never shows up, check the header first.
 |---|---|
 | `session-provenance` | *May I claim this?* The four session states, applog staleness, why a configured target proves nothing. Read before any register read or log quote. |
 | `aiegdb-console` | The verified `aie_exec` command surface: scope model, per-scope commands, which verbs write hardware. |
-| `debugui-tools` | The fourteen granted `mcp__debugui__*` tools (9 static-schedule + 5 app/UI-state) — names, params, returns, and which question each answers. |
+| `debugui-tools` | The sixteen granted `mcp__debugui__*` tools (9 static-schedule + 1 live-scan + 6 app/UI-state) — names, params, returns, and which question each answers. |
+| `live-scan-results` | What the AIE Debug pane's DMA/Cores/Events/Switch scans mean, how `[context] Live scan …` and `get_live_scan()` relate, and when to drill with `aie_exec`. |
 | `dma-stall-triage` | Ordered producer→hop→consumer procedure for a hang, stall or data mismatch. |
 | `app-layout` | Which file answers which question, and where the app actually is on disk. |
 | `source-grounding` | *Why am I not citing their code?* When to leave the register dump and open the app's own source, the hand-written vs generated split, the four schedule-number → declaration chains, and the `<file>:<line>` citation form the UI makes clickable. |

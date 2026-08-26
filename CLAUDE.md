@@ -167,6 +167,30 @@ Read the matching skill when the task fits:
 
 **Command:** [data-mismatch-debug](.claude/commands/data-mismatch-debug.md) — systematic DMA data-mismatch triage.
 
+### Browser automation (MCP)
+
+`mcp-browser` is configured in `.mcp.json` (built at `thirdparty/mcp-browser/`). It gives Claude live Playwright-based browser control via MCP tools.
+
+**When to use it:**
+- Testing or verifying the debug UI (`schedule_debug_server.py` / `schedule_view.py`) in a real browser
+- Reproducing UI bugs: navigate to the UI, screenshot, inspect element state
+- Adding or debugging frontend features: navigate → interact → screenshot to confirm the feature works
+- Checking that a server-side change is reflected in the rendered page without manual intervention
+
+**Key tools:** `browser_navigate`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_extract_text`, `browser_wait_for_element`, `browser_execute_script`
+
+**Typical debug UI workflow:**
+1. Ensure the debug server is running (e.g., `python3 src/tool/debug/schedule_debug_server.py ...`)
+2. `browser_navigate` to `http://localhost:<port>`
+3. `browser_screenshot` to see current state
+4. Interact and verify with `browser_click` / `browser_extract_text`
+
+**Re-building after changes:**
+```bash
+cd thirdparty/mcp-browser && npm run build
+```
+Restart Claude Code (or reload MCP) to pick up the rebuilt server.
+
 ### Debug tools
 
 - **[src/tool/debug/README.md](src/tool/debug/README.md)** — user guide and CLI for all debug tools

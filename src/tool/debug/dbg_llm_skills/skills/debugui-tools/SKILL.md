@@ -2,7 +2,7 @@
      SPDX-License-Identifier: Apache-2.0 -->
 ---
 name: debugui-tools
-description: Catalogue of the FIFTEEN granted `mcp__debugui__*` tools - exact names, parameter names/types/defaults, return shapes, and the error string each one emits. Read when you need a fact out of the COMPILED STATIC SCHEDULE (which tiles exist; a tile's role, kernel and channel<->kernel-argument map; a flow's hops and stream-switch pairs; per-flow supply/demand; BD lengths; where a symbol occurs) or out of WHAT THE USER HAS ON SCREEN (`get_ui_state` is how "this tile" / "that flow" resolves to real coords; `get_pane` returns one UI pane verbatim; `list_apps` / `current_app` answer "which app is loaded, and what else could be"; `app_sources` lists that app's own source files so an explanation can cite code instead of stopping at the schedule), and when a debugui call returned something you must interpret: "daemon not reachable" from the three daemon-backed tools, `_load_view()`'s tried-paths error, or a `kinds=` filter that is never validated and so silently matches nothing on a typo. None of the fifteen touch the board or the IPC socket, none are session-gated, none write hardware. `select_app` is registered in debug_ui_mcp.py but deliberately NOT granted - never call it; ask the user to switch apps in the UI. Also documents the get_applog FRESH/STALE/UNVERIFIED banner and the get_ipc_log CSV columns. A tool catalogue, not a procedure: symptom triage is dma-stall-triage's, an on-disk file's absolute path is app-layout's, what a banner lets you claim is session-provenance's.
+description: Catalogue of the SIXTEEN granted `mcp__debugui__*` tools - exact names, parameter names/types/defaults, return shapes, and the error string each one emits. Read when you need a fact out of the COMPILED STATIC SCHEDULE (which tiles exist; a tile's role, kernel and channel<->kernel-argument map; a flow's hops and stream-switch pairs; per-flow supply/demand; BD lengths; where a symbol occurs) or out of WHAT THE USER HAS ON SCREEN (`get_ui_state` is how "this tile" / "that flow" resolves to real coords; `get_pane` returns one UI pane verbatim; `list_apps` / `current_app` answer "which app is loaded, and what else could be"; `app_sources` lists that app's own source files so an explanation can cite code instead of stopping at the schedule), when the user has run a live overlay scan in the AIE Debug pane (`get_live_scan` returns the latest DMA/Cores/Events/Switch summary — pair with the `live-scan-results` skill), and when a debugui call returned something you must interpret: "daemon not reachable" from the daemon-backed tools, `_load_view()`'s tried-paths error, or a `kinds=` filter that is never validated and so silently matches nothing on a typo. Most of the sixteen touch only static schedule or disk logs; `get_live_scan` reads the last `/grid` overlay the user ran (still not a substitute for `get_backend_status` session gating). `select_app` is registered in debug_ui_mcp.py but deliberately NOT granted - never call it; ask the user to switch apps in the UI. Also documents the get_applog FRESH/STALE/UNVERIFIED banner and the get_ipc_log CSV columns. A tool catalogue, not a procedure: symptom triage is dma-stall-triage's, scan interpretation is live-scan-results's, an on-disk file's absolute path is app-layout's, what a banner lets you claim is session-provenance's.
 ---
 
 # debugui MCP tools — the cheap static-schedule and UI-state layer
@@ -14,23 +14,28 @@ sets `--permission-mode bypassPermissions` — so a tool the server exposes is c
 or not it is listed. Withholding one requires `--disallowedTools`, which the spawn uses for
 exactly one tool (below).
 
-**Fifteen** `mcp__debugui__*` tools are granted, in two groups:
+**Sixteen** `mcp__debugui__*` tools are granted, in three groups:
 
 - **Schedule-view tools** (9) — `get_design_overview`, `tile_list`, `tile_info`,
   `get_flow_detail`, `symbol_search`, `get_backend_status`, `get_applog`, `get_sim_log`,
   `get_ipc_log`. These read the **static compiled schedule** (`schedule_view.json`, the
   same blob that renders `host_schedule.html`) or a log file on disk.
+- **Live scan tool** (1) — `get_live_scan`. Returns the latest **overlay scan** the user
+  ran from the AIE Debug pane (DMA / Cores / Events / Switch). Does not touch the board
+  itself; it reads `backend_status.json > last_scan` or `GET /live_scan`. Interpret with
+  the `live-scan-results` skill; gate with `get_backend_status` / `session-provenance`.
 - **App / UI tools** (6) — `list_apps`, `current_app`, `app_sources`, `get_ui_state`,
   `list_panes`, `get_pane`. See the second section below. None reads
   `schedule_view.json` except `get_pane`, and they fail differently:
   `list_apps` / `current_app` / `get_ui_state` are **daemon-backed** (HTTP),
   `app_sources` reads `backend_status.json` off disk, and `list_panes` is a static table.
 
-None of the fifteen touch the board or the simulator IPC socket, none are gated by the
-session-authorization check that `mcp__aiegdb__aie_exec` enforces, none write hardware, and
-none can fail a run. Use them freely.
+Fifteen of the sixteen do not issue fresh hardware reads during the tool call itself.
+`get_live_scan` surfaces a scan the user (or live overlay) already triggered via `/grid`.
+None are gated by the session-authorization check that `mcp__aiegdb__aie_exec` enforces,
+none write hardware, and none can fail a run. Use them freely.
 
-`debug_ui_mcp.py` registers a sixteenth tool, `select_app(app_id)`, which the spawn
+`debug_ui_mcp.py` registers a seventeenth tool, `select_app(app_id)`, which the spawn
 explicitly **denies** via `--disallowedTools mcp__debugui__select_app` — switching the app
 reconfigures the whole server (board IPs, PDIs, ELF paths) and belongs to the user. Calling
 it will be refused; if the user needs a different app, tell them to pick it in the UI.
@@ -117,6 +122,26 @@ Read `note` and `session` **before** any `aie_exec` that touches the device:
   reads. The user must press "Connect", "Run" or "Open Current Session" first. Do
   not describe board state.
 Answers: *is a live read even possible right now?*
+
+### `mcp__debugui__get_live_scan(detail: bool = True)` → str
+No hardware read in the tool itself — returns the **latest overlay scan** the user
+ran from the AIE Debug pane (DMA / Cores / Events / Switch selector + Scan or live
+every ~2s). Sources, in order: `backend_status.json > last_scan`, then daemon
+`GET /live_scan`. After each scan the browser also injects
+`[context] Live scan (…)` into the LLM tab automatically.
+
+When `detail=True` (default), returns a multi-line block:
+`Live scan (<mode> @ <timestamp>)` plus mode-specific lines (tile state counts,
+stalled channels with `stall=` / `err=` / `bd=`, mismatch tiles, dynamic flow
+count, …). When `detail=False`, returns only the headline line.
+
+If nothing was scanned yet:
+`no live scan recorded yet — the user has not pressed Scan or enabled live overlay
+in the AIE Debug pane`.
+
+Answers: *what did the user's scan show?* Use before re-reading every tile with
+`aie_exec`. Interpret with the **`live-scan-results`** skill; still call
+`get_backend_status()` first so you know whose run the scan reflects.
 
 ### `mcp__debugui__get_applog(lines: int = 50)` → str
 Tail of the run log — simulator `ipc_app.log` when `backend == "simulator"`, otherwise the
@@ -276,7 +301,8 @@ something on screen and you want *just* that pane (pair it with `get_ui_state`);
 | "how is f3 routed?" | `get_flow_detail(3)` |
 | "did the run pass?" | `get_applog(80)` — and state the provenance banner |
 | sim hangs / no output | `get_backend_status()` → `get_sim_log(100)` → `get_ipc_log(120,"both")` |
-| "is the DMA actually stuck?" | static first (`get_flow_detail`, `tile_info`) to know what *should* happen, `get_backend_status()` to confirm a live read is allowed, only then `aie_exec("target tile C R")` / `aie_exec("dma status")` / `aie_exec("bd")` |
+| "is the DMA actually stuck?" | static first (`get_flow_detail`, `tile_info`) to know what *should* happen, `get_backend_status()` to confirm a live read is allowed, **`get_live_scan()` if the user scanned**, only then `aie_exec("target tile C R")` / `aie_exec("dma status")` / `aie_exec("bd")` |
+| coloured tiles / switch mismatch / "what did scan show?" | `get_live_scan()` → **`live-scan-results`** skill → `get_flow_detail` / `tile_info` on named tiles |
 
 **Rule:** never open with a hardware read. A live `dma status` is only interpretable once
 you know from `get_flow_detail`/`tile_info` which channel, BD id and length that tile was
