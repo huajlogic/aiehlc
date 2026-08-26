@@ -25,9 +25,13 @@ A "PASS" in the applog is meaningless if its timestamp predates this session.
 
 ---
 
-## 1. Start from the auto-scan report
+## 1. Start from the scan report
 
-The daemon's DMA scan flags channels with stall bits set. Read the flags literally:
+When the user has scanned the array (or you receive `[context] Live scan …`),
+call `get_live_scan()` and read the summary literally. Otherwise ask for a DMA
+scan first — do not invent stall locations.
+
+The DMA scan flags channels with stall bits set. Read the flags literally:
 
 | Flag | Meaning | First question |
 |---|---|---|

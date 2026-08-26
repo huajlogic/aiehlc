@@ -366,7 +366,8 @@ run console.
 | `llm_reset(reason)` | terminate + respawn; clear the buffer; advance the generation; return the new generation and reason. |
 
 Config fields: `claude_bin` (default `"claude"`), `claude_cwd` (default repo
-root = `os.path.dirname(_SCRIPT_DIR)`), `claude_model` (default → CLI default),
+root = `os.path.dirname(_SCRIPT_DIR)`), `claude_model` (CLI default
+`claude-opus-5[1m]`; `None` on the constructor means "no `--model` flag"),
 `llm_enabled`. All access is serialized by `self._llm_lock`.
 
 To avoid duplicating streamed text, the reader emits **text only** from
@@ -397,7 +398,7 @@ terminated (alongside the aiegdb subprocess).
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--claude-bin` | `claude` | Path to the claude CLI. |
-| `--claude-model` | none | Model for the LLM tab (else CLI default). |
+| `--claude-model` | `claude-opus-5[1m]` | Model for the LLM tab. Override via `$SCHEDULE_DEBUG_CLAUDE_MODEL`; pass `''` for the CLI default. |
 | `--claude-cwd` | repo root | Working dir so the subprocess loads `CLAUDE.md`/skills. |
 | `--no-llm` | off | Disable the LLM tab and its `/llm*` endpoints. |
 | `--password` | none (env `SCHEDULE_DEBUG_PASSWORD`) | Password required to use the LLM tab. If unset and stdin is a TTY, the daemon **prompts at startup** (`getpass`, no echo); pressing Enter with no input => no auth. |
