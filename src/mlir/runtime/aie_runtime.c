@@ -2980,6 +2980,121 @@ XAie_DmaDesc __Runtime_dma_bd_config(XAie_DevInst *dev, XAie_LocType tile, void 
     return DmaInst;
 }
 
+/* ===========================================================================
+ * Control-packet register/config write support.
+ *
+ * A control packet delivers in-tile register/memory writes through the stream
+ * switch: a SHIM MM2S BD streams a DDR buffer whose words carry, per <=4-word
+ * chunk, two in-band headers followed by data. The target tile's CTRL stream
+ * switch master port decodes the control header and performs the writes.
+ * Mirrors _XAie_CtrlPktizeElfPkt / _XAie_LoadElfStrmSwStartDma in the aie-rt
+ * driver (xaie_elfloader.c). The stream switch routes are set up separately
+ * (routing.cc, CTRL sink); these helpers only build and push the payload.
+ * =========================================================================== */
+
+/* Odd-parity bit for a 32-bit packet header (mirrors _XAie_GetPktParity:
+ * returns 1 for even parity, 0 for odd). */
+static uint32_t __Runtime_pkt_parity(uint32_t packet) {
+    for (uint8_t i = 16U; i > 0U; i >>= 1U)
+        packet ^= (packet >> i);
+    return (packet & 1U) ? 0U : 1U;
+}
+
+/**
+ * Build control-packet words for a contiguous block of @nwords 32-bit values
+ * targeting tile-local byte address @tile_addr onward, routed by @stream_id.
+ *
+ * Emits, per <=4-word chunk (matching the driver format):
+ *   [stream packet header] bits[4:0]=stream id, bit31=odd parity
+ *   [control packet header] bits[19:0]=tile addr, bits[21:20]=size-1, bit31=parity
+ *   [size data words]
+ *
+ * @out      output word buffer.
+ * @out_cap  capacity of @out in 32-bit words.
+ * @return   number of words written, or 0 on capacity overflow.
+ */
+uint32_t __Runtime_ctrl_pktize(uint32_t *out, uint32_t out_cap, uint32_t stream_id, uint32_t tile_addr,
+                               const uint32_t *data, uint32_t nwords) {
+    uint32_t idx = 0U;
+    for (uint32_t i = 0U; i < nwords; i += 4U) {
+        uint32_t pkt_size = (nwords - i) > 4U ? 4U : (nwords - i);
+        /* need 2 headers + pkt_size data words */
+        if (idx + 2U + pkt_size > out_cap) {
+            AIEHLC_LOG(printf("[aie_runtime] ctrl_pktize: overflow at word %u (cap=%u)\n", idx, out_cap););
+            return 0U;
+        }
+        uint32_t ctrl_hdr = 0U;
+        ctrl_hdr |= ((pkt_size - 1U) & 0x3U) << 20U;
+        ctrl_hdr |= (tile_addr + (i * (uint32_t)sizeof(uint32_t))) & 0xFFFFFU;
+        ctrl_hdr |= __Runtime_pkt_parity(ctrl_hdr) << 31U;
+
+        uint32_t pkt_hdr = stream_id & 0x1FU;
+        pkt_hdr |= __Runtime_pkt_parity(pkt_hdr) << 31U;
+
+        out[idx++] = pkt_hdr;
+        out[idx++] = ctrl_hdr;
+        for (uint32_t j = 0U; j < pkt_size; j++)
+            out[idx++] = data ? data[i + j] : 0U;
+    }
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_pktize: stream_id=%u tile_addr=0x%x nwords=%u -> %u pkt words\n", stream_id,
+                      tile_addr, nwords, idx););
+    return idx;
+}
+
+/**
+ * Push a control-packet buffer through a SHIM MM2S channel and wait for
+ * completion. @buf must be a DMA-capable buffer from __Runtime_alloc_buffer.
+ * Mirrors _XAie_LoadElfStrmSwStartDma (plain MM2S transfer; headers are in-band
+ * in the payload, so BD packet-mode is NOT enabled here).
+ *
+ * @shim_col  SHIM (row 0) column that sources the stream.
+ * @nwords    number of 32-bit words in @buf.
+ * @bd_id     BD index to use on the shim MM2S channel.
+ * @channel   MM2S channel index.
+ * @return    XAIE_OK on success.
+ */
+AieRC __Runtime_ctrl_push(XAie_DevInst *dev, uint8_t shim_col, uint32_t *buf, uint32_t nwords, int32_t bd_id,
+                          int32_t channel) {
+    XAie_LocType loc = XAie_TileLoc(shim_col, 0U);
+    uint64_t offset = 0U;
+    XAie_MemInst *mem = __vaddr_to_mem_offset(buf, &offset);
+    if (!mem) {
+        printf("[aie_runtime] ctrl_push ERROR: buf=%p is not a DMA buffer (use __Runtime_alloc_buffer)\n", buf);
+        return XAIE_ERR;
+    }
+    uint64_t dev_addr = XAie_MemGetDevAddr(mem) + offset;
+    uint32_t len = nwords * (uint32_t)sizeof(uint32_t);
+#ifdef __AIESIM__
+    ess_WriteGM(dev_addr, buf, (uint64_t)len);
+#endif
+    XAie_DmaDesc desc;
+    AieRC rc = XAie_DmaDescInit(dev, &desc, loc);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaSetAddrLen(&desc, dev_addr, len);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaEnableBd(&desc);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaSetAxi(&desc, 0U, 16U, 0U, 0U, 0U);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaWriteBd(dev, &desc, loc, (uint8_t)bd_id);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaChannelPushBdToQueue(dev, loc, (uint8_t)channel, DMA_MM2S, (uint8_t)bd_id);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaChannelEnable(dev, loc, (uint8_t)channel, DMA_MM2S);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_push ERROR: shim(%u,0) bd=%d ch=%d rc=%d\n", (unsigned)shim_col, bd_id, channel,
+               (int)rc);
+        return rc;
+    }
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_push shim(%u,0) bd=%d ch=%d addr=0x%lx len=%u\n", (unsigned)shim_col, bd_id,
+                      channel, (unsigned long)dev_addr, len););
+    uint8_t pending = 1U;
+    do {
+        (void)XAie_DmaGetPendingBdCount(dev, loc, (uint8_t)channel, DMA_MM2S, &pending);
+    } while (pending != 0U);
+    return XAIE_OK;
+}
+
 /**
  * Configure DMA buffer descriptor with multi-dimensional addressing.
  * Uses XAie_DmaSetMultiDimAddr with stride/wrap descriptors to enable

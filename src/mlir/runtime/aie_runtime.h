@@ -681,6 +681,25 @@ void *__Runtime_alloc_buffer(XAie_DevInst *dev, size_t size_bytes);
 // Free a buffer allocated by __Runtime_alloc_buffer.
 void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);
 
+// ---------------------------------------------------------------------------
+// Control-packet register/config write helpers.
+// Build a control-packet payload (two in-band headers per <=4-word chunk) and
+// push it via a SHIM MM2S BD so the target tile's CTRL stream-switch port
+// performs the register/memory writes. Stream-switch routes are set up
+// separately (routing.cc CTRL sink). Mirrors _XAie_CtrlPktizeElfPkt /
+// _XAie_LoadElfStrmSwStartDma in the aie-rt driver.
+// ---------------------------------------------------------------------------
+
+// Build control-packet words for a contiguous block; returns words written
+// (0 on capacity overflow).
+uint32_t __Runtime_ctrl_pktize(uint32_t *out, uint32_t out_cap, uint32_t stream_id, uint32_t tile_addr,
+                               const uint32_t *data, uint32_t nwords);
+
+// Push a control-packet buffer (from __Runtime_alloc_buffer) through a SHIM
+// MM2S channel and wait for completion.
+AieRC __Runtime_ctrl_push(XAie_DevInst *dev, uint8_t shim_col, uint32_t *buf, uint32_t nwords, int32_t bd_id,
+                          int32_t channel);
+
 // Flush dirty cache lines for the buffer to DDR (before DMA reads it).
 void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size);
 
