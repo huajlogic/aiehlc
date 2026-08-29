@@ -242,6 +242,30 @@ def test_aiegraph_compile_matches_direct():
         assert expected & produced, f"missing output files; got {sorted(produced)}"
 
 
+def test_orchestrate_conv_layer_appends():
+    """orchestrate_conv_layer appends host_canonicalized_<suffix> into ONE host.cc."""
+    try:
+        core = _compiler._core()
+    except Exception as e:
+        print("SKIP (pybind not built):", e); return
+    import tempfile
+    plan = build_plan(None)
+    launches = core.lower_aiegraph(_compiler.build_aiegraph_ir(plan))
+    convs = [(op, L) for op, L in zip(plan, launches) if cpu_codegen.is_aie_op(op.op)][:2]
+    with tempfile.TemporaryDirectory() as d:
+        for i, (op, L) in enumerate(convs):
+            specs = [(list(s), int(b), bool(x)) for (s, b, x) in L["tensor_specs"]]
+            body = kernels.kernel_body_for(op.op, L["func_name"])
+            n = core.orchestrate_conv_layer(2, 2, specs, d, body, L["func_name"],
+                                            host_func_suffix=L["func_name"],
+                                            append_mode=(i > 0))
+            assert isinstance(n, int) and n >= 1
+        host = open(os.path.join(d, "host.cc")).read()
+        for _, L in convs:
+            assert f"host_canonicalized_{L['func_name']}(" in host
+        assert host.count("host_canonicalized_") >= 2
+
+
 def test_cpu_codegen_bit_exact():
     """TVM CPU codegen is bit-exact with the numpy Q7 oracle.
 
@@ -351,6 +375,7 @@ def _main():
         ("aiegraph dataflow resolution", test_aiegraph_dataflow_resolution),
         ("aiegraph build + lower (if built)", test_aiegraph_build_and_lower),
         ("aiegraph compile == direct (if built)", test_aiegraph_compile_matches_direct),
+        ("orchestrate_conv_layer appends (if built)", test_orchestrate_conv_layer_appends),
         ("cpu codegen bit-exact (if TVM)", test_cpu_codegen_bit_exact),
         ("cpu codegen rejects AIE op", test_cpu_codegen_rejects_aie_op),
         ("dispatch routes non-conv to CPU (if built)", test_dispatch_routes_non_conv_to_cpu),

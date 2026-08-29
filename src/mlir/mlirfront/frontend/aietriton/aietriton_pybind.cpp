@@ -66,6 +66,33 @@ static bool run_aie_pipeline(int meshRows, int meshCols,
     return TilingLinalgPipeline::runPipeline(ctx, module, outputDir, userKernelBody, userKernelFuncName);
 }
 
+/// Multi-kernel variant of run_aie_pipeline. Forwards the already-present
+/// runPipeline multi-kernel args (hostFuncSuffix, appendMode, numHostDdrArgs)
+/// so per-layer host functions can be appended into ONE host.cc. Emits
+/// host_canonicalized_<suffix> into outputDir/host.cc; appendMode appends.
+/// Returns the number of DDR pointer args on the generated host function.
+static int orchestrate_conv_layer(int meshRows, int meshCols,
+                                  const std::vector<std::tuple<std::vector<int64_t>, int, bool>> &tensorSpecs,
+                                  const std::string &outputDir, const std::string &userKernelBody,
+                                  const std::string &userKernelFuncName, const std::string &hostFuncSuffix,
+                                  bool appendMode) {
+    mlir::MLIRContext ctx;
+    TilingLinalgPipeline::registerDialects(ctx);
+    std::vector<TensorParam> tensors;
+    for (auto &[shape, bw, isIn] : tensorSpecs)
+        tensors.push_back({shape, bw, isIn});
+    SplitModel splitModel = SplitModel::gemm();
+    auto module = TilingLinalgPipeline::buildRoutingIR(ctx, meshRows, meshCols, tensors, splitModel);
+    unsigned numHostDdrArgs = 0;
+    bool ok = TilingLinalgPipeline::runPipeline(ctx, module, outputDir, userKernelBody, userKernelFuncName,
+                                                /*runtimeDebugLevel=*/-1, /*userRewrittenSource=*/"", /*tensors=*/{},
+                                                /*maxPingPongBytes=*/4096, /*aieGen=*/"Gen2", hostFuncSuffix,
+                                                appendMode, &numHostDdrArgs);
+    if (!ok)
+        throw std::runtime_error("orchestrate_conv_layer: runPipeline failed");
+    return (int)numHostDdrArgs;
+}
+
 /// Build a C kernel body string from a list of KernelOp dicts via MLIR EmitC.
 ///
 /// Python passes a list[dict] where each dict has an "op" key plus op-specific
@@ -276,6 +303,11 @@ PYBIND11_MODULE(_aietriton_core, m) {
           "dma_specs: optional list of (dims, iter_step, iter_wrap, ddr_shape, mode) tuples, one per\n"
           "  tensor, giving non-flat shim DMA addressing (im2col conv). dims is a list of\n"
           "  (stride, wrap) pairs. Empty dims + mode 0 = flat (default).");
+    m.def("orchestrate_conv_layer", &orchestrate_conv_layer, py::arg("mesh_rows"), py::arg("mesh_cols"),
+          py::arg("tensor_specs"), py::arg("output_dir"), py::arg("user_kernel_body"), py::arg("user_kernel_func_name"),
+          py::arg("host_func_suffix"), py::arg("append_mode"),
+          "Multi-kernel variant of run_aie_pipeline: emits host_canonicalized_<suffix>\n"
+          "into output_dir/host.cc (append_mode appends). Returns numHostDdrArgs.");
     m.def("build_kernel_body", &build_kernel_body,
           py::arg("kernel_name"),
           py::arg("element_type"),
