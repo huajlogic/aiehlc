@@ -433,6 +433,29 @@ def test_buffer_graph_chains():
         assert isinstance(sz, int) and sz > 0
 
 
+def test_orchestrate_plan_emits_driver():
+    """orchestrate_plan writes ONE host.cc (N funcs), main.cc (program order), dispatcher, cpu .c."""
+    try:
+        core = _compiler._core()
+    except Exception as e:
+        print("  [skip] pybind not built:", e); return
+    import tempfile
+    plan = build_plan(None)
+    launches = core.lower_aiegraph(_compiler.build_aiegraph_ir(plan))
+    with tempfile.TemporaryDirectory() as d:
+        from frontend.tvm import orchestrator
+        bd = orchestrator.orchestrate_plan(plan, launches, d)
+        host = open(os.path.join(bd, "host.cc")).read()
+        main = open(os.path.join(bd, "main.cc")).read()
+        assert "__aie_launch(" in host and "__Runtime_set_kernel_elf(" in host
+        assert "int main(" in main
+        conv_names = [L["func_name"] for op, L in zip(plan, launches)
+                      if cpu_codegen.is_aie_op(op.op)]
+        for cn in conv_names[:3]:
+            assert cn in main
+        assert any(f.endswith(".c") for f in os.listdir(bd))
+
+
 def _main():
     tests = [
         ("cpu_reference == triton reference", test_cpu_reference_matches_triton),
@@ -449,6 +472,7 @@ def _main():
         ("dispatch routes non-conv to CPU (if built)", test_dispatch_routes_non_conv_to_cpu),
         ("plain-C CPU bit-exact (if cc)", test_plain_c_cpu_bit_exact),
         ("buffer graph chains producers", test_buffer_graph_chains),
+        ("orchestrate_plan emits driver (if built)", test_orchestrate_plan_emits_driver),
     ]
     print(f"TVM available: {tvm_available()}   onnx available: {onnx_available()}")
     logits, _ = cpu_reference()
