@@ -39,6 +39,7 @@ buffer is sized from layer-0's conv input ``Cin*H*W``.
 """
 
 import os
+import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Set
 
@@ -366,3 +367,193 @@ def orchestrate_plan(plan: List[LayerOp], launches: List[dict],
         f.write(_emit_main(graph, launches, plan, param_bufs))
 
     return build_dir
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  A2 build — arrange the build dir to satisfy hostcompile.sh's multi-kernel
+#  contract, then reuse script/hostcompile.sh to produce main.elf.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# hostcompile.sh (multi-kernel) contract — the pieces build_main_elf honours:
+#   * WORKLOCAL_DIR holds the sources; artifacts land in ``WORKLOCAL_DIR/build``.
+#   * It globs ``kernel_*.cc`` in WORKLOCAL_DIR and compiles each via kc.sh,
+#     renaming ``kernel.o`` -> ``kernel_<name>.o`` (per-kernel ``aieml_<name>.prx``
+#     is picked up automatically when present).
+#   * The host link (hostcompile.sh:469) compiles ONLY ``host.cc`` (+ the four
+#     runtime .c files + optional routing.o + the kernel objs). It does NOT pick
+#     up ``main.cc`` or the CPU ``<op>.c`` files, so build_main_elf folds the
+#     ``int main()`` body, the CPU-op plain-C entries, and the aieMesh/aieArray
+#     preamble (aiehlc.cc:4633-4663, needed by ``main``) INTO ``host.cc``.
+#   * host fixup (hostcompile.sh:369): if ``host.cc`` contains the literal
+#     ``int main()`` only ``#define __global__`` is added, so the folded main is
+#     emitted with the no-arg ``int main()`` signature to take that clean path.
+#   * The ELF lands at ``WORKLOCAL_DIR/build/host`` and is copied to
+#     ``<dirname(WORKLOCAL_DIR)>/main.elf``.
+
+# aieMesh/aieArray/aiePartition preamble — verbatim transcription of the subset
+# aiehlc.cc (4633-4663) injects that ``_emit_main`` relies on (aieArray::
+# partition(rows, cols), aieMesh.meshId). These types are NOT in aie_runtime.h,
+# so they must be defined in host.cc for the folded ``main`` to compile.
+_AIE_MESH_PREAMBLE = """
+// ===== aieMesh/aieArray host-partition preamble (mirrors aiehlc.cc) =====
+struct aiePartition {
+    int startCol, endCol, startRow, endRow;
+};
+struct aieMesh {
+    int rows, cols;
+    aiePartition partition;
+    int meshId;
+};
+struct aieArray {
+    int nextMeshId = 0;
+    XAie_DevInst* _dev = nullptr;
+    aieMesh partition(aiePartition p, int rows, int cols) {
+        int meshId = nextMeshId++;
+        _dev = __Runtime_init_mesh_partition(meshId, p.startCol,
+                                             p.endCol - p.startCol + 1);
+        return aieMesh{rows, cols, p, meshId};
+    }
+    aieMesh partition(int rows, int cols) {
+        int meshId = nextMeshId++;
+        _dev = __Runtime_init_mesh_partition(meshId, 0, cols);
+        return aieMesh{rows, cols, {0, cols - 1, 0, rows - 1}, meshId};
+    }
+    void* alloc(size_t size) { return __Runtime_alloc_buffer(_dev, size); }
+    void free(void* ptr) { __Runtime_free_buffer(_dev, ptr); }
+    void synchronizecpu(void* ptr, size_t size) {
+        __Runtime_sync_for_cpu(_dev, ptr, size);
+    }
+};
+"""
+
+
+def _strip_leading_copyright(text: str) -> str:
+    """Drop a leading ``_COPYRIGHT`` C block-comment from ``text`` (if present).
+
+    The folded artifacts (main.cc, CPU ``.c``) each carry their own copyright
+    banner; only host.cc's should survive in the merged file, so this removes a
+    duplicate leading ``/*...*/`` banner before splicing bodies in.
+    """
+    s = text.lstrip()
+    if s.startswith("/*"):
+        end = s.find("*/")
+        if end != -1:
+            return s[end + 2:].lstrip("\n")
+    return text
+
+
+def _fold_main_into_host(build_dir: str) -> None:
+    """Splice ``main.cc`` + CPU ``<op>.c`` bodies + mesh preamble into host.cc.
+
+    hostcompile.sh links only ``host.cc``; ``main.cc`` and the CPU ``.c`` files
+    are never picked up. So we append, in order: the aieMesh/aieArray preamble
+    (right after host.cc's existing ``#include "aie_runtime.h"``), then every CPU
+    op's plain-C body wrapped ``extern "C"`` (their entries are declared
+    ``extern "C"`` in ``main.cc``), then ``main.cc``'s body (its own
+    ``#include``s / copyright banner stripped, leaving the ``extern "C"`` protos
+    + ``int main()``). The CPU ``.c`` and ``main.cc`` files are left on disk (the
+    script ignores them); only ``host.cc`` is mutated.
+    """
+    host_path = os.path.join(build_dir, "host.cc")
+    with open(host_path) as f:
+        host = f.read()
+
+    parts = [host.rstrip("\n"), _AIE_MESH_PREAMBLE]
+
+    # CPU-op plain-C bodies (extern "C" so the C++ main can call the C entries).
+    for fname in sorted(os.listdir(build_dir)):
+        if not fname.endswith(".c"):
+            continue
+        with open(os.path.join(build_dir, fname)) as f:
+            body = _strip_leading_copyright(f.read())
+        parts.append('\nextern "C" {\n' + body.rstrip("\n") + '\n}\n')
+
+    # main.cc body: strip its copyright banner + #includes (host.cc already has
+    # aie_runtime.h / cstdint / cstdio / cstring); keep the extern "C" protos +
+    # int main(). Rewrite the argc/argv signature to the no-arg ``int main()``
+    # form so hostcompile.sh's clean fixup path (only #define __global__) fires.
+    main_path = os.path.join(build_dir, "main.cc")
+    with open(main_path) as f:
+        main_src = _strip_leading_copyright(f.read())
+    kept = [ln for ln in main_src.splitlines()
+            if not ln.lstrip().startswith("#include")]
+    main_body = "\n".join(kept).replace("int main(int argc, char** argv)",
+                                         "int main()")
+    parts.append("\n// ===== folded from main.cc (program-order driver) =====\n"
+                 + main_body.strip("\n") + "\n")
+
+    with open(host_path, "w") as f:
+        f.write("\n".join(parts) + "\n")
+
+
+def _arrange_build_dir(build_dir: str) -> None:
+    """Prepare ``build_dir`` (the WORKLOCAL_DIR) for hostcompile.sh.
+
+    ``orchestrate_plan`` already writes ``host.cc``, ``kernel_<name>.cc``, the
+    per-kernel ``aieml_<name>.prx``/``.bcf``, the CPU ``<op>.c`` files and
+    ``main.cc`` here — the exact multi-kernel layout hostcompile.sh expects. The
+    only missing piece is that the host link compiles ``host.cc`` alone, so we
+    fold ``main.cc`` + CPU bodies + the mesh preamble into it (idempotent-guarded
+    by a sentinel so a re-run doesn't double-splice).
+    """
+    host_path = os.path.join(build_dir, "host.cc")
+    if not os.path.isfile(host_path):
+        raise RuntimeError(f"host.cc not found in build dir: {build_dir!r}")
+    with open(host_path) as f:
+        if "folded from main.cc" in f.read():
+            return  # already arranged (idempotent)
+    if not os.path.isfile(os.path.join(build_dir, "main.cc")):
+        raise RuntimeError(f"main.cc not found in build dir: {build_dir!r}")
+    _fold_main_into_host(build_dir)
+
+
+def _invoke_hostcompile(build_dir: str, repo_root: str) -> str:
+    """Run ``script/hostcompile.sh`` over ``build_dir`` and return the ELF path.
+
+    Invokes with ``WORKLOCAL_DIR=build_dir AIE_VERSION=5 PLATFORM=baremetal``
+    (the same env aiehlc.sh/aiehlcrebuild.sh pass). On non-zero exit raises
+    ``RuntimeError`` with the tail of the combined stdout/stderr log. On success
+    returns ``build_dir/build/host`` (the linked ELF), verifying it exists.
+    """
+    script = os.path.join(repo_root, "script", "hostcompile.sh")
+    if not os.path.isfile(script):
+        raise RuntimeError(f"hostcompile.sh not found: {script!r}")
+    env = dict(os.environ)
+    env["WORKLOCAL_DIR"] = build_dir
+    env.setdefault("AIE_VERSION", "5")
+    env.setdefault("PLATFORM", "baremetal")
+    proc = subprocess.run(["bash", script], cwd=build_dir, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True)
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stdout or "").splitlines()[-40:])
+        raise RuntimeError(
+            f"hostcompile.sh failed (rc={proc.returncode}) for {build_dir!r}\n"
+            f"--- log tail ---\n{tail}")
+    elf = os.path.join(build_dir, "build", "host")
+    if not os.path.isfile(elf):
+        tail = "\n".join((proc.stdout or "").splitlines()[-40:])
+        raise RuntimeError(
+            f"hostcompile.sh reported success but {elf!r} is missing\n"
+            f"--- log tail ---\n{tail}")
+    return elf
+
+
+def build_main_elf(build_dir: str) -> str:
+    """Build the A2 ``main.elf`` from an ``orchestrate_plan`` build dir.
+
+    Arranges ``build_dir`` to satisfy hostcompile.sh's multi-kernel contract
+    (folds ``main.cc`` + CPU bodies + the aieMesh/aieArray preamble into
+    ``host.cc``; the ``kernel_<name>.cc``/``.prx``/``.bcf`` are already in place),
+    then reuses ``script/hostcompile.sh`` to compile every kernel and link the
+    host ELF. Returns the linked ELF path (``build_dir/build/host``); a copy is
+    also published by the script at ``<dirname(build_dir)>/main.elf``. Raises
+    ``RuntimeError`` on any arrangement or compile/link failure (never fakes a
+    build).
+    """
+    build_dir = os.path.abspath(build_dir)
+    # repo root: this file is <root>/src/frontend/tvm/orchestrator.py.
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    _arrange_build_dir(build_dir)
+    return _invoke_hostcompile(build_dir, repo_root)
