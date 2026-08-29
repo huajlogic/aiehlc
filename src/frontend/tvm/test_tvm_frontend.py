@@ -32,7 +32,7 @@ _SRC = os.path.dirname(os.path.dirname(_HERE))  # .../src
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from frontend.tvm import model, kernels, _compiler
+from frontend.tvm import model, kernels, _compiler, cpu_codegen
 from frontend.tvm import build_plan, cpu_reference, run_resnet
 from frontend.tvm.relay_import import tvm_available, onnx_available
 
@@ -242,6 +242,105 @@ def test_aiegraph_compile_matches_direct():
         assert expected & produced, f"missing output files; got {sorted(produced)}"
 
 
+def test_cpu_codegen_bit_exact():
+    """TVM CPU codegen is bit-exact with the numpy Q7 oracle.
+
+    Builds the SAME TE ``cpu_codegen`` emits, runs it on ``target="llvm"`` over
+    random int8 inputs, and asserts elementwise equality with
+    ``_compiler._cpu_add_relu`` / ``_compiler._cpu_avgpool_fc``. Also asserts the
+    emitted ``target="c"`` source carries the requested entry name. Skipped if
+    TVM is unavailable.
+    """
+    if not cpu_codegen.available():
+        print("  [skip] TVM not available for cpu_codegen")
+        return
+    import tvm
+
+    rng = np.random.default_rng(0)
+    dev = tvm.cpu()
+
+    # residual_add_relu: full int8 range on both inputs.
+    n = 40
+    res_op = model.LayerOp(op="residual_add_relu", out="o",
+                           ins=["a", "b"], length=n)
+    rmod, _ = cpu_codegen.build_llvm(res_op, "residual_add_relu_k")
+    a = rng.integers(-128, 128, n).astype(np.int8)
+    b = rng.integers(-128, 128, n).astype(np.int8)
+    ro = tvm.runtime.tensor(np.zeros(n, np.int8), dev)
+    rmod(tvm.runtime.tensor(a, dev), tvm.runtime.tensor(b, dev), ro)
+    ref = _compiler._cpu_add_relu(a, b)
+    assert np.array_equal(ro.numpy(), ref), \
+        f"residual: {list(ro.numpy())} != {list(ref)}"
+    src = cpu_codegen.cpu_c_source(res_op, "residual_add_relu_k")
+    assert "residual_add_relu_k" in src, "func_name missing from emitted C"
+
+    # avgpool_fc: feature is post-ReLU (>= 0), weights/bias full int8 range.
+    sh, sw, ch, nc = 2, 2, 8, 4
+    ap_op = model.LayerOp(op="avgpool_fc", out="logits", ins=["f", "params"],
+                          spatial_h=sh, spatial_w=sw, channels=ch, num_classes=nc)
+    amod, _ = cpu_codegen.build_llvm(ap_op, "avgpool_fc_k")
+    feat = rng.integers(0, 128, ch * sh * sw).astype(np.int8)
+    wts = rng.integers(-128, 128, ch * nc).astype(np.int8)
+    bias = rng.integers(-128, 128, nc).astype(np.int8)
+    lo = tvm.runtime.tensor(np.zeros(nc, np.int8), dev)
+    amod(tvm.runtime.tensor(feat, dev), tvm.runtime.tensor(wts, dev),
+         tvm.runtime.tensor(bias, dev), lo)
+    fc = np.concatenate([wts, bias]).astype(np.int8)  # headerless: weights|bias
+    ref = _compiler._cpu_avgpool_fc(feat, fc, sh, sw, ch, nc)
+    assert np.array_equal(lo.numpy(), ref), \
+        f"avgpool_fc: {list(lo.numpy())} != {list(ref)}"
+    src = cpu_codegen.cpu_c_source(ap_op, "avgpool_fc_k")
+    assert "avgpool_fc_k" in src, "func_name missing from emitted C"
+
+
+def test_cpu_codegen_rejects_aie_op():
+    """CPU codegen refuses conv2d-family ops (they belong to the AIE path)."""
+    conv = model.layer_plan()[0]
+    assert cpu_codegen.is_aie_op(conv.op)
+    try:
+        cpu_codegen.op_tensors(conv)
+    except ValueError:
+        return
+    assert False, "expected ValueError for an AIE op on the CPU path"
+
+
+def test_dispatch_routes_non_conv_to_cpu():
+    """The compile dispatch sends conv ops to AIE and non-conv ops to CPU C.
+
+    Runs ``compile_plan_via_aiegraph`` on a small valid sub-plan (three convs +
+    one residual): each conv dir must contain the AIE file set (``host.cc``); the
+    residual dir must contain ``<func_name>.c`` and NO ``host.cc``. Needs both
+    the built ``_aietriton_core`` (conv path) and TVM (CPU path).
+    """
+    try:
+        _compiler._core()
+    except RuntimeError:
+        print("  [skip] _aietriton_core not built")
+        return
+    if not cpu_codegen.available():
+        print("  [skip] TVM not available for cpu_codegen")
+        return
+    import tempfile
+    sub = model.layer_plan()[:4]  # conv, conv, conv, residual (valid dataflow)
+    assert sub[3].op == "residual_add_relu"
+    with tempfile.TemporaryDirectory() as d:
+        results = _compiler.compile_plan(sub, out_root=d, via_aiegraph=True)
+        assert len(results) == 4
+        for op, out_dir, ok in results:
+            assert ok, f"{op.op} launch failed"
+            produced = set(os.listdir(out_dir))
+            if cpu_codegen.is_aie_op(op.op):
+                assert "host.cc" in produced, \
+                    f"conv {out_dir} missing host.cc; got {sorted(produced)}"
+                assert not any(f.endswith(".c") for f in produced), \
+                    f"conv {out_dir} unexpectedly has a .c file: {sorted(produced)}"
+            else:
+                assert "host.cc" not in produced, \
+                    f"CPU op {out_dir} must not emit host.cc; got {sorted(produced)}"
+                assert any(f.endswith(".c") for f in produced), \
+                    f"CPU op {out_dir} missing <func_name>.c; got {sorted(produced)}"
+
+
 def _main():
     tests = [
         ("cpu_reference == triton reference", test_cpu_reference_matches_triton),
@@ -252,6 +351,9 @@ def _main():
         ("aiegraph dataflow resolution", test_aiegraph_dataflow_resolution),
         ("aiegraph build + lower (if built)", test_aiegraph_build_and_lower),
         ("aiegraph compile == direct (if built)", test_aiegraph_compile_matches_direct),
+        ("cpu codegen bit-exact (if TVM)", test_cpu_codegen_bit_exact),
+        ("cpu codegen rejects AIE op", test_cpu_codegen_rejects_aie_op),
+        ("dispatch routes non-conv to CPU (if built)", test_dispatch_routes_non_conv_to_cpu),
     ]
     print(f"TVM available: {tvm_available()}   onnx available: {onnx_available()}")
     logits, _ = cpu_reference()

@@ -13,13 +13,16 @@ compiled pybind extension:
   ``(int16)(acc*scale)>>7`` BN, uint8 config reads), so it is the bit-exact
   oracle the AIE result is checked against. Needs only numpy.
 
-* ``compile_plan(plan, out_root, mesh)`` — for each launch, assembles the
-  ``tensor_specs`` (feature + params + output int8 buffers) and the C kernel
-  body (``kernels.kernel_body_for``) and calls
+* ``compile_plan(plan, out_root, mesh)`` — for each launch, dispatches on the op
+  kind (``cpu_codegen.is_aie_op``). Conv2d-family ops (``conv_bn``,
+  ``conv_bn_relu``) assemble the ``tensor_specs`` (feature + params + output int8
+  buffers) and the C kernel body (``kernels.kernel_body_for``) and call
   ``_aietriton_core.run_aie_pipeline`` (reusing the aietriton package's compiled
-  extension). Each launch gets its own ``out_root/<idx>_<op>`` directory because
-  ``run_aie_pipeline`` writes one output file set per call. Needs the built
-  ``_aietriton_core`` extension.
+  extension). Non-conv ops (``residual_add_relu``, ``avgpool_fc``) are emitted as
+  bit-exact TVM CPU C via ``cpu_codegen.emit_cpu_launch`` (no AIE backend). Each
+  launch gets its own ``out_root/<idx>_<op>`` directory (AIE ops write
+  ``host.cc``/``kernel.cc``/``routing.cc``; CPU ops write ``<func_name>.c``).
+  Only the AIE ops need the built ``_aietriton_core`` extension.
 
 The optional ``im2col_dma_spec`` helper builds the multi-dim shim DMA addressing
 (mode 0) for the im2col conv path exposed by the extended pybind ``dma_specs``
@@ -36,6 +39,7 @@ import numpy as np
 from . import model
 from .model import CONFIG_SZ, LayerOp
 from . import kernels
+from . import cpu_codegen
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -223,17 +227,21 @@ def _core():
 
 def compile_launch(op: LayerOp, idx: int, out_root: str,
                    mesh: Tuple[int, int] = (2, 2)) -> Tuple[str, bool]:
-    """Emit AIE code for a single launch into ``out_root/<idx>_<op>``.
+    """Emit code for a single launch into ``out_root/<idx>_<op>``.
 
-    Returns ``(out_dir, success)``. Requires the built ``_aietriton_core``.
+    Conv2d-family ops go to the AIE backend (``run_aie_pipeline``, needs the
+    built ``_aietriton_core``); non-conv ops emit bit-exact TVM CPU C via
+    ``cpu_codegen.emit_cpu_launch``. Returns ``(out_dir, success)``.
     """
-    import os
-
-    core = _core()
     func_name = f"{op.op}_{idx}"
     out_dir = os.path.join(out_root, f"{idx:02d}_{op.op}")
     os.makedirs(out_dir, exist_ok=True)
 
+    if not cpu_codegen.is_aie_op(op.op):
+        ok = cpu_codegen.emit_cpu_launch(op, out_dir, func_name)
+        return out_dir, bool(ok)
+
+    core = _core()
     tensor_specs = _tensor_specs(op)
     body = kernels.kernel_body_for(op.op, func_name)
     ok = core.run_aie_pipeline(mesh[0], mesh[1], tensor_specs, out_dir, body, func_name)
@@ -307,12 +315,18 @@ def compile_plan_via_aiegraph(plan: Optional[List[LayerOp]] = None,
     for op, launch in zip(plan, launches):
         idx = int(launch["index"])
         func_name = launch["func_name"]
-        specs = [(list(shape), int(bits), bool(is_in))
-                 for (shape, bits, is_in) in launch["tensor_specs"]]
         out_dir = os.path.join(out_root, f"{idx:02d}_{op.op}")
         os.makedirs(out_dir, exist_ok=True)
-        body = kernels.kernel_body_for(op.op, func_name)
-        ok = core.run_aie_pipeline(mesh[0], mesh[1], specs, out_dir, body,
-                                   func_name)
+        # Conv2d-family -> AIE backend; non-conv ops stay in the aiegraph IR
+        # (already built + verified + lowered above) but their *runtime* code is
+        # bit-exact TVM CPU C, not an AIE launch.
+        if cpu_codegen.is_aie_op(op.op):
+            specs = [(list(shape), int(bits), bool(is_in))
+                     for (shape, bits, is_in) in launch["tensor_specs"]]
+            body = kernels.kernel_body_for(op.op, func_name)
+            ok = core.run_aie_pipeline(mesh[0], mesh[1], specs, out_dir, body,
+                                       func_name)
+        else:
+            ok = cpu_codegen.emit_cpu_launch(op, out_dir, func_name)
         results.append((op, out_dir, bool(ok)))
     return results

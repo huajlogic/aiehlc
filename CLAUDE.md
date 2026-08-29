@@ -65,6 +65,13 @@ Sits **above** `routing` — a fused/quantized op-level graph (TVM/Relay → aie
 → per-op `run_aie_pipeline`). Not part of the GEMM pass pipeline; it lowers each
 op to an independent launch on the existing backend.
 
+**Runtime op split.** The `run_aie_pipeline` backend implements only the conv2d
+family (`conv_bn`, `conv_bn_relu`). The other aiegraph ops (`residual_add_relu`,
+`avgpool_fc`) are **not** sent to AIE; they are emitted as bit-exact CPU C by TVM
+(`target="c"`, `src/frontend/tvm/cpu_codegen.py`). Non-conv ops still build/verify/
+lower in the aiegraph IR — only the emit path forks (dispatch via
+`cpu_codegen.is_aie_op`). See `doc/design/tvm_frontend.md` §"CPU fallback".
+
 | Dialect | Purpose |
 |---------|---------|
 | **aiegraph** | Fused int8 tensor ops (`conv_bn_relu`, `conv_bn`, `residual_add_relu`, `avgpool_fc`) as SSA def-use over `tensor<Nxi8>`, with per-op quant attrs + weights `SymbolRefAttr`; `func`/`yield` container. Buffer wiring is verified SSA, not string names. |
