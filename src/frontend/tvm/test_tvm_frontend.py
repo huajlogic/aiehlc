@@ -365,6 +365,60 @@ def test_dispatch_routes_non_conv_to_cpu():
                     f"CPU op {out_dir} missing <func_name>.c; got {sorted(produced)}"
 
 
+def test_plain_c_cpu_bit_exact():
+    """plain_c_source emits self-contained C that is bit-exact with the numpy oracle."""
+    import shutil, subprocess, ctypes, tempfile
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        print("  [skip] no C compiler"); return
+
+    # ── residual_add_relu: length-parametric plain C entry ──────────────────
+    res_op = model.LayerOp(op="residual_add_relu", out="o", ins=["a", "b"],
+                           length=64)
+    src = cpu_codegen.plain_c_source(res_op, "res_test")
+    assert "void res_test(" in src
+    with tempfile.TemporaryDirectory() as d:
+        cpath = os.path.join(d, "res.c"); sopath = os.path.join(d, "res.so")
+        open(cpath, "w").write(src)
+        subprocess.run([cc, "-shared", "-fPIC", "-O2", cpath, "-o", sopath],
+                       check=True)
+        lib = ctypes.CDLL(sopath)
+        n = 64
+        rng = np.random.default_rng(1)
+        a = rng.integers(-128, 128, n).astype(np.int8)
+        b = rng.integers(-128, 128, n).astype(np.int8)
+        out = np.zeros(n, dtype=np.int8)
+        p = ctypes.POINTER(ctypes.c_int8)
+        lib.res_test(a.ctypes.data_as(p), b.ctypes.data_as(p),
+                     out.ctypes.data_as(p), ctypes.c_int(n))
+        ref = _compiler._cpu_add_relu(a, b)
+        assert np.array_equal(out, ref), f"residual {list(out)} != {list(ref)}"
+
+    # ── avgpool_fc: fixed-geometry plain C entry ────────────────────────────
+    sh, sw, ch, nc = 2, 2, 8, 4
+    ap_op = model.LayerOp(op="avgpool_fc", out="logits", ins=["f", "params"],
+                          spatial_h=sh, spatial_w=sw, channels=ch, num_classes=nc)
+    asrc = cpu_codegen.plain_c_source(ap_op, "fc_test")
+    assert "void fc_test(" in asrc
+    with tempfile.TemporaryDirectory() as d:
+        cpath = os.path.join(d, "fc.c"); sopath = os.path.join(d, "fc.so")
+        open(cpath, "w").write(asrc)
+        subprocess.run([cc, "-shared", "-fPIC", "-O2", cpath, "-o", sopath],
+                       check=True)
+        lib = ctypes.CDLL(sopath)
+        rng = np.random.default_rng(2)
+        feat = rng.integers(0, 128, ch * sh * sw).astype(np.int8)   # post-ReLU >=0
+        wts = rng.integers(-128, 128, ch * nc).astype(np.int8)
+        bias = rng.integers(-128, 128, nc).astype(np.int8)
+        out = np.zeros(nc, dtype=np.int8)
+        p = ctypes.POINTER(ctypes.c_int8)
+        lib.fc_test(feat.ctypes.data_as(p), wts.ctypes.data_as(p),
+                    bias.ctypes.data_as(p), out.ctypes.data_as(p))
+        fc = np.concatenate([wts, bias]).astype(np.int8)  # headerless: weights|bias
+        ref = _compiler._cpu_avgpool_fc(feat, fc, sh, sw, ch, nc)
+        assert np.array_equal(out, ref), f"avgpool_fc {list(out)} != {list(ref)}"
+
+
 def _main():
     tests = [
         ("cpu_reference == triton reference", test_cpu_reference_matches_triton),
@@ -379,6 +433,7 @@ def _main():
         ("cpu codegen bit-exact (if TVM)", test_cpu_codegen_bit_exact),
         ("cpu codegen rejects AIE op", test_cpu_codegen_rejects_aie_op),
         ("dispatch routes non-conv to CPU (if built)", test_dispatch_routes_non_conv_to_cpu),
+        ("plain-C CPU bit-exact (if cc)", test_plain_c_cpu_bit_exact),
     ]
     print(f"TVM available: {tvm_available()}   onnx available: {onnx_available()}")
     logits, _ = cpu_reference()

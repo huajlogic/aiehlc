@@ -214,3 +214,103 @@ def emit_cpu_launch(op: LayerOp, out_dir: str, func_name: str) -> bool:
     with open(os.path.join(out_dir, f"{func_name}.c"), "w") as f:
         f.write(src)
     return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Plain-C emit — self-contained, TVM-FFI-free, aarch64-portable entries
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Unlike ``cpu_c_source`` (TVM ``target="c"``, a packed ``__tvm_ffi_*`` function
+# needing the TVM FFI ABI + headers to link), these emit a plain
+# ``void <func_name>(...)`` with only ``<stdint.h>``, so the CPU ops can be
+# linked into an on-board executable with no TVM FFI at runtime. Each function
+# below is a line-by-line transcription of the numpy Q7 oracle in
+# ``_compiler.py`` (``_cpu_add_relu`` / ``_cpu_avgpool_fc``): every accumulate is
+# ``int16_t`` (so C wrap == numpy ``int16`` wrap), clamps use the same bounds,
+# and the pool divide is C integer ``/`` (features are post-ReLU ``>= 0`` so
+# truncation-toward-zero == the oracle's ``int(s)//spatial_sz`` floor).
+
+def _plain_c_residual(func_name: str) -> str:
+    """Plain-C ``residual_add_relu`` (length-parametric).
+
+    Emits ``void <fn>(const int8_t* a, const int8_t* b, int8_t* out, int n)``:
+    per element ``s = int16(a[i]) + int16(b[i])``, clamp to ``[0, 127]`` (ReLU +
+    saturate), store int8 — byte-identical to ``_cpu_add_relu``.
+    """
+    return (
+        "#include <stdint.h>\n\n"
+        f"void {func_name}(const int8_t* a, const int8_t* b, int8_t* out, int n) {{\n"
+        "  for (int i = 0; i < n; ++i) {\n"
+        "    int16_t s = (int16_t)a[i] + (int16_t)b[i];\n"
+        "    if (s < 0) s = 0;\n"
+        "    if (s > 127) s = 127;\n"
+        "    out[i] = (int8_t)s;\n"
+        "  }\n"
+        "}\n")
+
+
+def _plain_c_avgpool_fc(func_name: str, spatial_h: int, spatial_w: int,
+                        channels: int, num_classes: int) -> str:
+    """Plain-C global-avgpool + FC (fixed geometry, headerless weights|bias).
+
+    Emits ``void <fn>(const int8_t* feat, const int8_t* wts,
+    const int8_t* bias, int8_t* out)`` with the geometry baked in. Mirrors
+    ``_cpu_avgpool_fc``: ``pooled[c] = int8(int16_sum(feat) / spatial_sz)``
+    (integer trunc; feat post-ReLU ``>= 0`` so ``==`` floor), then
+    ``acc = int16_sum(pooled*wts) + bias``, clamp ``[-128, 127]``, store int8.
+    """
+    ssz = spatial_h * spatial_w
+    return (
+        "#include <stdint.h>\n\n"
+        f"void {func_name}(const int8_t* feat, const int8_t* wts,\n"
+        "                 const int8_t* bias, int8_t* out) {\n"
+        f"  const int spatial_sz = {ssz};\n"
+        f"  const int channels = {channels};\n"
+        f"  const int num_classes = {num_classes};\n"
+        f"  int8_t pooled[{channels}];\n"
+        "  for (int c = 0; c < channels; ++c) {\n"
+        "    int16_t s = 0;\n"
+        "    for (int idx = 0; idx < spatial_sz; ++idx)\n"
+        "      s += (int16_t)feat[c * spatial_sz + idx];\n"
+        "    pooled[c] = (int8_t)((int)s / spatial_sz);\n"
+        "  }\n"
+        "  for (int j = 0; j < num_classes; ++j) {\n"
+        "    int16_t acc = 0;\n"
+        "    for (int i = 0; i < channels; ++i)\n"
+        "      acc += (int16_t)pooled[i] * (int16_t)wts[i * num_classes + j];\n"
+        "    acc += (int16_t)bias[j];\n"
+        "    if (acc < -128) acc = -128;\n"
+        "    if (acc > 127) acc = 127;\n"
+        "    out[j] = (int8_t)acc;\n"
+        "  }\n"
+        "}\n")
+
+
+def plain_c_source(op: LayerOp, func_name: str) -> str:
+    """Return self-contained plain-C source for a CPU ``op`` (entry ``func_name``).
+
+    Unlike ``cpu_c_source`` (TVM FFI packed function), the returned C is a plain
+    ``void <func_name>(...)`` needing only ``<stdint.h>`` and is bit-exact with
+    the numpy Q7 oracle. Raises ``ValueError`` for AIE ops / unknown ops.
+    """
+    if op.op == "residual_add_relu":
+        return _plain_c_residual(func_name)
+    if op.op == "avgpool_fc":
+        return _plain_c_avgpool_fc(func_name, op.spatial_h, op.spatial_w,
+                                   op.channels, op.num_classes)
+    if is_aie_op(op.op):
+        raise ValueError(f"{op.op!r} is an AIE op, not a CPU-codegen op")
+    raise ValueError(f"unknown op {op.op!r} (no plain-C emitter)")
+
+
+def emit_cpu_launch_plain(op: LayerOp, out_dir: str, func_name: str) -> bool:
+    """Write self-contained plain-C ``<func_name>.c`` for ``op`` into ``out_dir``.
+
+    Plain-C sibling of ``emit_cpu_launch`` (no TVM FFI). Returns ``True`` on
+    success. Raises ``ValueError`` for a non-CPU op.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    src = plain_c_source(op, func_name)
+    with open(os.path.join(out_dir, f"{func_name}.c"), "w") as f:
+        f.write(src)
+    return True
