@@ -234,7 +234,14 @@ def _emit_body(graph: BufferGraph, launches: List[dict],
 
     Conv layers dispatch through ``__aie_launch("<func_name>", mesh, in, sin,
     out, sout)``; CPU ops call their plain-C entry directly with the wired
-    buffers (residual: ``a, b, out, n``; avgpool_fc: ``feat, params, out``).
+    buffers (residual: ``a, b, out, n``; avgpool_fc: ``feat, wts, bias, out``).
+
+    The ``avgpool_fc`` ``.c`` (``_plain_c_avgpool_fc``) has a 4-pointer ABI:
+    ``(const int8_t* feat, const int8_t* wts, const int8_t* bias, int8_t* out)``.
+    The single ``params_<idx>`` buffer holds ``weights|bias`` concatenated
+    (``params[:C*NC]=weights``, ``params[C*NC:]=bias``), so we pass the buffer
+    base as ``wts`` and ``params_<idx> + C*NC`` as ``bias`` (``C*NC`` =
+    ``channels*num_classes``, emitted as a compile-time literal).
     """
     lines: List[str] = []
     for layer, launch, op in zip(graph.layers, launches, plan):
@@ -252,7 +259,9 @@ def _emit_body(graph: BufferGraph, launches: List[dict],
         elif op.op == "avgpool_fc":
             feat = layer.in_bufs[0]
             params = f"params_{layer.index}"  # weights|bias buffer (see _emit_allocs)
-            lines.append(f"    {name}({feat}, {params}, {out_buf});")
+            wts_len = op.channels * op.num_classes  # params[:C*NC]=wts, params[C*NC:]=bias
+            lines.append(
+                f"    {name}({feat}, {params}, {params} + {wts_len}, {out_buf});")
         else:
             raise ValueError(f"unknown op {op.op!r} in main body")
     return lines

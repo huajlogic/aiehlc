@@ -453,6 +453,37 @@ def test_orchestrate_plan_emits_driver():
                       if cpu_codegen.is_aie_op(op.op)]
         for cn in conv_names[:3]:
             assert cn in main
+
+        # ── CPU-op call arities in main.cc must match their .c ABI ──────────
+        # A stale bug emitted the avgpool_fc call with only 3 args
+        # (feat, params, out) while the .c has a 4-pointer ABI
+        # (feat, wts, bias, out). Assert the call arity per op.
+        def _call_line(txt, fn):
+            for ln in txt.splitlines():
+                s = ln.strip()
+                if s.startswith(fn + "(") and s.endswith(");"):
+                    return s
+            raise AssertionError(f"no call line for {fn!r} in main.cc")
+
+        for op, L in zip(plan, launches):
+            fn = L["func_name"]
+            if op.op == "residual_add_relu":
+                line = _call_line(main, fn)
+                # residual: a, b, out, n  → 4 args → 3 commas
+                assert line.count(",") == 3, f"residual arity wrong: {line}"
+            elif op.op == "avgpool_fc":
+                line = _call_line(main, fn)
+                # avgpool_fc: feat, wts, bias, out → 4 args → 3 commas.
+                # The old 3-arg (feat, params, out) form has only 2 commas
+                # and no `+ ` bias-pointer offset, so both checks fail on it.
+                assert line.count(",") == 3, f"avgpool_fc arity wrong: {line}"
+                assert "+ " in line, (
+                    f"avgpool_fc missing bias-ptr offset (params + C*NC): {line}")
+                # bias offset literal == channels*num_classes (weights length).
+                wts_len = op.channels * op.num_classes
+                assert f"+ {wts_len}" in line, (
+                    f"avgpool_fc bias offset != {wts_len}: {line}")
+
         assert any(f.endswith(".c") for f in os.listdir(bd))
 
 
