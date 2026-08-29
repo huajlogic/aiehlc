@@ -419,6 +419,20 @@ def test_plain_c_cpu_bit_exact():
         assert np.array_equal(out, ref), f"avgpool_fc {list(out)} != {list(ref)}"
 
 
+def test_buffer_graph_chains():
+    """_buffer_graph maps each layer to (in_bufs, out_buf) with sizes, chaining producers."""
+    from frontend.tvm import orchestrator
+    plan = build_plan(None)
+    g = orchestrator._buffer_graph(plan)
+    assert g.entry_buffer is not None            # layer-0 input
+    assert g.logits_buffer is not None           # final output
+    for layer in g.layers:
+        for b in layer.in_bufs:
+            assert b == g.entry_buffer or b in g.produced_before(layer.index)
+    for name, sz in g.sizes.items():
+        assert isinstance(sz, int) and sz > 0
+
+
 def _main():
     tests = [
         ("cpu_reference == triton reference", test_cpu_reference_matches_triton),
@@ -434,6 +448,7 @@ def _main():
         ("cpu codegen rejects AIE op", test_cpu_codegen_rejects_aie_op),
         ("dispatch routes non-conv to CPU (if built)", test_dispatch_routes_non_conv_to_cpu),
         ("plain-C CPU bit-exact (if cc)", test_plain_c_cpu_bit_exact),
+        ("buffer graph chains producers", test_buffer_graph_chains),
     ]
     print(f"TVM available: {tvm_available()}   onnx available: {onnx_available()}")
     logits, _ = cpu_reference()
