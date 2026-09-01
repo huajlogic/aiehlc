@@ -690,15 +690,117 @@ void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);
 // _XAie_LoadElfStrmSwStartDma in the aie-rt driver.
 // ---------------------------------------------------------------------------
 
-// Build control-packet words for a contiguous block; returns words written
-// (0 on capacity overflow).
-uint32_t __Runtime_ctrl_pktize(uint32_t *out, uint32_t out_cap, uint32_t stream_id, uint32_t tile_addr,
-                               const uint32_t *data, uint32_t nwords);
+// Build WRITE control-packet words for a contiguous block of @nwords 32-bit
+// values targeting tile byte address @tile_addr onward, routed by @stream_id
+// (two in-band headers per <=4-word chunk). When @readlastack is nonzero and
+// @nwords>0, a single trailing READ-with-return control packet for the LAST
+// written word (tile_addr + (nwords-1)*4) is appended in the same buffer via
+// __Runtime_ctrl_pktize_read, using @ret_stream_id for its response route;
+// because the dest CTRL port processes accesses in order, that read's response
+// is a completion barrier for all preceding writes. On success *@resp_words_out
+// (may be NULL) gets the appended read's expected response length in words (0
+// when no read is appended). Returns words written (0 on capacity overflow).
+uint32_t __Runtime_ctrl_pktize_write(uint32_t *out, uint32_t out_cap, uint32_t stream_id, uint32_t tile_addr,
+                                     const uint32_t *data, uint32_t nwords, int readlastack, uint32_t ret_stream_id,
+                                     uint32_t *resp_words_out);
 
-// Push a control-packet buffer (from __Runtime_alloc_buffer) through a SHIM
-// MM2S channel and wait for completion.
-AieRC __Runtime_ctrl_push(XAie_DevInst *dev, uint8_t shim_col, uint32_t *buf, uint32_t nwords, int32_t bd_id,
-                          int32_t channel);
+// Build READ control-packet words for a contiguous @nwords block of tile
+// registers/memory at byte address @tile_addr, following the AIE2ps Control-
+// Packet word format (doc/controlpkt.txt Table 3-31/3-32): per access the
+// control-info word carries [19:0]=byte addr, [21:20]=beats-1, [23:22]=01
+// (read with return), [28:24]=@ret_stream_id (response routing), [31]=odd
+// parity. The stream packet header uses @req_stream_id (routes the request to
+// the dest CTRL master port). No data payload is emitted. Accesses are split
+// to <=4 words and never cross a 128-bit boundary. On success *@resp_words_out
+// (may be NULL) gets the expected response length in 32-bit words (per access:
+// 1 stream header + beats data words). Returns request words written (0 on
+// capacity overflow).
+uint32_t __Runtime_ctrl_pktize_read(uint32_t *out, uint32_t out_cap, uint32_t req_stream_id, uint32_t ret_stream_id,
+                                    uint32_t tile_addr, uint32_t nwords, uint32_t *resp_words_out);
+
+// Control-packet send context. Identifies the shim source column, the
+// destination tile (same column as the shim), the packet stream id, and the
+// shim DMA channels / BD used for the forward send and the response return.
+// Fill the input fields (dev..s2mm_ch, resp_words), then drive it in three steps:
+//   __Runtime_ctrl_setup_routing(&c) - program the shim MM2S -> dest CTRL
+//       forward route and the dest CTRL slave -> shim S2MM response return
+//       route, alloc the response buffer, arm the shim S2MM drain;
+//   __Runtime_ctrl_push(&c, buf, nwords, block, log) - send (block!=0 also
+//                                       waits for the response via ctrl_tct_poll);
+//   __Runtime_ctrl_tct_poll(&c, print) - wait for the response drain, return
+//       its first word.
+// The return path is the control-packet response (read-with-return / write-
+// with-return): the dest CTRL slave port emits the response, which is circuit-
+// switched down to the shim S2MM. Completion is the S2MM drain landing
+// @resp_words words. __Runtime_ctrl_read_target composes all steps around a
+// register read. `token` is an internal DDR response buffer allocated by
+// setup_routing; release it with __Runtime_free_buffer(c.dev, c.token).
+typedef struct {
+    XAie_DevInst *dev; // partitioned device instance
+    uint8_t shim_col;  // shim (row 0) source column
+    uint8_t dest_col;  // destination column (must equal shim_col)
+    uint8_t dest_row;  // destination row (>0)
+    uint8_t stream_id; // request packet id; must match the header encoded in the buffer
+    int32_t bd_id; // shim MM2S BD for the send (response S2MM uses an adjacent in-range slot: bd_id+1, or bd_id-1 when
+                   // bd_id is the top slot)
+    int32_t mm2s_ch;     // shim MM2S channel (forward send)
+    int32_t s2mm_ch;     // shim S2MM channel (response return)
+    uint32_t *token;     // internal DDR response buffer (set by setup_routing)
+    uint32_t resp_words; // expected response length in 32-bit words (0 => treated as 1)
+} __Runtime_CtrlInstance;
+
+// Push a control-packet buffer (from __Runtime_alloc_buffer) through the SHIM
+// MM2S channel described by @inst and wait for the MM2S send to drain. The send
+// context (dev, shim_col, bd_id, mm2s_ch) comes from @inst; buf/nwords are the
+// packet payload for this call. If @block is nonzero, also waits for the TCT
+// return token via __Runtime_ctrl_tct_poll (requires @inst routing armed by
+// __Runtime_ctrl_setup_routing). @log (nonzero) prints the per-send log line and
+// the polled TCT value. @inst is not mutated.
+AieRC __Runtime_ctrl_push(const __Runtime_CtrlInstance *inst, uint32_t *buf, uint32_t nwords, int block, int log);
+
+// Program the forward (shim MM2S -> dest CTRL master) and response return (dest
+// CTRL slave -> shim S2MM) routes for @inst, allocate its internal response
+// buffer (@inst->resp_words words, min 1), and arm the shim S2MM to drain the
+// response. Same-column only (dest_col must equal shim_col). On success
+// @inst->token holds a freshly allocated DDR buffer.
+AieRC __Runtime_ctrl_setup_routing(__Runtime_CtrlInstance *inst, int port_evt = 0);
+
+// Poll the shim S2MM drain until the response lands, sync it for the CPU, and
+// return the first response word. Uses @inst->token armed by
+// __Runtime_ctrl_setup_routing. If @print is nonzero, prints the observed word.
+// @inst is not mutated.
+uint32_t __Runtime_ctrl_tct_poll(const __Runtime_CtrlInstance *inst, int print);
+
+// Self-contained control-packet send: builds a __Runtime_CtrlInstance, programs
+// the forward + response return routes, pushes the packet buffer via
+// __Runtime_ctrl_push, waits for the response drain, then frees the buffer.
+// buf/nwords are the packetized control words (from __Runtime_ctrl_pktize_write
+// / __Runtime_ctrl_pktize_read);
+// stream_id must match the packet id encoded in buf so the dest CTRL slave slot
+// accepts it. On success writes the first response word to *tct_value_out (may
+// be NULL). dev must be partitioned first; dest_col must equal shim_col.
+AieRC __Runtime_ctrl_push_target(XAie_DevInst *dev, uint8_t shim_col, uint8_t dest_col, uint8_t dest_row,
+                                 uint8_t stream_id, uint32_t *buf, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch,
+                                 int32_t s2mm_ch, uint32_t *tct_value_out);
+
+// Self-contained control-packet register READ: builds READ control packets for
+// @nwords 32-bit words at tile byte address @tile_addr on the dest tile
+// (@dest_col must equal @shim_col), programs the forward + response-return
+// routes, pushes the request via the shim MM2S, waits for the CTRL response to
+// drain into the shim S2MM, and copies the @nwords read values into @out_data
+// (skipping the per-access response headers). @req_stream_id routes the request
+// to the dest CTRL master; @ret_stream_id is encoded in the response header.
+// dev must be partitioned first. Returns XAIE_OK on success.
+//
+// NOTE: each control-packet response is its own AXI-stream packet (TLAST at end)
+// and the single shim S2MM drain BD completes on the first TLAST. This reliably
+// captures a SINGLE response packet, i.e. a read whose @nwords fit one access
+// (<=4 words and not crossing a 128-bit boundary from @tile_addr). Larger reads
+// span multiple response packets and would need one shim S2MM BD per packet
+// (not yet implemented).
+AieRC __Runtime_ctrl_read_target(XAie_DevInst *dev, uint8_t shim_col, uint8_t dest_col, uint8_t dest_row,
+                                 uint8_t req_stream_id, uint8_t ret_stream_id, uint32_t tile_addr, uint32_t nwords,
+                                 uint32_t *out_data, int32_t bd_id, int32_t mm2s_ch, int32_t s2mm_ch);
 
 // Flush dirty cache lines for the buffer to DDR (before DMA reads it).
 void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size);

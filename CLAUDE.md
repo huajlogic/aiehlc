@@ -44,6 +44,8 @@ User C++ → aiehlc (Clang AST) → AieFrontEnd (MLIR)
 
 Key runtime API: `__Runtime_device_init`, `__Runtime_load_kernel_group`, `__Runtime_launch_kernel_group`, `__Runtime_dma_bd_config`, `__Runtime_wait_event`, `__Runtime_device_teardown`.
 
+Control-packet API: `__Runtime_ctrl_pktize` (build WRITE control-packet words), `__Runtime_ctrl_pktize_read(out, cap, req_sid, ret_sid, tile_addr, nwords, &resp_words)` (build READ control-packet words per doc/controlpkt.txt: op=01, byte addr [19:0], beats-1 [21:20], return stream id [28:24], odd parity [31]; no data payload; reports the expected response word count). `__Runtime_ctrl_push(inst, buf, nwords, block, log)` pushes a packet buffer via a SHIM MM2S BD; the send context — dev, shim col, bd_id, mm2s_ch — comes from a `__Runtime_CtrlInstance *`, with `buf`/`nwords` the per-call payload; `block!=0` also waits for the response drain via `__Runtime_ctrl_tct_poll`. The return path is the **control-packet response**: the dest CTRL slave port emits the response (read data / write-with-return ack), circuit-switched down to the shim S2MM (the drain landing `resp_words` words is the completion barrier — no DMA TCT token issue). The send context is a `__Runtime_CtrlInstance` struct (shim col, dest tile, stream id, DMA channels/BD, `resp_words`, internal response buffer `token`); `__Runtime_ctrl_setup_routing(inst)` programs the shim→dest CTRL forward route + dest CTRL slave→shim S2MM return route, allocates the response buffer (`resp_words` words), and arms the shim S2MM; `__Runtime_ctrl_tct_poll(inst, print)` polls the S2MM drain and returns the first response word. `__Runtime_ctrl_read_target(dev, shim_col, dest_col, dest_row, req_sid, ret_sid, tile_addr, nwords, out_data, bd_id, mm2s_ch, s2mm_ch)` composes it all for a register read: build read packets → setup_routing → ctrl_push → tct_poll → extract data words into `out_data` (skipping per-access response headers). Single shim S2MM drain BD ⇒ one response packet (a ≤4-word access not crossing a 128-bit boundary); larger reads need one BD per packet (not yet implemented). `__Runtime_ctrl_push_target` composes setup_routing → ctrl_push → tct_poll around one packet buffer.
+
 Platforms: baremetal (`aarch64-none-elf-g++`) or Linux (`aarch64-linux-gnu-g++`).
 
 ## Part 2: tilinglinalg (Multi-Tile GEMM)
@@ -152,6 +154,7 @@ Read the matching skill when the task fits:
 | Pre-HW data correctness | datacorrectness |
 | XAie driver internals | aiedriverkb |
 | Live HW DMA stall debug | aiehwdmadebug |
+| Shim BD stuck on wrong/locked BD (index overflow into channel-control regs) | shimbdindexoverflow |
 | Sim PS.so load segfault | aiesimloaddebug |
 | HW performance counters | aiehwprofile |
 | Raw-XAie sim debug bundle | raw-xaie-sim-debug-bundle |
