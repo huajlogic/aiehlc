@@ -6,17 +6,23 @@
 
     (real ResNet-18 reference)  ->  ONNX -> Relay walk -> LayerOp plan
                                     -> aiegraph IR -> per-launch AIE code
+                                    -> A2 orchestration -> single main.elf
 
 Stage 0 classifies a real dog image with the pretrained ImageNet ResNet-18
 (``example/model/resnet18py``) so the demo prints a *meaningful* answer
 ("it's a dog"). The same image is then fed as int8 input into the AIE
-pipeline's bit-exact oracle. Degrades gracefully: without torch/PIL/onnx or a
-network the reference is skipped and the oracle falls back to
-``model.make_input()``; stages 3-4 need the built ``_aietriton_core`` pybind.
+pipeline's bit-exact oracle. Stage 5 orchestrates every launch into ONE
+program-order ``main.elf`` (A2 multi-kernel path, ``orchestrator.py``) and links
+it via ``script/hostcompile.sh``. Degrades gracefully: without torch/PIL/onnx or
+a network the reference is skipped and the oracle falls back to
+``model.make_input()``; stages 3-5 need the built ``_aietriton_core`` pybind, and
+stage 5's ELF link additionally needs an aarch64 cross g++ + xchesscc/Vitis
+(sources are still emitted when the toolchain is absent).
 
 Run:  python src/frontend/tvm/demo_flow.py
 """
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -31,7 +37,7 @@ if _SRC not in sys.path:
 if _RESNET18PY not in sys.path:
     sys.path.insert(0, _RESNET18PY)                     # classify.py / resnet18.py
 
-from frontend.tvm import model, kernels, _compiler, cpu_codegen
+from frontend.tvm import model, kernels, _compiler, cpu_codegen, orchestrator
 from frontend.tvm.walk import build_plan
 from frontend.tvm.relay_import import tvm_available, onnx_available
 
@@ -148,3 +154,37 @@ for op, launch in zip(plan, core.lower_aiegraph(ir)):
         ok = cpu_codegen.emit_cpu_launch(op, out_dir, launch["func_name"])
         kind = "CPU"
     print(op.op, kind, out_dir, "OK" if ok else "FAIL")
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Stage 5: orchestrate all launches into ONE main.elf (A2 multi-kernel path)
+# ═══════════════════════════════════════════════════════════════════════════
+# Unlike Stage 4 (independent per-launch dirs), the orchestrator regenerates
+# everything into one build dir: ONE host.cc (N appended host_canonicalized_<name>
+# funcs + __aie_launch dispatcher), per-conv kernel_<name>.cc, CPU-op plain-C
+# <name>.c, and a program-order main.cc with DDR buffer chaining. build_main_elf
+# then folds main.cc + CPU bodies into host.cc and links via hostcompile.sh.
+launches = core.lower_aiegraph(ir)                     # program-order launches
+a2_dir = os.path.join(OUT, "a2")
+try:
+    build_dir = orchestrator.orchestrate_plan(plan, launches, a2_dir)
+    print("[stage5] emitted A2 driver (host.cc / kernel_*.cc / main.cc / cpu .c):",
+          build_dir)
+except Exception as e:                                  # noqa: BLE001
+    print(f"[stage5] orchestrate_plan failed ({e}); skipping ELF build")
+    build_dir = None
+
+# Link main.elf only when the cross-toolchain is present; else stop at sources.
+_have_gpp = (shutil.which("aarch64-linux-gnu-g++")
+             or shutil.which("aarch64-none-elf-g++"))
+_have_chess = shutil.which("xchesscc") and os.environ.get("XILINX_VITIS")
+if build_dir and _have_gpp and _have_chess:
+    print("[stage5] linking main.elf via hostcompile.sh "
+          "(multi-kernel build; live log below)...", flush=True)
+    try:
+        elf = orchestrator.build_main_elf(build_dir)
+        print("[stage5] built main.elf ->", elf)
+    except Exception as e:                              # noqa: BLE001
+        print(f"[stage5] ELF link failed ({e})")
+elif build_dir:
+    print("[stage5] cross toolchain absent "
+          "(need aarch64 g++ + xchesscc/$XILINX_VITIS); emitted sources only")

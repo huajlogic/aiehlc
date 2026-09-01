@@ -175,6 +175,28 @@ def _param_elems(op: LayerOp) -> int:
     return 0                              # residual_add_relu takes no params
 
 
+def _wts_name(idx: int) -> str:
+    """Deterministic unique weights-buffer name for the conv launch at ``idx``."""
+    return f"wts_{idx}"
+
+
+def _wts_elems(launch: dict) -> int:
+    """Conv weights DDR element count, from the launch's 2nd tensor spec.
+
+    A conv launch's ``tensor_specs`` are ``[input, weights, output]``
+    (``is_input == [True, True, False]``); index 1 is the weights tensor. Its
+    ``host_canonicalized_<name>`` therefore takes 3 DDR pointers (input, weights,
+    output), so ``main`` must allocate + pass a weights buffer — the plan's
+    ``params`` input maps to this DDR region (dropped from the activation
+    ``_buffer_graph`` because it is not an inter-launch edge).
+    """
+    shape, _bw, _is_in = launch["tensor_specs"][1]
+    n = 1
+    for dim in shape:
+        n *= int(dim)
+    return n
+
+
 def _emit_dispatcher(convs: List[dict], ddr_args: Dict[str, int]) -> str:
     """Return the ``__aie_launch`` dispatcher C text to append to ``host.cc``.
 
@@ -215,17 +237,20 @@ def _emit_dispatcher(convs: List[dict], ddr_args: Dict[str, int]) -> str:
     return "\n".join(out) + "\n"
 
 
-def _emit_allocs(graph: BufferGraph, param_bufs: Dict[str, int]) -> List[str]:
+def _emit_allocs(graph: BufferGraph, param_bufs: Dict[str, int],
+                 wts_bufs: Dict[str, int]) -> List[str]:
     """Return the ``__Runtime_Alloc`` lines for every distinct DDR buffer once.
 
     Inter-launch buffers come from ``graph.sizes`` (entry, buf_<i>, logits);
-    ``param_bufs`` adds a CPU op's ``params_<idx>`` buffer (int8, one per op).
+    ``param_bufs`` adds a CPU op's ``params_<idx>`` buffer and ``wts_bufs`` adds a
+    conv layer's ``wts_<idx>`` weights buffer (int8, one per op). ``__Runtime_Alloc``
+    is the 1-arg ``void *__Runtime_Alloc(size_t)`` from ``aie_runtime.h`` (it does
+    NOT take a device handle).
     """
     lines: List[str] = []
-    for name, sz in graph.sizes.items():
-        lines.append(f"    int8_t* {name} = (int8_t*)__Runtime_Alloc(dev, {sz});")
-    for name, sz in param_bufs.items():
-        lines.append(f"    int8_t* {name} = (int8_t*)__Runtime_Alloc(dev, {sz});")
+    for src in (graph.sizes, wts_bufs, param_bufs):
+        for name, sz in src.items():
+            lines.append(f"    int8_t* {name} = (int8_t*)__Runtime_Alloc({sz});")
     return lines
 
 
@@ -234,8 +259,11 @@ def _emit_body(graph: BufferGraph, launches: List[dict],
     """Return the program-order launch/call lines for ``main``.
 
     Conv layers dispatch through ``__aie_launch("<func_name>", mesh, in, sin,
-    out, sout)``; CPU ops call their plain-C entry directly with the wired
-    buffers (residual: ``a, b, out, n``; avgpool_fc: ``feat, wts, bias, out``).
+    wts, swts, out, sout)`` — three DDR tensors (input, weights, output) matching
+    ``host_canonicalized_<name>``'s param order (``tensor_specs`` is ``[input,
+    weights, output]``). The ``wts_<idx>`` buffer is allocated in ``_emit_main``;
+    CPU ops call their plain-C entry directly with the wired buffers (residual:
+    ``a, b, out, n``; avgpool_fc: ``feat, wts, bias, out``).
 
     The ``avgpool_fc`` ``.c`` (``_plain_c_avgpool_fc``) has a 4-pointer ABI:
     ``(const int8_t* feat, const int8_t* wts, const int8_t* bias, int8_t* out)``.
@@ -249,9 +277,11 @@ def _emit_body(graph: BufferGraph, launches: List[dict],
         name = launch["func_name"]
         out_buf, out_sz = layer.out_buf, graph.sizes[layer.out_buf]
         if cpu_codegen.is_aie_op(op.op):
+            wts, wts_sz = _wts_name(layer.index), _wts_elems(launch)
             args = f'__aie_launch("{name}", mesh'
-            for b in layer.in_bufs:
+            for b in layer.in_bufs:       # conv activation input(s)
                 args += f", {b}, {graph.sizes[b]}"
+            args += f", {wts}, {wts_sz}"  # weights DDR buffer (see _wts_elems)
             args += f", {out_buf}, {out_sz}"
             lines.append(f"    {args});")
         elif op.op == "residual_add_relu":
@@ -275,7 +305,6 @@ def _emit_main(graph: BufferGraph, launches: List[dict],
     Mirrors the emitted-host ``main`` shape (device init → mesh partition →
     ``__Runtime_Alloc`` → launches → read back logits → teardown).
     """
-    convs = [L for op, L in zip(plan, launches) if cpu_codegen.is_aie_op(op.op)]
     cpu_protos = []
     for op, L in zip(plan, launches):
         if op.op == "residual_add_relu":
@@ -284,6 +313,11 @@ def _emit_main(graph: BufferGraph, launches: List[dict],
         elif op.op == "avgpool_fc":
             cpu_protos.append(f"void {L['func_name']}(const int8_t*, const int8_t*,"
                               " const int8_t*, int8_t*);")
+    # Per-conv weights DDR buffers (wts_<idx>), sized from tensor_specs[1].
+    wts_bufs: Dict[str, int] = {}
+    for idx, (op, L) in enumerate(zip(plan, launches)):
+        if cpu_codegen.is_aie_op(op.op):
+            wts_bufs[_wts_name(idx)] = _wts_elems(L)
     entry_sz = graph.sizes[graph.entry_buffer]
     logits_sz = graph.sizes[graph.logits_buffer]
     txt = [_COPYRIGHT,
@@ -295,12 +329,17 @@ def _emit_main(graph: BufferGraph, launches: List[dict],
            "// CPU-op plain-C entries (linked from <func>.c).",
            'extern "C" {'] + cpu_protos + ["}", ""]
     txt.append("int main(int argc, char** argv) {")
-    txt.append("    XAie_DevInst* dev = __Runtime_device_init();")
+    txt.append("    XAie_DevInst* dev = __Runtime_explicit_init();")
     txt.append("    aieArray arr; arr._dev = dev;")
     txt.append("    aieMesh mesh = arr.partition(2, 2);")
-    txt += _emit_allocs(graph, param_bufs)
+    txt += _emit_allocs(graph, param_bufs, wts_bufs)
     txt.append(f"    // Fill layer-0 entry ({entry_sz} int8) from the input image.")
     txt.append(f"    for (int i = 0; i < {entry_sz}; ++i) {graph.entry_buffer}[i] = 0;")
+    # Zero-fill conv weights + CPU params. TODO(Task 7): fill wts_<idx> from
+    # model.make_conv_params / params_<idx> from make_fc_params for bit-exact
+    # parity with cpu_reference; zero is sufficient to build + smoke the ELF.
+    for name, sz in list(wts_bufs.items()) + list(param_bufs.items()):
+        txt.append(f"    memset({name}, 0, {sz});")
     txt += _emit_body(graph, launches, plan)
     txt.append(f"    __Runtime_sync_for_cpu(dev, {graph.logits_buffer}, {logits_sz});")
     txt.append(f"    for (int j = 0; j < {logits_sz}; ++j)")
@@ -458,7 +497,20 @@ def _fold_main_into_host(build_dir: str) -> None:
     with open(host_path) as f:
         host = f.read()
 
-    parts = [host.rstrip("\n"), _AIE_MESH_PREAMBLE]
+    # The aieMesh/aieArray struct definitions must precede every use — in
+    # particular the __aie_launch dispatcher already appended to the END of
+    # host.cc dereferences ``mesh.meshId``. So splice the preamble in right after
+    # host.cc's leading ``#include "aie_runtime.h"`` (not at the end of the file,
+    # where it would land after the dispatcher and leave ``aieMesh`` undeclared).
+    _inc = '#include "aie_runtime.h"'
+    _at = host.find(_inc)
+    if _at != -1:
+        _cut = _at + len(_inc)
+        host = host[:_cut] + "\n" + _AIE_MESH_PREAMBLE + host[_cut:]
+    else:
+        host = host.rstrip("\n") + "\n" + _AIE_MESH_PREAMBLE
+
+    parts = [host.rstrip("\n")]
 
     # CPU-op plain-C bodies (extern "C" so the C++ main can call the C entries).
     for fname in sorted(os.listdir(build_dir)):
@@ -511,9 +563,14 @@ def _invoke_hostcompile(build_dir: str, repo_root: str) -> str:
     """Run ``script/hostcompile.sh`` over ``build_dir`` and return the ELF path.
 
     Invokes with ``WORKLOCAL_DIR=build_dir AIE_VERSION=5 PLATFORM=baremetal``
-    (the same env aiehlc.sh/aiehlcrebuild.sh pass). On non-zero exit raises
-    ``RuntimeError`` with the tail of the combined stdout/stderr log. On success
-    returns ``build_dir/build/host`` (the linked ELF), verifying it exists.
+    (the same env aiehlc.sh/aiehlcrebuild.sh pass). The multi-kernel build
+    compiles ~N AIE kernels through xchesscc and then links the host with no
+    per-step console feedback, so the script's combined stdout/stderr is
+    **streamed live** (each line echoed with a ``[hostcompile]`` prefix) instead
+    of buffered — otherwise the caller looks frozen for the whole build. Lines
+    are also accumulated so the failure path can still report the tail. On
+    non-zero exit raises ``RuntimeError`` with the tail; on success returns
+    ``build_dir/build/host`` (the linked ELF), verifying it exists.
     """
     script = os.path.join(repo_root, "script", "hostcompile.sh")
     if not os.path.isfile(script):
@@ -522,20 +579,31 @@ def _invoke_hostcompile(build_dir: str, repo_root: str) -> str:
     env["WORKLOCAL_DIR"] = build_dir
     env.setdefault("AIE_VERSION", "5")
     env.setdefault("PLATFORM", "baremetal")
-    proc = subprocess.run(["bash", script], cwd=build_dir, env=env,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          text=True)
-    if proc.returncode != 0:
-        tail = "\n".join((proc.stdout or "").splitlines()[-40:])
+    print(f"[hostcompile] building main.elf in {build_dir}\n"
+          "[hostcompile] compiling AIE kernels via xchesscc, then host link "
+          "(live log follows)...", flush=True)
+    lines: List[str] = []
+    proc = subprocess.Popen(["bash", script], cwd=build_dir, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        line = raw.rstrip("\n")
+        lines.append(line)
+        print(f"[hostcompile] {line}", flush=True)
+    rc = proc.wait()
+    if rc != 0:
+        tail = "\n".join(lines[-40:])
         raise RuntimeError(
-            f"hostcompile.sh failed (rc={proc.returncode}) for {build_dir!r}\n"
+            f"hostcompile.sh failed (rc={rc}) for {build_dir!r}\n"
             f"--- log tail ---\n{tail}")
     elf = os.path.join(build_dir, "build", "host")
     if not os.path.isfile(elf):
-        tail = "\n".join((proc.stdout or "").splitlines()[-40:])
+        tail = "\n".join(lines[-40:])
         raise RuntimeError(
             f"hostcompile.sh reported success but {elf!r} is missing\n"
             f"--- log tail ---\n{tail}")
+    print(f"[hostcompile] done -> {elf}", flush=True)
     return elf
 
 

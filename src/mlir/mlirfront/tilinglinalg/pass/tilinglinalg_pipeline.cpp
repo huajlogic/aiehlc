@@ -453,6 +453,26 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     int relEndCol = (partStartCol >= 0 && partEndCol >= 0) ? (partEndCol - partStartCol) : -1;
     RoutingTopology rtopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
 
+    // Reset the shared core-memory allocator so each pipeline run allocates its
+    // own kernel ping/pong buffers from a clean base. ResourceMgr::instance() is
+    // a process singleton; in the multi-kernel orchestrator flow runPipeline is
+    // invoked once per conv layer in the SAME process. CoreMemAllocator::allocate
+    // dedups by symbol name (buf_in_ping_0, ...) and returns the FIRST caller's
+    // address+size, so without this reset every conv's BCF would reuse conv #0's
+    // buffer layout while its kernel.cc emits its own (often larger) v4int8[N]
+    // arrays — an address/size mismatch the AIE linker rejects ("cannot find free
+    // area ... for space symbol 'buf_in_pong_0'"). Harmless in the single-kernel
+    // path (the allocator is already empty on the first call).
+    // On the very first pipeline run ResourceMgr::init() has not been called yet
+    // (it runs later inside a pass), so instance() throws — the allocator is empty
+    // then, so the catch is a safe no-op. Subsequent runs reuse the persisted
+    // singleton and reset it before the host allocation pass repopulates it.
+    try {
+        ResourceMgr::instance()->coreMemAllocator().reset();
+    } catch (...) {
+        // Singleton not yet initialized on the first pipeline run; nothing to reset.
+    }
+
     std::string irDir = setupPipelineIRDir("dfschedule");
     int stage = 0;
 
@@ -794,13 +814,21 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
             // In append mode, erase dskernel_receiver from the module to avoid
             // redefinition (it was already emitted by the first pipeline run).
             // Also erase #include "aie_runtime.h" emitc.include ops to avoid duplicate.
+            // The Phase-1 module-scope preamble (passdfscheduletoapi.cpp) is emitted
+            // as emitc::VerbatimOp (includes + XTime timer globals + timerStart/End
+            // helpers), NOT emitc::IncludeOp, so those slip past the IncludeOp erase
+            // and duplicate on every appended layer -> ODR redefinition. Erase all
+            // module-scope VerbatimOps too (only the shared preamble lives here; the
+            // per-layer host_canonicalized body lives inside its emitc::FuncOp).
             {
                 llvm::SmallVector<Operation *, 4> toErase;
                 for (auto &op : hostModule.getOps()) {
                     if (auto func = dyn_cast<emitc::FuncOp>(op)) {
                         if (func.getName() == "dskernel_receiver")
                             toErase.push_back(&op);
-                    } else if (auto inc = dyn_cast<emitc::IncludeOp>(op)) {
+                    } else if (isa<emitc::IncludeOp>(op)) {
+                        toErase.push_back(&op);
+                    } else if (isa<emitc::VerbatimOp>(op)) {
                         toErase.push_back(&op);
                     }
                 }
