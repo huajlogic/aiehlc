@@ -178,3 +178,15 @@ def test_extract_model_reports_entry_fn():
     assert model["entry_fn"] == "test_routing"
     doc = x.build_dfschedule(model, aie_gen=5)
     assert doc["host_entry_fn"] == "test_routing"
+
+
+def test_ctrl_tile_type_geometry():
+    # gen5/AIE2PS: rows 1,2 memtile, cores from row 3
+    assert x.ctrl_tile_type(0, 5) == "shim"
+    assert x.ctrl_tile_type(2, 5) == "memtile"
+    assert x.ctrl_tile_type(3, 5) == "core"
+    # gen2: cores from row 2
+    assert x.ctrl_tile_type(1, 2) == "memtile"
+    assert x.ctrl_tile_type(2, 2) == "core"
+    # gen1: cores from row 1 (no memtile rows)
+    assert x.ctrl_tile_type(1, 1) == "core"

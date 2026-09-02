@@ -218,6 +218,19 @@ def extract_model(raw_src, aie_gen, aiesim):
             "flows": flows, "entry_fn": find_entry_fn(active)}
 
 
+# AIE-core row start per generation (row 0 shim; 0<row<start memtile; row>=start
+# core). Mirrors the C rt_port_evt_base geometry and aiediag.AIE_TILE_ROW_START:
+# gen5/AIE2PS have 2 memtile rows (cores from 3), gen2 one (from 2), gen1 none.
+_CORE_ROW_START = {1: 1, 2: 2, 5: 3}
+
+
+def ctrl_tile_type(row, aie_gen):
+    if row == 0:
+        return "shim"
+    start = _CORE_ROW_START.get(int(aie_gen), 3)
+    return "memtile" if row < start else "core"
+
+
 def hw_gen_str(g):
     return {1: "Gen1", 2: "Gen2", 5: "Gen5"}.get(int(g), "Gen%s" % g)
 
