@@ -190,3 +190,39 @@ def test_ctrl_tile_type_geometry():
     assert x.ctrl_tile_type(2, 2) == "core"
     # gen1: cores from row 1 (no memtile rows)
     assert x.ctrl_tile_type(1, 1) == "core"
+
+
+CTRL_STRUCT_SRC = """
+    __Runtime_CtrlInstance _ri = {.dev = dev, .shim_col = 0u, .dest_col = 0u, .dest_row = 3u, .stream_id = 0u,
+                                  .bd_id = RAW_BD_SLOT, .mm2s_ch = 0, .s2mm_ch = 1, .token = NULL,
+                                  .resp_words = 2u};
+    AieRC _rrc = __Runtime_ctrl_setup_routing(&_ri, 1);
+"""
+
+CTRL_CALL_SRC = """
+    __Runtime_ctrl_read_target(dev, 0u, 0u, 2u, 5u, 6u, 0x1000u, 1u, out, RAW_BD_SLOT, 0, 1);
+"""
+
+
+def test_extract_ctrl_sends_struct():
+    active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_STRUCT_SRC))
+    defs = x.collect_defines(active)
+    sends = x.extract_ctrl_sends(active, defs)
+    assert sends == [{"shim_col": 0, "dest_row": 3, "resp_words": 2}]
+
+
+def test_extract_ctrl_sends_call():
+    active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_CALL_SRC))
+    defs = x.collect_defines(active)
+    sends = x.extract_ctrl_sends(active, defs)
+    # read_target positional: (dev, shim_col, dest_col, dest_row, ...)
+    assert sends == [{"shim_col": 0, "dest_row": 2, "resp_words": 1}]
+
+
+def test_extract_ctrl_sends_dedup_and_unresolved_respwords():
+    # resp_words references an unfoldable local -> defaults to 1; duplicate
+    # (shim_col,dest_row) collapses to one send.
+    src = CTRL_STRUCT_SRC.replace(".resp_words = 2u", ".resp_words = _rspcap") + CTRL_STRUCT_SRC
+    active = x.strip_comments(x.MacroResolver(5, False).active_source(src))
+    sends = x.extract_ctrl_sends(active, x.collect_defines(active))
+    assert sends == [{"shim_col": 0, "dest_row": 3, "resp_words": 1}]

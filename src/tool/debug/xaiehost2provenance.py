@@ -99,6 +99,18 @@ RE_ROUTE = re.compile(
     r"XAie_Route\s*\([^,]+,\s*[^,]+,\s*XAie_TileLoc\s*\(([^,]+),([^)]+)\)\s*,"
     r"\s*XAie_TileLoc\s*\(([^,]+),([^)]+)\)", re.DOTALL)
 
+# Control-packet send: a __Runtime_CtrlInstance designated-initializer block, or a
+# composite __Runtime_ctrl_read_target / __Runtime_ctrl_push_target call. Both are
+# same-column (dest_col == shim_col); a send reduces to (shim_col, dest_row,
+# resp_words). The struct body may span many lines (DOTALL); the call form gives
+# shim_col/dest_col/dest_row as positional args 2/3/4.
+RE_CTRL_STRUCT = re.compile(
+    r"__Runtime_CtrlInstance\s+\w+\s*=\s*\{(.*?)\}", re.DOTALL)
+RE_CTRL_FIELD = re.compile(r"\.(\w+)\s*=\s*([^,}]+)")
+RE_CTRL_CALL = re.compile(
+    r"__Runtime_ctrl_(?:read|push)_target\s*\(\s*[^,]+,\s*"
+    r"([^,]+),\s*([^,]+),\s*([^,]+),")
+
 
 def collect_defines(src):
     """Object-like #define NAME body -> {name: body}."""
@@ -115,6 +127,44 @@ def resolve_tileloc(col_expr, row_expr, defs):
     if c is None or r is None:
         return None
     return (c, r)
+
+
+def _ctrl_int(expr, defs, default=None):
+    """eval_int with C integer-suffix stripping (0u/3u/0x1000u) and a fallback,
+    for control-packet field exprs. eval_int rejects any [A-Za-z_], so the u/l
+    suffix on unsigned literals must be removed first (scoped here, not in the
+    shared eval_int). Only numeric literals are stripped, so identifiers like
+    _rspcap / RAW_BD_SLOT still fail to fold and take the default."""
+    cleaned = re.sub(r"\b(0[xX][0-9a-fA-F]+|\d+)[uUlL]+\b", r"\1", expr.strip())
+    v = eval_int(cleaned, defs)
+    return default if v is None else v
+
+
+def extract_ctrl_sends(active, defs):
+    """Reduce every control-packet send in @active to a same-column send dict
+    {shim_col, dest_row, resp_words}, deduped by (shim_col, dest_row). Values fold
+    through @defs; resp_words defaults to 1 when unresolvable. Sends whose shim_col
+    or dest_row cannot be resolved are skipped (mirrors tile-loc resolution)."""
+    sends, seen = [], set()
+
+    def add(shim_col, dest_row, resp_words):
+        if shim_col is None or dest_row is None:
+            return
+        key = (shim_col, dest_row)
+        if key in seen:
+            return
+        seen.add(key)
+        sends.append({"shim_col": shim_col, "dest_row": dest_row,
+                      "resp_words": resp_words if resp_words else 1})
+
+    for m in RE_CTRL_STRUCT.finditer(active):
+        fields = {k: v for k, v in RE_CTRL_FIELD.findall(m.group(1))}
+        add(_ctrl_int(fields.get("shim_col", ""), defs),
+            _ctrl_int(fields.get("dest_row", ""), defs),
+            _ctrl_int(fields.get("resp_words", "1"), defs, default=1))
+    for m in RE_CTRL_CALL.finditer(active):
+        add(_ctrl_int(m.group(1), defs), _ctrl_int(m.group(3), defs), 1)
+    return sends
 
 
 def strip_comments(src):
