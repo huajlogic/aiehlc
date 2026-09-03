@@ -538,20 +538,21 @@ int run_control_perf(XAie_DevInst *dev) {
         // Phase A: WRITE 0xABCD1234 to 0x1000 as its OWN push (separate TLAST).
         // Phase B: READ 0x1000 back as a SECOND push. Separating them tests whether
         // the write persists independent of write+read-in-one-buffer ordering.
-
-        uint32_t _wbuf_h[8];
-        uint32_t _wdata[1] = {0xABCD1234u};
-        uint32_t _ww = __Runtime_ctrl_pktize_write(_wbuf_h, 8u, /*stream_id=*/0u, /*tile_addr=*/0x1000u, _wdata,
-                                                   /*nwords=*/1u, /*lastwriteack=*/1, 0u, NULL);
+#define WDATA_NUM 5
+        uint32_t _wbuf_h[8 * WDATA_NUM];
+        uint32_t _wdata[WDATA_NUM];
+        for (int i = 0; i < WDATA_NUM; i++) {
+            _wdata[i] = 0xAB001234u + (uint32_t)i;
+        }
+        uint32_t _ww =
+            __Runtime_ctrl_pktize_write(_wbuf_h, 8 * WDATA_NUM, /*stream_id=*/0u, /*tile_addr=*/0x1000u, _wdata,
+                                        /*nwords=*/WDATA_NUM, /*lastwriteack=*/1, 0u, NULL);
         // Read a KNOWN non-zero, side-effect-free CORE-module register instead of
         // 0x1000 to isolate the read-with-return DATA path from write-landing.
         // CORE_MODULE_EVENT_GROUP_0_ENABLE @ local 0x34500 has POR value 0x00000FFF
         // (xaie2psgbl_params.h:2914/2916, reginit.c:3720). If token[1]==0xFFF the
         // read-data return path works end-to-end; if it stays sentinel w/ pending=1
         // the response data word never drains (return-route / framing bug).
-        const uint32_t _RD_ADDR = 0x1000;       // 0x34504u;   /* EVENT_GROUP_0_ENABLE, POR 0xFFF */
-        const uint32_t _RD_EXPECT = 0xABCD1234; // 0x0000003Fu;
-
         uint32_t _mrsp = 0u;
         uint32_t *_wbuf = (uint32_t *)__Runtime_alloc_buffer(dev, _ww * sizeof(uint32_t));
 #define _CONTROL_WRITE_TEST_
@@ -598,6 +599,8 @@ int run_control_perf(XAie_DevInst *dev) {
             // Arm S2MM for 4 words (over-provision) so we can see exactly how many
             // response words drain before TLAST, distinguishing header-only from
             // header+data-truncated.
+            const uint32_t _RD_ADDR = 0x34504u;      /* EVENT_GROUP_0_ENABLE, POR 0xFFF */
+            -const uint32_t _RD_EXPECT = 0xABCD1234; // 0x0000003Fu
             uint32_t _rbuf_h[4];
             uint32_t _rw =
                 __Runtime_ctrl_pktize_read(_rbuf_h, 4u, /*req_sid=*/0u, /*ret_sid=*/0u, /*tile_addr=*/_RD_ADDR,
@@ -1142,7 +1145,11 @@ int main(int argc, char *argv[]) {
         }
     }
     printf("before XAie_PartitionInitialize\n");
-    RC = XAie_PartitionInitialize(&DevInst, NULL);
+    XAie_PartInitOpts PartInitOpts;
+    PartInitOpts.Locs = NULL;
+    PartInitOpts.NumUseTiles = 0;
+    PartInitOpts.InitOpts = XAIE_PART_INIT_OPT_DEFAULT | XAIE_PART_INIT_OPT_CTRL_TLASTERROR_DISABLE;
+    RC = XAie_PartitionInitialize(&DevInst, &PartInitOpts);
 #else
     XAie_PmRequestTiles(&DevInst, NULL, 0);
 #endif

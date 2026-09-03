@@ -2119,8 +2119,17 @@ class DebugState:
             # -u: unbuffered stdout for realtime tail; -y: auto-confirm ELF pick.
             cmd = [sys.executable, "-u", script, "-y", "-nonreboot"]
             if not cfg_dev:
-                if self.elf and not os.path.isfile(self.elf):
-                    return {"error": f"ELF not found: {self.elf}"}
+                # The ELF is resolved once at app-select time, so a later
+                # clean/rebuild (build/host removed, aout/main.elf produced)
+                # leaves a stale path. Re-resolve before giving up so the
+                # search order (build/host -> parent *.elf -> aout/main.elf)
+                # picks whatever exists now instead of failing the run.
+                if not self.elf or not os.path.isfile(self.elf):
+                    fallback = _resolve_default_elf(self.workdir)
+                    if fallback:
+                        self.elf = fallback
+                    elif self.elf:
+                        return {"error": f"ELF not found: {self.elf}"}
                 if self.elf:
                     cmd.append(self.elf)
             try:

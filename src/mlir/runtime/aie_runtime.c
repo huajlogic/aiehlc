@@ -3059,8 +3059,10 @@ uint32_t __Runtime_ctrl_pktize_write(uint32_t *out, uint32_t out_cap, uint32_t s
 
         out[idx++] = pkt_hdr;
         out[idx++] = ctrl_hdr;
-        for (uint32_t j = 0U; j < pkt_size; j++)
+        for (uint32_t j = 0U; j < pkt_size; j++) {
             out[idx++] = data ? data[i + j] : 0U;
+            printf("[aie_runtime] ctrl_pktize_write: data[%u]=0x%x\n", i + j, out[idx - 1]);
+        }
     }
     if (lastwriteack && nwords > 0U) {
         uint32_t last_addr = tile_addr + (nwords - 1U) * (uint32_t)sizeof(uint32_t);
