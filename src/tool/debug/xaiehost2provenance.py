@@ -215,12 +215,13 @@ def extract_model(raw_src, aie_gen, aiesim):
 
     tiles, seen = [], set()
 
-    def add_tile(loc):
+    def add_tile(loc, ttype=None):
         if loc is None or loc in seen:
             return
         seen.add(loc)
-        tiles.append({"col": loc[0], "row": loc[1],
-                      "type": "shim" if loc[1] == 0 else "core"})
+        if ttype is None:
+            ttype = "shim" if loc[1] == 0 else "core"
+        tiles.append({"col": loc[0], "row": loc[1], "type": ttype})
 
     kernel_placements = {}
     for km in RE_LOADELF.finditer(active):
@@ -263,6 +264,15 @@ def extract_model(raw_src, aie_gen, aiesim):
         # XAie_Route only adds connectivity if no MoveData covers that pair.
         if (src, dst) in covered:
             continue
+
+    for s in extract_ctrl_sends(active, defs):
+        col, drow = s["shim_col"], s["dest_row"]
+        length = s["resp_words"] * 4
+        for r in range(0, drow + 1):
+            add_tile((col, r), ctrl_tile_type(r, aie_gen))
+        shim, dst = (col, 0), (col, drow)
+        flows.append({"src": shim, "dst": dst, "direction": "S2MM", "len": length})
+        flows.append({"src": dst, "dst": shim, "direction": "MM2S", "len": length})
 
     return {"tiles": tiles, "kernel_placements": kernel_placements,
             "flows": flows, "entry_fn": find_entry_fn(active)}

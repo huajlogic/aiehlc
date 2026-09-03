@@ -226,3 +226,37 @@ def test_extract_ctrl_sends_dedup_and_unresolved_respwords():
     active = x.strip_comments(x.MacroResolver(5, False).active_source(src))
     sends = x.extract_ctrl_sends(active, x.collect_defines(active))
     assert sends == [{"shim_col": 0, "dest_row": 3, "resp_words": 1}]
+
+
+CTRL_MODEL_SRC = """
+    __Runtime_CtrlInstance _ri = {.dev = dev, .shim_col = 0u, .dest_col = 0u, .dest_row = 3u, .stream_id = 0u,
+                                  .bd_id = RAW_BD_SLOT, .mm2s_ch = 0, .s2mm_ch = 1, .token = NULL,
+                                  .resp_words = 2u};
+    AieRC _rrc = __Runtime_ctrl_setup_routing(&_ri, 1);
+"""
+
+
+def test_extract_model_ctrl_packet():
+    model = x.extract_model(CTRL_MODEL_SRC, aie_gen=5, aiesim=False)
+    tiles = {(t["col"], t["row"]): t["type"] for t in model["tiles"]}
+    # shim, pass-through memtile rows 1,2, and core dest row 3
+    assert tiles[(0, 0)] == "shim"
+    assert tiles[(0, 1)] == "memtile"
+    assert tiles[(0, 2)] == "memtile"
+    assert tiles[(0, 3)] == "core"
+    # two flows: forward shim->dest S2MM (up), return dest->shim MM2S (down)
+    dirs = {(f["src"], f["dst"], f["direction"]) for f in model["flows"]}
+    assert ((0, 0), (0, 3), "S2MM") in dirs
+    assert ((0, 3), (0, 0), "MM2S") in dirs
+    # len tracks resp_words*4
+    fwd = next(f for f in model["flows"] if f["direction"] == "S2MM")
+    assert fwd["len"] == 8
+    # no kernel loaded on the control path
+    assert model["kernel_placements"] == {}
+
+
+def test_extract_model_ctrl_memtile_dest():
+    src = CTRL_MODEL_SRC.replace(".dest_row = 3u", ".dest_row = 2u")
+    model = x.extract_model(src, aie_gen=5, aiesim=False)
+    tiles = {(t["col"], t["row"]): t["type"] for t in model["tiles"]}
+    assert tiles[(0, 2)] == "memtile"
