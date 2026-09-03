@@ -277,3 +277,56 @@ def test_ctrl_entry_fn():
     assert model["entry_fn"] == "controlperf_main"
     doc = x.build_dfschedule(model, aie_gen=5)
     assert doc["host_entry_fn"] == "controlperf_main"
+
+
+# The real controlperf host.cc gates its sends behind a bare in-file
+# `#define _CONTROL_WRITE_TEST_` immediately followed by `#ifdef`. A real
+# preprocessor keeps the block; MacroResolver must honor inline define/undef.
+INLINE_DEFINE_SRC = """
+#define _CONTROL_WRITE_TEST_
+#ifdef _CONTROL_WRITE_TEST_
+    __Runtime_CtrlInstance _wi = {.dev = dev, .shim_col = 0u, .dest_col = 0u, .dest_row = 3u,
+                                  .resp_words = 1u};
+    __Runtime_ctrl_setup_routing(&_wi, 1);
+#endif
+#undef _CONTROL_WRITE_TEST_
+#ifdef _CONTROL_WRITE_TEST_
+    __Runtime_CtrlInstance _late = {.dev = dev, .shim_col = 1u, .dest_col = 1u, .dest_row = 3u,
+                                    .resp_words = 1u};
+#endif
+"""
+
+
+def test_macro_resolver_honors_inline_define_and_undef():
+    active = x.MacroResolver(5, False).active_source(INLINE_DEFINE_SRC)
+    assert "_wi" in active
+    assert "_late" not in active
+
+
+def test_extract_model_ctrl_behind_inline_define():
+    model = x.extract_model(INLINE_DEFINE_SRC, aie_gen=5, aiesim=False)
+    tiles = {(t["col"], t["row"]): t["type"] for t in model["tiles"]}
+    assert tiles[(0, 0)] == "shim"
+    assert tiles[(0, 3)] == "core"
+    # the #undef'd second send must not appear
+    assert (1, 3) not in tiles
+
+
+# A macro body captured from an inline #define may contain backslashes or \g
+# group-ref-like text (multi-line BENCH macros). _eval_cond must substitute it
+# literally; a bare re.sub replacement would raise "bad escape".
+MACRO_BODY_SRC = """
+#define BENCH(a, b) do { raw \\
+    stmt; } while (0)
+#if AIE_GEN == 5
+    int marker = 5;
+#else
+    int marker = 0;
+#endif
+"""
+
+
+def test_eval_cond_tolerates_macro_body_with_backslash():
+    active = x.MacroResolver(5, False).active_source(MACRO_BODY_SRC)
+    assert "int marker = 5;" in active
+    assert "int marker = 0;" not in active

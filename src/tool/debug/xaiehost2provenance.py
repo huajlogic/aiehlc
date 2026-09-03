@@ -44,7 +44,9 @@ class MacroResolver:
     def _eval_cond(self, expr):
         e = expr.strip()
         for name, val in self.defs.items():
-            e = re.sub(r"\b%s\b" % re.escape(name), str(val), e)
+            # Function replacement so macro bodies with backslashes or \g refs
+            # (e.g. multi-line BENCH defines) are substituted literally.
+            e = re.sub(r"\b%s\b" % re.escape(name), lambda _m, v=str(val): v, e)
         e = re.sub(r"\b[A-Za-z_]\w*\b", "0", e)
         try:
             return bool(eval(e, {"__builtins__": {}}, {}))
@@ -59,6 +61,16 @@ class MacroResolver:
             s = line.strip()
             m = re.match(r"#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)", s)
             if not m:
+                # Honor inline #define/#undef in active regions so a later
+                # #ifdef of an in-file-defined macro (e.g. the controlperf
+                # `#define _CONTROL_WRITE_TEST_` guard) resolves correctly.
+                dm = re.match(r"#\s*(define|undef)\s+(\w+)(.*)", s)
+                if dm and active():
+                    if dm.group(1) == "define":
+                        body = dm.group(3).strip()
+                        self.defs[dm.group(2)] = body if body else 1
+                    else:
+                        self.defs.pop(dm.group(2), None)
                 if active():
                     out.append(line)
                 continue
