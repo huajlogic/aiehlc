@@ -3000,11 +3000,6 @@ static uint32_t __Runtime_pkt_parity(uint32_t packet) {
     return (packet & 1U) ? 0U : 1U;
 }
 
-/* Forward decl: the write pktizer optionally appends a read-back access built by
- * __Runtime_ctrl_pktize_read (defined below). */
-uint32_t __Runtime_ctrl_pktize_read(uint32_t *out, uint32_t out_cap, uint32_t req_stream_id, uint32_t ret_stream_id,
-                                    uint32_t tile_addr, uint32_t nwords, uint32_t *resp_words_out);
-
 /**
  * Build control-packet WRITE words for a contiguous block of @nwords 32-bit
  * values targeting tile-local byte address @tile_addr onward, routed by
@@ -3012,33 +3007,43 @@ uint32_t __Runtime_ctrl_pktize_read(uint32_t *out, uint32_t out_cap, uint32_t re
  *
  * Emits, per <=4-word chunk (matching the driver format):
  *   [stream packet header] bits[4:0]=stream id, bit31=odd parity
- *   [control packet header] bits[19:0]=tile addr, bits[21:20]=size-1, bit31=parity
+ *   [control packet header] bits[19:0]=tile addr, bits[21:20]=size-1,
+ *                           bits[23:22]=00 (write without return), bit31=parity
  *   [size data words]
  *
- * When @readlastack is nonzero and @nwords>0, a single trailing READ-with-return
- * control packet for the LAST written word (tile_addr + (nwords-1)*4) is appended
- * in the same buffer via __Runtime_ctrl_pktize_read. Because the dest CTRL port
- * processes accesses in order, that read's response is a completion barrier for
- * all preceding writes: once it returns, every write has been applied. The read
- * is self-delimited by its own control-info (beats) word, so a single-TLAST
- * write+read buffer parses correctly under circuit-switched CTRL routing.
+ * When @lastwriteack is nonzero and @nwords>0, the LAST word is RESERVED from the
+ * plain write loop (which then covers only the first @nwords-1 words) and emitted
+ * as its own single-word WRITE-WITH-RETURN access, so it is written exactly once:
+ * the control-info operation field is 0b10 and the return stream id @ret_stream_id
+ * is set, so the dest CTRL port emits a response (a one-word AIE packet-switched
+ * stream header, per doc/controlpkt.txt Table 3-32). Because the
+ * dest CTRL port processes accesses in order, that ack is a completion barrier for
+ * all preceding writes: once its header lands at the shim S2MM, every write has
+ * been applied. It is self-delimited by its own control-info word, so a single-
+ * TLAST buffer parses correctly under circuit-switched CTRL routing. The return
+ * route keeps the packet header (XAIE_SS_PKT_DONOT_DROP_HEADER), so the ack's
+ * response length is 1 word (the header).
  *
  * @out            output word buffer.
  * @out_cap        capacity of @out in 32-bit words.
- * @readlastack    if nonzero, append the trailing read-back access.
- * @ret_stream_id  return stream id for the appended read's response.
+ * @lastwriteack   if nonzero, re-emit the last word as a write-with-return ack.
+ * @ret_stream_id  return stream id for the ack's response.
  * @resp_words_out if non-NULL, receives the expected response length in words
- *                 (0 when no read is appended).
+ *                 (1 when the ack is appended, 0 otherwise).
  * @return         total number of words written, or 0 on capacity overflow.
  */
 uint32_t __Runtime_ctrl_pktize_write(uint32_t *out, uint32_t out_cap, uint32_t stream_id, uint32_t tile_addr,
-                                     const uint32_t *data, uint32_t nwords, int readlastack, uint32_t ret_stream_id,
+                                     const uint32_t *data, uint32_t nwords, int lastwriteack, uint32_t ret_stream_id,
                                      uint32_t *resp_words_out) {
     uint32_t idx = 0U;
     if (resp_words_out)
         *resp_words_out = 0U;
-    for (uint32_t i = 0U; i < nwords; i += 4U) {
-        uint32_t pkt_size = (nwords - i) > 4U ? 4U : (nwords - i);
+    /* When lastwriteack is set, RESERVE the last word from the plain write loop:
+     * it is re-emitted below as a single write-with-return (op=0b10) so it is
+     * written exactly once. Otherwise the loop covers all nwords words. */
+    uint32_t nwrite = (lastwriteack && nwords > 0U) ? (nwords - 1U) : nwords;
+    for (uint32_t i = 0U; i < nwrite; i += 4U) {
+        uint32_t pkt_size = (nwrite - i) > 4U ? 4U : (nwrite - i);
         /* need 2 headers + pkt_size data words */
         if (idx + 2U + pkt_size > out_cap) {
             AIEHLC_LOG(printf("[aie_runtime] ctrl_pktize_write: overflow at word %u (cap=%u)\n", idx, out_cap););
@@ -3057,19 +3062,32 @@ uint32_t __Runtime_ctrl_pktize_write(uint32_t *out, uint32_t out_cap, uint32_t s
         for (uint32_t j = 0U; j < pkt_size; j++)
             out[idx++] = data ? data[i + j] : 0U;
     }
-    if (readlastack && nwords > 0U) {
+    if (lastwriteack && nwords > 0U) {
         uint32_t last_addr = tile_addr + (nwords - 1U) * (uint32_t)sizeof(uint32_t);
-        uint32_t rw = __Runtime_ctrl_pktize_read(out + idx, out_cap - idx, stream_id, ret_stream_id, last_addr, 1U,
-                                                 resp_words_out);
-        if (rw == 0U) {
-            AIEHLC_LOG(printf("[aie_runtime] ctrl_pktize_write: read-ack append overflow at word %u\n", idx););
+        /* 2 header words + 1 data word for the write-with-return re-emit. */
+        if (idx + 3U > out_cap) {
+            AIEHLC_LOG(printf("[aie_runtime] ctrl_pktize_write: write-ack append overflow at word %u\n", idx););
             return 0U;
         }
-        idx += rw;
+        uint32_t ctrl_hdr = 0U;
+        ctrl_hdr |= last_addr & 0xFFFFFU;           /* [19:0] local byte address */
+        ctrl_hdr |= (0U & 0x3U) << 20U;             /* [21:20] beats-1 = 0 (single word) */
+        ctrl_hdr |= (0x2U & 0x3U) << 22U;           /* [23:22] operation = 10 (write w/ return) */
+        ctrl_hdr |= (ret_stream_id & 0x1FU) << 24U; /* [28:24] stream id for return packet */
+        ctrl_hdr |= __Runtime_pkt_parity(ctrl_hdr) << 31U;
+
+        uint32_t pkt_hdr = stream_id & 0x1FU;
+        pkt_hdr |= __Runtime_pkt_parity(pkt_hdr) << 31U;
+
+        out[idx++] = pkt_hdr;
+        out[idx++] = ctrl_hdr;
+        out[idx++] = data ? data[nwords - 1U] : 0U;
+        if (resp_words_out)
+            *resp_words_out = 1U; /* response is a single stream-header word (header not dropped) */
     }
-    AIEHLC_LOG(printf("[aie_runtime] ctrl_pktize_write: stream_id=%u tile_addr=0x%x nwords=%u readlastack=%d -> %u "
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_pktize_write: stream_id=%u tile_addr=0x%x nwords=%u lastwriteack=%d -> %u "
                       "words\n",
-                      stream_id, tile_addr, nwords, readlastack, idx););
+                      stream_id, tile_addr, nwords, lastwriteack, idx););
     return idx;
 }
 
@@ -3103,8 +3121,12 @@ static uint32_t rt_ctrl_chunk_words(uint32_t tile_addr, uint32_t nwords, uint32_
  *                          bits[23:22]=01 (read w/ return),
  *                          bits[28:24]=@ret_stream_id, bit31=odd parity[30:0]
  * Accesses are <=4 words and never cross a 128-bit boundary. On success
- * *@resp_words_out (may be NULL) receives the expected response length in words
- * (per access: 1 stream header + beats data words).
+ * *@resp_words_out (may be NULL) receives the expected response length in words.
+ * The return-route packet-switched master keeps the header
+ * (XAIE_SS_PKT_DONOT_DROP_HEADER in rt_ctrl_route_setup_col), so each access's
+ * response lands as one stream header word followed by its data beats:
+ * resp_words counts, per access, 1 header word + chunk data words. The host
+ * strips the per-access header in rt_ctrl_read_extract.
  *
  * @return number of request words written, or 0 on capacity overflow.
  */
@@ -3131,7 +3153,7 @@ uint32_t __Runtime_ctrl_pktize_read(uint32_t *out, uint32_t out_cap, uint32_t re
 
         out[idx++] = pkt_hdr;
         out[idx++] = ctrl_hdr;
-        resp += 1U + chunk; /* response: 1 stream header + chunk data words */
+        resp += 1U + chunk; /* response: 1 stream header word + chunk data words (header kept) */
         w += chunk;
     }
     if (resp_words_out)
@@ -3140,6 +3162,78 @@ uint32_t __Runtime_ctrl_pktize_read(uint32_t *out, uint32_t out_cap, uint32_t re
                       "resp words\n",
                       req_stream_id, ret_stream_id, tile_addr, nwords, idx, resp););
     return idx;
+}
+
+/**
+ * Parse a control-info word (the second word of a control packet, following the
+ * stream packet header) into its fields, per the AIE2ps Control-Packet word
+ * format (doc/controlpkt.txt Table 3-31/3-32):
+ *   bits[19:0]  local byte address (two LSB unused)
+ *   bits[21:20] number of data beats - 1 (so decoded beats = field + 1, range 1..4)
+ *   bits[23:22] operation: 00=write no-return, 01=read w/return, 10=write w/return
+ *   bits[28:24] stream id for the return packet
+ *   bit[31]     odd parity over bits[30:0]
+ *
+ * Any output pointer may be NULL if that field is not needed.
+ *
+ * @ctrl_hdr    the raw 32-bit control-info word.
+ * @addr_out    receives the local byte address (bits[19:0]).
+ * @op_out      receives the operation field (bits[23:22]).
+ * @beats_out   receives the decoded beat count (bits[21:20] + 1, i.e. 1..4).
+ * @ret_sid_out receives the return-packet stream id (bits[28:24]).
+ * @return      1 if the parity bit is consistent (odd parity holds), 0 otherwise.
+ */
+int __Runtime_ctrl_parse_ctrl_hdr(uint32_t ctrl_hdr, uint32_t *addr_out, uint32_t *op_out, uint32_t *beats_out,
+                                  uint32_t *ret_sid_out) {
+    if (addr_out)
+        *addr_out = ctrl_hdr & 0xFFFFFU; /* [19:0] local byte address */
+    if (beats_out)
+        *beats_out = ((ctrl_hdr >> 20U) & 0x3U) + 1U; /* [21:20] beats-1 -> 1..4 */
+    if (op_out)
+        *op_out = (ctrl_hdr >> 22U) & 0x3U; /* [23:22] operation */
+    if (ret_sid_out)
+        *ret_sid_out = (ctrl_hdr >> 24U) & 0x1FU; /* [28:24] return stream id */
+    /* Parity check: recompute odd parity over bits[30:0] and compare to bit[31]. */
+    uint32_t expect = __Runtime_pkt_parity(ctrl_hdr & 0x7FFFFFFFU);
+    uint32_t actual = (ctrl_hdr >> 31U) & 0x1U;
+    return expect == actual ? 1 : 0;
+}
+
+/**
+ * Parse an AIE packet-switched stream header word (the first word of a control
+ * packet, and of each response packet) into its fields. Layout (AIE2/AIE-ML,
+ * consistent with XAIEGBL_MEM_VALUE_DMABD0PKT which places PktType at bits[14:12]
+ * and PktId at bits[4:0]; the control-packet handler fills source row/column into
+ * response headers, per doc/controlpkt.txt):
+ *   bits[4:0]   packet id (stream id)
+ *   bits[14:12] packet type (7 = SLVERR on a control-packet response)
+ *   bits[20:16] source row
+ *   bits[27:21] source column
+ *   bit[31]     odd parity over bits[30:0]
+ *
+ * Any output pointer may be NULL if that field is not needed.
+ *
+ * @pkt_hdr     the raw 32-bit stream packet header word.
+ * @id_out      receives the packet id / stream id (bits[4:0]).
+ * @type_out    receives the packet type (bits[14:12]).
+ * @src_row_out receives the source row (bits[20:16]).
+ * @src_col_out receives the source column (bits[27:21]).
+ * @return      1 if the parity bit is consistent (odd parity holds), 0 otherwise.
+ */
+int __Runtime_ctrl_parse_pkt_hdr(uint32_t pkt_hdr, uint32_t *id_out, uint32_t *type_out, uint32_t *src_row_out,
+                                 uint32_t *src_col_out) {
+    if (id_out)
+        *id_out = pkt_hdr & 0x1FU; /* [4:0] packet id / stream id */
+    if (type_out)
+        *type_out = (pkt_hdr >> 12U) & 0x7U; /* [14:12] packet type */
+    if (src_row_out)
+        *src_row_out = (pkt_hdr >> 16U) & 0x1FU; /* [20:16] source row */
+    if (src_col_out)
+        *src_col_out = (pkt_hdr >> 21U) & 0x7FU; /* [27:21] source column */
+    /* Parity check: recompute odd parity over bits[30:0] and compare to bit[31]. */
+    uint32_t expect = __Runtime_pkt_parity(pkt_hdr & 0x7FFFFFFFU);
+    uint32_t actual = (pkt_hdr >> 31U) & 0x1U;
+    return expect == actual ? 1 : 0;
 }
 
 /**
@@ -3430,14 +3524,55 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
     }
 
     /* Return: dest CTRL slave port (control-packet response emitter) -> SOUTH
-     * master, then pass-through down. Per doc/controlpkt.txt the CTRL slave port
-     * responds to read / write-with-return requests, so the response (1 stream
-     * header + read data) is circuit-switched down to the shim S2MM. (s2mm_ch is
-     * unused for the dest hop here; it only selects the shim demux port.) */
+     * master, then pass-through down to the shim S2MM. Per doc/controlpkt.txt the
+     * CTRL slave port emits the response as an AIE PACKET-SWITCHED stream (1 stream
+     * header + 1..4 data words + TLAST). This FIRST hop out of the CTRL slave port
+     * must therefore be PACKET-SWITCHED (mirroring the working core-trace drain,
+     * which packet-enables the source slave+slot and the driving SOUTH master, then
+     * circuit-switches the downstream hops). A plain XAie_StrmConnCctEnable here
+     * sets Packet-Enable=0 on both the CTRL slave and SOUTH master, so the switch
+     * does not honor the response's packet framing: only the 1-word header traverses
+     * and the data beat + TLAST stall, leaving the shim S2MM pending forever.
+     *   1. CTRL slave slot: match the response header id (Mask=0 => accept any id,
+     *      since this CTRL port carries only the single response stream).
+     *   2. CTRL slave port -> packet mode.
+     *   3. SOUTH master (vret) drives the packet out, KEEPING the header
+     *      (XAIE_SS_PKT_DONOT_DROP_HEADER) so the response stream header (and any
+     *      data beats) reach the shim S2MM; resp_words therefore counts the
+     *      per-access stream header word plus its data words (see
+     *      __Runtime_ctrl_pktize_read). A write-with-return ack is header-only
+     *      (one word); a read response is header + 1..4 data words.
+     * (s2mm_ch is unused for the dest hop; it only selects the shim demux port.) */
     (void)s2mm_ch;
-    rc = XAie_StrmConnCctEnable(dev, dst, CTRL, 0U, SOUTH, vret);
+    const uint8_t ctrl_arb = 0U;                            /* arbiter 0..7 */
+    const uint8_t ctrl_msel = 0U;                           /* slot MSel 0..3 */
+    const uint8_t ctrl_mselen = (uint8_t)(1U << ctrl_msel); /* master MSelEn bitmask */
+    XAie_Packet ctrl_pkt = XAie_PacketInit(stream_id, 0U);  /* PktId matches response id */
+    rc = XAie_StrmPktSwSlaveSlotEnable(dev, dst, CTRL, 0U, /*slot=*/0U, ctrl_pkt, /*Mask=*/0U, ctrl_msel, ctrl_arb);
     if (rc != XAIE_OK) {
-        printf("[aie_runtime] ctrl_route: dest StrmConnCctEnable (%u,%u) CTRL->SOUTH%u rc=%d\n", (unsigned)shim_col,
+        printf("[aie_runtime] ctrl_route: dest StrmPktSwSlaveSlotEnable (%u,%u) CTRL rc=%d\n", (unsigned)shim_col,
+               (unsigned)dest_row, (int)rc);
+        return rc;
+    }
+    rc = XAie_StrmPktSwSlavePortEnable(dev, dst, CTRL, 0U);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_route: dest StrmPktSwSlavePortEnable (%u,%u) CTRL rc=%d\n", (unsigned)shim_col,
+               (unsigned)dest_row, (int)rc);
+        return rc;
+    }
+    /* KEEP the response packet header at this (the only) packet-switched master so
+     * the shim S2MM receives the response stream header (plus any data words) +
+     * TLAST. resp_words therefore counts the per-access header word plus its data
+     * words. A write-with-return ack is header-only (one word) and that landing
+     * header IS the completion barrier; a read response is header + data words,
+     * and the header is stripped host-side in rt_ctrl_read_extract. The BD is
+     * retired by the last beat's TLAST via Finish-on-TLAST mode on the S2MM
+     * channel (rt_tct_s2mm_arm); without FoT the BD can only finish on exact
+     * programmed length and stalls (StalledStreamStarve) waiting for the fixed
+     * length while the short variable-length packet ends on TLAST. */
+    rc = XAie_StrmPktSwMstrPortEnable(dev, dst, SOUTH, vret, XAIE_SS_PKT_DONOT_DROP_HEADER, ctrl_arb, ctrl_mselen);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_route: dest StrmPktSwMstrPortEnable (%u,%u) SOUTH%u rc=%d\n", (unsigned)shim_col,
                (unsigned)dest_row, (unsigned)vret, (int)rc);
         return rc;
     }
@@ -3522,6 +3657,29 @@ static AieRC rt_tct_s2mm_arm(const __Runtime_CtrlInstance *c) {
         rc = XAie_DmaSetAxi(&desc, 0U, 16U, 0U, 0U, 0U);
     if (rc == XAIE_OK)
         rc = XAie_DmaWriteBd(dev, &desc, shim, (uint8_t)bd_id);
+    /* Finish-on-TLAST: a control-packet read response is a short, variable-length
+     * stream that ends on TLAST, not on a fixed programmed length. With the default
+     * DMA_FoT_DISABLED the S2MM channel only retires the BD when the exact
+     * programmed length is reached, so it ingests one beat then stalls forever with
+     * StalledStreamStarve (pending stays 1). DMA_FoT_NO_COUNTS makes the last data
+     * beat's TLAST retire the BD, so pending reaches 0 once the response lands. */
+    if (rc == XAIE_OK) {
+        XAie_DmaChannelDesc chdesc;
+        rc = XAie_DmaChannelDescInit(dev, &chdesc, shim);
+        if (rc == XAIE_OK)
+            rc = XAie_DmaChannelSetFoTMode(&chdesc, DMA_FoT_NO_COUNTS);
+        if (rc == XAIE_OK)
+            rc = XAie_DmaWriteChannel(dev, &chdesc, shim, (uint8_t)s2mm_ch, DMA_S2MM);
+        /* DIAG: read back the S2MM channel-control reg to confirm FoT[17:16] is set.
+         * NOC S2MM_0_CTRL @0x9300, ch stride 0x8 => ch1 @0x9308; FoT NO_COUNTS=1. */
+        if (rc == XAIE_OK) {
+            u32 _cc = 0U;
+            u64 _cca = XAie_GetTileAddr(dev, 0U, (u8)shim_col) + 0x9300U + (u64)s2mm_ch * 0x8U;
+            (void)XAie_Read32(dev, _cca, &_cc);
+            printf("[aie_runtime] ctrl_tct: s2mm ch%d CTRL@0x%lx=0x%08x FoT[17:16]=%u\n", s2mm_ch, (unsigned long)_cca,
+                   (unsigned)_cc, (unsigned)((_cc >> 16) & 0x3U));
+        }
+    }
     if (rc == XAIE_OK)
         rc = XAie_DmaChannelPushBdToQueue(dev, shim, (uint8_t)s2mm_ch, DMA_S2MM, (uint8_t)bd_id);
     if (rc == XAIE_OK)
@@ -3635,15 +3793,17 @@ AieRC __Runtime_ctrl_push_target(XAie_DevInst *dev, uint8_t shim_col, uint8_t de
 
 /**
  * Copy the @nwords read data words out of the raw control-packet response
- * @resp, skipping the per-access response header. The access chunking mirrors
- * __Runtime_ctrl_pktize_read (same @tile_addr / @nwords), so each access
- * contributes 1 header word followed by its data words.
+ * @resp. The return-route master keeps each response packet's stream header
+ * (XAIE_SS_PKT_DONOT_DROP_HEADER in rt_ctrl_route_setup_col), so @resp is, per
+ * access, one stream header word followed by its data words. The access chunking
+ * mirrors __Runtime_ctrl_pktize_read (same @tile_addr / @nwords); each access
+ * contributes 1 header word (skipped) + its data words.
  */
 static void rt_ctrl_read_extract(const uint32_t *resp, uint32_t tile_addr, uint32_t nwords, uint32_t *out_data) {
     uint32_t ridx = 0U;
     for (uint32_t w = 0U; w < nwords;) {
         uint32_t chunk = rt_ctrl_chunk_words(tile_addr, nwords, w);
-        ridx++; /* skip the response stream header */
+        ridx++; /* skip the per-access stream header word */
         for (uint32_t j = 0U; j < chunk; j++)
             out_data[w + j] = resp[ridx++];
         w += chunk;

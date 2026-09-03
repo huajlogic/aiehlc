@@ -692,16 +692,17 @@ void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);
 
 // Build WRITE control-packet words for a contiguous block of @nwords 32-bit
 // values targeting tile byte address @tile_addr onward, routed by @stream_id
-// (two in-band headers per <=4-word chunk). When @readlastack is nonzero and
-// @nwords>0, a single trailing READ-with-return control packet for the LAST
-// written word (tile_addr + (nwords-1)*4) is appended in the same buffer via
-// __Runtime_ctrl_pktize_read, using @ret_stream_id for its response route;
-// because the dest CTRL port processes accesses in order, that read's response
-// is a completion barrier for all preceding writes. On success *@resp_words_out
-// (may be NULL) gets the appended read's expected response length in words (0
-// when no read is appended). Returns words written (0 on capacity overflow).
+// (two in-band headers per <=4-word chunk). When @lastwriteack is nonzero and
+// @nwords>0, the LAST written word (tile_addr + (nwords-1)*4) is re-emitted as
+// its own single-word WRITE-WITH-RETURN access (control-info operation=0b10,
+// return stream id @ret_stream_id); because the dest CTRL port processes
+// accesses in order, that ack's response is a completion barrier for all
+// preceding writes. The response is a single AIE packet-switched stream header
+// word (per doc/controlpkt.txt Table 3-32), and the return route keeps the
+// header, so on success *@resp_words_out (may be NULL) gets 1 when the ack is
+// appended, 0 otherwise. Returns words written (0 on capacity overflow).
 uint32_t __Runtime_ctrl_pktize_write(uint32_t *out, uint32_t out_cap, uint32_t stream_id, uint32_t tile_addr,
-                                     const uint32_t *data, uint32_t nwords, int readlastack, uint32_t ret_stream_id,
+                                     const uint32_t *data, uint32_t nwords, int lastwriteack, uint32_t ret_stream_id,
                                      uint32_t *resp_words_out);
 
 // Build READ control-packet words for a contiguous @nwords block of tile
@@ -717,6 +718,24 @@ uint32_t __Runtime_ctrl_pktize_write(uint32_t *out, uint32_t out_cap, uint32_t s
 // capacity overflow).
 uint32_t __Runtime_ctrl_pktize_read(uint32_t *out, uint32_t out_cap, uint32_t req_stream_id, uint32_t ret_stream_id,
                                     uint32_t tile_addr, uint32_t nwords, uint32_t *resp_words_out);
+
+// Parse a control-info word (the word after the stream packet header) per the
+// AIE2ps Control-Packet format (doc/controlpkt.txt Table 3-31/3-32):
+// [19:0]=local byte address, [21:20]=beats-1, [23:22]=operation
+// (00=write, 01=read w/return, 10=write w/return), [28:24]=return stream id,
+// [31]=odd parity over [30:0]. Any out pointer may be NULL. @beats_out gets the
+// decoded beat count (field+1, i.e. 1..4). Returns 1 if the parity bit is
+// consistent, 0 otherwise.
+int __Runtime_ctrl_parse_ctrl_hdr(uint32_t ctrl_hdr, uint32_t *addr_out, uint32_t *op_out, uint32_t *beats_out,
+                                  uint32_t *ret_sid_out);
+
+// Parse an AIE packet-switched stream header word (the first word of a control
+// packet / response packet): [4:0]=packet id (stream id), [14:12]=packet type
+// (7=SLVERR on a control-packet response), [20:16]=source row, [27:21]=source
+// column, [31]=odd parity over [30:0]. Any out pointer may be NULL. Returns 1 if
+// the parity bit is consistent, 0 otherwise.
+int __Runtime_ctrl_parse_pkt_hdr(uint32_t pkt_hdr, uint32_t *id_out, uint32_t *type_out, uint32_t *src_row_out,
+                                 uint32_t *src_col_out);
 
 // Control-packet send context. Identifies the shim source column, the
 // destination tile (same column as the shim), the packet stream id, and the
