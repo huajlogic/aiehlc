@@ -175,7 +175,9 @@ def strip_comments(src):
     return src
 
 
-RE_XAIE_CALL = re.compile(r"XAie_(LoadElfMem|MoveData\w+|Route)\b")
+RE_XAIE_CALL = re.compile(
+    r"(XAie_(LoadElfMem|MoveData\w+|Route)|__Runtime_ctrl_setup_routing"
+    r"|__Runtime_ctrl_(read|push)_target)\b")
 RE_FUNC_HDR = re.compile(r"([A-Za-z_]\w*)\s*\([^;]*\)\s*\{?\s*$")
 
 

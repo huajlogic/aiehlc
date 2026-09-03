@@ -260,3 +260,20 @@ def test_extract_model_ctrl_memtile_dest():
     model = x.extract_model(src, aie_gen=5, aiesim=False)
     tiles = {(t["col"], t["row"]): t["type"] for t in model["tiles"]}
     assert tiles[(0, 2)] == "memtile"
+
+
+CTRL_ENTRY_SRC = """
+int controlperf_main(XAie_DevInst *dev)
+{
+    __Runtime_CtrlInstance _ri = {.dev = dev, .shim_col = 0u, .dest_col = 0u, .dest_row = 3u,
+                                  .resp_words = 1u};
+    __Runtime_ctrl_setup_routing(&_ri, 1);
+}
+"""
+
+
+def test_ctrl_entry_fn():
+    model = x.extract_model(CTRL_ENTRY_SRC, aie_gen=5, aiesim=False)
+    assert model["entry_fn"] == "controlperf_main"
+    doc = x.build_dfschedule(model, aie_gen=5)
+    assert doc["host_entry_fn"] == "controlperf_main"
