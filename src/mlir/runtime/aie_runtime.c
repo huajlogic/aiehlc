@@ -3056,12 +3056,11 @@ uint32_t __Runtime_ctrl_pktize_write(uint32_t *out, uint32_t out_cap, uint32_t s
 
         uint32_t pkt_hdr = stream_id & 0x1FU;
         pkt_hdr |= __Runtime_pkt_parity(pkt_hdr) << 31U;
-
         out[idx++] = pkt_hdr;
         out[idx++] = ctrl_hdr;
         for (uint32_t j = 0U; j < pkt_size; j++) {
             out[idx++] = data ? data[i + j] : 0U;
-            printf("[aie_runtime] ctrl_pktize_write: data[%u]=0x%x\n", i + j, out[idx - 1]);
+            // printf("[aie_runtime] ctrl_pktize_write: data[%u]=0x%x\n", i + j, out[idx - 1]);
         }
     }
     if (lastwriteack && nwords > 0U) {
@@ -3292,21 +3291,22 @@ AieRC __Runtime_ctrl_push(const __Runtime_CtrlInstance *inst, uint32_t *buf, uin
     if (log)
         printf("[aie_runtime] ctrl_push shim(%u,0) bd=%d ch=%d addr=0x%lx len=%u\n", (unsigned)shim_col, bd_id, channel,
                (unsigned long)dev_addr, len);
-    /* Bounded MM2S drain (mirror wait_io, aie_runtime.c): if the forward
-     * control-packet stream stalls at the dest CTRL port the channel never
-     * reaches pending=0, so cap the poll and report a timeout instead of
-     * hard-hanging the board (which forces a reset). */
-    uint8_t pending = 1U;
-    const uint32_t mm2s_max_iters = 100000U;
-    for (uint32_t iter = 0U; iter < mm2s_max_iters; iter++) {
-        (void)XAie_DmaGetPendingBdCount(dev, loc, (uint8_t)channel, DMA_MM2S, &pending);
-        if (pending == 0U)
-            break;
-        if (iter + 1U == mm2s_max_iters)
-            printf("[aie_runtime] ctrl_push TIMEOUT shim(%u,0) bd=%d ch=%d pending=%u\n", (unsigned)shim_col, bd_id,
-                   channel, (unsigned)pending);
-    }
+
     if (log) {
+        /* Bounded MM2S drain (mirror wait_io, aie_runtime.c): if the forward
+         * control-packet stream stalls at the dest CTRL port the channel never
+         * reaches pending=0, so cap the poll and report a timeout instead of
+         * hard-hanging the board (which forces a reset). */
+        uint8_t pending = 1U;
+        const uint32_t mm2s_max_iters = 100000U;
+        for (uint32_t iter = 0U; iter < mm2s_max_iters; iter++) {
+            (void)XAie_DmaGetPendingBdCount(dev, loc, (uint8_t)channel, DMA_MM2S, &pending);
+            if (pending == 0U)
+                break;
+            if (iter + 1U == mm2s_max_iters)
+                printf("[aie_runtime] ctrl_push TIMEOUT shim(%u,0) bd=%d ch=%d pending=%u\n", (unsigned)shim_col, bd_id,
+                       channel, (unsigned)pending);
+        }
         /* Read the dest CTRL master port state (armed via XAie_EventSelectStrmPort
          * in rt_ctrl_route_setup_col). run=1 => the forward control stream reached
          * the CTRL port (issue is CTRL consumption/framing); run=0 => the packet

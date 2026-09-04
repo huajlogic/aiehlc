@@ -538,7 +538,7 @@ int run_control_perf(XAie_DevInst *dev) {
         // Phase A: WRITE 0xABCD1234 to 0x1000 as its OWN push (separate TLAST).
         // Phase B: READ 0x1000 back as a SECOND push. Separating them tests whether
         // the write persists independent of write+read-in-one-buffer ordering.
-#define WDATA_NUM 5
+#define WDATA_NUM 10000
         uint32_t _wbuf_h[8 * WDATA_NUM];
         uint32_t _wdata[WDATA_NUM];
         for (int i = 0; i < WDATA_NUM; i++) {
@@ -572,15 +572,27 @@ int run_control_perf(XAie_DevInst *dev) {
                                           .s2mm_ch = 1,
                                           .token = NULL,
                                           .resp_words = 1u};
+            XTime _tt0, _tt1;
             AieRC _wrc = __Runtime_ctrl_setup_routing(&_wi, /*port_evt=*/1);
             if (_wrc == XAIE_OK) {
+                printf("token[0] before push: 0x%x\n", _wi.token[0]);
                 __Runtime_sync_for_dev(dev, _wi.token, _wi.resp_words * sizeof(uint32_t));
+                XTime_GetTime(&_tt0);
                 __Runtime_ctrl_push(&_wi, _wbuf, _ww, /*block=*/0, /*log=*/0);
-                printf("[controlperf] MINI-A write 0xABCD1234 -> (0,3) 0x1000 done\n");
+                // printf("[controlperf] MINI-A write 0xABCD1234 -> (0,3) 0x1000 done\n");
                 uint8_t _mp = 1u;
-                for (uint32_t _s = 0u; _s < 100000u && _mp != 0u; _s++)
+                for (uint32_t _s = 0u; _s < 1000000u && _mp != 0u; _s++) {
                     XAie_DmaGetPendingBdCount(dev, shim, /*s2mm_ch=*/1u, DMA_S2MM, &_mp);
-
+                    // usleep(1);
+                    // if (_wi.token[0] != 0u) break;
+                }
+                uint32_t curtokenv = _wi.token[0];
+                XTime_GetTime(&_tt1);
+                printf("curtokenv after push: 0x%x\n", curtokenv);
+                double _tus = 1.0 * (double)(_tt1 - _tt0) / ((double)COUNTS_PER_SECOND / 1000000.0);
+                printf("[controlperf] MINI-A write 0xABCD1234 -> (0,3) 0x1000 elapsed time:  (%.2f us) "
+                       "COUNTS_PER_SECOND=%llu\n",
+                       _tus, COUNTS_PER_SECOND);
                 uint32_t packet_id, type, row, col;
                 __Runtime_ctrl_parse_pkt_hdr(_wi.token[0], &packet_id, &type, &row, &col);
                 printf("write ack is [%u]=0x%x (packet_id=%u type=%u row=%u col=%u)\n", 0, _wi.token[0], packet_id,
@@ -647,7 +659,7 @@ int run_control_perf(XAie_DevInst *dev) {
             }
 #endif /* _CONTRL_READ_TEST_ */
     }
-
+// #define _CTRL_PKT_1000_TEST_
 #ifdef _CTRL_PKT_1000_TEST_
     {
         // Prepare a 1000-write control payload targeting tile-local address 0x1000
@@ -664,7 +676,7 @@ int run_control_perf(XAie_DevInst *dev) {
         for (uint32_t _d = 0u; _d < (uint32_t)CTRL_NWRITES; _d++)
             ctrl_data[_d] = 0xC0FFEE00u + _d;
         uint32_t *ctrl_buf = (uint32_t *)buf;
-        const uint32_t ctrl_cap = 16384u / 4u;
+        const uint32_t ctrl_cap = CTRL_NWRITES * 8;
         // WRITE packets for the 1000 target writes at 0x1000, with lastwriteack=1:
         // re-emit the LAST written word (at 0x1000 + (NWRITES-1)*4) as its own
         // single-word WRITE-WITH-RETURN access (op=0b10) into the SAME buffer. The
@@ -675,7 +687,7 @@ int run_control_perf(XAie_DevInst *dev) {
         // resp_words receives the expected response length (1). Because the dest CTRL
         // port processes accesses in order, that ack is a completion barrier for all
         // preceding writes.
-        uint32_t resp_words = 0u;
+        uint32_t resp_words = 1u;
         uint32_t ctrl_words = __Runtime_ctrl_pktize_write(ctrl_buf, ctrl_cap, /*stream_id=*/0u,
                                                           /*tile_addr=*/0x1000u, ctrl_data, /*nwords=*/CTRL_NWRITES,
                                                           /*lastwriteack=*/1, /*ret_stream_id=*/0u,
