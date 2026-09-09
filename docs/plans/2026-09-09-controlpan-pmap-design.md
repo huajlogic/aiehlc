@@ -160,3 +160,27 @@ Enable is gated by a single `__Runtime_ctrl_pmap_enable(1)` call before the firs
 - No client-side file picker; the button loads the session's `st.applog`.
 - Larger multi-packet reads / additional fabric shapes beyond what the runtime already
   programs are out of scope.
+
+## Status: DONE
+
+Implemented via `docs/plans/2026-09-09-controlpan-pmap.md` (8-task TDD plan), executed
+with subagent-driven-development (implementer + spec/quality review per task).
+
+### Files changed
+
+- `src/mlir/runtime/aie_runtime.h` — declare `__Runtime_ctrl_pmap_enable`.
+- `src/mlir/runtime/aie_runtime.c` — `g_ctrl_pmap` flag, `__Runtime_ctrl_pmap_enable`,
+  `rt_pmap_port` helper; emit calls in `rt_ctrl_route_setup_col` (same-column climb),
+  `rt_acr_port_name` + `rt_acr_dir` + per-op emits in `__Runtime_ctrl_row_emit`, and
+  the shim-entry emits in `rt_ctrl_row_shim_entry` (row fabric).
+- `src/tool/debug/controlpan_pmap.py` — standalone parser: `parse_ports`, `parse_edges`,
+  `parse` → `{ports, edges, count}`.
+- `src/tool/debug/tests/test_controlpan_pmap.py` — 6 parser tests (ports, malformed
+  tolerance, SPINE NORTH↔SOUTH pairing, EAST↔WEST chain, CTRL non-edge, summary counts).
+- `src/tool/debug/schedule_debug_server.py` — `import controlpan_pmap` + `/ctrlplan/load`
+  POST endpoint (reads `st.applog`, returns `controlpan_pmap.parse(text)`).
+- `src/tool/debug/schedule_view.py` — **Load control plan** button + `ctrl plan` toggle,
+  `ctrlPlanEdges` overlay layer, `drawCtrlPlanOverlay` / `loadCtrlPlan`, `dmClearAll` reset,
+  and `.ctrlplan-edge` / `.ctrlplan-ret` CSS.
+- Docs: `.cursor/skills/debug-ui-framework/reference.md` (Device map overlay bullet),
+  `CLAUDE.md` (control-packet paragraph), this design doc.

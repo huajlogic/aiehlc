@@ -259,6 +259,17 @@ index; `linespans='SL'` for line-independent cache. Auth-gated on wide bind.
 - **Whole-flow hover:** `dmApplyFlowHover(fi)` highlights all segments + shmem for flow index
 - **Tile colors:** muted `--tile-*-fill/stroke` (Grid keeps original `--shim`/`--core`)
 - **Routing-only tiles:** `selectRoutingTile()` / `buildRoutingTileHtml()`
+- **Control-plan overlay (CONTROLPAN-PMAP):** the **Load control plan** button
+  (`#dmLoadCtrlPlan`) POSTs `/ctrlplan/load`; the server reads `st.applog`, runs
+  `controlpan_pmap.parse(text)` (module `controlpan_pmap.py` — parses
+  `CONTROLPAN-PMAP col=.. row=.. port=.. idx=.. dir=fwd|ret ms=master|slave id=..`
+  lines into `{ports, edges, count}`, pairing each master port with the
+  opposite-type slave on the neighbor tile). The frontend stores `j.edges` in
+  `ctrlPlanEdges` and `drawCtrlPlanOverlay(svg, cx, cy)` draws them as a dashed
+  overlay (`.ctrlplan-edge`, `.ctrlplan-ret` for return) on top of the data-flow
+  edges, toggle-able via `#dmCtrlPlanToggle`; `dmClearAll()` clears it. The C
+  runtime emits the lines when `__Runtime_ctrl_pmap_enable(1)` is set before the
+  first `aie_ctrl*` `setup_routing` / `row_add`.
 
 ### Grid view
 
