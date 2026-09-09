@@ -2900,6 +2900,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               display:flex; align-items:center; gap:4px; user-select:none; }
   #dmSwWrap:hover { color:rgba(228,228,228,.9); }
   #dmSwWrap input { cursor:pointer; margin:0; }
+  #dmLoadCtrlPlan { position:absolute; top:8px; right:96px; font-size:10px; padding:3px 8px;
+                    border:1px solid rgba(228,228,228,.2); background:rgba(228,228,228,.07);
+                    color:rgba(228,228,228,.7); border-radius:4px; cursor:pointer; z-index:10; }
+  #dmLoadCtrlPlan:hover:not(:disabled) { background:rgba(228,228,228,.13); color:rgba(228,228,228,.95); }
+  #dmLoadCtrlPlan:disabled { opacity:.38; cursor:not-allowed; }
+  #dmCtrlPlanWrap { position:absolute; top:58px; right:8px; font-size:10px;
+                    color:rgba(228,228,228,.6); cursor:pointer; z-index:10;
+                    display:flex; align-items:center; gap:4px; user-select:none; }
+  #dmCtrlPlanWrap input { cursor:pointer; margin:0; }
+  .ctrlplan-edge { stroke:#e91e63; stroke-width:2; opacity:.85; pointer-events:none; }
+  .ctrlplan-ret { stroke:#00bcd4; }
   #devmap-legend { display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; font-size:10px;
                    color:rgba(228,228,228,.35); align-items:center; }
   .dml-item { display:flex; align-items:center; gap:4px; }
@@ -3326,6 +3337,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="devmap-vp">
       <button id="devmap-reset" onclick="dmReset(true)">Reset view</button>
       <label id="dmSwWrap" title="show/hide CCT/PKT routing config inside tiles"><input type="checkbox" id="dmSwToggle" checked> routing info</label>
+      <button id="dmLoadCtrlPlan" title="parse applog CONTROLPAN-PMAP lines and overlay the control-plan routing">Load control plan</button>
+      <label id="dmCtrlPlanWrap" title="show/hide the parsed control-plan overlay" hidden><input type="checkbox" id="dmCtrlPlanToggle" checked> ctrl plan</label>
       <div id="devmap-spacehint">scroll to zoom · click tile to inspect · right-click tile for routing/isolate menu · click stream to isolate</div>
       <div id="devmap-canvas"><svg id="devmap-svg"></svg></div>
       <div id="devmap-hint">col 0–3 · row 0 (shim) at bottom</div>
@@ -5472,6 +5485,10 @@ function dmClearAll(){
     srRenderResults();
     if (document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
   }
+  ctrlPlanEdges = [];
+  const _cpw = document.getElementById('dmCtrlPlanWrap');
+  if (_cpw) _cpw.hidden = true;
+  if (document.getElementById('devmap')?.classList.contains('show')) buildDeviceMap();
   dmSyncClearBtn();
 }
 
@@ -5940,6 +5957,40 @@ function dmMoveTip(e){
   if(lx+tw>window.innerWidth-8) lx=e.clientX-tw-14;
   if(ly<8) ly=e.clientY+14;
   dmTooltipEl.style.left=lx+'px'; dmTooltipEl.style.top=ly+'px';
+}
+
+// CONTROLPAN-PMAP overlay: control-plan routing edges parsed from the applog by
+// /ctrlplan/load. Drawn on top of the data-flow edges as a dashed overlay,
+// toggle-able via #dmCtrlPlanToggle. Each edge: {from:[c,r], to:[c,r], dir, id, port}.
+let ctrlPlanEdges = [];
+
+function drawCtrlPlanOverlay(svg, cx, cy){
+  if(!ctrlPlanEdges.length) return;
+  if(!document.getElementById('dmCtrlPlanToggle')?.checked) return;
+  for(const e of ctrlPlanEdges){
+    const ln = svgN('line', {
+      x1:cx(e.from[0]), y1:cy(e.from[1]),
+      x2:cx(e.to[0]),   y2:cy(e.to[1]),
+      class:'ctrlplan-edge '+(e.dir==='ret'?'ctrlplan-ret':''),
+      'stroke-dasharray':'5 3'});
+    svg.appendChild(ln);
+  }
+}
+
+async function loadCtrlPlan(){
+  const btn = document.getElementById('dmLoadCtrlPlan');
+  if(btn) btn.disabled = true;
+  try{
+    const j = await api('/ctrlplan/load', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{}'});
+    if(j.error){ alert('Load control plan: '+j.error); return; }
+    ctrlPlanEdges = j.edges || [];
+    const wrap = document.getElementById('dmCtrlPlanWrap');
+    if(wrap) wrap.hidden = ctrlPlanEdges.length===0;
+    const tog = document.getElementById('dmCtrlPlanToggle');
+    if(tog) tog.checked = true;
+    buildDeviceMap();
+  } finally { if(btn) btn.disabled = false; }
 }
 
 function buildDeviceMap(){
@@ -6807,6 +6858,8 @@ function buildDeviceMap(){
   });
 
   svg.appendChild(dotsG);
+
+  drawCtrlPlanOverlay(svg, cx, cy);
 
   // Fit only on the first build or an explicit "Reset view". Rebuilds triggered
   // by the net chips, the tile right-click menu or a search must not throw away
@@ -10171,6 +10224,10 @@ function runScanNow(setMsg){
   if (gbtn) gbtn.onclick = () => runScanNow(setStatus);
   const clr = document.getElementById('dmClearBtn');
   if (clr) clr.onclick = dmClearAll;
+  const lcp = document.getElementById('dmLoadCtrlPlan');
+  if (lcp) lcp.onclick = loadCtrlPlan;
+  const cpTog = document.getElementById('dmCtrlPlanToggle');
+  if (cpTog) cpTog.onchange = () => buildDeviceMap();
   const live = document.getElementById('dmLiveToggle');
   if (live) live.onchange = e => {
     if (e.target.checked && !LIVE.connected){
