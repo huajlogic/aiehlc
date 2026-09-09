@@ -6,6 +6,16 @@ extern "C" {
 acr_rc acr_book_port(acr_portbook *, uint8_t col, uint8_t row, acr_port, uint8_t idx, int is_master);
 acr_rc acr_plan_chain(acr_oplist *, acr_portbook *, uint8_t row, uint8_t col_lo, uint8_t col_hi,
                       int target_col /* -1 => broadcast all */, uint8_t ctrl_id);
+acr_rc acr_plan_row_add(acr_state *, acr_oplist *, acr_portbook *, uint8_t shim_col, uint8_t row, uint8_t col_lo,
+                        uint8_t col_hi, uint8_t ctrl_id);
+}
+
+static int count_kind(const acr_oplist *o, acr_op_kind k) {
+    int c = 0;
+    for (int i = 0; i < o->n; i++)
+        if (o->ops[i].kind == k)
+            c++;
+    return c;
 }
 
 // Count master-enable ops on a column for a given master port.
@@ -68,8 +78,23 @@ static int test_msel_rule() {
     return 0;
 }
 
+static int test_spine_reuse() {
+    acr_state s = {};
+    acr_portbook b = {};
+    acr_oplist o1 = {};
+    assert(acr_plan_row_add(&s, &o1, &b, 2, 3, 2, 4, 5) == ACR_OK); // rows 1..3 spine
+    assert(count_kind(&o1, ACR_OP_CCT) > 0);
+    acr_oplist o2 = {};
+    assert(acr_plan_row_add(&s, &o2, &b, 2, 3, 2, 4, 5) == ACR_OK); // re-add same row
+    assert(o2.n == 0);                                              // idempotent: nothing new
+    acr_oplist o3 = {};
+    assert(acr_plan_row_add(&s, &o3, &b, 2, 5, 2, 4, 5) == ACR_OK); // higher row reuses spine 1..3
+    assert(count_kind(&o3, ACR_OP_CCT) == 2);                       // only rows 4,5 spine hops added
+    return 0;
+}
+
 int main() {
-    if (test_book() || test_unicast() || test_broadcast() || test_msel_rule())
+    if (test_book() || test_unicast() || test_broadcast() || test_msel_rule() || test_spine_reuse())
         return 1;
     printf("PASS\n");
     return 0;

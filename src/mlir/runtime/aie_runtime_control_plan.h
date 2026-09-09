@@ -40,4 +40,12 @@ typedef struct {
 } acr_portbook;
 
 typedef enum { ACR_OK = 0, ACR_ERR_PORT_CONFLICT, ACR_ERR_SLOTS, ACR_ERR_BOUNDS, ACR_ERR_TILETYPE } acr_rc;
+
+/* Pure mirror of the instance's shared-spine state, so the spine/row-add logic
+ * can be host-unit-tested without the XAie-bearing __Runtime_CtrlRowFabric. */
+typedef struct {
+    uint8_t spine_top;          /* highest row the fwd spine reaches (0 => none) */
+    uint8_t rows[ACR_MAX_ROWS]; /* rows already configured (for idempotence) */
+    uint8_t nrows;
+} acr_state;
 #endif
