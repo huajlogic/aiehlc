@@ -3491,6 +3491,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                (unsigned)fport, (unsigned)vfwd, (int)rc);
         return rc;
     }
+    rt_pmap_port(shim_col, 0, "SOUTH", fport, "fwd", "slave", stream_id);
+    rt_pmap_port(shim_col, 0, "NORTH", vfwd, "fwd", "master", stream_id);
     /* Diagnostic: watch the shim forward output (NORTH master vfwd) on slot 0. */
     if (port_evt)
         (void)XAie_EventSelectStrmPort(dev, shim, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, NORTH, vfwd);
@@ -3503,6 +3505,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                    (unsigned)shim_col, (unsigned)r, (unsigned)vfwd, (int)rc);
             return rc;
         }
+        rt_pmap_port(shim_col, r, "SOUTH", vfwd, "fwd", "slave", stream_id);
+        rt_pmap_port(shim_col, r, "NORTH", vfwd, "fwd", "master", stream_id);
         /* Diagnostic: watch this hop's forward output (NORTH master vfwd) on slot 0. */
         if (port_evt)
             (void)XAie_EventSelectStrmPort(dev, thru, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, NORTH, vfwd);
@@ -3523,6 +3527,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                (unsigned)dest_row, (unsigned)vfwd, (int)rc);
         return rc;
     }
+    rt_pmap_port(shim_col, dest_row, "SOUTH", vfwd, "fwd", "slave", stream_id);
+    rt_pmap_port(shim_col, dest_row, "CTRL", 0, "fwd", "master", stream_id);
     /* Diagnostic: route the dest CTRL master port state onto select-id 0 so the
      * PORT_RUNNING_0 / PORT_IDLE_0 core events reflect whether the forward
      * control stream ever reached the CTRL port (mirrors _XAie_LoadElfSetupStrmSw
@@ -3591,6 +3597,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                (unsigned)dest_row, (unsigned)vret, (int)rc);
         return rc;
     }
+    rt_pmap_port(shim_col, dest_row, "CTRL", 0, "ret", "slave", stream_id);
+    rt_pmap_port(shim_col, dest_row, "SOUTH", vret, "ret", "master", stream_id);
     /* Pass-through rows dest_row-1..1: NORTH slave -> SOUTH master. Signed
      * counter so the r>=1 test terminates (uint8_t would wrap). */
     for (int r = (int)dest_row - 1; r >= 1; r--) {
@@ -3601,6 +3609,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                    (unsigned)shim_col, (unsigned)r, (unsigned)vret, (int)rc);
             return rc;
         }
+        rt_pmap_port(shim_col, (uint8_t)r, "NORTH", vret, "ret", "slave", stream_id);
+        rt_pmap_port(shim_col, (uint8_t)r, "SOUTH", vret, "ret", "master", stream_id);
         /* Diagnostic: watch this hop's return output (SOUTH master vret) on slot 1. */
         if (port_evt)
             (void)XAie_EventSelectStrmPort(dev, thru, RT_CTRL_SEL_RET, XAIE_STRMSW_MASTER, SOUTH, vret);
@@ -3621,6 +3631,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                (unsigned)rport, (int)rc);
         return rc;
     }
+    rt_pmap_port(shim_col, 0, "NORTH", vret, "ret", "slave", stream_id);
+    rt_pmap_port(shim_col, 0, "SOUTH", rport, "ret", "master", stream_id);
     AIEHLC_LOG(
         printf("[aie_runtime] ctrl_route ok: shim(%u,0)<->dest(%u,%u) fport=%u rport=%u vfwd=%u vret=%u sid=%u\n",
                (unsigned)shim_col, (unsigned)shim_col, (unsigned)dest_row, (unsigned)fport, (unsigned)rport,
