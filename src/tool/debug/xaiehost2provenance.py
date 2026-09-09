@@ -349,8 +349,18 @@ def extract_model(raw_src, aie_gen, aiesim):
             for c in range(rr["col_lo"], rr["col_hi"] + 1):
                 add_tile((c, rr["row"]), ctrl_tile_type(rr["row"], aie_gen))
             endpoint = (rr["col_hi"], rr["row"])
-            flows.append({"src": shim, "dst": endpoint, "direction": "S2MM", "len": 4})
-            flows.append({"src": endpoint, "dst": shim, "direction": "MM2S", "len": 4})
+            # Axis-aligned waypoint route so the device map (which builds edges
+            # only from Manhattan-distance-1 hops) draws the real spine + chain
+            # rather than a single diagonal shim->endpoint line: climb the spine
+            # (col, 0..row) then walk the EAST chain (col..col_hi, row).
+            fwd = [(col, r) for r in range(0, rr["row"] + 1)]
+            step = 1 if endpoint[0] >= col else -1
+            fwd += [(c, rr["row"])
+                    for c in range(col + step, endpoint[0] + step, step)]
+            flows.append({"src": shim, "dst": endpoint, "direction": "S2MM",
+                          "len": 4, "path": fwd})
+            flows.append({"src": endpoint, "dst": shim, "direction": "MM2S",
+                          "len": 4, "path": list(reversed(fwd))})
 
     return {"tiles": tiles, "kernel_placements": kernel_placements,
             "flows": flows, "entry_fn": find_entry_fn(active)}
@@ -473,7 +483,10 @@ def build_dmaphop(model):
     Stages carry roles ('producer'/'channel'/'consumer'), tiles are {col,row}
     dicts, and the channel stage holds hops as '(c,r)' from/to strings. Static
     XAie parsing cannot see the intermediate routing path (XAie_Route decides it
-    at runtime), so the channel carries only the direct producer->consumer hop.
+    at runtime), so the channel carries only the direct producer->consumer hop
+    -- unless the flow supplies an explicit axis-aligned waypoint 'path' (e.g.
+    the row-control spine + EAST chain), in which case it is expanded into
+    consecutive Manhattan-distance-1 hops so the device map renders each leg.
     """
     paths = []
     for fi, f in enumerate(model["flows"]):
@@ -482,9 +495,16 @@ def build_dmaphop(model):
         producer = {"role": "producer",
                     "tile": {"col": src[0], "row": src[1]},
                     "port_sym": "f%d_prod" % fi}
-        channel = {"role": "channel",
-                   "hops": [{"from": "(%d,%d)" % src, "to": "(%d,%d)" % dst,
-                             "hop_type": None, "shmem_kind": None}]}
+        # An explicit waypoint path is a known circuit/stream route, so type its
+        # legs 'stream'; otherwise leave the single hop untyped and let
+        # schedule_view classify it (dist>1 -> stream, else shmem).
+        explicit = bool(f.get("path"))
+        waypoints = f.get("path") or [src, dst]
+        hop_type = "stream" if explicit else None
+        hops = [{"from": "(%d,%d)" % tuple(a), "to": "(%d,%d)" % tuple(b),
+                 "hop_type": hop_type, "shmem_kind": None}
+                for a, b in zip(waypoints, waypoints[1:])]
+        channel = {"role": "channel", "hops": hops}
         consumer = {"role": "consumer",
                     "tile": {"col": dst[0], "row": dst[1]},
                     "port_sym": "f%d_cons" % fi}

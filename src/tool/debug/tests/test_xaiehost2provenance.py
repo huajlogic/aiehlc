@@ -411,3 +411,47 @@ def test_ctrl_row_entry_fn():
     assert model["entry_fn"] == "run_ctrlrow_demo"
     doc = x.build_dfschedule(model, aie_gen=5)
     assert doc["host_entry_fn"] == "run_ctrlrow_demo"
+
+
+def test_extract_model_ctrl_row_flow_has_lshaped_path():
+    # The device map (schedule_view._load_comm_paths) builds routing edges only
+    # from Manhattan-distance-1 hops. A single diagonal shim->endpoint hop draws
+    # nothing, so each row-fabric flow must carry an explicit axis-aligned
+    # waypoint path: vertical spine (shim_col, 0..row) then east chain
+    # (shim_col..col_hi, row). The return flow is that path reversed.
+    model = x.extract_model(CTRL_ROW_SRC, aie_gen=5, aiesim=False)
+    push = next(f for f in model["flows"]
+                if f["src"] == (0, 0) and f["dst"] == (1, 3))
+    assert push["path"] == [(0, 0), (0, 1), (0, 2), (0, 3), (1, 3)]
+    pull = next(f for f in model["flows"]
+                if f["src"] == (1, 3) and f["dst"] == (0, 0))
+    assert pull["path"] == [(1, 3), (0, 3), (0, 2), (0, 1), (0, 0)]
+
+
+def test_build_dmaphop_row_fabric_adjacent_hops():
+    # build_dmaphop must expand a flow's waypoint path into consecutive
+    # unit hops so schedule_view renders the spine + EAST chain as edges.
+    model = x.extract_model(CTRL_ROW_SRC, aie_gen=5, aiesim=False)
+    hop = x.build_dmaphop(model)
+    # locate the push path shim(0,0) -> endpoint(1,3)
+    push = next(p for p in hop["communication_paths"]
+                if p["direction"] == "push"
+                and any(s.get("tile") == {"col": 0, "row": 0}
+                        for s in p["stages"] if s["role"] == "producer")
+                and any(s.get("tile") == {"col": 1, "row": 3}
+                        for s in p["stages"] if s["role"] == "consumer"))
+    chan = next(s for s in push["stages"] if s["role"] == "channel")
+    hops = chan["hops"]
+    assert [(h["from"], h["to"]) for h in hops] == [
+        ("(0,0)", "(0,1)"), ("(0,1)", "(0,2)"),
+        ("(0,2)", "(0,3)"), ("(0,3)", "(1,3)")]
+    # every consecutive hop is Manhattan distance 1 (device-map edge friendly)
+    import re as _re
+    for h in hops:
+        (fc, fr) = map(int, _re.findall(r"\d+", h["from"]))
+        (tc, tr) = map(int, _re.findall(r"\d+", h["to"]))
+        assert abs(fc - tc) + abs(fr - tr) == 1
+    # control-packet routes are stream (circuit) hops, not shared memory: mark
+    # them so schedule_view types them 'stream' (drawn as stream lanes) instead
+    # of defaulting adjacent no-routing hops to dashed 'shmem' links.
+    assert all(h["hop_type"] == "stream" for h in hops)
