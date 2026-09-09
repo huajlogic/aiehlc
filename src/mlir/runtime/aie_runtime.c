@@ -3657,6 +3657,30 @@ static StrmSwPortType rt_acr_port(acr_port p) {
     }
 }
 
+/* Human-readable port name for CONTROLPAN-PMAP (mirrors rt_acr_port). */
+static const char *rt_acr_port_name(acr_port p) {
+    switch (p) {
+    case ACR_WEST:
+        return "WEST";
+    case ACR_EAST:
+        return "EAST";
+    case ACR_NORTH:
+        return "NORTH";
+    case ACR_SOUTH:
+        return "SOUTH";
+    case ACR_CTRL:
+    default:
+        return "CTRL";
+    }
+}
+
+/* fwd/ret for a remapped vertical spine channel; horizontal taps default fwd. */
+static const char *rt_acr_dir(acr_port p, uint8_t chan) {
+    if (p == ACR_NORTH || p == ACR_SOUTH)
+        return chan == RT_CTRL_VRET ? "ret" : "fwd";
+    return "fwd";
+}
+
 /* Remap a pure-planner spine port index (channel-agnostic idx 0) to the real
  * vertical channel numbers the rest of the runtime uses. The planner emits the
  * shared spine on SOUTH/NORTH idx 0; the forward (up) climb rides VFWD and the
@@ -3684,6 +3708,27 @@ AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops) {
         uint8_t sidx = rt_acr_chan(op->sport, /*master*/ 0, op->sidx);
         uint8_t midx = rt_acr_chan(op->mport, /*master*/ 1, op->midx);
         AieRC rc = XAIE_OK;
+        /* Provenance map (opt-in): record the port(s) this op programs so the
+         * aiedebug device-map can overlay the row-fabric control route. */
+        switch (op->kind) {
+        case ACR_OP_SLOT:
+        case ACR_OP_SLAVE_EN:
+            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op->sport, sidx), "slave",
+                         op->pkt_id);
+            break;
+        case ACR_OP_MASTER_EN:
+            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->mport), midx, rt_acr_dir(op->mport, midx), "master",
+                         op->pkt_id);
+            break;
+        case ACR_OP_CCT:
+            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op->sport, sidx), "slave",
+                         op->pkt_id);
+            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->mport), midx, rt_acr_dir(op->mport, midx), "master",
+                         op->pkt_id);
+            break;
+        default:
+            break;
+        }
         switch (op->kind) {
         case ACR_OP_SLOT: {
             XAie_Packet pkt = XAie_PacketInit(op->pkt_id, 0U);
@@ -3759,9 +3804,13 @@ static AieRC rt_ctrl_row_shim_entry(const __Runtime_CtrlRowFabric *f, int32_t mm
         return rc;
     }
     rc = XAie_StrmConnCctEnable(f->dev, shim, SOUTH, fport, NORTH, RT_CTRL_VFWD);
-    if (rc != XAIE_OK)
+    if (rc != XAIE_OK) {
         printf("[aie_runtime] ctrl_row: shim entry StrmConnCctEnable (%u,0) SOUTH%u->NORTH%u rc=%d\n",
                (unsigned)f->shim_col, (unsigned)fport, (unsigned)RT_CTRL_VFWD, (int)rc);
+        return rc;
+    }
+    rt_pmap_port(f->shim_col, 0, "SOUTH", fport, "fwd", "slave", f->ctrl_id);
+    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VFWD, "fwd", "master", f->ctrl_id);
     return rc;
 }
 
