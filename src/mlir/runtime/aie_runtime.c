@@ -3438,6 +3438,19 @@ static void rt_ctrl_dump_path_ports(const __Runtime_CtrlInstance *c) {
     }
 }
 
+/* Control-plan provenance map (CONTROLPAN-PMAP). Opt-in via
+ * __Runtime_ctrl_pmap_enable. Emits one line per programmed stream port so the
+ * aiedebug device-map can overlay the control-plan routing. */
+static int g_ctrl_pmap = 0;
+void __Runtime_ctrl_pmap_enable(int on) { g_ctrl_pmap = on; }
+
+static void rt_pmap_port(uint8_t col, uint8_t row, const char *ptype, uint8_t pidx, const char *dir, const char *ms,
+                         uint32_t id) {
+    if (g_ctrl_pmap)
+        printf("CONTROLPAN-PMAP col=%u row=%u port=%s idx=%u dir=%s ms=%s id=%u\n", (unsigned)col, (unsigned)row, ptype,
+               (unsigned)pidx, dir, ms, (unsigned)id);
+}
+
 /**
  * Program the same-column forward (shim MM2S -> dest CTRL) and return
  * (dest -> shim S2MM) stream-switch routes for a control-packet send @c.

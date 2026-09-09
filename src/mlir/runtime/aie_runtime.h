@@ -785,6 +785,12 @@ AieRC __Runtime_ctrl_push(const __Runtime_CtrlInstance *inst, uint32_t *buf, uin
 // @inst->token holds a freshly allocated DDR buffer.
 AieRC __Runtime_ctrl_setup_routing(__Runtime_CtrlInstance *inst, int port_evt = 0);
 
+// Enable (on!=0) or disable per-port control-plan provenance logging. When on,
+// the aie_ctrl* routing setup prints one `CONTROLPAN-PMAP ...` line per stream
+// port it programs (tile location, port type/idx, direction, master/slave, id)
+// to stdout (the applog). Call once before the first setup_routing / row_add.
+void __Runtime_ctrl_pmap_enable(int on);
+
 // Poll the shim S2MM drain until the response lands, sync it for the CPU, and
 // return the first response word. Uses @inst->token armed by
 // __Runtime_ctrl_setup_routing. If @print is nonzero, prints the observed word.
