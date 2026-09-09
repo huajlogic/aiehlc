@@ -133,11 +133,19 @@ acr_rc acr_plan_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_l
  * the EAST chain [col_lo..col_hi] on that row. Idempotent per requirement #5:
  *   - re-adding a row already in @s->rows emits nothing;
  *   - a higher row reuses the existing spine and only extends it upward.
- * Spine hops are circuit-switched pass-through (one ACR_OP_CCT per new row
- * level, SOUTH-in -> NORTH-out). The chain head (col_lo == shim_col) ingresses
- * from the spine below (SOUTH). The chain is built as the broadcast superset so
- * both broadcast and single-target transfers can flow; per-transfer intent is
- * carried by the control packet's tile address. */
+ * Spine hops are circuit-switched pass-through (one ACR_OP_CCT per row level,
+ * SOUTH-in -> NORTH-out). @s->spine_top is the highest row that HAS a
+ * pass-through hop; to feed head @row's SOUTH ingress the spine must pass
+ * through rows 1..row-1, so we extend up to row-1 (NOT row itself): the head row
+ * taps SOUTH into its chain and must not also be a circuit pass-through on the
+ * same SOUTH slave port. A later, higher row R2 reuses rows 1..spine_top and
+ * extends spine_top..R2-1; this adds the pass-through hop on any earlier head
+ * that now sits below R2 (that intermediate tile then both taps SOUTH and passes
+ * the spine up — a required fan-out validated by the emit layer). The chain head
+ * (col_lo == shim_col) ingresses from the spine below (SOUTH); row==1 ingresses
+ * directly from the shim's NORTH (no pass-through hop). The chain is built as the
+ * broadcast superset so both broadcast and single-target transfers can flow;
+ * per-transfer intent is carried by the control packet's tile address. */
 acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t shim_col, uint8_t row, uint8_t col_lo,
                         uint8_t col_hi, uint8_t ctrl_id) {
     if (row == 0 || row > ACR_MAX_ROWS || shim_col >= 64)
@@ -153,9 +161,11 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
     if (s->nrows >= ACR_MAX_ROWS)
         return ACR_ERR_BOUNDS;
 
-    /* Extend the spine upward: one circuit pass-through hop per new row level. */
-    if (row > s->spine_top) {
-        for (uint8_t r = (uint8_t)(s->spine_top + 1); r <= row; r++) {
+    /* Extend the spine's pass-through hops up to row-1 (the head row taps SOUTH,
+     * it is not a pass-through). row==1 needs none (fed by the shim's NORTH). */
+    uint8_t need_top = (uint8_t)(row - 1);
+    if (need_top > s->spine_top) {
+        for (uint8_t r = (uint8_t)(s->spine_top + 1); r <= need_top; r++) {
             acr_op cct = {.kind = ACR_OP_CCT,
                           .col = shim_col,
                           .row = r,
@@ -167,7 +177,7 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
             if (rc != ACR_OK)
                 return rc;
         }
-        s->spine_top = row;
+        s->spine_top = need_top;
     }
 
     /* Build the horizontal chain; head tile takes the spine input from SOUTH. */

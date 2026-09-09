@@ -888,4 +888,17 @@ AieRC __Runtime_ctrl_row_open(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uin
 // Tear down state and free the response buffer. Best-effort route teardown.
 AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f);
 
+// Configure one EAST chain on @row spanning columns [col_lo..col_hi] (the head
+// @col_lo must equal @f->shim_col). Extends/reuses the shared vertical spine
+// idempotently, emits the derived stream-switch config, and records the chain.
+// Re-adding an already-configured row is a no-op.
+AieRC __Runtime_ctrl_row_add(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t col_lo, uint8_t col_hi);
+
+// Broadcast a WRITE control packet (@nwords words to tile byte address
+// @tile_addr) to every tile consuming @f->ctrl_id on the configured rows.
+// Fire-and-forget (no ack, non-blocking). @bd_id / @mm2s_ch select the shim send
+// BD + channel; @log enables the per-send log. Requires a prior row_add.
+AieRC __Runtime_ctrl_row_broadcast_write(__Runtime_CtrlRowFabric *f, uint32_t tile_addr, const uint32_t *data,
+                                         uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log);
+
 #endif // AIE_RUNTIME_H
