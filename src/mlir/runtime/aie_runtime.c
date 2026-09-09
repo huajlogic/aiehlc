@@ -3672,6 +3672,40 @@ AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops) {
     return XAIE_OK;
 }
 
+/* Initialize the row-control fabric: record the device, spine column, control
+ * stream id, and the fixed memtile response sink. No HW is touched here; spine
+ * hops and EAST chains are emitted lazily by __Runtime_ctrl_row_add. The spine
+ * (spine_top=0, nrows=0) and per-tile port book start empty. */
+AieRC __Runtime_ctrl_row_open(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col,
+                              XAie_LocType resp_memtile, int32_t resp_s2mm_ch, int32_t resp_bd, uint8_t ctrl_id) {
+    if (!f || !dev)
+        return XAIE_INVALID_ARGS;
+    memset(f, 0, sizeof(*f));
+    f->dev = dev;
+    f->shim_col = shim_col;
+    f->ctrl_id = ctrl_id;
+    f->fwd_vc = 0U; /* single forward/return vertical channel pair for now */
+    f->ret_vc = 0U;
+    f->resp_memtile = resp_memtile;
+    f->resp_s2mm_ch = resp_s2mm_ch;
+    f->resp_bd = resp_bd;
+    f->resp_buf = NULL;
+    f->resp_words = 0U;
+    return XAIE_OK;
+}
+
+/* Tear down the fabric: free the lazily-allocated response buffer and clear all
+ * state. Stream-switch routes are not individually undone; partition teardown
+ * resets the switches (best-effort). */
+AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f) {
+    if (!f)
+        return XAIE_INVALID_ARGS;
+    if (f->resp_buf && f->dev)
+        __Runtime_free_buffer(f->dev, f->resp_buf);
+    memset(f, 0, sizeof(*f));
+    return XAIE_OK;
+}
+
 /**
  * Arm the shim S2MM channel to drain the returning control-packet response into
  * c->token (c->resp_words 32-bit words, min 1) using a distinct in-range shim BD
