@@ -330,3 +330,84 @@ def test_eval_cond_tolerates_macro_body_with_backslash():
     active = x.MacroResolver(5, False).active_source(MACRO_BODY_SRC)
     assert "int marker = 5;" in active
     assert "int marker = 0;" not in active
+
+
+# Row-control fabric API (design: 2026-09-08-row-control-connection). One
+# __Runtime_ctrl_row_open picks the spine (shim) column; each
+# __Runtime_ctrl_row_add(fab,row,col_lo,col_hi) adds an EAST chain. A re-add of
+# the same row is idempotent (dedup). The ctrl_id arg carries a (uint8_t) cast
+# that must not break shim_col parsing.
+CTRL_ROW_SRC = """
+int run_ctrlrow_demo(XAie_DevInst *dev) {
+    __Runtime_CtrlRowFabric fab;
+    __Runtime_ctrl_row_open(&fab, dev, 0u, 0, (uint8_t)0u);
+    __Runtime_ctrl_row_add(&fab, 3u, 0u, 1u);
+    __Runtime_ctrl_row_add(&fab, 5u, 0u, 1u);
+    __Runtime_ctrl_row_add(&fab, 3u, 0u, 1u);
+}
+"""
+
+
+def test_extract_ctrl_rows_open_and_add():
+    active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_SRC))
+    fab = x.extract_ctrl_rows(active, x.collect_defines(active))
+    assert fab["shim_col"] == 0
+    # the idempotent re-add of row 3 collapses -> two distinct chains
+    assert fab["rows"] == [{"row": 3, "col_lo": 0, "col_hi": 1},
+                           {"row": 5, "col_lo": 0, "col_hi": 1}]
+
+
+def test_extract_ctrl_rows_none_without_open():
+    assert x.extract_ctrl_rows("int main(){return 0;}", {}) is None
+
+
+# The real ctrlrow_demo.cc passes u-suffixed #define values (DEMO_SHIM_COL = 0u)
+# to the fabric calls, so the suffix rides in via the macro BODY and must fold
+# after substitution -- not only when stripped from a raw literal.
+CTRL_ROW_DEFINE_SRC = """
+#define DEMO_SHIM_COL 0u
+#define DEMO_CORE_ROW_A 3u
+#define DEMO_COL_LO 0u
+#define DEMO_COL_HI 1u
+int run_ctrlrow_demo(XAie_DevInst *dev) {
+    __Runtime_ctrl_row_open(&fab, dev, DEMO_SHIM_COL, 0, (uint8_t)0u);
+    __Runtime_ctrl_row_add(&fab, DEMO_CORE_ROW_A, DEMO_COL_LO, DEMO_COL_HI);
+}
+"""
+
+
+def test_extract_ctrl_rows_folds_suffixed_define():
+    active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_DEFINE_SRC))
+    fab = x.extract_ctrl_rows(active, x.collect_defines(active))
+    assert fab == {"shim_col": 0, "rows": [{"row": 3, "col_lo": 0, "col_hi": 1}]}
+
+
+def test_extract_model_ctrl_row_fabric():
+    model = x.extract_model(CTRL_ROW_SRC, aie_gen=5, aiesim=False)
+    tiles = {(t["col"], t["row"]): t["type"] for t in model["tiles"]}
+    # shared spine on column 0: shim, memtile pass-through rows 1-2, cores up to
+    # the highest configured row (incl. the row-4 pass-through between A and B)
+    assert tiles[(0, 0)] == "shim"
+    assert tiles[(0, 1)] == "memtile"
+    assert tiles[(0, 2)] == "memtile"
+    assert tiles[(0, 3)] == "core"
+    assert tiles[(0, 4)] == "core"
+    assert tiles[(0, 5)] == "core"
+    # EAST-chain east tiles on each configured row
+    assert tiles[(1, 3)] == "core"
+    assert tiles[(1, 5)] == "core"
+    # forward (up) + return (down) flow per chain, dest = chain endpoint col_hi
+    dirs = {(f["src"], f["dst"], f["direction"]) for f in model["flows"]}
+    assert ((0, 0), (1, 3), "S2MM") in dirs
+    assert ((1, 3), (0, 0), "MM2S") in dirs
+    assert ((0, 0), (1, 5), "S2MM") in dirs
+    assert ((1, 5), (0, 0), "MM2S") in dirs
+    # no kernel is loaded on the control path
+    assert model["kernel_placements"] == {}
+
+
+def test_ctrl_row_entry_fn():
+    model = x.extract_model(CTRL_ROW_SRC, aie_gen=5, aiesim=False)
+    assert model["entry_fn"] == "run_ctrlrow_demo"
+    doc = x.build_dfschedule(model, aie_gen=5)
+    assert doc["host_entry_fn"] == "run_ctrlrow_demo"

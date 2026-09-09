@@ -23,6 +23,11 @@ def eval_int(expr, defs):
             e = re.sub(r"\b%s\b" % re.escape(name), "(%s)" % str(val), e)
         if e == prev:
             break
+    # Strip C integer suffixes on numeric literals (0u, 3UL, 0x10u). These ride
+    # in through macro bodies (#define DEMO_SHIM_COL 0u), so they must be removed
+    # AFTER substitution, not only from a raw literal. Scoped to digit-led tokens
+    # so identifiers (e.g. buf2u) are untouched.
+    e = re.sub(r"\b(0[xX][0-9a-fA-F]+|\d+)[uUlL]+\b", r"\1", e)
     if re.search(r"[A-Za-z_]", e):
         return None
     try:
@@ -123,6 +128,17 @@ RE_CTRL_CALL = re.compile(
     r"__Runtime_ctrl_(?:read|push)_target\s*\(\s*[^,]+,\s*"
     r"([^,]+),\s*([^,]+),\s*([^,]+),")
 
+# Row-control fabric (design: 2026-09-08-row-control-connection). One
+# __Runtime_ctrl_row_open(fab, dev, shim_col, ...) picks the shared spine (shim)
+# column; each __Runtime_ctrl_row_add(fab, row, col_lo, col_hi) adds one EAST
+# chain rooted on the spine. Only the leading positional args are captured
+# (later args carry casts like (uint8_t) whose inner ')' would break a balanced
+# match), which is all the tile/routing model needs.
+RE_ROW_OPEN = re.compile(
+    r"__Runtime_ctrl_row_open\s*\(\s*[^,]+,\s*[^,]+,\s*([^,]+),")
+RE_ROW_ADD = re.compile(
+    r"__Runtime_ctrl_row_add\s*\(\s*[^,]+,\s*([^,]+),\s*([^,]+),\s*([^,)]+)\)")
+
 
 def collect_defines(src):
     """Object-like #define NAME body -> {name: body}."""
@@ -179,6 +195,35 @@ def extract_ctrl_sends(active, defs):
     return sends
 
 
+def extract_ctrl_rows(active, defs):
+    """Reduce a row-control fabric to {shim_col, rows:[{row,col_lo,col_hi}]}.
+
+    The single __Runtime_ctrl_row_open gives the shared spine (shim) column; each
+    __Runtime_ctrl_row_add adds one EAST chain. Chains are deduped by
+    (row,col_lo,col_hi) so an idempotent re-add collapses. Returns None when no
+    fabric is opened (or its shim column can't be folded); chains whose fields
+    don't fold are skipped. Values fold through @defs, tolerating u/l suffixes."""
+    mo = RE_ROW_OPEN.search(active)
+    if not mo:
+        return None
+    shim_col = _ctrl_int(mo.group(1), defs)
+    if shim_col is None:
+        return None
+    rows, seen = [], set()
+    for m in RE_ROW_ADD.finditer(active):
+        row = _ctrl_int(m.group(1), defs)
+        col_lo = _ctrl_int(m.group(2), defs)
+        col_hi = _ctrl_int(m.group(3), defs)
+        if row is None or col_lo is None or col_hi is None:
+            continue
+        key = (row, col_lo, col_hi)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"row": row, "col_lo": col_lo, "col_hi": col_hi})
+    return {"shim_col": shim_col, "rows": rows}
+
+
 def strip_comments(src):
     """Drop C block/line comments so inline /*src=*/ notes inside XAie call
     argument lists do not break the tile-loc regexes."""
@@ -189,7 +234,7 @@ def strip_comments(src):
 
 RE_XAIE_CALL = re.compile(
     r"(XAie_(LoadElfMem|MoveData\w+|Route)|__Runtime_ctrl_setup_routing"
-    r"|__Runtime_ctrl_(read|push)_target)\b")
+    r"|__Runtime_ctrl_(read|push)_target|__Runtime_ctrl_row_\w+)\b")
 RE_FUNC_HDR = re.compile(r"([A-Za-z_]\w*)\s*\([^;]*\)\s*\{?\s*$")
 
 
@@ -287,6 +332,25 @@ def extract_model(raw_src, aie_gen, aiesim):
         shim, dst = (col, 0), (col, drow)
         flows.append({"src": shim, "dst": dst, "direction": "S2MM", "len": length})
         flows.append({"src": dst, "dst": shim, "direction": "MM2S", "len": length})
+
+    # Row-control fabric: one shared vertical spine on the shim column feeds N
+    # EAST chains (one per configured row). Enumerate the spine (shim + vertical
+    # pass-through up to the highest row) and every chain tile, then draw a
+    # forward (up) + return (down) flow to each chain endpoint (col_hi,row). The
+    # return leg is the shim-S2MM read-response drain.
+    fabric = extract_ctrl_rows(active, defs)
+    if fabric and fabric["rows"]:
+        col = fabric["shim_col"]
+        shim = (col, 0)
+        top_row = max(r["row"] for r in fabric["rows"])
+        for r in range(0, top_row + 1):
+            add_tile((col, r), ctrl_tile_type(r, aie_gen))
+        for rr in fabric["rows"]:
+            for c in range(rr["col_lo"], rr["col_hi"] + 1):
+                add_tile((c, rr["row"]), ctrl_tile_type(rr["row"], aie_gen))
+            endpoint = (rr["col_hi"], rr["row"])
+            flows.append({"src": shim, "dst": endpoint, "direction": "S2MM", "len": 4})
+            flows.append({"src": endpoint, "dst": shim, "direction": "MM2S", "len": 4})
 
     return {"tiles": tiles, "kernel_placements": kernel_placements,
             "flows": flows, "entry_fn": find_entry_fn(active)}

@@ -842,13 +842,15 @@ void __Runtime_move_data_from_tile(XAie_RoutingInstance *routing, XAie_LocType s
 // row of AIE tiles: a control packet climbs a shared vertical spine (column
 // @shim_col) to the row's left tile, then daisy-chains EAST tile-to-tile. Each
 // tile can consume at CTRL, forward EAST, or both (broadcast). Single-target
-// read / write-with-return responses drain to a fixed memtile. Adding a new row
-// reuses the shared spine. Initial tile support: core and memtile only.
+// read / write-with-return responses drain down the shared vertical spine to the
+// shim S2MM (a MemTile S2MM will not commit a sub-beat control response — see the
+// row-control ADR). Adding a new row reuses the shared spine. Initial tile
+// support: core and memtile only.
 //
 // The per-tile packet-switch derivation and the shared-spine/idempotent
 // row-add logic live in the pure planner (aie_runtime_control_plan.c). This
 // struct pairs that planner state (@spine + @book) with the XAie device and the
-// fixed memtile response sink.
+// shim S2MM response channel.
 // ---------------------------------------------------------------------------
 
 // One configured EAST chain (design §3 RowChain).
@@ -864,11 +866,7 @@ typedef struct {
     uint32_t fwd_vc;   // vertical stream channel for the forward spine
     uint32_t ret_vc;   // vertical stream channel for the return spine
 
-    XAie_LocType resp_memtile; // memtile that drains single-target responses
-    int32_t resp_s2mm_ch;      // memtile S2MM channel
-    int32_t resp_bd;           // memtile S2MM BD
-    uint32_t *resp_buf;        // response buffer (allocated on first read)
-    uint32_t resp_words;       // expected response length in words (0 => 1)
+    int32_t resp_s2mm_ch; // shim S2MM channel that drains single-target responses
 
     acr_state spine;                           // shared spine + configured rows
     acr_portbook book;                         // per-tile port booking (req #7)
@@ -881,11 +879,12 @@ typedef struct {
 // abstract port tags (acr_port) mapped here to StrmSwPortType.
 AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops);
 
-// Initialize the fabric and record the fixed memtile response sink. No HW config.
-AieRC __Runtime_ctrl_row_open(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col,
-                              XAie_LocType resp_memtile, int32_t resp_s2mm_ch, int32_t resp_bd, uint8_t ctrl_id);
+// Initialize the fabric and record the shim S2MM response channel. No HW config.
+AieRC __Runtime_ctrl_row_open(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
+                              uint8_t ctrl_id);
 
-// Tear down state and free the response buffer. Best-effort route teardown.
+// Tear down fabric state. Best-effort route teardown (partition reset clears the
+// stream switches).
 AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f);
 
 // Configure one EAST chain on @row spanning columns [col_lo..col_hi] (the head
@@ -900,5 +899,21 @@ AieRC __Runtime_ctrl_row_add(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t co
 // BD + channel; @log enables the per-send log. Requires a prior row_add.
 AieRC __Runtime_ctrl_row_broadcast_write(__Runtime_CtrlRowFabric *f, uint32_t tile_addr, const uint32_t *data,
                                          uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log);
+
+// Unicast a WRITE control packet to a SINGLE tile (@target_col on @row) using a
+// distinct stream id (ctrl_id^1) so only that tile consumes it: pre-target tiles
+// forward-only on a parallel MSel (arb0/msel1) added over the broadcast chain,
+// the target consumes at CTRL. Fire-and-forget (block=0). Requires a prior
+// __Runtime_ctrl_row_add for @row and @target_col within its span.
+AieRC __Runtime_ctrl_row_unicast_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t target_col, uint32_t tile_addr,
+                                       const uint32_t *data, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log);
+
+// Unicast a READ control packet to a SINGLE tile (@target_col on @row) and drain
+// the write-with-return response down the shared vertical spine to the shim S2MM
+// (FoT-on-TLAST). Blocks on the shim drain, then copies @nwords data words into
+// @out (per-access stream header stripped). Requires a prior
+// __Runtime_ctrl_row_add for @row and @target_col within its span.
+AieRC __Runtime_ctrl_row_unicast_read(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t target_col, uint32_t tile_addr,
+                                      uint32_t *out, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log);
 
 #endif // AIE_RUNTIME_H

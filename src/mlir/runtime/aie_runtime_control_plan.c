@@ -129,23 +129,38 @@ acr_rc acr_plan_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_l
     return acr_plan_chain_ex(o, b, row, col_lo, col_hi, target_col, ctrl_id, ACR_WEST);
 }
 
+/* True if @row is an already-configured chain head in @s. */
+static int acr_row_is_head(const acr_state *s, uint8_t row) {
+    for (uint8_t i = 0; i < s->nrows; i++)
+        if (s->rows[i] == row)
+            return 1;
+    return 0;
+}
+
 /* Ensure the shared vertical spine (column @shim_col) reaches @row, then build
  * the EAST chain [col_lo..col_hi] on that row. Idempotent per requirement #5:
  *   - re-adding a row already in @s->rows emits nothing;
  *   - a higher row reuses the existing spine and only extends it upward.
- * Spine hops are circuit-switched pass-through (one ACR_OP_CCT per row level,
- * SOUTH-in -> NORTH-out). @s->spine_top is the highest row that HAS a
- * pass-through hop; to feed head @row's SOUTH ingress the spine must pass
- * through rows 1..row-1, so we extend up to row-1 (NOT row itself): the head row
- * taps SOUTH into its chain and must not also be a circuit pass-through on the
- * same SOUTH slave port. A later, higher row R2 reuses rows 1..spine_top and
- * extends spine_top..R2-1; this adds the pass-through hop on any earlier head
- * that now sits below R2 (that intermediate tile then both taps SOUTH and passes
- * the spine up — a required fan-out validated by the emit layer). The chain head
- * (col_lo == shim_col) ingresses from the spine below (SOUTH); row==1 ingresses
- * directly from the shim's NORTH (no pass-through hop). The chain is built as the
- * broadcast superset so both broadcast and single-target transfers can flow;
- * per-transfer intent is carried by the control packet's tile address. */
+ * @s->spine_top is the highest row that HAS a spine-up hop; to feed head @row's
+ * SOUTH ingress the spine must pass through rows 1..row-1, so we extend up to
+ * row-1 (NOT row itself): the head row taps SOUTH into its chain and must not
+ * also drive the spine up on the same SOUTH slave port.
+ *
+ * A spine-up hop takes one of two forms depending on the tile below:
+ *   - Pure pass-through tile (NOT a configured head): circuit-switched CCT,
+ *     SOUTH-in -> NORTH-out, one ACR_OP_CCT.
+ *   - Already-configured head tile: its SOUTH ingress is a *packet* slave (feeds
+ *     arb0). HW cannot ALSO circuit-switch that same slave-port channel, so
+ *     instead of a CCT we add a packet NORTH master on arb0 that fans the spine
+ *     up. Its MSelEn carries BOTH msel0 (broadcast slot) and msel1 (unicast
+ *     slot) so broadcast and per-row unicast both climb, and it keeps the packet
+ *     header. This is the shared-head fan-out. row==1 needs no hop (fed by the
+ *     shim's NORTH directly).
+ *
+ * The chain head (col_lo == shim_col) ingresses from the spine below (SOUTH).
+ * The chain is built as the broadcast superset so both broadcast and
+ * single-target transfers can flow; per-transfer intent is carried by the
+ * control packet's tile address. */
 acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t shim_col, uint8_t row, uint8_t col_lo,
                         uint8_t col_hi, uint8_t ctrl_id) {
     if (row == 0 || row > ACR_MAX_ROWS || shim_col >= 64)
@@ -154,28 +169,45 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
         return ACR_ERR_BOUNDS;
 
     /* Idempotent: already configured -> emit nothing. */
-    for (uint8_t i = 0; i < s->nrows; i++)
-        if (s->rows[i] == row)
-            return ACR_OK;
+    if (acr_row_is_head(s, row))
+        return ACR_OK;
 
     if (s->nrows >= ACR_MAX_ROWS)
         return ACR_ERR_BOUNDS;
 
-    /* Extend the spine's pass-through hops up to row-1 (the head row taps SOUTH,
-     * it is not a pass-through). row==1 needs none (fed by the shim's NORTH). */
+    /* Extend the spine's up-hops to row-1 (the head row taps SOUTH, it is not a
+     * spine-up hop). row==1 needs none (fed by the shim's NORTH). */
     uint8_t need_top = (uint8_t)(row - 1);
     if (need_top > s->spine_top) {
         for (uint8_t r = (uint8_t)(s->spine_top + 1); r <= need_top; r++) {
-            acr_op cct = {.kind = ACR_OP_CCT,
-                          .col = shim_col,
-                          .row = r,
-                          .sport = ACR_SOUTH,
-                          .sidx = 0,
-                          .mport = ACR_NORTH,
-                          .midx = 0};
-            acr_rc rc = acr_emit_op(o, &cct);
-            if (rc != ACR_OK)
-                return rc;
+            acr_rc rc;
+            if (acr_row_is_head(s, r)) {
+                /* Shared head: fan the spine up with a packet NORTH master on
+                 * arb0 (msel0|msel1, keep header) instead of a circuit CCT. */
+                if ((rc = acr_book_port(b, shim_col, r, ACR_NORTH, 0, /*master*/ 1)) != ACR_OK)
+                    return rc;
+                acr_op north = {.kind = ACR_OP_MASTER_EN,
+                                .col = shim_col,
+                                .row = r,
+                                .mport = ACR_NORTH,
+                                .midx = 0,
+                                .msel = 0,
+                                .arbiter = 0,
+                                .mselen = (uint8_t)((1u << 0) | (1u << 1)),
+                                .keep_header = 1};
+                if ((rc = acr_emit_op(o, &north)) != ACR_OK)
+                    return rc;
+            } else {
+                acr_op cct = {.kind = ACR_OP_CCT,
+                              .col = shim_col,
+                              .row = r,
+                              .sport = ACR_SOUTH,
+                              .sidx = 0,
+                              .mport = ACR_NORTH,
+                              .midx = 0};
+                if ((rc = acr_emit_op(o, &cct)) != ACR_OK)
+                    return rc;
+            }
         }
         s->spine_top = need_top;
     }
