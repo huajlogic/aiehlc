@@ -3615,6 +3615,63 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
     return XAIE_OK;
 }
 
+/* Map an abstract planner port tag to the XAie StrmSwPortType. */
+static StrmSwPortType rt_acr_port(acr_port p) {
+    switch (p) {
+    case ACR_WEST:
+        return WEST;
+    case ACR_EAST:
+        return EAST;
+    case ACR_NORTH:
+        return NORTH;
+    case ACR_SOUTH:
+        return SOUTH;
+    case ACR_CTRL:
+    default:
+        return CTRL;
+    }
+}
+
+/* Translate one pure-planner op list into XAie stream-switch calls. Slot/slave/
+ * master enables realize the packet-switch taps; CCT enables realize circuit
+ * pass-through hops. Returns the first non-XAIE_OK result, logging the tile. */
+AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops) {
+    for (int i = 0; i < ops->n; i++) {
+        const acr_op *op = &ops->ops[i];
+        XAie_LocType loc = XAie_TileLoc(op->col, op->row);
+        AieRC rc = XAIE_OK;
+        switch (op->kind) {
+        case ACR_OP_SLOT: {
+            XAie_Packet pkt = XAie_PacketInit(op->pkt_id, 0U);
+            rc = XAie_StrmPktSwSlaveSlotEnable(dev, loc, rt_acr_port(op->sport), op->sidx, op->slot, pkt, op->mask,
+                                               op->msel, op->arbiter);
+            break;
+        }
+        case ACR_OP_SLAVE_EN:
+            rc = XAie_StrmPktSwSlavePortEnable(dev, loc, rt_acr_port(op->sport), op->sidx);
+            break;
+        case ACR_OP_MASTER_EN: {
+            XAie_StrmSwPktHeader drop = op->keep_header ? XAIE_SS_PKT_DONOT_DROP_HEADER : XAIE_SS_PKT_DROP_HEADER;
+            rc =
+                XAie_StrmPktSwMstrPortEnable(dev, loc, rt_acr_port(op->mport), op->midx, drop, op->arbiter, op->mselen);
+            break;
+        }
+        case ACR_OP_CCT:
+            rc = XAie_StrmConnCctEnable(dev, loc, rt_acr_port(op->sport), op->sidx, rt_acr_port(op->mport), op->midx);
+            break;
+        default:
+            rc = XAIE_INVALID_ARGS;
+            break;
+        }
+        if (rc != XAIE_OK) {
+            printf("[aie_runtime] ctrl_row: op[%d] kind=%d tile(%u,%u) rc=%d\n", i, (int)op->kind, (unsigned)op->col,
+                   (unsigned)op->row, (int)rc);
+            return rc;
+        }
+    }
+    return XAIE_OK;
+}
+
 /**
  * Arm the shim S2MM channel to drain the returning control-packet response into
  * c->token (c->resp_words 32-bit words, min 1) using a distinct in-range shim BD

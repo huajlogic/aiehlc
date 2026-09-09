@@ -19,6 +19,7 @@ extern "C" {
 #include <stdio.h>
 #include <string.h>
 // #include <stdint.h>
+#include "aie_runtime_control_plan.h"
 
 // Runtime structures wrapping XAie types
 typedef struct {
@@ -833,5 +834,58 @@ void __Runtime_move_data_to_tile(XAie_RoutingInstance *routing, XAie_LocType shi
 
 void __Runtime_move_data_from_tile(XAie_RoutingInstance *routing, XAie_LocType src_tile, XAie_LocType shim_tile,
                                    XAie_MemInst *mem, uint32_t tile_offset, uint32_t size);
+
+// ---------------------------------------------------------------------------
+// Row-based control connection (design: 2026-09-08-row-control-connection).
+//
+// A stateful fabric that configures a control connection across a horizontal
+// row of AIE tiles: a control packet climbs a shared vertical spine (column
+// @shim_col) to the row's left tile, then daisy-chains EAST tile-to-tile. Each
+// tile can consume at CTRL, forward EAST, or both (broadcast). Single-target
+// read / write-with-return responses drain to a fixed memtile. Adding a new row
+// reuses the shared spine. Initial tile support: core and memtile only.
+//
+// The per-tile packet-switch derivation and the shared-spine/idempotent
+// row-add logic live in the pure planner (aie_runtime_control_plan.c). This
+// struct pairs that planner state (@spine + @book) with the XAie device and the
+// fixed memtile response sink.
+// ---------------------------------------------------------------------------
+
+// One configured EAST chain (design §3 RowChain).
+typedef struct {
+    uint8_t row;            // AIE row of this chain
+    uint8_t col_lo, col_hi; // inclusive column span built on this row
+} __Runtime_CtrlRowChain;
+
+typedef struct {
+    XAie_DevInst *dev; // partitioned device instance
+    uint8_t shim_col;  // vertical spine column (= row left edge)
+    uint8_t ctrl_id;   // 5-bit stream id used for consume-matching
+    uint32_t fwd_vc;   // vertical stream channel for the forward spine
+    uint32_t ret_vc;   // vertical stream channel for the return spine
+
+    XAie_LocType resp_memtile; // memtile that drains single-target responses
+    int32_t resp_s2mm_ch;      // memtile S2MM channel
+    int32_t resp_bd;           // memtile S2MM BD
+    uint32_t *resp_buf;        // response buffer (allocated on first read)
+    uint32_t resp_words;       // expected response length in words (0 => 1)
+
+    acr_state spine;                           // shared spine + configured rows
+    acr_portbook book;                         // per-tile port booking (req #7)
+    __Runtime_CtrlRowChain rows[ACR_MAX_ROWS]; // configured EAST chains
+    uint8_t nrows;
+} __Runtime_CtrlRowFabric;
+
+// Translate a planner op list into XAie stream-switch calls on @dev. Returns the
+// first non-XAIE_OK result, logging the offending tile. Pure-planner ops carry
+// abstract port tags (acr_port) mapped here to StrmSwPortType.
+AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops);
+
+// Initialize the fabric and record the fixed memtile response sink. No HW config.
+AieRC __Runtime_ctrl_row_open(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col,
+                              XAie_LocType resp_memtile, int32_t resp_s2mm_ch, int32_t resp_bd, uint8_t ctrl_id);
+
+// Tear down state and free the response buffer. Best-effort route teardown.
+AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f);
 
 #endif // AIE_RUNTIME_H

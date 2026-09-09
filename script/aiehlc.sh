@@ -739,6 +739,7 @@ RUNTIME_SRCS=(
     "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_debug.c"
     "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_stream_debug.c"
     "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c"
+    "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_control_plan.c"
 )
 RT_ROUTING_STUB="$(pwd)/aout/rt_routing_stub.c"
 cat > "${RT_ROUTING_STUB}" <<'EOF'
