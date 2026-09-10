@@ -12,11 +12,12 @@ Package root: `src/frontend/tvm/`.
 
 ```
 model.export_onnx()            scaled ResNet (torch.nn) ─► ONNX
-  └─ relay_import.import_relay  ONNX ─► Relay
+  └─ relay_import.import_relay  ONNX ─► Relay (primitive, NO FuseOps)
                                (InferType, SimplifyInference[BN fold],
-                                FoldConstant, FuseOps, InferType)
-       └─ walk.build_plan       fused graph ─► LayerOp launch plan
-                               (validated against model.layer_plan())
+                                FoldConstant, InferType)
+       └─ walk.build_plan       primitive graph ─► LayerOp launch plan
+                               (recover_primitives → fuse_primitives,
+                                validated against model.layer_plan())
             └─ _compiler.compile_plan   each launch ─► run_aie_pipeline
                                         (host.cc / kernel.cc / routing.cc / …)
             └─ _compiler.cpu_reference  bit-exact numpy oracle for verification
@@ -33,7 +34,7 @@ extension the CPU reference and plan recovery still work, only `compile_plan` /
 |----------|-------|---------------------------------------|-------|
 | **aiehlc** (C++) | C++ using `aie::SpatialPolicy` NTTP + Clang AST | `AieFrontEnd.cc` builds routing IR directly in-process | General GEMM / conv2d; `DmaTransform` / `Conv2dSpace`-derived im2col |
 | **aietriton** (Python) | `@aie_triton.jit` GEMM kernel | AST parse → tensor specs + C body → `_aietriton_core.run_aie_pipeline` | Single-kernel GEMM |
-| **tvm** (Python) | scaled ResNet-18 via ONNX → Relay | fused-graph walk → per-launch tensor specs + C body → `_aietriton_core.run_aie_pipeline` | Multi-launch CNN forward pass (~29 launches) |
+| **tvm** (Python) | scaled ResNet-18 via ONNX → Relay | primitive walk + our-fusion → per-launch tensor specs + C body → `_aietriton_core.run_aie_pipeline` | Multi-launch CNN forward pass (~29 launches) |
 
 The TVM frontend is **pipeline-internal** exactly like `aietriton`: it reuses the
 same compiled `_aietriton_core` pybind extension (imported as
@@ -61,40 +62,57 @@ ImageNet ResNet in `example/model/resnet18py`.
 then a `Sequential` pass pipeline:
 
 ```
-InferType → SimplifyInference → FoldConstant → FuseOps → InferType
+InferType → SimplifyInference → FoldConstant → InferType
 ```
 
-`SimplifyInference` folds BatchNorm into `multiply` + `add` (scale/shift), so a
-conv "block" in the fused graph is `conv2d → multiply → add [→ relu]`. `FuseOps`
-wraps ops in inner functions. `tvm_available()` / `onnx_available()` gate the
-optional path.
+`SimplifyInference` folds BatchNorm into `multiply` + `add` (scale/shift). We
+**deliberately drop `FuseOps`** so the imported graph is left in *primitive*
+form (top-level `nn.conv2d`, `multiply`, `add`, `nn.relu`, …) — fusion is done by
+our own pass in `walk.py` (below), so the frontend tolerates any TVM grouping.
+`tvm_available()` / `onnx_available()` gate the optional path. See the design doc
+`docs/plans/2026-09-09-aiegraph-primitive-fusion-offload-design.md`.
 
-## Fused-graph walk (walk.py)
+## Primitive walk + our-fusion (walk.py)
 
-`build_plan(onnx_path, strict)` walks the fused `IRModule` with a
-`relay.ExprVisitor` (`recover_signatures`) and maps op patterns to AIE launches:
+Because the import no longer fuses, `walk.py` runs two passes:
 
-| Relay pattern (after SimplifyInference)             | AIE launch          |
+1. **`recover_primitives(onnx_path)`** — walks the flat graph with a
+   `relay.ExprVisitor` and emits a *tagged* primitive stream in dataflow order.
+   The key discriminator: a BN `multiply`/`add` has exactly one `relay.Constant`
+   operand, while a residual `add(tensorA, tensorB)` has none. Tags:
+   `conv2d(H,W,Cin,Cout,K,stride)`, `bn_mul`, `bn_add`, `res_add`, `relu`, `gap`,
+   `dense(channels,nclass)`, and `bias_add` (a const `add` seen after a `dense`).
+
+2. **`fuse_primitives(prims)`** — OUR greedy fusion pass, grouping the stream
+   into the four fused `LayerOp` kinds:
+
+| Primitive window                                    | AIE launch          |
 |-----------------------------------------------------|---------------------|
-| `nn.conv2d` + folded BN `multiply`/`add` + `nn.relu` | `conv_bn_relu`      |
-| `nn.conv2d` + folded BN `multiply`/`add`            | `conv_bn`           |
-| `add` + `nn.relu` (residual join)                   | `residual_add_relu` |
-| `nn.global_avg_pool2d` + `nn.dense` (+ bias)        | `avgpool_fc`        |
+| `conv2d` [`bn_mul`] [`bn_add`] `relu`               | `conv_bn_relu`      |
+| `conv2d` [`bn_mul`] [`bn_add`]                      | `conv_bn`           |
+| `res_add` `relu`                                    | `residual_add_relu` |
+| `gap` `dense` [`bias_add`]                          | `avgpool_fc`        |
 
 Conv geometry `(H, W, Cin, Cout, K, stride)` is recovered from the graph:
 `(Cout, Cin, K, K)` from the weight's `checked_type.shape` (OIHW), `(H, W)` from
-the input's `checked_type.shape` (NCHW), `stride` from `attrs.strides[0]`.
+the input's `checked_type.shape` (NCHW), `stride` from `attrs.strides[0]`, and
+carried onto the fused `LayerOp`.
 
 **Why the walk validates rather than rebuilds.** Recovering the *buffer wiring*
-(which scratch buffer feeds which launch) and the residual element counts from a
-fused graph is fragile, and `model.layer_plan()` already encodes that wiring in a
-hand-verified form. So the walk recovers the *structural* op sequence from the
-real graph and **validates** it against the canonical plan's structure
-(`validate_against_canonical`: ordered conv geometry, residual count, GAP+dense
-presence); on a match it returns the canonical plan (buffer wiring intact). If
-TVM is unavailable or the structure diverges it falls back to the canonical plan
-(or raises when `strict=True`). This keeps the frontend a genuine TVM-driven path
-while staying bit-exact with the verified reference.
+(which scratch buffer feeds which launch) and the residual element counts from
+the graph is fragile, and `model.layer_plan()` already encodes that wiring in a
+hand-verified form. So `build_plan(onnx_path, strict)` runs
+`recover_primitives` → `fuse_primitives` to get the *structural* op sequence, then
+**validates** it against the canonical plan (`validate_fused_against_canonical`:
+ordered conv geometry, residual count, `avgpool_fc` presence); on a match it
+returns the canonical plan (buffer wiring intact). If TVM is unavailable or the
+structure diverges it falls back to the canonical plan (or raises when
+`strict=True`). This keeps the frontend a genuine TVM-driven path while staying
+bit-exact with the verified reference.
+
+Offload is unchanged: `_compiler.compile_plan_via_aiegraph` dispatches each op by
+`cpu_codegen.is_aie_op` (conv family → AIE, rest → CPU C) and now prints a
+per-launch `[tvm-offload] launch NN <op> -> AIE|CPU` transparency line.
 
 ## Kernel bodies (kernels.py)
 
@@ -380,7 +398,7 @@ AIE code.
 |------|------|
 | `model.py` | scaled ResNet (torch) + ONNX export + canonical `layer_plan()` + param buffers |
 | `relay_import.py` | ONNX → Relay import + optimisation passes; `tvm_available()` |
-| `walk.py` | fused-graph `ExprVisitor` → `LayerOp` plan; validates vs canonical |
+| `walk.py` | primitive `ExprVisitor` (`recover_primitives`) + our-fusion (`fuse_primitives`) → `LayerOp` plan; validates vs canonical |
 | `kernels.py` | raw-C bodies for the 4 kernels (int8/int16 Q7 math) |
 | `_compiler.py` | tensor specs + `run_aie_pipeline` glue; bit-exact numpy CPU reference; im2col DMA helper; AIE-vs-CPU emit dispatch |
 | `cpu_codegen.py` | TVM `target="c"` CPU fallback for non-conv ops (bit-exact TE transcription of the Q7 oracle) |
