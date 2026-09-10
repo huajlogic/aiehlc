@@ -2,33 +2,39 @@
 # Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 ###############################################################################
-"""Walk the fused Relay graph and recover the AIE launch plan.
+"""Walk the primitive Relay graph and recover the AIE launch plan.
 
-``build_plan(onnx_path)`` runs the ONNX -> Relay import pipeline
-(``relay_import.import_relay``) and walks the fused ``IRModule`` to recover the
-per-tile launch sequence, returning a ``model.LayerOp`` list.
+``relay_import.import_relay`` no longer runs ``FuseOps``, so the imported graph
+is left in *primitive* form (top-level ``nn.conv2d``, ``multiply``, ``add``,
+``nn.relu``, ...). Fusion is OUR job here:
+
+  ``recover_primitives(onnx_path)`` walks the flat graph and emits a tagged
+  primitive stream, discriminating BN ``multiply(const)``/``add(const)`` and
+  fc ``bias_add`` from a residual ``add(tensor, tensor)`` (the constant test).
+
+  ``fuse_primitives(prims)`` greedily groups that stream into the four fused
+  ``model.LayerOp`` kinds.
 
 Mapping (plan Step 3 op-mapping table)::
 
     nn.conv2d (+ folded BN multiply/add) + nn.relu   -> conv_bn_relu
     nn.conv2d (+ folded BN multiply/add)             -> conv_bn
-    add + nn.relu   (residual join)                  -> residual_add_relu
+    add(tensor,tensor) + nn.relu   (residual join)   -> residual_add_relu
     nn.global_avg_pool2d + nn.dense (+ bias)         -> avgpool_fc
 
 After ``SimplifyInference`` the BatchNorm folds into ``multiply`` + ``add``
-(scale/shift), so a conv "block" in the fused graph is
-``conv2d -> multiply -> add [-> relu]``. The ReLU presence is what distinguishes
-``conv_bn_relu`` from ``conv_bn``.
+(scale/shift); the ReLU presence is what distinguishes ``conv_bn_relu`` from
+``conv_bn``.
 
 Recovering the *buffer wiring* (which scratch buffer feeds which launch) and the
-residual element counts from a fused graph is fragile, and ``model.layer_plan()``
-already encodes that wiring in a hand-verified form. So the walk's job is to
-recover the *structural* op sequence from the real graph and **validate** it
-against the canonical plan's structure (``LayerOp.signature()``); on a match it
-returns the canonical plan (buffer wiring intact), and if TVM is unavailable or
-the structure diverges it falls back to the canonical plan as well. This keeps
-the frontend a genuine TVM-driven path while staying bit-exact with the verified
-reference.
+residual element counts from the graph is fragile, and ``model.layer_plan()``
+already encodes that wiring in a hand-verified form. So ``build_plan`` recovers
+the *structural* op sequence from the real graph and **validates** it against
+the canonical plan (``validate_fused_against_canonical``); on a match it returns
+the canonical plan (buffer wiring intact), and if TVM is unavailable or the
+structure diverges it falls back to the canonical plan as well (unless
+``strict``). This keeps the frontend a genuine TVM-driven path while staying
+bit-exact with the verified reference.
 """
 
 from typing import List, Tuple
@@ -54,48 +60,6 @@ def _feature_hw(call) -> Tuple[int, int]:
     """Input spatial (H, W) of a conv Call from arg[0]'s checked_type (NCHW)."""
     ishape = [int(x) for x in call.args[0].checked_type.shape]
     return ishape[2], ishape[3]
-
-
-def recover_signatures(onnx_path: str) -> List[tuple]:
-    """Walk the fused Relay graph; return the recovered ``signature()`` list.
-
-    Raises ``RuntimeError`` if TVM/onnx are unavailable.
-    """
-    import tvm
-    from tvm import relay
-
-    mod, _params = import_relay(onnx_path, input_name="input",
-                               input_shape=(1, model.INPUT_C, model.INPUT_H, model.INPUT_W))
-
-    sigs: List[tuple] = []
-
-    class _Walker(relay.ExprVisitor):
-        def visit_call(self, call):
-            # Post-order: visit inputs first so ops append in dataflow order.
-            for a in call.args:
-                self.visit(a)
-            name = getattr(call.op, "name", "")
-            if name == "nn.conv2d":
-                cin, cout, k, stride = _conv_signature(call)
-                h, w = _feature_hw(call)
-                # ReLU vs no-ReLU is decided by the consuming op; recorded as a
-                # provisional conv_bn, upgraded to conv_bn_relu below if a relu
-                # consumes this block. Here we only capture geometry.
-                sigs.append(("conv2d", h, w, cin, cout, k, stride))
-            elif name == "nn.relu":
-                sigs.append(("relu",))
-            elif name == "add":
-                sigs.append(("add",))
-            elif name == "nn.global_avg_pool2d":
-                sigs.append(("gap",))
-            elif name == "nn.dense":
-                wshape = [int(x) for x in call.args[1].checked_type.shape]
-                sigs.append(("dense", wshape[1], wshape[0]))  # (channels, nclass)
-
-    # FuseOps wraps ops in inner functions; walk the whole module body.
-    main = mod["main"]
-    _Walker().visit(main)
-    return sigs
 
 
 def _is_const(expr) -> bool:
@@ -233,17 +197,18 @@ def build_plan(onnx_path: str = None, strict: bool = False) -> List[LayerOp]:
         return canonical
 
     try:
-        recovered = recover_signatures(onnx_path)
+        prims = recover_primitives(onnx_path)
+        fused = fuse_primitives(prims)
     except Exception as e:  # pragma: no cover - import/shape edge cases
         if strict:
             raise
         return canonical
 
-    ok = validate_against_canonical(recovered, canonical)
+    ok = validate_fused_against_canonical(fused, canonical)
     if not ok and strict:
         raise RuntimeError(
-            "Relay-walk structure does not match the canonical plan:\n"
-            f"  recovered convs: {[s for s in recovered if s[0] == 'conv2d']}")
+            "Fused-primitive structure does not match the canonical plan:\n"
+            f"  recovered ops: {[op.op for op in fused]}")
     return canonical
 
 
@@ -279,26 +244,25 @@ def build_aiegraph_plan(onnx_path: str = None, strict: bool = False
     return annotate_quant(build_plan(onnx_path, strict), onnx_path)
 
 
-def validate_against_canonical(recovered: List[tuple],
-                               canonical: List[LayerOp]) -> bool:
-    """True iff the graph-recovered conv geometry matches the canonical plan.
+def validate_fused_against_canonical(fused: List[LayerOp],
+                                     canonical: List[LayerOp]) -> bool:
+    """True iff the fused op sequence matches the canonical plan structurally.
 
     We compare the ordered (H, W, Cin, Cout, K, stride) of every conv, which is
-    the robust, graph-derivable structural invariant. Residual/GAP/FC presence
-    is checked by count.
+    the robust, graph-derivable structural invariant. Residual/FC presence is
+    checked by count/presence.
     """
-    rec_convs = [s[1:] for s in recovered if s[0] == "conv2d"]
+    rec_convs = [(op.H, op.W, op.Cin, op.Cout, op.K, op.stride)
+                 for op in fused if op.op in ("conv_bn_relu", "conv_bn")]
     can_convs = [(op.H, op.W, op.Cin, op.Cout, op.K, op.stride)
                  for op in canonical if op.op in ("conv_bn_relu", "conv_bn")]
     if rec_convs != can_convs:
         return False
-    rec_adds = sum(1 for s in recovered if s[0] == "add")
+    rec_res = sum(1 for op in fused if op.op == "residual_add_relu")
     can_res = sum(1 for op in canonical if op.op == "residual_add_relu")
-    if rec_adds < can_res:
+    if rec_res < can_res:
         return False
-    has_gap = any(s[0] == "gap" for s in recovered)
-    has_dense = any(s[0] == "dense" for s in recovered)
     has_fc = any(op.op == "avgpool_fc" for op in canonical)
-    if has_fc and not (has_gap and has_dense):
+    if has_fc and not any(op.op == "avgpool_fc" for op in fused):
         return False
     return True

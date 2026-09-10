@@ -606,6 +606,21 @@ def test_fuse_primitives_conv_geometry():
     print("PASS test_fuse_primitives_conv_geometry")
 
 
+def test_build_plan_via_fusion_matches_canonical():
+    """build_plan (now primitive-walk + fuse) still yields the canonical plan."""
+    if not tvm_available() or not onnx_available():
+        print("SKIP test_build_plan_via_fusion (no tvm/onnx)")
+        return
+    from frontend.tvm import walk
+    onnx_path = os.path.join(_HERE, "_plan_fuse.onnx")
+    model.export_onnx(onnx_path)
+    plan = walk.build_plan(onnx_path, strict=True)  # strict: must match, no fallback
+    canonical = model.layer_plan()
+    assert [op.op for op in plan] == [op.op for op in canonical]
+    os.remove(onnx_path)
+    print("PASS test_build_plan_via_fusion")
+
+
 def _main():
     tests = [
         ("cpu_reference == triton reference", test_cpu_reference_matches_triton),
@@ -628,6 +643,7 @@ def _main():
         ("recover primitives (if tvm/onnx)", test_recover_primitives),
         ("fuse primitives structure", test_fuse_primitives_structure),
         ("fuse primitives conv geometry", test_fuse_primitives_conv_geometry),
+        ("build_plan via fusion (if tvm/onnx)", test_build_plan_via_fusion_matches_canonical),
     ]
     print(f"TVM available: {tvm_available()}   onnx available: {onnx_available()}")
     logits, _ = cpu_reference()
