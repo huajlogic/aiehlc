@@ -621,6 +621,19 @@ def test_build_plan_via_fusion_matches_canonical():
     print("PASS test_build_plan_via_fusion")
 
 
+def test_offload_dispatch_labels():
+    """is_aie_op labels each op's backend (pure predicate, no build needed)."""
+    plan = model.layer_plan()
+    labels = [("AIE" if cpu_codegen.is_aie_op(op.op) else "CPU") for op in plan]
+    assert "AIE" in labels and "CPU" in labels
+    for op, lab in zip(plan, labels):
+        if op.op in ("conv_bn", "conv_bn_relu"):
+            assert lab == "AIE"
+        else:
+            assert lab == "CPU"
+    print("PASS test_offload_dispatch_labels")
+
+
 def _main():
     tests = [
         ("cpu_reference == triton reference", test_cpu_reference_matches_triton),
@@ -644,6 +657,7 @@ def _main():
         ("fuse primitives structure", test_fuse_primitives_structure),
         ("fuse primitives conv geometry", test_fuse_primitives_conv_geometry),
         ("build_plan via fusion (if tvm/onnx)", test_build_plan_via_fusion_matches_canonical),
+        ("offload dispatch labels", test_offload_dispatch_labels),
     ]
     print(f"TVM available: {tvm_available()}   onnx available: {onnx_available()}")
     logits, _ = cpu_reference()

@@ -320,6 +320,8 @@ def compile_plan_via_aiegraph(plan: Optional[List[LayerOp]] = None,
         # Conv2d-family -> AIE backend; non-conv ops stay in the aiegraph IR
         # (already built + verified + lowered above) but their *runtime* code is
         # bit-exact TVM CPU C, not an AIE launch.
+        backend = "AIE" if cpu_codegen.is_aie_op(op.op) else "CPU"
+        print(f"[tvm-offload] launch {idx:02d} {op.op} -> {backend}")
         if cpu_codegen.is_aie_op(op.op):
             specs = [(list(shape), int(bits), bool(is_in))
                      for (shape, bits, is_in) in launch["tensor_specs"]]
