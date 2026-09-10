@@ -98,6 +98,69 @@ def recover_signatures(onnx_path: str) -> List[tuple]:
     return sigs
 
 
+def _is_const(expr) -> bool:
+    """True iff a Relay expr is a compile-time constant (BN scale/shift/bias)."""
+    import tvm
+    from tvm import relay
+    return isinstance(expr, relay.Constant)
+
+
+def recover_primitives(onnx_path: str) -> List[tuple]:
+    """Walk the UNFUSED Relay graph; return primitive ops in dataflow order.
+
+    Tags each recorded op so the fusion matcher can group them:
+      ("conv2d", H, W, Cin, Cout, K, stride)
+      ("bn_mul",)   multiply(x, Constant)     -> BN scale
+      ("bn_add",)   add(x, Constant)          -> BN shift
+      ("res_add",)  add(tensorA, tensorB)     -> residual join
+      ("relu",)
+      ("gap",)
+      ("dense", channels, nclass)
+      ("bias_add",) add(x, Constant) following a dense  (fc bias)
+
+    A residual add is distinguished from a BN/bias add by the constant test:
+    BN/bias adds have exactly one Constant operand; a residual add has none.
+    Raises RuntimeError if TVM/onnx are unavailable.
+    """
+    import tvm
+    from tvm import relay
+
+    mod, _params = import_relay(onnx_path, input_name="input",
+                               input_shape=(1, model.INPUT_C, model.INPUT_H, model.INPUT_W))
+    prims: List[tuple] = []
+    saw_dense = {"v": False}
+
+    class _Walker(relay.ExprVisitor):
+        def visit_call(self, call):
+            for a in call.args:
+                self.visit(a)
+            name = getattr(call.op, "name", "")
+            if name == "nn.conv2d":
+                cin, cout, k, stride = _conv_signature(call)
+                h, w = _feature_hw(call)
+                prims.append(("conv2d", h, w, cin, cout, k, stride))
+            elif name == "multiply":
+                if any(_is_const(a) for a in call.args):
+                    prims.append(("bn_mul",))
+            elif name == "add":
+                has_const = any(_is_const(a) for a in call.args)
+                if has_const:
+                    prims.append(("bias_add",) if saw_dense["v"] else ("bn_add",))
+                else:
+                    prims.append(("res_add",))
+            elif name == "nn.relu":
+                prims.append(("relu",))
+            elif name == "nn.global_avg_pool2d":
+                prims.append(("gap",))
+            elif name == "nn.dense":
+                wshape = [int(x) for x in call.args[1].checked_type.shape]
+                prims.append(("dense", wshape[1], wshape[0]))  # (channels, nclass)
+                saw_dense["v"] = True
+
+    _Walker().visit(mod["main"])
+    return prims
+
+
 # ── Plan construction ───────────────────────────────────────────────────────
 
 def build_plan(onnx_path: str = None, strict: bool = False) -> List[LayerOp]:

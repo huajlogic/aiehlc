@@ -560,6 +560,28 @@ def test_import_is_unfused():
     print("PASS test_import_is_unfused")
 
 
+def test_recover_primitives():
+    """Primitive walk records conv/mul-const/add-const/add-tensor/relu/gap/dense."""
+    if not tvm_available() or not onnx_available():
+        print("SKIP test_recover_primitives (no tvm/onnx)")
+        return
+    from frontend.tvm import walk
+    onnx_path = os.path.join(_HERE, "_plan_prims.onnx")
+    model.export_onnx(onnx_path)
+    prims = walk.recover_primitives(onnx_path)
+    kinds = [p[0] for p in prims]
+    assert "conv2d" in kinds
+    assert "bn_mul" in kinds, "BN multiply(const) must be tagged bn_mul"
+    assert "bn_add" in kinds, "BN add(const) must be tagged bn_add"
+    assert "res_add" in kinds, "residual add(tensor,tensor) must be tagged res_add"
+    assert "relu" in kinds and "gap" in kinds and "dense" in kinds
+    first_conv = next(p for p in prims if p[0] == "conv2d")
+    assert first_conv[1:] == (model.INPUT_H, model.INPUT_W, model.INPUT_C,
+                              first_conv[4], first_conv[5], first_conv[6])
+    os.remove(onnx_path)
+    print("PASS test_recover_primitives")
+
+
 def _main():
     tests = [
         ("cpu_reference == triton reference", test_cpu_reference_matches_triton),
@@ -579,6 +601,7 @@ def _main():
         ("orchestrate_plan emits driver (if built)", test_orchestrate_plan_emits_driver),
         ("orchestrate builds main.elf (if toolchain)", test_orchestrate_builds_elf),
         ("import is unfused (if tvm/onnx)", test_import_is_unfused),
+        ("recover primitives (if tvm/onnx)", test_recover_primitives),
     ]
     print(f"TVM available: {tvm_available()}   onnx available: {onnx_available()}")
     logits, _ = cpu_reference()
