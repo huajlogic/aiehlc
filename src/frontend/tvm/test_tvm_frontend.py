@@ -534,6 +534,32 @@ def test_orchestrate_builds_elf():
         assert elf and os.path.exists(elf)
 
 
+def test_import_is_unfused():
+    """After dropping FuseOps, BN multiply/add appear as top-level primitives."""
+    if not tvm_available() or not onnx_available():
+        print("SKIP test_import_is_unfused (no tvm/onnx)")
+        return
+    import tvm
+    from tvm import relay
+    from frontend.tvm.relay_import import import_relay
+    onnx_path = os.path.join(_HERE, "_plan_unfused.onnx")
+    model.export_onnx(onnx_path)
+    mod, _ = import_relay(onnx_path, input_name="input",
+                          input_shape=(1, model.INPUT_C, model.INPUT_H, model.INPUT_W))
+    names = []
+    class _V(relay.ExprVisitor):
+        def visit_call(self, call):
+            for a in call.args:
+                self.visit(a)
+            names.append(getattr(call.op, "name", ""))
+    _V().visit(mod["main"])
+    assert "nn.conv2d" in names
+    assert "multiply" in names, "BN scale should be a top-level multiply"
+    assert "add" in names, "BN shift / residual should be a top-level add"
+    os.remove(onnx_path)
+    print("PASS test_import_is_unfused")
+
+
 def _main():
     tests = [
         ("cpu_reference == triton reference", test_cpu_reference_matches_triton),
@@ -552,6 +578,7 @@ def _main():
         ("buffer graph chains producers", test_buffer_graph_chains),
         ("orchestrate_plan emits driver (if built)", test_orchestrate_plan_emits_driver),
         ("orchestrate builds main.elf (if toolchain)", test_orchestrate_builds_elf),
+        ("import is unfused (if tvm/onnx)", test_import_is_unfused),
     ]
     print(f"TVM available: {tvm_available()}   onnx available: {onnx_available()}")
     logits, _ = cpu_reference()
