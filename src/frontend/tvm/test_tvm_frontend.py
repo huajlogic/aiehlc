@@ -582,6 +582,30 @@ def test_recover_primitives():
     print("PASS test_recover_primitives")
 
 
+def test_fuse_primitives_structure():
+    """fuse_primitives groups tagged primitives into the canonical op sequence."""
+    from frontend.tvm import walk
+    prims = [
+        ("conv2d", 8, 8, 1, 8, 3, 1), ("bn_mul",), ("bn_add",), ("relu",),
+        ("conv2d", 8, 8, 8, 8, 3, 1), ("bn_mul",), ("bn_add",),        # conv_bn
+        ("res_add",), ("relu",),                                        # residual
+        ("gap",), ("dense", 8, 4), ("bias_add",),                      # avgpool_fc
+    ]
+    ops = [op.op for op in walk.fuse_primitives(prims)]
+    assert ops == ["conv_bn_relu", "conv_bn", "residual_add_relu", "avgpool_fc"]
+    print("PASS test_fuse_primitives_structure")
+
+
+def test_fuse_primitives_conv_geometry():
+    """Conv geometry is carried onto the fused LayerOp."""
+    from frontend.tvm import walk
+    prims = [("conv2d", 8, 8, 1, 8, 3, 1), ("bn_mul",), ("bn_add",), ("relu",)]
+    op = walk.fuse_primitives(prims)[0]
+    assert (op.op, op.H, op.W, op.Cin, op.Cout, op.K, op.stride) == \
+        ("conv_bn_relu", 8, 8, 1, 8, 3, 1)
+    print("PASS test_fuse_primitives_conv_geometry")
+
+
 def _main():
     tests = [
         ("cpu_reference == triton reference", test_cpu_reference_matches_triton),
@@ -602,6 +626,8 @@ def _main():
         ("orchestrate builds main.elf (if toolchain)", test_orchestrate_builds_elf),
         ("import is unfused (if tvm/onnx)", test_import_is_unfused),
         ("recover primitives (if tvm/onnx)", test_recover_primitives),
+        ("fuse primitives structure", test_fuse_primitives_structure),
+        ("fuse primitives conv geometry", test_fuse_primitives_conv_geometry),
     ]
     print(f"TVM available: {tvm_available()}   onnx available: {onnx_available()}")
     logits, _ = cpu_reference()

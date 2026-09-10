@@ -161,6 +161,59 @@ def recover_primitives(onnx_path: str) -> List[tuple]:
     return prims
 
 
+def fuse_primitives(prims: List[tuple]) -> List[LayerOp]:
+    """Greedily fuse the tagged primitive stream into fused ``LayerOp``s.
+
+    Grouping windows (left to right):
+      conv2d [bn_mul] [bn_add] relu       -> conv_bn_relu
+      conv2d [bn_mul] [bn_add]            -> conv_bn
+      res_add relu                        -> residual_add_relu
+      gap dense [bias_add]                -> avgpool_fc
+
+    Geometry is carried from the conv/dense primitive; buffer wiring (ins/out
+    names, residual length) is NOT recovered here — ``build_plan`` validates this
+    structure against the canonical plan and returns the canonical (wired) plan.
+    Placeholder buffer names keep the LayerOps constructible/inspectable.
+    """
+    ops: List[LayerOp] = []
+    i, n = 0, len(prims)
+    idx = 0
+    while i < n:
+        tag = prims[i][0]
+        if tag == "conv2d":
+            _, h, w, cin, cout, k, stride = prims[i]
+            j = i + 1
+            while j < n and prims[j][0] in ("bn_mul", "bn_add"):
+                j += 1
+            relu = j < n and prims[j][0] == "relu"
+            opname = "conv_bn_relu" if relu else "conv_bn"
+            ops.append(LayerOp(op=opname, out=f"_f{idx}", ins=[f"_i{idx}"],
+                               H=h, W=w, Cin=cin, Cout=cout, K=k, stride=stride))
+            i = j + 1 if relu else j
+        elif tag == "res_add":
+            relu = i + 1 < n and prims[i + 1][0] == "relu"
+            ops.append(LayerOp(op="residual_add_relu", out=f"_f{idx}",
+                               ins=[f"_a{idx}", f"_b{idx}"], length=0))
+            i = i + 2 if relu else i + 1
+        elif tag == "gap":
+            channels, nclass = 0, 0
+            j = i + 1
+            if j < n and prims[j][0] == "dense":
+                channels, nclass = prims[j][1], prims[j][2]
+                j += 1
+            if j < n and prims[j][0] == "bias_add":
+                j += 1
+            ops.append(LayerOp(op="avgpool_fc", out=f"_f{idx}", ins=[f"_i{idx}"],
+                               spatial_h=1, spatial_w=1,
+                               channels=channels, num_classes=nclass))
+            i = j
+        else:
+            i += 1  # stray primitive (already consumed by a window); skip
+            continue
+        idx += 1
+    return ops
+
+
 # ── Plan construction ───────────────────────────────────────────────────────
 
 def build_plan(onnx_path: str = None, strict: bool = False) -> List[LayerOp]:
