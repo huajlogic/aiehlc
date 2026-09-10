@@ -156,6 +156,7 @@ Read the matching skill when the task fits:
 | Live HW DMA stall debug | aiehwdmadebug |
 | Shim BD stuck on wrong/locked BD (index overflow into channel-control regs) | shimbdindexoverflow |
 | Sim PS.so load segfault | aiesimloaddebug |
+| aiesim live debug register socket | aiesim-debug-socket |
 | HW performance counters | aiehwprofile |
 | Raw-XAie sim debug bundle | raw-xaie-sim-debug-bundle |
 | Sim build/run separation | sim-build-run-separation |

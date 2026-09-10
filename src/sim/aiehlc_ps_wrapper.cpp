@@ -21,7 +21,12 @@
 #include <adf/wrapper/me_ip_block.h>
 #include <xtlm.h>
 #include "ioutils.h"
+#include "aiehlc_dbg_server.h"
+#include "aiehlc_dbg_protocol.h"
+#include "aie_device_map.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,6 +91,9 @@ private:
     static PSIP_aiehlc* psObj;
 
     sc_event transRspAvail;
+    sc_mutex m_axi_lock;
+    sc_event m_dbg_wake;
+    class DbgWakeChannel *m_dbg_wake_chan;
 
     void aximm_transaction(
         xtlm::xtlm_aximm_initiator_rd_socket_util& rd_util,
@@ -97,6 +105,7 @@ private:
 
     void set_payload_attr(xtlm::aximm_payload* trans, size_t transBytes);
     void main_action();
+    void debug_action();
     void response_process();
 
     template <typename T>
@@ -111,6 +120,25 @@ private:
 };
 
 PSIP_aiehlc* PSIP_aiehlc::psObj = nullptr;
+
+static std::atomic<bool> g_dbg_thread_stop{false};
+
+class DbgWakeChannel : public sc_core::sc_prim_channel {
+public:
+    DbgWakeChannel(const char *nm, sc_event &ev) : sc_core::sc_prim_channel(nm), m_ev(ev) {}
+    void wake_async() { async_request_update(); }
+protected:
+    void update() override { m_ev.notify(SC_ZERO_TIME); }
+private:
+    sc_event &m_ev;
+};
+
+static std::atomic<DbgWakeChannel *> g_dbg_wake_chan{nullptr};
+
+static void PSDbgWake() {
+    if (DbgWakeChannel *c = g_dbg_wake_chan.load())
+        c->wake_async();
+}
 
 PSIP_aiehlc::PSIP_aiehlc(sc_module_name nm)
   : IPBlock(nm)
@@ -127,7 +155,12 @@ PSIP_aiehlc::PSIP_aiehlc(sc_module_name nm)
     PS_AxiMM_Rd_Util->rd_socket.bind(PS_AxiMM_Rd);
     PS_AxiMM_Wr_Util->wr_socket.bind(PS_AxiMM_Wr);
 
+    m_dbg_wake_chan = new DbgWakeChannel("dbg_wake_chan", m_dbg_wake);
+    g_dbg_wake_chan.store(m_dbg_wake_chan);
+
     SC_THREAD(main_action);
+
+    SC_THREAD(debug_action);
 
     SC_THREAD(response_process);
     sensitive << (PS_AxiMM_Wr_Util->resp_available);
@@ -188,7 +221,9 @@ void PSIP_aiehlc::write32(uint64_t Addr, uint32_t Data) {
     trans->set_address(Addr);
     memcpy(trans->get_data_ptr(), &Data, sizeof(uint32_t));
     sc_time delay = SC_ZERO_TIME;
+    m_axi_lock.lock();
     PS_AxiMM_Wr_Util->b_transport(*trans, delay);
+    m_axi_lock.unlock();
     trans->release();
 }
 
@@ -199,7 +234,9 @@ uint32_t PSIP_aiehlc::read32(uint64_t Addr) {
     trans->set_command(xtlm::XTLM_READ_COMMAND);
     trans->set_address(Addr);
     sc_time delay = SC_ZERO_TIME;
+    m_axi_lock.lock();
     PS_AxiMM_Rd_Util->b_transport(*trans, delay);
+    m_axi_lock.unlock();
     uint32_t data = *(uint32_t*)trans->get_data_ptr();
     trans->release();
     if (getenv("AIE_SYNC_READ")) wait(10, SC_NS);
@@ -214,7 +251,9 @@ void PSIP_aiehlc::write128(uint64_t Addr, uint32_t* Data) {
     trans->set_address(Addr);
     memcpy(trans->get_data_ptr(), Data, 4 * sizeof(uint32_t));
     sc_time delay = SC_ZERO_TIME;
+    m_axi_lock.lock();
     PS_AxiMM_Wr_Util->b_transport(*trans, delay);
+    m_axi_lock.unlock();
     trans->release();
 }
 
@@ -225,7 +264,9 @@ void PSIP_aiehlc::read128(uint64_t Addr, uint32_t* Data) {
     trans->set_command(xtlm::XTLM_READ_COMMAND);
     trans->set_address(Addr);
     sc_time delay = SC_ZERO_TIME;
+    m_axi_lock.lock();
     PS_AxiMM_Rd_Util->b_transport(*trans, delay);
+    m_axi_lock.unlock();
     memcpy(Data, trans->get_data_ptr(), 4 * sizeof(uint32_t));
     trans->release();
 }
@@ -320,10 +361,56 @@ void PSIP_aiehlc::main_action() {
 
     if (const char* wd = getenv("AIE_WORK_DIR")) g_pkg_dir = wd;
 
+    aiehlc_dbg_callbacks_t dbg_cb = {PSRead32, PSWrite32, PSNpiRead32, PSNpiWrite32};
+    aiehlc_dbg_set_callbacks(&dbg_cb);
+    aiehlc_dbg_set_wake(PSDbgWake);
+    aiehlc_dbg_addr_info_t dbg_addr = {(uint64_t)XAIE_BASE_ADDR, (uint32_t)XAIE_COL_SHIFT, (uint32_t)XAIE_ROW_SHIFT,
+                                       (int)AIE_GEN};
+    aiehlc_dbg_start(&dbg_addr);
+
     CallPsMainFunction([](){ return aiehlc_ps_main(0, nullptr); });
+
+    if (aiehlc_dbg_active()) {
+        long idle_sec = 600;
+        if (const char *h = getenv(AIEHLC_DBG_ENV_HOLD_SEC))
+            idle_sec = strtol(h, nullptr, 10);
+        if (idle_sec > 0) {
+            std::cout << "IP-INFO: [" << basename() << "] AIEHLC PS holding array "
+                      << "readable; will exit after " << idle_sec << "s idle (debug socket)." << std::endl;
+            uint64_t last_count = aiehlc_dbg_service_count();
+            auto last_service = std::chrono::steady_clock::now();
+            while (true) {
+                wait(1, SC_MS);
+                uint64_t c = aiehlc_dbg_service_count();
+                if (c != last_count) {
+                    last_count = c;
+                    last_service = std::chrono::steady_clock::now();
+                }
+                if (std::chrono::steady_clock::now() - last_service >= std::chrono::seconds(idle_sec))
+                    break;
+            }
+        }
+    }
+
+    aiehlc_dbg_stop();
+    g_dbg_wake_chan.store(nullptr);
+    g_dbg_thread_stop.store(true);
+    m_dbg_wake.notify(SC_ZERO_TIME);
 
     ps_main_complete = 1;
     std::cout << "IP-INFO: [" << basename() << "] AIEHLC PS main completed." << std::endl;
+}
+
+void PSIP_aiehlc::debug_action() {
+    long poll_ns = 1000;
+    if (const char *p = getenv(AIEHLC_DBG_ENV_POLL_NS))
+        poll_ns = strtol(p, nullptr, 10);
+    if (poll_ns <= 0)
+        poll_ns = 1000;
+    while (!g_dbg_thread_stop.load()) {
+        wait(poll_ns, SC_NS, m_dbg_wake);
+        aiehlc_dbg_drain();
+    }
 }
 
 extern "C" {
