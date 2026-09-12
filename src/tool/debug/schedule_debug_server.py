@@ -5343,6 +5343,21 @@ class Handler(BaseHTTPRequestHandler):
                                  "ports": [], "edges": [], "count": 0})
                 return
             self._send_json(controlpan_pmap.parse(text))
+        elif u.path == "/ctrlplan/tile":
+            try:
+                with open(st.applog, "r", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                self._send_json({"error": f"cannot read applog: {e}",
+                                 "groups": []})
+                return
+            try:
+                col = int(body.get("col"))
+                row = int(body.get("row"))
+            except (TypeError, ValueError):
+                self._send_json({"error": "bad col/row", "groups": []})
+                return
+            self._send_json(controlpan_pmap.tile_switch_view(text, col, row))
         elif u.path == "/sim/run":
             self._send_json(st.start_sim())
         elif u.path == "/sim/stop":
