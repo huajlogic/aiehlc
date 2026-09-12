@@ -139,3 +139,36 @@ def test_tile_switch_view_splits_fwd_ret():
     )
     v = c.tile_switch_view(txt, 0, 3)
     assert {g["dir"] for g in v["groups"]} == {"fwd", "ret"}
+
+# The runtime emits one line per slot per port, so a (port,idx) recurs within a
+# group. tile_switch_view must de-dup and pick the master's routing slot.
+MULTISLOT = """
+CONTROLPAN-PMAP col=1 row=3 port=WEST idx=4 dir=fwd ms=slave  id=2 sw=pkt slot=0
+CONTROLPAN-PMAP col=1 row=3 port=WEST idx=4 dir=fwd ms=slave  id=2 sw=pkt slot=-1
+CONTROLPAN-PMAP col=1 row=3 port=EAST idx=0 dir=fwd ms=master id=2 sw=pkt slot=3
+CONTROLPAN-PMAP col=1 row=3 port=EAST idx=0 dir=fwd ms=master id=2 sw=circuit slot=-1
+"""
+
+def test_tile_switch_view_dedups_multislot():
+    v = c.tile_switch_view(MULTISLOT, 1, 3)
+    assert len(v["groups"]) == 1
+    g = v["groups"][0]
+    assert g["slaves"] == [{"port": "WEST", "idx": 4}]
+    assert len(g["masters"]) == 1 and g["masters"][0]["port"] == "EAST"
+    assert g["slot"] == 3 and g["sw"] == "pkt"
+
+# One neighbor port pair (EAST<->WEST) serves two flows with different (dir,id)
+# and different slave idx; each edge must carry its own flow's to_idx.
+SHARED = """
+CONTROLPAN-PMAP col=0 row=3 port=EAST idx=0 dir=fwd ms=master id=1 sw=pkt slot=1
+CONTROLPAN-PMAP col=1 row=3 port=WEST idx=0 dir=fwd ms=slave  id=1 sw=pkt slot=1
+CONTROLPAN-PMAP col=0 row=3 port=EAST idx=0 dir=ret ms=master id=2 sw=pkt slot=0
+CONTROLPAN-PMAP col=1 row=3 port=WEST idx=5 dir=ret ms=slave  id=2 sw=pkt slot=0
+"""
+
+def test_edges_shared_port_disambiguated_by_dir_id():
+    edges = c.parse_edges(SHARED)
+    fwd = [e for e in edges if e["dir"] == "fwd" and e["id"] == 1]
+    ret = [e for e in edges if e["dir"] == "ret" and e["id"] == 2]
+    assert fwd and fwd[0]["to_idx"] == 0
+    assert ret and ret[0]["to_idx"] == 5

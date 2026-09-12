@@ -51,14 +51,17 @@ def parse_edges(text):
     neighbor tile. CTRL master/slave are tile-local consume/emit markers (no
     edge). Returns a list of {from:[c,r], to:[c,r], dir, id, port} edges."""
     ports = parse_ports(text)
-    slaves = {(p["col"], p["row"], p["port"]): p
+    # Key slaves by (col,row,port,dir,id): one neighbor port can serve several
+    # flows (e.g. EAST<->WEST for both a fwd and a ret route), so keying on the
+    # port alone would keep only the last slave and bind the wrong to_idx.
+    slaves = {(p["col"], p["row"], p["port"], p["dir"], p["id"]): p
               for p in ports if p["ms"] == "slave"}
     edges = []
     for p in ports:
         if p["ms"] != "master" or p["port"] not in _DELTA:
             continue
         dc, dr = _DELTA[p["port"]]
-        nb = (p["col"] + dc, p["row"] + dr, _OPP[p["port"]])
+        nb = (p["col"] + dc, p["row"] + dr, _OPP[p["port"]], p["dir"], p["id"])
         if nb in slaves:
             edges.append({"from": [p["col"], p["row"]],
                           "to": [nb[0], nb[1]], "dir": p["dir"],
@@ -82,6 +85,12 @@ def tile_switch_view(text, col, row):
     its destination -- the neighbor tile "(c,r) PORT" from parse_edges, or
     "CTRL (local endpoint)" for a CTRL master, or a dash if unpaired.
 
+    The runtime emits one line per slot for a port, so the same (port,idx) can
+    recur within a group; slaves/masters are de-duplicated by (port,idx). The
+    group "slot" is the routing slot -- the largest slot>=0 among the group's
+    master ports, else the largest slot>=0 among any port, else -1; "sw" is
+    "pkt" if any port in the group is packet-switched, else "circuit".
+
     Returns {col, row, groups:[{dir,id,slot,sw,slaves:[{port,idx}],
     masters:[{port,idx,dest}]}]}.
     """
@@ -97,15 +106,29 @@ def tile_switch_view(text, col, row):
     for p in ports:
         key = (p["dir"], p["id"])
         g = groups.setdefault(key, {"dir": p["dir"], "id": p["id"],
-                                    "slot": p["slot"], "sw": p["sw"],
-                                    "slaves": [], "masters": []})
+                                    "slaves": [], "masters": [],
+                                    "_sslot": [], "_mslot": [], "_pkt": False})
+        g["_pkt"] = g["_pkt"] or (p["sw"] == "pkt")
         if p["ms"] == "slave":
-            g["slaves"].append({"port": p["port"], "idx": p["idx"]})
+            g["_sslot"].append(p["slot"])
+            if not any(s["port"] == p["port"] and s["idx"] == p["idx"]
+                       for s in g["slaves"]):
+                g["slaves"].append({"port": p["port"], "idx": p["idx"]})
         else:
+            g["_mslot"].append(p["slot"])
+            if any(m["port"] == p["port"] and m["idx"] == p["idx"]
+                   for m in g["masters"]):
+                continue
             if p["port"] == "CTRL":
                 dest = "CTRL (local endpoint)"
             else:
                 dest = dest_of.get((p["port"], p["idx"], p["dir"], p["id"]), "\u2014")
             g["masters"].append({"port": p["port"], "idx": p["idx"], "dest": dest})
+    for g in groups.values():
+        # Prefer a routing slot from the masters; fall back to any port's slot.
+        mpos = [s for s in g.pop("_mslot") if s >= 0]
+        apos = mpos + [s for s in g.pop("_sslot") if s >= 0]
+        g["slot"] = max(mpos) if mpos else (max(apos) if apos else -1)
+        g["sw"] = "pkt" if g.pop("_pkt") else "circuit"
     ordered = sorted(groups.values(), key=lambda g: (g["dir"], g["id"]))
     return {"col": col, "row": row, "groups": ordered}
