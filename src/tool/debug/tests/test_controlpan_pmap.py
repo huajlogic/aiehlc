@@ -130,8 +130,7 @@ def test_tile_switch_view_fanout():
     assert len(v["groups"]) == 1
     g = v["groups"][0]
     assert g["dir"] == "fwd" and g["id"] == 2 and g["slot"] == 1 and g["sw"] == "pkt"
-    assert g["slaves"] == [{"port": "WEST", "idx": 4,
-                            "mask": -1, "msel": -1, "arb": -1}]
+    assert g["slaves"] == [{"port": "WEST", "idx": 4}]
     ports = {m["port"]: m for m in g["masters"]}
     assert ports["CTRL"]["dest"] == "CTRL (local endpoint)"
     assert ports["EAST"]["dest"] == "(2,3) WEST"
@@ -167,14 +166,14 @@ def test_tile_switch_view_dedups_multislot():
     v = c.tile_switch_view(MULTISLOT, 1, 3)
     assert len(v["groups"]) == 1
     g = v["groups"][0]
-    assert g["slaves"] == [{"port": "WEST", "idx": 4,
-                            "mask": -1, "msel": -1, "arb": -1}]
+    assert g["slaves"] == [{"port": "WEST", "idx": 4}]
     assert len(g["masters"]) == 1 and g["masters"][0]["port"] == "EAST"
     assert g["slot"] == 3 and g["sw"] == "pkt"
 
-# A packet slot line carries (mask,msel,arb) for its slave and (msel,arb) for
-# its master. The runtime emits a bare enable line (arb=-1) plus a params line
-# (arb>=0) for the same (port,idx); the params-bearing record must win.
+# A packet slot line carries the slot config (mask,msel,arb) -- which belongs to
+# the GROUP (the slave slot), not the physical slave port -- and each master
+# carries (arb, mselen). The runtime emits a bare enable line (arb=-1) plus a
+# params line (arb>=0) for the same (port,idx); the params-bearing record wins.
 PARAMS = """
 CONTROLPAN-PMAP col=0 row=4 port=SOUTH idx=4 dir=fwd ms=slave  id=0 sw=pkt slot=0
 CONTROLPAN-PMAP col=0 row=4 port=SOUTH idx=4 dir=fwd ms=slave  id=0 sw=pkt slot=0 arb=2 msel=1 mask=31
@@ -184,10 +183,12 @@ CONTROLPAN-PMAP col=0 row=4 port=CTRL  idx=0 dir=fwd ms=master id=0 sw=pkt slot=
 def test_tile_switch_view_surfaces_packet_params():
     v = c.tile_switch_view(PARAMS, 0, 4)
     g = v["groups"][0]
-    assert g["slaves"] == [{"port": "SOUTH", "idx": 4,
-                            "mask": 31, "msel": 1, "arb": 2}]
+    # Slot config lives on the group, not the slave box.
+    assert g["slaves"] == [{"port": "SOUTH", "idx": 4}]
+    assert g["arb"] == 2 and g["msel"] == 1 and g["mask"] == 31 and g["slot"] == 0
     m = g["masters"][0]
-    assert m["port"] == "CTRL" and m["msel"] == 3 and m["arb"] == 2
+    # The master's "msel" field is really MSelEn (a bitmask), surfaced as mselen.
+    assert m["port"] == "CTRL" and m["mselen"] == 3 and m["arb"] == 2
 
 # One neighbor port pair (EAST<->WEST) serves two flows with different (dir,id)
 # and different slave idx; each edge must carry its own flow's to_idx.

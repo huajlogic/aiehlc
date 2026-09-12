@@ -6116,24 +6116,30 @@ function swDetailSvg(groups){
   };
   const link=(x1,y1,x2,y2)=>svgParts.push('<path class="swd-link" d="M'+x1+','+y1+' C'+((x1+x2)/2)+','+y1+' '+((x1+x2)/2)+','+y2+' '+x2+','+y2+'"/>');
   const esc=s=>String(s).replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
-  // Packet-routing params (only fields the port actually carries, i.e. >=0).
-  const params=(o,keys)=>keys.filter(k=>o[k]>=0).map(k=>k+'='+o[k]).join(' ');
+  const hx=v=>'0x'+(v>>>0).toString(16);
   const sub=(x,yy,txt)=>{ if(txt) svgParts.push('<text x="'+(x+9)+'" y="'+yy+'" class="swd-param">'+txt+'</text>'); };
   groups.forEach(g=>{
     const rows=Math.max(g.slaves.length, g.masters.length, 1);
     const slotY=y+(rows-1)*ROWH/2;
+    const pkt = g.arb>=0;  // packet slot config present -> mselen matching applies
     svgParts.push('<text x="'+COLX.slot+'" y="'+(slotY-BOXH/2-8)+'" class="swd-dest">'+esc(g.dir)+' id'+g.id+'</text>');
     box(COLX.slot, slotY, 'swd-slot', 'slot '+g.slot+' ('+esc(g.sw)+')');
+    // Packet-routing params live on the SLOT: arb (arbiter), msel (select),
+    // mask (id match mask). Circuit slots (arb<0) carry none.
+    if(pkt) sub(COLX.slot, slotY+BOXH/2+13, 'arb '+g.arb+' \u00b7 msel '+g.msel+' \u00b7 mask '+hx(g.mask));
     g.slaves.forEach((s,i)=>{ const sy=y+i*ROWH;
       box(COLX.slave, sy, 'swd-slave', esc(s.port)+' '+s.idx+' (slave)');
-      sub(COLX.slave, sy+BOXH/2+13, esc(params(s,['mask','msel','arb'])));
       link(COLX.slave+BOXW, sy, COLX.slot, slotY); });
     if(!g.slaves.length) box(COLX.slave, slotY, 'swd-slave', '(no slave)');
     g.masters.forEach((m,i)=>{ const my=y+i*ROWH;
       box(COLX.master, my, 'swd-master', esc(m.port)+' '+m.idx+' (master)');
       svgParts.push('<text x="'+COLX.master+'" y="'+(my+BOXH/2+13)+'" class="swd-dest">→ '+esc(m.dest)+'</text>');
-      sub(COLX.master, my+BOXH/2+26, esc(params(m,['msel','arb'])));
-      link(COLX.slot+BOXW, slotY, COLX.master, my); });
+      // A master carries (arb, mselen bitmask). It receives this slot's packets
+      // iff same arbiter and the slot's msel bit is set in mselen; only then do
+      // we draw the slot->master link (circuit groups connect unconditionally).
+      const match = !pkt || (m.arb===g.arb && ((m.mselen>>g.msel)&1));
+      if(m.arb>=0) sub(COLX.master, my+BOXH/2+26, 'arb '+m.arb+' \u00b7 mselen '+hx(m.mselen)+(match?'':' \u2717'));
+      if(match) link(COLX.slot+BOXW, slotY, COLX.master, my); });
     y += rows*ROWH + BANDPAD;
   });
   const H=y+10;

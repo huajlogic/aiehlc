@@ -95,17 +95,24 @@ def tile_switch_view(text, col, row):
 
     The runtime emits one line per slot for a port, so the same (port,idx) can
     recur within a group; slaves/masters are de-duplicated by (port,idx). The
-    group "slot" is the routing slot -- the largest slot>=0 among the group's
-    master ports, else the largest slot>=0 among any port, else -1; "sw" is
-    "pkt" if any port in the group is packet-switched, else "circuit".
+    group "slot" is the routing slot -- from the packet slave's slot config if
+    present, else the largest slot>=0 among the group's master ports, else the
+    largest slot>=0 among any port, else -1; "sw" is "pkt" if any port in the
+    group is packet-switched, else "circuit".
 
-    Each slave carries its packet-routing params (mask, msel, arb); each master
-    carries (msel, arb). A (port,idx) may recur with a params-bearing line (the
+    Per AIE stream-switch packet routing, the packet-routing params live on the
+    SLOT (configured on the slave port), not on the physical slave port: a slot
+    carries (mask, msel, arb=arbiter) and matches a packet header when
+    (id & mask) == (pkt_id & mask). Each MASTER carries (arb=arbiter, mselen),
+    where mselen is a BITMASK of accepted msel values; a master receives a
+    packet iff master.arb == slot.arb and ((master.mselen >> slot.msel) & 1).
+    So the group carries the slot config (arb/msel/mask) and each master its
+    (arb, mselen). A (port,idx) may recur with a params-bearing line (the
     SLOT/MASTER_EN line, arb>=0) and a bare enable line (arb<0); the params from
-    the record with arb>=0 win.
+    the record with arb>=0 win. The slaves themselves are just {port, idx}.
 
-    Returns {col, row, groups:[{dir,id,slot,sw,
-    slaves:[{port,idx,mask,msel,arb}], masters:[{port,idx,dest,msel,arb}]}]}.
+    Returns {col, row, groups:[{dir,id,slot,sw,arb,msel,mask,
+    slaves:[{port,idx}], masters:[{port,idx,dest,arb,mselen}]}]}.
     """
     ports = [p for p in parse_ports(text)
              if p["col"] == col and p["row"] == row]
@@ -120,37 +127,42 @@ def tile_switch_view(text, col, row):
         key = (p["dir"], p["id"])
         g = groups.setdefault(key, {"dir": p["dir"], "id": p["id"],
                                     "slaves": [], "masters": [],
-                                    "_sslot": [], "_mslot": [], "_pkt": False})
+                                    "arb": -1, "msel": -1, "mask": -1,
+                                    "_cslot": -1, "_mslot": [], "_sslot": [],
+                                    "_pkt": False})
         g["_pkt"] = g["_pkt"] or (p["sw"] == "pkt")
         if p["ms"] == "slave":
             g["_sslot"].append(p["slot"])
-            ex = next((s for s in g["slaves"]
-                       if s["port"] == p["port"] and s["idx"] == p["idx"]), None)
-            if ex is None:
-                g["slaves"].append({"port": p["port"], "idx": p["idx"],
-                                    "mask": p["mask"], "msel": p["msel"],
-                                    "arb": p["arb"]})
-            elif ex["arb"] < 0 and p["arb"] >= 0:
-                ex["mask"], ex["msel"], ex["arb"] = p["mask"], p["msel"], p["arb"]
+            # The slot config (arb/msel/mask) lives on the slave slot, not the
+            # physical port; capture it from the params-bearing line (arb>=0).
+            if p["arb"] >= 0 and g["arb"] < 0:
+                g["arb"], g["msel"], g["mask"] = p["arb"], p["msel"], p["mask"]
+                g["_cslot"] = p["slot"]
+            if not any(s["port"] == p["port"] and s["idx"] == p["idx"]
+                       for s in g["slaves"]):
+                g["slaves"].append({"port": p["port"], "idx": p["idx"]})
         else:
             g["_mslot"].append(p["slot"])
             ex = next((m for m in g["masters"]
                        if m["port"] == p["port"] and m["idx"] == p["idx"]), None)
             if ex is not None:
                 if ex["arb"] < 0 and p["arb"] >= 0:
-                    ex["msel"], ex["arb"] = p["msel"], p["arb"]
+                    ex["mselen"], ex["arb"] = p["msel"], p["arb"]
                 continue
             if p["port"] == "CTRL":
                 dest = "CTRL (local endpoint)"
             else:
                 dest = dest_of.get((p["port"], p["idx"], p["dir"], p["id"]), "\u2014")
             g["masters"].append({"port": p["port"], "idx": p["idx"], "dest": dest,
-                                 "msel": p["msel"], "arb": p["arb"]})
+                                 "mselen": p["msel"], "arb": p["arb"]})
     for g in groups.values():
-        # Prefer a routing slot from the masters; fall back to any port's slot.
+        # Prefer the slave slot config's slot; else largest master slot; else
+        # largest slot among any port.
         mpos = [s for s in g.pop("_mslot") if s >= 0]
         apos = mpos + [s for s in g.pop("_sslot") if s >= 0]
-        g["slot"] = max(mpos) if mpos else (max(apos) if apos else -1)
+        cslot = g.pop("_cslot")
+        g["slot"] = cslot if cslot >= 0 else \
+            (max(mpos) if mpos else (max(apos) if apos else -1))
         g["sw"] = "pkt" if g.pop("_pkt") else "circuit"
     ordered = sorted(groups.values(), key=lambda g: (g["dir"], g["id"]))
     return {"col": col, "row": row, "groups": ordered}

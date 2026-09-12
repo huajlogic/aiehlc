@@ -293,23 +293,31 @@ index; `linespans='SL'` for line-independent cache. Auth-gated on wide bind.
   `panelSync()`, replacing any prior switch card); the card's `wireBody` POSTs
   `/ctrlplan/tile {col,row}`, which returns
   `controlpan_pmap.tile_switch_view(text, col, row)` =
-  `{col, row, groups:[{dir, id, slot, sw, slaves:[{port,idx,mask,msel,arb}],
-  masters:[{port,idx,dest,msel,arb}]}]}` (ports on the tile grouped by `(dir,id)`:
-  slaves=switch inputs, masters=fan-out outputs, each master annotated with its
-  neighbor `(c,r) PORT` dest from `parse_edges`, `CTRL (local endpoint)` for a
-  CTRL master, or `—` if unpaired; de-duped by `(port,idx)`, group `slot` taken
-  from the largest master `slot>=0`). Each slave carries the packet-slot params
-  `mask/msel/arb` and each master carries `msel/arb` (the `arb=..msel=..mask=..`
-  fields on the applog line, default `-1` for circuit/legacy; when a `(port,idx)`
-  recurs the params-bearing record — `arb>=0` — wins). `swDetailFill` fetches the
-  groups and `swDetailSvg` draws an enlarged natural-size SVG (`#swd-host`
-  scrolls if narrower) : three columns slave→`slot N (sw)`→master with bezier
-  links (`.swd-slave` `#4a7fd4` / `.swd-slot` `#ffb300` / `.swd-master` `#e91e63`),
-  one band per group, each slave/master sub-labeled with its `.swd-param`
-  `mask/msel/arb` (packet groups only, fields `>=0`); the clicked tile is amber
-  ring-highlighted (`dmSetSwitchHi`/`dmApplySwitchHi`, cleared on normal select or
-  card close). Empty tiles render a `.swd-empty` message. Remove the card
-  via its panel-tab ×. **Enabling emission:** the C runtime emits the lines when
+  `{col, row, groups:[{dir, id, slot, sw, arb, msel, mask, slaves:[{port,idx}],
+  masters:[{port,idx,dest,arb,mselen}]}]}` (ports on the tile grouped by
+  `(dir,id)`: slaves=switch inputs, masters=fan-out outputs, each master
+  annotated with its neighbor `(c,r) PORT` dest from `parse_edges`,
+  `CTRL (local endpoint)` for a CTRL master, or `—` if unpaired; de-duped by
+  `(port,idx)`, group `slot` taken from the packet slave slot config, else the
+  largest master `slot>=0`). **Per AIE stream-switch packet routing the
+  packet-routing params live on the SLOT (configured on the slave port), not the
+  physical slave port** — so they are surfaced on the GROUP: a slot carries
+  `arb` (arbiter), `msel` (select) and `mask` (id match mask), captured from the
+  params-bearing slave line (`arb>=0`; `-1` for circuit/legacy). Each master
+  carries `arb` (arbiter) and `mselen` — a **bitmask** of accepted `msel` values
+  (the runtime emits it in the `msel=..` field of a master line). A master
+  receives this slot's packets iff `m.arb==g.arb && ((m.mselen>>g.msel)&1)`;
+  multiple matching masters on one arbiter = a legitimate multicast.
+  `swDetailFill` fetches the groups and `swDetailSvg` draws an enlarged
+  natural-size SVG (`#swd-host` scrolls if narrower): three columns
+  slave→`slot N (sw)`→master with bezier links (`.swd-slave` `#4a7fd4` /
+  `.swd-slot` `#ffb300` / `.swd-master` `#e91e63`), one band per group. The SLOT
+  box is sub-labeled `.swd-param` `arb A · msel M · mask 0xHH` (packet groups
+  only); each master is sub-labeled `arb A · mselen 0xHH` (with a `✗` if it does
+  not match this slot). A slot→master link is drawn only for matching masters
+  (circuit groups connect all). The clicked tile is amber ring-highlighted
+  (`dmSetSwitchHi`/`dmApplySwitchHi`, cleared on normal select or card close).
+  Empty tiles render a `.swd-empty` message. Remove the card via its panel-tab ×. **Enabling emission:** the C runtime emits the lines when
   `AIE_CTRL_PMAP=1` is in the environment (auto-gate, resolved once via `getenv`)
   or `__Runtime_ctrl_pmap_enable(1)` is called before the first `aie_ctrl*`
   `setup_routing` / `row_add`. Regenerate the applog with `AIE_CTRL_PMAP=1` set
