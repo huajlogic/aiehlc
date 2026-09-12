@@ -2923,19 +2923,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .ctrlplan-ctrl-lbl { font-size:7.5px; font-weight:700; fill:#ffcc66; pointer-events:none;
                        paint-order:stroke; stroke:#111; stroke-width:2.2px; stroke-linejoin:round; }
   .ctrlplan-ctrl-lbl-emit { fill:#7fe9f5; }
-  /* Enlarged stream-switch detail modal (opened by clicking a tile after a
-     control plan is loaded). Draws slave inputs -> slot node -> master fan-out. */
-  #swDetailModal { position:fixed; inset:0; z-index:200; display:none;
-    align-items:center; justify-content:center; background:rgba(0,0,0,.55); }
-  #swDetailModal.show { display:flex; }
-  #swDetailCard { background:#1c1f26; border:1px solid #3a3f4b; border-radius:8px;
-    padding:14px 16px; max-width:92vw; max-height:88vh; overflow:auto;
-    box-shadow:0 8px 30px rgba(0,0,0,.5); }
-  #swDetailCard .swd-hdr { display:flex; align-items:center; gap:10px;
-    font-size:13px; font-weight:700; color:#e4e4e4; margin-bottom:8px; }
-  #swDetailCard .swd-close { margin-left:auto; cursor:pointer; border:none;
-    background:#2a2f3a; color:#e4e4e4; border-radius:4px; padding:2px 9px; font-size:13px; }
-  #swDetailCard .swd-empty { color:#b0bec5; font-size:12px; padding:12px; }
+  /* Stream-switch connection detail (rendered into the right-side Info panel by
+     clicking a tile after a control plan is loaded). Draws slave inputs -> slot
+     node -> master fan-out; #swd-host holds the responsive SVG. */
+  #swd-host { overflow-x:auto; }
+  #swd-host .swd-svg { display:block; max-width:100%; }
+  .swd-empty { color:#b0bec5; font-size:12px; padding:8px 2px; }
   .swd-slave { fill:#4a7fd4; }
   .swd-slot  { fill:#ffb300; }
   .swd-master{ fill:#e91e63; }
@@ -3390,13 +3383,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <span id="devmap-stlegend" class="hide"></span>
     </div>
   </div>
-  <!-- Enlarged stream-switch detail: opened by clicking a tile after a control
-       plan is loaded; body is filled by showTileSwitchDetail(). -->
-  <div id="swDetailModal"><div id="swDetailCard">
-    <div class="swd-hdr"><span id="swDetailTitle">Stream switch</span>
-      <button class="swd-close" id="swDetailClose">&#10005;</button></div>
-    <div id="swDetailBody"></div>
-  </div></div>
   <!-- ── Targets panel ───────────────────────────────────────────── -->
   <div id="targetsview">
     <div id="tgt-toolbar">
@@ -6111,24 +6097,10 @@ async function loadCtrlPlan(){
   } finally { if(btn) btn.disabled = false; }
 }
 
-function swDetailClose(){ document.getElementById('swDetailModal')?.classList.remove('show'); }
-async function showTileSwitchDetail(tc, tr){
-  const modal = document.getElementById('swDetailModal');
-  const body = document.getElementById('swDetailBody');
-  const title = document.getElementById('swDetailTitle');
-  if(!modal||!body) return;
-  if(title) title.textContent = 'Stream switch ('+tc+','+tr+')';
-  body.innerHTML = 'loading…';
-  modal.classList.add('show');
-  let j;
-  try { j = await api('/ctrlplan/tile', {method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({col:tc,row:tr})}); }
-  catch(e){ body.textContent = 'error: '+e; return; }
-  if(j.error){ body.textContent = 'error: '+j.error; return; }
-  const groups = j.groups||[];
-  if(!groups.length){ body.innerHTML =
-    '<div class="swd-empty">no control-plan ports on this tile</div>'; return; }
+// Build the stream-switch SVG (slave inputs -> slot match -> master fan-out) for
+// one tile's control-plan groups. Responsive: a viewBox + width:100% so it
+// scales to the right-side Info panel width.
+function swDetailSvg(groups){
   const COLX={slave:30, slot:230, master:430}, W=760, ROWH=26, BANDPAD=18;
   let y=20, svgParts=[];
   const box=(x,yy,cls,txt)=>{
@@ -6152,8 +6124,43 @@ async function showTileSwitchDetail(tc, tr){
       link(COLX.slot+150, slotY, COLX.master, my); });
     y += rows*ROWH + BANDPAD;
   });
-  body.innerHTML = '<svg width="'+W+'" height="'+(y+10)+'" '+
-    'xmlns="http://www.w3.org/2000/svg">'+svgParts.join('')+'</svg>';
+  return '<svg class="swd-svg" viewBox="0 0 '+W+' '+(y+10)+'" width="100%" '+
+    'preserveAspectRatio="xMinYMin meet" xmlns="http://www.w3.org/2000/svg">'+
+    svgParts.join('')+'</svg>';
+}
+
+// Fetch the tile's control-plan switch view and render it into the card body's
+// #swd-host placeholder (host = the live #panel-body element passed by wireBody).
+async function swDetailFill(host, tc, tr){
+  const slot = host && host.querySelector ? host.querySelector('#swd-host') : null;
+  if(!slot) return;
+  let j;
+  try { j = await api('/ctrlplan/tile', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({col:tc,row:tr})}); }
+  catch(e){ slot.textContent = 'error: '+e; return; }
+  if(j.error){ slot.textContent = 'error: '+j.error; return; }
+  const groups = j.groups||[];
+  if(!groups.length){ slot.innerHTML =
+    '<div class="swd-empty">no control-plan ports on this tile</div>'; return; }
+  slot.innerHTML = swDetailSvg(groups);
+}
+
+// Open the tile's stream-switch connection detail as a card in the right-side
+// Info panel (replaces any prior switch card). The async fetch runs in wireBody,
+// which receives the live #panel-body once the placeholder is rendered.
+function showTileSwitchDetail(tc, tr){
+  const key = panelKey('switch', tc+','+tr);
+  const label = 'switch ('+tc+','+tr+')';
+  const llmCtx = 'control-plan stream-switch connection detail for tile ('+tc+','+tr+')';
+  panelItems.forEach((_,k)=>{ if(k.startsWith('switch:')) panelItems.delete(k); });
+  panelItems.set(key, {kind:'tile', label, color:null,
+    buildBody:()=>'<div class="sec"><div class="sec-hdr">Stream switch ('+tc+','+tr+')</div>'
+      +'<div id="swd-host"><div class="swd-empty">loading…</div></div></div>',
+    wireBody:(body)=>{ swDetailFill(body, tc, tr); },
+    llmCtx});
+  panelActiveKey = key;
+  panelSync();
 }
 
 function buildDeviceMap(){
@@ -10396,10 +10403,6 @@ function runScanNow(setMsg){
   if (clr) clr.onclick = dmClearAll;
   const lcp = document.getElementById('dmLoadCtrlPlan');
   if (lcp) lcp.onclick = loadCtrlPlan;
-  document.getElementById('swDetailClose')?.addEventListener('click', swDetailClose);
-  document.getElementById('swDetailModal')?.addEventListener('click', e=>{
-    if(e.target && e.target.id==='swDetailModal') swDetailClose(); });
-  document.addEventListener('keydown', e=>{ if(e.key==='Escape') swDetailClose(); });
   const cpTog = document.getElementById('dmCtrlPlanToggle');
   if (cpTog) cpTog.onchange = () => buildDeviceMap();
   const live = document.getElementById('dmLiveToggle');
