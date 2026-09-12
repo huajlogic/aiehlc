@@ -2935,6 +2935,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .swd-master{ fill:#e91e63; }
   .swd-lbl   { font-size:12px; fill:#e4e4e4; font-family:monospace; }
   .swd-dest  { font-size:11px; fill:#b0bec5; font-family:monospace; }
+  .swd-param { font-size:10px; fill:#90a4ae; font-family:monospace; }
   .swd-link  { stroke:#8a90a0; stroke-width:1.5; fill:none; }
   #devmap-legend { display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; font-size:10px;
                    color:rgba(228,228,228,.35); align-items:center; }
@@ -6107,7 +6108,7 @@ async function loadCtrlPlan(){
 // narrower than the diagram.
 function swDetailSvg(groups){
   const COLX={slave:20, slot:250, master:470};
-  const BOXW=175, BOXH=24, W=690, ROWH=44, BANDPAD=30;
+  const BOXW=175, BOXH=24, W=690, ROWH=54, BANDPAD=30;
   let y=30, svgParts=[];
   const box=(x,yy,cls,txt)=>{
     svgParts.push('<rect x="'+x+'" y="'+(yy-BOXH/2)+'" width="'+BOXW+'" height="'+BOXH+'" rx="5" class="'+cls+'" opacity="0.9"/>');
@@ -6115,6 +6116,9 @@ function swDetailSvg(groups){
   };
   const link=(x1,y1,x2,y2)=>svgParts.push('<path class="swd-link" d="M'+x1+','+y1+' C'+((x1+x2)/2)+','+y1+' '+((x1+x2)/2)+','+y2+' '+x2+','+y2+'"/>');
   const esc=s=>String(s).replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
+  // Packet-routing params (only fields the port actually carries, i.e. >=0).
+  const params=(o,keys)=>keys.filter(k=>o[k]>=0).map(k=>k+'='+o[k]).join(' ');
+  const sub=(x,yy,txt)=>{ if(txt) svgParts.push('<text x="'+(x+9)+'" y="'+yy+'" class="swd-param">'+txt+'</text>'); };
   groups.forEach(g=>{
     const rows=Math.max(g.slaves.length, g.masters.length, 1);
     const slotY=y+(rows-1)*ROWH/2;
@@ -6122,11 +6126,13 @@ function swDetailSvg(groups){
     box(COLX.slot, slotY, 'swd-slot', 'slot '+g.slot+' ('+esc(g.sw)+')');
     g.slaves.forEach((s,i)=>{ const sy=y+i*ROWH;
       box(COLX.slave, sy, 'swd-slave', esc(s.port)+' '+s.idx+' (slave)');
+      sub(COLX.slave, sy+BOXH/2+13, esc(params(s,['mask','msel','arb'])));
       link(COLX.slave+BOXW, sy, COLX.slot, slotY); });
     if(!g.slaves.length) box(COLX.slave, slotY, 'swd-slave', '(no slave)');
     g.masters.forEach((m,i)=>{ const my=y+i*ROWH;
       box(COLX.master, my, 'swd-master', esc(m.port)+' '+m.idx+' (master)');
       svgParts.push('<text x="'+COLX.master+'" y="'+(my+BOXH/2+13)+'" class="swd-dest">→ '+esc(m.dest)+'</text>');
+      sub(COLX.master, my+BOXH/2+26, esc(params(m,['msel','arb'])));
       link(COLX.slot+BOXW, slotY, COLX.master, my); });
     y += rows*ROWH + BANDPAD;
   });

@@ -5,19 +5,24 @@ __Runtime_ctrl_pmap_enable is on, or AIE_CTRL_PMAP is set) describes one
 programmed stream port:
 
     CONTROLPAN-PMAP col=<c> row=<r> port=<SOUTH|NORTH|CTRL|EAST|WEST> idx=<n> \
-        dir=<fwd|ret> ms=<master|slave> id=<id> sw=<pkt|circuit> slot=<n>
+        dir=<fwd|ret> ms=<master|slave> id=<id> sw=<pkt|circuit> slot=<n> \
+        arb=<n> msel=<n> mask=<n>
 
-sw/slot are optional (legacy lines default sw=circuit, slot=-1). parse_ports()
-returns the port dicts; parse_edges() pairs master ports with the slave port on
-the adjacent tile to synthesize device-map routing edges carrying the master
-hop's sw/slot and both port indices.
+sw/slot/arb/msel/mask are optional (legacy lines default sw=circuit, slot=-1 and
+arb/msel/mask=-1). arb/msel/mask are the AIE stream-switch packet-routing params:
+a packet slave slot carries (mask, msel, arbiter); a packet master port carries
+(arbiter, mselen, emitted as msel). Circuit ports emit -1 for all three.
+parse_ports() returns the port dicts; parse_edges() pairs master ports with the
+slave port on the adjacent tile to synthesize device-map routing edges carrying
+the master hop's sw/slot and both port indices.
 """
 import re
 
 _TAG = "CONTROLPAN-PMAP"
 _KV = re.compile(r"(\w+)=(\S+)")
-_INT_KEYS = ("col", "row", "idx", "id", "slot")
+_INT_KEYS = ("col", "row", "idx", "id", "slot", "arb", "msel", "mask")
 _REQUIRED = ("col", "row", "port", "idx", "dir", "ms", "id")
+_OPTIONAL = ("sw", "slot", "arb", "msel", "mask")
 
 # Master-port direction -> neighbor tile delta (col,row). AIE grid: row 0 = shim
 # at the bottom; NORTH points up (+row), SOUTH down (-row), EAST +col, WEST -col.
@@ -34,12 +39,15 @@ def parse_ports(text):
         kv = dict(_KV.findall(line[i + len(_TAG):]))
         if not set(_REQUIRED) <= set(kv):
             continue
-        # sw/slot are optional (legacy lines omit them).
+        # sw/slot/arb/msel/mask are optional (legacy lines omit them).
         kv.setdefault("sw", "circuit")
         kv.setdefault("slot", "-1")
+        kv.setdefault("arb", "-1")
+        kv.setdefault("msel", "-1")
+        kv.setdefault("mask", "-1")
         try:
             rec = {k: (int(kv[k]) if k in _INT_KEYS else kv[k])
-                   for k in _REQUIRED + ("sw", "slot")}
+                   for k in _REQUIRED + _OPTIONAL}
         except ValueError:
             continue
         ports.append(rec)
@@ -91,8 +99,13 @@ def tile_switch_view(text, col, row):
     master ports, else the largest slot>=0 among any port, else -1; "sw" is
     "pkt" if any port in the group is packet-switched, else "circuit".
 
-    Returns {col, row, groups:[{dir,id,slot,sw,slaves:[{port,idx}],
-    masters:[{port,idx,dest}]}]}.
+    Each slave carries its packet-routing params (mask, msel, arb); each master
+    carries (msel, arb). A (port,idx) may recur with a params-bearing line (the
+    SLOT/MASTER_EN line, arb>=0) and a bare enable line (arb<0); the params from
+    the record with arb>=0 win.
+
+    Returns {col, row, groups:[{dir,id,slot,sw,
+    slaves:[{port,idx,mask,msel,arb}], masters:[{port,idx,dest,msel,arb}]}]}.
     """
     ports = [p for p in parse_ports(text)
              if p["col"] == col and p["row"] == row]
@@ -111,19 +124,28 @@ def tile_switch_view(text, col, row):
         g["_pkt"] = g["_pkt"] or (p["sw"] == "pkt")
         if p["ms"] == "slave":
             g["_sslot"].append(p["slot"])
-            if not any(s["port"] == p["port"] and s["idx"] == p["idx"]
-                       for s in g["slaves"]):
-                g["slaves"].append({"port": p["port"], "idx": p["idx"]})
+            ex = next((s for s in g["slaves"]
+                       if s["port"] == p["port"] and s["idx"] == p["idx"]), None)
+            if ex is None:
+                g["slaves"].append({"port": p["port"], "idx": p["idx"],
+                                    "mask": p["mask"], "msel": p["msel"],
+                                    "arb": p["arb"]})
+            elif ex["arb"] < 0 and p["arb"] >= 0:
+                ex["mask"], ex["msel"], ex["arb"] = p["mask"], p["msel"], p["arb"]
         else:
             g["_mslot"].append(p["slot"])
-            if any(m["port"] == p["port"] and m["idx"] == p["idx"]
-                   for m in g["masters"]):
+            ex = next((m for m in g["masters"]
+                       if m["port"] == p["port"] and m["idx"] == p["idx"]), None)
+            if ex is not None:
+                if ex["arb"] < 0 and p["arb"] >= 0:
+                    ex["msel"], ex["arb"] = p["msel"], p["arb"]
                 continue
             if p["port"] == "CTRL":
                 dest = "CTRL (local endpoint)"
             else:
                 dest = dest_of.get((p["port"], p["idx"], p["dir"], p["id"]), "\u2014")
-            g["masters"].append({"port": p["port"], "idx": p["idx"], "dest": dest})
+            g["masters"].append({"port": p["port"], "idx": p["idx"], "dest": dest,
+                                 "msel": p["msel"], "arb": p["arb"]})
     for g in groups.values():
         # Prefer a routing slot from the masters; fall back to any port's slot.
         mpos = [s for s in g.pop("_mslot") if s >= 0]

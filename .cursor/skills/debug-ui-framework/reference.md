@@ -293,16 +293,22 @@ index; `linespans='SL'` for line-independent cache. Auth-gated on wide bind.
   `panelSync()`, replacing any prior switch card); the card's `wireBody` POSTs
   `/ctrlplan/tile {col,row}`, which returns
   `controlpan_pmap.tile_switch_view(text, col, row)` =
-  `{col, row, groups:[{dir, id, slot, sw, slaves:[{port,idx}],
-  masters:[{port,idx,dest}]}]}` (ports on the tile grouped by `(dir,id)`:
+  `{col, row, groups:[{dir, id, slot, sw, slaves:[{port,idx,mask,msel,arb}],
+  masters:[{port,idx,dest,msel,arb}]}]}` (ports on the tile grouped by `(dir,id)`:
   slaves=switch inputs, masters=fan-out outputs, each master annotated with its
   neighbor `(c,r) PORT` dest from `parse_edges`, `CTRL (local endpoint)` for a
   CTRL master, or `—` if unpaired; de-duped by `(port,idx)`, group `slot` taken
-  from the largest master `slot>=0`). `swDetailFill` fetches the groups and
-  `swDetailSvg` draws a responsive SVG (`viewBox` + `width:100%`) into the card's
-  `#swd-host`: three columns slave→`slot N (sw)`→master with bezier links
-  (`.swd-slave` `#4a7fd4` / `.swd-slot` `#ffb300` / `.swd-master` `#e91e63`),
-  one band per group; empty tiles render a `.swd-empty` message. Remove the card
+  from the largest master `slot>=0`). Each slave carries the packet-slot params
+  `mask/msel/arb` and each master carries `msel/arb` (the `arb=..msel=..mask=..`
+  fields on the applog line, default `-1` for circuit/legacy; when a `(port,idx)`
+  recurs the params-bearing record — `arb>=0` — wins). `swDetailFill` fetches the
+  groups and `swDetailSvg` draws an enlarged natural-size SVG (`#swd-host`
+  scrolls if narrower) : three columns slave→`slot N (sw)`→master with bezier
+  links (`.swd-slave` `#4a7fd4` / `.swd-slot` `#ffb300` / `.swd-master` `#e91e63`),
+  one band per group, each slave/master sub-labeled with its `.swd-param`
+  `mask/msel/arb` (packet groups only, fields `>=0`); the clicked tile is amber
+  ring-highlighted (`dmSetSwitchHi`/`dmApplySwitchHi`, cleared on normal select or
+  card close). Empty tiles render a `.swd-empty` message. Remove the card
   via its panel-tab ×. **Enabling emission:** the C runtime emits the lines when
   `AIE_CTRL_PMAP=1` is in the environment (auto-gate, resolved once via `getenv`)
   or `__Runtime_ctrl_pmap_enable(1)` is called before the first `aie_ctrl*`

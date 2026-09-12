@@ -3439,16 +3439,38 @@ static void rt_ctrl_dump_path_ports(const __Runtime_CtrlInstance *c) {
 }
 
 /* Control-plan provenance map (CONTROLPAN-PMAP). Opt-in via
- * __Runtime_ctrl_pmap_enable. Emits one line per programmed stream port so the
+ * __Runtime_ctrl_pmap_enable or the AIE_CTRL_PMAP env var. Emits one line per
+ * programmed stream port (with switch type + slot + packet arb/msel/mask) so the
  * aiedebug device-map can overlay the control-plan routing. */
-static int g_ctrl_pmap = 0;
-void __Runtime_ctrl_pmap_enable(int on) { g_ctrl_pmap = on; }
+static int g_ctrl_pmap = -1; /* -1 = unresolved; resolve from AIE_CTRL_PMAP on first use */
+void __Runtime_ctrl_pmap_enable(int on) { g_ctrl_pmap = on ? 1 : 0; }
+
+/* Resolve the provenance-map flag: explicit __Runtime_ctrl_pmap_enable wins;
+ * otherwise auto-enable when the AIE_CTRL_PMAP env var is set to a non-empty,
+ * non-"0" value. Resolved once and cached. */
+static int rt_ctrl_pmap_on(void) {
+    if (g_ctrl_pmap < 0) {
+        const char *e = getenv("AIE_CTRL_PMAP");
+        g_ctrl_pmap = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_ctrl_pmap;
+}
+
+/* Emit one provenance line, including the AIE stream-switch packet-routing
+ * params: a packet slave slot carries (mask, msel, arb=arbiter); a packet master
+ * port carries (msel=mselen, arb=arbiter). Pass -1 for any param a circuit port
+ * (or a bare enable line) does not carry; the parser defaults missing arb/msel/
+ * mask to -1 too, so legacy applogs stay backward compatible. */
+static void rt_pmap_port_ex(uint8_t col, uint8_t row, const char *ptype, uint8_t pidx, const char *dir, const char *ms,
+                            uint32_t id, const char *sw, int slot, int arb, int msel, int mask) {
+    if (rt_ctrl_pmap_on())
+        printf("CONTROLPAN-PMAP col=%u row=%u port=%s idx=%u dir=%s ms=%s id=%u sw=%s slot=%d arb=%d msel=%d mask=%d\n",
+               (unsigned)col, (unsigned)row, ptype, (unsigned)pidx, dir, ms, (unsigned)id, sw, slot, arb, msel, mask);
+}
 
 static void rt_pmap_port(uint8_t col, uint8_t row, const char *ptype, uint8_t pidx, const char *dir, const char *ms,
-                         uint32_t id) {
-    if (g_ctrl_pmap)
-        printf("CONTROLPAN-PMAP col=%u row=%u port=%s idx=%u dir=%s ms=%s id=%u\n", (unsigned)col, (unsigned)row, ptype,
-               (unsigned)pidx, dir, ms, (unsigned)id);
+                         uint32_t id, const char *sw, int slot) {
+    rt_pmap_port_ex(col, row, ptype, pidx, dir, ms, id, sw, slot, -1, -1, -1);
 }
 
 /**
@@ -3491,8 +3513,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                (unsigned)fport, (unsigned)vfwd, (int)rc);
         return rc;
     }
-    rt_pmap_port(shim_col, 0, "SOUTH", fport, "fwd", "slave", stream_id);
-    rt_pmap_port(shim_col, 0, "NORTH", vfwd, "fwd", "master", stream_id);
+    rt_pmap_port(shim_col, 0, "SOUTH", fport, "fwd", "slave", stream_id, "circuit", -1);
+    rt_pmap_port(shim_col, 0, "NORTH", vfwd, "fwd", "master", stream_id, "circuit", -1);
     /* Diagnostic: watch the shim forward output (NORTH master vfwd) on slot 0. */
     if (port_evt)
         (void)XAie_EventSelectStrmPort(dev, shim, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, NORTH, vfwd);
@@ -3505,8 +3527,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                    (unsigned)shim_col, (unsigned)r, (unsigned)vfwd, (int)rc);
             return rc;
         }
-        rt_pmap_port(shim_col, r, "SOUTH", vfwd, "fwd", "slave", stream_id);
-        rt_pmap_port(shim_col, r, "NORTH", vfwd, "fwd", "master", stream_id);
+        rt_pmap_port(shim_col, r, "SOUTH", vfwd, "fwd", "slave", stream_id, "circuit", -1);
+        rt_pmap_port(shim_col, r, "NORTH", vfwd, "fwd", "master", stream_id, "circuit", -1);
         /* Diagnostic: watch this hop's forward output (NORTH master vfwd) on slot 0. */
         if (port_evt)
             (void)XAie_EventSelectStrmPort(dev, thru, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, NORTH, vfwd);
@@ -3527,8 +3549,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                (unsigned)dest_row, (unsigned)vfwd, (int)rc);
         return rc;
     }
-    rt_pmap_port(shim_col, dest_row, "SOUTH", vfwd, "fwd", "slave", stream_id);
-    rt_pmap_port(shim_col, dest_row, "CTRL", 0, "fwd", "master", stream_id);
+    rt_pmap_port(shim_col, dest_row, "SOUTH", vfwd, "fwd", "slave", stream_id, "circuit", -1);
+    rt_pmap_port(shim_col, dest_row, "CTRL", 0, "fwd", "master", stream_id, "circuit", -1);
     /* Diagnostic: route the dest CTRL master port state onto select-id 0 so the
      * PORT_RUNNING_0 / PORT_IDLE_0 core events reflect whether the forward
      * control stream ever reached the CTRL port (mirrors _XAie_LoadElfSetupStrmSw
@@ -3597,8 +3619,10 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                (unsigned)dest_row, (unsigned)vret, (int)rc);
         return rc;
     }
-    rt_pmap_port(shim_col, dest_row, "CTRL", 0, "ret", "slave", stream_id);
-    rt_pmap_port(shim_col, dest_row, "SOUTH", vret, "ret", "master", stream_id);
+    rt_pmap_port_ex(shim_col, dest_row, "CTRL", 0, "ret", "slave", stream_id, "pkt", 0, (int)ctrl_arb, (int)ctrl_msel,
+                    /*mask=*/0);
+    rt_pmap_port_ex(shim_col, dest_row, "SOUTH", vret, "ret", "master", stream_id, "pkt", 0, (int)ctrl_arb,
+                    (int)ctrl_mselen, -1);
     /* Pass-through rows dest_row-1..1: NORTH slave -> SOUTH master. Signed
      * counter so the r>=1 test terminates (uint8_t would wrap). */
     for (int r = (int)dest_row - 1; r >= 1; r--) {
@@ -3609,8 +3633,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                    (unsigned)shim_col, (unsigned)r, (unsigned)vret, (int)rc);
             return rc;
         }
-        rt_pmap_port(shim_col, (uint8_t)r, "NORTH", vret, "ret", "slave", stream_id);
-        rt_pmap_port(shim_col, (uint8_t)r, "SOUTH", vret, "ret", "master", stream_id);
+        rt_pmap_port(shim_col, (uint8_t)r, "NORTH", vret, "ret", "slave", stream_id, "circuit", -1);
+        rt_pmap_port(shim_col, (uint8_t)r, "SOUTH", vret, "ret", "master", stream_id, "circuit", -1);
         /* Diagnostic: watch this hop's return output (SOUTH master vret) on slot 1. */
         if (port_evt)
             (void)XAie_EventSelectStrmPort(dev, thru, RT_CTRL_SEL_RET, XAIE_STRMSW_MASTER, SOUTH, vret);
@@ -3631,8 +3655,8 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
                (unsigned)rport, (int)rc);
         return rc;
     }
-    rt_pmap_port(shim_col, 0, "NORTH", vret, "ret", "slave", stream_id);
-    rt_pmap_port(shim_col, 0, "SOUTH", rport, "ret", "master", stream_id);
+    rt_pmap_port(shim_col, 0, "NORTH", vret, "ret", "slave", stream_id, "circuit", -1);
+    rt_pmap_port(shim_col, 0, "SOUTH", rport, "ret", "master", stream_id, "circuit", -1);
     AIEHLC_LOG(
         printf("[aie_runtime] ctrl_route ok: shim(%u,0)<->dest(%u,%u) fport=%u rport=%u vfwd=%u vret=%u sid=%u\n",
                (unsigned)shim_col, (unsigned)shim_col, (unsigned)dest_row, (unsigned)fport, (unsigned)rport,
@@ -3712,19 +3736,22 @@ AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops) {
          * aiedebug device-map can overlay the row-fabric control route. */
         switch (op->kind) {
         case ACR_OP_SLOT:
+            rt_pmap_port_ex(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op->sport, sidx), "slave",
+                            op->pkt_id, "pkt", (int)op->slot, (int)op->arbiter, (int)op->msel, (int)op->mask);
+            break;
         case ACR_OP_SLAVE_EN:
             rt_pmap_port(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op->sport, sidx), "slave",
-                         op->pkt_id);
+                         op->pkt_id, "pkt", -1);
             break;
         case ACR_OP_MASTER_EN:
-            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->mport), midx, rt_acr_dir(op->mport, midx), "master",
-                         op->pkt_id);
+            rt_pmap_port_ex(op->col, op->row, rt_acr_port_name(op->mport), midx, rt_acr_dir(op->mport, midx), "master",
+                            op->pkt_id, "pkt", -1, (int)op->arbiter, (int)op->mselen, -1);
             break;
         case ACR_OP_CCT:
             rt_pmap_port(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op->sport, sidx), "slave",
-                         op->pkt_id);
+                         op->pkt_id, "circuit", -1);
             rt_pmap_port(op->col, op->row, rt_acr_port_name(op->mport), midx, rt_acr_dir(op->mport, midx), "master",
-                         op->pkt_id);
+                         op->pkt_id, "circuit", -1);
             break;
         default:
             break;
@@ -3809,8 +3836,8 @@ static AieRC rt_ctrl_row_shim_entry(const __Runtime_CtrlRowFabric *f, int32_t mm
                (unsigned)f->shim_col, (unsigned)fport, (unsigned)RT_CTRL_VFWD, (int)rc);
         return rc;
     }
-    rt_pmap_port(f->shim_col, 0, "SOUTH", fport, "fwd", "slave", f->ctrl_id);
-    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VFWD, "fwd", "master", f->ctrl_id);
+    rt_pmap_port(f->shim_col, 0, "SOUTH", fport, "fwd", "slave", f->ctrl_id, "circuit", -1);
+    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VFWD, "fwd", "master", f->ctrl_id, "circuit", -1);
     return rc;
 }
 
@@ -4068,6 +4095,14 @@ static AieRC rt_ctrl_row_return_setup(const __Runtime_CtrlRowFabric *f, const __
                (unsigned)row, (int)rc);
         return rc;
     }
+    /* Provenance (opt-in): the target CTRL slave emits the response, then turns
+     * onto the return master (SOUTH VRET on-spine, else WEST toward the spine). */
+    rt_pmap_port_ex(target_col, row, "CTRL", 0, "ret", "slave", ret_sid, "pkt", 0, (int)rarb, (int)rmsel, /*mask=*/0);
+    if (target_col == scol)
+        rt_pmap_port_ex(target_col, row, "SOUTH", vret, "ret", "master", ret_sid, "pkt", 0, (int)rarb, (int)rmselen,
+                        -1);
+    else
+        rt_pmap_port_ex(target_col, row, "WEST", 0, "ret", "master", ret_sid, "pkt", 0, (int)rarb, (int)rmselen, -1);
     /* 2. Horizontal WEST pass-throughs (target-1 .. scol+1): EAST slave -> WEST master. */
     for (int c = (int)target_col - 1; c > (int)scol; c--) {
         rc = XAie_StrmConnCctEnable(dev, XAie_TileLoc((uint8_t)c, row), EAST, 0U, WEST, 0U);
@@ -4075,6 +4110,8 @@ static AieRC rt_ctrl_row_return_setup(const __Runtime_CtrlRowFabric *f, const __
             printf("[aie_runtime] ctrl_row_ret: west hop (%u,%u) rc=%d\n", (unsigned)c, (unsigned)row, (int)rc);
             return rc;
         }
+        rt_pmap_port((uint8_t)c, row, "EAST", 0, "ret", "slave", ret_sid, "circuit", -1);
+        rt_pmap_port((uint8_t)c, row, "WEST", 0, "ret", "master", ret_sid, "circuit", -1);
     }
     /* 3. Head turns the westbound response down onto the spine (EAST -> SOUTH VRET). */
     if (target_col != scol) {
@@ -4083,6 +4120,8 @@ static AieRC rt_ctrl_row_return_setup(const __Runtime_CtrlRowFabric *f, const __
             printf("[aie_runtime] ctrl_row_ret: head turn (%u,%u) rc=%d\n", (unsigned)scol, (unsigned)row, (int)rc);
             return rc;
         }
+        rt_pmap_port(scol, row, "EAST", 0, "ret", "slave", ret_sid, "circuit", -1);
+        rt_pmap_port(scol, row, "SOUTH", vret, "ret", "master", ret_sid, "circuit", -1);
     }
     /* 4. Vertical VRET pass-throughs (row-1 .. 1): NORTH slave -> SOUTH master. The
      *    response climbs down the shared spine (through the MemTile rows, which just
@@ -4093,6 +4132,8 @@ static AieRC rt_ctrl_row_return_setup(const __Runtime_CtrlRowFabric *f, const __
             printf("[aie_runtime] ctrl_row_ret: vret hop (%u,%u) rc=%d\n", (unsigned)scol, (unsigned)r, (int)rc);
             return rc;
         }
+        rt_pmap_port(scol, (uint8_t)r, "NORTH", vret, "ret", "slave", ret_sid, "circuit", -1);
+        rt_pmap_port(scol, (uint8_t)r, "SOUTH", vret, "ret", "master", ret_sid, "circuit", -1);
     }
     /* 5. Shim: NORTH slave VRET -> SOUTH S2MM demux port, then enable the shim S2MM
      *    stream port (mirrors the proven rt_ctrl_route_setup_col shim drain). */
@@ -4110,6 +4151,8 @@ static AieRC rt_ctrl_row_return_setup(const __Runtime_CtrlRowFabric *f, const __
                (unsigned)rport, (int)rc);
         return rc;
     }
+    rt_pmap_port(scol, 0, "NORTH", vret, "ret", "slave", ret_sid, "circuit", -1);
+    rt_pmap_port(scol, 0, "SOUTH", rport, "ret", "master", ret_sid, "circuit", -1);
     return XAIE_OK;
 }
 

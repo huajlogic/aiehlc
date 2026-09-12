@@ -15,23 +15,36 @@ def test_parse_ports_basic():
     assert len(ports) == 3
     assert ports[0] == {"col": 0, "row": 0, "port": "SOUTH", "idx": 3,
                         "dir": "fwd", "ms": "master", "id": 1,
-                        "sw": "circuit", "slot": -1}
+                        "sw": "circuit", "slot": -1,
+                        "arb": -1, "msel": -1, "mask": -1}
     assert ports[1]["port"] == "CTRL" and ports[1]["ms"] == "master"
     assert ports[2]["dir"] == "ret" and ports[2]["sw"] == "pkt" and ports[2]["slot"] == 0
 
 def test_parse_ports_legacy_defaults_sw_slot():
-    """Old-format line (no sw/slot) still parses, defaulting sw=circuit slot=-1."""
+    """Old-format line (no sw/slot/arb/msel/mask) still parses, defaulting
+    sw=circuit slot=-1 and arb/msel/mask=-1."""
     legacy = "CONTROLPAN-PMAP col=1 row=2 port=EAST idx=0 dir=fwd ms=master id=7\n"
     assert c.parse_ports(legacy) == [{"col": 1, "row": 2, "port": "EAST", "idx": 0,
                                       "dir": "fwd", "ms": "master", "id": 7,
-                                      "sw": "circuit", "slot": -1}]
+                                      "sw": "circuit", "slot": -1,
+                                      "arb": -1, "msel": -1, "mask": -1}]
+
+def test_parse_ports_packet_params():
+    """A packet line carries arb/msel/mask (slave slot params)."""
+    txt = ("CONTROLPAN-PMAP col=0 row=4 port=SOUTH idx=4 dir=fwd ms=slave id=0 "
+           "sw=pkt slot=0 arb=2 msel=1 mask=31\n")
+    assert c.parse_ports(txt) == [{"col": 0, "row": 4, "port": "SOUTH", "idx": 4,
+                                   "dir": "fwd", "ms": "slave", "id": 0,
+                                   "sw": "pkt", "slot": 0,
+                                   "arb": 2, "msel": 1, "mask": 31}]
 
 def test_parse_ports_ignores_malformed():
     bad = "CONTROLPAN-PMAP col=x row= port=SOUTH\nCONTROLPAN-PMAP col=1 row=2 port=EAST idx=0 dir=fwd ms=master id=7 sw=pkt slot=2\n"
     ports = c.parse_ports(bad)
     assert ports == [{"col": 1, "row": 2, "port": "EAST", "idx": 0,
                       "dir": "fwd", "ms": "master", "id": 7,
-                      "sw": "pkt", "slot": 2}]
+                      "sw": "pkt", "slot": 2,
+                      "arb": -1, "msel": -1, "mask": -1}]
 
 SPINE = """
 CONTROLPAN-PMAP col=0 row=0 port=NORTH idx=0 dir=fwd ms=master id=1 sw=circuit slot=-1
@@ -117,7 +130,8 @@ def test_tile_switch_view_fanout():
     assert len(v["groups"]) == 1
     g = v["groups"][0]
     assert g["dir"] == "fwd" and g["id"] == 2 and g["slot"] == 1 and g["sw"] == "pkt"
-    assert g["slaves"] == [{"port": "WEST", "idx": 4}]
+    assert g["slaves"] == [{"port": "WEST", "idx": 4,
+                            "mask": -1, "msel": -1, "arb": -1}]
     ports = {m["port"]: m for m in g["masters"]}
     assert ports["CTRL"]["dest"] == "CTRL (local endpoint)"
     assert ports["EAST"]["dest"] == "(2,3) WEST"
@@ -153,9 +167,27 @@ def test_tile_switch_view_dedups_multislot():
     v = c.tile_switch_view(MULTISLOT, 1, 3)
     assert len(v["groups"]) == 1
     g = v["groups"][0]
-    assert g["slaves"] == [{"port": "WEST", "idx": 4}]
+    assert g["slaves"] == [{"port": "WEST", "idx": 4,
+                            "mask": -1, "msel": -1, "arb": -1}]
     assert len(g["masters"]) == 1 and g["masters"][0]["port"] == "EAST"
     assert g["slot"] == 3 and g["sw"] == "pkt"
+
+# A packet slot line carries (mask,msel,arb) for its slave and (msel,arb) for
+# its master. The runtime emits a bare enable line (arb=-1) plus a params line
+# (arb>=0) for the same (port,idx); the params-bearing record must win.
+PARAMS = """
+CONTROLPAN-PMAP col=0 row=4 port=SOUTH idx=4 dir=fwd ms=slave  id=0 sw=pkt slot=0
+CONTROLPAN-PMAP col=0 row=4 port=SOUTH idx=4 dir=fwd ms=slave  id=0 sw=pkt slot=0 arb=2 msel=1 mask=31
+CONTROLPAN-PMAP col=0 row=4 port=CTRL  idx=0 dir=fwd ms=master id=0 sw=pkt slot=0 arb=2 msel=3
+"""
+
+def test_tile_switch_view_surfaces_packet_params():
+    v = c.tile_switch_view(PARAMS, 0, 4)
+    g = v["groups"][0]
+    assert g["slaves"] == [{"port": "SOUTH", "idx": 4,
+                            "mask": 31, "msel": 1, "arb": 2}]
+    m = g["masters"][0]
+    assert m["port"] == "CTRL" and m["msel"] == 3 and m["arb"] == 2
 
 # One neighbor port pair (EAST<->WEST) serves two flows with different (dir,id)
 # and different slave idx; each edge must carry its own flow's to_idx.
