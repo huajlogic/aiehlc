@@ -6565,8 +6565,12 @@ function buildDeviceMap(){
     }
 
     g.addEventListener('mouseenter',e=>{
-      rect.setAttribute('stroke','#e4e4e488');
-      rect.setAttribute('stroke-width','1.5');
+      // The switch-highlight (amber ring) is pinned to the open detail tile;
+      // hovering must not replace it with the gray hover stroke.
+      if(dmSwitchHiKey!==key){
+        rect.setAttribute('stroke','#e4e4e488');
+        rect.setAttribute('stroke-width','1.5');
+      }
       const lines=['('+tc+','+tr+') '+typStr];
       if(t.dma_channels&&t.dma_channels.length){
         const vis=(!dmHideAll&&dmActiveNets.size===0)?t.dma_channels
@@ -6617,7 +6621,11 @@ function buildDeviceMap(){
     });
     g.addEventListener('mousemove',dmMoveTip);
     g.addEventListener('mouseleave',()=>{
-      if(!dmSelKeys.has(key)){
+      if(dmSwitchHiKey===key){
+        // The switch-highlight (amber ring) is pinned to the open detail tile;
+        // hovering out must leave it in place, not restore the base stroke.
+        dmApplySwitchHi();
+      } else if(!dmSelKeys.has(key)){
         // Restore from dmTileStroke, not the captured `stroke`: a live scan may
         // have recolored this tile since it was built, and hovering out must
         // not wipe the status color.
