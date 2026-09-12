@@ -6117,7 +6117,7 @@ async function showTileSwitchDetail(tc, tr){
   const body = document.getElementById('swDetailBody');
   const title = document.getElementById('swDetailTitle');
   if(!modal||!body) return;
-  title.textContent = 'Stream switch ('+tc+','+tr+')';
+  if(title) title.textContent = 'Stream switch ('+tc+','+tr+')';
   body.innerHTML = 'loading…';
   modal.classList.add('show');
   let j;
@@ -6586,9 +6586,11 @@ function buildDeviceMap(){
     g.addEventListener('click',e=>{
       if(dmDragging) return;
       // Control-plan mode: if a plan is loaded and this tile has control-plan
-      // ports, open the enlarged stream-switch detail modal.
+      // ports, open the enlarged stream-switch detail modal and stop -- do not
+      // also mutate the selection / rebuild the map behind the popup.
       if((ctrlPlanPorts||[]).some(p=>p.col===tc && p.row===tr)){
         showTileSwitchDetail(tc, tr);
+        return;
       }
       const ctrl=e.ctrlKey||e.metaKey||ctrlHeld;
       const selOn=k=>{ const gr=tileGroups[k]; if(!gr) return;
