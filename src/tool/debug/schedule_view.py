@@ -2909,8 +2909,39 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     color:rgba(228,228,228,.6); cursor:pointer; z-index:10;
                     display:flex; align-items:center; gap:4px; user-select:none; }
   #dmCtrlPlanWrap input { cursor:pointer; margin:0; }
-  .ctrlplan-edge { stroke:#e91e63; stroke-width:2; opacity:.85; pointer-events:none; }
+  .ctrlplan-edge { stroke:#e91e63; stroke-width:2; opacity:.9; }
   .ctrlplan-ret { stroke:#00bcd4; }
+  .ctrlplan-lbl { font-size:8px; fill:rgba(228,228,228,.85); pointer-events:none;
+                  paint-order:stroke; stroke:#111; stroke-width:2.4px; stroke-linejoin:round; }
+  .ctrlplan-lbl-ret { fill:#7fe9f5; }
+  .ctrlplan-role { font-size:7.5px; font-weight:700; pointer-events:none;
+                   paint-order:stroke; stroke:#111; stroke-width:2.2px; stroke-linejoin:round; }
+  .ctrlplan-role-m { fill:#ffd54f; }
+  .ctrlplan-role-s { fill:#b0bec5; }
+  .ctrlplan-ctrl { fill:none; stroke:#ffb300; stroke-width:2; opacity:.9; pointer-events:none; }
+  .ctrlplan-ctrl-emit { stroke:#00bcd4; }
+  .ctrlplan-ctrl-lbl { font-size:7.5px; font-weight:700; fill:#ffcc66; pointer-events:none;
+                       paint-order:stroke; stroke:#111; stroke-width:2.2px; stroke-linejoin:round; }
+  .ctrlplan-ctrl-lbl-emit { fill:#7fe9f5; }
+  /* Enlarged stream-switch detail modal (opened by clicking a tile after a
+     control plan is loaded). Draws slave inputs -> slot node -> master fan-out. */
+  #swDetailModal { position:fixed; inset:0; z-index:200; display:none;
+    align-items:center; justify-content:center; background:rgba(0,0,0,.55); }
+  #swDetailModal.show { display:flex; }
+  #swDetailCard { background:#1c1f26; border:1px solid #3a3f4b; border-radius:8px;
+    padding:14px 16px; max-width:92vw; max-height:88vh; overflow:auto;
+    box-shadow:0 8px 30px rgba(0,0,0,.5); }
+  #swDetailCard .swd-hdr { display:flex; align-items:center; gap:10px;
+    font-size:13px; font-weight:700; color:#e4e4e4; margin-bottom:8px; }
+  #swDetailCard .swd-close { margin-left:auto; cursor:pointer; border:none;
+    background:#2a2f3a; color:#e4e4e4; border-radius:4px; padding:2px 9px; font-size:13px; }
+  #swDetailCard .swd-empty { color:#b0bec5; font-size:12px; padding:12px; }
+  .swd-slave { fill:#4a7fd4; }
+  .swd-slot  { fill:#ffb300; }
+  .swd-master{ fill:#e91e63; }
+  .swd-lbl   { font-size:10px; fill:#e4e4e4; font-family:monospace; }
+  .swd-dest  { font-size:9px; fill:#b0bec5; font-family:monospace; }
+  .swd-link  { stroke:#8a90a0; stroke-width:1.5; fill:none; }
   #devmap-legend { display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; font-size:10px;
                    color:rgba(228,228,228,.35); align-items:center; }
   .dml-item { display:flex; align-items:center; gap:4px; }
@@ -3359,6 +3390,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <span id="devmap-stlegend" class="hide"></span>
     </div>
   </div>
+  <!-- Enlarged stream-switch detail: opened by clicking a tile after a control
+       plan is loaded; body is filled by showTileSwitchDetail(). -->
+  <div id="swDetailModal"><div id="swDetailCard">
+    <div class="swd-hdr"><span id="swDetailTitle">Stream switch</span>
+      <button class="swd-close" id="swDetailClose">&#10005;</button></div>
+    <div id="swDetailBody"></div>
+  </div></div>
   <!-- ── Targets panel ───────────────────────────────────────────── -->
   <div id="targetsview">
     <div id="tgt-toolbar">
@@ -5486,6 +5524,7 @@ function dmClearAll(){
     if (document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
   }
   ctrlPlanEdges = [];
+  ctrlPlanPorts = [];
   const _cpw = document.getElementById('dmCtrlPlanWrap');
   if (_cpw) _cpw.hidden = true;
   if (document.getElementById('devmap')?.classList.contains('show')) buildDeviceMap();
@@ -5959,21 +5998,99 @@ function dmMoveTip(e){
   dmTooltipEl.style.left=lx+'px'; dmTooltipEl.style.top=ly+'px';
 }
 
-// CONTROLPAN-PMAP overlay: control-plan routing edges parsed from the applog by
-// /ctrlplan/load. Drawn on top of the data-flow edges as a dashed overlay,
-// toggle-able via #dmCtrlPlanToggle. Each edge: {from:[c,r], to:[c,r], dir, id, port}.
+// CONTROLPAN-PMAP overlay: control-plan routing parsed from the applog by
+// /ctrlplan/load. Drawn on top of the data-flow edges, toggle-able via
+// #dmCtrlPlanToggle. Each edge: {from:[c,r], to:[c,r], dir, id, port, sw, slot,
+// from_idx, to_idx}. Each port: {col,row,port,idx,dir,ms,id,sw,slot}.
+// Style: fwd = pink, ret = cyan; circuit = dashed, pkt = solid. Forward and
+// return share the spine column, so each direction is drawn in its own
+// perpendicular lane. Each edge tags its master (source, M<idx>) and slave
+// (dest, S<idx>) endpoints and a midpoint label "port sw [sN] · id<n>"; hover
+// <title> carries full detail. CTRL ports mark their tile with a labelled ring
+// (consume=fwd amber master / emit=ret cyan slave). Duplicate routes (one per
+// read) are de-duplicated via ctrlPlanUniq before drawing.
 let ctrlPlanEdges = [];
+let ctrlPlanPorts = [];
+
+function ctrlPlanTitle(svgEl, txt){
+  const t = document.createElementNS('http://www.w3.org/2000/svg','title');
+  t.textContent = txt; svgEl.appendChild(t);
+}
+
+// Dedup helper: the applog repeats identical routes (e.g. one route per read),
+// so collapse records that share every rendered field.
+function ctrlPlanUniq(items, keyer){
+  const seen=new Set(), out=[];
+  for(const it of items||[]){ const k=keyer(it); if(seen.has(k)) continue; seen.add(k); out.push(it); }
+  return out;
+}
 
 function drawCtrlPlanOverlay(svg, cx, cy){
-  if(!ctrlPlanEdges.length) return;
   if(!document.getElementById('dmCtrlPlanToggle')?.checked) return;
-  for(const e of ctrlPlanEdges){
-    const ln = svgN('line', {
-      x1:cx(e.from[0]), y1:cy(e.from[1]),
-      x2:cx(e.to[0]),   y2:cy(e.to[1]),
-      class:'ctrlplan-edge '+(e.dir==='ret'?'ctrlplan-ret':''),
-      'stroke-dasharray':'5 3'});
+  // Forward (request, pink) and return (response, cyan) share the vertical spine
+  // column, so draw each direction in its own perpendicular lane and annotate the
+  // master (emitting) and slave (receiving) endpoints, packet id, sw and slot.
+  const LANE=7;        // half-gap between the fwd and ret lanes (px)
+  const edges = ctrlPlanUniq(ctrlPlanEdges, e=>
+    e.dir+'|'+e.from+'|'+e.to+'|'+e.port+'|'+e.from_idx+'|'+e.to_idx+'|'+e.sw+'|'+e.slot+'|'+e.id);
+  for(const e of edges){
+    const ret = (e.dir==='ret');
+    const x1=cx(e.from[0]), y1=cy(e.from[1]), x2=cx(e.to[0]), y2=cy(e.to[1]);
+    const dx=x2-x1, dy=y2-y1, L=Math.hypot(dx,dy)||1, ux=dx/L, uy=dy/L;
+    // Canonicalize the perpendicular so it does NOT depend on travel direction:
+    // forward climbs the spine (up) while return drains it (down), so their raw
+    // direction vectors are opposite. Deriving px from the raw vector would flip
+    // the lane and cancel the opposite `off` sign, landing both on the same line.
+    // Fold the unit vector into a single half-plane first, then take perpendicular.
+    let cux=ux, cuy=uy;
+    if(cux<0 || (cux===0 && cuy<0)){ cux=-cux; cuy=-cuy; }
+    const px=-cuy, py=cux;               // direction-independent unit perpendicular
+    const off = ret ? LANE : -LANE;      // fwd/ret run in separate parallel lanes
+    const ox=px*off, oy=py*off;
+    const X1=x1+ox, Y1=y1+oy, X2=x2+ox, Y2=y2+oy;
+    const col = ret ? '#00bcd4' : '#e91e63';
+    const ln = svgN('line', {x1:X1, y1:Y1, x2:X2, y2:Y2,
+      class:'ctrlplan-edge '+(ret?'ctrlplan-ret':'')});
+    if(e.sw==='circuit') ln.setAttribute('stroke-dasharray','5 3');
+    ctrlPlanTitle(ln, e.dir.toUpperCase()+' '+e.port+' master['+e.from[0]+','+e.from[1]+'] idx'+
+      e.from_idx+'  ->  slave['+e.to[0]+','+e.to[1]+'] idx'+e.to_idx+
+      ' | '+e.sw+(e.slot>=0?(' slot='+e.slot):'')+' | pkt id='+e.id);
     svg.appendChild(ln);
+    // Arrowhead near the destination end (points master -> slave).
+    const bx=X2-ux*15, by=Y2-uy*15, tx=X2-ux*8, ty=Y2-uy*8, w=4;
+    const head = svgN('path', {d:'M'+tx+','+ty+' L'+(bx-uy*w)+','+(by+ux*w)+
+      ' L'+(bx+uy*w)+','+(by-ux*w)+' Z', fill:col, stroke:'none'});
+    svg.appendChild(head);
+    // Master (source) and slave (dest) role tags at each end, nudged inward.
+    const mtag = svgN('text', {x:X1+ux*17+px*off, y:Y1+uy*17+py*off,
+      class:'ctrlplan-role ctrlplan-role-m', 'text-anchor':'middle', 'dominant-baseline':'middle'});
+    mtag.textContent='M'+e.from_idx; svg.appendChild(mtag);
+    const stag = svgN('text', {x:X2-ux*17+px*off, y:Y2-uy*17+py*off,
+      class:'ctrlplan-role ctrlplan-role-s', 'text-anchor':'middle', 'dominant-baseline':'middle'});
+    stag.textContent='S'+e.to_idx; svg.appendChild(stag);
+    // Midpoint label: port, switch/slot and packet id.
+    const lbl = svgN('text', {x:(X1+X2)/2+px*(off>0?6:-6), y:(Y1+Y2)/2-2,
+      class:'ctrlplan-lbl '+(ret?'ctrlplan-lbl-ret':''), 'text-anchor':'middle'});
+    lbl.textContent = e.port+' '+e.sw+(e.slot>=0?(' s'+e.slot):'')+' · id'+e.id;
+    svg.appendChild(lbl);
+  }
+  // CTRL ports: tile-local consume (fwd request in, master) / emit (ret response
+  // out, slave). Offset the emit ring so a consume+emit on the same tile both show.
+  const ctrls = ctrlPlanUniq((ctrlPlanPorts||[]).filter(p=>p.port==='CTRL'),
+    p=>p.col+'|'+p.row+'|'+p.dir+'|'+p.ms+'|'+p.id+'|'+p.sw+'|'+p.slot);
+  for(const p of ctrls){
+    const emit = (p.dir==='ret');
+    const rx=cx(p.col)+(emit?9:-9), ry=cy(p.row);
+    const ring = svgN('circle', {cx:rx, cy:ry, r:12,
+      class:'ctrlplan-ctrl '+(emit?'ctrlplan-ctrl-emit':'')});
+    ctrlPlanTitle(ring, 'CTRL '+(emit?'emit (response out, slave)':'consume (request in, master)')+
+      ' tile('+p.col+','+p.row+') '+p.ms+' sw='+p.sw+(p.slot>=0?(' slot='+p.slot):'')+' pkt id='+p.id);
+    svg.appendChild(ring);
+    const clbl = svgN('text', {x:rx, y:ry+(emit?22:-18),
+      class:'ctrlplan-ctrl-lbl '+(emit?'ctrlplan-ctrl-lbl-emit':''), 'text-anchor':'middle'});
+    clbl.textContent='CTRL '+(emit?'emit':'consume')+' '+p.ms[0].toUpperCase()+
+      ' id'+p.id+' '+p.sw+(p.slot>=0?(' s'+p.slot):'');
+    svg.appendChild(clbl);
   }
 }
 
@@ -5985,12 +6102,58 @@ async function loadCtrlPlan(){
       headers:{'Content-Type':'application/json'}, body:'{}'});
     if(j.error){ alert('Load control plan: '+j.error); return; }
     ctrlPlanEdges = j.edges || [];
+    ctrlPlanPorts = j.ports || [];
     const wrap = document.getElementById('dmCtrlPlanWrap');
-    if(wrap) wrap.hidden = ctrlPlanEdges.length===0;
+    if(wrap) wrap.hidden = (ctrlPlanEdges.length===0 && ctrlPlanPorts.length===0);
     const tog = document.getElementById('dmCtrlPlanToggle');
     if(tog) tog.checked = true;
     buildDeviceMap();
   } finally { if(btn) btn.disabled = false; }
+}
+
+function swDetailClose(){ document.getElementById('swDetailModal')?.classList.remove('show'); }
+async function showTileSwitchDetail(tc, tr){
+  const modal = document.getElementById('swDetailModal');
+  const body = document.getElementById('swDetailBody');
+  const title = document.getElementById('swDetailTitle');
+  if(!modal||!body) return;
+  title.textContent = 'Stream switch ('+tc+','+tr+')';
+  body.innerHTML = 'loading…';
+  modal.classList.add('show');
+  let j;
+  try { j = await api('/ctrlplan/tile', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({col:tc,row:tr})}); }
+  catch(e){ body.textContent = 'error: '+e; return; }
+  if(j.error){ body.textContent = 'error: '+j.error; return; }
+  const groups = j.groups||[];
+  if(!groups.length){ body.innerHTML =
+    '<div class="swd-empty">no control-plan ports on this tile</div>'; return; }
+  const COLX={slave:30, slot:230, master:430}, W=760, ROWH=26, BANDPAD=18;
+  let y=20, svgParts=[];
+  const box=(x,yy,cls,txt)=>{
+    svgParts.push('<rect x="'+x+'" y="'+(yy-11)+'" width="150" height="20" rx="4" class="'+cls+'" opacity="0.9"/>');
+    svgParts.push('<text x="'+(x+6)+'" y="'+(yy+3)+'" class="swd-lbl">'+txt+'</text>');
+  };
+  const link=(x1,y1,x2,y2)=>svgParts.push('<path class="swd-link" d="M'+x1+','+y1+' C'+((x1+x2)/2)+','+y1+' '+((x1+x2)/2)+','+y2+' '+x2+','+y2+'"/>');
+  const esc=s=>String(s).replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
+  groups.forEach(g=>{
+    const rows=Math.max(g.slaves.length, g.masters.length, 1);
+    const slotY=y+(rows-1)*ROWH/2;
+    box(COLX.slot, slotY, 'swd-slot', 'slot '+g.slot+' ('+esc(g.sw)+')');
+    svgParts.push('<text x="'+COLX.slot+'" y="'+(slotY-15)+'" class="swd-dest">'+esc(g.dir)+' id'+g.id+'</text>');
+    g.slaves.forEach((s,i)=>{ const sy=y+i*ROWH;
+      box(COLX.slave, sy, 'swd-slave', esc(s.port)+' '+s.idx+' (slave)');
+      link(COLX.slave+150, sy, COLX.slot, slotY); });
+    if(!g.slaves.length) box(COLX.slave, slotY, 'swd-slave', '(no slave)');
+    g.masters.forEach((m,i)=>{ const my=y+i*ROWH;
+      box(COLX.master, my, 'swd-master', esc(m.port)+' '+m.idx+' (master)');
+      svgParts.push('<text x="'+COLX.master+'" y="'+(my+18)+'" class="swd-dest">→ '+esc(m.dest)+'</text>');
+      link(COLX.slot+150, slotY, COLX.master, my); });
+    y += rows*ROWH + BANDPAD;
+  });
+  body.innerHTML = '<svg width="'+W+'" height="'+(y+10)+'" '+
+    'xmlns="http://www.w3.org/2000/svg">'+svgParts.join('')+'</svg>';
 }
 
 function buildDeviceMap(){
@@ -6422,6 +6585,11 @@ function buildDeviceMap(){
 
     g.addEventListener('click',e=>{
       if(dmDragging) return;
+      // Control-plan mode: if a plan is loaded and this tile has control-plan
+      // ports, open the enlarged stream-switch detail modal.
+      if((ctrlPlanPorts||[]).some(p=>p.col===tc && p.row===tr)){
+        showTileSwitchDetail(tc, tr);
+      }
       const ctrl=e.ctrlKey||e.metaKey||ctrlHeld;
       const selOn=k=>{ const gr=tileGroups[k]; if(!gr) return;
         const r=gr.querySelector('rect'); if(!r) return;
@@ -10226,6 +10394,10 @@ function runScanNow(setMsg){
   if (clr) clr.onclick = dmClearAll;
   const lcp = document.getElementById('dmLoadCtrlPlan');
   if (lcp) lcp.onclick = loadCtrlPlan;
+  document.getElementById('swDetailClose')?.addEventListener('click', swDetailClose);
+  document.getElementById('swDetailModal')?.addEventListener('click', e=>{
+    if(e.target && e.target.id==='swDetailModal') swDetailClose(); });
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape') swDetailClose(); });
   const cpTog = document.getElementById('dmCtrlPlanToggle');
   if (cpTog) cpTog.onchange = () => buildDeviceMap();
   const live = document.getElementById('dmLiveToggle');
