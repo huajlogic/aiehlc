@@ -91,6 +91,18 @@ forward S2MM up (shim→dest) and return MM2S down (dest→shim). No kernel ELF 
 `kernel_placements` stays empty. This lets `schedule_debug_server.py` open a
 debug GUI for a control-packet app that has only `host.cc` (no `Work/` tree).
 
+It also recognizes the **row-control fabric** (`__Runtime_ctrl_row_open` picks the
+shared spine/shim column; each `__Runtime_ctrl_row_add(fab,row,col_lo,col_hi)` adds
+one EAST chain). `extract_ctrl_rows` enumerates the spine (shim + vertical
+pass-through up to the highest configured row) and every chain tile, then draws a
+forward-up + return-down flow per chain. **Wrapper forwarding** is resolved one
+level deep: when a `row_add` arg is a bare identifier naming a parameter of the
+enclosing function (e.g. a `demo_add_row(fab,row)` helper that forwards `row`), the
+value is folded from that helper's *call-site* args (`_c_functions` maps a call's
+char offset to its enclosing function; `_call_args` splits balanced arg lists). Without this, rows configured only through a wrapper are missed, the grid tops out
+at the highest *directly-passed* row, and the taller rows of the **Load control
+plan** overlay render off-canvas.
+
 - `MacroResolver` selects live `#if/#ifdef` branch for `AIE_GEN`/`__AIESIM__`
   and honors inline `#define`/`#undef` (so an in-file `#define _CONTROL_WRITE_TEST_`
   guard followed by `#ifdef` keeps its block)
@@ -262,14 +274,48 @@ index; `linespans='SL'` for line-independent cache. Auth-gated on wide bind.
 - **Control-plan overlay (CONTROLPAN-PMAP):** the **Load control plan** button
   (`#dmLoadCtrlPlan`) POSTs `/ctrlplan/load`; the server reads `st.applog`, runs
   `controlpan_pmap.parse(text)` (module `controlpan_pmap.py` — parses
-  `CONTROLPAN-PMAP col=.. row=.. port=.. idx=.. dir=fwd|ret ms=master|slave id=..`
-  lines into `{ports, edges, count}`, pairing each master port with the
-  opposite-type slave on the neighbor tile). The frontend stores `j.edges` in
-  `ctrlPlanEdges` and `drawCtrlPlanOverlay(svg, cx, cy)` draws them as a dashed
-  overlay (`.ctrlplan-edge`, `.ctrlplan-ret` for return) on top of the data-flow
-  edges, toggle-able via `#dmCtrlPlanToggle`; `dmClearAll()` clears it. The C
-  runtime emits the lines when `__Runtime_ctrl_pmap_enable(1)` is set before the
-  first `aie_ctrl*` `setup_routing` / `row_add`.
+  `CONTROLPAN-PMAP col=.. row=.. port=.. idx=.. dir=fwd|ret ms=master|slave id=..
+  sw=pkt|circuit slot=..` lines into `{ports, edges, count}`, pairing each master
+  port with the opposite-type slave on the neighbor tile; `sw`/`slot` are optional
+  and default to `circuit`/`-1` for legacy lines). Each edge carries `sw`, `slot`,
+  `from_idx` (master idx) and `to_idx` (slave idx). The frontend stores `j.edges`
+  in `ctrlPlanEdges` and `j.ports` in `ctrlPlanPorts`; `drawCtrlPlanOverlay(svg,
+  cx, cy)` draws per-hop edges (pink=fwd `#e91e63`, cyan=ret `#00bcd4`; `pkt`=solid,
+  `circuit`=dashed) with an arrowhead, a midpoint label `portN->M sw [sN]`
+  (`.ctrlplan-lbl`) and a hover `<title>` full detail, plus a ring on each `CTRL`
+  tile (`.ctrlplan-ctrl` consume / `.ctrlplan-ctrl-emit` emit). Toggle-able via
+  `#dmCtrlPlanToggle`; `dmClearAll()` resets both `ctrlPlanEdges` and
+  `ctrlPlanPorts`. **Tile stream-switch detail modal:** once a plan is loaded,
+  the device-map tile click handler checks `ctrlPlanPorts` for that `(col,row)`
+  and, if present, calls `showTileSwitchDetail(tc, tr)` (and returns, so it does
+  not also mutate the selection). That POSTs `/ctrlplan/tile {col,row}`, which
+  returns `controlpan_pmap.tile_switch_view(text, col, row)` =
+  `{col, row, groups:[{dir, id, slot, sw, slaves:[{port,idx}],
+  masters:[{port,idx,dest}]}]}` (ports on the tile grouped by `(dir,id)`:
+  slaves=switch inputs, masters=fan-out outputs, each master annotated with its
+  neighbor `(c,r) PORT` dest from `parse_edges`, `CTRL (local endpoint)` for a
+  CTRL master, or `—` if unpaired; de-duped by `(port,idx)`, group `slot` taken
+  from the largest master `slot>=0`). `showTileSwitchDetail` draws an SVG in the
+  `#swDetailModal` popup: three columns slave→`slot N (sw)`→master with bezier
+  links (`.swd-slave` `#4a7fd4` / `.swd-slot` `#ffb300` / `.swd-master` `#e91e63`),
+  one band per group; empty tiles render a `.swd-empty` message. Closes on the ✕
+  (`#swDetailClose`), backdrop click, or Esc (`swDetailClose`). **Enabling emission:** the C runtime emits the lines when
+  `AIE_CTRL_PMAP=1` is in the environment (auto-gate, resolved once via `getenv`)
+  or `__Runtime_ctrl_pmap_enable(1)` is called before the first `aie_ctrl*`
+  `setup_routing` / `row_add`. Regenerate the applog with `AIE_CTRL_PMAP=1` set
+  for the board run to populate the overlay.
+  **Return-path emit (row fabric):** the single-tile control path
+  (`rt_ctrl_route_setup_col`) always emitted both `dir=fwd` and `dir=ret` ports,
+  but the row-control fabric originally instrumented only the forward path
+  (`rt_ctrl_row_shim_entry` + `__Runtime_ctrl_row_emit`, all `fwd`) — its return
+  route builder `rt_ctrl_row_return_setup` (`aie_runtime.c`) emitted zero pmap
+  lines, so a `unicast_read`'s core→shim back route never reached the overlay.
+  It now emits one `dir=ret` port pair per return step (target CTRL slave + return
+  master, WEST pass-throughs, head EAST→SOUTH VRET turn, vertical VRET drain, shim
+  NORTH→SOUTH S2MM), mirroring the single-tile convention, so the cyan return
+  edges render. Note fire-and-forget `broadcast_write`/`unicast_write` program no
+  return route at all (only `unicast_read` calls `rt_ctrl_row_return_setup`), so
+  `ret` edges appear only when the app issues a control-packet read.
 
 ### Grid view
 
