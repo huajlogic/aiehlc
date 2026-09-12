@@ -285,21 +285,25 @@ index; `linespans='SL'` for line-independent cache. Auth-gated on wide bind.
   (`.ctrlplan-lbl`) and a hover `<title>` full detail, plus a ring on each `CTRL`
   tile (`.ctrlplan-ctrl` consume / `.ctrlplan-ctrl-emit` emit). Toggle-able via
   `#dmCtrlPlanToggle`; `dmClearAll()` resets both `ctrlPlanEdges` and
-  `ctrlPlanPorts`. **Tile stream-switch detail modal:** once a plan is loaded,
-  the device-map tile click handler checks `ctrlPlanPorts` for that `(col,row)`
-  and, if present, calls `showTileSwitchDetail(tc, tr)` (and returns, so it does
-  not also mutate the selection). That POSTs `/ctrlplan/tile {col,row}`, which
-  returns `controlpan_pmap.tile_switch_view(text, col, row)` =
+  `ctrlPlanPorts`. **Tile stream-switch detail (Info panel card):** once a plan is
+  loaded, the device-map tile click handler checks `ctrlPlanPorts` for that
+  `(col,row)` and, if present, calls `showTileSwitchDetail(tc, tr)` (and returns,
+  so it does not also mutate the selection). That pushes a keyed `switch:` card
+  into the right-side Info panel (`panelItems.set(panelKey('switch',...))` +
+  `panelSync()`, replacing any prior switch card); the card's `wireBody` POSTs
+  `/ctrlplan/tile {col,row}`, which returns
+  `controlpan_pmap.tile_switch_view(text, col, row)` =
   `{col, row, groups:[{dir, id, slot, sw, slaves:[{port,idx}],
   masters:[{port,idx,dest}]}]}` (ports on the tile grouped by `(dir,id)`:
   slaves=switch inputs, masters=fan-out outputs, each master annotated with its
   neighbor `(c,r) PORT` dest from `parse_edges`, `CTRL (local endpoint)` for a
   CTRL master, or `—` if unpaired; de-duped by `(port,idx)`, group `slot` taken
-  from the largest master `slot>=0`). `showTileSwitchDetail` draws an SVG in the
-  `#swDetailModal` popup: three columns slave→`slot N (sw)`→master with bezier
-  links (`.swd-slave` `#4a7fd4` / `.swd-slot` `#ffb300` / `.swd-master` `#e91e63`),
-  one band per group; empty tiles render a `.swd-empty` message. Closes on the ✕
-  (`#swDetailClose`), backdrop click, or Esc (`swDetailClose`). **Enabling emission:** the C runtime emits the lines when
+  from the largest master `slot>=0`). `swDetailFill` fetches the groups and
+  `swDetailSvg` draws a responsive SVG (`viewBox` + `width:100%`) into the card's
+  `#swd-host`: three columns slave→`slot N (sw)`→master with bezier links
+  (`.swd-slave` `#4a7fd4` / `.swd-slot` `#ffb300` / `.swd-master` `#e91e63`),
+  one band per group; empty tiles render a `.swd-empty` message. Remove the card
+  via its panel-tab ×. **Enabling emission:** the C runtime emits the lines when
   `AIE_CTRL_PMAP=1` is in the environment (auto-gate, resolved once via `getenv`)
   or `__Runtime_ctrl_pmap_enable(1)` is called before the first `aie_ctrl*`
   `setup_routing` / `row_add`. Regenerate the applog with `AIE_CTRL_PMAP=1` set
