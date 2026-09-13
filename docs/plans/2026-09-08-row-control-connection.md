@@ -22,6 +22,84 @@ instance that owns the resource booking.
 
 ---
 
+## Update (2026-09-12): column-subset row-multicast classes (supersedes two-mode)
+
+The per-tile derivation arms a **persistent column-subset slot superset** on every
+tile's ingress slave port; the runtime packet **id** then selects the delivery mode
+**and target row** at send time (no per-chain `target_col`). Unicast is **removed**.
+A row-multicast can target a **column subset** of a row, keyed by `id[3:2]`:
+- **all-but-last** (class `00`): every column of the target row **except** `col_hi`.
+- **only-last** (class `01`): **only** `col_hi`.
+- **whole-row** (class `10`): every column **including** `col_hi` (old row-multicast).
+
+Broadcast (`id[4]=1`) is unchanged (every column of every configured row).
+`acr_plan_chain_ex` takes `int shim_col` (‑1 ⇒ plain chain, no NORTH climb) and a
+`uint8_t rowidx`; `acr_plan_chain` passes `rowidx=0`.
+
+**Reserved-bit 5-bit stream id:** `[4]=broadcast marker`; when `[4]=0`,
+`[3:2]=class`, `[1:0]=target row index` (add-order, `0..3`, up to 4 rows —
+`ACR_MAX_ROW_IDX`). `id = (class<<2)|rowidx`. `acr_plan_row_add` assigns each
+configured row its add-order index (`s->nrows`); the runtime resolves a physical
+row → index the same way (`rt_ctrl_row_index`).
+
+**Interior tile** (`col < col_hi`, includes the spine head):
+
+| MSel | Slot class | PktId | Mask | Feeds masters |
+|---|---|---|---|---|
+| 0 | consume `{00,10}` @row K | `K` (rowidx) | `0x17` (match `[4]=0,[2]=0,[1:0]=K`; ignore `[3]`) | CTRL + EAST |
+| 1 | broadcast | `0x10` | `0x10` | CTRL + EAST (+NORTH on head) |
+| 2 | transit-north *(spine head only)* | `0x00` | `0x10` (any row-mcast) | NORTH climb |
+| 3 | transit-east `{01}` @row K | `4\|K` | `0x1F` exact | EAST only (forward past, not consumed) |
+
+Mask `0x17` covers all-but-last (`00`) and whole-row (`10`) for row K (both have
+`id[2]=0`); only-last (`01`, `id[2]=1`) is excluded from CTRL/consume and instead
+rides the transit-east slot (EAST only) through interior tiles to `col_hi`.
+
+**Last tile** (`col_hi`; no EAST, no NORTH):
+
+| MSel | Slot class | PktId | Mask | Feeds masters |
+|---|---|---|---|---|
+| 0 | only-last `{01}` @row K | `4\|K` | `0x1F` exact | CTRL |
+| 1 | whole-row `{10}` @row K | `8\|K` | `0x1F` exact | CTRL |
+| 2 | broadcast | `0x10` | `0x10` | CTRL |
+
+Two separate exact consume slots because `01` and `10` share no maskable bits; the
+last tile arms **no** all-but-last (`00`) slot.
+
+**Per-tile masters** (all `keep_header=1`, arbiter 0):
+- Interior **CTRL** `MSelEn = 0x3` (consume + broadcast).
+- Interior **EAST** `MSelEn = 0x0B` (consume + broadcast + transit-east) — forwards
+  **all** classes east so any subset reaches its columns.
+- Interior **NORTH** (spine head only) `MSelEn = 0x6` (broadcast + transit-north climb).
+- Last-tile **CTRL** `MSelEn = 0x7` (only-last + whole-row + broadcast).
+
+**Slot budget:** spine head arms 4 (consume, bcast, transit-north, transit-east);
+other interior arm 3; last tile arms 3; a single-column chain (head == last) arms
+only-last + whole-row + bcast + transit-north = 4.
+
+`acr_plan_row_add` passes `shim_col = col_lo` so the head emits its own NORTH climb
+master (`0x6`). Spine extension through an already-configured head row emits nothing
+(that head climbs via its own NORTH master); pure pass-through spine rows stay
+circuit `ACR_OP_CCT` (class-agnostic — every class + broadcast climb through
+unchanged).
+
+**Multi-match assumption (sim/HW):** at a target head K a `00`/`10` packet matches
+both the consume slot (CTRL+EAST) and transit-north — robust to either HW
+slot-priority rule (consumed here; if it also climbs, higher heads have a different
+K and drop it). only-last (`01`) at head K matches transit-east (EAST) and, if
+present, transit-north — it rides east to `col_hi` and any harmless climb drops at
+higher heads. Broadcast never multi-matches (bit 4 partitions it).
+
+Constants live in `aie_runtime_control_plan.h` (`ACR_MAX_ROW_IDX`, `ACR_CLASS_*`,
+interior/last `ACR_SLOT_*` + `ACR_MSEL_*`, `ACR_ARB_CTRL`, `ACR_ID_*`, `ACR_MASK_*`
+incl. `ACR_MASK_CONSUME 0x17`, `ACR_MSELEN_*`). The emit layer
+(`__Runtime_ctrl_row_emit`) is unchanged — it forwards slot/mask/msel/arbiter/mselen
+generically, and the pmap provenance (`rt_pmap_port_ex`) surfaces arb/msel/mask
+automatically. Runtime send: `__Runtime_ctrl_row_{all_but_last,only_last,whole_row}_write`
+resolve `row → rowidx` and send id `(class<<2)|rowidx`; `broadcast_write` unchanged.
+
+---
+
 ## Conventions
 
 - Tile coords are `XAie_TileLoc(Col, Row)`.
