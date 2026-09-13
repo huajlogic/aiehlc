@@ -119,62 +119,38 @@ static acr_rc acr_plan_chain_ex(acr_oplist *o, acr_portbook *b, uint8_t row, uin
         if ((rc = acr_book_port(b, c, row, sport, 0, /*master*/ 0)) != ACR_OK)
             return rc;
 
-        if (is_last) {
-            /* Last tile (col_hi): consume only-last + whole-row; no EAST/NORTH. */
-            uint8_t only_id = (uint8_t)((ACR_CLASS_ONLY_LAST << 2) | rowidx);
-            uint8_t whole_id = (uint8_t)((ACR_CLASS_WHOLE_ROW << 2) | rowidx);
-            if ((rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_ONLY_LAST, only_id, ACR_MASK_EXACT, ACR_MSEL_ONLY_LAST,
-                                    ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-            if ((rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_WHOLE, whole_id, ACR_MASK_EXACT, ACR_MSEL_WHOLE,
-                                    ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-            if ((rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_BCAST_LAST, ACR_ID_BCAST, ACR_MASK_BCAST,
-                                    ACR_MSEL_BCAST_LAST, ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-        } else {
             /* Interior tile (c < col_hi): masked consume (classes 00,10) +
              * broadcast + transit-east (class 01, EAST-only) [+ transit-north on
              * the spine head]. */
-            uint8_t consume_id = (uint8_t)((ACR_CLASS_ALL_BUT_LAST << 2) | rowidx); /* == rowidx */
-            uint8_t te_id = (uint8_t)((ACR_CLASS_ONLY_LAST << 2) | rowidx);
-            if ((rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_CONSUME, consume_id, ACR_MASK_CONSUME, ACR_MSEL_CONSUME,
-                                    ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-            if ((rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_BCAST, ACR_ID_BCAST, ACR_MASK_BCAST, ACR_MSEL_BCAST,
-                                    ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-            if (is_spine_head && (rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_TRANSIT_N, ACR_ID_TRANSIT,
-                                                     ACR_MASK_CLASS, ACR_MSEL_TRANSIT_N, ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-            if ((rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_TRANSIT_E, te_id, ACR_MASK_EXACT, ACR_MSEL_TRANSIT_E,
-                                    ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-        }
+        uint8_t consume_id = (uint8_t)((ACR_CLASS_ALL_BUT_LAST << 2) | rowidx); /* == rowidx */
+        uint8_t te_id = (uint8_t)((ACR_CLASS_ONLY_LAST << 2) | rowidx);
+        if ((rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_CONSUME, consume_id, ACR_MASK_CONSUME, ACR_MSEL_CONSUME,
+                                ACR_ARB_CTRL)) != ACR_OK)
+            return rc;
+        if ((rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_BCAST, ACR_ID_BCAST, ACR_MASK_BCAST, ACR_MSEL_BCAST,
+                                ACR_ARB_CTRL)) != ACR_OK)
+            return rc;
+        if (is_spine_head && (rc = acr_emit_slot(o, c, row, sport, ACR_SLOT_TRANSIT_N, ACR_ID_TRANSIT, ACR_MASK_CLASS,
+                                                 ACR_MSEL_TRANSIT_N, ACR_ARB_CTRL)) != ACR_OK)
+            return rc;
 
         acr_op slaveen = {.kind = ACR_OP_SLAVE_EN, .col = c, .row = row, .sport = sport, .sidx = 0, .pkt_id = ctrl_id};
         if ((rc = acr_emit_op(o, &slaveen)) != ACR_OK)
             return rc;
 
-        if (is_last) {
-            /* Last tile CTRL pulls only-last + whole-row + broadcast (0x7). */
-            if ((rc = acr_emit_master(o, b, c, row, ACR_CTRL, (uint8_t)ACR_MSELEN_CTRL_LAST, ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-        } else {
             /* Interior CTRL pulls consume + broadcast (0x3). */
-            if ((rc = acr_emit_master(o, b, c, row, ACR_CTRL, (uint8_t)ACR_MSELEN_CTRL, ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-            /* EAST forwards consume + broadcast + only-last transit (0xB) so every
-             * class reaches its columns. */
-            if (has_east &&
-                (rc = acr_emit_master(o, b, c, row, ACR_EAST, (uint8_t)ACR_MSELEN_EAST, ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-            /* NORTH climbs the spine for broadcast + any transiting row-mcast,
-             * head-on-spine-column only (0x6). */
-            if (is_spine_head &&
-                (rc = acr_emit_master(o, b, c, row, ACR_NORTH, (uint8_t)ACR_MSELEN_NORTH, ACR_ARB_CTRL)) != ACR_OK)
-                return rc;
-        }
+        if ((rc = acr_emit_master(o, b, c, row, ACR_CTRL, (uint8_t)ACR_MSELEN_CTRL, ACR_ARB_CTRL)) != ACR_OK)
+            return rc;
+        /* EAST forwards consume + broadcast + only-last transit (0xB) so every
+         * class reaches its columns. */
+        if (has_east &&
+            (rc = acr_emit_master(o, b, c, row, ACR_EAST, (uint8_t)ACR_MSELEN_EAST, ACR_ARB_CTRL)) != ACR_OK)
+            return rc;
+        /* NORTH climbs the spine for broadcast + any transiting row-mcast,
+         * head-on-spine-column only (0x6). */
+        if (is_spine_head &&
+            (rc = acr_emit_master(o, b, c, row, ACR_NORTH, (uint8_t)ACR_MSELEN_NORTH, ACR_ARB_CTRL)) != ACR_OK)
+            return rc;
     }
     return ACR_OK;
 }

@@ -86,83 +86,86 @@ def parse(text):
 
 
 def tile_switch_view(text, col, row):
-    """Group one tile's CONTROLPAN-PMAP ports into stream-switch routes.
+    """Merge one tile's CONTROLPAN-PMAP ports into per-direction switch views.
 
-    Groups the (col,row) ports by (dir, id): the slave ports are the switch
-    inputs, the master ports the fan-out outputs. Each master is annotated with
-    its destination -- the neighbor tile "(c,r) PORT" from parse_edges, or
-    "CTRL (local endpoint)" for a CTRL master, or a dash if unpaired.
+    Ports are grouped by DIRECTION only (fwd/ret). Within a direction each
+    physical port (port,idx) is MERGED to a single node -- a slave input arms
+    one or more packet slots on that one physical port, so the runtime's
+    one-line-per-slot emission collapses back to a single slave box carrying a
+    list of slots. Masters likewise merge by (port,idx).
 
-    The runtime emits one line per slot for a port, so the same (port,idx) can
-    recur within a group; slaves/masters are de-duplicated by (port,idx). The
-    group "slot" is the routing slot -- from the packet slave's slot config if
-    present, else the largest slot>=0 among the group's master ports, else the
-    largest slot>=0 among any port, else -1; "sw" is "pkt" if any port in the
-    group is packet-switched, else "circuit".
+    Per AIE stream-switch packet routing the routing params live on the SLOT
+    (configured on the slave port): a slot carries (pkt_id, mask, msel,
+    arb=arbiter) and matches a header when (incoming_id & mask) == (pkt_id &
+    mask), injecting into arbiter `arb` with select `msel`. Each MASTER carries
+    (arb=arbiter, mselen), a BITMASK of accepted msel values; a master pulls a
+    slot iff master.arb == slot.arb and ((master.mselen >> slot.msel) & 1). The
+    caller draws a slot->master link for every such match (this is request #3:
+    a master connects to ANY slot on ANY physical slave whose msel bit is set in
+    its mselen, not just same-id slots). Circuit ports carry no slot; a circuit
+    slave links straight to the circuit master with the matching id.
 
-    Per AIE stream-switch packet routing, the packet-routing params live on the
-    SLOT (configured on the slave port), not on the physical slave port: a slot
-    carries (mask, msel, arb=arbiter) and matches a packet header when
-    (id & mask) == (pkt_id & mask). Each MASTER carries (arb=arbiter, mselen),
-    where mselen is a BITMASK of accepted msel values; a master receives a
-    packet iff master.arb == slot.arb and ((master.mselen >> slot.msel) & 1).
-    So the group carries the slot config (arb/msel/mask) and each master its
-    (arb, mselen). A (port,idx) may recur with a params-bearing line (the
-    SLOT/MASTER_EN line, arb>=0) and a bare enable line (arb<0); the params from
-    the record with arb>=0 win. The slaves themselves are just {port, idx}.
+    A master destination is the neighbor tile it feeds -- "(c,r) OPP" when that
+    neighbor tile has a slave on the opposite port in the same direction, else a
+    dash; CTRL is the tile-local endpoint. Pairing is by (port,idx,dir) and
+    ignores id, because a packet master (id=pkt_id=0) feeds a whole physical
+    neighbor slave port that arms several pkt_ids.
 
-    Returns {col, row, groups:[{dir,id,slot,sw,arb,msel,mask,
-    slaves:[{port,idx}], masters:[{port,idx,dest,arb,mselen}]}]}.
+    Returns {col, row, dirs:[{dir,
+        slaves:[{port,idx,sw,id,slots:[{slot,pkt_id,mask,msel,arb}]}],
+        masters:[{port,idx,dest,sw,id,arb,mselen}]}]}.
     """
     ports = [p for p in parse_ports(text)
              if p["col"] == col and p["row"] == row]
-    # master (port,idx,dir,id) on this tile -> neighbor "(c,r) PORT".
-    dest_of = {}
-    for e in parse_edges(text):
-        if e["from"] == [col, row]:
-            dest_of[(e["port"], e["from_idx"], e["dir"], e["id"])] = \
-                "({},{}) {}".format(e["to"][0], e["to"][1], _OPP[e["port"]])
-    groups = {}
+    # Every slave port anywhere -> for neighbor-dest pairing (id-agnostic).
+    all_slaves = {(p["col"], p["row"], p["port"], p["dir"])
+                  for p in parse_ports(text) if p["ms"] == "slave"}
+
+    def dest_for(port, idx, dir_):
+        if port == "CTRL":
+            return "CTRL (local endpoint)"
+        if port not in _DELTA:
+            return "\u2014"
+        dc, dr = _DELTA[port]
+        nb = (col + dc, row + dr, _OPP[port], dir_)
+        return "({},{}) {}".format(col + dc, row + dr, _OPP[port]) \
+            if nb in all_slaves else "\u2014"
+
+    dirs = {}
     for p in ports:
-        key = (p["dir"], p["id"])
-        g = groups.setdefault(key, {"dir": p["dir"], "id": p["id"],
-                                    "slaves": [], "masters": [],
-                                    "arb": -1, "msel": -1, "mask": -1,
-                                    "_cslot": -1, "_mslot": [], "_sslot": [],
-                                    "_pkt": False})
-        g["_pkt"] = g["_pkt"] or (p["sw"] == "pkt")
+        d = dirs.setdefault(p["dir"], {"dir": p["dir"], "_sl": {}, "_ms": {}})
+        pk = (p["port"], p["idx"])
         if p["ms"] == "slave":
-            g["_sslot"].append(p["slot"])
-            # The slot config (arb/msel/mask) lives on the slave slot, not the
-            # physical port; capture it from the params-bearing line (arb>=0).
-            if p["arb"] >= 0 and g["arb"] < 0:
-                g["arb"], g["msel"], g["mask"] = p["arb"], p["msel"], p["mask"]
-                g["_cslot"] = p["slot"]
-            if not any(s["port"] == p["port"] and s["idx"] == p["idx"]
-                       for s in g["slaves"]):
-                g["slaves"].append({"port": p["port"], "idx": p["idx"]})
+            s = d["_sl"].setdefault(pk, {"port": p["port"], "idx": p["idx"],
+                                         "sw": "circuit", "id": p["id"],
+                                         "_slots": {}})
+            if p["sw"] == "pkt":
+                s["sw"] = "pkt"
+            # A real slot line carries params (slot>=0, arb>=0); bare enable
+            # lines (slot<0 / arb<0) only mark the port, they add no slot node.
+            if p["slot"] >= 0 and p["arb"] >= 0:
+                s["_slots"][p["slot"]] = {"slot": p["slot"], "pkt_id": p["id"],
+                                          "mask": p["mask"], "msel": p["msel"],
+                                          "arb": p["arb"]}
         else:
-            g["_mslot"].append(p["slot"])
-            ex = next((m for m in g["masters"]
-                       if m["port"] == p["port"] and m["idx"] == p["idx"]), None)
-            if ex is not None:
-                if ex["arb"] < 0 and p["arb"] >= 0:
-                    ex["mselen"], ex["arb"] = p["msel"], p["arb"]
-                continue
-            if p["port"] == "CTRL":
-                dest = "CTRL (local endpoint)"
-            else:
-                dest = dest_of.get((p["port"], p["idx"], p["dir"], p["id"]), "\u2014")
-            g["masters"].append({"port": p["port"], "idx": p["idx"], "dest": dest,
-                                 "mselen": p["msel"], "arb": p["arb"]})
-    for g in groups.values():
-        # Prefer the slave slot config's slot; else largest master slot; else
-        # largest slot among any port.
-        mpos = [s for s in g.pop("_mslot") if s >= 0]
-        apos = mpos + [s for s in g.pop("_sslot") if s >= 0]
-        cslot = g.pop("_cslot")
-        g["slot"] = cslot if cslot >= 0 else \
-            (max(mpos) if mpos else (max(apos) if apos else -1))
-        g["sw"] = "pkt" if g.pop("_pkt") else "circuit"
-    ordered = sorted(groups.values(), key=lambda g: (g["dir"], g["id"]))
-    return {"col": col, "row": row, "groups": ordered}
+            m = d["_ms"].setdefault(pk, {"port": p["port"], "idx": p["idx"],
+                                         "dest": dest_for(p["port"], p["idx"],
+                                                          p["dir"]),
+                                         "sw": "circuit", "id": p["id"],
+                                         "arb": -1, "mselen": -1})
+            if p["sw"] == "pkt":
+                m["sw"] = "pkt"
+            # MASTER_EN line carries (arb, mselen-as-msel); bare enable arb<0.
+            if p["arb"] >= 0 and m["arb"] < 0:
+                m["arb"], m["mselen"] = p["arb"], p["msel"]
+
+    out = []
+    for d in sorted(dirs.values(), key=lambda x: x["dir"]):
+        slaves = []
+        for s in sorted(d["_sl"].values(), key=lambda x: (x["port"], x["idx"])):
+            slots = [s["_slots"][k] for k in sorted(s["_slots"])]
+            slaves.append({"port": s["port"], "idx": s["idx"], "sw": s["sw"],
+                           "id": s["id"], "slots": slots})
+        masters = sorted(d["_ms"].values(), key=lambda x: (x["port"], x["idx"]))
+        out.append({"dir": d["dir"], "slaves": slaves, "masters": masters})
+    return {"col": col, "row": row, "dirs": out}

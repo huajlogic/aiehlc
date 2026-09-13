@@ -382,6 +382,49 @@ def test_extract_ctrl_rows_folds_suffixed_define():
     assert fab == {"shim_col": 0, "rows": [{"row": 3, "col_lo": 0, "col_hi": 1}]}
 
 
+# The real ctrlrow_demo.cc adds rows through a helper that forwards its own
+# `row` parameter to __Runtime_ctrl_row_add; the configured row constants live
+# only at the helper's CALL sites (demo_add_row(&fab, DEMO_CORE_ROW_B)). A direct
+# row_add fold sees just the idempotent re-add (row A), so extract_ctrl_rows must
+# follow one level of parameter forwarding to also capture row B. Without it the
+# device-map grid tops out at row A and the higher rows of the control-plan
+# overlay render off-canvas.
+CTRL_ROW_WRAPPER_SRC = """
+#define DEMO_SHIM_COL 0u
+#define DEMO_CORE_ROW_A 3u
+#define DEMO_CORE_ROW_B 5u
+#define DEMO_COL_LO 0u
+#define DEMO_COL_HI 3u
+static AieRC demo_add_row(__Runtime_CtrlRowFabric *fab, uint8_t row) {
+    return __Runtime_ctrl_row_add(fab, row, DEMO_COL_LO, DEMO_COL_HI);
+}
+int run_ctrlrow_demo(XAie_DevInst *dev) {
+    __Runtime_ctrl_row_open(&fab, dev, DEMO_SHIM_COL, 0, (uint8_t)0u);
+    demo_add_row(&fab, DEMO_CORE_ROW_A);
+    demo_add_row(&fab, DEMO_CORE_ROW_B);
+    __Runtime_ctrl_row_add(&fab, DEMO_CORE_ROW_A, DEMO_COL_LO, DEMO_COL_HI);
+}
+"""
+
+
+def test_extract_ctrl_rows_follows_wrapper_forwarding():
+    active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_WRAPPER_SRC))
+    fab = x.extract_ctrl_rows(active, x.collect_defines(active))
+    assert fab["shim_col"] == 0
+    # both the wrapper-forwarded rows (A via call site, B via call site) resolve;
+    # the direct idempotent re-add of row A collapses via dedup.
+    assert fab["rows"] == [{"row": 3, "col_lo": 0, "col_hi": 3},
+                           {"row": 5, "col_lo": 0, "col_hi": 3}]
+
+
+def test_extract_model_ctrl_row_wrapper_grid_reaches_row_b():
+    # End-to-end: the wrapper-forwarded row B (5) must land in the tile grid so
+    # the device map spans rows 0..5 and the control-plan overlay is on-canvas.
+    model = x.extract_model(CTRL_ROW_WRAPPER_SRC, aie_gen=5, aiesim=False)
+    tiles = {(t["col"], t["row"]) for t in model["tiles"]}
+    assert (0, 5) in tiles and (1, 5) in tiles and (0, 4) in tiles
+
+
 def test_extract_model_ctrl_row_fabric():
     model = x.extract_model(CTRL_ROW_SRC, aie_gen=5, aiesim=False)
     tiles = {(t["col"], t["row"]): t["type"] for t in model["tiles"]}

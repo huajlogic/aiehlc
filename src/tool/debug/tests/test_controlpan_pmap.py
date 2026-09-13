@@ -115,80 +115,93 @@ def test_edges_return_route_forms_full_ret_chain():
     assert len(edges) == 5
 
 
-# tile_switch_view: group one tile's ports by (dir,id) into slave inputs,
-# slot node, and master outputs (masters annotated with neighbor dest).
+# tile_switch_view: MERGE one tile's ports per direction. A physical slave
+# (port,idx) appears ONCE and carries its packet slots; masters cross-match
+# every slot by (arb, mselen>>msel). The runtime emits one MASTER_EN line with
+# id=pkt_id(=0) per master and one SLOT line per slot on a slave port.
 SWITCH = """
-CONTROLPAN-PMAP col=1 row=3 port=WEST idx=4 dir=fwd ms=slave  id=2 sw=pkt slot=1
-CONTROLPAN-PMAP col=1 row=3 port=CTRL idx=0 dir=fwd ms=master id=2 sw=pkt slot=1
-CONTROLPAN-PMAP col=1 row=3 port=EAST idx=0 dir=fwd ms=master id=2 sw=pkt slot=1
-CONTROLPAN-PMAP col=2 row=3 port=WEST idx=4 dir=fwd ms=slave  id=2 sw=pkt slot=1
+CONTROLPAN-PMAP col=0 row=3 port=SOUTH idx=4 dir=fwd ms=slave  id=0  sw=pkt slot=0 arb=0 msel=0 mask=31
+CONTROLPAN-PMAP col=0 row=3 port=SOUTH idx=4 dir=fwd ms=slave  id=8  sw=pkt slot=1 arb=0 msel=1 mask=24
+CONTROLPAN-PMAP col=0 row=3 port=SOUTH idx=4 dir=fwd ms=slave  id=16 sw=pkt slot=2 arb=0 msel=2 mask=16
+CONTROLPAN-PMAP col=0 row=3 port=SOUTH idx=4 dir=fwd ms=slave  id=0  sw=pkt slot=3 arb=0 msel=3 mask=24
+CONTROLPAN-PMAP col=0 row=3 port=SOUTH idx=4 dir=fwd ms=slave  id=0  sw=pkt slot=-1 arb=-1 msel=-1 mask=-1
+CONTROLPAN-PMAP col=0 row=3 port=CTRL  idx=0 dir=fwd ms=master id=0  sw=pkt slot=-1 arb=0 msel=7 mask=-1
+CONTROLPAN-PMAP col=0 row=3 port=EAST  idx=0 dir=fwd ms=master id=0  sw=pkt slot=-1 arb=0 msel=10 mask=-1
+CONTROLPAN-PMAP col=0 row=3 port=NORTH idx=4 dir=fwd ms=master id=0  sw=pkt slot=-1 arb=0 msel=4 mask=-1
+CONTROLPAN-PMAP col=0 row=4 port=SOUTH idx=4 dir=fwd ms=slave  id=0  sw=circuit slot=-1
+CONTROLPAN-PMAP col=1 row=3 port=WEST  idx=4 dir=fwd ms=slave  id=0  sw=pkt slot=0 arb=0 msel=0 mask=31
 """
 
-def test_tile_switch_view_fanout():
-    v = c.tile_switch_view(SWITCH, 1, 3)
-    assert v["col"] == 1 and v["row"] == 3
-    assert len(v["groups"]) == 1
-    g = v["groups"][0]
-    assert g["dir"] == "fwd" and g["id"] == 2 and g["slot"] == 1 and g["sw"] == "pkt"
-    assert g["slaves"] == [{"port": "WEST", "idx": 4}]
-    ports = {m["port"]: m for m in g["masters"]}
-    assert ports["CTRL"]["dest"] == "CTRL (local endpoint)"
-    assert ports["EAST"]["dest"] == "(2,3) WEST"
+def test_tile_switch_view_merges_physical_slave_port():
+    # SOUTH-4 arms four slots but must appear as ONE merged slave port.
+    v = c.tile_switch_view(SWITCH, 0, 3)
+    assert v["col"] == 0 and v["row"] == 3
+    assert len(v["dirs"]) == 1
+    d = v["dirs"][0]
+    assert d["dir"] == "fwd"
+    assert len(d["slaves"]) == 1
+    s = d["slaves"][0]
+    assert s["port"] == "SOUTH" and s["idx"] == 4 and s["sw"] == "pkt"
+    # Slots carry pkt_id and mask (request #1: mask alongside pkt_id).
+    assert s["slots"] == [
+        {"slot": 0, "pkt_id": 0,  "mask": 31, "msel": 0, "arb": 0},
+        {"slot": 1, "pkt_id": 8,  "mask": 24, "msel": 1, "arb": 0},
+        {"slot": 2, "pkt_id": 16, "mask": 16, "msel": 2, "arb": 0},
+        {"slot": 3, "pkt_id": 0,  "mask": 24, "msel": 3, "arb": 0},
+    ]
+
+def test_tile_switch_view_master_dests_and_params():
+    v = c.tile_switch_view(SWITCH, 0, 3)
+    m = {x["port"]: x for x in v["dirs"][0]["masters"]}
+    assert m["CTRL"]["dest"] == "CTRL (local endpoint)"
+    assert m["CTRL"]["arb"] == 0 and m["CTRL"]["mselen"] == 7
+    assert m["EAST"]["dest"] == "(1,3) WEST"
+    assert m["EAST"]["mselen"] == 10
+    # NORTH climbs to (0,4), whose SOUTH slave exists -> paired.
+    assert m["NORTH"]["dest"] == "(0,4) SOUTH"
+    assert m["NORTH"]["mselen"] == 4
 
 def test_tile_switch_view_empty_tile():
-    assert c.tile_switch_view(SWITCH, 9, 9) == {"col": 9, "row": 9, "groups": []}
+    assert c.tile_switch_view(SWITCH, 9, 9) == {"col": 9, "row": 9, "dirs": []}
 
 def test_tile_switch_view_unpaired_master_dest_dash():
     # EAST master with no neighbor slave -> dest "\u2014"
-    txt = "CONTROLPAN-PMAP col=0 row=3 port=EAST idx=0 dir=fwd ms=master id=5 sw=pkt slot=1\n"
+    txt = "CONTROLPAN-PMAP col=0 row=3 port=EAST idx=0 dir=fwd ms=master id=0 sw=pkt slot=-1 arb=0 msel=2\n"
     v = c.tile_switch_view(txt, 0, 3)
-    assert v["groups"][0]["masters"][0]["dest"] == "\u2014"
+    assert v["dirs"][0]["masters"][0]["dest"] == "\u2014"
 
 def test_tile_switch_view_splits_fwd_ret():
-    # Same tile, same id, different dir -> two groups.
+    # Same tile, same port, different dir -> two direction sections.
     txt = (
         "CONTROLPAN-PMAP col=0 row=3 port=CTRL idx=0 dir=fwd ms=master id=1 sw=pkt slot=0\n"
         "CONTROLPAN-PMAP col=0 row=3 port=CTRL idx=0 dir=ret ms=slave  id=1 sw=pkt slot=0\n"
     )
     v = c.tile_switch_view(txt, 0, 3)
-    assert {g["dir"] for g in v["groups"]} == {"fwd", "ret"}
+    assert {d["dir"] for d in v["dirs"]} == {"fwd", "ret"}
 
-# The runtime emits one line per slot per port, so a (port,idx) recurs within a
-# group. tile_switch_view must de-dup and pick the master's routing slot.
-MULTISLOT = """
-CONTROLPAN-PMAP col=1 row=3 port=WEST idx=4 dir=fwd ms=slave  id=2 sw=pkt slot=0
-CONTROLPAN-PMAP col=1 row=3 port=WEST idx=4 dir=fwd ms=slave  id=2 sw=pkt slot=-1
-CONTROLPAN-PMAP col=1 row=3 port=EAST idx=0 dir=fwd ms=master id=2 sw=pkt slot=3
-CONTROLPAN-PMAP col=1 row=3 port=EAST idx=0 dir=fwd ms=master id=2 sw=circuit slot=-1
+# A circuit direction (no slots): slaves carry an id and link straight to the
+# master with the matching id; the physical port still merges once.
+CIRCUIT = """
+CONTROLPAN-PMAP col=0 row=3 port=EAST  idx=0 dir=ret ms=slave  id=0 sw=circuit slot=-1
+CONTROLPAN-PMAP col=0 row=3 port=NORTH idx=3 dir=ret ms=slave  id=0 sw=circuit slot=-1
+CONTROLPAN-PMAP col=0 row=3 port=SOUTH idx=3 dir=ret ms=master id=0 sw=circuit slot=-1
+CONTROLPAN-PMAP col=0 row=3 port=SOUTH idx=3 dir=ret ms=master id=0 sw=circuit slot=-1
+CONTROLPAN-PMAP col=0 row=2 port=NORTH idx=3 dir=ret ms=slave  id=0 sw=circuit slot=-1
 """
 
-def test_tile_switch_view_dedups_multislot():
-    v = c.tile_switch_view(MULTISLOT, 1, 3)
-    assert len(v["groups"]) == 1
-    g = v["groups"][0]
-    assert g["slaves"] == [{"port": "WEST", "idx": 4}]
-    assert len(g["masters"]) == 1 and g["masters"][0]["port"] == "EAST"
-    assert g["slot"] == 3 and g["sw"] == "pkt"
-
-# A packet slot line carries the slot config (mask,msel,arb) -- which belongs to
-# the GROUP (the slave slot), not the physical slave port -- and each master
-# carries (arb, mselen). The runtime emits a bare enable line (arb=-1) plus a
-# params line (arb>=0) for the same (port,idx); the params-bearing record wins.
-PARAMS = """
-CONTROLPAN-PMAP col=0 row=4 port=SOUTH idx=4 dir=fwd ms=slave  id=0 sw=pkt slot=0
-CONTROLPAN-PMAP col=0 row=4 port=SOUTH idx=4 dir=fwd ms=slave  id=0 sw=pkt slot=0 arb=2 msel=1 mask=31
-CONTROLPAN-PMAP col=0 row=4 port=CTRL  idx=0 dir=fwd ms=master id=0 sw=pkt slot=0 arb=2 msel=3
-"""
-
-def test_tile_switch_view_surfaces_packet_params():
-    v = c.tile_switch_view(PARAMS, 0, 4)
-    g = v["groups"][0]
-    # Slot config lives on the group, not the slave box.
-    assert g["slaves"] == [{"port": "SOUTH", "idx": 4}]
-    assert g["arb"] == 2 and g["msel"] == 1 and g["mask"] == 31 and g["slot"] == 0
-    m = g["masters"][0]
-    # The master's "msel" field is really MSelEn (a bitmask), surfaced as mselen.
-    assert m["port"] == "CTRL" and m["mselen"] == 3 and m["arb"] == 2
+def test_tile_switch_view_circuit_merges_and_has_no_slots():
+    v = c.tile_switch_view(CIRCUIT, 0, 3)
+    d = v["dirs"][0]
+    assert d["dir"] == "ret"
+    # Two distinct circuit slave ports, each merged once; no packet slots.
+    assert sorted((s["port"], s["idx"]) for s in d["slaves"]) == [("EAST", 0), ("NORTH", 3)]
+    for s in d["slaves"]:
+        assert s["slots"] == [] and s["sw"] == "circuit" and s["id"] == 0
+    # The duplicated SOUTH-3 master lines merge into one master.
+    assert len(d["masters"]) == 1
+    m = d["masters"][0]
+    assert m["port"] == "SOUTH" and m["idx"] == 3 and m["sw"] == "circuit" and m["id"] == 0
+    assert m["dest"] == "(0,2) NORTH"
 
 # One neighbor port pair (EAST<->WEST) serves two flows with different (dir,id)
 # and different slave idx; each edge must carry its own flow's to_idx.

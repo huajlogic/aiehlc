@@ -5349,13 +5349,13 @@ class Handler(BaseHTTPRequestHandler):
                     text = f.read()
             except OSError as e:
                 self._send_json({"error": f"cannot read applog: {e}",
-                                 "groups": []})
+                                 "dirs": []})
                 return
             try:
                 col = int(body.get("col"))
                 row = int(body.get("row"))
             except (TypeError, ValueError):
-                self._send_json({"error": "bad col/row", "groups": []})
+                self._send_json({"error": "bad col/row", "dirs": []})
                 return
             self._send_json(controlpan_pmap.tile_switch_view(text, col, row))
         elif u.path == "/sim/run":
