@@ -787,8 +787,11 @@ AieRC __Runtime_ctrl_setup_routing(__Runtime_CtrlInstance *inst, int port_evt = 
 
 // Enable (on!=0) or disable per-port control-plan provenance logging. When on,
 // the aie_ctrl* routing setup prints one `CONTROLPAN-PMAP ...` line per stream
-// port it programs (tile location, port type/idx, direction, master/slave, id)
-// to stdout (the applog). Call once before the first setup_routing / row_add.
+// port it programs (tile location, port type/idx, direction, master/slave, id,
+// switch type pkt|circuit, slot) to stdout (the applog). Call once before the
+// first setup_routing / row_add. If this is never called, logging auto-enables
+// when the AIE_CTRL_PMAP environment variable is set to a non-empty, non-"0"
+// value.
 void __Runtime_ctrl_pmap_enable(int on);
 
 // Poll the shim S2MM drain until the response lands, sync it for the CPU, and
@@ -900,26 +903,30 @@ AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f);
 AieRC __Runtime_ctrl_row_add(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t col_lo, uint8_t col_hi);
 
 // Broadcast a WRITE control packet (@nwords words to tile byte address
-// @tile_addr) to every tile consuming @f->ctrl_id on the configured rows.
-// Fire-and-forget (no ack, non-blocking). @bd_id / @mm2s_ch select the shim send
-// BD + channel; @log enables the per-send log. Requires a prior row_add.
+// @tile_addr) to every tile of every configured row (stream id ACR_ID_BCAST,
+// id[4]=1). Fire-and-forget (no ack, non-blocking). @bd_id / @mm2s_ch select the
+// shim send BD + channel; @log enables the per-send log. Requires a prior row_add.
 AieRC __Runtime_ctrl_row_broadcast_write(__Runtime_CtrlRowFabric *f, uint32_t tile_addr, const uint32_t *data,
                                          uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log);
 
-// Unicast a WRITE control packet to a SINGLE tile (@target_col on @row) using a
-// distinct stream id (ctrl_id^1) so only that tile consumes it: pre-target tiles
-// forward-only on a parallel MSel (arb0/msel1) added over the broadcast chain,
-// the target consumes at CTRL. Fire-and-forget (block=0). Requires a prior
-// __Runtime_ctrl_row_add for @row and @target_col within its span.
-AieRC __Runtime_ctrl_row_unicast_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t target_col, uint32_t tile_addr,
-                                       const uint32_t *data, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log);
-
-// Unicast a READ control packet to a SINGLE tile (@target_col on @row) and drain
-// the write-with-return response down the shared vertical spine to the shim S2MM
-// (FoT-on-TLAST). Blocks on the shim drain, then copies @nwords data words into
-// @out (per-access stream header stripped). Requires a prior
-// __Runtime_ctrl_row_add for @row and @target_col within its span.
-AieRC __Runtime_ctrl_row_unicast_read(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t target_col, uint32_t tile_addr,
-                                      uint32_t *out, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log);
+// Column-subset row-multicast WRITE control packets (@nwords words to tile byte
+// address @tile_addr on the target @row). The stream id is (class<<2)|rowidx with
+// id[4]=0, where rowidx is @row's add-order index (id[1:0], up to 4 rows). The
+// packet climbs the shared spine (intervening heads forward it via their transit-
+// north slot) to reach any configured row, where the class-selected slots deliver
+// to the intended column subset. Fire-and-forget (block=0). @bd_id / @mm2s_ch
+// select the shim send BD + channel; @log enables the per-send log. Each requires
+// a prior __Runtime_ctrl_row_add for @row (add-order index <= ACR_MAX_ROW_IDX).
+//   all_but_last: every column EXCEPT col_hi.   only_last: only col_hi.
+//   whole_row:    every column incl. col_hi.
+AieRC __Runtime_ctrl_row_all_but_last_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr,
+                                            const uint32_t *data, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch,
+                                            int log);
+AieRC __Runtime_ctrl_row_only_last_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr,
+                                         const uint32_t *data, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch,
+                                         int log);
+AieRC __Runtime_ctrl_row_whole_row_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr,
+                                         const uint32_t *data, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch,
+                                         int log);
 
 #endif // AIE_RUNTIME_H
