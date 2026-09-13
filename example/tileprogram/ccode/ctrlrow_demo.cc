@@ -12,22 +12,30 @@
  *   __Runtime_ctrl_row_add   - configure an EAST chain on a core row (the
  *                              packet climbs a shared vertical spine to the
  *                              row's left tile, then daisy-chains EAST)
- *   __Runtime_ctrl_row_broadcast_write - fire a WRITE control packet that every
- *                              tile on the configured rows consumes (broadcast)
- *   __Runtime_ctrl_row_unicast_write / _read - write to / read back a single
- *                              tile; the read response drains down the shared
- *                              spine to the shim S2MM (FoT-on-TLAST)
+ *   __Runtime_ctrl_row_broadcast_write - fire a WRITE control packet (id[4]=1)
+ *                              that every tile on every configured row consumes
+ *   __Runtime_ctrl_row_{all_but_last,only_last,whole_row}_write - fire a WRITE
+ *                              control packet (id = (class<<2)|rowidx) that a
+ *                              COLUMN SUBSET of one target row consumes:
+ *                              all-but-last = every column except col_hi;
+ *                              only-last = only col_hi; whole-row = every column.
+ *                              The packet climbs the shared spine past any
+ *                              intervening head via its transit-north slot.
  *   __Runtime_ctrl_row_close - tear down
  *
  * The E2E flow configures TWO core rows on one shared spine to prove spine reuse
- * and per-row unicast readback:
- *   1. row_add row A (lower)  -> spine climbs shim..A
- *   2. row_add row B (higher) -> spine EXTENDS to B, reusing hops shim..A
+ * and per-row column-subset targeting:
+ *   1. row_add row A (lower)  -> spine climbs shim..A            (add-order idx 0)
+ *   2. row_add row B (higher) -> spine EXTENDS to B, reusing hops shim..A (idx 1)
  *   3. re-add row A           -> idempotent no-op (nrows unchanged)
  *   4. broadcast_write sentinel to a scratch L1 addr on every tile of both rows
- *   5. unicast_write + unicast_read a distinct value on col DEMO_UNI_COL of each
- *      row, comparing the readback (drained via the shim S2MM) to the written value
- * Success = both readbacks PASS and the run reaches teardown with no AIE ERROR.
+ *   5. per-class writes to row A (all-but-last, only-last, whole-row) then a
+ *      whole-row + only-last to row B, verifying via the direct debug memory
+ *      interface that exactly the intended column subset of the targeted row
+ *      changed and the other row did not (row B is ABOVE head row A, so this also
+ *      checks the spine climb past a head).
+ * Success = every class probe PASSes and the run reaches teardown with no AIE
+ * ERROR.
  *
  * Build (single-kernel flow — the dummy kernel below is extracted into a kernel
  * ELF; aie_runtime.c + aie_runtime_control_plan.c are linked in):
@@ -107,38 +115,65 @@ __global__ void ctrlrow_demo_dummy(input_window_int32 *win
 #define DEMO_MM2S_CH 0
 #define DEMO_S2MM_CH 0 /* shim response S2MM (even ch -> bd<24, parity rule) */
 
-/* Unicast: a distinct value to a single tile on each row, read back via the shim
- * S2MM response path. Row A/B get different values so a cross-talk bug is visible. */
-#define DEMO_UNI_COL 1u       /* single target column within [col_lo..col_hi] */
-#define DEMO_UNI_ADDR 0x2000u /* separate in-range core L1 scratch */
-#define DEMO_UNI_VAL_A 0xBEEF0003u
-#define DEMO_UNI_VAL_B 0xBEEF0005u
-#define DEMO_UNI_BD 3 /* shim MM2S BD for the unicast send */
+/* Column-subset multicast: a distinct value per probe so both cross-column and
+ * cross-row leaks are visible. Verified via the direct debug memory interface
+ * (XAie_DataMemBlockRead), not a control-response readback. */
+#define DEMO_MC_ADDR 0x2000u /* separate in-range core L1 scratch */
+#define DEMO_MC_BD 3         /* shim MM2S BD for the multicast send */
 
-/* Unicast-write a distinct value to tile(DEMO_UNI_COL,row), read it back through
- * the shim S2MM response path, and compare. Returns 0 on PASS, -1 otherwise. */
-static int demo_probe_tile(__Runtime_CtrlRowFabric *fab, uint8_t row, uint32_t val) {
+/* Send @val to a column subset of @target_row (selected by @cls) at DEMO_MC_ADDR,
+ * then verify via the direct debug memory interface that exactly the intended
+ * columns of @target_row hold @val (all-but-last: cols < col_hi; only-last: col_hi;
+ * whole-row: all) and no column of the other configured row @other_row does (no
+ * cross-row leak). Distinct @val per call keeps stale writes from other classes
+ * out of the equality test. Returns 0 on PASS, -1 otherwise. */
+static int demo_probe_class(__Runtime_CtrlRowFabric *fab, XAie_DevInst *dev, uint8_t cls, uint8_t target_row,
+                            uint8_t other_row, uint32_t val) {
+    const char *name = (cls == (uint8_t)ACR_CLASS_ALL_BUT_LAST) ? "all-but-last"
+                       : (cls == (uint8_t)ACR_CLASS_ONLY_LAST)  ? "only-last"
+                                                                : "whole-row";
     uint32_t wr = val;
-    AieRC rc = __Runtime_ctrl_row_unicast_write(fab, row, DEMO_UNI_COL, DEMO_UNI_ADDR, &wr, /*nwords=*/1u, DEMO_UNI_BD,
-                                                DEMO_MM2S_CH, /*log=*/1);
+    AieRC rc;
+    if (cls == (uint8_t)ACR_CLASS_ALL_BUT_LAST)
+        rc = __Runtime_ctrl_row_all_but_last_write(fab, target_row, DEMO_MC_ADDR, &wr, 1u, DEMO_MC_BD, DEMO_MM2S_CH, 1);
+    else if (cls == (uint8_t)ACR_CLASS_ONLY_LAST)
+        rc = __Runtime_ctrl_row_only_last_write(fab, target_row, DEMO_MC_ADDR, &wr, 1u, DEMO_MC_BD, DEMO_MM2S_CH, 1);
+    else
+        rc = __Runtime_ctrl_row_whole_row_write(fab, target_row, DEMO_MC_ADDR, &wr, 1u, DEMO_MC_BD, DEMO_MM2S_CH, 1);
     if (rc != XAIE_OK) {
-        printf("[ctrlrow] unicast_write row=%u rc=%d\n", (unsigned)row, (int)rc);
+        printf("[ctrlrow] %s write row=%u rc=%d\n", name, (unsigned)target_row, (int)rc);
         return -1;
     }
-    printf("[ctrlrow] unicast_write 0x%08x -> addr 0x%x on tile(%u,%u) done\n", val, DEMO_UNI_ADDR, DEMO_UNI_COL,
-           (unsigned)row);
+    printf("[ctrlrow] %s write 0x%08x -> addr 0x%x on row %u done\n", name, val, DEMO_MC_ADDR, (unsigned)target_row);
 
-    uint32_t readback = 0u;
-    rc = __Runtime_ctrl_row_unicast_read(fab, row, DEMO_UNI_COL, DEMO_UNI_ADDR, &readback, /*nwords=*/1u, DEMO_UNI_BD,
-                                         DEMO_MM2S_CH, /*log=*/1);
-    if (rc != XAIE_OK) {
-        printf("[ctrlrow] unicast_read row=%u rc=%d\n", (unsigned)row, (int)rc);
-        return -1;
+    int fails = 0;
+    /* Target row: the intended column subset holds @val; others must not. */
+    for (uint8_t dc = DEMO_COL_LO; dc <= DEMO_COL_HI; dc++) {
+        int is_last = (dc == DEMO_COL_HI);
+        int expect = (cls == (uint8_t)ACR_CLASS_WHOLE_ROW)   ? 1
+                     : (cls == (uint8_t)ACR_CLASS_ONLY_LAST) ? is_last
+                                                             : !is_last; /* all-but-last */
+        uint32_t v = 0u;
+        (void)XAie_DataMemBlockRead(dev, XAie_TileLoc(dc, target_row), DEMO_MC_ADDR, &v, sizeof(v));
+        int got = (v == val);
+        int ok = (got == expect);
+        printf("[ctrlrow] %s row=%u tile(%u,%u) -> 0x%08x %s (expect %s) %s\n", name, (unsigned)target_row,
+               (unsigned)dc, (unsigned)target_row, v, got ? "SET" : "unset", expect ? "SET" : "unset",
+               ok ? "PASS" : "FAIL");
+        if (!ok)
+            fails++;
     }
-    int pass = (readback == val);
-    printf("[ctrlrow] unicast_read tile(%u,%u) addr 0x%x -> 0x%08x (expected 0x%08x) %s\n", DEMO_UNI_COL, (unsigned)row,
-           DEMO_UNI_ADDR, readback, val, pass ? "PASS" : "MISMATCH");
-    return pass ? 0 : -1;
+    /* Other row: no column may hold this value (no cross-row leak). */
+    for (uint8_t dc = DEMO_COL_LO; dc <= DEMO_COL_HI; dc++) {
+        uint32_t v = 0u;
+        (void)XAie_DataMemBlockRead(dev, XAie_TileLoc(dc, other_row), DEMO_MC_ADDR, &v, sizeof(v));
+        int ok = (v != val);
+        printf("[ctrlrow] %s row=%u no-leak tile(%u,%u) -> 0x%08x %s\n", name, (unsigned)target_row, (unsigned)dc,
+               (unsigned)other_row, v, ok ? "PASS" : "LEAK");
+        if (!ok)
+            fails++;
+    }
+    return fails == 0 ? 0 : -1;
 }
 
 /* Add one core row and log the resulting spine/chain counters. */
@@ -155,6 +190,12 @@ static AieRC demo_add_row(__Runtime_CtrlRowFabric *fab, uint8_t row) {
 
 int run_ctrlrow_demo(XAie_DevInst *dev) {
     __Runtime_CtrlRowFabric fab;
+
+    /* Emit the control-plan provenance map (CONTROLPAN-PMAP lines) so the
+     * aiedebug device-map "Load control plan" button can overlay the row-fabric
+     * control route. Must precede the first row_add. On this baremetal target
+     * getenv("AIE_CTRL_PMAP") is unavailable, so enable it explicitly here. */
+    __Runtime_ctrl_pmap_enable(1);
 
     AieRC rc = __Runtime_ctrl_row_open(&fab, dev, DEMO_SHIM_COL, DEMO_S2MM_CH, (uint8_t)DEMO_CTRL_ID);
     if (rc != XAIE_OK) {
@@ -206,13 +247,31 @@ int run_ctrlrow_demo(XAie_DevInst *dev) {
         }
     }
 
-    /* 5. Per-row unicast write + read-back through the shim S2MM response. */
+    /* 5. Per-class column-subset writes, verified via the direct debug memory
+     * interface. Exercise all three classes on row A (lower head), then whole-row
+     * and only-last on row B (ABOVE head A -> also checks the spine climb past a
+     * head). only-last on row B rides the transit-east slot through interior tiles
+     * to col_hi. Each probe checks exactly the intended columns changed and the
+     * other row did not (no cross-row leak). Distinct values keep the checks clean. */
     int fails = 0;
-    fails += demo_probe_tile(&fab, DEMO_CORE_ROW_A, DEMO_UNI_VAL_A) ? 1 : 0;
-    fails += demo_probe_tile(&fab, DEMO_CORE_ROW_B, DEMO_UNI_VAL_B) ? 1 : 0;
+    fails += demo_probe_class(&fab, dev, (uint8_t)ACR_CLASS_ALL_BUT_LAST, DEMO_CORE_ROW_A, DEMO_CORE_ROW_B, 0xA1B00003u)
+                 ? 1
+                 : 0;
+    fails += demo_probe_class(&fab, dev, (uint8_t)ACR_CLASS_ONLY_LAST, DEMO_CORE_ROW_A, DEMO_CORE_ROW_B, 0x0A1A0003u)
+                 ? 1
+                 : 0;
+    fails += demo_probe_class(&fab, dev, (uint8_t)ACR_CLASS_WHOLE_ROW, DEMO_CORE_ROW_A, DEMO_CORE_ROW_B, 0x00110003u)
+                 ? 1
+                 : 0;
+    fails += demo_probe_class(&fab, dev, (uint8_t)ACR_CLASS_WHOLE_ROW, DEMO_CORE_ROW_B, DEMO_CORE_ROW_A, 0x00110005u)
+                 ? 1
+                 : 0;
+    fails += demo_probe_class(&fab, dev, (uint8_t)ACR_CLASS_ONLY_LAST, DEMO_CORE_ROW_B, DEMO_CORE_ROW_A, 0x0A1A0005u)
+                 ? 1
+                 : 0;
 
     __Runtime_ctrl_row_close(&fab);
-    printf("[ctrlrow] DONE %s (%d readback failure(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
+    printf("[ctrlrow] DONE %s (%d multicast failure(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
     return fails == 0 ? 0 : -1;
 }
 
