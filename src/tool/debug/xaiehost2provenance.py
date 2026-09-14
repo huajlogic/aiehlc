@@ -128,16 +128,16 @@ RE_CTRL_CALL = re.compile(
     r"__Runtime_ctrl_(?:read|push)_target\s*\(\s*[^,]+,\s*"
     r"([^,]+),\s*([^,]+),\s*([^,]+),")
 
-# Row-control fabric (design: 2026-09-08-row-control-connection). One
-# __Runtime_ctrl_row_open(fab, dev, shim_col, ...) picks the shared spine (shim)
-# column; each __Runtime_ctrl_row_add(fab, row, col_lo, col_hi) adds one EAST
-# chain rooted on the spine. Only the leading positional args are captured
-# (later args carry casts like (uint8_t) whose inner ')' would break a balanced
-# match), which is all the tile/routing model needs.
-RE_ROW_OPEN = re.compile(
-    r"__Runtime_ctrl_row_open\s*\(\s*[^,]+,\s*[^,]+,\s*([^,]+),")
-RE_ROW_ADD = re.compile(
-    r"__Runtime_ctrl_row_add\s*\(\s*[^,]+,\s*([^,]+),\s*([^,]+),\s*([^,)]+)\)")
+# Row-control fabric (design: 2026-09-08-row-control-connection). The single
+# __Runtime_ctrl_plan_init(fab, dev, shim_col, ...) picks the shared spine (shim)
+# column; its row list is a __Runtime_CtrlRowChain rows[] = {{row, col_lo,
+# col_hi}, ...} array. Capture the 3rd positional arg (shim_col) and each
+# {row, col_lo, col_hi} triple from the array initializer.
+RE_PLAN_INIT = re.compile(
+    r"__Runtime_ctrl_plan_init\s*\(\s*[^,]+,\s*[^,]+,\s*([^,]+),")
+RE_ROW_ARRAY = re.compile(
+    r"__Runtime_CtrlRowChain\s+\w+\s*\[[^\]]*\]\s*=\s*\{(.*?)\}\s*;", re.DOTALL)
+RE_ROW_TRIPLE = re.compile(r"\{\s*([^,{}]+),\s*([^,{}]+),\s*([^,{}]+)\}")
 
 
 def collect_defines(src):
@@ -195,129 +195,30 @@ def extract_ctrl_sends(active, defs):
     return sends
 
 
-# C-keyword statement heads that look like function definitions (`kw (...) {`)
-# but are not — excluded from the function table so wrapper resolution sees only
-# real functions. (for/while carry a `;` in their head so they never match here.)
-_C_STMT_KW = frozenset(("if", "while", "switch", "for", "do", "else",
-                        "return", "sizeof", "catch"))
-RE_C_FUNC = re.compile(r"([A-Za-z_]\w*)\s*\(([^;{}()]*)\)\s*\{")
-
-
-def _c_functions(src):
-    """[(name, [param_names], body_start, body_end)] for each C function def.
-
-    body_start/body_end bracket the definition so a call's char offset can be
-    mapped to its enclosing function. Only simple (no nested-paren) parameter
-    lists are parsed, which covers the row-fabric wrappers. Brace matching is
-    depth-based (mirrors find_entry_fn); string braces are not accounted for but
-    the generated host.cc has none in the relevant helpers."""
-    funcs = []
-    for m in RE_C_FUNC.finditer(src):
-        if m.group(1) in _C_STMT_KW:
-            continue
-        depth, i, n = 0, m.end() - 1, len(src)
-        while i < n:
-            if src[i] == "{":
-                depth += 1
-            elif src[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        params = []
-        for p in m.group(2).split(","):
-            toks = re.findall(r"[A-Za-z_]\w*", p)
-            if toks:
-                params.append(toks[-1])
-        funcs.append((m.group(1), params, m.start(), i))
-    return funcs
-
-
-def _call_args(src, name):
-    """Top-level argument-expression lists for every call `name(...)` in @src.
-
-    Balanced-paren aware so nested casts/calls in an argument stay intact; splits
-    only on depth-1 commas. The function's own definition header matches too but
-    its 'args' are typed params that fold to None, so it is harmlessly ignored."""
-    out = []
-    for m in re.finditer(r"\b%s\s*\(" % re.escape(name), src):
-        i, depth, n = m.end(), 1, len(src)
-        args, cur = [], ""
-        while i < n and depth > 0:
-            ch = src[i]
-            if ch == "(":
-                depth += 1
-                cur += ch
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    if cur.strip():
-                        args.append(cur.strip())
-                else:
-                    cur += ch
-            elif ch == "," and depth == 1:
-                args.append(cur.strip())
-                cur = ""
-            else:
-                cur += ch
-            i += 1
-        out.append(args)
-    return out
-
-
 def extract_ctrl_rows(active, defs):
     """Reduce a row-control fabric to {shim_col, rows:[{row,col_lo,col_hi}]}.
 
-    The single __Runtime_ctrl_row_open gives the shared spine (shim) column; each
-    __Runtime_ctrl_row_add adds one EAST chain. Chains are deduped by
-    (row,col_lo,col_hi) so an idempotent re-add collapses. Returns None when no
-    fabric is opened (or its shim column can't be folded); chains whose fields
-    don't fold are skipped. Values fold through @defs, tolerating u/l suffixes.
-
-    One level of wrapper forwarding is resolved: when a row_add argument is a bare
-    identifier naming a parameter of the enclosing function (e.g. a
-    `demo_add_row(fab, row)` helper that forwards `row`), the value is folded from
-    that helper's call-site arguments instead — so rows configured only through a
-    wrapper still land in the grid."""
-    mo = RE_ROW_OPEN.search(active)
+    The single __Runtime_ctrl_plan_init gives the shared spine (shim) column; its
+    __Runtime_CtrlRowChain rows[] initializer lists the EAST chains as {row,
+    col_lo, col_hi} triples. Chains are deduped by (row,col_lo,col_hi). Returns
+    None when no fabric is initialized (or its shim column can't be folded);
+    triples whose fields don't fold are skipped. Values fold through @defs,
+    tolerating u/l suffixes."""
+    mo = RE_PLAN_INIT.search(active)
     if not mo:
         return None
     shim_col = _ctrl_int(mo.group(1), defs)
     if shim_col is None:
         return None
-    funcs = _c_functions(active)
-
-    def _resolve(expr, pos):
-        """Fold @expr to a list of ints. Direct fold first; else, if @expr names a
-        parameter of the function enclosing char offset @pos, fold that wrapper's
-        call-site args at the parameter position. Empty list = unresolvable."""
-        v = _ctrl_int(expr, defs)
-        if v is not None:
-            return [v]
-        name = expr.strip()
-        if not re.fullmatch(r"[A-Za-z_]\w*", name):
-            return []
-        for fn, params, s, e in funcs:
-            if s <= pos <= e and name in params:
-                k = params.index(name)
-                vals = []
-                for args in _call_args(active, fn):
-                    if k < len(args):
-                        cv = _ctrl_int(args[k], defs)
-                        if cv is not None and cv not in vals:
-                            vals.append(cv)
-                return vals
-        return []
-
     rows, seen = [], set()
-    for m in RE_ROW_ADD.finditer(active):
-        row_vals = _resolve(m.group(1), m.start())
-        lo_vals = _resolve(m.group(2), m.start())
-        hi_vals = _resolve(m.group(3), m.start())
-        if not row_vals or not lo_vals or not hi_vals:
-            continue
-        col_lo, col_hi = lo_vals[0], hi_vals[0]
-        for row in row_vals:
+    am = RE_ROW_ARRAY.search(active)
+    if am:
+        for tm in RE_ROW_TRIPLE.finditer(am.group(1)):
+            row = _ctrl_int(tm.group(1), defs)
+            col_lo = _ctrl_int(tm.group(2), defs)
+            col_hi = _ctrl_int(tm.group(3), defs)
+            if row is None or col_lo is None or col_hi is None:
+                continue
             key = (row, col_lo, col_hi)
             if key in seen:
                 continue
@@ -336,7 +237,8 @@ def strip_comments(src):
 
 RE_XAIE_CALL = re.compile(
     r"(XAie_(LoadElfMem|MoveData\w+|Route)|__Runtime_ctrl_setup_routing"
-    r"|__Runtime_ctrl_(read|push)_target|__Runtime_ctrl_row_\w+)\b")
+    r"|__Runtime_ctrl_(read|push)_target|__Runtime_ctrl_plan_init"
+    r"|__Runtime_ctrl_row_\w+)\b")
 RE_FUNC_HDR = re.compile(r"([A-Za-z_]\w*)\s*\([^;]*\)\s*\{?\s*$")
 
 

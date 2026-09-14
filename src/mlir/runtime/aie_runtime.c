@@ -3474,97 +3474,26 @@ static void rt_pmap_port(uint8_t col, uint8_t row, const char *ptype, uint8_t pi
 }
 
 /**
- * Program the same-column forward (shim MM2S -> dest CTRL) and return
- * (dest -> shim S2MM) stream-switch routes for a control-packet send @c.
- * Both directions are pure circuit-switched, matching aie-rt's validated
- * control-packet path (_XAie_LoadElfSetupStrmSw): the CTRL port receives the raw
- * stream and self-delimits each control access from the embedded packet header +
- * control-info (beats) words, so no per-hop packet-switch demux is used (which
- * would mis-frame a multi-packet buffer sent under a single TLAST).
- * c->mm2s_ch/c->s2mm_ch are DMA channels; the shim stream ports are derived above.
- * @port_evt  if nonzero (default), route each hop's forward/return output port
- *            onto the diagnostic event select slots (read back by
- *            rt_ctrl_dump_path_ports); pass 0 to skip the port-event selects.
+ * Program the same-column control-packet RETURN route for send @c: the dest
+ * tile's CTRL slave port (control-packet response emitter) drives SOUTH master
+ * (packet-switched, KEEPING the header) then circuit-switched pass-through down
+ * the spine to the shim S2MM demux port. Split out of rt_ctrl_route_setup_col so
+ * the unicast forward route and the response drain can be programmed
+ * independently (the row-multicast fabric supplies its own return chain).
+ * @port_evt  if nonzero, route each hop's return output port onto the diagnostic
+ *            event select slots (read back by rt_ctrl_dump_path_ports).
  */
-static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_evt) {
+static AieRC rt_ctrl_col_return_route(const __Runtime_CtrlInstance *c, int port_evt) {
     XAie_DevInst *dev = c->dev;
     uint8_t shim_col = c->shim_col;
     uint8_t dest_row = c->dest_row;
     uint8_t stream_id = c->stream_id;
-    int32_t mm2s_ch = c->mm2s_ch;
     int32_t s2mm_ch = c->s2mm_ch;
     XAie_LocType shim = XAie_TileLoc(shim_col, 0U);
     XAie_LocType dst = XAie_TileLoc(shim_col, dest_row);
-    uint8_t fport = rt_shim_mm2s_port(mm2s_ch);       /* shim SOUTH MM2S mux port (3/7) */
-    uint8_t rport = rt_shim_s2mm_port(dev, s2mm_ch);  /* shim SOUTH S2MM demux port (1/3) */
-    uint8_t vfwd = RT_CTRL_VFWD, vret = RT_CTRL_VRET; /* vertical climb channels */
+    uint8_t rport = rt_shim_s2mm_port(dev, s2mm_ch); /* shim SOUTH S2MM demux port (1/3) */
+    uint8_t vret = RT_CTRL_VRET;                     /* vertical return channel */
     AieRC rc;
-
-    /* Forward: shim DMA MM2S onto SOUTH mux port, then SOUTH -> NORTH up. */
-    rc = XAie_EnableShimDmaToAieStrmPort(dev, shim, fport);
-    if (rc != XAIE_OK) {
-        printf("[aie_runtime] ctrl_route: EnableShimDmaToAieStrmPort shim(%u,0) port=%u rc=%d\n", (unsigned)shim_col,
-               (unsigned)fport, (int)rc);
-        return rc;
-    }
-    rc = XAie_StrmConnCctEnable(dev, shim, SOUTH, fport, NORTH, vfwd);
-    if (rc != XAIE_OK) {
-        printf("[aie_runtime] ctrl_route: shim StrmConnCctEnable (%u,0) SOUTH%u->NORTH%u rc=%d\n", (unsigned)shim_col,
-               (unsigned)fport, (unsigned)vfwd, (int)rc);
-        return rc;
-    }
-    rt_pmap_port(shim_col, 0, "SOUTH", fport, "fwd", "slave", stream_id, "circuit", -1);
-    rt_pmap_port(shim_col, 0, "NORTH", vfwd, "fwd", "master", stream_id, "circuit", -1);
-    /* Diagnostic: watch the shim forward output (NORTH master vfwd) on slot 0. */
-    if (port_evt)
-        (void)XAie_EventSelectStrmPort(dev, shim, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, NORTH, vfwd);
-    /* Forward vertical hops rows 1..dest_row-1: SOUTH slave -> NORTH master. */
-    for (uint8_t r = 1U; r < dest_row; r++) {
-        XAie_LocType thru = XAie_TileLoc(shim_col, r);
-        rc = XAie_StrmConnCctEnable(dev, thru, SOUTH, vfwd, NORTH, vfwd);
-        if (rc != XAIE_OK) {
-            printf("[aie_runtime] ctrl_route: fwd StrmConnCctEnable (%u,%u) SOUTH->NORTH ch=%u rc=%d\n",
-                   (unsigned)shim_col, (unsigned)r, (unsigned)vfwd, (int)rc);
-            return rc;
-        }
-        rt_pmap_port(shim_col, r, "SOUTH", vfwd, "fwd", "slave", stream_id, "circuit", -1);
-        rt_pmap_port(shim_col, r, "NORTH", vfwd, "fwd", "master", stream_id, "circuit", -1);
-        /* Diagnostic: watch this hop's forward output (NORTH master vfwd) on slot 0. */
-        if (port_evt)
-            (void)XAie_EventSelectStrmPort(dev, thru, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, NORTH, vfwd);
-    }
-    /* Dest tile: circuit-switch SOUTH(vfwd) slave -> CTRL master, exactly like
-     * aie-rt's _XAie_LoadElfSetupStrmSw (the validated control-packet path). The
-     * whole climb is circuit-switched, so the CTRL port receives the raw stream
-     * and self-delimits each control access using the embedded packet header +
-     * control-info (beats) words. Packet-switched routing here is wrong for a
-     * multi-packet buffer sent under a single TLAST: the switch treats the whole
-     * buffer as ONE packet (matching only the first header) and never re-demuxes
-     * the subsequent packets, so the CTRL framing breaks. stream_id is unused on
-     * the forward path now (kept in the instance only for the response id). */
-    (void)stream_id;
-    rc = XAie_StrmConnCctEnable(dev, dst, SOUTH, vfwd, CTRL, 0U);
-    if (rc != XAIE_OK) {
-        printf("[aie_runtime] ctrl_route: dest StrmConnCctEnable (%u,%u) SOUTH%u->CTRL rc=%d\n", (unsigned)shim_col,
-               (unsigned)dest_row, (unsigned)vfwd, (int)rc);
-        return rc;
-    }
-    rt_pmap_port(shim_col, dest_row, "SOUTH", vfwd, "fwd", "slave", stream_id, "circuit", -1);
-    rt_pmap_port(shim_col, dest_row, "CTRL", 0, "fwd", "master", stream_id, "circuit", -1);
-    /* Diagnostic: route the dest CTRL master port state onto select-id 0 so the
-     * PORT_RUNNING_0 / PORT_IDLE_0 core events reflect whether the forward
-     * control stream ever reached the CTRL port (mirrors _XAie_LoadElfSetupStrmSw
-     * which watches the last tile's CTRL master). Read back in __Runtime_ctrl_push.
-     * Diagnostic: route the dest CTRL slave port (the response emitter) onto the
-     * return slot so PORT_RUNNING/STALLED/IDLE reveal whether the CTRL handler
-     * ever drove a read/write-with-return response. Slave running/stalled =>
-     * response emitted (fault is on the return route); slave idle-only => no
-     * response generated (fault is request encoding / CTRL side). Distinct slots
-     * so master and slave selects do not clobber each other. */
-    if (port_evt) {
-        (void)XAie_EventSelectStrmPort(dev, dst, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, CTRL, 0U);
-        (void)XAie_EventSelectStrmPort(dev, dst, RT_CTRL_SEL_RET, XAIE_STRMSW_SLAVE, CTRL, 0U);
-    }
 
     /* Return: dest CTRL slave port (control-packet response emitter) -> SOUTH
      * master, then pass-through down to the shim S2MM. Per doc/controlpkt.txt the
@@ -3586,7 +3515,6 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
      *      __Runtime_ctrl_pktize_read). A write-with-return ack is header-only
      *      (one word); a read response is header + 1..4 data words.
      * (s2mm_ch is unused for the dest hop; it only selects the shim demux port.) */
-    (void)s2mm_ch;
     const uint8_t ctrl_arb = 0U;                            /* arbiter 0..7 */
     const uint8_t ctrl_msel = 0U;                           /* slot MSel 0..3 */
     const uint8_t ctrl_mselen = (uint8_t)(1U << ctrl_msel); /* master MSelEn bitmask */
@@ -3657,10 +3585,106 @@ static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_e
     }
     rt_pmap_port(shim_col, 0, "NORTH", vret, "ret", "slave", stream_id, "circuit", -1);
     rt_pmap_port(shim_col, 0, "SOUTH", rport, "ret", "master", stream_id, "circuit", -1);
-    AIEHLC_LOG(
-        printf("[aie_runtime] ctrl_route ok: shim(%u,0)<->dest(%u,%u) fport=%u rport=%u vfwd=%u vret=%u sid=%u\n",
-               (unsigned)shim_col, (unsigned)shim_col, (unsigned)dest_row, (unsigned)fport, (unsigned)rport,
-               (unsigned)vfwd, (unsigned)vret, (unsigned)stream_id););
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_return ok: shim(%u,0)<-dest(%u,%u) rport=%u vret=%u sid=%u\n",
+                      (unsigned)shim_col, (unsigned)shim_col, (unsigned)dest_row, (unsigned)rport, (unsigned)vret,
+                      (unsigned)stream_id););
+    return XAIE_OK;
+}
+
+/**
+ * Program the same-column FORWARD (shim MM2S -> dest CTRL) stream-switch route
+ * for a control-packet send @c. Pure circuit-switched, matching aie-rt's
+ * validated control-packet path (_XAie_LoadElfSetupStrmSw): the CTRL port
+ * receives the raw stream and self-delimits each control access from the embedded
+ * packet header + control-info (beats) words, so no per-hop packet-switch demux
+ * is used (which would mis-frame a multi-packet buffer sent under a single TLAST).
+ * The response drain (dest CTRL slave -> shim S2MM) is programmed separately by
+ * rt_ctrl_col_return_route.
+ * c->mm2s_ch is the DMA channel; the shim stream port is derived above.
+ * @port_evt  if nonzero (default), route each hop's forward output port onto the
+ *            diagnostic event select slots (read back by
+ *            rt_ctrl_dump_path_ports); pass 0 to skip the port-event selects.
+ */
+static AieRC rt_ctrl_route_setup_col(const __Runtime_CtrlInstance *c, int port_evt) {
+    XAie_DevInst *dev = c->dev;
+    uint8_t shim_col = c->shim_col;
+    uint8_t dest_row = c->dest_row;
+    uint8_t stream_id = c->stream_id;
+    int32_t mm2s_ch = c->mm2s_ch;
+    XAie_LocType shim = XAie_TileLoc(shim_col, 0U);
+    XAie_LocType dst = XAie_TileLoc(shim_col, dest_row);
+    uint8_t fport = rt_shim_mm2s_port(mm2s_ch); /* shim SOUTH MM2S mux port (3/7) */
+    uint8_t vfwd = RT_CTRL_VFWD;                /* vertical climb channel */
+    AieRC rc;
+
+    /* Forward: shim DMA MM2S onto SOUTH mux port, then SOUTH -> NORTH up. */
+    rc = XAie_EnableShimDmaToAieStrmPort(dev, shim, fport);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_route: EnableShimDmaToAieStrmPort shim(%u,0) port=%u rc=%d\n", (unsigned)shim_col,
+               (unsigned)fport, (int)rc);
+        return rc;
+    }
+    rc = XAie_StrmConnCctEnable(dev, shim, SOUTH, fport, NORTH, vfwd);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_route: shim StrmConnCctEnable (%u,0) SOUTH%u->NORTH%u rc=%d\n", (unsigned)shim_col,
+               (unsigned)fport, (unsigned)vfwd, (int)rc);
+        return rc;
+    }
+    rt_pmap_port(shim_col, 0, "SOUTH", fport, "fwd", "slave", stream_id, "circuit", -1);
+    rt_pmap_port(shim_col, 0, "NORTH", vfwd, "fwd", "master", stream_id, "circuit", -1);
+    /* Diagnostic: watch the shim forward output (NORTH master vfwd) on slot 0. */
+    if (port_evt)
+        (void)XAie_EventSelectStrmPort(dev, shim, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, NORTH, vfwd);
+    /* Forward vertical hops rows 1..dest_row-1: SOUTH slave -> NORTH master. */
+    for (uint8_t r = 1U; r < dest_row; r++) {
+        XAie_LocType thru = XAie_TileLoc(shim_col, r);
+        rc = XAie_StrmConnCctEnable(dev, thru, SOUTH, vfwd, NORTH, vfwd);
+        if (rc != XAIE_OK) {
+            printf("[aie_runtime] ctrl_route: fwd StrmConnCctEnable (%u,%u) SOUTH->NORTH ch=%u rc=%d\n",
+                   (unsigned)shim_col, (unsigned)r, (unsigned)vfwd, (int)rc);
+            return rc;
+        }
+        rt_pmap_port(shim_col, r, "SOUTH", vfwd, "fwd", "slave", stream_id, "circuit", -1);
+        rt_pmap_port(shim_col, r, "NORTH", vfwd, "fwd", "master", stream_id, "circuit", -1);
+        /* Diagnostic: watch this hop's forward output (NORTH master vfwd) on slot 0. */
+        if (port_evt)
+            (void)XAie_EventSelectStrmPort(dev, thru, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, NORTH, vfwd);
+    }
+    /* Dest tile: circuit-switch SOUTH(vfwd) slave -> CTRL master, exactly like
+     * aie-rt's _XAie_LoadElfSetupStrmSw (the validated control-packet path). The
+     * whole climb is circuit-switched, so the CTRL port receives the raw stream
+     * and self-delimits each control access using the embedded packet header +
+     * control-info (beats) words. Packet-switched routing here is wrong for a
+     * multi-packet buffer sent under a single TLAST: the switch treats the whole
+     * buffer as ONE packet (matching only the first header) and never re-demuxes
+     * the subsequent packets, so the CTRL framing breaks. stream_id is unused on
+     * the forward path now (kept in the instance only for the response id). */
+    (void)stream_id;
+    rc = XAie_StrmConnCctEnable(dev, dst, SOUTH, vfwd, CTRL, 0U);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_route: dest StrmConnCctEnable (%u,%u) SOUTH%u->CTRL rc=%d\n", (unsigned)shim_col,
+               (unsigned)dest_row, (unsigned)vfwd, (int)rc);
+        return rc;
+    }
+    rt_pmap_port(shim_col, dest_row, "SOUTH", vfwd, "fwd", "slave", stream_id, "circuit", -1);
+    rt_pmap_port(shim_col, dest_row, "CTRL", 0, "fwd", "master", stream_id, "circuit", -1);
+    /* Diagnostic: route the dest CTRL master port state onto select-id 0 so the
+     * PORT_RUNNING_0 / PORT_IDLE_0 core events reflect whether the forward
+     * control stream ever reached the CTRL port (mirrors _XAie_LoadElfSetupStrmSw
+     * which watches the last tile's CTRL master). Read back in __Runtime_ctrl_push.
+     * Diagnostic: route the dest CTRL slave port (the response emitter) onto the
+     * return slot so PORT_RUNNING/STALLED/IDLE reveal whether the CTRL handler
+     * ever drove a read/write-with-return response. Slave running/stalled =>
+     * response emitted (fault is on the return route); slave idle-only => no
+     * response generated (fault is request encoding / CTRL side). Distinct slots
+     * so master and slave selects do not clobber each other. */
+    if (port_evt) {
+        (void)XAie_EventSelectStrmPort(dev, dst, RT_CTRL_SEL_FWD, XAIE_STRMSW_MASTER, CTRL, 0U);
+        (void)XAie_EventSelectStrmPort(dev, dst, RT_CTRL_SEL_RET, XAIE_STRMSW_SLAVE, CTRL, 0U);
+    }
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_route ok: shim(%u,0)->dest(%u,%u) fport=%u vfwd=%u sid=%u\n",
+                      (unsigned)shim_col, (unsigned)shim_col, (unsigned)dest_row, (unsigned)fport, (unsigned)vfwd,
+                      (unsigned)stream_id););
     return XAIE_OK;
 }
 
@@ -3698,12 +3722,14 @@ static const char *rt_acr_port_name(acr_port p) {
     }
 }
 
-/* fwd/ret for a remapped vertical spine channel; horizontal taps default fwd. */
-static const char *rt_acr_dir(acr_port p, uint8_t chan) {
-    if (p == ACR_NORTH || p == ACR_SOUTH)
-        return chan == RT_CTRL_VRET ? "ret" : "fwd";
-    return "fwd";
-}
+/* fwd/ret provenance tag for an op's ports, taken from the planner's own is_ret
+ * flag rather than the port type. A port-based guess mislabels the whole return
+ * chain: its slots sit on CTRL/EAST slaves and its non-head master is WEST, all
+ * port types the forward chain also uses, so only the VRET spine hops came out
+ * right. The dir tag drives the device-map overlay colour AND the per-direction
+ * bucketing in controlpan_pmap.tile_switch_view -- a slot and the master that
+ * pulls it must share a dir or the switch-detail view cannot link them. */
+static const char *rt_acr_dir(const acr_op *op) { return op->is_ret ? "ret" : "fwd"; }
 
 /* Remap a pure-planner spine port index (channel-agnostic idx 0) to the real
  * vertical channel numbers the rest of the runtime uses. The planner emits the
@@ -3741,31 +3767,31 @@ AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops) {
             rc = XAie_StrmPktSwSlaveSlotEnable(dev, loc, rt_acr_port(op->sport), sidx, op->slot, pkt, op->mask,
                                                op->msel, op->arbiter);
             /* log: record the slave slot port in the provenance map */
-            rt_pmap_port_ex(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op->sport, sidx), "slave",
-                            op->pkt_id, "pkt", (int)op->slot, (int)op->arbiter, (int)op->msel, (int)op->mask);
+            rt_pmap_port_ex(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op), "slave", op->pkt_id,
+                            "pkt", (int)op->slot, (int)op->arbiter, (int)op->msel, (int)op->mask);
             break;
         }
         case ACR_OP_SLAVE_EN:
             rc = XAie_StrmPktSwSlavePortEnable(dev, loc, rt_acr_port(op->sport), sidx);
             /* log: record the enabled slave port in the provenance map */
-            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op->sport, sidx), "slave",
-                         op->pkt_id, "pkt", -1);
+            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op), "slave", op->pkt_id,
+                         "pkt", -1);
             break;
         case ACR_OP_MASTER_EN: {
             XAie_StrmSwPktHeader drop = op->keep_header ? XAIE_SS_PKT_DONOT_DROP_HEADER : XAIE_SS_PKT_DROP_HEADER;
             rc = XAie_StrmPktSwMstrPortEnable(dev, loc, rt_acr_port(op->mport), midx, drop, op->arbiter, op->mselen);
             /* log: record the enabled master port in the provenance map */
-            rt_pmap_port_ex(op->col, op->row, rt_acr_port_name(op->mport), midx, rt_acr_dir(op->mport, midx), "master",
-                            op->pkt_id, "pkt", -1, (int)op->arbiter, (int)op->mselen, -1);
+            rt_pmap_port_ex(op->col, op->row, rt_acr_port_name(op->mport), midx, rt_acr_dir(op), "master", op->pkt_id,
+                            "pkt", -1, (int)op->arbiter, (int)op->mselen, -1);
             break;
         }
         case ACR_OP_CCT:
             rc = XAie_StrmConnCctEnable(dev, loc, rt_acr_port(op->sport), sidx, rt_acr_port(op->mport), midx);
             /* log: record both circuit pass-through ports in the provenance map */
-            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op->sport, sidx), "slave",
-                         op->pkt_id, "circuit", -1);
-            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->mport), midx, rt_acr_dir(op->mport, midx), "master",
-                         op->pkt_id, "circuit", -1);
+            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->sport), sidx, rt_acr_dir(op), "slave", op->pkt_id,
+                         "circuit", -1);
+            rt_pmap_port(op->col, op->row, rt_acr_port_name(op->mport), midx, rt_acr_dir(op), "master", op->pkt_id,
+                         "circuit", -1);
             break;
         default:
             rc = XAIE_INVALID_ARGS;
@@ -3780,12 +3806,65 @@ AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops) {
     return XAIE_OK;
 }
 
-/* Initialize the row-control fabric: record the device, spine column, control
- * stream id, and the shim S2MM response channel. No HW is touched here; spine
- * hops and EAST chains are emitted lazily by __Runtime_ctrl_row_add. The spine
- * (spine_top=0, nrows=0) and per-tile port book start empty. */
-AieRC __Runtime_ctrl_row_open(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
-                              uint8_t ctrl_id) {
+/* Configure one EAST chain on @row spanning columns [col_lo..col_hi]. The chain
+ * head must sit on the spine column (col_lo == f->shim_col). Runs the pure
+ * planner (acr_plan_row_add) against the fabric's real spine + port book (so the
+ * shared spine is extended/reused idempotently), emits the derived stream-switch
+ * ops via __Runtime_ctrl_row_emit, and records the chain span. @is_top marks the
+ * topmost configured row so its return head omits the idle RET_NORTH slot.
+ * Re-adding an already-configured row emits nothing and is a no-op. */
+static AieRC rt_ctrl_plan_add_row(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t col_lo, uint8_t col_hi, int is_top) {
+    if (f->nrows >= ACR_MAX_ROWS)
+        return XAIE_INVALID_ARGS;
+    uint8_t nrows_before = f->spine.nrows;
+    acr_oplist ops;
+    ops.n = 0;
+    acr_rc prc = acr_plan_row_add(&f->spine, &ops, &f->book, f->shim_col, row, col_lo, col_hi, f->ctrl_id, is_top);
+    if (prc != ACR_OK) {
+        printf("[aie_runtime] ctrl_plan: planner rc=%d row=%u [%u..%u]\n", (int)prc, (unsigned)row, (unsigned)col_lo,
+               (unsigned)col_hi);
+        return XAIE_INVALID_ARGS;
+    }
+    AieRC rc = __Runtime_ctrl_row_emit(f->dev, &ops);
+    if (rc != XAIE_OK)
+        return rc;
+    /* Record the chain span only when the planner actually added a new row (an
+     * idempotent re-add leaves f->spine.nrows unchanged and emits nothing). */
+    if (f->spine.nrows > nrows_before) {
+        f->rows[f->nrows].row = row;
+        f->rows[f->nrows].col_lo = col_lo;
+        f->rows[f->nrows].col_hi = col_hi;
+        f->nrows++;
+    }
+    return XAIE_OK;
+}
+
+/* Add every chain in @rows. The topmost row (largest @row value) is flagged
+ * is_top so its return head drops the idle RET_NORTH slot. Rows may be listed in
+ * any order; the top row is computed here, not assumed to be last. */
+static AieRC rt_ctrl_plan_add_rows(__Runtime_CtrlRowFabric *f, const __Runtime_CtrlRowChain *rows, uint8_t nrows) {
+    if (!rows || nrows == 0U || nrows > ACR_MAX_ROWS)
+        return XAIE_INVALID_ARGS;
+    uint8_t top_row = rows[0].row;
+    for (uint8_t i = 1; i < nrows; i++)
+        if (rows[i].row > top_row)
+            top_row = rows[i].row;
+    for (uint8_t i = 0; i < nrows; i++) {
+        AieRC rc = rt_ctrl_plan_add_row(f, rows[i].row, rows[i].col_lo, rows[i].col_hi, rows[i].row == top_row);
+        if (rc != XAIE_OK)
+            return rc;
+    }
+    return XAIE_OK;
+}
+
+/* One-shot row-control fabric init: record the device, spine column, control
+ * stream id, and shim S2MM response channel, then plan + emit every EAST chain
+ * in @rows. The spine + per-tile port book start empty and are grown by the
+ * planner. @rows may be given in any row order (bottom-up preferred); the static
+ * planner computes the top row so its return head omits the idle RET_NORTH slot.
+ * Each chain head must sit on the spine column (col_lo == shim_col). */
+AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
+                               uint8_t ctrl_id, const __Runtime_CtrlRowChain *rows, uint8_t nrows) {
     if (!f || !dev)
         return XAIE_INVALID_ARGS;
     memset(f, 0, sizeof(*f));
@@ -3795,7 +3874,7 @@ AieRC __Runtime_ctrl_row_open(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uin
     f->fwd_vc = 0U; /* single forward/return vertical channel pair for now */
     f->ret_vc = 0U;
     f->resp_s2mm_ch = resp_s2mm_ch;
-    return XAIE_OK;
+    return rt_ctrl_plan_add_rows(f, rows, nrows);
 }
 
 /* Tear down the fabric: clear all state. Stream-switch routes are not
@@ -3833,48 +3912,14 @@ static AieRC rt_ctrl_row_shim_entry(const __Runtime_CtrlRowFabric *f, int32_t mm
     return rc;
 }
 
-/* Configure one EAST chain on @row spanning columns [col_lo..col_hi]. The chain
- * head must sit on the spine column (col_lo == f->shim_col). Runs the pure
- * planner (acr_plan_row_add) against the fabric's real spine + port book (so the
- * shared spine is extended/reused idempotently), emits the derived stream-switch
- * ops via __Runtime_ctrl_row_emit, and records the chain span. Re-adding an
- * already-configured row emits nothing and is a no-op. */
-AieRC __Runtime_ctrl_row_add(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t col_lo, uint8_t col_hi) {
-    if (!f || !f->dev)
-        return XAIE_INVALID_ARGS;
-    if (f->nrows >= ACR_MAX_ROWS)
-        return XAIE_INVALID_ARGS;
-    uint8_t nrows_before = f->spine.nrows;
-    acr_oplist ops;
-    ops.n = 0;
-    acr_rc prc = acr_plan_row_add(&f->spine, &ops, &f->book, f->shim_col, row, col_lo, col_hi, f->ctrl_id);
-    if (prc != ACR_OK) {
-        printf("[aie_runtime] ctrl_row_add: planner rc=%d row=%u [%u..%u]\n", (int)prc, (unsigned)row, (unsigned)col_lo,
-               (unsigned)col_hi);
-        return XAIE_INVALID_ARGS;
-    }
-    AieRC rc = __Runtime_ctrl_row_emit(f->dev, &ops);
-    if (rc != XAIE_OK)
-        return rc;
-    /* Record the chain span only when the planner actually added a new row (an
-     * idempotent re-add leaves f->spine.nrows unchanged and emits nothing). */
-    if (f->spine.nrows > nrows_before) {
-        f->rows[f->nrows].row = row;
-        f->rows[f->nrows].col_lo = col_lo;
-        f->rows[f->nrows].col_hi = col_hi;
-        f->nrows++;
-    }
-    return XAIE_OK;
-}
-
 /* Broadcast a WRITE control packet (stream id ACR_ID_BCAST, id[4]=1) to every
  * tile on the configured rows: the packet climbs the shared spine and each row
  * head taps it via its broadcast slot (each interior tile consumes + forwards
  * EAST + climbs NORTH on the head), so all tiles write @nwords words to tile byte
  * address @tile_addr. Fire-and-forget: no write-with-return ack and a
  * non-blocking push (block=0). @bd_id / @mm2s_ch select the shim send BD +
- * channel; @log enables the per-send log. Requires at least one prior
- * __Runtime_ctrl_row_add. */
+ * channel; @log enables the per-send log. Requires a prior
+ * __Runtime_ctrl_plan_init that configured at least one row. */
 AieRC __Runtime_ctrl_row_broadcast_write(__Runtime_CtrlRowFabric *f, uint32_t tile_addr, const uint32_t *data,
                                          uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log) {
     if (!f || !f->dev || !data || nwords == 0U || f->nrows == 0U)
@@ -4135,6 +4180,9 @@ AieRC __Runtime_ctrl_setup_routing(__Runtime_CtrlInstance *inst, int port_evt) {
     AieRC rc = rt_ctrl_route_setup_col(inst, port_evt);
     if (rc != XAIE_OK)
         return rc;
+    rc = rt_ctrl_col_return_route(inst, port_evt);
+    if (rc != XAIE_OK)
+        return rc;
 
     uint32_t rwords = inst->resp_words ? inst->resp_words : 1U;
     inst->token = (uint32_t *)__Runtime_alloc_buffer(inst->dev, (size_t)rwords * sizeof(uint32_t));
@@ -4261,6 +4309,271 @@ AieRC __Runtime_ctrl_read_target(XAie_DevInst *dev, uint8_t shim_col, uint8_t de
     __Runtime_free_buffer(dev, inst.token);
     __Runtime_free_buffer(dev, pkt);
     return XAIE_OK;
+}
+
+/* Arm @npkt shim S2MM BDs (one per returning row response packet) on @s2mm_ch,
+ * landing packet k at @token + k*@pkt_words. Each BD uses Finish-on-TLAST so a
+ * short variable-length response packet retires its BD on TLAST (mirrors
+ * rt_tct_s2mm_arm, but for N packets). BD ids are @base_bd..@base_bd+npkt-1 and
+ * must be in-range and distinct from the forward MM2S bd. Also programs the shim
+ * NORTH(VRET) -> SOUTH(S2MM demux) circuit hop + S2MM demux enable; the row
+ * fabric's per-tile planner owns the upstream return chain, so only this shim leg
+ * is programmed here. @npkt is bounded by the shim BD queue depth. */
+static AieRC rt_ctrl_row_shim_return(const __Runtime_CtrlRowFabric *f, int32_t s2mm_ch, int32_t base_bd, int npkt,
+                                     uint32_t pkt_words, uint32_t *token) {
+    XAie_DevInst *dev = f->dev;
+    XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
+    uint8_t rport = rt_shim_s2mm_port(dev, s2mm_ch);
+    AieRC rc = XAie_StrmConnCctEnable(dev, shim, NORTH, RT_CTRL_VRET, SOUTH, rport);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_row_return: shim StrmConnCctEnable (%u,0) NORTH%u->SOUTH%u rc=%d\n",
+               (unsigned)f->shim_col, (unsigned)RT_CTRL_VRET, (unsigned)rport, (int)rc);
+        return rc;
+    }
+    rc = XAie_EnableAieToShimDmaStrmPort(dev, shim, rport);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_row_return: EnableAieToShimDmaStrmPort (%u,0) port=%u rc=%d\n",
+               (unsigned)f->shim_col, (unsigned)rport, (int)rc);
+        return rc;
+    }
+    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VRET, "ret", "slave", f->ctrl_id, "circuit", -1);
+    rt_pmap_port(f->shim_col, 0, "SOUTH", rport, "ret", "master", f->ctrl_id, "circuit", -1);
+
+    uint64_t offset = 0U;
+    XAie_MemInst *mem = __vaddr_to_mem_offset(token, &offset);
+    if (!mem) {
+        printf("[aie_runtime] ctrl_row_return: token=%p is not a DMA buffer\n", (void *)token);
+        return XAIE_ERR;
+    }
+    uint64_t base_addr = XAie_MemGetDevAddr(mem) + offset;
+    uint32_t len = pkt_words * (uint32_t)sizeof(uint32_t);
+    uint8_t num_bds = 16U;
+    (void)XAie_DmaGetNumBds(dev, shim, &num_bds);
+    if (base_bd < 0 || base_bd + npkt > (int)num_bds) {
+        printf("[aie_runtime] ctrl_row_return: BD range [%d,%d) out of [0,%u)\n", base_bd, base_bd + npkt,
+               (unsigned)num_bds);
+        return XAIE_INVALID_ARGS;
+    }
+    /* Finish-on-TLAST once on the channel (shared by all queued BDs). */
+    XAie_DmaChannelDesc chdesc;
+    rc = XAie_DmaChannelDescInit(dev, &chdesc, shim);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaChannelSetFoTMode(&chdesc, DMA_FoT_NO_COUNTS);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaWriteChannel(dev, &chdesc, shim, (uint8_t)s2mm_ch, DMA_S2MM);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_row_return: FoT setup ch=%d rc=%d\n", s2mm_ch, (int)rc);
+        return rc;
+    }
+    for (int k = 0; k < npkt; k++) {
+        int32_t bd = base_bd + k;
+        uint64_t dev_addr = base_addr + (uint64_t)k * len;
+#ifdef __AIESIM__
+        ess_WriteGM(dev_addr, token + (size_t)k * pkt_words, (uint64_t)len);
+#endif
+        XAie_DmaDesc desc;
+        rc = XAie_DmaDescInit(dev, &desc, shim);
+        if (rc == XAIE_OK)
+            rc = XAie_DmaSetAddrLen(&desc, dev_addr, len);
+        if (rc == XAIE_OK)
+            rc = XAie_DmaEnableBd(&desc);
+        if (rc == XAIE_OK)
+            rc = XAie_DmaSetAxi(&desc, 0U, 16U, 0U, 0U, 0U);
+        if (rc == XAIE_OK)
+            rc = XAie_DmaWriteBd(dev, &desc, shim, (uint8_t)bd);
+        if (rc == XAIE_OK)
+            rc = XAie_DmaChannelPushBdToQueue(dev, shim, (uint8_t)s2mm_ch, DMA_S2MM, (uint8_t)bd);
+        if (rc != XAIE_OK) {
+            printf("[aie_runtime] ctrl_row_return: arm bd=%d ch=%d rc=%d\n", bd, s2mm_ch, (int)rc);
+            return rc;
+        }
+    }
+    rc = XAie_DmaChannelEnable(dev, shim, (uint8_t)s2mm_ch, DMA_S2MM);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_row_return: ChannelEnable ch=%d rc=%d\n", s2mm_ch, (int)rc);
+        return rc;
+    }
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_row_return armed shim(%u,0) ch=%d bds=[%d,%d) pkt_words=%u\n",
+                      (unsigned)f->shim_col, s2mm_ch, base_bd, base_bd + npkt, pkt_words););
+    return XAIE_OK;
+}
+
+/* Poll the shim S2MM drain until all @npkt row response packets land (pending
+ * count reaches 0), then sync @token (npkt*pkt_words words) for the CPU. Bounded
+ * spin so sim terminates. Returns the observed pending count (0 on success). */
+static uint8_t rt_ctrl_row_return_poll(const __Runtime_CtrlRowFabric *f, int32_t s2mm_ch, int npkt, uint32_t pkt_words,
+                                       uint32_t *token) {
+    XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
+    uint8_t pending = (uint8_t)npkt;
+    for (uint32_t spin = 0U; spin < 200000U; spin++) {
+        (void)XAie_DmaGetPendingBdCount(f->dev, shim, (uint8_t)s2mm_ch, DMA_S2MM, &pending);
+        if (pending == 0U)
+            break;
+    }
+    __Runtime_sync_for_cpu(f->dev, token, (size_t)npkt * pkt_words * sizeof(uint32_t));
+    return pending;
+}
+
+/* Row-multicast register READ (whole-row): read @nwords words at tile byte
+ * address @tile_addr from EVERY column of @row. Each column returns its own
+ * response packet (its stream header is kept), and the packets merge west down
+ * the shared spine to the shim S2MM (one BD per column). The per-column read
+ * values are placed into out_vals[(src_col-col_lo)*nwords + w]. @nwords must fit
+ * a single control access (<=4 words, no 128-bit crossing) so each column emits
+ * exactly one response packet. Blocking (drain is the completion barrier). */
+AieRC __Runtime_ctrl_row_read(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr, uint32_t nwords,
+                              uint32_t *out_vals, int32_t bd_id, int32_t mm2s_ch) {
+    if (!f || !f->dev || nwords == 0U || f->nrows == 0U)
+        return XAIE_INVALID_ARGS;
+    uint8_t rowidx = 0U;
+    const __Runtime_CtrlRowChain *chain = NULL;
+    if (!rt_ctrl_row_index(f, row, &rowidx, &chain)) {
+        printf("[aie_runtime] ctrl_row_read: row=%u not configured or index>%d\n", (unsigned)row, ACR_MAX_ROW_IDX);
+        return XAIE_INVALID_ARGS;
+    }
+    int ncols = (int)(chain->col_hi - chain->col_lo + 1U);
+    AieRC rc = rt_ctrl_row_shim_entry(f, mm2s_ch);
+    if (rc != XAIE_OK)
+        return rc;
+    uint8_t sid = (uint8_t)(((uint8_t)ACR_CLASS_WHOLE_ROW << 2) | (rowidx & 0x3U)); /* id[4]=0 whole-row */
+    uint32_t cap = nwords * 2U + 8U;
+    uint32_t *pkt = (uint32_t *)__Runtime_alloc_buffer(f->dev, (size_t)cap * sizeof(uint32_t));
+    if (!pkt) {
+        printf("[aie_runtime] ctrl_row_read ERROR: request buffer alloc failed\n");
+        return XAIE_ERR;
+    }
+    uint32_t per_pkt = 0U;
+    uint32_t pw = __Runtime_ctrl_pktize_read(pkt, cap, sid, /*ret_stream_id=*/0U, tile_addr, nwords, &per_pkt);
+    if (pw == 0U || per_pkt == 0U) {
+        __Runtime_free_buffer(f->dev, pkt);
+        return XAIE_ERR;
+    }
+    __Runtime_sync_for_dev(f->dev, pkt, (size_t)pw * sizeof(uint32_t));
+    uint32_t total = per_pkt * (uint32_t)ncols;
+    uint32_t *token = (uint32_t *)__Runtime_alloc_buffer(f->dev, (size_t)total * sizeof(uint32_t));
+    if (!token) {
+        __Runtime_free_buffer(f->dev, pkt);
+        return XAIE_ERR;
+    }
+    for (uint32_t i = 0U; i < total; i++)
+        token[i] = 0U;
+    rc = rt_ctrl_row_shim_return(f, f->resp_s2mm_ch, bd_id + 1, ncols, per_pkt, token);
+    if (rc != XAIE_OK) {
+        __Runtime_free_buffer(f->dev, token);
+        __Runtime_free_buffer(f->dev, pkt);
+        return rc;
+    }
+    __Runtime_CtrlInstance inst = {
+        .dev = f->dev,
+        .shim_col = f->shim_col,
+        .dest_col = chain->col_lo,
+        .dest_row = row,
+        .stream_id = sid,
+        .bd_id = bd_id,
+        .mm2s_ch = mm2s_ch,
+        .s2mm_ch = f->resp_s2mm_ch,
+        .token = token,
+        .resp_words = total,
+    };
+    rc = __Runtime_ctrl_push(&inst, pkt, pw, /*block=*/0, /*log=*/0);
+    if (rc != XAIE_OK) {
+        __Runtime_free_buffer(f->dev, token);
+        __Runtime_free_buffer(f->dev, pkt);
+        return rc;
+    }
+    uint8_t pending = rt_ctrl_row_return_poll(f, f->resp_s2mm_ch, ncols, per_pkt, token);
+    if (pending != 0U)
+        printf("[aie_runtime] ctrl_row_read WARN: %u response packet(s) never drained (row=%u)\n", (unsigned)pending,
+               (unsigned)row);
+    /* Route each landed packet to its column by its kept stream header src_col. */
+    for (int k = 0; k < ncols; k++) {
+        const uint32_t *p = token + (size_t)k * per_pkt;
+        uint32_t src_col = 0U;
+        (void)__Runtime_ctrl_parse_pkt_hdr(p[0], NULL, NULL, NULL, &src_col);
+        int ci = (int)src_col - (int)chain->col_lo;
+        if (ci >= 0 && ci < ncols && out_vals)
+            rt_ctrl_read_extract(p, tile_addr, nwords, out_vals + (size_t)ci * nwords);
+    }
+    __Runtime_free_buffer(f->dev, token);
+    __Runtime_free_buffer(f->dev, pkt);
+    return (pending == 0U) ? XAIE_OK : XAIE_ERR;
+}
+
+/* Row-multicast WRITE-with-ack (whole-row): write @nwords words to tile byte
+ * address @tile_addr on EVERY column of @row, with the last word re-emitted as a
+ * write-with-return so each column returns a header-only ack. All ncols acks
+ * draining the shim S2MM is the completion barrier (blocking). @nwords must fit a
+ * single control access so each column emits exactly one ack packet. */
+AieRC __Runtime_ctrl_row_write_ack(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr, const uint32_t *data,
+                                   uint32_t nwords, int32_t bd_id, int32_t mm2s_ch) {
+    if (!f || !f->dev || !data || nwords == 0U || f->nrows == 0U)
+        return XAIE_INVALID_ARGS;
+    uint8_t rowidx = 0U;
+    const __Runtime_CtrlRowChain *chain = NULL;
+    if (!rt_ctrl_row_index(f, row, &rowidx, &chain)) {
+        printf("[aie_runtime] ctrl_row_write_ack: row=%u not configured or index>%d\n", (unsigned)row, ACR_MAX_ROW_IDX);
+        return XAIE_INVALID_ARGS;
+    }
+    int ncols = (int)(chain->col_hi - chain->col_lo + 1U);
+    AieRC rc = rt_ctrl_row_shim_entry(f, mm2s_ch);
+    if (rc != XAIE_OK)
+        return rc;
+    uint8_t sid = (uint8_t)(((uint8_t)ACR_CLASS_WHOLE_ROW << 2) | (rowidx & 0x3U)); /* id[4]=0 whole-row */
+    uint32_t cap = nwords * 2U + 8U;
+    uint32_t *pkt = (uint32_t *)__Runtime_alloc_buffer(f->dev, (size_t)cap * sizeof(uint32_t));
+    if (!pkt) {
+        printf("[aie_runtime] ctrl_row_write_ack ERROR: request buffer alloc failed\n");
+        return XAIE_ERR;
+    }
+    uint32_t per_pkt = 0U;
+    uint32_t pw = __Runtime_ctrl_pktize_write(pkt, cap, sid, tile_addr, data, nwords,
+                                              /*lastwriteack=*/1, /*ret_stream_id=*/0U, &per_pkt);
+    if (pw == 0U || per_pkt == 0U) {
+        __Runtime_free_buffer(f->dev, pkt);
+        return XAIE_ERR;
+    }
+    __Runtime_sync_for_dev(f->dev, pkt, (size_t)pw * sizeof(uint32_t));
+    uint32_t total = per_pkt * (uint32_t)ncols;
+    uint32_t *token = (uint32_t *)__Runtime_alloc_buffer(f->dev, (size_t)total * sizeof(uint32_t));
+    if (!token) {
+        __Runtime_free_buffer(f->dev, pkt);
+        return XAIE_ERR;
+    }
+    for (uint32_t i = 0U; i < total; i++)
+        token[i] = 0U;
+    rc = rt_ctrl_row_shim_return(f, f->resp_s2mm_ch, bd_id + 1, ncols, per_pkt, token);
+    if (rc != XAIE_OK) {
+        __Runtime_free_buffer(f->dev, token);
+        __Runtime_free_buffer(f->dev, pkt);
+        return rc;
+    }
+    __Runtime_CtrlInstance inst = {
+        .dev = f->dev,
+        .shim_col = f->shim_col,
+        .dest_col = chain->col_lo,
+        .dest_row = row,
+        .stream_id = sid,
+        .bd_id = bd_id,
+        .mm2s_ch = mm2s_ch,
+        .s2mm_ch = f->resp_s2mm_ch,
+        .token = token,
+        .resp_words = total,
+    };
+    rc = __Runtime_ctrl_push(&inst, pkt, pw, /*block=*/0, /*log=*/0);
+    if (rc != XAIE_OK) {
+        __Runtime_free_buffer(f->dev, token);
+        __Runtime_free_buffer(f->dev, pkt);
+        return rc;
+    }
+    uint8_t pending = rt_ctrl_row_return_poll(f, f->resp_s2mm_ch, ncols, per_pkt, token);
+    if (pending != 0U)
+        printf("[aie_runtime] ctrl_row_write_ack WARN: %u ack(s) never drained (row=%u)\n", (unsigned)pending,
+               (unsigned)row);
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_row_write_ack row=%u addr=0x%x nwords=%u acks=%d drained=%d\n", (unsigned)row,
+                      tile_addr, nwords, ncols, ncols - (int)pending););
+    __Runtime_free_buffer(f->dev, token);
+    __Runtime_free_buffer(f->dev, pkt);
+    return (pending == 0U) ? XAIE_OK : XAIE_ERR;
 }
 
 /**

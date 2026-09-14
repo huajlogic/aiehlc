@@ -110,6 +110,14 @@ typedef struct {
     uint8_t midx; /* master side */
     uint8_t slot, pkt_id, mask, msel, arbiter, mselen;
     uint8_t keep_header; /* 1 => DONOT_DROP_HEADER */
+    /* 1 => this op belongs to the RETURN (response) fabric, 0 => forward. The
+     * emit layer tags its provenance-map lines dir=ret/fwd from this. It cannot
+     * be inferred from the port: the return chain's slots sit on CTRL and EAST
+     * slaves, the same port types the forward chain drives as masters. Slot and
+     * master ops derive it from arbiter == ACR_ARB_RET (the two fabrics use
+     * disjoint arbiters by construction); slave-enable and circuit ops carry no
+     * arbiter, so their emitter sets it explicitly. */
+    uint8_t is_ret;
 } acr_op;
 
 typedef struct {

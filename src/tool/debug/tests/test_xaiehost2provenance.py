@@ -333,17 +333,18 @@ def test_eval_cond_tolerates_macro_body_with_backslash():
 
 
 # Row-control fabric API (design: 2026-09-08-row-control-connection). One
-# __Runtime_ctrl_row_open picks the spine (shim) column; each
-# __Runtime_ctrl_row_add(fab,row,col_lo,col_hi) adds an EAST chain. A re-add of
-# the same row is idempotent (dedup). The ctrl_id arg carries a (uint8_t) cast
-# that must not break shim_col parsing.
+# __Runtime_ctrl_plan_init(fab, dev, shim_col, ...) picks the spine (shim)
+# column; its __Runtime_CtrlRowChain rows[] = {{row,col_lo,col_hi}, ...} array
+# lists the EAST chains. Duplicate triples are deduped. The ctrl_id arg carries a
+# (uint8_t) cast that must not break shim_col parsing.
 CTRL_ROW_SRC = """
 int run_ctrlrow_demo(XAie_DevInst *dev) {
     __Runtime_CtrlRowFabric fab;
-    __Runtime_ctrl_row_open(&fab, dev, 0u, 0, (uint8_t)0u);
-    __Runtime_ctrl_row_add(&fab, 3u, 0u, 1u);
-    __Runtime_ctrl_row_add(&fab, 5u, 0u, 1u);
-    __Runtime_ctrl_row_add(&fab, 3u, 0u, 1u);
+    static const __Runtime_CtrlRowChain rows[] = {
+        {3u, 0u, 1u},
+        {5u, 0u, 1u},
+    };
+    __Runtime_ctrl_plan_init(&fab, dev, 0u, 0, (uint8_t)0u, rows, 2u);
 }
 """
 
@@ -352,7 +353,7 @@ def test_extract_ctrl_rows_open_and_add():
     active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_SRC))
     fab = x.extract_ctrl_rows(active, x.collect_defines(active))
     assert fab["shim_col"] == 0
-    # the idempotent re-add of row 3 collapses -> two distinct chains
+    # two distinct chains from the row array
     assert fab["rows"] == [{"row": 3, "col_lo": 0, "col_hi": 1},
                            {"row": 5, "col_lo": 0, "col_hi": 1}]
 
@@ -370,8 +371,10 @@ CTRL_ROW_DEFINE_SRC = """
 #define DEMO_COL_LO 0u
 #define DEMO_COL_HI 1u
 int run_ctrlrow_demo(XAie_DevInst *dev) {
-    __Runtime_ctrl_row_open(&fab, dev, DEMO_SHIM_COL, 0, (uint8_t)0u);
-    __Runtime_ctrl_row_add(&fab, DEMO_CORE_ROW_A, DEMO_COL_LO, DEMO_COL_HI);
+    static const __Runtime_CtrlRowChain rows[] = {
+        {DEMO_CORE_ROW_A, DEMO_COL_LO, DEMO_COL_HI},
+    };
+    __Runtime_ctrl_plan_init(&fab, dev, DEMO_SHIM_COL, 0, (uint8_t)0u, rows, 1u);
 }
 """
 
@@ -382,47 +385,32 @@ def test_extract_ctrl_rows_folds_suffixed_define():
     assert fab == {"shim_col": 0, "rows": [{"row": 3, "col_lo": 0, "col_hi": 1}]}
 
 
-# The real ctrlrow_demo.cc adds rows through a helper that forwards its own
-# `row` parameter to __Runtime_ctrl_row_add; the configured row constants live
-# only at the helper's CALL sites (demo_add_row(&fab, DEMO_CORE_ROW_B)). A direct
-# row_add fold sees just the idempotent re-add (row A), so extract_ctrl_rows must
-# follow one level of parameter forwarding to also capture row B. Without it the
-# device-map grid tops out at row A and the higher rows of the control-plan
-# overlay render off-canvas.
-CTRL_ROW_WRAPPER_SRC = """
+# The real ctrlrow_demo.cc lists its rows in a __Runtime_CtrlRowChain rows[]
+# array of #define-folded triples. Every triple must fold so the device-map grid
+# spans all configured rows (here up to row B = 5) and the control-plan overlay
+# renders on-canvas.
+CTRL_ROW_MULTI_SRC = """
 #define DEMO_SHIM_COL 0u
 #define DEMO_CORE_ROW_A 3u
 #define DEMO_CORE_ROW_B 5u
 #define DEMO_COL_LO 0u
 #define DEMO_COL_HI 3u
-static AieRC demo_add_row(__Runtime_CtrlRowFabric *fab, uint8_t row) {
-    return __Runtime_ctrl_row_add(fab, row, DEMO_COL_LO, DEMO_COL_HI);
-}
 int run_ctrlrow_demo(XAie_DevInst *dev) {
-    __Runtime_ctrl_row_open(&fab, dev, DEMO_SHIM_COL, 0, (uint8_t)0u);
-    demo_add_row(&fab, DEMO_CORE_ROW_A);
-    demo_add_row(&fab, DEMO_CORE_ROW_B);
-    __Runtime_ctrl_row_add(&fab, DEMO_CORE_ROW_A, DEMO_COL_LO, DEMO_COL_HI);
+    static const __Runtime_CtrlRowChain rows[] = {
+        {DEMO_CORE_ROW_A, DEMO_COL_LO, DEMO_COL_HI},
+        {DEMO_CORE_ROW_B, DEMO_COL_LO, DEMO_COL_HI},
+    };
+    __Runtime_ctrl_plan_init(&fab, dev, DEMO_SHIM_COL, 0, (uint8_t)0u, rows, 2u);
 }
 """
 
 
-def test_extract_ctrl_rows_follows_wrapper_forwarding():
-    active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_WRAPPER_SRC))
+def test_extract_ctrl_rows_folds_row_array():
+    active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_MULTI_SRC))
     fab = x.extract_ctrl_rows(active, x.collect_defines(active))
     assert fab["shim_col"] == 0
-    # both the wrapper-forwarded rows (A via call site, B via call site) resolve;
-    # the direct idempotent re-add of row A collapses via dedup.
     assert fab["rows"] == [{"row": 3, "col_lo": 0, "col_hi": 3},
                            {"row": 5, "col_lo": 0, "col_hi": 3}]
-
-
-def test_extract_model_ctrl_row_wrapper_grid_reaches_row_b():
-    # End-to-end: the wrapper-forwarded row B (5) must land in the tile grid so
-    # the device map spans rows 0..5 and the control-plan overlay is on-canvas.
-    model = x.extract_model(CTRL_ROW_WRAPPER_SRC, aie_gen=5, aiesim=False)
-    tiles = {(t["col"], t["row"]) for t in model["tiles"]}
-    assert (0, 5) in tiles and (1, 5) in tiles and (0, 4) in tiles
 
 
 def test_extract_model_ctrl_row_fabric():

@@ -91,17 +91,15 @@ forward S2MM up (shim→dest) and return MM2S down (dest→shim). No kernel ELF 
 `kernel_placements` stays empty. This lets `schedule_debug_server.py` open a
 debug GUI for a control-packet app that has only `host.cc` (no `Work/` tree).
 
-It also recognizes the **row-control fabric** (`__Runtime_ctrl_row_open` picks the
-shared spine/shim column; each `__Runtime_ctrl_row_add(fab,row,col_lo,col_hi)` adds
-one EAST chain). `extract_ctrl_rows` enumerates the spine (shim + vertical
-pass-through up to the highest configured row) and every chain tile, then draws a
-forward-up + return-down flow per chain. **Wrapper forwarding** is resolved one
-level deep: when a `row_add` arg is a bare identifier naming a parameter of the
-enclosing function (e.g. a `demo_add_row(fab,row)` helper that forwards `row`), the
-value is folded from that helper's *call-site* args (`_c_functions` maps a call's
-char offset to its enclosing function; `_call_args` splits balanced arg lists). Without this, rows configured only through a wrapper are missed, the grid tops out
-at the highest *directly-passed* row, and the taller rows of the **Load control
-plan** overlay render off-canvas.
+It also recognizes the **row-control fabric** (`__Runtime_ctrl_plan_init(f, dev,
+shim_col, resp_s2mm_ch, ctrl_id, rows, nrows)` configures the whole fabric in one
+shot; `rows` is a `__Runtime_CtrlRowChain[]` of `{row, col_lo, col_hi}` triples, one
+EAST chain per entry). `extract_ctrl_rows` reads `shim_col` from the `plan_init`
+call (`RE_PLAN_INIT`), finds the `__Runtime_CtrlRowChain[] = {...}` initializer
+(`RE_ROW_ARRAY`), and folds each `{row, col_lo, col_hi}` triple (`RE_ROW_TRIPLE`,
+deduped) — resolving `#define` constants via `_ctrl_int`. It then enumerates the
+spine (shim + vertical pass-through up to the highest configured row) and every
+chain tile, and draws a forward-up + return-down flow per chain.
 
 - `MacroResolver` selects live `#if/#ifdef` branch for `AIE_GEN`/`__AIESIM__`
   and honors inline `#define`/`#undef` (so an in-file `#define _CONTROL_WRITE_TEST_`

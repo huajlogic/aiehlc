@@ -289,9 +289,77 @@ static int test_shared_head_fanout() {
     return 0;
 }
 
+// Every op carries the fwd/ret fabric tag the emit layer turns into the
+// CONTROLPAN-PMAP dir= field. The tag CANNOT be inferred from the port type --
+// the return chain's slots live on CTRL/EAST slaves and its non-head master is
+// WEST, all ports the forward chain uses too -- so the planner must carry it.
+//
+// The invariant the debug UI depends on: a slot and every master that pulls it
+// must agree on is_ret. tile_switch_view buckets ports by dir before linking
+// slots to masters, so a disagreement makes the pulling master vanish from the
+// slot's section (the head's return SOUTH master is the visible case).
+static int test_is_ret_tagging() {
+    acr_state s = {};
+    acr_portbook b = {};
+    acr_oplist o = {};
+    assert(acr_plan_row_add(&s, &o, &b, 2, 3, 2, 4, /*ctrl_id*/ 0, /*is_top*/ 0) == ACR_OK);
+
+    int npairs = 0, nret = 0, nfwd = 0;
+    for (int i = 0; i < o.n; i++) {
+        const acr_op *op = &o.ops[i];
+        assert(op->is_ret == 0 || op->is_ret == 1);
+        if (op->kind == ACR_OP_SLOT || op->kind == ACR_OP_MASTER_EN) {
+            // Slot/master ops derive the tag from the arbiter; the two fabrics
+            // use disjoint arbiters by construction.
+            assert(op->is_ret == (op->arbiter == ACR_ARB_RET));
+            op->is_ret ? nret++ : nfwd++;
+        }
+        if (op->kind != ACR_OP_MASTER_EN)
+            continue;
+        // Every slot this master pulls must share its fabric tag.
+        for (int j = 0; j < o.n; j++) {
+            const acr_op *sl = &o.ops[j];
+            if (sl->kind != ACR_OP_SLOT || sl->col != op->col || sl->row != op->row)
+                continue;
+            if (sl->arbiter != op->arbiter || !((op->mselen >> sl->msel) & 1u))
+                continue;
+            assert(sl->is_ret == op->is_ret);
+            npairs++;
+        }
+    }
+    assert(nfwd > 0 && nret > 0 && npairs > 0);
+
+    // The head's return SOUTH master and the CTRL/EAST return slots it pulls are
+    // the pair the port-based guess used to split apart: slots on CTRL/EAST (once
+    // tagged fwd), master on the VRET spine (tagged ret).
+    const acr_op *rl = find_slot(&o, 2, ACR_CTRL, ACR_SLOT_RET_LOCAL, ACR_ARB_RET);
+    const acr_op *rt = find_slot(&o, 2, ACR_EAST, ACR_SLOT_RET_TRANSIT, ACR_ARB_RET);
+    assert(rl && rl->is_ret == 1);
+    assert(rt && rt->is_ret == 1);
+    // Forward slots on the same tile stay fwd.
+    const acr_op *fc = find_slot(&o, 2, ACR_SOUTH, ACR_SLOT_CONSUME, ACR_ARB_CTRL);
+    assert(fc && fc->is_ret == 0);
+
+    // Slave-enables ride with the slots on their port; circuit spine hops are
+    // tagged by climb direction (SOUTH->NORTH forward, NORTH->SOUTH return).
+    for (int i = 0; i < o.n; i++) {
+        const acr_op *op = &o.ops[i];
+        if (op->kind == ACR_OP_SLAVE_EN) {
+            for (int j = 0; j < o.n; j++) {
+                const acr_op *sl = &o.ops[j];
+                if (sl->kind == ACR_OP_SLOT && sl->col == op->col && sl->row == op->row && sl->sport == op->sport)
+                    assert(sl->is_ret == op->is_ret);
+            }
+        } else if (op->kind == ACR_OP_CCT) {
+            assert(op->is_ret == (op->sport == ACR_NORTH && op->mport == ACR_SOUTH));
+        }
+    }
+    return 0;
+}
+
 int main() {
     if (test_book() || test_slot_classes() || test_east_forward() || test_forward_slot_table() || test_return_chain() ||
-        test_spine_reuse() || test_shared_head_fanout())
+        test_spine_reuse() || test_shared_head_fanout() || test_is_ret_tagging())
         return 1;
     printf("PASS\n");
     return 0;

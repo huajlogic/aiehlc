@@ -30,7 +30,8 @@
       "WebFetch(domain:files.pythonhosted.org)",
       "Skill(superpowers:test-driven-development)",
       "Skill(commands)",
-      "Skill(superpowers:finishing-a-development-branch)"
+      "Skill(superpowers:finishing-a-development-branch)",
+      "mcp__ide__getDiagnostics"
     ],
     "deny": []
   },

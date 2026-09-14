@@ -789,7 +789,7 @@ AieRC __Runtime_ctrl_setup_routing(__Runtime_CtrlInstance *inst, int port_evt = 
 // the aie_ctrl* routing setup prints one `CONTROLPAN-PMAP ...` line per stream
 // port it programs (tile location, port type/idx, direction, master/slave, id,
 // switch type pkt|circuit, slot) to stdout (the applog). Call once before the
-// first setup_routing / row_add. If this is never called, logging auto-enables
+// first setup_routing / plan_init. If this is never called, logging auto-enables
 // when the AIE_CTRL_PMAP environment variable is set to a non-empty, non-"0"
 // value.
 void __Runtime_ctrl_pmap_enable(int on);
@@ -888,24 +888,24 @@ typedef struct {
 // abstract port tags (acr_port) mapped here to StrmSwPortType.
 AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops);
 
-// Initialize the fabric and record the shim S2MM response channel. No HW config.
-AieRC __Runtime_ctrl_row_open(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
-                              uint8_t ctrl_id);
+// One-shot fabric init: record the device, spine column @shim_col, control
+// stream id @ctrl_id, and shim S2MM response channel @resp_s2mm_ch, then plan +
+// emit every EAST chain in @rows[0..nrows). Each chain head must sit on the spine
+// column (col_lo == shim_col). @rows may be given in any row order (bottom-up
+// preferred); the static planner computes the top row so its return head omits
+// the idle RET_NORTH slot. Responses drain via @resp_s2mm_ch.
+AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
+                               uint8_t ctrl_id, const __Runtime_CtrlRowChain *rows, uint8_t nrows);
 
 // Tear down fabric state. Best-effort route teardown (partition reset clears the
 // stream switches).
 AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f);
 
-// Configure one EAST chain on @row spanning columns [col_lo..col_hi] (the head
-// @col_lo must equal @f->shim_col). Extends/reuses the shared vertical spine
-// idempotently, emits the derived stream-switch config, and records the chain.
-// Re-adding an already-configured row is a no-op.
-AieRC __Runtime_ctrl_row_add(__Runtime_CtrlRowFabric *f, uint8_t row, uint8_t col_lo, uint8_t col_hi);
-
 // Broadcast a WRITE control packet (@nwords words to tile byte address
 // @tile_addr) to every tile of every configured row (stream id ACR_ID_BCAST,
 // id[4]=1). Fire-and-forget (no ack, non-blocking). @bd_id / @mm2s_ch select the
-// shim send BD + channel; @log enables the per-send log. Requires a prior row_add.
+// shim send BD + channel; @log enables the per-send log. Requires a prior
+// __Runtime_ctrl_plan_init that configured at least one row.
 AieRC __Runtime_ctrl_row_broadcast_write(__Runtime_CtrlRowFabric *f, uint32_t tile_addr, const uint32_t *data,
                                          uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log);
 
@@ -916,7 +916,7 @@ AieRC __Runtime_ctrl_row_broadcast_write(__Runtime_CtrlRowFabric *f, uint32_t ti
 // north slot) to reach any configured row, where the class-selected slots deliver
 // to the intended column subset. Fire-and-forget (block=0). @bd_id / @mm2s_ch
 // select the shim send BD + channel; @log enables the per-send log. Each requires
-// a prior __Runtime_ctrl_row_add for @row (add-order index <= ACR_MAX_ROW_IDX).
+// a prior __Runtime_ctrl_plan_init row for @row (add-order index <= ACR_MAX_ROW_IDX).
 //   all_but_last: every column EXCEPT col_hi.   only_last: only col_hi.
 //   whole_row:    every column incl. col_hi.
 AieRC __Runtime_ctrl_row_all_but_last_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr,
@@ -928,5 +928,26 @@ AieRC __Runtime_ctrl_row_only_last_write(__Runtime_CtrlRowFabric *f, uint8_t row
 AieRC __Runtime_ctrl_row_whole_row_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr,
                                          const uint32_t *data, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch,
                                          int log);
+
+// Row-multicast register READ (whole-row): read @nwords words at tile byte
+// address @tile_addr from EVERY column of @row. Each column returns its own
+// response packet (its stream header is kept); the packets merge west down the
+// shared spine to the shim S2MM (one BD per column, drained on @f->resp_s2mm_ch).
+// The per-column read values are placed into out_vals[(src_col-col_lo)*nwords+w]
+// (out_vals must hold ncols*nwords words). @nwords must fit one control access
+// (<=4 words, no 128-bit crossing) so each column emits exactly one packet.
+// @bd_id/@mm2s_ch select the shim forward BD/channel; the return uses BDs
+// bd_id+1..bd_id+ncols. Blocking. Requires @row configured by __Runtime_ctrl_plan_init.
+AieRC __Runtime_ctrl_row_read(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr, uint32_t nwords,
+                              uint32_t *out_vals, int32_t bd_id, int32_t mm2s_ch);
+
+// Row-multicast WRITE-with-ack (whole-row): write @nwords words to tile byte
+// address @tile_addr on EVERY column of @row, with the last word re-emitted as a
+// write-with-return so each column returns a header-only ack. All ncols acks
+// draining the shim S2MM (@f->resp_s2mm_ch, BDs bd_id+1..bd_id+ncols) is the
+// completion barrier. @nwords must fit one control access. Blocking. Returns
+// XAIE_OK iff every ack drained. Requires @row configured by __Runtime_ctrl_plan_init.
+AieRC __Runtime_ctrl_row_write_ack(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr, const uint32_t *data,
+                                   uint32_t nwords, int32_t bd_id, int32_t mm2s_ch);
 
 #endif // AIE_RUNTIME_H

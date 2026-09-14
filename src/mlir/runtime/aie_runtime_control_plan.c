@@ -47,7 +47,8 @@ static acr_rc acr_emit_slot(acr_oplist *o, uint8_t c, uint8_t row, acr_port spor
                      .pkt_id = pkt,
                      .mask = mask,
                      .msel = msel,
-                     .arbiter = arb};
+                     .arbiter = arb,
+                     .is_ret = (uint8_t)(arb == ACR_ARB_RET)};
     return acr_emit_op(o, &slotop);
 }
 
@@ -76,7 +77,8 @@ static acr_rc acr_emit_master(acr_oplist *o, acr_portbook *b, uint8_t c, uint8_t
                 .msel = 0,
                 .arbiter = arb,
                 .mselen = mselen,
-                .keep_header = 1};
+                .keep_header = 1,
+                .is_ret = (uint8_t)(arb == ACR_ARB_RET)};
     return acr_emit_op(o, &m);
 }
 
@@ -162,7 +164,7 @@ static acr_rc acr_emit_ret_slot(acr_oplist *o, acr_portbook *b, uint8_t c, uint8
         return rc;
     if ((rc = acr_emit_slot(o, c, row, sport, slot, /*pkt=*/0, /*mask=*/0, msel, ACR_ARB_RET)) != ACR_OK)
         return rc;
-    acr_op se = {.kind = ACR_OP_SLAVE_EN, .col = c, .row = row, .sport = sport, .sidx = 0, .pkt_id = 0};
+    acr_op se = {.kind = ACR_OP_SLAVE_EN, .col = c, .row = row, .sport = sport, .sidx = 0, .pkt_id = 0, .is_ret = 1};
     return acr_emit_op(o, &se);
 }
 
@@ -303,7 +305,8 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
                            .sport = ACR_NORTH,
                            .sidx = 0,
                            .mport = ACR_SOUTH,
-                           .midx = 0};
+                           .midx = 0,
+                           .is_ret = 1};
             if ((crc = acr_emit_op(o, &rcct)) != ACR_OK)
                 return crc;
         }
