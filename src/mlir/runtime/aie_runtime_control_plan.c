@@ -80,25 +80,21 @@ static acr_rc acr_emit_master(acr_oplist *o, acr_portbook *b, uint8_t c, uint8_t
     return acr_emit_op(o, &m);
 }
 
-/* Core chain derivation. Each tile in [col_lo..col_hi] arms a per-role slot table
- * on its ingress slave port; the runtime send-path selects the column subset via
- * the packet stream id ((class<<2)|@rowidx, see the header slot table):
- *   Interior tile (c < col_hi, includes the spine head):
- *     slot CONSUME   {classes 00,10} @rowidx (mask 0x17) -> CTRL + EAST
- *     slot BCAST     (id[4]=1)                            -> CTRL + EAST (+NORTH on head)
- *     slot TRANSIT_N (any row-mcast, spine head only)     -> NORTH climb
- *     slot TRANSIT_E {class 01} @rowidx (exact)           -> EAST only (forward past)
- *   Last tile (c == col_hi):
- *     slot ONLY_LAST {class 01} @rowidx (exact) -> CTRL
- *     slot WHOLE     {class 10} @rowidx (exact) -> CTRL
- *     slot BCAST     (id[4]=1)                  -> CTRL
- * Masters: interior CTRL 0x3, EAST 0xB (consume+bcast+transit-east) when not last,
- * NORTH 0x6 on the spine head; last-tile CTRL 0x7 (no EAST/NORTH). @head_ingress
- * is the slave port the leftmost tile (col_lo) receives on: WEST for a plain
- * chain, SOUTH when the head is the top of the vertical spine. @shim_col < 0
- * disables the NORTH climb / transit-north slot (plain chain). @row is the
- * physical AIE row (op coords); @rowidx is the add-order row index carried in
- * id[1:0]. @ctrl_id is retained for the emit layer's provenance logging. */
+/* Core chain derivation. Each tile in [col_lo..col_hi] arms the SAME uniform slot
+ * table on its ingress slave port, so a row-multicast reaches EVERY column of the
+ * row (the "all columns respond" model) and there is no last-tile special casing:
+ *   slot CONSUME   row-multicast @rowidx (mask 0x17: classes 00 & 10) -> CTRL + EAST
+ *   slot BCAST     (id[4]=1)                                          -> CTRL + EAST (+NORTH on head)
+ *   slot TRANSIT_N (row-multicast/broadcast, spine head only)         -> NORTH climb
+ * Masters: CTRL 0x3 on every tile, EAST 0xB when not the last column, NORTH 0x6 on
+ * the spine head. @head_ingress is the slave port the leftmost tile (col_lo)
+ * receives on: WEST for a plain chain, SOUTH when the head is the top of the
+ * vertical spine. @shim_col < 0 disables the NORTH climb / transit-north slot
+ * (plain chain). @row is the physical AIE row (op coords); @rowidx is the add-order
+ * row index carried in id[1:0]. @ctrl_id is retained for the emit layer's
+ * provenance logging. (The legacy only-last / all-but-last column-subset classes
+ * are no longer separately routed; the runtime's class-write wrappers still exist
+ * but resolve onto this uniform superset.) */
 static acr_rc acr_plan_chain_ex(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t rowidx, uint8_t col_lo,
                                 uint8_t col_hi, uint8_t ctrl_id, int shim_col, acr_port head_ingress) {
     if (col_hi < col_lo || col_hi >= 64)
@@ -155,6 +151,73 @@ static acr_rc acr_plan_chain_ex(acr_oplist *o, acr_portbook *b, uint8_t row, uin
     return ACR_OK;
 }
 
+/* Emit one return SLOT on tile (c,row)'s @sport slave: accept-any (pkt=0,mask=0)
+ * into arbiter ACR_ARB_RET with select value @msel, then enable that slave port.
+ * Books the slave port (idx 0) first (slots do not book on their own). Each
+ * return slave port carries exactly one slot, so slot index == MSel. */
+static acr_rc acr_emit_ret_slot(acr_oplist *o, acr_portbook *b, uint8_t c, uint8_t row, acr_port sport, uint8_t slot,
+                                uint8_t msel) {
+    acr_rc rc = acr_book_port(b, c, row, sport, 0, /*master*/ 0);
+    if (rc != ACR_OK)
+        return rc;
+    if ((rc = acr_emit_slot(o, c, row, sport, slot, /*pkt=*/0, /*mask=*/0, msel, ACR_ARB_RET)) != ACR_OK)
+        return rc;
+    acr_op se = {.kind = ACR_OP_SLAVE_EN, .col = c, .row = row, .sport = sport, .sidx = 0, .pkt_id = 0};
+    return acr_emit_op(o, &se);
+}
+
+/* Return chain for [col_lo..col_hi] on @row (east->west packet merge). Every tile
+ * injects its own CTRL-slave response (RET_LOCAL); a tile with an east neighbor
+ * (c<col_hi) also forwards that neighbor's westbound merged responses
+ * (RET_TRANSIT). The head (col_lo, on the spine column) drives the merged bus
+ * SOUTH->VRET and additionally merges the descending upper-spine responses on its
+ * NORTH slave (RET_NORTH); arming RET_NORTH unconditionally is harmless because on
+ * the topmost head that slot simply never receives traffic, and it keeps this
+ * routine fully local (no dependency on later row_adds, so no re-emit / double-
+ * book). Non-head tiles drive their merged bus WEST to the next tile's EAST slave.
+ * All return ports are disjoint from the forward chain (forward uses WEST/SOUTH
+ * slave ingress + EAST/CTRL/NORTH masters), and master/slave domains are booked
+ * separately, so there is no port conflict. See the header for the slot/MSel map. */
+acr_rc acr_plan_return_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_lo, uint8_t col_hi, int is_top) {
+    if (col_hi < col_lo || col_hi >= 64)
+        return ACR_ERR_BOUNDS;
+
+    for (uint8_t c = col_lo; c <= col_hi; c++) {
+        int is_head = (c == col_lo);
+        int has_transit = (c < col_hi);
+        acr_rc rc;
+
+        /* Local response source: this tile's CTRL slave. */
+        if ((rc = acr_emit_ret_slot(o, b, c, row, ACR_CTRL, ACR_SLOT_RET_LOCAL, ACR_MSEL_RET_LOCAL)) != ACR_OK)
+            return rc;
+        /* East neighbor's westbound merged responses (interior + head, not last). */
+        if (has_transit &&
+            (rc = acr_emit_ret_slot(o, b, c, row, ACR_EAST, ACR_SLOT_RET_TRANSIT, ACR_MSEL_RET_TRANSIT)) != ACR_OK)
+            return rc;
+
+        if (is_head) {
+            /* Non-top head: merge the descending upper-spine responses on its
+             * NORTH slave. The top head has nothing above it, so it omits this
+             * idle slot. */
+            if (!is_top &&
+                (rc = acr_emit_ret_slot(o, b, c, row, ACR_NORTH, ACR_SLOT_RET_NORTH, ACR_MSEL_RET_NORTH)) != ACR_OK)
+                return rc;
+            /* Head descent: SOUTH master -> VRET, pulling {local, transit?} plus
+             * {north} only when a head can sit above (non-top). */
+            uint8_t mselen = (uint8_t)((1u << ACR_MSEL_RET_LOCAL) | (has_transit ? (1u << ACR_MSEL_RET_TRANSIT) : 0u) |
+                                       (is_top ? 0u : (1u << ACR_MSEL_RET_NORTH)));
+            if ((rc = acr_emit_master(o, b, c, row, ACR_SOUTH, mselen, ACR_ARB_RET)) != ACR_OK)
+                return rc;
+        } else {
+            /* Interior/last: WEST master merges {local, transit?} to the west tile. */
+            uint8_t mselen = (uint8_t)((1u << ACR_MSEL_RET_LOCAL) | (has_transit ? (1u << ACR_MSEL_RET_TRANSIT) : 0u));
+            if ((rc = acr_emit_master(o, b, c, row, ACR_WEST, mselen, ACR_ARB_RET)) != ACR_OK)
+                return rc;
+        }
+    }
+    return ACR_OK;
+}
+
 /* Public chain planner: plain horizontal chain, head tile ingresses on WEST, no
  * vertical spine climb (shim_col=-1). A plain chain is a single row => rowidx 0. */
 acr_rc acr_plan_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_lo, uint8_t col_hi, uint8_t ctrl_id) {
@@ -194,7 +257,7 @@ static int acr_row_is_head(const acr_state *s, uint8_t row) {
  * (all-but-last / only-last / whole-row + broadcast) and the per-transfer class +
  * target row index are carried by the control packet's stream id at send time. */
 acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t shim_col, uint8_t row, uint8_t col_lo,
-                        uint8_t col_hi, uint8_t ctrl_id) {
+                        uint8_t col_hi, uint8_t ctrl_id, int is_top) {
     if (row == 0 || shim_col >= 64)
         return ACR_ERR_BOUNDS;
     if (col_lo != shim_col) /* row entry is the vertical spine's left column */
@@ -229,6 +292,20 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
             acr_rc crc = acr_emit_op(o, &cct);
             if (crc != ACR_OK)
                 return crc;
+            /* Symmetric RETURN descent through this pass-through row: NORTH slave
+             * -> SOUTH master CCT. The emit layer maps NORTH-slave and SOUTH-master
+             * to VRET, so this carries the descending merged responses down toward
+             * the shim. Head rows are skipped (they descend via their own return
+             * SOUTH master emitted in acr_plan_return_chain). */
+            acr_op rcct = {.kind = ACR_OP_CCT,
+                           .col = shim_col,
+                           .row = r,
+                           .sport = ACR_NORTH,
+                           .sidx = 0,
+                           .mport = ACR_SOUTH,
+                           .midx = 0};
+            if ((crc = acr_emit_op(o, &rcct)) != ACR_OK)
+                return crc;
         }
         s->spine_top = need_top;
     }
@@ -237,6 +314,12 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
      * emits its broadcast NORTH climb master (head sits on shim_col == col_lo). */
     acr_rc rc = acr_plan_chain_ex(o, b, row, /*rowidx=*/s->nrows, col_lo, col_hi, ctrl_id, /*shim_col=*/(int)shim_col,
                                   ACR_SOUTH);
+    if (rc != ACR_OK)
+        return rc;
+
+    /* Return path: every column of this row injects/forwards its CTRL response
+     * west, the head drives it SOUTH->VRET (merging any upper-spine descent). */
+    rc = acr_plan_return_chain(o, b, row, col_lo, col_hi, is_top);
     if (rc != ACR_OK)
         return rc;
 
