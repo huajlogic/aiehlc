@@ -19,6 +19,9 @@ extern "C" {
 #include "xaiengine.h"
 }
 
+// The standalone encoder under test.
+#include "aie_kernel_config.h"
+
 // ---- AIE2PS (gen5) device geometry (matches include/aie_device_map.h) ----
 #define KC_BASE_ADDR 0x20000000000ULL
 #define KC_COL_SHIFT 25
@@ -94,7 +97,8 @@ static std::vector<CapWrite> parse_txn(const uint8_t *buf) {
 // XAie driver calls that program one buffer descriptor. Runs inside an open
 // transaction, so nothing hits HW.
 static void emit_golden_core_bd(XAie_DevInst *dev, XAie_LocType loc, uint8_t bd_id, uint64_t dma_addr, uint32_t len,
-                                int next_bd, int acq_id, int acq_val, int rel_id, int rel_val, int ooo_bd_id) {
+                                int next_bd, int acq_id, int acq_val, int rel_id, int rel_val, int en_packet,
+                                int pkt_id, int pkt_type, int ooo_bd_id) {
     XAie_DmaDesc desc;
     XAie_DmaDescInit(dev, &desc, loc);
     XAie_DmaSetAddrLen(&desc, dma_addr, len);
@@ -102,6 +106,8 @@ static void emit_golden_core_bd(XAie_DevInst *dev, XAie_LocType loc, uint8_t bd_
         XAie_DmaSetLock(&desc, XAie_LockInit((u16)acq_id, (s8)acq_val), XAie_LockInit((u16)rel_id, (s8)rel_val));
     if (next_bd >= 0)
         XAie_DmaSetNextBd(&desc, (uint16_t)next_bd, XAIE_ENABLE);
+    if (en_packet)
+        XAie_DmaSetPkt(&desc, XAie_PacketInit((u8)pkt_id, (u8)pkt_type));
     if (ooo_bd_id >= 0)
         XAie_DmaSetOutofOrderBdId(&desc, (uint8_t)ooo_bd_id);
     XAie_DmaEnableBd(&desc);
@@ -110,6 +116,34 @@ static void emit_golden_core_bd(XAie_DevInst *dev, XAie_LocType loc, uint8_t bd_
         fprintf(stderr, "FAIL: XAie_DmaWriteBd rc=%d\n", (int)rc);
         exit(3);
     }
+}
+
+// Look up the golden captured value at a tile-local offset. Sets *found.
+static uint32_t golden_val(const std::vector<CapWrite> &g, uint32_t off, bool *found) {
+    for (const CapWrite &c : g) {
+        if (c.off == off) {
+            *found = true;
+            return c.val;
+        }
+    }
+    *found = false;
+    return 0;
+}
+
+// Diff every encoder-produced (off,val) against the golden capture. Prints each
+// comparison; returns the number of mismatches (0 == byte-identical).
+static int diff_regs(const char *label, const AieKcReg *enc, int n, const std::vector<CapWrite> &g) {
+    int bad = 0;
+    printf("--- %s: encoder vs golden (%d regs) ---\n", label, n);
+    for (int i = 0; i < n; i++) {
+        bool found = false;
+        uint32_t gv = golden_val(g, enc[i].off, &found);
+        const char *tag = (found && gv == enc[i].val) ? "ok" : (found ? "MISMATCH" : "MISSING");
+        printf("  off=0x%05x enc=0x%08x golden=0x%08x  %s\n", enc[i].off, enc[i].val, gv, tag);
+        if (!found || gv != enc[i].val)
+            bad++;
+    }
+    return bad;
 }
 
 int main(void) {
@@ -130,12 +164,44 @@ int main(void) {
         return 1;
     }
 
-    // Core tile at (col=0, row=3): S2MM ping BD 0 -> pong BD 1.
+    // Core tile at (col=0, row=3). BD params reused by both the golden driver
+    // emission and the standalone encoder so the two can be diffed.
     XAie_LocType loc = XAie_TileLoc(0, KC_CORE_ROW_ST);
     const uint64_t ping_addr = 0x2000; // core DMA-view byte address
     const uint32_t len = 1024;         // bytes
-    emit_golden_core_bd(&dev_inst, loc, /*bd_id=*/0, ping_addr, len, /*next_bd=*/1,
-                        /*acq_id=*/0, /*acq_val=*/-1, /*rel_id=*/1, /*rel_val=*/1, /*ooo_bd_id=*/-1);
+    const uint8_t bd_id = 0, next_bd = 1;
+    const int acq_id = 0, acq_val = -1, rel_id = 1, rel_val = 1;
+    const uint8_t lock_id = 1;
+    const int lock_val = 1;
+    const uint8_t ch = 0;
+    const uint32_t repeat = 1;
+
+    // Second BD: an MM2S-style BD exercising packet + out-of-order (so BD word 1
+    // is non-zero and those encoder branches are actually validated).
+    const uint8_t bd2_id = 2;
+    const uint64_t bd2_addr = 0x4000;
+    const uint32_t bd2_len = 512;
+    const int bd2_acq_id = 2, bd2_acq_val = -1, bd2_rel_id = 3, bd2_rel_val = 1;
+    const int bd2_pkt_id = 5, bd2_pkt_type = 0, bd2_ooo = 7;
+
+    // Golden #1: S2MM ping BD 0 -> pong BD 1.
+    emit_golden_core_bd(&dev_inst, loc, bd_id, ping_addr, len, next_bd, acq_id, acq_val, rel_id, rel_val,
+                        /*en_packet=*/0, /*pkt_id=*/0, /*pkt_type=*/0, /*ooo_bd_id=*/-1);
+    // Golden #1b: MM2S BD with packet + out-of-order id, no next bd.
+    emit_golden_core_bd(&dev_inst, loc, bd2_id, bd2_addr, bd2_len, /*next_bd=*/-1, bd2_acq_id, bd2_acq_val, bd2_rel_id,
+                        bd2_rel_val, /*en_packet=*/1, bd2_pkt_id, bd2_pkt_type, bd2_ooo);
+    // Golden #2: lock init value.
+    rc = XAie_LockSetValue(&dev_inst, loc, XAie_LockInit((u8)lock_id, (s8)lock_val));
+    if (rc != XAIE_OK) {
+        fprintf(stderr, "FAIL: XAie_LockSetValue rc=%d\n", (int)rc);
+        return 1;
+    }
+    // Golden #3: S2MM channel start queue.
+    rc = XAie_DmaChannelSetStartQueue(&dev_inst, loc, ch, DMA_S2MM, bd_id, repeat, XAIE_DISABLE);
+    if (rc != XAIE_OK) {
+        fprintf(stderr, "FAIL: XAie_DmaChannelSetStartQueue rc=%d\n", (int)rc);
+        return 1;
+    }
 
     uint8_t *txn = XAie_ExportSerializedTransaction(&dev_inst, 1, 0);
     if (!txn) {
@@ -144,24 +210,37 @@ int main(void) {
     }
 
     std::vector<CapWrite> writes = parse_txn(txn);
-
-    printf("captured %zu register writes for core-tile S2MM BD0:\n", writes.size());
-    int bd0_words = 0;
-    for (const CapWrite &c : writes) {
-        printf("  (col=%u,row=%u) off=0x%05x = 0x%08x", c.col, c.row, c.off, c.val);
-        if (c.off >= KC_DMA_BD0_0 && c.off < KC_DMA_BD0_0 + KC_DMA_BD_STRIDE) {
-            printf("   [BD0 word %u]", (c.off - KC_DMA_BD0_0) / 4u);
-            bd0_words++;
-        }
-        printf("\n");
-    }
-
     free(txn);
 
-    if (bd0_words != 6) {
-        fprintf(stderr, "FAIL: expected 6 BD0 register words, captured %d\n", bd0_words);
+    printf("captured %zu golden register writes:\n", writes.size());
+    for (const CapWrite &c : writes)
+        printf("  off=0x%05x = 0x%08x\n", c.off, c.val);
+
+    // Encode the same config via the standalone encoder and diff byte-for-byte.
+    int bad = 0;
+    AieKcReg bd[AIE_KC_DMA_BD_NUM_WORDS];
+    int nbd = aie_kc_encode_bd(bd, bd_id, ping_addr, len, next_bd, acq_id, acq_val, rel_id, rel_val,
+                               /*en_packet=*/0, /*pkt_id=*/0, /*pkt_type=*/0, /*ooo_bd_id=*/-1);
+    bad += diff_regs("S2MM BD0", bd, nbd, writes);
+
+    AieKcReg bd2[AIE_KC_DMA_BD_NUM_WORDS];
+    int nbd2 = aie_kc_encode_bd(bd2, bd2_id, bd2_addr, bd2_len, /*next_bd=*/-1, bd2_acq_id, bd2_acq_val, bd2_rel_id,
+                                bd2_rel_val, /*en_packet=*/1, bd2_pkt_id, bd2_pkt_type, bd2_ooo);
+    bad += diff_regs("MM2S BD2 (pkt+ooo)", bd2, nbd2, writes);
+
+    AieKcReg lk[1];
+    int nlk = aie_kc_encode_lock(lk, lock_id, lock_val);
+    bad += diff_regs("lock init", lk, nlk, writes);
+
+    AieKcReg sq[1];
+    int nsq = aie_kc_encode_s2mm_start(sq, ch, bd_id, repeat, /*en_token=*/0);
+    bad += diff_regs("S2MM start queue", sq, nsq, writes);
+
+    if (bad != 0) {
+        fprintf(stderr, "FAIL: %d encoder/golden mismatches\n", bad);
         return 1;
     }
-    printf("PASS: golden core-tile S2MM BD capture (6 words) works host-native\n");
+    printf("PASS: standalone encoder is byte-identical to aie-rt golden "
+           "(BD + lock + channel-start)\n");
     return 0;
 }
