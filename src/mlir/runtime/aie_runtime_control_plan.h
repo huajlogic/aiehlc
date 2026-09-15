@@ -1,6 +1,11 @@
 #ifndef AIE_RUNTIME_CONTROL_PLAN_H
 #define AIE_RUNTIME_CONTROL_PLAN_H
 #include <stdint.h>
+/* The HW stream-switch resources the planner emits (slots, arbiters, msel, the
+ * id/mask scheme) are owned by the reservation table. This header aliases its
+ * ACR_* names to the RT_RES_* single-source-of-truth constants so the planner
+ * and the table can never drift. */
+#include "aie_runtime_resource.h"
 
 /* Pure planner for row-based control connections. No XAie dependency so it can
  * be unit-tested on the host. The emit layer (aie_runtime.c) translates the
@@ -10,8 +15,8 @@
 
 #define ACR_MAX_ROWS 16
 #define ACR_MAX_OPS 256
-#define ACR_NUM_SLOTS 4 /* NumSlaveSlots per port (xaie_ss.c:755) */
-#define ACR_MAX_ROW_IDX 3 /* target row index lives in id[1:0] (0..3 => up to 4 rows) */
+#define ACR_NUM_SLOTS RT_RES_NUM_SLOTS     /* NumSlaveSlots per port (xaie_ss.c:755) */
+#define ACR_MAX_ROW_IDX RT_RES_MAX_ROW_IDX /* target row index lives in id[1:0] (0..3 => up to 4 rows) */
 
 /* Stream-id scheme (5-bit id): [4]=broadcast marker; when [4]=0 the packet is a
  * row-multicast whose target row is the add-order index in id[1:0]; id[3:2] is a
@@ -32,9 +37,9 @@
 
 /* Forward slot indices (== MSel on that tile). CONSUME + BCAST are armed on every
  * tile; TRANSIT_N is armed on the spine head only. */
-#define ACR_SLOT_CONSUME 0   /* row-multicast @row K (mask 0x17) -> CTRL + EAST */
-#define ACR_SLOT_BCAST 1     /* id[4]=1 -> CTRL + EAST (+NORTH on head) */
-#define ACR_SLOT_TRANSIT_N 2 /* row-multicast/broadcast -> NORTH climb (spine head only) */
+#define ACR_SLOT_CONSUME RT_RES_SLOT_CONSUME     /* row-multicast @row K (mask 0x17) -> CTRL + EAST */
+#define ACR_SLOT_BCAST RT_RES_SLOT_BCAST         /* id[4]=1 -> CTRL + EAST (+NORTH on head) */
+#define ACR_SLOT_TRANSIT_N RT_RES_SLOT_TRANSIT_N /* row-multicast/broadcast -> NORTH climb (spine head only) */
 #define ACR_SLOT_TRANSIT_E 3 /* legacy: former only-last EAST forward (unused by uniform planner) */
 
 /* Legacy last-tile slot indices — retained for the ACR_CLASS_* runtime wrappers;
@@ -44,15 +49,15 @@
 #define ACR_SLOT_BCAST_LAST 2 /* legacy: id[4]=1 -> CTRL */
 
 /* MSel select value each slot injects (mirrors the slot index above). */
-#define ACR_MSEL_CONSUME 0
-#define ACR_MSEL_BCAST 1
-#define ACR_MSEL_TRANSIT_N 2
+#define ACR_MSEL_CONSUME RT_RES_MSEL_CONSUME
+#define ACR_MSEL_BCAST RT_RES_MSEL_BCAST
+#define ACR_MSEL_TRANSIT_N RT_RES_MSEL_TRANSIT_N
 #define ACR_MSEL_TRANSIT_E 3
 #define ACR_MSEL_ONLY_LAST 0
 #define ACR_MSEL_WHOLE 1
 #define ACR_MSEL_BCAST_LAST 2
 
-#define ACR_ARB_CTRL 0 /* single shared arbiter for all classes */
+#define ACR_ARB_CTRL RT_RES_ARB_CTRL /* single shared arbiter for all classes */
 
 /* --- Return chain (write-ack / read response) ---------------------------- */
 /* Every target-row column returns its CTRL-slave response; the responses merge
@@ -61,15 +66,15 @@
  * never contend on a shared arbiter. Each return slot lives on its OWN slave
  * port (RET_LOCAL on CTRL-slave, RET_TRANSIT on EAST-slave, RET_NORTH on
  * NORTH-slave), so slot index == MSel and the port carries a single slot. */
-#define ACR_ARB_RET 1 /* return arbiter, distinct from ACR_ARB_CTRL */
+#define ACR_ARB_RET RT_RES_ARB_RET /* return arbiter, distinct from ACR_ARB_CTRL */
 
-#define ACR_SLOT_RET_LOCAL 0   /* this tile's CTRL-slave response */
-#define ACR_SLOT_RET_TRANSIT 1 /* east neighbor's westbound merged responses */
-#define ACR_SLOT_RET_NORTH 2   /* upper spine head's descending responses */
-#define ACR_SLOT_RET_EAST 2    /* upper spine head's descending responses */
-#define ACR_MSEL_RET_LOCAL 0
-#define ACR_MSEL_RET_TRANSIT 1
-#define ACR_MSEL_RET_NORTH 2
+#define ACR_SLOT_RET_LOCAL RT_RES_SLOT_RET_LOCAL     /* this tile's CTRL-slave response */
+#define ACR_SLOT_RET_TRANSIT RT_RES_SLOT_RET_TRANSIT /* east neighbor's westbound merged responses */
+#define ACR_SLOT_RET_NORTH RT_RES_SLOT_RET_NORTH     /* upper spine head's descending responses */
+#define ACR_SLOT_RET_EAST 2                          /* upper spine head's descending responses */
+#define ACR_MSEL_RET_LOCAL RT_RES_MSEL_RET_LOCAL
+#define ACR_MSEL_RET_TRANSIT RT_RES_MSEL_RET_TRANSIT
+#define ACR_MSEL_RET_NORTH RT_RES_MSEL_RET_NORTH
 #define ACR_MSEL_RET_EAST 2
 
 /* Per-master MSelEn bitmaps for the return SOUTH/WEST masters. */
@@ -80,12 +85,12 @@
 
 /* Reserved-bit id/mask scheme (5-bit stream id):
  *   [4]=bcast marker; [3:2]=class; [1:0]=target row index when [4]=0. */
-#define ACR_ID_BCAST 0x10     /* [4]=1 */
-#define ACR_MASK_BCAST 0x10   /* match on [4] only */
-#define ACR_ID_TRANSIT 0x00   /* transit-north matches any row-mcast (bit4=0) */
-#define ACR_MASK_CLASS 0x10   /* match on [4] only: row-mcast (0) vs broadcast (1) */
-#define ACR_MASK_EXACT 0x1F   /* full 5-bit exact match */
-#define ACR_MASK_CONSUME 0x17 /* match [4]=0,[2]=0,[1:0]=K ; ignore [3] -> classes 00 & 10 */
+#define ACR_ID_BCAST RT_RES_ID_BCAST         /* [4]=1 */
+#define ACR_MASK_BCAST RT_RES_MASK_BCAST     /* match on [4] only */
+#define ACR_ID_TRANSIT RT_RES_ID_TRANSIT     /* transit-north matches any row-mcast (bit4=0) */
+#define ACR_MASK_CLASS RT_RES_MASK_CLASS     /* match on [4] only: row-mcast (0) vs broadcast (1) */
+#define ACR_MASK_EXACT 0x1F                  /* full 5-bit exact match */
+#define ACR_MASK_CONSUME RT_RES_MASK_CONSUME /* match [4]=0,[2]=0,[1:0]=K ; ignore [3] -> classes 00 & 10 */
 
 /* Per-master MSelEn bitmaps: which slot MSels each enabled master pulls. */
 #define ACR_MSELEN_CTRL ((1u << ACR_MSEL_CONSUME) | (1u << ACR_MSEL_BCAST))                              /* 0x3 */

@@ -351,15 +351,15 @@ int run_ctrlrow_demo(XAie_DevInst *dev) {
 
 def test_extract_ctrl_rows_open_and_add():
     active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_SRC))
-    fab = x.extract_ctrl_rows(active, x.collect_defines(active))
-    assert fab["shim_col"] == 0
-    # two distinct chains from the row array
-    assert fab["rows"] == [{"row": 3, "col_lo": 0, "col_hi": 1},
-                           {"row": 5, "col_lo": 0, "col_hi": 1}]
+    fabs = x.extract_ctrl_rows(active, x.collect_defines(active))
+    # one fabric on spine col 0 with two distinct chains from the row array
+    assert fabs == [{"shim_col": 0,
+                     "rows": [{"row": 3, "col_lo": 0, "col_hi": 1},
+                              {"row": 5, "col_lo": 0, "col_hi": 1}]}]
 
 
 def test_extract_ctrl_rows_none_without_open():
-    assert x.extract_ctrl_rows("int main(){return 0;}", {}) is None
+    assert x.extract_ctrl_rows("int main(){return 0;}", {}) == []
 
 
 # The real ctrlrow_demo.cc passes u-suffixed #define values (DEMO_SHIM_COL = 0u)
@@ -381,8 +381,8 @@ int run_ctrlrow_demo(XAie_DevInst *dev) {
 
 def test_extract_ctrl_rows_folds_suffixed_define():
     active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_DEFINE_SRC))
-    fab = x.extract_ctrl_rows(active, x.collect_defines(active))
-    assert fab == {"shim_col": 0, "rows": [{"row": 3, "col_lo": 0, "col_hi": 1}]}
+    fabs = x.extract_ctrl_rows(active, x.collect_defines(active))
+    assert fabs == [{"shim_col": 0, "rows": [{"row": 3, "col_lo": 0, "col_hi": 1}]}]
 
 
 # The real ctrlrow_demo.cc lists its rows in a __Runtime_CtrlRowChain rows[]
@@ -407,10 +407,65 @@ int run_ctrlrow_demo(XAie_DevInst *dev) {
 
 def test_extract_ctrl_rows_folds_row_array():
     active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_MULTI_SRC))
-    fab = x.extract_ctrl_rows(active, x.collect_defines(active))
-    assert fab["shim_col"] == 0
-    assert fab["rows"] == [{"row": 3, "col_lo": 0, "col_hi": 3},
-                           {"row": 5, "col_lo": 0, "col_hi": 3}]
+    fabs = x.extract_ctrl_rows(active, x.collect_defines(active))
+    assert fabs == [{"shim_col": 0,
+                     "rows": [{"row": 3, "col_lo": 0, "col_hi": 3},
+                              {"row": 5, "col_lo": 0, "col_hi": 3}]}]
+
+
+# A translation unit may declare SEVERAL fabrics (one per demo function, each with
+# its own __Runtime_ctrl_plan_init + __Runtime_CtrlRowChain array, frequently
+# reusing the name `kRows`). The static parser cannot know which one main() runs,
+# so it UNIONS every fabric it finds -- keyed by (shim_col, row, col_lo, col_hi),
+# grouped by spine column -- pairing each plan_init with the nearest PRECEDING
+# array of the same name so the two `kRows` scopes stay distinct.
+CTRL_ROW_UNION_SRC = """
+int run_ctrlrow_demo(XAie_DevInst *dev) {
+    __Runtime_CtrlRowFabric fab;
+    static const __Runtime_CtrlRowChain kRows[] = {
+        {3u, 0u, 3u},
+        {5u, 0u, 3u},
+    };
+    __Runtime_ctrl_plan_init(&fab, dev, 0u, 0, (uint8_t)0u, kRows, 2u);
+}
+int demo_txn_multipl_row(XAie_DevInst *dev) {
+    __Runtime_CtrlRowFabric fab;
+    static const __Runtime_CtrlRowChain kRows[] = {
+        {3u, 0u, 3u},
+        {4u, 0u, 3u},
+        {5u, 0u, 3u},
+        {6u, 0u, 3u},
+    };
+    __Runtime_ctrl_plan_init(&fab, dev, 0u, 0, (uint8_t)0u, kRows, 4u);
+}
+"""
+
+
+def test_extract_ctrl_rows_unions_multiple_fabrics():
+    active = x.strip_comments(x.MacroResolver(5, False).active_source(CTRL_ROW_UNION_SRC))
+    fabs = x.extract_ctrl_rows(active, x.collect_defines(active))
+    # One spine column (0); rows 3,5 (first fabric) unioned with the new 4,6
+    # (second fabric), deduped, in first-seen order.
+    assert fabs == [{"shim_col": 0,
+                     "rows": [{"row": 3, "col_lo": 0, "col_hi": 3},
+                              {"row": 5, "col_lo": 0, "col_hi": 3},
+                              {"row": 4, "col_lo": 0, "col_hi": 3},
+                              {"row": 6, "col_lo": 0, "col_hi": 3}]}]
+
+
+def test_extract_model_unions_multiple_fabrics():
+    # The device-map grid must span EVERY configured row across all fabrics: the
+    # union covers rows 3..6 (the 4x4 demo) even though the first fabric only has
+    # rows 3,5. Endpoint flows exist for all four rows on spine col 0.
+    model = x.extract_model(CTRL_ROW_UNION_SRC, aie_gen=5, aiesim=False)
+    tiles = {(t["col"], t["row"]): t["type"] for t in model["tiles"]}
+    for r in (3, 4, 5, 6):
+        assert tiles[(0, r)] == "core"
+        assert tiles[(3, r)] == "core"
+    dirs = {(f["src"], f["dst"], f["direction"]) for f in model["flows"]}
+    for r in (3, 4, 5, 6):
+        assert ((0, 0), (3, r), "S2MM") in dirs
+        assert ((3, r), (0, 0), "MM2S") in dirs
 
 
 def test_extract_model_ctrl_row_fabric():

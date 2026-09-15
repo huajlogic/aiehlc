@@ -3092,6 +3092,196 @@ uint32_t __Runtime_ctrl_pktize_write(uint32_t *out, uint32_t out_cap, uint32_t s
     return idx;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Control-packet transaction capture (see aie_runtime.h). Captures WRITE-only
+ * register ops into an XAie transaction (auto-flush disabled, so nothing hits
+ * HW), then translates the exported serialized op buffer into control packets.
+ * ------------------------------------------------------------------------- */
+
+/* Begin capturing write-only ops without applying them to hardware, recording
+ * the cast target @row into @fab->txn_row so commit/push can read it back
+ * (@row < 0 => broadcast; @row >= 0 => row-multicast). @fab must be non-NULL. */
+int __Runtime_control_start_transaction(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, int row) {
+    if (!fab)
+        return -1;
+    fab->txn_row = row;
+    return XAie_StartTransaction(dev, XAIE_TRANSACTION_DISABLE_AUTO_FLUSH) == XAIE_OK ? 0 : -1;
+}
+
+/* Decode a flat XAie register offset into (col, row, tile-local byte addr) using
+ * the device's RowShift/ColShift. Address layout is
+ * Col<<ColShift | Row<<RowShift | tile_local_offset. Returns 0 on success. */
+static int rt_ctrl_txn_decode_regoff(XAie_DevInst *dev, uint64_t regoff, uint8_t *col, uint8_t *row,
+                                     uint32_t *tile_addr) {
+    if (!dev)
+        return -1;
+    uint8_t row_shift = dev->DevProp.RowShift;
+    uint8_t col_shift = dev->DevProp.ColShift;
+    uint32_t tile_mask = (row_shift >= 32U) ? 0xFFFFFFFFU : ((1U << row_shift) - 1U);
+    uint32_t row_span = col_shift - row_shift;
+    uint32_t row_mask = (row_span >= 32U) ? 0xFFFFFFFFU : ((1U << row_span) - 1U);
+    if (tile_addr)
+        *tile_addr = (uint32_t)(regoff & tile_mask);
+    if (row)
+        *row = (uint8_t)((regoff >> row_shift) & row_mask);
+    if (col)
+        *col = (uint8_t)(regoff >> col_shift);
+    return 0;
+}
+
+/* Validate one captured op's tile against the cast target, querying the device
+ * for the tile type. For a BROADCAST (@target_row < 0) every op must land on a
+ * CORE tile (XAIEGBL_TILE_TYPE_AIETILE) — the whole-array broadcast only reaches
+ * core tiles. For a ROW-MULTICAST (@target_row >= 0) every op must land on that
+ * physical row (so the transaction matches the target row's tile type). Returns
+ * 0 if the op is compatible, nonzero otherwise. */
+static int rt_ctrl_txn_check_tile(XAie_DevInst *dev, uint8_t col, uint8_t row, int target_row) {
+    if (target_row < 0) {
+        uint8_t tt = XAie_GetTileTypefromLoc(dev, XAie_TileLoc(col, row));
+        if (tt != XAIEGBL_TILE_TYPE_AIETILE) {
+            AIEHLC_LOG(printf("[aie_runtime] txn_translate: broadcast requires core tile; tile(%u,%u) type=%u\n",
+                              (unsigned)col, (unsigned)row, (unsigned)tt););
+            return -1;
+        }
+        return 0;
+    }
+    if ((int)row != target_row) {
+        AIEHLC_LOG(printf("[aie_runtime] txn_translate: multicast row=%d but op targets tile(%u,%u)\n", target_row,
+                          (unsigned)col, (unsigned)row););
+        return -1;
+    }
+    return 0;
+}
+
+/* Thin wrapper over __Runtime_ctrl_pktize_write appending WRITE packets at
+ * out[idx..]. @lastwriteack selects the packet type: 0 => fire-and-forget WRITE;
+ * 1 => the last data word is re-emitted as a WRITE-WITH-RETURN (write-ack) whose
+ * header-only response acks all preceding writes (return stream id @ret_sid).
+ * Returns words emitted (0 on overflow). */
+static uint32_t rt_ctrl_txn_emit_write(uint32_t *out, uint32_t cap, uint32_t idx, uint8_t sid, uint32_t tile_addr,
+                                       const uint32_t *data, uint32_t nwords, int lastwriteack, uint32_t ret_sid) {
+    if (idx > cap)
+        return 0U;
+    return __Runtime_ctrl_pktize_write(out + idx, cap - idx, sid, tile_addr, data, nwords, lastwriteack, ret_sid, NULL);
+}
+
+/* Translate a serialized-transaction byte buffer @buf into control-packet words
+ * in @out[0..@out_cap), stamping every emitted packet with the single broadcast/
+ * multicast stream id @sid. Walks @buf's XAie_TxnHeader + NumOps ops, emitting a
+ * WRITE control packet per Write32/BlockWrite32. Enforces that EVERY captured op
+ * is a write op: MaskWrite/MaskPoll and any other/unknown op are rejected (the
+ * control-packet format has no native masked/poll access). Each op's tile is
+ * validated against @target_row via rt_ctrl_txn_check_tile (broadcast <0 =>
+ * core-only; multicast >=0 => on that row). When @lastwriteack, ONLY the LAST
+ * emitted write packet is turned into a WRITE-WITH-RETURN (write-ack, return
+ * stream id @ret_sid) so a single header-only response acks the whole batch;
+ * every earlier op stays fire-and-forget. On success writes the total word count
+ * to *@nwords_out and returns 0; returns nonzero (leaving *@nwords_out untouched)
+ * on overflow, tile-type mismatch, or a non-write op. Not pure: queries dev tile
+ * type on broadcast. */
+int rt_ctrl_txn_translate(XAie_DevInst *dev, const uint8_t *buf, uint8_t sid, int target_row, uint32_t *out,
+                          uint32_t out_cap, uint32_t *nwords_out, int lastwriteack, uint32_t ret_sid) {
+    if (!dev || !buf || !out || !nwords_out)
+        return -1;
+    const XAie_TxnHeader *th = (const XAie_TxnHeader *)buf;
+    uint32_t num_ops = th->NumOps;
+    const uint8_t *ptr = buf + sizeof(XAie_TxnHeader);
+    uint32_t idx = 0U;
+    for (uint32_t i = 0U; i < num_ops; i++) {
+        const XAie_OpHdr *op = (const XAie_OpHdr *)ptr;
+        uint8_t col, row;
+        uint32_t tile_addr, nwords, n;
+        const uint32_t *payload;
+        uint32_t step;
+        if (op->Op == XAIE_IO_WRITE) {
+            const XAie_Write32Hdr *w = (const XAie_Write32Hdr *)ptr;
+            rt_ctrl_txn_decode_regoff(dev, w->RegOff, &col, &row, &tile_addr);
+            nwords = 1U;
+            payload = &w->Value;
+            step = w->Size;
+        } else if (op->Op == XAIE_IO_BLOCKWRITE) {
+            const XAie_BlockWrite32Hdr *b = (const XAie_BlockWrite32Hdr *)ptr;
+            rt_ctrl_txn_decode_regoff(dev, b->RegOff, &col, &row, &tile_addr);
+            nwords = (uint32_t)((b->Size - sizeof(XAie_BlockWrite32Hdr)) / sizeof(uint32_t));
+            payload = (const uint32_t *)(ptr + sizeof(XAie_BlockWrite32Hdr));
+            step = b->Size;
+        } else {
+            /* Not a write op (MaskWrite/MaskPoll/unknown) — reject the whole
+             * transaction; write control packets can only carry pure writes. */
+            AIEHLC_LOG(printf("[aie_runtime] txn_translate: non-write op %u (only Write32/BlockWrite32)\n", op->Op););
+            return -1;
+        }
+        if (rt_ctrl_txn_check_tile(dev, col, row, target_row))
+            return -1;
+        /* Only the final op carries the write-ack type; all earlier ops are
+         * fire-and-forget writes. */
+        int op_ack = (lastwriteack && i == num_ops - 1U) ? 1 : 0;
+        n = rt_ctrl_txn_emit_write(out, out_cap, idx, sid, tile_addr, payload, nwords, op_ack, ret_sid);
+        if (n == 0U && nwords > 0U)
+            return -1;
+        idx += n;
+        ptr += step;
+    }
+    *nwords_out = idx;
+    return 0;
+}
+
+/* Forward decl: resolve a physical row to its fabric add-order index (defined
+ * with the row-control fabric below). */
+static int rt_ctrl_row_index(const __Runtime_CtrlRowFabric *f, uint8_t row, uint8_t *rowidx,
+                             const __Runtime_CtrlRowChain **chain);
+
+/* Resolve the broadcast/multicast stream id for a cast target. @row < 0 selects
+ * the whole-array broadcast id (ACR_ID_BCAST, id[4]=1). @row >= 0 selects a
+ * row-multicast: resolve @row's add-order index in @fab and build
+ * (ACR_CLASS_WHOLE_ROW<<2)|(rowidx&3) (id[4]=0). Returns 0 on success (*sid set),
+ * nonzero if a multicast row is not configured in @fab. */
+static int rt_ctrl_txn_cast_sid(const __Runtime_CtrlRowFabric *fab, int row, uint8_t *sid) {
+    if (row < 0) {
+        *sid = (uint8_t)ACR_ID_BCAST;
+        return 0;
+    }
+    uint8_t rowidx = 0U;
+    if (!fab || !rt_ctrl_row_index(fab, (uint8_t)row, &rowidx, NULL)) {
+        AIEHLC_LOG(printf("[aie_runtime] commit_transaction: row=%d not configured\n", row););
+        return -1;
+    }
+    *sid = (uint8_t)(((uint8_t)ACR_CLASS_WHOLE_ROW << 2) | (rowidx & 0x3U));
+    return 0;
+}
+
+/* Export the captured transaction and translate every Write32/BlockWrite32 into
+ * broadcast/multicast control-packet words. Stateless w.r.t. the caller: the cast
+ * target is read from @fab->txn_row (set by start_transaction). txn_row < 0
+ * broadcasts to the whole array (every captured op must target a CORE tile);
+ * txn_row >= 0 multicasts to that physical row of @fab (every captured op must
+ * target that row). Every captured op must be a write op (Write32/BlockWrite32);
+ * MaskWrite/MaskPoll, any unknown op, and tile-type mismatches are rejected. Only
+ * the LAST emitted write packet is turned into a WRITE-WITH-RETURN (write-ack,
+ * return stream id 0) so a single header-only response acks the whole batch. */
+int __Runtime_control_write_pkt_commit_transaction(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, uint32_t *out,
+                                                   uint32_t out_cap, uint32_t *nwords_out) {
+    if (!dev || !fab || !out || !nwords_out)
+        return -1;
+    int row = fab->txn_row;
+    uint8_t sid = 0U;
+    if (rt_ctrl_txn_cast_sid(fab, row, &sid)) {
+        XAie_ClearTransaction(dev);
+        return -1;
+    }
+    uint8_t *buf = XAie_ExportSerializedTransaction(dev, 1, 0);
+    if (!buf) {
+        AIEHLC_LOG(printf("[aie_runtime] commit_transaction: export failed\n"););
+        XAie_ClearTransaction(dev);
+        return -1;
+    }
+    int rc = rt_ctrl_txn_translate(dev, buf, sid, row, out, out_cap, nwords_out, /*lastwriteack=*/1, /*ret_sid=*/0U);
+    free(buf);
+    XAie_ClearTransaction(dev);
+    AIEHLC_LOG(printf("[aie_runtime] commit_transaction: rc=%d sid=%u row=%d\n", rc, (unsigned)sid, row););
+    return rc;
+}
+
 /* Words available in @byte_addr's 128-bit (16-byte) block before it crosses the
  * boundary. Word-aligned inputs always return 1..4. */
 static uint32_t rt_ctrl_words_to_boundary(uint32_t byte_addr) {
@@ -3246,7 +3436,7 @@ int __Runtime_ctrl_parse_pkt_hdr(uint32_t pkt_hdr, uint32_t *id_out, uint32_t *t
  * @inst      send context (dev, shim_col, bd_id, mm2s_ch); not mutated.
  * @buf       DMA-capable control-packet payload.
  * @nwords    number of 32-bit words in @buf.
- * @block     if nonzero, also wait for the TCT return via __Runtime_ctrl_tct_poll
+ * @block     if nonzero, also wait for the TCT return via __Runtime_ctrl_ack_poll
  *            (requires @inst routing armed by __Runtime_ctrl_setup_routing).
  * @log       if nonzero, print the per-send log line and the polled TCT value.
  * @return    XAIE_OK on success.
@@ -3330,7 +3520,7 @@ AieRC __Runtime_ctrl_push(const __Runtime_CtrlInstance *inst, uint32_t *buf, uin
         rt_ctrl_dump_path_ports(inst);
     }
     if (block)
-        (void)__Runtime_ctrl_tct_poll(inst, log);
+        (void)__Runtime_ctrl_ack_poll(inst, log);
     return XAIE_OK;
 }
 
@@ -3345,7 +3535,7 @@ AieRC __Runtime_ctrl_push(const __Runtime_CtrlInstance *inst, uint32_t *buf, uin
  *       dest -> shim(col,0) S2MM TCT return route, alloc inst->token, arm shim S2MM;
  *   __Runtime_ctrl_push(inst, ..., block, log) - delegate the data send (block
  *       folds in the tct_poll below);
- *   __Runtime_ctrl_tct_poll(inst, print) - poll the S2MM drain, return the token.
+ *   __Runtime_ctrl_ack_poll(inst, print) - poll the S2MM drain, return the token.
  * __Runtime_ctrl_push_target composes all three around one packet buffer.
  * Same-column only: a straight vertical NORTH climb shim->dest and a SOUTH
  * return. The static helpers below each stay well under the 200-line rule;
@@ -3857,6 +4047,34 @@ static AieRC rt_ctrl_plan_add_rows(__Runtime_CtrlRowFabric *f, const __Runtime_C
     return XAIE_OK;
 }
 
+/* Program the shim return circuit that drains the vertical return spine: the
+ * NORTH(VRET) stream circuit-hops SOUTH onto the S2MM demux port, which then
+ * feeds the shim S2MM DMA. This is the row-0 counterpart of the per-tile return
+ * chain (the planner stops the descending CCT at row 1), so programming it makes
+ * the return spine reach the shim (row 0), symmetric with rt_ctrl_row_shim_entry's
+ * forward hop. Routing only -- the response-buffer-dependent BD arming stays
+ * per-send in rt_ctrl_row_shim_return. Re-enabling the same circuit is idempotent. */
+static AieRC rt_ctrl_row_shim_return_route(const __Runtime_CtrlRowFabric *f, int32_t s2mm_ch) {
+    XAie_DevInst *dev = f->dev;
+    XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
+    uint8_t rport = rt_shim_s2mm_port(dev, s2mm_ch);
+    AieRC rc = XAie_StrmConnCctEnable(dev, shim, NORTH, RT_CTRL_VRET, SOUTH, rport);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_row_return: shim StrmConnCctEnable (%u,0) NORTH%u->SOUTH%u rc=%d\n",
+               (unsigned)f->shim_col, (unsigned)RT_CTRL_VRET, (unsigned)rport, (int)rc);
+        return rc;
+    }
+    rc = XAie_EnableAieToShimDmaStrmPort(dev, shim, rport);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_row_return: EnableAieToShimDmaStrmPort (%u,0) port=%u rc=%d\n",
+               (unsigned)f->shim_col, (unsigned)rport, (int)rc);
+        return rc;
+    }
+    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VRET, "ret", "slave", f->ctrl_id, "circuit", -1);
+    rt_pmap_port(f->shim_col, 0, "SOUTH", rport, "ret", "master", f->ctrl_id, "circuit", -1);
+    return XAIE_OK;
+}
+
 /* One-shot row-control fabric init: record the device, spine column, control
  * stream id, and shim S2MM response channel, then plan + emit every EAST chain
  * in @rows. The spine + per-tile port book start empty and are grown by the
@@ -3874,7 +4092,17 @@ AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, ui
     f->fwd_vc = 0U; /* single forward/return vertical channel pair for now */
     f->ret_vc = 0U;
     f->resp_s2mm_ch = resp_s2mm_ch;
-    return rt_ctrl_plan_add_rows(f, rows, nrows);
+    AieRC rc = rt_ctrl_plan_add_rows(f, rows, nrows);
+    if (rc != XAIE_OK)
+        return rc;
+    /* Program the shim return leg now (row 0) so the return spine reaches the
+     * shim at plan time -- symmetric with the forward entry and visible on the
+     * device map without needing a read/write-ack send to lazily arm it. Per-send
+     * BD arming stays in rt_ctrl_row_shim_return. Skipped when no response channel
+     * is configured (resp_s2mm_ch < 0). */
+    if (resp_s2mm_ch >= 0)
+        rc = rt_ctrl_row_shim_return_route(f, resp_s2mm_ch);
+    return rc;
 }
 
 /* Tear down the fabric: clear all state. Stream-switch routes are not
@@ -4055,6 +4283,75 @@ AieRC __Runtime_ctrl_row_whole_row_write(__Runtime_CtrlRowFabric *f, uint8_t row
     return rt_ctrl_row_class_write(f, (uint8_t)ACR_CLASS_WHOLE_ROW, row, tile_addr, data, nwords, bd_id, mm2s_ch, log);
 }
 
+/* Resolve the diagnostic destination tile + stream id for @f's pending
+ * transaction cast target @row (matching commit's cast). Broadcast (@row < 0)
+ * points at the last-added row head (a real CTRL consumer, so __Runtime_ctrl_push's
+ * CORE_MOD port-status read is valid) with stream id ACR_ID_BCAST. Multicast
+ * (@row >= 0) points at the target row's chain col_lo with the whole-row stream
+ * id (ACR_CLASS_WHOLE_ROW<<2)|rowidx. Returns 0 on success, nonzero if a
+ * multicast row is not configured. */
+static int rt_ctrl_push_dest(const __Runtime_CtrlRowFabric *f, int row, uint8_t *dest_col, uint8_t *dest_row,
+                             uint8_t *sid) {
+    if (row < 0) {
+        const __Runtime_CtrlRowChain *last = &f->rows[f->nrows - 1U];
+        *dest_col = last->col_lo;
+        *dest_row = last->row;
+        *sid = (uint8_t)ACR_ID_BCAST;
+        return 0;
+    }
+    uint8_t rowidx = 0U;
+    const __Runtime_CtrlRowChain *chain = NULL;
+    if (!rt_ctrl_row_index(f, (uint8_t)row, &rowidx, &chain)) {
+        printf("[aie_runtime] control_push: row=%d not configured\n", row);
+        return -1;
+    }
+    *dest_col = chain->col_lo;
+    *dest_row = (uint8_t)row;
+    *sid = (uint8_t)(((uint8_t)ACR_CLASS_WHOLE_ROW << 2) | (rowidx & 0x3U));
+    return 0;
+}
+
+/* Push a committed control-packet word buffer @out (@nwords words) to HW. The
+ * cast target is read from @f->txn_row (set by __Runtime_control_start_transaction)
+ * to resolve the diagnostic destination tile + stream id. @out already holds
+ * fully-formed control packets (stream id baked in by pktize), so this copies it
+ * verbatim into a device DMA buffer (the caller's @out may be a stack array, which
+ * __Runtime_ctrl_push cannot DMA), syncs it, arms the shim spine entry, and pushes
+ * via a SHIM MM2S BD. Fire-and-forget writes (no response buffer). */
+AieRC __Runtime_control_push(__Runtime_CtrlRowFabric *f, const uint32_t *out, uint32_t nwords, int32_t bd_id,
+                             int32_t mm2s_ch, int block, int log) {
+    if (!f || !f->dev || !out || nwords == 0U || f->nrows == 0U)
+        return XAIE_INVALID_ARGS;
+    uint8_t dest_col = 0U, dest_row = 0U, sid = 0U;
+    if (rt_ctrl_push_dest(f, f->txn_row, &dest_col, &dest_row, &sid))
+        return XAIE_INVALID_ARGS;
+    AieRC rc = rt_ctrl_row_shim_entry(f, mm2s_ch);
+    if (rc != XAIE_OK)
+        return rc;
+    uint32_t *pkt = (uint32_t *)__Runtime_alloc_buffer(f->dev, (size_t)nwords * sizeof(uint32_t));
+    if (!pkt) {
+        printf("[aie_runtime] control_push ERROR: request buffer alloc failed\n");
+        return XAIE_ERR;
+    }
+    memcpy(pkt, out, (size_t)nwords * sizeof(uint32_t));
+    __Runtime_sync_for_dev(f->dev, pkt, (size_t)nwords * sizeof(uint32_t));
+    __Runtime_CtrlInstance inst = {
+        .dev = f->dev,
+        .shim_col = f->shim_col,
+        .dest_col = dest_col,
+        .dest_row = dest_row,
+        .stream_id = sid,
+        .bd_id = bd_id,
+        .mm2s_ch = mm2s_ch,
+        .s2mm_ch = 0,
+        .token = NULL,
+        .resp_words = 0U,
+    };
+    rc = __Runtime_ctrl_push(&inst, pkt, nwords, block, log);
+    __Runtime_free_buffer(f->dev, pkt);
+    return rc;
+}
+
 /**
  * Arm the shim S2MM channel to drain the returning control-packet response into
  * c->token (c->resp_words 32-bit words, min 1) using a distinct in-range shim BD
@@ -4143,7 +4440,7 @@ static AieRC rt_tct_s2mm_arm(const __Runtime_CtrlInstance *c) {
  * drain target (inst->resp_words words, min 1). When @print is nonzero the
  * observed word is printed.
  */
-uint32_t __Runtime_ctrl_tct_poll(const __Runtime_CtrlInstance *inst, int print) {
+uint32_t __Runtime_ctrl_ack_poll(const __Runtime_CtrlInstance *inst, int print) {
     XAie_DevInst *dev = inst->dev;
     XAie_LocType shim = XAie_TileLoc(inst->shim_col, 0U);
     uint32_t rwords = inst->resp_words ? inst->resp_words : 1U;
@@ -4227,7 +4524,7 @@ AieRC __Runtime_ctrl_push_target(XAie_DevInst *dev, uint8_t shim_col, uint8_t de
         return rc;
     }
 
-    uint32_t tv = __Runtime_ctrl_tct_poll(&inst, /*print=*/0);
+    uint32_t tv = __Runtime_ctrl_ack_poll(&inst, /*print=*/0);
     if (tct_value_out)
         *tct_value_out = tv;
     AIEHLC_LOG(printf("[aie_runtime] ctrl_push_target shim(%u,0)->dest(%u,%u) sid=%u nwords=%u tct=0x%x\n",
@@ -4299,7 +4596,7 @@ AieRC __Runtime_ctrl_read_target(XAie_DevInst *dev, uint8_t shim_col, uint8_t de
         return rc;
     }
     /* The response drain is the completion barrier; extract the read words. */
-    (void)__Runtime_ctrl_tct_poll(&inst, /*print=*/0);
+    (void)__Runtime_ctrl_ack_poll(&inst, /*print=*/0);
     if (out_data)
         rt_ctrl_read_extract(inst.token, tile_addr, nwords, out_data);
     AIEHLC_LOG(printf("[aie_runtime] ctrl_read_target shim(%u,0)->dest(%u,%u) req_sid=%u ret_sid=%u addr=0x%x "
@@ -4323,21 +4620,12 @@ static AieRC rt_ctrl_row_shim_return(const __Runtime_CtrlRowFabric *f, int32_t s
                                      uint32_t pkt_words, uint32_t *token) {
     XAie_DevInst *dev = f->dev;
     XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
-    uint8_t rport = rt_shim_s2mm_port(dev, s2mm_ch);
-    AieRC rc = XAie_StrmConnCctEnable(dev, shim, NORTH, RT_CTRL_VRET, SOUTH, rport);
-    if (rc != XAIE_OK) {
-        printf("[aie_runtime] ctrl_row_return: shim StrmConnCctEnable (%u,0) NORTH%u->SOUTH%u rc=%d\n",
-               (unsigned)f->shim_col, (unsigned)RT_CTRL_VRET, (unsigned)rport, (int)rc);
+    /* Shim return circuit (NORTH/VRET -> SOUTH -> S2MM). Idempotent with the
+     * plan-init programming; re-run here so a return send still works if the
+     * fabric was init'd without a response channel. */
+    AieRC rc = rt_ctrl_row_shim_return_route(f, s2mm_ch);
+    if (rc != XAIE_OK)
         return rc;
-    }
-    rc = XAie_EnableAieToShimDmaStrmPort(dev, shim, rport);
-    if (rc != XAIE_OK) {
-        printf("[aie_runtime] ctrl_row_return: EnableAieToShimDmaStrmPort (%u,0) port=%u rc=%d\n",
-               (unsigned)f->shim_col, (unsigned)rport, (int)rc);
-        return rc;
-    }
-    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VRET, "ret", "slave", f->ctrl_id, "circuit", -1);
-    rt_pmap_port(f->shim_col, 0, "SOUTH", rport, "ret", "master", f->ctrl_id, "circuit", -1);
 
     uint64_t offset = 0U;
     XAie_MemInst *mem = __vaddr_to_mem_offset(token, &offset);

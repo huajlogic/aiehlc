@@ -94,12 +94,19 @@ debug GUI for a control-packet app that has only `host.cc` (no `Work/` tree).
 It also recognizes the **row-control fabric** (`__Runtime_ctrl_plan_init(f, dev,
 shim_col, resp_s2mm_ch, ctrl_id, rows, nrows)` configures the whole fabric in one
 shot; `rows` is a `__Runtime_CtrlRowChain[]` of `{row, col_lo, col_hi}` triples, one
-EAST chain per entry). `extract_ctrl_rows` reads `shim_col` from the `plan_init`
-call (`RE_PLAN_INIT`), finds the `__Runtime_CtrlRowChain[] = {...}` initializer
-(`RE_ROW_ARRAY`), and folds each `{row, col_lo, col_hi}` triple (`RE_ROW_TRIPLE`,
-deduped) — resolving `#define` constants via `_ctrl_int`. It then enumerates the
-spine (shim + vertical pass-through up to the highest configured row) and every
-chain tile, and draws a forward-up + return-down flow per chain.
+EAST chain per entry). `extract_ctrl_rows` returns a **union** of EVERY fabric in
+the file (a list of `{shim_col, rows}`, grouped per spine column): it reads
+`shim_col` (arg3) and the rows-array identifier (arg6) from each `plan_init` call
+(`RE_PLAN_INIT`), pairs it with the nearest PRECEDING `__Runtime_CtrlRowChain
+<name>[] = {...}` declaration of that name (`RE_ROW_ARRAY`, so same-named `kRows`
+arrays in different functions stay distinct), and folds each `{row, col_lo,
+col_hi}` triple (`RE_ROW_TRIPLE`, deduped by `(shim_col,row,col_lo,col_hi)`) —
+resolving `#define` constants via `_ctrl_int`. Because the static parser can't
+know which fabric `main()` runs, unioning all of them means a file with several
+`plan_init` functions (e.g. a 2-row demo + a 4×4 demo) renders the combined
+topology. It then enumerates, per spine column, the spine (shim + vertical
+pass-through up to the highest configured row) and every chain tile, and draws a
+forward-up + return-down flow per chain.
 
 - `MacroResolver` selects live `#if/#ifdef` branch for `AIE_GEN`/`__AIESIM__`
   and honors inline `#define`/`#undef` (so an in-file `#define _CONTROL_WRITE_TEST_`

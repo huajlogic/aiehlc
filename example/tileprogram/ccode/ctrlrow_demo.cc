@@ -308,6 +308,259 @@ int run_ctrlrow_demo(XAie_DevInst *dev) {
     return fails == 0 ? 0 : -1;
 }
 
+/* Transaction-capture row-multicast scratch. Each per-row transaction captures
+ * one BlockWrite32 into core L1, commits it as a row-multicast (commit row =
+ * target physical row), proves the committed control-packet buffer equals a
+ * direct pktize with the row-multicast stream id, then delivers via the fabric
+ * whole-row primitive and verifies every column of the row landed the payload. */
+#define DEMO_TXN_MC_ADDR 0x5000u /* BlockWrite32 target (in-range core L1 scratch) */
+
+/* 4x4 broadcast transaction scratch. demo_txn_multipl_row captures ONE
+ * BlockWrite32 of DEMO_TXN_MR_NW words at DEMO_TXN_MR_ADDR and commits it with
+ * the tile mapped to the broadcast stream id (ACR_ID_BCAST, id[4]=1). Because a
+ * single <=4-word access packetizes identically whether it comes from the commit
+ * translator or a direct pktize, the committed buffer is byte-identical to the
+ * words __Runtime_ctrl_row_broadcast_write emits — verified before the same
+ * payload is broadcast to every tile of a 4-row x 4-col grid. */
+#define DEMO_TXN_MR_ADDR 0x6000u   /* 16-byte-aligned core L1 (one 128b access) */
+#define DEMO_TXN_MR_NW 4u          /* 4 words = exactly one control-packet access */
+#define DEMO_TXN_MR_BASE 0x4B0000u /* payload word i = DEMO_TXN_MR_BASE | i */
+#define DEMO_TXN_MR_BD 6           /* shim MM2S BD for the broadcast send */
+
+/* Capture one BlockWrite32 as a control-packet transaction and MULTICAST it to
+ * every column of @row via the row-control fabric @fab. Flow:
+ *   1. start_transaction (nothing touches HW; DISABLE_AUTO_FLUSH)
+ *   2. XAie_BlockWrite32 of DEMO_TXN_MR_NW words at DEMO_TXN_MC_ADDR targeting a
+ *      core tile ON @row (the commit validates every captured op lands on @row)
+ *   3. commit with row=@row -> the translator stamps the row-multicast stream id
+ *      (ACR_CLASS_WHOLE_ROW<<2)|rowidx (id[4]=0) on the packet
+ *   4. prove the committed buffer equals a direct pktize with that same sid
+ *   5. deliver via __Runtime_ctrl_row_whole_row_write and verify every column of
+ *      @row landed the payload (direct debug memory interface)
+ * @bw_base seeds the payload (word i = @bw_base | i). Returns 0 on PASS. */
+static int demo_txn_multicast_row(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, uint8_t row, uint32_t bw_base) {
+    uint32_t data[DEMO_TXN_MR_NW];
+    for (uint32_t i = 0u; i < DEMO_TXN_MR_NW; i++)
+        data[i] = bw_base | i;
+
+    /* start_transaction records the cast target (row) into @fab; commit reads it
+     * back (stateless w.r.t. the caller). */
+    if (__Runtime_control_start_transaction(dev, fab, (int)row) != 0) {
+        printf("[ctrltxn] start_transaction failed row=%u\n", (unsigned)row);
+        return -1;
+    }
+    /* Every captured op must target @row (commit rejects otherwise). Use the
+     * spine column of @row; the row-multicast reaches every column regardless. */
+    uint64_t tile_base = ((uint64_t)DEMO_SHIM_COL << XAIE_COL_SHIFT) | ((uint64_t)row << XAIE_ROW_SHIFT);
+    (void)XAie_BlockWrite32(dev, tile_base + DEMO_TXN_MC_ADDR, data, DEMO_TXN_MR_NW);
+
+    uint32_t pkt[16] = {0u};
+    uint32_t nwords = 0u;
+    int rc = __Runtime_control_write_pkt_commit_transaction(dev, fab, pkt, (uint32_t)(sizeof(pkt) / sizeof(pkt[0])),
+                                                            &nwords);
+    if (rc != 0 || nwords == 0u) {
+        printf("[ctrltxn] commit_transaction row=%u rc=%d nwords=%u\n", (unsigned)row, rc, (unsigned)nwords);
+        return -1;
+    }
+
+    /* Prove the committed buffer IS the row-multicast packet: byte-match a direct
+     * pktize with the same (ACR_CLASS_WHOLE_ROW<<2)|rowidx stream id. */
+    uint8_t rowidx = 0u;
+    for (uint8_t i = 0u; i < fab->nrows; i++)
+        if (fab->rows[i].row == row) {
+            rowidx = i;
+            break;
+        }
+    uint8_t sid = (uint8_t)(((uint8_t)ACR_CLASS_WHOLE_ROW << 2) | (rowidx & 0x3u));
+    uint32_t ref_pkt[16] = {0u};
+    uint32_t ref_nw = __Runtime_ctrl_pktize_write(ref_pkt, (uint32_t)(sizeof(ref_pkt) / sizeof(ref_pkt[0])), sid,
+                                                  DEMO_TXN_MC_ADDR, data, DEMO_TXN_MR_NW,
+                                                  /*lastwriteack=*/0, /*ret_stream_id=*/0u, NULL);
+    int match = (ref_nw == nwords) && (memcmp(pkt, ref_pkt, (size_t)nwords * sizeof(uint32_t)) == 0);
+    printf("[ctrltxn] row=%u multicast commit -> %u words (sid=%u), ref=%u words: %s\n", (unsigned)row,
+           (unsigned)nwords, (unsigned)sid, (unsigned)ref_nw, match ? "MATCH" : "MISMATCH");
+    int fails = match ? 0 : 1;
+
+    /* Issue the COMMITTED buffer itself via __Runtime_control_push: it reads the
+     * cast target back from @fab (set by start_transaction), copies @pkt into a
+     * device DMA buffer, and pushes it down the shared spine. This is the
+     * capture->commit->push flow (no re-pktize), then verify every column of @row. */
+    rc = __Runtime_control_push(fab, pkt, nwords, DEMO_TXN_MR_BD, DEMO_MM2S_CH, /*block=*/1, /*log=*/1);
+    if (rc != XAIE_OK) {
+        printf("[ctrltxn] control_push row=%u rc=%d\n", (unsigned)row, (int)rc);
+        return -1;
+    }
+    for (uint8_t dc = DEMO_COL_LO; dc <= DEMO_COL_HI; dc++) {
+        int tile_ok = 1;
+        for (uint32_t i = 0u; i < DEMO_TXN_MR_NW; i++) {
+            uint32_t v = 0u;
+            (void)XAie_DataMemBlockRead(dev, XAie_TileLoc(dc, row), DEMO_TXN_MC_ADDR + i * 4u, &v, sizeof(v));
+            if (v != data[i])
+                tile_ok = 0;
+        }
+        printf("[ctrltxn] row=%u tile(%u,%u) @0x%x[0..%u] %s\n", (unsigned)row, (unsigned)dc, (unsigned)row,
+               DEMO_TXN_MC_ADDR, (unsigned)(DEMO_TXN_MR_NW - 1u), tile_ok ? "PASS" : "FAIL");
+        if (!tile_ok)
+            fails++;
+    }
+    return fails == 0 ? 0 : -1;
+}
+
+/* run_ctrol_trasaction — control-plan transaction MULTICAST demo.
+ *
+ * Shows the capture->commit->push flow of the transaction API for row-cast:
+ *   __Runtime_control_start_transaction(dev,fab,row)  begin capture, record cast
+ *   XAie_BlockWrite32                                 record ops (no HW touch)
+ *   __Runtime_control_write_pkt_commit_transaction(dev,fab,...) -> row-multicast words
+ *   __Runtime_control_push(fab,pkt,nwords,...)        push committed words to HW
+ *
+ * Configures a fabric with two core rows (A, B) on the shared spine, then
+ * multicasts a distinct payload to each row and verifies every column landed it
+ * (cross-row leaks would show as a mismatch). Returns 0 on PASS, -1 otherwise. */
+int run_ctrol_trasaction(XAie_DevInst *dev) {
+    __Runtime_CtrlRowFabric fab;
+    static const __Runtime_CtrlRowChain kRows[] = {
+        {DEMO_CORE_ROW_A, DEMO_COL_LO, DEMO_COL_HI},
+        {DEMO_CORE_ROW_B, DEMO_COL_LO, DEMO_COL_HI},
+    };
+    const uint8_t nrows = (uint8_t)(sizeof(kRows) / sizeof(kRows[0]));
+    AieRC rc = __Runtime_ctrl_plan_init(&fab, dev, DEMO_SHIM_COL, DEMO_S2MM_CH, (uint8_t)DEMO_CTRL_ID, kRows, nrows);
+    if (rc != XAIE_OK) {
+        printf("[ctrltxn] plan_init rc=%d\n", (int)rc);
+        return -1;
+    }
+    int fails = 0;
+    fails += demo_txn_multicast_row(dev, &fab, (uint8_t)DEMO_CORE_ROW_A, /*bw_base=*/0x51A00000u) ? 1 : 0;
+    fails += demo_txn_multicast_row(dev, &fab, (uint8_t)DEMO_CORE_ROW_B, /*bw_base=*/0x51B00000u) ? 1 : 0;
+    __Runtime_ctrl_row_close(&fab);
+    printf("[ctrltxn] DONE %s (%d transaction failure(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
+    return fails == 0 ? 0 : -1;
+}
+
+/* demo_txn_multipl_row — capture a control-plane write via the transaction API
+ * and BROADCAST it to a 4x4 tile grid (4 rows x 4 cols = 16 tiles).
+ *
+ * demo_txn_one_tile pushes via __Runtime_ctrl_push_target, which is same-column
+ * only (dest_col == shim_col), so it cannot reach a grid that spans 4 columns.
+ * A 4x4 broadcast instead uses the row-control fabric broadcast primitive
+ * (__Runtime_ctrl_row_broadcast_write): one stream-id-ACR_ID_BCAST packet climbs
+ * the shared spine and every tile of every configured row consumes it.
+ *
+ * The transaction API is still the STAR: a single BlockWrite32 committed with the
+ * (representative) tile mapped to ACR_ID_BCAST yields exactly the broadcast packet
+ * words. Since a <=4-word access packetizes identically from the commit translator
+ * and from a direct pktize, the committed buffer is byte-compared to a reference
+ * pktize to prove the equivalence; the same payload is then broadcast to the grid
+ * and all 16 tiles are verified via the direct debug memory interface.
+ * Returns 0 on PASS, -1 otherwise. */
+int demo_txn_multipl_row(XAie_DevInst *dev) {
+    __Runtime_CtrlRowFabric fab;
+
+    /* Emit the CONTROLPAN-PMAP provenance lines (aiedebug overlay). Must precede
+     * plan_init; getenv("AIE_CTRL_PMAP") is unavailable on this baremetal target. */
+    __Runtime_ctrl_pmap_enable(1);
+
+    /* Configure a 4x4 grid: 4 core rows, each spanning cols DEMO_COL_LO..DEMO_COL_HI,
+     * all rooted on the shared spine at DEMO_SHIM_COL. Rows are listed bottom-up;
+     * the static planner marks the top row so its return head omits the idle
+     * RET_NORTH slot. 4 rows == the row-multicast index limit (id[1:0]), but a
+     * broadcast (id[4]=1) reaches every configured row regardless. */
+    static const __Runtime_CtrlRowChain kRows[] = {
+        {3u, DEMO_COL_LO, DEMO_COL_HI},
+        {4u, DEMO_COL_LO, DEMO_COL_HI},
+        {5u, DEMO_COL_LO, DEMO_COL_HI},
+        {6u, DEMO_COL_LO, DEMO_COL_HI},
+    };
+    const uint8_t nrows = (uint8_t)(sizeof(kRows) / sizeof(kRows[0]));
+    AieRC rc = __Runtime_ctrl_plan_init(&fab, dev, DEMO_SHIM_COL, DEMO_S2MM_CH, (uint8_t)DEMO_CTRL_ID, kRows, nrows);
+    if (rc != XAIE_OK) {
+        printf("[ctrltxn-mr] plan_init rc=%d\n", (int)rc);
+        return -1;
+    }
+    printf("[ctrltxn-mr] plan_init rows=%u cols=%u..%u (4x4 grid on spine col %u)\n", (unsigned)fab.nrows,
+           (unsigned)DEMO_COL_LO, (unsigned)DEMO_COL_HI, (unsigned)DEMO_SHIM_COL);
+
+    /* 1. Payload: DEMO_TXN_MR_NW words, word i = base | i. */
+    uint32_t data[DEMO_TXN_MR_NW];
+    for (uint32_t i = 0u; i < DEMO_TXN_MR_NW; i++)
+        data[i] = DEMO_TXN_MR_BASE | i;
+
+    /* 2. Capture the write in a transaction and commit it as a whole-array
+     * BROADCAST (row = -1). The commit validates every captured op targets a CORE
+     * tile (broadcast reaches cores) and stamps ACR_ID_BCAST (id[4]=1) on the
+     * packet. The representative tile only supplies the RegOff (col/row/addr): use
+     * a core tile on the spine head so the core-tile check passes. */
+    const uint8_t rep_col = (uint8_t)DEMO_SHIM_COL, rep_row = kRows[0].row;
+    /* start_transaction records the broadcast cast target (row = -1) into @fab;
+     * commit reads it back (stateless w.r.t. the caller). */
+    if (__Runtime_control_start_transaction(dev, &fab, /*row=*/-1) != 0) {
+        printf("[ctrltxn-mr] start_transaction failed\n");
+        __Runtime_ctrl_row_close(&fab);
+        return -1;
+    }
+    uint64_t tile_base = ((uint64_t)rep_col << XAIE_COL_SHIFT) | ((uint64_t)rep_row << XAIE_ROW_SHIFT);
+    (void)XAie_BlockWrite32(dev, tile_base + DEMO_TXN_MR_ADDR, data, DEMO_TXN_MR_NW);
+
+    uint32_t txn_pkt[16] = {0u};
+    uint32_t txn_nw = 0u;
+    int trc = __Runtime_control_write_pkt_commit_transaction(dev, &fab, txn_pkt,
+                                                             (uint32_t)(sizeof(txn_pkt) / sizeof(txn_pkt[0])), &txn_nw);
+    if (trc != 0 || txn_nw == 0u) {
+        printf("[ctrltxn-mr] commit_transaction rc=%d nwords=%u\n", trc, (unsigned)txn_nw);
+        __Runtime_ctrl_row_close(&fab);
+        return -1;
+    }
+
+    /* 3. Prove the committed buffer IS the broadcast packet: byte-match it to a
+     * direct pktize of the same payload with stream id ACR_ID_BCAST (exactly what
+     * __Runtime_ctrl_row_broadcast_write emits internally). */
+    uint32_t ref_pkt[16] = {0u};
+    uint32_t ref_nw = __Runtime_ctrl_pktize_write(ref_pkt, (uint32_t)(sizeof(ref_pkt) / sizeof(ref_pkt[0])),
+                                                  (uint32_t)ACR_ID_BCAST, DEMO_TXN_MR_ADDR, data, DEMO_TXN_MR_NW,
+                                                  /*lastwriteack=*/0, /*ret_stream_id=*/0u, NULL);
+    int match = (ref_nw == txn_nw) && (memcmp(txn_pkt, ref_pkt, (size_t)txn_nw * sizeof(uint32_t)) == 0);
+    uint32_t pid = 0u, ptype = 0u, prow = 0u, pcol = 0u;
+    (void)__Runtime_ctrl_parse_pkt_hdr(txn_pkt[0], &pid, &ptype, &prow, &pcol);
+    printf("[ctrltxn-mr] txn commit -> %u words, pkt id=%u (bcast id=%u), ref=%u words: %s\n", (unsigned)txn_nw,
+           (unsigned)pid, (unsigned)ACR_ID_BCAST, (unsigned)ref_nw, match ? "MATCH" : "MISMATCH");
+    int fails = match ? 0 : 1;
+
+    /* 4. Issue the COMMITTED broadcast buffer itself via __Runtime_control_push:
+     * it reads the cast target back from @fab (row = -1 => ACR_ID_BCAST), copies
+     * @txn_pkt into a device DMA buffer, arms the shim spine entry, and fires the
+     * packet to every tile of the 4x4 grid. This is the capture->commit->push flow
+     * (no re-pktize inside the broadcast primitive). */
+    rc = __Runtime_control_push(&fab, txn_pkt, txn_nw, DEMO_TXN_MR_BD, DEMO_MM2S_CH, /*block=*/1, /*log=*/1);
+    if (rc != XAIE_OK) {
+        printf("[ctrltxn-mr] control_push rc=%d\n", (int)rc);
+        __Runtime_ctrl_row_close(&fab);
+        return -1;
+    }
+    printf("[ctrltxn-mr] broadcast 0x%08x.. -> addr 0x%x on rows 3..6 done\n", data[0], DEMO_TXN_MR_ADDR);
+
+    /* 5. Verify all 16 tiles hold the DEMO_TXN_MR_NW words. */
+    for (uint8_t ri = 0u; ri < nrows; ri++) {
+        uint8_t dr = kRows[ri].row;
+        for (uint8_t dc = DEMO_COL_LO; dc <= DEMO_COL_HI; dc++) {
+            int tile_ok = 1;
+            for (uint32_t i = 0u; i < DEMO_TXN_MR_NW; i++) {
+                uint32_t v = 0u;
+                (void)XAie_DataMemBlockRead(dev, XAie_TileLoc(dc, dr), DEMO_TXN_MR_ADDR + i * 4u, &v, sizeof(v));
+                if (v != data[i])
+                    tile_ok = 0;
+            }
+            printf("[ctrltxn-mr] tile(%u,%u) @0x%x[0..%u] %s\n", (unsigned)dc, (unsigned)dr, DEMO_TXN_MR_ADDR,
+                   (unsigned)(DEMO_TXN_MR_NW - 1u), tile_ok ? "PASS" : "FAIL");
+            if (!tile_ok)
+                fails++;
+        }
+    }
+
+    __Runtime_ctrl_row_close(&fab);
+    printf("[ctrltxn-mr] DONE %s (%d failure(s))\n", fails == 0 ? "PASS" : "FAIL", fails);
+    return fails == 0 ? 0 : -1;
+}
+
 int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
@@ -350,6 +603,11 @@ int main(int argc, char *argv[]) {
 #endif
 #endif /* __AIESIM__ */
 
-    run_ctrlrow_demo(&DevInst);
+    // run_ctrlrow_demo(&DevInst);
+    /* Control-plan transaction demo: capture write-only ops into an XAie
+     * transaction, commit them into control-packet words, and push them. */
+    // run_ctrol_trasaction(&DevInst);
+    /* Same transaction API, delivered by broadcast to a 4x4 tile grid. */
+    demo_txn_multipl_row(&DevInst);
     return 0;
 }

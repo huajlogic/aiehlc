@@ -128,15 +128,20 @@ RE_CTRL_CALL = re.compile(
     r"__Runtime_ctrl_(?:read|push)_target\s*\(\s*[^,]+,\s*"
     r"([^,]+),\s*([^,]+),\s*([^,]+),")
 
-# Row-control fabric (design: 2026-09-08-row-control-connection). The single
-# __Runtime_ctrl_plan_init(fab, dev, shim_col, ...) picks the shared spine (shim)
-# column; its row list is a __Runtime_CtrlRowChain rows[] = {{row, col_lo,
-# col_hi}, ...} array. Capture the 3rd positional arg (shim_col) and each
-# {row, col_lo, col_hi} triple from the array initializer.
+# Row-control fabric (design: 2026-09-08-row-control-connection). Each
+# __Runtime_ctrl_plan_init(fab, dev, shim_col, s2mm_ch, ctrl_id, rows, nrows)
+# picks a shared spine (shim) column and names a __Runtime_CtrlRowChain rows[] =
+# {{row, col_lo, col_hi}, ...} array. A translation unit may hold SEVERAL such
+# fabrics (one per demo function, often reusing the array name `kRows`); the
+# static parser cannot know which one main() runs, so extract_ctrl_rows UNIONS
+# them all. Capture arg3 (shim_col) and arg6 (the rows array identifier) from the
+# call, the array's NAME + body from its declaration, and each {row, col_lo,
+# col_hi} triple from that body.
 RE_PLAN_INIT = re.compile(
-    r"__Runtime_ctrl_plan_init\s*\(\s*[^,]+,\s*[^,]+,\s*([^,]+),")
+    r"__Runtime_ctrl_plan_init\s*\(\s*[^,]+,\s*[^,]+,\s*([^,]+),"
+    r"\s*[^,]+,\s*[^,]+,\s*&?\s*(\w+)")
 RE_ROW_ARRAY = re.compile(
-    r"__Runtime_CtrlRowChain\s+\w+\s*\[[^\]]*\]\s*=\s*\{(.*?)\}\s*;", re.DOTALL)
+    r"__Runtime_CtrlRowChain\s+(\w+)\s*\[[^\]]*\]\s*=\s*\{(.*?)\}\s*;", re.DOTALL)
 RE_ROW_TRIPLE = re.compile(r"\{\s*([^,{}]+),\s*([^,{}]+),\s*([^,{}]+)\}")
 
 
@@ -195,36 +200,64 @@ def extract_ctrl_sends(active, defs):
     return sends
 
 
-def extract_ctrl_rows(active, defs):
-    """Reduce a row-control fabric to {shim_col, rows:[{row,col_lo,col_hi}]}.
-
-    The single __Runtime_ctrl_plan_init gives the shared spine (shim) column; its
-    __Runtime_CtrlRowChain rows[] initializer lists the EAST chains as {row,
-    col_lo, col_hi} triples. Chains are deduped by (row,col_lo,col_hi). Returns
-    None when no fabric is initialized (or its shim column can't be folded);
-    triples whose fields don't fold are skipped. Values fold through @defs,
-    tolerating u/l suffixes."""
-    mo = RE_PLAN_INIT.search(active)
-    if not mo:
-        return None
-    shim_col = _ctrl_int(mo.group(1), defs)
-    if shim_col is None:
-        return None
+def _fold_row_triples(body, defs):
+    """Fold a __Runtime_CtrlRowChain array body into a deduped list of
+    {row,col_lo,col_hi} dicts; triples whose fields don't fold are skipped."""
     rows, seen = [], set()
-    am = RE_ROW_ARRAY.search(active)
-    if am:
-        for tm in RE_ROW_TRIPLE.finditer(am.group(1)):
-            row = _ctrl_int(tm.group(1), defs)
-            col_lo = _ctrl_int(tm.group(2), defs)
-            col_hi = _ctrl_int(tm.group(3), defs)
-            if row is None or col_lo is None or col_hi is None:
-                continue
-            key = (row, col_lo, col_hi)
+    for tm in RE_ROW_TRIPLE.finditer(body):
+        row = _ctrl_int(tm.group(1), defs)
+        col_lo = _ctrl_int(tm.group(2), defs)
+        col_hi = _ctrl_int(tm.group(3), defs)
+        if row is None or col_lo is None or col_hi is None:
+            continue
+        key = (row, col_lo, col_hi)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"row": row, "col_lo": col_lo, "col_hi": col_hi})
+    return rows
+
+
+def extract_ctrl_rows(active, defs):
+    """Reduce EVERY row-control fabric to a UNION topology list.
+
+    Each __Runtime_ctrl_plan_init(fab, dev, shim_col, s2mm_ch, ctrl_id, rows,
+    nrows) names a shared spine (shim) column and a __Runtime_CtrlRowChain rows[]
+    initializer of {row, col_lo, col_hi} EAST-chain triples. A translation unit
+    may declare several fabrics (one per demo function, frequently reusing the
+    array name `kRows`); the static parser cannot know which one main() actually
+    runs, so it UNIONS them all -- keyed by (shim_col, row, col_lo, col_hi),
+    grouped by spine column -- pairing each plan_init with the nearest PRECEDING
+    __Runtime_CtrlRowChain array of the SAME name (so same-named arrays in
+    different function scopes stay distinct). Returns a list of {shim_col,
+    rows:[{row,col_lo,col_hi}]} (one entry per spine column, in first-seen
+    order); an empty list when no fabric is initialized. Chains whose shim column
+    or triple fields can't fold are skipped. Values fold through @defs, tolerating
+    u/l suffixes."""
+    arrays = [(am.start(), am.group(1), am.group(2))
+              for am in RE_ROW_ARRAY.finditer(active)]
+    by_col, order, seen = {}, [], set()
+    for pm in RE_PLAN_INIT.finditer(active):
+        shim_col = _ctrl_int(pm.group(1), defs)
+        if shim_col is None:
+            continue
+        # Nearest PRECEDING array declaration of the name passed to this call.
+        name, body, best = pm.group(2), None, -1
+        for start, aname, abody in arrays:
+            if aname == name and start < pm.start() and start > best:
+                best, body = start, abody
+        if body is None:
+            continue
+        for rr in _fold_row_triples(body, defs):
+            key = (shim_col, rr["row"], rr["col_lo"], rr["col_hi"])
             if key in seen:
                 continue
             seen.add(key)
-            rows.append({"row": row, "col_lo": col_lo, "col_hi": col_hi})
-    return {"shim_col": shim_col, "rows": rows}
+            if shim_col not in by_col:
+                by_col[shim_col] = []
+                order.append(shim_col)
+            by_col[shim_col].append(rr)
+    return [{"shim_col": c, "rows": by_col[c]} for c in order]
 
 
 def strip_comments(src):
@@ -341,9 +374,10 @@ def extract_model(raw_src, aie_gen, aiesim):
     # EAST chains (one per configured row). Enumerate the spine (shim + vertical
     # pass-through up to the highest row) and every chain tile, then draw a
     # forward (up) + return (down) flow to each chain endpoint (col_hi,row). The
-    # return leg is the shim-S2MM read-response drain.
-    fabric = extract_ctrl_rows(active, defs)
-    if fabric and fabric["rows"]:
+    # return leg is the shim-S2MM read-response drain. extract_ctrl_rows unions
+    # every fabric in the file (grouped per spine column), so a file with several
+    # plan_init functions renders the combined topology.
+    for fabric in extract_ctrl_rows(active, defs):
         col = fabric["shim_col"]
         shim = (col, 0)
         top_row = max(r["row"] for r in fabric["rows"])

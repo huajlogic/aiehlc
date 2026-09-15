@@ -3,6 +3,26 @@
 /* Pure planner: derives per-tile stream-switch ops for a row-based control
  * connection with no XAie dependency. See the header for type docs. */
 
+/* Opt-in cross-check: when ACR_VALIDATE_RESERVED is defined (the standalone
+ * planner unit test does this), every emitted forward/return op is asserted to
+ * lie within the reservation table's reserved set (aie_runtime_resource.c) so
+ * the planner can never emit a resource the table does not own (requirement #2).
+ * Production builds leave it off: no runtime cost, no new hard dependency at
+ * HW-emit time. Gen1/2/5 share one table today, so validation uses RT_RES_GEN2;
+ * acr_port and RT_RES_PORT_* share the same numbering. */
+#ifdef ACR_VALIDATE_RESERVED
+#include <assert.h>
+#define ACR_ASSERT_SLOT(port, slot, msel, arb, pkt)                                                                    \
+    assert(__Runtime_res_is_reserved(RT_RES_GEN2, (uint8_t)(port), /*is_master=*/0, (uint8_t)(slot), (uint8_t)(arb),   \
+                                     (uint8_t)(msel), (uint8_t)(pkt)))
+#define ACR_ASSERT_MASTER(port, mselen, arb)                                                                           \
+    assert(__Runtime_res_is_reserved(RT_RES_GEN2, (uint8_t)(port), /*is_master=*/1, RT_RES_NA, (uint8_t)(arb),         \
+                                     (uint8_t)(mselen), RT_RES_NA))
+#else
+#define ACR_ASSERT_SLOT(port, slot, msel, arb, pkt) ((void)0)
+#define ACR_ASSERT_MASTER(port, mselen, arb) ((void)0)
+#endif
+
 /* Return the port-usage bitmap cell for a tile's master or slave domain. */
 static uint16_t *acr_book_cell(acr_portbook *b, uint8_t col, uint8_t row, int is_master) {
     uint16_t(*t)[64] = is_master ? b->master_used : b->slave_used;
@@ -38,6 +58,7 @@ static acr_rc acr_emit_op(acr_oplist *o, const acr_op *op) {
  * once by the caller; the four slots are sub-resources of that one port. */
 static acr_rc acr_emit_slot(acr_oplist *o, uint8_t c, uint8_t row, acr_port sport, uint8_t slot, uint8_t pkt,
                             uint8_t mask, uint8_t msel, uint8_t arb) {
+    ACR_ASSERT_SLOT(sport, slot, msel, arb, pkt);
     acr_op slotop = {.kind = ACR_OP_SLOT,
                      .col = c,
                      .row = row,
@@ -69,6 +90,7 @@ static acr_rc acr_emit_master(acr_oplist *o, acr_portbook *b, uint8_t c, uint8_t
     acr_rc rc = acr_book_port(b, c, row, mport, 0, /*master*/ 1);
     if (rc != ACR_OK)
         return rc;
+    ACR_ASSERT_MASTER(mport, mselen, arb);
     acr_op m = {.kind = ACR_OP_MASTER_EN,
                 .col = c,
                 .row = row,

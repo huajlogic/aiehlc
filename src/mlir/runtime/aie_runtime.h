@@ -691,6 +691,90 @@ void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);
 // _XAie_LoadElfStrmSwStartDma in the aie-rt driver.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Control-packet transaction capture (design:
+// 2026-... runtime-control-packet-transaction).
+//
+// An XAie-transaction-like flow that captures WRITE-ONLY register ops and
+// exports them as a BROADCAST/MULTICAST control-packet-format word buffer:
+//
+//   __Runtime_control_start_transaction(dev, fab, /*row=*/-1)
+//       XAie_Write32(dev, RegOff, Value)
+//       XAie_BlockWrite32(dev, RegOff, Data, N)
+//       ...
+//   __Runtime_control_write_pkt_commit_transaction(dev, fab, out, cap, &nwords)
+//   __Runtime_control_push(fab, out, nwords, bd_id, mm2s_ch, block, log)
+//
+// start wraps XAie_StartTransaction(DISABLE_AUTO_FLUSH) so nothing touches HW,
+// and records the cast target @row into @fab->txn_row. commit is stateless w.r.t.
+// the caller: it reads @fab->txn_row back, calls XAie_ExportSerializedTransaction,
+// then translates every Write32/BlockWrite32 into control packets via
+// __Runtime_ctrl_pktize_write. Routing is a row-control cast against @fab (see
+// __Runtime_CtrlRowFabric):
+//   txn_row <  0 => whole-array BROADCAST (stream id ACR_ID_BCAST, id[4]=1); every
+//               captured op MUST target a CORE tile (broadcast reaches cores).
+//   txn_row >= 0 => row-MULTICAST to that physical row (stream id
+//               (ACR_CLASS_WHOLE_ROW<<2)|rowidx, id[4]=0, rowidx = the row's
+//               add-order index in @fab); every captured op MUST target that row.
+// MaskWrite32 / MaskPoll are rejected (no native masked control-packet write).
+// The commit output is a plain word buffer; __Runtime_control_push DMAs it to HW
+// (copies it into a device buffer, arms the shim entry, and pushes via the same
+// SHIM MM2S BD path as __Runtime_ctrl_row_*_write).
+// ---------------------------------------------------------------------------
+
+// Forward decl of the row-control fabric (full definition below) so the commit
+// cast target can reference it before the row-control API block.
+typedef struct __Runtime_CtrlRowFabric_s __Runtime_CtrlRowFabric;
+
+// Begin capturing write-only register ops into the XAie transaction buffer
+// WITHOUT applying them to hardware (XAIE_TRANSACTION_DISABLE_AUTO_FLUSH), and
+// record the cast target @row into @fab->txn_row (read back by commit / push).
+// @row < 0 => whole-array broadcast; @row >= 0 => row-multicast to that physical
+// row. @fab must be non-NULL. Returns 0 on success, nonzero on error.
+int __Runtime_control_start_transaction(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, int row);
+
+// Export the captured transaction, translate every Write32/BlockWrite32 into
+// broadcast/multicast control-packet words, and clear the transaction. Stateless
+// w.r.t. the caller: the cast target is read from @fab->txn_row (set by
+// __Runtime_control_start_transaction). txn_row < 0 broadcasts to the whole array
+// (every op must target a CORE tile); txn_row >= 0 multicasts to that physical row
+// of @fab (every op must target that row, and it must be a configured row of
+// @fab). Every captured op MUST be a write op (Write32/BlockWrite32); any other op
+// (MaskWrite32/MaskPoll/unknown) is rejected. Only the LAST emitted write packet
+// is turned into a WRITE-WITH-RETURN (write-ack) so a single header-only response
+// acks the whole batch. Writes at most @out_cap words into @out; the total word
+// count is returned via *@nwords_out. Returns 0 on success; nonzero on error
+// (overflow, tile-type mismatch, unconfigured row, non-write op, or export
+// failure).
+int __Runtime_control_write_pkt_commit_transaction(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, uint32_t *out,
+                                                   uint32_t out_cap, uint32_t *nwords_out);
+
+// Push a committed control-packet word buffer @out (@nwords words, as produced by
+// __Runtime_control_write_pkt_commit_transaction) to HW. Reads the cast target from
+// @fab->txn_row to resolve the diagnostic destination tile (broadcast => last-added
+// row head + ACR_ID_BCAST; multicast => that row's chain col_lo + the whole-row
+// stream id). Copies @out into a device DMA buffer, arms the shim spine entry, and
+// pushes via a SHIM MM2S BD (@bd_id / @mm2s_ch). @block!=0 waits for the MM2S
+// drain; @log enables the per-send log. Fire-and-forget writes (no response
+// buffer). Returns XAIE_OK on success. Requires a prior
+// __Runtime_ctrl_plan_init that configured at least one row.
+AieRC __Runtime_control_push(__Runtime_CtrlRowFabric *fab, const uint32_t *out, uint32_t nwords, int32_t bd_id,
+                             int32_t mm2s_ch, int block, int log);
+
+// Translation core of the commit step: parse the serialized-transaction byte
+// buffer @buf (a XAie_TxnHeader followed by NumOps ops) and emit a WRITE control
+// packet per Write32/BlockWrite32 into @out, stamping every packet with the
+// broadcast/multicast stream id @sid. Every op MUST be a write op; MaskWrite/
+// MaskPoll/unknown ops are rejected. Each op's tile is validated against
+// @target_row (< 0 => must be a CORE tile via XAie_GetTileTypefromLoc; >= 0 =>
+// must land on that physical row). @dev->DevProp.RowShift/.ColShift drive the
+// RegOff decode. When @lastwriteack is nonzero, ONLY the LAST emitted write packet
+// is a WRITE-WITH-RETURN (write-ack, return stream id @ret_sid); all earlier ops
+// stay fire-and-forget. Returns 0 on success (writing *@nwords_out) or nonzero on
+// overflow / tile-type mismatch / non-write op.
+int rt_ctrl_txn_translate(XAie_DevInst *dev, const uint8_t *buf, uint8_t sid, int target_row, uint32_t *out,
+                          uint32_t out_cap, uint32_t *nwords_out, int lastwriteack, uint32_t ret_sid);
+
 // Build WRITE control-packet words for a contiguous block of @nwords 32-bit
 // values targeting tile byte address @tile_addr onward, routed by @stream_id
 // (two in-band headers per <=4-word chunk). When @lastwriteack is nonzero and
@@ -747,7 +831,7 @@ int __Runtime_ctrl_parse_pkt_hdr(uint32_t pkt_hdr, uint32_t *id_out, uint32_t *t
 //       route, alloc the response buffer, arm the shim S2MM drain;
 //   __Runtime_ctrl_push(&c, buf, nwords, block, log) - send (block!=0 also
 //                                       waits for the response via ctrl_tct_poll);
-//   __Runtime_ctrl_tct_poll(&c, print) - wait for the response drain, return
+//   __Runtime_ctrl_ack_poll(&c, print) - wait for the response drain, return
 //       its first word.
 // The return path is the control-packet response (read-with-return / write-
 // with-return): the dest CTRL slave port emits the response, which is circuit-
@@ -773,7 +857,7 @@ typedef struct {
 // MM2S channel described by @inst and wait for the MM2S send to drain. The send
 // context (dev, shim_col, bd_id, mm2s_ch) comes from @inst; buf/nwords are the
 // packet payload for this call. If @block is nonzero, also waits for the TCT
-// return token via __Runtime_ctrl_tct_poll (requires @inst routing armed by
+// return token via __Runtime_ctrl_ack_poll (requires @inst routing armed by
 // __Runtime_ctrl_setup_routing). @log (nonzero) prints the per-send log line and
 // the polled TCT value. @inst is not mutated.
 AieRC __Runtime_ctrl_push(const __Runtime_CtrlInstance *inst, uint32_t *buf, uint32_t nwords, int block, int log);
@@ -798,7 +882,7 @@ void __Runtime_ctrl_pmap_enable(int on);
 // return the first response word. Uses @inst->token armed by
 // __Runtime_ctrl_setup_routing. If @print is nonzero, prints the observed word.
 // @inst is not mutated.
-uint32_t __Runtime_ctrl_tct_poll(const __Runtime_CtrlInstance *inst, int print);
+uint32_t __Runtime_ctrl_ack_poll(const __Runtime_CtrlInstance *inst, int print);
 
 // Self-contained control-packet send: builds a __Runtime_CtrlInstance, programs
 // the forward + response return routes, pushes the packet buffer via
@@ -868,7 +952,7 @@ typedef struct {
     uint8_t col_lo, col_hi; // inclusive column span built on this row
 } __Runtime_CtrlRowChain;
 
-typedef struct {
+typedef struct __Runtime_CtrlRowFabric_s {
     XAie_DevInst *dev; // partitioned device instance
     uint8_t shim_col;  // vertical spine column (= row left edge)
     uint8_t ctrl_id;   // 5-bit stream id used for consume-matching
@@ -881,6 +965,13 @@ typedef struct {
     acr_portbook book;                         // per-tile port booking (req #7)
     __Runtime_CtrlRowChain rows[ACR_MAX_ROWS]; // configured EAST chains
     uint8_t nrows;
+
+    // Pending control-packet transaction cast target, set by
+    // __Runtime_control_start_transaction and read back by
+    // __Runtime_control_write_pkt_commit_transaction / __Runtime_control_push (so commit is
+    // stateless w.r.t. the caller). @txn_row < 0 => whole-array broadcast;
+    // @txn_row >= 0 => row-multicast to that physical row.
+    int txn_row;
 } __Runtime_CtrlRowFabric;
 
 // Translate a planner op list into XAie stream-switch calls on @dev. Returns the
