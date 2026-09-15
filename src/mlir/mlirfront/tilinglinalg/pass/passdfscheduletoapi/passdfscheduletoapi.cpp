@@ -3203,26 +3203,38 @@ static int offloadStartIoRow(dfschedule::StartIoOp s) {
     return td.getRow();
 }
 
-// When #pragma KERNELCONFIGOFFLOAD is on, the AIE core self-programs its own DMA
-// (S2MM/MM2S BDs, lock inits, channel start) from kernel.cc via raw MMIO. This
-// removes the corresponding host-side dfschedule chain for CORE tiles only
+// True iff a start_io's create_io programs an S2MM (incoming) DMA. Only the
+// S2MM core chain is offloaded to kernel.cc; MM2S (outgoing) stays host-side
+// because it needs a per-(col,row) out-of-order BD id and no runtime core
+// tile-position intrinsic exists yet.
+static bool offloadStartIoIsS2MM(dfschedule::StartIoOp s) {
+    auto io = s.getIoHandle().getDefiningOp<dfschedule::ConfigCreateIoOp>();
+    return io && io.getDirection() == "S2MM";
+}
+
+// When #pragma KERNELCONFIGOFFLOAD is on, the AIE core self-programs its own
+// INCOMING (S2MM) DMA (BDs, lock inits, channel start) from kernel.cc via raw
+// MMIO. This removes ONLY the S2MM host-side dfschedule chain for CORE tiles
 // (row >= kOffloadCoreRowMin) BEFORE lowering, so that ConfigDmaBdInnerPattern
-// (which also emits the core-tile XAie_LockSetValue) never runs for them. Shim
-// BDs, memtile BDs, and the kernel-group launch are untouched.
+// (which also emits the core-tile XAie_LockSetValue) never runs for them. The
+// MM2S (outgoing) core chain stays host-side (deferred: it needs a per-(col,row)
+// out-of-order BD id with no runtime core tile-position intrinsic yet). Shim
+// BDs, memtile BDs, MM2S core BDs, and the kernel-group launch are untouched.
 //
-// The per-core-tile chain is: config.dma_bd (ping+pong) -> config.create_io ->
-// schedule.start_io, whose event feeds a schedule.wait. Removal order:
-//   1. Rebuild each schedule.wait without the core-tile start_io events.
-//   2. Erase core-tile start_io (+ any now-dead getbdid feeding its bd_id).
-//   3. Erase core-tile create_io.
-//   4. Fixpoint-erase core-tile config.dma_bd (the linked_bd ping/pong chain
-//      unravels once create_io is gone).
+// The per-core-tile S2MM chain is: config.dma_bd (ping+pong) -> config.create_io
+// -> schedule.start_io, whose event feeds a schedule.wait. Removal order:
+//   1. Collect only S2MM core-tile start_io (offloadStartIoIsS2MM).
+//   2. Rebuild each schedule.wait without those start_io events (keeps MM2S).
+//   3. Erase the S2MM start_io (+ any now-dead getbdid feeding its bd_id).
+//   4. Erase the S2MM create_io.
+//   5. Fixpoint-erase now-dead core-tile config.dma_bd; the use_empty() guard
+//      leaves MM2S ping/pong BDs (still fed to their kept MM2S create_io) intact.
 static void removeCoreTileHostDmaChain(ModuleOp moduleOp) {
     // 1. Collect core-tile start_io ops and their event Values.
     SmallVector<dfschedule::StartIoOp, 8> coreStarts;
     llvm::DenseSet<Value> coreEvents;
     moduleOp.walk([&](dfschedule::StartIoOp s) {
-        if (offloadStartIoRow(s) >= kOffloadCoreRowMin) {
+        if (offloadStartIoRow(s) >= kOffloadCoreRowMin && offloadStartIoIsS2MM(s)) {
             coreStarts.push_back(s);
             coreEvents.insert(s.getResult());
         }
