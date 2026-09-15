@@ -48,6 +48,15 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         Location loc = op.getLoc();
         Block &body = op.getBody().front();
 
+        // KERNELCONFIGOFFLOAD gate: when the top-level module carries
+        // routing.kernel_config_offload, the core self-configures its incoming
+        // S2MM DMA (BD chain + lock inits + channel-start) from kernel.cc via
+        // raw MMIO instead of the host programming it over the config bus.
+        bool offloadOn = false;
+        if (auto parentModule = op->getParentOfType<ModuleOp>())
+            if (auto a = parentModule->getAttrOfType<IntegerAttr>("routing.kernel_config_offload"))
+                offloadOn = a.getInt() != 0;
+
         // Build map: window symbol name -> (ping_buffer, pong_buffer, acquire_lock, release_lock)
         llvm::StringMap<WindowInfo> windowInfoMap;
         for (Operation &inner : body) {
@@ -108,6 +117,8 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 rewriter.create<emitc::VerbatimOp>(loc, "#include <adf.h>");
                 rewriter.create<emitc::VerbatimOp>(loc, "#include <aie_api/aie.hpp>");
                 rewriter.create<emitc::VerbatimOp>(loc, "#include <aie_api/aie_adf.hpp>");
+                if (offloadOn)
+                    rewriter.create<emitc::VerbatimOp>(loc, "#include \"aie_kernel_config.h\"");
                 rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_READ  1");
                 rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_WRITE 0");
                 // Emit per-window BUF_SZ defines (e.g. BUF_SZ_IN_0, BUF_SZ_OUT_0)
@@ -241,7 +252,7 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 continue;
             }
             if (auto mainOp = dyn_cast<KernelMainOp>(&inner)) {
-                convertMainToEmitC(rewriter, mainOp, op, windowInfoMap, elementType);
+                convertMainToEmitC(rewriter, mainOp, op, windowInfoMap, elementType, offloadOn);
                 continue;
             }
         }
@@ -250,9 +261,68 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         return success();
     }
 
+    // KERNELCONFIGOFFLOAD: emit the raw-MMIO block that self-configures every
+    // incoming S2MM window (ping/pong BD chain + lock inits + channel-start)
+    // via the aie_kernel_config.h encoder. Input window index i (in window_def
+    // declaration order) claims ping bd 2*i / pong bd 2*i+1 — the same 0..2·nIn−1
+    // range the host resource manager used for inputs, so it never collides with
+    // host-side MM2S bd-ids (allocated at higher ids). BD base address + length
+    // come from the core's own C buffer symbols. Lock ids/values mirror the host
+    // emitCorePingPongBd: DMA acquires the window ACQ lock (init = ppdepth 2 /
+    // single 1) with val -1, releases the window REL lock (init 0) with val 1.
+    void emitS2mmConfigBlock(ConversionPatternRewriter &rewriter, Location loc, KernelModuleOp kernelModuleOp,
+                             const llvm::StringMap<WindowInfo> &windowInfoMap) const {
+        int inputIdx = 0;
+        for (Operation &inner : kernelModuleOp.getBody().front()) {
+            auto windowDefOp = dyn_cast<WindowDefOp>(&inner);
+            if (!windowDefOp)
+                continue;
+            auto it = windowInfoMap.find(windowDefOp.getSymName());
+            if (it == windowInfoMap.end())
+                continue;
+            const WindowInfo &w = it->second;
+            if (w.direction != "in")
+                continue;
+
+            int i = inputIdx++;
+            int pingBd = 2 * i;
+            int pongBd = 2 * i + 1;
+            std::string acq = w.acquireLock;
+            std::string rel = w.releaseLock;
+            std::string ch = std::to_string(w.channel);
+            std::string acqInit = w.singleBuffer ? "1" : "2";
+            std::string ping = w.pingBuffer;
+            std::string pong = w.pongBuffer.empty() ? w.pingBuffer : w.pongBuffer;
+            std::string flush =
+                "  for (_k = 0; _k < _n; _k++) *(volatile uint32_t *)(uintptr_t)_kc[_k].off = _kc[_k].val;\n";
+            std::string one = "  *(volatile uint32_t *)(uintptr_t)_kc[0].off = _kc[0].val;\n";
+
+            std::string block = "{ // KERNELCONFIGOFFLOAD S2MM window_in_" + std::to_string(i) + "\n";
+            block += "  AieKcReg _kc[8];\n  int _n, _k;\n";
+            if (w.singleBuffer) {
+                // Single buffer: one BD, no next chaining.
+                block += "  _n = aie_kc_encode_bd(_kc, " + std::to_string(pingBd) + ", (uintptr_t)" + ping +
+                         ", sizeof(" + ping + "), -1, " + acq + ", -1, " + rel + ", 1, 0, 0, 0, -1);\n" + flush;
+            } else {
+                // Ping-pong: pong BD (next -> ping) then ping BD (next -> pong).
+                block += "  _n = aie_kc_encode_bd(_kc, " + std::to_string(pongBd) + ", (uintptr_t)" + pong +
+                         ", sizeof(" + pong + "), " + std::to_string(pingBd) + ", " + acq + ", -1, " + rel +
+                         ", 1, 0, 0, 0, -1);\n" + flush;
+                block += "  _n = aie_kc_encode_bd(_kc, " + std::to_string(pingBd) + ", (uintptr_t)" + ping +
+                         ", sizeof(" + ping + "), " + std::to_string(pongBd) + ", " + acq + ", -1, " + rel +
+                         ", 1, 0, 0, 0, -1);\n" + flush;
+            }
+            block += "  aie_kc_encode_lock(_kc, " + acq + ", " + acqInit + ");\n" + one;
+            block += "  aie_kc_encode_lock(_kc, " + rel + ", 0);\n" + one;
+            block += "  aie_kc_encode_s2mm_start(_kc, " + ch + ", " + std::to_string(pingBd) + ", 1, 0);\n" + one;
+            block += "}";
+            rewriter.create<emitc::VerbatimOp>(loc, block);
+        }
+    }
+
     void convertMainToEmitC(ConversionPatternRewriter &rewriter, KernelMainOp mainOp, KernelModuleOp kernelModuleOp,
-                            const llvm::StringMap<WindowInfo> &windowInfoMap,
-                            const std::string &elementType) const {
+                            const llvm::StringMap<WindowInfo> &windowInfoMap, const std::string &elementType,
+                            bool offloadOn) const {
         Location loc = mainOp.getLoc();
         Block &mainBody = mainOp.getBody().front();
 
@@ -275,6 +345,11 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         rewriter.create<emitc::VerbatimOp>(loc, "sync_buffer[0] = 0;");
         rewriter.create<emitc::VerbatimOp>(loc, "sync_buffer[1] = -1;");
         rewriter.create<emitc::VerbatimOp>(loc, "klog_init();");
+
+        // KERNELCONFIGOFFLOAD: arm the incoming S2MM DMA before the first
+        // window_init so the descriptor is live at core entry.
+        if (offloadOn)
+            emitS2mmConfigBlock(rewriter, loc, kernelModuleOp, windowInfoMap);
 
         for (Operation &inner : mainBody) {
             if (isa<AllocSyncBufferOp>(&inner)) {
