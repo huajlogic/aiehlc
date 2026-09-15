@@ -80,6 +80,8 @@ Platforms: baremetal (`aarch64-none-elf-g++`) or Linux (`aarch64-linux-gnu-g++`)
 
 5. `BlueprintToScheduleKernelPass` → `DfscheduleToKernelApiPass` → EmitC → `kernel.cc`
 
+**KERNELCONFIGOFFLOAD** (gated on `routing.kernel_config_offload`, set by `#pragma KERNELCONFIGOFFLOAD`, default off): when on, `DfscheduleToKernelApiPass::convertMainToEmitC` emits a raw-MMIO block into `kernel.cc main()` (after `klog_init()`, before the first `window_init`, via `emitS2mmConfigBlock`) so the core self-configures its **incoming S2MM** DMA — ping/pong BD chain + lock inits + S2MM channel-start — using the `include/aie_kernel_config.h` encoder (`aie_kc_encode_bd`/`_lock`/`_s2mm_start`). Input window `i` (window_def order) claims ping bd `2*i`/pong bd `2*i+1`; BD base+len come from the core's own C buffer symbols (`(uintptr_t)buf_in_ping_0`, `sizeof(...)`). Host-side `removeCoreTileHostDmaChain` (`passdfscheduletoapi.cpp`) becomes **S2MM-selective** (keeps MM2S). **MM2S stays host-side** (per-`(col,row)` offload deferred — no `get_coreid` intrinsic). The kernel include path needs `-I include` (added to `script/kc.sh`). Gen5 (AIE2PS) only.
+
 **Routing path** (alternative, Path A) → `routing.cc`:
 
 1. `RoutingUnrollingLowerPass` → `RoutingLowerPass` → `RoutingHWLowerPass` → `RoutingDeadArgPass` → `RoutingConstantFoldPass` → `CanonicalizerPass` → EmitC → `routing.cc`
