@@ -276,6 +276,9 @@ struct KernelParamInfo {
     int funcArgIndex = -1;      // Function argument index (0=A, 1=B, 2=C)
     bool singleBuffer = false;  // Single-buffer (no pong) mode, e.g. spatial-halo IFM slab
                                 // that is received once per invocation (numRounds==1).
+    int32_t channel = 0;        // Core-tile DMA channel (S2MM for input, MM2S for output).
+                                // Plumbed onto window_def so KERNELCONFIGOFFLOAD kernel.cc
+                                // codegen can emit the S2MM channel-start for this window.
 };
 
 // Structure to hold kernel generation parameters
@@ -402,6 +405,10 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
             winAttrs.append("buffer_size", rewriter.getI32IntegerAttr(paramInfo.bufferSize));
             if (paramInfo.numRounds > 0)
                 winAttrs.append("num_rounds", rewriter.getI32IntegerAttr(paramInfo.numRounds));
+            // KERNELCONFIGOFFLOAD: the core's own DMA channel + single/ping-pong mode,
+            // so kernel.cc can emit the incoming-S2MM BD chain + channel-start MMIO.
+            winAttrs.append("dma_channel", rewriter.getI32IntegerAttr(paramInfo.channel));
+            winAttrs.append("single_buffer", rewriter.getBoolAttr(paramInfo.singleBuffer));
             winAttrs.append("async", rewriter.getBoolAttr(true));
 
             rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr(paramInfo.windowName),
@@ -795,6 +802,12 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
             // Get element type and partition size from the core FlowConfig's view
             // (not the full tensor from declare_data, which is the root tensor)
             auto coreFlowConfig = isInput ? toFlowConfig : fromFlowConfig;
+            // Core-tile DMA channel (S2MM for input / MM2S for output). Same source
+            // FlowTransferConversion uses for the create_io channel (coreDmaChannels[0]).
+            if (auto coreDma = coreFlowConfig.getDma()) {
+                auto chans = coreDma.getChannels();
+                paramInfo.channel = chans.empty() ? 0 : static_cast<int32_t>(chans[0]);
+            }
             Value viewValue = coreFlowConfig.getView();
             Type viewType = viewValue ? viewValue.getType() : Type();
             if (auto tensorType = dyn_cast_or_null<RankedTensorType>(viewType)) {

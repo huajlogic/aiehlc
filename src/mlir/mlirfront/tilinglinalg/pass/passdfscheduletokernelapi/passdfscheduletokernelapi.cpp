@@ -30,9 +30,11 @@ struct WindowInfo {
     std::string pongBuffer;
     std::string acquireLock;
     std::string releaseLock;
-    int32_t bufferSize = 0; // Per-window buffer size from window_def attribute
-    int32_t numRounds = 0;  // Number of ping-pong rounds (0 = use bufferSize as fallback)
-    std::string direction;  // "in" or "out"
+    int32_t bufferSize = 0;    // Per-window buffer size from window_def attribute
+    int32_t numRounds = 0;     // Number of ping-pong rounds (0 = use bufferSize as fallback)
+    std::string direction;     // "in" or "out"
+    int32_t channel = 0;       // Core-tile DMA channel (S2MM in / MM2S out)
+    bool singleBuffer = false; // Single-buffer (no pong) mode
 };
 
 /// dfschedule.module -> convert entire body line-by-line then erase module.
@@ -66,6 +68,10 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     info.numRounds = a.getInt();
                 if (auto a = winAttrs.getAs<StringAttr>("direction"))
                     info.direction = a.getValue().str();
+                if (auto a = winAttrs.getAs<IntegerAttr>("dma_channel"))
+                    info.channel = a.getInt();
+                if (auto a = winAttrs.getAs<BoolAttr>("single_buffer"))
+                    info.singleBuffer = a.getValue();
                 windowInfoMap[windowDefOp.getSymName().str()] = info;
             }
         }
