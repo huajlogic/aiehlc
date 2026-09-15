@@ -102,11 +102,54 @@ Gate plumbing mirrors `CONTROL_PLAN_GROUP_REG_WRITE` (Task E):
 
 The #3 enable is confirmed supported by aie-rt (`XAie_CoreProcessorBusEnable`),
 which de-risks core access. Residual unknown: the exact core-visible address the
-kernel uses for its own memory-module registers (tile-local `0x1D000`/`0x1F000`
-vs. a core aperture base) and DMA re-arm behavior. Plan Task 1 is a minimal HW
-spike: host calls `XAie_CoreProcessorBusEnable` for one core tile, and a
-hand-written `kernel.cc` self-programs its S2MM BD + lock + start-queue via MMIO;
-confirm data lands BEFORE the full codegen refactor.
+kernel uses for its own memory-module registers, and DMA re-arm behavior.
+
+### Concrete register facts (AIE2PS / gen5, from `xaie2psgbl_params.h` + driver)
+
+- Processor-bus **enable** reg (core module): `CORE_PROCESSOR_BUS = 0x38038`,
+  `ENABLE_MASK = 0x1`. Note a companion `SLVERR_ON_ACCESS_MASK = 0x4` bit —
+  if the core touches a disallowed address it raises a slave error (and
+  `CORE_STATUS.CORE_PROCESSOR_BUS_STALL = 0x00200000` can stall the core).
+- Memory-module config regs (host/global tile view): `DMA_BD0_0 = 0x1D000`,
+  `DMA_S2MM_0_CTRL = 0x1DE00`, `DMA_S2MM_0_START_QUEUE = 0x1DE04`,
+  `LOCK0_VALUE = 0x1F000` (stride `0x10`).
+- Core module regs live at `0x30000+` (PC `0x30F00`, ProcBus `0x38038`);
+  memory module regs at `0x1xxxx`.
+
+### The open conflict (spike must resolve)
+
+Two DIFFERENT core-view bases appear in the sources:
+- Driver `Aie2PSCoreMod.DataMemAddr = 0x40000` — the core's local view of its
+  OWN memory-module **data** memory (64 KB, `DataMemShift=16`).
+- `flowtransfer_kernel.cpp:614` subtracts **`0x70000`** to convert an allocator
+  "core processor view" address to the DMA (0x00000) view.
+
+So the core-view base for the memory module is ambiguous (`0x40000` per the
+gen5 driver vs `0x70000` in the tiling codegen — the latter may be AIE-ML/gen4
+legacy). Candidate core-view addresses for the config registers to try in the
+spike, in priority order:
+1. `0x40000 + 0x1D000 = 0x5D000` (BD0), `0x40000 + 0x1F000 = 0x5F000` (lock0)
+   — from the gen5 driver `DataMemAddr`.
+2. `0x70000 + 0x1D000 = 0x8D000`, `0x70000 + 0x1F000 = 0x8F000`
+   — from the tiling-codegen `0x70000` convention.
+3. Direct tile-local `0x1D000` / `0x1F000` (no core-aperture shift).
+
+### Cheapest spike (sentinel probe, isolates the address)
+
+Rather than reprogramming a live DMA first, prove the mechanism safely:
+1. Keep the normal generated matmul flow (host still programs DMA ⇒ data
+   correctness stays intact as a control).
+2. In `kernel.cc main()`, BEFORE `window_init`, MMIO-write a **sentinel** value
+   to an UNUSED lock's value register (e.g. lock id 60 ⇒ candidate addr +
+   `60*0x10`) via a `volatile uint32_t *`.
+3. In `host.cc`, AFTER launch, read that lock value back
+   (`XAie_LockGetValue` / `XAie_Read32`) and check the sentinel.
+4. Sweep the 3 candidate bases until the sentinel reads back ⇒ that base is the
+   core-visible aperture. Watch `CORE_STATUS.CORE_PROCESSOR_BUS_STALL` /
+   SLVERR for wrong addresses.
+
+Only after the base is confirmed do the codegen tasks (5-7) emit the real
+S2MM/MM2S BD + lock + start-queue writes. Confirm data lands BEFORE the refactor.
 
 ## Out of scope (v1)
 
