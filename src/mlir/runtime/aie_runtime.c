@@ -2570,6 +2570,36 @@ static AieRC __Runtime_partition_initialize(XAie_DevInst *dev) {
 }
 #endif
 
+/* ---------------------------------------------------------------------------
+ * Enable each AIE core tile's processor bus (KERNELCONFIGOFFLOAD).
+ * XAie_CoreProcessorBusEnable mask-writes the ProcBusCtrl enable bit at the
+ * tile address, letting the core write its own memory-module DMA/lock
+ * registers. Iterate the partition's core tiles (AieTileRowStart .. +NumRows)
+ * across its columns (StartCol .. +NumCols). Gen5 baremetal only.
+ * ----------------------------------------------------------------------- */
+AieRC __Runtime_enable_core_proc_bus(XAie_DevInst *dev) {
+#if AIE_GEN == 5 && !defined(__AIESIM__)
+    AieRC rc = XAIE_OK;
+    u8 rowStart = dev->AieTileRowStart;
+    u8 rowEnd = (u8)(dev->AieTileRowStart + dev->AieTileNumRows);
+    u8 colEnd = (u8)(dev->StartCol + dev->NumCols);
+    for (u8 col = dev->StartCol; col < colEnd; col++) {
+        for (u8 row = rowStart; row < rowEnd; row++) {
+            AieRC r = XAie_CoreProcessorBusEnable(dev, XAie_TileLoc(col, row));
+            if (r != XAIE_OK) {
+                printf("[aie_runtime] enable_core_proc_bus col=%u row=%u rc=%d\n", (unsigned)col, (unsigned)row,
+                       (int)r);
+                rc = r;
+            }
+        }
+    }
+    return rc;
+#else
+    (void)dev;
+    return XAIE_OK;
+#endif
+}
+
 /**
  * Teardown partition (reference: aieml_perf.cc lines 348-352)
  */
@@ -2638,6 +2668,11 @@ XAie_DevInst *__Runtime_explicit_init(void) {
         free(dev);
         return NULL;
     }
+
+    // Enable each core's processor bus so KERNELCONFIGOFFLOAD kernels can
+    // self-program their DMA/lock registers via MMIO. No-op unless gen5
+    // baremetal; harmless when offload is off.
+    __Runtime_enable_core_proc_bus(dev);
 
     __Runtime_routing_init(dev);
 
@@ -2709,6 +2744,11 @@ XAie_DevInst *__Runtime_explicit_init_partition(int startCol, int numCols) {
         free(dev);
         return NULL;
     }
+
+    // Enable each core's processor bus so KERNELCONFIGOFFLOAD kernels can
+    // self-program their DMA/lock registers via MMIO. No-op unless gen5
+    // baremetal; harmless when offload is off.
+    __Runtime_enable_core_proc_bus(dev);
 
     /* Shim DMA loopback self-test: write 0xABCD at DDR offset 10MB,
      * loopback-copy to DDR offset 20MB, verify. Uses col=startCol. */

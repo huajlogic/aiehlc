@@ -251,6 +251,13 @@ void __Runtime_routing_init(XAie_DevInst *dev);
 // Device teardown (takes explicit dev pointer)
 AieRC __Runtime_device_teardown(XAie_DevInst *dev);
 
+// Enable each AIE core tile's processor bus so the core can write its own
+// memory-module DMA/lock registers (required for KERNELCONFIGOFFLOAD, where
+// kernel.cc self-programs its DMA via MMIO). Iterates the partition's core
+// tiles calling XAie_CoreProcessorBusEnable. Gen5 baremetal only; no-op
+// elsewhere. Safe to call unconditionally (only enables bus access).
+AieRC __Runtime_enable_core_proc_bus(XAie_DevInst *dev);
+
 // ---------------------------------------------------------------------------
 // Explicit init/teardown: heap-allocates XAie_DevInst, returns pointer.
 // Caller owns the returned pointer and must call __Runtime_explicit_teardown().
