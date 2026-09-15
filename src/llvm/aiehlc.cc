@@ -185,6 +185,12 @@ static bool parsedControlPlanCtrlPacket = false;
 // control-packet group writes (broadcast / row multicast). Absent (default) =>
 // the pass is skipped and lock inits are emitted as individual register writes.
 static bool parsedControlPlanGroupRegWrite = false;
+// Set by #pragma KERNELCONFIGOFFLOAD. When true, the pipeline offloads core-tile
+// DMA configuration (incoming/ongoing S2MM BDs, lock inits, MM2S BD, channel
+// start) from the HOST into the AIE CORE kernel, which self-programs its DMA via
+// raw MMIO register writes. Absent (default) => byte-identical to today (host
+// programs every core tile's DMA over the config bus).
+static bool parsedKernelConfigOffload = false;
 // Compute tiles to core-trace, from #pragma aie_trace(col,row) (mesh/partition-
 // relative). Repeatable and range-expanded (col:col2, row:row2 -> rectangle).
 // Each spec may carry an optional mem-module DMA/stream selection (2nd tuple).
@@ -3520,6 +3526,21 @@ class AieControlPlanGroupRegWritePragmaHandler : public clang::PragmaHandler {
     }
 };
 
+// Bare marker pragma: #pragma KERNELCONFIGOFFLOAD (no arguments). Its presence
+// opts the pipeline into offloading core-tile DMA configuration (S2MM/MM2S BDs,
+// lock inits, channel start) from the HOST into the AIE CORE kernel, which
+// self-programs its DMA via raw MMIO. Absent (default) => host programs the DMA.
+class AieKernelConfigOffloadPragmaHandler : public clang::PragmaHandler {
+  public:
+    AieKernelConfigOffloadPragmaHandler() : PragmaHandler("KERNELCONFIGOFFLOAD") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        parsedKernelConfigOffload = true;
+        llvm::outs() << "[aiehlc] Detected #pragma KERNELCONFIGOFFLOAD\n";
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
 class MyFrontendAction : public ASTFrontendAction {
 public:
 		MyFrontendAction() {
@@ -3572,6 +3593,7 @@ public:
             PP.AddPragmaHandler(new AieTracePragmaHandler());
             PP.AddPragmaHandler(new AieControlPlanPragmaHandler());
             PP.AddPragmaHandler(new AieControlPlanGroupRegWritePragmaHandler());
+            PP.AddPragmaHandler(new AieKernelConfigOffloadPragmaHandler());
 
             return true;
 		}
@@ -4561,6 +4583,11 @@ public:
                         // host pipeline gates the pass on it.
                         module->setAttr("routing.control_plan_group_reg_write",
                                         fcAttrBuilder.getI64IntegerAttr(parsedControlPlanGroupRegWrite ? 1 : 0));
+                        // Opt-in kernel config offload (see #pragma
+                        // KERNELCONFIGOFFLOAD). Publish the flag so the pipeline
+                        // gates the offload codegen on it.
+                        module->setAttr("routing.kernel_config_offload",
+                                        fcAttrBuilder.getI64IntegerAttr(parsedKernelConfigOffload ? 1 : 0));
                     }
 
                     // Replace aie::get_*() calls in kernel body with computed integer literals
@@ -5242,6 +5269,10 @@ public:
                     // pipeline gates the pass on it.
                     module->setAttr("routing.control_plan_group_reg_write",
                                     fcAttrBuilder.getI64IntegerAttr(parsedControlPlanGroupRegWrite ? 1 : 0));
+                    // Opt-in kernel config offload (see #pragma KERNELCONFIGOFFLOAD).
+                    // Publish the flag so the pipeline gates the offload codegen on it.
+                    module->setAttr("routing.kernel_config_offload",
+                                    fcAttrBuilder.getI64IntegerAttr(parsedKernelConfigOffload ? 1 : 0));
                 }
 
                 // Replace aie::get_*() calls in kernel body with computed integer literals
