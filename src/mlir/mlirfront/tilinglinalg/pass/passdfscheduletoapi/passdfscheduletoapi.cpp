@@ -184,13 +184,6 @@ struct ConversionState {
     bool enableDebug = false;
     int runtimeDebugLevel = -1;
 
-    // Set from module attr routing.kernel_config_offload. When true, the host does
-    // NOT program core-tile DMA (BD, lock init, create_io, channel start); the AIE
-    // core self-configures its own DMA via raw MMIO from kernel.cc instead. The
-    // entire core-tile host DMA chain is removed in a pre-conversion walk so shim
-    // BDs and the kernel-group launch stay intact.
-    bool kernelConfigOffload = false;
-
     // Cached values for inner patterns (set before applying inner patterns)
     Value devInstRef;
     Value cacheableConst;
@@ -3182,129 +3175,6 @@ static void setupTypeConverter(TypeConverter &typeConverter, MLIRContext *ctx) {
 }
 
 //===----------------------------------------------------------------------===//
-// KERNELCONFIGOFFLOAD: remove the core-tile host DMA chain
-//===----------------------------------------------------------------------===//
-
-// Core tiles begin at this row on the AIE2PS partition (row 0 = shim,
-// row 1 = memtile). Only core-tile DMA is offloaded into kernel.cc; shim and
-// memtile BDs stay host-side. Matches passgroupregwrite.cpp::kCoreRowMin.
-static constexpr int kOffloadCoreRowMin = 2;
-
-// Trace a start_io -> its create_io -> DeclareTileOp and report the target row
-// (-1 if it cannot be resolved). Used to classify the DMA chain as core vs
-// shim/memtile.
-static int offloadStartIoRow(dfschedule::StartIoOp s) {
-    auto io = s.getIoHandle().getDefiningOp<dfschedule::ConfigCreateIoOp>();
-    if (!io)
-        return -1;
-    auto td = io.getTile().getDefiningOp<dfschedule::DeclareTileOp>();
-    if (!td)
-        return -1;
-    return td.getRow();
-}
-
-// True iff a start_io's create_io programs an S2MM (incoming) DMA. Only the
-// S2MM core chain is offloaded to kernel.cc; MM2S (outgoing) stays host-side
-// because it needs a per-(col,row) out-of-order BD id and no runtime core
-// tile-position intrinsic exists yet.
-static bool offloadStartIoIsS2MM(dfschedule::StartIoOp s) {
-    auto io = s.getIoHandle().getDefiningOp<dfschedule::ConfigCreateIoOp>();
-    return io && io.getDirection() == "S2MM";
-}
-
-// When #pragma KERNELCONFIGOFFLOAD is on, the AIE core self-programs its own
-// INCOMING (S2MM) DMA (BDs, lock inits, channel start) from kernel.cc via raw
-// MMIO. This removes ONLY the S2MM host-side dfschedule chain for CORE tiles
-// (row >= kOffloadCoreRowMin) BEFORE lowering, so that ConfigDmaBdInnerPattern
-// (which also emits the core-tile XAie_LockSetValue) never runs for them. The
-// MM2S (outgoing) core chain stays host-side (deferred: it needs a per-(col,row)
-// out-of-order BD id with no runtime core tile-position intrinsic yet). Shim
-// BDs, memtile BDs, MM2S core BDs, and the kernel-group launch are untouched.
-//
-// The per-core-tile S2MM chain is: config.dma_bd (ping+pong) -> config.create_io
-// -> schedule.start_io, whose event feeds a schedule.wait. Removal order:
-//   1. Collect only S2MM core-tile start_io (offloadStartIoIsS2MM).
-//   2. Rebuild each schedule.wait without those start_io events (keeps MM2S).
-//   3. Erase the S2MM start_io (+ any now-dead getbdid feeding its bd_id).
-//   4. Erase the S2MM create_io.
-//   5. Fixpoint-erase now-dead core-tile config.dma_bd; the use_empty() guard
-//      leaves MM2S ping/pong BDs (still fed to their kept MM2S create_io) intact.
-static void removeCoreTileHostDmaChain(ModuleOp moduleOp) {
-    // 1. Collect core-tile start_io ops and their event Values.
-    SmallVector<dfschedule::StartIoOp, 8> coreStarts;
-    llvm::DenseSet<Value> coreEvents;
-    moduleOp.walk([&](dfschedule::StartIoOp s) {
-        if (offloadStartIoRow(s) >= kOffloadCoreRowMin && offloadStartIoIsS2MM(s)) {
-            coreStarts.push_back(s);
-            coreEvents.insert(s.getResult());
-        }
-    });
-    if (coreStarts.empty())
-        return;
-
-    // 2. Rebuild schedule.wait ops without the core-tile events.
-    SmallVector<dfschedule::ScheduleWaitOp, 4> waits;
-    moduleOp.walk([&](dfschedule::ScheduleWaitOp w) { waits.push_back(w); });
-    for (auto w : waits) {
-        SmallVector<Value, 8> keep;
-        bool changed = false;
-        for (Value e : w.getEvents()) {
-            if (coreEvents.count(e)) {
-                changed = true;
-                continue;
-            }
-            keep.push_back(e);
-        }
-        if (changed) {
-            OpBuilder b(w);
-            b.create<dfschedule::ScheduleWaitOp>(w.getLoc(), keep);
-            w.erase();
-        }
-    }
-
-    // 3. Erase core-tile start_io (+ dead getbdid feeding its bd_id) and collect
-    //    the create_io / dma_bd producers for subsequent removal.
-    SmallVector<dfschedule::ConfigCreateIoOp, 8> coreIos;
-    for (auto s : coreStarts) {
-        Value bdIdV = s.getBdId();
-        if (auto io = s.getIoHandle().getDefiningOp<dfschedule::ConfigCreateIoOp>())
-            coreIos.push_back(io);
-        s.erase();
-        if (bdIdV)
-            if (auto *def = bdIdV.getDefiningOp())
-                if (isa<dfschedule::GetBdIdOp>(def) && def->use_empty())
-                    def->erase();
-    }
-
-    // 4. Erase core-tile create_io (its config.dma_bd producers go dead).
-    for (auto io : coreIos) {
-        if (io->use_empty())
-            io.erase();
-    }
-
-    // 5. Fixpoint-erase every core-tile config.dma_bd (the ping/pong linked_bd
-    //    chain unravels once create_io is gone). Collected via a single walk so
-    //    each op appears once (no dangling double-erase).
-    SmallVector<dfschedule::ConfigDmaBdOp, 16> coreBds;
-    moduleOp.walk([&](dfschedule::ConfigDmaBdOp bd) {
-        if (auto td = bd.getTile().getDefiningOp<dfschedule::DeclareTileOp>())
-            if (td.getRow() >= kOffloadCoreRowMin)
-                coreBds.push_back(bd);
-    });
-    bool progressed = true;
-    while (progressed) {
-        progressed = false;
-        for (auto &bd : coreBds) {
-            if (bd && bd->use_empty()) {
-                bd.erase();
-                bd = nullptr;
-                progressed = true;
-            }
-        }
-    }
-}
-
-//===----------------------------------------------------------------------===//
 // Pass Implementation - Two-Phase Conversion with Walk + Patterns
 //===----------------------------------------------------------------------===//
 
@@ -3336,16 +3206,9 @@ void DfscheduleToApiPass::runOnOperation() {
                      << " folded lock-init triples (control-packet grouped)\n";
     }
 
-    // KERNELCONFIGOFFLOAD: when on, the AIE core self-programs its own DMA from
-    // kernel.cc (raw MMIO). Remove the core-tile host DMA chain (BD, lock init,
-    // create_io, channel start) BEFORE lowering so those host calls are never
-    // emitted; shim/memtile BDs and the kernel-group launch stay host-side.
-    if (auto a = moduleOp->getAttrOfType<IntegerAttr>("routing.kernel_config_offload"))
-        state.kernelConfigOffload = a.getInt() != 0;
-    if (state.kernelConfigOffload) {
-        llvm::errs() << "[Pass] KERNELCONFIGOFFLOAD on: removing core-tile host DMA chain\n";
-        removeCoreTileHostDmaChain(moduleOp);
-    }
+    // KERNELCONFIGOFFLOAD: the S2MM core-tile host DMA chain is now suppressed at
+    // generation time (BlueprintToSchedulePass::emitCoreBufferDma skips it when
+    // routing.kernel_config_offload is set), so no host-side removal is needed here.
 
     // Precompute the control-fabric C variable name for each ctrl_plan_init and
     // for the group_reg_writes that consume it, so their lowering order is

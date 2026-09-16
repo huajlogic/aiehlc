@@ -527,30 +527,44 @@ LogicalResult FlowTransferConversion::emitCoreBufferDma(FlowLoweringCtx &c, Core
                         t.coreOooBdId = c.shimPerTileBdIds[idx];
                 }
 
-                if (t.ppDepth == 1) {
-                    emitCoreSingleBufferBd(c, t);
-                } else {
-                    emitCorePingPongBd(c, t);
-                }
+                // KERNELCONFIGOFFLOAD: when on, the AIE core self-programs its own
+                // incoming (S2MM) DMA — BD chain, lock inits, channel start — from
+                // kernel.cc via raw MMIO (passdfscheduletokernelapi emitS2mmConfigBlock).
+                // So the host must NOT emit the S2MM core-tile DMA chain. Skip the BD +
+                // create_io + deferred start_io for INPUT (S2MM) core tiles (row >=
+                // kOffloadCoreRowMin, excluding memtiles). MM2S (output) core BDs stay
+                // host-side — deferred, no core-position intrinsic yet. Lock inits ride
+                // on the ConfigDmaBdOp, so skipping the BD also drops them.
+                constexpr int64_t kOffloadCoreRowMin = 2;
+                bool offloadSkipS2mm =
+                    passState && passState->kernelConfigOffload && c.isInput && t.row >= kOffloadCoreRowMin;
+                if (!offloadSkipS2mm) {
+                    if (t.ppDepth == 1) {
+                        emitCoreSingleBufferBd(c, t);
+                    } else {
+                        emitCorePingPongBd(c, t);
+                    }
 
-                // Create IO handle for core tile
-                auto coreCreateIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
-                    loc, dfschedule::IoHandleType::get(rewriter.getContext()), t.firstCoreBdHandle,
-                    t.coreTileOp.getTile(), rewriter.getI32IntegerAttr(c.coreChannel),
-                    rewriter.getStringAttr(c.coreDmaDirection), rewriter.getStringAttr(c.coreIoOperation),
-                    rewriter.getBoolAttr(false)); // enable_out_of_order=false for core tiles
-                auto coreBdIdOp =
-                    rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), t.coreTileOp.getTile());
-                // Defer core StartIoOp until after ELF is loaded (LoadKernelGroup)
-                // to prevent BSS initialization from overwriting DMA data.
-                // Core tiles use ping-pong BD chaining (next_bd links ping↔pong),
-                // so the DMA hardware automatically re-arms via the chain.
-                // repeat=1 is sufficient; the BD chain does the work.
-                int32_t coreRepeat = 1;
-                llvm::errs() << "[DeferredStartIo] PUSH deferredCoreStartIos flowIdx=" << c.flowIndex
-                             << " tileIdx=" << c.tileIndex << " total=" << (c.deferredCoreStartIos.size() + 1) << "\n";
-                c.deferredCoreStartIos.push_back(
-                    {coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), c.flowIndex, coreRepeat});
+                    // Create IO handle for core tile
+                    auto coreCreateIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
+                        loc, dfschedule::IoHandleType::get(rewriter.getContext()), t.firstCoreBdHandle,
+                        t.coreTileOp.getTile(), rewriter.getI32IntegerAttr(c.coreChannel),
+                        rewriter.getStringAttr(c.coreDmaDirection), rewriter.getStringAttr(c.coreIoOperation),
+                        rewriter.getBoolAttr(false)); // enable_out_of_order=false for core tiles
+                    auto coreBdIdOp =
+                        rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), t.coreTileOp.getTile());
+                    // Defer core StartIoOp until after ELF is loaded (LoadKernelGroup)
+                    // to prevent BSS initialization from overwriting DMA data.
+                    // Core tiles use ping-pong BD chaining (next_bd links ping↔pong),
+                    // so the DMA hardware automatically re-arms via the chain.
+                    // repeat=1 is sufficient; the BD chain does the work.
+                    int32_t coreRepeat = 1;
+                    llvm::errs() << "[DeferredStartIo] PUSH deferredCoreStartIos flowIdx=" << c.flowIndex
+                                 << " tileIdx=" << c.tileIndex << " total=" << (c.deferredCoreStartIos.size() + 1)
+                                 << "\n";
+                    c.deferredCoreStartIos.push_back(
+                        {coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), c.flowIndex, coreRepeat});
+                }
             } // end if (passState && ...)
         }
     }

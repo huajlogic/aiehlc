@@ -274,6 +274,11 @@ void BlueprintToSchedulePass::runOnOperation() {
                 auto attr = moduleOp->getAttrOfType<IntegerAttr>(name);
                 return attr ? attr.getInt() : 0;
             };
+            // KERNELCONFIGOFFLOAD: when the core self-programs its incoming S2MM
+            // DMA from kernel.cc, emitCoreBufferDma must skip the host S2MM core
+            // DMA chain (see BlueprintPassState::kernelConfigOffload).
+            passState->kernelConfigOffload = getI64("routing.kernel_config_offload") != 0;
+
             // Flat module attrs are the fallback source.
             passState->tileM = getI64("routing.tile_m");
             passState->tileRows = getI64("routing.tile_rows");

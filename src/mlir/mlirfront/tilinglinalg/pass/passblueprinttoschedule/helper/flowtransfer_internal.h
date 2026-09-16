@@ -74,6 +74,11 @@ struct BlueprintPassState {
     // partitiontensor op during conversion. Empty for conv, mirroring the old
     // !isFullConnectAuto Match/1/1 behavior.
     routing::GemmTilingScalars tilingScalars;
+    // KERNELCONFIGOFFLOAD (routing.kernel_config_offload): when set, the AIE core
+    // self-programs its own incoming (S2MM) DMA from kernel.cc via raw MMIO, so the
+    // host must NOT emit the S2MM core-tile DMA chain. emitCoreBufferDma reads this
+    // to skip the S2MM BD + create_io + start_io for core tiles.
+    bool kernelConfigOffload = false;
 };
 
 // === Tiling Classification ===
