@@ -860,7 +860,7 @@ LogicalResult FlowTransferConversion::emitScheduleMultipleInput(FlowLoweringCtx 
     // 1. load_kernel_group OUTSIDE the loop
     auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
         loc, dfschedule::KernelGroupType::get(rewriter.getContext()), c.coreTiles, rewriter.getArrayAttr(c.calleeAttrs),
-        rewriter.getArrayAttr(c.computeKernelAttrs), nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
+        /*kernel_config=*/nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
 
     // 2. launch_kernel_group OUTSIDE the loop
     auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
@@ -990,7 +990,7 @@ void FlowTransferConversion::emitScheduleOooOutput(FlowLoweringCtx &c) const {
     // 1. load_kernel_group OUTSIDE the loop
     auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
         loc, dfschedule::KernelGroupType::get(rewriter.getContext()), c.coreTiles, rewriter.getArrayAttr(c.calleeAttrs),
-        rewriter.getArrayAttr(c.computeKernelAttrs), nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
+        /*kernel_config=*/nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
 
     // 2. launch_kernel_group OUTSIDE the loop
     auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
@@ -1165,7 +1165,7 @@ void FlowTransferConversion::emitScheduleStraightLine(FlowLoweringCtx &c) const 
     }
     auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
         loc, dfschedule::KernelGroupType::get(rewriter.getContext()), c.coreTiles, rewriter.getArrayAttr(c.calleeAttrs),
-        rewriter.getArrayAttr(c.computeKernelAttrs), nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
+        /*kernel_config=*/nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
 
     auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
         loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());

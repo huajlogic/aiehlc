@@ -303,7 +303,6 @@ struct FlowLoweringCtx {
     // --- kernel_config finalize + schedule ---
     SmallVector<Attribute> kernelConfigSymbols;
     SmallVector<Attribute> calleeAttrs;
-    SmallVector<Attribute> computeKernelAttrs;
     TilingClassification classification;
     bool needsOuterLoop = false;
     bool fullConnect = true;

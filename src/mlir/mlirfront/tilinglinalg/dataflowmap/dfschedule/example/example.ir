@@ -39,8 +39,7 @@ module {
       %kernel_packet_1 = dfschedule.packet @packet1 (%gmem) {dma_channel=0}
       %kernel_group = "dfschedule.config.load_kernel_group"(%core_0, %core_1) {
         callee = [@dskernel_receiver],
-        distributed_compute_kernel_args = [@comput0, @compute0],
-        distributed_args = [@packet0, @packet1],   
+        distributed_args = [@packet0, @packet1],
       } : (!ds.tile, !ds.tile, tensor<4xi32>, i32) -> !dfschedule.kernelgroup
       %evt_kernel_group = "dfschedule.schedule.launch_kernel_group"(%kernel_group) {
       } : (dfschedule.kernelgroup) -> !ds.event

@@ -233,7 +233,6 @@ static void preMapExternalValues(Operation *rcOp, OpBuilder &builder, Location l
 struct KernelCfgEntry {
     TileKey tileKey;
     ArrayAttr tileConfigs; // from DeclareKernelConfigOp.tile_configs
-    Attribute computeArg;  // from LoadKernelGroupOp.distributed_compute_kernel_args[i]
 };
 
 /// Collect kernel config info from the cloned RoutingCreate block, then erase
@@ -253,7 +252,6 @@ static void collectAndErasePreInlineOps(Block &clonedBlock, Operation *clonedRc,
             calleeAttrs = loadOp.getCalleeAttr();
 
         auto distArgsOpt = loadOp.getDistributedArgs();
-        auto computeKernelArgs = loadOp.getDistributedComputeKernelArgs();
         auto tiles = loadOp.getTiles();
 
         for (size_t i = 0; i < tiles.size(); ++i) {
@@ -275,11 +273,7 @@ static void collectAndErasePreInlineOps(Block &clonedBlock, Operation *clonedRc,
                 }
             }
 
-            Attribute computeArg = SymbolRefAttr::get(clonedRc->getContext(), "compute0");
-            if (i < computeKernelArgs.size())
-                computeArg = computeKernelArgs[i];
-
-            kernelCfgEntries.push_back({k, tileConfigs, computeArg});
+            kernelCfgEntries.push_back({k, tileConfigs});
         }
     }
 
@@ -439,7 +433,6 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
     }
 
     SmallVector<Value> allCoreTileVals;
-    SmallVector<Attribute> allComputeArgs;
     SmallVector<Attribute> kernelConfigSyms;
 
     for (size_t i = 0; i < uniqueEntries.size(); ++i) {
@@ -449,7 +442,6 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
             continue;
 
         allCoreTileVals.push_back(tileVal);
-        allComputeArgs.push_back(entry.computeArg);
 
         std::string cfgName = "kernelconfig_merged" + std::to_string(i);
         ArrayAttr cfgAttr = entry.tileConfigs ? entry.tileConfigs : builder.getArrayAttr({});
@@ -462,7 +454,6 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
     if (!allCoreTileVals.empty() && calleeAttrs) {
         auto loadOp = builder.create<dfschedule::LoadKernelGroupOp>(
             loc, dfschedule::KernelGroupType::get(ctx), allCoreTileVals, calleeAttrs,
-            builder.getArrayAttr(allComputeArgs),
             /*kernel_config=*/nullptr, builder.getArrayAttr(kernelConfigSyms));
         auto launchOp = builder.create<dfschedule::LaunchKernelGroupOp>(loc, dfschedule::EventType::get(ctx),
                                                                         loadOp.getKernelGroup());

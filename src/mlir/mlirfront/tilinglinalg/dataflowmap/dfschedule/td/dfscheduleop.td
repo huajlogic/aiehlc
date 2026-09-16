@@ -212,15 +212,13 @@ def dfschedule_LoadKernelGroupOp : dfscheduleop<"config.load_kernel_group"> {
     ```mlir
     %kg = dfschedule.config.load_kernel_group(%tile0, %tile1) {
       callee = [@dskernel_receiver],
-      kernel_config = @kernelconfig,
-      distributed_compute_kernel_args = [@compute0, @compute0]
+      kernel_config = @kernelconfig
     }
     ```
   }];
   let arguments = (ins
     Variadic<dfschedule_TileHandleType>:$tiles,
     SymbolRefArrayAttr:$callee,
-    SymbolRefArrayAttr:$distributed_compute_kernel_args,
     OptionalAttr<FlatSymbolRefAttr>:$kernel_config,  // NEW: single unified config
     OptionalAttr<SymbolRefArrayAttr>:$distributed_args  // OLD: for backward compat
   );

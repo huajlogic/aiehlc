@@ -1966,12 +1966,10 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         
         // Get attributes
         auto calleeAttr = op.getCalleeAttr();
-        auto computeKernelArgsAttr = op.getDistributedComputeKernelArgsAttr();
         auto distributedArgsAttr = op.getDistributedArgsAttr();
-        
+
         llvm::errs() << "  Callee array: " << calleeAttr << "\n";
-        llvm::errs() << "  Compute kernel args array: " << computeKernelArgsAttr << "\n";
-        
+
         if (distributedArgsAttr) {
             llvm::errs() << "  Using distributed_args (kernel config symbols): " << distributedArgsAttr << "\n";
             

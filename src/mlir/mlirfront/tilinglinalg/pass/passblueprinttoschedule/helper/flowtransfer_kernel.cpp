@@ -797,11 +797,6 @@ void FlowTransferConversion::finalizeKernelConfig(FlowLoweringCtx &c) const {
 
     // Create callee symbol refs (dskernel_receiver for all)
     c.calleeAttrs.push_back(SymbolRefAttr::get(rewriter.getContext(), "dskernel_receiver"));
-
-    // Create distributed_compute_kernel_args (compute0 for all)
-    for (size_t i = 0; i < c.coreTiles.size(); ++i) {
-        c.computeKernelAttrs.push_back(SymbolRefAttr::get(rewriter.getContext(), "compute0"));
-    }
 }
 
 } // namespace blueprint_sched
