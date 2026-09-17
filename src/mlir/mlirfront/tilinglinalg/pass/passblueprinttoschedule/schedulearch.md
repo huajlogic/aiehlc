@@ -83,7 +83,7 @@ Iteratively erases use-empty ops until a fixed point:
 
 This cleans up tensor IR that was only needed to carry offset/size metadata into `FlowTransferConversion`.
 
-> **Note:** `scf.execute_region` restructuring is deferred to `ScheduleCanonicalizePass`. Generated `dfschedule` ops remain inside `routing.RoutingCreate` bodies (which carry the `SymbolTable` trait required by `DeclareKernelConfigOp`).
+> **Note:** `scf.execute_region` restructuring is deferred to `ScheduleCanonicalizePass`. Generated `dfschedule` ops remain inside `routing.RoutingCreate` bodies until then.
 
 ---
 
@@ -200,27 +200,19 @@ dfschedule.getbdid (coreTile)
 dfschedule.schedule.start_io (coreIoHandle, bdId, flowIndex)
 ```
 
-#### 4f. Per-Tile Config Dictionary (for KernelConfig)
-Each tile produces an attribute dictionary with:
-```
-tile_index, flow_index, packet_id, dma_channel,
-buffer_mode=1 (ping-pong), num_buffers=2,
-buffer_size, buffer_offset, element_size,
-acquire_lock_id, release_lock_id
-```
-
 ### Step 5 — Kernel Group and Launch
 
-```
-# One DeclareKernelConfigOp per tile (named @kernelconfig0, @kernelconfig1, ...)
-dfschedule.declare_kernel_config @kernelconfigN [singleTileConfigDict]
+The per-tile DMA/lock/buffer configuration is materialized directly by the DMA
+BD, lock-init, and `start_io` ops emitted in Step 4 — there is **no** separate
+per-tile config metadata op.
 
+```
 # Load kernel group (all core tiles share callee=@dskernel_receiver)
 dfschedule.config.load_kernel_group
     tiles              = [coreTile0, coreTile1, ...]
     callees            = [@dskernel_receiver]
     compute_kernels    = [@compute0, @compute0, ...]
-    distributed_args   = [@kernelconfig0, @kernelconfig1, ...]
+    # distributed_args is left null (kernel-config distribution was removed)
 
 # Launch
 dfschedule.schedule.launch_kernel_group (kernelGroup)
@@ -313,7 +305,6 @@ memref.subview %rootMemref[partOffsets][partSizes][partStrides]        // partit
     → dfschedule.config.create_io [core]
     → dfschedule.getbdid
     → dfschedule.schedule.start_io [core]
-    → dfschedule.declare_kernel_config @kernelconfigN
 
   → dfschedule.config.load_kernel_group
   → dfschedule.schedule.launch_kernel_group
@@ -337,7 +328,7 @@ dfschedule.dskernel_receiver @dskernel_receiver { }
 | Pong BD created *before* ping, then ping chains to it | Ensures `linked_bd` SSA value (pong BD handle) is available when ping BD is created |
 | `data_id` propagated to shim `ConfigDmaBdOp` | Lets `ScheduleCanonicalizePass` identify and merge BDs for the same root tensor |
 | `dskernel_receiver` body left empty | Separation of concerns; a later kernel pass fills in DMA BD config for the AIE core side |
-| Restructuring deferred to `ScheduleCanonicalizePass` | `routing.RoutingCreate` provides the `SymbolTable` scope needed by `DeclareKernelConfigOp` at conversion time |
+| Restructuring deferred to `ScheduleCanonicalizePass` | Keeps `FlowTransferConversion` focused on emitting the `dfschedule` sub-graph; region/`scf.execute_region` layout is a separate concern |
 
 ---
 

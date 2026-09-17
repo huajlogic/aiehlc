@@ -277,27 +277,6 @@ LogicalResult FlowTransferConversion::emitCoreTileParams(FlowLoweringCtx &c, Cor
         t.releaseLockId = outputLockBase + c.dirIdx * 2 + 1;
     }
 
-    // Build config dictionary for this tile
-    // buffer_mode: 0 = single buffer (pp_depth=1), 1 = ping-pong (pp_depth>=2)
-    int bufferMode = (t.ppDepth == 1) ? 0 : 1;
-    int numBuffers = (t.ppDepth == 1) ? 1 : 2;
-
-    NamedAttrList configAttrs;
-    configAttrs.append("tile_index", rewriter.getI32IntegerAttr(c.tileIndex));
-    configAttrs.append("flow_index", rewriter.getI32IntegerAttr(c.flowIndex));
-    configAttrs.append("packet_id", rewriter.getI32IntegerAttr(c.basePacketId + c.tileIndex));
-    configAttrs.append("dma_channel", rewriter.getI32IntegerAttr(c.coreChannel));
-    configAttrs.append("buffer_mode", rewriter.getI32IntegerAttr(bufferMode));
-    configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(numBuffers));
-    configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(t.pingPongBufferSize));
-    configAttrs.append("num_iterations", rewriter.getI32IntegerAttr(t.numIterations));
-    configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(t.bufferOffset));
-    configAttrs.append("element_size", rewriter.getI32IntegerAttr(t.elementSizeBytes));
-    configAttrs.append("acquire_lock_id", rewriter.getI32IntegerAttr(t.acquireLockId));
-    configAttrs.append("release_lock_id", rewriter.getI32IntegerAttr(t.releaseLockId));
-
-    c.tileConfigDicts.push_back(rewriter.getDictionaryAttr(configAttrs));
-
     return success();
 }
 
@@ -769,31 +748,10 @@ void FlowTransferConversion::emitCorePingPongBd(FlowLoweringCtx &c, CoreTileCtx 
 }
 
 // ---------------------------------------------------------------------------
-// finalizeKernelConfig — DeclareKernelConfigOp + callee/compute attrs
-// (orig 2217-2246). Preserves the function-local static kernelConfigIdx.
+// finalizeKernelConfig — callee attrs for the kernel group.
 // ---------------------------------------------------------------------------
 void FlowTransferConversion::finalizeKernelConfig(FlowLoweringCtx &c) const {
     ConversionPatternRewriter &rewriter = c.rewriter;
-    Location loc = c.loc;
-
-    // Create individual kernel_config ops for each tile (e.g., @kernelconfig0, @kernelconfig1)
-    // Use static counter to ensure unique names across multiple transfer manifests
-    static int kernelConfigIdx = 0;
-    for (size_t i = 0; i < c.tileConfigDicts.size(); ++i) {
-        std::string configName = "kernelconfig" + std::to_string(kernelConfigIdx++);
-
-        // Create a kernel_config op with a single tile's config
-        SmallVector<Attribute> singleTileConfig;
-        singleTileConfig.push_back(c.tileConfigDicts[i]);
-
-        auto kernelConfigOp = rewriter.create<dfschedule::DeclareKernelConfigOp>(
-            loc, dfschedule::KernelConfigType::get(rewriter.getContext()), rewriter.getStringAttr(configName),
-            rewriter.getArrayAttr(singleTileConfig));
-        (void)kernelConfigOp;
-
-        // Store symbol reference
-        c.kernelConfigSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), configName));
-    }
 
     // Create callee symbol refs (dskernel_receiver for all)
     c.calleeAttrs.push_back(SymbolRefAttr::get(rewriter.getContext(), "dskernel_receiver"));

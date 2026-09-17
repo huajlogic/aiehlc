@@ -114,12 +114,9 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
         %23 = dfschedule.schedule.getbdid(%16) : (!dfschedule.tile) -> i32
         %24 = dfschedule.schedule.start_io(%22, %23) {flow_index = 0 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
-        %25 = dfschedule.declare_kernel_config @kernelconfig0 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 0 : i32, buffer_size = 64 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 0 : i32, num_buffers = 2 : i32, packet_id = 1 : i32, release_lock_id = 1 : i32, tile_index = 0 : i32}]}
-        %26 = dfschedule.declare_kernel_config @kernelconfig1 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 64 : i32, buffer_size = 64 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 0 : i32, num_buffers = 2 : i32, packet_id = 2 : i32, release_lock_id = 1 : i32, tile_index = 1 : i32}]}
         %27 = dfschedule.config.load_kernel_group(%7, %16) {
           callee = [@dskernel_receiver],
-          distributed_compute_kernel_args = [@compute0, @compute0],
-          distributed_args = [@kernelconfig0, @kernelconfig1]
+          distributed_compute_kernel_args = [@compute0, @compute0]
         } : (!dfschedule.tile, !dfschedule.tile) -> !dfschedule.kernelgroup
         %28 = dfschedule.schedule.launch_kernel_group(%27) : (!dfschedule.kernelgroup) -> !dfschedule.event
         %29 = dfschedule.schedule.getbdid(%3) : (!dfschedule.tile) -> i32
@@ -226,12 +223,9 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"]} {
         } : (!dfschedule.bd_handle, !dfschedule.tile) -> !dfschedule.io_handle
         %23 = dfschedule.schedule.getbdid(%16) : (!dfschedule.tile) -> i32
         %24 = dfschedule.schedule.start_io(%22, %23) {flow_index = 1 : i32} : (!dfschedule.io_handle, i32) -> !dfschedule.event
-        %25 = dfschedule.declare_kernel_config @kernelconfig0 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 0 : i32, buffer_size = 64 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 1 : i32, num_buffers = 2 : i32, packet_id = 3 : i32, release_lock_id = 1 : i32, tile_index = 0 : i32}]}
-        %26 = dfschedule.declare_kernel_config @kernelconfig1 {tile_configs = [{acquire_lock_id = 0 : i32, buffer_mode = 1 : i32, buffer_offset = 64 : i32, buffer_size = 64 : i32, dma_channel = 0 : i32, element_size = 1 : i32, flow_index = 1 : i32, num_buffers = 2 : i32, packet_id = 4 : i32, release_lock_id = 1 : i32, tile_index = 1 : i32}]}
         %27 = dfschedule.config.load_kernel_group(%7, %16) {
           callee = [@dskernel_receiver],
-          distributed_compute_kernel_args = [@compute0, @compute0],
-          distributed_args = [@kernelconfig0, @kernelconfig1]
+          distributed_compute_kernel_args = [@compute0, @compute0]
         } : (!dfschedule.tile, !dfschedule.tile) -> !dfschedule.kernelgroup
         %28 = dfschedule.schedule.launch_kernel_group(%27) : (!dfschedule.kernelgroup) -> !dfschedule.event
         %29 = dfschedule.schedule.getbdid(%3) : (!dfschedule.tile) -> i32

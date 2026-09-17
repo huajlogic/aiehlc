@@ -126,8 +126,7 @@ These ops are produced by the two passes. Source: `pass/unitest/ir/dfschedule/5_
 | `dfschedule.config.create_io` | `!dfschedule.io_handle` | Creates an IO channel: BD handle, tile, channel, direction (MM2S/S2MM), operation (SEND/RECV) |
 | `dfschedule.schedule.getbdid` | `i32` | Retrieves the runtime BD ID for a tile |
 | `dfschedule.schedule.start_io` | `!dfschedule.event` | Starts a DMA IO channel, returns an event |
-| `dfschedule.declare_kernel_config` | `!dfschedule.kernel_config` | Declares per-tile kernel config dict (tile_index, flow_index, packet_id, buffer_size, lock IDs, etc.) |
-| `dfschedule.config.load_kernel_group` | `!dfschedule.kernelgroup` | Loads a kernel onto a set of tiles, with callee symbol and distributed_args |
+| `dfschedule.config.load_kernel_group` | `!dfschedule.kernelgroup` | Loads a kernel onto a set of tiles, with callee symbols (per-tile DMA/lock/buffer config is materialized by the BD/lock/start_io ops, not a separate metadata op) |
 | `dfschedule.schedule.launch_kernel_group` | `!dfschedule.event` | Launches the kernel group, returns an event |
 | `dfschedule.schedule.wait` | void | Waits for multiple events (kernel + shim IO) |
 | `dfschedule.free_device_mem` | void | Frees the DDR allocation |
@@ -216,29 +215,15 @@ BD ID and lock ID allocation is delegated to `ResourceMgr` (`hw/ResourceManager.
 
 Per-tile data slices come from `flowconfig.slice_symbols` which index into the `DataSliceOp` table.
 
-#### Step 4 — Kernel config and group launch
+#### Step 4 — Kernel group launch
 
 After all core tiles are processed:
 
 ```
-dfschedule.declare_kernel_config @kernelconfig0 {
-  tile_configs = [{
-    tile_index=0, flow_index=0, packet_id=0, dma_channel=0,
-    buffer_mode=1, num_buffers=2, buffer_size=64, buffer_offset=0,
-    element_size=1, acquire_lock_id=0, release_lock_id=1
-  }]
-}
-dfschedule.declare_kernel_config @kernelconfig1 {
-  tile_configs = [{
-    tile_index=1, flow_index=0, packet_id=1, dma_channel=0,
-    buffer_mode=1, num_buffers=2, buffer_size=64, buffer_offset=64,
-    element_size=1, acquire_lock_id=0, release_lock_id=1
-  }]
-}
 dfschedule.config.load_kernel_group(tile0, tile1) {
   callee=[@dskernel_receiver],
-  distributed_compute_kernel_args=[@compute0, @compute0],
-  distributed_args=[@kernelconfig0, @kernelconfig1]
+  distributed_compute_kernel_args=[@compute0, @compute0]
+  // distributed_args left null
 }
 dfschedule.schedule.launch_kernel_group(kernel_group)     → kernel_event
 dfschedule.schedule.getbdid(shim_tile)
@@ -247,7 +232,11 @@ dfschedule.schedule.wait(kernel_event, shim_event)
 dfschedule.free_device_mem(ddr_buffer)
 ```
 
-`buffer_offset` encodes the logical byte offset within the partitioned tensor for each tile (0 for tile 0, 64 for tile 1 with a 64-byte partition).
+The per-tile DMA/lock/buffer parameters (packet id, channel, buffer offset/size,
+lock IDs, etc.) are carried directly by the `config.dma_bd`, lock-init, and
+`start_io` ops emitted in Step 3. The former `dfschedule.declare_kernel_config`
+metadata ops and the `load_kernel_group.distributed_args` distribution were pure
+metadata (never lowered to runtime code) and have been removed.
 
 #### Step 5 — `dskernel_receiver` stub
 
@@ -375,7 +364,7 @@ arith::ConstantOp, memref::AllocOp
 | `flowconfig @f {type="core"}` | `declaretile` + `memref_mapping` + `bind_core_buffer(ping)` + `bind_core_buffer(pong)` + `config.dma_bd(pong)` + `config.dma_bd(ping, linked=pong)` + `config.create_io` + `schedule.getbdid` + `schedule.start_io` | Host |
 | `flowconfig @f {type="shim"}` | erased (kernel pass ignores shim) | Kernel |
 | `flowconfig @f {type="core"}` | `declaretile` + `memref.alloc` + `config.dma_bd` + `config.create_io` + `schedule.getbdid` + `schedule.start_io` | Kernel |
-| `flow_transfer @t` | `declare_kernel_config(×N)` + `config.load_kernel_group` + `schedule.launch_kernel_group` + `schedule.getbdid(shim)` + `schedule.start_io(shim)` + `schedule.wait` + `free_device_mem` + `dskernel_receiver {}` (stub) | Host |
+| `flow_transfer @t` | `config.load_kernel_group` + `schedule.launch_kernel_group` + `schedule.getbdid(shim)` + `schedule.start_io(shim)` + `schedule.wait` + `free_device_mem` + `dskernel_receiver {}` (stub) | Host |
 | `flow_transfer @t` | `dfschedule.module @kernel_driver_dskernel_receiver { ... }` | Kernel |
 
 ---
@@ -402,13 +391,11 @@ For each `flow_transfer`, in-place in the same `scf.execute_region`:
 1. Shim tile (2,0): `alloc_device_mem` → 128-byte DDR buf → `buffer_view(offset=0, len=128)` → `config.dma_bd(channel=0, S2MM, packet_id=0)` → `create_io(RECV)`
 2. Core tile (0,3): `bind_core_buffer(ping, offset=0)` + `bind_core_buffer(pong, offset=64)` → pong BD (bd_id=1, next_bd=0, packet_id=0) + ping BD (bd_id=0, next_bd=1, packet_id=0, linked=pong) → `create_io(MM2S, SEND)` → `getbdid` → `start_io(flow_index=0)`
 3. Core tile (1,3): same pattern, packet_id=1, bd_ids=0/1 (fresh per-tile allocation)
-4. `declare_kernel_config @kernelconfig0` (tile_index=0, buffer_offset=0, packet_id=0)
-5. `declare_kernel_config @kernelconfig1` (tile_index=1, buffer_offset=64, packet_id=1)
-6. `load_kernel_group(tile(0,3), tile(1,3))` {callee=[@dskernel_receiver], distributed_args=[@kernelconfig0, @kernelconfig1]}
-7. `launch_kernel_group` → kernel_event
-8. `getbdid(shim_tile)` → `start_io(shim_io, flow_index=0)` → shim_event
-9. `schedule.wait(kernel_event, shim_event)`
-10. `free_device_mem(ddr_buf)`
+4. `load_kernel_group(tile(0,3), tile(1,3))` {callee=[@dskernel_receiver]} (distributed_args null)
+5. `launch_kernel_group` → kernel_event
+6. `getbdid(shim_tile)` → `start_io(shim_io, flow_index=0)` → shim_event
+7. `schedule.wait(kernel_event, shim_event)`
+8. `free_device_mem(ddr_buf)`
 
 **Flow 1 (partition 1, tiles at row 4):** identical structure, using `channel=1` for the shim, `flow_index=1`.
 

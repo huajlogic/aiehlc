@@ -488,45 +488,8 @@ void DfscheduleProvenanceMapPass::runOnOperation() {
         tileDataMap[key].dmaChannels.push_back(io);
     }
 
-    // === Collect kernel configs ===
+    // === Kernel configs (kept empty: DeclareKernelConfigOp removed from pipeline) ===
     std::vector<KernelConfigEntry> kernelConfigs;
-    hostBlock->walk([&](DeclareKernelConfigOp kcOp) {
-        auto tileConfigsAttr = kcOp.getTileConfigs();
-        for (auto cfgAttr : tileConfigsAttr) {
-            auto dict = dyn_cast<DictionaryAttr>(cfgAttr);
-            if (!dict)
-                continue;
-
-            KernelConfigEntry kc;
-            kc.symName = kcOp.getSymName().str();
-            if (auto a = dict.getAs<IntegerAttr>("flow_index"))
-                kc.flowIndex = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("packet_id"))
-                kc.packetId = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("dma_channel"))
-                kc.dmaChannel = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("buffer_mode"))
-                kc.bufferMode = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("num_buffers"))
-                kc.numBuffers = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("acquire_lock_id"))
-                kc.acquireLockId = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("release_lock_id"))
-                kc.releaseLockId = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("buffer_offset"))
-                kc.bufferOffset = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("buffer_size"))
-                kc.bufferSize = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("element_size"))
-                kc.elementSize = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("num_iterations"))
-                kc.numIterations = a.getInt();
-            if (auto a = dict.getAs<IntegerAttr>("tile_index"))
-                kc.tileIndex = a.getInt();
-
-            kernelConfigs.push_back(kc);
-        }
-    });
 
     // === Collect load_kernel_group ===
     LoadKernelGroupInfo loadKgInfo;

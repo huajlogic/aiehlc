@@ -1931,20 +1931,6 @@ struct ScheduleWaitInnerPattern : public OpConversionPattern<dfschedule::Schedul
     }
 };
 
-/// OpConversionPattern for dfschedule.declare_kernel_config
-/// This is metadata-only, so just erase it
-struct DeclareKernelConfigInnerPattern : public OpConversionPattern<dfschedule::DeclareKernelConfigOp> {
-    using OpConversionPattern<dfschedule::DeclareKernelConfigOp>::OpConversionPattern;
-    
-    LogicalResult matchAndRewrite(dfschedule::DeclareKernelConfigOp op, OpAdaptor adaptor,
-                                  ConversionPatternRewriter &rewriter) const override {
-        llvm::errs() << "[Pattern] DeclareKernelConfig - erasing (metadata only)\n";
-        // This operation is pure metadata, it doesn't generate any runtime code
-        rewriter.eraseOp(op);
-        return success();
-    }
-};
-
 /// OpConversionPattern for dfschedule.config.load_kernel_group
 /// Converts LoadKernelGroup to __Runtime_load_kernel_group call
 /// struct kernel_group = __Runtime_load_kernel_group(tiles, callee_symbols, compute_args, kernel_config);
@@ -1966,71 +1952,7 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         
         // Get attributes
         auto calleeAttr = op.getCalleeAttr();
-        auto distributedArgsAttr = op.getDistributedArgsAttr();
-
         llvm::errs() << "  Callee array: " << calleeAttr << "\n";
-
-        if (distributedArgsAttr) {
-            llvm::errs() << "  Using distributed_args (kernel config symbols): " << distributedArgsAttr << "\n";
-            
-            auto moduleOp = op->getParentOfType<ModuleOp>();
-            
-            // Iterate through distributed_args to extract config for each tile
-            for (size_t i = 0; i < distributedArgsAttr.size(); ++i) {
-                auto symRef = mlir::cast<SymbolRefAttr>(distributedArgsAttr[i]);
-                llvm::errs() << "  Tile[" << i << "] config symbol: " << symRef << "\n";
-                
-                // Look up the kernel_config op
-                auto configOp = moduleOp.lookupSymbol<dfschedule::DeclareKernelConfigOp>(
-                    symRef.getRootReference());
-                
-                if (!configOp) {
-                    llvm::errs() << "    ERROR: Could not find kernel_config symbol\n";
-                    continue;
-                }
-                
-                // Extract tile_configs array (should have exactly one entry per config op)
-                auto tileConfigsAttr = configOp.getTileConfigs();
-                if (tileConfigsAttr.size() == 0) {
-                    llvm::errs() << "    ERROR: Empty tile_configs in kernel_config\n";
-                    continue;
-                }
-                
-                auto configDict = mlir::cast<DictionaryAttr>(tileConfigsAttr[0]);
-                
-                // Extract and log all config fields
-                uint32_t tileIndex = mlir::cast<IntegerAttr>(configDict.get("tile_index")).getInt();
-                uint8_t packetId = mlir::cast<IntegerAttr>(configDict.get("packet_id")).getInt();
-                uint32_t dmaChannel = mlir::cast<IntegerAttr>(configDict.get("dma_channel")).getInt();
-                uint8_t bufferMode = mlir::cast<IntegerAttr>(configDict.get("buffer_mode")).getInt();
-                uint8_t numBuffers = mlir::cast<IntegerAttr>(configDict.get("num_buffers")).getInt();
-                uint32_t bufferSize = mlir::cast<IntegerAttr>(configDict.get("buffer_size")).getInt();
-                uint64_t bufferOffset = mlir::cast<IntegerAttr>(configDict.get("buffer_offset")).getInt();
-                uint8_t elementSize = mlir::cast<IntegerAttr>(configDict.get("element_size")).getInt();
-                // Use null-safe reads: passblueprinttoschedule writes "acquire_lock_id" / "release_lock_id"
-                // (single pair, no ping/pong prefix). The old ping/pong keys do not exist.
-                uint32_t acquireLockId = 0, releaseLockId = 0;
-                if (auto a = configDict.get("acquire_lock_id"))
-                    acquireLockId = mlir::cast<IntegerAttr>(a).getInt();
-                if (auto r = configDict.get("release_lock_id"))
-                    releaseLockId = mlir::cast<IntegerAttr>(r).getInt();
-
-                llvm::errs() << "    Config: "
-                             << "tile_index=" << tileIndex << ", packet_id=" << (int)packetId
-                             << ", dma_channel=" << dmaChannel << ", buffer_mode=" << (int)bufferMode
-                             << ", num_buffers=" << (int)numBuffers << ", buffer_size=" << bufferSize
-                             << ", buffer_offset=" << bufferOffset << ", element_size=" << (int)elementSize
-                             << ", acq_lock=" << acquireLockId << ", rel_lock=" << releaseLockId << "\n";
-            }
-            
-            // NOTE: In the future, this would generate arrays of config values
-            // and pass them to __Runtime_load_kernel_group(tiles, num_tiles, configs[])
-            // For now, the simple call below is a placeholder
-            
-        } else {
-            llvm::errs() << "  ERROR: No distributed_args provided\n";
-            return failure();
-        }
 
         // Collect core tile debug info for snapshot
         if (state.enableDebug) {
@@ -3403,10 +3325,7 @@ void DfscheduleToApiPass::runOnOperation() {
     
     // LoadKernelGroupOp loads and configures kernel groups (benefit = 2)
     innerPatterns.add<LoadKernelGroupInnerPattern>(typeConverter, ctx, state, /*benefit=*/2);
-    
-    // DeclareKernelConfigOp is just metadata (benefit = 5, run early)
-    innerPatterns.add<DeclareKernelConfigInnerPattern>(typeConverter, ctx, /*benefit=*/5);
-    
+
     // LaunchKernelGroupOp depends on LoadKernelGroupOp (benefit = 1)
     innerPatterns.add<LaunchKernelGroupInnerPattern>(typeConverter, ctx, state, /*benefit=*/1);
 
@@ -3470,7 +3389,6 @@ void DfscheduleToApiPass::runOnOperation() {
     innerTarget.addIllegalOp<dfschedule::BufferViewOp>();
     innerTarget.addIllegalOp<dfschedule::BindCoreBufferOp>();
     innerTarget.addIllegalOp<dfschedule::FreeDeviceMemOp>();
-    innerTarget.addIllegalOp<dfschedule::DeclareKernelConfigOp>();
     innerTarget.addIllegalOp<UnrealizedConversionCastOp>();
 
     // DDR init chain ops moved into dfschedule.host by ScheduleCanonicalizePass.

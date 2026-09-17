@@ -356,10 +356,9 @@ void BlueprintToSchedulePass::runOnOperation() {
     }
 
     // Region restructuring is deferred to ScheduleCanonicalizePass.
-    // The dfschedule ops remain inside routing.RoutingCreate bodies, which is
-    // valid because RoutingCreate has the SymbolTable trait needed by
-    // DeclareKernelConfigOp.  ScheduleCanonicalizePass will extract them into
-    // per-partition scf.execute_region blocks and erase the routing ops.
+    // The dfschedule ops remain inside routing.RoutingCreate bodies;
+    // ScheduleCanonicalizePass will extract them into per-partition
+    // scf.execute_region blocks and erase the routing ops.
 }
 
 } // namespace mlir

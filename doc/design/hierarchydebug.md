@@ -128,7 +128,7 @@ The dfschedule IR is the final host-side representation before EmitC. It contain
 | `tiles[].dma_channels[]` | `ConfigCreateIoOp` | Per-channel: direction, enable_ooo, BD chain |
 | `tiles[].dma_channels[].bd_chain[]` | `ConfigDmaBdOp` chain | BD id, len, lock, packet, next_bd, ooo, dim/iter |
 | `tiles[].dma_channels[].start_io[]` | `StartIoOp` | repeat count, scf.for context |
-| `kernel_configs[]` | `DeclareKernelConfigOp` | buffer size, lock IDs, iteration count per tile |
+| `kernel_configs[]` | (removed) | Always empty — `DeclareKernelConfigOp` is no longer emitted; per-tile buffer/lock/iteration info comes from the BD/lock/start_io sections above |
 | `load_kernel_group` | `LoadKernelGroupOp` | kernel binary + target tiles |
 | `flow_summary[]` | Grouped `StartIoOp` entries | All tiles participating in each flow |
 | `invariant_checks[]` | Computed | Ping-pong chain cycle, lock symmetry |

@@ -675,16 +675,26 @@ void dfschedule::LoadKernelGroupOp::print(::mlir::OpAsmPrinter &printer) {
         printer << tile;
     });
     printer << ") {";
-    
-    // Print attributes with proper indentation
+
+    // Print attributes with proper indentation. kernel_config and
+    // distributed_args are OptionalAttr: skip them when absent, otherwise
+    // printAttribute() would be handed a null Attribute and assert.
     printer.increaseIndent();
     printer.printNewline();
     printer << "callee = ";
     printer.printAttribute(getCalleeAttr());
-    printer << ",";
-    printer.printNewline();
-    printer << "distributed_args = ";
-    printer.printAttribute(getDistributedArgsAttr());
+    if (auto kernelConfigAttr = getKernelConfigAttr()) {
+        printer << ",";
+        printer.printNewline();
+        printer << "kernel_config = ";
+        printer.printAttribute(kernelConfigAttr);
+    }
+    if (auto distributedArgsAttr = getDistributedArgsAttr()) {
+        printer << ",";
+        printer.printNewline();
+        printer << "distributed_args = ";
+        printer.printAttribute(distributedArgsAttr);
+    }
     printer.decreaseIndent();
     printer.printNewline();
     printer << "} ";

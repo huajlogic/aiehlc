@@ -296,12 +296,10 @@ struct FlowLoweringCtx {
     bool isInput = false;
     int funcArgIdx = -1;
     int dirIdx = 0;
-    SmallVector<Attribute> tileConfigDicts;
     SmallVector<DeferredCoreStartIo> deferredCoreStartIos;
     int tileIndex = 0;
 
     // --- kernel_config finalize + schedule ---
-    SmallVector<Attribute> kernelConfigSymbols;
     SmallVector<Attribute> calleeAttrs;
     TilingClassification classification;
     bool needsOuterLoop = false;
