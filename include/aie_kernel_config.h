@@ -30,6 +30,7 @@
 #define AIE_KC_DMA_BD_STRIDE 0x20u    /* per-BD IdxOffset */
 #define AIE_KC_DMA_BD_NUM_WORDS 6u    /* XAIEML_TILEDMA_NUM_BD_WORDS */
 #define AIE_KC_S2MM0_START_Q 0x1DE04u /* MEMORY_MODULE_DMA_S2MM_0_START_QUEUE */
+#define AIE_KC_MM2S0_START_Q 0x1DE14u /* MEMORY_MODULE_DMA_MM2S_0_START_QUEUE */
 #define AIE_KC_DMA_CH_STRIDE 0x8u     /* per-channel ChIdxOffset */
 #define AIE_KC_LOCK0_VALUE 0x1F000u   /* MEMORY_MODULE_LOCK0_VALUE */
 #define AIE_KC_LOCK_STRIDE 0x10u      /* per-lock */
@@ -122,13 +123,29 @@ static inline int aie_kc_encode_lock(AieKcReg *out, uint8_t lock_id, int value) 
     return 1;
 }
 
+/* Start-queue value: start bd id [3:0] | (repeat-1) [23:16] | en-token [31].
+ * S2MM_0_START_QUEUE and MM2S_0_START_QUEUE have identical layouts (both
+ * MASK 0x80FF000F), so both directions share this; only the base offset
+ * differs. Mirrors _XAie_DmaChannelSetStartQueuePrepare. */
+static inline uint32_t aie_kc_start_q_val(uint8_t start_bd, uint32_t repeat, int en_token) {
+    return aie_kc_field((uint32_t)start_bd, 0u, 0x0000000Fu) | aie_kc_field(repeat - 1u, 16u, 0x00FF0000u) |
+           aie_kc_field(en_token ? 1u : 0u, 31u, 0x80000000u);
+}
+
 /* Encode an S2MM channel start-queue write (S2MM_0_START_QUEUE + ch*0x8).
- * Mirrors _XAie_DmaChannelSetStartQueuePrepare: start bd id | (repeat-1) |
- * enable-token-issue. Returns 1. */
+ * Returns 1. */
 static inline int aie_kc_encode_s2mm_start(AieKcReg *out, uint8_t ch, uint8_t start_bd, uint32_t repeat, int en_token) {
     out[0].off = AIE_KC_S2MM0_START_Q + (uint32_t)ch * AIE_KC_DMA_CH_STRIDE;
-    out[0].val = aie_kc_field((uint32_t)start_bd, 0u, 0x0000000Fu) | aie_kc_field(repeat - 1u, 16u, 0x00FF0000u) |
-                 aie_kc_field(en_token ? 1u : 0u, 31u, 0x80000000u);
+    out[0].val = aie_kc_start_q_val(start_bd, repeat, en_token);
+    return 1;
+}
+
+/* Encode an MM2S channel start-queue write (MM2S_0_START_QUEUE + ch*0x8).
+ * Same value layout as S2MM; this is what lets the core arm its own OUTGOING
+ * DMA under KERNELCONFIGOFFLOAD. Returns 1. */
+static inline int aie_kc_encode_mm2s_start(AieKcReg *out, uint8_t ch, uint8_t start_bd, uint32_t repeat, int en_token) {
+    out[0].off = AIE_KC_MM2S0_START_Q + (uint32_t)ch * AIE_KC_DMA_CH_STRIDE;
+    out[0].val = aie_kc_start_q_val(start_bd, repeat, en_token);
     return 1;
 }
 

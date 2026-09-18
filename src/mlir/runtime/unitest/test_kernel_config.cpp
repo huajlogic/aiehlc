@@ -202,6 +202,19 @@ int main(void) {
         fprintf(stderr, "FAIL: XAie_DmaChannelSetStartQueue rc=%d\n", (int)rc);
         return 1;
     }
+    // Golden #3b: MM2S channel start queue — the core arming its own OUTGOING DMA
+    // under KERNELCONFIGOFFLOAD. Deliberately a DIFFERENT channel and bd than the
+    // S2MM case above: S2MM ch0 and MM2S ch0 would land on offsets 0x1DE04/0x1DE14,
+    // and reusing ch/bd would let a wrong base offset or a wrong ch stride still
+    // pass by aliasing onto the S2MM expectation.
+    const uint8_t mm2s_ch = 1;
+    const uint8_t mm2s_bd = 3;
+    const uint32_t mm2s_repeat = 2;
+    rc = XAie_DmaChannelSetStartQueue(&dev_inst, loc, mm2s_ch, DMA_MM2S, mm2s_bd, mm2s_repeat, XAIE_DISABLE);
+    if (rc != XAIE_OK) {
+        fprintf(stderr, "FAIL: XAie_DmaChannelSetStartQueue (MM2S) rc=%d\n", (int)rc);
+        return 1;
+    }
 
     uint8_t *txn = XAie_ExportSerializedTransaction(&dev_inst, 1, 0);
     if (!txn) {
@@ -236,11 +249,15 @@ int main(void) {
     int nsq = aie_kc_encode_s2mm_start(sq, ch, bd_id, repeat, /*en_token=*/0);
     bad += diff_regs("S2MM start queue", sq, nsq, writes);
 
+    AieKcReg mq[1];
+    int nmq = aie_kc_encode_mm2s_start(mq, mm2s_ch, mm2s_bd, mm2s_repeat, /*en_token=*/0);
+    bad += diff_regs("MM2S start queue", mq, nmq, writes);
+
     if (bad != 0) {
         fprintf(stderr, "FAIL: %d encoder/golden mismatches\n", bad);
         return 1;
     }
     printf("PASS: standalone encoder is byte-identical to aie-rt golden "
-           "(BD + lock + channel-start)\n");
+           "(BD + lock + S2MM/MM2S channel-start)\n");
     return 0;
 }

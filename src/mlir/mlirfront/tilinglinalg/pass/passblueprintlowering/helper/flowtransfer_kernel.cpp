@@ -506,18 +506,66 @@ LogicalResult FlowTransferConversion::emitCoreBufferDma(FlowLoweringCtx &c, Core
                         t.coreOooBdId = c.shimPerTileBdIds[idx];
                 }
 
+                // KERNELCONFIGOFFLOAD: publish this tile's config so the kernel path
+                // can emit the core's self-programming block. Everything above is
+                // per-tile and, for MM2S, NOT uniform across tiles: packetId is
+                // basePacketId+tileIndex and oooBdId comes from shim-side allocation,
+                // neither of which the kernel module clone can recompute. Recorded
+                // here, at the one point where all of it is known.
+                //
+                // Written through ResourceMgr::instance(), NOT the pass-local
+                // `resourceMgr` — only the singleton crosses the host/kernel clone
+                // boundary (same channel coreMemAllocator uses).
+                if (passState && passState->kernelConfigOffload && t.row >= kOffloadCoreRowMin) {
+                    CoreOffloadTileConfig cfg;
+                    cfg.col = (int)t.col;
+                    cfg.row = (int)t.row;
+                    cfg.isOutput = t.isOutputFlow;
+                    cfg.channel = (int)c.coreChannel;
+                    cfg.packetId = t.coreBdPacketId;
+                    cfg.enablePacket = t.coreBdEnablePacket;
+                    cfg.oooBdId = t.coreOooBdId;
+                    cfg.bdLenBytes = (int)t.coreBdLen;
+                    cfg.ppDepth = (int)t.ppDepth;
+                    cfg.flowIndex = c.flowIndex;
+                    try {
+                        ResourceMgr::instance()->addCoreOffloadTile(cfg);
+                    } catch (...) {
+                        // instance() throws if init() was never called (unit tests that
+                        // drive this pass standalone). The plan is only consumed under
+                        // the offload pragma, so degrade quietly rather than abort.
+                    }
+                    llvm::errs() << "[KernelConfigOffload] plan tile=(" << cfg.col << "," << cfg.row << ")"
+                                 << " dir=" << (cfg.isOutput ? "MM2S" : "S2MM") << " ch=" << cfg.channel
+                                 << " pktId=" << cfg.packetId << " oooBd=" << cfg.oooBdId << " len=" << cfg.bdLenBytes
+                                 << " ppDepth=" << cfg.ppDepth << "\n";
+                }
+
                 // KERNELCONFIGOFFLOAD: when on, the AIE core self-programs its own
-                // incoming (S2MM) DMA — BD chain, lock inits, channel start — from
-                // kernel.cc via raw MMIO (passdfscheduletokernelapi emitS2mmConfigBlock).
-                // So the host must NOT emit the S2MM core-tile DMA chain. Skip the BD +
-                // create_io + deferred start_io for INPUT (S2MM) core tiles (row >=
-                // kOffloadCoreRowMin, excluding memtiles). MM2S (output) core BDs stay
-                // host-side — deferred, no core-position intrinsic yet. Lock inits ride
-                // on the ConfigDmaBdOp, so skipping the BD also drops them.
-                constexpr int64_t kOffloadCoreRowMin = 2;
-                bool offloadSkipS2mm =
-                    passState && passState->kernelConfigOffload && c.isInput && t.row >= kOffloadCoreRowMin;
-                if (!offloadSkipS2mm) {
+                // DMA — BD chain, lock inits, channel start — from kernel.cc via raw
+                // MMIO (passdfscheduletokernelapi emitCoreDmaConfigBlocks), in BOTH
+                // directions. So the host must NOT emit the core-tile DMA chain. Skip
+                // the BD + create_io + deferred start_io. Lock inits ride on the
+                // ConfigDmaBdOp, so skipping the BD also drops them.
+                //
+                // The flow-level policy is decided by the orchestrator as
+                // c.offloadCoreDmaConfig; only the per-tile row test is applied here,
+                // where the row is known: rows below kOffloadCoreRowMin are
+                // shim/memtiles with no core to run the offloaded block.
+                bool offloadSkipCoreDma = c.offloadCoreDmaConfig && t.row >= kOffloadCoreRowMin;
+                if (offloadSkipCoreDma) {
+                    // Skipping emission must NOT skip accounting. The BD ids the core
+                    // self-programs come from KernelResourceManager on the kernel module
+                    // clone, but the hardware BD bank is shared per tile, and the host
+                    // allocates out of this per-tile pool starting at the first free id.
+                    // Claim the ids the kernel will use here — allocate and discard — so
+                    // the host cannot hand the same BD to two owners.
+                    reserveOffloadedCoreBds(c, t);
+                    llvm::errs() << "[KernelConfigOffload] skip host core DMA config dir="
+                                 << (t.isOutputFlow ? "MM2S" : "S2MM")
+                                 << " flowIdx=" << c.flowIndex << " tile=(" << t.col << "," << t.row << ")\n";
+                }
+                if (!offloadSkipCoreDma) {
                     if (t.ppDepth == 1) {
                         emitCoreSingleBufferBd(c, t);
                     } else {
@@ -616,6 +664,52 @@ void FlowTransferConversion::emitCoreBufferAlloc(FlowLoweringCtx &c, CoreTileCtx
     if (c.flowAddrsValid) {
         t.pingL1Offset = c.flowPingL1Offset;
         t.pongL1Offset = c.flowPongL1Offset;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// reserveOffloadedCoreBds — KERNELCONFIGOFFLOAD accounting-only counterpart of
+// emitCoreSingleBufferBd / emitCorePingPongBd.
+// ---------------------------------------------------------------------------
+// The core self-programs these BDs from kernel.cc, so the host emits no op for
+// them — but the BD bank is per-tile hardware shared with any flow the host DOES
+// still program on this tile. allocateTileBd() hands out the first free id, so
+// without this the host would reissue the very ids the core is using.
+//
+// Allocation COUNT must mirror what the KERNEL claims, not what the host emitter
+// would have claimed. Those differ: analyzeKernelParams (passblueprinttoschedulekernel)
+// advances its per-window BD counter TWICE for every window unconditionally — a
+// single-buffer window still burns its pong slot to keep window i at bd 2*i/2*i+1 —
+// whereas emitCoreSingleBufferBd would have taken only one. So reserve 2 per tile
+// here even when ppDepth==1, or the kernel's ping id for the next window lands on a
+// BD the host thinks is free. The ids themselves are discarded; only the count and
+// the resulting high-water mark matter.
+//
+// The counts line up because the kernel dedups windows by `declare_data` while the
+// host reserves once per (FlowTransferOp, tile) visit, and every physical core tile
+// is visited by exactly one FlowTransferOp per logical port (tile groups are
+// disjoint). Nothing asserts that invariant. If it ever breaks — two FlowTransferOps
+// sharing a declare_data AND landing on the same tile — the host OVER-reserves while
+// the kernel still burns 2, which wastes pool capacity and eventually trips the loud
+// warning below. That direction is safe; the dangerous direction (under-reserving,
+// which would silently alias a BD) cannot arise from that shape.
+void FlowTransferConversion::reserveOffloadedCoreBds(FlowLoweringCtx &c, CoreTileCtx &t) const {
+    if (!resourceMgr)
+        return;
+
+    constexpr int kKernelBdsPerWindow = 2;
+    for (int i = 0; i < kKernelBdsPerWindow; ++i) {
+        auto bd = resourceMgr->allocateTileBd(t.row, t.col, /*ownerId=*/c.flowIndex);
+        if (!bd) {
+            // Pool exhausted. Emission would have hit the same wall and silently
+            // fallen back to bd 0/1, so say so rather than leaving a quiet alias.
+            llvm::errs() << "WARNING: [KernelConfigOffload] BD reservation failed for tile (" << t.col << "," << t.row
+                         << ") flowIdx=" << c.flowIndex << "; host-programmed BDs on this tile may collide with the"
+                         << " core's self-programmed BDs\n";
+            break;
+        }
+        llvm::errs() << "[KernelConfigOffload] reserve core BD id=" << *bd << " tile=(" << t.col << "," << t.row
+                     << ") flowIdx=" << c.flowIndex << " (self-programmed by kernel.cc)\n";
     }
 }
 

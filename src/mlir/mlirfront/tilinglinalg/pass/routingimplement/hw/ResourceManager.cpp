@@ -746,6 +746,22 @@ std::optional<int> ResourceMgr::allocateTileBd(int row, int col, int ownerId) {
     return tile(row, col).allocateBd(ownerId);
 }
 
+// ──────────────────────────────────────────────────────────────
+// KERNELCONFIGOFFLOAD per-tile plan (host path -> kernel path)
+// ──────────────────────────────────────────────────────────────
+void ResourceMgr::addCoreOffloadTile(const CoreOffloadTileConfig &cfg) {
+    // Upsert on (col,row,direction). The host walks a tile once per flow, but a
+    // re-walk must refresh rather than append — a duplicated tile would emit a
+    // second, contradictory arm of the kernel-side dispatch.
+    for (auto &e : coreOffloadPlan_) {
+        if (e.col == cfg.col && e.row == cfg.row && e.isOutput == cfg.isOutput) {
+            e = cfg;
+            return;
+        }
+    }
+    coreOffloadPlan_.push_back(cfg);
+}
+
 bool ResourceMgr::releaseTileBd(int row, int col, int bdId, int ownerId) {
     if (row < 0 || row >= rows() || col < 0 || col >= cols())
         return false;

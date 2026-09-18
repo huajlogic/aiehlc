@@ -493,6 +493,30 @@ class CoreMemAllocator {
     std::vector<CoreMemSlot> allocations_;
 };
 
+// One core tile's self-programmed DMA config under #pragma KERNELCONFIGOFFLOAD.
+//
+// Why this lives on ResourceMgr and not in the IR: the host and kernel paths run
+// over two independent module clones, so the kernel pass cannot see what the host
+// pass computed. `oooBdId` in particular is derived from SHIM-side BD allocation
+// and is not recoverable on the kernel clone at all. ResourceMgr::instance() is
+// the existing channel between the two (coreMemAllocator already rides it).
+//
+// Populated by the host path (helper/flowtransfer_kernel.cpp) while it walks core
+// tiles; consumed by the kernel path (passblueprinttoschedulekernel) to build the
+// per-tile dispatch kernel.cc needs. One entry per (col,row,direction) pair.
+struct CoreOffloadTileConfig {
+    int col = -1;
+    int row = -1;
+    bool isOutput = false; // false = S2MM (input), true = MM2S (output)
+    int channel = 0;       // core-tile DMA channel for this direction
+    int packetId = 0;      // MM2S only; 0 for S2MM (circuit-switched)
+    bool enablePacket = false;
+    int oooBdId = -1; // MM2S only: shim S2MM BD this tile's data targets
+    int bdLenBytes = 0;
+    int ppDepth = 1;
+    int flowIndex = -1;
+};
+
 class ResourceMgr {
 public:
   ResourceMgr(std::unique_ptr<IHwResource> resource, ::TileType defaultType = ::TileType::Core);
@@ -547,6 +571,17 @@ public:
 
   // Core memory allocator (shared for all tiles using same kernel binary)
   CoreMemAllocator &coreMemAllocator() { return coreMemAllocator_; }
+
+  // KERNELCONFIGOFFLOAD per-tile plan. Written by the host path, read by the
+  // kernel path — the two run on separate module clones, so this singleton is
+  // the only channel between them. MUST be reached via ResourceMgr::instance():
+  // BlueprintToSchedulePass holds its own local ResourceMgr for BD/lock
+  // allocation, and writing the plan there would strand it.
+  std::vector<CoreOffloadTileConfig> &coreOffloadPlan() { return coreOffloadPlan_; }
+  const std::vector<CoreOffloadTileConfig> &coreOffloadPlan() const { return coreOffloadPlan_; }
+  // Record one tile+direction. Later writes for the same (col,row,isOutput)
+  // overwrite, so a re-walked flow refreshes rather than duplicates.
+  void addCoreOffloadTile(const CoreOffloadTileConfig &cfg);
 
   // Register shim column, channel, and direction to ioId mapping
   void registerShimChannelMapping(int shimCol, int channel, DMADIRECTION direction, int ioId);
@@ -628,6 +663,8 @@ private:
   std::unique_ptr<IHwResource> resource_;
   std::unordered_map<int, std::shared_ptr<DataIO>> DataIOMap;
   CoreMemAllocator coreMemAllocator_; // Shared core memory allocator for BCF generation
+  // KERNELCONFIGOFFLOAD per-tile DMA plan, host path -> kernel path.
+  std::vector<CoreOffloadTileConfig> coreOffloadPlan_;
 
   // Hash function for (shimCol, channel, direction) tuple
   struct ShimChannelDirHash {

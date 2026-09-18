@@ -2518,9 +2518,11 @@ class DebugState:
             board = None
         else:
             user = os.environ.get("USERNAME") or getpass.getuser()
-            palip = os.environ.get("PALIP")
-            if not palip:
-                raise RuntimeError("PALIP not set in daemon environment")
+            # Same fixed fallback the Connect probe uses (_pal_ip), so the
+            # "start hw_server" button and Connect always agree on which board
+            # they mean. Previously this hard-failed with "PALIP not set" while
+            # Connect silently probed a placeholder address.
+            palip = _pal_ip()
             ssh_target = f"{user}@{palip}"
             systest = "/bin/systest"
             board = os.environ.get("BOARDNAME", "palmyra")
@@ -5571,17 +5573,35 @@ def _hwsrv_drain(child):
         pass
 
 
+# The PAL board's JTAG host. Fixed, because the "pal" device selection names one
+# specific board — unlike vek385, whose hostname the user types into the UI.
+#
+# This used to fall back to the literal string "xx.xx.xx.213" when $PALIP was
+# unset, which is a placeholder, not an address: the browser's Connect probe
+# emitted `connect -url TCP:xx.xx.xx.213:3121` and failed at DNS before opening a
+# socket. $PALIP still wins when it is set (script/test/envlocal.sh exports it,
+# as do apppaltest.py / aiedbg's connecttest.py), so a farm move only needs the
+# env var — but with it unset, Connect now works out of the box.
+PAL_DEFAULT_IP = "10.23.224.213"
+
+
+def _pal_ip():
+    """JTAG host for the 'pal' device: $PALIP if set and non-empty, else the
+    fixed PAL board address."""
+    return (os.environ.get("PALIP") or "").strip() or PAL_DEFAULT_IP
+
+
 def resolve_target(st, device, host):
     """Device-aware aiedbg target for live reads.
 
-    * pal           → xsdb://<PALIP>:3121 ($PALIP, fallback xx.xx.xx.213).
+    * pal           → xsdb://<PALIP>:3121 ($PALIP, fallback PAL_DEFAULT_IP).
     * simulator     → None (reads go through IPC debug socket, not aiedbg).
     * any other board + host → xsdb://<host>:3121 (hostname from the UI).
     * otherwise     → the daemon's configured/env target (st.target).
     """
     device = (device or "").strip().lower()
     if device == "pal":
-        return f"xsdb://{os.environ.get('PALIP', 'xx.xx.xx.213')}:3121"
+        return f"xsdb://{_pal_ip()}:3121"
     if device == "simulator":
         return None
     if device and host:
@@ -5630,7 +5650,7 @@ def _jtag_host_for(device, board_host):
     """TCP host the browser's Connect probe uses (matches resolve_target)."""
     device = (device or "").strip().lower()
     if device == "pal":
-        return os.environ.get("PALIP", "xx.xx.xx.213")
+        return _pal_ip()
     host = (board_host or "").strip()
     return host
 

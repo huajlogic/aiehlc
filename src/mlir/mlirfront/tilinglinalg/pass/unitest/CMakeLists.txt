@@ -67,8 +67,9 @@ include_directories(../../routinghw/)
 include_directories(../)
 include_directories(../routingimplement/include/)
 include_directories(../passroutingtodmap/)
-include_directories(../passblueprinttoschedule/)
-include_directories(../passblueprinttoschedulekernel/)
+include_directories(../passblueprintlowering/)
+include_directories(../passblueprintlowering/passblueprinttoschedule/)
+include_directories(../passblueprintlowering/passblueprinttoschedulekernel/)
 include_directories(../passdmaphoptodfscheblueprint/)
 include_directories(../passdmaphoptoroutinghw/)
 include_directories(../passdmaptodmaphop/)
@@ -112,11 +113,11 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passroutingtodmap/routingtodmap.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaptodmaphop/dmaptodmaphop.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/passblueprinttoschedule.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/helper/flowtransfer_common.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/helper/flowtransfer_host.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/helper/flowtransfer_kernel.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedulekernel/passblueprinttoschedulekernel.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/helper/flowtransfer_common.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/helper/flowtransfer_host.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/helper/flowtransfer_kernel.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/passblueprinttoschedule/passblueprinttoschedule.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/passblueprinttoschedulekernel/passblueprinttoschedulekernel.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passschedulecanonicalize/passschedulecanonicalize.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passgroupregwrite/passgroupregwrite.cpp

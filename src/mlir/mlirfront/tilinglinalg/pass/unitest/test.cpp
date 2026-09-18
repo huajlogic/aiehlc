@@ -2,8 +2,8 @@
  * Copyright (C) 2025 Advanced Micro Devices, Inc. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  ******************************************************************************/
-#include "../passblueprinttoschedule/passblueprinttoschedule.h"
-#include "../passblueprinttoschedulekernel/passblueprinttoschedulekernel.h"
+#include "../passblueprintlowering/passblueprinttoschedule/passblueprinttoschedule.h"
+#include "../passblueprintlowering/passblueprinttoschedulekernel/passblueprinttoschedulekernel.h"
 #include "../passdfscheduleprovenancemap/passdfscheduleprovenancemap.h"
 #include "../passdfscheduletoapi/passdfscheduletoapi.h"
 #include "../passdfscheduletokernelapi/passdfscheduletokernelapi.h"
