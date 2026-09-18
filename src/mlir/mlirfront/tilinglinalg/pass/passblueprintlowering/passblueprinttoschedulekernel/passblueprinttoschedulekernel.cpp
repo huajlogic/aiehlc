@@ -95,10 +95,29 @@ class KernelResourceManager {
     // locks are accessed at ID 48+N where N is the host-side lock ID.
     static constexpr int32_t LOCK_BASE = 48;
 
-    KernelResourceManager() : nextBdId(0), nextLockId(0), nextLockOffset(0) {}
+    // Convert a kernel-intrinsic lock id (LOCK_BASE + N) back to the hardware
+    // lock index N used by register-level programming. The memory-module lock
+    // array is LOCK0_VALUE..LOCK15_VALUE (0x1F000 + id*0x10), and the DMA BD
+    // LOCK_ACQ_ID / LOCK_REL_ID fields are 4 bits wide, so anything written at
+    // register level must be the 0..15 hardware index, never the 48+N intrinsic
+    // id. Returns -1 for ids outside the intrinsic range so callers can reject
+    // them rather than silently aliasing into an unrelated register.
+    static int32_t toHardwareLockId(int32_t intrinsicLockId) {
+        int32_t hw = intrinsicLockId - LOCK_BASE;
+        return (hw >= 0 && hw <= 15) ? hw : -1;
+    }
+
+    KernelResourceManager() : nextBdId(0), nextLockId(0), nextLockOffset(0), nextCoreWindowBdId(0) {}
 
     // Allocate next BD ID (0, 1 for ping-pong)
     int32_t allocateBdId() { return nextBdId++; }
+
+    // Allocate the next core-tile BD id for a KERNELCONFIGOFFLOAD input window.
+    // Deliberately a separate counter from allocateBdId(): that one numbers the
+    // per-flow core-tile config BDs, and inputs must land at 0..2*nIn-1 (the
+    // range the host reserves for them) independently of how many flows were
+    // walked first.
+    int32_t allocateCoreWindowBdId() { return nextCoreWindowBdId++; }
 
     // Allocate next Lock ID
     int64_t allocateLockId() { return nextLockId++; }
@@ -122,12 +141,14 @@ class KernelResourceManager {
         nextBdId = 0;
         nextLockId = 0;
         nextLockOffset = 0;
+        nextCoreWindowBdId = 0;
     }
 
   private:
     int32_t nextBdId;
     int64_t nextLockId;
-    int32_t nextLockOffset; // Sequential offset from LOCK_BASE (48)
+    int32_t nextLockOffset;     // Sequential offset from LOCK_BASE (48)
+    int32_t nextCoreWindowBdId; // KERNELCONFIGOFFLOAD input-window BD ids (0..2*nIn-1)
 };
 
 // Generic template function to look up any operation by symbol reference
@@ -276,6 +297,20 @@ struct KernelParamInfo {
     int funcArgIndex = -1;      // Function argument index (0=A, 1=B, 2=C)
     bool singleBuffer = false;  // Single-buffer (no pong) mode, e.g. spatial-halo IFM slab
                                 // that is received once per invocation (numRounds==1).
+    int32_t channel = 0;        // Core-tile DMA channel (S2MM for input, MM2S for output).
+                                // Plumbed onto window_def so KERNELCONFIGOFFLOAD kernel.cc
+                                // codegen can emit the S2MM channel-start for this window.
+
+    // --- KERNELCONFIGOFFLOAD register-level programming (inputs only) ---
+    // Allocated here rather than recomputed downstream so this pass stays the
+    // single owner of core-tile BD ids and lock numbering.
+    int32_t pingBdId = -1;      // Hardware BD index backing the ping buffer.
+    int32_t pongBdId = -1;      // Hardware BD index backing the pong buffer (-1 if single-buffer).
+    int32_t acquireLockHwId = -1; // acquireLockId as a 0..15 hardware lock index, for MMIO
+    int32_t releaseLockHwId = -1; // releaseLockId likewise. The acquireLockId/releaseLockId
+                                  // fields above stay the 48+N *intrinsic* ids the kernel's
+                                  // acquire/release builtins take; only register-level
+                                  // encoding uses these.
 };
 
 // Structure to hold kernel generation parameters
@@ -296,7 +331,58 @@ struct KernelGenParams {
 
     // Dynamic parameter list - when non-empty, overrides the hardcoded lock IDs
     SmallVector<KernelParamInfo> kernelParams;
+
+    // KERNELCONFIGOFFLOAD (routing.kernel_config_offload): the core self-programs
+    // its incoming S2MM DMA from kernel.cc via raw MMIO instead of the host
+    // programming it over the config bus. Decided once in runOnOperation and
+    // stamped onto the generated KernelModuleOp, so downstream emission reads it
+    // off the kernel module rather than reaching back up to the top-level
+    // ModuleOp (the kernel module is the unit those passes actually operate on).
+    bool kernelConfigOffload = false;
 };
+
+// KERNELCONFIGOFFLOAD: copy the host path's per-tile plan onto the kernel module
+// as `dfschedule.core_offload_plan`, an array of dictionaries (one per core tile
+// and direction).
+//
+// Why an attr and not a direct read at emission time: the emitter is a conversion
+// pattern operating on the KernelModuleOp, and keeping every fact it needs on that
+// op is the same discipline `dfschedule.kernel_config_offload` follows. It also
+// makes the plan visible in the ir/*.mlir dumps, which is the only way to debug a
+// wrong per-tile MM2S arm after the fact.
+//
+// Source is ResourceMgr::instance() — the singleton — because the host path ran on
+// a different module clone and its pass-local ResourceMgr is long gone.
+static void attachCoreOffloadPlan(ConversionPatternRewriter &rewriter, dfschedule::KernelModuleOp kernelModuleOp) {
+    std::vector<CoreOffloadTileConfig> plan;
+    try {
+        plan = ResourceMgr::instance()->coreOffloadPlan();
+    } catch (...) {
+        // init() never called (standalone unit tests). Emission validates for an
+        // empty/missing plan, so leave the attr off rather than fabricating one.
+        return;
+    }
+    if (plan.empty())
+        return;
+
+    SmallVector<Attribute> entries;
+    entries.reserve(plan.size());
+    for (const auto &e : plan) {
+        NamedAttrList d;
+        d.append("col", rewriter.getI32IntegerAttr(e.col));
+        d.append("row", rewriter.getI32IntegerAttr(e.row));
+        d.append("is_output", rewriter.getBoolAttr(e.isOutput));
+        d.append("channel", rewriter.getI32IntegerAttr(e.channel));
+        d.append("packet_id", rewriter.getI32IntegerAttr(e.packetId));
+        d.append("enable_packet", rewriter.getBoolAttr(e.enablePacket));
+        d.append("ooo_bd_id", rewriter.getI32IntegerAttr(e.oooBdId));
+        d.append("bd_len_bytes", rewriter.getI32IntegerAttr(e.bdLenBytes));
+        d.append("pp_depth", rewriter.getI32IntegerAttr(e.ppDepth));
+        entries.push_back(rewriter.getDictionaryAttr(d));
+    }
+    kernelModuleOp->setAttr("dfschedule.core_offload_plan", rewriter.getArrayAttr(entries));
+    llvm::errs() << "[KernelConfigOffload] attached core_offload_plan with " << entries.size() << " tile entries\n";
+}
 
 // Generate dfschedule.module with kernel_config, locks, buffers, windows, kernel_decl, and main
 // This is the general-purpose kernel module that can be lowered by different passes
@@ -327,6 +413,14 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
 
     // Create the dfschedule.module operation
     auto kernelModuleOp = rewriter.create<dfschedule::KernelModuleOp>(loc, rewriter.getStringAttr(moduleName));
+
+    // KERNELCONFIGOFFLOAD: record the decision on the kernel module so kernel.cc
+    // emission reads it from the op it actually operates on, instead of walking
+    // up to the top-level ModuleOp for routing.kernel_config_offload.
+    if (params.kernelConfigOffload) {
+        kernelModuleOp->setAttr("dfschedule.kernel_config_offload", rewriter.getI64IntegerAttr(1));
+        attachCoreOffloadPlan(rewriter, kernelModuleOp);
+    }
 
     // Create the body block for the module
     Block *body = &kernelModuleOp.getBody().emplaceBlock();
@@ -402,6 +496,21 @@ static void generateKernelModule(ConversionPatternRewriter &rewriter, Location l
             winAttrs.append("buffer_size", rewriter.getI32IntegerAttr(paramInfo.bufferSize));
             if (paramInfo.numRounds > 0)
                 winAttrs.append("num_rounds", rewriter.getI32IntegerAttr(paramInfo.numRounds));
+            // KERNELCONFIGOFFLOAD: the core's own DMA channel + single/ping-pong mode,
+            // so kernel.cc can emit the BD chain + channel-start MMIO.
+            winAttrs.append("dma_channel", rewriter.getI32IntegerAttr(paramInfo.channel));
+            winAttrs.append("single_buffer", rewriter.getBoolAttr(paramInfo.singleBuffer));
+            // KERNELCONFIGOFFLOAD register-level resources, resolved by this pass so
+            // kernel.cc emission only formats them. Both directions now: S2MM is
+            // uniform across tiles and emits straight-line, MM2S is per-tile and
+            // emits under a get_coreid() dispatch, but the window-level ids here
+            // are the same for every tile in both cases.
+            if (params.kernelConfigOffload) {
+                winAttrs.append("ping_bd_id", rewriter.getI32IntegerAttr(paramInfo.pingBdId));
+                winAttrs.append("pong_bd_id", rewriter.getI32IntegerAttr(paramInfo.pongBdId));
+                winAttrs.append("acquire_lock_hw_id", rewriter.getI32IntegerAttr(paramInfo.acquireLockHwId));
+                winAttrs.append("release_lock_hw_id", rewriter.getI32IntegerAttr(paramInfo.releaseLockHwId));
+            }
             winAttrs.append("async", rewriter.getBoolAttr(true));
 
             rewriter.create<dfschedule::WindowDefOp>(loc, rewriter.getStringAttr(paramInfo.windowName),
@@ -576,7 +685,7 @@ static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Locati
                                      StringRef kernelName, RankedTensorType tensorType, int64_t bufferLen,
                                      uint32_t basePacketId, int64_t coreChannel, uint32_t flowIndex,
                                      KernelResourceManager &resourceMgr, double bufferRatio, int64_t maxPingPongBytes,
-                                     const routing::GemmTilingScalars &tiling) {
+                                     const routing::GemmTilingScalars &tiling, bool kernelConfigOffload) {
 
     // Build kernel generation parameters
     KernelGenParams params;
@@ -587,6 +696,7 @@ static void generateDSKernelReceiver(ConversionPatternRewriter &rewriter, Locati
     params.elementType = rewriter.getI32Type();
     params.vectorWidth = 4;
     params.iterationStyle = "internal"; // Legacy style: loop inside kernel
+    params.kernelConfigOffload = kernelConfigOffload;
 
     // Lock IDs (fallback - used when kernelParams is empty)
     // Sequential allocation from lock base 48: input pair (48,49), output pair (50,51)
@@ -795,6 +905,12 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
             // Get element type and partition size from the core FlowConfig's view
             // (not the full tensor from declare_data, which is the root tensor)
             auto coreFlowConfig = isInput ? toFlowConfig : fromFlowConfig;
+            // Core-tile DMA channel (S2MM for input / MM2S for output). Same source
+            // FlowTransferConversion uses for the create_io channel (coreDmaChannels[0]).
+            if (auto coreDma = coreFlowConfig.getDma()) {
+                auto chans = coreDma.getChannels();
+                paramInfo.channel = chans.empty() ? 0 : static_cast<int32_t>(chans[0]);
+            }
             Value viewValue = coreFlowConfig.getView();
             Type viewType = viewValue ? viewValue.getType() : Type();
             if (auto tensorType = dyn_cast_or_null<RankedTensorType>(viewType)) {
@@ -1092,6 +1208,21 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
         p->bufferPongName = p->singleBuffer ? p->bufferPingName : "buf_in_pong_" + std::to_string(sortedInputCount);
         p->acquireLockId = resourceMgr.allocateInputAcquireLock();
         p->releaseLockId = resourceMgr.allocateInputReleaseLock();
+        p->acquireLockHwId = KernelResourceManager::toHardwareLockId(p->acquireLockId);
+        p->releaseLockHwId = KernelResourceManager::toHardwareLockId(p->releaseLockId);
+        // KERNELCONFIGOFFLOAD ping/pong BD ids. Inputs are numbered first and
+        // contiguously from 0, so a single-buffer port still consumes its pong
+        // slot — that keeps input i at bd 2*i/2*i+1 regardless of the mix.
+        //
+        // These ids are allocated here, on the kernel module clone, while the
+        // host allocates core-tile BDs out of its own per-tile pool on the host
+        // clone — two allocators over one physical BD bank. They stay disjoint
+        // because the host reserves (allocate-and-discard) the BDs it skips
+        // emitting: see reserveOffloadedCoreBds in helper/flowtransfer_kernel.cpp.
+        // Keep the two counts in step if either side's BD shape changes.
+        p->pingBdId = resourceMgr.allocateCoreWindowBdId();
+        int32_t pongBd = resourceMgr.allocateCoreWindowBdId();
+        p->pongBdId = p->singleBuffer ? -1 : pongBd;
         sortedInputCount++;
     }
     int sortedOutputCount = 0;
@@ -1101,6 +1232,14 @@ static SmallVector<KernelParamInfo> analyzeKernelParams(Operation *rootOp, Kerne
         p->bufferPongName = "buf_out_pong_" + std::to_string(sortedOutputCount);
         p->acquireLockId = resourceMgr.allocateOutputAcquireLock();
         p->releaseLockId = resourceMgr.allocateOutputReleaseLock();
+        p->acquireLockHwId = KernelResourceManager::toHardwareLockId(p->acquireLockId);
+        p->releaseLockHwId = KernelResourceManager::toHardwareLockId(p->releaseLockId);
+        // KERNELCONFIGOFFLOAD MM2S ping/pong BD ids. Outputs continue the SAME
+        // counter the inputs used, so they land above [0, 2*nIn) and never alias
+        // an input BD on the same tile. The host mirrors this numbering when it
+        // reserves the ids it no longer emits (reserveOffloadedCoreBds).
+        p->pingBdId = resourceMgr.allocateCoreWindowBdId();
+        p->pongBdId = resourceMgr.allocateCoreWindowBdId();
         sortedOutputCount++;
     }
 
@@ -1134,10 +1273,14 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
     double bufferRatio;
     int64_t maxPingPongBytes;
     routing::GemmTilingScalars tiling;
+    // KERNELCONFIGOFFLOAD state, cached by the pass before conversion (module
+    // attrs may be stripped during applyPartialConversion).
+    bool kernelConfigOffload;
 
-    FlowTransferConversion(MLIRContext *ctx, double ratio, int64_t maxPPBytes, routing::GemmTilingScalars tiling)
+    FlowTransferConversion(MLIRContext *ctx, double ratio, int64_t maxPPBytes, routing::GemmTilingScalars tiling,
+                           bool kernelConfigOffload)
         : OpConversionPattern<dfscheblueprint::FlowTransferOp>(ctx), bufferRatio(ratio), maxPingPongBytes(maxPPBytes),
-          tiling(tiling) {}
+          tiling(tiling), kernelConfigOffload(kernelConfigOffload) {}
 
     mutable KernelResourceManager resourceMgr;
 
@@ -1215,7 +1358,7 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
         if (!hasDSKernelReceiver(op.getOperation(), kernelName)) {
             generateDSKernelReceiver(rewriter, loc, op.getOperation(), kernelName, kernelTensorType, bufferLen,
                                      basePacketId, coreChannel, flowIndex, resourceMgr, bufferRatio, maxPingPongBytes,
-                                     tiling);
+                                     tiling, kernelConfigOffload);
         }
 
         // --- Core tile DMA IO configuration (create_io + start_io) ---
@@ -1341,11 +1484,17 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
     // them from the routing.partitiontensor #routing.tiling op (still live here,
     // before conversion). The flat module attrs remain the fallback for conv.
     routing::GemmTilingScalars tiling;
+    // KERNELCONFIGOFFLOAD: cached alongside the tiling scalars, for the same
+    // reason — read the module attr once here, before conversion can strip it.
+    // This pass is the single decision point; it stamps the result onto the
+    // generated KernelModuleOp for kernel.cc emission to consume.
+    bool kernelConfigOffload = false;
     if (auto moduleOp = dyn_cast<ModuleOp>(getOperation())) {
         auto getI64 = [&](StringRef name) -> int64_t {
             auto attr = moduleOp->getAttrOfType<IntegerAttr>(name);
             return attr ? attr.getInt() : 0;
         };
+        kernelConfigOffload = getI64("routing.kernel_config_offload") != 0;
         tiling.tileM = getI64("routing.tile_m");
         tiling.tileRows = getI64("routing.tile_rows");
         tiling.tileN = getI64("routing.tile_n");
@@ -1361,7 +1510,7 @@ void BlueprintToScheduleKernelPass::runOnOperation() {
     RewritePatternSet patterns(context);
     // FlowTransferConversion converts flow_transfer to dfschedule operations
     // It reads from FlowConfigOps to get DMA configuration
-    patterns.add<FlowTransferConversion>(context, bufferRatio_, maxPingPongBytes_, tiling);
+    patterns.add<FlowTransferConversion>(context, bufferRatio_, maxPingPongBytes_, tiling, kernelConfigOffload);
     // DataSliceOp replaces with input tensor
     patterns.add<DataSliceOpConversion>(context);
     // Use unified erase pattern for ops that just need to be removed

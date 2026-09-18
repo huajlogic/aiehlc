@@ -5,6 +5,17 @@
 
 // Shared internal header for the split FlowTransferConversion implementation.
 //
+// Lives in passblueprintlowering/helper/ — one level ABOVE the two passes that
+// use it, because the host path (passblueprinttoschedule) and the kernel path
+// (passblueprinttoschedulekernel) lower the SAME core/kernel-tile DMA, lock and
+// buffer configuration and must agree on it. Anything describing core-tile
+// config that both paths need belongs here, not inside either pass.
+//
+//   passblueprintlowering/
+//     helper/                        — this shared layer
+//     passblueprinttoschedule/       — host path  → host.cc
+//     passblueprinttoschedulekernel/ — kernel path → kernel.cc
+//
 // The single ~2200-line FlowTransferConversion::matchAndRewrite has been broken
 // into a thin dispatcher (passblueprinttoschedule.cpp) plus host / kernel helper
 // member methods defined across:
@@ -74,7 +85,18 @@ struct BlueprintPassState {
     // partitiontensor op during conversion. Empty for conv, mirroring the old
     // !isFullConnectAuto Match/1/1 behavior.
     routing::GemmTilingScalars tilingScalars;
+    // KERNELCONFIGOFFLOAD (routing.kernel_config_offload): when set, the AIE core
+    // self-programs its own incoming (S2MM) DMA from kernel.cc via raw MMIO, so the
+    // host must NOT emit the S2MM core-tile DMA chain. emitCoreBufferDma reads this
+    // to skip the S2MM BD + create_io + start_io for core tiles.
+    bool kernelConfigOffload = false;
 };
+
+// KERNELCONFIGOFFLOAD: lowest tile row that is a compute core able to run
+// kernel.cc and therefore self-program its own DMA. Rows below this are the
+// shim (0) and memtiles (1), which have no core to execute the offloaded MMIO
+// block, so their DMA config always stays host-side.
+inline constexpr int64_t kOffloadCoreRowMin = 2;
 
 // === Tiling Classification ===
 // Determines whether the M/N-dimension tiling requires host-side SCF loops.
@@ -291,14 +313,27 @@ struct FlowLoweringCtx {
     bool isInput = false;
     int funcArgIdx = -1;
     int dirIdx = 0;
-    SmallVector<Attribute> tileConfigDicts;
     SmallVector<DeferredCoreStartIo> deferredCoreStartIos;
     int tileIndex = 0;
+    // KERNELCONFIGOFFLOAD gate for this flow, decided once by the orchestrator
+    // (BlueprintToSchedulePass::matchAndRewrite) from
+    // BlueprintPassState::kernelConfigOffload. When true the host must not emit
+    // this flow's core-tile DMA *configuration* (BD chain + create_io +
+    // start_io); the core self-programs it from kernel.cc via raw MMIO.
+    //
+    // Scope note: BOTH directions are offloadable. S2MM config is identical on
+    // every core tile and emits straight-line; MM2S carries per-tile packet_id /
+    // ooo_bd_id and emits under a get_coreid() dispatch built from the plan this
+    // host walk publishes (ResourceMgr::coreOffloadPlan).
+    //
+    // DeclareTileOp is never suppressed: it feeds `coreTiles` ->
+    // load_kernel_group, i.e. it is what puts the kernel ELF on the core. The
+    // offload depends on that ELF running, so dropping it would remove the very
+    // code meant to replace the host configuration.
+    bool offloadCoreDmaConfig = false;
 
     // --- kernel_config finalize + schedule ---
-    SmallVector<Attribute> kernelConfigSymbols;
     SmallVector<Attribute> calleeAttrs;
-    SmallVector<Attribute> computeKernelAttrs;
     TilingClassification classification;
     bool needsOuterLoop = false;
     bool fullConnect = true;
@@ -390,6 +425,12 @@ struct FlowTransferConversion : public OpConversionPattern<dfscheblueprint::Flow
     void emitCoreBufferAlloc(FlowLoweringCtx &c, CoreTileCtx &t) const;
     void emitCoreSingleBufferBd(FlowLoweringCtx &c, CoreTileCtx &t) const;
     void emitCorePingPongBd(FlowLoweringCtx &c, CoreTileCtx &t) const;
+    // KERNELCONFIGOFFLOAD counterpart of the two emitCore*Bd helpers: claims the
+    // same per-tile BD ids from the pool WITHOUT emitting any op, for the case
+    // where the core self-programs those BDs from kernel.cc. Keeps the host's
+    // allocator honest so a host-programmed flow on the same tile (e.g. MM2S
+    // output) is never handed a BD the core is already using.
+    void reserveOffloadedCoreBds(FlowLoweringCtx &c, CoreTileCtx &t) const;
     void finalizeKernelConfig(FlowLoweringCtx &c) const;
 };
 

@@ -860,7 +860,7 @@ LogicalResult FlowTransferConversion::emitScheduleMultipleInput(FlowLoweringCtx 
     // 1. load_kernel_group OUTSIDE the loop
     auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
         loc, dfschedule::KernelGroupType::get(rewriter.getContext()), c.coreTiles, rewriter.getArrayAttr(c.calleeAttrs),
-        rewriter.getArrayAttr(c.computeKernelAttrs), nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
+        /*kernel_config=*/nullptr, /*distributed_args=*/nullptr);
 
     // 2. launch_kernel_group OUTSIDE the loop
     auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
@@ -990,7 +990,7 @@ void FlowTransferConversion::emitScheduleOooOutput(FlowLoweringCtx &c) const {
     // 1. load_kernel_group OUTSIDE the loop
     auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
         loc, dfschedule::KernelGroupType::get(rewriter.getContext()), c.coreTiles, rewriter.getArrayAttr(c.calleeAttrs),
-        rewriter.getArrayAttr(c.computeKernelAttrs), nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
+        /*kernel_config=*/nullptr, /*distributed_args=*/nullptr);
 
     // 2. launch_kernel_group OUTSIDE the loop
     auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
@@ -1050,7 +1050,7 @@ void FlowTransferConversion::emitScheduleOooOutput(FlowLoweringCtx &c) const {
             for (size_t i = 1; i < nDims; i++)
                 mBaseOffset = rewriter.create<arith::AddIOp>(loc, mBaseOffset, offs[i]);
         }
-
+        printf("BlueprintToSchedule OOO -1\n");
         // Re-configure N OOO shim BDs with updated DDR offset
         SmallVector<Value> loopBdHandles(numCoreTiles);
         for (int64_t t = numCoreTiles - 1; t >= 0; t--) {
@@ -1105,7 +1105,7 @@ void FlowTransferConversion::emitScheduleOooOutput(FlowLoweringCtx &c) const {
 
         rewriter.setInsertionPointAfter(forOp);
     }
-
+    printf("BlueprintToSchedule OOO -Done\n");
     // 5. After all iterations: wait for kernel launch event
     SmallVector<Value> finalEvents;
     finalEvents.push_back(launchKernelGroupOp.getEvent());
@@ -1165,7 +1165,7 @@ void FlowTransferConversion::emitScheduleStraightLine(FlowLoweringCtx &c) const 
     }
     auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
         loc, dfschedule::KernelGroupType::get(rewriter.getContext()), c.coreTiles, rewriter.getArrayAttr(c.calleeAttrs),
-        rewriter.getArrayAttr(c.computeKernelAttrs), nullptr, rewriter.getArrayAttr(c.kernelConfigSymbols));
+        /*kernel_config=*/nullptr, /*distributed_args=*/nullptr);
 
     auto launchKernelGroupOp = rewriter.create<dfschedule::LaunchKernelGroupOp>(
         loc, dfschedule::EventType::get(rewriter.getContext()), loadKernelGroupOp.getKernelGroup());

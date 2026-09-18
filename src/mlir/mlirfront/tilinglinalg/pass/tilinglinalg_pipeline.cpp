@@ -18,6 +18,7 @@
 #include "passdmaphoptoroutinghw.h"
 #include "passroutingprovenancemap.h"
 #include "passroutingresourcemap.h"
+#include "passgroupregwrite.h"
 #include "passschedulecanonicalize.h"
 #include "passschedulesequentialop.h"
 #include "passwaitmerge.h"
@@ -75,9 +76,22 @@ using namespace mlir;
 // create_io channel that direction was assigned on the tile, matched by
 // declaration order within the direction. Default specs are left untouched (S2MM
 // ch0, unchecked). Reads IR only.
+//
+// KERNELCONFIGOFFLOAD interaction: when routing.kernel_config_offload is set the
+// core self-programs its own incoming S2MM DMA from kernel.cc, so
+// BlueprintToSchedulePass deliberately does NOT emit the host-side S2MM
+// create_io for core tiles. Those channels are still live on hardware — they are
+// simply no longer described by the host IR this function reads. Validating an
+// S2MM selection against the (now empty) host list would report the channel as
+// unused and abort the build, so S2MM specs are accepted unverified (with a
+// warning) under offload. MM2S stays host-side and is still fully validated.
+// `s2mmOffloaded` is the caller's routing.kernel_config_offload state. It is
+// passed in rather than read off `hostModule` because that clone has already
+// been through BlueprintToSchedulePass et al., which may strip module attrs
+// during applyPartialConversion (the pass caches them at entry for this reason).
 static bool resolveTraceParameterSpecs(mlir::ModuleOp hostModule, const std::vector<std::string> &portVarNames,
-                                       const std::vector<TensorParam> &tensors,
-                                       std::vector<TraceTileSpec> &traceTiles) {
+                                       const std::vector<TensorParam> &tensors, std::vector<TraceTileSpec> &traceTiles,
+                                       bool s2mmOffloaded) {
     bool needCheck = false;
     for (const auto &t : traceTiles)
         if (t.sel == TraceDmaSel::Parameter || t.sel == TraceDmaSel::Stream)
@@ -141,6 +155,15 @@ static bool resolveTraceParameterSpecs(mlir::ModuleOp hostModule, const std::vec
         if (t.sel == TraceDmaSel::Stream) {
             const auto &chList = (t.dmaKind == 2) ? mm2sCh[key] : s2mmCh[key];
             const char *dirName = (t.dmaKind == 2) ? "mm2s" : "s2mm";
+            // Under KERNELCONFIGOFFLOAD the S2MM channel is programmed by the core,
+            // not the host, so there is no host create_io to check it against. Accept
+            // the user's channel as-is rather than reporting it unused.
+            if (s2mmOffloaded && t.dmaKind != 2) {
+                std::cerr << "[aiehlc] Warning: #pragma aie_trace STREAM s2mm ch" << t.dmaCh << " on tile(" << t.col
+                          << "," << t.row << ") cannot be verified under #pragma KERNELCONFIGOFFLOAD"
+                          << " (the core programs its own S2MM DMA); trusting the pragma." << std::endl;
+                continue;
+            }
             if (std::find(chList.begin(), chList.end(), t.dmaCh) == chList.end()) {
                 std::cerr << "[aiehlc] Error: #pragma aie_trace STREAM " << dirName << " ch" << t.dmaCh
                           << " is not used by the app on tile(" << t.col << "," << t.row << "). Available " << dirName
@@ -158,6 +181,19 @@ static bool resolveTraceParameterSpecs(mlir::ModuleOp hostModule, const std::vec
         if (!lookupPort(t.paramName, isInput, ordinal)) {
             std::cerr << "[aiehlc] Error: #pragma aie_trace PARAMETER \"" << t.paramName
                       << "\" is not a kernel window/port name." << std::endl;
+            ok = false;
+            continue;
+        }
+        // An input PARAMETER resolves to an S2MM channel by looking up the host
+        // create_io list, which KERNELCONFIGOFFLOAD leaves empty. Unlike STREAM the
+        // user did not supply a channel number here, and there is nothing left to
+        // derive one from — defaulting would silently trace the wrong channel, so
+        // ask for an explicit STREAM selection instead.
+        if (s2mmOffloaded && isInput) {
+            std::cerr << "[aiehlc] Error: #pragma aie_trace PARAMETER \"" << t.paramName
+                      << "\" (S2MM) cannot be resolved to a DMA channel under #pragma KERNELCONFIGOFFLOAD,"
+                      << " because the core programs its own S2MM DMA and the host IR no longer records the channel."
+                      << " Use an explicit (STREAM, \"s2mm\", <ch>) selection instead." << std::endl;
             ok = false;
             continue;
         }
@@ -695,6 +731,14 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     {
         auto hwRes = makeResource(aieGen);
         ResourceMgr::init(std::move(hwRes));
+        // Control-plane resource reservation (pkt-ids/arbiters/slots excluded from
+        // routing/scheduling) is OPT-IN via `#pragma control_plan_op_control_packet`
+        // (module attr set in aiehlc.cc). Single source of truth for the reserved
+        // resources is the reservation table (aie_runtime_resource.c).
+        if (auto cpAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_op_control_packet");
+            cpAttr && cpAttr.getInt() != 0) {
+            ResourceMgr::instance()->reserveControlPlaneResources(__Runtime_res_gen_from_name(aieGen.c_str()));
+        }
     }
 
     // Early memory check: validate that per-tile buffer requirements fit in tile data memory
@@ -760,10 +804,32 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     // (dmaKind, dmaCh) while dfschedule create_io provenance is still present
     // (DfscheduleToApiPass below erases it). Stamps resolved values back into
     // traceTiles; aborts the build on an invalid PARAMETER name or an unused
-    // STREAM channel.
-    if (!resolveTraceParameterSpecs(hostModule, portVarNames, tensors, traceTiles)) {
+    // STREAM channel. Under #pragma KERNELCONFIGOFFLOAD the core-tile S2MM
+    // create_io is intentionally absent (the core programs that DMA itself), so
+    // S2MM selections cannot be cross-checked against the host IR.
+    bool kernelConfigOffloadOn = false;
+    if (auto kcoAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.kernel_config_offload"))
+        kernelConfigOffloadOn = kcoAttr.getInt() != 0;
+    if (!resolveTraceParameterSpecs(hostModule, portVarNames, tensors, traceTiles, kernelConfigOffloadOn)) {
         llvm::errs() << "[TilingLinalg] ERROR: invalid #pragma aie_trace mem-DMA selection.\n";
         return false;
+    }
+
+    // Coalesce identical per-tile lock-init register writes into control-packet
+    // group writes (broadcast / row-multicast). Must run before DfscheduleToApiPass
+    // so the folded triples (module attr dfschedule.grouped_lock_inits) suppress
+    // the individual XAie_LockSetValue emission there. Opt-in only: gated on the
+    // routing.control_plan_group_reg_write module attr, published by aiehlc when
+    // the user writes #pragma CONTROL_PLAN_GROUP_REG_WRITE. Without it, lock inits
+    // are emitted as individual register writes.
+    auto grwAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_group_reg_write");
+    if (grwAttr && grwAttr.getInt() != 0) {
+        if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::GroupRegWritePass>(), irDir, stage,
+                                   "GroupRegWritePass"))
+            return false;
+    } else {
+        llvm::errs() << "[TilingLinalg] GroupRegWritePass skipped (enable with "
+                        "#pragma CONTROL_PLAN_GROUP_REG_WRITE).\n";
     }
 
     if (!runPipelineSinglePass(ctx, hostModule,

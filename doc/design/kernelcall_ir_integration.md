@@ -195,20 +195,23 @@ for (size_t i = 0; i < coreTiles.size(); ++i) {
 ### LoadKernelGroupOp
 
 ```cpp
-// passblueprinttoschedule.cpp:1521-1526
 auto loadKernelGroupOp = rewriter.create<dfschedule::LoadKernelGroupOp>(
     loc, dfschedule::KernelGroupType::get(rewriter.getContext()), coreTiles,
     rewriter.getArrayAttr(calleeAttrs),          // callee = @dskernel_receiver
     rewriter.getArrayAttr(computeKernelAttrs),   // compute = @compute0
     nullptr,                                     // kernel_config = nullptr
-    rewriter.getArrayAttr(kernelConfigSymbols)); // distributed_args = [@kernelconfig0, ...]
+    nullptr);                                    // distributed_args = nullptr (removed)
 ```
 
 This op carries:
 - The list of core tiles to load kernels onto
 - Callee symbol `@dskernel_receiver` (the kernel wrapper that handles window acquire/release)
 - Compute kernel symbol `@compute0` (renamed to the user's `__global__` function name later)
-- Per-tile kernel configs (`@kernelconfig0`, `@kernelconfig1`, ...) containing DMA BD parameters
+
+> **Note:** The former per-tile `distributed_args`/`DeclareKernelConfigOp` kernel
+> configs were pure metadata (never lowered to runtime code) and have been removed.
+> The DMA BD parameters they carried are materialized directly by the
+> `config.dma_bd`, lock-init, and `start_io` ops.
 
 ### LaunchKernelGroupOp
 

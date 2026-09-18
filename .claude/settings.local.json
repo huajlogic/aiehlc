@@ -29,7 +29,12 @@
       "mcp__aiegdb__aie_scope",
       "WebFetch(domain:files.pythonhosted.org)",
       "Skill(superpowers:test-driven-development)",
-      "Skill(commands)"
+      "Skill(commands)",
+      "Skill(superpowers:finishing-a-development-branch)",
+      "mcp__ide__getDiagnostics",
+      "Bash(awk '{print $NF}')",
+      "Bash(awk -F'config\\\\\\\\\\(v1, ' '{print $2}')",
+      "Bash(awk -F', ' '{print \"enpkt=\"$6\" pktid=\"$7\" ooo=\"$12}')"
     ],
     "deny": []
   },

@@ -209,7 +209,8 @@ AIEHLC_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INCLUDE_PATH="-I$XILINX_VITIS_AIETOOLS/include \
 -I$XILINX_VITIS_AIETOOLS/include/aie_api \
 -I$include_base \
--I${AIEHLC_ROOT_DIR}/src/mlir/runtime"
+-I${AIEHLC_ROOT_DIR}/src/mlir/runtime \
+-I${AIEHLC_ROOT_DIR}/include"
 
 if [ -n "$kernel_cc" ]; then
     _kernel_src_dir="$(cd "$(dirname "$kernel_cc")" 2>/dev/null && pwd)"

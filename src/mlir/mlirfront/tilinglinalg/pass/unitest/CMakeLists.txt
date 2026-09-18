@@ -59,6 +59,7 @@ message(STATUS "Using ${CLANG_INCLUDE_DIRS}")
 set(CMAKE_BUILD_TYPE Debug)
 
 include_directories(../../../../)
+include_directories(../../../../runtime/)
 include_directories(../../routing/inc/)
 include_directories(../../routinghw/inc/)
 include_directories(../../routing/)
@@ -66,12 +67,14 @@ include_directories(../../routinghw/)
 include_directories(../)
 include_directories(../routingimplement/include/)
 include_directories(../passroutingtodmap/)
-include_directories(../passblueprinttoschedule/)
-include_directories(../passblueprinttoschedulekernel/)
+include_directories(../passblueprintlowering/)
+include_directories(../passblueprintlowering/passblueprinttoschedule/)
+include_directories(../passblueprintlowering/passblueprinttoschedulekernel/)
 include_directories(../passdmaphoptodfscheblueprint/)
 include_directories(../passdmaphoptoroutinghw/)
 include_directories(../passdmaptodmaphop/)
 include_directories(../passschedulecanonicalize/)
+include_directories(../passgroupregwrite/)
 include_directories(../passschedulesequentialop/)
 include_directories(../passwaitmerge/)
 include_directories(../passdfscheduletoapi/)
@@ -110,13 +113,14 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passroutingtodmap/routingtodmap.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaptodmaphop/dmaptodmaphop.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptoroutinghw/passdmaphoptoroutinghw.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/passblueprinttoschedule.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/helper/flowtransfer_common.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/helper/flowtransfer_host.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedule/helper/flowtransfer_kernel.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprinttoschedulekernel/passblueprinttoschedulekernel.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/helper/flowtransfer_common.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/helper/flowtransfer_host.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/helper/flowtransfer_kernel.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/passblueprinttoschedule/passblueprinttoschedule.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passblueprintlowering/passblueprinttoschedulekernel/passblueprinttoschedulekernel.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdmaphoptodfscheblueprint/passdmaphoptodfscheblueprint.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passschedulecanonicalize/passschedulecanonicalize.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../passgroupregwrite/passgroupregwrite.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passschedulesequentialop/passschedulesequentialop.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passwaitmerge/passwaitmerge.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../passdfscheduletoapi/passdfscheduletoapi.cpp
@@ -130,6 +134,7 @@ set(SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/hwresource.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/hw/ResourceManager.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/../routingimplement/routing/routingtopology.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../../runtime/aie_runtime_resource.c
                 ${CMAKE_CURRENT_SOURCE_DIR}/../tilinglinalg_pipeline.cpp
                 )
 

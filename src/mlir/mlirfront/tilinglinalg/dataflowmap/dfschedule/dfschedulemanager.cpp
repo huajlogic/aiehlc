@@ -675,20 +675,26 @@ void dfschedule::LoadKernelGroupOp::print(::mlir::OpAsmPrinter &printer) {
         printer << tile;
     });
     printer << ") {";
-    
-    // Print attributes with proper indentation
+
+    // Print attributes with proper indentation. kernel_config and
+    // distributed_args are OptionalAttr: skip them when absent, otherwise
+    // printAttribute() would be handed a null Attribute and assert.
     printer.increaseIndent();
     printer.printNewline();
     printer << "callee = ";
     printer.printAttribute(getCalleeAttr());
-    printer << ",";
-    printer.printNewline();
-    printer << "distributed_compute_kernel_args = ";
-    printer.printAttribute(getDistributedComputeKernelArgsAttr());
-    printer << ",";
-    printer.printNewline();
-    printer << "distributed_args = ";
-    printer.printAttribute(getDistributedArgsAttr());
+    if (auto kernelConfigAttr = getKernelConfigAttr()) {
+        printer << ",";
+        printer.printNewline();
+        printer << "kernel_config = ";
+        printer.printAttribute(kernelConfigAttr);
+    }
+    if (auto distributedArgsAttr = getDistributedArgsAttr()) {
+        printer << ",";
+        printer.printNewline();
+        printer << "distributed_args = ";
+        printer.printAttribute(distributedArgsAttr);
+    }
     printer.decreaseIndent();
     printer.printNewline();
     printer << "} ";
@@ -941,27 +947,18 @@ void dfschedulemanager::createHostBlock(OpBuilder& builder, MLIRContext* ctx, Sy
     llvm::SmallVector<Value, 2> tiles = {core0.getResult(), core1.getResult()};
     
     // Create symbol ref arrays
-    llvm::SmallVector<mlir::Attribute, 1> calleeRefs = {
-        mlir::FlatSymbolRefAttr::get(ctx, "dskernel_receiver")
-    };
-    llvm::SmallVector<mlir::Attribute, 2> computeKernelRefs = {
-        mlir::FlatSymbolRefAttr::get(ctx, "compute0"),
-        mlir::FlatSymbolRefAttr::get(ctx, "compute0")
-    };
+    llvm::SmallVector<mlir::Attribute, 1> calleeRefs = {mlir::FlatSymbolRefAttr::get(ctx, "dskernel_receiver")};
     llvm::SmallVector<mlir::Attribute, 2> packetRefs = {
         mlir::FlatSymbolRefAttr::get(ctx, "packet0"),
         mlir::FlatSymbolRefAttr::get(ctx, "packet1")
     };
-    
+
     auto kernelGroup = builder.create<dfschedule::LoadKernelGroupOp>(
-        location, kernelGroupType,
-        tiles,
-        builder.getArrayAttr(calleeRefs),
-        builder.getArrayAttr(computeKernelRefs),
-        nullptr,  // kernel_config (optional, using old style for now)
-        builder.getArrayAttr(packetRefs)  // distributed_args
+        location, kernelGroupType, tiles, builder.getArrayAttr(calleeRefs),
+        /*kernel_config=*/nullptr,       // (optional, using old style for now)
+        builder.getArrayAttr(packetRefs) // distributed_args
     );
-    
+
     // %evt_kernel_group = dfschedule.schedule.launch_kernel_group(%kernel_group) {...}
     auto eventType = dfschedule::EventType::get(ctx);
     auto evtKernelGroup = builder.create<dfschedule::LaunchKernelGroupOp>(

@@ -277,27 +277,6 @@ LogicalResult FlowTransferConversion::emitCoreTileParams(FlowLoweringCtx &c, Cor
         t.releaseLockId = outputLockBase + c.dirIdx * 2 + 1;
     }
 
-    // Build config dictionary for this tile
-    // buffer_mode: 0 = single buffer (pp_depth=1), 1 = ping-pong (pp_depth>=2)
-    int bufferMode = (t.ppDepth == 1) ? 0 : 1;
-    int numBuffers = (t.ppDepth == 1) ? 1 : 2;
-
-    NamedAttrList configAttrs;
-    configAttrs.append("tile_index", rewriter.getI32IntegerAttr(c.tileIndex));
-    configAttrs.append("flow_index", rewriter.getI32IntegerAttr(c.flowIndex));
-    configAttrs.append("packet_id", rewriter.getI32IntegerAttr(c.basePacketId + c.tileIndex));
-    configAttrs.append("dma_channel", rewriter.getI32IntegerAttr(c.coreChannel));
-    configAttrs.append("buffer_mode", rewriter.getI32IntegerAttr(bufferMode));
-    configAttrs.append("num_buffers", rewriter.getI32IntegerAttr(numBuffers));
-    configAttrs.append("buffer_size", rewriter.getI32IntegerAttr(t.pingPongBufferSize));
-    configAttrs.append("num_iterations", rewriter.getI32IntegerAttr(t.numIterations));
-    configAttrs.append("buffer_offset", rewriter.getI32IntegerAttr(t.bufferOffset));
-    configAttrs.append("element_size", rewriter.getI32IntegerAttr(t.elementSizeBytes));
-    configAttrs.append("acquire_lock_id", rewriter.getI32IntegerAttr(t.acquireLockId));
-    configAttrs.append("release_lock_id", rewriter.getI32IntegerAttr(t.releaseLockId));
-
-    c.tileConfigDicts.push_back(rewriter.getDictionaryAttr(configAttrs));
-
     return success();
 }
 
@@ -527,30 +506,92 @@ LogicalResult FlowTransferConversion::emitCoreBufferDma(FlowLoweringCtx &c, Core
                         t.coreOooBdId = c.shimPerTileBdIds[idx];
                 }
 
-                if (t.ppDepth == 1) {
-                    emitCoreSingleBufferBd(c, t);
-                } else {
-                    emitCorePingPongBd(c, t);
+                // KERNELCONFIGOFFLOAD: publish this tile's config so the kernel path
+                // can emit the core's self-programming block. Everything above is
+                // per-tile and, for MM2S, NOT uniform across tiles: packetId is
+                // basePacketId+tileIndex and oooBdId comes from shim-side allocation,
+                // neither of which the kernel module clone can recompute. Recorded
+                // here, at the one point where all of it is known.
+                //
+                // Written through ResourceMgr::instance(), NOT the pass-local
+                // `resourceMgr` — only the singleton crosses the host/kernel clone
+                // boundary (same channel coreMemAllocator uses).
+                if (passState && passState->kernelConfigOffload && t.row >= kOffloadCoreRowMin) {
+                    CoreOffloadTileConfig cfg;
+                    cfg.col = (int)t.col;
+                    cfg.row = (int)t.row;
+                    cfg.isOutput = t.isOutputFlow;
+                    cfg.channel = (int)c.coreChannel;
+                    cfg.packetId = t.coreBdPacketId;
+                    cfg.enablePacket = t.coreBdEnablePacket;
+                    cfg.oooBdId = t.coreOooBdId;
+                    cfg.bdLenBytes = (int)t.coreBdLen;
+                    cfg.ppDepth = (int)t.ppDepth;
+                    cfg.flowIndex = c.flowIndex;
+                    try {
+                        ResourceMgr::instance()->addCoreOffloadTile(cfg);
+                    } catch (...) {
+                        // instance() throws if init() was never called (unit tests that
+                        // drive this pass standalone). The plan is only consumed under
+                        // the offload pragma, so degrade quietly rather than abort.
+                    }
+                    llvm::errs() << "[KernelConfigOffload] plan tile=(" << cfg.col << "," << cfg.row << ")"
+                                 << " dir=" << (cfg.isOutput ? "MM2S" : "S2MM") << " ch=" << cfg.channel
+                                 << " pktId=" << cfg.packetId << " oooBd=" << cfg.oooBdId << " len=" << cfg.bdLenBytes
+                                 << " ppDepth=" << cfg.ppDepth << "\n";
                 }
 
-                // Create IO handle for core tile
-                auto coreCreateIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
-                    loc, dfschedule::IoHandleType::get(rewriter.getContext()), t.firstCoreBdHandle,
-                    t.coreTileOp.getTile(), rewriter.getI32IntegerAttr(c.coreChannel),
-                    rewriter.getStringAttr(c.coreDmaDirection), rewriter.getStringAttr(c.coreIoOperation),
-                    rewriter.getBoolAttr(false)); // enable_out_of_order=false for core tiles
-                auto coreBdIdOp =
-                    rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), t.coreTileOp.getTile());
-                // Defer core StartIoOp until after ELF is loaded (LoadKernelGroup)
-                // to prevent BSS initialization from overwriting DMA data.
-                // Core tiles use ping-pong BD chaining (next_bd links ping↔pong),
-                // so the DMA hardware automatically re-arms via the chain.
-                // repeat=1 is sufficient; the BD chain does the work.
-                int32_t coreRepeat = 1;
-                llvm::errs() << "[DeferredStartIo] PUSH deferredCoreStartIos flowIdx=" << c.flowIndex
-                             << " tileIdx=" << c.tileIndex << " total=" << (c.deferredCoreStartIos.size() + 1) << "\n";
-                c.deferredCoreStartIos.push_back(
-                    {coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), c.flowIndex, coreRepeat});
+                // KERNELCONFIGOFFLOAD: when on, the AIE core self-programs its own
+                // DMA — BD chain, lock inits, channel start — from kernel.cc via raw
+                // MMIO (passdfscheduletokernelapi emitCoreDmaConfigBlocks), in BOTH
+                // directions. So the host must NOT emit the core-tile DMA chain. Skip
+                // the BD + create_io + deferred start_io. Lock inits ride on the
+                // ConfigDmaBdOp, so skipping the BD also drops them.
+                //
+                // The flow-level policy is decided by the orchestrator as
+                // c.offloadCoreDmaConfig; only the per-tile row test is applied here,
+                // where the row is known: rows below kOffloadCoreRowMin are
+                // shim/memtiles with no core to run the offloaded block.
+                bool offloadSkipCoreDma = c.offloadCoreDmaConfig && t.row >= kOffloadCoreRowMin;
+                if (offloadSkipCoreDma) {
+                    // Skipping emission must NOT skip accounting. The BD ids the core
+                    // self-programs come from KernelResourceManager on the kernel module
+                    // clone, but the hardware BD bank is shared per tile, and the host
+                    // allocates out of this per-tile pool starting at the first free id.
+                    // Claim the ids the kernel will use here — allocate and discard — so
+                    // the host cannot hand the same BD to two owners.
+                    reserveOffloadedCoreBds(c, t);
+                    llvm::errs() << "[KernelConfigOffload] skip host core DMA config dir="
+                                 << (t.isOutputFlow ? "MM2S" : "S2MM")
+                                 << " flowIdx=" << c.flowIndex << " tile=(" << t.col << "," << t.row << ")\n";
+                }
+                if (!offloadSkipCoreDma) {
+                    if (t.ppDepth == 1) {
+                        emitCoreSingleBufferBd(c, t);
+                    } else {
+                        emitCorePingPongBd(c, t);
+                    }
+
+                    // Create IO handle for core tile
+                    auto coreCreateIoOp = rewriter.create<dfschedule::ConfigCreateIoOp>(
+                        loc, dfschedule::IoHandleType::get(rewriter.getContext()), t.firstCoreBdHandle,
+                        t.coreTileOp.getTile(), rewriter.getI32IntegerAttr(c.coreChannel),
+                        rewriter.getStringAttr(c.coreDmaDirection), rewriter.getStringAttr(c.coreIoOperation),
+                        rewriter.getBoolAttr(false)); // enable_out_of_order=false for core tiles
+                    auto coreBdIdOp =
+                        rewriter.create<dfschedule::GetBdIdOp>(loc, rewriter.getI32Type(), t.coreTileOp.getTile());
+                    // Defer core StartIoOp until after ELF is loaded (LoadKernelGroup)
+                    // to prevent BSS initialization from overwriting DMA data.
+                    // Core tiles use ping-pong BD chaining (next_bd links ping↔pong),
+                    // so the DMA hardware automatically re-arms via the chain.
+                    // repeat=1 is sufficient; the BD chain does the work.
+                    int32_t coreRepeat = 1;
+                    llvm::errs() << "[DeferredStartIo] PUSH deferredCoreStartIos flowIdx=" << c.flowIndex
+                                 << " tileIdx=" << c.tileIndex << " total=" << (c.deferredCoreStartIos.size() + 1)
+                                 << "\n";
+                    c.deferredCoreStartIos.push_back(
+                        {coreCreateIoOp.getIoHandle(), coreBdIdOp.getBdId(), c.flowIndex, coreRepeat});
+                }
             } // end if (passState && ...)
         }
     }
@@ -623,6 +664,52 @@ void FlowTransferConversion::emitCoreBufferAlloc(FlowLoweringCtx &c, CoreTileCtx
     if (c.flowAddrsValid) {
         t.pingL1Offset = c.flowPingL1Offset;
         t.pongL1Offset = c.flowPongL1Offset;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// reserveOffloadedCoreBds — KERNELCONFIGOFFLOAD accounting-only counterpart of
+// emitCoreSingleBufferBd / emitCorePingPongBd.
+// ---------------------------------------------------------------------------
+// The core self-programs these BDs from kernel.cc, so the host emits no op for
+// them — but the BD bank is per-tile hardware shared with any flow the host DOES
+// still program on this tile. allocateTileBd() hands out the first free id, so
+// without this the host would reissue the very ids the core is using.
+//
+// Allocation COUNT must mirror what the KERNEL claims, not what the host emitter
+// would have claimed. Those differ: analyzeKernelParams (passblueprinttoschedulekernel)
+// advances its per-window BD counter TWICE for every window unconditionally — a
+// single-buffer window still burns its pong slot to keep window i at bd 2*i/2*i+1 —
+// whereas emitCoreSingleBufferBd would have taken only one. So reserve 2 per tile
+// here even when ppDepth==1, or the kernel's ping id for the next window lands on a
+// BD the host thinks is free. The ids themselves are discarded; only the count and
+// the resulting high-water mark matter.
+//
+// The counts line up because the kernel dedups windows by `declare_data` while the
+// host reserves once per (FlowTransferOp, tile) visit, and every physical core tile
+// is visited by exactly one FlowTransferOp per logical port (tile groups are
+// disjoint). Nothing asserts that invariant. If it ever breaks — two FlowTransferOps
+// sharing a declare_data AND landing on the same tile — the host OVER-reserves while
+// the kernel still burns 2, which wastes pool capacity and eventually trips the loud
+// warning below. That direction is safe; the dangerous direction (under-reserving,
+// which would silently alias a BD) cannot arise from that shape.
+void FlowTransferConversion::reserveOffloadedCoreBds(FlowLoweringCtx &c, CoreTileCtx &t) const {
+    if (!resourceMgr)
+        return;
+
+    constexpr int kKernelBdsPerWindow = 2;
+    for (int i = 0; i < kKernelBdsPerWindow; ++i) {
+        auto bd = resourceMgr->allocateTileBd(t.row, t.col, /*ownerId=*/c.flowIndex);
+        if (!bd) {
+            // Pool exhausted. Emission would have hit the same wall and silently
+            // fallen back to bd 0/1, so say so rather than leaving a quiet alias.
+            llvm::errs() << "WARNING: [KernelConfigOffload] BD reservation failed for tile (" << t.col << "," << t.row
+                         << ") flowIdx=" << c.flowIndex << "; host-programmed BDs on this tile may collide with the"
+                         << " core's self-programmed BDs\n";
+            break;
+        }
+        llvm::errs() << "[KernelConfigOffload] reserve core BD id=" << *bd << " tile=(" << t.col << "," << t.row
+                     << ") flowIdx=" << c.flowIndex << " (self-programmed by kernel.cc)\n";
     }
 }
 
@@ -755,39 +842,13 @@ void FlowTransferConversion::emitCorePingPongBd(FlowLoweringCtx &c, CoreTileCtx 
 }
 
 // ---------------------------------------------------------------------------
-// finalizeKernelConfig — DeclareKernelConfigOp + callee/compute attrs
-// (orig 2217-2246). Preserves the function-local static kernelConfigIdx.
+// finalizeKernelConfig — callee attrs for the kernel group.
 // ---------------------------------------------------------------------------
 void FlowTransferConversion::finalizeKernelConfig(FlowLoweringCtx &c) const {
     ConversionPatternRewriter &rewriter = c.rewriter;
-    Location loc = c.loc;
-
-    // Create individual kernel_config ops for each tile (e.g., @kernelconfig0, @kernelconfig1)
-    // Use static counter to ensure unique names across multiple transfer manifests
-    static int kernelConfigIdx = 0;
-    for (size_t i = 0; i < c.tileConfigDicts.size(); ++i) {
-        std::string configName = "kernelconfig" + std::to_string(kernelConfigIdx++);
-
-        // Create a kernel_config op with a single tile's config
-        SmallVector<Attribute> singleTileConfig;
-        singleTileConfig.push_back(c.tileConfigDicts[i]);
-
-        auto kernelConfigOp = rewriter.create<dfschedule::DeclareKernelConfigOp>(
-            loc, dfschedule::KernelConfigType::get(rewriter.getContext()), rewriter.getStringAttr(configName),
-            rewriter.getArrayAttr(singleTileConfig));
-        (void)kernelConfigOp;
-
-        // Store symbol reference
-        c.kernelConfigSymbols.push_back(SymbolRefAttr::get(rewriter.getContext(), configName));
-    }
 
     // Create callee symbol refs (dskernel_receiver for all)
     c.calleeAttrs.push_back(SymbolRefAttr::get(rewriter.getContext(), "dskernel_receiver"));
-
-    // Create distributed_compute_kernel_args (compute0 for all)
-    for (size_t i = 0; i < c.coreTiles.size(); ++i) {
-        c.computeKernelAttrs.push_back(SymbolRefAttr::get(rewriter.getContext(), "compute0"));
-    }
 }
 
 } // namespace blueprint_sched

@@ -142,7 +142,7 @@ Final dialect before EmitC lowering. Contains both host schedule ops and kernel 
 | `declaretensor` | Declare tensor and allocate device mem |
 | `declaretile` | Declare tile (col, row) |
 | `packet` | Packet (data, dma_channel) |
-| `declare_kernel_config` | Kernel config for multiple tiles |
+| `declare_kernel_config` | Kernel config for multiple tiles (defined but **no longer emitted** by the pipeline — pure metadata, superseded by the BD/lock/start_io ops) |
 | `config.dma_bd` | Configure DMA buffer descriptor |
 | `config.create_io` | Create IO handle |
 | `config.load_kernel_group` | Load kernel group to tiles |
@@ -238,7 +238,7 @@ Physical stream switch and shim port configuration. Used only for `routing.cc`
 **Input**: dfscheblueprint → **Output**: dfschedule (host)
 
 - `FlowTransferOp` → `DeclareTensorOp` + `DeclareTileOp` + `ConfigDmaBdOp` + `ConfigCreateIoOp` + `GetBdIdOp` + `StartIoOp`
-- Core tiles → `DeclareKernelConfigOp` + `LoadKernelGroupOp` + `LaunchKernelGroupOp`
+- Core tiles → `LoadKernelGroupOp` + `LaunchKernelGroupOp` (no `DeclareKernelConfigOp`; per-tile config lives on the BD/lock/start_io ops)
 - `ScheduleWaitOp` on DMA + kernel events
 - Uses `KernelResourceManager` for BD/lock ID allocation
 

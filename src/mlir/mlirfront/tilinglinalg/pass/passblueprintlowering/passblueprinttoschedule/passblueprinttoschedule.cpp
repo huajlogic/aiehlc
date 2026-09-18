@@ -6,7 +6,7 @@
 #include "passblueprinttoschedule.h"
 #include "dfscheblueprintmanager.h"
 #include "dfschedulemanager.h"
-#include "helper/flowtransfer_internal.h"
+#include "../helper/flowtransfer_internal.h"
 #include "hw/ResourceManager.h"
 #include "hw/hwresource.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -202,7 +202,38 @@ LogicalResult FlowTransferConversion::matchAndRewrite(dfscheblueprint::FlowTrans
         rewriter.getStringAttr(c.ioOperation),     // io_operation (SEND or RECV)
         rewriter.getBoolAttr(c.useOOO));           // enable_out_of_order
 
-    // --- KERNEL: core-tile configs (declaretile + kernel_config + core DMA) ---
+    // --- KERNELCONFIGOFFLOAD gate (routing.kernel_config_offload) ---
+    // Decide once, here in the orchestrator, whether this flow's core-tile DMA
+    // *configuration* is offloaded to the core. emitCoreTileConfigs and its
+    // sub-helpers consult c.offloadCoreDmaConfig instead of re-deriving the
+    // policy per tile, so there is a single place that defines what "offloaded"
+    // means for a flow.
+    //
+    // BOTH directions are offloaded. This used to be S2MM-only (&& c.shimIsSender)
+    // because aie_kernel_config.h had no MM2S start encoder; it now has
+    // aie_kc_encode_mm2s_start, and emitCoreDmaConfigBlocks emits MM2S under a
+    // get_coreid() dispatch (MM2S packet_id / ooo_bd_id are per-tile, and one ELF
+    // runs on every tile). The per-tile row check (kOffloadCoreRowMin) is applied
+    // in emitCoreBufferDma, where the tile row is known.
+    //
+    // Suppressing MM2S host-side is only safe because the core now genuinely
+    // programs it: the plan the kernel emits from is published by this same host
+    // walk (ResourceMgr::coreOffloadPlan), so if the plan is empty the kernel pass
+    // hard-fails rather than silently leaving the output DMA unarmed.
+    c.offloadCoreDmaConfig = passState && passState->kernelConfigOffload;
+    if (c.offloadCoreDmaConfig) {
+        llvm::errs() << "[KernelConfigOffload] flowIdx=" << c.flowIndex << " "
+                     << (c.shimIsSender ? "S2MM" : "MM2S")
+                     << " core DMA config offloaded to kernel.cc (host emission suppressed)\n";
+    }
+
+    // --- KERNEL: core-tile configs (declaretile + core DMA) ---
+    // Note: DeclareTileOp is emitted even when offloading. It feeds c.coreTiles
+    // -> load_kernel_group, i.e. it is what loads the kernel ELF onto the core.
+    // The offloaded MMIO block lives in that ELF, so suppressing the tile
+    // declaration would remove the very code meant to replace the host config
+    // (and would trip the c.coreTiles.empty() bail-out below, dropping the
+    // kernel launch entirely).
     if (failed(emitCoreTileConfigs(c)))
         return failure();
 
@@ -274,6 +305,11 @@ void BlueprintToSchedulePass::runOnOperation() {
                 auto attr = moduleOp->getAttrOfType<IntegerAttr>(name);
                 return attr ? attr.getInt() : 0;
             };
+            // KERNELCONFIGOFFLOAD: when the core self-programs its incoming S2MM
+            // DMA from kernel.cc, emitCoreBufferDma must skip the host S2MM core
+            // DMA chain (see BlueprintPassState::kernelConfigOffload).
+            passState->kernelConfigOffload = getI64("routing.kernel_config_offload") != 0;
+
             // Flat module attrs are the fallback source.
             passState->tileM = getI64("routing.tile_m");
             passState->tileRows = getI64("routing.tile_rows");
@@ -351,10 +387,9 @@ void BlueprintToSchedulePass::runOnOperation() {
     }
 
     // Region restructuring is deferred to ScheduleCanonicalizePass.
-    // The dfschedule ops remain inside routing.RoutingCreate bodies, which is
-    // valid because RoutingCreate has the SymbolTable trait needed by
-    // DeclareKernelConfigOp.  ScheduleCanonicalizePass will extract them into
-    // per-partition scf.execute_region blocks and erase the routing ops.
+    // The dfschedule ops remain inside routing.RoutingCreate bodies;
+    // ScheduleCanonicalizePass will extract them into per-partition
+    // scf.execute_region blocks and erase the routing ops.
 }
 
 } // namespace mlir

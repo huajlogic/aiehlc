@@ -30,9 +30,37 @@ struct WindowInfo {
     std::string pongBuffer;
     std::string acquireLock;
     std::string releaseLock;
-    int32_t bufferSize = 0; // Per-window buffer size from window_def attribute
-    int32_t numRounds = 0;  // Number of ping-pong rounds (0 = use bufferSize as fallback)
-    std::string direction;  // "in" or "out"
+    int32_t bufferSize = 0;    // Per-window buffer size from window_def attribute
+    int32_t numRounds = 0;     // Number of ping-pong rounds (0 = use bufferSize as fallback)
+    std::string direction;     // "in" or "out"
+    int32_t channel = 0;       // Core-tile DMA channel (S2MM in / MM2S out)
+    bool singleBuffer = false; // Single-buffer (no pong) mode
+    // KERNELCONFIGOFFLOAD resources resolved by BlueprintToScheduleKernelPass.
+    // Present on both input and output windows under offload; -1 = not provided.
+    int32_t pingBdId = -1;
+    int32_t pongBdId = -1;
+    int32_t acquireLockHwId = -1; // 0..15 hardware lock index for MMIO encoding
+    int32_t releaseLockHwId = -1; // (acquireLock/releaseLock above stay the 48+N
+                                  // intrinsic names used by kernel builtins)
+};
+
+/// KERNELCONFIGOFFLOAD per-tile entry, mirrored out of the kernel module's
+/// `dfschedule.core_offload_plan` array attr (published by the host path via
+/// ResourceMgr). One per (col,row,direction).
+///
+/// This exists because MM2S core config is NOT uniform across tiles: packet_id
+/// and ooo_bd_id differ per tile, and there is only one kernel.cc/ELF broadcast
+/// to all of them. The emitted code therefore branches on get_coreid().
+struct CoreOffloadEntry {
+    int32_t col = -1;
+    int32_t row = -1;
+    bool isOutput = false;
+    int32_t channel = 0;
+    int32_t packetId = 0;
+    bool enablePacket = false;
+    int32_t oooBdId = -1;
+    int32_t bdLenBytes = 0;
+    int32_t ppDepth = 2;
 };
 
 /// dfschedule.module -> convert entire body line-by-line then erase module.
@@ -45,6 +73,15 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                                   ConversionPatternRewriter &rewriter) const override {
         Location loc = op.getLoc();
         Block &body = op.getBody().front();
+
+        // KERNELCONFIGOFFLOAD gate: the core self-configures its incoming S2MM
+        // DMA (BD chain + lock inits + channel-start) from kernel.cc via raw
+        // MMIO instead of the host programming it over the config bus.
+        // BlueprintToScheduleKernelPass owns that decision (and the BD/lock ids
+        // it implies) and stamps it here, so this pass only formats the result.
+        bool offloadOn = false;
+        if (auto a = op->getAttrOfType<IntegerAttr>("dfschedule.kernel_config_offload"))
+            offloadOn = a.getInt() != 0;
 
         // Build map: window symbol name -> (ping_buffer, pong_buffer, acquire_lock, release_lock)
         llvm::StringMap<WindowInfo> windowInfoMap;
@@ -66,7 +103,50 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                     info.numRounds = a.getInt();
                 if (auto a = winAttrs.getAs<StringAttr>("direction"))
                     info.direction = a.getValue().str();
+                if (auto a = winAttrs.getAs<IntegerAttr>("dma_channel"))
+                    info.channel = a.getInt();
+                if (auto a = winAttrs.getAs<BoolAttr>("single_buffer"))
+                    info.singleBuffer = a.getValue();
+                if (auto a = winAttrs.getAs<IntegerAttr>("ping_bd_id"))
+                    info.pingBdId = a.getInt();
+                if (auto a = winAttrs.getAs<IntegerAttr>("pong_bd_id"))
+                    info.pongBdId = a.getInt();
+                if (auto a = winAttrs.getAs<IntegerAttr>("acquire_lock_hw_id"))
+                    info.acquireLockHwId = a.getInt();
+                if (auto a = winAttrs.getAs<IntegerAttr>("release_lock_hw_id"))
+                    info.releaseLockHwId = a.getInt();
                 windowInfoMap[windowDefOp.getSymName().str()] = info;
+            }
+        }
+
+        // KERNELCONFIGOFFLOAD per-tile plan (see CoreOffloadEntry).
+        SmallVector<CoreOffloadEntry> offloadPlan;
+        if (auto planAttr = op->getAttrOfType<ArrayAttr>("dfschedule.core_offload_plan")) {
+            for (Attribute a : planAttr) {
+                auto d = dyn_cast<DictionaryAttr>(a);
+                if (!d)
+                    continue;
+                CoreOffloadEntry e;
+                auto geti = [&](StringRef k, int32_t dflt) -> int32_t {
+                    if (auto v = d.getAs<IntegerAttr>(k))
+                        return v.getInt();
+                    return dflt;
+                };
+                auto getb = [&](StringRef k) -> bool {
+                    if (auto v = d.getAs<BoolAttr>(k))
+                        return v.getValue();
+                    return false;
+                };
+                e.col = geti("col", -1);
+                e.row = geti("row", -1);
+                e.isOutput = getb("is_output");
+                e.channel = geti("channel", 0);
+                e.packetId = geti("packet_id", 0);
+                e.enablePacket = getb("enable_packet");
+                e.oooBdId = geti("ooo_bd_id", -1);
+                e.bdLenBytes = geti("bd_len_bytes", 0);
+                e.ppDepth = geti("pp_depth", 2);
+                offloadPlan.push_back(e);
             }
         }
 
@@ -102,6 +182,8 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 rewriter.create<emitc::VerbatimOp>(loc, "#include <adf.h>");
                 rewriter.create<emitc::VerbatimOp>(loc, "#include <aie_api/aie.hpp>");
                 rewriter.create<emitc::VerbatimOp>(loc, "#include <aie_api/aie_adf.hpp>");
+                if (offloadOn)
+                    rewriter.create<emitc::VerbatimOp>(loc, "#include \"aie_kernel_config.h\"");
                 rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_READ  1");
                 rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_WRITE 0");
                 // Emit per-window BUF_SZ defines (e.g. BUF_SZ_IN_0, BUF_SZ_OUT_0)
@@ -235,7 +317,9 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 continue;
             }
             if (auto mainOp = dyn_cast<KernelMainOp>(&inner)) {
-                convertMainToEmitC(rewriter, mainOp, op, windowInfoMap, elementType);
+                if (failed(
+                        convertMainToEmitC(rewriter, mainOp, op, windowInfoMap, elementType, offloadOn, offloadPlan)))
+                    return failure();
                 continue;
             }
         }
@@ -244,9 +328,216 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         return success();
     }
 
-    void convertMainToEmitC(ConversionPatternRewriter &rewriter, KernelMainOp mainOp, KernelModuleOp kernelModuleOp,
-                            const llvm::StringMap<WindowInfo> &windowInfoMap,
-                            const std::string &elementType) const {
+    // KERNELCONFIGOFFLOAD: emit the raw-MMIO block that self-configures every
+    // incoming S2MM window (ping/pong BD chain + lock inits + channel-start)
+    // via the aie_kernel_config.h encoder. BD ids and hardware lock indices are
+    // resolved upstream by BlueprintToScheduleKernelPass and read off window_def;
+    // this function only formats them. BD base address + length come from the
+    // core's own C buffer symbols. Lock values mirror the host emitCorePingPongBd:
+    // DMA acquires the window ACQ lock (init = ppdepth 2 / single 1) with val -1,
+    // releases the window REL lock (init 0) with val 1.
+    //
+    // Locks are emitted as *hardware* indices (0..15), not the 48+N intrinsic ids
+    // the kernel's acquire/release builtins use: aie_kc_encode_lock addresses
+    // LOCK0_VALUE + id*0x10 (valid only through LOCK15), and the BD LOCK_ACQ_ID /
+    // LOCK_REL_ID fields are 4 bits wide. Passing 48 there would write past the
+    // lock array into the LOCKS_EVENT_SELECTION registers and silently truncate
+    // the BD fields. window_init() still takes the intrinsic macro names.
+    // Shared by both directions: validate the upstream-resolved ids on a window.
+    // Missing/out-of-range values mean the two passes disagree, which would
+    // otherwise surface as MMIO writes to unrelated registers on hardware — fail
+    // the build instead.
+    static LogicalResult checkWindowOffloadIds(WindowDefOp windowDefOp, const WindowInfo &w,
+                                               ArrayRef<CoreOffloadEntry> offloadPlan) {
+        if (w.pingBdId < 0 || (!w.singleBuffer && w.pongBdId < 0)) {
+            windowDefOp.emitError() << "KERNELCONFIGOFFLOAD: window '" << windowDefOp.getSymName()
+                                    << "' is missing ping_bd_id/pong_bd_id from BlueprintToScheduleKernelPass";
+            return failure();
+        }
+        // Buffering-mode agreement between the two paths.
+        //
+        // The host allocates only a PING buffer when pp_depth==1 (emitCoreBufferAlloc
+        // in helper/flowtransfer_kernel.cpp) — the pong symbol is never registered in
+        // CoreMemAllocator. The kernel path, however, never sets `singleBuffer` today,
+        // so it would emit a full ping<->pong BD chain whose pong buffer address
+        // resolves to 0 via CoreMemAllocator::getAddress (which returns 0 on a miss,
+        // silently). That is a DMA writing to a bogus L1 address, visible only on
+        // hardware.
+        //
+        // The host publishes its real pp_depth per tile, so cross-check it rather than
+        // trusting either side alone, and fail the build on disagreement.
+        const bool isOut = (w.direction == "out");
+        for (const auto &e : offloadPlan) {
+            if (e.isOutput != isOut)
+                continue;
+            if (e.ppDepth == 1 && !w.singleBuffer) {
+                windowDefOp.emitError()
+                    << "KERNELCONFIGOFFLOAD: window '" << windowDefOp.getSymName() << "' is ping-pong on the kernel "
+                    << "path but the host reports pp_depth=1 for tile (" << e.col << "," << e.row
+                    << "); the host allocates no pong buffer in that mode, so the emitted pong BD would target L1 "
+                       "address 0. Propagate single-buffer mode into KernelParamInfo::singleBuffer, or keep "
+                       "pp_depth>=2 on offloaded tiles";
+                return failure();
+            }
+        }
+        if (w.acquireLockHwId < 0 || w.acquireLockHwId > 15 || w.releaseLockHwId < 0 || w.releaseLockHwId > 15) {
+            windowDefOp.emitError()
+                << "KERNELCONFIGOFFLOAD: window '" << windowDefOp.getSymName() << "' has hardware lock ids ("
+                << w.acquireLockHwId << ", " << w.releaseLockHwId
+                << ") outside the 0..15 memory-module lock range; register-level programming needs the "
+                   "hardware index, not the 48+N kernel-intrinsic lock id";
+            return failure();
+        }
+        return success();
+    }
+
+    // Body of one window's BD chain + lock init, shared by S2MM and MM2S.
+    // `pktArgs` supplies the en_packet/pkt_id/pkt_type/ooo_bd_id tail of
+    // aie_kc_encode_bd: constant "0, 0, 0, -1" for S2MM (circuit-switched), and
+    // per-tile literals for MM2S. `indent` keeps the emitted C readable when this
+    // sits inside a get_coreid() dispatch arm.
+    static std::string emitWindowBdAndLocks(const WindowInfo &w, StringRef pktArgs, StringRef indent) {
+        const std::string in = indent.str();
+        const std::string flush =
+            in + "  for (_k = 0; _k < _n; _k++) *(volatile uint32_t *)(uintptr_t)_kc[_k].off = _kc[_k].val;\n";
+        const std::string one = in + "  *(volatile uint32_t *)(uintptr_t)_kc[0].off = _kc[0].val;\n";
+        const std::string acq = std::to_string(w.acquireLockHwId);
+        const std::string rel = std::to_string(w.releaseLockHwId);
+        const std::string ping = w.pingBuffer;
+        const std::string pong = w.pongBuffer.empty() ? w.pingBuffer : w.pongBuffer;
+        const std::string pkt = pktArgs.str();
+
+        // The BD's acquire/release lock ids are SWAPPED for output, mirroring the
+        // host (helper/flowtransfer_kernel.cpp: `bdAcquireLockId = isOutputFlow ?
+        // releaseLockId : acquireLockId`):
+        //   S2MM (in):  DMA acquires the window ACQ lock, releases REL.
+        //   MM2S (out): DMA acquires the window REL lock, releases ACQ.
+        const bool isOut = (w.direction == "out");
+        const std::string bdAcq = isOut ? rel : acq;
+        const std::string bdRel = isOut ? acq : rel;
+        const std::string ppInit = w.singleBuffer ? "1" : "2";
+
+        std::string s;
+        s += in + "  // hw lock ids " + acq + "/" + rel + " = " + w.acquireLock + "/" + w.releaseLock +
+             " minus the 48 kernel-intrinsic lock base\n";
+        s += in + "  AieKcReg _kc[8];\n" + in + "  int _n, _k;\n";
+        if (w.singleBuffer) {
+            // Single buffer: one BD, no next chaining.
+            s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pingBdId) + ", (uintptr_t)" + ping +
+                 ", sizeof(" + ping + "), -1, " + bdAcq + ", -1, " + bdRel + ", 1, " + pkt + ");\n" + flush;
+        } else {
+            // Ping-pong: pong BD (next -> ping) then ping BD (next -> pong).
+            s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pongBdId) + ", (uintptr_t)" + pong +
+                 ", sizeof(" + pong + "), " + std::to_string(w.pingBdId) + ", " + bdAcq + ", -1, " + bdRel + ", 1, " +
+                 pkt + ");\n" + flush;
+            s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pingBdId) + ", (uintptr_t)" + ping +
+                 ", sizeof(" + ping + "), " + std::to_string(w.pongBdId) + ", " + bdAcq + ", -1, " + bdRel + ", 1, " +
+                 pkt + ");\n" + flush;
+        }
+        // Lock INITS are the same expression in both directions — window ACQ gets
+        // ppdepth, window REL gets 0 — even though the two directions mean opposite
+        // things by it, because the BD acq/rel swap above already encodes the
+        // difference:
+        //   S2MM: ACQ is the DMA's acquire (buffers free to receive into).
+        //   MM2S: ACQ is the KERNEL's acquire (buffers free to produce into), while
+        //         the DMA's acquire is REL at 0 so it waits for the kernel.
+        // This mirrors the host (passdfscheduletoapi.cpp: output inits
+        // `kernelAcquireLock = releaseLockId` to ppdepth and leaves the DMA's
+        // acquire at the hardware default 0). Swapping these deadlocks.
+        s += in + "  aie_kc_encode_lock(_kc, " + acq + ", " + ppInit + ");\n" + one;
+        s += in + "  aie_kc_encode_lock(_kc, " + rel + ", 0);\n" + one;
+        s += in + "  " + (isOut ? "aie_kc_encode_mm2s_start" : "aie_kc_encode_s2mm_start") + "(_kc, " +
+             std::to_string(w.channel) + ", " + std::to_string(w.pingBdId) + ", 1, 0);\n" + one;
+        return s;
+    }
+
+    // KERNELCONFIGOFFLOAD: emit the raw-MMIO blocks that self-configure the core's
+    // own DMA (BD chain + lock inits + channel-start) via the aie_kernel_config.h
+    // encoder. BD ids and hardware lock indices are resolved upstream by
+    // BlueprintToScheduleKernelPass and read off window_def; this only formats them.
+    // BD base address + length come from the core's own C buffer symbols.
+    //
+    // Two shapes, because the two directions differ in whether config is uniform:
+    //   S2MM (input)  — identical on every core tile (circuit-switched, no packet
+    //                   id, no out-of-order bd). Emitted straight-line.
+    //   MM2S (output) — packet_id and ooo_bd_id are PER TILE, but there is exactly
+    //                   one kernel.cc/ELF broadcast to every tile. Emitted inside a
+    //                   get_coreid() dispatch, one arm per tile, from the host's
+    //                   published plan (dfschedule.core_offload_plan).
+    //
+    // Locks are emitted as *hardware* indices (0..15), not the 48+N intrinsic ids
+    // the kernel's acquire/release builtins use: aie_kc_encode_lock addresses
+    // LOCK0_VALUE + id*0x10 (valid only through LOCK15), and the BD LOCK_ACQ_ID /
+    // LOCK_REL_ID fields are 4 bits wide. Passing 48 there would write past the
+    // lock array into the LOCKS_EVENT_SELECTION registers and silently truncate
+    // the BD fields. window_init() still takes the intrinsic macro names.
+    LogicalResult emitCoreDmaConfigBlocks(ConversionPatternRewriter &rewriter, Location loc,
+                                          KernelModuleOp kernelModuleOp,
+                                          const llvm::StringMap<WindowInfo> &windowInfoMap,
+                                          ArrayRef<CoreOffloadEntry> offloadPlan) const {
+        for (Operation &inner : kernelModuleOp.getBody().front()) {
+            auto windowDefOp = dyn_cast<WindowDefOp>(&inner);
+            if (!windowDefOp)
+                continue;
+            auto it = windowInfoMap.find(windowDefOp.getSymName());
+            if (it == windowInfoMap.end())
+                continue;
+            const WindowInfo &w = it->second;
+            const bool isOut = (w.direction == "out");
+            if (!isOut && w.direction != "in")
+                continue;
+
+            if (failed(checkWindowOffloadIds(windowDefOp, w, offloadPlan)))
+                return failure();
+
+            std::string block;
+            if (!isOut) {
+                block = "{ // KERNELCONFIGOFFLOAD S2MM " + windowDefOp.getSymName().str() + "\n";
+                block += emitWindowBdAndLocks(w, /*pktArgs=*/"0, 0, 0, -1", /*indent=*/"");
+                block += "}";
+            } else {
+                // Collect this direction's per-tile entries.
+                SmallVector<const CoreOffloadEntry *> outTiles;
+                for (const auto &e : offloadPlan)
+                    if (e.isOutput)
+                        outTiles.push_back(&e);
+                if (outTiles.empty()) {
+                    windowDefOp.emitError()
+                        << "KERNELCONFIGOFFLOAD: output window '" << windowDefOp.getSymName()
+                        << "' has no per-tile entries in dfschedule.core_offload_plan; the host path "
+                           "(helper/flowtransfer_kernel.cpp) must publish MM2S tiles before the core can "
+                           "self-program them";
+                    return failure();
+                }
+
+                block = "{ // KERNELCONFIGOFFLOAD MM2S " + windowDefOp.getSymName().str() + "\n";
+                block += "  // packet_id and ooo_bd_id differ per tile, but one ELF runs on all of\n";
+                block += "  // them, so dispatch on the core's own id.\n";
+                block += "  unsigned _cid = get_coreid();\n";
+                block += "  int _col = (int)(_cid >> 16);\n";
+                block += "  int _row = (int)(_cid & 0x1F);\n";
+                for (size_t i = 0; i < outTiles.size(); ++i) {
+                    const CoreOffloadEntry &e = *outTiles[i];
+                    std::string pkt = std::string(e.enablePacket ? "1" : "0") + ", " + std::to_string(e.packetId) +
+                                      ", 0, " + std::to_string(e.oooBdId);
+                    block += std::string("  ") + (i == 0 ? "if" : "else if") + " (_col == " + std::to_string(e.col) +
+                             " && _row == " + std::to_string(e.row) + ") {\n";
+                    block += emitWindowBdAndLocks(w, pkt, "  ");
+                    block += "  }\n";
+                }
+                // No else: a core tile outside the plan has no host-programmed MM2S
+                // either, so arming nothing is the correct and safe outcome.
+                block += "}";
+            }
+            rewriter.create<emitc::VerbatimOp>(loc, block);
+        }
+        return success();
+    }
+
+    LogicalResult convertMainToEmitC(ConversionPatternRewriter &rewriter, KernelMainOp mainOp,
+                                     KernelModuleOp kernelModuleOp, const llvm::StringMap<WindowInfo> &windowInfoMap,
+                                     const std::string &elementType, bool offloadOn,
+                                     ArrayRef<CoreOffloadEntry> offloadPlan) const {
         Location loc = mainOp.getLoc();
         Block &mainBody = mainOp.getBody().front();
 
@@ -269,6 +560,18 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         rewriter.create<emitc::VerbatimOp>(loc, "sync_buffer[0] = 0;");
         rewriter.create<emitc::VerbatimOp>(loc, "sync_buffer[1] = -1;");
         rewriter.create<emitc::VerbatimOp>(loc, "klog_init();");
+
+        // KERNELCONFIGOFFLOAD: arm the core's own DMA (S2MM in, MM2S out) before
+        // the first window_init so every descriptor is live at core entry.
+        //
+        // Ordering: the host has already armed the shim side and enabled this core
+        // before main() runs, so the shim may already be streaming. Arming here —
+        // as early as possible in main(), ahead of window_init and any compute —
+        // is the tightest the offload can be. The incoming S2MM has buffering and
+        // lock backpressure to absorb the gap; the outgoing MM2S cannot produce
+        // until the kernel releases a buffer, which happens strictly later.
+        if (offloadOn && failed(emitCoreDmaConfigBlocks(rewriter, loc, kernelModuleOp, windowInfoMap, offloadPlan)))
+            return failure();
 
         for (Operation &inner : mainBody) {
             if (isa<AllocSyncBufferOp>(&inner)) {
@@ -347,6 +650,7 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
             auto c0 = rewriter.create<emitc::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
             rewriter.create<emitc::ReturnOp>(loc, c0.getResult());
         }
+        return success();
     }
 };
 

@@ -746,6 +746,22 @@ std::optional<int> ResourceMgr::allocateTileBd(int row, int col, int ownerId) {
     return tile(row, col).allocateBd(ownerId);
 }
 
+// ──────────────────────────────────────────────────────────────
+// KERNELCONFIGOFFLOAD per-tile plan (host path -> kernel path)
+// ──────────────────────────────────────────────────────────────
+void ResourceMgr::addCoreOffloadTile(const CoreOffloadTileConfig &cfg) {
+    // Upsert on (col,row,direction). The host walks a tile once per flow, but a
+    // re-walk must refresh rather than append — a duplicated tile would emit a
+    // second, contradictory arm of the kernel-side dispatch.
+    for (auto &e : coreOffloadPlan_) {
+        if (e.col == cfg.col && e.row == cfg.row && e.isOutput == cfg.isOutput) {
+            e = cfg;
+            return;
+        }
+    }
+    coreOffloadPlan_.push_back(cfg);
+}
+
 bool ResourceMgr::releaseTileBd(int row, int col, int bdId, int ownerId) {
     if (row < 0 || row >= rows() || col < 0 || col >= cols())
         return false;
@@ -816,4 +832,40 @@ bool ResourceMgr::isPktIdFree(int pktId) const {
     if (pktId < 0 || pktId >= kMaxPktId)
         return false;
     return !pktIdPool_[pktId].used;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Control-plane resource reservation (excludes control-plane stream-switch
+// resources from routing/scheduling). Reads the reservation table
+// (aie_runtime_resource.c) — the single source of truth.
+// ──────────────────────────────────────────────────────────────
+void ResourceMgr::reserveControlPlaneResources(rt_res_gen gen) {
+    if (controlPlaneReserved_)
+        return; // idempotent
+
+    // 1. Exclude reserved pkt-ids so allocatePktId never hands them out.
+    uint32_t pmask = __Runtime_res_reserved_pktid_mask(gen);
+    for (int i = 0; i < kMaxPktId; ++i) {
+        if (pmask & (1u << i)) {
+            pktIdPool_[i].used = true;
+            pktIdPool_[i].ownerId = kControlPlaneOwner;
+        }
+    }
+
+    // 2. Record reserved arbiter + per-port slot masks for routing/scheduling.
+    reservedArbiterMask_ = __Runtime_res_reserved_arbiter_mask(gen);
+    for (int p = 0; p < kNumPortTypes; ++p) {
+        reservedSlotMask_[p][0] = __Runtime_res_reserved_slot_mask(gen, (uint8_t)p, /*is_master=*/0);
+        reservedSlotMask_[p][1] = __Runtime_res_reserved_slot_mask(gen, (uint8_t)p, /*is_master=*/1);
+    }
+
+    controlPlaneReserved_ = true;
+    std::cout << "[ResourceMgr] control-plane resources reserved (gen=" << (int)gen << " pktidmask=0x" << std::hex
+              << pmask << " arbmask=0x" << reservedArbiterMask_ << std::dec << ")" << std::endl;
+}
+
+int ResourceMgr::reservedSlotMask(uint8_t port, uint8_t is_master) const {
+    if (port >= kNumPortTypes || is_master > 1)
+        return 0;
+    return reservedSlotMask_[port][is_master];
 }

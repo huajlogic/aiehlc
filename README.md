@@ -315,6 +315,93 @@ indices and valid-but-unused channels. Tiles a given kernel does not own are
 skipped so multi-kernel meshes are not spuriously failed. The `Default` form
 (`aie_trace(col, row)`, S2MM ch0) is not validated.
 
+## Control-Plane Pragmas
+
+Two opt-in marker pragmas (no arguments) enable control-plane features in the
+multi-tile (`tilinglinalg`) flow. Both are off by default; add the pragma to your
+source file to turn the feature on. They are detected during preprocessing and
+published as module attributes that gate the corresponding MLIR pipeline stage.
+
+```cpp
+#pragma control_plan_op_control_packet
+#pragma CONTROL_PLAN_GROUP_REG_WRITE
+
+__global__ void mykernel(const int32_t *A, int32_t *B) {
+    // kernel code
+}
+
+int main() {
+    // host code
+}
+```
+
+| Pragma | Module attr | Effect when present |
+|--------|-------------|---------------------|
+| `#pragma control_plan_op_control_packet` | `routing.control_plan_op_control_packet` | The routing/scheduling pipeline **reserves** (excludes) control-plane stream-switch resources (pkt-ids / arbiters / slots) so the control-plane fabric and the data plane do not collide. Absent => reservation is skipped. |
+| `#pragma CONTROL_PLAN_GROUP_REG_WRITE` | `routing.control_plan_group_reg_write` | The host pipeline runs `GroupRegWritePass`, which coalesces identical core-tile lock-init register writes into **control-packet group writes** (broadcast / row-multicast, lowered to `__Runtime_ctrl_row_write_ack`). Absent => the pass is skipped and lock inits are emitted as individual `XAie_LockSetValue` register writes. |
+
+### `#pragma control_plan_op_control_packet`
+
+Reserves control-plane resources so a control-packet fabric (see the row-control
+planner APIs in `aie_runtime.h`) can share the array with the data plane without
+resource conflicts. The pipeline gates `reserveControlPlaneResources(...)` on the
+published attr.
+
+### `#pragma CONTROL_PLAN_GROUP_REG_WRITE`
+
+Enables `GroupRegWritePass`. In a tiled GEMM the per-tile lock inits are identical
+across the mesh; when this pass runs it clusters them by `(tile-local addr, value)`
+and folds a cluster that covers all configured tiles into a single `broadcast`
+group write, or all columns of one row into a `row` group write. Each group write
+lowers to a blocking `__Runtime_ctrl_row_write_ack` call in `host.cc`. Without the
+pragma the pass does not run (the pipeline logs
+`GroupRegWritePass skipped (enable with #pragma CONTROL_PLAN_GROUP_REG_WRITE)`)
+and every lock init is emitted individually.
+
+Both pragmas work in the single-kernel and multi-kernel `tilinglinalg` paths.
+
+## Kernel Config Offload
+
+`#pragma KERNELCONFIGOFFLOAD` (no arguments, off by default) moves the core
+tile's **incoming S2MM** DMA configuration off the host and into the AIE core
+itself. Add the pragma to your `tilinglinalg` source file to enable it:
+
+```cpp
+#pragma KERNELCONFIGOFFLOAD
+```
+
+| Pragma | Module attr | Effect |
+|--------|-------------|--------|
+| `#pragma KERNELCONFIGOFFLOAD` | `routing.kernel_config_offload` | The core self-configures its incoming S2MM DMA from `kernel.cc` via raw MMIO instead of the host programming it over the config bus. The host's `removeCoreTileHostDmaChain` becomes S2MM-selective (drops the core-tile S2MM BD chain + lock inits + channel-start), while MM2S stays host-side. Absent => the host programs all core-tile DMA as before. |
+
+### What gets offloaded
+
+When enabled, `convertMainToEmitC` emits a raw-MMIO block into `kernel.cc`
+`main()` — after `klog_init()` and before the first `window_init` — that
+self-configures every **incoming (S2MM)** window:
+
+- **Ping/pong BD chain** (or a single BD for single-buffer windows). Input
+  window `i` (in `window_def` declaration order) claims ping bd `2*i` /
+  pong bd `2*i+1` — the same `0..2·nIn−1` range the host resource manager used
+  for inputs, so kernel-side S2MM bd-ids never collide with host-side MM2S
+  bd-ids (allocated at higher ids).
+- **Lock inits**: acquire lock = ping-pong depth (`2`, or `1` single-buffer),
+  release lock = `0` — mirroring the host `emitCorePingPongBd`.
+- **S2MM channel-start** on the window's DMA channel.
+
+BD base address and length come from the core's own C buffer symbols
+(`(uintptr_t)buf_in_ping_0`, `sizeof(buf_in_ping_0)`), so the block is uniform
+across all core tiles and needs no runtime `(col,row)`. The encoder lives in
+[`include/aie_kernel_config.h`](include/aie_kernel_config.h)
+(`aie_kc_encode_bd` / `aie_kc_encode_lock` / `aie_kc_encode_s2mm_start`).
+
+### Scope and limitations
+
+- **S2MM only.** The outgoing **MM2S** BD stays host-side (per-`(col,row)`
+  offload needs a core-position mechanism — a separate design). MemTile / shim
+  self-config, non-gen5 targets, and mid-run reconfiguration are out of scope.
+- Gen5 (AIE2PS) only.
+
 ## Build Options
 
 Two host-build toggles, both off by default and both compile-time (they change how
