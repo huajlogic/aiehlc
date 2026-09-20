@@ -25,6 +25,23 @@
 
 #include <stdint.h>
 
+/* ---- Core-side address windows ----
+ *
+ * The register offsets below are TILE-LOCAL, i.e. what the XAie driver uses when
+ * it pokes a tile over the config bus from the host. Code running ON the core
+ * does not see that address space directly: the core's own memory map places the
+ * tile's control/config registers at CORE_PC_CONTROL_BASE_ADDR, so a core-side
+ * access must be CORE_PC_CONTROL_BASE_ADDR + <tile-local offset>.
+ *
+ * Writing the bare tile-local offset from the core lands in the core's DATA
+ * memory window instead of the register window — it silently scribbles on data
+ * memory and the DMA is never programmed. That is why an S2MM channel could
+ * appear "not started" even though the code ran: the start-queue write went to
+ * the wrong window entirely.
+ */
+#define AIE_KC_CORE_PC_CONTROL_BASE_ADDR 0x80000u /* core view of tile ctrl/config regs */
+#define AIE_KC_CORE_DM_BASE_ADDR 0x70000u         /* core data memory: 0x40000-0x7FFFF (256K) */
+
 /* ---- AIE2PS memory-module (tile-local) register offsets ---- */
 #define AIE_KC_DMA_BD0_0 0x1D000u     /* MEMORY_MODULE_DMA_BD0_0 */
 #define AIE_KC_DMA_BD_STRIDE 0x20u    /* per-BD IdxOffset */
@@ -35,11 +52,33 @@
 #define AIE_KC_LOCK0_VALUE 0x1F000u   /* MEMORY_MODULE_LOCK0_VALUE */
 #define AIE_KC_LOCK_STRIDE 0x10u      /* per-lock */
 
-/* One register write: tile-local byte offset + value. */
+/* One register write: tile-local byte offset + value.
+ * `off` is TILE-LOCAL — rebase with core_reg_write/core_reg_read to access it
+ * from code running on the core. */
 typedef struct {
     uint32_t off;
     uint32_t val;
 } AieKcReg;
+
+/* ---- Core-side register access ----
+ *
+ * Rebase a tile-local register offset into the core's control window and
+ * read/write it. ALL core-side register traffic must go through these; a raw
+ * `*(volatile uint32_t *)off` targets data memory, not the register.
+ */
+static inline volatile uint32_t *core_reg_ptr(uint32_t reg_addr) {
+    return (volatile uint32_t *)(uintptr_t)(AIE_KC_CORE_PC_CONTROL_BASE_ADDR + reg_addr);
+}
+
+static inline uint32_t core_reg_read(uint32_t reg_addr) { return *core_reg_ptr(reg_addr); }
+
+static inline void core_reg_write(uint32_t reg_addr, uint32_t value) { *core_reg_ptr(reg_addr) = value; }
+
+/* Flush an encoded register block (the AieKcReg[] the encoders below fill). */
+static inline void core_reg_write_block(const AieKcReg *regs, int n) {
+    for (int i = 0; i < n; i++)
+        core_reg_write(regs[i].off, regs[i].val);
+}
 
 /* Emulate the driver's XAie_SetField(v, Lsb, Mask) = (v << Lsb) & Mask.
  * Signed field values (e.g. a lock acquire value of -1) are passed already

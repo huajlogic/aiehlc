@@ -227,6 +227,7 @@ Restart Claude Code (or reload MCP) to pick up the rebuilt server.
 - **[script/verify_env.sh](script/verify_env.sh)** — validate Vitis, LLVM, toolchain, board vars before build
 - **[script/hostcompile.sh](script/hostcompile.sh)** — kernel build via `compile_one_kernel()` → `kc.sh`; do not restore deleted `compile_kernel.sh` (skill: hostcompile-entrypoint)
 - **[script/aiehlc.sh](script/aiehlc.sh)** — `--platform sim` is build-only; launch sim separately via `runsim.sh` or debug UI **Run** (skills: sim-build-run-separation, raw-xaie-sim-debug-bundle)
+- **[script/kc.sh](script/kc.sh)** — after linking the kernel ELF it runs `strip_kernel_debug_loc`: `llvm-objcopy` drops `.debug_loc` and the `.debug_info` group (13.7 MB → 82 KB on matmul; the chess VLIW scheduler explodes location lists), keeps `.debug_line` so `kernel.linemap.json` / aiediag pc are unaffected, and parks the full-DWARF original at `<out>/kernel_debug`. The kernel ELF is embedded into the host ELF (`ld -r -b binary`) and JTAG-downloaded by `dow -force`, so this is the JTAG download time. Pass `--keep-debug-loc` to opt out. Must be `llvm-objcopy` — GNU binutils rejects the chess `e_machine 0x108`.
 
 ## Key Terms
 

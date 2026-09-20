@@ -6,7 +6,7 @@
  */
 #include "simplematmul.h"
 // #pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
-#pragma aie_debug_level(0 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
+#pragma aie_debug_level(0 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN | AIE_KERNEL_CONFIG_TRACE)
 // Declarative per-tile core trace: mesh/partition-relative (col,row) of the
 // compute tile to trace. Repeatable; supports ranges e.g. #pragma aie_trace(1:2, 3).
 // #pragma aie_trace((0, 3), (PARAMETER, "win_a"))
@@ -41,7 +41,7 @@ constexpr aie::GemmSpace LtoR_Merge = {
                .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
     .d1 = {.fullsize = M, .tile_size = 16, .stride = 16},  // C: M-tile
     .d2 = {.fullsize = N, .tile_size = 16, .stride = 16}}; // C: N-tile
-// #define DEBUG_OUTPUT_ORDER 1
+#define DEBUG_OUTPUT_ORDER 1
 #define DEBUG_NOCOMPUTE 1
 //  Per-kernel GLOBAL policy, bound explicitly at the declaration site via
 //  __global__(matmul_policy). The <kernel>_policy naming convention still works
@@ -56,6 +56,7 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
     // Compiler-resolved tiling parameters
     // const int eff_k = aie::get_effective_k();            // K chunk size per k-round
     // const int k_rounds = aie::get_k_rounds();            // number of K-accumulation rounds
+    printf("log offload matmul\n");
     const int k_rounds = aie::get_arg_total_rounds_in_dim(1, win_a);
     const int eff_k = aie::get_arg_per_round_size_in_dim(1, win_a);
     const int eff_k_b = aie::get_arg_per_round_size_in_dim(1, win_b);

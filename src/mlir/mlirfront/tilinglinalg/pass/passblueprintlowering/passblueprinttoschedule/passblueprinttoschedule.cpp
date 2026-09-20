@@ -234,7 +234,11 @@ LogicalResult FlowTransferConversion::matchAndRewrite(dfscheblueprint::FlowTrans
     // declaration would remove the very code meant to replace the host config
     // (and would trip the c.coreTiles.empty() bail-out below, dropping the
     // kernel launch entirely).
-    if (failed(emitCoreTileConfigs(c)))
+    // Under offload the CORE emits its own DMA config (BlueprintToScheduleKernelPass
+    // calls this same emitter into the kernel module). The host still walks the
+    // tiles here — it must reserve the BD ids and publish coreOffloadPlan — but
+    // emits no core DMA ops.
+    if (failed(emitCoreTileConfigs(c, coreDeps(/*emitCoreDma=*/!c.offloadCoreDmaConfig))))
         return failure();
 
     if (c.coreTiles.empty()) {

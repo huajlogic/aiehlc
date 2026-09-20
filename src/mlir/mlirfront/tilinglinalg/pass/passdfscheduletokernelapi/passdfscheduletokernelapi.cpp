@@ -398,9 +398,29 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
     // sits inside a get_coreid() dispatch arm.
     static std::string emitWindowBdAndLocks(const WindowInfo &w, StringRef pktArgs, StringRef indent) {
         const std::string in = indent.str();
-        const std::string flush =
-            in + "  for (_k = 0; _k < _n; _k++) *(volatile uint32_t *)(uintptr_t)_kc[_k].off = _kc[_k].val;\n";
-        const std::string one = in + "  *(volatile uint32_t *)(uintptr_t)_kc[0].off = _kc[0].val;\n";
+        // Register writes go through core_reg_write (aie_kernel_config.h), which
+        // rebases the TILE-LOCAL offset into the core's control window at
+        // AIE_KC_CORE_PC_CONTROL_BASE_ADDR (0x80000).
+        //
+        // This was the S2MM-not-starting bug: the emitted code wrote the bare
+        // tile-local offset (`*(volatile uint32_t *)0x1DE04`), which from the core's
+        // own address map is DATA memory (DM base 0x70000, 0x40000-0x7FFFF), not the
+        // DMA register. The BD/lock/start writes silently landed in data memory and
+        // the DMA was never programmed — so the channel raised no start event even
+        // though the code ran.
+        //
+        // Every write is also traced to klog under KERNELCONFIGOFFLOAD_TRACE. Tags
+        // are 4 chars (klog's format); "OFF "/"VAL " pair per write, so a reader sees
+        // the exact (tile-local register, value) stream the core issued.
+        const std::string trace = in + "#ifdef KERNELCONFIGOFFLOAD_TRACE\n" + in +
+                                  "  for (_k = 0; _k < _n; _k++) { klog(\"OFF \", (int32_t)_kc[_k].off);"
+                                  " klog(\"VAL \", (int32_t)_kc[_k].val); }\n" +
+                                  in + "#endif\n";
+        const std::string traceOne = in + "#ifdef KERNELCONFIGOFFLOAD_TRACE\n" + in +
+                                     "  klog(\"OFF \", (int32_t)_kc[0].off); klog(\"VAL \", (int32_t)_kc[0].val);\n" +
+                                     in + "#endif\n";
+        const std::string flush = in + "  core_reg_write_block(_kc, _n);\n" + trace;
+        const std::string one = in + "  core_reg_write(_kc[0].off, _kc[0].val);\n" + traceOne;
         const std::string acq = std::to_string(w.acquireLockHwId);
         const std::string rel = std::to_string(w.releaseLockHwId);
         const std::string ping = w.pingBuffer;
@@ -420,7 +440,10 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         std::string s;
         s += in + "  // hw lock ids " + acq + "/" + rel + " = " + w.acquireLock + "/" + w.releaseLock +
              " minus the 48 kernel-intrinsic lock base\n";
-        s += in + "  AieKcReg _kc[8];\n" + in + "  int _n, _k;\n";
+        // _k only exists for the trace loop; declaring it unconditionally would warn
+        // as unused in the normal (untraced) build.
+        s += in + "  AieKcReg _kc[8];\n" + in + "  int _n;\n" + in + "#ifdef KERNELCONFIGOFFLOAD_TRACE\n" + in +
+             "  int _k;\n" + in + "#endif\n";
         if (w.singleBuffer) {
             // Single buffer: one BD, no next chaining.
             s += in + "  _n = aie_kc_encode_bd(_kc, " + std::to_string(w.pingBdId) + ", (uintptr_t)" + ping +
@@ -446,8 +469,18 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         // acquire at the hardware default 0). Swapping these deadlocks.
         s += in + "  aie_kc_encode_lock(_kc, " + acq + ", " + ppInit + ");\n" + one;
         s += in + "  aie_kc_encode_lock(_kc, " + rel + ", 0);\n" + one;
+        // Channel start. Traced with its own tag AND the channel number, because
+        // this is the write most likely to be silently ineffective: with start_bd=0
+        // and repeat=1 every field of the value is 0, so the register write is a
+        // no-content write and the DMA raises no start event. "STCH"/"STOF"/"STVL"
+        // give channel / offset / value so a zero value is visible as such rather
+        // than looking like the block never executed.
         s += in + "  " + (isOut ? "aie_kc_encode_mm2s_start" : "aie_kc_encode_s2mm_start") + "(_kc, " +
-             std::to_string(w.channel) + ", " + std::to_string(w.pingBdId) + ", 1, 0);\n" + one;
+             std::to_string(w.channel) + ", " + std::to_string(w.pingBdId) + ", 1, 0);\n";
+        s += in + "#ifdef KERNELCONFIGOFFLOAD_TRACE\n" + in + "  klog(\"" + (isOut ? "STMM" : "STS2") + "\", " +
+             std::to_string(w.channel) + ");\n" + in +
+             "  klog(\"STOF\", (int32_t)_kc[0].off); klog(\"STVL\", (int32_t)_kc[0].val);\n" + in + "#endif\n";
+        s += one;
         return s;
     }
 
@@ -497,10 +530,23 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 block += "}";
             } else {
                 // Collect this direction's per-tile entries.
+                // One arm per PHYSICAL TILE, not per plan entry. The plan is keyed
+                // by (col,row,direction,flow) because a tile can belong to several
+                // flows on the same direction, but the dispatch below branches on
+                // (col,row) alone — a second entry for the same tile would emit an
+                // unreachable `else if` and silently drop whichever arm lost.
+                // First entry wins; they describe the same physical MM2S channel.
                 SmallVector<const CoreOffloadEntry *> outTiles;
-                for (const auto &e : offloadPlan)
-                    if (e.isOutput)
+                for (const auto &e : offloadPlan) {
+                    if (!e.isOutput)
+                        continue;
+                    bool seen = false;
+                    for (const auto *o : outTiles)
+                        if (o->col == e.col && o->row == e.row)
+                            seen = true;
+                    if (!seen)
                         outTiles.push_back(&e);
+                }
                 if (outTiles.empty()) {
                     windowDefOp.emitError()
                         << "KERNELCONFIGOFFLOAD: output window '" << windowDefOp.getSymName()
