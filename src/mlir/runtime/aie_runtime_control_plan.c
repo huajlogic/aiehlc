@@ -120,7 +120,7 @@ static acr_rc acr_emit_master(acr_oplist *o, acr_portbook *b, uint8_t c, uint8_t
  * are no longer separately routed; the runtime's class-write wrappers still exist
  * but resolve onto this uniform superset.) */
 static acr_rc acr_plan_chain_ex(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t rowidx, uint8_t col_lo,
-                                uint8_t col_hi, uint8_t ctrl_id, int shim_col, acr_port head_ingress) {
+                                uint8_t col_hi, uint8_t ctrl_id, int shim_col, acr_port head_ingress, int is_top) {
     if (col_hi < col_lo || col_hi >= 64)
         return ACR_ERR_BOUNDS;
     if (rowidx > ACR_MAX_ROW_IDX) /* target row index lives in id[1:0] */
@@ -132,7 +132,7 @@ static acr_rc acr_plan_chain_ex(acr_oplist *o, acr_portbook *b, uint8_t row, uin
         acr_port sport = (c == col_lo) ? head_ingress : ACR_WEST;
         int is_last = (c == col_hi);
         int has_east = !is_last;
-        int is_spine_head = (shim_col >= 0) && (c == (uint8_t)shim_col) && (c == col_lo);
+        int is_spine_head = (shim_col >= 0) && (c == (uint8_t)shim_col) && (c == col_lo) && !is_top;
 
         acr_rc rc;
         /* Book the ingress slave *port* (idx 0) once; slots are sub-resources. */
@@ -245,7 +245,8 @@ acr_rc acr_plan_return_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_
 /* Public chain planner: plain horizontal chain, head tile ingresses on WEST, no
  * vertical spine climb (shim_col=-1). A plain chain is a single row => rowidx 0. */
 acr_rc acr_plan_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_lo, uint8_t col_hi, uint8_t ctrl_id) {
-    return acr_plan_chain_ex(o, b, row, /*rowidx=*/0, col_lo, col_hi, ctrl_id, /*shim_col=*/-1, ACR_WEST);
+    return acr_plan_chain_ex(o, b, row, /*rowidx=*/0, col_lo, col_hi, ctrl_id, /*shim_col=*/-1, ACR_WEST,
+                             /*is_top=*/1);
 }
 
 /* True if @row is an already-configured chain head in @s. */
@@ -338,7 +339,7 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
     /* Build the horizontal chain; head tile takes the spine input from SOUTH and
      * emits its broadcast NORTH climb master (head sits on shim_col == col_lo). */
     acr_rc rc = acr_plan_chain_ex(o, b, row, /*rowidx=*/s->nrows, col_lo, col_hi, ctrl_id, /*shim_col=*/(int)shim_col,
-                                  ACR_SOUTH);
+                                  ACR_SOUTH, is_top);
     if (rc != ACR_OK)
         return rc;
 
