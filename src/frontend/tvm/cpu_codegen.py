@@ -46,7 +46,7 @@ classic ``te.create_schedule`` + ``get_source`` API and the newer
 
 import os
 
-from .model import LayerOp
+from .model import CONFIG_SZ as _CFG_SZ, LayerOp
 
 # Ops the AIE runtime pipeline handles; everything else falls back to CPU C.
 AIE_OPS = {"conv_bn", "conv_bn_relu"}
@@ -197,20 +197,33 @@ def build_llvm(op: LayerOp, func_name: str = "cpu"):
     return _make_module(tensors, func_name, "llvm"), tensors
 
 
-def cpu_c_source(op: LayerOp, func_name: str) -> str:
-    """Return the TVM ``target="c"`` source for a CPU ``op`` (entry ``func_name``)."""
+def cpu_c_source(op: LayerOp, func_name: str, force: bool = False) -> str:
+    """Return the TVM ``target="c"`` source for a CPU ``op`` (entry ``func_name``).
+
+    ``force=True`` is the **force-offload-to-CPU** escape hatch (test purpose):
+    an AIE op (conv2d family) that would normally go to the AIE backend is
+    instead emitted as the self-contained, bit-exact plain-C transcription of
+    the oracle (``plain_c_source``) — the TVM ``target="c"`` packed-function form
+    has no bit-exact conv builder, so the plain-C form is used for forced convs.
+    Non-AIE ops (and ``force=False``) keep the TVM ``target="c"`` path.
+    """
+    if force and is_aie_op(op.op):
+        return plain_c_source(op, func_name, force=True)
     tensors = op_tensors(op)
     mod = _make_module(tensors, func_name, "c")
     return _module_source(mod)
 
 
-def emit_cpu_launch(op: LayerOp, out_dir: str, func_name: str) -> bool:
-    """Write ``<func_name>.c`` (TVM CPU C) for ``op`` into ``out_dir``.
+def emit_cpu_launch(op: LayerOp, out_dir: str, func_name: str,
+                    force: bool = False) -> bool:
+    """Write ``<func_name>.c`` (CPU C) for ``op`` into ``out_dir``.
 
-    Returns ``True`` on success. Raises ``ValueError`` for a non-CPU op.
+    Returns ``True`` on success. ``force=True`` allows an AIE op (conv2d family)
+    to be force-offloaded to the CPU backend for testing (emitted as bit-exact
+    plain-C). Without ``force`` an AIE op raises ``ValueError``.
     """
     os.makedirs(out_dir, exist_ok=True)
-    src = cpu_c_source(op, func_name)
+    src = cpu_c_source(op, func_name, force=force)
     with open(os.path.join(out_dir, f"{func_name}.c"), "w") as f:
         f.write(src)
     return True
@@ -245,6 +258,71 @@ def _plain_c_residual(func_name: str) -> str:
         "    if (s < 0) s = 0;\n"
         "    if (s > 127) s = 127;\n"
         "    out[i] = (int8_t)s;\n"
+        "  }\n"
+        "}\n")
+
+
+def _plain_c_conv(func_name: str, relu: bool) -> str:
+    """Plain-C Conv2D + Q7 BN (+ optional ReLU), config read from params header.
+
+    Force-offload-to-CPU transcription of the AIE conv kernel
+    (``kernels._conv_body``) and the numpy oracle (``_compiler._cpu_conv``), with
+    a plain, self-contained ABI (no AIE windows, only ``<stdint.h>``):
+
+        void <fn>(const int8_t* feat, const int8_t* params, int8_t* out)
+
+    ``params`` is the same buffer ``model.make_conv_params`` builds and the AIE
+    kernel reads: ``[config:6 = {H,W,Cin,Cout,K,stride}][weights][bn_scale:Cout]
+    [bn_bias:Cout]`` (config bytes read as ``uint8``). The two load-bearing wrap
+    details are preserved verbatim so the output is byte-identical to the oracle:
+    the accumulator is ``int16_t`` (wraps at each ``+=``) and the Q7 BN truncates
+    the ``acc*scale`` product to ``int16`` *before* the ``>>7``.
+    """
+    lo = "0" if relu else "-128"
+    kind = "conv_bn_relu" if relu else "conv_bn"
+    return (
+        "#include <stdint.h>\n\n"
+        f"// {kind}: Conv2D + Q7 BatchNorm{' + ReLU' if relu else ''} "
+        "(config from params header)\n"
+        f"void {func_name}(const int8_t* feat, const int8_t* params, int8_t* out) {{\n"
+        "  // uint16 LE config fields -- must match model.pack_config and the\n"
+        "  // AIE kernel's CFG16 macro exactly, or the two diverge silently.\n"
+        "  #define CFG16(p, i) ((int)(uint8_t)(p)[(i)*2] | ((int)(uint8_t)(p)[(i)*2+1] << 8))\n"
+        "  int H      = CFG16(params, 0);\n"
+        "  int W      = CFG16(params, 1);\n"
+        "  int Cin    = CFG16(params, 2);\n"
+        "  int Cout   = CFG16(params, 3);\n"
+        "  int K      = CFG16(params, 4);\n"
+        "  int stride = CFG16(params, 5);\n"
+        "  int pad  = K / 2;\n"
+        "  int outH = H / stride;\n"
+        "  int outW = W / stride;\n"
+        "  int wt_count = Cin * Cout * K * K;\n"
+        f"  const int8_t* weights  = &params[{_CFG_SZ}];\n"
+        f"  const int8_t* bn_scale = &params[{_CFG_SZ} + wt_count];\n"
+        f"  const int8_t* bn_bias  = &params[{_CFG_SZ} + wt_count + Cout];\n"
+        "  for (int oc = 0; oc < Cout; ++oc) {\n"
+        "    for (int oh = 0; oh < outH; ++oh) {\n"
+        "      for (int ow = 0; ow < outW; ++ow) {\n"
+        "        int16_t acc = 0;\n"
+        "        for (int ic = 0; ic < Cin; ++ic)\n"
+        "          for (int kh = 0; kh < K; ++kh)\n"
+        "            for (int kw = 0; kw < K; ++kw) {\n"
+        "              int ih = oh * stride + kh - pad;\n"
+        "              int iw = ow * stride + kw - pad;\n"
+        "              if (ih >= 0 && ih < H && iw >= 0 && iw < W) {\n"
+        "                int in_idx = ic * H * W + ih * W + iw;\n"
+        "                int wt_idx = oc * Cin * K * K + ic * K * K + kh * K + kw;\n"
+        "                acc += (int16_t)feat[in_idx] * (int16_t)weights[wt_idx];\n"
+        "              }\n"
+        "            }\n"
+        "        int16_t bn_out = (int16_t)(acc * (int16_t)bn_scale[oc]) >> 7;\n"
+        "        bn_out += (int16_t)bn_bias[oc];\n"
+        "        if (bn_out > 127) bn_out = 127;\n"
+        f"        if (bn_out < {lo}) bn_out = {lo};\n"
+        "        out[oc * outH * outW + oh * outW + ow] = (int8_t)bn_out;\n"
+        "      }\n"
+        "    }\n"
         "  }\n"
         "}\n")
 
@@ -286,31 +364,42 @@ def _plain_c_avgpool_fc(func_name: str, spatial_h: int, spatial_w: int,
         "}\n")
 
 
-def plain_c_source(op: LayerOp, func_name: str) -> str:
+def plain_c_source(op: LayerOp, func_name: str, force: bool = False) -> str:
     """Return self-contained plain-C source for a CPU ``op`` (entry ``func_name``).
 
     Unlike ``cpu_c_source`` (TVM FFI packed function), the returned C is a plain
     ``void <func_name>(...)`` needing only ``<stdint.h>`` and is bit-exact with
-    the numpy Q7 oracle. Raises ``ValueError`` for AIE ops / unknown ops.
+    the numpy Q7 oracle.
+
+    ``force=True`` is the **force-offload-to-CPU** escape hatch (test purpose):
+    an AIE op (conv2d family) is emitted as its bit-exact plain-C conv
+    (``void <fn>(const int8_t* feat, const int8_t* params, int8_t* out)``, config
+    read from the params header). Without ``force`` an AIE op raises ``ValueError``.
     """
     if op.op == "residual_add_relu":
         return _plain_c_residual(func_name)
     if op.op == "avgpool_fc":
         return _plain_c_avgpool_fc(func_name, op.spatial_h, op.spatial_w,
                                    op.channels, op.num_classes)
-    if is_aie_op(op.op):
-        raise ValueError(f"{op.op!r} is an AIE op, not a CPU-codegen op")
+    if op.op in ("conv_bn_relu", "conv_bn"):
+        if not force:
+            raise ValueError(
+                f"{op.op!r} is an AIE op; pass force=True to force-offload it "
+                "to the CPU backend (test purpose)")
+        return _plain_c_conv(func_name, relu=(op.op == "conv_bn_relu"))
     raise ValueError(f"unknown op {op.op!r} (no plain-C emitter)")
 
 
-def emit_cpu_launch_plain(op: LayerOp, out_dir: str, func_name: str) -> bool:
+def emit_cpu_launch_plain(op: LayerOp, out_dir: str, func_name: str,
+                          force: bool = False) -> bool:
     """Write self-contained plain-C ``<func_name>.c`` for ``op`` into ``out_dir``.
 
     Plain-C sibling of ``emit_cpu_launch`` (no TVM FFI). Returns ``True`` on
-    success. Raises ``ValueError`` for a non-CPU op.
+    success. ``force=True`` allows an AIE op (conv2d family) to be force-offloaded
+    to the CPU backend for testing; without it a non-CPU op raises ``ValueError``.
     """
     os.makedirs(out_dir, exist_ok=True)
-    src = plain_c_source(op, func_name)
+    src = plain_c_source(op, func_name, force=force)
     with open(os.path.join(out_dir, f"{func_name}.c"), "w") as f:
         f.write(src)
     return True

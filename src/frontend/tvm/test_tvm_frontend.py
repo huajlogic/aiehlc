@@ -41,15 +41,31 @@ from frontend.tvm.relay_import import tvm_available, onnx_available
 # Kept separate from _compiler._cpu_* so the test cross-checks two
 # implementations rather than comparing the frontend to itself.
 
+def _cfg16(params, i):
+    """Read config field ``i`` as a little-endian uint16 (see model.pack_config).
+
+    Decoded inline rather than via ``model.unpack_config`` to keep this oracle an
+    independent implementation — it cross-checks ``_compiler`` rather than
+    sharing code with it. The ``np.uint8`` casts are load-bearing: ``params`` is
+    int8, so a byte >= 0x80 would sign-extend and corrupt the field.
+    """
+    return int(np.uint8(params[i * 2])) | (int(np.uint8(params[i * 2 + 1])) << 8)
+
+
+# Config header: 6 fields x 2 bytes. One byte per field would cap every
+# dimension at 255, which real ResNet-18 exceeds (512 channels, 1000 classes).
+_CFG_SZ = 6 * 2
+
+
 def _triton_conv(feat_in, params, relu):
-    H, W = int(np.uint8(params[0])), int(np.uint8(params[1]))
-    Cin, Cout = int(np.uint8(params[2])), int(np.uint8(params[3]))
-    K, stride = int(np.uint8(params[4])), int(np.uint8(params[5]))
+    H, W = _cfg16(params, 0), _cfg16(params, 1)
+    Cin, Cout = _cfg16(params, 2), _cfg16(params, 3)
+    K, stride = _cfg16(params, 4), _cfg16(params, 5)
     pad = K // 2
     wt_count = Cin * Cout * K * K
-    weights = params[6:6 + wt_count]
-    bn_scale = params[6 + wt_count:6 + wt_count + Cout]
-    bn_bias = params[6 + wt_count + Cout:6 + wt_count + Cout * 2]
+    weights = params[_CFG_SZ:_CFG_SZ + wt_count]
+    bn_scale = params[_CFG_SZ + wt_count:_CFG_SZ + wt_count + Cout]
+    bn_bias = params[_CFG_SZ + wt_count + Cout:_CFG_SZ + wt_count + Cout * 2]
     outH, outW = H // stride, W // stride
     out = np.zeros(Cout * outH * outW, dtype=np.int8)
     lo = 0 if relu else -128
@@ -419,6 +435,67 @@ def test_plain_c_cpu_bit_exact():
         assert np.array_equal(out, ref), f"avgpool_fc {list(out)} != {list(ref)}"
 
 
+def test_force_offload_conv_to_cpu():
+    """A conv2d op force-offloaded to CPU emits bit-exact plain-C.
+
+    ``plain_c_source(conv, force=True)`` / ``cpu_c_source(conv, force=True)``
+    return a self-contained ``void <fn>(feat, params, out)`` that must be
+    byte-identical to ``_compiler._cpu_conv``. Without ``force`` the conv is
+    still rejected (it belongs to the AIE path by default).
+    """
+    import shutil, subprocess, ctypes, tempfile
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        print("  [skip] no C compiler"); return
+
+    # Without force, a conv is rejected on the CPU path (default AIE routing).
+    conv_relu = model.LayerOp(op="conv_bn_relu", out="o", ins=["f", "params"],
+                              H=8, W=8, Cin=4, Cout=8, K=3, stride=1)
+    for op in (conv_relu, model.LayerOp(op="conv_bn", out="o", ins=["f", "params"],
+                                        H=8, W=8, Cin=4, Cout=8, K=3, stride=2)):
+        try:
+            cpu_codegen.plain_c_source(op, "k")
+        except ValueError:
+            pass
+        else:
+            assert False, f"{op.op} must be rejected without force=True"
+
+    # With force, both cpu_c_source and plain_c_source return the plain-C conv,
+    # bit-exact vs the numpy oracle over both relu (>=0 clamp) and non-relu paths.
+    rng = np.random.default_rng(7)
+    cases = [
+        ("conv_bn_relu", 8, 8, 4, 8, 3, 1),   # stem-like, relu
+        ("conv_bn",      8, 8, 4, 8, 3, 2),    # downsample stride-2, no relu
+        ("conv_bn_relu", 4, 4, 8, 16, 3, 1),   # deeper, more channels
+    ]
+    for name, H, W, Cin, Cout, K, stride in cases:
+        op = model.LayerOp(op=name, out="o", ins=["f", "params"],
+                           H=H, W=W, Cin=Cin, Cout=Cout, K=K, stride=stride)
+        src = cpu_codegen.plain_c_source(op, "conv_test", force=True)
+        assert "void conv_test(" in src
+        # cpu_c_source(force=True) routes AIE ops to the same plain-C.
+        assert cpu_codegen.cpu_c_source(op, "conv_test", force=True) == src
+
+        params = model.make_conv_params(H, W, Cin, Cout, K, stride)
+        feat = rng.integers(-128, 128, Cin * H * W).astype(np.int8)
+        out_n = Cout * op.out_h * op.out_w
+        with tempfile.TemporaryDirectory() as d:
+            cpath = os.path.join(d, "c.c"); sopath = os.path.join(d, "c.so")
+            open(cpath, "w").write(src)
+            subprocess.run([cc, "-shared", "-fPIC", "-O2", cpath, "-o", sopath],
+                           check=True)
+            lib = ctypes.CDLL(sopath)
+            out = np.zeros(out_n, dtype=np.int8)
+            p = ctypes.POINTER(ctypes.c_int8)
+            lib.conv_test(feat.ctypes.data_as(p), params.ctypes.data_as(p),
+                          out.ctypes.data_as(p))
+        ref = _compiler._cpu_conv(feat, params, relu=(name == "conv_bn_relu"))
+        assert np.array_equal(out, ref), \
+            f"{name} {H}x{W} C{Cin}->{Cout} K{K} s{stride}: " \
+            f"{list(out)} != {list(ref)}"
+    print("PASS test_force_offload_conv_to_cpu")
+
+
 def test_buffer_graph_chains():
     """_buffer_graph maps each layer to (in_bufs, out_buf) with sizes, chaining producers."""
     from frontend.tvm import orchestrator
@@ -485,6 +562,50 @@ def test_orchestrate_plan_emits_driver():
                     f"avgpool_fc bias offset != {wts_len}: {line}")
 
         assert any(f.endswith(".c") for f in os.listdir(bd))
+
+
+def test_orchestrate_plan_offload_disabled():
+    """enable_aiehlc_offload=False emits NO kernel_*.cc and no __aie_launch.
+
+    Regression: the flag used to gate only the demo's per-launch stage, so the
+    A2 orchestrator still routed every conv through ``orchestrate_conv_layer``
+    and hostcompile.sh ran xchesscc on ~20 kernels for a supposedly all-CPU
+    build. Asserts the whole pipeline is CPU: one plain-C ``.c`` per op, a
+    standalone host.cc with no dispatcher, and direct 3-arg conv calls in main.
+    """
+    try:
+        core = _compiler._core()
+    except Exception as e:
+        print("  [skip] pybind not built:", e); return
+    import tempfile
+    from frontend.tvm import orchestrator
+    plan = build_plan(None)
+    launches = core.lower_aiegraph(_compiler.build_aiegraph_ir(plan))
+    with tempfile.TemporaryDirectory() as d:
+        bd = orchestrator.orchestrate_plan(plan, launches, d,
+                                           enable_aiehlc_offload=False)
+        files = os.listdir(bd)
+        # The load-bearing assertion: nothing for xchesscc to compile.
+        assert not [f for f in files if f.startswith("kernel_")], \
+            f"offload disabled but kernel sources emitted: {files}"
+        # Every op — conv2d family included — got a plain-C body.
+        for op, L in zip(plan, launches):
+            assert f"{L['func_name']}.c" in files, \
+                f"no plain-C for {L['func_name']} ({op.op})"
+        host = open(os.path.join(bd, "host.cc")).read()
+        assert "__aie_launch" not in host, "all-CPU host.cc has an AIE dispatcher"
+        main = open(os.path.join(bd, "main.cc")).read()
+        assert "__aie_launch" not in main, "all-CPU main.cc still calls __aie_launch"
+        # Forced convs call the 3-arg plain-C ABI (feat, params, out).
+        conv = next(L["func_name"] for op, L in zip(plan, launches)
+                    if cpu_codegen.is_aie_op(op.op))
+        line = next(ln.strip() for ln in main.splitlines()
+                    if ln.strip().startswith(conv + "("))
+        assert line.count(",") == 2, f"forced-conv call arity wrong: {line}"
+        # Params are filled with the real Q7 pattern, not memset to zero — an
+        # all-zero conv params buffer means H=W=0 (config is its first 6 bytes).
+        assert "fill_conv_params(" in main, "conv params not initialized"
+    print("PASS test_orchestrate_plan_offload_disabled")
 
 
 def test_orchestrate_builds_elf():
@@ -649,8 +770,10 @@ def _main():
         ("cpu codegen rejects AIE op", test_cpu_codegen_rejects_aie_op),
         ("dispatch routes non-conv to CPU (if built)", test_dispatch_routes_non_conv_to_cpu),
         ("plain-C CPU bit-exact (if cc)", test_plain_c_cpu_bit_exact),
+        ("force-offload conv to CPU (if cc)", test_force_offload_conv_to_cpu),
         ("buffer graph chains producers", test_buffer_graph_chains),
         ("orchestrate_plan emits driver (if built)", test_orchestrate_plan_emits_driver),
+        ("orchestrate_plan offload=False is all-CPU", test_orchestrate_plan_offload_disabled),
         ("orchestrate builds main.elf (if toolchain)", test_orchestrate_builds_elf),
         ("import is unfused (if tvm/onnx)", test_import_is_unfused),
         ("recover primitives (if tvm/onnx)", test_recover_primitives),

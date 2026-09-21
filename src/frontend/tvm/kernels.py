@@ -32,9 +32,13 @@ for bit-exactness with those references:
 
 Config travels in the parameter buffer header (not as scalar kernel args, which
 this ABI has no room for), so ONE body serves every conv/fc launch:
-  * conv params:  [config:6 = {H,W,Cin,Cout,K,stride}][weights][bn_scale][bn_bias]
-  * fc params:    [config:4 = {sp_h,sp_w,channels,nclass}][weights][bias]
-Config bytes are read as ``uint8`` (matching the CPU ref's ``int(np.uint8(...))``).
+  * conv params:  [config = {H,W,Cin,Cout,K,stride}][weights][bn_scale][bn_bias]
+  * fc params:    [config = {sp_h,sp_w,channels,nclass}][weights][bias]
+Each config field is TWO bytes -- a little-endian uint16 read via the ``CFG16``
+macro below, NOT a single ``uint8``. One byte would cap every dimension at 255,
+which real ResNet-18 exceeds (512 channels, 1000 classes). The header sizes come
+from ``model.CONFIG_SZ`` / ``FC_CONFIG_SZ`` so the readers cannot drift from the
+writer (``model.pack_config``).
 
 The residual kernel has no param buffer, so its element count comes from the
 pipeline's ``BUF_SZ_OUT_0`` macro (``passdfscheduletokernelapi.cpp:123``). That
@@ -55,19 +59,21 @@ void {func_name}(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
     int8_t *params  = (int8_t *)acquire_input_window(window_in_1);
     int8_t *out     = (int8_t *)acquire_output_window(window_out_0);
 
-    int H      = (int)(uint8_t)params[0];
-    int W      = (int)(uint8_t)params[1];
-    int Cin    = (int)(uint8_t)params[2];
-    int Cout   = (int)(uint8_t)params[3];
-    int K      = (int)(uint8_t)params[4];
-    int stride = (int)(uint8_t)params[5];
+    // Config fields are little-endian uint16 pairs (see model.pack_config):
+    // one byte would cap every dimension at 255, which real ResNet-18 exceeds.
+    int H      = CFG16(params, 0);
+    int W      = CFG16(params, 1);
+    int Cin    = CFG16(params, 2);
+    int Cout   = CFG16(params, 3);
+    int K      = CFG16(params, 4);
+    int stride = CFG16(params, 5);
     int pad  = K / 2;
     int outH = H / stride;
     int outW = W / stride;
     int wt_count = Cin * Cout * K * K;
-    int8_t *weights  = &params[6];
-    int8_t *bn_scale = &params[6 + wt_count];
-    int8_t *bn_bias  = &params[6 + wt_count + Cout];
+    int8_t *weights  = &params[CFG_SZ];
+    int8_t *bn_scale = &params[CFG_SZ + wt_count];
+    int8_t *bn_bias  = &params[CFG_SZ + wt_count + Cout];
 
     for (int oc = 0; oc < Cout; oc++) {{
         for (int oh = 0; oh < outH; oh++) {{
@@ -144,15 +150,15 @@ void {func_name}(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
     int8_t *fc_params = (int8_t *)acquire_input_window(window_in_1);
     int8_t *logits    = (int8_t *)acquire_output_window(window_out_0);
 
-    int spatial_h   = (int)(uint8_t)fc_params[0];
-    int spatial_w   = (int)(uint8_t)fc_params[1];
-    int channels    = (int)(uint8_t)fc_params[2];
-    int num_classes = (int)(uint8_t)fc_params[3];
+    int spatial_h   = CFG16(fc_params, 0);
+    int spatial_w   = CFG16(fc_params, 1);
+    int channels    = CFG16(fc_params, 2);
+    int num_classes = CFG16(fc_params, 3);
     int spatial_sz  = spatial_h * spatial_w;
-    int8_t *fc_weights = &fc_params[4];
-    int8_t *fc_bias    = &fc_params[4 + channels * num_classes];
+    int8_t *fc_weights = &fc_params[FC_CFG_SZ];
+    int8_t *fc_bias    = &fc_params[FC_CFG_SZ + channels * num_classes];
 
-    int8_t pooled[256];
+    int8_t pooled[MAX_POOL_CH];
     for (int c = 0; c < channels; c++) {{
         int16_t s = 0;
         for (int idx = 0; idx < spatial_sz; idx++)
@@ -177,6 +183,34 @@ void {func_name}(input_window_int8 *window_in_0, input_window_int8 *window_in_1,
 """
 
 
+# ── Shared C prelude prepended to every kernel body ─────────────────────────
+#
+# CFG16 decodes the little-endian uint16 config fields model.pack_config writes.
+# The cast through uint8_t matters: params is int8_t*, so a raw byte >= 0x80
+# would sign-extend and corrupt the field (e.g. Cout=512 -> lo=0x00 hi=0x02 is
+# fine, but Cin=200 -> lo=0xC8 would read as -56 without the cast).
+#
+# MAX_POOL_CH bounds avgpool_fc's on-stack pooled[] array. Real ResNet-18 ends
+# at 512 channels; the old fixed 256 would overflow the stack silently. Now that
+# the uint16 header makes >255 channels representable, this is the binding
+# limit, so model.make_fc_params rejects anything above it up front.
+_KERNEL_PRELUDE = """#ifndef AIEHLC_KERNEL_PRELUDE
+#define AIEHLC_KERNEL_PRELUDE
+#define CFG_SZ {cfg_sz}
+#define FC_CFG_SZ {fc_cfg_sz}
+#define MAX_POOL_CH {max_pool_ch}
+#define CFG16(p, i) ((int)(uint8_t)(p)[(i) * 2] | ((int)(uint8_t)(p)[(i) * 2 + 1] << 8))
+#endif
+"""
+
+
+def _prelude() -> str:
+    """Return the C prelude, with sizes taken from model.py (single source)."""
+    from .model import CONFIG_SZ, FC_CONFIG_SZ, MAX_POOL_CHANNELS
+    return _KERNEL_PRELUDE.format(cfg_sz=CONFIG_SZ, fc_cfg_sz=FC_CONFIG_SZ,
+                                  max_pool_ch=MAX_POOL_CHANNELS)
+
+
 # Map plan op name -> (body generator, #input windows, #output windows).
 KERNEL_BODIES = {
     "conv_bn_relu":      (conv_bn_relu_body, 2, 1),
@@ -190,7 +224,7 @@ def kernel_body_for(op: str, func_name: str) -> str:
     """Return the full C function body for plan op ``op`` named ``func_name``."""
     if op not in KERNEL_BODIES:
         raise ValueError(f"no kernel body for op {op!r}")
-    return KERNEL_BODIES[op][0](func_name)
+    return _prelude() + KERNEL_BODIES[op][0](func_name)
 
 
 def kernel_windows_for(op: str) -> tuple:

@@ -40,8 +40,23 @@ S0, S1, S2, S3 = 8, 4, 2, 1
 BN_SCALE_DEFAULT = 64  # 0.5 in Q7 (64/128)
 BN_BIAS_DEFAULT = 0
 
-CONFIG_SZ = 6    # conv params header: {H, W, Cin, Cout, K, stride}
-FC_CONFIG_SZ = 4  # fc params header:   {spatial_h, spatial_w, channels, num_classes}
+# Config headers store each field as TWO int8 bytes (little-endian uint16), not
+# one. A single byte caps every dimension at 255, which real ResNet-18 exceeds:
+# 512 channels and 1000 classes. Two bytes reach 65535 and keep the params
+# buffer int8, so nothing else in the pipeline (tensor_specs, DMA, windows)
+# has to change -- only the header width and the readers.
+CONFIG_FIELD_BYTES = 2
+CONFIG_SZ = 6 * CONFIG_FIELD_BYTES    # conv: {H, W, Cin, Cout, K, stride}
+FC_CONFIG_SZ = 4 * CONFIG_FIELD_BYTES  # fc: {spatial_h, spatial_w, channels, num_classes}
+CONFIG_MAX = (1 << (8 * CONFIG_FIELD_BYTES)) - 1
+
+# Upper bound on avgpool_fc's channel count, set by the AIE kernel's fixed
+# on-stack ``pooled[MAX_POOL_CH]`` array (kernels._KERNEL_PRELUDE). Widening the
+# config header to uint16 made channel counts > 255 *representable*, so this is
+# now the binding limit rather than the header width -- and exceeding it would
+# overflow the kernel's stack silently rather than failing to build. Enforced by
+# make_fc_params / fc_params_no_header; keep in lock-step with MAX_POOL_CH.
+MAX_POOL_CHANNELS = 512
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -228,8 +243,27 @@ def layer_plan() -> List[LayerOp]:
 #  Deterministic Q7 int8 parameter buffers (match resnet18_triton.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def pack_config(H, W, Cin, Cout, K, stride) -> np.ndarray:
-    return np.array([H, W, Cin, Cout, K, stride], dtype=np.int8)
+def pack_config(*fields) -> np.ndarray:
+    """Pack config ints as little-endian uint16 pairs, viewed as int8.
+
+    Each field occupies two bytes: ``lo = v & 0xFF``, ``hi = v >> 8``. Values
+    are range-checked rather than silently truncated -- a wrapped dimension
+    produces a network that builds and runs but computes nonsense.
+    """
+    out = np.zeros(len(fields) * CONFIG_FIELD_BYTES, dtype=np.uint8)
+    for i, v in enumerate(fields):
+        v = int(v)
+        if not 0 <= v <= CONFIG_MAX:
+            raise ValueError(f"config field {i} = {v} outside [0, {CONFIG_MAX}]")
+        out[i * 2] = v & 0xFF
+        out[i * 2 + 1] = (v >> 8) & 0xFF
+    return out.view(np.int8)
+
+
+def unpack_config(buf, n):
+    """Inverse of ``pack_config``: read ``n`` little-endian uint16 fields."""
+    b = np.asarray(buf, dtype=np.int8).view(np.uint8)
+    return [int(b[i * 2]) | (int(b[i * 2 + 1]) << 8) for i in range(n)]
 
 
 def make_conv_params(H, W, Cin, Cout, K, stride) -> np.ndarray:
@@ -252,11 +286,19 @@ def make_fc_params(spatial_h, spatial_w, channels, num_classes) -> np.ndarray:
     """FC param buffer (AIE layout): [config:4][weights:channels*nclass][bias:nclass].
 
     config = {spatial_h, spatial_w, channels, num_classes}. Weights = 1, bias = 0.
-    The 4-int8 config header lets one avgpool_fc kernel body serve any shape.
+    The config header lets one avgpool_fc kernel body serve any shape.
+
+    ``channels`` is checked against ``MAX_POOL_CHANNELS``: the AIE kernel pools
+    into a fixed on-stack ``pooled[MAX_POOL_CH]``, so an oversized channel count
+    would overflow that array on target instead of failing here.
     """
+    if channels > MAX_POOL_CHANNELS:
+        raise ValueError(
+            f"avgpool_fc channels={channels} exceeds MAX_POOL_CHANNELS="
+            f"{MAX_POOL_CHANNELS} (AIE kernel's fixed pooled[] stack array)")
     wt = channels * num_classes
     buf = np.zeros(FC_CONFIG_SZ + wt + num_classes, dtype=np.int8)
-    buf[:FC_CONFIG_SZ] = np.array([spatial_h, spatial_w, channels, num_classes], dtype=np.int8)
+    buf[:FC_CONFIG_SZ] = pack_config(spatial_h, spatial_w, channels, num_classes)
     buf[FC_CONFIG_SZ:FC_CONFIG_SZ + wt] = 1  # uniform weights, bias stays 0
     return buf
 

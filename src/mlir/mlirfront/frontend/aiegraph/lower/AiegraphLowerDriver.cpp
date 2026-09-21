@@ -11,13 +11,19 @@
 
 namespace aiegraph {
 
+// Config fields are stored as little-endian uint16 pairs, NOT single bytes:
+// one byte caps every dimension at 255, which real ResNet-18 exceeds (512
+// channels, 1000 classes). Must stay in lock-step with model.CONFIG_FIELD_BYTES
+// and the kernels' CFG16 macro -- a mismatch shifts every weight offset and
+// silently produces garbage rather than failing to build.
+static constexpr int64_t kConfigFieldBytes = 2;
 // conv params header: {H,W,Cin,Cout,K,stride}
-static constexpr int64_t kConvConfigSz = 6;
+static constexpr int64_t kConvConfigSz = 6 * kConfigFieldBytes;
 // fc params header:   {spatial_h,spatial_w,channels,num_classes}
-static constexpr int64_t kFcConfigSz = 4;
+static constexpr int64_t kFcConfigSz = 4 * kConfigFieldBytes;
 
 // Param buffer byte-length for a conv op — matches model.make_conv_params:
-//   [config:6][weights:Cin*Cout*K*K][bn_scale:Cout][bn_bias:Cout]
+//   [config][weights:Cin*Cout*K*K][bn_scale:Cout][bn_bias:Cout]
 static int64_t convParamSz(int64_t Cin, int64_t Cout, int64_t K) {
     return kConvConfigSz + Cin * Cout * K * K + Cout * 2;
 }

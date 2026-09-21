@@ -48,12 +48,8 @@ from . import cpu_codegen
 
 def _cpu_conv(feat_in: np.ndarray, params: np.ndarray, relu: bool) -> np.ndarray:
     """Conv2D + Q7 BN (+ ReLU). Mirrors cpu_conv_bn_relu / cpu_conv_bn."""
-    H = int(np.uint8(params[0]))
-    W = int(np.uint8(params[1]))
-    Cin = int(np.uint8(params[2]))
-    Cout = int(np.uint8(params[3]))
-    K = int(np.uint8(params[4]))
-    stride = int(np.uint8(params[5]))
+    # uint16 little-endian config fields (model.pack_config / kernel CFG16).
+    H, W, Cin, Cout, K, stride = model.unpack_config(params[:CONFIG_SZ], 6)
     pad = K // 2
 
     wt_count = Cin * Cout * K * K
