@@ -56,6 +56,51 @@ ImageNet ResNet in `example/model/resnet18py`.
 (`input / feat1 / feat2 / feat3 / tmp1 / tmp2 / skip_ds / logits`) match
 `resnet18_triton.py`'s scratch layout.
 
+**Placeholder weights — what the scaled model can and cannot show.** Its
+parameters are deterministic Q7 patterns, not trained values. That is enough to
+verify *structure and plumbing* bit-exactly (every buffer, offset, and launch
+matches the oracle), but the logits are all-zero and every class ties, so the
+prediction is structural rather than learned. Any "it classified the dog" claim
+must come from the quantization track below, not from this model.
+
+## Real int8 classification (`quant/`)
+
+`src/frontend/tvm/quant/` is the complement to the scaled model: real
+post-training quantization of the **pretrained ImageNet ResNet-18**
+(`example/model/resnet18py`) down to int8 C that actually classifies — the
+sample dog comes out *Samoyed 83.92%* against the float reference's 90.01%.
+
+| File | Role |
+|------|------|
+| `resnet_np.py` | dependency-free numpy float forward pass; verified vs torch (max err 6.7e-06) |
+| `ptq.py` | activation calibration + per-channel weight quantization |
+| `qresnet.py` | the quantized network (integer fixed-point requantization) |
+| `emit_c.py` | emits `resnet_int8.c` + the int8 weight blob |
+| `build_demo.py` | ONNX → quantize → C → binary; `--run` also classifies |
+
+Two things that are easy to get wrong and are therefore handled here rather
+than left to the caller:
+
+* **Preprocessing is not a free choice.** The image must arrive exactly as the
+  network was calibrated for (resize-256 / center-crop-224 / ImageNet mean-std),
+  quantized with the *calibrated input scale*. Raw `[0,255]` pixels, or a
+  different scale, silently produce garbage with perfectly good weights. So
+  `build_demo.py` emits `input_f32.bin` and bakes the calibrated scale/zp into
+  `main.c`, which quantizes on target — keeping the quantizer inside the program
+  being verified.
+* **`build_aarch64` deliberately bypasses `script/hostcompile.sh`.** That script
+  links a generated AIE host (XAie driver, `routing()` extern, embedded kernel
+  ELF); this program uses none of it — no device, no DMA, just int8 arithmetic
+  on the ARM core. It links against the same BSP and linker script directly.
+
+`main.c` prints `device_teardown done` because `apppaltest.py` polls the console
+for that marker; without it a finished run looks like a hang until the 300 s
+timeout even though the answer already printed.
+
+This track does **not** go through the aiegraph/AIE pipeline — it is the
+numerical reference for what int8 ResNet-18 *should* compute, and uses plain
+`int` config fields, so it is unaffected by the `CONFIG_FIELD_BYTES` layout.
+
 ## ONNX → Relay import (relay_import.py)
 
 `import_relay(onnx_path, input_name, input_shape)` runs `relay.frontend.from_onnx`
@@ -129,8 +174,37 @@ Two int16 details are **load-bearing for bit-exactness** with the CPU reference:
 
 ## Param buffers
 
-- conv: `[config:6={H,W,Cin,Cout,K,stride}][weights:Cin·Cout·K·K][bn_scale:Cout][bn_bias:Cout]`
-- fc:   `[config:4={spatial_h,spatial_w,channels,num_classes}][weights:channels·nclass][bias:nclass]`
+- conv: `[config={H,W,Cin,Cout,K,stride}][weights:Cin·Cout·K·K][bn_scale:Cout][bn_bias:Cout]`
+- fc:   `[config={spatial_h,spatial_w,channels,num_classes}][weights:channels·nclass][bias:nclass]`
+
+**Config fields are 2-byte little-endian uint16, not single bytes.** One byte
+caps every dimension at 255, which real ResNet-18 exceeds (512 channels, 1000
+classes). So `CONFIG_SZ = 6·2 = 12` and `FC_CONFIG_SZ = 4·2 = 8`
+(`model.CONFIG_FIELD_BYTES`); the buffer itself stays `int8`, so `tensor_specs`,
+DMA, and windows are unaffected. `model.pack_config` range-checks each field
+rather than truncating — a wrapped dimension builds and runs but computes
+nonsense.
+
+The width is duplicated across every reader, and one left behind does **not**
+fail to build: it shifts every weight offset and silently produces garbage.
+Keep these in lock-step:
+
+| Reader | Where |
+|--------|-------|
+| writer + decoder | `model.pack_config` / `unpack_config` |
+| AIE kernels | `kernels._KERNEL_PRELUDE`'s `CFG16` (sizes formatted from `model.py`) |
+| numpy oracle | `_compiler._cpu_conv` |
+| emitted plain-C | `cpu_codegen` (its own `CFG16`) |
+| launch sizing | `AiegraphLowerDriver.cpp` `kConfigFieldBytes` |
+| test oracle | `test_tvm_frontend._cfg16` — deliberately independent |
+
+`CFG16` casts through `uint8_t` before combining: `params` is `int8_t*`, so a
+byte ≥ 0x80 would sign-extend and corrupt the field.
+
+**Channel bound.** `avgpool_fc`'s AIE kernel pools into a fixed on-stack
+`pooled[MAX_POOL_CH]`. Now that >255 channels are representable, that array is
+the binding limit, so `model.make_fc_params` rejects `channels >
+MAX_POOL_CHANNELS` (512) up front instead of overflowing the stack on target.
 
 Deterministic patterns (conv weights ±1 alternating, `bn_scale=64`≈0.5 Q7, bias 0;
 fc weights 1, bias 0) — identical to `resnet18_triton.py`, so the AIE result and
@@ -243,6 +317,40 @@ Output layout is symmetric: each launch still gets `out_root/<idx>_<op>/`. Conv
 dirs contain `host.cc`/`kernel.cc`/`routing.cc`/…; CPU dirs contain a single
 `<func_name>.c`.
 
+### Disabling AIE offload entirely (all-CPU build)
+
+`is_aie_op` answers *"could this op run on AIE"*, **not** *"does it, in this
+build"*. The second question is `orchestrator._to_aie(op, enable_aiehlc_offload)`
+— `is_aie_op(op) and enable_aiehlc_offload` — and every backend-selecting site
+in the A2 orchestrator must use it. `orchestrate_plan(..., enable_aiehlc_offload
+=False)` force-offloads the conv2d family to its bit-exact plain-C
+(`plain_c_source(force=True)`), so **no `kernel_<name>.cc` is emitted and
+`hostcompile.sh` never invokes xchesscc**. `demo_flow.py`'s single
+`enable_aiehlc_offload` flag drives both Stage 4 and Stage 5.
+
+Three artifacts the AIE path *produces* have to be synthesized when it is off:
+
+| Artifact | Normally from | All-CPU replacement |
+|----------|---------------|---------------------|
+| `host.cc` | created by the first `orchestrate_conv_layer` | `_emit_cpu_only_host()` (stub; hostcompile.sh compiles only this TU) |
+| `routing.cc` | per-conv routing emit | `_emit_cpu_only_routing()` — a no-op `routing()`, since `aie_runtime.o` references it unconditionally |
+| a kernel to compile | `kernel_*.cc` | none; `script/hostcompile.sh` gained a host-only mode |
+
+The all-CPU `main` also skips `__Runtime_explicit_init` / mesh partition /
+teardown — the ELF must not require working AIE hardware to produce its logits.
+
+### Param buffers are filled, not zeroed
+
+`main.cc` emits `fill_conv_params` / `fill_fc_params` (C transcriptions of
+`model.make_conv_params` / `fc_params_no_header`) for **both** backends. Zeroing
+is not a benign placeholder: the conv config (`H,W,Cin,Cout,K,stride`) is the
+leading `CONFIG_SZ` bytes of the params buffer, so an all-zero buffer means
+`H=W=0` and the
+conv writes nothing. Verified by replaying `_compiler.cpu_reference` per launch
+and comparing every intermediate DDR buffer against the natively-compiled
+emitted C — not just the logits, which are all-zero under placeholder weights
+and so match vacuously.
+
 ### Bit-exact TE mapping (transcription of the numpy Q7 oracle)
 
 Each CPU op is a TVM TE compute mirroring the `_compiler.py` oracle
@@ -331,7 +439,7 @@ extended `run_aie_pipeline` `dma_specs` argument accepts.
 plan, maintaining a named-buffer dict. Its per-op math is a byte-for-byte port of
 `resnet18_triton.py`'s CPU references:
 
-* config reads via `int(np.uint8(...))`;
+* config reads via `model.unpack_config` (2-byte LE uint16 fields);
 * conv accumulator `np.int16`, `bn_out = (s * np.int16(bn_scale)) >> 7` then
   `+= bn_bias`, clamp `[0,127]` (relu) / `[-128,127]` (no relu);
 * residual `np.int16` add, clamp `[0,127]`;
@@ -402,9 +510,13 @@ AIE code.
 | `kernels.py` | raw-C bodies for the 4 kernels (int8/int16 Q7 math) |
 | `_compiler.py` | tensor specs + `run_aie_pipeline` glue; bit-exact numpy CPU reference; im2col DMA helper; AIE-vs-CPU emit dispatch |
 | `cpu_codegen.py` | TVM `target="c"` CPU fallback for non-conv ops (bit-exact TE transcription of the Q7 oracle) |
+| `orchestrator.py` | A2 multi-layer driver: DDR buffer chaining, `__aie_launch` dispatcher, all-CPU stubs, `main.cc`, ELF + x86 builds |
+| `demo_flow.py` | the whole flow unrolled stage by stage (reference classify → plan → aiegraph IR → emit → ELF → x86 run) |
+| `quant/` | real int8 PTQ of pretrained ImageNet ResNet-18 → C that actually classifies (see above) |
 | `__init__.py` | `run_resnet` entry + `RunResult` |
 | `requirements.txt` | Python dependencies (numpy + optional tvm/onnx/torch) |
 | `test_tvm_frontend.py` | verification (PASS/FAIL) |
+| `quant/test_quant.py` | quantization verification (calibration, fixed-point, emitted-C classification) |
 | `README.md` | module overview |
 
 ## See also
