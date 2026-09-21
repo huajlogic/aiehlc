@@ -43,7 +43,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Set
 
-from . import cpu_codegen, kernels
+from . import cpu_codegen, kernels, model
 from .model import LayerOp
 
 # C source header prepended to every emitted artifact.
@@ -168,6 +168,21 @@ def _buffer_graph(plan: List[LayerOp]) -> BufferGraph:
 # them by index.
 
 
+def _to_aie(op: LayerOp, enable_aiehlc_offload: bool) -> bool:
+    """True iff ``op`` is actually compiled to the AIE backend for this build.
+
+    The AIE/CPU split is the conjunction of two facts: the op *kind* must be an
+    AIE op (``cpu_codegen.is_aie_op`` — the conv2d family) **and** the build must
+    have AIE offload enabled. With ``enable_aiehlc_offload=False`` every conv is
+    force-offloaded to the CPU backend (bit-exact plain-C, see
+    ``cpu_codegen.plain_c_source(force=True)``), so no ``kernel_<name>.cc`` is
+    emitted and ``hostcompile.sh`` never invokes xchesscc. This is the single
+    predicate every backend-selecting call site must use — ``is_aie_op`` alone
+    only answers "could this run on AIE", not "does it, here".
+    """
+    return cpu_codegen.is_aie_op(op.op) and enable_aiehlc_offload
+
+
 def _param_elems(op: LayerOp) -> int:
     """Element count of a CPU op's headerless param buffer (0 if it has none)."""
     if op.op == "avgpool_fc":            # weights|bias, no config header
@@ -237,6 +252,47 @@ def _emit_dispatcher(convs: List[dict], ddr_args: Dict[str, int]) -> str:
     return "\n".join(out) + "\n"
 
 
+def _emit_cpu_only_host() -> str:
+    """Return a standalone ``host.cc`` for an all-CPU (offload-disabled) build.
+
+    On the AIE path ``host.cc`` is *created* by the first
+    ``core.orchestrate_conv_layer`` call and this module only appends to it.
+    With offload off there is no such call, yet hostcompile.sh still requires a
+    ``host.cc`` (it is the only translation unit it compiles, and
+    ``_fold_main_into_host`` splices main + the CPU bodies into it). So emit the
+    minimal stub: the runtime include the fold path anchors its mesh preamble
+    to, and nothing else — no ``__aie_launch`` dispatcher, because no launch
+    site references one.
+    """
+    return (_COPYRIGHT
+            + '#include "aie_runtime.h"\n'
+            + "#include <cstdint>\n"
+            + "#include <cstdio>\n"
+            + "#include <cstring>\n"
+            + "\n// All ops force-offloaded to the CPU backend: no AIE kernel and\n"
+            + "// no launch dispatcher. main + the plain-C op bodies are folded\n"
+            + "// in below by _fold_main_into_host.\n")
+
+
+def _emit_cpu_only_routing() -> str:
+    """Return a no-op ``routing.cc`` for an all-CPU (offload-disabled) build.
+
+    ``aie_runtime.c`` declares ``extern void routing(XAie_DevInst*)`` and calls
+    it from ``__Runtime_routing_init``, so the symbol must resolve at link time
+    even though nothing in an all-CPU build calls that path — the reference
+    lives in ``aie_runtime.o``, which hostcompile.sh always links. On the AIE
+    path the definition comes from the per-conv ``routing.cc`` the pipeline
+    emits; with no conv there is none, hence this stub. It is never executed
+    (the all-CPU ``main`` does no device init), so an empty body is correct
+    rather than merely convenient.
+    """
+    return (_COPYRIGHT
+            + '#include "aie_runtime.h"\n\n'
+            + "// All ops run on the CPU: no stream-switch routing to program.\n"
+            + "// Defined only to resolve aie_runtime.o's unconditional extern.\n"
+            + "void routing(XAie_DevInst* dev) { (void)dev; }\n")
+
+
 def _emit_allocs(graph: BufferGraph, param_bufs: Dict[str, int],
                  wts_bufs: Dict[str, int]) -> List[str]:
     """Return the ``__Runtime_Alloc`` lines for every distinct DDR buffer once.
@@ -254,8 +310,85 @@ def _emit_allocs(graph: BufferGraph, param_bufs: Dict[str, int],
     return lines
 
 
+def _emit_param_fillers() -> List[str]:
+    """Return the C helpers that fill conv/fc param buffers at runtime.
+
+    The scaled model has no pretrained weights: ``model.make_conv_params`` /
+    ``make_fc_params`` build deterministic Q7 patterns, and both the numpy
+    oracle and the AIE/CPU kernels read that exact layout. Emitting those
+    patterns as C loops (rather than a ~44 KB static table, or the zeros a
+    ``memset`` would leave) is what makes the linked ELF compute the same
+    logits as ``_compiler.cpu_reference``.
+
+    Zeros are not a harmless placeholder on the CPU path: the conv config
+    (``H,W,Cin,Cout,K,stride``) is read from the *first 6 bytes of the params
+    buffer*, so an all-zero buffer means ``H=W=0`` and the conv writes nothing.
+    """
+    return [
+        "// Deterministic Q7 params (mirrors model.make_conv_params /"
+        " make_fc_params).",
+        "static void fill_conv_params(int8_t* p, int H, int W, int Cin,",
+        "                             int Cout, int K, int stride) {",
+        f"    const int cfg = {model.CONFIG_SZ};",
+        "    int wt_count = Cin * Cout * K * K;",
+        "    // uint16 LE config fields (model.pack_config / kernel CFG16).",
+        "    const int _f[6] = {H, W, Cin, Cout, K, stride};",
+        "    for (int i = 0; i < 6; ++i) {",
+        "        p[i * 2]     = (int8_t)(_f[i] & 0xFF);",
+        "        p[i * 2 + 1] = (int8_t)((_f[i] >> 8) & 0xFF);",
+        "    }",
+        "    for (int i = 0; i < wt_count; ++i)",
+        "        p[cfg + i] = (int8_t)((i % 2 == 0) ? 1 : -1);",
+        "    for (int c = 0; c < Cout; ++c) {",
+        f"        p[cfg + wt_count + c] = (int8_t){model.BN_SCALE_DEFAULT};",
+        "        p[cfg + wt_count + Cout + c] = "
+        f"(int8_t){model.BN_BIAS_DEFAULT};",
+        "    }",
+        "}",
+        "",
+        "// Headerless weights|bias for the CPU avgpool_fc ABI"
+        " (model.fc_params_no_header).",
+        "static void fill_fc_params(int8_t* p, int channels, int num_classes) {",
+        "    for (int i = 0; i < channels * num_classes; ++i) p[i] = 1;",
+        "    for (int j = 0; j < num_classes; ++j)",
+        "        p[channels * num_classes + j] = 0;",
+        "}",
+        "",
+    ]
+
+
+def _emit_param_init(graph: BufferGraph, launches: List[dict],
+                     plan: List[LayerOp],
+                     param_bufs: Dict[str, int]) -> List[str]:
+    """Return the per-buffer ``fill_*_params`` calls for ``main``.
+
+    Deliberately takes no ``enable_aiehlc_offload``: param filling is
+    backend-agnostic. Conv buffers (``wts_<idx>``) are filled identically for
+    BOTH backends — the AIE kernel and the forced-CPU plain-C read the same
+    header+weights+BN layout — which is what keeps the two paths bit-exact with
+    each other and with the numpy oracle.
+    """
+    lines: List[str] = []
+    for idx, (op, _L) in enumerate(zip(plan, launches)):
+        if not cpu_codegen.is_aie_op(op.op):
+            continue
+        lines.append(
+            f"    fill_conv_params({_wts_name(idx)}, {op.H}, {op.W}, "
+            f"{op.Cin}, {op.Cout}, {op.K}, {op.stride});")
+    for idx, op in enumerate(plan):
+        name = f"params_{idx}"
+        if name not in param_bufs:
+            continue
+        if op.op == "avgpool_fc":
+            lines.append(f"    fill_fc_params({name}, {op.channels}, "
+                         f"{op.num_classes});")
+        else:
+            lines.append(f"    memset({name}, 0, {param_bufs[name]});")
+    return lines
+
+
 def _emit_body(graph: BufferGraph, launches: List[dict],
-               plan: List[LayerOp]) -> List[str]:
+               plan: List[LayerOp], enable_aiehlc_offload: bool = True) -> List[str]:
     """Return the program-order launch/call lines for ``main``.
 
     Conv layers dispatch through ``__aie_launch("<func_name>", mesh, in, sin,
@@ -276,7 +409,13 @@ def _emit_body(graph: BufferGraph, launches: List[dict],
     for layer, launch, op in zip(graph.layers, launches, plan):
         name = launch["func_name"]
         out_buf, out_sz = layer.out_buf, graph.sizes[layer.out_buf]
-        if cpu_codegen.is_aie_op(op.op):
+        if not _to_aie(op, enable_aiehlc_offload) and cpu_codegen.is_aie_op(op.op):
+            # Force-offloaded conv: plain-C ABI (feat, params, out) — no mesh,
+            # no DDR sync, the config header travels inside the params buffer.
+            feat = layer.in_bufs[0]
+            lines.append(f"    {name}({feat}, {_wts_name(layer.index)}, "
+                         f"{out_buf});")
+        elif _to_aie(op, enable_aiehlc_offload):
             wts, wts_sz = _wts_name(layer.index), _wts_elems(launch)
             args = f'__aie_launch("{name}", mesh'
             for b in layer.in_bufs:       # conv activation input(s)
@@ -299,11 +438,20 @@ def _emit_body(graph: BufferGraph, launches: List[dict],
 
 
 def _emit_main(graph: BufferGraph, launches: List[dict],
-               plan: List[LayerOp], param_bufs: Dict[str, int]) -> str:
+               plan: List[LayerOp], param_bufs: Dict[str, int],
+               enable_aiehlc_offload: bool = True,
+               image_header: str = None) -> str:
     """Return the ``main.cc`` text: allocs, entry fill, program order, readback.
 
     Mirrors the emitted-host ``main`` shape (device init → mesh partition →
     ``__Runtime_Alloc`` → launches → read back logits → teardown).
+
+    When no op actually reaches AIE (``enable_aiehlc_offload=False``, so every
+    conv is force-offloaded to plain-C) the device init AND the mesh partition
+    are skipped entirely, and each conv calls its plain-C entry directly rather
+    than going through ``__aie_launch``. That is deliberate: an all-CPU build
+    must compute its logits without requiring working AIE hardware, so it must
+    not call ``__Runtime_explicit_init``.
     """
     cpu_protos = []
     for op, L in zip(plan, launches):
@@ -313,7 +461,12 @@ def _emit_main(graph: BufferGraph, launches: List[dict],
         elif op.op == "avgpool_fc":
             cpu_protos.append(f"void {L['func_name']}(const int8_t*, const int8_t*,"
                               " const int8_t*, int8_t*);")
-    # Per-conv weights DDR buffers (wts_<idx>), sized from tensor_specs[1].
+        elif not _to_aie(op, enable_aiehlc_offload):   # force-offloaded conv
+            cpu_protos.append(f"void {L['func_name']}(const int8_t*, const int8_t*,"
+                              " int8_t*);")
+    # Per-conv weights DDR buffers (wts_<idx>), sized from tensor_specs[1]. These
+    # are allocated for BOTH backends — the forced-CPU conv reads the same
+    # header+weights+BN params buffer the AIE kernel would.
     wts_bufs: Dict[str, int] = {}
     for idx, (op, L) in enumerate(zip(plan, launches)):
         if cpu_codegen.is_aie_op(op.op):
@@ -328,30 +481,65 @@ def _emit_main(graph: BufferGraph, launches: List[dict],
            "",
            "// CPU-op plain-C entries (linked from <func>.c).",
            'extern "C" {'] + cpu_protos + ["}", ""]
+    if image_header:
+        txt.insert(5, f'#include "{image_header}.h"')
+    txt += _emit_param_fillers()
     txt.append("int main(int argc, char** argv) {")
-    txt.append("    XAie_DevInst* dev = __Runtime_explicit_init();")
-    txt.append("    aieArray arr; arr._dev = dev;")
-    txt.append("    aieMesh mesh = arr.partition(2, 2);")
+    if any(_to_aie(op, enable_aiehlc_offload) for op in plan):
+        txt.append("    XAie_DevInst* dev = __Runtime_explicit_init();")
+        txt.append("    aieArray arr; arr._dev = dev;")
+        txt.append("    aieMesh mesh = arr.partition(2, 2);")
+        txt.append("    (void)mesh;")
+    else:
+        # All-CPU build: no launch touches the array, so skip device init and
+        # the mesh partition entirely — the ELF must not require working AIE
+        # hardware to compute its logits.
+        txt.append("    // All ops run on the CPU: no device init, no mesh.")
     txt += _emit_allocs(graph, param_bufs, wts_bufs)
-    txt.append(f"    // Fill layer-0 entry ({entry_sz} int8) from the input image.")
-    txt.append(f"    for (int i = 0; i < {entry_sz}; ++i) {graph.entry_buffer}[i] = 0;")
-    # Zero-fill conv weights + CPU params. TODO(Task 7): fill wts_<idx> from
-    # model.make_conv_params / params_<idx> from make_fc_params for bit-exact
-    # parity with cpu_reference; zero is sufficient to build + smoke the ELF.
-    for name, sz in list(wts_bufs.items()) + list(param_bufs.items()):
-        txt.append(f"    memset({name}, 0, {sz});")
-    txt += _emit_body(graph, launches, plan)
-    txt.append(f"    __Runtime_sync_for_cpu(dev, {graph.logits_buffer}, {logits_sz});")
+    if image_header:
+        # The ELF carries raw pixels and quantizes them itself (see
+        # emit_image_header): the on-target quantizer is part of what runs.
+        txt.append(f"    // Quantize the embedded image into the entry buffer.")
+        txt.append(f"    {image_header}_quantize({graph.entry_buffer});")
+    else:
+        txt.append(f"    // Fill layer-0 entry ({entry_sz} int8) with model.make_input()'s")
+        txt.append("    // pattern (i%7)+1 so the ELF matches the numpy oracle.")
+        txt.append(f"    for (int i = 0; i < {entry_sz}; ++i)")
+        txt.append(f"        {graph.entry_buffer}[i] = (int8_t)((i % 7) + 1);")
+    txt += _emit_param_init(graph, launches, plan, param_bufs)
+    txt += _emit_body(graph, launches, plan, enable_aiehlc_offload)
+    if any(_to_aie(op, enable_aiehlc_offload) for op in plan):
+        txt.append(f"    __Runtime_sync_for_cpu(dev, {graph.logits_buffer}, "
+                   f"{logits_sz});")
     txt.append(f"    for (int j = 0; j < {logits_sz}; ++j)")
     txt.append(f'        printf("logit[%d] = %d\\n", j, (int){graph.logits_buffer}[j]);')
-    txt.append("    __Runtime_device_teardown(dev);")
+    if image_header:
+        # Argmax over the logits = the predicted class. Printed alongside the
+        # raw logits so a degenerate all-equal result stays visible rather than
+        # being hidden behind a confident-looking "class 0".
+        txt.append(f"    int best = 0, ties = 0;")
+        txt.append(f"    for (int j = 1; j < {logits_sz}; ++j)")
+        txt.append(f"        if ({graph.logits_buffer}[j] > {graph.logits_buffer}[best]) best = j;")
+        txt.append(f"    for (int j = 0; j < {logits_sz}; ++j)")
+        txt.append(f"        if ({graph.logits_buffer}[j] == {graph.logits_buffer}[best]) ++ties;")
+        txt.append('    printf("predicted class = %d\\n", best);')
+        txt.append('    if (ties > 1)')
+        txt.append('        printf("WARNING: %d/%d classes tie at logit %d -- "')
+        txt.append('               "the scaled demo model uses placeholder weights, "')
+        txt.append('               "so this prediction is structural, not learned\\n",')
+        txt.append(f'               ties, {logits_sz}, (int){graph.logits_buffer}[best]);')
+    if any(_to_aie(op, enable_aiehlc_offload) for op in plan):
+        txt.append("    __Runtime_device_teardown(dev);")
     txt.append("    return 0;")
     txt.append("}")
     return "\n".join(txt) + "\n"
 
 
 def orchestrate_plan(plan: List[LayerOp], launches: List[dict],
-                     out_dir: str) -> str:
+                     out_dir: str,
+                     enable_aiehlc_offload: bool = True,
+                     image_pixels=None,
+                     image_name: str = "demo_image") -> str:
     """A2 driver: emit ONE host.cc (+dispatcher), per-op glue, and main.cc.
 
     For each conv launch (first ``append_mode=False``, rest ``True``) calls
@@ -360,50 +548,80 @@ def orchestrate_plan(plan: List[LayerOp], launches: List[dict],
     CPU ops are emitted as plain-C ``<name>.c``. Then appends the ``__aie_launch``
     dispatcher to ``host.cc`` and writes ``main.cc`` in program order. Returns
     the build directory path. ``launches`` must align 1:1 with ``plan``.
+
+    ``enable_aiehlc_offload=False`` force-offloads the conv2d family to the CPU
+    backend: no ``orchestrate_conv_layer`` call, so no ``kernel_<name>.cc`` and
+    no xchesscc compile — every op becomes a plain-C ``<name>.c``. Because
+    ``host.cc`` is normally *produced* by the first ``orchestrate_conv_layer``,
+    the all-CPU build writes a minimal standalone ``host.cc`` itself
+    (``_emit_cpu_only_host``) to keep hostcompile.sh's "host.cc is the only
+    translation unit" contract satisfied.
     """
     from . import _compiler  # lazy: keeps module import cheap when pybind absent
-    core = _compiler._core()
 
     build_dir = os.path.join(out_dir, "build")
     os.makedirs(build_dir, exist_ok=True)
     graph = _buffer_graph(plan)
 
     # 1) Conv launches → ONE host.cc (append after the first) + kernel_<name>.cc.
+    #    Skipped entirely when offload is off (no pybind core needed either).
     ddr_args: Dict[str, int] = {}
     convs: List[dict] = []
-    conv_i = 0
-    for op, launch in zip(plan, launches):
-        if not cpu_codegen.is_aie_op(op.op):
-            continue
-        specs = [(list(s), int(b), bool(x)) for (s, b, x) in launch["tensor_specs"]]
-        body = kernels.kernel_body_for(op.op, launch["func_name"])
-        n = core.orchestrate_conv_layer(2, 2, specs, build_dir, body,
-                                        launch["func_name"],
-                                        host_func_suffix=launch["func_name"],
-                                        append_mode=(conv_i > 0))
-        ddr_args[launch["func_name"]] = int(n)
-        convs.append(launch)
-        conv_i += 1
+    if enable_aiehlc_offload:
+        core = _compiler._core()
+        conv_i = 0
+        for op, launch in zip(plan, launches):
+            if not _to_aie(op, enable_aiehlc_offload):
+                continue
+            specs = [(list(s), int(b), bool(x))
+                     for (s, b, x) in launch["tensor_specs"]]
+            body = kernels.kernel_body_for(op.op, launch["func_name"])
+            n = core.orchestrate_conv_layer(2, 2, specs, build_dir, body,
+                                            launch["func_name"],
+                                            host_func_suffix=launch["func_name"],
+                                            append_mode=(conv_i > 0))
+            ddr_args[launch["func_name"]] = int(n)
+            convs.append(launch)
+            conv_i += 1
 
-    # 2) CPU ops → plain-C <name>.c, and collect their param buffers.
+    # 2) Every non-offloaded op → plain-C <name>.c (force=True for a conv), and
+    #    collect the CPU-only param buffers (conv params live in wts_<idx>).
     param_bufs: Dict[str, int] = {}
-    for op, launch in zip(plan, launches):
-        if cpu_codegen.is_aie_op(op.op):
+    for idx, (op, launch) in enumerate(zip(plan, launches)):
+        if _to_aie(op, enable_aiehlc_offload):
             continue
-        cpu_codegen.emit_cpu_launch_plain(op, build_dir, launch["func_name"])
+        cpu_codegen.emit_cpu_launch_plain(op, build_dir, launch["func_name"],
+                                          force=cpu_codegen.is_aie_op(op.op))
         pelems = _param_elems(op)
         if pelems:
-            idx = launches.index(launch)
             param_bufs[f"params_{idx}"] = pelems
 
-    # 3) Append the __aie_launch dispatcher to host.cc.
+    # 3) host.cc: append the __aie_launch dispatcher (AIE path), or synthesize a
+    #    standalone one (all-CPU path, where no conv ever created host.cc).
     host_path = os.path.join(build_dir, "host.cc")
-    with open(host_path, "a") as f:
-        f.write(_emit_dispatcher(convs, ddr_args))
+    if convs:
+        with open(host_path, "a") as f:
+            f.write(_emit_dispatcher(convs, ddr_args))
+    else:
+        with open(host_path, "w") as f:
+            f.write(_emit_cpu_only_host())
+        # hostcompile.sh picks routing.cc up automatically when present; it
+        # resolves aie_runtime.o's unconditional extern (see the emitter).
+        with open(os.path.join(build_dir, "routing.cc"), "w") as f:
+            f.write(_emit_cpu_only_routing())
+
+    # 3b) Embed the input image as raw pixels + an on-target quantizer.
+    if image_pixels is not None:
+        emit_image_header(image_pixels,
+                          os.path.join(build_dir, f"{image_name}.h"),
+                          name=image_name,
+                          src_note="input image for the scaled demo model")
 
     # 4) Emit main.cc (program order: allocs → entry fill → launches → readback).
     with open(os.path.join(build_dir, "main.cc"), "w") as f:
-        f.write(_emit_main(graph, launches, plan, param_bufs))
+        f.write(_emit_main(graph, launches, plan, param_bufs,
+                           enable_aiehlc_offload,
+                           image_name if image_pixels is not None else None))
 
     return build_dir
 
@@ -527,8 +745,19 @@ def _fold_main_into_host(build_dir: str) -> None:
     main_path = os.path.join(build_dir, "main.cc")
     with open(main_path) as f:
         main_src = _strip_leading_copyright(f.read())
-    kept = [ln for ln in main_src.splitlines()
-            if not ln.lstrip().startswith("#include")]
+    # Strip main.cc's #includes -- host.cc already has aie_runtime.h/cstdint/
+    # cstdio/cstring -- but KEEP any local "..." include: that is the embedded
+    # image header, which defines the pixel table and the on-target quantizer
+    # main() calls. Dropping it compiles to 'demo_image_quantize was not
+    # declared in this scope'.
+    kept = []
+    for ln in main_src.splitlines():
+        stripped = ln.lstrip()
+        if stripped.startswith("#include"):
+            if '"' in stripped:               # local header: keep it
+                kept.append(ln)
+            continue
+        kept.append(ln)
     main_body = "\n".join(kept).replace("int main(int argc, char** argv)",
                                          "int main()")
     parts.append("\n// ===== folded from main.cc (program-order driver) =====\n"
@@ -579,9 +808,12 @@ def _invoke_hostcompile(build_dir: str, repo_root: str) -> str:
     env["WORKLOCAL_DIR"] = build_dir
     env.setdefault("AIE_VERSION", "5")
     env.setdefault("PLATFORM", "baremetal")
+    nkernels = len([f for f in os.listdir(build_dir)
+                    if f.startswith("kernel_") and f.endswith(".cc")])
+    what = (f"compiling {nkernels} AIE kernel(s) via xchesscc, then host link"
+            if nkernels else "host link only (no AIE kernels to compile)")
     print(f"[hostcompile] building main.elf in {build_dir}\n"
-          "[hostcompile] compiling AIE kernels via xchesscc, then host link "
-          "(live log follows)...", flush=True)
+          f"[hostcompile] {what} (live log follows)...", flush=True)
     lines: List[str] = []
     proc = subprocess.Popen(["bash", script], cwd=build_dir, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -625,3 +857,182 @@ def build_main_elf(build_dir: str) -> str:
         os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     _arrange_build_dir(build_dir)
     return _invoke_hostcompile(build_dir, repo_root)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  x86 host build — run the same emitted CPU code natively, no board needed
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The aarch64 path (build_main_elf) produces a baremetal ELF that only runs on
+# the board over JTAG. That is a slow feedback loop for a change that is purely
+# numerical, so this builds the SAME generated .c files for the host instead.
+# It is a verification path, not a deployment one: identical op bodies,
+# identical program order, but ordinary malloc and a printf you can actually
+# see. If the numbers are wrong here they are wrong on the board too.
+#
+# Only meaningful when every op is on the CPU (offload disabled). With AIE
+# kernels in the mix the launches go through __aie_launch into hardware, which
+# has no x86 equivalent.
+
+_X86_RUNTIME_SHIM = """
+/* ===== x86 stand-ins for the AIE runtime =====
+ * The emitted main() calls a handful of __Runtime_* helpers for DDR buffers
+ * and device lifecycle. On the host there is no device: allocation is calloc
+ * (zeroed, matching __Runtime_Alloc's fresh-DMA-buffer semantics) and the
+ * lifecycle calls are no-ops. Nothing here models AIE behaviour -- if a build
+ * reaches one of these on a path that matters, the all-CPU assumption is
+ * already broken. */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void *__Runtime_Alloc(size_t n) { return calloc(n ? n : 1, 1); }
+"""
+
+
+def build_x86_main(build_dir: str, out_path: str = None,
+                   cc: str = "gcc") -> str:
+    """Compile the emitted all-CPU sources into a native x86 binary.
+
+    ``build_dir`` is an ``orchestrate_plan`` output directory built with
+    ``enable_aiehlc_offload=False``. Returns the path to the linked binary.
+
+    Rather than compiling ``host.cc`` (which pulls in ``aie_runtime.h`` and the
+    whole XAie header set), this takes ``main.cc`` + the per-op ``.c`` files and
+    supplies a tiny shim for the few ``__Runtime_*`` calls ``main`` makes. The
+    op bodies -- the part whose numerics we are checking -- are compiled
+    verbatim, unmodified.
+
+    Raises ``RuntimeError`` if the build dir still contains AIE kernels (their
+    launches have no host equivalent) or if the compile fails.
+    """
+    build_dir = os.path.abspath(build_dir)
+    if [f for f in os.listdir(build_dir) if f.startswith("kernel_")]:
+        raise RuntimeError(
+            f"{build_dir!r} contains AIE kernels; the x86 path only supports "
+            "an all-CPU build (orchestrate_plan(..., "
+            "enable_aiehlc_offload=False))")
+    main_cc = os.path.join(build_dir, "main.cc")
+    if not os.path.isfile(main_cc):
+        raise RuntimeError(f"main.cc not found in {build_dir!r}")
+    if out_path is None:
+        out_path = os.path.join(build_dir, "main_x86")
+
+    # Strip the AIE include and the device lifecycle calls from main.cc; the
+    # all-CPU main has none of the latter, but an offload build would.
+    with open(main_cc) as f:
+        src = f.read()
+    src = src.replace('#include "aie_runtime.h"', _X86_RUNTIME_SHIM, 1)
+    drop = ("__Runtime_explicit_init", "__Runtime_device_teardown",
+            "__Runtime_sync_for_cpu", "__Runtime_sync_for_dev",
+            "aieArray ", "aieMesh ")
+    kept = [ln for ln in src.splitlines()
+            if not any(d in ln for d in drop)]
+    shim_path = os.path.join(build_dir, "main_x86.cc")
+    with open(shim_path, "w") as f:
+        f.write("\n".join(kept) + "\n")
+
+    csrcs = sorted(os.path.join(build_dir, f) for f in os.listdir(build_dir)
+                   if f.endswith(".c"))
+    if not csrcs:
+        raise RuntimeError(f"no CPU op .c files in {build_dir!r}")
+    objs = []
+    for c in csrcs:                      # C sources: compile with the C driver
+        o = c[:-2] + ".x86.o"
+        r = subprocess.run([cc, "-O1", "-c", c, "-o", o],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"failed to compile {os.path.basename(c)}:\n"
+                               f"{r.stderr[-2000:]}")
+        objs.append(o)
+    # -I build_dir so the generated main can find <image>.h.
+    r = subprocess.run([cc.replace("gcc", "g++"), "-O1", "-I", build_dir,
+                        "-o", out_path, shim_path] + objs,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"x86 link failed:\n{r.stderr[-2000:]}")
+    return out_path
+
+
+def run_x86_main(binary: str) -> str:
+    """Run an x86 binary from ``build_x86_main`` and return its stdout."""
+    r = subprocess.run([binary], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f"{binary!r} exited {r.returncode}\n{r.stderr[-2000:]}")
+    return r.stdout
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Embedded image input — raw pixels in a header, quantized on-target
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The alternative would be to quantize host-side and embed int8 values, but
+# then the quantizer is not part of what the ELF exercises. Embedding RAW
+# uint8 pixels and doing the affine quantization in C means the on-target code
+# path is the one being verified -- the same arithmetic a camera-fed pipeline
+# would run.
+
+def emit_image_header(pixels, path: str, name: str = "demo_image",
+                      src_note: str = "") -> dict:
+    """Write ``<path>`` declaring ``name[]`` as hex uint8 pixels + its qparams.
+
+    ``pixels`` is a flat uint8 array (grayscale, already resized to the model's
+    input). Returns the asymmetric quantization params the C will apply, so the
+    caller can reproduce them exactly for an oracle comparison.
+
+    Quantization is **asymmetric**: ``q = round(p/scale) + zp`` with the scale
+    and zero-point derived from the image's own [min,max]. For one-sided data
+    like 8-bit pixels this keeps the full int8 range in use, where a symmetric
+    scheme would waste the negative half. The params are computed here (float,
+    once) and baked in as constants; the C does only the per-pixel affine, which
+    is what an embedded target can afford.
+    """
+    import numpy as _np
+    px = _np.asarray(pixels, dtype=_np.float32).ravel()
+    lo, hi = float(px.min()), float(px.max())
+    if hi - lo < 1e-9:                      # flat image: avoid a zero scale
+        scale, zp = 1.0, -128
+    else:
+        scale = (hi - lo) / 255.0
+        zp = int(_np.clip(round(-128 - lo / scale), -128, 127))
+    u8 = _np.clip(_np.round(px), 0, 255).astype(_np.uint8)
+
+    rows = []
+    for i in range(0, u8.size, 12):
+        rows.append("    " + " ".join(f"0x{v:02X}," for v in u8[i:i + 12]))
+    body = "\n".join(rows)
+    with open(path, "w") as f:
+        f.write(f"""{_COPYRIGHT}/* GENERATED: {src_note or 'embedded demo image'}
+ * Raw 8-bit pixels; the program quantizes them at runtime with the affine
+ * params below (asymmetric: q = round(p/scale) + zp, clamped to int8).
+ */
+#ifndef {name.upper()}_H
+#define {name.upper()}_H
+#include <stdint.h>
+
+#define {name.upper()}_LEN {u8.size}
+#define {name.upper()}_SCALE {scale:.9f}f
+#define {name.upper()}_ZP {zp}
+
+static const uint8_t {name}[{u8.size}] = {{
+{body}
+}};
+
+/* Asymmetric quantize the embedded image into int8. Kept as a function (not a
+ * table of pre-quantized values) so the ELF actually performs the quantization
+ * rather than just replaying a host-side result. */
+static void {name}_quantize(int8_t *out) {{
+    for (int i = 0; i < {name.upper()}_LEN; ++i) {{
+        float v = (float){name}[i] / {name.upper()}_SCALE + ({name.upper()}_ZP);
+        int r = (int)(v < 0.0f ? v - 0.5f : v + 0.5f);   /* round-half-away */
+        if (r < -128) r = -128;
+        if (r >  127) r =  127;
+        out[i] = (int8_t)r;
+    }}
+}}
+
+#endif /* {name.upper()}_H */
+""")
+    return {"scale": scale, "zp": zp, "len": int(u8.size), "path": path,
+            "pixels": u8}

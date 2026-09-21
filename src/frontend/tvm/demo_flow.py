@@ -22,6 +22,7 @@ stage 5's ELF link additionally needs an aarch64 cross g++ + xchesscc/Vitis
 Run:  python src/frontend/tvm/demo_flow.py
 """
 import os
+import re
 import shutil
 import sys
 
@@ -88,11 +89,13 @@ def classify_dog_reference(topk=5):
     return image_path
 
 
-def dog_to_scaled_input(path):
-    """Open ``path``, grayscale -> INPUT_W x INPUT_H, quantize to length-64 int8.
+def dog_to_pixels(path):
+    """Open ``path`` -> grayscale INPUT_W x INPUT_H raw uint8 pixels.
 
-    Produces the input the scaled AIE demo model expects (8x8x1). Returns
-    ``None`` if PIL is unavailable so the caller can fall back.
+    Returns the *unquantized* pixels: the ELF embeds these and does the
+    asymmetric quantization itself (``emit_image_header``), so the quantizer is
+    part of what runs on target rather than a host-side preprocessing step.
+    ``None`` if PIL is unavailable, so the caller can fall back.
     """
     try:
         from PIL import Image
@@ -100,10 +103,27 @@ def dog_to_scaled_input(path):
         print(f"[stage2] PIL unavailable ({e}); using model.make_input()")
         return None
     img = Image.open(path).convert("L").resize((model.INPUT_W, model.INPUT_H))
-    arr = np.asarray(img, dtype=np.float32)            # [0,255], HxW
-    # Map [0,255] -> int8 [0,127] (Q7-ish); keep it simple and deterministic.
-    q = np.clip(np.round(arr / 255.0 * 127.0), 0, 127).astype(np.int8)
-    return q.reshape(-1)                               # length INPUT_H*INPUT_W*INPUT_C
+    return np.asarray(img, dtype=np.uint8).reshape(-1)  # [0,255], len H*W*C
+
+
+def quantize_pixels_asym(px):
+    """Host-side twin of the emitted ``<name>_quantize`` C function.
+
+    Must stay bit-identical to ``orchestrator.emit_image_header``'s generated C
+    — it is what lets Stage 2's numpy oracle be compared against the ELF's
+    output at all. Both derive scale/zp from the image's own [min,max] and
+    round half away from zero.
+    """
+    px = np.asarray(px, dtype=np.float32)
+    lo, hi = float(px.min()), float(px.max())
+    if hi - lo < 1e-9:
+        scale, zp = 1.0, -128
+    else:
+        scale = (hi - lo) / 255.0
+        zp = int(np.clip(round(-128 - lo / scale), -128, 127))
+    v = px / scale + zp
+    q = np.where(v < 0, np.ceil(v - 0.5), np.floor(v + 0.5))   # half away from 0
+    return np.clip(q, -128, 127).astype(np.int8)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -111,8 +131,11 @@ def dog_to_scaled_input(path):
 # ═══════════════════════════════════════════════════════════════════════════
 image_path = classify_dog_reference()
 
-# The same image, quantized for the scaled AIE model (or None -> make_input()).
-demo_input = dog_to_scaled_input(image_path) if image_path else None
+# The same image as raw pixels; the ELF quantizes them on-target. The host
+# oracle applies the identical affine so the two are comparable.
+demo_pixels = dog_to_pixels(image_path) if image_path else None
+demo_input = (quantize_pixels_asym(demo_pixels)
+              if demo_pixels is not None else None)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Stage 1: ONNX -> Relay walk -> LayerOp plan (fallback if TVM/onnx absent)
@@ -142,17 +165,25 @@ print(ir)
 # ═══════════════════════════════════════════════════════════════════════════
 #  Stage 4: aiegraph IR -> per-launch descriptors -> emit AIE host/kernel/routing
 # ═══════════════════════════════════════════════════════════════════════════
+# Single switch for BOTH stage 4 (per-launch dirs) and stage 5 (the A2
+# orchestrated main.elf). False => the conv2d family is force-offloaded to the
+# CPU backend everywhere, so no kernel_<name>.cc is emitted and hostcompile.sh
+# never invokes xchesscc.
+enable_aiehlc_offload = False
 for op, launch in zip(plan, core.lower_aiegraph(ir)):
     out_dir = os.path.join(OUT, f"{int(launch['index']):02d}_{op.op}")
     os.makedirs(out_dir, exist_ok=True)
-    if cpu_codegen.is_aie_op(op.op):                    # conv2d family -> AIE
+    if cpu_codegen.is_aie_op(op.op) and enable_aiehlc_offload:                    # conv2d family -> AIE
         specs = [(list(s), int(b), bool(i)) for (s, b, i) in launch["tensor_specs"]]
         body = kernels.kernel_body_for(op.op, launch["func_name"])
         ok = core.run_aie_pipeline(2, 2, specs, out_dir, body, launch["func_name"])
         kind = "AIE"
-    else:                                               # everything else -> TVM CPU C
-        ok = cpu_codegen.emit_cpu_launch(op, out_dir, launch["func_name"])
-        kind = "CPU"
+    else:                                               # everything else -> CPU C
+        # conv2d family reaching this branch is a *force-offload to CPU* (offload
+        # disabled): emit its bit-exact plain-C. Native CPU ops ignore force.
+        ok = cpu_codegen.emit_cpu_launch(op, out_dir, launch["func_name"],
+                                         force=cpu_codegen.is_aie_op(op.op))
+        kind = "CPU(forced)" if cpu_codegen.is_aie_op(op.op) else "CPU"
     print(op.op, kind, out_dir, "OK" if ok else "FAIL")
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -166,9 +197,12 @@ for op, launch in zip(plan, core.lower_aiegraph(ir)):
 launches = core.lower_aiegraph(ir)                     # program-order launches
 a2_dir = os.path.join(OUT, "a2")
 try:
-    build_dir = orchestrator.orchestrate_plan(plan, launches, a2_dir)
-    print("[stage5] emitted A2 driver (host.cc / kernel_*.cc / main.cc / cpu .c):",
-          build_dir)
+    build_dir = orchestrator.orchestrate_plan(
+        plan, launches, a2_dir, enable_aiehlc_offload=enable_aiehlc_offload,
+        image_pixels=demo_pixels)
+    _emitted = ("host.cc / kernel_*.cc / main.cc / cpu .c" if enable_aiehlc_offload
+                else "host.cc / main.cc / cpu .c (all ops on CPU, no AIE kernel)")
+    print(f"[stage5] emitted A2 driver ({_emitted}):", build_dir)
 except Exception as e:                                  # noqa: BLE001
     print(f"[stage5] orchestrate_plan failed ({e}); skipping ELF build")
     build_dir = None
@@ -176,10 +210,14 @@ except Exception as e:                                  # noqa: BLE001
 # Link main.elf only when the cross-toolchain is present; else stop at sources.
 _have_gpp = (shutil.which("aarch64-linux-gnu-g++")
              or shutil.which("aarch64-none-elf-g++"))
-_have_chess = shutil.which("xchesscc") and os.environ.get("XILINX_VITIS")
+# xchesscc is only needed when a conv actually compiles to an AIE kernel; the
+# all-CPU build has no kernel_*.cc for hostcompile.sh to hand to kc.sh.
+_have_chess = (not enable_aiehlc_offload
+               or (shutil.which("xchesscc") and os.environ.get("XILINX_VITIS")))
 if build_dir and _have_gpp and _have_chess:
     print("[stage5] linking main.elf via hostcompile.sh "
-          "(multi-kernel build; live log below)...", flush=True)
+          f"({'multi-kernel' if enable_aiehlc_offload else 'host-only'} build; "
+          "live log below)...", flush=True)
     try:
         elf = orchestrator.build_main_elf(build_dir)
         print("[stage5] built main.elf ->", elf)
@@ -188,3 +226,37 @@ if build_dir and _have_gpp and _have_chess:
 elif build_dir:
     print("[stage5] cross toolchain absent "
           "(need aarch64 g++ + xchesscc/$XILINX_VITIS); emitted sources only")
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Stage 6: build + RUN the same CPU code natively on x86
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 5's main.elf is a baremetal aarch64 binary — it only runs on the board
+# over JTAG, so it tells you the build works but not what it computes. This
+# compiles the SAME emitted .c files for the host and runs them, so the numbers
+# are visible immediately. Only possible for an all-CPU build: with AIE offload
+# on, the launches go into hardware and have no x86 equivalent.
+if build_dir and not enable_aiehlc_offload:
+    print("\n[stage6] building the same CPU code for x86 and running it...")
+    try:
+        x86 = orchestrator.build_x86_main(build_dir)
+        print(f"[stage6] built {x86}")
+        out = orchestrator.run_x86_main(x86)
+        print("[stage6] ---- x86 output ----")
+        for line in out.rstrip("\n").splitlines():
+            print(f"[stage6] {line}")
+        print("[stage6] ---------------------")
+        # The CPU oracle ran back in Stage 2 on the same plan and input, so a
+        # mismatch here means the emitted C diverges from the numpy reference.
+        want = [int(v) for v in logits]
+        got = [int(m) for m in re.findall(r"logit\[\d+\] = (-?\d+)", out)]
+        if got and got == want:
+            print(f"[stage6] MATCHES the Stage-2 numpy oracle {want}")
+        elif got:
+            print(f"[stage6] MISMATCH vs numpy oracle: C={got} numpy={want}")
+        else:
+            print("[stage6] (no logit lines parsed from x86 output)")
+    except Exception as e:                              # noqa: BLE001
+        print(f"[stage6] x86 build/run failed ({e})")
+elif build_dir:
+    print("\n[stage6] skipped: AIE offload is on, so the launches need "
+          "hardware (set enable_aiehlc_offload=False for a runnable x86 build)")
