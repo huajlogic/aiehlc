@@ -2361,21 +2361,23 @@ mlir::ModuleOp buildKernelAggModule(mlir::MLIRContext &ctx, int ntiles, int pert
         auto c0 = b.create<mlir::arith::ConstantOp>(loc, b.getI32IntegerAttr(0));
         int32_t len = (t == perturbLenOnTile) ? 512 : 256;
 
-        // Arg order follows the generated builder: ..., data_id, linked_bd,
-        // out_of_order_bd_id, dim_strides, dim_wraps, iter_step_size, iter_wrap.
-        // ooo matches the plan (t+2): the op and the plan are two independent
-        // derivations of the same shim BD, and the pass fails on disagreement.
+        // packet_id and out_of_order_bd_id are SSA operands (like bd_id/offset),
+        // so they are materialized as arith.constant and passed right after
+        // offset. Values match the plan (t+1 / t+2): the op and the plan are two
+        // independent derivations, and the pass fails on disagreement.
+        auto pktC = b.create<mlir::arith::ConstantOp>(loc, b.getI32IntegerAttr(t + 1));
+        auto oooC = b.create<mlir::arith::ConstantOp>(loc, b.getI32IntegerAttr(t + 2));
         auto pongBd = b.create<dfschedule::ConfigDmaBdOp>(
-            loc, bdTy, pong, tile.getTile(), c5, c0, /*len=*/(uint32_t)len, /*enable_packet=*/true,
-            /*packet_id=*/(uint32_t)(t + 1), /*next_bd=*/4u, /*acquire_lock_id=*/5u,
+            loc, bdTy, pong, tile.getTile(), c5, c0, pktC.getResult(), oooC.getResult(), /*len=*/(uint32_t)len,
+            /*enable_packet=*/true, /*next_bd=*/4u, /*acquire_lock_id=*/5u,
             /*acquire_lock_val=*/(uint32_t)-1, /*release_lock_id=*/4u, /*release_lock_val=*/1u,
-            /*data_id=*/(uint32_t)-1, /*linked_bd=*/mlir::Value(), /*out_of_order_bd_id=*/(uint32_t)(t + 2),
+            /*data_id=*/(uint32_t)-1, /*linked_bd=*/mlir::Value(),
             /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
         auto pingBd = b.create<dfschedule::ConfigDmaBdOp>(
-            loc, bdTy, ping, tile.getTile(), c4, c0, /*len=*/(uint32_t)len, /*enable_packet=*/true,
-            /*packet_id=*/(uint32_t)(t + 1), /*next_bd=*/5u, /*acquire_lock_id=*/5u,
+            loc, bdTy, ping, tile.getTile(), c4, c0, pktC.getResult(), oooC.getResult(), /*len=*/(uint32_t)len,
+            /*enable_packet=*/true, /*next_bd=*/5u, /*acquire_lock_id=*/5u,
             /*acquire_lock_val=*/(uint32_t)-1, /*release_lock_id=*/4u, /*release_lock_val=*/1u,
-            /*data_id=*/(uint32_t)-1, /*linked_bd=*/pongBd.getResult(), /*out_of_order_bd_id=*/(uint32_t)(t + 2),
+            /*data_id=*/(uint32_t)-1, /*linked_bd=*/pongBd.getResult(),
             /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr);
         auto io = b.create<dfschedule::ConfigCreateIoOp>(loc, ioTy, pingBd.getResult(), tile.getTile(),
                                                          b.getI32IntegerAttr(0), b.getStringAttr("MM2S"),
@@ -2488,7 +2490,11 @@ static void testKernelAggregation() {
             auto td = bd.getTile().getDefiningOp<dfschedule::DeclareTileOp>();
             if (!td || td.getCol() != 1)
                 return;
-            bd->setAttr("out_of_order_bd_id", mlir::OpBuilder(&ctx).getI32IntegerAttr(99));
+            // out_of_order_bd_id is an operand now, so skew it by swapping in a
+            // different constant rather than overwriting an attribute.
+            mlir::OpBuilder ib(bd);
+            auto skew = ib.create<mlir::arith::ConstantOp>(bd.getLoc(), ib.getI32IntegerAttr(99));
+            bd.getOutOfOrderBdIdMutable().assign(skew.getResult());
             skewed = true;
         });
 

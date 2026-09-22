@@ -223,13 +223,16 @@ static std::vector<BdConfig> collectBdChain(Value bdHandleVal) {
         bd.bufferOffset = resolveBufferOffset(bdOp.getBuffer());
         bd.len = bdOp.getLen();
         bd.enablePacket = bdOp.getEnablePacket();
-        bd.packetId = bdOp.getPacketId();
+        // packet_id / out_of_order_bd_id are operands; getConstI32 returns -1
+        // when the value is computed at runtime, matching how bd_id above
+        // degrades (the JSON writer emits "runtime" for a negative bd_id).
+        bd.packetId = getConstI32(bdOp.getPacketId());
         bd.nextBd = bdOp.getNextBd();
         bd.acquireLockId = bdOp.getAcquireLockId();
         bd.acquireLockVal = bdOp.getAcquireLockVal();
         bd.releaseLockId = bdOp.getReleaseLockId();
         bd.releaseLockVal = bdOp.getReleaseLockVal();
-        bd.outOfOrderBdId = bdOp.getOutOfOrderBdId();
+        bd.outOfOrderBdId = getConstI32(bdOp.getOutOfOrderBdId());
 
         if (auto strides = bdOp.getDimStrides()) {
             for (auto s : strides->getAsRange<IntegerAttr>())

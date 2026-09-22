@@ -828,13 +828,18 @@ void emitCoreSingleBufferBd(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEm
         rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(singleBdId));
     auto singleOffsetConst =
         rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+    auto singlePktConst =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(t.coreBdPacketId));
+    auto singleOooConst =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(t.coreOooBdId));
     auto singleBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
         loc, dfschedule::BdHandleType::get(rewriter.getContext()), singleL1.getBuffer(), t.coreTileOp.getTile(),
         singleBdIdConst.getResult(),
         singleOffsetConst.getResult(),                 // offset
+        singlePktConst.getResult(),                    // packet_id
+        singleOooConst.getResult(),                    // out_of_order_bd_id
         rewriter.getI32IntegerAttr(t.coreBdLen),       // len (bytes)
         rewriter.getBoolAttr(t.coreBdEnablePacket),    // enable_packet
-        rewriter.getI32IntegerAttr(t.coreBdPacketId),  // packet_id
         rewriter.getI32IntegerAttr(-1),                // next_bd = -1 (no chaining)
         rewriter.getI32IntegerAttr(t.bdAcquireLockId), // acquire_lock_id
         rewriter.getI32IntegerAttr(-1),                // acquire_lock_val
@@ -842,7 +847,6 @@ void emitCoreSingleBufferBd(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEm
         rewriter.getI32IntegerAttr(1),                 // release_lock_val
         rewriter.getI32IntegerAttr(-1),                // data_id
         Value(),                                       // linked_bd = none
-        rewriter.getI32IntegerAttr(t.coreOooBdId),     // out_of_order_bd_id
         /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
         rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
         rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
@@ -885,13 +889,20 @@ void emitCorePingPongBd(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitDe
         rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pongBdId));
     auto pongOffsetConst =
         rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+    // packet_id / out_of_order_bd_id are per-tile, and identical for this tile's
+    // ping and pong BDs; one constant each per BD keeps the operand wiring local.
+    auto pongPktConst =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(t.coreBdPacketId));
+    auto pongOooConst =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(t.coreOooBdId));
     auto pongBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
         loc, dfschedule::BdHandleType::get(rewriter.getContext()), pongL1.getBuffer(), t.coreTileOp.getTile(),
         pongBdIdConst.getResult(),
         pongOffsetConst.getResult(),                   // offset
+        pongPktConst.getResult(),                      // packet_id
+        pongOooConst.getResult(),                      // out_of_order_bd_id
         rewriter.getI32IntegerAttr(t.coreBdLen),       // len (bytes)
         rewriter.getBoolAttr(t.coreBdEnablePacket),    // enable_packet
-        rewriter.getI32IntegerAttr(t.coreBdPacketId),  // packet_id
         rewriter.getI32IntegerAttr(pingBdId),          // next_bd -> ping
         rewriter.getI32IntegerAttr(t.bdAcquireLockId), // acquire_lock_id
         rewriter.getI32IntegerAttr(-1),                // acquire_lock_val
@@ -899,7 +910,6 @@ void emitCorePingPongBd(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitDe
         rewriter.getI32IntegerAttr(1),                 // release_lock_val
         rewriter.getI32IntegerAttr(-1),                // data_id
         Value(),                                       // linked_bd = none
-        rewriter.getI32IntegerAttr(t.coreOooBdId),     // out_of_order_bd_id
         /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
         rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
         rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)
@@ -909,13 +919,18 @@ void emitCorePingPongBd(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitDe
         rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(pingBdId));
     auto pingOffsetConst =
         rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+    auto pingPktConst =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(t.coreBdPacketId));
+    auto pingOooConst =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(t.coreOooBdId));
     auto pingBdOp = rewriter.create<dfschedule::ConfigDmaBdOp>(
         loc, dfschedule::BdHandleType::get(rewriter.getContext()), pingL1.getBuffer(), t.coreTileOp.getTile(),
         pingBdIdConst.getResult(),
         pingOffsetConst.getResult(),                   // offset
+        pingPktConst.getResult(),                      // packet_id
+        pingOooConst.getResult(),                      // out_of_order_bd_id
         rewriter.getI32IntegerAttr(t.coreBdLen),       // len (bytes)
         rewriter.getBoolAttr(t.coreBdEnablePacket),    // enable_packet
-        rewriter.getI32IntegerAttr(t.coreBdPacketId),  // packet_id
         rewriter.getI32IntegerAttr(pongBdId),          // next_bd -> pong
         rewriter.getI32IntegerAttr(t.bdAcquireLockId), // acquire_lock_id
         rewriter.getI32IntegerAttr(-1),                // acquire_lock_val
@@ -923,7 +938,6 @@ void emitCorePingPongBd(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTileEmitDe
         rewriter.getI32IntegerAttr(1),                 // release_lock_val
         rewriter.getI32IntegerAttr(-1),                // data_id
         pongBdOp.getBdHandle(),                        // linked_bd = pong BD
-        rewriter.getI32IntegerAttr(t.coreOooBdId),     // out_of_order_bd_id
         /*dim_strides=*/nullptr, /*dim_wraps=*/nullptr,
         rewriter.getI32IntegerAttr(0),  // iter_step_size (no iteration)
         rewriter.getI32IntegerAttr(0)); // iter_wrap (no iteration)

@@ -146,21 +146,32 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
     dfschedule_TileHandleType:$tile,
     I32:$bd_id,
     I32:$offset,
+    // packet_id and out_of_order_bd_id are SSA operands, not attributes, for the
+    // same reason bd_id and offset are: they are per-tile values, and as operands
+    // they are visible to the normal SSA machinery (canonicalization, operand
+    // cloning, "where did this come from"). As attributes they were baked in at
+    // op-creation time, so a value that was wrong or missing at that moment
+    // stayed wrong with nothing downstream able to notice -- which is exactly how
+    // every MM2S core BD ended up with out_of_order_bd_id = -1.
+    //
+    // They must stay arith.constant-foldable: the kernel path reads them back to
+    // build the per-tile dispatch in kernel.cc and has no runtime path for them.
+    I32:$packet_id,
+    // Out-of-order BD target: when >= 0, this core MM2S BD tells the shim S2MM
+    // DMA engine to use this specific BD ID for the transfer (via
+    // XAie_DmaSetOutofOrderBdId). Value of -1 means "not used".
+    I32:$out_of_order_bd_id,
     I32Attr:$len,
     BoolAttr:$enable_packet,
-    I32Attr:$packet_id,
     I32Attr:$next_bd,
     DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_id,
     DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_val,
     DefaultValuedAttr<I32Attr, "-1">:$release_lock_id,
     DefaultValuedAttr<I32Attr, "-1">:$release_lock_val,
     DefaultValuedAttr<I32Attr, "-1">:$data_id,
+    // Keep this LAST among the operands: it is the only optional one, so the
+    // parser can disambiguate it positionally ("a 7th operand is linked_bd").
     Optional<dfschedule_BdHandleType>:$linked_bd,
-    // Out-of-order BD target: when >= 0, this core MM2S BD tells the shim S2MM
-    // DMA engine to use this specific BD ID for the transfer (via
-    // XAie_DmaSetOutofOrderBdId). Value of -1 means "not used" (backward
-    // compatible).
-    DefaultValuedAttr<I32Attr, "-1">:$out_of_order_bd_id,
     // Multi-dimensional addressing (optional, up to 4 dims)
     // When both present and non-empty, generates XAie_DmaSetMultiDimAddr
     // When absent, generates existing XAie_DmaSetAddrLen (no behavior change)
