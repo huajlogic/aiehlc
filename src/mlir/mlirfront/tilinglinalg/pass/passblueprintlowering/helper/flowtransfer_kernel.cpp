@@ -531,11 +531,37 @@ LogicalResult emitCoreBufferDma(FlowLoweringCtx &c, CoreTileCtx &t, const CoreTi
 
                 // Compute out_of_order_bd_id for output (MM2S) core BDs.
                 // This tells the shim S2MM DMA which BD to use for this tile's data.
+                //
+                // Two sources, because this helper runs on BOTH module clones:
+                //
+                //   host clone   — shimPerTileBdIds was just filled by the shim-side
+                //                  BD allocation in this same walk (flowtransfer_host.cpp),
+                //                  so it is authoritative here.
+                //   kernel clone — the host ran on a DIFFERENT clone and its ctx is
+                //                  long gone, so shimPerTileBdIds is EMPTY. Falling
+                //                  through would leave -1 on every MM2S core BD and
+                //                  the IR would misdescribe the hardware: the emitted
+                //                  kernel.cc carries real ooo ids (taken from the
+                //                  offload plan), so a reader comparing the two would
+                //                  be told the core targets "no particular shim BD".
+                //
+                // The host already published the real value per (col,row,MM2S,flow)
+                // into the ResourceMgr SINGLETON — the one channel that survives the
+                // clone — so read it back rather than leaving the op wrong.
                 t.coreOooBdId = -1;
-                if (t.isOutputFlow && !c.shimPerTileBdIds.empty()) {
-                    size_t idx = static_cast<size_t>(c.tileIndex);
-                    if (idx < c.shimPerTileBdIds.size())
-                        t.coreOooBdId = c.shimPerTileBdIds[idx];
+                if (t.isOutputFlow) {
+                    if (!c.shimPerTileBdIds.empty()) {
+                        size_t idx = static_cast<size_t>(c.tileIndex);
+                        if (idx < c.shimPerTileBdIds.size())
+                            t.coreOooBdId = c.shimPerTileBdIds[idx];
+                    } else if (d.resourceMgr) {
+                        for (const auto &e : d.resourceMgr->coreOffloadPlan()) {
+                            if (e.col == t.col && e.row == t.row && e.isOutput && e.flowIndex == c.flowIndex) {
+                                t.coreOooBdId = e.oooBdId;
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 // (KERNELCONFIGOFFLOAD plan is published below, after

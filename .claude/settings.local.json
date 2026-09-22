@@ -34,7 +34,9 @@
       "mcp__ide__getDiagnostics",
       "Bash(awk '{print $NF}')",
       "Bash(awk -F'config\\\\\\\\\\(v1, ' '{print $2}')",
-      "Bash(awk -F', ' '{print \"enpkt=\"$6\" pktid=\"$7\" ooo=\"$12}')"
+      "Bash(awk -F', ' '{print \"enpkt=\"$6\" pktid=\"$7\" ooo=\"$12}')",
+      "Bash(cd *)",
+      "Bash(awk '/enable_packet = true/,/^    } :/' ir/dfschedule/15_BlueprintToScheduleKernelPass.mlir)"
     ],
     "deny": []
   },

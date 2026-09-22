@@ -255,9 +255,19 @@ void dfschedule::KernelScheduleOp::print(::mlir::OpAsmPrinter &printer) {
 }
 
 // KernelModuleOp - Top-level kernel module container
+//
+// The attr-dict is printed/parsed. Without it the discardable attributes this op
+// carries -- dfschedule.kernel_config_offload and dfschedule.core_offload_plan
+// (set in passblueprinttoschedulekernel.cpp) -- are invisible in the ir/*.mlir
+// dumps, which defeats the stated reason for attaching the plan to the op at all.
+// A wrong per-tile MM2S arm is only debuggable after the fact if the plan it came
+// from is actually in the dump.
 ::mlir::ParseResult dfschedule::KernelModuleOp::parse(::mlir::OpAsmParser &parser, ::mlir::OperationState &result) {
     mlir::StringAttr nameAttr;
     if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
+        return mlir::failure();
+
+    if (parser.parseOptionalAttrDict(result.attributes))
         return mlir::failure();
 
     auto *body = result.addRegion();
@@ -272,6 +282,7 @@ void dfschedule::KernelScheduleOp::print(::mlir::OpAsmPrinter &printer) {
 
 void dfschedule::KernelModuleOp::print(::mlir::OpAsmPrinter &printer) {
     printer << " @" << getSymName();
+    printer.printOptionalAttrDict((*this)->getAttrs(), /*elidedAttrs=*/{mlir::SymbolTable::getSymbolAttrName()});
     printer << " ";
     printer.printRegion(getBody(), /*printEntryBlockArgs=*/false, /*printBlockTerminators=*/false);
 }
@@ -468,6 +479,41 @@ void dfschedule::ConfigDmaBdOp::print(::mlir::OpAsmPrinter &printer) {
         printer.printNewline();
         printer << "iter_wrap = " << getIterWrap() << " : i32";
     }
+    // Aggregation attributes (DfscheduleKernelAggregationPass). This printer
+    // enumerates fields explicitly rather than using an attr-dict, so anything
+    // not listed here is invisible in the IR dumps. These are discardable
+    // attributes describing which core tiles one BD program covers and how the
+    // per-tile packet id / out-of-order bd id vary across them -- exactly the
+    // facts you need in the dump to debug a wrong per-tile MM2S arm.
+    auto printI32Array = [&](llvm::StringRef name, mlir::ArrayAttr arr) {
+        printer << ",";
+        printer.printNewline();
+        printer << name << " = [";
+        for (size_t i = 0; i < arr.size(); ++i) {
+            if (i > 0)
+                printer << ", ";
+            if (auto inner = mlir::dyn_cast<mlir::ArrayAttr>(arr[i])) {
+                printer << "[";
+                for (size_t j = 0; j < inner.size(); ++j) {
+                    if (j > 0)
+                        printer << ", ";
+                    printer << mlir::cast<IntegerAttr>(inner[j]).getInt();
+                }
+                printer << "]";
+            } else {
+                printer << mlir::cast<IntegerAttr>(arr[i]).getInt();
+            }
+        }
+        printer << "]";
+    };
+    if (auto agg = (*this)->getAttrOfType<mlir::BoolAttr>("aggregated")) {
+        printer << ",";
+        printer.printNewline();
+        printer << "aggregated = " << (agg.getValue() ? "true" : "false");
+    }
+    for (llvm::StringRef n : {"tile_coords", "tile_packet_ids", "tile_ooo_bd_ids"})
+        if (auto arr = (*this)->getAttrOfType<mlir::ArrayAttr>(n))
+            printI32Array(n, arr);
     printer.decreaseIndent();
     printer.printNewline();
     printer << "} ";

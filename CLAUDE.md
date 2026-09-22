@@ -82,7 +82,13 @@ Platforms: baremetal (`aarch64-none-elf-g++`) or Linux (`aarch64-linux-gnu-g++`)
 
 **Kernel path** → `kernel.cc`:
 
-5. `BlueprintToScheduleKernelPass` → `DfscheduleToKernelApiPass` → EmitC → `kernel.cc`
+5. `BlueprintToScheduleKernelPass` → (`DfscheduleKernelAggregationPass`, offload-only) → `DfscheduleToKernelApiPass` → EmitC → `kernel.cc`
+
+`DfscheduleKernelAggregationPass` (`pass/passdfschedulekernelaggregation/`, gated on `routing.kernel_config_offload`) collapses the **per-core-tile** core DMA config into one BD group per window. `BlueprintToScheduleKernelPass` emits a `declaretile`/`dma_bd`/`create_io`/`start_io` group per tile — 48 groups / 96 `dma_bd` on a 4×4 mesh with 3 windows — but one `kernel.cc` is broadcast to every core tile, so those describe at most two distinct configurations: S2MM is identical on every tile (circuit-switched: no packet id, no ooo bd), and MM2S differs only in `packet_id` and `ooo_bd_id`. The pass rewrites each cluster onto a **sentinel** `declaretile {col = -1, row = -1}` ("any tile") carrying the fan-out as discardable attrs `aggregated` / `tile_coords` / `tile_packet_ids` / `tile_ooo_bd_ids` (96 → 6 `dma_bd`, IR 2002 → 247 lines). Any pass walking `declaretile` for real coordinates must skip negative ones.
+
+**`ooo_bd_id` on the kernel clone.** `out_of_order_bd_id` derives from `FlowLoweringCtx::shimPerTileBdIds`, which only the *host* clone populates (`helper/flowtransfer_host.cpp`) — on the kernel clone that vector is empty. `emitCoreBufferDma` therefore falls back to the value the host published per `(col,row,MM2S,flow)` into the `ResourceMgr` **singleton** (`coreOffloadPlan()`), the one channel that survives the clone. Without that fallback every MM2S core `dma_bd` in the stage-15 dump read `-1` while the emitted `kernel.cc` carried real ids — the IR actively misdescribed the hardware, and anyone reading it would conclude the core targeted no particular shim BD. Both `packet_id` and `ooo_bd_id` now exist in the op *and* the plan as independent derivations; the aggregation pass cross-checks them and **fails the build** on disagreement, because a wrong ooo id routes a tile's output into another tile's shim BD and surfaces only as a silent data mismatch on hardware.
+
+Mergeability is verified **strictly**: every attribute except those two must match across a cluster, and every tile must have a plan entry. The merge key is an allowlist of *varying* fields, so a newly added `dma_bd` attribute defaults to being compared — a silent wrong merge would program the wrong DMA registers and still compile. Erasure is a **fixpoint** sweep, not per-cluster: the BDs of one tile form a chain (pong `dma_bd` → ping's `linked_bd` → `create_io`), and ping/pong land in different clusters, so cluster-by-cluster erasure would orphan a pong — which `ConfigDmaBdOp`'s verifier rejects. `DfscheduleToKernelApiPass::emitCoreDmaConfigBlocks` reads the aggregated ops (`collectAggregatedOutTiles`) and falls back to `core_offload_plan` when the pass did not run; `emitWindowBdAndLocks` is unchanged, so `kernel.cc` is byte-identical either way. Tested by `unitest/test.cpp` → `./test kernelagg`.
 
 **KERNELCONFIGOFFLOAD** (gated on `routing.kernel_config_offload`, set by `#pragma KERNELCONFIGOFFLOAD`, default off): when on, the core self-configures **all of its own core-tile DMA** — BD chains, lock inits, lock config and channel starts, in **both** directions — from `kernel.cc` via raw MMIO instead of the host programming it over the config bus, using the `include/aie_kernel_config.h` encoders (`aie_kc_encode_bd` / `_lock` / `_s2mm_start` / `_mm2s_start`). Gen5 (AIE2PS) only. The kernel include path needs `-I include` (in `script/kc.sh`).
 
@@ -182,6 +188,7 @@ Read the matching skill when the task fits:
 | HW performance counters | aiehwprofile |
 | Raw-XAie sim debug bundle | raw-xaie-sim-debug-bundle |
 | Sim build/run separation | sim-build-run-separation |
+| Build fails on missing snap cmake / libz.so / ZLIB::ZLIB; fast single-file compile check | mlirbuildsandbox |
 | hostcompile / missing compile_kernel.sh | hostcompile-entrypoint |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |

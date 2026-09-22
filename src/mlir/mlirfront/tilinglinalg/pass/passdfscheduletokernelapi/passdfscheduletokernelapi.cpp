@@ -63,6 +63,61 @@ struct CoreOffloadEntry {
     int32_t ppDepth = 2;
 };
 
+/// Read the per-tile MM2S fan-out off the AGGREGATED dma_bd ops that
+/// DfscheduleKernelAggregationPass leaves in the kernel module body.
+///
+/// That pass collapses the 16 (or N) identical per-tile BD groups into one and
+/// records what varied as discardable array attributes:
+///
+///     aggregated      = true
+///     tile_coords     = [[col,row], ...]
+///     tile_packet_ids = [id, ...]        // parallel to tile_coords
+///     tile_ooo_bd_ids = [bd, ...]        // parallel to tile_coords
+///
+/// Only output (packet-enabled) groups carry the id arrays -- S2MM is uniform
+/// across tiles and needs no dispatch. Leaves `out` empty when the aggregation
+/// pass did not run, so the caller can fall back to core_offload_plan.
+static void collectAggregatedOutTiles(KernelModuleOp kernelModuleOp, SmallVectorImpl<CoreOffloadEntry> &out) {
+    for (Operation &inner : kernelModuleOp.getBody().front()) {
+        auto bd = dyn_cast<ConfigDmaBdOp>(&inner);
+        if (!bd)
+            continue;
+        auto agg = bd->getAttrOfType<BoolAttr>("aggregated");
+        if (!agg || !agg.getValue())
+            continue;
+        auto coords = bd->getAttrOfType<ArrayAttr>("tile_coords");
+        auto pkts = bd->getAttrOfType<ArrayAttr>("tile_packet_ids");
+        auto ooos = bd->getAttrOfType<ArrayAttr>("tile_ooo_bd_ids");
+        // Output groups only: an S2MM aggregate has no id arrays.
+        if (!coords || !pkts || !ooos)
+            continue;
+        if (pkts.size() != coords.size() || ooos.size() != coords.size())
+            continue;
+        for (size_t i = 0; i < coords.size(); ++i) {
+            auto pair = dyn_cast<ArrayAttr>(coords[i]);
+            if (!pair || pair.size() != 2)
+                continue;
+            CoreOffloadEntry e;
+            e.col = static_cast<int32_t>(cast<IntegerAttr>(pair[0]).getInt());
+            e.row = static_cast<int32_t>(cast<IntegerAttr>(pair[1]).getInt());
+            e.isOutput = true;
+            e.enablePacket = bd.getEnablePacket();
+            e.packetId = static_cast<int32_t>(cast<IntegerAttr>(pkts[i]).getInt());
+            e.oooBdId = static_cast<int32_t>(cast<IntegerAttr>(ooos[i]).getInt());
+            e.bdLenBytes = static_cast<int32_t>(bd.getLen());
+            bool seen = false;
+            for (const auto &o : out)
+                if (o.col == e.col && o.row == e.row)
+                    seen = true;
+            if (!seen)
+                out.push_back(e);
+        }
+        // One output window == one aggregated MM2S group; the first is enough.
+        if (!out.empty())
+            return;
+    }
+}
+
 /// dfschedule.module -> convert entire body line-by-line then erase module.
 /// Always matches and does full conversion so we do not depend on nested patterns
 /// firing first (conversion may try the parent before descending into regions).
@@ -536,16 +591,30 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 // (col,row) alone — a second entry for the same tile would emit an
                 // unreachable `else if` and silently drop whichever arm lost.
                 // First entry wins; they describe the same physical MM2S channel.
+                //
+                // Preferred source is the AGGREGATED dma_bd emitted by
+                // DfscheduleKernelAggregationPass: it carries tile_coords /
+                // tile_packet_ids / tile_ooo_bd_ids describing exactly this
+                // fan-out, so the IR is what drives codegen. The
+                // core_offload_plan walk below is the fallback for when that
+                // pass did not run.
+                SmallVector<CoreOffloadEntry> aggTiles;
+                collectAggregatedOutTiles(kernelModuleOp, aggTiles);
+
                 SmallVector<const CoreOffloadEntry *> outTiles;
-                for (const auto &e : offloadPlan) {
-                    if (!e.isOutput)
-                        continue;
-                    bool seen = false;
-                    for (const auto *o : outTiles)
-                        if (o->col == e.col && o->row == e.row)
-                            seen = true;
-                    if (!seen)
-                        outTiles.push_back(&e);
+                for (const auto &e : aggTiles)
+                    outTiles.push_back(&e);
+                if (outTiles.empty()) {
+                    for (const auto &e : offloadPlan) {
+                        if (!e.isOutput)
+                            continue;
+                        bool seen = false;
+                        for (const auto *o : outTiles)
+                            if (o->col == e.col && o->row == e.row)
+                                seen = true;
+                        if (!seen)
+                            outTiles.push_back(&e);
+                    }
                 }
                 if (outTiles.empty()) {
                     windowDefOp.emitError()
