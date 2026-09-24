@@ -75,7 +75,7 @@
 // trace-induced; set to 1 to re-enable.
 #ifndef TRACE_ENABLE
 #ifndef __AIESIM__
-#define TRACE_ENABLE 1
+// #define TRACE_ENABLE 1
 #else
 #define TRACE_ENABLE 0
 #endif
@@ -86,7 +86,7 @@
 // hex) that src/tool/debug/host_aie_timeline.py correlates into one microsecond
 // axis. Host-side only (XTime), so it is compiled out under the simulator.
 #ifndef __AIESIM__
-#define TIMESYNC 1
+// #define TIMESYNC 1
 #else
 #define TIMESYNC 0
 #endif
@@ -102,6 +102,52 @@
 #define N 4
 #define MAT_SIZE (N * N)
 
+// ===========================================================================
+// Declaring an address as TM (Tile Memory-Mapped)
+// ===========================================================================
+// Arch doc Table 5-5: the core sees three NON-OVERLAPPING spaces, each behind
+// an INDEPENDENT interface:
+//     PM 0x0_0000-0x0_4000 | DM 0x4_0000-0x7_FFFF | TM 0x8_0000-0xF_FFFF
+// and a register's core-bus address is its AXI-MM address + 0x8_0000
+// (DMA_BD0_0 = 0x1_D000 on AXI-MM -> 0x9_D000 from the core).
+//
+// THE ADDRESS ALONE DOES NOT SELECT THE INTERFACE. chess picks the interface
+// from the pointer's MEMORY SPACE, which a numeric cast cannot express:
+//
+//     *((volatile int *)(0x80000 + off)) = v;   // -> plain  ST   (stays in core)
+//     tm_write(off, v);                         // -> ST.TM       (processor bus)
+//
+// That is why a raw-pointer write reads back correctly ON the core (store and
+// load are coherent with each other) yet XAie_Read32 from the host sees 0 --
+// the transaction never left the core.
+//
+// The memory space comes from chess_storage(TM:<base>) on a FILE-SCOPE anchor
+// object. Accesses formed by indexing off its address inherit the TM space.
+// Must be file scope: a block-scope declaration gets no TM linkage (and
+// `inline` on a local is not even valid C++).
+//
+// Verified in the reference build
+// (aeg/res18sw/aie/Work/aie/3_3/Release/3_3.lst): 3x ST.TM + 3x LDA.TM. The
+// equivalent raw-pointer kernel emits zero .TM instructions.
+// IMPLEMENTATION NOTE: aiehlc regenerates the kernel from the function BODY
+// plus the user's #define lines (aiehlc.cc:4718-4725) -- file-scope functions
+// and variables declared here are NOT copied into aout/perf.cc. So the anchor
+// has to be introduced as MACROS, which do propagate, and the anchor object is
+// declared at block scope via a statement macro.
+//
+// Reg_DB_Offset is 0 on aie2*, i.e. TM_W/TM_R take the AXI-MM offset
+// (0x16000), NOT the already-biased core address (0x96000): the anchor's base
+// supplies the +0x80000. Pointer arithmetic is in uint32 units, hence /4.
+// chess_storage(TM:...) attaches to an OBJECT, not a pointer -- the compiler
+// rejects it on pointer/reference types. What it actually does is put the
+// object in TM, which clang models as address_space(15) (the diagnostic for a
+// mismatched assignment names it explicitly). So a TM pointer is spelled with
+// the address space directly, and any access through it becomes ST.TM/LDA.TM.
+#define TM_BASE_ADDR 0x80000
+#define TM_PTR(off) ((volatile uint32 __attribute__((address_space(15))) *)((TM_BASE_ADDR) + (off)))
+#define TM_W(off, v) (*TM_PTR(off) = (uint32)(v))
+#define TM_R(off) (*TM_PTR(off))
+
 // #define DISABLE_CACHE
 //__attribute__((annotate("streaming")))
 __global__ void perf(input_window_int32 *win __attribute__((annotate("mem_address:0x1000"), annotate("size_hint:512"))),
@@ -111,7 +157,49 @@ __global__ void perf(input_window_int32 *win __attribute__((annotate("mem_addres
 #define MAT_SIZE (N * N)
 #define DATA_SIZE (MAT_SIZE * 2)
 #define VECTOR_LENGTH 16
-	//aie::vector<int32_t, VECTOR_LENGTH> temp_a = window_readincr_v<VECTOR_LENGTH>(win);
+    // ---- Tile Memory-Mapped (TM) register access -----------------------------
+    // Per the arch doc (Table 5-5): PM 0x0_0000-0x0_4000, DM 0x4_0000-0x7_FFFF,
+    // TM 0x8_0000-0xF_FFFF, with a constant +0x8_0000 offset between a register's
+    // AXI-MM address and its core-processor-bus address. So Mem_Spare_Reg
+    // (AXI-MM 0x1_6000) is 0x9_6000 from the core.
+    //
+    // The ADDRESS alone is not enough: PM/DM/TM are reached through INDEPENDENT
+    // interfaces, and the compiler picks the interface from the pointer's memory
+    // space, not from the numeric value. A bare (volatile int *) cast compiles to
+    // an ordinary ST/LDA that never leaves the core -- which is why a raw-pointer
+    // write reads back correctly ON the core but shows 0 from XAie_Read32.
+    //
+    // adf::write/adf::read (adf/aie/tile_control.h, via <adf.h>) go through the
+    // chess_storage(TM:...) anchor and emit the dedicated ST.TM / LDA.TM
+    // instructions. Verified against the reference build
+    // (aeg/res18sw/aie/Work/aie/3_3/Release/3_3.lst), which contains 3x ST.TM and
+    // 3x LDA.TM; our previous raw-pointer kernel contained zero .TM instructions.
+    // (A) our own TM declaration -- see the TM_* macros above.
+    TM_W(0x16000, 0x7234);
+    chess_memory_fence();
+    uint32 rb = TM_R(0x16000);
+    uint32 corestatus = TM_R(0x32004);
+
+    // (B) the library path, for comparison. Both must emit ST.TM / LDA.TM; if
+    // only one does, that one is the correct way to declare a TM address.
+    adf::write(adf::reg_val{0x16004, 0x7235});
+    chess_memory_fence();
+    uint32 rb_adf = adf::read(0x16004);
+
+    // (C) deliberate control: a raw pointer cast to the SAME core-bus address.
+    // Expected to compile to a plain ST -- it is the bug this block documents.
+    *((volatile int *)(0x80000 + 0x16008)) = 0x7236;
+    chess_memory_fence();
+    uint32 rb_raw = *((volatile int *)(0x80000 + 0x16008));
+
+    // Park results in DM: data memory is passive storage, so the values survive
+    // until the host reads them (a TM register may be volatile hardware state).
+    *((volatile int *)(0x70000 + 0x0000FF04)) = (int)rb; // expect 0x7234
+    *((volatile int *)(0x70000 + 0x0000FF08)) = (int)corestatus;
+    *((volatile int *)(0x70000 + 0x0000FF0C)) = (int)rb_adf; // expect 0x7235
+    *((volatile int *)(0x70000 + 0x0000FF10)) = (int)rb_raw; // expect 0x7236 on-core
+
+    //aie::vector<int32_t, VECTOR_LENGTH> temp_a = window_readincr_v<VECTOR_LENGTH>(win);
 	//aie::store_unaligned_v<VECTOR_LENGTH>(A_mat + (w*VECTOR_LENGTH), temp_a);
 	uint32_t * ptr_out = (uint32_t *)(0x70000 + 0x6000);
 	uint32_t * ptr_in = (uint32_t *)(0x70000 + 0x1000);
@@ -168,6 +256,8 @@ int test_routing(XAie_DevInst *DevInst)
     XAie_CoreReset(DevInst, XAie_TileLoc(4, 4));
     XAie_LoadElfMem(DevInst, XAie_TileLoc(4, 4), (unsigned char *)perf);
     XAie_CoreUnreset(DevInst, XAie_TileLoc(4, 4));
+
+    XAie_CoreProcessorBusEnable(DevInst, XAie_TileLoc(4, 4));
 
     routingInstance = XAie_InitRoutingHandler(DevInst);
     XAie_Route(routingInstance, NULL, XAie_TileLoc(shimcol, 0) /* Source*/, XAie_TileLoc(4, 4) /* destination*/);
@@ -491,6 +581,10 @@ int main(int argc, char* argv[]) {
 #endif /* __AIESIM__ */
 
     test_routing(&DevInst);
+
+    u32 v = 0;
+    XAie_Read32(&DevInst, XAie_GetTileAddr(&DevInst, 4, 4) + 0x16000, &v);
+    printf("Read value from 0x16000: 0x%x\n", v);
     return 1;
     RC = XAie_PartitionTeardown(&DevInst);
     if(RC != XAIE_OK) {

@@ -6,7 +6,8 @@
  */
 #include "simplematmul.h"
 // #pragma aie_debug_level(2 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
-#pragma aie_debug_level(0 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN | AIE_KERNEL_CONFIG_TRACE)
+// #pragma aie_debug_level(0 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN | AIE_KERNEL_CONFIG_TRACE)
+#pragma aie_debug_level(0 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
 // Declarative per-tile core trace: mesh/partition-relative (col,row) of the
 // compute tile to trace. Repeatable; supports ranges e.g. #pragma aie_trace(1:2, 3).
 // #pragma aie_trace((0, 3), (PARAMETER, "win_a"))

@@ -2437,13 +2437,15 @@ static void testKernelAggregation() {
                 pktOk &= mlir::cast<mlir::IntegerAttr>(pkts[t]).getInt() == t + 1;
                 oooOk &= mlir::cast<mlir::IntegerAttr>(ooos[t]).getInt() == t + 2;
             }
-            if (auto td = bd.getTile().getDefiningOp<dfschedule::DeclareTileOp>())
-                sentinelOk = (td.getCol() == -1 && td.getRow() == -1);
+            // The aggregated group must hang off declaretile.self, NOT a
+            // coordinate-bearing tile: one ELF runs on every core tile.
+            sentinelOk = bd.getTile().getDefiningOp<dfschedule::DeclareTileSelfOp>() != nullptr &&
+                         bd.getTile().getDefiningOp<dfschedule::DeclareTileOp>() == nullptr;
         });
         std::cout << "  tile_coords has " << kTiles << " tiles:   " << (coordsOk ? "PASS" : "FAIL") << std::endl;
         std::cout << "  tile_packet_ids from plan: " << (pktOk ? "PASS" : "FAIL") << std::endl;
         std::cout << "  tile_ooo_bd_ids from plan: " << (oooOk ? "PASS" : "FAIL") << std::endl;
-        std::cout << "  sentinel tile (-1,-1):     " << (sentinelOk ? "PASS" : "FAIL") << std::endl;
+        std::cout << "  anchored on declaretile.self: " << (sentinelOk ? "PASS" : "FAIL") << std::endl;
         allPass &= coordsOk && pktOk && oooOk && sentinelOk;
 
         // Verifiers must still accept the rewritten module (no orphaned handles).

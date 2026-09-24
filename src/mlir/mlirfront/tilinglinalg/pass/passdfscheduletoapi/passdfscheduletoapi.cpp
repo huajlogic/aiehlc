@@ -3117,7 +3117,26 @@ void DfscheduleToApiPass::runOnOperation() {
     
     ModuleOp moduleOp = getOperation();
     MLIRContext *ctx = moduleOp.getContext();
-    
+
+    // dfschedule.declaretile.self is KERNEL-PATH ONLY. The host programs specific
+    // tiles over the config bus and lowers a tile handle to XAie_TileLoc(col,row),
+    // which a self-tile cannot supply -- it denotes "whichever core is running
+    // this kernel", resolved on-core via get_coreid(). Reaching here means a
+    // kernel-side construct leaked onto the host clone; fail with a real message
+    // instead of letting it become a bogus tile address.
+    {
+        bool sawSelfTile = false;
+        moduleOp.walk([&](dfschedule::DeclareTileSelfOp selfOp) {
+            selfOp.emitError("dfschedule.declaretile.self reached host lowering: the host must address a "
+                             "specific tile (XAie_TileLoc), but a self-tile has no coordinates. This op is "
+                             "only valid on the kernel path, where the core resolves its own location at "
+                             "runtime via get_coreid()");
+            sawSelfTile = true;
+        });
+        if (sawSelfTile)
+            return signalPassFailure();
+    }
+
     // Shared conversion state
     ConversionState state;
     state.enableDebug = enableDebug_;
