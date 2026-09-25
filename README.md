@@ -819,9 +819,13 @@ and most cost comming from regsiter read/write that default is through AXI-MM
 
 In following document there are some perf data  on the control plan
 
+[Register access unit cost — ~372 ns/write AXI-MM vs ~2.9 ns/write control packet](./doc/performance/register_write_cost.md)
+
 [Register r/w perf in axi-mm and control pkt](./doc/performance/controlperf_analysis.md)
 
 [TIME LINE](./doc/performance/controlperf_timeline_crosstrack.md)
+
+[HOST ONE ITER control cost] (./doc/performance/register_write_cost.md)
 
 
 ```
