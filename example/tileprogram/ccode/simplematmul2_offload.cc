@@ -42,7 +42,7 @@ constexpr aie::GemmSpace LtoR_Merge = {
                .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
     .d1 = {.fullsize = M, .tile_size = 16, .stride = 16},  // C: M-tile
     .d2 = {.fullsize = N, .tile_size = 16, .stride = 16}}; // C: N-tile
-#define DEBUG_OUTPUT_ORDER 1
+// #define DEBUG_OUTPUT_ORDER 1
 #define DEBUG_NOCOMPUTE 1
 //  Per-kernel GLOBAL policy, bound explicitly at the declaration site via
 //  __global__(matmul_policy). The <kernel>_policy naming convention still works
@@ -325,7 +325,7 @@ __global__ void mul2(aie::port<input_window_int8 *, RowBA> win_a, aie::port<inpu
 
 // HOST
 int main() {
-    printf("=== Matrix Multiply with Data Caching on AIE %dx%d Mesh ===\n", HW_ROWS, HW_COLS);
+    printf("=== OFFLOAD KERNEL Matrix Multiply with Data Caching on AIE %dx%d Mesh ===\n", HW_ROWS, HW_COLS);
     printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);
     // --- Device + mesh ---
     aieSetDevice(0);
