@@ -80,7 +80,11 @@ host = f"{username}@{vek385ip}"
 
 # Configuration
 PALBOARD_SCRIPTS_DIR = f"/proj/xsjsswstaff/{username}/palboard_scripts"
-VEK385PDI = f"/home/{username}/aiehlc/vek385.pdi"
+# Remote PDI/BOOT image programmed with "device program". Overridable so the
+# same runner serves other Versal boards that boot identically (e.g. VEK280,
+# which differs only in the image name) -- the debug UI passes this through
+# from a debug_ui_config.json entry's hw_env.
+VEK385PDI = os.environ.get("VEK385PDI") or f"/home/{username}/aiehlc/vek385.pdi"
 #XSDB_ALT_PATH = "/everest/set_vnc_bkup/vnc/t50/es1/tools/Labtools/9999.0/bin/xsdb"
 XSDB_ALT_PATH = "/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/Vitis/bin/xsdb"
 VITIS_SETTINGS = "/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/Vitis/settings64.sh"

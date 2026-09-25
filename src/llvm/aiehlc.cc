@@ -214,6 +214,23 @@ static std::string userKernelFuncName; // kernel function name from __global__ (
 static std::unordered_map<std::string, std::string> globalKernelBodies; // per-kernel: name -> cleaned body text
 static std::vector<std::string> userMacroDefines; // #define lines from user source
 
+// File-scope code the user wants carried verbatim into the generated kernel,
+// delimited in the source by:
+//
+//     // AIEHLC_KERNEL_PROLOGUE_BEGIN
+//     ... declarations ...
+//     // AIEHLC_KERNEL_PROLOGUE_END
+//
+// The kernel is regenerated from the compute function's BODY plus the user's
+// #define lines, so a file-scope declaration would otherwise be dropped. Some
+// constructs cannot be expressed as a macro and cannot live in a function body
+// -- notably the chess_storage(TM:...) anchor that gives an object Tile-Memory
+// linkage: chess_storage is rejected on pointer/reference types, so the anchor
+// must be a file-scope OBJECT whose address is then indexed. Without this
+// passthrough the only way to reach TM from an aiehlc kernel is to hardcode the
+// undocumented address_space number the frontend happens to use.
+static std::string userKernelPrologue;
+
 using namespace clang;
 using namespace clang::tooling;
 
@@ -527,7 +544,18 @@ public:
                  }
                  macroBlock += "\n";
              }
-             str = header + macroBlock + str;
+             // File-scope prologue (AIEHLC_KERNEL_PROLOGUE_BEGIN/END). Emitted
+             // after the macros so it may use them, and before the kernel body so
+             // its declarations are in scope. Must be at FILE scope: its whole
+             // purpose is constructs that cannot live in a function body, e.g. a
+             // chess_storage(TM:...) anchor object.
+             std::string prologueBlock;
+             if (!userKernelPrologue.empty()) {
+                 prologueBlock = "\n// User kernel prologue from source file "
+                                 "(AIEHLC_KERNEL_PROLOGUE_BEGIN/END)\n" +
+                                 userKernelPrologue + "\n";
+             }
+             str = header + macroBlock + prologueBlock + str;
              fd << str << std::endl;
     }
 
@@ -3682,6 +3710,32 @@ public:
                 // both branches are flattened into the kernel file).
                 {
                     userMacroDefines.clear();
+                    // Capture an optional AIEHLC_KERNEL_PROLOGUE_BEGIN/END block
+                    // for verbatim emission at file scope in the kernel. Scanned
+                    // here, in the same pass as the #defines, so both travel by
+                    // the same route.
+                    userKernelPrologue.clear();
+                    {
+                        std::istringstream piss(SourceCodeString);
+                        std::string pline;
+                        bool inPrologue = false;
+                        while (std::getline(piss, pline)) {
+                            if (pline.find("AIEHLC_KERNEL_PROLOGUE_BEGIN") != std::string::npos) {
+                                inPrologue = true;
+                                continue;
+                            }
+                            if (pline.find("AIEHLC_KERNEL_PROLOGUE_END") != std::string::npos) {
+                                inPrologue = false;
+                                continue;
+                            }
+                            if (inPrologue)
+                                userKernelPrologue += pline + "\n";
+                        }
+                        if (!userKernelPrologue.empty())
+                            llvm::outs() << "[aiehlc] captured kernel prologue ("
+                                         << std::count(userKernelPrologue.begin(), userKernelPrologue.end(), '\n')
+                                         << " lines)\n";
+                    }
                     std::istringstream iss(SourceCodeString);
                     std::string line;
                     std::string currentDefine;

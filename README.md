@@ -392,8 +392,11 @@ self-configures every **incoming (S2MM)** window:
 BD base address and length come from the core's own C buffer symbols
 (`(uintptr_t)buf_in_ping_0`, `sizeof(buf_in_ping_0)`), so the block is uniform
 across all core tiles and needs no runtime `(col,row)`. The encoder lives in
-[`include/aie_kernel_config.h`](include/aie_kernel_config.h)
-(`aie_kc_encode_bd` / `aie_kc_encode_lock` / `aie_kc_encode_s2mm_start`).
+[`src/mlir/runtime/aie_kernel_runtime.h`](src/mlir/runtime/aie_kernel_runtime.h)
+(`aie_kc_encode_bd` / `aie_kc_encode_lock` / `aie_kc_encode_s2mm_start`), which
+applies the encoded words through `core_reg_write` →
+[`kernel_tm.h`](src/mlir/runtime/kernel_tm.h)'s `TM_W` (a plain pointer cast
+would never reach the processor bus).
 
 ### Scope and limitations
 

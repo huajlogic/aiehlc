@@ -238,7 +238,7 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
                 rewriter.create<emitc::VerbatimOp>(loc, "#include <aie_api/aie.hpp>");
                 rewriter.create<emitc::VerbatimOp>(loc, "#include <aie_api/aie_adf.hpp>");
                 if (offloadOn)
-                    rewriter.create<emitc::VerbatimOp>(loc, "#include \"aie_kernel_config.h\"");
+                    rewriter.create<emitc::VerbatimOp>(loc, "#include \"aie_kernel_runtime.h\"");
                 rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_READ  1");
                 rewriter.create<emitc::VerbatimOp>(loc, "#define FOR_WRITE 0");
                 // Emit per-window BUF_SZ defines (e.g. BUF_SZ_IN_0, BUF_SZ_OUT_0)
@@ -385,7 +385,7 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
 
     // KERNELCONFIGOFFLOAD: emit the raw-MMIO block that self-configures every
     // incoming S2MM window (ping/pong BD chain + lock inits + channel-start)
-    // via the aie_kernel_config.h encoder. BD ids and hardware lock indices are
+    // via the aie_kernel_runtime.h encoder. BD ids and hardware lock indices are
     // resolved upstream by BlueprintToScheduleKernelPass and read off window_def;
     // this function only formats them. BD base address + length come from the
     // core's own C buffer symbols. Lock values mirror the host emitCorePingPongBd:
@@ -453,9 +453,8 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
     // sits inside a get_coreid() dispatch arm.
     static std::string emitWindowBdAndLocks(const WindowInfo &w, StringRef pktArgs, StringRef indent) {
         const std::string in = indent.str();
-        // Register writes go through core_reg_write (aie_kernel_config.h), which
-        // rebases the TILE-LOCAL offset into the core's control window at
-        // AIE_KC_CORE_PC_CONTROL_BASE_ADDR (0x80000).
+        // Register writes go through core_reg_write (aie_kernel_runtime.h), which
+        // issues the TILE-LOCAL offset into the core's TM space via TM_W.
         //
         // This was the S2MM-not-starting bug: the emitted code wrote the bare
         // tile-local offset (`*(volatile uint32_t *)0x1DE04`), which from the core's
@@ -463,6 +462,11 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
         // DMA register. The BD/lock/start writes silently landed in data memory and
         // the DMA was never programmed — so the channel raised no start event even
         // though the code ran.
+        //
+        // Adding the 0x80000 bias alone does NOT fix that: a numeric cast cannot
+        // express the memory space, so it still assembles to a plain ST that never
+        // leaves the core (and reads back fine on-core, hiding the failure). Only
+        // TM_W lowers to ST.TM. See src/mlir/runtime/kernel_tm.h.
         //
         // Every write is also traced to klog under KERNELCONFIGOFFLOAD_TRACE. Tags
         // are 4 chars (klog's format); "OFF "/"VAL " pair per write, so a reader sees
@@ -540,7 +544,7 @@ struct KernelModuleToEmitCPattern : public OpConversionPattern<KernelModuleOp> {
     }
 
     // KERNELCONFIGOFFLOAD: emit the raw-MMIO blocks that self-configure the core's
-    // own DMA (BD chain + lock inits + channel-start) via the aie_kernel_config.h
+    // own DMA (BD chain + lock inits + channel-start) via the aie_kernel_runtime.h
     // encoder. BD ids and hardware lock indices are resolved upstream by
     // BlueprintToScheduleKernelPass and read off window_def; this only formats them.
     // BD base address + length come from the core's own C buffer symbols.
