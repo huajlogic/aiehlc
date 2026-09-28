@@ -1,0 +1,73 @@
+# Build aiehlc, compile tutorial/example.cpp for the AIE simulator, and run it.
+#
+# GitHub-hosted runners cannot see the internal Vitis install (/proj/xbuilds)
+# or the local LLVM/MLIR build, so this job needs a self-hosted Linux runner
+# that already has:
+#   - Vitis on PATH, or the default VITIS_SETTINGS_PATH in script/setup.sh
+#   - an LLVM/MLIR/Clang build with RTTI, via LLVM_INSTALL_DIR
+#   - cmake, ninja, python3, boost, and the gold linker
+name: Simulator tutorial example
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: sim-tutorial-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sim-tutorial:
+    name: Build aiehlc and simulate tutorial/example.cpp
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build aiehlc, compile example, run simulator
+        run: |
+          set -euo pipefail
+
+          llvm_dir="${LLVM_INSTALL_DIR:-}"
+          if [ -z "${llvm_dir}" ] || [[ "${llvm_dir}" == /Users/* ]]; then
+            if [ -x /scratch/staff/huaj/llvm-project/build/bin/llvm-config ]; then
+              llvm_dir=/scratch/staff/huaj/llvm-project/build
+            else
+              echo "Set LLVM_INSTALL_DIR to an LLVM build with MLIR, Clang, and RTTI."
+              exit 1
+            fi
+          fi
+
+          # setup.sh exports the Vitis toolchain, then overwrites LLVM_INSTALL_DIR.
+          source script/setup.sh
+          export LLVM_INSTALL_DIR="${llvm_dir}"
+
+          cmake -S . -B build -DLLVM_INSTALL_DIR="${LLVM_INSTALL_DIR}" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)" --target aiehlc
+
+          source script/aiehlc.sh --debug-output \
+            --platform sim --aie-version 5 --sim-tiles "0:3" \
+            --runtime-source-file tutorial/example.cpp
+
+          set +e
+          bash script/runsim.sh aout 2>&1 | tee sim-tutorial.log
+          sim_rc=${PIPESTATUS[0]}
+          set -e
+
+          if ! grep -q "Sucess: CPU result matches AIE." sim-tutorial.log \
+              || ! grep -q "Kernel test passed!" sim-tutorial.log \
+              || ! grep -q "Simulation Finished, Sim result: 0" sim-tutorial.log; then
+            echo "Simulator log did not show a passing tutorial/example.cpp run."
+            exit 1
+          fi
+          exit "${sim_rc}"
+
+      - name: Upload simulator log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-tutorial-log
+          path: sim-tutorial.log
+          if-no-files-found: ignore
