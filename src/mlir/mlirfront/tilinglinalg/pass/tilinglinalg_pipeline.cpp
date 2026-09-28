@@ -298,6 +298,66 @@ static std::string resolveArgDimBuiltin(const std::string &body, const std::stri
     return out;
 }
 
+static void publishControlPlacement(mlir::ModuleOp module, const ControlShimPlacement &p) {
+    mlir::OpBuilder b(module.getContext());
+    module->setAttr("routing.control_plan_shim_col", b.getI64IntegerAttr(p.col));
+    module->setAttr("routing.control_plan_mm2s_ch", b.getI64IntegerAttr(p.mm2sCh));
+    module->setAttr("routing.control_plan_s2mm_ch", b.getI64IntegerAttr(p.s2mmCh));
+    module->setAttr("routing.control_plan_exclusive", b.getI64IntegerAttr(p.exclusive ? 1 : 0));
+}
+
+static bool planControlColumn(mlir::ModuleOp module, bool reserveControlPlane, int relStartCol, int relEndCol,
+                              int meshCols, ControlShimPlacement &placement, int &dataStartCol) {
+    auto forceAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_dedicated_shim");
+    bool force = forceAttr && forceAttr.getInt() != 0;
+    int partCols = relStartCol < 0 ? 0 : relEndCol - relStartCol + 1;
+    bool spare = meshCols > 0 && partCols >= meshCols + 1;
+    if (force && !reserveControlPlane) {
+        llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim requires "
+                        "#pragma control_plan_op_control_packet.\n";
+        return false;
+    }
+    if (force && !spare) {
+        llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim needs a partition with one "
+                        "spare column west of the mesh (mesh cols="
+                     << meshCols << ", partition cols=" << partCols << ").\n";
+        return false;
+    }
+    if (!reserveControlPlane || !spare)
+        return true;
+    placement.col = relStartCol;
+    placement.mm2sCh = 0;
+    placement.s2mmCh = 0;
+    placement.exclusive = true;
+    dataStartCol = relStartCol + 1;
+    publishControlPlacement(module, placement);
+    std::cout << "[TilingLinalg] control plane: dedicated shim col " << placement.col << " (MM2S ch0 / S2MM ch0); "
+              << "data plane uses cols [" << dataStartCol << "," << relEndCol << "]" << std::endl;
+    return true;
+}
+
+static void finalizeControlPlacement(mlir::ModuleOp module, const std::shared_ptr<ResourceMgr> &rm, int dataStartCol,
+                                     ControlShimPlacement &placement) {
+    if (placement.col < 0) {
+        int col = dataStartCol < 0 ? 0 : dataStartCol;
+        if (auto pick = rm->findFreeControlChannels(col)) {
+            placement = *pick;
+            std::cout << "[TilingLinalg] control plane: free shim channels on col " << col << " (MM2S ch"
+                      << placement.mm2sCh << " / S2MM ch" << placement.s2mmCh << ")" << std::endl;
+        } else {
+            placement.col = col;
+            placement.mm2sCh = 0;
+            placement.s2mmCh = 0;
+            placement.exclusive = false;
+            llvm::errs() << "[TilingLinalg] WARNING: no free shim MM2S/S2MM pair for the control plane; "
+                            "time-sharing col "
+                         << col << " channel 0 with the data plane (control usable only during load/launch). "
+                         << "Widen the partition by one column for a dedicated control shim.\n";
+        }
+    }
+    publishControlPlacement(module, placement);
+}
+
 static void dumpPipelineIRToFile(mlir::ModuleOp module, const std::string &dir, int stage, const std::string &passName) {
     if (dir.empty())
         return;
@@ -613,33 +673,15 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     bool reserveControlPlane = controlPlanAttr && controlPlanAttr.getInt() != 0;
     rt_res_gen resourceGen = __Runtime_res_gen_from_name(aieGen.c_str());
 
-    auto dedicatedAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_dedicated_shim");
-    int ctrlSpineCol = -1;
+    ControlShimPlacement ctrlPlacement;
     int dataStartCol = relStartCol;
-    if (dedicatedAttr && dedicatedAttr.getInt() != 0) {
-        if (!reserveControlPlane) {
-            llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim requires "
-                            "#pragma control_plan_op_control_packet.\n";
-            return false;
-        }
-        if (relStartCol < 0 || relEndCol - relStartCol + 1 < meshCols + 1) {
-            llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim needs a partition with one "
-                            "spare column west of the mesh (mesh cols="
-                         << meshCols << ", partition cols=" << (relStartCol < 0 ? 0 : relEndCol - relStartCol + 1)
-                         << ").\n";
-            return false;
-        }
-        ctrlSpineCol = relStartCol;
-        dataStartCol = relStartCol + 1;
-        mlir::OpBuilder attrBuilder(module.getContext());
-        module->setAttr("routing.control_plan_shim_col", attrBuilder.getI64IntegerAttr(ctrlSpineCol));
-        std::cout << "[TilingLinalg] control spine dedicated to partition col " << ctrlSpineCol
-                  << "; data plane uses cols [" << dataStartCol << "," << relEndCol << "]" << std::endl;
-    }
+    if (!planControlColumn(module, reserveControlPlane, relStartCol, relEndCol, meshCols, ctrlPlacement,
+                           dataStartCol))
+        return false;
     auto reserveControl = [&](const std::shared_ptr<ResourceMgr> &rm) {
         if (!reserveControlPlane)
             return;
-        rm->setControlSpineCol(ctrlSpineCol);
+        rm->setControlPlacement(ctrlPlacement);
         rm->reserveControlPlaneResources(resourceGen);
     };
 
@@ -708,6 +750,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     if (!runPipelineSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage, "DmapToDmaphopPass"))
         return false;
+    if (reserveControlPlane)
+        finalizeControlPlacement(module, rtopology.getRM(), dataStartCol, ctrlPlacement);
 
     // Generate provenance map JSON after dmaphop IR is available
     {
@@ -856,7 +900,11 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     if (enableGroupWrites || enableKernelControl) {
         if (!runPipelineSinglePass(ctx, hostModule,
                                    std::make_unique<mlir::GroupRegWritePass>(enableGroupWrites, enableKernelControl,
-                                                                             1, 0, 2, 0, ctrlSpineCol),
+                                                                             1, ctrlPlacement.s2mmCh, RT_RES_CTRL_BD_LO,
+                                                                             ctrlPlacement.mm2sCh,
+                                                                             ctrlPlacement.col < dataStartCol
+                                                                                 ? ctrlPlacement.col
+                                                                                 : -1),
                                    irDir, stage, "GroupRegWritePass"))
             return false;
     } else {

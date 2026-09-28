@@ -147,6 +147,7 @@ public:
   std::optional<int> allocateBd(int ownerId = -1);
   bool releaseBd(int bdId, int ownerId = -1);
   bool isBdFree(int bdId) const;
+  bool reserveBd(int bdId, int ownerId);
   int numBds() const { return static_cast<int>(bdPool_.size()); }
   int freeBdCount() const;
 
@@ -530,6 +531,13 @@ struct CoreOffloadTileConfig {
     int repeatCount = 1;
 };
 
+struct ControlShimPlacement {
+  int col = -1;
+  int mm2sCh = 0;
+  int s2mmCh = 0;
+  bool exclusive = false;
+};
+
 class ResourceMgr {
 public:
   ResourceMgr(std::unique_ptr<IHwResource> resource, ::TileType defaultType = ::TileType::Core);
@@ -631,9 +639,10 @@ public:
   // source of truth. Idempotent. Always called once after ResourceMgr::init.
   void reserveControlPlaneResources(rt_res_gen gen);
 
-  void setControlSpineCol(int col) { controlSpineCol_ = col; }
-  int controlSpineCol() const { return controlSpineCol_; }
-  static constexpr int kControlShimDmaCh = 0;
+  void setControlPlacement(const ControlShimPlacement &p) { ctrlPlacement_ = p; }
+  const ControlShimPlacement &controlPlacement() const { return ctrlPlacement_; }
+  std::optional<ControlShimPlacement> findFreeControlChannels(int col) const;
+  bool reserveControlShimBds(int col);
 
   // Reserved-resource accessors for routing/scheduling.
   uint32_t reservedArbiterMask() const { return reservedArbiterMask_; }
@@ -676,7 +685,8 @@ private:
   // [port][is_master] -> slot bitmask reserved by the control plane.
   std::array<std::array<int, 2>, kNumPortTypes> reservedSlotMask_{};
   bool controlPlaneReserved_ = false;
-  int controlSpineCol_ = -1;
+  ControlShimPlacement ctrlPlacement_;
+  void reserveControlSpinePorts(rt_res_gen gen, int spineCol);
 
   void InitSHIMNocList();
 

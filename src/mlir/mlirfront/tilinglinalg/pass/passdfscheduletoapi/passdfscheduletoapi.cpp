@@ -4,6 +4,7 @@
  ******************************************************************************/
 
 #include "passdfscheduletoapi.h"
+#include "aie_runtime_resource.h"
 #include "mlir/Conversion/SCFToEmitC/SCFToEmitC.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -172,6 +173,8 @@ struct ConversionState {
     DenseMap<Operation *, std::string> ctrlFabricNames;
     bool controlKernelOps = false;
     std::string controlKernelFabric;
+    int32_t controlMm2sCh = 0;
+    bool controlExclusive = false;
     int ctrlDataIndex = 0; // unique suffix for emitted __ctrl_data_N[] arrays
 
     // Configured row indices of each group_reg_write's fabric (from the fabric's
@@ -2036,9 +2039,11 @@ struct LoadKernelGroupInnerPattern : public OpConversionPattern<dfschedule::Load
         callOperands.push_back(numTilesConst.getResult());
         if (state.controlKernelOps) {
             callOperands.push_back(
-                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(2)).getResult());
+                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(RT_RES_CTRL_BD_LO))
+                    .getResult());
             callOperands.push_back(
-                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(0)).getResult());
+                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(state.controlMm2sCh))
+                    .getResult());
         }
 
         auto loadCall =
@@ -2105,9 +2110,11 @@ struct LaunchKernelGroupInnerPattern : public OpConversionPattern<dfschedule::La
         if (state.controlKernelOps) {
             auto i32Type = rewriter.getI32Type();
             launchOperands.push_back(
-                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(2)).getResult());
+                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(RT_RES_CTRL_BD_LO))
+                    .getResult());
             launchOperands.push_back(
-                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(0)).getResult());
+                rewriter.create<emitc::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(state.controlMm2sCh))
+                    .getResult());
         }
         auto launchCall = rewriter.create<emitc::CallOpaqueOp>(loc, eventType, launchName, nullptr, nullptr,
                                                                launchOperands);
@@ -2165,6 +2172,8 @@ struct CtrlPlanInitInnerPattern : public OpConversionPattern<dfschedule::CtrlPla
             ", " + std::to_string(static_cast<int32_t>(op.getRespS2mmCh())) + ", " +
             std::to_string(static_cast<int32_t>(op.getCtrlId())) + ", " + rowsArr + ", " + std::to_string(nrows) + ");";
         rewriter.create<emitc::VerbatimOp>(loc, call);
+        if (state.controlExclusive)
+            rewriter.create<emitc::VerbatimOp>(loc, "__Runtime_ctrl_plan_set_exclusive(&" + fab + ", 1);");
 
         llvm::errs() << "  ✓ Lowered ctrl_plan_init (" << nrows << " rows) fabric=" << fab << "\n";
 
@@ -3181,6 +3190,10 @@ void DfscheduleToApiPass::runOnOperation() {
     state.runtimeDebugLevel = runtimeDebugLevel_;
     if (auto attr = moduleOp->getAttrOfType<IntegerAttr>("dfschedule.control_kernel_ops"))
         state.controlKernelOps = attr.getInt() != 0;
+    if (auto attr = moduleOp->getAttrOfType<IntegerAttr>("routing.control_plan_mm2s_ch"))
+        state.controlMm2sCh = static_cast<int32_t>(attr.getInt());
+    if (auto attr = moduleOp->getAttrOfType<IntegerAttr>("routing.control_plan_exclusive"))
+        state.controlExclusive = attr.getInt() != 0;
 
     // Load the (col,row,lock_id) triples that GroupRegWritePass coalesced into
     // control-packet group writes; their individual XAie_LockSetValue emission is

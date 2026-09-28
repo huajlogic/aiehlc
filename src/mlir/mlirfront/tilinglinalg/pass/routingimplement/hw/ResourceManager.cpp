@@ -96,6 +96,17 @@ bool RoutingTile::releaseBd(int bdId, int ownerId) {
     return true;
 }
 
+bool RoutingTile::reserveBd(int bdId, int ownerId) {
+    if (bdId < 0 || bdId >= (int)bdPool_.size())
+        return false;
+    auto &slot = bdPool_[bdId];
+    if (slot.used && slot.ownerId != ownerId)
+        return false;
+    slot.used = true;
+    slot.ownerId = ownerId;
+    return true;
+}
+
 bool RoutingTile::isBdFree(int bdId) const {
     if (bdId < 0 || bdId >= (int)bdPool_.size())
         return false;
@@ -888,43 +899,89 @@ void ResourceMgr::reserveControlPlaneResources(rt_res_gen gen) {
         reservedSlotMask_[p][1] = __Runtime_res_reserved_slot_mask(gen, (uint8_t)p, /*is_master=*/1);
     }
 
-    int spineCol = controlSpineCol_ >= 0 ? controlSpineCol_ : (hasPartition() ? partitionStartCol_ : 0);
-    if (controlSpineCol_ >= 0) {
-        auto it = shimTiles_.find(TileCoord{0, controlSpineCol_});
+    const ControlShimPlacement &cp = ctrlPlacement_;
+    int spineCol = cp.col >= 0 ? cp.col : (hasPartition() ? partitionStartCol_ : 0);
+    if (cp.exclusive) {
+        auto it = shimTiles_.find(TileCoord{0, spineCol});
         if (it == shimTiles_.end())
             throw std::runtime_error("control spine column has no shim DMA");
-        if (!it->second->allocate(DMADIRECTION::MM2S, kControlShimDmaCh, kControlPlaneOwner) ||
-            !it->second->allocate(DMADIRECTION::S2MM, kControlShimDmaCh, kControlPlaneOwner))
+        if (!it->second->allocate(DMADIRECTION::MM2S, cp.mm2sCh, kControlPlaneOwner) ||
+            !it->second->allocate(DMADIRECTION::S2MM, cp.s2mmCh, kControlPlaneOwner))
             throw std::runtime_error("control spine shim DMA reservation conflicts with a data-plane DataIO");
     }
-    auto reservePort = [&](RoutingTile &tile, PortDirection port, PortRole role) {
-        if (!tile.reservePortNumber(port, role, 0, kControlPlaneOwner))
-            throw std::runtime_error("control-plane stream port reservation conflicts with an existing route");
-    };
     for (int row = 0; row < rows(); ++row) {
         for (int col = 0; col < cols(); ++col) {
             if (!isTileInPartition(row, col))
                 continue;
             RoutingTile &routingTile = tile(row, col);
-            if (routingTile.type() == TileType::Core) {
-                reservePort(routingTile, PortDirection::West, PortRole::Slave);
-                reservePort(routingTile, PortDirection::East, PortRole::Master);
-                reservePort(routingTile, PortDirection::East, PortRole::Slave);
-                reservePort(routingTile, PortDirection::West, PortRole::Master);
-            }
-            if (col == spineCol) {
-                reservePort(routingTile, PortDirection::North, PortRole::Slave);
-                reservePort(routingTile, PortDirection::North, PortRole::Master);
-                reservePort(routingTile, PortDirection::South, PortRole::Slave);
-                reservePort(routingTile, PortDirection::South, PortRole::Master);
-            }
+            if (routingTile.type() != TileType::Core)
+                continue;
+            for (PortDirection d : {PortDirection::West, PortDirection::East})
+                for (PortRole r : {PortRole::Master, PortRole::Slave})
+                    if (!routingTile.reservePortNumber(d, r, 0, kControlPlaneOwner))
+                        throw std::runtime_error("control-plane stream port reservation conflicts with an existing route");
         }
     }
+    reserveControlSpinePorts(gen, spineCol);
 
     controlPlaneReserved_ = true;
     std::cout << "[ResourceMgr] control-plane resources reserved (gen=" << (int)gen << " pktidmask=0x" << std::hex
               << pmask << " arbmask=0x" << reservedArbiterMask_ << std::dec << " spine_col=" << spineCol
-              << (controlSpineCol_ >= 0 ? " dedicated" : " shared") << ")" << std::endl;
+              << " mm2s_ch=" << cp.mm2sCh << " s2mm_ch=" << cp.s2mmCh
+              << (cp.exclusive ? " exclusive" : " time-shared") << ")" << std::endl;
+}
+
+void ResourceMgr::reserveControlSpinePorts(rt_res_gen gen, int spineCol) {
+    (void)gen;
+    auto reserve = [&](RoutingTile &t, PortDirection d, PortRole r, int portNum) {
+        if (!t.reservePortNumber(d, r, portNum, kControlPlaneOwner))
+            throw std::runtime_error("control spine port reservation conflicts with an existing route");
+    };
+    for (int row = 0; row < rows(); ++row) {
+        if (!isTileInPartition(row, spineCol))
+            continue;
+        RoutingTile &t = tile(row, spineCol);
+        reserve(t, PortDirection::North, PortRole::Master, RT_RES_VFWD_PORT);
+        reserve(t, PortDirection::North, PortRole::Slave, RT_RES_VRET_PORT);
+        if (row != 0) {
+            reserve(t, PortDirection::South, PortRole::Slave, RT_RES_VFWD_PORT);
+            reserve(t, PortDirection::South, PortRole::Master, RT_RES_VRET_PORT);
+        } else if (ctrlPlacement_.exclusive) {
+            reserve(t, PortDirection::South, PortRole::Master,
+                    (int)t.getPortnumFromPortIdx(PortDirection::South, PortRole::Master, ctrlPlacement_.mm2sCh));
+            reserve(t, PortDirection::South, PortRole::Slave,
+                    (int)t.getPortnumFromPortIdx(PortDirection::South, PortRole::Slave, ctrlPlacement_.s2mmCh));
+        }
+    }
+}
+
+std::optional<ControlShimPlacement> ResourceMgr::findFreeControlChannels(int col) const {
+    auto it = shimTiles_.find(TileCoord{0, col});
+    if (it == shimTiles_.end())
+        return std::nullopt;
+    const ShimTile &shim = *it->second;
+    auto mm2s = shim.freeChannels(DMADIRECTION::MM2S);
+    auto s2mm = shim.freeChannels(DMADIRECTION::S2MM);
+    if (mm2s.empty() || s2mm.empty())
+        return std::nullopt;
+    ControlShimPlacement p;
+    p.col = col;
+    p.mm2sCh = mm2s.back();
+    p.s2mmCh = s2mm.back();
+    p.exclusive = true;
+    return p;
+}
+
+bool ResourceMgr::reserveControlShimBds(int col) {
+    if (col < 0 || col >= cols())
+        return false;
+    RoutingTile &shim = tile(0, col);
+    bool ok = true;
+    for (int bd = RT_RES_CTRL_BD_LO; bd <= RT_RES_CTRL_BD_HI; ++bd)
+        ok &= shim.reserveBd(bd, kControlPlaneOwner);
+    for (int bd = RT_RES_CTRL_ACK_BD_LO; bd <= RT_RES_CTRL_ACK_BD_HI; ++bd)
+        ok &= shim.reserveBd(bd, kControlPlaneOwner);
+    return ok;
 }
 
 int ResourceMgr::reservedSlotMask(uint8_t port, uint8_t is_master) const {

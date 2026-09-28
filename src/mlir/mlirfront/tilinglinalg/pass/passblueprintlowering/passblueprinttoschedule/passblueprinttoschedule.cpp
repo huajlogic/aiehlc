@@ -354,6 +354,16 @@ void BlueprintToSchedulePass::runOnOperation() {
 
     auto hwRes = makeResource(aieGen_);
     auto resourceMgr = std::make_shared<ResourceMgr>(std::move(hwRes));
+    if (auto moduleOp = dyn_cast<ModuleOp>(getOperation())) {
+        auto ctrlAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.control_plan_op_control_packet");
+        auto colAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.control_plan_shim_col");
+        if (ctrlAttr && ctrlAttr.getInt() != 0 && colAttr && colAttr.getInt() >= 0 &&
+            !resourceMgr->reserveControlShimBds(static_cast<int>(colAttr.getInt()))) {
+            getOperation()->emitError("control-plane shim BD reservation failed");
+            signalPassFailure();
+            return;
+        }
+    }
 
     RewritePatternSet patterns(context);
     patterns.add<blueprint_sched::FlowTransferConversion>(context, resourceMgr, passState, bufferRatio_,

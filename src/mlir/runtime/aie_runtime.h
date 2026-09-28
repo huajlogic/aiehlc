@@ -1016,6 +1016,8 @@ AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, ui
 
 AieRC __Runtime_ctrl_plan_release(__Runtime_CtrlRowFabric *f, int32_t mm2s_ch);
 
+void __Runtime_ctrl_plan_set_exclusive(__Runtime_CtrlRowFabric *f, int on);
+
 // Tear down fabric state. Best-effort route teardown (partition reset clears the
 // stream switches).
 AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f);

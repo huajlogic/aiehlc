@@ -13,7 +13,6 @@ void __Runtime_ctrl_high_throughput_enable(int on);
 #pragma aie_debug_level(0 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
 #pragma CONTROL_PLAN_GROUP_REG_WRITE
 #pragma control_plan_op_control_packet
-#pragma control_plan_dedicated_shim
 #define MATMUL_LARGE_MMUL 1
 #ifdef MATMUL_LARGE_MMUL
 constexpr int kTileMn = 64;
@@ -318,7 +317,7 @@ __global__ void mul2(aie::port<input_window_int8 *, RowBA> win_a, aie::port<inpu
 }
 
 int main() {
-    __Runtime_ctrl_high_throughput_enable(0);
+    __Runtime_ctrl_high_throughput_enable(1);
     __Runtime_ctrl_pmap_enable(1);
     printf("=== Matrix Multiply CTRL-PKT %dx%d Mesh ===\n", HW_ROWS, HW_COLS);
     printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);

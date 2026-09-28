@@ -3667,8 +3667,8 @@ static uint8_t rt_shim_s2mm_port(XAie_DevInst *dev, int32_t s2mm_ch) {
  * rides NORTH-master / SOUTH-slave so it may use 0-5; the return (down) channel
  * rides SOUTH-master / NORTH-slave and MUST stay within 0-3, else
  * XAie_StrmConnCctEnable returns XAIE_ERR_STREAM_PORT. */
-#define RT_CTRL_VFWD 4U /* forward vertical NORTH/SOUTH channel (shim->dest); NORTH-master/SOUTH-slave, 0-5 */
-#define RT_CTRL_VRET 3U /* return  vertical NORTH/SOUTH channel (dest->shim); SOUTH-master/NORTH-slave, 0-3 */
+#define RT_CTRL_VFWD ((uint8_t)RT_RES_VFWD_PORT) /* forward vertical NORTH/SOUTH channel (shim->dest); NORTH-master/SOUTH-slave, 0-5 */
+#define RT_CTRL_VRET ((uint8_t)RT_RES_VRET_PORT) /* return  vertical NORTH/SOUTH channel (dest->shim); SOUTH-master/NORTH-slave, 0-3 */
 
 /* Diagnostic stream-switch event select slots for the control-packet path: every
  * hop tile puts its forward (up) output port on slot 0 and its return (down)
@@ -4198,6 +4198,11 @@ AieRC __Runtime_ctrl_plan_release(__Runtime_CtrlRowFabric *f, int32_t mm2s_ch) {
     AIEHLC_LOG(printf("[aie_runtime] ctrl_plan_release: shim(%u,0) VFWD cut, data-plane routing restored\n",
                       (unsigned)f->shim_col););
     return XAIE_OK;
+}
+
+void __Runtime_ctrl_plan_set_exclusive(__Runtime_CtrlRowFabric *f, int on) {
+    if (f)
+        f->dedicated_shim = on ? 1U : 0U;
 }
 
 /* One-shot row-control fabric init: record the device, spine column, control
@@ -5536,7 +5541,7 @@ struct_kernel_group __Runtime_load_kernel_group_16t(XAie_DevInst *dev, XAie_LocT
 #define RT_CTRL_ELF_SKIP_ADDR 0xFFFFFFFFU
 #define RT_CTRL_ELF_ACK_WAVE 3U
 #define RT_CTRL_ELF_PKT_STRIDE 8U
-#define RT_CTRL_ELF_RET_BD 12
+#define RT_CTRL_ELF_RET_BD RT_RES_CTRL_ACK_BD_LO
 #define RT_CTRL_ELF_NBD 4U
 #define RT_CTRL_ELF_QDEPTH 3U
 
@@ -5660,6 +5665,7 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const uint8_t *elf, XAie_LocTyp
         }
     }
     *nacc_out = acc;
+    *payload_words_out = payload_words;
     *last_addr_out = last_addr;
     *last_value_out = last_value;
     return XAIE_OK;
@@ -5807,7 +5813,7 @@ static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, 
     uint32_t ack_words = __Runtime_ctrl_pktize_write(ack, 4U, sid, last_addr, &last_value, 1U, 1, 0U, NULL);
     AIEHLC_LOG(printf("[aie_runtime] ctrl_elf pktize rc=%d cap=%u accesses=%u final_addr=0x%x ack_words=%u acks=%d\n",
                       (int)rc, (unsigned)npkt_cap, (unsigned)nacc, (unsigned)last_addr, (unsigned)ack_words, nacks););
-    if (rc == XAIE_OK && nacc > 0U && ack_words > 0U) {
+    if (rc == XAIE_OK && nacc > 0U && payload_words > 0U && ack_words > 0U) {
         __Runtime_sync_for_dev(fab->dev, pkt, (size_t)(ack_off + ack_words) * sizeof(uint32_t));
         rc = rt_ctrl_elf_dma(fab, pkt, nacc, payload_words, ack, ack_words, pkt + token_off, nacks, bd_id, mm2s_ch);
     } else if (rc == XAIE_OK) {
