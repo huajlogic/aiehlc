@@ -100,6 +100,8 @@ static inline unsigned long long __rt_pmccntr(void) { return 0ULL; }
 static unsigned long long g_wait_io_cycles = 0ULL;
 static unsigned int g_wait_io_calls = 0U;
 static unsigned long long g_wait_io_iters = 0ULL;
+static int g_ctrl_high_throughput = 0;
+static int g_ctrl_high_throughput_ready = 0;
 
 enum { PH_KLOAD = 0, PH_BDCFG = 1, PH_COREEN = 2, PH_STARTIO = 3, PH_N = 4 };
 static unsigned long long g_ph_cyc[PH_N] = {0, 0, 0, 0};
@@ -130,6 +132,12 @@ void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls) {
 void __Runtime_wait_io_iters(unsigned long long *iters) {
     if (iters)
         *iters = g_wait_io_iters;
+}
+
+void __Runtime_ctrl_high_throughput_enable(int on) {
+    g_ctrl_high_throughput = on ? 1 : 0;
+    if (!on)
+        g_ctrl_high_throughput_ready = 0;
 }
 void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls) {
     for (int i = 0; i < PH_N; i++) {
@@ -2572,8 +2580,22 @@ void __Runtime_routing_init(XAie_DevInst *dev) {
 static AieRC __Runtime_partition_initialize(XAie_DevInst *dev) {
 #ifdef __AIESIM__
     (void)dev;
+    g_ctrl_high_throughput_ready = 0;
     return XAIE_OK;
 #else
+    g_ctrl_high_throughput_ready = 0;
+#if AIE_GEN == 5
+    if (g_ctrl_high_throughput) {
+        XAie_PartInitOpts opts;
+        opts.Locs = NULL;
+        opts.NumUseTiles = 0U;
+        opts.InitOpts = XAIE_PART_INIT_OPT_DEFAULT | XAIE_PART_INIT_OPT_CTRL_TLASTERROR_DISABLE;
+        AieRC rc = XAie_PartitionInitialize(dev, &opts);
+        if (rc == XAIE_OK)
+            g_ctrl_high_throughput_ready = 1;
+        return rc;
+    }
+#endif
     return XAie_PartitionInitialize(dev, NULL);
 #endif
 }
@@ -4079,8 +4101,7 @@ AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops) {
     return XAIE_OK;
 }
 
-/* Configure one EAST chain on @row spanning columns [col_lo..col_hi]. The chain
- * head must sit on the spine column (col_lo == f->shim_col). Runs the pure
+/* Configure one EAST chain on @row spanning columns [col_lo..col_hi]. Runs the pure
  * planner (acr_plan_row_add) against the fabric's real spine + port book (so the
  * shared spine is extended/reused idempotently), emits the derived stream-switch
  * ops via __Runtime_ctrl_row_emit, and records the chain span. @is_top marks the
@@ -4169,6 +4190,8 @@ static void rt_ctrl_shim_park_data_masters(const __Runtime_CtrlRowFabric *f, uin
 AieRC __Runtime_ctrl_plan_release(__Runtime_CtrlRowFabric *f, int32_t mm2s_ch) {
     if (!f || !f->dev)
         return XAIE_INVALID_ARGS;
+    if (f->dedicated_shim)
+        return XAIE_OK;
     XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
     (void)XAie_StrmConnCctDisable(f->dev, shim, SOUTH, rt_shim_mm2s_port(mm2s_ch), NORTH, RT_CTRL_VFWD);
     routing(f->dev);
@@ -4195,8 +4218,14 @@ AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, ui
     f->ret_vc = 0U;
     f->resp_s2mm_ch = resp_s2mm_ch;
     AieRC rc = rt_ctrl_plan_add_rows(f, rows, nrows);
-    AIEHLC_LOG(printf("[aie_runtime] ctrl_plan_init shim_col=%u ctrl_id=%u resp_s2mm_ch=%d nrows=%u add_rows_rc=%d\n",
-                      (unsigned)shim_col, (unsigned)ctrl_id, (int)resp_s2mm_ch, (unsigned)nrows, (int)rc););
+    f->dedicated_shim = (rc == XAIE_OK && f->nrows > 0U) ? 1U : 0U;
+    for (uint8_t i = 0; i < f->nrows; i++)
+        if (f->rows[i].col_lo <= shim_col)
+            f->dedicated_shim = 0U;
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_plan_init shim_col=%u ctrl_id=%u resp_s2mm_ch=%d nrows=%u dedicated=%u "
+                      "add_rows_rc=%d\n",
+                      (unsigned)shim_col, (unsigned)ctrl_id, (int)resp_s2mm_ch, (unsigned)nrows,
+                      (unsigned)f->dedicated_shim, (int)rc););
     if (rc != XAIE_OK)
         printf("[aie_runtime] ctrl_plan_init ERROR rc=%d (shim_col=%u nrows=%u)\n", (int)rc, (unsigned)shim_col,
                (unsigned)nrows);
@@ -4230,7 +4259,8 @@ AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f) {
 static AieRC rt_ctrl_row_shim_entry(const __Runtime_CtrlRowFabric *f, int32_t mm2s_ch) {
     XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
     uint8_t fport = rt_shim_mm2s_port(mm2s_ch);
-    rt_ctrl_shim_park_data_masters(f, fport);
+    if (!f->dedicated_shim)
+        rt_ctrl_shim_park_data_masters(f, fport);
     AieRC rc = XAie_EnableShimDmaToAieStrmPort(f->dev, shim, fport);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] ctrl_row: shim entry EnableShimDmaToAieStrmPort (%u,0) port=%u rc=%d\n",
@@ -5586,9 +5616,12 @@ static uint32_t rt_ctrl_elf_count_pkts(XAie_DevInst *dev, const uint8_t *elf, XA
 static uint32_t rt_ctrl_elf_pkt_len(const uint32_t *acc) { return 2U + (((acc[1] >> 20) & 0x3U) + 1U); }
 
 static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const uint8_t *elf, XAie_LocType loc, uint32_t *pkt, uint32_t max_acc,
-                              uint32_t *nacc_out, uint32_t *last_addr_out, uint32_t *last_value_out) {
+                              int packed, uint32_t *nacc_out, uint32_t *payload_words_out,
+                              uint32_t *last_addr_out, uint32_t *last_value_out) {
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elf;
     uint32_t acc = 0U;
+    uint32_t payload_words = 0U;
+    uint32_t capacity = max_acc * RT_CTRL_ELF_PKT_STRIDE;
     uint32_t last_addr = 0U;
     uint32_t last_value = 0U;
     for (uint32_t i = 0U; i < ehdr->e_phnum; i++) {
@@ -5612,12 +5645,15 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const uint8_t *elf, XAie_LocTyp
             memcpy(words, elf + phdr->p_offset + byte_off, chunk_bytes);
             if (acc >= max_acc)
                 return XAIE_ERR;
-            uint32_t *slot = pkt + (size_t)acc * RT_CTRL_ELF_PKT_STRIDE;
-            uint32_t got = __Runtime_ctrl_pktize_write(slot, RT_CTRL_ELF_PKT_STRIDE, (uint8_t)ACR_ID_BCAST,
+            uint32_t slot_off = packed ? payload_words : acc * RT_CTRL_ELF_PKT_STRIDE;
+            uint32_t slot_cap = packed ? capacity - slot_off : RT_CTRL_ELF_PKT_STRIDE;
+            uint32_t *slot = pkt + slot_off;
+            uint32_t got = __Runtime_ctrl_pktize_write(slot, slot_cap, (uint8_t)ACR_ID_BCAST,
                                                        tile_addr + byte_off, words, nwords, 0, 0U, NULL);
             if (got == 0U)
                 return XAIE_ERR;
             acc++;
+            payload_words += got;
             last_addr = tile_addr + byte_off + (nwords - 1U) * sizeof(uint32_t);
             last_value = words[nwords - 1U];
             byte_off += chunk_bytes;
@@ -5680,8 +5716,9 @@ static void rt_ctrl_elf_timeout_dump(__Runtime_CtrlRowFabric *fab, const uint32_
     }
 }
 
-static AieRC rt_ctrl_elf_dma(__Runtime_CtrlRowFabric *fab, uint32_t *pkt, uint32_t nacc, uint32_t *ack,
-                             uint32_t ack_words, uint32_t *token, int nacks, int32_t bd_id, int32_t mm2s_ch) {
+static AieRC rt_ctrl_elf_dma(__Runtime_CtrlRowFabric *fab, uint32_t *pkt, uint32_t nacc, uint32_t payload_words,
+                             uint32_t *ack, uint32_t ack_words, uint32_t *token, int nacks, int32_t bd_id,
+                             int32_t mm2s_ch) {
     AieRC rc = rt_ctrl_row_shim_entry(fab, mm2s_ch);
     if (rc != XAIE_OK)
         return rc;
@@ -5701,18 +5738,25 @@ static AieRC rt_ctrl_elf_dma(__Runtime_CtrlRowFabric *fab, uint32_t *pkt, uint32
     };
     AIEHLC_LOG(printf("[aie_runtime] ctrl_elf_dma per-packet accesses=%u first=[%08x %08x]\n", (unsigned)nacc,
                       (unsigned)pkt[0], (unsigned)pkt[1]););
-    for (uint32_t i = 0U; i < nacc; i++) {
-        uint32_t *slot = pkt + (size_t)i * RT_CTRL_ELF_PKT_STRIDE;
-        rc = rt_ctrl_mm2s_wait_below(fab->dev, fab->shim_col, mm2s_ch, RT_CTRL_ELF_QDEPTH);
+    if (g_ctrl_high_throughput_ready) {
+        rc = __Runtime_ctrl_push(&inst, pkt, payload_words, 0, 0);
         if (rc != XAIE_OK) {
-            printf("[aie_runtime] ctrl_elf_dma stalled on access %u/%u\n", (unsigned)i, (unsigned)nacc);
-            rt_ctrl_elf_timeout_dump(fab, slot, rt_ctrl_elf_pkt_len(slot));
             return rc;
         }
-        inst.bd_id = bd_id + (int32_t)(i % RT_CTRL_ELF_NBD);
-        rc = __Runtime_ctrl_push(&inst, slot, rt_ctrl_elf_pkt_len(slot), /*block=*/0, /*log=*/0);
-        if (rc != XAIE_OK)
-            return rc;
+    } else {
+        for (uint32_t i = 0U; i < nacc; i++) {
+            uint32_t *slot = pkt + (size_t)i * RT_CTRL_ELF_PKT_STRIDE;
+            rc = rt_ctrl_mm2s_wait_below(fab->dev, fab->shim_col, mm2s_ch, RT_CTRL_ELF_QDEPTH);
+            if (rc != XAIE_OK) {
+                printf("[aie_runtime] ctrl_elf_dma stalled on access %u/%u\n", (unsigned)i, (unsigned)nacc);
+                rt_ctrl_elf_timeout_dump(fab, slot, rt_ctrl_elf_pkt_len(slot));
+                return rc;
+            }
+            inst.bd_id = bd_id + (int32_t)(i % RT_CTRL_ELF_NBD);
+            rc = __Runtime_ctrl_push(&inst, slot, rt_ctrl_elf_pkt_len(slot), /*block=*/0, /*log=*/0);
+            if (rc != XAIE_OK)
+                return rc;
+        }
     }
     inst.bd_id = bd_id;
     rc = rt_ctrl_mm2s_wait(fab->dev, fab->shim_col, mm2s_ch);
@@ -5755,8 +5799,9 @@ static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, 
         fab->dev, (size_t)(token_off + (uint32_t)wave * 4U) * sizeof(uint32_t));
     if (!pkt)
         return XAIE_ERR;
-    uint32_t nacc = 0U, last_addr = 0U, last_value = 0U;
-    AieRC rc = rt_ctrl_elf_fill(fab->dev, elf, loc, pkt, npkt_cap, &nacc, &last_addr, &last_value);
+    uint32_t nacc = 0U, payload_words = 0U, last_addr = 0U, last_value = 0U;
+    AieRC rc = rt_ctrl_elf_fill(fab->dev, elf, loc, pkt, npkt_cap, g_ctrl_high_throughput_ready, &nacc, &payload_words,
+                                &last_addr, &last_value);
     uint32_t *ack = pkt + ack_off;
     uint8_t sid = (uint8_t)(((uint8_t)ACR_CLASS_WHOLE_ROW << 2) | ((fab->nrows - 1U) & 0x3U));
     uint32_t ack_words = __Runtime_ctrl_pktize_write(ack, 4U, sid, last_addr, &last_value, 1U, 1, 0U, NULL);
@@ -5764,7 +5809,7 @@ static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, 
                       (int)rc, (unsigned)npkt_cap, (unsigned)nacc, (unsigned)last_addr, (unsigned)ack_words, nacks););
     if (rc == XAIE_OK && nacc > 0U && ack_words > 0U) {
         __Runtime_sync_for_dev(fab->dev, pkt, (size_t)(ack_off + ack_words) * sizeof(uint32_t));
-        rc = rt_ctrl_elf_dma(fab, pkt, nacc, ack, ack_words, pkt + token_off, nacks, bd_id, mm2s_ch);
+        rc = rt_ctrl_elf_dma(fab, pkt, nacc, payload_words, ack, ack_words, pkt + token_off, nacks, bd_id, mm2s_ch);
     } else if (rc == XAIE_OK) {
         rc = XAIE_ERR;
     }

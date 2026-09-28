@@ -9,25 +9,35 @@
  */
 #include "simplematmul.h"
 void __Runtime_ctrl_pmap_enable(int on);
+void __Runtime_ctrl_high_throughput_enable(int on);
 #pragma aie_debug_level(0 | AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN)
 #pragma CONTROL_PLAN_GROUP_REG_WRITE
 #pragma control_plan_op_control_packet
+#pragma control_plan_dedicated_shim
+#define MATMUL_LARGE_MMUL 1
+#ifdef MATMUL_LARGE_MMUL
+constexpr int kTileMn = 64;
+constexpr aie::Bytes kL1Budget{8192};
+#else
+constexpr int kTileMn = 16;
+constexpr aie::Bytes kL1Budget{4096};
+#endif
 constexpr aie::GemmSpace RowBA = {.policy = {.map = {.act = aie::Pattern::Broadcast, .layout = aie::Layout::Row},
                                              .mat = {.pad = aie::PadMaterialize::DDR, .im2col = aie::Im2col::None},
-                                             .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
-                                  .d1 = {.fullsize = M, .tile_size = 16, .stride = 16},
+                                             .sched = {.pp_depth = 2, .l1_budget = kL1Budget}},
+                                  .d1 = {.fullsize = M, .tile_size = kTileMn, .stride = kTileMn},
                                   .d2 = {.fullsize = K, .tile_size = 64, .stride = 64}};
 constexpr aie::GemmSpace ColBB = {.policy = {.map = {.wgt = aie::Pattern::Broadcast, .layout = aie::Layout::Col},
                                              .mat = {.pad = aie::PadMaterialize::DDR, .im2col = aie::Im2col::None},
-                                             .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
-                                  .d1 = {.fullsize = N, .tile_size = 16, .stride = 16},
+                                             .sched = {.pp_depth = 2, .l1_budget = kL1Budget}},
+                                  .d1 = {.fullsize = N, .tile_size = kTileMn, .stride = kTileMn},
                                   .d2 = {.fullsize = K, .tile_size = 64, .stride = 64}};
 constexpr aie::GemmSpace LtoR_Merge = {
     .policy = {.map = {.layout = aie::Layout::Row, .merge_order = aie::Flow::LeftToRight},
                .mat = {.pad = aie::PadMaterialize::DDR, .im2col = aie::Im2col::None},
-               .sched = {.pp_depth = 2, .l1_budget = aie::Bytes{4096}}},
-    .d1 = {.fullsize = M, .tile_size = 16, .stride = 16},
-    .d2 = {.fullsize = N, .tile_size = 16, .stride = 16}};
+               .sched = {.pp_depth = 2, .l1_budget = kL1Budget}},
+    .d1 = {.fullsize = M, .tile_size = kTileMn, .stride = kTileMn},
+    .d2 = {.fullsize = N, .tile_size = kTileMn, .stride = kTileMn}};
 constexpr aie::GlobalPolicy matmul_policy = {.fullconnect_auto = 1};
 __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_a,
                                       aie::port<input_window_int8 *, ColBB> win_b,
@@ -71,7 +81,14 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
 #endif
 
     int8_t all_A[tile_rows * eff_k];
+#ifdef MATMUL_LARGE_MMUL
+    int32_t accum[tile_rows * tile_cols];
+    alignas(aie::vector_decl_align) int8_t a_block[64];
+    alignas(aie::vector_decl_align) int8_t b_block[64];
+    alignas(aie::vector_decl_align) int32_t c_block[64];
+#else
     int16_t accum[tile_rows * tile_cols];
+#endif
     int8_t local_out[tile_rows * tile_cols];
 
     for (int mr = 0; mr < m_rounds * n_rounds; mr++) {
@@ -99,6 +116,35 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
             for (int rb = 0; rb < num_b_rounds; rb++) {
                 int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
 #ifndef DEBUG_NOCOMPUTE
+#ifdef MATMUL_LARGE_MMUL
+                for (int i0 = 0; i0 < tile_rows; i0 += 8) {
+                    for (int j0 = 0; j0 < cols_per_round; j0 += 8) {
+                        aie::mmul<8, 8, 8, int8, int8> block;
+                        for (int k0 = 0; k0 < eff_k; k0 += 8) {
+                            for (int i = 0; i < 8; i++) {
+                                for (int k = 0; k < 8; k++)
+                                    a_block[i * 8 + k] = all_A[(i0 + i) * eff_k + k0 + k];
+                            }
+                            for (int k = 0; k < 8; k++) {
+                                for (int j = 0; j < 8; j++)
+                                    b_block[k * 8 + j] = B_ptr[(j0 + j) * eff_k + k0 + k];
+                            }
+                            auto av = aie::load_v<64>(a_block);
+                            auto bv = aie::load_v<64>(b_block);
+                            if (k0 == 0)
+                                block.mul(av, bv);
+                            else
+                                block.mac(av, bv);
+                        }
+                        aie::store_v(c_block, block.to_vector<int32>());
+                        for (int i = 0; i < 8; i++) {
+                            for (int j = 0; j < 8; j++) {
+                                accum[(i0 + i) * tile_cols + rb * cols_per_round + j0 + j] += c_block[i * 8 + j];
+                            }
+                        }
+                    }
+                }
+#else
                 for (int i = 0; i < tile_rows; i++) {
                     for (int j = 0; j < cols_per_round; j++) {
                         int16_t sum = 0;
@@ -108,6 +154,7 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
                         accum[i * tile_cols + rb * cols_per_round + j] += sum;
                     }
                 }
+#endif
 #endif
 
 #if DEBUG_OUTPUT_ORDER
@@ -120,7 +167,11 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
 
 #ifndef DEBUG_NOCOMPUTE
         for (int i = 0; i < tile_rows * tile_cols; i++) {
+#ifdef MATMUL_LARGE_MMUL
+            int32_t val = accum[i];
+#else
             int16_t val = accum[i];
+#endif
             if (val > 127)
                 val = 127;
             else if (val < -128)
@@ -267,13 +318,14 @@ __global__ void mul2(aie::port<input_window_int8 *, RowBA> win_a, aie::port<inpu
 }
 
 int main() {
+    __Runtime_ctrl_high_throughput_enable(0);
     __Runtime_ctrl_pmap_enable(1);
     printf("=== Matrix Multiply CTRL-PKT %dx%d Mesh ===\n", HW_ROWS, HW_COLS);
     printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);
     __ps_pmccntr_enable();
     aieSetDevice(0);
     aieArray device;
-    aieMesh mesh = device.partition({0, 3, 0, 6}, HW_ROWS, HW_COLS);
+    aieMesh mesh = device.partition({0, HW_COLS, 0, 6}, HW_ROWS, HW_COLS);
     int8_t *A = (int8_t *)device.alloc(M * K * sizeof(int8_t) * 4);
     int8_t *B = (int8_t *)device.alloc(K * N * sizeof(int8_t) * 4);
     int8_t *C = (int8_t *)device.alloc(M * N * sizeof(int8_t) * 4);
@@ -298,8 +350,9 @@ int main() {
         __Runtime_phase_cycles(ph, phc);
         __Runtime_wait_io_cycles(&wio, &wion);
         __Runtime_kload_split_cycles(&kelf, &kelfn, &krst, &krstn);
-        printf("[PERF] variant=ctrl_pkt kload=%llu elf=%llu rst=%llu bdcfg=%llu coreen=%llu startio=%llu wait_io=%llu\n",
-               ph[0], kelf, krst, ph[1], ph[2], ph[3], wio);
+        printf(
+            "[PERF] variant=ctrl_pkt kload=%llu elf=%llu rst=%llu bdcfg=%llu coreen=%llu startio=%llu wait_io=%llu\n",
+            ph[0], kelf, krst, ph[1], ph[2], ph[3], wio);
     }
 #ifndef DEBUG_NOCOMPUTE
     int result = verify_matmul(A, B, C);
@@ -307,6 +360,15 @@ int main() {
     int result = 0;
     printf("test end=----------------------------------%.3f ms\n", elapsed_ms);
 #endif
+    {
+        unsigned long long ph[4] = {0, 0, 0, 0}, wio = 0ULL, kelf = 0ULL, krst = 0ULL;
+        __Runtime_phase_cycles(ph, NULL);
+        __Runtime_wait_io_cycles(&wio, NULL);
+        __Runtime_kload_split_cycles(&kelf, NULL, &krst, NULL);
+        printf("[FINAL_PERF] wall_ms=%.3f kload=%llu elf=%llu rst=%llu bdcfg=%llu coreen=%llu startio=%llu "
+               "wait_io=%llu\n",
+               elapsed_ms, ph[0], kelf, krst, ph[1], ph[2], ph[3], wio);
+    }
     device.free(A);
     device.free(B);
     device.free(C);

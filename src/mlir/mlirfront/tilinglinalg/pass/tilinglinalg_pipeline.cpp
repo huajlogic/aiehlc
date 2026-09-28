@@ -588,7 +588,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
     // Extract partition bounds from createhwmesh op in the IR (if present)
     int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
+    int meshCols = 0;
     module.walk([&](routing::createhwmesh meshOp) {
+        meshCols = std::max<int>(meshCols, meshOp.getCol());
         if (auto sc = meshOp.getStartCol())
             partStartCol = *sc;
         if (auto ec = meshOp.getEndCol())
@@ -610,9 +612,39 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_op_control_packet");
     bool reserveControlPlane = controlPlanAttr && controlPlanAttr.getInt() != 0;
     rt_res_gen resourceGen = __Runtime_res_gen_from_name(aieGen.c_str());
-    RoutingTopology rtopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
-    if (reserveControlPlane)
-        rtopology.getRM()->reserveControlPlaneResources(resourceGen);
+
+    auto dedicatedAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_dedicated_shim");
+    int ctrlSpineCol = -1;
+    int dataStartCol = relStartCol;
+    if (dedicatedAttr && dedicatedAttr.getInt() != 0) {
+        if (!reserveControlPlane) {
+            llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim requires "
+                            "#pragma control_plan_op_control_packet.\n";
+            return false;
+        }
+        if (relStartCol < 0 || relEndCol - relStartCol + 1 < meshCols + 1) {
+            llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim needs a partition with one "
+                            "spare column west of the mesh (mesh cols="
+                         << meshCols << ", partition cols=" << (relStartCol < 0 ? 0 : relEndCol - relStartCol + 1)
+                         << ").\n";
+            return false;
+        }
+        ctrlSpineCol = relStartCol;
+        dataStartCol = relStartCol + 1;
+        mlir::OpBuilder attrBuilder(module.getContext());
+        module->setAttr("routing.control_plan_shim_col", attrBuilder.getI64IntegerAttr(ctrlSpineCol));
+        std::cout << "[TilingLinalg] control spine dedicated to partition col " << ctrlSpineCol
+                  << "; data plane uses cols [" << dataStartCol << "," << relEndCol << "]" << std::endl;
+    }
+    auto reserveControl = [&](const std::shared_ptr<ResourceMgr> &rm) {
+        if (!reserveControlPlane)
+            return;
+        rm->setControlSpineCol(ctrlSpineCol);
+        rm->reserveControlPlaneResources(resourceGen);
+    };
+
+    RoutingTopology rtopology(aieGen, "", dataStartCol, relEndCol, partStartRow, partEndRow);
+    reserveControl(rtopology.getRM());
 
     std::string irDir = setupPipelineIRDir("dfschedule");
     int stage = 0;
@@ -822,9 +854,10 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     bool enableGroupWrites = grwAttr && grwAttr.getInt() != 0;
     bool enableKernelControl = ctrlAttr && ctrlAttr.getInt() != 0;
     if (enableGroupWrites || enableKernelControl) {
-        if (!runPipelineSinglePass(
-                ctx, hostModule, std::make_unique<mlir::GroupRegWritePass>(enableGroupWrites, enableKernelControl),
-                irDir, stage, "GroupRegWritePass"))
+        if (!runPipelineSinglePass(ctx, hostModule,
+                                   std::make_unique<mlir::GroupRegWritePass>(enableGroupWrites, enableKernelControl,
+                                                                             1, 0, 2, 0, ctrlSpineCol),
+                                   irDir, stage, "GroupRegWritePass"))
             return false;
     } else {
         llvm::errs() << "[TilingLinalg] GroupRegWritePass skipped (enable with "
@@ -1744,9 +1777,8 @@ after_host_emit:
         // consumed shim/port resources from the original rtopology. Phase 5 reads
         // shim tile info from the dmaphop IR and allocates its own DataIO objects.
         // Use the same 0-based partition-relative columns as the host path.
-        RoutingTopology routingPathTopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
-        if (reserveControlPlane)
-            routingPathTopology.getRM()->reserveControlPlaneResources(resourceGen);
+        RoutingTopology routingPathTopology(aieGen, "", dataStartCol, relEndCol, partStartRow, partEndRow);
+        reserveControl(routingPathTopology.getRM());
 
         if (!runPipelineSinglePass(ctx, routingDmaphopModule,
                                    std::make_unique<DmaphopToRoutinghwPass>(routingPathTopology), routingIrDir, rstage,

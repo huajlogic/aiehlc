@@ -631,6 +631,10 @@ public:
   // source of truth. Idempotent. Always called once after ResourceMgr::init.
   void reserveControlPlaneResources(rt_res_gen gen);
 
+  void setControlSpineCol(int col) { controlSpineCol_ = col; }
+  int controlSpineCol() const { return controlSpineCol_; }
+  static constexpr int kControlShimDmaCh = 0;
+
   // Reserved-resource accessors for routing/scheduling.
   uint32_t reservedArbiterMask() const { return reservedArbiterMask_; }
   // bit i => slot i is reserved on (port,is_master) by the control plane.
@@ -643,6 +647,11 @@ public:
   int partitionEndCol() const { return partitionEndCol_; }
   int partitionStartRow() const { return partitionStartRow_; }
   int partitionEndRow() const { return partitionEndRow_; }
+  bool inPartition(int r, int c) const { return isTileInPartition(r, c); }
+  std::shared_ptr<ShimTile> getShimTile(int r, int c) const {
+    auto it = shimTiles_.find(TileCoord{r, c});
+    return it == shimTiles_.end() ? nullptr : it->second;
+  }
 
 private:
   // Partition bounds (-1 = use full mesh)
@@ -651,7 +660,9 @@ private:
 
   // Check if a column/row is within partition bounds
   bool isColInPartition(int c) const { return !hasPartition() || (c >= partitionStartCol_ && c <= partitionEndCol_); }
-  bool isRowInPartition(int r) const { return !hasPartition() || (r >= partitionStartRow_ && r <= partitionEndRow_); }
+  bool isRowInPartition(int r) const {
+    return !hasPartition() || partitionStartRow_ < 0 || (r >= partitionStartRow_ && r <= partitionEndRow_);
+  }
   bool isTileInPartition(int r, int c) const { return isColInPartition(c) && isRowInPartition(r); }
 
   static constexpr int kMaxPktId = 32; // 5-bit AIE pkt_id field
@@ -665,6 +676,7 @@ private:
   // [port][is_master] -> slot bitmask reserved by the control plane.
   std::array<std::array<int, 2>, kNumPortTypes> reservedSlotMask_{};
   bool controlPlaneReserved_ = false;
+  int controlSpineCol_ = -1;
 
   void InitSHIMNocList();
 

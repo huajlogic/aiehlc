@@ -301,6 +301,51 @@ static int test_top_head_no_north_climb() {
     return 0;
 }
 
+static int test_relay_head() {
+    acr_state s = {};
+    acr_portbook b = {};
+    acr_oplist o = {};
+    assert(acr_plan_row_add(&s, &o, &b, 0, 3, 1, 4, 0, 0) == ACR_OK);
+
+    assert(count_master(&o, 0, ACR_CTRL) == 0);
+    assert(find_slot(&o, 0, ACR_CTRL, ACR_SLOT_RET_LOCAL, ACR_ARB_RET) == nullptr);
+    assert(find_slot(&o, 0, ACR_SOUTH, ACR_SLOT_CONSUME, ACR_ARB_CTRL) != nullptr);
+    assert(find_slot(&o, 0, ACR_SOUTH, ACR_SLOT_BCAST, ACR_ARB_CTRL) != nullptr);
+    assert(find_slot(&o, 0, ACR_SOUTH, ACR_SLOT_TRANSIT_N, ACR_ARB_CTRL) != nullptr);
+    assert(master_mselen(&o, 0, ACR_EAST) == 0xB);
+    assert(master_mselen(&o, 0, ACR_NORTH) == 0x6);
+    assert(find_slot(&o, 0, ACR_EAST, ACR_SLOT_RET_TRANSIT, ACR_ARB_RET) != nullptr);
+    assert(master_mselen(&o, 0, ACR_SOUTH) == ((1 << ACR_MSEL_RET_TRANSIT) | (1 << ACR_MSEL_RET_NORTH)));
+
+    assert(find_slot(&o, 1, ACR_WEST, ACR_SLOT_CONSUME, ACR_ARB_CTRL) != nullptr);
+    assert(find_slot(&o, 1, ACR_SOUTH, ACR_SLOT_CONSUME, ACR_ARB_CTRL) == nullptr);
+    assert(count_master(&o, 1, ACR_NORTH) == 0);
+    assert(count_master(&o, 1, ACR_SOUTH) == 0);
+    assert(master_mselen(&o, 1, ACR_WEST) == 0x3);
+    for (uint8_t c = 1; c <= 4; c++) {
+        assert(master_mselen(&o, c, ACR_CTRL) == 0x3);
+        assert(find_slot(&o, c, ACR_CTRL, ACR_SLOT_RET_LOCAL, ACR_ARB_RET) != nullptr);
+    }
+    assert(master_mselen(&o, 4, ACR_WEST) == 0x1);
+    assert(count_master(&o, 4, ACR_EAST) == 0);
+
+    assert(has_cct(&o, 0, 1, ACR_SOUTH, ACR_NORTH));
+    assert(has_cct(&o, 0, 2, ACR_NORTH, ACR_SOUTH));
+    for (int i = 0; i < o.n; i++)
+        assert(o.ops[i].col <= 4);
+
+    acr_oplist ot = {};
+    assert(acr_plan_row_add(&s, &ot, &b, 0, 6, 1, 4, 0, 1) == ACR_OK);
+    assert(count_master(&ot, 0, ACR_NORTH) == 0);
+    assert(master_mselen(&ot, 0, ACR_SOUTH) == (1 << ACR_MSEL_RET_TRANSIT));
+
+    acr_state s2 = {};
+    acr_portbook b2 = {};
+    acr_oplist o2 = {};
+    assert(acr_plan_row_add(&s2, &o2, &b2, 2, 3, 1, 4, 0, 1) == ACR_ERR_BOUNDS);
+    return 0;
+}
+
 // Every op carries the fwd/ret fabric tag the emit layer turns into the
 // CONTROLPAN-PMAP dir= field. The tag CANNOT be inferred from the port type --
 // the return chain's slots live on CTRL/EAST slaves and its non-head master is
@@ -371,7 +416,8 @@ static int test_is_ret_tagging() {
 
 int main() {
     if (test_book() || test_slot_classes() || test_east_forward() || test_forward_slot_table() || test_return_chain() ||
-        test_spine_reuse() || test_shared_head_fanout() || test_top_head_no_north_climb() || test_is_ret_tagging())
+        test_spine_reuse() || test_shared_head_fanout() || test_top_head_no_north_climb() || test_relay_head() ||
+        test_is_ret_tagging())
         return 1;
     printf("PASS\n");
     return 0;

@@ -38,9 +38,9 @@ class GroupRegWritePass : public PassWrapper<GroupRegWritePass, OperationPass<Mo
     // Resource selection for the control fabric (must not collide with the
     // data-plane DMA channels/BDs used by the offloaded kernels).
     GroupRegWritePass(bool enableGroupWrites, bool enableKernelControl, int ctrlId = 1, int respS2mmCh = 0,
-                      int sendBdId = 2, int sendMm2sCh = 0)
+                      int sendBdId = 2, int sendMm2sCh = 0, int spineCol = -1)
         : enableGroupWrites(enableGroupWrites), enableKernelControl(enableKernelControl), ctrlId(ctrlId),
-          respS2mmCh(respS2mmCh), sendBdId(sendBdId), sendMm2sCh(sendMm2sCh) {}
+          respS2mmCh(respS2mmCh), sendBdId(sendBdId), sendMm2sCh(sendMm2sCh), spineCol(spineCol) {}
 
     StringRef getArgument() const final { return "group-reg-write"; }
     StringRef getDescription() const final {
@@ -64,6 +64,7 @@ class GroupRegWritePass : public PassWrapper<GroupRegWritePass, OperationPass<Mo
     // (which uses only BD0/BD1 on channel 0). sendBdId=2 -> BDs 2..6.
     int sendBdId = 2;
     int sendMm2sCh = 0;
+    int spineCol = -1;
 };
 
 } // namespace mlir

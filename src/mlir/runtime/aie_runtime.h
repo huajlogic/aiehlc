@@ -902,6 +902,8 @@ AieRC __Runtime_ctrl_setup_routing(__Runtime_CtrlInstance *inst, int port_evt = 
 // value.
 void __Runtime_ctrl_pmap_enable(int on);
 
+void __Runtime_ctrl_high_throughput_enable(int on);
+
 // Poll the shim S2MM drain until the response lands, sync it for the CPU, and
 // return the first response word. Uses @inst->token armed by
 // __Runtime_ctrl_setup_routing. If @print is nonzero, prints the observed word.
@@ -979,6 +981,7 @@ typedef struct {
 typedef struct __Runtime_CtrlRowFabric_s {
     XAie_DevInst *dev; // partitioned device instance
     uint8_t shim_col;  // vertical spine column (= row left edge)
+    uint8_t dedicated_shim;
     uint8_t ctrl_id;   // 5-bit stream id used for consume-matching
     uint32_t fwd_vc;   // vertical stream channel for the forward spine
     uint32_t ret_vc;   // vertical stream channel for the return spine
@@ -1005,8 +1008,7 @@ AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops);
 
 // One-shot fabric init: record the device, spine column @shim_col, control
 // stream id @ctrl_id, and shim S2MM response channel @resp_s2mm_ch, then plan +
-// emit every EAST chain in @rows[0..nrows). Each chain head must sit on the spine
-// column (col_lo == shim_col). @rows may be given in any row order (bottom-up
+// emit every EAST chain in @rows[0..nrows). @rows may be given in any row order (bottom-up
 // preferred); the static planner computes the top row so its return head omits
 // the idle RET_NORTH slot. Responses drain via @resp_s2mm_ch.
 AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,

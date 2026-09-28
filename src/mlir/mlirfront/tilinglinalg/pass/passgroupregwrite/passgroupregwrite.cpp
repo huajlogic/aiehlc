@@ -167,6 +167,14 @@ void GroupRegWritePass::runOnOperation() {
     }
     if (rowCols.empty())
         return;
+    if (spineCol >= 0) {
+        if (spineCol >= shimCol) {
+            hostOp.emitError("dedicated control spine column must lie west of every configured tile");
+            signalPassFailure();
+            return;
+        }
+        shimCol = spineCol;
+    }
 
     // --- 3. Cluster by (tileAddr,value) ---
     std::map<std::pair<uint32_t, int>, std::vector<const LockInit *>> clusters;

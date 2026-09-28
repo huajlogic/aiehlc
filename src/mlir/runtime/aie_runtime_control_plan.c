@@ -120,8 +120,9 @@ static acr_rc acr_emit_master(acr_oplist *o, acr_portbook *b, uint8_t c, uint8_t
  * are no longer separately routed; the runtime's class-write wrappers still exist
  * but resolve onto this uniform superset.) */
 static acr_rc acr_plan_chain_ex(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t rowidx, uint8_t col_lo,
-                                uint8_t col_hi, uint8_t ctrl_id, int shim_col, acr_port head_ingress, int is_top) {
-    if (col_hi < col_lo || col_hi >= 64)
+                                uint8_t target_lo, uint8_t col_hi, uint8_t ctrl_id, int shim_col,
+                                acr_port head_ingress, int is_top) {
+    if (col_hi < col_lo || col_hi >= 64 || target_lo < col_lo || target_lo > col_hi)
         return ACR_ERR_BOUNDS;
     if (rowidx > ACR_MAX_ROW_IDX) /* target row index lives in id[1:0] */
         return ACR_ERR_BOUNDS;
@@ -159,7 +160,8 @@ static acr_rc acr_plan_chain_ex(acr_oplist *o, acr_portbook *b, uint8_t row, uin
             return rc;
 
             /* Interior CTRL pulls consume + broadcast (0x3). */
-        if ((rc = acr_emit_master(o, b, c, row, ACR_CTRL, (uint8_t)ACR_MSELEN_CTRL, ACR_ARB_CTRL)) != ACR_OK)
+        if (c >= target_lo &&
+            (rc = acr_emit_master(o, b, c, row, ACR_CTRL, (uint8_t)ACR_MSELEN_CTRL, ACR_ARB_CTRL)) != ACR_OK)
             return rc;
         /* EAST forwards consume + broadcast + only-last transit (0xB) so every
          * class reaches its columns. */
@@ -202,17 +204,20 @@ static acr_rc acr_emit_ret_slot(acr_oplist *o, acr_portbook *b, uint8_t c, uint8
  * All return ports are disjoint from the forward chain (forward uses WEST/SOUTH
  * slave ingress + EAST/CTRL/NORTH masters), and master/slave domains are booked
  * separately, so there is no port conflict. See the header for the slot/MSel map. */
-acr_rc acr_plan_return_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_lo, uint8_t col_hi, int is_top) {
-    if (col_hi < col_lo || col_hi >= 64)
+static acr_rc acr_plan_return_chain_ex(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_lo, uint8_t target_lo,
+                                       uint8_t col_hi, int is_top) {
+    if (col_hi < col_lo || col_hi >= 64 || target_lo < col_lo || target_lo > col_hi)
         return ACR_ERR_BOUNDS;
 
     for (uint8_t c = col_lo; c <= col_hi; c++) {
         int is_head = (c == col_lo);
         int has_transit = (c < col_hi);
+        int has_local = (c >= target_lo);
         acr_rc rc;
 
         /* Local response source: this tile's CTRL slave. */
-        if ((rc = acr_emit_ret_slot(o, b, c, row, ACR_CTRL, ACR_SLOT_RET_LOCAL, ACR_MSEL_RET_LOCAL)) != ACR_OK)
+        if (has_local &&
+            (rc = acr_emit_ret_slot(o, b, c, row, ACR_CTRL, ACR_SLOT_RET_LOCAL, ACR_MSEL_RET_LOCAL)) != ACR_OK)
             return rc;
         /* East neighbor's westbound merged responses (interior + head, not last). */
         if (has_transit &&
@@ -228,13 +233,15 @@ acr_rc acr_plan_return_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_
                 return rc;
             /* Head descent: SOUTH master -> VRET, pulling {local, transit?} plus
              * {north} only when a head can sit above (non-top). */
-            uint8_t mselen = (uint8_t)((1u << ACR_MSEL_RET_LOCAL) | (has_transit ? (1u << ACR_MSEL_RET_TRANSIT) : 0u) |
+            uint8_t mselen = (uint8_t)((has_local ? (1u << ACR_MSEL_RET_LOCAL) : 0u) |
+                                       (has_transit ? (1u << ACR_MSEL_RET_TRANSIT) : 0u) |
                                        (is_top ? 0u : (1u << ACR_MSEL_RET_NORTH)));
             if ((rc = acr_emit_master(o, b, c, row, ACR_SOUTH, mselen, ACR_ARB_RET)) != ACR_OK)
                 return rc;
         } else {
             /* Interior/last: WEST master merges {local, transit?} to the west tile. */
-            uint8_t mselen = (uint8_t)((1u << ACR_MSEL_RET_LOCAL) | (has_transit ? (1u << ACR_MSEL_RET_TRANSIT) : 0u));
+            uint8_t mselen = (uint8_t)((has_local ? (1u << ACR_MSEL_RET_LOCAL) : 0u) |
+                                       (has_transit ? (1u << ACR_MSEL_RET_TRANSIT) : 0u));
             if ((rc = acr_emit_master(o, b, c, row, ACR_WEST, mselen, ACR_ARB_RET)) != ACR_OK)
                 return rc;
         }
@@ -242,10 +249,14 @@ acr_rc acr_plan_return_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_
     return ACR_OK;
 }
 
+acr_rc acr_plan_return_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_lo, uint8_t col_hi, int is_top) {
+    return acr_plan_return_chain_ex(o, b, row, col_lo, col_lo, col_hi, is_top);
+}
+
 /* Public chain planner: plain horizontal chain, head tile ingresses on WEST, no
  * vertical spine climb (shim_col=-1). A plain chain is a single row => rowidx 0. */
 acr_rc acr_plan_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_lo, uint8_t col_hi, uint8_t ctrl_id) {
-    return acr_plan_chain_ex(o, b, row, /*rowidx=*/0, col_lo, col_hi, ctrl_id, /*shim_col=*/-1, ACR_WEST,
+    return acr_plan_chain_ex(o, b, row, /*rowidx=*/0, col_lo, col_lo, col_hi, ctrl_id, /*shim_col=*/-1, ACR_WEST,
                              /*is_top=*/1);
 }
 
@@ -285,7 +296,7 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
                         uint8_t col_hi, uint8_t ctrl_id, int is_top) {
     if (row == 0 || shim_col >= 64)
         return ACR_ERR_BOUNDS;
-    if (col_lo != shim_col) /* row entry is the vertical spine's left column */
+    if (col_lo < shim_col)
         return ACR_ERR_BOUNDS;
 
     /* Idempotent: already configured -> emit nothing. */
@@ -338,14 +349,14 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
 
     /* Build the horizontal chain; head tile takes the spine input from SOUTH and
      * emits its broadcast NORTH climb master (head sits on shim_col == col_lo). */
-    acr_rc rc = acr_plan_chain_ex(o, b, row, /*rowidx=*/s->nrows, col_lo, col_hi, ctrl_id, /*shim_col=*/(int)shim_col,
-                                  ACR_SOUTH, is_top);
+    acr_rc rc = acr_plan_chain_ex(o, b, row, /*rowidx=*/s->nrows, shim_col, col_lo, col_hi, ctrl_id,
+                                  /*shim_col=*/(int)shim_col, ACR_SOUTH, is_top);
     if (rc != ACR_OK)
         return rc;
 
     /* Return path: every column of this row injects/forwards its CTRL response
      * west, the head drives it SOUTH->VRET (merging any upper-spine descent). */
-    rc = acr_plan_return_chain(o, b, row, col_lo, col_hi, is_top);
+    rc = acr_plan_return_chain_ex(o, b, row, shim_col, col_lo, col_hi, is_top);
     if (rc != ACR_OK)
         return rc;
 

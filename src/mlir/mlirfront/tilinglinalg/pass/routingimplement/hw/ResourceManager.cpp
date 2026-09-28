@@ -888,7 +888,15 @@ void ResourceMgr::reserveControlPlaneResources(rt_res_gen gen) {
         reservedSlotMask_[p][1] = __Runtime_res_reserved_slot_mask(gen, (uint8_t)p, /*is_master=*/1);
     }
 
-    int spineCol = hasPartition() ? partitionStartCol_ : 0;
+    int spineCol = controlSpineCol_ >= 0 ? controlSpineCol_ : (hasPartition() ? partitionStartCol_ : 0);
+    if (controlSpineCol_ >= 0) {
+        auto it = shimTiles_.find(TileCoord{0, controlSpineCol_});
+        if (it == shimTiles_.end())
+            throw std::runtime_error("control spine column has no shim DMA");
+        if (!it->second->allocate(DMADIRECTION::MM2S, kControlShimDmaCh, kControlPlaneOwner) ||
+            !it->second->allocate(DMADIRECTION::S2MM, kControlShimDmaCh, kControlPlaneOwner))
+            throw std::runtime_error("control spine shim DMA reservation conflicts with a data-plane DataIO");
+    }
     auto reservePort = [&](RoutingTile &tile, PortDirection port, PortRole role) {
         if (!tile.reservePortNumber(port, role, 0, kControlPlaneOwner))
             throw std::runtime_error("control-plane stream port reservation conflicts with an existing route");
@@ -915,7 +923,8 @@ void ResourceMgr::reserveControlPlaneResources(rt_res_gen gen) {
 
     controlPlaneReserved_ = true;
     std::cout << "[ResourceMgr] control-plane resources reserved (gen=" << (int)gen << " pktidmask=0x" << std::hex
-              << pmask << " arbmask=0x" << reservedArbiterMask_ << std::dec << ")" << std::endl;
+              << pmask << " arbmask=0x" << reservedArbiterMask_ << std::dec << " spine_col=" << spineCol
+              << (controlSpineCol_ >= 0 ? " dedicated" : " shared") << ")" << std::endl;
 }
 
 int ResourceMgr::reservedSlotMask(uint8_t port, uint8_t is_master) const {

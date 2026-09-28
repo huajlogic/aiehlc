@@ -191,6 +191,7 @@ static bool parsedControlPlanGroupRegWrite = false;
 // raw MMIO register writes. Absent (default) => byte-identical to today (host
 // programs every core tile's DMA over the config bus).
 static bool parsedKernelConfigOffload = false;
+static bool parsedControlPlanDedicatedShim = false;
 // Compute tiles to core-trace, from #pragma aie_trace(col,row) (mesh/partition-
 // relative). Repeatable and range-expanded (col:col2, row:row2 -> rectangle).
 // Each spec may carry an optional mem-module DMA/stream selection (2nd tuple).
@@ -3606,6 +3607,17 @@ class AieKernelConfigOffloadPragmaHandler : public clang::PragmaHandler {
     }
 };
 
+class AieControlPlanDedicatedShimPragmaHandler : public clang::PragmaHandler {
+  public:
+    AieControlPlanDedicatedShimPragmaHandler() : PragmaHandler("control_plan_dedicated_shim") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        parsedControlPlanDedicatedShim = true;
+        llvm::outs() << "[aiehlc] Detected #pragma control_plan_dedicated_shim\n";
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
 class MyFrontendAction : public ASTFrontendAction {
 public:
 		MyFrontendAction() {
@@ -3659,6 +3671,7 @@ public:
             PP.AddPragmaHandler(new AieControlPlanPragmaHandler());
             PP.AddPragmaHandler(new AieControlPlanGroupRegWritePragmaHandler());
             PP.AddPragmaHandler(new AieKernelConfigOffloadPragmaHandler());
+            PP.AddPragmaHandler(new AieControlPlanDedicatedShimPragmaHandler());
 
             return true;
 		}
@@ -4679,6 +4692,8 @@ public:
                         // gates the offload codegen on it.
                         module->setAttr("routing.kernel_config_offload",
                                         fcAttrBuilder.getI64IntegerAttr(parsedKernelConfigOffload ? 1 : 0));
+                        module->setAttr("routing.control_plan_dedicated_shim",
+                                        fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
                     }
 
                     // Replace aie::get_*() calls in kernel body with computed integer literals
@@ -5364,6 +5379,8 @@ public:
                     // Publish the flag so the pipeline gates the offload codegen on it.
                     module->setAttr("routing.kernel_config_offload",
                                     fcAttrBuilder.getI64IntegerAttr(parsedKernelConfigOffload ? 1 : 0));
+                    module->setAttr("routing.control_plan_dedicated_shim",
+                                    fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
                 }
 
                 // Replace aie::get_*() calls in kernel body with computed integer literals

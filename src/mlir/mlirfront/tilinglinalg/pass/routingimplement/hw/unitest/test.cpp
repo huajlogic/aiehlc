@@ -20,6 +20,26 @@ int main()
     }
     assert(collisionDetected);
 
+    {
+        auto dedicated = std::make_shared<ResourceMgr>(makeResource("Gen5"));
+        dedicated->setPartitionBounds(1, 4, 0, 6);
+        dedicated->setControlSpineCol(0);
+        dedicated->reserveControlPlaneResources(RT_RES_GEN5);
+        auto shim0 = dedicated->getShimTile(0, 0);
+        assert(shim0 && !shim0->isChannelFree(DMADIRECTION::MM2S, 0) && !shim0->isChannelFree(DMADIRECTION::S2MM, 0));
+        int mm2s = 0;
+        for (int i = 0; i < 8; ++i) {
+            std::optional<TypeBasedTileLoc> loc(TypeBasedTileLoc{TileType::Core, Point{0, 1}});
+            auto slot = dedicated->freeShimNoc(loc, DMADIRECTION::MM2S, 100 + i);
+            assert(slot && slot->loc.c >= 1 && slot->loc.c <= 4);
+            ++mm2s;
+        }
+        assert(mm2s == 8);
+        std::optional<TypeBasedTileLoc> loc(TypeBasedTileLoc{TileType::Core, Point{0, 1}});
+        assert(!dedicated->freeShimNoc(loc, DMADIRECTION::MM2S, 200));
+        assert(!dedicated->inPartition(3, 0) && dedicated->inPartition(3, 1));
+    }
+
     auto res = makeResource("Gen2");          // default variant
 
     assert(res->getRows()    == 11);

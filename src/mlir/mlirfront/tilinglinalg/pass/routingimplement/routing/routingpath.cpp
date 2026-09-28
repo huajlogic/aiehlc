@@ -83,6 +83,7 @@ Point RoutingPath::nearestTreePoint(const Point& dst) const {
 bool RoutingPath::connectAvailable(Point start, Point goal) {
     int portNum;
     if (isWall(start.r,start.c)||isWall(goal.r,goal.c)) return false;
+    if (!resmgr_->inPartition(goal.r, goal.c)) return false;
     return resmgr_->linkAvailable(start, goal, portNum);
 }
 
