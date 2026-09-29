@@ -48,6 +48,8 @@ jobs:
             --platform sim --aie-version 5 --sim-tiles "0:3" \
             --runtime-source-file example/tileprogram/ccode/passthrough_sim.cc
 
+          # Pass/fail only; do not keep the sim up for the debug socket.
+          export AIEHLC_DBG_HOLD_SEC=0
           set +e
           bash script/runsim.sh aout/worklocal 2>&1 | tee sim-passthrough.log
           sim_rc=${PIPESTATUS[0]}
