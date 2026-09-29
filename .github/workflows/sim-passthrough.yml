@@ -1,8 +1,4 @@
-# Build aiehlc, then compile and simulate the 1x1 tilinglinalg passthrough
-# (example/tileprogram/ccode/passthrough_sim.cc).
-#
-# Runs on the same self-hosted Linux runner as sim-tutorial.yml; see that file
-# for the Vitis / LLVM prerequisites.
+# Tilinglinalg simulator check for example/tileprogram/ccode/passthrough_sim.cc.
 name: Tilinglinalg flow sim
 
 on:
@@ -23,50 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build aiehlc, compile passthrough, run simulator
-        run: |
-          set -euo pipefail
-
-          llvm_dir="${LLVM_INSTALL_DIR:-}"
-          if [ -z "${llvm_dir}" ] || [[ "${llvm_dir}" == /Users/* ]]; then
-            if [ -x /scratch/staff/huaj/llvm-project/build/bin/llvm-config ]; then
-              llvm_dir=/scratch/staff/huaj/llvm-project/build
-            else
-              echo "Set LLVM_INSTALL_DIR to an LLVM build with MLIR, Clang, and RTTI."
-              exit 1
-            fi
-          fi
-
-          # setup.sh exports the Vitis toolchain, then overwrites LLVM_INSTALL_DIR.
-          source script/setup.sh
-          export LLVM_INSTALL_DIR="${llvm_dir}"
-
-          cmake -S . -B build -DLLVM_INSTALL_DIR="${LLVM_INSTALL_DIR}" -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target aiehlc
-
-          source script/aiehlc.sh --debug-output \
-            --platform sim --aie-version 5 --sim-tiles "0:3" \
-            --runtime-source-file example/tileprogram/ccode/passthrough_sim.cc
-
-          # Pass/fail only; do not keep the sim up for the debug socket.
-          export AIEHLC_DBG_HOLD_SEC=0
-          set +e
-          bash script/runsim.sh aout/worklocal 2>&1 | tee sim-passthrough.log
-          sim_rc=${PIPESTATUS[0]}
-          set -e
-
-          if ! grep -q "\[passthrough\] PASS:" sim-passthrough.log \
-              || ! grep -q "Kernel test passed!" sim-passthrough.log \
-              || ! grep -q "Simulation Finished, Sim result: 0" sim-passthrough.log; then
-            echo "Simulator log did not show a passing tilinglinalg passthrough run."
-            exit 1
-          fi
-          exit "${sim_rc}"
+      - name: Build, simulate, check result
+        run: bash script/ci/pr_sim_test.sh passthrough
 
       - name: Upload simulator log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sim-passthrough-log
-          path: sim-passthrough.log
+          path: ci-public.log
           if-no-files-found: ignore
