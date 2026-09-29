@@ -118,7 +118,7 @@ export LLVM_AIE_PATH="${AIEHLC_DIR}/thirdparty/llvm-aie"
 popd
 
 #set up the vitis path
-if [ -n "$XILINX_VITIS" ]; then
+if [ -n "${XILINX_VITIS:-}" ]; then
     echo "XILINX_VITIS is set to $XILINX_VITIS"
 elif which aiecompiler > /dev/null 2>&1; then
     XILINX_VITIS=$(dirname $(which aiecompiler))/../..
@@ -127,19 +127,29 @@ elif which aiecompiler > /dev/null 2>&1; then
 else
     echo "XILINX_VITIS is not set or aiecompiler not found."
     echo "Trying to source ${VITIS_SETTINGS_PATH}"
-    source $VITIS_SETTINGS_PATH
-    export XILINX_VITIS
+    case $- in
+        *u*) _aiehlc_nounset=1; set +u ;;
+        *) _aiehlc_nounset=0 ;;
+    esac
+    source "$VITIS_SETTINGS_PATH"
+    if [ -n "${XILINX_VITIS:-}" ]; then
+        export XILINX_VITIS
+    fi
+    if [ "${_aiehlc_nounset}" -eq 1 ]; then
+        set -u
+    fi
+    unset _aiehlc_nounset
 fi
 
-echo "XILINX_VITIS: ${XILINX_VITIS}"
+echo "XILINX_VITIS: ${XILINX_VITIS:-}"
 
-if [ -n "$XILINX_VITIS" ]; then
+if [ -n "${XILINX_VITIS:-}" ]; then
     bash "$SCRIPT_DIR/sim/gen_aiesimulator.sh" "$AIEHLC_DIR/aiehlc_aiesimulator" || \
         echo "WARNING: failed to generate aiehlc_aiesimulator launcher."
 fi
 
 #set up the petalinux path
-if [ -n "$PETALINUX" ]; then
+if [ -n "${PETALINUX:-}" ]; then
     echo "PETALINUX is set to $PETALINUX"
 elif [ -d "/proj/petalinux/2025.1/petalinux-v2025.1_daily_latest/tool/petalinux-v2025.1-final" ]; then
     PETALINUX="/proj/petalinux/2025.1/petalinux-v2025.1_daily_latest/tool/petalinux-v2025.1-final"
@@ -148,7 +158,7 @@ elif [ -d "/proj/petalinux/2025.1/petalinux-v2025.1_daily_latest/tool/petalinux-
 else
     echo "PETALINUX is not set or directory does not exist."
 fi
-echo "PETALINUX: ${PETALINUX}"
+echo "PETALINUX: ${PETALINUX:-}"
 
 export LIB_PATH="${XILINX_VITIS}/gnu/aarch64/lin/aarch64-none/x86_64-oesdk-linux/usr/lib"
 export LIB_BASE_PATH="${XILINX_VITIS}/gnu/aarch64/lin/aarch64-none/x86_64-oesdk-linux/lib"
