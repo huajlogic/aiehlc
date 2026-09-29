@@ -57,6 +57,7 @@ USE_LLVMAIE=0
 SKIP_BSP=0
 LOCAL_AIE_RT_REPO=0
 PATH_SET_ONLY=0
+AIE_RT_DEFAULT_REPO="${AIE_RT_REPO:-https://github.com/AMD-AECG-AIENGINE/aie-rt.git}"
 #VITIS_SETTINGS_PATH="/proj/xbuilds/2025.2_0414_1/installs/lin64/HEAD/Vitis/settings64.sh"
 #VITIS_SETTINGS_PATH="/proj/xbuilds/HEAD_qualified_latest/installs/lin64/HEAD/Vitis/settings64.sh"
 VITIS_SETTINGS_PATH="/proj/xbuilds/2026.2_daily_latest/installs/lin64/2026.2/Vitis/settings64.sh"
@@ -176,12 +177,6 @@ unset _gcc_include_base _gcc_version
 export LLVM_INSTALL_DIR=/Users/hua/src/dsamlir/thirdparty/llvm-project/build/
 
 if [ "$SKIP_BSP" -eq 0 ]; then
-    # Clean thirdparty/alib/ when using default BSP generation (not git repo)
-    # This ensures we use Vitis-provided aie-rt headers, not git-cloned ones
-    if [ -d "${AIE_DRIVER_PARENT_DIR}/aie-rt" ]; then
-        echo "Cleaning thirdparty/alib/aie-rt directory for default BSP setup..."
-        rm -rf "${AIE_DRIVER_PARENT_DIR}/aie-rt"
-    fi
     if [ -d "${AIE_DRIVER_PARENT_DIR}/include/" ]; then
         echo "Cleaning thirdparty/alib/include/ directory..."
         rm -rf "${AIE_DRIVER_PARENT_DIR}/include/"
@@ -223,6 +218,9 @@ if [ "$SKIP_BSP" -eq 0 ]; then
     else
         echo "BSPs already exist. Skipping generation."
     fi
+
+    echo "Installing aie-rt headers from ${AIE_RT_DEFAULT_REPO}"
+    aierepo_download_check "${AIE_RT_DEFAULT_REPO}"
 else
     if [ "${PATH_SET_ONLY:-0}" -eq 0 ]; then
         echo "Skipping BSP generation due to --skip-bsp option."

@@ -1,4 +1,5 @@
-# Build aiehlc, compile tutorial/example.cpp for the AIE simulator, and run it.
+# Build aiehlc once, then simulate tutorial/example.cpp and the 1x1
+# tilinglinalg passthrough (example/tileprogram/ccode/passthrough_sim.cc).
 #
 # GitHub-hosted runners cannot see the internal Vitis install (/proj/xbuilds)
 # or the local LLVM/MLIR build, so this job needs a self-hosted Linux runner
@@ -64,10 +65,46 @@ jobs:
           fi
           exit "${sim_rc}"
 
+      - name: Simulate tilinglinalg passthrough
+        run: |
+          set -euo pipefail
+
+          llvm_dir="${LLVM_INSTALL_DIR:-}"
+          if [ -z "${llvm_dir}" ] || [[ "${llvm_dir}" == /Users/* ]]; then
+            if [ -x /scratch/staff/huaj/llvm-project/build/bin/llvm-config ]; then
+              llvm_dir=/scratch/staff/huaj/llvm-project/build
+            else
+              echo "Set LLVM_INSTALL_DIR to an LLVM build with MLIR, Clang, and RTTI."
+              exit 1
+            fi
+          fi
+
+          source script/setup.sh
+          export LLVM_INSTALL_DIR="${llvm_dir}"
+
+          source script/aiehlc.sh --debug-output \
+            --platform sim --aie-version 5 --sim-tiles "0:3" \
+            --runtime-source-file example/tileprogram/ccode/passthrough_sim.cc
+
+          set +e
+          bash script/runsim.sh aout/worklocal 2>&1 | tee sim-passthrough.log
+          sim_rc=${PIPESTATUS[0]}
+          set -e
+
+          if ! grep -q "\[passthrough\] PASS:" sim-passthrough.log \
+              || ! grep -q "Kernel test passed!" sim-passthrough.log \
+              || ! grep -q "Simulation Finished, Sim result: 0" sim-passthrough.log; then
+            echo "Simulator log did not show a passing tilinglinalg passthrough run."
+            exit 1
+          fi
+          exit "${sim_rc}"
+
       - name: Upload simulator log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sim-tutorial-log
-          path: sim-tutorial.log
+          path: |
+            sim-tutorial.log
+            sim-passthrough.log
           if-no-files-found: ignore
