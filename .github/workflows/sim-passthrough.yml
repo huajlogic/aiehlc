@@ -3,7 +3,7 @@
 #
 # Runs on the same self-hosted Linux runner as sim-tutorial.yml; see that file
 # for the Vitis / LLVM prerequisites.
-name: Simulator tilinglinalg passthrough
+name: Tilinglinalg flow sim
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   sim-passthrough:
-    name: Build aiehlc and simulate tilinglinalg passthrough
+    name: Tilinglinalg flow (passthrough_sim.cc)
     runs-on: [self-hosted, linux]
     timeout-minutes: 180
     steps:

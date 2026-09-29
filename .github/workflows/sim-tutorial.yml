@@ -6,7 +6,7 @@
 #   - Vitis on PATH, or the default VITIS_SETTINGS_PATH in script/setup.sh
 #   - an LLVM/MLIR/Clang build with RTTI, via LLVM_INSTALL_DIR
 #   - cmake, ninja, python3, boost, and the gold linker
-name: Simulator tutorial example
+name: Single-kernel flow sim
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   sim-tutorial:
-    name: Build aiehlc and simulate tutorial/example.cpp
+    name: Single-kernel flow (tutorial/example.cpp)
     runs-on: [self-hosted, linux]
     timeout-minutes: 180
     steps:
