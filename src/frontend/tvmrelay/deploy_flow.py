@@ -7,8 +7,9 @@
     ensure_tvm016()  ->  download resnet18-v1-7.onnx  ->  Relay
                      ->  int8 quantize  ->  target="c" codegen
                      ->  per-layer folders  ->  baremetal aarch64 main.elf
+                     ->  CPU reference classification
 
-Six stages, matching the six things this flow has to prove:
+Seven stages, matching the seven things this flow has to prove:
 
 1. **Environment** — ``onnx_compat.ensure_tvm016()`` guarantees TVM 0.16 with a
    working ``tvm.relay`` (Relay was removed in the Relax transition, so the
@@ -41,6 +42,21 @@ Six stages, matching the six things this flow has to prove:
    ``script/hostcompile.sh``. Needs ``source script/setup.sh --path-set-only``
    for the cross toolchain; without it the stage reports and is skipped.
 
+   The image the ELF classifies is baked in as ``input_image.h``: a real photo
+   (the pytorch/hub dog by default, ``--image`` for another) run through the
+   standard ImageNet preprocessing, plus ``imagenet_labels.h`` so the board
+   prints "Samoyed" rather than "class 258". Preprocessing is *called*, not
+   reimplemented -- ``example/model/resnet18py/classify.py:preprocess`` -- so
+   the board and the CPU reference cannot disagree over normalization.
+
+7. **CPU** — classify the same image with onnxruntime on the same folded ONNX
+   and print the top-5. This is the answer the ELF has to reproduce, from an
+   **independent** implementation rather than a second call into the generated
+   C, so matching means the compile path is right rather than self-consistent.
+   The ELF prints the same five lines in the same format, logits included --
+   a class index alone would hide the small numeric drift a miscompiled kernel
+   actually produces.
+
 Two host-specific fixups this flow has to make, both load-bearing:
 
 ``target_has_feature``
@@ -67,6 +83,7 @@ Run::
 
     source script/setup.sh --path-set-only          # for stage 6's toolchain
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py
+    PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --image cat.jpg
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --skip-quantize
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --no-arm
 """
@@ -198,7 +215,7 @@ def stage_env(verbose: bool = True) -> bool:
 
     ok, detail = tvmrelay.tvm016_status()
     if not ok:
-        print(f"[1/6] TVM 0.16 unavailable: {detail}", file=sys.stderr)
+        print(f"[1/7] TVM 0.16 unavailable: {detail}", file=sys.stderr)
         return False
 
     shimmed = _shim_target_features()
@@ -206,10 +223,10 @@ def stage_env(verbose: bool = True) -> bool:
     if verbose:
         import onnx
 
-        print(f"[1/6] env    : tvm {detail} | onnx {onnx.__version__} | "
+        print(f"[1/7] env    : tvm {detail} | onnx {onnx.__version__} | "
               f"llvm {'yes' if has_llvm else 'no'} ({llvm_detail})")
         if shimmed:
-            print(f"[1/6]          shimmed {', '.join(shimmed)} (no-LLVM build)")
+            print(f"[1/7]          shimmed {', '.join(shimmed)} (no-LLVM build)")
     return True
 
 
@@ -223,15 +240,15 @@ def fetch_model(out_dir: Path, url: str = MODEL_URL, verbose: bool = True) -> Pa
     path = out_dir / MODEL_NAME
     if path.exists() and path.stat().st_size > 0:
         if verbose:
-            print(f"[2/6] model  : cached {path} ({path.stat().st_size:,} B)")
+            print(f"[2/7] model  : cached {path} ({path.stat().st_size:,} B)")
         return path
     if verbose:
-        print(f"[2/6] model  : downloading {url}")
+        print(f"[2/7] model  : downloading {url}")
     tmp = path.with_suffix(".part")
     urllib.request.urlretrieve(url, tmp)
     tmp.replace(path)
     if verbose:
-        print(f"[2/6]          saved {path} ({path.stat().st_size:,} B)")
+        print(f"[2/7]          saved {path} ({path.stat().st_size:,} B)")
     return path
 
 
@@ -258,7 +275,7 @@ def prefold_onnx(model_path: Path, verbose: bool = True) -> Path:
     folded = model_path.with_name(FOLDED_NAME)
     if folded.exists() and folded.stat().st_size > 0:
         if verbose:
-            print(f"[2/6] fold   : cached {folded.name}")
+            print(f"[2/7] fold   : cached {folded.name}")
         return folded
 
     import onnxruntime as ort
@@ -275,7 +292,7 @@ def prefold_onnx(model_path: Path, verbose: bool = True) -> Path:
         for node in onnx.load(str(folded)).graph.node:
             counts[node.op_type] = counts.get(node.op_type, 0) + 1
         kept = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-        print(f"[2/6] fold   : BN folded into Conv -> {kept}")
+        print(f"[2/7] fold   : BN folded into Conv -> {kept}")
     return folded
 
 
@@ -296,7 +313,7 @@ def import_relay(model_path: Path, verbose: bool = True):
     )
     mod = relay.transform.InferType()(mod)
     if verbose:
-        print(f"[2/6] relay  : imported | params={len(params)} "
+        print(f"[2/7] relay  : imported | params={len(params)} "
               f"(initializers are inline Constants) | {_op_summary(mod)}")
     return mod, params
 
@@ -339,9 +356,9 @@ def quantize_int8(mod, params, *, global_scale: float = 8.0,
     has_llvm, detail = llvm_status()
     if not has_llvm:
         if verbose:
-            print(f"[3/6] int8   : SKIPPED -- this TVM has no LLVM ({detail})")
+            print(f"[3/7] int8   : SKIPPED -- this TVM has no LLVM ({detail})")
             print(_LLVM_HINT, end="")
-            print("[3/6]          continuing in fp32; stage 4 output is NOT int8")
+            print("[3/7]          continuing in fp32; stage 4 output is NOT int8")
         return mod, False
 
     with relay.quantize.qconfig(
@@ -352,7 +369,7 @@ def quantize_int8(mod, params, *, global_scale: float = 8.0,
     ):
         qmod = relay.quantize.quantize(mod, params)
     if verbose:
-        print(f"[3/6] int8   : quantized (global_scale={global_scale}, "
+        print(f"[3/7] int8   : quantized (global_scale={global_scale}, "
               f"skip_conv_layers={list(skip_conv_layers)}) | {_op_summary(qmod)}")
     return qmod, True
 
@@ -428,8 +445,8 @@ def build_c(mod, params, out_dir: Path, *, opt_level: int = 3, fuse: bool = True
         # `source.count(...)` reports exactly double.
         from frontend.tvmrelay.split_layers import iter_c_functions
         n_fns = sum(1 for _ in iter_c_functions(source))
-        print(f"[4/6] codegen: {c_path} ({len(source):,} chars, {n_fns} kernels)")
-        print(f"[4/6]          {graph_path.name}, {params_path.name} "
+        print(f"[4/7] codegen: {c_path} ({len(source):,} chars, {n_fns} kernels)")
+        print(f"[4/7]          {graph_path.name}, {params_path.name} "
               f"({params_path.stat().st_size:,} B)")
     return c_path
 
@@ -448,7 +465,7 @@ def verify_c(c_path: Path, verbose: bool = True) -> bool:
     cc = shutil.which("gcc") or shutil.which("cc")
     if cc is None:
         if verbose:
-            print("[4/6] verify : skipped (no gcc/cc on PATH)")
+            print("[4/7] verify : skipped (no gcc/cc on PATH)")
         return True
 
     tvm_root = Path(__file__).resolve().parents[3] / "thirdparty" / "tvm-0.16"
@@ -459,11 +476,11 @@ def verify_c(c_path: Path, verbose: bool = True) -> bool:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         first = (proc.stderr.strip().splitlines() or ["(no output)"])[0]
-        print(f"[4/6] verify : FAILED -- emitted C does not compile: {first}",
+        print(f"[4/7] verify : FAILED -- emitted C does not compile: {first}",
               file=sys.stderr)
         return False
     if verbose:
-        print(f"[4/6] verify : {c_path.name} compiles ({cc} -fsyntax-only)")
+        print(f"[4/7] verify : {c_path.name} compiles ({cc} -fsyntax-only)")
     return True
 
 
@@ -471,10 +488,56 @@ def verify_c(c_path: Path, verbose: bool = True) -> bool:
 #  Driver
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Stage 7 — CPU reference classification
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cpu_reference(out_dir: Path, image=None, topk: int = 5,
+                  verbose: bool = True):
+    """Classify the same image on the CPU and print the top-k. Returns it.
+
+    This is the answer the board ELF has to reproduce. It is deliberately an
+    **independent** implementation -- onnxruntime on the same folded ONNX, not
+    a second call into the generated C -- so agreeing means the compile path
+    is right, rather than only self-consistent.
+
+    Compare it against the ELF by eye, or diff the printed logits: the ELF
+    prints the same five lines in the same format. A class index alone would
+    hide a small numeric drift, and drift is what a miscompiled kernel
+    produces.
+    """
+    onnx_path = Path(out_dir) / FOLDED_NAME
+    if not onnx_path.is_file():
+        if verbose:
+            print(f"[7/7] cpu    : skipped -- {onnx_path.name} not found")
+        return None
+    try:
+        from frontend.tvmrelay import image_input
+
+        tensor, path = image_input.preprocess_image(image, verbose=False)
+        labels = image_input.load_labels(verbose=False)
+        top = image_input.classify_reference(tensor, onnx_path, labels,
+                                             topk=topk)
+    except Exception as exc:                     # torch/PIL/onnxruntime absent
+        if verbose:
+            print(f"[7/7] cpu    : skipped -- {type(exc).__name__}: {exc}")
+        return None
+
+    if verbose:
+        print(f"[7/7] cpu    : onnxruntime reference on {Path(path).name}")
+        for rank, idx, name, logit in top:
+            print(f"               {rank}. class={idx:<4d} {name:<30s} "
+                  f"logit={logit:.4f}")
+        print(f"[7/7]          the ELF prints these same lines; "
+              f"top1 must be class {top[0][1]} ({top[0][2]})")
+    return top
+
+
 def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         global_scale: float = 8.0, fuse: bool = True, split: bool = True,
-        flat: bool = False, arm: bool = True, verbose: bool = True) -> dict:
-    """Run all six stages. Returns a dict of what happened."""
+        flat: bool = False, arm: bool = True, image=None,
+        verbose: bool = True) -> dict:
+    """Run all seven stages. Returns a dict of what happened."""
     if not stage_env(verbose=verbose):
         return {"ok": False, "stage": "env"}
 
@@ -485,7 +548,7 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     quantized = False
     if skip_quantize:
         if verbose:
-            print("[3/6] int8   : skipped (--skip-quantize)")
+            print("[3/7] int8   : skipped (--skip-quantize)")
     else:
         mod, quantized = quantize_int8(mod, params, global_scale=global_scale,
                                        verbose=verbose)
@@ -496,12 +559,12 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     layers = None
     if not split:
         if verbose:
-            print("[5/6] split  : skipped (--no-split)")
+            print("[5/7] split  : skipped (--no-split)")
     elif not compiles:
         # Splitting C that does not compile just multiplies the broken file by
         # 22. Fail at the source instead.
         if verbose:
-            print("[5/6] split  : skipped -- the emitted C does not compile")
+            print("[5/7] split  : skipped -- the emitted C does not compile")
     else:
         from frontend.tvmrelay.split_layers import split_layers
         layers = split_layers(c_path, out_dir=out_dir / "layers",
@@ -511,36 +574,38 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
             note = ("all compile" if check == "pass"
                     else f"{len(check)} FAILED" if isinstance(check, list)
                     else str(check))
-            print(f"[5/6] split  : {layers['layer_count']} layers -> "
+            print(f"[5/7] split  : {layers['layer_count']} layers -> "
                   f"{out_dir / 'layers'}/ ({note})")
             # One folder per layer, already in execution order -- just show the
             # first few so the ordering is visible at a glance.
             key = "path" if flat else "dir"
             shown = [f"{e[key]}{'' if flat else '/'}"
                      for e in layers["layers"][:4]]
-            print(f"[5/6]          {', '.join(shown)}, ... "
+            print(f"[5/7]          {', '.join(shown)}, ... "
                   f"({layers['layer_count']} in execution order)")
 
     elf = None
     if not arm:
         if verbose:
-            print("[6/6] arm    : skipped (--no-arm)")
+            print("[6/7] arm    : skipped (--no-arm)")
     elif not compiles:
         if verbose:
-            print("[6/6] arm    : skipped -- the emitted C does not compile")
+            print("[6/7] arm    : skipped -- the emitted C does not compile")
     else:
         from frontend.tvmrelay.arm_build import build_arm_elf
 
         if verbose:
-            print("[6/6] arm    : linking baremetal aarch64 ELF")
+            print("[6/7] arm    : linking baremetal aarch64 ELF")
         built = build_arm_elf(out_dir, c_name=Path(c_path).name,
-                              verbose=verbose)
+                              image=image, verbose=verbose)
         if built.get("ok"):
             elf = built["elf"]
         elif verbose and built.get("stderr"):
-            print(f"[6/6]          {built['reason']}:")
+            print(f"[6/7]          {built['reason']}:")
             for line in built["stderr"].strip().splitlines()[:5]:
                 print(f"              {line}")
+
+    cpu = cpu_reference(out_dir, image=image, verbose=verbose)
 
     if verbose:
         kind = "int8" if quantized else "fp32"
@@ -551,7 +616,8 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     return {"ok": compiles, "quantized": quantized, "c_path": str(c_path),
             "out_dir": str(out_dir), "fused": fuse,
             "layer_count": layers["layer_count"] if layers else None,
-            "elf": elf}
+            "elf": elf, "cpu_top1": (cpu[0][1] if cpu else None),
+            "cpu_top": cpu}
 
 
 def main(argv=None) -> int:
@@ -572,12 +638,15 @@ def main(argv=None) -> int:
                          "op (a real relu.c) instead of per fused group")
     ap.add_argument("--no-arm", action="store_true",
                     help="skip stage 6 (do not link the aarch64 board ELF)")
+    ap.add_argument("--image", default=None,
+                    help="image path or URL to classify "
+                         "(default: the pytorch/hub dog.jpg sample)")
     args = ap.parse_args(argv)
 
     result = run(args.out_dir, skip_quantize=args.skip_quantize,
                  global_scale=args.global_scale, fuse=not args.no_fuse,
                  split=not args.no_split, flat=args.flat,
-                 arm=not args.no_arm)
+                 arm=not args.no_arm, image=args.image)
     return 0 if result.get("ok") else 1
 
 

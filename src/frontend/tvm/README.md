@@ -6,6 +6,14 @@ through **TVM Relay**, walks the fused graph to recover a per-tile AIE launch
 plan, and emits the same kernel launches the hand-written
 `example/tileprogram/design/triton/resnet18_triton.py` produces.
 
+> **Which TVM is installed matters.** This package was written against
+> Relax-era TVM (0.25+), where `tvm.relay` no longer exists — which is why
+> `relay_import.tvm_available()` returns False on every run and `walk.build_plan`
+> always falls back to `model.layer_plan()`. The sibling
+> [`src/frontend/tvmrelay`](../tvmrelay/README.md) targets **TVM 0.16** for a
+> real Relay path. One environment holds one TVM, so **the two are mutually
+> exclusive**; `tvmrelay/setup_tvm016.py --verify-only` reports which is live.
+
 ## Pipeline
 
 ```

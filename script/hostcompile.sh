@@ -138,6 +138,13 @@ if [ ${#MULTI_KERNEL_FILES[@]} -gt 0 ]; then
     # Remove temporary symlink
     rm -f "${WORKLOCAL_DIR}/kernel.cc"
     popd
+elif [ ! -f "${WORKLOCAL_DIR}/kernel.cc" ]; then
+    # Host-only mode: no kernel_<name>.cc and no kernel.cc. This is a legitimate
+    # build (e.g. the TVM frontend with AIE offload disabled — every op is
+    # force-offloaded to the CPU backend, so there is nothing for xchesscc to
+    # compile), not a missing-file error. Link host.cc with no embedded kernel.
+    echo "[Host-only] No kernel sources found; linking host.cc without an AIE kernel"
+    KERNEL_OBJ_LIST=""
 else
     # Single-kernel mode (backward compat)
     # Auto-detect kernel function name from kernel.cc's "// kernel_decl <name>" comment
