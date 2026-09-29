@@ -79,15 +79,99 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
     klog("TRA1", (int32_t)aie::get_arg_total_rounds_in_dim(1, win_a));
 #endif
 
-    int8_t all_A[tile_rows * eff_k];
 #ifdef MATMUL_LARGE_MMUL
-    int32_t accum[tile_rows * tile_cols];
-    alignas(aie::vector_decl_align) int8_t a_block[64];
-    alignas(aie::vector_decl_align) int8_t b_block[64];
-    alignas(aie::vector_decl_align) int32_t c_block[64];
-#else
-    int16_t accum[tile_rows * tile_cols];
+    const int k_tiles = eff_k / 8;
+    const int m_tiles = tile_rows / 8;
+    const int n_tiles = tile_cols / 8;
+    const int b_strips = cols_per_round / 8;
+    alignas(aie::vector_decl_align) int8_t a_pack[tile_rows * eff_k];
+    alignas(aie::vector_decl_align) int8_t b_strip[eff_k * 8];
+    alignas(aie::vector_decl_align) int32_t acc[tile_rows * tile_cols];
+    alignas(aie::vector_decl_align) int8_t c_tile[64];
+    alignas(4) int8_t local_out[tile_rows * tile_cols];
+
+    for (int mr = 0; mr < m_rounds * n_rounds; mr++) {
+        for (int kr = 0; kr < k_rounds; kr++) {
+            const bool first = (kr == 0);
+            const bool last = (kr == k_rounds - 1);
+            for (int ra = 0; ra < num_a_rounds; ra++) {
+                const uint32_t *A_w = (const uint32_t *)acquire_input_window(win_a);
+#ifndef DEBUG_NOCOMPUTE
+                for (int r = 0; r < rows_per_round; r++) {
+                    const int row = ra * rows_per_round + r;
+                    uint32_t *dst = (uint32_t *)(a_pack + (row >> 3) * k_tiles * 64 + (row & 7) * 8);
+                    const uint32_t *src = A_w + r * (eff_k / 4);
+                    for (int kt = 0; kt < k_tiles; kt++) {
+                        dst[kt * 16] = src[kt * 2];
+                        dst[kt * 16 + 1] = src[kt * 2 + 1];
+                    }
+                }
 #endif
+                release_input_window(win_a);
+            }
+
+            for (int rb = 0; rb < num_b_rounds; rb++) {
+                const uint32_t *B_w = (const uint32_t *)acquire_input_window(win_b);
+#ifndef DEBUG_NOCOMPUTE
+                for (int jt = 0; jt < b_strips; jt++) {
+                    for (int kt = 0; kt < k_tiles; kt++) {
+                        uint32_t *dst = (uint32_t *)(b_strip + kt * 64);
+                        for (int j = 0; j < 8; j++) {
+                            const uint32_t *src = B_w + (jt * 8 + j) * (eff_k / 4) + kt * 2;
+                            dst[j * 2] = src[0];
+                            dst[j * 2 + 1] = src[1];
+                        }
+                        aie::store_v(b_strip + kt * 64, aie::transpose(aie::load_v<64>(b_strip + kt * 64), 8, 8));
+                    }
+                    const int ct = rb * b_strips + jt;
+                    for (int it = 0; it < m_tiles; it++) {
+                        int32_t *acc_t = acc + (it * n_tiles + ct) * 64;
+                        const int8_t *a_t = a_pack + it * k_tiles * 64;
+                        aie::mmul<8, 8, 8, int8, int8> block;
+                        if (first) {
+                            block.mul(aie::load_v<64>(a_t), aie::load_v<64>(b_strip));
+                        } else {
+                            block = aie::mmul<8, 8, 8, int8, int8>(aie::load_v<64>(acc_t));
+                            block.mac(aie::load_v<64>(a_t), aie::load_v<64>(b_strip));
+                        }
+                        for (int kt = 1; kt < k_tiles; kt++)
+                            block.mac(aie::load_v<64>(a_t + kt * 64), aie::load_v<64>(b_strip + kt * 64));
+                        if (!last) {
+                            aie::store_v(acc_t, block.to_vector<int32>());
+                            continue;
+                        }
+                        const auto c32 = block.to_vector<int32>();
+                        for (int h = 0; h < 2; h++) {
+                            aie::accum<acc32, 32> sat;
+                            sat.from_vector(aie::min(aie::max(c32.extract<32>(h), (int32_t)-128), (int32_t)127));
+                            aie::store_v(c_tile + h * 32, sat.to_vector<int8>(0));
+                        }
+                        const uint32_t *ct_w = (const uint32_t *)c_tile;
+                        for (int i = 0; i < 8; i++) {
+                            uint32_t *o = (uint32_t *)(local_out + (it * 8 + i) * tile_cols + ct * 8);
+                            o[0] = ct_w[i * 2];
+                            o[1] = ct_w[i * 2 + 1];
+                        }
+                    }
+                }
+#endif
+                release_input_window(win_b);
+            }
+        }
+
+        for (int rc = 0; rc < num_c_rounds; rc++) {
+            uint32_t *out = (uint32_t *)acquire_output_window(win_c);
+#ifndef DEBUG_NOCOMPUTE
+            const uint32_t *src = (const uint32_t *)(local_out + rc * buf_sz_c);
+            for (int w = 0; w < buf_sz_c / 4; w++)
+                out[w] = src[w];
+#endif
+            release_output_window(win_c);
+        }
+    }
+#else
+    int8_t all_A[tile_rows * eff_k];
+    int16_t accum[tile_rows * tile_cols];
     int8_t local_out[tile_rows * tile_cols];
 
     for (int mr = 0; mr < m_rounds * n_rounds; mr++) {
@@ -115,35 +199,6 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
             for (int rb = 0; rb < num_b_rounds; rb++) {
                 int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
 #ifndef DEBUG_NOCOMPUTE
-#ifdef MATMUL_LARGE_MMUL
-                for (int i0 = 0; i0 < tile_rows; i0 += 8) {
-                    for (int j0 = 0; j0 < cols_per_round; j0 += 8) {
-                        aie::mmul<8, 8, 8, int8, int8> block;
-                        for (int k0 = 0; k0 < eff_k; k0 += 8) {
-                            for (int i = 0; i < 8; i++) {
-                                for (int k = 0; k < 8; k++)
-                                    a_block[i * 8 + k] = all_A[(i0 + i) * eff_k + k0 + k];
-                            }
-                            for (int k = 0; k < 8; k++) {
-                                for (int j = 0; j < 8; j++)
-                                    b_block[k * 8 + j] = B_ptr[(j0 + j) * eff_k + k0 + k];
-                            }
-                            auto av = aie::load_v<64>(a_block);
-                            auto bv = aie::load_v<64>(b_block);
-                            if (k0 == 0)
-                                block.mul(av, bv);
-                            else
-                                block.mac(av, bv);
-                        }
-                        aie::store_v(c_block, block.to_vector<int32>());
-                        for (int i = 0; i < 8; i++) {
-                            for (int j = 0; j < 8; j++) {
-                                accum[(i0 + i) * tile_cols + rb * cols_per_round + j0 + j] += c_block[i * 8 + j];
-                            }
-                        }
-                    }
-                }
-#else
                 for (int i = 0; i < tile_rows; i++) {
                     for (int j = 0; j < cols_per_round; j++) {
                         int16_t sum = 0;
@@ -153,7 +208,6 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
                         accum[i * tile_cols + rb * cols_per_round + j] += sum;
                     }
                 }
-#endif
 #endif
 
 #if DEBUG_OUTPUT_ORDER
@@ -166,11 +220,7 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
 
 #ifndef DEBUG_NOCOMPUTE
         for (int i = 0; i < tile_rows * tile_cols; i++) {
-#ifdef MATMUL_LARGE_MMUL
-            int32_t val = accum[i];
-#else
             int16_t val = accum[i];
-#endif
             if (val > 127)
                 val = 127;
             else if (val < -128)
@@ -195,6 +245,7 @@ __global__(matmul_policy) void matmul(aie::port<input_window_int8 *, RowBA> win_
             release_output_window(win_c);
         }
     }
+#endif
 }
 
 __global__ void mul2(aie::port<input_window_int8 *, RowBA> win_a, aie::port<input_window_int8 *, ColBB> win_b,

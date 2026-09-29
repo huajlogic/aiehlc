@@ -1770,7 +1770,8 @@ after_host_emit:
 
         if (!allocations.empty()) {
             TilingBcf bcf;
-            bcf.setStack(0x70000, 0x2800);
+            constexpr uint32_t kStackBase = 0x70000;
+            bcf.setStack(kStackBase, allocator.getBaseAddr() - kStackBase);
             bcf.addReservedDMB(0x40000, 0x10000);
             // This crashes the simulator, commenting out for now
             // bcf.addReservedDMB(0x7F800, 0x800);
