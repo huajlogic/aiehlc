@@ -1,12 +1,9 @@
-# Build aiehlc, then compile and simulate tutorial/example.cpp.
+# Build aiehlc, then compile and simulate the 1x1 tilinglinalg passthrough
+# (example/tileprogram/ccode/passthrough_sim.cc).
 #
-# GitHub-hosted runners cannot see the internal Vitis install (/proj/xbuilds)
-# or the local LLVM/MLIR build, so this job needs a self-hosted Linux runner
-# that already has:
-#   - Vitis on PATH, or the default VITIS_SETTINGS_PATH in script/setup.sh
-#   - an LLVM/MLIR/Clang build with RTTI, via LLVM_INSTALL_DIR
-#   - cmake, ninja, python3, boost, and the gold linker
-name: Simulator tutorial example
+# Runs on the same self-hosted Linux runner as sim-tutorial.yml; see that file
+# for the Vitis / LLVM prerequisites.
+name: Simulator tilinglinalg passthrough
 
 on:
   workflow_dispatch:
@@ -15,18 +12,18 @@ on:
     branches: [main, master]
 
 concurrency:
-  group: sim-tutorial-${{ github.ref }}
+  group: sim-passthrough-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  sim-tutorial:
-    name: Build aiehlc and simulate tutorial/example.cpp
+  sim-passthrough:
+    name: Build aiehlc and simulate tilinglinalg passthrough
     runs-on: [self-hosted, linux]
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build aiehlc, compile example, run simulator
+      - name: Build aiehlc, compile passthrough, run simulator
         run: |
           set -euo pipefail
 
@@ -49,17 +46,17 @@ jobs:
 
           source script/aiehlc.sh --debug-output \
             --platform sim --aie-version 5 --sim-tiles "0:3" \
-            --runtime-source-file tutorial/example.cpp
+            --runtime-source-file example/tileprogram/ccode/passthrough_sim.cc
 
           set +e
-          bash script/runsim.sh aout 2>&1 | tee sim-tutorial.log
+          bash script/runsim.sh aout/worklocal 2>&1 | tee sim-passthrough.log
           sim_rc=${PIPESTATUS[0]}
           set -e
 
-          if ! grep -q "Sucess: CPU result matches AIE." sim-tutorial.log \
-              || ! grep -q "Kernel test passed!" sim-tutorial.log \
-              || ! grep -q "Simulation Finished, Sim result: 0" sim-tutorial.log; then
-            echo "Simulator log did not show a passing tutorial/example.cpp run."
+          if ! grep -q "\[passthrough\] PASS:" sim-passthrough.log \
+              || ! grep -q "Kernel test passed!" sim-passthrough.log \
+              || ! grep -q "Simulation Finished, Sim result: 0" sim-passthrough.log; then
+            echo "Simulator log did not show a passing tilinglinalg passthrough run."
             exit 1
           fi
           exit "${sim_rc}"
@@ -68,6 +65,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sim-tutorial-log
-          path: sim-tutorial.log
+          name: sim-passthrough-log
+          path: sim-passthrough.log
           if-no-files-found: ignore
