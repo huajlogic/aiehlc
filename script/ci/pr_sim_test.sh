@@ -48,7 +48,7 @@ case "$mode" in
         label="single-kernel tutorial/example.cpp"
         sim_dir="aout"
         src="tutorial/example.cpp"
-        tiles="4:2"
+        tiles="4:4"
         markers=(
             "Sucess: CPU result matches AIE."
             "Kernel test passed!"
