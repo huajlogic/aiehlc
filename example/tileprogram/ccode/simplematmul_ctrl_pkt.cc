@@ -395,14 +395,16 @@ int main() {
     {
         unsigned long long ph[4] = {0, 0, 0, 0};
         unsigned int phc[4] = {0, 0, 0, 0};
-        unsigned long long wio = 0ULL, kelf = 0ULL, krst = 0ULL;
-        unsigned int wion = 0U, kelfn = 0U, krstn = 0U;
+        unsigned long long wio = 0ULL, kelf = 0ULL, krst = 0ULL, plan = 0ULL, sync = 0ULL, pmap = 0ULL;
+        unsigned int wion = 0U, kelfn = 0U, krstn = 0U, pmapn = 0U;
         __Runtime_phase_cycles(ph, phc);
         __Runtime_wait_io_cycles(&wio, &wion);
         __Runtime_kload_split_cycles(&kelf, &kelfn, &krst, &krstn);
-        printf(
-            "[PERF] variant=ctrl_pkt kload=%llu elf=%llu rst=%llu bdcfg=%llu coreen=%llu startio=%llu wait_io=%llu\n",
-            ph[0], kelf, krst, ph[1], ph[2], ph[3], wio);
+        __Runtime_setup_split_cycles(&plan, NULL, &sync, NULL);
+        __Runtime_pmap_print_cycles(&pmap, &pmapn);
+        printf("[PERF] variant=ctrl_pkt sync=%llu plan=%llu kload=%llu elf=%llu rst=%llu bdcfg=%llu coreen=%llu "
+               "startio=%llu wait_io=%llu pmap_print=%llu pmap_lines=%u\n",
+               sync, plan, ph[0], kelf, krst, ph[1], ph[2], ph[3], wio, pmap, pmapn);
     }
 #ifndef DEBUG_NOCOMPUTE
     int result = verify_matmul(A, B, C);
@@ -411,13 +413,16 @@ int main() {
     printf("test end=----------------------------------%.3f ms\n", elapsed_ms);
 #endif
     {
-        unsigned long long ph[4] = {0, 0, 0, 0}, wio = 0ULL, kelf = 0ULL, krst = 0ULL;
+        unsigned long long ph[4] = {0, 0, 0, 0}, wio = 0ULL, kelf = 0ULL, krst = 0ULL, plan = 0ULL, sync = 0ULL;
+        unsigned long long pmap = 0ULL;
         __Runtime_phase_cycles(ph, NULL);
         __Runtime_wait_io_cycles(&wio, NULL);
         __Runtime_kload_split_cycles(&kelf, NULL, &krst, NULL);
-        printf("[FINAL_PERF] wall_ms=%.3f kload=%llu elf=%llu rst=%llu bdcfg=%llu coreen=%llu startio=%llu "
-               "wait_io=%llu\n",
-               elapsed_ms, ph[0], kelf, krst, ph[1], ph[2], ph[3], wio);
+        __Runtime_setup_split_cycles(&plan, NULL, &sync, NULL);
+        __Runtime_pmap_print_cycles(&pmap, NULL);
+        printf("[FINAL_PERF] wall_ms=%.3f sync=%llu plan=%llu kload=%llu elf=%llu rst=%llu bdcfg=%llu coreen=%llu "
+               "startio=%llu wait_io=%llu pmap_print=%llu\n",
+               elapsed_ms, sync, plan, ph[0], kelf, krst, ph[1], ph[2], ph[3], wio, pmap);
     }
     device.free(A);
     device.free(B);

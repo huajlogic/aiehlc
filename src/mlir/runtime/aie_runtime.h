@@ -371,6 +371,9 @@ void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls);
 void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls);
 void __Runtime_kload_split_cycles(unsigned long long *elf_cyc, unsigned int *elf_n, unsigned long long *rst_cyc,
                                   unsigned int *rst_n);
+void __Runtime_setup_split_cycles(unsigned long long *plan_cyc, unsigned int *plan_n, unsigned long long *sync_cyc,
+                                  unsigned int *sync_n);
+void __Runtime_pmap_print_cycles(unsigned long long *cyc, unsigned int *lines);
 
 // Core enable (reference: aeg_runtime_api.cpp graph_api::run)
 void __Runtime_core_run(XAie_DevInst *dev, XAie_LocType *tiles, uint32_t num_tiles);
@@ -665,8 +668,11 @@ void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, 
 // equivalent to __Runtime_core_trace_begin_dma(dev,col,row,AIE_TRACE_DMA_S2MM,0).
 void __Runtime_core_trace_begin_dma(XAie_DevInst *dev, uint8_t col, uint8_t row, int mem_dma_kind, uint8_t mem_dma_ch);
 
+void __Runtime_core_trace_app_begin(XAie_DevInst *dev);
+
 // Start host<->AIE time correlation for the tiles armed by
-// __Runtime_core_trace_begin. Inits a process-global AieTraceProfile, records
+// __Runtime_core_trace_begin. Inits a process-global AieTraceProfile (unless
+// __Runtime_core_trace_app_begin already opened it), records
 // the host clock (cps) and anchor0 (host time + each armed tile's AIE core
 // timer). Call AFTER all __Runtime_core_trace_begin calls and just BEFORE the
 // cores run (before __Runtime_launch_kernel_group). When present, the paired
@@ -677,9 +683,9 @@ void __Runtime_core_trace_begin_dma(XAie_DevInst *dev, uint8_t col, uint8_t row,
 void __Runtime_core_trace_sync_begin(XAie_DevInst *dev);
 
 // Record one host phase event (iter, phase name) into the auto-injected
-// core-trace session's process-global profile. Captures the host clock now.
-// No-op unless __Runtime_core_trace_sync_begin has armed the correlated session
-// (so it is safe to call unconditionally from generated host code).
+// core-trace session's process-global profile. Captures the session clock now.
+// No-op unless __Runtime_core_trace_app_begin or _sync_begin opened the
+// correlated session (so it is safe to call unconditionally from generated host code).
 void __Runtime_core_trace_event(XAie_DevInst *dev, int iter, const char *phase);
 
 // Read back, decode and dump every tile armed by __Runtime_core_trace_begin.
@@ -999,6 +1005,7 @@ typedef struct __Runtime_CtrlRowFabric_s {
     // stateless w.r.t. the caller). @txn_row < 0 => whole-array broadcast;
     // @txn_row >= 0 => row-multicast to that physical row.
     int txn_row;
+    uint8_t pmap_shim_seen;
 } __Runtime_CtrlRowFabric;
 
 // Translate a planner op list into XAie stream-switch calls on @dev. Returns the

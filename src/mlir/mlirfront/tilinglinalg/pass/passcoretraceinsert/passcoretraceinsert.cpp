@@ -47,10 +47,16 @@ static void emitTraceSyncBegin(OpBuilder &builder, Operation *beforeOp, Value de
 }
 
 // Emit one emitc.call_opaque "__Runtime_core_trace_end"(dev) before `beforeOp`.
-static void emitTraceEnd(OpBuilder &builder, Operation *beforeOp, Value dev) {
+static Operation *emitTraceEnd(OpBuilder &builder, Operation *beforeOp, Value dev) {
     builder.setInsertionPoint(beforeOp);
-    builder.create<emitc::CallOpaqueOp>(beforeOp->getLoc(), TypeRange{}, "__Runtime_core_trace_end", nullptr, nullptr,
-                                        ValueRange{dev});
+    return builder.create<emitc::CallOpaqueOp>(beforeOp->getLoc(), TypeRange{}, "__Runtime_core_trace_end", nullptr,
+                                               nullptr, ValueRange{dev});
+}
+
+static void emitAppBegin(OpBuilder &builder, Block &entry, Value dev) {
+    builder.setInsertionPoint(&entry.front());
+    builder.create<emitc::CallOpaqueOp>(entry.front().getLoc(), TypeRange{}, "__Runtime_core_trace_app_begin", nullptr,
+                                        nullptr, ValueRange{dev});
 }
 
 // Create an emitc.constant of type `const char *` rendering the C string
@@ -110,6 +116,62 @@ static bool isCall(Operation *op, StringRef name) {
     return callOp && callOp.getCallee() == name;
 }
 
+static Operation *findFirstCall(emitc::FuncOp func, StringRef prefix) {
+    Operation *found = nullptr;
+    func.walk([&](emitc::CallOpaqueOp callOp) {
+        if (!found && callOp.getCallee().starts_with(prefix))
+            found = callOp.getOperation();
+    });
+    return found;
+}
+
+static Operation *findFirstCallOrVerbatim(emitc::FuncOp func, StringRef prefix) {
+    Operation *found = nullptr;
+    func.walk([&](Operation *op) {
+        if (found)
+            return;
+        if (auto callOp = dyn_cast<emitc::CallOpaqueOp>(op); callOp && callOp.getCallee().starts_with(prefix))
+            found = op;
+        else if (auto vOp = dyn_cast<emitc::VerbatimOp>(op); vOp && vOp.getValue().ltrim().starts_with(prefix))
+            found = op;
+    });
+    return found;
+}
+
+static void emitRoundMarkers(OpBuilder &builder, Block *body, Value dev, Value iterVal) {
+    Operation *firstBd = nullptr;
+    Operation *firstStartio = nullptr;
+    Operation *firstWait = nullptr;
+    Operation *lastWait = nullptr;
+    for (Operation &op : body->getOperations()) {
+        auto callOp = dyn_cast<emitc::CallOpaqueOp>(&op);
+        if (!firstBd && callOp && callOp.getCallee().starts_with("__Runtime_dma_bd_config"))
+            firstBd = &op;
+        if (!firstStartio && isCall(&op, "__Runtime_startio"))
+            firstStartio = &op;
+        if (isCall(&op, "__Runtime_wait")) {
+            if (!firstWait)
+                firstWait = &op;
+            lastWait = &op;
+        }
+    }
+    auto emit = [&](Operation *at, bool placeAfter, StringRef phase) {
+        if (iterVal)
+            emitEvent(builder, at, placeAfter, dev, iterVal, phase);
+        else
+            emitEventC(builder, at, placeAfter, dev, /*iter=*/0, phase);
+    };
+    Operation *iterAt = iterVal ? &body->front() : firstBd;
+    if (iterAt)
+        emit(iterAt, /*placeAfter=*/false, "iter_start");
+    if (firstStartio)
+        emit(firstStartio, /*placeAfter=*/false, "dma_start");
+    if (firstWait)
+        emit(firstWait, /*placeAfter=*/false, "wait_start");
+    if (lastWait)
+        emit(lastWait, /*placeAfter=*/true, "wait_done");
+}
+
 void CoreTraceInsertPass::runOnOperation() {
     if (traceTiles_.empty())
         return; // clean no-op
@@ -141,7 +203,8 @@ void CoreTraceInsertPass::runOnOperation() {
     emitc::CallOpaqueOp teardownOp;
     hostFunc.walk([&](emitc::CallOpaqueOp callOp) {
         StringRef callee = callOp.getCallee();
-        if (callee == "__Runtime_launch_kernel_group" && !launchOp)
+        if ((callee == "__Runtime_launch_kernel_group" || callee == "__Runtime_launch_kernel_group_ctrl") &&
+            !launchOp)
             launchOp = callOp;
         else if (callee == "__Runtime_device_teardown" && !teardownOp)
             teardownOp = callOp;
@@ -158,26 +221,22 @@ void CoreTraceInsertPass::runOnOperation() {
         emitTraceBegin(builder, launchOp.getOperation(), dev, traceTiles_);
         emitTraceSyncBegin(builder, launchOp.getOperation(), dev);
     } else {
-        Block &entry = hostFunc.getBlocks().front();
-        emitTraceBegin(builder, &entry.front(), dev, traceTiles_);
-        emitTraceSyncBegin(builder, &entry.front(), dev);
+        Operation *anchor = &hostFunc.getBlocks().front().front();
+        emitTraceBegin(builder, anchor, dev, traceTiles_);
+        emitTraceSyncBegin(builder, anchor, dev);
     }
 
     // trace_end before device teardown; else before the function terminator.
-    if (teardownOp) {
-        emitTraceEnd(builder, teardownOp.getOperation(), dev);
-    } else {
-        Block &entry = hostFunc.getBlocks().front();
-        emitTraceEnd(builder, entry.getTerminator(), dev);
-    }
+    Block &entry = hostFunc.getBlocks().front();
+    Operation *traceEndOp =
+        emitTraceEnd(builder, teardownOp ? teardownOp.getOperation() : entry.getTerminator(), dev);
 
-    // ---------------------------------------------------------------------
-    // Host phase events. sync_begin (just inserted before launch) arms the
-    // correlated session, so __Runtime_core_trace_event fires from here on.
-    // Once, outside the loop: "launch" right after the kernel-group launch.
-    // ---------------------------------------------------------------------
+    if (Operation *planOp = findFirstCallOrVerbatim(hostFunc, "__Runtime_ctrl_plan_init"))
+        emitEventC(builder, planOp, /*placeAfter=*/false, dev, /*iter=*/-1, "ctrl_plan");
+    if (Operation *kloadOp = findFirstCall(hostFunc, "__Runtime_load_kernel_group"))
+        emitEventC(builder, kloadOp, /*placeAfter=*/false, dev, /*iter=*/-1, "kload");
     if (launchOp)
-        emitEventC(builder, launchOp.getOperation(), /*placeAfter=*/true, dev, /*iter=*/-1, "launch");
+        emitEventC(builder, launchOp.getOperation(), /*placeAfter=*/false, dev, /*iter=*/-1, "launch");
 
     // Collect round loops: each emitc.for whose body DIRECTLY contains a
     // __Runtime_wait call (the per-round wait block). Do not descend into
@@ -191,44 +250,13 @@ void CoreTraceInsertPass::runOnOperation() {
             }
         }
     });
+    for (emitc::ForOp forOp : roundLoops)
+        emitRoundMarkers(builder, forOp.getBody(), dev, forOp.getInductionVar());
+    if (roundLoops.empty())
+        emitRoundMarkers(builder, &entry, dev, Value());
 
-    for (emitc::ForOp forOp : roundLoops) {
-        Value iterVal = forOp.getInductionVar();
-        Block *body = forOp.getBody();
-
-        // iter_start: top of the loop body.
-        emitEvent(builder, &body->front(), /*placeAfter=*/false, dev, iterVal, "iter_start");
-
-        // Scan direct body children for the round's own startio/wait markers.
-        Operation *firstStartio = nullptr;
-        Operation *firstWait = nullptr;
-        Operation *lastWait = nullptr;
-        for (Operation &op : body->getOperations()) {
-            if (!firstStartio && isCall(&op, "__Runtime_startio"))
-                firstStartio = &op;
-            if (isCall(&op, "__Runtime_wait")) {
-                if (!firstWait)
-                    firstWait = &op;
-                lastWait = &op;
-            }
-        }
-
-        // dma_start: before the first startio kick.
-        if (firstStartio)
-            emitEvent(builder, firstStartio, /*placeAfter=*/false, dev, iterVal, "dma_start");
-        // wait_start: before the first wait.
-        if (firstWait)
-            emitEvent(builder, firstWait, /*placeAfter=*/false, dev, iterVal, "wait_start");
-        // wait_done: after the last wait.
-        if (lastWait)
-            emitEvent(builder, lastWait, /*placeAfter=*/true, dev, iterVal, "wait_done");
-    }
-
-    // Fallback for a single-shot schedule (no round loop): emit a "wait_done"
-    // before teardown so the host lane still gets a marker. "launch" already
-    // fired above when a launch anchor exists.
-    if (roundLoops.empty() && teardownOp)
-        emitEventC(builder, teardownOp.getOperation(), /*placeAfter=*/false, dev, /*iter=*/0, "wait_done");
+    emitEventC(builder, traceEndOp, /*placeAfter=*/false, dev, /*iter=*/-1, "app_end");
+    emitAppBegin(builder, entry, dev);
 
     std::cout << "[CoreTraceInsert] injected core trace for " << traceTiles_.size() << " tile(s) into "
               << hostFunc.getName().str() << "; round loops=" << roundLoops.size() << std::endl;

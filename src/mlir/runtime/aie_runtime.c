@@ -70,11 +70,14 @@ static inline unsigned long long __rt_pmccntr(void) {
 static inline unsigned long long __rt_pmccntr(void) { return 0ULL; }
 #endif
 
+static unsigned long long g_prof_excl_cyc = 0ULL;
+static inline unsigned long long __rt_prof_now(void) { return __rt_pmccntr() - g_prof_excl_cyc; }
+
 #if AIEHLC_PROFILING
-#define RT_PROF_TIC() __rt_pmccntr()
+#define RT_PROF_TIC() __rt_prof_now()
 #define RT_PROF_ADD(cyc, n, t0)                                                                                        \
     do {                                                                                                               \
-        (cyc) += (__rt_pmccntr() - (t0));                                                                              \
+        (cyc) += (__rt_prof_now() - (t0));                                                                             \
         (n)++;                                                                                                         \
     } while (0)
 #define RT_PROF_PHASE(ph, t0) __rt_ph_add((ph), (t0))
@@ -115,10 +118,14 @@ static unsigned long long g_bd_gtt_cyc = 0ULL, g_bd_saddr_cyc = 0ULL, g_bd_en_cy
 static unsigned int g_bd_gtt_n = 0U, g_bd_saddr_n = 0U, g_bd_en_n = 0U;
 static unsigned long long g_kl_elf_cyc = 0ULL, g_kl_rst_cyc = 0ULL;
 static unsigned int g_kl_elf_n = 0U, g_kl_rst_n = 0U;
+static unsigned long long g_ctrl_plan_cyc = 0ULL, g_sync_dev_cyc = 0ULL;
+static unsigned int g_ctrl_plan_n = 0U, g_sync_dev_n = 0U;
+static unsigned long long g_pmap_print_cyc = 0ULL;
+static unsigned int g_pmap_print_n = 0U;
 
 #if AIEHLC_PROFILING
 static inline void __rt_ph_add(int ph, unsigned long long t0) {
-    g_ph_cyc[ph] += (__rt_pmccntr() - t0);
+    g_ph_cyc[ph] += (__rt_prof_now() - t0);
     g_ph_calls[ph]++;
 }
 #endif
@@ -194,6 +201,24 @@ void __Runtime_kload_split_cycles(unsigned long long *elf_cyc, unsigned int *elf
         *rst_cyc = g_kl_rst_cyc;
     if (rst_n)
         *rst_n = g_kl_rst_n;
+}
+void __Runtime_setup_split_cycles(unsigned long long *plan_cyc, unsigned int *plan_n, unsigned long long *sync_cyc,
+                                  unsigned int *sync_n) {
+    if (plan_cyc)
+        *plan_cyc = g_ctrl_plan_cyc;
+    if (plan_n)
+        *plan_n = g_ctrl_plan_n;
+    if (sync_cyc)
+        *sync_cyc = g_sync_dev_cyc;
+    if (sync_n)
+        *sync_n = g_sync_dev_n;
+}
+
+void __Runtime_pmap_print_cycles(unsigned long long *cyc, unsigned int *lines) {
+    if (cyc)
+        *cyc = g_pmap_print_cyc;
+    if (lines)
+        *lines = g_pmap_print_n;
 }
 
 static int s_core_perf_probe_valid = 0;
@@ -1288,6 +1313,8 @@ typedef struct {
     uint32_t mask;
     AieTraceProfile *prof;    /* optional sink; NULL = print only */
     const char *const *names; /* active 8-slot name table for this stream */
+    int timed;
+    int quiet;
 } __core_trace_run;
 
 /* Build the '|'-joined slot names of an 8-bit event mask into out[cap]
@@ -1340,6 +1367,10 @@ static void __core_trace_names(const char *const *names, const uint16_t *events,
 static void __core_trace_flush(__core_trace_run *run) {
     if (!run->open)
         return;
+    if (run->quiet) {
+        run->open = 0;
+        return;
+    }
     char names[128];
     /* Live decode keeps the plain "<names>" form (no event-value suffix) so it
      * stays byte-identical to the Python reference model; the [TIMESYNC] profile
@@ -1354,7 +1385,7 @@ static void __core_trace_flush(__core_trace_run *run) {
      * stream may only fill up to CAP minus the slots reserved for streams that
      * have not been decoded yet (fair-share: keeps a chatty core stream from
      * starving the mem stream decoded after it -- see __Runtime_core_trace_decode). */
-    if (run->prof) {
+    if (run->prof && run->timed) {
         AieTraceProfile *p = run->prof;
         uint32_t eff_cap = (p->reserve < AIE_TRACE_PROFILE_CAP) ? (AIE_TRACE_PROFILE_CAP - p->reserve) : 0u;
         if (p->count < eff_cap) {
@@ -1410,7 +1441,8 @@ static void __core_trace_repeat(__core_trace_run *run, uint64_t *cycle, uint32_t
  * *_STALL timeline, labelling event slots with `names`. Factored out of the
  * public entry so a shared buffer can be demuxed by pkt id and each stream
  * decoded with its own slot-name table. */
-static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *const *names, AieTraceProfile *prof) {
+static int __core_trace_decode_group(const __core_trace_ctx *ctx, const char *const *names, AieTraceProfile *prof,
+                                     int quiet) {
     uint64_t total_bits = (uint64_t)ctx->npkts * 7u * 32u;
 
     /* Inner: Event-Time frame stream (AIE2ps Arch Spec, Figure 4-14). */
@@ -1420,6 +1452,7 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
     __core_trace_run run = {0}; /* run-length coalescer for per-cycle events */
     run.prof = prof;            /* optional interval sink */
     run.names = names;          /* this stream's slot-name table */
+    run.quiet = quiet;
 
     while (bitpos + 8u <= total_bits) {
         uint32_t b0 = __core_trace_peek8(ctx, bitpos), v;
@@ -1478,7 +1511,8 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
                     v = __core_trace_bits(ctx, &bitpos, 32u);
                     cycle += (v & 0x3FFFFu);
                     __core_trace_flush(&run);
-                    printf("[aie_runtime] core_trace_decode: STOP @ %llu\n", (unsigned long long)cycle);
+                    if (!quiet)
+                        printf("[aie_runtime] core_trace_decode: STOP @ %llu\n", (unsigned long long)cycle);
                     last_kind = -1;
                 }
             }
@@ -1490,10 +1524,13 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
                 break;
             uint32_t w0 = __core_trace_bits(ctx, &bitpos, 32u);
             uint32_t w1 = __core_trace_bits(ctx, &bitpos, 32u);
-            cycle = ((uint64_t)(w0 & 0x00FFFFFFu) << 32) | w1;
+            uint64_t start_timer = ((uint64_t)(w0 & 0x00FFFFFFu) << 32) | w1;
             __core_trace_flush(&run);
-            printf("[aie_runtime] core_trace_decode: START timer=%llu overrun=%u\n", (unsigned long long)cycle,
-                   (unsigned)((w0 >> 26) & 1u));
+            run.timed = 1;
+            cycle = start_timer;
+            if (!quiet)
+                printf("[aie_runtime] core_trace_decode: START timer=%llu overrun=%u\n", (unsigned long long)cycle,
+                       (unsigned)((w0 >> 26) & 1u));
             last_kind = -1;
         } else { /* Filler (0xFE) / Sync (0xFF) 8b */
             v = __core_trace_bits(ctx, &bitpos, 8u);
@@ -1505,6 +1542,7 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
         }
     }
     __core_trace_flush(&run);
+    return run.timed;
 }
 
 /* Map a stream packet id to its 8-slot event name table: pkt 2 = mem-module DMA
@@ -1512,6 +1550,32 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
  * trace. */
 static const char *const *__core_trace_table_for_id(uint32_t id) {
     return (id == 2u) ? s_mem_trace_slot_name : s_core_trace_slot_name;
+}
+
+static int __core_trace_block_zero(const uint32_t *buf, uint32_t p) {
+    for (uint32_t k = 0; k < 8u; k++) {
+        if (buf[p + k] != 0u)
+            return 0;
+    }
+    return 1;
+}
+
+static uint32_t __core_trace_header_phase(const uint32_t *buf, uint32_t nwords) {
+    uint32_t best = 0, best_hits = 0, hits0 = 0;
+    for (uint32_t k = 0; k < 8u; k++) {
+        uint32_t shape = buf[k] & ~0x1Fu, hits = 0;
+        for (uint32_t p = k; p + 8u <= nwords && !__core_trace_block_zero(buf, p); p += 8u) {
+            if (buf[p] != 0u && (buf[p] & ~0x1Fu) == shape)
+                hits++;
+        }
+        if (k == 0u)
+            hits0 = hits;
+        if (hits > best_hits) {
+            best = k;
+            best_hits = hits;
+        }
+    }
+    return (best_hits >= 2u && best_hits > hits0) ? best : 0u;
 }
 
 void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof) {
@@ -1524,18 +1588,10 @@ void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceP
      * core (pkt 1) and mem (pkt 2) streams in one buffer, so record every
      * packet base; the streams are demuxed by header pkt id (low 5 bits) below.
      * A lone pkt id (incl. legacy id 0) yields a single group == old behavior. */
-    uint32_t whole = nwords - (nwords % 8u);
     uint32_t bases[AIE_TRACE_MAX_PKTS];
     uint32_t npkts = 0;
-    for (uint32_t p = 0; p < whole; p += 8u) {
-        int all_zero = 1;
-        for (uint32_t k = 0; k < 8u; k++) {
-            if (buf[p + k] != 0u) {
-                all_zero = 0;
-                break;
-            }
-        }
-        if (all_zero)
+    for (uint32_t p = __core_trace_header_phase(buf, nwords); p + 8u <= nwords; p += 8u) {
+        if (__core_trace_block_zero(buf, p))
             break;
         if (npkts < AIE_TRACE_MAX_PKTS)
             bases[npkts++] = p;
@@ -1543,15 +1599,28 @@ void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceP
 
     /* Pre-count distinct pkt-id streams present so the profile can reserve a fair
      * share for each stream not yet decoded (see reserve bookkeeping below). */
-    uint32_t nstreams = 0;
+    uint32_t present = 0;
+    for (uint32_t i = 0; i < npkts; i++)
+        present |= 1u << (buf[bases[i]] & 0x1Fu);
+    uint32_t wanted = 0;
     for (uint32_t id = 0; id < 32u; id++) {
+        if (!((present >> id) & 1u))
+            continue;
+        uint32_t gbases[AIE_TRACE_MAX_PKTS];
+        uint32_t gn = 0;
         for (uint32_t i = 0; i < npkts; i++) {
-            if ((buf[bases[i]] & 0x1Fu) == id) {
-                nstreams++;
-                break;
-            }
+            if ((buf[bases[i]] & 0x1Fu) == id)
+                gbases[gn++] = bases[i];
         }
+        __core_trace_ctx ctx = {buf, gbases, gn};
+        if (__core_trace_decode_group(&ctx, __core_trace_table_for_id(id), NULL, 1))
+            wanted |= 1u << id;
     }
+    if (!wanted)
+        wanted = present;
+    uint32_t nstreams = 0;
+    for (uint32_t id = 0; id < 32u; id++)
+        nstreams += (wanted >> id) & 1u;
 
     /* Demux: for each distinct pkt id (0..31, header & 0x1F) build that stream's
      * ordered base list and decode it with the matching slot-name table. Ids are
@@ -1566,14 +1635,14 @@ void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceP
             if ((buf[bases[i]] & 0x1Fu) == id)
                 gbases[gn++] = bases[i];
         }
-        if (gn == 0u)
+        if (gn == 0u || !((wanted >> id) & 1u))
             continue;
         if (prof) {
             uint32_t remaining_after = nstreams - decoded - 1u; /* streams after this one */
             prof->reserve = remaining_after * AIE_TRACE_PROFILE_MIN_PER_STREAM;
         }
         __core_trace_ctx ctx = {buf, gbases, gn};
-        __core_trace_decode_group(&ctx, __core_trace_table_for_id(id), prof);
+        __core_trace_decode_group(&ctx, __core_trace_table_for_id(id), prof, 0);
         decoded++;
     }
     if (prof)
@@ -1832,6 +1901,9 @@ static inline uint64_t __aie_host_now(void) { return 0; }
 static inline uint64_t __aie_host_cps(void) { return 0; }
 #endif
 
+static uint64_t s_trace_host_skew = 0;
+static inline uint64_t __aie_trace_now(void) { return __aie_host_now() - s_trace_host_skew; }
+
 /* Capture one anchor (which=0 before launch, 1 at end) for every armed tile:
  * host-before -> read each armed tile's AIE core timer -> host-after; the
  * anchor's host value is the midpoint, since XAie_ReadTimer has ~us AXI-MM
@@ -1839,7 +1911,7 @@ static inline uint64_t __aie_host_cps(void) { return 0; }
 static void __aie_trace_anchor_all(XAie_DevInst *dev, int which) {
     if (!dev || s_trace_session_n == 0)
         return;
-    uint64_t hb = __aie_host_now();
+    uint64_t hb = __aie_trace_now();
     uint64_t av[AIE_TRACE_SESSION_CAP] = {0};
     for (uint32_t i = 0; i < s_trace_session_n; i++) {
         XAie_LocType core = XAie_TileLoc(s_trace_session[i].col, s_trace_session[i].row);
@@ -1847,7 +1919,7 @@ static void __aie_trace_anchor_all(XAie_DevInst *dev, int which) {
         __Runtime_read_aie_timer(dev, core, &v);
         av[i] = v;
     }
-    uint64_t ha = __aie_host_now();
+    uint64_t ha = __aie_trace_now();
     uint64_t hm = hb + (ha - hb) / 2;
     for (uint32_t i = 0; i < s_trace_session_n; i++) {
         XAie_LocType core = XAie_TileLoc(s_trace_session[i].col, s_trace_session[i].row);
@@ -1860,7 +1932,7 @@ static void __aie_trace_anchor_all(XAie_DevInst *dev, int which) {
 // mem_dma_kind/mem_dma_ch select which tile DMA the memory-module trace unit
 // watches; the _begin/_begin_ch entry points pass the S2MM/0 defaults so their
 // behaviour is unchanged, while _begin_dma threads the pragma-driven selection.
-static void trace_begin_impl(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg, int mem_dma_kind,
+static void trace_begin_body(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg, int mem_dma_kind,
                              uint8_t mem_dma_ch) {
     if (!dev) {
         printf("[aie_runtime] core_trace_begin: NULL dev, ignored\n");
@@ -1924,6 +1996,12 @@ static void trace_begin_impl(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_
     uint32_t read_addr = AIE_TRACE_REGION_BASE + (uint32_t)slot * AIE_TRACE_BUF_LEN;
     uint32_t setup_addr = read_addr | AIE_TRACE_DMA_HI;
 
+    static const uint32_t s_trace_zero[AIE_TRACE_BUF_LEN / 4u] = {0};
+    XAie_LocType mt_loc = XAie_TileLoc(col, (uint8_t)(XAIE_AIE_TILE_ROW_START - 1));
+    if (XAie_DataMemBlockWrite(dev, mt_loc, read_addr, s_trace_zero, AIE_TRACE_BUF_LEN) != XAIE_OK)
+        printf("[aie_runtime] core_trace_begin: clearing trace buffer failed tile(%u,%u)\n", (unsigned)col,
+               (unsigned)row);
+
     XAie_LocType tile = XAie_TileLoc(col, row);
     /* Pass the generated routing resource map when this flow has one so the trace
      * route's strm_ch/s2mm_ch/pkt id dodge the recorded data-plane ports; absent
@@ -1968,6 +2046,13 @@ static void trace_begin_impl(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_
            (unsigned)col, (unsigned)row, (unsigned)slot, (unsigned)strm_ch, (unsigned)s2mm_ch, (unsigned)bdnum,
            mem_dma_kind, (unsigned)mem_dma_ch, strm_port_type_name(ev_port), strm_port_intf_name(ev_intf),
            (unsigned)ev_idx, read_addr);
+}
+
+static void trace_begin_impl(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg, int mem_dma_kind,
+                             uint8_t mem_dma_ch) {
+    uint64_t t0 = __aie_host_now();
+    trace_begin_body(dev, col, row, strm_ch_arg, mem_dma_kind, mem_dma_ch);
+    s_trace_host_skew += __aie_host_now() - t0;
 }
 
 void __Runtime_core_trace_begin(XAie_DevInst *dev, uint8_t col, uint8_t row) {
@@ -2021,6 +2106,14 @@ void __Runtime_core_trace_end_into(XAie_DevInst *dev, AieTraceProfile *prof) {
         s_trace_col_used[c] = 0;
 }
 
+void __Runtime_core_trace_app_begin(XAie_DevInst *dev) {
+    (void)dev;
+    __Runtime_aie_trace_profile_init(&s_trace_sync_prof);
+    __Runtime_aie_trace_profile_set_clock(&s_trace_sync_prof, __aie_host_cps());
+    s_trace_host_skew = 0;
+    s_trace_sync_active = 1;
+}
+
 void __Runtime_core_trace_sync_begin(XAie_DevInst *dev) {
     if (s_trace_session_n == 0)
         return; /* nothing armed: sync stays off, decode-only path unaffected */
@@ -2028,19 +2121,23 @@ void __Runtime_core_trace_sync_begin(XAie_DevInst *dev) {
         printf("[aie_runtime] core_trace_sync_begin: NULL dev; time-sync disabled\n");
         return;
     }
-    __Runtime_aie_trace_profile_init(&s_trace_sync_prof);
-    __Runtime_aie_trace_profile_set_clock(&s_trace_sync_prof, __aie_host_cps());
-    __aie_trace_anchor_all(dev, 0); /* anchor0: just before the cores run */
-    s_trace_sync_active = 1;
+    uint64_t t0 = __aie_host_now();
     printf("[aie_runtime] core_trace_sync_begin: armed %u tile(s), cps=%llu\n", (unsigned)s_trace_session_n,
            (unsigned long long)__aie_host_cps());
+    s_trace_host_skew += __aie_host_now() - t0;
+    if (!s_trace_sync_active) {
+        __Runtime_aie_trace_profile_init(&s_trace_sync_prof);
+        __Runtime_aie_trace_profile_set_clock(&s_trace_sync_prof, __aie_host_cps());
+    }
+    __aie_trace_anchor_all(dev, 0); /* anchor0: just before the cores run */
+    s_trace_sync_active = 1;
 }
 
 void __Runtime_core_trace_event(XAie_DevInst *dev, int iter, const char *phase) {
     (void)dev;
     if (!s_trace_sync_active)
         return;
-    __Runtime_aie_trace_profile_event(&s_trace_sync_prof, iter, phase, __aie_host_now());
+    __Runtime_aie_trace_profile_event(&s_trace_sync_prof, iter, phase, __aie_trace_now());
 }
 
 void __Runtime_core_trace_end(XAie_DevInst *dev) {
@@ -2053,6 +2150,7 @@ void __Runtime_core_trace_end(XAie_DevInst *dev) {
         __aie_trace_anchor_all(dev, 1); /* anchor1: cores have finished */
         __Runtime_core_trace_end_into(dev, &s_trace_sync_prof);
         __Runtime_aie_trace_profile_dump(&s_trace_sync_prof);
+        printf("[TIMESYNC] excluded host=%llu\n", (unsigned long long)s_trace_host_skew);
         s_trace_sync_active = 0;
         return;
     }
@@ -2514,6 +2612,7 @@ void __Runtime_perfcnt_read_mm2s_bd_finished_partition(XAie_DevInst *dev, uint8_
 }
 
 void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size) {
+    unsigned long long __sd_t0 = RT_PROF_TIC();
     if (dev) {
         AieRC rc = XAie_MemSyncForDevVAddr(dev, ptr, (uint64_t)size);
         AIEHLC_LOG(printf("[aie_runtime] sync_for_dev(%p, %zu) via VAddr rc=%d\n", ptr, size, rc););
@@ -2521,6 +2620,7 @@ void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size) {
         Xil_DCacheFlushRange((UINTPTR)ptr, size);
         AIEHLC_LOG(printf("[aie_runtime] sync_for_dev(%p, %zu) via DCacheFlushRange\n", ptr, size));
     }
+    RT_PROF_ADD(g_sync_dev_cyc, g_sync_dev_n, __sd_t0);
 }
 
 void __Runtime_sync_for_cpu(XAie_DevInst *dev, void *ptr, size_t size) {
@@ -3758,14 +3858,33 @@ static int rt_ctrl_pmap_on(void) {
  * mask to -1 too, so legacy applogs stay backward compatible. */
 static void rt_pmap_port_ex(uint8_t col, uint8_t row, const char *ptype, uint8_t pidx, const char *dir, const char *ms,
                             uint32_t id, const char *sw, int slot, int arb, int msel, int mask) {
-    if (rt_ctrl_pmap_on())
-        printf("CONTROLPAN-PMAP col=%u row=%u port=%s idx=%u dir=%s ms=%s id=%u sw=%s slot=%d arb=%d msel=%d mask=%d\n",
-               (unsigned)col, (unsigned)row, ptype, (unsigned)pidx, dir, ms, (unsigned)id, sw, slot, arb, msel, mask);
+    if (!rt_ctrl_pmap_on())
+        return;
+    uint64_t h0 = __aie_host_now();
+    unsigned long long c0 = __rt_pmccntr();
+    printf("CONTROLPAN-PMAP col=%u row=%u port=%s idx=%u dir=%s ms=%s id=%u sw=%s slot=%d arb=%d msel=%d mask=%d\n",
+           (unsigned)col, (unsigned)row, ptype, (unsigned)pidx, dir, ms, (unsigned)id, sw, slot, arb, msel, mask);
+    unsigned long long dc = __rt_pmccntr() - c0;
+    g_pmap_print_cyc += dc;
+    g_prof_excl_cyc += dc;
+    g_pmap_print_n++;
+    s_trace_host_skew += __aie_host_now() - h0;
 }
 
 static void rt_pmap_port(uint8_t col, uint8_t row, const char *ptype, uint8_t pidx, const char *dir, const char *ms,
                          uint32_t id, const char *sw, int slot) {
     rt_pmap_port_ex(col, row, ptype, pidx, dir, ms, id, sw, slot, -1, -1, -1);
+}
+
+static int rt_pmap_shim_first(const __Runtime_CtrlRowFabric *f, unsigned bit) {
+    if (!rt_ctrl_pmap_on())
+        return 0;
+    __Runtime_CtrlRowFabric *m = (__Runtime_CtrlRowFabric *)f;
+    uint8_t mask = (uint8_t)(1U << (bit & 7U));
+    if (m->pmap_shim_seen & mask)
+        return 0;
+    m->pmap_shim_seen |= mask;
+    return 1;
 }
 
 /**
@@ -4174,8 +4293,10 @@ static AieRC rt_ctrl_row_shim_return_route(const __Runtime_CtrlRowFabric *f, int
                (unsigned)f->shim_col, (unsigned)rport, (int)rc);
         return rc;
     }
-    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VRET, "ret", "slave", f->ctrl_id, "circuit", -1);
-    rt_pmap_port(f->shim_col, 0, "SOUTH", rport, "ret", "master", f->ctrl_id, "circuit", -1);
+    if (rt_pmap_shim_first(f, (unsigned)s2mm_ch)) {
+        rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VRET, "ret", "slave", f->ctrl_id, "circuit", -1);
+        rt_pmap_port(f->shim_col, 0, "SOUTH", rport, "ret", "master", f->ctrl_id, "circuit", -1);
+    }
     return XAIE_OK;
 }
 
@@ -4211,7 +4332,7 @@ void __Runtime_ctrl_plan_set_exclusive(__Runtime_CtrlRowFabric *f, int on) {
  * planner. @rows may be given in any row order (bottom-up preferred); the static
  * planner computes the top row so its return head omits the idle RET_NORTH slot.
  * Each chain head must sit on the spine column (col_lo == shim_col). */
-AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
+static AieRC rt_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
                                uint8_t ctrl_id, const __Runtime_CtrlRowChain *rows, uint8_t nrows) {
     if (!f || !dev)
         return XAIE_INVALID_ARGS;
@@ -4243,6 +4364,14 @@ AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, ui
      * is configured (resp_s2mm_ch < 0). */
     if (resp_s2mm_ch >= 0)
         rc = rt_ctrl_row_shim_return_route(f, resp_s2mm_ch);
+    return rc;
+}
+
+AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
+                               uint8_t ctrl_id, const __Runtime_CtrlRowChain *rows, uint8_t nrows) {
+    unsigned long long __cp_t0 = RT_PROF_TIC();
+    AieRC rc = rt_ctrl_plan_init(f, dev, shim_col, resp_s2mm_ch, ctrl_id, rows, nrows);
+    RT_PROF_ADD(g_ctrl_plan_cyc, g_ctrl_plan_n, __cp_t0);
     return rc;
 }
 
@@ -4278,8 +4407,10 @@ static AieRC rt_ctrl_row_shim_entry(const __Runtime_CtrlRowFabric *f, int32_t mm
                (unsigned)f->shim_col, (unsigned)fport, (unsigned)RT_CTRL_VFWD, (int)rc);
         return rc;
     }
-    rt_pmap_port(f->shim_col, 0, "SOUTH", fport, "fwd", "slave", f->ctrl_id, "circuit", -1);
-    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VFWD, "fwd", "master", f->ctrl_id, "circuit", -1);
+    if (rt_pmap_shim_first(f, 2U + (unsigned)mm2s_ch)) {
+        rt_pmap_port(f->shim_col, 0, "SOUTH", fport, "fwd", "slave", f->ctrl_id, "circuit", -1);
+        rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VFWD, "fwd", "master", f->ctrl_id, "circuit", -1);
+    }
     AIEHLC_LOG(printf("[aie_runtime] ctrl_row shim entry OK (%u,0) SOUTH%u->NORTH%u\n", (unsigned)f->shim_col,
                       (unsigned)fport, (unsigned)RT_CTRL_VFWD););
     return rc;

@@ -593,6 +593,7 @@ def _pick_backend(save, want_window):
 # Fraction of the run span a tile event may extend past the host window before
 # it is treated as a garbled trace-decode outlier rather than real activity.
 _XRANGE_MARGIN_FRAC = 1.0
+_XRANGE_POINT_MARGIN_US = 10000.0
 # Percentile clip used only when there is no host lane to anchor the axis.
 _XRANGE_CLIP_LO, _XRANGE_CLIP_HI = 0.01, 0.99
 
@@ -615,11 +616,11 @@ def _robust_xrange(model):
     if not all_x:
         return 0.0, 1.0
     host = host_lane(model)
-    if host is not None and host["events"]:
-        hx = [e["start_us"] for e in host["events"]] + \
-             [e["end_us"] for e in host["events"]]
+    hx = ([e["start_us"] for e in host["events"]] + [e["end_us"] for e in host["events"]]
+          if host is not None else [])
+    if hx:
         h_lo, h_hi = min(hx), max(hx)
-        margin = max(h_hi - h_lo, 1.0) * _XRANGE_MARGIN_FRAC
+        margin = (h_hi - h_lo) * _XRANGE_MARGIN_FRAC if h_hi > h_lo else _XRANGE_POINT_MARGIN_US
         lo_ok, hi_ok = h_lo - margin, h_hi + margin
         kept = [x for x in all_x if lo_ok <= x <= hi_ok]
         if kept:
@@ -848,9 +849,9 @@ def _draw(ax, model, nbins=2000):
     # matplotlib autoscale; out-of-range artists are simply clipped.
     if x_hi > x_lo:
         ax.set_xlim(x_lo, x_hi)
-    ax.set_xlabel("time (us, t=0 at host anchor0)")
-
     meta = model.get("meta", {})
+    ax.set_xlabel("time (us, t=0 at %s)" % meta.get("t0", "host anchor0"))
+
     ax.set_title("AIE/host timeline  cps=%s  tiles=%s  host_span=%.2f us" % (
         meta.get("cps", "?"), meta.get("num_tiles", len(tiles)),
         meta.get("host_span_us", 0.0)))

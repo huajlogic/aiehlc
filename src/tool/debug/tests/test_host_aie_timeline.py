@@ -339,6 +339,31 @@ def test_correlate_without_hostcc_still_enriches_color_no_line():
         assert "hostcc_line" not in e
 
 
+def test_app_markers_before_anchor0_move_origin():
+    text = _block(two_tiles=False).replace(
+        "[TIMESYNC] hostevt iter=0 phase=iter_start host=1000",
+        "[TIMESYNC] hostevt iter=-1 phase=ctrl_plan host=700\n"
+        "[TIMESYNC] hostevt iter=-1 phase=kload host=800\n"
+        "[TIMESYNC] hostevt iter=0 phase=iter_start host=1000")
+    model = hat.correlate(hat.parse_timesync(text))
+    host = next(l for l in model["lanes"] if l["name"] == "host")
+    us = {e["event"]: e["start_us"] for e in host["events"]}
+    assert us["iter-1.ctrl_plan"] == 0.0
+    assert us["iter-1.kload"] == 100.0
+    assert us["iter0.iter_start"] == 300.0
+    t44 = next(l for l in model["lanes"] if l["name"] == "tile 4,4 core")
+    ev = {e["event"]: e for e in t44["events"]}
+    assert ev["ACTIVE"]["start_us"] == 310.0
+    assert model["meta"]["t0"] == "first host event"
+    assert model["meta"]["host_span_us"] == 1300.0
+
+
+def test_origin_stays_anchor0_without_earlier_events():
+    model = hat.correlate(hat.parse_timesync(_block()))
+    assert model["meta"]["t0"] == "host anchor0"
+    assert model["meta"]["host_span_us"] == 1000.0
+
+
 def test_self_test_entry_point():
     assert hat._self_test() == 0
 
