@@ -26,10 +26,10 @@ def _port(obj, key):
 
 
 def _slot(obj, key):
-    """Return (dir, idx, pktid, mask, msel, arbiter) for a recv_slave / local_dma object."""
+    """Return packet slave resource fields."""
     p = obj.get(key) if obj else None
     if not isinstance(p, dict):
-        return ("NONE", -1, -1, 0, 0, 0)
+        return ("NONE", -1, -1, 0, 0, 0, 0)
     return (
         str(p.get("dir", "NONE")),
         int(p.get("idx", -1)),
@@ -37,6 +37,7 @@ def _slot(obj, key):
         int(p.get("mask", 0)),
         int(p.get("msel", 0)),
         int(p.get("arbiter", 0)),
+        int(p.get("slot", 0)),
     )
 
 
@@ -74,6 +75,7 @@ def _new_row(kind, col, row, tkind):
         "recv_mask": 0,
         "recv_msel": 0,
         "recv_arbiter": 0,
+        "recv_slot": 0,
         # packet_connect: local DMA slave slot
         "dma_dir": "NONE",
         "dma_idx": -1,
@@ -81,6 +83,7 @@ def _new_row(kind, col, row, tkind):
         "dma_mask": 0,
         "dma_msel": 0,
         "dma_arbiter": 0,
+        "dma_slot": 0,
         # packet_connect: forward master port
         "fwd_dir": "NONE",
         "fwd_idx": -1,
@@ -127,9 +130,9 @@ def build_entries(model):
 
         if kind == "packet_connect":
             (r["recv_dir"], r["recv_idx"], r["recv_pktid"], r["recv_mask"],
-             r["recv_msel"], r["recv_arbiter"]) = _slot(conn, "recv_slave")
+             r["recv_msel"], r["recv_arbiter"], r["recv_slot"]) = _slot(conn, "recv_slave")
             (r["dma_dir"], r["dma_idx"], r["dma_pktid"], r["dma_mask"],
-             r["dma_msel"], r["dma_arbiter"]) = _slot(conn, "local_dma")
+             r["dma_msel"], r["dma_arbiter"], r["dma_slot"]) = _slot(conn, "local_dma")
             r["fwd_dir"], r["fwd_idx"], r["fwd_mselen"], r["fwd_arbiter"] = _master(conn, "forward_master")
             r["preserve"] = 1 if conn.get("preserve_header") else 0
         elif kind == "circuit_connect":
@@ -200,6 +203,7 @@ def render_header(model, rows):
     w("    int recv_mask;")
     w("    int recv_msel;")
     w("    int recv_arbiter;")
+    w("    int recv_slot;")
     w("    /* local DMA slave slot */")
     w("    const char *dma_dir;")
     w("    int dma_idx;")
@@ -207,6 +211,7 @@ def render_header(model, rows):
     w("    int dma_mask;")
     w("    int dma_msel;")
     w("    int dma_arbiter;")
+    w("    int dma_slot;")
     w("    /* forward master port (mselen = MSelEn bitmask) */")
     w("    const char *fwd_dir;")
     w("    int fwd_idx;")
@@ -223,7 +228,7 @@ def render_header(model, rows):
     w("static const struct AieResourceEntry __aie_resource_map[] = {")
     for e in rows:
         w(
-            "    { %s, %d, %d, %s, %s, %d, %d, %d, %d, %d, %s, %d, %d, %d, %d, %d, "
+            "    { %s, %d, %d, %s, %s, %d, %d, %d, %d, %d, %d, %s, %d, %d, %d, %d, %d, %d, "
             "%s, %d, %d, %d, %s, %d, %s, %d, %d },"
             % (
                 _cstr(e["kind"]),
@@ -236,12 +241,14 @@ def render_header(model, rows):
                 e["recv_mask"],
                 e["recv_msel"],
                 e["recv_arbiter"],
+                e["recv_slot"],
                 _cstr(e["dma_dir"]),
                 e["dma_idx"],
                 e["dma_pktid"],
                 e["dma_mask"],
                 e["dma_msel"],
                 e["dma_arbiter"],
+                e["dma_slot"],
                 _cstr(e["fwd_dir"]),
                 e["fwd_idx"],
                 e["fwd_mselen"],
@@ -264,15 +271,15 @@ def render_header(model, rows):
     w("    for (int i = 0; i < __aie_resource_map_count; ++i) {")
     w("        const struct AieResourceEntry *e = &__aie_resource_map[i];")
     w('        printf("[aie_resource_map] #%d %s tile(%d,%d,%s)"')
-    w('               " recv[%s:%d pktid=%d mask=0x%x msel=%d arb=%d]"')
-    w('               " dma[%s:%d pktid=%d mask=0x%x msel=%d arb=%d]"')
+    w('               " recv[%s:%d pktid=%d mask=0x%x msel=%d arb=%d slot=%d]"')
+    w('               " dma[%s:%d pktid=%d mask=0x%x msel=%d arb=%d slot=%d]"')
     w('               " fwd[%s:%d mselen=%d arb=%d]"')
     w('               " slave[%s:%d] master[%s:%d] preserve=%d\\n",')
     w("               i, e->kind, e->col, e->row, e->tile_kind,")
     w("               e->recv_dir, e->recv_idx, e->recv_pktid, e->recv_mask,")
-    w("               e->recv_msel, e->recv_arbiter,")
+    w("               e->recv_msel, e->recv_arbiter, e->recv_slot,")
     w("               e->dma_dir, e->dma_idx, e->dma_pktid, e->dma_mask,")
-    w("               e->dma_msel, e->dma_arbiter,")
+    w("               e->dma_msel, e->dma_arbiter, e->dma_slot,")
     w("               e->fwd_dir, e->fwd_idx, e->fwd_mselen, e->fwd_arbiter,")
     w("               e->slave_dir, e->slave_idx,")
     w("               e->master_dir, e->master_idx, e->preserve_header);")

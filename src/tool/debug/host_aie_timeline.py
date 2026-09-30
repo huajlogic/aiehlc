@@ -65,6 +65,8 @@ from collections import OrderedDict
 # match the standalone prototype so the production render reads the same.
 # --------------------------------------------------------------------------
 HOST_PHASE_STYLE = OrderedDict([
+    ("ctrl_plan",  ("#aec7e8", "ctrl_plan_init (control fabric)")),
+    ("kload",      ("#dbdb8d", "load_kernel_group (ELF load)")),
     ("launch",     ("#9467bd", "launch_kernel_group")),
     ("iter_start", ("#1f77b4", "input DMA BD config")),
     ("dma_start",  ("#17becf", "startio (issue DMAs)")),
@@ -320,13 +322,14 @@ class TileFit:
     us(cycle) = (h0 + (cycle-a0)*(h1-h0)/(a1-a0) - h0) / (cps/1e6)
     """
 
-    def __init__(self, tile, cps, h0, h1, a0, a1):
+    def __init__(self, tile, cps, h0, h1, a0, a1, origin=None):
         if a1 == a0:
             raise ValueError(f"tile {tile}: degenerate anchors a0==a1=={a0}")
         self.tile = tile
         self.cps = cps
         self.h0, self.h1 = h0, h1
         self.a0, self.a1 = a0, a1
+        self.origin = h0 if origin is None else origin
         self.counts_per_cycle = (h1 - h0) / (a1 - a0)
         self.counts_per_us = cps / 1e6
         # Effective AIE Hz from the empirical slope (no hardcoded frequency).
@@ -334,7 +337,7 @@ class TileFit:
 
     def cycle_to_us(self, cycle):
         counts = self.h0 + (cycle - self.a0) * self.counts_per_cycle
-        return (counts - self.h0) / self.counts_per_us
+        return (counts - self.origin) / self.counts_per_us
 
     def as_dict(self):
         return {"tile": "%d,%d" % self.tile, "h0": self.h0, "h1": self.h1,
@@ -383,13 +386,14 @@ def correlate(ts, hostcc_lines=None):
     h0, h1 = a0["host"], a1["host"]
     if h0 is None or h1 is None:
         raise ValueError("missing anchor0/anchor1 host record")
+    t0 = min([h0] + [c for _, _, c in ts["hostevts"]])
 
     fits = {}
     for tile, av0 in a0["tiles"].items():
         av1 = a1["tiles"].get(tile)
         if av1 is None:
             continue
-        fits[tile] = TileFit(tile, cps, h0, h1, av0, av1)
+        fits[tile] = TileFit(tile, cps, h0, h1, av0, av1, origin=t0)
 
     lanes = []
 
@@ -398,7 +402,7 @@ def correlate(ts, hostcc_lines=None):
     hostcc_lines = hostcc_lines or {}
     host_events = []
     for it, phase, counts in ts["hostevts"]:
-        us = host_counts_to_us(counts, cps, h0)
+        us = host_counts_to_us(counts, cps, t0)
         color, api = host_phase_style(phase)
         ev = {"event": "iter%d.%s" % (it, phase),
               "start_us": us, "end_us": us,
@@ -456,7 +460,8 @@ def correlate(ts, hostcc_lines=None):
                           "role": "mem", "ident": ident})
 
     meta = {"cps": cps, "counts_per_us": cps / 1e6,
-            "host_span_us": host_counts_to_us(h1, cps, h0),
+            "host_span_us": host_counts_to_us(h1, cps, t0),
+            "t0": "host anchor0" if t0 == h0 else "first host event",
             "num_tiles": len(fits), "num_host_events": len(ts["hostevts"])}
     anchors = {
         "anchor0": {"host": h0, "tiles": {"%d,%d" % k: v for k, v in a0["tiles"].items()}},

@@ -68,6 +68,14 @@ typedef enum { RT_RES_GEN1 = 1, RT_RES_GEN2 = 2, RT_RES_GEN5 = 5 } rt_res_gen;
 #define RT_RES_MASK_CLASS 0x10
 #define RT_RES_MASK_CONSUME 0x17
 
+#define RT_RES_VFWD_PORT 4
+#define RT_RES_VRET_PORT 3
+
+#define RT_RES_CTRL_BD_LO 2
+#define RT_RES_CTRL_BD_HI 6
+#define RT_RES_CTRL_ACK_BD_LO 12
+#define RT_RES_CTRL_ACK_BD_HI 14
+
 /* Sentinel for the fields that do not apply to a given entry. */
 #define RT_RES_NA 0xFF
 

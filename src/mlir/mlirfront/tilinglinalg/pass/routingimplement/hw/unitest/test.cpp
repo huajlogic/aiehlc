@@ -10,6 +10,76 @@
 
 int main()
 {
+    ResourceMgr conflicting(makeResource("Gen2"));
+    assert(conflicting.allocatePktId(7) == 1);
+    bool collisionDetected = false;
+    try {
+        conflicting.reserveControlPlaneResources(RT_RES_GEN2);
+    } catch (const std::runtime_error &) {
+        collisionDetected = true;
+    }
+    assert(collisionDetected);
+
+    {
+        auto dedicated = std::make_shared<ResourceMgr>(makeResource("Gen5"));
+        dedicated->setPartitionBounds(1, 4, 0, 6);
+        ControlShimPlacement cp;
+        cp.col = 0;
+        cp.exclusive = true;
+        dedicated->setControlPlacement(cp);
+        dedicated->reserveControlPlaneResources(RT_RES_GEN5);
+        auto shim0 = dedicated->getShimTile(0, 0);
+        assert(shim0 && !shim0->isChannelFree(DMADIRECTION::MM2S, 0) && !shim0->isChannelFree(DMADIRECTION::S2MM, 0));
+        int mm2s = 0;
+        for (int i = 0; i < 8; ++i) {
+            std::optional<TypeBasedTileLoc> loc(TypeBasedTileLoc{TileType::Core, Point{0, 1}});
+            auto slot = dedicated->freeShimNoc(loc, DMADIRECTION::MM2S, 100 + i);
+            assert(slot && slot->loc.c >= 1 && slot->loc.c <= 4);
+            ++mm2s;
+        }
+        assert(mm2s == 8);
+        std::optional<TypeBasedTileLoc> loc(TypeBasedTileLoc{TileType::Core, Point{0, 1}});
+        assert(!dedicated->freeShimNoc(loc, DMADIRECTION::MM2S, 200));
+        assert(!dedicated->inPartition(3, 0) && dedicated->inPartition(3, 1));
+    }
+
+    {
+        auto shared = std::make_shared<ResourceMgr>(makeResource("Gen5"));
+        shared->setPartitionBounds(0, 3, 0, 6);
+        auto shim0 = shared->getShimTile(0, 0);
+        assert(shim0->allocate(DMADIRECTION::MM2S, 0, 1) && shim0->allocate(DMADIRECTION::S2MM, 0, 2));
+        auto pick = shared->findFreeControlChannels(0);
+        assert(pick && pick->col == 0 && pick->mm2sCh == 1 && pick->s2mmCh == 1 && pick->exclusive);
+        shared->setControlPlacement(*pick);
+        shared->reserveControlPlaneResources(RT_RES_GEN5);
+        auto &shimTile = shared->tile(0, 0);
+        int muxIdx = -1, demuxIdx = -1;
+        for (int i = 0; i < 2; ++i) {
+            if (shimTile.getPortnumFromPortIdx(PortDirection::South, PortRole::Master, i) == 7)
+                muxIdx = i;
+            if (shimTile.getPortnumFromPortIdx(PortDirection::South, PortRole::Slave, i) == 3)
+                demuxIdx = i;
+        }
+        assert(muxIdx >= 0 && shimTile.bank(PortDirection::South).master[muxIdx].used);
+        assert(demuxIdx >= 0 && shimTile.bank(PortDirection::South).slave[demuxIdx].used);
+        assert(!shimTile.bank(PortDirection::South).master[1 - muxIdx].used);
+        assert(shimTile.bank(PortDirection::North).slave[RT_RES_VRET_PORT].used);
+        assert(shared->tile(1, 0).bank(PortDirection::North).master[RT_RES_VFWD_PORT].used);
+        assert(shared->tile(1, 0).bank(PortDirection::South).slave[RT_RES_VFWD_PORT].used);
+        assert(shared->tile(3, 0).bank(PortDirection::South).master[RT_RES_VRET_PORT].used);
+        assert(!shared->tile(3, 1).bank(PortDirection::South).master[RT_RES_VRET_PORT].used);
+        assert(!shared->findFreeControlChannels(0));
+        assert(shared->reserveControlShimBds(0));
+        for (int bd = 0; bd < 16; ++bd) {
+            bool ctrl = (bd >= RT_RES_CTRL_BD_LO && bd <= RT_RES_CTRL_BD_HI) ||
+                        (bd >= RT_RES_CTRL_ACK_BD_LO && bd <= RT_RES_CTRL_ACK_BD_HI);
+            assert(shared->tile(0, 0).isBdFree(bd) == !ctrl);
+        }
+        assert(shared->allocateTileBd(0, 0, 7) == 0);
+        assert(shared->allocateTileBd(0, 0, 7) == 1);
+        assert(shared->allocateTileBd(0, 0, 7) == 7);
+    }
+
     auto res = makeResource("Gen2");          // default variant
 
     assert(res->getRows()    == 11);
@@ -23,6 +93,21 @@ int main()
     // resource manager test
     bool ret = ResourceMgr::init(std::move(res));
     auto rmgr = ResourceMgr::instance();
+    rmgr->reserveControlPlaneResources(RT_RES_GEN2);
+    assert(rmgr->allocatePktId(8) == 4);
+    assert(rmgr->dataPlanePktArbiter() == 2);
+    assert(rmgr->dataPlanePktSlaveSlot(PortDirection::West) == 3);
+    assert(rmgr->dataPlanePktSlaveSlot(PortDirection::South) == 3);
+    assert(rmgr->dataPlanePktSlaveSlot(PortDirection::East) == 0);
+    assert(rmgr->dataPlanePktSlaveSlot(PortDirection::North) == 0);
+    assert(rmgr->dataPlanePktSlaveSlot(PortDirection::Control) == 1);
+    int dataPort = -1;
+    assert(rmgr->portDirAvailable(Point{3, 0}, dataPort, PortDirection::East, true));
+    assert(dataPort == 1);
+    assert(rmgr->portDirAvailable(Point{3, 0}, dataPort, PortDirection::North, true));
+    assert(dataPort == 0);
+    assert(rmgr->tile(3, 0).bank(PortDirection::South).master[RT_RES_VRET_PORT].used);
+    assert(!rmgr->tile(3, 1).bank(PortDirection::South).master[RT_RES_VRET_PORT].used);
     std::optional<Point> dst(Point{3, 20});
     auto free_shim = rmgr->freeShimNoc(dst);
     if (free_shim) {

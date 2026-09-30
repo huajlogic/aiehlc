@@ -5,10 +5,10 @@ command and wait for the post-login shell prompt in exactly the same way.
 """
 
 
-# Match a bare interactive shell prompt at end of buffer: $, # or > possibly
+# Match a bare interactive shell prompt at end of buffer: $, #, > or % possibly
 # followed by trailing whitespace. Kept in sync with setup_first_connection in
 # apppaltest.py.
-_SHELL_PROMPT_PATTERNS = [r'\$\s*$', r'#\s*$', r'>\s*$']
+_SHELL_PROMPT_PATTERNS = [r'\$\s*$', r'#\s*$', r'>\s*$', r'%\s*$']
 
 
 def ssh_command(ssh_target):

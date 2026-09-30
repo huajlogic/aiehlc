@@ -1,0 +1,31 @@
+# Tilinglinalg simulator check for example/tileprogram/ccode/passthrough_sim.cc.
+name: Tilinglinalg flow sim
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: sim-passthrough-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sim-passthrough:
+    name: Tilinglinalg flow (passthrough_sim.cc)
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build, simulate, check result
+        run: bash script/ci/pr_sim_test.sh passthrough
+
+      - name: Upload simulator log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-passthrough-log
+          path: ci-public.log
+          if-no-files-found: ignore

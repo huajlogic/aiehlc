@@ -6311,6 +6311,16 @@ function buildDeviceMap(){
       });
     });
   });
+  if(document.getElementById('dmCtrlPlanToggle')?.checked){
+    const coreMin=DATA.grid.device_core_min_row||3;
+    const addCtrlTile=(c,r)=>{
+      const k=c+','+r;
+      routedTileKeys.add(k);
+      if(!tileMap[k]) tileMap[k]={loc:[c,r],type:r===0?'shim':(r<coreMin?'mem':'core'),dma_channels:[]};
+    };
+    (ctrlPlanPorts||[]).forEach(p=>addCtrlTile(p.col,p.row));
+    (ctrlPlanEdges||[]).forEach(e=>{ addCtrlTile(e.from[0],e.from[1]); addCtrlTile(e.to[0],e.to[1]); });
+  }
   // Pure stream-switch waypoints: tiles synthesised from comm_paths edges only
   // (not in DATA.tiles, not in comm_paths.tiles, not a shim, not a shmem endpoint,
   // no DMA channels). These are implicit path endpoints that the stream line passes

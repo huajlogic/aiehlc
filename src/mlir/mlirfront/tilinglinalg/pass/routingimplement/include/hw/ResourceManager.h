@@ -136,6 +136,7 @@ public:
   std::optional<int> allocate(IOType io, int portidx, PortDirection dir, int ioId);
   std::optional<int> occupyport(IOType io, PortDirection dir, int ioId);
   bool releaseByIo(IOType io, int portidx, PortDirection dir, int ioId);
+  bool reservePortNumber(PortDirection dir, PortRole role, int portNum, int ownerId);
 
   const DirBank &bank(PortDirection d) const { return banks_.at(d); }
   ::TileType type() const { return type_; }
@@ -146,6 +147,7 @@ public:
   std::optional<int> allocateBd(int ownerId = -1);
   bool releaseBd(int bdId, int ownerId = -1);
   bool isBdFree(int bdId) const;
+  bool reserveBd(int bdId, int ownerId);
   int numBds() const { return static_cast<int>(bdPool_.size()); }
   int freeBdCount() const;
 
@@ -529,6 +531,13 @@ struct CoreOffloadTileConfig {
     int repeatCount = 1;
 };
 
+struct ControlShimPlacement {
+  int col = -1;
+  int mm2sCh = 0;
+  int s2mmCh = 0;
+  bool exclusive = false;
+};
+
 class ResourceMgr {
 public:
   ResourceMgr(std::unique_ptr<IHwResource> resource, ::TileType defaultType = ::TileType::Core);
@@ -630,17 +639,28 @@ public:
   // source of truth. Idempotent. Always called once after ResourceMgr::init.
   void reserveControlPlaneResources(rt_res_gen gen);
 
-  // Reserved-resource accessors for routing/scheduling to consult (the data-
-  // plane slot/arbiter picking wiring is a follow-up).
+  void setControlPlacement(const ControlShimPlacement &p) { ctrlPlacement_ = p; }
+  const ControlShimPlacement &controlPlacement() const { return ctrlPlacement_; }
+  std::optional<ControlShimPlacement> findFreeControlChannels(int col) const;
+  bool reserveControlShimBds(int col);
+
+  // Reserved-resource accessors for routing/scheduling.
   uint32_t reservedArbiterMask() const { return reservedArbiterMask_; }
   // bit i => slot i is reserved on (port,is_master) by the control plane.
   int reservedSlotMask(uint8_t port, uint8_t is_master) const;
+  std::optional<int> dataPlanePktArbiter() const;
+  std::optional<int> dataPlanePktSlaveSlot(PortDirection port) const;
 
   // Partition bounds accessors
   int partitionStartCol() const { return partitionStartCol_; }
   int partitionEndCol() const { return partitionEndCol_; }
   int partitionStartRow() const { return partitionStartRow_; }
   int partitionEndRow() const { return partitionEndRow_; }
+  bool inPartition(int r, int c) const { return isTileInPartition(r, c); }
+  std::shared_ptr<ShimTile> getShimTile(int r, int c) const {
+    auto it = shimTiles_.find(TileCoord{r, c});
+    return it == shimTiles_.end() ? nullptr : it->second;
+  }
 
 private:
   // Partition bounds (-1 = use full mesh)
@@ -649,7 +669,9 @@ private:
 
   // Check if a column/row is within partition bounds
   bool isColInPartition(int c) const { return !hasPartition() || (c >= partitionStartCol_ && c <= partitionEndCol_); }
-  bool isRowInPartition(int r) const { return !hasPartition() || (r >= partitionStartRow_ && r <= partitionEndRow_); }
+  bool isRowInPartition(int r) const {
+    return !hasPartition() || partitionStartRow_ < 0 || (r >= partitionStartRow_ && r <= partitionEndRow_);
+  }
   bool isTileInPartition(int r, int c) const { return isColInPartition(c) && isRowInPartition(r); }
 
   static constexpr int kMaxPktId = 32; // 5-bit AIE pkt_id field
@@ -663,6 +685,8 @@ private:
   // [port][is_master] -> slot bitmask reserved by the control plane.
   std::array<std::array<int, 2>, kNumPortTypes> reservedSlotMask_{};
   bool controlPlaneReserved_ = false;
+  ControlShimPlacement ctrlPlacement_;
+  void reserveControlSpinePorts(rt_res_gen gen, int spineCol);
 
   void InitSHIMNocList();
 

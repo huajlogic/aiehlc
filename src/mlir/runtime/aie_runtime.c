@@ -70,11 +70,14 @@ static inline unsigned long long __rt_pmccntr(void) {
 static inline unsigned long long __rt_pmccntr(void) { return 0ULL; }
 #endif
 
+static unsigned long long g_prof_excl_cyc = 0ULL;
+static inline unsigned long long __rt_prof_now(void) { return __rt_pmccntr() - g_prof_excl_cyc; }
+
 #if AIEHLC_PROFILING
-#define RT_PROF_TIC() __rt_pmccntr()
+#define RT_PROF_TIC() __rt_prof_now()
 #define RT_PROF_ADD(cyc, n, t0)                                                                                        \
     do {                                                                                                               \
-        (cyc) += (__rt_pmccntr() - (t0));                                                                              \
+        (cyc) += (__rt_prof_now() - (t0));                                                                             \
         (n)++;                                                                                                         \
     } while (0)
 #define RT_PROF_PHASE(ph, t0) __rt_ph_add((ph), (t0))
@@ -100,6 +103,8 @@ static inline unsigned long long __rt_pmccntr(void) { return 0ULL; }
 static unsigned long long g_wait_io_cycles = 0ULL;
 static unsigned int g_wait_io_calls = 0U;
 static unsigned long long g_wait_io_iters = 0ULL;
+static int g_ctrl_high_throughput = 0;
+static int g_ctrl_high_throughput_ready = 0;
 
 enum { PH_KLOAD = 0, PH_BDCFG = 1, PH_COREEN = 2, PH_STARTIO = 3, PH_N = 4 };
 static unsigned long long g_ph_cyc[PH_N] = {0, 0, 0, 0};
@@ -113,10 +118,14 @@ static unsigned long long g_bd_gtt_cyc = 0ULL, g_bd_saddr_cyc = 0ULL, g_bd_en_cy
 static unsigned int g_bd_gtt_n = 0U, g_bd_saddr_n = 0U, g_bd_en_n = 0U;
 static unsigned long long g_kl_elf_cyc = 0ULL, g_kl_rst_cyc = 0ULL;
 static unsigned int g_kl_elf_n = 0U, g_kl_rst_n = 0U;
+static unsigned long long g_ctrl_plan_cyc = 0ULL, g_sync_dev_cyc = 0ULL;
+static unsigned int g_ctrl_plan_n = 0U, g_sync_dev_n = 0U;
+static unsigned long long g_pmap_print_cyc = 0ULL;
+static unsigned int g_pmap_print_n = 0U;
 
 #if AIEHLC_PROFILING
 static inline void __rt_ph_add(int ph, unsigned long long t0) {
-    g_ph_cyc[ph] += (__rt_pmccntr() - t0);
+    g_ph_cyc[ph] += (__rt_prof_now() - t0);
     g_ph_calls[ph]++;
 }
 #endif
@@ -130,6 +139,12 @@ void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls) {
 void __Runtime_wait_io_iters(unsigned long long *iters) {
     if (iters)
         *iters = g_wait_io_iters;
+}
+
+void __Runtime_ctrl_high_throughput_enable(int on) {
+    g_ctrl_high_throughput = on ? 1 : 0;
+    if (!on)
+        g_ctrl_high_throughput_ready = 0;
 }
 void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls) {
     for (int i = 0; i < PH_N; i++) {
@@ -186,6 +201,24 @@ void __Runtime_kload_split_cycles(unsigned long long *elf_cyc, unsigned int *elf
         *rst_cyc = g_kl_rst_cyc;
     if (rst_n)
         *rst_n = g_kl_rst_n;
+}
+void __Runtime_setup_split_cycles(unsigned long long *plan_cyc, unsigned int *plan_n, unsigned long long *sync_cyc,
+                                  unsigned int *sync_n) {
+    if (plan_cyc)
+        *plan_cyc = g_ctrl_plan_cyc;
+    if (plan_n)
+        *plan_n = g_ctrl_plan_n;
+    if (sync_cyc)
+        *sync_cyc = g_sync_dev_cyc;
+    if (sync_n)
+        *sync_n = g_sync_dev_n;
+}
+
+void __Runtime_pmap_print_cycles(unsigned long long *cyc, unsigned int *lines) {
+    if (cyc)
+        *cyc = g_pmap_print_cyc;
+    if (lines)
+        *lines = g_pmap_print_n;
 }
 
 static int s_core_perf_probe_valid = 0;
@@ -1280,6 +1313,8 @@ typedef struct {
     uint32_t mask;
     AieTraceProfile *prof;    /* optional sink; NULL = print only */
     const char *const *names; /* active 8-slot name table for this stream */
+    int timed;
+    int quiet;
 } __core_trace_run;
 
 /* Build the '|'-joined slot names of an 8-bit event mask into out[cap]
@@ -1332,6 +1367,10 @@ static void __core_trace_names(const char *const *names, const uint16_t *events,
 static void __core_trace_flush(__core_trace_run *run) {
     if (!run->open)
         return;
+    if (run->quiet) {
+        run->open = 0;
+        return;
+    }
     char names[128];
     /* Live decode keeps the plain "<names>" form (no event-value suffix) so it
      * stays byte-identical to the Python reference model; the [TIMESYNC] profile
@@ -1346,7 +1385,7 @@ static void __core_trace_flush(__core_trace_run *run) {
      * stream may only fill up to CAP minus the slots reserved for streams that
      * have not been decoded yet (fair-share: keeps a chatty core stream from
      * starving the mem stream decoded after it -- see __Runtime_core_trace_decode). */
-    if (run->prof) {
+    if (run->prof && run->timed) {
         AieTraceProfile *p = run->prof;
         uint32_t eff_cap = (p->reserve < AIE_TRACE_PROFILE_CAP) ? (AIE_TRACE_PROFILE_CAP - p->reserve) : 0u;
         if (p->count < eff_cap) {
@@ -1402,7 +1441,8 @@ static void __core_trace_repeat(__core_trace_run *run, uint64_t *cycle, uint32_t
  * *_STALL timeline, labelling event slots with `names`. Factored out of the
  * public entry so a shared buffer can be demuxed by pkt id and each stream
  * decoded with its own slot-name table. */
-static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *const *names, AieTraceProfile *prof) {
+static int __core_trace_decode_group(const __core_trace_ctx *ctx, const char *const *names, AieTraceProfile *prof,
+                                     int quiet) {
     uint64_t total_bits = (uint64_t)ctx->npkts * 7u * 32u;
 
     /* Inner: Event-Time frame stream (AIE2ps Arch Spec, Figure 4-14). */
@@ -1412,6 +1452,7 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
     __core_trace_run run = {0}; /* run-length coalescer for per-cycle events */
     run.prof = prof;            /* optional interval sink */
     run.names = names;          /* this stream's slot-name table */
+    run.quiet = quiet;
 
     while (bitpos + 8u <= total_bits) {
         uint32_t b0 = __core_trace_peek8(ctx, bitpos), v;
@@ -1470,7 +1511,8 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
                     v = __core_trace_bits(ctx, &bitpos, 32u);
                     cycle += (v & 0x3FFFFu);
                     __core_trace_flush(&run);
-                    printf("[aie_runtime] core_trace_decode: STOP @ %llu\n", (unsigned long long)cycle);
+                    if (!quiet)
+                        printf("[aie_runtime] core_trace_decode: STOP @ %llu\n", (unsigned long long)cycle);
                     last_kind = -1;
                 }
             }
@@ -1482,10 +1524,13 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
                 break;
             uint32_t w0 = __core_trace_bits(ctx, &bitpos, 32u);
             uint32_t w1 = __core_trace_bits(ctx, &bitpos, 32u);
-            cycle = ((uint64_t)(w0 & 0x00FFFFFFu) << 32) | w1;
+            uint64_t start_timer = ((uint64_t)(w0 & 0x00FFFFFFu) << 32) | w1;
             __core_trace_flush(&run);
-            printf("[aie_runtime] core_trace_decode: START timer=%llu overrun=%u\n", (unsigned long long)cycle,
-                   (unsigned)((w0 >> 26) & 1u));
+            run.timed = 1;
+            cycle = start_timer;
+            if (!quiet)
+                printf("[aie_runtime] core_trace_decode: START timer=%llu overrun=%u\n", (unsigned long long)cycle,
+                       (unsigned)((w0 >> 26) & 1u));
             last_kind = -1;
         } else { /* Filler (0xFE) / Sync (0xFF) 8b */
             v = __core_trace_bits(ctx, &bitpos, 8u);
@@ -1497,6 +1542,7 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
         }
     }
     __core_trace_flush(&run);
+    return run.timed;
 }
 
 /* Map a stream packet id to its 8-slot event name table: pkt 2 = mem-module DMA
@@ -1504,6 +1550,32 @@ static void __core_trace_decode_group(const __core_trace_ctx *ctx, const char *c
  * trace. */
 static const char *const *__core_trace_table_for_id(uint32_t id) {
     return (id == 2u) ? s_mem_trace_slot_name : s_core_trace_slot_name;
+}
+
+static int __core_trace_block_zero(const uint32_t *buf, uint32_t p) {
+    for (uint32_t k = 0; k < 8u; k++) {
+        if (buf[p + k] != 0u)
+            return 0;
+    }
+    return 1;
+}
+
+static uint32_t __core_trace_header_phase(const uint32_t *buf, uint32_t nwords) {
+    uint32_t best = 0, best_hits = 0, hits0 = 0;
+    for (uint32_t k = 0; k < 8u; k++) {
+        uint32_t shape = buf[k] & ~0x1Fu, hits = 0;
+        for (uint32_t p = k; p + 8u <= nwords && !__core_trace_block_zero(buf, p); p += 8u) {
+            if (buf[p] != 0u && (buf[p] & ~0x1Fu) == shape)
+                hits++;
+        }
+        if (k == 0u)
+            hits0 = hits;
+        if (hits > best_hits) {
+            best = k;
+            best_hits = hits;
+        }
+    }
+    return (best_hits >= 2u && best_hits > hits0) ? best : 0u;
 }
 
 void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof) {
@@ -1516,18 +1588,10 @@ void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceP
      * core (pkt 1) and mem (pkt 2) streams in one buffer, so record every
      * packet base; the streams are demuxed by header pkt id (low 5 bits) below.
      * A lone pkt id (incl. legacy id 0) yields a single group == old behavior. */
-    uint32_t whole = nwords - (nwords % 8u);
     uint32_t bases[AIE_TRACE_MAX_PKTS];
     uint32_t npkts = 0;
-    for (uint32_t p = 0; p < whole; p += 8u) {
-        int all_zero = 1;
-        for (uint32_t k = 0; k < 8u; k++) {
-            if (buf[p + k] != 0u) {
-                all_zero = 0;
-                break;
-            }
-        }
-        if (all_zero)
+    for (uint32_t p = __core_trace_header_phase(buf, nwords); p + 8u <= nwords; p += 8u) {
+        if (__core_trace_block_zero(buf, p))
             break;
         if (npkts < AIE_TRACE_MAX_PKTS)
             bases[npkts++] = p;
@@ -1535,15 +1599,28 @@ void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceP
 
     /* Pre-count distinct pkt-id streams present so the profile can reserve a fair
      * share for each stream not yet decoded (see reserve bookkeeping below). */
-    uint32_t nstreams = 0;
+    uint32_t present = 0;
+    for (uint32_t i = 0; i < npkts; i++)
+        present |= 1u << (buf[bases[i]] & 0x1Fu);
+    uint32_t wanted = 0;
     for (uint32_t id = 0; id < 32u; id++) {
+        if (!((present >> id) & 1u))
+            continue;
+        uint32_t gbases[AIE_TRACE_MAX_PKTS];
+        uint32_t gn = 0;
         for (uint32_t i = 0; i < npkts; i++) {
-            if ((buf[bases[i]] & 0x1Fu) == id) {
-                nstreams++;
-                break;
-            }
+            if ((buf[bases[i]] & 0x1Fu) == id)
+                gbases[gn++] = bases[i];
         }
+        __core_trace_ctx ctx = {buf, gbases, gn};
+        if (__core_trace_decode_group(&ctx, __core_trace_table_for_id(id), NULL, 1))
+            wanted |= 1u << id;
     }
+    if (!wanted)
+        wanted = present;
+    uint32_t nstreams = 0;
+    for (uint32_t id = 0; id < 32u; id++)
+        nstreams += (wanted >> id) & 1u;
 
     /* Demux: for each distinct pkt id (0..31, header & 0x1F) build that stream's
      * ordered base list and decode it with the matching slot-name table. Ids are
@@ -1558,14 +1635,14 @@ void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceP
             if ((buf[bases[i]] & 0x1Fu) == id)
                 gbases[gn++] = bases[i];
         }
-        if (gn == 0u)
+        if (gn == 0u || !((wanted >> id) & 1u))
             continue;
         if (prof) {
             uint32_t remaining_after = nstreams - decoded - 1u; /* streams after this one */
             prof->reserve = remaining_after * AIE_TRACE_PROFILE_MIN_PER_STREAM;
         }
         __core_trace_ctx ctx = {buf, gbases, gn};
-        __core_trace_decode_group(&ctx, __core_trace_table_for_id(id), prof);
+        __core_trace_decode_group(&ctx, __core_trace_table_for_id(id), prof, 0);
         decoded++;
     }
     if (prof)
@@ -1824,6 +1901,9 @@ static inline uint64_t __aie_host_now(void) { return 0; }
 static inline uint64_t __aie_host_cps(void) { return 0; }
 #endif
 
+static uint64_t s_trace_host_skew = 0;
+static inline uint64_t __aie_trace_now(void) { return __aie_host_now() - s_trace_host_skew; }
+
 /* Capture one anchor (which=0 before launch, 1 at end) for every armed tile:
  * host-before -> read each armed tile's AIE core timer -> host-after; the
  * anchor's host value is the midpoint, since XAie_ReadTimer has ~us AXI-MM
@@ -1831,7 +1911,7 @@ static inline uint64_t __aie_host_cps(void) { return 0; }
 static void __aie_trace_anchor_all(XAie_DevInst *dev, int which) {
     if (!dev || s_trace_session_n == 0)
         return;
-    uint64_t hb = __aie_host_now();
+    uint64_t hb = __aie_trace_now();
     uint64_t av[AIE_TRACE_SESSION_CAP] = {0};
     for (uint32_t i = 0; i < s_trace_session_n; i++) {
         XAie_LocType core = XAie_TileLoc(s_trace_session[i].col, s_trace_session[i].row);
@@ -1839,7 +1919,7 @@ static void __aie_trace_anchor_all(XAie_DevInst *dev, int which) {
         __Runtime_read_aie_timer(dev, core, &v);
         av[i] = v;
     }
-    uint64_t ha = __aie_host_now();
+    uint64_t ha = __aie_trace_now();
     uint64_t hm = hb + (ha - hb) / 2;
     for (uint32_t i = 0; i < s_trace_session_n; i++) {
         XAie_LocType core = XAie_TileLoc(s_trace_session[i].col, s_trace_session[i].row);
@@ -1852,7 +1932,7 @@ static void __aie_trace_anchor_all(XAie_DevInst *dev, int which) {
 // mem_dma_kind/mem_dma_ch select which tile DMA the memory-module trace unit
 // watches; the _begin/_begin_ch entry points pass the S2MM/0 defaults so their
 // behaviour is unchanged, while _begin_dma threads the pragma-driven selection.
-static void trace_begin_impl(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg, int mem_dma_kind,
+static void trace_begin_body(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg, int mem_dma_kind,
                              uint8_t mem_dma_ch) {
     if (!dev) {
         printf("[aie_runtime] core_trace_begin: NULL dev, ignored\n");
@@ -1916,6 +1996,12 @@ static void trace_begin_impl(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_
     uint32_t read_addr = AIE_TRACE_REGION_BASE + (uint32_t)slot * AIE_TRACE_BUF_LEN;
     uint32_t setup_addr = read_addr | AIE_TRACE_DMA_HI;
 
+    static const uint32_t s_trace_zero[AIE_TRACE_BUF_LEN / 4u] = {0};
+    XAie_LocType mt_loc = XAie_TileLoc(col, (uint8_t)(XAIE_AIE_TILE_ROW_START - 1));
+    if (XAie_DataMemBlockWrite(dev, mt_loc, read_addr, s_trace_zero, AIE_TRACE_BUF_LEN) != XAIE_OK)
+        printf("[aie_runtime] core_trace_begin: clearing trace buffer failed tile(%u,%u)\n", (unsigned)col,
+               (unsigned)row);
+
     XAie_LocType tile = XAie_TileLoc(col, row);
     /* Pass the generated routing resource map when this flow has one so the trace
      * route's strm_ch/s2mm_ch/pkt id dodge the recorded data-plane ports; absent
@@ -1960,6 +2046,13 @@ static void trace_begin_impl(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_
            (unsigned)col, (unsigned)row, (unsigned)slot, (unsigned)strm_ch, (unsigned)s2mm_ch, (unsigned)bdnum,
            mem_dma_kind, (unsigned)mem_dma_ch, strm_port_type_name(ev_port), strm_port_intf_name(ev_intf),
            (unsigned)ev_idx, read_addr);
+}
+
+static void trace_begin_impl(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch_arg, int mem_dma_kind,
+                             uint8_t mem_dma_ch) {
+    uint64_t t0 = __aie_host_now();
+    trace_begin_body(dev, col, row, strm_ch_arg, mem_dma_kind, mem_dma_ch);
+    s_trace_host_skew += __aie_host_now() - t0;
 }
 
 void __Runtime_core_trace_begin(XAie_DevInst *dev, uint8_t col, uint8_t row) {
@@ -2013,6 +2106,14 @@ void __Runtime_core_trace_end_into(XAie_DevInst *dev, AieTraceProfile *prof) {
         s_trace_col_used[c] = 0;
 }
 
+void __Runtime_core_trace_app_begin(XAie_DevInst *dev) {
+    (void)dev;
+    __Runtime_aie_trace_profile_init(&s_trace_sync_prof);
+    __Runtime_aie_trace_profile_set_clock(&s_trace_sync_prof, __aie_host_cps());
+    s_trace_host_skew = 0;
+    s_trace_sync_active = 1;
+}
+
 void __Runtime_core_trace_sync_begin(XAie_DevInst *dev) {
     if (s_trace_session_n == 0)
         return; /* nothing armed: sync stays off, decode-only path unaffected */
@@ -2020,19 +2121,23 @@ void __Runtime_core_trace_sync_begin(XAie_DevInst *dev) {
         printf("[aie_runtime] core_trace_sync_begin: NULL dev; time-sync disabled\n");
         return;
     }
-    __Runtime_aie_trace_profile_init(&s_trace_sync_prof);
-    __Runtime_aie_trace_profile_set_clock(&s_trace_sync_prof, __aie_host_cps());
-    __aie_trace_anchor_all(dev, 0); /* anchor0: just before the cores run */
-    s_trace_sync_active = 1;
+    uint64_t t0 = __aie_host_now();
     printf("[aie_runtime] core_trace_sync_begin: armed %u tile(s), cps=%llu\n", (unsigned)s_trace_session_n,
            (unsigned long long)__aie_host_cps());
+    s_trace_host_skew += __aie_host_now() - t0;
+    if (!s_trace_sync_active) {
+        __Runtime_aie_trace_profile_init(&s_trace_sync_prof);
+        __Runtime_aie_trace_profile_set_clock(&s_trace_sync_prof, __aie_host_cps());
+    }
+    __aie_trace_anchor_all(dev, 0); /* anchor0: just before the cores run */
+    s_trace_sync_active = 1;
 }
 
 void __Runtime_core_trace_event(XAie_DevInst *dev, int iter, const char *phase) {
     (void)dev;
     if (!s_trace_sync_active)
         return;
-    __Runtime_aie_trace_profile_event(&s_trace_sync_prof, iter, phase, __aie_host_now());
+    __Runtime_aie_trace_profile_event(&s_trace_sync_prof, iter, phase, __aie_trace_now());
 }
 
 void __Runtime_core_trace_end(XAie_DevInst *dev) {
@@ -2045,6 +2150,7 @@ void __Runtime_core_trace_end(XAie_DevInst *dev) {
         __aie_trace_anchor_all(dev, 1); /* anchor1: cores have finished */
         __Runtime_core_trace_end_into(dev, &s_trace_sync_prof);
         __Runtime_aie_trace_profile_dump(&s_trace_sync_prof);
+        printf("[TIMESYNC] excluded host=%llu\n", (unsigned long long)s_trace_host_skew);
         s_trace_sync_active = 0;
         return;
     }
@@ -2506,6 +2612,7 @@ void __Runtime_perfcnt_read_mm2s_bd_finished_partition(XAie_DevInst *dev, uint8_
 }
 
 void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size) {
+    unsigned long long __sd_t0 = RT_PROF_TIC();
     if (dev) {
         AieRC rc = XAie_MemSyncForDevVAddr(dev, ptr, (uint64_t)size);
         AIEHLC_LOG(printf("[aie_runtime] sync_for_dev(%p, %zu) via VAddr rc=%d\n", ptr, size, rc););
@@ -2513,6 +2620,7 @@ void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size) {
         Xil_DCacheFlushRange((UINTPTR)ptr, size);
         AIEHLC_LOG(printf("[aie_runtime] sync_for_dev(%p, %zu) via DCacheFlushRange\n", ptr, size));
     }
+    RT_PROF_ADD(g_sync_dev_cyc, g_sync_dev_n, __sd_t0);
 }
 
 void __Runtime_sync_for_cpu(XAie_DevInst *dev, void *ptr, size_t size) {
@@ -2572,8 +2680,22 @@ void __Runtime_routing_init(XAie_DevInst *dev) {
 static AieRC __Runtime_partition_initialize(XAie_DevInst *dev) {
 #ifdef __AIESIM__
     (void)dev;
+    g_ctrl_high_throughput_ready = 0;
     return XAIE_OK;
 #else
+    g_ctrl_high_throughput_ready = 0;
+#if AIE_GEN == 5
+    if (g_ctrl_high_throughput) {
+        XAie_PartInitOpts opts;
+        opts.Locs = NULL;
+        opts.NumUseTiles = 0U;
+        opts.InitOpts = XAIE_PART_INIT_OPT_DEFAULT | XAIE_PART_INIT_OPT_CTRL_TLASTERROR_DISABLE;
+        AieRC rc = XAie_PartitionInitialize(dev, &opts);
+        if (rc == XAIE_OK)
+            g_ctrl_high_throughput_ready = 1;
+        return rc;
+    }
+#endif
     return XAie_PartitionInitialize(dev, NULL);
 #endif
 }
@@ -3573,6 +3695,40 @@ AieRC __Runtime_ctrl_push(const __Runtime_CtrlInstance *inst, uint32_t *buf, uin
     return XAIE_OK;
 }
 
+static AieRC rt_ctrl_mm2s_wait_below(XAie_DevInst *dev, uint8_t shim_col, int32_t channel, uint8_t below) {
+    XAie_LocType loc = XAie_TileLoc(shim_col, 0U);
+    uint8_t pending = 0xFFU;
+    for (uint32_t iter = 0U; iter < 100000U; iter++) {
+        AieRC rc = XAie_DmaGetPendingBdCount(dev, loc, (uint8_t)channel, DMA_MM2S, &pending);
+        if (rc != XAIE_OK)
+            return rc;
+        if (pending < below)
+            return XAIE_OK;
+    }
+    printf("[aie_runtime] ctrl MM2S TIMEOUT shim(%u,0) ch=%d pending=%u below=%u\n", (unsigned)shim_col, channel,
+           (unsigned)pending, (unsigned)below);
+    return XAIE_ERR;
+}
+
+static AieRC rt_ctrl_mm2s_wait(XAie_DevInst *dev, uint8_t shim_col, int32_t channel) {
+    XAie_LocType loc = XAie_TileLoc(shim_col, 0U);
+    uint32_t status = 0U;
+    for (uint32_t spin = 0U; spin < 1000000U; spin++) {
+        AieRC rc = XAie_DmaGetChannelStatus(dev, loc, (uint8_t)channel, DMA_MM2S, &status);
+        if (rc != XAIE_OK)
+            return rc;
+        uint32_t queued = (status & AIERT_DMA_TASK_Q_SIZE_MASK) >> AIERT_DMA_TASK_Q_SIZE_LSB;
+        if ((status & AIERT_DMA_CHANNEL_RUNNING_MASK) == 0U && queued == 0U)
+            return XAIE_OK;
+    }
+    printf("[aie_runtime] ctrl MM2S idle TIMEOUT shim(%u,0) ch=%d status=0x%08x running=%u queued=%u cur_bd=%u\n",
+           (unsigned)shim_col, channel, (unsigned)status,
+           (unsigned)((status & AIERT_DMA_CHANNEL_RUNNING_MASK) != 0U),
+           (unsigned)((status & AIERT_DMA_TASK_Q_SIZE_MASK) >> AIERT_DMA_TASK_Q_SIZE_LSB),
+           (unsigned)((status & AIERT_DMA_CUR_BD_MASK) >> AIERT_DMA_CUR_BD_LSB));
+    return XAIE_ERR;
+}
+
 /* ===========================================================================
  * Self-contained control-packet send with routing + TCT return.
  *
@@ -3611,8 +3767,8 @@ static uint8_t rt_shim_s2mm_port(XAie_DevInst *dev, int32_t s2mm_ch) {
  * rides NORTH-master / SOUTH-slave so it may use 0-5; the return (down) channel
  * rides SOUTH-master / NORTH-slave and MUST stay within 0-3, else
  * XAie_StrmConnCctEnable returns XAIE_ERR_STREAM_PORT. */
-#define RT_CTRL_VFWD 4U /* forward vertical NORTH/SOUTH channel (shim->dest); NORTH-master/SOUTH-slave, 0-5 */
-#define RT_CTRL_VRET 3U /* return  vertical NORTH/SOUTH channel (dest->shim); SOUTH-master/NORTH-slave, 0-3 */
+#define RT_CTRL_VFWD ((uint8_t)RT_RES_VFWD_PORT) /* forward vertical NORTH/SOUTH channel (shim->dest); NORTH-master/SOUTH-slave, 0-5 */
+#define RT_CTRL_VRET ((uint8_t)RT_RES_VRET_PORT) /* return  vertical NORTH/SOUTH channel (dest->shim); SOUTH-master/NORTH-slave, 0-3 */
 
 /* Diagnostic stream-switch event select slots for the control-packet path: every
  * hop tile puts its forward (up) output port on slot 0 and its return (down)
@@ -3702,14 +3858,33 @@ static int rt_ctrl_pmap_on(void) {
  * mask to -1 too, so legacy applogs stay backward compatible. */
 static void rt_pmap_port_ex(uint8_t col, uint8_t row, const char *ptype, uint8_t pidx, const char *dir, const char *ms,
                             uint32_t id, const char *sw, int slot, int arb, int msel, int mask) {
-    if (rt_ctrl_pmap_on())
-        printf("CONTROLPAN-PMAP col=%u row=%u port=%s idx=%u dir=%s ms=%s id=%u sw=%s slot=%d arb=%d msel=%d mask=%d\n",
-               (unsigned)col, (unsigned)row, ptype, (unsigned)pidx, dir, ms, (unsigned)id, sw, slot, arb, msel, mask);
+    if (!rt_ctrl_pmap_on())
+        return;
+    uint64_t h0 = __aie_host_now();
+    unsigned long long c0 = __rt_pmccntr();
+    printf("CONTROLPAN-PMAP col=%u row=%u port=%s idx=%u dir=%s ms=%s id=%u sw=%s slot=%d arb=%d msel=%d mask=%d\n",
+           (unsigned)col, (unsigned)row, ptype, (unsigned)pidx, dir, ms, (unsigned)id, sw, slot, arb, msel, mask);
+    unsigned long long dc = __rt_pmccntr() - c0;
+    g_pmap_print_cyc += dc;
+    g_prof_excl_cyc += dc;
+    g_pmap_print_n++;
+    s_trace_host_skew += __aie_host_now() - h0;
 }
 
 static void rt_pmap_port(uint8_t col, uint8_t row, const char *ptype, uint8_t pidx, const char *dir, const char *ms,
                          uint32_t id, const char *sw, int slot) {
     rt_pmap_port_ex(col, row, ptype, pidx, dir, ms, id, sw, slot, -1, -1, -1);
+}
+
+static int rt_pmap_shim_first(const __Runtime_CtrlRowFabric *f, unsigned bit) {
+    if (!rt_ctrl_pmap_on())
+        return 0;
+    __Runtime_CtrlRowFabric *m = (__Runtime_CtrlRowFabric *)f;
+    uint8_t mask = (uint8_t)(1U << (bit & 7U));
+    if (m->pmap_shim_seen & mask)
+        return 0;
+    m->pmap_shim_seen |= mask;
+    return 1;
 }
 
 /**
@@ -4045,8 +4220,7 @@ AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops) {
     return XAIE_OK;
 }
 
-/* Configure one EAST chain on @row spanning columns [col_lo..col_hi]. The chain
- * head must sit on the spine column (col_lo == f->shim_col). Runs the pure
+/* Configure one EAST chain on @row spanning columns [col_lo..col_hi]. Runs the pure
  * planner (acr_plan_row_add) against the fabric's real spine + port book (so the
  * shared spine is extended/reused idempotently), emits the derived stream-switch
  * ops via __Runtime_ctrl_row_emit, and records the chain span. @is_top marks the
@@ -4119,9 +4293,37 @@ static AieRC rt_ctrl_row_shim_return_route(const __Runtime_CtrlRowFabric *f, int
                (unsigned)f->shim_col, (unsigned)rport, (int)rc);
         return rc;
     }
-    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VRET, "ret", "slave", f->ctrl_id, "circuit", -1);
-    rt_pmap_port(f->shim_col, 0, "SOUTH", rport, "ret", "master", f->ctrl_id, "circuit", -1);
+    if (rt_pmap_shim_first(f, (unsigned)s2mm_ch)) {
+        rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VRET, "ret", "slave", f->ctrl_id, "circuit", -1);
+        rt_pmap_port(f->shim_col, 0, "SOUTH", rport, "ret", "master", f->ctrl_id, "circuit", -1);
+    }
     return XAIE_OK;
+}
+
+#define RT_CTRL_SHIM_NORTH_MSTRS 6U
+
+static void rt_ctrl_shim_park_data_masters(const __Runtime_CtrlRowFabric *f, uint8_t fport) {
+    XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
+    for (uint8_t m = 0U; m < RT_CTRL_SHIM_NORTH_MSTRS; m++)
+        (void)XAie_StrmConnCctDisable(f->dev, shim, SOUTH, fport, NORTH, m);
+}
+
+AieRC __Runtime_ctrl_plan_release(__Runtime_CtrlRowFabric *f, int32_t mm2s_ch) {
+    if (!f || !f->dev)
+        return XAIE_INVALID_ARGS;
+    if (f->dedicated_shim)
+        return XAIE_OK;
+    XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
+    (void)XAie_StrmConnCctDisable(f->dev, shim, SOUTH, rt_shim_mm2s_port(mm2s_ch), NORTH, RT_CTRL_VFWD);
+    routing(f->dev);
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_plan_release: shim(%u,0) VFWD cut, data-plane routing restored\n",
+                      (unsigned)f->shim_col););
+    return XAIE_OK;
+}
+
+void __Runtime_ctrl_plan_set_exclusive(__Runtime_CtrlRowFabric *f, int on) {
+    if (f)
+        f->dedicated_shim = on ? 1U : 0U;
 }
 
 /* One-shot row-control fabric init: record the device, spine column, control
@@ -4130,7 +4332,7 @@ static AieRC rt_ctrl_row_shim_return_route(const __Runtime_CtrlRowFabric *f, int
  * planner. @rows may be given in any row order (bottom-up preferred); the static
  * planner computes the top row so its return head omits the idle RET_NORTH slot.
  * Each chain head must sit on the spine column (col_lo == shim_col). */
-AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
+static AieRC rt_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
                                uint8_t ctrl_id, const __Runtime_CtrlRowChain *rows, uint8_t nrows) {
     if (!f || !dev)
         return XAIE_INVALID_ARGS;
@@ -4142,6 +4344,17 @@ AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, ui
     f->ret_vc = 0U;
     f->resp_s2mm_ch = resp_s2mm_ch;
     AieRC rc = rt_ctrl_plan_add_rows(f, rows, nrows);
+    f->dedicated_shim = (rc == XAIE_OK && f->nrows > 0U) ? 1U : 0U;
+    for (uint8_t i = 0; i < f->nrows; i++)
+        if (f->rows[i].col_lo <= shim_col)
+            f->dedicated_shim = 0U;
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_plan_init shim_col=%u ctrl_id=%u resp_s2mm_ch=%d nrows=%u dedicated=%u "
+                      "add_rows_rc=%d\n",
+                      (unsigned)shim_col, (unsigned)ctrl_id, (int)resp_s2mm_ch, (unsigned)nrows,
+                      (unsigned)f->dedicated_shim, (int)rc););
+    if (rc != XAIE_OK)
+        printf("[aie_runtime] ctrl_plan_init ERROR rc=%d (shim_col=%u nrows=%u)\n", (int)rc, (unsigned)shim_col,
+               (unsigned)nrows);
     if (rc != XAIE_OK)
         return rc;
     /* Program the shim return leg now (row 0) so the return spine reaches the
@@ -4151,6 +4364,14 @@ AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, ui
      * is configured (resp_s2mm_ch < 0). */
     if (resp_s2mm_ch >= 0)
         rc = rt_ctrl_row_shim_return_route(f, resp_s2mm_ch);
+    return rc;
+}
+
+AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
+                               uint8_t ctrl_id, const __Runtime_CtrlRowChain *rows, uint8_t nrows) {
+    unsigned long long __cp_t0 = RT_PROF_TIC();
+    AieRC rc = rt_ctrl_plan_init(f, dev, shim_col, resp_s2mm_ch, ctrl_id, rows, nrows);
+    RT_PROF_ADD(g_ctrl_plan_cyc, g_ctrl_plan_n, __cp_t0);
     return rc;
 }
 
@@ -4172,6 +4393,8 @@ AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f) {
 static AieRC rt_ctrl_row_shim_entry(const __Runtime_CtrlRowFabric *f, int32_t mm2s_ch) {
     XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
     uint8_t fport = rt_shim_mm2s_port(mm2s_ch);
+    if (!f->dedicated_shim)
+        rt_ctrl_shim_park_data_masters(f, fport);
     AieRC rc = XAie_EnableShimDmaToAieStrmPort(f->dev, shim, fport);
     if (rc != XAIE_OK) {
         printf("[aie_runtime] ctrl_row: shim entry EnableShimDmaToAieStrmPort (%u,0) port=%u rc=%d\n",
@@ -4184,8 +4407,12 @@ static AieRC rt_ctrl_row_shim_entry(const __Runtime_CtrlRowFabric *f, int32_t mm
                (unsigned)f->shim_col, (unsigned)fport, (unsigned)RT_CTRL_VFWD, (int)rc);
         return rc;
     }
-    rt_pmap_port(f->shim_col, 0, "SOUTH", fport, "fwd", "slave", f->ctrl_id, "circuit", -1);
-    rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VFWD, "fwd", "master", f->ctrl_id, "circuit", -1);
+    if (rt_pmap_shim_first(f, 2U + (unsigned)mm2s_ch)) {
+        rt_pmap_port(f->shim_col, 0, "SOUTH", fport, "fwd", "slave", f->ctrl_id, "circuit", -1);
+        rt_pmap_port(f->shim_col, 0, "NORTH", RT_CTRL_VFWD, "fwd", "master", f->ctrl_id, "circuit", -1);
+    }
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_row shim entry OK (%u,0) SOUTH%u->NORTH%u\n", (unsigned)f->shim_col,
+                      (unsigned)fport, (unsigned)RT_CTRL_VFWD););
     return rc;
 }
 
@@ -4234,6 +4461,8 @@ AieRC __Runtime_ctrl_row_broadcast_write(__Runtime_CtrlRowFabric *f, uint32_t ti
         .resp_words = 0U,
     };
     rc = __Runtime_ctrl_push(&inst, pkt, pw, /*block=*/0, log);
+    if (rc == XAIE_OK)
+        rc = rt_ctrl_mm2s_wait(f->dev, f->shim_col, mm2s_ch);
     __Runtime_free_buffer(f->dev, pkt);
     return rc;
 }
@@ -4743,10 +4972,17 @@ static uint8_t rt_ctrl_row_return_poll(const __Runtime_CtrlRowFabric *f, int32_t
     XAie_LocType shim = XAie_TileLoc(f->shim_col, 0U);
     uint8_t pending = (uint8_t)npkt;
     for (uint32_t spin = 0U; spin < 200000U; spin++) {
-        (void)XAie_DmaGetPendingBdCount(f->dev, shim, (uint8_t)s2mm_ch, DMA_S2MM, &pending);
+        AieRC rc = XAie_DmaGetPendingBdCount(f->dev, shim, (uint8_t)s2mm_ch, DMA_S2MM, &pending);
+        if (rc != XAIE_OK) {
+            printf("[aie_runtime] ctrl_row_return poll ERROR ch=%d rc=%d expected=%d\n", s2mm_ch, (int)rc, npkt);
+            return 0xFFU;
+        }
         if (pending == 0U)
             break;
     }
+    if (pending != 0U)
+        printf("[aie_runtime] ctrl_row_return poll TIMEOUT ch=%d pending=%u expected=%d\n", s2mm_ch,
+               (unsigned)pending, npkt);
     __Runtime_sync_for_cpu(f->dev, token, (size_t)npkt * pkt_words * sizeof(uint32_t));
     return pending;
 }
@@ -4857,7 +5093,10 @@ AieRC __Runtime_ctrl_row_write_ack(__Runtime_CtrlRowFabric *f, uint8_t row, uint
         return rc;
     uint8_t sid = (uint8_t)(((uint8_t)ACR_CLASS_WHOLE_ROW << 2) | (rowidx & 0x3U)); /* id[4]=0 whole-row */
     uint32_t cap = nwords * 2U + 8U;
-    uint32_t *pkt = (uint32_t *)__Runtime_alloc_buffer(f->dev, (size_t)cap * sizeof(uint32_t));
+    uint32_t total = (uint32_t)ncols;
+    uint32_t token_off = (cap + 3U) & ~3U;
+    uint32_t *pkt =
+        (uint32_t *)__Runtime_alloc_buffer(f->dev, (size_t)(token_off + total) * sizeof(uint32_t));
     if (!pkt) {
         printf("[aie_runtime] ctrl_row_write_ack ERROR: request buffer alloc failed\n");
         return XAIE_ERR;
@@ -4870,17 +5109,12 @@ AieRC __Runtime_ctrl_row_write_ack(__Runtime_CtrlRowFabric *f, uint8_t row, uint
         return XAIE_ERR;
     }
     __Runtime_sync_for_dev(f->dev, pkt, (size_t)pw * sizeof(uint32_t));
-    uint32_t total = per_pkt * (uint32_t)ncols;
-    uint32_t *token = (uint32_t *)__Runtime_alloc_buffer(f->dev, (size_t)total * sizeof(uint32_t));
-    if (!token) {
-        __Runtime_free_buffer(f->dev, pkt);
-        return XAIE_ERR;
-    }
+    total = per_pkt * (uint32_t)ncols;
+    uint32_t *token = pkt + token_off;
     for (uint32_t i = 0U; i < total; i++)
         token[i] = 0U;
     rc = rt_ctrl_row_shim_return(f, f->resp_s2mm_ch, bd_id + 1, ncols, per_pkt, token);
     if (rc != XAIE_OK) {
-        __Runtime_free_buffer(f->dev, token);
         __Runtime_free_buffer(f->dev, pkt);
         return rc;
     }
@@ -4898,7 +5132,6 @@ AieRC __Runtime_ctrl_row_write_ack(__Runtime_CtrlRowFabric *f, uint8_t row, uint
     };
     rc = __Runtime_ctrl_push(&inst, pkt, pw, /*block=*/0, /*log=*/0);
     if (rc != XAIE_OK) {
-        __Runtime_free_buffer(f->dev, token);
         __Runtime_free_buffer(f->dev, pkt);
         return rc;
     }
@@ -4908,7 +5141,6 @@ AieRC __Runtime_ctrl_row_write_ack(__Runtime_CtrlRowFabric *f, uint8_t row, uint
                (unsigned)row);
     AIEHLC_LOG(printf("[aie_runtime] ctrl_row_write_ack row=%u addr=0x%x nwords=%u acks=%d drained=%d\n", (unsigned)row,
                       tile_addr, nwords, ncols, ncols - (int)pending););
-    __Runtime_free_buffer(f->dev, token);
     __Runtime_free_buffer(f->dev, pkt);
     return (pending == 0U) ? XAIE_OK : XAIE_ERR;
 }
@@ -5436,6 +5668,542 @@ struct_kernel_group __Runtime_load_kernel_group_16t(XAie_DevInst *dev, XAie_LocT
     return __Runtime_load_kernel_group_nt(dev, arr, n);
 }
 
+#define RT_CTRL_ELF_CHUNK_WORDS 4U
+#define RT_CTRL_ELF_SKIP_ADDR 0xFFFFFFFFU
+#define RT_CTRL_ELF_ACK_WAVE 3U
+#define RT_CTRL_ELF_PKT_STRIDE 8U
+#define RT_CTRL_ELF_RET_BD RT_RES_CTRL_ACK_BD_LO
+#define RT_CTRL_ELF_NBD 4U
+#define RT_CTRL_ELF_QDEPTH 3U
+#define RT_CTRL_ELF_RESET_ACC 2U
+
+static AieRC rt_ctrl_elf_target(XAie_DevInst *dev, XAie_LocType loc, uint32_t paddr, uint32_t *tile_addr) {
+    const XAie_CoreMod *core = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    if (paddr < core->ProgMemSize) {
+        *tile_addr = core->ProgMemHostOffset + paddr;
+        return XAIE_OK;
+    }
+    if (paddr < core->DataMemAddr || paddr >= core->DataMemAddr + core->DataMemSize * 4U)
+        return XAIE_INVALID_ELF;
+    uint8_t dir = (uint8_t)(paddr / core->DataMemSize);
+    uint8_t parity = core->IsCheckerBoard ? (uint8_t)(loc.Row & 1U) : 1U;
+    XAie_LocType target = loc;
+    if (dir == 4U)
+        target.Row--;
+    else if (dir == 5U && parity)
+        target.Col--;
+    else if (dir == 6U)
+        target.Row++;
+    else if (dir == 7U && !parity)
+        target.Col++;
+    else if (dir < 4U || dir > 7U)
+        return XAIE_INVALID_ELF;
+    if (target.Col != loc.Col || target.Row != loc.Row) {
+        *tile_addr = RT_CTRL_ELF_SKIP_ADDR;
+        return XAIE_OK;
+    }
+    *tile_addr = paddr & (core->DataMemSize - 1U);
+    return XAIE_OK;
+}
+
+static AieRC rt_ctrl_bcast_push(__Runtime_CtrlRowFabric *fab, uint32_t *pkt, uint32_t nwords, int32_t bd_id,
+                                int32_t mm2s_ch) {
+    if (!nwords)
+        return XAIE_OK;
+    AieRC rc = rt_ctrl_row_shim_entry(fab, mm2s_ch);
+    if (rc != XAIE_OK)
+        return rc;
+    const __Runtime_CtrlRowChain *last = &fab->rows[fab->nrows - 1U];
+    __Runtime_sync_for_dev(fab->dev, pkt, (size_t)nwords * sizeof(uint32_t));
+    __Runtime_CtrlInstance inst = {
+        .dev = fab->dev,
+        .shim_col = fab->shim_col,
+        .dest_col = last->col_lo,
+        .dest_row = last->row,
+        .stream_id = (uint8_t)ACR_ID_BCAST,
+        .bd_id = bd_id,
+        .mm2s_ch = mm2s_ch,
+        .s2mm_ch = 0,
+        .token = NULL,
+        .resp_words = 0U,
+    };
+    rc = __Runtime_ctrl_push(&inst, pkt, nwords, /*block=*/0, /*log=*/0);
+    if (rc == XAIE_OK)
+        rc = rt_ctrl_mm2s_wait(fab->dev, fab->shim_col, mm2s_ch);
+    return rc;
+}
+
+static uint32_t rt_ctrl_elf_count_pkts(XAie_DevInst *dev, const uint8_t *elf, XAie_LocType loc) {
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elf;
+    uint32_t npkt = 0U;
+    for (uint32_t i = 0U; i < ehdr->e_phnum; i++) {
+        const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elf + ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize);
+        if (phdr->p_type != (uint32_t)PT_LOAD || phdr->p_filesz == 0U)
+            continue;
+        uint32_t tile_addr = 0U;
+        if (rt_ctrl_elf_target(dev, loc, phdr->p_paddr, &tile_addr) != XAIE_OK ||
+            tile_addr == RT_CTRL_ELF_SKIP_ADDR)
+            continue;
+        npkt += (phdr->p_filesz + (uint32_t)sizeof(uint32_t) * RT_CTRL_ELF_CHUNK_WORDS - 1U) /
+                ((uint32_t)sizeof(uint32_t) * RT_CTRL_ELF_CHUNK_WORDS);
+    }
+    return npkt;
+}
+
+static uint32_t rt_ctrl_elf_pkt_len(const uint32_t *acc) { return 2U + (((acc[1] >> 20) & 0x3U) + 1U); }
+
+static AieRC rt_ctrl_elf_put(uint32_t *pkt, uint32_t max_acc, int packed, uint32_t *acc, uint32_t *payload_words,
+                             uint32_t tile_addr, const uint32_t *words, uint32_t nwords) {
+    if (*acc >= max_acc)
+        return XAIE_ERR;
+    uint32_t capacity = max_acc * RT_CTRL_ELF_PKT_STRIDE;
+    uint32_t slot_off = packed ? *payload_words : *acc * RT_CTRL_ELF_PKT_STRIDE;
+    uint32_t slot_cap = packed ? capacity - slot_off : RT_CTRL_ELF_PKT_STRIDE;
+    uint32_t got = __Runtime_ctrl_pktize_write(pkt + slot_off, slot_cap, (uint8_t)ACR_ID_BCAST, tile_addr, words,
+                                               nwords, 0, 0U, NULL);
+    if (got == 0U)
+        return XAIE_ERR;
+    (*acc)++;
+    *payload_words += got;
+    return XAIE_OK;
+}
+
+static AieRC rt_ctrl_elf_core_reset(XAie_DevInst *dev, uint32_t *pkt, uint32_t max_acc, int packed, uint32_t *acc,
+                                    uint32_t *payload_words) {
+    const XAie_RegCoreCtrl *ctrl = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod->CoreCtrl;
+    uint32_t reset = ctrl->CtrlRst.Mask;
+    uint32_t unreset = 0U;
+    AieRC rc = rt_ctrl_elf_put(pkt, max_acc, packed, acc, payload_words, ctrl->RegOff, &reset, 1U);
+    if (rc == XAIE_OK)
+        rc = rt_ctrl_elf_put(pkt, max_acc, packed, acc, payload_words, ctrl->RegOff, &unreset, 1U);
+    return rc;
+}
+
+static inline uint32_t rt_ctrl_odd_parity_bit(uint32_t v) { return (uint32_t)(!__builtin_parity(v)) << 31U; }
+
+static AieRC rt_ctrl_elf_fill_seg_packed(const uint8_t *src, uint32_t filesz, uint32_t tile_addr, uint32_t *pkt,
+                                         uint32_t capacity, uint32_t *acc, uint32_t *payload_words,
+                                         uint32_t *last_addr, uint32_t *last_value) {
+    const uint32_t pkt_hdr = (uint32_t)ACR_ID_BCAST | rt_ctrl_odd_parity_bit((uint32_t)ACR_ID_BCAST);
+    uint32_t pw = *payload_words;
+    uint32_t off = 0U;
+    uint32_t words[RT_CTRL_ELF_CHUNK_WORDS];
+    uint32_t nwords = 0U;
+    for (; off < filesz; off += (uint32_t)sizeof(words)) {
+        uint32_t chunk = filesz - off < (uint32_t)sizeof(words) ? filesz - off : (uint32_t)sizeof(words);
+        nwords = (chunk + 3U) / 4U;
+        if (pw + 2U + nwords > capacity)
+            return XAIE_ERR;
+        if (chunk < (uint32_t)sizeof(words))
+            memset(words, 0, sizeof(words));
+        memcpy(words, src + off, chunk);
+        uint32_t ctrl = (((nwords - 1U) & 0x3U) << 20U) | ((tile_addr + off) & 0xFFFFFU);
+        pkt[pw] = pkt_hdr;
+        pkt[pw + 1U] = ctrl | rt_ctrl_odd_parity_bit(ctrl);
+        memcpy(pkt + pw + 2U, words, nwords * sizeof(uint32_t));
+        pw += 2U + nwords;
+        (*acc)++;
+    }
+    if (nwords) {
+        uint32_t last_off = off - (uint32_t)sizeof(words);
+        *last_addr = tile_addr + last_off + (nwords - 1U) * (uint32_t)sizeof(uint32_t);
+        *last_value = words[nwords - 1U];
+    }
+    *payload_words = pw;
+    return XAIE_OK;
+}
+
+static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const uint8_t *elf, XAie_LocType loc, uint32_t *pkt, uint32_t max_acc,
+                              int packed, uint32_t *nacc_out, uint32_t *payload_words_out,
+                              uint32_t *last_addr_out, uint32_t *last_value_out) {
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elf;
+    uint32_t acc = 0U;
+    uint32_t payload_words = 0U;
+    uint32_t last_addr = 0U;
+    uint32_t last_value = 0U;
+    AieRC reset_rc = rt_ctrl_elf_core_reset(dev, pkt, max_acc, packed, &acc, &payload_words);
+    if (reset_rc != XAIE_OK)
+        return reset_rc;
+    for (uint32_t i = 0U; i < ehdr->e_phnum; i++) {
+        const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elf + ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize);
+        if (phdr->p_type != (uint32_t)PT_LOAD || phdr->p_filesz == 0U)
+            continue;
+        uint32_t tile_addr = 0U;
+        AieRC rc = rt_ctrl_elf_target(dev, loc, phdr->p_paddr, &tile_addr);
+        if (rc != XAIE_OK)
+            return rc;
+        if (tile_addr == RT_CTRL_ELF_SKIP_ADDR)
+            continue;
+        if (packed) {
+            rc = rt_ctrl_elf_fill_seg_packed(elf + phdr->p_offset, phdr->p_filesz, tile_addr, pkt,
+                                             max_acc * RT_CTRL_ELF_PKT_STRIDE, &acc, &payload_words, &last_addr,
+                                             &last_value);
+            if (rc != XAIE_OK)
+                return rc;
+            continue;
+        }
+        uint32_t byte_off = 0U;
+        while (byte_off < phdr->p_filesz) {
+            uint32_t words[RT_CTRL_ELF_CHUNK_WORDS];
+            uint32_t chunk_bytes = phdr->p_filesz - byte_off;
+            if (chunk_bytes > sizeof(words))
+                chunk_bytes = sizeof(words);
+            uint32_t nwords = (chunk_bytes + 3U) / 4U;
+            memset(words, 0, sizeof(words));
+            memcpy(words, elf + phdr->p_offset + byte_off, chunk_bytes);
+            rc = rt_ctrl_elf_put(pkt, max_acc, packed, &acc, &payload_words, tile_addr + byte_off, words, nwords);
+            if (rc != XAIE_OK)
+                return rc;
+            last_addr = tile_addr + byte_off + (nwords - 1U) * sizeof(uint32_t);
+            last_value = words[nwords - 1U];
+            byte_off += chunk_bytes;
+        }
+    }
+    *nacc_out = acc;
+    *payload_words_out = payload_words;
+    *last_addr_out = last_addr;
+    *last_value_out = last_value;
+    return XAIE_OK;
+}
+
+static AieRC rt_ctrl_elf_ack_drain(__Runtime_CtrlRowFabric *fab, uint32_t *token, int nacks) {
+    int remaining = nacks;
+    int wave_idx = 0;
+    while (remaining > 0) {
+        int wave = remaining > RT_CTRL_ELF_ACK_WAVE ? RT_CTRL_ELF_ACK_WAVE : remaining;
+        if (wave_idx > 0) {
+            AieRC rc = rt_ctrl_row_shim_return(fab, fab->resp_s2mm_ch, RT_CTRL_ELF_RET_BD, wave, 1U, token);
+            if (rc != XAIE_OK)
+                return rc;
+        }
+        uint8_t pending = rt_ctrl_row_return_poll(fab, fab->resp_s2mm_ch, wave, 1U, token);
+        AIEHLC_LOG(
+            printf("[aie_runtime] ctrl_elf ack wave=%d count=%d pending=%u\n", wave_idx, wave, (unsigned)pending););
+        if (pending != 0U) {
+            printf("[aie_runtime] ctrl_elf ack TIMEOUT wave=%d count=%d pending=%u\n", wave_idx, wave,
+                   (unsigned)pending);
+            return XAIE_ERR;
+        }
+        remaining -= wave;
+        wave_idx++;
+    }
+    return XAIE_OK;
+}
+
+static void rt_ctrl_elf_timeout_dump(__Runtime_CtrlRowFabric *fab, const uint32_t *pkt, uint32_t nwords) {
+    uint32_t dump_words = nwords < 24U ? nwords : 24U;
+    printf("[aie_runtime] ctrl_elf tx first_words:");
+    for (uint32_t i = 0U; i < dump_words; i++)
+        printf(" %u:%08x", (unsigned)i, (unsigned)pkt[i]);
+    printf("\n");
+    static const uint32_t addrs[] = {0x20000U, 0x20004U, 0x20008U, 0x2000CU,
+                                     0x20010U, 0x20014U, 0x20018U, 0x2001CU,
+                                     0x20020U, 0x20024U, 0x20028U, 0x2002CU};
+    for (uint8_t ri = 0U; ri < fab->nrows; ri++) {
+        const __Runtime_CtrlRowChain *row = &fab->rows[ri];
+        uint8_t cols[2] = {row->col_lo, row->col_hi};
+        for (uint8_t ci = 0U; ci < 2U; ci++) {
+            if (ci == 1U && cols[ci] == cols[0])
+                continue;
+            printf("[aie_runtime] ctrl_elf pmem tile(%u,%u):", (unsigned)cols[ci], (unsigned)row->row);
+            uint64_t base = XAie_GetTileAddr(fab->dev, row->row, cols[ci]);
+            for (uint32_t ai = 0U; ai < sizeof(addrs) / sizeof(addrs[0]); ai++) {
+                uint32_t value = 0xDEADBEEFU;
+                AieRC rc = XAie_Read32(fab->dev, base + addrs[ai], &value);
+                printf(" %05x=%08x/%d", (unsigned)addrs[ai], (unsigned)value, (int)rc);
+            }
+            printf("\n");
+        }
+    }
+}
+
+static AieRC rt_ctrl_elf_dma(__Runtime_CtrlRowFabric *fab, uint32_t *pkt, uint32_t nacc, uint32_t payload_words,
+                             uint32_t *ack, uint32_t ack_words, uint32_t *token, int nacks, int32_t bd_id,
+                             int32_t mm2s_ch) {
+    AieRC rc = rt_ctrl_row_shim_entry(fab, mm2s_ch);
+    if (rc != XAIE_OK)
+        return rc;
+    int wave = nacks > RT_CTRL_ELF_ACK_WAVE ? RT_CTRL_ELF_ACK_WAVE : nacks;
+    const __Runtime_CtrlRowChain *last = &fab->rows[fab->nrows - 1U];
+    __Runtime_CtrlInstance inst = {
+        .dev = fab->dev,
+        .shim_col = fab->shim_col,
+        .dest_col = last->col_lo,
+        .dest_row = last->row,
+        .stream_id = (uint8_t)ACR_ID_BCAST,
+        .bd_id = bd_id,
+        .mm2s_ch = mm2s_ch,
+        .s2mm_ch = fab->resp_s2mm_ch,
+        .token = token,
+        .resp_words = (uint32_t)wave,
+    };
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_elf_dma per-packet accesses=%u first=[%08x %08x]\n", (unsigned)nacc,
+                      (unsigned)pkt[0], (unsigned)pkt[1]););
+    if (g_ctrl_high_throughput_ready) {
+        rc = __Runtime_ctrl_push(&inst, pkt, payload_words, 0, 0);
+        if (rc != XAIE_OK) {
+            return rc;
+        }
+    } else {
+        for (uint32_t i = 0U; i < nacc; i++) {
+            uint32_t *slot = pkt + (size_t)i * RT_CTRL_ELF_PKT_STRIDE;
+            rc = rt_ctrl_mm2s_wait_below(fab->dev, fab->shim_col, mm2s_ch, RT_CTRL_ELF_QDEPTH);
+            if (rc != XAIE_OK) {
+                printf("[aie_runtime] ctrl_elf_dma stalled on access %u/%u\n", (unsigned)i, (unsigned)nacc);
+                rt_ctrl_elf_timeout_dump(fab, slot, rt_ctrl_elf_pkt_len(slot));
+                return rc;
+            }
+            inst.bd_id = bd_id + (int32_t)(i % RT_CTRL_ELF_NBD);
+            rc = __Runtime_ctrl_push(&inst, slot, rt_ctrl_elf_pkt_len(slot), /*block=*/0, /*log=*/0);
+            if (rc != XAIE_OK)
+                return rc;
+        }
+    }
+    inst.bd_id = bd_id;
+    rc = rt_ctrl_mm2s_wait(fab->dev, fab->shim_col, mm2s_ch);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl_elf_dma stalled draining %u accesses\n", (unsigned)nacc);
+        rt_ctrl_elf_timeout_dump(fab, pkt, rt_ctrl_elf_pkt_len(pkt));
+        return rc;
+    }
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_elf_dma per-packet complete accesses=%u\n", (unsigned)nacc););
+    rc = rt_ctrl_row_shim_return(fab, fab->resp_s2mm_ch, RT_CTRL_ELF_RET_BD, wave, 1U, token);
+    if (rc != XAIE_OK)
+        return rc;
+    inst.stream_id = (uint8_t)(((uint8_t)ACR_CLASS_WHOLE_ROW << 2) | ((fab->nrows - 1U) & 0x3U));
+    inst.dest_row = last->row;
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_elf_dma final ack row=%u sid=%u words=%u acks=%d\n", (unsigned)last->row,
+                      (unsigned)inst.stream_id, (unsigned)ack_words, nacks););
+    rc = __Runtime_ctrl_push(&inst, ack, ack_words, /*block=*/0, /*log=*/0);
+    if (rc != XAIE_OK)
+        return rc;
+    rc = rt_ctrl_mm2s_wait(fab->dev, fab->shim_col, mm2s_ch);
+    if (rc != XAIE_OK)
+        return rc;
+    return rt_ctrl_elf_ack_drain(fab, token, nacks);
+}
+
+static AieRC rt_ctrl_elf_ret_arm(__Runtime_CtrlRowFabric *fab, uint32_t *token, uint32_t nresp) {
+    XAie_DevInst *dev = fab->dev;
+    XAie_LocType shim = XAie_TileLoc(fab->shim_col, 0U);
+    uint8_t ch = (uint8_t)fab->resp_s2mm_ch;
+    AieRC rc = rt_ctrl_row_shim_return_route(fab, fab->resp_s2mm_ch);
+    if (rc != XAIE_OK)
+        return rc;
+    uint64_t offset = 0U;
+    XAie_MemInst *mem = __vaddr_to_mem_offset(token, &offset);
+    if (!mem)
+        return XAIE_ERR;
+    uint64_t dev_addr = XAie_MemGetDevAddr(mem) + offset;
+#ifdef __AIESIM__
+    ess_WriteGM(dev_addr, token, (uint64_t)nresp * sizeof(uint32_t));
+#endif
+    XAie_DmaChannelDesc chdesc;
+    rc = XAie_DmaChannelDescInit(dev, &chdesc, shim);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaChannelSetFoTMode(&chdesc, DMA_FoT_DISABLED);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaWriteChannel(dev, &chdesc, shim, ch, DMA_S2MM);
+    XAie_DmaDesc desc;
+    if (rc == XAIE_OK)
+        rc = XAie_DmaDescInit(dev, &desc, shim);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaSetAddrLen(&desc, dev_addr, nresp * (uint32_t)sizeof(uint32_t));
+    if (rc == XAIE_OK)
+        rc = XAie_DmaEnableBd(&desc);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaSetAxi(&desc, 0U, 16U, 0U, 0U, 0U);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaWriteBd(dev, &desc, shim, (uint8_t)RT_CTRL_ELF_RET_BD);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaChannelPushBdToQueue(dev, shim, ch, DMA_S2MM, (uint8_t)RT_CTRL_ELF_RET_BD);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaChannelEnable(dev, shim, ch, DMA_S2MM);
+    if (rc != XAIE_OK)
+        printf("[aie_runtime] ctrl_elf ret arm ERROR: shim(%u,0) ch=%u rc=%d\n", (unsigned)fab->shim_col,
+               (unsigned)ch, (int)rc);
+    return rc;
+}
+
+static AieRC rt_ctrl_elf_dma_packed(__Runtime_CtrlRowFabric *fab, uint32_t *pkt, uint32_t payload_words,
+                                    uint32_t *token, uint32_t nresp, int32_t bd_id, int32_t mm2s_ch) {
+    AieRC rc = rt_ctrl_row_shim_entry(fab, mm2s_ch);
+    if (rc == XAIE_OK)
+        rc = rt_ctrl_elf_ret_arm(fab, token, nresp);
+    if (rc != XAIE_OK)
+        return rc;
+    const __Runtime_CtrlRowChain *last = &fab->rows[fab->nrows - 1U];
+    __Runtime_CtrlInstance inst = {
+        .dev = fab->dev,
+        .shim_col = fab->shim_col,
+        .dest_col = last->col_lo,
+        .dest_row = last->row,
+        .stream_id = (uint8_t)ACR_ID_BCAST,
+        .bd_id = bd_id,
+        .mm2s_ch = mm2s_ch,
+        .s2mm_ch = fab->resp_s2mm_ch,
+        .token = token,
+        .resp_words = nresp,
+    };
+    rc = __Runtime_ctrl_push(&inst, pkt, payload_words, /*block=*/0, /*log=*/0);
+    if (rc != XAIE_OK)
+        return rc;
+    uint8_t pending = rt_ctrl_row_return_poll(fab, fab->resp_s2mm_ch, 1, nresp, token);
+    if (pending != 0U) {
+        printf("[aie_runtime] ctrl_elf ack TIMEOUT: %u responses expected\n", (unsigned)nresp);
+        rt_ctrl_elf_timeout_dump(fab, pkt, rt_ctrl_elf_pkt_len(pkt));
+        return XAIE_ERR;
+    }
+    return rt_ctrl_mm2s_wait(fab->dev, fab->shim_col, mm2s_ch);
+}
+
+static uint32_t rt_ctrl_fabric_tiles(const __Runtime_CtrlRowFabric *fab) {
+    uint32_t n = 0U;
+    for (uint8_t ri = 0U; ri < fab->nrows; ri++)
+        n += (uint32_t)fab->rows[ri].col_hi - (uint32_t)fab->rows[ri].col_lo + 1U;
+    return n;
+}
+
+static AieRC rt_ctrl_load_elf_packed(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, XAie_LocType loc,
+                                     uint32_t npkt_cap, int32_t bd_id, int32_t mm2s_ch) {
+    uint32_t nresp = rt_ctrl_fabric_tiles(fab);
+    uint32_t data_cap = npkt_cap * RT_CTRL_ELF_PKT_STRIDE + 3U;
+    uint32_t token_off = (data_cap + 3U) & ~3U;
+    uint32_t *pkt = (uint32_t *)__Runtime_alloc_buffer(fab->dev, (size_t)(token_off + nresp) * sizeof(uint32_t));
+    if (!pkt)
+        return XAIE_ERR;
+    uint32_t *token = pkt + token_off;
+    uint32_t nacc = 0U, payload_words = 0U, last_addr = 0U, last_value = 0U;
+    AieRC rc = rt_ctrl_elf_fill(fab->dev, elf, loc, pkt, npkt_cap, 1, &nacc, &payload_words, &last_addr, &last_value);
+    uint32_t ack_words = 0U;
+    if (rc == XAIE_OK && nacc > 0U && payload_words > 0U)
+        ack_words = __Runtime_ctrl_pktize_write(pkt + payload_words, data_cap - payload_words, (uint8_t)ACR_ID_BCAST,
+                                                last_addr, &last_value, 1U, 1, 0U, NULL);
+    if (ack_words == 0U) {
+        rc = rc == XAIE_OK ? XAIE_ERR : rc;
+    } else {
+        payload_words += ack_words;
+        __Runtime_sync_for_dev(fab->dev, pkt, (size_t)(token_off + nresp) * sizeof(uint32_t));
+        rc = rt_ctrl_elf_dma_packed(fab, pkt, payload_words, token, nresp, bd_id, mm2s_ch);
+    }
+    __Runtime_free_buffer(fab->dev, pkt);
+    return rc;
+}
+
+static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, int32_t bd_id, int32_t mm2s_ch) {
+    if (!fab || !fab->dev || !elf || fab->nrows == 0U)
+        return XAIE_INVALID_ARGS;
+    XAie_LocType loc = XAie_TileLoc(fab->rows[0].col_lo, fab->rows[0].row);
+    uint32_t npkt_cap = rt_ctrl_elf_count_pkts(fab->dev, elf, loc);
+    if (npkt_cap == 0U)
+        return XAIE_OK;
+    npkt_cap += RT_CTRL_ELF_RESET_ACC;
+    if (g_ctrl_high_throughput_ready)
+        return rt_ctrl_load_elf_packed(fab, elf, loc, npkt_cap, bd_id, mm2s_ch);
+    const __Runtime_CtrlRowChain *last = &fab->rows[fab->nrows - 1U];
+    int nacks = (int)last->col_hi - (int)last->col_lo + 1;
+    int wave = nacks > RT_CTRL_ELF_ACK_WAVE ? RT_CTRL_ELF_ACK_WAVE : nacks;
+    uint32_t data_cap = npkt_cap * RT_CTRL_ELF_PKT_STRIDE;
+    uint32_t ack_off = (data_cap + 3U) & ~3U;
+    uint32_t token_off = ack_off + 4U;
+    uint32_t *pkt = (uint32_t *)__Runtime_alloc_buffer(
+        fab->dev, (size_t)(token_off + (uint32_t)wave * 4U) * sizeof(uint32_t));
+    if (!pkt)
+        return XAIE_ERR;
+    uint32_t nacc = 0U, payload_words = 0U, last_addr = 0U, last_value = 0U;
+    AieRC rc = rt_ctrl_elf_fill(fab->dev, elf, loc, pkt, npkt_cap, g_ctrl_high_throughput_ready, &nacc, &payload_words,
+                                &last_addr, &last_value);
+    uint32_t *ack = pkt + ack_off;
+    uint8_t sid = (uint8_t)(((uint8_t)ACR_CLASS_WHOLE_ROW << 2) | ((fab->nrows - 1U) & 0x3U));
+    uint32_t ack_words = __Runtime_ctrl_pktize_write(ack, 4U, sid, last_addr, &last_value, 1U, 1, 0U, NULL);
+    AIEHLC_LOG(printf("[aie_runtime] ctrl_elf pktize rc=%d cap=%u accesses=%u final_addr=0x%x ack_words=%u acks=%d\n",
+                      (int)rc, (unsigned)npkt_cap, (unsigned)nacc, (unsigned)last_addr, (unsigned)ack_words, nacks););
+    if (rc == XAIE_OK && nacc > 0U && payload_words > 0U && ack_words > 0U) {
+        __Runtime_sync_for_dev(fab->dev, pkt, (size_t)(ack_off + ack_words) * sizeof(uint32_t));
+        rc = rt_ctrl_elf_dma(fab, pkt, nacc, payload_words, ack, ack_words, pkt + token_off, nacks, bd_id, mm2s_ch);
+    } else if (rc == XAIE_OK) {
+        rc = XAIE_ERR;
+    }
+    __Runtime_free_buffer(fab->dev, pkt);
+    return rc;
+}
+
+static AieRC rt_ctrl_kernel_state_write(__Runtime_CtrlRowFabric *fab, uint32_t value, int32_t bd_id,
+                                        int32_t mm2s_ch) {
+    const XAie_CoreMod *core = fab->dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    return __Runtime_ctrl_row_broadcast_write(fab, core->CoreCtrl->RegOff, &value, 1U, bd_id, mm2s_ch, 0);
+}
+
+static int rt_ctrl_kernel_tiles_match(const __Runtime_CtrlRowFabric *fab, const XAie_LocType *tiles, int n) {
+    int fabric_tiles = 0;
+    for (uint8_t ri = 0U; ri < fab->nrows; ri++)
+        fabric_tiles += (int)fab->rows[ri].col_hi - (int)fab->rows[ri].col_lo + 1;
+    if (fabric_tiles != n)
+        return 0;
+    for (int i = 0; i < n; i++) {
+        int found = 0;
+        for (uint8_t ri = 0U; ri < fab->nrows; ri++) {
+            const __Runtime_CtrlRowChain *r = &fab->rows[ri];
+            if (tiles[i].Row == r->row && tiles[i].Col >= r->col_lo && tiles[i].Col <= r->col_hi) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            return 0;
+    }
+    return 1;
+}
+
+static struct_kernel_group rt_ctrl_load_kernel_group_nt(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
+                                                         XAie_LocType *tiles, int n, int32_t bd_id,
+                                                         int32_t mm2s_ch) {
+    unsigned long long __kl_t0 = RT_PROF_TIC();
+    struct_kernel_group kg = {.tiles = s_kernel_tiles, .num_tiles = 0U, .elf_buffers = NULL};
+    if (!dev || !fab || fab->dev != dev || !s_active_kernel_elf || n <= 0 || n > MAX_KERNEL_TILES ||
+        !rt_ctrl_kernel_tiles_match(fab, tiles, n)) {
+        printf("[aie_runtime] ctrl kernel load ERROR: invalid fabric, ELF, or tile coverage\n");
+        return kg;
+    }
+    for (int i = 0; i < n; i++)
+        s_kernel_tiles[i] = tiles[i];
+    unsigned long long __ke0 = RT_PROF_TIC();
+    AieRC rc = rt_ctrl_load_elf(fab, s_active_kernel_elf, bd_id, mm2s_ch);
+    RT_PROF_ADD(g_kl_elf_cyc, g_kl_elf_n, __ke0);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl kernel load ERROR: rc=%d\n", (int)rc);
+        return kg;
+    }
+    kg.num_tiles = (uint32_t)n;
+    AIEHLC_LOG(printf("[aie_runtime] ctrl kernel load PASS: tiles=%d rows=%u\n", n, (unsigned)fab->nrows););
+    RT_PROF_PHASE(PH_KLOAD, __kl_t0);
+    return kg;
+}
+
+struct_kernel_group __Runtime_load_kernel_group_4t_ctrl(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
+                                                        XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+                                                        XAie_LocType t3, int n, int32_t bd_id, int32_t mm2s_ch) {
+    XAie_LocType tiles[] = {t0, t1, t2, t3};
+    return rt_ctrl_load_kernel_group_nt(dev, fab, tiles, n, bd_id, mm2s_ch);
+}
+
+struct_kernel_group __Runtime_load_kernel_group_8t_ctrl(
+    XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+    XAie_LocType t3, XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, int n, int32_t bd_id,
+    int32_t mm2s_ch) {
+    XAie_LocType tiles[] = {t0, t1, t2, t3, t4, t5, t6, t7};
+    return rt_ctrl_load_kernel_group_nt(dev, fab, tiles, n, bd_id, mm2s_ch);
+}
+
+struct_kernel_group __Runtime_load_kernel_group_16t_ctrl(
+    XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+    XAie_LocType t3, XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, XAie_LocType t8,
+    XAie_LocType t9, XAie_LocType t10, XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14,
+    XAie_LocType t15, int n, int32_t bd_id, int32_t mm2s_ch) {
+    XAie_LocType tiles[] = {t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15};
+    return rt_ctrl_load_kernel_group_nt(dev, fab, tiles, n, bd_id, mm2s_ch);
+}
+
 /**
  * Enable AIE cores using transaction batching.
  * Reference: aeg_runtime_api.cpp graph_api::run() lines 176-181
@@ -5459,14 +6227,7 @@ void __Runtime_core_run(XAie_DevInst *dev, XAie_LocType *tiles, uint32_t num_til
  * Launch kernel group (start cores)
  * Reference: aeg_runtime_api.cpp graph_api::run()
  */
-struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_group kg) {
-    struct_event evt;
-    evt.tiles = kg.tiles;
-    evt.num_tiles = kg.num_tiles;
-    evt.timeout_us = 100000;
-
-    AIEHLC_LOG(printf("[aie_runtime] launch_kernel_group num_tiles=%u\n", (unsigned)kg.num_tiles););
-
+static void rt_kernel_profile_setup(XAie_DevInst *dev, struct_kernel_group kg) {
 #if AIEHLC_PROFILING
     if (AIE_DEBUG_HAS_FLAG(g_runtime_debug_level, AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER)) {
         for (uint32_t i = 0; i < kg.num_tiles; i++) {
@@ -5490,12 +6251,51 @@ struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_grou
             }
         }
     }
+#else
+    (void)dev;
+    (void)kg;
 #endif
+}
+
+struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_group kg) {
+    struct_event evt;
+    evt.tiles = kg.tiles;
+    evt.num_tiles = kg.num_tiles;
+    evt.timeout_us = 100000;
+
+    AIEHLC_LOG(printf("[aie_runtime] launch_kernel_group num_tiles=%u\n", (unsigned)kg.num_tiles););
+    rt_kernel_profile_setup(dev, kg);
 
     unsigned long long __ce_t0 = RT_PROF_TIC();
     __Runtime_core_run(dev, kg.tiles, kg.num_tiles);
     RT_PROF_PHASE(PH_COREEN, __ce_t0);
 
+    return evt;
+}
+
+struct_event __Runtime_launch_kernel_group_ctrl(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
+                                                struct_kernel_group kg, int32_t bd_id, int32_t mm2s_ch) {
+    struct_event evt = {.tiles = kg.tiles, .num_tiles = kg.num_tiles, .timeout_us = 100000U};
+    if (!dev || !fab || fab->dev != dev || kg.num_tiles == 0U ||
+        !rt_ctrl_kernel_tiles_match(fab, kg.tiles, (int)kg.num_tiles)) {
+        printf("[aie_runtime] ctrl kernel launch ERROR: invalid fabric or tile coverage (num_tiles=%u)\n",
+               (unsigned)(kg.num_tiles));
+        evt.num_tiles = 0U;
+        return evt;
+    }
+    rt_kernel_profile_setup(dev, kg);
+    const XAie_CoreMod *core = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
+    uint32_t enable = core->CoreCtrl->CtrlEn.Mask;
+    unsigned long long t0 = RT_PROF_TIC();
+    AieRC rc = rt_ctrl_kernel_state_write(fab, enable, bd_id, mm2s_ch);
+    RT_PROF_PHASE(PH_COREEN, t0);
+    if (rc != XAIE_OK) {
+        printf("[aie_runtime] ctrl kernel launch ERROR: rc=%d\n", (int)rc);
+        evt.num_tiles = 0U;
+    } else {
+        AIEHLC_LOG(printf("[aie_runtime] ctrl kernel launch PASS: tiles=%u\n", (unsigned)kg.num_tiles););
+    }
+    (void)__Runtime_ctrl_plan_release(fab, mm2s_ch);
     return evt;
 }
 

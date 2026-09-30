@@ -1,0 +1,31 @@
+# Single-kernel simulator check for tutorial/example.cpp.
+name: Single-kernel flow sim
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: sim-tutorial-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sim-tutorial:
+    name: Single-kernel flow (tutorial/example.cpp)
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build, simulate, check result
+        run: bash script/ci/pr_sim_test.sh tutorial
+
+      - name: Upload simulator log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-tutorial-log
+          path: ci-public.log
+          if-no-files-found: ignore

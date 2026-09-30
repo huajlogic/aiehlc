@@ -298,6 +298,66 @@ static std::string resolveArgDimBuiltin(const std::string &body, const std::stri
     return out;
 }
 
+static void publishControlPlacement(mlir::ModuleOp module, const ControlShimPlacement &p) {
+    mlir::OpBuilder b(module.getContext());
+    module->setAttr("routing.control_plan_shim_col", b.getI64IntegerAttr(p.col));
+    module->setAttr("routing.control_plan_mm2s_ch", b.getI64IntegerAttr(p.mm2sCh));
+    module->setAttr("routing.control_plan_s2mm_ch", b.getI64IntegerAttr(p.s2mmCh));
+    module->setAttr("routing.control_plan_exclusive", b.getI64IntegerAttr(p.exclusive ? 1 : 0));
+}
+
+static bool planControlColumn(mlir::ModuleOp module, bool reserveControlPlane, int relStartCol, int relEndCol,
+                              int meshCols, ControlShimPlacement &placement, int &dataStartCol) {
+    auto forceAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_dedicated_shim");
+    bool force = forceAttr && forceAttr.getInt() != 0;
+    int partCols = relStartCol < 0 ? 0 : relEndCol - relStartCol + 1;
+    bool spare = meshCols > 0 && partCols >= meshCols + 1;
+    if (force && !reserveControlPlane) {
+        llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim requires "
+                        "#pragma control_plan_op_control_packet.\n";
+        return false;
+    }
+    if (force && !spare) {
+        llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim needs a partition with one "
+                        "spare column west of the mesh (mesh cols="
+                     << meshCols << ", partition cols=" << partCols << ").\n";
+        return false;
+    }
+    if (!reserveControlPlane || !spare)
+        return true;
+    placement.col = relStartCol;
+    placement.mm2sCh = 0;
+    placement.s2mmCh = 0;
+    placement.exclusive = true;
+    dataStartCol = relStartCol + 1;
+    publishControlPlacement(module, placement);
+    std::cout << "[TilingLinalg] control plane: dedicated shim col " << placement.col << " (MM2S ch0 / S2MM ch0); "
+              << "data plane uses cols [" << dataStartCol << "," << relEndCol << "]" << std::endl;
+    return true;
+}
+
+static void finalizeControlPlacement(mlir::ModuleOp module, const std::shared_ptr<ResourceMgr> &rm, int dataStartCol,
+                                     ControlShimPlacement &placement) {
+    if (placement.col < 0) {
+        int col = dataStartCol < 0 ? 0 : dataStartCol;
+        if (auto pick = rm->findFreeControlChannels(col)) {
+            placement = *pick;
+            std::cout << "[TilingLinalg] control plane: free shim channels on col " << col << " (MM2S ch"
+                      << placement.mm2sCh << " / S2MM ch" << placement.s2mmCh << ")" << std::endl;
+        } else {
+            placement.col = col;
+            placement.mm2sCh = 0;
+            placement.s2mmCh = 0;
+            placement.exclusive = false;
+            llvm::errs() << "[TilingLinalg] WARNING: no free shim MM2S/S2MM pair for the control plane; "
+                            "time-sharing col "
+                         << col << " channel 0 with the data plane (control usable only during load/launch). "
+                         << "Widen the partition by one column for a dedicated control shim.\n";
+        }
+    }
+    publishControlPlacement(module, placement);
+}
+
 static void dumpPipelineIRToFile(mlir::ModuleOp module, const std::string &dir, int stage, const std::string &passName) {
     if (dir.empty())
         return;
@@ -588,7 +648,9 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
 
     // Extract partition bounds from createhwmesh op in the IR (if present)
     int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
+    int meshCols = 0;
     module.walk([&](routing::createhwmesh meshOp) {
+        meshCols = std::max<int>(meshCols, meshOp.getCol());
         if (auto sc = meshOp.getStartCol())
             partStartCol = *sc;
         if (auto ec = meshOp.getEndCol())
@@ -606,7 +668,25 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     // otherwise keep relStartCol = -1 so RoutingTopology skips setPartitionBounds.
     int relStartCol = (partStartCol >= 0 && partEndCol >= 0) ? 0 : -1;
     int relEndCol = (partStartCol >= 0 && partEndCol >= 0) ? (partEndCol - partStartCol) : -1;
-    RoutingTopology rtopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
+    auto controlPlanAttr =
+        module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_op_control_packet");
+    bool reserveControlPlane = controlPlanAttr && controlPlanAttr.getInt() != 0;
+    rt_res_gen resourceGen = __Runtime_res_gen_from_name(aieGen.c_str());
+
+    ControlShimPlacement ctrlPlacement;
+    int dataStartCol = relStartCol;
+    if (!planControlColumn(module, reserveControlPlane, relStartCol, relEndCol, meshCols, ctrlPlacement,
+                           dataStartCol))
+        return false;
+    auto reserveControl = [&](const std::shared_ptr<ResourceMgr> &rm) {
+        if (!reserveControlPlane)
+            return;
+        rm->setControlPlacement(ctrlPlacement);
+        rm->reserveControlPlaneResources(resourceGen);
+    };
+
+    RoutingTopology rtopology(aieGen, "", dataStartCol, relEndCol, partStartRow, partEndRow);
+    reserveControl(rtopology.getRM());
 
     std::string irDir = setupPipelineIRDir("dfschedule");
     int stage = 0;
@@ -670,6 +750,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     if (!runPipelineSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage, "DmapToDmaphopPass"))
         return false;
+    if (reserveControlPlane)
+        finalizeControlPlacement(module, rtopology.getRM(), dataStartCol, ctrlPlacement);
 
     // Generate provenance map JSON after dmaphop IR is available
     {
@@ -732,14 +814,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     {
         auto hwRes = makeResource(aieGen);
         ResourceMgr::init(std::move(hwRes));
-        // Control-plane resource reservation (pkt-ids/arbiters/slots excluded from
-        // routing/scheduling) is OPT-IN via `#pragma control_plan_op_control_packet`
-        // (module attr set in aiehlc.cc). Single source of truth for the reserved
-        // resources is the reservation table (aie_runtime_resource.c).
-        if (auto cpAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_op_control_packet");
-            cpAttr && cpAttr.getInt() != 0) {
-            ResourceMgr::instance()->reserveControlPlaneResources(__Runtime_res_gen_from_name(aieGen.c_str()));
-        }
+        if (reserveControlPlane)
+            ResourceMgr::instance()->reserveControlPlaneResources(resourceGen);
     }
 
     // Early memory check: validate that per-tile buffer requirements fit in tile data memory
@@ -816,17 +892,20 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     }
 
-    // Coalesce identical per-tile lock-init register writes into control-packet
-    // group writes (broadcast / row-multicast). Must run before DfscheduleToApiPass
-    // so the folded triples (module attr dfschedule.grouped_lock_inits) suppress
-    // the individual XAie_LockSetValue emission there. Opt-in only: gated on the
-    // routing.control_plan_group_reg_write module attr, published by aiehlc when
-    // the user writes #pragma CONTROL_PLAN_GROUP_REG_WRITE. Without it, lock inits
-    // are emitted as individual register writes.
+    // Must run before DfscheduleToApiPass.
     auto grwAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_group_reg_write");
-    if (grwAttr && grwAttr.getInt() != 0) {
-        if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<mlir::GroupRegWritePass>(), irDir, stage,
-                                   "GroupRegWritePass"))
+    auto ctrlAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_op_control_packet");
+    bool enableGroupWrites = grwAttr && grwAttr.getInt() != 0;
+    bool enableKernelControl = ctrlAttr && ctrlAttr.getInt() != 0;
+    if (enableGroupWrites || enableKernelControl) {
+        if (!runPipelineSinglePass(ctx, hostModule,
+                                   std::make_unique<mlir::GroupRegWritePass>(enableGroupWrites, enableKernelControl,
+                                                                             1, ctrlPlacement.s2mmCh, RT_RES_CTRL_BD_LO,
+                                                                             ctrlPlacement.mm2sCh,
+                                                                             ctrlPlacement.col < dataStartCol
+                                                                                 ? ctrlPlacement.col
+                                                                                 : -1),
+                                   irDir, stage, "GroupRegWritePass"))
             return false;
     } else {
         llvm::errs() << "[TilingLinalg] GroupRegWritePass skipped (enable with "
@@ -1691,7 +1770,8 @@ after_host_emit:
 
         if (!allocations.empty()) {
             TilingBcf bcf;
-            bcf.setStack(0x70000, 0x2800);
+            constexpr uint32_t kStackBase = 0x70000;
+            bcf.setStack(kStackBase, allocator.getBaseAddr() - kStackBase);
             bcf.addReservedDMB(0x40000, 0x10000);
             // This crashes the simulator, commenting out for now
             // bcf.addReservedDMB(0x7F800, 0x800);
@@ -1746,7 +1826,8 @@ after_host_emit:
         // consumed shim/port resources from the original rtopology. Phase 5 reads
         // shim tile info from the dmaphop IR and allocates its own DataIO objects.
         // Use the same 0-based partition-relative columns as the host path.
-        RoutingTopology routingPathTopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
+        RoutingTopology routingPathTopology(aieGen, "", dataStartCol, relEndCol, partStartRow, partEndRow);
+        reserveControl(routingPathTopology.getRM());
 
         if (!runPipelineSinglePass(ctx, routingDmaphopModule,
                                    std::make_unique<DmaphopToRoutinghwPass>(routingPathTopology), routingIrDir, rstage,

@@ -57,6 +57,7 @@ USE_LLVMAIE=0
 SKIP_BSP=0
 LOCAL_AIE_RT_REPO=0
 PATH_SET_ONLY=0
+AIE_RT_DEFAULT_REPO="${AIE_RT_REPO:-https://github.com/AMD-AECG-AIENGINE/aie-rt.git}"
 #VITIS_SETTINGS_PATH="/proj/xbuilds/2025.2_0414_1/installs/lin64/HEAD/Vitis/settings64.sh"
 #VITIS_SETTINGS_PATH="/proj/xbuilds/HEAD_qualified_latest/installs/lin64/HEAD/Vitis/settings64.sh"
 VITIS_SETTINGS_PATH="/proj/xbuilds/2026.2_daily_latest/installs/lin64/2026.2/Vitis/settings64.sh"
@@ -118,7 +119,7 @@ export LLVM_AIE_PATH="${AIEHLC_DIR}/thirdparty/llvm-aie"
 popd
 
 #set up the vitis path
-if [ -n "$XILINX_VITIS" ]; then
+if [ -n "${XILINX_VITIS:-}" ]; then
     echo "XILINX_VITIS is set to $XILINX_VITIS"
 elif which aiecompiler > /dev/null 2>&1; then
     XILINX_VITIS=$(dirname $(which aiecompiler))/../..
@@ -127,19 +128,29 @@ elif which aiecompiler > /dev/null 2>&1; then
 else
     echo "XILINX_VITIS is not set or aiecompiler not found."
     echo "Trying to source ${VITIS_SETTINGS_PATH}"
-    source $VITIS_SETTINGS_PATH
-    export XILINX_VITIS
+    case $- in
+        *u*) _aiehlc_nounset=1; set +u ;;
+        *) _aiehlc_nounset=0 ;;
+    esac
+    source "$VITIS_SETTINGS_PATH"
+    if [ -n "${XILINX_VITIS:-}" ]; then
+        export XILINX_VITIS
+    fi
+    if [ "${_aiehlc_nounset}" -eq 1 ]; then
+        set -u
+    fi
+    unset _aiehlc_nounset
 fi
 
-echo "XILINX_VITIS: ${XILINX_VITIS}"
+echo "XILINX_VITIS: ${XILINX_VITIS:-}"
 
-if [ -n "$XILINX_VITIS" ]; then
+if [ -n "${XILINX_VITIS:-}" ]; then
     bash "$SCRIPT_DIR/sim/gen_aiesimulator.sh" "$AIEHLC_DIR/aiehlc_aiesimulator" || \
         echo "WARNING: failed to generate aiehlc_aiesimulator launcher."
 fi
 
 #set up the petalinux path
-if [ -n "$PETALINUX" ]; then
+if [ -n "${PETALINUX:-}" ]; then
     echo "PETALINUX is set to $PETALINUX"
 elif [ -d "/proj/petalinux/2025.1/petalinux-v2025.1_daily_latest/tool/petalinux-v2025.1-final" ]; then
     PETALINUX="/proj/petalinux/2025.1/petalinux-v2025.1_daily_latest/tool/petalinux-v2025.1-final"
@@ -148,7 +159,7 @@ elif [ -d "/proj/petalinux/2025.1/petalinux-v2025.1_daily_latest/tool/petalinux-
 else
     echo "PETALINUX is not set or directory does not exist."
 fi
-echo "PETALINUX: ${PETALINUX}"
+echo "PETALINUX: ${PETALINUX:-}"
 
 export LIB_PATH="${XILINX_VITIS}/gnu/aarch64/lin/aarch64-none/x86_64-oesdk-linux/usr/lib"
 export LIB_BASE_PATH="${XILINX_VITIS}/gnu/aarch64/lin/aarch64-none/x86_64-oesdk-linux/lib"
@@ -166,12 +177,6 @@ unset _gcc_include_base _gcc_version
 export LLVM_INSTALL_DIR=/Users/hua/src/dsamlir/thirdparty/llvm-project/build/
 
 if [ "$SKIP_BSP" -eq 0 ]; then
-    # Clean thirdparty/alib/ when using default BSP generation (not git repo)
-    # This ensures we use Vitis-provided aie-rt headers, not git-cloned ones
-    if [ -d "${AIE_DRIVER_PARENT_DIR}/aie-rt" ]; then
-        echo "Cleaning thirdparty/alib/aie-rt directory for default BSP setup..."
-        rm -rf "${AIE_DRIVER_PARENT_DIR}/aie-rt"
-    fi
     if [ -d "${AIE_DRIVER_PARENT_DIR}/include/" ]; then
         echo "Cleaning thirdparty/alib/include/ directory..."
         rm -rf "${AIE_DRIVER_PARENT_DIR}/include/"
@@ -213,6 +218,9 @@ if [ "$SKIP_BSP" -eq 0 ]; then
     else
         echo "BSPs already exist. Skipping generation."
     fi
+
+    echo "Installing aie-rt headers from ${AIE_RT_DEFAULT_REPO}"
+    aierepo_download_check "${AIE_RT_DEFAULT_REPO}"
 else
     if [ "${PATH_SET_ONLY:-0}" -eq 0 ]; then
         echo "Skipping BSP generation due to --skip-bsp option."

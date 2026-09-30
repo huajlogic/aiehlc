@@ -48,6 +48,8 @@ typedef struct {
     uint32_t timeout_us;
 } struct_event;
 
+typedef struct __Runtime_CtrlRowFabric_s __Runtime_CtrlRowFabric;
+
 // Global routing instance (kept for legacy path)
 extern XAie_RoutingInstance *g_RoutingInst;
 
@@ -348,8 +350,30 @@ struct_kernel_group __Runtime_load_kernel_group_16t(XAie_DevInst *dev, XAie_LocT
                                                     XAie_LocType t6, XAie_LocType t7, XAie_LocType t8, XAie_LocType t9,
                                                     XAie_LocType t10, XAie_LocType t11, XAie_LocType t12,
                                                     XAie_LocType t13, XAie_LocType t14, XAie_LocType t15, int n);
+struct_kernel_group __Runtime_load_kernel_group_4t_ctrl(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
+                                                        XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+                                                        XAie_LocType t3, int n, int32_t bd_id, int32_t mm2s_ch);
+struct_kernel_group __Runtime_load_kernel_group_8t_ctrl(
+    XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+    XAie_LocType t3, XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, int n, int32_t bd_id,
+    int32_t mm2s_ch);
+struct_kernel_group __Runtime_load_kernel_group_16t_ctrl(
+    XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+    XAie_LocType t3, XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, XAie_LocType t8,
+    XAie_LocType t9, XAie_LocType t10, XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14,
+    XAie_LocType t15, int n, int32_t bd_id, int32_t mm2s_ch);
 
 struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_group kg);
+struct_event __Runtime_launch_kernel_group_ctrl(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
+                                                struct_kernel_group kg, int32_t bd_id, int32_t mm2s_ch);
+
+void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls);
+void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls);
+void __Runtime_kload_split_cycles(unsigned long long *elf_cyc, unsigned int *elf_n, unsigned long long *rst_cyc,
+                                  unsigned int *rst_n);
+void __Runtime_setup_split_cycles(unsigned long long *plan_cyc, unsigned int *plan_n, unsigned long long *sync_cyc,
+                                  unsigned int *sync_n);
+void __Runtime_pmap_print_cycles(unsigned long long *cyc, unsigned int *lines);
 
 // Core enable (reference: aeg_runtime_api.cpp graph_api::run)
 void __Runtime_core_run(XAie_DevInst *dev, XAie_LocType *tiles, uint32_t num_tiles);
@@ -644,8 +668,11 @@ void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, 
 // equivalent to __Runtime_core_trace_begin_dma(dev,col,row,AIE_TRACE_DMA_S2MM,0).
 void __Runtime_core_trace_begin_dma(XAie_DevInst *dev, uint8_t col, uint8_t row, int mem_dma_kind, uint8_t mem_dma_ch);
 
+void __Runtime_core_trace_app_begin(XAie_DevInst *dev);
+
 // Start host<->AIE time correlation for the tiles armed by
-// __Runtime_core_trace_begin. Inits a process-global AieTraceProfile, records
+// __Runtime_core_trace_begin. Inits a process-global AieTraceProfile (unless
+// __Runtime_core_trace_app_begin already opened it), records
 // the host clock (cps) and anchor0 (host time + each armed tile's AIE core
 // timer). Call AFTER all __Runtime_core_trace_begin calls and just BEFORE the
 // cores run (before __Runtime_launch_kernel_group). When present, the paired
@@ -656,9 +683,9 @@ void __Runtime_core_trace_begin_dma(XAie_DevInst *dev, uint8_t col, uint8_t row,
 void __Runtime_core_trace_sync_begin(XAie_DevInst *dev);
 
 // Record one host phase event (iter, phase name) into the auto-injected
-// core-trace session's process-global profile. Captures the host clock now.
-// No-op unless __Runtime_core_trace_sync_begin has armed the correlated session
-// (so it is safe to call unconditionally from generated host code).
+// core-trace session's process-global profile. Captures the session clock now.
+// No-op unless __Runtime_core_trace_app_begin or _sync_begin opened the
+// correlated session (so it is safe to call unconditionally from generated host code).
 void __Runtime_core_trace_event(XAie_DevInst *dev, int iter, const char *phase);
 
 // Read back, decode and dump every tile armed by __Runtime_core_trace_begin.
@@ -728,10 +755,6 @@ void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);
 // (copies it into a device buffer, arms the shim entry, and pushes via the same
 // SHIM MM2S BD path as __Runtime_ctrl_row_*_write).
 // ---------------------------------------------------------------------------
-
-// Forward decl of the row-control fabric (full definition below) so the commit
-// cast target can reference it before the row-control API block.
-typedef struct __Runtime_CtrlRowFabric_s __Runtime_CtrlRowFabric;
 
 // Begin capturing write-only register ops into the XAie transaction buffer
 // WITHOUT applying them to hardware (XAIE_TRANSACTION_DISABLE_AUTO_FLUSH), and
@@ -885,6 +908,8 @@ AieRC __Runtime_ctrl_setup_routing(__Runtime_CtrlInstance *inst, int port_evt = 
 // value.
 void __Runtime_ctrl_pmap_enable(int on);
 
+void __Runtime_ctrl_high_throughput_enable(int on);
+
 // Poll the shim S2MM drain until the response lands, sync it for the CPU, and
 // return the first response word. Uses @inst->token armed by
 // __Runtime_ctrl_setup_routing. If @print is nonzero, prints the observed word.
@@ -962,6 +987,7 @@ typedef struct {
 typedef struct __Runtime_CtrlRowFabric_s {
     XAie_DevInst *dev; // partitioned device instance
     uint8_t shim_col;  // vertical spine column (= row left edge)
+    uint8_t dedicated_shim;
     uint8_t ctrl_id;   // 5-bit stream id used for consume-matching
     uint32_t fwd_vc;   // vertical stream channel for the forward spine
     uint32_t ret_vc;   // vertical stream channel for the return spine
@@ -979,6 +1005,7 @@ typedef struct __Runtime_CtrlRowFabric_s {
     // stateless w.r.t. the caller). @txn_row < 0 => whole-array broadcast;
     // @txn_row >= 0 => row-multicast to that physical row.
     int txn_row;
+    uint8_t pmap_shim_seen;
 } __Runtime_CtrlRowFabric;
 
 // Translate a planner op list into XAie stream-switch calls on @dev. Returns the
@@ -988,12 +1015,15 @@ AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops);
 
 // One-shot fabric init: record the device, spine column @shim_col, control
 // stream id @ctrl_id, and shim S2MM response channel @resp_s2mm_ch, then plan +
-// emit every EAST chain in @rows[0..nrows). Each chain head must sit on the spine
-// column (col_lo == shim_col). @rows may be given in any row order (bottom-up
+// emit every EAST chain in @rows[0..nrows). @rows may be given in any row order (bottom-up
 // preferred); the static planner computes the top row so its return head omits
 // the idle RET_NORTH slot. Responses drain via @resp_s2mm_ch.
 AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
                                uint8_t ctrl_id, const __Runtime_CtrlRowChain *rows, uint8_t nrows);
+
+AieRC __Runtime_ctrl_plan_release(__Runtime_CtrlRowFabric *f, int32_t mm2s_ch);
+
+void __Runtime_ctrl_plan_set_exclusive(__Runtime_CtrlRowFabric *f, int on);
 
 // Tear down fabric state. Best-effort route teardown (partition reset clears the
 // stream switches).

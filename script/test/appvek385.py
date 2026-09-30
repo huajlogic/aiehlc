@@ -13,7 +13,7 @@ Prerequisites:
 This script:
 1. Creates two SSH connections to vek385ip
 2. First connection: sets up xsdb and programs the device
-3. Second connection: connects to com0 for console output
+3. Second connection: connects to VEK385_CONSOLE (com3 by default)
 4. First connection: downloads the ELF file
 5. Captures and prints console output from second connection
 """
@@ -77,6 +77,7 @@ if not username or not vek385ip:
     sys.exit(1)
 
 host = f"{username}@{vek385ip}"
+console_port = os.environ.get("VEK385_CONSOLE", "com3")
 
 # Configuration
 PALBOARD_SCRIPTS_DIR = f"/proj/xsjsswstaff/{username}/palboard_scripts"
@@ -313,7 +314,7 @@ def setup_first_connection():
 
     # Step 6: Start xsdb (try default first, then alternative path)
     child.sendline("xsdb")
-    index = child.expect([r'xsdb%', r'command not found', r'Unrecognized', pexpect.TIMEOUT], timeout=15)
+    index = child.expect([r'xsdb%', r'command not found', r'Unrecognized', pexpect.TIMEOUT], timeout=60)
 
     if index != 0:
         print("[Connection 1] xsdb not found / timed-out, exiting and trying alternative path...")
@@ -398,12 +399,12 @@ def setup_second_connection():
     # Step 2: Run systest
     child.sendline("/opt/systest/common/bin/systest-client")
     child.expect(r'Systest[#>]', timeout=60)
-    print("[Connection 2] In systest, connecting to com3...")
+    print(f"[Connection 2] In systest, connecting to {console_port}...")
 
-    # Step 3: Connect to com0 (no output until ELF runs on first connection)
-    child.sendline("connect com3")
-    child.expect(r'Connecting to device com3.*escape', timeout=60)
-    print("[Connection 2] Connected to com3, listening for output...")
+    # Step 3: Connect to the selected console (no output until ELF runs).
+    child.sendline(f"connect {console_port}")
+    child.expect(rf'Connecting to device {console_port}.*escape', timeout=60)
+    print(f"[Connection 2] Connected to {console_port}, listening for output...")
 
     return child
 
@@ -612,7 +613,7 @@ Examples:
         # Step 4: Setup second connection for console output
         print("\n>>> Setting up second connection...")
         conn2 = setup_second_connection()
-        
+
         # Step 5: Download ELF file
         print("\n>>> Downloading ELF file...")
         elf_ok = download_elf_and_continue(conn1, remote_elf_path)
