@@ -23,7 +23,6 @@
 #include "ioutils.h"
 #include "aiehlc_dbg_server.h"
 #include "aiehlc_dbg_protocol.h"
-#include "aie_device_map.h"
 
 #include <atomic>
 #include <chrono>
@@ -46,6 +45,9 @@ void host_canonicalized();
 #else
 #  error "Set AIEHLC_HOST_SRC to the absolute path of host.cc on the compiler command line"
 #endif
+
+// Included after the host so its CORE_IP_MEM/CORE_OP_MEM fallbacks do not replace kernel's dm_offsets.h values.
+#include "aie_device_map.h"
 
 extern int         ps_main_complete;
 extern int         graph_return_value;
