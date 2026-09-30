@@ -5779,6 +5779,40 @@ static AieRC rt_ctrl_elf_core_reset(XAie_DevInst *dev, uint32_t *pkt, uint32_t m
     return rc;
 }
 
+static inline uint32_t rt_ctrl_odd_parity_bit(uint32_t v) { return (uint32_t)(!__builtin_parity(v)) << 31U; }
+
+static AieRC rt_ctrl_elf_fill_seg_packed(const uint8_t *src, uint32_t filesz, uint32_t tile_addr, uint32_t *pkt,
+                                         uint32_t capacity, uint32_t *acc, uint32_t *payload_words,
+                                         uint32_t *last_addr, uint32_t *last_value) {
+    const uint32_t pkt_hdr = (uint32_t)ACR_ID_BCAST | rt_ctrl_odd_parity_bit((uint32_t)ACR_ID_BCAST);
+    uint32_t pw = *payload_words;
+    uint32_t off = 0U;
+    uint32_t words[RT_CTRL_ELF_CHUNK_WORDS];
+    uint32_t nwords = 0U;
+    for (; off < filesz; off += (uint32_t)sizeof(words)) {
+        uint32_t chunk = filesz - off < (uint32_t)sizeof(words) ? filesz - off : (uint32_t)sizeof(words);
+        nwords = (chunk + 3U) / 4U;
+        if (pw + 2U + nwords > capacity)
+            return XAIE_ERR;
+        if (chunk < (uint32_t)sizeof(words))
+            memset(words, 0, sizeof(words));
+        memcpy(words, src + off, chunk);
+        uint32_t ctrl = (((nwords - 1U) & 0x3U) << 20U) | ((tile_addr + off) & 0xFFFFFU);
+        pkt[pw] = pkt_hdr;
+        pkt[pw + 1U] = ctrl | rt_ctrl_odd_parity_bit(ctrl);
+        memcpy(pkt + pw + 2U, words, nwords * sizeof(uint32_t));
+        pw += 2U + nwords;
+        (*acc)++;
+    }
+    if (nwords) {
+        uint32_t last_off = off - (uint32_t)sizeof(words);
+        *last_addr = tile_addr + last_off + (nwords - 1U) * (uint32_t)sizeof(uint32_t);
+        *last_value = words[nwords - 1U];
+    }
+    *payload_words = pw;
+    return XAIE_OK;
+}
+
 static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const uint8_t *elf, XAie_LocType loc, uint32_t *pkt, uint32_t max_acc,
                               int packed, uint32_t *nacc_out, uint32_t *payload_words_out,
                               uint32_t *last_addr_out, uint32_t *last_value_out) {
@@ -5800,6 +5834,14 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const uint8_t *elf, XAie_LocTyp
             return rc;
         if (tile_addr == RT_CTRL_ELF_SKIP_ADDR)
             continue;
+        if (packed) {
+            rc = rt_ctrl_elf_fill_seg_packed(elf + phdr->p_offset, phdr->p_filesz, tile_addr, pkt,
+                                             max_acc * RT_CTRL_ELF_PKT_STRIDE, &acc, &payload_words, &last_addr,
+                                             &last_value);
+            if (rc != XAIE_OK)
+                return rc;
+            continue;
+        }
         uint32_t byte_off = 0U;
         while (byte_off < phdr->p_filesz) {
             uint32_t words[RT_CTRL_ELF_CHUNK_WORDS];
@@ -5941,6 +5983,113 @@ static AieRC rt_ctrl_elf_dma(__Runtime_CtrlRowFabric *fab, uint32_t *pkt, uint32
     return rt_ctrl_elf_ack_drain(fab, token, nacks);
 }
 
+static AieRC rt_ctrl_elf_ret_arm(__Runtime_CtrlRowFabric *fab, uint32_t *token, uint32_t nresp) {
+    XAie_DevInst *dev = fab->dev;
+    XAie_LocType shim = XAie_TileLoc(fab->shim_col, 0U);
+    uint8_t ch = (uint8_t)fab->resp_s2mm_ch;
+    AieRC rc = rt_ctrl_row_shim_return_route(fab, fab->resp_s2mm_ch);
+    if (rc != XAIE_OK)
+        return rc;
+    uint64_t offset = 0U;
+    XAie_MemInst *mem = __vaddr_to_mem_offset(token, &offset);
+    if (!mem)
+        return XAIE_ERR;
+    uint64_t dev_addr = XAie_MemGetDevAddr(mem) + offset;
+#ifdef __AIESIM__
+    ess_WriteGM(dev_addr, token, (uint64_t)nresp * sizeof(uint32_t));
+#endif
+    XAie_DmaChannelDesc chdesc;
+    rc = XAie_DmaChannelDescInit(dev, &chdesc, shim);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaChannelSetFoTMode(&chdesc, DMA_FoT_DISABLED);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaWriteChannel(dev, &chdesc, shim, ch, DMA_S2MM);
+    XAie_DmaDesc desc;
+    if (rc == XAIE_OK)
+        rc = XAie_DmaDescInit(dev, &desc, shim);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaSetAddrLen(&desc, dev_addr, nresp * (uint32_t)sizeof(uint32_t));
+    if (rc == XAIE_OK)
+        rc = XAie_DmaEnableBd(&desc);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaSetAxi(&desc, 0U, 16U, 0U, 0U, 0U);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaWriteBd(dev, &desc, shim, (uint8_t)RT_CTRL_ELF_RET_BD);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaChannelPushBdToQueue(dev, shim, ch, DMA_S2MM, (uint8_t)RT_CTRL_ELF_RET_BD);
+    if (rc == XAIE_OK)
+        rc = XAie_DmaChannelEnable(dev, shim, ch, DMA_S2MM);
+    if (rc != XAIE_OK)
+        printf("[aie_runtime] ctrl_elf ret arm ERROR: shim(%u,0) ch=%u rc=%d\n", (unsigned)fab->shim_col,
+               (unsigned)ch, (int)rc);
+    return rc;
+}
+
+static AieRC rt_ctrl_elf_dma_packed(__Runtime_CtrlRowFabric *fab, uint32_t *pkt, uint32_t payload_words,
+                                    uint32_t *token, uint32_t nresp, int32_t bd_id, int32_t mm2s_ch) {
+    AieRC rc = rt_ctrl_row_shim_entry(fab, mm2s_ch);
+    if (rc == XAIE_OK)
+        rc = rt_ctrl_elf_ret_arm(fab, token, nresp);
+    if (rc != XAIE_OK)
+        return rc;
+    const __Runtime_CtrlRowChain *last = &fab->rows[fab->nrows - 1U];
+    __Runtime_CtrlInstance inst = {
+        .dev = fab->dev,
+        .shim_col = fab->shim_col,
+        .dest_col = last->col_lo,
+        .dest_row = last->row,
+        .stream_id = (uint8_t)ACR_ID_BCAST,
+        .bd_id = bd_id,
+        .mm2s_ch = mm2s_ch,
+        .s2mm_ch = fab->resp_s2mm_ch,
+        .token = token,
+        .resp_words = nresp,
+    };
+    rc = __Runtime_ctrl_push(&inst, pkt, payload_words, /*block=*/0, /*log=*/0);
+    if (rc != XAIE_OK)
+        return rc;
+    uint8_t pending = rt_ctrl_row_return_poll(fab, fab->resp_s2mm_ch, 1, nresp, token);
+    if (pending != 0U) {
+        printf("[aie_runtime] ctrl_elf ack TIMEOUT: %u responses expected\n", (unsigned)nresp);
+        rt_ctrl_elf_timeout_dump(fab, pkt, rt_ctrl_elf_pkt_len(pkt));
+        return XAIE_ERR;
+    }
+    return rt_ctrl_mm2s_wait(fab->dev, fab->shim_col, mm2s_ch);
+}
+
+static uint32_t rt_ctrl_fabric_tiles(const __Runtime_CtrlRowFabric *fab) {
+    uint32_t n = 0U;
+    for (uint8_t ri = 0U; ri < fab->nrows; ri++)
+        n += (uint32_t)fab->rows[ri].col_hi - (uint32_t)fab->rows[ri].col_lo + 1U;
+    return n;
+}
+
+static AieRC rt_ctrl_load_elf_packed(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, XAie_LocType loc,
+                                     uint32_t npkt_cap, int32_t bd_id, int32_t mm2s_ch) {
+    uint32_t nresp = rt_ctrl_fabric_tiles(fab);
+    uint32_t data_cap = npkt_cap * RT_CTRL_ELF_PKT_STRIDE + 3U;
+    uint32_t token_off = (data_cap + 3U) & ~3U;
+    uint32_t *pkt = (uint32_t *)__Runtime_alloc_buffer(fab->dev, (size_t)(token_off + nresp) * sizeof(uint32_t));
+    if (!pkt)
+        return XAIE_ERR;
+    uint32_t *token = pkt + token_off;
+    uint32_t nacc = 0U, payload_words = 0U, last_addr = 0U, last_value = 0U;
+    AieRC rc = rt_ctrl_elf_fill(fab->dev, elf, loc, pkt, npkt_cap, 1, &nacc, &payload_words, &last_addr, &last_value);
+    uint32_t ack_words = 0U;
+    if (rc == XAIE_OK && nacc > 0U && payload_words > 0U)
+        ack_words = __Runtime_ctrl_pktize_write(pkt + payload_words, data_cap - payload_words, (uint8_t)ACR_ID_BCAST,
+                                                last_addr, &last_value, 1U, 1, 0U, NULL);
+    if (ack_words == 0U) {
+        rc = rc == XAIE_OK ? XAIE_ERR : rc;
+    } else {
+        payload_words += ack_words;
+        __Runtime_sync_for_dev(fab->dev, pkt, (size_t)(token_off + nresp) * sizeof(uint32_t));
+        rc = rt_ctrl_elf_dma_packed(fab, pkt, payload_words, token, nresp, bd_id, mm2s_ch);
+    }
+    __Runtime_free_buffer(fab->dev, pkt);
+    return rc;
+}
+
 static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, int32_t bd_id, int32_t mm2s_ch) {
     if (!fab || !fab->dev || !elf || fab->nrows == 0U)
         return XAIE_INVALID_ARGS;
@@ -5949,6 +6098,8 @@ static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, 
     if (npkt_cap == 0U)
         return XAIE_OK;
     npkt_cap += RT_CTRL_ELF_RESET_ACC;
+    if (g_ctrl_high_throughput_ready)
+        return rt_ctrl_load_elf_packed(fab, elf, loc, npkt_cap, bd_id, mm2s_ch);
     const __Runtime_CtrlRowChain *last = &fab->rows[fab->nrows - 1U];
     int nacks = (int)last->col_hi - (int)last->col_lo + 1;
     int wave = nacks > RT_CTRL_ELF_ACK_WAVE ? RT_CTRL_ELF_ACK_WAVE : nacks;
