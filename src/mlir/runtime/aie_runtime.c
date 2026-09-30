@@ -5675,6 +5675,7 @@ struct_kernel_group __Runtime_load_kernel_group_16t(XAie_DevInst *dev, XAie_LocT
 #define RT_CTRL_ELF_RET_BD RT_RES_CTRL_ACK_BD_LO
 #define RT_CTRL_ELF_NBD 4U
 #define RT_CTRL_ELF_QDEPTH 3U
+#define RT_CTRL_ELF_RESET_ACC 2U
 
 static AieRC rt_ctrl_elf_target(XAie_DevInst *dev, XAie_LocType loc, uint32_t paddr, uint32_t *tile_addr) {
     const XAie_CoreMod *core = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod;
@@ -5751,15 +5752,44 @@ static uint32_t rt_ctrl_elf_count_pkts(XAie_DevInst *dev, const uint8_t *elf, XA
 
 static uint32_t rt_ctrl_elf_pkt_len(const uint32_t *acc) { return 2U + (((acc[1] >> 20) & 0x3U) + 1U); }
 
+static AieRC rt_ctrl_elf_put(uint32_t *pkt, uint32_t max_acc, int packed, uint32_t *acc, uint32_t *payload_words,
+                             uint32_t tile_addr, const uint32_t *words, uint32_t nwords) {
+    if (*acc >= max_acc)
+        return XAIE_ERR;
+    uint32_t capacity = max_acc * RT_CTRL_ELF_PKT_STRIDE;
+    uint32_t slot_off = packed ? *payload_words : *acc * RT_CTRL_ELF_PKT_STRIDE;
+    uint32_t slot_cap = packed ? capacity - slot_off : RT_CTRL_ELF_PKT_STRIDE;
+    uint32_t got = __Runtime_ctrl_pktize_write(pkt + slot_off, slot_cap, (uint8_t)ACR_ID_BCAST, tile_addr, words,
+                                               nwords, 0, 0U, NULL);
+    if (got == 0U)
+        return XAIE_ERR;
+    (*acc)++;
+    *payload_words += got;
+    return XAIE_OK;
+}
+
+static AieRC rt_ctrl_elf_core_reset(XAie_DevInst *dev, uint32_t *pkt, uint32_t max_acc, int packed, uint32_t *acc,
+                                    uint32_t *payload_words) {
+    const XAie_RegCoreCtrl *ctrl = dev->DevProp.DevMod[XAIEGBL_TILE_TYPE_AIETILE].CoreMod->CoreCtrl;
+    uint32_t reset = ctrl->CtrlRst.Mask;
+    uint32_t unreset = 0U;
+    AieRC rc = rt_ctrl_elf_put(pkt, max_acc, packed, acc, payload_words, ctrl->RegOff, &reset, 1U);
+    if (rc == XAIE_OK)
+        rc = rt_ctrl_elf_put(pkt, max_acc, packed, acc, payload_words, ctrl->RegOff, &unreset, 1U);
+    return rc;
+}
+
 static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const uint8_t *elf, XAie_LocType loc, uint32_t *pkt, uint32_t max_acc,
                               int packed, uint32_t *nacc_out, uint32_t *payload_words_out,
                               uint32_t *last_addr_out, uint32_t *last_value_out) {
     const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)elf;
     uint32_t acc = 0U;
     uint32_t payload_words = 0U;
-    uint32_t capacity = max_acc * RT_CTRL_ELF_PKT_STRIDE;
     uint32_t last_addr = 0U;
     uint32_t last_value = 0U;
+    AieRC reset_rc = rt_ctrl_elf_core_reset(dev, pkt, max_acc, packed, &acc, &payload_words);
+    if (reset_rc != XAIE_OK)
+        return reset_rc;
     for (uint32_t i = 0U; i < ehdr->e_phnum; i++) {
         const Elf32_Phdr *phdr = (const Elf32_Phdr *)(elf + ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize);
         if (phdr->p_type != (uint32_t)PT_LOAD || phdr->p_filesz == 0U)
@@ -5779,17 +5809,9 @@ static AieRC rt_ctrl_elf_fill(XAie_DevInst *dev, const uint8_t *elf, XAie_LocTyp
             uint32_t nwords = (chunk_bytes + 3U) / 4U;
             memset(words, 0, sizeof(words));
             memcpy(words, elf + phdr->p_offset + byte_off, chunk_bytes);
-            if (acc >= max_acc)
-                return XAIE_ERR;
-            uint32_t slot_off = packed ? payload_words : acc * RT_CTRL_ELF_PKT_STRIDE;
-            uint32_t slot_cap = packed ? capacity - slot_off : RT_CTRL_ELF_PKT_STRIDE;
-            uint32_t *slot = pkt + slot_off;
-            uint32_t got = __Runtime_ctrl_pktize_write(slot, slot_cap, (uint8_t)ACR_ID_BCAST,
-                                                       tile_addr + byte_off, words, nwords, 0, 0U, NULL);
-            if (got == 0U)
-                return XAIE_ERR;
-            acc++;
-            payload_words += got;
+            rc = rt_ctrl_elf_put(pkt, max_acc, packed, &acc, &payload_words, tile_addr + byte_off, words, nwords);
+            if (rc != XAIE_OK)
+                return rc;
             last_addr = tile_addr + byte_off + (nwords - 1U) * sizeof(uint32_t);
             last_value = words[nwords - 1U];
             byte_off += chunk_bytes;
@@ -5926,6 +5948,7 @@ static AieRC rt_ctrl_load_elf(__Runtime_CtrlRowFabric *fab, const uint8_t *elf, 
     uint32_t npkt_cap = rt_ctrl_elf_count_pkts(fab->dev, elf, loc);
     if (npkt_cap == 0U)
         return XAIE_OK;
+    npkt_cap += RT_CTRL_ELF_RESET_ACC;
     const __Runtime_CtrlRowChain *last = &fab->rows[fab->nrows - 1U];
     int nacks = (int)last->col_hi - (int)last->col_lo + 1;
     int wave = nacks > RT_CTRL_ELF_ACK_WAVE ? RT_CTRL_ELF_ACK_WAVE : nacks;
@@ -5993,20 +6016,6 @@ static struct_kernel_group rt_ctrl_load_kernel_group_nt(XAie_DevInst *dev, __Run
     }
     for (int i = 0; i < n; i++)
         s_kernel_tiles[i] = tiles[i];
-    for (int i = 0; i < n; i++) {
-        unsigned long long __kr0 = RT_PROF_TIC();
-        AieRC rc = XAie_CoreDisable(dev, tiles[i]);
-        if (rc == XAIE_OK)
-            rc = XAie_CoreReset(dev, tiles[i]);
-        if (rc == XAIE_OK)
-            rc = XAie_CoreUnreset(dev, tiles[i]);
-        RT_PROF_ADD(g_kl_rst_cyc, g_kl_rst_n, __kr0);
-        if (rc != XAIE_OK) {
-            printf("[aie_runtime] ctrl kernel load ERROR: prepare tile(%u,%u) rc=%d\n", (unsigned)tiles[i].Col,
-                   (unsigned)tiles[i].Row, (int)rc);
-            return kg;
-        }
-    }
     unsigned long long __ke0 = RT_PROF_TIC();
     AieRC rc = rt_ctrl_load_elf(fab, s_active_kernel_elf, bd_id, mm2s_ch);
     RT_PROF_ADD(g_kl_elf_cyc, g_kl_elf_n, __ke0);
