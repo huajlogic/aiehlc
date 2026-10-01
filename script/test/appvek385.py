@@ -13,7 +13,7 @@ Prerequisites:
 This script:
 1. Creates two SSH connections to vek385ip
 2. First connection: sets up xsdb and programs the device
-3. Second connection: connects to com0 for console output
+3. Second connection: connects to VEK385_CONSOLE (com3 by default)
 4. First connection: downloads the ELF file
 5. Captures and prints console output from second connection
 """
@@ -26,6 +26,7 @@ import threading
 import queue
 import argparse
 import glob
+import shlex
 
 try:
     import pexpect
@@ -76,13 +77,22 @@ if not username or not vek385ip:
     sys.exit(1)
 
 host = f"{username}@{vek385ip}"
+console_port = os.environ.get("VEK385_CONSOLE", "com3")
 
 # Configuration
 PALBOARD_SCRIPTS_DIR = f"/proj/xsjsswstaff/{username}/palboard_scripts"
-VEK385PDI = f"/home/{username}/aiehlc/vek385.pdi"
+# Remote PDI/BOOT image programmed with "device program". Overridable so the
+# same runner serves other Versal boards that boot identically (e.g. VEK280,
+# which differs only in the image name) -- the debug UI passes this through
+# from a debug_ui_config.json entry's hw_env.
+VEK385PDI = os.environ.get("VEK385PDI") or f"/home/{username}/aiehlc/vek385.pdi"
 #XSDB_ALT_PATH = "/everest/set_vnc_bkup/vnc/t50/es1/tools/Labtools/9999.0/bin/xsdb"
 XSDB_ALT_PATH = "/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/Vitis/bin/xsdb"
 VITIS_SETTINGS = "/proj/xbuilds/2025.2_daily_latest/installs/lin64/HEAD/Vitis/settings64.sh"
+
+# Seconds to wait for "dow -force" to finish downloading the ELF over JTAG.
+# Override with AIEHLC_DOWNLOAD_TIMEOUT for an unusually slow link or large ELF.
+DOWNLOAD_TIMEOUT_S = int(os.environ.get("AIEHLC_DOWNLOAD_TIMEOUT", "240"))
 
 # Queue to collect console output from second connection
 console_output_queue = queue.Queue()
@@ -304,7 +314,7 @@ def setup_first_connection():
 
     # Step 6: Start xsdb (try default first, then alternative path)
     child.sendline("xsdb")
-    index = child.expect([r'xsdb%', r'command not found', r'Unrecognized', pexpect.TIMEOUT], timeout=15)
+    index = child.expect([r'xsdb%', r'command not found', r'Unrecognized', pexpect.TIMEOUT], timeout=60)
 
     if index != 0:
         print("[Connection 1] xsdb not found / timed-out, exiting and trying alternative path...")
@@ -389,12 +399,12 @@ def setup_second_connection():
     # Step 2: Run systest
     child.sendline("/opt/systest/common/bin/systest-client")
     child.expect(r'Systest[#>]', timeout=60)
-    print("[Connection 2] In systest, connecting to com3...")
+    print(f"[Connection 2] In systest, connecting to {console_port}...")
 
-    # Step 3: Connect to com0 (no output until ELF runs on first connection)
-    child.sendline("connect com3")
-    child.expect(r'Connecting to device com3.*escape', timeout=60)
-    print("[Connection 2] Connected to com3, listening for output...")
+    # Step 3: Connect to the selected console (no output until ELF runs).
+    child.sendline(f"connect {console_port}")
+    child.expect(rf'Connecting to device {console_port}.*escape', timeout=60)
+    print(f"[Connection 2] Connected to {console_port}, listening for output...")
 
     return child
 
@@ -425,8 +435,13 @@ def download_elf_and_continue(child, elf_path):
     # aborts and xsdb prints "PLM stalled during programming".  Without this
     # check the script would retry after rst -proc, the download succeeds but
     # UART/PS peripherals are never initialized so we get zero console output
-    # and waste 120 seconds waiting.
-    index = child.expect([r'Successfully downloaded', r'PLM stalled'], timeout=120)
+    # and waste the download budget waiting.
+    #
+    # Timeout sized for a slow JTAG link: observed ~0.1MB/s on a loaded board,
+    # where a ~10MB ELF needs ~130s and the old 120s budget expired at ~65%.
+    # The expect returns as soon as the match arrives, so a generous ceiling
+    # costs nothing on a fast link.
+    index = child.expect([r'Successfully downloaded', r'PLM stalled'], timeout=DOWNLOAD_TIMEOUT_S)
     if index == 1:
         # Consume remaining output up to the prompt
         child.expect(r'xsdb%', timeout=60)
@@ -444,6 +459,52 @@ def download_elf_and_continue(child, elf_path):
     child.expect(r'xsdb%', timeout=60)
     print("[Connection 1] Execution started!")
     return True
+
+
+# The build produces the same binary under two names -- `build/host` (the linker
+# output) and `aout/main.elf` (the copy) -- and the debug UI's ELF search may pick
+# either one, so the board only ever received whichever name won. A `dow -force`
+# typed against the other name then hit a stale leftover, or nothing at all.
+# Whichever of the pair is staged, publish it under both.
+ELF_ALIAS_NAMES = ("host", "main.elf")
+
+
+def elf_alias_names(elf_filename):
+    """The other remote names this ELF should also be published under.
+
+    Only the host/main.elf pair, and only when the staged file IS one of them:
+    aliasing an unrelated ELF (perf.elf) would silently clobber a main.elf that
+    has nothing to do with it.
+    """
+    if elf_filename not in ELF_ALIAS_NAMES:
+        return []
+    return [n for n in ELF_ALIAS_NAMES if n != elf_filename]
+
+
+def publish_elf_aliases(dest_dir, dest_elf):
+    """Copy the just-staged ELF to its alias names on the board.
+
+    A remote `cp` rather than a second SCP: the ELF is ~17 MB, and copying from
+    the file we just landed is what guarantees the alias holds the bits `dow`
+    will load -- re-uploading the local file leaves room for the two to differ.
+    Alias failure is a warning, not an error: the primary path is already
+    staged and the run can proceed.
+    """
+    published = []
+    for alias in elf_alias_names(os.path.basename(dest_elf)):
+        alias_path = os.path.join(dest_dir, alias)
+        try:
+            subprocess.run(
+                ["ssh", host,
+                 f"cp -f {shlex.quote(dest_elf)} {shlex.quote(alias_path)}"],
+                check=True, capture_output=True, text=True, timeout=60
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            print(f"Warning: could not publish alias {alias_path}: {e}")
+            continue
+        print(f"    Also staged as: {host}:{alias_path}")
+        published.append(alias_path)
+    return published
 
 
 def copy_elf_to_remote(local_elf):
@@ -472,6 +533,9 @@ def copy_elf_to_remote(local_elf):
             check=True, capture_output=True, text=True, timeout=120
         )
         print(">>> ELF file copied successfully via SCP")
+        publish_elf_aliases(dest_dir, dest_elf)
+        # The primary path is what gets downloaded; the alias exists so a
+        # hand-typed dow against the other name loads the same build.
         return True, dest_elf
     except subprocess.CalledProcessError as e:
         print(f"Error copying ELF file via SCP: {e}")
@@ -549,7 +613,7 @@ Examples:
         # Step 4: Setup second connection for console output
         print("\n>>> Setting up second connection...")
         conn2 = setup_second_connection()
-        
+
         # Step 5: Download ELF file
         print("\n>>> Downloading ELF file...")
         elf_ok = download_elf_and_continue(conn1, remote_elf_path)

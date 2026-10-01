@@ -19,6 +19,10 @@
 #include <array>
 #include <stdexcept>
 #include <mutex>
+// Control-plane reservation table (pure C, C++-safe via its extern "C" guard).
+// ResourceMgr consults it to exclude the stream-switch resources the control
+// plane occupies (pkt-ids, arbiters, slots) from routing/scheduling.
+#include "aie_runtime_resource.h"
 inline PortDirection opposite(PortDirection d){
     return d==PortDirection::North ? PortDirection::South :
            d==PortDirection::South ? PortDirection::North :
@@ -116,7 +120,11 @@ enum class ReservationStrategy {
 // stream type
 enum class StreamType {
     FORWARDONLY,
-    BROADCAST
+    BROADCAST,
+    // Control-packet flow: shim->tile(s) carrying config/register writes that
+    // terminate at each target tile's CTRL master stream-switch port (header
+    // preserved). Uses the same packet fan-out engine as BROADCAST.
+    CONTROL
 };
 class RoutingTile {
 public:
@@ -128,6 +136,7 @@ public:
   std::optional<int> allocate(IOType io, int portidx, PortDirection dir, int ioId);
   std::optional<int> occupyport(IOType io, PortDirection dir, int ioId);
   bool releaseByIo(IOType io, int portidx, PortDirection dir, int ioId);
+  bool reservePortNumber(PortDirection dir, PortRole role, int portNum, int ownerId);
 
   const DirBank &bank(PortDirection d) const { return banks_.at(d); }
   ::TileType type() const { return type_; }
@@ -138,6 +147,7 @@ public:
   std::optional<int> allocateBd(int ownerId = -1);
   bool releaseBd(int bdId, int ownerId = -1);
   bool isBdFree(int bdId) const;
+  bool reserveBd(int bdId, int ownerId);
   int numBds() const { return static_cast<int>(bdPool_.size()); }
   int freeBdCount() const;
 
@@ -485,6 +495,49 @@ class CoreMemAllocator {
     std::vector<CoreMemSlot> allocations_;
 };
 
+// One core tile's self-programmed DMA config under #pragma KERNELCONFIGOFFLOAD.
+//
+// Why this lives on ResourceMgr and not in the IR: the host and kernel paths run
+// over two independent module clones, so the kernel pass cannot see what the host
+// pass computed. `oooBdId` in particular is derived from SHIM-side BD allocation
+// and is not recoverable on the kernel clone at all. ResourceMgr::instance() is
+// the existing channel between the two (coreMemAllocator already rides it).
+//
+// Populated by the host path (helper/flowtransfer_kernel.cpp) while it walks core
+// tiles; consumed by the kernel path (passblueprinttoschedulekernel) to build the
+// per-tile dispatch kernel.cc needs. One entry per (col,row,direction) pair.
+struct CoreOffloadTileConfig {
+    int col = -1;
+    int row = -1;
+    bool isOutput = false; // false = S2MM (input), true = MM2S (output)
+    int channel = 0;       // core-tile DMA channel for this direction
+    int packetId = 0;      // MM2S only; 0 for S2MM (circuit-switched)
+    bool enablePacket = false;
+    int oooBdId = -1; // MM2S only: shim S2MM BD this tile's data targets
+    int bdLenBytes = 0;
+    int ppDepth = 1;
+    int flowIndex = -1;
+    // --- BD chain detail, so the debug provenance map can describe the DMA the
+    // core programs for itself exactly as it describes a host-programmed one.
+    // Without these the aiedbg device map shows a core tile with no channels.
+    int pingBdId = -1;
+    int pongBdId = -1;    // -1 when single-buffer
+    int pingL1Offset = 0; // core DMA view (0x08000+), matches host bd buffer_offset
+    int pongL1Offset = 0;
+    int bdAcquireLockId = 0; // as programmed into the BD (already direction-swapped)
+    int bdReleaseLockId = 0;
+    int acquireLockVal = -1;
+    int releaseLockVal = 1;
+    int repeatCount = 1;
+};
+
+struct ControlShimPlacement {
+  int col = -1;
+  int mm2sCh = 0;
+  int s2mmCh = 0;
+  bool exclusive = false;
+};
+
 class ResourceMgr {
 public:
   ResourceMgr(std::unique_ptr<IHwResource> resource, ::TileType defaultType = ::TileType::Core);
@@ -540,6 +593,17 @@ public:
   // Core memory allocator (shared for all tiles using same kernel binary)
   CoreMemAllocator &coreMemAllocator() { return coreMemAllocator_; }
 
+  // KERNELCONFIGOFFLOAD per-tile plan. Written by the host path, read by the
+  // kernel path — the two run on separate module clones, so this singleton is
+  // the only channel between them. MUST be reached via ResourceMgr::instance():
+  // BlueprintToSchedulePass holds its own local ResourceMgr for BD/lock
+  // allocation, and writing the plan there would strand it.
+  std::vector<CoreOffloadTileConfig> &coreOffloadPlan() { return coreOffloadPlan_; }
+  const std::vector<CoreOffloadTileConfig> &coreOffloadPlan() const { return coreOffloadPlan_; }
+  // Record one tile+direction. Later writes for the same (col,row,isOutput)
+  // overwrite, so a re-walked flow refreshes rather than duplicates.
+  void addCoreOffloadTile(const CoreOffloadTileConfig &cfg);
+
   // Register shim column, channel, and direction to ioId mapping
   void registerShimChannelMapping(int shimCol, int channel, DMADIRECTION direction, int ioId);
 
@@ -565,11 +629,38 @@ public:
   bool releasePktId(int pktId, int ownerId = -1);
   bool isPktIdFree(int pktId) const;
 
+  // Owner sentinel marking a pkt-id reserved by the control plane (never handed
+  // out to data-plane allocations).
+  static constexpr int kControlPlaneOwner = -2;
+
+  // Mark every stream-switch resource the control plane occupies (pkt-ids,
+  // arbiters, per-port slots) for @gen as used, so routing/scheduling excludes
+  // them. Consults the reservation table (aie_runtime_resource.c) — the single
+  // source of truth. Idempotent. Always called once after ResourceMgr::init.
+  void reserveControlPlaneResources(rt_res_gen gen);
+
+  void setControlPlacement(const ControlShimPlacement &p) { ctrlPlacement_ = p; }
+  const ControlShimPlacement &controlPlacement() const { return ctrlPlacement_; }
+  std::optional<ControlShimPlacement> findFreeControlChannels(int col) const;
+  bool reserveControlShimBds(int col);
+
+  // Reserved-resource accessors for routing/scheduling.
+  uint32_t reservedArbiterMask() const { return reservedArbiterMask_; }
+  // bit i => slot i is reserved on (port,is_master) by the control plane.
+  int reservedSlotMask(uint8_t port, uint8_t is_master) const;
+  std::optional<int> dataPlanePktArbiter() const;
+  std::optional<int> dataPlanePktSlaveSlot(PortDirection port) const;
+
   // Partition bounds accessors
   int partitionStartCol() const { return partitionStartCol_; }
   int partitionEndCol() const { return partitionEndCol_; }
   int partitionStartRow() const { return partitionStartRow_; }
   int partitionEndRow() const { return partitionEndRow_; }
+  bool inPartition(int r, int c) const { return isTileInPartition(r, c); }
+  std::shared_ptr<ShimTile> getShimTile(int r, int c) const {
+    auto it = shimTiles_.find(TileCoord{r, c});
+    return it == shimTiles_.end() ? nullptr : it->second;
+  }
 
 private:
   // Partition bounds (-1 = use full mesh)
@@ -578,11 +669,25 @@ private:
 
   // Check if a column/row is within partition bounds
   bool isColInPartition(int c) const { return !hasPartition() || (c >= partitionStartCol_ && c <= partitionEndCol_); }
-  bool isRowInPartition(int r) const { return !hasPartition() || (r >= partitionStartRow_ && r <= partitionEndRow_); }
+  bool isRowInPartition(int r) const {
+    return !hasPartition() || partitionStartRow_ < 0 || (r >= partitionStartRow_ && r <= partitionEndRow_);
+  }
   bool isTileInPartition(int r, int c) const { return isColInPartition(c) && isRowInPartition(r); }
 
   static constexpr int kMaxPktId = 32; // 5-bit AIE pkt_id field
   std::array<PktIdSlot, kMaxPktId> pktIdPool_{};
+
+  // Control-plane reserved-resource state (populated by
+  // reserveControlPlaneResources). Number of stream port-types == acr_port /
+  // RT_RES_PORT_* count (WEST/EAST/NORTH/SOUTH/CTRL).
+  static constexpr int kNumPortTypes = 5;
+  uint32_t reservedArbiterMask_ = 0;
+  // [port][is_master] -> slot bitmask reserved by the control plane.
+  std::array<std::array<int, 2>, kNumPortTypes> reservedSlotMask_{};
+  bool controlPlaneReserved_ = false;
+  ControlShimPlacement ctrlPlacement_;
+  void reserveControlSpinePorts(rt_res_gen gen, int spineCol);
+
   void InitSHIMNocList();
 
   void addShimTile(std::shared_ptr<ShimTile> shim);
@@ -594,6 +699,8 @@ private:
   std::unique_ptr<IHwResource> resource_;
   std::unordered_map<int, std::shared_ptr<DataIO>> DataIOMap;
   CoreMemAllocator coreMemAllocator_; // Shared core memory allocator for BCF generation
+  // KERNELCONFIGOFFLOAD per-tile DMA plan, host path -> kernel path.
+  std::vector<CoreOffloadTileConfig> coreOffloadPlan_;
 
   // Hash function for (shimCol, channel, direction) tuple
   struct ShimChannelDirHash {

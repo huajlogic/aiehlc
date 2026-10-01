@@ -21,6 +21,9 @@ run_cmd() {
 
 usage() {
     echo "Usage: $0 --runtime-source-file <path> --aie-version <version> [--kernel-count <count>] [--kernel <source> [<directory>]] [--aielib-only] [--prettydebug] [-gdb] [--profiling] [--skip-bss]"
+    echo "  --platform    baremetal (default) | sim | linux | baremetal_debug"
+    echo "                'baremetal_debug' builds a baremetal ELF and writes sim_config.sh so the debug"
+    echo "                UI can run either a hardware test or a simulator run from one build."
     echo "  --profiling   build the host with the PMU profiling layer (-DAIEHLC_PROFILING=1)"
     echo "  --skip-bss    skip .bss zero-init on kernel load (-DAIEHLC_SKIP_BSS_DEFAULT=1)"
     return 1
@@ -300,7 +303,7 @@ check_bsp_environment "$aie_version" || return 1
 
 if [[ "$platform" == "linux" ]]; then
     TOOL_PREFIX="aarch64-linux-gnu-"
-elif [[ "$platform" == "baremetal" ]]; then
+elif [[ "$platform" == "baremetal" || "$platform" == "baremetal_debug" ]]; then
     TOOL_PREFIX="aarch64-none-elf-"
 elif [[ "$platform" == "sim" ]]; then
     TOOL_PREFIX="aarch64-none-elf-"
@@ -443,6 +446,12 @@ AIEHLC_ARGS+=(
     --extra-arg="-I$XILINX_VITIS_AIETOOLS/include" --extra-arg="-I${CLANG_INCLUDE_PATH}" --extra-arg="-I${AIEHLC_DIR}/include/llvm"
     --extra-arg="-I${SOURCE_DIR}" --extra-arg="-I${AIEHLC_DIR}/src/mlir/runtime"
     --extra-arg="-I${AIEHLC_DIR}/include"
+    # Keep LAST: fallbacks for BSP headers that only exist on the armclang
+    # branch of the standalone BSP. aiehlc parses with Clang, so __clang__ is
+    # defined and xpseudo_asm.h takes that branch, but the Gen2 (cortexa72)
+    # BSP ships only the GCC variant. Where the BSP does provide the real
+    # header (Gen5 / cortexa78) the earlier -I dirs still win.
+    --extra-arg="-I${AIEHLC_DIR}/include/bspcompat"
 )
 if [ -n "$AIEHLC_SIM_DEFINE" ]; then
     AIEHLC_ARGS+=("$AIEHLC_SIM_DEFINE")
@@ -528,6 +537,19 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
 
     echo "${runtime_source_file}" > "${WORKLOCAL_DIR}/app_source.txt"
 
+    # Convert the routing resource map JSON into a C header compiled into the host.
+    # Non-fatal: header generation must never break the build (set -e is active).
+    if [ -f "${WORKLOCAL_DIR}/routingresourcemap.json" ]; then
+        echo "Generating routing resource map header..."
+        if python3 "${AIEHLC_DIR}/src/tool/debug/resource_json_to_header.py" \
+                "${WORKLOCAL_DIR}/routingresourcemap.json" \
+                --out "${WORKLOCAL_DIR}/aie_resource_map.h"; then
+            echo "    ${WORKLOCAL_DIR}/aie_resource_map.h"
+        else
+            echo "    warning: resource_json_to_header.py failed (non-fatal); skipping header."
+        fi
+    fi
+
     # Run hostcompile.sh with WORKLOCAL_DIR pointing at aout/worklocal.
     hc_extra_defs="${EXTRA_DEFS:-}"
     if [ "${SKIP_BSS}" -eq 1 ]; then
@@ -602,6 +624,9 @@ kernel_names=()
 
 rm -f $final_obj_file
 
+_kc_platform="$platform"
+[[ "$platform" == "baremetal_debug" ]] && _kc_platform="baremetal"
+
 echo -e "\nStarting Kernel Compilation..."
 while IFS= read -r kernel_source_file; do
     kernel_names+=("$kernel_source_file")
@@ -617,13 +642,13 @@ while IFS= read -r kernel_source_file; do
         --output-dir "$KERNEL_BUILD_DIR"
         --func-name "$func_name"
         --aie-version "$aie_version"
-        --platform "$platform"
+        --platform "$_kc_platform"
         --include-base "$AIETOOLS_INCLUDE_BASE"
     )
 
-    if [[ "$use_llvm_aie" == "true" && "$platform" != "sim" ]]; then
+    if [[ "$use_llvm_aie" == "true" && "$_kc_platform" != "sim" ]]; then
         compile_args+=(--use-llvm-aie --ld-script "$KERNEL_SRC/main.ld.script")
-    elif [[ "$platform" == "sim" ]]; then
+    elif [[ "$_kc_platform" == "sim" ]]; then
         compile_args+=(--prx "$KERNEL_SRC/aieml.prx" --commons-dir "$KERNEL_BUILD_DIR")
     else
         compile_args+=(--prx "$KERNEL_SRC/aieml.prx" --commons-dir "$KERNEL_DIR/TheHouseOfCommons/")
@@ -650,6 +675,40 @@ while IFS= read -r kernel_source_file; do
         return 1
     fi
 done < "$kernel_list_file"
+
+sim_obj_files=()
+if [[ "$platform" == "baremetal_debug" ]]; then
+    echo -e "\n[baremetal_debug] Compiling kernels for simulator..."
+    while IFS= read -r kernel_source_file; do
+        func_name=$(basename "$kernel_source_file" .cc)
+        KERNEL_SRC=$KERNEL_DIR/kernelcfg/${kernel_source_file}
+        KERNEL_BUILD_DIR_SIM=$(pwd)/aout/build/${kernel_source_file}/obj_sim/
+        obj_file_sim="${KERNEL_BUILD_DIR_SIM}/kernel.o"
+        sim_obj_files+=("$obj_file_sim")
+
+        compile_args_sim=(
+            --kernel-cc "$KERNEL_SRC/wrapper.cc"
+            --output-dir "$KERNEL_BUILD_DIR_SIM"
+            --func-name "$func_name"
+            --aie-version "$aie_version"
+            --platform "sim"
+            --include-base "$AIETOOLS_INCLUDE_BASE"
+            --prx "$KERNEL_SRC/aieml.prx"
+            --commons-dir "$KERNEL_BUILD_DIR_SIM"
+        )
+        [ "$DEBUG_OUTPUT" = 1 ] && compile_args_sim+=(--debug-output)
+
+        source "$SCRIPT_DIR/kc.sh" "${compile_args_sim[@]}"
+        KC_RC=$?
+        if [ $KC_RC -ne 0 ]; then
+            echo ""
+            echo "==========================================================="
+            echo "Error: sim kernel compilation failed for $func_name (exit code $KC_RC)."
+            echo "==========================================================="
+            return $KC_RC
+        fi
+    done < "$kernel_list_file"
+fi
 
 #Compile host
 host_file=$(pwd)/aout/host.cc
@@ -686,6 +745,8 @@ RUNTIME_SRCS=(
     "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_debug.c"
     "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_stream_debug.c"
     "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_common.c"
+    "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_control_plan.c"
+    "${AIEHLC_DIR}/src/mlir/runtime/aie_runtime_resource.c"
 )
 RT_ROUTING_STUB="$(pwd)/aout/rt_routing_stub.c"
 cat > "${RT_ROUTING_STUB}" <<'EOF'
@@ -718,7 +779,7 @@ if [[ "$platform" == "sim" ]]; then
         "$host_file" "${HOST_BUILD_DIR}/worklocal" "$runtime_source_file" \
         "$aie_version" "$platform"
     return 0
-elif [[ "$platform" == "baremetal" ]]; then
+elif [[ "$platform" == "baremetal" || "$platform" == "baremetal_debug" ]]; then
     dbg_echo ${TOOL_PREFIX}g++ $opt_flags ${RUNTIME_LINK_FLAGS} -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime -I${AIEHLC_DIR}/include -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file "${RUNTIME_SRCS[@]}" ${temp_obj_files[@]} -Wl,--gc-sections -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
     ${TOOL_PREFIX}g++ $opt_flags ${RUNTIME_LINK_FLAGS} -L$XILINX_VITIS/aietools/lib/lnx64.o/ -L$AIENGINE_LIB_DIR -DAIE_GEN=${aie_version} ${compiler_cpu_flag} -Wl,-T -Wl,${ARCH_APU_LD} -I${AIETOOLS_INCLUDE_BASE} -I$AIE_DRIVER_PARENT_DIR/include/ -I$ARCH_APU_AINC -I$SECONDARY_ARCH_APU_AINC -I${SOURCE_DIR} -I${AIEHLC_DIR}/src/mlir/runtime -I${AIEHLC_DIR}/include -L$ARCH_APU_ALIB -L$AIE_DRIVER_PARENT_DIR/lib/ -o $HOST_BUILD_DIR/main.elf $host_file "${RUNTIME_SRCS[@]}" ${temp_obj_files[@]} -Wl,--gc-sections -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${EXTRA_LIBS}--end-group
     GPP_RC=$?
@@ -750,10 +811,17 @@ fi
 echo "Build complete."
 echo "    $HOST_BUILD_DIR/main.elf"
 
+if [[ "$platform" == "baremetal_debug" ]]; then
+    echo -e "\n[baremetal_debug] Writing sim config for simulator run..."
+    rm -f  "${SCRIPT_DIR}/sim/build/aiehlc_ps.so" \
+           "${SCRIPT_DIR}/sim/build/kernel_elf_init."{cc,o}
+    write_sim_config "$HOST_BUILD_DIR" "$host_file" "${sim_obj_files[*]}" "${kernel_names[*]}" "$aie_version" "$SIM_TILES"
+fi
+
 if [ -f "$host_file" ]; then
     prepare_raw_xaie_debug_view \
         "$host_file" "${HOST_BUILD_DIR}/worklocal" "$runtime_source_file" \
-        "$aie_version" "$platform" "${HOST_BUILD_DIR}/main.elf"
+        "$aie_version" "baremetal" "${HOST_BUILD_DIR}/main.elf"
 fi
 }
 

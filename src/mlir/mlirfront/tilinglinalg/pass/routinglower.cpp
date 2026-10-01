@@ -5,6 +5,7 @@
 
 #include "routinglower.h"
 #include "routing/routingpath.h"
+#include "routinghw_pkt_slot.h"
 #include <sstream>
 
 int ioIdx = 0;
@@ -148,6 +149,7 @@ struct StreamPKTConnection {
 
         // For output gather flows, preserve headers when OOO is enabled
         bool preserveHdr = true;
+        auto pktSlot = routinghw::pktslot::makePktSlotAttrs(rewriter);
         rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
             op->getLoc(), // Operation location
             output,
@@ -165,8 +167,7 @@ struct StreamPKTConnection {
                 PortDirectiontoString(value.MasterSendToNextTileDirection)), // No forwarding: empty master direction
             rewriter.getI32IntegerAttr(
                 (int)(value.MasterSendToNextTileDirectionPortIdx)), // No forwarding: port index 0
-            rewriter.getBoolAttr(preserveHdr)                       // preserveheader: keep headers for OOO BD dispatch
-        );
+            rewriter.getBoolAttr(preserveHdr), ROUTINGHW_PKT_SLOT_ATTRS(pktSlot));
     }
     ret.tile = tilist.back();
     ret.pktconn = pktswitchmap[ret.tile];
@@ -338,6 +339,7 @@ void ParseTheCCTRoutingPath(Operation* op,
                 auto tileOp = dyn_cast<routinghw::TileCreate>((Operation* )lastPkttilemap->tileOp);
                 // Transition op: preserve headers when OOO is enabled
                 bool preserveHdrTransition = true;
+                auto pktSlot = routinghw::pktslot::makePktSlotAttrs(rewriter);
                 ///*
                 rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
                     loc, // Operation location
@@ -356,8 +358,7 @@ void ParseTheCCTRoutingPath(Operation* op,
                         conn.MasterSendToNextTileDirection)), // No forwarding: empty master direction
                     rewriter.getI32IntegerAttr(
                         (int)(conn.MasterSendToNextTileDirectionPortIdx)), // No forwarding: port index 0
-                    rewriter.getBoolAttr(preserveHdrTransition)            // preserveheader
-                );                                                         //*/
+                    rewriter.getBoolAttr(preserveHdrTransition), ROUTINGHW_PKT_SLOT_ATTRS(pktSlot)); //*/
             }
             
             continue;

@@ -1453,6 +1453,33 @@ class DfscheduleSlicer:
 
 import re as _re
 
+
+
+def _normalize_pkt_connect(conn):
+    """Fill PKT slot metadata matching routinghwlower.cpp constants."""
+    if conn.get('kind') != 'packet_connect':
+        return
+    for leg, defaults in (
+        ('recv_slave', {'mask': 0, 'msel': 0, 'arbiter': 0, 'slot': 0}),
+        ('local_dma', {'mask': 0x1f, 'msel': 0, 'arbiter': 0, 'slot': 0}),
+    ):
+        port = conn.setdefault(leg, {})
+        if port.get('dir') in (None, 'NONE'):
+            continue
+        for k, v in defaults.items():
+            port.setdefault(k, v)
+    fm = conn.setdefault('forward_master', {})
+    if fm.get('dir') not in (None, 'NONE'):
+        fm.setdefault('arbiter', 0)
+        fm.setdefault('msel_en', 1)
+
+
+def _normalize_routing_groups(groups):
+    for g in groups:
+        for c in g.get('connections', []):
+            _normalize_pkt_connect(c)
+
+
 def _load_comm_paths(workdir):
     """Load comm_paths from dmaphopprovenacemap.json + optional routingprovenancemap.json.
 
@@ -1491,6 +1518,7 @@ def _load_comm_paths(workdir):
         try:
             with open(rp_path) as f:
                 rp_groups = json.load(f).get('routing_groups', [])
+            _normalize_routing_groups(rp_groups)
         except Exception:
             pass
 
@@ -1581,6 +1609,13 @@ def _load_comm_paths(workdir):
             edges.append([[fc, fr], [tc, tr]])
             tiles_seen.add((fc, fr))
             tiles_seen.add((tc, tr))
+
+        # Groups that name their DMA endpoints directly (work2provenance) are
+        # taken at their word; deriving them from a master.dir=='DMA' entry
+        # only works for push, where the DMA is the master.
+        for t in g.get('dma_tiles', []):
+            dma_tiles.add((t[0], t[1]))
+            tiles_seen.add((t[0], t[1]))
 
         if direction == 'pull' and split_idx is not None:
             for c in push_conns:
@@ -1715,7 +1750,38 @@ def _load_comm_paths(workdir):
             rg = rp_by_flow_index.get(flow_index)
         if rg is None:
             rg = rp_by_dma_tiles.get(frozenset(nonshim_tiles))
-        rg_connections = rg.get('connections', []) if rg else []
+        rg_conns_all = rg.get('connections', []) if rg else []
+        if rg_conns_all:
+            _split = next((i for i, c in enumerate(rg_conns_all)
+                           if c.get('kind') == 'shim_aie_to_ext'), None)
+            if _split is not None:
+                if direction == 'push':
+                    # Packet entries in a split group are the gather segment:
+                    # local_dma is a packet *slave*, i.e. the tile sourcing
+                    # into the stream, which only happens on the way out.  A
+                    # push consumer takes delivery on a circuit_connect whose
+                    # master is DMA.  Leaving them in attributed the pull
+                    # flow's gather config to the push flow as well.
+                    rg_connections = [c for c in rg_conns_all[:_split]
+                                      if c.get('kind') != 'packet_connect']
+                else:
+                    # Pull flows: keep only packet_connect entries from the push
+                    # section (packet-switch gather config is shared) plus all
+                    # entries after shim_aie_to_ext (the pull-side routing).
+                    # Exclude push-section circuit_connect entries: they configure
+                    # the input distribution stream switch and must not appear on
+                    # pull flows or they get wrongly attributed to both.
+                    push_pkts = [c for c in rg_conns_all[:_split]
+                                 if c.get('kind') == 'packet_connect']
+                    # Keep the shim_aie_to_ext marker itself: it is this pull
+                    # flow's egress port, and dropping it left pull nets with
+                    # no GMIO section and the port attributed to no flow.
+                    pull_conns = rg_conns_all[_split:]
+                    rg_connections = push_pkts + pull_conns
+            else:
+                rg_connections = rg_conns_all
+        else:
+            rg_connections = []
 
         stages_raw = p.get('stages', [])
 
@@ -2020,9 +2086,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <style>
   /* ── design tokens ───────────────────────────────────────────── */
   :root {
-    /* tile identity colors — saturated enough to read on a dark base */
     --shim: #2a5a90;
     --core: #2a5a3a;
+    --tile-shim-fill: rgba(42, 90, 144, 0.11);
+    --tile-shim-stroke: rgba(58, 104, 152, 0.36);
+    --tile-core-fill: rgba(42, 90, 58, 0.11);
+    --tile-core-stroke: rgba(56, 104, 72, 0.36);
+    --tile-mem-fill: rgba(72, 64, 104, 0.12);
+    --tile-mem-stroke: rgba(88, 88, 120, 0.36);
     --sel: #f0b840;
     /* backgrounds — three-level stack with clear contrast steps */
     --bg-base:    #282828;
@@ -2051,6 +2122,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     /* peer highlight colors */
     --peer-send-border: #d058c0;
     --peer-recv-border: #38d0e0;
+    --right-pad: 16px;
   }
 
   * { box-sizing: border-box; }
@@ -2064,9 +2136,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #lefttop { flex:3 1 0; overflow:auto; padding:16px; min-height:80px; }
   #leftbottom { flex:1 1 0; overflow:hidden; min-height:60px;
                display:flex; flex-direction:column; }
-  #right { flex:1 1 0; min-width:200px; padding:16px; overflow:hidden;
+  #right { flex:1 1 0; min-width:200px; padding:var(--right-pad); overflow:hidden;
            display:flex; flex-direction:column; }
-  #panel { flex:1 1 0; overflow:auto; min-height:0; }
+  #panel { flex:1 1 0; min-height:0; display:flex; flex-direction:column; position:relative; }
+  #panel-body { flex:1 1 0; overflow-y:auto; min-height:0; }
+  #panel-toc { position:absolute; right:0; top:0; width:112px; overflow-y:auto;
+               max-height:100%; background:rgba(28,28,28,0.40);
+               border-left:1px solid rgba(255,255,255,0.08);
+               padding:0; z-index:5; transition:width 0.15s ease; }
+  #panel-toc.no-items { display:none; }
+  #panel-toc.collapsed { width:22px; overflow:hidden; }
+  #panel-toc.collapsed .ptoc-item { display:none; }
+  .ptoc-toggle { display:block; width:100%; padding:4px 0; text-align:center;
+                 font-size:14px; color:var(--tx); background:none; border:none;
+                 border-bottom:1px solid rgba(255,255,255,0.08); cursor:pointer; line-height:1; }
+  .ptoc-toggle:hover { color:var(--accent); }
+  .ptoc-top { display:block; width:100%; padding:3px 0; text-align:center;
+              font-size:13px; color:var(--tx); background:none; border:none;
+              border-bottom:1px solid rgba(255,255,255,0.06); cursor:pointer; line-height:1; }
+  .ptoc-top:hover { color:var(--tx-hi); }
+  .ptoc-item { display:block; padding:2px 8px; font-size:10px; color:var(--tx);
+               cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+               line-height:1.5; }
+  .ptoc-item:hover { color:var(--tx-hi); background:rgba(255,255,255,0.06); }
   /* Title + item tabs share one row, and it sits OUTSIDE #panel: the strip used
      to scroll away with the body, and hoisting it costs no extra height. */
   #panel-hdr { flex:0 0 auto; display:flex; align-items:baseline; flex-wrap:wrap;
@@ -2107,7 +2199,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #lhsplitter:hover::after, #lhsplitter.drag::after { background:var(--accent); }
 
   #rhsplitter { display:none; flex:0 0 5px; cursor:row-resize; background:var(--bg-base);
-                margin-top:8px; border-top:1px solid var(--bd); border-bottom:1px solid var(--bd);
+                margin:8px calc(-1 * var(--right-pad)) 0;
+                border-top:1px solid var(--bd); border-bottom:1px solid var(--bd);
                 transition:background .15s; position:relative; }
   #right:has(#cmdconsole:not(.hide)) #rhsplitter { display:block; }
   #rhsplitter:hover, #rhsplitter.drag { background:var(--accent-dim); border-color:var(--accent); }
@@ -2117,13 +2210,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   /* ── typography ──────────────────────────────────────────────── */
   #lefttop-header { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
-  h1 { font-size:17px; font-weight:700; margin:0; letter-spacing:-.01em; }
+  h1 { font-size:17px; font-weight:700; margin:0; letter-spacing:-.01em;
+       transform:scale(1.118); transform-origin:left center;
+       margin-right:calc((1.118 - 1) * 10ch); }
   /* One name per pane. Each rides the pane's existing first row — a control
-     row or a tab strip — rather than taking a row of its own. */
+     row or a tab strip — rather than taking a row of its own. Scale up visually
+     without changing the flex/inline footprint (font-size drives layout box);
+     margin-right absorbs the scaled overflow to the right. */
   .pane-title { flex:0 0 auto; font-size:13px; font-weight:700; margin:0;
-                color:var(--tx-hi); letter-spacing:.01em; white-space:nowrap; }
+                color:var(--tx-hi); letter-spacing:.01em; white-space:nowrap;
+                transform:scale(1.154); transform-origin:left center;
+                margin-right:calc((1.154 - 1) * 9ch); }
   #contabs > .pane-title { display:inline-block; vertical-align:bottom;
-                           padding-bottom:3px; margin-right:8px; }
+                           padding-bottom:3px;
+                           margin-right:calc(8px + (1.154 - 1) * 5ch);
+                           transform-origin:left bottom; }
   .sub { color:var(--tx-lo); font-size:11px; letter-spacing:.01em; }
   .panel h2 { font-size:12px; font-weight:600; margin:16px 0 6px;
               padding-bottom:5px; border-bottom:1px solid var(--bd-soft);
@@ -2174,6 +2275,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   ul.sum { margin:4px 0; padding-left:18px; font-size:12px; }
   ul.sum li { margin:2px 0; }
   .contract { color:#c9a; font-size:11.5px; }
+  .contract .ct-pktid { display:inline-block; font-size:9px; color:#c07fd4;
+                        background:#1a0d24; border-radius:2px; padding:0 3px;
+                        margin-left:3px; vertical-align:middle; }
 
   /* ── supply/demand badges ────────────────────────────────────── */
   .sdrow { margin:4px 0 7px; }
@@ -2334,6 +2438,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      three sides; paint the left edge of the following segment to close it. */
   .vsw.act + .vsw { border-left:1px solid var(--bd-accent); }
 
+  /* Profile tab is inert until a run renders a timeline.png. */
+  .vsw-disabled { opacity:.4; pointer-events:none; cursor:default; }
+
+  /* ── Profile panel ───────────────────────────────────────────── */
+  #profileview { display:none; flex-direction:column; gap:8px; }
+  #profileview.show { display:flex; }
+  #profile-status { font-size:12px; color:var(--tx-mid); }
+  #profile-img { max-width:100%; height:auto; border:1px solid var(--bd);
+                 border-radius:4px; background:#fff; }
+
   /* ── Targets panel ───────────────────────────────────────────── */
   #targetsview { display:none; flex-direction:column; gap:0; }
   #targetsview.show { display:flex; }
@@ -2453,11 +2567,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .hide { display:none; }
 
   /* ── console / terminal ──────────────────────────────────────── */
-  #cmdconsole { flex:0 0 260px; border-top:1px solid var(--bd); margin-top:8px;
-                padding-top:10px; display:flex; flex-direction:column;
+  #cmdconsole { flex:0 0 260px; border-top:1px solid var(--bd);
+                margin:8px calc(-1 * var(--right-pad)) 0;
+                padding:10px var(--right-pad) 0; display:flex; flex-direction:column;
                 min-height:0; overflow:hidden; }
   #conhdr, #conhelp { flex:0 0 auto; }
   #conhdr { font-weight:600; margin-bottom:4px; font-size:12px; }
+  #llmpane #conhdr { display:flex; align-items:center; gap:0; }
+  .llm-hint { font-size:11px; font-weight:400; color:var(--tx-lo); margin-left:10px; }
   #contarget { color:var(--accent-fg); }
   #conhelp { display:flex; flex-wrap:wrap; align-items:center; gap:2px;
              margin-bottom:6px; }
@@ -2599,7 +2716,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #overlayctl { font-size:12px; }
   #testconn:disabled { opacity:.38; cursor:not-allowed; }
   #leftbottom label.disabled, #overlayctl label.disabled { opacity:.45; pointer-events:none; }
-  #livestatus { color:var(--accent-fg); font-size:11px; margin-top:6px; min-height:14px; }
+  #livestatus { color:var(--accent-fg); font-size:11px; margin-top:4px; min-height:0; }
+  #livestatus:empty { display:none; }
   #runstatus  { color:var(--tx-mid);   font-size:11px; min-height:14px; }
   /* ── DMA issue bar ───────────────────────────────────────────── */
   #issue-bar { display:none; margin-top:6px; border:1px solid #6b2222;
@@ -2631,16 +2749,95 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* ── device map ──────────────────────────────────────────────── */
   #devmap { display:none; flex-direction:column; }
   #devmap.show { display:flex; }
-  /* nowrap + min-width:0 on the netbar: the net pills wrap *inside* their own
-     box, so the scan controls stay pinned to the right of the same row instead
-     of being pushed onto a second line by a long net list. */
+  /* The topbar stays nowrap so the scan controls keep their pinned-right slot
+     no matter how long the net list gets; each half absorbs pressure inside
+     its own box. #devmap-scan has to be shrinkable or the first control added
+     to it starves the netbar to zero, and the netbar needs a real basis: with
+     basis:auto its shrink factor scales with its content width, so it absorbs
+     essentially all of the overflow on its own. */
+  /* Two columns: pills left, controls right. The topbar itself never wraps —
+     each side absorbs its own growth, the pills by wrapping to more rows and
+     the controls by stacking down the right column. */
   #devmap-topbar { display:flex; flex-wrap:nowrap; align-items:flex-start; gap:8px;
                    margin-bottom:8px; }
+  /* min-content floor so a control row can never be squeezed narrower than the
+     buttons on it; below that the pills give way rather than Clear sliding out
+     of the pane. */
+  /* max-width:50% is what actually holds the split. A column flex box sizes to
+     its widest row and will not yield on its own, so without a cap the scan
+     status text — which is perfectly able to ellipsize — silently takes width
+     from the pills and they pay for it in rows. */
+  #devmap-right { display:flex; flex-direction:column; align-items:flex-end;
+                  gap:4px; flex:0 1 auto; min-width:min-content; max-width:50%;
+                  margin-left:auto; }
+  #dmRsrc { margin-left:0; }
+  /* A half-width basis: the pills are navigation and claim their own half,
+     rather than being left whatever the scan status text — transient, and able
+     to ellipsize — happens not to want. */
   #devmap-netbar { display:flex; flex-wrap:wrap; gap:4px; align-items:center;
-                   flex:1 1 auto; min-width:0; }
-  #devmap-scan { display:flex; align-items:center; gap:4px;
-                 flex:0 0 auto; margin-left:auto; }
-  #devmap-scan .ltab { margin:0; }
+                   flex:1 1 50%; min-width:0; }
+  /* Deliberately not flex-wrap: the status text changes length every 2s in
+     live mode, so a wrapping cluster would move the Scan button between rows
+     while the user is aiming at it. */
+  #devmap-scan { display:flex; align-items:center; gap:4px; }
+  /* Scan mode is a one-of-N selection that grew past the width a pill strip
+     can spend on it, so it is a dropdown wearing the unselected .ltab skin —
+     it is a selection, and must not read as the accent-filled active tab or as
+     the solid-accent Scan verb beside it. */
+  .scan-what { padding:2px 6px; border:1px solid var(--bd); border-radius:4px;
+               background:var(--bg-raised); color:var(--tx-mid);
+               cursor:pointer; font-size:11px; font-family:inherit;
+               transition:background .12s, color .12s, border-color .12s; }
+  .scan-what:hover { color:var(--tx-hi); background:var(--bg-hover); }
+  .scan-what:focus-visible { outline:1px solid var(--bd-accent); outline-offset:1px; }
+  #overlayWhat { margin-left:8px; vertical-align:middle; }
+  /* Scan progress. A switch scan costs one board round-trip per tile, so the
+     status text alone leaves the page looking hung. Revealed on a delay (see
+     setScanBusy) so the 2s DMA poll does not blink it. */
+  .spin { display:inline-block; width:11px; height:11px; margin-left:7px;
+          vertical-align:-1px; box-sizing:border-box;
+          border:2px solid var(--bd); border-top-color:var(--accent);
+          border-radius:50%; animation:scanspin .7s linear infinite; }
+  .spin[hidden] { display:none; }
+  @keyframes scanspin { to { transform:rotate(360deg); } }
+  /* Reduced motion: the ring appearing at all is the signal; spinning it is
+     decoration the user has asked not to see. */
+  @media (prefers-reduced-motion: reduce) { .spin { animation:none; } }
+  /* Routing source. Hidden until a switch scan has actually reconstructed a
+     map, because until then there is nothing to switch to. It is a one-of-2
+     selection whose label carries the flow count, so a pill strip would cost
+     width proportional to the design — the same reason scan mode above became
+     a dropdown. Save is a verb, so it stays a button beside it. */
+  /* flex:0 0 auto, not min-width:0: as a shrinkable flex child this collapsed
+     to the width of the selector alone and the Save button spilled out on top
+     of the next control. The status text next to it is the one that gives. */
+  .rsrc { display:inline-flex; align-items:center; gap:6px; flex:0 0 auto;
+          margin-left:10px; font-size:11px; vertical-align:middle; }
+  .rsrc[hidden] { display:none; }
+  .rsrc-diff-wrap { color:var(--tx-dim); white-space:nowrap; cursor:pointer;
+                     flex:0 0 auto; }
+  .rsrc-diff-wrap input { margin:0 4px 0 0; vertical-align:middle; }
+  .rsrc-diff-wrap:has(input:checked) { color:var(--tx-hi); }
+  /* A floor, not min-width:0: the whole point of the label is the source name
+     and the flow count, and a selector shrunk to "rout…" carries neither. The
+     status text beside it already ellipsizes, so it absorbs the pressure. */
+  .rsrc-sel { flex:0 0 auto; min-width:112px; }
+  /* Dynamic stays selected across every panel and view, so the selector has
+     to carry that state at rest. Border and text only: an --accent-dim fill
+     here is the active-tab reading the .scan-what skin exists to avoid. */
+  .rsrc-sel[data-src="dynamic"] { color:var(--tx-hi); border-color:var(--bd-accent); }
+  .rsrc .rs-dl { flex:0 0 auto; font-size:11px; padding:2px 8px;
+                 border-radius:4px; cursor:pointer; font-family:inherit;
+                 color:var(--tx-dim); border:1px solid var(--bd);
+                 background:var(--bg-raised); }
+  .rsrc .rs-dl:hover { color:var(--tx-hi); background:var(--bg-hover); }
+  /* nowrap: the failure message is longer than the selector it replaces, and
+     wrapping it would push the Scan button onto a second row — the one thing
+     the surrounding layout is built to prevent. */
+  .rsrc-err { color:var(--tx-dim); white-space:nowrap; overflow:hidden;
+              text-overflow:ellipsis; min-width:0; }
+  .rsrc-sel[hidden], .rsrc .rs-dl[hidden], .rsrc-err[hidden] { display:none; }
+  #gridRsrc { margin-left:8px; }
   /* Scan is an ACTION, not a selection. It deliberately avoids both tab states:
      --accent-dim fill would read as a selected tab, and the default button
      surface (--bg-raised on --bd) is nearly identical to an *un*selected .ltab.
@@ -2660,8 +2857,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #dmLiveWrap { font-size:10px; color:var(--tx-lo); cursor:pointer; display:flex;
                 align-items:center; gap:3px; }
   #dmLiveWrap input { margin:0; }
+  /* A px cap, not a percentage: nowrap text contributes its full width to the
+     column's min-content, and min-width beats max-width — so a percentage cap
+     on the column cannot hold it back. Capped here it ellipsizes instead, and
+     the column's width stops depending on how long the last message was. */
   #dmScanStatus { font-size:10px; color:var(--accent-fg); min-width:0; white-space:nowrap;
-                  overflow:hidden; text-overflow:ellipsis; max-width:260px; }
+                  overflow:hidden; text-overflow:ellipsis; max-width:100%; margin-top:4px;
+                  align-self:stretch; }
+  /* No empty line above the buttons on the runs where there is no status yet. */
+  #dmScanStatus:empty { display:none; }
   #dmScanStatus.err { color:var(--red-fg); }
   .dm-vsep { width:1px; height:16px; background:var(--bd-soft); flex-shrink:0; }
   /* Status ring on a net chip — sits left of the identity dot so the net's own
@@ -2691,6 +2895,39 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   border:1px solid rgba(228,228,228,.2); background:rgba(228,228,228,.07);
                   color:rgba(228,228,228,.7); border-radius:4px; cursor:pointer; z-index:10; }
   #devmap-reset:hover { background:rgba(228,228,228,.13); color:rgba(228,228,228,.95); }
+  #dmSwWrap { position:absolute; top:34px; right:8px; font-size:10px;
+              color:rgba(228,228,228,.6); cursor:pointer; z-index:10;
+              display:flex; align-items:center; gap:4px; user-select:none; }
+  #dmSwWrap:hover { color:rgba(228,228,228,.9); }
+  #dmSwWrap input { cursor:pointer; margin:0; }
+  #dmLoadCtrlPlan { position:absolute; top:8px; right:96px; font-size:10px; padding:3px 8px;
+                    border:1px solid rgba(228,228,228,.2); background:rgba(228,228,228,.07);
+                    color:rgba(228,228,228,.7); border-radius:4px; cursor:pointer; z-index:10; }
+  #dmLoadCtrlPlan:hover:not(:disabled) { background:rgba(228,228,228,.13); color:rgba(228,228,228,.95); }
+  #dmLoadCtrlPlan:disabled { opacity:.38; cursor:not-allowed; }
+  #dmCtrlPlanWrap { position:absolute; top:58px; right:8px; font-size:10px;
+                    color:rgba(228,228,228,.6); cursor:pointer; z-index:10;
+                    display:flex; align-items:center; gap:4px; user-select:none; }
+  #dmCtrlPlanWrap input { cursor:pointer; margin:0; }
+  .ctrlplan-edge { stroke:#e91e63; stroke-width:2; opacity:.9; }
+  .ctrlplan-ret { stroke:#00bcd4; }
+  .ctrlplan-ctrl { fill:none; stroke:#ffb300; stroke-width:2; opacity:.9; pointer-events:none; }
+  .ctrlplan-ctrl-emit { stroke:#00bcd4; }
+  /* Stream-switch connection detail (rendered into the right-side Info panel by
+     clicking a tile after a control plan is loaded). Draws slave inputs -> slot
+     node -> master fan-out. The SVG renders at its natural size so text stays
+     crisp and legible; #swd-host scrolls horizontally when the panel is narrower. */
+  #swd-host { overflow-x:auto; }
+  #swd-host .swd-svg { display:block; }
+  .swd-empty { color:#b0bec5; font-size:12px; padding:8px 2px; }
+  .swd-slave { fill:#4a7fd4; }
+  .swd-slot  { fill:#ffb300; }
+  .swd-master{ fill:#e91e63; }
+  .swd-lbl   { font-size:12px; fill:#e4e4e4; font-family:monospace; }
+  .swd-dest  { font-size:11px; fill:#b0bec5; font-family:monospace; }
+  .swd-param { font-size:10px; fill:#90a4ae; font-family:monospace; }
+  .swd-link  { stroke:#8a90a0; stroke-width:1.5; fill:none; }
+  .swd-dirhdr{ font-size:12px; fill:#ffd54f; font-family:monospace; font-weight:bold; }
   #devmap-legend { display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; font-size:10px;
                    color:rgba(228,228,228,.35); align-items:center; }
   .dml-item { display:flex; align-items:center; gap:4px; }
@@ -2837,7 +3074,57 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .rctbl { border-collapse:collapse; margin:7px 0 9px; font-size:12px; width:100%; }
   .rctbl th, .rctbl td { border:1px solid var(--bd); padding:3px 8px; text-align:left;
                            white-space:nowrap; }
+  .rctbl td:last-child { white-space:normal; }
   .rctbl td:first-child { color:var(--accent-fg); font-family:ui-monospace,monospace; }
+
+  /* ── tile routing + DMA BD mini-sections ─────────────────────── */
+  .rt-row { display:flex; align-items:center; gap:6px; font-size:11px;
+            font-family:ui-monospace,monospace; padding:2px 4px;
+            border-radius:2px; margin:1px 0; }
+  .rt-row .rt-kind { flex:0 0 32px; font-size:9px; font-weight:700;
+                      text-transform:uppercase; color:var(--tx-lo); }
+  .rt-row .rt-ports { flex:1; color:var(--tx-hi); }
+  .rt-row .rt-flow  { flex:0 0 auto; color:var(--tx-lo); font-size:9px; }
+  .rt-pktid { font-size:9px; color:#c07fd4; background:#1a0d24; border-radius:2px;
+              padding:1px 5px; margin-left:6px; display:inline-block; white-space:nowrap; }
+  .rt-pktmask { font-size:9px; color:#e87850; background:#3a1010; border-radius:2px;
+                padding:1px 5px; margin-left:6px; display:inline-block; white-space:nowrap; }
+  .rt-row .rt-pktid, .rt-row .rt-pktmask { flex:0 0 auto; margin-left:0; }
+  /* stream-switch scan verdicts */
+  .sw-ok { font-size:9px; color:#7fd48a; background:#0f2413; border-radius:2px;
+           padding:0 3px; margin-left:4px; flex:0 0 auto; }
+  .sw-bad { font-size:9px; color:#ff9270; background:#361208; border-radius:2px;
+            padding:0 3px; margin-left:4px; flex:0 0 auto; }
+  .rt-row.sw-extra { opacity:0.95; }
+  .sw-state { font-size:9px; border-radius:2px; padding:0 4px; margin-left:6px; }
+  .sw-state.verified { color:#7fd48a; background:#0f2413; }
+  .sw-state.mismatch { color:#ff9270; background:#361208; }
+  .sw-state.unreachable { color:#c0a080; background:#2a2118; }
+  .sw-state.idle { color:#8a94a0; background:#1a1e24; }
+  .rt-s2mm { font-size:9px; color:#30c0d0; background:#0a2830; border-radius:2px;
+             padding:1px 4px; margin-left:6px; display:inline-block; white-space:nowrap; }
+  .rt-mm2s { font-size:9px; color:#c050b0; background:#2a1028; border-radius:2px;
+             padding:1px 4px; margin-left:6px; display:inline-block; white-space:nowrap; }
+  .rt-row .rt-s2mm, .rt-row .rt-mm2s { flex:0 0 auto; margin-left:0; }
+  .rt-route { font-size:9px; color:#687080; background:#141820; border-radius:2px;
+              padding:1px 4px; margin-left:6px; display:inline-block; white-space:nowrap;
+              font-style:italic; opacity:.88; }
+  .rt-row .rt-route { flex:0 0 auto; margin-left:0; }
+  .rt-row .rt-fwd   { color:var(--tx-lo); font-size:9px; margin-left:2px; }
+  .rt-row.cct  { border-left:2px solid #4a7fd4; }
+  .rt-row.pkt  { border-left:2px solid #9c4fd4; }
+  .rt-row.mst  { border-left:2px solid #7a5098; opacity:.92; }
+  .rt-row.shim { border-left:2px solid #4aa4d4; }
+  .rt-mst-hdr { font-size:10px; color:var(--tx-lo); margin:8px 0 3px 4px;
+                text-transform:uppercase; letter-spacing:.04em; }
+  .bd-mini { font-size:11px; font-family:ui-monospace,monospace;
+             padding:2px 4px; margin:1px 0; border-left:2px solid var(--bd); }
+  .bd-mini .bd-id, .bd-id   { color:var(--accent-fg); font-weight:700; margin-right:3px; }
+  .bd-mini .bd-len, .bd-len { color:var(--tx-hi); margin-right:3px; }
+  .bd-mini .bd-next,.bd-next{ color:var(--tx-lo); margin-right:3px; }
+  .bd-mini .bd-lock,.bd-lock{ color:#6aaa80; font-size:10px; }
+  .bd-mini-ch { font-size:11px; font-weight:600; margin:6px 0 2px;
+                color:var(--tx-mid); }
 
   .dimtxt { color:var(--tx-lo); font-size:12px; }
 
@@ -3014,18 +3301,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <span class="vsw act" data-v="grid" onclick="switchView('grid')">Grid</span>
       <span class="vsw" data-v="map" onclick="switchView('map')">Device Map</span>
       <span class="vsw" data-v="targets" onclick="switchView('targets')">Host</span>
+      <!-- Profile tab: disabled until a run finishes and timeline.png renders. -->
+      <span class="vsw vsw-disabled" id="vsw-profile" data-v="profile"
+            onclick="switchView('profile')" title="Timeline appears after a run finishes">Profile</span>
     </div>
   </div>
   <div class="sub" id="meta" style="display:none"></div>
   <!-- live status overlay: pinned above the tile grid -->
   <div id="overlayctl" style="margin-bottom:6px;">
     <label><input type="checkbox" id="liveToggle"> Live status overlay</label>
-    <div id="overlaytabs" style="display:inline-flex;gap:4px;margin-left:8px;">
-      <span class="ltab act" data-w="dma">DMA</span>
-      <span class="ltab" data-w="cores">Cores</span>
-      <span class="ltab" data-w="events">Events</span>
-    </div>
-    <button id="gridScanBtn" title="read live status from the board / simulator">Scan</button>
+    <span class="rsrc" id="gridRsrc" hidden></span>
+    <select id="overlayWhat" class="scan-what" title="what to read on the next scan">
+      <option value="dma" title="DMA channel state and BD progress">DMA</option>
+      <option value="cores" title="core status per tile">Cores</option>
+      <option value="events" title="DMA start/finish/error events">Events</option>
+      <option value="switch" title="stream-switch registers, diffed against the routing map">Switch</option>
+    </select>
+    <button id="gridScanBtn" title="read live status from the board / simulator">Scan</button><span class="spin" id="gridSpin" hidden title="scan in progress"></span>
     <div id="livestatus"></div>
     <div id="runstatus"></div>
     <div id="issue-bar"></div>
@@ -3038,33 +3330,46 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="devmap-topbar">
       <div id="devmap-netbar"></div>
       <span class="dm-vsep"></span>
+      <!-- Right column. The net pills own the left and grow downward there;
+           anything control-shaped stacks on this side instead of stealing
+           width from them. -->
+      <div id="devmap-right">
       <div id="devmap-scan">
-        <span id="dmScanStatus"></span>
         <label id="dmLiveWrap" title="re-scan every 2s"><input type="checkbox" id="dmLiveToggle"> live</label>
-        <span id="dmScanWhat">
-          <span class="ltab act" data-w="dma">DMA</span>
-          <span class="ltab" data-w="cores">Cores</span>
-          <span class="ltab" data-w="events">Events</span>
-        </span>
-        <button id="dmScanBtn" title="read live status from the board / simulator">Scan</button>
+        <select id="dmScanWhat" class="scan-what" title="what to read on the next scan">
+          <option value="dma" title="DMA channel state and BD progress">DMA</option>
+          <option value="cores" title="core status per tile">Cores</option>
+          <option value="events" title="DMA start/finish/error events">Events</option>
+          <option value="switch" title="stream-switch registers, diffed against the routing map">Switch</option>
+        </select>
+        <button id="dmScanBtn" title="read live status from the board / simulator">Scan</button><span class="spin" id="dmSpin" hidden title="scan in progress"></span>
         <button id="dmClearBtn" title="clear scan status and search highlights">Clear</button>
+      </div>
+        <!-- Second row of the right column: this selects which routing map the
+             whole view reads, and the scan row has no width left to lend it. -->
+        <span class="rsrc" id="dmRsrc" hidden></span>
+        <span id="dmScanStatus"></span>
       </div>
     </div>
     <div id="devmap-vp">
       <button id="devmap-reset" onclick="dmReset(true)">Reset view</button>
-      <div id="devmap-spacehint">scroll to zoom · click tile to inspect · click stream to isolate</div>
+      <label id="dmSwWrap" title="show/hide CCT/PKT routing config inside tiles"><input type="checkbox" id="dmSwToggle" checked> routing info</label>
+      <button id="dmLoadCtrlPlan" title="parse applog CONTROLPAN-PMAP lines and overlay the control-plan routing">Load control plan</button>
+      <label id="dmCtrlPlanWrap" title="show/hide the parsed control-plan overlay" hidden><input type="checkbox" id="dmCtrlPlanToggle" checked> ctrl plan</label>
+      <div id="devmap-spacehint">scroll to zoom · click tile to inspect · right-click tile for routing/isolate menu · click stream to isolate</div>
       <div id="devmap-canvas"><svg id="devmap-svg"></svg></div>
       <div id="devmap-hint">col 0–3 · row 0 (shim) at bottom</div>
     </div>
     <div id="devmap-legend">
-      <div class="dml-item"><div class="dml-swatch" style="background:#e4e4e41e;border:1px solid #e4e4e433"></div>SHIM = PL/NoC gateway</div>
-      <div class="dml-item"><div class="dml-swatch" style="background:#e4e4e411;border:1px solid #e4e4e41f"></div>MEM = memory tiles</div>
-      <div class="dml-item"><div class="dml-swatch" style="background:#e4e4e41e;border:1px solid #e4e4e433"></div>AIE = compute cores</div>
+      <div class="dml-item"><div class="dml-swatch" style="background:var(--tile-shim-fill);border:1px solid var(--tile-shim-stroke)"></div>SHIM = PL/NoC gateway</div>
+      <div class="dml-item"><div class="dml-swatch" style="background:var(--tile-mem-fill);border:1px solid var(--tile-mem-stroke)"></div>MEM = memory tiles</div>
+      <div class="dml-item"><div class="dml-swatch" style="background:var(--tile-core-fill);border:1px solid var(--tile-core-stroke)"></div>AIE = compute cores</div>
       <div class="dml-item"><div class="dml-line" style="border-top:2.5px solid #599ce7"></div>solid = stream-switch route</div>
       <div class="dml-item"><div class="dml-line" style="border-top:2px solid #599ce7;border-bottom:2px solid #599ce7;height:5px"></div><span style="color:#599ce7">&#9642;</span> double line + square = ping-pong window (kernel&harr;kernel)</div>
       <div class="dml-item"><div class="dml-line" style="border-top:2px dashed #599ce7"></div>dashed = direct shared-memory (DMA&harr;kernel)</div>
       <div class="dml-item"><div class="dml-dot" style="background:#599ce7;border:1.2px solid #181818"></div>● solid = injects into stream (source / contributor)</div>
       <div class="dml-item"><div class="dml-dot" style="background:#181818;border:2.2px solid #599ce7"></div>○ hollow = takes from stream (destination / tap)</div>
+      <div class="dml-item"><span style="font:600 9px monospace;color:#30c0d0;background:#0a2830;padding:0 3px;border-radius:2px">s2mm</span> receive &nbsp; <span style="font:600 9px monospace;color:#c050b0;background:#2a1028;padding:0 3px;border-radius:2px">mm2s</span> send &nbsp; <span style="font:600 9px monospace;color:#687080;background:#141820;padding:0 3px;border-radius:2px;font-style:italic">route</span> passthrough</div>
       <!-- Live-status swatches: hidden until a scan returns, so the legend does
            not advertise colors that are not on screen yet. Colors are injected
            from LSTATE at load so this list cannot drift from the renderer. -->
@@ -3079,6 +3384,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <span id="tgt-status"></span>
     </div>
     <div id="tgt-list"><div class="tgt-empty">Click Refresh to read targets from the board.</div></div>
+  </div>
+  <!-- ── Profile panel ───────────────────────────────────────────── -->
+  <!-- Shows the host+AIE timeline.png rendered on the server when a run ends
+       (natural finish or Stop run). Cleared and the tab disabled on a new run. -->
+  <div id="profileview">
+    <div id="profile-status">No timeline yet — it appears after a run finishes.</div>
+    <img id="profile-img" class="hide" alt="host + AIE execution timeline"
+         onerror="profileImgError()"/>
   </div>
   <!-- collapsible legend — collapsed by default -->
   <details id="legend-detail">
@@ -3154,6 +3467,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div id="panel" class="panel">
     <div id="panel-body"><div class="placeholder">Select a tile or net for details.</div></div>
+    <div id="panel-toc" class="collapsed"></div>
   </div>
   <div id="rhsplitter" title="Drag to resize (panel / console)"></div>
   <div id="cmdconsole" class="hide">
@@ -3189,8 +3503,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div id="llmpane" class="hide">
       <div id="conhdr">Claude Code
-        <button id="llmreset" title="kill + respawn claude (new conversation)">New chat</button></div>
-      <div id="conhelp">Ask about anything related to this design, application, or the codebase.</div>
+        <button id="llmreset" title="kill + respawn claude (new conversation)">New chat</button>
+        <span class="llm-hint">Ask about anything related to this design, application, or the codebase.</span></div>
       <div id="llmterm">
         <div id="llmmsg"></div>
         <div id="llmthink" class="hide"><span class="llm-dot"></span><span class="llm-dot"></span><span class="llm-dot"></span></div>
@@ -3445,7 +3759,7 @@ function renderKernelCode(t, ch, focused, openFirst){
   if(!sections.length)
     return '<div class="placeholder">(no kernel code found)</div>';
   return sections.map((s, i) =>
-    renderCodeSection(esc(s[0]), s[1], !!openFirst && i===0)
+    renderCodeSection(esc(s[0]), s[1], !!openFirst)
   ).join('');
 }
 function renderTileCodeKernelFirst(t, ch, focused, banner){
@@ -3463,12 +3777,12 @@ function renderTileCodeKernelFirst(t, ch, focused, banner){
   }
   if(kv && kv.kernel_lines){
     out += renderCodeSection('Generated wrapper &mdash; '+esc(kv.file||'kernel.cc'),
-      renderKernelCC(t, ch, focused), false);
+      renderKernelCC(t, ch, focused), true);
     any = true;
   }
   if(b && b.lines){
     out += renderCodeSection('Buffer address map &mdash; '+esc(b.file||'.bcf'),
-      renderBcf(t, ch, focused), false);
+      renderBcf(t, ch, focused), true);
     any = true;
   }
   if(!any)
@@ -3885,18 +4199,69 @@ rowsDesc.forEach(r => {
 // Device Map is the default view; the initial call at the bottom of this script
 // runs through here too, so the shown/hidden state has exactly one definition.
 function switchView(name){
+  // The Profile tab's enabled state is owned by the run lifecycle, not by which
+  // view is showing. Re-assert it from LIVE.profileReady on every switch so a
+  // view change (Device Map, Host, Grid) can never leave the tab stuck disabled
+  // once a timeline has rendered — it clears only when the next Run starts.
+  if(LIVE.profileReady) setProfileTabEnabled(true);
+  // The Profile tab is inert until a run renders a timeline — ignore clicks
+  // on it while disabled so a disabled tab can never take over the view.
+  if(name==='profile'){
+    const t=document.getElementById('vsw-profile');
+    if(t && t.classList.contains('vsw-disabled')) return;
+  }
   document.querySelectorAll('.vsw').forEach(b=>b.classList.toggle('act', b.dataset.v===name));
   const showGrid    = name==='grid';
   const showMap     = name==='map';
   const showTargets = name==='targets';
+  const showProfile = name==='profile';
   document.getElementById('grid').style.display = showGrid ? '' : 'none';
   document.getElementById('overlayctl').style.display = showGrid ? '' : 'none';
   document.getElementById('legend-detail').style.display = showGrid ? '' : 'none';
   document.getElementById('devmap').classList.toggle('show', showMap);
   document.getElementById('targetsview').classList.toggle('show', showTargets);
+  document.getElementById('profileview').classList.toggle('show', showProfile);
   if(showMap) buildDeviceMap();
   if(showTargets) tgtMaybeAutoRefresh();
   reportUIState({view: name});
+}
+
+// ── Profile tab (host+AIE timeline.png) ───────────────────────────
+// Enable/disable the Profile tab; disabling also flips the view back to Grid
+// if the Profile panel is the one on screen.
+function setProfileTabEnabled(on){
+  const t=document.getElementById('vsw-profile');
+  if(!t) return;
+  t.classList.toggle('vsw-disabled', !on);
+  if(!on && t.classList.contains('act')) switchView('grid');
+}
+// A run started: wipe any prior timeline image and lock the Profile tab.
+function clearTimelineProfile(){
+  const img=document.getElementById('profile-img');
+  const st =document.getElementById('profile-status');
+  if(img){ img.removeAttribute('src'); img.classList.add('hide'); }
+  if(st){ st.textContent='Run in progress — timeline will appear when it finishes.'; }
+  // Clear the flag BEFORE disabling: setProfileTabEnabled(false) may bounce the
+  // view to Grid via switchView, which re-reads this flag.
+  LIVE.profileReady = false;
+  setProfileTabEnabled(false);
+}
+// A run ended and the server rendered timeline.png: show it and unlock the tab.
+function showTimelineProfile(){
+  const img=document.getElementById('profile-img');
+  const st =document.getElementById('profile-status');
+  if(img){ img.src='/timeline.png?ts='+Date.now(); img.classList.remove('hide'); }
+  if(st){ st.textContent=''; }
+  // Latch the tab ON: from here it stays enabled across any view switch until
+  // the next Run calls clearTimelineProfile().
+  LIVE.profileReady = true;
+  setProfileTabEnabled(true);
+}
+function profileImgError(){
+  const img=document.getElementById('profile-img');
+  const st =document.getElementById('profile-status');
+  if(img) img.classList.add('hide');
+  if(st) st.textContent='timeline.png could not be loaded.';
 }
 
 // ── Targets panel ─────────────────────────────────────────────
@@ -4472,15 +4837,34 @@ const DM_COLORS = [
 ];
 // Build from comm_paths so flows that appear in edges but have no core-tile DMA
 // entries (e.g. GMIO-to-memtile flows absent from flow_summary) still get a color.
-const dmFlowIds = [...new Set([
-  ...Object.keys(flowMembers).map(Number),
-  ...(DATA.comm_paths||[]).map(p=>p.flow_index),
-])].sort((a,b)=>a-b);
+// Declared here: recomputeFlowIds() runs at module scope and reads it.
+let ROUTING_SRC = 'static';
+let ROUTING_DIFF = false;
+let dmFlowIds = [];
+function recomputeFlowIds(){
+  const base = ROUTING_SRC === 'dynamic'
+    ? [] : Object.keys(flowMembers).map(Number);
+  dmFlowIds = [...new Set([
+    ...base,
+    ...(DATA.comm_paths||[]).map(p=>p.flow_index),
+  ])].sort((a,b)=>a-b);
+}
+recomputeFlowIds();
 function dmColor(fi){ return DM_COLORS[dmFlowIds.indexOf(fi)%DM_COLORS.length]; }
 
 let dmActiveNets = new Set();   // empty = all nets active (unless dmHideAll)
 let dmHideAll = false;          // true = All Flows toggled off
+let dmShowSW = true;
+// Per-tile routing-info overrides, driven by the tile right-click menu. The
+// dmSwToggle checkbox stays the master switch; this set carves individual tiles
+// out of it so a dense map can be thinned one tile/row/column at a time.
+// Collapsed tiles also drop out of the SW_ROWS max, so collapsing everything in
+// view shrinks the boxes instead of leaving a field of empty rows.
+let dmSwCollapsed = new Set();  // 'c,r' keys whose routing rows are hidden
 let dmBuilt = false;
+// One-shot: refit on the next rebuild. Set only by "Reset view" — every other
+// rebuild (net chips, tile menu, search, filters) keeps the user's pan/zoom.
+let dmRefitNext = false;
 // Map tile selection lives at module scope so it survives a buildDeviceMap()
 // rebuild (e.g. triggered by a net click) instead of being wiped each time.
 let dmSelKeys = new Set();      // 'c,r' keys of highlighted map tiles
@@ -4509,7 +4893,9 @@ function dmApply(){
   document.getElementById('devmap-canvas').style.transform=
     'translate('+dmTx+'px,'+dmTy+'px) scale('+dmScale+')';
 }
-function dmReset(rebuild){
+// Centre the map at fit-zoom. Reads the SVG's current width/height, so it must
+// run *after* a rebuild has resized it, never before.
+function dmFitView(){
   const vp=document.getElementById('devmap-vp');
   const svg=document.getElementById('devmap-svg');
   const vpW=vp.clientWidth, vpH=vp.clientHeight;
@@ -4517,21 +4903,30 @@ function dmReset(rebuild){
   const svgH=parseFloat(svg.getAttribute('height')||'300');
   if(svgW>0&&svgH>0){
     const scaleX=vpW/svgW, scaleY=vpH/svgH;
-    dmScale=Math.min(scaleX,scaleY)*0.92;
+    dmScale=Math.max(scaleX*0.88, Math.min(scaleX,scaleY)*0.92);
     dmTx=(vpW-svgW*dmScale)/2;
     dmTy=(vpH-svgH*dmScale)/2;
   } else { dmTx=20; dmTy=20; dmScale=0.9; }
   dmApply();
+}
+
+function dmReset(rebuild){
   // Reset filter state only when called from the Reset button, not from buildDeviceMap itself.
   if(rebuild){
     dmActiveNets=new Set();
     dmHideAll=false;
     dmSelKeys=new Set();
+    dmSwCollapsed=new Set();
     const allChip=document.querySelector('.dm-chip.all-chip');
     if(allChip) allChip.classList.add('act');
     document.querySelectorAll('.dm-chip.net-chip').forEach(c=>c.classList.add('act'));
+    // Refit after the rebuild, not before: clearing the filters changes the tile
+    // geometry, so fitting against the old SVG size would land slightly wrong.
+    dmRefitNext=true;
     buildDeviceMap();
+    return;
   }
+  dmFitView();
 }
 
 (function initPanZoom(){
@@ -4554,7 +4949,7 @@ function dmReset(rebuild){
     e.preventDefault();
     const r=vp.getBoundingClientRect();
     const mx=e.clientX-r.left, my=e.clientY-r.top;
-    const d=e.deltaY<0?1.12:1/1.12;
+    const d=Math.pow(1.0016,-e.deltaY);
     const ns=Math.max(0.12,Math.min(6,dmScale*d));
     dmTx=mx-(mx-dmTx)*(ns/dmScale);
     dmTy=my-(my-dmTy)*(ns/dmScale);
@@ -4675,10 +5070,17 @@ const searchIndex = [];
   (DATA.comm_paths||[]).forEach(p=>{
     if(!p) return;
     const fi=p.flow_index!=null?p.flow_index:null;
-    // Derive a representative tkey from the first DMA tile
-    const dmaTiles=(p.dma_tiles||[]);
-    const repTile=dmaTiles[0]||null;
-    const tkey=repTile?repTile[0]+','+repTile[1]:'0,0';
+    // Representative tile for the hit. Prefer a DMA tile, but pull flows have
+    // none (routing_edges_for_flow fills dma_tiles only from circuit_connects
+    // whose master is DMA, and a pull source has DMA as the slave), so fall
+    // back to a tile the flow actually touches instead of the literal 0,0.
+    // Sorted because dma_tiles is serialized from a Python set.
+    const cand=[...(p.dma_tiles||[]), ...(p.tiles||[]),
+                ...(p.edges||[]).map(e=>e[0])].filter(t=>t&&t.length===2);
+    const repTile=cand.length
+      ?cand.slice().sort((a,b)=>(a[0]-b[0])||(a[1]-b[1]))[0]
+      :null;
+    const tkey=repTile?repTile[0]+','+repTile[1]:null;
 
     // Net ID: "net7"
     if(p.net_id) add('net',tkey,fi,p.net_id,'net ('+p.net_id+') f'+fi);
@@ -4741,7 +5143,7 @@ function lkActiveSets(){
   const flowLockFis=new Set();
   srSearchTerms.forEach(term=>{
     srResolve(term).forEach(h=>{
-      tileLockKeys.add(h.tkey);
+      if(h.tkey) tileLockKeys.add(h.tkey);
       if(h.fi!=null) flowLockFis.add(h.fi);
     });
   });
@@ -4872,7 +5274,7 @@ function srRenderChips(){
     chip.appendChild(document.createTextNode(term));
     const x=document.createElement('span');
     x.className='lk-x'; x.textContent='×';
-    x.onclick=()=>{ srSearchTerms.delete(term); srRenderChips(); srRenderResults(); if(document.getElementById('devmap').classList.contains('show')) buildDeviceMap(); };
+    x.onclick=()=>{ srSearchTerms.delete(term); srRenderChips(); srRenderResults(); if(document.getElementById('devmap').classList.contains('show')) buildDeviceMap(); if(!srSearchTerms.size) llmPushCtx(null,'search'); };
     chip.appendChild(x);
     wrap.appendChild(chip);
   });
@@ -4972,9 +5374,9 @@ function dmStColor(state){ return (LSTATE[state]||LSTATE.unknown)[0]; }
 function dmStLabel(state){ return (LSTATE[state]||LSTATE.unknown)[1]; }
 
 // Paint scan results onto the already-built SVG. Deliberately a DOM patch
-// rather than a rebuild: buildDeviceMap() ends in dmReset(), which re-fits the
-// zoom, so rebuilding on every 2s poll would yank the view out from under a
-// user who has panned in.
+// rather than a rebuild: a rebuild is far more work than setting a few
+// attributes, and doing it on every 2s poll would churn the whole SVG under a
+// user who is mid-interaction.
 function dmPaintStatus(){
   const cells = dmStatus.cells;
   const svg = document.getElementById('devmap-svg');
@@ -5092,12 +5494,19 @@ function dmClearAll(){
   // Stop the poll first: clearing while live is on just gets repainted 2s later.
   if (LIVE.enabled) setLive(false);
   else dmClearStatus();
+  if (ROUTING_SRC !== 'static') setRoutingSource('static');
   if (srSearchTerms.size){
     srSearchTerms.clear();
+    llmPushCtx(null, 'search');
     srRenderChips();
     srRenderResults();
     if (document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
   }
+  ctrlPlanEdges = [];
+  ctrlPlanPorts = [];
+  const _cpw = document.getElementById('dmCtrlPlanWrap');
+  if (_cpw) _cpw.hidden = true;
+  if (document.getElementById('devmap')?.classList.contains('show')) buildDeviceMap();
   dmSyncClearBtn();
 }
 
@@ -5107,7 +5516,7 @@ function buildNetBar(){
   // "All Flows" chip
   const allc=document.createElement('button');
   allc.className='dm-chip all-chip'+(!dmHideAll&&dmActiveNets.size===0?' act':'');
-  allc.textContent='All Flows';
+  allc.textContent='Toggle All Flows';
   allc.onclick=()=>dmSelectNet(-1,false);
   bar.appendChild(allc);
   // Per-flow chips — derive label from flow_summary if available
@@ -5148,6 +5557,13 @@ function dmSelectNet(fi, ctrl){
     if(dmActiveNets.size===1&&dmActiveNets.has(fi)) dmActiveNets=new Set();
     else { dmActiveNets=new Set(); dmActiveNets.add(fi); }
   }
+  dmSyncNetSelection();
+}
+
+// Repaint the chip bar, rebuild the map and reconcile the side panel against
+// whatever dmActiveNets/dmHideAll now say. Split out of dmSelectNet so the tile
+// right-click menu can set the selection itself and still land in one place.
+function dmSyncNetSelection(){
   const allActive=!dmHideAll&&dmActiveNets.size===0;
   document.querySelector('.dm-chip.all-chip').classList.toggle('act',allActive);
   document.querySelectorAll('.dm-chip.net-chip').forEach(c=>{
@@ -5178,6 +5594,112 @@ function dmSelectNet(fi, ctrl){
   }
   panelSync();
 }
+
+// ── Tile right-click menu ─────────────────────────────────────
+// Two actions the chip bar can't express: thinning routing rows per tile/row/
+// column, and isolating by tile instead of by net.
+
+// Flow indices whose path touches (tc,tr). Uses the same _flowTileSet() the
+// renderer uses to decide which tiles a flow draws through, so the isolated set
+// is exactly the flows that would still paint this tile.
+function dmFlowsAtTile(tc, tr){
+  const key=tc+','+tr, out=new Set();
+  (DATA.comm_paths||[]).forEach(p=>{
+    if(_flowTileSet(p).has(key)) out.add(p.flow_index);
+  });
+  return out;
+}
+
+// Keys of every rendered tile box in a row / column / the whole map. Waypoint
+// tiles are excluded: they draw no box and so have no routing rows to collapse.
+function dmTileKeysIn(scope, tc, tr){
+  const svg=document.getElementById('devmap-svg');
+  const out=[];
+  svg.querySelectorAll('.dm-tile').forEach(g=>{
+    if(g.getAttribute('data-waypoint')==='1') return;
+    const k=g.getAttribute('data-key'); if(!k) return;
+    const [c,r]=k.split(',').map(Number);
+    if(scope==='row'&&r!==tr) return;
+    if(scope==='col'&&c!==tc) return;
+    out.push(k);
+  });
+  return out;
+}
+
+// Collapse unless every key in scope is already collapsed, in which case expand.
+// One menu entry per scope that reads as a toggle, matching the net chips.
+function dmToggleRouting(keys){
+  if(!keys.length) return;
+  const allHidden=keys.every(k=>dmSwCollapsed.has(k));
+  keys.forEach(k=>{ if(allHidden) dmSwCollapsed.delete(k); else dmSwCollapsed.add(k); });
+  buildDeviceMap();
+}
+
+function dmHideMenu(){
+  const m=document.getElementById('dm-ctxmenu');
+  if(m) m.remove();
+}
+
+function dmShowTileMenu(clientX, clientY, tc, tr){
+  dmHideMenu();
+  dmHideTip();
+  const key=tc+','+tr;
+  const rowKeys=dmTileKeysIn('row',tc,tr), colKeys=dmTileKeysIn('col',tc,tr);
+  const flows=dmFlowsAtTile(tc,tr);
+  const lbl=(keys,what)=>(keys.every(k=>dmSwCollapsed.has(k))?'Expand ':'Collapse ')+what;
+
+  const items=[
+    {head:'routing info'},
+    {text:lbl([key],'this tile'), on:()=>dmToggleRouting([key])},
+    {text:lbl(rowKeys,'row '+tr+'  ('+rowKeys.length+' tiles)'), on:()=>dmToggleRouting(rowKeys)},
+    {text:lbl(colKeys,'column '+tc+'  ('+colKeys.length+' tiles)'), on:()=>dmToggleRouting(colKeys)},
+    {sep:true},
+    {head:'flows'},
+    {text:'Isolate flows through this tile  ('+flows.size+')',
+     dis:flows.size===0,
+     on:()=>{ dmHideAll=false; dmActiveNets=new Set(flows); dmSyncNetSelection(); }},
+    {text:'Show all flows', dis:!dmHideAll&&dmActiveNets.size===0,
+     on:()=>{ dmHideAll=false; dmActiveNets=new Set(); dmSyncNetSelection(); }},
+  ];
+
+  const m=document.createElement('div');
+  m.id='dm-ctxmenu';
+  m.style.cssText='position:fixed;z-index:10000;min-width:210px;'
+    +'background:#1a1c27;border:1px solid #2a2e46;border-radius:5px;padding:4px 0;'
+    +'font:11px/1.6 ui-monospace,monospace;color:#e2e4f0;'
+    +'box-shadow:0 6px 22px rgba(0,0,0,.7);';
+  items.forEach(it=>{
+    const d=document.createElement('div');
+    if(it.sep){
+      d.style.cssText='height:1px;background:#2a2e46;margin:4px 0;';
+    } else if(it.head){
+      d.style.cssText='padding:2px 10px;color:#7c8099;font-size:9px;'
+        +'letter-spacing:.08em;text-transform:uppercase;';
+      d.textContent=it.head;
+    } else {
+      d.style.cssText='padding:3px 12px;cursor:'+(it.dis?'default':'pointer')
+        +';color:'+(it.dis?'#5a5e74':'#e2e4f0')+';white-space:nowrap;';
+      d.textContent=it.text;
+      if(!it.dis){
+        d.onmouseenter=()=>d.style.background='#262a3d';
+        d.onmouseleave=()=>d.style.background='';
+        d.onclick=()=>{ dmHideMenu(); it.on(); };
+      }
+    }
+    m.appendChild(d);
+  });
+  document.body.appendChild(m);
+  // Flip against the viewport edges the same way dmShowTip does.
+  let lx=clientX+2, ly=clientY+2;
+  if(lx+m.offsetWidth>window.innerWidth-8) lx=clientX-m.offsetWidth-2;
+  if(ly+m.offsetHeight>window.innerHeight-8) ly=Math.max(8,clientY-m.offsetHeight-2);
+  m.style.left=lx+'px'; m.style.top=ly+'px';
+}
+document.addEventListener('mousedown',e=>{
+  const m=document.getElementById('dm-ctxmenu');
+  if(m&&!m.contains(e.target)) dmHideMenu();
+});
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') dmHideMenu(); });
 
 function buildNetBody(p){
   if(!p) return '<div class="placeholder">Click a tile or net for details</div>';
@@ -5224,22 +5746,34 @@ function buildNetBody(p){
     const t=tileMap[key]; if(!t) return;
     const ch=(t.dma_channels||[]).filter(c=>c.flow_index===fi);
     ch.forEach(c=>{
-      const bd=(c.bd_chain||[])[0]||{};
-      const acq=(bd.acquire_lock||[])[0]||{};
-      const rel=(bd.release_lock||[])[0]||{};
-      const lock=(acq.id!=null||rel.id!=null)?' lock '+acq.id+'/'+rel.id:'';
-      chanRows+='<tr><td>('+t.loc[0]+','+t.loc[1]+')</td><td>'+esc(t.type)+'</td>'
+      const bds=c.bd_chain||[];
+      const bdChain=bds.slice(0,4).map((bd,i)=>{
+        const hasNext=bd.next_bd!=null&&bd.next_bd>=0&&i<bds.length-1;
+        return '<span class="bd-id">BD'+bd.bd_id+'</span>'
+          +'<span class="bd-len">['+bd.len+'B]</span>'
+          +(hasNext?'<span class="bd-next">→</span>':'');
+      }).join('')+(bds.length>4?'…':'');
+      const acqSet=new Set(), relSet=new Set();
+      bds.forEach(bd=>{
+        (bd.acquire_lock||[]).forEach(l=>l.id!=null&&acqSet.add('L'+l.id+'('+l.val+')'));
+        (bd.release_lock||[]).forEach(l=>l.id!=null&&relSet.add('L'+l.id+'('+l.val+')'));
+      });
+      const lockStr=(acqSet.size||relSet.size)
+        ?'<span class="bd-lock">acq:'+[...acqSet].join(',')+' rel:'+[...relSet].join(',')+'</span>'
+        :'-';
+      chanRows+='<tr>'
+        +'<td>('+t.loc[0]+','+t.loc[1]+')</td>'
+        +'<td>'+esc(t.type)+'</td>'
         +'<td>'+esc(c.direction)+' ch'+c.channel+'</td>'
-        +'<td>'+(bd.len!=null?bd.len+'B':'?')+'</td>'
-        +'<td>'+(c.bd_chain||[]).length+'</td>'
-        +'<td>'+esc(lock)+'</td>'
+        +'<td style="font-family:ui-monospace,monospace;white-space:nowrap">'+(bdChain||'—')+'</td>'
+        +'<td style="font-size:10px">'+lockStr+'</td>'
         +(c.kernel_port?'<td>'+esc(c.kernel_port)+'</td>':'<td>-</td>')
         +'</tr>';
     });
   });
   const chanTable=chanRows
     ?'<table class="rctbl"><thead><tr><th>tile</th><th>type</th><th>ch</th>'
-      +'<th>len</th><th>BDs</th><th>lock acq/rel</th><th>port</th></tr></thead>'
+      +'<th>BD chain</th><th>locks</th><th>port</th></tr></thead>'
       +'<tbody>'+chanRows+'</tbody></table>'
     :'<div class="placeholder">(no DMA channels on participating tiles)</div>';
 
@@ -5251,19 +5785,45 @@ function buildNetBody(p){
   const gmioConns=(p.routing_connections||[]).filter(c=>shimKinds.has(c.kind));
   const swConnsRaw=(p.routing_connections||[]).filter(c=>!shimKinds.has(c.kind));
   // Sort stream-switch in data-flow order: pull → high row first; push → low row first.
-  const swConns=[...swConnsRaw].sort((a,b)=>
+  const pktOnPath=swConnsRaw.filter(c=>c.kind==='packet_connect');
+  const sharedPktFwd=_sharedPktForwardMaster(pktOnPath);
+  const swExpanded=[];
+  swConnsRaw.forEach(c=>{
+    if(c.kind!=='packet_connect'){ swExpanded.push(c); return; }
+    _expandPktConnectRows(c,sharedPktFwd).forEach(row=>{
+      swExpanded.push({kind:'packet_hw', tile:c.tile, flow_index:c.flow_index, ...row});
+    });
+  });
+  swExpanded.sort((a,b)=>
     p.direction==='pull'
       ?(b.tile?.row??0)-(a.tile?.row??0)
       :(a.tile?.row??0)-(b.tile?.row??0)
   );
-  const connKindLabel={'circuit_connect':'circuit','packet_connect':'packet'};
   let swRows='';
-  swConns.forEach(c=>{
+  swExpanded.forEach(c=>{
     const t=c.tile||{};
-    const kind=connKindLabel[c.kind]||esc(c.kind);
-    let detail='';
-    if(c.slave&&c.master) detail=esc(c.slave.dir)+'['+c.slave.idx+'] → '+esc(c.master.dir)+'['+c.master.idx+']';
-    swRows+='<tr><td>('+t.col+','+t.row+')</td><td>'+kind+'</td><td>'+detail+'</td></tr>';
+    let kind='', detail='', extra='';
+    if(c.kind==='packet_hw'){
+      kind='PKT';
+      const sl=c.slave||{};
+      detail=sl.dir
+        ?esc(sl.dir)+':'+sl.idx+'&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx
+        :'fwd&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx;
+      if(c.pktid!=null) extra='<span class="rt-pktid" title="packet match id">pkt'+c.pktid+'</span>';
+      if(c.mask!=null) extra+=_fmtPktMaskBadge(c.mask,c.leg);
+    } else {
+      kind='CCT';
+      const s=c.slave||{}, m=c.master||{};
+      if(s.dir!=null&&m.dir!=null){
+        detail=esc(s.dir)+':'+s.idx+'&nbsp;&rarr;&nbsp;'+esc(m.dir)+':'+m.idx;
+      }
+    }
+    // The panel is already scoped to one net: use its flow, not c.flow_index —
+    // routing_connections records carry no flow_index, so that was always null
+    // and every row fell back to the grey "no local DMA" badge.
+    extra+=_flowDmaSpanHtml(p.flow_index,t.col,t.row);
+    swRows+='<tr><td>('+t.col+','+t.row+')</td><td>'+kind+'</td>'
+      +'<td>'+detail+extra+'</td></tr>';
   });
   const swTable=swRows
     ?'<table class="rctbl"><thead><tr><th>tile</th><th>kind</th><th>ports</th></tr></thead>'
@@ -5337,8 +5897,58 @@ function svgN(tag,attrs){
 }
 function svgT(el, txt){ el.textContent=txt; return el; }
 
-// ── Hover tooltip state ────────────────────────────────────────
 let dmTooltipEl=null;
+let dmFlowHoverFi=null;
+let dmFlowHoverTimer=null;
+function dmTagFlowLine(el, fi, cls, normW, normO, hoverW, hoverO){
+  el.setAttribute('class', cls);
+  el.setAttribute('data-fi', String(fi));
+  el.dataset.normW=normW; el.dataset.normO=normO;
+  el.dataset.hoverW=hoverW; el.dataset.hoverO=hoverO;
+}
+function dmTagFlowSq(el, fi, normFo, hoverFo){
+  el.setAttribute('class', 'dm-shmemsq');
+  el.setAttribute('data-fi', String(fi));
+  el.dataset.normFo=normFo; el.dataset.hoverFo=hoverFo;
+}
+function dmApplyFlowHover(fi, on){
+  const svg=document.getElementById('devmap-svg');
+  if(!svg||fi==null) return;
+  svg.querySelectorAll('.dm-flowvis[data-fi="'+fi+'"],.dm-shmemvis[data-fi="'+fi+'"]')
+    .forEach(v=>{
+      v.setAttribute('stroke-width', on?v.dataset.hoverW:v.dataset.normW);
+      v.setAttribute('stroke-opacity', on?v.dataset.hoverO:v.dataset.normO);
+    });
+  svg.querySelectorAll('.dm-shmemsq[data-fi="'+fi+'"]').forEach(r=>{
+    r.setAttribute('fill-opacity', on?r.dataset.hoverFo:r.dataset.normFo);
+  });
+}
+function dmFlowHoverIn(fi, e, tipLines){
+  if(dmFlowHoverTimer){ clearTimeout(dmFlowHoverTimer); dmFlowHoverTimer=null; }
+  if(dmFlowHoverFi!==fi){
+    if(dmFlowHoverFi!=null) dmApplyFlowHover(dmFlowHoverFi, false);
+    dmFlowHoverFi=fi;
+    dmApplyFlowHover(fi, true);
+  }
+  if(tipLines&&tipLines.length) dmShowTip(e.clientX, e.clientY, tipLines);
+}
+function dmFlowHoverLeave(fi){
+  if(dmFlowHoverTimer) clearTimeout(dmFlowHoverTimer);
+  dmFlowHoverTimer=setTimeout(()=>{
+    if(dmFlowHoverFi===fi){
+      dmApplyFlowHover(fi, false);
+      dmFlowHoverFi=null;
+      dmHideTip();
+    }
+    dmFlowHoverTimer=null;
+  }, 40);
+}
+function dmWireFlowHit(hit, fi, tipLines){
+  if(!hit) return;
+  hit.addEventListener('mouseenter', e=>dmFlowHoverIn(fi, e, tipLines));
+  hit.addEventListener('mousemove', dmMoveTip);
+  hit.addEventListener('mouseleave', ()=>dmFlowHoverLeave(fi));
+}
 function dmShowTip(clientX, clientY, lines){
   dmHideTip();
   const d=document.createElement('div');
@@ -5358,9 +5968,263 @@ function dmShowTip(clientX, clientY, lines){
 function dmHideTip(){
   if(dmTooltipEl){ dmTooltipEl.remove(); dmTooltipEl=null; }
 }
+function dmMoveTip(e){
+  if(!dmTooltipEl) return;
+  const tw=dmTooltipEl.offsetWidth, th=dmTooltipEl.offsetHeight;
+  let lx=e.clientX+14, ly=e.clientY-th-10;
+  if(lx+tw>window.innerWidth-8) lx=e.clientX-tw-14;
+  if(ly<8) ly=e.clientY+14;
+  dmTooltipEl.style.left=lx+'px'; dmTooltipEl.style.top=ly+'px';
+}
+
+// CONTROLPAN-PMAP overlay: control-plan routing parsed from the applog by
+// /ctrlplan/load. Drawn on top of the data-flow edges, toggle-able via
+// #dmCtrlPlanToggle. Each edge: {from:[c,r], to:[c,r], dir, id, port, sw, slot,
+// from_idx, to_idx}. Each port: {col,row,port,idx,dir,ms,id,sw,slot}.
+// Style: fwd = pink, ret = cyan; circuit = dashed, pkt = solid. Forward and
+// return share the spine column, so each direction is drawn in its own
+// perpendicular lane. The overlay adds NO on-map text: each edge draws a line +
+// arrowhead and each CTRL port a ring, with all per-edge/per-port detail carried
+// in the hover <title> only (loading the plan must not clutter the map with
+// labels). CTRL rings: consume=fwd amber master / emit=ret cyan slave. Duplicate
+// routes (one per read) are de-duplicated via ctrlPlanUniq before drawing.
+// Loading the plan also turns off the data-flow SW routing rows (dmShowSW) so the
+// control plan replaces, not overlaps, the function-call routing analysis.
+let ctrlPlanEdges = [];
+let ctrlPlanPorts = [];
+// Device-map key ("col,row") of the tile whose stream-switch detail is open in
+// the Info panel, so it can be ring-highlighted and restored on the next click.
+let dmSwitchHiKey = null;
+
+function ctrlPlanTitle(svgEl, txt){
+  const t = document.createElementNS('http://www.w3.org/2000/svg','title');
+  t.textContent = txt; svgEl.appendChild(t);
+}
+
+// Dedup helper: the applog repeats identical routes (e.g. one route per read),
+// so collapse records that share every rendered field.
+function ctrlPlanUniq(items, keyer){
+  const seen=new Set(), out=[];
+  for(const it of items||[]){ const k=keyer(it); if(seen.has(k)) continue; seen.add(k); out.push(it); }
+  return out;
+}
+
+function drawCtrlPlanOverlay(svg, cx, cy){
+  if(!document.getElementById('dmCtrlPlanToggle')?.checked) return;
+  // Forward (request, pink) and return (response, cyan) share the vertical spine
+  // column, so draw each direction in its own perpendicular lane and annotate the
+  // master (emitting) and slave (receiving) endpoints, packet id, sw and slot.
+  const LANE=7;        // half-gap between the fwd and ret lanes (px)
+  const edges = ctrlPlanUniq(ctrlPlanEdges, e=>
+    e.dir+'|'+e.from+'|'+e.to+'|'+e.port+'|'+e.from_idx+'|'+e.to_idx+'|'+e.sw+'|'+e.slot+'|'+e.id);
+  for(const e of edges){
+    const ret = (e.dir==='ret');
+    const x1=cx(e.from[0]), y1=cy(e.from[1]), x2=cx(e.to[0]), y2=cy(e.to[1]);
+    const dx=x2-x1, dy=y2-y1, L=Math.hypot(dx,dy)||1, ux=dx/L, uy=dy/L;
+    // Canonicalize the perpendicular so it does NOT depend on travel direction:
+    // forward climbs the spine (up) while return drains it (down), so their raw
+    // direction vectors are opposite. Deriving px from the raw vector would flip
+    // the lane and cancel the opposite `off` sign, landing both on the same line.
+    // Fold the unit vector into a single half-plane first, then take perpendicular.
+    let cux=ux, cuy=uy;
+    if(cux<0 || (cux===0 && cuy<0)){ cux=-cux; cuy=-cuy; }
+    const px=-cuy, py=cux;               // direction-independent unit perpendicular
+    const off = ret ? LANE : -LANE;      // fwd/ret run in separate parallel lanes
+    const ox=px*off, oy=py*off;
+    const X1=x1+ox, Y1=y1+oy, X2=x2+ox, Y2=y2+oy;
+    const col = ret ? '#00bcd4' : '#e91e63';
+    const ln = svgN('line', {x1:X1, y1:Y1, x2:X2, y2:Y2,
+      class:'ctrlplan-edge '+(ret?'ctrlplan-ret':'')});
+    if(e.sw==='circuit') ln.setAttribute('stroke-dasharray','5 3');
+    ctrlPlanTitle(ln, e.dir.toUpperCase()+' '+e.port+' master['+e.from[0]+','+e.from[1]+'] idx'+
+      e.from_idx+'  ->  slave['+e.to[0]+','+e.to[1]+'] idx'+e.to_idx+
+      ' | '+e.sw+(e.slot>=0?(' slot='+e.slot):'')+' | pkt id='+e.id);
+    svg.appendChild(ln);
+    // Arrowhead near the destination end (points master -> slave).
+    const bx=X2-ux*15, by=Y2-uy*15, tx=X2-ux*8, ty=Y2-uy*8, w=4;
+    const head = svgN('path', {d:'M'+tx+','+ty+' L'+(bx-uy*w)+','+(by+ux*w)+
+      ' L'+(bx+uy*w)+','+(by-ux*w)+' Z', fill:col, stroke:'none'});
+    svg.appendChild(head);
+    // No on-map text: the master/slave role tags and midpoint id/slot label are
+    // intentionally omitted so loading the control plan adds no new text to the
+    // device map. Full per-edge detail stays available via the line's hover
+    // <title> (ctrlPlanTitle above).
+  }
+  // CTRL ports: tile-local consume (fwd request in, master) / emit (ret response
+  // out, slave). Offset the emit ring so a consume+emit on the same tile both show.
+  const ctrls = ctrlPlanUniq((ctrlPlanPorts||[]).filter(p=>p.port==='CTRL'),
+    p=>p.col+'|'+p.row+'|'+p.dir+'|'+p.ms+'|'+p.id+'|'+p.sw+'|'+p.slot);
+  for(const p of ctrls){
+    const emit = (p.dir==='ret');
+    const rx=cx(p.col)+(emit?9:-9), ry=cy(p.row);
+    const ring = svgN('circle', {cx:rx, cy:ry, r:12,
+      class:'ctrlplan-ctrl '+(emit?'ctrlplan-ctrl-emit':'')});
+    ctrlPlanTitle(ring, 'CTRL '+(emit?'emit (response out, slave)':'consume (request in, master)')+
+      ' tile('+p.col+','+p.row+') '+p.ms+' sw='+p.sw+(p.slot>=0?(' slot='+p.slot):'')+' pkt id='+p.id);
+    svg.appendChild(ring);
+    // No CTRL text label: detail lives in the ring's hover <title>.
+  }
+}
+
+async function loadCtrlPlan(){
+  const btn = document.getElementById('dmLoadCtrlPlan');
+  if(btn) btn.disabled = true;
+  try{
+    const j = await api('/ctrlplan/load', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{}'});
+    if(j.error){ alert('Load control plan: '+j.error); return; }
+    ctrlPlanEdges = j.edges || [];
+    ctrlPlanPorts = j.ports || [];
+    const wrap = document.getElementById('dmCtrlPlanWrap');
+    if(wrap) wrap.hidden = (ctrlPlanEdges.length===0 && ctrlPlanPorts.length===0);
+    const tog = document.getElementById('dmCtrlPlanToggle');
+    if(tog) tog.checked = true;
+    // Loading the control plan replaces the data-flow view: erase the old
+    // function-call SW routing rows (from DATA.comm_paths) so only the control
+    // plan is shown. Mirror the state in the #dmSwToggle checkbox.
+    dmShowSW = false;
+    const swTog = document.getElementById('dmSwToggle');
+    if(swTog) swTog.checked = false;
+    buildDeviceMap();
+  } finally { if(btn) btn.disabled = false; }
+}
+
+// Build the stream-switch SVG for one tile's control-plan, one section per
+// DIRECTION (fwd/ret). Left column = merged physical slave ports; middle column
+// = the packet slots each slave arms (a slave links to each of its slots); right
+// column = merged master ports. A slot->master link is drawn iff the master
+// pulls that slot (same arbiter and the slot's msel bit set in the master's
+// mselen); circuit slaves (no slots) link straight to the circuit master with
+// the matching id. Natural size; #swd-host scrolls if the panel is narrower.
+function swDetailSvg(dirs){
+  // The slot box carries the longest label ("slot N · pkt_id X · mask 0xY"), so
+  // it gets a wider width (SLOTW) and the master column is pushed right of it.
+  const BOXW=175, SLOTW=250, BOXH=24, ROWH=54, SECPAD=34;
+  const COLX={slave:20, slot:250, master:20+250+SLOTW+40};  // slave | slot(SLOTW) | master
+  const W=COLX.master+BOXW+20;
+  let y=24, svgParts=[];
+  const box=(x,yy,cls,txt,w)=>{ w=w||BOXW;
+    svgParts.push('<rect x="'+x+'" y="'+(yy-BOXH/2)+'" width="'+w+'" height="'+BOXH+'" rx="5" class="'+cls+'" opacity="0.9"/>');
+    svgParts.push('<text x="'+(x+9)+'" y="'+(yy+4)+'" class="swd-lbl">'+txt+'</text>');
+  };
+  const link=(x1,y1,x2,y2)=>svgParts.push('<path class="swd-link" d="M'+x1+','+y1+' C'+((x1+x2)/2)+','+y1+' '+((x1+x2)/2)+','+y2+' '+x2+','+y2+'"/>');
+  const esc=s=>String(s).replace(/[&<>]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
+  const hx=v=>'0x'+(v>>>0).toString(16);
+  const sub=(x,yy,txt)=>{ if(txt) svgParts.push('<text x="'+(x+9)+'" y="'+yy+'" class="swd-param">'+txt+'</text>'); };
+  dirs.forEach(d=>{
+    svgParts.push('<text x="'+COLX.slave+'" y="'+(y+4)+'" class="swd-dirhdr">'+esc(d.dir)+'</text>');
+    y += 18;
+    const y0=y;
+    // Middle-column rows: one per packet slot, plus one per circuit slave (which
+    // has no slot). Each row remembers its owning slave index.
+    const rows=[];  // {si, slot|null}
+    d.slaves.forEach((s,si)=>{
+      if(s.slots && s.slots.length) s.slots.forEach(sl=>rows.push({si:si, sl:sl}));
+      else rows.push({si:si, sl:null});
+    });
+    const rowY=i=>y0+i*ROWH;
+    const nrows=Math.max(rows.length, d.masters.length, 1);
+    // Which middle rows belong to each slave (to center its box + link it).
+    const slaveRows={};
+    rows.forEach((r,ri)=>{ (slaveRows[r.si]=slaveRows[r.si]||[]).push(ri); });
+    // Draw slot boxes (request #1: pkt_id and mask on the box, arb/msel below).
+    rows.forEach((r,ri)=>{ if(!r.sl) return; const sy=rowY(ri);
+      box(COLX.slot, sy, 'swd-slot', 'slot '+r.sl.slot+' \u00b7 pkt_id '+r.sl.pkt_id+' \u00b7 mask '+hx(r.sl.mask), SLOTW);
+      sub(COLX.slot, sy+BOXH/2+13, 'arb '+r.sl.arb+' \u00b7 msel '+r.sl.msel); });
+    // Draw merged slave boxes centered over their rows; link to their slots.
+    d.slaves.forEach((s,si)=>{ const rs=slaveRows[si]||[]; if(!rs.length) return;
+      const cy=(rowY(rs[0])+rowY(rs[rs.length-1]))/2;
+      box(COLX.slave, cy, 'swd-slave', esc(s.port)+' '+s.idx+' (slave)');
+      rs.forEach(ri=>{ if(rows[ri].sl) link(COLX.slave+BOXW, cy, COLX.slot, rowY(ri)); }); });
+    if(!d.slaves.length) box(COLX.slave, y0, 'swd-slave', '(no slave)');
+    // Draw merged master boxes; link them to every slot/circuit-slave they pull.
+    d.masters.forEach((m,mi)=>{ const my=rowY(mi);
+      box(COLX.master, my, 'swd-master', esc(m.port)+' '+m.idx+' (master)');
+      svgParts.push('<text x="'+COLX.master+'" y="'+(my+BOXH/2+13)+'" class="swd-dest">→ '+esc(m.dest)+'</text>');
+      if(m.arb>=0) sub(COLX.master, my+BOXH/2+26, 'arb '+m.arb+' \u00b7 mselen '+hx(m.mselen));
+      if(m.sw==='pkt'){
+        rows.forEach((r,ri)=>{ if(!r.sl) return;
+          // request #3: match on arbiter + (mselen>>msel)&1, across ALL slots.
+          if(m.arb===r.sl.arb && ((m.mselen>>r.sl.msel)&1)) link(COLX.slot+SLOTW, rowY(ri), COLX.master, my); });
+      } else {
+        // circuit: slave -> master directly when ids match (no slot node).
+        d.slaves.forEach((s,si)=>{ if(s.slots && s.slots.length) return;
+          if(s.id!==m.id) return; const rs=slaveRows[si]||[]; if(!rs.length) return;
+          const cy=(rowY(rs[0])+rowY(rs[rs.length-1]))/2;
+          link(COLX.slave+BOXW, cy, COLX.master, my); });
+      } });
+    y = y0 + nrows*ROWH + SECPAD;
+  });
+  const H=y+10;
+  return '<svg class="swd-svg" width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'" '+
+    'xmlns="http://www.w3.org/2000/svg">'+svgParts.join('')+'</svg>';
+}
+
+// Fetch the tile's control-plan switch view and render it into the card body's
+// #swd-host placeholder (host = the live #panel-body element passed by wireBody).
+async function swDetailFill(host, tc, tr){
+  const slot = host && host.querySelector ? host.querySelector('#swd-host') : null;
+  if(!slot) return;
+  let j;
+  try { j = await api('/ctrlplan/tile', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({col:tc,row:tr})}); }
+  catch(e){ slot.textContent = 'error: '+e; return; }
+  if(j.error){ slot.textContent = 'error: '+j.error; return; }
+  const dirs = j.dirs||[];
+  if(!dirs.length){ slot.innerHTML =
+    '<div class="swd-empty">no control-plan ports on this tile</div>'; return; }
+  slot.innerHTML = swDetailSvg(dirs);
+}
+
+// Restore a tile rect's stroke to its selected or base look (used when moving the
+// switch highlight off a tile).
+function dmRestoreTileStroke(key){
+  const r = document.querySelector('g.dm-tile[data-key="'+key+'"] rect');
+  if(!r) return;
+  if(dmSelKeys.has(key)){ r.setAttribute('stroke','var(--sel)'); r.setAttribute('stroke-width','2'); }
+  else { r.setAttribute('stroke', dmTileStroke[key]||'var(--stroke,#e4e4e433)'); r.setAttribute('stroke-width','1'); }
+}
+
+// Ring the currently open switch tile on the device map (amber, matching the slot
+// color) so it is visually tied to the Info-panel card.
+function dmApplySwitchHi(){
+  if(!dmSwitchHiKey) return;
+  const r = document.querySelector('g.dm-tile[data-key="'+dmSwitchHiKey+'"] rect');
+  if(r){ r.setAttribute('stroke','#ffb300'); r.setAttribute('stroke-width','3'); }
+}
+
+// Move the switch highlight to `key` (or null to clear), restoring the previous tile.
+function dmSetSwitchHi(key){
+  if(dmSwitchHiKey && dmSwitchHiKey!==key) dmRestoreTileStroke(dmSwitchHiKey);
+  dmSwitchHiKey = key;
+  dmApplySwitchHi();
+}
+
+// Open the tile's stream-switch connection detail as a card in the right-side
+// Info panel (replaces any prior switch card) and ring-highlight the tile. The
+// async fetch runs in wireBody, which receives the live #panel-body once the
+// placeholder is rendered.
+function showTileSwitchDetail(tc, tr){
+  const key = panelKey('switch', tc+','+tr);
+  const label = 'switch ('+tc+','+tr+')';
+  const llmCtx = 'control-plan stream-switch connection detail for tile ('+tc+','+tr+')';
+  panelItems.forEach((_,k)=>{ if(k.startsWith('switch:')) panelItems.delete(k); });
+  panelItems.set(key, {kind:'tile', label, color:null,
+    buildBody:()=>'<div class="sec"><div class="sec-hdr">Stream switch ('+tc+','+tr+')</div>'
+      +'<div id="swd-host"><div class="swd-empty">loading…</div></div></div>',
+    wireBody:(body)=>{ swDetailFill(body, tc, tr); },
+    llmCtx});
+  panelActiveKey = key;
+  panelSync();
+  dmSetSwitchHi(tc+','+tr);
+}
 
 function buildDeviceMap(){
   if(!DATA.tiles||!DATA.tiles.length){ console.warn('buildDeviceMap: no tiles'); return; }
+  dmFlowHoverFi=null;
+  if(dmFlowHoverTimer){ clearTimeout(dmFlowHoverTimer); dmFlowHoverTimer=null; }
+  dmHideTip();
   buildNetBar();
   const svg=document.getElementById('devmap-svg');
   svg.innerHTML='';
@@ -5371,10 +6235,54 @@ function buildDeviceMap(){
   const vpW=vp.clientWidth||800, vpH=vp.clientHeight||600;
   const ML=44, MT=28, MR=16, MB=12;
 
-  // Compute col/row counts first (need tileMap for this)
-  // Defer sizing until after tileMap is built — use temp values here,
-  // then recalculate SVG size after allCols/allRows are known.
-  const TW=148, TH=56, GX=24, GY=16;
+  const _swShimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
+  const _tileConnKeys=new Map();
+  if(dmShowSW&&!dmHideAll){
+    (DATA.comm_paths||[]).forEach(p=>{
+      if(dmActiveNets.size>0&&!dmActiveNets.has(p.flow_index)) return;
+      const fts=_flowTileSet(p);
+      const pathPkt=(p.routing_connections||[]).filter(c=>c.kind==='packet_connect');
+      const sharedPktFwd=_sharedPktForwardMaster(pathPkt);
+      (p.routing_connections||[]).forEach(c=>{
+        const t=c.tile||{};
+        if(_swShimKinds.has(c.kind)) return;
+        const tkey=t.col+','+t.row;
+        if(dmSwCollapsed.has(tkey)) return;
+        if(fts.size>0&&!fts.has(tkey)) return;
+        let ck;
+        if(c.kind==='packet_connect'){
+          _expandPktConnectRows(c,sharedPktFwd).forEach(row=>{
+            if(!_tileConnKeys.has(tkey)) _tileConnKeys.set(tkey,new Set());
+            _tileConnKeys.get(tkey).add(p.flow_index+'|'+_pktRowKey(row));
+          });
+          return;
+        }
+        const s=c.slave||{},m=c.master||{};
+        ck=p.flow_index+'|'+c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
+        if(!_tileConnKeys.has(tkey)) _tileConnKeys.set(tkey,new Set());
+        _tileConnKeys.get(tkey).add(ck);
+      });
+    });
+  }
+  const _maxConns=_tileConnKeys.size?Math.max(...[..._tileConnKeys.values()].map(s=>s.size)):0;
+  // No rows to draw anywhere (routing info off, all flows hidden, or every tile
+  // collapsed) → zero rows, so the boxes shrink instead of reserving dead space.
+  const SW_ROWS=(dmShowSW&&_maxConns)?Math.min(24,Math.max(4,_maxConns)):0;
+
+  // Max number of DMA badges any single SW row needs (one per flow with a local DMA channel).
+  let _maxDmaBadges=1;
+  if(dmShowSW){
+    (DATA.tiles||[]).forEach(t=>{
+      if(dmSwCollapsed.has(t.loc[0]+','+t.loc[1])) return;
+      const localFiSet=new Set((t.dma_channels||[]).map(ch=>ch.flow_index));
+      _tileRoutingConns(t.loc[0],t.loc[1]).forEach(c=>{
+        const withDma=(c.flow_indices||[c.flow_index]).filter(fi=>localFiSet.has(fi));
+        if(withDma.length>_maxDmaBadges) _maxDmaBadges=withDma.length;
+      });
+    });
+  }
+  // Extra tile width: each additional badge is ~28px (label ≤7 chars * 3.55 + 4 + 2px gap).
+  const TW=148+(_maxDmaBadges-1)*30, TH=dmShowSW?(52+SW_ROWS*8):72, GX=24, GY=14;
   const COLSTEP=TW+GX, ROWSTEP=TH+GY;
 
   // Merge DATA.tiles with every tile referenced in comm_paths (waypoints + hops)
@@ -5403,6 +6311,16 @@ function buildDeviceMap(){
       });
     });
   });
+  if(document.getElementById('dmCtrlPlanToggle')?.checked){
+    const coreMin=DATA.grid.device_core_min_row||3;
+    const addCtrlTile=(c,r)=>{
+      const k=c+','+r;
+      routedTileKeys.add(k);
+      if(!tileMap[k]) tileMap[k]={loc:[c,r],type:r===0?'shim':(r<coreMin?'mem':'core'),dma_channels:[]};
+    };
+    (ctrlPlanPorts||[]).forEach(p=>addCtrlTile(p.col,p.row));
+    (ctrlPlanEdges||[]).forEach(e=>{ addCtrlTile(e.from[0],e.from[1]); addCtrlTile(e.to[0],e.to[1]); });
+  }
   // Pure stream-switch waypoints: tiles synthesised from comm_paths edges only
   // (not in DATA.tiles, not in comm_paths.tiles, not a shim, not a shmem endpoint,
   // no DMA channels). These are implicit path endpoints that the stream line passes
@@ -5469,14 +6387,16 @@ function buildDeviceMap(){
   const ty=r=>MT+(maxR-r)*ROWSTEP;
   const cx=c=>tx(c)+TW/2;
   const cy=r=>ty(r)+TH/2;
+  const fcx=c=>tx(c)+Math.round(TW*0.70);
+  const fcy=r=>ty(r)+Math.round(TH*0.38);
 
   // Lane spacing. Scaled down as the flow count grows so the whole fan stays a
   // fraction of the tile pitch: 12 flows at a fixed 5px would span 55px of a
   // 72px row step and stray off the tiles.
-  const OX_STEP=Math.max(3, Math.min(8,
-    Math.round(0.40*COLSTEP/Math.max(1, dmFlowIds.length-1))));
-  const OY_STEP=Math.max(2, Math.min(5,
-    Math.round(0.40*ROWSTEP/Math.max(1, dmFlowIds.length-1))));
+  const OX_STEP=Math.max(2, Math.min(5,
+    Math.round(0.25*COLSTEP/Math.max(1, dmFlowIds.length-1))));
+  const OY_STEP=Math.max(1, Math.min(3,
+    Math.round(0.25*ROWSTEP/Math.max(1, dmFlowIds.length-1))));
   // One lane per flow, held for the whole path.
   //
   // This used to fan flows out per EDGE, by how many flows shared that
@@ -5531,7 +6451,13 @@ function buildDeviceMap(){
     if(r>=deviceCoreMinRow) return 'core';
     return 'mem';
   };
-  const usedKeys=new Set(DATA.tiles.map(t=>t.loc[0]+','+t.loc[1]));
+  function dmTileStyle(ttype){
+    if(ttype==='shim') return {fill:'var(--tile-shim-fill)', stroke:'var(--tile-shim-stroke)',
+      label:'#78a8e0'};
+    if(ttype==='mem') return {fill:'var(--tile-mem-fill)', stroke:'var(--tile-mem-stroke)',
+      label:'#a898d8'};
+    return {fill:'var(--tile-core-fill)', stroke:'var(--tile-core-stroke)', label:'#78c890'};
+  }
   const tileGroups={};
 
   allTiles.forEach(t=>{
@@ -5549,12 +6475,11 @@ function buildDeviceMap(){
       return;
     }
     const ttype=tileType(tr);
-    const used=usedKeys.has(key);
-    const fill=ttype==='mem'?'var(--fill,#e4e4e411)':'var(--fill2,#e4e4e41e)';
-    const stroke=used?'var(--stroke,#e4e4e433)':'var(--stroke2,#e4e4e41f)';
-    const baseOp=used?1:0.32;
+    const ts=dmTileStyle(ttype);
+    const fill=ts.fill;
+    const stroke=ts.stroke;
 
-    const g=svgN('g',{opacity:baseOp,cursor:'pointer',class:'dm-tile','data-key':key,
+    const g=svgN('g',{opacity:'1',cursor:'pointer',class:'dm-tile','data-key':key,
       'data-basestroke':stroke});
     tileGroups[key]=g;
     dmTileStroke[key]=stroke;
@@ -5565,50 +6490,110 @@ function buildDeviceMap(){
     g.appendChild(rect);
     // Empty placeholder so dmPaintStatus() only has to set textContent — it must
     // not add nodes, since it runs on every poll.
-    g.appendChild(svgN('text',{class:'dm-stlabel',x:tx(tc)+TW-6,y:ty(tr)+TH-6,
-      'text-anchor':'end','font-size':'9','font-family':'monospace',
+    g.appendChild(svgN('text',{class:'dm-stlabel',x:tx(tc)+TW-6,y:ty(tr)+TH-5,
+      'text-anchor':'end','font-size':'8','font-family':'monospace',
       'font-weight':'700','pointer-events':'none'}));
 
     // Coord top-left, type badge top-right
     const typStr=ttype==='shim'?'SHIM':ttype==='mem'?'MEM':'AIE';
-    g.appendChild(svgT(svgN('text',{x:tx(tc)+6,y:ty(tr)+13,
-      'font-size':'9','font-family':'monospace',fill:'#e4e4e848'}),
+    g.appendChild(svgT(svgN('text',{x:tx(tc)+6,y:ty(tr)+12,
+      'font-size':'8','font-family':'monospace',fill:'#e4e4e848'}),
       '('+tc+','+tr+')'));
-    g.appendChild(svgT(svgN('text',{x:tx(tc)+TW-6,y:ty(tr)+13,
-      'text-anchor':'end','font-size':'8','font-family':'monospace',fill:'#e4e4e43a'}),
+    g.appendChild(svgT(svgN('text',{x:tx(tc)+TW-6,y:ty(tr)+12,
+      'text-anchor':'end','font-size':'7','font-family':'monospace',fill:ts.label}),
       typStr));
 
-    // Show only terminal DMA channels (S2MM=input, MM2S=output) — not pass-through.
-    // Each line: colored arrow + "f{fi}" compactly at bottom of tile.
-    if(used&&t.dma_channels&&t.dma_channels.length){
+    if(dmShowSW&&!dmSwCollapsed.has(key)){
+      let rconns=_tileRoutingConns(tc,tr, ROUTING_DIFF ? STATIC_PATHS : undefined);
+      if(dmHideAll){
+        rconns=[];
+      } else if(dmActiveNets.size>0){
+        rconns=rconns.filter(c=>(c.flow_indices||[c.flow_index]).some(fi=>dmActiveNets.has(fi)));
+      }
+      const shortDir=_shortDir;
+      rconns.slice(0,SW_ROWS).forEach((c,i)=>{
+        const isCct=c.kind==='circuit_connect';
+        const kc=isCct?'#4a7fd4':'#9c4fd4';
+        const y=ty(tr)+20+i*8;
+        let label; let pktBadges=[];
+        if(c.kind==='packet_hw'){
+          label=_fmtPktLabel(c, true);
+          pktBadges=_dmPktBadges(c);
+        } else {
+          const s=c.slave||{}, m=c.master||{};
+          label='CCT '+shortDir(s.dir)+':'+s.idx+' → '+shortDir(m.dir)+':'+m.idx;
+        }
+        g.appendChild(svgN('rect',{x:tx(tc)+5,y:y-6,width:'2',height:'6',
+          fill:kc,rx:'1','pointer-events':'none'}));
+        g.appendChild(svgT(svgN('text',{x:tx(tc)+10,y,
+          'font-size':'6.5','font-family':'monospace',fill:'#c8cad8',
+          'pointer-events':'none'}), label));
+        let badgeX=tx(tc)+10+label.length*3.9;
+        pktBadges.forEach(b=>{
+          const bw=_svgBadgeWidth(b.text);
+          g.appendChild(svgN('rect',{x:badgeX,y:y-5,width:String(bw),height:'7',
+            rx:'2',fill:b.bg,'pointer-events':'none'}));
+          g.appendChild(svgT(svgN('text',{x:badgeX+2,y,
+            'font-size':'6','font-family':'monospace',fill:b.fg,
+            'pointer-events':'none'}), b.text));
+          badgeX+=bw+2;
+        });
+        // Draw one badge per flow that has a local DMA channel on this tile, right-aligned.
+        const localFiSet=new Set((t.dma_channels||[]).map(ch=>ch.flow_index));
+        const dmaCandidates=(c.flow_indices||[c.flow_index]).filter(fi=>localFiSet.has(fi));
+        const dmaBadges=dmaCandidates.length
+          ?dmaCandidates.map(fi=>{const lbl=_flowDmaLabel(fi,tc,tr);return _flowDmaBadgeStyle(lbl);})
+          :[_flowDmaBadgeStyle('')];
+        let bx=tx(tc)+TW-4;
+        dmaBadges.forEach(dmaSt=>{
+          const bw=_svgBadgeWidth(dmaSt.text);
+          bx-=bw;
+          g.appendChild(svgN('rect',{x:bx,y:y-5,width:String(bw),height:'7',
+            rx:'2',fill:dmaSt.bg,'pointer-events':'none'}));
+          g.appendChild(svgT(svgN('text',{x:bx+2,y,
+            'font-size':'6','font-family':'monospace',
+            fill:dmaSt.fg,'pointer-events':'none'}), dmaSt.text));
+          bx-=2;
+        });
+      });
+    }
+
+    if(t.dma_channels&&t.dma_channels.length){
       const chans=(!dmHideAll&&dmActiveNets.size===0)?t.dma_channels
         :t.dma_channels.filter(ch=>!dmHideAll&&dmActiveNets.has(ch.flow_index));
-      // Split into inputs (S2MM) and outputs (MM2S)
       const ins=chans.filter(ch=>ch.direction==='S2MM');
       const outs=chans.filter(ch=>ch.direction==='MM2S');
-      // Render inputs on left half, outputs on right half, centered vertically
-      const midY=ty(tr)+TH/2+4;
+      // A collapsed tile drew no routing rows, so pull its DMA badges up into
+      // the freed space instead of leaving a gap the height of the global rows.
+      const swRowsHere=(dmShowSW&&!dmSwCollapsed.has(key))?SW_ROWS:0;
+      const dmaBaseY=ty(tr)+(swRowsHere?(22+swRowsHere*8):22);
       ins.slice(0,3).forEach((ch,i)=>{
         const fc=dmColor(ch.flow_index);
-        const y=midY+(i-(ins.length-1)/2)*11;
-        // Arrow pointing in: ▶ f{fi}
+        const y=dmaBaseY+i*10;
+        const bd0=(ch.bd_chain||[])[0];
+        const bdTag=bd0?' BD'+bd0.bd_id:'';
         g.appendChild(svgT(svgN('text',{x:tx(tc)+7,y,
-          'font-size':'8.5','font-family':'monospace',fill:fc}),
-          '▶ f'+ch.flow_index));
+          'font-size':'7.5','font-family':'monospace',fill:fc}),
+          '▶f'+ch.flow_index+bdTag));
       });
       outs.slice(0,3).forEach((ch,i)=>{
         const fc=dmColor(ch.flow_index);
-        const y=midY+(i-(outs.length-1)/2)*11;
-        // Arrow pointing out: f{fi} ▶
+        const y=dmaBaseY+i*10;
+        const bd0=(ch.bd_chain||[])[0];
+        const bdTag=bd0?' BD'+bd0.bd_id:'';
         g.appendChild(svgT(svgN('text',{x:tx(tc)+TW-7,y,
-          'text-anchor':'end','font-size':'8.5','font-family':'monospace',fill:fc}),
-          'f'+ch.flow_index+' ▶'));
+          'text-anchor':'end','font-size':'7.5','font-family':'monospace',fill:fc}),
+          'f'+ch.flow_index+bdTag+'▶'));
       });
     }
 
     g.addEventListener('mouseenter',e=>{
-      rect.setAttribute('stroke','#e4e4e488');
-      rect.setAttribute('stroke-width','1.5');
+      // The switch-highlight (amber ring) is pinned to the open detail tile;
+      // hovering must not replace it with the gray hover stroke.
+      if(dmSwitchHiKey!==key){
+        rect.setAttribute('stroke','#e4e4e488');
+        rect.setAttribute('stroke-width','1.5');
+      }
       const lines=['('+tc+','+tr+') '+typStr];
       if(t.dma_channels&&t.dma_channels.length){
         const vis=(!dmHideAll&&dmActiveNets.size===0)?t.dma_channels
@@ -5657,16 +6642,13 @@ function buildDeviceMap(){
       }
       dmShowTip(e.clientX, e.clientY, lines);
     });
-    g.addEventListener('mousemove',e=>{
-      if(!dmTooltipEl) return;
-      const tw=dmTooltipEl.offsetWidth, th=dmTooltipEl.offsetHeight;
-      let lx=e.clientX+14, ly=e.clientY-th-10;
-      if(lx+tw>window.innerWidth-8) lx=e.clientX-tw-14;
-      if(ly<8) ly=e.clientY+14;
-      dmTooltipEl.style.left=lx+'px'; dmTooltipEl.style.top=ly+'px';
-    });
+    g.addEventListener('mousemove',dmMoveTip);
     g.addEventListener('mouseleave',()=>{
-      if(!dmSelKeys.has(key)){
+      if(dmSwitchHiKey===key){
+        // The switch-highlight (amber ring) is pinned to the open detail tile;
+        // hovering out must leave it in place, not restore the base stroke.
+        dmApplySwitchHi();
+      } else if(!dmSelKeys.has(key)){
         // Restore from dmTileStroke, not the captured `stroke`: a live scan may
         // have recolored this tile since it was built, and hovering out must
         // not wipe the status color.
@@ -5676,12 +6658,29 @@ function buildDeviceMap(){
       }
       dmHideTip();
     });
+    // Right-click menu. stopPropagation keeps the viewport's blanket
+    // preventDefault from being the only handler that sees this event.
+    g.addEventListener('contextmenu',e=>{
+      e.preventDefault(); e.stopPropagation();
+      dmShowTileMenu(e.clientX,e.clientY,tc,tr);
+    });
+
     g.addEventListener('click',e=>{
       if(dmDragging) return;
+      // Control-plan mode: if a plan is loaded and this tile has control-plan
+      // ports, open the stream-switch detail in the Info panel + highlight the
+      // tile, and stop -- do not also mutate the selection / rebuild the map.
+      if((ctrlPlanPorts||[]).some(p=>p.col===tc && p.row===tr)){
+        showTileSwitchDetail(tc, tr);
+        return;
+      }
+      // A normal selection supersedes the switch view: drop its highlight so no
+      // stray amber ring survives a subsequent map rebuild.
+      dmSetSwitchHi(null);
       const ctrl=e.ctrlKey||e.metaKey||ctrlHeld;
       const selOn=k=>{ const gr=tileGroups[k]; if(!gr) return;
         const r=gr.querySelector('rect'); if(!r) return;
-        r.setAttribute('stroke','#599ce7'); r.setAttribute('stroke-width','2'); };
+        r.setAttribute('stroke','var(--sel)'); r.setAttribute('stroke-width','2'); };
       const selOff=k=>{ const gr=tileGroups[k]; if(!gr) return;
         const r=gr.querySelector('rect'); if(!r) return;
         r.setAttribute('stroke',dmTileStroke[k]||'var(--stroke,#e4e4e433)');
@@ -5702,7 +6701,7 @@ function buildDeviceMap(){
         }
         dmSelKeys.add(key); selOn(key);
         if(match) select(match, gridCell()||g, null, null, true);
-        else setConTargetLoc(tc, tr, null);
+        else { selectRoutingTile(tc, tr, true); setConTargetLoc(tc, tr, null); }
       } else {
         // Plain click: clear the selection; clicking the only selected tile deselects.
         const wasOnly = dmSelKeys.size===1 && dmSelKeys.has(key);
@@ -5711,8 +6710,7 @@ function buildDeviceMap(){
         if(wasOnly){ panelRemove(panelKey('tile', tc+','+tr)); return; }
         dmSelKeys.add(key); selOn(key);
         if(match) select(match, gridCell()||g, null, null, false);
-        else { panelClearTiles('tile ('+tc+','+tr+'): no schedule info');
-               setConTargetLoc(tc, tr, null); }
+        else { selectRoutingTile(tc, tr, false); setConTargetLoc(tc, tr, null); }
       }
     });
     svg.appendChild(g);
@@ -5723,8 +6721,10 @@ function buildDeviceMap(){
   dmSelKeys.forEach(k=>{
     const gr=tileGroups[k]; if(!gr) return;
     const r=gr.querySelector('rect'); if(!r) return;
-    r.setAttribute('stroke','#599ce7'); r.setAttribute('stroke-width','2');
+    r.setAttribute('stroke','var(--sel)'); r.setAttribute('stroke-width','2');
   });
+  // Re-apply the open switch-detail tile ring for the same reason.
+  dmApplySwitchHi();
 
   // ── LAYER 3: packet-switched and shmem links ──────────────────────
   // 'packet' hops: adjacent core tiles connected via packet-routed streams
@@ -5736,8 +6736,8 @@ function buildDeviceMap(){
     const dc=tc-fc, dr=tr-fr;
     if(dc>0)       return [tx(fc)+TW, cy(fr), tx(tc),    cy(tr)];
     if(dc<0)       return [tx(fc),    cy(fr), tx(tc)+TW, cy(tr)];
-    if(dr>0)       return [cx(fc), ty(fr),    cx(tc), ty(tr)+TH];
-    /* dr<0 */     return [cx(fc), ty(fr)+TH, cx(tc), ty(tr)   ];
+    if(dr>0)       return [fcx(fc), ty(fr),    fcx(tc), ty(tr)+TH];
+    /* dr<0 */     return [fcx(fc), ty(fr)+TH, fcx(tc), ty(tr)   ];
   }
   // Shmem links live in a RESERVED lane outside the stream-edge offset band, so
   // dashed shared-memory links never draw on top of the solid stream edges.
@@ -5795,7 +6795,7 @@ function buildDeviceMap(){
         const {ox,oy}=edgeOffset(e,fi);
         const [fc,fr]=e[0],[tc,tr]=e[1];
         svg.appendChild(svgN('line',{
-          x1:cx(fc)+ox,y1:cy(fr)+oy,x2:cx(tc)+ox,y2:cy(tr)+oy,
+          x1:fcx(fc)+ox,y1:fcy(fr)+oy,x2:fcx(tc)+ox,y2:fcy(tr)+oy,
           stroke:'rgba(255,210,0,0.40)','stroke-width':'10',
           'stroke-linecap':'round','pointer-events':'none'}));
       });
@@ -5820,9 +6820,15 @@ function buildDeviceMap(){
     });
   }
 
+  // When the control plan is loaded and its toggle is on, it REPLACES the
+  // data-flow view: skip the function-call routing lines (LAYER 3 shmem links +
+  // LAYER 4 stream edges) so only the control-plan overlay is drawn. Unchecking
+  // the control-plan toggle brings the data-flow lines back on the next rebuild.
+  const ctrlPlanShown = !!document.getElementById('dmCtrlPlanToggle')?.checked
+    && (ctrlPlanEdges.length>0 || ctrlPlanPorts.length>0);
   (DATA.comm_paths||[]).forEach(p=>{
     const fi=p.flow_index;
-    const dim=dmHideAll||(dmActiveNets.size>0&&!dmActiveNets.has(fi));
+    const dim=dmHideAll||ctrlPlanShown||(dmActiveNets.size>0&&!dmActiveNets.has(fi));
     if(dim) return;
     const color=dmColor(fi);
     const RAIL=2.4;   // half-gap between the two rails of a ping-pong window link
@@ -5841,35 +6847,44 @@ function buildDeviceMap(){
       //             two parallel rails (the ping/pong buffers) + a filled
       //             square (buffer glyph) at the midpoint.
       if(h.kind==='dma'){
-        svg.appendChild(svgN('line',{
+        const vis=svgN('line',{
           x1, y1, x2, y2,
           stroke:color,
           'stroke-width':'1.5',
           'stroke-opacity':'0.6',
           'stroke-dasharray':'5 3',
           'stroke-linecap':'round',
-          'marker-end':'url(#ar-'+fi+')'}));
+          'marker-end':'url(#ar-'+fi+')'});
+        svg.appendChild(vis);
+        dmTagFlowLine(vis, fi, 'dm-shmemvis', '1.5', '0.6', '2.6', '0.95');
       } else {
-        const dx = vertical ? RAIL : 0;   // rails offset perpendicular to the link
+        const dx = vertical ? RAIL : 0;
         const dy = vertical ? 0 : RAIL;
         [-1, 1].forEach(s=>{
-          svg.appendChild(svgN('line',{
+          const ln=svgN('line',{
             x1:x1+s*dx, y1:y1+s*dy, x2:x2+s*dx, y2:y2+s*dy,
             stroke:color,
             'stroke-width':'1.6',
             'stroke-opacity':'0.8',
             'stroke-linecap':'round',
-            'marker-end':'url(#ar-'+fi+')'}));
+            'marker-end':'url(#ar-'+fi+')'});
+          svg.appendChild(ln);
+          dmTagFlowLine(ln, fi, 'dm-shmemvis', '1.6', '0.8', '2.8', '0.98');
         });
         const mx=(x1+x2)/2, my=(y1+y2)/2;
-        svg.appendChild(svgN('rect',{
+        const sq=svgN('rect',{
           x:mx-BUFSZ/2, y:my-BUFSZ/2, width:BUFSZ, height:BUFSZ,
           fill:color, 'fill-opacity':'0.9',
-          stroke:'#181818', 'stroke-width':'0.8'}));
+          stroke:'#181818', 'stroke-width':'0.8'});
+        svg.appendChild(sq);
+        dmTagFlowSq(sq, fi, '0.9', '1');
       }
       // Wide transparent hit area (covers both rails for window links).
       const hit=svgN('line',{x1,y1,x2,y2,stroke:'transparent','stroke-width':'12',
         cursor:'pointer','pointer-events':'stroke'});
+      const kindLbl=h.kind==='window'?'shmem window (ping-pong)':'shmem dma bridge';
+      const flowTip=['flow f'+fi+(p.id?' ('+p.id+')':'')+' · '+p.direction, kindLbl];
+      dmWireFlowHit(hit, fi, flowTip);
       hit.addEventListener('click',ev=>{
         if(dmDragging) return;
         ev.stopPropagation();
@@ -5891,7 +6906,7 @@ function buildDeviceMap(){
       const [fc,fr]=e[0], [tc,tr]=e[1];
       const {ox,oy}=edgeOffset(e,fi);
       const isTerminal=!srcKeys.has(tc+','+tr);
-      const x1=cx(fc)+ox, y1=cy(fr)+oy, x2=cx(tc)+ox, y2=cy(tr)+oy;
+      const x1=fcx(fc)+ox, y1=fcy(fr)+oy, x2=fcx(tc)+ox, y2=fcy(tr)+oy;
       // Status casing, drawn first so it sits under the identity-colored line.
       // Starts transparent; dmPaintStatus() fills it in when a scan lands.
       if(!dim){
@@ -5900,16 +6915,20 @@ function buildDeviceMap(){
           stroke:'transparent', 'stroke-width':'9', 'stroke-opacity':'0.55',
           'stroke-linecap':'round', 'pointer-events':'none'}));
       }
-      svg.appendChild(svgN('line',{
+      const vis=svgN('line',{
         x1, y1, x2, y2,
         stroke:color,
-        'stroke-width':dim?'1':'3',
-        'stroke-opacity':dim?'0.05':'0.95',
-        'stroke-linecap':'round'}));
+        'stroke-width':dim?'0.7':'1.5',
+        'stroke-opacity':dim?'0.05':'0.6',
+        'stroke-linecap':'round'});
+      svg.appendChild(vis);
+      if(!dim) dmTagFlowLine(vis, fi, 'dm-flowvis', '1.5', '0.6', '2.8', '0.95');
       // Wide transparent hit area — only on active lines so dim flows aren't clickable.
       if(!dim){
         const hit=svgN('line',{x1,y1,x2,y2,stroke:'transparent','stroke-width':'12',
           cursor:'pointer','pointer-events':'stroke'});
+        const flowTip=['flow f'+fi+(p.id?' ('+p.id+')':'')+' · '+p.direction];
+        dmWireFlowHit(hit, fi, flowTip);
         hit.addEventListener('click',e=>{
           if(dmDragging) return;
           e.stopPropagation();
@@ -5919,8 +6938,8 @@ function buildDeviceMap(){
       }
     });
   }
-  if(dmHideAll){
-    // Hide-all mode: draw nothing.
+  if(dmHideAll||ctrlPlanShown){
+    // Hide-all mode, or control plan replacing the data-flow view: draw nothing.
   } else if(dmActiveNets.size===0){
     // All-nets mode: draw every flow bright.
     (DATA.comm_paths||[]).forEach(p=>drawEdges(p, false));
@@ -5943,8 +6962,9 @@ function buildDeviceMap(){
   // outward=true  (source):      arrow exits the dot — base just outside on downstream side, tip further downstream.
   // outward=false (destination): arrow on the line upstream — tip just outside dot on upstream side, base further back.
   // gap overrides the clearance from dot centre (default 7px, just past r=4.5px dot edge).
-  function svgArrow(x, y, dx, dy, color, outward, gap=7){
-    const LEN=9, HALF=3.5;
+  let dotsG = null;
+  function svgArrow(x, y, dx, dy, color, outward, gap=4){
+    const LEN=4, HALF=1.5;
     const nx=-dy, ny=dx;
     let tx, ty, bx, by;
     if(outward){
@@ -5956,7 +6976,7 @@ function buildDeviceMap(){
     }
     const b1x=bx+nx*HALF, b1y=by+ny*HALF;
     const b2x=bx-nx*HALF, b2y=by-ny*HALF;
-    svg.appendChild(svgN('polygon',{points:`${tx},${ty} ${b1x},${b1y} ${b2x},${b2y}`,fill:color,opacity:'0.9'}));
+    (dotsG||svg).appendChild(svgN('polygon',{points:`${tx},${ty} ${b1x},${b1y} ${b2x},${b2y}`,fill:color,opacity:'0.9'}));
   }
   // Normalise a grid-space direction vector to unit length (Manhattan tiles only).
   function gridDir(fromC, fromR, toC, toR){
@@ -5969,6 +6989,7 @@ function buildDeviceMap(){
   // Solid = injects into stream: source (push origin) or contributor (pull gather inject).
   // Fork = pure routing split (not a data producer or consumer).
   // Drawn before hollow dots so hollow dots always render on top.
+  dotsG = svgN('g',{'pointer-events':'none'});
   (DATA.comm_paths||[]).forEach(p=>{
     const fi=p.flow_index;
     const active=!dmHideAll&&(dmActiveNets.size===0||dmActiveNets.has(fi));
@@ -5994,12 +7015,12 @@ function buildDeviceMap(){
       const [sc,sr]=srcTile[0];
       if(!(isPull&&pktTileSet.has(sc+','+sr))){
         const {ox,oy}=dotOffset(p,sc,sr);
-        svg.appendChild(svgN('circle',{cx:cx(sc)+ox,cy:cy(sr)+oy,r:'4.5',
-          fill:color,stroke:'#181818','stroke-width':'1.2'}));
+        dotsG.appendChild(svgN('circle',{cx:fcx(sc)+ox,cy:fcy(sr)+oy,r:'1.8',
+          fill:color,stroke:'#181818','stroke-width':'0.7'}));
         // Arrow at source dot (push flows only — pull contributors use solid dot without arrow).
         if(!isPull){
           const [tc2,tr2]=srcTile[1];
-          if(tr2>=0){ const [dx,dy]=gridDir(sc,sr,tc2,tr2); svgArrow(cx(sc)+ox,cy(sr)+oy,dx,dy,color,true); }
+          if(tr2>=0){ const [dx,dy]=gridDir(sc,sr,tc2,tr2); svgArrow(fcx(sc)+ox,fcy(sr)+oy,dx,dy,color,true); }
         }
       }
     }
@@ -6013,10 +7034,10 @@ function buildDeviceMap(){
         if(seen.has(k)) return;
         seen.add(k);
         const {ox,oy}=dotOffset(p,tc,tr);
-        svg.appendChild(svgN('circle',{cx:cx(tc)+ox,cy:cy(tr)+oy,r:'4.5',
-          fill:color,stroke:'#181818','stroke-width':'1.2'}));
+        dotsG.appendChild(svgN('circle',{cx:fcx(tc)+ox,cy:fcy(tr)+oy,r:'1.8',
+          fill:color,stroke:'#181818','stroke-width':'0.7'}));
         const outEdge=edges.find(e=>e[0][0]===tc&&e[0][1]===tr);
-        if(outEdge){ const [dx,dy]=gridDir(tc,tr,outEdge[1][0],outEdge[1][1]); svgArrow(cx(tc)+ox,cy(tr)+oy,dx,dy,color,true); }
+        if(outEdge){ const [dx,dy]=gridDir(tc,tr,outEdge[1][0],outEdge[1][1]); svgArrow(fcx(tc)+ox,fcy(tr)+oy,dx,dy,color,true); }
       });
     }
 
@@ -6029,9 +7050,9 @@ function buildDeviceMap(){
       if(outC>=2 && inC===1 && !dmaTileSet.has(k) && !forkSeen.has(k)){
         forkSeen.add(k);
         const {ox,oy}=dotOffset(p,fc,fr);
-        svg.appendChild(svgN('circle',{
-          cx:cx(fc)+ox,cy:cy(fr)+oy,
-          r:'5',fill:color,stroke:'#e4e4e4','stroke-width':'1.5'}));
+        dotsG.appendChild(svgN('circle',{
+          cx:fcx(fc)+ox,cy:fcy(fr)+oy,
+          r:'2',fill:color,stroke:'#e4e4e4','stroke-width':'0.8'}));
       }
     });
   });
@@ -6072,11 +7093,11 @@ function buildDeviceMap(){
       if(!outCount[dk] && tr>=0 && !dstSeen.has(dk)){
         dstSeen.add(dk);
         const {ox,oy}=dotOffset(p,tc,tr);
-        svg.appendChild(svgN('circle',{cx:cx(tc)+ox,cy:cy(tr)+oy,r:'4.5',
-          fill:'#181818',stroke:color,'stroke-width':'2.2'}));
+        dotsG.appendChild(svgN('circle',{cx:fcx(tc)+ox,cy:fcy(tr)+oy,r:'1.8',
+          fill:'#181818',stroke:color,'stroke-width':'1.2'}));
         // Arrow pointing into the dot (data flows in from the previous tile).
         const [dx,dy]=gridDir(sc2,sr2,tc,tr);
-        svgArrow(cx(tc)+ox,cy(tr)+oy,dx,dy,color,false,5);
+        svgArrow(fcx(tc)+ox,fcy(tr)+oy,dx,dy,color,false,4);
       }
     });
 
@@ -6090,16 +7111,25 @@ function buildDeviceMap(){
       if(sr>=0 && dmaTileSet.has(sk) && outCount[sk] && inCount[sk] && !tapSeen.has(sk) && !globalTerminals.has(sk)){
         tapSeen.add(sk);
         const {ox,oy}=dotOffset(p,sc,sr);
-        svg.appendChild(svgN('circle',{cx:cx(sc)+ox,cy:cy(sr)+oy,r:'5',
-          fill:'#181818',stroke:color,'stroke-width':'2.5'}));
+        dotsG.appendChild(svgN('circle',{cx:fcx(sc)+ox,cy:fcy(sr)+oy,r:'2',
+          fill:'#181818',stroke:color,'stroke-width':'1.2'}));
         // Inward arrow only — tap is a consumer (output node), data flows in.
         const inEdge=edges.find(e2=>e2[1][0]===sc&&e2[1][1]===sr);
-        if(inEdge){ const [dx,dy]=gridDir(inEdge[0][0],inEdge[0][1],sc,sr); svgArrow(cx(sc)+ox,cy(sr)+oy,dx,dy,color,false,5); }
+        if(inEdge){ const [dx,dy]=gridDir(inEdge[0][0],inEdge[0][1],sc,sr); svgArrow(fcx(sc)+ox,fcy(sr)+oy,dx,dy,color,false,4); }
       }
     });
   });
 
-  dmReset();
+  svg.appendChild(dotsG);
+
+  drawCtrlPlanOverlay(svg, cx, cy);
+
+  // Fit only on the first build or an explicit "Reset view". Rebuilds triggered
+  // by the net chips, the tile right-click menu or a search must not throw away
+  // the pan/zoom the user set up — the transform is independent of the geometry,
+  // so reapplying it keeps the view anchored even when tile heights change.
+  if(dmRefitNext||!dmBuilt){ dmRefitNext=false; dmFitView(); }
+  else dmApply();
   // The SVG was recreated from scratch above, so any live status painted on the
   // previous DOM is gone — re-apply it from module state.
   dmPaintStatus();
@@ -6107,6 +7137,603 @@ function buildDeviceMap(){
 }
 
 buildNetBar();
+
+
+function _fmtDmaChanBadge(ch){
+  const p=ch.direction==='S2MM'?'s2mm':'mm2s';
+  return p+(ch.channel??0);
+}
+function _flowDmaLabel(fi, col, row){
+  if(fi==null) return '';
+  const tile=(DATA.tiles||[]).find(t=>t.loc[0]===col && t.loc[1]===row);
+  if(!tile) return '';
+  const chans=(tile.dma_channels||[]).filter(c=>c.flow_index===fi);
+  if(chans.length===1) return _fmtDmaChanBadge(chans[0]);
+  if(chans.length>1){
+    return chans.map(_fmtDmaChanBadge).join(' ');
+  }
+  return '';
+}
+function _flowDmaBadgeStyle(lbl){
+  if(!lbl){
+    return {cls:'rt-route', bg:'#141820', fg:'#687080', text:'route',
+      title:'stream-switch routing only — no local DMA for this flow on this tile'};
+  }
+  if(lbl.startsWith('mm2s')){
+    return {cls:'rt-mm2s', bg:'#2a1028', fg:'#c050b0', text:lbl,
+      title:'MM2S — tile memory to stream (send)'};
+  }
+  return {cls:'rt-s2mm', bg:'#0a2830', fg:'#30c0d0', text:lbl,
+    title:'S2MM — stream to tile memory (receive)'};
+}
+function _flowDmaSpanHtml(fi, col, row){
+  if(fi==null){
+    const st=_flowDmaBadgeStyle('');
+    return '<span class="'+st.cls+'" title="'+esc(st.title)+'">'+esc(st.text)+'</span>';
+  }
+  const tile=(DATA.tiles||[]).find(t=>t.loc[0]===col && t.loc[1]===row);
+  const chans=tile?(tile.dma_channels||[]).filter(c=>c.flow_index===fi):[];
+  if(!chans.length){
+    const st=_flowDmaBadgeStyle('');
+    return '<span class="'+st.cls+'" title="'+esc(st.title)+'">'+esc(st.text)+'</span>';
+  }
+  return chans.map(ch=>{
+    const lbl=_fmtDmaChanBadge(ch);
+    const st=_flowDmaBadgeStyle(lbl);
+    return '<span class="'+st.cls+'" title="'+esc(st.title)+'">'+esc(st.text)+'</span>';
+  }).join('');
+}
+
+function _flowTileSet(p){
+  const s=new Set();
+  (p.edges||[]).forEach(e=>{ s.add(e[0][0]+','+e[0][1]); s.add(e[1][0]+','+e[1][1]); });
+  (p.tiles||[]).forEach(t=>s.add(t[0]+','+t[1]));
+  (p.dma_tiles||[]).forEach(t=>s.add(t[0]+','+t[1]));
+  return s;
+}
+function _isPktPort(p){ return p&&p.dir&&p.dir!=='NONE'; }
+function _sharedPktForwardMaster(pktConns){
+  for(const c of pktConns){
+    const fm=c.forward_master||{};
+    if(_isPktPort(fm)) return fm;
+  }
+  return null;
+}
+function _defaultPktMask(leg){ return leg==='dma'?0x1f:0; }
+function _resolvePktMask(leg, port){
+  if(port&&port.mask!=null) return port.mask;
+  return _defaultPktMask(leg);
+}
+function _shortDir(d){
+  return d==='NORTH'?'N':d==='SOUTH'?'S':d==='EAST'?'E':d==='WEST'?'W':d?d[0]:'?';
+}
+function _fmtPktMaskHex(mask, leg){
+  const m=(mask!=null)?mask:_defaultPktMask(leg);
+  return '0x'+Number(m).toString(16).toUpperCase();
+}
+function _fmtPktMaskHtml(mask, leg){
+  return _fmtPktMaskBadge(mask, leg);
+}
+function _fmtPktMaskBadge(mask, leg){
+  return '<span class="rt-pktmask" title="slave slot match mask (XAie_StrmPktSwSlaveSlotEnable)">'
+    +_fmtPktMaskHex(mask, leg)+'</span>';
+}
+function _expandPktConnectRows(c, sharedFwd){
+  const rs=c.recv_slave||{}, ld=c.local_dma||{}, fm=c.forward_master||{};
+  const master=_isPktPort(fm)?fm:sharedFwd;
+  const rows=[];
+  if(_isPktPort(rs) && master)
+    rows.push({leg:'recv', slave:{dir:rs.dir, idx:rs.idx},
+               master:{dir:master.dir, idx:master.idx},
+               pktid:rs.pktid, mask:_resolvePktMask('recv', rs)});
+  if(_isPktPort(ld) && master)
+    rows.push({leg:'dma', slave:{dir:ld.dir, idx:ld.idx},
+               master:{dir:master.dir, idx:master.idx},
+               pktid:ld.pktid, mask:_resolvePktMask('dma', ld)});
+  // Forward-only entry: no recv/dma slave but a valid forward_master (e.g. the
+  // terminal gather tile that hands off from the packet segment to circuit-switch).
+  if(!rows.length && _isPktPort(fm))
+    rows.push({leg:'fwd', slave:null, master:{dir:fm.dir, idx:fm.idx},
+               pktid:null, mask:null});
+  return rows;
+}
+function _pktRowKey(row){
+  const sl=row.slave||{};
+  return 'pkt|'+row.leg+'|'+(sl.dir??'none')+'|'+(sl.idx??'-')+'|'+(row.pktid??'?')
+    +'|'+row.mask+'|'+row.master.dir+'|'+row.master.idx;
+}
+function _fmtPktLabel(row, compact){
+  const dir=compact?_shortDir:(d=>d);
+  const arr=' → ';
+  const sl=row.slave||{};
+  const slavePart=sl.dir?dir(sl.dir)+':'+sl.idx:'fwd';
+  let s='PKT '+slavePart+arr+dir(row.master.dir)+':'+row.master.idx;
+  if(!compact){
+    if(row.pktid!=null) s+=' pkt'+row.pktid;
+    if(row.mask!=null) s+=' '+_fmtPktMaskHex(row.mask, row.leg);
+  }
+  return s;
+}
+function _dmPktBadges(row){
+  const badges=[];
+  if(row.pktid!=null) badges.push({text:'pkt'+row.pktid, bg:'#2a0838', fg:'#c07fd4'});
+  if(row.mask!=null) badges.push({text:_fmtPktMaskHex(row.mask, row.leg), bg:'#3a1010', fg:'#e87850'});
+  return badges;
+}
+function _svgBadgeWidth(text){
+  return Math.round(text.length*3.55+4);
+}
+function _fmtMselEnHex(v){
+  return '0x'+Number(v!=null?v:1).toString(16).toUpperCase();
+}
+function _tilePktMasters(col, row, focusFlowIdx){
+  const out=new Map();
+  (DATA.comm_paths||[]).forEach(p=>{
+    if(focusFlowIdx!=null && p.flow_index!==focusFlowIdx) return;
+    const fts=_flowTileSet(p);
+    if(fts.size>0 && !fts.has(col+','+row)) return;
+    (p.routing_connections||[]).forEach(c=>{
+      if(c.kind!=='packet_connect') return;
+      const t=c.tile||{};
+      if(t.col!==col || t.row!==row) return;
+      const fm=c.forward_master||{};
+      if(!_isPktPort(fm)) return;
+      const key=fm.dir+'|'+fm.idx;
+      if(!out.has(key)){
+        out.set(key, {
+          dir:fm.dir, idx:fm.idx,
+          arbiter:(fm.arbiter!=null)?fm.arbiter:0,
+          msel_en:(fm.msel_en!=null)?fm.msel_en:1,
+          flow_indices:[],
+        });
+      }
+      const e=out.get(key);
+      if(p.flow_index!=null && !e.flow_indices.includes(p.flow_index))
+        e.flow_indices.push(p.flow_index);
+    });
+  });
+  return [...out.values()].sort((a,b)=>
+    a.dir.localeCompare(b.dir)||a.idx-b.idx);
+}
+function _renderPktMasterBlock(col, row, focusFlowIdx, scan){
+  const masters=_tilePktMasters(col, row, focusFlowIdx);
+  const mstExtra=_swExtraMstHtml(scan, masters);
+  if(!masters.length && !mstExtra) return '';
+  const rows=masters.map(m=>{
+    const flows=m.flow_indices.map(fi=>'fl'+fi).join(' ');
+    const flow=flows?'<span class="rt-flow">'+esc(flows)+'</span>':'';
+    const swSpan=_swMarkHtmlMst(scan, m.dir+':'+m.idx, m.arbiter, m.msel_en);
+    return '<div class="rt-row mst">'
+      +'<span class="rt-kind">MST</span>'
+      +'<span class="rt-ports">'+esc(m.dir)+':'+m.idx+'</span>'
+      +'<span class="rt-pktid" title="XAie_StrmPktSwMstrPortEnable Arbitor">arb:'
+        +m.arbiter+'</span>'
+      +'<span class="rt-pktid" title="XAie_StrmPktSwMstrPortEnable MSelEn (bitmask of slave MSel lines)">msel_en:'
+        +_fmtMselEnHex(m.msel_en)+'</span>'
+      +flow+swSpan+'</div>';
+  }).join('');
+  return '<div class="rt-mst-hdr">PKT master ports</div>'
+    +rows+mstExtra;
+}
+function _tileRoutingConns(col, row, paths){
+  paths = paths || DATA.comm_paths || [];
+  const shimKinds=new Set(['shim_aie_to_ext','shim_ext_to_aie']);
+  const keyIdx=new Map();
+  const out=[];
+  (paths||[]).forEach(p=>{
+    const fts=_flowTileSet(p);
+    if(fts.size>0 && !fts.has(col+','+row)) return;
+    const pathPkt=(p.routing_connections||[]).filter(c=>{
+      const t=c.tile||{};
+      return t.col===col && t.row===row && c.kind==='packet_connect';
+    });
+    const sharedPktFwd=_sharedPktForwardMaster(pathPkt);
+    pathPkt.forEach(c=>{
+      _expandPktConnectRows(c,sharedPktFwd).forEach(row=>{
+        const key=_pktRowKey(row);
+        if(keyIdx.has(key)){
+          const existing=out[keyIdx.get(key)];
+          if(!(existing.flow_indices||[]).includes(p.flow_index)) existing.flow_indices.push(p.flow_index);
+          return;
+        }
+        keyIdx.set(key, out.length);
+        out.push({kind:'packet_hw', ...row, flow_index:p.flow_index, flow_indices:[p.flow_index]});
+      });
+    });
+    (p.routing_connections||[]).forEach(c=>{
+      const t=c.tile||{};
+      if(t.col!==col || t.row!==row || shimKinds.has(c.kind)) return;
+      if(c.kind==='packet_connect') return;
+      const s=c.slave||{}, m=c.master||{};
+      const key=c.kind+'|'+s.dir+'|'+s.idx+'|'+m.dir+'|'+m.idx;
+      if(keyIdx.has(key)){
+        const existing=out[keyIdx.get(key)];
+        if(!(existing.flow_indices||[]).includes(p.flow_index)) existing.flow_indices.push(p.flow_index);
+        return;
+      }
+      keyIdx.set(key, out.length);
+      out.push({...c, flow_index:p.flow_index, flow_indices:[p.flow_index]});
+    });
+  });
+  return out;
+}
+
+function _routingConnDiffRecord(c){
+  if(c.kind==='packet_hw'){
+    const sl=c.slave||{};
+    return {kind:'PKT',
+      slave: sl.dir ? sl.dir+':'+sl.idx : null,
+      master: c.master.dir+':'+c.master.idx};
+  }
+  const s=c.slave||{}, m=c.master||{};
+  return {kind:'CCT', slave:s.dir+':'+s.idx, master:m.dir+':'+m.idx};
+}
+function _routingConnDiffKey(c){
+  const r=_routingConnDiffRecord(c);
+  return _swKey(r.kind, r.slave, r.master);
+}
+function _filterRoutingConns(conns){
+  return conns.filter(c=>{
+    if(c.kind==='packet_hw') return true;
+    const s=c.slave||{}, m=c.master||{};
+    return s.dir!=null && s.idx!=null && m.dir!=null && m.idx!=null;
+  });
+}
+function _routingDiffSides(){
+  const base = ROUTING_SRC==='dynamic' ? 'dynamic' : 'static';
+  return {base, other: base==='dynamic' ? 'static' : 'dynamic'};
+}
+function _routingSrcDiffTile(col, row){
+  if(!(DYNAMIC && DYNAMIC.comm_paths)) return null;
+  const d=_routingDiffSides();
+  const basePaths=d.base==='dynamic' ? DYNAMIC.comm_paths : STATIC_PATHS;
+  const otherPaths=d.base==='dynamic' ? STATIC_PATHS : DYNAMIC.comm_paths;
+  const baseConns=_filterRoutingConns(_tileRoutingConns(col, row, basePaths));
+  const otherConns=_filterRoutingConns(_tileRoutingConns(col, row, otherPaths));
+  const bMap=new Map();
+  baseConns.forEach(c=>{ const k=_routingConnDiffKey(c); if(!bMap.has(k)) bMap.set(k, _routingConnDiffRecord(c)); });
+  const oMap=new Map();
+  otherConns.forEach(c=>{ const k=_routingConnDiffKey(c); if(!oMap.has(k)) oMap.set(k, _routingConnDiffRecord(c)); });
+  const missing=[], unexpected=[];
+  bMap.forEach((rec, k)=>{ if(!oMap.has(k)) missing.push(rec); });
+  oMap.forEach((rec, k)=>{ if(!bMap.has(k)) unexpected.push(rec); });
+  let state='verified';
+  if(!bMap.size && !oMap.size) state='idle';
+  else if(missing.length || unexpected.length) state='mismatch';
+  return {state, missing, unexpected};
+}
+
+// ── live switch scan overlay ────────────────────────────────────────────────
+// A scanned tile carries the set of rows the hardware is NOT programmed with
+// (missing) and the rows it has that no flow accounts for (unexpected).  Rows
+// are keyed the same way both sides build them: kind + slave + master.
+function _swKey(kind, slave, master){ return kind+'|'+(slave||'fwd')+'|'+master; }
+function _swNormSlave(slave){
+  return (!slave || slave==='fwd') ? 'fwd' : slave;
+}
+function _swRecordKey(r){
+  if(!r) return '';
+  if(r.kind==='PKT'){
+    return 'PKT|'+_swNormSlave(r.slave)+'|'+r.master
+      +'|'+(r.pktid!=null?r.pktid:'?')+'|'+(r.mask!=null?r.mask:'?');
+  }
+  if(r.kind==='MST'){
+    return 'MST|'+r.master+'|'+(r.arbiter!=null?r.arbiter:0)
+      +'|'+(r.msel_en!=null?r.msel_en:1);
+  }
+  return _swKey(r.kind, r.slave, r.master);
+}
+function _swCoarseKey(r){
+  if(!r) return '';
+  if(r.kind==='PKT'){
+    const sl = (r.slave==='fwd'||!r.slave) ? null : r.slave;
+    return _swKey('PKT', sl, r.master);
+  }
+  if(r.kind==='MST') return _swKey('MST', null, r.master);
+  return _swKey(r.kind, r.slave, r.master);
+}
+function _swConnCoarseKey(c){
+  if(c.kind==='packet_hw'){
+    const sl=c.slave||{};
+    return _swKey('PKT', sl.dir?sl.dir+':'+sl.idx:null,
+                  c.master.dir+':'+c.master.idx);
+  }
+  const s=c.slave||{}, m=c.master||{};
+  return _swKey('CCT', s.dir+':'+s.idx, m.dir+':'+m.idx);
+}
+function _swScanTile(col, row){
+  return SWSCAN ? SWSCAN[col+','+row] : null;
+}
+function _swMissingRecordKeys(scan){
+  const s=new Set();
+  (scan&&scan.missing||[]).forEach(r=>s.add(_swRecordKey(r)));
+  return s;
+}
+function _swMissingKeys(scan){
+  const s=new Set();
+  (scan&&scan.missing||[]).forEach(r=>s.add(_swCoarseKey(r)));
+  return s;
+}
+function _swOnlyLabel(){
+  if(!ROUTING_DIFF){
+    return {text:'HW only',
+            title:'programmed in hardware but no flow in the routing map accounts for it'};
+  }
+  const d=_routingDiffSides();
+  return {text:d.other+' only',
+          title:'in the '+d.other+' map but not in the '+d.base+' map'};
+}
+function _swDiffBadHtml(){
+  const d=_routingDiffSides();
+  return _swBadHtml('in the '+d.base+' map but not in the '+d.other+' map',
+                    d.base+' only');
+}
+function _swBadHtml(title, text){
+  return '<span class="sw-bad" title="'+esc(title)+'">'+text+'</span>';
+}
+function _swOkHtml(title, text){
+  return '<span class="sw-ok" title="'+esc(title)+'">'+text+'</span>';
+}
+function _swMarkHtmlCct(scan, slave, master){
+  if(!scan || scan.state==='unreachable') return '';
+  const rec={kind:'CCT', slave:slave, master:master};
+  if(_swMissingRecordKeys(scan).has(_swRecordKey(rec))){
+    if(ROUTING_DIFF) return _swDiffBadHtml();
+    return _swBadHtml('the routing map claims this connection '
+      +'but the stream-switch registers are not programmed with it',
+                      'not in HW');
+  }
+  if(ROUTING_DIFF){
+    return _swOkHtml('present in both the static and dynamic maps', 'match');
+  }
+  return _swOkHtml('this connection is programmed in the stream-switch registers',
+                   'in HW');
+}
+function _swMarkHtmlPkt(scan, slave, master, pktid, mask){
+  if(!scan || scan.state==='unreachable') return '';
+  const sl = slave || 'fwd';
+  const rec={kind:'PKT', slave:sl, master:master, pktid:pktid, mask:mask};
+  if(_swMissingRecordKeys(scan).has(_swRecordKey(rec))){
+    if(ROUTING_DIFF) return _swDiffBadHtml();
+    return _swBadHtml('the routing map claims this connection '
+      +'but the stream-switch registers are not programmed with it',
+                      'not in HW');
+  }
+  if(ROUTING_DIFF){
+    return _swOkHtml('present in both the static and dynamic maps', 'match');
+  }
+  return _swOkHtml('this connection is programmed in the stream-switch registers',
+                   'in HW');
+}
+function _swMarkHtmlMst(scan, master, arbiter, msel_en){
+  if(!scan || scan.state==='unreachable') return '';
+  const rec={kind:'MST', slave:null, master:master,
+             arbiter:arbiter, msel_en:msel_en};
+  if(_swMissingRecordKeys(scan).has(_swRecordKey(rec))){
+    if(ROUTING_DIFF) return '';
+    return _swBadHtml('the routing map claims this master port '
+      +'but the stream-switch registers are not programmed with it',
+                      'not in HW');
+  }
+  if(ROUTING_DIFF) return '';
+  return _swOkHtml('this master port is programmed in the stream-switch registers',
+                   'in HW');
+}
+function _swExtraRowHtml(r, only){
+  const ports=(r.slave?esc(r.slave):'fwd')+'&nbsp;&rarr;&nbsp;'+esc(r.master);
+  return '<div class="rt-row sw-extra">'
+    +'<span class="rt-kind">'+esc(r.kind)+'</span>'
+    +'<span class="rt-ports">'+ports+'</span>'
+    +_swBadHtml(only.title, only.text)+'</div>';
+}
+function _swExtraRowsHtml(scan, mainConns){
+  if(!scan) return '';
+  const only=_swOnlyLabel();
+  const mainCoarse=new Set((mainConns||[]).map(_swConnCoarseKey));
+  const missingCoarse=_swMissingKeys(scan);
+  const seen=new Set();
+  return (scan.unexpected||[]).filter(r=>{
+    if(!r || r.kind==='MST') return false;
+    const ck=_swCoarseKey(r);
+    if(mainCoarse.has(ck) && !missingCoarse.has(ck)) return false;
+    const fk=_swRecordKey(r);
+    if(seen.has(fk)) return false;
+    seen.add(fk);
+    return true;
+  }).map(r=>_swExtraRowHtml(r, only)).join('');
+}
+function _swExtraMstHtml(scan, masters){
+  if(!scan) return '';
+  const only=_swOnlyLabel();
+  const mainCoarse=new Set((masters||[]).map(m=>_swKey('MST', null, m.dir+':'+m.idx)));
+  const missingCoarse=_swMissingKeys(scan);
+  const seen=new Set();
+  return (scan.unexpected||[]).filter(r=>{
+    if(!r || r.kind!=='MST') return false;
+    const ck=_swCoarseKey(r);
+    if(mainCoarse.has(ck) && !missingCoarse.has(ck)) return false;
+    const fk=_swRecordKey(r);
+    if(seen.has(fk)) return false;
+    seen.add(fk);
+    return true;
+  }).map(r=>{
+    const ports=(r.slave?esc(r.slave):'fwd')+'&nbsp;&rarr;&nbsp;'+esc(r.master);
+    let tail='';
+    if(r.arbiter!=null){
+      tail+=' <span class="rt-pktid" title="arbiter">arb:'+r.arbiter+'</span>';
+    }
+    if(r.msel_en!=null){
+      tail+=' <span class="rt-pktid" title="msel_en">msel_en:'
+        +_fmtMselEnHex(r.msel_en)+'</span>';
+    }
+    return '<div class="rt-row mst sw-extra">'
+      +'<span class="rt-kind">MST</span>'
+      +'<span class="rt-ports">'+ports+'</span>'
+      +tail+_swBadHtml(only.title, only.text)+'</div>';
+  }).join('');
+}
+
+function renderTileRoutingSection(col, row, focusFlowIdx){
+  const scan = ROUTING_DIFF
+    ? (_routingSrcDiffTile(col, row) || _swScanTile(col, row))
+    : null;
+  const allRaw=_tileRoutingConns(col, row);
+
+  let conns=_filterRoutingConns(allRaw);
+  if(focusFlowIdx!=null) conns=conns.filter(c=>(c.flow_indices||[c.flow_index]).includes(focusFlowIdx));
+  conns=conns.slice().sort((a,b)=>{
+    const rank=c=>(c.kind==='packet_hw'?1:0);
+    return rank(a)-rank(b);
+  });
+  if(!conns.length && !scan) return '';
+  if(!conns.length && scan && !(scan.unexpected||[]).length) return '';
+
+  const rows=conns.map(c=>{
+    const tile=(DATA.tiles||[]).find(t=>t.loc[0]===col&&t.loc[1]===row);
+    const localFis=new Set((tile&&tile.dma_channels||[]).map(ch=>ch.flow_index));
+    // Under focus the row is claimed by one flow only; badging every flow that
+    // shares the row would put another flow's channel on it.
+    const candidates=(focusFlowIdx!=null)
+      ?[focusFlowIdx]
+      :(c.flow_indices||[c.flow_index]);
+    const withDma=candidates.filter(fi=>localFis.has(fi));
+    // Show one badge per flow that has a local DMA channel; fall back to route badge.
+    const dmaSpan=withDma.length
+      ?withDma.map(fi=>_flowDmaSpanHtml(fi,col,row)).join('')
+      :_flowDmaSpanHtml(null,col,row);
+    if(c.kind==='packet_hw'){
+      const sl=c.slave||{};
+      const ports=sl.dir
+        ?esc(sl.dir)+':'+sl.idx+'&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx
+        :'fwd&nbsp;&rarr;&nbsp;'+esc(c.master.dir)+':'+c.master.idx;
+      const pktSpan=(c.pktid!=null)
+        ?'<span class="rt-pktid" title="packet match id">pkt'+c.pktid+'</span>':'';
+      const maskSpan=(c.mask!=null)?_fmtPktMaskBadge(c.mask,c.leg):'';
+      const swSpan=_swMarkHtmlPkt(scan,
+        sl.dir?sl.dir+':'+sl.idx:null, c.master.dir+':'+c.master.idx,
+        c.pktid, c.mask);
+      return '<div class="rt-row pkt">'
+        +'<span class="rt-kind">PKT</span>'
+        +'<span class="rt-ports">'+ports+'</span>'
+        +pktSpan+maskSpan+dmaSpan+swSpan+'</div>';
+    }
+    const s=c.slave||{}, m=c.master||{};
+    const ports=esc(s.dir)+':'+s.idx+'&nbsp;&rarr;&nbsp;'+esc(m.dir)+':'+m.idx;
+    const swSpan=_swMarkHtmlCct(scan, s.dir+':'+s.idx, m.dir+':'+m.idx);
+    return '<div class="rt-row cct">'
+      +'<span class="rt-kind">CCT</span>'
+      +'<span class="rt-ports">'+ports+'</span>'
+      +dmaSpan+swSpan+'</div>';
+  });
+  const mstBlock=_renderPktMasterBlock(col, row, focusFlowIdx, scan);
+  const swHdr=scan
+    ?' <span class="sw-state '+esc(scan.state)+'">'+esc(scan.state)+'</span>'
+    :'';
+  const extra=_swExtraRowsHtml(scan, conns);
+  if(!rows.filter(Boolean).join('') && !mstBlock && !extra) return '';
+  return '<div class="sec"><div class="sec-hdr">Stream switch'+swHdr+'</div>'
+    +rows.filter(Boolean).join('')+mstBlock+extra+'</div>';
+}
+
+function _routingTileType(row){
+  const deviceCoreMinRow=DATA.grid.device_core_min_row||3;
+  if(row===0) return 'shim';
+  if(row>=deviceCoreMinRow) return 'core';
+  return 'mem';
+}
+function _tileCommPaths(col, row){
+  // Stream edges plus shared-memory hops: a tile reached only through shared
+  // memory still carries the flow, and printing "(no comm paths through this
+  // tile)" above its own Shared memory table contradicted itself.
+  const onEdge=p=>(p.edges||[]).some(e=>
+    (e[0][0]===col&&e[0][1]===row)||(e[1][0]===col&&e[1][1]===row));
+  const onShmem=p=>(p.hops||[]).some(h=>h.type==='shmem'&&
+    ((h.from_col===col&&h.from_row===row)||(h.to_col===col&&h.to_row===row)));
+  return (DATA.comm_paths||[]).filter(p=>onEdge(p)||onShmem(p));
+}
+function _tileShmemHops(col, row){
+  const out=[];
+  (DATA.comm_paths||[]).forEach(p=>{
+    (p.hops||[]).filter(h=>h.type==='shmem').forEach(h=>{
+      if((h.from_col===col&&h.from_row===row)||(h.to_col===col&&h.to_row===row))
+        out.push({flow_index:p.flow_index, ...h});
+    });
+  });
+  return out;
+}
+function buildRoutingTileHtml(col, row){
+  const ttype=_routingTileType(row);
+  const flows=_tileCommPaths(col, row);
+  const flowRows=flows.map(p=>'<tr><td>f'+p.flow_index+'</td><td>'
+    +esc(p.direction||'')+'</td><td>'+esc(p.id||'')+'</td></tr>').join('');
+  const flowTable=flowRows
+    ?'<table class="rctbl"><thead><tr><th>flow</th><th>dir</th><th>net</th></tr></thead>'
+      +'<tbody>'+flowRows+'</tbody></table>'
+    :'<div class="placeholder">(no comm paths through this tile)</div>';
+  const shmem=_tileShmemHops(col, row);
+  const shmemRows=shmem.map(h=>'<tr><td>f'+h.flow_index+'</td><td>('+h.from_col+','+h.from_row
+    +')</td><td>→</td><td>('+h.to_col+','+h.to_row+')</td><td>'
+    +esc(h.kind||'shmem')+'</td></tr>').join('');
+  const shmemSec=shmemRows
+    ?'<div class="sec"><div class="sec-hdr">Shared memory</div>'
+      +'<table class="rctbl"><thead><tr><th>flow</th><th>from</th><th></th><th>to</th>'
+      +'<th>kind</th></tr></thead><tbody>'+shmemRows+'</tbody></table></div>'
+    :'';
+  const swSec=renderTileRoutingSection(col, row);
+  return '<div class="placeholder dimtxt">No kernel or DMA schedule for this tile — routing path only.</div>'
+    +'<div class="sec"><div class="sec-hdr">Tile</div>'
+    +'<div class="kv"><b>location:</b> ('+col+','+row+')</div>'
+    +'<div class="kv"><b>geometry:</b> '+ttype+'</div></div>'
+    +'<div class="sec"><div class="sec-hdr">Flows</div>'+flowTable+'</div>'
+    +shmemSec+(swSec||'');
+}
+function selectRoutingTile(col, row, ctrl){
+  reportUIState({selected_tile:[col,row], channel:null, flow:null});
+  const tileKey=panelKey('tile', col+','+row);
+  const label='('+col+','+row+') routing';
+  const llmCtx='tile ('+col+','+row+') routing-only (no schedule bundle)';
+  const buildBody=()=>buildRoutingTileHtml(col, row);
+  if(ctrl){
+    if(panelItems.has(tileKey)){ panelRemove(tileKey); return; }
+    panelItems.set(tileKey,{kind:'tile',label,color:null,buildBody,wireBody:()=>{},llmCtx});
+  } else {
+    panelItems.forEach((_,k)=>{ if(k.startsWith('tile:')) panelItems.delete(k); });
+    panelItems.set(tileKey,{kind:'tile',label,color:null,buildBody,wireBody:()=>{},llmCtx});
+  }
+  panelActiveKey=tileKey;
+  panelSync();
+}
+
+function renderTileDmaBdSection(t, ch, focused){
+  const chans=focused?[ch]:(t.dma_channels||[]);
+  if(!chans.length) return '';
+  const parts=chans.map(c=>{
+    const bds=c.bd_chain||[];
+    if(!bds.length) return '';
+    const bdRows=bds.map(bd=>{
+      const nxt=(bd.next_bd!=null && bd.next_bd>=0)?' &rarr;BD'+bd.next_bd:'';
+      const acq=(bd.acquire_lock||[])[0];
+      const rel=(bd.release_lock||[])[0];
+      const locks=(acq||rel)
+        ?'<span class="bd-lock">'
+          +(acq?'acq=L'+acq.id+'('+acq.val+')':'')
+          +(acq&&rel?' ':'')
+          +(rel?'rel=L'+rel.id+'('+rel.val+')':'')
+          +'</span>':'';
+      return '<div class="bd-mini">'
+        +'<span class="bd-id">BD'+bd.bd_id+'</span>'
+        +'<span class="bd-len">len='+bd.len+'</span>'
+        +(nxt?'<span class="bd-next">'+nxt+'</span>':'')
+        +locks+'</div>';
+    });
+    const hdr=focused?''
+      :'<div class="bd-mini-ch">'+esc(c.direction)+' ch'+c.channel
+        +(c.flow_index!=null?' fl'+c.flow_index:'')+'</div>';
+    return hdr+bdRows.join('');
+  }).filter(Boolean);
+  if(!parts.length) return '';
+  return '<div class="sec"><div class="sec-hdr">DMA BDs</div>'+parts.join('')+'</div>';
+}
 
 // One-line summary for a single channel (mirrors build_summary in schedule_view.py).
 function chanSummary(ch){
@@ -6224,10 +7851,14 @@ function select(t, el, ch, badgeEl, ctrl){
         '<div class="kv"><b>channel:</b> '+ch.direction+ch.channel+' &mdash; flow '+ch.flow_index+'</div>' +
         '<div class="kv"><b>transfer:</b> '+esc(chanSummary(ch))+'</div>' +
       '</div>' +
+      renderTileRoutingSection(t.loc[0], t.loc[1], ch.flow_index) +
+      renderTileDmaBdSection(t, ch, true) +
       (con?'<div class="sec"><div class="sec-hdr">Contract</div>'+con+'</div>':'');
   } else {
     const sum = (hlv.summary||[]).map(s=>'<li>'+esc(s)+'</li>').join('');
-    const con = (hlv.contracts||[]).map(s=>'<div class="contract">'+esc(s)+'</div>').join('');
+    const con = (hlv.contracts||[]).map(s=>{
+      return '<div class="contract">'+esc(s)+'</div>';
+    }).join('');
     // Build status bar from tile-level balances
     const balRows = [];
     const bseen = {};
@@ -6252,6 +7883,8 @@ function select(t, el, ch, badgeEl, ctrl){
         (hlv.kernel?'<div class="kv"><b>kernel:</b> '+esc(hlv.kernel)+'</div>':'') +
         '<div class="kv"><b>transfers:</b></div><ul class="sum">'+sum+'</ul>' +
       '</div>' +
+      renderTileRoutingSection(t.loc[0], t.loc[1]) +
+      renderTileDmaBdSection(t, null, false) +
       (kmatch?'<div class="sec"><div class="sec-hdr">Kernel &harr; Channel Arguments</div>'+kmatch+'</div>':'') +
       (balRows.length?'<div class="sec"><div class="sec-hdr">Supply / Demand</div>'+balRows.map(renderFlowBalance).join('')+'</div>':'') +
       (con?'<div class="sec"><div class="sec-hdr">Contracts</div>'+con+'</div>':'');
@@ -6301,8 +7934,8 @@ function select(t, el, ch, badgeEl, ctrl){
         ' ('+(flo.ranges||[]).length+' range(s))'+
         (focused?' &mdash; '+ch.direction+ch.channel+' scope':''),
         renderFullBlock(flo.code_lines,
-          focused ? ((ch.low_level||{}).params||null) : null), false) +
-      (kcodeOn ? renderKernelCode(t, ch, focused, false) : '')
+          focused ? ((ch.low_level||{}).params||null) : null), true) +
+      (kcodeOn ? renderKernelCode(t, ch, focused, true) : '')
     : renderTileCodeKernelFirst(t, ch, focused, codePathBanner);
   const hostFileBody = CAPS.host_lines
     ? codePathBanner +
@@ -6371,6 +8004,7 @@ function wireTileExtra(t, ch, focused, flo, midIR, kcodeOn, body){
         other => other.classList.toggle('act', other === tab));
       body.querySelectorAll('.codefile-view').forEach(
         view => view.classList.toggle('hide', view.dataset.codefile !== key));
+      panelBuildToc();
     };
   });
   body.querySelectorAll('.kshowall').forEach(kbtn => {
@@ -6457,6 +8091,49 @@ let panelActiveKey = null;
 
 function panelKey(kind, id){ return kind+':'+id; }
 
+function panelBuildToc(){
+  const toc = document.getElementById('panel-toc');
+  const pb  = document.getElementById('panel-body');
+  if(!toc || !pb){ return; }
+  function notHidden(el){
+    let p = el;
+    while(p && p !== pb){ if(p.classList.contains('hide')) return false; p = p.parentElement; }
+    return true;
+  }
+  const entries = [];
+  pb.querySelectorAll('.sec-hdr, details.codesec > summary').forEach(el => {
+    if(notHidden(el)) entries.push({ label: el.textContent.trim(), el });
+  });
+  if(!entries.length){ toc.innerHTML = ''; toc.classList.add('no-items'); return; }
+  toc.classList.remove('no-items');
+  const collapsed = toc.classList.contains('collapsed');
+  toc.innerHTML =
+    '<button class="ptoc-toggle" title="'+(collapsed?'Expand':'Collapse')+' table of contents">'+(collapsed?'◀':'▶')+'</button>' +
+    '<button class="ptoc-top" title="Scroll to top">▲</button>' +
+    entries.map((e, i) => '<span class="ptoc-item" data-i="'+i+'">'+esc(e.label)+'</span>').join('');
+  toc.querySelector('.ptoc-toggle').onclick = () => {
+    toc.classList.toggle('collapsed');
+    const btn = toc.querySelector('.ptoc-toggle');
+    const now = toc.classList.contains('collapsed');
+    btn.textContent = now ? '◀' : '▶';
+    btn.title = now ? 'Expand table of contents' : 'Collapse table of contents';
+  };
+  const topBtn = toc.querySelector('.ptoc-top');
+  topBtn.onclick = () => pb.scrollTo({ top: 0, behavior: 'smooth' });
+  const syncTopBtn = () => { topBtn.style.display = pb.scrollTop > 40 ? '' : 'none'; };
+  if(pb._ptocScroll) pb.removeEventListener('scroll', pb._ptocScroll);
+  pb._ptocScroll = syncTopBtn;
+  pb.addEventListener('scroll', syncTopBtn, { passive: true });
+  syncTopBtn();
+  toc.querySelectorAll('.ptoc-item').forEach(span => {
+    const target = entries[+span.dataset.i].el;
+    span.onclick = () => {
+      const off = target.getBoundingClientRect().top - pb.getBoundingClientRect().top + pb.scrollTop - 6;
+      pb.scrollTo({ top: Math.max(0, off), behavior: 'smooth' });
+    };
+  });
+}
+
 function panelRenderTabs(){
   const strip = document.getElementById('panel-itemtabs');
   strip.innerHTML = '';
@@ -6482,7 +8159,7 @@ function panelRenderTabs(){
 function panelRenderBody(key){
   const body = document.getElementById('panel-body');
   const item = panelItems.get(key);
-  if(!item){ body.innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; return; }
+  if(!item){ body.innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; panelBuildToc(); return; }
   body.innerHTML = item.buildBody();
   // wire folder tabs inside body
   body.querySelectorAll('.tab').forEach(tab=>{
@@ -6493,10 +8170,12 @@ function panelRenderBody(key){
       if (tabField) reportUIState({[tabField]: tab.dataset.t});
       const id='tab-'+tab.dataset.t;
       body.querySelectorAll('.tabbody>div').forEach(d=>d.classList.toggle('hide',d.id!==id));
+      panelBuildToc();
     };
   });
   // wire any extra handlers the item needs
   if(item.wireBody) item.wireBody(body);
+  panelBuildToc();
 }
 
 function panelShow(key){
@@ -6507,6 +8186,8 @@ function panelShow(key){
 }
 
 function panelRemove(key){
+  // Closing the switch-detail card also drops its device-map tile highlight.
+  if(typeof dmSwitchHiKey!=='undefined' && key==='switch:'+dmSwitchHiKey) dmSetSwitchHi(null);
   panelItems.delete(key);
   if(panelActiveKey===key){
     // activate the last remaining item, or nothing
@@ -6514,19 +8195,8 @@ function panelRemove(key){
   }
   panelRenderTabs();
   if(panelActiveKey) panelRenderBody(panelActiveKey);
-  else document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>';
+  else { document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; panelBuildToc(); }
   panelUpdateLLM();
-}
-
-// A device-map tile with no DATA.tiles entry. Without this the pane keeps the
-// PREVIOUS tile's detail on screen, reading as if it belonged to the one just
-// clicked. Nets stay: they are a separate selection.
-function panelClearTiles(note){
-  panelItems.forEach((_,k)=>{ if(k.startsWith('tile:')) panelItems.delete(k); });
-  panelSync();
-  if(!panelItems.size && note)
-    document.getElementById('panel-body').innerHTML =
-      '<div class="placeholder">'+esc(note)+'</div>';
 }
 
 function panelSync(){
@@ -6534,7 +8204,7 @@ function panelSync(){
   if(!panelItems.has(panelActiveKey)) panelActiveKey = panelItems.size ? [...panelItems.keys()][0] : null;
   panelRenderTabs();
   if(panelActiveKey) panelRenderBody(panelActiveKey);
-  else document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>';
+  else { document.getElementById('panel-body').innerHTML='<div class="placeholder">Select a tile or net for details.</div>'; panelBuildToc(); }
   panelUpdateLLM();
 }
 
@@ -6624,7 +8294,7 @@ function srcBuildBody(item){
      + '</div><div class="srcwrap">' + m.html + '</div>';
 }
 function srcWireBody(item, body){
-  const panel = document.getElementById('panel');
+  const panel = document.getElementById('panel-body');
   let row = null;
   if (item.line){
     for (let n = item.line; n <= (item.endLine || item.line); n++){
@@ -6635,7 +8305,6 @@ function srcWireBody(item, body){
     }
   }
   // Not scrollIntoView (it walks ancestors and would move the outer flex column
-  // and the page), and not offsetTop either: #panel is position:static, so
   // offsetParent is <body> and offsetTop measures from the top of the document.
   // Rect deltas are correct whatever the offsetParent turns out to be.
   if (panel){
@@ -7327,8 +8996,8 @@ document.getElementById('conreload').onclick = () => {
 // root. Each user turn becomes a .llm-msg-you bubble; streamed reply tokens
 // accumulate into a .llm-msg-ai bubble via llmAppendToMsg.
 const LLM = { off:0, poll:null, busy:false, pendingId:null,
-  ctx:new Map(), ctxSent:new Map(), generation:null };
-const LLM_CTX_ORDER = ['session', 'run', 'search', 'selection'];
+  ctx:new Map(), ctxSent:new Map(), generation:null, pollErrors:0 };
+const LLM_CTX_ORDER = ['session', 'run', 'search', 'selection', 'scan'];
 let llmMessages = [];
 let llmMsgIdCtr = 0;
 function llmEscape(s){
@@ -7607,16 +9276,15 @@ function llmPollOnce(){
   if (LLM.busy) return;
   LLM.busy = true;
   api('/llm/poll?offset=' + LLM.off).then(r => {
+    LLM.pollErrors = 0;
     if (r.auth){ llmLock(); return; }
     if (r.error){ llmStopPoll(); llmShowThink(false); return; }
     if (llmAdoptGeneration(r)) return;
     if (r.stuck){
-      // Watchdog: the daemon received no output from claude for _LLM_STUCK_S seconds.
-      // The turn is declared over; show a recovery notice and a Reset button.
+      const s = r.stuck_s ? r.stuck_s + 's' : '2min';
       llmStopPoll();
       llmShowThink(false);
       if (LLM.pendingId){
-        const s = r.stuck_s ? r.stuck_s + 's' : '2min';
         llmAppendToMsg(LLM.pendingId,
           `\n[no response after ${s} — the turn may be stuck. Use **Reset chat** to start a fresh conversation.]`,
           true);
@@ -7632,8 +9300,10 @@ function llmPollOnce(){
     // tool calls and further text long after the opening tokens land.
     llmShowThink(!done);
     if (done){ llmStopPoll(); LLM.pendingId = null; }
-  }).catch(() => { llmStopPoll(); llmShowThink(false); })
-    .finally(() => { LLM.busy = false; });
+  }).catch(() => {
+    LLM.pollErrors += 1;
+    if (LLM.pollErrors > 4){ llmStopPoll(); llmShowThink(false); }
+  }).finally(() => { LLM.busy = false; });
 }
 // Echo the context that just went out, as read-only pills above the message.
 // Without this the blocks vanished from the transcript the moment they were
@@ -7861,6 +9531,7 @@ document.getElementById('gbtn').onclick = () => {
     '<h2>Global / kernel-group</h2>' +
     '<div class="kv">'+esc(gl.note)+'</div>' +
     '<pre class="code">'+hl(gl.code||'')+'</pre>';
+  panelBuildToc();
 };
 
 // ─── Live debug overlay (talks to schedule_debug_server on the same origin) ───
@@ -7874,18 +9545,138 @@ const LIVE = { enabled:false, connected:false, what:'dma', gridTimer:null,
                // page's: a reload or dropped tail must not convince the UI that
                // a live run is over.
                runOwned:false, daemonRun:null, rsBusy:false, rsTimer:null,
-               simOnly:false };
+               // Timeline auto-launch. tlDone dedups the final render across the
+               // TIMESYNC-idle timer, natural run-end and force-stop paths.
+               // tsSeen: the first [TIMESYNC] line has appeared this run.
+               // tsIdleTimer: the 5s "quiet" timer that fires the render once no
+               // new [TIMESYNC] line has arrived for a full 5 seconds.
+               tlDone:false, tsSeen:false, tsIdleTimer:null,
+               // profileReady is the single source of truth for the Profile tab:
+               // true once a timeline has rendered, false again only when a new
+               // Run starts. switchView re-asserts the tab from this flag so no
+               // view switch (e.g. Device Map) can leave the tab stuck disabled.
+               profileReady:false,
+               simOnly:false, jtagHost:'' };
+const HW_SERVER_CMD = 'exec hw_server -stcp:0.0.0.0:3121';
 const LSTATE = {
   running:['#4caf50','RUN'], stalled:['#ffca28','STALL'], error:['#ef5350','ERR'],
   completed:['#26a69a','done'], idle:['#546e7a','idle'],
-  unreachable:['#8d6e63','n/a'], unknown:['#546e7a','?']
+  unreachable:['#8d6e63','n/a'], unknown:['#546e7a','?'],
+  verified:['#2e7d32','sw ok'], mismatch:['#d84315','sw ≠']
 };
+let SWSCAN = null;
+let SWSCAN_RES = null;
+
+const STATIC_PATHS = DATA.comm_paths || [];
+let DYNAMIC = null;
+
+function setRoutingSource(which){
+  if (which === 'dynamic' && !(DYNAMIC && DYNAMIC.comm_paths)) {
+    syncRoutingSource(); return;
+  }
+  ROUTING_SRC = which;
+  DATA.comm_paths = which === 'dynamic' ? DYNAMIC.comm_paths : STATIC_PATHS;
+  recomputeFlowIds();
+  syncRoutingSource();
+  if (document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
+  if (panelActiveKey) panelRenderBody(panelActiveKey);
+  reapplySwitchScan();
+}
+
+function setRoutingDiff(on){
+  ROUTING_DIFF = !!on;
+  syncRoutingSource();
+  if (document.getElementById('devmap').classList.contains('show')) buildDeviceMap();
+  if (panelActiveKey) panelRenderBody(panelActiveKey);
+  reapplySwitchScan();
+}
+
+// No interpolation: the markup is fixed and every varying string is written as
+// a property below, so the reconstructor's error text never reaches an HTML
+// parser.
+const RSRC_HTML =
+    '<label class="rsrc-diff-wrap" title="annotate the selected map\'s stream-switch rows with what the other map does or does not have">'
+  + '<input type="checkbox" class="rsrc-diff" onchange="setRoutingDiff(this.checked)"> diff</label>'
+  + '<select class="scan-what rsrc-sel" title="which routing map every panel reads"'
+  + ' onchange="setRoutingSource(this.value)">'
+  + '<option value="static" title="the map the compiler emitted"></option>'
+  + '<option value="dynamic"></option>'
+  + '</select>'
+  + '<button class="rs-dl" title="save the reconstructed routing map as JSON"'
+  + ' onclick="downloadDynamic()">Save JSON</button>'
+  + '<span class="rsrc-err" hidden></span>';
+
+function syncRoutingSource(){
+  ['gridRsrc','dmRsrc'].forEach(id=>{
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.hidden = !DYNAMIC;
+    if (!DYNAMIC) return;
+    // applyGrid() calls this on every switch scan and `live` re-scans every 2s,
+    // so the nodes are built once: replacing the markup would slam an open
+    // dropdown shut under the cursor mid-selection.
+    if (!el.firstChild) el.innerHTML = RSRC_HTML;
+    const diff = el.querySelector('.rsrc-diff');
+    const sel = el.querySelector('.rsrc-sel');
+    const dl  = el.querySelector('.rs-dl');
+    const msg = el.querySelector('.rsrc-err');
+    const err = DYNAMIC.error || '';
+    sel.hidden = !!err; dl.hidden = !!err; msg.hidden = !err;
+    if (diff){ diff.checked = ROUTING_DIFF; diff.disabled = !!err; }
+    if (err){ msg.textContent = 'routing: reconstruct failed'; msg.title = err; return; }
+    const n = DYNAMIC.n_flows || 0;
+    sel.querySelector('option[value="static"]').textContent =
+      'static · ' + n + ' found';
+    const od = sel.querySelector('option[value="dynamic"]');
+    od.textContent = 'dynamic (' + n + ')';
+    od.title = n + ' flow' + (n===1?'':'s') + ' reconstructed from the live switch'
+             + ' registers — independent of the provenance map';
+    sel.value = ROUTING_SRC;
+    sel.dataset.src = ROUTING_SRC;
+    sel.title = ROUTING_DIFF
+      ? 'which routing map every panel reads — and the side diff annotates from'
+      : 'which routing map every panel reads';
+  });
+}
+
+function downloadDynamic(){
+  if (!(DYNAMIC && DYNAMIC.routing_groups)) return;
+  const blob = new Blob([JSON.stringify(DYNAMIC.routing_groups, null, 1)],
+                        {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'routingprovenancemap.dynamic.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function llmToken(){ return sessionStorage.getItem('LLM_AUTH') || ''; }
 function api(path, opts){
   opts = opts || {};
   const tok = llmToken();
   if (tok) opts.headers = Object.assign({}, opts.headers, {'X-LLM-Auth': tok});
   return fetch(path, opts).then(r => r.json());
+}
+// Render `timeline.py <applog>` to timeline.png on the server and show it in the
+// Profile tab. Trigger model: TIMESYNC-idle. The render only happens once real
+// [TIMESYNC] data has been seen this run (LIVE.tsSeen) — the primary caller is
+// the 5s "quiet" timer armed in pollLog when [TIMESYNC] lines stop arriving.
+// The run-end and force-stop callers are gated safety nets: on a run with no
+// TIMESYNC output they no-op (tsSeen stays false), which is what avoids the
+// `no [TIMESYNC] cps= record found` error. LIVE.tlDone dedups across all three
+// callers; both flags reset when the next run starts.
+function triggerTimeline(final){
+  if (!LIVE.tsSeen) return;      // no TIMESYNC data this run → nothing to render.
+  if (LIVE.tlDone) return;
+  LIVE.tlDone = true;
+  setStatus('timeline: rendering…');
+  api('/timeline', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body:'{}'})
+    .then(r => {
+      if (r && r.started){ showTimelineProfile(); setStatus('timeline: ready (Profile tab)'); }
+      else { setStatus('timeline: ' + ((r && r.error) || 'not generated')); }
+    })
+    .catch(() => {});
 }
 function setStatus(msg){ const e=document.getElementById('livestatus'); if(e) e.textContent=msg; }
 function setRunStatus(msg){ const e=document.getElementById('runstatus'); if(e) e.textContent=msg; }
@@ -7972,18 +9763,65 @@ function _updateIssueBar(res){
   applyIssues(issues);
 }
 
+function _swDisplayRes(res){
+  const cells = {};
+  Object.entries(res.cells || {}).forEach(([k, c]) => {
+    if (!c) return;
+    if (c.state === 'unreachable'){ cells[k] = c; return; }
+    if (ROUTING_DIFF){
+      const parts = k.split(',').map(Number);
+      const d = _routingSrcDiffTile(parts[0], parts[1]);
+      cells[k] = d ? Object.assign({}, c, d) : c;
+      return;
+    }
+    const plain = Object.assign({}, c);
+    delete plain.state;
+    cells[k] = plain;
+  });
+  return Object.assign({}, res, { cells });
+}
+function reapplySwitchScan(){
+  if (!SWSCAN_RES) return;
+  const again = Object.assign({}, SWSCAN_RES);
+  delete again.llm_summary;
+  applyGrid(again);
+}
+
 function applyGrid(res){
+  if (res.llm_summary){
+    llmPushCtx('[context] '+res.llm_summary, 'scan');
+  }
+  const isSwitch = res.what === 'switch' && !res.error;
+  if (isSwitch) SWSCAN_RES = res;
+  const disp = isSwitch ? _swDisplayRes(res) : res;
   if (res.error){ setStatus('live: '+res.error); }
+  else if (res.what === 'switch'){
+    SWSCAN = res.cells || {};
+    if (ROUTING_DIFF){
+      const n = Object.values(disp.cells || {})
+        .filter(c => c && c.state === 'mismatch').length;
+      setStatus(n
+        ? ('switch: '+(n===1?'1 tile differs':n+' tiles differ')
+           +' between static and dynamic')
+        : 'switch: static and dynamic agree on every tile');
+    } else {
+      const n = Object.keys(disp.cells || {}).length;
+      setStatus('switch: '+n+' tile'+(n===1?'':'s')+' read · showing '+ROUTING_SRC
+                +' routing — tick diff to compare the two maps');
+    }
+    if (res.dynamic){ DYNAMIC = res.dynamic; syncRoutingSource(); }
+    if (panelActiveKey) panelRenderBody(panelActiveKey);
+  }
   else setStatus('live '+LIVE.what+' @ '+new Date().toLocaleTimeString());
   // One fetch feeds both views; the device map paints from the same payload.
-  dmApplyStatus(res);
-  const cells = res.cells || {};
+  dmApplyStatus(disp);
+  const cells = disp.cells || {};
   Object.keys(liveBar).forEach(k => {
     const b = liveBar[k], c = cells[k];
     const cell = cellByLoc[k];
     // Only badge tiles with actionable states — idle/completed channels
     // finished cleanly and should not display a coloured bar.
-    if (!c || c.state === 'idle' || c.state === 'completed'){
+    if (!c || !c.state || c.state === 'idle' || c.state === 'completed'){
       b.className='livebar hide';
       // Still surface last-BD info on the tile hover for completed channels.
       if(c && c.channels && cell){
@@ -8008,6 +9846,19 @@ function applyGrid(res){
 // userInitiated: a click (mode pill, Scan button, live checkbox) rather than the
 // 2s timer. Only user scans queue a retry when the guard rejects them — letting
 // skipped auto-polls retry would busy-loop the board back-to-back with no gap.
+// Scan progress indicator, shared by both views.
+let SCAN_SPIN_T = null;
+function setScanBusy(on){
+  clearTimeout(SCAN_SPIN_T); SCAN_SPIN_T = null;
+  const els = ['gridSpin','dmSpin']
+    .map(id => document.getElementById(id)).filter(Boolean);
+  if (!on){ els.forEach(e => e.hidden = true); return; }
+  // Delayed reveal: a DMA poll usually lands well inside this, and a spinner
+  // that blinks every 2s reads as a fault rather than as progress. A switch
+  // scan (one board round-trip per tile) is always slower than the delay.
+  SCAN_SPIN_T = setTimeout(() => els.forEach(e => e.hidden = false), 250);
+}
+
 function scanOnce(userInitiated){
   // One-shot scan, always runs (user-triggered). Skips the runActive guard so
   // the user can read core/DMA state even while a run is parked on the board —
@@ -8019,6 +9870,7 @@ function scanOnce(userInitiated){
   if (LIVE.gridBusy){ if (userInitiated) LIVE.rescan = true; return; }
   LIVE.gridBusy = true;
   LIVE.rescan = false;
+  setScanBusy(true);
   // Pin the mode for this request. A scan can easily outlive the 2s poll, so by
   // the time it lands the user may have picked a different one.
   const what = LIVE.what;
@@ -8039,8 +9891,13 @@ function scanOnce(userInitiated){
       LIVE.gridBusy = false;
       // A swallowed click always retries. A mode changed mid-scan only retries
       // under live — with the poll off, picking a mode must not read the board.
-      if (LIVE.rescan || (LIVE.enabled && what !== LIVE.what)){
+      const chained = LIVE.rescan || (LIVE.enabled && what !== LIVE.what);
+      if (chained){
+        // Leave the spinner up across the handoff; hiding it here would blink
+        // it off and on for a scan that never actually stopped.
         LIVE.rescan = false; scanOnce(true);
+      } else {
+        setScanBusy(false);
       }
     });
 }
@@ -8073,6 +9930,12 @@ function setLive(on){
     showSimLiveUnavailable();
     on = false;
   }
+  // The switch is static configuration, not per-cycle state: polling it every
+  // 2s would spend a board round-trip per tile to re-read bits that only the
+  // host program changes. Scan it on demand instead.
+  if (on && LIVE.what === 'switch'){
+    on = false;
+  }
   LIVE.enabled = on;
   // Both views expose the same poll as a checkbox; keep them mirrored so the
   // one that did not initiate the change does not lie about the poll state.
@@ -8097,6 +9960,9 @@ function unlockConsoleForDebug(){
   const ci = document.getElementById('conin');
   if (cr) cr.disabled = false;
   if (ci){ ci.disabled = false; ci.classList.remove('disabled'); }
+  // The run has parked (compute done, applog flushed). Timeline rendering is no
+  // longer tied to this park event — it's driven by the TIMESYNC-idle timer in
+  // pollLog, so a run with no TIMESYNC output never renders.
   if (LIVE.runOwned && LIVE.daemonRun) renderRunBanner();
   else setRunStatus('run parked \u2014 aiegdb console unlocked for live debug '
                   + '(overlay stays off)');
@@ -8159,6 +10025,50 @@ function updateConnectionPresentation(){
 }
 // Show/hide the "start hw_server on the target board" hint (shown on failure).
 function setConnHint(show){ const e=document.getElementById('connhint'); if(e) e.classList.toggle('hide', !show); }
+
+function connectTcpHost(dev, host){
+  if (dev === 'pal') return LIVE.jtagHost || null;
+  return host || null;
+}
+function boardConnectGuideText(dev, host){
+  const tcp = connectTcpHost(dev, host);
+  const lines = [
+    '[board setup — run on the target in xsdb, then press Connect here]',
+    '',
+    'On the target board, in xsdb, start hw_server:',
+    '',
+    '    ' + HW_SERVER_CMD,
+    '',
+  ];
+  if (tcp){
+    lines.push('This UI will probe from here (same as Connect):');
+    lines.push('');
+    lines.push('    connect -url TCP:' + tcp + ':3121');
+    lines.push('');
+  } else if (dev !== 'pal'){
+    lines.push('Enter the board hostname above first.');
+    lines.push('');
+  }
+  lines.push('Then press Connect.');
+  return lines.join('\n');
+}
+function showBoardConnectGuide(dev, host){
+  if (LIVE.simOnly || !dev || dev === 'simulator' || LIVE.connected) return hideRunConsole();
+  if (LIVE.conTimer || LIVE.hwsrvTimer || SIM.timer) return;
+  const con = document.getElementById('console');
+  if (!con) return;
+  con.textContent = boardConnectGuideText(dev, host);
+  con.classList.remove('hide');
+}
+function hideRunConsole(){
+  if (LIVE.conTimer || LIVE.hwsrvTimer || SIM.timer) return;
+  const con = document.getElementById('console');
+  if (!con) return;
+  con.classList.add('hide');
+  if (!con.textContent.startsWith('[run ') && !con.textContent.startsWith('[adopted ')
+      && !con.textContent.startsWith('[auto-starting'))
+    con.textContent = '';
+}
 
 // ── run-state reconciliation (UI ⇄ daemon) ───────────────────────────────────
 function updateRunButtons(){
@@ -8264,12 +10174,15 @@ function syncRunState(){
 // arrive asynchronously and the selection is usually already made by then.
 function refreshDeviceStatus(){
   const dev = deviceSel ? deviceSel.value : '';
-  if (!dev){ if (testconn) testconn.disabled = true; setConnStatus('Not connected'); return; }
+  const host = boardHost ? boardHost.value.trim() : '';
+  if (!dev){ if (testconn) testconn.disabled = true; setConnStatus('Not connected'); hideRunConsole(); return; }
   if (dev !== 'simulator'){
     if (testconn) testconn.disabled = false;
     setConnStatus('click "Connect" to enable live features');
+    if (!LIVE.connected) showBoardConnectGuide(dev, host);
     return;
   }
+  hideRunConsole();
   const sr = simRow();
   if (sr && sr.available === false){
     // Offered, but nothing to run. Naming the missing artifact here is the
@@ -8330,6 +10243,7 @@ function applyConnected(r){
   if (liveToggle){ liveToggle.disabled = false;
     liveToggle.closest('label').classList.remove('disabled'); }
   updateLiveReadControls();
+  hideRunConsole();
   const box = document.getElementById('cmdconsole');
   if (box) box.classList.remove('hide');   // reveal the aiegdb console
   const rsp = document.getElementById('rhsplitter');
@@ -8366,43 +10280,6 @@ function markDisconnected(){
   if (liveToggle) liveToggle.disabled = true;
   hideConsole();
 }
-// Recovery: when the JTAG connect fails but the daemon is up, have the daemon
-// ssh to the board, start hw_server (ssh -> systest -> xsdb -> exec hw_server),
-// then re-probe once. The launch runs async on the daemon; we tail its per-step
-// progress into the left-bottom console (#console) via /hwsrv_log so the user
-// sees each step live. On success we're connected; otherwise show the hint.
-function autoLaunchHwServer(dev, host, why){
-  markDisconnected();
-  // Keep the selection so applyConnected (reached via pollHwSrv on success)
-  // switches the aiegdb console target to this same host.
-  LIVE.device = dev; LIVE.host = host;
-  setConnStatus('connect failed (' + why + ') \u2014 starting hw_server on board\u2026');
-  setConnHint(false);
-  // Reveal + reset the left-bottom console so the launch steps stream in.
-  const con = document.getElementById('console');
-  if (con){ con.classList.remove('hide'); con.textContent =
-    '[auto-starting hw_server on board \u2014 live progress below]\n'; }
-  LIVE.hwsrvOff = 0;
-  api('/launch_hwserver', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({device:dev, host:host})})
-    .then(r => {
-      if (r && r.started){
-        // Begin tailing the daemon's hw_server session log into #console.
-        if (LIVE.hwsrvTimer) clearInterval(LIVE.hwsrvTimer);
-        LIVE.hwsrvTimer = setInterval(pollHwSrv, 1000);
-        pollHwSrv();   // immediate first tail so steps show without a 1s delay
-      } else {
-        markDisconnected();
-        setConnStatus('auto-start failed: ' + ((r && r.detail) || 'unknown'));
-        setConnHint(true);   // fall back to the manual start-hw_server guidance
-      }
-    })
-    .catch(() => {
-      markDisconnected();
-      setConnStatus('daemon offline: cannot auto-start hw_server.');
-      setConnHint(true);
-    });
-}
 const LOG_FOLLOW_FRAC = 0.5, LOG_FOLLOW_MIN = 160;
 function logFollowing(el){
   if (!el) return true;
@@ -8410,46 +10287,6 @@ function logFollowing(el){
   return (el.scrollHeight - el.scrollTop - el.clientHeight) <= slack;
 }
 function logFollow(el, was){ if (el && was) el.scrollTop = el.scrollHeight; }
-// Tail the daemon's hw_server launch session into #console and, once the
-// background worker is done, apply the connect result (single-retry outcome).
-function pollHwSrv(){
-  if (LIVE.hwsrvBusy) return;           // guard against overlapping tails
-  LIVE.hwsrvBusy = true;
-  api('/hwsrv_log?offset='+LIVE.hwsrvOff).then(r => {
-    const con = document.getElementById('console');
-    if (con){
-      const follow = logFollowing(con);
-      if (r.data){ con.textContent += r.data; }
-      logFollow(con, follow);
-    }
-    if (r.next != null) LIVE.hwsrvOff = r.next;
-    setConnStatus('hw_server: ' + (r.status || 'starting') + '\u2026');
-    if (r.done){
-      if (LIVE.hwsrvTimer){ clearInterval(LIVE.hwsrvTimer); LIVE.hwsrvTimer=null; }
-      if (r.ok){ applyConnected(r); }    // connected on the single retry
-      else {
-        LIVE.connected = false;
-        updateConnectionPresentation();
-        updateRunButtons();
-        if (liveToggle) liveToggle.disabled = true;
-        if (con){
-          con.textContent += '\n[auto-start failed \u2014 connection still down: '
-            + ((r && r.detail) || 'unknown') + ']\n'
-            + 'Connection failed. On the target hw board, start hw_server via xsdb:\n'
-            + '    exec hw_server -stcp:0.0.0.0:3121\n';
-          con.scrollTop = con.scrollHeight;
-        }
-        setConnStatus('connection failed \u2014 run "exec hw_server -stcp:0.0.0.0:3121" on the target board');
-        setConnHint(true);   // also show the persistent manual-start hint banner
-      }
-    }
-  }).catch(() => {
-    if (LIVE.hwsrvTimer){ clearInterval(LIVE.hwsrvTimer); LIVE.hwsrvTimer=null; }
-    markDisconnected();
-    setConnStatus('daemon offline: cannot auto-start hw_server.');
-    setConnHint(true);
-  }).finally(() => { LIVE.hwsrvBusy = false; });
-}
 // Test the daemon + JTAG target; on success unlock the overlay + reveal console.
 function testConnect(){
   const dev = deviceSel ? deviceSel.value : '';
@@ -8516,7 +10353,7 @@ function testConnect(){
   const host = boardHost ? boardHost.value.trim() : '';
   if (dev !== 'pal' && !host){ setConnStatus('enter the ' + dev + ' board hostname'); return; }
   // Remember the selection so applyConnected can tell the daemon which target
-  // to switch the aiegdb console to (mirrors autoLaunchHwServer's closure).
+  // to switch the aiegdb console to.
   LIVE.device = dev; LIVE.host = host;
   setConnStatus('testing\u2026');
   const qs = '?device='+encodeURIComponent(dev)+'&host='+encodeURIComponent(host);
@@ -8530,9 +10367,18 @@ function testConnect(){
       setConnStatus('a board run is still in progress; press "Stop run" then Connect again');
       setConnHint(false);
     } else {
-      // Daemon answered but the JTAG connect failed → try to auto-start
-      // hw_server on the board and retry once.
-      autoLaunchHwServer(dev, host, (r && r.detail) || 'no response');
+      // Daemon answered but the JTAG connect failed. Auto-starting hw_server
+      // on the board over ssh proved unstable (intermittent failures), so we
+      // no longer attempt it; guide the user to start it manually instead.
+      markDisconnected();
+      const con = document.getElementById('console');
+      if (con){ con.classList.remove('hide'); con.textContent =
+        '[connection failed: ' + ((r && r.detail) || 'no response') + ']\n'
+        + 'Connection failed. On the target hw board, start hw_server via xsdb:\n'
+        + '    exec hw_server -stcp:0.0.0.0:3121\n'; }
+      setConnStatus('connection failed \u2014 start hw_server on the target board: '
+        + 'exec hw_server -stcp:0.0.0.0:3121');
+      setConnHint(true);   // show the persistent manual-start guidance banner
     }
   }).catch(() => {
     // Daemon itself is unreachable (static mode) → can't ssh from a dead
@@ -8580,46 +10426,59 @@ document.getElementById('liveToggle').onchange = e => setLive(e.target.checked);
 function setOverlayWhat(w){
   const changed = LIVE.what !== w;
   LIVE.what = w;
-  document.querySelectorAll('#overlaytabs .ltab, #dmScanWhat .ltab').forEach(
-    x => x.classList.toggle('act', x.dataset.w === w));
+  // Both views expose the same selection; keep them mirrored so the one that
+  // did not initiate the change does not name a mode it is not showing.
+  ['overlayWhat','dmScanWhat'].forEach(id => {
+    const s = document.getElementById(id);
+    if (s && s.value !== w) s.value = w;
+  });
   if (!changed) return;
   // Drop the previous mode's colors immediately: leaving DMA tints on screen
   // under a "Cores" selection reads as live data for a mode never read.
   dmClearStatus();
-  const msg = LIVE.enabled ? 'scanning '+w+'…' : 'click "Scan" to read '+w;
-  dmSetScanStatus(msg);
-  setStatus(msg);
+  // Same reasoning for the per-row switch verdicts: they are only true for the
+  // scan that produced them.
+  SWSCAN = null;
+  SWSCAN_RES = null;
+  if (panelActiveKey) panelRenderBody(panelActiveKey);
+  // Static config: never let the 2s poll carry over into this mode.
+  if (w === 'switch' && LIVE.enabled) setLive(false);
+  if (LIVE.enabled){
+    const msg = 'scanning '+w+'…';
+    dmSetScanStatus(msg);
+    setStatus(msg);
+  } else {
+    dmSetScanStatus('');
+    setStatus('');
+  }
 }
 // Picking a mode is a SELECTION, not an action. It reads the board only while
 // the live poll is on; otherwise "Scan" is the trigger.
 function pickOverlayWhat(w, setMsg){
   setOverlayWhat(w);
-  if (!LIVE.connected){
-    setMsg('not connected; use Connect in the debug panel below', true);
-    return;
-  }
+  if (!LIVE.connected) return;
   if (LIVE.enabled) scanOnce(true);
 }
-document.querySelectorAll('#overlaytabs .ltab').forEach(tab => tab.onclick = () =>
-  pickOverlayWhat(tab.dataset.w, setStatus));
+(function(){
+  const s = document.getElementById('overlayWhat');
+  if (s) s.onchange = () => pickOverlayWhat(s.value, setStatus);
+})();
 
 // ── Device-map scan controls ──────────────────────────────────
 // Deliberately routed through the same scanOnce()/setLive() pair as the grid
 // overlay rather than a parallel fetch path: LIVE.gridBusy is a single-flight
 // guard and LIVE.gridTimer a single handle, so a second poller here would
 // fight the first for the one aiedbg subprocess the daemon runs per scan.
-document.querySelectorAll('#dmScanWhat .ltab').forEach(tab => tab.onclick = () =>
-  pickOverlayWhat(tab.dataset.w, dmSetScanStatus));
+(function(){
+  const s = document.getElementById('dmScanWhat');
+  if (s) s.onchange = () => pickOverlayWhat(s.value, dmSetScanStatus);
+})();
 function runScanNow(setMsg){
   if (deviceSel && deviceSel.value === 'simulator' && !simHasLiveReads()){
-    setMsg(simLiveUnavailableText(), true);
     updateLiveReadControls();
     return;
   }
-  if (!LIVE.connected){
-    setMsg('not connected; use Connect in the debug panel below', true);
-    return;
-  }
+  if (!LIVE.connected) return;
   setMsg('scanning '+LIVE.what+'…');
   scanOnce(true);
 }
@@ -8630,25 +10489,60 @@ function runScanNow(setMsg){
   if (gbtn) gbtn.onclick = () => runScanNow(setStatus);
   const clr = document.getElementById('dmClearBtn');
   if (clr) clr.onclick = dmClearAll;
+  const lcp = document.getElementById('dmLoadCtrlPlan');
+  if (lcp) lcp.onclick = loadCtrlPlan;
+  const cpTog = document.getElementById('dmCtrlPlanToggle');
+  if (cpTog) cpTog.onchange = () => buildDeviceMap();
   const live = document.getElementById('dmLiveToggle');
   if (live) live.onchange = e => {
     if (e.target.checked && !LIVE.connected){
       e.target.checked = false;
-      dmSetScanStatus('not connected; use Connect in the debug panel below', true);
       return;
     }
     setLive(e.target.checked);
   };
+  const swToggle = document.getElementById('dmSwToggle');
+  if (swToggle) swToggle.onchange = e => {
+    dmShowSW = e.target.checked;
+    buildDeviceMap();
+  };
 })();
 
+// Keep the console DOM bounded so a long AIE trace run (multi-MB of
+// STREAM_STALL/DMA_FINISH lines) doesn't jank the tab with an ever-growing
+// textContent. Trim from the front, keeping the most recent MAX lines.
+function capConsole(con){
+  const MAX = 5000;
+  const txt = con.textContent;
+  if (txt.length < 400000) return;   // cheap: only split when it's large enough
+  const nl = txt.split('\n');
+  if (nl.length > MAX) con.textContent = nl.slice(nl.length - MAX).join('\n');
+}
+
 function pollLog(){
-  // Guard against overlapping tails so a slow response can't pile up.
+  // Guard against overlapping tails so a slow response can't pile up. A stuck
+  // fetch can no longer wedge the tail forever: an AbortController aborts it
+  // after a timeout, so `.finally()` always runs and clears logBusy — the next
+  // 1s tick then retries instead of early-returning forever.
   if (LIVE.logBusy) return;
   LIVE.logBusy = true;
-  api('/applog?offset='+LIVE.logoff).then(r => {
+  const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const abTimer = ctrl ? setTimeout(() => ctrl.abort(), 8000) : null;
+  api('/applog?offset='+LIVE.logoff, ctrl ? {signal: ctrl.signal} : undefined).then(r => {
     const con = document.getElementById('console');
     const follow = logFollowing(con);
-    if (r.data){ con.textContent += r.data; }
+    if (r.data){ con.textContent += r.data; capConsole(con); }
+    // TIMESYNC-idle trigger: the first [TIMESYNC] line arms a 5s "quiet" window;
+    // each new TIMESYNC-bearing chunk re-arms it. When a full 5 seconds pass with
+    // no further [TIMESYNC] output the block is complete → render the timeline.
+    if (r.data && /\[TIMESYNC\]/.test(r.data)){
+      LIVE.tsSeen = true;
+      if (LIVE.tsIdleTimer) clearTimeout(LIVE.tsIdleTimer);
+      LIVE.tsIdleTimer = setTimeout(() => {
+        LIVE.tsIdleTimer = null;
+        triggerTimeline(true);   // gated by tsSeen; dedups via tlDone
+      }, 5000);
+    }
     if (r.next != null) LIVE.logoff = r.next;
     logFollow(con, follow);
     if (LIVE.runOwned && LIVE.daemonRun){
@@ -8663,28 +10557,45 @@ function pollLog(){
     // running/parked/hung). Only typed commands hit JTAG; the live overlay
     // grid-poll stays OFF so we don't compete with the run's own reads.
     if (r.running === true && r.debuggable) unlockConsoleForDebug();
+    // Timeline rendering is driven by the TIMESYNC-idle timer above, not by the
+    // derived pass/fail status — a run with no TIMESYNC output never renders.
     // Stop only when the subprocess has actually exited — NOT on a derived
     // pass/fail. apppaltest keeps writing (summary/cleanup/reboot) long after
     // the teardown marker first appears mid-run.
     if (r.running === false){
       if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer=null; }
+      // Drop any pending idle timer so it can't fire into the next run.
+      if (LIVE.tsIdleTimer){ clearTimeout(LIVE.tsIdleTimer); LIVE.tsIdleTimer=null; }
       // Run ended (force-stop OR natural completion) → re-enable aiedbg features.
       LIVE.runOwned = false;
       setDebugEnabled(true);
       setRunStatus('');
+      triggerTimeline(true);   // safety net; gated by tsSeen, dedups via tlDone.
     }
   }).catch(() => {
-    // Daemon went offline mid-run. The run process is no longer observable, so
-    // unblock all aiedbg features — JTAG is not held by anything we can see.
-    if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
-    setDebugEnabled(true);
-  }).finally(() => { LIVE.logBusy = false; });
+    // Transient tail failure: a slow/interrupted/aborted poll or a brief daemon
+    // hiccup over a remote link. While the run is still ours, DO NOT tear down
+    // the tail — one bad poll must not permanently freeze the console. Note it
+    // and let the next 1s tick retry; the tail is only stopped on a confirmed
+    // `running === false` response in the then-branch above.
+    if (LIVE.runOwned){
+      setRunStatus('run: tail retrying…');
+    } else {
+      // Not a live run we own (adopted run already ended, or never running) →
+      // the daemon is gone and nothing holds JTAG, so unblock aiedbg features.
+      if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
+      setDebugEnabled(true);
+    }
+  }).finally(() => { if (abTimer) clearTimeout(abTimer); LIVE.logBusy = false; });
 }
 document.getElementById('runbtn').onclick = () => {
   const dev = deviceSel ? deviceSel.value : '';
   if (!dev){ setStatus('select a device first'); return; }
   const con = document.getElementById('console');
   con.classList.remove('hide'); con.textContent = '';
+  // New run → drop the previous run's timeline and lock the Profile tab; it
+  // re-populates when this run ends and the server re-renders timeline.png.
+  clearTimelineProfile();
   // Simulator path: route to /sim/run and tail /sim/log.
   if (dev === 'simulator'){
     SIM.logoff = 0; SIM.applogoff = 0; SIM.applogSeen = false;
@@ -8720,6 +10631,9 @@ document.getElementById('runbtn').onclick = () => {
   const host = boardHost ? boardHost.value.trim() : '';
   if (dev !== 'pal' && !host){ setStatus('enter the ' + dev + ' board hostname'); return; }
   LIVE.logoff = 0;
+  // New run → reset the TIMESYNC-idle trigger state and drop any stale timer.
+  LIVE.tlDone = false; LIVE.tsSeen = false;
+  if (LIVE.tsIdleTimer){ clearTimeout(LIVE.tsIdleTimer); LIVE.tsIdleTimer = null; }
   // Stop aiedbg polling/console BEFORE the download starts so its JTAG reads
   // don't collide with device program/reset/dow -force. Re-enabled in pollLog
   // when the run ends (force-stop or natural completion).
@@ -8767,11 +10681,18 @@ document.getElementById('stopbtn').onclick = () => {
       // Re-enable debug features immediately — don't wait for the next pollLog
       // tick, which may never fire if the run was in a bad state.
       if (LIVE.conTimer){ clearInterval(LIVE.conTimer); LIVE.conTimer = null; }
+      // Drop any pending idle timer so it can't fire into the next run.
+      if (LIVE.tsIdleTimer){ clearTimeout(LIVE.tsIdleTimer); LIVE.tsIdleTimer = null; }
       // "no run in progress" is not a failure: the board is free, which is what
       // the click asked for. Clearing on that answer is what unwedges the UI.
       LIVE.runOwned = false;
       setDebugEnabled(true);
       setRunStatus('');
+      // Every Stop click should re-render and reload timeline.png. Clearing
+      // tlDone defeats the dedup so triggerTimeline regenerates from the final
+      // applog and showTimelineProfile re-fetches the image (cache-busted ts).
+      LIVE.tlDone = false;
+      triggerTimeline(true);   // gated by tsSeen; forced fresh render on Stop.
       if (r.run) applyRunState(r.run);
       updateRunButtons();
       if (r.error){ setStatus('stop: ' + r.error); }
@@ -8811,9 +10732,7 @@ function simLiveUnavailableText(){
   return 'live scans unavailable: aiesim exposes no debug socket';
 }
 function showSimLiveUnavailable(){
-  const msg = simLiveUnavailableText();
-  setStatus(msg);
-  dmSetScanStatus(msg, true);
+  updateLiveReadControls();
 }
 function updateLiveReadControls(){
   const blocked = !!(deviceSel && deviceSel.value === 'simulator'
@@ -8836,7 +10755,6 @@ function updateLiveReadControls(){
   });
   const name = document.querySelector('#conhdr .chname');
   if (name) name.textContent = blocked ? 'aiegdb (navigation only)' : 'aiegdb';
-  if (blocked) showSimLiveUnavailable();
 }
 function pollSimLog(){
   if (SIM.logBusy) return;
@@ -8999,6 +10917,7 @@ function applyBoardDefaults(){
       if (has) deviceSel.value = c.device;
     }
     if (c.board_host && boardHost) boardHost.value = c.board_host;
+    if (c.jtag_host) LIVE.jtagHost = c.jtag_host;
     if (c.source_viewer === false) SRC.on = false;
     updateDeviceUI();   // reveal/enable controls for the preselected device
     if (LIVE.simOnly) testConnect();
@@ -9450,6 +11369,12 @@ if (location.protocol === 'http:' || location.protocol === 'https:') probeLLM();
   window._ctxInsertFrag = ctxInsertFrag;
 
   function hidePopup(){ popup.style.display = 'none'; }
+
+  document.addEventListener('selectionchange', () => {
+    if (popup.style.display === 'none') return;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.toString().trim()) hidePopup();
+  });
 
   document.addEventListener('mouseup', e => {
     if (e.target === popup) return;

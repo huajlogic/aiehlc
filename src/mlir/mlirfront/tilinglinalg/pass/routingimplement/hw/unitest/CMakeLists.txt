@@ -4,6 +4,7 @@
 # ******************************************************************************/
 
 cmake_minimum_required(VERSION 3.20)
+project(aie_hwresource_ut LANGUAGES C CXX)
 
 # ------------------------------------------------------------------
 # 1.  Test sources in this folder
@@ -17,7 +18,8 @@ file(GLOB TEST_SRC CONFIGURE_DEPENDS
 add_executable(hwresource_ut 
             ${TEST_SRC}
             ../hwresource.cpp
-            ../ResourceManager.cpp)
+            ../ResourceManager.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../runtime/aie_runtime_resource.c)
 
 # Link against the production library defined one level up
 #target_link_libraries(hwresource_ut
@@ -25,11 +27,10 @@ add_executable(hwresource_ut
 #    "${CMAKE_CURRENT_SOURCE_DIR}/../build/libhwresource.a"
 #)
 
-project(aie_hwresource_ut LANGUAGES CXX)
-
 target_include_directories(hwresource_ut PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(hwresource_ut PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../)
 target_include_directories(hwresource_ut PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../include/)
+target_include_directories(hwresource_ut PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../runtime/)
 
 message(STATUS "Using ${CMAKE_CURRENT_SOURCE_DIR}/../")
 

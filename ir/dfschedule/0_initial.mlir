@@ -1,12 +1,12 @@
-module attributes {routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}} {
-  func.func @main(%arg0: memref<25088xi8>, %arg1: memref<2360332xi8>, %arg2: memref<25088xi8>) {
-    %0 = routing.routingcreatehwmesh row = 2, col = 2 -> i32
-    %1 = bufferization.to_tensor %arg0 : memref<25088xi8>
-    %2 = routing.routingcreatescheduletensor %1 : tensor<25088xi8> shape = [25088], dim = 1 -> tensor<25088xi8>
-    %3 = bufferization.to_tensor %arg1 : memref<2360332xi8>
-    %4 = routing.routingcreatescheduletensor %3 : tensor<2360332xi8> shape = [2360332], dim = 1 -> tensor<2360332xi8>
-    %5 = bufferization.to_tensor %arg2 : memref<25088xi8>
-    %6 = routing.routingcreatescheduletensor %5 : tensor<25088xi8> shape = [25088], dim = 1 -> tensor<25088xi8>
+module attributes {routing.control_plan_group_reg_write = 0 : i64, routing.control_plan_op_control_packet = 0 : i64, routing.fullconnect_auto = 1 : i64, routing.kernel_config_offload = 1 : i64, routing.pp_depth_map = {tensor_0 = 2 : i32, tensor_1 = 2 : i32, tensor_2 = 2 : i32}} {
+  func.func @main(%arg0: memref<256x256xi8>, %arg1: memref<256x256xi8>, %arg2: memref<256x256xi8>) {
+    %0 = routing.routingcreatehwmesh row = 4, col = 4 partition = 0, 3, 0, 6 -> i32
+    %1 = bufferization.to_tensor %arg0 : memref<256x256xi8>
+    %2 = routing.routingcreatescheduletensor %1 : tensor<256x256xi8> shape = [256, 256], dim = 2 -> tensor<256x256xi8>
+    %3 = bufferization.to_tensor %arg1 : memref<256x256xi8>
+    %4 = routing.routingcreatescheduletensor %3 : tensor<256x256xi8> shape = [256, 256], dim = 2 -> tensor<256x256xi8>
+    %5 = bufferization.to_tensor %arg2 : memref<256x256xi8>
+    %6 = routing.routingcreatescheduletensor %5 : tensor<256x256xi8> shape = [256, 256], dim = 2 -> tensor<256x256xi8>
     scf.execute_region {
       %7 = routing.partitionmesh mesh = %0, splitnum = 2, splitaxis = "col" : i32 -> i32
       %8 = routing.partitiontensor %4 : tensor<2360332xi8> {

@@ -76,7 +76,8 @@ _DEFAULT_WORKDIR = "aout/worklocal"
 # default for `claude -p`.
 _LLM_PLUGIN_DIR = os.path.join(_THIS_DIR, "dbg_llm_skills")
 _LLM_SKILLS_DIR = os.path.join(_LLM_PLUGIN_DIR, "skills")
-_LLM_STUCK_S = 120   # seconds without output from claude before declaring a turn stuck
+_LLM_STUCK_S = 120
+_LLM_STUCK_HARD_S = 600
 
 
 import struct as _struct
@@ -1262,8 +1263,12 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 import aiediag  # noqa: E402
 import aiegdb  # noqa: E402
+import switch_scan  # noqa: E402
+import switch_reconstruct  # noqa: E402
+import live_scan_summary  # noqa: E402
 import schedule_view  # noqa: E402  (render_html for server-side app injection)
 import work2provenance  # noqa: E402  (auto-generate worklocal/ from Work/)
+import controlpan_pmap  # noqa: E402  (parse CONTROLPAN-PMAP provenance lines)
 
 # pexpect drives the interactive ssh -> systest -> xsdb -> hw_server recovery
 # session (see DebugState.start_hwserver_async). Optional: without it the auto-start
@@ -1272,6 +1277,11 @@ try:
     import pexpect  # noqa: E402
 except ImportError:
     pexpect = None
+
+_SSH_PEXPECT_DIR = os.path.join(_REPO_ROOT, "script", "test")
+if _SSH_PEXPECT_DIR not in sys.path:
+    sys.path.insert(0, _SSH_PEXPECT_DIR)
+from ssh_pexpect import expect_shell_after_ssh, ssh_command  # noqa: E402
 
 # Vitis settings + xsdb fallback for the hw_server-launch recovery path, kept in
 # sync with script/test/apppaltest.py and script/test/connecttest.py.
@@ -1552,14 +1562,28 @@ class DebugState:
         self.applog = os.path.abspath(applog)
         self.sim_only = bool(sim_only)
 
-        # Cached schedule tiles from schedule_view.json.
+        # Cached slices of schedule_view.json.
         self._tiles = None
+        self._comm_paths = None
+        self._grid_info = None
+        self._last_scan = None
+        self._last_dynamic_routing = None
+        self._scan_lock = threading.Lock()
 
         # Live run bookkeeping.
         self._lock = threading.Lock()
         self._run_proc = None         # subprocess.Popen or None
         self._run_fh = None           # open applog file handle (subprocess stdout)
         self._run_id = 0
+
+        # applog tail bookkeeping. Deriving the run status no longer decodes the
+        # whole file each poll; instead we remember which status markers have
+        # been seen so far in this tail and update that set from each new chunk.
+        # `_applog_scan_tail` carries the last few hundred bytes so a marker
+        # split across a chunk boundary is still caught. Both reset when the
+        # client restarts the tail from offset 0 (a new run).
+        self._applog_seen = set()
+        self._applog_scan_tail = ""
 
         # ---- session provenance ------------------------------------------
         # self.target is populated at startup from $AIEDBG_TARGET (envlocal.sh),
@@ -1624,10 +1648,6 @@ class DebugState:
         self._llm_first_turn = True
         self._llm_generation = 0
         self._llm_reset_reason = ""
-        # Watchdog: timestamp of the last byte received from claude stdout.
-        # None when no turn is active.  Set on every _llm_append/_llm_handle_event
-        # call; if _llm_active is True and now - _llm_last_output > _LLM_STUCK_S
-        # the turn is declared stuck and the client is told to show a recovery UI.
         self._llm_last_output = None   # float (time.monotonic) or None
 
         # Path to the auto-generated MCP config handed to the claude subprocess
@@ -1726,6 +1746,8 @@ class DebugState:
         self.app = app
         self.workdir = app.path
         self._tiles = None
+        self._comm_paths = None
+        self._grid_info = None
         self._llm_log_dir = app.path
         self.elf = _resolve_default_elf(app.path)
         self._load_app_profile(app.path)
@@ -1782,6 +1804,19 @@ class DebugState:
         with self._uistate_lock:
             return dict(self._uistate)
 
+    def record_live_scan(self, what, res, device="", host=""):
+        """Remember the latest /grid result for the LLM tab and debugui MCP."""
+        summary = live_scan_summary.summarize_live_scan(what, res or {})
+        summary["device"] = (device or "").strip()
+        summary["host"] = (host or "").strip()
+        with self._scan_lock:
+            self._last_scan = summary
+        self._write_backend_status()
+
+    def get_live_scan(self):
+        with self._scan_lock:
+            return dict(self._last_scan) if self._last_scan else None
+
     def sim_running(self):
         with self._sim_lock:
             return bool(self._sim_proc and self._sim_proc.poll() is None)
@@ -1825,10 +1860,27 @@ class DebugState:
     def tiles(self):
         """Return the tile list from schedule_view.json (cached)."""
         if self._tiles is None:
-            with open(self.json_path()) as f:
-                view = json.load(f)
-            self._tiles = view.get("tiles", [])
+            self._load_view_parts()
         return self._tiles
+
+    def comm_paths(self):
+        """Return the comm_paths list from schedule_view.json (cached)."""
+        if self._comm_paths is None:
+            self._load_view_parts()
+        return self._comm_paths
+
+    def grid_info(self):
+        """Return the grid geometry block from schedule_view.json (cached)."""
+        if self._grid_info is None:
+            self._load_view_parts()
+        return self._grid_info
+
+    def _load_view_parts(self):
+        with open(self.json_path()) as f:
+            view = json.load(f)
+        self._tiles = view.get("tiles", [])
+        self._comm_paths = view.get("comm_paths", [])
+        self._grid_info = view.get("grid", {})
 
     # ---- session provenance ----------------------------------------------
     def mark_hw_session(self, mode, detail="", target=None):
@@ -2068,8 +2120,17 @@ class DebugState:
             # -u: unbuffered stdout for realtime tail; -y: auto-confirm ELF pick.
             cmd = [sys.executable, "-u", script, "-y", "-nonreboot"]
             if not cfg_dev:
-                if self.elf and not os.path.isfile(self.elf):
-                    return {"error": f"ELF not found: {self.elf}"}
+                # The ELF is resolved once at app-select time, so a later
+                # clean/rebuild (build/host removed, aout/main.elf produced)
+                # leaves a stale path. Re-resolve before giving up so the
+                # search order (build/host -> parent *.elf -> aout/main.elf)
+                # picks whatever exists now instead of failing the run.
+                if not self.elf or not os.path.isfile(self.elf):
+                    fallback = _resolve_default_elf(self.workdir)
+                    if fallback:
+                        self.elf = fallback
+                    elif self.elf:
+                        return {"error": f"ELF not found: {self.elf}"}
                 if self.elf:
                     cmd.append(self.elf)
             try:
@@ -2156,6 +2217,37 @@ class DebugState:
             pass
         return {"stopped": True, "run_id": run_id, "pid": pid,
                 "abandoned": abandoned, "running": False}
+
+    def timeline_png_path(self):
+        """Where `timeline.py` writes the rendered PNG — next to the applog so it
+        travels with the run artifacts and is served by GET /timeline.png."""
+        out_dir = os.path.dirname(self.applog) or "."
+        return os.path.join(out_dir, "timeline.png")
+
+    def launch_timeline(self):
+        """Render `timeline.py <applog>` to a PNG on disk (no interactive window)
+        so the browser can show it in the Profile tab via GET /timeline.png.
+
+        Runs synchronously and waits for the render so the caller can report
+        whether the PNG is ready. No-op when no applog exists yet."""
+        if not os.path.isfile(self.applog):
+            return {"started": False, "applog": self.applog,
+                    "error": "no applog on disk yet"}
+        script = os.path.join(_THIS_DIR, "timeline.py")
+        out_dir = os.path.dirname(self.applog) or "."
+        png_path = self.timeline_png_path()
+        try:
+            proc = subprocess.run(
+                [sys.executable, script, self.applog,
+                 "--out-dir", out_dir, "--png", png_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            return {"started": False, "applog": self.applog, "error": str(e)}
+        if proc.returncode != 0 or not os.path.isfile(png_path):
+            detail = (proc.stdout or b"").decode("utf-8", "replace").strip()
+            return {"started": False, "applog": self.applog,
+                    "error": detail[-400:] or "timeline render failed"}
+        return {"started": True, "applog": self.applog, "png": png_path}
 
     def sim_in_progress(self):
         with self._sim_lock:
@@ -2426,18 +2518,20 @@ class DebugState:
             board = None
         else:
             user = os.environ.get("USERNAME") or getpass.getuser()
-            palip = os.environ.get("PALIP")
-            if not palip:
-                raise RuntimeError("PALIP not set in daemon environment")
+            # Same fixed fallback the Connect probe uses (_pal_ip), so the
+            # "start hw_server" button and Connect always agree on which board
+            # they mean. Previously this hard-failed with "PALIP not set" while
+            # Connect silently probed a placeholder address.
+            palip = _pal_ip()
             ssh_target = f"{user}@{palip}"
             systest = "/bin/systest"
             board = os.environ.get("BOARDNAME", "palmyra")
 
         self._hwsrv_log(f"[hwserver] ssh -X {ssh_target} ...\n")
-        child = pexpect.spawn(f"ssh -X {ssh_target}", encoding="utf-8",
+        child = pexpect.spawn(ssh_command(ssh_target), encoding="utf-8",
                               timeout=60)
         child.logfile_read = logsink            # stream the raw session output
-        child.expect([r'\$\s*$', r'#\s*$', r'>\s*$'], timeout=60)  # shell prompt
+        expect_shell_after_ssh(child, timeout=60)
         self._hwsrv_log(f"\n[hwserver] launch {systest} ...\n")
         child.sendline(systest)
         child.expect(r'Systest[#>]', timeout=60)
@@ -2555,16 +2649,73 @@ class DebugState:
             return {"data": "", "next": 0, "status": "idle", "running": False}
         with self._lock:
             running = self._run_proc is not None and self._run_proc.poll() is None
+        # A fresh tail (client reset to offset 0 for a new run) invalidates the
+        # cached marker state carried over from the previous run's file.
+        if offset <= 0:
+            offset = 0
+            self._applog_seen = set()
+            self._applog_scan_tail = ""
+        size = os.path.getsize(self.applog)
+        # Read ONLY the new bytes, not the whole file, so poll cost stays flat as
+        # the AIE event trace grows to many MB.
         with open(self.applog, "rb") as f:
-            full = f.read()
-        chunk = full[offset:]
-        data = chunk.decode("utf-8", errors="replace")
+            f.seek(offset)
+            chunk = f.read()
         nxt = offset + len(chunk)
+        truncated = False
+        # Safety cap: if the client fell far behind (multi-MB backlog), ship only
+        # the last CAP bytes + a truncated flag instead of tens of MB in one hop.
+        if len(chunk) > self._APPLOG_TAIL_CAP:
+            chunk = chunk[-self._APPLOG_TAIL_CAP:]
+            truncated = True
+        data = chunk.decode("utf-8", errors="replace")
+        # Update the seen-marker set from this chunk only (plus a small carry so a
+        # marker split across the previous boundary is still caught). No full-file
+        # decode.
+        scan = self._applog_scan_tail + data
+        for m in self._STATUS_MARKERS:
+            if m not in self._applog_seen and m in scan:
+                self._applog_seen.add(m)
+        self._applog_scan_tail = scan[-256:]
         last_ts = os.path.getmtime(self.applog)
-        full_text = full.decode("utf-8", errors="replace")
-        status = self._derive_status(full_text, running, last_ts)
+        status = self._derive_status_markers(self._applog_seen, running, last_ts,
+                                             size > 0)
         return {"data": data, "next": nxt, "status": status, "running": running,
-                "debuggable": self._is_debuggable(full_text, status)}
+                "truncated": truncated,
+                "debuggable": self._is_debuggable_markers(self._applog_seen,
+                                                          status)}
+
+    # Cap on bytes shipped in a single /applog poll. Beyond this the client has
+    # fallen too far behind to catch up in one hop, so we send the last CAP bytes
+    # and flag the gap rather than blocking the link on a huge payload.
+    _APPLOG_TAIL_CAP = 2 * 1024 * 1024
+
+    # Pass/fail markers plus the debuggable markers, scanned out of each tail
+    # chunk so status derivation never re-reads the whole file.
+    _STATUS_MARKERS = ("device_teardown done", "Not tearing down partition",
+                       "AIE ERROR", "ELF download complete", "Execution started",
+                       "board stays powered on for debug", "wait_io TIMEOUT",
+                       "Waiting for console output")
+
+    @staticmethod
+    def _derive_status_markers(seen, running, last_ts, has_content):
+        """Marker-set equivalent of _derive_status (no whole-file decode)."""
+        if "device_teardown done" in seen or "Not tearing down partition" in seen:
+            return "pass"
+        if "AIE ERROR" in seen:
+            return "fail"
+        if running:
+            if last_ts and (time.time() - last_ts) > 60:
+                return "hang"
+            return "running"
+        return "fail" if has_content else "idle"
+
+    @classmethod
+    def _is_debuggable_markers(cls, seen, status):
+        """Marker-set equivalent of _is_debuggable."""
+        if status in ("hang", "pass", "fail"):
+            return True
+        return any(m in seen for m in cls._DEBUGGABLE_MARKERS)
 
     _DEBUGGABLE_MARKERS = (
         "ELF download complete",
@@ -2861,6 +3012,9 @@ class DebugState:
             "app_sources_text": _fmt_app_sources(_srcs, rel_to=_ap.get("app_dir")),
             "aiedbg_paths": _aiedbg_paths(),
         }
+        with self._scan_lock:
+            if self._last_scan:
+                data["last_scan"] = dict(self._last_scan)
         path = os.path.join(self.workdir, "backend_status.json")
         try:
             tmp = path + ".tmp"
@@ -3289,9 +3443,11 @@ net detail in **Info**; the "All nets / f0 / f1 …" chips filter what is drawn.
 - Clicking a tile or channel badge in either view opens it in **Info** and \
 prepends context to your next message. A tile with no compiled schedule clears \
 **Info** and says "no schedule info" — that is a real empty selection, not a bug.
-- Live overlay controls sit here: the `DMA / Cores / Events` pills **select** what \
-to read, `Scan` reads it **once**, and the `live` checkbox re-reads every 2s. \
-Picking a pill does not itself read the board unless live is on.
+- Live overlay controls sit here: the `DMA / Cores / Events / Switch` selector \
+**chooses** what to read, `Scan` reads it **once**, and the `live` checkbox \
+re-reads every 2s. Each scan is summarized for you — call `get_live_scan()` \
+to read the latest result and how to interpret it (see the `live-scan-results` \
+skill). Picking a mode does not itself read the board unless live is on.
 
 **Execution (bottom-left)** — `App:` and `Board:` selectors, then `Connect`, \
 `Open Current Session`, `Run`, `Force stop`, and the run log beneath them.
@@ -3398,6 +3554,10 @@ message is authoritative and current — prefer it.
   file:line defining each kernel the schedule runs. Refreshes the inventory below \
   after an app switch. Read what it names; do not guess filenames.
 - `get_backend_status()` — current backend, AIEDBG_TARGET, IPC readiness
+- `get_live_scan(detail)` — latest DMA/Cores/Events/Switch scan the user ran \
+  in the AIE Debug pane (counts, stalled tiles, switch mismatches). \
+  **Call this when the user asks about scan colours, stalls, or routing \
+  mismatches** — do not re-scan with aie_exec unless you need finer detail.
 - `get_applog(lines)` — last N lines of the hardware run log
 - `get_sim_log(lines)` — last N lines of the simulator application log (ipc_app.log)
 - `get_ipc_log(lines, side)` — recent IPC transaction CSV log; side="client"|"server"|"both"
@@ -3424,9 +3584,11 @@ message is authoritative and current — prefer it.
    call `tile_info(C, R)` for the full detail.
 3. When the user clicks a flow, you receive `[context] Selected net/flow fN …` — \
    call `get_flow_detail(N)` for the routing detail.
-4. For live AIE state, check `get_backend_status()` first; if connected, use `aie_exec` \
-   commands to read DMA/core registers.
-5. If the user has just run and wants to check results, call `get_applog()` or \
+4. When the user has scanned the array (or asks about coloured tiles / stalls / \
+   switch mismatches), call `get_live_scan()` before issuing your own reads.
+5. For finer per-register detail after a scan, check `get_backend_status()` first; \
+   if connected, use `aie_exec` commands to read DMA/core registers.
+6. If the user has just run and wants to check results, call `get_applog()` or \
    `get_sim_log()` depending on the backend.
 {_workflow_step6}
 7. Before you answer, read the application source behind whatever you found — the \
@@ -3500,6 +3662,7 @@ message is authoritative and current — prefer it.
                     "mcp__debugui__get_sim_log",
                     "mcp__debugui__get_applog",
                     "mcp__debugui__get_ipc_log",
+                    "mcp__debugui__get_live_scan",
                     # App / UI awareness. These were registered in debug_ui_mcp
                     # but never granted, so the assistant could not answer "which
                     # app is this?" or see what the user had open — the very
@@ -3732,32 +3895,42 @@ message is authoritative and current — prefer it.
             "llm_generation": self._llm_generation,
         }
 
+    def _llm_proc_alive(self):
+        proc = self._llm_proc
+        return proc is not None and proc.poll() is None
+
     def llm_poll(self, offset):
         """Return the transcript slice past `offset` plus the turn-active flag.
 
-        When active is True but no output has arrived for _LLM_STUCK_S seconds,
-        sets stuck=True and clears _llm_active so the browser can show recovery UI.
+        When active is True but no stdout has arrived, the turn stays active while
+        the claude subprocess is running (no client signal).  stuck=True is returned
+        only when the turn is hard-abandoned: subprocess exited with no recent
+        output, or silence exceeds _LLM_STUCK_HARD_S.
         """
         with self._llm_lock:
             buf = self._llm_buf
             active = self._llm_active
             last = self._llm_last_output
+            stuck = False
+            stuck_s = None
             if active and last is not None:
                 age = time.monotonic() - last
-                if age >= _LLM_STUCK_S:
-                    self._llm_active = False
-                    active = False
+                if age >= _LLM_STUCK_HARD_S:
                     stuck = True
                     stuck_s = int(age)
+                    self._llm_active = False
+                    active = False
                     self._llm_log_write(
-                        f"\n[watchdog: no output for {stuck_s}s — turn declared stuck]\n"
+                        f"\n[watchdog: no output for {stuck_s}s — turn abandoned]\n"
                     )
-                else:
-                    stuck = False
-                    stuck_s = None
-            else:
-                stuck = False
-                stuck_s = None
+                elif age >= _LLM_STUCK_S and not self._llm_proc_alive():
+                    stuck = True
+                    stuck_s = int(age)
+                    self._llm_active = False
+                    active = False
+                    self._llm_log_write(
+                        f"\n[watchdog: no output for {stuck_s}s — claude exited]\n"
+                    )
         if offset < 0:
             offset = 0
         result = {
@@ -4519,6 +4692,127 @@ def grid_cores(st, target=None, reg_read_fn=None, device=None):
     return {"what": "cores", "cells": cells}
 
 
+def _switch_tiles(st):
+    """[(col, row, tile_type)] for every tile with a stream switch to read.
+
+    Not st.tiles(): memtile rows carry real circuit connections but never
+    appear in the schedule grid, so the routing map has to be consulted too.
+
+    The whole grid rectangle is included as well, because reconstruction has to
+    work when the routing map is missing or wrong -- seeding the tile list from
+    that map would make discovery find only what the map already claims.  Note
+    the rows come from the grid extent, not `row_list`: that list skips the
+    memtile rows, which routing demonstrably crosses.
+    """
+    grid = st.grid_info()
+    core_min = grid.get("device_core_min_row") or 3
+    locs = {tuple(t["loc"]) for t in st.tiles()}
+    cols = grid.get("col_list") or list(range(grid.get("cols") or 0))
+    for col in cols:
+        for row in range(grid.get("rows") or 0):
+            locs.add((col, row))
+    for p in st.comm_paths():
+        for e in p.get("edges", []):
+            locs.add((e[0][0], e[0][1]))
+            locs.add((e[1][0], e[1][1]))
+        for c in p.get("routing_connections", []):
+            t = c.get("tile") or {}
+            if t.get("col") is not None:
+                locs.add((t["col"], t["row"]))
+    out = []
+    for col, row in sorted(locs):
+        ttype = "shim" if row == 0 else ("core" if row >= core_min else "memtile")
+        out.append((col, row, ttype))
+    return out
+
+
+def grid_switch(st, target=None, reg_read_fn=None, device=None,
+                routing_map='static'):
+    """Live stream-switch config per tile, diffed against a routing map.
+
+    `routing_map` selects which comm_paths expected_records uses:
+      static  — the compiler map in schedule_view.json (default)
+      dynamic — flows reconstructed from the registers just read on this scan
+
+    This is static configuration, not per-cycle state, so it is a scan and
+    never a poll.  On hardware each tile costs a single `aiedbg mem read` of
+    the whole switch register block; reading it the way aiegdb's `show switch`
+    does would be ~230 `reg read` subprocesses per tile.
+    """
+    cells = {}
+    switches = {}
+    for col, row, ttype in _switch_tiles(st):
+        phys_col = col + st.startcol
+        try:
+            decoded = switch_scan.read_tile_switch(
+                ttype, phys_col, row,
+                reg_read_fn=reg_read_fn, target=target or st.target,
+                device=device)
+            if decoded is None:
+                cells[f"{col},{row}"] = {
+                    "state": switch_scan.UNREACHABLE,
+                    "phys_col": phys_col, "matched": 0,
+                    "missing": [], "unexpected": []}
+            else:
+                switches[(col, row)] = (ttype, decoded)
+        except Exception as e:
+            cells[f"{col},{row}"] = {
+                "state": switch_scan.UNREACHABLE,
+                "phys_col": phys_col, "matched": 0,
+                "missing": [], "unexpected": [], "error": str(e)}
+        if f"{col},{row}" in cells:
+            cells[f"{col},{row}"]["type"] = ttype
+
+    dynamic = _dynamic_routing(st, switches)
+    st._last_dynamic_routing = dynamic
+
+    comm_paths = st.comm_paths()
+    if (routing_map or "static").strip().lower() == "dynamic":
+        if dynamic and dynamic.get("comm_paths"):
+            comm_paths = dynamic["comm_paths"]
+
+    for (col, row), (ttype, decoded) in switches.items():
+        phys_col = col + st.startcol
+        live = switch_scan.live_records(ttype, col, row, decoded)
+        expected = switch_scan.expected_records(comm_paths, col, row)
+        cell = switch_scan.compare_tile(live, expected)
+        cell["phys_col"] = phys_col
+        cell["type"] = ttype
+        cells[f"{col},{row}"] = cell
+
+    n_bad = sum(1 for c in cells.values() if c["state"] == switch_scan.MISMATCH)
+    return {"what": "switch", "cells": cells, "mismatch_tiles": n_bad,
+            "dynamic": dynamic, "routing_map": routing_map or "static"}
+
+
+def _dynamic_routing(st, switches):
+    """Rebuild the routing map from the switches just read.
+
+    Never raises: a reconstruction problem must not cost the user the scan
+    result they asked for, which is still valid on its own.
+    """
+    if not switches:
+        return None
+    try:
+        flows = switch_reconstruct.discover_flows(switches, st.aie_version)
+        flows = switch_reconstruct.reconcile(flows, st.comm_paths())
+        groups = switch_reconstruct.to_routing_groups(flows, st.startcol)
+        out = {"n_flows": len(flows),
+               "comm_paths": switch_reconstruct.to_comm_paths(flows),
+               "routing_groups": groups,
+               "scanned_tiles": len(switches)}
+    except Exception as e:
+        return {"error": str(e)}
+    path = os.path.join(st.workdir, "routingprovenancemap.dynamic.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(groups, f, indent=1)
+        out["path"] = path
+    except OSError as e:
+        out["write_error"] = str(e)
+    return out
+
+
 def grid_events(st, target=None, reg_read_fn=None, device=None):
     cells = {}
 
@@ -4692,6 +4986,35 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter default logging
         sys.stderr.write("[schedule_debug_server] " + (fmt % args) + "\n")
 
+    def handle(self):
+        # This is a plain-HTTP server. A browser that connects with https://
+        # sends a TLS ClientHello, whose binary bytes the base parser logs as a
+        # "Bad request version (<garbage>)" 400. Peek the first byte (without
+        # consuming it) and, if it is a TLS handshake record (content type
+        # 0x16), reply with a plaintext hint and log one clean line instead of
+        # the binary noise. Normal HTTP requests fall through untouched.
+        try:
+            first = self.connection.recv(1, socket.MSG_PEEK)
+        except OSError:
+            first = b""
+        if first[:1] == b"\x16":
+            self.log_message("%s", "rejected TLS/https:// connection on plain "
+                                    "HTTP port; use http:// instead")
+            body = (b"This is a plain HTTP debug server. You connected with "
+                    b"https:// (TLS). Reload the page using http:// instead.\n")
+            try:
+                self.connection.sendall(
+                    b"HTTP/1.0 400 Bad Request\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                    b"\r\n" + body)
+            except OSError:
+                pass
+            self.close_connection = True
+            return
+        return super().handle()
+
     def _send_json(self, obj, code=200):
         payload = json.dumps(obj).encode("utf-8")
         self.send_response(code)
@@ -4761,6 +5084,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(st.get_uistate())
         elif path == "/schedule_view.json":
             self._send_file(st.json_path(), "application/json")
+        elif path == "/timeline.png":
+            # Rendered by launch_timeline() when a run ends; the Profile tab
+            # fetches it with a cache-busting ?ts= so a new run shows a new PNG.
+            self._send_file(st.timeline_png_path(), "image/png")
         elif path == "/config":
             self._send_json(_ui_defaults(st))
         elif path == "/aiegdb/spec":
@@ -4916,6 +5243,7 @@ class Handler(BaseHTTPRequestHandler):
             what = q.get("what", ["dma"])[0]
             device = q.get("device", [""])[0]
             host = q.get("host", [""])[0]
+            routing_map = q.get("routing", ["static"])[0]
             is_sim = (device or "").strip().lower() == "simulator"
             if is_sim and st.sim_kind == "aiesim":
                 self._send_json({"error": _AIESIM_LIVE_ERROR, "cells": {},
@@ -4936,16 +5264,32 @@ class Handler(BaseHTTPRequestHandler):
             rrfn = _make_reg_read_fn(st, device, tgt)
             try:
                 if what == "cores":
-                    self._send_json(grid_cores(st, target=tgt,
-                                               reg_read_fn=rrfn, device=dev))
+                    res = grid_cores(st, target=tgt,
+                                     reg_read_fn=rrfn, device=dev)
                 elif what == "events":
-                    self._send_json(grid_events(st, target=tgt,
-                                                reg_read_fn=rrfn, device=dev))
+                    res = grid_events(st, target=tgt,
+                                      reg_read_fn=rrfn, device=dev)
+                elif what == "switch":
+                    res = grid_switch(st, target=tgt,
+                                      reg_read_fn=rrfn, device=dev,
+                                      routing_map=routing_map)
                 else:
-                    self._send_json(grid_dma(st, target=tgt,
-                                             reg_read_fn=rrfn, device=dev))
+                    res = grid_dma(st, target=tgt,
+                                   reg_read_fn=rrfn, device=dev)
+                st.record_live_scan(what, res, device=device, host=host)
+                summary = st.get_live_scan()
+                if summary:
+                    res["llm_summary"] = live_scan_summary.format_for_llm(summary)
+                self._send_json(res)
             except Exception as e:  # never crash the poll loop
                 self._send_json({"error": str(e), "cells": {}}, code=500)
+        elif path == "/live_scan":
+            summary = st.get_live_scan()
+            if not summary:
+                self._send_json({"ok": False, "detail": "no scan recorded yet"})
+                return
+            self._send_json({"ok": True, "summary": summary,
+                             "text": live_scan_summary.format_for_llm(summary)})
         else:
             self._send_json({"error": f"unknown path: {path}"}, code=404)
 
@@ -4990,6 +5334,32 @@ class Handler(BaseHTTPRequestHandler):
             res = st.stop_run()
             res["run"] = st.run_state()
             self._send_json(res)
+        elif u.path == "/timeline":
+            self._send_json(st.launch_timeline())
+        elif u.path == "/ctrlplan/load":
+            try:
+                with open(st.applog, "r", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                self._send_json({"error": f"cannot read applog: {e}",
+                                 "ports": [], "edges": [], "count": 0})
+                return
+            self._send_json(controlpan_pmap.parse(text))
+        elif u.path == "/ctrlplan/tile":
+            try:
+                with open(st.applog, "r", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                self._send_json({"error": f"cannot read applog: {e}",
+                                 "dirs": []})
+                return
+            try:
+                col = int(body.get("col"))
+                row = int(body.get("row"))
+            except (TypeError, ValueError):
+                self._send_json({"error": "bad col/row", "dirs": []})
+                return
+            self._send_json(controlpan_pmap.tile_switch_view(text, col, row))
         elif u.path == "/sim/run":
             self._send_json(st.start_sim())
         elif u.path == "/sim/stop":
@@ -5203,17 +5573,35 @@ def _hwsrv_drain(child):
         pass
 
 
+# The PAL board's JTAG host. Fixed, because the "pal" device selection names one
+# specific board — unlike vek385, whose hostname the user types into the UI.
+#
+# This used to fall back to the literal string "xx.xx.xx.213" when $PALIP was
+# unset, which is a placeholder, not an address: the browser's Connect probe
+# emitted `connect -url TCP:xx.xx.xx.213:3121` and failed at DNS before opening a
+# socket. $PALIP still wins when it is set (script/test/envlocal.sh exports it,
+# as do apppaltest.py / aiedbg's connecttest.py), so a farm move only needs the
+# env var — but with it unset, Connect now works out of the box.
+PAL_DEFAULT_IP = "10.23.224.213"
+
+
+def _pal_ip():
+    """JTAG host for the 'pal' device: $PALIP if set and non-empty, else the
+    fixed PAL board address."""
+    return (os.environ.get("PALIP") or "").strip() or PAL_DEFAULT_IP
+
+
 def resolve_target(st, device, host):
     """Device-aware aiedbg target for live reads.
 
-    * pal           → xsdb://<PALIP>:3121 ($PALIP, fallback xx.xx.xx.213).
+    * pal           → xsdb://<PALIP>:3121 ($PALIP, fallback PAL_DEFAULT_IP).
     * simulator     → None (reads go through IPC debug socket, not aiedbg).
     * any other board + host → xsdb://<host>:3121 (hostname from the UI).
     * otherwise     → the daemon's configured/env target (st.target).
     """
     device = (device or "").strip().lower()
     if device == "pal":
-        return f"xsdb://{os.environ.get('PALIP', 'xx.xx.xx.213')}:3121"
+        return f"xsdb://{_pal_ip()}:3121"
     if device == "simulator":
         return None
     if device and host:
@@ -5242,7 +5630,7 @@ def _ui_defaults(st):
     """
     if st.sim_only:
         return {"device": "simulator", "board_host": "", "sim_only": True,
-                "source_viewer": True}
+                "source_viewer": True, "jtag_host": ""}
     host = os.environ.get("VEK385IP", "").strip()
     if not host and st.target:
         m = re.match(r"xsdb://([^:/]+)", st.target)
@@ -5252,8 +5640,19 @@ def _ui_defaults(st):
         # Last resort: the checkout's own hwlocal.sh. This is a PREFILL, not a
         # binding — the box stays editable and the typed value wins per run.
         host = _expected_board_host(st.workdir)
-    return {"device": "vek385" if host else "", "board_host": host,
-            "sim_only": False, "source_viewer": True}
+    device = "vek385" if host else ""
+    return {"device": device, "board_host": host,
+            "sim_only": False, "source_viewer": True,
+            "jtag_host": _jtag_host_for(device, host)}
+
+
+def _jtag_host_for(device, board_host):
+    """TCP host the browser's Connect probe uses (matches resolve_target)."""
+    device = (device or "").strip().lower()
+    if device == "pal":
+        return _pal_ip()
+    host = (board_host or "").strip()
+    return host
 
 
 def _target_from_aiedbg_env():
@@ -5293,6 +5692,15 @@ def _lan_ip():
         return socket.gethostbyname(socket.gethostname())
     except OSError:
         return "127.0.0.1"
+
+
+# ── per-user applog (shared checkout hosts) ──
+
+def _default_applog_path():
+    raw = os.environ.get("SCHEDULE_DEBUG_APPLOG")
+    if raw:
+        return os.path.abspath(raw)
+    return os.path.join(_REPO_ROOT, f"applog.{getpass.getuser()}")
 
 
 # ── occupied-port policy (same-user => exit + list pid; else pick next port) ──
@@ -5432,6 +5840,42 @@ def make_server(host, requested_port, handler, max_scan=50):
     sys.exit(1)
 
 
+def _open_browser(url):
+    """Best-effort open `url` in a browser, tolerant of headless/SSH sessions.
+
+    In a VS Code Remote-SSH terminal, $BROWSER points at the `code` CLI, which
+    tries to reach the editor over a per-session IPC socket
+    ($VSCODE_IPC_HOOK_CLI). When that socket is stale (window closed/reconnected)
+    the opener dies with ECONNREFUSED and a noisy Node deprecation warning. None
+    of that should surface here: the daemon is already serving, so a failed
+    auto-open must be silent and non-fatal. We try a plain opener first
+    (xdg-open / open) and only fall back to webbrowser, suppressing all output
+    and exceptions either way.
+    """
+    time.sleep(0.5)
+    # Prefer a plain OS opener that never touches the VS Code IPC socket.
+    for opener in ("xdg-open", "open"):
+        path = shutil.which(opener)
+        if not path:
+            continue
+        try:
+            subprocess.Popen(
+                [path, url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+            return
+        except OSError:
+            continue
+    # Last resort: webbrowser (may invoke the `code` opener over SSH). Swallow
+    # any failure so a dead IPC socket can't crash the open thread.
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Live AIE debug/test daemon for host_schedule.html")
@@ -5471,13 +5915,17 @@ def main():
     ap.add_argument("--apppaltest", default=None,
                     help="path to apppaltest.py (default: script/test/apppaltest.py)")
     ap.add_argument("--applog", default=None,
-                    help="run log file to write + tail (default: repo-root applog)")
+                    help="run log file to write + tail (default: repo-root "
+                         "applog.$USER, or $SCHEDULE_DEBUG_APPLOG)")
     ap.add_argument("--open", action="store_true",
                     help="open the served URL in a browser after binding")
     ap.add_argument("--claude-bin", default="claude",
                     help="path to the claude CLI for the LLM tab (default: claude)")
-    ap.add_argument("--claude-model", default=None,
-                    help="model for the LLM tab (default: claude CLI default)")
+    ap.add_argument("--claude-model",
+                    default=os.environ.get("SCHEDULE_DEBUG_CLAUDE_MODEL",
+                                           "claude-opus-5[1m]"),
+                    help="model for the LLM tab (default: claude-opus-5[1m], or "
+                         "$SCHEDULE_DEBUG_CLAUDE_MODEL; pass '' for the CLI default)")
     ap.add_argument("--claude-cwd", default=None,
                     help="working dir for the claude subprocess so it loads "
                          "CLAUDE.md/skills (default: repo root)")
@@ -5531,7 +5979,7 @@ def main():
     elf = os.path.abspath(args.elf) if args.elf else _resolve_default_elf(workdir)
     apppaltest = args.apppaltest or os.path.join(
         _REPO_ROOT, "script", "test", "apppaltest.py")
-    applog = args.applog or os.path.join(_REPO_ROOT, "applog")
+    applog = args.applog or _default_applog_path()
     # aiedbg needs a JTAG target. Resolve in priority: --target, then
     # $AIEDBG_TARGET, then ~/.aiedbg_env (the file aiedbg-setup writes) so a
     # restart works without a manual `source`. Without any, aiedbg uses its own
@@ -5675,8 +6123,7 @@ def main():
               "--target xsdb://<host>:3121)", file=sys.stderr)
     print("  Ctrl-C to stop.")
     if args.open:
-        threading.Thread(target=lambda: (time.sleep(0.5),
-                                         webbrowser.open(url)),
+        threading.Thread(target=_open_browser, args=(url,),
                         daemon=True).start()
     try:
         server.serve_forever()

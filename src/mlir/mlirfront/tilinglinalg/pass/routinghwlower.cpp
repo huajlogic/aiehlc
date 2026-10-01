@@ -4,6 +4,7 @@
  ******************************************************************************/
 
 #include "routinghwlower.h"
+#include "routinghw_pkt_slot.h"
 struct EnableExtToAieShimPortpattern: public ConversionPattern {
     explicit EnableExtToAieShimPortpattern(MLIRContext* ctx, LLVMTypeConverter &converter, RoutingTopology & router) :
         ConversionPattern(routinghw::EnableExtToAieShimPort::getOperationName(), 1, ctx), typeconverter(converter), router_(router) {
@@ -182,6 +183,18 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             dmadirectionstr = pdma.getValue().str();
         }
 
+        // Local stream-switch sink port the packet terminates into.
+        // "DMA" (default) => S2MM data path; "CTRL" => control-packet register
+        // write via the tile's CTRL master stream-switch port. For CTRL the
+        // termination is a master-port enable (mirroring the driver's
+        // _XAie_LoadElfStrmSwFromMemPkt), and the control header must be
+        // preserved so the CTRL decoder can read the target address.
+        std::string localsinkportstr = "DMA";
+        if (auto plsp = op->getAttrOfType<StringAttr>("localsinkport")) {
+            localsinkportstr = plsp.getValue().str();
+        }
+        bool isCtrlSink = (localsinkportstr == "CTRL");
+
         if (auto pd = op->getAttrOfType<IntegerAttr>("localdmapktid")) {
             dma_pkt_idx = pd.getInt();
         }
@@ -192,6 +205,11 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
         if (auto pn = op->getAttrOfType<IntegerAttr>("localdmaportidx")) {
             dma_port_num = pn.getInt();
         }
+
+        auto recvSlot = routinghw::pktslot::recvSlaveFromOp(op);
+        auto dmaSlot = routinghw::pktslot::localDmaFromOp(op);
+        auto fwdMaster = routinghw::pktslot::forwardMasterFromOp(op);
+        dma_port_slot_num = dmaSlot.slot;
 
         auto dropheader = "XAIE_SS_PKT_DROP_HEADER";
         auto nodropheader = "XAIE_SS_PKT_DONOT_DROP_HEADER";
@@ -234,13 +252,19 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
                                         mlir::emitc::OpaqueAttr::get(rewriter.getContext(), slaveportdirectionstr));
         Value dmaport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType1,
                                         mlir::emitc::OpaqueAttr::get(rewriter.getContext(), "DMA"));
-        Value mask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
-        Value msel = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
-        Value abitr = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
+        Value mask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                              rewriter.getI32IntegerAttr(recvSlot.mask));
+        Value msel = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                              rewriter.getI32IntegerAttr(recvSlot.msel));
+        Value abitr = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                               rewriter.getI32IntegerAttr(recvSlot.arbiter));
 
-        Value slaveidx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(slaveportidx));
-        Value slaveslotnum = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
-        Value dmamask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0x1f));
+        Value slaveidx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                  rewriter.getI32IntegerAttr(slaveportidx));
+        Value slaveslotnum = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                      rewriter.getI32IntegerAttr(recvSlot.slot));
+        Value dmamask = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                 rewriter.getI32IntegerAttr(dmaSlot.mask));
         StringRef calleeSPE = "XAie_StrmPktSwSlavePortEnable";
         //receive pkt from neighbor
         if (PortDirectiontoString(PortDirection::NONE) != slaveportdirectionstr) {
@@ -271,13 +295,23 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
         StringRef calleeM = "XAie_StrmPktSwMstrPortEnable";
          //string type
         mlir::Type stringType2 = mlir::emitc::PointerType::get(rewriter.getI8Type());
-        if (PortDirectiontoString(PortDirection::NONE) != masterportdirectionstr) {
-            Value masterport = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), stringType2,
-                                            mlir::emitc::OpaqueAttr::get(rewriter.getContext(), masterportdirectionstr));
-            Value masteridx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(masterportidx));
+        // For a control-packet terminal sink, the packet ends at the tile's CTRL
+        // master stream-switch port (idx 0) instead of the forwarding data master.
+        // This mirrors _XAie_LoadElfStrmSwFromMemPkt in the driver, which enables
+        // the CTRL master so the control-packet header/data drive an in-tile
+        // register/memory write.
+        std::string effMasterDirStr = isCtrlSink ? std::string("CTRL") : masterportdirectionstr;
+        int32_t effMasterIdx = isCtrlSink ? 0 : masterportidx;
+        if (PortDirectiontoString(PortDirection::NONE) != effMasterDirStr) {
+            Value masterport = rewriter.create<mlir::emitc::ConstantOp>(
+                op->getLoc(), stringType2, mlir::emitc::OpaqueAttr::get(rewriter.getContext(), effMasterDirStr));
+            Value masteridx = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                       rewriter.getI32IntegerAttr(effMasterIdx));
 
-            Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(1));
-            Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),rewriter.getI32IntegerAttr(0));
+            Value msel2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                   rewriter.getI32IntegerAttr(fwdMaster.mselEn));
+            Value abitr2 = rewriter.create<mlir::emitc::ConstantOp>(op->getLoc(), rewriter.getI32Type(),
+                                                                    rewriter.getI32IntegerAttr(fwdMaster.arbiter));
 
             // DROP_HEADER only at the PKT→CIRC transition (last PKT hop),
             // UNLESS preserveheader=true (OOO mode needs headers at shim S2MM).
@@ -286,13 +320,16 @@ struct ConnectStreamPktSwitchPortpattern: public ConversionPattern {
             // Intermediate PKT hops must preserve the header so the next PKT slave
             // can read it; dropping early causes the downstream PKT switch to consume
             // a data word as a fake header, losing one element per BD.
+            // Control-packet sinks (CTRL) must ALWAYS preserve the header so the
+            // CTRL decoder can read the target address/size from the control header.
             bool preserveHeader = false;
             if (auto phAttr = op->getAttrOfType<BoolAttr>("preserveheader"))
                 preserveHeader = phAttr.getValue();
             bool isLastPktHop = (slaveportdirectionstr == PortDirectiontoString(PortDirection::NONE) &&
                                  dmadirectionstr == PortDirectiontoString(PortDirection::NONE));
-            // When preserveheader=true, always keep headers (OOO BD dispatch needs them)
-            auto headerPolicy = (isLastPktHop && !preserveHeader) ? dropheader : nodropheader;
+            // When preserveheader=true, always keep headers (OOO BD dispatch needs them).
+            // CTRL sinks force header preservation regardless of hop position.
+            auto headerPolicy = (isLastPktHop && !preserveHeader && !isCtrlSink) ? dropheader : nodropheader;
             Value dropheadervalue = rewriter.create<mlir::emitc::ConstantOp>(
                 op->getLoc(), stringType1, mlir::emitc::OpaqueAttr::get(rewriter.getContext(), headerPolicy));
             auto callOpMport = rewriter.create<mlir::emitc::CallOp>(

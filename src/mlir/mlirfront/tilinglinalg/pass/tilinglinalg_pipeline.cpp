@@ -9,6 +9,7 @@
 #include "kernelconfig.h"
 #include "passblueprinttoschedule.h"
 #include "passblueprinttoschedulekernel.h"
+#include "passcoretraceinsert/passcoretraceinsert.h"
 #include "passdfscheduleprovenancemap.h"
 #include "passdfscheduletoapi.h"
 #include "passdfscheduletokernelapi.h"
@@ -16,6 +17,9 @@
 #include "passdmaphoptodfscheblueprint.h"
 #include "passdmaphoptoroutinghw.h"
 #include "passroutingprovenancemap.h"
+#include "passroutingresourcemap.h"
+#include "passdfschedulekernelaggregation.h"
+#include "passgroupregwrite.h"
 #include "passschedulecanonicalize.h"
 #include "passschedulesequentialop.h"
 #include "passwaitmerge.h"
@@ -52,6 +56,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <iostream>
 #include <map>
 
@@ -60,6 +65,155 @@ using namespace mlir;
 // ---------------------------------------------------------------------------
 // Helpers (same as unitest/test.cpp)
 // ---------------------------------------------------------------------------
+
+// Resolve and validate `#pragma aie_trace` mem-DMA selections against the
+// dfschedule create_io provenance on `hostModule` (still present before
+// DfscheduleToApiPass). Returns false on a fatal user error so the caller aborts:
+//   * PARAMETER "name" that is not a kernel window/port, or whose direction has no
+//     DMA channel assigned on the traced tile.
+//   * STREAM dir/ch whose channel the app never uses on the traced tile (covers
+//     both hardware-invalid indices and valid-but-unused channels).
+// A kernel window/port name maps to a direction via `tensors[i].isInput` (input =>
+// S2MM, output => MM2S) using the tensor-ordered `portVarNames`, then to the
+// create_io channel that direction was assigned on the tile, matched by
+// declaration order within the direction. Default specs are left untouched (S2MM
+// ch0, unchecked). Reads IR only.
+//
+// KERNELCONFIGOFFLOAD interaction: when routing.kernel_config_offload is set the
+// core self-programs its own incoming S2MM DMA from kernel.cc, so
+// BlueprintToSchedulePass deliberately does NOT emit the host-side S2MM
+// create_io for core tiles. Those channels are still live on hardware — they are
+// simply no longer described by the host IR this function reads. Validating an
+// S2MM selection against the (now empty) host list would report the channel as
+// unused and abort the build, so S2MM specs are accepted unverified (with a
+// warning) under offload. MM2S stays host-side and is still fully validated.
+// `s2mmOffloaded` is the caller's routing.kernel_config_offload state. It is
+// passed in rather than read off `hostModule` because that clone has already
+// been through BlueprintToSchedulePass et al., which may strip module attrs
+// during applyPartialConversion (the pass caches them at entry for this reason).
+static bool resolveTraceParameterSpecs(mlir::ModuleOp hostModule, const std::vector<std::string> &portVarNames,
+                                       const std::vector<TensorParam> &tensors, std::vector<TraceTileSpec> &traceTiles,
+                                       bool s2mmOffloaded) {
+    bool needCheck = false;
+    for (const auto &t : traceTiles)
+        if (t.sel == TraceDmaSel::Parameter || t.sel == TraceDmaSel::Stream)
+            needCheck = true;
+    if (!needCheck)
+        return true;
+
+    // Build per-tile ordered channel lists per direction from create_io.
+    // key = (col,row); value = channels in IR order for S2MM / MM2S respectively.
+    std::map<std::pair<int, int>, std::vector<int>> s2mmCh, mm2sCh;
+    hostModule.walk([&](dfschedule::ConfigCreateIoOp io) {
+        auto tileOp = io.getTile().getDefiningOp<dfschedule::DeclareTileOp>();
+        if (!tileOp)
+            return;
+        std::pair<int, int> key{(int)tileOp.getCol(), (int)tileOp.getRow()};
+        std::string dir = io.getDirection().str();
+        if (dir == "S2MM")
+            s2mmCh[key].push_back((int)io.getChannel());
+        else if (dir == "MM2S")
+            mm2sCh[key].push_back((int)io.getChannel());
+    });
+
+    // Map a port name -> (isInput, ordinalWithinDirection) from tensors order.
+    auto lookupPort = [&](const std::string &name, bool &isInput, int &ordinal) -> bool {
+        int inOrd = 0, outOrd = 0;
+        for (size_t i = 0; i < portVarNames.size(); i++) {
+            bool in = (i < tensors.size()) ? tensors[i].isInput : true;
+            if (portVarNames[i] == name) {
+                isInput = in;
+                ordinal = in ? inOrd : outOrd;
+                return true;
+            }
+            if (in)
+                inOrd++;
+            else
+                outOrd++;
+        }
+        return false;
+    };
+
+    auto joinCh = [](const std::vector<int> &lst) -> std::string {
+        if (lst.empty())
+            return "(none)";
+        std::string s;
+        for (size_t i = 0; i < lst.size(); i++)
+            s += (i ? ", ch" : "ch") + std::to_string(lst[i]);
+        return s;
+    };
+
+    bool ok = true;
+    for (auto &t : traceTiles) {
+        std::pair<int, int> key{t.col, t.row};
+
+        // Skip specs whose tile has no create_io in this module: in multi-kernel
+        // mode each kernel gets its own module, and a traced tile may belong to a
+        // different kernel (or be an out-of-mesh coord). Validating it here would
+        // spuriously abort. The kernel that owns the tile validates it.
+        if (!s2mmCh.count(key) && !mm2sCh.count(key))
+            continue;
+
+        if (t.sel == TraceDmaSel::Stream) {
+            const auto &chList = (t.dmaKind == 2) ? mm2sCh[key] : s2mmCh[key];
+            const char *dirName = (t.dmaKind == 2) ? "mm2s" : "s2mm";
+            // Under KERNELCONFIGOFFLOAD the S2MM channel is programmed by the core,
+            // not the host, so there is no host create_io to check it against. Accept
+            // the user's channel as-is rather than reporting it unused.
+            if (s2mmOffloaded && t.dmaKind != 2) {
+                std::cerr << "[aiehlc] Warning: #pragma aie_trace STREAM s2mm ch" << t.dmaCh << " on tile(" << t.col
+                          << "," << t.row << ") cannot be verified under #pragma KERNELCONFIGOFFLOAD"
+                          << " (the core programs its own S2MM DMA); trusting the pragma." << std::endl;
+                continue;
+            }
+            if (std::find(chList.begin(), chList.end(), t.dmaCh) == chList.end()) {
+                std::cerr << "[aiehlc] Error: #pragma aie_trace STREAM " << dirName << " ch" << t.dmaCh
+                          << " is not used by the app on tile(" << t.col << "," << t.row << "). Available " << dirName
+                          << " channels: " << joinCh(chList) << std::endl;
+                ok = false;
+            }
+            continue;
+        }
+
+        if (t.sel != TraceDmaSel::Parameter)
+            continue;
+
+        bool isInput = true;
+        int ordinal = 0;
+        if (!lookupPort(t.paramName, isInput, ordinal)) {
+            std::cerr << "[aiehlc] Error: #pragma aie_trace PARAMETER \"" << t.paramName
+                      << "\" is not a kernel window/port name." << std::endl;
+            ok = false;
+            continue;
+        }
+        // An input PARAMETER resolves to an S2MM channel by looking up the host
+        // create_io list, which KERNELCONFIGOFFLOAD leaves empty. Unlike STREAM the
+        // user did not supply a channel number here, and there is nothing left to
+        // derive one from — defaulting would silently trace the wrong channel, so
+        // ask for an explicit STREAM selection instead.
+        if (s2mmOffloaded && isInput) {
+            std::cerr << "[aiehlc] Error: #pragma aie_trace PARAMETER \"" << t.paramName
+                      << "\" (S2MM) cannot be resolved to a DMA channel under #pragma KERNELCONFIGOFFLOAD,"
+                      << " because the core programs its own S2MM DMA and the host IR no longer records the channel."
+                      << " Use an explicit (STREAM, \"s2mm\", <ch>) selection instead." << std::endl;
+            ok = false;
+            continue;
+        }
+        const auto &chList = isInput ? s2mmCh[key] : mm2sCh[key];
+        if (ordinal >= (int)chList.size()) {
+            std::cerr << "[aiehlc] Error: #pragma aie_trace PARAMETER \"" << t.paramName << "\" ("
+                      << (isInput ? "S2MM" : "MM2S") << ") has no DMA channel on tile(" << t.col << "," << t.row
+                      << "). Available channels: " << joinCh(chList) << std::endl;
+            ok = false;
+            continue;
+        }
+        t.dmaKind = isInput ? 1 : 2; // S2MM : MM2S
+        t.dmaCh = chList[ordinal];
+        std::cout << "[CoreTraceInsert] PARAMETER \"" << t.paramName << "\" -> tile(" << t.col << "," << t.row << ") "
+                  << (isInput ? "S2MM" : "MM2S") << " ch" << t.dmaCh << std::endl;
+    }
+    return ok;
+}
 
 static std::string setupPipelineIRDir(const std::string &subdir) {
     llvm::SmallString<256> cwdPath;
@@ -143,6 +297,66 @@ static std::string resolveArgDimBuiltin(const std::string &body, const std::stri
         pos += replacement.size();
     }
     return out;
+}
+
+static void publishControlPlacement(mlir::ModuleOp module, const ControlShimPlacement &p) {
+    mlir::OpBuilder b(module.getContext());
+    module->setAttr("routing.control_plan_shim_col", b.getI64IntegerAttr(p.col));
+    module->setAttr("routing.control_plan_mm2s_ch", b.getI64IntegerAttr(p.mm2sCh));
+    module->setAttr("routing.control_plan_s2mm_ch", b.getI64IntegerAttr(p.s2mmCh));
+    module->setAttr("routing.control_plan_exclusive", b.getI64IntegerAttr(p.exclusive ? 1 : 0));
+}
+
+static bool planControlColumn(mlir::ModuleOp module, bool reserveControlPlane, int relStartCol, int relEndCol,
+                              int meshCols, ControlShimPlacement &placement, int &dataStartCol) {
+    auto forceAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_dedicated_shim");
+    bool force = forceAttr && forceAttr.getInt() != 0;
+    int partCols = relStartCol < 0 ? 0 : relEndCol - relStartCol + 1;
+    bool spare = meshCols > 0 && partCols >= meshCols + 1;
+    if (force && !reserveControlPlane) {
+        llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim requires "
+                        "#pragma control_plan_op_control_packet.\n";
+        return false;
+    }
+    if (force && !spare) {
+        llvm::errs() << "[TilingLinalg] ERROR: #pragma control_plan_dedicated_shim needs a partition with one "
+                        "spare column west of the mesh (mesh cols="
+                     << meshCols << ", partition cols=" << partCols << ").\n";
+        return false;
+    }
+    if (!reserveControlPlane || !spare)
+        return true;
+    placement.col = relStartCol;
+    placement.mm2sCh = 0;
+    placement.s2mmCh = 0;
+    placement.exclusive = true;
+    dataStartCol = relStartCol + 1;
+    publishControlPlacement(module, placement);
+    std::cout << "[TilingLinalg] control plane: dedicated shim col " << placement.col << " (MM2S ch0 / S2MM ch0); "
+              << "data plane uses cols [" << dataStartCol << "," << relEndCol << "]" << std::endl;
+    return true;
+}
+
+static void finalizeControlPlacement(mlir::ModuleOp module, const std::shared_ptr<ResourceMgr> &rm, int dataStartCol,
+                                     ControlShimPlacement &placement) {
+    if (placement.col < 0) {
+        int col = dataStartCol < 0 ? 0 : dataStartCol;
+        if (auto pick = rm->findFreeControlChannels(col)) {
+            placement = *pick;
+            std::cout << "[TilingLinalg] control plane: free shim channels on col " << col << " (MM2S ch"
+                      << placement.mm2sCh << " / S2MM ch" << placement.s2mmCh << ")" << std::endl;
+        } else {
+            placement.col = col;
+            placement.mm2sCh = 0;
+            placement.s2mmCh = 0;
+            placement.exclusive = false;
+            llvm::errs() << "[TilingLinalg] WARNING: no free shim MM2S/S2MM pair for the control plane; "
+                            "time-sharing col "
+                         << col << " channel 0 with the data plane (control usable only during load/launch). "
+                         << "Widen the partition by one column for a dedicated control shim.\n";
+        }
+    }
+    publishControlPlacement(module, placement);
 }
 
 static void dumpPipelineIRToFile(mlir::ModuleOp module, const std::string &dir, int stage, const std::string &passName) {
@@ -429,11 +643,17 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                                        int runtimeDebugLevel, const std::string &userRewrittenSource,
                                        const std::vector<TensorParam> &tensors, int64_t maxPingPongBytes,
                                        const std::string &aieGen, const std::string &hostFuncSuffix, bool appendMode,
-                                       unsigned *numHostDdrArgs, const std::vector<std::string> &portVarNames) {
+                                       unsigned *numHostDdrArgs, const std::vector<std::string> &portVarNames,
+                                       const std::vector<TraceTileSpec> &traceTilesIn) {
+    // Mutable copy so the PARAMETER resolver (below) can stamp resolved dmaKind/
+    // dmaCh back into the specs before CoreTraceInsertPass consumes them.
+    std::vector<TraceTileSpec> traceTiles = traceTilesIn;
 
     // Extract partition bounds from createhwmesh op in the IR (if present)
     int partStartCol = -1, partEndCol = -1, partStartRow = -1, partEndRow = -1;
+    int meshCols = 0;
     module.walk([&](routing::createhwmesh meshOp) {
+        meshCols = std::max<int>(meshCols, meshOp.getCol());
         if (auto sc = meshOp.getStartCol())
             partStartCol = *sc;
         if (auto ec = meshOp.getEndCol())
@@ -451,7 +671,25 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     // otherwise keep relStartCol = -1 so RoutingTopology skips setPartitionBounds.
     int relStartCol = (partStartCol >= 0 && partEndCol >= 0) ? 0 : -1;
     int relEndCol = (partStartCol >= 0 && partEndCol >= 0) ? (partEndCol - partStartCol) : -1;
-    RoutingTopology rtopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
+    auto controlPlanAttr =
+        module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_op_control_packet");
+    bool reserveControlPlane = controlPlanAttr && controlPlanAttr.getInt() != 0;
+    rt_res_gen resourceGen = __Runtime_res_gen_from_name(aieGen.c_str());
+
+    ControlShimPlacement ctrlPlacement;
+    int dataStartCol = relStartCol;
+    if (!planControlColumn(module, reserveControlPlane, relStartCol, relEndCol, meshCols, ctrlPlacement,
+                           dataStartCol))
+        return false;
+    auto reserveControl = [&](const std::shared_ptr<ResourceMgr> &rm) {
+        if (!reserveControlPlane)
+            return;
+        rm->setControlPlacement(ctrlPlacement);
+        rm->reserveControlPlaneResources(resourceGen);
+    };
+
+    RoutingTopology rtopology(aieGen, "", dataStartCol, relEndCol, partStartRow, partEndRow);
+    reserveControl(rtopology.getRM());
 
     // Reset the shared core-memory allocator so each pipeline run allocates its
     // own kernel ping/pong buffers from a clean base. ResourceMgr::instance() is
@@ -535,6 +773,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
         return false;
     if (!runPipelineSinglePass(ctx, module, std::make_unique<DmapToDmaphopPass>(rtopology), irDir, stage, "DmapToDmaphopPass"))
         return false;
+    if (reserveControlPlane)
+        finalizeControlPlacement(module, rtopology.getRM(), dataStartCol, ctrlPlacement);
 
     // Generate provenance map JSON after dmaphop IR is available
     {
@@ -597,6 +837,8 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
     {
         auto hwRes = makeResource(aieGen);
         ResourceMgr::init(std::move(hwRes));
+        if (reserveControlPlane)
+            ResourceMgr::instance()->reserveControlPlaneResources(resourceGen);
     }
 
     // Early memory check: validate that per-tile buffer requirements fit in tile data memory
@@ -658,6 +900,41 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                               "DfscheduleProvenanceMapPass");
     }
 
+    // Resolve + validate #pragma aie_trace mem-DMA selections to physical
+    // (dmaKind, dmaCh) while dfschedule create_io provenance is still present
+    // (DfscheduleToApiPass below erases it). Stamps resolved values back into
+    // traceTiles; aborts the build on an invalid PARAMETER name or an unused
+    // STREAM channel. Under #pragma KERNELCONFIGOFFLOAD the core-tile S2MM
+    // create_io is intentionally absent (the core programs that DMA itself), so
+    // S2MM selections cannot be cross-checked against the host IR.
+    bool kernelConfigOffloadOn = false;
+    if (auto kcoAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.kernel_config_offload"))
+        kernelConfigOffloadOn = kcoAttr.getInt() != 0;
+    if (!resolveTraceParameterSpecs(hostModule, portVarNames, tensors, traceTiles, kernelConfigOffloadOn)) {
+        llvm::errs() << "[TilingLinalg] ERROR: invalid #pragma aie_trace mem-DMA selection.\n";
+        return false;
+    }
+
+    // Must run before DfscheduleToApiPass.
+    auto grwAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_group_reg_write");
+    auto ctrlAttr = module->getAttrOfType<mlir::IntegerAttr>("routing.control_plan_op_control_packet");
+    bool enableGroupWrites = grwAttr && grwAttr.getInt() != 0;
+    bool enableKernelControl = ctrlAttr && ctrlAttr.getInt() != 0;
+    if (enableGroupWrites || enableKernelControl) {
+        if (!runPipelineSinglePass(ctx, hostModule,
+                                   std::make_unique<mlir::GroupRegWritePass>(enableGroupWrites, enableKernelControl,
+                                                                             1, ctrlPlacement.s2mmCh, RT_RES_CTRL_BD_LO,
+                                                                             ctrlPlacement.mm2sCh,
+                                                                             ctrlPlacement.col < dataStartCol
+                                                                                 ? ctrlPlacement.col
+                                                                                 : -1),
+                                   irDir, stage, "GroupRegWritePass"))
+            return false;
+    } else {
+        llvm::errs() << "[TilingLinalg] GroupRegWritePass skipped (enable with "
+                        "#pragma CONTROL_PLAN_GROUP_REG_WRITE).\n";
+    }
+
     if (!runPipelineSinglePass(ctx, hostModule,
                                std::make_unique<mlir::DfscheduleToApiPass>(/*enableDebug=*/true, runtimeDebugLevel),
                                irDir, stage, "DfscheduleToApiPass"))
@@ -668,11 +945,36 @@ bool TilingLinalgPipeline::runPipeline(mlir::MLIRContext &ctx, mlir::ModuleOp mo
                                "RoutingConstantFoldPass"))
         return false;
 
+    // Inject declarative per-tile core trace (#pragma aie_trace) into the host
+    // dispatch function. Runs on the pure-emitc host module so the injected
+    // __Runtime_core_trace_begin/_end calls survive to translateToCpp. No-op
+    // when no trace tiles were requested.
+    if (!runPipelineSinglePass(ctx, hostModule, std::make_unique<CoreTraceInsertPass>(traceTiles), irDir, stage,
+                               "CoreTraceInsertPass"))
+        return false;
+
     // Phase 3: kernel path (blueprint -> kernel schedule -> kernel API)
     if (!runPipelineSinglePass(ctx, kernelModule,
                                std::make_unique<mlir::BlueprintToScheduleKernelPass>(0.5, maxPingPongBytes), irDir,
                                stage, "BlueprintToScheduleKernelPass"))
         return false;
+
+    // Collapse the per-core-tile core DMA config into one BD group per window.
+    // BlueprintToScheduleKernelPass emits a declaretile/dma_bd/create_io/start_io
+    // group per tile (48 groups on a 4x4 mesh with 3 windows), but one kernel.cc
+    // is broadcast to every core tile, so those groups describe at most two
+    // distinct configurations -- identical for S2MM, differing only in packet_id
+    // and ooo_bd_id for MM2S. Must run before DfscheduleToKernelApiPass, which
+    // erases the KernelModuleOp. Gated on routing.kernel_config_offload: without
+    // that pragma there is no per-tile core DMA config to aggregate.
+    if (kernelConfigOffloadOn) {
+        if (!runPipelineSinglePass(ctx, kernelModule, std::make_unique<mlir::DfscheduleKernelAggregationPass>(), irDir,
+                                   stage, "DfscheduleKernelAggregationPass"))
+            return false;
+    } else {
+        llvm::errs() << "[TilingLinalg] DfscheduleKernelAggregationPass skipped (enable with "
+                        "#pragma KERNELCONFIGOFFLOAD).\n";
+    }
 
     // Extract kernel parameter info from KernelModuleOp (before DfscheduleToKernelApiPass lowers it)
     int numInputWindows = 0;
@@ -1499,7 +1801,8 @@ after_host_emit:
 
         if (!allocations.empty()) {
             TilingBcf bcf;
-            bcf.setStack(0x70000, 0x2800);
+            constexpr uint32_t kStackBase = 0x70000;
+            bcf.setStack(kStackBase, allocator.getBaseAddr() - kStackBase);
             bcf.addReservedDMB(0x40000, 0x10000);
             // This crashes the simulator, commenting out for now
             // bcf.addReservedDMB(0x7F800, 0x800);
@@ -1554,7 +1857,8 @@ after_host_emit:
         // consumed shim/port resources from the original rtopology. Phase 5 reads
         // shim tile info from the dmaphop IR and allocates its own DataIO objects.
         // Use the same 0-based partition-relative columns as the host path.
-        RoutingTopology routingPathTopology(aieGen, "", relStartCol, relEndCol, partStartRow, partEndRow);
+        RoutingTopology routingPathTopology(aieGen, "", dataStartCol, relEndCol, partStartRow, partEndRow);
+        reserveControl(routingPathTopology.getRM());
 
         if (!runPipelineSinglePass(ctx, routingDmaphopModule,
                                    std::make_unique<DmaphopToRoutinghwPass>(routingPathTopology), routingIrDir, rstage,
@@ -1568,6 +1872,14 @@ after_host_emit:
             auto routingProvenancePass = std::make_unique<RoutingProvenanceMapPass>(outputDir, partStartCol, aieGen);
             runPipelineSinglePass(ctx, routingDmaphopModule, std::move(routingProvenancePass), routingIrDir, rstage,
                                   "RoutingProvenanceMapPass");
+        }
+
+        // Emit the routing resource map JSON (tile/port/pktid/pkt-mask). Must run
+        // BEFORE RoutingHWLowerPass, while the routinghw connection ops still exist.
+        {
+            auto routingResourcePass = std::make_unique<RoutingResourceMapPass>(outputDir, partStartCol, aieGen);
+            runPipelineSinglePass(ctx, routingDmaphopModule, std::move(routingResourcePass), routingIrDir, rstage,
+                                  "RoutingResourceMapPass");
         }
 
         if (!runPipelineSinglePass(ctx, routingDmaphopModule, std::make_unique<RoutingHWLowerPass>(routingPathTopology),

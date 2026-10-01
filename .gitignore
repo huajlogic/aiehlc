@@ -3,6 +3,7 @@ Crash_Report/
 *.mlir
 *.json
 *.txt
+.ipcache/
 
 # build/binary
 aout/

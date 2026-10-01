@@ -99,6 +99,38 @@ def dfschedule_DeclareTileOp : dfscheduleop<"declaretile"> {
   let assemblyFormat = "attr-dict `:` type($tile)";
 }
 
+// Declare THE tile that is executing this kernel.
+def dfschedule_DeclareTileSelfOp : dfscheduleop<"declaretile.self"> {
+  let summary = "The core tile executing this kernel (resolved at runtime)";
+  let description = [{
+    One kernel ELF is broadcast to every core tile, so core-tile DMA config is
+    not bound to a location: the core discovers its own (col,row) at runtime via
+    `get_coreid()`. This op denotes that tile, and produces the same
+    `!dfschedule.tile` handle as `dfschedule.declaretile` so every op taking a
+    tile accepts it unchanged.
+
+    KERNEL PATH ONLY. The host programs specific tiles over the config bus and
+    lowers a tile handle to `XAie_TileLoc(col, row)`, which a self-tile cannot
+    supply -- `DfscheduleToApiPass` rejects one rather than emitting a bogus
+    address.
+
+    This exists instead of a `declaretile {col = -1, row = -1}` sentinel so that
+    "no coordinates" is a TYPE-level fact: `getDefiningOp<DeclareTileOp>()`
+    returns null for a self-tile, which makes coordinate-reading code fail
+    closed instead of silently computing -1. (The sentinel was also easy to
+    test wrongly: `getCol()` returns uint32_t, so `getCol() < 0` is always
+    false.)
+
+    Example:
+    ```mlir
+    %t = dfschedule.declaretile.self : !dfschedule.tile
+    ```
+  }];
+  let arguments = (ins);
+  let results = (outs dfschedule_TileHandleType:$tile);
+  let assemblyFormat = "attr-dict `:` type($tile)";
+}
+
 // Create a packet handle
 def dfschedule_PacketOp : dfscheduleop<"packet", [Symbol]> {
   let summary = "Create a named packet associated with data and DMA channel";
@@ -146,21 +178,32 @@ def dfschedule_ConfigDmaBdOp : dfscheduleop<"config.dma_bd"> {
     dfschedule_TileHandleType:$tile,
     I32:$bd_id,
     I32:$offset,
+    // packet_id and out_of_order_bd_id are SSA operands, not attributes, for the
+    // same reason bd_id and offset are: they are per-tile values, and as operands
+    // they are visible to the normal SSA machinery (canonicalization, operand
+    // cloning, "where did this come from"). As attributes they were baked in at
+    // op-creation time, so a value that was wrong or missing at that moment
+    // stayed wrong with nothing downstream able to notice -- which is exactly how
+    // every MM2S core BD ended up with out_of_order_bd_id = -1.
+    //
+    // They must stay arith.constant-foldable: the kernel path reads them back to
+    // build the per-tile dispatch in kernel.cc and has no runtime path for them.
+    I32:$packet_id,
+    // Out-of-order BD target: when >= 0, this core MM2S BD tells the shim S2MM
+    // DMA engine to use this specific BD ID for the transfer (via
+    // XAie_DmaSetOutofOrderBdId). Value of -1 means "not used".
+    I32:$out_of_order_bd_id,
     I32Attr:$len,
     BoolAttr:$enable_packet,
-    I32Attr:$packet_id,
     I32Attr:$next_bd,
     DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_id,
     DefaultValuedAttr<I32Attr, "-1">:$acquire_lock_val,
     DefaultValuedAttr<I32Attr, "-1">:$release_lock_id,
     DefaultValuedAttr<I32Attr, "-1">:$release_lock_val,
     DefaultValuedAttr<I32Attr, "-1">:$data_id,
+    // Keep this LAST among the operands: it is the only optional one, so the
+    // parser can disambiguate it positionally ("a 7th operand is linked_bd").
     Optional<dfschedule_BdHandleType>:$linked_bd,
-    // Out-of-order BD target: when >= 0, this core MM2S BD tells the shim S2MM
-    // DMA engine to use this specific BD ID for the transfer (via
-    // XAie_DmaSetOutofOrderBdId). Value of -1 means "not used" (backward
-    // compatible).
-    DefaultValuedAttr<I32Attr, "-1">:$out_of_order_bd_id,
     // Multi-dimensional addressing (optional, up to 4 dims)
     // When both present and non-empty, generates XAie_DmaSetMultiDimAddr
     // When absent, generates existing XAie_DmaSetAddrLen (no behavior change)
@@ -212,20 +255,73 @@ def dfschedule_LoadKernelGroupOp : dfscheduleop<"config.load_kernel_group"> {
     ```mlir
     %kg = dfschedule.config.load_kernel_group(%tile0, %tile1) {
       callee = [@dskernel_receiver],
-      kernel_config = @kernelconfig,
-      distributed_compute_kernel_args = [@compute0, @compute0]
+      kernel_config = @kernelconfig
     }
     ```
   }];
   let arguments = (ins
     Variadic<dfschedule_TileHandleType>:$tiles,
     SymbolRefArrayAttr:$callee,
-    SymbolRefArrayAttr:$distributed_compute_kernel_args,
     OptionalAttr<FlatSymbolRefAttr>:$kernel_config,  // NEW: single unified config
     OptionalAttr<SymbolRefArrayAttr>:$distributed_args  // OLD: for backward compat
   );
   let results = (outs dfschedule_KernelGroupType:$kernel_group);
   let hasCustomAssemblyFormat = 1;
+}
+
+// ============================================================================
+// CONTROL-PLANE GROUP REGISTER-WRITE OPERATIONS
+// ============================================================================
+// These ops coalesce identical per-tile register writes (emitted individually
+// today by BD/lock lowering) into hardware control-packet group writes: one
+// shim-DMA push fans out to N tiles through the stream switch. The coalescing
+// decision is made by GroupRegWritePass; lowering (DfscheduleToApiPass) maps
+// them onto the existing control-plane runtime.
+
+// One-shot control fabric configuration. Lowers to __Runtime_ctrl_plan_init.
+// Produces an SSA fabric handle threaded to every group_reg_write.
+def dfschedule_CtrlPlanInitOp : dfscheduleop<"ctrl_plan_init"> {
+  let summary = "Configure the control-packet row fabric once (broadcast/row-multicast)";
+  let description = [{
+    Sets up the shared control spine + per-row EAST chains used by grouped
+    register writes. `rows` is an array of dictionary attrs, each carrying
+    row/col_lo/col_hi describing one configured chain (ordered bottom-up).
+    It lowers to __Runtime_ctrl_plan_init and yields the fabric handle.
+  }];
+  let arguments = (ins
+    I32Attr:$shim_col,
+    I32Attr:$ctrl_id,
+    I32Attr:$resp_s2mm_ch,
+    ArrayAttr:$rows  // array of DictionaryAttr {row, col_lo, col_hi}
+  );
+  let results = (outs dfschedule_CtrlFabricType:$fabric);
+  let assemblyFormat = "attr-dict `:` type($fabric)";
+}
+
+// A coalesced register write delivered by control packet to a group of tiles.
+// kind = "broadcast" -> __Runtime_ctrl_row_broadcast_write (whole array)
+// kind = "row"       -> __Runtime_ctrl_row_whole_row_write (all cols of $row)
+def dfschedule_GroupRegWriteOp : dfscheduleop<"group_reg_write"> {
+  let summary = "Coalesced control-packet register write to a group of tiles";
+  let description = [{
+    Writes `data` (one or more 32-bit words) to tile-local byte address
+    `tile_addr` on every tile of the addressed group. `kind` selects the
+    delivery scope: "broadcast" (all configured tiles) or "row" (all columns of
+    `row`). Fire-and-forget over the control fabric produced by
+    dfschedule.ctrl_plan_init.
+  }];
+  let arguments = (ins
+    dfschedule_CtrlFabricType:$fabric,
+    StrAttr:$kind,                              // "broadcast" | "row"
+    DefaultValuedAttr<I32Attr, "-1">:$row,      // target row for kind="row"
+    I32Attr:$tile_addr,                         // tile-local byte address
+    I32ArrayAttr:$data,                         // words to write
+    I32Attr:$bd_id,
+    I32Attr:$mm2s_ch,
+    DefaultValuedAttr<I32Attr, "0">:$log
+  );
+  let results = (outs);
+  let assemblyFormat = "`(` $fabric `)` attr-dict `:` `(` type($fabric) `)`";
 }
 
 // ============================================================================

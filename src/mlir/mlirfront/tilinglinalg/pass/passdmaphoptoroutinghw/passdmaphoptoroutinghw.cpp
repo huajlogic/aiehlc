@@ -15,6 +15,7 @@
 #include "routing/routingpath.h"
 #include "routinghwmanager.h"
 #include "routingmanager.h"
+#include "routinghw_pkt_slot.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include <iostream>
@@ -31,6 +32,16 @@ using namespace routinghw;
 namespace {
 
 int ioIdx = 0;
+
+static routinghw::pktslot::PktSlotAttrValues<ConversionPatternRewriter>
+makeDataPlanePktSlotAttrs(ConversionPatternRewriter &rewriter, RoutingTopology &router, PortDirection receivePort) {
+    auto rm = router.getRM();
+    auto arbiter = rm->dataPlanePktArbiter();
+    auto slot = rm->dataPlanePktSlaveSlot(receivePort);
+    if (!arbiter || !slot)
+        llvm::report_fatal_error("No packet-switch resources remain after control-plane reservation");
+    return routinghw::pktslot::makePktSlotAttrs(rewriter, *slot, *arbiter);
+}
 
 // Info about a consumer/producer op, captured before erasure
 struct DmaPortInfo {
@@ -289,6 +300,8 @@ std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
         // For output gather flows, preserve packet headers when OOO is enabled
         // so shim S2MM DMA can do OOO BD dispatch based on packet_id.
         bool preserveHdr = true;
+        auto pktSlot =
+            makeDataPlanePktSlotAttrs(rewriter, router_, value.SlaveReceiveForwardDirection);
         rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
             op->getLoc(), // Operation location
             output,
@@ -306,8 +319,7 @@ std::optional<TileListPktRoutingNode> GatherPktRoutingPathCreate(Operation* op,
                 PortDirectiontoString(value.MasterSendToNextTileDirection)), // No forwarding: empty master direction
             rewriter.getI32IntegerAttr(
                 (int)(value.MasterSendToNextTileDirectionPortIdx)), // No forwarding: port index 0
-            rewriter.getBoolAttr(preserveHdr)                       // preserveheader: keep headers for OOO BD dispatch
-        );
+            rewriter.getBoolAttr(preserveHdr), ROUTINGHW_PKT_SLOT_ATTRS(pktSlot));
     }
     ret.tile = tilist.back();
     ret.pktconn = pktswitchmap[ret.tile];
@@ -464,7 +476,12 @@ GetSeqPath(std::optional<std::shared_ptr<const RoutingPath>> rpath, std::shared_
 
     for (const auto& p : orderedPathPoints) {
         connectionData[p].localDMAForwardDirection = PortDirection::NONE;
-        if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core && StreamType::BROADCAST == streamtype &&
+        // CONTROL flows deliver to each target core like BROADCAST, but the
+        // final termination is the tile's CTRL port (handled in
+        // ParseTheCCTRoutingPath). Marking localDMAForwardDirection here lets the
+        // per-tile termination fire; the DMA port index is unused for CTRL sinks.
+        if (rm->getrsc()->tileType(p.r, p.c) == TileType::Core &&
+            (StreamType::BROADCAST == streamtype || StreamType::CONTROL == streamtype) &&
             dsttiles.find(p) != dsttiles.end()) {
             auto it = consumerDmaPortMap.find(p);
             if (it != consumerDmaPortMap.end()) {
@@ -499,6 +516,14 @@ void ParseTheCCTRoutingPath(Operation *op, std::optional<TileListPktRoutingNode>
 
     auto loc = op->getLoc();
     auto outputType = rewriter.getI32Type();
+    // Control-packet flow: the stream carries config/register writes that must
+    // terminate at each target tile's CTRL master stream-switch port (packet
+    // mode, header preserved) instead of the S2MM DMA data path. Uses the same
+    // path/fan-out as BROADCAST. A single control stream id is used for the flow
+    // (5-bit stream-packet-header id space, bits[4:0]); broadcast targets share
+    // the id so identical writes land on every tapped tile.
+    bool isControl = (streamtype == StreamType::CONTROL);
+    int ctrlPktId = static_cast<int>(dioid & 0x1f);
     // --- Phase 1: Build connection map AND an ordered list of points ---
     auto troutingmap =
         GetSeqPath(rpath, dio, dsttiles, streamtype /* 0 normal no dma, 1 broadcast dma receive*/, lastPkttilemap,
@@ -580,6 +605,7 @@ void ParseTheCCTRoutingPath(Operation *op, std::optional<TileListPktRoutingNode>
                 // preserve headers so shim S2MM DMA can read packet_id for
                 // OOO BD dispatch.
                 bool preserveHdrTransition = true;
+                auto pktSlot = makeDataPlanePktSlotAttrs(rewriter, router_, PortDirection::NONE);
                 rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
                     loc, // Operation location
                     output,
@@ -597,8 +623,7 @@ void ParseTheCCTRoutingPath(Operation *op, std::optional<TileListPktRoutingNode>
                         conn.MasterSendToNextTileDirection)), // No forwarding: empty master direction
                     rewriter.getI32IntegerAttr(
                         (int)(conn.MasterSendToNextTileDirectionPortIdx)), // No forwarding: port index 0
-                    rewriter.getBoolAttr(preserveHdrTransition)            // preserveheader
-                );
+                    rewriter.getBoolAttr(preserveHdrTransition), ROUTINGHW_PKT_SLOT_ATTRS(pktSlot));
             }
             continue;
         }
@@ -644,11 +669,36 @@ void ParseTheCCTRoutingPath(Operation *op, std::optional<TileListPktRoutingNode>
                     conn.MasterSendToNextTileDirectionPortIdx2);
             }
 
-            // Create connection to the local DMA (if this is a destination core tile)
+            // Create connection to the local sink (if this is a destination core tile).
             if (conn.localDMAForwardDirection != PortDirection::NONE) {
-                rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
-                    inputDirStr, inputPortIdx,
-                    "DMA", conn.localDMAForwardPortIdx);
+                if (isControl) {
+                    // Control-packet terminal: route the incoming stream into the
+                    // tile's CTRL master stream-switch port (packet mode, header
+                    // preserved) so the control-packet header/data drive an
+                    // in-tile register/memory write. RoutingHWLowerPass forces the
+                    // master port to CTRL and DONOT_DROP_HEADER when
+                    // localsinkport=="CTRL"; forwardmaster is left NONE here.
+                    auto pktSlot = routinghw::pktslot::makePktSlotAttrs(rewriter);
+                    auto ctrlOp = rewriter.create<routinghw::ConnectStreamPktSwitchPort>(
+                        loc, outputType, currentTileOp.getResult(),
+                        rewriter.getStringAttr(inputDirStr),                                // receiveslavedirection
+                        rewriter.getI32IntegerAttr(inputPortIdx),                           // receiveslaveportidx
+                        rewriter.getI32IntegerAttr(ctrlPktId),                              // receiveslavepktid
+                        rewriter.getI32IntegerAttr(0),                                      // receiveslavepkttype
+                        rewriter.getStringAttr(PortDirectiontoString(PortDirection::NONE)), // localdmadirection = NONE
+                        rewriter.getI32IntegerAttr(0),                                      // localdmaportidx
+                        rewriter.getI32IntegerAttr(0),                                      // localdmapktid
+                        rewriter.getI32IntegerAttr(0),                                      // localdmapkttype
+                        rewriter.getStringAttr(PortDirectiontoString(PortDirection::NONE)), // forwardmasterdirection
+                        rewriter.getI32IntegerAttr(0),                                      // forwardmasterportidx
+                        rewriter.getBoolAttr(true),                                         // preserveheader
+                        ROUTINGHW_PKT_SLOT_ATTRS(pktSlot));
+                    ctrlOp->setAttr("localsinkport", rewriter.getStringAttr("CTRL"));
+                } else {
+                    rewriter.create<ConnectStreamSingleSwitchPort>(loc, outputType, currentTileOp.getResult(),
+                                                                   inputDirStr, inputPortIdx, "DMA",
+                                                                   conn.localDMAForwardPortIdx);
+                }
             }
         }
     }
@@ -1004,7 +1054,14 @@ struct DmaphopPathConversionPattern : public OpConversionPattern<dmaphop::create
         Point firstTile = isShimToCore ? coreTileList[0] : coreTileList.back();
         DMADIRECTION dmadir = isShimToCore ? DMADIRECTION::MM2S : DMADIRECTION::S2MM;
         StreamType streamtype = isShimToCore ? StreamType::BROADCAST : StreamType::FORWARDONLY;
-        
+        // A control-packet flow is a shim->core (MM2S) delivery of config/register
+        // writes. When the dmaphop path is marked control, terminate at each
+        // target tile's CTRL port (packet mode, header preserved) instead of DMA.
+        if (isShimToCore && op->hasAttrOfType<BoolAttr>("control") &&
+            op->getAttrOfType<BoolAttr>("control").getValue()) {
+            streamtype = StreamType::CONTROL;
+        }
+
         // Try to find existing DataIO for the shim location
         // If shim was specified in dmaphop, we should look it up
         // Otherwise, create a new DataIO

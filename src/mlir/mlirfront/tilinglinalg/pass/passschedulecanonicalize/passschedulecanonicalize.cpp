@@ -82,7 +82,13 @@ struct FoldDuplicateShimBdPattern : public OpRewritePattern<dfschedule::ConfigDm
         // Also skip BDs with out_of_order_bd_id set (core MM2S OOO BDs).
         if (op.getEnablePacket())
             return failure();
-        if (static_cast<int32_t>(op.getOutOfOrderBdId()) >= 0)
+        // out_of_order_bd_id is an SSA operand. Only a constant < 0 ("unused")
+        // permits folding; a runtime-computed value could be anything, so be
+        // conservative and never fold -- same treatment bd_id/offset get below.
+        APInt oooVal;
+        if (!matchPattern(op.getOutOfOrderBdId(), m_ConstantInt(&oooVal)))
+            return failure();
+        if (static_cast<int32_t>(oooVal.getSExtValue()) >= 0)
             return failure();
 
         int32_t dataId = static_cast<int32_t>(op.getDataId());
@@ -232,18 +238,17 @@ static void preMapExternalValues(Operation *rcOp, OpBuilder &builder, Location l
 
 struct KernelCfgEntry {
     TileKey tileKey;
-    ArrayAttr tileConfigs; // from DeclareKernelConfigOp.tile_configs
-    Attribute computeArg;  // from LoadKernelGroupOp.distributed_compute_kernel_args[i]
 };
 
 /// Collect kernel config info from the cloned RoutingCreate block, then erase
 /// the ops that must NOT be inlined (ScheduleWait, LaunchKernelGroup,
-/// LoadKernelGroup, DeclareKernelConfig, FreeDeviceMem).
+/// LoadKernelGroup, FreeDeviceMem).
 /// Non-launch events from ScheduleWaitOp are pushed into `allWaitEvents`.
 static void collectAndErasePreInlineOps(Block &clonedBlock, Operation *clonedRc,
                                         SmallVector<KernelCfgEntry> &kernelCfgEntries, ArrayAttr &calleeAttrs,
                                         SmallVector<Value> &allWaitEvents) {
-    // First pass: collect from LoadKernelGroupOp (tile→config association).
+    (void)clonedRc;
+    // First pass: collect core tiles from LoadKernelGroupOp.
     for (Operation &op : clonedBlock) {
         auto loadOp = dyn_cast<dfschedule::LoadKernelGroupOp>(&op);
         if (!loadOp)
@@ -252,34 +257,13 @@ static void collectAndErasePreInlineOps(Block &clonedBlock, Operation *clonedRc,
         if (!calleeAttrs)
             calleeAttrs = loadOp.getCalleeAttr();
 
-        auto distArgsOpt = loadOp.getDistributedArgs();
-        auto computeKernelArgs = loadOp.getDistributedComputeKernelArgs();
         auto tiles = loadOp.getTiles();
 
         for (size_t i = 0; i < tiles.size(); ++i) {
             auto tileDecl = tiles[i].getDefiningOp<dfschedule::DeclareTileOp>();
             if (!tileDecl)
                 continue;
-            TileKey k = getTileKey(tileDecl);
-
-            // Find the corresponding DeclareKernelConfigOp via symbol lookup.
-            ArrayAttr tileConfigs;
-            if (distArgsOpt) {
-                ArrayAttr distArgs = *distArgsOpt;
-                if (i < (size_t)distArgs.size()) {
-                    if (auto symRef = dyn_cast<SymbolRefAttr>(distArgs[i])) {
-                        if (auto cfgOp = SymbolTable::lookupSymbolIn(clonedRc, symRef.getRootReference()))
-                            if (auto kCfg = dyn_cast<dfschedule::DeclareKernelConfigOp>(cfgOp))
-                                tileConfigs = kCfg.getTileConfigs();
-                    }
-                }
-            }
-
-            Attribute computeArg = SymbolRefAttr::get(clonedRc->getContext(), "compute0");
-            if (i < computeKernelArgs.size())
-                computeArg = computeKernelArgs[i];
-
-            kernelCfgEntries.push_back({k, tileConfigs, computeArg});
+            kernelCfgEntries.push_back({getTileKey(tileDecl)});
         }
     }
 
@@ -299,7 +283,7 @@ static void collectAndErasePreInlineOps(Block &clonedBlock, Operation *clonedRc,
     SmallVector<Operation *> eraseList;
     for (Operation &op : clonedBlock) {
         if (isa<dfschedule::ScheduleWaitOp, dfschedule::LaunchKernelGroupOp, dfschedule::LoadKernelGroupOp,
-                dfschedule::DeclareKernelConfigOp, dfschedule::FreeDeviceMemOp>(&op))
+                dfschedule::FreeDeviceMemOp>(&op))
             eraseList.push_back(&op);
     }
     for (Operation *op : llvm::reverse(eraseList)) {
@@ -439,8 +423,6 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
     }
 
     SmallVector<Value> allCoreTileVals;
-    SmallVector<Attribute> allComputeArgs;
-    SmallVector<Attribute> kernelConfigSyms;
 
     for (size_t i = 0; i < uniqueEntries.size(); ++i) {
         auto &entry = uniqueEntries[i];
@@ -449,21 +431,13 @@ static void buildHostBlockByCloning(func::FuncOp mainFunc, ModuleOp moduleOp) {
             continue;
 
         allCoreTileVals.push_back(tileVal);
-        allComputeArgs.push_back(entry.computeArg);
-
-        std::string cfgName = "kernelconfig_merged" + std::to_string(i);
-        ArrayAttr cfgAttr = entry.tileConfigs ? entry.tileConfigs : builder.getArrayAttr({});
-        builder.create<dfschedule::DeclareKernelConfigOp>(loc, dfschedule::KernelConfigType::get(ctx),
-                                                          builder.getStringAttr(cfgName), cfgAttr);
-        kernelConfigSyms.push_back(SymbolRefAttr::get(ctx, cfgName));
     }
 
     Value launchEvent;
     if (!allCoreTileVals.empty() && calleeAttrs) {
         auto loadOp = builder.create<dfschedule::LoadKernelGroupOp>(
             loc, dfschedule::KernelGroupType::get(ctx), allCoreTileVals, calleeAttrs,
-            builder.getArrayAttr(allComputeArgs),
-            /*kernel_config=*/nullptr, builder.getArrayAttr(kernelConfigSyms));
+            /*kernel_config=*/nullptr, /*distributed_args=*/nullptr);
         auto launchOp = builder.create<dfschedule::LaunchKernelGroupOp>(loc, dfschedule::EventType::get(ctx),
                                                                         loadOp.getKernelGroup());
         launchEvent = launchOp.getEvent();

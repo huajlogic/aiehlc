@@ -156,6 +156,7 @@
 | `passdfscheduletoapi/passdfscheduletoapi.cpp` | 3,595 | dfschedule -> EmitC (host.cc) **LARGEST PASS** |
 | `passdfscheduletokernelapi/passdfscheduletokernelapi.cpp` | 369 | dfschedule -> EmitC (kernel.cc) |
 | `passdfscheduleprovenancemap/passdfscheduleprovenancemap.cpp` | 800 | Provenance tracking (debug) |
+| `passcoretraceinsert/passcoretraceinsert.cpp` | 97 | Inject `__Runtime_core_trace_begin/_end` for `#pragma aie_trace` tiles (host path, emitc level) |
 
 ---
 
@@ -164,7 +165,7 @@
 **Key Files:**
 | File | Lines | Role |
 |------|-------|------|
-| `src/mlir/runtime/aie_runtime.c` | 1,363 | Core runtime: device_init, load_kernel, dma_bd_config, wait_event |
+| `src/mlir/runtime/aie_runtime.c` | 1,363 | Core runtime: device_init, load_kernel, dma_bd_config, wait_event; `__Runtime_core_trace_begin/_end` session helpers (fixed-reserved MemTile drain + `AieTraceProfile` bookkeeping) for `#pragma aie_trace`. `__Runtime_core_trace_end` splits into `__Runtime_core_trace_end_into(dev, prof)` (read+decode into a caller-supplied profile, no init/dump) + a thin dumping wrapper; `example/perf/aieml_perf.cc` consumes the session helpers, using `_end_into` to unify core trace with its `[TIMESYNC]` host clock/anchor/event profile in one dump. `__Runtime_core_trace_begin` is itself a thin wrapper over `__Runtime_core_trace_begin_ch(dev, col, row, strm_ch)` (`AIE_TRACE_STRM_CH_AUTO` = slot default); the `_ch` form PINS the physical stream channel the core->MemTile trace route rides, because that route is programmed directly (outside the routing engine's ResourceManager) and an auto channel colliding with a data-plane DMA on the same SOUTH egress deadlocks it — `aieml_perf.cc` pins strm_ch=1 so its output DMA (SOUTH ch 0) is clear |
 | `src/mlir/runtime/aie_runtime.h` | 380 | Runtime API declarations |
 | `src/mlir/runtime/aie_runtime_common.c` | 585 | Common utilities |
 | `src/mlir/runtime/aie_runtime_debug.c` | 2,143 | Debug/diagnostic wrappers |

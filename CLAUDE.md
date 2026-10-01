@@ -27,6 +27,10 @@ aiehlc/
 │               ├── routinghw/     # Physical routing dialect
 │               ├── dataflowmap/   # dmap, dmaphop, dfscheblueprint, dfschedule dialects
 │               └── pass/          # All lowering passes + unitest/
+│                   └── passblueprintlowering/  # host+kernel blueprint lowering
+│                       ├── helper/             # SHARED core-tile DMA/lock config
+│                       ├── passblueprinttoschedule/       # → host.cc
+│                       └── passblueprinttoschedulekernel/ # → kernel.cc
 ├── script/                    # setup.sh, aiehlc.sh, kc.sh, test/apppaltest.py
 ├── example/                   # AIE examples (perf, matmul, multi-kernel)
 └── thirdparty/alib/           # XAie driver (excluded from this doc)
@@ -43,6 +47,32 @@ User C++ → aiehlc (Clang AST) → AieFrontEnd (MLIR)
 ```
 
 Key runtime API: `__Runtime_device_init`, `__Runtime_load_kernel_group`, `__Runtime_launch_kernel_group`, `__Runtime_dma_bd_config`, `__Runtime_wait_event`, `__Runtime_device_teardown`.
+
+**Control-packet plane** — register access over the stream fabric instead of the host
+config bus. See **[doc/controlplane.md](doc/controlplane.md)** for the full API,
+encoding, and fabric layout. In brief:
+
+| Layer | Entry points |
+|-------|--------------|
+| Packet encode/parse | `__Runtime_ctrl_pktize_write` / `_pktize_read`, `_parse_ctrl_hdr` / `_parse_pkt_hdr` |
+| Single-target send | `__Runtime_CtrlInstance` + `_setup_routing` / `_push` / `_tct_poll`; composed by `_read_target` / `_push_target` |
+| Row/broadcast fabric | `__Runtime_ctrl_plan_init` (one-shot planner, `aie_runtime_control_plan.c`), then `_row_broadcast_write` / `_row_whole_row_write` / `_row_read` / `_row_write_ack` |
+| Transaction capture | `__Runtime_control_start_transaction` → `_write_pkt_commit_transaction` → `_control_push` (WRITE-only ops → broadcast/multicast packet buffer) |
+| Resource reservation | `aie_runtime_resource.{c,h}` — single source of truth for slots/arbiters/msel/pkt-ids; `RT_RES_*` constants aliased by the planner's `ACR_*` |
+
+Key invariants worth knowing before touching it:
+
+- Completion is the **control-packet response** draining at the shim S2MM
+  (`resp_words` words), not a DMA TCT token.
+- The return route KEEPS each response's stream header
+  (`XAIE_SS_PKT_DONOT_DROP_HEADER`); it is stripped host-side in `rt_ctrl_read_extract`.
+- Forward routing arms a **uniform slot superset** on every chain tile — all columns of
+  a row respond; there is no last-tile special case.
+- Provenance `dir=fwd|ret` comes from the planner's `acr_op.is_ret` tag, **not** the port
+  type (both fabrics use the same ports). A slot and every master pulling it must share
+  a `dir`, or the debug switch-detail view silently drops the link.
+- `ResourceMgr::reserveControlPlaneResources` is **opt-in** via
+  `#pragma control_plan_op_control_packet`; default off.
 
 Platforms: baremetal (`aarch64-none-elf-g++`) or Linux (`aarch64-linux-gnu-g++`).
 
@@ -93,11 +123,39 @@ pybind: `build_aiegraph_module(ops)` (build+verify → textual IR) and
 
 **Host path** → `host.cc`:
 
-5. `BlueprintToSchedulePass` → `ScheduleCanonicalizePass` → `DfscheduleToApiPass` → `RoutingConstantFoldPass` → `CanonicalizerPass` → EmitC → `host.cc`
+5. `BlueprintToSchedulePass` → `ScheduleCanonicalizePass` → (`GroupRegWritePass`, opt-in) → `DfscheduleToApiPass` → `RoutingConstantFoldPass` → `CanonicalizerPass` → EmitC → `host.cc`
+
+`GroupRegWritePass` is **gated** on `routing.control_plan_group_reg_write`, published by
+aiehlc only for `#pragma CONTROL_PLAN_GROUP_REG_WRITE`. Off (the default), per-tile lock
+inits emit as individual `XAie_LockSetValue` writes instead of coalesced control-packet
+group writes (`__Runtime_ctrl_row_write_ack`), and the pipeline logs
+`GroupRegWritePass skipped`.
 
 **Kernel path** → `kernel.cc`:
 
-5. `BlueprintToScheduleKernelPass` → `DfscheduleToKernelApiPass` → EmitC → `kernel.cc`
+5. `BlueprintToScheduleKernelPass` → (`DfscheduleKernelAggregationPass`, offload-only) → `DfscheduleToKernelApiPass` → EmitC → `kernel.cc`
+
+`DfscheduleKernelAggregationPass` (`pass/passdfschedulekernelaggregation/`, gated on
+`routing.kernel_config_offload`) collapses the per-core-tile DMA config onto
+`dfschedule.declaretile.self` — one BD group per window instead of one per tile
+(96 → 6 `dma_bd`). `packet_id` / `out_of_order_bd_id` are **SSA operands, not
+attributes**, and must stay `arith.constant`-foldable. See
+**[doc/design/kernel_dma_aggregation.md](doc/design/kernel_dma_aggregation.md)** — it
+covers why `declaretile.self` is its own op (fail-closed on `getDefiningOp`), why
+`ooo_bd_id` needs the `ResourceMgr` singleton fallback on the kernel clone, and why
+erasure must be a fixpoint sweep.
+
+**KERNELCONFIGOFFLOAD** (gated on `routing.kernel_config_offload`, set by
+`#pragma KERNELCONFIGOFFLOAD`, default off, Gen5 only): the core self-configures all of
+its own core-tile DMA from `kernel.cc` via MMIO instead of the host programming it over
+the config bus, using `src/mlir/runtime/aie_kernel_runtime.h` (encoders + `core_reg_*`
+apply, the latter going through `kernel_tm.h`'s `TM_W` — a plain pointer cast never
+reaches the processor bus). See
+**[doc/design/kernel_config_offload.md](doc/design/kernel_config_offload.md)** for that
+TM rule, the direction asymmetry, the cross-clone plan channel, and the BD-id reservation
+contract — each one deadlocks or silently corrupts registers if broken.
+
+**Pass layout.** Both blueprint-lowering passes live under `pass/passblueprintlowering/`, with the shared `helper/` hoisted **above** them (`passblueprintlowering/helper/`) rather than nested inside the host pass. The two paths describe the same physical core tiles — one BD bank, one lock array per tile — so whoever programs it must agree with whoever doesn't. Anything both paths must agree on belongs in `helper/`. See `passblueprintlowering/README.md`.
 
 **Routing path** (alternative, Path A) → `routing.cc`:
 
@@ -147,47 +205,83 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 
 ## Additional Documentation
 
-### Design & Reference Docs
-- **[doc/module_analysis.md](doc/module_analysis.md)** — 9-module breakdown (M1–M9) with key files, line counts, I/O, dependencies, data-flow diagram.
-- **[doc/aieapi.md](doc/aieapi.md)** — XAie driver API guide: single-tile flow, multi-tile manual routing/DMA/locks, production call patterns.
-- **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: all 6 dialects, 15 passes, routing engine, test/build/HW-run flow.
-- **[doc/lowering.md](doc/lowering.md)** — IR lowering trace of a 2x2 mesh / 16x16 tensor through every dialect stage, with IR snippets and op→API tables.
-- **[doc/llvm_mlir_pitfalls.md](doc/llvm_mlir_pitfalls.md)** — Known LLVM/MLIR API pitfalls (ArrayRef dangling, StringRef lifetime, RTTI, SSA discipline, etc.).
-- **[doc/design/tile_dim_structured_design.md](doc/design/tile_dim_structured_design.md)** — Structured `tile_dim` (size/stride/groups) for `aie::SpatialPolicy`; unifies conv halo/overlap.
-- **[doc/design/spatial_space_composition.md](doc/design/spatial_space_composition.md)** — Composition-based op spaces (`GemmSpace`, `Conv2dSpace`) over a lean `SpatialPolicy`.
-- **[doc/design/aiegdb_live_debug_framework.md](doc/design/aiegdb_live_debug_framework.md)** — Design for the live debug/test framework unifying the static schedule viewer with a runtime daemon.
-- **[doc/design/tvm_frontend.md](doc/design/tvm_frontend.md)** — TVM ResNet-18 frontend (`src/frontend/tvm/`), a **third frontend into `TilingLinalgPipeline`** alongside C++ `aiehlc` and `aietriton`: ONNX→Relay→fused-graph walk→per-layer `run_aie_pipeline` launches, reusing `_aietriton_core`. Covers the op-mapping table, the bit-exact Q7 int8 CPU oracle, and the pybind `dma_specs` (generic `DmaAddressing`) extension for the im2col conv path. Also: the 2-byte LE uint16 param config header (duplicated across ~6 readers that must stay in lock-step — a stale one computes garbage silently), the all-CPU `enable_aiehlc_offload=False` build, and `quant/` (real int8 PTQ of pretrained ImageNet ResNet-18 → C that genuinely classifies; the scaled `model.py` uses placeholder weights and ties every logit).
-- **[src/frontend/tvmrelay/README.md](src/frontend/tvmrelay/README.md)** — the **Relay-era** sibling of `src/frontend/tvm`, targeting **TVM 0.16** (the last release with a complete `tvm.relay`). One environment holds one TVM, so the two frontends are **mutually exclusive**. `setup_tvm016.py` detects/uninstalls a newer TVM and source-builds `v0.16.0` into `thirdparty/tvm-0.16/` (gitignored; no 0.16 wheel exists on PyPI or tlcpack), then proves itself by importing a real ONNX model through Relay. Also holds `onnx_compat.py`, which applies two import-time fixups: `ensure_tvm016()` (checks for TVM 0.16 + working `tvm.relay` and **auto-installs via `setup_tvm016.provision()` if missing** — disable with `AIEHLC_TVM_AUTO_INSTALL=0`; guarded against verify→import→provision recursion by the `_TVMRELAY_PROVISIONING` sentinel) and `ensure_onnx_mapping()` (onnx 1.16 deleted `onnx.mapping`, which TVM 0.16 needs, so the shim is load-bearing for `relay.frontend.from_onnx`). Import as `frontend.tvmrelay` with `.../src` on the path; `.../src/frontend` shadows the real `tvm`/`onnx`. `deploy_flow.py` runs five stages (env → ONNX+Relay import → int8 → `target="c"` codegen → **split**); stage 5 is `split_layers.py`, which breaks the one 4.5k-line generated `resnet18.c` into `layers/` — **one folder per op kind**, one compilable `.c` per layer inside it (`conv2d_add_relu/02_conv2d_add_relu.c`), numbered in graph execution order, plus a shared `layers_common.h`, `manifest.json`, and a `Makefile` where `make <kind>` builds one folder. Grouping is the useful unit: every file in a kind folder is the same operator at a different shape, so one AIE kernel covers the folder. `--flat` gives a single directory. Re-splitting clears only generated `.c`/`.o`, so a hand-written kernel dropped beside them survives. There is **no standalone `relu.c` by default** — TVM's `FuseOps` welds elementwise ops into their producer, so the compiled unit genuinely is conv+bias+residual+relu; pass `--no-fuse` for true per-op files. Two ways into AIE sit on top of the split: `aie_offload.py` (`--aie-offload`, index-selected, lowers named layers) and `aiegraph_partition.py` (`--aiegraph`, **no selection** — lifts the *whole* graph into one verified `aiegraph.func` with real SSA dataflow, then partitions: layers whose aiegraph ops are all in `--aiegraph-ops` go to the aiehlc backend, every other layer **reuses the TVM CPU C** untouched, with a per-layer verdict+reason in `layers/partition.json`). Three traps it is built around: the graph has 24 invocations for 22 symbols (two kernels called twice) so mapping must be **by symbol, not by position** — `aie_offload.select_layers` zips positionally and hands every layer from index 4 on another layer's geometry; a residual block expands to **two** aiegraph ops (`conv_bn` + `residual_add_relu`) that must not be deduplicated into one, and stays on CPU by default because the fused C has no seam to split at; and `max_pool2d`/`batch_flatten` have no op in the 4-op dialect at all. Skill: **tvm016provision**.
-- **[doc/design/tvm_custom_model_recipe.md](doc/design/tvm_custom_model_recipe.md)** — "bring your own model" how-to for the TVM frontend: take a customized model (contrasted with the full ImageNet `example/model/resnet18py`) through ONNX→Relay→`walk.build_plan`→`run_aie_pipeline`, editing `model.py`'s `layer_plan()`/`build_torch_model()` in lock-step. Step-by-step recipe plus the int8-config / fixed-op-set / placeholder-weight constraints and a scale-down mapping table.
+### Design docs
 
-### Skills (static verification & debug procedures)
-- **xaieapiverify** — Static verification of XAie API calls in generated code (port limits, PortVerify, packet consistency, routing connectivity).
-- **routinghwdebug** — End-to-end routing debug: scan routing.cc, trace errors back through the dialect stack to routingimplement root causes.
-- **dmabdverify** — Static verification of DMA Buffer Descriptor config in host.cc (BD/lock IDs, ping-pong, lengths, packet IDs, channels).
-- **datacorrectness** — Pre-HW-run checklist: type widths, direction, bank assignment, address validity, tensor coverage, lock protocol.
-- **aiedriverkb** — AIE Driver Knowledge Base for XAie APIs in `thirdparty/alib/aie-rt` (e.g. KB-101 ELF loading).
-- **aiehwdmadebug** — Live JTAG/XSDB DMA debug (aiediag/aiedbg/aieshow); decodes AIE2PS DMA status; offset-as-value pitfall.
-- **aiesimloaddebug** — Debug sim (`aie2pssimmsm`) segfaults at PS.so load; usual cause is a stale `kernel_elf_init.cc` symbol.
-- **aiehwprofile** — Capture AIE HW perf counters from a running board via the Vitis `aieprofile` XSDB package.
-- **debugui-llm-reset** — Diagnose embedded-LLM context loss / stale live tools during target changes (retarget without restarting Claude).
-- **tvm016provision** — Provisioning TVM 0.16 (Relay) on a modern box: `from tvm import relay` failing on 0.25+, plus the four things that break a `v0.16.0` source build here (CMake 4 / system GTest, PEP 660 vs `pip install -e`, missing runtime deps after the `.pth` fallback, onnx 1.16 dropping `onnx.mapping`) and the `src/frontend` namespace-package shadowing trap.
-- **elfsizetrim** — `main.elf` far bigger than the code justifies. ~70% of a host link is DWARF from the prebuilt BSP/libgloss/aie-rt archives (our own objects are `-Os`, no `-g`), so `hostcompile.sh` publishes `--strip-debug`'d and keeps `main.debug.elf`; `DEBUG_SYMS=1` opts out. Covers the host-vs-cross `objcopy` trap and verifying the LOAD segment is unchanged.
-- **tvmgraphlayermap** — Correlating TVM graph-JSON nodes with `manifest.json` layer folders and aiegraph launches. The three silent off-by-one traps: symbols ≠ invocations (never map positionally), dedup must key on `(folder, op)` not folder, and `__nop` nodes break producer chains.
-- **tvmoffloadgate** — TVM frontend still runs xchesscc with AIE offload disabled; the AIE-vs-CPU split is decided at several call sites (`orchestrator._to_aie` is the single predicate), and an all-CPU build must also synthesize `host.cc` + a no-op `routing.cc`.
-- **dbg-llm-skills** (`src/tool/debug/dbg_llm_skills/`) — Plugin of 9 live-debug procedures loaded by the daemon via `--plugin-dir`.
-- **Command: data-mismatch-debug** (`.claude/commands/data-mismatch-debug.md`) — Systematic DMA data-mismatch debug (supply/demand tables, root-cause patterns).
+- **[doc/module_analysis.md](doc/module_analysis.md)** — 9-module project breakdown (M1–M9), key files, dependencies, data-flow diagram
+- **[doc/aieapi.md](doc/aieapi.md)** — XAie driver API guide (single-tile, multi-tile manual, production AEG patterns)
+- **[doc/controlplane.md](doc/controlplane.md)** — Control-packet plane: encoding, `CtrlInstance` send/recv, row/broadcast fabric, transaction capture, resource reservation, provenance
+- **[doc/performance/register_write_cost.md](doc/performance/register_write_cost.md)** — **Measured** host↔AIE register access cost: ~372 ns per 32-bit `XAie_Write32` (non-posted Device-nGnRnE NoC round trip; an N-word BD is N serial writes) vs ~2.9 ns via control packets. Cite this instead of deriving ns/write from a timeline span.
+- **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: dialects, passes, routing engine, build/HW-run flow
+- **[doc/design/kernel_config_offload.md](doc/design/kernel_config_offload.md)** — `#pragma KERNELCONFIGOFFLOAD`: core self-configured DMA, lock asymmetry, BD-id reservation
+- **[doc/design/kernel_dma_aggregation.md](doc/design/kernel_dma_aggregation.md)** — `DfscheduleKernelAggregationPass`, `declaretile.self`, `packet_id`/`ooo_bd_id` operands
+- **[doc/debug/tutorial_aiehlc.md](doc/debug/tutorial_aiehlc.md)** — aiehlc simulator + debug UI (`--platform sim`, `--sim-only`)
+- **[doc/debug/tutorial_baremetal.md](doc/debug/tutorial_baremetal.md)** — naiebaremetal VEK385 boot + debug UI
+- **[doc/design/tile_dim_structured_design.md](doc/design/tile_dim_structured_design.md)** — Structured `tile_dim` for `aie::SpatialPolicy`
+- **[doc/design/spatial_space_composition.md](doc/design/spatial_space_composition.md)** — Composition-based spatial op spaces (GemmSpace, Conv2dSpace)
+- **[doc/design/aiegdb_live_debug_framework.md](doc/design/aiegdb_live_debug_framework.md)** — Live debug framework design (static view + daemon)
+- **[doc/llvm_mlir_pitfalls.md](doc/llvm_mlir_pitfalls.md)** — Known LLVM/MLIR API pitfalls
+- **[doc/aiedifferentview.md](doc/aiedifferentview.md)** — Memory and lock semantics
 
-### Debug Tooling
-- **External: aiedbg clone** (`/scratch/staff/bkirinci/aiedbg`, on PATH) — The tool reaching the hardware; docs live only in the clone. `reg lookup` runs offline (spell `--device-type pal`).
-- **[src/tool/debug/aiediag.py](src/tool/debug/aiediag.py)** — Flow-aware DMA diagnostic: reads DMA status regs, cross-refs provenance JSONs, prints root-cause diagnosis. Also holds switch read-back/flow-trace (`show/scan switch`).
-- **[src/tool/debug/aiegdb.py](src/tool/debug/aiegdb.py)** — GDB-like scoped CLI over aiedbg (partition→tile→channel). `COMMAND_SPEC` is the shared machine-readable grammar.
-- **[src/tool/debug/aiemcp.py](src/tool/debug/aiemcp.py)** — MCP server exposing aiegdb to Claude Code (`aie_exec/scope/commands/help`); in-process singleton; session-gated.
-- **[src/tool/debug/xaiehost2provenance.py](src/tool/debug/xaiehost2provenance.py)** — Static provenance generator for the raw-XAie single-kernel flow (parses host.cc XAie calls → provenance JSON).
-- **[src/tool/debug/schedule_debug_server.py](src/tool/debug/schedule_debug_server.py)** — Live-debug daemon. Handles session provenance (none/connected/attached/ran), app capability detection (sim/hw), run-state reconciliation, board-per-run resolution, source grounding, one device namespace. See git history for the detailed rationale of each subsystem.
-- **[src/tool/debug/schedule_view.py](src/tool/debug/schedule_view.py)** — Renders `host_schedule.html`: aiegdb console tab, source viewer, device-map flow lanes, pane names, scan controls, LLM tool-call rendering, inline context pills, transcript pinning, working indicator.
-- **[src/tool/debug/debug_ui_mcp.py](src/tool/debug/debug_ui_mcp.py)** — MCP tools for the debug UI (`get_pane`, `list_panes`, `app_sources`, `get_backend_status`).
-- **[script/debug/aieprofile.sh](script/debug/aieprofile.sh)** (+ `aieprofile.tcl`, `aierun_retrigger.tcl`, `aieprofile_summary.py`, `aieprofile_report.py`) — Wrapper around the Vitis `aieprofile` XSDB package; program-once → reload-ELF → profile → resume; two readers render the CSVs.
-- **[script/verify_env.sh](script/verify_env.sh)** — Environment verification (Vitis, LLVM, cross-compiler, aie-rt, BSP, PAL/board vars). Run before build.
+### Agent skills (`.cursor/skills/<name>/SKILL.md`)
+
+Read the matching skill when the task fits:
+
+| Topic | Skill |
+|-------|-------|
+| Debug UI, daemon, live session, browser UI features | **debug-ui-framework** (+ [reference.md](.cursor/skills/debug-ui-framework/reference.md)) |
+| Embedded LLM context loss on retarget | debugui-llm-reset |
+| Static XAie API verify (routing.cc, host.cc) | xaieapiverify |
+| Routing debug (IR → generated code) | routinghwdebug |
+| DMA BD verify in host.cc | dmabdverify |
+| Pre-HW data correctness | datacorrectness |
+| XAie driver internals | aiedriverkb |
+| Live HW DMA stall debug | aiehwdmadebug |
+| Core register write succeeds on-core but host reads 0 / DMA never starts (`ST` vs `ST.TM`) | coretmregisterwrite |
+| Shim BD stuck on wrong/locked BD (index overflow into channel-control regs) | shimbdindexoverflow |
+| Sim PS.so load segfault | aiesimloaddebug |
+| aiesim live debug register socket | aiesim-debug-socket |
+| HW performance counters | aiehwprofile |
+| Raw-XAie sim debug bundle | raw-xaie-sim-debug-bundle |
+| Sim build/run separation | sim-build-run-separation |
+| Build fails on missing snap cmake / libz.so / ZLIB::ZLIB; fast single-file compile check | mlirbuildsandbox |
+| Gen2-only build break: missing `xpseudo_asm_armclang.h`, or `XPAR_CPU_TIMESTAMP_CLK_FREQ` undeclared | bspheadergen2 |
+| hostcompile / missing compile_kernel.sh | hostcompile-entrypoint |
+| AEG IPC sim C++ headers | aeg-sim-cxx-headers |
+| Host codegen | hostcodegen |
+| Kernel codegen | kernelcodegen |
+
+**Embedded LLM plugin** (`src/tool/debug/dbg_llm_skills/`): nine skills for the browser LLM tab. Launch locally with `claude --plugin-dir src/tool/debug/dbg_llm_skills`. Listed in **debug-ui-framework** reference.
+
+**External:** aiedbg clone at `/scratch/staff/bkirinci/aiedbg` — see plugin skill `aiedbg-reference`.
+
+**Command:** [data-mismatch-debug](.claude/commands/data-mismatch-debug.md) — systematic DMA data-mismatch triage.
+
+### Browser automation (MCP)
+
+`mcp-browser` (configured in `.mcp.json`, built at `thirdparty/mcp-browser/`) gives live
+Playwright browser control. **Use it for any debug-UI work** — verifying
+`schedule_debug_server.py` / `schedule_view.py` renders, reproducing UI bugs, and
+confirming a server-side change actually reaches the page.
+
+Workflow: start the debug server → `browser_navigate` to `http://localhost:<port>` →
+`browser_screenshot` → interact with `browser_click` / `browser_extract_text`.
+Other tools: `browser_type`, `browser_wait_for_element`, `browser_execute_script`.
+
+After changing it: `cd thirdparty/mcp-browser && npm run build`, then restart Claude Code
+to reload the MCP server.
+
+### Debug tools
+
+- **[src/tool/debug/README.md](src/tool/debug/README.md)** — user guide and CLI for all debug tools
+- **Skill: debug-ui-framework** — implementation map for `schedule_debug_server.py`, `schedule_view.py`, `aiegdb.py`, `aiemcp.py`, `aiediag.py`, `xaiehost2provenance.py` (detail in [reference.md](.cursor/skills/debug-ui-framework/reference.md))
+
+### Build notes
+
+- **[script/verify_env.sh](script/verify_env.sh)** — validate Vitis, LLVM, toolchain, board vars before build
+- **[script/hostcompile.sh](script/hostcompile.sh)** — kernel build via `compile_one_kernel()` → `kc.sh`; do not restore deleted `compile_kernel.sh` (skill: hostcompile-entrypoint)
+- **[script/aiehlc.sh](script/aiehlc.sh)** — `--platform sim` is build-only; launch sim separately via `runsim.sh` or debug UI **Run** (skills: sim-build-run-separation, raw-xaie-sim-debug-bundle)
+- **`include/bspcompat/`** — shims for standalone-BSP headers present only on the armclang branch (`thirdparty/alib/include/` is a flattened copy of *one* BSP, picked by `--aie-version`, wiped every run, gitignored). `aiehlc.sh` appends `-I${AIEHLC_DIR}/include/bspcompat` **last** in `AIEHLC_ARGS` so the real Gen5 header still wins — add it to the **front-end only**, never to the host/kernel compiles. Details and the related `AIE_GEN > 2` XTime gate: skill **bspheadergen2**.
+- **[script/kc.sh](script/kc.sh)** — after linking the kernel ELF, `strip_kernel_debug_loc` drops `.debug_loc` + the `.debug_info` group via `llvm-objcopy` (13.7 MB → 82 KB on matmul; this is JTAG download time, since the kernel ELF is embedded into the host ELF and `dow -force`d). `.debug_line` is kept, so `kernel.linemap.json` / aiediag pc are unaffected; the full-DWARF original is parked at `<out>/kernel_debug`. `--keep-debug-loc` opts out. Must be `llvm-objcopy` — GNU binutils rejects the chess `e_machine 0x108`.
 
 ## Key Terms
 
@@ -203,14 +297,10 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 | **xchesscc** | Synopsys compiler for AIE cores (from Vitis) |
 | **PAL** | Board environment for running ELFs on real AIE hardware |
 
-## never do
-- the api function > 200 lines
-## Learn rule
-- create skill when a issue fixed
-- when do somthing wrong that is fix by user guide create related skill
-## Document rule
-- Maintain and update architecture doc and keep update after do some changes
-## Process transperent rule
-- after each task done, list all files that change or new created
-## Memory and Lock
-- ./doc/aiedifferentview.md
+## Working rules
+
+- **Never** let an API function exceed 200 lines.
+- **Create a skill** whenever an issue is fixed, or whenever the user has to correct
+  something you did wrong.
+- **Keep the architecture docs current** — update them as part of the change, not after.
+- **After each task, list every file changed or created.**

@@ -23,6 +23,10 @@ package). None of them modify `host.cc` or any generated source.
 | `schedule_view.py` | Generates `schedule_view.json` + `host_schedule.html` from provenance JSON + `host.cc` | none (stdlib) |
 | `ensure_aiedbg.py` | Clone/install/update `aiedbg` + write `.aiehlc/aiedbg_env.sh` for PATH | none (stdlib) |
 | `schedule_debug_server.py` | **Live debug daemon** (`http.server`) behind `host_schedule.html`; deploys ELF, tails `applog`, overlays live DMA/core/event status, drives an LLM tab | `aiediag`, `aiegdb`, `ensure_aiedbg`; spawns `aiemcp.py` |
+| `streamswitch_crossref.py` | **Accuracy check + CLI** — cross-references the UI's per-tile Stream switch panel against the `XAie_Strm*` calls in generated source | `schedule_view`, `node` |
+| `flow_crossref.py` | **Attribution check + CLI** — checks that every tile and flow is shown the right information, against `routing.cc` groups + `dmaphop` endpoints | `streamswitch_crossref`, `schedule_view`, `node` |
+| `switch_scan.py` | **Live switch read + diff** — reads the stream-switch registers off the board/sim and diffs them against the routing map; backs the UI's `Switch` scan | `aiediag`, `streamswitch_crossref` |
+| `switch_reconstruct.py` | **Routing rebuilt from the board** — turns those same registers into flows with no provenance map involved, for when the map is absent, stale, or was changed at runtime; backs the UI's `Dynamic` routing source | `aiediag` |
 
 ### Dependency graph
 
@@ -149,6 +153,33 @@ helpers `dma status`, `bd`, `event`, `pc`. Flags mirror `aiediag`
 (`--startcol`, `--aie-version`, `--json-dir`, `--device`). `--server` runs a
 framed stdin/stdout REPL used by the debug daemon.
 
+### Tile scope: `show switch` / `scan switch` (stream-switch read-back)
+
+Two **read-only** tile-scope commands decode the AIE stream switch from its
+configuration registers (`aiediag.read_switch` / `format_switch`):
+
+```bash
+# Decode THIS tile's stream switch: every enabled master, the slave feeding it,
+# circuit vs packet mode, enabled slaves and their packet slots.
+python3 src/tool/debug/aiegdb.py -c "tile 0 3; show switch"   # alias: switch
+
+# Flow-trace every configured connection through this tile: BFS the reachable
+# set of tiles along enabled directional ports (up + downstream), read each
+# switch, then print the assembled end-to-end flows, e.g.
+#   DMA0@(0,3) -> NORTH0@(0,3) -> NORTH0@(0,4) -> CORE0@(0,5)
+python3 src/tool/debug/aiegdb.py -c "tile 0 3; scan switch"
+```
+
+A master-config register's `CONFIGURATION` field is the *physical slave index*
+feeding it (driver `_XAie_StreamSwitchConfigureCct`), so the decode maps each
+enabled master directly back to its source slave. Register bases are identical
+for gen5 (aieml) and gen 2ps: core/shim master `0x3F000` / slave `0x3F100` /
+slot `0x3F200`; memtile `0xB0000` / `0xB0100` / `0xB0200`. Port maps and
+inter-tile wiring (NORTH↔SOUTH, EAST↔WEST; shim SOUTH = PL/NoC/DDR terminal;
+memtiles have no EAST/WEST) are transcribed from `xaie2psgbl_reginit.c`. Both
+commands are non-intrusive (no writes) and cycle-safe (BFS `visited` +
+per-branch recursion guard).
+
 ### `COMMAND_SPEC` — the one grammar definition
 
 `COMMAND_SPEC` (module level, keyed `universal` / `partition` / `tile` /
@@ -215,12 +246,18 @@ live DMA/core/event overlays, and drives an in-browser LLM tab wired to the
 ```bash
 python3 src/tool/debug/schedule_debug_server.py <workdir> \
     --elf <path/to/main.elf> --aie-version 5 --open
+
+# Open one aiecompiler app directly and generate worklocal/ when needed.
+python3 src/tool/debug/schedule_debug_server.py \
+    --app ../naiebaremetal/example/example_oob_4x4 --open
 ```
 
 Key flags: `--port 8091`, `--host 0.0.0.0`, `--target xsdb://...`, `--device pal`,
 `--startcol N`, `--apppaltest PATH` (default `script/test/apppaltest.py`),
-`--applog PATH` (default repo-root `applog`), `--no-llm`, `--password` /
-`--no-password`, `--no-mcp-probe`. Launched automatically by
+`--applog PATH` (default repo-root `applog.$USER`, or `$SCHEDULE_DEBUG_APPLOG`), `--no-llm`, `--password` /
+`--no-password`, `--no-mcp-probe`. `--app PATH` selects exactly one app and
+accepts either its root directory or an existing provenance bundle;
+`--app-root DIR` remains the multi-app discovery mode. Launched automatically by
 `script/aiehlc.sh --prettydebug`.
 
 ### Session provenance — a target is not a connection
@@ -240,7 +277,7 @@ The daemon tracks how the session earned its access, via one builder
 | `none` | startup default, target notwithstanding | reads refused |
 | `connected` | **Connect** → a passing `/ping` | link real; registers are pre-existing state |
 | `attached` | **Open Current Session** → `POST /attach` | real run, started outside the UI; earlier history unknown |
-| `ran` | **Run test** → `start_run` | live state *and* `applog` describe the current run |
+| `ran` | **Run** → `start_run` | live state *and* `applog` describe the current run |
 
 `hw_authorized()` gates `/grid` and the `aiegdb` MCP server's device commands
 (navigation, `help` and `?` stay open so the console works offline).
@@ -441,7 +478,51 @@ every example's own `src/graph.cpp` resolves to its own copy. Relatedly,
 then `--app`) over `list()`'s newest-by-mtime ordering: a cold
 `run_debug_ui.sh` passes the app's worklocal positionally, and it used to lose
 to whichever unrelated app was rebuilt most recently — which silently scoped
-bare-filename lookups to the wrong app. Roots are recomputed per
+bare-filename lookups to the wrong app. Going further: when the invocation
+*names* an app (positional workdir or `--app`) and passes no `--app-root`, the
+`aout/` + `example/` auto-scan is skipped entirely. That scan exists so a bare
+`schedule_debug_server.py` finds the newest build on its own; once you have said
+what to debug and asked for no tree to browse, its hits are noise from whichever
+repo the daemon was started in — launching on a naiebaremetal bundle listed this
+repo's `aout` and `example/stream` in the App dropdown. The positional `workdir`
+therefore defaults to `None`, not `"aout/worklocal"`: whether the user named a
+work dir is the deciding input, and a default string makes every bare invocation
+look explicit (`_DEFAULT_WORKDIR` is the fallback when the registry is empty).
+An explicit positional path or `--app PATH` may name either a provenance bundle
+or an app directory containing `Work/`. The app-directory form regenerates
+`worklocal` when `aie_control_config.json` is newer, writes
+`schedule_view.json` plus `host_schedule.html`, and registers only that app.
+`--app` is singular; `--app-root` remains the multi-app discovery mode.
+The browser follows from the app *count*, not a launch flag — `loadApps()` sets
+`#ctrlbar[data-apps="one"]` at `apps.length <= 1` and CSS drops the whole App row
+(label, select, path), so a later `POST /apps/add` brings it back on the next load
+with no extra plumbing. `--sim-only` is the same shape for the Board row:
+`/config` reports `sim_only`, the page sets `#ctrlbar[data-simonly="true"]` and CSS
+drops `#row-board`, `Connect`, `Attach existing run` and the start-hw_server hint;
+when both rows go, `.run-fields` goes with them. The buttons are NOT in that block
+— they sit on the pane-title row (`.run-head`), since they are the pane's point and
+under sim-only + one app they are all that is left; `#connstatus` is pushed right
+with `margin-left:auto` and wraps to its own line on a narrow pane rather than
+crushing them. Below the buttons is one flex `.run-row` per selector, Board then
+App, deliberately not a grid: a hidden grid row still leaves its `row-gap` behind,
+a hidden flex child does not. `#deviceSel`
+stays in the DOM pinned to `simulator` because every connect/run path in the page
+branches on its value — hiding the row, not deleting the control, is what keeps
+those paths untouched. Hiding is not enforcement, so the daemon refuses `/ping`,
+`/targets`, `/run`, `/attach`, `/settarget` and `/launch_hwserver` with
+`sim_only: true` (an MCP client, a page loaded before the flag, and curl all reach
+the same handlers), `session_state()` publishes `sim_only`, and `session_summary()`
+gains a sim-only "NO SESSION" wording so the model does not suggest Connect.
+`Connect` goes too, leaving `Run` as the only button — but Connect is what
+*unlocks* Run, so `applyBoardDefaults()` calls `testConnect()` on load when
+`sim_only`. Its simulator branch touches no board (it probes `/sim/status`, reveals
+the console and enables the run buttons), so firing it automatically is safe, and
+it runs after `updateDeviceUI()` because that resets exactly the state it sets.
+`Stop run` stays: a simulator you cannot stop is a trap. The status line drops the
+word "activated" under sim-only — it names a step the user no longer takes — for
+`simulator ready — press "Run"`. With
+the App row gone the identity moves to `#appbadge` beside the `AIE Debug` pane
+title, and `document.title` carries it too. Roots are recomputed per
 request because `select_app` reassigns `workdir`; nested roots are kept
 deliberately — they are also the join bases for a relative citation, and dropping
 `aout/worklocal` because it sits under the repo root made `worklocal/host.cc`
@@ -942,7 +1023,7 @@ restarted.
 ### Run state — the UI must not keep its own copy
 
 The browser used to learn about a board run from exactly one place: the `/applog`
-tail *it* started after clicking **Run test**. Nothing else told it a run existed.
+tail *it* started after clicking **Run**. Nothing else told it a run existed.
 So a page reload, a dropped tail, or a run started from another tab left the
 browser believing the board was free while `_run_proc` was still live in the
 daemon — and every recovery path is gated on the daemon's belief, not the
@@ -951,7 +1032,7 @@ browser's:
 | Control | Refused mid-run because | Result when the two disagree |
 |---|---|---|
 | **Connect** | `/ping` returns "disabled during run" | reads as a dead link → the UI ssh'd to the board to restart `hw_server` (touching hardware for nothing), retried, failed again |
-| **Run test** | `start_run` → "a run is already in progress" | dead end |
+| **Run** | `start_run` → "a run is already in progress" | dead end |
 | **Force stop** | *not* refused — but the button is only ungrayed by a successful Connect | unclickable, so the one control that fixes it is unreachable |
 
 The result was a UI that could only be unwedged by restarting the daemon.
@@ -986,11 +1067,227 @@ root.
 
 ---
 
+## 6. `streamswitch_crossref.py` — is the Stream switch panel telling the truth?
+
+The tile panel's **Stream switch** section is three hops away from hardware:
+`routingprovenancemap.json` → `_load_comm_paths()` → browser JS. Nothing in that
+chain reads the code that actually programs the switch. This tool closes the
+loop by deriving the same facts from the generated source and diffing them.
+
+```bash
+python3 src/tool/debug/streamswitch_crossref.py aout/worklocal
+python3 src/tool/debug/streamswitch_crossref.py aout/worklocal -v   # + view artifacts
+```
+
+Two extractors, no shared input:
+
+| Side | Input | Method |
+|------|-------|--------|
+| source | `routing.cc`, `host.cc` | parse `XAie_StrmConnCctEnable`, `XAie_StrmPktSwSlaveSlotEnable`, `XAie_StrmPktSwSlavePortEnable`, `XAie_StrmPktSwMstrPortEnable`, `XAie_Enable{Shim,Aie}*StrmPort` |
+| ui | `routingprovenancemap.json` | run the real `renderTileRoutingSection()` from `schedule_view.HTML_TEMPLATE` under `node`, parse the rows back out |
+
+Packet routes are resolved the way the switch resolves them: a slave slot drives
+every master port on its tile whose **arbiter** matches and whose **MSelEn** has
+the slot's **msel** line set. The UI instead borrows a "shared forward master"
+from a sibling provenance record — the two agree only while that heuristic is
+right, which is exactly what this checks.
+
+Exit code is 0 on MATCH, 1 on deviation. Reported separately:
+
+- **missing from UI** — programmed in source, never rendered
+- **the UI invents** — rendered with nothing behind it
+- **rows no flow focus can reach** — visible unfocused, lost under every flow filter
+- **shim port enables absent from every UI surface** — dropped before any view
+- **NO UI DATA** — `routingprovenancemap.json` absent, so the panel is empty by
+  construction; a pipeline gap rather than a misreporting UI
+
+`tests/test_streamswitch_crossref.py` runs this against two committed fixtures
+(`tests/fixtures/streamswitch/{tiling,rawxaie}`) plus the parser and pairing unit
+tests. Known deviations live in `KNOWN_DEVIATIONS` with their root cause and are
+asserted in both directions, so fixing one makes the test ask to be updated.
+Point it at a fresh build with:
+
+```bash
+AIE_XREF_WORKDIR=aout/worklocal python3 -m pytest \
+  src/tool/debug/tests/test_streamswitch_crossref.py -q
+```
+
+Static parsing sees generated code only — switch writes issued at runtime with
+computed arguments (core-trace setup, shim loopback) are out of scope.
+
+---
+
+## 7. `flow_crossref.py` — is the right info on the right tile and flow?
+
+Section 6 asks whether a connection is real. This asks whether the UI puts it
+on the flow and the tile it belongs to — the failure a user actually notices,
+because a connection shown under the wrong flow looks entirely plausible.
+
+```bash
+python3 src/tool/debug/flow_crossref.py aout/worklocal
+python3 src/tool/debug/flow_crossref.py aout/worklocal -v   # full lists
+```
+
+**The oracle.** `routing.cc` emits one `if (v2) { ... }` block per routing
+group, in the same order as `routing_groups`, and each block's
+`XAie_EnableAieToShimDmaStrmPort` splits it exactly where `shim_aie_to_ext`
+splits the group — so a block yields a push record set and a pull record set.
+Blocks are joined to flows on DMA endpoints (tile **and** port index) plus shim
+column, taken from `dmaphopprovenacemap.json`. Neither input is what the UI
+uses: groups carry no `flow_index` in the tiling flow, so `_load_comm_paths`
+falls back to a frozenset of DMA tiles, which its own comments call ambiguous.
+
+**What it checks**
+
+| Check | Question |
+|---|---|
+| group structure | does each provenance group hold exactly its source block's connections? |
+| flow connections | does flow N's panel show flow N's connections and no others? |
+| flow tiles | does flow N's tile set match the tiles its block programs? |
+| tile flows | do the Flows table, the focused Stream switch rows, and source agree per tile? |
+| DMA badges | does each channel badge name the flow that channel serves? |
+| focus badges | after focusing flow N, does any row still wear flow M's badge? |
+| net panel badges | does the net panel agree with the tile panel about the same connection? |
+| hop coverage | does every stream hop land on a tile in the flow? |
+| shmem flows | does a tile listing a shared-memory hop for flow N admit to carrying N? |
+| shim attribution | is every shim port enable owned by exactly one flow? |
+| search anchor | does a search hit point at a tile the flow touches? |
+| group key collisions | can two groups be confused by the DMA-tile key the UI joins on? |
+
+It degrades rather than errors: without `routing.cc` blocks only whole-design
+attribution is checkable, and without `dfscheduleprovenancemap.json` the DMA
+badge checks are skipped. Both cases are stated in the output.
+
+`tests/test_flow_crossref.py` pins the checks that pass today as regression
+guards and the known defects in `KNOWN_DEFECTS` with their root cause, asserted
+in both directions.
+
+---
+
+## 8. `Switch` scan — what the hardware is actually programmed with
+
+Sections 6 and 7 check the UI against the *source*. This checks it against the
+**board**: a fourth live-overlay mode next to DMA / Cores / Events that reads
+the stream-switch registers off every tile.
+
+Pick **Switch**, press **Scan**. The payoff is the `Dynamic (n)` routing source
+that appears next to the scan button (§9) — a map rebuilt from what the array is
+actually programmed with. Tiles are left untinted, except `unreachable` for any
+whose registers could not be read.
+
+There is deliberately no "this tile has switch config" tint: that is true of
+nearly every tile in the array, so it would be a colour that never varies.
+Comparing the two maps is the **diff** checkbox in §9.
+
+**Cost.** aiegdb's `show switch` reads one register per `aiedbg reg read`
+subprocess — 228 of them for a core tile. The switch register block is
+contiguous and fits inside aiedbg's 256-word limit, so the scan issues a single
+`aiedbg mem read` per tile instead. The simulator uses its per-register IPC
+reader directly.
+
+**Not polled.** Switch configuration is static — only the host program changes
+it — so selecting `Switch` turns the 2 s live poll off. Re-scan explicitly
+after a run programs the array.
+
+Decoding matches the driver: a **circuit** master's `CONFIGURATION` field is
+the source slave index, but a **packet** master's is `arbiter[2:0] |
+msel_en[6:3]` ([xaie_ss.c:45-48](../../../thirdparty/alib/aie-rt/driver/src/stream_switch/xaie_ss.c))
+and names no slave at all. Packet routes are then resolved the way the arbiters
+do — a slave slot drives every master whose arbiter matches and whose MSelEn
+has the slot's msel line set.
+
+`tests/test_switch_scan.py` encodes the frozen fixture's real `routing.cc` into
+a register image, decodes it back through the same helpers the board path uses,
+and asserts all 28 tiles verify against the provenance map — so a wrong
+register layout, field split or pairing rule fails the suite without a board.
+
+---
+
+## 9. Dynamic routing — rebuilding the map from the board
+
+The `Switch` scan above can only answer *relative to the routing map*. That
+leaves three cases where it has nothing to say:
+
+- there is no `routingprovenancemap.json` (raw-XAie flows, a bare workdir),
+- the map is stale — the board holds a different binary than the workdir
+  describes,
+- routing was reprogrammed at runtime, so the map was never right.
+
+The same registers a scan already reads are enough to rebuild the flows from
+scratch, so every `Switch` scan also reconstructs one. When it finds anything, a
+**routing: `diff` | `Static` | `Dynamic (n)` | `Save JSON`** control appears next
+to the scan button.
+
+| Source | What you are looking at |
+|---|---|
+| `Static` | the map the compiler emitted — `routingprovenancemap.json` |
+| `Dynamic` | flows rebuilt from the live stream-switch registers, with no reference to that map |
+
+Switching source repoints every routing panel at once — device map, net panels
+and each tile's **Stream switch** section — because they all read the same
+`comm_paths`. **Clear** returns to `Static`.
+
+**The `diff` checkbox owns every verdict.** With it off you are reading one map,
+plainly: no badges on the rows and no tint on the tiles. Tick it and the *same*
+rows — still the map you selected — get annotated against the other one, and the
+tiles go `sw ok` / `sw ≠`.
+
+Diff is relative to the source you picked, so it reads in the direction you are
+looking:
+
+| Selected | Rows drawn from | Badge on a row the other map lacks | Extra rows |
+|---|---|---|---|
+| `Static` | the compiler's map | `static only` | `dynamic only` |
+| `Dynamic` | the rebuild from registers | `dynamic only` | `static only` |
+
+Note that `dynamic` *is* the hardware, rebuilt from the registers the scan read,
+so "board vs static map" and "dynamic vs static" are the same comparison — which
+is why there is one control for it rather than a verdict that follows you around.
+The two maps disagreeing is the ordinary case (a flow that never moved data is
+enough to do it), so it stays behind the checkbox instead of painting the array
+red on every scan.
+
+**How a flow is recovered.** Intra-tile edges come from the master config
+(circuit) or the arbiter/msel pairing (packet); inter-tile edges from the fixed
+port wiring. A DFS from every terminal slave gives one fan-out tree per source,
+and trees are then grouped by their **shim endpoint** — which is what the
+compiler's map calls a flow. A broadcast to four cores is one push flow with
+four sinks; four DMAs draining to one shim port are one pull flow, not four.
+
+**Identity.** A reconstructed flow that matches a static one tile-for-tile and
+edge-for-edge adopts its `id` and `flow_index`, so the DMA and lock tables keyed
+off that index keep working. A flow that does *not* match keeps its own — it is
+genuinely not that flow, and an empty BD table is the honest answer.
+
+**Artifact.** Each scan writes `routingprovenancemap.dynamic.json` into the
+workdir, and `Save JSON` downloads the same thing. It is emitted in the standard
+`routing_groups` shape, so `streamswitch_crossref.py` and `flow_crossref.py`
+read it like any other map.
+
+Two limits worth knowing: a slot register carries no packet type, so `pkttype`
+is reported as `0`; and a flow crossing a tile that could not be read splits
+into fragments marked `partial` rather than being bridged over the gap.
+
+`tests/test_switch_reconstruct.py` drives three round trips off the fixture's
+own `routing.cc`: the rebuilt flows must reproduce the static `comm_paths`
+edges (12/12 on `tiling`, 2/2 on `rawxaie`), the production `scan_tile` diff
+must come back clean against the rebuilt map, and the written artifact must
+survive being reloaded — that last one pins the connection *ordering*, which
+`routing_edges_for_flow` is sensitive to.
+
+---
+
 ## Quick reference
 
 ```bash
 # Offline: generate the static schedule view
 python3 src/tool/debug/schedule_view.py aout/worklocal
+
+# Offline: check the Stream switch panel against the generated source
+python3 src/tool/debug/streamswitch_crossref.py aout/worklocal
+
+# Offline: check per-tile / per-flow attribution
+python3 src/tool/debug/flow_crossref.py aout/worklocal
 
 # Offline: dry-run the live tools (no board)
 python3 src/tool/debug/aiegdb.py --dry-run -c "target tile 0 3; dma status"

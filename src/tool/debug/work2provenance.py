@@ -804,19 +804,15 @@ def gen_routing(dcfg, shim_mux, shim_demux, router_soln, aie_gen, startcol):
                 })
                 dma_tiles.add((col, row))
             elif s_dir in ("S2MM", "MM2S"):
-                # Pull source: DMA emits toward m_dir (compass).  Keep the compass
-                # edge, then add a terminal marker so this tile is keyed as DMA.
+                # Pull source: DMA emits toward m_dir (compass).  Only the one
+                # real connection — the tile is keyed as a DMA endpoint through
+                # the group's dma_tiles field.  Emitting a reversed twin here
+                # put a connection on screen that host.cc never programs.
                 connections.append({
                     "kind":   "circuit_connect",
                     "tile":   {"col": col, "row": row},
                     "slave":  {"dir": "DMA", "idx": sp["ch"]},
                     "master": {"dir": m_dir, "idx": dp["ch"]},
-                })
-                connections.append({
-                    "kind":   "circuit_connect",
-                    "tile":   {"col": col, "row": row},
-                    "slave":  {"dir": m_dir, "idx": dp["ch"]},
-                    "master": {"dir": "DMA", "idx": sp["ch"]},
                 })
                 dma_tiles.add((col, row))
             else:

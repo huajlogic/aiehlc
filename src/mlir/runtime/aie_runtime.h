@@ -19,6 +19,7 @@ extern "C" {
 #include <stdio.h>
 #include <string.h>
 // #include <stdint.h>
+#include "aie_runtime_control_plan.h"
 
 // Runtime structures wrapping XAie types
 typedef struct {
@@ -46,6 +47,8 @@ typedef struct {
     uint32_t num_tiles;
     uint32_t timeout_us;
 } struct_event;
+
+typedef struct __Runtime_CtrlRowFabric_s __Runtime_CtrlRowFabric;
 
 // Global routing instance (kept for legacy path)
 extern XAie_RoutingInstance *g_RoutingInst;
@@ -250,6 +253,13 @@ void __Runtime_routing_init(XAie_DevInst *dev);
 // Device teardown (takes explicit dev pointer)
 AieRC __Runtime_device_teardown(XAie_DevInst *dev);
 
+// Enable each AIE core tile's processor bus so the core can write its own
+// memory-module DMA/lock registers (required for KERNELCONFIGOFFLOAD, where
+// kernel.cc self-programs its DMA via MMIO). Iterates the partition's core
+// tiles calling XAie_CoreProcessorBusEnable. Gen5 baremetal only; no-op
+// elsewhere. Safe to call unconditionally (only enables bus access).
+AieRC __Runtime_enable_core_proc_bus(XAie_DevInst *dev);
+
 // ---------------------------------------------------------------------------
 // Explicit init/teardown: heap-allocates XAie_DevInst, returns pointer.
 // Caller owns the returned pointer and must call __Runtime_explicit_teardown().
@@ -340,8 +350,30 @@ struct_kernel_group __Runtime_load_kernel_group_16t(XAie_DevInst *dev, XAie_LocT
                                                     XAie_LocType t6, XAie_LocType t7, XAie_LocType t8, XAie_LocType t9,
                                                     XAie_LocType t10, XAie_LocType t11, XAie_LocType t12,
                                                     XAie_LocType t13, XAie_LocType t14, XAie_LocType t15, int n);
+struct_kernel_group __Runtime_load_kernel_group_4t_ctrl(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
+                                                        XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+                                                        XAie_LocType t3, int n, int32_t bd_id, int32_t mm2s_ch);
+struct_kernel_group __Runtime_load_kernel_group_8t_ctrl(
+    XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+    XAie_LocType t3, XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, int n, int32_t bd_id,
+    int32_t mm2s_ch);
+struct_kernel_group __Runtime_load_kernel_group_16t_ctrl(
+    XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, XAie_LocType t0, XAie_LocType t1, XAie_LocType t2,
+    XAie_LocType t3, XAie_LocType t4, XAie_LocType t5, XAie_LocType t6, XAie_LocType t7, XAie_LocType t8,
+    XAie_LocType t9, XAie_LocType t10, XAie_LocType t11, XAie_LocType t12, XAie_LocType t13, XAie_LocType t14,
+    XAie_LocType t15, int n, int32_t bd_id, int32_t mm2s_ch);
 
 struct_event __Runtime_launch_kernel_group(XAie_DevInst *dev, struct_kernel_group kg);
+struct_event __Runtime_launch_kernel_group_ctrl(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab,
+                                                struct_kernel_group kg, int32_t bd_id, int32_t mm2s_ch);
+
+void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls);
+void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls);
+void __Runtime_kload_split_cycles(unsigned long long *elf_cyc, unsigned int *elf_n, unsigned long long *rst_cyc,
+                                  unsigned int *rst_n);
+void __Runtime_setup_split_cycles(unsigned long long *plan_cyc, unsigned int *plan_n, unsigned long long *sync_cyc,
+                                  unsigned int *sync_n);
+void __Runtime_pmap_print_cycles(unsigned long long *cyc, unsigned int *lines);
 
 // Core enable (reference: aeg_runtime_api.cpp graph_api::run)
 void __Runtime_core_run(XAie_DevInst *dev, XAie_LocType *tiles, uint32_t num_tiles);
@@ -429,11 +461,17 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 // stealing core data memory.
 // ---------------------------------------------------------------------------
 
+// DMA direction selector for the memory-module trace unit (see
+// __Runtime_mem_trace_setup / the mem_dma_kind param of core_trace_setup).
+enum { AIE_TRACE_DMA_NONE = 0, AIE_TRACE_DMA_S2MM = 1, AIE_TRACE_DMA_MM2S = 2 };
+
 // Configure the core trace unit on `tile`: capture window ACTIVE_CORE..
 // DISABLED_CORE, EVENT_TIME mode (delta-cycle timestamps), trace slots 0..3 =
-// ACTIVE / LOCK_STALL / STREAM_STALL / MEMORY_STALL, then route the TRACE stream
-// down to the top MemTile in the same column and land it via the MemTile's S2MM
-// channel `s2mm_ch` into [buf_addr, buf_addr+buf_len) of MemTile memory.
+// ACTIVE / LOCK_STALL / STREAM_STALL / MEMORY_STALL and slots 4..6 =
+// PORT_IDLE_0 / PORT_RUNNING_0 / PORT_STALLED_0 (the stream-switch port-0 event
+// group), then route the TRACE stream down to the top MemTile in the same column
+// and land it via the MemTile's S2MM channel `s2mm_ch` into
+// [buf_addr, buf_addr+buf_len) of MemTile memory.
 //   strm_ch  physical stream channel (0..3) used for every SOUTH/NORTH hop from
 //            the core down to the MemTile; caller must ensure it is free.
 //   s2mm_ch  the MemTile's S2MM DMA channel the trace drains into.
@@ -442,8 +480,47 @@ void __Runtime_perfcnt_read_mm2s_probe(uint32_t *ch0, uint32_t *ch1);
 //            XAie_DataMemBlockRead for the MemTile loc).
 // Call BEFORE enabling the core; the caller must reserve the MemTile buffer
 // region and the strm_ch/s2mm_ch so they do not clash with data traffic.
+//
+// The PORT_*_0 events only fire once the core's stream-switch event port 0 is
+// bound to a physical port; port_intf/port/port_num pick which one (default
+// core MASTER port 0 = the core's outgoing stream). Pass XAIE_STRMSW_SLAVE /
+// a different StrmSwPortType / index to watch another port.
+//
+// When a generated routing resource map is passed (resmap != NULL && count > 0),
+// the trace route's stream channel, MemTile S2MM channel and packet id are
+// re-selected to avoid the data-plane ports the map records for this column;
+// strm_ch/s2mm_ch/bdnum are then treated as fallbacks. NULL/0 (raw/single-kernel
+// flow) keeps the convention values the caller passed in.
+//
+// mem_dma_kind/mem_dma_ch additionally arm the tile's MEMORY-module trace unit
+// (packet id 2) capturing a DMA channel's BD/stall/lock events; it rides the
+// SAME TRACE->SOUTH->MemTile drain and lands in the SAME buffer as the core
+// stream (pkt id 1), demuxed by packet id on read. AIE_TRACE_DMA_NONE disables
+// it; the default is S2MM channel 0. See __Runtime_mem_trace_setup.
+struct AieResourceEntry; /* generated in aie_resource_map.h; opaque here */
 AieRC __Runtime_core_trace_setup(XAie_DevInst *dev, XAie_LocType tile, uint32_t buf_addr, uint32_t buf_len,
-                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum = 0);
+                                 uint8_t strm_ch, uint8_t s2mm_ch, uint8_t bdnum = 0,
+                                 const struct AieResourceEntry *resmap = 0, int resmap_count = 0,
+                                 XAie_StrmPortIntf port_intf = XAIE_STRMSW_SLAVE, StrmSwPortType port = SOUTH,
+                                 uint8_t port_num = 0, int mem_dma_kind = AIE_TRACE_DMA_S2MM, uint8_t mem_dma_ch = 0);
+
+// Arm the compute tile's MEMORY-module trace unit and merge its packet stream
+// (packet id 2) onto the core trace's shared TRACE->SOUTH->MemTile drain.
+//   dma_kind  AIE_TRACE_DMA_S2MM / _MM2S selects which DMA direction to trace
+//             (AIE_TRACE_DMA_NONE is a no-op that returns XAIE_OK).
+//   dma_ch    DMA channel index (0 or 1) whose BD/stall/lock events are traced.
+//   arbiter   the packet-switch arbiter the core stream already claimed on this
+//             tile's SOUTH master (both streams share ONE arbiter).
+//   msel      the MASTER-select line for THIS (mem) stream; must differ from the
+//             core stream's msel so the shared SOUTH master's MSelEn bitmask can
+//             round-robin between the two packet ids.
+// Programs the MEM_MOD trace unit (8 slots: DMA start/finish/stall/lock),
+// installs packet id 2, and enables the MEM_TRACE stream-switch slave port
+// (TRACE port index 1; TRACE:0 is the core AIE_TRACE port). The caller
+// (__Runtime_core_trace_setup) must have already enabled the SOUTH master with
+// an MSelEn covering both msels. Call BEFORE enabling the core.
+AieRC __Runtime_mem_trace_setup(XAie_DevInst *dev, XAie_LocType tile, int dma_kind, uint8_t dma_ch, uint8_t arbiter,
+                                uint8_t msel);
 
 // Read raw trace words back from the MemTile buffer. Pass the MemTile loc (the
 // same-column top MemTile, row XAIE_AIE_TILE_ROW_START-1) and buf_addr used in
@@ -464,6 +541,9 @@ typedef struct {
     uint8_t col, row; // tile that produced it (set by attach)
     uint32_t mask;    // 8-bit event mask (ACTIVE/*_STALL/...)
     uint64_t start_cycle, end_cycle;
+    const char *const *names; // 8-slot name table of the producing stream
+                              // (core vs mem); set by the decoder on flush so
+                              // the dump labels each pkt-id stream correctly.
 } AieTraceInterval;
 
 // One host<->AIE anchor pair for a tile: the tile's free-running AIE core-timer
@@ -483,7 +563,13 @@ typedef struct {
     uint64_t host;
 } AieTraceHostEvt;
 
-#define AIE_TRACE_PROFILE_CAP 512u
+#define AIE_TRACE_PROFILE_CAP 4096u
+// Per-stream reservation: when the shared buffer holds several demuxed streams
+// (core pkt-1 + mem pkt-2), each stream still not yet decoded is guaranteed at
+// least this many interval slots so a chatty earlier stream (the core port
+// toggles) cannot starve a later one (the mem DMA events). See the reserve
+// bookkeeping in __Runtime_core_trace_decode / __core_trace_flush.
+#define AIE_TRACE_PROFILE_MIN_PER_STREAM 1024u
 #define AIE_TRACE_ANCHOR_CAP 8u
 #define AIE_TRACE_EVENT_CAP 64u
 // Fixed-capacity, no-malloc collector (baremetal-safe). One container for a run:
@@ -495,6 +581,8 @@ typedef struct {
     AieTraceInterval iv[AIE_TRACE_PROFILE_CAP];
     uint32_t count;           // valid intervals in iv[]
     uint32_t dropped;         // intervals discarded past CAP
+    uint32_t reserve;         // slots held back for not-yet-decoded streams
+                              // (set per stream by __Runtime_core_trace_decode)
     uint8_t cur_col, cur_row; // tag applied to appended intervals
     int attached;             // nonzero after attach()
     // --- host<->AIE time-sync ---
@@ -543,6 +631,81 @@ void __Runtime_aie_trace_profile_dump(AieTraceProfile *p);
 void __Runtime_core_trace_decode(const uint32_t *buf, uint32_t nwords, AieTraceProfile *prof);
 
 // ---------------------------------------------------------------------------
+// Declarative core-trace session (auto-injected by #pragma aie_trace).
+// ---------------------------------------------------------------------------
+// A thin session layer over __Runtime_core_trace_setup/read/decode that hides
+// the MemTile drain-resource bookkeeping so the compiler-injected host code is
+// just two opaque calls. The fixed-reserved MemTile convention (S2MM channel,
+// BD parity, high buffer offset) lives entirely inside these two functions.
+//
+// Arm the core trace unit on the compute tile at mesh/partition-relative
+// (col,row) BEFORE the core runs. Reserves this column's trace drain resources
+// by a fixed convention, routes the TRACE stream DOWN into the same-column top
+// MemTile's S2MM DMA, and records the tile in a small static registry (cap
+// AIE_TRACE_SESSION_CAP). Multiple tiles in the SAME column each take a distinct
+// strm_ch/s2mm_ch/BD slot. Silently caps/warns past the registry or per-column
+// slot limits. Idempotent-safe: a repeated (col,row) is ignored.
+void __Runtime_core_trace_begin(XAie_DevInst *dev, uint8_t col, uint8_t row);
+
+// Same as __Runtime_core_trace_begin but PINS the physical stream channel the
+// core->MemTile trace route rides (every hop; 0..3). Pass AIE_TRACE_STRM_CH_AUTO
+// for the default (= per-column slot, what the 3-arg form uses). Pin an explicit
+// channel when a data-plane DMA shares this tile's SOUTH egress: the trace route
+// is programmed directly, outside the routing engine's resource manager, so an
+// auto strm_ch that collides with a data flow on the same SOUTH channel deadlocks
+// that DMA (e.g. example/perf/aieml_perf.cc pins ch 1 to clear its output DMA).
+// Independent of the MemTile S2MM channel/BD (still slot-derived).
+#define AIE_TRACE_STRM_CH_AUTO 0xFFu
+void __Runtime_core_trace_begin_ch(XAie_DevInst *dev, uint8_t col, uint8_t row, uint8_t strm_ch);
+
+// Same as __Runtime_core_trace_begin but additionally selects which tile DMA the
+// MEMORY-module trace unit watches (see __Runtime_core_trace_setup /
+// __Runtime_mem_trace_setup). mem_dma_kind is AIE_TRACE_DMA_S2MM/_MM2S (or
+// _NONE to disable), mem_dma_ch is the DMA channel index (0/1). The physical
+// stream channel is AUTO (per-column slot). Emitted by CoreTraceInsertPass for
+// `#pragma aie_trace((col,row),(STREAM,...))` / `(PARAMETER,...)`; the default
+// (no second tuple) is still S2MM ch0, so plain __Runtime_core_trace_begin is
+// equivalent to __Runtime_core_trace_begin_dma(dev,col,row,AIE_TRACE_DMA_S2MM,0).
+void __Runtime_core_trace_begin_dma(XAie_DevInst *dev, uint8_t col, uint8_t row, int mem_dma_kind, uint8_t mem_dma_ch);
+
+void __Runtime_core_trace_app_begin(XAie_DevInst *dev);
+
+// Start host<->AIE time correlation for the tiles armed by
+// __Runtime_core_trace_begin. Inits a process-global AieTraceProfile (unless
+// __Runtime_core_trace_app_begin already opened it), records
+// the host clock (cps) and anchor0 (host time + each armed tile's AIE core
+// timer). Call AFTER all __Runtime_core_trace_begin calls and just BEFORE the
+// cores run (before __Runtime_launch_kernel_group). When present, the paired
+// __Runtime_core_trace_end captures anchor1 and dumps the FULL [TIMESYNC] block
+// (cps/anchor0/anchor1/trace) that host_aie_timeline.correlate() needs; when
+// absent, __Runtime_core_trace_end stays decode-only (trace lines only). No-op
+// when no tile was armed, or (cps=0, so still decode-only) under the simulator.
+void __Runtime_core_trace_sync_begin(XAie_DevInst *dev);
+
+// Record one host phase event (iter, phase name) into the auto-injected
+// core-trace session's process-global profile. Captures the session clock now.
+// No-op unless __Runtime_core_trace_app_begin or _sync_begin opened the
+// correlated session (so it is safe to call unconditionally from generated host code).
+void __Runtime_core_trace_event(XAie_DevInst *dev, int iter, const char *phase);
+
+// Read back, decode and dump every tile armed by __Runtime_core_trace_begin.
+// Owns a static AieTraceProfile; for each registered tile reads the MemTile
+// trace buffer, attaches the (col,row) tag, decodes into the profile, then
+// emits one [TIMESYNC] block via __Runtime_aie_trace_profile_dump. Clears the
+// registry. Call AFTER the cores have finished (post kernel-group wait), before
+// device teardown. No-op when no tile was armed. If __Runtime_core_trace_sync_begin
+// ran this session, uses that correlated profile (adds anchor1) instead.
+void __Runtime_core_trace_end(XAie_DevInst *dev);
+
+// Same read+decode as __Runtime_core_trace_end, but decodes every armed tile
+// into a CALLER-supplied profile and does NOT init or dump it. Use this when the
+// core trace must be unified with other timeline data (host clock, TS_ANCHOR
+// host<->AIE anchors, TS_EVT phase events) inside ONE AieTraceProfile so a single
+// __Runtime_aie_trace_profile_dump emits one coherent [TIMESYNC] block (e.g.
+// example/perf/aieml_perf.cc). Clears the registry. No-op when no tile was armed.
+void __Runtime_core_trace_end_into(XAie_DevInst *dev, AieTraceProfile *prof);
+
+// ---------------------------------------------------------------------------
 // DMA-capable buffer allocation with cache sync support
 // ---------------------------------------------------------------------------
 
@@ -552,6 +715,237 @@ void *__Runtime_alloc_buffer(XAie_DevInst *dev, size_t size_bytes);
 
 // Free a buffer allocated by __Runtime_alloc_buffer.
 void __Runtime_free_buffer(XAie_DevInst *dev, void *ptr);
+
+// ---------------------------------------------------------------------------
+// Control-packet register/config write helpers.
+// Build a control-packet payload (two in-band headers per <=4-word chunk) and
+// push it via a SHIM MM2S BD so the target tile's CTRL stream-switch port
+// performs the register/memory writes. Stream-switch routes are set up
+// separately (routing.cc CTRL sink). Mirrors _XAie_CtrlPktizeElfPkt /
+// _XAie_LoadElfStrmSwStartDma in the aie-rt driver.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Control-packet transaction capture (design:
+// 2026-... runtime-control-packet-transaction).
+//
+// An XAie-transaction-like flow that captures WRITE-ONLY register ops and
+// exports them as a BROADCAST/MULTICAST control-packet-format word buffer:
+//
+//   __Runtime_control_start_transaction(dev, fab, /*row=*/-1)
+//       XAie_Write32(dev, RegOff, Value)
+//       XAie_BlockWrite32(dev, RegOff, Data, N)
+//       ...
+//   __Runtime_control_write_pkt_commit_transaction(dev, fab, out, cap, &nwords)
+//   __Runtime_control_push(fab, out, nwords, bd_id, mm2s_ch, block, log)
+//
+// start wraps XAie_StartTransaction(DISABLE_AUTO_FLUSH) so nothing touches HW,
+// and records the cast target @row into @fab->txn_row. commit is stateless w.r.t.
+// the caller: it reads @fab->txn_row back, calls XAie_ExportSerializedTransaction,
+// then translates every Write32/BlockWrite32 into control packets via
+// __Runtime_ctrl_pktize_write. Routing is a row-control cast against @fab (see
+// __Runtime_CtrlRowFabric):
+//   txn_row <  0 => whole-array BROADCAST (stream id ACR_ID_BCAST, id[4]=1); every
+//               captured op MUST target a CORE tile (broadcast reaches cores).
+//   txn_row >= 0 => row-MULTICAST to that physical row (stream id
+//               (ACR_CLASS_WHOLE_ROW<<2)|rowidx, id[4]=0, rowidx = the row's
+//               add-order index in @fab); every captured op MUST target that row.
+// MaskWrite32 / MaskPoll are rejected (no native masked control-packet write).
+// The commit output is a plain word buffer; __Runtime_control_push DMAs it to HW
+// (copies it into a device buffer, arms the shim entry, and pushes via the same
+// SHIM MM2S BD path as __Runtime_ctrl_row_*_write).
+// ---------------------------------------------------------------------------
+
+// Begin capturing write-only register ops into the XAie transaction buffer
+// WITHOUT applying them to hardware (XAIE_TRANSACTION_DISABLE_AUTO_FLUSH), and
+// record the cast target @row into @fab->txn_row (read back by commit / push).
+// @row < 0 => whole-array broadcast; @row >= 0 => row-multicast to that physical
+// row. @fab must be non-NULL. Returns 0 on success, nonzero on error.
+int __Runtime_control_start_transaction(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, int row);
+
+// Export the captured transaction, translate every Write32/BlockWrite32 into
+// broadcast/multicast control-packet words, and clear the transaction. Stateless
+// w.r.t. the caller: the cast target is read from @fab->txn_row (set by
+// __Runtime_control_start_transaction). txn_row < 0 broadcasts to the whole array
+// (every op must target a CORE tile); txn_row >= 0 multicasts to that physical row
+// of @fab (every op must target that row, and it must be a configured row of
+// @fab). Every captured op MUST be a write op (Write32/BlockWrite32); any other op
+// (MaskWrite32/MaskPoll/unknown) is rejected. Only the LAST emitted write packet
+// is turned into a WRITE-WITH-RETURN (write-ack) so a single header-only response
+// acks the whole batch. Writes at most @out_cap words into @out; the total word
+// count is returned via *@nwords_out. Returns 0 on success; nonzero on error
+// (overflow, tile-type mismatch, unconfigured row, non-write op, or export
+// failure).
+int __Runtime_control_write_pkt_commit_transaction(XAie_DevInst *dev, __Runtime_CtrlRowFabric *fab, uint32_t *out,
+                                                   uint32_t out_cap, uint32_t *nwords_out);
+
+// Push a committed control-packet word buffer @out (@nwords words, as produced by
+// __Runtime_control_write_pkt_commit_transaction) to HW. Reads the cast target from
+// @fab->txn_row to resolve the diagnostic destination tile (broadcast => last-added
+// row head + ACR_ID_BCAST; multicast => that row's chain col_lo + the whole-row
+// stream id). Copies @out into a device DMA buffer, arms the shim spine entry, and
+// pushes via a SHIM MM2S BD (@bd_id / @mm2s_ch). @block!=0 waits for the MM2S
+// drain; @log enables the per-send log. Fire-and-forget writes (no response
+// buffer). Returns XAIE_OK on success. Requires a prior
+// __Runtime_ctrl_plan_init that configured at least one row.
+AieRC __Runtime_control_push(__Runtime_CtrlRowFabric *fab, const uint32_t *out, uint32_t nwords, int32_t bd_id,
+                             int32_t mm2s_ch, int block, int log);
+
+// Translation core of the commit step: parse the serialized-transaction byte
+// buffer @buf (a XAie_TxnHeader followed by NumOps ops) and emit a WRITE control
+// packet per Write32/BlockWrite32 into @out, stamping every packet with the
+// broadcast/multicast stream id @sid. Every op MUST be a write op; MaskWrite/
+// MaskPoll/unknown ops are rejected. Each op's tile is validated against
+// @target_row (< 0 => must be a CORE tile via XAie_GetTileTypefromLoc; >= 0 =>
+// must land on that physical row). @dev->DevProp.RowShift/.ColShift drive the
+// RegOff decode. When @lastwriteack is nonzero, ONLY the LAST emitted write packet
+// is a WRITE-WITH-RETURN (write-ack, return stream id @ret_sid); all earlier ops
+// stay fire-and-forget. Returns 0 on success (writing *@nwords_out) or nonzero on
+// overflow / tile-type mismatch / non-write op.
+int rt_ctrl_txn_translate(XAie_DevInst *dev, const uint8_t *buf, uint8_t sid, int target_row, uint32_t *out,
+                          uint32_t out_cap, uint32_t *nwords_out, int lastwriteack, uint32_t ret_sid);
+
+// Build WRITE control-packet words for a contiguous block of @nwords 32-bit
+// values targeting tile byte address @tile_addr onward, routed by @stream_id
+// (two in-band headers per <=4-word chunk). When @lastwriteack is nonzero and
+// @nwords>0, the LAST written word (tile_addr + (nwords-1)*4) is re-emitted as
+// its own single-word WRITE-WITH-RETURN access (control-info operation=0b10,
+// return stream id @ret_stream_id); because the dest CTRL port processes
+// accesses in order, that ack's response is a completion barrier for all
+// preceding writes. The response is a single AIE packet-switched stream header
+// word (per doc/controlpkt.txt Table 3-32), and the return route keeps the
+// header, so on success *@resp_words_out (may be NULL) gets 1 when the ack is
+// appended, 0 otherwise. Returns words written (0 on capacity overflow).
+uint32_t __Runtime_ctrl_pktize_write(uint32_t *out, uint32_t out_cap, uint32_t stream_id, uint32_t tile_addr,
+                                     const uint32_t *data, uint32_t nwords, int lastwriteack, uint32_t ret_stream_id,
+                                     uint32_t *resp_words_out);
+
+// Build READ control-packet words for a contiguous @nwords block of tile
+// registers/memory at byte address @tile_addr, following the AIE2ps Control-
+// Packet word format (doc/controlpkt.txt Table 3-31/3-32): per access the
+// control-info word carries [19:0]=byte addr, [21:20]=beats-1, [23:22]=01
+// (read with return), [28:24]=@ret_stream_id (response routing), [31]=odd
+// parity. The stream packet header uses @req_stream_id (routes the request to
+// the dest CTRL master port). No data payload is emitted. Accesses are split
+// to <=4 words and never cross a 128-bit boundary. On success *@resp_words_out
+// (may be NULL) gets the expected response length in 32-bit words (per access:
+// 1 stream header + beats data words). Returns request words written (0 on
+// capacity overflow).
+uint32_t __Runtime_ctrl_pktize_read(uint32_t *out, uint32_t out_cap, uint32_t req_stream_id, uint32_t ret_stream_id,
+                                    uint32_t tile_addr, uint32_t nwords, uint32_t *resp_words_out);
+
+// Parse a control-info word (the word after the stream packet header) per the
+// AIE2ps Control-Packet format (doc/controlpkt.txt Table 3-31/3-32):
+// [19:0]=local byte address, [21:20]=beats-1, [23:22]=operation
+// (00=write, 01=read w/return, 10=write w/return), [28:24]=return stream id,
+// [31]=odd parity over [30:0]. Any out pointer may be NULL. @beats_out gets the
+// decoded beat count (field+1, i.e. 1..4). Returns 1 if the parity bit is
+// consistent, 0 otherwise.
+int __Runtime_ctrl_parse_ctrl_hdr(uint32_t ctrl_hdr, uint32_t *addr_out, uint32_t *op_out, uint32_t *beats_out,
+                                  uint32_t *ret_sid_out);
+
+// Parse an AIE packet-switched stream header word (the first word of a control
+// packet / response packet): [4:0]=packet id (stream id), [14:12]=packet type
+// (7=SLVERR on a control-packet response), [20:16]=source row, [27:21]=source
+// column, [31]=odd parity over [30:0]. Any out pointer may be NULL. Returns 1 if
+// the parity bit is consistent, 0 otherwise.
+int __Runtime_ctrl_parse_pkt_hdr(uint32_t pkt_hdr, uint32_t *id_out, uint32_t *type_out, uint32_t *src_row_out,
+                                 uint32_t *src_col_out);
+
+// Control-packet send context. Identifies the shim source column, the
+// destination tile (same column as the shim), the packet stream id, and the
+// shim DMA channels / BD used for the forward send and the response return.
+// Fill the input fields (dev..s2mm_ch, resp_words), then drive it in three steps:
+//   __Runtime_ctrl_setup_routing(&c) - program the shim MM2S -> dest CTRL
+//       forward route and the dest CTRL slave -> shim S2MM response return
+//       route, alloc the response buffer, arm the shim S2MM drain;
+//   __Runtime_ctrl_push(&c, buf, nwords, block, log) - send (block!=0 also
+//                                       waits for the response via ctrl_tct_poll);
+//   __Runtime_ctrl_ack_poll(&c, print) - wait for the response drain, return
+//       its first word.
+// The return path is the control-packet response (read-with-return / write-
+// with-return): the dest CTRL slave port emits the response, which is circuit-
+// switched down to the shim S2MM. Completion is the S2MM drain landing
+// @resp_words words. __Runtime_ctrl_read_target composes all steps around a
+// register read. `token` is an internal DDR response buffer allocated by
+// setup_routing; release it with __Runtime_free_buffer(c.dev, c.token).
+typedef struct {
+    XAie_DevInst *dev; // partitioned device instance
+    uint8_t shim_col;  // shim (row 0) source column
+    uint8_t dest_col;  // destination column (must equal shim_col)
+    uint8_t dest_row;  // destination row (>0)
+    uint8_t stream_id; // request packet id; must match the header encoded in the buffer
+    int32_t bd_id; // shim MM2S BD for the send (response S2MM uses an adjacent in-range slot: bd_id+1, or bd_id-1 when
+                   // bd_id is the top slot)
+    int32_t mm2s_ch;     // shim MM2S channel (forward send)
+    int32_t s2mm_ch;     // shim S2MM channel (response return)
+    uint32_t *token;     // internal DDR response buffer (set by setup_routing)
+    uint32_t resp_words; // expected response length in 32-bit words (0 => treated as 1)
+} __Runtime_CtrlInstance;
+
+// Push a control-packet buffer (from __Runtime_alloc_buffer) through the SHIM
+// MM2S channel described by @inst and wait for the MM2S send to drain. The send
+// context (dev, shim_col, bd_id, mm2s_ch) comes from @inst; buf/nwords are the
+// packet payload for this call. If @block is nonzero, also waits for the TCT
+// return token via __Runtime_ctrl_ack_poll (requires @inst routing armed by
+// __Runtime_ctrl_setup_routing). @log (nonzero) prints the per-send log line and
+// the polled TCT value. @inst is not mutated.
+AieRC __Runtime_ctrl_push(const __Runtime_CtrlInstance *inst, uint32_t *buf, uint32_t nwords, int block, int log);
+
+// Program the forward (shim MM2S -> dest CTRL master) and response return (dest
+// CTRL slave -> shim S2MM) routes for @inst, allocate its internal response
+// buffer (@inst->resp_words words, min 1), and arm the shim S2MM to drain the
+// response. Same-column only (dest_col must equal shim_col). On success
+// @inst->token holds a freshly allocated DDR buffer.
+AieRC __Runtime_ctrl_setup_routing(__Runtime_CtrlInstance *inst, int port_evt = 0);
+
+// Enable (on!=0) or disable per-port control-plan provenance logging. When on,
+// the aie_ctrl* routing setup prints one `CONTROLPAN-PMAP ...` line per stream
+// port it programs (tile location, port type/idx, direction, master/slave, id,
+// switch type pkt|circuit, slot) to stdout (the applog). Call once before the
+// first setup_routing / plan_init. If this is never called, logging auto-enables
+// when the AIE_CTRL_PMAP environment variable is set to a non-empty, non-"0"
+// value.
+void __Runtime_ctrl_pmap_enable(int on);
+
+void __Runtime_ctrl_high_throughput_enable(int on);
+
+// Poll the shim S2MM drain until the response lands, sync it for the CPU, and
+// return the first response word. Uses @inst->token armed by
+// __Runtime_ctrl_setup_routing. If @print is nonzero, prints the observed word.
+// @inst is not mutated.
+uint32_t __Runtime_ctrl_ack_poll(const __Runtime_CtrlInstance *inst, int print);
+
+// Self-contained control-packet send: builds a __Runtime_CtrlInstance, programs
+// the forward + response return routes, pushes the packet buffer via
+// __Runtime_ctrl_push, waits for the response drain, then frees the buffer.
+// buf/nwords are the packetized control words (from __Runtime_ctrl_pktize_write
+// / __Runtime_ctrl_pktize_read);
+// stream_id must match the packet id encoded in buf so the dest CTRL slave slot
+// accepts it. On success writes the first response word to *tct_value_out (may
+// be NULL). dev must be partitioned first; dest_col must equal shim_col.
+AieRC __Runtime_ctrl_push_target(XAie_DevInst *dev, uint8_t shim_col, uint8_t dest_col, uint8_t dest_row,
+                                 uint8_t stream_id, uint32_t *buf, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch,
+                                 int32_t s2mm_ch, uint32_t *tct_value_out);
+
+// Self-contained control-packet register READ: builds READ control packets for
+// @nwords 32-bit words at tile byte address @tile_addr on the dest tile
+// (@dest_col must equal @shim_col), programs the forward + response-return
+// routes, pushes the request via the shim MM2S, waits for the CTRL response to
+// drain into the shim S2MM, and copies the @nwords read values into @out_data
+// (skipping the per-access response headers). @req_stream_id routes the request
+// to the dest CTRL master; @ret_stream_id is encoded in the response header.
+// dev must be partitioned first. Returns XAIE_OK on success.
+//
+// NOTE: each control-packet response is its own AXI-stream packet (TLAST at end)
+// and the single shim S2MM drain BD completes on the first TLAST. This reliably
+// captures a SINGLE response packet, i.e. a read whose @nwords fit one access
+// (<=4 words and not crossing a 128-bit boundary from @tile_addr). Larger reads
+// span multiple response packets and would need one shim S2MM BD per packet
+// (not yet implemented).
+AieRC __Runtime_ctrl_read_target(XAie_DevInst *dev, uint8_t shim_col, uint8_t dest_col, uint8_t dest_row,
+                                 uint8_t req_stream_id, uint8_t ret_stream_id, uint32_t tile_addr, uint32_t nwords,
+                                 uint32_t *out_data, int32_t bd_id, int32_t mm2s_ch, int32_t s2mm_ch);
 
 // Flush dirty cache lines for the buffer to DDR (before DMA reads it).
 void __Runtime_sync_for_dev(XAie_DevInst *dev, void *ptr, size_t size);
@@ -565,5 +959,123 @@ void __Runtime_move_data_to_tile(XAie_RoutingInstance *routing, XAie_LocType shi
 
 void __Runtime_move_data_from_tile(XAie_RoutingInstance *routing, XAie_LocType src_tile, XAie_LocType shim_tile,
                                    XAie_MemInst *mem, uint32_t tile_offset, uint32_t size);
+
+// ---------------------------------------------------------------------------
+// Row-based control connection (design: 2026-09-08-row-control-connection).
+//
+// A stateful fabric that configures a control connection across a horizontal
+// row of AIE tiles: a control packet climbs a shared vertical spine (column
+// @shim_col) to the row's left tile, then daisy-chains EAST tile-to-tile. Each
+// tile can consume at CTRL, forward EAST, or both (broadcast). Single-target
+// read / write-with-return responses drain down the shared vertical spine to the
+// shim S2MM (a MemTile S2MM will not commit a sub-beat control response — see the
+// row-control ADR). Adding a new row reuses the shared spine. Initial tile
+// support: core and memtile only.
+//
+// The per-tile packet-switch derivation and the shared-spine/idempotent
+// row-add logic live in the pure planner (aie_runtime_control_plan.c). This
+// struct pairs that planner state (@spine + @book) with the XAie device and the
+// shim S2MM response channel.
+// ---------------------------------------------------------------------------
+
+// One configured EAST chain (design §3 RowChain).
+typedef struct {
+    uint8_t row;            // AIE row of this chain
+    uint8_t col_lo, col_hi; // inclusive column span built on this row
+} __Runtime_CtrlRowChain;
+
+typedef struct __Runtime_CtrlRowFabric_s {
+    XAie_DevInst *dev; // partitioned device instance
+    uint8_t shim_col;  // vertical spine column (= row left edge)
+    uint8_t dedicated_shim;
+    uint8_t ctrl_id;   // 5-bit stream id used for consume-matching
+    uint32_t fwd_vc;   // vertical stream channel for the forward spine
+    uint32_t ret_vc;   // vertical stream channel for the return spine
+
+    int32_t resp_s2mm_ch; // shim S2MM channel that drains single-target responses
+
+    acr_state spine;                           // shared spine + configured rows
+    acr_portbook book;                         // per-tile port booking (req #7)
+    __Runtime_CtrlRowChain rows[ACR_MAX_ROWS]; // configured EAST chains
+    uint8_t nrows;
+
+    // Pending control-packet transaction cast target, set by
+    // __Runtime_control_start_transaction and read back by
+    // __Runtime_control_write_pkt_commit_transaction / __Runtime_control_push (so commit is
+    // stateless w.r.t. the caller). @txn_row < 0 => whole-array broadcast;
+    // @txn_row >= 0 => row-multicast to that physical row.
+    int txn_row;
+    uint8_t pmap_shim_seen;
+} __Runtime_CtrlRowFabric;
+
+// Translate a planner op list into XAie stream-switch calls on @dev. Returns the
+// first non-XAIE_OK result, logging the offending tile. Pure-planner ops carry
+// abstract port tags (acr_port) mapped here to StrmSwPortType.
+AieRC __Runtime_ctrl_row_emit(XAie_DevInst *dev, const acr_oplist *ops);
+
+// One-shot fabric init: record the device, spine column @shim_col, control
+// stream id @ctrl_id, and shim S2MM response channel @resp_s2mm_ch, then plan +
+// emit every EAST chain in @rows[0..nrows). @rows may be given in any row order (bottom-up
+// preferred); the static planner computes the top row so its return head omits
+// the idle RET_NORTH slot. Responses drain via @resp_s2mm_ch.
+AieRC __Runtime_ctrl_plan_init(__Runtime_CtrlRowFabric *f, XAie_DevInst *dev, uint8_t shim_col, int32_t resp_s2mm_ch,
+                               uint8_t ctrl_id, const __Runtime_CtrlRowChain *rows, uint8_t nrows);
+
+AieRC __Runtime_ctrl_plan_release(__Runtime_CtrlRowFabric *f, int32_t mm2s_ch);
+
+void __Runtime_ctrl_plan_set_exclusive(__Runtime_CtrlRowFabric *f, int on);
+
+// Tear down fabric state. Best-effort route teardown (partition reset clears the
+// stream switches).
+AieRC __Runtime_ctrl_row_close(__Runtime_CtrlRowFabric *f);
+
+// Broadcast a WRITE control packet (@nwords words to tile byte address
+// @tile_addr) to every tile of every configured row (stream id ACR_ID_BCAST,
+// id[4]=1). Fire-and-forget (no ack, non-blocking). @bd_id / @mm2s_ch select the
+// shim send BD + channel; @log enables the per-send log. Requires a prior
+// __Runtime_ctrl_plan_init that configured at least one row.
+AieRC __Runtime_ctrl_row_broadcast_write(__Runtime_CtrlRowFabric *f, uint32_t tile_addr, const uint32_t *data,
+                                         uint32_t nwords, int32_t bd_id, int32_t mm2s_ch, int log);
+
+// Column-subset row-multicast WRITE control packets (@nwords words to tile byte
+// address @tile_addr on the target @row). The stream id is (class<<2)|rowidx with
+// id[4]=0, where rowidx is @row's add-order index (id[1:0], up to 4 rows). The
+// packet climbs the shared spine (intervening heads forward it via their transit-
+// north slot) to reach any configured row, where the class-selected slots deliver
+// to the intended column subset. Fire-and-forget (block=0). @bd_id / @mm2s_ch
+// select the shim send BD + channel; @log enables the per-send log. Each requires
+// a prior __Runtime_ctrl_plan_init row for @row (add-order index <= ACR_MAX_ROW_IDX).
+//   all_but_last: every column EXCEPT col_hi.   only_last: only col_hi.
+//   whole_row:    every column incl. col_hi.
+AieRC __Runtime_ctrl_row_all_but_last_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr,
+                                            const uint32_t *data, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch,
+                                            int log);
+AieRC __Runtime_ctrl_row_only_last_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr,
+                                         const uint32_t *data, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch,
+                                         int log);
+AieRC __Runtime_ctrl_row_whole_row_write(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr,
+                                         const uint32_t *data, uint32_t nwords, int32_t bd_id, int32_t mm2s_ch,
+                                         int log);
+
+// Row-multicast register READ (whole-row): read @nwords words at tile byte
+// address @tile_addr from EVERY column of @row. Each column returns its own
+// response packet (its stream header is kept); the packets merge west down the
+// shared spine to the shim S2MM (one BD per column, drained on @f->resp_s2mm_ch).
+// The per-column read values are placed into out_vals[(src_col-col_lo)*nwords+w]
+// (out_vals must hold ncols*nwords words). @nwords must fit one control access
+// (<=4 words, no 128-bit crossing) so each column emits exactly one packet.
+// @bd_id/@mm2s_ch select the shim forward BD/channel; the return uses BDs
+// bd_id+1..bd_id+ncols. Blocking. Requires @row configured by __Runtime_ctrl_plan_init.
+AieRC __Runtime_ctrl_row_read(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr, uint32_t nwords,
+                              uint32_t *out_vals, int32_t bd_id, int32_t mm2s_ch);
+
+// Row-multicast WRITE-with-ack (whole-row): write @nwords words to tile byte
+// address @tile_addr on EVERY column of @row, with the last word re-emitted as a
+// write-with-return so each column returns a header-only ack. All ncols acks
+// draining the shim S2MM (@f->resp_s2mm_ch, BDs bd_id+1..bd_id+ncols) is the
+// completion barrier. @nwords must fit one control access. Blocking. Returns
+// XAIE_OK iff every ack drained. Requires @row configured by __Runtime_ctrl_plan_init.
+AieRC __Runtime_ctrl_row_write_ack(__Runtime_CtrlRowFabric *f, uint8_t row, uint32_t tile_addr, const uint32_t *data,
+                                   uint32_t nwords, int32_t bd_id, int32_t mm2s_ch);
 
 #endif // AIE_RUNTIME_H

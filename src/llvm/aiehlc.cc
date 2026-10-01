@@ -25,6 +25,7 @@
 #include "../mlir/mlirfront/AieFrontEnd.h"
 #include <boost/algorithm/string.hpp>
 
+#include <algorithm>
 #include <ios>
 #include <iostream>
 #include <fstream>
@@ -33,6 +34,8 @@
 #include <cstdlib>
 #include <regex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "routingimplement/include/hw/hwresource.h"
 #include "tilinglinalg_pipeline.h"
@@ -174,6 +177,29 @@ static DerivedTilingParams derivedTilingParams;
 static int64_t macroDimM = 0, macroDimN = 0, macroDimK = 0; // GEMM dimensions from launch args or macros
 
 static int parsedDebugLevel = -1; // -1 = not set by user, >=0 = #pragma aie_debug_level value
+// Set by #pragma control_plan_op_control_packet. When true, the MLIR pipeline
+// reserves (excludes) control-plane stream-switch resources from routing.
+static bool parsedControlPlanCtrlPacket = false;
+// Set by #pragma CONTROL_PLAN_GROUP_REG_WRITE. When true, the host pipeline runs
+// GroupRegWritePass, which coalesces identical core-tile lock inits into
+// control-packet group writes (broadcast / row multicast). Absent (default) =>
+// the pass is skipped and lock inits are emitted as individual register writes.
+static bool parsedControlPlanGroupRegWrite = false;
+// Set by #pragma KERNELCONFIGOFFLOAD. When true, the pipeline offloads core-tile
+// DMA configuration (incoming/ongoing S2MM BDs, lock inits, MM2S BD, channel
+// start) from the HOST into the AIE CORE kernel, which self-programs its DMA via
+// raw MMIO register writes. Absent (default) => byte-identical to today (host
+// programs every core tile's DMA over the config bus).
+static bool parsedKernelConfigOffload = false;
+static bool parsedControlPlanDedicatedShim = false;
+// Compute tiles to core-trace, from #pragma aie_trace(col,row) (mesh/partition-
+// relative). Repeatable and range-expanded (col:col2, row:row2 -> rectangle).
+// Each spec may carry an optional mem-module DMA/stream selection (2nd tuple).
+static std::vector<TraceTileSpec> parsedTraceTiles;
+// Set when a #pragma aie_trace directive is unrecoverably invalid (e.g. a STREAM
+// direction that is neither "s2mm" nor "mm2s"). Checked before the pipeline runs
+// so the build aborts with a clear error instead of silently mis-tracing.
+static bool parsedTraceFatal = false;
 static std::string userSourceDir; // directory containing the original user source file
 static PartitionDesc parsedPartition; // default: invalid (all -1), set by #pragma aie_partition
 static std::vector<MeshKernelDesc> parsedMeshKernels; // multi-kernel mode: one per <<<mesh>>> launch
@@ -188,6 +214,23 @@ static std::string userKernelBody;     // raw source text of __global__ function
 static std::string userKernelFuncName; // kernel function name from __global__ (last kernel, backward compat)
 static std::unordered_map<std::string, std::string> globalKernelBodies; // per-kernel: name -> cleaned body text
 static std::vector<std::string> userMacroDefines; // #define lines from user source
+
+// File-scope code the user wants carried verbatim into the generated kernel,
+// delimited in the source by:
+//
+//     // AIEHLC_KERNEL_PROLOGUE_BEGIN
+//     ... declarations ...
+//     // AIEHLC_KERNEL_PROLOGUE_END
+//
+// The kernel is regenerated from the compute function's BODY plus the user's
+// #define lines, so a file-scope declaration would otherwise be dropped. Some
+// constructs cannot be expressed as a macro and cannot live in a function body
+// -- notably the chess_storage(TM:...) anchor that gives an object Tile-Memory
+// linkage: chess_storage is rejected on pointer/reference types, so the anchor
+// must be a file-scope OBJECT whose address is then indexed. Without this
+// passthrough the only way to reach TM from an aiehlc kernel is to hardcode the
+// undocumented address_space number the frontend happens to use.
+static std::string userKernelPrologue;
 
 using namespace clang;
 using namespace clang::tooling;
@@ -502,7 +545,18 @@ public:
                  }
                  macroBlock += "\n";
              }
-             str = header + macroBlock + str;
+             // File-scope prologue (AIEHLC_KERNEL_PROLOGUE_BEGIN/END). Emitted
+             // after the macros so it may use them, and before the kernel body so
+             // its declarations are in scope. Must be at FILE scope: its whole
+             // purpose is constructs that cannot live in a function body, e.g. a
+             // chess_storage(TM:...) anchor object.
+             std::string prologueBlock;
+             if (!userKernelPrologue.empty()) {
+                 prologueBlock = "\n// User kernel prologue from source file "
+                                 "(AIEHLC_KERNEL_PROLOGUE_BEGIN/END)\n" +
+                                 userKernelPrologue + "\n";
+             }
+             str = header + macroBlock + prologueBlock + str;
              fd << str << std::endl;
     }
 
@@ -3183,9 +3237,17 @@ class AieDebugLevelPragmaHandler : public clang::PragmaHandler {
     void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer Introducer, clang::Token &FirstToken) override {
         // Known flag macros (must match aie_runtime.h definitions)
         static const std::unordered_map<std::string, int> knownFlags = {
-            {"AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA", 1 << 4}, {"AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN", 1 << 5},
-            {"AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER", 1 << 6},   {"AIE_DMA_ISSUE_COUNT", 1 << 7},
-            {"AIE_DEBUG_FLAG_CORE_PERF_COUNTER", 1 << 8},      {"AIE_DEBUG_LOG", 1 << 9},
+            {"AIE_DEBUG_FLAG_DISABLE_MULTID_DIM_DMA", 1 << 4},
+            {"AIE_DEBUG_FLAG_DISABLE_PARTITIONTEARDOWN", 1 << 5},
+            {"AIE_DEBUG_FLAG_MM2SBDFINISH_COUNTER", 1 << 6},
+            {"AIE_DMA_ISSUE_COUNT", 1 << 7},
+            {"AIE_DEBUG_FLAG_CORE_PERF_COUNTER", 1 << 8},
+            {"AIE_DEBUG_LOG", 1 << 9},
+            // Kernel-side logging. Unlike the flags above (which only steer HOST
+            // runtime behaviour) this one reaches the KERNEL compile: kc.sh turns it
+            // into -DKERNEL_LOG_ENABLED -DKERNELCONFIGOFFLOAD_TRACE, which switches on
+            // klog() itself plus the KERNELCONFIGOFFLOAD per-register trace.
+            {"AIE_KERNEL_CONFIG_TRACE", 1 << 10},
         };
 
         clang::Token Tok;
@@ -3243,9 +3305,314 @@ class AieDebugLevelPragmaHandler : public clang::PragmaHandler {
         if (valid) {
             parsedDebugLevel = result;
             llvm::outs() << "[aiehlc] Detected #pragma aie_debug_level " << parsedDebugLevel << "\n";
+
+            // Publish kernel-side build flags for script/kc.sh.
+            //
+            // The kernel is compiled by a SEPARATE process (aiehlc.sh ->
+            // hostcompile.sh -> kc.sh), so a pragma parsed here cannot reach
+            // xchesscc through memory. Write a tiny shell fragment kc.sh sources.
+            //
+            // Emitted HERE, in the pragma handler, because this runs for every
+            // flow. The host.cc writer further down is split into tiling and
+            // single-tile branches, and writing from one of them silently skips
+            // the other — which is exactly the bug this replaces.
+            //
+            // AIE_KERNEL_CONFIG_TRACE (bit 10) switches on klog() itself plus the
+            // KERNELCONFIGOFFLOAD per-register trace.
+            constexpr int kKernelConfigTraceBit = 1 << 10;
+            bool trace = (parsedDebugLevel & kKernelConfigTraceBit) != 0;
+            // AOUT already exists here (kernel_list is written into it earlier in
+            // the same run), so no directory creation is needed.
+            std::string flagsPath = std::string(AOUT) + "kernel_build_flags.sh";
+            std::ofstream kf(flagsPath, std::ios::out);
+            if (kf) {
+                kf << "# Generated by aiehlc from #pragma aie_debug_level. Sourced by script/kc.sh.\n";
+                kf << "AIEHLC_KERNEL_LOG=" << (trace ? 1 : 0) << "\n";
+                kf.close();
+                llvm::outs() << "[aiehlc] wrote " << flagsPath << " (AIEHLC_KERNEL_LOG=" << (trace ? 1 : 0) << ")\n";
+            } else {
+                llvm::errs() << "[aiehlc] Warning: could not write " << flagsPath
+                             << "; kernel logging will stay disabled\n";
+            }
         }
 
         // Consume remaining tokens on the pragma line (if any)
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
+// #pragma aie_trace(col, row) — declare compute tile(s) to core-trace.
+// Coordinates are mesh/partition-relative (the same space the generated host
+// uses). Each of col and row may be a single value N or a range N:M; the
+// col x row rectangle is expanded into (col,row) pairs and accumulated across
+// repeated pragmas. Only compute-tile coords are meaningful; the runtime
+// rejects non-compute rows at __Runtime_core_trace_begin.
+//   #pragma aie_trace(2, 3)     -> (2,3)
+//   #pragma aie_trace(1:2, 3)   -> (1,3),(2,3)
+//
+// An optional SECOND tuple selects which tile DMA the memory-module trace unit
+// watches. It requires the coord to be its own nested tuple:
+//   #pragma aie_trace((0,3),(STREAM,"s2mm",0))    // explicit dir + channel
+//   #pragma aie_trace((0,3),(STREAM,"mm2s",1))
+//   #pragma aie_trace((0,3),(PARAMETER,"win_a"))  // named window -> resolved
+// The selection applies to every (col,row) expanded from the first tuple. No
+// second tuple keeps the runtime default (S2MM ch0). A malformed second tuple
+// warns and falls back to Default without dropping the tile.
+class AieTracePragmaHandler : public clang::PragmaHandler {
+  public:
+    AieTracePragmaHandler() : PragmaHandler("aie_trace") {}
+
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer Introducer, clang::Token &FirstToken) override {
+        clang::Token Tok;
+        PP.Lex(Tok);
+
+        if (!Tok.is(clang::tok::l_paren)) {
+            llvm::errs() << "[aiehlc] Warning: #pragma aie_trace expects '(col, row)', ignored\n";
+            if (Tok.isNot(clang::tok::eod))
+                PP.DiscardUntilEndOfDirective();
+            return;
+        }
+        PP.Lex(Tok); // consume outer '('
+
+        // Detect nested-tuple form ((col,row),(SEL,...)) vs. flat (col,row): the
+        // nested form opens a second '(' immediately after the first.
+        bool nested = Tok.is(clang::tok::l_paren);
+        if (nested)
+            PP.Lex(Tok); // consume the inner '(' of ((col,row),...)
+
+        // Parse one coord spec: a numeric_constant, optionally 'N : M'. Returns
+        // false on a malformed token stream; leaves Tok after the spec.
+        auto parseSpec = [&](int &lo, int &hi) -> bool {
+            if (!Tok.is(clang::tok::numeric_constant))
+                return false;
+            {
+                llvm::SmallString<16> Buf;
+                bool Invalid = false;
+                llvm::StringRef Spelling = PP.getSpelling(Tok, Buf, &Invalid);
+                if (Invalid || Spelling.getAsInteger(0, lo))
+                    return false;
+            }
+            hi = lo;
+            PP.Lex(Tok);
+            if (Tok.is(clang::tok::colon)) {
+                PP.Lex(Tok); // consume ':'
+                if (!Tok.is(clang::tok::numeric_constant))
+                    return false;
+                llvm::SmallString<16> Buf;
+                bool Invalid = false;
+                llvm::StringRef Spelling = PP.getSpelling(Tok, Buf, &Invalid);
+                if (Invalid || Spelling.getAsInteger(0, hi))
+                    return false;
+                PP.Lex(Tok);
+            }
+            return true;
+        };
+
+        // Strip surrounding quotes from a string_literal spelling.
+        auto stringLitValue = [&](std::string &out) -> bool {
+            if (!Tok.is(clang::tok::string_literal))
+                return false;
+            llvm::SmallString<32> Buf;
+            bool Invalid = false;
+            llvm::StringRef Spelling = PP.getSpelling(Tok, Buf, &Invalid);
+            if (Invalid || Spelling.size() < 2)
+                return false;
+            out = Spelling.substr(1, Spelling.size() - 2).str(); // drop quotes
+            PP.Lex(Tok);
+            return true;
+        };
+
+        int colLo = 0, colHi = 0, rowLo = 0, rowHi = 0;
+        bool ok = parseSpec(colLo, colHi);
+        if (ok && Tok.is(clang::tok::comma)) {
+            PP.Lex(Tok); // consume ','
+            ok = parseSpec(rowLo, rowHi);
+        } else {
+            ok = false;
+        }
+        if (ok && Tok.is(clang::tok::r_paren))
+            PP.Lex(Tok); // consume ')' closing (col,row)
+        else
+            ok = false;
+
+        if (!ok) {
+            llvm::errs() << "[aiehlc] Warning: malformed #pragma aie_trace(col, row), ignored\n";
+            if (Tok.isNot(clang::tok::eod))
+                PP.DiscardUntilEndOfDirective();
+            return;
+        }
+
+        // Parse the optional second tuple (only in nested form). Malformed ->
+        // warn + Default (do not drop the tile).
+        TraceDmaSel sel = TraceDmaSel::Default;
+        int dmaKind = 1; // AIE_TRACE_DMA_S2MM
+        int dmaCh = 0;
+        std::string paramName;
+        if (nested && Tok.is(clang::tok::comma)) {
+            PP.Lex(Tok); // consume ',' between the two tuples
+            bool selOk = false;
+            if (Tok.is(clang::tok::l_paren)) {
+                PP.Lex(Tok); // consume '(' of the sel tuple
+                if (Tok.is(clang::tok::identifier)) {
+                    llvm::StringRef kw = Tok.getIdentifierInfo()->getName();
+                    PP.Lex(Tok);
+                    if (kw == "STREAM" && Tok.is(clang::tok::comma)) {
+                        PP.Lex(Tok);
+                        std::string dir;
+                        if (stringLitValue(dir) && Tok.is(clang::tok::comma)) {
+                            std::string dl = dir;
+                            std::transform(dl.begin(), dl.end(), dl.begin(), ::tolower);
+                            PP.Lex(Tok);
+                            int idx = 0;
+                            if (Tok.is(clang::tok::numeric_constant)) {
+                                llvm::SmallString<16> Buf;
+                                bool Invalid = false;
+                                llvm::StringRef Sp = PP.getSpelling(Tok, Buf, &Invalid);
+                                if (!Invalid && !Sp.getAsInteger(0, idx)) {
+                                    PP.Lex(Tok);
+                                    if (dl == "s2mm" || dl == "mm2s") {
+                                        sel = TraceDmaSel::Stream;
+                                        dmaKind = (dl == "mm2s") ? 2 : 1;
+                                        dmaCh = idx;
+                                        selOk = Tok.is(clang::tok::r_paren);
+                                        if (selOk)
+                                            PP.Lex(Tok); // consume ')'
+                                    } else {
+                                        // Recognizable STREAM tuple but an invalid direction
+                                        // name (e.g. "s3mm"): hard error, not a silent
+                                        // fallback. Consume ')' so the rest parses cleanly.
+                                        llvm::errs() << "[aiehlc] Error: #pragma aie_trace STREAM direction \"" << dir
+                                                     << "\" is invalid (expected \"s2mm\" or \"mm2s\")\n";
+                                        parsedTraceFatal = true;
+                                        selOk = true; // suppress the generic malformed warning
+                                        if (Tok.is(clang::tok::r_paren))
+                                            PP.Lex(Tok); // consume ')'
+                                    }
+                                }
+                            }
+                        }
+                    } else if (kw == "PARAMETER" && Tok.is(clang::tok::comma)) {
+                        PP.Lex(Tok);
+                        std::string nm;
+                        if (stringLitValue(nm)) {
+                            sel = TraceDmaSel::Parameter;
+                            paramName = nm;
+                            selOk = Tok.is(clang::tok::r_paren);
+                            if (selOk)
+                                PP.Lex(Tok); // consume ')'
+                        }
+                    }
+                }
+            }
+            if (!selOk) {
+                llvm::errs() << "[aiehlc] Warning: malformed 2nd tuple in #pragma aie_trace; "
+                                "using default mem trace (S2MM ch0)\n";
+                sel = TraceDmaSel::Default;
+                dmaKind = 1;
+                dmaCh = 0;
+                paramName.clear();
+            }
+        }
+        if (nested && Tok.is(clang::tok::r_paren))
+            PP.Lex(Tok); // consume outer ')'
+
+        if (colLo > colHi)
+            std::swap(colLo, colHi);
+        if (rowLo > rowHi)
+            std::swap(rowLo, rowHi);
+
+        unsigned added = 0;
+        for (int c = colLo; c <= colHi; c++) {
+            for (int r = rowLo; r <= rowHi; r++) {
+                // Dedup on (col,row); a later sel overrides an earlier Default.
+                auto it = std::find_if(parsedTraceTiles.begin(), parsedTraceTiles.end(),
+                                       [&](const TraceTileSpec &s) { return s.col == c && s.row == r; });
+                if (it == parsedTraceTiles.end()) {
+                    TraceTileSpec s;
+                    s.col = c;
+                    s.row = r;
+                    s.sel = sel;
+                    s.dmaKind = dmaKind;
+                    s.dmaCh = dmaCh;
+                    s.paramName = paramName;
+                    parsedTraceTiles.push_back(std::move(s));
+                    added++;
+                } else if (it->sel == TraceDmaSel::Default && sel != TraceDmaSel::Default) {
+                    it->sel = sel;
+                    it->dmaKind = dmaKind;
+                    it->dmaCh = dmaCh;
+                    it->paramName = paramName;
+                }
+            }
+        }
+        llvm::outs() << "[aiehlc] Detected #pragma aie_trace col=" << colLo << ":" << colHi << " row=" << rowLo << ":"
+                     << rowHi << " (+" << added << " tiles, total " << parsedTraceTiles.size() << ")\n";
+        for (const auto &t : parsedTraceTiles) {
+            llvm::outs() << "[aiehlc]   trace tile (" << t.col << "," << t.row << ")";
+            if (t.sel == TraceDmaSel::Stream)
+                llvm::outs() << " mem=" << (t.dmaKind == 2 ? "MM2S" : "S2MM") << ":ch" << t.dmaCh;
+            else if (t.sel == TraceDmaSel::Parameter)
+                llvm::outs() << " mem=param(" << t.paramName << ")";
+            llvm::outs() << "\n";
+        }
+
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
+// Bare marker pragma: #pragma control_plan_op_control_packet (no arguments).
+// Its presence opts the MLIR pipeline into control-plane resource reservation
+// (excluding control-plane pkt-ids/arbiters/slots from routing/scheduling).
+// Absent (default) => reservation is skipped.
+class AieControlPlanPragmaHandler : public clang::PragmaHandler {
+  public:
+    AieControlPlanPragmaHandler() : PragmaHandler("control_plan_op_control_packet") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        parsedControlPlanCtrlPacket = true;
+        llvm::outs() << "[aiehlc] Detected #pragma control_plan_op_control_packet\n";
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
+// Bare marker pragma: #pragma CONTROL_PLAN_GROUP_REG_WRITE (no arguments).
+// Its presence opts the host pipeline into GroupRegWritePass, which coalesces
+// identical core-tile lock inits into control-packet group writes (broadcast /
+// row multicast). Absent (default) => the pass is skipped.
+class AieControlPlanGroupRegWritePragmaHandler : public clang::PragmaHandler {
+  public:
+    AieControlPlanGroupRegWritePragmaHandler() : PragmaHandler("CONTROL_PLAN_GROUP_REG_WRITE") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        parsedControlPlanGroupRegWrite = true;
+        llvm::outs() << "[aiehlc] Detected #pragma CONTROL_PLAN_GROUP_REG_WRITE\n";
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
+// Bare marker pragma: #pragma KERNELCONFIGOFFLOAD (no arguments). Its presence
+// opts the pipeline into offloading core-tile DMA configuration (S2MM/MM2S BDs,
+// lock inits, channel start) from the HOST into the AIE CORE kernel, which
+// self-programs its DMA via raw MMIO. Absent (default) => host programs the DMA.
+class AieKernelConfigOffloadPragmaHandler : public clang::PragmaHandler {
+  public:
+    AieKernelConfigOffloadPragmaHandler() : PragmaHandler("KERNELCONFIGOFFLOAD") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        parsedKernelConfigOffload = true;
+        llvm::outs() << "[aiehlc] Detected #pragma KERNELCONFIGOFFLOAD\n";
+        if (Tok.isNot(clang::tok::eod))
+            PP.DiscardUntilEndOfDirective();
+    }
+};
+
+class AieControlPlanDedicatedShimPragmaHandler : public clang::PragmaHandler {
+  public:
+    AieControlPlanDedicatedShimPragmaHandler() : PragmaHandler("control_plan_dedicated_shim") {}
+    void HandlePragma(clang::Preprocessor &PP, clang::PragmaIntroducer, clang::Token &Tok) override {
+        parsedControlPlanDedicatedShim = true;
+        llvm::outs() << "[aiehlc] Detected #pragma control_plan_dedicated_shim\n";
         if (Tok.isNot(clang::tok::eod))
             PP.DiscardUntilEndOfDirective();
     }
@@ -3300,6 +3667,11 @@ public:
 
             clang::Preprocessor &PP = CI.getPreprocessor();
             PP.AddPragmaHandler(new AieDebugLevelPragmaHandler());
+            PP.AddPragmaHandler(new AieTracePragmaHandler());
+            PP.AddPragmaHandler(new AieControlPlanPragmaHandler());
+            PP.AddPragmaHandler(new AieControlPlanGroupRegWritePragmaHandler());
+            PP.AddPragmaHandler(new AieKernelConfigOffloadPragmaHandler());
+            PP.AddPragmaHandler(new AieControlPlanDedicatedShimPragmaHandler());
 
             return true;
 		}
@@ -3351,6 +3723,32 @@ public:
                 // both branches are flattened into the kernel file).
                 {
                     userMacroDefines.clear();
+                    // Capture an optional AIEHLC_KERNEL_PROLOGUE_BEGIN/END block
+                    // for verbatim emission at file scope in the kernel. Scanned
+                    // here, in the same pass as the #defines, so both travel by
+                    // the same route.
+                    userKernelPrologue.clear();
+                    {
+                        std::istringstream piss(SourceCodeString);
+                        std::string pline;
+                        bool inPrologue = false;
+                        while (std::getline(piss, pline)) {
+                            if (pline.find("AIEHLC_KERNEL_PROLOGUE_BEGIN") != std::string::npos) {
+                                inPrologue = true;
+                                continue;
+                            }
+                            if (pline.find("AIEHLC_KERNEL_PROLOGUE_END") != std::string::npos) {
+                                inPrologue = false;
+                                continue;
+                            }
+                            if (inPrologue)
+                                userKernelPrologue += pline + "\n";
+                        }
+                        if (!userKernelPrologue.empty())
+                            llvm::outs() << "[aiehlc] captured kernel prologue ("
+                                         << std::count(userKernelPrologue.begin(), userKernelPrologue.end(), '\n')
+                                         << " lines)\n";
+                    }
                     std::istringstream iss(SourceCodeString);
                     std::string line;
                     std::string currentDefine;
@@ -4279,6 +4677,23 @@ public:
                                         fcAttrBuilder.getI64IntegerAttr(mkd.fullConnectAuto ? 1 : 0));
                         llvm::outs() << "[TilingLinalg] Set fullconnect_auto=" << (mkd.fullConnectAuto ? 1 : 0)
                                      << " for kernel " << mkd.kernelName << "\n";
+                        // Opt-in control-plane resource reservation (see
+                        // #pragma control_plan_op_control_packet). Publish the flag
+                        // so the pipeline gates reserveControlPlaneResources on it.
+                        module->setAttr("routing.control_plan_op_control_packet",
+                                        fcAttrBuilder.getI64IntegerAttr(parsedControlPlanCtrlPacket ? 1 : 0));
+                        // Opt-in GroupRegWritePass (see #pragma
+                        // CONTROL_PLAN_GROUP_REG_WRITE). Publish the flag so the
+                        // host pipeline gates the pass on it.
+                        module->setAttr("routing.control_plan_group_reg_write",
+                                        fcAttrBuilder.getI64IntegerAttr(parsedControlPlanGroupRegWrite ? 1 : 0));
+                        // Opt-in kernel config offload (see #pragma
+                        // KERNELCONFIGOFFLOAD). Publish the flag so the pipeline
+                        // gates the offload codegen on it.
+                        module->setAttr("routing.kernel_config_offload",
+                                        fcAttrBuilder.getI64IntegerAttr(parsedKernelConfigOffload ? 1 : 0));
+                        module->setAttr("routing.control_plan_dedicated_shim",
+                                        fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
                     }
 
                     // Replace aie::get_*() calls in kernel body with computed integer literals
@@ -4385,10 +4800,14 @@ public:
                     std::string hostFuncSuffix = mkd.kernelName;
                     // Don't pass userRewrittenSource in multi-kernel mode — we emit it ourselves after all runs
                     unsigned hostDdrArgs = 0;
+                    if (parsedTraceFatal) {
+                        llvm::errs() << "[aiehlc] Aborting: invalid #pragma aie_trace directive(s).\n";
+                        std::exit(1);
+                    }
                     if (!TilingLinalgPipeline::runPipeline(
                             ctx, module, outputDir, kernelBodyWithMacros, mkd.kernelFuncName, parsedDebugLevel,
                             /*userRewrittenSource=*/"", {}, mkd.maxPPBytes, aieGenStr, hostFuncSuffix, appendMode,
-                            &hostDdrArgs, mkd.portVarNames)) {
+                            &hostDdrArgs, mkd.portVarNames, parsedTraceTiles)) {
                         llvm::errs() << "[TilingLinalg] Pipeline FAILED for kernel: " << mkd.kernelName << "\n";
                         std::exit(1);
                     }
@@ -4946,6 +5365,22 @@ public:
                                     fcAttrBuilder.getI64IntegerAttr(singleFullConnectAuto ? 1 : 0));
                     llvm::outs() << "[TilingLinalg] Set fullconnect_auto=" << (singleFullConnectAuto ? 1 : 0)
                                  << " for kernel " << singleKernelFuncName << "\n";
+                    // Opt-in control-plane resource reservation (see
+                    // #pragma control_plan_op_control_packet). Publish the flag
+                    // so the pipeline gates reserveControlPlaneResources on it.
+                    module->setAttr("routing.control_plan_op_control_packet",
+                                    fcAttrBuilder.getI64IntegerAttr(parsedControlPlanCtrlPacket ? 1 : 0));
+                    // Opt-in GroupRegWritePass (see #pragma
+                    // CONTROL_PLAN_GROUP_REG_WRITE). Publish the flag so the host
+                    // pipeline gates the pass on it.
+                    module->setAttr("routing.control_plan_group_reg_write",
+                                    fcAttrBuilder.getI64IntegerAttr(parsedControlPlanGroupRegWrite ? 1 : 0));
+                    // Opt-in kernel config offload (see #pragma KERNELCONFIGOFFLOAD).
+                    // Publish the flag so the pipeline gates the offload codegen on it.
+                    module->setAttr("routing.kernel_config_offload",
+                                    fcAttrBuilder.getI64IntegerAttr(parsedKernelConfigOffload ? 1 : 0));
+                    module->setAttr("routing.control_plan_dedicated_shim",
+                                    fcAttrBuilder.getI64IntegerAttr(parsedControlPlanDedicatedShim ? 1 : 0));
                 }
 
                 // Replace aie::get_*() calls in kernel body with computed integer literals
@@ -5048,10 +5483,14 @@ public:
                     singlePortVarNames.push_back(pt.varName);
 
                 // Run pipeline (single kernel — no suffix, no append mode)
+                if (parsedTraceFatal) {
+                    llvm::errs() << "[aiehlc] Aborting: invalid #pragma aie_trace directive(s).\n";
+                    std::exit(1);
+                }
                 if (!TilingLinalgPipeline::runPipeline(
                         ctx, module, outputDir, kernelBodyWithMacros, singleKernelFuncName, parsedDebugLevel,
                         userRewrittenSource, tensors, effectiveMaxPPBytes, aieGenStr, /*hostFuncSuffix=*/"",
-                        /*appendMode=*/false, /*numHostDdrArgs=*/nullptr, singlePortVarNames)) {
+                        /*appendMode=*/false, /*numHostDdrArgs=*/nullptr, singlePortVarNames, parsedTraceTiles)) {
                     llvm::errs() << "[TilingLinalg] Pipeline FAILED.\n";
                     std::exit(1);
                 }

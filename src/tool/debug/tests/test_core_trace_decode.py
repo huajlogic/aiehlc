@@ -38,27 +38,58 @@ _RUNTIME_C = os.path.normpath(
 # Extract the real decoder from aie_runtime.c and build a compilable harness.
 # --------------------------------------------------------------------------
 def _extract_c_decoder(src):
-    m = re.search(r"static const char \*const s_core_trace_slot_name\[4\][^;]*;", src)
-    assert m, "s_core_trace_slot_name[4] table not found in aie_runtime.c"
+    m = re.search(r"static const char \*const s_core_trace_slot_name\[8\][^;]*;", src)
+    assert m, "s_core_trace_slot_name[8] table not found in aie_runtime.c"
     slot_tbl = m.group(0)
 
+    # The demux (__core_trace_table_for_id) also references the mem-module slot
+    # table for pkt id 2, so pull it in too or the harness will not link.
+    mm = re.search(r"static const char \*const s_mem_trace_slot_name\[8\][^;]*;", src)
+    assert mm, "s_mem_trace_slot_name[8] table not found in aie_runtime.c"
+    mem_tbl = mm.group(0)
+
+    # The profile dump appends each slot's physical HW event id from two parallel
+    # event-value tables. Both are now filled at trace-setup time (device-only),
+    # so their declarations are plain uninitialized arrays; the harness never runs
+    # setup, so they stay zero and the dump prints "{event value 0:...}".
+    ce = re.search(r"static uint16_t s_core_trace_slot_event\[8\][^;]*;", src)
+    assert ce, "s_core_trace_slot_event[8] table not found in aie_runtime.c"
+    core_evt_tbl = ce.group(0)
+    me = re.search(r"static uint16_t s_mem_trace_slot_event\[8\][^;]*;", src)
+    assert me, "s_mem_trace_slot_event[8] table not found in aie_runtime.c"
+    mem_evt_tbl = me.group(0)
+
     start = src.index("#define XAIE_TRACE_SYNC_CYCLES")
-    end = src.index("// Global routing instance", start)
+    # Stop right after the trace-profile dump: the declarative-session code that
+    # follows pulls in board headers (xtime_l.h / xiltimer.h) that cannot be
+    # compiled standalone. The harness only needs init/attach/.../decode/dump.
+    end = src.index("Declarative core-trace session", start)
+    end = src.rindex("/*", start, end)  # back up to that comment block's opener
     block = src[start:end].rstrip()
     assert "__Runtime_core_trace_decode" in block, "decoder body not captured"
-    return slot_tbl, block
+    return slot_tbl, mem_tbl, core_evt_tbl, mem_evt_tbl, block
 
 
 # Minimal shim for the types the profile path references. The real defs live in
 # aie_runtime.h (which pulls in xaiengine.h and cannot be included standalone);
 # only the fields the extracted code touches matter here. Must match the header.
 _PROFILE_SHIM = r"""
+/* The event-value tables (s_core/s_mem_trace_slot_event) are filled on-device at
+ * trace setup via XAie_EventLogicalToPhysicalConv, which the standalone harness
+ * never runs -- so they stay zero here and the dump prints "{event value 0:..}".
+ * The mem-module dynamic-name table is likewise populated on-device from
+ * XAie_EventGetString; NULL here, so the dump falls back to the generic
+ * s_mem_trace_slot_name labels. Declared here because its declaration in
+ * aie_runtime.c lives outside the extracted decoder region. */
+static const char *s_mem_trace_slot_dynname[8];
+
 typedef struct { uint8_t Col, Row; } XAie_LocType;
 
 typedef struct {
     uint8_t  col, row;
     uint32_t mask;
     uint64_t start_cycle, end_cycle;
+    const char *const *names;
 } AieTraceInterval;
 
 typedef struct {
@@ -72,13 +103,15 @@ typedef struct {
     uint64_t    host;
 } AieTraceHostEvt;
 
-#define AIE_TRACE_PROFILE_CAP 512u
+#define AIE_TRACE_PROFILE_CAP 4096u
+#define AIE_TRACE_PROFILE_MIN_PER_STREAM 1024u
 #define AIE_TRACE_ANCHOR_CAP    8u
 #define AIE_TRACE_EVENT_CAP    64u
 typedef struct {
     AieTraceInterval iv[AIE_TRACE_PROFILE_CAP];
     uint32_t count;
     uint32_t dropped;
+    uint32_t reserve;
     uint8_t  cur_col, cur_row;
     int      attached;
     uint64_t cps;
@@ -141,10 +174,11 @@ def _build_harness():
         return None
     with open(_RUNTIME_C) as f:
         src = f.read()
-    slot_tbl, block = _extract_c_decoder(src)
+    slot_tbl, mem_tbl, core_evt_tbl, mem_evt_tbl, block = _extract_c_decoder(src)
     prog = ("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n"
             "#include <string.h>\n\n"
-            + _PROFILE_SHIM + "\n" + slot_tbl + "\n\n" + block + "\n" + _HARNESS_MAIN)
+            + _PROFILE_SHIM + "\n" + slot_tbl + "\n" + mem_tbl + "\n"
+            + core_evt_tbl + "\n" + mem_evt_tbl + "\n\n" + block + "\n" + _HARNESS_MAIN)
 
     d = tempfile.mkdtemp(prefix="ctd_ut_")
     cpath = os.path.join(d, "harness.c")
@@ -351,10 +385,16 @@ def raw_intervals(text):
 
 
 # Profile dump interval line:
-#   "[TIMESYNC] trace tile=<c>,<r> <start>[ -- <end>]  <events>[  (<N> cyc)]".
-# The "[TIMESYNC] trace tile=c,r words=N" header line has "words=" (not a digit)
-# after the tile, so it never matches this interval regex.
-_PROF = re.compile(r"^\[TIMESYNC\] trace tile=(\d+),(\d+) (\d+)(?:\s+--\s+(\d+))?  (\S+?)(?:  \(\d+ cyc\))?$")
+#   "[TIMESYNC] trace tile=<c>,<r> [stream=<tag> ]<start>[ -- <end>]  <events>[{event value ...}][  (<N> cyc)]".
+# The optional "stream=<tag>" marks the mem-module DMA stream (pkt id 2); it is
+# non-capturing here so core lines keep their 5-group layout. The trailing
+# "{event value v1:v2:...}" carries each set slot's raw XAie event value and is
+# stripped (non-capturing) so the names group stays clean. The
+# "[TIMESYNC] trace tile=c,r words=N" header has "words=" after the tile, so it
+# never matches this interval regex.
+_PROF = re.compile(
+    r"^\[TIMESYNC\] trace tile=(\d+),(\d+) (?:stream=\w+ )?(\d+)(?:\s+--\s+(\d+))?  "
+    r"(\S+?)(?:\{event value [^}]*\})?(?:  \(\d+ cyc\))?$")
 
 
 def profile_intervals(text):
@@ -431,10 +471,14 @@ def _check(words, golden):
 def test_extract_regions_present():
     with open(_RUNTIME_C) as f:
         src = f.read()
-    slot_tbl, block = _extract_c_decoder(src)
+    slot_tbl, mem_tbl, core_evt_tbl, mem_evt_tbl, block = _extract_c_decoder(src)
     assert "ACTIVE" in slot_tbl and "MEMORY_STALL" in slot_tbl
+    assert "DMA_START" in mem_tbl and "LOCK_REL" in mem_tbl
+    assert "s_core_trace_slot_event" in core_evt_tbl
+    assert "s_mem_trace_slot_event" in mem_evt_tbl
     assert "__core_trace_bits" in block
     assert "void __Runtime_core_trace_decode(" in block
+    assert "__core_trace_table_for_id" in block  # demux by pkt id
     # The profile API travels with the decoder (same extracted region).
     assert "__Runtime_aie_trace_profile_dump" in block
 
@@ -544,8 +588,8 @@ def test_single2_wide_cycle():
 def test_multiple1_and_multiple2_with_event_slots():
     words = pack(start(0), multiple(0xFF, 500), multiple(0x81, 200000))
     golden = [(500, "ACTIVE"), (500, "LOCK_STALL"), (500, "STREAM_STALL"),
-              (500, "MEMORY_STALL"), (500, "EVENT4"), (500, "EVENT5"),
-              (500, "EVENT6"), (500, "EVENT7"),
+              (500, "MEMORY_STALL"), (500, "PORT_IDLE_0"), (500, "PORT_RUNNING_0"),
+              (500, "PORT_STALLED_0"), (500, "EVENT7"),
               (200500, "ACTIVE"), (200500, "EVENT7")]
     _check(words, golden)
 
@@ -615,6 +659,93 @@ def test_empty_buffer_is_header_only():
 
 
 # --------------------------------------------------------------------------
+# Packet-id demux: a shared MemTile buffer carrying the core stream (pkt id 1)
+# and the mem-module DMA stream (pkt id 2) must decode each with its OWN slot
+# table, ascending by id (core before mem). Legacy single-id buffers are
+# unchanged (covered by every other case, which uses id 1 / id 0).
+# --------------------------------------------------------------------------
+MEM_HDR = 0x00000002  # packet id=2, type=0 (mem-module DMA trace)
+
+
+def test_demux_core_and_mem_streams():
+    # id 1 (core): ACTIVE @1010; id 2 (mem): slot0 DMA_START @2005. The two
+    # streams share one buffer; the demux splits them by header id and labels
+    # each with its table. Decoded ascending -> core interval then mem interval.
+    _skip_if_no_cc()
+    core = pack(start(1000), single(0, 10), header=PKT_HDR, terminate=False)
+    mem = pack(start(2000), single(0, 5), header=MEM_HDR, terminate=False)
+    words = core + mem + [0] * 8
+    _check(words, [(1010, "ACTIVE"), (2005, "DMA_START")])
+
+
+def test_demux_mem_slot_names_and_category():
+    # Exercise several mem slots and assert the Python model tags them with the
+    # mem name table and the 'mem' timeline category (distinct from core).
+    mem = pack(start(0), multiple(0x0F, 5), header=MEM_HDR, terminate=False)
+    words = mem + [0] * 8
+    tl = ctd.CoreTraceDecoder(mode="quiet").decode(words)
+    assert tl == [
+        (5, "DMA_START", "mem"),
+        (5, "DMA_FINISH", "mem"),
+        (5, "DMA_STALL_LOCK", "mem"),
+        (5, "STREAM_STALL", "mem"),
+    ]
+
+
+def test_demux_core_and_mem_categories_distinct():
+    # Same STREAM_STALL slot name appears in BOTH tables (core slot 2, mem slot
+    # 3); only the category disambiguates the stream. Core STREAM_STALL is
+    # 'core', mem STREAM_STALL is 'mem'.
+    core = pack(start(0), single(2, 7), header=PKT_HDR, terminate=False)
+    mem = pack(start(0), single(3, 7), header=MEM_HDR, terminate=False)
+    words = core + mem + [0] * 8
+    tl = ctd.CoreTraceDecoder(mode="quiet").decode(words)
+    assert (7, "STREAM_STALL", "core") in tl
+    assert (7, "STREAM_STALL", "mem") in tl
+
+
+def test_profile_dump_tags_mem_stream():
+    # The profile dump must tag mem-module intervals (pkt id 2) with "stream=mem"
+    # so the off-device timeline can route them to their own lane -- STREAM_STALL
+    # collides with the core table, so the slot name alone cannot disambiguate.
+    # Core intervals stay untagged (backward compatible with existing parsers).
+    _skip_if_no_cc()
+    core = pack(start(1000), single(0, 10), header=PKT_HDR, terminate=False)
+    mem = pack(start(2000), single(0, 5), single(3, 2), header=MEM_HDR, terminate=False)
+    words = core + mem + [0] * 8
+    out = run_c_profile(words)
+    lines = [l for l in out.splitlines() if l.startswith("[TIMESYNC] trace tile=")]
+    core_lines = [l for l in lines if "stream=" not in l]
+    mem_lines = [l for l in lines if "stream=mem " in l]
+    # Each set slot now carries an "{event value ...}" suffix after the names.
+    assert any("1010  ACTIVE{event value" in l for l in core_lines), core_lines
+    assert any("DMA_START{event value" in l for l in mem_lines), mem_lines
+    assert any("STREAM_STALL{event value" in l for l in mem_lines), mem_lines
+    # The dump still parses into intervals (stream tag + suffix are non-capturing).
+    ivs = [(s, e, nm) for _, _, s, e, nm in profile_intervals(out)]
+    assert (2005, 2005, "DMA_START") in ivs, ivs
+    assert (2007, 2007, "STREAM_STALL") in ivs, ivs
+
+
+def test_profile_dump_appends_event_value_suffix():
+    # Every set slot's raw AIE event value is appended after the joined names as
+    # "{event value v1:v2:...}" in slot order. A core interval covering slots 0
+    # and 2 (ACTIVE|STREAM_STALL) yields the two core event values, colon-joined.
+    _skip_if_no_cc()
+    core = pack(start(1000), multiple(0x05, 10), header=PKT_HDR, terminate=False)
+    words = core + [0] * 8
+    out = run_c_profile(words)
+    lines = [l for l in out.splitlines() if l.startswith("[TIMESYNC] trace tile=")]
+    ev = [l for l in lines if "ACTIVE" in l and "STREAM_STALL" in l]
+    assert ev, lines
+    m = re.search(r"\{event value ([0-9:]+)\}", ev[0])
+    assert m, ev[0]
+    vals = m.group(1).split(":")
+    assert len(vals) == 2, ev[0]  # two set slots -> two colon-joined values
+    assert all(v.isdigit() for v in vals), ev[0]
+
+
+# --------------------------------------------------------------------------
 # Real captured buffer -- a raw 8-word packet exactly as passed by a caller.
 #
 #   [0] 0xf0000000  [1] 0x00d5922e  [2] 0x00d971ff  [3] 0xd833fefe
@@ -645,13 +776,13 @@ def test_user_capture_8word_packet():
     # buf[0]=0xf0000000 skipped as header; first payload byte 0x00 -> Single0
     # event 0, cycle 0.
     assert tl[0] == (0, "ACTIVE")
-    assert tl[1:4] == [(142848, "STREAM_STALL"), (142848, "EVENT5"),
-                       (142848, "EVENT6")]
+    assert tl[1:4] == [(142848, "STREAM_STALL"), (142848, "PORT_RUNNING_0"),
+                       (142848, "PORT_STALLED_0")]
     assert tl[-1] == (13854729, "ACTIVE")
     assert len(tl) == 1522
     assert max(cyc for cyc, _ in tl) == 13854729
     assert dict(collections.Counter(n for _, n in tl)) == {
-        "ACTIVE": 412, "STREAM_STALL": 370, "EVENT5": 370, "EVENT6": 370}
+        "ACTIVE": 412, "STREAM_STALL": 370, "PORT_RUNNING_0": 370, "PORT_STALLED_0": 370}
 
 
 # --------------------------------------------------------------------------

@@ -58,6 +58,8 @@ A bare `mm2s0` at tile scope also selects the channel.
 | `status` | `core`, `core status` | — | decoded core status (enable/reset/stall); errors on row 0 |
 | `event` | — | — | **core tiles only**: decoded MEM-module event status (`MEM_EVT_STATUS_REGS`). On a **shim tile (row 0) there is NO decode, ever** — `_tile_events` just reads `0x34200`/`0x34204` and the only output is the `[registers read]` appendix. For a shim verdict go to channel scope. |
 | `channels` | `chans` | — | lists channels from `schedule_view.json` — **no board read** |
+| `show switch` | `switch`, `switches` | — | decoded stream-switch config: every enabled master, the slave (source) port feeding it, circuit vs packet mode, enabled slaves + packet slots. Reads master `0x3F000`/slave `0x3F100`/slot `0x3F200` (memtile `0xB0000`/`0xB0100`/`0xB0200`). Read-only. |
+| `scan switch` | `scanswitch` | — | flow-trace: BFS the reachable set of tiles along enabled directional ports (up + downstream), read each switch, print the assembled end-to-end flows (e.g. `DMA0@(0,3) -> NORTH0@(0,3) -> NORTH0@(0,4) -> CORE0@(0,5)`). Read-only, cycle-safe; can read MANY tiles, so prefer `show switch` for a single tile. |
 | `log` | `klog` | — | kernel klog buffer, core tiles only |
 
 `reg read OFF`, `mem read ADDR LEN` and `callstack show|layers|stream` are
@@ -125,7 +127,7 @@ gated even though it only navigates — use `target channel mm2s0` instead.
 
 Everything else is gated on `backend_status.json > session.authorized`, written by the daemon
 (`DebugState.session_state`). Authorized means the user pressed **Connect** (`connected`),
-**Run test** (`ran`), or **Open Current Session** (`attached`). If not authorized, `aie_exec`
+**Run** (`ran`), or **Open Current Session** (`attached`). If not authorized, `aie_exec`
 returns:
 
 ```json
@@ -134,7 +136,7 @@ returns:
 
 When you see `refused: true`: **nothing was read.** Do not describe, infer, or guess board
 state, and do not fall back to the `applog` as if it were this run. Tell the user to press
-Connect / Run test / Open Current Session. (If `backend_status.json` has no `session` key —
+Connect / Run / Open Current Session. (If `backend_status.json` has no `session` key —
 aiemcp launched standalone — the gate is skipped and commands proceed.)
 
 ## Worked navigation

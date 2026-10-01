@@ -23,6 +23,11 @@ def eval_int(expr, defs):
             e = re.sub(r"\b%s\b" % re.escape(name), "(%s)" % str(val), e)
         if e == prev:
             break
+    # Strip C integer suffixes on numeric literals (0u, 3UL, 0x10u). These ride
+    # in through macro bodies (#define DEMO_SHIM_COL 0u), so they must be removed
+    # AFTER substitution, not only from a raw literal. Scoped to digit-led tokens
+    # so identifiers (e.g. buf2u) are untouched.
+    e = re.sub(r"\b(0[xX][0-9a-fA-F]+|\d+)[uUlL]+\b", r"\1", e)
     if re.search(r"[A-Za-z_]", e):
         return None
     try:
@@ -44,7 +49,9 @@ class MacroResolver:
     def _eval_cond(self, expr):
         e = expr.strip()
         for name, val in self.defs.items():
-            e = re.sub(r"\b%s\b" % re.escape(name), str(val), e)
+            # Function replacement so macro bodies with backslashes or \g refs
+            # (e.g. multi-line BENCH defines) are substituted literally.
+            e = re.sub(r"\b%s\b" % re.escape(name), lambda _m, v=str(val): v, e)
         e = re.sub(r"\b[A-Za-z_]\w*\b", "0", e)
         try:
             return bool(eval(e, {"__builtins__": {}}, {}))
@@ -59,6 +66,16 @@ class MacroResolver:
             s = line.strip()
             m = re.match(r"#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)", s)
             if not m:
+                # Honor inline #define/#undef in active regions so a later
+                # #ifdef of an in-file-defined macro (e.g. the controlperf
+                # `#define _CONTROL_WRITE_TEST_` guard) resolves correctly.
+                dm = re.match(r"#\s*(define|undef)\s+(\w+)(.*)", s)
+                if dm and active():
+                    if dm.group(1) == "define":
+                        body = dm.group(3).strip()
+                        self.defs[dm.group(2)] = body if body else 1
+                    else:
+                        self.defs.pop(dm.group(2), None)
                 if active():
                     out.append(line)
                 continue
@@ -99,6 +116,34 @@ RE_ROUTE = re.compile(
     r"XAie_Route\s*\([^,]+,\s*[^,]+,\s*XAie_TileLoc\s*\(([^,]+),([^)]+)\)\s*,"
     r"\s*XAie_TileLoc\s*\(([^,]+),([^)]+)\)", re.DOTALL)
 
+# Control-packet send: a __Runtime_CtrlInstance designated-initializer block, or a
+# composite __Runtime_ctrl_read_target / __Runtime_ctrl_push_target call. Both are
+# same-column (dest_col == shim_col); a send reduces to (shim_col, dest_row,
+# resp_words). The struct body may span many lines (DOTALL); the call form gives
+# shim_col/dest_col/dest_row as positional args 2/3/4.
+RE_CTRL_STRUCT = re.compile(
+    r"__Runtime_CtrlInstance\s+\w+\s*=\s*\{(.*?)\}", re.DOTALL)
+RE_CTRL_FIELD = re.compile(r"\.(\w+)\s*=\s*([^,}]+)")
+RE_CTRL_CALL = re.compile(
+    r"__Runtime_ctrl_(?:read|push)_target\s*\(\s*[^,]+,\s*"
+    r"([^,]+),\s*([^,]+),\s*([^,]+),")
+
+# Row-control fabric (design: 2026-09-08-row-control-connection). Each
+# __Runtime_ctrl_plan_init(fab, dev, shim_col, s2mm_ch, ctrl_id, rows, nrows)
+# picks a shared spine (shim) column and names a __Runtime_CtrlRowChain rows[] =
+# {{row, col_lo, col_hi}, ...} array. A translation unit may hold SEVERAL such
+# fabrics (one per demo function, often reusing the array name `kRows`); the
+# static parser cannot know which one main() runs, so extract_ctrl_rows UNIONS
+# them all. Capture arg3 (shim_col) and arg6 (the rows array identifier) from the
+# call, the array's NAME + body from its declaration, and each {row, col_lo,
+# col_hi} triple from that body.
+RE_PLAN_INIT = re.compile(
+    r"__Runtime_ctrl_plan_init\s*\(\s*[^,]+,\s*[^,]+,\s*([^,]+),"
+    r"\s*[^,]+,\s*[^,]+,\s*&?\s*(\w+)")
+RE_ROW_ARRAY = re.compile(
+    r"__Runtime_CtrlRowChain\s+(\w+)\s*\[[^\]]*\]\s*=\s*\{(.*?)\}\s*;", re.DOTALL)
+RE_ROW_TRIPLE = re.compile(r"\{\s*([^,{}]+),\s*([^,{}]+),\s*([^,{}]+)\}")
+
 
 def collect_defines(src):
     """Object-like #define NAME body -> {name: body}."""
@@ -117,6 +162,104 @@ def resolve_tileloc(col_expr, row_expr, defs):
     return (c, r)
 
 
+def _ctrl_int(expr, defs, default=None):
+    """eval_int with C integer-suffix stripping (0u/3u/0x1000u) and a fallback,
+    for control-packet field exprs. eval_int rejects any [A-Za-z_], so the u/l
+    suffix on unsigned literals must be removed first (scoped here, not in the
+    shared eval_int). Only numeric literals are stripped, so identifiers like
+    _rspcap / RAW_BD_SLOT still fail to fold and take the default."""
+    cleaned = re.sub(r"\b(0[xX][0-9a-fA-F]+|\d+)[uUlL]+\b", r"\1", expr.strip())
+    v = eval_int(cleaned, defs)
+    return default if v is None else v
+
+
+def extract_ctrl_sends(active, defs):
+    """Reduce every control-packet send in @active to a same-column send dict
+    {shim_col, dest_row, resp_words}, deduped by (shim_col, dest_row). Values fold
+    through @defs; resp_words defaults to 1 when unresolvable. Sends whose shim_col
+    or dest_row cannot be resolved are skipped (mirrors tile-loc resolution)."""
+    sends, seen = [], set()
+
+    def add(shim_col, dest_row, resp_words):
+        if shim_col is None or dest_row is None:
+            return
+        key = (shim_col, dest_row)
+        if key in seen:
+            return
+        seen.add(key)
+        sends.append({"shim_col": shim_col, "dest_row": dest_row,
+                      "resp_words": resp_words if resp_words else 1})
+
+    for m in RE_CTRL_STRUCT.finditer(active):
+        fields = {k: v for k, v in RE_CTRL_FIELD.findall(m.group(1))}
+        add(_ctrl_int(fields.get("shim_col", ""), defs),
+            _ctrl_int(fields.get("dest_row", ""), defs),
+            _ctrl_int(fields.get("resp_words", "1"), defs, default=1))
+    for m in RE_CTRL_CALL.finditer(active):
+        add(_ctrl_int(m.group(1), defs), _ctrl_int(m.group(3), defs), 1)
+    return sends
+
+
+def _fold_row_triples(body, defs):
+    """Fold a __Runtime_CtrlRowChain array body into a deduped list of
+    {row,col_lo,col_hi} dicts; triples whose fields don't fold are skipped."""
+    rows, seen = [], set()
+    for tm in RE_ROW_TRIPLE.finditer(body):
+        row = _ctrl_int(tm.group(1), defs)
+        col_lo = _ctrl_int(tm.group(2), defs)
+        col_hi = _ctrl_int(tm.group(3), defs)
+        if row is None or col_lo is None or col_hi is None:
+            continue
+        key = (row, col_lo, col_hi)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"row": row, "col_lo": col_lo, "col_hi": col_hi})
+    return rows
+
+
+def extract_ctrl_rows(active, defs):
+    """Reduce EVERY row-control fabric to a UNION topology list.
+
+    Each __Runtime_ctrl_plan_init(fab, dev, shim_col, s2mm_ch, ctrl_id, rows,
+    nrows) names a shared spine (shim) column and a __Runtime_CtrlRowChain rows[]
+    initializer of {row, col_lo, col_hi} EAST-chain triples. A translation unit
+    may declare several fabrics (one per demo function, frequently reusing the
+    array name `kRows`); the static parser cannot know which one main() actually
+    runs, so it UNIONS them all -- keyed by (shim_col, row, col_lo, col_hi),
+    grouped by spine column -- pairing each plan_init with the nearest PRECEDING
+    __Runtime_CtrlRowChain array of the SAME name (so same-named arrays in
+    different function scopes stay distinct). Returns a list of {shim_col,
+    rows:[{row,col_lo,col_hi}]} (one entry per spine column, in first-seen
+    order); an empty list when no fabric is initialized. Chains whose shim column
+    or triple fields can't fold are skipped. Values fold through @defs, tolerating
+    u/l suffixes."""
+    arrays = [(am.start(), am.group(1), am.group(2))
+              for am in RE_ROW_ARRAY.finditer(active)]
+    by_col, order, seen = {}, [], set()
+    for pm in RE_PLAN_INIT.finditer(active):
+        shim_col = _ctrl_int(pm.group(1), defs)
+        if shim_col is None:
+            continue
+        # Nearest PRECEDING array declaration of the name passed to this call.
+        name, body, best = pm.group(2), None, -1
+        for start, aname, abody in arrays:
+            if aname == name and start < pm.start() and start > best:
+                best, body = start, abody
+        if body is None:
+            continue
+        for rr in _fold_row_triples(body, defs):
+            key = (shim_col, rr["row"], rr["col_lo"], rr["col_hi"])
+            if key in seen:
+                continue
+            seen.add(key)
+            if shim_col not in by_col:
+                by_col[shim_col] = []
+                order.append(shim_col)
+            by_col[shim_col].append(rr)
+    return [{"shim_col": c, "rows": by_col[c]} for c in order]
+
+
 def strip_comments(src):
     """Drop C block/line comments so inline /*src=*/ notes inside XAie call
     argument lists do not break the tile-loc regexes."""
@@ -125,7 +268,10 @@ def strip_comments(src):
     return src
 
 
-RE_XAIE_CALL = re.compile(r"XAie_(LoadElfMem|MoveData\w+|Route)\b")
+RE_XAIE_CALL = re.compile(
+    r"(XAie_(LoadElfMem|MoveData\w+|Route)|__Runtime_ctrl_setup_routing"
+    r"|__Runtime_ctrl_(read|push)_target|__Runtime_ctrl_plan_init"
+    r"|__Runtime_ctrl_row_\w+)\b")
 RE_FUNC_HDR = re.compile(r"([A-Za-z_]\w*)\s*\([^;]*\)\s*\{?\s*$")
 
 
@@ -165,12 +311,13 @@ def extract_model(raw_src, aie_gen, aiesim):
 
     tiles, seen = [], set()
 
-    def add_tile(loc):
+    def add_tile(loc, ttype=None):
         if loc is None or loc in seen:
             return
         seen.add(loc)
-        tiles.append({"col": loc[0], "row": loc[1],
-                      "type": "shim" if loc[1] == 0 else "core"})
+        if ttype is None:
+            ttype = "shim" if loc[1] == 0 else "core"
+        tiles.append({"col": loc[0], "row": loc[1], "type": ttype})
 
     kernel_placements = {}
     for km in RE_LOADELF.finditer(active):
@@ -214,8 +361,60 @@ def extract_model(raw_src, aie_gen, aiesim):
         if (src, dst) in covered:
             continue
 
+    for s in extract_ctrl_sends(active, defs):
+        col, drow = s["shim_col"], s["dest_row"]
+        length = s["resp_words"] * 4
+        for r in range(0, drow + 1):
+            add_tile((col, r), ctrl_tile_type(r, aie_gen))
+        shim, dst = (col, 0), (col, drow)
+        flows.append({"src": shim, "dst": dst, "direction": "S2MM", "len": length})
+        flows.append({"src": dst, "dst": shim, "direction": "MM2S", "len": length})
+
+    # Row-control fabric: one shared vertical spine on the shim column feeds N
+    # EAST chains (one per configured row). Enumerate the spine (shim + vertical
+    # pass-through up to the highest row) and every chain tile, then draw a
+    # forward (up) + return (down) flow to each chain endpoint (col_hi,row). The
+    # return leg is the shim-S2MM read-response drain. extract_ctrl_rows unions
+    # every fabric in the file (grouped per spine column), so a file with several
+    # plan_init functions renders the combined topology.
+    for fabric in extract_ctrl_rows(active, defs):
+        col = fabric["shim_col"]
+        shim = (col, 0)
+        top_row = max(r["row"] for r in fabric["rows"])
+        for r in range(0, top_row + 1):
+            add_tile((col, r), ctrl_tile_type(r, aie_gen))
+        for rr in fabric["rows"]:
+            for c in range(rr["col_lo"], rr["col_hi"] + 1):
+                add_tile((c, rr["row"]), ctrl_tile_type(rr["row"], aie_gen))
+            endpoint = (rr["col_hi"], rr["row"])
+            # Axis-aligned waypoint route so the device map (which builds edges
+            # only from Manhattan-distance-1 hops) draws the real spine + chain
+            # rather than a single diagonal shim->endpoint line: climb the spine
+            # (col, 0..row) then walk the EAST chain (col..col_hi, row).
+            fwd = [(col, r) for r in range(0, rr["row"] + 1)]
+            step = 1 if endpoint[0] >= col else -1
+            fwd += [(c, rr["row"])
+                    for c in range(col + step, endpoint[0] + step, step)]
+            flows.append({"src": shim, "dst": endpoint, "direction": "S2MM",
+                          "len": 4, "path": fwd})
+            flows.append({"src": endpoint, "dst": shim, "direction": "MM2S",
+                          "len": 4, "path": list(reversed(fwd))})
+
     return {"tiles": tiles, "kernel_placements": kernel_placements,
             "flows": flows, "entry_fn": find_entry_fn(active)}
+
+
+# AIE-core row start per generation (row 0 shim; 0<row<start memtile; row>=start
+# core). Mirrors the C rt_port_evt_base geometry and aiediag.AIE_TILE_ROW_START:
+# gen5/AIE2PS have 2 memtile rows (cores from 3), gen2 one (from 2), gen1 none.
+_CORE_ROW_START = {1: 1, 2: 2, 5: 3}
+
+
+def ctrl_tile_type(row, aie_gen):
+    if row == 0:
+        return "shim"
+    start = _CORE_ROW_START.get(int(aie_gen), 3)
+    return "memtile" if row < start else "core"
 
 
 def hw_gen_str(g):
@@ -322,7 +521,10 @@ def build_dmaphop(model):
     Stages carry roles ('producer'/'channel'/'consumer'), tiles are {col,row}
     dicts, and the channel stage holds hops as '(c,r)' from/to strings. Static
     XAie parsing cannot see the intermediate routing path (XAie_Route decides it
-    at runtime), so the channel carries only the direct producer->consumer hop.
+    at runtime), so the channel carries only the direct producer->consumer hop
+    -- unless the flow supplies an explicit axis-aligned waypoint 'path' (e.g.
+    the row-control spine + EAST chain), in which case it is expanded into
+    consecutive Manhattan-distance-1 hops so the device map renders each leg.
     """
     paths = []
     for fi, f in enumerate(model["flows"]):
@@ -331,9 +533,16 @@ def build_dmaphop(model):
         producer = {"role": "producer",
                     "tile": {"col": src[0], "row": src[1]},
                     "port_sym": "f%d_prod" % fi}
-        channel = {"role": "channel",
-                   "hops": [{"from": "(%d,%d)" % src, "to": "(%d,%d)" % dst,
-                             "hop_type": None, "shmem_kind": None}]}
+        # An explicit waypoint path is a known circuit/stream route, so type its
+        # legs 'stream'; otherwise leave the single hop untyped and let
+        # schedule_view classify it (dist>1 -> stream, else shmem).
+        explicit = bool(f.get("path"))
+        waypoints = f.get("path") or [src, dst]
+        hop_type = "stream" if explicit else None
+        hops = [{"from": "(%d,%d)" % tuple(a), "to": "(%d,%d)" % tuple(b),
+                 "hop_type": hop_type, "shmem_kind": None}
+                for a, b in zip(waypoints, waypoints[1:])]
+        channel = {"role": "channel", "hops": hops}
         consumer = {"role": "consumer",
                     "tile": {"col": dst[0], "row": dst[1]},
                     "port_sym": "f%d_cons" % fi}

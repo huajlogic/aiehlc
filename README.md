@@ -129,9 +129,10 @@ source ./script/setup.sh --bsp-use-git-repo=https://path/to/aie-rt.git
 
 # stub all tiles (seems to crash the simulator often)
 source script/aiehlc.sh --platform sim --aie-version 5 --runtime-source-file tutorial/example.cpp
-# or explicitly stub only tiles you used, e.g. col=0 row=3
-source script/aiehlc.sh --platform sim --aie-version 5 --sim-tiles "0:3" --runtime-source-file tutorial/example.cpp
+# tutorial/example.cpp programs XAie_TileLoc(4, 4)
+source script/aiehlc.sh --platform sim --aie-version 5 --sim-tiles "4:4" --runtime-source-file tutorial/example.cpp
 
+# aiehlc only builds the artifacts; launch separately
 bash script/runsim.sh
 ```
 
@@ -143,6 +144,9 @@ bash script/runsim.sh
 
 # 2. Specific aout dir: point it at any aout/ containing a sim_config.sh
 bash script/runsim.sh path/to/aout
+
+# TilingLinalg writes its config in the provenance bundle
+bash script/runsim.sh aout/worklocal
 
 # 3. Direct (no config file): pass the inputs yourself (not recommended)
 bash script/runsim.sh \
@@ -240,6 +244,195 @@ The debug level value is a bitfield:
 The pragma is detected during preprocessing and emits a strong symbol override of `g_runtime_debug_level` into the generated `host.cc`. The runtime in `aie_runtime.c` defines this variable as a weak symbol with default `0`, so the linker picks the user-specified value when present.
 
 This works for both single-tile (`aiehlc`) and multi-tile (`tilinglinalg`) compilation paths.
+
+## Core Trace
+
+Arm the AIE per-tile trace units from your source file using `#pragma aie_trace`.
+Each pragma selects a tile `(col, row)` whose core-module and memory-module trace
+units are set up in the generated `host.cc` (via `__Runtime_core_trace_begin_dma`).
+The memory-module trace stream is drained through one of the tile's DMA channels;
+the pragma lets you pick which one.
+
+### Forms
+
+```cpp
+// 1. Default: trace tile (0,3); mem-trace drains via S2MM channel 0.
+#pragma aie_trace(0, 3)
+
+// 2. Ranges: trace every tile in col 1..2, row 3 (all get the default S2MM ch0).
+#pragma aie_trace(1:2, 3)
+
+// 3. STREAM: pick the mem-trace DMA direction + channel explicitly.
+#pragma aie_trace((0, 3), (STREAM, "s2mm", 0))
+#pragma aie_trace((0, 3), (STREAM, "mm2s", 1))
+
+// 4. PARAMETER: name a kernel window; the compiler resolves the physical
+//    (direction, channel) the tiling flow assigned to it on that tile.
+//    Input windows drain via S2MM, output windows via MM2S.
+#pragma aie_trace((0, 3), (PARAMETER, "win_a"))
+```
+
+### Selection semantics
+
+| Form | `mem_dma_kind` | `mem_dma_ch` |
+|------|----------------|--------------|
+| `aie_trace(col, row)` | `S2MM` | `0` (default) |
+| `(STREAM, "s2mm", ch)` | `S2MM` | `ch` |
+| `(STREAM, "mm2s", ch)` | `MM2S` | `ch` |
+| `(PARAMETER, "win_x")` | resolved: input→`S2MM`, output→`MM2S` | resolved channel |
+
+- The direction string is case-insensitive (`"s2mm"` / `"S2MM"`).
+- `PARAMETER` resolution reads the `dfschedule.config.create_io` provenance to
+  map a window name to the DMA channel the flow physically assigned on the traced
+  tile. It is available in the multi-tile (`tilinglinalg`) flow; if a name cannot
+  be resolved (unknown window, or no matching create_io on that tile) the compiler
+  warns and falls back to the default `S2MM ch0` so the trace still arms.
+- Pragmas are repeatable and ranges expand to one trace-setup call per tile; the
+  selected mem-DMA applies to every tile expanded from that pragma.
+- The legacy flat form `#pragma aie_trace(0, 3)` (no inner parens) is still
+  accepted and is identical to the default `S2MM ch0` behaviour.
+
+Each pragma emits `__Runtime_core_trace_begin_dma(dev, col, row, dma_kind, dma_ch)`
+into `host.cc`. STREAM selection works in both single-tile and multi-tile flows;
+PARAMETER resolution requires the multi-tile provenance and otherwise falls back
+to the default.
+
+### Validation
+
+The mem-DMA selection is checked at compile time and the build **fails with an
+error** (non-zero exit) rather than silently mis-tracing when:
+
+| Case | Example | Error |
+|------|---------|-------|
+| Invalid STREAM direction | `(STREAM, "s3mm", 0)` | `STREAM direction "s3mm" is invalid (expected "s2mm" or "mm2s")` |
+| STREAM channel not used by the app on that tile | `(STREAM, "mm2s", 1)` when the tile only drives `mm2s ch0` | `STREAM mm2s ch1 is not used by the app on tile(0,3). Available mm2s channels: ch0` |
+| PARAMETER name is not a kernel window | `(PARAMETER, "win_xyz")` | `PARAMETER "win_xyz" is not a kernel window/port name.` |
+
+The STREAM channel check compares the requested `(direction, channel)` against the
+channels the tiling flow actually assigned on the traced tile (from the
+`dfschedule.config.create_io` provenance), so it rejects both hardware-invalid
+indices and valid-but-unused channels. Tiles a given kernel does not own are
+skipped so multi-kernel meshes are not spuriously failed. The `Default` form
+(`aie_trace(col, row)`, S2MM ch0) is not validated.
+
+## Control-Plane Pragmas
+
+Two opt-in marker pragmas (no arguments) enable control-plane features in the
+multi-tile (`tilinglinalg`) flow. Both are off by default; add the pragma to your
+source file to turn the feature on. They are detected during preprocessing and
+published as module attributes that gate the corresponding MLIR pipeline stage.
+
+```cpp
+#pragma control_plan_op_control_packet
+#pragma CONTROL_PLAN_GROUP_REG_WRITE
+
+__global__ void mykernel(const int32_t *A, int32_t *B) {
+    // kernel code
+}
+
+int main() {
+    // host code
+}
+```
+
+| Pragma | Module attr | Effect when present |
+|--------|-------------|---------------------|
+| `#pragma control_plan_op_control_packet` | `routing.control_plan_op_control_packet` | Reserves control-plane stream-switch resources and lowers kernel ELF loading plus core launch to fire-and-forget broadcast control-packet writes. Absent => normal `XAie_LoadElfMem` / `XAie_CoreEnable` behavior. |
+| `#pragma CONTROL_PLAN_GROUP_REG_WRITE` | `routing.control_plan_group_reg_write` | The host pipeline runs `GroupRegWritePass`, which coalesces identical core-tile lock-init register writes into **control-packet group writes** (broadcast / row-multicast, lowered to `__Runtime_ctrl_row_write_ack`). Absent => the pass is skipped and lock inits are emitted as individual `XAie_LockSetValue` register writes. |
+
+### `#pragma control_plan_op_control_packet`
+
+Reserves control-plane resources so a control-packet fabric (see the row-control
+planner APIs in `aie_runtime.h`) can share the array with the data plane without
+resource conflicts. The pipeline gates `reserveControlPlaneResources(...)` on the
+published attr.
+
+The host pipeline also materializes the row-control fabric before
+`load_kernel_group`. Generated code calls
+`__Runtime_load_kernel_group_{4,8,16}t_ctrl` to stream ELF program/data words
+through the reserved fabric, then calls `__Runtime_launch_kernel_group_ctrl` to
+enable the cores through that same path. Core reset/unreset remains direct
+driver configuration so the CTRL endpoint is live while the ELF is transferred.
+ELF PT_LOAD bytes are pktized as 4-word broadcast writes. On AIE2PS,
+`__Runtime_ctrl_high_throughput_enable(1)` before device initialization disables
+CTRL TLAST errors at partition init and packs all self-delimiting accesses into
+one shim MM2S BD with one final TLAST. The last write-with-return stays separate
+and its CTRL ACK drain is the completion barrier. Without that opt-in, the
+compatibility path uses one BD and TLAST per access. Generated control-plane
+traffic uses the hardware-validated shim MM2S/S2MM channel 0 pair used by
+`ctrlrow_demo`.
+
+### `#pragma CONTROL_PLAN_GROUP_REG_WRITE`
+
+Enables `GroupRegWritePass`. In a tiled GEMM the per-tile lock inits are identical
+across the mesh; when this pass runs it clusters them by `(tile-local addr, value)`
+and folds a cluster that covers all configured tiles into a single `broadcast`
+group write, or all columns of one row into a `row` group write. Each group write
+lowers to a blocking `__Runtime_ctrl_row_write_ack` call in `host.cc`. Without the
+pragma the pass does not run (the pipeline logs
+`GroupRegWritePass skipped (enable with #pragma CONTROL_PLAN_GROUP_REG_WRITE)`)
+and every lock init is emitted individually.
+
+Both pragmas work in the single-kernel and multi-kernel `tilinglinalg` paths.
+
+Compare MMIO vs control-packet host setup with the same 4×4 GEMM kernel:
+
+```bash
+source script/aiehlc.sh --platform baremetal --aie-version 5 --profiling --skip-bss \
+    --runtime-source-file ./example/tileprogram/ccode/simplematmul2.cc
+# copy aout/main.elf, then rebuild with simplematmul_ctrl_pkt.cc
+```
+
+`simplematmul2.cc` keeps per-tile `XAie_LoadElfMem` / `XAie_LockSetValue` /
+`XAie_CoreEnable`. `simplematmul_ctrl_pkt.cc` enables both pragmas so lock
+init, ELF load, and core launch use the row-control fabric. Both print
+`aie matmul time` plus a `[PERF]` kload/elf/rst/bdcfg/coreen/startio/wait_io
+line when `--profiling` is set.
+
+## Kernel Config Offload
+
+`#pragma KERNELCONFIGOFFLOAD` (no arguments, off by default) moves the core
+tile's **incoming S2MM** DMA configuration off the host and into the AIE core
+itself. Add the pragma to your `tilinglinalg` source file to enable it:
+
+```cpp
+#pragma KERNELCONFIGOFFLOAD
+```
+
+| Pragma | Module attr | Effect |
+|--------|-------------|--------|
+| `#pragma KERNELCONFIGOFFLOAD` | `routing.kernel_config_offload` | The core self-configures its incoming S2MM DMA from `kernel.cc` via raw MMIO instead of the host programming it over the config bus. The host's `removeCoreTileHostDmaChain` becomes S2MM-selective (drops the core-tile S2MM BD chain + lock inits + channel-start), while MM2S stays host-side. Absent => the host programs all core-tile DMA as before. |
+
+### What gets offloaded
+
+When enabled, `convertMainToEmitC` emits a raw-MMIO block into `kernel.cc`
+`main()` — after `klog_init()` and before the first `window_init` — that
+self-configures every **incoming (S2MM)** window:
+
+- **Ping/pong BD chain** (or a single BD for single-buffer windows). Input
+  window `i` (in `window_def` declaration order) claims ping bd `2*i` /
+  pong bd `2*i+1` — the same `0..2·nIn−1` range the host resource manager used
+  for inputs, so kernel-side S2MM bd-ids never collide with host-side MM2S
+  bd-ids (allocated at higher ids).
+- **Lock inits**: acquire lock = ping-pong depth (`2`, or `1` single-buffer),
+  release lock = `0` — mirroring the host `emitCorePingPongBd`.
+- **S2MM channel-start** on the window's DMA channel.
+
+BD base address and length come from the core's own C buffer symbols
+(`(uintptr_t)buf_in_ping_0`, `sizeof(buf_in_ping_0)`), so the block is uniform
+across all core tiles and needs no runtime `(col,row)`. The encoder lives in
+[`src/mlir/runtime/aie_kernel_runtime.h`](src/mlir/runtime/aie_kernel_runtime.h)
+(`aie_kc_encode_bd` / `aie_kc_encode_lock` / `aie_kc_encode_s2mm_start`), which
+applies the encoded words through `core_reg_write` →
+[`kernel_tm.h`](src/mlir/runtime/kernel_tm.h)'s `TM_W` (a plain pointer cast
+would never reach the processor bus).
+
+### Scope and limitations
+
+- **S2MM only.** The outgoing **MM2S** BD stays host-side (per-`(col,row)`
+  offload needs a core-position mechanism — a separate design). MemTile / shim
+  self-config, non-gen5 targets, and mid-run reconfiguration are out of scope.
+- Gen5 (AIE2PS) only.
 
 ## Build Options
 
@@ -543,7 +736,7 @@ python3 src/tool/debug/schedule_debug_server.py aout/worklocal \
 |--------|------|---------|
 | `GET` | `/` | Serves the enhanced `host_schedule.html` |
 | `GET` | `/schedule_view.json` | The static `DATA` blob |
-| `POST` | `/run` | Spawn the board test `-y -nonreboot <elf>` (`-u` unbuffered) → `applog`. Body `{device, board_host}`: `palmyra` → `apppaltest.py` (inherit env); `vek385` → `appvek385.py` with env `USERNAME=getpass.getuser()` + `VEK385IP=<board_host>` (host required) |
+| `POST` | `/run` | Spawn the board test `-y -nonreboot <elf>` (`-u` unbuffered) → `applog`. Body `{device, board_host}`: `palmyra` → `apppaltest.py` (inherit env); `vek385` → `appvek385.py` with env `USERNAME=getpass.getuser()` + `VEK385IP=<board_host>` (host required). Rev B boards: `VEK385_REV=b` in the env or `hw_env` programs `VEK385_BOOT_PDI` then `VEK385_PLD_PDI` (skill `vek385-revb-boot`) |
 | `POST` | `/stop` | Force-kill the running test's process group (SIGTERM→SIGKILL); appends a `[force-stop]` line to `applog` |
 | `GET` | `/applog?offset=N` | Realtime tail of the `applog` file → `{data, next, running, status}`; poll stops on `running=false` (process exit), not on derived `pass\|fail` |
 | `GET` | `/ping?device=&host=` | Connection test → `{ok, aiedbg, target, detail}`. Confirms `aiedbg` is in PATH **and** the resolved JTAG target actually answers (one read-only register read on the first schedule tile). Drives the UI's "Connect" gating; a passing probe records session mode `connected` |
@@ -556,7 +749,7 @@ The browser UI has a **Board selector** (`palmyra` / `vek385`). Selecting a devi
 enables a **"Connect"** button (and, for `vek385`, reveals a board-hostname
 text box). Clicking **Connect** hits `/ping`; only on a passing test does the
 "Live status overlay" checkbox unlock **and** the drill-down console appear. The
-"Run test" button (spawns `apppaltest`) is enabled as soon as a device is chosen.
+"Run" button (spawns `apppaltest`) is enabled as soon as a device is chosen.
 
 #### Session provenance — why a target is not a connection
 
@@ -571,7 +764,7 @@ daemon therefore tracks how the current session earned its access:
 | `none` | default at startup, even with `AIEDBG_TARGET` set | reads refused; nothing may be inferred about the board |
 | `connected` | **Connect** (a verified `/ping`) | link is real, but registers are pre-existing state, not the result of a run here |
 | `attached` | **Open Current Session** (`/attach`) | a real run is in play, started outside the UI — the daemon cannot vouch for what came before |
-| `ran` | **Run test** | only here are live state and the `applog` the current run |
+| `ran` | **Run** | only here are live state and the `applog` the current run |
 
 `hw_authorized()` gates the live overlay (`/grid`) and the `aiegdb` MCP server's device
 commands; navigation, `help` and `?` stay available so the console is still useful
@@ -626,7 +819,7 @@ test fails.
   a running target sharing the same JTAG bridge. The two commands that *do* write —
   `reg write` and `dma counter setup` — are reachable only by typing them explicitly in the
   aiegdb console, and are flagged **WRITES HW** wherever they are suggested.
-- Live reads require a **board session** (Connect / Run test / Open Current Session). A
+- Live reads require a **board session** (Connect / Run / Open Current Session). A
   target inherited from `$AIEDBG_TARGET` does not authorize reads, so neither the overlay
   nor the embedded agent can silently report another run's leftover register state as
   current — see *Session provenance* above.
@@ -644,6 +837,84 @@ source script/aiehlc.sh --prettydebug  --aie-version 5 --runtime-source-file ./e
 Building aiehlc is only necessary if you intend to develop or compile aiehlc itself. If your aim is simply to use aiehlc, this step is not required.
 
 Build Tutorial: [build.md](doc/build.md)
+
+## Performance data
+
+The perf cost comming from three Domain, Compute , Data Movement, and Control 
+
+The control cost comming from Register read/write and host alg cost in cpu, in high level most host alg cpu cost are low
+
+and most cost comming from regsiter read/write that default is through AXI-MM
+
+In following document there are some perf data  on the control plan
+
+[Register access unit cost — ~372 ns/write AXI-MM vs ~2.9 ns/write control packet](./doc/performance/register_write_cost.md)
+
+[Register r/w perf in axi-mm and control pkt](./doc/performance/controlperf_analysis.md)
+
+[TIME LINE](./doc/performance/controlperf_timeline_crosstrack.md)
+
+[HOST ONE ITER control cost] (./doc/performance/register_write_cost.md)
+
+
+```
+==== AIE control-plane API microbenchmark (AIE_GEN=5) ====
+Each __Runtime_* config call = a burst of AXI-MM register writes to the device.
+API                                   iters     total_us      us/call
+-------------------------------------------------------------------------
+XAie_TileLoc (cpu)                     1000         3.19       0.0032
+XAie_DmaDescInit (cpu)                 1000        19.09       0.0191
+dma_createio_4 (cpu struct)            1000        39.90       0.0399
+-------------------------------------------------------------------------
+API vs raw write32              nW     api_us     raw_us   delta_us     ns/wr
+-------------------------------------------------------------------------
+dma_bd_config (shim,1024)        9     3.3388     3.3522    -0.0134     372.5
+dma_bd_config (core,1024)        6     2.2914     2.3012    -0.0098     383.5
+dma_bd_config_multidim (3D)      9     3.3306     3.3606    -0.0300     373.4
+dma_bd_config_multidim_ooo       9     3.3394     3.3517    -0.0123     372.4
+XAie_DmaWriteBd (shim)           9     3.3366     3.3536    -0.0170     372.6
+XAie_LockSetValue+LockInit       1     0.3712     0.3838    -0.0126     383.8
+dma_channel_enable_ooo           1     0.3622     0.3714    -0.0092     371.4
+startio (SetStartQueue)          1     0.3645     0.3684    -0.0039     368.4
+wait_io (idle poll, read)        1     0.8796     0.4143     0.4653     414.3
+load_kernel_group_16t (ELF x16)          20    147415.26    7370.7631
+launch_kernel_group (enable x16)         20       276.15      13.8076
+-------------------------------------------------------------------------
+--- control overhead / matmul iter (120 bd_config + 60 createio+startio) ---
+      api=290.11 us   raw(780 write32)=296.04 us   host_overhead=-5.93 us   raw=379.5 ns/write
+==== control-plane microbenchmark done ====
+XAie_UpdateNpiAddr()
+XAie_UpdateNpiAddr(0xf6d50000)
+before XAie_PartitionInitialize
+
+==== AIE control-plane API microbenchmark (AIE_GEN=5) ====
+Each __Runtime_* config call = a burst of AXI-MM register writes to the device.
+API                                   iters     total_us      us/call
+-------------------------------------------------------------------------
+XAie_TileLoc (cpu)                     1000         3.19       0.0032
+XAie_DmaDescInit (cpu)                 1000        19.09       0.0191
+dma_createio_4 (cpu struct)            1000        39.90       0.0399
+-------------------------------------------------------------------------
+API vs raw write32              nW     api_us     raw_us   delta_us     ns/wr
+-------------------------------------------------------------------------
+dma_bd_config (shim,1024)        9     3.3388     3.3522    -0.0134     372.5
+dma_bd_config (core,1024)        6     2.2914     2.3012    -0.0098     383.5
+dma_bd_config_multidim (3D)      9     3.3306     3.3606    -0.0300     373.4
+dma_bd_config_multidim_ooo       9     3.3394     3.3517    -0.0123     372.4
+XAie_DmaWriteBd (shim)           9     3.3366     3.3536    -0.0170     372.6
+XAie_LockSetValue+LockInit       1     0.3712     0.3838    -0.0126     383.8
+dma_channel_enable_ooo           1     0.3622     0.3714    -0.0092     371.4
+startio (SetStartQueue)          1     0.3645     0.3684    -0.0039     368.4
+wait_io (idle poll, read)        1     0.8796     0.4143     0.4653     414.3
+load_kernel_group_16t (ELF x16)          20    147415.26    7370.7631
+launch_kernel_group (enable x16)         20       276.15      13.8076
+-------------------------------------------------------------------------
+--- control overhead / matmul iter (120 bd_config + 60 createio+startio) ---
+      api=290.11 us   raw(780 write32)=296.04 us   host_overhead=-5.93 us   raw=379.5 ns/write
+==== control-plane microbenchmark done ====
+```
+
+
 
 ## Contributing
 

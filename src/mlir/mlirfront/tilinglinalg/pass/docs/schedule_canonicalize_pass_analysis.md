@@ -60,14 +60,12 @@ Walk the entire `ModuleOp` and partition all ops into `ModuleScheduleInfo` bucke
 Each op is stored with an `OpWithParent` wrapper that records the parent op and whether the op
 lives inside a `dfschedule.dskernel_receiver` region (those are never touched).
 
-### Step 2 — `associatePacketsWithTiles`
+### Step 2 — Collect core tiles from `LoadKernelGroupOp`
 
-For each `LoadKernelGroupOp`, look up the `DeclareKernelConfigOp` for each tile via its
-`distributed_args` symbol references, extract the `tile_configs` dictionary, and associate
-it to the `TileScheduleInfo` for that tile's `(col, row)` key.
-
-This builds the per-tile config dictionaries (`configDicts`) that will be replicated in the
-merged `kernelconfig_mergedN` ops.
+For each `LoadKernelGroupOp`, collect its core-tile `(col, row)` keys and the shared
+`callee` symbols. The former `DeclareKernelConfigOp` / `distributed_args` kernel-config
+lookup was removed: per-tile DMA/lock/buffer parameters already live on the `config.dma_bd`,
+lock-init, and `start_io` ops, so no separate config dictionary is rebuilt here.
 
 ### Step 3 — Find `func.func @main`
 
@@ -176,23 +174,21 @@ Core start_io is fire-and-forget (not waited on directly — the kernel launch e
 
 #### 4g — Merge all core tiles into one `load_kernel_group`
 
-Collect all unique core tile handles (sorted by `TileKey`) and their associated `configDicts`.
-Emit fresh `@kernelconfig_mergedN` ops and a single `load_kernel_group`:
+Collect all unique core tile handles (sorted by `TileKey`) and emit a single
+`load_kernel_group`:
 
 ```
-dfschedule.declare_kernel_config @kernelconfig_merged0 { tile_configs=[{...}] }
-...
-dfschedule.declare_kernel_config @kernelconfig_mergedN { tile_configs=[{...}] }
 dfschedule.config.load_kernel_group(tile0, tile1, ..., tileN) {
   callee = [@dskernel_receiver],
-  distributed_compute_kernel_args = [@compute0, ...],
-  distributed_args = [@kernelconfig_merged0, ..., @kernelconfig_mergedN]
+  distributed_compute_kernel_args = [@compute0, ...]
+  // distributed_args left null
 }
 dfschedule.schedule.launch_kernel_group(kernel_group) → kernel_event
 ```
 
-The config dict for each tile is taken from `tileInfo.configDicts[0]` (populated in step 2).
-If no config was associated (backward compat), a default dict is synthesized.
+No `declare_kernel_config` / `distributed_args` metadata is (re-)emitted — that
+mechanism was removed. The per-tile DMA/lock/buffer parameters already live on the
+`config.dma_bd`, lock-init, and `start_io` ops carried into the host block.
 
 #### 4h — Single merged `schedule.wait`
 
@@ -276,8 +272,6 @@ func.func @main() {
     ...ping-pong BDs...
     %29 = dfschedule.schedule.start_io(...) {flow_index=0}
     // kernel group for flow 0
-    %30 = dfschedule.declare_kernel_config @kernelconfig0 ...
-    %31 = dfschedule.declare_kernel_config @kernelconfig1 ...
     %32 = dfschedule.config.load_kernel_group(%10, %20) {callee=[@dskernel_receiver], ...}
     %33 = dfschedule.schedule.launch_kernel_group(%32)
     %34 = dfschedule.schedule.getbdid(%6)
@@ -359,13 +353,9 @@ dfschedule.host @host_canonicalized {
   // ... (same for each core tile)
 
   // 8. Single merged load_kernel_group (all 4 core tiles)
-  %45 = dfschedule.declare_kernel_config @kernelconfig_merged0 {...}
-  %46 = dfschedule.declare_kernel_config @kernelconfig_merged1 {...}
-  %47 = dfschedule.declare_kernel_config @kernelconfig_merged2 {...}
-  %48 = dfschedule.declare_kernel_config @kernelconfig_merged3 {...}
   %49 = dfschedule.config.load_kernel_group(%7, %8, %9, %10) {
-    callee=[@dskernel_receiver],
-    distributed_args=[@kernelconfig_merged0, ..., @kernelconfig_merged3]
+    callee=[@dskernel_receiver]
+    // distributed_args left null
   }
   %50 = dfschedule.schedule.launch_kernel_group(%49) → kernel_event
 
@@ -391,7 +381,6 @@ dfschedule.dskernel_receiver @dskernel_receiver {}
 | N shim `config.dma_bd` ops | 1 per unique `(shimKey, data_id, sliceIndex)` |
 | N shim `config.create_io` ops | 1 per unique `(shimKey, channel, direction)` |
 | N `load_kernel_group` ops (one per flow) | 1 merged `load_kernel_group` with all core tiles |
-| N `declare_kernel_config @kernelconfigK` | Renumbered as `@kernelconfig_mergedN` |
 | N `schedule.launch_kernel_group` events | 1 launch event |
 | N `schedule.wait` ops | 1 merged wait with all events |
 | `func.func @main` with execute_regions | `@main` = `launchhost @host_canonicalized; return` |
