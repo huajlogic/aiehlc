@@ -1,153 +1,172 @@
-# BYOC → AIE 集成计划（方案 A：单 ELF）
+# BYOC → AIE integration plan (option A: single ELF)
 
-把 TVM BYOC 分区出来的卷积子图接到 aiehlc 生成的 AIE kernel 上，**所有东西链进
-同一个 `main.elf`**，由 TVM 的 graph executor 负责调度。
+Wire the convolution subgraphs TVM BYOC partitions out onto aiehlc-generated AIE
+kernels, with **everything linked into one `main.elf`** and TVM's graph executor
+doing the scheduling.
 
-**spatial tiling / halo / mesh 切分 / 路由 / DMA / tile 预算 全部由 aiehlc
-(`run_aie_pipeline`) 负责。** 本计划里我方代码不碰这些，只做翻译和接线。
+**Spatial tiling, halo, mesh partitioning, routing, DMA and tile budgeting are
+all aiehlc's job (`run_aie_pipeline`).** Nothing in this plan implements any of
+them; our side only translates and wires.
 
 ---
 
-## 0. 现状（已实测，不是推测）
+## 0. Where things stand (measured, not assumed)
 
-BYOC 四块代码已写完并跑通（`src/frontend/tvmrelay/byoc/`）：
+The four BYOC pieces are written and working (`src/frontend/tvmrelay/byoc/`):
 
 ```
-MergeComposite 匹配到 20 个 aie.qconv
-标注 5 个下沉 AIE (上限 5)
-分区出 5 个 AIE 子图
-relay.build OK → 6 个 C 模块（1 TVM kernels + 5 AIE wrapper），430,743 字符
-交叉编译通过 (aarch64-none-elf-gcc -fsyntax-only)
+MergeComposite matched 20 aie.qconv
+annotated 5 for AIE offload (limit 5)
+partitioned into 5 AIE subgraphs
+relay.build OK -> 6 C modules (1 TVM kernels + 5 AIE wrappers), 430,743 chars
+cross-compiles clean (aarch64-none-elf-gcc -fsyntax-only)
 ```
 
-**但 wrapper 函数体是占位实现**（按元素搬运 + clamp），分类结果不正确。本计划
-就是把它换成真的 AIE 调用。
+**But the wrapper bodies are placeholders** (per-element copy + clamp), so the
+classification result is wrong. This plan is about replacing them with real AIE
+calls.
 
-已确认的下游兼容性：
+Downstream compatibility, already confirmed:
 
-| 环节 | 结论 | 证据 |
+| Stage | Verdict | Evidence |
 |---|---|---|
-| `graph.json` | 无需改 | 5 个 AIE 子图是普通 `tvm_op` 节点，119 节点中正常排列 |
-| `arm_build.py` driver | 无需改 | 按 `func_name` 生成调用，不关心实现者 |
-| `split_layers.py` | 自动适配 | 切分正则就是 `extern "C" + TVM_DLL`，wrapper 自成 layer |
-| `params.bin` | 无需改 | 177 条，与非 BYOC 一致 |
-| `build_c` | **要改** | `lib.lib.get_source()` 在复合模块上抛 `Module[const_loader] does not support GetSource` |
+| `graph.json` | no change | the 5 AIE subgraphs are ordinary `tvm_op` nodes, sitting normally among 119 |
+| `arm_build.py` driver | no change | it emits calls by `func_name`, indifferent to who implements them |
+| `split_layers.py` | adapts itself | its split regex is `extern "C" + TVM_DLL`, so wrappers become their own layer folders |
+| `params.bin` | no change | 177 entries, same as the non-BYOC path |
+| `build_c` | **must change** | `lib.lib.get_source()` throws `Module[const_loader] does not support GetSource` on a composite module |
 
 ---
 
-## 1. 接口（已从代码中读出，不是假设）
+## 1. The interfaces (read out of the code, not guessed)
 
-### aiehlc 侧的入口
+### What aiehlc exposes
 
-`orchestrate_conv_layer(..., host_func_suffix=name)` 产出：
+`orchestrate_conv_layer(..., host_func_suffix=name)` produces:
 
 ```c
 void host_canonicalized_<name>(XAie_DevInst* dev, void* in, void* params, void* out);
 extern unsigned char _binary_kernel_<name>_start[];
 ```
 
-调用契约（抄自 `orchestrator._emit_dispatcher`，它镜像 `aiehlc.cc:4711-4734`）：
+The calling contract, taken from `orchestrator._emit_dispatcher` (which mirrors
+`aiehlc.cc:4711-4734`):
 
 ```c
 XAie_DevInst* dev = __Runtime_get_partition_dev(mesh.meshId);
 __Runtime_set_kernel_elf(_binary_kernel_<name>_start);
-__Runtime_sync_for_dev(dev, t0, s0);          // 每个 DDR 参数一次
+__Runtime_sync_for_dev(dev, t0, s0);          // once per DDR argument
 __Runtime_sync_for_dev(dev, t1, s1);
 host_canonicalized_<name>(dev, t0, t1, t2);
 ```
 
-### params buffer 布局（`model.make_conv_params`）
+### params buffer layout (`model.make_conv_params`)
 
 ```
 [config:12B][weights:Cin*Cout*K*K][bn_scale:Cout][bn_bias:Cout]
- ^ 6 个 uint16 LE: H, W, Cin, Cout, K, stride
+ ^ six uint16 LE fields: H, W, Cin, Cout, K, stride
 ```
 
-**这个 header 有 ~6 处读取方，必须锁步**（CLAUDE.md 已记录：一处读错会静默算错）。
+**This header has ~6 readers that must stay in lock-step** (already recorded in
+CLAUDE.md: one stale reader computes garbage silently).
 
-### TVM 侧的入口（我生成的 wrapper）
+### What TVM expects (the wrapper I generate)
 
 ```c
 TVM_DLL int tvmgen_default_aie_main_0(void* args, int* type_codes, int num_args,
                                       void* out_value, int* out_type_code);
 ```
 
-**我要实现的就是这两者之间的胶水。**
+**The glue between these two is exactly what I have to implement.**
 
 ---
 
-## 2. 我要写的四件事（都是翻译/接线）
+## 2. The four things I write (all translation and wiring)
 
-### 2.1 几何抽取 — 从 Relay 子图读参数
-从子图的 `nn.conv2d` attrs + `checked_type` 读出
-`H/W/Cin/Cout/K/stride/padding/groups`。纯查属性。
-**验收**：20 个卷积的几何与 `graph.json` shape 推出的值逐一相符。
+### 2.1 Geometry extraction — read parameters off the Relay subgraph
+Read `H/W/Cin/Cout/K/stride/padding/groups` from the subgraph's `nn.conv2d`
+attrs and `checked_type`. Pure attribute lookup.
+**Acceptance**: the geometry of all 20 convolutions matches what the
+`graph.json` shapes imply, one by one.
 
-### 2.2 `tensor_specs` 生成 — 声明张量，不决定怎么切
-转成 `run_aie_pipeline` 要的 `[(shape, bits, is_input), ...]`。
-**只声明"有哪些张量、多大、是输入还是输出"**；怎么切给 mesh 是 aiehlc 的事。
+### 2.2 `tensor_specs` — declare tensors, do not decide how to split
+Convert to the `[(shape, bits, is_input), ...]` form `run_aie_pipeline` wants.
+This only declares *which tensors exist, how big, input or output*; how they map
+onto the mesh is aiehlc's decision.
 
-### 2.3 params blob 打包 — 真权重，不是占位
-现有 `make_conv_params` 填的是交替 ±1 的**假权重**。要换成从 Relay Constant
-读出的真 int8 权重 + 真 bias，按上面的布局打包。
-**验收**：解包回来与 Relay Constant 逐字节相同。
+### 2.3 params blob packing — real weights, not placeholders
+`make_conv_params` today fills in **fake** alternating ±1 weights. Replace with
+the real int8 weights and bias read out of the Relay Constants, packed in the
+layout above.
+**Acceptance**: unpacking the blob reproduces the Relay Constants byte for byte.
 
-### 2.4 ABI 胶水 — 唯一有实质工作的部分
-`aie_codegen.py` 的 wrapper 函数体从"搬运 clamp"换成：
+### 2.4 ABI glue — the only piece with real work in it
+The wrapper body in `aie_codegen.py` goes from copy-and-clamp to:
 
 ```c
 TVM_DLL int tvmgen_default_aie_main_0(void* args, ...) {
-    /* 1. 解包 DLTensor → 裸指针 */
+    /* 1. unpack DLTensor -> raw pointers */
     /* 2. __Runtime_set_kernel_elf(_binary_kernel_<name>_start); */
-    /* 3. __Runtime_sync_for_dev(dev, p, size) 每个 DDR 参数 */
+    /* 3. __Runtime_sync_for_dev(dev, p, size) per DDR argument */
     /* 4. host_canonicalized_<name>(dev, in, params, out); */
 }
 ```
 
 ---
 
-## 3. 阶段划分
+## 3. Phases
 
-### 阶段 1 — 接通管线（低风险，先做）
-- `build_c` 改为遍历模块树收集所有 `type_key=='c'` 的源码并拼接
-  （**已验证**：6 个模块 → 430,743 字符 → 交叉编译通过）
-- `deploy_flow` 加 `--byoc-aie [N]`，默认关
-- **验收**：`N=0` 产出的 ELF 与非 BYOC 路径**逐字节相同**
+### Phase 1 — close the pipeline (low risk, do first)
+- Change `build_c` to walk the module tree, collect every `type_key=='c'`
+  source and concatenate (**already verified**: 6 modules → 430,743 chars →
+  cross-compiles clean)
+- Add `--byoc-aie [N]` to `deploy_flow`, off by default
+- **Acceptance**: the ELF produced with `N=0` is **byte-identical** to the
+  non-BYOC path
 
-### 阶段 2 — 单层真实 kernel（核心）
-先只做 **1 层**（`N=1`），打通 2.1–2.4 全部四件事。
-- 调 `run_aie_pipeline` 生成该层的 `host.cc`/`kernel.cc`/`routing.cc`/`.bcf`
-- wrapper 换成真调用
-- **验收**：该层输出与 TVM CPU 参考逐元素比对（允许量化误差，但不能是垃圾）
-- **风险**：tile 放不下由 aiehlc 报错；我方不预判、不预先拒绝
+### Phase 2 — one real kernel (the core)
+Do a **single layer** (`N=1`) end to end, exercising all four items in §2.
+- Call `run_aie_pipeline` to generate that layer's
+  `host.cc`/`kernel.cc`/`routing.cc`/`.bcf`
+- Swap the wrapper over to the real call
+- **Acceptance**: that layer's output compared element-wise against the TVM CPU
+  reference (quantization error allowed; garbage is not)
+- **Risk**: if it does not fit a tile, aiehlc reports it; our side neither
+  predicts nor pre-rejects
 
-### 阶段 3 — 链接整合
-- `arm_build.py` 的 `SRCS` 加入 aiehlc 产出的 `.cc`
-- kernel ELF 通过 `ld -r -b binary` 嵌入（复用 weights.bin 的现成机制）
-- 设备生命周期：`main.c` 开头 `__Runtime_device_init`、结尾 teardown
-- **验收**：`main.elf` 链接成功，板上跑完打印 `device_teardown done`
+### Phase 3 — linking it together
+- Add aiehlc's generated `.cc` files to `arm_build.py`'s `SRCS`
+- Embed the kernel ELF via `ld -r -b binary` (reuse the existing weights.bin
+  mechanism)
+- Device lifecycle: `__Runtime_device_init` at the top of `main.c`, teardown at
+  the end
+- **Acceptance**: `main.elf` links, and a board run prints `device_teardown done`
 
-### 阶段 4 — 扩到 N 层 + 精度验证
+### Phase 4 — scale to N layers and verify accuracy
 - `N=5` → `N=20`
-- 板上 top-5 与 CPU 参考比对，top-1 必须仍是 Samoyed(258)
-- 用已有 timer 量 `inference` ms，对比纯 CPU 基线
+- Compare the board's top-5 against the CPU reference; top-1 must still be
+  Samoyed (258)
+- Measure `inference` ms with the timer already added, against the pure-CPU
+  baseline
 
-### 阶段 5 — 收敛与文档
-- **三条 AIE 路径必须合并**：`--aie-offload` / `--aiegraph` / `--byoc-aie`。
-  前两条因 ONNX-PTQ 默认化已失效（0/28 eligible，已确认）。建议 BYOC 成为唯一
-  路径，前两条标废弃。
-- README + skill 记录 TVM 0.16 的三个坑
+### Phase 5 — converge and document
+- **The three AIE paths must be merged**: `--aie-offload`, `--aiegraph`,
+  `--byoc-aie`. The first two are already dead under the ONNX-PTQ default
+  (0/28 eligible, confirmed). Proposal: BYOC becomes the only path, the other
+  two get deprecated.
+- README plus a skill recording the three TVM 0.16 traps
 
 ---
 
-## 4. 已知风险
+## 4. Known risks
 
-| 风险 | 性质 | 应对 |
+| Risk | Nature | Response |
 |---|---|---|
-| tile 放不下 | **aiehlc 负责** | 不预判；由 aiehlc 报错后再谈 |
-| params header 6 处读取方不同步 | 静默算错 | 阶段 2 加解包回读断言 |
-| 设备生命周期在 TVM 调度下的时机 | 未验证 | 阶段 3 的主要未知数：TVM 可能多次调用子图，init 不能重入 |
-| int16 存储（非 int8） | 已知 | `target="c"` 无 int8 qnn legalization；与本计划正交 |
+| does not fit a tile | **aiehlc's job** | no prediction on our side; revisit once aiehlc reports |
+| params header's 6 readers drift | silent miscompute | phase 2 adds an unpack-and-compare assertion |
+| device lifecycle under TVM scheduling | unverified | the main unknown in phase 3: TVM may call a subgraph more than once, and init is not re-entrant |
+| int16 storage (not int8) | known | `target="c"` has no int8 qnn legalization; orthogonal to this plan |
 
-**最大未知数是阶段 3 的设备生命周期**——TVM graph executor 何时调用子图、是否
-并发、`XAie_DevInst` 怎么共享。这是方案 A（单 ELF）相对方案 B 的主要代价。
+**The biggest unknown is the device lifecycle in phase 3** — when the TVM graph
+executor calls a subgraph, whether calls can overlap, and how `XAie_DevInst` is
+shared. That is the main cost of option A (single ELF) over option B.
