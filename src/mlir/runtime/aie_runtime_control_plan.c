@@ -239,9 +239,11 @@ static acr_rc acr_plan_return_chain_ex(acr_oplist *o, acr_portbook *b, uint8_t r
             if ((rc = acr_emit_master(o, b, c, row, ACR_SOUTH, mselen, ACR_ARB_RET)) != ACR_OK)
                 return rc;
         } else {
-            /* Interior/last: WEST master merges {local, transit?} to the west tile. */
-            uint8_t mselen = (uint8_t)((has_local ? (1u << ACR_MSEL_RET_LOCAL) : 0u) |
-                                       (has_transit ? (1u << ACR_MSEL_RET_TRANSIT) : 0u));
+            /* Interior/last: WEST master merges {local, transit} to the west tile.
+             * The last tile has no transit slot, but enables the transit msel
+             * anyway so every non-head WEST master is the same register value
+             * (lets the runtime broadcast it; see rt_ctrl_ret_defer_finish). */
+            uint8_t mselen = (uint8_t)((has_local ? (1u << ACR_MSEL_RET_LOCAL) : 0u) | (1u << ACR_MSEL_RET_TRANSIT));
             if ((rc = acr_emit_master(o, b, c, row, ACR_WEST, mselen, ACR_ARB_RET)) != ACR_OK)
                 return rc;
         }

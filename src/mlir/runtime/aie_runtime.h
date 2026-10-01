@@ -984,6 +984,8 @@ typedef struct {
     uint8_t col_lo, col_hi; // inclusive column span built on this row
 } __Runtime_CtrlRowChain;
 
+#define RT_CTRL_RET_BCAST_MAX 16U
+
 typedef struct __Runtime_CtrlRowFabric_s {
     XAie_DevInst *dev; // partitioned device instance
     uint8_t shim_col;  // vertical spine column (= row left edge)
@@ -1006,6 +1008,15 @@ typedef struct __Runtime_CtrlRowFabric_s {
     // @txn_row >= 0 => row-multicast to that physical row.
     int txn_row;
     uint8_t pmap_shim_seen;
+
+    // Return-route register writes identical on every consumer tile, withheld
+    // from ctrl_plan_init (high-throughput mode only) and broadcast at the front
+    // of the next packed ELF payload. Any response-arming send that runs first
+    // writes them over MMIO instead; @ret_bcast_pending is cleared either way.
+    uint32_t ret_bcast_off[RT_CTRL_RET_BCAST_MAX];
+    uint32_t ret_bcast_val[RT_CTRL_RET_BCAST_MAX];
+    uint8_t ret_bcast_n;
+    uint8_t ret_bcast_pending;
 } __Runtime_CtrlRowFabric;
 
 // Translate a planner op list into XAie stream-switch calls on @dev. Returns the
