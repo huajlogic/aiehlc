@@ -23,9 +23,35 @@ Seven stages, matching the seven things this flow has to prove:
    back empty even under ``freeze_params=True``), so anything wanting weights
    must read them out of the graph.
 
-3. **Quantize** — ``relay.quantize`` to int8. **Gated**: see the LLVM note
-   below. When the gate is shut this stage is skipped and the flow continues in
-   fp32 rather than emitting something mislabelled as int8.
+3. **Quantize** — int8 PTQ **in ONNX**, before Relay sees the graph
+   (``onnx_ptq.py``): symmetric per-channel int8 weights + **asymmetric**
+   activations, covering every conv *including the first* and the input image
+   itself. The quantized QDQ model is then imported and run through
+   ``FakeQuantizationToInteger`` so the graph is genuinely integer rather than
+   ``dequantize -> fp32 op -> quantize``.
+
+   The quantization itself needs no LLVM (it happens in onnxruntime), but the
+   build still does: ``FakeQuantizationToInteger`` calls ``FoldConstantExpr``
+   directly (``fake_quantization_to_integer.py:35``), which
+   ``disabled_pass=["FoldConstant"]`` cannot reach, so codegen on a
+   ``USE_LLVM=OFF`` build dies with ``target.build.llvm is not enabled``
+   *after* stage 3 has already succeeded.
+
+   ``--relay-ptq`` selects the older ``relay.quantize`` path instead. It is
+   symmetric-only -- its annotation op is
+   ``simulated_quantize(data, scale, clip_min, clip_max)``, with no zero-point
+   anywhere -- and it leaves an fp32 head and tail
+   (``skip_conv_layers=[0]``, ``skip_dense_layer=True``). It is also **gated on
+   LLVM**: see the note below; when the gate is shut the stage is skipped and
+   the flow continues in fp32 rather than emitting something mislabelled as
+   int8.
+
+   The ONNX path currently produces a *larger* ELF (~24 MB vs ~14 MB) because
+   the generic ``qnn_conv2d_legalize`` upcasts operands to int16 to fold
+   zero-points and ``target="c"`` registers no fast-int8 legalization. The
+   values are genuine int8; only the storage width is not. It is still the
+   default because it quantizes the whole network and preserves the fp32
+   top-5 ordering, which the symmetric path does not.
 
 4. **Codegen** — ``relay.build(target="c")`` and write the C source + header,
    then ``gcc -fsyntax-only`` it (TVM can emit C that does not compile).
@@ -48,6 +74,24 @@ Seven stages, matching the seven things this flow has to prove:
    prints "Samoyed" rather than "class 258". Preprocessing is *called*, not
    reimplemented -- ``example/model/resnet18py/classify.py:preprocess`` -- so
    the board and the CPU reference cannot disagree over normalization.
+
+   **AIE offload** (``--aie-offload``, off by default) runs alongside this
+   stage, not instead of it: the selected layers (default layer 0, the 7x7/s2
+   stem) are additionally lowered through the ``aiegraph`` dialect and
+   ``run_aie_pipeline`` into ``layers/<NN_name>/aie/``. The C path and this
+   APU ELF are produced either way -- verified byte-identical with the flag on
+   and off. See ``aie_offload.py``, including why layer 0's artifacts generate
+   but do not yet fit a tile.
+
+   **Whole-graph aiegraph** (``--aiegraph``) is the other way in, and differs
+   in that it does not take a layer selection: it lifts the *entire* graph into
+   one ``aiegraph.func`` whose SSA edges are the model's real dataflow, then
+   **partitions** it -- layers whose aiegraph ops are all in ``--aiegraph-ops``
+   (default the conv2d family) go to the aiehlc kernel backend, and every other
+   layer **reuses the TVM-generated CPU C** from stage 5 unchanged. Every layer
+   gets a verdict and a reason in ``layers/partition.json``, including the ones
+   the 4-op dialect cannot express (``max_pool2d``, ``batch_flatten``). See
+   ``aiegraph_partition.py``.
 
 7. **CPU** — classify the same image with onnxruntime on the same folded ONNX
    and print the top-5. This is the answer the ELF has to reproduce, from an
@@ -86,6 +130,13 @@ Run::
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --image cat.jpg
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --skip-quantize
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --no-arm
+    PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload
+    PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py \\
+        --aie-offload --aie-layers 0,2 --aie-mesh 4x4
+    PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aiegraph
+    PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py \\
+        --aiegraph --aiegraph-ops conv_bn_relu --no-arm
+    PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --relay-ptq
 """
 
 from __future__ import annotations
@@ -123,6 +174,13 @@ INPUT_SHAPE = (1, 3, 224, 224)
 NO_LLVM_DISABLED_PASSES = ["AlterOpLayout", "FoldConstant"]
 
 DEFAULT_OUT = Path("./worklocal/tvmrelay_deploy")
+
+#: Op kinds ``run_aie_pipeline`` has a kernel body for; everything else stays
+#: on the APU no matter what ``--aie-layers`` (or ``--aiegraph-ops``) asks for.
+#: This is the single list the ``--aiegraph`` partition is decided against --
+#: widen it only when the op gains both a ``frontend.tvm.kernels`` body and a
+#: runtime path, or the offload emits a kernel that does not compute the layer.
+AIE_OP_KINDS = ("conv_bn_relu", "conv_bn")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -191,12 +249,22 @@ _LLVM_HINT = """\
   from Python. Disabling FoldConstant does not work either -- calibration
   asserts on isinstance(expr.args[0], Constant) (_calibrate.py:154).
 
-  To enable it, install the two dev packages LLVM links against, then
-  rebuild (host LLVM 19 is already detected as compatible):
+  To enable it, rebuild against the host LLVM 19:
 
-      sudo apt install zlib1g-dev libzstd-dev
       python src/frontend/tvmrelay/setup_tvm016.py --yes \\
           --llvm /scratch/staff/huaj/llvm-project/build/bin/llvm-config
+
+  LLVM links against zlib/zstd/libxml2. If the dev packages are missing and
+  you have no sudo, point cmake at the runtime libs with locally-staged
+  headers instead -- ``ZLIB_LIBRARY``/``ZLIB_INCLUDE_DIR`` and
+  ``-DCMAKE_SHARED_LINKER_FLAGS=-L<stub>/lib`` -- using headers whose version
+  matches the installed ``libz.so.N``/``libzstd.so.N``. libxml2 is only
+  referenced by LLVM's Windows-manifest code, which is unreachable here, so a
+  stub exporting its 16 symbols satisfies the link.
+
+  ``setup_tvm016.apply_source_fixups`` handles the two source incompatibilities
+  automatically (LLVM 19 removed ``StringRef::startswith``; NumPy 2.0 removed
+  ``np.math``, which breaks quantize calibration).
 """
 
 
@@ -339,7 +407,12 @@ def _op_summary(mod, top: int = 6) -> str:
 
 def quantize_int8(mod, params, *, global_scale: float = 8.0,
                   skip_conv_layers=(0,), verbose: bool = True):
-    """Quantize to int8. Returns ``(mod, did_quantize)``.
+    """Quantize to int8 with ``relay.quantize``. Returns ``(mod, did_quantize)``.
+
+    The ``--relay-ptq`` path, **not** the default -- stage 3 now quantizes in
+    ONNX (``onnx_ptq.py``). Two limits keep this one optional: it is
+    symmetric-only (its annotation op carries a scale and a clip range, no
+    zero-point), and it leaves the first conv and the dense layer in fp32.
 
     Returns the module **unchanged** with ``did_quantize=False`` when the
     running TVM has no LLVM, because ``relay.quantize`` cannot run at all in
@@ -536,22 +609,67 @@ def cpu_reference(out_dir: Path, image=None, topk: int = 5,
 def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         global_scale: float = 8.0, fuse: bool = True, split: bool = True,
         flat: bool = False, arm: bool = True, image=None,
-        verbose: bool = True) -> dict:
-    """Run all seven stages. Returns a dict of what happened."""
+        aie_offload: bool = False, aie_layers=(0,),
+        aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
+        aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
+        relay_ptq: bool = False, verbose: bool = True) -> dict:
+    """Run all seven stages. Returns a dict of what happened.
+
+    ``aie_offload`` turns on the aiegraph path for ``aie_layers`` (default
+    layer 0, the 7x7/s2 stem); ``None`` means every eligible layer. It is
+    additive -- the C generation and the APU ELF are produced either way.
+
+    ``aiegraph`` instead lifts the **whole** graph into one verified
+    ``aiegraph.func`` and partitions it: layers whose aiegraph ops are all in
+    ``aiegraph_ops`` are offloaded to the aiehlc kernel backend, and the rest
+    reuse the TVM-generated CPU C. Also additive.
+
+    **Quantizer.** Stage 3 defaults to ONNX PTQ (``onnx_ptq.py``): the model is
+    quantized *before* Relay sees it, giving symmetric per-channel int8 weights
+    and **asymmetric** activations, and covering every conv including the first
+    plus the input image itself. ``relay_ptq=True`` selects the older
+    ``relay.quantize`` path instead -- symmetric-only, and it leaves an fp32
+    head and tail (``skip_conv_layers=[0]``, ``skip_dense_layer=True``). See
+    ``quantize_int8`` for what that costs and why it needs LLVM.
+    ``skip_quantize`` overrides both and emits fp32.
+    """
     if not stage_env(verbose=verbose):
         return {"ok": False, "stage": "env"}
 
-    model_path = fetch_model(out_dir, verbose=verbose)
-    model_path = prefold_onnx(model_path, verbose=verbose)
-    mod, params = import_relay(model_path, verbose=verbose)
+    raw_path = fetch_model(out_dir, verbose=verbose)
+    model_path = prefold_onnx(raw_path, verbose=verbose)
 
     quantized = False
+    accuracy = None
+    quantizer = None
     if skip_quantize:
+        # fp32: overrides both quantizers.
+        mod, params = import_relay(model_path, verbose=verbose)
         if verbose:
             print("[3/7] int8   : skipped (--skip-quantize)")
-    else:
-        mod, quantized = quantize_int8(mod, params, global_scale=global_scale,
+    elif relay_ptq:
+        mod, params = import_relay(model_path, verbose=verbose)
+        mod, quantized = quantize_int8(mod, params,
+                                       global_scale=global_scale,
                                        verbose=verbose)
+        quantizer = "relay.quantize" if quantized else None
+    else:
+        # Default. Quantize in ONNX *before* Relay sees the graph, so the
+        # import is already int8 -- including layer 0 and the input image,
+        # which relay.quantize cannot reach. See onnx_ptq.py.
+        from frontend.tvmrelay import onnx_ptq as _ptq
+
+        qdq_path = _ptq.quantize_onnx_int8(raw_path, out_dir, images=(
+            [image] if image else None), verbose=verbose)
+        accuracy = _ptq.compare_topk(model_path, qdq_path, image=image,
+                                     verbose=verbose)
+        mod, params = import_relay(qdq_path, verbose=verbose)
+        # Required, not optional: without this the QDQ graph stays
+        # dequantize->fp32 op->quantize and codegen emits float kernels over a
+        # 46 MB fp32 param blob, while every accuracy check still passes.
+        mod = _ptq.to_integer_ops(mod, verbose=verbose)
+        quantized = True
+        quantizer = "onnx_ptq"
 
     c_path = build_c(mod, params, out_dir, fuse=fuse, verbose=verbose)
     compiles = verify_c(c_path, verbose=verbose)
@@ -584,6 +702,51 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
             print(f"[5/7]          {', '.join(shown)}, ... "
                   f"({layers['layer_count']} in execution order)")
 
+    # AIE offload is additive: selected layers also get aiegraph-lowered AIE
+    # artifacts in their layer folder. The C path and the APU ELF below are
+    # unchanged, so a run with offload on still produces the same program.
+    aie = None
+    if aie_offload:
+        if layers is None:
+            if verbose:
+                print("[6/7] aie    : skipped -- needs stage 5's layers/")
+        else:
+            from frontend.tvmrelay import aie_offload as _aie
+
+            if verbose:
+                sel = "all" if aie_layers is None else \
+                    ",".join(str(i) for i in aie_layers)
+                print(f"[6/7] aie    : offloading layer(s) {sel} via aiegraph")
+            aie = _aie.offload_layers(out_dir, indices=aie_layers,
+                                      op_kinds=tuple(aie_ops), mesh=mesh,
+                                      verbose=verbose)
+            if verbose and not aie.get("ok"):
+                print(f"[6/7]          {aie.get('reason', 'offload failed')}")
+            elif verbose and aie.get("infeasible"):
+                print(f"[6/7]          {aie['infeasible']} layer(s) exceed tile "
+                      f"memory -- artifacts generated, but the kernel indexes "
+                      f"the whole feature map and the window is 4 KB; see "
+                      f"aie_offload.py")
+
+    # Whole-graph aiegraph + AIE/CPU partition. Also additive: CPU layers keep
+    # reusing the stage-5 C, and AIE layers keep theirs too so the ELF links.
+    graph_part = None
+    if aiegraph:
+        if layers is None:
+            if verbose:
+                print("[6/7] aiegrph: skipped -- needs stage 5's layers/")
+        else:
+            from frontend.tvmrelay import aiegraph_partition
+
+            if verbose:
+                print(f"[6/7] aiegrph: lifting the whole graph "
+                      f"(AIE ops: {', '.join(aiegraph_ops)})")
+            graph_part = aiegraph_partition.run_aiegraph(
+                out_dir, aie_ops=tuple(aiegraph_ops), mesh=mesh,
+                verbose=verbose)
+            if verbose and not graph_part.get("ok"):
+                print(f"[6/7]          {graph_part.get('reason', 'partition failed')}")
+
     elf = None
     if not arm:
         if verbose:
@@ -613,11 +776,16 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
               f"{'' if compiles else '  (WARNING: does not compile)'}")
         if elf:
             print(f"      board ELF: {elf}")
+        if graph_part and graph_part.get("aie_count") is not None:
+            print(f"      aiegraph : {graph_part['aie_count']} invocation(s) on "
+                  f"AIE, {graph_part['cpu_count']} reusing TVM CPU C "
+                  f"(layers/partition.json)")
     return {"ok": compiles, "quantized": quantized, "c_path": str(c_path),
             "out_dir": str(out_dir), "fused": fuse,
             "layer_count": layers["layer_count"] if layers else None,
             "elf": elf, "cpu_top1": (cpu[0][1] if cpu else None),
-            "cpu_top": cpu}
+            "cpu_top": cpu, "aie": aie, "aiegraph": graph_part,
+            "quantizer": quantizer, "accuracy": accuracy}
 
 
 def main(argv=None) -> int:
@@ -627,7 +795,8 @@ def main(argv=None) -> int:
     ap.add_argument("--skip-quantize", action="store_true",
                     help="emit fp32 C without attempting stage 3")
     ap.add_argument("--global-scale", type=float, default=8.0,
-                    help="relay.quantize global_scale (default: 8.0)")
+                    help="relay.quantize global_scale (default: 8.0); only "
+                         "used with --relay-ptq")
     ap.add_argument("--no-split", action="store_true",
                     help="skip stage 5 (do not write layers/)")
     ap.add_argument("--flat", action="store_true",
@@ -641,12 +810,70 @@ def main(argv=None) -> int:
     ap.add_argument("--image", default=None,
                     help="image path or URL to classify "
                          "(default: the pytorch/hub dog.jpg sample)")
+    ap.add_argument("--aie-offload", action="store_true",
+                    help="also lower the selected layers through the aiegraph "
+                         "dialect to AIE (additive: the C path and the APU "
+                         "ELF are still produced)")
+    ap.add_argument("--aie-layers", default="", #default="0",
+                    help="which layers to offload: an index, a comma list, or "
+                         "'all' (default: 0, the 7x7/s2 stem)")
+    ap.add_argument("--aie-ops", default=",".join(AIE_OP_KINDS),
+                    help=f"op kinds eligible for AIE "
+                         f"(default: {','.join(AIE_OP_KINDS)})")
+    ap.add_argument("--aie-mesh", default="2x2",
+                    help="AIE mesh as ROWSxCOLS (default: 2x2)")
+    ap.add_argument("--aiegraph", action="store_true",
+                    help="lift the WHOLE graph into one aiegraph.func, then "
+                         "partition: layers matching --aiegraph-ops go to the "
+                         "aiehlc kernel backend, the rest reuse the TVM CPU C "
+                         "(verdicts in layers/partition.json)")
+    ap.add_argument("--relay-ptq", action="store_true",
+                    help="quantize with relay.quantize instead of the default "
+                         "ONNX PTQ: symmetric-only, leaves an fp32 head and "
+                         "tail (skips the first conv and the dense layer), and "
+                         "needs an LLVM-enabled TVM. Smaller ELF today because "
+                         "target=\"c\" has no int8 qnn legalization")
+    ap.add_argument("--aiegraph-ops", default=",".join(AIE_OP_KINDS),
+                    help=f"aiegraph op kinds to offload to AIE; a layer goes "
+                         f"to AIE only if all of its ops are listed "
+                         f"(default: {','.join(AIE_OP_KINDS)})")
     args = ap.parse_args(argv)
+
+    from frontend.tvmrelay.aie_offload import parse_selection
+
+    try:
+        aie_layers = parse_selection(args.aie_layers)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        rows, cols = (int(v) for v in args.aie_mesh.lower().split("x"))
+    except ValueError:
+        print(f"error: bad --aie-mesh {args.aie_mesh!r} (want ROWSxCOLS)",
+              file=sys.stderr)
+        return 2
+
+    # Reject an unknown op kind up front. Silently ignoring it would read as
+    # "that layer is not eligible" rather than "you misspelled the flag".
+    from frontend.tvmrelay.aiegraph_partition import AIEGRAPH_OP_KINDS
+
+    aiegraph_ops = tuple(s.strip() for s in args.aiegraph_ops.split(",") if s.strip())
+    unknown = [op for op in aiegraph_ops if op not in AIEGRAPH_OP_KINDS]
+    if unknown:
+        print(f"error: unknown --aiegraph-ops {', '.join(unknown)} "
+              f"(the dialect defines {', '.join(AIEGRAPH_OP_KINDS)})",
+              file=sys.stderr)
+        return 2
 
     result = run(args.out_dir, skip_quantize=args.skip_quantize,
                  global_scale=args.global_scale, fuse=not args.no_fuse,
                  split=not args.no_split, flat=args.flat,
-                 arm=not args.no_arm, image=args.image)
+                 arm=not args.no_arm, image=args.image,
+                 aie_offload=args.aie_offload, aie_layers=aie_layers,
+                 aie_ops=tuple(s.strip() for s in args.aie_ops.split(",")),
+                 mesh=(rows, cols),
+                 aiegraph=args.aiegraph, aiegraph_ops=aiegraph_ops,
+                 relay_ptq=args.relay_ptq)
     return 0 if result.get("ok") else 1
 
 

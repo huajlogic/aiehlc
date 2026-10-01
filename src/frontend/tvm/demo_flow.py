@@ -219,8 +219,18 @@ if build_dir and _have_gpp and _have_chess:
           f"({'multi-kernel' if enable_aiehlc_offload else 'host-only'} build; "
           "live log below)...", flush=True)
     try:
+        # Stripped by default (build_main_elf's default, not an env var): most
+        # of the link is DWARF from the prebuilt BSP/libgloss/aie-rt archives,
+        # so this is ~3x smaller to push over JTAG with an identical LOAD
+        # segment. Report both sizes -- the saving is the whole point, and a
+        # silent "built main.elf" would not show whether it actually happened.
         elf = orchestrator.build_main_elf(build_dir)
-        print("[stage5] built main.elf ->", elf)
+        _dbg = os.path.join(os.path.dirname(elf), "main.debug.elf")
+        _note = (f" (stripped from {os.path.getsize(_dbg):,} B; "
+                 f"full symbols in {os.path.basename(_dbg)})"
+                 if os.path.isfile(_dbg) else "")
+        print(f"[stage5] built main.elf -> {elf} "
+              f"({os.path.getsize(elf):,} B){_note}")
     except Exception as e:                              # noqa: BLE001
         print(f"[stage5] ELF link failed ({e})")
 elif build_dir:

@@ -645,7 +645,16 @@ def orchestrate_plan(plan: List[LayerOp], launches: List[dict],
 #     ``int main()`` only ``#define __global__`` is added, so the folded main is
 #     emitted with the no-arg ``int main()`` signature to take that clean path.
 #   * The ELF lands at ``WORKLOCAL_DIR/build/host`` and is copied to
-#     ``<dirname(WORKLOCAL_DIR)>/main.elf``.
+#     ``<dirname(WORKLOCAL_DIR)>/main.elf`` -- **stripped** (--strip-debug),
+#     with the unstripped original kept beside it as ``main.debug.elf``. Around
+#     70% of the link is DWARF from the prebuilt BSP/libgloss/aie-rt libs
+#     (nothing we compile carries -g; OPT_FLAGS is -Os), so a 2.8 MB A2 build
+#     publishes at ~880 KB with a byte-identical LOAD segment. Stripping is the
+#     default and is **not** driven by the ambient ``DEBUG_SYMS`` env var (which
+#     script/aiehlc.sh exports for its own debug builds, and which would
+#     otherwise silently triple this ELF) -- ask via
+#     ``build_main_elf(debug_syms=True)``. ``build_main_elf`` returns the
+#     published path, not the unstripped ``build/host`` intermediate.
 
 # aieMesh/aieArray/aiePartition preamble — verbatim transcription of the subset
 # aiehlc.cc (4633-4663) injects that ``_emit_main`` relies on (aieArray::
@@ -788,7 +797,8 @@ def _arrange_build_dir(build_dir: str) -> None:
     _fold_main_into_host(build_dir)
 
 
-def _invoke_hostcompile(build_dir: str, repo_root: str) -> str:
+def _invoke_hostcompile(build_dir: str, repo_root: str,
+                        debug_syms: bool = False) -> str:
     """Run ``script/hostcompile.sh`` over ``build_dir`` and return the ELF path.
 
     Invokes with ``WORKLOCAL_DIR=build_dir AIE_VERSION=5 PLATFORM=baremetal``
@@ -808,6 +818,13 @@ def _invoke_hostcompile(build_dir: str, repo_root: str) -> str:
     env["WORKLOCAL_DIR"] = build_dir
     env.setdefault("AIE_VERSION", "5")
     env.setdefault("PLATFORM", "baremetal")
+    # A small, stripped main.elf is the default here -- assigned, not
+    # setdefault'd. The env is inherited from the caller's shell and
+    # script/aiehlc.sh exports DEBUG_SYMS=1 for its own debug builds, so a
+    # leftover export would otherwise silently publish the ~3x larger
+    # unstripped ELF. Symbols are requested explicitly via
+    # build_main_elf(debug_syms=True), never by ambient environment.
+    env["DEBUG_SYMS"] = "1" if debug_syms else "0"
     nkernels = len([f for f in os.listdir(build_dir)
                     if f.startswith("kernel_") and f.endswith(".cc")])
     what = (f"compiling {nkernels} AIE kernel(s) via xchesscc, then host link"
@@ -835,28 +852,52 @@ def _invoke_hostcompile(build_dir: str, repo_root: str) -> str:
         raise RuntimeError(
             f"hostcompile.sh reported success but {elf!r} is missing\n"
             f"--- log tail ---\n{tail}")
-    print(f"[hostcompile] done -> {elf}", flush=True)
+
+    # Prefer the published main.elf over build/host: they are the same program,
+    # but hostcompile.sh strips the published copy (~70% of the link is DWARF
+    # from the prebuilt BSP/libgloss/aie-rt libs, which none of our own -Os
+    # objects contribute). build/host is the unstripped intermediate, so
+    # returning it would hand the caller -- and every `dow` over JTAG -- the
+    # big one. Full symbols stay beside it as main.debug.elf.
+    published = os.path.join(os.path.dirname(build_dir), "main.elf")
+    if os.path.isfile(published):
+        elf = published
+    print(f"[hostcompile] done -> {elf} ({os.path.getsize(elf):,} B)", flush=True)
     return elf
 
 
-def build_main_elf(build_dir: str) -> str:
+def build_main_elf(build_dir: str, debug_syms: bool = False) -> str:
     """Build the A2 ``main.elf`` from an ``orchestrate_plan`` build dir.
 
     Arranges ``build_dir`` to satisfy hostcompile.sh's multi-kernel contract
     (folds ``main.cc`` + CPU bodies + the aieMesh/aieArray preamble into
     ``host.cc``; the ``kernel_<name>.cc``/``.prx``/``.bcf`` are already in place),
     then reuses ``script/hostcompile.sh`` to compile every kernel and link the
-    host ELF. Returns the linked ELF path (``build_dir/build/host``); a copy is
-    also published by the script at ``<dirname(build_dir)>/main.elf``. Raises
-    ``RuntimeError`` on any arrangement or compile/link failure (never fakes a
-    build).
+    host ELF. Raises ``RuntimeError`` on any arrangement or compile/link failure
+    (never fakes a build).
+
+    Returns the **published, stripped** ELF at ``<dirname(build_dir)>/main.elf``,
+    falling back to the unstripped ``build_dir/build/host`` intermediate only if
+    the publish step did not run. Stripping is the **default**: ~70% of the link
+    is DWARF from the prebuilt BSP/libgloss/aie-rt archives (nothing this
+    project compiles carries ``-g``), so a 2.8 MB A2 build publishes at ~880 KB
+    with a byte-identical LOAD segment -- same program, ~3x less to push over
+    JTAG. ``--strip-debug`` keeps ``.symtab``, so xsdb/aiedbg still resolve
+    function names.
+
+    ``debug_syms=True`` builds with ``-g`` and skips the strip. It is a
+    parameter rather than an inherited ``DEBUG_SYMS`` env var on purpose:
+    ``script/aiehlc.sh`` exports that variable for its own debug builds, and a
+    leftover export silently tripling this ELF is exactly the surprise worth
+    designing out. Full symbols are kept beside the stripped ELF as
+    ``main.debug.elf`` regardless.
     """
     build_dir = os.path.abspath(build_dir)
     # repo root: this file is <root>/src/frontend/tvm/orchestrator.py.
     repo_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     _arrange_build_dir(build_dir)
-    return _invoke_hostcompile(build_dir, repo_root)
+    return _invoke_hostcompile(build_dir, repo_root, debug_syms=debug_syms)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

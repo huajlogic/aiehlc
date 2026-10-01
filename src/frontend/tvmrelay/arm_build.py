@@ -14,7 +14,7 @@ C that the aiehlc aarch64 toolchain can link:
     resnet18.c           kernels           (stage 4)
     tvm_runtime_shim.c   the ~4 TVM runtime symbols the kernels call   <- here
     graph_driver.c       storage plan + kernel calls in graph order    <- here
-    main.c               entry point, weight load, argmax              <- here
+    main.c               entry point, weight load, argmax, timing      <- here
     weights.bin          resnet18_params.bin, linked via ld -r         <- here
     Makefile             the build recipe                              <- here
       -> make -> main.elf
@@ -147,6 +147,15 @@ def param_offsets(blob_path: Path) -> dict:
     Walks the NDArray records so the generated C can ``memcpy`` straight out of
     the linked blob -- no runtime deserializer, no allocation, and the weights
     stay in ``.rodata``.
+
+    **``graph_driver.c`` and ``weights.bin`` are a matched pair.** The offsets
+    returned here are baked into the driver as literals, and TVM serializes
+    ``save_param_dict`` in an unordered-map order that varies run to run -- the
+    same weights land at different offsets each time (the C source is stable;
+    only the blob ordering moves). Pairing a driver with a blob from a
+    *different* stage-4 run therefore reads each weight from the wrong place
+    and silently computes garbage. Regenerate both together, which
+    ``build_arm_elf`` does; never hand-copy one over the other.
     """
     data = blob_path.read_bytes()
     names = read_param_names(blob_path)
@@ -243,10 +252,23 @@ _MAIN_C = """\
  * logits. The printed logits are what the host-side CPU reference is
  * compared against -- a class index alone would not show a small numeric
  * drift, and drift is exactly what a miscompiled kernel produces.
+ *
+ * Each phase is timed with the Arm generic timer (``aie_timer.h``, the same
+ * XTime/COUNTS_PER_SECOND helpers the tilinglinalg host code uses). Three
+ * numbers rather than one total, because they answer different questions and
+ * only one of them is the model:
+ *
+ *   init     one-off: point the graph at the weight blob
+ *   inference  graph_run() -- THE number; what an AIE offload has to beat
+ *   top-5    the argmax, printed so it is visibly not part of inference
+ *
+ * COUNTS_PER_SECOND is reported too: a bare tick count means nothing without
+ * the frequency, and on this part the generic timer is nowhere near CPU clock.
  */
 #include <stdint.h>
 #include <stdio.h>
 
+#include "aie_timer.h"        /* XTime, XTime_GetTime, COUNTS_PER_SECOND */
 #include "input_image.h"      /* input_image[], INPUT_IMAGE_ELEMS */
 #include "imagenet_labels.h"  /* imagenet_labels[], IMAGENET_NUM_CLASSES */
 
@@ -260,17 +282,34 @@ extern const uint8_t _binary_weights_bin_start[];
 
 #define TOPK 5
 
-int main(void) {
-    printf("resnet18: init\\n");
-    graph_init(_binary_weights_bin_start);
+/* Ticks -> ms. Done in one place so every number uses the same conversion,
+ * and as double because at ~100 MHz a 24 ms inference is ~2.4M ticks: fine in
+ * an integer, but the division to ms is not. */
+static double ticks_to_ms(XTime start, XTime end) {
+    return 1.0 * (double)(end - start) / (double)COUNTS_PER_SECOND * 1000.0;
+}
 
+int main(void) {
+    XTime t_init0, t_init1, t_run0, t_run1, t_top0, t_top1;
+
+    printf("resnet18: init\\n");
+    XTime_GetTime(&t_init0);
+    graph_init(_binary_weights_bin_start);
+    XTime_GetTime(&t_init1);
+
+    /* Outside the inference window on purpose: copying the image in is the
+     * harness feeding the model, not the model running. */
     float *in = graph_input();
     for (int i = 0; i < INPUT_IMAGE_ELEMS; ++i)
         in[i] = input_image[i];
 
     printf("resnet18: run\\n");
+    XTime_GetTime(&t_run0);
     float *out = graph_run();
+    XTime_GetTime(&t_run1);
     int n = graph_output_len();
+
+    XTime_GetTime(&t_top0);
 
     /* Partial selection sort over the top K: no allocation, no qsort, and K
      * is 5 -- a full sort of 1000 logits would cost more than the argmax. */
@@ -286,6 +325,7 @@ int main(void) {
         }
         idx[k] = best;
     }
+    XTime_GetTime(&t_top1);
 
     printf("resnet18: top%d\\n", TOPK);
     for (int k = 0; k < TOPK && k < n; ++k) {
@@ -295,6 +335,24 @@ int main(void) {
                k + 1, c, name, (double)out[c]);
     }
     printf("resnet18: top1 class=%d logit=%.6f\\n", idx[0], (double)out[idx[0]]);
+
+    /* Timing last, so it cannot be mistaken for part of the measured work and
+     * so the logits stay adjacent to the CPU reference they are diffed with. */
+    {
+        double init_ms = ticks_to_ms(t_init0, t_init1);
+        double run_ms  = ticks_to_ms(t_run0,  t_run1);
+        double top_ms  = ticks_to_ms(t_top0,  t_top1);
+        printf("resnet18: timing (timer %llu Hz, 1 tick = %.1f ns)\\n",
+               (unsigned long long)COUNTS_PER_SECOND,
+               1e9 / (double)COUNTS_PER_SECOND);
+        printf("  init       %10.3f ms\\n", init_ms);
+        printf("  inference  %10.3f ms   <- graph_run()\\n", run_ms);
+        printf("  top%d       %10.3f ms\\n", TOPK, top_ms);
+        printf("  total      %10.3f ms\\n", init_ms + run_ms + top_ms);
+        if (run_ms > 0.0)
+            printf("  throughput %10.2f inferences/s\\n", 1000.0 / run_ms);
+    }
+
     printf("device_teardown done\\n");   /* the string verify_host.sh greps */
     return 0;
 }
@@ -593,7 +651,11 @@ LSCRIPT := $(ARCH)/lscript.ld
 # tvm/runtime/*.h in this directory stand in for TVM's real headers.
 KERNELS := {kernels}
 
-CFLAGS  ?= -Os -mcpu=$(CPU) -std=c11 -I. -I$(BSP)/include
+# -I$(REPO)/include reaches aie_timer.h (main.c times each phase with it).
+# -DAIE_GEN=5 picks its xiltimer.h branch, which is what this cortexa78 BSP
+# ships -- the default branch wants xtime_l.h, which the BSP does not have.
+CFLAGS  ?= -Os -mcpu=$(CPU) -std=c11 -DAIE_GEN=5 \\
+           -I. -I$(REPO)/include -I$(BSP)/include
 LDFLAGS := --specs=nosys.specs \\
            -Wl,--defsym,end=__bss_end__ \\
            -Wl,-T -Wl,$(LSCRIPT) \\

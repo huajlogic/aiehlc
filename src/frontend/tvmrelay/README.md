@@ -108,6 +108,8 @@ PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --image cat.jpg
 PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --skip-quantize
 PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --no-fuse
 PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --no-arm
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aiegraph
 ```
 
 Seven stages: `ensure_tvm016()` → download + Relay import → int8 quantize →
@@ -115,8 +117,48 @@ Seven stages: `ensure_tvm016()` → download + Relay import → int8 quantize �
 per-layer folders → baremetal aarch64 `main.elf` → CPU reference
 classification.
 
-Flags: `--out-dir --image --skip-quantize --global-scale --no-split --no-fuse
---flat --no-arm`.
+Flags: `--out-dir --image --skip-quantize --relay-ptq --global-scale
+--no-split --no-fuse --flat --no-arm --aie-offload --aie-layers --aie-ops
+--aie-mesh --aiegraph --aiegraph-ops`.
+
+### Stage 3: which quantizer
+
+**Default is ONNX PTQ** (`onnx_ptq.py`) — the model is quantized *before* Relay
+sees it, so the import is already int8.
+
+| | default (ONNX PTQ) | `--relay-ptq` |
+|---|---|---|
+| weights | symmetric int8, **per-channel** | symmetric int8, per-tensor |
+| activations | **asymmetric** (zero-point) | symmetric |
+| first conv | **quantized** | fp32 (`skip_conv_layers=[0]`) |
+| dense layer | quantized | fp32 (`skip_dense_layer=True`) |
+| input image | **quantized** | fp32 |
+| needs LLVM | yes (in codegen, not quantize) | yes (in quantize) |
+| top-5 vs fp32 | **order identical** | top-1 kept, 2–5 reordered |
+| `main.elf` | 24.4 MB | **14.2 MB** |
+
+`relay.quantize` *cannot* do asymmetric: its annotation op is
+`simulated_quantize(data, scale, clip_min, clip_max)` — a scale and a clip
+range, with no zero-point in the op, in `QConfig`, or in the C++ pass. That is
+also why it skips the first conv, where raw-pixel dynamic range hurts a
+symmetric scale most.
+
+**Why the default is the bigger ELF.** The generic `qnn_conv2d_legalize`
+upcasts operands to int16 so zero-points can be folded by subtraction
+(`legalizations.py:115`); targets with a fast int8 path register their own
+(`cpu`/`arm_cpu`/`cuda`/`hexagon`), and `target="c"` registers none. The values
+are genuine int8 — all 22 weight tensors verify within `[-127, 127]` — so this
+is storage width, not a quantization failure. Registering a `"c"` legalization
+that keeps int8 and folds the zero-point into the accumulator would close it.
+
+**`FakeQuantizationToInteger` is not optional** on this path. A QDQ import is
+*simulated* quantization: left alone it stays `dequantize → fp32 op →
+quantize`, the weights get folded back to fp32 constants, and codegen emits
+`float*` kernels over a 46 MB blob — while every accuracy check still passes.
+`to_integer_ops()` runs the pass and reports the op counts so a partial
+conversion is visible rather than assumed.
+
+`--skip-quantize` overrides both and emits fp32.
 
 ### The image, and what the two ends print
 
@@ -149,6 +191,132 @@ Verified by compiling the ELF's exact sources for x86 and running them — both
 images match the oracle on all five entries including logits (dog → Samoyed
 12.4359; cat → Egyptian cat 15.6039).
 
+## `aie_offload.py` — selecting layers for AIE
+
+```bash
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload --aie-layers 0,2
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload --aie-layers all
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload --aie-mesh 4x4
+```
+
+Off by default. With `--aie-offload`, the selected layers *also* go through the
+aiegraph dialect to the AIE backend:
+
+```
+LayerOp geometry -> aiegraph.conv_bn_relu (built + verified in C++)
+                 -> lower_aiegraph        (-> tensor_specs)
+                 -> run_aie_pipeline      (-> host.cc/kernel.cc/routing.cc/aieml.bcf)
+```
+
+Artifacts land in the layer's own folder — `layers/00_conv2d_add_relu/aie/` —
+which is what the per-layer, execution-ordered layout was for.
+
+**Additive, not a mode switch.** The C generation and the APU `main.elf` run
+either way. Verified byte-identical with the flag on and off
+(`5a3a8a153518712bb2ab848d6b419edb`).
+
+Two things make that comparison harder than it looks, if you repeat it:
+
+- the ELF embeds its build path, so runs into different out-dirs differ for
+  that reason alone;
+- **`resnet18_params.bin` is not byte-reproducible.** TVM serializes
+  `save_param_dict` in an unordered-map order that varies run to run. The
+  weights are identical — an order-independent digest over the parsed arrays
+  matches — but the bytes, and therefore the offsets `graph_driver.c` bakes in,
+  move. The generated `.c` is stable; only the blob ordering is not.
+
+That second point is a real hazard beyond hash comparisons: `graph_driver.c`
+and `weights.bin` are a **matched pair**. Pairing a driver with a blob from a
+different stage-4 run reads every weight from the wrong offset and silently
+computes garbage. `build_arm_elf` always regenerates both together; don't
+hand-copy one over the other.
+
+Selection: `--aie-layers` takes an index, a comma list, or `all` (default `0`,
+the 7×7/s2 stem); `--aie-ops` filters by kind. Only the conv2d family has a
+kernel body, so `all` offloads 18 convs and reports the other 4 —
+`max_pool2d`, `global_avg_pool2d`, `dense_add`, `batch_flatten` — as skipped
+with the reason, rather than dropping them silently.
+
+### These layers do not fit a tile yet, and the flow says so
+
+```
+[aie] layer 00 conv2d_add_relu: 224x224x3 -> 64ch K7s2 | 495,768 B/tile vs 49,152 -- OVER BUDGET by 10.1x
+```
+
+`run_aie_pipeline` returns **True** for layer 0 and writes a full artifact set
+including `aieml.bcf`. It is still not runnable: the kernel body from
+`frontend.tvm.kernels` indexes `feat_in[ic*H*W + ih*W + iw]` across 150,528
+bytes while the pipeline hands it a **1,024-byte** ping-pong window — a 147×
+overrun, 784× on the output.
+
+Nothing in the existing pipeline catches this. The C++ budget check at
+`tilinglinalg_pipeline.cpp:602` iterates a `tensors` vector that neither pybind
+entry populates, so it prints `estimated 0 bytes per tile` and passes
+everything. `aie_offload.check_layer` therefore computes the real figure and
+every result carries a `feasible` flag.
+
+Generating the artifacts is still worth doing — it exercises the dialect, the
+routing, and the DMA config, and produces the `.bcf`. Making them *run* needs
+the spatial-halo tiling that `example/tileprogram/ccode/simpleconv2d.cc`
+already does at 224×224 through the Clang frontend, and that the pybind
+`DmaSpec` cannot currently request (it exposes 5 of `DmaAddressing`'s ~18
+fields and drops every halo field).
+
+## `aiegraph_partition.py` — whole-graph lift, then AIE/CPU partition
+
+```bash
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aiegraph
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py \
+    --aiegraph --aiegraph-ops conv_bn_relu,conv_bn,residual_add_relu,avgpool_fc
+```
+
+The other way into aiegraph, and the difference from `--aie-offload` is that it
+takes **no layer selection**. It lifts the *entire* graph into one verified
+`aiegraph.func` whose SSA edges are the model's real dataflow, then partitions:
+a layer goes to the aiehlc kernel backend when **every** aiegraph op it expands
+to is in `--aiegraph-ops`, and otherwise **reuses the TVM-generated CPU C**
+from stage 5 untouched. Every layer gets a verdict and a reason in
+`layers/partition.json`; the `.c` files are byte-identical with the flag on and
+off.
+
+On ResNet-18 that is 29 aiegraph ops over 24 graph invocations — 12 AIE / 12
+CPU with the default conv-family op set, 21 / 3 with all four ops enabled.
+
+| TVM fused layer | aiegraph | default verdict |
+|---|---|---|
+| `conv2d_add_relu` | `conv_bn_relu` | **AIE** |
+| `conv2d_add` | `conv_bn` | **AIE** |
+| `conv2d_add_add_relu` | `conv_bn` + `residual_add_relu` | CPU — see below |
+| `global_avg_pool2d` + `dense_add` | one `avgpool_fc` (folded) | CPU — no AIE kernel |
+| `max_pool2d` | *(none)* | CPU — not in the 4-op dialect |
+| `batch_flatten` | *(none)* | CPU — dead kernel, graph elides it |
+
+**Partial eligibility is not offloadable.** A residual block's conv half is an
+eligible `conv_bn`, but the TVM C for that layer is a *single fused function*
+computing conv+bias+residual+relu, so there is no seam to split it at — taking
+the conv to AIE would mean the residual add never runs. The whole layer stays
+on the APU unless `residual_add_relu` is enabled too, in which case both
+kernels are built into `aie/conv_bn/` and `aie/residual_add_relu/`
+subdirectories. Single-op layers keep the flat `aie/` layout.
+
+**Two counting traps this module is built around.** ResNet-18 has 22 distinct
+generated symbols but **24** graph invocations — two shape-identical 64ch/56×56
+kernels are each called twice — and dataflow lives on the *nodes*, not the
+symbols. So the IR is built by walking `graph["nodes"]`, and layers are keyed
+back by symbol. (`aie_offload.select_layers` instead zips manifest index *i*
+against `call_nodes[i]` positionally, which desynchronizes at the first
+repeated symbol and hands every layer from index 4 on **another layer's
+geometry**; `--aiegraph` does not share that path.) Counts in `partition.json`
+are over invocations, with `aie_dirs`/`cpu_dirs` giving the folder counts.
+
+**The block args do not alias.** Two consumers of the same CPU-produced tensor
+each get their own block argument, since `-1` ("not from an aiegraph op") is
+the only thing the pybind boundary can say and it allocates a fresh one every
+time. The IR is faithful about which ops run where and about every edge between
+two aiegraph ops, but under-shares at the CPU boundary — harmless, because each
+launch is standalone and the APU owns the buffers between them.
+
 ### What a no-LLVM TVM costs you
 
 This tree's TVM 0.16 is built `USE_LLVM=OFF`. Four separate things break, and
@@ -161,12 +329,22 @@ each fails in a way that does not name LLVM:
 | `target.build.llvm is not enabled` | `target_host` defaults to `llvm`; the host module is built separately from the kernels | `Target("c", host="c")` |
 | `target.build.llvm is not enabled` (again) | `FoldConstant` JIT-executes constant subgraphs against a target hardcoded in C++ (`fold_constant.cc:403`) | disable `FoldConstant` + `AlterOpLayout` |
 
-**int8 quantization is genuinely unavailable without LLVM.** `relay.quantize` →
+**`--relay-ptq` is genuinely unavailable without LLVM.** `relay.quantize` →
 `prerequisite_optimize` → `FoldConstant`, and that target is not reachable from
 Python. Disabling `FoldConstant` does not help either: calibration then asserts
 on `isinstance(expr.args[0], Constant)` (`_calibrate.py:154`) because it
-*requires* folded constants. So stage 3 detects this, prints the root cause and
-the fix, and continues in fp32 rather than mislabelling the output. To enable:
+*requires* folded constants. So that path detects this, prints the root cause
+and the fix, and continues in fp32 rather than mislabelling the output.
+
+**The default path still needs LLVM too, for a different reason.** Quantizing
+outside TVM removes the dependency from *quantization* — stage 3 gets all the
+way to `top-5 order identical` on a `USE_LLVM=OFF` build — but codegen then
+dies with the same `target.build.llvm is not enabled`. The culprit is
+`FakeQuantizationToInteger`, which calls `FoldConstantExpr` directly
+(`fake_quantization_to_integer.py:35`), so `disabled_pass=["FoldConstant"]`
+cannot reach it. Verified by swapping the no-LLVM `libtvm.so` back in.
+
+So: LLVM is required either way. To enable `--relay-ptq`:
 
 ```bash
 sudo apt install zlib1g-dev libzstd-dev     # the only two things missing
@@ -267,12 +445,42 @@ missing pieces from `resnet18_graph.json` instead, into `arm_build/`:
 |---|---|
 | `graph_driver.c` | one static buffer per `storage_id`, weights pointed into the blob, one kernel call per graph node in order |
 | `tvm_runtime_shim.c` | the four runtime symbols the kernels reference — a bump allocator plus an error sink |
-| `main.c` | entry point, feeds `input_image.h`, prints the top-5 with names and logits, and the `device_teardown done` line `verify_host.sh` greps |
+| `main.c` | entry point, feeds `input_image.h`, prints the top-5 with names and logits, the per-phase timing, and the `device_teardown done` line `verify_host.sh` greps |
 | `input_image.h` | the preprocessed photo as `static const float[150528]` |
 | `imagenet_labels.h` | the 1000 class names |
 | `tvm/runtime/c_*_api.h` | baremetal stand-ins so `resnet18.c` is used **verbatim**, not patched |
 | `weights.bin` | `resnet18_params.bin`, linked in via `ld -r -b binary` |
 | `Makefile` | the build recipe |
+
+### What the ELF prints
+
+After the top-5, `main.c` reports what each phase cost, measured with the Arm
+generic timer via `include/aie_timer.h` — the same `XTime` /
+`COUNTS_PER_SECOND` helpers the tilinglinalg host code uses:
+
+```
+resnet18: timing (timer 100000000 Hz, 1 tick = 10.0 ns)
+  init            1.234 ms
+  inference      24.567 ms   <- graph_run()
+  top5            0.089 ms
+  total          25.890 ms
+  throughput      40.70 inferences/s
+```
+
+Three numbers rather than one total, because only one of them is the model:
+`init` is a one-off weight-pointer setup, `top5` is the argmax, and
+**`inference` is `graph_run()`** — the number an AIE offload has to beat. The
+image copy sits outside the window deliberately: that is the harness feeding
+the model, not the model running.
+
+The timer frequency is printed because a tick count means nothing without it,
+and on this part the generic timer runs nowhere near the CPU clock. `-DAIE_GEN=5`
+in `CFLAGS` selects `aie_timer.h`'s `xiltimer.h` branch, which is what this
+cortexa78 BSP ships — the default branch wants `xtime_l.h`, which it does not
+have.
+
+`device_teardown done` stays the **last** line, so `verify_host.sh` is
+unaffected.
 
 ### Python generates, `make` builds
 

@@ -382,6 +382,68 @@ def _clone(src_dir: Path, *, dry_run: bool) -> None:
             parked.replace(manifest)
 
 
+#: Source fixups TVM 0.16 needs to build/run against toolchains newer than it.
+#: Each entry is ``(relative path, [(old, new), ...])``.
+#:
+#: Every ``old`` must be absent from the *patched* result, or the substitution
+#: re-fires on the next run -- ``"import logging\n" -> "import logging\nimport
+#: math\n"`` is the trap, since the pattern survives in its own replacement and
+#: stacks another ``import math`` every call. Anchoring on the unpatched-only
+#: text (``import logging\nimport multiprocessing``) makes the rewrite
+#: self-limiting, which ``test_apply_source_fixups_is_idempotent`` enforces.
+#:
+#: These are *semantically identical* renames, not behaviour changes:
+#:
+#: * ``StringRef::startswith``/``endswith`` were renamed to ``starts_with``/
+#:   ``ends_with`` in LLVM 16 and the old spellings deleted by LLVM 19. Without
+#:   this, an ``--llvm`` build fails to compile three files in src/target/llvm/.
+#: * ``np.math`` was only ever an alias for the stdlib ``math`` module; NumPy
+#:   2.0 removed it. Without this, ``relay.quantize`` reaches calibration and
+#:   dies in ``_power2_scale`` -- i.e. int8 quantization is broken on NumPy 2
+#:   even when LLVM is present.
+_SOURCE_FIXUPS = (
+    ("src/target/llvm/llvm_instance.cc",
+     ((".startswith(", ".starts_with("), (".endswith(", ".ends_with("))),
+    ("src/target/llvm/codegen_hexagon.cc",
+     ((".startswith(", ".starts_with("), (".endswith(", ".ends_with("))),
+    ("src/target/llvm/codegen_llvm.cc",
+     ((".startswith(", ".starts_with("), (".endswith(", ".ends_with("))),
+    ("python/tvm/relay/quantize/_calibrate.py",
+     (("import logging\nimport multiprocessing",
+       "import logging\nimport math\nimport multiprocessing"),
+      ("2 ** np.math.ceil(np.math.log(val, 2))", "2 ** math.ceil(math.log(val, 2))"))),
+)
+
+
+def apply_source_fixups(src_dir: Path, *, dry_run: bool = False) -> list:
+    """Patch TVM 0.16 for LLVM 19 + NumPy 2. Returns the files changed.
+
+    Idempotent: re-running finds nothing to do. Safe to call on every build,
+    which is the point -- ``thirdparty/tvm-0.16/`` is gitignored, so a fresh
+    provision would otherwise silently reintroduce both breakages.
+    """
+    changed = []
+    for rel, subs in _SOURCE_FIXUPS:
+        path = src_dir / rel
+        if not path.is_file():
+            continue
+        text = original = path.read_text()
+        for old, new in subs:
+            if old in text:
+                text = text.replace(old, new)
+        if text == original:
+            continue
+        changed.append(rel)
+        if not dry_run:
+            backup = path.with_suffix(path.suffix + ".orig")
+            if not backup.exists():
+                backup.write_text(original)
+            path.write_text(text)
+    if changed:
+        _log(f"patched for LLVM 19 / NumPy 2: {', '.join(changed)}")
+    return changed
+
+
 def _cmake_config(build_dir: Path, src_dir: Path, use_llvm: str, *, dry_run: bool) -> None:
     if not dry_run:
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -410,6 +472,9 @@ def build_from_source(
     """Clone tag v0.16.0, cmake+ninja it, and pip-install python/ editable."""
     _require_tools(["git", "cmake", "ninja"])
     _clone(src_dir, dry_run=dry_run)
+    # Must run after the clone and before cmake: two of the four files are C++
+    # that will not compile against LLVM 19 as shipped.
+    apply_source_fixups(src_dir, dry_run=dry_run)
 
     build_dir = src_dir / "build"
     _cmake_config(build_dir, src_dir, use_llvm, dry_run=dry_run)
