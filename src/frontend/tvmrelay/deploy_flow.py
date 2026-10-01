@@ -814,7 +814,7 @@ def main(argv=None) -> int:
                     help="also lower the selected layers through the aiegraph "
                          "dialect to AIE (additive: the C path and the APU "
                          "ELF are still produced)")
-    ap.add_argument("--aie-layers", default="", #default="0",
+    ap.add_argument("--aie-layers", default="1",
                     help="which layers to offload: an index, a comma list, or "
                          "'all' (default: 0, the 7x7/s2 stem)")
     ap.add_argument("--aie-ops", default=",".join(AIE_OP_KINDS),
