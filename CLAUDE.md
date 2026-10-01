@@ -89,6 +89,29 @@ Platforms: baremetal (`aarch64-none-elf-g++`) or Linux (`aarch64-linux-gnu-g++`)
 | **dfscheblueprint** | Schedule blueprint: transfer manifests, flow configs |
 | **dfschedule** | Executable schedule: DMA BD, kernel launch, locks |
 
+### High-level frontend dialect (`aiegraph`)
+
+Sits **above** `routing` — a fused/quantized op-level graph (TVM/Relay → aiegraph
+→ per-op `run_aie_pipeline`). Not part of the GEMM pass pipeline; it lowers each
+op to an independent launch on the existing backend.
+
+**Runtime op split.** The `run_aie_pipeline` backend implements only the conv2d
+family (`conv_bn`, `conv_bn_relu`). The other aiegraph ops (`residual_add_relu`,
+`avgpool_fc`) are **not** sent to AIE; they are emitted as bit-exact CPU C by TVM
+(`target="c"`, `src/frontend/tvm/cpu_codegen.py`). Non-conv ops still build/verify/
+lower in the aiegraph IR — only the emit path forks (dispatch via
+`cpu_codegen.is_aie_op`). See `doc/design/tvm_frontend.md` §"CPU fallback".
+
+| Dialect | Purpose |
+|---------|---------|
+| **aiegraph** | Fused int8 tensor ops (`conv_bn_relu`, `conv_bn`, `residual_add_relu`, `avgpool_fc`) as SSA def-use over `tensor<Nxi8>`, with per-op quant attrs + weights `SymbolRefAttr`; `func`/`yield` container. Buffer wiring is verified SSA, not string names. |
+
+Location: `src/mlir/mlirfront/frontend/aiegraph/` (`td/`, `gen.sh`, `inc/`,
+`aiegraphmanager.{h,cpp}`, `lower/AiegraphLowerDriver.{h,cpp}`, `unitest/`).
+pybind: `build_aiegraph_module(ops)` (build+verify → textual IR) and
+`lower_aiegraph(mlir_text)` (walk → per-launch `tensor_specs`) in
+`aietriton_pybind.cpp`. Python entry: `_compiler.compile_plan(..., via_aiegraph=True)`.
+
 ### Pass Pipeline
 
 **Shared stages** (produces dfscheblueprint IR, then module is cloned):

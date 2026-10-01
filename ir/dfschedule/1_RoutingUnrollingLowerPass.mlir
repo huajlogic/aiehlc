@@ -4,109 +4,66 @@ module attributes {codegen.headers = ["stdint.h", "stdio.h", "custom_lib.h"], ro
     %c2_i32 = arith.constant 2 : i32
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
-    %0 = routing.routingcreatehwmesh row = 4, col = 4 partition = 0, 3, 0, 6 -> i32
-    %1 = bufferization.to_tensor %arg0 : memref<256x256xi8>
-    %2 = routing.routingcreatescheduletensor %1 : tensor<256x256xi8> shape = [256, 256], dim = 2 -> tensor<256x256xi8>
-    %3 = bufferization.to_tensor %arg1 : memref<256x256xi8>
-    %4 = routing.routingcreatescheduletensor %3 : tensor<256x256xi8> shape = [256, 256], dim = 2 -> tensor<256x256xi8>
-    %5 = bufferization.to_tensor %arg2 : memref<256x256xi8>
-    %6 = routing.routingcreatescheduletensor %5 : tensor<256x256xi8> shape = [256, 256], dim = 2 -> tensor<256x256xi8>
+    %0 = routing.routingcreatehwmesh row = 2, col = 2 -> i32
+    %1 = bufferization.to_tensor %arg0 : memref<25088xi8>
+    %2 = routing.routingcreatescheduletensor %1 : tensor<25088xi8> shape = [25088], dim = 1 -> tensor<25088xi8>
+    %3 = bufferization.to_tensor %arg1 : memref<2360332xi8>
+    %4 = routing.routingcreatescheduletensor %3 : tensor<2360332xi8> shape = [2360332], dim = 1 -> tensor<2360332xi8>
+    %5 = bufferization.to_tensor %arg2 : memref<25088xi8>
+    %6 = routing.routingcreatescheduletensor %5 : tensor<25088xi8> shape = [25088], dim = 1 -> tensor<25088xi8>
     scf.execute_region {
-      %7 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "col" : i32 -> i32
-      %8 = routing.partitiontensor %4 : tensor<256x256xi8> {
-  partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "col", replicateOn = "row", singleTileOwner = "">,
-  tiling = #routing.tiling<d0 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4, slice_tiling = #routing.level<base = 64, total = 64, slice = 16, step = 16, rounds = 4>>>, d1 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 256, step = 256, rounds = 1, slice_tiling = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4>>>>
-} -> tensor<256x256xi8>
+      %7 = routing.partitionmesh mesh = %0, splitnum = 2, splitaxis = "col" : i32 -> i32
+      %8 = routing.partitiontensor %4 : tensor<2360332xi8> {
+  partition = #routing.partition<splitnum = 2, splitdim = 0, hwAxisOwner = "col", replicateOn = "row", singleTileOwner = "">
+} -> tensor<2360332xi8>
       %9 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %13 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
-        %14 = routing.routingextract_data %8, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %15 = routing.routingcreatehwiowithtarget targettilelist = %13 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %16 = routing.routingmovedatabyio tensordata = %14, hwiowithtarget = %15 : tensor<64x256xi8>, i32 -> i32
+        %11 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
+        %12 = routing.routingextract_data %8, %arg3 : tensor<2360332xi8>, i32 -> tensor<1180166xi8>
+        %13 = routing.routingcreatehwiowithtarget targettilelist = %11 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %14 = routing.routingmovedatabyio tensordata = %12, hwiowithtarget = %13 : tensor<1180166xi8>, i32 -> i32
         "routing.yield"() : () -> ()
       }
       %10 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %13 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
-        %14 = routing.routingextract_data %8, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %15 = routing.routingcreatehwiowithtarget targettilelist = %13 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %16 = routing.routingmovedatabyio tensordata = %14, hwiowithtarget = %15 : tensor<64x256xi8>, i32 -> i32
-        "routing.yield"() : () -> ()
-      }
-      %11 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c2_i32 : i32) -> i32{
-      ^bb0(%arg3: i32):
-        %13 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
-        %14 = routing.routingextract_data %8, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %15 = routing.routingcreatehwiowithtarget targettilelist = %13 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %16 = routing.routingmovedatabyio tensordata = %14, hwiowithtarget = %15 : tensor<64x256xi8>, i32 -> i32
-        "routing.yield"() : () -> ()
-      }
-      %12 = routing.RoutingCreate<Memo = "col"> ( scf_idx = %c3_i32 : i32) -> i32{
-      ^bb0(%arg3: i32):
-        %13 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
-        %14 = routing.routingextract_data %8, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %15 = routing.routingcreatehwiowithtarget targettilelist = %13 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %16 = routing.routingmovedatabyio tensordata = %14, hwiowithtarget = %15 : tensor<64x256xi8>, i32 -> i32
+        %11 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
+        %12 = routing.routingextract_data %8, %arg3 : tensor<2360332xi8>, i32 -> tensor<1180166xi8>
+        %13 = routing.routingcreatehwiowithtarget targettilelist = %11 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %14 = routing.routingmovedatabyio tensordata = %12, hwiowithtarget = %13 : tensor<1180166xi8>, i32 -> i32
         "routing.yield"() : () -> ()
       }
       scf.yield
     } {routing_memo = "col"}
     scf.execute_region {
-      %7 = routing.partitionmesh mesh = %0, splitnum = 4, splitaxis = "row" : i32 -> i32
-      %8 = routing.partitiontensor %2 : tensor<256x256xi8> {
-  partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "row", replicateOn = "col", singleTileOwner = "">,
-  tiling = #routing.tiling<d0 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4, slice_tiling = #routing.level<base = 64, total = 64, slice = 16, step = 16, rounds = 4>>>, d1 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 256, step = 256, rounds = 1, slice_tiling = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4>>>>
-} -> tensor<256x256xi8>
-      %9 = routing.partitiontensor %6 : tensor<256x256xi8> {
-  partition = #routing.partition<splitnum = 4, splitdim = 0, hwAxisOwner = "row", replicateOn = "col", singleTileOwner = "">,
-  tiling = #routing.tiling<d0 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4, slice_tiling = #routing.level<base = 64, total = 64, slice = 16, step = 16, rounds = 4>>>, d1 = #routing.dim<outer = #routing.level<base = 256, total = 256, slice = 64, step = 64, rounds = 4, slice_tiling = #routing.level<base = 64, total = 64, slice = 16, step = 16, rounds = 4>>>>
-} -> tensor<256x256xi8>
+      %7 = routing.partitionmesh mesh = %0, splitnum = 2, splitaxis = "row" : i32 -> i32
+      %8 = routing.partitiontensor %2 : tensor<25088xi8> {
+  partition = #routing.partition<splitnum = 2, splitdim = 0, hwAxisOwner = "row", replicateOn = "col", singleTileOwner = "">
+} -> tensor<25088xi8>
+      %9 = routing.partitiontensor %6 : tensor<25088xi8> {
+  partition = #routing.partition<splitnum = 2, splitdim = 0, hwAxisOwner = "row", replicateOn = "col", singleTileOwner = "">
+} -> tensor<25088xi8>
       %10 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c0_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %14 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
-        %15 = routing.routingextract_data %8, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %16 = routing.routingcreatehwiowithtarget targettilelist = %14 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %17 = routing.routingmovedatabyio tensordata = %15, hwiowithtarget = %16 : tensor<64x256xi8>, i32 -> i32
-        %18 = routing.routingextract_data %9, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %19 = routing.routingroutinggatherout tilelist = %14, tensordata = %18 : i32, tensor<64x256xi8> -> tensor<64x256xi8>
-        %20 = routing.routingcreatehwiowithtarget targettilelist = %14 : i32 {direction = "output", iotype = "mem2"} -> i32
-        %21 = routing.routingmovedatabyio tensordata = %19, hwiowithtarget = %20 : tensor<64x256xi8>, i32 -> i32
+        %12 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
+        %13 = routing.routingextract_data %8, %arg3 : tensor<25088xi8>, i32 -> tensor<12544xi8>
+        %14 = routing.routingcreatehwiowithtarget targettilelist = %12 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %15 = routing.routingmovedatabyio tensordata = %13, hwiowithtarget = %14 : tensor<12544xi8>, i32 -> i32
+        %16 = routing.routingextract_data %9, %arg3 : tensor<25088xi8>, i32 -> tensor<12544xi8>
+        %17 = routing.routingroutinggatherout tilelist = %12, tensordata = %16 : i32, tensor<12544xi8> -> tensor<12544xi8>
+        %18 = routing.routingcreatehwiowithtarget targettilelist = %12 : i32 {direction = "output", iotype = "mem2"} -> i32
+        %19 = routing.routingmovedatabyio tensordata = %17, hwiowithtarget = %18 : tensor<12544xi8>, i32 -> i32
         "routing.yield"() : () -> ()
       }
       %11 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c1_i32 : i32) -> i32{
       ^bb0(%arg3: i32):
-        %14 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
-        %15 = routing.routingextract_data %8, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %16 = routing.routingcreatehwiowithtarget targettilelist = %14 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %17 = routing.routingmovedatabyio tensordata = %15, hwiowithtarget = %16 : tensor<64x256xi8>, i32 -> i32
-        %18 = routing.routingextract_data %9, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %19 = routing.routingroutinggatherout tilelist = %14, tensordata = %18 : i32, tensor<64x256xi8> -> tensor<64x256xi8>
-        %20 = routing.routingcreatehwiowithtarget targettilelist = %14 : i32 {direction = "output", iotype = "mem2"} -> i32
-        %21 = routing.routingmovedatabyio tensordata = %19, hwiowithtarget = %20 : tensor<64x256xi8>, i32 -> i32
-        "routing.yield"() : () -> ()
-      }
-      %12 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c2_i32 : i32) -> i32{
-      ^bb0(%arg3: i32):
-        %14 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
-        %15 = routing.routingextract_data %8, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %16 = routing.routingcreatehwiowithtarget targettilelist = %14 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %17 = routing.routingmovedatabyio tensordata = %15, hwiowithtarget = %16 : tensor<64x256xi8>, i32 -> i32
-        %18 = routing.routingextract_data %9, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %19 = routing.routingroutinggatherout tilelist = %14, tensordata = %18 : i32, tensor<64x256xi8> -> tensor<64x256xi8>
-        %20 = routing.routingcreatehwiowithtarget targettilelist = %14 : i32 {direction = "output", iotype = "mem2"} -> i32
-        %21 = routing.routingmovedatabyio tensordata = %19, hwiowithtarget = %20 : tensor<64x256xi8>, i32 -> i32
-        "routing.yield"() : () -> ()
-      }
-      %13 = routing.RoutingCreate<Memo = "row"> ( scf_idx = %c3_i32 : i32) -> i32{
-      ^bb0(%arg3: i32):
-        %14 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
-        %15 = routing.routingextract_data %8, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %16 = routing.routingcreatehwiowithtarget targettilelist = %14 : i32 {direction = "input", iotype = "mem2"} -> i32
-        %17 = routing.routingmovedatabyio tensordata = %15, hwiowithtarget = %16 : tensor<64x256xi8>, i32 -> i32
-        %18 = routing.routingextract_data %9, %arg3 : tensor<256x256xi8>, i32 -> tensor<64x256xi8>
-        %19 = routing.routingroutinggatherout tilelist = %14, tensordata = %18 : i32, tensor<64x256xi8> -> tensor<64x256xi8>
-        %20 = routing.routingcreatehwiowithtarget targettilelist = %14 : i32 {direction = "output", iotype = "mem2"} -> i32
-        %21 = routing.routingmovedatabyio tensordata = %19, hwiowithtarget = %20 : tensor<64x256xi8>, i32 -> i32
+        %12 = routing.routingextract_tiles %7, %arg3 : i32, i32 -> i32
+        %13 = routing.routingextract_data %8, %arg3 : tensor<25088xi8>, i32 -> tensor<12544xi8>
+        %14 = routing.routingcreatehwiowithtarget targettilelist = %12 : i32 {direction = "input", iotype = "mem2"} -> i32
+        %15 = routing.routingmovedatabyio tensordata = %13, hwiowithtarget = %14 : tensor<12544xi8>, i32 -> i32
+        %16 = routing.routingextract_data %9, %arg3 : tensor<25088xi8>, i32 -> tensor<12544xi8>
+        %17 = routing.routingroutinggatherout tilelist = %12, tensordata = %16 : i32, tensor<12544xi8> -> tensor<12544xi8>
+        %18 = routing.routingcreatehwiowithtarget targettilelist = %12 : i32 {direction = "output", iotype = "mem2"} -> i32
+        %19 = routing.routingmovedatabyio tensordata = %17, hwiowithtarget = %18 : tensor<12544xi8>, i32 -> i32
         "routing.yield"() : () -> ()
       }
       scf.yield

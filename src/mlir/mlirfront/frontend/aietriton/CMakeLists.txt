@@ -17,6 +17,7 @@ target_link_libraries(_aietriton_core PRIVATE
     clangBasic
     clangASTMatchers
     MLIREmitCDialect
+    MLIRSCFToEmitC
     MLIRTargetCpp
     MLIRAMDGPUDialect
     MLIRNVVMDialect
@@ -76,6 +77,9 @@ target_include_directories(_aietriton_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../tilinglinalg/dataflowmap/dfschedule/
     ${CMAKE_CURRENT_SOURCE_DIR}/../tilinglinalg/dataflowmap/dfscheblueprint/inc/
     ${CMAKE_CURRENT_SOURCE_DIR}/../tilinglinalg/dataflowmap/dfscheblueprint/
+    ${CMAKE_CURRENT_SOURCE_DIR}/../aiegraph/inc/
+    ${CMAKE_CURRENT_SOURCE_DIR}/../aiegraph/
+    ${CMAKE_CURRENT_SOURCE_DIR}/../aiegraph/lower/
     ${CMAKE_CURRENT_SOURCE_DIR}/../../
 )
 

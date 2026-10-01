@@ -138,6 +138,13 @@ if [ ${#MULTI_KERNEL_FILES[@]} -gt 0 ]; then
     # Remove temporary symlink
     rm -f "${WORKLOCAL_DIR}/kernel.cc"
     popd
+elif [ ! -f "${WORKLOCAL_DIR}/kernel.cc" ]; then
+    # Host-only mode: no kernel_<name>.cc and no kernel.cc. This is a legitimate
+    # build (e.g. the TVM frontend with AIE offload disabled — every op is
+    # force-offloaded to the CPU backend, so there is nothing for xchesscc to
+    # compile), not a missing-file error. Link host.cc with no embedded kernel.
+    echo "[Host-only] No kernel sources found; linking host.cc without an AIE kernel"
+    KERNEL_OBJ_LIST=""
 else
     # Single-kernel mode (backward compat)
     # Auto-detect kernel function name from kernel.cc's "// kernel_decl <name>" comment
@@ -511,8 +518,41 @@ echo "============================================"
 ls -l host
 
 AOUT_DIR="$(dirname "${WORKLOCAL_DIR}")"
-cp -f "${BUILD_DIR}/host" "${AOUT_DIR}/main.elf"
-echo "Published: ${AOUT_DIR}/main.elf"
+
+# Publish a stripped main.elf, keeping the full one as main.debug.elf.
+#
+# ~70% of the linked ELF is DWARF that none of our own code produces: host.cc,
+# the kernels and routing.cc all compile at -Os with no -g (see OPT_FLAGS), but
+# the prebuilt BSP, libgloss and aie-rt libraries we link against were built
+# with -g and drag their debug info in. On a 2.8 MB A2 build that is ~2.0 MB of
+# DWARF riding along on every `dow -force` over JTAG.
+#
+# --strip-debug (not --strip-all) keeps .symtab, so xsdb/aiedbg can still
+# resolve function names for breakpoints and backtraces. Only non-loadable
+# sections go: the LOAD segment is byte-identical before and after, so this
+# cannot change what executes on the board.
+#
+# DEBUG_SYMS=1 means "I am debugging" -- it already adds -g above, so it also
+# suppresses the strip and publishes the unstripped ELF directly.
+if [ "${DEBUG_SYMS:-0}" -eq 1 ]; then
+    cp -f "${BUILD_DIR}/host" "${AOUT_DIR}/main.elf"
+    # This ELF already has symbols, so a main.debug.elf left over from an
+    # earlier stripped build would be a stale sibling of a different binary --
+    # exactly the file someone would then load symbols from.
+    rm -f "${AOUT_DIR}/main.debug.elf"
+    echo "Published: ${AOUT_DIR}/main.elf (unstripped, DEBUG_SYMS=1)"
+else
+    cp -f "${BUILD_DIR}/host" "${AOUT_DIR}/main.debug.elf"
+    # Fall back to publishing unstripped rather than failing the build: a
+    # missing objcopy is a smaller problem than no ELF at all.
+    if ! "${TOOL_PREFIX}objcopy" --strip-debug \
+            "${BUILD_DIR}/host" "${AOUT_DIR}/main.elf" 2>/dev/null; then
+        echo "Warning: ${TOOL_PREFIX}objcopy unavailable; publishing unstripped"
+        cp -f "${BUILD_DIR}/host" "${AOUT_DIR}/main.elf"
+    fi
+    echo "Published: ${AOUT_DIR}/main.elf (stripped; full symbols in main.debug.elf)"
+    ls -l "${AOUT_DIR}/main.debug.elf"
+fi
 ls -l "${AOUT_DIR}/main.elf"
 
 cd "${_HOSTCOMPILE_ORIG_PWD}"

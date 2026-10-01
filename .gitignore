@@ -137,3 +137,6 @@ script/sim/build/
 
 /aiehlc_aiesimulator
 
+
+# TVM 0.16 source build (src/frontend/tvmrelay/setup_tvm016.py)
+thirdparty/tvm-0.16/
