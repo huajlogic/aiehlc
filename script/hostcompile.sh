@@ -363,23 +363,53 @@ for kobj in ${KERNEL_OBJ_LIST}; do
 done
 echo ""
 
+# Library vs executable mode.
+#
+# An app source with no main() (e.g. simplematmul2_aiegraph.cc, whose host entry
+# is `int test_matmul(int)`) cannot be linked into an ELF — there is nothing to
+# start. Such a source is meant to be embedded in a larger program, so archive
+# the objects into a static library instead and let the caller supply main().
+#
+# Detect the entry point from the GENERATED host.cc: `int main()` is a
+# user-written main passed through verbatim, `void main()` is the MLIR-only
+# emission that the fixups below promote to `int main()`. Neither => library.
+if grep -q 'int main()' "${WORKLOCAL_DIR}/host.cc"; then
+    HOST_ENTRY_KIND="user-main"
+elif grep -q 'void main()' "${WORKLOCAL_DIR}/host.cc"; then
+    HOST_ENTRY_KIND="mlir-main"
+else
+    HOST_ENTRY_KIND="library"
+fi
+
+# Library name follows the app source: simplematmul2_aiegraph.cc -> libsimplematmul2_aiegraph.a
+HOST_LIB_NAME="libhost.a"
+if [ -f "${WORKLOCAL_DIR}/app_source.txt" ]; then
+    _app_base="$(basename "$(cat "${WORKLOCAL_DIR}/app_source.txt")")"
+    _app_base="${_app_base%.*}"
+    [ -n "${_app_base}" ] && HOST_LIB_NAME="lib${_app_base}.a"
+fi
+
 echo "============================================"
 echo "Host compilation (host.cc + aie_runtime)"
 echo "============================================"
 echo "Source: ${WORKLOCAL_DIR}/host.cc"
-echo "Output: ${BUILD_DIR}/host"
+if [ "${HOST_ENTRY_KIND}" = "library" ]; then
+    echo "Output: ${BUILD_DIR}/${HOST_LIB_NAME} (static library: host.cc has no main())"
+else
+    echo "Output: ${BUILD_DIR}/host"
+fi
 echo "Platform: $platform  AIE version: $aie_version"
 echo ""
 
 # Fix generated host.cc for C++: forward decl, int main(), return 0 in main, __global__
 HOST_FIXED="${BUILD_DIR}/host_fixed.cc"
-if grep -q 'int main()' "${WORKLOCAL_DIR}/host.cc"; then
+if [ "${HOST_ENTRY_KIND}" = "user-main" ]; then
     # User source already provides int main() — only add __global__ define
     sed -e '/#include "aie_runtime.h"/a\
 #define __global__
 ' \
         "${WORKLOCAL_DIR}/host.cc" > "${HOST_FIXED}"
-else
+elif [ "${HOST_ENTRY_KIND}" = "mlir-main" ]; then
     # MLIR-only output: apply all fixups (void main → int main, return 0, forward decl)
     sed -e '/#include "aie_runtime.h"/a\
 void host_canonicalized();\
@@ -387,6 +417,16 @@ void host_canonicalized();\
 ' \
         -e 's/void main()/int main()/' \
         -e '0,/^  return;$/s/^  return;$/  return 0;/' \
+        "${WORKLOCAL_DIR}/host.cc" > "${HOST_FIXED}"
+else
+    # Library: no main to promote. The `return 0` rewrite above is deliberately
+    # NOT applied -- it targets the first `return;` in the file, which without a
+    # main belongs to `void host_canonicalized()` and would be rewritten into
+    # "return-statement with a value, in function returning 'void'".
+    sed -e '/#include "aie_runtime.h"/a\
+void host_canonicalized();\
+#define __global__
+' \
         "${WORKLOCAL_DIR}/host.cc" > "${HOST_FIXED}"
 fi
 HOST_SRC="${HOST_FIXED}"
@@ -492,6 +532,63 @@ if [ "${HAS_ROUTING}" -eq 1 ]; then
     fi
     ROUTING_OBJ="routing.o"
 fi
+HOST_OBJS="host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o aie_runtime_control_plan.o aie_runtime_resource.o ${ROUTING_OBJ} ${KERNEL_OBJ_LIST}"
+
+if [ "${HOST_ENTRY_KIND}" = "library" ]; then
+    # No main() => archive rather than link. The kernel ELF objects are included
+    # so the embedded-kernel symbols (_binary_kernel_*_start/_end/_size) travel
+    # with the library; the final executable still needs the BSP/XAie libs that
+    # the link branch below passes, since an archive records no dependencies.
+    echo "Archiving host static library (no main() in host.cc)..."
+    set -x
+    rm -f "${HOST_LIB_NAME}"
+    ${TOOL_PREFIX}ar rcs "${HOST_LIB_NAME}" ${HOST_OBJS}
+    _ar_rc=$?
+    set +x
+    if [ ${_ar_rc} -ne 0 ]; then
+        echo "Error: failed to archive ${HOST_LIB_NAME}"
+        exit 1
+    fi
+    ${TOOL_PREFIX}ranlib "${HOST_LIB_NAME}" 2>/dev/null || true
+
+    echo ""
+    echo "============================================"
+    echo "Host static library built: ${BUILD_DIR}/${HOST_LIB_NAME}"
+    echo "============================================"
+    ls -l "${HOST_LIB_NAME}"
+    echo ""
+    echo "host.cc defines no main(), so no ELF was linked. Provide your own main()"
+    echo "and link against this archive, e.g.:"
+    echo ""
+    # Same -L set and --start-group as the executable link below. All four are
+    # needed: -l${BAREMETAL_AIENGINE_LIB} lives in ALIB_LIB_DIR, the BSP libs in
+    # ARCH_APU_ALIB. Dropping either gives "cannot find -l...".
+    echo "    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -o app main.o \\"
+    echo "        ${BUILD_DIR}/${HOST_LIB_NAME} \\"
+    echo "        --specs=nosys.specs -Wl,--defsym,end=__bss_end__ \\"
+    echo "        -Wl,-T -Wl,${ARCH_APU_LD} \\"
+    echo "        -L\"${ALIB_LIB_DIR}\" \\"
+    echo "        -L\"${AIENGINE_LIB_DIR}\" \\"
+    echo "        -L\"${ARCH_APU_ALIB}\" \\"
+    echo "        -L\"${AIE_DRIVER_PARENT_DIR}/lib\" \\"
+    echo "        -Wl,--start-group,-lm,-l${BAREMETAL_AIENGINE_LIB},-lxil,-lgcc,-lc,-lstdc++,${LINK_EXTRA},--end-group"
+    echo ""
+    echo "NOTE: ${ALIB_LIB_DIR} is wiped and rebuilt on every aiehlc.sh run."
+    echo "      Copy lib${BAREMETAL_AIENGINE_LIB}.a elsewhere if you link later."
+    echo ""
+    echo "Entry points available in the archive:"
+    ${TOOL_PREFIX}nm --defined-only host.o 2>/dev/null | grep ' T ' | head -20 || true
+
+    # Publish next to the ELF the executable path would have produced, so
+    # callers have one predictable location to look in.
+    AOUT_DIR="$(dirname "${WORKLOCAL_DIR}")"
+    cp -f "${HOST_LIB_NAME}" "${AOUT_DIR}/${HOST_LIB_NAME}"
+    echo "Published: ${AOUT_DIR}/${HOST_LIB_NAME}"
+
+    cd "${_HOSTCOMPILE_ORIG_PWD}"
+    exit 0
+fi
+
 set -x
 # Link (same libs as aiehlc.sh baremetal host link: -L and -l for XAie_* and BSP)
 # --specs=nosys.specs provides stubs for _exit, _close, _fstat, etc. (baremetal/newlib)

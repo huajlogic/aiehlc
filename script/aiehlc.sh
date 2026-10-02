@@ -571,6 +571,15 @@ if [ -f "${HOST_BUILD_DIR}/worklocal/host.cc" ]; then
         cp -f "${TILING_BUILD_DIR}/host" "${HOST_BUILD_DIR}/main.elf"
         echo "Build complete (tiling mode)."
         echo "    ${HOST_BUILD_DIR}/main.elf"
+    else
+        # No ELF: an app source with no main() is archived into a static library
+        # by hostcompile.sh instead of linked. Report the .a so the build does not
+        # look like it silently produced nothing.
+        _tiling_lib="$(ls "${TILING_BUILD_DIR}"/*.a 2>/dev/null | head -1)"
+        if [ -n "${_tiling_lib}" ]; then
+            echo "Build complete (tiling mode, static library — host.cc has no main())."
+            echo "    ${_tiling_lib}"
+        fi
     fi
 
     # Generate the readable schedule view (schedule_view.json + host_schedule.html).

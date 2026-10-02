@@ -10,8 +10,7 @@
 // Declarative per-tile core trace: mesh/partition-relative (col,row) of the
 // compute tile to trace. Repeatable; supports ranges e.g. #pragma aie_trace(1:2, 3).
 // #pragma aie_trace((0, 3), (PARAMETER, "win_a"))
-#pragma CONTROL_PLAN_GROUP_REG_WRITE // enable use control pla nto gorup send config op
-#pragma control_plan_op_control_packet
+// #pragma CONTROL_PLAN_GROUP_REG_WRITE  // enable use control pla nto gorup send config op
 // #pragma control_plan_op_control_packet // enable control plan #1. reserve stream switch routing to cooperate with ir
 // #2. call control plan init in platform init
 #pragma aie_trace((0, 3), (STREAM, "s2mm", 1))
@@ -322,7 +321,7 @@ __global__ void mul2(aie::port<input_window_int8 *, RowBA> win_a, aie::port<inpu
 }
 
 // HOST
-int main() {
+int test_matmul(int argc) {
     printf("=== Matrix Multiply with Data Caching on AIE %dx%d Mesh ===\n", HW_ROWS, HW_COLS);
     printf("    C[%dx%d] = A[%dx%d] * B^T[%dx%d], int8\n", M, N, M, K, K, N);
     // --- Device + mesh ---
