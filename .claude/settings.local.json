@@ -41,7 +41,10 @@
       "Bash(awk -F: '{print $1}')",
       "Bash(grep -n 'I32:\\\\$\\\\|I32:\\\\\\\\$' td/dfscheduleop.td)",
       "Bash(awk '/class ConfigDmaBdOp /,/^};/' src/mlir/mlirfront/tilinglinalg/dataflowmap/dfschedule/inc/dfscheduleop.h.inc)",
-      "Bash(awk '/ConfigDmaBdOp::getODSOperandIndexAndLength/,/^}/' src/mlir/mlirfront/tilinglinalg/dataflowmap/dfschedule/inc/dfscheduleop.cc.inc)"
+      "Bash(awk '/ConfigDmaBdOp::getODSOperandIndexAndLength/,/^}/' src/mlir/mlirfront/tilinglinalg/dataflowmap/dfschedule/inc/dfscheduleop.cc.inc)",
+      "Read(//tmp/tvmllvm/**)",
+      "Bash(rm -rf *)",
+      "Bash(timeout 600 /scratch/staff/huaj/aiehlc/.venv/bin/cmake /scratch/staff/huaj/aiehlc/aiehlcopensource/aiehlchj/thirdparty/tvm-0.16 -DUSE_LLVM=/scratch/staff/huaj/llvm-project/build/bin/llvm-config -DCMAKE_BUILD_TYPE=Release)"
     ],
     "deny": []
   },

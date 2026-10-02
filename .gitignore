@@ -140,3 +140,6 @@ script/sim/build/
 
 # TVM 0.16 source build (src/frontend/tvmrelay/setup_tvm016.py)
 thirdparty/tvm-0.16/
+# Staged zlib/zstd headers + libxml2 stub for the LLVM-enabled TVM build
+# (stage_llvm_link_deps); machine-specific, regenerated on demand.
+thirdparty/.llvmdeps/

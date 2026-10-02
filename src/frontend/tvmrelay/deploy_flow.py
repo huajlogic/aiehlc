@@ -653,6 +653,30 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
                                        global_scale=global_scale,
                                        verbose=verbose)
         quantizer = "relay.quantize" if quantized else None
+    elif not llvm_status()[0]:
+        # DEGRADED PATH -- not the intended default. ONNX PTQ *is* the default
+        # and works fine; it needs an LLVM-enabled TVM, which this one is not.
+        #
+        # Importing the QDQ graph is what breaks: relay.frontend.from_onnx
+        # calls fold_constant() on EVERY node (onnx.py:6973 -> common.py:515),
+        # and folding a q/dq node JIT-executes it against the hardcoded "llvm"
+        # target, so the import dies with "target.build.llvm is not enabled".
+        # It is unreachable from Python (disabled_pass does not apply inside
+        # the frontend), and the fp32 model imports fine -- so the gate belongs
+        # here, before we spend minutes quantizing something we cannot import.
+        #
+        # Rebuilding TVM with LLVM is the fix, and _LLVM_HINT gives the exact
+        # command (including the stub-header workaround when the zlib/zstd/
+        # libxml2 dev packages are missing). Falling back to fp32 only avoids
+        # a crash; it does NOT produce the artifact this flow is meant to.
+        if verbose:
+            print(f"[3/7] int8   : SKIPPED -- this TVM has no LLVM "
+                  f"({llvm_status()[1]})")
+            print(_LLVM_HINT, end="")
+            print("[3/7]          FALLING BACK to fp32 -- stage 4 output is "
+                  "NOT int8. Rebuild TVM with LLVM (above) to get the "
+                  "default int8 path.")
+        mod, params = import_relay(model_path, verbose=verbose)
     else:
         # Default. Quantize in ONNX *before* Relay sees the graph, so the
         # import is already int8 -- including layer 0 and the input image,
