@@ -88,12 +88,51 @@ def parse_selection(spec) -> list:
     return out
 
 
+def _nchw(shape: list) -> tuple:
+    """Normalize a feature-map shape to ``(C, H, W)``, or ``None`` if we cannot.
+
+    Two layouts arrive here, because ``_layer_geometry`` reads the graph AFTER
+    ``relay.build`` has run ``AlterOpLayout``:
+
+        [N, C, H, W]          plain NCHW
+        [N, C/c, H, W, c]     NCHWc -- C split so the inner block vectorizes
+
+    The 5-D form is a *layout* artifact of TVM's x86 schedule, not a real fifth
+    spatial axis, so folding ``C = C_outer * c`` recovers the geometry aiehlc
+    wants. aiehlc's spatial spaces carry d1..d4 (``aiehlc.cc`` defines no
+    ``tdD5``), and the Gen5 DMA tops out at ``NumAddrDim`` 3 for the shim and
+    core tiles / 4 for the MemTile, so a genuine 5-D descriptor could not be
+    programmed anyway.
+
+    **``C_outer`` must be 1 for the fold to be more than arithmetic.** With
+    ``C_outer == 1`` the NCHWc buffer is byte-identical to HWC and aietensorop
+    can consume it as-is. With ``C_outer > 1`` the element count still matches
+    but the memory ORDER does not -- NCHWc interleaves as
+    ``(c_outer, h, w, c_inner)`` while the kernel reads ``(h, w, c)`` -- so
+    handing that buffer to the kernel computes against transposed channels and
+    silently produces wrong numbers. Verified both ways; this is the one case
+    that must not be waved through, so it returns None and the caller reports
+    the layer ineligible rather than offloading something it will get wrong.
+    """
+    if len(shape) == 4:
+        return shape[1], shape[2], shape[3]
+    if len(shape) == 5:
+        c_outer, h, w, c_inner = shape[1], shape[2], shape[3], shape[4]
+        if c_outer != 1:
+            return None
+        return c_outer * c_inner, h, w
+    return None
+
+
 def _layer_geometry(graph: dict, node_idx: int) -> dict:
     """Recover ``{H,W,Cin,Cout,K,stride}`` for a conv node from the graph JSON.
 
     The shapes are authoritative -- they come from TVM's own type inference --
     so nothing here has to re-derive convolution arithmetic. ``K`` and
     ``stride`` come from the weight shape and the input/output ratio.
+
+    Accepts both NCHW and NCHWc; see ``_nchw`` for why the 5-D case folds and
+    when it must not.
     """
     attrs = graph["attrs"]
     shapes = attrs["shape"][1]
@@ -101,17 +140,45 @@ def _layer_geometry(graph: dict, node_idx: int) -> dict:
     node = graph["nodes"][node_idx]
 
     in_eids = [row_ptr[src] + slot for src, slot, _ in node["inputs"]]
-    feat = shapes[in_eids[0]]                    # [N, Cin, H, W]
-    out = shapes[row_ptr[node_idx]]              # [N, Cout, OH, OW]
-    if len(feat) != 4 or len(out) != 4:
+    feat = _nchw(shapes[in_eids[0]])             # input  [N, Cin, H, W](c)
+    out = _nchw(shapes[row_ptr[node_idx]])       # output [N, Cout, OH, OW](c)
+    if feat is None or out is None:
         return {}
+    cin, h, w = feat
+    cout, oh, ow = out
+
+    # Weights are NCHWc-blocked too: [Co/c, Ci/c, KH, KW, ci, co] (6-D) next to
+    # the plain [Cout, Cin, KH, KW]. KH sits at index 2 in both.
     weight = shapes[in_eids[1]] if len(in_eids) > 1 else []
-    k = weight[2] if len(weight) == 4 else 0
-    stride = max(1, feat[2] // out[2]) if out[2] else 1
-    return {"H": feat[2], "W": feat[3], "Cin": feat[1], "Cout": out[1],
+    k = weight[2] if len(weight) in (4, 6) else 0
+    stride = max(1, h // oh) if oh else 1
+    return {"H": h, "W": w, "Cin": cin, "Cout": cout,
             "K": k, "stride": stride,
-            "in_elems": feat[1] * feat[2] * feat[3],
-            "out_elems": out[1] * out[2] * out[3]}
+            "in_elems": cin * h * w,
+            "out_elems": cout * oh * ow}
+
+
+def _geometry_reject_reason(graph: dict, node_idx: int) -> str:
+    """Say WHY the geometry was unusable. "not a conv2d" is wrong for NCHWc.
+
+    A blocked conv whose ``C_outer`` is > 1 IS a convolution -- it is just in a
+    channel order aietensorop cannot read directly -- and reporting it as "not
+    a conv2d" sends the reader looking in the wrong place entirely.
+    """
+    shapes = graph["attrs"]["shape"][1]
+    row_ptr = graph["node_row_ptr"]
+    node = graph["nodes"][node_idx]
+    in_eids = [row_ptr[src] + slot for src, slot, _ in node["inputs"]]
+    feat = shapes[in_eids[0]]
+    out = shapes[row_ptr[node_idx]]
+
+    for name, s in (("input", feat), ("output", out)):
+        if len(s) == 5 and s[1] != 1:
+            return (f"NCHWc {name} {s} has C_outer={s[1]} (> 1): the channel "
+                    f"block is interleaved, so the buffer is not the HWC order "
+                    f"aietensorop reads. Folding Cin={s[1]}*{s[4]} would give "
+                    f"the right size and the wrong data.")
+    return f"unsupported shapes: input {feat}, output {out} (want rank 4, or rank 5 with C_outer=1)"
 
 
 def select_layers(manifest: dict, graph: dict, indices=None,
@@ -160,7 +227,7 @@ def select_layers(manifest: dict, graph: dict, indices=None,
 
         geom = _layer_geometry(graph, call_nodes[idx])
         if not geom:
-            sel.update(eligible=False, reason="non-4D shapes; not a conv2d")
+            sel.update(eligible=False, reason=_geometry_reject_reason(graph, call_nodes[idx]))
             picked.append(sel)
             continue
         sel.update(eligible=True, **geom)

@@ -451,6 +451,40 @@ def quantize_int8(mod, params, *, global_scale: float = 8.0,
 #  Stage 4 — C codegen
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _collect_c_source(lib) -> str:
+    """Concatenate the C source of a module tree, not just the root.
+
+    ``lib.get_source()`` is enough for a plain ``target="c"`` build, but a BYOC
+    build returns a COMPOSITE module: the TVM kernels and each offloaded
+    subgraph's wrapper are separate child modules, and calling ``get_source()``
+    on the root raises
+
+        Module[const_loader] does not support GetSource
+
+    So walk ``imported_modules`` and take every child whose ``type_key`` is
+    ``"c"``. Without this the wrappers are silently missing from ``resnet18.c``
+    and the link fails on an undefined ``tvmgen_default_aie_main_*``.
+    """
+    seen, parts = set(), []
+
+    def walk(m):
+        if id(m) in seen:
+            return
+        seen.add(id(m))
+        if m.type_key == "c":
+            try:
+                parts.append(m.get_source())
+            except Exception:  # a "c" module that cannot emit is not fatal
+                pass
+        for child in getattr(m, "imported_modules", []):
+            walk(child)
+
+    walk(lib)
+    if not parts:  # non-composite build: the old path still applies
+        return lib.get_source()
+    return "\n".join(parts)
+
+
 def build_c(mod, params, out_dir: Path, *, opt_level: int = 3, fuse: bool = True,
             verbose: bool = True) -> Path:
     """``relay.build(target="c")`` and write the C source. Returns its path.
@@ -502,7 +536,7 @@ def build_c(mod, params, out_dir: Path, *, opt_level: int = 3, fuse: bool = True
         lib = relay.build(mod, target=tvm.target.Target("c", host="c"),
                           params=params)
 
-    source = lib.lib.get_source()
+    source = _collect_c_source(lib.lib)
     c_path = out_dir / "resnet18.c"
     c_path.write_text(source)
 
@@ -612,7 +646,7 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         aie_offload: bool = False, aie_layers=(0,),
         aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
         aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
-        relay_ptq: bool = False, verbose: bool = True) -> dict:
+        relay_ptq: bool = False, byoc_aie: int = 0, verbose: bool = True) -> dict:
     """Run all seven stages. Returns a dict of what happened.
 
     ``aie_offload`` turns on the aiegraph path for ``aie_layers`` (default
@@ -694,6 +728,20 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         mod = _ptq.to_integer_ops(mod, verbose=verbose)
         quantized = True
         quantizer = "onnx_ptq"
+
+    # BYOC: partition conv subgraphs out to the AIE backend before codegen.
+    # Must run BEFORE relay.build -- build internally applies AlterOpLayout,
+    # which rewrites nn.conv2d into 5-D contrib_conv2d_NCHWc that neither the
+    # pattern nor the kernel recognizes.
+    byoc = None
+    if byoc_aie:
+        from frontend.tvmrelay.byoc import aie_byoc
+
+        mod, byoc = aie_byoc.partition_for_aie(mod, n=byoc_aie, verbose=verbose)
+        if verbose:
+            print(f"[4/7] byoc   : {byoc.get('count', 0)} subgraph(s) offloaded "
+                  f"to AIE of {byoc.get('matched', 0)} matched "
+                  f"(--byoc-aie {byoc_aie})")
 
     c_path = build_c(mod, params, out_dir, fuse=fuse, verbose=verbose)
     compiles = verify_c(c_path, verbose=verbose)
@@ -851,6 +899,13 @@ def main(argv=None) -> int:
                          "partition: layers matching --aiegraph-ops go to the "
                          "aiehlc kernel backend, the rest reuse the TVM CPU C "
                          "(verdicts in layers/partition.json)")
+    ap.add_argument("--byoc-aie", type=int, nargs="?", const=1, default=0,
+                    metavar="N",
+                    help="offload the first N matching conv subgraphs to AIE "
+                         "via TVM BYOC (default: 0 = off; bare --byoc-aie "
+                         "means 1). Only the ResNet-18 stem geometry currently "
+                         "has a real kernel (libconv2dstem.a); other matches "
+                         "get a placeholder body")
     ap.add_argument("--relay-ptq", action="store_true",
                     help="quantize with relay.quantize instead of the default "
                          "ONNX PTQ: symmetric-only, leaves an fp32 head and "
@@ -897,7 +952,7 @@ def main(argv=None) -> int:
                  aie_ops=tuple(s.strip() for s in args.aie_ops.split(",")),
                  mesh=(rows, cols),
                  aiegraph=args.aiegraph, aiegraph_ops=aiegraph_ops,
-                 relay_ptq=args.relay_ptq)
+                 relay_ptq=args.relay_ptq, byoc_aie=args.byoc_aie)
     return 0 if result.get("ok") else 1
 
 

@@ -112,6 +112,61 @@ pybind: `build_aiegraph_module(ops)` (build+verify → textual IR) and
 `lower_aiegraph(mlir_text)` (walk → per-launch `tensor_specs`) in
 `aietriton_pybind.cpp`. Python entry: `_compiler.compile_plan(..., via_aiegraph=True)`.
 
+### PyTorch → PT2E int8 → MLIR (`src/frontend/pytorchmlir/`)
+
+A **second model-ingest frontend**, independent of TVM: torchvision ResNet-18
+**v1** → `torch.export` → PT2E int8 (`NPUQuantizer`, per-channel symmetric
+weights / affine activations) → `torch_mlir.fx` → torch dialect →
+linalg-on-tensors. **Scope ends at MLIR** — no aiegraph, no AIE backend.
+Needs no compiled TVM, so it coexists with `tvmrelay`.
+
+```bash
+PYTHONPATH=src python src/frontend/pytorchmlir/deploy_torch.py
+python src/frontend/pytorchmlir/setup_torchmlir.py --verify-only
+```
+
+Verified on torch 2.10.0 / torchvision 0.25.0 / torchao 0.18.0 /
+torch-mlir 20261001: 20 int8 convs + int8 fc, fp32-vs-int8 top-1 match with
+identical top-5 order. Details in
+**[src/frontend/pytorchmlir/README.md](src/frontend/pytorchmlir/README.md)**.
+
+Three non-obvious things, each of which silently misleads if forgotten:
+
+- **`0 fused *_q` is expected, not a failure.** torch-mlir registers
+  `quantized_decomposed.*` as native ODS ops, but `torch-match-quantized-custom-ops`
+  matches only the *unregistered* `torch.operator` spelling — so the matcher
+  never fires and no `!torch.qint8` appears. int8 still reaches linalg as
+  explicit `arith.extsi/subi/mulf` around `linalg.conv_2d_nchw_fchw`.
+- **`--output-type tosa` needs `--per-tensor`** — TOSA marks
+  `dequantize_per_channel` illegal with no lowering pattern.
+- **PT2E lives in `torchao`**, not `torch.ao` (deprecated, deletion planned).
+  All PT2E symbols resolve in `torch_deps.pt2e_api()`.
+- Do **not** reuse `example/model/resnet18py/resnet18.py:resnet18()` here — it
+  builds ResNet-18 **v2** from ONNX weights. Only `classify.preprocess` is shared.
+
+### TVM BYOC → AIE (`--byoc-aie`)
+
+A **third**, independent offload path, next to `--aie-offload` / `--aiegraph`:
+real Relay `MergeComposite` → `PartitionGraph` → `relay.ext.aie` codegen, so the
+offloaded subgraph is an ordinary `tvm_op` node and TVM's graph executor schedules
+it. Lives in `src/frontend/tvmrelay/byoc/` (`aie_patterns`, `aie_annotate`,
+`aie_codegen`, `aie_byoc`); design in **[doc/design/byoc_aie_plan.md](doc/design/byoc_aie_plan.md)**.
+
+Today it targets one op: the ResNet-18 stem conv, implemented by
+`src/aietensorop/conv2dstem/` (built to `libconv2dstem.a` via the library mode in
+skill **hostlibrarymode**). Default **off** (`--byoc-aie 0` is byte-identical to
+the CPU path).
+
+Non-obvious and each one silently wrong if broken — see skill **byocaieoffload**:
+the partitioned subgraph is the **raw int32 conv**, not the fused op (bias/
+requantize/ReLU stay outside in Relay, so `conv2d_stem_raw` is what gets called);
+the match shape is **230×230 with padding=0** because TVM hoists `nn.pad` out;
+the accumulator must be **int32** (int16 wraps on real weights — 41.6% of outputs
+wrong); per-channel quant params hide in the filter window's **pad channel**
+(a 4th `aie::port` is unproven, and appending bytes breaks `ColBC`); kernel-visible
+helpers must be **macros**, not `static inline`; and the link needs the BSP's
+`libxil.a` de-duplicated against `libxaienginea78.a`.
+
 ### Pass Pipeline
 
 **Shared stages** (produces dfscheblueprint IR, then module is cloned):
@@ -249,6 +304,8 @@ Read the matching skill when the task fits:
 | App source with no `main()` → static lib; "return-statement with a value, in function returning 'void'" | hostlibrarymode |
 | Pipeline "succeeds" but emits an EMPTY module (0 routing connections, no BCF/PRX → `Couldn't open aie2ps.prx`): `__global__` in a comment, or a prototype above the kernel | aiesourcetextrewrite |
 | `deploy_flow.py` emits fp32 instead of the default int8, `target.build.llvm is not enabled`, missing `onnx`, or stage-5 split silently skipped | tvmrelaynollvm |
+| PT2E int8 → torch-mlir yields no `!torch.qint8` / no `linalg.*_q` (fusion passes look like no-ops); TOSA "failed to legalize `dequantize_per_channel`"; `pip install torchvision` upgrading torch | torchmlirquantfusion |
+| TVM BYOC → AIE offload (`--byoc-aie`), conv2dstem int32/epilogue, duplicate `XAie_*` at link | byocaieoffload |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |
 | Kernel codegen | kernelcodegen |

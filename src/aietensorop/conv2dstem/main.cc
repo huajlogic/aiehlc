@@ -65,6 +65,27 @@ static void fill_inputs(int8_t *ifm, int8_t *wts) {
         wts[i] = (int8_t)((i % 3) - 1); // {-1, 0, 1}
 }
 
+// Quant params that make the epilogue an exact identity, so this smoke test
+// stays a pure convolution check and any difference points at the data path.
+//
+// With multiplier = 2^30 and shift = -1 the epilogue reduces to
+//   (acc * 2^30 + 2^29) >> 30  ==  acc
+// (verified exhaustively over acc in [-200, 200]). Only the final clamp to
+// [0, 255] then applies, so negative taps read back as 0.
+//
+// The REAL numerical validation is NOT here -- it is
+// src/aietensorop/conv2dstem/ref/verify_pack.c, which checks this library's
+// packing and epilogue against output produced from the actual ResNet-18
+// weights and cross-checked against TVM.
+static void fill_qparams(conv2dstem_qparam *qp) {
+    for (int f = 0; f < CONV2DSTEM_NUM_FILTERS; f++) {
+        qp[f].bias = 0;
+        qp[f].zero_point = 0;
+        qp[f].multiplier = 1 << 30; /* Q31 1.0 */
+        qp[f].shift = -1;           /* net shift of 30 cancels the Q31 scale */
+    }
+}
+
 int main() {
     printf("=== ResNet-18 stem conv2d on AIE ===\n");
     printf("    Input:  [%d, %d, %d]\n", CONV2DSTEM_INPUT_H, CONV2DSTEM_INPUT_W, CONV2DSTEM_INPUT_C);
@@ -76,29 +97,32 @@ int main() {
     // --- Allocate DMA-capable host memory ---
     int8_t *ifm = (int8_t *)__Runtime_Alloc(CONV2DSTEM_IFM_ELEMS * sizeof(int8_t));
     int8_t *wts = (int8_t *)__Runtime_Alloc(CONV2DSTEM_WTS_ELEMS * sizeof(int8_t));
-    int8_t *ofm = (int8_t *)__Runtime_Alloc(CONV2DSTEM_OFM_ELEMS * sizeof(int8_t));
-    if (!ifm || !wts || !ofm) {
+    uint8_t *ofm = (uint8_t *)__Runtime_Alloc(CONV2DSTEM_OFM_ELEMS * sizeof(uint8_t));
+    conv2dstem_qparam *qp = (conv2dstem_qparam *)__Runtime_Alloc(CONV2DSTEM_NUM_FILTERS * sizeof(conv2dstem_qparam));
+    if (!ifm || !wts || !ofm || !qp) {
         printf("ERROR: host buffer allocation failed.\n");
         // free(NULL) is a no-op, so an partial allocation still cleans up safely.
         free(ifm);
         free(wts);
         free(ofm);
+        free(qp);
         return 1;
     }
 
     fill_inputs(ifm, wts);
+    fill_qparams(qp);
 
     // --- Run on the AIE mesh ---
     // The library pads/repacks into its own staging buffers, programs the mesh,
     // and copies the result back into ofm.
 #if CONV2DSTEM_VERIFY
     printf("\n--- Running conv2d_stem (with CPU cross-check) ---\n");
-    int rc = conv2d_stem_verify(ifm, wts, ofm);
+    int rc = conv2d_stem_verify(ifm, wts, qp, ofm);
     if (rc > 0)
         printf("FAIL: %d mismatches against the CPU reference.\n", rc);
 #else
     printf("\n--- Running conv2d_stem ---\n");
-    int rc = conv2d_stem(ifm, wts, ofm);
+    int rc = conv2d_stem(ifm, wts, qp, ofm);
 #endif
 
     if (rc < 0) {
@@ -107,7 +131,7 @@ int main() {
         // Spot-print one output row of the f=0 plane so a run shows real data.
         printf("Output f=0, oh=0 (first 16 cols):\n  [");
         for (int ow = 0; ow < 16; ow++)
-            printf("%4d%s", ofm[(0 * CONV2DSTEM_OUTPUT_W + ow) * CONV2DSTEM_NUM_FILTERS + 0], ow < 15 ? "," : "");
+            printf("%4u%s", ofm[(0 * CONV2DSTEM_OUTPUT_W + ow) * CONV2DSTEM_NUM_FILTERS + 0], ow < 15 ? "," : "");
         printf("]\n");
     }
 
@@ -118,6 +142,7 @@ int main() {
     free(ifm);
     free(wts);
     free(ofm);
+    free(qp);
 
     printf("conv2dstem done (rc=%d).\n", rc);
     return rc;

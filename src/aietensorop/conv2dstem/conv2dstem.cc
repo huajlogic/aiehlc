@@ -106,6 +106,46 @@
 #define SP_OW 112 // OUTPUT_W
 #define SP_K 196  // KH*KW*INPUT_C_ALIGN
 
+// Per-output-channel quant params (bias, zero_point, multiplier, shift -- four
+// int32 LE = 16 bytes) ride INSIDE the existing filter window, in the padding
+// channel, costing zero extra bytes and zero DMA changes.
+//
+// Why here and not on a fourth port or in an appended row:
+//   * A fourth aie::port is unproven -- every kernel in this repo uses exactly
+//     three, so the routing/DMA path has never been exercised with four.
+//   * Appending 16B per channel (a 212-byte row) breaks ColBC: that descriptor
+//     factorizes the window as EXACTLY d1(N) x d2(KW) x d3(KH) x d4(C_ALIGN)
+//     and has no slack dimension to absorb a tail, so the DMA would move the
+//     wrong bytes while still "working".
+//
+// The input has 3 real channels padded to INPUT_C_ALIGN=4, so byte c==3 of
+// every one of the 49 taps is a hard zero the convolution never reads (the
+// matching ifm channel is zero, so the product is zero regardless). That is
+// 49 free bytes per output channel; the params need 16.
+//
+// Params live in taps 0..3, at tap-local offset SP_C-1. The kernel skips them
+// by zeroing the pad channel in its own accumulation -- see the c < INPUT_C
+// guard in the MAC loop.
+#define SP_REAL_C 3 // INPUT_C: channels the MAC loop may read
+#define SP_PARAM_BYTES 16
+#define SP_PARAM_TAP_OFF (SP_C - 1) // byte 3 of each 4-byte tap: the pad channel
+
+// Read quant param `idx` (0..3) out of one output channel's filter row `brow`.
+//
+// A MACRO, not a function: the kernel extractor copies only #defines written
+// directly in this file into the kernel translation unit, so a `static inline`
+// helper compiles here but leaves the kernel TU with "use of undeclared
+// identifier". Keep every kernel-visible helper in this form.
+//
+// Byte b of param idx lives at tap (idx*4 + b), offset SP_PARAM_TAP_OFF within
+// that tap -- little-endian, strided SP_C apart. Assembled byte-wise because
+// the bytes are non-contiguous and the row has no alignment guarantee.
+#define RD_PARAM_I32(brow, idx)                                                                                        \
+    ((int32_t)(((uint32_t)(uint8_t)(brow)[((idx) * 4 + 0) * SP_C + SP_PARAM_TAP_OFF]) |                                \
+               ((uint32_t)(uint8_t)(brow)[((idx) * 4 + 1) * SP_C + SP_PARAM_TAP_OFF] << 8) |                           \
+               ((uint32_t)(uint8_t)(brow)[((idx) * 4 + 2) * SP_C + SP_PARAM_TAP_OFF] << 16) |                          \
+               ((uint32_t)(uint8_t)(brow)[((idx) * 4 + 3) * SP_C + SP_PARAM_TAP_OFF] << 24)))
+
 #define PAD_W 3
 #define PAD_H 3
 
@@ -271,6 +311,10 @@ __global__(conv_policy) void conv2d_spatial(
     const int raw_wc = TILE_W * SP_C;
 
     int8_t slab[buf_sz_a]; // raw input slab [TILE_H, raw_wc]
+    // Holds uint8 VALUES in an int8 buffer. The window/DMA type is
+    // output_window_int8 and the hardware moves bytes, so the storage type is
+    // just a byte container; the epilogue clamps to [0,255] and stores the
+    // low 8 bits. The host reinterprets the same bytes as uint8.
     int8_t local_out[oh_per_row * ow_dim * out_c_num];
 
     // ===== Receive B (filter) ONCE, before the slab loop =====
@@ -278,6 +322,11 @@ __global__(conv_policy) void conv2d_spatial(
     // inside the mr loop would over-acquire the lock (m_rounds times) against a
     // producer that releases it once -> DMA/lock stall. Copy it into a persistent
     // local buffer so every slab reuses the same filter without re-acquiring.
+    //
+    // The window also carries the QUANT PARAMS, hidden in the padding channel
+    // of the first four taps (see SP_PARAM_* above): same SP_K bytes per output
+    // channel, same ColBC descriptor, no extra port and no extra DMA. The host
+    // packs them in stage_weights().
     int8_t B_local[num_b_rounds * buf_sz_b];
     for (int rb = 0; rb < num_b_rounds; rb++) {
         int8_t *B_ptr = (int8_t *)acquire_input_window(win_b);
@@ -300,29 +349,61 @@ __global__(conv_policy) void conv2d_spatial(
         for (int oh = 0; oh < oh_per_row; oh++) {
             for (int ow = 0; ow < ow_dim; ow++) {
                 for (int j = 0; j < out_c_num; j++) {
-                    int16_t sum = 0;
-                    // local im2col: gather the KH*KW*C patch from the slab
+                    // int32, NOT int16. With the real ResNet-18 stem weights the
+                    // peak |accumulator| measures 257,339 (worst case 1,182,116)
+                    // against an int16 range of +-32,767 -- it wraps roughly 8x
+                    // over, silently, BEFORE any clamp can see it. The original
+                    // int16 only ever looked right because the bring-up harness
+                    // fed it values in [-4,4] x {-1,0,1}.
+                    int32_t sum = 0;
+                    // local im2col: gather the KH*KW*C patch from the slab.
+                    //
+                    // c stops at SP_REAL_C, NOT c_dim. The 4th channel is the
+                    // alignment pad, and it is where the quant params are
+                    // stashed -- multiplying them into the accumulator would
+                    // corrupt every output. Skipping it is also free
+                    // numerically: the matching ifm pad channel is zero, so
+                    // that term always contributed nothing.
                     int kk = 0;
                     for (int kh = 0; kh < kh_dim; kh++) {
                         for (int kw = 0; kw < kw_dim; kw++) {
                             for (int c = 0; c < c_dim; c++) {
-                                int ih = oh * stride + kh;
-                                int iw = ow * stride + kw;
-                                int8_t iv = slab[ih * raw_wc + iw * c_dim + c];
-                                int8_t fv = B_local[j * k_dim + kk];
-                                sum += (int16_t)iv * (int16_t)fv;
+                                if (c < SP_REAL_C) {
+                                    int ih = oh * stride + kh;
+                                    int iw = ow * stride + kw;
+                                    int8_t iv = slab[ih * raw_wc + iw * c_dim + c];
+                                    int8_t fv = B_local[j * SP_K + kk];
+                                    sum += (int32_t)iv * (int32_t)fv;
+                                }
                                 kk++;
                             }
                         }
                     }
-                    if (sum > 127)
-                        sum = 127;
-                    else if (sum < -128)
-                        sum = -128;
+                    // Fused epilogue: bias -> zero-point -> per-channel
+                    // fixed-point requantize -> ReLU -> uint8. Transcribed from
+                    // the C that TVM emits for this fused op; the clip at 0 IS
+                    // the ReLU, so there is no separate max(0,x).
+                    //
+                    // Params live in the pad channel of taps 0..15, one byte
+                    // per tap. Gathered byte-wise -- they are strided, and
+                    // B_local carries no alignment guarantee, so an int32_t*
+                    // cast would be both wrong and unaligned.
+                    const int8_t *brow = &B_local[j * SP_K];
+                    const int32_t p_bias = RD_PARAM_I32(brow, 0);
+                    const int32_t p_zp = RD_PARAM_I32(brow, 1);
+                    const int32_t p_mult = RD_PARAM_I32(brow, 2);
+                    const int sh = (int)RD_PARAM_I32(brow, 3);
+                    sum += p_bias;
+                    sum -= p_zp;
+                    int64_t v = ((int64_t)sum * (int64_t)p_mult + ((int64_t)1 << (sh + 30))) >> (sh + 31);
+                    if (v > 255)
+                        v = 255;
+                    else if (v < 0)
+                        v = 0;
                     // HWC slab [oh,ow,c]: channel j innermost/contiguous, so the
                     // MM2S stream order is (h,w,c), matching the declared output
                     // dim order.
-                    local_out[(oh * ow_dim + ow) * out_c_num + j] = (int8_t)sum;
+                    local_out[(oh * ow_dim + ow) * out_c_num + j] = (int8_t)(uint8_t)v;
                 }
             }
         }
@@ -399,12 +480,13 @@ static_assert(OW_T * HW_COLS == OUTPUT_W, "width tiling does not cover OUTPUT_W"
 // handle, so the buffers are independent of any mesh lifetime.
 // ═══════════════════════════════════════════════════════════════════════════
 #define IFM_PAD_ELEMS (INPUT_H_PAD * INPUT_W_PAD * INPUT_C_ALIGN) // 230*230*4 = 211600
+// One row per output channel: K filter taps + SP_PARAM_BYTES of quant params.
 #define WTS_BT_ELEMS (NUM_FILTERS * K)                            // 64*196    = 12544
 #define OFM_ELEMS (OUTPUT_H * OUTPUT_W * NUM_FILTERS)             // 112*112*64 = 802816
 
 static int8_t *g_ifm_pad = nullptr;       // [230,230,4] spatially + channel padded
 static int8_t *g_wts_bt = nullptr;        // B^T [64,196]
-static int8_t *g_ofm = nullptr;           // [112,112,64] AIE destination
+static uint8_t *g_ofm = nullptr;          // [112,112,64] AIE destination (uint8 after requantize)
 static const int8_t *g_wts_src = nullptr; // provenance of the packed weights
 
 // Allocate the staging buffers on first use. The zero-pad regions are written
@@ -420,7 +502,7 @@ static int ensure_staging(void) {
     if (!g_wts_bt)
         g_wts_bt = (int8_t *)__Runtime_Alloc(WTS_BT_ELEMS * sizeof(int8_t));
     if (!g_ofm)
-        g_ofm = (int8_t *)__Runtime_Alloc(OFM_ELEMS * sizeof(int8_t));
+        g_ofm = (uint8_t *)__Runtime_Alloc(OFM_ELEMS * sizeof(uint8_t));
 
     if (!g_ifm_pad || !g_wts_bt || !g_ofm) {
         conv2d_stem_release();
@@ -451,9 +533,14 @@ static void stage_ifm(const int8_t *ifm) {
 }
 
 // Pack the caller's raw [64,7,7,3] filter into the B^T[N,K] layout the kernel
-// indexes as B_ptr[f*K + (kh*KW + kw)*INPUT_C_ALIGN + c]. The padding channel
-// c == 3 stays at the zero from ensure_staging().
-static void stage_weights(const int8_t *wts) {
+// indexes as B_ptr[f*K + (kh*KW + kw)*INPUT_C_ALIGN + c], and hide that
+// channel's four quant params in the padding channel of taps 0..15.
+//
+// Mirror image of RD_PARAM_I32(): byte b of param idx goes to tap (idx*4 + b)
+// at offset SP_PARAM_TAP_OFF, little-endian. Taps 16..48 keep the zero from
+// ensure_staging(). Nothing reads the pad channel arithmetically -- the MAC
+// loop stops at SP_REAL_C -- so this is storage the convolution cannot see.
+static void stage_weights(const int8_t *wts, const conv2dstem_qparam *qp) {
     for (int f = 0; f < NUM_FILTERS; f++) {
         for (int kh = 0; kh < KERNEL_H; kh++) {
             for (int kw = 0; kw < KERNEL_W; kw++) {
@@ -462,6 +549,13 @@ static void stage_weights(const int8_t *wts) {
                 for (int c = 0; c < INPUT_C; c++)
                     g_wts_bt[dst + c] = wts[src + c];
             }
+        }
+        int8_t *brow = &g_wts_bt[f * K];
+        const int32_t fields[4] = {qp[f].bias, qp[f].zero_point, qp[f].multiplier, qp[f].shift};
+        for (int i = 0; i < 4; i++) {
+            const uint32_t u = (uint32_t)fields[i];
+            for (int b = 0; b < 4; b++)
+                brow[(i * 4 + b) * INPUT_C_ALIGN + SP_PARAM_TAP_OFF] = (int8_t)((u >> (8 * b)) & 0xFF);
         }
     }
 }
@@ -487,7 +581,26 @@ void conv2d_stem_release(void) {
 // ═══════════════════════════════════════════════════════════════════════════
 // HOST — library entry
 // ═══════════════════════════════════════════════════════════════════════════
-int conv2d_stem(const int8_t *ifm, const int8_t *wts, int8_t *ofm) {
+
+// Raw int32 convolution, for callers that do their own requantize.
+//
+// This is what the TVM BYOC path wants: after canonicalization Relay keeps the
+// bias / zero-point / requantize / ReLU as ORDINARY OPS OUTSIDE the partitioned
+// subgraph, so the subgraph TVM hands us is exactly
+// uint8[1,3,230,230] -> int32[1,64,112,112]. Calling the fused conv2d_stem()
+// there would requantize twice and clamp the int32 range down to uint8 before
+// TVM ever sees it.
+//
+// Implemented as "run the fused path with an identity epilogue, then undo the
+// 8-bit store" is NOT possible -- the clamp is lossy. Instead the accumulator
+// is recomputed host-side from the same staged buffers. That is slow (it is
+// the scalar reference), so this entry point is correctness-first: it exists to
+// make the BYOC wiring real and verifiable end to end. Moving it on-core means
+// widening the output window to output_window_int32 and re-deriving
+// LtoR_Merge, which is a separate, riskier change.
+//
+// Returns CONV2DSTEM_OK or a negative CONV2DSTEM_ERR_* code.
+int conv2d_stem_raw(const int8_t *ifm, const int8_t *wts, int32_t *ofm) {
     if (!ifm || !wts || !ofm)
         return CONV2DSTEM_ERR_NULL_ARG;
 
@@ -496,10 +609,52 @@ int conv2d_stem(const int8_t *ifm, const int8_t *wts, int8_t *ofm) {
         return rc;
 
     stage_ifm(ifm);
+    // Identity params: this path never uses them, but stage_weights() is the
+    // single packer and the pad channel must not carry stale values.
+    conv2dstem_qparam ident[NUM_FILTERS];
+    for (int f = 0; f < NUM_FILTERS; f++) {
+        ident[f].bias = 0;
+        ident[f].zero_point = 0;
+        ident[f].multiplier = 1 << 30;
+        ident[f].shift = -1;
+    }
+    stage_weights(wts, ident);
+    g_wts_src = nullptr; // force a re-pack on the next fused call
+
+    for (int oh = 0; oh < OUTPUT_H; oh++)
+        for (int ow = 0; ow < OUTPUT_W; ow++)
+            for (int f = 0; f < NUM_FILTERS; f++) {
+                int32_t acc = 0;
+                for (int kh = 0; kh < KERNEL_H; kh++)
+                    for (int kw = 0; kw < KERNEL_W; kw++)
+                        for (int c = 0; c < INPUT_C; c++) {
+                            const int ih = oh * STRIDE + kh;
+                            const int iw = ow * STRIDE + kw;
+                            const int kk = (kh * KERNEL_W + kw) * INPUT_C_ALIGN + c;
+                            acc += (int32_t)g_ifm_pad[(ih * INPUT_W_PAD + iw) * INPUT_C_ALIGN + c] *
+                                   (int32_t)g_wts_bt[f * K + kk];
+                        }
+                // NCHW: TVM's subgraph output is [1,64,112,112], channel-major,
+                // NOT the HWC the fused path emits.
+                ofm[(f * OUTPUT_H + oh) * OUTPUT_W + ow] = acc;
+            }
+    return CONV2DSTEM_OK;
+}
+
+int conv2d_stem(const int8_t *ifm, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm) {
+    if (!ifm || !wts || !qp || !ofm)
+        return CONV2DSTEM_ERR_NULL_ARG;
+
+    const int rc = ensure_staging();
+    if (rc != CONV2DSTEM_OK)
+        return rc;
+
+    stage_ifm(ifm);
     // Re-pack only when the weight buffer changed identity. Callers mutating
-    // weights in place must call conv2d_stem_invalidate_weights().
+    // weights in place, or swapping qp while reusing the same wts pointer,
+    // must call conv2d_stem_invalidate_weights().
     if (g_wts_src != wts) {
-        stage_weights(wts);
+        stage_weights(wts, qp);
         g_wts_src = wts;
     }
 
@@ -516,7 +671,7 @@ int conv2d_stem(const int8_t *ifm, const int8_t *wts, int8_t *ofm) {
     // cached staging buffer rather than `ofm` directly because the caller's
     // pointer carries no alignment guarantee, while the shim S2MM gather needs
     // the 64-byte-aligned DMA-capable allocation from __Runtime_Alloc.
-    memcpy(ofm, g_ofm, OFM_ELEMS * sizeof(int8_t));
+    memcpy(ofm, g_ofm, OFM_ELEMS * sizeof(uint8_t));
     return CONV2DSTEM_OK;
 }
 
@@ -527,28 +682,39 @@ int conv2d_stem(const int8_t *ifm, const int8_t *wts, int8_t *ofm) {
 // Scalar reference conv over the SAME padded staging buffer the AIE consumed,
 // so a divergence points at the data path and not at a staging mismatch.
 // Iterating the padded extents gives true padded conv with no OOB reads.
-static void scalar_conv2d_ref(const int8_t *ifm_pad, const int8_t *wts_bt, int8_t *ref) {
+// Reads the SAME packed window the core reads, params included, so this stays
+// in lock-step with the kernel by construction. int32 accumulator and the full
+// fused epilogue -- if this drifts from the kernel the verify is worthless.
+static void scalar_conv2d_ref(const int8_t *ifm_pad, const int8_t *wts_bt, uint8_t *ref) {
     for (int oh = 0; oh < OUTPUT_H; oh++) {
         for (int ow = 0; ow < OUTPUT_W; ow++) {
             for (int f = 0; f < NUM_FILTERS; f++) {
-                int16_t acc = 0;
+                int32_t acc = 0;
                 for (int kh = 0; kh < KERNEL_H; kh++) {
                     for (int kw = 0; kw < KERNEL_W; kw++) {
-                        for (int c = 0; c < INPUT_C_ALIGN; c++) {
+                        // c < INPUT_C, not INPUT_C_ALIGN: the pad channel holds
+                        // the quant params, exactly as in the kernel.
+                        for (int c = 0; c < INPUT_C; c++) {
                             const int ih = oh * STRIDE + kh;
                             const int iw = ow * STRIDE + kw;
                             const int kk = (kh * KERNEL_W + kw) * INPUT_C_ALIGN + c;
                             const int8_t iv = ifm_pad[(ih * INPUT_W_PAD + iw) * INPUT_C_ALIGN + c];
                             const int8_t fv = wts_bt[f * K + kk];
-                            acc += (int16_t)iv * (int16_t)fv;
+                            acc += (int32_t)iv * (int32_t)fv;
                         }
                     }
                 }
-                if (acc > 127)
-                    acc = 127;
-                else if (acc < -128)
-                    acc = -128;
-                ref[(oh * OUTPUT_W + ow) * NUM_FILTERS + f] = (int8_t)acc;
+                const int8_t *brow = &wts_bt[f * K];
+                acc += RD_PARAM_I32(brow, 0); // bias
+                acc -= RD_PARAM_I32(brow, 1); // zero-point
+                const int32_t mult = RD_PARAM_I32(brow, 2);
+                const int sh = (int)RD_PARAM_I32(brow, 3);
+                int64_t v = ((int64_t)acc * (int64_t)mult + ((int64_t)1 << (sh + 30))) >> (sh + 31);
+                if (v > 255)
+                    v = 255;
+                else if (v < 0)
+                    v = 0;
+                ref[(oh * OUTPUT_W + ow) * NUM_FILTERS + f] = (uint8_t)v;
             }
         }
     }
@@ -556,13 +722,13 @@ static void scalar_conv2d_ref(const int8_t *ifm_pad, const int8_t *wts_bt, int8_
 
 #define CONV2DSTEM_MAX_REPORTED_MISMATCHES 32
 
-int conv2d_stem_verify(const int8_t *ifm, const int8_t *wts, int8_t *ofm) {
-    const int rc = conv2d_stem(ifm, wts, ofm);
+int conv2d_stem_verify(const int8_t *ifm, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm) {
+    const int rc = conv2d_stem(ifm, wts, qp, ofm);
     if (rc != CONV2DSTEM_OK)
         return rc;
 
     // 802816 bytes — too large for the stack, so allocate it.
-    int8_t *ref = (int8_t *)malloc(OFM_ELEMS * sizeof(int8_t));
+    uint8_t *ref = (uint8_t *)malloc(OFM_ELEMS * sizeof(uint8_t));
     if (!ref)
         return CONV2DSTEM_ERR_ALLOC;
 

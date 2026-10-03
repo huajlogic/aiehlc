@@ -655,15 +655,32 @@ KERNELS := {kernels}
 # -DAIE_GEN=5 picks its xiltimer.h branch, which is what this cortexa78 BSP
 # ships -- the default branch wants xtime_l.h, which the BSP does not have.
 CFLAGS  ?= -Os -mcpu=$(CPU) -std=c11 -DAIE_GEN=5 \\
-           -I. -I$(REPO)/include -I$(BSP)/include
+           -I. -I$(REPO)/include -I$(BSP)/include \\
+           -I$(REPO)/src/aietensorop/conv2dstem
+
+# AIE offload (--byoc-aie). AIE_LIB is libconv2dstem.a when stage 4 emitted a
+# BYOC wrapper, and empty otherwise, so a non-BYOC build links exactly as
+# before. The archive also pulls in the AIE runtime and the embedded kernel
+# ELF, hence the extra BSP/driver -L paths next to it.
+AIE_LIB  := {aie_lib}
+AIE_LDIRS := {aie_ldirs}
+AIE_EXTRA := {aie_extra}
+
+# AIE_LDIRS comes FIRST, before $(BSP)/lib. The BSP's libxil.a bundles a stale
+# copy of the aienginev2 driver (62 xaie*.obj members); build_hw_lib in
+# aiehlc.sh strips those from its own libxil.a in thirdparty/alib/lib and
+# treats the local aie-rt as authoritative. Searching the BSP first picks the
+# unstripped copy and the link dies with dozens of
+#   multiple definition of `XAie_UpdateNpiAddr'
+# Order matters here; this is not cosmetic.
 LDFLAGS := --specs=nosys.specs \\
            -Wl,--defsym,end=__bss_end__ \\
            -Wl,-T -Wl,$(LSCRIPT) \\
-           -L$(BSP)/lib
+           $(AIE_LDIRS) -L$(BSP)/lib
 # One unbroken token: the commas are -Wl separators, so a line continuation
 # here would split it into two arguments and ld would look for a library
 # literally named "-lxilstandalone,...".
-LDLIBS  := -Wl,--start-group,-lm,-lxil,-lgcc,-lc,-lxiltimer,-lxilstandalone,-lxilpm_ng,--end-group
+LDLIBS  := -Wl,--start-group,-lm,-lxil,-lgcc,-lc,-lxiltimer,-lxilstandalone,-lxilpm_ng$(AIE_EXTRA),--end-group
 
 SRCS := $(KERNELS) graph_driver.c tvm_runtime_shim.c main.c
 OBJS := $(notdir $(SRCS:.c=.o))
@@ -671,7 +688,7 @@ OBJS := $(notdir $(SRCS:.c=.o))
 all: main.elf
 
 main.elf: $(OBJS) weights.o
-\t$(CC) $(CFLAGS) -o $@ $(OBJS) weights.o $(LDFLAGS) $(LDLIBS)
+\t$(CC) $(CFLAGS) -o $@ $(OBJS) weights.o $(AIE_LIB) $(LDFLAGS) $(LDLIBS)
 \t@echo "built $@"
 \t@$(CROSS)size $@ 2>/dev/null || true
 
@@ -697,6 +714,86 @@ clean:
 """
 
 
+def _aie_link_vars(repo_root: Path, kernel_src: Path, build: Path) -> dict:
+    """Decide whether this ELF links against libconv2dstem.a, and stage its deps.
+
+    Keyed off the generated C actually calling into it, not off a flag: if the
+    BYOC wrapper is not in the source there is nothing to resolve, and linking
+    the archive anyway would drag the whole AIE runtime into a CPU-only build.
+
+    The archive is produced by
+        source script/aiehlc.sh --aie-version 5 \\
+            --runtime-source-file src/aietensorop/conv2dstem/conv2dstem.cc
+    and published to aout/.
+
+    Two things have to be staged, both because ``thirdparty/alib/lib`` is
+    volatile (every aiehlc.sh run wipes and repopulates it):
+
+      * ``libxaienginea78.a`` -- build_hw_lib builds the local aie-rt, strips
+        the stale aienginev2 members out of the BSP's libxil.a, and renames the
+        result to this. It is the authoritative AIE driver.
+      * A **de-duplicated copy of the BSP's libxil.a**. That archive still
+        carries 62 ``xaie*.obj`` members of its own, which collide with the 67
+        in libxaienginea78.a:
+            multiple definition of `XAie_UpdateNpiAddr'
+        Deleting them here mirrors exactly what build_hw_lib does to its own
+        copy, and leaves the rest of libxil.a (which the BSP needs) intact.
+    """
+    empty = {"aie_lib": "", "aie_ldirs": "", "aie_extra": ""}
+    try:
+        if "conv2d_stem_raw" not in kernel_src.read_text():
+            return empty
+    except OSError:
+        return empty
+
+    archive = repo_root / "aout" / "libconv2dstem.a"
+    alib = repo_root / "thirdparty" / "alib" / "lib"
+    hint = ("rebuild with `source script/aiehlc.sh --aie-version 5 "
+            "--runtime-source-file src/aietensorop/conv2dstem/conv2dstem.cc`")
+    if not archive.is_file():
+        print(f"  [arm] warning: the generated C calls conv2d_stem_raw but "
+              f"{archive} is missing -- {hint}")
+        return empty
+
+    staged = build / "aielib"
+    staged.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for lib in sorted(alib.glob("*.a")):
+        shutil.copy2(lib, staged / lib.name)
+        copied += 1
+    if not (staged / "libxaienginea78.a").is_file():
+        print(f"  [arm] warning: libxaienginea78.a not found in {alib} "
+              f"(it is wiped between runs) -- {hint}, then re-run this build "
+              f"in the SAME shell.")
+        return empty
+
+    # De-duplicate the BSP's libxil.a against the authoritative driver.
+    arch = repo_root / "thirdparty" / "arch" / "cortexa78_0"
+    bsp = _bsp_dir(arch)
+    ar = f"{os.environ.get('CROSS', 'aarch64-none-elf-')}ar"
+    src_xil = bsp / "lib" / "libxil.a"
+    if src_xil.is_file():
+        shutil.copy2(src_xil, staged / "libxil.a")
+        try:
+            members = subprocess.run([ar, "t", str(staged / "libxil.a")],
+                                     capture_output=True, text=True, check=True).stdout.split()
+            stale = [m for m in members if m.startswith("xaie")]
+            if stale:
+                subprocess.run([ar, "d", str(staged / "libxil.a"), *stale], check=True)
+                print(f"  [arm] stripped {len(stale)} stale xaie* members from the staged libxil.a")
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            print(f"  [arm] warning: could not de-duplicate libxil.a ({exc}); "
+                  f"expect `multiple definition of XAie_*` at link")
+    print(f"  [arm] staged {copied} AIE libs -> {staged}")
+
+    return {
+        "aie_lib": str(archive),
+        "aie_ldirs": f"-L{staged}",
+        # Leading comma: this is spliced inside an existing --start-group list.
+        "aie_extra": ",-lxaienginea78,-lstdc++",
+    }
+
+
 def write_makefile(build: Path, repo_root: Path, kernel_src: Path) -> Path:
     """Write the Makefile that actually builds the ELF. Returns its path.
 
@@ -712,6 +809,7 @@ def write_makefile(build: Path, repo_root: Path, kernel_src: Path) -> Path:
     text = _MAKEFILE_TMPL.format(
         repo=repo_root, arch=arch, bsp=bsp,
         kernels=kernel_src, kernel_rule=rule,
+        **_aie_link_vars(repo_root, kernel_src, build),
     )
     path = build / "Makefile"
     path.write_text(text)

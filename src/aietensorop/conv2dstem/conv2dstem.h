@@ -11,10 +11,16 @@
  * leak out, so a plain host translation unit (e.g. a TVM BYOC wrapper) can
  * include it without pulling the AIE toolchain's header set.
  *
- * Buffer contract (caller-facing, all int8, all row-major / HWC):
- *   ifm : [H=224][W=224][C=3]      raw, UNPADDED, channel-packed
- *   wts : [F=64][KH=7][KW=7][C=3]  raw, filter-major
- *   ofm : [OH=112][OW=112][F=64]   channel-fastest (HWC)
+ * The op is the FUSED one TVM emits, not a bare convolution: conv -> bias ->
+ * zero-point -> per-channel fixed-point requantize -> ReLU -> uint8. The clip
+ * at 0 is the ReLU. Max-pool is NOT part of it (in the Relay graph that is a
+ * separate op downstream), so this library must not pool.
+ *
+ * Buffer contract (caller-facing, all row-major / HWC):
+ *   ifm : [H=224][W=224][C=3]      int8,  raw, UNPADDED, channel-packed
+ *   wts : [F=64][KH=7][KW=7][C=3]  int8,  raw, filter-major
+ *   qp  : [F=64]                   per-output-channel quant params
+ *   ofm : [OH=112][OW=112][F=64]   uint8, channel-fastest (HWC)
  *
  * The AIE data path needs a spatially pre-padded, channel-aligned input
  * ([230,230,4]) and a B^T[64,196] filter. The library materializes both in its
@@ -26,6 +32,10 @@
 #define AIETENSOROP_CONV2DSTEM_H
 
 #include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* ── Geometry (ResNet-18 conv1) ─────────────────────────────────────────── */
 #define CONV2DSTEM_INPUT_H 224
@@ -52,24 +62,66 @@
 #define CONV2DSTEM_ERR_ALLOC (-2)
 
 /*
+ * Per-output-channel quantization parameters, one entry per filter.
+ *
+ * Applied on-core, after the int32 accumulator and before the uint8 store:
+ *
+ *   acc += bias; acc -= zero_point;
+ *   v = ((int64)acc * multiplier + (1LL << (shift+30))) >> (shift+31);
+ *   out = (uint8)clamp(v, 0, 255);          // clamp at 0 IS the ReLU
+ *
+ * This is TVM's `fixed_point_multiply_per_axis` lowering transcribed exactly,
+ * including the rounding term and the split shift. Feeding values from any
+ * other convention will produce plausible-looking but wrong pixels.
+ *
+ * NOTE the accumulator is int32 and must stay int32. With real ResNet-18 stem
+ * weights the peak |accumulator| measures 257,339 (worst case 1,182,116)
+ * against an int16 range of +-32,767.
+ */
+typedef struct {
+    int32_t bias;       /* folded BN beta, pre-requantize                 */
+    int32_t zero_point; /* input zero-point correction (0 for this model) */
+    int32_t multiplier; /* Q31 fixed-point multiplier                     */
+    int32_t shift;      /* right shift applied as (shift + 31)            */
+} conv2dstem_qparam;
+
+/*
  * Run the stem convolution on the AIE mesh.
  *
  * On the first call the library allocates its DMA-capable staging buffers and
- * packs `wts` into the B^T[64,196] layout the kernel consumes; both are reused
- * on later calls. Weights are re-packed only when `wts` differs from the
- * pointer seen on the previous call — if you mutate the weight buffer IN PLACE
- * at the same address, call conv2d_stem_invalidate_weights() first or the stale
- * packed copy will be used.
+ * packs `wts` + `qp` into the per-channel layout the kernel consumes (196
+ * filter taps then 16 bytes of params, per output channel); both are reused on
+ * later calls. Weights are re-packed only when `wts` differs from the pointer
+ * seen on the previous call — if you mutate the weight buffer IN PLACE at the
+ * same address, or change `qp` without changing `wts`, call
+ * conv2d_stem_invalidate_weights() first or the stale packed copy will be used.
  *
  * Not reentrant and not thread-safe: the staging buffers are process-global.
  *
  * Returns CONV2DSTEM_OK, or a negative CONV2DSTEM_ERR_* code.
  */
-int conv2d_stem(const int8_t *ifm, const int8_t *wts, int8_t *ofm);
+int conv2d_stem(const int8_t *ifm, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm);
+
+/*
+ * Raw int32 convolution — no bias, no requantize, no ReLU, no clamp.
+ *
+ * This is the entry point the TVM BYOC wrapper uses. After canonicalization
+ * Relay leaves the bias / zero-point / requantize / ReLU as ordinary ops
+ * OUTSIDE the partitioned subgraph, so what TVM asks for is exactly the bare
+ * accumulator. Calling conv2d_stem() there would apply the epilogue twice and
+ * clamp to uint8 before TVM's own requantize ever ran.
+ *
+ * `ofm` is NCHW [1][64][112][112] int32 — channel-major, matching the Relay
+ * subgraph's output type. Note this differs from conv2d_stem()'s HWC layout.
+ *
+ * Caller must size ofm for CONV2DSTEM_OFM_ELEMS int32 values.
+ */
+int conv2d_stem_raw(const int8_t *ifm, const int8_t *wts, int32_t *ofm);
 
 /*
  * Force the next conv2d_stem() call to re-pack the weight buffer. Use after
- * mutating weights in place at an address already seen by conv2d_stem().
+ * mutating weights in place at an address already seen by conv2d_stem(), or
+ * after changing `qp` while reusing the same `wts` pointer.
  */
 void conv2d_stem_invalidate_weights(void);
 
@@ -88,6 +140,10 @@ void conv2d_stem_release(void);
  * NOT part of the conv2d_stem() fast path. Returns the mismatch count (0 ==
  * bit-exact), or a negative CONV2DSTEM_ERR_* code if the AIE run itself failed.
  */
-int conv2d_stem_verify(const int8_t *ifm, const int8_t *wts, int8_t *ofm);
+int conv2d_stem_verify(const int8_t *ifm, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* AIETENSOROP_CONV2DSTEM_H */

@@ -44,7 +44,19 @@
       "Bash(awk '/ConfigDmaBdOp::getODSOperandIndexAndLength/,/^}/' src/mlir/mlirfront/tilinglinalg/dataflowmap/dfschedule/inc/dfscheduleop.cc.inc)",
       "Read(//tmp/tvmllvm/**)",
       "Bash(rm -rf *)",
-      "Bash(timeout 600 /scratch/staff/huaj/aiehlc/.venv/bin/cmake /scratch/staff/huaj/aiehlc/aiehlcopensource/aiehlchj/thirdparty/tvm-0.16 -DUSE_LLVM=/scratch/staff/huaj/llvm-project/build/bin/llvm-config -DCMAKE_BUILD_TYPE=Release)"
+      "Bash(timeout 600 /scratch/staff/huaj/aiehlc/.venv/bin/cmake /scratch/staff/huaj/aiehlc/aiehlcopensource/aiehlchj/thirdparty/tvm-0.16 -DUSE_LLVM=/scratch/staff/huaj/llvm-project/build/bin/llvm-config -DCMAKE_BUILD_TYPE=Release)",
+      "Bash(/scratch/staff/huaj/aiehlc/.venv/bin/python3 -m py_compile /scratch/staff/huaj/aiehlc/aiehlcopensource/aiehlchj/src/frontend/tvmrelay/byoc/*.py)",
+      "Read(//tmp/tmwheel/**)",
+      "Bash(timeout 120 python3 -c ' *)",
+      "Bash(timeout 60 python3 -c ' *)",
+      "Read(//tmp/**)",
+      "Bash(python3 -c \"import pybind11, sys; print\\('pybind11', pybind11.__version__, pybind11.get_cmake_dir\\(\\)\\)\")",
+      "Bash(timeout 180 python3 -c ' *)",
+      "Bash(timeout 90 python3 -m pip index versions torch)",
+      "Bash(timeout 60 curl -s https://download.pytorch.org/whl/cpu/torch/)",
+      "Bash(timeout 120 python3 -m pip download torchao --no-deps -d /tmp/taowheel -q)",
+      "Bash(gh api *)",
+      "Bash(timeout 90 python3 -c ' *)"
     ],
     "deny": []
   },
