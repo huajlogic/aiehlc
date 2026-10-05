@@ -35,8 +35,6 @@ from __future__ import annotations
 
 import atexit
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -174,11 +172,12 @@ def _require_emit_deps() -> None:
       * ``frontend.tvmrelay.kernels`` -- the kernel-body generator
         (``kernel_body_for()``), restored from the ``src/frontend/tvm/``
         package that ``05ee99d`` deleted.
-      * ``_aietriton_core`` -- the pybind module. cmake silently skips it unless
-        it finds python3-dev AND pybind11 (pass ``-Dpybind11_DIR``; the pip
-        install is not on cmake's search path). ``_core_dir()`` finds the
-        ``.so`` in the build tree, and it runs out of process (``_CoreProxy``)
-        because it cannot share a process with TVM (skill: mlirbuildsandbox).
+      * ``_aiebackend`` -- the AIE backend pybind module. cmake silently skips
+        it unless it finds python3-dev AND pybind11 (pass ``-Dpybind11_DIR``;
+        the pip install is not on cmake's search path). ``aie_backend()`` finds
+        the ``.so`` in the build tree and runs it out of process, because it
+        cannot share a process with TVM (skills: mlirbuildsandbox,
+        aiebackendtvmllvm).
 
     Raised up front, naming both, instead of letting a bare
     ``ModuleNotFoundError`` surface from an import several frames down. Layer
@@ -187,12 +186,9 @@ def _require_emit_deps() -> None:
     """
     missing = []
     try:
-        _core()
+        aie_backend()
     except Exception as exc:
-        missing.append(f"_aietriton_core ({type(exc).__name__}: {exc}) -- "
-                       f"configure with -Dpybind11_DIR=$(python3 -m pybind11 "
-                       f"--cmakedir), then `make _aietriton_core`; see skill "
-                       f"mlirbuildsandbox")
+        missing.append(f"AIE backend _aiebackend ({type(exc).__name__}: {exc})")
     try:
         from frontend.tvmrelay import kernels  # noqa: F401
     except Exception:
@@ -306,100 +302,32 @@ def select_layers(manifest: dict, graph: dict, indices=None,
 #  Offload
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _core_dir():
-    """Directory holding the built ``_aietriton_core*.so``, or ``None``.
+#: ``src/mlir/mlirfront/frontend`` -- parent of the ``aiebackend`` package.
+_MLIR_FRONTEND_DIR = (Path(__file__).resolve().parents[2]
+                      / "mlir" / "mlirfront" / "frontend")
 
-    ``pybind11_add_module`` writes the ``.so`` into the CMake BUILD tree, NOT
-    next to the sources, so the build directory has to be searched too --
-    otherwise a freshly built module is invisible and the only symptom is a
-    bare ``ModuleNotFoundError``. ``$AIEHLC_BUILD_DIR`` overrides the default
-    ``<repo>/build`` for out-of-tree builds.
+_BACKEND = None
+
+
+def aie_backend():
+    """The AIE backend (``_aiebackend``), running in a child process.
+
+    Returns an ``aiebackend.BackendProcess`` whose methods mirror the pybind
+    module (``build_aiegraph_module`` / ``lower_aiegraph`` /
+    ``run_aie_pipeline``). It is never imported in-process here: this package
+    always has TVM loaded, and TVM's LLVM and the backend's static LLVM abort on
+    duplicate command-line options (skill: aiebackendtvmllvm). Started once and
+    reused; closed at interpreter exit.
     """
-    repo = Path(__file__).resolve().parents[3]   # .../src/frontend/tvmrelay/<file>
-    rel = Path("src") / "mlir" / "mlirfront" / "frontend" / "aietriton"
-    env_build = os.environ.get("AIEHLC_BUILD_DIR")
-    candidates = [
-        Path(env_build) / rel if env_build else None,
-        repo / "build" / rel,          # the usual cmake build tree
-        repo / "build_claude" / rel,   # the repo's second configured tree
-        repo / rel,                    # an in-source / installed copy
-    ]
-    for pkg in candidates:
-        if pkg is not None and pkg.is_dir() and list(pkg.glob("_aietriton_core*.so")):
-            return pkg
-    return None
+    global _BACKEND
+    if _BACKEND is None:
+        if str(_MLIR_FRONTEND_DIR) not in sys.path:
+            sys.path.insert(0, str(_MLIR_FRONTEND_DIR))
+        import aiebackend
 
-
-class _CoreProxy:
-    """``_aietriton_core`` running in a child process (``aietriton_worker.py``).
-
-    It cannot be imported here: it statically links LLVM, TVM's ``libtvm.so``
-    carries another, and the two abort on duplicate LLVM command-line options
-    in either import order. Every ``frontend.tvmrelay`` import loads TVM, so the
-    module always runs out of process. Calls look the same as on the real
-    module -- ``proxy.run_aie_pipeline(...)`` -- with JSON-able args/results.
-    """
-
-    def __init__(self, so_dir: Path):
-        worker = Path(__file__).with_name("aietriton_worker.py")
-        self._proc = subprocess.Popen(
-            [sys.executable, str(worker), str(so_dir)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        hello = self._recv()
-        if not hello.get("ok"):
-            self.close()
-            raise ImportError(hello.get("error", "worker failed to start"))
-        self.__file__ = hello["result"]
-
-    def _recv(self) -> dict:
-        line = self._proc.stdout.readline()
-        if not line:
-            raise RuntimeError(f"aietriton_worker exited "
-                               f"(rc={self._proc.poll()}); see stderr above")
-        return json.loads(line)
-
-    def __getattr__(self, name):
-        if name.startswith("_"):
-            raise AttributeError(name)
-
-        def call(*args, **kwargs):
-            self._proc.stdin.write(json.dumps(
-                {"fn": name, "args": list(args), "kwargs": kwargs}) + "\n")
-            self._proc.stdin.flush()
-            reply = self._recv()
-            if not reply.get("ok"):
-                raise RuntimeError(f"_aietriton_core.{name}: {reply['error']}")
-            return reply["result"]
-        return call
-
-    def close(self) -> None:
-        if self._proc.poll() is None:
-            self._proc.stdin.close()
-            self._proc.wait()
-
-
-_CORE = None
-
-
-def _core():
-    """The ``_aietriton_core`` pybind extension, via an out-of-process proxy.
-
-    Despite the name there is nothing Triton-specific in it: it is the pybind
-    binding over ``TilingLinalgPipeline`` (``build_aiegraph_module`` /
-    ``lower_aiegraph`` / ``run_aie_pipeline``). It lives under the ``aietriton``
-    frontend because that was simply its first caller. See ``_CoreProxy`` for
-    why it is not imported in-process.
-    """
-    global _CORE
-    if _CORE is None:
-        so_dir = _core_dir()
-        if so_dir is None:
-            raise ModuleNotFoundError(
-                "no _aietriton_core*.so under build/, build_claude/, "
-                "$AIEHLC_BUILD_DIR or the source dir")
-        _CORE = _CoreProxy(so_dir)
-        atexit.register(_CORE.close)
-    return _CORE
+        _BACKEND = aiebackend.spawn()
+        atexit.register(_BACKEND.close)
+    return _BACKEND
 
 
 def build_aiegraph_ir(selections: list, func_name: str = "offload") -> str:
@@ -409,7 +337,7 @@ def build_aiegraph_ir(selections: list, func_name: str = "offload") -> str:
     the whole offloaded subgraph at once, and so the textual IR is a readable
     record of exactly what was handed to the backend.
     """
-    core = _core()
+    backend = aie_backend()
     ops = []
     for sel in selections:
         if not sel.get("eligible"):
@@ -428,7 +356,7 @@ def build_aiegraph_ir(selections: list, func_name: str = "offload") -> str:
         })
     if not ops:
         return ""
-    return core.build_aiegraph_module(ops, func_name)
+    return backend.build_aiegraph_module(ops, func_name)
 
 
 def offload_layers(out_dir, indices=None, op_kinds=AIE_OP_KINDS,
@@ -478,10 +406,10 @@ def offload_layers(out_dir, indices=None, op_kinds=AIE_OP_KINDS,
     if verbose:
         print(f"  [aie] aiegraph IR verified -> {ir_path.name}")
 
-    core = _core()
+    backend = aie_backend()
     from frontend.tvmrelay import kernels
 
-    launches = core.lower_aiegraph(ir)
+    launches = backend.lower_aiegraph(ir)
     built = []
     for sel, launch in zip(eligible, launches):
         layer_dir = layers_dir / (sel["dir"] or f"{sel['index']:02d}")
@@ -490,7 +418,7 @@ def offload_layers(out_dir, indices=None, op_kinds=AIE_OP_KINDS,
         specs = [(list(shape), int(bits), bool(is_in))
                  for (shape, bits, is_in) in launch["tensor_specs"]]
         body = kernels.kernel_body_for(sel["aie_op"], launch["func_name"])
-        ok = core.run_aie_pipeline(mesh[0], mesh[1], specs, str(aie_dir),
+        ok = backend.run_aie_pipeline(mesh[0], mesh[1], specs, str(aie_dir),
                                    body, launch["func_name"])
         produced = sorted(p.name for p in aie_dir.iterdir()) if ok else []
         built.append({"index": sel["index"], "dir": str(aie_dir), "ok": bool(ok),

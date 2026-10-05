@@ -6,7 +6,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include "tilinglinalg_pipeline.h"
-#include "aie_pass/kernel_body_emitter.h"
+#include "kernel_body_emitter.h"
 #include "aiegraphmanager.h"
 #include "lower/AiegraphLowerDriver.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
@@ -292,8 +292,8 @@ static py::list lower_aiegraph(const std::string &mlirText) {
     return result;
 }
 
-PYBIND11_MODULE(_aietriton_core, m) {
-    m.doc() = "AIE Triton pybind11 bindings to TilingLinalgPipeline";
+PYBIND11_MODULE(_aiebackend, m) {
+    m.doc() = "AIE backend: pybind11 bindings to TilingLinalgPipeline (shared by the Triton and TVM frontends)";
     m.def("run_aie_pipeline", &run_aie_pipeline, py::arg("mesh_rows"), py::arg("mesh_cols"), py::arg("tensor_specs"),
           py::arg("output_dir"), py::arg("user_kernel_body") = "", py::arg("user_kernel_func_name") = "",
           py::arg("split_specs") = std::vector<std::tuple<int, std::string, std::string>>{},

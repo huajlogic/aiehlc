@@ -77,7 +77,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from frontend.tvmrelay.aie_offload import _core
+from frontend.tvmrelay.aie_offload import aie_backend
 
 __all__ = ["AIEGRAPH_OP_KINDS", "DEFAULT_AIE_OPS", "build_nodes",
            "build_ir_ops", "partition_layers", "run_aiegraph"]
@@ -435,15 +435,15 @@ def run_aiegraph(out_dir, aie_ops=DEFAULT_AIE_OPS, mesh=(2, 2),
         return {"ok": False, "reason": "no layer mapped onto an aiegraph op",
                 "layers": verdicts}
 
-    core = _core()
-    ir = core.build_aiegraph_module(op_dicts, "resnet18")
+    backend = aie_backend()
+    ir = backend.build_aiegraph_module(op_dicts, "resnet18")
     ir_path = layers_dir / "aiegraph.mlir"
     ir_path.write_text(ir)
     if verbose:
         print(f"  [aiegraph] {len(op_dicts)} ops over {len(records)} layers, "
               f"verified -> {ir_path.name}")
 
-    built = _offload(core, ir, owners, verdicts, layers_dir, out_dir,
+    built = _offload(backend, ir, owners, verdicts, layers_dir, out_dir,
                      aie_ops, mesh, emit_aie, verbose)
 
     n_aie = sum(1 for v in verdicts if v["target"] == "aie")
@@ -455,7 +455,7 @@ def run_aiegraph(out_dir, aie_ops=DEFAULT_AIE_OPS, mesh=(2, 2),
     return result
 
 
-def _offload(core, ir: str, owners: list, verdicts: list, layers_dir: Path,
+def _offload(backend, ir: str, owners: list, verdicts: list, layers_dir: Path,
              out_dir: Path, aie_ops, mesh, emit_aie: bool,
              verbose: bool) -> list:
     """Run ``run_aie_pipeline`` for each AIE-bound layer. Returns build records.
@@ -478,7 +478,7 @@ def _offload(core, ir: str, owners: list, verdicts: list, layers_dir: Path,
     from frontend.tvmrelay import kernels
 
     aie_dirs = {v["node"]: v for v in verdicts if v["target"] == "aie"}
-    launches = core.lower_aiegraph(ir)
+    launches = backend.lower_aiegraph(ir)
     # The launches are matched to owners positionally, so a backend that ever
     # reorders or merges ops would misattribute every later layer. Fail loudly
     # instead: silent misattribution is the exact bug this module exists to
@@ -505,21 +505,21 @@ def _offload(core, ir: str, owners: list, verdicts: list, layers_dir: Path,
         aie_dir = layers_dir / stem / "aie"
         if rec["node"] in multi_op:
             aie_dir = aie_dir / launch["op"]
-        entry = _build_one(core, kernels, launch, rec, verdict, aie_dir,
+        entry = _build_one(backend, kernels, launch, rec, verdict, aie_dir,
                            out_dir, mesh, verbose)
         built.append(entry)
         done[key] = entry
     return built
 
 
-def _build_one(core, kernels, launch: dict, rec: dict, verdict: dict,
+def _build_one(backend, kernels, launch: dict, rec: dict, verdict: dict,
                aie_dir: Path, out_dir: Path, mesh, verbose: bool) -> dict:
     """Run ``run_aie_pipeline`` for one launch into *aie_dir*. Returns its record."""
     aie_dir.mkdir(parents=True, exist_ok=True)
     specs = [(list(shape), int(bits), bool(is_in))
              for (shape, bits, is_in) in launch["tensor_specs"]]
     body = kernels.kernel_body_for(launch["op"], launch["func_name"])
-    ok = core.run_aie_pipeline(mesh[0], mesh[1], specs, str(aie_dir), body,
+    ok = backend.run_aie_pipeline(mesh[0], mesh[1], specs, str(aie_dir), body,
                                launch["func_name"])
     produced = sorted(p.name for p in aie_dir.iterdir()) if ok else []
 

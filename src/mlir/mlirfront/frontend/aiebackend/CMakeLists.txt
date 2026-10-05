@@ -6,12 +6,12 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 find_package(pybind11 REQUIRED)
 
-pybind11_add_module(_aietriton_core
-    aietriton_pybind.cpp
-    aie_pass/kernel_body_emitter.cpp
+pybind11_add_module(_aiebackend
+    aiebackend_pybind.cpp
+    kernel_body_emitter.cpp
 )
 
-target_link_libraries(_aietriton_core PRIVATE
+target_link_libraries(_aiebackend PRIVATE
     mlirtestlib
     clangTooling
     clangBasic
@@ -48,7 +48,7 @@ target_link_libraries(_aietriton_core PRIVATE
     dl
 )
 
-target_include_directories(_aietriton_core PRIVATE
+target_include_directories(_aiebackend PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../tilinglinalg/pass/
     ${CMAKE_CURRENT_SOURCE_DIR}/../tilinglinalg/routing/inc/
@@ -83,7 +83,8 @@ target_include_directories(_aietriton_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../
 )
 
-target_link_options(_aietriton_core PRIVATE ${LLVM_LDFLAGS})
+target_link_options(_aiebackend PRIVATE ${LLVM_LDFLAGS})
 
-# Install the .so next to the Python package files
-install(TARGETS _aietriton_core DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
+# Install the .so next to the aiebackend Python package (aiebackend.find_module_dir
+# also searches the build tree, so this step is optional)
+install(TARGETS _aiebackend DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
