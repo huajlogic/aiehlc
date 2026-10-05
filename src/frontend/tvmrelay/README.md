@@ -238,30 +238,15 @@ kernel body, so `all` offloads 18 convs and reports the other 4 —
 `max_pool2d`, `global_avg_pool2d`, `dense_add`, `batch_flatten` — as skipped
 with the reason, rather than dropping them silently.
 
-### These layers do not fit a tile yet, and the flow says so
+### No tile-budget check — offload is blind
 
-```
-[aie] layer 00 conv2d_add_relu: 224x224x3 -> 64ch K7s2 | 495,768 B/tile vs 49,152 -- OVER BUDGET by 10.1x
-```
-
-`run_aie_pipeline` returns **True** for layer 0 and writes a full artifact set
-including `aieml.bcf`. It is still not runnable: the kernel body from
-`frontend.tvm.kernels` indexes `feat_in[ic*H*W + ih*W + iw]` across 150,528
-bytes while the pipeline hands it a **1,024-byte** ping-pong window — a 147×
-overrun, 784× on the output.
-
-Nothing in the existing pipeline catches this. The C++ budget check at
-`tilinglinalg_pipeline.cpp:602` iterates a `tensors` vector that neither pybind
-entry populates, so it prints `estimated 0 bytes per tile` and passes
-everything. `aie_offload.check_layer` therefore computes the real figure and
-every result carries a `feasible` flag.
-
-Generating the artifacts is still worth doing — it exercises the dialect, the
-routing, and the DMA config, and produces the `.bcf`. Making them *run* needs
-the spatial-halo tiling that `example/tileprogram/ccode/simpleconv2d.cc`
-already does at 224×224 through the Clang frontend, and that the pybind
-`DmaSpec` cannot currently request (it exposes 5 of `DmaAddressing`'s ~18
-fields and drops every halo field).
+The frontend hands every selected layer to aiehlc as-is and does **not** predict
+whether it fits a tile. Spatial tiling, halo, mesh partitioning and the per-tile
+memory budget belong to aiehlc, which reports what does not fit
+(`doc/design/byoc_aie_plan.md`). A Python-side estimate would duplicate — and
+drift from — the backend's own policy, so the former `check_layer` /
+`feasible` / "OVER BUDGET" report has been removed from both `aie_offload.py`
+and `aiegraph_partition.py`.
 
 ## `aiegraph_partition.py` — whole-graph lift, then AIE/CPU partition
 

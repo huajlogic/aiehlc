@@ -80,8 +80,8 @@ Seven stages, matching the seven things this flow has to prove:
    stem) are additionally lowered through the ``aiegraph`` dialect and
    ``run_aie_pipeline`` into ``layers/<NN_name>/aie/``. The C path and this
    APU ELF are produced either way -- verified byte-identical with the flag on
-   and off. See ``aie_offload.py``, including why layer 0's artifacts generate
-   but do not yet fit a tile.
+   and off. Offload is blind: no tile-budget check on this side -- tiling and
+   memory fit are aiehlc's job. See ``aie_offload.py``.
 
    **Whole-graph aiegraph** (``--aiegraph``) is the other way in, and differs
    in that it does not take a layer selection: it lifts the *entire* graph into
@@ -178,7 +178,7 @@ DEFAULT_OUT = Path("./worklocal/tvmrelay_deploy")
 #: Op kinds ``run_aie_pipeline`` has a kernel body for; everything else stays
 #: on the APU no matter what ``--aie-layers`` (or ``--aiegraph-ops``) asks for.
 #: This is the single list the ``--aiegraph`` partition is decided against --
-#: widen it only when the op gains both a ``frontend.tvm.kernels`` body and a
+#: widen it only when the op gains both a ``frontend.tvmrelay.kernels`` body and a
 #: runtime path, or the offload emits a kernel that does not compute the layer.
 AIE_OP_KINDS = ("conv_bn_relu", "conv_bn")
 
@@ -794,11 +794,6 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
                                       verbose=verbose)
             if verbose and not aie.get("ok"):
                 print(f"[6/7]          {aie.get('reason', 'offload failed')}")
-            elif verbose and aie.get("infeasible"):
-                print(f"[6/7]          {aie['infeasible']} layer(s) exceed tile "
-                      f"memory -- artifacts generated, but the kernel indexes "
-                      f"the whole feature map and the window is 4 KB; see "
-                      f"aie_offload.py")
 
     # Whole-graph aiegraph + AIE/CPU partition. Also additive: CPU layers keep
     # reusing the stage-5 C, and AIE layers keep theirs too so the ELF links.

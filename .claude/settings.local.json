@@ -56,7 +56,8 @@
       "Bash(timeout 60 curl -s https://download.pytorch.org/whl/cpu/torch/)",
       "Bash(timeout 120 python3 -m pip download torchao --no-deps -d /tmp/taowheel -q)",
       "Bash(gh api *)",
-      "Bash(timeout 90 python3 -c ' *)"
+      "Bash(timeout 90 python3 -c ' *)",
+      "Bash(/scratch/staff/huaj/aiehlc/.venv/bin/python3 -c ' *)"
     ],
     "deny": []
   },

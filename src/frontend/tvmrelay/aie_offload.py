@@ -24,39 +24,23 @@ filters by op kind, defaulting to the conv2d family because that is all
 ``run_aie_pipeline`` implements. Layer 0 is the default: it is the 7x7/s2 stem,
 the first thing to execute and the easiest to reason about.
 
-**Feasibility is checked and reported, not assumed.** ``run_aie_pipeline``
-returns True for ResNet-18's layer 0 and writes a complete artifact set -- but
-the generated kernel is the whole-feature-map loop nest from
-``frontend.tvm.kernels``, indexing ``feat_in[ic*H*W + ih*W + iw]`` over 150,528
-bytes, while the pipeline hands it a 1,024-byte ping-pong window. That is a
-147x overrun that no stage of the existing pipeline rejects: the C++ budget
-check at ``tilinglinalg_pipeline.cpp:602`` loops over a ``tensors`` vector that
-neither pybind entry populates, so it reports "estimated 0 bytes per tile" and
-passes everything.
-
-So ``check_layer`` computes the real numbers and every offload result carries a
-``feasible`` flag plus the arithmetic behind it. Generating the artifacts is
-useful -- it exercises the dialect, the routing, and the DMA config, and
-produces the ``.bcf`` -- but a layer this size needs the spatial-halo tiling
-that ``example/tileprogram/ccode/simpleconv2d.cc`` does through the Clang
-frontend and that the pybind ``DmaSpec`` cannot currently express (it exposes 5
-of ``DmaAddressing``'s ~18 fields and drops every halo field).
+**No tile-budget check here -- offload is blind by design.** Every selected
+layer is handed to aiehlc as-is; spatial tiling, halo, mesh partitioning and
+the per-tile memory budget are aiehlc's job, and it reports what does not fit.
+Predicting that from Python would duplicate (and drift from) the backend's own
+policy -- see ``doc/design/byoc_aie_plan.md``.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
-__all__ = ["select_layers", "check_layer", "offload_layers", "parse_selection"]
-
-#: AIE core tile data memory actually available for ping-pong buffers
-#: (``hwresource.h:116-118``: 64 KB total - 10 KB stack reserve).
-TILE_USABLE_BYTES = 49152
-
-#: Ping-pong depth the pipeline assumes (``tilinglinalg_pipeline.cpp:613``).
-PING_PONG_DEPTH = 2
+__all__ = ["select_layers", "offload_layers", "parse_selection"]
 
 #: Only the conv2d family has a kernel body + runtime path. Everything else in
 #: the graph stays on the APU regardless of what is selected.
@@ -104,22 +88,22 @@ def _nchw(shape: list) -> tuple:
     core tiles / 4 for the MemTile, so a genuine 5-D descriptor could not be
     programmed anyway.
 
-    **``C_outer`` must be 1 for the fold to be more than arithmetic.** With
-    ``C_outer == 1`` the NCHWc buffer is byte-identical to HWC and aietensorop
-    can consume it as-is. With ``C_outer > 1`` the element count still matches
-    but the memory ORDER does not -- NCHWc interleaves as
-    ``(c_outer, h, w, c_inner)`` while the kernel reads ``(h, w, c)`` -- so
-    handing that buffer to the kernel computes against transposed channels and
-    silently produces wrong numbers. Verified both ways; this is the one case
-    that must not be waved through, so it returns None and the caller reports
-    the layer ineligible rather than offloading something it will get wrong.
+    The fold is valid for SIZING unconditionally -- ``Cin = C_outer * c`` is the
+    true channel count either way, and that is all the callers here use it for
+    (``tensor_specs`` dims, never addressing).
+
+    It is NOT a statement about memory order. Only ``C_outer == 1`` makes the
+    NCHWc buffer byte-identical to the HWC that aietensorop reads; with
+    ``C_outer > 1`` the data interleaves as ``(c_outer, h, w, c_inner)`` and a
+    repack is required at the data-movement boundary or the kernel computes
+    against transposed channels. ``needs_repack`` in ``_layer_geometry`` carries
+    that fact forward so the emit path can act on it instead of rediscovering
+    it. Both cases verified empirically.
     """
     if len(shape) == 4:
         return shape[1], shape[2], shape[3]
     if len(shape) == 5:
         c_outer, h, w, c_inner = shape[1], shape[2], shape[3], shape[4]
-        if c_outer != 1:
-            return None
         return c_outer * c_inner, h, w
     return None
 
@@ -140,45 +124,97 @@ def _layer_geometry(graph: dict, node_idx: int) -> dict:
     node = graph["nodes"][node_idx]
 
     in_eids = [row_ptr[src] + slot for src, slot, _ in node["inputs"]]
-    feat = _nchw(shapes[in_eids[0]])             # input  [N, Cin, H, W](c)
-    out = _nchw(shapes[row_ptr[node_idx]])       # output [N, Cout, OH, OW](c)
+    raw_in = shapes[in_eids[0]]                  # input  [N, Cin, H, W](c)
+    raw_out = shapes[row_ptr[node_idx]]          # output [N, Cout, OH, OW](c)
+    feat = _nchw(raw_in)
+    out = _nchw(raw_out)
     if feat is None or out is None:
         return {}
     cin, h, w = feat
     cout, oh, ow = out
 
-    # Weights are NCHWc-blocked too: [Co/c, Ci/c, KH, KW, ci, co] (6-D) next to
-    # the plain [Cout, Cin, KH, KW]. KH sits at index 2 in both.
-    weight = shapes[in_eids[1]] if len(in_eids) > 1 else []
-    k = weight[2] if len(weight) in (4, 6) else 0
+    # Kernel size, from the weight tensor.
+    #
+    # Do NOT assume the weights are input[1]. In a fused residual block the
+    # second input is another feature map and the weights land at input[2]
+    # (e.g. [1,16,56,56,4], [1,16,56,56,4], [16,16,3,3,4,4]) -- indexing [1]
+    # blindly yields K=0 -- a kernel that does not exist. Identify it by RANK instead: weights are 4-D [Cout,Cin,KH,KW]
+    # or 6-D NCHWc-blocked [Co/c,Ci/c,KH,KW,ci,co]; feature maps are 4-D/5-D
+    # with a leading batch of 1, so require a non-1 leading dim to disambiguate
+    # the 4-D case. KH sits at index 2 in both weight forms.
+    k = 0
+    for eid in in_eids[1:]:
+        s = shapes[eid]
+        if len(s) == 6 or (len(s) == 4 and s[0] != 1):
+            k = s[2]
+            break
     stride = max(1, h // oh) if oh else 1
+
+    # Does the buffer need a channel repack before/after the AIE kernel?
+    # NCHWc with C_outer == 1 is already byte-identical to HWC; anything bigger
+    # interleaves and must be transposed at the data-movement boundary. Carried
+    # here so the emit path acts on it instead of rediscovering it.
+    def _blocked(s):
+        return len(s) == 5 and s[1] != 1
+
     return {"H": h, "W": w, "Cin": cin, "Cout": cout,
             "K": k, "stride": stride,
             "in_elems": cin * h * w,
-            "out_elems": cout * oh * ow}
+            "out_elems": cout * oh * ow,
+            "in_layout": "NCHWc" if len(raw_in) == 5 else "NCHW",
+            "out_layout": "NCHWc" if len(raw_out) == 5 else "NCHW",
+            "needs_repack": _blocked(raw_in) or _blocked(raw_out)}
+
+
+def _require_emit_deps() -> None:
+    """Fail with both missing names, before any of the emit work starts.
+
+    The emit path needs two things:
+
+      * ``frontend.tvmrelay.kernels`` -- the kernel-body generator
+        (``kernel_body_for()``), restored from the ``src/frontend/tvm/``
+        package that ``05ee99d`` deleted.
+      * ``_aietriton_core`` -- the pybind module. cmake silently skips it unless
+        it finds python3-dev AND pybind11 (pass ``-Dpybind11_DIR``; the pip
+        install is not on cmake's search path). ``_core_dir()`` finds the
+        ``.so`` in the build tree, and it runs out of process (``_CoreProxy``)
+        because it cannot share a process with TVM (skill: mlirbuildsandbox).
+
+    Raised up front, naming both, instead of letting a bare
+    ``ModuleNotFoundError`` surface from an import several frames down. Layer
+    selection runs before this and is useful on its own, so the caller still
+    sees it.
+    """
+    missing = []
+    try:
+        _core()
+    except Exception as exc:
+        missing.append(f"_aietriton_core ({type(exc).__name__}: {exc}) -- "
+                       f"configure with -Dpybind11_DIR=$(python3 -m pybind11 "
+                       f"--cmakedir), then `make _aietriton_core`; see skill "
+                       f"mlirbuildsandbox")
+    try:
+        from frontend.tvmrelay import kernels  # noqa: F401
+    except Exception:
+        missing.append("frontend.tvmrelay.kernels -- the kernel-body "
+                       "generator; --aie-offload cannot emit without it")
+    if missing:
+        raise RuntimeError(
+            "AIE emit unavailable: " + "; ".join(missing)
+            + ". Layer selection above still ran. "
+              "The working offload path today is --byoc-aie.")
 
 
 def _geometry_reject_reason(graph: dict, node_idx: int) -> str:
-    """Say WHY the geometry was unusable. "not a conv2d" is wrong for NCHWc.
-
-    A blocked conv whose ``C_outer`` is > 1 IS a convolution -- it is just in a
-    channel order aietensorop cannot read directly -- and reporting it as "not
-    a conv2d" sends the reader looking in the wrong place entirely.
-    """
+    """Say WHY the geometry was unusable, with the actual shapes."""
     shapes = graph["attrs"]["shape"][1]
     row_ptr = graph["node_row_ptr"]
     node = graph["nodes"][node_idx]
     in_eids = [row_ptr[src] + slot for src, slot, _ in node["inputs"]]
     feat = shapes[in_eids[0]]
     out = shapes[row_ptr[node_idx]]
-
-    for name, s in (("input", feat), ("output", out)):
-        if len(s) == 5 and s[1] != 1:
-            return (f"NCHWc {name} {s} has C_outer={s[1]} (> 1): the channel "
-                    f"block is interleaved, so the buffer is not the HWC order "
-                    f"aietensorop reads. Folding Cin={s[1]}*{s[4]} would give "
-                    f"the right size and the wrong data.")
-    return f"unsupported shapes: input {feat}, output {out} (want rank 4, or rank 5 with C_outer=1)"
+    return (f"unsupported shapes: input {feat}, output {out} "
+            f"(want rank 4 NCHW or rank 5 NCHWc)")
 
 
 def select_layers(manifest: dict, graph: dict, indices=None,
@@ -192,15 +228,44 @@ def select_layers(manifest: dict, graph: dict, indices=None,
     -- asking for a layer and getting nothing back with no explanation is the
     failure mode worth avoiding.
     """
-    # Graph nodes that are real kernel calls, in execution order -- the same
-    # order stage 5 numbered the folders in.
+    # Graph nodes that are real kernel calls, in execution order.
     call_nodes = [i for i, n in enumerate(graph["nodes"])
                   if n.get("op") == "tvm_op"
                   and n["attrs"].get("func_name") != "__nop"]
 
+    # Map manifest entry -> graph node by SYMBOL, not by position.
+    #
+    # `call_nodes[idx]` looks right and is not: the manifest has one entry per
+    # emitted C function while the graph has one node per CALL, and a function
+    # invoked twice appears once in the manifest and twice here. On ResNet-18
+    # that is 28 vs 30, and the two desynchronize from index 6 onward -- every
+    # later layer then gets another layer's geometry, silently. (The same bug
+    # is called out in aiegraph_partition.py's docstring.)
+    #
+    # Symbols repeat, so consume them in order: the n-th manifest entry naming
+    # a symbol takes the n-th graph node calling it.
+    by_symbol = {}
+    for ni in call_nodes:
+        by_symbol.setdefault(graph["nodes"][ni]["attrs"]["func_name"], []).append(ni)
+    taken = {}
+
+    def _node_for(entry):
+        sym = entry["symbol"]
+        nodes = by_symbol.get(sym, [])
+        seq = taken.get(sym, 0)
+        if seq >= len(nodes):
+            return None
+        taken[sym] = seq + 1
+        return nodes[seq]
+
     picked = []
     for entry in manifest["layers"]:
         idx = entry["index"]
+        # Claim this entry's graph node BEFORE the index filter. _node_for
+        # consumes repeated symbols in order, so skipping entries early would
+        # hand the next selected layer an earlier layer's node -- making the
+        # result depend on which --aie-layers were asked for.
+        node_idx = _node_for(entry)
         if indices is not None and idx not in indices:
             continue
         kind = entry.get("kind", "")
@@ -220,61 +285,121 @@ def select_layers(manifest: dict, graph: dict, indices=None,
                               f"(run_aie_pipeline implements {', '.join(op_kinds)})")
             picked.append(sel)
             continue
-        if idx >= len(call_nodes):
-            sel.update(eligible=False, reason="no matching graph node")
+        if node_idx is None:
+            sel.update(eligible=False,
+                       reason=f"no graph node calls {entry['symbol']!r}")
             picked.append(sel)
             continue
 
-        geom = _layer_geometry(graph, call_nodes[idx])
+        geom = _layer_geometry(graph, node_idx)
         if not geom:
-            sel.update(eligible=False, reason=_geometry_reject_reason(graph, call_nodes[idx]))
+            sel.update(eligible=False, reason=_geometry_reject_reason(graph, node_idx))
             picked.append(sel)
             continue
+        sel["node"] = node_idx
         sel.update(eligible=True, **geom)
         picked.append(sel)
     return picked
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Feasibility
-# ═══════════════════════════════════════════════════════════════════════════
-
-def check_layer(sel: dict, mesh=DEFAULT_MESH) -> dict:
-    """Does this layer's working set fit one AIE tile? Returns the arithmetic.
-
-    The params buffer is **not** split across the mesh -- every tile needs the
-    whole weight set -- so it is counted at full size while the feature and
-    output tensors are divided by the tile count.
-    """
-    tiles = max(1, mesh[0] * mesh[1])
-    param_elems = (CONFIG_SZ + sel["Cin"] * sel["Cout"] * sel["K"] ** 2
-                   + sel["Cout"] * 2)
-    per_tile = PING_PONG_DEPTH * (sel["in_elems"] // tiles + param_elems
-                                  + sel["out_elems"] // tiles)
-    return {"per_tile_bytes": per_tile, "budget_bytes": TILE_USABLE_BYTES,
-            "param_bytes": param_elems, "fits": per_tile <= TILE_USABLE_BYTES,
-            "overrun": per_tile / TILE_USABLE_BYTES}
-
-
-#: Conv param header: 6 uint16 fields (``frontend.tvm.model.CONFIG_SZ``).
-CONFIG_SZ = 12
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 #  Offload
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _core():
-    """Import the ``_aietriton_core`` pybind extension."""
-    pkg = Path(__file__).resolve().parents[1] / "mlir" / "mlirfront" / "frontend" / "aietriton"
-    if not pkg.is_dir():
-        pkg = (Path(__file__).resolve().parents[3] / "src" / "mlir" / "mlirfront"
-               / "frontend" / "aietriton")
-    if str(pkg) not in sys.path:
-        sys.path.insert(0, str(pkg))
-    import _aietriton_core  # noqa: F401
+def _core_dir():
+    """Directory holding the built ``_aietriton_core*.so``, or ``None``.
 
-    return _aietriton_core
+    ``pybind11_add_module`` writes the ``.so`` into the CMake BUILD tree, NOT
+    next to the sources, so the build directory has to be searched too --
+    otherwise a freshly built module is invisible and the only symptom is a
+    bare ``ModuleNotFoundError``. ``$AIEHLC_BUILD_DIR`` overrides the default
+    ``<repo>/build`` for out-of-tree builds.
+    """
+    repo = Path(__file__).resolve().parents[3]   # .../src/frontend/tvmrelay/<file>
+    rel = Path("src") / "mlir" / "mlirfront" / "frontend" / "aietriton"
+    env_build = os.environ.get("AIEHLC_BUILD_DIR")
+    candidates = [
+        Path(env_build) / rel if env_build else None,
+        repo / "build" / rel,          # the usual cmake build tree
+        repo / "build_claude" / rel,   # the repo's second configured tree
+        repo / rel,                    # an in-source / installed copy
+    ]
+    for pkg in candidates:
+        if pkg is not None and pkg.is_dir() and list(pkg.glob("_aietriton_core*.so")):
+            return pkg
+    return None
+
+
+class _CoreProxy:
+    """``_aietriton_core`` running in a child process (``aietriton_worker.py``).
+
+    It cannot be imported here: it statically links LLVM, TVM's ``libtvm.so``
+    carries another, and the two abort on duplicate LLVM command-line options
+    in either import order. Every ``frontend.tvmrelay`` import loads TVM, so the
+    module always runs out of process. Calls look the same as on the real
+    module -- ``proxy.run_aie_pipeline(...)`` -- with JSON-able args/results.
+    """
+
+    def __init__(self, so_dir: Path):
+        worker = Path(__file__).with_name("aietriton_worker.py")
+        self._proc = subprocess.Popen(
+            [sys.executable, str(worker), str(so_dir)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        hello = self._recv()
+        if not hello.get("ok"):
+            self.close()
+            raise ImportError(hello.get("error", "worker failed to start"))
+        self.__file__ = hello["result"]
+
+    def _recv(self) -> dict:
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError(f"aietriton_worker exited "
+                               f"(rc={self._proc.poll()}); see stderr above")
+        return json.loads(line)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        def call(*args, **kwargs):
+            self._proc.stdin.write(json.dumps(
+                {"fn": name, "args": list(args), "kwargs": kwargs}) + "\n")
+            self._proc.stdin.flush()
+            reply = self._recv()
+            if not reply.get("ok"):
+                raise RuntimeError(f"_aietriton_core.{name}: {reply['error']}")
+            return reply["result"]
+        return call
+
+    def close(self) -> None:
+        if self._proc.poll() is None:
+            self._proc.stdin.close()
+            self._proc.wait()
+
+
+_CORE = None
+
+
+def _core():
+    """The ``_aietriton_core`` pybind extension, via an out-of-process proxy.
+
+    Despite the name there is nothing Triton-specific in it: it is the pybind
+    binding over ``TilingLinalgPipeline`` (``build_aiegraph_module`` /
+    ``lower_aiegraph`` / ``run_aie_pipeline``). It lives under the ``aietriton``
+    frontend because that was simply its first caller. See ``_CoreProxy`` for
+    why it is not imported in-process.
+    """
+    global _CORE
+    if _CORE is None:
+        so_dir = _core_dir()
+        if so_dir is None:
+            raise ModuleNotFoundError(
+                "no _aietriton_core*.so under build/, build_claude/, "
+                "$AIEHLC_BUILD_DIR or the source dir")
+        _CORE = _CoreProxy(so_dir)
+        atexit.register(_CORE.close)
+    return _CORE
 
 
 def build_aiegraph_ir(selections: list, func_name: str = "offload") -> str:
@@ -338,18 +463,14 @@ def offload_layers(out_dir, indices=None, op_kinds=AIE_OP_KINDS,
         return {"ok": False, "reason": "no eligible layers selected",
                 "selections": selections}
 
-    # Feasibility first: report before spending time in the backend.
-    for sel in eligible:
-        sel["check"] = check_layer(sel, mesh)
-        if verbose:
-            chk = sel["check"]
-            verdict = ("fits" if chk["fits"]
-                       else f"OVER BUDGET by {chk['overrun']:.1f}x")
+    # No budget check: tiling and memory fit are aiehlc's call (module doc).
+    if verbose:
+        for sel in eligible:
             print(f"  [aie] layer {sel['index']:02d} {sel['kind']}: "
                   f"{sel['H']}x{sel['W']}x{sel['Cin']} -> {sel['Cout']}ch "
-                  f"K{sel['K']}s{sel['stride']} | "
-                  f"{chk['per_tile_bytes']:,} B/tile vs "
-                  f"{chk['budget_bytes']:,} -- {verdict}")
+                  f"K{sel['K']}s{sel['stride']}")
+
+    _require_emit_deps()
 
     ir = build_aiegraph_ir(eligible)
     ir_path = layers_dir / "aiegraph.mlir"
@@ -358,7 +479,7 @@ def offload_layers(out_dir, indices=None, op_kinds=AIE_OP_KINDS,
         print(f"  [aie] aiegraph IR verified -> {ir_path.name}")
 
     core = _core()
-    from frontend.tvm import kernels
+    from frontend.tvmrelay import kernels
 
     launches = core.lower_aiegraph(ir)
     built = []
@@ -373,15 +494,11 @@ def offload_layers(out_dir, indices=None, op_kinds=AIE_OP_KINDS,
                                    body, launch["func_name"])
         produced = sorted(p.name for p in aie_dir.iterdir()) if ok else []
         built.append({"index": sel["index"], "dir": str(aie_dir), "ok": bool(ok),
-                      "func_name": launch["func_name"], "files": produced,
-                      "feasible": sel["check"]["fits"],
-                      "per_tile_bytes": sel["check"]["per_tile_bytes"]})
+                      "func_name": launch["func_name"], "files": produced})
         if verbose:
             print(f"  [aie] layer {sel['index']:02d} -> {aie_dir.relative_to(out_dir)}/ "
                   f"({len(produced)} files: {', '.join(produced[:4])}"
                   f"{', ...' if len(produced) > 4 else ''})")
 
-    infeasible = [b for b in built if not b["feasible"]]
     return {"ok": all(b["ok"] for b in built), "ir": str(ir_path),
-            "layers": built, "selections": selections,
-            "infeasible": len(infeasible)}
+            "layers": built, "selections": selections}

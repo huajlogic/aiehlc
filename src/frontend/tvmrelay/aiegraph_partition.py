@@ -77,7 +77,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from frontend.tvmrelay.aie_offload import CONFIG_SZ, check_layer, _core
+from frontend.tvmrelay.aie_offload import _core
 
 __all__ = ["AIEGRAPH_OP_KINDS", "DEFAULT_AIE_OPS", "build_nodes",
            "build_ir_ops", "partition_layers", "run_aiegraph"]
@@ -87,7 +87,7 @@ AIEGRAPH_OP_KINDS = ("conv_bn_relu", "conv_bn", "residual_add_relu",
                      "avgpool_fc")
 
 #: Ops actually offloaded to the aiehlc kernel backend. Only the conv2d family
-#: has a kernel body in ``frontend.tvm.kernels`` and a ``run_aie_pipeline``
+#: has a kernel body in ``frontend.tvmrelay.kernels`` and a ``run_aie_pipeline``
 #: path; the rest reuse TVM's CPU C.
 DEFAULT_AIE_OPS = ("conv_bn_relu", "conv_bn")
 
@@ -475,7 +475,7 @@ def _offload(core, ir: str, owners: list, verdicts: list, layers_dir: Path,
     """
     if not emit_aie:
         return []
-    from frontend.tvm import kernels
+    from frontend.tvmrelay import kernels
 
     aie_dirs = {v["node"]: v for v in verdicts if v["target"] == "aie"}
     launches = core.lower_aiegraph(ir)
@@ -521,29 +521,17 @@ def _build_one(core, kernels, launch: dict, rec: dict, verdict: dict,
     body = kernels.kernel_body_for(launch["op"], launch["func_name"])
     ok = core.run_aie_pipeline(mesh[0], mesh[1], specs, str(aie_dir), body,
                                launch["func_name"])
-    # check_layer sizes a *convolution* working set (Cin*Cout*K^2 weights), so
-    # it only describes the conv-family launches; an elementwise op has no
-    # weights and would be reported against the wrong formula.
-    check = (check_layer(rec, mesh)
-             if launch["op"] in ("conv_bn", "conv_bn_relu") else None)
     produced = sorted(p.name for p in aie_dir.iterdir()) if ok else []
 
     if verbose:
-        if check is None:
-            budget = "elementwise -- no conv working-set estimate"
-        else:
-            fit = "fits" if check["fits"] else f"OVER {check['overrun']:.0f}x"
-            budget = f"{check['per_tile_bytes']:,} B/tile -- {fit}"
         print(f"  [aiegraph] layer {verdict['index']:02d} {verdict['kind']}"
               f" -> {launch['op']} -> {aie_dir.relative_to(out_dir)}/ "
-              f"({len(produced)} files, {budget})")
+              f"({len(produced)} files)")
 
     return {"index": verdict["index"], "node": rec["node"],
             "dir": str(aie_dir.relative_to(out_dir)), "ok": bool(ok),
             "op": launch["op"], "func_name": launch["func_name"],
-            "files": produced,
-            "feasible": check["fits"] if check else None,
-            "per_tile_bytes": check["per_tile_bytes"] if check else None}
+            "files": produced}
 
 
 def _write_partition(layers_dir: Path, result: dict, verbose: bool) -> Path:
@@ -564,7 +552,6 @@ def _write_partition(layers_dir: Path, result: dict, verbose: bool) -> Path:
             "aiegraph": v["aiegraph"], "target": v["target"],
             "reason": v["verdict_reason"],
             "aie_dir": built["dir"] if built else None,
-            "feasible": built["feasible"] if built else None,
         })
     # Counts are over graph *invocations*, so two nodes sharing a symbol count
     # twice -- that is the honest number for "how much of the network runs on
