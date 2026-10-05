@@ -76,6 +76,13 @@ typedef enum { RT_RES_GEN1 = 1, RT_RES_GEN2 = 2, RT_RES_GEN5 = 5 } rt_res_gen;
 #define RT_RES_CTRL_ACK_BD_LO 12
 #define RT_RES_CTRL_ACK_BD_HI 14
 
+#define RT_RES_SHIMROW_CH 1
+#define RT_RES_SHIMROW_BD_LO 7
+#define RT_RES_SHIMROW_BD_HI 11
+#define RT_RES_SHIMROW_ACK_BD 15
+#define RT_RES_SHIMROW_MAX_COLS (RT_RES_SHIMROW_BD_HI - RT_RES_SHIMROW_BD_LO + 1)
+#define RT_RES_SHIMROW_PORT 0
+
 /* Sentinel for the fields that do not apply to a given entry. */
 #define RT_RES_NA 0xFF
 

@@ -175,6 +175,8 @@ struct ConversionState {
     std::string controlKernelFabric;
     int32_t controlMm2sCh = 0;
     bool controlExclusive = false;
+    bool shimBdCtrl = false;
+    bool shimBdCommitted = false;
     int ctrlDataIndex = 0; // unique suffix for emitted __ctrl_data_N[] arrays
 
     // Configured row indices of each group_reg_write's fabric (from the fabric's
@@ -1935,6 +1937,10 @@ struct ScheduleWaitInnerPattern : public OpConversionPattern<dfschedule::Schedul
         // Create comment showing what we're waiting for
         std::string comment = "/* Wait for " + std::to_string(events.size()) + " event(s) */";
         rewriter.create<emitc::VerbatimOp>(loc, comment);
+        if (state.shimBdCtrl && !state.shimBdCommitted) {
+            rewriter.create<emitc::VerbatimOp>(loc, "__Runtime_ctrl_shim_bd_commit();");
+            state.shimBdCommitted = true;
+        }
 
         // Create __Runtime_wait call for each event (C++ overloads dispatch event vs ioevent)
         for (auto eventVal : events) {
@@ -2118,6 +2124,9 @@ struct LaunchKernelGroupInnerPattern : public OpConversionPattern<dfschedule::La
         }
         auto launchCall = rewriter.create<emitc::CallOpaqueOp>(loc, eventType, launchName, nullptr, nullptr,
                                                                launchOperands);
+        if (state.shimBdCtrl)
+            rewriter.create<emitc::VerbatimOp>(loc, "__Runtime_ctrl_shim_bd_begin(&" + state.controlKernelFabric +
+                                                        ");");
 
         llvm::errs() << "  ✓ Created __Runtime_launch_kernel_group call\n";
         
@@ -3194,6 +3203,8 @@ void DfscheduleToApiPass::runOnOperation() {
         state.controlMm2sCh = static_cast<int32_t>(attr.getInt());
     if (auto attr = moduleOp->getAttrOfType<IntegerAttr>("routing.control_plan_exclusive"))
         state.controlExclusive = attr.getInt() != 0;
+    if (auto attr = moduleOp->getAttrOfType<IntegerAttr>("routing.control_plan_shim_bd_ctrl"))
+        state.shimBdCtrl = state.controlKernelOps && attr.getInt() != 0;
 
     // Load the (col,row,lock_id) triples that GroupRegWritePass coalesced into
     // control-packet group writes; their individual XAie_LockSetValue emission is

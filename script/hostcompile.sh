@@ -470,6 +470,28 @@ else
     echo "Skipping aie_runtime_resource.c (aie_runtime_resource.o exists; pass 'rebuild' or '-rebuild' to force)"
 fi
 
+if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_ctrlpkt_encode.o ]; then
+    echo "Compiling aie_ctrlpkt_encode.c..."
+    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_ctrlpkt_encode.c" -o aie_ctrlpkt_encode.o
+    if [ $? -ne 0 ]; then
+        echo "Error: failed to compile aie_ctrlpkt_encode.c"
+        exit 1
+    fi
+else
+    echo "Skipping aie_ctrlpkt_encode.c (aie_ctrlpkt_encode.o exists; pass 'rebuild' or '-rebuild' to force)"
+fi
+
+if [ "${REBUILD}" -eq 1 ] || [ ! -f aie_runtime_xaie_seq.o ]; then
+    echo "Compiling aie_runtime_xaie_seq.c..."
+    ${TOOL_PREFIX}g++ ${OPT_FLAGS} -std=c++17 ${DEFS} ${INCLUDE_OPTS} ${compiler_cpu_flag} -c "${AIEHLC_ROOT}/src/mlir/runtime/aie_runtime_xaie_seq.c" -o aie_runtime_xaie_seq.o
+    if [ $? -ne 0 ]; then
+        echo "Error: failed to compile aie_runtime_xaie_seq.c"
+        exit 1
+    fi
+else
+    echo "Skipping aie_runtime_xaie_seq.c (aie_runtime_xaie_seq.o exists; pass 'rebuild' or '-rebuild' to force)"
+fi
+
 # Compile routing.cc (if present)
 ROUTING_OBJ=""
 if [ "${HAS_ROUTING}" -eq 1 ]; then
@@ -490,7 +512,7 @@ set -x
 # --specs=nosys.specs provides stubs for _exit, _close, _fstat, etc. (baremetal/newlib)
 # -Wl,--defsym,end=__bss_end__ defines 'end' for newlib _sbrk (lscript.ld defines __bss_end__)
 echo "Linking host (with embedded kernel binary)..."
-${TOOL_PREFIX}g++ ${OPT_FLAGS} -o host host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o aie_runtime_control_plan.o aie_runtime_resource.o ${ROUTING_OBJ} ${KERNEL_OBJ_LIST} \
+${TOOL_PREFIX}g++ ${OPT_FLAGS} -o host host.o aie_runtime.o aie_runtime_debug.o aie_runtime_stream_debug.o aie_runtime_common.o aie_runtime_control_plan.o aie_runtime_resource.o aie_ctrlpkt_encode.o aie_runtime_xaie_seq.o ${ROUTING_OBJ} ${KERNEL_OBJ_LIST} \
     --specs=nosys.specs \
     -Wl,--defsym,end=__bss_end__ \
     -Wl,-T -Wl,${ARCH_APU_LD} \

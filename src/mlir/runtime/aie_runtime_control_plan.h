@@ -184,4 +184,11 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
  * RET_NORTH slot and drives SOUTH->VRET with {local, transit} only (nothing
  * descends from above the top head). */
 acr_rc acr_plan_return_chain(acr_oplist *o, acr_portbook *b, uint8_t row, uint8_t col_lo, uint8_t col_hi, int is_top);
+
+#define ACR_SHIMROW_SLOT_OWN 0
+#define ACR_SHIMROW_SLOT_FWD 1
+#define ACR_SHIMROW_MSEL_OWN 0
+#define ACR_SHIMROW_MSEL_FWD 1
+uint8_t acr_shim_row_id(uint8_t k);
+acr_rc acr_plan_shim_row(acr_oplist *fwd, acr_oplist *ret, acr_portbook *b, uint8_t col_lo, uint8_t col_hi);
 #endif

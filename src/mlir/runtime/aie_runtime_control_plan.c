@@ -365,3 +365,67 @@ acr_rc acr_plan_row_add(acr_state *s, acr_oplist *o, acr_portbook *b, uint8_t sh
     s->rows[s->nrows++] = row;
     return ACR_OK;
 }
+
+uint8_t acr_shim_row_id(uint8_t k) { return (uint8_t)((1u << k) - 1u); }
+
+static acr_rc acr_shim_row_fwd_tile(acr_oplist *o, acr_portbook *b, uint8_t c, uint8_t k, int has_east) {
+    acr_rc rc = acr_book_port(b, c, 0, ACR_WEST, 0, 0);
+    if (rc != ACR_OK)
+        return rc;
+    acr_op own = {.kind = ACR_OP_SLOT,
+                  .col = c,
+                  .sport = ACR_WEST,
+                  .slot = ACR_SHIMROW_SLOT_OWN,
+                  .pkt_id = acr_shim_row_id(k),
+                  .mask = ACR_MASK_EXACT,
+                  .msel = ACR_SHIMROW_MSEL_OWN,
+                  .arbiter = ACR_ARB_CTRL};
+    if ((rc = acr_emit_op(o, &own)) != ACR_OK)
+        return rc;
+    if (has_east) {
+        acr_op fwd = own;
+        fwd.slot = ACR_SHIMROW_SLOT_FWD;
+        fwd.pkt_id = (uint8_t)(1u << k);
+        fwd.mask = (uint8_t)(1u << k);
+        fwd.msel = ACR_SHIMROW_MSEL_FWD;
+        if ((rc = acr_emit_op(o, &fwd)) != ACR_OK)
+            return rc;
+    }
+    acr_op se = {.kind = ACR_OP_SLAVE_EN, .col = c, .sport = ACR_WEST};
+    if ((rc = acr_emit_op(o, &se)) != ACR_OK)
+        return rc;
+    for (int e = 0; e <= has_east; e++) {
+        acr_port mport = e ? ACR_EAST : ACR_CTRL;
+        if ((rc = acr_book_port(b, c, 0, mport, 0, 1)) != ACR_OK)
+            return rc;
+        acr_op m = {.kind = ACR_OP_MASTER_EN,
+                    .col = c,
+                    .mport = mport,
+                    .arbiter = ACR_ARB_CTRL,
+                    .mselen = (uint8_t)(1u << (e ? ACR_SHIMROW_MSEL_FWD : ACR_SHIMROW_MSEL_OWN)),
+                    .keep_header = 1};
+        if ((rc = acr_emit_op(o, &m)) != ACR_OK)
+            return rc;
+    }
+    return ACR_OK;
+}
+
+acr_rc acr_plan_shim_row(acr_oplist *fwd, acr_oplist *ret, acr_portbook *b, uint8_t col_lo, uint8_t col_hi) {
+    if (col_hi < col_lo || col_hi >= 64 || col_hi - col_lo + 1 > RT_RES_SHIMROW_MAX_COLS)
+        return ACR_ERR_BOUNDS;
+    for (uint8_t c = col_lo; c <= col_hi; c++) {
+        int has_east = c < col_hi;
+        acr_rc rc = acr_shim_row_fwd_tile(fwd, b, c, (uint8_t)(c - col_lo), has_east);
+        if (rc != ACR_OK)
+            return rc;
+        if ((rc = acr_emit_ret_slot(ret, b, c, 0, ACR_CTRL, ACR_SLOT_RET_LOCAL, ACR_MSEL_RET_LOCAL)) != ACR_OK)
+            return rc;
+        if (has_east &&
+            (rc = acr_emit_ret_slot(ret, b, c, 0, ACR_EAST, ACR_SLOT_RET_TRANSIT, ACR_MSEL_RET_TRANSIT)) != ACR_OK)
+            return rc;
+        uint8_t mselen = (uint8_t)((1u << ACR_MSEL_RET_LOCAL) | (1u << ACR_MSEL_RET_TRANSIT));
+        if ((rc = acr_emit_master(ret, b, c, 0, ACR_WEST, mselen, ACR_ARB_RET)) != ACR_OK)
+            return rc;
+    }
+    return ACR_OK;
+}

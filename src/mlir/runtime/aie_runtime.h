@@ -369,6 +369,11 @@ struct_event __Runtime_launch_kernel_group_ctrl(XAie_DevInst *dev, __Runtime_Ctr
 
 void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls);
 void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls);
+void __Runtime_ctrl_kernel_pkt_set(const void *blob, unsigned int bytes);
+void __Runtime_ctrl_aot_register(const void *table);
+void __Runtime_ctrl_aot_window(XAie_DevInst *dev, __Runtime_CtrlRowFabric *f, int nbuf, ...);
+struct_ioevent __Runtime_ioevent_make(XAie_LocType tile, int32_t channel, int32_t bd_id, XAie_DmaDirection dir);
+void __Runtime_kload_fill_cycles(unsigned long long *fill_cyc, unsigned int *fill_n, int *aot);
 void __Runtime_kload_split_cycles(unsigned long long *elf_cyc, unsigned int *elf_n, unsigned long long *rst_cyc,
                                   unsigned int *rst_n);
 void __Runtime_setup_split_cycles(unsigned long long *plan_cyc, unsigned int *plan_n, unsigned long long *sync_cyc,
@@ -909,6 +914,10 @@ AieRC __Runtime_ctrl_setup_routing(__Runtime_CtrlInstance *inst, int port_evt = 
 void __Runtime_ctrl_pmap_enable(int on);
 
 void __Runtime_ctrl_high_throughput_enable(int on);
+
+void __Runtime_ctrl_shim_bd_begin(__Runtime_CtrlRowFabric *f);
+void __Runtime_ctrl_shim_bd_commit(void);
+void __Runtime_ctrl_shim_bd_ctrl_stats_print(void);
 
 // Poll the shim S2MM drain until the response lands, sync it for the CPU, and
 // return the first response word. Uses @inst->token armed by
