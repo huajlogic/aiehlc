@@ -6,8 +6,9 @@
 # Verify host ELF: run on HW via apppaltest.py and check console for success/errors.
 # Bundled in hostcodegen skill; resolves repo root from skill path.
 # Usage: verify_host.sh [--compile] [elf_path]
-#   --compile   Compile host first (run hostcompile.sh from worklocal).
-#   elf_path    ELF to run (default: worklocal/build/host from repo root).
+#   --compile   Compile host first (script/hostcompile.sh on $WORKLOCAL_DIR).
+#   elf_path    ELF to run (default: $WORKLOCAL_DIR/build/host; WORKLOCAL_DIR defaults
+#               to the unitest driver's pass/unitest/build/worklocal).
 # Requires: USERNAME, PALIP, BOARDNAME (or script/test/envlocal.sh).
 # Exit: 0 if verify passed (no AIE ERROR / Invalid Tile; runtime teardown seen), 1 otherwise.
 ###############################################################################
@@ -17,8 +18,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # From skill scripts/ go up to repo root: scripts -> hostcodegen -> skills -> .cursor -> repo
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
-DEFAULT_ELF="${REPO_ROOT}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal/build/host"
-WORKLOCAL_DIR="${REPO_ROOT}/src/mlir/mlirfront/tilinglinalg/pass/unitest/worklocal"
+WORKLOCAL_DIR="${WORKLOCAL_DIR:-${REPO_ROOT}/src/mlir/mlirfront/tilinglinalg/pass/unitest/build/worklocal}"
+DEFAULT_ELF="${WORKLOCAL_DIR}/build/host"
 TEST_DIR="${REPO_ROOT}/script/test"
 
 DO_COMPILE=0
@@ -58,7 +59,7 @@ fi
 if [[ "$DO_COMPILE" -eq 1 ]]; then
     echo ">>> Compiling host..."
     if [[ -f "${WORKLOCAL_DIR}/host.cc" ]]; then
-        (cd "$REPO_ROOT" && source script/setup.sh --path-set-only 2>/dev/null; cd "$WORKLOCAL_DIR" && source hostcompile.sh) || { echo "Error: hostcompile failed"; exit 1; }
+        (cd "$REPO_ROOT" && source script/setup.sh --path-set-only 2>/dev/null; WORKLOCAL_DIR="$WORKLOCAL_DIR" source script/hostcompile.sh) || { echo "Error: hostcompile failed"; exit 1; }
         ELF_PATH="$DEFAULT_ELF"
         ELF_PATH="$(cd "$(dirname "$ELF_PATH")" && pwd)/$(basename "$ELF_PATH")"
     else

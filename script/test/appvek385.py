@@ -234,10 +234,8 @@ def console_reader(child, output_queue, stop_event):
                     output_queue.put("[console_reader] UART session dropped\n")
                     tail = ""
                 elif "telnet>" in window:
-                    # The com port's telnet client drops into command mode on its
-                    # own shortly after attaching; an empty line resumes the session.
-                    child.sendline("")
-                    output_queue.put("[console_reader] telnet command mode, resumed\n")
+                    child.sendline("quit")
+                    output_queue.put("[console_reader] telnet command mode, quit; UART session dropped\n")
                     tail = ""
         except pexpect.TIMEOUT:
             # No data available, continue polling
@@ -445,6 +443,18 @@ def setup_first_connection(board_rev="a"):
     print("[Connection 1] Setup complete!")
     
     return child
+
+
+def uart_reconnect_step(conn, chunk, st):
+    dropped = "Connection closed by foreign host" in chunk or "UART session dropped" in chunk
+    if dropped:
+        st["pending"] = True
+    if st.get("pending") and re.search(r'Systest[#>]', chunk) and st.get("count", 0) < 4:
+        st["pending"] = False
+        st["count"] = st.get("count", 0) + 1
+        print(f"\n[Connection 2] UART dropped, reconnecting to {console_port} ({st['count']})")
+        conn.sendline(f"connect {console_port}")
+    return dropped
 
 
 def setup_second_connection():
@@ -714,25 +724,19 @@ Examples:
         console_thread.start()
         uart_ready = False
         uart_seen = 0.0
-        reconnects = 0
+        uart_st = {}
         settle_deadline = time.time() + 45
-        while time.time() < settle_deadline and reconnects < 4:
-            closed = False
+        while time.time() < settle_deadline:
             while not console_output_queue.empty():
                 chunk = console_output_queue.get()
                 print(chunk, end='', flush=True)
-                if not uart_seen and chunk.strip():
-                    uart_seen = time.time()
-                if "Connection closed by foreign host" in chunk or "UART session dropped" in chunk:
-                    closed = True
+                if uart_reconnect_step(conn2, chunk, uart_st):
                     uart_seen = 0.0
-            if uart_seen and time.time() - uart_seen >= 2 and not closed:
+                elif not uart_seen and not uart_st.get("pending") and chunk.strip():
+                    uart_seen = time.time()
+            if uart_seen and time.time() - uart_seen >= 3 and not uart_st.get("pending"):
                 uart_ready = True
                 break
-            if closed:
-                reconnects += 1
-                print(f"\n[Connection 2] UART dropped, reconnecting to {console_port} ({reconnects})")
-                conn2.sendline(f"connect {console_port}")
             time.sleep(0.5)
         if not uart_ready:
             print("\n[Connection 2] UART did not stay up; continuing anyway")
@@ -788,6 +792,7 @@ Examples:
                 print(chunk, end='', flush=True)
                 output_detected = True
                 got_new = True
+                uart_reconnect_step(conn2, chunk, uart_st)
                 # Check for completion marker
                 if "device_teardown done" in chunk or "test end" in chunk or "PASS:" in chunk or "FAIL:" in chunk:
                     program_done = True
