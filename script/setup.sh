@@ -43,7 +43,11 @@ aierepo_download_check() {
     fi
 
     if [ ! -d "$AIE_DRIVER_PARENT_DIR/aie-rt/driver/src" ] ; then
-        bash -c "pushd  $AIE_DRIVER_PARENT_DIR;git clone --branch main-aie $AIE_REPO; popd"
+        if ! git clone --branch main-aie "$AIE_REPO" "$AIE_DRIVER_PARENT_DIR/aie-rt"; then
+            echo "ERROR: failed to clone aie-rt (branch main-aie) from $AIE_REPO."
+            echo "       Check GitHub credentials for that repo, or set AIE_RT_REPO to a reachable URL or local clone."
+            return 1
+        fi
     else
         echo "aie-rt already present at $AIE_DRIVER_PARENT_DIR/aie-rt; skipping clone"
     fi
