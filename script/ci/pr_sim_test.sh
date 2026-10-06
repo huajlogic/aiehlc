@@ -20,13 +20,15 @@ redact() {
             -e 's|/scratch/staff/[^[:space:]]+|<user>|g' \
             -e 's|/home/[^[:space:]]+|<user>|g' \
             -e 's|/Users/[^[:space:]]+|<user>|g' \
-            -e 's|/proj/[^[:space:]]+|<tools>|g'
+            -e 's|/proj/[^[:space:]]+|<tools>|g' \
+            -e 's#(https?://)[^/@[:space:]]+@#\1***@#g'
     else
         sed -E \
             -e 's|/scratch/staff/[^[:space:]]+|<user>|g' \
             -e 's|/home/[^[:space:]]+|<user>|g' \
             -e 's|/Users/[^[:space:]]+|<user>|g' \
-            -e 's|/proj/[^[:space:]]+|<tools>|g'
+            -e 's|/proj/[^[:space:]]+|<tools>|g' \
+            -e 's#(https?://)[^/@[:space:]]+@#\1***@#g'
     fi
 }
 
