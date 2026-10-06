@@ -2,43 +2,40 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 ###############################################################################
-"""Annotation pass: hand only the **first N** matched composite functions to AIE.
+"""Annotation pass: hand the SELECTED matched composite functions to AIE.
 
-The second of the four BYOC files. The default behaviour of ``AnnotateTarget``
-is "offload everything that matches", whereas what we want here is "get the
-first 5 layers working first" -- so we write our own mutator that counts in
-**program order** up to the N-th one.
+The second of the four BYOC files. ``AnnotateTarget`` offloads everything that
+matches; ``--aie-offload --aie-layers`` asks for specific layers, so this pass
+inserts ``compiler_begin``/``compiler_end`` itself, around the composites whose
+conv was selected. ``MergeCompilerRegions`` + ``PartitionGraph`` then work as
+usual.
 
-Why not ``AnnotateTarget``
---------------------------
-``AnnotateTarget(["aie"])`` only knows "do I support this operator", it has no
-notion of counting. To limit the count you have to insert
-``compiler_begin``/``compiler_end`` yourself, which is exactly what this pass
-does. Once they are inserted, ``MergeCompilerRegions`` + ``PartitionGraph`` work
-as usual; TVM does not care who inserted the markers.
-
-Program order == execution order
---------------------------------
-``ExprMutator`` traverses Relay's nested let/call structure in post-order, and
-for this model the visiting order is the dataflow order: the 0th composite
-visited is the stem conv. So "the first N" is equivalent here to "the first N
-layers of the network", with no extra sorting needed.
+A conv is identified by its WEIGHTS, not its position
+-----------------------------------------------------
+Relay's post-order and the graph executor's order are NOT the same: in every
+ResNet downsampling block TVM fuses the 1x1 shortcut conv with the residual
+add, so it runs after the main branch, while Relay's post-order visits it
+first (convs 5-7, 10-12, 15-17 swap -- measured). Any "n-th conv" numbering is
+therefore wrong on one side. ``weight_fingerprint`` -- a hash of the SORTED
+weight values -- is layout-independent (the CPU build stores the same weights
+as NCHWc-blocked int16) and unique for all 20 ResNet-18 convs, so
+``aie_offload.resolve_conv_targets`` selects by it.
 
 The boundary goes on the composite function, not on individual operators
 -----------------------------------------------------------------------
-``compiler_begin`` wraps the composite function's **inputs**, ``compiler_end``
-wraps its **output**. Inserting the markers on individual operators inside the
-composite would tear a kernel in half at partition time -- the three ops that
-``MergeComposite`` just fused get split apart again, and the generated subgraph
-is neither a complete convolution nor pure CPU.
+``compiler_begin`` wraps the composite's inputs and ``compiler_end`` its output.
+Marking individual operators inside it would tear the fused kernel apart again.
 """
 
 from __future__ import annotations
 
+import hashlib
+
+import numpy as np
 from tvm import relay
 from tvm.relay.op.annotation import compiler_begin, compiler_end
 
-__all__ = ["FirstNAnnotator", "AIE_COMPILER_NAME"]
+__all__ = ["ConvSelectAnnotator", "AIE_COMPILER_NAME", "weight_fingerprint"]
 
 #: The codegen name registered with TVM. It must match the registration name of
 #: ``relay.ext.<name>``, otherwise after PartitionGraph TVM cannot find the
@@ -46,75 +43,94 @@ __all__ = ["FirstNAnnotator", "AIE_COMPILER_NAME"]
 AIE_COMPILER_NAME = "aie"
 
 
-class FirstNAnnotator(relay.ExprMutator):
-    """Attach AIE begin/end markers to the first *n* ``Composite`` functions.
+def weight_fingerprint(weights) -> str:
+    """Layout- and dtype-independent identity of a conv: hash of its sorted weights."""
+    a = np.sort(np.asarray(weights).astype(np.int64).reshape(-1))
+    return hashlib.sha1(a.tobytes()).hexdigest()
 
-    ``n=None`` means no limit (offload everything that matched); ``n=0`` means
-    offload nothing, which is a useful control group -- the rest of the flow is
-    completely identical, only there is no AIE subgraph.
 
-    The counter is only incremented on **acceptance**, so N means "the number
-    actually offloaded", not "the number looked at".
+def _conv_geometry(conv) -> dict:
+    """(Cin, Cout, K, stride) of an nn.conv2d -- read off the constant weight and
+    attrs, so it works on freshly rebuilt nodes that carry no checked_type."""
+    w = conv.args[1]
+    shape = [int(d) for d in (w.data.shape if isinstance(w, relay.Constant)
+                              else w.checked_type.shape)]
+    return {"Cin": shape[1], "Cout": shape[0], "K": shape[2],
+            "stride": int(conv.attrs.strides[0])}
+
+
+def _find_conv(expr):
+    found = []
+    relay.analysis.post_order_visit(
+        expr, lambda e: found.append(e) if isinstance(e, relay.Call)
+        and getattr(e.op, "name", "") == "nn.conv2d" else None)
+    return found[0] if found else None
+
+
+class ConvSelectAnnotator(relay.ExprMutator):
+    """Mark the ``Composite`` functions whose conv weight fingerprint is in *selected*
+    (``None``: every composite the pattern accepted).
+
+    Composites that are not selected are inlined back (see ``visit_call``).
+    ``convs`` records ``{fingerprint, geometry, composite, offloaded}`` for
+    every conv -- matched or not -- for the caller to verify.
     """
 
-    def __init__(self, n=None, compiler: str = AIE_COMPILER_NAME,
-                 pattern_name: str = "aie.qconv"):
+    def __init__(self, selected, pattern_name: str,
+                 compiler: str = AIE_COMPILER_NAME):
         super().__init__()
-        self.n = n
+        self.selected = None if selected is None else set(selected)
         self.compiler = compiler
         self.pattern_name = pattern_name
-        self.annotated = 0          # number actually offloaded
-        self.skipped = 0            # matched but beyond N
+        self.convs = []
 
     def _is_target_composite(self, op) -> bool:
-        """Is this callee the composite function we are after."""
         if not isinstance(op, relay.Function):
             return False
         comp = op.attrs["Composite"] if op.attrs and "Composite" in op.attrs else None
         return comp is not None and str(comp) == self.pattern_name
 
+    def _record(self, conv, composite: bool, offloaded: bool) -> None:
+        self.convs.append({"fingerprint": self._fingerprint(conv),
+                           **_conv_geometry(conv),
+                           "composite": composite, "offloaded": offloaded})
+
+    @staticmethod
+    def _fingerprint(conv):
+        w = conv.args[1]
+        return weight_fingerprint(w.data.numpy()) if isinstance(w, relay.Constant) else None
+
     def visit_call(self, call):
-        # Recurse into the children first, so that the counting order is the
-        # dataflow order (post-order).
         new_args = [self.visit(a) for a in call.args]
         op = call.op
 
         if not self._is_target_composite(op):
+            if getattr(op, "name", "") == "nn.conv2d":
+                self._record(call, composite=False, offloaded=False)
             return relay.Call(self.visit(op) if isinstance(op, relay.Function) else op,
                               new_args, call.attrs, call.type_args, call.span)
 
-        if self.n is not None and self.annotated >= self.n:
-            self.skipped += 1
-            # Crucial: **inline back** the composite functions that were not
-            # selected, instead of leaving them as they are.
-            #
-            # A Composite function produced by MergeComposite only has a home if
-            # it gets offloaded by BYOC; left in the main graph it has neither a
-            # Compiler attribute nor a Primitive attribute, and TECompiler dies
-            # when it reaches it:
-            #
-            #   TVMError: Check failed: (prim_fns) is false:
-            #     primitive functions not set on Relay function by TECompiler
-            #
-            # This error has nothing to do with how many are offloaded -- in
-            # practice n=0 (offload nothing at all) fails just the same, because
-            # MergeComposite still wrapped all 20 convolutions into composites.
-            # So anything not offloaded must be restored to its original operator
-            # sequence and handed back to TVM to compile normally.
-            # Inlining = bind the parameters to the arguments and then take the
-            # function body, not Call(op.body, args) (the body is an expression,
-            # not something callable).
+        conv = _find_conv(op.body)
+        take = self.selected is None or self._fingerprint(conv) in self.selected
+        self._record(conv, composite=True, offloaded=take)
+        if not take:
+            # Inline the composite back. A Composite function left in main has
+            # neither a Compiler nor a Primitive attribute, and TECompiler dies:
+            #   Check failed: (prim_fns) is false: primitive functions not set
+            # Inlining = bind the params to the args, then take the body.
             return relay.bind(op.body, dict(zip(op.params, new_args)))
 
-        # Wrap the whole composite function: compiler_begin on every input,
-        # compiler_end on the output.
         begins = [compiler_begin(a, self.compiler) for a in new_args]
         out = relay.Call(op, begins, call.attrs, call.type_args, call.span)
-        self.annotated += 1
         return compiler_end(out, self.compiler)
 
+    @property
+    def annotated(self) -> int:
+        return sum(1 for c in self.convs if c["offloaded"])
+
     def report(self) -> str:
-        """A one-line plain-language summary the caller can print directly."""
-        limit = "all" if self.n is None else str(self.n)
-        tail = f", plus {self.skipped} matched but over the limit" if self.skipped else ""
-        return f"annotated {self.annotated} {self.pattern_name} for AIE offload (limit {limit}){tail}"
+        """One-line summary the caller can print directly."""
+        matched = sum(1 for c in self.convs if c["composite"])
+        return (f"annotated {self.annotated} {self.pattern_name} for AIE "
+                f"({'all' if self.selected is None else len(self.selected)} conv(s) selected; "
+                f"{matched}/{len(self.convs)} convs match the pattern)")

@@ -2,41 +2,73 @@
  * Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * conv2dstem — driver main() for the ResNet-18 stem convolution library.
+ * conv2dstem — driver main() for the ResNet-18 stem convolution.
  *
- * This is the CALLER side of libconv2dstem.a: it owns the input/output buffers,
- * fills the input, calls conv2d_stem(), and frees. It is a PLAIN host translation
- * unit — it includes only conv2dstem.h, contains no AIE kernel and no <<<mesh>>>
- * launch, and is NOT built by aiehlc.sh. Build it with the host cross-compiler
- * and link it against the archive (recipe at the bottom of this comment).
+ * This is an aiehlc ENTRY FILE: it owns main() and #includes the kernel source,
+ * so one command produces host.cc (device init, DMA/mesh setup, the launch), the
+ * extracted kernel, and a linked ELF:
  *
- * Buffer convention follows the normal aiehlc host code (see
- * example/tileprogram/ccode/simpleconv2d.cc): allocate with __Runtime_Alloc()
- * (64-byte-aligned, DMA-capable) and release with plain free().
- *
- * Note the buffers here are the RAW caller-facing shapes — [224,224,3] input and
- * [64,7,7,3] filter, NOT the AIE's padded [230,230,4] / B^T[64,196] layouts. The
- * library stages between the two internally, so this file carries no knowledge of
- * the AIE data layout.
- *
- * Build:
  *   source script/aiehlc.sh --aie-version 5 \
- *       --runtime-source-file ./src/aietensorop/conv2dstem/conv2dstem.cc
- *   # then, in the SAME shell (aiehlc.sh wipes thirdparty/alib/lib on each run):
- *   aarch64-none-elf-g++ -Os -I src/aietensorop/conv2dstem \
- *       -c -o main.o src/aietensorop/conv2dstem/main.cc
- *   aarch64-none-elf-g++ -Os -o app main.o aout/libconv2dstem.a \
- *       --specs=nosys.specs -Wl,--defsym,end=__bss_end__ \
- *       -Wl,-T -Wl,thirdparty/arch/cortexa78_0/lscript.ld \
- *       -L thirdparty/alib/lib -L <bsp>/lib \
- *       -L <bsp>/lib/../libsrc/build_configs/gen_bsp/libsrc/aienginev2/src \
- *       -Wl,--start-group,-lm,-lxaienginea78,-lxil,-lgcc,-lc,-lstdc++,\
- * -lxiltimer,-lxilstandalone,-lxilpm_ng,--end-group
+ *       --runtime-source-file ./src/aietensorop/conv2dstem/main.cc
  *
- * The full recipe with absolute paths is printed by hostcompile.sh at the end of
- * a library build.
+ * The frontend splices `#include "conv2dstem.cc"` into the text before its
+ * rewrites run, so the kernel is annotated, body-guarded and launch-lowered as
+ * if it had been written here (src/llvm/aiehlc.cc:inlineSourceIncludes; read
+ * aout/newfile.cpp to see the flattened result). Only `.cc`/`.cpp` includes are
+ * spliced — the `.h` data headers below are left for Clang, so they cannot
+ * disturb kernel extraction. Because main() survives into host.cc,
+ * hostcompile.sh classifies this as HOST_ENTRY_KIND=user-main and links an ELF
+ * -- in contrast to building conv2dstem.cc directly, which has no main() and is
+ * archived into libconv2dstem.a for the TVM BYOC path (skill: hostlibrarymode).
+ *
+ * ── What this runs on ──────────────────────────────────────────────────────
+ *
+ * REAL data, not a synthetic pattern: the actual int8-quantized ResNet-18
+ * conv1 applied to an actual photograph. Three generated headers carry it,
+ * all produced by src/aietensorop/conv2dstem/data/ (see data/README.md):
+ *
+ *   conv2dstem_image.h    [230,230,4] int8  the fixture image, already
+ *                                           ImageNet-preprocessed, quantized,
+ *                                           zero-point-padded and HWC4 —
+ *                                           byte-for-byte g_ifm_pad's layout
+ *   conv2dstem_weights.h  [64,7,7,3] int8   the real conv1 weights, plus the
+ *                                           64 folded {bias, zp, mult, shift}
+ *   conv2dstem_golden.h   [112,112,64] u8   the CPU ground truth to check against
+ *
+ * This matters beyond realism. The previous synthetic fixture fed values in
+ * [-4,4] x {-1,0,1}, which keeps the accumulator inside int16; with the real
+ * weights the peak |accumulator| is 1,023,225, so an int16 accumulator would
+ * silently wrap on roughly every output. Only real data exercises that.
+ *
+ * Because the image header already has the kernel's exact [230,230,4] layout,
+ * the host does no scatter at all — stage_ifm_pad4() is a straight memcpy.
+ * That is why this file no longer talks about "raw caller-facing shapes": the
+ * staging has moved off the board and into the generator.
  ******************************************************************************/
-#include "conv2dstem.h"
+// Brings in the kernel, the staging helpers and the geometry #defines. The
+// geometry arrives with it, so parameter.h must NOT also be included here --
+// the two spell OUTPUT_H/K differently (same values) and would redefine them.
+#include "conv2dstem.cc"
+
+// Generated fixtures. Their element-count macros are all CONV2DSTEM_DATA_*,
+// deliberately disjoint from conv2dstem.h's CONV2DSTEM_* names — reusing
+// CONV2DSTEM_WTS_ELEMS here would be a macro redefinition with a different
+// token sequence. Regenerate with data/*.py, never hand-edit.
+#include "conv2dstem_image.h"
+#include "conv2dstem_weights.h"
+
+// The golden output is ~800 KB of .rodata and is derived from the two headers
+// above, so it is gitignored rather than committed. Build without it and the
+// app still runs — it just does not self-check.
+#if defined(__has_include)
+#if __has_include("conv2dstem_golden.h")
+#include "conv2dstem_golden.h"
+#define CONV2DSTEM_HAVE_GOLDEN 1
+#endif
+#endif
+#ifndef CONV2DSTEM_HAVE_GOLDEN
+#define CONV2DSTEM_HAVE_GOLDEN 0
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -48,102 +80,93 @@
 // so declare them as plain C++ or the link fails with an undefined reference.
 void *__Runtime_Alloc(size_t bytes);
 
-// Run the CPU reference cross-check instead of a bare compute call. The reference
-// is ~157M scalar int8 MACs on the APU and takes seconds — keep it off unless
-// bringing up / debugging the data path.
-#ifndef CONV2DSTEM_VERIFY
-#define CONV2DSTEM_VERIFY 0
-#endif
+// The generated arrays are uint8_t — a hex initializer for int8_t would lean on
+// an implementation-defined out-of-range conversion — so they are cast at the
+// point of use. These are the only two casts in the file.
+static const int8_t *fixture_ifm(void) { return (const int8_t *)conv2dstem_ifm_pad4; }
+static const int8_t *fixture_wts(void) { return (const int8_t *)conv2dstem_wts; }
 
-// Deterministic, zero-mean sample values. Small magnitudes keep the 49-tap x
-// 3-channel accumulator inside int8 so the output is distributed rather than
-// saturated at +/-127 — the same reasoning as the simpleconv2d.cc generator.
-static void fill_inputs(int8_t *ifm, int8_t *wts) {
-    for (int i = 0; i < CONV2DSTEM_IFM_ELEMS; i++)
-        ifm[i] = (int8_t)((i % 9) - 4); // [-4, 4]
-    for (int i = 0; i < CONV2DSTEM_WTS_ELEMS; i++)
-        wts[i] = (int8_t)((i % 3) - 1); // {-1, 0, 1}
-}
+// conv2dstem_qp is a flat int32 block of 64 x {bias, zero_point, multiplier,
+// shift}; conv2dstem_qparam is exactly that struct. The reinterpretation is
+// only sound if the struct has no padding, which this asserts at compile time.
+static_assert(sizeof(conv2dstem_qparam) == 4 * sizeof(int32_t),
+              "conv2dstem_qparam is padded; conv2dstem_qp cannot be reinterpreted");
+static const conv2dstem_qparam *fixture_qp(void) { return (const conv2dstem_qparam *)conv2dstem_qp; }
 
-// Quant params that make the epilogue an exact identity, so this smoke test
-// stays a pure convolution check and any difference points at the data path.
-//
-// With multiplier = 2^30 and shift = -1 the epilogue reduces to
-//   (acc * 2^30 + 2^29) >> 30  ==  acc
-// (verified exhaustively over acc in [-200, 200]). Only the final clamp to
-// [0, 255] then applies, so negative taps read back as 0.
-//
-// The REAL numerical validation is NOT here -- it is
-// src/aietensorop/conv2dstem/ref/verify_pack.c, which checks this library's
-// packing and epilogue against output produced from the actual ResNet-18
-// weights and cross-checked against TVM.
-static void fill_qparams(conv2dstem_qparam *qp) {
-    for (int f = 0; f < CONV2DSTEM_NUM_FILTERS; f++) {
-        qp[f].bias = 0;
-        qp[f].zero_point = 0;
-        qp[f].multiplier = 1 << 30; /* Q31 1.0 */
-        qp[f].shift = -1;           /* net shift of 30 cancels the Q31 scale */
+/*
+ * Compare the AIE output against the CPU ground truth, element for element.
+ *
+ * Prints at most CONV2DSTEM_MAX_REPORTED_MISMATCHES coordinate lines, then one
+ * verdict line. The cap is not cosmetic: apppaltest.py gives the run a 300 s
+ * no-output / 600 s total watchdog, and 802,816 lines over a UART would blow
+ * through both. data/groundtruth.py --applog parses the verdict line back off
+ * the console log, which is the only channel a baremetal board under xsdb has.
+ *
+ * Returns the mismatch count (0 == bit-exact).
+ */
+#if CONV2DSTEM_HAVE_GOLDEN
+static int check_against_golden(const uint8_t *ofm) {
+    int mismatches = 0;
+    for (int i = 0; i < OFM_ELEMS; i++) {
+        if (ofm[i] != conv2dstem_golden_ofm[i]) {
+            if (mismatches < CONV2DSTEM_MAX_REPORTED_MISMATCHES) {
+                const int oh = i / (OUTPUT_W * NUM_FILTERS);
+                const int ow = (i / NUM_FILTERS) % OUTPUT_W;
+                const int f = i % NUM_FILTERS;
+                printf("[conv2dstem] MISMATCH ofm[oh=%d,ow=%d,f=%d] (flat %d): got %d, want %d\n", oh, ow, f, i, ofm[i],
+                       conv2dstem_golden_ofm[i]);
+            }
+            mismatches++;
+        }
     }
+    // One machine-readable line, matched by groundtruth.py's
+    // r"GOLDEN (PASS|FAIL)\s+(\d+)\s*/\s*(\d+)".
+    printf("[conv2dstem] GOLDEN %s %d/%d\n", mismatches == 0 ? "PASS" : "FAIL", OFM_ELEMS - mismatches, OFM_ELEMS);
+    return mismatches;
 }
+#endif
 
 int main() {
     printf("=== ResNet-18 stem conv2d on AIE ===\n");
-    printf("    Input:  [%d, %d, %d]\n", CONV2DSTEM_INPUT_H, CONV2DSTEM_INPUT_W, CONV2DSTEM_INPUT_C);
+    printf("    Input:  [%d, %d, %d] padded to [%d, %d, %d]\n", CONV2DSTEM_INPUT_H, CONV2DSTEM_INPUT_W,
+           CONV2DSTEM_INPUT_C, INPUT_H_PAD, INPUT_W_PAD, INPUT_C_ALIGN);
     printf("    Filter: [%d, %d, %d, %d]\n", CONV2DSTEM_NUM_FILTERS, CONV2DSTEM_KERNEL_H, CONV2DSTEM_KERNEL_W,
            CONV2DSTEM_INPUT_C);
     printf("    Output: [%d, %d, %d]  (stride %d, pad %d)\n", CONV2DSTEM_OUTPUT_H, CONV2DSTEM_OUTPUT_W,
            CONV2DSTEM_NUM_FILTERS, CONV2DSTEM_STRIDE, CONV2DSTEM_PAD);
+    printf("    Data:   real int8 ResNet-18 conv1 on the fixture image\n");
 
-    // --- Allocate DMA-capable host memory ---
-    int8_t *ifm = (int8_t *)__Runtime_Alloc(CONV2DSTEM_IFM_ELEMS * sizeof(int8_t));
-    int8_t *wts = (int8_t *)__Runtime_Alloc(CONV2DSTEM_WTS_ELEMS * sizeof(int8_t));
+    // The fixture is const .rodata and needs no DMA alignment: the weights and
+    // qparams are only ever read on the host (stage_weights packs them into the
+    // aligned g_wts_bt), and the image is memcpy'd into the aligned g_ifm_pad.
+    // Only the output buffer is allocated.
     uint8_t *ofm = (uint8_t *)__Runtime_Alloc(CONV2DSTEM_OFM_ELEMS * sizeof(uint8_t));
-    conv2dstem_qparam *qp = (conv2dstem_qparam *)__Runtime_Alloc(CONV2DSTEM_NUM_FILTERS * sizeof(conv2dstem_qparam));
-    if (!ifm || !wts || !ofm || !qp) {
+    if (!ofm) {
         printf("ERROR: host buffer allocation failed.\n");
-        // free(NULL) is a no-op, so an partial allocation still cleans up safely.
-        free(ifm);
-        free(wts);
-        free(ofm);
-        free(qp);
         return 1;
     }
 
-    fill_inputs(ifm, wts);
-    fill_qparams(qp);
-
-    // --- Run on the AIE mesh ---
-    // The library pads/repacks into its own staging buffers, programs the mesh,
-    // and copies the result back into ofm.
-#if CONV2DSTEM_VERIFY
-    printf("\n--- Running conv2d_stem (with CPU cross-check) ---\n");
-    int rc = conv2d_stem_verify(ifm, wts, qp, ofm);
-    if (rc > 0)
-        printf("FAIL: %d mismatches against the CPU reference.\n", rc);
-#else
-    printf("\n--- Running conv2d_stem ---\n");
-    int rc = conv2d_stem(ifm, wts, qp, ofm);
-#endif
-
-    if (rc < 0) {
-        printf("ERROR: conv2d_stem failed (rc=%d).\n", rc);
-    } else {
-        // Spot-print one output row of the f=0 plane so a run shows real data.
-        printf("Output f=0, oh=0 (first 16 cols):\n  [");
-        for (int ow = 0; ow < 16; ow++)
-            printf("%4u%s", ofm[(0 * CONV2DSTEM_OUTPUT_W + ow) * CONV2DSTEM_NUM_FILTERS + 0], ow < 15 ? "," : "");
-        printf("]\n");
+    int rc = ensure_staging();
+    if (rc != CONV2DSTEM_OK) {
+        printf("ERROR: staging allocation failed (rc=%d).\n", rc);
+        free(ofm);
+        return 1;
     }
 
-    // --- Cleanup ---
-    // Release the library's cached staging buffers first, then our own. Buffers
-    // from __Runtime_Alloc are plain aligned_alloc allocations, freed with free().
-    conv2d_stem_release();
-    free(ifm);
-    free(wts);
-    free(ofm);
-    free(qp);
+    // The image header is already in g_ifm_pad's exact layout, so this is a
+    // copy rather than the scatter conv2d_stem()/conv2d_stem_prepadded() do.
+    stage_ifm_pad4(fixture_ifm());
+    rc = stem_run(fixture_wts(), fixture_qp(), ofm);
 
+#if CONV2DSTEM_HAVE_GOLDEN
+    if (rc == CONV2DSTEM_OK)
+        rc = check_against_golden(ofm);
+#else
+    printf("[conv2dstem] conv2dstem_golden.h absent -- no self-check. "
+           "Generate it with data/groundtruth.py.\n");
+#endif
+
+    free(ofm);
     printf("conv2dstem done (rc=%d).\n", rc);
     return rc;
 }

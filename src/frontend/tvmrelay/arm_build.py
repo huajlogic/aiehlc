@@ -658,7 +658,7 @@ CFLAGS  ?= -Os -mcpu=$(CPU) -std=c11 -DAIE_GEN=5 \\
            -I. -I$(REPO)/include -I$(BSP)/include \\
            -I$(REPO)/src/aietensorop/conv2dstem
 
-# AIE offload (--byoc-aie). AIE_LIB is libconv2dstem.a when stage 4 emitted a
+# AIE offload (--aie-offload). AIE_LIB is libconv2dstem.a when stage 4 emitted a
 # BYOC wrapper, and empty otherwise, so a non-BYOC build links exactly as
 # before. The archive also pulls in the AIE runtime and the embedded kernel
 # ELF, hence the extra BSP/driver -L paths next to it.
@@ -714,6 +714,12 @@ clean:
 """
 
 
+#: The libconv2dstem.a entry the BYOC wrapper calls. Defined HERE (TVM-free)
+#: and imported by ``byoc/aie_codegen``, so the symbol the link keys off and
+#: the symbol the codegen emits cannot drift apart.
+AIE_ENTRY = "conv2d_stem_prepadded"
+
+
 def _aie_link_vars(repo_root: Path, kernel_src: Path, build: Path) -> dict:
     """Decide whether this ELF links against libconv2dstem.a, and stage its deps.
 
@@ -741,7 +747,7 @@ def _aie_link_vars(repo_root: Path, kernel_src: Path, build: Path) -> dict:
     """
     empty = {"aie_lib": "", "aie_ldirs": "", "aie_extra": ""}
     try:
-        if "conv2d_stem_raw" not in kernel_src.read_text():
+        if AIE_ENTRY not in kernel_src.read_text():
             return empty
     except OSError:
         return empty
@@ -751,7 +757,7 @@ def _aie_link_vars(repo_root: Path, kernel_src: Path, build: Path) -> dict:
     hint = ("rebuild with `source script/aiehlc.sh --aie-version 5 "
             "--runtime-source-file src/aietensorop/conv2dstem/conv2dstem.cc`")
     if not archive.is_file():
-        print(f"  [arm] warning: the generated C calls conv2d_stem_raw but "
+        print(f"  [arm] warning: the generated C calls {AIE_ENTRY} but "
               f"{archive} is missing -- {hint}")
         return empty
 

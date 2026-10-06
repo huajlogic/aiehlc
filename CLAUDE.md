@@ -22,6 +22,7 @@ aiehlc/
 │       └── mlirfront/
 │           ├── AieFrontEnd.cc     # Clang AST → MLIR
 │           ├── AieDialect.cc      # AIE dialect (LoadKernel, etc.)
+│           ├── frontend/aiebackend/  # _aiebackend pybind over TilingLinalgPipeline (Triton + TVM share it)
 │           └── tilinglinalg/      # ★ Multi-tile GEMM pipeline
 │               ├── routing/       # Abstract routing dialect
 │               ├── routinghw/     # Physical routing dialect
@@ -110,7 +111,7 @@ Location: `src/mlir/mlirfront/frontend/aiegraph/` (`td/`, `gen.sh`, `inc/`,
 `aiegraphmanager.{h,cpp}`, `lower/AiegraphLowerDriver.{h,cpp}`, `unitest/`).
 pybind: `build_aiegraph_module(ops)` (build+verify → textual IR) and
 `lower_aiegraph(mlir_text)` (walk → per-launch `tensor_specs`) in
-`aietriton_pybind.cpp`. Python entry: `_compiler.compile_plan(..., via_aiegraph=True)`.
+`aiebackend/aiebackend_pybind.cpp`. Python entry: `_compiler.compile_plan(..., via_aiegraph=True)`.
 
 ### PyTorch → PT2E int8 → MLIR (`src/frontend/pytorchmlir/`)
 
@@ -144,28 +145,29 @@ Three non-obvious things, each of which silently misleads if forgotten:
 - Do **not** reuse `example/model/resnet18py/resnet18.py:resnet18()` here — it
   builds ResNet-18 **v2** from ONNX weights. Only `classify.preprocess` is shared.
 
-### TVM BYOC → AIE (`--byoc-aie`)
+### TVM `--aie-offload` → AIE via BYOC
 
-A **third**, independent offload path, next to `--aie-offload` / `--aiegraph`:
-real Relay `MergeComposite` → `PartitionGraph` → `relay.ext.aie` codegen, so the
-offloaded subgraph is an ordinary `tvm_op` node and TVM's graph executor schedules
-it. Lives in `src/frontend/tvmrelay/byoc/` (`aie_patterns`, `aie_annotate`,
-`aie_codegen`, `aie_byoc`); design in **[doc/design/byoc_aie_plan.md](doc/design/byoc_aie_plan.md)**.
-
-Today it targets one op: the ResNet-18 stem conv, implemented by
-`src/aietensorop/conv2dstem/` (built to `libconv2dstem.a` via the library mode in
-skill **hostlibrarymode**). Default **off** (`--byoc-aie 0` is byte-identical to
-the CPU path).
+`deploy_flow.py --aie-offload --aie-layers N` (default 1, the stem) puts layer N
+on the AIE: after the CPU build, Relay `MergeComposite` → `PartitionGraph` →
+`relay.ext.aie` codegen, the C is rebuilt, and TVM's graph executor calls the
+generated wrapper → `conv2d_stem_prepadded()` in `aout/libconv2dstem.a` (built
+from `src/aietensorop/conv2dstem/conv2dstem.cc` by `aiehlc.sh` in library mode —
+skill **hostlibrarymode**; aiehlc generates the init/partition/launch caller).
+`--byoc-aie` was merged into this flag. Code: `src/frontend/tvmrelay/byoc/`
+(`aie_patterns`, `aie_annotate`, `aie_codegen`, `aie_byoc`) + `aie_offload.py`;
+design **[doc/design/aie_offload_byoc.md](doc/design/aie_offload_byoc.md)**; check
+`byoc/verify_aie_stem.py` (bit-exact vs TVM, incl. all 1000 logits).
 
 Non-obvious and each one silently wrong if broken — see skill **byocaieoffload**:
-the partitioned subgraph is the **raw int32 conv**, not the fused op (bias/
-requantize/ReLU stay outside in Relay, so `conv2d_stem_raw` is what gets called);
-the match shape is **230×230 with padding=0** because TVM hoists `nn.pad` out;
-the accumulator must be **int32** (int16 wraps on real weights — 41.6% of outputs
-wrong); per-channel quant params hide in the filter window's **pad channel**
-(a 4th `aie::port` is unproven, and appending bytes breaks `ColBC`); kernel-visible
-helpers must be **macros**, not `static inline`; and the link needs the BSP's
-`libxil.a` de-duplicated against `libxaienginea78.a`.
+the subgraph is the **fused** op (conv → requantize → ReLU → uint8), because that
+is all the AIE kernel can emit; the uint8 input (zero-point 113) goes in as
+**`x − 128`** with `+128·Σw` folded into the bias — a plain cast corrupts every
+pixel ≥ 128; TVM pads with the **zero-point**, so the library takes the
+**pre-padded** 230×230 tensor; layers map onto Relay convs by **weight
+fingerprint**, not position (shortcut convs run in a different order); the
+accumulator must be **int32**; per-channel quant params hide in the filter
+window's **pad channel**; kernel-visible helpers must be **macros**; and the link
+needs the BSP's `libxil.a` de-duplicated against `libxaienginea78.a`.
 
 ### Pass Pipeline
 
@@ -268,6 +270,7 @@ Each dialect has its own `unitest/` directory with independent CMake build:
 - **[doc/performance/register_write_cost.md](doc/performance/register_write_cost.md)** — **Measured** host↔AIE register access cost: ~372 ns per 32-bit `XAie_Write32` (non-posted Device-nGnRnE NoC round trip; an N-word BD is N serial writes) vs ~2.9 ns via control packets. Cite this instead of deriving ns/write from a timeline span.
 - **[doc/tilinglinalg.md](doc/tilinglinalg.md)** — TilingLinalg deep dive: dialects, passes, routing engine, build/HW-run flow
 - **[doc/design/kernel_config_offload.md](doc/design/kernel_config_offload.md)** — `#pragma KERNELCONFIGOFFLOAD`: core self-configured DMA, lock asymmetry, BD-id reservation
+- **[doc/design/aie_offload_byoc.md](doc/design/aie_offload_byoc.md)** — `--aie-offload`: TVM BYOC → `libconv2dstem.a`, fused boundary, uint8 shift, weight-fingerprint layer mapping
 - **[doc/design/kernel_dma_aggregation.md](doc/design/kernel_dma_aggregation.md)** — `DfscheduleKernelAggregationPass`, `declaretile.self`, `packet_id`/`ooo_bd_id` operands
 - **[doc/debug/tutorial_aiehlc.md](doc/debug/tutorial_aiehlc.md)** — aiehlc simulator + debug UI (`--platform sim`, `--sim-only`)
 - **[doc/debug/tutorial_baremetal.md](doc/debug/tutorial_baremetal.md)** — naiebaremetal VEK385 boot + debug UI
@@ -285,6 +288,7 @@ Read the matching skill when the task fits:
 |-------|-------|
 | Debug UI, daemon, live session, browser UI features | **debug-ui-framework** (+ [reference.md](.cursor/skills/debug-ui-framework/reference.md)) |
 | Embedded LLM context loss on retarget | debugui-llm-reset |
+| Debug UI grid: every tile red border + ⚠ "supply/demand mismatch" on every launch | flowbalancebroadcast |
 | Static XAie API verify (routing.cc, host.cc) | xaieapiverify |
 | Routing debug (IR → generated code) | routinghwdebug |
 | DMA BD verify in host.cc | dmabdverify |
@@ -305,9 +309,9 @@ Read the matching skill when the task fits:
 | Pipeline "succeeds" but emits an EMPTY module (0 routing connections, no BCF/PRX → `Couldn't open aie2ps.prx`): `__global__` in a comment, or a prototype above the kernel | aiesourcetextrewrite |
 | `deploy_flow.py` emits fp32 instead of the default int8, `target.build.llvm is not enabled`, missing `onnx`, or stage-5 split silently skipped | tvmrelaynollvm |
 | PT2E int8 → torch-mlir yields no `!torch.qint8` / no `linalg.*_q` (fusion passes look like no-ops); TOSA "failed to legalize `dequantize_per_channel`"; `pip install torchvision` upgrading torch | torchmlirquantfusion |
-| TVM BYOC → AIE offload (`--byoc-aie`), conv2dstem int32/epilogue, duplicate `XAie_*` at link | byocaieoffload |
+| TVM `--aie-offload` (BYOC → AIE): fused boundary, uint8 shift, zero-point padding, weight-fingerprint layer mapping, conv2dstem int32/epilogue, duplicate `XAie_*` at link | byocaieoffload |
 | `--aie-offload` says `non-4D shapes; not a conv2d` for every layer, or a layer gets another layer's geometry (`K=0`); TVM 5-D NCHWc vs aiehlc's d1..d4 | nchwclayoutfold |
-| `Option '...' registered more than once` / `Option 'basic' already exists` when TVM flow loads `_aietriton_core` (two LLVMs) | aietritontvmllvm |
+| `Option '...' registered more than once` / `Option 'basic' already exists` when TVM flow loads `_aiebackend` (two LLVMs) | aiebackendtvmllvm |
 | Frontend prints "OVER BUDGET" / gates offload on tile memory — don't; offload is blind, aiehlc tiles | aieoffloadblind |
 | AEG IPC sim C++ headers | aeg-sim-cxx-headers |
 | Host codegen | hostcodegen |

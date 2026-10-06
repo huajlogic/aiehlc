@@ -75,13 +75,15 @@ Seven stages, matching the seven things this flow has to prove:
    reimplemented -- ``example/model/resnet18py/classify.py:preprocess`` -- so
    the board and the CPU reference cannot disagree over normalization.
 
-   **AIE offload** (``--aie-offload``, off by default) runs alongside this
-   stage, not instead of it: the selected layers (default layer 0, the 7x7/s2
-   stem) are additionally lowered through the ``aiegraph`` dialect and
-   ``run_aie_pipeline`` into ``layers/<NN_name>/aie/``. The C path and this
-   APU ELF are produced either way -- verified byte-identical with the flag on
-   and off. Offload is blind: no tile-budget check on this side -- tiling and
-   memory fit are aiehlc's job. See ``aie_offload.py``.
+   **AIE offload** (``--aie-offload``, off by default) puts the selected
+   layers (``--aie-layers``, default 1 = the 7x7/s2 stem) on the AIE through
+   TVM BYOC: the convs are partitioned out of the Relay graph, the C is
+   rebuilt, and the graph executor calls the generated wrapper -> the aiehlc
+   library ``aout/libconv2dstem.a`` in their place. The library is built
+   separately (``source script/aiehlc.sh --aie-version 5 --runtime-source-file
+   src/aietensorop/conv2dstem/conv2dstem.cc``); aiehlc generates its device
+   init / mesh partition / launch. Offload is blind: no tile-budget check on
+   this side. See ``aie_offload.py`` and ``byoc/``.
 
    **Whole-graph aiegraph** (``--aiegraph``) is the other way in, and differs
    in that it does not take a layer selection: it lifts the *entire* graph into
@@ -132,7 +134,7 @@ Run::
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --no-arm
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py \\
-        --aie-offload --aie-layers 0,2 --aie-mesh 4x4
+        --aie-offload --aie-layers 1
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aiegraph
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py \\
         --aiegraph --aiegraph-ops conv_bn_relu --no-arm
@@ -175,11 +177,10 @@ NO_LLVM_DISABLED_PASSES = ["AlterOpLayout", "FoldConstant"]
 
 DEFAULT_OUT = Path("./worklocal/tvmrelay_deploy")
 
-#: Op kinds ``run_aie_pipeline`` has a kernel body for; everything else stays
-#: on the APU no matter what ``--aie-layers`` (or ``--aiegraph-ops``) asks for.
-#: This is the single list the ``--aiegraph`` partition is decided against --
-#: widen it only when the op gains both a ``frontend.tvmrelay.kernels`` body and a
-#: runtime path, or the offload emits a kernel that does not compute the layer.
+#: Conv op kinds. ``--aie-ops`` filters ``--aie-offload``'s layer selection by
+#: them (a selected conv still needs a matching AIE kernel -- ``byoc/aie_patterns``
+#: decides that), and the ``--aiegraph`` partition is decided against the same
+#: list, where each op also needs a ``frontend.tvmrelay.kernels`` body.
 AIE_OP_KINDS = ("conv_bn_relu", "conv_bn")
 
 
@@ -640,18 +641,116 @@ def cpu_reference(out_dir: Path, image=None, topk: int = 5,
     return top
 
 
+def _stage_split(c_path, out_dir: Path, *, split: bool, compiles: bool,
+                 flat: bool, verbose: bool):
+    """Stage 5: one folder per layer, in execution order. Returns the result or None."""
+    if not split:
+        if verbose:
+            print("[5/7] split  : skipped (--no-split)")
+        return None
+    if not compiles:
+        # Splitting C that does not compile just multiplies the broken file.
+        if verbose:
+            print("[5/7] split  : skipped -- the emitted C does not compile")
+        return None
+    from frontend.tvmrelay.split_layers import split_layers
+
+    layers = split_layers(c_path, out_dir=out_dir / "layers",
+                          group=not flat, verbose=False)
+    if verbose:
+        check = layers.get("syntax_check")
+        note = ("all compile" if check == "pass"
+                else f"{len(check)} FAILED" if isinstance(check, list)
+                else str(check))
+        print(f"[5/7] split  : {layers['layer_count']} layers -> "
+              f"{out_dir / 'layers'}/ ({note})")
+        key = "path" if flat else "dir"
+        shown = [f"{e[key]}{'' if flat else '/'}" for e in layers["layers"][:4]]
+        print(f"[5/7]          {', '.join(shown)}, ... "
+              f"({layers['layer_count']} in execution order)")
+    return layers
+
+
+def _stage_aie_offload(mod, params, out_dir: Path, aie_layers, aie_ops, *,
+                       layers_ok: bool, fuse: bool, verbose: bool) -> dict:
+    """Stage 6a: offload the selected layers to AIE through TVM BYOC.
+
+    1. Layer indices -> conv weight fingerprints, from the CPU build just
+       written (``aie_offload.resolve_conv_targets``).
+    2. ``partition_for_aie`` on the pre-build Relay module. Each target must be
+       exactly one Relay conv with the same geometry (``check_targets``), or
+       nothing is offloaded -- the wrong conv on the AIE computes garbage.
+    3. Rebuild the C. Returns ``{"count", "c_path", ...}``; ``count == 0``
+       means the CPU build stands unchanged.
+    """
+    from frontend.tvmrelay import aie_offload as _aie
+    from frontend.tvmrelay.byoc import aie_byoc
+    from frontend.tvmrelay.byoc.aie_codegen import AIE_ENTRY
+
+    if not layers_ok:
+        if verbose:
+            print("[6/7] aie    : skipped -- needs stage 5's layers/ to resolve "
+                  "--aie-layers")
+        return {"count": 0, "reason": "no layers/"}
+    res = _aie.resolve_conv_targets(out_dir, aie_layers, tuple(aie_ops))
+    if not res.get("ok"):
+        if verbose:
+            print(f"[6/7] aie    : skipped -- {res['reason']}")
+        return {"count": 0, **res}
+    targets = res["targets"]
+    if verbose:
+        sel = "all" if aie_layers is None else ",".join(str(i) for i in aie_layers)
+        print(f"[6/7] aie    : offloading layer(s) {sel} to AIE via BYOC")
+        for s in res["selections"]:
+            if not s.get("eligible"):
+                print(f"  [aie] layer {s['index']:02d} {s['kind']}: skipped -- "
+                      f"{s['reason']}")
+            else:
+                print(f"  [aie] layer {s['index']:02d} {s['kind']}: {s['H']}x"
+                      f"{s['W']}x{s['Cin']} -> {s['Cout']}ch K{s['K']}s{s['stride']}")
+    if not targets:
+        return {"count": 0, **res}
+
+    fp_layer = {t["fingerprint"]: layer for layer, t in targets.items()}
+    pmod, info = aie_byoc.partition_for_aie(mod, params, convs=set(fp_layer),
+                                            verbose=verbose)
+    bad = _aie.check_targets(targets, info["convs"])
+    if bad:
+        if verbose:
+            print("[6/7]          selected layers do not map onto the Relay graph "
+                  "-- offloading NOTHING:")
+            for line in bad[:5]:
+                print(f"              {line}")
+        return {"count": 0, "mapping_errors": bad, **res}
+    for fp in info["unmatched"]:
+        if verbose:
+            print(f"  [aie] layer {fp_layer[fp]:02d}: no AIE kernel for this conv "
+                  f"yet -- stays on the APU (AIE_BYOC_DEBUG=1 for the reason)")
+    if not info["count"]:
+        return {"count": 0, **res, "byoc": info}
+
+    if verbose:
+        print(f"[6/7]          rebuilding the C with {info['count']} AIE "
+              f"subgraph(s) (calls {AIE_ENTRY}() in aout/libconv2dstem.a)")
+    c_path = build_c(pmod, None, out_dir, fuse=fuse, verbose=verbose)
+    return {**res, "count": info["count"], "functions": info["functions"],
+            "c_path": c_path, "byoc": info}
+
+
 def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         global_scale: float = 8.0, fuse: bool = True, split: bool = True,
         flat: bool = False, arm: bool = True, image=None,
         aie_offload: bool = False, aie_layers=(0,),
         aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
         aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
-        relay_ptq: bool = False, byoc_aie: int = 0, verbose: bool = True) -> dict:
+        relay_ptq: bool = False, verbose: bool = True) -> dict:
     """Run all seven stages. Returns a dict of what happened.
 
-    ``aie_offload`` turns on the aiegraph path for ``aie_layers`` (default
-    layer 0, the 7x7/s2 stem); ``None`` means every eligible layer. It is
-    additive -- the C generation and the APU ELF are produced either way.
+    ``aie_offload`` offloads ``aie_layers`` (stage-5 layer indices; ``None``
+    means every eligible layer) to AIE through TVM BYOC: after the CPU build,
+    the selected convs are partitioned out of the Relay graph and the C is
+    rebuilt, so the graph executor calls the generated wrapper -> the aiehlc
+    AIE library in place of TVM's own kernel (``_stage_aie_offload``).
 
     ``aiegraph`` instead lifts the **whole** graph into one verified
     ``aiegraph.func`` and partitions it: layers whose aiegraph ops are all in
@@ -729,71 +828,24 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         quantized = True
         quantizer = "onnx_ptq"
 
-    # BYOC: partition conv subgraphs out to the AIE backend before codegen.
-    # Must run BEFORE relay.build -- build internally applies AlterOpLayout,
-    # which rewrites nn.conv2d into 5-D contrib_conv2d_NCHWc that neither the
-    # pattern nor the kernel recognizes.
-    byoc = None
-    if byoc_aie:
-        from frontend.tvmrelay.byoc import aie_byoc
-
-        mod, byoc = aie_byoc.partition_for_aie(mod, n=byoc_aie, verbose=verbose)
-        if verbose:
-            print(f"[4/7] byoc   : {byoc.get('count', 0)} subgraph(s) offloaded "
-                  f"to AIE of {byoc.get('matched', 0)} matched "
-                  f"(--byoc-aie {byoc_aie})")
-
     c_path = build_c(mod, params, out_dir, fuse=fuse, verbose=verbose)
     compiles = verify_c(c_path, verbose=verbose)
 
-    layers = None
-    if not split:
-        if verbose:
-            print("[5/7] split  : skipped (--no-split)")
-    elif not compiles:
-        # Splitting C that does not compile just multiplies the broken file by
-        # 22. Fail at the source instead.
-        if verbose:
-            print("[5/7] split  : skipped -- the emitted C does not compile")
-    else:
-        from frontend.tvmrelay.split_layers import split_layers
-        layers = split_layers(c_path, out_dir=out_dir / "layers",
-                              group=not flat, verbose=False)
-        if verbose:
-            check = layers.get("syntax_check")
-            note = ("all compile" if check == "pass"
-                    else f"{len(check)} FAILED" if isinstance(check, list)
-                    else str(check))
-            print(f"[5/7] split  : {layers['layer_count']} layers -> "
-                  f"{out_dir / 'layers'}/ ({note})")
-            # One folder per layer, already in execution order -- just show the
-            # first few so the ordering is visible at a glance.
-            key = "path" if flat else "dir"
-            shown = [f"{e[key]}{'' if flat else '/'}"
-                     for e in layers["layers"][:4]]
-            print(f"[5/7]          {', '.join(shown)}, ... "
-                  f"({layers['layer_count']} in execution order)")
+    layers = _stage_split(c_path, out_dir, split=split, compiles=compiles,
+                          flat=flat, verbose=verbose)
 
-    # AIE offload is additive: selected layers also get aiegraph-lowered AIE
-    # artifacts in their layer folder. The C path and the APU ELF below are
-    # unchanged, so a run with offload on still produces the same program.
+    # AIE offload via BYOC: partition the selected convs out of the Relay
+    # graph and rebuild, so main.elf calls the AIE library for them.
     aie = None
     if aie_offload:
-        if layers is None:
-            if verbose:
-                print("[6/7] aie    : skipped -- needs stage 5's layers/")
-        else:
-            from frontend.tvmrelay import aie_offload as _aie
-
-            if verbose:
-                sel = "all" if aie_layers is None else \
-                    ",".join(str(i) for i in aie_layers)
-                print(f"[6/7] aie    : offloading layer(s) {sel} via aiegraph")
-            aie = _aie.offload_layers(out_dir, indices=aie_layers,
-                                      op_kinds=tuple(aie_ops), mesh=mesh,
-                                      verbose=verbose)
-            if verbose and not aie.get("ok"):
-                print(f"[6/7]          {aie.get('reason', 'offload failed')}")
+        aie = _stage_aie_offload(mod, params, out_dir, aie_layers, aie_ops,
+                                 layers_ok=layers is not None, fuse=fuse,
+                                 verbose=verbose)
+        if aie.get("count"):
+            c_path = aie["c_path"]
+            compiles = verify_c(c_path, verbose=verbose)
+            layers = _stage_split(c_path, out_dir, split=split,
+                                  compiles=compiles, flat=flat, verbose=verbose)
 
     # Whole-graph aiegraph + AIE/CPU partition. Also additive: CPU layers keep
     # reusing the stage-5 C, and AIE layers keep theirs too so the ELF links.
@@ -878,29 +930,25 @@ def main(argv=None) -> int:
                     help="image path or URL to classify "
                          "(default: the pytorch/hub dog.jpg sample)")
     ap.add_argument("--aie-offload", action="store_true",
-                    help="also lower the selected layers through the aiegraph "
-                         "dialect to AIE (additive: the C path and the APU "
-                         "ELF are still produced)")
+                    help="offload the --aie-layers to AIE through TVM BYOC: "
+                         "the generated C calls the aiehlc AIE library "
+                         "(aout/libconv2dstem.a) in place of TVM's kernel. "
+                         "Only the ResNet-18 stem has an AIE kernel today")
     ap.add_argument("--aie-layers", default="1",
-                    help="which layers to offload: an index, a comma list, or "
-                         "'all' (default: 0, the 7x7/s2 stem)")
+                    help="which layers to offload, as numbered in layers/ by "
+                         "the CPU build: an index, a comma list, or 'all' "
+                         "(default: 1, the 7x7/s2 stem)")
     ap.add_argument("--aie-ops", default=",".join(AIE_OP_KINDS),
                     help=f"op kinds eligible for AIE "
                          f"(default: {','.join(AIE_OP_KINDS)})")
     ap.add_argument("--aie-mesh", default="2x2",
-                    help="AIE mesh as ROWSxCOLS (default: 2x2)")
+                    help="AIE mesh as ROWSxCOLS for --aiegraph (default: 2x2); "
+                         "--aie-offload uses the mesh built into the AIE library")
     ap.add_argument("--aiegraph", action="store_true",
                     help="lift the WHOLE graph into one aiegraph.func, then "
                          "partition: layers matching --aiegraph-ops go to the "
                          "aiehlc kernel backend, the rest reuse the TVM CPU C "
                          "(verdicts in layers/partition.json)")
-    ap.add_argument("--byoc-aie", type=int, nargs="?", const=1, default=0,
-                    metavar="N",
-                    help="offload the first N matching conv subgraphs to AIE "
-                         "via TVM BYOC (default: 0 = off; bare --byoc-aie "
-                         "means 1). Only the ResNet-18 stem geometry currently "
-                         "has a real kernel (libconv2dstem.a); other matches "
-                         "get a placeholder body")
     ap.add_argument("--relay-ptq", action="store_true",
                     help="quantize with relay.quantize instead of the default "
                          "ONNX PTQ: symmetric-only, leaves an fp32 head and "
@@ -947,7 +995,7 @@ def main(argv=None) -> int:
                  aie_ops=tuple(s.strip() for s in args.aie_ops.split(",")),
                  mesh=(rows, cols),
                  aiegraph=args.aiegraph, aiegraph_ops=aiegraph_ops,
-                 relay_ptq=args.relay_ptq, byoc_aie=args.byoc_aie)
+                 relay_ptq=args.relay_ptq)
     return 0 if result.get("ok") else 1
 
 

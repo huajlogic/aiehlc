@@ -2,33 +2,29 @@
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 ###############################################################################
-"""Select layers to offload to AIE, and lower them through the aiegraph dialect.
+"""Map ``--aie-offload --aie-layers`` onto the convs the AIE BYOC path offloads.
 
-The default flow keeps every layer on the APU as generated C. With
-``--aie-offload`` the chosen layers instead go:
+``--aie-offload`` runs through TVM BYOC (``byoc/``): the selected layers are
+partitioned out of the Relay graph BEFORE ``relay.build``, and TVM's graph
+executor calls the generated wrapper -- which calls the aiehlc-built AIE
+library -- in place of its own kernel. See ``deploy_flow.run`` and
+``doc/design/byoc_aie_plan.md``.
 
-    LayerOp geometry  ->  aiegraph.conv_bn_relu  (built + verified in C++)
-                      ->  lower_aiegraph         (-> per-launch tensor_specs)
-                      ->  run_aie_pipeline       (-> host.cc/kernel.cc/
-                                                     routing.cc/aieml.bcf)
+Layer index -> conv identity
+----------------------------
+``--aie-layers`` numbers layers the way stage 5 does (``layers/NN_<name>/``,
+from the CPU build), but BYOC partitions Relay, where those layers do not exist
+yet. Position cannot bridge the two: the graph executor runs each ResNet
+shortcut conv AFTER its main branch (fused with the residual add) while
+Relay's post-order meets it first. So a selected layer is identified by its
+conv's **weights** (``byoc.aie_annotate.weight_fingerprint``, a hash of the
+sorted values -- layout- and dtype-independent): ``resolve_conv_targets``
+fingerprints the layer's weight param in the CPU build, and
+``check_targets`` demands exactly one Relay conv with that fingerprint AND the
+same geometry before anything is offloaded.
 
-Artifacts land in that layer's folder under ``layers/`` -- ``00_conv2d_add_relu/``
-gets an ``aie/`` subdirectory -- which is what the per-layer, execution-ordered
-layout exists for. The C path and the APU ``main.elf`` are untouched: this is
-additive, so a run with offload on still produces the same CPU program.
-
-Selection
----------
-``--aie-layers`` takes indices (``0``, ``0,2,4``, ``all``) and ``--aie-ops``
-filters by op kind, defaulting to the conv2d family because that is all
-``run_aie_pipeline`` implements. Layer 0 is the default: it is the 7x7/s2 stem,
-the first thing to execute and the easiest to reason about.
-
-**No tile-budget check here -- offload is blind by design.** Every selected
-layer is handed to aiehlc as-is; spatial tiling, halo, mesh partitioning and
-the per-tile memory budget are aiehlc's job, and it reports what does not fit.
-Predicting that from Python would duplicate (and drift from) the backend's own
-policy -- see ``doc/design/byoc_aie_plan.md``.
+**No tile-budget check here -- offload is blind by design.** Tiling and the
+per-tile memory budget are aiehlc's job (skill: aieoffloadblind).
 """
 
 from __future__ import annotations
@@ -38,13 +34,12 @@ import json
 import sys
 from pathlib import Path
 
-__all__ = ["select_layers", "offload_layers", "parse_selection"]
+__all__ = ["select_layers", "parse_selection", "resolve_conv_targets",
+           "check_targets", "aie_backend"]
 
 #: Only the conv2d family has a kernel body + runtime path. Everything else in
 #: the graph stays on the APU regardless of what is selected.
 AIE_OP_KINDS = ("conv_bn_relu", "conv_bn")
-
-DEFAULT_MESH = (2, 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -164,43 +159,6 @@ def _layer_geometry(graph: dict, node_idx: int) -> dict:
             "needs_repack": _blocked(raw_in) or _blocked(raw_out)}
 
 
-def _require_emit_deps() -> None:
-    """Fail with both missing names, before any of the emit work starts.
-
-    The emit path needs two things:
-
-      * ``frontend.tvmrelay.kernels`` -- the kernel-body generator
-        (``kernel_body_for()``), restored from the ``src/frontend/tvm/``
-        package that ``05ee99d`` deleted.
-      * ``_aiebackend`` -- the AIE backend pybind module. cmake silently skips
-        it unless it finds python3-dev AND pybind11 (pass ``-Dpybind11_DIR``;
-        the pip install is not on cmake's search path). ``aie_backend()`` finds
-        the ``.so`` in the build tree and runs it out of process, because it
-        cannot share a process with TVM (skills: mlirbuildsandbox,
-        aiebackendtvmllvm).
-
-    Raised up front, naming both, instead of letting a bare
-    ``ModuleNotFoundError`` surface from an import several frames down. Layer
-    selection runs before this and is useful on its own, so the caller still
-    sees it.
-    """
-    missing = []
-    try:
-        aie_backend()
-    except Exception as exc:
-        missing.append(f"AIE backend _aiebackend ({type(exc).__name__}: {exc})")
-    try:
-        from frontend.tvmrelay import kernels  # noqa: F401
-    except Exception:
-        missing.append("frontend.tvmrelay.kernels -- the kernel-body "
-                       "generator; --aie-offload cannot emit without it")
-    if missing:
-        raise RuntimeError(
-            "AIE emit unavailable: " + "; ".join(missing)
-            + ". Layer selection above still ran. "
-              "The working offload path today is --byoc-aie.")
-
-
 def _geometry_reject_reason(graph: dict, node_idx: int) -> str:
     """Say WHY the geometry was unusable, with the actual shapes."""
     shapes = graph["attrs"]["shape"][1]
@@ -277,8 +235,8 @@ def select_layers(manifest: dict, graph: dict, indices=None,
 
         if aie_op is None or aie_op not in op_kinds:
             sel.update(eligible=False,
-                       reason=f"op kind {kind!r} has no AIE kernel "
-                              f"(run_aie_pipeline implements {', '.join(op_kinds)})")
+                       reason=f"op kind {kind!r} is not a conv -- only convs "
+                              f"offload through the AIE BYOC path")
             picked.append(sel)
             continue
         if node_idx is None:
@@ -330,103 +288,72 @@ def aie_backend():
     return _BACKEND
 
 
-def build_aiegraph_ir(selections: list, func_name: str = "offload") -> str:
-    """Lift the eligible selections into one verified ``aiegraph.func``.
+# ═══════════════════════════════════════════════════════════════════════════
+#  Layer index -> conv identity
+# ═══════════════════════════════════════════════════════════════════════════
 
-    Built as a single module rather than one per layer so the dialect verifies
-    the whole offloaded subgraph at once, and so the textual IR is a readable
-    record of exactly what was handed to the backend.
+_GEOM_KEYS = ("Cin", "Cout", "K", "stride")
+
+
+def _weight_param(graph: dict, node_idx: int):
+    """Name of the conv node's weight input (rank 6 NCHWc-blocked, or rank 4 OIHW)."""
+    shapes = graph["attrs"]["shape"][1]
+    row_ptr = graph["node_row_ptr"]
+    for src, slot, _ in graph["nodes"][node_idx]["inputs"][1:]:
+        s = shapes[row_ptr[src] + slot]
+        if len(s) == 6 or (len(s) == 4 and s[0] != 1):
+            return graph["nodes"][src]["name"]
+    return None
+
+
+def resolve_conv_targets(out_dir, indices=None, op_kinds=AIE_OP_KINDS) -> dict:
+    """Stage-5 layer indices -> conv weight fingerprints, from the CPU build in *out_dir*.
+
+    Returns ``{"ok", "reason"?, "selections", "targets": {layer: {fingerprint,
+    geometry}}}``. Layers that are not convs come back in ``selections`` with
+    ``eligible=False`` and a reason.
     """
-    backend = aie_backend()
-    ops = []
+    from tvm import relay
+
+    from frontend.tvmrelay.byoc.aie_annotate import weight_fingerprint
+
+    out_dir = Path(out_dir).resolve()
+    manifest_path = out_dir / "layers" / "manifest.json"
+    graph_path = next(out_dir.glob("*_graph.json"), None)
+    params_path = next(out_dir.glob("*_params.bin"), None)
+    if not manifest_path.is_file() or graph_path is None or params_path is None:
+        return {"ok": False, "reason": "needs stage 4's *_graph.json + *_params.bin "
+                                       "and stage 5's layers/manifest.json"}
+    manifest = json.loads(manifest_path.read_text())
+    graph = json.loads(graph_path.read_text())
+    params = relay.load_param_dict(params_path.read_bytes())
+
+    selections = select_layers(manifest, graph, indices, op_kinds)
+    targets = {}
     for sel in selections:
         if not sel.get("eligible"):
             continue
-        ops.append({
-            "op": sel["aie_op"],
-            # -1 = network input. Each offloaded layer is launched standalone
-            # (the APU owns the buffers between launches), so none of them
-            # chains to another layer's aiegraph result.
-            "main_index": -1,
-            "H": sel["H"], "W": sel["W"], "Cin": sel["Cin"],
-            "Cout": sel["Cout"], "K": sel["K"], "stride": sel["stride"],
-            "in_scale": 1.0, "in_zp": 0, "out_scale": 1.0, "out_zp": 0,
-            "bn_scale": 64, "bn_bias": 0,
-            "weights": f"w{sel['index']}",
-        })
-    if not ops:
-        return ""
-    return backend.build_aiegraph_module(ops, func_name)
+        name = _weight_param(graph, sel["node"])
+        if name is None or name not in params:
+            sel.update(eligible=False, reason="cannot find the conv's weight param")
+            continue
+        targets[sel["index"]] = {
+            "fingerprint": weight_fingerprint(params[name].numpy()),
+            **{k: sel[k] for k in _GEOM_KEYS}}
+    return {"ok": True, "selections": selections, "targets": targets}
 
 
-def offload_layers(out_dir, indices=None, op_kinds=AIE_OP_KINDS,
-                   mesh=DEFAULT_MESH, verbose: bool = True) -> dict:
-    """Offload the selected layers through aiegraph. Returns a result dict.
+def check_targets(targets: dict, relay_convs: list) -> list:
+    """Every target must be exactly one Relay conv with the same geometry.
 
-    Writes each layer's AIE artifacts into ``layers/<NN_name>/aie/`` and the
-    shared textual IR to ``layers/aiegraph.mlir``. The APU C path is not
-    touched.
+    Returns a list of error strings (empty = OK).
     """
-    out_dir = Path(out_dir).resolve()
-    layers_dir = out_dir / "layers"
-    manifest_path = layers_dir / "manifest.json"
-    graph_path = next(out_dir.glob("*_graph.json"), None)
-    if not manifest_path.is_file():
-        return {"ok": False, "reason": "layers/manifest.json not found "
-                                       "(stage 5 did not run)"}
-    if graph_path is None:
-        return {"ok": False, "reason": "no *_graph.json in the output dir"}
-
-    manifest = json.loads(manifest_path.read_text())
-    graph = json.loads(graph_path.read_text())
-    selections = select_layers(manifest, graph, indices, op_kinds)
-    eligible = [s for s in selections if s.get("eligible")]
-
-    if verbose:
-        for sel in selections:
-            if not sel.get("eligible"):
-                print(f"  [aie] layer {sel['index']:02d} {sel['kind']}: "
-                      f"skipped -- {sel['reason']}")
-    if not eligible:
-        return {"ok": False, "reason": "no eligible layers selected",
-                "selections": selections}
-
-    # No budget check: tiling and memory fit are aiehlc's call (module doc).
-    if verbose:
-        for sel in eligible:
-            print(f"  [aie] layer {sel['index']:02d} {sel['kind']}: "
-                  f"{sel['H']}x{sel['W']}x{sel['Cin']} -> {sel['Cout']}ch "
-                  f"K{sel['K']}s{sel['stride']}")
-
-    _require_emit_deps()
-
-    ir = build_aiegraph_ir(eligible)
-    ir_path = layers_dir / "aiegraph.mlir"
-    ir_path.write_text(ir)
-    if verbose:
-        print(f"  [aie] aiegraph IR verified -> {ir_path.name}")
-
-    backend = aie_backend()
-    from frontend.tvmrelay import kernels
-
-    launches = backend.lower_aiegraph(ir)
-    built = []
-    for sel, launch in zip(eligible, launches):
-        layer_dir = layers_dir / (sel["dir"] or f"{sel['index']:02d}")
-        aie_dir = layer_dir / "aie"
-        aie_dir.mkdir(parents=True, exist_ok=True)
-        specs = [(list(shape), int(bits), bool(is_in))
-                 for (shape, bits, is_in) in launch["tensor_specs"]]
-        body = kernels.kernel_body_for(sel["aie_op"], launch["func_name"])
-        ok = backend.run_aie_pipeline(mesh[0], mesh[1], specs, str(aie_dir),
-                                   body, launch["func_name"])
-        produced = sorted(p.name for p in aie_dir.iterdir()) if ok else []
-        built.append({"index": sel["index"], "dir": str(aie_dir), "ok": bool(ok),
-                      "func_name": launch["func_name"], "files": produced})
-        if verbose:
-            print(f"  [aie] layer {sel['index']:02d} -> {aie_dir.relative_to(out_dir)}/ "
-                  f"({len(produced)} files: {', '.join(produced[:4])}"
-                  f"{', ...' if len(produced) > 4 else ''})")
-
-    return {"ok": all(b["ok"] for b in built), "ir": str(ir_path),
-            "layers": built, "selections": selections}
+    bad = []
+    for layer, t in targets.items():
+        hits = [c for c in relay_convs if c["fingerprint"] == t["fingerprint"]]
+        if len(hits) != 1:
+            bad.append(f"layer {layer}: {len(hits)} Relay convs carry its weights, want 1")
+        elif any(hits[0][k] != t[k] for k in _GEOM_KEYS):
+            bad.append(f"layer {layer}: graph {[t[k] for k in _GEOM_KEYS]} vs Relay "
+                       f"{[hits[0][k] for k in _GEOM_KEYS]} (Cin,Cout,K,stride)")
+    return bad

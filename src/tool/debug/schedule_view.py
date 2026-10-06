@@ -650,11 +650,25 @@ def compute_flow_balance(flow_summary):
         note = ''
 
         if len(shim_prod) == 1 and core_cons and not core_prod and not shim_cons:
-            pattern = 'broadcast'
+            # One shim feeding N cores is either a REPLICATING broadcast (every
+            # core receives the whole stream -- e.g. a ColBC filter window sent
+            # down a column) or a SPLITTING scatter (each core takes its slice).
+            # The flow summary carries no flag for which, but the bytes decide
+            # it: replicate <=> every read == supply, split <=> sum == supply.
+            # Checking only the split form flagged every true broadcast as a
+            # 4x "under-supply" and painted all compute tiles red.
             supply = shim_prod[0]['bd_len']
-            demand = sum(c['bd_len'] for c in core_cons)
-            balanced = (supply == demand)
-            note = 'shim per-fire bytes vs sum of %d core reads' % len(core_cons)
+            reads = [c['bd_len'] for c in core_cons]
+            if len(core_cons) > 1 and all(r == supply for r in reads):
+                pattern = 'broadcast'
+                demand = supply
+                balanced = True
+                note = 'shim per-fire bytes replicated to each of %d core reads' % len(core_cons)
+            else:
+                pattern = 'scatter'
+                demand = sum(reads)
+                balanced = (supply == demand)
+                note = 'shim per-fire bytes vs sum of %d core reads' % len(core_cons)
         elif len(shim_cons) == 1 and core_prod and not core_cons and not shim_prod:
             pattern = 'gather'
             supply = sum(p['bd_len'] for p in core_prod)

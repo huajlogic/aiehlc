@@ -421,7 +421,7 @@ __global__(conv_policy) void conv2d_spatial(
 // ═══════════════════════════════════════════════════════════════════════════
 // Header include placement — DO NOT move this to the top of the file.
 //
-// conv2dstem.h declares conv2d_stem(), which contains the <<<mesh>>> launch.
+// conv2dstem.h declares conv2d_stem(), whose call chain reaches the mesh launch.
 // The aiehlc Clang frontend's VisitFunctionDecl registers an annotated kernel
 // into globalKernelFuncs when it visits the kernel DEFINITION, and resolves the
 // launch's tensor parameters by looking the kernel up in that map.
@@ -488,6 +488,10 @@ static int8_t *g_ifm_pad = nullptr;       // [230,230,4] spatially + channel pad
 static int8_t *g_wts_bt = nullptr;        // B^T [64,196]
 static uint8_t *g_ofm = nullptr;          // [112,112,64] AIE destination (uint8 after requantize)
 static const int8_t *g_wts_src = nullptr; // provenance of the packed weights
+// Set once conv2d_stem_prepadded() has written the spatial border with the
+// caller's pad value; stage_ifm() then re-zeroes it before trusting the zero
+// border again.
+static int g_border_dirty = 0;
 
 // Allocate the staging buffers on first use. The zero-pad regions are written
 // once here and never touched again: stage_ifm() only ever overwrites the
@@ -522,6 +526,10 @@ static int ensure_staging(void) {
 // ensure_staging() — do NOT memset here, it would re-zero 211600 bytes every
 // call to rewrite regions that are already zero.
 static void stage_ifm(const int8_t *ifm) {
+    if (g_border_dirty) {
+        memset(g_ifm_pad, 0, IFM_PAD_ELEMS * sizeof(int8_t));
+        g_border_dirty = 0;
+    }
     for (int h = 0; h < INPUT_H; h++) {
         for (int w = 0; w < INPUT_W; w++) {
             const int src = (h * INPUT_W + w) * INPUT_C;
@@ -530,6 +538,41 @@ static void stage_ifm(const int8_t *ifm) {
                 g_ifm_pad[dst + c] = ifm[src + c];
         }
     }
+}
+
+// Copy a caller-padded [230,230,3] IFM -- border included -- into the
+// channel-aligned staging buffer. The border carries whatever the caller padded
+// with (a TVM uint8 graph pads with the input zero-point, NOT zero), so it is
+// rewritten on every call and the zero-border invariant stage_ifm() relies on is
+// flagged as broken. Channel 3 is never written and stays zero.
+static void stage_ifm_prepadded(const int8_t *ifm_pad) {
+    for (int h = 0; h < INPUT_H_PAD; h++) {
+        for (int w = 0; w < INPUT_W_PAD; w++) {
+            const int src = (h * INPUT_W_PAD + w) * INPUT_C;
+            const int dst = (h * INPUT_W_PAD + w) * INPUT_C_ALIGN;
+            for (int c = 0; c < INPUT_C; c++)
+                g_ifm_pad[dst + c] = ifm_pad[src + c];
+        }
+    }
+    g_border_dirty = 1;
+}
+
+// Adopt a caller-supplied [230,230,4] IFM verbatim -- already spatially padded
+// AND channel-aligned, i.e. exactly this buffer's own layout, so it is a
+// straight copy with no scatter.
+//
+// This is what the generated fixture (data/make_image_header.py ->
+// conv2dstem_image.h) emits, precisely so the board does no layout work on an
+// image the host already knows the final shape of. Like
+// stage_ifm_prepadded(), the border carries the caller's pad value -- the
+// quantized ResNet graph pads with the input zero-point, not zero -- so the
+// zero-border invariant stage_ifm() relies on is flagged broken.
+//
+// The 4th channel is whatever the caller put there (the fixture writes 0);
+// nothing reads it, because the MAC loop stops at SP_REAL_C.
+static void stage_ifm_pad4(const int8_t *ifm_pad4) {
+    memcpy(g_ifm_pad, ifm_pad4, IFM_PAD_ELEMS * sizeof(int8_t));
+    g_border_dirty = 1;
 }
 
 // Pack the caller's raw [64,7,7,3] filter into the B^T[N,K] layout the kernel
@@ -576,80 +619,22 @@ void conv2d_stem_release(void) {
         g_ofm = nullptr;
     }
     g_wts_src = nullptr;
+    g_border_dirty = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HOST — library entry
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Raw int32 convolution, for callers that do their own requantize.
-//
-// This is what the TVM BYOC path wants: after canonicalization Relay keeps the
-// bias / zero-point / requantize / ReLU as ORDINARY OPS OUTSIDE the partitioned
-// subgraph, so the subgraph TVM hands us is exactly
-// uint8[1,3,230,230] -> int32[1,64,112,112]. Calling the fused conv2d_stem()
-// there would requantize twice and clamp the int32 range down to uint8 before
-// TVM ever sees it.
-//
-// Implemented as "run the fused path with an identity epilogue, then undo the
-// 8-bit store" is NOT possible -- the clamp is lossy. Instead the accumulator
-// is recomputed host-side from the same staged buffers. That is slow (it is
-// the scalar reference), so this entry point is correctness-first: it exists to
-// make the BYOC wiring real and verifiable end to end. Moving it on-core means
-// widening the output window to output_window_int32 and re-deriving
-// LtoR_Merge, which is a separate, riskier change.
-//
-// Returns CONV2DSTEM_OK or a negative CONV2DSTEM_ERR_* code.
-int conv2d_stem_raw(const int8_t *ifm, const int8_t *wts, int32_t *ofm) {
-    if (!ifm || !wts || !ofm)
-        return CONV2DSTEM_ERR_NULL_ARG;
-
-    const int rc = ensure_staging();
-    if (rc != CONV2DSTEM_OK)
-        return rc;
-
-    stage_ifm(ifm);
-    // Identity params: this path never uses them, but stage_weights() is the
-    // single packer and the pad channel must not carry stale values.
-    conv2dstem_qparam ident[NUM_FILTERS];
-    for (int f = 0; f < NUM_FILTERS; f++) {
-        ident[f].bias = 0;
-        ident[f].zero_point = 0;
-        ident[f].multiplier = 1 << 30;
-        ident[f].shift = -1;
-    }
-    stage_weights(wts, ident);
-    g_wts_src = nullptr; // force a re-pack on the next fused call
-
-    for (int oh = 0; oh < OUTPUT_H; oh++)
-        for (int ow = 0; ow < OUTPUT_W; ow++)
-            for (int f = 0; f < NUM_FILTERS; f++) {
-                int32_t acc = 0;
-                for (int kh = 0; kh < KERNEL_H; kh++)
-                    for (int kw = 0; kw < KERNEL_W; kw++)
-                        for (int c = 0; c < INPUT_C; c++) {
-                            const int ih = oh * STRIDE + kh;
-                            const int iw = ow * STRIDE + kw;
-                            const int kk = (kh * KERNEL_W + kw) * INPUT_C_ALIGN + c;
-                            acc += (int32_t)g_ifm_pad[(ih * INPUT_W_PAD + iw) * INPUT_C_ALIGN + c] *
-                                   (int32_t)g_wts_bt[f * K + kk];
-                        }
-                // NCHW: TVM's subgraph output is [1,64,112,112], channel-major,
-                // NOT the HWC the fused path emits.
-                ofm[(f * OUTPUT_H + oh) * OUTPUT_W + ow] = acc;
-            }
-    return CONV2DSTEM_OK;
-}
-
-int conv2d_stem(const int8_t *ifm, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm) {
-    if (!ifm || !wts || !qp || !ofm)
-        return CONV2DSTEM_ERR_NULL_ARG;
-
-    const int rc = ensure_staging();
-    if (rc != CONV2DSTEM_OK)
-        return rc;
-
-    stage_ifm(ifm);
+// Pack weights (if they changed), run conv2d_spatial on the mesh, copy out.
+// The ifm staging buffer must already be filled. This is the ONE launch site:
+// the aiehlc Clang frontend recovers the mesh from the function-local
+// device.partition(...) VarDecl, which must sit in the same function as the
+// kernel launch -- so both public entries funnel through here rather than
+// each carrying its own launch. (Never write the triple-angle launch syntax in
+// a comment near here: aiehlc's source rewriter matches it textually and
+// splices __aie_launch over the surrounding code -- skill aiesourcetextrewrite.)
+static int stem_run(const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm) {
     // Re-pack only when the weight buffer changed identity. Callers mutating
     // weights in place, or swapping qp while reusing the same wts pointer,
     // must call conv2d_stem_invalidate_weights().
@@ -673,6 +658,49 @@ int conv2d_stem(const int8_t *ifm, const int8_t *wts, const conv2dstem_qparam *q
     // the 64-byte-aligned DMA-capable allocation from __Runtime_Alloc.
     memcpy(ofm, g_ofm, OFM_ELEMS * sizeof(uint8_t));
     return CONV2DSTEM_OK;
+}
+
+// Stage a raw caller input, then run. The 4-argument spelling of stem_run().
+//
+// Exists so a driver that INCLUDES this file (src/aietensorop/conv2dstem/main.cc)
+// can say stem_run(ifm, wts, ofm, qp) and get staging + launch in one call,
+// without reaching into ensure_staging()/stage_ifm() itself. An overload rather
+// than a change to the 3-argument form, because the two public entries stage the
+// input DIFFERENTLY -- conv2d_stem_prepadded() uses stage_ifm_prepadded() -- so
+// the input staging cannot be folded into the shared launch site.
+static int stem_run(const int8_t *ifm, const int8_t *wts, uint8_t *ofm, const conv2dstem_qparam *qp) {
+    if (!ifm || !wts || !qp || !ofm)
+        return CONV2DSTEM_ERR_NULL_ARG;
+
+    const int rc = ensure_staging();
+    if (rc != CONV2DSTEM_OK)
+        return rc;
+
+    stage_ifm(ifm);
+    return stem_run(wts, qp, ofm);
+}
+
+int conv2d_stem(const int8_t *ifm, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm) {
+    return stem_run(ifm, wts, ofm, qp);
+}
+
+// Fused conv on an input the caller already padded -- the TVM BYOC entry.
+//
+// TVM hoists the stem's spatial padding into its own nn.pad and fills it with
+// the INPUT ZERO-POINT (113 for this model), not zero, so the library must not
+// re-pad: it takes the [230,230,3] tensor border and all. The caller also
+// shifts the uint8 activations into int8 (x - 128) and folds the matching
+// +128*sum(w) into qp[].bias, which keeps the int8 x int8 kernel exact.
+int conv2d_stem_prepadded(const int8_t *ifm_pad, const int8_t *wts, const conv2dstem_qparam *qp, uint8_t *ofm) {
+    if (!ifm_pad || !wts || !qp || !ofm)
+        return CONV2DSTEM_ERR_NULL_ARG;
+
+    const int rc = ensure_staging();
+    if (rc != CONV2DSTEM_OK)
+        return rc;
+
+    stage_ifm_prepadded(ifm_pad);
+    return stem_run(wts, qp, ofm);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

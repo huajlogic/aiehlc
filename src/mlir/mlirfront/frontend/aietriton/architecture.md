@@ -17,8 +17,8 @@ Reference files:
 | `src/mlir/mlirfront/aietriton/__init__.py` | Python package: `jit` decorator, `_JitKernel`, `_KernelLauncher`, `mesh()` |
 | `src/mlir/mlirfront/aietriton/language.py` | `tl.` namespace stubs: types, ops (parsed via AST, not executed) |
 | `src/mlir/mlirfront/aietriton/_compiler.py` | AST parser + pipeline invocation: `compile_and_run()` |
-| `src/mlir/mlirfront/aietriton/aietriton_pybind.cpp` | pybind11 wrapper: `_aietriton_core.run_aie_pipeline()` |
-| `src/mlir/mlirfront/aietriton/CMakeLists.txt` | Build `_aietriton_core.so`, links `mlirtestlib` + MLIR libs |
+| `src/mlir/mlirfront/aiebackend/aiebackend_pybind.cpp` | pybind11 wrapper: `_aiebackend.run_aie_pipeline()` |
+| `src/mlir/mlirfront/aietriton/CMakeLists.txt` | Build `_aiebackend.so`, links `mlirtestlib` + MLIR libs |
 
 ---
 
@@ -37,7 +37,7 @@ _compiler.py: compile_and_run()
   │  _is_input_tensor() → AST walk for tl.store targets
   │  numpy args → shape, dtype → tensor_specs
   ▼
-_aietriton_core.run_aie_pipeline() [pybind11]
+_aiebackend.run_aie_pipeline() [pybind11]
   │  tensor_specs → TensorParam[]
   │  registers MLIR dialects, calls buildRoutingIR + runPipeline
   ▼
@@ -110,7 +110,7 @@ The Python frontend is a 3-layer design:
 |-------|------|----------------|
 | **API surface** | `aietriton/__init__.py` | Public API: `jit` decorator, `mesh()`, `set_device()`, `synchronize()` |
 | **AST engine** | `aietriton/_compiler.py` | AST parsing, parameter classification, pipeline invocation |
-| **C++ bridge** | `aietriton/_aietriton_core` (`.so`) | pybind11 module wrapping `TilingLinalgPipeline` C++ API |
+| **C++ bridge** | `aiebackend/_aiebackend` (`.so`, shared with the TVM frontend) | pybind11 module wrapping `TilingLinalgPipeline` C++ API |
 
 Supporting module:
 
@@ -144,7 +144,7 @@ The launch protocol follows Triton's `kernel[grid](*args)` pattern:
 
 3. **`kernel[grid](A, B, C, ...)`** → `_KernelLauncher.__call__(*args, **kwargs)` triggers `compile_and_run(fn, name, grid, args, kwargs)`.
 
-4. **Lazy compilation:** The pybind11 module `_aietriton_core` is imported inside `compile_and_run()` (not at package load time). This allows `import aietriton` to succeed even without a built `.so` — useful for IDE autocomplete and standalone AST parser testing.
+4. **Lazy compilation:** The pybind11 module `_aiebackend` is imported inside `compile_and_run()` (not at package load time). This allows `import aietriton` to succeed even without a built `.so` — useful for IDE autocomplete and standalone AST parser testing.
 
 ### 3.3 AST Analysis Engine (`_compiler.py`)
 
@@ -175,8 +175,8 @@ Currently a stub returning `""` (empty string), which triggers auto-generated GE
 **Phase 3 — C++ pipeline invocation:**
 
 ```python
-from . import _aietriton_core
-success = _aietriton_core.run_aie_pipeline(
+_backend()   # aiebackend.load() -> _aiebackend
+success = _aiebackend.run_aie_pipeline(
     mesh_rows, mesh_cols, tensor_specs, output_dir, kernel_body, name
 )
 ```
@@ -191,7 +191,7 @@ success = _aietriton_core.run_aie_pipeline(
 | `_find_kernel_def(tree, name)` | Walks AST to find `ast.FunctionDef` with matching function name |
 | `_numpy_dtype_to_bits(dtype)` | `dtype.itemsize * 8` — converts numpy dtype to bit width |
 
-### 3.4 pybind11 Binding Layer (`aietriton_pybind.cpp`)
+### 3.4 pybind11 Binding Layer (`aiebackend_pybind.cpp`)
 
 The C++ bridge exposes a single entry point:
 
@@ -219,14 +219,14 @@ static bool run_aie_pipeline(
 3. Calls `TilingLinalgPipeline::buildRoutingIR(ctx, meshRows, meshCols, tensors)` → routing IR module
 4. Calls `TilingLinalgPipeline::runPipeline(ctx, module, outputDir, userKernelBody, userKernelFuncName)` → generates output files
 
-The pybind11 module is named `_aietriton_core` (underscore prefix = private implementation detail, not part of public API).
+The pybind11 module is named `_aiebackend` (underscore prefix = private implementation detail, not part of public API).
 
 ### 3.5 Output
 
 A `TensorParam[]` vector, mesh dimensions, and kernel body text:
 
 ```cpp
-// Constructed in _compiler.py as tensor_specs, passed to _aietriton_core.run_aie_pipeline()
+// Constructed in _compiler.py as tensor_specs, passed to _aiebackend.run_aie_pipeline()
 std::vector<TensorParam> tensors = {
     {{16, 16}, 8, true },   // A — tl.load target
     {{16, 16}, 8, true },   // B — tl.load target
@@ -659,7 +659,7 @@ Key features:
 - `_compute_trip_count()` evaluates `range(start, stop, step)` using constexpr values
 - Input/output releases are automatically emitted at end of for-loop bodies
 
-#### Layer 2: pybind11 Bridge (`aietriton_pybind.cpp`)
+#### Layer 2: pybind11 Bridge (`aiebackend_pybind.cpp`)
 
 `build_kernel_body()` converts Python `list[dict]` to `vector<KernelOp>` structs:
 
@@ -671,7 +671,7 @@ static std::string build_kernel_body(
     const py::list &kernelOpsList);
 ```
 
-#### Layer 3: C++ MLIR EmitC Builder (`aie_pass/kernel_body_emitter.h/.cpp`)
+#### Layer 3: C++ MLIR EmitC Builder (`aiebackend/kernel_body_emitter.h/.cpp`)
 
 `KernelBodyEmitter` iterates over `KernelOp` structs and creates `emitc::VerbatimOp` for each construct -- the same pattern used by `DfscheduleToKernelApiPass`. After all ops are built into a `ModuleOp`, `mlir::emitc::translateToCpp()` emits the final C string.
 
@@ -714,8 +714,8 @@ void matmul_simple(input_window_int8 *window_in_0,
 |------|---------|
 | `aie_pass/__init__.py` | Package marker |
 | `aie_pass/ast_to_kernelops.py` | Python AST -> KernelOp list |
-| `aie_pass/kernel_body_emitter.h` | C++ header: `KernelBodyEmitter` class + `KernelOp` struct |
-| `aie_pass/kernel_body_emitter.cpp` | C++ impl: EmitC VerbatimOp construction + translateToCpp |
+| `aiebackend/kernel_body_emitter.h` | C++ header: `KernelBodyEmitter` class + `KernelOp` struct |
+| `aiebackend/kernel_body_emitter.cpp` | C++ impl: EmitC VerbatimOp construction + translateToCpp |
 | `aie_pass/test_ast_to_c.py` | Unit test: AST -> KernelOps -> C verification |
 
 #### Testing
@@ -949,7 +949,7 @@ The host ELF runs on the ARM processor and uses XAie driver APIs to:
 
 ## 11. Build System Integration
 
-### 11.1 `_aietriton_core.so` Build (`aietriton/CMakeLists.txt`)
+### 11.1 `_aiebackend.so` Build (`aietriton/CMakeLists.txt`)
 
 The pybind11 shared object is built as part of the main `mlirfront` CMake project:
 
@@ -957,9 +957,9 @@ The pybind11 shared object is built as part of the main `mlirfront` CMake projec
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 find_package(pybind11 REQUIRED)
 
-pybind11_add_module(_aietriton_core aietriton_pybind.cpp)
+pybind11_add_module(_aiebackend aiebackend_pybind.cpp)
 
-target_link_libraries(_aietriton_core PRIVATE
+target_link_libraries(_aiebackend PRIVATE
     mlirtestlib          # TilingLinalgPipeline + all dialect managers
     clangTooling clangBasic clangASTMatchers
     MLIREmitCDialect MLIRTargetCpp
@@ -968,7 +968,7 @@ target_link_libraries(_aietriton_core PRIVATE
     ... (same MLIR libs as mlirtest executable)
 )
 
-install(TARGETS _aietriton_core DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
+install(TARGETS _aiebackend DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
 ```
 
 Key points:
@@ -983,21 +983,21 @@ Key points:
 add_subdirectory(aietriton)
 ```
 
-Added at the end of `mlirfront/CMakeLists.txt`, after `mlirtest` and `mlirtestlib` targets are defined. The `_aietriton_core` target depends on `mlirtestlib` which depends on all tablegen custom targets.
+Added at the end of `mlirfront/CMakeLists.txt`, after `mlirtest` and `mlirtestlib` targets are defined. The `_aiebackend` target depends on `mlirtestlib` which depends on all tablegen custom targets.
 
 ### 11.3 Build and Run
 
 ```bash
 # Build (from project root)
 cd build && cmake .. -DLLVM_INSTALL_DIR=/path/to/llvm/build && make -j$(nproc)
-# Produces: build/src/mlir/mlirfront/aietriton/_aietriton_core.cpython-3X-*.so
+# Produces: build/src/mlir/mlirfront/frontend/aiebackend/_aiebackend.cpython-3X-*.so
 
 # Install .so next to Python package
 make install
-# Copies .so to: src/mlir/mlirfront/aietriton/_aietriton_core.cpython-3X-*.so
+# Copies .so to: src/mlir/mlirfront/frontend/aiebackend/_aiebackend.cpython-3X-*.so (optional; the build tree is searched)
 
 # Set PYTHONPATH so 'import aietriton' resolves
-export PYTHONPATH=src/mlir/mlirfront
+export PYTHONPATH=src/mlir/mlirfront/frontend
 
 # Run
 python3 example/tileprogram/design/triton/triton_matmul.py
@@ -1012,8 +1012,8 @@ python3 example/tileprogram/design/triton/triton_matmul.py
 | `aietriton/__init__.py` | Python package API: `jit` decorator, `_JitKernel`, `_KernelLauncher`, `mesh()`, `set_device()`, `synchronize()` |
 | `aietriton/language.py` | `tl.` stub namespace: type classes (`_DType`, `constexpr`), op stubs (`load`, `store`, `dot`, `zeros`, `arange`, etc.) |
 | `aietriton/_compiler.py` | AST analysis engine: `compile_and_run()`, `_classify_params()`, `_is_input_tensor()`, `_extract_kernel_body()` |
-| `aietriton/aietriton_pybind.cpp` | pybind11 C++ bridge: `_aietriton_core.run_aie_pipeline()` wrapping `TilingLinalgPipeline` |
-| `aietriton/CMakeLists.txt` | Build `_aietriton_core.so`: `pybind11_add_module`, links `mlirtestlib` + MLIR libs |
+| `aiebackend/aiebackend_pybind.cpp` | pybind11 C++ bridge: `_aiebackend.run_aie_pipeline()` wrapping `TilingLinalgPipeline` |
+| `aietriton/CMakeLists.txt` | Build `_aiebackend.so`: `pybind11_add_module`, links `mlirtestlib` + MLIR libs |
 | `tilinglinalg/pass/tilinglinalg_pipeline.h` | `TensorParam` struct, `buildRoutingIR()` and `runPipeline()` public API |
 | `tilinglinalg/pass/tilinglinalg_pipeline.cpp` | Pipeline orchestration: pass ordering, module cloning, EmitC output, BCF/PRX generation |
 | `tilinglinalg/routing/routingmanager.cpp` | `createroutingfuncGEMM()` (GEMM-specific routing with B broadcast), `createroutingfuncByDim()` (per-tensor generic routing) |
@@ -1069,15 +1069,15 @@ The Python package directory is named `aietriton` (no underscore), matching the 
 
 ### Lazy pybind11 import
 
-`_aietriton_core` is imported inside `compile_and_run()`, not at package load time (`__init__.py`):
+`_aiebackend` is imported inside `compile_and_run()`, not at package load time (`__init__.py`):
 
 ```python
 def compile_and_run(fn, name, grid, args, kwargs):
     ...
-    from . import _aietriton_core   # ← imported here, not at top-level
+    backend = _backend()   # ← aiebackend.load(), imported here, not at top-level
 ```
 
-This allows `import aietriton` to succeed even without a built `_aietriton_core.so`. Benefits:
+This allows `import aietriton` to succeed even without a built `_aiebackend.so`. Benefits:
 - IDE autocomplete works without building the C++ extension
 - The AST parser (`_classify_params`, `_is_input_tensor`) can be tested standalone
 - Clean error message at call time ("module not found") rather than import-time failure

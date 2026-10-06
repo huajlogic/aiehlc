@@ -191,52 +191,37 @@ Verified by compiling the ELF's exact sources for x86 and running them — both
 images match the oracle on all five entries including logits (dog → Samoyed
 12.4359; cat → Egyptian cat 15.6039).
 
-## `aie_offload.py` — selecting layers for AIE
+## `--aie-offload` — layers onto the AIE via TVM BYOC
 
 ```bash
-PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload
-PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload --aie-layers 0,2
-PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload --aie-layers all
-PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload --aie-mesh 4x4
+# once (and after any aiehlc.sh run for another source -- it resets aout/):
+source script/aiehlc.sh --aie-version 5 \
+    --runtime-source-file ./src/aietensorop/conv2dstem/conv2dstem.cc
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload            # layer 1 = stem
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload --aie-layers 1
+PYTHONPATH=src python3 src/frontend/tvmrelay/byoc/verify_aie_stem.py               # bit-exact check
 ```
 
-Off by default. With `--aie-offload`, the selected layers *also* go through the
-aiegraph dialect to the AIE backend:
+Off by default. After the CPU build (stages 4–5), the selected layers are
+partitioned out of the Relay graph with BYOC, the C is rebuilt, and TVM's graph
+executor calls the generated wrapper → `conv2d_stem_prepadded()` in
+`aout/libconv2dstem.a` in their place. `--byoc-aie` was merged into this flag.
+Design, and why each step is the way it is: **`doc/design/aie_offload_byoc.md`**.
 
-```
-LayerOp geometry -> aiegraph.conv_bn_relu (built + verified in C++)
-                 -> lower_aiegraph        (-> tensor_specs)
-                 -> run_aie_pipeline      (-> host.cc/kernel.cc/routing.cc/aieml.bcf)
-```
+`aie_offload.py` maps `--aie-layers` (stage-5 numbering) onto convs by **weight
+fingerprint**, not position — the graph executor and Relay order the ResNet
+shortcut convs differently — and refuses to offload if any target does not map
+onto exactly one Relay conv with the same geometry.
 
-Artifacts land in the layer's own folder — `layers/00_conv2d_add_relu/aie/` —
-which is what the per-layer, execution-ordered layout was for.
+Selection: `--aie-layers` takes an index, a comma list, or `all` (default `1`,
+the 7×7/s2 stem); `--aie-ops` filters by kind. Non-conv layers are reported as
+skipped with the reason. Only the stem has an AIE kernel today: any other
+selected conv is reported ("no AIE kernel for this conv yet") and stays on the
+APU.
 
-**Additive, not a mode switch.** The C generation and the APU `main.elf` run
-either way. Verified byte-identical with the flag on and off
-(`5a3a8a153518712bb2ab848d6b419edb`).
-
-Two things make that comparison harder than it looks, if you repeat it:
-
-- the ELF embeds its build path, so runs into different out-dirs differ for
-  that reason alone;
-- **`resnet18_params.bin` is not byte-reproducible.** TVM serializes
-  `save_param_dict` in an unordered-map order that varies run to run. The
-  weights are identical — an order-independent digest over the parsed arrays
-  matches — but the bytes, and therefore the offsets `graph_driver.c` bakes in,
-  move. The generated `.c` is stable; only the blob ordering is not.
-
-That second point is a real hazard beyond hash comparisons: `graph_driver.c`
-and `weights.bin` are a **matched pair**. Pairing a driver with a blob from a
-different stage-4 run reads every weight from the wrong offset and silently
-computes garbage. `build_arm_elf` always regenerates both together; don't
-hand-copy one over the other.
-
-Selection: `--aie-layers` takes an index, a comma list, or `all` (default `0`,
-the 7×7/s2 stem); `--aie-ops` filters by kind. Only the conv2d family has a
-kernel body, so `all` offloads 18 convs and reports the other 4 —
-`max_pool2d`, `global_avg_pool2d`, `dense_add`, `batch_flatten` — as skipped
-with the reason, rather than dropping them silently.
+Partitioning canonicalizes the whole graph before `relay.build`, so the CPU
+remainder is built differently (65 kernels instead of 28) — still bit-exact:
+`verify_aie_stem.py` compares all 1000 logits against the unpartitioned build.
 
 ### No tile-budget check — offload is blind
 

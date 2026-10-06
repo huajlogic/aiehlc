@@ -914,7 +914,16 @@ launch_kernel_group (enable x16)         20       276.15      13.8076
 ==== control-plane microbenchmark done ====
 ```
 
+## Perf of control pkt and raw axi-mm compare
 
+Everything below is measured on real hardware, not estimated. If you need to
+justify a control-plane design decision, cite this page rather than re-deriving
+a number from a timeline span (see [Pitfalls](#pitfalls)).
+
+| | Path | ns / 32-bit write |
+|---|---|---|
+| Today | host `XAie_Write32` (serial MMIO) | **~372** |
+| Batched | control packet via shim DMA | **~2.9** |
 
 ## Contributing
 

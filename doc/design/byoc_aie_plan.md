@@ -1,5 +1,11 @@
 # BYOC → AIE integration plan (option A: single ELF)
 
+> **Superseded in part — see [aie_offload_byoc.md](aie_offload_byoc.md) for what
+> is implemented.** The subgraph boundary is the *fused* op (not the raw conv),
+> the kernel is the aiehlc-built `libconv2dstem.a` (not `run_aie_pipeline`, which
+> emits no caller), and layers are matched by weight fingerprint. Kept as the
+> original plan.
+
 Wire the convolution subgraphs TVM BYOC partitions out onto aiehlc-generated AIE
 kernels, with **everything linked into one `main.elf`** and TVM's graph executor
 doing the scheduling.
