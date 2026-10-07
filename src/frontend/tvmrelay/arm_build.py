@@ -689,6 +689,14 @@ KERNEL_OBJ := {kernel_obj}
 LAYER_SRCS := $(sort $(wildcard $(LAYERS)/*/*.c))
 LAYER_OBJS := $(LAYER_SRCS:.c=.o)
 
+# Per-layer AIE archives, one per offloaded layer, built by
+# aie_layer_lib.build_archive into layers/NN_op/aie/build/libNN_op.a. Empty on
+# a CPU-only build. Each carries that layer's host.cc, its op entry and its
+# embedded core ELF, so they are independent of each other and of the order
+# they appear here.
+AIE_LAYER_LIBS := $(sort $(wildcard $(LAYERS)/*/aie/build/*.a) \
+                        $(wildcard $(LAYERS)/*/aie/*/build/*.a))
+
 # Neither source of kernels resolved. Without this the build would cheerfully
 # archive zero objects and fail much later with a wall of undefined
 # tvmgen_default_* references, which says nothing about the real cause.
@@ -742,9 +750,9 @@ LAYER_LIB := $(if $(LAYER_OBJS),liblayers.a,)
 
 all: main.elf
 
-main.elf: $(OBJS) weights.o $(LAYER_LIB)
-\t$(CC) $(CFLAGS) -o $@ $(OBJS) weights.o $(LAYER_LIB) $(AIE_LIB) $(LDFLAGS) $(LDLIBS)
-\t@echo "built $@"
+main.elf: $(OBJS) weights.o $(LAYER_LIB) $(AIE_LAYER_LIBS)
+\t$(CC) $(CFLAGS) -o $@ $(OBJS) weights.o $(LAYER_LIB) $(AIE_LAYER_LIBS) $(AIE_LIB) $(LDFLAGS) $(LDLIBS)
+\t@echo "built $@$(if $(AIE_LAYER_LIBS), with $(words $(AIE_LAYER_LIBS)) per-layer AIE archive(s),)"
 \t@$(CROSS)size $@ 2>/dev/null || true
 
 # One archive of per-operator objects. graph_driver.o pulls in the members it

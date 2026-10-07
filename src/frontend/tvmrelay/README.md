@@ -262,6 +262,69 @@ CPU with the default conv-family op set, 21 / 3 with all four ops enabled.
 | `max_pool2d` | *(none)* | CPU — not in the 4-op dialect |
 | `batch_flatten` | *(none)* | CPU — dead kernel, graph elides it |
 
+### Each AIE layer gets its own `lib<layer>.a`
+
+`run_aie_pipeline` stops at source — `host.cc`, `kernel.cc`, `routing.cc`,
+`aieml.bcf/prx` — and what it emits is only
+
+```c
+void host_canonicalized(XAie_DevInst* dev, void* t0, void* t1, void* t2);
+```
+
+the DMA/lock/launch body. No device init, no buffer allocation, no caller, no
+compiled kernel ELF: nothing a host program could call, which is why those
+folders used to hold artifacts and no library.
+
+`aie_layer_lib.py` supplies the two missing pieces per layer:
+
+1. **An op entry** — the generated counterpart of `conv2dstem.cc`'s
+   `stem_run()`. `stem_run` is hand-written for one op and the pipeline never
+   sees it (`run_aie_pipeline` is driven by tensor shapes and a kernel-body
+   string, not by a C++ file), so the same wrapping is generated from the shape
+   the aiehlc frontend emits for `__aie_launch`: partition → `set_kernel_elf` →
+   `sync_for_dev` per input → `host_canonicalized` → `sync_for_cpu` per output
+   → teardown. It is **appended to `host.cc`**, not written as a sibling file,
+   because `hostcompile.sh` compiles a *fixed* set of sources and a standalone
+   `.cc` would be silently left out of the archive. Re-running replaces the
+   block rather than stacking copies.
+2. **The archive** — `hostcompile.sh` with the layer's `aie/` as its working
+   directory builds `kernel.cc` into the core ELF, embeds it (`_binary_kernel_
+   <func>_*`), sees `host.cc` has no `main()` and therefore archives
+   (`HOST_ENTRY_KIND=library`, skill **hostlibrarymode**).
+
+```
+layers/01_conv2d/aie/
+  host.cc  kernel.cc  routing.cc  aieml.bcf
+  build/lib01_conv2d.a          <- self-contained: op entry + host + kernel ELF
+```
+
+Verified on one layer: `T aie_01_..._run` (the entry), `T _Z18host_canonicalized…`
+(the pipeline body), and the embedded core ELF closing *within* the archive
+(`U _binary_kernel_conv_bn_0_start` in `host.o`, `D` in `kernel.o`).
+
+`partition.json` records `archive` per layer, or `archive_reason` when it could
+not be built — a box without the Vitis cross toolchain is a normal place to run
+the earlier stages, so that is reported, not raised.
+
+`arm_build` discovers them by wildcard and links them:
+
+```make
+AIE_LAYER_LIBS := $(sort $(wildcard $(LAYERS)/*/aie/build/*.a) \
+                        $(wildcard $(LAYERS)/*/aie/*/build/*.a))
+```
+
+(the second pattern catches the `aie/conv_bn/`, `aie/residual_add_relu/`
+subdirectories a multi-op layer produces). They link cleanly alongside
+`libconv2dstem.a` despite both carrying the AIE runtime, because `ld` pulls only
+the archive members that resolve an undefined symbol.
+
+> **Not yet wired:** `graph_driver.c` still calls the **CPU** kernel for those
+> layers, so the archives link but no member is pulled and `.text` is unchanged.
+> Redirecting the call needs buffer marshalling — TVM's graph buffers are plain
+> `static` arrays, while the entry requires `__Runtime_alloc_buffer` memory —
+> and it changes the ELF's numerical output. That is the BYOC path's job today
+> (`tvmgen_default_aie_main_0` → wrapper → `conv2d_stem_prepadded`).
+
 **Partial eligibility is not offloadable.** A residual block's conv half is an
 eligible `conv_bn`, but the TVM C for that layer is a *single fused function*
 computing conv+bias+residual+relu, so there is no seam to split it at — taking

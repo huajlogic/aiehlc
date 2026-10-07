@@ -79,6 +79,10 @@ from pathlib import Path
 
 from frontend.tvmrelay.aie_offload import aie_backend
 
+#: Repo root: .../src/frontend/tvmrelay/aiegraph_partition.py -> up three.
+#: Needed to reach script/hostcompile.sh when archiving a layer.
+_REPO = Path(__file__).resolve().parents[3]
+
 __all__ = ["AIEGRAPH_OP_KINDS", "DEFAULT_AIE_OPS", "build_nodes",
            "build_ir_ops", "partition_layers", "run_aiegraph"]
 
@@ -528,10 +532,48 @@ def _build_one(backend, kernels, launch: dict, rec: dict, verdict: dict,
               f" -> {launch['op']} -> {aie_dir.relative_to(out_dir)}/ "
               f"({len(produced)} files)")
 
-    return {"index": verdict["index"], "node": rec["node"],
-            "dir": str(aie_dir.relative_to(out_dir)), "ok": bool(ok),
-            "op": launch["op"], "func_name": launch["func_name"],
-            "files": produced}
+    entry = {"index": verdict["index"], "node": rec["node"],
+             "dir": str(aie_dir.relative_to(out_dir)), "ok": bool(ok),
+             "op": launch["op"], "func_name": launch["func_name"],
+             "files": produced}
+
+    # The pipeline stops at source. Wrap it in an op entry and archive it, so
+    # the layer folder holds something a host program can actually link
+    # against rather than artifacts nothing consumes.
+    if ok:
+        entry.update(_archive_one(aie_dir, verdict, launch, specs, mesh,
+                                  out_dir, verbose))
+    return entry
+
+
+def _archive_one(aie_dir: Path, verdict: dict, launch: dict, specs,
+                 mesh, out_dir: Path, verbose: bool) -> dict:
+    """Emit the op entry for one built layer and archive it. Never raises."""
+    from frontend.tvmrelay import aie_layer_lib
+
+    stem = aie_dir.parent.name if aie_dir.name == "aie" else aie_dir.name
+    try:
+        src = aie_layer_lib.emit_op_entry(aie_dir, stem, launch["func_name"],
+                                          specs, mesh)
+        built = aie_layer_lib.build_archive(aie_dir, stem, _REPO,
+                                            verbose=verbose)
+    except Exception as exc:                       # noqa: BLE001
+        return {"archive": None, "archive_reason": f"{type(exc).__name__}: {exc}"}
+
+    if not built.get("ok"):
+        if verbose:
+            print(f"  [aiegraph]   no archive: {built['reason']}")
+        return {"archive": None, "archive_reason": built["reason"],
+                "op_entry": src.name}
+
+    # Resolve both sides: aie_dir may arrive relative to the cwd while out_dir
+    # is absolute, and relative_to() raises rather than coping with the mix.
+    archive = Path(built["archive"]).resolve()
+    try:
+        shown = archive.relative_to(Path(out_dir).resolve())
+    except ValueError:                  # archive redirected outside out_dir
+        shown = archive
+    return {"archive": str(shown), "op_entry": src.name}
 
 
 def _write_partition(layers_dir: Path, result: dict, verbose: bool) -> Path:
@@ -552,6 +594,11 @@ def _write_partition(layers_dir: Path, result: dict, verbose: bool) -> Path:
             "aiegraph": v["aiegraph"], "target": v["target"],
             "reason": v["verdict_reason"],
             "aie_dir": built["dir"] if built else None,
+            # The linkable product of that folder, or why there isn't one.
+            # Null with a reason is the normal state on a box without the
+            # Vitis cross toolchain; null without one means it was never tried.
+            "archive": built.get("archive") if built else None,
+            "archive_reason": built.get("archive_reason") if built else None,
         })
     # Counts are over graph *invocations*, so two nodes sharing a symbol count
     # twice -- that is the honest number for "how much of the network runs on

@@ -172,6 +172,21 @@ Three non-obvious things, each of which silently misleads if forgotten:
 - Do **not** reuse `example/model/resnet18py/resnet18.py:resnet18()` here — it
   builds ResNet-18 **v2** from ONNX weights. Only `classify.preprocess` is shared.
 
+**Each AIE layer builds its own `lib<layer>.a`.** `run_aie_pipeline` stops at
+source (`host.cc`/`kernel.cc`/`routing.cc`) exposing only
+`host_canonicalized(dev, t0, t1, t2)` — no device init, no allocation, no
+caller, no kernel ELF. `aie_layer_lib.py` appends a generated op entry (the
+counterpart of `conv2dstem.cc`'s hand-written `stem_run()`; the pipeline never
+sees that file, so it cannot emit it) **into `host.cc`** — a sibling `.cc`
+would be dropped, since `hostcompile.sh` compiles a fixed source set — then
+runs `hostcompile.sh` in that directory to archive
+`layers/NN_op/aie/build/libNN_op.a`. `arm_build` links them by wildcard
+(`AIE_LAYER_LIBS`), and `partition.json` records `archive` / `archive_reason`.
+They coexist with `libconv2dstem.a` despite both carrying the AIE runtime,
+because `ld` pulls only members that resolve an undefined symbol. **Not yet
+wired:** `graph_driver.c` still calls the CPU kernel for those layers, so the
+archives link but contribute nothing.
+
 **The board ELF links from the per-layer split, not the monolithic C.** Stage 5
 (`split_layers.py`, on by default; `--no-split` disables) writes one translation
 unit per operator to `worklocal/tvmrelay_deploy/layers/NN_op/NN_op.c`; stage 6
