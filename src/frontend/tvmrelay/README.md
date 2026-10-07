@@ -491,6 +491,7 @@ source script/setup.sh --path-set-only        # cross toolchain + XILINX_VITIS
 PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py
 PYTHONPATH=src python src/frontend/tvmrelay/arm_build.py worklocal/tvmrelay_deploy
 PYTHONPATH=src python src/frontend/tvmrelay/arm_build.py --no-make   # generate only
+PYTHONPATH=src python src/frontend/tvmrelay/arm_build.py --local     # + x86 ELF
 ```
 
 `relay.build(target="c")` gives kernels but **not a program**: no `main`, no
@@ -594,6 +595,58 @@ One Makefile subtlety worth not re-discovering: `LDLIBS` must stay a single
 unbroken token. The commas are `-Wl` separators, so a `\` line continuation
 splits it and ld goes looking for a library literally named
 `-lxilstandalone,...`.
+
+### `--local` — the same C, run on this host
+
+```bash
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --local
+PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --local --no-arm
+make -C worklocal/tvmrelay_deploy/arm_build local       # build main_local.elf
+make -C worklocal/tvmrelay_deploy/arm_build run-local    # build it and run it
+```
+
+`main_local.elf` is the **same generated C** — same `graph_driver.c`, same
+`liblayers.a` sources, same `weights.bin`, same `main.c` — linked for x86 with
+the host gcc. It prints the same top-5 with logits the board would, so stage
+7's onnxruntime reference can be checked in a second instead of by flashing a
+board, and `deploy_flow.py` prints the verdict:
+
+```
+      local vs cpu: MATCH class=258 (Samoyed) logit 12.0173 vs 12.4359
+```
+
+It needs **no Vitis toolchain**, which is why it composes with `--no-arm`, and
+it is built *before* the cross-toolchain gate for exactly that reason.
+
+It is not the cross build with a different `-mcpu`. The BSP include/lib paths
+and the whole baremetal link recipe (`--specs=nosys.specs`,
+`--defsym end=__bss_end__`, `-T lscript.ld`) are **dropped**, and two flags
+have to be **added** — the ones a hand-rolled `gcc resnet18.c` always misses:
+
+| flag | without it |
+|---|---|
+| `-D__AIESIM__` | `aie_timer.h` falls through to `#include "xtime_l.h"`, a BSP header that does not exist off-target → `fatal error: xtime_l.h: No such file` |
+| `-std=gnu11` (**not** `-std=c11`) | `clock_gettime`/`CLOCK_MONOTONIC` are POSIX, which strict ISO mode hides → `'CLOCK_MONOTONIC' undeclared` **inside** `aie_timer.h` |
+| `-lm` | the BSP supplied libm inside `-lxil`'s group; here it is explicit |
+
+Objects go to `arm_build/localobj/` with flattened basenames, so a local build
+never clobbers the aarch64 objects (which sit next to their `.c` under
+`layers/`). The directory is deliberately **not** called `local` — that is the
+phony target's name, and make would read `localobj/x.o: ... | local` as
+circular, drop the order-only prerequisite, and then fail with
+`can't create local/x.o: No such file or directory`. `vpath` is what lets a
+flat `localobj/NN_op.o` find its source back under `layers/NN_op/`.
+
+An **AIE-offloaded build cannot be linked here** and says so up front: the
+archives are aarch64 baremetal and their kernels execute on the array. Re-run
+without `--aie-offload`/`--aiegraph` for a local ELF.
+
+This is also what caught `TVMValue args[8]` in `graph_driver.c`: the NCHWc
+convs take **10** arguments, so `args[8]`/`args[9]` ran off the end into
+`codes[0..1]`. The kernels ignore `arg_type_ids`, which is the only reason the
+board tolerated it — on x86 it trips the stack protector immediately. Both
+widths are now computed from the graph (`graph_widths`, emitted as
+`GRAPH_MAX_NDIM`/`GRAPH_MAX_ARGS`).
 
 **Why not TVM's AOT executor.** `Executor("aot")` does emit a real
 `tvmgen_default_run`, which looks like the obvious answer. It was tried and

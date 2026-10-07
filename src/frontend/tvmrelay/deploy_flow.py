@@ -75,6 +75,17 @@ Seven stages, matching the seven things this flow has to prove:
    reimplemented -- ``example/model/resnet18py/classify.py:preprocess`` -- so
    the board and the CPU reference cannot disagree over normalization.
 
+   **``--local``** links the *same* generated C into ``main_local.elf`` for
+   this host instead (``make local``) and runs it, so the top-5 can be diffed
+   against stage 7 in seconds rather than by flashing a board. It needs no
+   Vitis toolchain -- it composes with ``--no-arm`` -- and it is not the cross
+   build with a different ``-mcpu``: the BSP and the baremetal link recipe are
+   dropped, and two flags have to be *added*, ``-D__AIESIM__`` (so
+   ``aie_timer.h`` takes its portable ``clock_gettime`` branch rather than
+   including the BSP's ``xtime_l.h``) and ``-std=gnu11`` instead of
+   ``-std=c11`` (``CLOCK_MONOTONIC`` is POSIX, which strict ISO mode hides).
+   An AIE-offloaded build cannot be linked here and says so.
+
    **AIE offload** (``--aie-offload``, off by default) puts the selected
    layers (``--aie-layers``, default 1 = the 7x7/s2 stem) on the AIE through
    TVM BYOC: the convs are partitioned out of the Relay graph, the C is
@@ -132,6 +143,8 @@ Run::
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --image cat.jpg
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --skip-quantize
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --no-arm
+    PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --local
+    PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --local --no-arm
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py \\
         --aie-offload --aie-layers 1
@@ -743,7 +756,8 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
         aie_offload: bool = False, aie_layers=(0,),
         aie_ops=("conv_bn_relu", "conv_bn"), mesh=(2, 2),
         aiegraph: bool = False, aiegraph_ops=AIE_OP_KINDS,
-        relay_ptq: bool = False, verbose: bool = True) -> dict:
+        relay_ptq: bool = False, local: bool = False, local_run: bool = True,
+        verbose: bool = True) -> dict:
     """Run all seven stages. Returns a dict of what happened.
 
     ``aie_offload`` offloads ``aie_layers`` (stage-5 layer indices; ``None``
@@ -765,6 +779,11 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     head and tail (``skip_conv_layers=[0]``, ``skip_dense_layer=True``). See
     ``quantize_int8`` for what that costs and why it needs LLVM.
     ``skip_quantize`` overrides both and emits fp32.
+
+    ``local`` additionally links the same generated C into ``main_local.elf``
+    for *this* host and runs it, so stage 6's output can be checked against
+    stage 7's reference without a board. It needs no Vitis toolchain, so it
+    composes with ``arm=False``; it cannot link an AIE-offloaded build.
     """
     if not stage_env(verbose=verbose):
         return {"ok": False, "stage": "env"}
@@ -867,7 +886,8 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
                 print(f"[6/7]          {graph_part.get('reason', 'partition failed')}")
 
     elf = None
-    if not arm:
+    local_res = None
+    if not arm and not local:
         if verbose:
             print("[6/7] arm    : skipped (--no-arm)")
     elif not compiles:
@@ -876,16 +896,21 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     else:
         from frontend.tvmrelay.arm_build import build_arm_elf
 
+        # Generation is shared: --local --no-arm still writes the driver, the
+        # image header and the Makefile, then builds only the host ELF.
         if verbose:
-            print("[6/7] arm    : linking baremetal aarch64 ELF")
+            print("[6/7] arm    : " + ("linking baremetal aarch64 ELF" if arm
+                                       else "generating sources (--no-arm)"))
         built = build_arm_elf(out_dir, c_name=Path(c_path).name,
-                              image=image, verbose=verbose)
+                              image=image, run_make=arm, local=local,
+                              local_run=local_run, verbose=verbose)
         if built.get("ok"):
             elf = built["elf"]
         elif verbose and built.get("stderr"):
             print(f"[6/7]          {built['reason']}:")
             for line in built["stderr"].strip().splitlines()[:5]:
                 print(f"              {line}")
+        local_res = built.get("local")
 
     cpu = cpu_reference(out_dir, image=image, verbose=verbose)
 
@@ -895,16 +920,44 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
               f"{'' if compiles else '  (WARNING: does not compile)'}")
         if elf:
             print(f"      board ELF: {elf}")
+        if local_res and local_res.get("ok"):
+            print(f"      local ELF: {local_res['elf']}")
         if graph_part and graph_part.get("aie_count") is not None:
             print(f"      aiegraph : {graph_part['aie_count']} invocation(s) on "
                   f"AIE, {graph_part['cpu_count']} reusing TVM CPU C "
                   f"(layers/partition.json)")
+        _report_local_vs_cpu(local_res, cpu)
     return {"ok": compiles, "quantized": quantized, "c_path": str(c_path),
             "out_dir": str(out_dir), "fused": fuse,
             "layer_count": layers["layer_count"] if layers else None,
             "elf": elf, "cpu_top1": (cpu[0][1] if cpu else None),
             "cpu_top": cpu, "aie": aie, "aiegraph": graph_part,
+            "local": local_res,
             "quantizer": quantizer, "accuracy": accuracy}
+
+
+def _report_local_vs_cpu(local_res, cpu) -> None:
+    """Say whether the local ELF agreed with stage 7's onnxruntime reference.
+
+    This is the reason ``--local`` exists: the board ELF and the reference are
+    normally only comparable by flashing a board and reading a console. The
+    same generated C, run here, answers it in seconds -- and a *disagreement*
+    is the signal, since both sides classify the identical preprocessed image.
+    """
+    if not (local_res and local_res.get("ran") and cpu):
+        return
+    top1 = local_res.get("top1")
+    if not top1 or top1[0] is None:
+        return
+    cls, logit = top1
+    ref_cls, ref_name, ref_logit = cpu[0][1], cpu[0][2], cpu[0][3]
+    if cls == ref_cls:
+        print(f"      local vs cpu: MATCH class={cls} ({ref_name}) "
+              f"logit {logit:.4f} vs {ref_logit:.4f}")
+    else:
+        print(f"      local vs cpu: MISMATCH -- local says class={cls} "
+              f"logit={logit:.4f}, reference says class={ref_cls} "
+              f"({ref_name}) logit={ref_logit:.4f}")
 
 
 def main(argv=None) -> int:
@@ -926,6 +979,14 @@ def main(argv=None) -> int:
                          "op (a real relu.c) instead of per fused group")
     ap.add_argument("--no-arm", action="store_true",
                     help="skip stage 6 (do not link the aarch64 board ELF)")
+    ap.add_argument("--local", action="store_true",
+                    help="also build main_local.elf for THIS host (x86) from "
+                         "the same generated C and run it, printing the same "
+                         "top-5 the board would. Needs no Vitis toolchain, so "
+                         "it combines with --no-arm; cannot link an "
+                         "AIE-offloaded build")
+    ap.add_argument("--no-local-run", action="store_true",
+                    help="with --local, link main_local.elf but do not run it")
     ap.add_argument("--image", default=None,
                     help="image path or URL to classify "
                          "(default: the pytorch/hub dog.jpg sample)")
@@ -995,7 +1056,8 @@ def main(argv=None) -> int:
                  aie_ops=tuple(s.strip() for s in args.aie_ops.split(",")),
                  mesh=(rows, cols),
                  aiegraph=args.aiegraph, aiegraph_ops=aiegraph_ops,
-                 relay_ptq=args.relay_ptq)
+                 relay_ptq=args.relay_ptq, local=args.local,
+                 local_run=not args.no_local_run)
     return 0 if result.get("ok") else 1
 
 

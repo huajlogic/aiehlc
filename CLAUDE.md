@@ -187,6 +187,20 @@ because `ld` pulls only members that resolve an undefined symbol. **Not yet
 wired:** `graph_driver.c` still calls the CPU kernel for those layers, so the
 archives link but contribute nothing.
 
+**`--local` runs the same C on x86.** `deploy_flow.py --local` (or `make local` /
+`make run-local` in `arm_build/`) links `main_local.elf` from the *same* generated
+sources with the host gcc and runs it, printing the same top-5 the board would, so
+stage 7's onnxruntime reference is checkable without flashing a board — the flow
+prints `local vs cpu: MATCH/MISMATCH`. It needs no Vitis toolchain (so it composes
+with `--no-arm`, and is built *before* the cross-toolchain gate). It is **not** the
+cross build retargeted: the BSP and the baremetal link recipe are dropped, and two
+flags must be **added** — `-D__AIESIM__` (else `aie_timer.h` includes the BSP-only
+`xtime_l.h`) and `-std=gnu11` not `-std=c11` (else POSIX `CLOCK_MONOTONIC` is
+hidden *inside* that header). Objects land in `arm_build/localobj/`, never `local/`
+— that is the phony target's name and make drops the order-only dir dependency as
+circular. An AIE-offloaded build cannot link here and fails with a named error.
+Skill: **tvmlocalhostelf**.
+
 **The board ELF links from the per-layer split, not the monolithic C.** Stage 5
 (`split_layers.py`, on by default; `--no-split` disables) writes one translation
 unit per operator to `worklocal/tvmrelay_deploy/layers/NN_op/NN_op.c`; stage 6
@@ -364,6 +378,7 @@ Read the matching skill when the task fits:
 | Entry file `#include`s a kernel `.cc`; `unknown type name '__global__'` or `acquire_input_window` errors pointing at an INCLUDED file | aiehlcincludekernel |
 | Pipeline "succeeds" but emits an EMPTY module (0 routing connections, no BCF/PRX → `Couldn't open aie2ps.prx`): `__global__` in a comment, or a prototype above the kernel | aiesourcetextrewrite |
 | `deploy_flow.py` emits fp32 instead of the default int8, `target.build.llvm is not enabled`, missing `onnx`, or stage-5 split silently skipped | tvmrelaynollvm |
+| Run the TVM-generated ResNet C on x86 (`--local` / `make local`): `xtime_l.h: No such file`, `'CLOCK_MONOTONIC' undeclared`, `Circular ... dependency dropped`, stack-smash in `graph_run` | tvmlocalhostelf |
 | PT2E int8 → torch-mlir yields no `!torch.qint8` / no `linalg.*_q` (fusion passes look like no-ops); TOSA "failed to legalize `dequantize_per_channel`"; `pip install torchvision` upgrading torch | torchmlirquantfusion |
 | TVM `--aie-offload` (BYOC → AIE): fused boundary, uint8 shift, zero-point padding, weight-fingerprint layer mapping, conv2dstem int32/epilogue, duplicate `XAie_*` at link | byocaieoffload |
 | conv2dstem real-data fixture: generated header can't live in a subdir; zero-point border; `shift = -exponent`; golden self-check over the console | conv2dstemfixture |
