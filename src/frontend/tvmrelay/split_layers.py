@@ -139,11 +139,26 @@ def iter_c_functions(source: str):
 
 
 def split_module(source: str) -> tuple:
-    """Return ``(prologue, declarations, definitions)``.
+    """Return ``(prologue, declarations, interstitial, definitions)``.
 
     *prologue* is everything before the first guard block (the ``#include``s),
     *declarations* the forward-declaration run, *definitions* the list of
     ``(name, start, end)`` from :func:`iter_c_functions`.
+
+    *interstitial* is the file-scope text that sits BETWEEN function
+    definitions, concatenated in source order. TVM emits none, but a BYOC
+    codegen appends its own module after TVM's kernels, so its prelude --
+    ``byoc/aie_codegen.py``'s declaration of ``conv2d_stem_prepadded`` -- lands
+    mid-file, past the first ``extern "C"`` guard. Dropping it is what made a
+    split layer compile with an *implicit declaration* of that function: still
+    linkable on aarch64, since the pointer arguments pass in registers either
+    way, but unprototyped and a hard error under ``-Werror``.
+
+    It is hoisted into ``layers_common.h``, which every layer includes, so this
+    carries **declarations**, not definitions. That is the standing contract --
+    a BYOC codegen must keep its weights as *function-scope* statics (see the
+    note in ``aie_codegen._FUNC_TMPL``). File-scope data here would be
+    duplicated into all 65 translation units and collide at link, loudly.
     """
     if _EXTERN_C not in source:
         raise ValueError('no \'extern "C"\' guard found -- not a TVM C module?')
@@ -153,7 +168,35 @@ def split_module(source: str) -> tuple:
     first_guard = source.index(_EXTERN_C)
     prologue = source[:first_guard].rstrip() + "\n"
     declarations = source[first_guard:defs[0][1]].rstrip() + "\n"
-    return prologue, declarations, defs
+
+    gaps, prev_end = [], defs[0][1]
+    for _, start, end in defs:
+        chunk = source[prev_end:start].strip()
+        if chunk:
+            gaps.append(chunk)
+        prev_end = end
+    tail = source[prev_end:].strip()
+    if tail:
+        gaps.append(tail)
+    interstitial = ("\n\n".join(gaps) + "\n") if gaps else ""
+
+    # Declare anything DEFINED here that TVM's own declaration run did not
+    # already cover. TVM pre-declares its packed-ABI kernels, but a BYOC
+    # codegen's helper is only ever defined -- in the single file that was
+    # fine, because the definition preceded its caller. Split apart, the
+    # caller is a different translation unit (the AIE shim is layer 1, the
+    # wrapper it calls is layer 64), so without this the shim compiles with
+    # an implicit declaration.
+    synthesized = []
+    for name, start, end in defs:
+        if re.search(rf"\b{re.escape(name)}\b\s*\(", declarations):
+            continue
+        brace = source.index("{", start, end)
+        synthesized.append(source[start:brace].strip() + ";")
+    if synthesized:
+        interstitial += "\n" + "\n".join(synthesized) + "\n"
+
+    return prologue, declarations, interstitial, defs
 
 
 # --------------------------------------------------------------------------- #
@@ -237,7 +280,18 @@ _HEADER_TMPL = """\
 /* Forward declarations for every kernel in the module, so any layer may call
  * any other (and so each file compiles without seeing its siblings). */
 {declarations}
+{interstitial}
 #endif  /* TVMRELAY_LAYERS_COMMON_H */
+"""
+
+#: Heading for the hoisted mid-file material. Only emitted when there is any,
+#: so a plain TVM module's header is byte-identical to before.
+_INTERSTITIAL_HDR = """\
+/* File-scope material that sat BETWEEN function definitions in the original
+ * module -- a BYOC codegen's prelude, appended after TVM's own kernels. Hoisted
+ * here because a layer that uses it would otherwise compile with an implicit
+ * declaration. Declarations only: anything defining storage would be duplicated
+ * into every layer and collide at link. */
 """
 
 _LAYER_TMPL = """\
@@ -394,7 +448,7 @@ def split_layers(c_path, graph_path=None, out_dir=None, verify=True,
     """
     c_path = Path(c_path)
     source = c_path.read_text()
-    prologue, declarations, defs = split_module(source)
+    prologue, declarations, interstitial, defs = split_module(source)
 
     if graph_path is None:
         cand = c_path.with_name(c_path.stem + "_graph.json")
@@ -412,7 +466,8 @@ def split_layers(c_path, graph_path=None, out_dir=None, verify=True,
     _clear_stale(out_dir)
 
     (out_dir / "layers_common.h").write_text(_HEADER_TMPL.format(
-        src=c_path.name, prologue=prologue, declarations=declarations))
+        src=c_path.name, prologue=prologue, declarations=declarations,
+        interstitial=(_INTERSTITIAL_HDR + interstitial) if interstitial else ""))
 
     width = max(2, len(str(len(ordered) - 1)))
     entries, written, kinds = [], [], []

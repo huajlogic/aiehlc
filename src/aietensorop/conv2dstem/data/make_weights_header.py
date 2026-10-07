@@ -34,6 +34,7 @@ the very same arrays rather than re-deriving them.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -123,7 +124,7 @@ def main(argv=None) -> int:
             w_scale=sp.w_scale, bias_q=sp.bias_q.astype(np.int32),
             in_scale=sp.in_scale, in_zp=sp.in_zp,
             out_scale=sp.out_scale, out_zp=sp.out_zp, model=str(sp.model))
-        print(f"  [write]  {npz.relative_to(fc.REPO)}  "
+        print(f"  [write]  {os.path.relpath(npz, Path.cwd())}  "
               f"({npz.stat().st_size / 1024:,.0f} KB)")
     return 0
 

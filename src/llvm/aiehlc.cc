@@ -33,6 +33,7 @@
 #include <sstream>
 #include <cstdlib>
 #include <regex>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -3676,7 +3677,87 @@ public:
             return true;
 		}
 
-		std::string GetKeyReplaceAndAddInclude(clang::SourceManager &SourceMgr, std::unordered_map<std::string,std::string>& funcMap) {
+        // Splice `#include "foo.cc"` directives into `src`, in place.
+        //
+        // Quoted form only -- `<...>` is a system header and is never a user
+        // kernel. Only .cc/.cpp are inlined; .h keeps going through Clang.
+        //
+        // `seen` makes inclusion idempotent: including the same kernel twice
+        // (directly and via another .cc) would otherwise duplicate a __global__
+        // definition and produce a redefinition error that points at generated
+        // text. One level of recursion per file, driven by the worklist, so an
+        // included .cc may itself include another.
+        //
+        // A directive whose file cannot be read is left ALONE rather than
+        // dropped -- Clang then reports the missing include against the real
+        // line, which is a better error than a silent empty splice.
+        void inlineSourceIncludes(std::string &src, int depth = 0) {
+            if (depth > 8) // cycle backstop; `seen` already prevents the common case
+                return;
+            static std::set<std::string> seen;
+            if (depth == 0)
+                seen.clear();
+
+            // Custom delimiter: the pattern itself contains `"` and `)`.
+            const std::regex incRe(R"RE(^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*(//[^\n]*)?$)RE",
+                                   std::regex::multiline);
+            std::smatch m;
+            size_t searchFrom = 0;
+            while (std::regex_search(src.cbegin() + searchFrom, src.cend(), m, incRe)) {
+                const size_t matchBeg = searchFrom + m.position(0);
+                const size_t matchLen = m.length(0);
+                const std::string name = m[1].str();
+
+                auto isSource = [](const std::string &n) {
+                    auto dot = n.rfind('.');
+                    if (dot == std::string::npos)
+                        return false;
+                    std::string ext = n.substr(dot);
+                    return ext == ".cc" || ext == ".cpp" || ext == ".cxx";
+                };
+                if (!isSource(name)) {
+                    searchFrom = matchBeg + matchLen; // a header: leave it for Clang
+                    continue;
+                }
+
+                // Resolve relative to the including file's directory.
+                std::string path = (!name.empty() && name[0] == '/')
+                                       ? name
+                                       : (userSourceDir.empty() ? name : userSourceDir + "/" + name);
+
+                if (seen.count(path)) {
+                    // Already inlined: drop the directive so the definition is
+                    // not repeated. An include guard cannot help here, because
+                    // the text is spliced before the preprocessor ever runs.
+                    src.erase(matchBeg, matchLen);
+                    searchFrom = matchBeg;
+                    continue;
+                }
+
+                std::ifstream in(path, std::ios::binary);
+                if (!in.good()) {
+                    llvm::errs() << "aiehlc: cannot inline #include \"" << name << "\" (tried " << path
+                                 << "); leaving it for clang\n";
+                    searchFrom = matchBeg + matchLen;
+                    continue;
+                }
+                seen.insert(path);
+                std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                in.close();
+
+                inlineSourceIncludes(text, depth + 1);
+
+                std::string block = "\n// ==== aiehlc: inlined " + path + " ====\n" + text + "\n// ==== aiehlc: end " +
+                                    path + " ====\n";
+                src.replace(matchBeg, matchLen, block);
+                // Resume AFTER the spliced block: its own includes are already
+                // resolved, and rescanning them would re-enter needlessly.
+                searchFrom = matchBeg + block.size();
+                llvm::outs() << "aiehlc: inlined kernel source " << path << "\n";
+            }
+        }
+
+        std::string GetKeyReplaceAndAddInclude(clang::SourceManager &SourceMgr, std::unordered_map<std::string,std::string>& funcMap) {
 			std::string ret;
 			// Get the main file entry
 			const auto FileEntryRef = SourceMgr.getFileEntryRefForID(SourceMgr.getMainFileID());
@@ -3716,6 +3797,37 @@ public:
 
 				//llvm::StringRef UpdatedSource;
 				std::string SourceCodeString = SourceCode.str();
+
+                // Flatten `#include "foo.cc"` into the text BEFORE any rewriting.
+                //
+                // Everything below -- the #define scan, the __global__ ->
+                // annotate replacement, the #ifdef KERNEL_COMPILE body guard and
+                // the <<<mesh>>> launch rewrite -- operates on this one string,
+                // which is read from the MAIN FILE only. Clang expands #includes
+                // afterwards, so a kernel living in an included .cc is never
+                // rewritten and fails with `unknown type name '__global__'`
+                // (__global__ has no #define anywhere; it is purely text
+                // replaced). Splicing the text in here lets an app be written as
+                // a thin main.cc that includes its kernel, with every existing
+                // rewrite applying unchanged.
+                //
+                // Deliberately NOT emitting #line markers. The inlining has to be
+                // opaque to Clang, because two later stages key off the kernel's
+                // FileID and would break if it resolved back to the original file:
+                //   * GetFuncText() slices the kernel out of
+                //     getBufferData(getFileID(startLocation)) -- with #line that
+                //     is the UNREWRITTEN conv2dstem.cc, so there is no annotate
+                //     to strip and no KERNEL_COMPILE guard to remove.
+                //   * host.cc is harvested from getRewriteBufferFor(getMainFileID())
+                //     while RemoveText(kernel) / InsertText(_binary_kernel_*) are
+                //     applied at the kernel's own location -- a different FileID
+                //     means those edits land in a buffer nobody reads, leaving the
+                //     kernel body in host.cc and the externs missing.
+                // Cost: diagnostics point into the flattened buffer. Read
+                // aout/newfile.cpp, which is that buffer verbatim.
+                //
+                // Headers (`.h`) are left to Clang, as before.
+                inlineSourceIncludes(SourceCodeString);
 
                 // Collect user #define macros before any rewriting.
                 // Track #if/#else/#endif nesting to skip macros inside
@@ -5508,6 +5620,19 @@ public:
                     if (headerName == "aie_runtime.h" || headerName == "aie_runtime_debug.h" ||
                         headerName == "xaiengine.h")
                         continue;
+                    // Skip .cc/.cpp: inlineSourceIncludes() already spliced those
+                    // into the rewritten text. Copying the file as well would put
+                    // the RAW, unrewritten kernel next to a host.cc that includes
+                    // it -- reproducing `unknown type name '__global__'` at host
+                    // compile time. (This regex matches any quoted include.)
+                    {
+                        auto dot = headerName.rfind('.');
+                        if (dot != std::string::npos) {
+                            std::string ext = headerName.substr(dot);
+                            if (ext == ".cc" || ext == ".cpp" || ext == ".cxx")
+                                continue;
+                        }
+                    }
                     std::string srcPath = userSourceDir + "/" + headerName;
                     std::string dstPath = outputDir + "/" + headerName;
                     // Only copy if the file exists in the user source directory

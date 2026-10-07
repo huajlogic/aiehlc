@@ -57,7 +57,8 @@
       "Bash(timeout 120 python3 -m pip download torchao --no-deps -d /tmp/taowheel -q)",
       "Bash(gh api *)",
       "Bash(timeout 90 python3 -c ' *)",
-      "Bash(/scratch/staff/huaj/aiehlc/.venv/bin/python3 -c ' *)"
+      "Bash(/scratch/staff/huaj/aiehlc/.venv/bin/python3 -c ' *)",
+      "Bash(grep -n 'runtime-source-file\\\\|RUNTIME_SOURCE\\\\|aiehlc .*--extra-arg\\\\|$AIEHLC_BIN\\\\|aiehlc \"' script/aiehlc.sh)"
     ],
     "deny": []
   },

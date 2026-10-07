@@ -393,9 +393,14 @@ def emit_header(out_path: Path, guard: str, generator: str, prose: str,
     out_path.write_text(text)
     if verbose:
         kb = len(text) / 1024.0
+        # Relative to where the USER is standing, not to the repo root. These
+        # scripts live in data/ but write one level up, and a repo-relative
+        # path printed from inside data/ reads as though it were relative to
+        # data/ -- which sends people looking for a header that is not there.
         try:
-            shown = out_path.relative_to(REPO)
-        except ValueError:
+            shown = os.path.relpath(out_path, Path.cwd())
+        except ValueError:                      # different drive (Windows)
             shown = out_path
         print(f"  [write]  {shown}  ({kb:,.0f} KB)")
+        print(f"           = {out_path}")
     return out_path

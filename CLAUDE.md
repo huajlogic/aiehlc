@@ -49,6 +49,33 @@ User C++ → aiehlc (Clang AST) → AieFrontEnd (MLIR)
 
 Key runtime API: `__Runtime_device_init`, `__Runtime_load_kernel_group`, `__Runtime_launch_kernel_group`, `__Runtime_dma_bd_config`, `__Runtime_wait_event`, `__Runtime_device_teardown`.
 
+**Entry file may `#include` its kernel.** The `__global__` kernel does not have to
+sit in the file passed to `--runtime-source-file`: a thin `main.cc` may
+`#include "kernel.cc"`. `inlineSourceIncludes()` (`src/llvm/aiehlc.cc`) splices
+quoted `.cc`/`.cpp` includes into the text *before* the rewrites run, so the
+kernel is annotated, body-guarded and launch-lowered as if written inline. The
+artifact kind follows `main()`: present → ELF, absent → `lib<app>.a` (skill:
+hostlibrarymode). `src/aietensorop/conv2dstem/` ships both entries over one
+kernel. The splice is deliberately **opaque** (no `#line`) because kernel export
+and the host `RewriteBuffer` both key off the kernel's `FileID` — see skill
+**aiehlcincludekernel** before changing it.
+
+**conv2dstem runs on real data.** `src/aietensorop/conv2dstem/data/` generates
+three committed-or-derived headers from a photo and the int8-quantized
+ResNet-18: `conv2dstem_image.h` (`int8[230,230,4]`, already preprocessed,
+quantized, **zero-point**-padded and channel-aligned — byte-for-byte
+`g_ifm_pad`, so the board does no scatter), `conv2dstem_weights.h` (real conv1
+weights + 64 folded qparams), and `conv2dstem_golden.h` (CPU ground truth, which
+`main.cc` self-checks against and `groundtruth.py --applog` reads back; a
+baremetal board under xsdb has no channel but the console). This matters: with
+real weights the peak accumulator is **1,023,225**, so an int16 accumulator
+wraps — the old synthetic `[-4,4]×{-1,0,1}` fixture could not show that.
+Generated headers must land **flat** in the app source dir, not in `data/` —
+`aiehlc.sh:532` copies user headers with a non-recursive `*.h` glob flattened to
+basename and the host compile only gets `-I<worklocal>`, so a `data/` header
+parses in the frontend and then fails at cross-g++. See
+`src/aietensorop/conv2dstem/data/README.md` and skill **conv2dstemfixture**.
+
 **Control-packet plane** — register access over the stream fabric instead of the host
 config bus. See **[doc/controlplane.md](doc/controlplane.md)** for the full API,
 encoding, and fabric layout. In brief:
@@ -144,6 +171,19 @@ Three non-obvious things, each of which silently misleads if forgotten:
   All PT2E symbols resolve in `torch_deps.pt2e_api()`.
 - Do **not** reuse `example/model/resnet18py/resnet18.py:resnet18()` here — it
   builds ResNet-18 **v2** from ONNX weights. Only `classify.preprocess` is shared.
+
+**The board ELF links from the per-layer split, not the monolithic C.** Stage 5
+(`split_layers.py`, on by default; `--no-split` disables) writes one translation
+unit per operator to `worklocal/tvmrelay_deploy/layers/NN_op/NN_op.c`; stage 6
+(`arm_build.py`) compiles each to a `.o` **beside its source** and archives them
+into `arm_build/liblayers.a`, which `graph_driver.c` + `main.c` link against.
+Editing one operator recompiles one TU. `resnet18.c` remains the fallback when
+`layers/` is absent; exactly one of the two is wired in, and `make` stops with a
+named error if neither resolves. Cost measured on ResNet-18 int8: **+0.02%**
+`.text`. Because every layer includes `layers_common.h`, that header now also
+carries mid-file material (a BYOC prelude) and a synthesized prototype for any
+function defined but not pre-declared — so **BYOC codegen must keep weights as
+function-scope statics**, or they duplicate into all 65 TUs and collide at link.
 
 ### TVM `--aie-offload` → AIE via BYOC
 
@@ -306,10 +346,12 @@ Read the matching skill when the task fits:
 | Gen2-only build break: missing `xpseudo_asm_armclang.h`, or `XPAR_CPU_TIMESTAMP_CLK_FREQ` undeclared | bspheadergen2 |
 | hostcompile / missing compile_kernel.sh | hostcompile-entrypoint |
 | App source with no `main()` → static lib; "return-statement with a value, in function returning 'void'" | hostlibrarymode |
+| Entry file `#include`s a kernel `.cc`; `unknown type name '__global__'` or `acquire_input_window` errors pointing at an INCLUDED file | aiehlcincludekernel |
 | Pipeline "succeeds" but emits an EMPTY module (0 routing connections, no BCF/PRX → `Couldn't open aie2ps.prx`): `__global__` in a comment, or a prototype above the kernel | aiesourcetextrewrite |
 | `deploy_flow.py` emits fp32 instead of the default int8, `target.build.llvm is not enabled`, missing `onnx`, or stage-5 split silently skipped | tvmrelaynollvm |
 | PT2E int8 → torch-mlir yields no `!torch.qint8` / no `linalg.*_q` (fusion passes look like no-ops); TOSA "failed to legalize `dequantize_per_channel`"; `pip install torchvision` upgrading torch | torchmlirquantfusion |
 | TVM `--aie-offload` (BYOC → AIE): fused boundary, uint8 shift, zero-point padding, weight-fingerprint layer mapping, conv2dstem int32/epilogue, duplicate `XAie_*` at link | byocaieoffload |
+| conv2dstem real-data fixture: generated header can't live in a subdir; zero-point border; `shift = -exponent`; golden self-check over the console | conv2dstemfixture |
 | `--aie-offload` says `non-4D shapes; not a conv2d` for every layer, or a layer gets another layer's geometry (`K=0`); TVM 5-D NCHWc vs aiehlc's d1..d4 | nchwclayoutfold |
 | `Option '...' registered more than once` / `Option 'basic' already exists` when TVM flow loads `_aiebackend` (two LLVMs) | aiebackendtvmllvm |
 | Frontend prints "OVER BUDGET" / gates offload on tile memory — don't; offload is blind, aiehlc tiles | aieoffloadblind |

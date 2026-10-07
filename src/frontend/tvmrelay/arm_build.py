@@ -11,13 +11,27 @@ supplies that from its graph *runtime* (C++, host-side). This module generates
 the missing pieces from ``resnet18_graph.json`` instead, so the result is plain
 C that the aiehlc aarch64 toolchain can link:
 
-    resnet18.c           kernels           (stage 4)
+    layers/NN_op/NN_op.c one kernel per operator       (stage 5)
+      -> NN_op.o -> liblayers.a                                        <- here
     tvm_runtime_shim.c   the ~4 TVM runtime symbols the kernels call   <- here
     graph_driver.c       storage plan + kernel calls in graph order    <- here
     main.c               entry point, weight load, argmax, timing      <- here
     weights.bin          resnet18_params.bin, linked via ld -r         <- here
     Makefile             the build recipe                              <- here
       -> make -> main.elf
+
+**Kernels come from the per-layer split by default.** Stage 5 writes one
+translation unit per operator under ``<out>/layers/``; each is compiled to a
+``.o`` *beside its source* and archived into ``liblayers.a``. That is what
+makes a single operator independently rebuildable -- editing one layer
+recompiles one TU, not a 536 KB module -- and it is the natural place for a
+layer's AIE artifacts to sit next to the C they replace.
+
+The monolithic ``resnet18.c`` remains the fallback, used when stage 5 was
+skipped (``--no-split``). Exactly one of the two is wired into the Makefile,
+so no kernel is ever compiled twice. Measured difference on ResNet-18 int8:
+1,312,864 vs 1,312,608 bytes of .text (+0.02%, slightly less cross-TU
+inlining), same 65 ``tvmgen_*`` symbols.
 
 **Python generates; make builds.** Everything above is written to
 ``<out>/arm_build/``, then ``make`` is invoked on the generated Makefile --
@@ -641,15 +655,48 @@ CROSS   ?= aarch64-none-elf-
 CPU     ?= cortex-a78
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
+AR      := $(CROSS)ar
 
 REPO    ?= {repo}
 ARCH    := {arch}
 BSP     := {bsp}
 LSCRIPT := $(ARCH)/lscript.ld
 
-# The kernel file stays where stage 4 wrote it and is compiled verbatim --
-# tvm/runtime/*.h in this directory stand in for TVM's real headers.
+# Where the kernels come from.
+#
+# DEFAULT: the per-layer sources stage 5 split out, one translation unit per
+# operator, compiled to a .o NEXT TO ITS SOURCE and archived into liblayers.a.
+# That is what makes a layer individually rebuildable -- `make
+# ../layers/09_conv.../09_conv....o` touches one operator -- and it is why
+# split_layers' _clear_stale already sweeps `*/*.o` as well as `*/*.c`.
+#
+# FALLBACK: the single resnet18.c, used when stage 5 was skipped (--no-split)
+# or produced nothing. Exactly one of the two is active; KERNELS is empty in
+# the layer case, so the file is never compiled twice.
+LAYERS  := {layers_dir}
 KERNELS := {kernels}
+
+# The monolithic object, named whether or not it is built. Only `clean` uses it
+# in the per-layer build: switching modes (or an older tree) can leave a stale
+# resnet18.o here, and a `clean` that skipped it would strand a 52 KB object
+# that LOOKS like it is part of the link but is not in OBJS and never linked.
+KERNEL_OBJ := {kernel_obj}
+
+# Evaluated when make parses this file. Stage 5 runs before stage 6, so the
+# layer sources already exist; `sort` both de-duplicates and fixes the order.
+# A layer directory with no .c (an AIE-offloaded one, whose kernel now lives
+# under its aie/ subdir) simply contributes nothing.
+LAYER_SRCS := $(sort $(wildcard $(LAYERS)/*/*.c))
+LAYER_OBJS := $(LAYER_SRCS:.c=.o)
+
+# Neither source of kernels resolved. Without this the build would cheerfully
+# archive zero objects and fail much later with a wall of undefined
+# tvmgen_default_* references, which says nothing about the real cause.
+ifeq ($(strip $(KERNELS)$(LAYER_SRCS)),)
+$(error no kernels found: $(LAYERS) contains no */*.c and KERNELS is empty. \
+Re-run deploy_flow.py, or build the monolithic file with \
+`make KERNELS=/path/to/resnet18.c`)
+endif
 
 # -I$(REPO)/include reaches aie_timer.h (main.c times each phase with it).
 # -DAIE_GEN=5 picks its xiltimer.h branch, which is what this cortexa78 BSP
@@ -682,19 +729,45 @@ LDFLAGS := --specs=nosys.specs \\
 # literally named "-lxilstandalone,...".
 LDLIBS  := -Wl,--start-group,-lm,-lxil,-lgcc,-lc,-lxiltimer,-lxilstandalone,-lxilpm_ng$(AIE_EXTRA),--end-group
 
+# The DRIVER sources only. In the default per-layer build KERNELS is empty, so
+# OBJS is just these three -- the 65 kernels are NOT here, they reach the link
+# as liblayers.a below. Do not read OBJS as "everything that gets linked".
 SRCS := $(KERNELS) graph_driver.c tvm_runtime_shim.c main.c
 OBJS := $(notdir $(SRCS:.c=.o))
 
+# The kernels' entry to the link. Empty in the monolithic fallback (where they
+# arrive as resnet18.o inside OBJS instead), so `make` never archives zero
+# objects into a library nothing needs.
+LAYER_LIB := $(if $(LAYER_OBJS),liblayers.a,)
+
 all: main.elf
 
-main.elf: $(OBJS) weights.o
-\t$(CC) $(CFLAGS) -o $@ $(OBJS) weights.o $(AIE_LIB) $(LDFLAGS) $(LDLIBS)
+main.elf: $(OBJS) weights.o $(LAYER_LIB)
+\t$(CC) $(CFLAGS) -o $@ $(OBJS) weights.o $(LAYER_LIB) $(AIE_LIB) $(LDFLAGS) $(LDLIBS)
 \t@echo "built $@"
 \t@$(CROSS)size $@ 2>/dev/null || true
 
-# Kernels live one directory up; everything else is generated here.
+# One archive of per-operator objects. graph_driver.o pulls in the members it
+# calls, and a member may call another (the AIE packed-ABI shim calls the BYOC
+# wrapper, which is a separate layer): GNU ld rescans an archive until no new
+# undefined symbols are resolved, so intra-archive references are fine and no
+# --start-group is needed around it.
+# The ar line is quiet on purpose: echoing 65 absolute object paths buries the
+# per-layer compiles that precede it. `make V=1` shows it.
+liblayers.a: $(LAYER_OBJS)
+\t@rm -f $@
+\t$(if $(V),,@)$(AR) rcs $@ $(LAYER_OBJS)
+\t@echo "archived $(words $(LAYER_OBJS)) layer objects into $@ (from $(LAYERS))"
+
+# Kernels live one directory up; everything else is generated here. The same
+# rule compiles a layer in place ($(LAYERS)/NN_op/NN_op.c -> .../NN_op.o),
+# which is what keeps one operator independently rebuildable.
 %.o: %.c
 \t$(CC) $(CFLAGS) -c $< -o $@
+
+# Every layer includes ../layers_common.h, so a regenerated prologue must
+# rebuild all of them.
+$(LAYER_OBJS): $(LAYERS)/layers_common.h
 
 # main.c embeds the preprocessed image and the label table, so regenerating
 # either must force it to recompile.
@@ -708,7 +781,7 @@ weights.o: weights.bin
 \t$(LD) -r -b binary -o $@ $<
 
 clean:
-\trm -f $(OBJS) weights.o main.elf
+\trm -f $(OBJS) $(KERNEL_OBJ) weights.o main.elf liblayers.a $(LAYER_OBJS)
 
 .PHONY: all clean
 """
@@ -800,21 +873,60 @@ def _aie_link_vars(repo_root: Path, kernel_src: Path, build: Path) -> dict:
     }
 
 
-def write_makefile(build: Path, repo_root: Path, kernel_src: Path) -> Path:
+def layer_sources(layers_dir) -> list:
+    """The per-layer ``.c`` files stage 5 split out, in execution order.
+
+    Empty when the directory is absent or holds no C -- which is the signal to
+    fall back to the monolithic kernel file. A layer folder with only an
+    ``aie/`` subdir (its kernel was offloaded) contributes nothing and is not
+    an error.
+    """
+    layers_dir = Path(layers_dir)
+    if not layers_dir.is_dir():
+        return []
+    return sorted(layers_dir.glob("*/*.c"))
+
+
+def write_makefile(build: Path, repo_root: Path, kernel_src: Path,
+                   layers_dir=None, verbose: bool = True) -> Path:
     """Write the Makefile that actually builds the ELF. Returns its path.
 
     The recipe lives here rather than in Python so the build is reproducible
     and editable by hand: ``make`` after a tweak rebuilds only what changed,
     and ``make CROSS=... CPU=...`` retargets without touching the generator.
+
+    Kernels come from *layers_dir* when stage 5 produced one -- one object per
+    operator, archived into ``liblayers.a``. Otherwise the single
+    *kernel_src* is compiled, which is what ``--no-split`` leaves behind.
+    Exactly one of the two is wired up, so no kernel is ever compiled twice.
     """
     arch = repo_root / "thirdparty" / "arch" / "cortexa78_0"
     bsp = _bsp_dir(arch)
-    # Compile the kernel file from wherever stage 4 left it, into a local .o.
-    rule = (f"{kernel_src.stem}.o: {kernel_src}\n"
-            f"\t$(CC) $(CFLAGS) -c $< -o $@\n")
+
+    # Absolute: make runs in build/, so a path relative to the caller's cwd
+    # would silently expand to nothing and quietly produce an empty archive.
+    layers_dir = (Path(layers_dir) if layers_dir else build.parent / "layers").resolve()
+    sources = layer_sources(layers_dir)
+
+    if sources:
+        # Per-layer build: KERNELS empty, the wildcard over $(LAYERS) drives it.
+        kernels, rule = "", ""
+        if verbose:
+            print(f"  [arm]    kernels: {len(sources)} per-layer objects "
+                  f"-> liblayers.a  ({layers_dir.name}/)")
+    else:
+        # Fallback: compile the kernel file from wherever stage 4 left it.
+        kernels = str(kernel_src)
+        rule = (f"{kernel_src.stem}.o: {kernel_src}\n"
+                f"\t$(CC) $(CFLAGS) -c $< -o $@\n")
+        if verbose:
+            print(f"  [arm]    kernels: {kernel_src.name} (monolithic -- "
+                  f"no layers/ found; --no-split?)")
+
     text = _MAKEFILE_TMPL.format(
         repo=repo_root, arch=arch, bsp=bsp,
-        kernels=kernel_src, kernel_rule=rule,
+        layers_dir=layers_dir, kernels=kernels, kernel_rule=rule,
+        kernel_obj=f"{kernel_src.stem}.o",
         **_aie_link_vars(repo_root, kernel_src, build),
     )
     path = build / "Makefile"
@@ -871,8 +983,12 @@ def build_arm_elf(out_dir, repo_root=None, c_name="resnet18.c",
     image_input.write_labels_header(labels, build / "imagenet_labels.h",
                                     verbose=verbose)
     summary["image"] = str(image_path)
-    makefile = write_makefile(build, repo_root, out_dir / c_name)
+    # Stage 5 splits into <out_dir>/layers/ and runs before this stage, so the
+    # per-layer sources are already on disk when the Makefile is written.
+    makefile = write_makefile(build, repo_root, out_dir / c_name,
+                              layers_dir=out_dir / "layers", verbose=verbose)
     summary["makefile"] = str(makefile)
+    summary["layer_objects"] = len(layer_sources(out_dir / "layers"))
     if verbose:
         print(f"  [arm] makefile: {makefile}")
 

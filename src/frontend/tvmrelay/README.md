@@ -376,6 +376,30 @@ Each file is a **complete translation unit** — it includes
 with `gcc -fsyntax-only` rather than assuming. In `layers/`, `make` builds all
 22 and `make 00_conv2d_add_relu` builds one layer.
 
+These are not just for reading: **stage 6 links the board ELF from them.** Each
+layer becomes a `.o` beside its source, archived into
+`arm_build/liblayers.a` — so editing one operator recompiles one translation
+unit rather than the whole module. See [`arm_build.py`](#arm_buildpy--stage-6-the-board-elf).
+
+`layers_common.h` carries two things beyond TVM's own prologue, both needed
+only once the layers are compiled *separately*:
+
+- **mid-file material**, such as the BYOC prelude `aie_codegen.py` appends
+  after TVM's kernels (its `conv2d_stem_prepadded` declaration). It sits past
+  the first `extern "C"` guard, so it is not part of the prologue;
+- **a synthesized prototype for every function defined but not pre-declared** —
+  TVM declares its packed-ABI kernels up front, but a BYOC helper is only ever
+  *defined*. In one file the definition preceded its caller; split apart, the
+  AIE shim (layer 1) calls a wrapper defined in layer 64.
+
+Without either, those layers compiled with an **implicit declaration** —
+linkable on aarch64 since the pointer arguments pass in registers regardless,
+but unprototyped and a hard error under `-Werror`. Note the contract this
+implies: what gets hoisted is **declarations**. A BYOC codegen must keep its
+weights as *function-scope* statics (as `aie_codegen._FUNC_TMPL` does), because
+file-scope data here would be duplicated into all 65 translation units and
+collide at link.
+
 Folder numbers are **graph execution order**, read from `resnet18_graph.json`,
 so the listing reads like the network — stem conv, maxpool, eight residual
 blocks, avgpool, dense.
@@ -420,7 +444,36 @@ missing pieces from `resnet18_graph.json` instead, into `arm_build/`:
 | `imagenet_labels.h` | the 1000 class names |
 | `tvm/runtime/c_*_api.h` | baremetal stand-ins so `resnet18.c` is used **verbatim**, not patched |
 | `weights.bin` | `resnet18_params.bin`, linked in via `ld -r -b binary` |
+| `liblayers.a` | the per-layer objects from stage 5, one per operator — **the kernels** |
 | `Makefile` | the build recipe |
+
+### Where the kernels come from
+
+By default, **the per-layer sources stage 5 split out**: `layers/NN_op/NN_op.c`
+→ `NN_op.o` beside its source → `liblayers.a`. Editing one operator recompiles
+one translation unit:
+
+```bash
+make -C worklocal/tvmrelay_deploy/arm_build          # 1 TU + archive + link
+```
+
+The monolithic `resnet18.c` is the fallback, used when `layers/` is absent
+(`--no-split`). Exactly one of the two is wired into the Makefile, so no kernel
+is compiled twice; if neither resolves, `make` stops with a named error rather
+than a wall of undefined `tvmgen_default_*` references. Override by hand:
+
+```bash
+make -C ... LAYERS=/nonexistent KERNELS=/path/to/resnet18.c
+```
+
+Cost of splitting, measured on ResNet-18 int8 with `--aie-offload`: 1,312,864
+vs 1,312,608 bytes of `.text` (**+0.02%**, from slightly less cross-TU
+inlining), identical 65 `tvmgen_*` symbols.
+
+`graph_driver.o` pulls the members it calls out of the archive, and one member
+may call another — the AIE packed-ABI shim calls the BYOC wrapper, a separate
+layer. GNU ld rescans an archive until no new undefined symbols are resolved,
+so intra-archive references need no `--start-group`.
 
 ### What the ELF prints
 

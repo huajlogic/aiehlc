@@ -12,6 +12,13 @@ never reveal.
 
 ## Regenerate
 
+> **The headers are written one level UP, not into this directory.**
+> `../conv2dstem_image.h`, `../conv2dstem_weights.h`, `../conv2dstem_golden.h`.
+> That is required, not a preference — see
+> [Why the headers are not in this directory](#why-the-headers-are-not-in-this-directory).
+> Only `stem_fixture.npz` lands here. If you ran everything and `ls` shows no
+> `.h`, you are looking in the wrong directory: `ls ../conv2dstem_*.h`.
+
 Order matters: the ground truth is derived from the other two.
 
 ```bash
@@ -19,6 +26,8 @@ cd src/aietensorop/conv2dstem/data
 python3 make_image_header.py            # dog.jpg -> ../conv2dstem_image.h
 python3 make_weights_header.py --emit-npz   #      -> ../conv2dstem_weights.h + stem_fixture.npz
 python3 groundtruth.py                  #          -> ../conv2dstem_golden.h
+
+ls -l ../conv2dstem_*.h                 # confirm: three files, ~1.3 MB / 62 KB / 5.0 MB
 ```
 
 Needs `numpy`, `onnx`, `onnxruntime`, `torch` + `PIL` (for the preprocessing).
