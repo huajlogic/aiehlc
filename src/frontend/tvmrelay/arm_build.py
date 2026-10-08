@@ -616,6 +616,14 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         "",
     ]
 
+    # Entry indices that hold a weight rather than an activation. Only used to
+    # label the layeriohex provenance comment: both are kernel inputs and both
+    # are dumped, but "which of these is a parameter" is the first question
+    # asked of a traced call, and it is not visible from the tensor itself.
+    param_eids = frozenset(eid(i) for i, node in enumerate(nodes)
+                           if node.get("op") == "null"
+                           and node["name"] in offsets)
+
     n_calls = 0
     for node_idx, node in enumerate(nodes):
         if node.get("op") != "tvm_op":
@@ -632,9 +640,9 @@ def generate_driver(graph_path: Path, params_path: Path, out_dir: Path,
         arg_eids = in_eids + out_eids
         for slot, tensor_idx in enumerate(arg_eids):
             lines.append(f"    args[{slot}].v_handle = &tensors[{tensor_idx}];")
-        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "in")
+        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "in", param_eids)
         lines.append(f"    {fn}(args, codes, {len(arg_eids)}, 0, 0, 0);")
-        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "out")
+        lines += _trace_lines(n_calls, fn, in_eids, out_eids, "out", param_eids)
         lines.append("")
         n_calls += 1
 
@@ -742,27 +750,216 @@ static inline void graph_dump_tensor(const char *tag, int idx, int n) {
     }
     printf("\\n");
 }
+
+/* ── Per-layer I/O as C hex headers ────────────────────────────────────────
+ *
+ * GRAPH_TRACE prints the first few elements; GRAPH_TRACE_HEX writes every
+ * kernel input and output out IN FULL as a compilable C header of hex bytes,
+ * one file per tensor per call, so a layer's real data can be diffed against
+ * another build, replayed into a standalone test, or fed to the AIE kernel.
+ *
+ * BYTES, not decoded elements, and deliberately so: this is the on-the-wire
+ * image of the buffer. The element view is graph_dump_tensor's job, and the
+ * header carries the dtype and shape as macros so a reader can decode it.
+ *
+ * Two sinks, because the two targets do not have the same world:
+ *
+ *   GRAPH_TRACE_HEX_FILES  (hosted; `make local` sets it) -- real files in
+ *       ./layeriohex/, relative to wherever the ELF is run.
+ *   otherwise              (baremetal board) -- there is no filesystem under
+ *       xsdb, the console IS the channel, so the identical text goes to
+ *       stdout between BEGIN/END markers. `arm_build.split_layeriohex()`
+ *       cuts a captured log back into the same files.
+ */
+#ifdef GRAPH_TRACE_HEX
+
+#ifndef GRAPH_TRACE_HEX_DIR
+#define GRAPH_TRACE_HEX_DIR "layeriohex"
+#endif
+
+/* 0 = the whole tensor. A cap matters most on the console sink, where the
+ * full int8 ResNet-18 is ~100 MB of text over a UART. */
+#ifndef GRAPH_TRACE_HEX_MAX_BYTES
+#define GRAPH_TRACE_HEX_MAX_BYTES 0
+#endif
+
+#ifdef GRAPH_TRACE_HEX_FILES
+#include <sys/stat.h>
+#include <sys/types.h>
+
+static FILE *graph_hex_open(const char *name) {
+    static int made;
+    char path[512];
+    if (!made) {            /* once, and an existing directory is not an error */
+        mkdir(GRAPH_TRACE_HEX_DIR, 0777);
+        made = 1;
+    }
+    snprintf(path, sizeof path, "%s/%s.h", GRAPH_TRACE_HEX_DIR, name);
+    FILE *f = fopen(path, "w");
+    if (!f) printf("   hex: cannot write %s\\n", path);
+    return f;
+}
+
+static void graph_hex_close(FILE *f, const char *name) { (void)name; fclose(f); }
+#else   /* console sink: no filesystem on the board */
+static FILE *graph_hex_open(const char *name) {
+    printf("===BEGIN " GRAPH_TRACE_HEX_DIR "/%s.h===\\n", name);
+    return stdout;
+}
+
+static void graph_hex_close(FILE *f, const char *name) {
+    (void)f;
+    printf("===END " GRAPH_TRACE_HEX_DIR "/%s.h===\\n", name);
+}
+#endif
+
+/* `name` is the file stem AND the C identifier prefix. It is generated
+ * (l<NN>_<fn>_<in|out><slot>), so it is unique per call and a valid
+ * identifier by construction -- nothing here has to sanitize it.
+ * `provenance` is the static description arm_build.py already knows: call
+ * index, kernel symbol, argument slot, and whether the tensor is a parameter.
+ */
+static void graph_dump_hex(const char *name, int idx, const char *provenance) {
+    const DLTensor *t = &tensors[idx];
+    char ds[24];
+    long long numel = 1, nbytes, shown;
+    for (int i = 0; i < t->ndim; ++i) numel *= (long long)t->shape[i];
+    nbytes = numel * (long long)((t->dtype.bits + 7) / 8)
+                   * (long long)t->dtype.lanes;
+    shown = nbytes;
+    if (GRAPH_TRACE_HEX_MAX_BYTES > 0 && shown > GRAPH_TRACE_HEX_MAX_BYTES)
+        shown = GRAPH_TRACE_HEX_MAX_BYTES;
+
+    FILE *f = graph_hex_open(name);
+    if (!f) return;
+    fprintf(f, "/* Written by graph_driver.c under `make TRACE=1` -- "
+               "regenerated every run, do not edit.\\n"
+               " * %s\\n */\\n", provenance);
+    fprintf(f, "#ifndef LAYERIOHEX_%s_H\\n#define LAYERIOHEX_%s_H\\n\\n",
+            name, name);
+    fprintf(f, "#define %s_DTYPE \\"%s\\"\\n", name,
+            dl_dtype_str(t->dtype, ds, sizeof ds));
+    fprintf(f, "#define %s_NDIM  %d\\n", name, t->ndim);
+    fprintf(f, "#define %s_ELEMS %lldLL\\n", name, numel);
+    fprintf(f, "#define %s_BYTES %lldLL\\n", name, nbytes);
+    if (shown != nbytes)    /* say so IN the file; a short array is otherwise
+                             * indistinguishable from a small tensor */
+        fprintf(f, "#define %s_TRUNCATED %lldLL\\n", name, shown);
+    fprintf(f, "\\nstatic const long long %s_shape[%d] = {", name,
+            t->ndim ? t->ndim : 1);
+    for (int i = 0; i < t->ndim; ++i)
+        fprintf(f, "%s%lld", i ? ", " : " ", (long long)t->shape[i]);
+    fprintf(f, "%s};\\n\\n", t->ndim ? " " : " 1 ");
+
+    const unsigned char *p = (const unsigned char *)t->data + t->byte_offset;
+    fprintf(f, "static const unsigned char %s_data[%lldLL] = {\\n", name, shown);
+    for (long long i = 0; i < shown; ++i) {
+        fprintf(f, "%s0x%02x,", (i % 16) ? " " : "    ", (unsigned)p[i]);
+        if ((i % 16) == 15) fputc('\\n', f);
+    }
+    if (shown % 16) fputc('\\n', f);
+    fprintf(f, "};\\n\\n#endif\\n");
+    graph_hex_close(f, name);
+}
+#endif  /* GRAPH_TRACE_HEX */
 """
 
 
+#: Longest kernel-symbol slice allowed inside a layeriohex file stem. The call
+#: index already makes the stem unique, so this only has to keep
+#: ``l07_<fn>_in2.h`` inside a filesystem's 255-byte name limit -- TVM's fused
+#: names run past 180 characters on their own.
+_HEX_NAME_FN_CHARS = 90
+
+
+def _hex_name(call_idx: int, fn: str, where: str, slot: int) -> str:
+    """File stem and C identifier prefix for one traced tensor.
+
+    ``l03_fused_nn_contrib_conv2d_NCHWc_add_..._in1``. Unique by the call
+    index, so the truncated kernel name is provenance rather than identity.
+    The leading letter matters: the stem is pasted straight into
+    ``static const ... <stem>_data``, and an identifier cannot start with a
+    digit.
+    """
+    short = fn[len("tvmgen_default_"):] if fn.startswith("tvmgen_default_") else fn
+    short = "".join(c if (c.isalnum() or c == "_") else "_" for c in short)
+    return f"l{call_idx:02d}_{short[:_HEX_NAME_FN_CHARS]}_{where}{slot}"
+
+
 def _trace_lines(call_idx: int, fn: str, in_eids: list, out_eids: list,
-                 where: str) -> list:
+                 where: str, param_eids=frozenset()) -> list:
     """``#ifdef GRAPH_TRACE`` dump around one kernel call. ``where`` is in|out.
 
     Generated rather than hand-added, so instrumenting a node survives the
     next ``deploy_flow.py`` run -- editing ``graph_driver.c`` directly does
     not, the file is overwritten every time.
+
+    Two dumps per tensor, nested so the second is separately switchable:
+    ``graph_dump_tensor`` prints the first few DECODED elements to the console,
+    and ``graph_dump_hex`` (``GRAPH_TRACE_HEX``, which ``TRACE=1`` turns on
+    unless ``TRACE_HEX=0``) writes the whole buffer to ``layeriohex/`` as a C
+    header. *param_eids* only shapes the provenance comment -- weights are
+    kernel inputs like any other and are dumped too, since a mismatch is as
+    often in a parameter as in an activation.
     """
+    eids = in_eids if where == "in" else out_eids
+    tag = "   in " if where == "in" else "   out"
     out = ["#ifdef GRAPH_TRACE"]
     if where == "in":
         out.append(f'    printf("[{call_idx:02d}] {fn}\\n");')
-        out += [f'    graph_dump_tensor("   in ", {t}, GRAPH_TRACE_ELEMS);'
-                for t in in_eids]
-    else:
-        out += [f'    graph_dump_tensor("   out", {t}, GRAPH_TRACE_ELEMS);'
-                for t in out_eids]
-    out.append("#endif")
+    out += [f'    graph_dump_tensor("{tag}", {t}, GRAPH_TRACE_ELEMS);'
+            for t in eids]
+    out.append("#ifdef GRAPH_TRACE_HEX")
+    for slot, t in enumerate(eids):
+        role = "param" if t in param_eids else where
+        prov = (f"call [{call_idx:02d}] {fn} -- {where}[{slot}] "
+                f"= tensors[{t}] ({role})")
+        out.append(f'    graph_dump_hex("{_hex_name(call_idx, fn, where, slot)}"'
+                   f', {t}, "{prov}");')
+    out += ["#endif", "#endif"]
     return out
+
+
+def split_layeriohex(log_path, out_dir=None, verbose: bool = True) -> dict:
+    """Cut a board console log back into ``layeriohex/*.h``. Returns a summary.
+
+    The hosted build writes the headers itself; a baremetal board cannot, so
+    ``graph_dump_hex`` streams the identical text to the console framed by
+    ``===BEGIN layeriohex/<stem>.h===`` / ``===END ...===``. Point this at the
+    captured log (``applog``) and the two sinks produce the same files.
+
+    Unterminated blocks are written anyway and counted in ``truncated``: a run
+    that was interrupted mid-dump still carries every layer before it, and
+    dropping them would lose exactly the data the log was captured for.
+    """
+    log_path = Path(log_path)
+    out_dir = Path(out_dir) if out_dir else log_path.parent / "layeriohex"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    written, truncated, name, body = [], [], None, []
+    for line in log_path.read_text(errors="replace").splitlines():
+        if line.startswith("===BEGIN layeriohex/") and line.endswith(".h==="):
+            if name is not None:                # BEGIN inside a block
+                truncated.append(name)
+                (out_dir / f"{name}.h").write_text("\n".join(body) + "\n")
+                written.append(name)
+            name = line[len("===BEGIN layeriohex/"):-len(".h===")]
+            body = []
+        elif name is not None and line.startswith("===END layeriohex/"):
+            (out_dir / f"{name}.h").write_text("\n".join(body) + "\n")
+            written.append(name)
+            name, body = None, []
+        elif name is not None:
+            body.append(line)
+    if name is not None:                        # log ends mid-block
+        (out_dir / f"{name}.h").write_text("\n".join(body) + "\n")
+        written.append(name)
+        truncated.append(name)
+
+    if verbose:
+        print(f"  [hex] {len(written)} header(s) -> {out_dir}"
+              + (f"  ({len(truncated)} truncated)" if truncated else ""))
+    return {"dir": str(out_dir), "written": written, "truncated": truncated}
 
 
 #: Scratch for TVMBackendAllocWorkspace. Kernels allocate inside a fused op
@@ -1036,10 +1233,28 @@ LOCAL_LDLIBS ?= -lm
 #
 # This is why instrumenting a node does NOT mean editing graph_driver.c: that
 # file is regenerated by deploy_flow.py and hand edits are overwritten.
+#
+# TRACE=1 ALSO writes every kernel input and output out in full as a C header
+# of hex bytes -- one file per tensor per call, into ./layeriohex/ relative to
+# wherever the ELF runs (so `make local run-local` fills arm_build/layeriohex/).
+# TRACE_HEX=0 keeps the console trace but drops the headers; TRACE_HEX_MAX=N
+# caps each file at N bytes of payload.
+#
+# Only the HOSTED build gets -DGRAPH_TRACE_HEX_FILES. A baremetal board has no
+# filesystem -- under xsdb the console is the only channel -- so there the same
+# text streams to stdout between BEGIN/END markers and
+# `arm_build.split_layeriohex()` cuts a captured log back into files. Linking
+# fopen/mkdir into the BSP build instead would compile and then fail at run
+# time, which is the worse failure.
 ifdef TRACE
 TRACE_DEFS := -DGRAPH_TRACE $(if $(TRACE_ELEMS),-DGRAPH_TRACE_ELEMS=$(TRACE_ELEMS),)
+ifneq ($(TRACE_HEX),0)
+TRACE_DEFS += -DGRAPH_TRACE_HEX \\
+              $(if $(TRACE_HEX_MAX),-DGRAPH_TRACE_HEX_MAX_BYTES=$(TRACE_HEX_MAX),)
+LOCAL_HEX_DEFS := -DGRAPH_TRACE_HEX_FILES
+endif
 CFLAGS       += $(TRACE_DEFS)
-LOCAL_CFLAGS += $(TRACE_DEFS)
+LOCAL_CFLAGS += $(TRACE_DEFS) $(LOCAL_HEX_DEFS)
 endif
 
 # Layer basenames carry their NN_ prefix, so flattening them into localobj/
@@ -1098,10 +1313,16 @@ run-local: main_local.elf
 clean-local:
 \trm -rf $(LOCALOBJ) main_local.elf
 
+# Separate from clean-local: a traced run is expensive (the headers are the
+# whole graph's buffers) and `make clean-local` to rebuild should not throw
+# away the dump you just spent minutes producing.
+clean-hex:
+\trm -rf layeriohex
+
 clean: clean-local
 \trm -f $(OBJS) $(KERNEL_OBJ) weights.o main.elf liblayers.a $(LAYER_OBJS)
 
-.PHONY: all clean clean-local local run-local
+.PHONY: all clean clean-local clean-hex local run-local
 """
 
 
@@ -1390,6 +1611,7 @@ make -j8
 | `Makefile` | the build recipe — nothing is hidden in Python |
 | `liblayers.a` | built: the @@LAYERS@@ per-layer objects from stage 5 — **the kernels** |
 | `localobj/` | built: host objects for `make local`, kept apart from the aarch64 ones |
+| `layeriohex/` | built by a `TRACE=1` **run**, not by the build: every kernel input and output as a C hex header |
 
 `graph_driver.c` and `weights.bin` are a **matched pair**: the driver has the
 blob's byte offsets baked in as literals, and `save_param_dict` orders its
@@ -1406,6 +1628,7 @@ garbage.
 make local TRACE=1 run-local        # host, traced, run it
 make TRACE=1                        # board ELF, traced
 make local TRACE=1 TRACE_ELEMS=16   # 16 elements per tensor (default 8)
+make local TRACE=1 TRACE_HEX=0      # console trace only, no layeriohex/
 ```
 
 ```
@@ -1418,6 +1641,85 @@ make local TRACE=1 TRACE_ELEMS=16   # 16 elements per tensor (default 8)
    in  tensors[3] int16 [16,1,7,7,3,4] = -2 0 -52 25 -18 0
    out tensors[9] uint8 [1,16,112,112,4] = 46 97 14 0 30 89
 ```
+
+### Full per-layer I/O — `layeriohex/`
+
+`TRACE=1` does two things. The lines above are the first; the second is that
+**every** kernel input and output is written out *in full* as a compilable C
+header of hex bytes, one file per tensor per call, into `layeriohex/` —
+relative to wherever the ELF runs, so `make local run-local` fills
+`arm_build/layeriohex/`.
+
+```
+layeriohex/l00_fused_divide_round_add_clip_cast_subtract_layout_transform_in0.h
+layeriohex/l00_fused_divide_round_add_clip_cast_subtract_layout_transform_out0.h
+layeriohex/l01_fused_nn_contrib_conv2d_NCHWc_add_..._in1.h
+```
+
+```c
+/* Written by graph_driver.c under `make TRACE=1` -- regenerated every run, do not edit.
+ * call [01] tvmgen_default_fused_nn_contrib_conv2d_NCHWc_add_... -- in[1] = tensors[3] (param)
+ */
+#ifndef LAYERIOHEX_l01_fused_nn_contrib_conv2d_NCHWc_add____in1_H
+#define LAYERIOHEX_l01_fused_nn_contrib_conv2d_NCHWc_add____in1_H
+
+#define l01_..._in1_DTYPE "int16"
+#define l01_..._in1_NDIM  6
+#define l01_..._in1_ELEMS 9408LL
+#define l01_..._in1_BYTES 18816LL
+
+static const long long l01_..._in1_shape[6] = { 16, 1, 7, 7, 3, 4 };
+
+static const unsigned char l01_..._in1_data[18816LL] = {
+    0xfe, 0xff, 0x00, 0x00, 0xcc, 0xff, 0x19, 0x00, ...
+};
+#endif
+```
+
+The stem is `l<call>_<kernel>_<in|out><slot>`, which is both the filename and
+the C identifier prefix — the call index makes it unique, so the kernel name
+is only provenance and is truncated to keep the filename under 255 bytes.
+
+**Bytes, not decoded elements, and on purpose.** This is the on-the-wire image
+of the buffer; the element view is what `graph_dump_tensor()` prints. The
+dtype and shape ride along as macros so a reader can decode it — see *Dump
+elements, not bytes* below for why mixing the two readings is the standard
+way to misread this data.
+
+| knob | effect |
+|---|---|
+| `TRACE_HEX=0` | keep the console trace, write no headers |
+| `TRACE_HEX_MAX=N` | cap each file at N bytes of payload (`_TRUNCATED` is defined in the header when it bites) |
+| `make clean-hex` | delete `layeriohex/` — deliberately **not** part of `clean-local`, so rebuilding does not discard a dump |
+
+It is not small: the full int8 ResNet-18 is roughly **100 MB** of text, because
+parameters are kernel inputs too and a weight used by one call is dumped for
+that call. They are dumped rather than skipped because a mismatch lands in a
+parameter as often as in an activation — `TRACE_HEX_MAX` is the lever when you
+only need the leading bytes.
+
+#### On the board there is no filesystem
+
+Only the hosted build gets `-DGRAPH_TRACE_HEX_FILES`. A baremetal board under
+xsdb has no filesystem — the console is the only channel — so `make TRACE=1`
+for the board streams the *identical* text to stdout, framed:
+
+```
+===BEGIN layeriohex/l00_..._in0.h===
+...the same header text...
+===END layeriohex/l00_..._in0.h===
+```
+
+Capture it and cut it back into files:
+
+```python
+from frontend.tvmrelay.arm_build import split_layeriohex
+split_layeriohex("applog")            # -> ./layeriohex/*.h
+```
+
+Linking `fopen`/`mkdir` into the BSP build instead would compile and then fail
+at run time, which is the worse failure. Note that a UART carries ~100 MB very
+slowly — `TRACE_HEX_MAX=256` is the usual setting for a board run.
 
 ### Why not just add a `printf`
 

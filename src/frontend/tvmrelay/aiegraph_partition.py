@@ -374,17 +374,31 @@ def build_ir_ops(records: list) -> tuple:
 #  Partition
 # ═══════════════════════════════════════════════════════════════════════════
 
-def partition_layers(records: list, aie_ops=DEFAULT_AIE_OPS) -> list:
+def partition_layers(records: list, aie_ops=DEFAULT_AIE_OPS,
+                     layers=None) -> list:
     """Decide AIE vs CPU per layer. Returns one verdict dict per record.
 
     A layer goes to AIE only when **every** aiegraph op it expands to is in
     *aie_ops*. Partial eligibility is not offloadable: the TVM C for a residual
     block is a single fused function, so taking its conv to AIE would drop the
     residual add entirely.
+
+    *layers* is the ``--aie-layers`` selection: a list of ``layers/`` folder
+    indices, or ``None`` for "every eligible layer". A layer outside the
+    selection stays on the APU even when it is otherwise eligible -- this is the
+    same selection ``--aie-offload`` uses, so both flags target the same conv
+    (layer 6, the 7x7/s2 stem, under the int8-legalized graph).
     """
+    sel = None if layers is None else set(layers)
     verdicts = []
     for rec in records:
         kinds = rec["aiegraph"]
+        if sel is not None and rec.get("index") not in sel:
+            want = ",".join(str(i) for i in sorted(sel))
+            verdicts.append({**rec, "target": "cpu",
+                             "verdict_reason": f"not in the --aie-layers "
+                                               f"selection ({want})"})
+            continue
         if not kinds:
             reason = rec.get("reason", "no aiegraph op")
             target = "cpu"
@@ -405,7 +419,8 @@ def partition_layers(records: list, aie_ops=DEFAULT_AIE_OPS) -> list:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_aiegraph(out_dir, aie_ops=DEFAULT_AIE_OPS, mesh=(2, 2),
-                 emit_aie: bool = True, verbose: bool = True) -> dict:
+                 emit_aie: bool = True, layers=None,
+                 verbose: bool = True) -> dict:
     """Lift the whole graph to aiegraph, partition it, and offload the AIE part.
 
     Writes ``layers/aiegraph.mlir`` (the verified whole-graph IR) and
@@ -413,6 +428,11 @@ def run_aiegraph(out_dir, aie_ops=DEFAULT_AIE_OPS, mesh=(2, 2),
     ``layers/<NN_name>/aie/`` for each offloaded layer. The TVM C of every layer
     is left exactly as stage 5 wrote it -- CPU layers reuse it as-is, and it is
     kept for AIE layers too so the APU ELF still links.
+
+    *layers* narrows the offload to those ``layers/`` indices (``--aie-layers``;
+    ``None`` = every eligible layer). The whole graph is still lifted and
+    verified either way -- the selection only decides which verified layers get
+    an ``aie/`` build.
     """
     out_dir = Path(out_dir).resolve()
     layers_dir = out_dir / "layers"
@@ -432,7 +452,7 @@ def run_aiegraph(out_dir, aie_ops=DEFAULT_AIE_OPS, mesh=(2, 2),
         # stage-4/5 artifact is a stage-4/5 problem, not a crash here.
         return {"ok": False, "reason": f"unreadable {type(exc).__name__}: {exc}"}
     records = build_nodes(manifest, graph)
-    verdicts = partition_layers(records, aie_ops)
+    verdicts = partition_layers(records, aie_ops, layers)
 
     op_dicts, owners = build_ir_ops(records)
     if not op_dicts:
@@ -454,7 +474,8 @@ def run_aiegraph(out_dir, aie_ops=DEFAULT_AIE_OPS, mesh=(2, 2),
     result = {"ok": all(b["ok"] for b in built) if built else True,
               "ir": str(ir_path), "op_count": len(op_dicts),
               "aie_count": n_aie, "cpu_count": len(verdicts) - n_aie,
-              "aie_ops": list(aie_ops), "layers": verdicts, "built": built}
+              "aie_ops": list(aie_ops), "layers": verdicts, "built": built,
+              "selection": None if layers is None else list(layers)}
     _write_partition(layers_dir, result, verbose)
     return result
 

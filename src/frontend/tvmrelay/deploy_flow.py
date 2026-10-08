@@ -100,8 +100,24 @@ Seven stages, matching the seven things this flow has to prove:
    ``-std=c11`` (``CLOCK_MONOTONIC`` is POSIX, which strict ISO mode hides).
    An AIE-offloaded build cannot be linked here and says so.
 
+   **``make TRACE=1``** compiles in the generated driver's per-node
+   instrumentation, which this stage emits behind ``#ifdef GRAPH_TRACE`` on
+   every build -- a normal build carries none of it. Two dumps per tensor:
+   the first few DECODED elements to the console, and **every kernel input and
+   output in full** as a compilable C header of hex bytes, one file per tensor
+   per call, into ``layeriohex/`` next to the running ELF (so ``--local`` fills
+   ``arm_build/layeriohex/``). ``TRACE_HEX=0`` drops the headers,
+   ``TRACE_HEX_MAX=N`` caps each at N bytes. Only the hosted build writes
+   files; a baremetal board has no filesystem, so there the identical text
+   streams over the console between ``===BEGIN layeriohex/...===`` markers and
+   ``arm_build.split_layeriohex(log)`` cuts it back into the same files.
+   Instrumenting a node therefore never means editing ``graph_driver.c`` --
+   that file is rewritten on every run of this script.
+
    **AIE offload** (``--aie-offload``, off by default) puts the selected
-   layers (``--aie-layers``, default 1 = the 7x7/s2 stem) on the AIE through
+   layers (``--aie-layers``, default 6 = the 7x7/s2 conv stem; it was 1 before
+   int8 legalization split each conv into a zero-point chain and renumbered
+   ``layers/``) on the AIE through
    TVM BYOC: the convs are partitioned out of the Relay graph, the C is
    rebuilt, and the graph executor calls the generated wrapper -> the aiehlc
    library ``aout/libconv2dstem.a`` in their place. The library is built
@@ -110,15 +126,18 @@ Seven stages, matching the seven things this flow has to prove:
    init / mesh partition / launch. Offload is blind: no tile-budget check on
    this side. See ``aie_offload.py`` and ``byoc/``.
 
-   **Whole-graph aiegraph** (``--aiegraph``) is the other way in, and differs
-   in that it does not take a layer selection: it lifts the *entire* graph into
-   one ``aiegraph.func`` whose SSA edges are the model's real dataflow, then
-   **partitions** it -- layers whose aiegraph ops are all in ``--aiegraph-ops``
-   (default the conv2d family) go to the aiehlc kernel backend, and every other
+   **Whole-graph aiegraph** (``--aiegraph``) is the other way in: it lifts the
+   *entire* graph into one ``aiegraph.func`` whose SSA edges are the model's
+   real dataflow, then **partitions** it -- layers that are in ``--aie-layers``
+   *and* whose aiegraph ops are all in ``--aiegraph-ops`` (default the conv2d
+   family) go to the aiehlc kernel backend, and every other
    layer **reuses the TVM-generated CPU C** from stage 5 unchanged. Every layer
    gets a verdict and a reason in ``layers/partition.json``, including the ones
-   the 4-op dialect cannot express (``max_pool2d``, ``batch_flatten``). See
-   ``aiegraph_partition.py``.
+   the 4-op dialect cannot express (``max_pool2d``, ``batch_flatten``). The
+   whole graph is lifted and verified regardless of the selection -- it only
+   decides which verified layers get an ``aie/`` build, so ``--aie-layers``
+   means the same thing here as under ``--aie-offload`` and both default to the
+   conv stem at layer 6. See ``aiegraph_partition.py``.
 
 7. **CPU** — classify the same image with onnxruntime on the same folded ONNX
    and print the top-5. This is the answer the ELF has to reproduce, from an
@@ -161,10 +180,10 @@ Run::
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --local --no-arm
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aie-offload
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py \\
-        --aie-offload --aie-layers 1
+        --aie-offload --aie-layers 6      # 6 is the default: the conv stem
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --aiegraph
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py \\
-        --aiegraph --aiegraph-ops conv_bn_relu --no-arm
+        --aiegraph --aie-layers all --aiegraph-ops conv_bn_relu --no-arm
     PYTHONPATH=src python src/frontend/tvmrelay/deploy_flow.py --relay-ptq
 """
 
@@ -866,9 +885,12 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     AIE library in place of TVM's own kernel (``_stage_aie_offload``).
 
     ``aiegraph`` instead lifts the **whole** graph into one verified
-    ``aiegraph.func`` and partitions it: layers whose aiegraph ops are all in
-    ``aiegraph_ops`` are offloaded to the aiehlc kernel backend, and the rest
-    reuse the TVM-generated CPU C. Also additive.
+    ``aiegraph.func`` and partitions it: layers in ``aie_layers`` whose aiegraph
+    ops are all in ``aiegraph_ops`` are offloaded to the aiehlc kernel backend,
+    and the rest reuse the TVM-generated CPU C. Also additive. ``aie_layers`` is
+    the **same** selection ``aie_offload`` uses -- both default to layer 6, the
+    7x7/s2 conv stem under the int8-legalized graph -- so the two ways in target
+    the same conv instead of one offloading a layer and the other the graph.
 
     **Quantizer.** Stage 3 defaults to ONNX PTQ (``onnx_ptq.py``): the model is
     quantized *before* Relay sees it, giving symmetric per-channel int8 weights
@@ -902,7 +924,8 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
     # `check_targets` demands exactly one Relay conv matching both the
     # fingerprint and the geometry before anything is offloaded. Verified: the
     # same weights hash identically as int8/NCHW, int16/NCHW and int16/NCHWc.
-    # `--aiegraph` never took a selection at all.
+    # `--aiegraph` now takes the same `--aie-layers` selection (it used to take
+    # none), so both ways in target the same conv: layer 6, the stem.
     #
     # Keeping it off was also the wrong default on its own terms: the AIE kernel
     # consumes int8, so legalizing to int16 meant the offloaded conv's operands
@@ -968,11 +991,13 @@ def run(out_dir: Path = DEFAULT_OUT, *, skip_quantize: bool = False,
             from frontend.tvmrelay import aiegraph_partition
 
             if verbose:
-                print(f"[6/7] aiegrph: lifting the whole graph "
-                      f"(AIE ops: {', '.join(aiegraph_ops)})")
+                sel = ("all" if aie_layers is None
+                       else ",".join(str(i) for i in aie_layers))
+                print(f"[6/7] aiegrph: lifting the whole graph, offloading "
+                      f"layer(s) {sel} (AIE ops: {', '.join(aiegraph_ops)})")
             graph_part = aiegraph_partition.run_aiegraph(
                 out_dir, aie_ops=tuple(aiegraph_ops), mesh=mesh,
-                verbose=verbose)
+                layers=aie_layers, verbose=verbose)
             if verbose and not graph_part.get("ok"):
                 print(f"[6/7]          {graph_part.get('reason', 'partition failed')}")
 
@@ -1097,10 +1122,10 @@ def main(argv=None) -> int:
                          "12.8 -> 24.4 MB) for the same bit-identical output. "
                          "Useful for A/B-ing against the old artifacts")
     ap.add_argument("--pe-int8", action="store_true",
-                    help="force the int8 PE legalization ON. It is already "
-                         "the default; this only matters with --aie-offload "
-                         "or --aiegraph, where it is switched off because it "
-                         "renumbers layers/ and --aie-layers selects by index")
+                    help="force the int8 PE legalization ON. It is already the "
+                         "default on every path, AIE ones included -- this flag "
+                         "only makes that explicit, e.g. to override an earlier "
+                         "--no-pe-int8 in a wrapper script")
     ap.add_argument("--image", default=None,
                     help="image path or URL to classify "
                          "(default: the pytorch/hub dog.jpg sample)")
@@ -1111,10 +1136,12 @@ def main(argv=None) -> int:
                          "Only the ResNet-18 stem has an AIE kernel today")
     ap.add_argument("--aie-layers", default="6",
                     help="which layers to offload, as numbered in layers/ by "
-                         "the CPU build: an index, a comma list, or 'all' "
-                         "(default: 6, the 7x7/s2 stem under the int8-legalized "
-                         "graph -- it was 1 before int8 split each conv into a "
-                         "zero-point chain; check layers/ if unsure)")
+                         "the CPU build: an index, a comma list, or 'all'. "
+                         "Applies to BOTH --aie-offload and --aiegraph "
+                         "(default: 6, the 7x7/s2 conv stem under the "
+                         "int8-legalized graph -- it was 1 before int8 split "
+                         "each conv into a zero-point chain; check layers/ if "
+                         "unsure)")
     ap.add_argument("--aie-ops", default=",".join(AIE_OP_KINDS),
                     help=f"op kinds eligible for AIE "
                          f"(default: {','.join(AIE_OP_KINDS)})")
@@ -1123,9 +1150,10 @@ def main(argv=None) -> int:
                          "--aie-offload uses the mesh built into the AIE library")
     ap.add_argument("--aiegraph", action="store_true",
                     help="lift the WHOLE graph into one aiegraph.func, then "
-                         "partition: layers matching --aiegraph-ops go to the "
-                         "aiehlc kernel backend, the rest reuse the TVM CPU C "
-                         "(verdicts in layers/partition.json)")
+                         "partition: layers in --aie-layers matching "
+                         "--aiegraph-ops go to the aiehlc kernel backend, the "
+                         "rest reuse the TVM CPU C (verdicts in "
+                         "layers/partition.json)")
     ap.add_argument("--relay-ptq", action="store_true",
                     help="quantize with relay.quantize instead of the default "
                          "ONNX PTQ: symmetric-only, leaves an fp32 head and "
@@ -1174,7 +1202,7 @@ def main(argv=None) -> int:
                  aiegraph=args.aiegraph, aiegraph_ops=aiegraph_ops,
                  relay_ptq=args.relay_ptq, local=args.local,
                  local_run=not args.no_local_run,
-                 # None = default: on, unless an AIE stage is requested.
+                 # None = default: on, AIE stages included.
                  pe_int8=(False if args.no_pe_int8
                           else True if args.pe_int8 else None))
     return 0 if result.get("ok") else 1

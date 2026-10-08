@@ -221,9 +221,14 @@ hash identically as int8/NCHW, int16/NCHW and int16/NCHWc — and `check_targets
 demands one Relay conv matching fingerprint *and* geometry. Keeping int8 off was
 also wrong on its own terms: the AIE kernel eats int8, so int16 legalization left
 the offloaded conv's operands the one thing not in the hardware's width.
-`--aie-layers` **defaults to 6**; a stale index now reports `not a conv -- only
-convs offload` rather than offloading the wrong op. `--aiegraph` still maps 0
-layers, but it already did (`byoc_aie_plan.md:160`, "0/28 eligible, confirmed") —
+`--aie-layers` **defaults to 6** and now governs **both** `--aie-offload` and
+`--aiegraph`, so the two ways in target the same conv; a stale index now reports
+`not a conv -- only convs offload` rather than offloading the wrong op.
+`--aiegraph` used to take no selection at all — `partition_layers(records,
+aie_ops, layers)` forces every layer outside the selection to CPU with
+`not in the --aie-layers selection (N)` as its `partition.json` verdict, *after*
+the whole graph is still lifted and verified. It still maps 0 layers under int8,
+but it already did (`byoc_aie_plan.md:160`, "0/28 eligible, confirmed") —
 it keys on fused *names* (`conv2d_add_relu`) that legalization renames. **Bias,
 requant multiplier and shift stay int32 and must** — bias lives at the
 `s_x·s_w` accumulator scale (23 bits here), the multiplier is a fixed-point
@@ -266,9 +271,27 @@ carries a per-node dump of every kernel input/output behind `#ifdef GRAPH_TRACE`
 dtype — `DLDataType` is a 4-byte **struct**, so `printf("%d", t.dtype)` is UB that
 prints `code | bits<<8 | lanes<<16`, i.e. int16 shows as `69632`, uint8 as `67585`
 — and dumps **elements, not bytes** (a byte dump of int16 reads `98 ff` = `-104`).
-`dl_dtype_str`/`graph_dump_tensor` are `static inline` and always emitted. Hand
-edits to `graph_driver.c` are overwritten by the next `deploy_flow.py` run; change
-`arm_build._trace_lines` / `_DEBUG_HELPERS_C` instead. All of it is restated in the
+`dl_dtype_str`/`graph_dump_tensor` are `static inline` and always emitted.
+
+`TRACE=1` *also* writes **every kernel input and output in full** as a
+compilable C hex header (`GRAPH_TRACE_HEX`, `graph_dump_hex`), one file per
+tensor per call, into **`layeriohex/` next to the running ELF** — so `make local
+run-local` fills `arm_build/layeriohex/`. Stem = C identifier prefix =
+`l<call>_<kernel>_<in|out><slot>`; the call index makes it unique, so the kernel
+name is truncated (`_HEX_NAME_FN_CHARS`) to stay under a 255-byte filename.
+Header carries `_DTYPE`/`_NDIM`/`_ELEMS`/`_BYTES` + `_shape[]` so it decodes on
+its own; the payload is **bytes** (the on-the-wire buffer image) where
+`graph_dump_tensor` gives elements. Knobs: `TRACE_HEX=0` off, `TRACE_HEX_MAX=N`
+cap (sets `_TRUNCATED`), `make clean-hex`. ~100 MB on int8 ResNet-18 — params are
+kernel inputs and are dumped per call, deliberately. **Only the hosted build gets
+`-DGRAPH_TRACE_HEX_FILES`**: a baremetal board has no filesystem, so it streams
+the identical text over the console between `===BEGIN layeriohex/...===` markers
+and `arm_build.split_layeriohex(log)` cuts it back into byte-identical files
+(verified). Linking `fopen`/`mkdir` into the BSP build would compile, then fail
+at run time.
+
+Hand edits to `graph_driver.c` are overwritten by the next `deploy_flow.py` run;
+change `arm_build._trace_lines` / `_DEBUG_HELPERS_C` instead. All of it is restated in the
 **generated** `arm_build/README.md` (`arm_build.write_readme` / `_README_MD`), which
 carries each run's real numbers — edit the template, never the copy.
 
