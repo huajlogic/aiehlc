@@ -17,14 +17,14 @@ jobs:
     runs-on: [self-hosted, linux]
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build, simulate, check result
         run: bash script/ci/pr_sim_test.sh tutorial
 
       - name: Upload simulator log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sim-tutorial-log
           path: ci-public.log

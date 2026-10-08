@@ -357,8 +357,10 @@ void BlueprintToSchedulePass::runOnOperation() {
     if (auto moduleOp = dyn_cast<ModuleOp>(getOperation())) {
         auto ctrlAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.control_plan_op_control_packet");
         auto colAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.control_plan_shim_col");
+        auto shimBdAttr = moduleOp->getAttrOfType<IntegerAttr>("routing.control_plan_shim_bd_ctrl");
+        bool shimRow = shimBdAttr && shimBdAttr.getInt() != 0;
         if (ctrlAttr && ctrlAttr.getInt() != 0 && colAttr && colAttr.getInt() >= 0 &&
-            !resourceMgr->reserveControlShimBds(static_cast<int>(colAttr.getInt()))) {
+            !resourceMgr->reserveControlShimBds(static_cast<int>(colAttr.getInt()), shimRow)) {
             getOperation()->emitError("control-plane shim BD reservation failed");
             signalPassFailure();
             return;

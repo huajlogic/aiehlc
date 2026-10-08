@@ -10,6 +10,7 @@ mode="${1:-}"
 log="ci-sim.log"
 public="ci-public.log"
 : >"$log"
+rm -f "$public"
 
 redact() {
     local ws="${GITHUB_WORKSPACE:-}"
@@ -19,21 +20,23 @@ redact() {
             -e 's|/scratch/staff/[^[:space:]]+|<user>|g' \
             -e 's|/home/[^[:space:]]+|<user>|g' \
             -e 's|/Users/[^[:space:]]+|<user>|g' \
-            -e 's|/proj/[^[:space:]]+|<tools>|g'
+            -e 's|/proj/[^[:space:]]+|<tools>|g' \
+            -e 's#(https?://)[^/@[:space:]]+@#\1***@#g'
     else
         sed -E \
             -e 's|/scratch/staff/[^[:space:]]+|<user>|g' \
             -e 's|/home/[^[:space:]]+|<user>|g' \
             -e 's|/Users/[^[:space:]]+|<user>|g' \
-            -e 's|/proj/[^[:space:]]+|<tools>|g'
+            -e 's|/proj/[^[:space:]]+|<tools>|g' \
+            -e 's#(https?://)[^/@[:space:]]+@#\1***@#g'
     fi
 }
 
 finish_fail() {
-    trap - ERR
+    trap - EXIT
     {
-        echo "FAIL: ${label}"
-        excerpt="$(grep -E 'Mismatch|Failure|failed|error:|Error|CMake Error|unbound|undefined|CRITICAL|axi_mm|Sim result|PASS:|passed' "$log" | tail -n 30 || true)"
+        echo "FAIL: ${label:-pr_sim_test.sh ${mode}}"
+        excerpt="$(grep -E 'Mismatch|Failure|failed|error:|Error|ERROR|fatal:|403|forbidden|CMake Error|unbound|undefined|CRITICAL|axi_mm|Sim result|PASS:|passed' "$log" | tail -n 30 || true)"
         if [ -n "${excerpt}" ]; then
             printf '%s\n' "${excerpt}" | redact
         else
@@ -73,7 +76,13 @@ case "$mode" in
 esac
 
 shift
-trap finish_fail ERR
+on_exit() {
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        finish_fail
+    fi
+}
+trap on_exit EXIT
 
 root="$(pwd)"
 llvm_dir="${LLVM_INSTALL_DIR:-}"

@@ -536,6 +536,7 @@ struct ControlShimPlacement {
   int mm2sCh = 0;
   int s2mmCh = 0;
   bool exclusive = false;
+  bool shimRow = false;
 };
 
 class ResourceMgr {
@@ -642,7 +643,7 @@ public:
   void setControlPlacement(const ControlShimPlacement &p) { ctrlPlacement_ = p; }
   const ControlShimPlacement &controlPlacement() const { return ctrlPlacement_; }
   std::optional<ControlShimPlacement> findFreeControlChannels(int col) const;
-  bool reserveControlShimBds(int col);
+  bool reserveControlShimBds(int col, bool shimRow = false);
 
   // Reserved-resource accessors for routing/scheduling.
   uint32_t reservedArbiterMask() const { return reservedArbiterMask_; }
@@ -687,6 +688,7 @@ private:
   bool controlPlaneReserved_ = false;
   ControlShimPlacement ctrlPlacement_;
   void reserveControlSpinePorts(rt_res_gen gen, int spineCol);
+  void reserveShimRowControl(int spineCol);
 
   void InitSHIMNocList();
 

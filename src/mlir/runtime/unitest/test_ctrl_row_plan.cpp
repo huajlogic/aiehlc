@@ -181,8 +181,8 @@ static int test_forward_slot_table() {
 // forwards the neighbor's merged responses on its EAST slave (RET_TRANSIT, msel1);
 // the head merges the descending upper-spine responses on its NORTH slave
 // (RET_NORTH, msel2) and drives them all SOUTH->VRET (SOUTH master mselen 0x7).
-// Non-head interior drives WEST (mselen 0x3 local+transit); the last tile drives
-// WEST (mselen 0x1 local only). Standalone (acr_plan_return_chain) matches the
+// Every non-head tile drives WEST with mselen 0x3 (local+transit); the last tile
+// has no transit slot but enables its msel so the register is uniform. Standalone (acr_plan_return_chain) matches the
 // row_add-embedded chain.
 static int test_return_chain() {
     acr_oplist o = {};
@@ -205,11 +205,11 @@ static int test_return_chain() {
     // Head descends SOUTH->VRET pulling {local,transit,north} = 0x7.
     assert(count_master(&o, head, ACR_SOUTH) == 1);
     assert(master_mselen(&o, head, ACR_SOUTH) == 0x7);
-    // Interior merges WEST with {local,transit} = 0x3; last with {local} = 0x1.
+    // Interior and last both merge WEST with {local,transit} = 0x3.
     assert(count_master(&o, 3, ACR_WEST) == 1);
     assert(master_mselen(&o, 3, ACR_WEST) == 0x3);
     assert(count_master(&o, col_hi, ACR_WEST) == 1);
-    assert(master_mselen(&o, col_hi, ACR_WEST) == 0x1);
+    assert(master_mselen(&o, col_hi, ACR_WEST) == 0x3);
     // The head does not drive WEST; the last tile does not drive SOUTH.
     assert(count_master(&o, head, ACR_WEST) == 0);
     assert(count_master(&o, col_hi, ACR_SOUTH) == 0);
@@ -326,7 +326,7 @@ static int test_relay_head() {
         assert(master_mselen(&o, c, ACR_CTRL) == 0x3);
         assert(find_slot(&o, c, ACR_CTRL, ACR_SLOT_RET_LOCAL, ACR_ARB_RET) != nullptr);
     }
-    assert(master_mselen(&o, 4, ACR_WEST) == 0x1);
+    assert(master_mselen(&o, 4, ACR_WEST) == 0x3);
     assert(count_master(&o, 4, ACR_EAST) == 0);
 
     assert(has_cct(&o, 0, 1, ACR_SOUTH, ACR_NORTH));

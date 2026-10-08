@@ -9,10 +9,10 @@ description: AIEHLC schedule debug UI — schedule_debug_server daemon, schedule
 
 | Resource | Role |
 |----------|------|
-| [src/tool/debug/README.md](../../src/tool/debug/README.md) | User guide, CLI, endpoints |
-| [doc/design/aiegdb_live_debug_framework.md](../../doc/design/aiegdb_live_debug_framework.md) | Original design doc |
+| [src/tool/debug/README.md](../../../src/tool/debug/README.md) | User guide, CLI, endpoints |
+| [doc/design/aiegdb_live_debug_framework.md](../../../doc/design/aiegdb_live_debug_framework.md) | Original design doc |
 | [reference.md](reference.md) | Implementation notes moved from CLAUDE.md |
-| [dbg_llm_skills/](../../src/tool/debug/dbg_llm_skills/) | Ten embedded-LLM plugin skills |
+| [dbg_llm_skills/](../../../src/tool/debug/dbg_llm_skills/) | Ten embedded-LLM plugin skills |
 
 ## Quick launch
 

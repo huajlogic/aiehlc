@@ -369,6 +369,11 @@ struct_event __Runtime_launch_kernel_group_ctrl(XAie_DevInst *dev, __Runtime_Ctr
 
 void __Runtime_phase_cycles(unsigned long long *cyc, unsigned int *calls);
 void __Runtime_wait_io_cycles(unsigned long long *cycles, unsigned int *calls);
+void __Runtime_ctrl_kernel_pkt_set(const void *blob, unsigned int bytes);
+void __Runtime_ctrl_aot_register(const void *table);
+void __Runtime_ctrl_aot_window(XAie_DevInst *dev, __Runtime_CtrlRowFabric *f, int nbuf, ...);
+struct_ioevent __Runtime_ioevent_make(XAie_LocType tile, int32_t channel, int32_t bd_id, XAie_DmaDirection dir);
+void __Runtime_kload_fill_cycles(unsigned long long *fill_cyc, unsigned int *fill_n, int *aot);
 void __Runtime_kload_split_cycles(unsigned long long *elf_cyc, unsigned int *elf_n, unsigned long long *rst_cyc,
                                   unsigned int *rst_n);
 void __Runtime_setup_split_cycles(unsigned long long *plan_cyc, unsigned int *plan_n, unsigned long long *sync_cyc,
@@ -910,6 +915,10 @@ void __Runtime_ctrl_pmap_enable(int on);
 
 void __Runtime_ctrl_high_throughput_enable(int on);
 
+void __Runtime_ctrl_shim_bd_begin(__Runtime_CtrlRowFabric *f);
+void __Runtime_ctrl_shim_bd_commit(void);
+void __Runtime_ctrl_shim_bd_ctrl_stats_print(void);
+
 // Poll the shim S2MM drain until the response lands, sync it for the CPU, and
 // return the first response word. Uses @inst->token armed by
 // __Runtime_ctrl_setup_routing. If @print is nonzero, prints the observed word.
@@ -984,6 +993,8 @@ typedef struct {
     uint8_t col_lo, col_hi; // inclusive column span built on this row
 } __Runtime_CtrlRowChain;
 
+#define RT_CTRL_RET_BCAST_MAX 16U
+
 typedef struct __Runtime_CtrlRowFabric_s {
     XAie_DevInst *dev; // partitioned device instance
     uint8_t shim_col;  // vertical spine column (= row left edge)
@@ -1006,6 +1017,15 @@ typedef struct __Runtime_CtrlRowFabric_s {
     // @txn_row >= 0 => row-multicast to that physical row.
     int txn_row;
     uint8_t pmap_shim_seen;
+
+    // Return-route register writes identical on every consumer tile, withheld
+    // from ctrl_plan_init (high-throughput mode only) and broadcast at the front
+    // of the next packed ELF payload. Any response-arming send that runs first
+    // writes them over MMIO instead; @ret_bcast_pending is cleared either way.
+    uint32_t ret_bcast_off[RT_CTRL_RET_BCAST_MAX];
+    uint32_t ret_bcast_val[RT_CTRL_RET_BCAST_MAX];
+    uint8_t ret_bcast_n;
+    uint8_t ret_bcast_pending;
 } __Runtime_CtrlRowFabric;
 
 // Translate a planner op list into XAie stream-switch calls on @dev. Returns the
